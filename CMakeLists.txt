@@ -9,8 +9,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_library(cppllm
+    src/cppllm/gguf/gguf.cpp
     src/cppllm/kv/block_allocator.cpp
     src/cppllm/sys/features.cpp
+    src/cppllm/sys/mmap_file.cpp
 )
 target_include_directories(cppllm PUBLIC src)
 

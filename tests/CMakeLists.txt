@@ -11,6 +11,7 @@ add_executable(cppllm_tests
     test_sanity.cpp
     test_block_allocator.cpp
     test_features.cpp
+    test_gguf.cpp
 )
 target_link_libraries(cppllm_tests PRIVATE cppllm catch2)
 
