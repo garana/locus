@@ -12,6 +12,7 @@ add_executable(cppllm_tests
     test_block_allocator.cpp
     test_features.cpp
     test_gguf.cpp
+    test_tokenizer.cpp
 )
 target_link_libraries(cppllm_tests PRIVATE cppllm catch2)
 

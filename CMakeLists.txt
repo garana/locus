@@ -13,6 +13,7 @@ add_library(cppllm
     src/cppllm/kv/block_allocator.cpp
     src/cppllm/sys/features.cpp
     src/cppllm/sys/mmap_file.cpp
+    src/cppllm/tok/tokenizer.cpp
 )
 target_include_directories(cppllm PUBLIC src)
 
