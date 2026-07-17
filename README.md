@@ -16,7 +16,7 @@ milestone plan.
 
 | Milestone | Description                             | State       |
 |-----------|-----------------------------------------|-------------|
-| M0        | Scaffolding, CMake, Catch2, allocator   | in progress |
+| M0        | Scaffolding, CMake, Catch2, allocator   | done        |
 | M1        | GGUF loader + tokenizer                 | not started |
 | M2        | CPU forward pass, single sequence       | not started |
 | M3        | Paged KV + continuous batching          | not started |
@@ -35,6 +35,10 @@ milestone plan.
 
 ## Dependencies
 
-None at runtime. Catch2 (tests only) is vendored under
+None required at runtime. Catch2 (tests only) is vendored under
 `third_party/catch2/` -- see docs/DESIGN.md section 6 for the
-dependency policy.
+dependency policy. Optional, auto-detected at configure time:
+
+- Vulkan loader (GPU backend, milestone M5)
+- SIMD compiler flags per arch (neon/sse4/avx2/avx512); kernel
+  variants are selected at runtime via `cppllm::sys::detect()`

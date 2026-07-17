@@ -10,6 +10,7 @@ target_include_directories(catch2 SYSTEM PUBLIC
 add_executable(cppllm_tests
     test_sanity.cpp
     test_block_allocator.cpp
+    test_features.cpp
 )
 target_link_libraries(cppllm_tests PRIVATE cppllm catch2)
 

@@ -98,6 +98,17 @@ backends. Vulkan is the chosen GPU path because it is the only
 vendor-neutral option that ships on macOS (MoltenVK), Linux/AMD,
 and Linux/NVIDIA without per-vendor toolchains.
 
+Vectorized CPU kernels follow the scheme proven in ../pbw: each
+SIMD variant (neon, sse4, avx2, avx512) lives in its own source
+file compiled with only that variant's flags, gated at configure
+time by check_cxx_compiler_flag; `cppllm::sys::detect()` probes
+the running machine and the backend picks the best variant at
+runtime. This keeps one binary portable across CPU generations.
+Build-time detection for both SIMD and Vulkan (find_package +
+loader link, later glslc-to-embedded-SPIR-V as in pbw) is wired
+up since M0; the kernels themselves land in M2 (CPU) and M5
+(Vulkan).
+
 ### 4.4 GGUF loader
 
 Parsing untrusted model files is an attack surface (llama.cpp has
