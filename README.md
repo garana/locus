@@ -17,7 +17,7 @@ milestone plan.
 | Milestone | Description                             | State       |
 |-----------|-----------------------------------------|-------------|
 | M0        | Scaffolding, CMake, Catch2, allocator   | done        |
-| M1        | GGUF loader + tokenizer                 | not started |
+| M1        | GGUF loader + tokenizer                 | done        |
 | M2        | CPU forward pass, single sequence       | not started |
 | M3        | Paged KV + continuous batching          | not started |
 | M4        | HTTP server (OpenAI API, SSE)           | not started |

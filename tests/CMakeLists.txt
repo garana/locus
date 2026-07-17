@@ -13,7 +13,11 @@ add_executable(cppllm_tests
     test_features.cpp
     test_gguf.cpp
     test_tokenizer.cpp
+    test_model_e2e.cpp
 )
 target_link_libraries(cppllm_tests PRIVATE cppllm catch2)
+target_compile_definitions(cppllm_tests PRIVATE
+    CPPLLM_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
 
 add_test(NAME unit COMMAND cppllm_tests)
