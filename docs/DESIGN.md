@@ -98,6 +98,14 @@ backends. Vulkan is the chosen GPU path because it is the only
 vendor-neutral option that ships on macOS (MoltenVK), Linux/AMD,
 and Linux/NVIDIA without per-vendor toolchains.
 
+Backends are runtime-selectable: a registry (backend/registry.cpp)
+lists every compiled variant with availability on the running
+machine; the model routes heavy ops (matvec, dequant) through the
+chosen entry. Selection order: --backend flag > CPPLLM_BACKEND env
+var > best available. `--backends` prints the registry. Every
+variant must match the scalar reference in tests, and the golden
+e2e runs through whatever backend is the machine's default.
+
 Vectorized CPU kernels follow the scheme proven in ../pbw: each
 SIMD variant (neon, sse4, avx2, avx512) lives in its own source
 file compiled with only that variant's flags, gated at configure

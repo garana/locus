@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "backend_cli.hpp"
 #include "cppllm/engine/engine.hpp"
 #include "cppllm/gguf/gguf.hpp"
 #include "cppllm/model/llama.hpp"
@@ -11,27 +12,41 @@
 
 /**
  * Minimal single-sequence greedy generation driver (M2):
- *   cppllm-run <model.gguf> <prompt> [n_tokens]
+ *   cppllm-run [--backend NAME] <model.gguf> <prompt> [n_tokens]
+ *   cppllm-run --backends
  */
 int main(int argc, char** argv) {
-    if (argc < 3) {
+    auto args = cppllm_tools::parse_backend_args(argc, argv);
+    if (args.list) {
+        cppllm_tools::print_backends();
+        return 0;
+    }
+    if (args.positional.size() < 2) {
         std::fprintf(stderr,
-                     "usage: %s <model.gguf> <prompt> [n_tokens]\n",
-                     argv[0]);
+                     "usage: %s [--backend NAME] <model.gguf> "
+                     "<prompt> [n_tokens]\n       %s --backends\n",
+                     argv[0], argv[0]);
         return 2;
     }
-    const std::string model_path = argv[1];
-    const std::string prompt = argv[2];
-    const int n_gen = argc > 3 ? std::atoi(argv[3]) : 64;
+    const std::string model_path = args.positional[0];
+    const std::string prompt = args.positional[1];
+    const int n_gen = args.positional.size() > 2
+                          ? std::atoi(args.positional[2].c_str())
+                          : 64;
 
     try {
         auto g = cppllm::gguf::GgufFile::open(model_path);
         auto model = cppllm::model::LlamaModel::load(g);
+        model.use_backend(
+            cppllm::backend::resolve_backend(args.choice));
         auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
         const auto& hp = model.hparams();
         std::fprintf(stderr,
-                     "%s | layers=%u embd=%u heads=%u/%u vocab=%u\n",
+                     "%s | backend=%s | layers=%u embd=%u "
+                     "heads=%u/%u vocab=%u\n",
                      cppllm::sys::to_string(cppllm::sys::detect())
+                         .c_str(),
+                     std::string(model.active_backend().name)
                          .c_str(),
                      hp.n_layers, hp.n_embd, hp.n_heads,
                      hp.n_kv_heads, hp.n_vocab);

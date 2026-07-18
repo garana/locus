@@ -13,8 +13,8 @@ description: Build and run the cpp-llm Catch2 unit tests. Use after
 
 - Run a subset with a tag filter: `./build/tests/cppllm_tests
   "[kv]"` (tags: [sanity], [kv], [sys], [gguf], [tok], [ops],
-  [engine], [server], [vulkan], [e2e]; keep this list current as
-  suites are added).
+  [backend], [engine], [server], [vulkan], [e2e]; keep this list
+  current as suites are added).
 - [e2e] needs the ~1 MB test model: `scripts/fetch-test-model.sh`
   (gitignored under tests/models/; tests SKIP if absent).
 - Every new component gets its own `tests/test_<name>.cpp`,

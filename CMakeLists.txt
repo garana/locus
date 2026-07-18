@@ -10,6 +10,8 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_library(cppllm
     src/cppllm/backend/cpu_ops.cpp
+    src/cppllm/backend/matvec_neon.cpp
+    src/cppllm/backend/registry.cpp
     src/cppllm/backend/vulkan/context.cpp
     src/cppllm/engine/engine.cpp
     src/cppllm/gguf/gguf.cpp

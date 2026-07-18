@@ -125,6 +125,7 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
         m.layers_.push_back(lay);
     }
 
+    m.backend_ = &backend::best_backend();
     m.out_norm_ = need_vec(g, "output_norm.weight", hp.n_embd);
     // Tied embeddings when output.weight is absent.
     m.out_w_ = g.find_tensor("output.weight") != nullptr
@@ -182,8 +183,10 @@ void LlamaModel::forward(tok::TokenId token,
     const std::size_t kv_dim =
         static_cast<std::size_t>(hp_.n_kv_heads) * hd;
     const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
+    const backend::Ops& op = backend_->ops;
 
-    dequant_row(embd_, static_cast<std::uint32_t>(token), ws.x);
+    op.dequant_row(embd_, static_cast<std::uint32_t>(token),
+                   ws.x);
 
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
@@ -192,9 +195,9 @@ void LlamaModel::forward(tok::TokenId token,
         rmsnorm(ws.x, lay.attn_norm, hp_.rms_eps, ws.xb);
         float* krow = cache.k(seq, l, pos);
         float* vrow = cache.v(seq, l, pos);
-        matvec(lay.wq, ws.xb, ws.q);
-        matvec(lay.wk, ws.xb, {krow, kv_dim});
-        matvec(lay.wv, ws.xb, {vrow, kv_dim});
+        op.matvec(lay.wq, ws.xb, ws.q);
+        op.matvec(lay.wk, ws.xb, {krow, kv_dim});
+        op.matvec(lay.wv, ws.xb, {vrow, kv_dim});
         rope_norm(ws.q, hp_.n_heads, hd, pos, hp_.rope_freq_base);
         rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd, pos,
                   hp_.rope_freq_base);
@@ -228,24 +231,24 @@ void LlamaModel::forward(tok::TokenId token,
                 }
             }
         }
-        matvec(lay.wo, ws.out, ws.xb2);
+        op.matvec(lay.wo, ws.out, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
             ws.x[i] += ws.xb2[i];
         }
 
         // Feed-forward block (SwiGLU).
         rmsnorm(ws.x, lay.ffn_norm, hp_.rms_eps, ws.xb);
-        matvec(lay.w_gate, ws.xb, ws.gate);
-        matvec(lay.w_up, ws.xb, ws.up);
+        op.matvec(lay.w_gate, ws.xb, ws.gate);
+        op.matvec(lay.w_up, ws.xb, ws.up);
         silu_mul(ws.gate, ws.up, ws.gate);
-        matvec(lay.w_down, ws.gate, ws.xb2);
+        op.matvec(lay.w_down, ws.gate, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
             ws.x[i] += ws.xb2[i];
         }
     }
 
     rmsnorm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
-    matvec(out_w_, ws.xb, logits);
+    op.matvec(out_w_, ws.xb, logits);
     seq.n_tokens = pos + 1;
 }
 

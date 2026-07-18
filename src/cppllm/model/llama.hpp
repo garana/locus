@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "cppllm/backend/cpu_ops.hpp"
+#include "cppllm/backend/registry.hpp"
 #include "cppllm/gguf/gguf.hpp"
 #include "cppllm/kv/paged_cache.hpp"
 #include "cppllm/tok/tokenizer.hpp"
@@ -44,6 +45,17 @@ class LlamaModel {
 
     const Hparams& hparams() const { return hp_; }
 
+    /**
+     * Routes heavy ops through the given backend (default: the
+     * best available at load time; see backend::backends()).
+     */
+    void use_backend(const backend::Backend& b) { backend_ = &b; }
+
+    /** @returns The backend currently doing the math. */
+    const backend::Backend& active_backend() const {
+        return *backend_;
+    }
+
     /** Reusable per-thread scratch buffers (no sequence state). */
     struct Workspace {
         std::vector<float> x, xb, xb2, q, att, gate, up, out;
@@ -80,6 +92,7 @@ class LlamaModel {
     };
 
     Hparams hp_;
+    const backend::Backend* backend_ = nullptr;
     backend::Mat embd_;
     std::span<const float> out_norm_;
     backend::Mat out_w_;

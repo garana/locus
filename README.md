@@ -33,6 +33,20 @@ milestone plan.
     cmake --build build --target cppllm_tests
     ./build/tests/cppllm_tests
 
+## Math backends
+
+Every SIMD/GPU variant is compiled into the one binary; at startup
+the best one supported by the running machine is picked (pbw-style
+runtime dispatch). Inspect and override:
+
+    cppllm-run --backends
+    cppllm-run --backend scalar model.gguf "prompt" 32
+    CPPLLM_BACKEND=neon cppllm-server model.gguf 8080
+
+Current entries: neon (arm64), scalar (reference), vulkan (listed;
+selectable once M5 completes). x86 sse4/avx2/avx512 and CUDA slot
+into src/cppllm/backend/registry.cpp when their kernels land.
+
 ## Dependencies
 
 No external packages at runtime. Vendored (pinned, checksummed,
