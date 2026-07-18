@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_library(cppllm
+    src/cppllm/backend/cpu_ops.cpp
     src/cppllm/gguf/gguf.cpp
     src/cppllm/kv/block_allocator.cpp
     src/cppllm/sys/features.cpp

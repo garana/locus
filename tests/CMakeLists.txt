@@ -11,6 +11,7 @@ add_executable(cppllm_tests
     test_sanity.cpp
     test_block_allocator.cpp
     test_features.cpp
+    test_cpu_ops.cpp
     test_gguf.cpp
     test_tokenizer.cpp
     test_model_e2e.cpp

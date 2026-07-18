@@ -1,0 +1,153 @@
+#include <cmath>
+#include <cstring>
+#include <vector>
+
+#include "catch_amalgamated.hpp"
+#include "cppllm/backend/cpu_ops.hpp"
+
+using namespace cppllm::backend;
+using cppllm::gguf::TensorType;
+using Catch::Approx;
+
+TEST_CASE("f16 conversion round-trips", "[ops]") {
+    for (float v : {0.0f, 1.0f, -1.0f, 0.5f, 65504.0f, 1e-4f}) {
+        REQUIRE(f16_to_f32(f32_to_f16(v)) ==
+                Approx(v).margin(v == 0 ? 0 : std::abs(v) * 1e-3));
+    }
+    // Subnormal range: absolute precision is one f16 ulp (~6e-8).
+    REQUIRE(f16_to_f32(f32_to_f16(1e-6f)) ==
+            Approx(1e-6f).margin(6e-8));
+    REQUIRE(f16_to_f32(0x3800) == Approx(0.5f));
+    REQUIRE(std::isinf(f16_to_f32(0x7c00)));
+}
+
+TEST_CASE("rmsnorm matches the closed form", "[ops]") {
+    const float x[] = {3.0f, 4.0f};
+    const float w[] = {1.0f, 2.0f};
+    float out[2];
+    rmsnorm(x, w, 0.0f, out);
+    const float scale = 1.0f / std::sqrt((9.0f + 16.0f) / 2.0f);
+    REQUIRE(out[0] == Approx(3.0f * scale));
+    REQUIRE(out[1] == Approx(4.0f * 2.0f * scale));
+}
+
+TEST_CASE("softmax normalizes and orders", "[ops]") {
+    float x[] = {0.0f, std::log(3.0f)};
+    softmax_inplace(x);
+    REQUIRE(x[0] == Approx(0.25f));
+    REQUIRE(x[1] == Approx(0.75f));
+}
+
+TEST_CASE("silu_mul limits", "[ops]") {
+    const float gate[] = {0.0f, 100.0f, -100.0f};
+    const float up[] = {5.0f, 2.0f, 3.0f};
+    float out[3];
+    silu_mul(gate, up, out);
+    REQUIRE(out[0] == 0.0f);            // silu(0) = 0
+    REQUIRE(out[1] == Approx(200.0f));  // silu(x) -> x for big x
+    REQUIRE(out[2] == Approx(0.0f).margin(1e-6));
+}
+
+TEST_CASE("rope is identity at pos 0 and norm-preserving", "[ops]") {
+    std::vector<float> x = {1.0f, 2.0f, 3.0f, 4.0f};
+    auto orig = x;
+    rope_norm(x, 1, 4, 0, 10000.0f);
+    REQUIRE(x == orig);
+
+    rope_norm(x, 2, 2, 17, 10000.0f);  // two heads of dim 2
+    float n0 = 0, n1 = 0;
+    for (int i = 0; i < 4; ++i) {
+        n0 += orig[i] * orig[i];
+        n1 += x[i] * x[i];
+    }
+    REQUIRE(n1 == Approx(n0));
+    REQUIRE(x[0] != orig[0]);  // actually rotated
+}
+
+TEST_CASE("matvec f32 and f16 agree", "[ops]") {
+    const std::vector<float> wf = {1, 2, 3, 4, 5, 6};  // 2x3
+    std::vector<std::uint16_t> wh(6);
+    for (int i = 0; i < 6; ++i) {
+        wh[i] = f32_to_f16(wf[i]);
+    }
+    const float x[] = {1.0f, -1.0f, 2.0f};
+    float out[2];
+
+    Mat m32{TensorType::kF32,
+            reinterpret_cast<const std::byte*>(wf.data()), 2, 3};
+    matvec(m32, x, out);
+    REQUIRE(out[0] == Approx(1 - 2 + 6));
+    REQUIRE(out[1] == Approx(4 - 5 + 12));
+
+    Mat m16{TensorType::kF16,
+            reinterpret_cast<const std::byte*>(wh.data()), 2, 3};
+    matvec(m16, x, out);
+    REQUIRE(out[0] == Approx(5.0f));
+    REQUIRE(out[1] == Approx(11.0f));
+}
+
+namespace {
+
+/** Builds one Q8_0 row (single block) with scale d and quants q. */
+std::vector<std::byte> q8_0_row(float d,
+                                const std::vector<int>& q) {
+    std::vector<std::byte> row(34);
+    std::uint16_t h = f32_to_f16(d);
+    std::memcpy(row.data(), &h, 2);
+    for (int i = 0; i < 32; ++i) {
+        row[static_cast<std::size_t>(2 + i)] =
+            static_cast<std::byte>(static_cast<std::int8_t>(q[
+                static_cast<std::size_t>(i)]));
+    }
+    return row;
+}
+
+}  // namespace
+
+TEST_CASE("matvec q8_0 dequantizes correctly", "[ops]") {
+    std::vector<int> q(32, 0);
+    q[0] = 4;
+    q[31] = -2;
+    auto row = q8_0_row(0.5f, q);
+
+    std::vector<float> x(32, 1.0f);
+    float out[1];
+    Mat m{TensorType::kQ8_0, row.data(), 1, 32};
+    matvec(m, x, out);
+    REQUIRE(out[0] == Approx(0.5f * (4 - 2)));
+
+    std::vector<float> dq(32);
+    dequant_row(m, 0, dq);
+    REQUIRE(dq[0] == Approx(2.0f));
+    REQUIRE(dq[31] == Approx(-1.0f));
+    REQUIRE(dq[15] == 0.0f);
+}
+
+TEST_CASE("matvec q4_0 dequantizes correctly", "[ops]") {
+    // One block: scale 2.0, all nibbles 8 (-> value 0) except
+    // byte 0 = 0x9A: low nibble 10 (elem 0 -> +2), high nibble 9
+    // (elem 16 -> +1).
+    std::vector<std::byte> row(18, std::byte{0x88});
+    std::uint16_t h = f32_to_f16(2.0f);
+    std::memcpy(row.data(), &h, 2);
+    row[2] = std::byte{0x9A};
+
+    std::vector<float> x(32, 1.0f);
+    float out[1];
+    Mat m{TensorType::kQ4_0, row.data(), 1, 32};
+    matvec(m, x, out);
+    REQUIRE(out[0] == Approx(2.0f * ((10 - 8) + (9 - 8))));
+
+    std::vector<float> dq(32);
+    dequant_row(m, 0, dq);
+    REQUIRE(dq[0] == Approx(4.0f));
+    REQUIRE(dq[16] == Approx(2.0f));
+    REQUIRE(dq[1] == 0.0f);
+}
+
+TEST_CASE("matvec rejects unsupported weight types", "[ops]") {
+    Mat m{TensorType::kQ4_K, nullptr, 1, 256};
+    std::vector<float> x(256, 0.0f);
+    float out[1];
+    REQUIRE_THROWS_AS(matvec(m, x, out), cppllm::gguf::Error);
+}
