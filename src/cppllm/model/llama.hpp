@@ -6,6 +6,7 @@
 
 #include "cppllm/backend/cpu_ops.hpp"
 #include "cppllm/gguf/gguf.hpp"
+#include "cppllm/kv/paged_cache.hpp"
 #include "cppllm/tok/tokenizer.hpp"
 
 namespace cppllm::model {
@@ -26,10 +27,10 @@ struct Hparams {
 };
 
 /**
- * Single-sequence Llama-family runtime over the scalar CPU backend
- * (DESIGN.md milestone M2). Weights stay in the GGUF mapping; the
- * GgufFile must outlive the model. M3 replaces State's contiguous
- * KV vectors with the paged cache.
+ * Llama-family runtime over the scalar CPU backend, reading and
+ * writing KV state through the paged cache so any number of
+ * sequences can interleave (DESIGN.md M2/M3). Weights stay in the
+ * GGUF mapping; the GgufFile must outlive the model.
  */
 class LlamaModel {
   public:
@@ -43,28 +44,33 @@ class LlamaModel {
 
     const Hparams& hparams() const { return hp_; }
 
-    /** Per-sequence KV cache and scratch buffers. */
-    struct State {
-        /** Per layer: n_ctx * n_kv_heads * head_dim floats. */
-        std::vector<std::vector<float>> k, v;
-        /** Tokens already in the cache. */
-        std::uint32_t n = 0;
-        /** Scratch (sized by make_state). */
+    /** Reusable per-thread scratch buffers (no sequence state). */
+    struct Workspace {
         std::vector<float> x, xb, xb2, q, att, gate, up, out;
     };
 
-    /** @returns A fresh State sized for this model. */
-    State make_state() const;
+    /** @returns A workspace sized for this model. */
+    Workspace make_workspace() const;
 
     /**
-     * Runs one token through the model, appending to the cache.
+     * @param n_blocks Pool size in blocks; 0 sizes the pool for
+     *     one full context window.
+     * @returns A paged cache with this model's geometry.
+     */
+    kv::PagedKvCache make_cache(std::uint32_t n_blocks = 0) const;
+
+    /**
+     * Runs one token at position seq.n_tokens, appending K/V to
+     * seq and advancing it.
      *
      * @param token In-vocab token id.
-     * @param st State whose st.n equals this token's position.
+     * @param cache Cache the sequence lives in; capacity for one
+     *     more position must already be ensured.
      * @param logits Out; n_vocab floats.
-     * @throws std::invalid_argument on position/context misuse.
+     * @throws std::invalid_argument on vocab/context misuse.
      */
-    void forward(tok::TokenId token, State& st,
+    void forward(tok::TokenId token, kv::PagedKvCache& cache,
+                 kv::PagedKvCache::Seq& seq, Workspace& ws,
                  std::span<float> logits) const;
 
   private:

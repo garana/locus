@@ -134,28 +134,36 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
     return m;
 }
 
-LlamaModel::State LlamaModel::make_state() const {
-    State st;
-    const std::size_t kv_dim =
-        static_cast<std::size_t>(hp_.n_kv_heads) * hp_.head_dim;
-    st.k.resize(hp_.n_layers);
-    st.v.resize(hp_.n_layers);
-    for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
-        st.k[l].resize(hp_.n_ctx * kv_dim);
-        st.v[l].resize(hp_.n_ctx * kv_dim);
-    }
-    st.x.resize(hp_.n_embd);
-    st.xb.resize(hp_.n_embd);
-    st.xb2.resize(hp_.n_embd);
-    st.q.resize(hp_.n_embd);
-    st.att.resize(hp_.n_ctx);
-    st.gate.resize(hp_.n_ff);
-    st.up.resize(hp_.n_ff);
-    st.out.resize(hp_.n_embd);
-    return st;
+LlamaModel::Workspace LlamaModel::make_workspace() const {
+    Workspace ws;
+    ws.x.resize(hp_.n_embd);
+    ws.xb.resize(hp_.n_embd);
+    ws.xb2.resize(hp_.n_embd);
+    ws.q.resize(hp_.n_embd);
+    ws.att.resize(hp_.n_ctx);
+    ws.gate.resize(hp_.n_ff);
+    ws.up.resize(hp_.n_ff);
+    ws.out.resize(hp_.n_embd);
+    return ws;
 }
 
-void LlamaModel::forward(tok::TokenId token, State& st,
+kv::PagedKvCache LlamaModel::make_cache(
+    std::uint32_t n_blocks) const {
+    kv::PagedKvCache::Geometry geom;
+    geom.n_layers = hp_.n_layers;
+    geom.kv_dim = hp_.n_kv_heads * hp_.head_dim;
+    geom.block_tokens = 16;
+    geom.n_blocks =
+        n_blocks != 0
+            ? n_blocks
+            : (hp_.n_ctx + geom.block_tokens - 1) /
+                  geom.block_tokens;
+    return kv::PagedKvCache(geom);
+}
+
+void LlamaModel::forward(tok::TokenId token,
+                         kv::PagedKvCache& cache,
+                         kv::PagedKvCache::Seq& seq, Workspace& ws,
                          std::span<float> logits) const {
     using namespace cppllm::backend;
 
@@ -163,40 +171,43 @@ void LlamaModel::forward(tok::TokenId token, State& st,
         static_cast<std::uint32_t>(token) >= hp_.n_vocab) {
         throw std::invalid_argument("token id out of vocab");
     }
-    if (st.n >= hp_.n_ctx) {
+    if (seq.n_tokens >= hp_.n_ctx) {
         throw std::invalid_argument("context window exhausted");
     }
-    const std::uint32_t pos = st.n;
+    if (seq.n_tokens >= cache.capacity(seq)) {
+        throw std::invalid_argument("seq capacity not ensured");
+    }
+    const std::uint32_t pos = seq.n_tokens;
     const std::uint32_t hd = hp_.head_dim;
     const std::size_t kv_dim =
         static_cast<std::size_t>(hp_.n_kv_heads) * hd;
     const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
 
-    dequant_row(embd_, static_cast<std::uint32_t>(token), st.x);
+    dequant_row(embd_, static_cast<std::uint32_t>(token), ws.x);
 
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
 
         // Attention block.
-        rmsnorm(st.x, lay.attn_norm, hp_.rms_eps, st.xb);
-        float* krow = st.k[l].data() + pos * kv_dim;
-        float* vrow = st.v[l].data() + pos * kv_dim;
-        matvec(lay.wq, st.xb, st.q);
-        matvec(lay.wk, st.xb, {krow, kv_dim});
-        matvec(lay.wv, st.xb, {vrow, kv_dim});
-        rope_norm(st.q, hp_.n_heads, hd, pos, hp_.rope_freq_base);
+        rmsnorm(ws.x, lay.attn_norm, hp_.rms_eps, ws.xb);
+        float* krow = cache.k(seq, l, pos);
+        float* vrow = cache.v(seq, l, pos);
+        matvec(lay.wq, ws.xb, ws.q);
+        matvec(lay.wk, ws.xb, {krow, kv_dim});
+        matvec(lay.wv, ws.xb, {vrow, kv_dim});
+        rope_norm(ws.q, hp_.n_heads, hd, pos, hp_.rope_freq_base);
         rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd, pos,
                   hp_.rope_freq_base);
 
         const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
         for (std::uint32_t h = 0; h < hp_.n_heads; ++h) {
-            const float* qh = st.q.data() +
+            const float* qh = ws.q.data() +
                               static_cast<std::size_t>(h) * hd;
             const std::size_t kvh =
                 static_cast<std::size_t>(h / group) * hd;
-            std::span<float> att(st.att.data(), pos + 1);
+            std::span<float> att(ws.att.data(), pos + 1);
             for (std::uint32_t t = 0; t <= pos; ++t) {
-                const float* kt = st.k[l].data() + t * kv_dim + kvh;
+                const float* kt = cache.k(seq, l, t) + kvh;
                 float s = 0.0f;
                 for (std::uint32_t i = 0; i < hd; ++i) {
                     s += qh[i] * kt[i];
@@ -204,38 +215,38 @@ void LlamaModel::forward(tok::TokenId token, State& st,
                 att[t] = s * scale;
             }
             softmax_inplace(att);
-            float* oh = st.out.data() +
+            float* oh = ws.out.data() +
                         static_cast<std::size_t>(h) * hd;
             for (std::uint32_t i = 0; i < hd; ++i) {
                 oh[i] = 0.0f;
             }
             for (std::uint32_t t = 0; t <= pos; ++t) {
-                const float* vt = st.v[l].data() + t * kv_dim + kvh;
+                const float* vt = cache.v(seq, l, t) + kvh;
                 const float a = att[t];
                 for (std::uint32_t i = 0; i < hd; ++i) {
                     oh[i] += a * vt[i];
                 }
             }
         }
-        matvec(lay.wo, st.out, st.xb2);
+        matvec(lay.wo, ws.out, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
-            st.x[i] += st.xb2[i];
+            ws.x[i] += ws.xb2[i];
         }
 
         // Feed-forward block (SwiGLU).
-        rmsnorm(st.x, lay.ffn_norm, hp_.rms_eps, st.xb);
-        matvec(lay.w_gate, st.xb, st.gate);
-        matvec(lay.w_up, st.xb, st.up);
-        silu_mul(st.gate, st.up, st.gate);
-        matvec(lay.w_down, st.gate, st.xb2);
+        rmsnorm(ws.x, lay.ffn_norm, hp_.rms_eps, ws.xb);
+        matvec(lay.w_gate, ws.xb, ws.gate);
+        matvec(lay.w_up, ws.xb, ws.up);
+        silu_mul(ws.gate, ws.up, ws.gate);
+        matvec(lay.w_down, ws.gate, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
-            st.x[i] += st.xb2[i];
+            ws.x[i] += ws.xb2[i];
         }
     }
 
-    rmsnorm(st.x, out_norm_, hp_.rms_eps, st.xb);
-    matvec(out_w_, st.xb, logits);
-    st.n = pos + 1;
+    rmsnorm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
+    matvec(out_w_, ws.xb, logits);
+    seq.n_tokens = pos + 1;
 }
 
 tok::TokenId argmax(std::span<const float> logits) {

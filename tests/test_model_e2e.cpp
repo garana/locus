@@ -75,11 +75,14 @@ TEST_CASE("greedy decode matches the llama.cpp golden output",
     auto model = cppllm::model::LlamaModel::load(g);
     auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
 
-    auto st = model.make_state();
+    auto cache = model.make_cache();
+    auto ws = model.make_workspace();
+    cppllm::kv::PagedKvCache::Seq seq;
     std::vector<float> logits(model.hparams().n_vocab);
     auto ids = tok.encode("Once upon a time", true);
     for (auto id : ids) {
-        model.forward(id, st, logits);
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(id, cache, seq, ws, logits);
     }
     for (int i = 0; i < 40; ++i) {
         auto next = cppllm::model::argmax(logits);
@@ -87,7 +90,10 @@ TEST_CASE("greedy decode matches the llama.cpp golden output",
             break;
         }
         ids.push_back(next);
-        model.forward(next, st, logits);
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(next, cache, seq, ws, logits);
     }
+    cache.release(seq);
+    REQUIRE(cache.free_blocks() == cache.total_blocks());
     REQUIRE(trim(tok.decode(ids)) == golden);
 }

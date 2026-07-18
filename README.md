@@ -18,7 +18,7 @@ milestone plan.
 |-----------|-----------------------------------------|-------------|
 | M0        | Scaffolding, CMake, Catch2, allocator   | done        |
 | M1        | GGUF loader + tokenizer                 | done        |
-| M2        | CPU forward pass, single sequence       | not started |
+| M2        | CPU forward pass, single sequence       | done        |
 | M3        | Paged KV + continuous batching          | not started |
 | M4        | HTTP server (OpenAI API, SSE)           | not started |
 | M5        | Vulkan backend                          | not started |

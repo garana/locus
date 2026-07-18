@@ -12,7 +12,9 @@ add_executable(cppllm_tests
     test_block_allocator.cpp
     test_features.cpp
     test_cpu_ops.cpp
+    test_engine.cpp
     test_gguf.cpp
+    test_paged_cache.cpp
     test_tokenizer.cpp
     test_model_e2e.cpp
 )

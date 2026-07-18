@@ -10,8 +10,10 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_library(cppllm
     src/cppllm/backend/cpu_ops.cpp
+    src/cppllm/engine/engine.cpp
     src/cppllm/gguf/gguf.cpp
     src/cppllm/kv/block_allocator.cpp
+    src/cppllm/kv/paged_cache.cpp
     src/cppllm/sys/features.cpp
     src/cppllm/model/llama.cpp
     src/cppllm/sys/mmap_file.cpp

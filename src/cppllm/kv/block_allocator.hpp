@@ -9,6 +9,9 @@ namespace cppllm::kv {
 /** Identifier of a KV-cache block inside a BlockAllocator pool. */
 using BlockId = std::uint32_t;
 
+/** Sentinel for "no block". */
+inline constexpr BlockId kInvalidBlock = 0xffffffffu;
+
 /**
  * Ref-counted allocator for a fixed pool of KV-cache blocks.
  *

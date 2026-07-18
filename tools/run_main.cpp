@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "cppllm/engine/engine.hpp"
 #include "cppllm/gguf/gguf.hpp"
 #include "cppllm/model/llama.hpp"
 #include "cppllm/sys/features.hpp"
@@ -35,27 +36,20 @@ int main(int argc, char** argv) {
                      hp.n_layers, hp.n_embd, hp.n_heads,
                      hp.n_kv_heads, hp.n_vocab);
 
-        auto st = model.make_state();
-        std::vector<float> logits(hp.n_vocab);
-
         auto ids = tok.encode(prompt, true);
-        for (auto id : ids) {
-            model.forward(id, st, logits);
-        }
         std::printf("%s", tok.decode(ids).c_str());
 
-        std::vector<cppllm::tok::TokenId> generated;
-        for (int i = 0; i < n_gen; ++i) {
-            auto next = cppllm::model::argmax(logits);
-            if (next == tok.eos_id()) {
-                break;
+        cppllm::engine::Engine engine(model, tok.eos_id());
+        engine.on_token = [&](const cppllm::engine::Request&,
+                              cppllm::tok::TokenId t) {
+            if (t != tok.eos_id()) {
+                std::printf("%s", tok.decode({&t, 1}).c_str());
+                std::fflush(stdout);
             }
-            generated.push_back(next);
-            std::printf("%s",
-                        tok.decode({&next, 1}).c_str());
-            std::fflush(stdout);
-            model.forward(next, st, logits);
-        }
+        };
+        engine.submit(ids,
+                      static_cast<std::uint32_t>(n_gen));
+        engine.run_to_completion();
         std::printf("\n");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
