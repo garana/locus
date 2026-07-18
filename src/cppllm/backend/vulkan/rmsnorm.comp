@@ -1,0 +1,27 @@
+#version 450
+
+// RMS norm: out = x * weight / sqrt(mean(x^2) + eps).
+// Single invocation; n is small (n_embd) and this keeps the
+// reduction trivially correct.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    float eps;
+} pc;
+
+void main() {
+    float ss = 0.0;
+    for (uint i = 0; i < pc.n; ++i) {
+        ss += x[i] * x[i];
+    }
+    float scale = inversesqrt(ss / float(pc.n) + pc.eps);
+    for (uint i = 0; i < pc.n; ++i) {
+        o[i] = x[i] * scale * w[i];
+    }
+}

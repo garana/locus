@@ -3,6 +3,8 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "cppllm/backend/registry.hpp"
+#include "cppllm/backend/variants.hpp"
 #include "cppllm/engine/engine.hpp"
 #include "cppllm/gguf/gguf.hpp"
 #include "cppllm/model/llama.hpp"
@@ -105,6 +107,38 @@ TEST_CASE("preemption recomputes and still matches",
     Engine engine(model, tok.eos_id(), cfg);
     auto id0 = engine.submit(p0, 24);
     auto id1 = engine.submit(p1, 24);
+    engine.run_to_completion();
+
+    REQUIRE(engine.get(id0)->status == Status::kDone);
+    REQUIRE(engine.get(id1)->status == Status::kDone);
+    REQUIRE(engine.get(id0)->generated == want0);
+    REQUIRE(engine.get(id1)->generated == want1);
+    REQUIRE(engine.free_blocks() == engine.total_blocks());
+}
+
+TEST_CASE("engine on the vulkan backend matches CPU output",
+          "[engine][e2e][vulkan]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    if (!cppllm::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    auto g = cppllm::gguf::GgufFile::open(model_path());
+    auto model = cppllm::model::LlamaModel::load(g);
+    auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
+
+    auto p0 = tok.encode("Once upon a time", true);
+    auto p1 = tok.encode("The little dog", true);
+    // References on the default (CPU) backend.
+    auto want0 = reference_generate(model, tok, p0, 20);
+    auto want1 = reference_generate(model, tok, p1, 20);
+
+    model.use_backend(
+        *cppllm::backend::find_backend("vulkan"));
+    Engine engine(model, tok.eos_id());
+    auto id0 = engine.submit(p0, 20);
+    auto id1 = engine.submit(p1, 20);
     engine.run_to_completion();
 
     REQUIRE(engine.get(id0)->status == Status::kDone);

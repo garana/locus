@@ -21,7 +21,7 @@ milestone plan.
 | M2        | CPU forward pass, single sequence       | done        |
 | M3        | Paged KV + continuous batching          | done        |
 | M4        | HTTP server (OpenAI API, SSE)           | done        |
-| M5        | Vulkan backend                          | hybrid done |
+| M5        | Vulkan backend                          | done        |
 
 ## Building
 
@@ -44,14 +44,17 @@ runtime dispatch). Inspect and override:
     CPPLLM_BACKEND=neon cppllm-server model.gguf 8080
 
 Current entries: neon (arm64), scalar (reference), and vulkan --
-a hybrid that runs F32 matmuls on the GPU (weights resident,
-uploaded once) with attention/norms on CPU. Every selectable
-backend must reproduce the llama.cpp golden output token-exact
-(tested). Vulkan is correctness-complete but slower than CPU on
-tiny models (synchronous dispatch overhead); batched submission,
-GPU attention, and quantized kernels are the remaining M5 work.
-x86 sse4/avx2/avx512 and CUDA slot into
-src/cppllm/backend/registry.cpp when their kernels land.
+a full GPU forward pass: F32/Q8_0 matmul shaders (weights
+resident, uploaded once), rmsnorm, RoPE, SwiGLU, and paged
+attention reading K/V from a GPU-mapped cache pool, all recorded
+as one command batch per token. Every selectable backend must
+reproduce the llama.cpp golden output token-exact (tested, single
+and concurrent streams). At real-model sizes the GPU wins (2048^2
+f32 matvec: ~750us vs ~3550us scalar CPU, Apple M-series via
+MoltenVK); on the tiny 260K test model dispatch overhead keeps
+CPU ahead. F16/Q4_0 GPU shaders, x86 sse4/avx2/avx512, and CUDA
+slot into src/cppllm/backend/registry.cpp when their kernels
+land.
 
 ## Dependencies
 

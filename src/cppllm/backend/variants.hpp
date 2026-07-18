@@ -26,4 +26,7 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
 /** @returns true when a usable Vulkan device + kernels exist. */
 bool vulkan_backend_usable();
 
+/** KV-pool allocator returning a GPU-mapped pointer (Ops hook). */
+float* vulkan_alloc_kv(std::size_t n_floats);
+
 }  // namespace cppllm::backend

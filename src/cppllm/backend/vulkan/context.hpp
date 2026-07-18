@@ -6,19 +6,33 @@
 
 namespace cppllm::backend::vk {
 
+/** Compute kernels compiled into the binary as SPIR-V. */
+enum class Kernel {
+    kMatvecF32,
+    kMatvecQ8_0,
+    kRmsNorm,
+    kRope,
+    kSiluMul,
+    kAttnPaged,
+    kCount_,
+};
+
 /**
- * Minimal synchronous Vulkan compute context: one device, one
- * compute queue, pipelines built from SPIR-V embedded at compile
- * time (glslangValidator --vn, per the ../pbw pattern).
+ * Synchronous Vulkan compute context: one device, one compute
+ * queue, one pipeline per Kernel, SPIR-V embedded at compile time
+ * (glslangValidator --vn, per the ../pbw pattern).
  *
- * This is the M5 foundation: correctness-first, host-visible
- * buffers and a wait-idle per dispatch. Persistent device-local
- * weight buffers and batched command recording come with the full
- * GPU forward pass.
+ * Work is recorded in batches: begin_batch(), any number of
+ * dispatch() calls (a memory barrier separates consecutive
+ * dispatches), end_batch() submits once and waits. The full GPU
+ * forward records one batch per token, which is what makes the
+ * backend usable -- a submit per op was ~20x slower.
  *
- * Only available when the build found the Vulkan SDK and shader
- * compiler (CPPLLM_HAS_VULKAN_KERNELS); otherwise construction
- * throws std::runtime_error.
+ * Buffers are host-visible and coherent; on Apple unified memory
+ * that is also the device-fast path. Only available when the
+ * build found the Vulkan SDK and a shader compiler
+ * (CPPLLM_HAS_VULKAN_KERNELS); otherwise construction throws
+ * std::runtime_error.
  */
 class VulkanContext {
   public:
@@ -47,10 +61,30 @@ class VulkanContext {
     void write_buffer(Buffer b, std::span<const std::byte> data);
     void read_buffer(Buffer b, std::span<std::byte> out);
 
+    /** @returns The host mapping of b (coherent; UMA-fast). */
+    void* mapped(Buffer b);
+
+    /** Opens a command batch; dispatches record until end_batch. */
+    void begin_batch();
+
+    /**
+     * Records one compute dispatch into the open batch.
+     *
+     * @param k Kernel to run; buffer count must match its layout.
+     * @param push Raw push constants (floats bit-cast to uint32).
+     * @param groups_x X workgroup count.
+     */
+    void dispatch(Kernel k, std::span<const Buffer> buffers,
+                  std::span<const std::uint32_t> push,
+                  std::uint32_t groups_x);
+
+    /** Submits the batch and waits for completion. */
+    void end_batch();
+
     /**
      * GPU f32 matvec over resident buffers:
-     * out[r] = dot(w row r, x). Synchronous (waits for the
-     * dispatch); persistent weights avoid per-call uploads.
+     * out[r] = dot(w row r, x). One-dispatch batch (synchronous);
+     * persistent weights avoid per-call uploads.
      */
     void matvec_f32(Buffer w, std::uint32_t rows,
                     std::uint32_t cols, Buffer x, Buffer out);

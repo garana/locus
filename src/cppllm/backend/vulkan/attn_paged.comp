@@ -1,0 +1,70 @@
+#version 450
+
+// Paged causal attention for one token, one layer: each
+// invocation handles one query head, reading K/V straight from
+// the paged pool through the sequence's block table (DESIGN.md
+// 4.1/4.3). Two passes with an ATT scratch row per head: scores +
+// max, then softmax-weighted V accumulation.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, binding = 1) readonly buffer POOL { float pool[]; };
+layout(std430, binding = 2) readonly buffer TABLE { uint table[]; };
+layout(std430, binding = 3) buffer ATT { float att[]; };
+layout(std430, binding = 4) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint n_heads;
+    uint group;         // n_heads / n_kv_heads
+    uint head_dim;
+    uint kv_dim;        // n_kv_heads * head_dim
+    uint n_pos;         // positions to attend over (pos + 1)
+    uint block_tokens;
+    uint block_stride;  // floats per block
+    uint layer_offset;  // floats: layer * layer_stride
+    uint v_offset;      // floats: K row -> V row delta
+} pc;
+
+uint kv_base(uint t) {
+    uint blk = table[t / pc.block_tokens];
+    return blk * pc.block_stride + pc.layer_offset +
+           (t % pc.block_tokens) * pc.kv_dim;
+}
+
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= pc.n_heads) {
+        return;
+    }
+    uint qh = h * pc.head_dim;
+    uint kvh = (h / pc.group) * pc.head_dim;
+    uint arow = h * pc.n_pos;
+    float scale = inversesqrt(float(pc.head_dim));
+
+    float mx = -3.4e38;
+    for (uint t = 0; t < pc.n_pos; ++t) {
+        uint kb = kv_base(t) + kvh;
+        float s = 0.0;
+        for (uint i = 0; i < pc.head_dim; ++i) {
+            s += q[qh + i] * pool[kb + i];
+        }
+        s *= scale;
+        att[arow + t] = s;
+        mx = max(mx, s);
+    }
+    float sum = 0.0;
+    for (uint t = 0; t < pc.n_pos; ++t) {
+        float e = exp(att[arow + t] - mx);
+        att[arow + t] = e;
+        sum += e;
+    }
+    for (uint i = 0; i < pc.head_dim; ++i) {
+        float acc = 0.0;
+        for (uint t = 0; t < pc.n_pos; ++t) {
+            uint vb = kv_base(t) + pc.v_offset + kvh;
+            acc += att[arow + t] * pool[vb + i];
+        }
+        o[qh + i] = acc / sum;
+    }
+}

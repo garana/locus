@@ -20,16 +20,19 @@ const std::vector<Backend>& list() {
         b.push_back({"neon",
                      "ARM NEON vectorized matvec (F32/Q8_0)",
                      f.neon, true,
-                     {&matvec_neon, &dequant_row}});
+                     {&matvec_neon, &dequant_row, nullptr}});
 #endif
         b.push_back({"scalar", "portable reference (all types)",
-                     true, true, {&matvec, &dequant_row}});
+                     true, true,
+                     {&matvec, &dequant_row, nullptr}});
         const bool vk = f.vulkan && vulkan_backend_usable();
         b.push_back({"vulkan",
-                     "GPU F32 matmuls via Vulkan, CPU attention "
-                     "(hybrid; quantized types fall back to CPU)",
+                     "GPU forward pass via Vulkan (F32/Q8_0 "
+                     "weights, paged attention on GPU; other "
+                     "types fall back to CPU)",
                      vk, vk,
-                     {&matvec_vulkan, &dequant_row}});
+                     {&matvec_vulkan, &dequant_row,
+                      &vulkan_alloc_kv}});
         return b;
     }();
     return v;

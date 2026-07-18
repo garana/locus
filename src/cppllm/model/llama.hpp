@@ -73,7 +73,9 @@ class LlamaModel {
 
     /**
      * Runs one token at position seq.n_tokens, appending K/V to
-     * seq and advancing it.
+     * seq and advancing it. Routed to the GPU when the active
+     * backend provides a full forward (vulkan); CPU ops
+     * otherwise.
      *
      * @param token In-vocab token id.
      * @param cache Cache the sequence lives in; capacity for one
@@ -85,12 +87,20 @@ class LlamaModel {
                  kv::PagedKvCache::Seq& seq, Workspace& ws,
                  std::span<float> logits) const;
 
-  private:
+    /** Per-layer weights (read by GPU backends; else internal). */
     struct Layer {
         std::span<const float> attn_norm, ffn_norm;
         backend::Mat wq, wk, wv, wo, w_gate, w_up, w_down;
     };
 
+    const std::vector<Layer>& layers() const { return layers_; }
+    const backend::Mat& embedding() const { return embd_; }
+    const backend::Mat& output_weight() const { return out_w_; }
+    std::span<const float> output_norm() const {
+        return out_norm_;
+    }
+
+  private:
     Hparams hp_;
     const backend::Backend* backend_ = nullptr;
     backend::Mat embd_;

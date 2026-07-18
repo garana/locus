@@ -18,6 +18,14 @@ PagedKvCache::PagedKvCache(const Geometry& geom)
         throw std::invalid_argument("empty cache geometry");
     }
     pool_.resize(block_stride_ * geom.n_blocks);
+    pool_ptr_ = pool_.data();
+}
+
+PagedKvCache::PagedKvCache(const Geometry& geom, float* storage)
+    : PagedKvCache(geom) {
+    pool_.clear();
+    pool_.shrink_to_fit();
+    pool_ptr_ = storage;
 }
 
 bool PagedKvCache::ensure_capacity(Seq& seq, std::uint32_t n_more) {
@@ -60,8 +68,8 @@ bool PagedKvCache::fork(const Seq& parent, Seq& child) {
             return false;
         }
         copy_id = *id;
-        std::memcpy(pool_.data() + *id * block_stride_,
-                    pool_.data() +
+        std::memcpy(pool_ptr_ + *id * block_stride_,
+                    pool_ptr_ +
                         parent.blocks[full] * block_stride_,
                     block_stride_ * sizeof(float));
     }
@@ -92,7 +100,7 @@ float* PagedKvCache::row(const Seq& seq, std::uint32_t layer,
     assert(pos < capacity(seq));
     const std::size_t b = pos / geom_.block_tokens;
     const std::size_t in_block = pos % geom_.block_tokens;
-    return pool_.data() + seq.blocks[b] * block_stride_ +
+    return pool_ptr_ + seq.blocks[b] * block_stride_ +
            layer * layer_stride_ +
            (value ? layer_stride_ / 2 : 0) +
            in_block * geom_.kv_dim;

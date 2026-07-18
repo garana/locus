@@ -8,12 +8,19 @@
 namespace cppllm::backend {
 
 /** Op table a backend provides to the model runtime. Ops not in
- * the table (rmsnorm, rope, ...) are negligible and stay scalar. */
+ * the table (rmsnorm, rope, ...) are negligible on CPU backends;
+ * the vulkan backend replaces the whole forward pass instead. */
 struct Ops {
     void (*matvec)(const Mat&, std::span<const float>,
                    std::span<float>);
     void (*dequant_row)(const Mat&, std::uint32_t,
                         std::span<float>);
+    /**
+     * Optional KV-pool allocator (nullptr: heap). The vulkan
+     * backend hands out a GPU-mapped pointer so the paged cache
+     * lives in memory the attention kernel can read directly.
+     */
+    float* (*alloc_kv)(std::size_t n_floats);
 };
 
 /**

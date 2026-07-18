@@ -9,7 +9,12 @@
 #include <cstring>
 #include <vector>
 
+#include "attn_paged_spv.h"
+#include "matvec_q8_0_spv.h"
 #include "matvec_spv.h"
+#include "rmsnorm_spv.h"
+#include "rope_spv.h"
+#include "silu_mul_spv.h"
 
 namespace cppllm::backend::vk {
 
@@ -21,6 +26,28 @@ void check(VkResult r, const char* what) {
     }
 }
 
+/** Static description of each kernel's interface. */
+struct KernelDesc {
+    const std::uint32_t* spv;
+    std::size_t spv_bytes;
+    std::uint32_t n_buffers;
+    std::uint32_t push_bytes;
+};
+
+const KernelDesc& kernel_desc(Kernel k) {
+    static const KernelDesc descs[] = {
+        {cppllm_matvec_spv, sizeof(cppllm_matvec_spv), 3, 16},
+        {cppllm_matvec_q8_0_spv, sizeof(cppllm_matvec_q8_0_spv),
+         3, 16},
+        {cppllm_rmsnorm_spv, sizeof(cppllm_rmsnorm_spv), 3, 8},
+        {cppllm_rope_spv, sizeof(cppllm_rope_spv), 1, 20},
+        {cppllm_silu_mul_spv, sizeof(cppllm_silu_mul_spv), 3, 4},
+        {cppllm_attn_paged_spv, sizeof(cppllm_attn_paged_spv), 5,
+         36},
+    };
+    return descs[static_cast<int>(k)];
+}
+
 }  // namespace
 
 struct VulkanContext::Impl {
@@ -30,10 +57,17 @@ struct VulkanContext::Impl {
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t queue_family = 0;
     VkCommandPool pool = VK_NULL_HANDLE;
-    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
-    VkPipelineLayout layout = VK_NULL_HANDLE;
-    VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorPool dpool = VK_NULL_HANDLE;
+
+    struct Pipe {
+        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+    };
+    Pipe pipes[static_cast<int>(Kernel::kCount_)];
+
+    /** Open batch state (begin_batch .. end_batch). */
+    VkCommandBuffer batch_cmd = VK_NULL_HANDLE;
 
     struct HostBuffer {
         VkBuffer buf = VK_NULL_HANDLE;
@@ -115,8 +149,34 @@ struct VulkanContext::Impl {
         check(vkCreateCommandPool(device, &cpi, nullptr, &pool),
               "create command pool");
 
-        VkDescriptorSetLayoutBinding binds[3]{};
-        for (std::uint32_t i = 0; i < 3; ++i) {
+        for (int k = 0; k < static_cast<int>(Kernel::kCount_);
+             ++k) {
+            create_pipe(static_cast<Kernel>(k));
+        }
+
+        // Sized for the largest realistic per-token batch (a few
+        // hundred dispatches); reset after every end_batch().
+        VkDescriptorPoolSize dps{};
+        dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        dps.descriptorCount = 4096;
+        VkDescriptorPoolCreateInfo dpi{};
+        dpi.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpi.maxSets = 1024;
+        dpi.poolSizeCount = 1;
+        dpi.pPoolSizes = &dps;
+        check(vkCreateDescriptorPool(device, &dpi, nullptr,
+                                     &dpool),
+              "create descriptor pool");
+    }
+
+    void create_pipe(Kernel k) {
+        const KernelDesc& kd = kernel_desc(k);
+        Pipe& p = pipes[static_cast<int>(k)];
+
+        std::vector<VkDescriptorSetLayoutBinding> binds(
+            kd.n_buffers);
+        for (std::uint32_t i = 0; i < kd.n_buffers; ++i) {
             binds[i].binding = i;
             binds[i].descriptorType =
                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -126,31 +186,31 @@ struct VulkanContext::Impl {
         VkDescriptorSetLayoutCreateInfo dli{};
         dli.sType =
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dli.bindingCount = 3;
-        dli.pBindings = binds;
+        dli.bindingCount = kd.n_buffers;
+        dli.pBindings = binds.data();
         check(vkCreateDescriptorSetLayout(device, &dli, nullptr,
-                                          &dsl),
+                                          &p.dsl),
               "create dsl");
 
         VkPushConstantRange pcr{};
         pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pcr.size = 2 * sizeof(std::uint32_t);
+        pcr.size = kd.push_bytes;
         VkPipelineLayoutCreateInfo pli{};
         pli.sType =
             VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pli.setLayoutCount = 1;
-        pli.pSetLayouts = &dsl;
+        pli.pSetLayouts = &p.dsl;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pcr;
         check(vkCreatePipelineLayout(device, &pli, nullptr,
-                                     &layout),
+                                     &p.layout),
               "create pipeline layout");
 
         VkShaderModuleCreateInfo smi{};
         smi.sType =
             VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        smi.codeSize = sizeof(cppllm_matvec_spv);
-        smi.pCode = cppllm_matvec_spv;
+        smi.codeSize = kd.spv_bytes;
+        smi.pCode = kd.spv;
         VkShaderModule sm;
         check(vkCreateShaderModule(device, &smi, nullptr, &sm),
               "create shader module");
@@ -163,24 +223,12 @@ struct VulkanContext::Impl {
         cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         cpci.stage.module = sm;
         cpci.stage.pName = "main";
-        cpci.layout = layout;
+        cpci.layout = p.layout;
         check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1,
-                                       &cpci, nullptr, &pipeline),
+                                       &cpci, nullptr,
+                                       &p.pipeline),
               "create pipeline");
         vkDestroyShaderModule(device, sm, nullptr);
-
-        VkDescriptorPoolSize dps{};
-        dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        dps.descriptorCount = 3;
-        VkDescriptorPoolCreateInfo dpi{};
-        dpi.sType =
-            VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dpi.maxSets = 1;
-        dpi.poolSizeCount = 1;
-        dpi.pPoolSizes = &dps;
-        check(vkCreateDescriptorPool(device, &dpi, nullptr,
-                                     &dpool),
-              "create descriptor pool");
     }
 
     HostBuffer make_buffer(VkDeviceSize size) {
@@ -242,9 +290,13 @@ struct VulkanContext::Impl {
         if (device != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device);
             vkDestroyDescriptorPool(device, dpool, nullptr);
-            vkDestroyPipeline(device, pipeline, nullptr);
-            vkDestroyPipelineLayout(device, layout, nullptr);
-            vkDestroyDescriptorSetLayout(device, dsl, nullptr);
+            for (const Pipe& p : pipes) {
+                vkDestroyPipeline(device, p.pipeline, nullptr);
+                vkDestroyPipelineLayout(device, p.layout,
+                                        nullptr);
+                vkDestroyDescriptorSetLayout(device, p.dsl,
+                                             nullptr);
+            }
             vkDestroyCommandPool(device, pool, nullptr);
             vkDestroyDevice(device, nullptr);
         }
@@ -293,77 +345,116 @@ void VulkanContext::read_buffer(Buffer b,
     std::memcpy(out.data(), hb->map, out.size());
 }
 
-void VulkanContext::matvec_f32(Buffer w, std::uint32_t rows,
-                               std::uint32_t cols, Buffer x,
-                               Buffer out) {
+void* VulkanContext::mapped(Buffer b) {
+    return static_cast<Impl::HostBuffer*>(b.impl)->map;
+}
+
+void VulkanContext::begin_batch() {
     Impl& im = *impl_;
-    auto& wb = *static_cast<Impl::HostBuffer*>(w.impl);
-    auto& xb = *static_cast<Impl::HostBuffer*>(x.impl);
-    auto& ob = *static_cast<Impl::HostBuffer*>(out.impl);
-
-    VkDescriptorSetAllocateInfo dsa{};
-    dsa.sType =
-        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsa.descriptorPool = im.dpool;
-    dsa.descriptorSetCount = 1;
-    dsa.pSetLayouts = &im.dsl;
-    VkDescriptorSet ds;
-    check(vkAllocateDescriptorSets(im.device, &dsa, &ds),
-          "allocate descriptor set");
-
-    VkDescriptorBufferInfo infos[3] = {
-        {wb.buf, 0, VK_WHOLE_SIZE},
-        {xb.buf, 0, VK_WHOLE_SIZE},
-        {ob.buf, 0, VK_WHOLE_SIZE}};
-    VkWriteDescriptorSet writes[3]{};
-    for (std::uint32_t i = 0; i < 3; ++i) {
-        writes[i].sType =
-            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = ds;
-        writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType =
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &infos[i];
-    }
-    vkUpdateDescriptorSets(im.device, 3, writes, 0, nullptr);
-
     VkCommandBufferAllocateInfo cba{};
     cba.sType =
         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cba.commandPool = im.pool;
     cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cba.commandBufferCount = 1;
-    VkCommandBuffer cmd;
-    check(vkAllocateCommandBuffers(im.device, &cba, &cmd),
+    check(vkAllocateCommandBuffers(im.device, &cba,
+                                   &im.batch_cmd),
           "allocate command buffer");
-
     VkCommandBufferBeginInfo cbb{};
     cbb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cbb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    check(vkBeginCommandBuffer(cmd, &cbb), "begin cmd");
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      im.pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            im.layout, 0, 1, &ds, 0, nullptr);
-    const std::uint32_t pc[2] = {rows, cols};
-    vkCmdPushConstants(cmd, im.layout,
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                       sizeof(pc), pc);
-    vkCmdDispatch(cmd, (rows + 63) / 64, 1, 1);
-    check(vkEndCommandBuffer(cmd), "end cmd");
+    check(vkBeginCommandBuffer(im.batch_cmd, &cbb), "begin cmd");
+}
 
+void VulkanContext::dispatch(Kernel k,
+                             std::span<const Buffer> buffers,
+                             std::span<const std::uint32_t> push,
+                             std::uint32_t groups_x) {
+    Impl& im = *impl_;
+    const Impl::Pipe& p = im.pipes[static_cast<int>(k)];
+    const KernelDesc& kd = kernel_desc(k);
+    if (buffers.size() != kd.n_buffers ||
+        push.size() * 4 != kd.push_bytes) {
+        throw std::runtime_error("vulkan: dispatch shape");
+    }
+
+    VkDescriptorSetAllocateInfo dsa{};
+    dsa.sType =
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsa.descriptorPool = im.dpool;
+    dsa.descriptorSetCount = 1;
+    dsa.pSetLayouts = &p.dsl;
+    VkDescriptorSet ds;
+    check(vkAllocateDescriptorSets(im.device, &dsa, &ds),
+          "allocate descriptor set");
+
+    std::vector<VkDescriptorBufferInfo> infos(buffers.size());
+    std::vector<VkWriteDescriptorSet> writes(buffers.size());
+    for (std::size_t i = 0; i < buffers.size(); ++i) {
+        auto* hb =
+            static_cast<Impl::HostBuffer*>(buffers[i].impl);
+        infos[i] = {hb->buf, 0, VK_WHOLE_SIZE};
+        writes[i] = {};
+        writes[i].sType =
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = ds;
+        writes[i].dstBinding = static_cast<std::uint32_t>(i);
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType =
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &infos[i];
+    }
+    vkUpdateDescriptorSets(
+        im.device, static_cast<std::uint32_t>(writes.size()),
+        writes.data(), 0, nullptr);
+
+    vkCmdBindPipeline(im.batch_cmd,
+                      VK_PIPELINE_BIND_POINT_COMPUTE,
+                      p.pipeline);
+    vkCmdBindDescriptorSets(
+        im.batch_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout,
+        0, 1, &ds, 0, nullptr);
+    vkCmdPushConstants(im.batch_cmd, p.layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       kd.push_bytes, push.data());
+    vkCmdDispatch(im.batch_cmd, groups_x, 1, 1);
+
+    // Serialize consecutive dispatches (writes feed reads).
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(im.batch_cmd,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                         1, &mb, 0, nullptr, 0, nullptr);
+}
+
+void VulkanContext::end_batch() {
+    Impl& im = *impl_;
+    check(vkEndCommandBuffer(im.batch_cmd), "end cmd");
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
+    si.pCommandBuffers = &im.batch_cmd;
     check(vkQueueSubmit(im.queue, 1, &si, VK_NULL_HANDLE),
           "submit");
     check(vkQueueWaitIdle(im.queue), "wait idle");
-
-    vkFreeCommandBuffers(im.device, im.pool, 1, &cmd);
+    vkFreeCommandBuffers(im.device, im.pool, 1, &im.batch_cmd);
+    im.batch_cmd = VK_NULL_HANDLE;
     check(vkResetDescriptorPool(im.device, im.dpool, 0),
           "reset descriptor pool");
+}
+
+void VulkanContext::matvec_f32(Buffer w, std::uint32_t rows,
+                               std::uint32_t cols, Buffer x,
+                               Buffer out) {
+    begin_batch();
+    const Buffer bufs[] = {w, x, out};
+    const std::uint32_t push[] = {rows, cols, 0, 0};
+    dispatch(Kernel::kMatvecF32, bufs, push, (rows + 63) / 64);
+    end_batch();
 }
 
 void VulkanContext::matvec_f32(std::span<const float> w,
@@ -424,6 +515,14 @@ void VulkanContext::write_buffer(Buffer,
 void VulkanContext::read_buffer(Buffer, std::span<std::byte>) {
     no_kernels();
 }
+void* VulkanContext::mapped(Buffer) { no_kernels(); }
+void VulkanContext::begin_batch() { no_kernels(); }
+void VulkanContext::dispatch(Kernel, std::span<const Buffer>,
+                             std::span<const std::uint32_t>,
+                             std::uint32_t) {
+    no_kernels();
+}
+void VulkanContext::end_batch() { no_kernels(); }
 void VulkanContext::matvec_f32(Buffer, std::uint32_t,
                                std::uint32_t, Buffer, Buffer) {
     no_kernels();

@@ -42,6 +42,22 @@ class PagedKvCache {
     explicit PagedKvCache(const Geometry& geom);
 
     /**
+     * Uses caller-provided storage (e.g. a GPU-mapped buffer on
+     * unified memory) instead of allocating. `storage` must hold
+     * pool_floats(geom) floats and outlive the cache.
+     */
+    PagedKvCache(const Geometry& geom, float* storage);
+
+    /** @returns Floats a pool for this geometry occupies. */
+    static std::size_t pool_floats(const Geometry& geom) {
+        return static_cast<std::size_t>(geom.n_blocks) *
+               geom.n_layers * geom.block_tokens * geom.kv_dim * 2;
+    }
+
+    /** @returns The pool base address (for backend lookup). */
+    const float* pool_data() const { return pool_ptr_; }
+
+    /**
      * Ensures seq can hold n_more positions past seq.n_tokens,
      * allocating blocks as needed. All-or-nothing: on false the
      * seq is unchanged (caller queues or preempts).
@@ -93,7 +109,10 @@ class PagedKvCache {
     std::size_t layer_stride_;
     /** Floats per block: n_layers * layer_stride_. */
     std::size_t block_stride_;
+    /** Owned storage (empty when external). */
     std::vector<float> pool_;
+    /** Points at pool_.data() or the external storage. */
+    float* pool_ptr_ = nullptr;
 };
 
 }  // namespace cppllm::kv

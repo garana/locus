@@ -146,6 +146,12 @@ until chat templates land (post-MVP).
 | M4        | HTTP server, SSE streaming                   | OpenAI client works against it              |
 | M5        | Vulkan backend with paged attention          | M2/M3 tests pass on GPU, faster than CPU    |
 
+M5 exit status (2026-07-18): golden and engine tests pass on the
+vulkan backend (full GPU forward incl. paged attention over the
+GPU-mapped pool); "faster than CPU" holds at real-model matrix
+sizes (2048^2 matvec ~4.7x vs scalar), while the 260K test model
+stays CPU-bound by per-token dispatch overhead.
+
 ## 6. Dependency policy
 
 - Runtime deps: libc, libc++, OS APIs. Nothing else by default.

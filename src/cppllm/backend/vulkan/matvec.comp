@@ -8,11 +8,13 @@ layout(local_size_x = 64) in;
 
 layout(std430, binding = 0) readonly buffer W { float w[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
-layout(std430, binding = 2) writeonly buffer O { float o[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
 
 layout(push_constant) uniform PC {
     uint rows;
     uint cols;
+    uint out_offset;  // float offset into O (e.g. a KV pool row)
+    uint accumulate;  // 1: o += result (residual connections)
 } pc;
 
 void main() {
@@ -24,5 +26,6 @@ void main() {
     for (uint i = 0; i < pc.cols; ++i) {
         acc += w[r * pc.cols + i] * x[i];
     }
-    o[r] = acc;
+    uint at = pc.out_offset + r;
+    o[at] = pc.accumulate != 0 ? o[at] + acc : acc;
 }

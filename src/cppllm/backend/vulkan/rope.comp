@@ -1,0 +1,35 @@
+#version 450
+
+// Interleaved-pair ("norm") RoPE, one invocation per head,
+// rotating in place at a float offset (Q buffer or a KV pool row).
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) buffer X { float x[]; };
+
+layout(push_constant) uniform PC {
+    uint n_heads;
+    uint head_dim;
+    uint pos;
+    uint offset;  // float offset of the first head
+    float freq_base;
+} pc;
+
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= pc.n_heads) {
+        return;
+    }
+    uint base = pc.offset + h * pc.head_dim;
+    for (uint i = 0; i + 1u < pc.head_dim; i += 2u) {
+        float theta = float(pc.pos) *
+                      pow(pc.freq_base,
+                          -float(i) / float(pc.head_dim));
+        float c = cos(theta);
+        float s = sin(theta);
+        float x0 = x[base + i];
+        float x1 = x[base + i + 1u];
+        x[base + i] = x0 * c - x1 * s;
+        x[base + i + 1u] = x0 * s + x1 * c;
+    }
+}

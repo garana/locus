@@ -4,6 +4,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "cppllm/backend/vulkan_forward.hpp"
+
 namespace cppllm::model {
 
 namespace {
@@ -159,6 +161,13 @@ kv::PagedKvCache LlamaModel::make_cache(
             ? n_blocks
             : (hp_.n_ctx + geom.block_tokens - 1) /
                   geom.block_tokens;
+    if (backend_->ops.alloc_kv != nullptr) {
+        float* storage = backend_->ops.alloc_kv(
+            kv::PagedKvCache::pool_floats(geom));
+        if (storage != nullptr) {
+            return kv::PagedKvCache(geom, storage);
+        }
+    }
     return kv::PagedKvCache(geom);
 }
 
@@ -171,6 +180,10 @@ void LlamaModel::forward(tok::TokenId token,
     if (token < 0 ||
         static_cast<std::uint32_t>(token) >= hp_.n_vocab) {
         throw std::invalid_argument("token id out of vocab");
+    }
+    if (backend_->name == "vulkan" &&
+        vulkan_forward(*this, token, cache, seq, logits)) {
+        return;
     }
     if (seq.n_tokens >= hp_.n_ctx) {
         throw std::invalid_argument("context window exhausted");
