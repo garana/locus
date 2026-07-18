@@ -24,6 +24,17 @@ inline void print_backends() {
     }
 }
 
+/** Flag lines shared by every tool's --help output. */
+inline constexpr const char* kCommonHelp =
+    "options:\n"
+    "  --backend NAME   select the math backend (see --backends)\n"
+    "  --backends       list available backends and exit\n"
+    "  -h, --help       show this help and exit\n"
+    "\n"
+    "environment:\n"
+    "  CPPLLM_BACKEND   backend to use when --backend is not\n"
+    "                   given; same names as --backends\n";
+
 /** Backend flags peeled off argv; the rest stays positional. */
 struct BackendArgs {
     std::vector<std::string> positional;
@@ -31,6 +42,8 @@ struct BackendArgs {
     std::string choice;
     /** --backends was given: list and exit. */
     bool list = false;
+    /** --help / -h was given: print usage and exit. */
+    bool help = false;
 };
 
 inline BackendArgs parse_backend_args(int argc, char** argv) {
@@ -39,6 +52,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         const std::string_view a = argv[i];
         if (a == "--backends") {
             out.list = true;
+        } else if (a == "--help" || a == "-h") {
+            out.help = true;
         } else if (a == "--backend" && i + 1 < argc) {
             out.choice = argv[++i];
         } else if (a.rfind("--backend=", 0) == 0) {

@@ -20,10 +20,19 @@ int main(int argc, char** argv) {
         cppllm_tools::print_backends();
         return 0;
     }
+    if (args.help) {
+        std::printf(
+            "usage: %s [options] <model.gguf> [port]\n\n"
+            "OpenAI-compatible inference server (default port "
+            "8080):\n  POST /v1/completions\n  POST "
+            "/v1/chat/completions\n  GET  /health\n\n%s",
+            argv[0], cppllm_tools::kCommonHelp);
+        return 0;
+    }
     if (args.positional.empty()) {
         std::fprintf(stderr,
                      "usage: %s [--backend NAME] <model.gguf> "
-                     "[port]\n       %s --backends\n",
+                     "[port]\nsee %s --help\n",
                      argv[0], argv[0]);
         return 2;
     }

@@ -21,10 +21,18 @@ int main(int argc, char** argv) {
         cppllm_tools::print_backends();
         return 0;
     }
+    if (args.help) {
+        std::printf(
+            "usage: %s [options] <model.gguf> <prompt> "
+            "[n_tokens]\n\nGreedy single-prompt generation "
+            "(default 64 tokens).\n\n%s",
+            argv[0], cppllm_tools::kCommonHelp);
+        return 0;
+    }
     if (args.positional.size() < 2) {
         std::fprintf(stderr,
                      "usage: %s [--backend NAME] <model.gguf> "
-                     "<prompt> [n_tokens]\n       %s --backends\n",
+                     "<prompt> [n_tokens]\nsee %s --help\n",
                      argv[0], argv[0]);
         return 2;
     }
