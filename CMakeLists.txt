@@ -16,12 +16,23 @@ add_library(cppllm
     src/cppllm/kv/paged_cache.cpp
     src/cppllm/sys/features.cpp
     src/cppllm/model/llama.cpp
+    src/cppllm/server/engine_loop.cpp
+    src/cppllm/server/server.cpp
     src/cppllm/sys/mmap_file.cpp
     src/cppllm/tok/tokenizer.cpp
 )
+target_include_directories(cppllm SYSTEM PRIVATE
+    third_party/httplib
+    third_party/json
+)
+find_package(Threads REQUIRED)
+target_link_libraries(cppllm PUBLIC Threads::Threads)
 
 add_executable(cppllm-run tools/run_main.cpp)
 target_link_libraries(cppllm-run PRIVATE cppllm)
+
+add_executable(cppllm-server tools/server_main.cpp)
+target_link_libraries(cppllm-server PRIVATE cppllm)
 target_include_directories(cppllm PUBLIC src)
 
 # ----------------------------------------------------------------

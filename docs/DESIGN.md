@@ -119,9 +119,13 @@ tests from day one, mmap read-only.
 ### 4.5 HTTP server
 
 OpenAI-compatible `/v1/completions` and `/v1/chat/completions`
-with SSE streaming. Single vendored, pinned, checksummed
-single-header HTTP library (cpp-httplib) -- or hand-rolled
-kqueue/epoll loop if auditing favors it. Decision deferred to M4.
+with SSE streaming, plus `/health`. Decision (M4): vendored
+cpp-httplib (MIT) for HTTP and nlohmann/json (MIT) for parsing
+untrusted request bodies -- hand-rolled JSON parsing is exactly
+where API vulnerabilities come from. A worker thread drives
+Engine::step(); handler threads submit and wait on a condition
+variable (EngineLoop). Chat messages are flattened to plain text
+until chat templates land (post-MVP).
 
 ## 5. Milestones
 
@@ -138,7 +142,9 @@ kqueue/epoll loop if auditing favors it. Decision deferred to M4.
 
 - Runtime deps: libc, libc++, OS APIs. Nothing else by default.
 - Vendored (in-tree, pinned, sha256 recorded in the commit that
-  imports them): Catch2 amalgamated (tests only), cpp-httplib (M4).
+  imports them, license files alongside): Catch2 v3.7.1 (BSL-1.0,
+  tests only), cpp-httplib v0.18.3 (MIT), nlohmann/json v3.11.3
+  (MIT).
 - No FetchContent/network at configure or build time.
 - Optional system deps behind CMake flags: BLAS/Accelerate, Vulkan.
 

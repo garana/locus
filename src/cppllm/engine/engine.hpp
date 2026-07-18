@@ -91,6 +91,11 @@ class Engine {
     /** @returns The request for id, or nullptr. */
     const Request* get(std::uint64_t id) const;
 
+    /** @returns true when nothing is waiting or running. */
+    bool idle() const {
+        return waiting_.empty() && running_.empty();
+    }
+
     /** Invoked after each newly sampled token (streaming). */
     std::function<void(const Request&, tok::TokenId)> on_token;
 

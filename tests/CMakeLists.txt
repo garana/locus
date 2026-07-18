@@ -15,10 +15,15 @@ add_executable(cppllm_tests
     test_engine.cpp
     test_gguf.cpp
     test_paged_cache.cpp
+    test_server.cpp
     test_tokenizer.cpp
     test_model_e2e.cpp
 )
 target_link_libraries(cppllm_tests PRIVATE cppllm catch2)
+target_include_directories(cppllm_tests SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/httplib
+    ${CMAKE_SOURCE_DIR}/third_party/json
+)
 target_compile_definitions(cppllm_tests PRIVATE
     CPPLLM_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
