@@ -13,9 +13,13 @@ add_library(cppllm
     src/cppllm/gguf/gguf.cpp
     src/cppllm/kv/block_allocator.cpp
     src/cppllm/sys/features.cpp
+    src/cppllm/model/llama.cpp
     src/cppllm/sys/mmap_file.cpp
     src/cppllm/tok/tokenizer.cpp
 )
+
+add_executable(cppllm-run tools/run_main.cpp)
+target_link_libraries(cppllm-run PRIVATE cppllm)
 target_include_directories(cppllm PUBLIC src)
 
 # ----------------------------------------------------------------
