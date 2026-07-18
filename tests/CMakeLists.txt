@@ -16,6 +16,7 @@ add_executable(cppllm_tests
     test_gguf.cpp
     test_paged_cache.cpp
     test_server.cpp
+    test_vulkan.cpp
     test_tokenizer.cpp
     test_model_e2e.cpp
 )

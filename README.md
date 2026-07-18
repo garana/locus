@@ -21,7 +21,7 @@ milestone plan.
 | M2        | CPU forward pass, single sequence       | done        |
 | M3        | Paged KV + continuous batching          | done        |
 | M4        | HTTP server (OpenAI API, SSE)           | done        |
-| M5        | Vulkan backend                          | not started |
+| M5        | Vulkan backend                          | in progress |
 
 ## Building
 

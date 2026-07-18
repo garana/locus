@@ -10,6 +10,7 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_library(cppllm
     src/cppllm/backend/cpu_ops.cpp
+    src/cppllm/backend/vulkan/context.cpp
     src/cppllm/engine/engine.cpp
     src/cppllm/gguf/gguf.cpp
     src/cppllm/kv/block_allocator.cpp
@@ -71,6 +72,49 @@ if(Vulkan_FOUND)
     target_compile_definitions(cppllm PRIVATE CPPLLM_HAS_VULKAN=1)
     target_link_libraries(cppllm PRIVATE Vulkan::Vulkan)
     message(STATUS "cppllm Vulkan: found (${Vulkan_LIBRARY})")
+
+    find_program(GLSLC glslc)
+    find_program(GLSLANG_VALIDATOR glslangValidator)
+    set(SHADER_SRC
+        ${CMAKE_SOURCE_DIR}/src/cppllm/backend/vulkan/matvec.comp)
+    set(SHADER_HDR ${CMAKE_BINARY_DIR}/shaders/matvec_spv.h)
+    if(GLSLANG_VALIDATOR)
+        add_custom_command(
+            OUTPUT ${SHADER_HDR}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${CMAKE_BINARY_DIR}/shaders
+            COMMAND ${GLSLANG_VALIDATOR} -V --vn cppllm_matvec_spv
+                    ${SHADER_SRC} -o ${SHADER_HDR}
+            DEPENDS ${SHADER_SRC}
+            COMMENT "Compiling matvec.comp -> SPIR-V header")
+    elseif(GLSLC)
+        # glslc has no header emitter; go via xxd-style embed.
+        add_custom_command(
+            OUTPUT ${SHADER_HDR}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${CMAKE_BINARY_DIR}/shaders
+            COMMAND ${GLSLC} --target-env=vulkan1.1 -mfmt=c
+                    ${SHADER_SRC}
+                    -o ${CMAKE_BINARY_DIR}/shaders/matvec_spv.inc
+            COMMAND ${CMAKE_COMMAND}
+                    -DIN=${CMAKE_BINARY_DIR}/shaders/matvec_spv.inc
+                    -DOUT=${SHADER_HDR}
+                    -P ${CMAKE_SOURCE_DIR}/cmake/wrap_spv.cmake
+            DEPENDS ${SHADER_SRC}
+            COMMENT "Compiling matvec.comp -> SPIR-V header")
+    endif()
+    if(GLSLANG_VALIDATOR OR GLSLC)
+        add_custom_target(cppllm_shaders DEPENDS ${SHADER_HDR})
+        add_dependencies(cppllm cppllm_shaders)
+        target_include_directories(cppllm PRIVATE
+            ${CMAKE_BINARY_DIR}/shaders)
+        target_compile_definitions(cppllm PRIVATE
+            CPPLLM_HAS_VULKAN_KERNELS=1)
+        message(STATUS "cppllm Vulkan kernels: enabled")
+    else()
+        message(STATUS
+            "cppllm Vulkan kernels: no shader compiler found")
+    endif()
 else()
     message(STATUS "cppllm Vulkan: not found, GPU backend disabled")
 endif()
