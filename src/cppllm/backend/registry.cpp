@@ -24,10 +24,12 @@ const std::vector<Backend>& list() {
 #endif
         b.push_back({"scalar", "portable reference (all types)",
                      true, true, {&matvec, &dequant_row}});
+        const bool vk = f.vulkan && vulkan_backend_usable();
         b.push_back({"vulkan",
-                     "GPU compute via Vulkan (foundation only; "
-                     "not yet selectable for inference)",
-                     f.vulkan, false, {&matvec, &dequant_row}});
+                     "GPU F32 matmuls via Vulkan, CPU attention "
+                     "(hybrid; quantized types fall back to CPU)",
+                     vk, vk,
+                     {&matvec_vulkan, &dequant_row}});
         return b;
     }();
     return v;

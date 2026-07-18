@@ -33,10 +33,31 @@ class VulkanContext {
     VulkanContext& operator=(const VulkanContext&) = delete;
 
     /**
-     * GPU f32 matvec: out[r] = dot(w row r, x).
-     *
-     * @param w Row-major rows*cols floats.
-     * @throws std::runtime_error on device errors.
+     * Opaque handle to a device buffer (host-visible; on Apple
+     * unified memory this is also device-fast). Buffers live
+     * until destroy_buffer or context destruction.
+     */
+    struct Buffer {
+        void* impl = nullptr;
+    };
+
+    /** @throws std::runtime_error when allocation fails. */
+    Buffer create_buffer(std::size_t bytes);
+    void destroy_buffer(Buffer b);
+    void write_buffer(Buffer b, std::span<const std::byte> data);
+    void read_buffer(Buffer b, std::span<std::byte> out);
+
+    /**
+     * GPU f32 matvec over resident buffers:
+     * out[r] = dot(w row r, x). Synchronous (waits for the
+     * dispatch); persistent weights avoid per-call uploads.
+     */
+    void matvec_f32(Buffer w, std::uint32_t rows,
+                    std::uint32_t cols, Buffer x, Buffer out);
+
+    /**
+     * Convenience overload copying host spans through scratch
+     * buffers (tests/one-shot use).
      */
     void matvec_f32(std::span<const float> w, std::uint32_t rows,
                     std::uint32_t cols, std::span<const float> x,

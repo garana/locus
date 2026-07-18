@@ -27,9 +27,14 @@ TEST_CASE("registry lists and resolves backends", "[backend]") {
             find_backend("scalar"));
     REQUIRE_THROWS_AS(resolve_backend("nope"),
                       std::invalid_argument);
-    // Listed but not selectable for inference yet.
-    REQUIRE_THROWS_AS(resolve_backend("vulkan"),
-                      std::invalid_argument);
+    // Selectable exactly when a usable device + kernels exist.
+    if (vulkan_backend_usable()) {
+        REQUIRE(&resolve_backend("vulkan") ==
+                find_backend("vulkan"));
+    } else {
+        REQUIRE_THROWS_AS(resolve_backend("vulkan"),
+                          std::invalid_argument);
+    }
 }
 
 #if defined(__aarch64__)

@@ -267,21 +267,39 @@ VulkanContext::VulkanContext() : impl_(new Impl) { impl_->init(); }
 
 VulkanContext::~VulkanContext() = default;
 
-void VulkanContext::matvec_f32(std::span<const float> w,
-                               std::uint32_t rows,
-                               std::uint32_t cols,
-                               std::span<const float> x,
-                               std::span<float> out) {
-    if (w.size() != static_cast<std::size_t>(rows) * cols ||
-        x.size() != cols || out.size() != rows) {
-        throw std::runtime_error("vulkan: matvec size mismatch");
+VulkanContext::Buffer VulkanContext::create_buffer(
+    std::size_t bytes) {
+    auto* hb = new Impl::HostBuffer(impl_->make_buffer(bytes));
+    return Buffer{hb};
+}
+
+void VulkanContext::destroy_buffer(Buffer b) {
+    auto* hb = static_cast<Impl::HostBuffer*>(b.impl);
+    if (hb != nullptr) {
+        impl_->destroy_buffer(*hb);
+        delete hb;
     }
+}
+
+void VulkanContext::write_buffer(Buffer b,
+                                 std::span<const std::byte> data) {
+    auto* hb = static_cast<Impl::HostBuffer*>(b.impl);
+    std::memcpy(hb->map, data.data(), data.size());
+}
+
+void VulkanContext::read_buffer(Buffer b,
+                                std::span<std::byte> out) {
+    auto* hb = static_cast<Impl::HostBuffer*>(b.impl);
+    std::memcpy(out.data(), hb->map, out.size());
+}
+
+void VulkanContext::matvec_f32(Buffer w, std::uint32_t rows,
+                               std::uint32_t cols, Buffer x,
+                               Buffer out) {
     Impl& im = *impl_;
-    auto wb = im.make_buffer(w.size_bytes());
-    auto xb = im.make_buffer(x.size_bytes());
-    auto ob = im.make_buffer(out.size_bytes());
-    std::memcpy(wb.map, w.data(), w.size_bytes());
-    std::memcpy(xb.map, x.data(), x.size_bytes());
+    auto& wb = *static_cast<Impl::HostBuffer*>(w.impl);
+    auto& xb = *static_cast<Impl::HostBuffer*>(x.impl);
+    auto& ob = *static_cast<Impl::HostBuffer*>(out.impl);
 
     VkDescriptorSetAllocateInfo dsa{};
     dsa.sType =
@@ -343,14 +361,30 @@ void VulkanContext::matvec_f32(std::span<const float> w,
           "submit");
     check(vkQueueWaitIdle(im.queue), "wait idle");
 
-    std::memcpy(out.data(), ob.map, out.size_bytes());
-
     vkFreeCommandBuffers(im.device, im.pool, 1, &cmd);
     check(vkResetDescriptorPool(im.device, im.dpool, 0),
           "reset descriptor pool");
-    im.destroy_buffer(wb);
-    im.destroy_buffer(xb);
-    im.destroy_buffer(ob);
+}
+
+void VulkanContext::matvec_f32(std::span<const float> w,
+                               std::uint32_t rows,
+                               std::uint32_t cols,
+                               std::span<const float> x,
+                               std::span<float> out) {
+    if (w.size() != static_cast<std::size_t>(rows) * cols ||
+        x.size() != cols || out.size() != rows) {
+        throw std::runtime_error("vulkan: matvec size mismatch");
+    }
+    Buffer wb = create_buffer(w.size_bytes());
+    Buffer xb = create_buffer(x.size_bytes());
+    Buffer ob = create_buffer(out.size_bytes());
+    write_buffer(wb, std::as_bytes(w));
+    write_buffer(xb, std::as_bytes(x));
+    matvec_f32(wb, rows, cols, xb, ob);
+    read_buffer(ob, std::as_writable_bytes(out));
+    destroy_buffer(wb);
+    destroy_buffer(xb);
+    destroy_buffer(ob);
 }
 
 }  // namespace cppllm::backend::vk
@@ -370,12 +404,35 @@ VulkanContext::VulkanContext() {
 
 VulkanContext::~VulkanContext() = default;
 
+namespace {
+
+[[noreturn]] void no_kernels() {
+    throw std::runtime_error(
+        "cppllm built without Vulkan kernels");
+}
+
+}  // namespace
+
+VulkanContext::Buffer VulkanContext::create_buffer(std::size_t) {
+    no_kernels();
+}
+void VulkanContext::destroy_buffer(Buffer) { no_kernels(); }
+void VulkanContext::write_buffer(Buffer,
+                                 std::span<const std::byte>) {
+    no_kernels();
+}
+void VulkanContext::read_buffer(Buffer, std::span<std::byte>) {
+    no_kernels();
+}
+void VulkanContext::matvec_f32(Buffer, std::uint32_t,
+                               std::uint32_t, Buffer, Buffer) {
+    no_kernels();
+}
 void VulkanContext::matvec_f32(std::span<const float>,
                                std::uint32_t, std::uint32_t,
                                std::span<const float>,
                                std::span<float>) {
-    throw std::runtime_error(
-        "cppllm built without Vulkan kernels");
+    no_kernels();
 }
 
 }  // namespace cppllm::backend::vk
