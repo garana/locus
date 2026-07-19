@@ -17,22 +17,26 @@ json make_error(const std::string& message) {
                            {"type", "invalid_request_error"}}}};
 }
 
-/** Flattens chat messages to a plain-text prompt (MVP: no chat
- * template; base models complete text). */
-std::string flatten_messages(const json& messages) {
-    std::string prompt;
+/** Parses and validates the OpenAI messages array. */
+std::vector<chat::Message> parse_messages(const json& messages) {
+    std::vector<chat::Message> out;
     for (const auto& m : messages) {
         if (!m.contains("content") ||
             !m["content"].is_string()) {
             throw std::invalid_argument(
                 "message content must be a string");
         }
-        if (!prompt.empty()) {
-            prompt += "\n";
+        chat::Message msg;
+        msg.role = m.value("role", "user");
+        if (msg.role != "system" && msg.role != "user" &&
+            msg.role != "assistant") {
+            throw std::invalid_argument(
+                "unsupported message role: " + msg.role);
         }
-        prompt += m["content"].get<std::string>();
+        msg.content = m["content"].get<std::string>();
+        out.push_back(std::move(msg));
     }
-    return prompt;
+    return out;
 }
 
 }  // namespace
@@ -87,7 +91,8 @@ void OpenAiServer::install_routes() {
                     throw std::invalid_argument(
                         "messages must be a non-empty array");
                 }
-                prompt = flatten_messages(body["messages"]);
+                prompt = opt_.chat_template.apply(
+                    parse_messages(body["messages"]));
             } else {
                 if (!body.contains("prompt") ||
                     !body["prompt"].is_string()) {

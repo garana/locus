@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 
+#include "cppllm/chat/template.hpp"
 #include "cppllm/engine/engine.hpp"
 #include "cppllm/model/llama.hpp"
 #include "cppllm/server/engine_loop.hpp"
@@ -34,6 +35,10 @@ class OpenAiServer {
         engine::Engine::Config engine;
         /** Hard cap applied to requested max_tokens. */
         std::uint32_t max_tokens_cap = 1024;
+        /** Formats /v1/chat/completions prompts (default plain).
+         * Use chat::ChatTemplate::from_gguf for real chat
+         * models. */
+        chat::ChatTemplate chat_template;
     };
 
     OpenAiServer(const model::LlamaModel& m,

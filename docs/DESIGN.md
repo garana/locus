@@ -132,8 +132,11 @@ cpp-httplib (MIT) for HTTP and nlohmann/json (MIT) for parsing
 untrusted request bodies -- hand-rolled JSON parsing is exactly
 where API vulnerabilities come from. A worker thread drives
 Engine::step(); handler threads submit and wait on a condition
-variable (EngineLoop). Chat messages are flattened to plain text
-until chat templates land (post-MVP).
+variable (EngineLoop). Chat messages are formatted by
+chat::ChatTemplate (R2): the GGUF Jinja source is fingerprinted
+to a known family (llama3, chatml, llama2, zephyr, deepseek) and
+rendered by a hardcoded formatter; unknown templates fall back to
+plain concatenation.
 
 ## 5. Milestones
 
@@ -176,7 +179,8 @@ active) before any large-scale run.
 | R1    | Byte-level BPE tokenizer (done    | all non-SPM models          |
 |       | 2026-07-18, incl. llama3 rope     |                             |
 |       | scaling via rope_freqs.weight)    |                             |
-| R2    | Chat templates                    | instruct/chat checkpoints   |
+| R2    | Chat templates (done 2026-07-18:  | instruct/chat checkpoints   |
+|       | fingerprinted families, no Jinja) |                             |
 | R3    | K-quants (Q4_K/Q5_K/Q6_K) CPU +   | most published GGUFs of     |
 |       | Vulkan kernels                    | large models                |
 | R4    | MoE FFN: top-k router (softmax    | DeepSeek-V2-Lite end to end |

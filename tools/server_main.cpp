@@ -51,12 +51,16 @@ int main(int argc, char** argv) {
 
         cppllm::server::OpenAiServer::Options opt;
         opt.model_name = model_path;
+        opt.chat_template =
+            cppllm::chat::ChatTemplate::from_gguf(g);
         cppllm::server::OpenAiServer server(model, tok, opt);
         std::fprintf(
             stderr,
-            "%s\nbackend: %s\ncppllm-server listening on :%d\n",
+            "%s\nbackend: %s | chat template: %s\n"
+            "cppllm-server listening on :%d\n",
             cppllm::sys::to_string(cppllm::sys::detect()).c_str(),
             std::string(model.active_backend().name).c_str(),
+            std::string(opt.chat_template.name()).c_str(),
             port);
         if (!server.listen("0.0.0.0", port)) {
             std::fprintf(stderr, "error: cannot bind port %d\n",

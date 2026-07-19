@@ -14,6 +14,7 @@ add_library(cppllm
     src/cppllm/backend/matvec_vulkan.cpp
     src/cppllm/backend/registry.cpp
     src/cppllm/backend/vulkan/context.cpp
+    src/cppllm/chat/template.cpp
     src/cppllm/engine/engine.cpp
     src/cppllm/gguf/gguf.cpp
     src/cppllm/kv/block_allocator.cpp

@@ -13,6 +13,7 @@ add_executable(cppllm_tests
     test_features.cpp
     test_backend_registry.cpp
     test_bpe_tokenizer.cpp
+    test_chat_template.cpp
     test_cpu_ops.cpp
     test_engine.cpp
     test_gguf.cpp
