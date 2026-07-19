@@ -162,7 +162,59 @@ stays CPU-bound by per-token dispatch overhead.
 - No FetchContent/network at configure or build time.
 - Optional system deps behind CMake flags: BLAS/Accelerate, Vulkan.
 
-## 7. Testing strategy
+## 7. Post-MVP roadmap: DeepSeek-family and Kimi K3
+
+Goal: run DeepSeek V3/R1-class models (which also covers Kimi K2,
+same "deepseek2" GGUF architecture) and eventually Kimi K3. Phases
+are ordered so each lands independently testable on hardware we
+have; the big-model phases are correctness-first via small
+same-architecture models (e.g. DeepSeek-V2-Lite, 16B total / 2.4B
+active) before any large-scale run.
+
+| Phase | Deliverable                       | Unblocks                    |
+|-------|-----------------------------------|-----------------------------|
+| R1    | Byte-level BPE tokenizer          | all non-SPM models          |
+| R2    | Chat templates                    | instruct/chat checkpoints   |
+| R3    | K-quants (Q4_K/Q5_K/Q6_K) CPU +   | most published GGUFs of     |
+|       | Vulkan kernels                    | large models                |
+| R4    | MoE FFN: top-k router (softmax    | DeepSeek-V2-Lite end to end |
+|       | and sigmoid+bias), shared         |                             |
+|       | experts, 3-D expert tensors,      |                             |
+|       | per-expert matvec dispatch        |                             |
+| R5    | MLA attention: latent-KV cache    | DeepSeek V3/R1, Kimi K2     |
+|       | (paged cache gains per-layer row  | (memory-viable 128k ctx)    |
+|       | sizes), decoupled RoPE, YaRN      |                             |
+| R6    | Architecture registry ("llama",   | clean multi-arch dispatch   |
+|       | "deepseek2", ...) replacing the   |                             |
+|       | single hardcoded forward          |                             |
+| R7    | Kimi K3: Kimi Delta Attention     | K3 once weights + GGUF      |
+|       | (per-layer recurrent state        | support exist (due          |
+|       | alongside paged KV), MXFP4        | 2026-07-27); arch id not    |
+|       | blocks, AttnRes                   | yet upstreamed              |
+| R8    | Scale-out ergonomics: expert      | practical big-MoE hosting   |
+|       | weights served straight from the  | on big-RAM hosts            |
+|       | read-only mmap (OS page cache as  |                             |
+|       | the working set), multi-token     |                             |
+|       | GPU batching for prefill          |                             |
+
+Notes:
+- MoE fits the existing design well: the scheduler, paged KV, and
+  server layers are unchanged; the work concentrates in the
+  loader (3-D tensors, new quant types), the FFN block, and the
+  backend op tables (per-expert matvec).
+- MLA *shrinks* the KV cache (latents instead of full K/V), which
+  compounds with paged allocation; KDA layers instead carry fixed
+  -size recurrent state per sequence -- a new cache kind next to
+  the paged pool, owned by the same allocator story.
+- Hardware reality: K3-class (2.8T, ~1.5 TB MXFP4) stays
+  cluster/big-RAM territory regardless of engine quality. The
+  roadmap therefore optimizes for correctness on small
+  same-architecture models locally, with mmap + page-cache
+  residency as the path to "runs on a 2 TB RAM host".
+- Multimodal (K3 vision) is explicitly out of scope until the
+  text path is proven.
+
+## 8. Testing strategy
 
 - Catch2 unit tests per component (allocator, scheduler invariants,
   GGUF parser, tokenizer round-trips).

@@ -23,6 +23,11 @@ milestone plan.
 | M4        | HTTP server (OpenAI API, SSE)           | done        |
 | M5        | Vulkan backend                          | done        |
 
+All MVP milestones are complete. The post-MVP roadmap (BPE
+tokenizer, chat templates, K-quants, MoE, MLA, Kimi Delta
+Attention -- the path to DeepSeek V3/R1, Kimi K2, and Kimi K3) is
+in docs/DESIGN.md section 7.
+
 ## Building
 
     cmake -B build -DCMAKE_BUILD_TYPE=Release
