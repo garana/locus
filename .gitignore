@@ -1,5 +1,15 @@
 build/
+build-*/
 .cache/
 compile_commands.json
 .DS_Store
 tests/models/
+
+# IDE files
+.idea/
+.vscode/
+.vs/
+*.swp
+*.swo
+.clangd/
+cmake-build-*/

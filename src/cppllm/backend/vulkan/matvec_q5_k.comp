@@ -1,0 +1,81 @@
+#version 450
+
+// Q5_K matvec: 176-byte super-blocks -- f16 d/dmin, 12 packed
+// scale bytes, 32 high-bit bytes, 128 nibble bytes.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint out_offset;
+    uint accumulate;
+} pc;
+
+uint byte_at(uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+float f16_at(uint i) {
+    return unpackHalf2x16(byte_at(i) | (byte_at(i + 1u) << 8u)).x;
+}
+
+void scale_min(uint j, uint sc0, out float d, out float m) {
+    if (j < 4u) {
+        d = float(byte_at(sc0 + j) & 63u);
+        m = float(byte_at(sc0 + j + 4u) & 63u);
+    } else {
+        d = float((byte_at(sc0 + j + 4u) & 0xfu) |
+                  ((byte_at(sc0 + j - 4u) >> 6u) << 4u));
+        m = float((byte_at(sc0 + j + 4u) >> 4u) |
+                  ((byte_at(sc0 + j) >> 6u) << 4u));
+    }
+}
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.rows) {
+        return;
+    }
+    uint nb = pc.cols / 256u;
+    float acc = 0.0;
+    for (uint b = 0; b < nb; ++b) {
+        uint at = (r * nb + b) * 176u;
+        float d = f16_at(at);
+        float dmin = f16_at(at + 2u);
+        uint qh = at + 16u;
+        uint ql = at + 48u;
+        uint xb = b * 256u;
+        uint u1 = 1u;
+        for (uint j = 0; j < 4u; ++j) {
+            float sc, mn;
+            scale_min(2u * j, at + 4u, sc, mn);
+            float d1 = d * sc, m1 = dmin * mn;
+            scale_min(2u * j + 1u, at + 4u, sc, mn);
+            float d2 = d * sc, m2 = dmin * mn;
+            for (uint l = 0; l < 32u; ++l) {
+                uint v = byte_at(ql + l);
+                uint h = byte_at(qh + l);
+                acc += (d1 * float((v & 0xfu) +
+                                   ((h & u1) != 0u ? 16u : 0u)) -
+                        m1) *
+                       x[xb + l];
+                acc += (d2 * float((v >> 4u) +
+                                   ((h & (u1 << 1u)) != 0u
+                                        ? 16u
+                                        : 0u)) -
+                        m2) *
+                       x[xb + 32u + l];
+            }
+            ql += 32u;
+            xb += 64u;
+            u1 <<= 2u;
+        }
+    }
+    uint at_out = pc.out_offset + r;
+    o[at_out] = pc.accumulate != 0 ? o[at_out] + acc : acc;
+}

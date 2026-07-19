@@ -83,6 +83,7 @@ if(Vulkan_FOUND)
     if(GLSLANG_VALIDATOR OR GLSLC)
         set(CPPLLM_SHADERS
             matvec matvec_f16 matvec_q8_0 matvec_q4_0
+            matvec_q4_k matvec_q5_k matvec_q6_k
             rmsnorm rope silu_mul attn_paged)
         set(SHADER_HDRS "")
         foreach(shader ${CPPLLM_SHADERS})

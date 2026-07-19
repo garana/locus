@@ -1,5 +1,6 @@
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -158,8 +159,82 @@ TEST_CASE("matvec q4_0 dequantizes correctly", "[ops]") {
 }
 
 TEST_CASE("matvec rejects unsupported weight types", "[ops]") {
-    Mat m{TensorType::kQ4_K, nullptr, 1, 256};
+    Mat m{TensorType::kQ3_K, nullptr, 1, 256};
     std::vector<float> x(256, 0.0f);
     float out[1];
     REQUIRE_THROWS_AS(matvec(m, x, out), cppllm::gguf::Error);
+}
+
+namespace {
+
+/** Random-but-sane K-quant row: qs random, f16 fields bounded. */
+std::vector<std::byte> k_quant_row(TensorType t,
+                                   std::uint32_t blocks,
+                                   std::uint32_t seed) {
+    const std::size_t bytes = t == TensorType::kQ4_K   ? 144
+                              : t == TensorType::kQ5_K ? 176
+                                                       : 210;
+    std::vector<std::byte> row(blocks * bytes);
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    for (auto& b : row) {
+        b = static_cast<std::byte>(byte_d(rng));
+    }
+    // Overwrite the f16 scale fields with sane magnitudes.
+    for (std::uint32_t b = 0; b < blocks; ++b) {
+        std::byte* blk = row.data() + b * bytes;
+        const std::uint16_t d =
+            cppllm::backend::f32_to_f16(0.01f);
+        const std::uint16_t dmin =
+            cppllm::backend::f32_to_f16(0.005f);
+        if (t == TensorType::kQ6_K) {
+            std::memcpy(blk + 208, &d, 2);
+        } else {
+            std::memcpy(blk, &d, 2);
+            std::memcpy(blk + 2, &dmin, 2);
+        }
+    }
+    return row;
+}
+
+}  // namespace
+
+TEST_CASE("k-quant matvec is consistent with dequant_row",
+          "[ops]") {
+    const std::uint32_t rows = 3, cols = 512;  // 2 blocks/row
+    std::vector<float> x(cols);
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ5_K,
+                         TensorType::kQ6_K}) {
+        auto row0 = k_quant_row(t, 2, 40);
+        auto row1 = k_quant_row(t, 2, 41);
+        auto row2 = k_quant_row(t, 2, 42);
+        std::vector<std::byte> w;
+        for (auto* r : {&row0, &row1, &row2}) {
+            w.insert(w.end(), r->begin(), r->end());
+        }
+        Mat m{t, w.data(), rows, cols};
+
+        std::vector<float> mv(rows), dq(cols);
+        matvec(m, x, mv);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            dequant_row(m, r, dq);
+            float ref = 0.0f;
+            for (std::uint32_t i = 0; i < cols; ++i) {
+                ref += dq[i] * x[i];
+            }
+            INFO("type " << static_cast<int>(t) << " row " << r);
+            REQUIRE(mv[r] == Approx(ref).margin(1e-4));
+        }
+        // Some value must be nonzero, or the test proves nothing.
+        bool nonzero = false;
+        for (float v : dq) {
+            nonzero = nonzero || v != 0.0f;
+        }
+        REQUIRE(nonzero);
+    }
 }

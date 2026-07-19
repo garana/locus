@@ -182,7 +182,7 @@ active) before any large-scale run.
 | R2    | Chat templates (done 2026-07-18:  | instruct/chat checkpoints   |
 |       | fingerprinted families, no Jinja) |                             |
 | R3    | K-quants (Q4_K/Q5_K/Q6_K) CPU +   | most published GGUFs of     |
-|       | Vulkan kernels                    | large models                |
+|       | Vulkan kernels (done 2026-07-19)  | large models                |
 | R4    | MoE FFN: top-k router (softmax    | DeepSeek-V2-Lite end to end |
 |       | and sigmoid+bias), shared         |                             |
 |       | experts, 3-D expert tensors,      |                             |

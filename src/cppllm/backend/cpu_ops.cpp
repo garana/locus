@@ -70,6 +70,157 @@ float dot_q4_0(const std::byte* row, std::span<const float> x) {
     return acc;
 }
 
+/**
+ * Unpacks the 6-bit scale/min pair of K-quant sub-block j from
+ * the packed 12-byte scales array (ggml's get_scale_min_k4).
+ */
+void scale_min_k4(int j, const std::uint8_t* q,
+                  std::uint8_t& d, std::uint8_t& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = static_cast<std::uint8_t>((q[j + 4] & 0x0f) |
+                                      ((q[j - 4] >> 6) << 4));
+        m = static_cast<std::uint8_t>((q[j + 4] >> 4) |
+                                      ((q[j] >> 6) << 4));
+    }
+}
+
+/** Dequantizes one 256-element Q4_K super-block (144 bytes). */
+void dequant_block_q4_k(const std::byte* blk, float* y) {
+    const float d = f16_to_f32(load_u16(blk));
+    const float dmin = f16_to_f32(load_u16(blk + 2));
+    const auto* scales =
+        reinterpret_cast<const std::uint8_t*>(blk + 4);
+    const auto* q =
+        reinterpret_cast<const std::uint8_t*>(blk + 16);
+    int is = 0;
+    for (int j = 0; j < 256; j += 64) {
+        std::uint8_t sc, mn;
+        scale_min_k4(is + 0, scales, sc, mn);
+        const float d1 = d * sc, m1 = dmin * mn;
+        scale_min_k4(is + 1, scales, sc, mn);
+        const float d2 = d * sc, m2 = dmin * mn;
+        for (int l = 0; l < 32; ++l) {
+            *y++ = d1 * static_cast<float>(q[l] & 0x0f) - m1;
+        }
+        for (int l = 0; l < 32; ++l) {
+            *y++ = d2 * static_cast<float>(q[l] >> 4) - m2;
+        }
+        q += 32;
+        is += 2;
+    }
+}
+
+/** Dequantizes one 256-element Q5_K super-block (176 bytes). */
+void dequant_block_q5_k(const std::byte* blk, float* y) {
+    const float d = f16_to_f32(load_u16(blk));
+    const float dmin = f16_to_f32(load_u16(blk + 2));
+    const auto* scales =
+        reinterpret_cast<const std::uint8_t*>(blk + 4);
+    const auto* qh =
+        reinterpret_cast<const std::uint8_t*>(blk + 16);
+    const auto* ql =
+        reinterpret_cast<const std::uint8_t*>(blk + 48);
+    int is = 0;
+    std::uint8_t u1 = 1, u2 = 2;
+    for (int j = 0; j < 256; j += 64) {
+        std::uint8_t sc, mn;
+        scale_min_k4(is + 0, scales, sc, mn);
+        const float d1 = d * sc, m1 = dmin * mn;
+        scale_min_k4(is + 1, scales, sc, mn);
+        const float d2 = d * sc, m2 = dmin * mn;
+        for (int l = 0; l < 32; ++l) {
+            *y++ = d1 * static_cast<float>((ql[l] & 0x0f) +
+                                           ((qh[l] & u1) ? 16
+                                                         : 0)) -
+                   m1;
+        }
+        for (int l = 0; l < 32; ++l) {
+            *y++ = d2 * static_cast<float>((ql[l] >> 4) +
+                                           ((qh[l] & u2) ? 16
+                                                         : 0)) -
+                   m2;
+        }
+        ql += 32;
+        is += 2;
+        u1 = static_cast<std::uint8_t>(u1 << 2);
+        u2 = static_cast<std::uint8_t>(u2 << 2);
+    }
+}
+
+/** Dequantizes one 256-element Q6_K super-block (210 bytes). */
+void dequant_block_q6_k(const std::byte* blk, float* y) {
+    const auto* ql =
+        reinterpret_cast<const std::uint8_t*>(blk);
+    const auto* qh =
+        reinterpret_cast<const std::uint8_t*>(blk + 128);
+    const auto* sc =
+        reinterpret_cast<const std::int8_t*>(blk + 192);
+    const float d = f16_to_f32(load_u16(blk + 208));
+    for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; ++l) {
+            const int is = l / 16;
+            const int q1 =
+                static_cast<int>((ql[l] & 0x0f) |
+                                 (((qh[l] >> 0) & 3) << 4)) -
+                32;
+            const int q2 =
+                static_cast<int>((ql[l + 32] & 0x0f) |
+                                 (((qh[l] >> 2) & 3) << 4)) -
+                32;
+            const int q3 =
+                static_cast<int>((ql[l] >> 4) |
+                                 (((qh[l] >> 4) & 3) << 4)) -
+                32;
+            const int q4 =
+                static_cast<int>((ql[l + 32] >> 4) |
+                                 (((qh[l] >> 6) & 3) << 4)) -
+                32;
+            y[l] = d * sc[is] * static_cast<float>(q1);
+            y[l + 32] = d * sc[is + 2] * static_cast<float>(q2);
+            y[l + 64] = d * sc[is + 4] * static_cast<float>(q3);
+            y[l + 96] = d * sc[is + 6] * static_cast<float>(q4);
+        }
+        y += 128;
+        ql += 64;
+        qh += 32;
+        sc += 8;
+    }
+}
+
+using BlockDequantFn = void (*)(const std::byte*, float*);
+
+/** @returns {block_bytes, fn} for 256-elem K-quant types. */
+std::pair<std::size_t, BlockDequantFn> k_traits(
+    gguf::TensorType t) {
+    switch (t) {
+        case gguf::TensorType::kQ4_K:
+            return {144, &dequant_block_q4_k};
+        case gguf::TensorType::kQ5_K:
+            return {176, &dequant_block_q5_k};
+        case gguf::TensorType::kQ6_K:
+            return {210, &dequant_block_q6_k};
+        default:
+            return {0, nullptr};
+    }
+}
+
+float dot_k_quant(const Mat& w, const std::byte* row,
+                  std::span<const float> x) {
+    const auto [bytes, fn] = k_traits(w.type);
+    float acc = 0.0f;
+    float tmp[256];
+    for (std::size_t b = 0; b < x.size() / 256; ++b) {
+        fn(row + b * bytes, tmp);
+        for (std::size_t i = 0; i < 256; ++i) {
+            acc += tmp[i] * x[b * 256 + i];
+        }
+    }
+    return acc;
+}
+
 /** @returns Bytes per row for a supported matvec weight type. */
 std::size_t row_bytes(const Mat& w) {
     switch (w.type) {
@@ -79,6 +230,10 @@ std::size_t row_bytes(const Mat& w) {
             return w.cols / 32ull * kQ8_0BlockBytes;
         case gguf::TensorType::kQ4_0:
             return w.cols / 32ull * kQ4_0BlockBytes;
+        case gguf::TensorType::kQ4_K:
+        case gguf::TensorType::kQ5_K:
+        case gguf::TensorType::kQ6_K:
+            return w.cols / 256ull * k_traits(w.type).first;
         default:
             throw gguf::Error("no CPU kernel for this weight type");
     }
@@ -230,8 +385,11 @@ void matvec(const Mat& w, std::span<const float> x,
             case gguf::TensorType::kQ8_0:
                 out[r] = dot_q8_0(row, x);
                 break;
-            default:
+            case gguf::TensorType::kQ4_0:
                 out[r] = dot_q4_0(row, x);
+                break;
+            default:
+                out[r] = dot_k_quant(w, row, x);
                 break;
         }
     }
@@ -261,7 +419,7 @@ void dequant_row(const Mat& w, std::uint32_t row,
                 }
             }
             break;
-        default: {
+        case gguf::TensorType::kQ4_0: {
             for (std::uint32_t b = 0; b < w.cols / 32; ++b) {
                 const std::byte* blk = p + b * kQ4_0BlockBytes;
                 const float d = f16_to_f32(load_u16(blk));
@@ -273,6 +431,13 @@ void dequant_row(const Mat& w, std::uint32_t row,
                     out[b * 32 + i + 16] =
                         d * (static_cast<float>(q[i] >> 4) - 8.0f);
                 }
+            }
+            break;
+        }
+        default: {
+            const auto [bytes, fn] = k_traits(w.type);
+            for (std::uint32_t b = 0; b < w.cols / 256; ++b) {
+                fn(p + b * bytes, out.data() + b * 256);
             }
             break;
         }

@@ -32,6 +32,18 @@ std::size_t weight_bytes(const Mat& w) {
             b = static_cast<std::size_t>(w.rows) *
                 (w.cols / 32) * 18;
             break;
+        case gguf::TensorType::kQ4_K:
+            b = static_cast<std::size_t>(w.rows) *
+                (w.cols / 256) * 144;
+            break;
+        case gguf::TensorType::kQ5_K:
+            b = static_cast<std::size_t>(w.rows) *
+                (w.cols / 256) * 176;
+            break;
+        case gguf::TensorType::kQ6_K:
+            b = static_cast<std::size_t>(w.rows) *
+                (w.cols / 256) * 210;
+            break;
         default:
             return 0;  // no GPU kernel for this type
     }
@@ -118,6 +130,9 @@ Kernel matvec_kernel(const Mat& w) {
         case gguf::TensorType::kF16: return Kernel::kMatvecF16;
         case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0;
         case gguf::TensorType::kQ4_0: return Kernel::kMatvecQ4_0;
+        case gguf::TensorType::kQ4_K: return Kernel::kMatvecQ4_K;
+        case gguf::TensorType::kQ5_K: return Kernel::kMatvecQ5_K;
+        case gguf::TensorType::kQ6_K: return Kernel::kMatvecQ6_K;
         default: return Kernel::kCount_;
     }
 }

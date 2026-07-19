@@ -1,0 +1,77 @@
+#version 450
+
+// Q6_K matvec: 210-byte super-blocks -- 128 nibble bytes, 64
+// high-2-bit bytes, 16 signed scales, f16 d at the end.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint out_offset;
+    uint accumulate;
+} pc;
+
+uint byte_at(uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+float f16_at(uint i) {
+    return unpackHalf2x16(byte_at(i) | (byte_at(i + 1u) << 8u)).x;
+}
+
+int sbyte_at(uint i) {
+    return bitfieldExtract(int(byte_at(i)), 0, 8);
+}
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.rows) {
+        return;
+    }
+    uint nb = pc.cols / 256u;
+    float acc = 0.0;
+    for (uint b = 0; b < nb; ++b) {
+        uint at = (r * nb + b) * 210u;
+        float d = f16_at(at + 208u);
+        uint xb = b * 256u;
+        for (uint n = 0; n < 2u; ++n) {
+            uint ql = at + n * 64u;
+            uint qh = at + 128u + n * 32u;
+            uint sc = at + 192u + n * 8u;
+            uint xo = xb + n * 128u;
+            for (uint l = 0; l < 32u; ++l) {
+                uint is = l / 16u;
+                uint lo0 = byte_at(ql + l);
+                uint lo32 = byte_at(ql + l + 32u);
+                uint h = byte_at(qh + l);
+                int q1 = int((lo0 & 0xfu) |
+                             (((h >> 0u) & 3u) << 4u)) -
+                         32;
+                int q2 = int((lo32 & 0xfu) |
+                             (((h >> 2u) & 3u) << 4u)) -
+                         32;
+                int q3 = int((lo0 >> 4u) |
+                             (((h >> 4u) & 3u) << 4u)) -
+                         32;
+                int q4 = int((lo32 >> 4u) |
+                             (((h >> 6u) & 3u) << 4u)) -
+                         32;
+                acc += d * float(sbyte_at(sc + is)) *
+                       float(q1) * x[xo + l];
+                acc += d * float(sbyte_at(sc + is + 2u)) *
+                       float(q2) * x[xo + l + 32u];
+                acc += d * float(sbyte_at(sc + is + 4u)) *
+                       float(q3) * x[xo + l + 64u];
+                acc += d * float(sbyte_at(sc + is + 6u)) *
+                       float(q4) * x[xo + l + 96u];
+            }
+        }
+    }
+    uint at_out = pc.out_offset + r;
+    o[at_out] = pc.accumulate != 0 ? o[at_out] + acc : acc;
+}

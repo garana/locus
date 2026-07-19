@@ -80,6 +80,67 @@ TEST_CASE("template rendering", "[chat]") {
     }
 }
 
+namespace {
+
+/** Greedy chat answer for a single user message. */
+std::string chat_answer(const cppllm::model::LlamaModel& model,
+                        const cppllm::tok::Tokenizer& tok,
+                        const ChatTemplate& tmpl,
+                        const std::string& user, int max_new) {
+    const std::vector<Message> msgs = {{"user", user}};
+    auto cache = model.make_cache();
+    auto ws = model.make_workspace();
+    cppllm::kv::PagedKvCache::Seq seq;
+    std::vector<float> logits(model.hparams().n_vocab);
+    for (auto id : tok.encode(tmpl.apply(msgs), true)) {
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(id, cache, seq, ws, logits);
+    }
+    std::vector<cppllm::tok::TokenId> gen;
+    for (int i = 0; i < max_new; ++i) {
+        auto next = cppllm::model::argmax(logits);
+        if (next == tok.eos_id()) {
+            break;
+        }
+        gen.push_back(next);
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(next, cache, seq, ws, logits);
+    }
+    cache.release(seq);
+    return tok.decode(gen);
+}
+
+}  // namespace
+
+TEST_CASE("llama-3.2 Q4_K_M chat matches llama.cpp on every "
+          "backend",
+          "[chat][e2e]") {
+    const std::string path =
+        std::string(CPPLLM_SOURCE_DIR) +
+        "/tests/models/llama-3.2-1b-q4_k_m.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("model not present (llama-3.2-1b-q4_k_m.gguf)");
+    }
+    auto g = cppllm::gguf::GgufFile::open(path);
+    auto model = cppllm::model::LlamaModel::load(g);
+    auto tok = cppllm::tok::tokenizer_from_gguf(g);
+    auto tmpl = ChatTemplate::from_gguf(g);
+
+    // llama-completion (chat template, --temp 0) answers:
+    const std::string want =
+        "The capital of France is Paris.";
+    for (const auto& b : cppllm::backend::backends()) {
+        if (!b.available || !b.selectable) {
+            continue;
+        }
+        INFO("backend " << b.name);
+        model.use_backend(b);
+        REQUIRE(chat_answer(model, *tok, tmpl,
+                            "The capital of France is", 24) ==
+                want);
+    }
+}
+
 TEST_CASE("llama-3.2 chat matches the llama.cpp answer",
           "[chat][e2e]") {
     const std::string path =

@@ -175,6 +175,84 @@ TEST_CASE("vulkan f16 and q4_0 matvec match the CPU reference",
     }
 }
 
+TEST_CASE("vulkan k-quant matvec matches the CPU reference",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(47);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+
+    const std::uint32_t rows = 4, cols = 512;
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+
+    struct KCase {
+        cppllm::gguf::TensorType type;
+        Kernel kernel;
+        std::size_t block_bytes;
+        std::size_t d_off;  // f16 scale offset inside the block
+    };
+    const KCase cases[] = {
+        {cppllm::gguf::TensorType::kQ4_K, Kernel::kMatvecQ4_K,
+         144, 0},
+        {cppllm::gguf::TensorType::kQ5_K, Kernel::kMatvecQ5_K,
+         176, 0},
+        {cppllm::gguf::TensorType::kQ6_K, Kernel::kMatvecQ6_K,
+         210, 208},
+    };
+    for (const auto& c : cases) {
+        INFO("type " << static_cast<int>(c.type));
+        std::vector<std::byte> w(rows * (cols / 256) *
+                                 c.block_bytes);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t blk = 0; blk < rows * (cols / 256);
+             ++blk) {
+            std::byte* p =
+                w.data() + blk * c.block_bytes + c.d_off;
+            const std::uint16_t d =
+                cppllm::backend::f32_to_f16(0.01f);
+            std::memcpy(p, &d, 2);
+            if (c.d_off == 0) {  // dmin follows d
+                const std::uint16_t dmin =
+                    cppllm::backend::f32_to_f16(0.005f);
+                std::memcpy(p + 2, &dmin, 2);
+            }
+        }
+
+        std::vector<float> cpu(rows), gpu(rows);
+        cppllm::backend::Mat m{c.type, w.data(), rows, cols};
+        cppllm::backend::matvec(m, x, cpu);
+
+        auto wb =
+            ctx.create_buffer((w.size() + 3) & ~std::size_t{3});
+        auto xb = ctx.create_buffer(x.size() * 4);
+        auto ob = ctx.create_buffer(gpu.size() * 4);
+        ctx.write_buffer(wb, w);
+        ctx.write_buffer(xb, std::as_bytes(std::span(x)));
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+        const std::uint32_t push[] = {rows, cols, 0, 0};
+        ctx.dispatch(c.kernel, bufs, push, (rows + 63) / 64);
+        ctx.end_batch();
+        ctx.read_buffer(ob,
+                        std::as_writable_bytes(std::span(gpu)));
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(gpu[r] ==
+                    Catch::Approx(cpu[r]).margin(1e-3));
+        }
+        ctx.destroy_buffer(wb);
+        ctx.destroy_buffer(xb);
+        ctx.destroy_buffer(ob);
+    }
+}
+
 TEST_CASE("gpu matvec beats scalar cpu at real-model sizes",
           "[vulkan][benchmark]") {
     if (!VulkanContext::available()) {
