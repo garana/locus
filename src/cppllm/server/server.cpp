@@ -38,7 +38,7 @@ std::string flatten_messages(const json& messages) {
 }  // namespace
 
 OpenAiServer::OpenAiServer(const model::LlamaModel& m,
-                           const tok::SpmTokenizer& tok,
+                           const tok::Tokenizer& tok,
                            Options opt)
     : tok_(tok),
       opt_(std::move(opt)),

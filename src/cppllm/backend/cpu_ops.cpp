@@ -192,8 +192,9 @@ void silu_mul(std::span<const float> gate, std::span<const float> up,
 
 void rope_norm(std::span<float> x, std::uint32_t n_heads,
                std::uint32_t head_dim, std::uint32_t pos,
-               float freq_base) {
+               float freq_base, std::span<const float> factors) {
     assert(x.size() == static_cast<std::size_t>(n_heads) * head_dim);
+    assert(factors.empty() || factors.size() >= head_dim / 2);
     for (std::uint32_t h = 0; h < n_heads; ++h) {
         float* v = x.data() + static_cast<std::size_t>(h) * head_dim;
         for (std::uint32_t i = 0; i + 1 < head_dim; i += 2) {
@@ -201,7 +202,8 @@ void rope_norm(std::span<float> x, std::uint32_t n_heads,
                 static_cast<float>(pos) *
                 std::pow(freq_base,
                          -static_cast<float>(i) /
-                             static_cast<float>(head_dim));
+                             static_cast<float>(head_dim)) /
+                (factors.empty() ? 1.0f : factors[i / 2]);
             const float c = std::cos(theta);
             const float s = std::sin(theta);
             const float x0 = v[i];

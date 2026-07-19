@@ -64,6 +64,18 @@ TEST_CASE("rope is identity at pos 0 and norm-preserving", "[ops]") {
     REQUIRE(x[0] != orig[0]);  // actually rotated
 }
 
+TEST_CASE("rope factors divide the frequency", "[ops]") {
+    // With factor 2 at pos p, the rotation equals factor 1 at
+    // pos p/2 (theta scales linearly with pos).
+    std::vector<float> a = {1.0f, 2.0f};
+    std::vector<float> b = a;
+    const float factors[] = {2.0f};
+    rope_norm(a, 1, 2, 10, 10000.0f, factors);
+    rope_norm(b, 1, 2, 5, 10000.0f);
+    REQUIRE(a[0] == Approx(b[0]));
+    REQUIRE(a[1] == Approx(b[1]));
+}
+
 TEST_CASE("matvec f32 and f16 agree", "[ops]") {
     const std::vector<float> wf = {1, 2, 3, 4, 5, 6};  // 2x3
     std::vector<std::uint16_t> wh(6);

@@ -128,6 +128,10 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
     }
 
     m.backend_ = &backend::best_backend();
+    if (g.find_tensor("rope_freqs.weight") != nullptr) {
+        m.rope_factors_ =
+            need_vec(g, "rope_freqs.weight", hp.head_dim / 2);
+    }
     m.out_norm_ = need_vec(g, "output_norm.weight", hp.n_embd);
     // Tied embeddings when output.weight is absent.
     m.out_w_ = g.find_tensor("output.weight") != nullptr
@@ -211,9 +215,10 @@ void LlamaModel::forward(tok::TokenId token,
         op.matvec(lay.wq, ws.xb, ws.q);
         op.matvec(lay.wk, ws.xb, {krow, kv_dim});
         op.matvec(lay.wv, ws.xb, {vrow, kv_dim});
-        rope_norm(ws.q, hp_.n_heads, hd, pos, hp_.rope_freq_base);
+        rope_norm(ws.q, hp_.n_heads, hd, pos, hp_.rope_freq_base,
+                  rope_factors_);
         rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd, pos,
-                  hp_.rope_freq_base);
+                  hp_.rope_freq_base, rope_factors_);
 
         const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
         for (std::uint32_t h = 0; h < hp_.n_heads; ++h) {

@@ -37,7 +37,7 @@ class OpenAiServer {
     };
 
     OpenAiServer(const model::LlamaModel& m,
-                 const tok::SpmTokenizer& tok, Options opt);
+                 const tok::Tokenizer& tok, Options opt);
     ~OpenAiServer();
 
     /** Serves forever on host:port. @returns false on bind error. */
@@ -60,7 +60,7 @@ class OpenAiServer {
   private:
     void install_routes();
 
-    const tok::SpmTokenizer& tok_;
+    const tok::Tokenizer& tok_;
     Options opt_;
     EngineLoop loop_;
     std::unique_ptr<httplib::Server> http_;

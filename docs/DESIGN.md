@@ -173,7 +173,9 @@ active) before any large-scale run.
 
 | Phase | Deliverable                       | Unblocks                    |
 |-------|-----------------------------------|-----------------------------|
-| R1    | Byte-level BPE tokenizer          | all non-SPM models          |
+| R1    | Byte-level BPE tokenizer (done    | all non-SPM models          |
+|       | 2026-07-18, incl. llama3 rope     |                             |
+|       | scaling via rope_freqs.weight)    |                             |
 | R2    | Chat templates                    | instruct/chat checkpoints   |
 | R3    | K-quants (Q4_K/Q5_K/Q6_K) CPU +   | most published GGUFs of     |
 |       | Vulkan kernels                    | large models                |

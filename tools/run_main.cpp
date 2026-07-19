@@ -47,7 +47,8 @@ int main(int argc, char** argv) {
         auto model = cppllm::model::LlamaModel::load(g);
         model.use_backend(
             cppllm::backend::resolve_backend(args.choice));
-        auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
+        auto tok_ptr = cppllm::tok::tokenizer_from_gguf(g);
+        auto& tok = *tok_ptr;
         const auto& hp = model.hparams();
         std::fprintf(stderr,
                      "%s | backend=%s | layers=%u embd=%u "

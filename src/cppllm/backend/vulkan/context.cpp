@@ -46,7 +46,7 @@ const KernelDesc& kernel_desc(Kernel k) {
         {cppllm_matvec_q4_0_spv, sizeof(cppllm_matvec_q4_0_spv),
          3, 16},
         {cppllm_rmsnorm_spv, sizeof(cppllm_rmsnorm_spv), 3, 8},
-        {cppllm_rope_spv, sizeof(cppllm_rope_spv), 1, 20},
+        {cppllm_rope_spv, sizeof(cppllm_rope_spv), 2, 20},
         {cppllm_silu_mul_spv, sizeof(cppllm_silu_mul_spv), 3, 4},
         {cppllm_attn_paged_spv, sizeof(cppllm_attn_paged_spv), 5,
          36},

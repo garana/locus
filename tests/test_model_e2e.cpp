@@ -18,6 +18,11 @@ std::string model_path() {
            "/tests/models/stories260K.gguf";
 }
 
+std::string llama32_path() {
+    return std::string(CPPLLM_SOURCE_DIR) +
+           "/tests/models/llama-3.2-1b-q8_0.gguf";
+}
+
 }  // namespace
 
 TEST_CASE("loads a real Llama-family GGUF model", "[e2e]") {
@@ -108,6 +113,53 @@ TEST_CASE("greedy decode matches the llama.cpp golden output",
 
     REQUIRE(trim(generate_text(model, tok, "Once upon a time",
                                40)) == golden);
+}
+
+TEST_CASE("llama-3.2 (BPE + scaled rope) runs consistently",
+          "[e2e][backend]") {
+    if (!std::filesystem::exists(llama32_path())) {
+        SKIP("model not present (llama-3.2-1b-q8_0.gguf)");
+    }
+    auto g = cppllm::gguf::GgufFile::open(llama32_path());
+    auto model = cppllm::model::LlamaModel::load(g);
+    auto tok_ptr = cppllm::tok::tokenizer_from_gguf(g);
+    REQUIRE(!model.rope_factors().empty());  // llama3 scaling
+
+    // All selectable backends must agree with each other; the
+    // text must answer the prompt (no llama.cpp golden here: it
+    // auto-applies the chat template to this model).
+    std::string reference;
+    for (const auto& b : cppllm::backend::backends()) {
+        if (!b.available || !b.selectable) {
+            continue;
+        }
+        INFO("backend " << b.name);
+        model.use_backend(b);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        cppllm::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        auto ids =
+            tok_ptr->encode("The capital of France is", true);
+        for (auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
+        }
+        for (int i = 0; i < 8; ++i) {
+            auto next = cppllm::model::argmax(logits);
+            ids.push_back(next);
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(next, cache, seq, ws, logits);
+        }
+        cache.release(seq);
+        const std::string text = tok_ptr->decode(ids);
+        REQUIRE(text.find("Paris") != std::string::npos);
+        if (reference.empty()) {
+            reference = text;
+        } else {
+            REQUIRE(text == reference);
+        }
+    }
 }
 
 TEST_CASE("every selectable backend reproduces the golden output",

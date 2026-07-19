@@ -56,10 +56,30 @@ struct State {
 
     /** Activation buffers, sized on first use per model dims. */
     VulkanContext::Buffer x{}, xb{}, q{}, gate{}, up{}, attout{},
-        att{}, logits{}, table{};
+        att{}, logits{}, table{}, ones{};
     std::size_t x_n = 0, xb_n = 0, q_n = 0, gate_n = 0, up_n = 0,
                 attout_n = 0, att_n = 0, logits_n = 0,
-                table_n = 0;
+                table_n = 0, ones_n = 0;
+
+    /** Rope divisor buffer: factors when scaled, else 1.0s. */
+    VulkanContext::Buffer rope_divisors(
+        std::span<const float> factors, std::uint32_t half_dim) {
+        if (!factors.empty()) {
+            return upload(factors.data(), factors.size() * 4);
+        }
+        if (half_dim > ones_n) {
+            if (ones_n != 0) {
+                ctx.destroy_buffer(ones);
+            }
+            ones = ctx.create_buffer(half_dim * 4);
+            auto* p = static_cast<float*>(ctx.mapped(ones));
+            for (std::uint32_t i = 0; i < half_dim; ++i) {
+                p[i] = 1.0f;
+            }
+            ones_n = half_dim;
+        }
+        return ones;
+    }
 
     VulkanContext::Buffer upload(const void* ptr,
                                  std::size_t bytes) {
@@ -234,13 +254,15 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
             s.ctx.dispatch(Kernel::kRmsNorm, bufs, push, 1);
         };
 
+        const VulkanContext::Buffer divisors =
+            s.rope_divisors(m.rope_factors(), hp.head_dim / 2);
         norm(lay.attn_norm, s.x, s.xb);
         rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
         rec_matvec(s, lay.wk, s.xb, pool, k_off, false);
         rec_matvec(s, lay.wv, s.xb, pool,
                    k_off + layer_stride / 2, false);
         {
-            const VulkanContext::Buffer bufs[] = {s.q};
+            const VulkanContext::Buffer bufs[] = {s.q, divisors};
             const std::uint32_t push[] = {hp.n_heads,
                                           hp.head_dim, pos, 0,
                                           rope_bits};
@@ -248,7 +270,8 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
                            hp.n_heads);
         }
         {
-            const VulkanContext::Buffer bufs[] = {pool};
+            const VulkanContext::Buffer bufs[] = {pool,
+                                                  divisors};
             const std::uint32_t push[] = {hp.n_kv_heads,
                                           hp.head_dim, pos,
                                           k_off, rope_bits};

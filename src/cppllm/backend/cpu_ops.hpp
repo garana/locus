@@ -45,13 +45,17 @@ void silu_mul(std::span<const float> gate, std::span<const float> up,
 /**
  * Applies interleaved-pair ("norm") RoPE in place, as used by
  * Llama-family models: pairs (x[2i], x[2i+1]) within each head are
- * rotated by pos * freq_base^(-2i/head_dim).
+ * rotated by pos * freq_base^(-2i/head_dim) / factor[i].
  *
  * @param x Q or K activations, n_heads * head_dim floats.
+ * @param factors Per-pair frequency divisors (head_dim/2 entries,
+ *     the GGUF rope_freqs.weight tensor for llama3-scaled
+ *     models); empty means all 1.
  */
 void rope_norm(std::span<float> x, std::uint32_t n_heads,
                std::uint32_t head_dim, std::uint32_t pos,
-               float freq_base);
+               float freq_base,
+               std::span<const float> factors = {});
 
 /**
  * A 2-D weight view into mapped model memory. Rows are output

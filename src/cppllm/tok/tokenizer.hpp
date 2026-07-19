@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -25,6 +26,36 @@ enum class TokenType : std::int32_t {
     kByte = 6,
 };
 
+/** Interface every tokenizer family implements. */
+class Tokenizer {
+  public:
+    virtual ~Tokenizer() = default;
+
+    /** @returns Token ids; prepends BOS when add_bos. */
+    virtual std::vector<TokenId> encode(std::string_view text,
+                                        bool add_bos) const = 0;
+
+    /** @returns UTF-8 text; control tokens render as nothing. */
+    virtual std::string decode(
+        std::span<const TokenId> ids) const = 0;
+
+    /** @returns The raw vocab string for a token id. */
+    virtual std::string_view piece(TokenId id) const = 0;
+
+    virtual std::size_t vocab_size() const = 0;
+    virtual TokenId bos_id() const = 0;
+    virtual TokenId eos_id() const = 0;
+};
+
+/**
+ * Builds the right tokenizer for a model file, dispatching on
+ * `tokenizer.ggml.model` ("llama" -> SPM, "gpt2" -> BPE).
+ *
+ * @throws gguf::Error on unknown tokenizer families.
+ */
+std::unique_ptr<Tokenizer> tokenizer_from_gguf(
+    const gguf::GgufFile& g);
+
 /**
  * SentencePiece-style (SPM) tokenizer for Llama-family models.
  *
@@ -33,7 +64,7 @@ enum class TokenType : std::int32_t {
  * (the "meta" underscore), unknown symbols fall back to `<0xNN>`
  * byte tokens, and remaining misses map to the unk token.
  */
-class SpmTokenizer {
+class SpmTokenizer final : public Tokenizer {
   public:
     /** Vocabulary and special-token configuration. */
     struct Config {
@@ -71,7 +102,7 @@ class SpmTokenizer {
      * @returns Token ids; empty input yields just BOS (if asked).
      */
     std::vector<TokenId> encode(std::string_view text,
-                                bool add_bos) const;
+                                bool add_bos) const override;
 
     /**
      * @param ids Any sequence of in-range token ids.
@@ -79,14 +110,16 @@ class SpmTokenizer {
      *     tokens as their byte. May carry the SPM leading space.
      * @throws std::out_of_range on an id outside the vocabulary.
      */
-    std::string decode(std::span<const TokenId> ids) const;
+    std::string decode(std::span<const TokenId> ids) const override;
 
     /** @returns The piece (raw vocab string) for a token id. */
-    std::string_view piece(TokenId id) const;
+    std::string_view piece(TokenId id) const override;
 
-    std::size_t vocab_size() const { return cfg_.tokens.size(); }
-    TokenId bos_id() const { return cfg_.bos; }
-    TokenId eos_id() const { return cfg_.eos; }
+    std::size_t vocab_size() const override {
+        return cfg_.tokens.size();
+    }
+    TokenId bos_id() const override { return cfg_.bos; }
+    TokenId eos_id() const override { return cfg_.eos; }
     TokenId unk_id() const { return cfg_.unk; }
 
   private:

@@ -23,6 +23,7 @@ add_library(cppllm
     src/cppllm/server/engine_loop.cpp
     src/cppllm/server/server.cpp
     src/cppllm/sys/mmap_file.cpp
+    src/cppllm/tok/bpe_tokenizer.cpp
     src/cppllm/tok/tokenizer.cpp
 )
 target_include_directories(cppllm SYSTEM PRIVATE

@@ -100,9 +100,18 @@ class LlamaModel {
         return out_norm_;
     }
 
+    /**
+     * @returns llama3 rope-scaling divisors (head_dim/2 floats,
+     *     from rope_freqs.weight), or empty when unscaled.
+     */
+    std::span<const float> rope_factors() const {
+        return rope_factors_;
+    }
+
   private:
     Hparams hp_;
     const backend::Backend* backend_ = nullptr;
+    std::span<const float> rope_factors_;
     backend::Mat embd_;
     std::span<const float> out_norm_;
     backend::Mat out_w_;

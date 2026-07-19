@@ -4,7 +4,23 @@
 #include <limits>
 #include <stdexcept>
 
+#include "cppllm/tok/bpe_tokenizer.hpp"
+
 namespace cppllm::tok {
+
+std::unique_ptr<Tokenizer> tokenizer_from_gguf(
+    const gguf::GgufFile& g) {
+    const auto model = g.get_string("tokenizer.ggml.model");
+    if (model == "llama") {
+        return std::make_unique<SpmTokenizer>(
+            SpmTokenizer::from_gguf(g));
+    }
+    if (model == "gpt2") {
+        return std::make_unique<BpeTokenizer>(
+            BpeTokenizer::from_gguf(g));
+    }
+    throw gguf::Error("unsupported tokenizer.ggml.model");
+}
 
 namespace {
 
