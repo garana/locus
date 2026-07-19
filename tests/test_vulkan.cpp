@@ -98,6 +98,83 @@ TEST_CASE("vulkan q8_0 matvec matches the CPU reference",
     ctx.destroy_buffer(ob);
 }
 
+TEST_CASE("vulkan f16 and q4_0 matvec match the CPU reference",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(31);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    const std::uint32_t rows = 5, cols = 64;
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    auto run_kernel = [&](Kernel k, std::span<const std::byte> w,
+                          std::span<float> out) {
+        auto wb =
+            ctx.create_buffer((w.size() + 3) & ~std::size_t{3});
+        auto xb = ctx.create_buffer(x.size() * 4);
+        auto ob = ctx.create_buffer(out.size() * 4);
+        ctx.write_buffer(wb, w);
+        ctx.write_buffer(xb, std::as_bytes(std::span(x)));
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+        const std::uint32_t push[] = {rows, cols, 0, 0};
+        ctx.dispatch(k, bufs, push, (rows + 63) / 64);
+        ctx.end_batch();
+        ctx.read_buffer(ob, std::as_writable_bytes(out));
+        ctx.destroy_buffer(wb);
+        ctx.destroy_buffer(xb);
+        ctx.destroy_buffer(ob);
+    };
+
+    SECTION("f16") {
+        std::vector<std::uint16_t> w(rows * cols);
+        for (auto& v : w) {
+            v = cppllm::backend::f32_to_f16(dist(rng));
+        }
+        std::vector<float> cpu(rows), gpu(rows);
+        cppllm::backend::Mat m{
+            cppllm::gguf::TensorType::kF16,
+            reinterpret_cast<const std::byte*>(w.data()), rows,
+            cols};
+        cppllm::backend::matvec(m, x, cpu);
+        run_kernel(Kernel::kMatvecF16,
+                   std::as_bytes(std::span(w)), gpu);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(gpu[r] ==
+                    Catch::Approx(cpu[r]).margin(1e-3));
+        }
+    }
+
+    SECTION("q4_0") {
+        std::vector<std::byte> w(rows * (cols / 32) * 18);
+        std::uniform_int_distribution<int> nib(0, 255);
+        for (std::size_t b = 0; b < rows * (cols / 32); ++b) {
+            std::byte* blk = w.data() + b * 18;
+            const std::uint16_t d =
+                cppllm::backend::f32_to_f16(0.25f);
+            std::memcpy(blk, &d, 2);
+            for (int i = 0; i < 16; ++i) {
+                blk[2 + i] =
+                    static_cast<std::byte>(nib(rng));
+            }
+        }
+        std::vector<float> cpu(rows), gpu(rows);
+        cppllm::backend::Mat m{cppllm::gguf::TensorType::kQ4_0,
+                               w.data(), rows, cols};
+        cppllm::backend::matvec(m, x, cpu);
+        run_kernel(Kernel::kMatvecQ4_0, w, gpu);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(gpu[r] ==
+                    Catch::Approx(cpu[r]).margin(1e-3));
+        }
+    }
+}
+
 TEST_CASE("gpu matvec beats scalar cpu at real-model sizes",
           "[vulkan][benchmark]") {
     if (!VulkanContext::available()) {

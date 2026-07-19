@@ -9,7 +9,9 @@ namespace cppllm::backend::vk {
 /** Compute kernels compiled into the binary as SPIR-V. */
 enum class Kernel {
     kMatvecF32,
+    kMatvecF16,
     kMatvecQ8_0,
+    kMatvecQ4_0,
     kRmsNorm,
     kRope,
     kSiluMul,

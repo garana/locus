@@ -1,0 +1,46 @@
+#version 450
+
+// Q4_0 matvec: 18-byte blocks (f16 scale + 16 nibble bytes; low
+// nibble is element i, high nibble element i+16, both offset by
+// -8), read through a uint view as in matvec_q8_0.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint out_offset;
+    uint accumulate;
+} pc;
+
+uint byte_at(uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.rows) {
+        return;
+    }
+    uint nb = pc.cols / 32u;
+    uint row_base = r * nb * 18u;
+    float acc = 0.0;
+    for (uint b = 0; b < nb; ++b) {
+        uint at = row_base + b * 18u;
+        float d = unpackHalf2x16(byte_at(at) |
+                                 (byte_at(at + 1u) << 8u)).x;
+        float s = 0.0;
+        for (uint i = 0; i < 16u; ++i) {
+            uint q = byte_at(at + 2u + i);
+            s += (float(q & 0xfu) - 8.0) * x[b * 32u + i];
+            s += (float(q >> 4u) - 8.0) * x[b * 32u + i + 16u];
+        }
+        acc += d * s;
+    }
+    uint at_out = pc.out_offset + r;
+    o[at_out] = pc.accumulate != 0 ? o[at_out] + acc : acc;
+}

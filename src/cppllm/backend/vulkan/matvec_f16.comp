@@ -1,0 +1,36 @@
+#version 450
+
+// F16 matvec: rows of half-precision weights, read through a
+// uint view (two halfs per word) via unpackHalf2x16.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint out_offset;
+    uint accumulate;
+} pc;
+
+float half_at(uint e) {
+    vec2 pair = unpackHalf2x16(w[e >> 1]);
+    return (e & 1u) != 0u ? pair.y : pair.x;
+}
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.rows) {
+        return;
+    }
+    uint base = r * pc.cols;
+    float acc = 0.0;
+    for (uint i = 0; i < pc.cols; ++i) {
+        acc += half_at(base + i) * x[i];
+    }
+    uint at = pc.out_offset + r;
+    o[at] = pc.accumulate != 0 ? o[at] + acc : acc;
+}

@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "attn_paged_spv.h"
+#include "matvec_f16_spv.h"
+#include "matvec_q4_0_spv.h"
 #include "matvec_q8_0_spv.h"
 #include "matvec_spv.h"
 #include "rmsnorm_spv.h"
@@ -37,7 +39,11 @@ struct KernelDesc {
 const KernelDesc& kernel_desc(Kernel k) {
     static const KernelDesc descs[] = {
         {cppllm_matvec_spv, sizeof(cppllm_matvec_spv), 3, 16},
+        {cppllm_matvec_f16_spv, sizeof(cppllm_matvec_f16_spv), 3,
+         16},
         {cppllm_matvec_q8_0_spv, sizeof(cppllm_matvec_q8_0_spv),
+         3, 16},
+        {cppllm_matvec_q4_0_spv, sizeof(cppllm_matvec_q4_0_spv),
          3, 16},
         {cppllm_rmsnorm_spv, sizeof(cppllm_rmsnorm_spv), 3, 8},
         {cppllm_rope_spv, sizeof(cppllm_rope_spv), 1, 20},
