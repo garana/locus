@@ -1,5 +1,6 @@
 #include "cppllm/model/llama.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -50,6 +51,26 @@ Mat need_mat(const GgufFile& g, const std::string& name,
     return Mat{t->type, g.tensor_data(*t).data(), rows, cols};
 }
 
+/** Fetches a 3-D expert tensor, enforcing its shape. */
+LlamaModel::ExpertMat need_mat3(const GgufFile& g,
+                                const std::string& name,
+                                std::uint32_t cols,
+                                std::uint32_t rows,
+                                std::uint32_t n_expert) {
+    const TensorInfo* t = g.find_tensor(name);
+    if (t == nullptr) {
+        throw Error("missing tensor: " + name);
+    }
+    if (t->ne[0] != cols || t->ne[1] != rows ||
+        t->ne[2] != n_expert || t->ne[3] != 1) {
+        throw Error("unexpected shape for tensor: " + name);
+    }
+    LlamaModel::ExpertMat em;
+    em.base = Mat{t->type, g.tensor_data(*t).data(), rows, cols};
+    em.expert_bytes = t->nbytes / n_expert;
+    return em;
+}
+
 /** Fetches a 1-D F32 tensor (norm weights). */
 std::span<const float> need_vec(const GgufFile& g,
                                 const std::string& name,
@@ -83,6 +104,15 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
             .value_or(hp.n_heads));
     hp.n_ff = need_uint(g, "llama.feed_forward_length");
     hp.n_ctx = need_uint(g, "llama.context_length");
+    hp.n_expert = static_cast<std::uint32_t>(
+        g.get_uint("llama.expert_count").value_or(0));
+    hp.n_expert_used = static_cast<std::uint32_t>(
+        g.get_uint("llama.expert_used_count").value_or(0));
+    if (hp.n_expert > 0 &&
+        (hp.n_expert_used == 0 ||
+         hp.n_expert_used > hp.n_expert)) {
+        throw Error("invalid expert_used_count");
+    }
     hp.rms_eps = get_float(
         g, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
     hp.rope_freq_base =
@@ -118,12 +148,26 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
         lay.wv = need_mat(g, p + "attn_v.weight", hp.n_embd, kv_dim);
         lay.wo = need_mat(g, p + "attn_output.weight", hp.n_embd,
                           hp.n_embd);
-        lay.w_gate = need_mat(g, p + "ffn_gate.weight", hp.n_embd,
-                              hp.n_ff);
-        lay.w_up = need_mat(g, p + "ffn_up.weight", hp.n_embd,
-                            hp.n_ff);
-        lay.w_down = need_mat(g, p + "ffn_down.weight", hp.n_ff,
-                              hp.n_embd);
+        if (hp.n_expert > 0) {
+            lay.gate_inp = need_mat(g, p + "ffn_gate_inp.weight",
+                                    hp.n_embd, hp.n_expert);
+            lay.gate_exps =
+                need_mat3(g, p + "ffn_gate_exps.weight",
+                          hp.n_embd, hp.n_ff, hp.n_expert);
+            lay.up_exps =
+                need_mat3(g, p + "ffn_up_exps.weight", hp.n_embd,
+                          hp.n_ff, hp.n_expert);
+            lay.down_exps =
+                need_mat3(g, p + "ffn_down_exps.weight", hp.n_ff,
+                          hp.n_embd, hp.n_expert);
+        } else {
+            lay.w_gate = need_mat(g, p + "ffn_gate.weight",
+                                  hp.n_embd, hp.n_ff);
+            lay.w_up = need_mat(g, p + "ffn_up.weight",
+                                hp.n_embd, hp.n_ff);
+            lay.w_down = need_mat(g, p + "ffn_down.weight",
+                                  hp.n_ff, hp.n_embd);
+        }
         m.layers_.push_back(lay);
     }
 
@@ -151,6 +195,8 @@ LlamaModel::Workspace LlamaModel::make_workspace() const {
     ws.gate.resize(hp_.n_ff);
     ws.up.resize(hp_.n_ff);
     ws.out.resize(hp_.n_embd);
+    ws.router.resize(hp_.n_expert);
+    ws.moe_acc.resize(hp_.n_expert > 0 ? hp_.n_embd : 0);
     return ws;
 }
 
@@ -254,14 +300,59 @@ void LlamaModel::forward(tok::TokenId token,
             ws.x[i] += ws.xb2[i];
         }
 
-        // Feed-forward block (SwiGLU).
+        // Feed-forward block (SwiGLU; dense or MoE).
         rmsnorm(ws.x, lay.ffn_norm, hp_.rms_eps, ws.xb);
-        op.matvec(lay.w_gate, ws.xb, ws.gate);
-        op.matvec(lay.w_up, ws.xb, ws.up);
-        silu_mul(ws.gate, ws.up, ws.gate);
-        op.matvec(lay.w_down, ws.gate, ws.xb2);
-        for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
-            ws.x[i] += ws.xb2[i];
+        if (hp_.n_expert == 0) {
+            op.matvec(lay.w_gate, ws.xb, ws.gate);
+            op.matvec(lay.w_up, ws.xb, ws.up);
+            silu_mul(ws.gate, ws.up, ws.gate);
+            op.matvec(lay.w_down, ws.gate, ws.xb2);
+            for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
+                ws.x[i] += ws.xb2[i];
+            }
+        } else {
+            // Router: softmax over all experts, take the top-k,
+            // renormalize their weights (Mixtral-style gating).
+            op.matvec(lay.gate_inp, ws.xb, ws.router);
+            softmax_inplace(ws.router);
+            std::vector<std::uint32_t> picked;
+            for (std::uint32_t k = 0; k < hp_.n_expert_used;
+                 ++k) {
+                std::uint32_t best = hp_.n_expert;
+                for (std::uint32_t e = 0; e < hp_.n_expert;
+                     ++e) {
+                    const bool taken =
+                        std::find(picked.begin(), picked.end(),
+                                  e) != picked.end();
+                    if (!taken &&
+                        (best == hp_.n_expert ||
+                         ws.router[e] > ws.router[best])) {
+                        best = e;
+                    }
+                }
+                picked.push_back(best);
+            }
+            float wsum = 0.0f;
+            for (auto e : picked) {
+                wsum += ws.router[e];
+            }
+            std::fill(ws.moe_acc.begin(), ws.moe_acc.end(),
+                      0.0f);
+            for (auto e : picked) {
+                const float wgt = ws.router[e] / wsum;
+                op.matvec(lay.gate_exps.expert(e), ws.xb,
+                          ws.gate);
+                op.matvec(lay.up_exps.expert(e), ws.xb, ws.up);
+                silu_mul(ws.gate, ws.up, ws.gate);
+                op.matvec(lay.down_exps.expert(e), ws.gate,
+                          ws.xb2);
+                for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
+                    ws.moe_acc[i] += wgt * ws.xb2[i];
+                }
+            }
+            for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
+                ws.x[i] += ws.moe_acc[i];
+            }
         }
     }
 

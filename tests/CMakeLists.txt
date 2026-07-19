@@ -22,6 +22,7 @@ add_executable(cppllm_tests
     test_vulkan.cpp
     test_tokenizer.cpp
     test_model_e2e.cpp
+    test_moe.cpp
 )
 target_link_libraries(cppllm_tests PRIVATE cppllm catch2)
 target_include_directories(cppllm_tests SYSTEM PRIVATE

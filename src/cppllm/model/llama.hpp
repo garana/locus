@@ -21,6 +21,10 @@ struct Hparams {
     std::uint32_t n_ff = 0;
     std::uint32_t n_vocab = 0;
     std::uint32_t head_dim = 0;
+    /** MoE: expert count (0 = dense FFN). */
+    std::uint32_t n_expert = 0;
+    /** MoE: experts activated per token. */
+    std::uint32_t n_expert_used = 0;
     /** Max context the model was trained for. */
     std::uint32_t n_ctx = 0;
     float rms_eps = 1e-5f;
@@ -59,6 +63,8 @@ class LlamaModel {
     /** Reusable per-thread scratch buffers (no sequence state). */
     struct Workspace {
         std::vector<float> x, xb, xb2, q, att, gate, up, out;
+        /** MoE: router probabilities and expert accumulator. */
+        std::vector<float> router, moe_acc;
     };
 
     /** @returns A workspace sized for this model. */
@@ -87,10 +93,31 @@ class LlamaModel {
                  kv::PagedKvCache::Seq& seq, Workspace& ws,
                  std::span<float> logits) const;
 
+    /**
+     * A 3-D expert tensor: n_expert equally-sized matrices,
+     * contiguous in the mapped file.
+     */
+    struct ExpertMat {
+        backend::Mat base;
+        std::uint64_t expert_bytes = 0;
+
+        /** @returns Expert e's matrix view. */
+        backend::Mat expert(std::uint32_t e) const {
+            backend::Mat m = base;
+            m.data = base.data + e * expert_bytes;
+            return m;
+        }
+    };
+
     /** Per-layer weights (read by GPU backends; else internal). */
     struct Layer {
         std::span<const float> attn_norm, ffn_norm;
-        backend::Mat wq, wk, wv, wo, w_gate, w_up, w_down;
+        backend::Mat wq, wk, wv, wo;
+        /** Dense FFN (unused when the model is MoE). */
+        backend::Mat w_gate, w_up, w_down;
+        /** MoE router and expert tensors (n_expert > 0). */
+        backend::Mat gate_inp;
+        ExpertMat gate_exps, up_exps, down_exps;
     };
 
     const std::vector<Layer>& layers() const { return layers_; }

@@ -189,6 +189,11 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
                     kv::PagedKvCache& cache,
                     kv::PagedKvCache::Seq& seq,
                     std::span<float> logits) {
+    if (m.hparams().n_expert > 0) {
+        // MoE routing is CPU-side for now (R4); the hybrid op
+        // path still runs matmuls on the GPU.
+        return false;
+    }
     State& s = state();
     auto pool_it = s.kv_pools.find(cache.pool_data());
     if (pool_it == s.kv_pools.end()) {

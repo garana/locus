@@ -183,10 +183,11 @@ active) before any large-scale run.
 |       | fingerprinted families, no Jinja) |                             |
 | R3    | K-quants (Q4_K/Q5_K/Q6_K) CPU +   | most published GGUFs of     |
 |       | Vulkan kernels (done 2026-07-19)  | large models                |
-| R4    | MoE FFN: top-k router (softmax    | DeepSeek-V2-Lite end to end |
-|       | and sigmoid+bias), shared         |                             |
-|       | experts, 3-D expert tensors,      |                             |
-|       | per-expert matvec dispatch        |                             |
+| R4    | MoE FFN: top-k router, 3-D expert | Mixtral-style llama-arch    |
+|       | tensors, per-expert matvec (done  | MoE; DeepSeek gating        |
+|       | 2026-07-19: softmax gating,       | (sigmoid+bias, shared       |
+|       | Mixtral-style; GPU falls back to  | experts) moves to R5 with   |
+|       | hybrid for MoE)                   | the deepseek2 arch          |
 | R5    | MLA attention: latent-KV cache    | DeepSeek V3/R1, Kimi K2     |
 |       | (paged cache gains per-layer row  | (memory-viable 128k ctx)    |
 |       | sizes), decoupled RoPE, YaRN      |                             |
