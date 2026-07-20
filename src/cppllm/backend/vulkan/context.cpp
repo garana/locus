@@ -6,9 +6,11 @@
 
 #include <vulkan/vulkan.h>
 
+#include <bit>
 #include <cstring>
 #include <vector>
 
+#include "attn_mla_spv.h"
 #include "attn_paged_spv.h"
 #include "matvec_f16_spv.h"
 #include "matvec_q4_0_spv.h"
@@ -17,6 +19,7 @@
 #include "matvec_q6_k_spv.h"
 #include "matvec_q8_0_spv.h"
 #include "matvec_spv.h"
+#include "matvec_t_spv.h"
 #include "rmsnorm_spv.h"
 #include "rope_spv.h"
 #include "silu_mul_spv.h"
@@ -41,23 +44,27 @@ struct KernelDesc {
 
 const KernelDesc& kernel_desc(Kernel k) {
     static const KernelDesc descs[] = {
-        {cppllm_matvec_spv, sizeof(cppllm_matvec_spv), 3, 16},
+        {cppllm_matvec_spv, sizeof(cppllm_matvec_spv), 3, 28},
         {cppllm_matvec_f16_spv, sizeof(cppllm_matvec_f16_spv), 3,
-         16},
+         28},
         {cppllm_matvec_q8_0_spv, sizeof(cppllm_matvec_q8_0_spv),
-         3, 16},
+         3, 28},
         {cppllm_matvec_q4_0_spv, sizeof(cppllm_matvec_q4_0_spv),
-         3, 16},
+         3, 28},
         {cppllm_matvec_q4_k_spv, sizeof(cppllm_matvec_q4_k_spv),
-         3, 16},
+         3, 28},
         {cppllm_matvec_q5_k_spv, sizeof(cppllm_matvec_q5_k_spv),
-         3, 16},
+         3, 28},
         {cppllm_matvec_q6_k_spv, sizeof(cppllm_matvec_q6_k_spv),
-         3, 16},
-        {cppllm_rmsnorm_spv, sizeof(cppllm_rmsnorm_spv), 3, 8},
-        {cppllm_rope_spv, sizeof(cppllm_rope_spv), 2, 20},
+         3, 28},
+        {cppllm_matvec_t_spv, sizeof(cppllm_matvec_t_spv), 3,
+         20},
+        {cppllm_rmsnorm_spv, sizeof(cppllm_rmsnorm_spv), 3, 12},
+        {cppllm_rope_spv, sizeof(cppllm_rope_spv), 2, 36},
         {cppllm_silu_mul_spv, sizeof(cppllm_silu_mul_spv), 3, 4},
         {cppllm_attn_paged_spv, sizeof(cppllm_attn_paged_spv), 5,
+         36},
+        {cppllm_attn_mla_spv, sizeof(cppllm_attn_mla_spv), 6,
          36},
     };
     return descs[static_cast<int>(k)];
@@ -462,12 +469,39 @@ void VulkanContext::end_batch() {
           "reset descriptor pool");
 }
 
+void VulkanContext::copy_buffer(Buffer src, std::size_t src_off,
+                                Buffer dst, std::size_t dst_off,
+                                std::size_t bytes) {
+    Impl& im = *impl_;
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(im.batch_cmd,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                         &mb, 0, nullptr, 0, nullptr);
+    VkBufferCopy region{src_off, dst_off, bytes};
+    vkCmdCopyBuffer(im.batch_cmd,
+                    static_cast<Impl::HostBuffer*>(src.impl)->buf,
+                    static_cast<Impl::HostBuffer*>(dst.impl)->buf,
+                    1, &region);
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(im.batch_cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                         1, &mb, 0, nullptr, 0, nullptr);
+}
+
 void VulkanContext::matvec_f32(Buffer w, std::uint32_t rows,
                                std::uint32_t cols, Buffer x,
                                Buffer out) {
     begin_batch();
     const Buffer bufs[] = {w, x, out};
-    const std::uint32_t push[] = {rows, cols, 0, 0};
+    const std::uint32_t push[] = {
+        rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
     dispatch(Kernel::kMatvecF32, bufs, push, (rows + 63) / 64);
     end_batch();
 }
@@ -538,6 +572,10 @@ void VulkanContext::dispatch(Kernel, std::span<const Buffer>,
     no_kernels();
 }
 void VulkanContext::end_batch() { no_kernels(); }
+void VulkanContext::copy_buffer(Buffer, std::size_t, Buffer,
+                                std::size_t, std::size_t) {
+    no_kernels();
+}
 void VulkanContext::matvec_f32(Buffer, std::uint32_t,
                                std::uint32_t, Buffer, Buffer) {
     no_kernels();

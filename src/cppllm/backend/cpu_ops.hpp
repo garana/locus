@@ -98,6 +98,14 @@ struct Yarn {
 };
 
 /**
+ * Computes the YARN correction-dim range for a rope of head_dim
+ * (identity yarn yields lo = hi = 0). Exposed so GPU dispatch can
+ * precompute what the shaders need.
+ */
+void yarn_corr_range(std::uint32_t head_dim, float freq_base,
+                     const Yarn& yarn, float& lo, float& hi);
+
+/**
  * NEOX-style RoPE in place: within each head, pairs
  * (x[i], x[i + head_dim/2]) rotate by the YARN-corrected angle.
  */

@@ -1,8 +1,9 @@
 #version 450
 
-// RMS norm: out = x * weight / sqrt(mean(x^2) + eps).
-// Single invocation; n is small (n_embd) and this keeps the
-// reduction trivially correct.
+// RMS norm: out[out_off + i] = x[i] * w[i] / sqrt(mean+eps),
+// over the first n elements of X. Single invocation; n is small
+// (n_embd or kv_lora_rank) and this keeps the reduction
+// trivially correct.
 
 layout(local_size_x = 1) in;
 
@@ -13,6 +14,7 @@ layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(push_constant) uniform PC {
     uint n;
     float eps;
+    uint out_off;
 } pc;
 
 void main() {
@@ -22,6 +24,6 @@ void main() {
     }
     float scale = inversesqrt(ss / float(pc.n) + pc.eps);
     for (uint i = 0; i < pc.n; ++i) {
-        o[i] = x[i] * scale * w[i];
+        o[pc.out_off + i] = x[i] * scale * w[i];
     }
 }

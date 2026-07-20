@@ -1,0 +1,74 @@
+#version 450
+
+// MLA paged attention for one token, one layer: each invocation
+// handles one query head. Scores are dot products of the absorbed
+// query (QABS) and the roped q_pe part of Q against the cached
+// latent rows (rms-normed c_kv | roped k_pe), read through the
+// block table. Output is the softmax-weighted latent per head;
+// the W_uv projection runs as separate matvec dispatches.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, binding = 1) readonly buffer QABS { float qa[]; };
+layout(std430, binding = 2) readonly buffer POOL { float pool[]; };
+layout(std430, binding = 3) readonly buffer TABLE { uint table[]; };
+layout(std430, binding = 4) buffer ATT { float att[]; };
+layout(std430, binding = 5) writeonly buffer L { float lat[]; };
+
+layout(push_constant) uniform PC {
+    uint n_heads;
+    uint rank;          // kv_lora_rank
+    uint nope;          // qk_nope_dim
+    uint rope;          // qk_rope_dim
+    uint n_pos;         // positions to attend over (pos + 1)
+    uint block_tokens;
+    uint block_stride;  // floats per block
+    uint layer_offset;  // floats: layer * layer_stride
+    float kq_scale;
+} pc;
+
+uint row_base(uint t) {
+    uint blk = table[t / pc.block_tokens];
+    return blk * pc.block_stride + pc.layer_offset +
+           (t % pc.block_tokens) * (pc.rank + pc.rope);
+}
+
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= pc.n_heads) {
+        return;
+    }
+    uint qk = pc.nope + pc.rope;
+    uint qpe = h * qk + pc.nope;  // roped q_pe of this head
+    uint qah = h * pc.rank;
+    uint arow = h * pc.n_pos;
+
+    float mx = -3.4e38;
+    for (uint t = 0; t < pc.n_pos; ++t) {
+        uint rb = row_base(t);
+        float s = 0.0;
+        for (uint i = 0; i < pc.rank; ++i) {
+            s += qa[qah + i] * pool[rb + i];
+        }
+        for (uint i = 0; i < pc.rope; ++i) {
+            s += q[qpe + i] * pool[rb + pc.rank + i];
+        }
+        s *= pc.kq_scale;
+        att[arow + t] = s;
+        mx = max(mx, s);
+    }
+    float sum = 0.0;
+    for (uint t = 0; t < pc.n_pos; ++t) {
+        float e = exp(att[arow + t] - mx);
+        att[arow + t] = e;
+        sum += e;
+    }
+    for (uint i = 0; i < pc.rank; ++i) {
+        float acc = 0.0;
+        for (uint t = 0; t < pc.n_pos; ++t) {
+            acc += att[arow + t] * pool[row_base(t) + i];
+        }
+        lat[qah + i] = acc / sum;
+    }
+}

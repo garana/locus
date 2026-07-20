@@ -14,7 +14,10 @@ layout(push_constant) uniform PC {
     uint rows;
     uint cols;
     uint out_offset;  // float offset into O (e.g. a KV pool row)
-    uint accumulate;  // 1: o += result (residual connections)
+    uint accumulate;
+    uint w_off;   // element offset (f32/f16), byte offset (quant)
+    uint x_off;
+    float scale;
 } pc;
 
 void main() {
@@ -24,8 +27,9 @@ void main() {
     }
     float acc = 0.0;
     for (uint i = 0; i < pc.cols; ++i) {
-        acc += w[r * pc.cols + i] * x[i];
+        acc += w[pc.w_off + r * pc.cols + i] * x[pc.x_off + i];
     }
     uint at = pc.out_offset + r;
-    o[at] = pc.accumulate != 0 ? o[at] + acc : acc;
+    float v = acc * pc.scale;
+    o[at] = pc.accumulate != 0 ? o[at] + v : v;
 }

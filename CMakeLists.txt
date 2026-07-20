@@ -83,9 +83,9 @@ if(Vulkan_FOUND)
     find_program(GLSLANG_VALIDATOR glslangValidator)
     if(GLSLANG_VALIDATOR OR GLSLC)
         set(CPPLLM_SHADERS
-            matvec matvec_f16 matvec_q8_0 matvec_q4_0
+            matvec matvec_f16 matvec_q8_0 matvec_q4_0 matvec_t
             matvec_q4_k matvec_q5_k matvec_q6_k
-            rmsnorm rope silu_mul attn_paged)
+            rmsnorm rope silu_mul attn_paged attn_mla)
         set(SHADER_HDRS "")
         foreach(shader ${CPPLLM_SHADERS})
             set(SRC ${CMAKE_SOURCE_DIR}/src/cppllm/backend/vulkan/${shader}.comp)

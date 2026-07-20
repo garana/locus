@@ -1,3 +1,4 @@
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <random>
@@ -84,7 +85,8 @@ TEST_CASE("vulkan q8_0 matvec matches the CPU reference",
     ctx.write_buffer(xb, std::as_bytes(std::span(x)));
     ctx.begin_batch();
     const VulkanContext::Buffer bufs[] = {wb, xb, ob};
-    const std::uint32_t push[] = {rows, cols, 0, 0};
+    const std::uint32_t push[] = {
+        rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
     ctx.dispatch(Kernel::kMatvecQ8_0, bufs, push,
                  (rows + 63) / 64);
     ctx.end_batch();
@@ -122,7 +124,8 @@ TEST_CASE("vulkan f16 and q4_0 matvec match the CPU reference",
         ctx.write_buffer(xb, std::as_bytes(std::span(x)));
         ctx.begin_batch();
         const VulkanContext::Buffer bufs[] = {wb, xb, ob};
-        const std::uint32_t push[] = {rows, cols, 0, 0};
+        const std::uint32_t push[] = {
+        rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
         ctx.dispatch(k, bufs, push, (rows + 63) / 64);
         ctx.end_batch();
         ctx.read_buffer(ob, std::as_writable_bytes(out));
@@ -238,7 +241,8 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
         ctx.write_buffer(xb, std::as_bytes(std::span(x)));
         ctx.begin_batch();
         const VulkanContext::Buffer bufs[] = {wb, xb, ob};
-        const std::uint32_t push[] = {rows, cols, 0, 0};
+        const std::uint32_t push[] = {
+        rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
         ctx.dispatch(c.kernel, bufs, push, (rows + 63) / 64);
         ctx.end_batch();
         ctx.read_buffer(ob,

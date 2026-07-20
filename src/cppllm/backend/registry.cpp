@@ -27,9 +27,9 @@ const std::vector<Backend>& list() {
                      {&matvec, &dequant_row, nullptr}});
         const bool vk = f.vulkan && vulkan_backend_usable();
         b.push_back({"vulkan",
-                     "GPU forward pass via Vulkan (F32/F16/"
-                     "Q8_0/Q4_0/Q4_K/Q5_K/Q6_K weights, paged "
-                     "attention on GPU)",
+                     "GPU forward pass via Vulkan: paged/MLA "
+                     "attention and MoE experts on GPU "
+                     "(F32/F16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K)",
                      vk, vk,
                      {&matvec_vulkan, &dequant_row,
                       &vulkan_alloc_kv}});

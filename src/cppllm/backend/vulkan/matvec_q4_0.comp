@@ -15,6 +15,9 @@ layout(push_constant) uniform PC {
     uint cols;
     uint out_offset;
     uint accumulate;
+    uint w_off;   // element offset (f32/f16), byte offset (quant)
+    uint x_off;
+    float scale;
 } pc;
 
 uint byte_at(uint i) {
@@ -27,7 +30,7 @@ void main() {
         return;
     }
     uint nb = pc.cols / 32u;
-    uint row_base = r * nb * 18u;
+    uint row_base = pc.w_off + r * nb * 18u;
     float acc = 0.0;
     for (uint b = 0; b < nb; ++b) {
         uint at = row_base + b * 18u;
@@ -36,11 +39,12 @@ void main() {
         float s = 0.0;
         for (uint i = 0; i < 16u; ++i) {
             uint q = byte_at(at + 2u + i);
-            s += (float(q & 0xfu) - 8.0) * x[b * 32u + i];
-            s += (float(q >> 4u) - 8.0) * x[b * 32u + i + 16u];
+            s += (float(q & 0xfu) - 8.0) * x[pc.x_off + b * 32u + i];
+            s += (float(q >> 4u) - 8.0) * x[pc.x_off + b * 32u + i + 16u];
         }
         acc += d * s;
     }
     uint at_out = pc.out_offset + r;
-    o[at_out] = pc.accumulate != 0 ? o[at_out] + acc : acc;
+    float v = acc * pc.scale;
+    o[at_out] = pc.accumulate != 0 ? o[at_out] + v : v;
 }

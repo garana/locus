@@ -160,10 +160,15 @@ kv::PagedKvCache LlamaModel::make_cache(
     geom.n_layers = hp_.n_layers;
     geom.kv_dim = spec_->kv_dim(hp_);
     geom.block_tokens = 16;
+    // Default pool covers min(n_ctx, 4096) tokens: long-context
+    // models (128k+) would otherwise demand tens of GB up front.
+    // Callers wanting more pass n_blocks explicitly.
+    const std::uint32_t cap_tokens =
+        std::min(hp_.n_ctx, 4096u);
     geom.n_blocks =
         n_blocks != 0
             ? n_blocks
-            : (hp_.n_ctx + geom.block_tokens - 1) /
+            : (cap_tokens + geom.block_tokens - 1) /
                   geom.block_tokens;
     if (backend_->ops.alloc_kv != nullptr) {
         float* storage = backend_->ops.alloc_kv(

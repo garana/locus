@@ -1,7 +1,8 @@
 #version 450
 
-// Interleaved-pair ("norm") RoPE, one invocation per head,
-// rotating in place at a float offset (Q buffer or a KV pool row).
+// Interleaved-pair RoPE, one invocation per head, rotating in
+// place at `offset + h*stride`. Supports llama frequency factors
+// (divisors buffer) and YARN corrections (freq_scale != 1).
 
 layout(local_size_x = 1) in;
 
@@ -14,8 +15,12 @@ layout(push_constant) uniform PC {
     uint n_heads;
     uint head_dim;
     uint pos;
-    uint offset;  // float offset of the first head
+    uint offset;      // float offset of the first head
+    uint stride;      // floats between consecutive heads
     float freq_base;
+    float freq_scale; // YARN: 1/scaling_factor; 1.0 = off
+    float corr_lo;    // YARN correction dims (precomputed)
+    float corr_hi;
 } pc;
 
 void main() {
@@ -23,12 +28,20 @@ void main() {
     if (h >= pc.n_heads) {
         return;
     }
-    uint base = pc.offset + h * pc.head_dim;
+    uint base = pc.offset + h * pc.stride;
     for (uint i = 0; i + 1u < pc.head_dim; i += 2u) {
-        float theta = float(pc.pos) *
-                      pow(pc.freq_base,
-                          -float(i) / float(pc.head_dim)) /
-                      f[i / 2u];
+        float theta_extrap =
+            float(pc.pos) *
+            pow(pc.freq_base, -float(i) / float(pc.head_dim));
+        float theta = theta_extrap;
+        if (pc.freq_scale != 1.0) {
+            float y = (float(i / 2u) - pc.corr_lo) /
+                      max(0.001, pc.corr_hi - pc.corr_lo);
+            float ramp = 1.0 - min(1.0, max(0.0, y));
+            theta = pc.freq_scale * theta_extrap * (1.0 - ramp) +
+                    theta_extrap * ramp;
+        }
+        theta /= f[i / 2u];
         float c = cos(theta);
         float s = sin(theta);
         float x0 = x[base + i];

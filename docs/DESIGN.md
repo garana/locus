@@ -186,13 +186,15 @@ active) before any large-scale run.
 | R4    | MoE FFN: top-k router, 3-D expert | Mixtral-style llama-arch    |
 |       | tensors, per-expert matvec (done  | MoE; DeepSeek gating        |
 |       | 2026-07-19: softmax gating,       | (sigmoid+bias, shared       |
-|       | Mixtral-style; GPU falls back to  | experts) moves to R5 with   |
-|       | hybrid for MoE)                   | the deepseek2 arch          |
+|       | Mixtral-style; GPU MoE dispatch   | experts) moves to R5 with   |
+|       | added 2026-07-20)                 | the deepseek2 arch          |
 | R5    | MLA + deepseek2 arch (done        | DeepSeek-V2 verified        |
 |       | 2026-07-19: absorbed latent-KV    | token-exact vs llama.cpp;   |
 |       | cache, interleaved YARN rope,     | V3/R1/K2 still need         |
 |       | DeepSeek gating, shared experts,  | q_lora_rank + sigmoid       |
-|       | Q5_0)                             | gating at scale             |
+|       | Q5_0; full GPU MLA+MoE dispatch   | gating at scale             |
+|       | added 2026-07-20, 3x NEON on      |                             |
+|       | V2-Lite)                          |                             |
 | R6    | Architecture registry (done       | new arch = one ArchSpec     |
 |       | 2026-07-20: ArchSpec hooks for    | entry; --archs lists them   |
 |       | hparams/tensors/attention/kv_dim) |                             |

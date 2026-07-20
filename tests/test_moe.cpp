@@ -3,6 +3,8 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "cppllm/backend/registry.hpp"
+#include "cppllm/backend/variants.hpp"
 #include "cppllm/gguf/gguf.hpp"
 #include "cppllm/model/llama.hpp"
 #include "gguf_builder.hpp"
@@ -120,9 +122,14 @@ class ModelBuilder {
 /** Greedy logits after feeding `tokens` through the model. */
 std::vector<float> run(const std::vector<std::byte>& image,
                        const std::vector<cppllm::tok::TokenId>&
-                           tokens) {
+                           tokens,
+                       const char* backend = nullptr) {
     auto g = cppllm::gguf::GgufFile::parse(image);
     auto model = LlamaModel::load(g);
+    if (backend != nullptr) {
+        model.use_backend(
+            *cppllm::backend::find_backend(backend));
+    }
     auto cache = model.make_cache();
     auto ws = model.make_workspace();
     cppllm::kv::PagedKvCache::Seq seq;
@@ -233,6 +240,49 @@ TEST_CASE("router forced to one expert matches that expert's "
     auto b = run(moe_img, toks);
     for (std::size_t i = 0; i < a.size(); ++i) {
         REQUIRE(b[i] == Catch::Approx(a[i]).margin(1e-4));
+    }
+}
+
+TEST_CASE("moe on the vulkan backend matches dense",
+          "[moe][vulkan]") {
+    if (!cppllm::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    const auto wg = weights(kE * kF, 10);
+    const auto wu = weights(kE * kF, 11);
+    const auto wd = weights(kF * kE, 12);
+
+    ModelBuilder dense;
+    dense.common();
+    dense.tensor("blk.0.ffn_gate.weight", {kE, kF}, wg);
+    dense.tensor("blk.0.ffn_up.weight", {kE, kF}, wu);
+    dense.tensor("blk.0.ffn_down.weight", {kF, kE}, wd);
+    auto dense_img = dense.build(0, 0);
+
+    auto rep = [](const std::vector<float>& w, int n) {
+        std::vector<float> out;
+        for (int i = 0; i < n; ++i) {
+            out.insert(out.end(), w.begin(), w.end());
+        }
+        return out;
+    };
+    ModelBuilder moe;
+    moe.common();
+    moe.tensor("blk.0.ffn_gate_inp.weight", {kE, 4},
+               weights(kE * 4, 13));
+    moe.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, 4},
+               rep(wg, 4));
+    moe.tensor("blk.0.ffn_up_exps.weight", {kE, kF, 4},
+               rep(wu, 4));
+    moe.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
+               rep(wd, 4));
+    auto moe_img = moe.build(4, 2);
+
+    const std::vector<cppllm::tok::TokenId> toks = {3, 7, 1};
+    auto a = run(dense_img, toks);  // CPU dense reference
+    auto b = run(moe_img, toks, "vulkan");
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        REQUIRE(b[i] == Catch::Approx(a[i]).margin(1e-3));
     }
 }
 

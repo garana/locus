@@ -1,0 +1,31 @@
+#version 450
+
+// Transposed f32 matvec: out[out_off + c] = sum_r w[r,c]*x[r],
+// over a row-slice of W starting at element w_off. Used by MLA's
+// weight absorption (q_abs = W_uk^T q_nope).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { float w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint w_off;   // element offset of the slice's first row
+    uint x_off;
+    uint out_off;
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.cols) {
+        return;
+    }
+    float acc = 0.0;
+    for (uint r = 0; r < pc.rows; ++r) {
+        acc += w[pc.w_off + r * pc.cols + c] * x[pc.x_off + r];
+    }
+    o[pc.out_off + c] = acc;
+}

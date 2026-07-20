@@ -14,6 +14,9 @@ layout(push_constant) uniform PC {
     uint cols;
     uint out_offset;
     uint accumulate;
+    uint w_off;   // element offset (f32/f16), byte offset (quant)
+    uint x_off;
+    float scale;
 } pc;
 
 float half_at(uint e) {
@@ -26,11 +29,12 @@ void main() {
     if (r >= pc.rows) {
         return;
     }
-    uint base = r * pc.cols;
+    uint base = pc.w_off + r * pc.cols;
     float acc = 0.0;
     for (uint i = 0; i < pc.cols; ++i) {
-        acc += half_at(base + i) * x[i];
+        acc += half_at(base + i) * x[pc.x_off + i];
     }
     uint at = pc.out_offset + r;
-    o[at] = pc.accumulate != 0 ? o[at] + acc : acc;
+    float v = acc * pc.scale;
+    o[at] = pc.accumulate != 0 ? o[at] + v : v;
 }

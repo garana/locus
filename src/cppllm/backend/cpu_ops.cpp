@@ -464,8 +464,9 @@ float yarn_theta(std::uint32_t i, std::uint32_t head_dim,
     return theta_interp * (1.0f - ramp) + theta_extrap * ramp;
 }
 
-void yarn_corr_range(std::uint32_t head_dim, float freq_base,
-                     const Yarn& yarn, float& lo, float& hi) {
+void yarn_corr_range_impl(std::uint32_t head_dim, float freq_base,
+                          const Yarn& yarn, float& lo,
+                          float& hi) {
     lo = 0.0f;
     hi = 0.0f;
     if (yarn.freq_scale == 1.0f || yarn.n_ctx_orig == 0) {
@@ -491,7 +492,7 @@ void rope_neox_yarn(std::span<float> x, std::uint32_t n_heads,
            static_cast<std::size_t>(n_heads) * head_dim);
     const std::uint32_t half = head_dim / 2;
     float corr_lo, corr_hi;
-    yarn_corr_range(head_dim, freq_base, yarn, corr_lo, corr_hi);
+    yarn_corr_range_impl(head_dim, freq_base, yarn, corr_lo, corr_hi);
     for (std::uint32_t h = 0; h < n_heads; ++h) {
         float* v =
             x.data() + static_cast<std::size_t>(h) * head_dim;
@@ -509,13 +510,18 @@ void rope_neox_yarn(std::span<float> x, std::uint32_t n_heads,
     }
 }
 
+void yarn_corr_range(std::uint32_t head_dim, float freq_base,
+                     const Yarn& yarn, float& lo, float& hi) {
+    yarn_corr_range_impl(head_dim, freq_base, yarn, lo, hi);
+}
+
 void rope_norm_yarn(std::span<float> x, std::uint32_t n_heads,
                     std::uint32_t head_dim, std::uint32_t pos,
                     float freq_base, const Yarn& yarn) {
     assert(x.size() ==
            static_cast<std::size_t>(n_heads) * head_dim);
     float corr_lo, corr_hi;
-    yarn_corr_range(head_dim, freq_base, yarn, corr_lo, corr_hi);
+    yarn_corr_range_impl(head_dim, freq_base, yarn, corr_lo, corr_hi);
     for (std::uint32_t h = 0; h < n_heads; ++h) {
         float* v =
             x.data() + static_cast<std::size_t>(h) * head_dim;

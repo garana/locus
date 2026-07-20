@@ -1,4 +1,7 @@
+#include <algorithm>
+#include <stdexcept>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -13,6 +16,10 @@ namespace {
 
 using vk::Kernel;
 using vk::VulkanContext;
+
+std::uint32_t fbits(float v) {
+    return std::bit_cast<std::uint32_t>(v);
+}
 
 /** @returns On-disk bytes of one weight matrix, 4-byte padded. */
 std::size_t weight_bytes(const Mat& w) {
@@ -50,6 +57,32 @@ std::size_t weight_bytes(const Mat& w) {
     return (b + 3) & ~std::size_t{3};
 }
 
+/** @returns The matvec kernel for w, or kCount_ if unsupported. */
+Kernel matvec_kernel(const Mat& w) {
+    switch (w.type) {
+        case gguf::TensorType::kF32: return Kernel::kMatvecF32;
+        case gguf::TensorType::kF16: return Kernel::kMatvecF16;
+        case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0;
+        case gguf::TensorType::kQ4_0: return Kernel::kMatvecQ4_0;
+        case gguf::TensorType::kQ4_K: return Kernel::kMatvecQ4_K;
+        case gguf::TensorType::kQ5_K: return Kernel::kMatvecQ5_K;
+        case gguf::TensorType::kQ6_K: return Kernel::kMatvecQ6_K;
+        default: return Kernel::kCount_;
+    }
+}
+
+/** Converts a byte offset into shader w_off units for w's type. */
+std::uint32_t w_off_units(const Mat& w, std::uint64_t bytes) {
+    switch (w.type) {
+        case gguf::TensorType::kF32:
+            return static_cast<std::uint32_t>(bytes / 4);
+        case gguf::TensorType::kF16:
+            return static_cast<std::uint32_t>(bytes / 2);
+        default:
+            return static_cast<std::uint32_t>(bytes);
+    }
+}
+
 /**
  * Process-lifetime GPU state: one context, resident buffers for
  * weights and norm vectors (keyed by their mmap pointers, stable
@@ -63,15 +96,65 @@ struct State {
     VulkanContext ctx;
     std::unordered_map<const void*, VulkanContext::Buffer>
         resident;
+    /** Weights dequantized to F32 at upload (MLA's wkv_b). */
+    std::unordered_map<const void*, VulkanContext::Buffer>
+        resident_f32;
     std::unordered_map<const void*, VulkanContext::Buffer>
         kv_pools;
 
     /** Activation buffers, sized on first use per model dims. */
     VulkanContext::Buffer x{}, xb{}, q{}, gate{}, up{}, attout{},
-        att{}, logits{}, table{}, ones{};
+        att{}, logits{}, table{}, ones{}, kv_a{}, q_abs{},
+        latent{};
     std::size_t x_n = 0, xb_n = 0, q_n = 0, gate_n = 0, up_n = 0,
                 attout_n = 0, att_n = 0, logits_n = 0,
-                table_n = 0, ones_n = 0;
+                table_n = 0, ones_n = 0, kv_a_n = 0, q_abs_n = 0,
+                latent_n = 0;
+
+    VulkanContext::Buffer upload(const void* ptr,
+                                 std::size_t bytes) {
+        auto it = resident.find(ptr);
+        if (it != resident.end()) {
+            return it->second;
+        }
+        auto buf = ctx.create_buffer(bytes);
+        ctx.write_buffer(
+            buf, {static_cast<const std::byte*>(ptr), bytes});
+        resident.emplace(ptr, buf);
+        return buf;
+    }
+
+    /** Uploads w dequantized to F32 (any CPU-supported type). */
+    VulkanContext::Buffer upload_f32(const Mat& w) {
+        auto it = resident_f32.find(w.data);
+        if (it != resident_f32.end()) {
+            return it->second;
+        }
+        std::vector<float> host(
+            static_cast<std::size_t>(w.rows) * w.cols);
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            dequant_row(w, r,
+                        {host.data() +
+                             static_cast<std::size_t>(r) * w.cols,
+                         w.cols});
+        }
+        auto buf = ctx.create_buffer(host.size() * 4);
+        ctx.write_buffer(
+            buf, std::as_bytes(std::span<const float>(host)));
+        resident_f32.emplace(w.data, buf);
+        return buf;
+    }
+
+    void grow(VulkanContext::Buffer& b, std::size_t& cap,
+              std::size_t n_floats) {
+        if (n_floats > cap) {
+            if (cap != 0) {
+                ctx.destroy_buffer(b);
+            }
+            b = ctx.create_buffer(n_floats * 4);
+            cap = n_floats;
+        }
+    }
 
     /** Rope divisor buffer: factors when scaled, else 1.0s. */
     VulkanContext::Buffer rope_divisors(
@@ -92,30 +175,6 @@ struct State {
         }
         return ones;
     }
-
-    VulkanContext::Buffer upload(const void* ptr,
-                                 std::size_t bytes) {
-        auto it = resident.find(ptr);
-        if (it != resident.end()) {
-            return it->second;
-        }
-        auto buf = ctx.create_buffer(bytes);
-        ctx.write_buffer(
-            buf, {static_cast<const std::byte*>(ptr), bytes});
-        resident.emplace(ptr, buf);
-        return buf;
-    }
-
-    void grow(VulkanContext::Buffer& b, std::size_t& cap,
-              std::size_t n_floats) {
-        if (n_floats > cap) {
-            if (cap != 0) {
-                ctx.destroy_buffer(b);
-            }
-            b = ctx.create_buffer(n_floats * 4);
-            cap = n_floats;
-        }
-    }
 };
 
 State& state() {
@@ -123,28 +182,24 @@ State& state() {
     return s;
 }
 
-/** @returns The matvec kernel for w, or kCount_ if unsupported. */
-Kernel matvec_kernel(const Mat& w) {
-    switch (w.type) {
-        case gguf::TensorType::kF32: return Kernel::kMatvecF32;
-        case gguf::TensorType::kF16: return Kernel::kMatvecF16;
-        case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0;
-        case gguf::TensorType::kQ4_0: return Kernel::kMatvecQ4_0;
-        case gguf::TensorType::kQ4_K: return Kernel::kMatvecQ4_K;
-        case gguf::TensorType::kQ5_K: return Kernel::kMatvecQ5_K;
-        case gguf::TensorType::kQ6_K: return Kernel::kMatvecQ6_K;
-        default: return Kernel::kCount_;
-    }
-}
-
 /** Records one matvec dispatch into the open batch. */
 void rec_matvec(State& s, const Mat& w, VulkanContext::Buffer x,
                 VulkanContext::Buffer out,
-                std::uint32_t out_offset, bool accumulate) {
-    const VulkanContext::Buffer bufs[] = {
-        s.upload(w.data, weight_bytes(w)), x, out};
-    const std::uint32_t push[] = {w.rows, w.cols, out_offset,
-                                  accumulate ? 1u : 0u};
+                std::uint32_t out_offset, bool accumulate,
+                std::uint64_t w_byte_off = 0,
+                std::uint32_t x_off = 0, float scale = 1.0f,
+                VulkanContext::Buffer* whole = nullptr) {
+    const VulkanContext::Buffer wb =
+        whole != nullptr ? *whole
+                         : s.upload(w.data, weight_bytes(w));
+    const VulkanContext::Buffer bufs[] = {wb, x, out};
+    const std::uint32_t push[] = {w.rows,
+                                  w.cols,
+                                  out_offset,
+                                  accumulate ? 1u : 0u,
+                                  w_off_units(w, w_byte_off),
+                                  x_off,
+                                  fbits(scale)};
     s.ctx.dispatch(matvec_kernel(w), bufs, push,
                    (w.rows + 63) / 64);
 }
@@ -178,7 +233,8 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
     s.ctx.write_buffer(s.x, std::as_bytes(x));
     s.ctx.begin_batch();
     const VulkanContext::Buffer bufs[] = {wb, s.x, s.xb};
-    const std::uint32_t push[] = {w.rows, w.cols, 0, 0};
+    const std::uint32_t push[] = {w.rows, w.cols, 0, 0, 0, 0,
+                                  fbits(1.0f)};
     s.ctx.dispatch(matvec_kernel(w), bufs, push,
                    (w.rows + 63) / 64);
     s.ctx.end_batch();
@@ -189,30 +245,38 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
                     kv::PagedKvCache& cache,
                     kv::PagedKvCache::Seq& seq,
                     std::span<float> logits) {
-    if (m.hparams().n_expert > 0 ||
-        m.hparams().arch != model::Arch::kLlama) {
-        // MoE routing and MLA attention are CPU-side for now;
-        // the hybrid op path still runs matmuls on the GPU.
-        return false;
-    }
+    const auto& hp = m.hparams();
     State& s = state();
     auto pool_it = s.kv_pools.find(cache.pool_data());
     if (pool_it == s.kv_pools.end()) {
         return false;  // cache pool is not GPU-mapped
     }
+    const bool mla = hp.arch == model::Arch::kDeepseek2;
     for (const auto& l : m.layers()) {
-        for (const Mat* w : {&l.wq, &l.wk, &l.wv, &l.wo,
-                             &l.w_gate, &l.w_up, &l.w_down}) {
+        const Mat* mats[] = {&l.wq, &l.wo};
+        for (const Mat* w : mats) {
             if (matvec_kernel(*w) == Kernel::kCount_) {
                 return false;
             }
         }
+        auto ok = [](const Mat& w) {
+            return w.rows == 0 ||
+                   matvec_kernel(w) != Kernel::kCount_;
+        };
+        if (!ok(l.wk) || !ok(l.wv) || !ok(l.w_gate) ||
+            !ok(l.w_up) || !ok(l.w_down) || !ok(l.gate_inp) ||
+            !ok(l.gate_exps.base) || !ok(l.up_exps.base) ||
+            !ok(l.down_exps.base) || !ok(l.gate_shexp) ||
+            !ok(l.up_shexp) || !ok(l.down_shexp) ||
+            !ok(l.wkv_a)) {
+            return false;
+        }
+        // wkv_b goes through the F32-dequant path: any CPU type.
     }
     if (matvec_kernel(m.output_weight()) == Kernel::kCount_) {
         return false;
     }
 
-    const auto& hp = m.hparams();
     if (seq.n_tokens >= hp.n_ctx ||
         seq.n_tokens >= cache.capacity(seq)) {
         throw std::invalid_argument("seq capacity not ensured");
@@ -224,19 +288,36 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
         geom.block_tokens * kv_dim * 2;
     const std::uint32_t block_stride =
         hp.n_layers * layer_stride;
-    const std::uint32_t group = hp.n_heads / hp.n_kv_heads;
+
+    const std::uint32_t rank = hp.kv_lora_rank;
+    const std::uint32_t nope = hp.qk_nope_dim;
+    const std::uint32_t rope_d = hp.qk_rope_dim;
+    const std::uint32_t vd = hp.v_head_dim;
+    const std::uint32_t qk = nope + rope_d;
 
     s.grow(s.x, s.x_n, hp.n_embd);
+    const std::uint32_t ff_max = std::max(
+        {hp.n_ff, hp.n_ff_exp,
+         hp.n_ff_exp * hp.n_expert_shared});
     s.grow(s.xb, s.xb_n,
-           std::max<std::size_t>(hp.n_embd, hp.n_ff));
-    s.grow(s.q, s.q_n, hp.n_embd);
-    s.grow(s.gate, s.gate_n, hp.n_ff);
-    s.grow(s.up, s.up_n, hp.n_ff);
-    s.grow(s.attout, s.attout_n, hp.n_embd);
+           std::max<std::size_t>(hp.n_embd, ff_max));
+    s.grow(s.q, s.q_n,
+           mla ? std::size_t{hp.n_heads} * qk : hp.n_embd);
+    s.grow(s.gate, s.gate_n, ff_max);
+    s.grow(s.up, s.up_n, ff_max);
+    s.grow(s.attout, s.attout_n,
+           mla ? std::size_t{hp.n_heads} * vd : hp.n_embd);
     s.grow(s.att, s.att_n,
            static_cast<std::size_t>(hp.n_heads) * hp.n_ctx);
     s.grow(s.logits, s.logits_n, hp.n_vocab);
     s.grow(s.table, s.table_n, cache.total_blocks());
+    if (mla) {
+        s.grow(s.kv_a, s.kv_a_n, rank + rope_d);
+        s.grow(s.q_abs, s.q_abs_n,
+               static_cast<std::size_t>(hp.n_heads) * rank);
+        s.grow(s.latent, s.latent_n,
+               static_cast<std::size_t>(hp.n_heads) * rank);
+    }
 
     // CPU side: embedding lookup and this token's block table.
     std::vector<float> x_host(hp.n_embd);
@@ -249,89 +330,240 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
         std::as_bytes(std::span<const kv::BlockId>(seq.blocks)));
 
     const auto pool = pool_it->second;
-    const float rope_base = hp.rope_freq_base;
-    const std::uint32_t rope_bits =
-        std::bit_cast<std::uint32_t>(rope_base);
-    const std::uint32_t eps_bits =
-        std::bit_cast<std::uint32_t>(hp.rms_eps);
-    // K row of this position inside the pool, in floats.
-    const std::uint32_t block =
-        seq.blocks[pos / geom.block_tokens];
+    const std::uint32_t eps_bits = fbits(hp.rms_eps);
+    const std::uint32_t base_bits = fbits(hp.rope_freq_base);
+    float corr_lo = 0.0f, corr_hi = 0.0f;
+    if (mla) {
+        yarn_corr_range(rope_d, hp.rope_freq_base, hp.yarn,
+                        corr_lo, corr_hi);
+    }
+    const std::uint32_t fs_bits = fbits(hp.yarn.freq_scale);
+    const std::uint32_t lo_bits = fbits(corr_lo);
+    const std::uint32_t hi_bits = fbits(corr_hi);
+    const std::uint32_t block = seq.blocks[pos / geom.block_tokens];
     const std::uint32_t in_block = pos % geom.block_tokens;
+    const std::uint32_t group =
+        hp.n_kv_heads > 0 ? hp.n_heads / hp.n_kv_heads : 1;
+
+    auto norm = [&](std::span<const float> w,
+                    VulkanContext::Buffer in,
+                    VulkanContext::Buffer out,
+                    std::uint32_t n, std::uint32_t out_off) {
+        const VulkanContext::Buffer bufs[] = {
+            in, s.upload(w.data(), w.size() * 4), out};
+        const std::uint32_t push[] = {n, eps_bits, out_off};
+        s.ctx.dispatch(Kernel::kRmsNorm, bufs, push, 1);
+    };
+    auto swiglu = [&](const Mat& wg, const Mat& wu, const Mat& wd,
+                      std::uint32_t ff, float wgt,
+                      std::uint64_t off_g, std::uint64_t off_u,
+                      std::uint64_t off_d,
+                      VulkanContext::Buffer* whole_g,
+                      VulkanContext::Buffer* whole_u,
+                      VulkanContext::Buffer* whole_d) {
+        Mat g2 = wg, u2 = wu, d2 = wd;
+        g2.rows = ff;
+        u2.rows = ff;
+        d2.cols = ff;
+        rec_matvec(s, g2, s.xb, s.gate, 0, false, off_g, 0, 1.0f,
+                   whole_g);
+        rec_matvec(s, u2, s.xb, s.up, 0, false, off_u, 0, 1.0f,
+                   whole_u);
+        const VulkanContext::Buffer bufs[] = {s.gate, s.up,
+                                              s.gate};
+        const std::uint32_t push[] = {ff};
+        s.ctx.dispatch(Kernel::kSiluMul, bufs, push,
+                       (ff + 63) / 64);
+        rec_matvec(s, d2, s.gate, s.x, 0, true, off_d, 0, wgt,
+                   whole_d);
+    };
+
+    std::vector<float> xb_host(hp.n_embd);
+    std::vector<float> router(hp.n_expert);
 
     s.ctx.begin_batch();
     for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
         const auto& lay = m.layers()[l];
-        const std::uint32_t k_off = block * block_stride +
-                                    l * layer_stride +
-                                    in_block * kv_dim;
+        const std::uint32_t row_off = block * block_stride +
+                                      l * layer_stride +
+                                      in_block * kv_dim;
 
-        auto norm = [&](std::span<const float> w,
-                        VulkanContext::Buffer in,
-                        VulkanContext::Buffer out) {
-            const VulkanContext::Buffer bufs[] = {
-                in, s.upload(w.data(), w.size() * 4), out};
-            const std::uint32_t push[] = {hp.n_embd, eps_bits};
-            s.ctx.dispatch(Kernel::kRmsNorm, bufs, push, 1);
-        };
-
-        const VulkanContext::Buffer divisors =
-            s.rope_divisors(m.rope_factors(), hp.head_dim / 2);
-        norm(lay.attn_norm, s.x, s.xb);
-        rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
-        rec_matvec(s, lay.wk, s.xb, pool, k_off, false);
-        rec_matvec(s, lay.wv, s.xb, pool,
-                   k_off + layer_stride / 2, false);
-        {
-            const VulkanContext::Buffer bufs[] = {s.q, divisors};
-            const std::uint32_t push[] = {hp.n_heads,
-                                          hp.head_dim, pos, 0,
-                                          rope_bits};
-            s.ctx.dispatch(Kernel::kRope, bufs, push,
-                           hp.n_heads);
-        }
-        {
-            const VulkanContext::Buffer bufs[] = {pool,
-                                                  divisors};
-            const std::uint32_t push[] = {hp.n_kv_heads,
-                                          hp.head_dim, pos,
-                                          k_off, rope_bits};
-            s.ctx.dispatch(Kernel::kRope, bufs, push,
-                           hp.n_kv_heads);
-        }
-        {
-            const VulkanContext::Buffer bufs[] = {
-                s.q, pool, s.table, s.att, s.attout};
-            const std::uint32_t push[] = {
-                hp.n_heads,   group,
-                hp.head_dim,  kv_dim,
-                pos + 1,      geom.block_tokens,
-                block_stride, l * layer_stride,
-                layer_stride / 2};
-            s.ctx.dispatch(Kernel::kAttnPaged, bufs, push,
-                           hp.n_heads);
+        norm(lay.attn_norm, s.x, s.xb, hp.n_embd, 0);
+        if (!mla) {
+            const VulkanContext::Buffer divisors =
+                s.rope_divisors(m.rope_factors(),
+                                hp.head_dim / 2);
+            rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
+            rec_matvec(s, lay.wk, s.xb, pool, row_off, false);
+            rec_matvec(s, lay.wv, s.xb, pool,
+                       row_off + layer_stride / 2, false);
+            {
+                const VulkanContext::Buffer bufs[] = {s.q,
+                                                      divisors};
+                const std::uint32_t push[] = {
+                    hp.n_heads, hp.head_dim, pos, 0, hp.head_dim,
+                    base_bits,  fbits(1.0f), 0,   0};
+                s.ctx.dispatch(Kernel::kRope, bufs, push,
+                               hp.n_heads);
+            }
+            {
+                const VulkanContext::Buffer bufs[] = {pool,
+                                                      divisors};
+                const std::uint32_t push[] = {
+                    hp.n_kv_heads, hp.head_dim, pos,
+                    row_off,       hp.head_dim, base_bits,
+                    fbits(1.0f),   0,           0};
+                s.ctx.dispatch(Kernel::kRope, bufs, push,
+                               hp.n_kv_heads);
+            }
+            {
+                const VulkanContext::Buffer bufs[] = {
+                    s.q, pool, s.table, s.att, s.attout};
+                const std::uint32_t push[] = {
+                    hp.n_heads,   group,
+                    hp.head_dim,  kv_dim,
+                    pos + 1,      geom.block_tokens,
+                    block_stride, l * layer_stride,
+                    layer_stride / 2};
+                s.ctx.dispatch(Kernel::kAttnPaged, bufs, push,
+                               hp.n_heads);
+            }
+        } else {
+            VulkanContext::Buffer wkv_b32 =
+                s.upload_f32(lay.wkv_b);
+            const VulkanContext::Buffer divisors =
+                s.rope_divisors({}, rope_d / 2);
+            rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
+            rec_matvec(s, lay.wkv_a, s.xb, s.kv_a, 0, false);
+            norm(lay.kv_a_norm, s.kv_a, pool, rank, row_off);
+            s.ctx.copy_buffer(s.kv_a, rank * 4, pool,
+                              (row_off + rank) * 4, rope_d * 4);
+            {
+                const VulkanContext::Buffer bufs[] = {pool,
+                                                      divisors};
+                const std::uint32_t push[] = {
+                    1,       rope_d,  pos,     row_off + rank,
+                    0,       base_bits, fs_bits, lo_bits,
+                    hi_bits};
+                s.ctx.dispatch(Kernel::kRope, bufs, push, 1);
+            }
+            {
+                const VulkanContext::Buffer bufs[] = {s.q,
+                                                      divisors};
+                const std::uint32_t push[] = {
+                    hp.n_heads, rope_d,  pos,     nope,
+                    qk,         base_bits, fs_bits, lo_bits,
+                    hi_bits};
+                s.ctx.dispatch(Kernel::kRope, bufs, push,
+                               hp.n_heads);
+            }
+            for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
+                const VulkanContext::Buffer bufs[] = {
+                    wkv_b32, s.q, s.q_abs};
+                const std::uint32_t push[] = {
+                    nope, rank, (h * (nope + vd)) * rank,
+                    h * qk, h * rank};
+                s.ctx.dispatch(Kernel::kMatvecT, bufs, push,
+                               (rank + 63) / 64);
+            }
+            {
+                const VulkanContext::Buffer bufs[] = {
+                    s.q,   s.q_abs, pool,
+                    s.table, s.att,   s.latent};
+                const std::uint32_t push[] = {
+                    hp.n_heads,   rank,
+                    nope,         rope_d,
+                    pos + 1,      geom.block_tokens,
+                    block_stride, l * layer_stride,
+                    fbits(hp.kq_scale)};
+                s.ctx.dispatch(Kernel::kAttnMla, bufs, push,
+                               hp.n_heads);
+            }
+            for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
+                Mat uv{gguf::TensorType::kF32, nullptr, vd,
+                       rank};
+                rec_matvec(s, uv, s.latent, s.attout, h * vd,
+                           false,
+                           std::uint64_t{h * (nope + vd) + nope} *
+                               rank * 4,
+                           h * rank, 1.0f, &wkv_b32);
+            }
         }
         rec_matvec(s, lay.wo, s.attout, s.x, 0, true);
 
-        norm(lay.ffn_norm, s.x, s.xb);
-        rec_matvec(s, lay.w_gate, s.xb, s.gate, 0, false);
-        rec_matvec(s, lay.w_up, s.xb, s.up, 0, false);
-        {
-            const VulkanContext::Buffer bufs[] = {s.gate, s.up,
-                                                  s.gate};
-            const std::uint32_t push[] = {hp.n_ff};
-            s.ctx.dispatch(Kernel::kSiluMul, bufs, push,
-                           (hp.n_ff + 63) / 64);
+        norm(lay.ffn_norm, s.x, s.xb, hp.n_embd, 0);
+        if (!lay.is_moe()) {
+            swiglu(lay.w_gate, lay.w_up, lay.w_down, hp.n_ff,
+                   1.0f, 0, 0, 0, nullptr, nullptr, nullptr);
+        } else {
+            // Router runs on the CPU: sync the batch, read the
+            // normed activations, gate, then keep recording.
+            s.ctx.end_batch();
+            s.ctx.read_buffer(
+                s.xb,
+                std::as_writable_bytes(std::span<float>(
+                    xb_host.data(), hp.n_embd)));
+            matvec(lay.gate_inp,
+                   {xb_host.data(), hp.n_embd}, router);
+            if (hp.gating == model::GatingFunc::kSoftmax) {
+                softmax_inplace(router);
+            } else {
+                for (float& v : router) {
+                    v = 1.0f / (1.0f + std::exp(-v));
+                }
+            }
+            std::vector<std::uint32_t> picked;
+            for (std::uint32_t k = 0; k < hp.n_expert_used;
+                 ++k) {
+                std::uint32_t best = hp.n_expert;
+                for (std::uint32_t e = 0; e < hp.n_expert; ++e) {
+                    const bool taken =
+                        std::find(picked.begin(), picked.end(),
+                                  e) != picked.end();
+                    if (!taken && (best == hp.n_expert ||
+                                   router[e] > router[best])) {
+                        best = e;
+                    }
+                }
+                picked.push_back(best);
+            }
+            float wsum = 1.0f;
+            if (hp.expert_weights_norm) {
+                wsum = 0.0f;
+                for (auto e : picked) {
+                    wsum += router[e];
+                }
+            }
+            s.ctx.begin_batch();
+            auto whole = [&](const model::LlamaModel::ExpertMat&
+                                 em) {
+                return s.upload(
+                    em.base.data,
+                    (em.expert_bytes * hp.n_expert + 3) &
+                        ~std::uint64_t{3});
+            };
+            VulkanContext::Buffer wg = whole(lay.gate_exps);
+            VulkanContext::Buffer wu = whole(lay.up_exps);
+            VulkanContext::Buffer wd = whole(lay.down_exps);
+            for (auto e : picked) {
+                const float wgt = router[e] / wsum *
+                                  hp.expert_weights_scale;
+                swiglu(lay.gate_exps.base, lay.up_exps.base,
+                       lay.down_exps.base, hp.n_ff_exp, wgt,
+                       e * lay.gate_exps.expert_bytes,
+                       e * lay.up_exps.expert_bytes,
+                       e * lay.down_exps.expert_bytes, &wg, &wu,
+                       &wd);
+            }
+            if (hp.n_expert_shared > 0) {
+                swiglu(lay.gate_shexp, lay.up_shexp,
+                       lay.down_shexp,
+                       hp.n_ff_exp * hp.n_expert_shared, 1.0f, 0,
+                       0, 0, nullptr, nullptr, nullptr);
+            }
         }
-        rec_matvec(s, lay.w_down, s.gate, s.x, 0, true);
     }
-    {
-        const VulkanContext::Buffer bufs[] = {
-            s.x, s.upload(m.output_norm().data(), hp.n_embd * 4),
-            s.xb};
-        const std::uint32_t push[] = {hp.n_embd, eps_bits};
-        s.ctx.dispatch(Kernel::kRmsNorm, bufs, push, 1);
-    }
+    norm(m.output_norm(), s.x, s.xb, hp.n_embd, 0);
     rec_matvec(s, m.output_weight(), s.xb, s.logits, 0, false);
     s.ctx.end_batch();
 

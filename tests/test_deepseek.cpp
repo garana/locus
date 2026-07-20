@@ -3,6 +3,8 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "cppllm/backend/registry.hpp"
+#include "cppllm/backend/variants.hpp"
 #include "cppllm/gguf/gguf.hpp"
 #include "cppllm/model/llama.hpp"
 #include "cppllm/tok/tokenizer.hpp"
@@ -45,25 +47,37 @@ TEST_CASE("deepseek-v2-lite matches llama.cpp token-exact",
         "bit different. She was a little bit shy, a little bit "
         "awkward,";
 
-    auto cache = model.make_cache();
-    auto ws = model.make_workspace();
-    cppllm::kv::PagedKvCache::Seq seq;
-    std::vector<float> logits(hp.n_vocab);
-    auto ids = tok->encode("Once upon a time", true);
-    for (auto id : ids) {
-        REQUIRE(cache.ensure_capacity(seq, 1));
-        model.forward(id, cache, seq, ws, logits);
+    // Run on the default (CPU) backend and, when usable, the
+    // full GPU path (MLA + MoE dispatch) -- both token-exact.
+    std::vector<const cppllm::backend::Backend*> backends = {
+        &model.active_backend()};
+    if (cppllm::backend::vulkan_backend_usable()) {
+        backends.push_back(
+            cppllm::backend::find_backend("vulkan"));
     }
-    for (int i = 0; i < 24; ++i) {
-        auto next = cppllm::model::argmax(logits);
-        if (next == tok->eos_id()) {
-            break;
+    for (const auto* b : backends) {
+        INFO("backend " << b->name);
+        model.use_backend(*b);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        cppllm::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(hp.n_vocab);
+        auto ids = tok->encode("Once upon a time", true);
+        for (auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
         }
-        ids.push_back(next);
-        REQUIRE(cache.ensure_capacity(seq, 1));
-        model.forward(next, cache, seq, ws, logits);
+        for (int i = 0; i < 24; ++i) {
+            auto next = cppllm::model::argmax(logits);
+            if (next == tok->eos_id()) {
+                break;
+            }
+            ids.push_back(next);
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(next, cache, seq, ws, logits);
+        }
+        cache.release(seq);
+        REQUIRE(tok->decode(ids) == want);
+        REQUIRE(cache.free_blocks() == cache.total_blocks());
     }
-    cache.release(seq);
-    REQUIRE(tok->decode(ids) == want);
-    REQUIRE(cache.free_blocks() == cache.total_blocks());
 }

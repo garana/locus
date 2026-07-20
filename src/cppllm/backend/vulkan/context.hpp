@@ -15,10 +15,12 @@ enum class Kernel {
     kMatvecQ4_K,
     kMatvecQ5_K,
     kMatvecQ6_K,
+    kMatvecT,
     kRmsNorm,
     kRope,
     kSiluMul,
     kAttnPaged,
+    kAttnMla,
     kCount_,
 };
 
@@ -85,6 +87,13 @@ class VulkanContext {
 
     /** Submits the batch and waits for completion. */
     void end_batch();
+
+    /**
+     * Records a buffer copy into the open batch, fenced against
+     * surrounding compute dispatches.
+     */
+    void copy_buffer(Buffer src, std::size_t src_off, Buffer dst,
+                     std::size_t dst_off, std::size_t bytes);
 
     /**
      * GPU f32 matvec over resident buffers:
