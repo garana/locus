@@ -91,6 +91,11 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
             lay.down_exps =
                 need_mat3(g, bp + "ffn_down_exps.weight",
                           hp.n_ff_exp, hp.n_embd, hp.n_expert);
+            if (g.find_tensor(bp + "exp_probs_b.bias") !=
+                nullptr) {
+                lay.exp_probs_b = need_vec(
+                    g, bp + "exp_probs_b.bias", hp.n_expert);
+            }
             if (hp.n_expert_shared > 0) {
                 const std::uint32_t sh =
                     hp.n_ff_exp * hp.n_expert_shared;
@@ -150,6 +155,7 @@ LlamaModel::Workspace LlamaModel::make_workspace() const {
         ws.kv_a.resize(hp_.kv_lora_rank + hp_.qk_rope_dim);
         ws.q_abs.resize(hp_.kv_lora_rank);
         ws.latent.resize(hp_.kv_lora_rank);
+        ws.q_a.resize(hp_.q_lora_rank);
     }
     return ws;
 }
@@ -254,6 +260,48 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws) const {
             v = 1.0f / (1.0f + std::exp(-v));
         }
     }
+    // Selection scores add the V3/K2 correction bias (weights do
+    // not); group-limited routing masks all but the best groups,
+    // each scored by the sum of its top-2 selection scores.
+    std::vector<float> sel(ws.router.begin(), ws.router.end());
+    if (!lay.exp_probs_b.empty()) {
+        for (std::uint32_t e = 0; e < hp_.n_expert; ++e) {
+            sel[e] += lay.exp_probs_b[e];
+        }
+    }
+    if (hp_.n_group > 1) {
+        const std::uint32_t per = hp_.n_expert / hp_.n_group;
+        std::vector<float> gscore(hp_.n_group);
+        for (std::uint32_t gi = 0; gi < hp_.n_group; ++gi) {
+            float top1 = -1e30f, top2 = -1e30f;
+            for (std::uint32_t e = gi * per;
+                 e < (gi + 1) * per; ++e) {
+                if (sel[e] > top1) {
+                    top2 = top1;
+                    top1 = sel[e];
+                } else if (sel[e] > top2) {
+                    top2 = sel[e];
+                }
+            }
+            gscore[gi] = top1 + (per > 1 ? top2 : 0.0f);
+        }
+        std::vector<bool> keep(hp_.n_group, false);
+        for (std::uint32_t k = 0; k < hp_.n_group_used; ++k) {
+            std::uint32_t best = hp_.n_group;
+            for (std::uint32_t gi = 0; gi < hp_.n_group; ++gi) {
+                if (!keep[gi] && (best == hp_.n_group ||
+                                  gscore[gi] > gscore[best])) {
+                    best = gi;
+                }
+            }
+            keep[best] = true;
+        }
+        for (std::uint32_t e = 0; e < hp_.n_expert; ++e) {
+            if (!keep[e / per]) {
+                sel[e] = -1e30f;
+            }
+        }
+    }
     std::vector<std::uint32_t> picked;
     for (std::uint32_t k = 0; k < hp_.n_expert_used; ++k) {
         std::uint32_t best = hp_.n_expert;
@@ -262,7 +310,7 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws) const {
                 std::find(picked.begin(), picked.end(), e) !=
                 picked.end();
             if (!taken && (best == hp_.n_expert ||
-                           ws.router[e] > ws.router[best])) {
+                           sel[e] > sel[best])) {
                 best = e;
             }
         }

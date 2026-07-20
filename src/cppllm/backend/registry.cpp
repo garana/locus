@@ -22,6 +22,12 @@ const std::vector<Backend>& list() {
                      f.neon, true,
                      {&matvec_neon, &dequant_row, nullptr}});
 #endif
+#if defined(__x86_64__)
+        b.push_back({"avx2",
+                     "x86-64 AVX2 vectorized matvec (F32/Q8_0)",
+                     f.avx2, true,
+                     {&matvec_avx2, &dequant_row, nullptr}});
+#endif
         b.push_back({"scalar", "portable reference (all types)",
                      true, true,
                      {&matvec, &dequant_row, nullptr}});
@@ -33,6 +39,11 @@ const std::vector<Backend>& list() {
                      vk, vk,
                      {&matvec_vulkan, &dequant_row,
                       &vulkan_alloc_kv}});
+        b.push_back({"cuda",
+                     "NVIDIA CUDA backend (planned; requires a "
+                     "CUDA host and is not built yet)",
+                     false, false,
+                     {&matvec, &dequant_row, nullptr}});
         return b;
     }();
     return v;

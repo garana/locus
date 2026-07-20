@@ -252,6 +252,14 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
         return false;  // cache pool is not GPU-mapped
     }
     const bool mla = hp.arch == model::Arch::kDeepseek2;
+    if (hp.q_lora_rank > 0 || hp.n_group > 1) {
+        return false;  // K2/V3-class paths are CPU-only so far
+    }
+    for (const auto& l : m.layers()) {
+        if (!l.exp_probs_b.empty()) {
+            return false;
+        }
+    }
     for (const auto& l : m.layers()) {
         const Mat* mats[] = {&l.wq, &l.wo};
         for (const Mat* w : mats) {

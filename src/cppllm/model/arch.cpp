@@ -110,10 +110,8 @@ std::uint32_t llama_kv_dim(const Hparams& hp) {
 void deepseek2_hparams(const gguf::GgufFile& g,
                        const std::string& p, Hparams& hp) {
     hp.arch = Arch::kDeepseek2;
-    if (g.get_uint(p + "attention.q_lora_rank").value_or(0) !=
-        0) {
-        throw gguf::Error("q_lora_rank models not yet supported");
-    }
+    hp.q_lora_rank = static_cast<std::uint32_t>(
+        g.get_uint(p + "attention.q_lora_rank").value_or(0));
     hp.kv_lora_rank = need_uint(g, p + "attention.kv_lora_rank");
     hp.qk_rope_dim = need_uint(g, p + "rope.dimension_count");
     const std::uint32_t qk =
@@ -136,6 +134,15 @@ void deepseek2_hparams(const gguf::GgufFile& g,
         g.get_uint(p + "expert_gating_func")
             .value_or(static_cast<std::uint64_t>(
                 GatingFunc::kSoftmax)));
+    hp.n_group = static_cast<std::uint32_t>(
+        g.get_uint(p + "expert_group_count").value_or(1));
+    hp.n_group_used = static_cast<std::uint32_t>(
+        g.get_uint(p + "expert_group_used_count").value_or(1));
+    if (hp.n_group == 0 || hp.n_group_used == 0 ||
+        hp.n_group_used > hp.n_group ||
+        (hp.n_expert > 0 && hp.n_expert % hp.n_group != 0)) {
+        throw gguf::Error("invalid expert group configuration");
+    }
 
     // YARN: frequencies are corrected; the cos/sin mscale cancels
     // for DeepSeek (mscale == mscale_all_dim) and the attention
@@ -163,8 +170,17 @@ void deepseek2_attention_tensors(const gguf::GgufFile& g,
                                  const Hparams& hp,
                                  LlamaModel::Layer& lay) {
     const std::uint32_t qk = hp.qk_nope_dim + hp.qk_rope_dim;
-    lay.wq = need_mat(g, bp + "attn_q.weight", hp.n_embd,
-                      hp.n_heads * qk);
+    if (hp.q_lora_rank > 0) {
+        lay.wq_a = need_mat(g, bp + "attn_q_a.weight", hp.n_embd,
+                            hp.q_lora_rank);
+        lay.q_a_norm = need_vec(g, bp + "attn_q_a_norm.weight",
+                                hp.q_lora_rank);
+        lay.wq_b = need_mat(g, bp + "attn_q_b.weight",
+                            hp.q_lora_rank, hp.n_heads * qk);
+    } else {
+        lay.wq = need_mat(g, bp + "attn_q.weight", hp.n_embd,
+                          hp.n_heads * qk);
+    }
     lay.wkv_a =
         need_mat(g, bp + "attn_kv_a_mqa.weight", hp.n_embd,
                  hp.kv_lora_rank + hp.qk_rope_dim);
@@ -192,8 +208,15 @@ void deepseek2_attention(const LlamaModel& m,
     const std::uint32_t vd = hp.v_head_dim;
     const std::uint32_t qk = nope + rope;
 
+    // Query: direct, or through the compressed q_lora path.
+    if (hp.q_lora_rank > 0) {
+        op.matvec(lay.wq_a, ws.xb, ws.q_a);
+        rmsnorm(ws.q_a, lay.q_a_norm, hp.rms_eps, ws.q_a);
+        op.matvec(lay.wq_b, ws.q_a, ws.q);
+    } else {
+        op.matvec(lay.wq, ws.xb, ws.q);
+    }
     // Latent row: rms-normed c_kv followed by roped shared k_pe.
-    op.matvec(lay.wq, ws.xb, ws.q);
     op.matvec(lay.wkv_a, ws.xb, ws.kv_a);
     float* row = cache.k(seq, l, pos);
     rmsnorm({ws.kv_a.data(), rank}, lay.kv_a_norm, hp.rms_eps,

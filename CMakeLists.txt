@@ -10,6 +10,7 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_library(cppllm
     src/cppllm/backend/cpu_ops.cpp
+    src/cppllm/backend/matvec_avx2.cpp
     src/cppllm/backend/matvec_neon.cpp
     src/cppllm/backend/matvec_vulkan.cpp
     src/cppllm/backend/registry.cpp
@@ -60,6 +61,9 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     check_cxx_compiler_flag("-mavx2" CPPLLM_CC_AVX2)
     if(CPPLLM_CC_AVX2)
         list(APPEND CPPLLM_SIMD_VARIANTS "avx2")
+        set_source_files_properties(
+            src/cppllm/backend/matvec_avx2.cpp
+            PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
     endif()
     check_cxx_compiler_flag("-mavx512f" CPPLLM_CC_AVX512)
     if(CPPLLM_CC_AVX512)

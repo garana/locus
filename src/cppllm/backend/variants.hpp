@@ -15,6 +15,16 @@ void matvec_neon(const Mat& w, std::span<const float> x,
                  std::span<float> out);
 #endif
 
+#if defined(__x86_64__)
+/**
+ * AVX2-vectorized matvec: F32 and Q8_0 rows use AVX2 inner
+ * loops; other weight types delegate to the scalar reference.
+ * Compiled only on x86-64 hosts (per-source -mavx2).
+ */
+void matvec_avx2(const Mat& w, std::span<const float> x,
+                 std::span<float> out);
+#endif
+
 /**
  * Vulkan matvec: F32 weights run on the GPU (uploaded once,
  * resident); other types delegate to the scalar reference.

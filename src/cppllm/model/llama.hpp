@@ -49,6 +49,11 @@ struct Hparams {
     /** MoE: renormalize the top-k weights. */
     bool expert_weights_norm = false;
     GatingFunc gating = GatingFunc::kSoftmax;
+    /** MoE: routing groups (V3/K2 group-limited routing). */
+    std::uint32_t n_group = 1;
+    std::uint32_t n_group_used = 1;
+    /** MLA: query compression rank (0 = direct wq). */
+    std::uint32_t q_lora_rank = 0;
     /** MLA (deepseek2): latent and per-head dims. */
     std::uint32_t kv_lora_rank = 0;
     std::uint32_t qk_nope_dim = 0;
@@ -98,8 +103,9 @@ class LlamaModel {
         std::vector<float> x, xb, xb2, q, att, gate, up, out;
         /** MoE: router probabilities and expert accumulator. */
         std::vector<float> router, moe_acc;
-        /** MLA: kv_a projection, absorbed q, weighted latent. */
-        std::vector<float> kv_a, q_abs, latent;
+        /** MLA: kv_a projection, absorbed q, weighted latent,
+         * compressed query. */
+        std::vector<float> kv_a, q_abs, latent, q_a;
     };
 
     /** @returns A workspace sized for this model. */
@@ -158,6 +164,11 @@ class LlamaModel {
         /** MLA (deepseek2): latent projections and norms. */
         backend::Mat wkv_a, wkv_b;
         std::span<const float> kv_a_norm;
+        /** MLA: compressed-query path (q_lora_rank > 0). */
+        backend::Mat wq_a, wq_b;
+        std::span<const float> q_a_norm;
+        /** MoE: selection bias (V3/K2 e_score_correction). */
+        std::span<const float> exp_probs_b;
 
         /** @returns true when this layer routes experts. */
         bool is_moe() const { return gate_inp.rows > 0; }
