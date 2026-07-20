@@ -114,10 +114,16 @@ void deepseek2_hparams(const gguf::GgufFile& g,
         g.get_uint(p + "attention.q_lora_rank").value_or(0));
     hp.kv_lora_rank = need_uint(g, p + "attention.kv_lora_rank");
     hp.qk_rope_dim = need_uint(g, p + "rope.dimension_count");
-    const std::uint32_t qk =
-        need_uint(g, p + "attention.key_length");
+    // Newer conversions store per-head dims in *_mla and repurpose
+    // key/value_length for the absorbed sizes; prefer the former.
+    const std::uint32_t qk = static_cast<std::uint32_t>(
+        g.get_uint(p + "attention.key_length_mla")
+            .value_or(need_uint(g, p + "attention.key_length")));
     hp.qk_nope_dim = qk - hp.qk_rope_dim;
-    hp.v_head_dim = need_uint(g, p + "attention.value_length");
+    hp.v_head_dim = static_cast<std::uint32_t>(
+        g.get_uint(p + "attention.value_length_mla")
+            .value_or(
+                need_uint(g, p + "attention.value_length")));
     hp.head_dim = qk;
     hp.n_expert_shared = static_cast<std::uint32_t>(
         g.get_uint(p + "expert_shared_count").value_or(0));
