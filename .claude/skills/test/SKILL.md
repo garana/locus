@@ -16,7 +16,9 @@ description: Build and run the cpp-llm Catch2 unit tests. Use after
   [backend], [engine], [server], [vulkan], [e2e]; keep this list
   current as suites are added).
 - [e2e] needs the ~1 MB test model: `scripts/fetch-test-model.sh`
-  (gitignored under tests/models/; tests SKIP if absent).
+  (gitignored under tests/models/; tests SKIP if absent). Larger
+  optional models (llama-3.2-1b Q8_0/Q4_K_M, deepseek-v2-lite)
+  enable more goldens; [deepseek] alone takes ~2 min of CPU.
 - Every new component gets its own `tests/test_<name>.cpp`,
   registered in `tests/CMakeLists.txt`, using the vendored Catch2
   (`#include "catch_amalgamated.hpp"`).

@@ -12,8 +12,21 @@
 
 namespace cppllm::model {
 
+/** Model architecture families the runtime implements. */
+enum class Arch {
+    kLlama,
+    kDeepseek2,
+};
+
+/** MoE gating functions (deepseek2.expert_gating_func values). */
+enum class GatingFunc : std::uint32_t {
+    kSoftmax = 1,
+    kSigmoid = 2,
+};
+
 /** Llama-family hyperparameters read from GGUF metadata. */
 struct Hparams {
+    Arch arch = Arch::kLlama;
     std::uint32_t n_embd = 0;
     std::uint32_t n_layers = 0;
     std::uint32_t n_heads = 0;
@@ -25,6 +38,26 @@ struct Hparams {
     std::uint32_t n_expert = 0;
     /** MoE: experts activated per token. */
     std::uint32_t n_expert_used = 0;
+    /** MoE: always-on shared experts (deepseek2). */
+    std::uint32_t n_expert_shared = 0;
+    /** MoE: first layers that use the dense FFN (deepseek2). */
+    std::uint32_t n_dense_lead = 0;
+    /** MoE: per-expert FFN width (deepseek2; else n_ff). */
+    std::uint32_t n_ff_exp = 0;
+    /** MoE: routed-expert weight multiplier. */
+    float expert_weights_scale = 1.0f;
+    /** MoE: renormalize the top-k weights. */
+    bool expert_weights_norm = false;
+    GatingFunc gating = GatingFunc::kSoftmax;
+    /** MLA (deepseek2): latent and per-head dims. */
+    std::uint32_t kv_lora_rank = 0;
+    std::uint32_t qk_nope_dim = 0;
+    std::uint32_t qk_rope_dim = 0;
+    std::uint32_t v_head_dim = 0;
+    /** Attention score scale (arch-dependent; yarn mscale^2). */
+    float kq_scale = 0.0f;
+    /** YARN rope correction (freq_scale 1 = off). */
+    backend::Yarn yarn;
     /** Max context the model was trained for. */
     std::uint32_t n_ctx = 0;
     float rms_eps = 1e-5f;
@@ -65,6 +98,8 @@ class LlamaModel {
         std::vector<float> x, xb, xb2, q, att, gate, up, out;
         /** MoE: router probabilities and expert accumulator. */
         std::vector<float> router, moe_acc;
+        /** MLA: kv_a projection, absorbed q, weighted latent. */
+        std::vector<float> kv_a, q_abs, latent;
     };
 
     /** @returns A workspace sized for this model. */
@@ -113,11 +148,19 @@ class LlamaModel {
     struct Layer {
         std::span<const float> attn_norm, ffn_norm;
         backend::Mat wq, wk, wv, wo;
-        /** Dense FFN (unused when the model is MoE). */
+        /** Dense FFN (unused when the layer is MoE). */
         backend::Mat w_gate, w_up, w_down;
-        /** MoE router and expert tensors (n_expert > 0). */
+        /** MoE router and expert tensors. */
         backend::Mat gate_inp;
         ExpertMat gate_exps, up_exps, down_exps;
+        /** MoE shared experts (deepseek2; fused matrices). */
+        backend::Mat gate_shexp, up_shexp, down_shexp;
+        /** MLA (deepseek2): latent projections and norms. */
+        backend::Mat wkv_a, wkv_b;
+        std::span<const float> kv_a_norm;
+
+        /** @returns true when this layer routes experts. */
+        bool is_moe() const { return gate_inp.rows > 0; }
     };
 
     const std::vector<Layer>& layers() const { return layers_; }
@@ -136,6 +179,16 @@ class LlamaModel {
     }
 
   private:
+    void attention_dense(const Layer& lay,
+                         kv::PagedKvCache& cache,
+                         kv::PagedKvCache::Seq& seq,
+                         Workspace& ws, std::uint32_t l,
+                         std::uint32_t pos) const;
+    void attention_mla(const Layer& lay, kv::PagedKvCache& cache,
+                       kv::PagedKvCache::Seq& seq, Workspace& ws,
+                       std::uint32_t l, std::uint32_t pos) const;
+    void moe_ffn(const Layer& lay, Workspace& ws) const;
+
     Hparams hp_;
     const backend::Backend* backend_ = nullptr;
     std::span<const float> rope_factors_;

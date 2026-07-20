@@ -188,9 +188,11 @@ active) before any large-scale run.
 |       | 2026-07-19: softmax gating,       | (sigmoid+bias, shared       |
 |       | Mixtral-style; GPU falls back to  | experts) moves to R5 with   |
 |       | hybrid for MoE)                   | the deepseek2 arch          |
-| R5    | MLA attention: latent-KV cache    | DeepSeek V3/R1, Kimi K2     |
-|       | (paged cache gains per-layer row  | (memory-viable 128k ctx)    |
-|       | sizes), decoupled RoPE, YaRN      |                             |
+| R5    | MLA + deepseek2 arch (done        | DeepSeek-V2 verified        |
+|       | 2026-07-19: absorbed latent-KV    | token-exact vs llama.cpp;   |
+|       | cache, interleaved YARN rope,     | V3/R1/K2 still need         |
+|       | DeepSeek gating, shared experts,  | q_lora_rank + sigmoid       |
+|       | Q5_0)                             | gating at scale             |
 | R6    | Architecture registry ("llama",   | clean multi-arch dispatch   |
 |       | "deepseek2", ...) replacing the   |                             |
 |       | single hardcoded forward          |                             |

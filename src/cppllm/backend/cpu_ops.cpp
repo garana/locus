@@ -12,6 +12,9 @@ namespace {
 constexpr std::size_t kQ8_0BlockBytes = 34;
 /** Q4_0 block: 32 elems, f16 scale + 16 nibble bytes (18 bytes). */
 constexpr std::size_t kQ4_0BlockBytes = 18;
+/** Q5_0 block: 32 elems, f16 scale + 4 high-bit bytes + 16
+ * nibble bytes (22 bytes). */
+constexpr std::size_t kQ5_0BlockBytes = 22;
 
 std::uint16_t load_u16(const std::byte* p) {
     std::uint16_t v;
@@ -66,6 +69,37 @@ float dot_q4_0(const std::byte* row, std::span<const float> x) {
             s += lo * x[b * 32 + i] + hi * x[b * 32 + i + 16];
         }
         acc += d * s;
+    }
+    return acc;
+}
+
+/** Dequantizes one Q5_0 block (32 elems) into y. */
+void dequant_block_q5_0(const std::byte* blk, float* y) {
+    const float d = f16_to_f32(load_u16(blk));
+    std::uint32_t qh;
+    std::memcpy(&qh, blk + 2, 4);
+    const auto* qs =
+        reinterpret_cast<const std::uint8_t*>(blk + 6);
+    for (int j = 0; j < 16; ++j) {
+        const std::uint8_t xh0 =
+            static_cast<std::uint8_t>(((qh >> j) << 4) & 0x10);
+        const std::uint8_t xh1 =
+            static_cast<std::uint8_t>((qh >> (j + 12)) & 0x10);
+        y[j] = d * (static_cast<float>((qs[j] & 0x0f) | xh0) -
+                    16.0f);
+        y[j + 16] =
+            d * (static_cast<float>((qs[j] >> 4) | xh1) - 16.0f);
+    }
+}
+
+float dot_q5_0(const std::byte* row, std::span<const float> x) {
+    float acc = 0.0f;
+    float tmp[32];
+    for (std::size_t b = 0; b < x.size() / 32; ++b) {
+        dequant_block_q5_0(row + b * kQ5_0BlockBytes, tmp);
+        for (int i = 0; i < 32; ++i) {
+            acc += tmp[i] * x[b * 32 + i];
+        }
     }
     return acc;
 }
@@ -230,6 +264,8 @@ std::size_t row_bytes(const Mat& w) {
             return w.cols / 32ull * kQ8_0BlockBytes;
         case gguf::TensorType::kQ4_0:
             return w.cols / 32ull * kQ4_0BlockBytes;
+        case gguf::TensorType::kQ5_0:
+            return w.cols / 32ull * kQ5_0BlockBytes;
         case gguf::TensorType::kQ4_K:
         case gguf::TensorType::kQ5_K:
         case gguf::TensorType::kQ6_K:
@@ -369,6 +405,134 @@ void rope_norm(std::span<float> x, std::uint32_t n_heads,
     }
 }
 
+std::size_t mat_row_bytes(const Mat& w) { return row_bytes(w); }
+
+void matvec_t(const Mat& w, std::span<const float> x,
+              std::span<float> out) {
+    assert(x.size() == w.rows && out.size() == w.cols);
+    std::fill(out.begin(), out.end(), 0.0f);
+    static thread_local std::vector<float> tmp;
+    tmp.resize(w.cols);
+    for (std::uint32_t r = 0; r < w.rows; ++r) {
+        const float xr = x[r];
+        if (xr == 0.0f) {
+            continue;
+        }
+        dequant_row(w, r, tmp);
+        for (std::uint32_t c = 0; c < w.cols; ++c) {
+            out[c] += xr * tmp[c];
+        }
+    }
+}
+
+namespace {
+
+/** ggml's YARN correction dim for one beta. */
+float yarn_corr_dim(std::uint32_t n_dims,
+                    std::uint32_t n_ctx_orig, float beta,
+                    float base) {
+    return static_cast<float>(n_dims) *
+           std::log(static_cast<float>(n_ctx_orig) /
+                    (beta * 2.0f *
+                     3.14159265358979323846f)) /
+           (2.0f * std::log(base));
+}
+
+}  // namespace
+
+namespace {
+
+/** YARN-corrected rotation angle for pair index i (of half). */
+float yarn_theta(std::uint32_t i, std::uint32_t head_dim,
+                 std::uint32_t pos, float freq_base,
+                 const Yarn& yarn, float corr_lo,
+                 float corr_hi) {
+    const float theta_extrap =
+        static_cast<float>(pos) *
+        std::pow(freq_base, -2.0f * static_cast<float>(i) /
+                                static_cast<float>(head_dim));
+    if (yarn.freq_scale == 1.0f || yarn.n_ctx_orig == 0) {
+        return theta_extrap;
+    }
+    // Interpolate above corr_hi, extrapolate below corr_lo,
+    // ramp in between (ggml rope_yarn with ext_factor = 1).
+    const float y = (static_cast<float>(i) - corr_lo) /
+                    std::max(0.001f, corr_hi - corr_lo);
+    const float ramp =
+        1.0f - std::min(1.0f, std::max(0.0f, y));
+    const float theta_interp = yarn.freq_scale * theta_extrap;
+    return theta_interp * (1.0f - ramp) + theta_extrap * ramp;
+}
+
+void yarn_corr_range(std::uint32_t head_dim, float freq_base,
+                     const Yarn& yarn, float& lo, float& hi) {
+    lo = 0.0f;
+    hi = 0.0f;
+    if (yarn.freq_scale == 1.0f || yarn.n_ctx_orig == 0) {
+        return;
+    }
+    lo = std::max(
+        0.0f, std::floor(yarn_corr_dim(head_dim,
+                                       yarn.n_ctx_orig,
+                                       yarn.beta_fast,
+                                       freq_base)));
+    hi = std::min(
+        static_cast<float>(head_dim) - 1.0f,
+        std::ceil(yarn_corr_dim(head_dim, yarn.n_ctx_orig,
+                                yarn.beta_slow, freq_base)));
+}
+
+}  // namespace
+
+void rope_neox_yarn(std::span<float> x, std::uint32_t n_heads,
+                    std::uint32_t head_dim, std::uint32_t pos,
+                    float freq_base, const Yarn& yarn) {
+    assert(x.size() ==
+           static_cast<std::size_t>(n_heads) * head_dim);
+    const std::uint32_t half = head_dim / 2;
+    float corr_lo, corr_hi;
+    yarn_corr_range(head_dim, freq_base, yarn, corr_lo, corr_hi);
+    for (std::uint32_t h = 0; h < n_heads; ++h) {
+        float* v =
+            x.data() + static_cast<std::size_t>(h) * head_dim;
+        for (std::uint32_t i = 0; i < half; ++i) {
+            const float theta =
+                yarn_theta(i, head_dim, pos, freq_base, yarn,
+                           corr_lo, corr_hi);
+            const float c = std::cos(theta) * yarn.mscale;
+            const float s = std::sin(theta) * yarn.mscale;
+            const float x0 = v[i];
+            const float x1 = v[i + half];
+            v[i] = x0 * c - x1 * s;
+            v[i + half] = x0 * s + x1 * c;
+        }
+    }
+}
+
+void rope_norm_yarn(std::span<float> x, std::uint32_t n_heads,
+                    std::uint32_t head_dim, std::uint32_t pos,
+                    float freq_base, const Yarn& yarn) {
+    assert(x.size() ==
+           static_cast<std::size_t>(n_heads) * head_dim);
+    float corr_lo, corr_hi;
+    yarn_corr_range(head_dim, freq_base, yarn, corr_lo, corr_hi);
+    for (std::uint32_t h = 0; h < n_heads; ++h) {
+        float* v =
+            x.data() + static_cast<std::size_t>(h) * head_dim;
+        for (std::uint32_t i = 0; i < head_dim / 2; ++i) {
+            const float theta =
+                yarn_theta(i, head_dim, pos, freq_base, yarn,
+                           corr_lo, corr_hi);
+            const float c = std::cos(theta) * yarn.mscale;
+            const float s = std::sin(theta) * yarn.mscale;
+            const float x0 = v[2 * i];
+            const float x1 = v[2 * i + 1];
+            v[2 * i] = x0 * c - x1 * s;
+            v[2 * i + 1] = x0 * s + x1 * c;
+        }
+    }
+}
+
 void matvec(const Mat& w, std::span<const float> x,
             std::span<float> out) {
     assert(x.size() == w.cols && out.size() == w.rows);
@@ -387,6 +551,9 @@ void matvec(const Mat& w, std::span<const float> x,
                 break;
             case gguf::TensorType::kQ4_0:
                 out[r] = dot_q4_0(row, x);
+                break;
+            case gguf::TensorType::kQ5_0:
+                out[r] = dot_q5_0(row, x);
                 break;
             default:
                 out[r] = dot_k_quant(w, row, x);
@@ -431,6 +598,13 @@ void dequant_row(const Mat& w, std::uint32_t row,
                     out[b * 32 + i + 16] =
                         d * (static_cast<float>(q[i] >> 4) - 8.0f);
                 }
+            }
+            break;
+        }
+        case gguf::TensorType::kQ5_0: {
+            for (std::uint32_t b = 0; b < w.cols / 32; ++b) {
+                dequant_block_q5_0(p + b * kQ5_0BlockBytes,
+                                   out.data() + b * 32);
             }
             break;
         }

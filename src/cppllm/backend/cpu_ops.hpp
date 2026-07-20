@@ -79,9 +79,59 @@ void matvec(const Mat& w, std::span<const float> x,
             std::span<float> out);
 
 /**
+ * Transposed matrix-vector product: out[c] = sum_r w[r,c]*x[r]
+ * (i.e. W^T x). Used by MLA's weight absorption; scalar only.
+ */
+void matvec_t(const Mat& w, std::span<const float> x,
+              std::span<float> out);
+
+/** YARN long-context rope correction parameters. */
+struct Yarn {
+    /** 1/scaling_factor; 1.0 disables all corrections. */
+    float freq_scale = 1.0f;
+    /** cos/sin magnitude scale (1.0 for DeepSeek: it cancels). */
+    float mscale = 1.0f;
+    /** Original (pre-scaling) training context. */
+    std::uint32_t n_ctx_orig = 0;
+    float beta_fast = 32.0f;
+    float beta_slow = 1.0f;
+};
+
+/**
+ * NEOX-style RoPE in place: within each head, pairs
+ * (x[i], x[i + head_dim/2]) rotate by the YARN-corrected angle.
+ */
+void rope_neox_yarn(std::span<float> x, std::uint32_t n_heads,
+                    std::uint32_t head_dim, std::uint32_t pos,
+                    float freq_base, const Yarn& yarn);
+
+/**
+ * Interleaved-pair RoPE with YARN corrections: pairs
+ * (x[2i], x[2i+1]) rotate by the corrected angle. This is what
+ * deepseek2 applies to its q_pe/k_pe (the HF implementation's
+ * de-interleaving view makes its rotate_half equivalent to
+ * interleaved pairs; verified against llama.cpp tensors).
+ */
+void rope_norm_yarn(std::span<float> x, std::uint32_t n_heads,
+                    std::uint32_t head_dim, std::uint32_t pos,
+                    float freq_base, const Yarn& yarn);
+
+/**
  * Dequantizes one row of w into out (used for embedding lookup).
  */
 void dequant_row(const Mat& w, std::uint32_t row,
                  std::span<float> out);
+
+/** @returns On-disk bytes of one row of w (for row slicing). */
+std::size_t mat_row_bytes(const Mat& w);
+
+/** @returns The nrows-row sub-matrix of w starting at row0. */
+inline Mat mat_rows(const Mat& w, std::uint32_t row0,
+                    std::uint32_t nrows) {
+    Mat s = w;
+    s.data = w.data + row0 * mat_row_bytes(w);
+    s.rows = nrows;
+    return s;
+}
 
 }  // namespace cppllm::backend
