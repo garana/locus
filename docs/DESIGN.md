@@ -193,9 +193,9 @@ active) before any large-scale run.
 |       | cache, interleaved YARN rope,     | V3/R1/K2 still need         |
 |       | DeepSeek gating, shared experts,  | q_lora_rank + sigmoid       |
 |       | Q5_0)                             | gating at scale             |
-| R6    | Architecture registry ("llama",   | clean multi-arch dispatch   |
-|       | "deepseek2", ...) replacing the   |                             |
-|       | single hardcoded forward          |                             |
+| R6    | Architecture registry (done       | new arch = one ArchSpec     |
+|       | 2026-07-20: ArchSpec hooks for    | entry; --archs lists them   |
+|       | hparams/tensors/attention/kv_dim) |                             |
 | R7    | Kimi K3: Kimi Delta Attention     | K3 once weights + GGUF      |
 |       | (per-layer recurrent state        | support exist (due          |
 |       | alongside paged KV), MXFP4        | 2026-07-27); arch id not    |

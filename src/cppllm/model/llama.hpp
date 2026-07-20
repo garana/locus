@@ -179,17 +179,10 @@ class LlamaModel {
     }
 
   private:
-    void attention_dense(const Layer& lay,
-                         kv::PagedKvCache& cache,
-                         kv::PagedKvCache::Seq& seq,
-                         Workspace& ws, std::uint32_t l,
-                         std::uint32_t pos) const;
-    void attention_mla(const Layer& lay, kv::PagedKvCache& cache,
-                       kv::PagedKvCache::Seq& seq, Workspace& ws,
-                       std::uint32_t l, std::uint32_t pos) const;
     void moe_ffn(const Layer& lay, Workspace& ws) const;
 
     Hparams hp_;
+    const struct ArchSpec* spec_ = nullptr;
     const backend::Backend* backend_ = nullptr;
     std::span<const float> rope_factors_;
     backend::Mat embd_;

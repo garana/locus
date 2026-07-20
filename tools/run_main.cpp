@@ -21,6 +21,10 @@ int main(int argc, char** argv) {
         cppllm_tools::print_backends();
         return 0;
     }
+    if (args.list_archs) {
+        cppllm_tools::print_archs();
+        return 0;
+    }
     if (args.help) {
         std::printf(
             "usage: %s [options] <model.gguf> <prompt> "

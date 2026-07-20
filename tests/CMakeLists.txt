@@ -11,6 +11,7 @@ add_executable(cppllm_tests
     test_sanity.cpp
     test_block_allocator.cpp
     test_features.cpp
+    test_arch_registry.cpp
     test_backend_registry.cpp
     test_bpe_tokenizer.cpp
     test_chat_template.cpp

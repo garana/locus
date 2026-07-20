@@ -20,6 +20,7 @@ add_library(cppllm
     src/cppllm/kv/block_allocator.cpp
     src/cppllm/kv/paged_cache.cpp
     src/cppllm/sys/features.cpp
+    src/cppllm/model/arch.cpp
     src/cppllm/model/llama.cpp
     src/cppllm/server/engine_loop.cpp
     src/cppllm/server/server.cpp

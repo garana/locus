@@ -6,8 +6,19 @@
 #include <vector>
 
 #include "cppllm/backend/registry.hpp"
+#include "cppllm/model/arch.hpp"
 
 namespace cppllm_tools {
+
+/** Prints the supported model architectures. */
+inline void print_archs() {
+    std::printf("architectures:\n");
+    for (const auto& a : cppllm::model::archs()) {
+        std::printf("  %-10s %s\n",
+                    std::string(a.name).c_str(),
+                    std::string(a.description).c_str());
+    }
+}
 
 /** Prints the backend registry, marking the auto-pick with '*'. */
 inline void print_backends() {
@@ -29,6 +40,7 @@ inline constexpr const char* kCommonHelp =
     "options:\n"
     "  --backend NAME   select the math backend (see --backends)\n"
     "  --backends       list available backends and exit\n"
+    "  --archs          list supported architectures and exit\n"
     "  -h, --help       show this help and exit\n"
     "\n"
     "environment:\n"
@@ -42,6 +54,8 @@ struct BackendArgs {
     std::string choice;
     /** --backends was given: list and exit. */
     bool list = false;
+    /** --archs was given: list architectures and exit. */
+    bool list_archs = false;
     /** --help / -h was given: print usage and exit. */
     bool help = false;
 };
@@ -52,6 +66,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         const std::string_view a = argv[i];
         if (a == "--backends") {
             out.list = true;
+        } else if (a == "--archs") {
+            out.list_archs = true;
         } else if (a == "--help" || a == "-h") {
             out.help = true;
         } else if (a == "--backend" && i + 1 < argc) {
