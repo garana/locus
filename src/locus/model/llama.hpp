@@ -193,7 +193,8 @@ class LlamaModel {
     }
 
   private:
-    void moe_ffn(const Layer& lay, Workspace& ws) const;
+    void moe_ffn(const Layer& lay, Workspace& ws,
+                 std::uint32_t layer) const;
 
     Hparams hp_;
     const struct ArchSpec* spec_ = nullptr;

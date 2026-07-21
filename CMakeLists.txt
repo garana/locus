@@ -24,6 +24,7 @@ add_library(locus
     src/locus/sys/features.cpp
     src/locus/model/arch.cpp
     src/locus/model/llama.cpp
+    src/locus/model/moe_stats.cpp
     src/locus/server/engine_loop.cpp
     src/locus/server/server.cpp
     src/locus/sys/mmap_file.cpp

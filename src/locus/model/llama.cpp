@@ -9,6 +9,7 @@
 
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/arch.hpp"
+#include "locus/model/moe_stats.hpp"
 #include "locus/model/gguf_load.hpp"
 
 namespace locus::model {
@@ -237,7 +238,7 @@ void LlamaModel::forward(tok::TokenId token,
                 ws.x[i] += ws.xb2[i];
             }
         } else {
-            moe_ffn(lay, ws);
+            moe_ffn(lay, ws, l);
             for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
                 ws.x[i] += ws.moe_acc[i];
             }
@@ -331,13 +332,20 @@ std::vector<std::pair<std::uint32_t, float>> moe_select(
     return out;
 }
 
-void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws) const {
+void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
+                         std::uint32_t layer) const {
     using namespace locus::backend;
     const Ops& op = backend_->ops;
     const std::uint32_t n_ff = hp_.n_ff_exp;
 
     op.matvec(lay.gate_inp, ws.xb, ws.router);
     const auto picked = moe_select(hp_, lay, ws.router);
+    if (MoeStats::enabled()) {
+        for (const auto& [e, wgt] : picked) {
+            MoeStats::record(layer, e, hp_.n_layers,
+                             hp_.n_expert);
+        }
+    }
     std::fill(ws.moe_acc.begin(), ws.moe_acc.end(), 0.0f);
     auto swiglu_into_acc = [&](const Mat& wg, const Mat& wu,
                                const Mat& wd, std::uint32_t ff,

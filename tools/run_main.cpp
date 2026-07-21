@@ -7,6 +7,7 @@
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/llama.hpp"
+#include "locus/model/moe_stats.hpp"
 #include "locus/sys/features.hpp"
 #include "locus/tok/tokenizer.hpp"
 
@@ -79,6 +80,7 @@ int main(int argc, char** argv) {
                       static_cast<std::uint32_t>(n_gen));
         engine.run_to_completion();
         std::printf("\n");
+        locus::model::MoeStats::report();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

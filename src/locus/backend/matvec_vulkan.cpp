@@ -9,6 +9,7 @@
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
 #include "locus/backend/vulkan_forward.hpp"
+#include "locus/model/moe_stats.hpp"
 
 namespace locus::backend {
 
@@ -540,6 +541,12 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
                    {xb_host.data(), hp.n_embd}, router);
             const auto picked =
                 model::moe_select(hp, lay, router);
+            if (model::MoeStats::enabled()) {
+                for (const auto& [e, wgt] : picked) {
+                    model::MoeStats::record(l, e, hp.n_layers,
+                                            hp.n_expert);
+                }
+            }
             s.ctx.begin_batch();
             auto whole = [&](const model::LlamaModel::ExpertMat&
                                  em) {
