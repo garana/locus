@@ -12,6 +12,7 @@ add_library(locus
     src/locus/backend/cpu_ops.cpp
     src/locus/backend/matvec_avx2.cpp
     src/locus/backend/matvec_neon.cpp
+    src/locus/backend/matvec_sse4.cpp
     src/locus/backend/matvec_vulkan.cpp
     src/locus/backend/registry.cpp
     src/locus/backend/vulkan/context.cpp
@@ -59,6 +60,9 @@ endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(LOCUS_SIMD_VARIANTS "sse4")
+    set_source_files_properties(
+        src/locus/backend/matvec_sse4.cpp
+        PROPERTIES COMPILE_FLAGS "-msse4.1")
     check_cxx_compiler_flag("-mavx2" LOCUS_CC_AVX2)
     if(LOCUS_CC_AVX2)
         list(APPEND LOCUS_SIMD_VARIANTS "avx2")

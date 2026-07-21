@@ -16,6 +16,9 @@ const std::vector<Backend>& list() {
     static const std::vector<Backend> v = [] {
         const sys::Features f = sys::detect();
         std::vector<Backend> b;
+        b.reserve(6);  // fits every arch's entries; also avoids a
+                       // GCC-13 -Wstringop-overflow false positive
+                       // on the vector-growth path.
 #if defined(__aarch64__)
         b.push_back({"neon",
                      "ARM NEON vectorized matvec (F32/Q8_0)",
@@ -27,6 +30,10 @@ const std::vector<Backend>& list() {
                      "x86-64 AVX2 vectorized matvec (F32/Q8_0)",
                      f.avx2, true,
                      {&matvec_avx2, &dequant_row, nullptr}});
+        b.push_back({"sse4",
+                     "x86-64 SSE4.1 vectorized matvec (F32/Q8_0)",
+                     f.sse4, true,
+                     {&matvec_sse4, &dequant_row, nullptr}});
 #endif
         b.push_back({"scalar", "portable reference (all types)",
                      true, true,

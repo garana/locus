@@ -17,6 +17,15 @@ void matvec_neon(const Mat& w, std::span<const float> x,
 
 #if defined(__x86_64__)
 /**
+ * SSE4-vectorized matvec: F32 and Q8_0 rows use 128-bit SSE4.1
+ * inner loops; other weight types delegate to the scalar
+ * reference. Compiled only on x86-64 hosts (per-source -msse4.1).
+ * The baseline x86 vector path for CPUs without AVX2.
+ */
+void matvec_sse4(const Mat& w, std::span<const float> x,
+                 std::span<float> out);
+
+/**
  * AVX2-vectorized matvec: F32 and Q8_0 rows use AVX2 inner
  * loops; other weight types delegate to the scalar reference.
  * Compiled only on x86-64 hosts (per-source -mavx2).

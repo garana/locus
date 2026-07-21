@@ -13,6 +13,7 @@ Features detect() {
 #if defined(__aarch64__)
     f.neon = true;
 #elif defined(__x86_64__)
+    f.sse4 = __builtin_cpu_supports("sse4.1") != 0;
     f.avx2 = __builtin_cpu_supports("avx2") != 0;
     f.avx512f = __builtin_cpu_supports("avx512f") != 0;
 #endif
@@ -26,9 +27,9 @@ Features detect() {
 
 std::string to_string(const Features& f) {
     auto mark = [](bool on) { return on ? "+" : "-"; };
-    return std::string("cpu[") + mark(f.neon) + "neon " + mark(f.avx2) +
-           "avx2 " + mark(f.avx512f) + "avx512f] gpu[" + mark(f.vulkan) +
-           "vulkan]";
+    return std::string("cpu[") + mark(f.neon) + "neon " + mark(f.sse4) +
+           "sse4 " + mark(f.avx2) + "avx2 " + mark(f.avx512f) +
+           "avx512f] gpu[" + mark(f.vulkan) + "vulkan]";
 }
 
 }  // namespace locus::sys
