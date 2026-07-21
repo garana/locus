@@ -189,6 +189,44 @@ kv::PagedKvCache LlamaModel::make_cache(
     return kv::PagedKvCache(geom);
 }
 
+namespace {
+
+/** Hints a whole matrix for readahead; empty mats are skipped. */
+void advise_mat(const backend::Mat& m) {
+    if (m.data != nullptr && m.rows > 0) {
+        sys::advise_willneed(
+            m.data, m.rows * backend::mat_row_bytes(m));
+    }
+}
+
+/**
+ * R8 layer readahead: hints every statically-known weight of a
+ * layer -- attention (incl. MLA projections), dense FFN, router
+ * and shared experts. Routed experts are excluded: their
+ * identity is only known after routing (see moe_ffn).
+ */
+void advise_layer_statics(const LlamaModel::Layer& lay) {
+    advise_mat(lay.wq);
+    advise_mat(lay.wk);
+    advise_mat(lay.wv);
+    advise_mat(lay.wo);
+    advise_mat(lay.w_gate);
+    advise_mat(lay.w_up);
+    advise_mat(lay.w_down);
+    advise_mat(lay.gate_inp);
+    advise_mat(lay.gate_shexp);
+    advise_mat(lay.up_shexp);
+    advise_mat(lay.down_shexp);
+    advise_mat(lay.wkv_a);
+    advise_mat(lay.wkv_b);
+    advise_mat(lay.wk_b);
+    advise_mat(lay.wv_b);
+    advise_mat(lay.wq_a);
+    advise_mat(lay.wq_b);
+}
+
+}  // namespace
+
 void LlamaModel::forward(tok::TokenId token,
                          kv::PagedKvCache& cache,
                          kv::PagedKvCache::Seq& seq, Workspace& ws,
@@ -215,8 +253,22 @@ void LlamaModel::forward(tok::TokenId token,
     op.dequant_row(embd_, static_cast<std::uint32_t>(token),
                    ws.x);
 
+    // R8 layer readahead: while layer l computes, ask the kernel
+    // to page in layer l+1's static weights (and the output head
+    // after the last layer). Opt-in for A/B; routed experts are
+    // covered separately at selection time (moe_ffn).
+    const bool layer_ra =
+        std::getenv("LOCUS_LAYER_READAHEAD") != nullptr;
+
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
+        if (layer_ra) {
+            if (l + 1 < hp_.n_layers) {
+                advise_layer_statics(layers_[l + 1]);
+            } else {
+                advise_mat(out_w_);
+            }
+        }
 
         rmsnorm(ws.x, lay.attn_norm, hp_.rms_eps, ws.xb);
         spec_->attention(*this, lay, cache, seq, ws, l, pos);
@@ -349,9 +401,7 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
     // R8 expert readahead: overlap the SSD reads of every routed
     // expert before the sequential per-expert matmuls fault them
     // in one by one. Opt-in for A/B against the passive baseline.
-    static const bool readahead =
-        std::getenv("LOCUS_EXPERT_READAHEAD") != nullptr;
-    if (readahead) {
+    if (std::getenv("LOCUS_EXPERT_READAHEAD") != nullptr) {
         for (const auto& [e, wgt] : picked) {
             sys::advise_willneed(lay.gate_exps.expert(e).data,
                                  lay.gate_exps.expert_bytes);

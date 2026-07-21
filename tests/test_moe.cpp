@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -284,6 +285,50 @@ TEST_CASE("moe on the vulkan backend matches dense",
     for (std::size_t i = 0; i < a.size(); ++i) {
         REQUIRE(b[i] == Catch::Approx(a[i]).margin(1e-3));
     }
+}
+
+TEST_CASE("readahead hints leave outputs bit-identical",
+          "[moe]") {
+    // R8: LOCUS_LAYER_READAHEAD / LOCUS_EXPERT_READAHEAD are
+    // pure madvise hints; logits must not change at all. The
+    // in-memory image is not file-backed, so this also covers
+    // the best-effort path where madvise fails.
+    const auto wg = weights(kE * kF, 70);
+    const auto wu = weights(kE * kF, 71);
+    const auto wd = weights(kF * kE, 72);
+
+    ModelBuilder dense;
+    dense.common();
+    dense.tensor("blk.0.ffn_gate.weight", {kE, kF}, wg);
+    dense.tensor("blk.0.ffn_up.weight", {kE, kF}, wu);
+    dense.tensor("blk.0.ffn_down.weight", {kF, kE}, wd);
+    auto dense_img = dense.build(0, 0);
+
+    ModelBuilder moe;
+    moe.common();
+    moe.tensor("blk.0.ffn_gate_inp.weight", {kE, 4},
+               weights(kE * 4, 73));
+    moe.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 74));
+    moe.tensor("blk.0.ffn_up_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 75));
+    moe.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
+               weights(kF * kE * 4, 76));
+    auto moe_img = moe.build(4, 2);
+
+    const std::vector<locus::tok::TokenId> toks = {3, 7, 1};
+    auto dense_off = run(dense_img, toks);
+    auto moe_off = run(moe_img, toks);
+
+    setenv("LOCUS_LAYER_READAHEAD", "1", 1);
+    setenv("LOCUS_EXPERT_READAHEAD", "1", 1);
+    auto dense_on = run(dense_img, toks);
+    auto moe_on = run(moe_img, toks);
+    unsetenv("LOCUS_LAYER_READAHEAD");
+    unsetenv("LOCUS_EXPERT_READAHEAD");
+
+    REQUIRE(dense_on == dense_off);
+    REQUIRE(moe_on == moe_off);
 }
 
 TEST_CASE("distinct experts diverge from the dense model",
