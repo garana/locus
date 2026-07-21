@@ -43,6 +43,9 @@ target_link_libraries(locus-run PRIVATE locus)
 
 add_executable(locus-server tools/server_main.cpp)
 target_link_libraries(locus-server PRIVATE locus)
+
+add_executable(locus-gguf tools/gguf_info_main.cpp)
+target_link_libraries(locus-gguf PRIVATE locus)
 target_include_directories(locus PUBLIC src)
 
 # ----------------------------------------------------------------
