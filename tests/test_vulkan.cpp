@@ -5,12 +5,12 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/backend/cpu_ops.hpp"
-#include "cppllm/backend/variants.hpp"
-#include "cppllm/backend/vulkan/context.hpp"
+#include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan/context.hpp"
 
-using cppllm::backend::vk::Kernel;
-using cppllm::backend::vk::VulkanContext;
+using locus::backend::vk::Kernel;
+using locus::backend::vk::VulkanContext;
 
 TEST_CASE("vulkan matvec matches the CPU reference", "[vulkan]") {
     if (!VulkanContext::available()) {
@@ -34,10 +34,10 @@ TEST_CASE("vulkan matvec matches the CPU reference", "[vulkan]") {
     std::vector<float> gpu(rows), cpu(rows);
     ctx.matvec_f32(w, rows, cols, x, gpu);
 
-    cppllm::backend::Mat m{
-        cppllm::gguf::TensorType::kF32,
+    locus::backend::Mat m{
+        locus::gguf::TensorType::kF32,
         reinterpret_cast<const std::byte*>(w.data()), rows, cols};
-    cppllm::backend::matvec(m, x, cpu);
+    locus::backend::matvec(m, x, cpu);
 
     for (std::uint32_t r = 0; r < rows; ++r) {
         REQUIRE(gpu[r] ==
@@ -61,7 +61,7 @@ TEST_CASE("vulkan q8_0 matvec matches the CPU reference",
     for (std::size_t b = 0; b < rows * (cols / 32); ++b) {
         std::byte* blk = w.data() + b * 34;
         const std::uint16_t d =
-            cppllm::backend::f32_to_f16(0.05f);
+            locus::backend::f32_to_f16(0.05f);
         std::memcpy(blk, &d, 2);
         for (int i = 0; i < 32; ++i) {
             blk[2 + i] = static_cast<std::byte>(
@@ -74,9 +74,9 @@ TEST_CASE("vulkan q8_0 matvec matches the CPU reference",
     }
 
     std::vector<float> cpu(rows), gpu(rows);
-    cppllm::backend::Mat m{cppllm::gguf::TensorType::kQ8_0,
+    locus::backend::Mat m{locus::gguf::TensorType::kQ8_0,
                            w.data(), rows, cols};
-    cppllm::backend::matvec(m, x, cpu);
+    locus::backend::matvec(m, x, cpu);
 
     auto wb = ctx.create_buffer((w.size() + 3) & ~std::size_t{3});
     auto xb = ctx.create_buffer(x.size() * 4);
@@ -137,14 +137,14 @@ TEST_CASE("vulkan f16 and q4_0 matvec match the CPU reference",
     SECTION("f16") {
         std::vector<std::uint16_t> w(rows * cols);
         for (auto& v : w) {
-            v = cppllm::backend::f32_to_f16(dist(rng));
+            v = locus::backend::f32_to_f16(dist(rng));
         }
         std::vector<float> cpu(rows), gpu(rows);
-        cppllm::backend::Mat m{
-            cppllm::gguf::TensorType::kF16,
+        locus::backend::Mat m{
+            locus::gguf::TensorType::kF16,
             reinterpret_cast<const std::byte*>(w.data()), rows,
             cols};
-        cppllm::backend::matvec(m, x, cpu);
+        locus::backend::matvec(m, x, cpu);
         run_kernel(Kernel::kMatvecF16,
                    std::as_bytes(std::span(w)), gpu);
         for (std::uint32_t r = 0; r < rows; ++r) {
@@ -159,7 +159,7 @@ TEST_CASE("vulkan f16 and q4_0 matvec match the CPU reference",
         for (std::size_t b = 0; b < rows * (cols / 32); ++b) {
             std::byte* blk = w.data() + b * 18;
             const std::uint16_t d =
-                cppllm::backend::f32_to_f16(0.25f);
+                locus::backend::f32_to_f16(0.25f);
             std::memcpy(blk, &d, 2);
             for (int i = 0; i < 16; ++i) {
                 blk[2 + i] =
@@ -167,9 +167,9 @@ TEST_CASE("vulkan f16 and q4_0 matvec match the CPU reference",
             }
         }
         std::vector<float> cpu(rows), gpu(rows);
-        cppllm::backend::Mat m{cppllm::gguf::TensorType::kQ4_0,
+        locus::backend::Mat m{locus::gguf::TensorType::kQ4_0,
                                w.data(), rows, cols};
-        cppllm::backend::matvec(m, x, cpu);
+        locus::backend::matvec(m, x, cpu);
         run_kernel(Kernel::kMatvecQ4_0, w, gpu);
         for (std::uint32_t r = 0; r < rows; ++r) {
             REQUIRE(gpu[r] ==
@@ -195,17 +195,17 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
     }
 
     struct KCase {
-        cppllm::gguf::TensorType type;
+        locus::gguf::TensorType type;
         Kernel kernel;
         std::size_t block_bytes;
         std::size_t d_off;  // f16 scale offset inside the block
     };
     const KCase cases[] = {
-        {cppllm::gguf::TensorType::kQ4_K, Kernel::kMatvecQ4_K,
+        {locus::gguf::TensorType::kQ4_K, Kernel::kMatvecQ4_K,
          144, 0},
-        {cppllm::gguf::TensorType::kQ5_K, Kernel::kMatvecQ5_K,
+        {locus::gguf::TensorType::kQ5_K, Kernel::kMatvecQ5_K,
          176, 0},
-        {cppllm::gguf::TensorType::kQ6_K, Kernel::kMatvecQ6_K,
+        {locus::gguf::TensorType::kQ6_K, Kernel::kMatvecQ6_K,
          210, 208},
     };
     for (const auto& c : cases) {
@@ -220,18 +220,18 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
             std::byte* p =
                 w.data() + blk * c.block_bytes + c.d_off;
             const std::uint16_t d =
-                cppllm::backend::f32_to_f16(0.01f);
+                locus::backend::f32_to_f16(0.01f);
             std::memcpy(p, &d, 2);
             if (c.d_off == 0) {  // dmin follows d
                 const std::uint16_t dmin =
-                    cppllm::backend::f32_to_f16(0.005f);
+                    locus::backend::f32_to_f16(0.005f);
                 std::memcpy(p + 2, &dmin, 2);
             }
         }
 
         std::vector<float> cpu(rows), gpu(rows);
-        cppllm::backend::Mat m{c.type, w.data(), rows, cols};
-        cppllm::backend::matvec(m, x, cpu);
+        locus::backend::Mat m{c.type, w.data(), rows, cols};
+        locus::backend::matvec(m, x, cpu);
 
         auto wb =
             ctx.create_buffer((w.size() + 3) & ~std::size_t{3});
@@ -298,12 +298,12 @@ TEST_CASE("gpu matvec beats scalar cpu at real-model sizes",
         iters;
     ctx.read_buffer(ob, std::as_writable_bytes(std::span(gpu)));
 
-    cppllm::backend::Mat m{
-        cppllm::gguf::TensorType::kF32,
+    locus::backend::Mat m{
+        locus::gguf::TensorType::kF32,
         reinterpret_cast<const std::byte*>(w.data()), n, n};
     t0 = clock::now();
     for (int i = 0; i < iters; ++i) {
-        cppllm::backend::matvec(m, x, cpu);
+        locus::backend::matvec(m, x, cpu);
     }
     auto cpu_us =
         std::chrono::duration_cast<std::chrono::microseconds>(

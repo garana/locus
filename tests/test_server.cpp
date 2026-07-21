@@ -3,10 +3,10 @@
 #include <thread>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/gguf/gguf.hpp"
-#include "cppllm/model/llama.hpp"
-#include "cppllm/server/server.hpp"
-#include "cppllm/tok/tokenizer.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/model/llama.hpp"
+#include "locus/server/server.hpp"
+#include "locus/tok/tokenizer.hpp"
 #include "httplib.h"
 #include "json.hpp"
 
@@ -15,14 +15,14 @@ using nlohmann::json;
 namespace {
 
 std::string model_path() {
-    return std::string(CPPLLM_SOURCE_DIR) +
+    return std::string(LOCUS_SOURCE_DIR) +
            "/tests/models/stories260K.gguf";
 }
 
 /** Server bound to an ephemeral port, serving on a thread. */
 struct TestServer {
-    explicit TestServer(const cppllm::model::LlamaModel& m,
-                        const cppllm::tok::SpmTokenizer& tok)
+    explicit TestServer(const locus::model::LlamaModel& m,
+                        const locus::tok::SpmTokenizer& tok)
         : server(m, tok, {}) {
         port = server.bind_any_port("127.0.0.1");
         REQUIRE(port > 0);
@@ -35,7 +35,7 @@ struct TestServer {
         thread.join();
     }
 
-    cppllm::server::OpenAiServer server;
+    locus::server::OpenAiServer server;
     int port = -1;
     std::thread thread;
 };
@@ -46,9 +46,9 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
-    auto g = cppllm::gguf::GgufFile::open(model_path());
-    auto model = cppllm::model::LlamaModel::load(g);
-    auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     TestServer ts(model, tok);
     httplib::Client client("127.0.0.1", ts.port);
 

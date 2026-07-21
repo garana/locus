@@ -2,12 +2,12 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/gguf/gguf.hpp"
+#include "locus/gguf/gguf.hpp"
 #include "gguf_builder.hpp"
 
-using cppllm::gguf::Error;
-using cppllm::gguf::GgufFile;
-using cppllm::gguf::TensorType;
+using locus::gguf::Error;
+using locus::gguf::GgufFile;
+using locus::gguf::TensorType;
 
 namespace {
 

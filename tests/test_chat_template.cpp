@@ -3,22 +3,22 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/chat/template.hpp"
-#include "cppllm/gguf/gguf.hpp"
-#include "cppllm/model/llama.hpp"
-#include "cppllm/tok/tokenizer.hpp"
+#include "locus/chat/template.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/model/llama.hpp"
+#include "locus/tok/tokenizer.hpp"
 #include "gguf_builder.hpp"
 
-using cppllm::chat::ChatTemplate;
-using cppllm::chat::Message;
-using Family = cppllm::chat::ChatTemplate::Family;
+using locus::chat::ChatTemplate;
+using locus::chat::Message;
+using Family = locus::chat::ChatTemplate::Family;
 
 namespace {
 
 ChatTemplate detect(std::string_view tmpl) {
     GgufBuilder b;
     b.header(0, 1).kv_string("tokenizer.chat_template", tmpl);
-    auto g = cppllm::gguf::GgufFile::parse(b.bytes());
+    auto g = locus::gguf::GgufFile::parse(b.bytes());
     return ChatTemplate::from_gguf(g);
 }
 
@@ -40,7 +40,7 @@ TEST_CASE("template family detection", "[chat]") {
 
     GgufBuilder none;
     none.header(0, 0);
-    auto g = cppllm::gguf::GgufFile::parse(none.bytes());
+    auto g = locus::gguf::GgufFile::parse(none.bytes());
     REQUIRE(ChatTemplate::from_gguf(g).family() ==
             Family::kPlain);
 }
@@ -83,22 +83,22 @@ TEST_CASE("template rendering", "[chat]") {
 namespace {
 
 /** Greedy chat answer for a single user message. */
-std::string chat_answer(const cppllm::model::LlamaModel& model,
-                        const cppllm::tok::Tokenizer& tok,
+std::string chat_answer(const locus::model::LlamaModel& model,
+                        const locus::tok::Tokenizer& tok,
                         const ChatTemplate& tmpl,
                         const std::string& user, int max_new) {
     const std::vector<Message> msgs = {{"user", user}};
     auto cache = model.make_cache();
     auto ws = model.make_workspace();
-    cppllm::kv::PagedKvCache::Seq seq;
+    locus::kv::PagedKvCache::Seq seq;
     std::vector<float> logits(model.hparams().n_vocab);
     for (auto id : tok.encode(tmpl.apply(msgs), true)) {
         REQUIRE(cache.ensure_capacity(seq, 1));
         model.forward(id, cache, seq, ws, logits);
     }
-    std::vector<cppllm::tok::TokenId> gen;
+    std::vector<locus::tok::TokenId> gen;
     for (int i = 0; i < max_new; ++i) {
-        auto next = cppllm::model::argmax(logits);
+        auto next = locus::model::argmax(logits);
         if (next == tok.eos_id()) {
             break;
         }
@@ -116,20 +116,20 @@ TEST_CASE("llama-3.2 Q4_K_M chat matches llama.cpp on every "
           "backend",
           "[chat][e2e]") {
     const std::string path =
-        std::string(CPPLLM_SOURCE_DIR) +
+        std::string(LOCUS_SOURCE_DIR) +
         "/tests/models/llama-3.2-1b-q4_k_m.gguf";
     if (!std::filesystem::exists(path)) {
         SKIP("model not present (llama-3.2-1b-q4_k_m.gguf)");
     }
-    auto g = cppllm::gguf::GgufFile::open(path);
-    auto model = cppllm::model::LlamaModel::load(g);
-    auto tok = cppllm::tok::tokenizer_from_gguf(g);
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
     auto tmpl = ChatTemplate::from_gguf(g);
 
     // llama-completion (chat template, --temp 0) answers:
     const std::string want =
         "The capital of France is Paris.";
-    for (const auto& b : cppllm::backend::backends()) {
+    for (const auto& b : locus::backend::backends()) {
         if (!b.available || !b.selectable) {
             continue;
         }
@@ -144,14 +144,14 @@ TEST_CASE("llama-3.2 Q4_K_M chat matches llama.cpp on every "
 TEST_CASE("llama-3.2 chat matches the llama.cpp answer",
           "[chat][e2e]") {
     const std::string path =
-        std::string(CPPLLM_SOURCE_DIR) +
+        std::string(LOCUS_SOURCE_DIR) +
         "/tests/models/llama-3.2-1b-q8_0.gguf";
     if (!std::filesystem::exists(path)) {
         SKIP("model not present (llama-3.2-1b-q8_0.gguf)");
     }
-    auto g = cppllm::gguf::GgufFile::open(path);
-    auto model = cppllm::model::LlamaModel::load(g);
-    auto tok = cppllm::tok::tokenizer_from_gguf(g);
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
     auto tmpl = ChatTemplate::from_gguf(g);
     REQUIRE(tmpl.family() == Family::kLlama3);
 
@@ -163,15 +163,15 @@ TEST_CASE("llama-3.2 chat matches the llama.cpp answer",
 
     auto cache = model.make_cache();
     auto ws = model.make_workspace();
-    cppllm::kv::PagedKvCache::Seq seq;
+    locus::kv::PagedKvCache::Seq seq;
     std::vector<float> logits(model.hparams().n_vocab);
     for (auto id : ids) {
         REQUIRE(cache.ensure_capacity(seq, 1));
         model.forward(id, cache, seq, ws, logits);
     }
-    std::vector<cppllm::tok::TokenId> gen;
+    std::vector<locus::tok::TokenId> gen;
     for (int i = 0; i < 16; ++i) {
-        auto next = cppllm::model::argmax(logits);
+        auto next = locus::model::argmax(logits);
         if (next == tok->eos_id()) {
             break;
         }

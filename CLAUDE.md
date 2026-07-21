@@ -1,4 +1,4 @@
-# cpp-llm
+# locus
 
 Pure C/C++ LLM inference server: vendor-neutral GPU (Vulkan),
 paged KV cache, continuous batching, OpenAI-compatible API, with a
@@ -19,7 +19,7 @@ plan: docs/DESIGN.md. Current milestone status: README.md.
 Use the `build` and `test` skills (.claude/skills/). Quick form:
 
     cmake -B build -DCMAKE_BUILD_TYPE=Release
-    cmake --build build -j && ./build/tests/cppllm_tests
+    cmake --build build -j && ./build/tests/locus_tests
 
 ## Conventions
 
@@ -35,4 +35,4 @@ Use the `build` and `test` skills (.claude/skills/). Quick form:
   build time; vendor pinned single-file deps with recorded sha256.
 - SIMD kernel variants follow the ../pbw pattern: one source file
   per variant with per-source compile flags, runtime dispatch via
-  cppllm::sys::detect().
+  locus::sys::detect().

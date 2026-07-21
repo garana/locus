@@ -1,4 +1,4 @@
-# cpp-llm MVP Design
+# locus MVP Design
 
 Status: draft v1 (2026-07-17)
 
@@ -17,7 +17,7 @@ high-concurrency scheduler; TensorRT-LLM has the scheduler but is
 NVIDIA-only with a heavy Python toolchain; LightLLM/vLLM/SGLang have
 both but sit on a large Python package ecosystem (supply-chain risk).
 
-cpp-llm targets that intersection: llama.cpp's footprint with a
+locus targets that intersection: llama.cpp's footprint with a
 LightLLM-class serving core.
 
 ## 2. MVP thesis
@@ -71,7 +71,7 @@ Correctness first, single-node CPU throughput second, GPU third.
   blocks need not be contiguous.
 - Blocks are ref-counted so sequences forked from a shared prefix
   (system prompts, beam candidates) share blocks copy-on-write.
-- `BlockAllocator` (implemented, `src/cppllm/kv/`) owns the free
+- `BlockAllocator` (implemented, `src/locus/kv/`) owns the free
   list, ref counts, and utilization stats. It is pure bookkeeping:
   no tensor memory, so it is unit-testable in isolation and reused
   unchanged by every backend.
@@ -101,7 +101,7 @@ and Linux/NVIDIA without per-vendor toolchains.
 Backends are runtime-selectable: a registry (backend/registry.cpp)
 lists every compiled variant with availability on the running
 machine; the model routes heavy ops (matvec, dequant) through the
-chosen entry. Selection order: --backend flag > CPPLLM_BACKEND env
+chosen entry. Selection order: --backend flag > LOCUS_BACKEND env
 var > best available. `--backends` prints the registry. Every
 variant must match the scalar reference in tests, and the golden
 e2e runs through whatever backend is the machine's default.
@@ -109,7 +109,7 @@ e2e runs through whatever backend is the machine's default.
 Vectorized CPU kernels follow the scheme proven in ../pbw: each
 SIMD variant (neon, sse4, avx2, avx512) lives in its own source
 file compiled with only that variant's flags, gated at configure
-time by check_cxx_compiler_flag; `cppllm::sys::detect()` probes
+time by check_cxx_compiler_flag; `locus::sys::detect()` probes
 the running machine and the backend picks the best variant at
 runtime. This keeps one binary portable across CPU generations.
 Build-time detection for both SIMD and Vulkan (find_package +

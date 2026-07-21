@@ -2,10 +2,10 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/kv/block_allocator.hpp"
+#include "locus/kv/block_allocator.hpp"
 
-using cppllm::kv::BlockAllocator;
-using cppllm::kv::BlockId;
+using locus::kv::BlockAllocator;
+using locus::kv::BlockId;
 
 TEST_CASE("allocates until exhaustion", "[kv]") {
     BlockAllocator alloc(4);

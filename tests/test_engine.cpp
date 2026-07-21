@@ -3,40 +3,40 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/backend/registry.hpp"
-#include "cppllm/backend/variants.hpp"
-#include "cppllm/engine/engine.hpp"
-#include "cppllm/gguf/gguf.hpp"
-#include "cppllm/model/llama.hpp"
-#include "cppllm/tok/tokenizer.hpp"
+#include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
+#include "locus/engine/engine.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/model/llama.hpp"
+#include "locus/tok/tokenizer.hpp"
 
-using cppllm::engine::Engine;
-using cppllm::engine::Status;
+using locus::engine::Engine;
+using locus::engine::Status;
 
 namespace {
 
 std::string model_path() {
-    return std::string(CPPLLM_SOURCE_DIR) +
+    return std::string(LOCUS_SOURCE_DIR) +
            "/tests/models/stories260K.gguf";
 }
 
 /** Single-sequence reference generation via the raw model API. */
-std::vector<cppllm::tok::TokenId> reference_generate(
-    const cppllm::model::LlamaModel& model,
-    const cppllm::tok::SpmTokenizer& tok,
-    const std::vector<cppllm::tok::TokenId>& prompt,
+std::vector<locus::tok::TokenId> reference_generate(
+    const locus::model::LlamaModel& model,
+    const locus::tok::SpmTokenizer& tok,
+    const std::vector<locus::tok::TokenId>& prompt,
     std::uint32_t max_new) {
     auto cache = model.make_cache();
     auto ws = model.make_workspace();
-    cppllm::kv::PagedKvCache::Seq seq;
+    locus::kv::PagedKvCache::Seq seq;
     std::vector<float> logits(model.hparams().n_vocab);
     for (auto id : prompt) {
         REQUIRE(cache.ensure_capacity(seq, 1));
         model.forward(id, cache, seq, ws, logits);
     }
-    std::vector<cppllm::tok::TokenId> out;
+    std::vector<locus::tok::TokenId> out;
     for (std::uint32_t i = 0; i < max_new; ++i) {
-        auto next = cppllm::model::argmax(logits);
+        auto next = locus::model::argmax(logits);
         out.push_back(next);
         if (next == tok.eos_id()) {
             break;
@@ -54,14 +54,14 @@ TEST_CASE("concurrent streams match single-sequence output",
     if (!std::filesystem::exists(model_path())) {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
-    auto g = cppllm::gguf::GgufFile::open(model_path());
-    auto model = cppllm::model::LlamaModel::load(g);
-    auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     const std::vector<std::string> prompts = {
         "Once upon a time", "The little dog", "One day, Tom",
         "Once upon a time"};
-    std::vector<std::vector<cppllm::tok::TokenId>> want;
+    std::vector<std::vector<locus::tok::TokenId>> want;
     for (const auto& p : prompts) {
         want.push_back(reference_generate(
             model, tok, tok.encode(p, true), 24));
@@ -89,9 +89,9 @@ TEST_CASE("preemption recomputes and still matches",
     if (!std::filesystem::exists(model_path())) {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
-    auto g = cppllm::gguf::GgufFile::open(model_path());
-    auto model = cppllm::model::LlamaModel::load(g);
-    auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     auto p0 = tok.encode("Once upon a time", true);
     auto p1 = tok.encode("The little dog", true);
@@ -121,12 +121,12 @@ TEST_CASE("engine on the vulkan backend matches CPU output",
     if (!std::filesystem::exists(model_path())) {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
-    if (!cppllm::backend::vulkan_backend_usable()) {
+    if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device / kernels not built");
     }
-    auto g = cppllm::gguf::GgufFile::open(model_path());
-    auto model = cppllm::model::LlamaModel::load(g);
-    auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     auto p0 = tok.encode("Once upon a time", true);
     auto p1 = tok.encode("The little dog", true);
@@ -135,7 +135,7 @@ TEST_CASE("engine on the vulkan backend matches CPU output",
     auto want1 = reference_generate(model, tok, p1, 20);
 
     model.use_backend(
-        *cppllm::backend::find_backend("vulkan"));
+        *locus::backend::find_backend("vulkan"));
     Engine engine(model, tok.eos_id());
     auto id0 = engine.submit(p0, 20);
     auto id1 = engine.submit(p1, 20);
@@ -153,9 +153,9 @@ TEST_CASE("oversized request fails instead of wedging",
     if (!std::filesystem::exists(model_path())) {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
-    auto g = cppllm::gguf::GgufFile::open(model_path());
-    auto model = cppllm::model::LlamaModel::load(g);
-    auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     Engine::Config cfg;
     cfg.n_blocks = 1;  // 16 positions total

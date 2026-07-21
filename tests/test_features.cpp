@@ -1,8 +1,8 @@
 #include "catch_amalgamated.hpp"
-#include "cppllm/sys/features.hpp"
+#include "locus/sys/features.hpp"
 
 TEST_CASE("feature detection runs and reports", "[sys]") {
-    auto f = cppllm::sys::detect();
+    auto f = locus::sys::detect();
 
 #if defined(__aarch64__)
     REQUIRE(f.neon);
@@ -11,7 +11,7 @@ TEST_CASE("feature detection runs and reports", "[sys]") {
     REQUIRE_FALSE(f.neon);
 #endif
 
-    auto s = cppllm::sys::to_string(f);
+    auto s = locus::sys::to_string(f);
     REQUIRE(s.find("neon") != std::string::npos);
     REQUIRE(s.find("vulkan") != std::string::npos);
 }

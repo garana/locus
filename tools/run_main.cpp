@@ -4,25 +4,25 @@
 #include <vector>
 
 #include "backend_cli.hpp"
-#include "cppllm/engine/engine.hpp"
-#include "cppllm/gguf/gguf.hpp"
-#include "cppllm/model/llama.hpp"
-#include "cppllm/sys/features.hpp"
-#include "cppllm/tok/tokenizer.hpp"
+#include "locus/engine/engine.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/model/llama.hpp"
+#include "locus/sys/features.hpp"
+#include "locus/tok/tokenizer.hpp"
 
 /**
  * Minimal single-sequence greedy generation driver (M2):
- *   cppllm-run [--backend NAME] <model.gguf> <prompt> [n_tokens]
- *   cppllm-run --backends
+ *   locus-run [--backend NAME] <model.gguf> <prompt> [n_tokens]
+ *   locus-run --backends
  */
 int main(int argc, char** argv) {
-    auto args = cppllm_tools::parse_backend_args(argc, argv);
+    auto args = locus_tools::parse_backend_args(argc, argv);
     if (args.list) {
-        cppllm_tools::print_backends();
+        locus_tools::print_backends();
         return 0;
     }
     if (args.list_archs) {
-        cppllm_tools::print_archs();
+        locus_tools::print_archs();
         return 0;
     }
     if (args.help) {
@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
             "usage: %s [options] <model.gguf> <prompt> "
             "[n_tokens]\n\nGreedy single-prompt generation "
             "(default 64 tokens).\n\n%s",
-            argv[0], cppllm_tools::kCommonHelp);
+            argv[0], locus_tools::kCommonHelp);
         return 0;
     }
     if (args.positional.size() < 2) {
@@ -47,17 +47,17 @@ int main(int argc, char** argv) {
                           : 64;
 
     try {
-        auto g = cppllm::gguf::GgufFile::open(model_path);
-        auto model = cppllm::model::LlamaModel::load(g);
+        auto g = locus::gguf::GgufFile::open(model_path);
+        auto model = locus::model::LlamaModel::load(g);
         model.use_backend(
-            cppllm::backend::resolve_backend(args.choice));
-        auto tok_ptr = cppllm::tok::tokenizer_from_gguf(g);
+            locus::backend::resolve_backend(args.choice));
+        auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
         auto& tok = *tok_ptr;
         const auto& hp = model.hparams();
         std::fprintf(stderr,
                      "%s | backend=%s | layers=%u embd=%u "
                      "heads=%u/%u vocab=%u\n",
-                     cppllm::sys::to_string(cppllm::sys::detect())
+                     locus::sys::to_string(locus::sys::detect())
                          .c_str(),
                      std::string(model.active_backend().name)
                          .c_str(),
@@ -67,9 +67,9 @@ int main(int argc, char** argv) {
         auto ids = tok.encode(prompt, true);
         std::printf("%s", tok.decode(ids).c_str());
 
-        cppllm::engine::Engine engine(model, tok.eos_id());
-        engine.on_token = [&](const cppllm::engine::Request&,
-                              cppllm::tok::TokenId t) {
+        locus::engine::Engine engine(model, tok.eos_id());
+        engine.on_token = [&](const locus::engine::Request&,
+                              locus::tok::TokenId t) {
             if (t != tok.eos_id()) {
                 std::printf("%s", tok.decode({&t, 1}).c_str());
                 std::fflush(stdout);

@@ -1,4 +1,4 @@
-# cpp-llm
+# locus
 
 A pure C/C++ LLM inference server aiming at the unfilled niche
 between llama.cpp and the Python serving stacks (LightLLM, vLLM):
@@ -35,8 +35,8 @@ in docs/DESIGN.md section 7.
 
 ## Testing
 
-    cmake --build build --target cppllm_tests
-    ./build/tests/cppllm_tests
+    cmake --build build --target locus_tests
+    ./build/tests/locus_tests
 
 ## Math backends
 
@@ -44,9 +44,9 @@ Every SIMD/GPU variant is compiled into the one binary; at startup
 the best one supported by the running machine is picked (pbw-style
 runtime dispatch). Inspect and override:
 
-    cppllm-run --backends
-    cppllm-run --backend scalar model.gguf "prompt" 32
-    CPPLLM_BACKEND=neon cppllm-server model.gguf 8080
+    locus-run --backends
+    locus-run --backend scalar model.gguf "prompt" 32
+    LOCUS_BACKEND=neon locus-server model.gguf 8080
 
 Current entries: neon (arm64), scalar (reference), and vulkan --
 a full GPU forward pass: F32/Q8_0 matmul shaders (weights
@@ -58,7 +58,7 @@ and concurrent streams). At real-model sizes the GPU wins (2048^2
 f32 matvec: ~750us vs ~3550us scalar CPU, Apple M-series via
 MoltenVK); on the tiny 260K test model dispatch overhead keeps
 CPU ahead. F16/Q4_0 GPU shaders, x86 sse4/avx2/avx512, and CUDA
-slot into src/cppllm/backend/registry.cpp when their kernels
+slot into src/locus/backend/registry.cpp when their kernels
 land.
 
 ## Dependencies
@@ -70,4 +70,4 @@ configure time:
 
 - Vulkan loader (GPU backend, milestone M5)
 - SIMD compiler flags per arch (neon/sse4/avx2/avx512); kernel
-  variants are selected at runtime via `cppllm::sys::detect()`
+  variants are selected at runtime via `locus::sys::detect()`

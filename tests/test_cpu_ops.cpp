@@ -4,10 +4,10 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/backend/cpu_ops.hpp"
+#include "locus/backend/cpu_ops.hpp"
 
-using namespace cppllm::backend;
-using cppllm::gguf::TensorType;
+using namespace locus::backend;
+using locus::gguf::TensorType;
 using Catch::Approx;
 
 TEST_CASE("f16 conversion round-trips", "[ops]") {
@@ -162,7 +162,7 @@ TEST_CASE("matvec rejects unsupported weight types", "[ops]") {
     Mat m{TensorType::kQ3_K, nullptr, 1, 256};
     std::vector<float> x(256, 0.0f);
     float out[1];
-    REQUIRE_THROWS_AS(matvec(m, x, out), cppllm::gguf::Error);
+    REQUIRE_THROWS_AS(matvec(m, x, out), locus::gguf::Error);
 }
 
 namespace {
@@ -184,9 +184,9 @@ std::vector<std::byte> k_quant_row(TensorType t,
     for (std::uint32_t b = 0; b < blocks; ++b) {
         std::byte* blk = row.data() + b * bytes;
         const std::uint16_t d =
-            cppllm::backend::f32_to_f16(0.01f);
+            locus::backend::f32_to_f16(0.01f);
         const std::uint16_t dmin =
-            cppllm::backend::f32_to_f16(0.005f);
+            locus::backend::f32_to_f16(0.005f);
         if (t == TensorType::kQ6_K) {
             std::memcpy(blk + 208, &d, 2);
         } else {

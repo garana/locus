@@ -2,12 +2,12 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/gguf/gguf.hpp"
-#include "cppllm/tok/tokenizer.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/tok/tokenizer.hpp"
 #include "gguf_builder.hpp"
 
-using cppllm::tok::SpmTokenizer;
-using cppllm::tok::TokenId;
+using locus::tok::SpmTokenizer;
+using locus::tok::TokenId;
 
 namespace {
 
@@ -79,7 +79,7 @@ TEST_CASE("builds from GGUF metadata", "[tok]") {
         .kv_u32("tokenizer.ggml.bos_token_id", 1)
         .kv_u32("tokenizer.ggml.eos_token_id", 2)
         .kv_u32("tokenizer.ggml.unknown_token_id", 0);
-    auto g = cppllm::gguf::GgufFile::parse(b.bytes());
+    auto g = locus::gguf::GgufFile::parse(b.bytes());
 
     auto tok = SpmTokenizer::from_gguf(g);
     REQUIRE(tok.vocab_size() == 8);
@@ -90,7 +90,7 @@ TEST_CASE("builds from GGUF metadata", "[tok]") {
 TEST_CASE("rejects non-SPM tokenizers", "[tok]") {
     GgufBuilder b;
     b.header(0, 1).kv_string("tokenizer.ggml.model", "gpt2");
-    auto g = cppllm::gguf::GgufFile::parse(b.bytes());
+    auto g = locus::gguf::GgufFile::parse(b.bytes());
     REQUIRE_THROWS_AS(SpmTokenizer::from_gguf(g),
-                      cppllm::gguf::Error);
+                      locus::gguf::Error);
 }

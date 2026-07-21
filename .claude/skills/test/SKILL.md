@@ -1,17 +1,17 @@
 ---
 name: test
-description: Build and run the cpp-llm Catch2 unit tests. Use after
+description: Build and run the locus Catch2 unit tests. Use after
   any code change, before commits, or when the user asks to run or
   fix tests.
 ---
 
-# Test cpp-llm
+# Test locus
 
     cmake -B build -DCMAKE_BUILD_TYPE=Release
-    cmake --build build -j --target cppllm_tests
-    ./build/tests/cppllm_tests
+    cmake --build build -j --target locus_tests
+    ./build/tests/locus_tests
 
-- Run a subset with a tag filter: `./build/tests/cppllm_tests
+- Run a subset with a tag filter: `./build/tests/locus_tests
   "[kv]"` (tags: [sanity], [kv], [sys], [gguf], [tok], [ops],
   [backend], [engine], [server], [vulkan], [e2e]; keep this list
   current as suites are added).

@@ -2,9 +2,9 @@
 #include <stdexcept>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/kv/paged_cache.hpp"
+#include "locus/kv/paged_cache.hpp"
 
-using cppllm::kv::PagedKvCache;
+using locus::kv::PagedKvCache;
 
 namespace {
 

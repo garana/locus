@@ -1,11 +1,11 @@
 #include <string>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/gguf/gguf.hpp"
-#include "cppllm/model/arch.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/model/arch.hpp"
 #include "gguf_builder.hpp"
 
-using namespace cppllm::model;
+using namespace locus::model;
 
 TEST_CASE("arch registry lists and finds", "[arch]") {
     REQUIRE(archs().size() >= 2);
@@ -24,11 +24,11 @@ TEST_CASE("unsupported architectures fail with a useful error",
           "[arch]") {
     GgufBuilder b;
     b.header(0, 1).kv_string("general.architecture", "qwen2");
-    auto g = cppllm::gguf::GgufFile::parse(b.bytes());
+    auto g = locus::gguf::GgufFile::parse(b.bytes());
     try {
         LlamaModel::load(g);
         FAIL("expected gguf::Error");
-    } catch (const cppllm::gguf::Error& e) {
+    } catch (const locus::gguf::Error& e) {
         const std::string msg = e.what();
         REQUIRE(msg.find("qwen2") != std::string::npos);
         REQUIRE(msg.find("llama") != std::string::npos);

@@ -3,11 +3,11 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/backend/cpu_ops.hpp"
-#include "cppllm/backend/registry.hpp"
-#include "cppllm/backend/variants.hpp"
+#include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 
-using namespace cppllm::backend;
+using namespace locus::backend;
 
 TEST_CASE("registry lists and resolves backends", "[backend]") {
     REQUIRE(!backends().empty());
@@ -53,7 +53,7 @@ TEST_CASE("neon matvec matches scalar", "[backend]") {
         for (auto& v : x) {
             v = dist(rng);
         }
-        Mat m{cppllm::gguf::TensorType::kF32,
+        Mat m{locus::gguf::TensorType::kF32,
               reinterpret_cast<const std::byte*>(w.data()), rows,
               cols};
         std::vector<float> a(rows), b(rows);
@@ -81,7 +81,7 @@ TEST_CASE("neon matvec matches scalar", "[backend]") {
         for (auto& v : x) {
             v = dist(rng);
         }
-        Mat m{cppllm::gguf::TensorType::kQ8_0, w.data(), rows,
+        Mat m{locus::gguf::TensorType::kQ8_0, w.data(), rows,
               cols};
         std::vector<float> a(rows), b(rows);
         matvec(m, x, a);

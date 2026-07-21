@@ -3,12 +3,12 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/gguf/gguf.hpp"
-#include "cppllm/tok/bpe_tokenizer.hpp"
-#include "cppllm/tok/tokenizer.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/tok/bpe_tokenizer.hpp"
+#include "locus/tok/tokenizer.hpp"
 
-using cppllm::tok::BpeTokenizer;
-using cppllm::tok::TokenId;
+using locus::tok::BpeTokenizer;
+using locus::tok::TokenId;
 
 namespace {
 
@@ -25,7 +25,7 @@ BpeTokenizer::Config tiny_vocab() {
 }
 
 std::string model_path() {
-    return std::string(CPPLLM_SOURCE_DIR) +
+    return std::string(LOCUS_SOURCE_DIR) +
            "/tests/models/llama-3.2-1b-q8_0.gguf";
 }
 
@@ -58,8 +58,8 @@ TEST_CASE("bpe matches llama.cpp goldens on Llama-3.2",
     if (!std::filesystem::exists(model_path())) {
         SKIP("model not present (llama-3.2-1b-q8_0.gguf)");
     }
-    auto g = cppllm::gguf::GgufFile::open(model_path());
-    auto tok = cppllm::tok::tokenizer_from_gguf(g);
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto tok = locus::tok::tokenizer_from_gguf(g);
 
     // Expected ids produced by:
     //   llama-tokenize -m llama-3.2-1b-q8_0.gguf -p <text> --ids

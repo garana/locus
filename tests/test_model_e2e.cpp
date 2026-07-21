@@ -5,21 +5,21 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/backend/registry.hpp"
-#include "cppllm/gguf/gguf.hpp"
-#include "cppllm/model/llama.hpp"
-#include "cppllm/tok/tokenizer.hpp"
+#include "locus/backend/registry.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/model/llama.hpp"
+#include "locus/tok/tokenizer.hpp"
 
 namespace {
 
 /** Real-model fixture path; see scripts/fetch-test-model.sh. */
 std::string model_path() {
-    return std::string(CPPLLM_SOURCE_DIR) +
+    return std::string(LOCUS_SOURCE_DIR) +
            "/tests/models/stories260K.gguf";
 }
 
 std::string llama32_path() {
-    return std::string(CPPLLM_SOURCE_DIR) +
+    return std::string(LOCUS_SOURCE_DIR) +
            "/tests/models/llama-3.2-1b-q8_0.gguf";
 }
 
@@ -31,7 +31,7 @@ TEST_CASE("loads a real Llama-family GGUF model", "[e2e]") {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
 
-    auto g = cppllm::gguf::GgufFile::open(path);
+    auto g = locus::gguf::GgufFile::open(path);
     REQUIRE(g.get_string("general.architecture") == "llama");
     REQUIRE_FALSE(g.tensors().empty());
 
@@ -40,7 +40,7 @@ TEST_CASE("loads a real Llama-family GGUF model", "[e2e]") {
         REQUIRE(g.tensor_data(t).size() == t.nbytes);
     }
 
-    auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     REQUIRE(tok.vocab_size() > 0);
 
     auto ids = tok.encode("Once upon a time", true);
@@ -65,12 +65,12 @@ std::string trim(std::string s) {
 namespace {
 
 /** Greedy generation returning the full decoded text. */
-std::string generate_text(cppllm::model::LlamaModel& model,
-                          const cppllm::tok::SpmTokenizer& tok,
+std::string generate_text(locus::model::LlamaModel& model,
+                          const locus::tok::SpmTokenizer& tok,
                           const std::string& prompt, int n_gen) {
     auto cache = model.make_cache();
     auto ws = model.make_workspace();
-    cppllm::kv::PagedKvCache::Seq seq;
+    locus::kv::PagedKvCache::Seq seq;
     std::vector<float> logits(model.hparams().n_vocab);
     auto ids = tok.encode(prompt, true);
     for (auto id : ids) {
@@ -78,7 +78,7 @@ std::string generate_text(cppllm::model::LlamaModel& model,
         model.forward(id, cache, seq, ws, logits);
     }
     for (int i = 0; i < n_gen; ++i) {
-        auto next = cppllm::model::argmax(logits);
+        auto next = locus::model::argmax(logits);
         if (next == tok.eos_id()) {
             break;
         }
@@ -100,16 +100,16 @@ TEST_CASE("greedy decode matches the llama.cpp golden output",
     }
     // Produced by: llama-completion -m stories260K.gguf \
     //   -p "Once upon a time" -n 40 --temp 0
-    std::ifstream golden_file(std::string(CPPLLM_SOURCE_DIR) +
+    std::ifstream golden_file(std::string(LOCUS_SOURCE_DIR) +
                               "/tests/golden/stories260K_once.txt");
     REQUIRE(golden_file.good());
     std::stringstream ss;
     ss << golden_file.rdbuf();
     const std::string golden = trim(ss.str());
 
-    auto g = cppllm::gguf::GgufFile::open(path);
-    auto model = cppllm::model::LlamaModel::load(g);
-    auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     REQUIRE(trim(generate_text(model, tok, "Once upon a time",
                                40)) == golden);
@@ -120,16 +120,16 @@ TEST_CASE("llama-3.2 (BPE + scaled rope) runs consistently",
     if (!std::filesystem::exists(llama32_path())) {
         SKIP("model not present (llama-3.2-1b-q8_0.gguf)");
     }
-    auto g = cppllm::gguf::GgufFile::open(llama32_path());
-    auto model = cppllm::model::LlamaModel::load(g);
-    auto tok_ptr = cppllm::tok::tokenizer_from_gguf(g);
+    auto g = locus::gguf::GgufFile::open(llama32_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
     REQUIRE(!model.rope_factors().empty());  // llama3 scaling
 
     // All selectable backends must agree with each other; the
     // text must answer the prompt (no llama.cpp golden here: it
     // auto-applies the chat template to this model).
     std::string reference;
-    for (const auto& b : cppllm::backend::backends()) {
+    for (const auto& b : locus::backend::backends()) {
         if (!b.available || !b.selectable) {
             continue;
         }
@@ -137,7 +137,7 @@ TEST_CASE("llama-3.2 (BPE + scaled rope) runs consistently",
         model.use_backend(b);
         auto cache = model.make_cache();
         auto ws = model.make_workspace();
-        cppllm::kv::PagedKvCache::Seq seq;
+        locus::kv::PagedKvCache::Seq seq;
         std::vector<float> logits(model.hparams().n_vocab);
         auto ids =
             tok_ptr->encode("The capital of France is", true);
@@ -146,7 +146,7 @@ TEST_CASE("llama-3.2 (BPE + scaled rope) runs consistently",
             model.forward(id, cache, seq, ws, logits);
         }
         for (int i = 0; i < 8; ++i) {
-            auto next = cppllm::model::argmax(logits);
+            auto next = locus::model::argmax(logits);
             ids.push_back(next);
             REQUIRE(cache.ensure_capacity(seq, 1));
             model.forward(next, cache, seq, ws, logits);
@@ -168,18 +168,18 @@ TEST_CASE("every selectable backend reproduces the golden output",
     if (!std::filesystem::exists(path)) {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
-    std::ifstream golden_file(std::string(CPPLLM_SOURCE_DIR) +
+    std::ifstream golden_file(std::string(LOCUS_SOURCE_DIR) +
                               "/tests/golden/stories260K_once.txt");
     REQUIRE(golden_file.good());
     std::stringstream ss;
     ss << golden_file.rdbuf();
     const std::string golden = trim(ss.str());
 
-    auto g = cppllm::gguf::GgufFile::open(path);
-    auto model = cppllm::model::LlamaModel::load(g);
-    auto tok = cppllm::tok::SpmTokenizer::from_gguf(g);
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
-    for (const auto& b : cppllm::backend::backends()) {
+    for (const auto& b : locus::backend::backends()) {
         if (!b.available || !b.selectable) {
             continue;
         }

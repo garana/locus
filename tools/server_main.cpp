@@ -3,25 +3,25 @@
 #include <string>
 
 #include "backend_cli.hpp"
-#include "cppllm/gguf/gguf.hpp"
-#include "cppllm/model/llama.hpp"
-#include "cppllm/server/server.hpp"
-#include "cppllm/sys/features.hpp"
-#include "cppllm/tok/tokenizer.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/model/llama.hpp"
+#include "locus/server/server.hpp"
+#include "locus/sys/features.hpp"
+#include "locus/tok/tokenizer.hpp"
 
 /**
  * OpenAI-compatible inference server (M4):
- *   cppllm-server [--backend NAME] <model.gguf> [port]
- *   cppllm-server --backends
+ *   locus-server [--backend NAME] <model.gguf> [port]
+ *   locus-server --backends
  */
 int main(int argc, char** argv) {
-    auto args = cppllm_tools::parse_backend_args(argc, argv);
+    auto args = locus_tools::parse_backend_args(argc, argv);
     if (args.list) {
-        cppllm_tools::print_backends();
+        locus_tools::print_backends();
         return 0;
     }
     if (args.list_archs) {
-        cppllm_tools::print_archs();
+        locus_tools::print_archs();
         return 0;
     }
     if (args.help) {
@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
             "OpenAI-compatible inference server (default port "
             "8080):\n  POST /v1/completions\n  POST "
             "/v1/chat/completions\n  GET  /health\n\n%s",
-            argv[0], cppllm_tools::kCommonHelp);
+            argv[0], locus_tools::kCommonHelp);
         return 0;
     }
     if (args.positional.empty()) {
@@ -46,23 +46,23 @@ int main(int argc, char** argv) {
                          : 8080;
 
     try {
-        auto g = cppllm::gguf::GgufFile::open(model_path);
-        auto model = cppllm::model::LlamaModel::load(g);
+        auto g = locus::gguf::GgufFile::open(model_path);
+        auto model = locus::model::LlamaModel::load(g);
         model.use_backend(
-            cppllm::backend::resolve_backend(args.choice));
-        auto tok_ptr = cppllm::tok::tokenizer_from_gguf(g);
+            locus::backend::resolve_backend(args.choice));
+        auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
         auto& tok = *tok_ptr;
 
-        cppllm::server::OpenAiServer::Options opt;
+        locus::server::OpenAiServer::Options opt;
         opt.model_name = model_path;
         opt.chat_template =
-            cppllm::chat::ChatTemplate::from_gguf(g);
-        cppllm::server::OpenAiServer server(model, tok, opt);
+            locus::chat::ChatTemplate::from_gguf(g);
+        locus::server::OpenAiServer server(model, tok, opt);
         std::fprintf(
             stderr,
             "%s\nbackend: %s | chat template: %s\n"
-            "cppllm-server listening on :%d\n",
-            cppllm::sys::to_string(cppllm::sys::detect()).c_str(),
+            "locus-server listening on :%d\n",
+            locus::sys::to_string(locus::sys::detect()).c_str(),
             std::string(model.active_backend().name).c_str(),
             std::string(opt.chat_template.name()).c_str(),
             port);

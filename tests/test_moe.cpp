@@ -3,13 +3,13 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "cppllm/backend/registry.hpp"
-#include "cppllm/backend/variants.hpp"
-#include "cppllm/gguf/gguf.hpp"
-#include "cppllm/model/llama.hpp"
+#include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/model/llama.hpp"
 #include "gguf_builder.hpp"
 
-using cppllm::model::LlamaModel;
+using locus::model::LlamaModel;
 
 namespace {
 
@@ -121,18 +121,18 @@ class ModelBuilder {
 
 /** Greedy logits after feeding `tokens` through the model. */
 std::vector<float> run(const std::vector<std::byte>& image,
-                       const std::vector<cppllm::tok::TokenId>&
+                       const std::vector<locus::tok::TokenId>&
                            tokens,
                        const char* backend = nullptr) {
-    auto g = cppllm::gguf::GgufFile::parse(image);
+    auto g = locus::gguf::GgufFile::parse(image);
     auto model = LlamaModel::load(g);
     if (backend != nullptr) {
         model.use_backend(
-            *cppllm::backend::find_backend(backend));
+            *locus::backend::find_backend(backend));
     }
     auto cache = model.make_cache();
     auto ws = model.make_workspace();
-    cppllm::kv::PagedKvCache::Seq seq;
+    locus::kv::PagedKvCache::Seq seq;
     std::vector<float> logits(model.hparams().n_vocab);
     for (auto t : tokens) {
         REQUIRE(cache.ensure_capacity(seq, 1));
@@ -181,7 +181,7 @@ TEST_CASE("identical experts reproduce the dense model exactly",
                rep(wd, 4));
     auto moe_img = moe.build(4, 2);
 
-    const std::vector<cppllm::tok::TokenId> toks = {3, 7, 1};
+    const std::vector<locus::tok::TokenId> toks = {3, 7, 1};
     auto a = run(dense_img, toks);
     auto b = run(moe_img, toks);
     REQUIRE(a.size() == b.size());
@@ -235,7 +235,7 @@ TEST_CASE("router forced to one expert matches that expert's "
                splice(wd, kF * kE, 50));
     auto moe_img = moe.build(4, 1);
 
-    const std::vector<cppllm::tok::TokenId> toks = {5, 2};
+    const std::vector<locus::tok::TokenId> toks = {5, 2};
     auto a = run(dense_img, toks);
     auto b = run(moe_img, toks);
     for (std::size_t i = 0; i < a.size(); ++i) {
@@ -245,7 +245,7 @@ TEST_CASE("router forced to one expert matches that expert's "
 
 TEST_CASE("moe on the vulkan backend matches dense",
           "[moe][vulkan]") {
-    if (!cppllm::backend::vulkan_backend_usable()) {
+    if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device / kernels not built");
     }
     const auto wg = weights(kE * kF, 10);
@@ -278,7 +278,7 @@ TEST_CASE("moe on the vulkan backend matches dense",
                rep(wd, 4));
     auto moe_img = moe.build(4, 2);
 
-    const std::vector<cppllm::tok::TokenId> toks = {3, 7, 1};
+    const std::vector<locus::tok::TokenId> toks = {3, 7, 1};
     auto a = run(dense_img, toks);  // CPU dense reference
     auto b = run(moe_img, toks, "vulkan");
     for (std::size_t i = 0; i < a.size(); ++i) {
@@ -311,7 +311,7 @@ TEST_CASE("distinct experts diverge from the dense model",
                weights(kF * kE * 4, 66));
     auto moe_img = moe.build(4, 2);
 
-    const std::vector<cppllm::tok::TokenId> toks = {9};
+    const std::vector<locus::tok::TokenId> toks = {9};
     auto a = run(dense_img, toks);
     auto b = run(moe_img, toks);
     bool differs = false;

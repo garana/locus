@@ -5,15 +5,15 @@
 #include <string_view>
 #include <vector>
 
-#include "cppllm/backend/registry.hpp"
-#include "cppllm/model/arch.hpp"
+#include "locus/backend/registry.hpp"
+#include "locus/model/arch.hpp"
 
-namespace cppllm_tools {
+namespace locus_tools {
 
 /** Prints the supported model architectures. */
 inline void print_archs() {
     std::printf("architectures:\n");
-    for (const auto& a : cppllm::model::archs()) {
+    for (const auto& a : locus::model::archs()) {
         std::printf("  %-10s %s\n",
                     std::string(a.name).c_str(),
                     std::string(a.description).c_str());
@@ -22,9 +22,9 @@ inline void print_archs() {
 
 /** Prints the backend registry, marking the auto-pick with '*'. */
 inline void print_backends() {
-    const auto& best = cppllm::backend::best_backend();
+    const auto& best = locus::backend::best_backend();
     std::printf("backends (best first):\n");
-    for (const auto& b : cppllm::backend::backends()) {
+    for (const auto& b : locus::backend::backends()) {
         const char* note = !b.available      ? "  [unavailable]"
                            : !b.selectable   ? "  [not selectable]"
                            : &b == &best     ? "  [default]"
@@ -44,7 +44,7 @@ inline constexpr const char* kCommonHelp =
     "  -h, --help       show this help and exit\n"
     "\n"
     "environment:\n"
-    "  CPPLLM_BACKEND   backend to use when --backend is not\n"
+    "  LOCUS_BACKEND   backend to use when --backend is not\n"
     "                   given; same names as --backends\n";
 
 /** Backend flags peeled off argv; the rest stays positional. */
@@ -81,4 +81,4 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
     return out;
 }
 
-}  // namespace cppllm_tools
+}  // namespace locus_tools
