@@ -3,7 +3,13 @@ build-*/
 .cache/
 compile_commands.json
 .DS_Store
-tests/models/
+
+# Large model files live outside the repo; these paths may be plain
+# directories or symlinks to a big-disk location. No trailing slash
+# so a symlink at the path is ignored too (a "dir/" pattern matches
+# only real directories, not a symlink pointing at one).
+tests/models
+/models
 
 # IDE files
 .idea/
