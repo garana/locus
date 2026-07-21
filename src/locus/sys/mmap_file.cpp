@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <system_error>
 #include <utility>
 
@@ -58,6 +59,19 @@ MappedFile::~MappedFile() {
     if (data_ != nullptr) {
         ::munmap(data_, size_);
     }
+}
+
+void advise_willneed(const void* p, std::size_t n) {
+    if (p == nullptr || n == 0) {
+        return;
+    }
+    static const std::size_t page =
+        static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    const auto addr = reinterpret_cast<std::uintptr_t>(p);
+    const std::uintptr_t base = addr & ~(page - 1);
+    // Best-effort hint; failures (e.g. non-mmap memory) are fine.
+    (void)::madvise(reinterpret_cast<void*>(base),
+                    n + (addr - base), MADV_WILLNEED);
 }
 
 }  // namespace locus::sys

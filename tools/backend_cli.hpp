@@ -44,8 +44,12 @@ inline constexpr const char* kCommonHelp =
     "  -h, --help       show this help and exit\n"
     "\n"
     "environment:\n"
-    "  LOCUS_BACKEND   backend to use when --backend is not\n"
-    "                   given; same names as --backends\n";
+    "  LOCUS_BACKEND           backend when --backend absent;\n"
+    "                          same names as --backends\n"
+    "  LOCUS_MOE_STATS=1       print expert-routing telemetry\n"
+    "                          at exit (R8 working-set data)\n"
+    "  LOCUS_EXPERT_READAHEAD=1  madvise routed experts before\n"
+    "                          their matmuls (streaming models)\n";
 
 /** Backend flags peeled off argv; the rest stays positional. */
 struct BackendArgs {

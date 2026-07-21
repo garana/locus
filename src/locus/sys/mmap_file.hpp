@@ -41,4 +41,12 @@ class MappedFile {
     std::size_t size_ = 0;
 };
 
+/**
+ * Asks the OS to start faulting in [p, p+n) asynchronously
+ * (madvise WILLNEED, page-aligned). Best-effort: errors are
+ * ignored. Used by the R8 expert-readahead policy to overlap the
+ * SSD reads of the experts a token just routed to.
+ */
+void advise_willneed(const void* p, std::size_t n);
+
 }  // namespace locus::sys

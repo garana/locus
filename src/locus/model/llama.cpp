@@ -346,6 +346,21 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
                              hp_.n_expert);
         }
     }
+    // R8 expert readahead: overlap the SSD reads of every routed
+    // expert before the sequential per-expert matmuls fault them
+    // in one by one. Opt-in for A/B against the passive baseline.
+    static const bool readahead =
+        std::getenv("LOCUS_EXPERT_READAHEAD") != nullptr;
+    if (readahead) {
+        for (const auto& [e, wgt] : picked) {
+            sys::advise_willneed(lay.gate_exps.expert(e).data,
+                                 lay.gate_exps.expert_bytes);
+            sys::advise_willneed(lay.up_exps.expert(e).data,
+                                 lay.up_exps.expert_bytes);
+            sys::advise_willneed(lay.down_exps.expert(e).data,
+                                 lay.down_exps.expert_bytes);
+        }
+    }
     std::fill(ws.moe_acc.begin(), ws.moe_acc.end(), 0.0f);
     auto swiglu_into_acc = [&](const Mat& wg, const Mat& wu,
                                const Mat& wd, std::uint32_t ff,
