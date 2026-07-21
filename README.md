@@ -48,8 +48,12 @@ runtime dispatch). Inspect and override:
     locus-run --backend scalar model.gguf "prompt" 32
     LOCUS_BACKEND=neon locus-server model.gguf 8080
 
-Current entries: neon (arm64), scalar (reference), and vulkan --
-a full GPU forward pass: F32/Q8_0 matmul shaders (weights
+Current entries: neon (arm64), sse4 (x86-64), scalar (reference),
+vulkan, and cuda. neon/sse4 are hybrid backends -- F32/Q8_0 matvec
+vectorized, the rest scalar. cuda is likewise hybrid: F32/Q8_0
+matvec on an NVIDIA GPU (streamed per call for now; other types
+scalar), validated on sm_50 (GTX 750 Ti, CUDA 12.x). vulkan is the
+full GPU forward pass instead: F32/Q8_0 matmul shaders (weights
 resident, uploaded once), rmsnorm, RoPE, SwiGLU, and paged
 attention reading K/V from a GPU-mapped cache pool, all recorded
 as one command batch per token. Every selectable backend must
@@ -57,9 +61,9 @@ reproduce the llama.cpp golden output token-exact (tested, single
 and concurrent streams). At real-model sizes the GPU wins (2048^2
 f32 matvec: ~750us vs ~3550us scalar CPU, Apple M-series via
 MoltenVK); on the tiny 260K test model dispatch overhead keeps
-CPU ahead. F16/Q4_0 GPU shaders, x86 sse4/avx2/avx512, and CUDA
-slot into src/locus/backend/registry.cpp when their kernels
-land.
+CPU ahead. F16/Q4_0 GPU shaders, x86 avx2/avx512 (avx2 kernel
+exists, pending validation on an AVX2 host), and CUDA residency/
+streaming policies (R8) slot into src/locus/backend/ as they land.
 
 ## Dependencies
 
