@@ -30,6 +30,7 @@ add_library(locus
     src/locus/tok/tokenizer.cpp
 )
 target_include_directories(locus SYSTEM PRIVATE
+    third_party/ggml
     third_party/httplib
     third_party/json
 )

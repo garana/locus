@@ -159,7 +159,7 @@ TEST_CASE("matvec q4_0 dequantizes correctly", "[ops]") {
 }
 
 TEST_CASE("matvec rejects unsupported weight types", "[ops]") {
-    Mat m{TensorType::kQ3_K, nullptr, 1, 256};
+    Mat m{TensorType::kQ4_1, nullptr, 1, 256};
     std::vector<float> x(256, 0.0f);
     float out[1];
     REQUIRE_THROWS_AS(matvec(m, x, out), locus::gguf::Error);
@@ -171,10 +171,25 @@ namespace {
 std::vector<std::byte> k_quant_row(TensorType t,
                                    std::uint32_t blocks,
                                    std::uint32_t seed) {
-    const std::size_t bytes = t == TensorType::kQ4_K   ? 144
-                              : t == TensorType::kQ5_K ? 176
-                                                       : 210;
-    std::vector<std::byte> row(blocks * bytes);
+    struct Layout {
+        std::size_t bytes;
+        std::size_t d_off;
+        int dmin_off;  // -1: none
+    };
+    const Layout lay = [t]() -> Layout {
+        switch (t) {
+            case TensorType::kQ2_K: return {84, 80, 82};
+            case TensorType::kQ3_K: return {110, 108, -1};
+            case TensorType::kQ4_K: return {144, 0, 2};
+            case TensorType::kQ5_K: return {176, 0, 2};
+            case TensorType::kQ6_K: return {210, 208, -1};
+            case TensorType::kIQ2_XXS: return {66, 0, -1};
+            case TensorType::kIQ3_XXS: return {98, 0, -1};
+            case TensorType::kIQ1_S: return {50, 0, -1};
+            default: return {136, 0, -1};  // kIQ4_XS
+        }
+    }();
+    std::vector<std::byte> row(blocks * lay.bytes);
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> byte_d(0, 255);
     for (auto& b : row) {
@@ -182,16 +197,14 @@ std::vector<std::byte> k_quant_row(TensorType t,
     }
     // Overwrite the f16 scale fields with sane magnitudes.
     for (std::uint32_t b = 0; b < blocks; ++b) {
-        std::byte* blk = row.data() + b * bytes;
+        std::byte* blk = row.data() + b * lay.bytes;
         const std::uint16_t d =
             locus::backend::f32_to_f16(0.01f);
         const std::uint16_t dmin =
             locus::backend::f32_to_f16(0.005f);
-        if (t == TensorType::kQ6_K) {
-            std::memcpy(blk + 208, &d, 2);
-        } else {
-            std::memcpy(blk, &d, 2);
-            std::memcpy(blk + 2, &dmin, 2);
+        std::memcpy(blk + lay.d_off, &d, 2);
+        if (lay.dmin_off >= 0) {
+            std::memcpy(blk + lay.dmin_off, &dmin, 2);
         }
     }
     return row;
@@ -208,8 +221,12 @@ TEST_CASE("k-quant matvec is consistent with dequant_row",
     for (auto& v : x) {
         v = dist(rng);
     }
-    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ5_K,
-                         TensorType::kQ6_K}) {
+    for (TensorType t :
+         {TensorType::kQ2_K, TensorType::kQ3_K,
+          TensorType::kQ4_K, TensorType::kQ5_K,
+          TensorType::kQ6_K, TensorType::kIQ2_XXS,
+          TensorType::kIQ3_XXS, TensorType::kIQ1_S,
+          TensorType::kIQ4_XS}) {
         auto row0 = k_quant_row(t, 2, 40);
         auto row1 = k_quant_row(t, 2, 41);
         auto row2 = k_quant_row(t, 2, 42);

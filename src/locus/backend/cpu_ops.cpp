@@ -224,18 +224,221 @@ void dequant_block_q6_k(const std::byte* blk, float* y) {
     }
 }
 
+// ----------------------------------------------------------------
+// Q2_K/Q3_K and IQ-family super-block dequantizers, ported from
+// ggml's dequantize_row_* reference implementations (llama.cpp,
+// MIT); the IQ lookup grids are vendored in third_party/ggml.
+// ----------------------------------------------------------------
+#include "iq_grids.h"
+
+constexpr std::uint8_t kmask_iq2xs[8] = {1,  2,  4,  8,
+                                         16, 32, 64, 128};
+
+/** Q2_K (84 bytes): scales[16] | qs[64] | d | dmin. */
+void dequant_block_q2_k(const std::byte* blk, float* y) {
+    const auto* scales =
+        reinterpret_cast<const std::uint8_t*>(blk);
+    const auto* q =
+        reinterpret_cast<const std::uint8_t*>(blk + 16);
+    const float d = f16_to_f32(load_u16(blk + 80));
+    const float min = f16_to_f32(load_u16(blk + 82));
+    int is = 0;
+    for (int n = 0; n < 256; n += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            std::uint8_t sc = scales[is++];
+            float dl = d * (sc & 0x0f), ml = min * (sc >> 4);
+            for (int l = 0; l < 16; ++l) {
+                *y++ = dl * ((q[l] >> shift) & 3) - ml;
+            }
+            sc = scales[is++];
+            dl = d * (sc & 0x0f);
+            ml = min * (sc >> 4);
+            for (int l = 0; l < 16; ++l) {
+                *y++ = dl * ((q[l + 16] >> shift) & 3) - ml;
+            }
+            shift += 2;
+        }
+        q += 32;
+    }
+}
+
+/** Q3_K (110 bytes): hmask[32] | qs[64] | scales[12] | d. */
+void dequant_block_q3_k(const std::byte* blk, float* y) {
+    const auto* hm = reinterpret_cast<const std::uint8_t*>(blk);
+    const auto* q =
+        reinterpret_cast<const std::uint8_t*>(blk + 32);
+    const float d_all = f16_to_f32(load_u16(blk + 108));
+
+    constexpr std::uint32_t kmask1 = 0x03030303;
+    constexpr std::uint32_t kmask2 = 0x0f0f0f0f;
+    std::uint32_t aux[4];
+    std::memcpy(aux, blk + 96, 12);
+    const std::uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) |
+             (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) |
+             (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const auto* scales =
+        reinterpret_cast<const std::int8_t*>(aux);
+
+    int is = 0;
+    std::uint8_t m = 1;
+    for (int n = 0; n < 256; n += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            float dl = d_all * (scales[is++] - 32);
+            for (int l = 0; l < 16; ++l) {
+                *y++ = dl * (static_cast<int>((q[l] >> shift) &
+                                              3) -
+                             ((hm[l] & m) ? 0 : 4));
+            }
+            dl = d_all * (scales[is++] - 32);
+            for (int l = 0; l < 16; ++l) {
+                *y++ = dl *
+                       (static_cast<int>((q[l + 16] >> shift) &
+                                         3) -
+                        ((hm[l + 16] & m) ? 0 : 4));
+            }
+            shift += 2;
+            m = static_cast<std::uint8_t>(m << 1);
+        }
+        q += 32;
+    }
+}
+
+/** IQ2_XXS (66 bytes): d | qs as 32 u16. */
+void dequant_block_iq2_xxs(const std::byte* blk, float* y) {
+    const float d = f16_to_f32(load_u16(blk));
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+        std::uint32_t aux32[2];
+        std::memcpy(aux32, blk + 2 + 8 * ib32, 8);
+        const auto* aux8 =
+            reinterpret_cast<const std::uint8_t*>(aux32);
+        const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+            const auto* grid =
+                reinterpret_cast<const std::uint8_t*>(
+                    iq2xxs_grid + aux8[l]);
+            const std::uint8_t signs =
+                ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+            for (int j = 0; j < 8; ++j) {
+                y[j] = db * grid[j] *
+                       ((signs & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+            }
+            y += 8;
+        }
+    }
+}
+
+/** IQ3_XXS (98 bytes): d | qs[64] | scales_and_signs[32]. */
+void dequant_block_iq3_xxs(const std::byte* blk, float* y) {
+    const float d = f16_to_f32(load_u16(blk));
+    const auto* qs =
+        reinterpret_cast<const std::uint8_t*>(blk + 2);
+    const std::byte* sas = blk + 2 + 64;
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+        std::uint32_t aux32;
+        std::memcpy(&aux32, sas + 4 * ib32, 4);
+        const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+        for (int l = 0; l < 4; ++l) {
+            const std::uint8_t signs =
+                ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+            const auto* grid1 =
+                reinterpret_cast<const std::uint8_t*>(
+                    iq3xxs_grid + qs[2 * l]);
+            const auto* grid2 =
+                reinterpret_cast<const std::uint8_t*>(
+                    iq3xxs_grid + qs[2 * l + 1]);
+            for (int j = 0; j < 4; ++j) {
+                y[j] = db * grid1[j] *
+                       ((signs & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                y[j + 4] = db * grid2[j] *
+                           ((signs & kmask_iq2xs[j + 4])
+                                ? -1.0f
+                                : 1.0f);
+            }
+            y += 8;
+        }
+        qs += 8;
+    }
+}
+
+/** IQ1_S (50 bytes): d | qs[32] | qh as 8 u16. */
+void dequant_block_iq1_s(const std::byte* blk, float* y) {
+    constexpr float kIq1sDelta = 0.125f;
+    const float d = f16_to_f32(load_u16(blk));
+    const auto* qs =
+        reinterpret_cast<const std::uint8_t*>(blk + 2);
+    for (int ib = 0; ib < 8; ++ib) {
+        std::uint16_t qh;
+        std::memcpy(&qh, blk + 34 + 2 * ib, 2);
+        const float dl = d * (2 * ((qh >> 12) & 7) + 1);
+        const float delta =
+            (qh & 0x8000) ? -kIq1sDelta : kIq1sDelta;
+        for (int l = 0; l < 4; ++l) {
+            const auto* grid =
+                reinterpret_cast<const std::int8_t*>(
+                    iq1s_grid +
+                    (qs[l] | (((qh >> (3 * l)) & 7) << 8)));
+            for (int j = 0; j < 8; ++j) {
+                y[j] = dl * (grid[j] + delta);
+            }
+            y += 8;
+        }
+        qs += 4;
+    }
+}
+
+/** IQ4_XS (136 bytes): d | scales_h u16 | scales_l[4] | qs[128]. */
+void dequant_block_iq4_xs(const std::byte* blk, float* y) {
+    const float d = f16_to_f32(load_u16(blk));
+    std::uint16_t scales_h;
+    std::memcpy(&scales_h, blk + 2, 2);
+    const auto* scales_l =
+        reinterpret_cast<const std::uint8_t*>(blk + 4);
+    const auto* qs =
+        reinterpret_cast<const std::uint8_t*>(blk + 8);
+    for (int ib = 0; ib < 8; ++ib) {
+        const int ls =
+            ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0f) |
+            (((scales_h >> (2 * ib)) & 3) << 4);
+        const float dl = d * (ls - 32);
+        for (int j = 0; j < 16; ++j) {
+            y[j] = dl * kvalues_iq4nl[qs[j] & 0x0f];
+            y[j + 16] = dl * kvalues_iq4nl[qs[j] >> 4];
+        }
+        y += 32;
+        qs += 16;
+    }
+}
+
 using BlockDequantFn = void (*)(const std::byte*, float*);
 
-/** @returns {block_bytes, fn} for 256-elem K-quant types. */
+/** @returns {block_bytes, fn} for 256-elem super-block types. */
 std::pair<std::size_t, BlockDequantFn> k_traits(
     gguf::TensorType t) {
     switch (t) {
+        case gguf::TensorType::kQ2_K:
+            return {84, &dequant_block_q2_k};
+        case gguf::TensorType::kQ3_K:
+            return {110, &dequant_block_q3_k};
         case gguf::TensorType::kQ4_K:
             return {144, &dequant_block_q4_k};
         case gguf::TensorType::kQ5_K:
             return {176, &dequant_block_q5_k};
         case gguf::TensorType::kQ6_K:
             return {210, &dequant_block_q6_k};
+        case gguf::TensorType::kIQ2_XXS:
+            return {66, &dequant_block_iq2_xxs};
+        case gguf::TensorType::kIQ3_XXS:
+            return {98, &dequant_block_iq3_xxs};
+        case gguf::TensorType::kIQ1_S:
+            return {50, &dequant_block_iq1_s};
+        case gguf::TensorType::kIQ4_XS:
+            return {136, &dequant_block_iq4_xs};
         default:
             return {0, nullptr};
     }
@@ -266,9 +469,15 @@ std::size_t row_bytes(const Mat& w) {
             return w.cols / 32ull * kQ4_0BlockBytes;
         case gguf::TensorType::kQ5_0:
             return w.cols / 32ull * kQ5_0BlockBytes;
+        case gguf::TensorType::kQ2_K:
+        case gguf::TensorType::kQ3_K:
         case gguf::TensorType::kQ4_K:
         case gguf::TensorType::kQ5_K:
         case gguf::TensorType::kQ6_K:
+        case gguf::TensorType::kIQ2_XXS:
+        case gguf::TensorType::kIQ3_XXS:
+        case gguf::TensorType::kIQ1_S:
+        case gguf::TensorType::kIQ4_XS:
             return w.cols / 256ull * k_traits(w.type).first;
         default:
             throw gguf::Error("no CPU kernel for this weight type");
