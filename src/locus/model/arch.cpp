@@ -1,5 +1,6 @@
 #include "locus/model/arch.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 #include "locus/model/gguf_load.hpp"
@@ -309,6 +310,24 @@ std::uint32_t deepseek2_kv_dim(const Hparams& hp) {
     return hp.kv_lora_rank + hp.qk_rope_dim;
 }
 
+/**
+ * GLM-5.2 (DSA): MLA with q_lora + split k_b/v_b and V3-style
+ * sigmoid gating -- computationally the deepseek2 stack. Its
+ * dynamic-sparse-attention indexer selects top_k positions; for
+ * contexts <= top_k the selection keeps everything and DSA
+ * equals dense MLA, so the indexer tensors are ignored and the
+ * usable context is capped at indexer.top_k until the indexer
+ * is implemented.
+ */
+void glm_dsa_hparams(const gguf::GgufFile& g,
+                     const std::string& p, Hparams& hp) {
+    deepseek2_hparams(g, p, hp);
+    const std::uint32_t top_k = static_cast<std::uint32_t>(
+        g.get_uint(p + "attention.indexer.top_k")
+            .value_or(2048));
+    hp.n_ctx = std::min(hp.n_ctx, top_k);
+}
+
 const ArchSpec kArchs[] = {
     {"llama",
      "Llama family (dense or Mixtral-style MoE, GQA)",
@@ -317,6 +336,11 @@ const ArchSpec kArchs[] = {
     {"deepseek2",
      "DeepSeek-V2 family (MLA latent attention, DeepSeek MoE)",
      &deepseek2_hparams, &deepseek2_attention_tensors,
+     &deepseek2_attention, &deepseek2_kv_dim},
+    {"glm-dsa",
+     "GLM-5.2 family (MLA + DeepSeek MoE; dense-equivalent DSA, "
+     "context capped at indexer top_k)",
+     &glm_dsa_hparams, &deepseek2_attention_tensors,
      &deepseek2_attention, &deepseek2_kv_dim},
 };
 
