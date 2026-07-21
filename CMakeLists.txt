@@ -6,7 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_compile_options(-Wall -Wextra -Wpedantic)
+# Warning flags are C++-only: nvcc does not understand -Wpedantic on
+# CUDA sources (host-side warnings go through -Xcompiler instead).
+add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>")
 
 add_library(locus
     src/locus/backend/cpu_ops.cpp
@@ -14,6 +16,7 @@ add_library(locus
     src/locus/backend/matvec_neon.cpp
     src/locus/backend/matvec_sse4.cpp
     src/locus/backend/matvec_vulkan.cpp
+    src/locus/backend/cuda_stub.cpp
     src/locus/backend/registry.cpp
     src/locus/backend/vulkan/context.cpp
     src/locus/chat/template.cpp
@@ -145,6 +148,35 @@ if(Vulkan_FOUND)
     endif()
 else()
     message(STATUS "locus Vulkan: not found, GPU backend disabled")
+endif()
+
+# ----------------------------------------------------------------
+# CUDA (optional): when a toolkit is present, compile the .cu matvec
+# variant and define LOCUS_HAS_CUDA so registry.cpp links the real
+# kernels instead of the scalar stub. Absent a toolkit, cuda_stub.cpp
+# supplies the fallbacks and the backend reports itself unusable.
+# sm_50 (Maxwell, e.g. GTX 750 Ti) still compiles in the CUDA 12.x
+# series; a 12.x binary runs on driver >=525 via minor-version compat.
+# ----------------------------------------------------------------
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    if(NOT DEFINED CMAKE_CUDA_COMPILER)
+        set(CMAKE_CUDA_COMPILER "${CUDAToolkit_NVCC_EXECUTABLE}")
+    endif()
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 20)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    target_sources(locus PRIVATE
+        src/locus/backend/cuda/cuda_matvec.cu)
+    set_target_properties(locus PROPERTIES CUDA_ARCHITECTURES "50")
+    target_compile_definitions(locus PRIVATE LOCUS_HAS_CUDA=1)
+    target_compile_options(locus PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
+    target_link_libraries(locus PRIVATE CUDA::cudart)
+    message(STATUS
+        "locus CUDA: found (${CUDAToolkit_VERSION}), sm_50")
+else()
+    message(STATUS "locus CUDA: not found, GPU backend disabled")
 endif()
 
 enable_testing()

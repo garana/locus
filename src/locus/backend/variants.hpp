@@ -48,4 +48,16 @@ bool vulkan_backend_usable();
 /** KV-pool allocator returning a GPU-mapped pointer (Ops hook). */
 float* vulkan_alloc_kv(std::size_t n_floats);
 
+/**
+ * CUDA matvec: F32 and Q8_0 weights run on an NVIDIA GPU (streamed
+ * per call for now); other types delegate to the scalar reference.
+ * When the build has no CUDA toolkit a stub delegates entirely to
+ * scalar and reports the backend unusable.
+ */
+void matvec_cuda(const Mat& w, std::span<const float> x,
+                 std::span<float> out);
+
+/** @returns true when a usable CUDA device is present. */
+bool cuda_backend_usable();
+
 }  // namespace locus::backend

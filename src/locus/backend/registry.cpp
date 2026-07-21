@@ -46,11 +46,12 @@ const std::vector<Backend>& list() {
                      vk, vk,
                      {&matvec_vulkan, &dequant_row,
                       &vulkan_alloc_kv}});
+        const bool cu = cuda_backend_usable();
         b.push_back({"cuda",
-                     "NVIDIA CUDA backend (planned; requires a "
-                     "CUDA host and is not built yet)",
-                     false, false,
-                     {&matvec, &dequant_row, nullptr}});
+                     "NVIDIA CUDA matvec (F32/Q8_0 on GPU, "
+                     "streamed per call; other types scalar)",
+                     cu, cu,
+                     {&matvec_cuda, &dequant_row, nullptr}});
         return b;
     }();
     return v;

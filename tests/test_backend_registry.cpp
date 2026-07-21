@@ -96,13 +96,12 @@ TEST_CASE("neon matvec matches scalar", "[backend]") {
 }
 #endif
 
-#if defined(__x86_64__)
 namespace {
 
-/** Drives one x86 vectorized matvec vs the scalar reference over
- *  an f32 tail case and a multi-block q8_0 case. `variant` is only
- *  invoked after the caller has confirmed the CPU supports it. */
-void check_x86_variant_matches_scalar(
+/** Drives one matvec variant vs the scalar reference over an f32
+ *  tail case and a multi-block q8_0 case. `variant` is only invoked
+ *  after the caller has confirmed the device/CPU supports it. */
+void check_matvec_variant_matches_scalar(
     void (*variant)(const Mat&, std::span<const float>,
                     std::span<float>)) {
     std::mt19937 rng(11);
@@ -160,17 +159,25 @@ void check_x86_variant_matches_scalar(
 
 }  // namespace
 
+#if defined(__x86_64__)
 TEST_CASE("sse4 matvec matches scalar", "[backend]") {
     if (!locus::sys::detect().sse4) {
         SKIP("CPU lacks SSE4.1");
     }
-    check_x86_variant_matches_scalar(&matvec_sse4);
+    check_matvec_variant_matches_scalar(&matvec_sse4);
 }
 
 TEST_CASE("avx2 matvec matches scalar", "[backend]") {
     if (!locus::sys::detect().avx2) {
         SKIP("CPU lacks AVX2 (running matvec_avx2 would fault)");
     }
-    check_x86_variant_matches_scalar(&matvec_avx2);
+    check_matvec_variant_matches_scalar(&matvec_avx2);
 }
 #endif
+
+TEST_CASE("cuda matvec matches scalar", "[backend]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    check_matvec_variant_matches_scalar(&matvec_cuda);
+}
