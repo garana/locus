@@ -238,6 +238,15 @@ Notes:
   slots, so routing spreads fast -- prefetch wins, if any, come
   from *within-token* expert readahead (overlap SSD reads across
   the 8 routed experts per layer), not from cross-token reuse.
+- First policy result (2026-07-21): LOCUS_EXPERT_READAHEAD
+  (madvise WILLNEED on all routed experts at selection time)
+  measures 12% faster wall (524.4s -> 461.7s over 8 cold
+  forwards) at equal fault counts (8.74M both legs -- proof both
+  ran equally cold) and -23% sys time. Output identical. Next
+  levers: readahead one layer AHEAD (route layer l while l-1
+  computes is not possible -- routing depends on l's input -- but
+  shared-expert and dense tensors of l+1 are known statically);
+  and larger overlap via aggregating madvise calls per layer.
 - Multimodal (K3 vision) is explicitly out of scope until the
   text path is proven.
 
