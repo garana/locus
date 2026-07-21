@@ -1,4 +1,6 @@
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -6,6 +8,7 @@
 #include "gguf_builder.hpp"
 
 using locus::gguf::Error;
+using locus::gguf::TensorInfo;
 using locus::gguf::GgufFile;
 using locus::gguf::TensorType;
 
@@ -120,6 +123,55 @@ TEST_CASE("hostile images throw instead of crashing", "[gguf]") {
         b.header(0, 1).kv_u32("general.alignment", 3);
         REQUIRE_THROWS_AS(GgufFile::parse(b.bytes()), Error);
     }
+}
+
+TEST_CASE("split models stitch tensors across shards", "[gguf]") {
+    namespace fs = std::filesystem;
+    const fs::path dir =
+        fs::temp_directory_path() / "locus-split-test";
+    fs::create_directories(dir);
+    auto write = [&](const char* name,
+                     std::span<const std::byte> bytes) {
+        std::ofstream f(dir / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size()));
+    };
+
+    // Shard 1: metadata only, declares the split.
+    GgufBuilder s1;
+    s1.header(0, 3)
+        .kv_string("general.architecture", "llama")
+        .kv_u32("split.no", 0)
+        .kv_u32("split.count", 2);
+    write("m-00001-of-00002.gguf", s1.bytes());
+
+    // Shard 2: carries one tensor.
+    GgufBuilder s2;
+    const std::uint64_t dims[] = {2, 2};
+    s2.header(1, 1)
+        .kv_u32("split.no", 1)
+        .tensor("weight", dims, 0 /* F32 */, 0)
+        .pad()
+        .zeros(16);
+    write("m-00002-of-00002.gguf", s2.bytes());
+
+    auto g = GgufFile::open(
+        (dir / "m-00001-of-00002.gguf").string());
+    REQUIRE(g.total_tensor_count() == 1);
+    REQUIRE(g.tensors().empty());  // own tensors only
+    const auto* t = g.find_tensor("weight");
+    REQUIRE(t != nullptr);
+    REQUIRE(g.tensor_data(*t).size() == 16);
+
+    // A foreign descriptor is rejected, not misread.
+    TensorInfo fake = *t;
+    REQUIRE_THROWS_AS(g.tensor_data(fake), Error);
+
+    // A missing sibling shard fails loudly.
+    fs::remove(dir / "m-00002-of-00002.gguf");
+    REQUIRE_THROWS(GgufFile::open(
+        (dir / "m-00001-of-00002.gguf").string()));
+    fs::remove_all(dir);
 }
 
 TEST_CASE("hostile tensor tables throw", "[gguf]") {

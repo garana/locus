@@ -318,10 +318,13 @@ BpeTokenizer BpeTokenizer::from_gguf(const gguf::GgufFile& g) {
     };
     cfg.bos = id_of("tokenizer.ggml.bos_token_id", 0);
     cfg.eos = id_of("tokenizer.ggml.eos_token_id", 0);
-    // BPE-family models default to NO leading BOS (llama.cpp
-    // semantics); SPM is the family that defaults to true.
+    // When the key is absent, llama.cpp defaults add_bos by
+    // pretokenizer family: the llama3 family prepends BOS, the
+    // rest of the BPE world (deepseek, gpt2, ...) does not.
+    const bool bos_default =
+        cfg.pre == "llama-bpe" || cfg.pre == "llama3";
     cfg.add_bos = g.get_bool("tokenizer.ggml.add_bos_token")
-                      .value_or(false);
+                      .value_or(bos_default);
     return BpeTokenizer(std::move(cfg));
 }
 

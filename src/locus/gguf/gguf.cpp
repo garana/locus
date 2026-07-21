@@ -1,6 +1,8 @@
 #include "locus/gguf/gguf.hpp"
 
+#include <cstdio>
 #include <cstring>
+#include <memory>
 #include <unordered_set>
 
 namespace locus::gguf {
@@ -32,6 +34,12 @@ TypeTraits traits(TensorType t) {
         case TensorType::kQ5_K: return {256, 176};
         case TensorType::kQ6_K: return {256, 210};
         case TensorType::kQ8_K: return {256, 292};
+        // IQ family: sizes for loading/validation; dequant
+        // kernels are separate work.
+        case TensorType::kIQ2_XXS: return {256, 66};
+        case TensorType::kIQ3_XXS: return {256, 98};
+        case TensorType::kIQ1_S: return {256, 50};
+        case TensorType::kIQ4_XS: return {256, 136};
     }
     return {0, 0};
 }
@@ -139,7 +147,39 @@ GgufFile GgufFile::open(const std::string& path) {
     g.file_ = sys::MappedFile(path);
     g.buf_ = g.file_.bytes();
     g.parse_buffer();
+    if (g.get_uint("split.no").value_or(0) == 0 &&
+        g.get_uint("split.count").value_or(1) > 1) {
+        g.open_shards(path);
+    }
     return g;
+}
+
+void GgufFile::open_shards(const std::string& path) {
+    // Shards follow "<base>-NNNNN-of-MMMMM.gguf"; this file is
+    // shard 1. Derive the siblings by substituting the index.
+    const std::size_t count = static_cast<std::size_t>(
+        get_uint("split.count").value_or(1));
+    const std::string suffix = "-of-";
+    const std::size_t of = path.rfind(suffix);
+    const std::size_t num = path.rfind('-', of - 1);
+    if (of == std::string::npos || num == std::string::npos ||
+        of - num != 6) {
+        throw Error(
+            "split model file name lacks -NNNNN-of-MMMMM: " +
+            path);
+    }
+    for (std::size_t i = 2; i <= count; ++i) {
+        char idx[8];
+        std::snprintf(idx, sizeof(idx), "%05zu", i);
+        std::string sib = path;
+        sib.replace(num + 1, 5, idx);
+        // make_unique cannot reach the private constructor.
+        std::unique_ptr<GgufFile> shard(new GgufFile());
+        shard->file_ = sys::MappedFile(sib);
+        shard->buf_ = shard->file_.bytes();
+        shard->parse_buffer();
+        shards_.push_back(std::move(shard));
+    }
 }
 
 GgufFile GgufFile::parse(std::span<const std::byte> buf) {
@@ -294,11 +334,37 @@ const TensorInfo* GgufFile::find_tensor(std::string_view name) const {
             return &t;
         }
     }
+    for (const auto& s : shards_) {
+        if (const TensorInfo* t = s->find_tensor(name)) {
+            return t;
+        }
+    }
     return nullptr;
+}
+
+std::size_t GgufFile::total_tensor_count() const {
+    std::size_t n = tensors_.size();
+    for (const auto& s : shards_) {
+        n += s->total_tensor_count();
+    }
+    return n;
+}
+
+bool GgufFile::owns(const TensorInfo& info) const {
+    return !tensors_.empty() && &info >= tensors_.data() &&
+           &info < tensors_.data() + tensors_.size();
 }
 
 std::span<const std::byte> GgufFile::tensor_data(
     const TensorInfo& info) const {
+    if (!owns(info)) {
+        for (const auto& s : shards_) {
+            if (s->owns(info)) {
+                return s->tensor_data(info);
+            }
+        }
+        throw Error("tensor descriptor not from this file");
+    }
     // Re-validated here so a corrupted TensorInfo from elsewhere
     // cannot produce an out-of-bounds span.
     if (checked_add(info.offset, info.nbytes) > data_.size()) {

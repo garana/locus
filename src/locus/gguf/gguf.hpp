@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -53,6 +54,10 @@ enum class TensorType : std::uint32_t {
     kQ5_K = 13,
     kQ6_K = 14,
     kQ8_K = 15,
+    kIQ2_XXS = 16,
+    kIQ3_XXS = 18,
+    kIQ1_S = 19,
+    kIQ4_XS = 23,
 };
 
 /**
@@ -101,10 +106,15 @@ struct TensorInfo {
 class GgufFile {
   public:
     /**
-     * Maps and parses a model file.
+     * Maps and parses a model file. When the file is the first
+     * shard of a split model (split.no == 0, split.count > 1),
+     * sibling shards ("-NNNNN-of-MMMMM.gguf") are mapped too and
+     * their tensors become visible through find_tensor and
+     * tensor_data; tensors() lists only this file's own tensors.
      *
      * @param path Path to a .gguf file.
-     * @throws Error on malformed content, std::system_error on IO.
+     * @throws Error on malformed content or a missing sibling
+     *     shard, std::system_error on IO.
      */
     static GgufFile open(const std::string& path);
 
@@ -144,8 +154,11 @@ class GgufFile {
     /** @returns Tensor descriptors in file order. */
     const std::vector<TensorInfo>& tensors() const { return tensors_; }
 
-    /** @returns The tensor named `name`, or nullptr. */
+    /** @returns The tensor named `name` (any shard), or nullptr. */
     const TensorInfo* find_tensor(std::string_view name) const;
+
+    /** @returns Tensor count across this file and all shards. */
+    std::size_t total_tensor_count() const;
 
     /**
      * @param info A descriptor obtained from this file.
@@ -156,6 +169,9 @@ class GgufFile {
   private:
     GgufFile() = default;
     void parse_buffer();
+    void open_shards(const std::string& path);
+    /** @returns true when info belongs to this file's tensors_. */
+    bool owns(const TensorInfo& info) const;
 
     sys::MappedFile file_;
     std::span<const std::byte> buf_;
@@ -164,6 +180,8 @@ class GgufFile {
     std::uint32_t alignment_ = 32;
     std::map<std::string, Value, std::less<>> metadata_;
     std::vector<TensorInfo> tensors_;
+    /** Sibling shards of a split model (first shard only). */
+    std::vector<std::unique_ptr<GgufFile>> shards_;
 };
 
 }  // namespace locus::gguf
