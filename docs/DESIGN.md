@@ -247,6 +247,17 @@ Notes:
   computes is not possible -- routing depends on l's input -- but
   shared-expert and dense tensors of l+1 are known statically);
   and larger overlap via aggregating madvise calls per layer.
+- Future work (Gonzalo, 2026-07-21): dedicated prefetch thread
+  that faults in the NEXT weight chunk while the math runs on
+  the current one. Mechanism note: each shard is mmap'd once,
+  whole-file, at load -- there is no map/unmap cycling of
+  pieces; the kernel demand-pages on first touch and evicts
+  under pressure. So the thread's job is to pre-FAULT upcoming
+  tensors (touch pages, not just hint): expert e+1 while expert
+  e's matmul runs, and layer l+1's statically-known tensors
+  (attn, dense, shared expert) during layer l -- turning the
+  WILLNEED hints into a real I/O/compute pipeline. This
+  subsumes the madvise-aggregation lever above.
 - Multimodal (K3 vision) is explicitly out of scope until the
   text path is proven.
 
