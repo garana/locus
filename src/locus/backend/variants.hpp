@@ -49,8 +49,8 @@ bool vulkan_backend_usable();
 float* vulkan_alloc_kv(std::size_t n_floats);
 
 /**
- * CUDA matvec: F32 and Q8_0 weights run on an NVIDIA GPU (streamed
- * per call for now); other types delegate to the scalar reference.
+ * CUDA matvec: F32, Q8_0 and Q4_K weights run on an NVIDIA GPU
+ * (streamed per call for now); other types delegate to scalar.
  * When the build has no CUDA toolkit a stub delegates entirely to
  * scalar and reports the backend unusable.
  */

@@ -48,7 +48,7 @@ const std::vector<Backend>& list() {
                       &vulkan_alloc_kv}});
         const bool cu = cuda_backend_usable();
         b.push_back({"cuda",
-                     "NVIDIA CUDA matvec (F32/Q8_0 on GPU, "
+                     "NVIDIA CUDA matvec (F32/Q8_0/Q4_K on GPU, "
                      "streamed per call; other types scalar)",
                      cu, cu,
                      {&matvec_cuda, &dequant_row, nullptr}});
