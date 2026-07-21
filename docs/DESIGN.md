@@ -229,6 +229,15 @@ Notes:
   token window (the true working set). Deliberate residency and
   prefetch policies are only justified by beating that baseline;
   the same numbers gate the Vulkan/CUDA paging designs.
+- Baseline, first cut (2026-07-21, GLM-5.2 UD-IQ1_S 216 GB,
+  neon, cold cache, 8 forwards): 509 s wall (~60 s/token), peak
+  RSS 15.4 GB (~7% of the model; only ~1 GB dirty -- the rest is
+  evictable page cache), 8.7 M page faults. Expert telemetry via
+  LOCUS_MOE_STATS (locus-run prints it at exit); Moonlight
+  reference point: 11 forwards touch 43.8% of layer-expert
+  slots, so routing spreads fast -- prefetch wins, if any, come
+  from *within-token* expert readahead (overlap SSD reads across
+  the 8 routed experts per layer), not from cross-token reuse.
 - Multimodal (K3 vision) is explicitly out of scope until the
   text path is proven.
 
