@@ -41,8 +41,12 @@ int main(int argc, char** argv) {
             std::printf(
                 "%s ne=[%llu,%llu,%llu,%llu] type=%u "
                 "bytes=%llu first=%02x\n",
-                t->name.c_str(), t->ne[0], t->ne[1], t->ne[2],
-                t->ne[3], (unsigned)t->type, t->nbytes,
+                t->name.c_str(),
+                (unsigned long long)t->ne[0],
+                (unsigned long long)t->ne[1],
+                (unsigned long long)t->ne[2],
+                (unsigned long long)t->ne[3], (unsigned)t->type,
+                (unsigned long long)t->nbytes,
                 (unsigned)g.tensor_data(*t)[0]);
         } else if (cmd == "tokens" && argc > 3) {
             auto tok = locus::tok::tokenizer_from_gguf(g);

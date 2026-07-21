@@ -98,7 +98,7 @@ TEST_CASE("greedy decode matches the llama.cpp golden output",
     if (!std::filesystem::exists(path)) {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
-    // Produced by: llama-completion -m stories260K.gguf \
+    // Produced by: llama-completion -m stories260K.gguf
     //   -p "Once upon a time" -n 40 --temp 0
     std::ifstream golden_file(std::string(LOCUS_SOURCE_DIR) +
                               "/tests/golden/stories260K_once.txt");
