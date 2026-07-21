@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "iq_grids.h"  // iq1s_grid lookup table (global scope)
+
 namespace locus::backend {
 
 namespace {
@@ -138,6 +140,61 @@ __global__ void matvec_q4_k_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
+/** One IQ1_S super-block is 50 bytes: d (f16) + qs[32] + qh[8]u16,
+ *  256 weights. Each of 8 sub-blocks picks 4 grid entries (8 int8
+ *  each) scaled by dl with a +/-0.125 delta. Dequant + accumulate in
+ *  the exact order of the scalar dequant_block_iq1_s so the dot is
+ *  token-exact. `grid` is the device copy of iq1s_grid. */
+__global__ void matvec_iq1_s_kernel(const std::uint8_t* w,
+                                    const std::uint64_t* grid,
+                                    const float* x, float* out,
+                                    std::uint32_t rows,
+                                    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    constexpr float kIq1sDelta = 0.125f;
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 50;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            50;
+        const std::uint16_t db =
+            static_cast<std::uint16_t>(blk[0]) |
+            (static_cast<std::uint16_t>(blk[1]) << 8);
+        const float d = __half2float(__ushort_as_half(db));
+        const std::uint8_t* qs = blk + 2;
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        int yi = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const std::uint8_t* qhp = blk + 34 + 2 * ib;
+            const std::uint16_t qh =
+                static_cast<std::uint16_t>(qhp[0]) |
+                (static_cast<std::uint16_t>(qhp[1]) << 8);
+            const float dl = d * (2 * ((qh >> 12) & 7) + 1);
+            const float delta =
+                (qh & 0x8000) ? -kIq1sDelta : kIq1sDelta;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint32_t gi =
+                    qs[l] | (((qh >> (3 * l)) & 7) << 8);
+                const std::int8_t* g =
+                    reinterpret_cast<const std::int8_t*>(&grid[gi]);
+                for (int j = 0; j < 8; ++j) {
+                    const float val =
+                        dl * (static_cast<float>(g[j]) + delta);
+                    acc += val * xb[yi++];
+                }
+            }
+            qs += 4;
+        }
+    }
+    out[r] = acc;
+}
+
 /** RAII-ish scoped device buffer; frees on scope exit. */
 struct DevBuf {
     void* p = nullptr;
@@ -151,11 +208,30 @@ struct DevBuf {
     }
 };
 
-enum class Kind { kF32, kQ8_0, kQ4_K };
+/** Lazily uploads iq1s_grid to the device once; nullptr on failure
+ *  (caller falls back to scalar). */
+const std::uint64_t* device_iq1s_grid() {
+    static const std::uint64_t* d =
+        []() -> const std::uint64_t* {
+        void* p = nullptr;
+        if (!cuda_ok(cudaMalloc(&p, sizeof(iq1s_grid)))) {
+            return nullptr;
+        }
+        if (!cuda_ok(cudaMemcpy(p, iq1s_grid, sizeof(iq1s_grid),
+                                cudaMemcpyHostToDevice))) {
+            cudaFree(p);
+            return nullptr;
+        }
+        return static_cast<const std::uint64_t*>(p);
+    }();
+    return d;
+}
+
+enum class Kind { kF32, kQ8_0, kQ4_K, kIQ1_S };
 
 bool run_matvec(const Mat& w, std::span<const float> x,
                 std::span<float> out, std::size_t w_bytes,
-                Kind kind) {
+                Kind kind, const std::uint64_t* grid = nullptr) {
     DevBuf dw, dx, dout;
     const std::size_t x_bytes = x.size() * sizeof(float);
     const std::size_t out_bytes =
@@ -189,6 +265,10 @@ bool run_matvec(const Mat& w, std::span<const float> x,
             matvec_q4_k_kernel<<<blocks, threads>>>(
                 dwb, dxf, doutf, w.rows, w.cols);
             break;
+        case Kind::kIQ1_S:
+            matvec_iq1_s_kernel<<<blocks, threads>>>(
+                dwb, grid, dxf, doutf, w.rows, w.cols);
+            break;
     }
     if (!cuda_ok(cudaGetLastError()) ||
         !cuda_ok(cudaDeviceSynchronize())) {
@@ -218,6 +298,13 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
             static_cast<std::size_t>(w.rows) *
             (w.cols / 256ull) * 144ull;
         done = run_matvec(w, x, out, bytes, Kind::kQ4_K);
+    } else if (w.type == gguf::TensorType::kIQ1_S) {
+        if (const std::uint64_t* grid = device_iq1s_grid()) {
+            const std::size_t bytes =
+                static_cast<std::size_t>(w.rows) *
+                (w.cols / 256ull) * 50ull;
+            done = run_matvec(w, x, out, bytes, Kind::kIQ1_S, grid);
+        }
     }
     if (!done) {
         matvec(w, x, out);  // fallback / other types: scalar

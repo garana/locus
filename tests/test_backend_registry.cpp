@@ -186,6 +186,36 @@ void check_matvec_variant_matches_scalar(
             REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-3));
         }
     }
+
+    SECTION("iq1_s super-block") {
+        const std::uint32_t rows = 3, cols = 256;  // 1 sblk/row
+        const std::uint32_t nsb = cols / 256;
+        std::vector<std::byte> w(
+            static_cast<std::size_t>(rows) * nsb * 50);
+        std::uniform_int_distribution<int> bd(0, 255);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(bd(rng));
+        }
+        // Sane f16 d per super-block; random qs/qh index the grid
+        // (max index 255|(7<<8)=2047 < 2048, always in range).
+        for (std::uint32_t s = 0; s < rows * nsb; ++s) {
+            std::byte* blk =
+                w.data() + static_cast<std::size_t>(s) * 50;
+            const std::uint16_t d = f32_to_f16(0.01f);
+            std::memcpy(blk, &d, 2);
+        }
+        std::vector<float> x(cols);
+        for (auto& v : x) {
+            v = dist(rng);
+        }
+        Mat m{locus::gguf::TensorType::kIQ1_S, w.data(), rows, cols};
+        std::vector<float> a(rows), b(rows);
+        matvec(m, x, a);
+        variant(m, x, b);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-2));
+        }
+    }
 }
 
 }  // namespace
