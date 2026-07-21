@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -247,32 +249,29 @@ void LlamaModel::forward(tok::TokenId token,
     seq.n_tokens = pos + 1;
 }
 
-void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws) const {
-    using namespace cppllm::backend;
-    const Ops& op = backend_->ops;
-    const std::uint32_t n_ff = hp_.n_ff_exp;
-
-    op.matvec(lay.gate_inp, ws.xb, ws.router);
-    if (hp_.gating == GatingFunc::kSoftmax) {
-        softmax_inplace(ws.router);
+std::vector<std::pair<std::uint32_t, float>> moe_select(
+    const Hparams& hp, const LlamaModel::Layer& lay,
+    std::span<float> router) {
+    if (hp.gating == GatingFunc::kSoftmax) {
+        backend::softmax_inplace(router);
     } else {
-        for (float& v : ws.router) {
+        for (float& v : router) {
             v = 1.0f / (1.0f + std::exp(-v));
         }
     }
     // Selection scores add the V3/K2 correction bias (weights do
     // not); group-limited routing masks all but the best groups,
     // each scored by the sum of its top-2 selection scores.
-    std::vector<float> sel(ws.router.begin(), ws.router.end());
+    std::vector<float> sel(router.begin(), router.end());
     if (!lay.exp_probs_b.empty()) {
-        for (std::uint32_t e = 0; e < hp_.n_expert; ++e) {
+        for (std::uint32_t e = 0; e < hp.n_expert; ++e) {
             sel[e] += lay.exp_probs_b[e];
         }
     }
-    if (hp_.n_group > 1) {
-        const std::uint32_t per = hp_.n_expert / hp_.n_group;
-        std::vector<float> gscore(hp_.n_group);
-        for (std::uint32_t gi = 0; gi < hp_.n_group; ++gi) {
+    if (hp.n_group > 1) {
+        const std::uint32_t per = hp.n_expert / hp.n_group;
+        std::vector<float> gscore(hp.n_group);
+        for (std::uint32_t gi = 0; gi < hp.n_group; ++gi) {
             float top1 = -1e30f, top2 = -1e30f;
             for (std::uint32_t e = gi * per;
                  e < (gi + 1) * per; ++e) {
@@ -285,31 +284,31 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws) const {
             }
             gscore[gi] = top1 + (per > 1 ? top2 : 0.0f);
         }
-        std::vector<bool> keep(hp_.n_group, false);
-        for (std::uint32_t k = 0; k < hp_.n_group_used; ++k) {
-            std::uint32_t best = hp_.n_group;
-            for (std::uint32_t gi = 0; gi < hp_.n_group; ++gi) {
-                if (!keep[gi] && (best == hp_.n_group ||
+        std::vector<bool> keep(hp.n_group, false);
+        for (std::uint32_t k = 0; k < hp.n_group_used; ++k) {
+            std::uint32_t best = hp.n_group;
+            for (std::uint32_t gi = 0; gi < hp.n_group; ++gi) {
+                if (!keep[gi] && (best == hp.n_group ||
                                   gscore[gi] > gscore[best])) {
                     best = gi;
                 }
             }
             keep[best] = true;
         }
-        for (std::uint32_t e = 0; e < hp_.n_expert; ++e) {
+        for (std::uint32_t e = 0; e < hp.n_expert; ++e) {
             if (!keep[e / per]) {
                 sel[e] = -1e30f;
             }
         }
     }
     std::vector<std::uint32_t> picked;
-    for (std::uint32_t k = 0; k < hp_.n_expert_used; ++k) {
-        std::uint32_t best = hp_.n_expert;
-        for (std::uint32_t e = 0; e < hp_.n_expert; ++e) {
+    for (std::uint32_t k = 0; k < hp.n_expert_used; ++k) {
+        std::uint32_t best = hp.n_expert;
+        for (std::uint32_t e = 0; e < hp.n_expert; ++e) {
             const bool taken =
                 std::find(picked.begin(), picked.end(), e) !=
                 picked.end();
-            if (!taken && (best == hp_.n_expert ||
+            if (!taken && (best == hp.n_expert ||
                            sel[e] > sel[best])) {
                 best = e;
             }
@@ -317,12 +316,28 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws) const {
         picked.push_back(best);
     }
     float wsum = 1.0f;
-    if (hp_.expert_weights_norm) {
+    if (hp.expert_weights_norm) {
         wsum = 0.0f;
         for (auto e : picked) {
-            wsum += ws.router[e];
+            wsum += router[e];
         }
     }
+    std::vector<std::pair<std::uint32_t, float>> out;
+    out.reserve(picked.size());
+    for (auto e : picked) {
+        out.emplace_back(
+            e, router[e] / wsum * hp.expert_weights_scale);
+    }
+    return out;
+}
+
+void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws) const {
+    using namespace cppllm::backend;
+    const Ops& op = backend_->ops;
+    const std::uint32_t n_ff = hp_.n_ff_exp;
+
+    op.matvec(lay.gate_inp, ws.xb, ws.router);
+    const auto picked = moe_select(hp_, lay, ws.router);
     std::fill(ws.moe_acc.begin(), ws.moe_acc.end(), 0.0f);
     auto swiglu_into_acc = [&](const Mat& wg, const Mat& wu,
                                const Mat& wd, std::uint32_t ff,
@@ -336,9 +351,7 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws) const {
             ws.moe_acc[i] += wgt * ws.xb2[i];
         }
     };
-    for (auto e : picked) {
-        const float wgt = ws.router[e] / wsum *
-                          hp_.expert_weights_scale;
+    for (const auto& [e, wgt] : picked) {
         swiglu_into_acc(lay.gate_exps.expert(e),
                         lay.up_exps.expert(e),
                         lay.down_exps.expert(e), n_ff, wgt);

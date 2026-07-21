@@ -161,8 +161,11 @@ class LlamaModel {
         ExpertMat gate_exps, up_exps, down_exps;
         /** MoE shared experts (deepseek2; fused matrices). */
         backend::Mat gate_shexp, up_shexp, down_shexp;
-        /** MLA (deepseek2): latent projections and norms. */
-        backend::Mat wkv_a, wkv_b;
+        /** MLA (deepseek2): latent projections and norms. The
+         * decompression weights come fused (wkv_b) in older
+         * conversions or split (wk_b/wv_b, k_b pre-transposed)
+         * in MLA-cache-era GGUFs. */
+        backend::Mat wkv_a, wkv_b, wk_b, wv_b;
         std::span<const float> kv_a_norm;
         /** MLA: compressed-query path (q_lora_rank > 0). */
         backend::Mat wq_a, wq_b;
@@ -204,5 +207,16 @@ class LlamaModel {
 
 /** @returns The index of the largest logit (greedy sampling). */
 tok::TokenId argmax(std::span<const float> logits);
+
+/**
+ * MoE expert selection shared by the CPU and GPU forwards:
+ * applies the gating function to raw router logits, adds the
+ * V3/K2 selection bias, applies group-limited routing, picks the
+ * top-k, and returns (expert, mixing weight) pairs with
+ * normalization and expert_weights_scale applied.
+ */
+std::vector<std::pair<std::uint32_t, float>> moe_select(
+    const Hparams& hp, const LlamaModel::Layer& lay,
+    std::span<float> router_logits);
 
 }  // namespace cppllm::model

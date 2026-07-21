@@ -318,8 +318,10 @@ BpeTokenizer BpeTokenizer::from_gguf(const gguf::GgufFile& g) {
     };
     cfg.bos = id_of("tokenizer.ggml.bos_token_id", 0);
     cfg.eos = id_of("tokenizer.ggml.eos_token_id", 0);
-    cfg.add_bos =
-        g.get_bool("tokenizer.ggml.add_bos_token").value_or(true);
+    // BPE-family models default to NO leading BOS (llama.cpp
+    // semantics); SPM is the family that defaults to true.
+    cfg.add_bos = g.get_bool("tokenizer.ggml.add_bos_token")
+                      .value_or(false);
     return BpeTokenizer(std::move(cfg));
 }
 

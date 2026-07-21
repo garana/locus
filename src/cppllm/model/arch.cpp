@@ -192,9 +192,27 @@ void deepseek2_attention_tensors(const gguf::GgufFile& g,
                  hp.kv_lora_rank + hp.qk_rope_dim);
     lay.kv_a_norm = need_vec(g, bp + "attn_kv_a_norm.weight",
                              hp.kv_lora_rank);
-    lay.wkv_b =
-        need_mat(g, bp + "attn_kv_b.weight", hp.kv_lora_rank,
-                 hp.n_heads * (hp.qk_nope_dim + hp.v_head_dim));
+    if (g.find_tensor(bp + "attn_kv_b.weight") != nullptr) {
+        lay.wkv_b = need_mat(
+            g, bp + "attn_kv_b.weight", hp.kv_lora_rank,
+            hp.n_heads * (hp.qk_nope_dim + hp.v_head_dim));
+    } else {
+        // MLA-cache-era split: 3-D per-head tensors, with k_b
+        // stored transposed ([rank x nope] per head) so
+        // absorption is a plain matvec; v_b matches the fused
+        // W_uv slices. Heads are outermost, so flattening ne[1]
+        // and ne[2] into rows preserves the memory layout.
+        lay.wk_b = need_mat3(g, bp + "attn_k_b.weight",
+                             hp.qk_nope_dim, hp.kv_lora_rank,
+                             hp.n_heads)
+                       .base;
+        lay.wk_b.rows = hp.n_heads * hp.kv_lora_rank;
+        lay.wv_b = need_mat3(g, bp + "attn_v_b.weight",
+                             hp.kv_lora_rank, hp.v_head_dim,
+                             hp.n_heads)
+                       .base;
+        lay.wv_b.rows = hp.n_heads * hp.v_head_dim;
+    }
     lay.wo = need_mat(g, bp + "attn_output.weight",
                       hp.n_heads * hp.v_head_dim, hp.n_embd);
 }
@@ -239,9 +257,15 @@ void deepseek2_attention(const LlamaModel& m,
 
         // Weight absorption: q_abs = W_uk_h^T q_nope, so scores
         // are dot products against the cached latents directly.
-        const Mat w_uk =
-            mat_rows(lay.wkv_b, h * (nope + vd), nope);
-        matvec_t(w_uk, {qh, nope}, ws.q_abs);
+        // Split-form k_b is already transposed per head.
+        if (lay.wk_b.rows > 0) {
+            const Mat k_b = mat_rows(lay.wk_b, h * rank, rank);
+            op.matvec(k_b, {qh, nope}, ws.q_abs);
+        } else {
+            const Mat w_uk =
+                mat_rows(lay.wkv_b, h * (nope + vd), nope);
+            matvec_t(w_uk, {qh, nope}, ws.q_abs);
+        }
 
         std::span<float> att(ws.att.data(), pos + 1);
         for (std::uint32_t t = 0; t <= pos; ++t) {
@@ -267,7 +291,10 @@ void deepseek2_attention(const LlamaModel& m,
             }
         }
         const Mat w_uv =
-            mat_rows(lay.wkv_b, h * (nope + vd) + nope, vd);
+            lay.wv_b.rows > 0
+                ? mat_rows(lay.wv_b, h * vd, vd)
+                : mat_rows(lay.wkv_b, h * (nope + vd) + nope,
+                           vd);
         op.matvec(w_uv, ws.latent,
                   {ws.out.data() +
                        static_cast<std::size_t>(h) * vd,
