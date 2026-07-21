@@ -257,10 +257,10 @@ Notes:
   Plan, in order: (1) hints-first -- at the start of layer l,
   WILLNEED layer l+1's statically-known tensors (attn, dense,
   shared expert), which today get no hint at all; (2) A/B it;
-  (3) only if large sys time remains (evidence the kernel drops
-  or caps advisory readahead) add a forcing prefetch thread
-  that touches pages -- it cannot be ignored, but costs a core
-  and needs pacing to avoid evicting the working set.
+  (3) PARKED (Gonzalo, 2026-07-21): a forcing prefetch thread
+  that touches pages. Revisit only if, after wider hints, large
+  sys time remains as evidence the kernel drops or caps
+  advisory readahead.
 - Multimodal (K3 vision) is explicitly out of scope until the
   text path is proven.
 
