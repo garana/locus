@@ -247,6 +247,14 @@ Notes:
   computes is not possible -- routing depends on l's input -- but
   shared-expert and dense tensors of l+1 are known statically);
   and larger overlap via aggregating madvise calls per layer.
+- Second policy result (2026-07-21): LOCUS_LAYER_READAHEAD
+  (hint layer l+1's static weights at the start of layer l)
+  stacked on expert readahead measures 351.4s over the same 8
+  cold forwards -- 33% under the 524.4s passive baseline and
+  24% under expert-readahead alone (461.7s), at equal fault
+  counts (8.74M; equally cold) with sys time down 60.9s ->
+  22.9s. RSS rises 9.2GB -> 13.2GB (~6% of the model) as
+  readahead keeps more of the window resident. ~44s/token.
 - Future work (2026-07-21): overlap I/O with compute one step
   ahead. Mechanism notes: each shard is mmap'd once, whole-file
   (PROT_READ MAP_PRIVATE, never written) -- weight pages are
