@@ -222,6 +222,13 @@ Notes:
   roadmap therefore optimizes for correctness on small
   same-architecture models locally, with mmap + page-cache
   residency as the path to "runs on a 2 TB RAM host".
+- R8 starts with measurement, not code: on the first real
+  bigger-than-RAM model we can load (GLM-5.2 target), record the
+  passive-streaming baseline -- peak RSS vs model size, page
+  faults, cold/warm tokens/sec, and unique experts touched per
+  token window (the true working set). Deliberate residency and
+  prefetch policies are only justified by beating that baseline;
+  the same numbers gate the Vulkan/CUDA paging designs.
 - Multimodal (K3 vision) is explicitly out of scope until the
   text path is proven.
 
