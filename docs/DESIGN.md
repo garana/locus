@@ -272,6 +272,59 @@ Notes:
 - Multimodal (K3 vision) is explicitly out of scope until the
   text path is proven.
 
+### R8-GPU: weight paging (Vulkan; mirrored on CUDA)
+
+Problem. The GPU backends have no middle ground today: Vulkan
+uploads every weight once into an unbounded resident map
+(matvec_vulkan State::resident, keyed by host pointer, never
+evicted), so a model must fit in device memory; CUDA re-uploads
+per matvec call, so nothing is ever reused. Neither serves
+bigger-than-VRAM models.
+
+Design: a weight pager per GPU backend.
+
+- Page unit: one whole tensor for static weights; one expert
+  slice (ExpertMat::expert_bytes) for routed-expert tensors, so
+  paging granularity matches routing granularity.
+- Budget: fixed device-byte budget. Knob LOCUS_GPU_POOL_MB;
+  default queries the device-local heap and takes ~80% after
+  the KV pool and activation buffers. Weights dequantized to
+  F32 at upload (fused wkv_b) count their F32 size.
+- Page table: host pointer -> {buffer, last_use, pin count}.
+  Pages referenced by the command batch being recorded are
+  pinned; unpinned pages evict LRU when an upload would exceed
+  the budget. Eviction frees the device buffer only -- the
+  source of truth stays the host mmap, exactly like the kernel
+  page cache story on the CPU side.
+- Prefetch: same schedule that won 33% on the CPU. While layer
+  l's compute is recorded/submitted, upload layer l+1's static
+  tensors; at MoE selection time (routing is already CPU-side
+  per layer) upload the routed experts before their matmuls.
+  Vulkan uses a dedicated transfer queue when the device has
+  one (semaphore into the compute submit), else copies batch
+  ahead of the compute dispatches on the same queue. CUDA
+  mirrors with cudaMemcpyAsync on a second stream + events.
+  LOCUS_NO_READAHEAD=1 disables prefetch (demand-only paging),
+  keeping one opt-out for the whole R8 family.
+- Pipeline composition: the CPU-side WILLNEED hints stay on --
+  SSD -> page cache (kernel readahead) -> VRAM (pager) overlap
+  the same one-step-ahead schedule end to end.
+- Telemetry: pool hit rate, bytes uploaded/token, evictions,
+  printed with the LOCUS_MOE_STATS report.
+
+Exit test: deepseek-v2-lite Q4_K on vulkan with
+LOCUS_GPU_POOL_MB set below the model's weight bytes must
+reproduce the llama.cpp golden token-exact with evictions > 0
+in telemetry -- paging proven, not mere residency. The CUDA
+mirror validates the same way on vx (2GB VRAM makes the
+sub-model budget the natural case). Full-GPU GLM additionally
+needs IQ matvec shaders; that stays parked behind this work.
+
+Rollout order: (1) pager with demand paging only, default
+budget = unbounded to preserve today's behavior; (2) LRU +
+pinning under an explicit budget; (3) the prefetch schedule;
+(4) IQ shaders.
+
 ## 8. Testing strategy
 
 - Catch2 unit tests per component (allocator, scheduler invariants,
