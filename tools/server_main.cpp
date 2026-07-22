@@ -55,6 +55,9 @@ int main(int argc, char** argv) {
 
         locus::server::OpenAiServer::Options opt;
         opt.model_name = model_path;
+        if (args.ctx > 0) {
+            opt.engine.n_blocks = (args.ctx + 15) / 16;
+        }
         opt.chat_template =
             locus::chat::ChatTemplate::from_gguf(g);
         locus::server::OpenAiServer server(model, tok, opt);

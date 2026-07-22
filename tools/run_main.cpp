@@ -68,7 +68,11 @@ int main(int argc, char** argv) {
         auto ids = tok.encode(prompt, true);
         std::printf("%s", tok.decode(ids).c_str());
 
-        locus::engine::Engine engine(model, tok.eos_id());
+        locus::engine::Engine::Config cfg;
+        if (args.ctx > 0) {
+            cfg.n_blocks = (args.ctx + 15) / 16;
+        }
+        locus::engine::Engine engine(model, tok.eos_id(), cfg);
         engine.on_token = [&](const locus::engine::Request&,
                               locus::tok::TokenId t) {
             if (t != tok.eos_id()) {

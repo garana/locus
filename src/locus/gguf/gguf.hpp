@@ -151,6 +151,14 @@ class GgufFile {
     /** @returns Array elements for key, or nullptr. */
     const std::vector<Value>* get_array(std::string_view key) const;
 
+    /**
+     * @returns true when the image is a read-only file mapping
+     *     (open()); false for in-memory images (parse()), whose
+     *     anonymous pages must never receive madvise DONTNEED --
+     *     that would discard their contents.
+     */
+    bool file_backed() const { return !file_.bytes().empty(); }
+
     /** @returns Tensor descriptors in file order. */
     const std::vector<TensorInfo>& tensors() const { return tensors_; }
 

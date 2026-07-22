@@ -211,6 +211,9 @@ class LlamaModel {
     Hparams hp_;
     const struct ArchSpec* spec_ = nullptr;
     const backend::Backend* backend_ = nullptr;
+    /** Weights live in a read-only file mapping; gates the
+     * LOCUS_WEIGHT_WINDOW DONTNEED policy (see gguf.hpp). */
+    bool file_backed_ = false;
     std::span<const float> rope_factors_;
     backend::Mat embd_;
     std::span<const float> out_norm_;
