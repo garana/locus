@@ -361,6 +361,86 @@ pinning under an explicit budget; (3) the prefetch schedule;
 started on vx; the Ops::prefetch field + llama.cpp call sites
 land together once the registry side exists.
 
+### R9: threaded execution and static pinning (CPU)
+
+Motivation (measured, GLM-5.2 on the 32GB m2). With readahead
+default-on the profile is 78% single-core compute, ~15% I/O
+stall: we are compute-bound on ONE core. llama-completion on
+the same machine/model does 14.3 s/token CPU-only by using all
+cores. Faults say ~18GB streams per token: ~8.4GB routed
+experts (irreducible at temp-0 decode) + ~13GB statics that
+are identical every token. Ladder: threading -> ~15 s/token
+(then I/O-bound); + pinned statics and deeper overlap ->
+~4-6 s/token; MTP on top approaches the ~2-3 s/token disk
+floor.
+
+- R9.1 threaded matvec. Model-level row split: a heavy matvec
+  becomes T slices via mat_rows(w, r0, n) dispatched to a
+  persistent locus::sys::ThreadPool, each slice through the
+  ACTIVE backend's op.matvec into a disjoint out span. Each
+  row's dot is computed by the same kernel code as today, so
+  logits are bit-identical for every thread count. Knob
+  LOCUS_THREADS (default: hardware cores, 1 disables). Applies
+  to the CPU forward's large matvecs (attention projections,
+  dense FFN, expert FFN, output head); matvec_t (small latent
+  ops) and the vulkan full forward are untouched. Parallel
+  slices also mean parallel page faults -- deeper NVMe queue,
+  which is the second half of the win on streamed models.
+- R9.2 static pinning. LOCUS_PIN_STATIC=1 mlocks every
+  non-expert weight (attention, norms via their mats, dense
+  FFN, shared experts, router, embeddings, output head) at
+  load. Best-effort like advise_willneed: on failure (rlimit)
+  it stays a plain fault-in. Opt-in because wiring ~13GB is a
+  policy decision on a 32GB machine, not a default.
+- R9.3 (parked): MTP decode via the nextn tensors GLM/DeepSeek
+  ship -- each accepted speculative token amortizes the per-
+  token weight stream. Revisit after R9.1/R9.2 measurements.
+
+Exit test: logits bit-identical across LOCUS_THREADS=1/2/8 on
+the synthetic models and the real-model goldens (validated on
+vx); GLM-5.2 wall time at or below llama.cpp's measured 14.3
+s/token on the same machine.
+
+### DSA indexer: GLM-5.2 beyond top_k tokens
+
+Today glm-dsa runs dense-equivalent attention with n_ctx
+capped at attention.indexer.top_k (2048); the model's real
+context_length is 1M. The lightning indexer (DeepSeek-V3.2
+reference implementation, inference/model.py -- GLM-5.2 ships
+the same DSA) selects which cached tokens the MLA attention
+sees:
+
+- Per layer, per token: k_idx(s) = LayerNorm_{w,b}(
+  W_k x_s) in R^128, cached; q_idx(t) = W_qb q_a(t) viewed as
+  32 heads x 128; head weights w(t) = W_proj x_t in R^32.
+- Rope: applied to the FIRST rope.dimension_count (64) dims of
+  BOTH q_idx and k_idx, HALF-SPLIT (non-interleaved) -- the
+  reference is explicit that the indexer differs from the main
+  attention's interleaved rope here.
+- Score(t,s) = sum_h w_h(t) * ReLU(q_h(t) . k_idx(s)). Global
+  scale factors (n_heads^-0.5, softmax scale) do not change
+  the top-k ORDER, so selection ignores them.
+- Selection: top min(top_k, positions) scores; attention and
+  its softmax then run over the selected positions only. For
+  sequences <= top_k every position is selected, so the
+  existing dense-equivalent golden anchors correctness of the
+  whole path below 2048 tokens bit-exactly.
+- Storage: glm-dsa's cache row grows kv_dim 576 -> 704 (576
+  MLA latent+rope || 128 post-norm post-rope k_idx).
+- The n_ctx cap lifts for glm-dsa once the indexer is active
+  (KV pool still defaults to min(n_ctx, 4096) tokens).
+
+Validation limits, recorded honestly: llama.cpp IGNORES the
+indexer tensors (dense full-context fallback), so there is no
+external golden beyond top_k. Long-context real-model runs are
+impractical on current hardware (>2048 sequential forwards at
+tens of s/token). So: synthetic-model unit tests assert (a)
+short sequences reproduce the dense path bit-exactly, (b)
+beyond top_k exactly k positions are attended and outputs stay
+finite, (c) selection picks the positions a scalar reference
+scores highest. Real-model long-context quality is future work
+on faster hardware.
+
 ## 8. Testing strategy
 
 - Catch2 unit tests per component (allocator, scheduler invariants,
