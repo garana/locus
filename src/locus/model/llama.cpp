@@ -384,10 +384,26 @@ void LlamaModel::forward(tok::TokenId token,
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
         if (layer_ra) {
+            // The same one-step-ahead schedule feeds both tiers:
+            // madvise (SSD -> page cache) and, on backends with
+            // a weight pager, op.prefetch (host -> device).
             if (l + 1 < hp_.n_layers) {
                 advise_layer_statics(layers_[l + 1]);
+                if (op.prefetch != nullptr) {
+                    for_each_static_mat(
+                        layers_[l + 1],
+                        [&](const backend::Mat& m) {
+                            if (m.data != nullptr &&
+                                m.rows > 0) {
+                                op.prefetch(m);
+                            }
+                        });
+                }
             } else {
                 advise_mat(out_w_);
+                if (op.prefetch != nullptr) {
+                    op.prefetch(out_w_);
+                }
             }
         }
 
@@ -530,6 +546,13 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
                                  lay.up_exps.expert_bytes);
             sys::advise_willneed(lay.down_exps.expert(e).data,
                                  lay.down_exps.expert_bytes);
+            // Pager tier: expert(e) yields the same .data the
+            // matmuls below pass to matvec -- the page key.
+            if (op.prefetch != nullptr) {
+                op.prefetch(lay.gate_exps.expert(e));
+                op.prefetch(lay.up_exps.expert(e));
+                op.prefetch(lay.down_exps.expert(e));
+            }
         }
     }
     std::fill(ws.moe_acc.begin(), ws.moe_acc.end(), 0.0f);
