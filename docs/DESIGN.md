@@ -269,6 +269,17 @@ Notes:
   that touches pages. Revisit only if, after wider hints, large
   sys time remains as evidence the kernel drops or caps
   advisory readahead.
+- GLM-5.2 correctness + telemetry (2026-07-21): bounded
+  CPU-only llama-completion (-ngl 0 --no-warmup -c 512; Metal
+  full-offload wired 216GB and crashed the host -- never again)
+  produces "Once upon a time, there was a" -- token-exact with
+  locus at 4 greedy tokens. LOCUS_MOE_STATS over the same 8
+  forwards: 4256 activations, 29-52 unique experts per MoE
+  layer, 14.7% of the 76x256 layer-expert slots touched.
+  Moonlight hit 43.8% in 11 forwards; at 256 experts the
+  working set disperses slower in relative terms but the
+  absolute bytes stay huge -- confirms within-token prefetch
+  over cross-token caching at GLM scale too.
 - Multimodal (K3 vision) is explicitly out of scope until the
   text path is proven.
 
@@ -288,8 +299,14 @@ Design: a weight pager per GPU backend.
   paging granularity matches routing granularity.
 - Budget: fixed device-byte budget. Knob LOCUS_GPU_POOL_MB;
   default queries the device-local heap and takes ~80% after
-  the KV pool and activation buffers. Weights dequantized to
-  F32 at upload (fused wkv_b) count their F32 size.
+  the KV pool and activation buffers. The budget counts bytes
+  as uploaded, which differs per backend (agreed with
+  claude-vx-locus 2026-07-21): both CUDA and Vulkan keep
+  weights QUANTIZED on-device for types their kernels dequant
+  in-shader (Q4_K is ~0.5 B/weight, so ~8x more model fits in
+  2GB VRAM); paths that dequantize at upload count F32 size
+  (fused wkv_b on both backends; on Vulkan also any type
+  without a matvec shader).
 - Page table: host pointer -> {buffer, last_use, pin count}.
   Pages referenced by the command batch being recorded are
   pinned; unpinned pages evict LRU when an upload would exceed
@@ -320,10 +337,26 @@ mirror validates the same way on vx (2GB VRAM makes the
 sub-model budget the natural case). Full-GPU GLM additionally
 needs IQ matvec shaders; that stays parked behind this work.
 
+Prefetch hook contract (agreed with claude-vx-locus
+2026-07-21): backend::Ops grows an optional
+`void (*prefetch)(const Mat& w)` -- the backend MAY begin an
+async host-to-device upload of w so a later matvec(w) finds it
+resident; fire-and-forget; nullptr on backends without a pager
+(CPU always; Vulkan/CUDA until theirs lands). The model calls
+it, gated by the same readahead-enabled condition as the
+madvise hints and mirroring those sites 1:1: forward() fires
+it for layer l+1's static Mats next to advise_layer_statics,
+moe_ffn() for the three expert(e) slices next to
+advise_willneed. Invariant: the Mat passed to prefetch is
+IDENTICAL (same host .data) to the one later passed to matvec
+-- that pointer is the pager's page-table key.
+
 Rollout order: (1) pager with demand paging only, default
 budget = unbounded to preserve today's behavior; (2) LRU +
 pinning under an explicit budget; (3) the prefetch schedule;
-(4) IQ shaders.
+(4) IQ shaders. Phases 1-2 for CUDA are backend-internal and
+started on vx; the Ops::prefetch field + llama.cpp call sites
+land together once the registry side exists.
 
 ## 8. Testing strategy
 

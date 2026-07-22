@@ -26,7 +26,11 @@ milestone plan.
 All MVP milestones are complete. The post-MVP roadmap (BPE
 tokenizer, chat templates, K-quants, MoE, MLA, Kimi Delta
 Attention -- the path to DeepSeek V3/R1, Kimi K2, and Kimi K3) is
-in docs/DESIGN.md section 7.
+in docs/DESIGN.md section 7. Greedy output is validated
+token-exact against llama.cpp on stories260K, Llama-3.2-1B
+(Q8_0 and Q4_K_M), DeepSeek-V2-Lite, Moonlight-16B-A3B, and
+GLM-5.2 744B (UD-IQ1_S, streamed from a 203GB split GGUF on a
+32GB machine -- see the R8 notes in DESIGN.md).
 
 ## Building
 
