@@ -1,9 +1,9 @@
-// CUDA matvec variant. Correctness-first (streaming): each call
-// uploads the weight rows it needs, launches a thread-per-row dot
-// product, and copies the result back. Residency/prefetch policies
-// (R8) build on top of this once it is proven token-exact. F32 and
-// Q8_0 run on the GPU; other weight types delegate to the scalar
-// reference on the host.
+// CUDA matvec variant. Weights run through a device weight pool (the
+// R8-GPU pager): each weight is uploaded once, keyed by host pointer,
+// and reused across tokens under a byte budget with LRU eviction;
+// weights too big for the budget fall back to an uncached per-call
+// upload. Kernels dequantize F32/Q8_0/Q4_K/IQ1_S on-device (the pool
+// stores the source quantized bytes); other types delegate to scalar.
 
 #include "locus/backend/variants.hpp"
 
@@ -12,6 +12,9 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 #include "iq_grids.h"  // iq1s_grid lookup table (global scope)
 
@@ -208,6 +211,147 @@ struct DevBuf {
     }
 };
 
+/**
+ * Device weight pool (R8-GPU pager, phases 1-2). Caches one device
+ * buffer per weight, keyed by host pointer, so a weight is uploaded
+ * once and reused across tokens under a byte budget with LRU
+ * eviction. acquire() pins the page for the duration of a matvec so
+ * a concurrent call cannot evict a weight in use; release() unpins.
+ * A weight larger than the whole budget, or when every resident page
+ * is pinned, returns nullptr so the caller uses an uncached per-call
+ * upload -- preserving correctness on tiny-VRAM hosts. The pool holds
+ * the source (quantized) bytes; the kernels dequantize on-device.
+ */
+class WeightPool {
+ public:
+    /** @returns device buffer for `host` (uploading on miss) with the
+     *  page pinned, or nullptr if it cannot be cached. */
+    const void* acquire(const void* host, std::size_t bytes) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (budget_ == 0) {
+            init_budget();
+        }
+        const std::uint64_t now = ++clock_;
+        if (auto it = table_.find(host); it != table_.end()) {
+            it->second.last_use = now;
+            it->second.pins++;
+            hits_++;
+            return it->second.dptr;
+        }
+        if (bytes > budget_) {
+            return nullptr;  // never fits: caller uses demand path
+        }
+        while (used_ + bytes > budget_) {
+            if (!evict_one()) {
+                return nullptr;  // all pinned: caller demand path
+            }
+        }
+        void* dptr = nullptr;
+        if (!cuda_ok(cudaMalloc(&dptr, bytes))) {
+            while (evict_one()) {  // reclaim slack, then retry once
+            }
+            if (!cuda_ok(cudaMalloc(&dptr, bytes))) {
+                return nullptr;
+            }
+        }
+        if (!cuda_ok(cudaMemcpy(dptr, host, bytes,
+                                cudaMemcpyHostToDevice))) {
+            cudaFree(dptr);
+            return nullptr;
+        }
+        used_ += bytes;
+        upload_bytes_ += bytes;
+        misses_++;
+        table_.emplace(host, Page{dptr, bytes, now, 1});
+        return dptr;
+    }
+
+    void release(const void* host) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (auto it = table_.find(host);
+            it != table_.end() && it->second.pins > 0) {
+            it->second.pins--;
+        }
+    }
+
+    ~WeightPool() {
+        if (std::getenv("LOCUS_MOE_STATS") == nullptr) {
+            return;
+        }
+        const std::uint64_t tot = hits_ + misses_;
+        std::fprintf(
+            stderr,
+            "[cuda-pool] budget=%zuMB resident=%zuMB hits=%llu "
+            "misses=%llu hit_rate=%.1f%% evictions=%llu "
+            "uploaded=%lluMB\n",
+            budget_ >> 20, used_ >> 20,
+            static_cast<unsigned long long>(hits_),
+            static_cast<unsigned long long>(misses_),
+            tot ? 100.0 * static_cast<double>(hits_) /
+                      static_cast<double>(tot)
+                : 0.0,
+            static_cast<unsigned long long>(evictions_),
+            static_cast<unsigned long long>(upload_bytes_ >> 20));
+        // Process exit frees the device; skip cudaFree to avoid
+        // ordering issues with CUDA context teardown.
+    }
+
+ private:
+    struct Page {
+        void* dptr;
+        std::size_t bytes;
+        std::uint64_t last_use;
+        int pins;
+    };
+
+    void init_budget() {
+        if (const char* mb = std::getenv("LOCUS_GPU_POOL_MB")) {
+            budget_ = static_cast<std::size_t>(
+                          std::strtoull(mb, nullptr, 10))
+                      << 20;
+        }
+        if (budget_ == 0) {
+            std::size_t free_b = 0, total_b = 0;
+            budget_ = cuda_ok(cudaMemGetInfo(&free_b, &total_b))
+                          ? free_b / 5 * 4  // ~80% of free VRAM
+                          : (std::size_t{512} << 20);
+        }
+    }
+
+    bool evict_one() {
+        auto victim = table_.end();
+        std::uint64_t oldest = UINT64_MAX;
+        for (auto it = table_.begin(); it != table_.end(); ++it) {
+            if (it->second.pins == 0 &&
+                it->second.last_use < oldest) {
+                oldest = it->second.last_use;
+                victim = it;
+            }
+        }
+        if (victim == table_.end()) {
+            return false;  // everything pinned
+        }
+        cudaFree(victim->second.dptr);
+        used_ -= victim->second.bytes;
+        evictions_++;
+        table_.erase(victim);
+        return true;
+    }
+
+    std::unordered_map<const void*, Page> table_;
+    std::size_t budget_ = 0;
+    std::size_t used_ = 0;
+    std::uint64_t clock_ = 0;
+    std::uint64_t hits_ = 0, misses_ = 0, evictions_ = 0;
+    std::uint64_t upload_bytes_ = 0;
+    std::mutex mu_;
+};
+
+WeightPool& pool() {
+    static WeightPool p;
+    return p;
+}
+
 /** Lazily uploads iq1s_grid to the device once; nullptr on failure
  *  (caller falls back to scalar). */
 const std::uint64_t* device_iq1s_grid() {
@@ -229,53 +373,75 @@ const std::uint64_t* device_iq1s_grid() {
 
 enum class Kind { kF32, kQ8_0, kQ4_K, kIQ1_S };
 
-bool run_matvec(const Mat& w, std::span<const float> x,
-                std::span<float> out, std::size_t w_bytes,
-                Kind kind, const std::uint64_t* grid = nullptr) {
-    DevBuf dw, dx, dout;
-    const std::size_t x_bytes = x.size() * sizeof(float);
-    const std::size_t out_bytes =
-        static_cast<std::size_t>(w.rows) * sizeof(float);
-    if (!dw.alloc(w_bytes) || !dx.alloc(x_bytes) ||
-        !dout.alloc(out_bytes)) {
-        return false;
-    }
-    if (!cuda_ok(cudaMemcpy(dw.p, w.data, w_bytes,
-                            cudaMemcpyHostToDevice)) ||
-        !cuda_ok(cudaMemcpy(dx.p, x.data(), x_bytes,
-                            cudaMemcpyHostToDevice))) {
-        return false;
-    }
+void launch_kernel(Kind kind, const void* dw,
+                   const std::uint64_t* grid, const float* dxf,
+                   float* doutf, std::uint32_t rows,
+                   std::uint32_t cols) {
     const std::uint32_t threads = 256;
-    const std::uint32_t blocks = (w.rows + threads - 1) / threads;
-    const auto* dwb = static_cast<const std::uint8_t*>(dw.p);
-    const auto* dxf = static_cast<const float*>(dx.p);
-    auto* doutf = static_cast<float*>(dout.p);
+    const std::uint32_t blocks = (rows + threads - 1) / threads;
+    const auto* dwb = static_cast<const std::uint8_t*>(dw);
     switch (kind) {
         case Kind::kF32:
             matvec_f32_kernel<<<blocks, threads>>>(
-                static_cast<const float*>(dw.p), dxf, doutf,
-                w.rows, w.cols);
+                static_cast<const float*>(dw), dxf, doutf, rows,
+                cols);
             break;
         case Kind::kQ8_0:
             matvec_q8_0_kernel<<<blocks, threads>>>(
-                dwb, dxf, doutf, w.rows, w.cols);
+                dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kQ4_K:
             matvec_q4_k_kernel<<<blocks, threads>>>(
-                dwb, dxf, doutf, w.rows, w.cols);
+                dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kIQ1_S:
             matvec_iq1_s_kernel<<<blocks, threads>>>(
-                dwb, grid, dxf, doutf, w.rows, w.cols);
+                dwb, grid, dxf, doutf, rows, cols);
             break;
     }
-    if (!cuda_ok(cudaGetLastError()) ||
-        !cuda_ok(cudaDeviceSynchronize())) {
-        return false;
+}
+
+bool run_matvec(const Mat& w, std::span<const float> x,
+                std::span<float> out, std::size_t w_bytes,
+                Kind kind, const std::uint64_t* grid = nullptr) {
+    // Weight: resident pool, or an uncached per-call upload when it
+    // cannot be cached (too big for the budget / all pages pinned).
+    const void* dw = pool().acquire(w.data, w_bytes);
+    const bool pooled = dw != nullptr;
+    DevBuf dw_demand;
+    if (!pooled) {
+        if (!dw_demand.alloc(w_bytes) ||
+            !cuda_ok(cudaMemcpy(dw_demand.p, w.data, w_bytes,
+                                cudaMemcpyHostToDevice))) {
+            return false;
+        }
+        dw = dw_demand.p;
     }
-    return cuda_ok(cudaMemcpy(out.data(), dout.p, out_bytes,
-                              cudaMemcpyDeviceToHost));
+
+    bool ok = false;
+    {
+        DevBuf dx, dout;  // transient: change every call
+        const std::size_t x_bytes = x.size() * sizeof(float);
+        const std::size_t out_bytes =
+            static_cast<std::size_t>(w.rows) * sizeof(float);
+        if (dx.alloc(x_bytes) && dout.alloc(out_bytes) &&
+            cuda_ok(cudaMemcpy(dx.p, x.data(), x_bytes,
+                               cudaMemcpyHostToDevice))) {
+            launch_kernel(kind, dw, grid,
+                          static_cast<const float*>(dx.p),
+                          static_cast<float*>(dout.p), w.rows,
+                          w.cols);
+            ok = cuda_ok(cudaGetLastError()) &&
+                 cuda_ok(cudaDeviceSynchronize()) &&
+                 cuda_ok(cudaMemcpy(out.data(), dout.p, out_bytes,
+                                    cudaMemcpyDeviceToHost));
+        }
+    }
+
+    if (pooled) {
+        pool().release(w.data);
+    }
+    return ok;
 }
 
 }  // namespace
