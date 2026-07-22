@@ -401,6 +401,15 @@ the synthetic models and the real-model goldens (validated on
 vx); GLM-5.2 wall time at or below llama.cpp's measured 14.3
 s/token on the same machine.
 
+Status (2026-07-22): R9.1/R9.2 landed with the DSA indexer
+(commit 0ffd1df); vx validated the full suite green plus cuda
+under LOCUS_THREADS=4 token-exact -- concurrent matvec slices
+compose with the weight pager (95% hit rate with prefetch, up
+from 92.3% demand-only; 22% vs 0% under a thrashing 512MB
+budget). R8-GPU phase 3 (op.prefetch model wiring + cuda
+second-stream pipeline) is complete end-to-end. The GLM-5.2
+wall-time measurement on the m2 is still pending (heavy run).
+
 ### DSA indexer: GLM-5.2 beyond top_k tokens
 
 Today glm-dsa runs dense-equivalent attention with n_ctx

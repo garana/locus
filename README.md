@@ -30,7 +30,12 @@ in docs/DESIGN.md section 7. Greedy output is validated
 token-exact against llama.cpp on stories260K, Llama-3.2-1B
 (Q8_0 and Q4_K_M), DeepSeek-V2-Lite, Moonlight-16B-A3B, and
 GLM-5.2 744B (UD-IQ1_S, streamed from a 203GB split GGUF on a
-32GB machine -- see the R8 notes in DESIGN.md).
+32GB machine -- see the R8 notes in DESIGN.md). Streaming
+models decode with madvise readahead (default-on), optional
+threaded matvecs (LOCUS_THREADS) and static-weight pinning
+(LOCUS_PIN_STATIC) per DESIGN.md R9; GLM-5.2's DSA lightning
+indexer is implemented, so its context is no longer capped at
+2048 tokens.
 
 ## Building
 
@@ -54,10 +59,12 @@ runtime dispatch). Inspect and override:
 
 Current entries: neon (arm64), sse4 (x86-64), scalar (reference),
 vulkan, and cuda. neon/sse4 are hybrid backends -- F32/Q8_0 matvec
-vectorized, the rest scalar. cuda is likewise hybrid: F32/Q8_0
-matvec on an NVIDIA GPU (streamed per call for now; other types
-scalar), validated on sm_50 (GTX 750 Ti, CUDA 12.x). vulkan is the
-full GPU forward pass instead: F32/Q8_0 matmul shaders (weights
+vectorized, the rest scalar. cuda runs F32/Q8_0/Q4_K/IQ1_S matvec
+on an NVIDIA GPU through a paged weight pool (LOCUS_GPU_POOL_MB
+budget, LRU eviction, one-step-ahead prefetch on a second
+stream; other types scalar), validated on sm_50 (GTX 750 Ti,
+CUDA 12.x). vulkan is the full GPU forward pass instead:
+matmul shaders (F32/F16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K, weights
 resident, uploaded once), rmsnorm, RoPE, SwiGLU, and paged
 attention reading K/V from a GPU-mapped cache pool, all recorded
 as one command batch per token. Every selectable backend must
@@ -65,9 +72,9 @@ reproduce the llama.cpp golden output token-exact (tested, single
 and concurrent streams). At real-model sizes the GPU wins (2048^2
 f32 matvec: ~750us vs ~3550us scalar CPU, Apple M-series via
 MoltenVK); on the tiny 260K test model dispatch overhead keeps
-CPU ahead. F16/Q4_0 GPU shaders, x86 avx2/avx512 (avx2 kernel
-exists, pending validation on an AVX2 host), and CUDA residency/
-streaming policies (R8) slot into src/locus/backend/ as they land.
+CPU ahead. Vulkan weight paging and IQ shaders, plus x86
+avx2/avx512 (avx2 kernel exists, pending validation on an AVX2
+host) slot into src/locus/backend/ as they land.
 
 ## Dependencies
 
