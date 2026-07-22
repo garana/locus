@@ -74,4 +74,16 @@ void advise_willneed(const void* p, std::size_t n) {
                     n + (addr - base), MADV_WILLNEED);
 }
 
+bool lock_resident(const void* p, std::size_t n) {
+    if (p == nullptr || n == 0) {
+        return true;
+    }
+    static const std::size_t page =
+        static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    const auto addr = reinterpret_cast<std::uintptr_t>(p);
+    const std::uintptr_t base = addr & ~(page - 1);
+    return ::mlock(reinterpret_cast<void*>(base),
+                   n + (addr - base)) == 0;
+}
+
 }  // namespace locus::sys

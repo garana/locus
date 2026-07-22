@@ -218,12 +218,20 @@ void deepseek2_attention_tensors(const gguf::GgufFile& g,
                       hp.n_heads * hp.v_head_dim, hp.n_embd);
 }
 
-void deepseek2_attention(const LlamaModel& m,
-                         const LlamaModel::Layer& lay,
-                         kv::PagedKvCache& cache,
-                         kv::PagedKvCache::Seq& seq,
-                         LlamaModel::Workspace& ws,
-                         std::uint32_t l, std::uint32_t pos) {
+/**
+ * MLA attention over the cached latents. When sel is non-null
+ * only the n_att positions it lists (ascending) are attended --
+ * the DSA path; a null sel attends all n_att = pos + 1 cached
+ * positions, which is the dense case and bit-identical to the
+ * pre-DSA implementation.
+ */
+void mla_attention(const LlamaModel& m,
+                   const LlamaModel::Layer& lay,
+                   kv::PagedKvCache& cache,
+                   kv::PagedKvCache::Seq& seq,
+                   LlamaModel::Workspace& ws, std::uint32_t l,
+                   std::uint32_t pos, const std::uint32_t* sel,
+                   std::uint32_t n_att) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
     const Ops& op = m.active_backend().ops;
@@ -237,9 +245,9 @@ void deepseek2_attention(const LlamaModel& m,
     if (hp.q_lora_rank > 0) {
         op.matvec(lay.wq_a, ws.xb, ws.q_a);
         rmsnorm(ws.q_a, lay.q_a_norm, hp.rms_eps, ws.q_a);
-        op.matvec(lay.wq_b, ws.q_a, ws.q);
+        matvec_mt(op, lay.wq_b, ws.q_a, ws.q);
     } else {
-        op.matvec(lay.wq, ws.xb, ws.q);
+        matvec_mt(op, lay.wq, ws.xb, ws.q);
     }
     // Latent row: rms-normed c_kv followed by roped shared k_pe.
     op.matvec(lay.wkv_a, ws.xb, ws.kv_a);
@@ -268,8 +276,9 @@ void deepseek2_attention(const LlamaModel& m,
             matvec_t(w_uk, {qh, nope}, ws.q_abs);
         }
 
-        std::span<float> att(ws.att.data(), pos + 1);
-        for (std::uint32_t t = 0; t <= pos; ++t) {
+        std::span<float> att(ws.att.data(), n_att);
+        for (std::uint32_t j = 0; j < n_att; ++j) {
+            const std::uint32_t t = sel != nullptr ? sel[j] : j;
             const float* ckv = cache.k(seq, l, t);
             float s = 0.0f;
             for (std::uint32_t i = 0; i < rank; ++i) {
@@ -278,15 +287,16 @@ void deepseek2_attention(const LlamaModel& m,
             for (std::uint32_t i = 0; i < rope; ++i) {
                 s += qh[nope + i] * ckv[rank + i];
             }
-            att[t] = s * hp.kq_scale;
+            att[j] = s * hp.kq_scale;
         }
         softmax_inplace(att);
 
         // o_h = W_uv_h (sum_t a_t c_kv(t)).
         std::fill(ws.latent.begin(), ws.latent.end(), 0.0f);
-        for (std::uint32_t t = 0; t <= pos; ++t) {
+        for (std::uint32_t j = 0; j < n_att; ++j) {
+            const std::uint32_t t = sel != nullptr ? sel[j] : j;
             const float* ckv = cache.k(seq, l, t);
-            const float a = att[t];
+            const float a = att[j];
             for (std::uint32_t i = 0; i < rank; ++i) {
                 ws.latent[i] += a * ckv[i];
             }
@@ -303,6 +313,16 @@ void deepseek2_attention(const LlamaModel& m,
     }
 }
 
+void deepseek2_attention(const LlamaModel& m,
+                         const LlamaModel::Layer& lay,
+                         kv::PagedKvCache& cache,
+                         kv::PagedKvCache::Seq& seq,
+                         LlamaModel::Workspace& ws,
+                         std::uint32_t l, std::uint32_t pos) {
+    mla_attention(m, lay, cache, seq, ws, l, pos, nullptr,
+                  pos + 1);
+}
+
 std::uint32_t deepseek2_kv_dim(const Hparams& hp) {
     // One latent row per position; the paged cache's V half goes
     // unused (simplicity > 2x space; still ~9x smaller than
@@ -312,20 +332,172 @@ std::uint32_t deepseek2_kv_dim(const Hparams& hp) {
 
 /**
  * GLM-5.2 (DSA): MLA with q_lora + split k_b/v_b and V3-style
- * sigmoid gating -- computationally the deepseek2 stack. Its
- * dynamic-sparse-attention indexer selects top_k positions; for
- * contexts <= top_k the selection keeps everything and DSA
- * equals dense MLA, so the indexer tensors are ignored and the
- * usable context is capped at indexer.top_k until the indexer
- * is implemented.
+ * sigmoid gating -- computationally the deepseek2 stack -- plus
+ * the DSA lightning indexer, which picks the top_k cached
+ * positions the MLA attention sees. For contexts <= top_k the
+ * selection keeps everything and DSA equals dense MLA, which is
+ * what the llama.cpp golden anchors.
  */
 void glm_dsa_hparams(const gguf::GgufFile& g,
                      const std::string& p, Hparams& hp) {
     deepseek2_hparams(g, p, hp);
-    const std::uint32_t top_k = static_cast<std::uint32_t>(
+    // The trailing MTP block(s) are not part of the causal
+    // stack: llama.cpp likewise loads and ignores them.
+    const std::uint32_t nextn = static_cast<std::uint32_t>(
+        g.get_uint(p + "nextn_predict_layers").value_or(0));
+    if (nextn >= hp.n_layers) {
+        throw gguf::Error("invalid nextn_predict_layers");
+    }
+    hp.n_layers -= nextn;
+    hp.idx_heads = static_cast<std::uint32_t>(
+        g.get_uint(p + "attention.indexer.head_count")
+            .value_or(0));
+    hp.idx_dim = static_cast<std::uint32_t>(
+        g.get_uint(p + "attention.indexer.key_length")
+            .value_or(0));
+    hp.idx_top_k = static_cast<std::uint32_t>(
         g.get_uint(p + "attention.indexer.top_k")
             .value_or(2048));
-    hp.n_ctx = std::min(hp.n_ctx, top_k);
+    if (hp.idx_heads == 0 || hp.idx_dim == 0 ||
+        hp.q_lora_rank == 0) {
+        // No indexer metadata: dense-equivalent DSA only, so
+        // the usable context stays capped at top_k.
+        hp.n_ctx = std::min(hp.n_ctx, hp.idx_top_k);
+        hp.idx_heads = 0;
+        hp.idx_dim = 0;
+        hp.idx_top_k = 0;
+    }
+}
+
+void glm_dsa_attention_tensors(const gguf::GgufFile& g,
+                               const std::string& bp,
+                               const Hparams& hp,
+                               LlamaModel::Layer& lay) {
+    deepseek2_attention_tensors(g, bp, hp, lay);
+    if (hp.idx_heads == 0) {
+        return;
+    }
+    lay.idx_proj = need_mat(g, bp + "indexer.proj.weight",
+                            hp.n_embd, hp.idx_heads);
+    lay.idx_k = need_mat(g, bp + "indexer.attn_k.weight",
+                         hp.n_embd, hp.idx_dim);
+    lay.idx_q_b =
+        need_mat(g, bp + "indexer.attn_q_b.weight",
+                 hp.q_lora_rank, hp.idx_heads * hp.idx_dim);
+    lay.idx_k_norm = need_vec(g, bp + "indexer.k_norm.weight",
+                              hp.idx_dim);
+    lay.idx_k_norm_b = need_vec(g, bp + "indexer.k_norm.bias",
+                                hp.idx_dim);
+}
+
+/** LayerNorm with bias, in place (the indexer k norm). */
+void layernorm_inplace(std::span<float> x,
+                       std::span<const float> w,
+                       std::span<const float> b, float eps) {
+    const std::size_t n = x.size();
+    float mean = 0.0f;
+    for (float v : x) {
+        mean += v;
+    }
+    mean /= static_cast<float>(n);
+    float var = 0.0f;
+    for (float v : x) {
+        var += (v - mean) * (v - mean);
+    }
+    var /= static_cast<float>(n);
+    const float inv = 1.0f / std::sqrt(var + eps);
+    for (std::size_t i = 0; i < n; ++i) {
+        x[i] = (x[i] - mean) * inv * w[i] + b[i];
+    }
+}
+
+/**
+ * Half-split (non-interleaved) rope on the first d dims of x:
+ * pair (i, i + d/2). The DSA reference is explicit that the
+ * indexer's rope is NOT interleaved, unlike the main MLA rope.
+ */
+void rope_half(float* x, std::uint32_t d, std::uint32_t pos,
+               float base) {
+    const std::uint32_t half = d / 2;
+    for (std::uint32_t i = 0; i < half; ++i) {
+        const float freq = std::pow(
+            base, -2.0f * static_cast<float>(i) /
+                      static_cast<float>(d));
+        const float a = static_cast<float>(pos) * freq;
+        const float c = std::cos(a);
+        const float s = std::sin(a);
+        const float x0 = x[i];
+        const float x1 = x[i + half];
+        x[i] = x0 * c - x1 * s;
+        x[i + half] = x0 * s + x1 * c;
+    }
+}
+
+void glm_dsa_attention(const LlamaModel& m,
+                       const LlamaModel::Layer& lay,
+                       kv::PagedKvCache& cache,
+                       kv::PagedKvCache::Seq& seq,
+                       LlamaModel::Workspace& ws, std::uint32_t l,
+                       std::uint32_t pos) {
+    using namespace locus::backend;
+    const Hparams& hp = m.hparams();
+    const Ops& op = m.active_backend().ops;
+    const std::uint32_t n_pos = pos + 1;
+    const std::uint32_t* sel = nullptr;
+    std::uint32_t n_att = n_pos;
+
+    if (hp.idx_heads > 0) {
+        const std::uint32_t off =
+            hp.kv_lora_rank + hp.qk_rope_dim;
+        const std::uint32_t d = hp.idx_dim;
+        // Compute and cache this position's indexer key:
+        // layernorm(W_k x), roped half-split on the rope dims.
+        float* krow = cache.k(seq, l, pos) + off;
+        op.matvec(lay.idx_k, ws.xb, {krow, d});
+        layernorm_inplace({krow, d}, lay.idx_k_norm,
+                          lay.idx_k_norm_b, hp.rms_eps);
+        rope_half(krow, hp.qk_rope_dim, pos, hp.rope_freq_base);
+
+        if (n_pos > hp.idx_top_k) {
+            // Indexer queries share the MLA q latent path.
+            op.matvec(lay.wq_a, ws.xb, ws.q_a);
+            rmsnorm(ws.q_a, lay.q_a_norm, hp.rms_eps, ws.q_a);
+            matvec_mt(op, lay.idx_q_b, ws.q_a, ws.idx_q);
+            for (std::uint32_t h = 0; h < hp.idx_heads; ++h) {
+                rope_half(ws.idx_q.data() +
+                              static_cast<std::size_t>(h) * d,
+                          hp.qk_rope_dim, pos,
+                          hp.rope_freq_base);
+            }
+            op.matvec(lay.idx_proj, ws.xb, ws.idx_w);
+            for (std::uint32_t t = 0; t < n_pos; ++t) {
+                ws.idx_scores[t] = dsa_index_score(
+                    ws.idx_q, ws.idx_w,
+                    {cache.k(seq, l, t) + off, d});
+            }
+            ws.idx_sel.resize(n_pos);
+            for (std::uint32_t t = 0; t < n_pos; ++t) {
+                ws.idx_sel[t] = t;
+            }
+            std::nth_element(
+                ws.idx_sel.begin(),
+                ws.idx_sel.begin() + hp.idx_top_k,
+                ws.idx_sel.end(),
+                [&](std::uint32_t a, std::uint32_t b) {
+                    return ws.idx_scores[a] > ws.idx_scores[b];
+                });
+            ws.idx_sel.resize(hp.idx_top_k);
+            std::sort(ws.idx_sel.begin(), ws.idx_sel.end());
+            sel = ws.idx_sel.data();
+            n_att = hp.idx_top_k;
+        }
+    }
+    mla_attention(m, lay, cache, seq, ws, l, pos, sel, n_att);
+}
+
+std::uint32_t glm_dsa_kv_dim(const Hparams& hp) {
+    // MLA latent row plus the cached indexer key.
+    return hp.kv_lora_rank + hp.qk_rope_dim + hp.idx_dim;
 }
 
 const ArchSpec kArchs[] = {
@@ -338,10 +510,10 @@ const ArchSpec kArchs[] = {
      &deepseek2_hparams, &deepseek2_attention_tensors,
      &deepseek2_attention, &deepseek2_kv_dim},
     {"glm-dsa",
-     "GLM-5.2 family (MLA + DeepSeek MoE; dense-equivalent DSA, "
-     "context capped at indexer top_k)",
-     &glm_dsa_hparams, &deepseek2_attention_tensors,
-     &deepseek2_attention, &deepseek2_kv_dim},
+     "GLM-5.2 family (MLA + DeepSeek MoE + DSA lightning "
+     "indexer beyond top_k tokens)",
+     &glm_dsa_hparams, &glm_dsa_attention_tensors,
+     &glm_dsa_attention, &glm_dsa_kv_dim},
 };
 
 }  // namespace

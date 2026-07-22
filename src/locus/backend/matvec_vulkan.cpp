@@ -252,6 +252,11 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
     if (pool_it == s.kv_pools.end()) {
         return false;  // cache pool is not GPU-mapped
     }
+    if (hp.idx_top_k > 0) {
+        // DSA indexer models: the 704-float cache row and the
+        // top-k selection are CPU-only for now.
+        return false;
+    }
     const bool mla = hp.arch == model::Arch::kDeepseek2;
     for (const auto& l : m.layers()) {
         if (matvec_kernel(l.wo) == Kernel::kCount_) {

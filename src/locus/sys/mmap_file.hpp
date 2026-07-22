@@ -49,4 +49,14 @@ class MappedFile {
  */
 void advise_willneed(const void* p, std::size_t n);
 
+/**
+ * Wires [p, p+n) into RAM (mlock, page-aligned). Best-effort:
+ * on failure (RLIMIT_MEMLOCK, memory pressure) the range simply
+ * stays demand-paged. Used by the R9 LOCUS_PIN_STATIC policy to
+ * keep a streamed model's non-expert weights resident.
+ *
+ * @returns true when the whole range was locked.
+ */
+bool lock_resident(const void* p, std::size_t n);
+
 }  // namespace locus::sys

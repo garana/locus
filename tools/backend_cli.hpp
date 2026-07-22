@@ -50,7 +50,12 @@ inline constexpr const char* kCommonHelp =
     "                          at exit (R8 working-set data)\n"
     "  LOCUS_NO_READAHEAD=1    disable the default madvise\n"
     "                          readahead of upcoming weights\n"
-    "                          (routed experts + next layer)\n";
+    "                          (routed experts + next layer)\n"
+    "  LOCUS_THREADS=N         cap the matvec thread fan-out\n"
+    "                          (default: hardware cores; 1\n"
+    "                          runs single-threaded)\n"
+    "  LOCUS_PIN_STATIC=1      mlock non-expert weights at\n"
+    "                          load (streaming models; R9)\n";
 
 /** Backend flags peeled off argv; the rest stays positional. */
 struct BackendArgs {

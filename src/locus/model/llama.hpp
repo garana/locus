@@ -58,6 +58,10 @@ struct Hparams {
     std::uint32_t kv_lora_rank = 0;
     std::uint32_t qk_nope_dim = 0;
     std::uint32_t qk_rope_dim = 0;
+    /** DSA lightning indexer (glm-dsa; 0 heads = no indexer). */
+    std::uint32_t idx_heads = 0;
+    std::uint32_t idx_dim = 0;
+    std::uint32_t idx_top_k = 0;
     std::uint32_t v_head_dim = 0;
     /** Attention score scale (arch-dependent; yarn mscale^2). */
     float kq_scale = 0.0f;
@@ -106,6 +110,10 @@ class LlamaModel {
         /** MLA: kv_a projection, absorbed q, weighted latent,
          * compressed query. */
         std::vector<float> kv_a, q_abs, latent, q_a;
+        /** DSA indexer: per-head queries, head weights, scores
+         * over cached positions, selected positions. */
+        std::vector<float> idx_q, idx_w, idx_scores;
+        std::vector<std::uint32_t> idx_sel;
     };
 
     /** @returns A workspace sized for this model. */
@@ -172,6 +180,10 @@ class LlamaModel {
         std::span<const float> q_a_norm;
         /** MoE: selection bias (V3/K2 e_score_correction). */
         std::span<const float> exp_probs_b;
+        /** DSA indexer (glm-dsa): head weights, shared key,
+         * per-head queries from the q latent, key layernorm. */
+        backend::Mat idx_proj, idx_k, idx_q_b;
+        std::span<const float> idx_k_norm, idx_k_norm_b;
 
         /** @returns true when this layer routes experts. */
         bool is_moe() const { return gate_inp.rows > 0; }
@@ -219,5 +231,25 @@ tok::TokenId argmax(std::span<const float> logits);
 std::vector<std::pair<std::uint32_t, float>> moe_select(
     const Hparams& hp, const LlamaModel::Layer& lay,
     std::span<float> router_logits);
+
+/**
+ * Row-split matvec across the R9 thread pool: slices w into row
+ * ranges dispatched through the SAME backend kernel into
+ * disjoint spans of out, so logits are bit-identical for every
+ * thread count. LOCUS_THREADS caps the fan-out (default:
+ * hardware cores; 1 runs inline). Small matrices stay inline.
+ */
+void matvec_mt(const backend::Ops& op, const backend::Mat& w,
+               std::span<const float> x, std::span<float> out);
+
+/**
+ * DSA lightning-indexer score for one cached position:
+ * sum over heads h of w[h] * relu(dot(q[h*d .. h*d+d), k)).
+ * Global scale factors are omitted -- they do not change the
+ * top-k order the score exists to produce.
+ */
+float dsa_index_score(std::span<const float> q,
+                      std::span<const float> w,
+                      std::span<const float> k);
 
 }  // namespace locus::model

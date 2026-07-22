@@ -25,6 +25,8 @@ add_executable(locus_tests
     test_tokenizer.cpp
     test_model_e2e.cpp
     test_moe.cpp
+    test_dsa.cpp
+    test_threads.cpp
 )
 target_link_libraries(locus_tests PRIVATE locus catch2)
 target_include_directories(locus_tests SYSTEM PRIVATE

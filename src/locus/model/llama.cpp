@@ -11,6 +11,7 @@
 #include "locus/model/arch.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/model/gguf_load.hpp"
+#include "locus/sys/thread_pool.hpp"
 
 namespace locus::model {
 
@@ -19,6 +20,110 @@ using backend::Mat;
 using gguf::Error;
 using gguf::GgufFile;
 using gguf::TensorInfo;
+
+namespace {
+
+/**
+ * R8 readahead (expert + layer) is on by default: it measured
+ * 33% faster cold streaming on GLM-5.2 with bit-identical
+ * output, and madvise on resident pages is a no-op for warm
+ * models. LOCUS_NO_READAHEAD=1 opts out (A/B benchmarks).
+ */
+bool readahead_enabled() {
+    return std::getenv("LOCUS_NO_READAHEAD") == nullptr;
+}
+
+/** Hints a whole matrix for readahead; empty mats are skipped. */
+void advise_mat(const backend::Mat& m) {
+    if (m.data != nullptr && m.rows > 0) {
+        sys::advise_willneed(
+            m.data, m.rows * backend::mat_row_bytes(m));
+    }
+}
+
+/**
+ * Applies f to every statically-known weight of a layer --
+ * attention (incl. MLA projections and the DSA indexer), dense
+ * FFN, router and shared experts. Routed experts are excluded:
+ * their identity is only known after routing (see moe_ffn).
+ * Shared by the R8 layer readahead and the R9 static pinning.
+ */
+template <class F>
+void for_each_static_mat(const LlamaModel::Layer& lay, F&& f) {
+    f(lay.wq);
+    f(lay.wk);
+    f(lay.wv);
+    f(lay.wo);
+    f(lay.w_gate);
+    f(lay.w_up);
+    f(lay.w_down);
+    f(lay.gate_inp);
+    f(lay.gate_shexp);
+    f(lay.up_shexp);
+    f(lay.down_shexp);
+    f(lay.wkv_a);
+    f(lay.wkv_b);
+    f(lay.wk_b);
+    f(lay.wv_b);
+    f(lay.wq_a);
+    f(lay.wq_b);
+    f(lay.idx_proj);
+    f(lay.idx_k);
+    f(lay.idx_q_b);
+}
+
+void advise_layer_statics(const LlamaModel::Layer& lay) {
+    for_each_static_mat(
+        lay, [](const backend::Mat& m) { advise_mat(m); });
+}
+
+}  // namespace
+
+void matvec_mt(const backend::Ops& op, const Mat& w,
+               std::span<const float> x, std::span<float> out) {
+    // Below this many rows per slice the dispatch overhead wins.
+    constexpr std::uint32_t kMinRowsPerSlice = 64;
+    auto& pool = sys::ThreadPool::instance();
+    std::size_t t = pool.parallelism();
+    if (const char* env = std::getenv("LOCUS_THREADS")) {
+        const long v = std::atol(env);
+        if (v >= 1) {
+            t = std::min<std::size_t>(
+                t, static_cast<std::size_t>(v));
+        }
+    }
+    t = std::min<std::size_t>(t, w.rows / kMinRowsPerSlice);
+    if (t <= 1) {
+        op.matvec(w, x, out);
+        return;
+    }
+    pool.parallel_for(t, [&](std::size_t i) {
+        const std::uint32_t r0 = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(w.rows) * i / t);
+        const std::uint32_t r1 = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(w.rows) * (i + 1) / t);
+        op.matvec(backend::mat_rows(w, r0, r1 - r0), x,
+                  out.subspan(r0, r1 - r0));
+    });
+}
+
+float dsa_index_score(std::span<const float> q,
+                      std::span<const float> w,
+                      std::span<const float> k) {
+    const std::size_t d = k.size();
+    float score = 0.0f;
+    for (std::size_t h = 0; h < w.size(); ++h) {
+        const float* qh = q.data() + h * d;
+        float dot = 0.0f;
+        for (std::size_t i = 0; i < d; ++i) {
+            dot += qh[i] * k[i];
+        }
+        if (dot > 0.0f) {  // ReLU
+            score += w[h] * dot;
+        }
+    }
+    return score;
+}
 
 LlamaModel LlamaModel::load(const GgufFile& g) {
     const auto arch_name = g.get_string("general.architecture");
@@ -134,6 +239,54 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
                    ? need_mat(g, "output.weight", hp.n_embd,
                               hp.n_vocab)
                    : m.embd_;
+
+    // R9 static pinning (opt-in): wire every non-expert weight
+    // into RAM so per-token streaming is only the routed
+    // experts. Policy decision on a small-RAM host, hence the
+    // env gate; failures degrade to plain demand paging.
+    if (std::getenv("LOCUS_PIN_STATIC") != nullptr) {
+        std::size_t locked = 0, failed = 0;
+        auto pin_bytes = [&](const void* p, std::size_t n) {
+            if (p == nullptr || n == 0) {
+                return;
+            }
+            (sys::lock_resident(p, n) ? locked : failed) += n;
+        };
+        auto pin = [&](const Mat& w) {
+            if (w.data != nullptr && w.rows > 0) {
+                pin_bytes(w.data,
+                          w.rows * backend::mat_row_bytes(w));
+            }
+        };
+        for (const Layer& lay : m.layers_) {
+            for_each_static_mat(lay, pin);
+            pin_bytes(lay.attn_norm.data(),
+                      lay.attn_norm.size_bytes());
+            pin_bytes(lay.ffn_norm.data(),
+                      lay.ffn_norm.size_bytes());
+            pin_bytes(lay.kv_a_norm.data(),
+                      lay.kv_a_norm.size_bytes());
+            pin_bytes(lay.q_a_norm.data(),
+                      lay.q_a_norm.size_bytes());
+            pin_bytes(lay.exp_probs_b.data(),
+                      lay.exp_probs_b.size_bytes());
+            pin_bytes(lay.idx_k_norm.data(),
+                      lay.idx_k_norm.size_bytes());
+            pin_bytes(lay.idx_k_norm_b.data(),
+                      lay.idx_k_norm_b.size_bytes());
+        }
+        pin(m.embd_);
+        if (m.out_w_.data != m.embd_.data) {
+            pin(m.out_w_);
+        }
+        pin_bytes(m.out_norm_.data(), m.out_norm_.size_bytes());
+        pin_bytes(m.rope_factors_.data(),
+                  m.rope_factors_.size_bytes());
+        std::fprintf(stderr,
+                     "locus: pinned %zu MB static weights"
+                     " (%zu MB failed)\n",
+                     locked >> 20, failed >> 20);
+    }
     return m;
 }
 
@@ -159,6 +312,13 @@ LlamaModel::Workspace LlamaModel::make_workspace() const {
         ws.q_abs.resize(hp_.kv_lora_rank);
         ws.latent.resize(hp_.kv_lora_rank);
         ws.q_a.resize(hp_.q_lora_rank);
+    }
+    if (hp_.idx_heads > 0) {
+        ws.idx_q.resize(static_cast<std::size_t>(hp_.idx_heads) *
+                        hp_.idx_dim);
+        ws.idx_w.resize(hp_.idx_heads);
+        ws.idx_scores.resize(hp_.n_ctx);
+        ws.idx_sel.reserve(hp_.idx_top_k);
     }
     return ws;
 }
@@ -188,54 +348,6 @@ kv::PagedKvCache LlamaModel::make_cache(
     }
     return kv::PagedKvCache(geom);
 }
-
-namespace {
-
-/**
- * R8 readahead (expert + layer) is on by default: it measured
- * 33% faster cold streaming on GLM-5.2 with bit-identical
- * output, and madvise on resident pages is a no-op for warm
- * models. LOCUS_NO_READAHEAD=1 opts out (A/B benchmarks).
- */
-bool readahead_enabled() {
-    return std::getenv("LOCUS_NO_READAHEAD") == nullptr;
-}
-
-/** Hints a whole matrix for readahead; empty mats are skipped. */
-void advise_mat(const backend::Mat& m) {
-    if (m.data != nullptr && m.rows > 0) {
-        sys::advise_willneed(
-            m.data, m.rows * backend::mat_row_bytes(m));
-    }
-}
-
-/**
- * R8 layer readahead: hints every statically-known weight of a
- * layer -- attention (incl. MLA projections), dense FFN, router
- * and shared experts. Routed experts are excluded: their
- * identity is only known after routing (see moe_ffn).
- */
-void advise_layer_statics(const LlamaModel::Layer& lay) {
-    advise_mat(lay.wq);
-    advise_mat(lay.wk);
-    advise_mat(lay.wv);
-    advise_mat(lay.wo);
-    advise_mat(lay.w_gate);
-    advise_mat(lay.w_up);
-    advise_mat(lay.w_down);
-    advise_mat(lay.gate_inp);
-    advise_mat(lay.gate_shexp);
-    advise_mat(lay.up_shexp);
-    advise_mat(lay.down_shexp);
-    advise_mat(lay.wkv_a);
-    advise_mat(lay.wkv_b);
-    advise_mat(lay.wk_b);
-    advise_mat(lay.wv_b);
-    advise_mat(lay.wq_a);
-    advise_mat(lay.wq_b);
-}
-
-}  // namespace
 
 void LlamaModel::forward(tok::TokenId token,
                          kv::PagedKvCache& cache,
@@ -281,19 +393,19 @@ void LlamaModel::forward(tok::TokenId token,
 
         rmsnorm(ws.x, lay.attn_norm, hp_.rms_eps, ws.xb);
         spec_->attention(*this, lay, cache, seq, ws, l, pos);
-        op.matvec(lay.wo, ws.out, ws.xb2);
+        matvec_mt(op, lay.wo, ws.out, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
             ws.x[i] += ws.xb2[i];
         }
 
         rmsnorm(ws.x, lay.ffn_norm, hp_.rms_eps, ws.xb);
         if (!lay.is_moe()) {
-            op.matvec(lay.w_gate, ws.xb, ws.gate);
-            op.matvec(lay.w_up, ws.xb, ws.up);
+            matvec_mt(op, lay.w_gate, ws.xb, ws.gate);
+            matvec_mt(op, lay.w_up, ws.xb, ws.up);
             silu_mul({ws.gate.data(), hp_.n_ff},
                      {ws.up.data(), hp_.n_ff},
                      {ws.gate.data(), hp_.n_ff});
-            op.matvec(lay.w_down, {ws.gate.data(), hp_.n_ff},
+            matvec_mt(op, lay.w_down, {ws.gate.data(), hp_.n_ff},
                       ws.xb2);
             for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
                 ws.x[i] += ws.xb2[i];
@@ -307,7 +419,7 @@ void LlamaModel::forward(tok::TokenId token,
     }
 
     rmsnorm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
-    op.matvec(out_w_, ws.xb, logits);
+    matvec_mt(op, out_w_, ws.xb, logits);
     seq.n_tokens = pos + 1;
 }
 
@@ -424,11 +536,11 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
     auto swiglu_into_acc = [&](const Mat& wg, const Mat& wu,
                                const Mat& wd, std::uint32_t ff,
                                float wgt) {
-        op.matvec(wg, ws.xb, {ws.gate.data(), ff});
-        op.matvec(wu, ws.xb, {ws.up.data(), ff});
+        matvec_mt(op, wg, ws.xb, {ws.gate.data(), ff});
+        matvec_mt(op, wu, ws.xb, {ws.up.data(), ff});
         silu_mul({ws.gate.data(), ff}, {ws.up.data(), ff},
                  {ws.gate.data(), ff});
-        op.matvec(wd, {ws.gate.data(), ff}, ws.xb2);
+        matvec_mt(op, wd, {ws.gate.data(), ff}, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
             ws.moe_acc[i] += wgt * ws.xb2[i];
         }
