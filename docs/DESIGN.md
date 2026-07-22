@@ -255,6 +255,9 @@ Notes:
   counts (8.74M; equally cold) with sys time down 60.9s ->
   22.9s. RSS rises 9.2GB -> 13.2GB (~6% of the model) as
   readahead keeps more of the window resident. ~44s/token.
+  Both policies are DEFAULT-ON since then (the flags
+  LOCUS_EXPERT_READAHEAD / LOCUS_LAYER_READAHEAD are gone);
+  LOCUS_NO_READAHEAD=1 restores passive streaming for A/Bs.
 - Future work (2026-07-21): overlap I/O with compute one step
   ahead. Mechanism notes: each shard is mmap'd once, whole-file
   (PROT_READ MAP_PRIVATE, never written) -- weight pages are

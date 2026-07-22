@@ -191,6 +191,16 @@ kv::PagedKvCache LlamaModel::make_cache(
 
 namespace {
 
+/**
+ * R8 readahead (expert + layer) is on by default: it measured
+ * 33% faster cold streaming on GLM-5.2 with bit-identical
+ * output, and madvise on resident pages is a no-op for warm
+ * models. LOCUS_NO_READAHEAD=1 opts out (A/B benchmarks).
+ */
+bool readahead_enabled() {
+    return std::getenv("LOCUS_NO_READAHEAD") == nullptr;
+}
+
 /** Hints a whole matrix for readahead; empty mats are skipped. */
 void advise_mat(const backend::Mat& m) {
     if (m.data != nullptr && m.rows > 0) {
@@ -255,10 +265,9 @@ void LlamaModel::forward(tok::TokenId token,
 
     // R8 layer readahead: while layer l computes, ask the kernel
     // to page in layer l+1's static weights (and the output head
-    // after the last layer). Opt-in for A/B; routed experts are
-    // covered separately at selection time (moe_ffn).
-    const bool layer_ra =
-        std::getenv("LOCUS_LAYER_READAHEAD") != nullptr;
+    // after the last layer). Routed experts are covered
+    // separately at selection time (moe_ffn).
+    const bool layer_ra = readahead_enabled();
 
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
@@ -400,8 +409,8 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
     }
     // R8 expert readahead: overlap the SSD reads of every routed
     // expert before the sequential per-expert matmuls fault them
-    // in one by one. Opt-in for A/B against the passive baseline.
-    if (std::getenv("LOCUS_EXPERT_READAHEAD") != nullptr) {
+    // in one by one.
+    if (readahead_enabled()) {
         for (const auto& [e, wgt] : picked) {
             sys::advise_willneed(lay.gate_exps.expert(e).data,
                                  lay.gate_exps.expert_bytes);

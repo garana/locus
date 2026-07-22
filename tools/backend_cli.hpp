@@ -48,10 +48,9 @@ inline constexpr const char* kCommonHelp =
     "                          same names as --backends\n"
     "  LOCUS_MOE_STATS=1       print expert-routing telemetry\n"
     "                          at exit (R8 working-set data)\n"
-    "  LOCUS_EXPERT_READAHEAD=1  madvise routed experts before\n"
-    "                          their matmuls (streaming models)\n"
-    "  LOCUS_LAYER_READAHEAD=1   madvise the next layer's static\n"
-    "                          weights during the current layer\n";
+    "  LOCUS_NO_READAHEAD=1    disable the default madvise\n"
+    "                          readahead of upcoming weights\n"
+    "                          (routed experts + next layer)\n";
 
 /** Backend flags peeled off argv; the rest stays positional. */
 struct BackendArgs {

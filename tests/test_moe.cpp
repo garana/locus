@@ -289,10 +289,10 @@ TEST_CASE("moe on the vulkan backend matches dense",
 
 TEST_CASE("readahead hints leave outputs bit-identical",
           "[moe]") {
-    // R8: LOCUS_LAYER_READAHEAD / LOCUS_EXPERT_READAHEAD are
-    // pure madvise hints; logits must not change at all. The
-    // in-memory image is not file-backed, so this also covers
-    // the best-effort path where madvise fails.
+    // R8: readahead (default on) is pure madvise hinting;
+    // logits must not change at all vs LOCUS_NO_READAHEAD=1.
+    // The in-memory image is not file-backed, so this also
+    // covers the best-effort path where madvise fails.
     const auto wg = weights(kE * kF, 70);
     const auto wu = weights(kE * kF, 71);
     const auto wd = weights(kF * kE, 72);
@@ -317,15 +317,13 @@ TEST_CASE("readahead hints leave outputs bit-identical",
     auto moe_img = moe.build(4, 2);
 
     const std::vector<locus::tok::TokenId> toks = {3, 7, 1};
+    auto dense_on = run(dense_img, toks);  // default: hints on
+    auto moe_on = run(moe_img, toks);
+
+    setenv("LOCUS_NO_READAHEAD", "1", 1);
     auto dense_off = run(dense_img, toks);
     auto moe_off = run(moe_img, toks);
-
-    setenv("LOCUS_LAYER_READAHEAD", "1", 1);
-    setenv("LOCUS_EXPERT_READAHEAD", "1", 1);
-    auto dense_on = run(dense_img, toks);
-    auto moe_on = run(moe_img, toks);
-    unsetenv("LOCUS_LAYER_READAHEAD");
-    unsetenv("LOCUS_EXPERT_READAHEAD");
+    unsetenv("LOCUS_NO_READAHEAD");
 
     REQUIRE(dense_on == dense_off);
     REQUIRE(moe_on == moe_off);
