@@ -187,6 +187,67 @@ void check_matvec_variant_matches_scalar(
         }
     }
 
+    SECTION("q5_k super-block") {
+        const std::uint32_t rows = 3, cols = 256;  // 1 sblk/row
+        const std::uint32_t nsb = cols / 256;
+        std::vector<std::byte> w(
+            static_cast<std::size_t>(rows) * nsb * 176);
+        std::uniform_int_distribution<int> bd(0, 255);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(bd(rng));
+        }
+        // Sane f16 d/dmin at the block head (random qh/ql/scales).
+        for (std::uint32_t s = 0; s < rows * nsb; ++s) {
+            std::byte* blk =
+                w.data() + static_cast<std::size_t>(s) * 176;
+            const std::uint16_t d = f32_to_f16(0.01f);
+            const std::uint16_t dmin = f32_to_f16(0.005f);
+            std::memcpy(blk, &d, 2);
+            std::memcpy(blk + 2, &dmin, 2);
+        }
+        std::vector<float> x(cols);
+        for (auto& v : x) {
+            v = dist(rng);
+        }
+        Mat m{locus::gguf::TensorType::kQ5_K, w.data(), rows, cols};
+        std::vector<float> a(rows), b(rows);
+        matvec(m, x, a);
+        variant(m, x, b);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-3));
+        }
+    }
+
+    SECTION("q6_k super-block") {
+        const std::uint32_t rows = 3, cols = 256;  // 1 sblk/row
+        const std::uint32_t nsb = cols / 256;
+        std::vector<std::byte> w(
+            static_cast<std::size_t>(rows) * nsb * 210);
+        std::uniform_int_distribution<int> bd(0, 255);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(bd(rng));
+        }
+        // Q6_K's f16 d lives at the block tail (blk+208); sc[16] and
+        // ql/qh stay random.
+        for (std::uint32_t s = 0; s < rows * nsb; ++s) {
+            std::byte* blk =
+                w.data() + static_cast<std::size_t>(s) * 210;
+            const std::uint16_t d = f32_to_f16(0.01f);
+            std::memcpy(blk + 208, &d, 2);
+        }
+        std::vector<float> x(cols);
+        for (auto& v : x) {
+            v = dist(rng);
+        }
+        Mat m{locus::gguf::TensorType::kQ6_K, w.data(), rows, cols};
+        std::vector<float> a(rows), b(rows);
+        matvec(m, x, a);
+        variant(m, x, b);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-2));
+        }
+    }
+
     SECTION("iq1_s super-block") {
         const std::uint32_t rows = 3, cols = 256;  // 1 sblk/row
         const std::uint32_t nsb = cols / 256;

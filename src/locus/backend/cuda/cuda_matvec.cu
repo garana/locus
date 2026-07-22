@@ -143,6 +143,138 @@ __global__ void matvec_q4_k_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
+/** One Q5_K super-block is 176 bytes: d,dmin (f16) + scales[12] +
+ *  qh[32] + ql[128], 256 weights. The 5th bit comes from qh, its bit
+ *  position advancing per 64-group (u1/u2). Fill order is sequential,
+ *  so the dot accumulates on the fly matching dequant_block_q5_k. */
+__global__ void matvec_q5_k_kernel(const std::uint8_t* w,
+                                   const float* x, float* out,
+                                   std::uint32_t rows,
+                                   std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 176;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            176;
+        const std::uint16_t db =
+            static_cast<std::uint16_t>(blk[0]) |
+            (static_cast<std::uint16_t>(blk[1]) << 8);
+        const std::uint16_t dmb =
+            static_cast<std::uint16_t>(blk[2]) |
+            (static_cast<std::uint16_t>(blk[3]) << 8);
+        const float d = __half2float(__ushort_as_half(db));
+        const float dmin = __half2float(__ushort_as_half(dmb));
+        const std::uint8_t* scales = blk + 4;
+        const std::uint8_t* qh = blk + 16;
+        const std::uint8_t* ql = blk + 48;
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        int is = 0, yi = 0;
+        std::uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < 256; j += 64) {
+            std::uint8_t sc, mn;
+            scale_min_k4(is + 0, scales, sc, mn);
+            const float d1 = d * sc, m1 = dmin * mn;
+            scale_min_k4(is + 1, scales, sc, mn);
+            const float d2 = d * sc, m2 = dmin * mn;
+            for (int l = 0; l < 32; ++l) {
+                const float val =
+                    d1 * static_cast<float>(
+                             (ql[l] & 0x0f) +
+                             ((qh[l] & u1) ? 16 : 0)) -
+                    m1;
+                acc += val * xb[yi++];
+            }
+            for (int l = 0; l < 32; ++l) {
+                const float val =
+                    d2 * static_cast<float>(
+                             (ql[l] >> 4) +
+                             ((qh[l] & u2) ? 16 : 0)) -
+                    m2;
+                acc += val * xb[yi++];
+            }
+            ql += 32;
+            is += 2;
+            u1 = static_cast<std::uint8_t>(u1 << 2);
+            u2 = static_cast<std::uint8_t>(u2 << 2);
+        }
+    }
+    out[r] = acc;
+}
+
+/** One Q6_K super-block is 210 bytes: ql[128] + qh[64] + sc[16]int8
+ *  + d (f16), 256 weights. The scalar fills y in a scattered order
+ *  (y[l], y[l+32], y[l+64], y[l+96]); to keep the dot bit-identical
+ *  to dot_k_quant we materialize the block then accumulate i=0..255. */
+__global__ void matvec_q6_k_kernel(const std::uint8_t* w,
+                                   const float* x, float* out,
+                                   std::uint32_t rows,
+                                   std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 210;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            210;
+        const std::uint8_t* qlp = blk;
+        const std::uint8_t* qhp = blk + 128;
+        const std::int8_t* scp =
+            reinterpret_cast<const std::int8_t*>(blk + 192);
+        const std::uint16_t db =
+            static_cast<std::uint16_t>(blk[208]) |
+            (static_cast<std::uint16_t>(blk[209]) << 8);
+        const float d = __half2float(__ushort_as_half(db));
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        float tmp[256];
+        float* y = tmp;
+        for (int n = 0; n < 256; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int q1 = static_cast<int>(
+                                   (qlp[l] & 0x0f) |
+                                   (((qhp[l] >> 0) & 3) << 4)) -
+                               32;
+                const int q2 = static_cast<int>(
+                                   (qlp[l + 32] & 0x0f) |
+                                   (((qhp[l] >> 2) & 3) << 4)) -
+                               32;
+                const int q3 = static_cast<int>(
+                                   (qlp[l] >> 4) |
+                                   (((qhp[l] >> 4) & 3) << 4)) -
+                               32;
+                const int q4 = static_cast<int>(
+                                   (qlp[l + 32] >> 4) |
+                                   (((qhp[l] >> 6) & 3) << 4)) -
+                               32;
+                y[l] = d * scp[is] * static_cast<float>(q1);
+                y[l + 32] = d * scp[is + 2] * static_cast<float>(q2);
+                y[l + 64] = d * scp[is + 4] * static_cast<float>(q3);
+                y[l + 96] = d * scp[is + 6] * static_cast<float>(q4);
+            }
+            y += 128;
+            qlp += 64;
+            qhp += 32;
+            scp += 8;
+        }
+        for (int i = 0; i < 256; ++i) {
+            acc += tmp[i] * xb[i];
+        }
+    }
+    out[r] = acc;
+}
+
 /** One IQ1_S super-block is 50 bytes: d (f16) + qs[32] + qh[8]u16,
  *  256 weights. Each of 8 sub-blocks picks 4 grid entries (8 int8
  *  each) scaled by dl with a +/-0.125 delta. Dequant + accumulate in
@@ -460,7 +592,7 @@ const std::uint64_t* device_iq1s_grid() {
     return d;
 }
 
-enum class Kind { kF32, kQ8_0, kQ4_K, kIQ1_S };
+enum class Kind { kF32, kQ8_0, kQ4_K, kQ5_K, kQ6_K, kIQ1_S };
 
 void launch_kernel(Kind kind, const void* dw,
                    const std::uint64_t* grid, const float* dxf,
@@ -481,6 +613,14 @@ void launch_kernel(Kind kind, const void* dw,
             break;
         case Kind::kQ4_K:
             matvec_q4_k_kernel<<<blocks, threads>>>(
+                dwb, dxf, doutf, rows, cols);
+            break;
+        case Kind::kQ5_K:
+            matvec_q5_k_kernel<<<blocks, threads>>>(
+                dwb, dxf, doutf, rows, cols);
+            break;
+        case Kind::kQ6_K:
+            matvec_q6_k_kernel<<<blocks, threads>>>(
                 dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kIQ1_S:
@@ -545,6 +685,12 @@ std::size_t device_weight_bytes(const Mat& w) {
         case gguf::TensorType::kQ4_K:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 256ull) * 144ull;
+        case gguf::TensorType::kQ5_K:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 176ull;
+        case gguf::TensorType::kQ6_K:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 210ull;
         case gguf::TensorType::kIQ1_S:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 256ull) * 50ull;
@@ -559,6 +705,10 @@ Kind kind_for(gguf::TensorType t) {
             return Kind::kQ8_0;
         case gguf::TensorType::kQ4_K:
             return Kind::kQ4_K;
+        case gguf::TensorType::kQ5_K:
+            return Kind::kQ5_K;
+        case gguf::TensorType::kQ6_K:
+            return Kind::kQ6_K;
         case gguf::TensorType::kIQ1_S:
             return Kind::kIQ1_S;
         default:

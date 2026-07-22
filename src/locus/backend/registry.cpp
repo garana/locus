@@ -48,8 +48,8 @@ const std::vector<Backend>& list() {
                       &vulkan_alloc_kv, nullptr}});
         const bool cu = cuda_backend_usable();
         b.push_back({"cuda",
-                     "NVIDIA CUDA matvec (F32/Q8_0/Q4_K/IQ1_S on "
-                     "GPU, pooled weights; other types scalar)",
+                     "NVIDIA CUDA matvec (F32/Q8_0/Q4_K/Q5_K/Q6_K/"
+                     "IQ1_S on GPU, pooled weights; other scalar)",
                      cu, cu,
                      {&matvec_cuda, &dequant_row, nullptr,
                       &cuda_prefetch}});
