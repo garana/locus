@@ -60,4 +60,12 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
 /** @returns true when a usable CUDA device is present. */
 bool cuda_backend_usable();
 
+/**
+ * Async weight prefetch (Ops.prefetch): begins a cudaMemcpyAsync of
+ * w onto a dedicated stream into the CUDA weight pool, so a later
+ * matvec_cuda(w) finds it resident. No-op for weight types the GPU
+ * kernels do not handle, and a no-op stub on non-CUDA builds.
+ */
+void cuda_prefetch(const Mat& w);
+
 }  // namespace locus::backend

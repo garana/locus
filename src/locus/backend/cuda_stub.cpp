@@ -14,6 +14,8 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
     matvec(w, x, out);
 }
 
+void cuda_prefetch(const Mat&) {}
+
 bool cuda_backend_usable() { return false; }
 
 }  // namespace locus::backend

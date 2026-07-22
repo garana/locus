@@ -242,3 +242,37 @@ TEST_CASE("cuda matvec matches scalar", "[backend]") {
     }
     check_matvec_variant_matches_scalar(&matvec_cuda);
 }
+
+// Phase 3: prefetch uploads the weight async on a second stream;
+// the following matvec must wait on that copy and stay token-exact.
+TEST_CASE("cuda prefetch then matvec is token-exact", "[backend]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    std::mt19937 rng(23);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    const std::uint32_t rows = 4, cols = 64;  // 2 q8_0 blocks/row
+    std::vector<std::byte> w(rows * (cols / 32) * 34);
+    std::uniform_int_distribution<int> qd(-127, 127);
+    for (std::size_t bl = 0; bl < rows * (cols / 32); ++bl) {
+        std::byte* blk = w.data() + bl * 34;
+        const std::uint16_t d = f32_to_f16(0.02f);
+        std::memcpy(blk, &d, 2);
+        for (int i = 0; i < 32; ++i) {
+            blk[2 + i] = static_cast<std::byte>(
+                static_cast<std::int8_t>(qd(rng)));
+        }
+    }
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    Mat m{locus::gguf::TensorType::kQ8_0, w.data(), rows, cols};
+    std::vector<float> a(rows), b(rows);
+    matvec(m, x, a);
+    cuda_prefetch(m);       // async upload into the pool
+    matvec_cuda(m, x, b);   // must consume the in-flight page
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-4));
+    }
+}

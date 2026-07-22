@@ -212,15 +212,20 @@ struct DevBuf {
 };
 
 /**
- * Device weight pool (R8-GPU pager, phases 1-2). Caches one device
- * buffer per weight, keyed by host pointer, so a weight is uploaded
- * once and reused across tokens under a byte budget with LRU
- * eviction. acquire() pins the page for the duration of a matvec so
- * a concurrent call cannot evict a weight in use; release() unpins.
+ * Device weight pool (R8-GPU pager). Caches one device buffer per
+ * weight, keyed by host pointer, so a weight is uploaded once and
+ * reused across tokens under a byte budget with LRU eviction.
+ * acquire() pins the page for the duration of a matvec so a
+ * concurrent call cannot evict a weight in use; release() unpins.
  * A weight larger than the whole budget, or when every resident page
  * is pinned, returns nullptr so the caller uses an uncached per-call
  * upload -- preserving correctness on tiny-VRAM hosts. The pool holds
  * the source (quantized) bytes; the kernels dequantize on-device.
+ *
+ * prefetch() (phase 3) uploads a weight asynchronously on a dedicated
+ * non-blocking stream so the copy overlaps the default-stream compute
+ * of the current layer/expert; acquire() then waits on that copy's
+ * event before handing the pointer to the kernel.
  */
 class WeightPool {
  public:
@@ -233,37 +238,73 @@ class WeightPool {
         }
         const std::uint64_t now = ++clock_;
         if (auto it = table_.find(host); it != table_.end()) {
+            wait_ready(it->second);  // finish any in-flight prefetch
             it->second.last_use = now;
             it->second.pins++;
             hits_++;
             return it->second.dptr;
         }
-        if (bytes > budget_) {
-            return nullptr;  // never fits: caller uses demand path
-        }
-        while (used_ + bytes > budget_) {
-            if (!evict_one()) {
-                return nullptr;  // all pinned: caller demand path
-            }
-        }
-        void* dptr = nullptr;
-        if (!cuda_ok(cudaMalloc(&dptr, bytes))) {
-            while (evict_one()) {  // reclaim slack, then retry once
-            }
-            if (!cuda_ok(cudaMalloc(&dptr, bytes))) {
-                return nullptr;
-            }
+        void* dptr = alloc(bytes);
+        if (dptr == nullptr) {
+            return nullptr;  // too big / all pinned: caller demand path
         }
         if (!cuda_ok(cudaMemcpy(dptr, host, bytes,
                                 cudaMemcpyHostToDevice))) {
             cudaFree(dptr);
+            used_ -= bytes;
             return nullptr;
         }
-        used_ += bytes;
         upload_bytes_ += bytes;
         misses_++;
-        table_.emplace(host, Page{dptr, bytes, now, 1});
+        table_.emplace(host,
+                       Page{dptr, bytes, now, 1, nullptr, false});
         return dptr;
+    }
+
+    /** Fire-and-forget async upload into the pool (Ops.prefetch). */
+    void prefetch(const void* host, std::size_t bytes) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (budget_ == 0) {
+            init_budget();
+        }
+        const std::uint64_t now = ++clock_;
+        if (auto it = table_.find(host); it != table_.end()) {
+            it->second.last_use = now;  // already resident/in flight
+            return;
+        }
+        ensure_stream();
+        void* dptr = alloc(bytes);
+        if (dptr == nullptr) {
+            return;  // no room now; matvec will demand-load it
+        }
+        cudaEvent_t ev = nullptr;
+        if (stream_ != nullptr &&
+            cuda_ok(cudaEventCreateWithFlags(
+                &ev, cudaEventDisableTiming)) &&
+            cuda_ok(cudaMemcpyAsync(dptr, host, bytes,
+                                    cudaMemcpyHostToDevice,
+                                    stream_)) &&
+            cuda_ok(cudaEventRecord(ev, stream_))) {
+            upload_bytes_ += bytes;
+            prefetches_++;
+            table_.emplace(host, Page{dptr, bytes, now, 0, ev, true});
+            return;
+        }
+        // Async path unavailable: synchronous upload keeps the page
+        // valid and reusable.
+        if (ev != nullptr) {
+            cudaEventDestroy(ev);
+        }
+        if (!cuda_ok(cudaMemcpy(dptr, host, bytes,
+                                cudaMemcpyHostToDevice))) {
+            cudaFree(dptr);
+            used_ -= bytes;
+            return;
+        }
+        upload_bytes_ += bytes;
+        prefetches_++;
+        table_.emplace(host,
+                       Page{dptr, bytes, now, 0, nullptr, false});
     }
 
     void release(const void* host) {
@@ -282,14 +323,15 @@ class WeightPool {
         std::fprintf(
             stderr,
             "[cuda-pool] budget=%zuMB resident=%zuMB hits=%llu "
-            "misses=%llu hit_rate=%.1f%% evictions=%llu "
-            "uploaded=%lluMB\n",
+            "misses=%llu hit_rate=%.1f%% prefetches=%llu "
+            "evictions=%llu uploaded=%lluMB\n",
             budget_ >> 20, used_ >> 20,
             static_cast<unsigned long long>(hits_),
             static_cast<unsigned long long>(misses_),
             tot ? 100.0 * static_cast<double>(hits_) /
                       static_cast<double>(tot)
                 : 0.0,
+            static_cast<unsigned long long>(prefetches_),
             static_cast<unsigned long long>(evictions_),
             static_cast<unsigned long long>(upload_bytes_ >> 20));
         // Process exit frees the device; skip cudaFree to avoid
@@ -302,7 +344,27 @@ class WeightPool {
         std::size_t bytes;
         std::uint64_t last_use;
         int pins;
+        cudaEvent_t ev;   // set while an async prefetch is in flight
+        bool inflight;
     };
+
+    void ensure_stream() {
+        if (stream_ == nullptr) {
+            cudaStreamCreateWithFlags(&stream_,
+                                      cudaStreamNonBlocking);
+        }
+    }
+
+    /** Blocks until a page's in-flight prefetch copy is complete, so
+     *  the default-stream kernel that follows reads valid data. */
+    void wait_ready(Page& pg) {
+        if (pg.inflight) {
+            cudaEventSynchronize(pg.ev);
+            cudaEventDestroy(pg.ev);
+            pg.ev = nullptr;
+            pg.inflight = false;
+        }
+    }
 
     void init_budget() {
         if (const char* mb = std::getenv("LOCUS_GPU_POOL_MB")) {
@@ -318,6 +380,30 @@ class WeightPool {
         }
     }
 
+    /** Reserves room (evicting LRU) then cudaMallocs `bytes`; nullptr
+     *  if it cannot fit even after evicting every unpinned page.
+     *  Updates used_ on success. */
+    void* alloc(std::size_t bytes) {
+        if (bytes > budget_) {
+            return nullptr;
+        }
+        while (used_ + bytes > budget_) {
+            if (!evict_one()) {
+                return nullptr;
+            }
+        }
+        void* p = nullptr;
+        if (!cuda_ok(cudaMalloc(&p, bytes))) {
+            while (evict_one()) {  // reclaim slack, then retry once
+            }
+            if (!cuda_ok(cudaMalloc(&p, bytes))) {
+                return nullptr;
+            }
+        }
+        used_ += bytes;
+        return p;
+    }
+
     bool evict_one() {
         auto victim = table_.end();
         std::uint64_t oldest = UINT64_MAX;
@@ -331,6 +417,7 @@ class WeightPool {
         if (victim == table_.end()) {
             return false;  // everything pinned
         }
+        wait_ready(victim->second);  // don't free mid-copy
         cudaFree(victim->second.dptr);
         used_ -= victim->second.bytes;
         evictions_++;
@@ -339,10 +426,12 @@ class WeightPool {
     }
 
     std::unordered_map<const void*, Page> table_;
+    cudaStream_t stream_ = nullptr;
     std::size_t budget_ = 0;
     std::size_t used_ = 0;
     std::uint64_t clock_ = 0;
     std::uint64_t hits_ = 0, misses_ = 0, evictions_ = 0;
+    std::uint64_t prefetches_ = 0;
     std::uint64_t upload_bytes_ = 0;
     std::mutex mu_;
 };
@@ -444,36 +533,63 @@ bool run_matvec(const Mat& w, std::span<const float> x,
     return ok;
 }
 
+/** Device upload size for a GPU-handled weight type; 0 otherwise. */
+std::size_t device_weight_bytes(const Mat& w) {
+    switch (w.type) {
+        case gguf::TensorType::kF32:
+            return static_cast<std::size_t>(w.rows) * w.cols *
+                   sizeof(float);
+        case gguf::TensorType::kQ8_0:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 32ull) * 34ull;
+        case gguf::TensorType::kQ4_K:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 144ull;
+        case gguf::TensorType::kIQ1_S:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 50ull;
+        default:
+            return 0;
+    }
+}
+
+Kind kind_for(gguf::TensorType t) {
+    switch (t) {
+        case gguf::TensorType::kQ8_0:
+            return Kind::kQ8_0;
+        case gguf::TensorType::kQ4_K:
+            return Kind::kQ4_K;
+        case gguf::TensorType::kIQ1_S:
+            return Kind::kIQ1_S;
+        default:
+            return Kind::kF32;
+    }
+}
+
 }  // namespace
 
 void matvec_cuda(const Mat& w, std::span<const float> x,
                  std::span<float> out) {
+    const std::size_t bytes = device_weight_bytes(w);
     bool done = false;
-    if (w.type == gguf::TensorType::kF32) {
-        const std::size_t bytes =
-            static_cast<std::size_t>(w.rows) * w.cols *
-            sizeof(float);
-        done = run_matvec(w, x, out, bytes, Kind::kF32);
-    } else if (w.type == gguf::TensorType::kQ8_0) {
-        const std::size_t bytes =
-            static_cast<std::size_t>(w.rows) *
-            (w.cols / 32ull) * 34ull;
-        done = run_matvec(w, x, out, bytes, Kind::kQ8_0);
-    } else if (w.type == gguf::TensorType::kQ4_K) {
-        const std::size_t bytes =
-            static_cast<std::size_t>(w.rows) *
-            (w.cols / 256ull) * 144ull;
-        done = run_matvec(w, x, out, bytes, Kind::kQ4_K);
-    } else if (w.type == gguf::TensorType::kIQ1_S) {
-        if (const std::uint64_t* grid = device_iq1s_grid()) {
-            const std::size_t bytes =
-                static_cast<std::size_t>(w.rows) *
-                (w.cols / 256ull) * 50ull;
-            done = run_matvec(w, x, out, bytes, Kind::kIQ1_S, grid);
+    if (bytes > 0) {
+        const std::uint64_t* grid =
+            w.type == gguf::TensorType::kIQ1_S ? device_iq1s_grid()
+                                               : nullptr;
+        if (w.type != gguf::TensorType::kIQ1_S || grid != nullptr) {
+            done = run_matvec(w, x, out, bytes, kind_for(w.type),
+                              grid);
         }
     }
     if (!done) {
         matvec(w, x, out);  // fallback / other types: scalar
+    }
+}
+
+void cuda_prefetch(const Mat& w) {
+    const std::size_t bytes = device_weight_bytes(w);
+    if (bytes > 0) {
+        pool().prefetch(w.data, bytes);
     }
 }
 

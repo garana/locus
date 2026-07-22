@@ -21,6 +21,16 @@ struct Ops {
      * lives in memory the attention kernel can read directly.
      */
     float* (*alloc_kv)(std::size_t n_floats);
+    /**
+     * Optional one-step-ahead weight-prefetch hint (nullptr on
+     * backends without a pager). The model may call this at the R8
+     * readahead points -- next layer's static tensors, and each
+     * routed expert at MoE selection time -- with the exact same Mat
+     * (host pointer) a later matvec() will use; a GPU backend begins
+     * an async upload into its weight pool so the matvec finds it
+     * resident. Fire-and-forget: it never blocks and may no-op.
+     */
+    void (*prefetch)(const Mat& w);
 };
 
 /**

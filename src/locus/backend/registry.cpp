@@ -23,21 +23,21 @@ const std::vector<Backend>& list() {
         b.push_back({"neon",
                      "ARM NEON vectorized matvec (F32/Q8_0)",
                      f.neon, true,
-                     {&matvec_neon, &dequant_row, nullptr}});
+                     {&matvec_neon, &dequant_row, nullptr, nullptr}});
 #endif
 #if defined(__x86_64__)
         b.push_back({"avx2",
                      "x86-64 AVX2 vectorized matvec (F32/Q8_0)",
                      f.avx2, true,
-                     {&matvec_avx2, &dequant_row, nullptr}});
+                     {&matvec_avx2, &dequant_row, nullptr, nullptr}});
         b.push_back({"sse4",
                      "x86-64 SSE4.1 vectorized matvec (F32/Q8_0)",
                      f.sse4, true,
-                     {&matvec_sse4, &dequant_row, nullptr}});
+                     {&matvec_sse4, &dequant_row, nullptr, nullptr}});
 #endif
         b.push_back({"scalar", "portable reference (all types)",
                      true, true,
-                     {&matvec, &dequant_row, nullptr}});
+                     {&matvec, &dequant_row, nullptr, nullptr}});
         const bool vk = f.vulkan && vulkan_backend_usable();
         b.push_back({"vulkan",
                      "GPU forward pass via Vulkan: paged/MLA "
@@ -45,13 +45,14 @@ const std::vector<Backend>& list() {
                      "(F32/F16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K)",
                      vk, vk,
                      {&matvec_vulkan, &dequant_row,
-                      &vulkan_alloc_kv}});
+                      &vulkan_alloc_kv, nullptr}});
         const bool cu = cuda_backend_usable();
         b.push_back({"cuda",
                      "NVIDIA CUDA matvec (F32/Q8_0/Q4_K/IQ1_S on "
-                     "GPU, streamed per call; other types scalar)",
+                     "GPU, pooled weights; other types scalar)",
                      cu, cu,
-                     {&matvec_cuda, &dequant_row, nullptr}});
+                     {&matvec_cuda, &dequant_row, nullptr,
+                      &cuda_prefetch}});
         return b;
     }();
     return v;
