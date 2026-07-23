@@ -27,12 +27,41 @@ Notation used throughout:
 In diagrams the dot product is written `q . k` (not `<q,k>`), to
 keep the diagram renderer happy.
 
+A note on the word "learned." This document describes inference:
+running a model whose training is already finished, which is what
+locus does. Every matrix below -- the projections `W_*` and the
+embedding `E` -- is a fixed table of numbers (its weights, or
+parameters) produced by a separate training process we do not cover.
+So "learned" here just means "a constant that training settled on";
+while locus runs, none of these tables change.
+
 ## 1. What the model computes
 
 A language model is a function from a sequence of tokens to a
-prediction of the next token. Text is first cut into tokens, each a
-small integer drawn from a fixed vocabulary of size `V` (about
-150,000 here). The model never sees letters, only these ids.
+prediction of the next token.
+
+Tokenization -- how text becomes tokens. The models here use
+byte-pair encoding (BPE). A fixed vocabulary of about 150,000 tokens
+is built once, before training, and then reused unchanged. It is
+grown by merging: start with an alphabet of the 256 single bytes (so
+any text at all is expressible), scan a large corpus, repeatedly find
+the most frequent adjacent pair of existing tokens, and add that pair
+as a new token -- recording each merge and the order (its "rank") in
+which it was added. After about 150,000 merges the vocabulary is
+frozen.
+
+To tokenize a new string at run time, locus (a) splits it into rough
+chunks with a fixed regular expression -- which decides, for example,
+that a leading space stays attached to the following word and that
+runs of digits break apart; (b) turns each chunk into its raw bytes;
+then (c) greedily re-applies the learned merges in rank order until
+none fits. The surviving pieces are the tokens, and a token's integer
+id is simply its row number in the vocabulary. Frequent words collapse
+to a single token, rare words fall back to a few sub-word pieces, and
+in the worst case to individual bytes -- so there is never an
+"unknown" token. A special begin-of-sequence marker is usually
+prepended. From here on the model sees only these integer ids, never
+characters. (Code: `src/locus/tok/bpe_tokenizer.cpp`.)
 
 Its output is a vector `z in R^V` of scores called logits, one per
 vocabulary entry. To turn scores into an actual next token we use
@@ -59,10 +88,20 @@ tokens `t_1 .. t_n` become the score vector `z`.
 
 A token id is just an index; on its own it has no geometry, no
 notion of "close to" or "far from" another token. The first step
-attaches a vector to each id. An embedding matrix `E in R^{V x d}`
-stores one row per vocabulary entry; token id `t` becomes its row
-`E_t in R^d`. The number `d` (2048 to 6144 in our models) is the
-model dimension, also called the hidden size.
+gives each id a vector, by a plain table lookup. The model holds an
+embedding matrix `E in R^{V x d}` -- one of its fixed weight tables,
+with one row per vocabulary entry. Token id `t` selects row `t` of
+`E`, the vector `E_t in R^d`. That is the whole operation: an index
+into a table. (Equivalently it is `E^T` times the "one-hot" vector
+that is 1 in position `t` and 0 elsewhere, but it is implemented as a
+direct row read -- and dequantized to floats first if `E` is stored
+compressed, Section 11.) The number `d` (2048 to 6144 in our models)
+is the model dimension, also called the hidden size.
+
+The rows of `E` are not arbitrary: training arranges them so that ids
+occurring in similar contexts get nearby vectors, and that geometry is
+what the rest of the network operates on. For locus, which only runs
+the finished model, the rows are simply constants read out per token.
 
 From here the model transforms one vector `x in R^d` per position
 through a stack of `L` identical layers. This running vector is
@@ -89,9 +128,18 @@ RMSNorm (Root-Mean-Square Normalization):
 
 It divides every entry by the root-mean-square of the vector
 (making it unit length in the RMS sense), then multiplies
-elementwise by a learned gain vector `g`. The term `eps` (epsilon)
-is a tiny constant so the division stays safe when `x` is near
-zero.
+elementwise by a gain vector `g`. The term `eps` (epsilon) is a tiny
+constant so the division stays safe when `x` is near zero.
+
+Where `g` comes from: it is a learned weight vector of length `d`,
+one number per hidden dimension, stored in the model file alongside
+the layer -- there is a separate `g` for each normalization site
+(the attention norm, the feed-forward norm, and the final output
+norm carry their own, as `blk.N.attn_norm.weight`,
+`blk.N.ffn_norm.weight`, `output_norm.weight`). Like every weight it
+is fixed at inference; it lets training decide how much each of the
+`d` coordinates should count after the vector has been rescaled to
+unit RMS.
 
 RMSNorm does not subtract the mean. The older and more common
 LayerNorm (Layer Normalization) does: it centers `x` (subtracts its
