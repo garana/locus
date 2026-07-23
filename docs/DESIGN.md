@@ -283,6 +283,20 @@ Notes:
   working set disperses slower in relative terms but the
   absolute bytes stay huge -- confirms within-token prefetch
   over cross-token caching at GLM scale too.
+- GLM-5.2 re-anchored after the nextn/blk.78 exclusion
+  (2026-07-23, on vx): locus (sse4) and a CPU-only llama.cpp
+  (llama-simple, GGML_CUDA=OFF, -ngl 0, build b1-e8e6c7a)
+  agree BYTE-EXACT on 16 greedy tokens for "Once upon a time":
+  "Once upon a time, there was a little girl named Lily who
+  loved to explore the world around her". Confirms the MTP
+  block exclusion is correct past the old 4-token anchor.
+  256-expert telemetry over 16 forwards: 11400 activations,
+  52-108 unique experts per MoE layer, 27.4% of the 75x256
+  slots touched. Cold llama.cpp on the vx RAID: ~124 s/tok
+  (67min load + 33min decode), 171k major faults, 28.5GB RSS;
+  locus's 40min run was warm-cache (ran second) so not a fair
+  cold perf comparison -- the ~124 s/tok cold reference is the
+  real "GLM on spinning disk" datapoint.
 - Multimodal (K3 vision) is explicitly out of scope until the
   text path is proven.
 
