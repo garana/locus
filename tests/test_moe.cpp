@@ -1,5 +1,7 @@
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -327,6 +329,55 @@ TEST_CASE("readahead hints leave outputs bit-identical",
 
     REQUIRE(dense_on == dense_off);
     REQUIRE(moe_on == moe_off);
+}
+
+TEST_CASE("weight window drops file-backed experts losslessly",
+          "[moe]") {
+    ModelBuilder moe;
+    moe.common();
+    moe.tensor("blk.0.ffn_gate_inp.weight", {kE, 4},
+               weights(kE * 4, 80));
+    moe.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 81));
+    moe.tensor("blk.0.ffn_up_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 82));
+    moe.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
+               weights(kF * kE * 4, 83));
+    auto img = moe.build(4, 2);
+    const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 5};
+    auto ref = run(img, toks);
+
+    const auto path = std::filesystem::temp_directory_path() /
+                      "locus_weight_window_test.gguf";
+    {
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(img.data()),
+                static_cast<std::streamsize>(img.size()));
+    }
+    setenv("LOCUS_WEIGHT_WINDOW", "1", 1);
+    // File-backed: DONTNEED drops clean pages, later forwards
+    // re-read them from the file -- logits must not change.
+    {
+        auto g = locus::gguf::GgufFile::open(path.string());
+        REQUIRE(g.file_backed());
+        auto model = LlamaModel::load(g);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        for (auto t : toks) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(t, cache, seq, ws, logits);
+        }
+        cache.release(seq);
+        REQUIRE(logits == ref);
+    }
+    // In-memory image: the file_backed gate must keep DONTNEED
+    // away from anonymous pages (it would DISCARD them).
+    auto mem = run(img, toks);
+    unsetenv("LOCUS_WEIGHT_WINDOW");
+    REQUIRE(mem == ref);
+    std::filesystem::remove(path);
 }
 
 TEST_CASE("distinct experts diverge from the dense model",

@@ -297,6 +297,17 @@ Notes:
   locus's 40min run was warm-cache (ran second) so not a fair
   cold perf comparison -- the ~124 s/tok cold reference is the
   real "GLM on spinning disk" datapoint.
+- Memory bounding (2026-07-22, after llama.cpp's Metal
+  full-offload crashed the 32GB host): locus's dirty memory is
+  the KV pool + workspaces; weights are clean file-backed pages
+  the kernel can always evict. Two knobs tighten it further:
+  --ctx N caps the KV pool in tokens from the CLI, and
+  LOCUS_WEIGHT_WINDOW=1 madvises DONTNEED (inward-aligned) on
+  each layer's routed experts right after use so streamed
+  models never build up page-cache pressure -- gated on the
+  weights being file-backed, because DONTNEED on an anonymous
+  in-memory image would discard the contents. Statics, shared
+  experts and pinned weights are never dropped.
 - Multimodal (K3 vision) is explicitly out of scope until the
   text path is proven.
 

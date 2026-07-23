@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -41,6 +43,9 @@ inline constexpr const char* kCommonHelp =
     "  --backend NAME   select the math backend (see --backends)\n"
     "  --backends       list available backends and exit\n"
     "  --archs          list supported architectures and exit\n"
+    "  --ctx N          cap the KV pool at N tokens (bounds the\n"
+    "                   dirty memory a run can allocate; default\n"
+    "                   min(model context, 4096))\n"
     "  -h, --help       show this help and exit\n"
     "\n"
     "environment:\n"
@@ -55,13 +60,19 @@ inline constexpr const char* kCommonHelp =
     "                          (default: hardware cores; 1\n"
     "                          runs single-threaded)\n"
     "  LOCUS_PIN_STATIC=1      mlock non-expert weights at\n"
-    "                          load (streaming models; R9)\n";
+    "                          load (streaming models; R9)\n"
+    "  LOCUS_WEIGHT_WINDOW=1   drop routed-expert pages right\n"
+    "                          after use (madvise DONTNEED) so\n"
+    "                          streamed models never build up\n"
+    "                          memory pressure\n";
 
 /** Backend flags peeled off argv; the rest stays positional. */
 struct BackendArgs {
     std::vector<std::string> positional;
     /** From --backend NAME or --backend=NAME; empty if absent. */
     std::string choice;
+    /** From --ctx N: KV pool cap in tokens (0 = default). */
+    std::uint32_t ctx = 0;
     /** --backends was given: list and exit. */
     bool list = false;
     /** --archs was given: list architectures and exit. */
@@ -84,6 +95,12 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.choice = argv[++i];
         } else if (a.rfind("--backend=", 0) == 0) {
             out.choice = std::string(a.substr(10));
+        } else if (a == "--ctx" && i + 1 < argc) {
+            out.ctx = static_cast<std::uint32_t>(
+                std::atol(argv[++i]));
+        } else if (a.rfind("--ctx=", 0) == 0) {
+            out.ctx = static_cast<std::uint32_t>(
+                std::atol(std::string(a.substr(6)).c_str()));
         } else {
             out.positional.emplace_back(a);
         }

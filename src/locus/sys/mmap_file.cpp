@@ -74,6 +74,22 @@ void advise_willneed(const void* p, std::size_t n) {
                     n + (addr - base), MADV_WILLNEED);
 }
 
+void advise_dontneed(const void* p, std::size_t n) {
+    if (p == nullptr || n == 0) {
+        return;
+    }
+    static const std::size_t page =
+        static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    const auto addr = reinterpret_cast<std::uintptr_t>(p);
+    const std::uintptr_t base = (addr + page - 1) & ~(page - 1);
+    const std::uintptr_t end = (addr + n) & ~(page - 1);
+    if (end <= base) {
+        return;  // range smaller than one full page
+    }
+    (void)::madvise(reinterpret_cast<void*>(base), end - base,
+                    MADV_DONTNEED);
+}
+
 bool lock_resident(const void* p, std::size_t n) {
     if (p == nullptr || n == 0) {
         return true;

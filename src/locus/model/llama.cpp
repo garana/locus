@@ -142,6 +142,7 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
 
     LlamaModel m;
     m.spec_ = spec;
+    m.file_backed_ = g.file_backed();
     Hparams& hp = m.hp_;
     const std::string p = std::string(spec->name) + ".";
 
@@ -572,6 +573,24 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
         swiglu_into_acc(lay.gate_exps.expert(e),
                         lay.up_exps.expert(e),
                         lay.down_exps.expert(e), n_ff, wgt);
+    }
+    // Weight window (opt-in): drop this layer's routed experts
+    // right after use. Routing rarely repeats an expert on the
+    // next token, and statics/shared experts are never dropped,
+    // so the re-read cost is small while the resident set stays
+    // flat -- streamed models stop building memory pressure.
+    // file_backed_ gate: DONTNEED on an in-memory (anonymous)
+    // image would DISCARD the weights, not just evict them.
+    if (file_backed_ &&
+        std::getenv("LOCUS_WEIGHT_WINDOW") != nullptr) {
+        for (const auto& [e, wgt] : picked) {
+            sys::advise_dontneed(lay.gate_exps.expert(e).data,
+                                 lay.gate_exps.expert_bytes);
+            sys::advise_dontneed(lay.up_exps.expert(e).data,
+                                 lay.up_exps.expert_bytes);
+            sys::advise_dontneed(lay.down_exps.expert(e).data,
+                                 lay.down_exps.expert_bytes);
+        }
     }
     if (hp_.n_expert_shared > 0) {
         swiglu_into_acc(lay.gate_shexp, lay.up_shexp,

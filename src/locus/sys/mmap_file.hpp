@@ -59,4 +59,15 @@ void advise_willneed(const void* p, std::size_t n);
  */
 bool lock_resident(const void* p, std::size_t n);
 
+/**
+ * Tells the OS the clean file-backed pages FULLY inside
+ * [p, p+n) will not be needed again soon (madvise DONTNEED,
+ * aligned inward so a partial page shared with a neighboring
+ * tensor is never dropped). Best-effort: errors are ignored;
+ * the next access simply re-reads from the file. Used by the
+ * LOCUS_WEIGHT_WINDOW policy to keep streamed models from
+ * building up memory pressure.
+ */
+void advise_dontneed(const void* p, std::size_t n);
+
 }  // namespace locus::sys

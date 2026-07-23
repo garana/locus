@@ -27,11 +27,15 @@ add_executable(locus_tests
     test_moe.cpp
     test_dsa.cpp
     test_threads.cpp
+    test_cli_args.cpp
 )
 target_link_libraries(locus_tests PRIVATE locus catch2)
 target_include_directories(locus_tests SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/httplib
     ${CMAKE_SOURCE_DIR}/third_party/json
+)
+target_include_directories(locus_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/tools
 )
 target_compile_definitions(locus_tests PRIVATE
     LOCUS_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
