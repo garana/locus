@@ -27,13 +27,16 @@ Notation used throughout:
 In diagrams the dot product is written `q . k` (not `<q,k>`), to
 keep the diagram renderer happy.
 
-A note on the word "learned." This document describes inference:
-running a model whose training is already finished, which is what
-locus does. Every matrix below -- the projections `W_*` and the
-embedding `E` -- is a fixed table of numbers (its weights, or
-parameters) produced by a separate training process we do not cover.
-So "learned" here just means "a constant that training settled on";
-while locus runs, none of these tables change.
+A note on the word "learned." A model is produced in two separate
+phases. Training happens once, on large hardware, before the model
+ships: it searches for good values of all the numbers inside the
+model. Inference is running that finished model to produce output.
+locus only ever performs inference; it never trains. Every matrix
+below -- the projections `W_*` and the embedding `E` -- is a fixed
+table of numbers (its weights, or parameters) that training already
+fixed. So throughout this document "learned" simply means "a constant
+that training settled on"; while locus runs, none of these tables
+change.
 
 ## 1. What the model computes
 
@@ -41,8 +44,10 @@ A language model is a function from a sequence of tokens to a
 prediction of the next token.
 
 Tokenization -- how text becomes tokens. The models here use
-byte-pair encoding (BPE). A fixed vocabulary of about 150,000 tokens
-is built once, before training, and then reused unchanged. It is
+byte-pair encoding (BPE). A fixed vocabulary of `V` tokens (here `V`
+is about 150,000; `V` is just the number of distinct tokens, the
+vocabulary size) is built once, before training, and then reused
+unchanged. It is
 grown by merging: start with an alphabet of the 256 single bytes (so
 any text at all is expressible), scan a large corpus, repeatedly find
 the most frequent adjacent pair of existing tokens, and add that pair
@@ -63,12 +68,23 @@ in the worst case to individual bytes -- so there is never an
 prepended. From here on the model sees only these integer ids, never
 characters. (Code: `src/locus/tok/bpe_tokenizer.cpp`.)
 
-Its output is a vector `z in R^V` of scores called logits, one per
-vocabulary entry. To turn scores into an actual next token we use
-greedy decoding: pick the id with the largest score, `argmax_i z_i`.
-(One could instead sample randomly with probabilities proportional
-to `exp(z)`, but the tests use greedy decoding because it is
-deterministic and reproducible.)
+Its output is a vector `z in R^V` of scores called logits -- one per
+vocabulary token, so `z` has `V` entries. A logit is a raw,
+unnormalized score: any real number, positive or negative, where a
+larger value means the model favors that token more. Logits are not
+yet probabilities. To read them as probabilities one applies the
+softmax function: exponentiate every entry and divide by the total,
+`softmax(z)_i = exp(z_i) / sum_j exp(z_j)`, which makes the values
+nonnegative and sum to 1 (this function reappears inside attention
+and is treated again in Section 5.2). The name "logit" is historical:
+it is the log-odds that softmax turns back into a probability.
+
+For our tests we do not even need the probabilities. Greedy decoding
+picks the token with the largest logit, `argmax_i z_i` (the index `i`
+of the greatest entry) -- the same token softmax would rank first. We
+use greedy decoding because it is deterministic and reproducible;
+sampling a token at random in proportion to `softmax(z)` would be the
+usual alternative.
 
 Generation is autoregressive: predict the next token, append it to
 the sequence, and repeat.
@@ -190,10 +206,14 @@ itself against every earlier position `t` by a dot product, scaled:
 
     s_t  =  <q_n, k_t> / sqrt(d_head)
 
-The division by `sqrt(d_head)` (the per-head dimension, Section 5.5)
-keeps the scores from growing just because the vectors are
-high-dimensional. The scores become weights through the softmax
-function:
+Here `d_head` is the length of the query and key vectors. (We are
+describing one attention "head"; Section 5.5 splits the work into
+several heads, each operating on a `d_head`-sized slice, hence the
+name. For now just read it as the dimension of `q` and `k`.) Dividing
+by `sqrt(d_head)` keeps the scores from growing merely because the
+vectors are high-dimensional -- a dot product of two `d_head`-vectors
+with unit-scale entries grows like `sqrt(d_head)`. The scores become
+weights through the softmax function (Section 1):
 
     a_t  =  exp(s_t) / sum_{t'} exp(s_{t'})
 
@@ -238,7 +258,8 @@ specialize in different relationships.
 ### 5.6 Sharing keys and values: GQA
 
 The KV cache stores `h` keys and `h` values per position -- the
-dominant memory cost at long context. GQA (Grouped-Query Attention)
+dominant memory cost at long context (a long sequence, meaning many
+past positions to keep). GQA (Grouped-Query Attention)
 reduces it: keep all `h` query heads, but let groups of query heads
 share a single key/value head, so the cache holds only `h_kv < h`
 keys and values per token. Our `llama-3.2-1b` uses 32 query heads
@@ -303,8 +324,10 @@ variant SwiGLU (Swish-Gated Linear Unit):
 Two up-projections widen `x` to a larger inner dimension (`W_gate`
 and `W_up`), an elementwise gate multiplies them, and a
 down-projection returns to `R^d`. The nonlinearity `silu` (Sigmoid
-Linear Unit, `silu(z) = z * sigmoid(z)`) is a smooth curve; the
-"gate" term `silu(W_gate.x)` modulates the "up" term elementwise
+Linear Unit, `silu(z) = z * sigmoid(z)`, where the sigmoid
+`sigmoid(z) = 1/(1 + exp(-z))` is the S-shaped curve that squashes
+any real number into the open interval `(0,1)`) is a smooth curve;
+the "gate" term `silu(W_gate.x)` modulates the "up" term elementwise
 before the down-projection. Without a nonlinearity the whole stack
 would collapse to a single linear map, so this is where the model's
 expressive power beyond linear algebra enters. The FFN runs
@@ -362,23 +385,25 @@ latent (Section 9) and then sparse (Section 10).
 ## 8. More capacity without more compute: Mixture of Experts (MoE)
 
 A dense FFN applies the same `W_gate`/`W_up`/`W_down` to every
-token. A Mixture of Experts (MoE) layer instead keeps `E` separate
-FFNs, called experts, and uses only a few per token. A small linear
-router scores the experts, and a top-k selection decides which
-actually run. This decouples the parameter count from the
-per-token cost: `E` can be large (64, or 256) while only `k`
-experts (6, or 8) execute for any given token. The model stores a
-great deal but computes with little at a time.
+token. A Mixture of Experts (MoE) layer instead keeps `N` separate
+FFNs, called experts, and uses only a few per token. (We write the
+expert count as `N`, not `E`, to avoid clashing with the embedding
+matrix `E` of Section 2.) A small linear router scores the experts,
+then a top-k selection keeps the `k` highest-scoring ones -- `k` a
+small fixed number -- and only those run. This decouples the
+parameter count from the per-token cost: `N` can be large (64, or
+256) while only `k` experts (6, or 8) execute for any given token.
+The model stores a great deal but computes with little at a time.
 
 The selection procedure (the `moe_select` routine in the code):
 
-- router logits `r = W_router . x in R^E`: one score per expert.
+- router logits `r = W_router . x in R^N`: one score per expert.
 - turn scores into gate weights, one of two ways: softmax across all
   experts (they compete for a shared budget -- `deepseek-v2-lite`),
   or sigmoid on each expert independently (`moonlight`, `GLM`).
 - an optional per-expert selection bias is added for the RANKING
   only, not for the output weights.
-- group-limited routing (larger models): the `E` experts are split
+- group-limited routing (larger models): the `N` experts are split
   into groups; only the few best groups survive (ranked by the sum
   of each group's top-2 scores), and selection happens within them.
   This bounds how many groups a token touches -- and, when weights
@@ -391,9 +416,10 @@ Two further details our models use:
 
 - shared experts: a small number of experts that run for EVERY token
   (handling common computation), added on top of the routed ones.
-- leading dense layers: the first `n` layers are ordinary dense FFNs
-  and only later layers route (`n = 1` for deepseek/moonlight, `3`
-  for GLM). The earliest layers seem to benefit from full mixing.
+- leading dense layers: the first `M` layers are ordinary dense FFNs
+  and only later layers route (`M = 1` for deepseek/moonlight, `3`
+  for GLM; `M` chosen to avoid the position index `n`). The earliest
+  layers seem to benefit from full mixing.
 
 ```mermaid
 flowchart TD
@@ -526,11 +552,13 @@ flowchart TD
 
 ## 11. How the weights are stored: quantization
 
-Every section above assumed real-valued weights. Training produces
-them in F32 (32-bit IEEE-754 floating point), but storing 744
-billion of those would be about 3 terabytes. Quantization stores
-each weight in fewer bits -- as a small integer plus shared scale
-factors -- trading rounding error for size. The number to watch is
+Every section above assumed real-valued weights, grouped into tensors
+(a tensor is just one of the model's weight arrays -- every `W` and
+the embedding `E`). Training produces them in F32 (32-bit IEEE-754
+floating point, the standard binary format for real numbers), but
+storing 744 billion of those would be about 3 terabytes. Quantization
+stores each weight in fewer bits -- as a small integer plus shared
+scale factors -- trading rounding error for size. The number to watch is
 bits-per-weight (bpw). Every scheme dequantizes back to F32 before
 the matvec (or performs an equivalent integer dot product).
 
@@ -581,8 +609,8 @@ Reading the columns:
 
 - Attention: MHA/GQA/MLA (Sections 5, 9) with `heads` or
   `heads/kv_heads`; `+DSA` marks the sparse indexer of Section 10.
-- Feed-forward: `N dense` = the first N layers are dense FFNs
-  (Section 6); `MoE E/U + S shared` = an MoE layer of `E` experts,
+- Feed-forward: `M dense` = the first M layers are dense FFNs
+  (Section 6); `MoE N/U + S shared` = an MoE layer of `N` experts,
   `U` routed per token, plus `S` always-on shared experts
   (Section 8).
 - `79 (78+1)`: 78 causal layers plus one trailing MTP block that is
