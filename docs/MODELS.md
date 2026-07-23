@@ -1,196 +1,559 @@
-# Test-model architectures and information flow
+# How the models work: a linear-algebra walkthrough
 
-Information-flow diagrams for every model under `tests/models/`.
-The six model files map onto three architecture families the
-runtime implements (`src/locus/model/arch.cpp`): `llama`,
-`deepseek2`, and `glm-dsa`. Diagrams are per family; the
-inventory below maps each file to its family and the spec that
-drives its forward pass.
+This document explains, from the ground up, the machine that every
+model file under `tests/models/` runs. It is written for a reader
+who is comfortable with vectors, matrices, and dot products but has
+never studied neural networks or AI. Read it top to bottom: each
+section uses only ideas introduced before it. The last sections
+list the actual model files, now that every term in them has a
+meaning, and point to where each idea lives in the code.
 
-## 1. Inventory
+Acronyms are spelled out the first time they appear (and again when
+reintroduced far from their definition); a full table is in the
+final "Acronyms" section.
 
-| Model file            | Arch      | Quant  | Layers    | Attn        | FFN            |
-|-----------------------|-----------|--------|-----------|-------------|----------------|
-| stories260K           | llama     | F32    | 5         | MHA 8       | dense          |
-| llama-3.2-1b-q8_0     | llama     | Q8_0   | 16        | GQA 32/8    | dense          |
-| llama-3.2-1b-q4_k_m   | llama     | Q4_K_M | 16        | GQA 32/8    | dense          |
-| deepseek-v2-lite      | deepseek2 | Q4_K_M | 27        | MLA 16      | 1d, MoE 64/6+2s |
-| moonlight-16b-a3b     | deepseek2 | Q4_K_M | 27        | MLA 16/1    | 1d, MoE 64/6+2s |
-| glm-5.2-iq1s          | glm-dsa   | IQ1_S  | 79 (78+1) | MLA+DSA 64/1 | 3d, MoE 256/8+1s |
+Notation used throughout:
 
-Attn column: MHA/GQA/MLA with `heads` or `heads/kv_heads`. FFN
-column: `Nd` = N leading dense layers, `MoE E/U+Ss` = E experts,
-U routed per token, S always-on shared experts.
+- Lowercase `x in R^d` is a column vector of `d` real numbers.
+- Uppercase `W in R^{m x n}` is a matrix (`m` rows, `n` columns).
+- `W.x` is the matrix-vector product (result in `R^m`).
+- `<a,b> = sum_i a_i b_i` is the dot product of two vectors.
+- `a * b` is elementwise multiplication; `c*x` is scalar times
+  vector.
+- A "token" is one chunk of input text (a word or word-piece)
+  identified by an integer id. The "sequence" is the tokens seen so
+  far; a token's "position" is its index in the sequence.
 
-Key differences that change the diagrams:
+In diagrams the dot product is written `q . k` (not `<q,k>`), to
+keep the diagram renderer happy.
 
-- llama uses materialized-KV attention (MHA or GQA); deepseek2
-  and glm-dsa use MLA latent attention (one compressed row per
-  token in the cache).
-- deepseek-v2-lite gates experts with softmax; moonlight and
-  GLM-5.2 gate with sigmoid + group-limited routing.
-- Only glm-dsa runs the DSA lightning indexer; the trailing MTP
-  block (layer 78) is loaded but excluded from the causal stack,
-  matching llama.cpp.
+## 1. What the model computes
 
-## 2. Shared forward skeleton
+A language model is a function from a sequence of tokens to a
+prediction of the next token. Text is first cut into tokens, each a
+small integer drawn from a fixed vocabulary of size `V` (about
+150,000 here). The model never sees letters, only these ids.
 
-Every model is the same outer loop; the family only changes what
-happens inside the Attention and FFN blocks.
+Its output is a vector `z in R^V` of scores called logits, one per
+vocabulary entry. To turn scores into an actual next token we use
+greedy decoding: pick the id with the largest score, `argmax_i z_i`.
+(One could instead sample randomly with probabilities proportional
+to `exp(z)`, but the tests use greedy decoding because it is
+deterministic and reproducible.)
+
+Generation is autoregressive: predict the next token, append it to
+the sequence, and repeat.
+
+```mermaid
+flowchart LR
+  s["tokens so far: t_1 .. t_n"] --> M["the model (sections 2-11)"]
+  M --> z["logits z in R^V"]
+  z --> a["argmax -> t_{n+1}"]
+  a --> s
+```
+
+Everything that follows is the inside of the "model" box: how the
+tokens `t_1 .. t_n` become the score vector `z`.
+
+## 2. From token ids to vectors: embeddings and the residual stream
+
+A token id is just an index; on its own it has no geometry, no
+notion of "close to" or "far from" another token. The first step
+attaches a vector to each id. An embedding matrix `E in R^{V x d}`
+stores one row per vocabulary entry; token id `t` becomes its row
+`E_t in R^d`. The number `d` (2048 to 6144 in our models) is the
+model dimension, also called the hidden size.
+
+From here the model transforms one vector `x in R^d` per position
+through a stack of `L` identical layers. This running vector is
+called the residual stream. Each layer reads `x`, computes a
+correction, and adds it back:
+
+    x  <-  x + correction
+
+Because every update is additive, a layer is "the identity plus a
+learned perturbation." That additive structure is what lets the
+stack be dozens of layers deep without the signal blowing up or
+fading to zero as it passes through.
+
+At the very end, the final `x` is turned back into vocabulary
+logits (Section 7).
+
+## 3. Keeping numbers in range: normalization
+
+As corrections accumulate, the magnitude of `x` could drift. So
+before each layer uses `x`, it normalizes a copy. The models use
+RMSNorm (Root-Mean-Square Normalization):
+
+    rmsnorm(x)_i  =  x_i / sqrt( (1/d) * sum_j x_j^2  +  eps )  *  g_i
+
+It divides every entry by the root-mean-square of the vector
+(making it unit length in the RMS sense), then multiplies
+elementwise by a learned gain vector `g`. The term `eps` (epsilon)
+is a tiny constant so the division stays safe when `x` is near
+zero.
+
+RMSNorm does not subtract the mean. The older and more common
+LayerNorm (Layer Normalization) does: it centers `x` (subtracts its
+mean) and then scales. One component of the GLM model uses LayerNorm
+(Section 10); everywhere else these models use RMSNorm.
+
+## 4. The one operation everything is built from: the linear layer
+
+Nearly every learned transformation below is a matrix times a
+vector, `y = W.x`. This "matvec" (matrix-vector product) is more
+than 95% of the arithmetic the model does. The entries of `W` are
+learned numbers called weights; when a model is said to have "744
+billion parameters," it means its `W` matrices together hold that
+many numbers.
+
+Two shapes recur:
+
+- a down-projection `W in R^{r x d}` with `r < d`: compress a vector
+  into a smaller `r`-dimensional space.
+- an up-projection `W in R^{d x r}`: expand back to `d`.
+
+Chaining a down- then an up-projection, `W_up.(W_down.x)`, routes a
+large `d x d` transformation through a thin `r`-dimensional
+bottleneck, using far fewer parameters than a full `d x d` matrix.
+This low-rank factorization idea returns twice later (query
+compression and the MLA latent, Sections 8-9). Keep it in mind.
+
+## 5. Attention: letting positions talk to each other
+
+So far each position is processed alone. Attention is the only
+operation that mixes information across positions -- it is how a
+pronoun reaches its antecedent, or how a fact stated early informs
+an answer produced late. We build it up piece by piece.
+
+### 5.1 Queries, keys, values
+
+From each position's normalized vector `x`, three separate linear
+layers (Section 4) produce three vectors:
+
+- query  `q = W_q.x`  -- "what am I looking for"
+- key    `k = W_k.x`  -- "what do I offer to others"
+- value  `v = W_v.x`  -- "what I will contribute if selected"
+
+### 5.2 Scores and the weighted average
+
+The position we are computing (the query, at position `n`) compares
+itself against every earlier position `t` by a dot product, scaled:
+
+    s_t  =  <q_n, k_t> / sqrt(d_head)
+
+The division by `sqrt(d_head)` (the per-head dimension, Section 5.5)
+keeps the scores from growing just because the vectors are
+high-dimensional. The scores become weights through the softmax
+function:
+
+    a_t  =  exp(s_t) / sum_{t'} exp(s_{t'})
+
+The `a_t` are nonnegative and sum to 1 -- a probability distribution
+over earlier positions. The head's output is the weighted average of
+those positions' values:
+
+    out  =  sum_t a_t * v_t
+
+So each position pulls in a blend of earlier values, weighted by how
+well its query matches each earlier key.
+
+### 5.3 Causal: only the past
+
+The index `t` ranges only over positions `<= n`: a position may
+attend to itself and to earlier tokens, never to future ones. This
+is what makes left-to-right generation self-consistent -- the
+prediction at position `n` cannot depend on tokens not yet produced.
+
+### 5.4 The KV cache
+
+To score position `n` we need the keys and values of all earlier
+positions. Those never change once computed, so we store them. The
+KV cache (Key/Value cache) holds every past `k_t` and `v_t`.
+Generating one new token then costs: compute its single new `(k,v)`,
+append to the cache, and read the whole cache. Without the cache we
+would recompute all earlier keys and values at every step. (In
+locus this cache is stored in fixed-size blocks called pages -- a
+"paged KV cache" -- so many independent sequences can share one pool
+of memory and common prefixes need not be duplicated.)
+
+### 5.5 Multiple heads: MHA
+
+A single query-key comparison can track one kind of relationship.
+Multi-Head Attention (MHA) runs `h` of them in parallel: the
+projections are split into `h` independent heads, each with its own
+`d_head`-dimensional query, key, and value (with `h * d_head = d`).
+Each head does Sections 5.1-5.2 in its own subspace, and the `h`
+outputs are concatenated back into an `R^d` vector. Different heads
+specialize in different relationships.
+
+### 5.6 Sharing keys and values: GQA
+
+The KV cache stores `h` keys and `h` values per position -- the
+dominant memory cost at long context. GQA (Grouped-Query Attention)
+reduces it: keep all `h` query heads, but let groups of query heads
+share a single key/value head, so the cache holds only `h_kv < h`
+keys and values per token. Our `llama-3.2-1b` uses 32 query heads
+over 8 KV heads (4:1 sharing); `stories260K` uses 8 over 8, i.e. no
+sharing, which is plain MHA. The quality cost is small and the cache
+shrinks by the sharing factor.
+
+### 5.7 Where does position come from? RoPE
+
+Nothing above depends on WHERE a token sits: dot products do not
+care about order. Position must be injected deliberately. RoPE
+(Rotary Position Embedding) does it by rotation. Take the query and
+key in two-dimensional coordinate pairs and rotate each pair by an
+angle proportional to (position index) times (a per-pair frequency).
+Writing `R(theta)` for the 2x2 rotation matrix, the query at
+position `n` is rotated by `R(n*f)` and the key at position `t` by
+`R(t*f)`. Their dot product then depends on
+
+    R(n*f)^T R(t*f)  =  R((t-n)*f)
+
+-- a function of the RELATIVE offset `t - n` only. So attention
+automatically perceives relative distance, with no extra inputs.
+
+The pairing of coordinates has two conventions:
+
+- interleaved: pair adjacent dimensions `(2i, 2i+1)`. The llama
+  models use this.
+- half-split: pair `(i, i+d/2)`. The GLM indexer (Section 10) uses
+  this.
+
+The math is identical; only the bookkeeping differs, and each model
+must use the convention it was trained with. A "rope base" (for
+example 500000) sets the spread of frequencies: a larger base gives
+longer wavelengths and supports longer contexts.
+
+Putting one head together:
 
 ```mermaid
 flowchart TD
-    tok["token id"] --> emb["embedding lookup (dequant row)"]
-    emb --> x["hidden state x"]
-    x --> L{"for each layer l"}
-    L --> an["rmsnorm attn_norm"]
-    an --> attn["ATTENTION (family-specific)"]
-    attn --> wo["output proj wo"]
-    wo --> r1["residual add: x += attn_out"]
-    r1 --> fn["rmsnorm ffn_norm"]
-    fn --> ffn["FFN: dense OR MoE (family-specific)"]
-    ffn --> r2["residual add: x += ffn_out"]
-    r2 --> L
-    L -->|done| on["rmsnorm output_norm"]
-    on --> outw["output proj (tied or output.weight)"]
-    outw --> logits["logits over vocab -> argmax"]
+  x["normed x (position n)"] --> q["q = W_q.x"]
+  x --> k["k = W_k.x"]
+  x --> v["v = W_v.x"]
+  q --> rq["RoPE(q)"]
+  k --> rk["RoPE(k)"]
+  rk --> C["KV cache: append (k,v); holds t = 1..n"]
+  v --> C
+  rq --> S["s_t = (q . k_t)/sqrt(d_head), t = 1..n"]
+  C --> S
+  S --> A["a = softmax(s)"]
+  A --> O["out = sum_t a_t * v_t"]
 ```
 
-## 3. llama family
+## 6. The other half of a layer: the feed-forward network
 
-Models: stories260K, llama-3.2-1b (Q8_0 and Q4_K_M).
-Dense FFN; attention is multi-head, with grouped KV (GQA) when
-`head_count_kv < head_count` (llama-3.2 is 32/8, stories260K is
-8/8 = plain MHA). RoPE is the interleaved-pair variant; llama-3.2
-carries a large rope base (500000) and optional llama3 scaling
-divisors.
+Attention mixes across positions; the second sublayer transforms
+each position on its own. It is a feed-forward network (FFN), also
+called an MLP (Multi-Layer Perceptron). Our models use the gated
+variant SwiGLU (Swish-Gated Linear Unit):
+
+    FFN(x)  =  W_down . ( silu(W_gate . x) * (W_up . x) )
+
+Two up-projections widen `x` to a larger inner dimension (`W_gate`
+and `W_up`), an elementwise gate multiplies them, and a
+down-projection returns to `R^d`. The nonlinearity `silu` (Sigmoid
+Linear Unit, `silu(z) = z * sigmoid(z)`) is a smooth curve; the
+"gate" term `silu(W_gate.x)` modulates the "up" term elementwise
+before the down-projection. Without a nonlinearity the whole stack
+would collapse to a single linear map, so this is where the model's
+expressive power beyond linear algebra enters. The FFN runs
+identically and independently at every position.
+
+## 7. A complete layer and the output: the "llama" family
+
+We now have both sublayers. One layer is:
+
+    x  <-  x + Attention( rmsnorm(x) )     (mix across positions)
+    x  <-  x + FFN( rmsnorm(x) )           (transform each position)
+
+Note the normalization before each sublayer and the residual add
+around it (this "pre-norm" arrangement is what Sections 2-3 set up).
+Stack `L` such layers. After the last one, a final RMSNorm and one
+more linear map produce the logits:
+
+    z  =  W_out . rmsnorm(x)     in R^V
+
+Often `W_out` is not stored separately: tied embeddings reuse the
+embedding matrix, `W_out = E`, so `z_t = <E_t, x>` scores the final
+state against every vocabulary vector. Then `argmax(z)` is the
+predicted token.
+
+This complete machine -- embeddings, then `L` layers of
+{MHA-or-GQA attention with RoPE, SwiGLU FFN}, then a final norm and
+output projection -- is the llama family, the simplest of the three
+in `tests/models/`. Our `stories260K` (a tiny 5-layer test network)
+and `llama-3.2-1b` (16 layers) are exactly this.
+
+The full forward pass, drawn once. Only the two boxes marked
+"family-specific" differ between the three families; everything
+else is shared.
 
 ```mermaid
 flowchart TD
-    xb["normed x"] --> q["Q = wq . x"]
-    xb --> k["K = wk . x"]
-    xb --> v["V = wv . x"]
-    q --> rq["RoPE(Q)"]
-    k --> rk["RoPE(K)"]
-    rk --> kv["append K,V to paged cache"]
-    v --> kv
-    rq --> sc["per head: scores = Q . K_t * scale"]
-    kv --> sc
-    sc --> sm["softmax over positions"]
-    sm --> av["out_h = sum_t a_t . V_t"]
-    av --> ao["attention output"]
-
-    ao -.wo + residual.-> ffnorm["normed x (ffn)"]
-    ffnorm --> g["gate = w_gate . x"]
-    ffnorm --> u["up = w_up . x"]
-    g --> si["silu(gate) * up"]
-    u --> si
-    si --> d["w_down"]
-    d --> out["dense FFN output"]
+  tok["token id t_n"] --> emb["embedding: x = E_t"]
+  emb --> L{"for each layer 1..L"}
+  L --> an["rmsnorm"]
+  an --> attn["ATTENTION (family-specific)"]
+  attn --> r1["x += attention output"]
+  r1 --> fn["rmsnorm"]
+  fn --> ffn["FFN: dense or MoE (family-specific)"]
+  ffn --> r2["x += FFN output"]
+  r2 --> L
+  L -->|done| on["final rmsnorm"]
+  on --> outw["z = W_out . x  (tied to E if no output matrix)"]
+  outw --> arg["argmax(z) -> next token"]
 ```
 
-## 4. deepseek2 family (MLA + DeepSeek MoE)
+The other two families each change exactly one of those boxes: the
+FFN becomes a Mixture of Experts (Section 8), and ATTENTION becomes
+latent (Section 9) and then sparse (Section 10).
 
-Models: deepseek-v2-lite, moonlight-16b-a3b. MLA weight-absorbed
-attention caches one latent row (rms-normed compressed KV plus a
-shared roped key) per token instead of full K/V heads. FFN is
-dense for the leading layer(s) then DeepSeek MoE (routed experts
-+ always-on shared experts). deepseek-v2-lite uses softmax
-gating; moonlight uses sigmoid gating.
+## 8. More capacity without more compute: Mixture of Experts (MoE)
+
+A dense FFN applies the same `W_gate`/`W_up`/`W_down` to every
+token. A Mixture of Experts (MoE) layer instead keeps `E` separate
+FFNs, called experts, and uses only a few per token. A small linear
+router scores the experts, and a top-k selection decides which
+actually run. This decouples the parameter count from the
+per-token cost: `E` can be large (64, or 256) while only `k`
+experts (6, or 8) execute for any given token. The model stores a
+great deal but computes with little at a time.
+
+The selection procedure (the `moe_select` routine in the code):
+
+- router logits `r = W_router . x in R^E`: one score per expert.
+- turn scores into gate weights, one of two ways: softmax across all
+  experts (they compete for a shared budget -- `deepseek-v2-lite`),
+  or sigmoid on each expert independently (`moonlight`, `GLM`).
+- an optional per-expert selection bias is added for the RANKING
+  only, not for the output weights.
+- group-limited routing (larger models): the `E` experts are split
+  into groups; only the few best groups survive (ranked by the sum
+  of each group's top-2 scores), and selection happens within them.
+  This bounds how many groups a token touches -- and, when weights
+  are streamed from disk, how many bytes are read per token.
+- pick the top-k experts; optionally renormalize their weights to
+  sum to 1 and multiply by a constant.
+- output = `sum over chosen experts  w_e * FFN_e(x)`.
+
+Two further details our models use:
+
+- shared experts: a small number of experts that run for EVERY token
+  (handling common computation), added on top of the routed ones.
+- leading dense layers: the first `n` layers are ordinary dense FFNs
+  and only later layers route (`n = 1` for deepseek/moonlight, `3`
+  for GLM). The earliest layers seem to benefit from full mixing.
 
 ```mermaid
 flowchart TD
-    xb["normed x"] --> qy{"q_lora_rank > 0 ?"}
-    qy -->|no: direct| q["Q = wq . x"]
-    qy -->|yes| qa["wq_a -> rmsnorm q_a_norm -> wq_b"]
-    qa --> q
-    xb --> kva["wkv_a -> [c_kv | k_pe]"]
-    kva --> ckv["rmsnorm(c_kv) = latent"]
-    kva --> kpe["RoPE(k_pe) shared key"]
-    ckv --> cache["cache latent row (kv_lora + rope)"]
-    kpe --> cache
-
-    q --> abs["per head: absorb via wk_b / wkv_b"]
-    abs --> sc["scores = q_abs . latents + q_pe . k_pe"]
-    cache --> sc
-    sc --> sm["softmax"]
-    sm --> wl["weighted latent = sum a_t . c_kv(t)"]
-    cache --> wl
-    wl --> uv["W_uv (wv_b / wkv_b) -> out_h"]
-
-    uv -.wo + residual.-> fn{"layer < n_dense_lead ?"}
-    fn -->|yes: dense| dense["dense FFN (gate/up/silu/down)"]
-    fn -->|no: MoE| route["gate_inp -> moe_select"]
-    route --> exps["top-k routed experts: gate/up/silu/down"]
-    route --> shexp["shared experts (always on)"]
-    exps --> acc["weighted sum -> FFN output"]
-    shexp --> acc
+  x["normed x"] --> r["router logits = W_router.x"]
+  r --> g{"gating"}
+  g -->|softmax across experts| gw["gate weights"]
+  g -->|sigmoid per expert| gw
+  gw --> b["+ selection bias (ranking only)"]
+  b --> grp["group-limited: keep the best groups"]
+  grp --> tk["pick top-k experts"]
+  tk --> nz["renormalize, times scale"]
+  nz --> mix["out = sum_e w_e * FFN_e(x)  (plus shared experts)"]
 ```
 
-MoE routing (`moe_select`, shared by CPU and GPU):
+`deepseek-v2-lite` and `moonlight` are the llama skeleton with this
+MoE feed-forward and the latent attention of the next section.
+
+## 9. Shrinking the KV cache: Multi-head Latent Attention (MLA)
+
+Recall from Sections 5.4 and 5.6 that the KV cache -- `h_kv` keys
+and values per token -- is the memory bottleneck. Multi-head Latent
+Attention (MLA) shrinks it to ONE small vector per token, using the
+low-rank factorization from Section 4.
+
+Instead of storing per-head keys and values, MLA stores a single
+compressed latent `c_kv in R^r` (`r = kv_lora`, 512 in our models),
+produced by a down-projection of `x`, plus one shared rotary key
+`k_pe`. The trick that keeps attention correct without ever
+rebuilding per-head keys is weight absorption -- a plain algebraic
+identity:
+
+    <q, W_uk c>  =  <W_uk^T q, c>
+
+Here `W_uk` is the up-projection that would reconstruct a head's key
+from the latent. Rather than reconstruct the key (left side), we
+fold `W_uk` into the query once (right side): precompute
+`q_abs = W_uk^T q` and dot it directly against the stored latent
+`c_kv`. The value side works symmetrically, with an up-projection
+`W_uv` applied AFTER the weighted average, so values are never
+materialized per token either:
+
+    out_head  =  W_uv . ( sum_t a_t * c_kv(t) )
+
+The score has two parts: the compressed part `<q_abs, c_kv>` plus a
+rotary part `<q_pe, k_pe>` that carries position. (RoPE lives on its
+own small slice, because a position-dependent rotation cannot be
+folded into a static matrix the way `W_uk` was.)
+
+MLA also compresses the query path itself with the same low-rank
+factorization, here called a LoRA (Low-Rank Adaptation):
+`x -> W_q_a` (down to a small rank) `-> rmsnorm -> W_q_b` (up). GLM
+uses this query compression; the smaller models project the query
+directly.
+
+The net effect: the cache is one `r`-vector per token instead of
+`2 * h_kv * d_head` numbers -- roughly an order of magnitude smaller
+-- at the price of a little extra arithmetic (the absorptions). This
+is the deepseek2 family: MLA attention with an MoE feed-forward.
 
 ```mermaid
 flowchart TD
-    rl["router logits = gate_inp . x"] --> gf{"gating func"}
-    gf -->|softmax| sfx["softmax"]
-    gf -->|sigmoid| sig["sigmoid"]
-    sfx --> bias["+ selection bias (exp_probs_b)"]
-    sig --> bias
-    bias --> grp["group-limited routing (top groups by top-2 sum)"]
-    grp --> topk["pick top-k experts"]
-    topk --> nrm["optional renorm * expert_weights_scale"]
-    nrm --> out["(expert, weight) pairs"]
+  x["normed x"] --> qp["query: direct, or LoRA (down, rmsnorm, up)"]
+  x --> kv["W_kv_a.x -> [ c_kv | k_pe ]"]
+  kv --> cn["c_kv = rmsnorm(c_kv)"]
+  kv --> kr["k_pe = RoPE(k_pe)"]
+  cn --> C["latent cache: store [c_kv | k_pe], one row per token"]
+  kr --> C
+  qp --> ab["q_abs = W_uk^T q   (weight absorption)"]
+  ab --> sc["s_t = (q_abs . c_kv(t)) + (q_pe . k_pe(t))"]
+  C --> sc
+  sc --> a["a = softmax(s)"]
+  a --> wl["latent average = sum_t a_t * c_kv(t)"]
+  C --> wl
+  wl --> ov["out = W_uv . (latent average)"]
 ```
 
-## 5. glm-dsa (MLA + DeepSeek MoE + DSA indexer)
+## 10. Long context cheaply: the DSA sparse-attention indexer
 
-Model: GLM-5.2 (744B, UD-IQ1_S). Computationally the deepseek2
-stack (MLA + q_lora + split k_b/v_b, sigmoid gating, 256 experts
-/ 8 used / 1 shared, 3 dense-lead layers, rope base 8e6) with one
-addition: the DSA lightning indexer selects which cached
-positions MLA attends. Below `indexer.top_k` (2048) positions the
-selection keeps everything and the layer is identical to dense
-MLA (this is what the llama.cpp golden anchors); beyond it, only
-the top-k scored positions are attended. The trailing MTP block
-(layer 78) is excluded from the causal stack.
+Attention over all past positions costs work proportional to `n` at
+position `n` -- fine for short text, expensive at tens of thousands
+of tokens. GLM-5.2 adds DSA (DeepSeek Sparse Attention), a
+"lightning indexer" that, past a cutoff, lets each query attend to
+only the `top_k` most relevant earlier positions instead of all of
+them.
+
+A cheap secondary scorer runs before the main MLA attention:
+
+- each position caches a small indexer key
+  `k_idx = LayerNorm(W_ik . x)` -- this is the one place LayerNorm
+  (mean-centered, Section 3) is used, followed by RoPE in the
+  half-split convention.
+- the query builds per-head indexer queries `q_h` (from the same
+  query latent as MLA) and a set of per-head scalar weights
+  `w_h = W_wproj . x`.
+- earlier position `t` gets a relevance score
+
+      score(t)  =  sum_h  w_h * ReLU( <q_h, k_idx(t)> )
+
+  a head-weighted sum of rectified query-key similarities. ReLU
+  (Rectified Linear Unit, `ReLU(z) = max(0, z)`) zeroes out heads
+  that correlate negatively.
+- keep the `top_k` highest-scoring positions; MLA then attends only
+  those.
+
+Below `top_k` positions (2048), "keep the top_k" keeps everything,
+so the layer is exactly the dense MLA of Section 9. That is why a
+short-prompt run can validate the entire code path against a
+reference implementation. Above `top_k`, the cost is proportional to
+`top_k` rather than `n`.
+
+One loading detail: GLM ships an extra trailing block for MTP
+(Multi-Token Prediction) -- a head trained to guess the
+token-after-next, used to accelerate decoding in other systems. It
+is not part of the left-to-right forward pass, so locus loads its
+weights but excludes that block. This is the glm-dsa family: MLA
+plus MoE plus the DSA indexer.
 
 ```mermaid
 flowchart TD
-    xb["normed x"] --> idxk["idx_k = LayerNorm+bias(idx_k . x)"]
-    idxk --> rhk["half-split RoPE (non-interleaved)"]
-    rhk --> icache["cache indexer key (idx_dim)"]
-
-    xb --> cap{"positions > top_k ?"}
-    cap -->|no| mlaAll["MLA over ALL cached positions"]
-    cap -->|yes| idxq["idx queries from q latent (idx_q_b)"]
-    idxq --> rhq["half-split RoPE per head"]
-    rhq --> score["score(t) = sum_h w_h . ReLU(q_h . k_idx(t))"]
-    icache --> score
-    xb --> hw["head weights w = idx_proj . x"]
-    hw --> score
-    score --> sel["top-k positions (nth_element + sort)"]
-    sel --> mlaSel["MLA over SELECTED positions only"]
-
-    mlaAll --> ffn["FFN: dense x3 then sigmoid-gated MoE"]
-    mlaSel --> ffn
+  x["normed x"] --> ik["k_idx = LayerNorm(W_ik.x), half-split RoPE"]
+  ik --> IC["indexer-key cache"]
+  x --> cap{"positions above top_k ?"}
+  cap -->|no| all["MLA over ALL past (identical to dense)"]
+  cap -->|yes| iq["per-head q_h and weights w_h = W_wproj.x"]
+  iq --> sco["score(t) = sum_h w_h * ReLU(q_h . k_idx(t))"]
+  IC --> sco
+  sco --> top["keep top_k positions"]
+  top --> sel["MLA over the SELECTED positions only"]
 ```
 
-## 6. Attention families at a glance
+## 11. How the weights are stored: quantization
 
-```
-llama (MHA/GQA)      deepseek2 / glm-dsa (MLA)
------------------    -------------------------------
-cache: K,V per head  cache: 1 latent row per token
-  (kv_heads * head_    (kv_lora + rope; glm-dsa adds
-   dim, 2 tensors)      idx_dim for the indexer key)
-scores: Q . K        scores: absorbed q . latents
-                       + q_pe . k_pe
-value: sum a . V     value: W_uv (sum a . c_kv)
-select: all past     select: all past (deepseek2) or
-                       DSA top-k (glm-dsa > top_k)
-```
+Every section above assumed real-valued weights. Training produces
+them in F32 (32-bit IEEE-754 floating point), but storing 744
+billion of those would be about 3 terabytes. Quantization stores
+each weight in fewer bits -- as a small integer plus shared scale
+factors -- trading rounding error for size. The number to watch is
+bits-per-weight (bpw). Every scheme dequantizes back to F32 before
+the matvec (or performs an equivalent integer dot product).
 
-## 7. Where the diagrams live in code
+| Scheme | bpw   | How a weight is reconstructed                   |
+|--------|-------|-------------------------------------------------|
+| F32    | 32    | IEEE-754 single precision. The reference; no    |
+|        |       | quantization at all.                            |
+| F16    | 16    | IEEE-754 half precision. Same values, about 3   |
+|        |       | decimal digits of precision.                    |
+| Q8_0   | ~8.5  | Blocks of 32 weights share one F16 scale d;     |
+|        |       | each weight is an int8 q, and w = d * q.         |
+|        |       | Symmetric, near-lossless.                       |
+| Q4_K_M | ~4.5  | A "K-quant": super-blocks of 256, 4-bit         |
+|        |       | weights, with 6-bit per-sub-block (scale, min)  |
+|        |       | over an F16 super-scale, so w = d_sub*q + m_sub. |
+|        |       | The "_M" keeps a few sensitive tensors at higher|
+|        |       | precision -- a mixed-precision blend.           |
+| IQ1_S  | ~1.56 | Importance-aware: each block's weights are an   |
+|        |       | index into a fixed sign/magnitude codebook fit  |
+|        |       | to the weight distribution, times a per-block   |
+|        |       | scale. About 20x smaller than F32.              |
+
+The reconstruction is affine (an integer times a scale, plus an
+offset) for F16/Q8_0/Q4_K, or a codebook lookup for IQ1_S. Fewer
+bits per weight means a smaller file and coarser rounding: Q8_0 is
+essentially lossless, Q4_K_M is the usual quality/size sweet spot,
+and IQ1_S (about 1.56 bpw) is aggressive -- viable only because its
+codebook is fit to the actual weight distribution. IQ1_S is what
+lets a 744-billion-parameter model occupy 203 GB and stream from
+disk on a machine that could never hold it in memory.
+
+## 12. The models we run
+
+With every concept in hand, the inventory reads directly. All six
+files are stored in GGUF (the on-disk container format for weights
+plus metadata) under `tests/models/`.
+
+| Model file          | Family    | Quant  | Layers    | Attention    | Feed-forward             |
+|---------------------|-----------|--------|-----------|--------------|--------------------------|
+| stories260K         | llama     | F32    | 5         | MHA 8        | dense                    |
+| llama-3.2-1b-q8_0   | llama     | Q8_0   | 16        | GQA 32/8     | dense                    |
+| llama-3.2-1b-q4_k_m | llama     | Q4_K_M | 16        | GQA 32/8     | dense                    |
+| deepseek-v2-lite    | deepseek2 | Q4_K_M | 27        | MLA 16       | 1 dense, MoE 64/6 + 2 shared  |
+| moonlight-16b-a3b   | deepseek2 | Q4_K_M | 27        | MLA 16/1     | 1 dense, MoE 64/6 + 2 shared  |
+| glm-5.2-iq1s        | glm-dsa   | IQ1_S  | 79 (78+1) | MLA+DSA 64/1 | 3 dense, MoE 256/8 + 1 shared |
+
+Reading the columns:
+
+- Attention: MHA/GQA/MLA (Sections 5, 9) with `heads` or
+  `heads/kv_heads`; `+DSA` marks the sparse indexer of Section 10.
+- Feed-forward: `N dense` = the first N layers are dense FFNs
+  (Section 6); `MoE E/U + S shared` = an MoE layer of `E` experts,
+  `U` routed per token, plus `S` always-on shared experts
+  (Section 8).
+- `79 (78+1)`: 78 causal layers plus one trailing MTP block that is
+  loaded but not run.
+
+The three families differ in exactly the two boxes Section 7
+flagged:
+
+| Family    | Attention box     | Feed-forward box              |
+|-----------|-------------------|-------------------------------|
+| llama     | MHA / GQA         | dense SwiGLU                  |
+| deepseek2 | MLA               | dense (lead) then MoE         |
+| glm-dsa   | MLA + DSA indexer | dense (lead) then MoE         |
+
+And the two MoE models gate their experts differently:
+`deepseek-v2-lite` uses softmax gating, while `moonlight` and
+`GLM-5.2` use sigmoid gating with group-limited routing.
+
+## 13. Where each idea lives in the code
 
 | Stage                | Source                                        |
 |----------------------|-----------------------------------------------|
@@ -202,209 +565,27 @@ select: all past     select: all past (deepseek2) or
 | dense / MoE FFN      | `LlamaModel::forward` / `moe_ffn` (llama.cpp) |
 | expert routing       | `moe_select` (llama.cpp)                       |
 
-The rest of this file is a glossary for a reader comfortable with
-linear algebra but new to transformer internals. Notation: x in
-R^d is a column vector, W in R^{m x n} a matrix, W.x the matvec,
-<a,b> the dot product, `*` a scalar/elementwise product, `.` also
-used as "apply matrix". A "token" is one input symbol; a
-"position" is its index in the sequence.
+## 14. Acronyms
 
-## 8. Quantization
-
-A weight tensor is a real matrix W in R^{m x n} learned in F32.
-Quantization stores each entry in fewer bits as a low-precision
-integer plus one or more shared scales, trading rounding error
-for size. The headline number is bits-per-weight (bpw). All
-schemes below dequantize back to F32 (an affine or table map)
-before the matvec, unless a kernel does the integer dot directly.
-
-| Scheme | bpw   | Encoding                                       |
-|--------|-------|------------------------------------------------|
-| F32    | 32    | IEEE-754 single. The reference; no quantizing. |
-| F16    | 16    | IEEE-754 half. Same values, ~3 decimal digits. |
-| Q8_0   | ~8.5  | Blocks of 32: one F16 scale d, int8 q per      |
-|        |       | weight; w = d * q. Symmetric, near-lossless.   |
-| Q4_K_M | ~4.5  | K-quant: super-blocks of 256, 4-bit weights,   |
-|        |       | 6-bit per-sub-block (scale,min) over an F16     |
-|        |       | super scale; w = d_sub*q + m_sub. "_M" keeps a  |
-|        |       | few sensitive tensors higher -> mixed precision.|
-| IQ1_S  | ~1.56 | Importance-aware: each block's weights are an   |
-|        |       | index into a fixed sign/magnitude codebook fit  |
-|        |       | to the weight distribution, times a per-block   |
-|        |       | scale. ~20x smaller than F32 -- how 744B params |
-|        |       | fit in 203 GB. Heavy rounding, codebook-viable. |
-
-The trend: fewer bpw = smaller file, coarser rounding. Q8_0 is
-essentially lossless; Q4_K_M is the usual quality/size sweet
-spot; IQ1_S is aggressive and only works because the codebook is
-fit to the actual weights.
-
-## 9. What each diagram box computes
-
-For x in R^d the per-layer state and W_* learned matrices:
-
-- embedding lookup (dequant row): row t of the embedding matrix
-  E in R^{V x d}, dequantized to F32. Maps a token id to E_t in
-  R^d.
-- hidden state x: the "residual stream" vector in R^d carried
-  through every layer; each block reads a normalized copy and
-  adds its result back.
-- rmsnorm (attn_norm / ffn_norm / output_norm): root-mean-square
-  normalization, y_i = x_i / sqrt(mean_j x_j^2 + eps) * g_i, with
-  g a learned diagonal gain. Rescales x to unit RMS; no
-  mean-centering (that is the difference from LayerNorm).
-- ATTENTION: the only sequence-mixing operator -- produces a
-  context vector as a softmax-weighted average over past tokens
-  (per-family math in sections 3-5). Everything else is
-  position-wise.
-- output proj wo: linear map W_o applied to the concatenated
-  per-head attention outputs, back to R^d.
-- residual add: x <- x + sublayer(rmsnorm(x)). The skip
-  connection; makes each block an identity-plus-perturbation.
-- FFN (dense): position-wise gated MLP (SwiGLU),
-  down( silu(W_gate.x) * (W_up.x) ), applied to each token
-  independently. silu(z) = z * sigmoid(z).
-- FFN (MoE): same MLP shape, but the (gate,up,down) matrices are
-  chosen per token from a bank of experts (section on routing).
-- output proj (tied or output.weight): final linear map
-  R^d -> R^V to vocabulary logits; "tied" reuses E^T when there
-  is no separate output matrix.
-- logits -> argmax: z in R^V; greedy decoding emits argmax_i z_i.
-
-llama attention:
-
-- Q=wq.x, K=wk.x, V=wv.x: linear projections into per-head query,
-  key, value subspaces.
-- RoPE(Q)/RoPE(K): rotary position embedding -- rotate 2D
-  coordinate pairs of Q,K by angle theta proportional to
-  position * frequency. Encodes RELATIVE position because
-  R(theta_a)^T R(theta_b) depends only on b - a.
-- append K,V to paged cache: store this token's K,V so later
-  tokens can attend to it.
-- scores = Q.K_t * scale: inner products <q, k_t> over past t,
-  scaled by 1/sqrt(head_dim).
-- softmax over positions: a = exp(s) / sum exp(s), a probability
-  vector over past positions.
-- out_h = sum_t a_t * V_t: convex combination of past values.
-
-deepseek2 / MLA attention:
-
-- q_lora branch: low-rank query, x -> wq_a (down to rank r) ->
-  rmsnorm -> wq_b (up). A factored W_q = wq_b.wq_a.
-- wkv_a -> [c_kv | k_pe]: one projection yielding a compressed
-  KV latent c_kv in R^{kv_lora} and a shared rotary key k_pe.
-- rmsnorm(c_kv) = latent; RoPE(k_pe): normalize the latent,
-  position-encode the shared key.
-- cache latent row: store [normalized c_kv | roped k_pe] -- one
-  vector per token instead of full per-head K,V (the MLA memory
-  win).
-- absorb via wk_b/wkv_b: weight absorption -- precompute
-  q_abs = W_uk^T q so scores run directly against the latent,
-  never materializing per-head K.
-- scores = q_abs.latents + q_pe.k_pe: split inner product,
-  compressed part plus rotary part.
-- weighted latent = sum_t a_t * c_kv(t): average in latent space.
-- W_uv -> out_h: decompress the averaged latent to the output
-  space.
-
-MoE routing:
-
-- router logits = gate_inp.x: score every expert, r in R^E.
-- softmax / sigmoid: map logits to gate weights (normalized
-  across experts, vs independent per expert).
-- + selection bias (exp_probs_b): additive per-expert bias used
-  only to SELECT experts, not to weight their outputs.
-- group-limited routing: partition experts into groups, keep the
-  top groups (ranked by sum of each group's top-2 scores), select
-  within them -- bounds how many groups a token touches.
-- pick top-k experts: keep the k highest-scoring.
-- optional renorm * expert_weights_scale: renormalize kept
-  weights to sum 1, times a constant.
-- (expert, weight) pairs: the sparse mixture applied to outputs.
-
-glm-dsa indexer:
-
-- idx_k = LayerNorm+bias(idx_k.x): the per-position indexer key.
-  LayerNorm here (mean-centered), unlike the rmsnorm elsewhere.
-- half-split RoPE (non-interleaved): rotary on the (i, i+d/2)
-  pairing rather than adjacent (2i, 2i+1) pairs.
-- cache indexer key: store it to score future queries.
-- idx queries from q latent (idx_q_b): per-head indexer queries
-  off the shared query latent.
-- head weights w = idx_proj.x: a scalar weight per indexer head.
-- score(t) = sum_h w_h * ReLU(<q_h, k_idx(t)>): head-weighted,
-  rectified relevance of past position t.
-- top-k positions: select top_k by score (nth_element, then sort
-  to keep positions ascending).
-- MLA over selected: run MLA restricted to those positions.
-
-## 10. Acronyms
-
-| Term     | Expansion                | One line                         |
-|----------|--------------------------|----------------------------------|
-| MHA      | Multi-Head Attention     | h independent Q/K/V subspaces    |
-| GQA      | Grouped-Query Attention  | query heads share a K/V head     |
-| MLA      | Multi-head Latent Attn   | cache a low-rank latent, not K/V |
-| DSA      | DeepSeek Sparse Attn     | attend a selected position subset|
-| MoE      | Mixture of Experts       | per-token choice of FFN weights  |
-| FFN/MLP  | Feed-Forward / perceptron| the position-wise sublayer       |
-| KV       | Key / Value              | the tensors attention caches     |
-| RoPE     | Rotary Position Embedding| position via coordinate rotation |
-| RMSNorm  | Root-Mean-Square Norm    | scale to unit RMS, learned gain  |
-| LayerNorm| Layer Normalization      | mean-center then scale           |
-| SwiGLU   | Swish-Gated Linear Unit  | silu(gate) * up MLP              |
-| SiLU     | Sigmoid Linear Unit      | silu(z) = z * sigmoid(z)         |
-| ReLU     | Rectified Linear Unit    | max(0, z)                        |
-| LoRA     | Low-Rank Adaptation      | W as a product of two thin mats  |
-| MTP      | Multi-Token Prediction   | the extra nextn block            |
-| GGUF     | (model container format) | the on-disk weights + metadata   |
-| bpw      | bits per weight          | quantization density             |
-| eps      | epsilon                  | small constant for stability     |
-
-## 11. Concepts
-
-- Residual stream: x in R^d threaded through all layers; each
-  sublayer adds sublayer(rmsnorm(x)). The network is a sum of
-  contributions (identity + perturbation), which is what lets it
-  go deep without vanishing signal.
-- Materialized-KV attention (MHA / GQA): the classic form --
-  cache the full key K_t and value V_t per token; scores are
-  <q, k_t>, output sum softmax_t * V_t. GQA shares one K/V head
-  across a group of query heads, shrinking the cache by the group
-  factor with almost no quality loss.
-- MLA latent attention: cache one compressed c_kv in R^{kv_lora}
-  per token plus a shared rotary key, instead of per-head K,V.
-  Weight absorption rewrites <q, k> as <W_uk^T q, c_kv>, so
-  per-head K is never formed; the value is recovered by W_uv on
-  the averaged latent. ~order-of-magnitude smaller cache for a
-  little extra compute.
-- Weight absorption: the identity q^T (W_uk c) = (W_uk^T q)^T c.
-  Precomputing W_uk^T q makes scores a dot against the latent.
-- Mixture of Experts: the FFN matrices are one of E banks; a
-  router picks k per token; output is sum_e w_e * FFN_e(x). Grows
-  parameter count without growing per-token FLOPs (only k of E
-  run). Shared experts always run; routed experts are selected.
-- Group-limited routing: confine a token's routing to a few
-  expert groups, bounding the working set -- and, when streaming
-  weights from disk, the bytes read per token.
-- Leading dense layers: the first n blocks use a plain dense FFN;
-  routing begins only after them (n_dense_lead).
-- RoPE interleaved vs half-split: same rotation math, different
-  pairing of the coordinates it rotates -- adjacent (2i,2i+1) vs
-  (i, i+d/2). Must match training; llama uses interleaved, the
-  DSA indexer uses half-split.
-- DSA lightning indexer: a cheap auxiliary scorer. Once the
-  context exceeds top_k it ranks past positions by
-  sum_h w_h ReLU(<q_h, k_idx>) and lets MLA attend only the top_k
-  -- O(top_k) instead of O(n) beyond the cap, at the cost of the
-  indexer projections. Below top_k it selects everything, so it
-  is exactly dense (which is why the sub-2048 golden validates
-  the whole path).
-- Multi-token prediction (MTP / nextn): an extra block trained to
-  predict the token after next (a speculative-decoding aid). Not
-  part of the causal forward, so locus loads but excludes it.
-- Tied embeddings: reuse E as E^T for the output projection when
-  the model ships no separate output.weight.
-- Paged KV cache: the K/V (or MLA latent) store is allocated in
-  fixed-size blocks (pages), so many sequences share one pool and
-  common prefixes can be shared instead of copied.
+| Term      | Expansion                 | One line                        |
+|-----------|---------------------------|---------------------------------|
+| MHA       | Multi-Head Attention      | h independent Q/K/V subspaces   |
+| GQA       | Grouped-Query Attention   | query heads share a K/V head    |
+| MLA       | Multi-head Latent Attn    | cache a low-rank latent, not K/V|
+| DSA       | DeepSeek Sparse Attention | attend a selected position set  |
+| MoE       | Mixture of Experts        | per-token choice of FFN weights |
+| FFN       | Feed-Forward Network      | the position-wise sublayer      |
+| MLP       | Multi-Layer Perceptron    | another name for the FFN        |
+| KV        | Key / Value               | the tensors attention caches    |
+| RoPE      | Rotary Position Embedding | position via coordinate rotation|
+| RMSNorm   | Root-Mean-Square Norm     | scale to unit RMS, learned gain |
+| LayerNorm | Layer Normalization       | mean-center, then scale         |
+| SwiGLU    | Swish-Gated Linear Unit   | silu(gate) * up feed-forward    |
+| SiLU      | Sigmoid Linear Unit       | silu(z) = z * sigmoid(z)        |
+| ReLU      | Rectified Linear Unit     | ReLU(z) = max(0, z)             |
+| LoRA      | Low-Rank Adaptation       | a matrix as two thin factors    |
+| MTP       | Multi-Token Prediction    | the extra, unused nextn block   |
+| GGUF      | (model container format)  | on-disk weights plus metadata   |
+| bpw       | bits per weight           | quantization density            |
+| eps       | epsilon                   | small constant for stability    |
+| F32 / F16 | 32- / 16-bit float        | IEEE-754 single / half          |
