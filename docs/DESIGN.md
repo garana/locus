@@ -297,6 +297,18 @@ Notes:
   locus's 40min run was warm-cache (ran second) so not a fair
   cold perf comparison -- the ~124 s/tok cold reference is the
   real "GLM on spinning disk" datapoint.
+- Cold(-ish) locus (2026-07-23, GLM shards fadvise-evicted on
+  vx): 50.7 min total for 16 tok (~190 s/tok all-in; lazy mmap,
+  no separate load step), 82.5 GB read, 28.3 GB reclaimable RSS.
+  So locus is faster END-TO-END than the cold llama.cpp
+  reference (50.7 vs 92 min) because it streams lazily instead
+  of front-loading the whole model. Methodology caveat to
+  remember: locus major-fault counts are a FALSE coldness signal
+  -- R8 readahead faults pages in ahead of access, so they never
+  count as major faults (55.8k cold vs 54.6k warm, ~equal); use
+  bytes-read (82.5 GB cold vs 70 GB warm) to judge coldness. The
+  16-tok working set (27.4% of slots) exceeds the 28 GB page
+  cache, so GLM is disk-bound regardless of warmth on that RAID.
 - Memory bounding (2026-07-22, after llama.cpp's Metal
   full-offload crashed the 32GB host): locus's dirty memory is
   the KV pool + workspaces; weights are clean file-backed pages
@@ -385,6 +397,28 @@ pinning under an explicit budget; (3) the prefetch schedule;
 (4) IQ shaders. Phases 1-2 for CUDA are backend-internal and
 started on vx; the Ops::prefetch field + llama.cpp call sites
 land together once the registry side exists.
+
+Vulkan pager status (2026-07-24): phases 1-2 landed
+(matvec_vulkan WeightPool, header src/locus/backend/vulkan/
+weight_pool.hpp). Host-pointer-keyed device buffers, byte
+budget via LOCUS_GPU_POOL_MB (default unbounded = identical to
+the old resident map), LRU eviction, buffers pinned for the
+open command batch and unpinned at end_batch, transient
+(uncached) fallback for a weight too big or when all resident
+buffers are pinned, [vulkan-pool] telemetry. The eviction core
+is unit-tested GPU-free via an injected buffer factory
+(test_vulkan_pool.cpp). One structural limit: Vulkan records a
+whole command batch per (sub-)token and end_batch submits+waits,
+so eviction only frees buffers between batches -- a single
+batch's working set must still fit device memory. A model whose
+per-batch working set exceeds VRAM needs finer batch splitting
+(future work); this is why deepseek-v2-lite on MoltenVK/M2
+(~10GB uploaded in one batch) fails with "end cmd" both with
+and without the pager -- a device limit, not a pager bug.
+Validation host: the Raspberry Pi 5 (VideoCore VII Vulkan,
+small VRAM) forces real cross-batch eviction on modest models
+and is where the real-model exit test runs; heavy runs stay off
+the 32GB MacBook.
 
 ### R9: threaded execution and static pinning (CPU)
 

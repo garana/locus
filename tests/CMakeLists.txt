@@ -28,6 +28,7 @@ add_executable(locus_tests
     test_dsa.cpp
     test_threads.cpp
     test_cli_args.cpp
+    test_vulkan_pool.cpp
 )
 target_link_libraries(locus_tests PRIVATE locus catch2)
 target_include_directories(locus_tests SYSTEM PRIVATE

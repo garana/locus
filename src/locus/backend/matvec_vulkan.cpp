@@ -2,12 +2,14 @@
 #include <stdexcept>
 #include <bit>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
 
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
+#include "locus/backend/vulkan/weight_pool.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/moe_stats.hpp"
 
@@ -84,8 +86,10 @@ std::uint32_t w_off_units(const Mat& w, std::uint64_t bytes) {
     }
 }
 
+using WeightPool = WeightPoolT<VulkanContext::Buffer>;
+
 /**
- * Process-lifetime GPU state: one context, resident buffers for
+ * Process-lifetime GPU state: one context, a weight pager for
  * weights and norm vectors (keyed by their mmap pointers, stable
  * for the model's lifetime), grow-only activation scratch, and
  * the GPU-mapped KV pools handed to PagedKvCache.
@@ -95,13 +99,19 @@ std::uint32_t w_off_units(const Mat& w, std::uint64_t bytes) {
  */
 struct State {
     VulkanContext ctx;
-    std::unordered_map<const void*, VulkanContext::Buffer>
-        resident;
-    /** Weights dequantized to F32 at upload (MLA's wkv_b). */
-    std::unordered_map<const void*, VulkanContext::Buffer>
-        resident_f32;
+    WeightPool pool;
     std::unordered_map<const void*, VulkanContext::Buffer>
         kv_pools;
+
+    State() {
+        pool.create = [this](std::size_t n) {
+            return ctx.create_buffer(n);
+        };
+        pool.destroy = [this](VulkanContext::Buffer b) {
+            ctx.destroy_buffer(b);
+        };
+    }
+    ~State() { pool.report(); }
 
     /** Activation buffers, sized on first use per model dims. */
     VulkanContext::Buffer x{}, xb{}, q{}, gate{}, up{}, attout{},
@@ -114,36 +124,33 @@ struct State {
 
     VulkanContext::Buffer upload(const void* ptr,
                                  std::size_t bytes) {
-        auto it = resident.find(ptr);
-        if (it != resident.end()) {
-            return it->second;
-        }
-        auto buf = ctx.create_buffer(bytes);
-        ctx.write_buffer(
-            buf, {static_cast<const std::byte*>(ptr), bytes});
-        resident.emplace(ptr, buf);
-        return buf;
+        return pool.acquire(
+            ptr, bytes, [&](VulkanContext::Buffer b) {
+                ctx.write_buffer(
+                    b, {static_cast<const std::byte*>(ptr),
+                        bytes});
+            });
     }
 
     /** Uploads w dequantized to F32 (any CPU-supported type). */
     VulkanContext::Buffer upload_f32(const Mat& w) {
-        auto it = resident_f32.find(w.data);
-        if (it != resident_f32.end()) {
-            return it->second;
-        }
-        std::vector<float> host(
-            static_cast<std::size_t>(w.rows) * w.cols);
-        for (std::uint32_t r = 0; r < w.rows; ++r) {
-            dequant_row(w, r,
+        const std::size_t bytes =
+            static_cast<std::size_t>(w.rows) * w.cols * 4;
+        return pool.acquire(
+            w.data, bytes, [&](VulkanContext::Buffer b) {
+                std::vector<float> host(
+                    static_cast<std::size_t>(w.rows) * w.cols);
+                for (std::uint32_t r = 0; r < w.rows; ++r) {
+                    dequant_row(
+                        w, r,
                         {host.data() +
                              static_cast<std::size_t>(r) * w.cols,
                          w.cols});
-        }
-        auto buf = ctx.create_buffer(host.size() * 4);
-        ctx.write_buffer(
-            buf, std::as_bytes(std::span<const float>(host)));
-        resident_f32.emplace(w.data, buf);
-        return buf;
+                }
+                ctx.write_buffer(
+                    b, std::as_bytes(
+                           std::span<const float>(host)));
+            });
     }
 
     void grow(VulkanContext::Buffer& b, std::size_t& cap,
@@ -239,6 +246,7 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
     s.ctx.dispatch(matvec_kernel(w), bufs, push,
                    (w.rows + 63) / 64);
     s.ctx.end_batch();
+    s.pool.on_batch_end();
     s.ctx.read_buffer(s.xb, std::as_writable_bytes(out));
 }
 
@@ -538,6 +546,7 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
             // Router runs on the CPU: sync the batch, read the
             // normed activations, gate, then keep recording.
             s.ctx.end_batch();
+            s.pool.on_batch_end();
             s.ctx.read_buffer(
                 s.xb,
                 std::as_writable_bytes(std::span<float>(
@@ -582,6 +591,7 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
     norm(m.output_norm(), s.x, s.xb, hp.n_embd, 0);
     rec_matvec(s, m.output_weight(), s.xb, s.logits, 0, false);
     s.ctx.end_batch();
+    s.pool.on_batch_end();
 
     s.ctx.read_buffer(s.logits, std::as_writable_bytes(logits));
     seq.n_tokens = pos + 1;
