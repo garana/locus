@@ -258,40 +258,33 @@ TEST_CASE("k-quant matvec is consistent with dequant_row",
 }
 
 #if defined(__aarch64__)
-TEST_CASE("matvec_neon q4_k matches the scalar reference",
+TEST_CASE("matvec_neon matches the scalar reference for K-quants",
           "[ops][neon]") {
-    constexpr std::uint32_t cols = 512;  // two Q4_K super-blocks
-    constexpr std::uint32_t rows = 3;
-    const std::size_t row_bytes = cols / 256 * 144;
-    std::vector<std::byte> w(rows * row_bytes);
-    std::mt19937 rng(1234);
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        std::byte* row = w.data() + r * row_bytes;
-        for (std::size_t b = 0; b < cols / 256; ++b) {
-            std::byte* blk = row + b * 144;
-            // Finite f16 scales; any bytes are a valid Q4_K block.
-            std::uint16_t d = f32_to_f16(0.03f + 0.01f * r);
-            std::uint16_t dmin = f32_to_f16(0.015f + 0.005f * b);
-            std::memcpy(blk, &d, 2);
-            std::memcpy(blk + 2, &dmin, 2);
-            for (std::size_t i = 4; i < 144; ++i) {
-                blk[i] = std::byte{
-                    static_cast<std::uint8_t>(rng() & 0xff)};
-            }
-        }
-    }
+    constexpr std::uint32_t rows = 3, nblk = 2, cols = nblk * 256;
+    std::mt19937 rng(99);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::vector<float> x(cols);
     for (auto& v : x) {
         v = dist(rng);
     }
-    Mat m{TensorType::kQ4_K, w.data(), rows, cols};
-    std::vector<float> ref(rows), got(rows);
-    matvec(m, x, ref);
-    matvec_neon(m, x, got);
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        INFO("row " << r);
-        REQUIRE(got[r] == Approx(ref[r]).epsilon(1e-4).margin(1e-4));
+    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+        std::vector<std::byte> w;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto row = k_quant_row(
+                t, nblk,
+                1000u + r +
+                    10u * static_cast<std::uint32_t>(t));
+            w.insert(w.end(), row.begin(), row.end());
+        }
+        Mat m{t, w.data(), rows, cols};
+        std::vector<float> ref(rows), got(rows);
+        matvec(m, x, ref);        // scalar reference
+        matvec_neon(m, x, got);   // vectorized kernel
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            INFO("type " << static_cast<int>(t) << " row " << r);
+            REQUIRE(got[r] ==
+                    Approx(ref[r]).epsilon(1e-4).margin(1e-4));
+        }
     }
 }
 #endif

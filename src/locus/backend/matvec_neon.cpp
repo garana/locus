@@ -125,6 +125,84 @@ float dot_q4_k_block_neon(const std::byte* blk, const float* x) {
     return vaddvq_f32(acc);
 }
 
+/**
+ * Accumulates 16 Q6_K values into acc: reconstructs each 6-bit
+ * quant from the low/high nibble of ql (HIGH picks the high
+ * nibble) and 2 bits of qh at QH_SHIFT, subtracts the 32 bias,
+ * scales by dsc = d*sc, and multiplies by x.
+ */
+template <bool HIGH, int QH_SHIFT>
+float32x4_t accum16_q6k(float32x4_t acc, const std::uint8_t* ql16,
+                        const std::uint8_t* qh16, float dsc,
+                        const float* xp) {
+    const uint8x16_t qlb = vld1q_u8(ql16);
+    const uint8x16_t qhb = vld1q_u8(qh16);
+    const uint8x16_t low =
+        HIGH ? vshrq_n_u8(qlb, 4)
+             : vandq_u8(qlb, vdupq_n_u8(0x0f));
+    uint8x16_t qh_sh;
+    if constexpr (QH_SHIFT == 0) {
+        qh_sh = qhb;
+    } else {
+        qh_sh = vshrq_n_u8(qhb, QH_SHIFT == 0 ? 1 : QH_SHIFT);
+    }
+    const uint8x16_t high =
+        vshlq_n_u8(vandq_u8(qh_sh, vdupq_n_u8(3)), 4);
+    const int8x16_t v = vsubq_s8(
+        vreinterpretq_s8_u8(vorrq_u8(low, high)), vdupq_n_s8(32));
+    const int16x8_t vlo = vmovl_s8(vget_low_s8(v));
+    const int16x8_t vhi = vmovl_s8(vget_high_s8(v));
+    float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vlo)));
+    float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vlo)));
+    float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vhi)));
+    float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vhi)));
+    const float32x4_t s = vdupq_n_f32(dsc);
+    acc = vfmaq_f32(acc, vmulq_f32(f0, s), vld1q_f32(xp));
+    acc = vfmaq_f32(acc, vmulq_f32(f1, s), vld1q_f32(xp + 4));
+    acc = vfmaq_f32(acc, vmulq_f32(f2, s), vld1q_f32(xp + 8));
+    acc = vfmaq_f32(acc, vmulq_f32(f3, s), vld1q_f32(xp + 12));
+    return acc;
+}
+
+/**
+ * One Q6_K super-block (256 elements, 210 bytes): fused dequant +
+ * dot. Follows dequant_block_q6_k -- two 128-element halves, each
+ * with four 32-value streams (ql low/high nibble x qh 2-bit pair)
+ * scaled by one of eight int8 scales (two per stream, split at
+ * lane 16).
+ */
+float dot_q6_k_block_neon(const std::byte* blk, const float* x) {
+    const auto* ql = reinterpret_cast<const std::uint8_t*>(blk);
+    const auto* qh =
+        reinterpret_cast<const std::uint8_t*>(blk + 128);
+    const auto* sc =
+        reinterpret_cast<const std::int8_t*>(blk + 192);
+    const float d = f16_to_f32(load_u16(blk + 208));
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (int n = 0; n < 256; n += 128) {
+        acc = accum16_q6k<false, 0>(acc, ql, qh, d * sc[0],
+                                    x + n);
+        acc = accum16_q6k<false, 0>(acc, ql + 16, qh + 16,
+                                    d * sc[1], x + n + 16);
+        acc = accum16_q6k<false, 2>(acc, ql + 32, qh, d * sc[2],
+                                    x + n + 32);
+        acc = accum16_q6k<false, 2>(acc, ql + 48, qh + 16,
+                                    d * sc[3], x + n + 48);
+        acc = accum16_q6k<true, 4>(acc, ql, qh, d * sc[4],
+                                   x + n + 64);
+        acc = accum16_q6k<true, 4>(acc, ql + 16, qh + 16,
+                                   d * sc[5], x + n + 80);
+        acc = accum16_q6k<true, 6>(acc, ql + 32, qh, d * sc[6],
+                                   x + n + 96);
+        acc = accum16_q6k<true, 6>(acc, ql + 48, qh + 16,
+                                   d * sc[7], x + n + 112);
+        ql += 64;
+        qh += 32;
+        sc += 8;
+    }
+    return vaddvq_f32(acc);
+}
+
 }  // namespace
 
 void matvec_neon(const Mat& w, std::span<const float> x,
@@ -161,6 +239,20 @@ void matvec_neon(const Mat& w, std::span<const float> x,
             for (std::size_t b = 0; b < nblk; ++b) {
                 acc += dot_q4_k_block_neon(
                     row + b * 144, x.data() + b * 256);
+            }
+            out[r] = acc;
+        }
+        return;
+    }
+    if (w.type == gguf::TensorType::kQ6_K) {
+        const std::size_t row_bytes = w.cols / 256ull * 210ull;
+        const std::size_t nblk = w.cols / 256;
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            const std::byte* row = w.data + r * row_bytes;
+            float acc = 0.0f;
+            for (std::size_t b = 0; b < nblk; ++b) {
+                acc += dot_q6_k_block_neon(
+                    row + b * 210, x.data() + b * 256);
             }
             out[r] = acc;
         }
