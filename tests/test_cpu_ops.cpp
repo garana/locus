@@ -289,3 +289,36 @@ TEST_CASE("matvec_neon matches the scalar reference for K-quants",
     }
 }
 #endif
+
+#if defined(__x86_64__) && defined(__SSE4_1__)
+TEST_CASE("matvec_sse4 matches the scalar reference for K-quants",
+          "[ops][sse4]") {
+    constexpr std::uint32_t rows = 3, nblk = 2, cols = nblk * 256;
+    std::mt19937 rng(99);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    // sse4 covers Q4_K/Q6_K (no IQ1_S kernel there yet).
+    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+        std::vector<std::byte> w;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto row = k_quant_row(
+                t, nblk,
+                1000u + r +
+                    10u * static_cast<std::uint32_t>(t));
+            w.insert(w.end(), row.begin(), row.end());
+        }
+        Mat m{t, w.data(), rows, cols};
+        std::vector<float> ref(rows), got(rows);
+        matvec(m, x, ref);        // scalar reference
+        matvec_sse4(m, x, got);   // vectorized kernel
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            INFO("type " << static_cast<int>(t) << " row " << r);
+            REQUIRE(got[r] ==
+                    Approx(ref[r]).epsilon(1e-4).margin(1e-4));
+        }
+    }
+}
+#endif
