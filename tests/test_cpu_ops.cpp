@@ -6,6 +6,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/sys/features.hpp"
 
 using namespace locus::backend;
 using locus::gguf::TensorType;
@@ -290,9 +291,16 @@ TEST_CASE("matvec_neon matches the scalar reference for K-quants",
 }
 #endif
 
-#if defined(__x86_64__) && defined(__SSE4_1__)
+// Guard on the arch only: matvec_sse4 is defined for all x86-64
+// builds (matvec_sse4.cpp carries -msse4.1); __SSE4_1__ is NOT set
+// in this TU, so guarding on it would silently drop the test. Gate
+// execution at runtime instead, since a non-SSE4.1 CPU would fault.
+#if defined(__x86_64__)
 TEST_CASE("matvec_sse4 matches the scalar reference for K-quants",
           "[ops][sse4]") {
+    if (!locus::sys::detect().sse4) {
+        SKIP("CPU lacks SSE4.1");
+    }
     constexpr std::uint32_t rows = 3, nblk = 2, cols = nblk * 256;
     std::mt19937 rng(99);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
