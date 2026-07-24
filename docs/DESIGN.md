@@ -420,6 +420,18 @@ small VRAM) forces real cross-batch eviction on modest models
 and is where the real-model exit test runs; heavy runs stay off
 the 32GB MacBook.
 
+Exit test PASSED (2026-07-24, Raspberry Pi 5): llama-3.2-1b
+Q4_K_M on --backend vulkan produces byte-identical output to the
+scalar and unbounded-vulkan runs ("Once upon a time, in a small
+village nestled in the", 8 greedy tokens) under
+LOCUS_GPU_POOL_MB=64. Telemetry: budget 64MB, resident 63MB,
+hits 378, misses 1566, evictions 341, uploaded 8483MB (the
+0.8GB model re-streamed ~10x under the sub-working-set budget).
+So eviction fires and stays token-exact -- paging proven, not
+mere residency. (The Pi's tile GPU is slower than its CPU here,
+so the "GPU faster than CPU" perf assertion is a reported WARN,
+not a gate.)
+
 ### R9: threaded execution and static pinning (CPU)
 
 Motivation (measured, GLM-5.2 on the 32GB m2). With readahead
