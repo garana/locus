@@ -6,6 +6,8 @@
 
 #include <cstring>
 
+#include "iq_grids.h"
+
 namespace locus::backend {
 
 namespace {
@@ -203,6 +205,49 @@ float dot_q6_k_block_neon(const std::byte* blk, const float* x) {
     return vaddvq_f32(acc);
 }
 
+/**
+ * One IQ1_S super-block (256 elements, 50 bytes): the codebook
+ * lookup stays scalar (a gather), but the per-8 dequant+dot is
+ * vectorized. Follows dequant_block_iq1_s: eight sub-blocks, each
+ * with a 3-bit scale and a sign delta, four 8-wide grid entries.
+ */
+float dot_iq1_s_block_neon(const std::byte* blk, const float* x) {
+    constexpr float kIq1sDelta = 0.125f;
+    const float d = f16_to_f32(load_u16(blk));
+    const auto* qs =
+        reinterpret_cast<const std::uint8_t*>(blk + 2);
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    const float* xp = x;
+    for (int ib = 0; ib < 8; ++ib) {
+        std::uint16_t qh;
+        std::memcpy(&qh, blk + 34 + 2 * ib, 2);
+        const float dl = d * (2 * ((qh >> 12) & 7) + 1);
+        const float delta =
+            (qh & 0x8000) ? -kIq1sDelta : kIq1sDelta;
+        const float32x4_t dlv = vdupq_n_f32(dl);
+        const float32x4_t dv = vdupq_n_f32(delta);
+        for (int l = 0; l < 4; ++l) {
+            const auto* grid =
+                reinterpret_cast<const std::int8_t*>(
+                    iq1s_grid +
+                    (qs[l] | (((qh >> (3 * l)) & 7) << 8)));
+            const int16x8_t g16 = vmovl_s8(vld1_s8(grid));
+            float32x4_t glo =
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(g16)));
+            float32x4_t ghi =
+                vcvtq_f32_s32(vmovl_s16(vget_high_s16(g16)));
+            // dl * (grid + delta)
+            glo = vmulq_f32(vaddq_f32(glo, dv), dlv);
+            ghi = vmulq_f32(vaddq_f32(ghi, dv), dlv);
+            acc = vfmaq_f32(acc, glo, vld1q_f32(xp));
+            acc = vfmaq_f32(acc, ghi, vld1q_f32(xp + 4));
+            xp += 8;
+        }
+        qs += 4;
+    }
+    return vaddvq_f32(acc);
+}
+
 }  // namespace
 
 void matvec_neon(const Mat& w, std::span<const float> x,
@@ -253,6 +298,20 @@ void matvec_neon(const Mat& w, std::span<const float> x,
             for (std::size_t b = 0; b < nblk; ++b) {
                 acc += dot_q6_k_block_neon(
                     row + b * 210, x.data() + b * 256);
+            }
+            out[r] = acc;
+        }
+        return;
+    }
+    if (w.type == gguf::TensorType::kIQ1_S) {
+        const std::size_t row_bytes = w.cols / 256ull * 50ull;
+        const std::size_t nblk = w.cols / 256;
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            const std::byte* row = w.data + r * row_bytes;
+            float acc = 0.0f;
+            for (std::size_t b = 0; b < nblk; ++b) {
+                acc += dot_iq1_s_block_neon(
+                    row + b * 50, x.data() + b * 256);
             }
             out[r] = acc;
         }

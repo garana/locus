@@ -267,7 +267,8 @@ TEST_CASE("matvec_neon matches the scalar reference for K-quants",
     for (auto& v : x) {
         v = dist(rng);
     }
-    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K,
+                         TensorType::kIQ1_S}) {
         std::vector<std::byte> w;
         for (std::uint32_t r = 0; r < rows; ++r) {
             auto row = k_quant_row(
