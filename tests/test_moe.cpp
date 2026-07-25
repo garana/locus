@@ -380,6 +380,63 @@ TEST_CASE("weight window drops file-backed experts losslessly",
     std::filesystem::remove(path);
 }
 
+TEST_CASE("batched forward matches N sequential forwards",
+          "[batch]") {
+    // R10: forward_batch(N) must be byte-identical to N
+    // forward() calls -- logits AND the KV cache -- on the dense
+    // llama path.
+    ModelBuilder mb;
+    mb.common();
+    mb.tensor("blk.0.ffn_gate.weight", {kE, kF},
+              weights(kE * kF, 40));
+    mb.tensor("blk.0.ffn_up.weight", {kE, kF},
+              weights(kE * kF, 41));
+    mb.tensor("blk.0.ffn_down.weight", {kF, kE},
+              weights(kF * kE, 42));
+    auto img = mb.build(0, 0);  // dense llama
+    auto g = locus::gguf::GgufFile::parse(img);
+    auto model = LlamaModel::load(g);
+    REQUIRE(model.supports_batch());
+
+    const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 5};
+    const auto& hp = model.hparams();
+    const std::size_t kvd =
+        static_cast<std::size_t>(hp.n_kv_heads) * hp.head_dim;
+
+    auto seq_run = [&](bool batched) {
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(hp.n_vocab);
+        if (batched) {
+            REQUIRE(cache.ensure_capacity(seq, toks.size()));
+            model.forward_batch(toks, cache, seq, ws, logits);
+        } else {
+            for (auto t : toks) {
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(t, cache, seq, ws, logits);
+            }
+        }
+        // Snapshot the KV cache for every layer and position.
+        std::vector<float> kv;
+        for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
+            for (std::uint32_t p = 0; p < seq.n_tokens; ++p) {
+                const float* k = cache.k(seq, l, p);
+                const float* v = cache.v(seq, l, p);
+                kv.insert(kv.end(), k, k + kvd);
+                kv.insert(kv.end(), v, v + kvd);
+            }
+        }
+        cache.release(seq);
+        return std::pair{logits, kv};
+    };
+
+    auto [log_seq, kv_seq] = seq_run(false);
+    auto [log_bat, kv_bat] = seq_run(true);
+    REQUIRE(log_bat == log_seq);  // bit-identical logits
+    REQUIRE(kv_bat == kv_seq);    // bit-identical KV cache
+}
+
 TEST_CASE("distinct experts diverge from the dense model",
           "[moe]") {
     const auto wg = weights(kE * kF, 60);

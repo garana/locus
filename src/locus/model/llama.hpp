@@ -143,6 +143,29 @@ class LlamaModel {
                  std::span<float> logits) const;
 
     /**
+     * Runs N tokens of one sequence in a single pass (R10 batched
+     * forward): each weight is applied to all N tokens before the
+     * next weight, so a streamed weight is read once per layer,
+     * not once per token. Byte-identical to N sequential forward()
+     * calls (weight-stationary, not a GEMM). Only the last token's
+     * logits are produced (prefill semantics). Currently the dense
+     * llama path only; MLA/MoE archs fall back is the caller's job.
+     *
+     * @param tokens In-vocab token ids; capacity for tokens.size()
+     *     more positions must already be ensured on seq.
+     * @param logits Out; n_vocab floats for the LAST token.
+     * @throws std::invalid_argument on misuse or unsupported arch.
+     */
+    void forward_batch(std::span<const tok::TokenId> tokens,
+                       kv::PagedKvCache& cache,
+                       kv::PagedKvCache::Seq& seq, Workspace& ws,
+                       std::span<float> logits) const;
+
+    /** @returns true when forward_batch supports this model
+     * (dense llama today; extended to MLA/MoE later). */
+    bool supports_batch() const;
+
+    /**
      * A 3-D expert tensor: n_expert equally-sized matrices,
      * contiguous in the mapped file.
      */
@@ -244,6 +267,18 @@ std::vector<std::pair<std::uint32_t, float>> moe_select(
  */
 void matvec_mt(const backend::Ops& op, const backend::Mat& w,
                std::span<const float> x, std::span<float> out);
+
+/**
+ * Weight-stationary batched matvec (R10): applies w to each of
+ * the n input vectors (x_batch is n * w.cols contiguous) into
+ * out_batch (n * w.rows contiguous). The batch loop is inside so
+ * w is touched once and stays hot in cache / page cache across
+ * the n tokens. Byte-identical to n matvec() calls -- the win is
+ * fewer weight reads, not different arithmetic.
+ */
+void matvec_batch(const backend::Ops& op, const backend::Mat& w,
+                  std::span<const float> x_batch,
+                  std::span<float> out_batch, std::uint32_t n);
 
 /**
  * DSA lightning-indexer score for one cached position:
