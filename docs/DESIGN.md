@@ -675,20 +675,28 @@ Shape:
   naive N-wide att would be N x n_ctx and is the one trap to
   avoid.
 
-Rollout (status 2026-07-25): (1) matvec_batch and (2)
-LlamaModel::forward_batch for the dense llama path are DONE
-(commit f954a65) -- the [batch] test asserts forward_batch(N) is
-byte-identical to N forward() calls on BOTH the last-token
-logits and the full KV cache. Default forward() is untouched and
-forward_batch is not yet wired into the engine (opt-in, new
-code). Remaining: (3) extend to MLA (deepseek2) and glm-dsa
-attention; (4) wire Engine::advance() to batch prefill chunks
-and per-step decode across running sequences; (5) the optional
-dequant-amortization batched kernel (token-exact); (6) measure
-ingestion I/O on a streaming model and multi-request decode
-throughput (Pi/vx). Each step re-runs all goldens; the byte-
-identical property makes any divergence an immediately-caught
-bug.
+Rollout (status 2026-07-25): (1) matvec_batch, (2)
+forward_batch, (3) all-arch coverage, and (4a) engine prefill
+batching are DONE.
+- (1)+(2) commit f954a65; (3) commit 42846d4 refactored
+  forward_batch to reuse the shared per-token attention
+  (spec_->attention) so llama / deepseek2 (MLA) / glm-dsa are
+  all covered, dense FFN batched via matvec_batch, MoE per token.
+  [batch] tests assert byte-identity to N forward() calls
+  (logits + KV) on synthetic dense-llama, deepseek2-MLA and
+  llama-MoE. supports_batch() is true for every CPU/CUDA backend
+  (Vulkan opts out -- it has its own full forward).
+- (4a) commit 20d560c: Engine::advance() ingests the remaining
+  prompt as one forward_batch (Config::batched_prefill, default
+  on); [engine] A/B test confirms identical output to per-token.
+Remaining: (3b) batch the routed MoE experts weight-stationary
+(the streaming win for MoE models; needs per-token accumulation
+order preserved for byte-identity, or a token-exact variant);
+(4b) cross-SEQUENCE decode batching (N running sequences per
+step -- the serving-throughput core, needs a multi-seq
+forward_batch); (5) the optional dequant-amortization kernel
+(token-exact); (6) measure ingestion I/O and multi-request decode
+throughput (Pi/vx). Each step re-runs all goldens.
 
 Risk note: forward_batch duplicates the forward + per-arch
 attention shape, so it lands as NEW code validated against the
