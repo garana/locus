@@ -97,6 +97,28 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
             return;  // out of prefill budget this iteration
         }
 
+        // R10: ingest the remaining prompt in one batched forward
+        // when the model and config allow -- byte-identical to
+        // the per-token path, fewer weight reads. Falls through
+        // to per-token (which preempts) if the chunk cannot be
+        // capacity-ensured.
+        if (prefilling && cfg_.batched_prefill &&
+            model_.supports_batch()) {
+            const std::uint32_t remaining = n_prompt - r.n_fed;
+            const std::uint32_t nb = std::min(remaining, budget);
+            if (nb >= 2 &&
+                r.n_fed + nb <= model_.hparams().n_ctx &&
+                cache_.ensure_capacity(r.seq, nb)) {
+                model_.forward_batch(
+                    std::span<const tok::TokenId>(
+                        r.prompt.data() + r.n_fed, nb),
+                    cache_, r.seq, ws_, logits_);
+                r.n_fed += nb;
+                budget -= nb;
+                continue;
+            }
+        }
+
         if (r.n_fed + 1 > model_.hparams().n_ctx) {
             finish(r, Status::kFailed, "context overflow");
             return;

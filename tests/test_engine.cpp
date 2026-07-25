@@ -84,6 +84,30 @@ TEST_CASE("concurrent streams match single-sequence output",
     REQUIRE(engine.free_blocks() == engine.total_blocks());
 }
 
+TEST_CASE("batched prefill matches per-token prefill (engine)",
+          "[engine][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    REQUIRE(model.supports_batch());  // stories260K is dense llama
+    const auto prompt =
+        tok.encode("Once upon a time, there was", true);
+
+    auto run = [&](bool batched) {
+        Engine::Config cfg;
+        cfg.batched_prefill = batched;
+        Engine engine(model, tok.eos_id(), cfg);
+        auto id = engine.submit(prompt, 24);
+        engine.run_to_completion();
+        return engine.get(id)->generated;
+    };
+    // R10: batched prefill is byte-identical, so identical tokens.
+    REQUIRE(run(true) == run(false));
+}
+
 TEST_CASE("preemption recomputes and still matches",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {

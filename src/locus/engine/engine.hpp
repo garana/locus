@@ -58,6 +58,10 @@ class Engine {
         std::uint32_t decode_headroom = 16;
         /** Cap on simultaneously running sequences. */
         std::uint32_t max_running = 64;
+        /** Ingest a prompt in one batched forward when the model
+         * supports it (R10); byte-identical to per-token prefill,
+         * fewer weight reads. Off falls back to per-token. */
+        bool batched_prefill = true;
     };
 
     /**
