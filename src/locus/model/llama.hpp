@@ -310,10 +310,29 @@ void matvec_mt(const backend::Ops& op, const backend::Mat& w,
  * w is touched once and stays hot in cache / page cache across
  * the n tokens. Byte-identical to n matvec() calls -- the win is
  * fewer weight reads, not different arithmetic.
+ *
+ * With LOCUS_BATCH_DEQUANT set, dispatches instead to a dequant-
+ * amortized kernel that dequantizes each weight row to f32 once and
+ * dots it against all n columns (cuts dequant work n-fold). That
+ * path is token-exact but not byte-identical to the fused matvec,
+ * so it is opt-in and covered by its own approximate-equality test.
  */
 void matvec_batch(const backend::Ops& op, const backend::Mat& w,
                   std::span<const float> x_batch,
                   std::span<float> out_batch, std::uint32_t n);
+
+/**
+ * Dequant-amortized batched matvec (R10 step 5): dequantizes each
+ * weight row to f32 once via op.dequant_row, then dots it against
+ * all n token columns in plain scalar f32. Cuts dequant work from
+ * once-per-(row,token) to once-per-row. Token-exact and
+ * deterministic, but not byte-identical to the fused matvec, so
+ * matvec_batch only routes here when LOCUS_BATCH_DEQUANT is set.
+ * Exposed for its dedicated approximate-equality test.
+ */
+void matvec_batch_deq(const backend::Ops& op, const backend::Mat& w,
+                      std::span<const float> x_batch,
+                      std::span<float> out_batch, std::uint32_t n);
 
 /**
  * DSA lightning-indexer score for one cached position:

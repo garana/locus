@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -617,4 +618,93 @@ TEST_CASE("distinct experts diverge from the dense model",
         differs = differs || std::abs(a[i] - b[i]) > 1e-6;
     }
     REQUIRE(differs);
+}
+
+namespace {
+
+/**
+ * Quantizes an f32 row-major matrix (rows x cols, cols a multiple
+ * of 32) to Q8_0 blocks: [f16 scale][32 int8 quants] per 32 cols.
+ */
+std::vector<std::byte> quantize_q8_0(const std::vector<float>& w,
+                                     std::uint32_t rows,
+                                     std::uint32_t cols) {
+    const std::uint32_t blocks = cols / 32;
+    std::vector<std::byte> out(static_cast<std::size_t>(rows) *
+                               blocks * 34);
+    std::size_t o = 0;
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        for (std::uint32_t b = 0; b < blocks; ++b) {
+            const float* v = w.data() +
+                             static_cast<std::size_t>(r) * cols +
+                             b * 32;
+            float amax = 0.0f;
+            for (int i = 0; i < 32; ++i) {
+                amax = std::max(amax, std::abs(v[i]));
+            }
+            const float d = amax / 127.0f;
+            const float id = d > 0.0f ? 1.0f / d : 0.0f;
+            std::uint16_t h = locus::backend::f32_to_f16(d);
+            std::memcpy(out.data() + o, &h, 2);
+            for (int i = 0; i < 32; ++i) {
+                int q = static_cast<int>(std::lround(v[i] * id));
+                q = std::max(-127, std::min(127, q));
+                out[o + 2 + static_cast<std::size_t>(i)] =
+                    static_cast<std::byte>(
+                        static_cast<std::int8_t>(q));
+            }
+            o += 34;
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("dequant-amortized batch matvec matches per-token "
+          "(f32 byte-identical, q8_0 token-exact)", "[batch]") {
+    using locus::backend::Mat;
+    constexpr std::uint32_t rows = 48, cols = 64, n = 5;
+    const auto& op = locus::backend::find_backend("scalar")->ops;
+
+    std::vector<float> w = weights(
+        static_cast<std::size_t>(rows) * cols, 71);
+    std::vector<float> xb = weights(
+        static_cast<std::size_t>(n) * cols, 72);
+
+    // F32: dequant_row is a plain copy and the row dot is the same
+    // scalar accumulation matvec() uses, so the amortized kernel is
+    // byte-identical to n sequential matvec() calls.
+    {
+        Mat m{locus::gguf::TensorType::kF32,
+              reinterpret_cast<const std::byte*>(w.data()), rows,
+              cols};
+        std::vector<float> ref(static_cast<std::size_t>(n) * rows);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            op.matvec(m, {xb.data() + t * cols, cols},
+                      {ref.data() + t * rows, rows});
+        }
+        std::vector<float> got(static_cast<std::size_t>(n) * rows);
+        locus::model::matvec_batch_deq(op, m, xb, got, n);
+        REQUIRE(got == ref);
+    }
+
+    // Q8_0: fused matvec interleaves dequant with accumulation; the
+    // amortized kernel dequants the whole row first. Same math,
+    // reordered sums -> token-exact within a tight tolerance, not
+    // bitwise equal.
+    {
+        auto q = quantize_q8_0(w, rows, cols);
+        Mat m{locus::gguf::TensorType::kQ8_0, q.data(), rows, cols};
+        std::vector<float> ref(static_cast<std::size_t>(n) * rows);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            op.matvec(m, {xb.data() + t * cols, cols},
+                      {ref.data() + t * rows, rows});
+        }
+        std::vector<float> got(static_cast<std::size_t>(n) * rows);
+        locus::model::matvec_batch_deq(op, m, xb, got, n);
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            REQUIRE(got[i] == Catch::Approx(ref[i]).margin(1e-5));
+        }
+    }
 }

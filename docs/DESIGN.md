@@ -713,11 +713,21 @@ batching are DONE.
   preemption + recompute in both paths).
 So the whole batched-forward stack -- prefill + continuous-batch
 decode, all archs, batched MoE experts -- is byte-identical and
-in place. Remaining, both optional/deferred: (5) the
-dequant-amortization batched kernel (token-exact compute win on
-the quantized single-core path); (6) measure ingestion I/O and
-multi-request decode throughput on the Pi/vx, then flip
-batched_decode default-on once validated on real models.
+in place. Optional step (5) is now landed too: the
+dequant-amortization batched kernel (matvec_batch_deq)
+dequantizes each weight row to f32 once, then dots it against all
+n token columns -- cutting dequant work from once-per-(row,token)
+to once-per-row. Because it dequants the whole row before the
+dot rather than interleaving (as the fused SIMD matvec does), it
+is token-exact and deterministic but NOT byte-identical, so it is
+opt-in behind LOCUS_BATCH_DEQUANT and matvec_batch routes to it
+only when that is set. Its own [batch] test proves f32 stays
+byte-identical (dequant_row is a copy there) and q8_0 matches the
+fused matvec within a 1e-5 margin. Remaining: (6) measure
+ingestion I/O and multi-request decode throughput on the Pi/vx --
+including LOCUS_BATCH_DEQUANT on vs off for the compute win --
+then flip batched_decode default-on once validated on real
+models.
 
 Risk note: forward_batch duplicates the forward + per-arch
 attention shape, so it lands as NEW code validated against the

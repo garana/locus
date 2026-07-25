@@ -658,9 +658,42 @@ void LlamaModel::forward_batch_decode(
     }
 }
 
+void matvec_batch_deq(const backend::Ops& op, const Mat& w,
+                      std::span<const float> x_batch,
+                      std::span<float> out_batch, std::uint32_t n) {
+    const std::uint32_t xc = w.cols;
+    const std::uint32_t oc = w.rows;
+    std::vector<float> row(xc);
+    for (std::uint32_t r = 0; r < oc; ++r) {
+        op.dequant_row(w, r, row);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const float* x = x_batch.data() + static_cast<std::size_t>(t) * xc;
+            float acc = 0.0f;
+            for (std::uint32_t c = 0; c < xc; ++c) {
+                acc += row[c] * x[c];
+            }
+            out_batch[static_cast<std::size_t>(t) * oc + r] = acc;
+        }
+    }
+}
+
+namespace {
+
+/** Cached LOCUS_BATCH_DEQUANT toggle (read once). */
+bool batch_dequant_enabled() {
+    static const bool on = std::getenv("LOCUS_BATCH_DEQUANT") != nullptr;
+    return on;
+}
+
+}  // namespace
+
 void matvec_batch(const backend::Ops& op, const Mat& w,
                   std::span<const float> x_batch,
                   std::span<float> out_batch, std::uint32_t n) {
+    if (batch_dequant_enabled()) {
+        matvec_batch_deq(op, w, x_batch, out_batch, n);
+        return;
+    }
     const std::size_t xc = w.cols;
     const std::size_t oc = w.rows;
     for (std::uint32_t t = 0; t < n; ++t) {
