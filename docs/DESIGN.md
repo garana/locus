@@ -591,6 +591,64 @@ finite, (c) selection picks the positions a scalar reference
 scores highest. Real-model long-context quality is future work
 on faster hardware.
 
+### R10: batched prefill (weight-stationary, streaming)
+
+Problem. Engine::advance() feeds prompt tokens to
+model_.forward() ONE at a time, so an N-token prompt makes N
+full passes over the weights. On a streaming model the weights
+do not fit RAM, so each pass evicts what the previous faulted in
+-- the per-token expert re-streaming the GLM telemetry showed.
+Prefill I/O is thus ~N x the necessary. Decode is inherently
+one-token (autoregressive) and unaffected; this is a
+prompt-ingestion win, largest for long prompts (RAG, long
+context) -- exactly the case that punishes streaming today.
+
+The fix: read each weight ONCE per prefill and apply it to all N
+prompt tokens (weight stays hot instead of being re-faulted N
+times).
+
+Safety property that makes this tractable on the token-exact
+core: implement it as a weight-stationary LOOP REORDER, NOT a
+GEMM that changes summation order. For each weight, loop over the
+N tokens doing the SAME per-token matvec the sequential path
+does. The arithmetic for token t is byte-for-byte identical
+whether computed alone or interleaved; only the weight read is
+amortized. So a batched forward_batch(t_1..t_N) must produce a
+KV cache and logits BIT-IDENTICAL to N sequential forward()
+calls -- a hard equality check, not an approximate one. That is
+the exit test.
+
+Shape:
+- Position-wise ops batch trivially and bit-identically: the
+  attention projections (wq/wk/wv/wo), dense/expert FFN,
+  embedding, output head -- each weight applied to N token
+  columns of an N-wide activation workspace.
+- Attention is cross-token but uses no large weights: compute
+  Q/K/V for all N first (weight-stationary), write N KV rows,
+  then per-token scores/softmax/weighted-sum exactly as today.
+  Causal ordering within the batch is already respected (token t
+  reads only positions <= t).
+- MoE: routing is per token, so each of the N tokens picks its
+  own experts; the union of picked experts is uploaded/faulted
+  once per layer and each is applied to the tokens that routed to
+  it -- this is where the streaming win concentrates.
+
+Rollout: (1) forward_batch behind the same code paths, validated
+bit-identical to N sequential forwards on the synthetic models
+and the real goldens; (2) Engine::advance() calls it for prefill
+chunks (prefill_budget already bounds N); (3) measure prompt-
+ingestion I/O reduction on a streaming model (Pi/vx). Composes
+with, and is orthogonal to, the cross-SEQUENCE continuous
+batching the scheduler already does.
+
+Risk note: this touches forward() and all three arch attention
+implementations (arch.cpp) plus the workspace -- the code the
+6-model token-exact goldens validate. The bit-identical property
+is the guardrail (any divergence is a bug, caught immediately),
+but the change is cross-cutting and warrants landing behind a
+flag and re-running every golden before it becomes the default
+prefill path.
+
 ## 8. Testing strategy
 
 - Catch2 unit tests per component (allocator, scheduler invariants,
