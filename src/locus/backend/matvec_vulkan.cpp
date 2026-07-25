@@ -562,23 +562,31 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
                 }
             }
             s.ctx.begin_batch();
-            auto whole = [&](const model::LlamaModel::ExpertMat&
-                                 em) {
-                return s.upload(
-                    em.base.data,
-                    (em.expert_bytes * hp.n_expert + 3) &
-                        ~std::uint64_t{3});
-            };
-            VulkanContext::Buffer wg = whole(lay.gate_exps);
-            VulkanContext::Buffer wu = whole(lay.up_exps);
-            VulkanContext::Buffer wd = whole(lay.down_exps);
+            // Upload only the ROUTED experts, each to its own
+            // pooled buffer keyed by that expert's mmap pointer, so
+            // the pager caches/evicts per expert across tokens.
+            // Uploading all n_expert inflated MoE residency by
+            // n_expert/n_expert_used (e.g. 64/6) and OOMs big
+            // models on small hosts; only the picked experts are
+            // ever read by the swiglu dispatches below.
+            const auto up_expert =
+                [&](const model::LlamaModel::ExpertMat& em,
+                    std::uint32_t e) {
+                    return s.upload(
+                        em.expert(e).data,
+                        (em.expert_bytes + 3) & ~std::uint64_t{3});
+                };
             for (const auto& [e, wgt] : picked) {
-                swiglu(lay.gate_exps.base, lay.up_exps.base,
-                       lay.down_exps.base, hp.n_ff_exp, wgt,
-                       e * lay.gate_exps.expert_bytes,
-                       e * lay.up_exps.expert_bytes,
-                       e * lay.down_exps.expert_bytes, &wg, &wu,
-                       &wd);
+                VulkanContext::Buffer bg =
+                    up_expert(lay.gate_exps, e);
+                VulkanContext::Buffer bu =
+                    up_expert(lay.up_exps, e);
+                VulkanContext::Buffer bd =
+                    up_expert(lay.down_exps, e);
+                swiglu(lay.gate_exps.expert(e),
+                       lay.up_exps.expert(e),
+                       lay.down_exps.expert(e), hp.n_ff_exp, wgt, 0,
+                       0, 0, &bg, &bu, &bd);
             }
             if (hp.n_expert_shared > 0) {
                 swiglu(lay.gate_shexp, lay.up_shexp,
