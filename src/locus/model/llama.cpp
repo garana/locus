@@ -449,17 +449,12 @@ void LlamaModel::forward(tok::TokenId token,
 }
 
 bool LlamaModel::supports_batch() const {
-    // First increment: dense llama (materialized-KV) only. MLA
-    // (deepseek2/glm-dsa) and MoE add batched attention/routing.
-    if (hp_.arch != Arch::kLlama || hp_.n_expert != 0) {
-        return false;
-    }
-    for (const Layer& lay : layers_) {
-        if (lay.is_moe()) {
-            return false;
-        }
-    }
-    return true;
+    // forward_batch batches the FFN through op.matvec and reuses
+    // the per-token attention, so every CPU/CUDA arch (llama /
+    // deepseek2 / glm-dsa, dense or MoE) is supported. The Vulkan
+    // backend has its own full forward (vulkan_forward) that this
+    // CPU-driver path would bypass, so it opts out.
+    return backend_->name != "vulkan";
 }
 
 void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
@@ -468,15 +463,13 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
                                Workspace& ws,
                                std::span<float> logits) const {
     using namespace locus::backend;
-    (void)ws;  // N-wide scratch is local for now; a batched
-               // workspace is a later optimization.
     const auto n = static_cast<std::uint32_t>(toks.size());
     if (n == 0) {
         throw std::invalid_argument("forward_batch: empty batch");
     }
     if (!supports_batch()) {
         throw std::invalid_argument(
-            "forward_batch: unsupported arch (dense llama only)");
+            "forward_batch: unsupported backend");
     }
     const std::uint32_t base = seq.n_tokens;
     for (auto t : toks) {
@@ -491,20 +484,14 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
     }
     const Ops& op = backend_->ops;
     const std::uint32_t E = hp_.n_embd;
-    const std::uint32_t hd = hp_.head_dim;
-    const std::size_t kv_dim = spec_->kv_dim(hp_);
-    const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
     const std::uint32_t ff = hp_.n_ff;
 
-    // N-wide activation scratch (row-major: token t at [t*dim]).
+    // Per-token residual stream x, plus batched dense-FFN scratch.
     std::vector<float> x(static_cast<std::size_t>(n) * E);
-    std::vector<float> xb(static_cast<std::size_t>(n) * E);
-    std::vector<float> q(static_cast<std::size_t>(n) * E);
-    std::vector<float> out(static_cast<std::size_t>(n) * E);
+    std::vector<float> xbf(static_cast<std::size_t>(n) * E);
     std::vector<float> xb2(static_cast<std::size_t>(n) * E);
     std::vector<float> gate(static_cast<std::size_t>(n) * ff);
     std::vector<float> up(static_cast<std::size_t>(n) * ff);
-    std::vector<float> att(hp_.n_ctx);  // reused per token
 
     for (std::uint32_t t = 0; t < n; ++t) {
         op.dequant_row(embd_, static_cast<std::uint32_t>(toks[t]),
@@ -514,95 +501,62 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
 
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
-        // Attention rmsnorm, then Q/K/V projections weight-
-        // stationary (each weight touched once across the batch).
+        // Attention per token via the shared arch implementation
+        // (reusing it keeps every arch byte-identical to the
+        // sequential path). The attention projections are the only
+        // weights not yet batched here.
         for (std::uint32_t t = 0; t < n; ++t) {
             const std::size_t o = static_cast<std::size_t>(t) * E;
             rmsnorm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
-                    {xb.data() + o, E});
-        }
-        matvec_batch(op, lay.wq, xb, q, n);
-        for (std::uint32_t t = 0; t < n; ++t) {
-            const std::size_t o = static_cast<std::size_t>(t) * E;
-            op.matvec(lay.wk, {xb.data() + o, E},
-                      {cache.k(seq, l, base + t), kv_dim});
-            op.matvec(lay.wv, {xb.data() + o, E},
-                      {cache.v(seq, l, base + t), kv_dim});
-        }
-        for (std::uint32_t t = 0; t < n; ++t) {
-            const std::uint32_t pos = base + t;
-            rope_norm({q.data() + static_cast<std::size_t>(t) * E,
-                       E},
-                      hp_.n_heads, hd, pos, hp_.rope_freq_base,
-                      rope_factors_);
-            rope_norm({cache.k(seq, l, pos), kv_dim}, hp_.n_kv_heads,
-                      hd, pos, hp_.rope_freq_base, rope_factors_);
-        }
-        // Per-token attention (no large weights; mirrors
-        // llama_attention with pos = base + t).
-        for (std::uint32_t t = 0; t < n; ++t) {
-            const std::uint32_t pos = base + t;
-            const float* qb = q.data() + static_cast<std::size_t>(
-                                             t) * E;
-            float* ob = out.data() + static_cast<std::size_t>(t) * E;
-            for (std::uint32_t h = 0; h < hp_.n_heads; ++h) {
-                const float* qh =
-                    qb + static_cast<std::size_t>(h) * hd;
-                const std::size_t kvh =
-                    static_cast<std::size_t>(h / group) * hd;
-                std::span<float> a(att.data(), pos + 1);
-                for (std::uint32_t s = 0; s <= pos; ++s) {
-                    const float* kt = cache.k(seq, l, s) + kvh;
-                    float sc = 0.0f;
-                    for (std::uint32_t i = 0; i < hd; ++i) {
-                        sc += qh[i] * kt[i];
-                    }
-                    a[s] = sc * hp_.kq_scale;
-                }
-                softmax_inplace(a);
-                float* oh = ob + static_cast<std::size_t>(h) * hd;
-                for (std::uint32_t i = 0; i < hd; ++i) {
-                    oh[i] = 0.0f;
-                }
-                for (std::uint32_t s = 0; s <= pos; ++s) {
-                    const float* vt = cache.v(seq, l, s) + kvh;
-                    const float av = a[s];
-                    for (std::uint32_t i = 0; i < hd; ++i) {
-                        oh[i] += av * vt[i];
-                    }
-                }
+                    ws.xb);
+            spec_->attention(*this, lay, cache, seq, ws, l,
+                             base + t);
+            matvec_mt(op, lay.wo, ws.out, ws.xb2);
+            for (std::uint32_t i = 0; i < E; ++i) {
+                x[o + i] += ws.xb2[i];
             }
         }
-        matvec_batch(op, lay.wo, out, xb2, n);
-        for (std::uint32_t i = 0;
-             i < static_cast<std::size_t>(n) * E; ++i) {
-            x[i] += xb2[i];
-        }
-        // Dense FFN, weight-stationary.
-        for (std::uint32_t t = 0; t < n; ++t) {
-            const std::size_t o = static_cast<std::size_t>(t) * E;
-            rmsnorm({x.data() + o, E}, lay.ffn_norm, hp_.rms_eps,
-                    {xb.data() + o, E});
-        }
-        matvec_batch(op, lay.w_gate, xb, gate, n);
-        matvec_batch(op, lay.w_up, xb, up, n);
-        for (std::uint32_t t = 0; t < n; ++t) {
-            const std::size_t o = static_cast<std::size_t>(t) * ff;
-            silu_mul({gate.data() + o, ff}, {up.data() + o, ff},
-                     {gate.data() + o, ff});
-        }
-        matvec_batch(op, lay.w_down, gate, xb2, n);
-        for (std::uint32_t i = 0;
-             i < static_cast<std::size_t>(n) * E; ++i) {
-            x[i] += xb2[i];
+        if (!lay.is_moe()) {
+            // Dense FFN: weight-stationary batched matvecs.
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const std::size_t o =
+                    static_cast<std::size_t>(t) * E;
+                rmsnorm({x.data() + o, E}, lay.ffn_norm,
+                        hp_.rms_eps, {xbf.data() + o, E});
+            }
+            matvec_batch(op, lay.w_gate, xbf, gate, n);
+            matvec_batch(op, lay.w_up, xbf, up, n);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const std::size_t o =
+                    static_cast<std::size_t>(t) * ff;
+                silu_mul({gate.data() + o, ff}, {up.data() + o, ff},
+                         {gate.data() + o, ff});
+            }
+            matvec_batch(op, lay.w_down, gate, xb2, n);
+            for (std::uint32_t i = 0;
+                 i < static_cast<std::size_t>(n) * E; ++i) {
+                x[i] += xb2[i];
+            }
+        } else {
+            // MoE per token (byte-identical). Batching the routed
+            // experts weight-stationary is the follow-on (step 3b).
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const std::size_t o =
+                    static_cast<std::size_t>(t) * E;
+                rmsnorm({x.data() + o, E}, lay.ffn_norm,
+                        hp_.rms_eps, ws.xb);
+                moe_ffn(lay, ws, l);
+                for (std::uint32_t i = 0; i < E; ++i) {
+                    x[o + i] += ws.moe_acc[i];
+                }
+            }
         }
     }
 
     // Only the last token needs logits (prefill semantics).
     const std::size_t last = static_cast<std::size_t>(n - 1) * E;
-    rmsnorm({x.data() + last, E}, out_norm_, hp_.rms_eps,
-            {xb.data(), E});
-    matvec_mt(op, out_w_, {xb.data(), E}, logits);
+    rmsnorm({x.data() + last, E}, out_norm_, hp_.rms_eps, ws.xb);
+    matvec_mt(op, out_w_, ws.xb, logits);
     seq.n_tokens = base + n;
 }
 

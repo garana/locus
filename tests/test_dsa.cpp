@@ -149,6 +149,52 @@ std::vector<std::vector<float>> run(
 
 }  // namespace
 
+TEST_CASE("batched forward matches sequential (deepseek2 MLA)",
+          "[batch]") {
+    // R10: forward_batch must be byte-identical to N forward()
+    // calls on the MLA path (attention reused per token, dense
+    // FFN batched).
+    auto img = build_image("deepseek2");
+    auto g = locus::gguf::GgufFile::parse(img);
+    auto model = LlamaModel::load(g);
+    REQUIRE(model.supports_batch());
+    const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 9};
+    const auto& hp = model.hparams();
+    // MLA caches one latent row (kv_lora + rope) per token; the V
+    // half is unused, so compare only the K (latent) rows.
+    const std::size_t kvd = hp.kv_lora_rank + hp.qk_rope_dim;
+
+    auto snapshot = [&](bool batched) {
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(hp.n_vocab);
+        if (batched) {
+            REQUIRE(cache.ensure_capacity(seq, toks.size()));
+            model.forward_batch(toks, cache, seq, ws, logits);
+        } else {
+            for (auto t : toks) {
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(t, cache, seq, ws, logits);
+            }
+        }
+        std::vector<float> kv;
+        for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
+            for (std::uint32_t p = 0; p < seq.n_tokens; ++p) {
+                const float* k = cache.k(seq, l, p);
+                kv.insert(kv.end(), k, k + kvd);
+            }
+        }
+        cache.release(seq);
+        return std::pair{logits, kv};
+    };
+
+    auto [log_seq, kv_seq] = snapshot(false);
+    auto [log_bat, kv_bat] = snapshot(true);
+    REQUIRE(log_bat == log_seq);
+    REQUIRE(kv_bat == kv_seq);
+}
+
 TEST_CASE("dsa index score applies relu and head weights",
           "[dsa]") {
     // 2 heads x 2 dims. Head 0 dot = 1*1 + 0*2 = 1 (kept),
