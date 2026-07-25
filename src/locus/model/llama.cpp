@@ -538,18 +538,16 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
                 x[i] += xb2[i];
             }
         } else {
-            // MoE per token (byte-identical). Batching the routed
-            // experts weight-stationary is the follow-on (step 3b).
+            // MoE: ffn-norm all tokens, then apply the routed
+            // experts weight-stationary (each read once across the
+            // tokens that picked it). Byte-identical to per token.
             for (std::uint32_t t = 0; t < n; ++t) {
                 const std::size_t o =
                     static_cast<std::size_t>(t) * E;
                 rmsnorm({x.data() + o, E}, lay.ffn_norm,
-                        hp_.rms_eps, ws.xb);
-                moe_ffn(lay, ws, l);
-                for (std::uint32_t i = 0; i < E; ++i) {
-                    x[o + i] += ws.moe_acc[i];
-                }
+                        hp_.rms_eps, {xbf.data() + o, E});
             }
+            moe_ffn_batch(lay, l, xbf, x, n, ws);
         }
     }
 
@@ -727,6 +725,155 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
         swiglu_into_acc(lay.gate_shexp, lay.up_shexp,
                         lay.down_shexp,
                         n_ff * hp_.n_expert_shared, 1.0f);
+    }
+}
+
+void LlamaModel::moe_ffn_batch(const Layer& lay,
+                               std::uint32_t layer,
+                               const std::vector<float>& xbf,
+                               std::vector<float>& x,
+                               std::uint32_t n, Workspace& ws) const {
+    using namespace locus::backend;
+    const Ops& op = backend_->ops;
+    const std::uint32_t E = hp_.n_embd;
+    const std::uint32_t ff = hp_.n_ff_exp;
+    const std::uint32_t k = hp_.n_expert_used;
+
+    // Phase 1: route each token (byte-identical to moe_ffn).
+    std::vector<std::vector<std::pair<std::uint32_t, float>>>
+        picked(n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        op.matvec(
+            lay.gate_inp,
+            {xbf.data() + static_cast<std::size_t>(t) * E, E},
+            ws.router);
+        picked[t] = moe_select(hp_, lay, ws.router);
+        if (MoeStats::enabled()) {
+            for (const auto& [e, wgt] : picked[t]) {
+                MoeStats::record(layer, e, hp_.n_layers,
+                                 hp_.n_expert);
+            }
+        }
+    }
+
+    // Group (token, slot) by expert so each expert's weights are
+    // read once across the tokens that picked it.
+    struct Use {
+        std::uint32_t e, t, s;
+    };
+    std::vector<Use> uses;
+    uses.reserve(static_cast<std::size_t>(n) * k);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        for (std::uint32_t s = 0;
+             s < static_cast<std::uint32_t>(picked[t].size());
+             ++s) {
+            uses.push_back({picked[t][s].first, t, s});
+        }
+    }
+    std::sort(uses.begin(), uses.end(),
+              [](const Use& a, const Use& b) { return a.e < b.e; });
+
+    // Readahead the union once (first appearance of each expert).
+    if (readahead_enabled()) {
+        std::uint32_t prev = UINT32_MAX;
+        for (const auto& u : uses) {
+            if (u.e == prev) {
+                continue;
+            }
+            prev = u.e;
+            const Mat g = lay.gate_exps.expert(u.e);
+            const Mat up = lay.up_exps.expert(u.e);
+            const Mat d = lay.down_exps.expert(u.e);
+            sys::advise_willneed(g.data, lay.gate_exps.expert_bytes);
+            sys::advise_willneed(up.data, lay.up_exps.expert_bytes);
+            sys::advise_willneed(d.data, lay.down_exps.expert_bytes);
+            if (op.prefetch != nullptr) {
+                op.prefetch(g);
+                op.prefetch(up);
+                op.prefetch(d);
+            }
+        }
+    }
+
+    // Phase 3: weight-stationary swiglu -> res[(t*k + s)*E].
+    std::vector<float> res(static_cast<std::size_t>(n) * k * E);
+    std::vector<float> down(E);
+    auto swiglu = [&](const Mat& wg, const Mat& wu, const Mat& wd,
+                      std::uint32_t ffw, const float* xin,
+                      float* dout) {
+        matvec_mt(op, wg, {xin, E}, {ws.gate.data(), ffw});
+        matvec_mt(op, wu, {xin, E}, {ws.up.data(), ffw});
+        silu_mul({ws.gate.data(), ffw}, {ws.up.data(), ffw},
+                 {ws.gate.data(), ffw});
+        matvec_mt(op, wd, {ws.gate.data(), ffw}, {dout, E});
+    };
+    std::uint32_t cur = UINT32_MAX;
+    Mat wg, wu, wd;
+    for (const auto& u : uses) {
+        if (u.e != cur) {
+            cur = u.e;
+            wg = lay.gate_exps.expert(u.e);
+            wu = lay.up_exps.expert(u.e);
+            wd = lay.down_exps.expert(u.e);
+        }
+        swiglu(wg, wu, wd, ff,
+               xbf.data() + static_cast<std::size_t>(u.t) * E,
+               down.data());
+        const float wgt = picked[u.t][u.s].second;
+        float* r = res.data() +
+                   (static_cast<std::size_t>(u.t) * k + u.s) * E;
+        for (std::uint32_t i = 0; i < E; ++i) {
+            r[i] = wgt * down[i];
+        }
+    }
+
+    // Weight window on the union (opt-in), after routed use.
+    if (file_backed_ && std::getenv("LOCUS_WEIGHT_WINDOW")) {
+        std::uint32_t prev = UINT32_MAX;
+        for (const auto& u : uses) {
+            if (u.e == prev) {
+                continue;
+            }
+            prev = u.e;
+            sys::advise_dontneed(lay.gate_exps.expert(u.e).data,
+                                 lay.gate_exps.expert_bytes);
+            sys::advise_dontneed(lay.up_exps.expert(u.e).data,
+                                 lay.up_exps.expert_bytes);
+            sys::advise_dontneed(lay.down_exps.expert(u.e).data,
+                                 lay.down_exps.expert_bytes);
+        }
+    }
+
+    // Phase 4: per-token mixture in moe_select order, then shared,
+    // then into the residual -- byte-identical to moe_ffn's
+    // moe_acc accumulation followed by x += moe_acc.
+    std::vector<float> acc(E);
+    const std::uint32_t ffs = ff * hp_.n_expert_shared;
+    for (std::uint32_t t = 0; t < n; ++t) {
+        std::fill(acc.begin(), acc.end(), 0.0f);
+        for (std::uint32_t s = 0;
+             s < static_cast<std::uint32_t>(picked[t].size());
+             ++s) {
+            const float* r =
+                res.data() +
+                (static_cast<std::size_t>(t) * k + s) * E;
+            for (std::uint32_t i = 0; i < E; ++i) {
+                acc[i] += r[i];
+            }
+        }
+        if (hp_.n_expert_shared > 0) {
+            swiglu(lay.gate_shexp, lay.up_shexp, lay.down_shexp,
+                   ffs,
+                   xbf.data() + static_cast<std::size_t>(t) * E,
+                   down.data());
+            for (std::uint32_t i = 0; i < E; ++i) {
+                acc[i] += down[i];
+            }
+        }
+        float* xt = x.data() + static_cast<std::size_t>(t) * E;
+        for (std::uint32_t i = 0; i < E; ++i) {
+            xt[i] += acc[i];
+        }
     }
 }
 

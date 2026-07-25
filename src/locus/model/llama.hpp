@@ -231,6 +231,20 @@ class LlamaModel {
     void moe_ffn(const Layer& lay, Workspace& ws,
                  std::uint32_t layer) const;
 
+    /**
+     * Batched MoE (R10 step 3b): routes n tokens (ffn-normed
+     * inputs in xbf, n*n_embd), then applies the routed experts
+     * WEIGHT-STATIONARY -- each expert's gate/up/down is read once
+     * across the tokens that picked it -- accumulating into the
+     * residual x (n*n_embd). Byte-identical to n moe_ffn() calls:
+     * each token's mixture is summed in moe_select order (routed
+     * then shared) before adding to x.
+     */
+    void moe_ffn_batch(const Layer& lay, std::uint32_t layer,
+                       const std::vector<float>& xbf,
+                       std::vector<float>& x, std::uint32_t n,
+                       Workspace& ws) const;
+
     Hparams hp_;
     const struct ArchSpec* spec_ = nullptr;
     const backend::Backend* backend_ = nullptr;
