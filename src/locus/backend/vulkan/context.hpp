@@ -12,6 +12,7 @@ enum class Kernel {
     kMatvecF16,
     kMatvecQ8_0,
     kMatvecQ4_0,
+    kMatvecQ5_0,
     kMatvecQ4_K,
     kMatvecQ5_K,
     kMatvecQ6_K,

@@ -1,0 +1,59 @@
+#version 450
+
+// Q5_0 matvec: 22-byte blocks (f16 scale + u32 qh high-bits + 16
+// nibble bytes). Element j (0..15) is qs[j]'s low nibble plus its
+// 5th bit from qh bit j; element j+16 is qs[j]'s high nibble plus
+// its 5th bit from qh bit j+16. Both are offset by -16. Read
+// through a uint view as in matvec_q4_0.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint out_offset;
+    uint accumulate;
+    uint w_off;   // element offset (f32/f16), byte offset (quant)
+    uint x_off;
+    float scale;
+} pc;
+
+uint byte_at(uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.rows) {
+        return;
+    }
+    uint nb = pc.cols / 32u;
+    uint row_base = pc.w_off + r * nb * 22u;
+    float acc = 0.0;
+    for (uint b = 0; b < nb; ++b) {
+        uint at = row_base + b * 22u;
+        float d = unpackHalf2x16(byte_at(at) |
+                                 (byte_at(at + 1u) << 8u)).x;
+        uint qh = byte_at(at + 2u) | (byte_at(at + 3u) << 8u) |
+                  (byte_at(at + 4u) << 16u) |
+                  (byte_at(at + 5u) << 24u);
+        float s = 0.0;
+        for (uint i = 0; i < 16u; ++i) {
+            uint q = byte_at(at + 6u + i);
+            uint xh0 = ((qh >> i) << 4u) & 0x10u;
+            uint xh1 = (qh >> (i + 12u)) & 0x10u;
+            s += (float((q & 0xfu) | xh0) - 16.0) *
+                 x[pc.x_off + b * 32u + i];
+            s += (float((q >> 4u) | xh1) - 16.0) *
+                 x[pc.x_off + b * 32u + i + 16u];
+        }
+        acc += d * s;
+    }
+    uint at_out = pc.out_offset + r;
+    float v = acc * pc.scale;
+    o[at_out] = pc.accumulate != 0 ? o[at_out] + v : v;
+}

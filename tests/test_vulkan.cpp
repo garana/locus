@@ -176,6 +176,32 @@ TEST_CASE("vulkan f16 and q4_0 matvec match the CPU reference",
                     Catch::Approx(cpu[r]).margin(1e-3));
         }
     }
+
+    SECTION("q5_0") {
+        // 22-byte blocks: f16 d + u32 qh + 16 qs bytes; qh and qs
+        // fully random so the 5th-bit path is exercised.
+        std::vector<std::byte> w(rows * (cols / 32) * 22);
+        std::uniform_int_distribution<int> byte(0, 255);
+        for (std::size_t b = 0; b < rows * (cols / 32); ++b) {
+            std::byte* blk = w.data() + b * 22;
+            const std::uint16_t d =
+                locus::backend::f32_to_f16(0.25f);
+            std::memcpy(blk, &d, 2);
+            for (int i = 0; i < 20; ++i) {
+                blk[2 + i] =
+                    static_cast<std::byte>(byte(rng));
+            }
+        }
+        std::vector<float> cpu(rows), gpu(rows);
+        locus::backend::Mat m{locus::gguf::TensorType::kQ5_0,
+                               w.data(), rows, cols};
+        locus::backend::matvec(m, x, cpu);
+        run_kernel(Kernel::kMatvecQ5_0, w, gpu);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(gpu[r] ==
+                    Catch::Approx(cpu[r]).margin(1e-3));
+        }
+    }
 }
 
 TEST_CASE("vulkan k-quant matvec matches the CPU reference",

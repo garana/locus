@@ -14,6 +14,7 @@
 #include "attn_paged_spv.h"
 #include "matvec_f16_spv.h"
 #include "matvec_q4_0_spv.h"
+#include "matvec_q5_0_spv.h"
 #include "matvec_q4_k_spv.h"
 #include "matvec_q5_k_spv.h"
 #include "matvec_q6_k_spv.h"
@@ -50,6 +51,8 @@ const KernelDesc& kernel_desc(Kernel k) {
         {locus_matvec_q8_0_spv, sizeof(locus_matvec_q8_0_spv),
          3, 28},
         {locus_matvec_q4_0_spv, sizeof(locus_matvec_q4_0_spv),
+         3, 28},
+        {locus_matvec_q5_0_spv, sizeof(locus_matvec_q5_0_spv),
          3, 28},
         {locus_matvec_q4_k_spv, sizeof(locus_matvec_q4_k_spv),
          3, 28},
