@@ -432,6 +432,34 @@ mere residency. (The Pi's tile GPU is slower than its CPU here,
 so the "GPU faster than CPU" perf assertion is a reported WARN,
 not a gate.)
 
+Prefetch (phase 3) DROPPED for Vulkan (2026-07-24, measured on
+V3D by profiling matvec_vulkan). On llama-3.2-1b, compute
+(end_batch submit+wait over the matvec shaders) is a fixed
+~66.8s for 16 tokens whether the pool is unbounded or paging
+hard; upload (a plain memcpy into HOST_COHERENT unified memory,
+no DMA engine) is 0.28% of compute unbounded and only 4.5% even
+under pathological paging (589 evictions, 14GB re-uploaded). So
+prefetch's absolute ceiling is <5%, and the overlap-with-compute
+fraction on a synchronous end_batch is realistically <2% -- not
+worth a second queue or a warm() pool variant. The measure-first
+plan paid off: the numbers killed it before any code landed.
+
+The real Vulkan MoE inefficiency (found in the same pass, now
+the next item): the MoE path uploads ALL hp.n_expert experts per
+layer per token via whole(), though only expert_used_count are
+routed (64 vs 6 on deepseek-v2-lite) -- ~10x wasted memcpy and
+residency. Fix: pool.acquire per PICKED expert (each
+expert(e).data is a distinct key, matching the pager's
+per-expert granularity), remapping the shader w_off from
+e*expert_bytes to the compact per-expert buffer. Likely the
+cause of, and fix for, the Pi's 10GB-MoE Vulkan crash: on the
+4GB Pi, deepseek-v2-lite on --backend vulkan SIGSEGVs
+(pool=2048MB) / OOM-kills (pool=256MB) because the whole-expert
+upload plus F32 dequant temporaries exceed RAM on top of the
+mmap -- it crashes rather than degrading. A graceful
+device-alloc guard (clean throw instead of SIGSEGV) is a
+secondary follow-up.
+
 ### R9: threaded execution and static pinning (CPU)
 
 Motivation (measured, GLM-5.2 on the 32GB m2). With readahead
