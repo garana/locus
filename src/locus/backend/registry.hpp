@@ -31,6 +31,16 @@ struct Ops {
      * resident. Fire-and-forget: it never blocks and may no-op.
      */
     void (*prefetch)(const Mat& w);
+    /**
+     * True when matvec() may be called concurrently from several
+     * threads (the R9 row-split, matvec_mt). The CPU kernels and
+     * the CUDA pager are re-entrant; the Vulkan backend drives a
+     * single-threaded VulkanContext singleton, so it sets this
+     * false and matvec_mt runs it inline. Applies to the
+     * per-op fallback path, which is the only time a GPU
+     * backend's matvec() is reached through matvec_mt.
+     */
+    bool mt_safe = true;
 };
 
 /**

@@ -81,6 +81,14 @@ void advise_layer_statics(const LlamaModel::Layer& lay) {
 
 void matvec_mt(const backend::Ops& op, const Mat& w,
                std::span<const float> x, std::span<float> out) {
+    // A backend whose matvec is not re-entrant (Vulkan's single
+    // VulkanContext singleton) must run inline: parallel calls
+    // crash the driver. This path is hit when a GPU full-forward
+    // bails to the per-op fallback on an unshadered weight type.
+    if (!op.mt_safe) {
+        op.matvec(w, x, out);
+        return;
+    }
     // Below this many rows per slice the dispatch overhead wins.
     constexpr std::uint32_t kMinRowsPerSlice = 64;
     auto& pool = sys::ThreadPool::instance();

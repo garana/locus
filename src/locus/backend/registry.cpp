@@ -45,7 +45,8 @@ const std::vector<Backend>& list() {
                      "(F32/F16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K)",
                      vk, vk,
                      {&matvec_vulkan, &dequant_row,
-                      &vulkan_alloc_kv, nullptr}});
+                      &vulkan_alloc_kv, nullptr,
+                      /*mt_safe=*/false}});
         const bool cu = cuda_backend_usable();
         b.push_back({"cuda",
                      "NVIDIA CUDA matvec (F32/Q8_0/Q4_K/Q5_K/Q6_K/"
