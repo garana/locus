@@ -703,13 +703,21 @@ batching are DONE.
   batched across all N. Byte-identical to N forward() calls
   ([batch] test: 4 sequences, distinct contexts). This is the
   executor-level continuous-batching primitive.
-Remaining: (4b, engine) wire step() to gather running sequences
-into a batched decode call (phase-based scheduler: prefill ->
-sample -> batched decode-forward, per-request logits, preemption
-in the batched path) -- the throughput payoff, guarded by the
-concurrent-streams/preemption goldens; (5) the optional
-dequant-amortization kernel (token-exact); (6) measure ingestion
-I/O and multi-request decode throughput (Pi/vx).
+- (4b, engine) commit 724ff13: step_batched() (Config::
+  batched_decode, default OFF) runs prefill -> sample -> ONE
+  forward_batch_decode for every running sequence with a pending
+  token, with per-request logits and preemption confined to the
+  not-yet-gathered tail. Byte-identical to the per-sequence
+  scheduler: [engine] A/B test matches generated tokens across 4
+  streams on a comfortable pool AND a tight pool (forces
+  preemption + recompute in both paths).
+So the whole batched-forward stack -- prefill + continuous-batch
+decode, all archs, batched MoE experts -- is byte-identical and
+in place. Remaining, both optional/deferred: (5) the
+dequant-amortization batched kernel (token-exact compute win on
+the quantized single-core path); (6) measure ingestion I/O and
+multi-request decode throughput on the Pi/vx, then flip
+batched_decode default-on once validated on real models.
 
 Risk note: forward_batch duplicates the forward + per-arch
 attention shape, so it lands as NEW code validated against the
