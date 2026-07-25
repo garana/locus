@@ -437,6 +437,95 @@ TEST_CASE("batched forward matches N sequential forwards",
     REQUIRE(kv_bat == kv_seq);    // bit-identical KV cache
 }
 
+TEST_CASE("batched decode matches per-sequence decode",
+          "[batch]") {
+    // R10 step 4b: forward_batch_decode over N independent
+    // sequences must be byte-identical to N separate forward()
+    // decode calls -- logits and each sequence's KV.
+    ModelBuilder mb;
+    mb.common();
+    mb.tensor("blk.0.ffn_gate.weight", {kE, kF},
+              weights(kE * kF, 90));
+    mb.tensor("blk.0.ffn_up.weight", {kE, kF},
+              weights(kE * kF, 91));
+    mb.tensor("blk.0.ffn_down.weight", {kF, kE},
+              weights(kF * kE, 92));
+    auto img = mb.build(0, 0);
+    auto g = locus::gguf::GgufFile::parse(img);
+    auto model = LlamaModel::load(g);
+    REQUIRE(model.supports_batch());
+    const auto& hp = model.hparams();
+    const std::uint32_t V = hp.n_vocab;
+    const std::size_t kvd =
+        static_cast<std::size_t>(hp.n_kv_heads) * hp.head_dim;
+
+    // N sequences with distinct prefill contexts + a decode token.
+    const std::vector<std::vector<locus::tok::TokenId>> ctx = {
+        {3, 7}, {1, 5, 9}, {2}, {4, 8, 6, 0}};
+    const std::vector<locus::tok::TokenId> next = {5, 2, 7, 1};
+    const std::uint32_t N = 4;
+
+    auto prefill = [&](locus::kv::PagedKvCache& cache,
+                       std::vector<locus::kv::PagedKvCache::Seq>&
+                           seqs,
+                       LlamaModel::Workspace& ws) {
+        std::vector<float> logits(V);
+        for (std::uint32_t i = 0; i < N; ++i) {
+            for (auto t : ctx[i]) {
+                REQUIRE(cache.ensure_capacity(seqs[i], 1));
+                model.forward(t, cache, seqs[i], ws, logits);
+            }
+        }
+    };
+
+    // Sequential decode.
+    auto cacheA = model.make_cache(8);
+    auto wsA = model.make_workspace();
+    std::vector<locus::kv::PagedKvCache::Seq> seqsA(N);
+    prefill(cacheA, seqsA, wsA);
+    std::vector<std::vector<float>> logA(N,
+                                         std::vector<float>(V));
+    for (std::uint32_t i = 0; i < N; ++i) {
+        REQUIRE(cacheA.ensure_capacity(seqsA[i], 1));
+        model.forward(next[i], cacheA, seqsA[i], wsA, logA[i]);
+    }
+
+    // Batched decode.
+    auto cacheB = model.make_cache(8);
+    auto wsB = model.make_workspace();
+    std::vector<locus::kv::PagedKvCache::Seq> seqsB(N);
+    prefill(cacheB, seqsB, wsB);
+    std::vector<locus::kv::PagedKvCache::Seq*> ptrs;
+    for (std::uint32_t i = 0; i < N; ++i) {
+        REQUIRE(cacheB.ensure_capacity(seqsB[i], 1));
+        ptrs.push_back(&seqsB[i]);
+    }
+    std::vector<float> logB(static_cast<std::size_t>(N) * V);
+    model.forward_batch_decode(next, cacheB, ptrs, wsB, logB);
+
+    for (std::uint32_t i = 0; i < N; ++i) {
+        REQUIRE(seqsB[i].n_tokens == seqsA[i].n_tokens);
+        std::vector<float> got(
+            logB.begin() + static_cast<std::ptrdiff_t>(i) * V,
+            logB.begin() + static_cast<std::ptrdiff_t>(i + 1) * V);
+        REQUIRE(got == logA[i]);  // byte-identical logits
+        // Byte-identical KV for this sequence.
+        for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
+            for (std::uint32_t p = 0; p < seqsA[i].n_tokens; ++p) {
+                const float* ka = cacheA.k(seqsA[i], l, p);
+                const float* kb = cacheB.k(seqsB[i], l, p);
+                for (std::size_t j = 0; j < kvd; ++j) {
+                    REQUIRE(ka[j] == kb[j]);
+                }
+            }
+        }
+    }
+    for (std::uint32_t i = 0; i < N; ++i) {
+        cacheA.release(seqsA[i]);
+        cacheB.release(seqsB[i]);
+    }
+}
+
 TEST_CASE("batched forward matches sequential (llama MoE)",
           "[batch]") {
     // R10: MoE FFN runs per token inside forward_batch, so it

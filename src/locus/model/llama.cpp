@@ -558,6 +558,106 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
     seq.n_tokens = base + n;
 }
 
+void LlamaModel::forward_batch_decode(
+    std::span<const tok::TokenId> toks, kv::PagedKvCache& cache,
+    std::span<kv::PagedKvCache::Seq* const> seqs, Workspace& ws,
+    std::span<float> logits) const {
+    using namespace locus::backend;
+    const auto n = static_cast<std::uint32_t>(toks.size());
+    if (n == 0) {
+        throw std::invalid_argument("forward_batch_decode: empty");
+    }
+    if (seqs.size() != n) {
+        throw std::invalid_argument(
+            "forward_batch_decode: seqs/tokens size mismatch");
+    }
+    if (!supports_batch()) {
+        throw std::invalid_argument(
+            "forward_batch_decode: unsupported backend");
+    }
+    const Ops& op = backend_->ops;
+    const std::uint32_t E = hp_.n_embd;
+    const std::uint32_t ff = hp_.n_ff;
+    const std::uint32_t V = hp_.n_vocab;
+
+    // Each token is an independent sequence at its own position.
+    std::vector<std::uint32_t> pos(n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        if (toks[t] < 0 ||
+            static_cast<std::uint32_t>(toks[t]) >= hp_.n_vocab) {
+            throw std::invalid_argument("token id out of vocab");
+        }
+        pos[t] = seqs[t]->n_tokens;
+        if (pos[t] + 1 > hp_.n_ctx ||
+            pos[t] + 1 > cache.capacity(*seqs[t])) {
+            throw std::invalid_argument(
+                "forward_batch_decode: seq capacity not ensured");
+        }
+    }
+
+    std::vector<float> x(static_cast<std::size_t>(n) * E);
+    std::vector<float> xbf(static_cast<std::size_t>(n) * E);
+    std::vector<float> xb2(static_cast<std::size_t>(n) * E);
+    std::vector<float> gate(static_cast<std::size_t>(n) * ff);
+    std::vector<float> up(static_cast<std::size_t>(n) * ff);
+
+    for (std::uint32_t t = 0; t < n; ++t) {
+        op.dequant_row(embd_, static_cast<std::uint32_t>(toks[t]),
+                       {x.data() + static_cast<std::size_t>(t) * E,
+                        E});
+    }
+
+    for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
+        const Layer& lay = layers_[l];
+        // Attention: each token against ITS OWN sequence's cache.
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const std::size_t o = static_cast<std::size_t>(t) * E;
+            rmsnorm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
+                    ws.xb);
+            spec_->attention(*this, lay, cache, *seqs[t], ws, l,
+                             pos[t]);
+            matvec_mt(op, lay.wo, ws.out, ws.xb2);
+            for (std::uint32_t i = 0; i < E; ++i) {
+                x[o + i] += ws.xb2[i];
+            }
+        }
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const std::size_t o = static_cast<std::size_t>(t) * E;
+            rmsnorm({x.data() + o, E}, lay.ffn_norm, hp_.rms_eps,
+                    {xbf.data() + o, E});
+        }
+        if (!lay.is_moe()) {
+            matvec_batch(op, lay.w_gate, xbf, gate, n);
+            matvec_batch(op, lay.w_up, xbf, up, n);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const std::size_t o =
+                    static_cast<std::size_t>(t) * ff;
+                silu_mul({gate.data() + o, ff}, {up.data() + o, ff},
+                         {gate.data() + o, ff});
+            }
+            matvec_batch(op, lay.w_down, gate, xb2, n);
+            for (std::uint32_t i = 0;
+                 i < static_cast<std::size_t>(n) * E; ++i) {
+                x[i] += xb2[i];
+            }
+        } else {
+            moe_ffn_batch(lay, l, xbf, x, n, ws);
+        }
+    }
+
+    // Every decode token needs logits.
+    for (std::uint32_t t = 0; t < n; ++t) {
+        const std::size_t o = static_cast<std::size_t>(t) * E;
+        rmsnorm({x.data() + o, E}, out_norm_, hp_.rms_eps, ws.xb);
+        matvec_mt(op, out_w_, ws.xb,
+                  logits.subspan(static_cast<std::size_t>(t) * V,
+                                 V));
+    }
+    for (std::uint32_t t = 0; t < n; ++t) {
+        seqs[t]->n_tokens = pos[t] + 1;
+    }
+}
+
 void matvec_batch(const backend::Ops& op, const Mat& w,
                   std::span<const float> x_batch,
                   std::span<float> out_batch, std::uint32_t n) {

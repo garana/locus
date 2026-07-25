@@ -161,9 +161,30 @@ class LlamaModel {
                        kv::PagedKvCache::Seq& seq, Workspace& ws,
                        std::span<float> logits) const;
 
-    /** @returns true when forward_batch supports this model
-     * (dense llama today; extended to MLA/MoE later). */
+    /** @returns true when the batched forwards support this model
+     * (every CPU/CUDA backend + arch; Vulkan opts out). */
     bool supports_batch() const;
+
+    /**
+     * Decodes one token from each of N DIFFERENT sequences in a
+     * single pass (R10 step 4b, continuous-batch decode): token i
+     * belongs to seqs[i] and attends to its own KV cache, while
+     * the weight-bearing ops are batched across all N so each
+     * weight is read once per layer instead of once per sequence.
+     * Byte-identical to N separate forward() calls (the sequences
+     * are independent). Produces logits for every token
+     * (n * n_vocab, token-major) and advances each seq by one.
+     *
+     * @param tokens One in-vocab token id per sequence.
+     * @param seqs   Sequence per token; each must have capacity
+     *     for one more position ensured.
+     * @param logits Out; n * n_vocab floats, token i at [i*n_vocab].
+     */
+    void forward_batch_decode(
+        std::span<const tok::TokenId> tokens,
+        kv::PagedKvCache& cache,
+        std::span<kv::PagedKvCache::Seq* const> seqs,
+        Workspace& ws, std::span<float> logits) const;
 
     /**
      * A 3-D expert tensor: n_expert equally-sized matrices,
