@@ -34,6 +34,9 @@ std::uint32_t Engine::blocks_for(std::uint32_t n_tokens) const {
 }
 
 bool Engine::step() {
+    if (cfg_.batched_decode) {
+        return step_batched();
+    }
     // Admission: FCFS while the pool can cover prompt + headroom.
     while (!waiting_.empty() &&
            running_.size() < cfg_.max_running) {
@@ -81,15 +84,7 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
         // Sample as soon as logits for the last fed token exist.
         if (!prefilling && r.n_fed == n_total && r.n_fed > 0 &&
             r.seq.n_tokens == r.n_fed) {
-            const auto next = model::argmax(logits_);
-            r.generated.push_back(next);
-            if (on_token) {
-                on_token(r, next);
-            }
-            if (next == eos_ ||
-                r.generated.size() >= r.max_new_tokens) {
-                finish(r, Status::kDone);
-            }
+            sample_from(r, logits_);
             return;  // one decode token per iteration
         }
 
@@ -176,6 +171,185 @@ void Engine::run_to_completion() {
 
 const Request* Engine::get(std::uint64_t id) const {
     return id < requests_.size() ? requests_[id].get() : nullptr;
+}
+
+void Engine::sample_from(Request& r,
+                         std::span<const float> logits) {
+    const auto next = model::argmax(logits);
+    r.generated.push_back(next);
+    if (on_token) {
+        on_token(r, next);
+    }
+    if (next == eos_ ||
+        r.generated.size() >= r.max_new_tokens) {
+        finish(r, Status::kDone);
+    }
+}
+
+bool Engine::prefill_only(Request& r, std::uint32_t& budget) {
+    const std::uint32_t n_prompt =
+        static_cast<std::uint32_t>(r.prompt.size());
+    const std::uint32_t V = model_.hparams().n_vocab;
+    if (r.logits.size() != V) {
+        r.logits.assign(V, 0.0f);
+    }
+    while (r.n_fed < n_prompt) {
+        if (budget == 0) {
+            return true;
+        }
+        if (cfg_.batched_prefill && model_.supports_batch()) {
+            const std::uint32_t remaining = n_prompt - r.n_fed;
+            const std::uint32_t nb = std::min(remaining, budget);
+            if (nb >= 2 &&
+                r.n_fed + nb <= model_.hparams().n_ctx &&
+                cache_.ensure_capacity(r.seq, nb)) {
+                model_.forward_batch(
+                    std::span<const tok::TokenId>(
+                        r.prompt.data() + r.n_fed, nb),
+                    cache_, r.seq, ws_, r.logits);
+                r.n_fed += nb;
+                budget -= nb;
+                continue;
+            }
+        }
+        if (r.n_fed + 1 > model_.hparams().n_ctx) {
+            finish(r, Status::kFailed, "context overflow");
+            return false;
+        }
+        if (!cache_.ensure_capacity(r.seq, 1)) {
+            const std::uint64_t victim = running_.back();
+            if (victim == r.id) {
+                if (running_.size() == 1) {
+                    finish(r, Status::kFailed,
+                           "kv pool too small for request");
+                    return false;
+                }
+                return true;  // cannot progress this step
+            }
+            preempt(victim);
+            continue;
+        }
+        model_.forward(r.prompt[r.n_fed], cache_, r.seq, ws_,
+                       r.logits);
+        ++r.n_fed;
+        --budget;
+    }
+    return true;
+}
+
+bool Engine::step_batched() {
+    // Admission: same FCFS policy as step().
+    while (!waiting_.empty() &&
+           running_.size() < cfg_.max_running) {
+        Request& r = *requests_[waiting_.front()];
+        const std::uint32_t want = blocks_for(
+            static_cast<std::uint32_t>(r.prompt.size()) +
+            static_cast<std::uint32_t>(r.generated.size()) +
+            cfg_.decode_headroom);
+        if (want > cache_.free_blocks()) {
+            break;
+        }
+        r.status = Status::kRunning;
+        running_.push_back(r.id);
+        waiting_.pop_front();
+    }
+
+    // Phase 1: prefill each running request still on its prompt.
+    std::uint32_t budget = cfg_.prefill_budget;
+    for (std::size_t i = 0; i < running_.size();) {
+        Request& r = *requests_[running_[i]];
+        if (r.n_fed <
+            static_cast<std::uint32_t>(r.prompt.size())) {
+            if (!prefill_only(r, budget)) {
+                running_.erase(running_.begin() +
+                               static_cast<std::ptrdiff_t>(i));
+                continue;
+            }
+        }
+        ++i;
+    }
+
+    // Phase 2: sample from every request that has caught up.
+    for (std::size_t i = 0; i < running_.size();) {
+        Request& r = *requests_[running_[i]];
+        const std::uint32_t n_total =
+            static_cast<std::uint32_t>(r.prompt.size()) +
+            static_cast<std::uint32_t>(r.generated.size());
+        if (r.n_fed == n_total && r.n_fed > 0 &&
+            r.seq.n_tokens == r.n_fed) {
+            sample_from(r, r.logits);
+            if (r.status != Status::kRunning) {
+                running_.erase(running_.begin() +
+                               static_cast<std::ptrdiff_t>(i));
+                continue;
+            }
+        }
+        ++i;
+    }
+
+    // Phase 3: one forward_batch_decode for every running request
+    // with a pending token (a just-sampled decode token, or a
+    // generated token being recomputed after preemption).
+    std::vector<tok::TokenId> toks;
+    std::vector<kv::PagedKvCache::Seq*> seqs;
+    std::vector<std::uint64_t> ids;
+    for (std::size_t i = 0; i < running_.size();) {
+        Request& r = *requests_[running_[i]];
+        const std::uint32_t n_prompt =
+            static_cast<std::uint32_t>(r.prompt.size());
+        const std::uint32_t n_total =
+            n_prompt +
+            static_cast<std::uint32_t>(r.generated.size());
+        if (r.n_fed < n_prompt || r.n_fed >= n_total) {
+            ++i;  // still prefilling (budget-out) or up to date
+            continue;
+        }
+        if (r.n_fed + 1 > model_.hparams().n_ctx) {
+            finish(r, Status::kFailed, "context overflow");
+            running_.erase(running_.begin() +
+                           static_cast<std::ptrdiff_t>(i));
+            continue;
+        }
+        if (!cache_.ensure_capacity(r.seq, 1)) {
+            const std::uint64_t victim = running_.back();
+            if (victim == r.id) {
+                ++i;  // cannot fit this step; retry next
+                continue;
+            }
+            preempt(victim);  // tail (not yet gathered) -> free it
+            continue;         // retry same index
+        }
+        toks.push_back(r.generated[r.n_fed - n_prompt]);
+        seqs.push_back(&r.seq);
+        ids.push_back(r.id);
+        ++i;
+    }
+    if (!toks.empty()) {
+        const std::uint32_t V = model_.hparams().n_vocab;
+        const std::size_t need =
+            static_cast<std::size_t>(toks.size()) * V;
+        if (batched_logits_.size() < need) {
+            batched_logits_.assign(need, 0.0f);
+        }
+        model_.forward_batch_decode(
+            toks, cache_,
+            std::span<kv::PagedKvCache::Seq* const>(seqs), ws_,
+            std::span<float>(batched_logits_.data(), need));
+        for (std::size_t j = 0; j < ids.size(); ++j) {
+            Request& r = *requests_[ids[j]];
+            if (r.logits.size() != V) {
+                r.logits.assign(V, 0.0f);
+            }
+            std::copy(batched_logits_.begin() +
+                          static_cast<std::ptrdiff_t>(j) * V,
+                      batched_logits_.begin() +
+                          static_cast<std::ptrdiff_t>(j + 1) * V,
+                      r.logits.begin());
+            ++r.n_fed;
+        }
+    }
+
+    return !waiting_.empty() || !running_.empty();
 }
 
 }  // namespace locus::engine

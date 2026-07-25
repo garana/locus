@@ -34,6 +34,9 @@ struct Request {
     kv::PagedKvCache::Seq seq;
     /** Prompt + generated tokens fed through the model so far. */
     std::uint32_t n_fed = 0;
+    /** Logits of the last token fed (batched-decode path only,
+     * where several sequences' forwards interleave in one step). */
+    std::vector<float> logits;
 };
 
 /**
@@ -62,6 +65,11 @@ class Engine {
          * supports it (R10); byte-identical to per-token prefill,
          * fewer weight reads. Off falls back to per-token. */
         bool batched_prefill = true;
+        /** Decode all running sequences in one batched forward per
+         * step (R10 4b) -- the continuous-batching throughput win.
+         * Byte-identical to the per-token scheduler. Off keeps the
+         * per-sequence step(). */
+        bool batched_decode = false;
     };
 
     /**
@@ -113,6 +121,18 @@ class Engine {
   private:
     /** Feeds up to `budget` tokens of r; samples when caught up. */
     void advance(Request& r, std::uint32_t& budget);
+
+    /** One iteration with cross-sequence batched decode (R10 4b):
+     * prefill -> sample -> one forward_batch_decode for every
+     * running sequence with a pending token. */
+    bool step_batched();
+    /** Feeds r's remaining PROMPT (batched or per-token) into
+     * r.logits without sampling; used by step_batched's prefill
+     * phase. @returns false if r finished (context overflow). */
+    bool prefill_only(Request& r, std::uint32_t& budget);
+    /** Samples the next token for r from r.logits, appends it, and
+     * finishes r on EOS / max. @returns the sampled token. */
+    void sample_from(Request& r, std::span<const float> logits);
     /** Releases r's blocks and moves it back to the wait queue. */
     void preempt(std::uint64_t victim_id);
     void finish(Request& r, Status s, std::string error = "");
@@ -125,6 +145,8 @@ class Engine {
     kv::PagedKvCache cache_;
     model::LlamaModel::Workspace ws_;
     std::vector<float> logits_;
+    /** n * n_vocab scratch for the batched-decode step. */
+    std::vector<float> batched_logits_;
 
     std::vector<std::unique_ptr<Request>> requests_;
     std::deque<std::uint64_t> waiting_;

@@ -108,6 +108,47 @@ TEST_CASE("batched prefill matches per-token prefill (engine)",
     REQUIRE(run(true) == run(false));
 }
 
+TEST_CASE("batched decode matches the per-sequence scheduler",
+          "[engine][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    REQUIRE(model.supports_batch());
+
+    const std::vector<std::string> prompts = {
+        "Once upon a time", "The little dog", "One day, Tom",
+        "Once upon a time"};
+    auto run = [&](bool batched, std::uint32_t n_blocks,
+                   std::uint32_t headroom) {
+        Engine::Config cfg;
+        cfg.batched_decode = batched;
+        cfg.n_blocks = n_blocks;
+        cfg.decode_headroom = headroom;
+        Engine engine(model, tok.eos_id(), cfg);
+        std::vector<std::uint64_t> ids;
+        for (const auto& p : prompts) {
+            ids.push_back(engine.submit(tok.encode(p, true), 20));
+        }
+        engine.run_to_completion();
+        std::vector<std::vector<locus::tok::TokenId>> outs;
+        for (auto id : ids) {
+            const auto* r = engine.get(id);
+            REQUIRE(r->status == Status::kDone);
+            outs.push_back(r->generated);
+        }
+        REQUIRE(engine.free_blocks() == engine.total_blocks());
+        return outs;
+    };
+    // R10 4b: batched decode is byte-identical, so identical
+    // tokens -- comfortable pool (pure batching) and a tight pool
+    // that forces preemption + recompute in both schedulers.
+    REQUIRE(run(true, 0, 16) == run(false, 0, 16));
+    REQUIRE(run(true, 6, 1) == run(false, 6, 1));
+}
+
 TEST_CASE("preemption recomputes and still matches",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
