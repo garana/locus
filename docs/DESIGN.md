@@ -460,6 +460,26 @@ mmap -- it crashes rather than degrading. A graceful
 device-alloc guard (clean throw instead of SIGSEGV) is a
 secondary follow-up.
 
+deepseek-on-Vulkan root cause (2026-07-24, gdb on the Pi by
+claude-pi-locus -- NOT memory, as first assumed): the model has
+mixed expert quant (ffn_down_exps is Q5_0 in 14 of 26 MoE
+layers), and Vulkan has no Q5_0 matvec shader, so
+vulkan_forward() returns false at the first Q5_0 tensor and the
+model falls back to the generic per-op forward. That path drives
+ops.matvec through R9's matvec_mt (the thread pool), but the
+Vulkan matvec drives a single VulkanContext singleton -> N
+threads doing begin/dispatch/end_batch concurrently SIGSEGV in
+V3DV. Two fixes: (a) matvec_mt now runs a backend inline when
+Ops::mt_safe is false (vulkan) -- so ANY unshadered-type model
+degrades instead of crashing (commit cc5dfc1); (b) add a Q5_0
+Vulkan matvec shader so deepseek stays on the full-GPU path
+(claude-pi-locus). With routed-expert upload for residency,
+deepseek should then run on the 4GB Pi. (Q5_0 is the sole
+unshadered type deepseek needs; Q5_1 is a companion but unused
+here.) Operational note: do not run deepseek-on-Vulkan on the
+4GB Pi until Q5_0 lands -- it thrashes hard enough to trip the
+OOM killer on unrelated processes.
+
 ### R9: threaded execution and static pinning (CPU)
 
 Motivation (measured, GLM-5.2 on the 32GB m2). With readahead
