@@ -69,12 +69,19 @@ resident, uploaded once), rmsnorm, RoPE, SwiGLU, and paged
 attention reading K/V from a GPU-mapped cache pool, all recorded
 as one command batch per token. Every selectable backend must
 reproduce the llama.cpp golden output token-exact (tested, single
-and concurrent streams). At real-model sizes the GPU wins (2048^2
-f32 matvec: ~750us vs ~3550us scalar CPU, Apple M-series via
-MoltenVK); on the tiny 260K test model dispatch overhead keeps
-CPU ahead. Vulkan weight paging and IQ shaders, plus x86
-avx2/avx512 (avx2 kernel exists, pending validation on an AVX2
-host) slot into src/locus/backend/ as they land.
+and concurrent streams). The Vulkan full-GPU path is validated
+end to end on a real MoE + MLA model: deepseek-v2-lite runs
+token-exact on a Raspberry Pi 5 (VideoCore VII) and fits in
+~2GB RSS for a 10GB model via the paged weight pool (upload only
+routed experts, LOCUS_GPU_POOL_MB budget with LRU eviction).
+Whether the GPU beats the CPU is device- and workload-specific:
+a desktop/MoltenVK GPU wins at real-model matvec sizes (2048^2
+f32: ~750us vs ~3550us scalar), but a tile GPU streaming a
+bigger-than-pool model (Pi's V3D on deepseek) is compute-bound
+and slower than NEON -- there Vulkan is a capability win, not a
+speed win. Remaining GPU work (IQ Vulkan shaders) and x86
+avx2/avx512 (avx2 kernel exists, pending an AVX2 host) slot into
+src/locus/backend/ as they land.
 
 ## Dependencies
 

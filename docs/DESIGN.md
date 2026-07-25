@@ -480,6 +480,28 @@ here.) Operational note: do not run deepseek-on-Vulkan on the
 4GB Pi until Q5_0 lands -- it thrashes hard enough to trip the
 OOM killer on unrelated processes.
 
+MILESTONE -- first full-GPU MoE+MLA on real hardware (2026-07-24,
+Raspberry Pi 5 V3D, after Q5_0 f099051 + routed-expert 0daa990):
+deepseek-v2-lite-q4_k_m on --backend vulkan is token-exact with
+--backend scalar ("Once upon a time, there was a", 4 tok) and
+FITS -- vulkan peak RSS 2011MB / min MemAvailable 1850MB on the
+4GB box (a 10GB model on the GPU path; scalar peaked higher,
+3114MB, since it dequants into host memory while the vulkan pool
+stays leaner). Confirms the full-GPU MLA + DeepSeek-MoE path end
+to end on a real model -- unvalidatable before (M2 MoltenVK
+can't run it, vx has no Vulkan device). Routed-expert upload
+verified staging ~6 experts/token not 64 ([vulkan-pool] @768MB:
+uploaded 13.6GB, hits 0, evictions 5627 -- pure streaming,
+per-token working set >> budget; that residency cut is what
+moved peak RSS from OOM-kill to 2.0GB). PERFORMANCE reality on
+V3D: vulkan 85s vs scalar/NEON 21s for prompt+4tok -- the GPU is
+~4x SLOWER here, consistent with the prefetch profiling (V3D is
+compute-bound and this run re-streams 13.6GB through the pager).
+Takeaway: on the Pi, Vulkan is a CAPABILITY win (correct full-GPU
+path, leaner RSS), not a speed win for bigger-than-pool models --
+NEON CPU wins those; Vulkan pays off only for models that FIT the
+pool (no re-streaming).
+
 ### R9: threaded execution and static pinning (CPU)
 
 Motivation (measured, GLM-5.2 on the 32GB m2). With readahead
