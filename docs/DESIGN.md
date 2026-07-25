@@ -629,23 +629,33 @@ dense/expert FFN):
   KB (fits L1), so reading it once and reusing it across the N
   tokens cuts weight DRAM traffic ~N x (in-RAM large models --
   prefill is bandwidth-bound today).
-- dequant compute: dequantize each weight block ONCE and reuse
-  the F32 across the N tokens instead of re-dequantizing per
-  token (the ~78%-single-core cost on GLM's IQ1_S is dequant).
+- dequant compute: OPTIONAL follow-on kernel, NOT part of the
+  byte-identical core. A dedicated batched kernel can dequantize
+  each weight block ONCE and reuse the F32 across the N tokens
+  (the ~78%-single-core cost on GLM's IQ1_S is dequant). It
+  matches the SCALAR path exactly but reorders sums vs the fused
+  neon/sse4 kernels, so it rides the token-exact bar (like the
+  SIMD kernels), not the byte-identical check. The disk-I/O and
+  DRAM-bandwidth wins above do NOT need it.
 
-Safety property that makes this tractable on the token-exact
-core: it is bit-identical to N sequential forwards, because each
-output y[row][token] = dot(W[row], x[token]) is computed
-unchanged regardless of loop order -- weight-stationary, NOT a
-GEMM that reorders summation, and dequant-once is deterministic.
+Safety property of the byte-identical core: forward_batch does
+EXACTLY the sequential per-token matvecs, only reordered so each
+weight is used for all N tokens before moving to the next
+weight. Each output y[row][token] = dot(W[row], x[token]) (via
+the active backend's matvec) is unchanged regardless of loop
+order -- weight-stationary, NOT a GEMM that reorders summation.
 So forward_batch(t_1..t_N) must produce a KV cache and logits
-BYTE-IDENTICAL to N sequential forward() calls. That hard
-equality is the exit test.
+BYTE-IDENTICAL to N sequential forward() calls -- the exit test.
+(The dequant-once kernel trades this byte-identity for the
+compute win and is validated token-exact instead.)
 
 Shape:
-- New primitive matvec_batch(W, x[0..N], out[0..N]): weight-row-
-  stationary, dequantize each block once, N dots per row.
-  Bit-identical to N matvec() calls. Carries all three wins.
+- Primitive matvec_batch(W, x[0..N], out[0..N]): a weight-
+  stationary loop calling the backend's matvec per token, so the
+  weight stays hot in cache / page cache across the batch.
+  Byte-identical to N matvec() calls. Carries the disk-I/O and
+  cache-residency wins; dequant-amortization is the separate
+  kernel noted above.
 - Position-wise ops batch through it: wq/wk/wv/wo, dense/expert
   FFN, embedding; the output head runs only for tokens that need
   logits (the last prompt token in prefill; every token in
@@ -665,16 +675,20 @@ Shape:
   naive N-wide att would be N x n_ctx and is the one trap to
   avoid.
 
-Rollout: (1) matvec_batch + unit test (bit-identical vs N
-matvec). (2) LlamaModel::forward_batch for the dense llama path,
-validated byte-identical to N forward() calls on the synthetic
-model; default forward() untouched so risk is contained. (3)
-extend to MLA (deepseek2) and glm-dsa attention. (4) wire
-Engine::advance() to batch prefill chunks and per-step decode
-across running sequences. (5) measure ingestion I/O on a
-streaming model + multi-request decode throughput (Pi/vx). Each
-step re-runs all goldens; the bit-identical property makes any
-divergence an immediately-caught bug.
+Rollout (status 2026-07-25): (1) matvec_batch and (2)
+LlamaModel::forward_batch for the dense llama path are DONE
+(commit f954a65) -- the [batch] test asserts forward_batch(N) is
+byte-identical to N forward() calls on BOTH the last-token
+logits and the full KV cache. Default forward() is untouched and
+forward_batch is not yet wired into the engine (opt-in, new
+code). Remaining: (3) extend to MLA (deepseek2) and glm-dsa
+attention; (4) wire Engine::advance() to batch prefill chunks
+and per-step decode across running sequences; (5) the optional
+dequant-amortization batched kernel (token-exact); (6) measure
+ingestion I/O on a streaming model and multi-request decode
+throughput (Pi/vx). Each step re-runs all goldens; the byte-
+identical property makes any divergence an immediately-caught
+bug.
 
 Risk note: forward_batch duplicates the forward + per-arch
 attention shape, so it lands as NEW code validated against the
