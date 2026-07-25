@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -66,24 +68,55 @@ int main(int argc, char** argv) {
                      hp.n_kv_heads, hp.n_vocab);
 
         auto ids = tok.encode(prompt, true);
-        std::printf("%s", tok.decode(ids).c_str());
 
         locus::engine::Engine::Config cfg;
         if (args.ctx > 0) {
             cfg.n_blocks = (args.ctx + 15) / 16;
         }
+        cfg.batched_decode = args.batch_decode;
+        cfg.batched_prefill = !args.no_batch_prefill;
         locus::engine::Engine engine(model, tok.eos_id(), cfg);
-        engine.on_token = [&](const locus::engine::Request&,
-                              locus::tok::TokenId t) {
-            if (t != tok.eos_id()) {
-                std::printf("%s", tok.decode({&t, 1}).c_str());
-                std::fflush(stdout);
+
+        const std::uint32_t conc = std::max(1u, args.concurrent);
+        if (conc == 1) {
+            std::printf("%s", tok.decode(ids).c_str());
+            engine.on_token = [&](const locus::engine::Request&,
+                                  locus::tok::TokenId t) {
+                if (t != tok.eos_id()) {
+                    std::printf("%s", tok.decode({&t, 1}).c_str());
+                    std::fflush(stdout);
+                }
+            };
+            engine.submit(ids,
+                          static_cast<std::uint32_t>(n_gen));
+            engine.run_to_completion();
+            std::printf("\n");
+        } else {
+            // Bench: submit the prompt `conc` times and time the
+            // aggregate run (no per-token printing).
+            std::vector<std::uint64_t> req;
+            for (std::uint32_t i = 0; i < conc; ++i) {
+                req.push_back(engine.submit(
+                    ids, static_cast<std::uint32_t>(n_gen)));
             }
-        };
-        engine.submit(ids,
-                      static_cast<std::uint32_t>(n_gen));
-        engine.run_to_completion();
-        std::printf("\n");
+            const auto t0 = std::chrono::steady_clock::now();
+            engine.run_to_completion();
+            const auto t1 = std::chrono::steady_clock::now();
+            const double sec =
+                std::chrono::duration<double>(t1 - t0).count();
+            std::uint64_t total = 0;
+            for (auto id : req) {
+                total += engine.get(id)->generated.size();
+            }
+            std::fprintf(
+                stderr,
+                "bench: %u seqs, %llu tokens, %.2fs, %.1f tok/s "
+                "(batch_decode=%d batch_prefill=%d)\n",
+                conc, static_cast<unsigned long long>(total), sec,
+                sec > 0 ? total / sec : 0.0,
+                static_cast<int>(cfg.batched_decode),
+                static_cast<int>(cfg.batched_prefill));
+        }
         locus::model::MoeStats::report();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());

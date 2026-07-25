@@ -46,6 +46,10 @@ inline constexpr const char* kCommonHelp =
     "  --ctx N          cap the KV pool at N tokens (bounds the\n"
     "                   dirty memory a run can allocate; default\n"
     "                   min(model context, 4096))\n"
+    "  --concurrent N   locus-run: submit the prompt N times and\n"
+    "                   report aggregate tok/s (bench mode)\n"
+    "  --batch-decode   enable R10 cross-sequence batched decode\n"
+    "  --no-batch-prefill  force per-token prompt ingestion\n"
     "  -h, --help       show this help and exit\n"
     "\n"
     "environment:\n"
@@ -73,6 +77,13 @@ struct BackendArgs {
     std::string choice;
     /** From --ctx N: KV pool cap in tokens (0 = default). */
     std::uint32_t ctx = 0;
+    /** From --concurrent N: submit the prompt N times and report
+     * aggregate throughput (bench mode; default 1 = normal run). */
+    std::uint32_t concurrent = 1;
+    /** --batch-decode: enable R10 cross-sequence batched decode. */
+    bool batch_decode = false;
+    /** --no-batch-prefill: force per-token prompt ingestion. */
+    bool no_batch_prefill = false;
     /** --backends was given: list and exit. */
     bool list = false;
     /** --archs was given: list architectures and exit. */
@@ -101,6 +112,16 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         } else if (a.rfind("--ctx=", 0) == 0) {
             out.ctx = static_cast<std::uint32_t>(
                 std::atol(std::string(a.substr(6)).c_str()));
+        } else if (a == "--concurrent" && i + 1 < argc) {
+            out.concurrent = static_cast<std::uint32_t>(
+                std::atol(argv[++i]));
+        } else if (a.rfind("--concurrent=", 0) == 0) {
+            out.concurrent = static_cast<std::uint32_t>(
+                std::atol(std::string(a.substr(13)).c_str()));
+        } else if (a == "--batch-decode") {
+            out.batch_decode = true;
+        } else if (a == "--no-batch-prefill") {
+            out.no_batch_prefill = true;
         } else {
             out.positional.emplace_back(a);
         }
