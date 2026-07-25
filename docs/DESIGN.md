@@ -689,14 +689,27 @@ batching are DONE.
 - (4a) commit 20d560c: Engine::advance() ingests the remaining
   prompt as one forward_batch (Config::batched_prefill, default
   on); [engine] A/B test confirms identical output to per-token.
-Remaining: (3b) batch the routed MoE experts weight-stationary
-(the streaming win for MoE models; needs per-token accumulation
-order preserved for byte-identity, or a token-exact variant);
-(4b) cross-SEQUENCE decode batching (N running sequences per
-step -- the serving-throughput core, needs a multi-seq
-forward_batch); (5) the optional dequant-amortization kernel
-(token-exact); (6) measure ingestion I/O and multi-request decode
-throughput (Pi/vx). Each step re-runs all goldens.
+- (3b) commit 77cfc0e: moe_ffn_batch applies routed experts
+  WEIGHT-STATIONARY (route all n, group (token,slot) by expert,
+  read each expert once across the tokens that picked it; union
+  read-ahead/prefetch/weight-window once). Byte-identical:
+  each token's mixture is summed in moe_select order (routed
+  then shared) before adding to the residual, matching moe_ffn.
+  forward_batch's MoE layers now use it. [batch] llama-MoE test
+  covers it.
+- (4b, model) commit d76fa7f: forward_batch_decode decodes one
+  token from each of N different sequences in a pass -- per-token
+  attention against each sequence's own KV, weight-bearing ops
+  batched across all N. Byte-identical to N forward() calls
+  ([batch] test: 4 sequences, distinct contexts). This is the
+  executor-level continuous-batching primitive.
+Remaining: (4b, engine) wire step() to gather running sequences
+into a batched decode call (phase-based scheduler: prefill ->
+sample -> batched decode-forward, per-request logits, preemption
+in the batched path) -- the throughput payoff, guarded by the
+concurrent-streams/preemption goldens; (5) the optional
+dequant-amortization kernel (token-exact); (6) measure ingestion
+I/O and multi-request decode throughput (Pi/vx).
 
 Risk note: forward_batch duplicates the forward + per-arch
 attention shape, so it lands as NEW code validated against the
