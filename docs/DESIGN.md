@@ -591,63 +591,96 @@ finite, (c) selection picks the positions a scalar reference
 scores highest. Real-model long-context quality is future work
 on faster hardware.
 
-### R10: batched prefill (weight-stationary, streaming)
+### R10: batched forward (prefill + continuous-batch decode)
 
-Problem. Engine::advance() feeds prompt tokens to
-model_.forward() ONE at a time, so an N-token prompt makes N
-full passes over the weights. On a streaming model the weights
-do not fit RAM, so each pass evicts what the previous faulted in
--- the per-token expert re-streaming the GLM telemetry showed.
-Prefill I/O is thus ~N x the necessary. Decode is inherently
-one-token (autoregressive) and unaffected; this is a
-prompt-ingestion win, largest for long prompts (RAG, long
-context) -- exactly the case that punishes streaming today.
+The executor -- Engine::advance() -> model_.forward() -- runs ONE
+token per call. So it processes N tokens as N full passes over
+the weights, whether those N are prompt positions or N
+concurrent sequences' decode tokens. locus already does
+continuous batching at the SCHEDULER level (admits/tracks N
+running sequences, shared paged-KV pool, no head-of-line
+blocking) but NOT at the executor: it gets continuous batching's
+memory/scheduling benefits without its compute/bandwidth
+benefit. R10 closes that gap with a batched forward.
 
-The fix: read each weight ONCE per prefill and apply it to all N
-prompt tokens (weight stays hot instead of being re-faulted N
-times).
+Where the batch of N comes from -- one mechanism, three
+consumers:
+1. PREFILL: N prompt positions of one sequence. Cuts prompt-
+   ingestion I/O ~N x (largest for long prompts / RAG).
+2. CONTINUOUS-BATCH DECODE (the throughput core, the LightLLM/
+   vLLM niche this project targets): N concurrent requests each
+   emit one decode token per step -> batch across sequences.
+   Serving N users drops from N weight-passes/step to one;
+   aggregate throughput scales ~N x, per-served-token weight I/O
+   drops ~N x. This is what makes serving a bigger-than-RAM
+   model to multiple users viable -- they share one weight
+   stream per step.
+3. SPECULATIVE / MTP (future, R9.3): draft K tokens via the
+   nextn head, verify all K in one batched forward -- the batch
+   win inside a single stream. Same machinery.
+Single-stream, non-speculative decode cannot batch (auto-
+regressive); that is the only case R10 does not help.
+
+The win, three ways, all in the weight-bearing ops (projections,
+dense/expert FFN):
+- disk I/O: each weight read/faulted once, not N times
+  (streaming models).
+- DRAM bandwidth: matvec is memory-bound; a weight ROW is a few
+  KB (fits L1), so reading it once and reusing it across the N
+  tokens cuts weight DRAM traffic ~N x (in-RAM large models --
+  prefill is bandwidth-bound today).
+- dequant compute: dequantize each weight block ONCE and reuse
+  the F32 across the N tokens instead of re-dequantizing per
+  token (the ~78%-single-core cost on GLM's IQ1_S is dequant).
 
 Safety property that makes this tractable on the token-exact
-core: implement it as a weight-stationary LOOP REORDER, NOT a
-GEMM that changes summation order. For each weight, loop over the
-N tokens doing the SAME per-token matvec the sequential path
-does. The arithmetic for token t is byte-for-byte identical
-whether computed alone or interleaved; only the weight read is
-amortized. So a batched forward_batch(t_1..t_N) must produce a
-KV cache and logits BIT-IDENTICAL to N sequential forward()
-calls -- a hard equality check, not an approximate one. That is
-the exit test.
+core: it is bit-identical to N sequential forwards, because each
+output y[row][token] = dot(W[row], x[token]) is computed
+unchanged regardless of loop order -- weight-stationary, NOT a
+GEMM that reorders summation, and dequant-once is deterministic.
+So forward_batch(t_1..t_N) must produce a KV cache and logits
+BYTE-IDENTICAL to N sequential forward() calls. That hard
+equality is the exit test.
 
 Shape:
-- Position-wise ops batch trivially and bit-identically: the
-  attention projections (wq/wk/wv/wo), dense/expert FFN,
-  embedding, output head -- each weight applied to N token
-  columns of an N-wide activation workspace.
-- Attention is cross-token but uses no large weights: compute
-  Q/K/V for all N first (weight-stationary), write N KV rows,
-  then per-token scores/softmax/weighted-sum exactly as today.
-  Causal ordering within the batch is already respected (token t
-  reads only positions <= t).
-- MoE: routing is per token, so each of the N tokens picks its
-  own experts; the union of picked experts is uploaded/faulted
-  once per layer and each is applied to the tokens that routed to
-  it -- this is where the streaming win concentrates.
+- New primitive matvec_batch(W, x[0..N], out[0..N]): weight-row-
+  stationary, dequantize each block once, N dots per row.
+  Bit-identical to N matvec() calls. Carries all three wins.
+- Position-wise ops batch through it: wq/wk/wv/wo, dense/expert
+  FFN, embedding; the output head runs only for tokens that need
+  logits (the last prompt token in prefill; every token in
+  decode).
+- Attention uses no large weights, so it stays PER TOKEN: after
+  the batched Q/K/V projection, each token does scores/softmax/
+  weighted-sum against ITS OWN sequence's KV (prefill tokens
+  share one causal KV; decode tokens each hit their sequence's
+  cache). No amortization lost there.
+- MoE routing is per token; the union of experts a layer's N
+  tokens pick is faulted once and each applied to the tokens
+  that chose it.
+- Memory: neutral. Weights (mmap) and the KV pool are unchanged;
+  only activations go N-wide (~7-14MB at N=64 across our models);
+  logits stay 1-wide where only the last token is sampled. The
+  attention scores buffer stays 1-wide (reused per token) -- a
+  naive N-wide att would be N x n_ctx and is the one trap to
+  avoid.
 
-Rollout: (1) forward_batch behind the same code paths, validated
-bit-identical to N sequential forwards on the synthetic models
-and the real goldens; (2) Engine::advance() calls it for prefill
-chunks (prefill_budget already bounds N); (3) measure prompt-
-ingestion I/O reduction on a streaming model (Pi/vx). Composes
-with, and is orthogonal to, the cross-SEQUENCE continuous
-batching the scheduler already does.
+Rollout: (1) matvec_batch + unit test (bit-identical vs N
+matvec). (2) LlamaModel::forward_batch for the dense llama path,
+validated byte-identical to N forward() calls on the synthetic
+model; default forward() untouched so risk is contained. (3)
+extend to MLA (deepseek2) and glm-dsa attention. (4) wire
+Engine::advance() to batch prefill chunks and per-step decode
+across running sequences. (5) measure ingestion I/O on a
+streaming model + multi-request decode throughput (Pi/vx). Each
+step re-runs all goldens; the bit-identical property makes any
+divergence an immediately-caught bug.
 
-Risk note: this touches forward() and all three arch attention
-implementations (arch.cpp) plus the workspace -- the code the
-6-model token-exact goldens validate. The bit-identical property
-is the guardrail (any divergence is a bug, caught immediately),
-but the change is cross-cutting and warrants landing behind a
-flag and re-running every golden before it becomes the default
-prefill path.
+Risk note: forward_batch duplicates the forward + per-arch
+attention shape, so it lands as NEW code validated against the
+sequential path before the engine ever calls it -- the
+6-model token-exact goldens keep guarding the default path
+throughout.
 
 ## 8. Testing strategy
 
