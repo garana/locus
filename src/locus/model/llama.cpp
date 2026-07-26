@@ -77,6 +77,25 @@ void advise_layer_statics(const LlamaModel::Layer& lay) {
         lay, [](const backend::Mat& m) { advise_mat(m); });
 }
 
+/**
+ * How many row-slices to split a `rows`-row matvec across: the
+ * thread-pool width, capped by LOCUS_THREADS and by keeping at
+ * least kMinRowsPerSlice rows per slice so dispatch overhead never
+ * dominates. Returns <= 1 when the work should run inline.
+ */
+std::size_t mt_slices(std::uint32_t rows) {
+    constexpr std::uint32_t kMinRowsPerSlice = 64;
+    std::size_t t = sys::ThreadPool::instance().parallelism();
+    if (const char* env = std::getenv("LOCUS_THREADS")) {
+        const long v = std::atol(env);
+        if (v >= 1) {
+            t = std::min<std::size_t>(
+                t, static_cast<std::size_t>(v));
+        }
+    }
+    return std::min<std::size_t>(t, rows / kMinRowsPerSlice);
+}
+
 }  // namespace
 
 void matvec_mt(const backend::Ops& op, const Mat& w,
@@ -89,23 +108,12 @@ void matvec_mt(const backend::Ops& op, const Mat& w,
         op.matvec(w, x, out);
         return;
     }
-    // Below this many rows per slice the dispatch overhead wins.
-    constexpr std::uint32_t kMinRowsPerSlice = 64;
-    auto& pool = sys::ThreadPool::instance();
-    std::size_t t = pool.parallelism();
-    if (const char* env = std::getenv("LOCUS_THREADS")) {
-        const long v = std::atol(env);
-        if (v >= 1) {
-            t = std::min<std::size_t>(
-                t, static_cast<std::size_t>(v));
-        }
-    }
-    t = std::min<std::size_t>(t, w.rows / kMinRowsPerSlice);
+    const std::size_t t = mt_slices(w.rows);
     if (t <= 1) {
         op.matvec(w, x, out);
         return;
     }
-    pool.parallel_for(t, [&](std::size_t i) {
+    sys::ThreadPool::instance().parallel_for(t, [&](std::size_t i) {
         const std::uint32_t r0 = static_cast<std::uint32_t>(
             static_cast<std::uint64_t>(w.rows) * i / t);
         const std::uint32_t r1 = static_cast<std::uint32_t>(
@@ -658,34 +666,65 @@ void LlamaModel::forward_batch_decode(
     }
 }
 
+namespace {
+
+/** Cached LOCUS_BATCH_DEQUANT toggle (read once). */
+bool batch_dequant_enabled() {
+    static const bool on =
+        std::getenv("LOCUS_BATCH_DEQUANT") != nullptr;
+    return on;
+}
+
+/**
+ * Runs body(r0, r1) over row-slices of a rows-row matvec: threaded
+ * across mt_slices() when the backend is re-entrant, else inline.
+ * Each slice carries the full n-token batch, so the weight rows in
+ * that slice stay hot across all n tokens (weight-stationary) while
+ * the slices themselves fan out over cores.
+ */
+template <typename Body>
+void for_row_slices(const backend::Ops& op, std::uint32_t rows,
+                    Body&& body) {
+    const std::size_t nslice = op.mt_safe ? mt_slices(rows) : 0;
+    if (nslice <= 1) {
+        body(0u, rows);
+        return;
+    }
+    sys::ThreadPool::instance().parallel_for(
+        nslice, [&](std::size_t i) {
+            const std::uint32_t r0 = static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(rows) * i / nslice);
+            const std::uint32_t r1 = static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(rows) * (i + 1) /
+                nslice);
+            body(r0, r1);
+        });
+}
+
+}  // namespace
+
 void matvec_batch_deq(const backend::Ops& op, const Mat& w,
                       std::span<const float> x_batch,
                       std::span<float> out_batch, std::uint32_t n) {
     const std::uint32_t xc = w.cols;
     const std::uint32_t oc = w.rows;
-    std::vector<float> row(xc);
-    for (std::uint32_t r = 0; r < oc; ++r) {
-        op.dequant_row(w, r, row);
-        for (std::uint32_t t = 0; t < n; ++t) {
-            const float* x = x_batch.data() + static_cast<std::size_t>(t) * xc;
-            float acc = 0.0f;
-            for (std::uint32_t c = 0; c < xc; ++c) {
-                acc += row[c] * x[c];
+    for_row_slices(op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+        std::vector<float> row(xc);
+        for (std::uint32_t r = r0; r < r1; ++r) {
+            op.dequant_row(w, r, row);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const float* x = x_batch.data() +
+                                 static_cast<std::size_t>(t) * xc;
+                float acc = 0.0f;
+                for (std::uint32_t c = 0; c < xc; ++c) {
+                    acc += row[c] * x[c];
+                }
+                out_batch[static_cast<std::size_t>(t) * oc + r] =
+                    acc;
             }
-            out_batch[static_cast<std::size_t>(t) * oc + r] = acc;
         }
-    }
+    });
 }
-
-namespace {
-
-/** Cached LOCUS_BATCH_DEQUANT toggle (read once). */
-bool batch_dequant_enabled() {
-    static const bool on = std::getenv("LOCUS_BATCH_DEQUANT") != nullptr;
-    return on;
-}
-
-}  // namespace
 
 void matvec_batch(const backend::Ops& op, const Mat& w,
                   std::span<const float> x_batch,
@@ -694,12 +733,20 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
         matvec_batch_deq(op, w, x_batch, out_batch, n);
         return;
     }
-    const std::size_t xc = w.cols;
-    const std::size_t oc = w.rows;
-    for (std::uint32_t t = 0; t < n; ++t) {
-        op.matvec(w, x_batch.subspan(t * xc, xc),
-                  out_batch.subspan(t * oc, oc));
-    }
+    const std::uint32_t xc = w.cols;
+    const std::uint32_t oc = w.rows;
+    for_row_slices(op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+        const Mat sub = backend::mat_rows(w, r0, r1 - r0);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            op.matvec(
+                sub,
+                x_batch.subspan(static_cast<std::size_t>(t) * xc,
+                                xc),
+                out_batch.subspan(
+                    static_cast<std::size_t>(t) * oc + r0,
+                    r1 - r0));
+        }
+    });
 }
 
 std::vector<std::pair<std::uint32_t, float>> moe_select(

@@ -723,11 +723,30 @@ is token-exact and deterministic but NOT byte-identical, so it is
 opt-in behind LOCUS_BATCH_DEQUANT and matvec_batch routes to it
 only when that is set. Its own [batch] test proves f32 stays
 byte-identical (dequant_row is a copy there) and q8_0 matches the
-fused matvec within a 1e-5 margin. Remaining: (6) measure
-ingestion I/O and multi-request decode throughput on the Pi/vx --
-including LOCUS_BATCH_DEQUANT on vs off for the compute win --
-then flip batched_decode default-on once validated on real
-models.
+fused matvec within a 1e-5 margin.
+
+(5b, threading) The first Pi measurement caught a real gap:
+matvec_batch was single-threaded (a serial `for t in n:
+op.matvec`), while the sequential forward's FFN uses the R9
+threaded matvec_mt. So on a large model over multiple cores,
+batched decode forfeited multicore and lost to the per-token path
+(Pi llama-1b in-RAM: 3.2 -> 1.8 tok/s), even though it won on tiny
+models where matvec_mt inlines (stories260K: ~2x on both Pi and
+M2). Fix: matvec_batch (and matvec_batch_deq) now row-slice across
+the ThreadPool via the shared mt_slices()/for_row_slices() helper,
+exactly like matvec_mt (honors mt_safe and LOCUS_THREADS). Each
+slice carries the whole n-token batch, so it keeps the weight-
+stationary reuse AND regains multicore -- batched decode should be
+>= per-token in every regime. Byte-identity holds (row-split is
+bitwise-equal per row); the [batch] test now checks the threaded
+fused path at THREADS=1/2/4 on a 200-row matrix.
+
+Remaining: (6) measure ingestion I/O and multi-request decode
+throughput on the Pi/vx -- including LOCUS_BATCH_DEQUANT on vs off
+for the compute win -- then flip batched_decode default-on once
+validated on real models. Confirmed so far: prefill batching is a
+clean I/O win on the Pi (deepseek: 2.44x fewer bytes read, 1.74x
+faster).
 
 Risk note: forward_batch duplicates the forward + per-arch
 attention shape, so it lands as NEW code validated against the

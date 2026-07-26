@@ -664,7 +664,9 @@ std::vector<std::byte> quantize_q8_0(const std::vector<float>& w,
 TEST_CASE("dequant-amortized batch matvec matches per-token "
           "(f32 byte-identical, q8_0 token-exact)", "[batch]") {
     using locus::backend::Mat;
-    constexpr std::uint32_t rows = 48, cols = 64, n = 5;
+    // rows > kMinRowsPerSlice (64) so the threaded row-split path
+    // is actually exercised below.
+    constexpr std::uint32_t rows = 200, cols = 64, n = 5;
     const auto& op = locus::backend::find_backend("scalar")->ops;
 
     std::vector<float> w = weights(
@@ -706,5 +708,27 @@ TEST_CASE("dequant-amortized batch matvec matches per-token "
         for (std::size_t i = 0; i < ref.size(); ++i) {
             REQUIRE(got[i] == Catch::Approx(ref[i]).margin(1e-5));
         }
+    }
+
+    // Fused matvec_batch is the default (byte-identical) path: its
+    // threaded row-split must stay bitwise equal to n sequential
+    // matvec() calls at every thread count (like matvec_mt).
+    {
+        Mat m{locus::gguf::TensorType::kF32,
+              reinterpret_cast<const std::byte*>(w.data()), rows,
+              cols};
+        std::vector<float> ref(static_cast<std::size_t>(n) * rows);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            op.matvec(m, {xb.data() + t * cols, cols},
+                      {ref.data() + t * rows, rows});
+        }
+        for (const char* nt : {"1", "2", "4"}) {
+            setenv("LOCUS_THREADS", nt, 1);
+            std::vector<float> got(
+                static_cast<std::size_t>(n) * rows);
+            locus::model::matvec_batch(op, m, xb, got, n);
+            REQUIRE(got == ref);
+        }
+        unsetenv("LOCUS_THREADS");
     }
 }
