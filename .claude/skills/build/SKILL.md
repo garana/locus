@@ -42,8 +42,10 @@ that backend, the build still succeeds. Confirmed recipes:
   making nvcc discoverable -- export `CUDACXX=/usr/local/cuda/bin/nvcc`
   (or put `/usr/local/cuda/bin` on PATH) so `find_package(CUDAToolkit)`
   resolves. `CUDA_ARCHITECTURES` is set inside CMakeLists, not on the
-  command line. Vulkan loader is found but there's no usable device,
-  so that backend stays unavailable -- expected, not an error.
+  command line. Vulkan dev headers are not installed, so
+  `find_package(Vulkan)` reports not-found at configure ("locus
+  Vulkan: not found, GPU backend disabled") and that backend is
+  skipped -- expected, not an error.
 - Shaders: CMake uses `glslc` when present (M2/vx) and falls back to
   `glslangValidator` (Pi) automatically -- either satisfies the
   shader custom-command; no action needed.
