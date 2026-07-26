@@ -799,19 +799,26 @@ associative); [ops][batch][sse4]/[neon] byte-tests are bit-exact,
 
 Measured ratio (fused-fallback vs kernel, 1B Q4_K, --concurrent 8,
 in-RAM warm):
+  cuda / GTX 750 Ti   : 2.2 -> 3.4 tok/s  = 1.55x
   neon / LPDDR4X (Pi) : 4.4 -> 6.2 tok/s  = ~1.35x
   sse4 / DDR3   (vx)  : 4.5 -> 4.9 tok/s  = 1.09x
 The more bandwidth-starved box gets the bigger traffic-amortization
 win, as predicted; after the n-fold weight-traffic cut the loop
 goes SIMD-compute-bound, so 128-bit sse4 caps vx's ratio (avx2 +
-DDR5 would show more). A backend kernel that special-cases only some
-types must fall back to n calls of the SAME backend's matvec()
-(scattered row-major), never the scalar reference -- else F32/Q8_0
-diverge from that backend's per-token path (contract note in
-registry.hpp). Target set is Q4_K/Q6_K (the Q4_K_M tensors we run);
-Q5_K/Q5_0 register-blocking is parked until a served model needs it.
-Remaining R11: avx2 (parked until a Haswell+ cloud box) and the
-CUDA batched kernel (task).
+DDR5 would show more). The CUDA kernel (07736a4) wins most: one
+launch replaces ~N*slices tiny per-token launches AND each weight
+block is read from VRAM once for all n tokens ([cuda-pool] identical
+both sides, so the gain is pure kernel). It uses batch_self_parallel
+(the model hands it the whole matrix, one grid over all rows) plus
+the weight-pool device pointer, so it stacks on the pager's shared-
+upload win; a modern GPU raises the ratio further. A backend kernel
+that special-cases only some types must fall back to n calls of the
+SAME backend's matvec() (scattered row-major), never the scalar
+reference -- else F32/Q8_0 diverge from that backend's per-token
+path (contract note in registry.hpp). Target set is Q4_K/Q6_K (the
+Q4_K_M tensors we run); Q5_K/Q5_0 register-blocking is parked until a
+served model needs it. Remaining R11: avx2 only (parked until a
+Haswell+ cloud box; sse4 is the template).
 
 Risk note: forward_batch duplicates the forward + per-arch
 attention shape, so it lands as NEW code validated against the
