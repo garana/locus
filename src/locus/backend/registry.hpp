@@ -44,6 +44,18 @@ struct Ops {
     void (*matvec_batch)(const Mat&, std::span<const float>,
                          std::span<float>, std::uint32_t n) = nullptr;
     /**
+     * True when matvec_batch parallelizes the weight rows itself and
+     * wants the WHOLE matrix in one call (a GPU backend: its kernel
+     * grids over all rows in a single launch). The model then skips
+     * the CPU row-slice fan-out (for_row_slices) for the batched
+     * path and calls matvec_batch once. Distinct from mt_safe, which
+     * only says matvec() is re-entrant: a GPU backend is both
+     * mt_safe (per-op fallback) AND batch_self_parallel. CPU SIMD
+     * backends leave this false so the model still splits rows across
+     * cores.
+     */
+    bool batch_self_parallel = false;
+    /**
      * Optional KV-pool allocator (nullptr: heap). The vulkan
      * backend hands out a GPU-mapped pointer so the paged cache
      * lives in memory the attention kernel can read directly.

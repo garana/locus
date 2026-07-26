@@ -742,15 +742,23 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
         // row-slice is a contiguous span we can thread. Then
         // transpose back to the token-major layout downstream wants.
         std::vector<float> rt(static_cast<std::size_t>(oc) * n);
-        for_row_slices(
-            op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
-                const Mat sub = backend::mat_rows(w, r0, r1 - r0);
-                op.matvec_batch(
-                    sub, x_batch,
-                    {rt.data() + static_cast<std::size_t>(r0) * n,
-                     static_cast<std::size_t>(r1 - r0) * n},
-                    n);
-            });
+        if (op.batch_self_parallel) {
+            // A GPU kernel grids over all rows in one launch: hand it
+            // the whole matrix rather than fanning slices across CPU
+            // threads (which would issue one launch per slice).
+            op.matvec_batch(w, x_batch, rt, n);
+        } else {
+            for_row_slices(
+                op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+                    const Mat sub = backend::mat_rows(w, r0, r1 - r0);
+                    op.matvec_batch(
+                        sub, x_batch,
+                        {rt.data() +
+                             static_cast<std::size_t>(r0) * n,
+                         static_cast<std::size_t>(r1 - r0) * n},
+                        n);
+                });
+        }
         for (std::uint32_t r = 0; r < oc; ++r) {
             for (std::uint32_t t = 0; t < n; ++t) {
                 out_batch[static_cast<std::size_t>(t) * oc + r] =
