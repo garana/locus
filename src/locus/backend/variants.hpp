@@ -26,6 +26,16 @@ void matvec_sse4(const Mat& w, std::span<const float> x,
                  std::span<float> out);
 
 /**
+ * SSE4 batched matvec (R11 Ops::matvec_batch): Q4_K/Q6_K use a
+ * register-blocked kernel (weight block dequanted once, FMA'd into n
+ * token accumulators -- byte-identical to n matvec_sse4() calls but
+ * ~n-fold less weight traffic); other types delegate to
+ * matvec_batch_scalar. out_batch is row-major (out[r*n + t]).
+ */
+void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
+                       std::span<float> out_batch, std::uint32_t n);
+
+/**
  * AVX2-vectorized matvec: F32 and Q8_0 rows use AVX2 inner
  * loops; other weight types delegate to the scalar reference.
  * Compiled only on x86-64 hosts (per-source -mavx2).

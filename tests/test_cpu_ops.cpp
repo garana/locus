@@ -369,4 +369,48 @@ TEST_CASE("matvec_sse4 matches the scalar reference for K-quants",
         }
     }
 }
+
+// R11: the register-blocked batch kernel must be BIT-identical to n
+// per-token matvec_sse4() calls, in row-major layout (out[r*n + t]).
+TEST_CASE("matvec_batch_sse4 Q4_K/Q6_K byte-identical to per-token "
+          "matvec_sse4 (R11)",
+          "[ops][batch][sse4]") {
+    if (!locus::sys::detect().sse4) {
+        SKIP("CPU lacks SSE4.1");
+    }
+    constexpr std::uint32_t rows = 3, nblk = 2, cols = nblk * 256,
+                            n = 5;
+    std::mt19937 rng(31);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    std::vector<float> xb(static_cast<std::size_t>(n) * cols);
+    for (auto& v : xb) {
+        v = xd(rng);
+    }
+    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+        std::vector<std::byte> w;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto row = k_quant_row(
+                t, nblk,
+                500u + r + 7u * static_cast<std::uint32_t>(t));
+            w.insert(w.end(), row.begin(), row.end());
+        }
+        Mat m{t, w.data(), rows, cols};
+        std::vector<float> got(static_cast<std::size_t>(rows) * n);
+        matvec_batch_sse4(m, xb, got, n);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            for (std::uint32_t tk = 0; tk < n; ++tk) {
+                float ref = 0.0f;
+                matvec_sse4(mat_rows(m, r, 1),
+                            {xb.data() +
+                                 static_cast<std::size_t>(tk) * cols,
+                             cols},
+                            {&ref, 1});
+                INFO("type " << static_cast<int>(t) << " row " << r
+                             << " tok " << tk);
+                REQUIRE(got[static_cast<std::size_t>(r) * n + tk] ==
+                        ref);  // exact, not Approx
+            }
+        }
+    }
+}
 #endif

@@ -5,6 +5,7 @@
 #include <smmintrin.h>  // SSE4.1
 
 #include <cstring>
+#include <vector>
 
 namespace locus::backend {
 
@@ -206,6 +207,143 @@ float dot_q6_k_block_sse4(const std::byte* blk, const float* x) {
     return hsum(acc);
 }
 
+// R11 batched matvec: block-outer / token-inner so each weight block
+// is streamed from DRAM once and reused across all n tokens (n-fold
+// less weight traffic), with the dequant precomputed once per block.
+// Each token's accumulator runs the identical accum16 sequence + hsum
+// as the per-token kernel, so the output is byte-identical to n
+// matvec_sse4() calls. out is row-major: out[r*n + t].
+
+void batch_q4_k_sse(const Mat& w, const float* xb, float* ob,
+                    std::uint32_t n) {
+    const std::size_t rb = w.cols / 256ull * 144ull;
+    const std::uint32_t nblk = w.cols / 256;
+    const __m128i mask = _mm_set1_epi8(0x0f);
+    for (std::uint32_t r = 0; r < w.rows; ++r) {
+        const std::byte* row = w.data + r * rb;
+        float* o = ob + static_cast<std::size_t>(r) * n;
+        for (std::uint32_t t = 0; t < n; ++t) {
+            o[t] = 0.0f;
+        }
+        for (std::uint32_t b = 0; b < nblk; ++b) {
+            const std::byte* blk = row + b * 144;
+            const float d = f16_to_f32(load_u16(blk));
+            const float dmin = f16_to_f32(load_u16(blk + 2));
+            const auto* scales =
+                reinterpret_cast<const std::uint8_t*>(blk + 4);
+            const auto* q =
+                reinterpret_cast<const std::uint8_t*>(blk + 16);
+            __m128i gv[16];
+            float gd[16], gm[16];
+            std::uint32_t goff[16];
+            int gi = 0, is = 0;
+            for (int j = 0; j < 256; j += 64) {
+                std::uint8_t sc, mn;
+                scale_min_k4_sse(is + 0, scales, sc, mn);
+                const float d1 = d * sc, m1 = dmin * mn;
+                scale_min_k4_sse(is + 1, scales, sc, mn);
+                const float d2 = d * sc, m2 = dmin * mn;
+                const __m128i qb0 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(q));
+                const __m128i qb1 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(q + 16));
+                const std::uint32_t xb0 = b * 256 + j;
+                gv[gi] = _mm_and_si128(qb0, mask);
+                gd[gi] = d1, gm[gi] = m1, goff[gi] = xb0, ++gi;
+                gv[gi] = _mm_and_si128(qb1, mask);
+                gd[gi] = d1, gm[gi] = m1, goff[gi] = xb0 + 16, ++gi;
+                gv[gi] = _mm_and_si128(_mm_srli_epi16(qb0, 4), mask);
+                gd[gi] = d2, gm[gi] = m2, goff[gi] = xb0 + 32, ++gi;
+                gv[gi] = _mm_and_si128(_mm_srli_epi16(qb1, 4), mask);
+                gd[gi] = d2, gm[gi] = m2, goff[gi] = xb0 + 48, ++gi;
+                q += 32;
+                is += 2;
+            }
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const float* xt =
+                    xb + static_cast<std::size_t>(t) * w.cols;
+                __m128 bacc = _mm_setzero_ps();
+                for (int i = 0; i < 16; ++i) {
+                    bacc = accum16_q4k_sse(bacc, gv[i], gd[i], gm[i],
+                                           xt + goff[i]);
+                }
+                o[t] += hsum(bacc);
+            }
+        }
+    }
+}
+
+void batch_q6_k_sse(const Mat& w, const float* xb, float* ob,
+                    std::uint32_t n) {
+    const std::size_t rb = w.cols / 256ull * 210ull;
+    const std::uint32_t nsb = w.cols / 256;
+    for (std::uint32_t r = 0; r < w.rows; ++r) {
+        const std::byte* row = w.data + r * rb;
+        float* o = ob + static_cast<std::size_t>(r) * n;
+        for (std::uint32_t t = 0; t < n; ++t) {
+            o[t] = 0.0f;
+        }
+        for (std::uint32_t b = 0; b < nsb; ++b) {
+            const std::byte* blk = row + b * 210;
+            const auto* qlp =
+                reinterpret_cast<const std::uint8_t*>(blk);
+            const auto* qhp =
+                reinterpret_cast<const std::uint8_t*>(blk + 128);
+            const auto* scp =
+                reinterpret_cast<const std::int8_t*>(blk + 192);
+            const float d = f16_to_f32(load_u16(blk + 208));
+            __m128i gv[16];
+            float gdsc[16];
+            std::uint32_t goff[16];
+            int gi = 0;
+            for (int nn = 0; nn < 256; nn += 128) {
+                const __m128i q0 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(qlp));
+                const __m128i q1 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(qlp + 16));
+                const __m128i q2 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(qlp + 32));
+                const __m128i q3 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(qlp + 48));
+                const __m128i h0 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(qhp));
+                const __m128i h1 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(qhp + 16));
+                const std::uint32_t base = b * 256 + nn;
+                gv[gi] = q6k_vals_sse(q0, h0, false, 0);
+                gdsc[gi] = d * scp[0], goff[gi] = base, ++gi;
+                gv[gi] = q6k_vals_sse(q1, h1, false, 0);
+                gdsc[gi] = d * scp[1], goff[gi] = base + 16, ++gi;
+                gv[gi] = q6k_vals_sse(q2, h0, false, 2);
+                gdsc[gi] = d * scp[2], goff[gi] = base + 32, ++gi;
+                gv[gi] = q6k_vals_sse(q3, h1, false, 2);
+                gdsc[gi] = d * scp[3], goff[gi] = base + 48, ++gi;
+                gv[gi] = q6k_vals_sse(q0, h0, true, 4);
+                gdsc[gi] = d * scp[4], goff[gi] = base + 64, ++gi;
+                gv[gi] = q6k_vals_sse(q1, h1, true, 4);
+                gdsc[gi] = d * scp[5], goff[gi] = base + 80, ++gi;
+                gv[gi] = q6k_vals_sse(q2, h0, true, 6);
+                gdsc[gi] = d * scp[6], goff[gi] = base + 96, ++gi;
+                gv[gi] = q6k_vals_sse(q3, h1, true, 6);
+                gdsc[gi] = d * scp[7], goff[gi] = base + 112, ++gi;
+                qlp += 64;
+                qhp += 32;
+                scp += 8;
+            }
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const float* xt =
+                    xb + static_cast<std::size_t>(t) * w.cols;
+                __m128 bacc = _mm_setzero_ps();
+                for (int i = 0; i < 16; ++i) {
+                    bacc = accum16_q6k_sse(bacc, gv[i], gdsc[i],
+                                           xt + goff[i]);
+                }
+                o[t] += hsum(bacc);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 void matvec_sse4(const Mat& w, std::span<const float> x,
@@ -259,6 +397,34 @@ void matvec_sse4(const Mat& w, std::span<const float> x,
         return;
     }
     matvec(w, x, out);  // other types: scalar reference
+}
+
+void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
+                       std::span<float> out_batch, std::uint32_t n) {
+    if (w.type == gguf::TensorType::kQ4_K) {
+        batch_q4_k_sse(w, x_batch.data(), out_batch.data(), n);
+        return;
+    }
+    if (w.type == gguf::TensorType::kQ6_K) {
+        batch_q6_k_sse(w, x_batch.data(), out_batch.data(), n);
+        return;
+    }
+    // Other types: n per-token matvec_sse4() calls scattered into the
+    // row-major layout. No weight-traffic amortization (not the hot
+    // path), but bit-exact to the per-token sse4 kernel -- which for
+    // F32/Q8_0 is SIMD, so delegating to matvec_batch_scalar would
+    // diverge and break batched==per-token token-exactness.
+    std::vector<float> col(w.rows);
+    const std::size_t xc = w.cols;
+    for (std::uint32_t t = 0; t < n; ++t) {
+        matvec_sse4(
+            w,
+            x_batch.subspan(static_cast<std::size_t>(t) * xc, xc),
+            col);
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            out_batch[static_cast<std::size_t>(r) * n + t] = col[r];
+        }
+    }
 }
 
 }  // namespace locus::backend

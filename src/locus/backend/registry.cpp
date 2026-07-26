@@ -19,6 +19,12 @@ const std::vector<Backend>& list() {
         b.reserve(6);  // fits every arch's entries; also avoids a
                        // GCC-13 -Wstringop-overflow false positive
                        // on the vector-growth path.
+// GCC 13 -Wextra flags designated initializers that omit trailing
+// members (which are value-initialized to their defaults); clang does
+// not. The Ops entries below deliberately set only the fields a
+// backend provides, so silence that GCC-only false positive here.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #if defined(__aarch64__)
         b.push_back({"neon",
                      "ARM NEON vectorized matvec (F32/Q8_0)",
@@ -33,10 +39,12 @@ const std::vector<Backend>& list() {
                      {.matvec = &matvec_avx2,
                       .dequant_row = &dequant_row}});
         b.push_back({"sse4",
-                     "x86-64 SSE4.1 vectorized matvec (F32/Q8_0)",
+                     "x86-64 SSE4.1 vectorized matvec + batched "
+                     "(F32/Q8_0; Q4_K/Q6_K register-blocked batch)",
                      f.sse4, true,
                      {.matvec = &matvec_sse4,
-                      .dequant_row = &dequant_row}});
+                      .dequant_row = &dequant_row,
+                      .matvec_batch = &matvec_batch_sse4}});
 #endif
         // The scalar backend ships the R11 batched reference; the
         // SIMD backends (neon/sse4/avx2) leave matvec_batch null for
@@ -65,6 +73,7 @@ const std::vector<Backend>& list() {
                      {.matvec = &matvec_cuda,
                       .dequant_row = &dequant_row,
                       .prefetch = &cuda_prefetch}});
+#pragma GCC diagnostic pop
         return b;
     }();
     return v;
