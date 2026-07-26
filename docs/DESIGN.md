@@ -784,6 +784,35 @@ SIMD: re-measure the now-threaded matvec_batch_deq (row read once,
 scalar dots) on the 1B -- if it ties/beats the fused per-token path
 despite ~8x more compute, that confirms traffic is the wall.
 
+Status (done for CPU Q4_K/Q6_K). Hook landed a04f269
+(Ops::matvec_batch; output row-major out[r*n+t] so the model row-
+slices it across threads then transposes back; scalar reference +
+[ops][batch] byte-test). Pre-validation on vx confirmed the wall:
+threaded matvec_batch_deq did ~8x more compute for only 16% slow-
+down -- the fingerprint of a memory-bound loop. SIMD kernels then
+landed: sse4 6c3ecdb, neon 2e6e15e, both Q4_K/Q6_K register-blocked
+(read+dequant each block once, FMA into n per-token accumulators).
+Byte-identity held by keeping matvec's exact per-block reduction
+order (a single end-of-row reduction diverges -- float add is not
+associative); [ops][batch][sse4]/[neon] byte-tests are bit-exact,
+[moe][batch] e2e token-exact at THREADS=1/2/4.
+
+Measured ratio (fused-fallback vs kernel, 1B Q4_K, --concurrent 8,
+in-RAM warm):
+  neon / LPDDR4X (Pi) : 4.4 -> 6.2 tok/s  = ~1.35x
+  sse4 / DDR3   (vx)  : 4.5 -> 4.9 tok/s  = 1.09x
+The more bandwidth-starved box gets the bigger traffic-amortization
+win, as predicted; after the n-fold weight-traffic cut the loop
+goes SIMD-compute-bound, so 128-bit sse4 caps vx's ratio (avx2 +
+DDR5 would show more). A backend kernel that special-cases only some
+types must fall back to n calls of the SAME backend's matvec()
+(scattered row-major), never the scalar reference -- else F32/Q8_0
+diverge from that backend's per-token path (contract note in
+registry.hpp). Target set is Q4_K/Q6_K (the Q4_K_M tensors we run);
+Q5_K/Q5_0 register-blocking is parked until a served model needs it.
+Remaining R11: avx2 (parked until a Haswell+ cloud box) and the
+CUDA batched kernel (task).
+
 Risk note: forward_batch duplicates the forward + per-arch
 attention shape, so it lands as NEW code validated against the
 sequential path before the engine ever calls it -- the

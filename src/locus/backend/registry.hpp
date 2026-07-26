@@ -33,6 +33,13 @@ struct Ops {
      * byte-identical to n matvec() calls (same per-block
      * accumulation order). nullptr means "no batched kernel": the
      * model loops matvec() per token instead.
+     *
+     * A kernel that special-cases only some weight types MUST fall
+     * back to n calls of the SAME backend's matvec() (scattered into
+     * the row-major output) for the rest -- never to the scalar
+     * reference. A SIMD backend does F32/Q8_0 in SIMD, so delegating
+     * those to matvec_batch_scalar would diverge from this backend's
+     * own per-token path and break batched==per-token.
      */
     void (*matvec_batch)(const Mat&, std::span<const float>,
                          std::span<float>, std::uint32_t n) = nullptr;
