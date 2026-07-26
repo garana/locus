@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "iq_grids.h"  // iq1s_grid lookup table (global scope)
 
@@ -328,6 +329,154 @@ __global__ void matvec_iq1_s_kernel(const std::uint8_t* w,
         }
     }
     out[r] = acc;
+}
+
+// R11 batched kernels: one launch, one thread per row, n token
+// accumulators. Each weight block is read from VRAM once and reused
+// across all n tokens (weight traffic ~n-fold down). Each token t's
+// accumulator runs the identical dequant+FMA order as the per-token
+// kernel, so the result is byte-identical to n matvec_cuda() calls.
+// out is row-major: out[r*n + t]. x is token-major: token t at t*cols.
+constexpr std::uint32_t kMaxBatch = 32;
+
+__global__ void matvec_batch_q4_k_kernel(const std::uint8_t* w,
+                                         const float* x, float* out,
+                                         std::uint32_t rows,
+                                         std::uint32_t cols,
+                                         std::uint32_t n) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 144;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc[kMaxBatch];
+    for (std::uint32_t t = 0; t < n; ++t) {
+        acc[t] = 0.0f;
+    }
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            144;
+        const std::uint16_t db =
+            static_cast<std::uint16_t>(blk[0]) |
+            (static_cast<std::uint16_t>(blk[1]) << 8);
+        const std::uint16_t dmb =
+            static_cast<std::uint16_t>(blk[2]) |
+            (static_cast<std::uint16_t>(blk[3]) << 8);
+        const float d = __half2float(__ushort_as_half(db));
+        const float dmin = __half2float(__ushort_as_half(dmb));
+        const std::uint8_t* scales = blk + 4;
+        const std::uint8_t* q = blk + 16;
+        const std::size_t xoff = static_cast<std::size_t>(b) * 256;
+        int is = 0, yi = 0;
+        for (int j = 0; j < 256; j += 64) {
+            std::uint8_t sc, mn;
+            scale_min_k4(is + 0, scales, sc, mn);
+            const float d1 = d * sc, m1 = dmin * mn;
+            scale_min_k4(is + 1, scales, sc, mn);
+            const float d2 = d * sc, m2 = dmin * mn;
+            for (int l = 0; l < 32; ++l) {
+                const float val =
+                    d1 * static_cast<float>(q[l] & 0x0f) - m1;
+                for (std::uint32_t t = 0; t < n; ++t) {
+                    acc[t] += val *
+                              x[static_cast<std::size_t>(t) * cols +
+                                xoff + yi];
+                }
+                ++yi;
+            }
+            for (int l = 0; l < 32; ++l) {
+                const float val =
+                    d2 * static_cast<float>(q[l] >> 4) - m2;
+                for (std::uint32_t t = 0; t < n; ++t) {
+                    acc[t] += val *
+                              x[static_cast<std::size_t>(t) * cols +
+                                xoff + yi];
+                }
+                ++yi;
+            }
+            q += 32;
+            is += 2;
+        }
+    }
+    for (std::uint32_t t = 0; t < n; ++t) {
+        out[static_cast<std::size_t>(r) * n + t] = acc[t];
+    }
+}
+
+__global__ void matvec_batch_q6_k_kernel(const std::uint8_t* w,
+                                         const float* x, float* out,
+                                         std::uint32_t rows,
+                                         std::uint32_t cols,
+                                         std::uint32_t n) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 210;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc[kMaxBatch];
+    for (std::uint32_t t = 0; t < n; ++t) {
+        acc[t] = 0.0f;
+    }
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            210;
+        const std::uint8_t* qlp = blk;
+        const std::uint8_t* qhp = blk + 128;
+        const std::int8_t* scp =
+            reinterpret_cast<const std::int8_t*>(blk + 192);
+        const std::uint16_t db =
+            static_cast<std::uint16_t>(blk[208]) |
+            (static_cast<std::uint16_t>(blk[209]) << 8);
+        const float d = __half2float(__ushort_as_half(db));
+        float tmp[256];
+        float* y = tmp;
+        for (int nn = 0; nn < 256; nn += 128) {
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int q1 = static_cast<int>(
+                                   (qlp[l] & 0x0f) |
+                                   (((qhp[l] >> 0) & 3) << 4)) -
+                               32;
+                const int q2 = static_cast<int>(
+                                   (qlp[l + 32] & 0x0f) |
+                                   (((qhp[l] >> 2) & 3) << 4)) -
+                               32;
+                const int q3 = static_cast<int>(
+                                   (qlp[l] >> 4) |
+                                   (((qhp[l] >> 4) & 3) << 4)) -
+                               32;
+                const int q4 = static_cast<int>(
+                                   (qlp[l + 32] >> 4) |
+                                   (((qhp[l] >> 6) & 3) << 4)) -
+                               32;
+                y[l] = d * scp[is] * static_cast<float>(q1);
+                y[l + 32] = d * scp[is + 2] * static_cast<float>(q2);
+                y[l + 64] = d * scp[is + 4] * static_cast<float>(q3);
+                y[l + 96] = d * scp[is + 6] * static_cast<float>(q4);
+            }
+            y += 128;
+            qlp += 64;
+            qhp += 32;
+            scp += 8;
+        }
+        const std::size_t xoff = static_cast<std::size_t>(b) * 256;
+        for (int i = 0; i < 256; ++i) {
+            for (std::uint32_t t = 0; t < n; ++t) {
+                acc[t] += tmp[i] *
+                          x[static_cast<std::size_t>(t) * cols +
+                            xoff + i];
+            }
+        }
+    }
+    for (std::uint32_t t = 0; t < n; ++t) {
+        out[static_cast<std::size_t>(r) * n + t] = acc[t];
+    }
 }
 
 /** RAII-ish scoped device buffer; frees on scope exit. */
@@ -716,6 +865,56 @@ Kind kind_for(gguf::TensorType t) {
     }
 }
 
+/** One-launch batched Q4_K/Q6_K matvec: weight pulled from the pool
+ *  (shared across the n tokens), x_batch + out_batch staged once. */
+bool run_batch(const Mat& w, std::span<const float> x_batch,
+               std::span<float> out_batch, std::size_t w_bytes,
+               std::uint32_t n, bool q6) {
+    const void* dw = pool().acquire(w.data, w_bytes);
+    const bool pooled = dw != nullptr;
+    DevBuf dw_demand;
+    if (!pooled) {
+        if (!dw_demand.alloc(w_bytes) ||
+            !cuda_ok(cudaMemcpy(dw_demand.p, w.data, w_bytes,
+                                cudaMemcpyHostToDevice))) {
+            return false;
+        }
+        dw = dw_demand.p;
+    }
+    bool ok = false;
+    {
+        DevBuf dx, dout;
+        const std::size_t x_bytes = x_batch.size() * sizeof(float);
+        const std::size_t out_bytes = out_batch.size() * sizeof(float);
+        if (dx.alloc(x_bytes) && dout.alloc(out_bytes) &&
+            cuda_ok(cudaMemcpy(dx.p, x_batch.data(), x_bytes,
+                               cudaMemcpyHostToDevice))) {
+            const std::uint32_t threads = 256;
+            const std::uint32_t blocks =
+                (w.rows + threads - 1) / threads;
+            const auto* dwb = static_cast<const std::uint8_t*>(dw);
+            const auto* dxf = static_cast<const float*>(dx.p);
+            auto* doutf = static_cast<float*>(dout.p);
+            if (q6) {
+                matvec_batch_q6_k_kernel<<<blocks, threads>>>(
+                    dwb, dxf, doutf, w.rows, w.cols, n);
+            } else {
+                matvec_batch_q4_k_kernel<<<blocks, threads>>>(
+                    dwb, dxf, doutf, w.rows, w.cols, n);
+            }
+            ok = cuda_ok(cudaGetLastError()) &&
+                 cuda_ok(cudaDeviceSynchronize()) &&
+                 cuda_ok(cudaMemcpy(out_batch.data(), dout.p,
+                                    out_bytes,
+                                    cudaMemcpyDeviceToHost));
+        }
+    }
+    if (pooled) {
+        pool().release(w.data);
+    }
+    return ok;
+}
+
 }  // namespace
 
 void matvec_cuda(const Mat& w, std::span<const float> x,
@@ -740,6 +939,33 @@ void cuda_prefetch(const Mat& w) {
     const std::size_t bytes = device_weight_bytes(w);
     if (bytes > 0) {
         pool().prefetch(w.data, bytes);
+    }
+}
+
+void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
+                       std::span<float> out_batch, std::uint32_t n) {
+    // Q4_K/Q6_K get the one-launch register-blocked kernel; other
+    // types (incl F32/Q8_0) fall back to n matvec_cuda() calls
+    // scattered to row-major -- the same-backend fallback rule, so
+    // batched stays byte-identical to per-token.
+    if (n <= kMaxBatch && (w.type == gguf::TensorType::kQ4_K ||
+                           w.type == gguf::TensorType::kQ6_K)) {
+        const std::size_t bytes = device_weight_bytes(w);
+        if (run_batch(w, x_batch, out_batch, bytes, n,
+                      w.type == gguf::TensorType::kQ6_K)) {
+            return;
+        }
+    }
+    std::vector<float> col(w.rows);
+    const std::size_t xc = w.cols;
+    for (std::uint32_t t = 0; t < n; ++t) {
+        matvec_cuda(
+            w,
+            x_batch.subspan(static_cast<std::size_t>(t) * xc, xc),
+            col);
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            out_batch[static_cast<std::size_t>(r) * n + t] = col[r];
+        }
     }
 }
 

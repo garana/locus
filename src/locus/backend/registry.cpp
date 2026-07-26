@@ -74,6 +74,7 @@ const std::vector<Backend>& list() {
                      cu, cu,
                      {.matvec = &matvec_cuda,
                       .dequant_row = &dequant_row,
+                      .matvec_batch = &matvec_batch_cuda,
                       .batch_self_parallel = true,
                       .prefetch = &cuda_prefetch}});
 #pragma GCC diagnostic pop

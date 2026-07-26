@@ -82,6 +82,18 @@ float* vulkan_alloc_kv(std::size_t n_floats);
 void matvec_cuda(const Mat& w, std::span<const float> x,
                  std::span<float> out);
 
+/**
+ * CUDA batched matvec (R11 Ops::matvec_batch, batch_self_parallel):
+ * one kernel launch over all rows x n tokens. Q4_K/Q6_K read each
+ * weight block from VRAM once and FMA it into n token accumulators
+ * (bit-identical to n matvec_cuda() calls, ~n-fold less VRAM weight
+ * traffic, weight shared from the pool); other types fall back to n
+ * matvec_cuda() calls. out_batch is row-major (out[r*n + t]); x_batch
+ * token-major. Scalar-delegating stub on non-CUDA builds.
+ */
+void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
+                       std::span<float> out_batch, std::uint32_t n);
+
 /** @returns true when a usable CUDA device is present. */
 bool cuda_backend_usable();
 

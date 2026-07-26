@@ -16,6 +16,11 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
 
 void cuda_prefetch(const Mat&) {}
 
+void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
+                       std::span<float> out_batch, std::uint32_t n) {
+    matvec_batch_scalar(w, x_batch, out_batch, n);
+}
+
 bool cuda_backend_usable() { return false; }
 
 }  // namespace locus::backend
