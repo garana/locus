@@ -101,7 +101,7 @@ if(Vulkan_FOUND)
     if(GLSLANG_VALIDATOR OR GLSLC)
         set(LOCUS_SHADERS
             matvec matvec_f16 matvec_q8_0 matvec_q4_0 matvec_q5_0
-            matvec_t matvec_q4_k matvec_q5_k matvec_q6_k
+            matvec_t matvec_q4_k matvec_q5_k matvec_q6_k matvec_q2_k
             rmsnorm rope silu_mul attn_paged attn_mla)
         set(SHADER_HDRS "")
         foreach(shader ${LOCUS_SHADERS})

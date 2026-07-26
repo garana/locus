@@ -225,14 +225,17 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
         Kernel kernel;
         std::size_t block_bytes;
         std::size_t d_off;  // f16 scale offset inside the block
+        bool has_dmin;      // f16 dmin follows d at d_off + 2
     };
     const KCase cases[] = {
         {locus::gguf::TensorType::kQ4_K, Kernel::kMatvecQ4_K,
-         144, 0},
+         144, 0, true},
         {locus::gguf::TensorType::kQ5_K, Kernel::kMatvecQ5_K,
-         176, 0},
+         176, 0, true},
         {locus::gguf::TensorType::kQ6_K, Kernel::kMatvecQ6_K,
-         210, 208},
+         210, 208, false},
+        {locus::gguf::TensorType::kQ2_K, Kernel::kMatvecQ2_K,
+         84, 80, true},
     };
     for (const auto& c : cases) {
         INFO("type " << static_cast<int>(c.type));
@@ -248,7 +251,7 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
             const std::uint16_t d =
                 locus::backend::f32_to_f16(0.01f);
             std::memcpy(p, &d, 2);
-            if (c.d_off == 0) {  // dmin follows d
+            if (c.has_dmin) {  // dmin follows d at d_off + 2
                 const std::uint16_t dmin =
                     locus::backend::f32_to_f16(0.005f);
                 std::memcpy(p + 2, &dmin, 2);

@@ -1,0 +1,76 @@
+#version 450
+
+// Q2_K matvec: 84-byte super-blocks of 256 elements --
+// scales[16] | qs[64] | f16 d | f16 dmin. Each output element is
+// dl*(2-bit quant) - ml, dl/ml from a 4-bit scale/min pair; the dot
+// against x is fused here (mirrors cpu_ops dequant_block_q2_k).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint out_offset;
+    uint accumulate;
+    uint w_off;   // element offset (f32/f16), byte offset (quant)
+    uint x_off;
+    float scale;
+} pc;
+
+uint byte_at(uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+float f16_at(uint i) {
+    return unpackHalf2x16(byte_at(i) | (byte_at(i + 1u) << 8u)).x;
+}
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.rows) {
+        return;
+    }
+    uint nb = pc.cols / 256u;
+    float acc = 0.0;
+    for (uint b = 0; b < nb; ++b) {
+        uint at = pc.w_off + (r * nb + b) * 84u;
+        float d = f16_at(at + 80u);
+        float dmin = f16_at(at + 82u);
+        uint sc0 = at;         // scales[16]
+        uint qs0 = at + 16u;   // qs[64]
+        uint xb = pc.x_off + b * 256u;
+        uint yi = 0u;          // element index within the block
+        uint is = 0u;          // scale index 0..15
+        for (uint n = 0; n < 2u; ++n) {
+            uint qh = qs0 + n * 32u;
+            for (uint j = 0; j < 4u; ++j) {
+                uint shift = 2u * j;
+                uint sc = byte_at(sc0 + is);
+                ++is;
+                float dl = d * float(sc & 0xfu);
+                float ml = dmin * float(sc >> 4u);
+                for (uint l = 0; l < 16u; ++l) {
+                    uint v = (byte_at(qh + l) >> shift) & 3u;
+                    acc += (dl * float(v) - ml) * x[xb + yi];
+                    ++yi;
+                }
+                sc = byte_at(sc0 + is);
+                ++is;
+                dl = d * float(sc & 0xfu);
+                ml = dmin * float(sc >> 4u);
+                for (uint l = 0; l < 16u; ++l) {
+                    uint v = (byte_at(qh + 16u + l) >> shift) & 3u;
+                    acc += (dl * float(v) - ml) * x[xb + yi];
+                    ++yi;
+                }
+            }
+        }
+    }
+    uint at_out = pc.out_offset + r;
+    float v = acc * pc.scale;
+    o[at_out] = pc.accumulate != 0 ? o[at_out] + v : v;
+}
