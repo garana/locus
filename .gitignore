@@ -1,5 +1,7 @@
-build/
-build-*/
+# Anchored to the repo root so the CMake tree is ignored but a
+# directory named "build" elsewhere (e.g. .claude/skills/build) is not.
+/build/
+/build-*/
 .cache/
 compile_commands.json
 .DS_Store
