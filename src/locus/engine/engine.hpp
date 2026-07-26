@@ -68,8 +68,11 @@ class Engine {
         /** Decode all running sequences in one batched forward per
          * step (R10 4b) -- the continuous-batching throughput win.
          * Byte-identical to the per-token scheduler. Off keeps the
+         * per-sequence step(). Default-on since R10's matvec_batch
+         * threading fix (07c72f5): measured >= per-token in every
+         * regime on both NEON (Pi) and x86/sse4 (vx). Off keeps the
          * per-sequence step(). */
-        bool batched_decode = false;
+        bool batched_decode = true;
     };
 
     /**

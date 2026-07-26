@@ -741,12 +741,48 @@ stationary reuse AND regains multicore -- batched decode should be
 bitwise-equal per row); the [batch] test now checks the threaded
 fused path at THREADS=1/2/4 on a 200-row matrix.
 
-Remaining: (6) measure ingestion I/O and multi-request decode
-throughput on the Pi/vx -- including LOCUS_BATCH_DEQUANT on vs off
-for the compute win -- then flip batched_decode default-on once
-validated on real models. Confirmed so far: prefill batching is a
-clean I/O win on the Pi (deepseek: 2.44x fewer bytes read, 1.74x
-faster).
+(6, done) Measured on Pi (NEON) and vx (x86/sse4): with the
+threading fix, batched decode is >= per-token in every regime --
+Pi 1B in-RAM ties (4.5 vs 4.4 tok/s), tiny model wins (1.4-2x),
+deepseek streaming cuts disk bytes; vx 1B ties (4.4 vs 4.3). So
+batched_decode is now default-ON (Engine::Config), with step()
+falling back to the per-token scheduler when the model does not
+support batching (Vulkan drives its own forward) so the default is
+safe on every backend. Prefill batching stays a clean I/O win on
+the Pi (deepseek: 2.44x fewer bytes read, 1.74x faster).
+
+Measurement also pinned the ceiling: decode is memory-bandwidth-
+bound (vx callgrind: matvec 95% of instructions; 66% parallel
+efficiency at 4 cores on DDR3), and the current fused matvec_batch
+re-streams each weight row N times (per-token op.matvec loop), so
+it saves no DRAM traffic on a large in-RAM model -- hence the tie,
+not a win. That motivates R11.
+
+## R11: cache-blocked batched matvec
+
+The batched decode of N concurrent sequences is a skinny GEMM
+Y = W . X^T (X is N x cols). Today's kernel loops op.matvec per
+token, streaming |W| from DRAM N times. Reorder to weight-
+stationary at the register level: outer loop over weight rows/col-
+blocks, inner loop over the N tokens, so each weight block is
+loaded+dequantized ONCE and reused across all N token dots while
+hot in vector registers (N running SIMD accumulators). Weight DRAM
+traffic drops ~N-fold; the kernel moves from memory-bound toward
+compute-bound. Needs N >= 2 (single-stream decode has no reuse and
+stays bandwidth-bound); the win scales with N until the N-vector X
+tile spills L1, past which cols is cache-tiled. Byte-identity is
+preservable: if the blocked SIMD kernel keeps the same per-col-
+block accumulation order as op.matvec, each token's dot is
+bitwise-unchanged (unlike matvec_batch_deq, which reordered sums).
+
+Plan: add an optional matvec_batch hook to backend::Ops (nullptr
+-> today's per-token fallback); wire model matvec_batch() to
+prefer it. Scalar reference + byte-exact test here; per-arch SIMD
+kernels for the hot quants (Q4_K/Q6_K): NEON owner claude-pi-locus,
+sse4/avx2 owner claude-vx-locus. Cheap pre-validation before any
+SIMD: re-measure the now-threaded matvec_batch_deq (row read once,
+scalar dots) on the 1B -- if it ties/beats the fused per-token path
+despite ~8x more compute, that confirms traffic is the wall.
 
 Risk note: forward_batch duplicates the forward + per-arch
 attention shape, so it lands as NEW code validated against the

@@ -34,7 +34,11 @@ std::uint32_t Engine::blocks_for(std::uint32_t n_tokens) const {
 }
 
 bool Engine::step() {
-    if (cfg_.batched_decode) {
+    // Batched decode needs a model/backend that supports the
+    // batched forward (Vulkan drives its own full forward and opts
+    // out); fall back to the per-token scheduler otherwise so
+    // default-on batched_decode is safe on every backend.
+    if (cfg_.batched_decode && model_.supports_batch()) {
         return step_batched();
     }
     // Admission: FCFS while the pool can cover prompt + headroom.
