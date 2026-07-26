@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -23,6 +24,14 @@ TEST_CASE("deepseek-v2-lite matches llama.cpp token-exact",
     if (!std::filesystem::exists(model_path())) {
         SKIP("model not present (deepseek-v2-lite-q4_k_m.gguf, "
              "~10GB)");
+    }
+    // Heavy: loads a ~10GB model and generates on CPU AND Vulkan.
+    // Minutes on x86, but HOURS on a Pi (streaming + V3D Vulkan)
+    // with OOM risk -- so it is opt-in, never run in a default
+    // suite pass on a host that happens to have the model.
+    if (std::getenv("LOCUS_HEAVY_TESTS") == nullptr) {
+        SKIP("deepseek e2e is heavy (~10GB, CPU+Vulkan generation); "
+             "set LOCUS_HEAVY_TESTS=1 to run it");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::LlamaModel::load(g);
