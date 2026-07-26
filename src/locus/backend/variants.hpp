@@ -13,6 +13,21 @@ namespace locus::backend {
  */
 void matvec_neon(const Mat& w, std::span<const float> x,
                  std::span<float> out);
+
+/**
+ * NEON register-blocked batched matvec (R11, Ops::matvec_batch):
+ * applies w to all n token vectors in x_batch (token-major, token t
+ * at t*w.cols) into out_batch (row-major, out[r*n + t]). Q4_K and
+ * Q6_K rows are weight-stationary -- each weight block is read and
+ * dequantized ONCE, then FMA'd into all n token accumulators, so
+ * weight DRAM traffic drops ~n-fold vs n matvec() calls. Other
+ * types fall back to per-token matvec_neon. Byte-identical to n
+ * matvec_neon() calls (same per-block accumulation order).
+ * Single-threaded: the model row-slices and calls this per slice.
+ */
+void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
+                       std::span<float> out_batch,
+                       std::uint32_t n);
 #endif
 
 #if defined(__x86_64__)

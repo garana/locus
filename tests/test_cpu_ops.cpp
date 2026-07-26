@@ -414,3 +414,47 @@ TEST_CASE("matvec_batch_sse4 Q4_K/Q6_K byte-identical to per-token "
     }
 }
 #endif
+
+#if defined(__aarch64__)
+TEST_CASE("matvec_batch_neon is byte-identical to per-token neon",
+          "[ops][batch][neon]") {
+    // R11 register-blocked kernel must be bit-for-bit equal to n
+    // separate matvec_neon() calls. Q4_K/Q6_K exercise the
+    // register-blocked paths; Q5_K exercises the per-token fallback
+    // + row-major scatter.
+    constexpr std::uint32_t rows = 5, blocks = 2,
+                            cols = blocks * 256, n = 6;
+    std::mt19937 rng(99);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    std::vector<float> xb(static_cast<std::size_t>(n) * cols);
+    for (auto& v : xb) {
+        v = xd(rng);
+    }
+    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K,
+                         TensorType::kQ5_K}) {
+        std::vector<std::byte> w;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto row = k_quant_row(t, blocks, 100 + r);
+            w.insert(w.end(), row.begin(), row.end());
+        }
+        Mat m{t, w.data(), rows, cols};
+        std::vector<float> got(static_cast<std::size_t>(rows) * n);
+        matvec_batch_neon(m, xb, got, n);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            for (std::uint32_t tk = 0; tk < n; ++tk) {
+                float ref = 0.0f;
+                matvec_neon(
+                    mat_rows(m, r, 1),
+                    {xb.data() +
+                         static_cast<std::size_t>(tk) * cols,
+                     cols},
+                    {&ref, 1});
+                INFO("type " << static_cast<int>(t) << " r=" << r
+                             << " t=" << tk);
+                REQUIRE(got[static_cast<std::size_t>(r) * n + tk] ==
+                        ref);
+            }
+        }
+    }
+}
+#endif

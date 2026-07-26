@@ -30,7 +30,8 @@ const std::vector<Backend>& list() {
                      "ARM NEON vectorized matvec (F32/Q8_0)",
                      f.neon, true,
                      {.matvec = &matvec_neon,
-                      .dequant_row = &dequant_row}});
+                      .dequant_row = &dequant_row,
+                      .matvec_batch = &matvec_batch_neon}});
 #endif
 #if defined(__x86_64__)
         b.push_back({"avx2",
@@ -46,10 +47,11 @@ const std::vector<Backend>& list() {
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_sse4}});
 #endif
-        // The scalar backend ships the R11 batched reference; the
-        // SIMD backends (neon/sse4/avx2) leave matvec_batch null for
-        // now and use the per-token fallback until their register-
-        // blocked kernels land (owners: claude-pi-locus / vx).
+        // The scalar backend ships the R11 batched reference; neon
+        // ships its register-blocked kernel (Q4_K/Q6_K + per-token
+        // fallback). sse4/avx2 leave matvec_batch null for now and
+        // use the per-token fallback until their kernels land
+        // (owner: vx).
         b.push_back({"scalar", "portable reference (all types)",
                      true, true,
                      {.matvec = &matvec,
