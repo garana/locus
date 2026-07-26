@@ -16,6 +16,27 @@ struct Ops {
     void (*dequant_row)(const Mat&, std::uint32_t,
                         std::span<float>);
     /**
+     * Optional cache-blocked batched matvec (R11): applies w to n
+     * input vectors at once. Input x_batch is n * w.cols contiguous
+     * with vector t at t*w.cols (token-major, as the model holds
+     * activations). Output out_batch is w.rows * n contiguous in
+     * ROW-MAJOR order -- result[row r, token t] at r*n + t. That
+     * row-major output lets the caller row-slice the matrix across
+     * threads (each slice writes a contiguous span) and matches the
+     * register-blocked kernel's natural write pattern (n running
+     * accumulators -> n contiguous writes per row). The model
+     * transposes it back to token-major for downstream ops.
+     *
+     * A backend fills this with a kernel that reads/dequantizes each
+     * weight block once and reuses it across all n columns, cutting
+     * weight DRAM traffic ~n-fold on batched decode. Must be
+     * byte-identical to n matvec() calls (same per-block
+     * accumulation order). nullptr means "no batched kernel": the
+     * model loops matvec() per token instead.
+     */
+    void (*matvec_batch)(const Mat&, std::span<const float>,
+                         std::span<float>, std::uint32_t n) = nullptr;
+    /**
      * Optional KV-pool allocator (nullptr: heap). The vulkan
      * backend hands out a GPU-mapped pointer so the paged cache
      * lives in memory the attention kernel can read directly.

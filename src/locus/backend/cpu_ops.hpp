@@ -79,6 +79,18 @@ void matvec(const Mat& w, std::span<const float> x,
             std::span<float> out);
 
 /**
+ * Scalar reference for the R11 batched matvec (backend::Ops::
+ * matvec_batch). Applies w to n token vectors (x_batch is n*w.cols,
+ * token t at t*w.cols) and writes results row-major: out_batch is
+ * w.rows*n with [row r, token t] at r*n + t. Byte-identical to n
+ * matvec() calls; the correctness baseline the SIMD register-
+ * blocked kernels are tested against.
+ */
+void matvec_batch_scalar(const Mat& w, std::span<const float> x_batch,
+                         std::span<float> out_batch,
+                         std::uint32_t n);
+
+/**
  * Transposed matrix-vector product: out[c] = sum_r w[r,c]*x[r]
  * (i.e. W^T x). Used by MLA's weight absorption; scalar only.
  */

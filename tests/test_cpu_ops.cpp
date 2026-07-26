@@ -138,6 +138,46 @@ TEST_CASE("matvec q8_0 dequantizes correctly", "[ops]") {
     REQUIRE(dq[15] == 0.0f);
 }
 
+TEST_CASE("matvec_batch_scalar: row-major layout, byte-identical "
+          "to per-token matvec (R11 Ops contract)",
+          "[ops][batch]") {
+    constexpr std::uint32_t rows = 3, cols = 32, n = 4;
+    std::mt19937 rng(7);
+    std::uniform_int_distribution<int> qd(-127, 127);
+    std::vector<std::byte> w;
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        std::vector<int> q(32);
+        for (auto& v : q) {
+            v = qd(rng);
+        }
+        auto row = q8_0_row(0.1f + 0.05f * static_cast<float>(r), q);
+        w.insert(w.end(), row.begin(), row.end());
+    }
+    Mat m{TensorType::kQ8_0, w.data(), rows, cols};
+
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    std::vector<float> xb(static_cast<std::size_t>(n) * cols);
+    for (auto& v : xb) {
+        v = xd(rng);
+    }
+
+    std::vector<float> got(static_cast<std::size_t>(rows) * n);
+    matvec_batch_scalar(m, xb, got, n);
+
+    // Output is row-major (out[r*n + t]) and each entry is bitwise a
+    // matvec() of that row against token t.
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        for (std::uint32_t t = 0; t < n; ++t) {
+            float ref = 0.0f;
+            matvec(mat_rows(m, r, 1),
+                   {xb.data() + static_cast<std::size_t>(t) * cols,
+                    cols},
+                   {&ref, 1});
+            REQUIRE(got[static_cast<std::size_t>(r) * n + t] == ref);
+        }
+    }
+}
+
 TEST_CASE("matvec q4_0 dequantizes correctly", "[ops]") {
     // One block: scale 2.0, all nibbles 8 (-> value 0) except
     // byte 0 = 0x9A: low nibble 10 (elem 0 -> +2), high nibble 9

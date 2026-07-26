@@ -735,6 +735,30 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
     }
     const std::uint32_t xc = w.cols;
     const std::uint32_t oc = w.rows;
+    if (op.matvec_batch != nullptr) {
+        // R11: the backend's register-blocked kernel reads each
+        // weight block once and reuses it across all n tokens. Its
+        // output is row-major ([row r, token t] at r*n + t), so a
+        // row-slice is a contiguous span we can thread. Then
+        // transpose back to the token-major layout downstream wants.
+        std::vector<float> rt(static_cast<std::size_t>(oc) * n);
+        for_row_slices(
+            op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+                const Mat sub = backend::mat_rows(w, r0, r1 - r0);
+                op.matvec_batch(
+                    sub, x_batch,
+                    {rt.data() + static_cast<std::size_t>(r0) * n,
+                     static_cast<std::size_t>(r1 - r0) * n},
+                    n);
+            });
+        for (std::uint32_t r = 0; r < oc; ++r) {
+            for (std::uint32_t t = 0; t < n; ++t) {
+                out_batch[static_cast<std::size_t>(t) * oc + r] =
+                    rt[static_cast<std::size_t>(r) * n + t];
+            }
+        }
+        return;
+    }
     for_row_slices(op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
         const Mat sub = backend::mat_rows(w, r0, r1 - r0);
         for (std::uint32_t t = 0; t < n; ++t) {

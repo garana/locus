@@ -777,6 +777,49 @@ void matvec(const Mat& w, std::span<const float> x,
     }
 }
 
+void matvec_batch_scalar(const Mat& w, std::span<const float> x_batch,
+                         std::span<float> out_batch,
+                         std::uint32_t n) {
+    assert(x_batch.size() ==
+               static_cast<std::size_t>(n) * w.cols &&
+           out_batch.size() ==
+               static_cast<std::size_t>(w.rows) * n);
+    const std::size_t stride = row_bytes(w);
+    const std::size_t xc = w.cols;
+    // Row-major output (out[r*n + t]) and the same per-row dot
+    // dispatch matvec() uses, so each result is bit-for-bit a
+    // matvec() of that row against token t. The reference re-reads
+    // the row per token; the SIMD kernels amortize that read.
+    for (std::uint32_t r = 0; r < w.rows; ++r) {
+        const std::byte* row = w.data + r * stride;
+        float* o = out_batch.data() + static_cast<std::size_t>(r) * n;
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const std::span<const float> x =
+                x_batch.subspan(static_cast<std::size_t>(t) * xc, xc);
+            switch (w.type) {
+                case gguf::TensorType::kF32:
+                    o[t] = dot_f32(row, x);
+                    break;
+                case gguf::TensorType::kF16:
+                    o[t] = dot_f16(row, x);
+                    break;
+                case gguf::TensorType::kQ8_0:
+                    o[t] = dot_q8_0(row, x);
+                    break;
+                case gguf::TensorType::kQ4_0:
+                    o[t] = dot_q4_0(row, x);
+                    break;
+                case gguf::TensorType::kQ5_0:
+                    o[t] = dot_q5_0(row, x);
+                    break;
+                default:
+                    o[t] = dot_k_quant(w, row, x);
+                    break;
+            }
+        }
+    }
+}
+
 void dequant_row(const Mat& w, std::uint32_t row,
                  std::span<float> out) {
     assert(out.size() == w.cols && row < w.rows);
