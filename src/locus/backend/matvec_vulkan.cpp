@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "iq_grids.h"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
 #include "locus/backend/vulkan/weight_pool.hpp"
@@ -62,6 +63,10 @@ std::size_t weight_bytes(const Mat& w) {
             b = static_cast<std::size_t>(w.rows) *
                 (w.cols / 256) * 84;
             break;
+        case gguf::TensorType::kIQ2_XXS:
+            b = static_cast<std::size_t>(w.rows) *
+                (w.cols / 256) * 66;
+            break;
         default:
             return 0;  // no GPU kernel for this type
     }
@@ -80,6 +85,8 @@ Kernel matvec_kernel(const Mat& w) {
         case gguf::TensorType::kQ5_K: return Kernel::kMatvecQ5_K;
         case gguf::TensorType::kQ6_K: return Kernel::kMatvecQ6_K;
         case gguf::TensorType::kQ2_K: return Kernel::kMatvecQ2_K;
+        case gguf::TensorType::kIQ2_XXS:
+            return Kernel::kMatvecIQ2_XXS;
         default: return Kernel::kCount_;
     }
 }
@@ -174,6 +181,32 @@ struct State {
         }
     }
 
+    // IQ2_XXS grid+signs table (SSBO 3), uploaded once: iq2xxs_grid
+    // (2048 B) then ksigns_iq2xs (128 B) at byte offset 2048.
+    VulkanContext::Buffer iq2xxs_tbl{};
+    bool iq2xxs_tbl_ready = false;
+    VulkanContext::Buffer iq2xxs_table() {
+        if (!iq2xxs_tbl_ready) {
+            const std::size_t gsz = sizeof(::iq2xxs_grid);
+            const std::size_t ssz = sizeof(::ksigns_iq2xs);
+            iq2xxs_tbl = ctx.create_buffer(gsz + ssz);
+            auto* p =
+                static_cast<std::byte*>(ctx.mapped(iq2xxs_tbl));
+            std::memcpy(p, ::iq2xxs_grid, gsz);
+            std::memcpy(p + gsz, ::ksigns_iq2xs, ssz);
+            iq2xxs_tbl_ready = true;
+        }
+        return iq2xxs_tbl;
+    }
+
+    /** The extra SSBO an IQ kernel binds (grid+signs), or null. */
+    VulkanContext::Buffer grid_for(Kernel k) {
+        if (k == Kernel::kMatvecIQ2_XXS) {
+            return iq2xxs_table();
+        }
+        return {};
+    }
+
     /** Rope divisor buffer: factors when scaled, else 1.0s. */
     VulkanContext::Buffer rope_divisors(
         std::span<const float> factors, std::uint32_t half_dim) {
@@ -210,7 +243,10 @@ void rec_matvec(State& s, const Mat& w, VulkanContext::Buffer x,
     const VulkanContext::Buffer wb =
         whole != nullptr ? *whole
                          : s.upload(w.data, weight_bytes(w));
-    const VulkanContext::Buffer bufs[] = {wb, x, out};
+    const Kernel k = matvec_kernel(w);
+    const VulkanContext::Buffer grid = s.grid_for(k);
+    const VulkanContext::Buffer bufs[] = {wb, x, out, grid};
+    const std::size_t nbuf = grid.impl != nullptr ? 4u : 3u;
     const std::uint32_t push[] = {w.rows,
                                   w.cols,
                                   out_offset,
@@ -218,8 +254,7 @@ void rec_matvec(State& s, const Mat& w, VulkanContext::Buffer x,
                                   w_off_units(w, w_byte_off),
                                   x_off,
                                   fbits(scale)};
-    s.ctx.dispatch(matvec_kernel(w), bufs, push,
-                   (w.rows + 63) / 64);
+    s.ctx.dispatch(k, {bufs, nbuf}, push, (w.rows + 63) / 64);
 }
 
 }  // namespace
@@ -245,16 +280,18 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
         return;
     }
     State& s = state();
+    const Kernel k = matvec_kernel(w);
     auto wb = s.upload(w.data, weight_bytes(w));
     s.grow(s.x, s.x_n, x.size());
     s.grow(s.xb, s.xb_n, out.size());
     s.ctx.write_buffer(s.x, std::as_bytes(x));
+    const VulkanContext::Buffer grid = s.grid_for(k);
     s.ctx.begin_batch();
-    const VulkanContext::Buffer bufs[] = {wb, s.x, s.xb};
+    const VulkanContext::Buffer bufs[] = {wb, s.x, s.xb, grid};
+    const std::size_t nbuf = grid.impl != nullptr ? 4u : 3u;
     const std::uint32_t push[] = {w.rows, w.cols, 0, 0, 0, 0,
                                   fbits(1.0f)};
-    s.ctx.dispatch(matvec_kernel(w), bufs, push,
-                   (w.rows + 63) / 64);
+    s.ctx.dispatch(k, {bufs, nbuf}, push, (w.rows + 63) / 64);
     s.ctx.end_batch();
     s.pool.on_batch_end();
     s.ctx.read_buffer(s.xb, std::as_writable_bytes(out));

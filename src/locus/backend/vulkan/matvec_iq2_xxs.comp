@@ -1,0 +1,87 @@
+#version 450
+
+// IQ2_XXS matvec: 66-byte blocks of 256 elements -- f16 d, then 8
+// sub-blocks of 8 bytes (two u32 each). Each sub-block yields 32
+// values in 4 groups of 8: an 8-bit index picks a grid entry (8
+// unsigned bytes), a 7-bit index picks a sign mask, db scales.
+// Mirrors cpu_ops dequant_block_iq2_xxs; the dot against x is fused.
+//
+// Binding 3 (G) is a combined table: iq2xxs_grid (2048 bytes = 256
+// uint64) followed by ksigns_iq2xs (128 bytes) at byte offset 2048.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+layout(std430, binding = 3) readonly buffer G { uint g[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint out_offset;
+    uint accumulate;
+    uint w_off;
+    uint x_off;
+    float scale;
+} pc;
+
+uint byte_at(uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+float f16_at(uint i) {
+    return unpackHalf2x16(byte_at(i) | (byte_at(i + 1u) << 8u)).x;
+}
+
+uint u32_at(uint i) {
+    return byte_at(i) | (byte_at(i + 1u) << 8u) |
+           (byte_at(i + 2u) << 16u) | (byte_at(i + 3u) << 24u);
+}
+
+// Unsigned byte j (0..7) of grid entry idx (a uint64 = two words).
+uint grid_byte(uint idx, uint j) {
+    uint word = g[idx * 2u + (j >> 2u)];
+    return (word >> ((j & 3u) * 8u)) & 0xffu;
+}
+
+// ksigns_iq2xs[si], stored at byte offset 2048 in G.
+uint ksign(uint si) {
+    uint off = 2048u + si;
+    return (g[off >> 2u] >> ((off & 3u) * 8u)) & 0xffu;
+}
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.rows) {
+        return;
+    }
+    uint nb = pc.cols / 256u;
+    float acc = 0.0;
+    for (uint b = 0; b < nb; ++b) {
+        uint at = pc.w_off + (r * nb + b) * 66u;
+        float d = f16_at(at);
+        uint xb = pc.x_off + b * 256u;
+        uint yi = 0u;
+        for (uint ib = 0; ib < 8u; ++ib) {
+            uint base = at + 2u + 8u * ib;
+            uint a0 = u32_at(base);
+            uint a1 = u32_at(base + 4u);
+            float db = d * (0.5 + float(a1 >> 28u)) * 0.25;
+            for (uint l = 0; l < 4u; ++l) {
+                uint idx = (a0 >> (8u * l)) & 0xffu;
+                uint signs = ksign((a1 >> (7u * l)) & 127u);
+                for (uint j = 0; j < 8u; ++j) {
+                    float gp = float(grid_byte(idx, j));
+                    float sgn =
+                        ((signs & (1u << j)) != 0u) ? -1.0 : 1.0;
+                    acc += db * gp * sgn * x[xb + yi];
+                    ++yi;
+                }
+            }
+        }
+    }
+    uint at_out = pc.out_offset + r;
+    float v = acc * pc.scale;
+    o[at_out] = pc.accumulate != 0 ? o[at_out] + v : v;
+}

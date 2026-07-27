@@ -286,6 +286,43 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
     }
 }
 
+TEST_CASE("vulkan IQ2_XXS matvec matches the CPU reference",
+          "[vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    std::mt19937 rng(51);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+
+    // IQ2_XXS: 66-byte blocks of 256 elements, f16 d at offset 0.
+    const std::uint32_t rows = 4, cols = 512;
+    const std::size_t nblk = rows * (cols / 256);
+    std::vector<std::byte> w(nblk * 66);
+    for (auto& b : w) {
+        b = static_cast<std::byte>(byte_d(rng));
+    }
+    for (std::size_t blk = 0; blk < nblk; ++blk) {
+        const std::uint16_t d = locus::backend::f32_to_f16(0.01f);
+        std::memcpy(w.data() + blk * 66, &d, 2);
+    }
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+
+    locus::backend::Mat m{locus::gguf::TensorType::kIQ2_XXS,
+                          w.data(), rows, cols};
+    std::vector<float> cpu(rows), gpu(rows);
+    locus::backend::matvec(m, x, cpu);
+    // The op path binds the grid+signs SSBO for the IQ kernel.
+    locus::backend::matvec_vulkan(m, x, gpu);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        REQUIRE(gpu[r] ==
+                Catch::Approx(cpu[r]).margin(1e-2).epsilon(1e-3));
+    }
+}
+
 TEST_CASE("gpu matvec beats scalar cpu at real-model sizes",
           "[vulkan][benchmark]") {
     if (!VulkanContext::available()) {

@@ -19,6 +19,7 @@
 #include "matvec_q5_k_spv.h"
 #include "matvec_q6_k_spv.h"
 #include "matvec_q2_k_spv.h"
+#include "matvec_iq2_xxs_spv.h"
 #include "matvec_q8_0_spv.h"
 #include "matvec_spv.h"
 #include "matvec_t_spv.h"
@@ -63,6 +64,8 @@ const KernelDesc& kernel_desc(Kernel k) {
          3, 28},
         {locus_matvec_q2_k_spv, sizeof(locus_matvec_q2_k_spv),
          3, 28},
+        {locus_matvec_iq2_xxs_spv,
+         sizeof(locus_matvec_iq2_xxs_spv), 4, 28},
         {locus_matvec_t_spv, sizeof(locus_matvec_t_spv), 3,
          20},
         {locus_rmsnorm_spv, sizeof(locus_rmsnorm_spv), 3, 12},
