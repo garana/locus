@@ -317,6 +317,18 @@ bool Engine::step_batched() {
         if (!cache_.ensure_capacity(r.seq, 1)) {
             const std::uint64_t victim = running_.back();
             if (victim == r.id) {
+                // Nothing newer to preempt. If we are the only
+                // running request the pool is just too small for
+                // us -- fail rather than wedge forever; otherwise
+                // defer and let an earlier request free blocks.
+                if (running_.size() == 1) {
+                    finish(r, Status::kFailed,
+                           "kv pool too small for request");
+                    running_.erase(
+                        running_.begin() +
+                        static_cast<std::ptrdiff_t>(i));
+                    continue;
+                }
                 ++i;  // cannot fit this step; retry next
                 continue;
             }
