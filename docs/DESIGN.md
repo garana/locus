@@ -560,8 +560,22 @@ under LOCUS_THREADS=4 token-exact -- concurrent matvec slices
 compose with the weight pager (95% hit rate with prefetch, up
 from 92.3% demand-only; 22% vs 0% under a thrashing 512MB
 budget). R8-GPU phase 3 (op.prefetch model wiring + cuda
-second-stream pipeline) is complete end-to-end. The GLM-5.2
-wall-time measurement on the m2 is still pending (heavy run).
+second-stream pipeline) is complete end-to-end.
+
+GLM-5.2 wall-time exit test (2026-07-27, PASS, on vx -- 750 Ti /
+31GB RAM / 7200rpm SATA HDD, GLM-5.2 UD-IQ1_S 216GB, 16 tokens,
+cold, same box/model/prompt): llama.cpp (CPU) 5523 s vs locus
+(sse4, streaming) 3042 s -- locus 1.82x faster and token-exact.
+locus <= llama.cpp: PASS. This is the bigger-than-RAM streaming
+thesis realized: a 216GB model on a 31GB box, resident set ~15GB,
+served faster than llama.cpp. The full-GPU CUDA path also runs the
+real model coherently (validates the Q2_K/IQ2/IQ3/IQ4 device
+kernels beyond synthetic units), but on the 750 Ti's ~1.2GB usable
+VRAM the pager thrashes (24.4% hit, 131k evictions, 240GB
+re-uploaded over PCIe for 6 tokens), so CUDA is PCIe-bound there and
+sse4 is the faster locus backend on that box. CUDA's streaming win
+needs a larger-VRAM GPU -- the one place a cloud box helps here is
+VRAM (bigger pager working set), not compute.
 
 ### DSA indexer: GLM-5.2 beyond top_k tokens
 
