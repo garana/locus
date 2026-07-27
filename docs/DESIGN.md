@@ -564,18 +564,22 @@ second-stream pipeline) is complete end-to-end.
 
 GLM-5.2 wall-time exit test (2026-07-27, PASS, on vx -- 750 Ti /
 31GB RAM / 7200rpm SATA HDD, GLM-5.2 UD-IQ1_S 216GB, 16 tokens,
-cold, same box/model/prompt): llama.cpp (CPU) 5523 s vs locus
-(sse4, streaming) 3042 s -- locus 1.82x faster and token-exact.
-locus <= llama.cpp: PASS. This is the bigger-than-RAM streaming
-thesis realized: a 216GB model on a 31GB box, resident set ~15GB,
-served faster than llama.cpp. The full-GPU CUDA path also runs the
-real model coherently (validates the Q2_K/IQ2/IQ3/IQ4 device
-kernels beyond synthetic units), but on the 750 Ti's ~1.2GB usable
-VRAM the pager thrashes (24.4% hit, 131k evictions, 240GB
-re-uploaded over PCIe for 6 tokens), so CUDA is PCIe-bound there and
-sse4 is the faster locus backend on that box. CUDA's streaming win
-needs a larger-VRAM GPU -- the one place a cloud box helps here is
-VRAM (bigger pager working set), not compute.
+cold, same box/model/prompt, all token-exact):
+  llama.cpp (CPU)  5523 s  345 s/tok  1.00x
+  locus sse4       3042 s  190 s/tok  1.82x
+  locus CUDA       1793 s  112 s/tok  3.08x  (fastest)
+locus <= llama.cpp: PASS, hardest on CUDA. This is the
+bigger-than-RAM streaming thesis realized: a 216GB model on a 31GB
+box (resident set ~15-28GB) served up to 3x faster than llama.cpp.
+The CUDA path validates the Q2_K/IQ2/IQ3/IQ4 device kernels on the
+real model (beyond synthetic units) AND is the fastest backend here
+despite the 750 Ti's ~1.2GB usable VRAM starving the pager (12.4%
+hit, 323k evictions, 601GB re-uploaded over PCIe for 16 tok): those
+re-uploads are host-RAM -> GPU (experts stay in page cache), cheap
+enough that GPU matvec still dominates sse4. Bigger VRAM would make
+CUDA even faster (less PCIe churn), not rescue a loss. (An earlier
+6-token CUDA sample wrongly read as a loss -- the cold first token
+was 1/6 of that average; matched 16-token counts settle it.)
 
 ### DSA indexer: GLM-5.2 beyond top_k tokens
 
