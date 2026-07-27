@@ -99,6 +99,15 @@ void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
 bool cuda_backend_usable();
 
 /**
+ * Frees every resident page in the CUDA weight pool (test seam). The
+ * pool keys weights by host pointer, valid only while that buffer is
+ * live; tests reset it between cases so transient weight buffers whose
+ * addresses get recycled do not alias a stale device page. No-op on
+ * non-CUDA builds; never needed in inference (weight pointers stable).
+ */
+void cuda_pool_reset();
+
+/**
  * Async weight prefetch (Ops.prefetch): begins a cudaMemcpyAsync of
  * w onto a dedicated stream into the CUDA weight pool, so a later
  * matvec_cuda(w) finds it resident. No-op for weight types the GPU

@@ -425,6 +425,7 @@ TEST_CASE("matvec_cuda matches the scalar reference for K-/IQ-quants",
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
     }
+    cuda_pool_reset();  // drop any stale pages from prior test cases
     constexpr std::uint32_t rows = 3, nblk = 2, cols = nblk * 256;
     std::mt19937 rng(77);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -466,6 +467,7 @@ TEST_CASE("matvec_batch_cuda Q4_K/Q6_K byte-identical to per-token "
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
     }
+    cuda_pool_reset();  // drop any stale pages from prior test cases
     constexpr std::uint32_t rows = 3, nblk = 2, cols = nblk * 256,
                             n = 5;
     std::mt19937 rng(41);

@@ -842,6 +842,21 @@ class WeightPool {
         }
     }
 
+    /** Frees every resident page and empties the table. For tests:
+     *  the pool keys weights by host pointer (valid only while that
+     *  buffer is live), so transient test weights whose addresses get
+     *  recycled across unrelated cases would otherwise alias. Not used
+     *  in inference, where weight pointers are stable for the run. */
+    void reset() {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& [host, pg] : table_) {
+            wait_ready(pg);
+            cudaFree(pg.dptr);
+        }
+        table_.clear();
+        used_ = 0;
+    }
+
     ~WeightPool() {
         if (std::getenv("LOCUS_MOE_STATS") == nullptr) {
             return;
@@ -1259,6 +1274,8 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
 }
 
 }  // namespace
+
+void cuda_pool_reset() { pool().reset(); }
 
 void matvec_cuda(const Mat& w, std::span<const float> x,
                  std::span<float> out) {

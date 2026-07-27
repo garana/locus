@@ -301,6 +301,7 @@ TEST_CASE("cuda matvec matches scalar", "[backend]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
     }
+    cuda_pool_reset();  // drop any stale pages from prior test cases
     check_matvec_variant_matches_scalar(&matvec_cuda);
 }
 
@@ -310,6 +311,7 @@ TEST_CASE("cuda prefetch then matvec is token-exact", "[backend]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
     }
+    cuda_pool_reset();  // drop any stale pages from prior test cases
     std::mt19937 rng(23);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     const std::uint32_t rows = 4, cols = 64;  // 2 q8_0 blocks/row

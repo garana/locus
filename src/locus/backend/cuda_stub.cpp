@@ -23,6 +23,8 @@ void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
 
 bool cuda_backend_usable() { return false; }
 
+void cuda_pool_reset() {}
+
 }  // namespace locus::backend
 
 #endif  // !LOCUS_HAS_CUDA
