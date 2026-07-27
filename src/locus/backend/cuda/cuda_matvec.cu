@@ -2,8 +2,9 @@
 // R8-GPU pager): each weight is uploaded once, keyed by host pointer,
 // and reused across tokens under a byte budget with LRU eviction;
 // weights too big for the budget fall back to an uncached per-call
-// upload. Kernels dequantize F32/Q8_0/Q4_K/IQ1_S on-device (the pool
-// stores the source quantized bytes); other types delegate to scalar.
+// upload. Kernels dequantize F32/Q8_0/Q2_K/Q4_K/Q5_K/Q6_K and the
+// IQ1_S/IQ2_XXS/IQ3_XXS/IQ4_XS families on-device (the pool stores the
+// source quantized bytes); other types delegate to scalar.
 
 #include "locus/backend/variants.hpp"
 
@@ -25,6 +26,21 @@ namespace {
 
 /** Aborts to scalar on any CUDA error (caller falls back). */
 bool cuda_ok(cudaError_t e) { return e == cudaSuccess; }
+
+/** Reads a little-endian IEEE half from two device bytes. */
+__device__ inline float ld_f16(const std::uint8_t* p) {
+    return __half2float(__ushort_as_half(
+        static_cast<std::uint16_t>(p[0]) |
+        (static_cast<std::uint16_t>(p[1]) << 8)));
+}
+
+/** Reads a little-endian u32 from four (possibly unaligned) bytes. */
+__device__ inline std::uint32_t ld_u32(const std::uint8_t* p) {
+    return static_cast<std::uint32_t>(p[0]) |
+           (static_cast<std::uint32_t>(p[1]) << 8) |
+           (static_cast<std::uint32_t>(p[2]) << 16) |
+           (static_cast<std::uint32_t>(p[3]) << 24);
+}
 
 __global__ void matvec_f32_kernel(const float* w, const float* x,
                                   float* out, std::uint32_t rows,
@@ -331,6 +347,216 @@ __global__ void matvec_iq1_s_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
+/** One Q2_K super-block is 84 bytes: scales[16] + qs[64] + d,dmin
+ *  (f16), 256 weights. The scalar fills y sequentially; we still
+ *  materialize tmp[256] then dot i=0..255 so the accumulation order
+ *  is bit-for-bit dot_k_quant. Grid-free. */
+__global__ void matvec_q2_k_kernel(const std::uint8_t* w,
+                                   const float* x, float* out,
+                                   std::uint32_t rows,
+                                   std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 84;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            84;
+        const std::uint8_t* scales = blk;
+        const std::uint8_t* qp = blk + 16;
+        const float d = ld_f16(blk + 80);
+        const float mn = ld_f16(blk + 82);
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        float tmp[256];
+        float* y = tmp;
+        int is = 0;
+        for (int n = 0; n < 256; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                std::uint8_t sc = scales[is++];
+                float dl = d * (sc & 0x0f), ml = mn * (sc >> 4);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl * ((qp[l] >> shift) & 3) - ml;
+                }
+                sc = scales[is++];
+                dl = d * (sc & 0x0f);
+                ml = mn * (sc >> 4);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl * ((qp[l + 16] >> shift) & 3) - ml;
+                }
+                shift += 2;
+            }
+            qp += 32;
+        }
+        for (int i = 0; i < 256; ++i) {
+            acc += tmp[i] * xb[i];
+        }
+    }
+    out[r] = acc;
+}
+
+/** One IQ2_XXS super-block is 66 bytes: d (f16) + 32 u16, 256
+ *  weights. Each 32-group picks 4 grid entries (8 u8 each) and a sign
+ *  byte from ksigns; `grid` = device iq2xxs_grid (u64), `ksigns` =
+ *  device ksigns_iq2xs. Materialize then dot for dot_k_quant order. */
+__global__ void matvec_iq2_xxs_kernel(const std::uint8_t* w,
+                                      const std::uint64_t* grid,
+                                      const std::uint8_t* ksigns,
+                                      const float* x, float* out,
+                                      std::uint32_t rows,
+                                      std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 66;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            66;
+        const float d = ld_f16(blk);
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        float tmp[256];
+        float* y = tmp;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const std::uint8_t* a = blk + 2 + 8 * ib32;
+            const std::uint32_t aux1 = ld_u32(a + 4);
+            const float db = d * (0.5f + (aux1 >> 28)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint8_t* g =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + a[l]);
+                const std::uint8_t signs =
+                    ksigns[(aux1 >> (7 * l)) & 127];
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = db * g[j] *
+                           ((signs & (1 << j)) ? -1.0f : 1.0f);
+                }
+                y += 8;
+            }
+        }
+        for (int i = 0; i < 256; ++i) {
+            acc += tmp[i] * xb[i];
+        }
+    }
+    out[r] = acc;
+}
+
+/** One IQ3_XXS super-block is 98 bytes: d (f16) + qs[64] +
+ *  scales_and_signs[32], 256 weights. Each 32-group picks 8 grid
+ *  entries (4 u8 each) via qs and a sign byte; `grid` = device
+ *  iq3xxs_grid (u32), `ksigns` = device ksigns_iq2xs. */
+__global__ void matvec_iq3_xxs_kernel(const std::uint8_t* w,
+                                      const std::uint32_t* grid,
+                                      const std::uint8_t* ksigns,
+                                      const float* x, float* out,
+                                      std::uint32_t rows,
+                                      std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 98;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            98;
+        const float d = ld_f16(blk);
+        const std::uint8_t* qs = blk + 2;
+        const std::uint8_t* sas = blk + 2 + 64;
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        float tmp[256];
+        float* y = tmp;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const std::uint32_t aux = ld_u32(sas + 4 * ib32);
+            const float db = d * (0.5f + (aux >> 28)) * 0.5f;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint8_t signs =
+                    ksigns[(aux >> (7 * l)) & 127];
+                const std::uint8_t* g1 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + qs[2 * l]);
+                const std::uint8_t* g2 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + qs[2 * l + 1]);
+                for (int j = 0; j < 4; ++j) {
+                    y[j] = db * g1[j] *
+                           ((signs & (1 << j)) ? -1.0f : 1.0f);
+                    y[j + 4] = db * g2[j] *
+                               ((signs & (1 << (j + 4))) ? -1.0f
+                                                         : 1.0f);
+                }
+                y += 8;
+            }
+            qs += 8;
+        }
+        for (int i = 0; i < 256; ++i) {
+            acc += tmp[i] * xb[i];
+        }
+    }
+    out[r] = acc;
+}
+
+/** One IQ4_XS super-block is 136 bytes: d (f16) + scales_h (u16) +
+ *  scales_l[4] + qs[128], 256 weights. Grid-free: each nibble indexes
+ *  the 16-entry kvalues_iq4nl codebook (device `kvalues`). Scalar fill
+ *  interleaves y[j]/y[j+16], so materialize then dot i=0..255. */
+__global__ void matvec_iq4_xs_kernel(const std::uint8_t* w,
+                                     const std::int8_t* kvalues,
+                                     const float* x, float* out,
+                                     std::uint32_t rows,
+                                     std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 136;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            136;
+        const float d = ld_f16(blk);
+        const std::uint16_t scales_h =
+            static_cast<std::uint16_t>(blk[2]) |
+            (static_cast<std::uint16_t>(blk[3]) << 8);
+        const std::uint8_t* scales_l = blk + 4;
+        const std::uint8_t* qs = blk + 8;
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        float tmp[256];
+        float* y = tmp;
+        for (int ib = 0; ib < 8; ++ib) {
+            const int ls =
+                ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0f) |
+                (((scales_h >> (2 * ib)) & 3) << 4);
+            const float dl = d * (ls - 32);
+            for (int j = 0; j < 16; ++j) {
+                y[j] = dl * kvalues[qs[j] & 0x0f];
+                y[j + 16] = dl * kvalues[qs[j] >> 4];
+            }
+            y += 32;
+            qs += 16;
+        }
+        for (int i = 0; i < 256; ++i) {
+            acc += tmp[i] * xb[i];
+        }
+    }
+    out[r] = acc;
+}
+
 // R11 batched kernels: one launch, one thread per row, n token
 // accumulators. Each weight block is read from VRAM once and reused
 // across all n tokens (weight traffic ~n-fold down). Each token t's
@@ -519,11 +745,22 @@ class WeightPool {
         }
         const std::uint64_t now = ++clock_;
         if (auto it = table_.find(host); it != table_.end()) {
-            wait_ready(it->second);  // finish any in-flight prefetch
-            it->second.last_use = now;
-            it->second.pins++;
-            hits_++;
-            return it->second.dptr;
+            if (it->second.bytes == bytes) {
+                wait_ready(it->second);  // finish in-flight prefetch
+                it->second.last_use = now;
+                it->second.pins++;
+                hits_++;
+                return it->second.dptr;
+            }
+            // Same host pointer, different size: the address was
+            // recycled for another weight (weights are keyed by host
+            // pointer, valid only while that buffer is live). Drop the
+            // stale page and re-upload. A live pin would mean the same
+            // weight is in use, which cannot have a different size.
+            wait_ready(it->second);
+            cudaFree(it->second.dptr);
+            used_ -= it->second.bytes;
+            table_.erase(it);
         }
         void* dptr = alloc(bytes);
         if (dptr == nullptr) {
@@ -550,8 +787,17 @@ class WeightPool {
         }
         const std::uint64_t now = ++clock_;
         if (auto it = table_.find(host); it != table_.end()) {
-            it->second.last_use = now;  // already resident/in flight
-            return;
+            if (it->second.bytes == bytes) {
+                it->second.last_use = now;  // resident / in flight
+                return;
+            }
+            if (it->second.pins != 0) {
+                return;  // in use; let a later acquire refresh it
+            }
+            wait_ready(it->second);  // recycled address: drop stale
+            cudaFree(it->second.dptr);
+            used_ -= it->second.bytes;
+            table_.erase(it);
         }
         ensure_stream();
         void* dptr = alloc(bytes);
@@ -741,10 +987,71 @@ const std::uint64_t* device_iq1s_grid() {
     return d;
 }
 
-enum class Kind { kF32, kQ8_0, kQ4_K, kQ5_K, kQ6_K, kIQ1_S };
+/** Uploads a host lookup table to the device once; nullptr on
+ *  failure (callers fall back to scalar). */
+const void* upload_table(const void* host, std::size_t bytes) {
+    void* p = nullptr;
+    if (!cuda_ok(cudaMalloc(&p, bytes))) {
+        return nullptr;
+    }
+    if (!cuda_ok(cudaMemcpy(p, host, bytes,
+                            cudaMemcpyHostToDevice))) {
+        cudaFree(p);
+        return nullptr;
+    }
+    return p;
+}
+
+const std::uint64_t* device_iq2xxs_grid() {
+    static const auto* d = static_cast<const std::uint64_t*>(
+        upload_table(iq2xxs_grid, sizeof(iq2xxs_grid)));
+    return d;
+}
+
+const std::uint32_t* device_iq3xxs_grid() {
+    static const auto* d = static_cast<const std::uint32_t*>(
+        upload_table(iq3xxs_grid, sizeof(iq3xxs_grid)));
+    return d;
+}
+
+/** Sign lookup shared by IQ2_XXS and IQ3_XXS. */
+const std::uint8_t* device_ksigns() {
+    static const auto* d = static_cast<const std::uint8_t*>(
+        upload_table(ksigns_iq2xs, sizeof(ksigns_iq2xs)));
+    return d;
+}
+
+/** IQ4_NL 16-entry codebook used by IQ4_XS. */
+const std::int8_t* device_kvalues_iq4nl() {
+    static const auto* d = static_cast<const std::int8_t*>(
+        upload_table(kvalues_iq4nl, sizeof(kvalues_iq4nl)));
+    return d;
+}
+
+enum class Kind {
+    kF32,
+    kQ8_0,
+    kQ4_K,
+    kQ5_K,
+    kQ6_K,
+    kIQ1_S,
+    kQ2_K,
+    kIQ2_XXS,
+    kIQ3_XXS,
+    kIQ4_XS
+};
+
+/** Device lookup tables threaded to the grid/codebook kernels; unused
+ *  fields stay null for types that need none. */
+struct CudaTables {
+    const std::uint64_t* g64 = nullptr;    // iq1s / iq2xxs grid
+    const std::uint32_t* g32 = nullptr;    // iq3xxs grid
+    const std::uint8_t* ksigns = nullptr;  // iq2xxs / iq3xxs signs
+    const std::int8_t* kvalues = nullptr;  // iq4_xs codebook
+};
 
 void launch_kernel(Kind kind, const void* dw,
-                   const std::uint64_t* grid, const float* dxf,
+                   const CudaTables& t, const float* dxf,
                    float* doutf, std::uint32_t rows,
                    std::uint32_t cols) {
     const std::uint32_t threads = 256;
@@ -774,14 +1081,30 @@ void launch_kernel(Kind kind, const void* dw,
             break;
         case Kind::kIQ1_S:
             matvec_iq1_s_kernel<<<blocks, threads>>>(
-                dwb, grid, dxf, doutf, rows, cols);
+                dwb, t.g64, dxf, doutf, rows, cols);
+            break;
+        case Kind::kQ2_K:
+            matvec_q2_k_kernel<<<blocks, threads>>>(
+                dwb, dxf, doutf, rows, cols);
+            break;
+        case Kind::kIQ2_XXS:
+            matvec_iq2_xxs_kernel<<<blocks, threads>>>(
+                dwb, t.g64, t.ksigns, dxf, doutf, rows, cols);
+            break;
+        case Kind::kIQ3_XXS:
+            matvec_iq3_xxs_kernel<<<blocks, threads>>>(
+                dwb, t.g32, t.ksigns, dxf, doutf, rows, cols);
+            break;
+        case Kind::kIQ4_XS:
+            matvec_iq4_xs_kernel<<<blocks, threads>>>(
+                dwb, t.kvalues, dxf, doutf, rows, cols);
             break;
     }
 }
 
 bool run_matvec(const Mat& w, std::span<const float> x,
                 std::span<float> out, std::size_t w_bytes,
-                Kind kind, const std::uint64_t* grid = nullptr) {
+                Kind kind, const CudaTables& t = {}) {
     // Weight: resident pool, or an uncached per-call upload when it
     // cannot be cached (too big for the budget / all pages pinned).
     const void* dw = pool().acquire(w.data, w_bytes);
@@ -805,7 +1128,7 @@ bool run_matvec(const Mat& w, std::span<const float> x,
         if (dx.alloc(x_bytes) && dout.alloc(out_bytes) &&
             cuda_ok(cudaMemcpy(dx.p, x.data(), x_bytes,
                                cudaMemcpyHostToDevice))) {
-            launch_kernel(kind, dw, grid,
+            launch_kernel(kind, dw, t,
                           static_cast<const float*>(dx.p),
                           static_cast<float*>(dout.p), w.rows,
                           w.cols);
@@ -843,6 +1166,18 @@ std::size_t device_weight_bytes(const Mat& w) {
         case gguf::TensorType::kIQ1_S:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 256ull) * 50ull;
+        case gguf::TensorType::kQ2_K:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 84ull;
+        case gguf::TensorType::kIQ2_XXS:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 66ull;
+        case gguf::TensorType::kIQ3_XXS:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 98ull;
+        case gguf::TensorType::kIQ4_XS:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 136ull;
         default:
             return 0;
     }
@@ -860,6 +1195,14 @@ Kind kind_for(gguf::TensorType t) {
             return Kind::kQ6_K;
         case gguf::TensorType::kIQ1_S:
             return Kind::kIQ1_S;
+        case gguf::TensorType::kQ2_K:
+            return Kind::kQ2_K;
+        case gguf::TensorType::kIQ2_XXS:
+            return Kind::kIQ2_XXS;
+        case gguf::TensorType::kIQ3_XXS:
+            return Kind::kIQ3_XXS;
+        case gguf::TensorType::kIQ4_XS:
+            return Kind::kIQ4_XS;
         default:
             return Kind::kF32;
     }
@@ -922,12 +1265,34 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
     const std::size_t bytes = device_weight_bytes(w);
     bool done = false;
     if (bytes > 0) {
-        const std::uint64_t* grid =
-            w.type == gguf::TensorType::kIQ1_S ? device_iq1s_grid()
-                                               : nullptr;
-        if (w.type != gguf::TensorType::kIQ1_S || grid != nullptr) {
-            done = run_matvec(w, x, out, bytes, kind_for(w.type),
-                              grid);
+        // Grid/codebook kernels need their device tables uploaded;
+        // if any upload failed we fall back to scalar for that call.
+        CudaTables t;
+        bool tables_ok = true;
+        switch (w.type) {
+            case gguf::TensorType::kIQ1_S:
+                t.g64 = device_iq1s_grid();
+                tables_ok = t.g64 != nullptr;
+                break;
+            case gguf::TensorType::kIQ2_XXS:
+                t.g64 = device_iq2xxs_grid();
+                t.ksigns = device_ksigns();
+                tables_ok = t.g64 != nullptr && t.ksigns != nullptr;
+                break;
+            case gguf::TensorType::kIQ3_XXS:
+                t.g32 = device_iq3xxs_grid();
+                t.ksigns = device_ksigns();
+                tables_ok = t.g32 != nullptr && t.ksigns != nullptr;
+                break;
+            case gguf::TensorType::kIQ4_XS:
+                t.kvalues = device_kvalues_iq4nl();
+                tables_ok = t.kvalues != nullptr;
+                break;
+            default:
+                break;  // F32/Q8_0/Q2_K/Q4_K/Q5_K/Q6_K need none
+        }
+        if (tables_ok) {
+            done = run_matvec(w, x, out, bytes, kind_for(w.type), t);
         }
     }
     if (!done) {

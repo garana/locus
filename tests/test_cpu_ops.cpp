@@ -415,6 +415,48 @@ TEST_CASE("matvec_batch_sse4 Q4_K/Q6_K byte-identical to per-token "
 }
 #endif
 
+// Per-token CUDA device kernels vs the scalar reference, across every
+// GPU-handled K-/IQ-quant. The IQ/Q2_K kernels port dequant_block_*
+// (grids + signs + codebook) onto the device; each materializes the
+// super-block then dots i=0..255 matching dot_k_quant. Runtime-gated
+// on a usable CUDA device (SKIP on non-CUDA builds / no GPU).
+TEST_CASE("matvec_cuda matches the scalar reference for K-/IQ-quants",
+          "[ops][cuda]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    constexpr std::uint32_t rows = 3, nblk = 2, cols = nblk * 256;
+    std::mt19937 rng(77);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    for (TensorType t :
+         {TensorType::kQ2_K, TensorType::kQ4_K, TensorType::kQ5_K,
+          TensorType::kQ6_K, TensorType::kIQ1_S,
+          TensorType::kIQ2_XXS, TensorType::kIQ3_XXS,
+          TensorType::kIQ4_XS}) {
+        std::vector<std::byte> w;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto row = k_quant_row(
+                t, nblk,
+                2000u + r +
+                    13u * static_cast<std::uint32_t>(t));
+            w.insert(w.end(), row.begin(), row.end());
+        }
+        Mat m{t, w.data(), rows, cols};
+        std::vector<float> ref(rows), got(rows);
+        matvec(m, x, ref);       // scalar reference
+        matvec_cuda(m, x, got);  // device kernel
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            INFO("type " << static_cast<int>(t) << " row " << r);
+            REQUIRE(got[r] ==
+                    Approx(ref[r]).epsilon(1e-4).margin(1e-4));
+        }
+    }
+}
+
 // R11 CUDA: the one-launch batched kernel must be BIT-identical to n
 // per-token matvec_cuda() calls (row-major out[r*n + t]). Not
 // arch-guarded -- gated at runtime on a usable CUDA device.
