@@ -374,8 +374,20 @@ LOCUS_GPU_POOL_MB set below the model's weight bytes must
 reproduce the llama.cpp golden token-exact with evictions > 0
 in telemetry -- paging proven, not mere residency. The CUDA
 mirror validates the same way on vx (2GB VRAM makes the
-sub-model budget the natural case). Full-GPU GLM additionally
-needs IQ matvec shaders; that stays parked behind this work.
+sub-model budget the natural case).
+
+Full-GPU GLM Vulkan quant coverage (done): GLM-5.2 uses four quant
+types Vulkan previously fell back to host scalar on -- Q2_K (5c1a6e2)
+and IQ2_XXS/IQ3_XXS/IQ4_XS (abe0b1a, 830966c). Each ports its
+cpu_ops dequant_block_* into a GLSL matvec (dequant fused into the
+dot), validated on the M2 (MoltenVK) vs the scalar reference in
+[vulkan]. The IQ2/IQ3 grid tables reach the GPU the way CUDA does
+(device_iq1s_grid): a persistent SSBO of grid + ksigns_iq2xs bound
+as a 4th input for those kernels (the pipe table already carries a
+per-kernel binding count); IQ4_XS is grid-free (kvalues_iq4nl
+embedded as a GLSL const). So every GLM quant type now has a Vulkan
+matvec -- no host-scalar fallback. The CUDA twin (Q2_K + IQ2/IQ3/IQ4
+device kernels) is the remaining gap for full-GPU GLM on CUDA.
 
 Prefetch hook contract (agreed with claude-vx-locus
 2026-07-21): backend::Ops grows an optional
