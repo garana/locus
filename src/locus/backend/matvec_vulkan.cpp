@@ -67,6 +67,14 @@ std::size_t weight_bytes(const Mat& w) {
             b = static_cast<std::size_t>(w.rows) *
                 (w.cols / 256) * 66;
             break;
+        case gguf::TensorType::kIQ3_XXS:
+            b = static_cast<std::size_t>(w.rows) *
+                (w.cols / 256) * 98;
+            break;
+        case gguf::TensorType::kIQ4_XS:
+            b = static_cast<std::size_t>(w.rows) *
+                (w.cols / 256) * 136;
+            break;
         default:
             return 0;  // no GPU kernel for this type
     }
@@ -87,6 +95,10 @@ Kernel matvec_kernel(const Mat& w) {
         case gguf::TensorType::kQ2_K: return Kernel::kMatvecQ2_K;
         case gguf::TensorType::kIQ2_XXS:
             return Kernel::kMatvecIQ2_XXS;
+        case gguf::TensorType::kIQ3_XXS:
+            return Kernel::kMatvecIQ3_XXS;
+        case gguf::TensorType::kIQ4_XS:
+            return Kernel::kMatvecIQ4_XS;
         default: return Kernel::kCount_;
     }
 }
@@ -181,28 +193,36 @@ struct State {
         }
     }
 
-    // IQ2_XXS grid+signs table (SSBO 3), uploaded once: iq2xxs_grid
-    // (2048 B) then ksigns_iq2xs (128 B) at byte offset 2048.
-    VulkanContext::Buffer iq2xxs_tbl{};
-    bool iq2xxs_tbl_ready = false;
-    VulkanContext::Buffer iq2xxs_table() {
-        if (!iq2xxs_tbl_ready) {
-            const std::size_t gsz = sizeof(::iq2xxs_grid);
+    // IQ grid+signs tables (SSBO 3), uploaded once: the grid then
+    // ksigns_iq2xs (128 B) at the grid's end. iq2xxs_grid is 2048 B
+    // (256 u64), iq3xxs_grid is 1024 B (256 u32).
+    VulkanContext::Buffer iq2xxs_tbl{}, iq3xxs_tbl{};
+    bool iq2xxs_tbl_ready = false, iq3xxs_tbl_ready = false;
+
+    template <typename Grid>
+    VulkanContext::Buffer grid_table(VulkanContext::Buffer& buf,
+                                     bool& ready, const Grid& grid) {
+        if (!ready) {
+            const std::size_t gsz = sizeof(grid);
             const std::size_t ssz = sizeof(::ksigns_iq2xs);
-            iq2xxs_tbl = ctx.create_buffer(gsz + ssz);
-            auto* p =
-                static_cast<std::byte*>(ctx.mapped(iq2xxs_tbl));
-            std::memcpy(p, ::iq2xxs_grid, gsz);
+            buf = ctx.create_buffer(gsz + ssz);
+            auto* p = static_cast<std::byte*>(ctx.mapped(buf));
+            std::memcpy(p, &grid[0], gsz);
             std::memcpy(p + gsz, ::ksigns_iq2xs, ssz);
-            iq2xxs_tbl_ready = true;
+            ready = true;
         }
-        return iq2xxs_tbl;
+        return buf;
     }
 
     /** The extra SSBO an IQ kernel binds (grid+signs), or null. */
     VulkanContext::Buffer grid_for(Kernel k) {
         if (k == Kernel::kMatvecIQ2_XXS) {
-            return iq2xxs_table();
+            return grid_table(iq2xxs_tbl, iq2xxs_tbl_ready,
+                              ::iq2xxs_grid);
+        }
+        if (k == Kernel::kMatvecIQ3_XXS) {
+            return grid_table(iq3xxs_tbl, iq3xxs_tbl_ready,
+                              ::iq3xxs_grid);
         }
         return {};
     }

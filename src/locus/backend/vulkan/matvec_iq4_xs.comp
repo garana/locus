@@ -1,0 +1,72 @@
+#version 450
+
+// IQ4_XS matvec: 136-byte blocks of 256 elements -- f16 d, u16
+// scales_h, scales_l[4], qs[128]. Each of 8 sub-blocks has a 6-bit
+// scale (nibble from scales_l + 2 bits from scales_h); each qs byte
+// gives two 4-bit indices into the fixed kvalues_iq4nl table. No
+// grid SSBO -- the 16-entry table is embedded. Mirrors
+// dequant_block_iq4_xs; the dot against x is fused.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint out_offset;
+    uint accumulate;
+    uint w_off;
+    uint x_off;
+    float scale;
+} pc;
+
+const int kvalues_iq4nl[16] = int[16](
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113);
+
+uint byte_at(uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+float f16_at(uint i) {
+    return unpackHalf2x16(byte_at(i) | (byte_at(i + 1u) << 8u)).x;
+}
+
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= pc.rows) {
+        return;
+    }
+    uint nb = pc.cols / 256u;
+    float acc = 0.0;
+    for (uint b = 0; b < nb; ++b) {
+        uint at = pc.w_off + (r * nb + b) * 136u;
+        float d = f16_at(at);
+        uint scales_h = byte_at(at + 2u) | (byte_at(at + 3u) << 8u);
+        uint sl = at + 4u;    // scales_l[4]
+        uint qs0 = at + 8u;   // qs[128]
+        uint xb = pc.x_off + b * 256u;
+        for (uint ib = 0; ib < 8u; ++ib) {
+            uint ls = ((byte_at(sl + (ib >> 1u)) >>
+                        (4u * (ib & 1u))) &
+                       0x0fu) |
+                      (((scales_h >> (2u * ib)) & 3u) << 4u);
+            float dl = d * (float(ls) - 32.0);
+            uint qh = qs0 + 16u * ib;
+            uint eb = xb + ib * 32u;
+            for (uint j = 0; j < 16u; ++j) {
+                uint q = byte_at(qh + j);
+                acc += dl * float(kvalues_iq4nl[q & 0x0fu]) *
+                       x[eb + j];
+                acc += dl * float(kvalues_iq4nl[q >> 4u]) *
+                       x[eb + j + 16u];
+            }
+        }
+    }
+    uint at_out = pc.out_offset + r;
+    float v = acc * pc.scale;
+    o[at_out] = pc.accumulate != 0 ? o[at_out] + v : v;
+}

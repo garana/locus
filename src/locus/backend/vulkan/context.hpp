@@ -18,6 +18,8 @@ enum class Kernel {
     kMatvecQ6_K,
     kMatvecQ2_K,
     kMatvecIQ2_XXS,
+    kMatvecIQ3_XXS,
+    kMatvecIQ4_XS,
     kMatvecT,
     kRmsNorm,
     kRope,

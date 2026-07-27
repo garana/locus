@@ -323,6 +323,53 @@ TEST_CASE("vulkan IQ2_XXS matvec matches the CPU reference",
     }
 }
 
+TEST_CASE("vulkan IQ3_XXS and IQ4_XS matvec match the CPU "
+          "reference",
+          "[vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    std::mt19937 rng(53);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+
+    struct Case {
+        locus::gguf::TensorType type;
+        std::size_t block_bytes;
+    };
+    const Case cases[] = {
+        {locus::gguf::TensorType::kIQ3_XXS, 98},
+        {locus::gguf::TensorType::kIQ4_XS, 136},
+    };
+    const std::uint32_t rows = 4, cols = 512;
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    for (const auto& c : cases) {
+        INFO("type " << static_cast<int>(c.type));
+        const std::size_t nblk = rows * (cols / 256);
+        std::vector<std::byte> w(nblk * c.block_bytes);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t blk = 0; blk < nblk; ++blk) {
+            const std::uint16_t d =
+                locus::backend::f32_to_f16(0.01f);
+            std::memcpy(w.data() + blk * c.block_bytes, &d, 2);
+        }
+        locus::backend::Mat m{c.type, w.data(), rows, cols};
+        std::vector<float> cpu(rows), gpu(rows);
+        locus::backend::matvec(m, x, cpu);
+        locus::backend::matvec_vulkan(m, x, gpu);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(gpu[r] == Catch::Approx(cpu[r])
+                                  .margin(1e-2)
+                                  .epsilon(1e-3));
+        }
+    }
+}
+
 TEST_CASE("gpu matvec beats scalar cpu at real-model sizes",
           "[vulkan][benchmark]") {
     if (!VulkanContext::available()) {
