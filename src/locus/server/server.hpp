@@ -16,16 +16,22 @@ class Server;
 namespace locus::server {
 
 /**
- * OpenAI-compatible HTTP front end (DESIGN.md 4.5):
+ * OpenAI- and Anthropic-compatible HTTP front end (DESIGN.md 4.5):
  *
  *   POST /v1/completions        {prompt, max_tokens, stream}
  *   POST /v1/chat/completions   {messages, max_tokens, stream}
+ *   POST /v1/messages           Anthropic Messages API
  *   GET  /health
  *
- * stream=true answers as text/event-stream with OpenAI-style
- * `data: {...}` chunks and a final `data: [DONE]`. Chat messages
- * are flattened to plain text (base models have no chat template;
- * documented limitation for the MVP).
+ * The OpenAI endpoints stream as text/event-stream with OpenAI-style
+ * `data: {...}` chunks and a final `data: [DONE]`. /v1/messages
+ * speaks the Anthropic shape -- {system, messages, max_tokens,
+ * stream}, a {type:"message", content:[{type:"text"}]} response, and
+ * the message_start / content_block_delta / message_stop SSE event
+ * sequence -- so Claude Code (ANTHROPIC_BASE_URL) and the Anthropic
+ * SDK can target locus directly. Chat prompts are built via the
+ * configured chat template. Text-only: image and tool_use/
+ * tool_result content blocks are ignored (no tool support yet).
  */
 class OpenAiServer {
   public:

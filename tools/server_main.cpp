@@ -27,9 +27,10 @@ int main(int argc, char** argv) {
     if (args.help) {
         std::printf(
             "usage: %s [options] <model.gguf> [port]\n\n"
-            "OpenAI-compatible inference server (default port "
-            "8080):\n  POST /v1/completions\n  POST "
-            "/v1/chat/completions\n  GET  /health\n\n%s",
+            "OpenAI + Anthropic compatible inference server "
+            "(default port 8080):\n  POST /v1/completions\n  POST "
+            "/v1/chat/completions\n  POST /v1/messages  "
+            "(Anthropic)\n  GET  /health\n\n%s",
             argv[0], locus_tools::kCommonHelp);
         return 0;
     }

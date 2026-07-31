@@ -93,6 +93,86 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
                      .empty());
     }
 
+    SECTION("anthropic messages, non-streaming") {
+        json req{{"system", "You are a storyteller."},
+                 {"messages",
+                  json::array(
+                      {{{"role", "user"},
+                        {"content", "Once upon a time"}}})},
+                 {"max_tokens", 12}};
+        auto res = client.Post("/v1/messages", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = json::parse(res->body);
+        REQUIRE(body["type"] == "message");
+        REQUIRE(body["role"] == "assistant");
+        REQUIRE(body["content"][0]["type"] == "text");
+        REQUIRE(!body["content"][0]["text"]
+                     .get<std::string>()
+                     .empty());
+        REQUIRE((body["stop_reason"] == "end_turn" ||
+                 body["stop_reason"] == "max_tokens"));
+        REQUIRE(body["usage"]["input_tokens"].get<int>() > 0);
+    }
+
+    SECTION("anthropic messages, content blocks") {
+        // Content as an array of text blocks must also work.
+        json req{{"messages",
+                  json::array({{{"role", "user"},
+                                {"content",
+                                 json::array({{{"type", "text"},
+                                               {"text",
+                                                "Once upon"}}})}}})},
+                 {"max_tokens", 8}};
+        auto res = client.Post("/v1/messages", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        REQUIRE(json::parse(res->body)["type"] == "message");
+    }
+
+    SECTION("anthropic messages, streaming SSE") {
+        json req{{"messages",
+                  json::array({{{"role", "user"},
+                                {"content", "Once upon a time"}}})},
+                 {"max_tokens", 8},
+                 {"stream", true}};
+        auto res = client.Post("/v1/messages", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        REQUIRE(res->get_header_value("Content-Type") ==
+                "text/event-stream");
+        const std::string& sse = res->body;
+        REQUIRE(sse.find("event: message_start") == 0);
+        REQUIRE(sse.find("event: content_block_start") !=
+                std::string::npos);
+        REQUIRE(sse.find("event: content_block_delta") !=
+                std::string::npos);
+        REQUIRE(sse.find("\"type\":\"text_delta\"") !=
+                std::string::npos);
+        REQUIRE(sse.find("event: message_delta") !=
+                std::string::npos);
+        REQUIRE(sse.find("event: message_stop") !=
+                std::string::npos);
+        // Reassemble the streamed text_delta pieces (parse each
+        // SSE data line as JSON -- key order is not guaranteed).
+        std::string text;
+        std::size_t at = 0;
+        const std::string dp = "data: ";
+        while ((at = sse.find(dp, at)) != std::string::npos) {
+            at += dp.size();
+            const std::size_t end = sse.find("\n\n", at);
+            const auto j = json::parse(sse.substr(at, end - at));
+            if (j.value("type", "") == "content_block_delta") {
+                text += j["delta"]["text"].get<std::string>();
+            }
+            at = end;
+        }
+        REQUIRE(!text.empty());
+    }
+
     SECTION("completions, streaming SSE") {
         json req{{"prompt", "Once upon a time"},
                  {"max_tokens", 8},
