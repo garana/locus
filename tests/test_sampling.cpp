@@ -1,4 +1,5 @@
 #include <random>
+#include <set>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -11,6 +12,15 @@ using locus::tok::TokenId;
 namespace {
 std::mt19937_64 rng(123);
 std::vector<TokenId> none;
+
+/** Test constraint that only permits a fixed set of token ids. */
+struct AllowSet : locus::model::TokenConstraint {
+    std::set<TokenId> ok;
+    bool allows(TokenId t) const override {
+        return ok.count(t) > 0;
+    }
+    void commit(TokenId) override {}
+};
 }  // namespace
 
 TEST_CASE("default sampling is greedy (argmax)", "[sampling]") {
@@ -57,6 +67,25 @@ TEST_CASE("same seed is reproducible", "[sampling]") {
         std::vector<float> la = logits, lb = logits;
         REQUIRE(sample(la, p, none, a) ==
                 sample(lb, p, none, b));
+    }
+}
+
+TEST_CASE("a constraint restricts the choice", "[sampling]") {
+    AllowSet c;
+    c.ok = {2, 3};  // token 0 has the top logit but is disallowed
+    SECTION("greedy picks the highest-logit allowed token") {
+        std::vector<float> logits{5.0f, 4.0f, 3.0f, 2.0f, 1.0f};
+        SamplingParams p;  // greedy
+        REQUIRE(sample(logits, p, none, rng, &c) == 2);
+    }
+    SECTION("sampling only draws allowed tokens") {
+        SamplingParams p;
+        p.temperature = 1.0f;
+        for (int i = 0; i < 30; ++i) {
+            std::vector<float> l{5.0f, 4.0f, 3.0f, 2.0f, 1.0f};
+            const TokenId t = sample(l, p, none, rng, &c);
+            REQUIRE(c.ok.count(t) == 1);
+        }
     }
 }
 

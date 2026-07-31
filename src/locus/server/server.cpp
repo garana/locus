@@ -7,6 +7,7 @@
 
 #include "httplib.h"
 #include "json.hpp"
+#include "locus/model/grammar.hpp"
 #include "locus/server/tools.hpp"
 
 namespace locus::server {
@@ -130,6 +131,55 @@ std::pair<model::SamplingParams, std::uint64_t> parse_sampling(
     return {p, seed};
 }
 
+/** True when the caller asked for JSON output (OpenAI
+ * response_format:{type:"json_object"} or Anthropic-style). */
+bool wants_json(const json& body) {
+    if (body.contains("response_format") &&
+        body["response_format"].is_object()) {
+        return body["response_format"].value("type", "") ==
+               "json_object";
+    }
+    return false;
+}
+
+/**
+ * Constrained-decoding filter that forces valid JSON output. Holds
+ * the shared token->bytes table plus a live JsonGrammar; a candidate
+ * token is allowed iff feeding its bytes keeps the JSON valid.
+ */
+class JsonTokenConstraint : public model::TokenConstraint {
+  public:
+    explicit JsonTokenConstraint(
+        std::shared_ptr<const std::vector<std::string>> pieces)
+        : pieces_(std::move(pieces)) {}
+
+    bool allows(tok::TokenId t) const override {
+        if (static_cast<std::size_t>(t) >= pieces_->size()) {
+            return true;  // special/oob token (e.g. eos): allow
+        }
+        model::JsonGrammar g = grammar_;
+        for (unsigned char c : (*pieces_)[t]) {
+            if (!g.feed(c)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void commit(tok::TokenId t) override {
+        if (static_cast<std::size_t>(t) >= pieces_->size()) {
+            return;
+        }
+        for (unsigned char c : (*pieces_)[t]) {
+            grammar_.feed(c);
+        }
+    }
+
+  private:
+    std::shared_ptr<const std::vector<std::string>> pieces_;
+    model::JsonGrammar grammar_;
+};
+
 }  // namespace
 
 OpenAiServer::OpenAiServer(const model::LlamaModel& m,
@@ -138,8 +188,23 @@ OpenAiServer::OpenAiServer(const model::LlamaModel& m,
     : tok_(tok),
       opt_(std::move(opt)),
       loop_(m, tok.eos_id(), opt_.engine),
-      http_(std::make_unique<httplib::Server>()) {
+      http_(std::make_unique<httplib::Server>()),
+      n_vocab_(m.hparams().n_vocab) {
     install_routes();
+}
+
+std::shared_ptr<const std::vector<std::string>>
+OpenAiServer::json_pieces() {
+    std::call_once(pieces_once_, [this] {
+        auto pieces = std::make_shared<std::vector<std::string>>();
+        pieces->reserve(n_vocab_);
+        for (std::uint32_t t = 0; t < n_vocab_; ++t) {
+            const tok::TokenId id = static_cast<tok::TokenId>(t);
+            pieces->push_back(tok_.decode({&id, 1}));
+        }
+        pieces_ = std::move(pieces);
+    });
+    return pieces_;
 }
 
 OpenAiServer::~OpenAiServer() { http_->stop(); }
@@ -220,8 +285,14 @@ void OpenAiServer::install_routes() {
         }
 
         auto [sampling, seed] = parse_sampling(body);
+        std::unique_ptr<model::TokenConstraint> constraint;
+        if (wants_json(body)) {
+            constraint = std::make_unique<JsonTokenConstraint>(
+                json_pieces());
+        }
         const std::uint64_t id = loop_.submit(
-            tok_.encode(prompt, true), max_tokens, sampling, seed);
+            tok_.encode(prompt, true), max_tokens, sampling, seed,
+            std::move(constraint));
         const std::string object =
             chat ? "chat.completion" : "text_completion";
         const std::string sse_object =
@@ -337,6 +408,7 @@ void OpenAiServer::install_routes() {
         std::vector<ToolSpec> tools;
         model::SamplingParams sampling;
         std::uint64_t seed = 0;
+        std::unique_ptr<model::TokenConstraint> constraint;
         try {
             const json body = json::parse(req.body);
             if (!body.contains("messages") ||
@@ -344,6 +416,10 @@ void OpenAiServer::install_routes() {
                 body["messages"].empty()) {
                 throw std::invalid_argument(
                     "messages must be a non-empty array");
+            }
+            if (wants_json(body)) {
+                constraint = std::make_unique<JsonTokenConstraint>(
+                    json_pieces());
             }
             auto msgs = parse_anthropic_messages(body);
             tools = parse_tools(body, /*anthropic=*/true);
@@ -380,8 +456,9 @@ void OpenAiServer::install_routes() {
             return;
         }
 
-        const std::uint64_t id = loop_.submit(
-            std::move(ids), max_tokens, sampling, seed);
+        const std::uint64_t id =
+            loop_.submit(std::move(ids), max_tokens, sampling, seed,
+                         std::move(constraint));
         const std::string rid = "msg_locus-" + std::to_string(id);
 
         if (!stream) {

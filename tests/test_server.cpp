@@ -4,6 +4,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/gguf/gguf.hpp"
+#include "locus/model/grammar.hpp"
 #include "locus/model/llama.hpp"
 #include "locus/server/server.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -115,6 +116,28 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(res->status == 200);
         auto body = json::parse(res->body);
         REQUIRE(body["choices"][0].contains("message"));
+    }
+
+    SECTION("response_format json_object constrains to valid JSON") {
+        json req{
+            {"messages",
+             json::array({{{"role", "user"},
+                           {"content", "Give me an object"}}})},
+            {"max_tokens", 24},
+            {"response_format", {{"type", "json_object"}}}};
+        auto res = client.Post("/v1/chat/completions", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const std::string content = json::parse(
+            res->body)["choices"][0]["message"]["content"];
+        REQUIRE(!content.empty());
+        // Every byte must keep the output a valid JSON prefix.
+        locus::model::JsonGrammar g;
+        for (unsigned char c : content) {
+            INFO("content: " << content);
+            REQUIRE(g.feed(c));
+        }
     }
 
     SECTION("anthropic messages, non-streaming") {

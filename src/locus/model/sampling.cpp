@@ -44,11 +44,26 @@ void apply_penalties(std::span<float> logits, const SamplingParams& p,
 
 tok::TokenId sample(std::span<float> logits, const SamplingParams& p,
                     std::span<const tok::TokenId> history,
-                    std::mt19937_64& rng) {
+                    std::mt19937_64& rng,
+                    const TokenConstraint* constraint) {
     apply_penalties(logits, p, history);
 
+    // Greedy: highest-logit token (allowed one, if constrained).
     if (p.temperature <= 0.0f) {
-        return argmax(logits);
+        if (constraint == nullptr) {
+            return argmax(logits);
+        }
+        std::int64_t best = -1;
+        float best_l = 0.0f;
+        for (std::uint32_t i = 0; i < logits.size(); ++i) {
+            if (constraint->allows(i) &&
+                (best < 0 || logits[i] > best_l)) {
+                best = i;
+                best_l = logits[i];
+            }
+        }
+        return best >= 0 ? static_cast<tok::TokenId>(best)
+                         : argmax(logits);
     }
 
     // Candidate (logit, index) pairs, highest logit first.
@@ -56,6 +71,18 @@ tok::TokenId sample(std::span<float> logits, const SamplingParams& p,
     cand.reserve(logits.size());
     for (std::uint32_t i = 0; i < logits.size(); ++i) {
         cand.emplace_back(logits[i], i);
+    }
+    if (constraint != nullptr) {
+        std::vector<std::pair<float, std::uint32_t>> allowed;
+        allowed.reserve(cand.size());
+        for (const auto& c : cand) {
+            if (constraint->allows(c.second)) {
+                allowed.push_back(c);
+            }
+        }
+        if (!allowed.empty()) {  // else: dead end -> stay unconstrained
+            cand.swap(allowed);
+        }
     }
     const auto by_logit = [](const auto& a, const auto& b) {
         return a.first > b.first;

@@ -16,15 +16,15 @@ EngineLoop::~EngineLoop() {
     worker_.join();
 }
 
-std::uint64_t EngineLoop::submit(std::vector<tok::TokenId> prompt,
-                                 std::uint32_t max_new_tokens,
-                                 model::SamplingParams sampling,
-                                 std::uint64_t seed) {
+std::uint64_t EngineLoop::submit(
+    std::vector<tok::TokenId> prompt, std::uint32_t max_new_tokens,
+    model::SamplingParams sampling, std::uint64_t seed,
+    std::unique_ptr<model::TokenConstraint> constraint) {
     std::uint64_t id;
     {
         std::lock_guard<std::mutex> lk(mu_);
         id = engine_.submit(std::move(prompt), max_new_tokens,
-                            sampling, seed);
+                            sampling, seed, std::move(constraint));
     }
     work_cv_.notify_all();
     return id;

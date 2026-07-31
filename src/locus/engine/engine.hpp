@@ -36,6 +36,8 @@ struct Request {
     model::SamplingParams sampling;
     /** Per-request RNG (seeded at submit) for stochastic sampling. */
     std::mt19937_64 rng;
+    /** Optional constrained-decoding filter (e.g. JSON grammar). */
+    std::unique_ptr<model::TokenConstraint> constraint;
 
     /** Cache handle (internal to the engine). */
     kv::PagedKvCache::Seq seq;
@@ -99,10 +101,11 @@ class Engine {
      * @param seed RNG seed; 0 draws a nondeterministic one.
      * @returns Request id for get().
      */
-    std::uint64_t submit(std::vector<tok::TokenId> prompt,
-                         std::uint32_t max_new_tokens,
-                         model::SamplingParams sampling = {},
-                         std::uint64_t seed = 0);
+    std::uint64_t submit(
+        std::vector<tok::TokenId> prompt,
+        std::uint32_t max_new_tokens,
+        model::SamplingParams sampling = {}, std::uint64_t seed = 0,
+        std::unique_ptr<model::TokenConstraint> constraint = nullptr);
 
     /**
      * Runs one scheduling iteration.

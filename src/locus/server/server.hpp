@@ -1,7 +1,9 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "locus/chat/template.hpp"
 #include "locus/engine/engine.hpp"
@@ -78,11 +80,17 @@ class OpenAiServer {
 
   private:
     void install_routes();
+    /** Lazily builds (once) and returns the token -> decoded-bytes
+     * table used by constrained decoding. */
+    std::shared_ptr<const std::vector<std::string>> json_pieces();
 
     const tok::Tokenizer& tok_;
     Options opt_;
     EngineLoop loop_;
     std::unique_ptr<httplib::Server> http_;
+    std::uint32_t n_vocab_ = 0;
+    std::once_flag pieces_once_;
+    std::shared_ptr<const std::vector<std::string>> pieces_;
 };
 
 }  // namespace locus::server

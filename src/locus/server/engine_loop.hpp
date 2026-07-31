@@ -34,10 +34,11 @@ class EngineLoop {
     EngineLoop& operator=(const EngineLoop&) = delete;
 
     /** Enqueues a request and wakes the worker. */
-    std::uint64_t submit(std::vector<tok::TokenId> prompt,
-                         std::uint32_t max_new_tokens,
-                         model::SamplingParams sampling = {},
-                         std::uint64_t seed = 0);
+    std::uint64_t submit(
+        std::vector<tok::TokenId> prompt,
+        std::uint32_t max_new_tokens,
+        model::SamplingParams sampling = {}, std::uint64_t seed = 0,
+        std::unique_ptr<model::TokenConstraint> constraint = nullptr);
 
     /** @returns A snapshot of the request's current state. */
     View view(std::uint64_t id);

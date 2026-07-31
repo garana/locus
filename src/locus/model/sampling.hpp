@@ -33,18 +33,36 @@ struct SamplingParams {
 };
 
 /**
+ * A per-request token-level constraint for constrained decoding
+ * (e.g. a JSON grammar). The sampler only considers tokens that
+ * allows() accepts; the engine commit()s the chosen token so the
+ * constraint can advance its state.
+ */
+class TokenConstraint {
+  public:
+    virtual ~TokenConstraint() = default;
+    /** @returns true if `t` may be emitted next. */
+    virtual bool allows(tok::TokenId t) const = 0;
+    /** Advances internal state past the chosen token `t`. */
+    virtual void commit(tok::TokenId t) = 0;
+};
+
+/**
  * Samples one token from `logits` (mutated in place: penalties and
  * temperature are applied to it). `history` is the recent token
  * stream the penalties look back over; `rng` supplies randomness
- * (seed it per request for reproducibility).
+ * (seed it per request for reproducibility). `constraint`, when
+ * non-null, restricts the choice to allowed tokens (falling back to
+ * unconstrained if it would leave no candidate).
  *
- * temperature <= 0 short-circuits to argmax (rng unused), so greedy
- * decoding stays bit-exact. Filter order matches llama.cpp:
- * penalties -> top_k -> temperature/softmax -> top_p -> min_p ->
- * sample.
+ * temperature <= 0 short-circuits to argmax (rng unused, no
+ * constraint) so greedy decoding stays bit-exact. Filter order
+ * matches llama.cpp: penalties -> constraint -> top_k ->
+ * temperature/softmax -> top_p -> min_p -> sample.
  */
 tok::TokenId sample(std::span<float> logits, const SamplingParams& p,
                     std::span<const tok::TokenId> history,
-                    std::mt19937_64& rng);
+                    std::mt19937_64& rng,
+                    const TokenConstraint* constraint = nullptr);
 
 }  // namespace locus::model

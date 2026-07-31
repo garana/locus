@@ -18,15 +18,16 @@ Engine::Engine(const model::LlamaModel& m, tok::TokenId eos,
 Engine::Engine(const model::LlamaModel& m, tok::TokenId eos)
     : Engine(m, eos, Config{}) {}
 
-std::uint64_t Engine::submit(std::vector<tok::TokenId> prompt,
-                             std::uint32_t max_new_tokens,
-                             model::SamplingParams sampling,
-                             std::uint64_t seed) {
+std::uint64_t Engine::submit(
+    std::vector<tok::TokenId> prompt, std::uint32_t max_new_tokens,
+    model::SamplingParams sampling, std::uint64_t seed,
+    std::unique_ptr<model::TokenConstraint> constraint) {
     auto r = std::make_unique<Request>();
     r->id = requests_.size();
     r->prompt = std::move(prompt);
     r->max_new_tokens = max_new_tokens;
     r->sampling = sampling;
+    r->constraint = std::move(constraint);
     r->rng.seed(seed != 0 ? seed
                           : std::random_device{}() ^
                                 (r->id * 0x9e3779b97f4a7c15ULL));
@@ -185,8 +186,11 @@ const Request* Engine::get(std::uint64_t id) const {
 }
 
 void Engine::sample_from(Request& r, std::span<float> logits) {
-    const auto next =
-        model::sample(logits, r.sampling, r.generated, r.rng);
+    const auto next = model::sample(logits, r.sampling, r.generated,
+                                    r.rng, r.constraint.get());
+    if (r.constraint) {
+        r.constraint->commit(next);
+    }
     r.generated.push_back(next);
     if (on_token) {
         on_token(r, next);
