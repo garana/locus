@@ -28,6 +28,7 @@ add_library(locus
     src/locus/model/arch.cpp
     src/locus/model/llama.cpp
     src/locus/model/moe_stats.cpp
+    src/locus/model/sampling.cpp
     src/locus/server/engine_loop.cpp
     src/locus/server/server.cpp
     src/locus/server/tools.cpp

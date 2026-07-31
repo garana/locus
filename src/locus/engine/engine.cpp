@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <random>
 
 namespace locus::engine {
 
@@ -18,11 +19,17 @@ Engine::Engine(const model::LlamaModel& m, tok::TokenId eos)
     : Engine(m, eos, Config{}) {}
 
 std::uint64_t Engine::submit(std::vector<tok::TokenId> prompt,
-                             std::uint32_t max_new_tokens) {
+                             std::uint32_t max_new_tokens,
+                             model::SamplingParams sampling,
+                             std::uint64_t seed) {
     auto r = std::make_unique<Request>();
     r->id = requests_.size();
     r->prompt = std::move(prompt);
     r->max_new_tokens = max_new_tokens;
+    r->sampling = sampling;
+    r->rng.seed(seed != 0 ? seed
+                          : std::random_device{}() ^
+                                (r->id * 0x9e3779b97f4a7c15ULL));
     requests_.push_back(std::move(r));
     waiting_.push_back(requests_.back()->id);
     return requests_.back()->id;
@@ -177,9 +184,9 @@ const Request* Engine::get(std::uint64_t id) const {
     return id < requests_.size() ? requests_[id].get() : nullptr;
 }
 
-void Engine::sample_from(Request& r,
-                         std::span<const float> logits) {
-    const auto next = model::argmax(logits);
+void Engine::sample_from(Request& r, std::span<float> logits) {
+    const auto next =
+        model::sample(logits, r.sampling, r.generated, r.rng);
     r.generated.push_back(next);
     if (on_token) {
         on_token(r, next);

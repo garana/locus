@@ -35,7 +35,9 @@ class EngineLoop {
 
     /** Enqueues a request and wakes the worker. */
     std::uint64_t submit(std::vector<tok::TokenId> prompt,
-                         std::uint32_t max_new_tokens);
+                         std::uint32_t max_new_tokens,
+                         model::SamplingParams sampling = {},
+                         std::uint64_t seed = 0);
 
     /** @returns A snapshot of the request's current state. */
     View view(std::uint64_t id);

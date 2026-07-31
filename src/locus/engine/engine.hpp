@@ -4,11 +4,13 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/llama.hpp"
+#include "locus/model/sampling.hpp"
 #include "locus/tok/tokenizer.hpp"
 
 namespace locus::engine {
@@ -29,6 +31,11 @@ struct Request {
     std::vector<tok::TokenId> generated;
     Status status = Status::kWaiting;
     std::string error;
+
+    /** Sampling parameters (default: greedy/argmax). */
+    model::SamplingParams sampling;
+    /** Per-request RNG (seeded at submit) for stochastic sampling. */
+    std::mt19937_64 rng;
 
     /** Cache handle (internal to the engine). */
     kv::PagedKvCache::Seq seq;
@@ -88,10 +95,14 @@ class Engine {
     /**
      * Enqueues a prompt for generation.
      *
+     * @param sampling Sampling params (default greedy/argmax).
+     * @param seed RNG seed; 0 draws a nondeterministic one.
      * @returns Request id for get().
      */
     std::uint64_t submit(std::vector<tok::TokenId> prompt,
-                         std::uint32_t max_new_tokens);
+                         std::uint32_t max_new_tokens,
+                         model::SamplingParams sampling = {},
+                         std::uint64_t seed = 0);
 
     /**
      * Runs one scheduling iteration.
@@ -135,7 +146,7 @@ class Engine {
     bool prefill_only(Request& r, std::uint32_t& budget);
     /** Samples the next token for r from r.logits, appends it, and
      * finishes r on EOS / max. @returns the sampled token. */
-    void sample_from(Request& r, std::span<const float> logits);
+    void sample_from(Request& r, std::span<float> logits);
     /** Releases r's blocks and moves it back to the wait queue. */
     void preempt(std::uint64_t victim_id);
     void finish(Request& r, Status s, std::string error = "");

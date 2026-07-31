@@ -17,11 +17,14 @@ EngineLoop::~EngineLoop() {
 }
 
 std::uint64_t EngineLoop::submit(std::vector<tok::TokenId> prompt,
-                                 std::uint32_t max_new_tokens) {
+                                 std::uint32_t max_new_tokens,
+                                 model::SamplingParams sampling,
+                                 std::uint64_t seed) {
     std::uint64_t id;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        id = engine_.submit(std::move(prompt), max_new_tokens);
+        id = engine_.submit(std::move(prompt), max_new_tokens,
+                            sampling, seed);
     }
     work_cv_.notify_all();
     return id;

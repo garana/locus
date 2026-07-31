@@ -1,6 +1,8 @@
 #include "locus/server/server.hpp"
 
 #include <cstdint>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "httplib.h"
@@ -98,6 +100,36 @@ std::vector<chat::Message> parse_anthropic_messages(
     return out;
 }
 
+/**
+ * Reads sampling parameters common to both APIs from the request.
+ * Unspecified -> greedy default (temperature 0), which keeps
+ * responses deterministic unless the caller opts into sampling.
+ * @returns {params, seed} (seed 0 = nondeterministic).
+ */
+std::pair<model::SamplingParams, std::uint64_t> parse_sampling(
+    const json& body) {
+    model::SamplingParams p;
+    const auto num = [&](const char* k, float& dst) {
+        if (body.contains(k) && body[k].is_number()) {
+            dst = body[k].get<float>();
+        }
+    };
+    num("temperature", p.temperature);
+    num("top_p", p.top_p);
+    num("min_p", p.min_p);
+    num("repeat_penalty", p.repeat_penalty);
+    num("frequency_penalty", p.frequency_penalty);
+    num("presence_penalty", p.presence_penalty);
+    if (body.contains("top_k") && body["top_k"].is_number_unsigned()) {
+        p.top_k = body["top_k"].get<std::uint32_t>();
+    }
+    std::uint64_t seed = 0;
+    if (body.contains("seed") && body["seed"].is_number_unsigned()) {
+        seed = body["seed"].get<std::uint64_t>();
+    }
+    return {p, seed};
+}
+
 }  // namespace
 
 OpenAiServer::OpenAiServer(const model::LlamaModel& m,
@@ -187,8 +219,9 @@ void OpenAiServer::install_routes() {
             return;
         }
 
-        const std::uint64_t id =
-            loop_.submit(tok_.encode(prompt, true), max_tokens);
+        auto [sampling, seed] = parse_sampling(body);
+        const std::uint64_t id = loop_.submit(
+            tok_.encode(prompt, true), max_tokens, sampling, seed);
         const std::string object =
             chat ? "chat.completion" : "text_completion";
         const std::string sse_object =
@@ -302,6 +335,8 @@ void OpenAiServer::install_routes() {
         bool stream = false;
         std::vector<tok::TokenId> ids;
         std::vector<ToolSpec> tools;
+        model::SamplingParams sampling;
+        std::uint64_t seed = 0;
         try {
             const json body = json::parse(req.body);
             if (!body.contains("messages") ||
@@ -330,6 +365,7 @@ void OpenAiServer::install_routes() {
                         opt_.max_tokens_cap));
             }
             stream = body.value("stream", false);
+            std::tie(sampling, seed) = parse_sampling(body);
             ids = tok_.encode(prompt, true);
             input_tokens = static_cast<std::uint32_t>(ids.size());
         } catch (const std::exception& e) {
@@ -344,8 +380,8 @@ void OpenAiServer::install_routes() {
             return;
         }
 
-        const std::uint64_t id = loop_.submit(std::move(ids),
-                                              max_tokens);
+        const std::uint64_t id = loop_.submit(
+            std::move(ids), max_tokens, sampling, seed);
         const std::string rid = "msg_locus-" + std::to_string(id);
 
         if (!stream) {
