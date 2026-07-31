@@ -93,6 +93,30 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
                      .empty());
     }
 
+    SECTION("chat completions with tools is accepted") {
+        // The toy model won't emit a valid tool call, so this just
+        // confirms the tools plumbing (system injection + response
+        // branch) doesn't break a normal request.
+        json req{
+            {"messages",
+             json::array({{{"role", "user"},
+                           {"content", "Once upon a time"}}})},
+            {"max_tokens", 8},
+            {"tools",
+             json::array(
+                 {{{"type", "function"},
+                   {"function",
+                    {{"name", "get_weather"},
+                     {"description", "weather"},
+                     {"parameters", {{"type", "object"}}}}}}})}};
+        auto res = client.Post("/v1/chat/completions", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = json::parse(res->body);
+        REQUIRE(body["choices"][0].contains("message"));
+    }
+
     SECTION("anthropic messages, non-streaming") {
         json req{{"system", "You are a storyteller."},
                  {"messages",

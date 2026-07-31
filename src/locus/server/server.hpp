@@ -30,8 +30,16 @@ namespace locus::server {
  * the message_start / content_block_delta / message_stop SSE event
  * sequence -- so Claude Code (ANTHROPIC_BASE_URL) and the Anthropic
  * SDK can target locus directly. Chat prompts are built via the
- * configured chat template. Text-only: image and tool_use/
- * tool_result content blocks are ignored (no tool support yet).
+ * configured chat template.
+ *
+ * Tool-calling output: /v1/chat/completions and /v1/messages accept
+ * a `tools` list (OpenAI or Anthropic shape). It is rendered into a
+ * system instruction, and if the (non-streaming) completion parses
+ * as a tool call the response carries OpenAI `tool_calls` /
+ * finish_reason "tool_calls", or Anthropic `tool_use` /
+ * stop_reason "tool_use". locus only expresses the call -- it never
+ * runs the tool (execution is the client's job). See server/tools.
+ * Incoming image/tool_result content blocks are still ignored.
  */
 class OpenAiServer {
   public:

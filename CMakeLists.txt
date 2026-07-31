@@ -30,6 +30,7 @@ add_library(locus
     src/locus/model/moe_stats.cpp
     src/locus/server/engine_loop.cpp
     src/locus/server/server.cpp
+    src/locus/server/tools.cpp
     src/locus/sys/mmap_file.cpp
     src/locus/sys/thread_pool.cpp
     src/locus/tok/bpe_tokenizer.cpp

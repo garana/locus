@@ -5,6 +5,7 @@
 
 #include "httplib.h"
 #include "json.hpp"
+#include "locus/server/tools.hpp"
 
 namespace locus::server {
 
@@ -140,6 +141,7 @@ void OpenAiServer::install_routes() {
         std::string prompt;
         std::uint32_t max_tokens = 16;
         bool stream = false;
+        std::vector<ToolSpec> tools;
         try {
             body = json::parse(req.body);
             if (chat) {
@@ -149,8 +151,14 @@ void OpenAiServer::install_routes() {
                     throw std::invalid_argument(
                         "messages must be a non-empty array");
                 }
-                prompt = opt_.chat_template.apply(
-                    parse_messages(body["messages"]));
+                auto msgs = parse_messages(body["messages"]);
+                tools = parse_tools(body, /*anthropic=*/false);
+                if (!tools.empty()) {
+                    msgs.insert(msgs.begin(),
+                                {"system",
+                                 render_tools_system(tools)});
+                }
+                prompt = opt_.chat_template.apply(msgs);
             } else {
                 if (!body.contains("prompt") ||
                     !body["prompt"].is_string()) {
@@ -200,17 +208,32 @@ void OpenAiServer::install_routes() {
             const bool hit_eos =
                 !v.generated.empty() &&
                 v.generated.back() == tok_.eos_id();
-            json choice =
-                chat ? json{{"index", 0},
-                            {"message",
-                             {{"role", "assistant"},
-                              {"content", text}}},
-                            {"finish_reason",
-                             hit_eos ? "stop" : "length"}}
-                     : json{{"index", 0},
-                            {"text", text},
-                            {"finish_reason",
-                             hit_eos ? "stop" : "length"}};
+            json choice;
+            if (auto tc = detect_tool_call(text, tools)) {
+                json call{{"id", "call_" + std::to_string(id)},
+                          {"type", "function"},
+                          {"function",
+                           {{"name", tc->name},
+                            {"arguments", tc->arguments.dump()}}}};
+                choice = {{"index", 0},
+                          {"message",
+                           {{"role", "assistant"},
+                            {"content", nullptr},
+                            {"tool_calls", json::array({call})}}},
+                          {"finish_reason", "tool_calls"}};
+            } else if (chat) {
+                choice = {{"index", 0},
+                          {"message",
+                           {{"role", "assistant"},
+                            {"content", text}}},
+                          {"finish_reason",
+                           hit_eos ? "stop" : "length"}};
+            } else {
+                choice = {{"index", 0},
+                          {"text", text},
+                          {"finish_reason",
+                           hit_eos ? "stop" : "length"}};
+            }
             json out{{"id", rid},
                      {"object", object},
                      {"model", opt_.model_name},
@@ -278,6 +301,7 @@ void OpenAiServer::install_routes() {
         std::uint32_t input_tokens = 0;
         bool stream = false;
         std::vector<tok::TokenId> ids;
+        std::vector<ToolSpec> tools;
         try {
             const json body = json::parse(req.body);
             if (!body.contains("messages") ||
@@ -286,8 +310,13 @@ void OpenAiServer::install_routes() {
                 throw std::invalid_argument(
                     "messages must be a non-empty array");
             }
-            prompt = opt_.chat_template.apply(
-                parse_anthropic_messages(body));
+            auto msgs = parse_anthropic_messages(body);
+            tools = parse_tools(body, /*anthropic=*/true);
+            if (!tools.empty()) {
+                msgs.insert(msgs.begin(),
+                            {"system", render_tools_system(tools)});
+            }
+            prompt = opt_.chat_template.apply(msgs);
             if (body.contains("max_tokens")) {
                 const auto v = body["max_tokens"];
                 if (!v.is_number_unsigned() ||
@@ -336,14 +365,27 @@ void OpenAiServer::install_routes() {
             const bool hit_eos =
                 !v.generated.empty() &&
                 v.generated.back() == tok_.eos_id();
+            json content;
+            std::string stop_reason;
+            if (auto tc = detect_tool_call(text, tools)) {
+                content = json::array(
+                    {{{"type", "tool_use"},
+                      {"id", "toolu_locus-" + std::to_string(id)},
+                      {"name", tc->name},
+                      {"input", tc->arguments}}});
+                stop_reason = "tool_use";
+            } else {
+                content = json::array(
+                    {{{"type", "text"}, {"text", text}}});
+                stop_reason = hit_eos ? "end_turn" : "max_tokens";
+            }
             json out{
                 {"id", rid},
                 {"type", "message"},
                 {"role", "assistant"},
                 {"model", opt_.model_name},
-                {"content", json::array({{{"type", "text"},
-                                          {"text", text}}})},
-                {"stop_reason", hit_eos ? "end_turn" : "max_tokens"},
+                {"content", content},
+                {"stop_reason", stop_reason},
                 {"stop_sequence", nullptr},
                 {"usage",
                  {{"input_tokens", input_tokens},
