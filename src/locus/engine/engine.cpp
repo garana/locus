@@ -4,6 +4,8 @@
 #include <cassert>
 #include <random>
 
+#include "locus/model/speculative.hpp"
+
 namespace locus::engine {
 
 Engine::Engine(const model::LlamaModel& m, tok::TokenId eos,
@@ -51,7 +53,11 @@ bool Engine::step() {
     // batched forward (Vulkan drives its own full forward and opts
     // out); fall back to the per-token scheduler otherwise so
     // default-on batched_decode is safe on every backend.
-    if (cfg_.batched_decode && model_.supports_batch()) {
+    // Speculative decoding runs on the per-token scheduler (it does
+    // its own multi-token batched forward), so it takes priority over
+    // the batched-decode path.
+    if (cfg_.batched_decode && !cfg_.speculative &&
+        model_.supports_batch()) {
         return step_batched();
     }
     // Admission: FCFS while the pool can cover prompt + headroom.
@@ -109,6 +115,18 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
             r.seq.n_tokens == r.n_fed) {
             sample_from(r, logits_);
             return;  // one decode token per iteration
+        }
+
+        // Speculative decode: when a just-sampled token is pending
+        // (greedy, unconstrained), verify n-gram drafts in one
+        // batched forward instead of a single per-token forward.
+        if (cfg_.speculative && !prefilling && r.n_fed < n_total &&
+            r.n_fed >= n_prompt && r.sampling.temperature <= 0.0f &&
+            !r.constraint && model_.supports_batch() &&
+            r.seq.n_tokens == r.n_fed) {
+            if (spec_decode_step(r)) {
+                return;  // one spec step per iteration
+            }
         }
 
         if (prefilling && budget == 0) {
@@ -216,6 +234,101 @@ void Engine::try_adopt(Request& r) {
     cache_.retain_prefix(r.seq, blocks);
     r.n_fed = static_cast<std::uint32_t>(blocks.size()) * bt;
     prefix_reused_tokens_ += r.n_fed;
+}
+
+bool Engine::spec_decode_step(Request& r) {
+    const std::uint32_t n_prompt =
+        static_cast<std::uint32_t>(r.prompt.size());
+    const std::uint32_t base = r.n_fed;  // pending token's position
+    const std::uint32_t V = model_.hparams().n_vocab;
+    const std::uint32_t n_ctx = model_.hparams().n_ctx;
+
+    // Context = prompt + generated up to and including the pending
+    // token (generated[base - n_prompt]).
+    std::vector<tok::TokenId> ctx = r.prompt;
+    const std::size_t gen_upto = base - n_prompt + 1;
+    ctx.insert(ctx.end(), r.generated.begin(),
+               r.generated.begin() +
+                   static_cast<std::ptrdiff_t>(gen_upto));
+    const tok::TokenId pending = r.generated[base - n_prompt];
+
+    const auto drafts = model::ngram_draft(ctx, cfg_.spec_ngram,
+                                           cfg_.spec_draft);
+    std::vector<tok::TokenId> batch;
+    batch.push_back(pending);
+    batch.insert(batch.end(), drafts.begin(), drafts.end());
+
+    const std::uint32_t room = n_ctx > base ? n_ctx - base : 0;
+    if (room == 0) {
+        return false;
+    }
+    if (batch.size() > room) {
+        batch.resize(room);
+    }
+    const std::uint32_t kb =
+        static_cast<std::uint32_t>(batch.size());
+    if (!cache_.ensure_capacity(r.seq, kb)) {
+        return false;  // let the per-token path preempt
+    }
+
+    const std::size_t need = static_cast<std::size_t>(kb) * V;
+    if (batched_logits_.size() < need) {
+        batched_logits_.assign(need, 0.0f);
+    }
+    model_.forward_batch(batch, cache_, r.seq, ws_,
+                         {batched_logits_.data(), need},
+                         /*all_logits=*/true);
+    ++spec_steps_;
+
+    // Verify greedily: logits at position base+i-1 predict token
+    // base+i; the pending token (batch[0]) is already committed.
+    std::uint32_t acc = 0;
+    bool terminal = false;
+    for (std::uint32_t i = 1; i < kb; ++i) {
+        const tok::TokenId predicted = model::argmax(
+            {batched_logits_.data() +
+                 static_cast<std::size_t>(i - 1) * V,
+             V});
+        const bool accepted = predicted == batch[i];
+        const tok::TokenId t = accepted ? batch[i] : predicted;
+        r.generated.push_back(t);
+        if (on_token) {
+            on_token(r, t);
+        }
+        if (accepted) {
+            ++acc;
+            ++spec_accepted_;
+        }
+        if (t == eos_ || r.generated.size() >= r.max_new_tokens) {
+            terminal = true;
+            break;
+        }
+        if (!accepted) {
+            break;  // corrected -> discard the remaining drafts
+        }
+    }
+    if (!terminal && acc == kb - 1) {
+        // Every draft matched (or there were none): the bonus token.
+        const tok::TokenId bonus = model::argmax(
+            {batched_logits_.data() +
+                 static_cast<std::size_t>(kb - 1) * V,
+             V});
+        r.generated.push_back(bonus);
+        if (on_token) {
+            on_token(r, bonus);
+        }
+        terminal = bonus == eos_ ||
+                   r.generated.size() >= r.max_new_tokens;
+    }
+
+    // Commit pending + accepted drafts; roll back rejected KV.
+    const std::uint32_t committed = base + 1 + acc;
+    r.n_fed = committed;
+    r.seq.n_tokens = committed;
+    if (terminal) {
+        finish(r, Status::kDone);
+    }
+    return true;
 }
 
 void Engine::run_to_completion() {

@@ -23,6 +23,7 @@ add_executable(locus_tests
     test_prefix_cache.cpp
     test_grammar.cpp
     test_sampling.cpp
+    test_speculative.cpp
     test_server.cpp
     test_tools.cpp
     test_vulkan.cpp

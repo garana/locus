@@ -153,13 +153,17 @@ class LlamaModel {
      *
      * @param tokens In-vocab token ids; capacity for tokens.size()
      *     more positions must already be ensured on seq.
-     * @param logits Out; n_vocab floats for the LAST token.
+     * @param logits Out; n_vocab floats for the LAST token, or
+     *     n * n_vocab (one per position, in order) when all_logits.
+     * @param all_logits Emit every position's logits (speculative
+     *     verify) instead of only the last (prefill).
      * @throws std::invalid_argument on misuse or unsupported arch.
      */
     void forward_batch(std::span<const tok::TokenId> tokens,
                        kv::PagedKvCache& cache,
                        kv::PagedKvCache::Seq& seq, Workspace& ws,
-                       std::span<float> logits) const;
+                       std::span<float> logits,
+                       bool all_logits = false) const;
 
     /** @returns true when the batched forwards support this model
      * (every CPU/CUDA backend + arch; Vulkan opts out). */

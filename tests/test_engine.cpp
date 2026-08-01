@@ -219,6 +219,40 @@ TEST_CASE("prefix cache reuses KV and stays byte-exact",
     REQUIRE(engine.free_blocks() < engine.total_blocks());  // pinned
 }
 
+TEST_CASE("speculative decoding matches greedy output",
+          "[engine][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    // A repetitive prompt makes the greedy continuation echo earlier
+    // n-grams, so prompt-lookup drafts get accepted (exercises the
+    // accept path, not just the correction path). ngram=2 widens
+    // matches on the toy vocab.
+    auto prompt = tok.encode(
+        "the cat sat on the mat the cat sat on the mat the cat sat "
+        "on the mat the cat sat on the",
+        true);
+
+    Engine baseline(model, tok.eos_id(), Engine::Config{});
+    const auto id = baseline.submit(prompt, 48);
+    baseline.run_to_completion();
+    const auto want = baseline.get(id)->generated;
+
+    Engine::Config cfg;
+    cfg.speculative = true;
+    cfg.spec_ngram = 2;
+    Engine engine(model, tok.eos_id(), cfg);
+    const auto a = engine.submit(prompt, 48);
+    engine.run_to_completion();
+    // Greedy spec decode is byte-exact to plain greedy.
+    REQUIRE(engine.get(a)->generated == want);
+    REQUIRE(engine.spec_steps() > 0);            // verify ran
+    REQUIRE(engine.spec_accepted_tokens() > 0);  // and accepted
+}
+
 TEST_CASE("engine on the vulkan backend matches CPU output",
           "[engine][e2e][vulkan]") {
     if (!std::filesystem::exists(model_path())) {

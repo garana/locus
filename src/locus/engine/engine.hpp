@@ -88,6 +88,15 @@ class Engine {
         bool prefix_cache = false;
         /** Max cached prompt prefixes (LRU) when prefix_cache is on. */
         std::uint32_t prefix_cache_slots = 32;
+        /** Prompt-lookup speculative decoding: draft n-gram tokens
+         * from the context and verify them in one batched forward
+         * (greedy only). Byte-exact; off by default; uses the
+         * per-token scheduler (implies non-batched decode). */
+        bool speculative = false;
+        /** Trailing n-gram length matched for drafts. */
+        std::uint32_t spec_ngram = 3;
+        /** Max draft tokens proposed per step. */
+        std::uint32_t spec_draft = 4;
     };
 
     /**
@@ -147,6 +156,13 @@ class Engine {
         return prefix_reused_tokens_;
     }
 
+    /** Draft tokens accepted by speculative verify, cumulative. */
+    std::uint64_t spec_accepted_tokens() const {
+        return spec_accepted_;
+    }
+    /** Speculative verify forwards run, cumulative. */
+    std::uint64_t spec_steps() const { return spec_steps_; }
+
   private:
     /** Feeds up to `budget` tokens of r; samples when caught up. */
     void advance(Request& r, std::uint32_t& budget);
@@ -170,6 +186,11 @@ class Engine {
     /** Adopts the longest cached prompt prefix into a fresh request
      * (prefix_cache on), advancing n_fed past the shared blocks. */
     void try_adopt(Request& r);
+    /** One prompt-lookup speculative-decode step: verifies drafts in
+     * a single batched forward, appending the accepted prefix plus a
+     * correction/bonus. @returns false if it could not run (capacity
+     * / overflow) so the caller uses the per-token path. */
+    bool spec_decode_step(Request& r);
 
     const model::LlamaModel& model_;
     tok::TokenId eos_;
@@ -186,6 +207,8 @@ class Engine {
 
     std::unique_ptr<PrefixCache> prefix_cache_;
     std::uint64_t prefix_reused_tokens_ = 0;
+    std::uint64_t spec_accepted_ = 0;
+    std::uint64_t spec_steps_ = 0;
 };
 
 }  // namespace locus::engine

@@ -469,7 +469,8 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
                                kv::PagedKvCache& cache,
                                kv::PagedKvCache::Seq& seq,
                                Workspace& ws,
-                               std::span<float> logits) const {
+                               std::span<float> logits,
+                               bool all_logits) const {
     using namespace locus::backend;
     const auto n = static_cast<std::uint32_t>(toks.size());
     if (n == 0) {
@@ -559,10 +560,22 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
         }
     }
 
-    // Only the last token needs logits (prefill semantics).
-    const std::size_t last = static_cast<std::size_t>(n - 1) * E;
-    rmsnorm({x.data() + last, E}, out_norm_, hp_.rms_eps, ws.xb);
-    matvec_mt(op, out_w_, ws.xb, logits);
+    // Prefill needs only the last token's logits; speculative verify
+    // needs every position's (logits is then n * n_vocab).
+    if (all_logits) {
+        const std::uint32_t V = hp_.n_vocab;
+        for (std::uint32_t t = 0; t < n; ++t) {
+            rmsnorm({x.data() + static_cast<std::size_t>(t) * E, E},
+                    out_norm_, hp_.rms_eps, ws.xb);
+            matvec_mt(op, out_w_, ws.xb,
+                      logits.subspan(static_cast<std::size_t>(t) * V,
+                                     V));
+        }
+    } else {
+        const std::size_t last = static_cast<std::size_t>(n - 1) * E;
+        rmsnorm({x.data() + last, E}, out_norm_, hp_.rms_eps, ws.xb);
+        matvec_mt(op, out_w_, ws.xb, logits);
+    }
     seq.n_tokens = base + n;
 }
 
