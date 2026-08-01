@@ -74,6 +74,17 @@ EngineLoop::View EngineLoop::wait_progress(std::uint64_t id,
     return snapshot_locked(id);
 }
 
+EngineLoop::Stats EngineLoop::stats() {
+    std::lock_guard<std::mutex> lk(mu_);
+    Stats s;
+    s.free_blocks = engine_.free_blocks();
+    s.total_blocks = engine_.total_blocks();
+    s.prefix_reused_tokens = engine_.prefix_reused_tokens();
+    s.spec_accepted_tokens = engine_.spec_accepted_tokens();
+    s.spec_steps = engine_.spec_steps();
+    return s;
+}
+
 EngineLoop::View EngineLoop::wait_done(std::uint64_t id) {
     std::unique_lock<std::mutex> lk(mu_);
     progress_cv_.wait(lk, [&] {

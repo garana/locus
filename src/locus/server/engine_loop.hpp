@@ -52,6 +52,16 @@ class EngineLoop {
     /** Blocks until the request is kDone or kFailed. */
     View wait_done(std::uint64_t id);
 
+    /** Engine gauges for /metrics (snapshotted under the mutex). */
+    struct Stats {
+        std::uint32_t free_blocks = 0;
+        std::uint32_t total_blocks = 0;
+        std::uint64_t prefix_reused_tokens = 0;
+        std::uint64_t spec_accepted_tokens = 0;
+        std::uint64_t spec_steps = 0;
+    };
+    Stats stats();
+
   private:
     void run();
     View snapshot_locked(std::uint64_t id) const;

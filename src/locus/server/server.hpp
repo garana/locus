@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -92,6 +93,12 @@ class OpenAiServer {
     EngineLoop loop_;
     std::unique_ptr<httplib::Server> http_;
     std::uint32_t n_vocab_ = 0;
+
+    // Cumulative counters exposed at GET /metrics (Prometheus text).
+    std::atomic<std::uint64_t> requests_total_{0};
+    std::atomic<std::uint64_t> prompt_tokens_total_{0};
+    std::atomic<std::uint64_t> completion_tokens_total_{0};
+
     std::once_flag pieces_once_;
     std::shared_ptr<const std::vector<std::string>> pieces_;
 

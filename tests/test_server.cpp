@@ -61,6 +61,47 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(json::parse(res->body)["status"] == "ok");
     }
 
+    SECTION("model listing") {
+        auto res = client.Get("/v1/models");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = json::parse(res->body);
+        REQUIRE(body["object"] == "list");
+        REQUIRE(body["data"].size() == 1);
+        const std::string id = body["data"][0]["id"];
+        REQUIRE(body["data"][0]["object"] == "model");
+
+        auto one = client.Get("/v1/models/" + id);
+        REQUIRE(one);
+        REQUIRE(one->status == 200);
+        REQUIRE(json::parse(one->body)["id"] == id);
+
+        auto miss = client.Get("/v1/models/nope");
+        REQUIRE(miss);
+        REQUIRE(miss->status == 404);
+    }
+
+    SECTION("metrics count requests and tokens") {
+        json req{{"prompt", "Once upon a time"}, {"max_tokens", 4}};
+        auto gen = client.Post("/v1/completions", req.dump(),
+                               "application/json");
+        REQUIRE(gen);
+        REQUIRE(gen->status == 200);
+
+        auto res = client.Get("/metrics");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const std::string& b = res->body;
+        REQUIRE(b.find("locus_requests_total") != std::string::npos);
+        REQUIRE(b.find("locus_completion_tokens_total") !=
+                std::string::npos);
+        REQUIRE(b.find("locus_kv_blocks_total") !=
+                std::string::npos);
+        // At least the request we just issued is counted.
+        REQUIRE(b.find("locus_requests_total 0\n") ==
+                std::string::npos);
+    }
+
     SECTION("completions, non-streaming") {
         json req{{"prompt", "Once upon a time"},
                  {"max_tokens", 16}};
@@ -74,6 +115,9 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         const std::string text = body["choices"][0]["text"];
         REQUIRE(text.find("little girl") != std::string::npos);
         REQUIRE(body["choices"][0]["finish_reason"] == "length");
+        REQUIRE(body["usage"]["completion_tokens"] == 16);
+        REQUIRE(body["usage"]["total_tokens"] ==
+                body["usage"]["prompt_tokens"].get<int>() + 16);
     }
 
     SECTION("chat completions, non-streaming") {

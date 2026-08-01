@@ -259,6 +259,99 @@ void OpenAiServer::install_routes() {
                                    "application/json");
                });
 
+    // OpenAI model listing: locus serves exactly one model.
+    http_->Get(
+        "/v1/models",
+        [this](const httplib::Request&, httplib::Response& res) {
+            json entry{{"id", opt_.model_name},
+                       {"object", "model"},
+                       {"created", 0},
+                       {"owned_by", "locus"}};
+            res.set_content(
+                json{{"object", "list"},
+                     {"data", json::array({entry})}}
+                    .dump(),
+                "application/json");
+        });
+    // Retrieve a single model by id (OpenAI GET /v1/models/{id}).
+    http_->Get(
+        R"(/v1/models/(.+))",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            if (req.matches[1] != opt_.model_name) {
+                res.status = 404;
+                res.set_content(
+                    make_error("model not found").dump(),
+                    "application/json");
+                return;
+            }
+            res.set_content(json{{"id", opt_.model_name},
+                                 {"object", "model"},
+                                 {"created", 0},
+                                 {"owned_by", "locus"}}
+                                .dump(),
+                            "application/json");
+        });
+
+    // Prometheus text-format metrics: request/token counters plus
+    // engine gauges (KV pool, prefix reuse, speculative accepts).
+    http_->Get(
+        "/metrics",
+        [this](const httplib::Request&, httplib::Response& res) {
+            const auto s = loop_.stats();
+            std::string b;
+            auto counter = [&](const char* name, const char* help,
+                               std::uint64_t v) {
+                b += "# HELP ";
+                b += name;
+                b += ' ';
+                b += help;
+                b += "\n# TYPE ";
+                b += name;
+                b += " counter\n";
+                b += name;
+                b += ' ';
+                b += std::to_string(v);
+                b += '\n';
+            };
+            auto gauge = [&](const char* name, const char* help,
+                             std::uint64_t v) {
+                b += "# HELP ";
+                b += name;
+                b += ' ';
+                b += help;
+                b += "\n# TYPE ";
+                b += name;
+                b += " gauge\n";
+                b += name;
+                b += ' ';
+                b += std::to_string(v);
+                b += '\n';
+            };
+            counter("locus_requests_total",
+                    "Completion requests accepted.",
+                    requests_total_.load());
+            counter("locus_prompt_tokens_total",
+                    "Prompt tokens submitted.",
+                    prompt_tokens_total_.load());
+            counter("locus_completion_tokens_total",
+                    "Tokens generated.",
+                    completion_tokens_total_.load());
+            counter("locus_prefix_reused_tokens_total",
+                    "Prompt tokens served from the prefix cache.",
+                    s.prefix_reused_tokens);
+            counter("locus_spec_accepted_tokens_total",
+                    "Speculative draft tokens accepted.",
+                    s.spec_accepted_tokens);
+            counter("locus_spec_steps_total",
+                    "Speculative verify forwards run.",
+                    s.spec_steps);
+            gauge("locus_kv_blocks_total", "KV cache pool size.",
+                  s.total_blocks);
+            gauge("locus_kv_blocks_free", "Free KV cache blocks.",
+                  s.free_blocks);
+            res.set_content(b, "text/plain; version=0.0.4");
+        });
+
     // Both endpoints share one implementation; `chat` only changes
     // how the prompt is built and how the response is shaped.
     auto handle = [this](const httplib::Request& req,
@@ -319,8 +412,14 @@ void OpenAiServer::install_routes() {
             constraint = std::make_unique<JsonTokenConstraint>(
                 json_pieces());
         }
+        auto prompt_ids = tok_.encode(prompt, true);
+        const std::uint32_t n_prompt =
+            static_cast<std::uint32_t>(prompt_ids.size());
+        requests_total_.fetch_add(1, std::memory_order_relaxed);
+        prompt_tokens_total_.fetch_add(n_prompt,
+                                       std::memory_order_relaxed);
         const std::uint64_t id = loop_.submit(
-            tok_.encode(prompt, true), max_tokens, sampling, seed,
+            std::move(prompt_ids), max_tokens, sampling, seed,
             std::move(constraint));
         const std::string object =
             chat ? "chat.completion" : "text_completion";
@@ -367,10 +466,18 @@ void OpenAiServer::install_routes() {
                           {"finish_reason",
                            hit_eos ? "stop" : "length"}};
             }
+            const auto n_completion =
+                static_cast<std::uint32_t>(v.generated.size());
+            completion_tokens_total_.fetch_add(
+                n_completion, std::memory_order_relaxed);
             json out{{"id", rid},
                      {"object", object},
                      {"model", opt_.model_name},
-                     {"choices", json::array({choice})}};
+                     {"choices", json::array({choice})},
+                     {"usage",
+                      {{"prompt_tokens", n_prompt},
+                       {"completion_tokens", n_completion},
+                       {"total_tokens", n_prompt + n_completion}}}};
             res.set_content(out.dump(), "application/json");
             return;
         }
@@ -409,6 +516,9 @@ void OpenAiServer::install_routes() {
                     v.status == engine::Status::kDone ||
                     v.status == engine::Status::kFailed;
                 if (terminal) {
+                    completion_tokens_total_.fetch_add(
+                        v.generated.size(),
+                        std::memory_order_relaxed);
                     payload += "data: [DONE]\n\n";
                 }
                 if (!payload.empty() &&
@@ -485,6 +595,9 @@ void OpenAiServer::install_routes() {
             return;
         }
 
+        requests_total_.fetch_add(1, std::memory_order_relaxed);
+        prompt_tokens_total_.fetch_add(input_tokens,
+                                       std::memory_order_relaxed);
         const std::uint64_t id =
             loop_.submit(std::move(ids), max_tokens, sampling, seed,
                          std::move(constraint));
@@ -534,6 +647,8 @@ void OpenAiServer::install_routes() {
                   {"output_tokens",
                    static_cast<std::uint32_t>(
                        v.generated.size())}}}};
+            completion_tokens_total_.fetch_add(
+                v.generated.size(), std::memory_order_relaxed);
             res.set_content(out.dump(), "application/json");
             return;
         }
@@ -627,6 +742,8 @@ void OpenAiServer::install_routes() {
                                json{{"type", "message_stop"}}
                                    .dump() +
                                "\n\n";
+                    completion_tokens_total_.fetch_add(
+                        st->emitted, std::memory_order_relaxed);
                 }
                 if (!payload.empty() &&
                     !sink.write(payload.data(), payload.size())) {
