@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "locus/engine/prefix_cache.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/llama.hpp"
 #include "locus/model/sampling.hpp"
@@ -82,6 +83,11 @@ class Engine {
          * regime on both NEON (Pi) and x86/sse4 (vx). Off keeps the
          * per-sequence step(). */
         bool batched_decode = true;
+        /** Reuse KV across requests that share a prompt prefix
+         * (R12: prefix caching). Byte-exact; off by default. */
+        bool prefix_cache = false;
+        /** Max cached prompt prefixes (LRU) when prefix_cache is on. */
+        std::uint32_t prefix_cache_slots = 32;
     };
 
     /**
@@ -135,6 +141,12 @@ class Engine {
         return cache_.total_blocks();
     }
 
+    /** Prompt positions served from the prefix cache (skipped
+     * prefill), cumulative. 0 when prefix_cache is off. */
+    std::uint64_t prefix_reused_tokens() const {
+        return prefix_reused_tokens_;
+    }
+
   private:
     /** Feeds up to `budget` tokens of r; samples when caught up. */
     void advance(Request& r, std::uint32_t& budget);
@@ -155,6 +167,9 @@ class Engine {
     void finish(Request& r, Status s, std::string error = "");
     /** @returns Blocks needed to hold n tokens. */
     std::uint32_t blocks_for(std::uint32_t n_tokens) const;
+    /** Adopts the longest cached prompt prefix into a fresh request
+     * (prefix_cache on), advancing n_fed past the shared blocks. */
+    void try_adopt(Request& r);
 
     const model::LlamaModel& model_;
     tok::TokenId eos_;
@@ -168,6 +183,9 @@ class Engine {
     std::vector<std::unique_ptr<Request>> requests_;
     std::deque<std::uint64_t> waiting_;
     std::vector<std::uint64_t> running_;
+
+    std::unique_ptr<PrefixCache> prefix_cache_;
+    std::uint64_t prefix_reused_tokens_ = 0;
 };
 
 }  // namespace locus::engine

@@ -81,6 +81,23 @@ class PagedKvCache {
      */
     bool fork(const Seq& parent, Seq& child);
 
+    /**
+     * Adopts `blocks` (full, shared prefix blocks from a prefix
+     * cache) into the empty `child` by ref-count, setting its
+     * committed length to cover them. Shared blocks are full and
+     * never written, so the child appends only in private blocks.
+     *
+     * @param child Must be empty.
+     */
+    void retain_prefix(Seq& child,
+                       const std::vector<BlockId>& blocks);
+
+    /** Increments a live block's ref count (prefix-cache pin). */
+    void retain_block(BlockId id) { alloc_.retain(id); }
+
+    /** Decrements a block's ref count; @returns true if freed. */
+    bool release_block(BlockId id) { return alloc_.release(id); }
+
     /** Writable K row for a position < capacity of seq. */
     float* k(const Seq& seq, std::uint32_t layer, std::uint32_t pos);
 

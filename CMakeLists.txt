@@ -21,6 +21,7 @@ add_library(locus
     src/locus/backend/vulkan/context.cpp
     src/locus/chat/template.cpp
     src/locus/engine/engine.cpp
+    src/locus/engine/prefix_cache.cpp
     src/locus/gguf/gguf.cpp
     src/locus/kv/block_allocator.cpp
     src/locus/kv/paged_cache.cpp

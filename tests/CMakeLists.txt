@@ -20,6 +20,7 @@ add_executable(locus_tests
     test_engine.cpp
     test_gguf.cpp
     test_paged_cache.cpp
+    test_prefix_cache.cpp
     test_grammar.cpp
     test_sampling.cpp
     test_server.cpp

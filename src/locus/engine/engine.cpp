@@ -13,7 +13,12 @@ Engine::Engine(const model::LlamaModel& m, tok::TokenId eos,
       cfg_(cfg),
       cache_(m.make_cache(cfg.n_blocks)),
       ws_(m.make_workspace()),
-      logits_(m.hparams().n_vocab) {}
+      logits_(m.hparams().n_vocab) {
+    if (cfg_.prefix_cache) {
+        prefix_cache_ = std::make_unique<PrefixCache>(
+            cache_, cfg_.prefix_cache_slots);
+    }
+}
 
 Engine::Engine(const model::LlamaModel& m, tok::TokenId eos)
     : Engine(m, eos, Config{}) {}
@@ -60,11 +65,17 @@ bool Engine::step() {
             static_cast<std::uint32_t>(r.generated.size()) +
             cfg_.decode_headroom);
         if (want > cache_.free_blocks()) {
-            break;  // FCFS: do not admit later arrivals first
+            if (prefix_cache_) {
+                prefix_cache_->evict_until_free(want);
+            }
+            if (want > cache_.free_blocks()) {
+                break;  // FCFS: do not admit later arrivals first
+            }
         }
         r.status = Status::kRunning;
         running_.push_back(r.id);
         waiting_.pop_front();
+        try_adopt(r);
     }
 
     // One iteration: each running sequence advances; prefill is
@@ -170,10 +181,41 @@ void Engine::preempt(std::uint64_t victim_id) {
 }
 
 void Engine::finish(Request& r, Status s, std::string error) {
+    // Register the prompt's full-block prefix before releasing, so a
+    // later request sharing it can adopt the (still-pinned) KV.
+    if (prefix_cache_ && s == Status::kDone && !r.prompt.empty()) {
+        prefix_cache_->insert(r.prompt, r.seq.blocks);
+    }
     cache_.release(r.seq);
     r.status = s;
     r.error = std::move(error);
     r.n_fed = 0;
+}
+
+void Engine::try_adopt(Request& r) {
+    if (!prefix_cache_ || r.n_fed != 0 || !r.generated.empty() ||
+        !r.seq.blocks.empty()) {
+        return;
+    }
+    const std::uint32_t n_prompt =
+        static_cast<std::uint32_t>(r.prompt.size());
+    if (n_prompt < 2) {
+        return;
+    }
+    std::vector<kv::BlockId> blocks = prefix_cache_->match(r.prompt);
+    const std::uint32_t bt = cache_.geometry().block_tokens;
+    // Leave at least one prompt token to reprefill so the sampler
+    // has logits for the last position.
+    const std::uint32_t max_blocks = (n_prompt - 1) / bt;
+    if (blocks.size() > max_blocks) {
+        blocks.resize(max_blocks);
+    }
+    if (blocks.empty()) {
+        return;
+    }
+    cache_.retain_prefix(r.seq, blocks);
+    r.n_fed = static_cast<std::uint32_t>(blocks.size()) * bt;
+    prefix_reused_tokens_ += r.n_fed;
 }
 
 void Engine::run_to_completion() {
@@ -262,11 +304,17 @@ bool Engine::step_batched() {
             static_cast<std::uint32_t>(r.generated.size()) +
             cfg_.decode_headroom);
         if (want > cache_.free_blocks()) {
-            break;
+            if (prefix_cache_) {
+                prefix_cache_->evict_until_free(want);
+            }
+            if (want > cache_.free_blocks()) {
+                break;
+            }
         }
         r.status = Status::kRunning;
         running_.push_back(r.id);
         waiting_.pop_front();
+        try_adopt(r);
     }
 
     // Phase 1: prefill each running request still on its prompt.

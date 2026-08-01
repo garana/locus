@@ -181,6 +181,44 @@ TEST_CASE("preemption recomputes and still matches",
     REQUIRE(engine.free_blocks() == engine.total_blocks());
 }
 
+TEST_CASE("prefix cache reuses KV and stays byte-exact",
+          "[engine][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    // A prompt longer than one block (16 tokens) so a full block is
+    // cacheable.
+    auto prompt = tok.encode(
+        "Once upon a time, there was a little girl named Lily who "
+        "loved to explore the forest near her home every day.",
+        true);
+    REQUIRE(prompt.size() > 16);
+
+    Engine baseline(model, tok.eos_id(), Engine::Config{});
+    const auto id = baseline.submit(prompt, 20);
+    baseline.run_to_completion();
+    const auto want = baseline.get(id)->generated;
+
+    Engine::Config cfg;
+    cfg.prefix_cache = true;
+    Engine engine(model, tok.eos_id(), cfg);
+    // First run: cache is empty, nothing reused, output matches.
+    const auto a = engine.submit(prompt, 20);
+    engine.run_to_completion();
+    REQUIRE(engine.get(a)->generated == want);
+    REQUIRE(engine.prefix_reused_tokens() == 0);
+    // Second run of the same prompt: adopts the cached prefix (>= 1
+    // block) and produces byte-identical output.
+    const auto b = engine.submit(prompt, 20);
+    engine.run_to_completion();
+    REQUIRE(engine.get(b)->generated == want);
+    REQUIRE(engine.prefix_reused_tokens() >= 16);
+    REQUIRE(engine.free_blocks() < engine.total_blocks());  // pinned
+}
+
 TEST_CASE("engine on the vulkan backend matches CPU output",
           "[engine][e2e][vulkan]") {
     if (!std::filesystem::exists(model_path())) {

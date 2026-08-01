@@ -53,6 +53,17 @@ void PagedKvCache::release(Seq& seq) {
     seq.n_tokens = 0;
 }
 
+void PagedKvCache::retain_prefix(
+    Seq& child, const std::vector<BlockId>& blocks) {
+    assert(child.blocks.empty());
+    for (BlockId id : blocks) {
+        alloc_.retain(id);
+        child.blocks.push_back(id);
+    }
+    child.n_tokens = static_cast<std::uint32_t>(blocks.size()) *
+                     geom_.block_tokens;
+}
+
 bool PagedKvCache::fork(const Seq& parent, Seq& child) {
     assert(child.blocks.empty());
     const std::uint32_t tail = parent.n_tokens % geom_.block_tokens;
