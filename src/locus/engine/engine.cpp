@@ -28,13 +28,15 @@ Engine::Engine(const model::LlamaModel& m, tok::TokenId eos)
 std::uint64_t Engine::submit(
     std::vector<tok::TokenId> prompt, std::uint32_t max_new_tokens,
     model::SamplingParams sampling, std::uint64_t seed,
-    std::unique_ptr<model::TokenConstraint> constraint) {
+    std::unique_ptr<model::TokenConstraint> constraint,
+    LogprobsOpt logprobs) {
     auto r = std::make_unique<Request>();
     r->id = requests_.size();
     r->prompt = std::move(prompt);
     r->max_new_tokens = max_new_tokens;
     r->sampling = sampling;
     r->constraint = std::move(constraint);
+    r->logprobs_opt = logprobs;
     r->rng.seed(seed != 0 ? seed
                           : std::random_device{}() ^
                                 (r->id * 0x9e3779b97f4a7c15ULL));
@@ -341,12 +343,25 @@ const Request* Engine::get(std::uint64_t id) const {
 }
 
 void Engine::sample_from(Request& r, std::span<float> logits) {
+    // sample() mutates logits (penalties/temperature); snapshot the
+    // raw logits first so logprobs reflect the natural distribution.
+    std::vector<float> raw;
+    if (r.logprobs_opt.enabled) {
+        raw.assign(logits.begin(), logits.end());
+    }
     const auto next = model::sample(logits, r.sampling, r.generated,
                                     r.rng, r.constraint.get());
     if (r.constraint) {
         r.constraint->commit(next);
     }
     r.generated.push_back(next);
+    if (r.logprobs_opt.enabled) {
+        LogprobEntry e;
+        e.token = next;
+        model::logprobs_from(raw, next, r.logprobs_opt.top,
+                             e.logprob, e.top);
+        r.logprobs.push_back(std::move(e));
+    }
     if (on_token) {
         on_token(r, next);
     }

@@ -147,4 +147,46 @@ tok::TokenId sample(std::span<float> logits, const SamplingParams& p,
     return cand[keep - 1].second;
 }
 
+void logprobs_from(std::span<const float> logits,
+                   tok::TokenId chosen, std::uint32_t n_top,
+                   float& chosen_lp,
+                   std::vector<TokenLogprob>& top) {
+    const std::size_t V = logits.size();
+    float max_logit = logits[0];
+    for (float l : logits) {
+        max_logit = std::max(max_logit, l);
+    }
+    double sum = 0.0;
+    for (float l : logits) {
+        sum += std::exp(static_cast<double>(l) - max_logit);
+    }
+    const double log_z = std::log(sum) + max_logit;
+    auto lp = [&](std::size_t i) {
+        return static_cast<float>(logits[i] - log_z);
+    };
+    chosen_lp =
+        (chosen >= 0 && static_cast<std::size_t>(chosen) < V)
+            ? lp(static_cast<std::size_t>(chosen))
+            : 0.0f;
+
+    top.clear();
+    const std::size_t k = std::min<std::size_t>(n_top, V);
+    if (k == 0) {
+        return;
+    }
+    std::vector<std::size_t> idx(V);
+    for (std::size_t i = 0; i < V; ++i) {
+        idx[i] = i;
+    }
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                      [&](std::size_t a, std::size_t b) {
+                          return logits[a] > logits[b];
+                      });
+    top.reserve(k);
+    for (std::size_t i = 0; i < k; ++i) {
+        top.push_back(
+            {static_cast<tok::TokenId>(idx[i]), lp(idx[i])});
+    }
+}
+
 }  // namespace locus::model

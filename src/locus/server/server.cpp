@@ -412,6 +412,19 @@ void OpenAiServer::install_routes() {
             constraint = std::make_unique<JsonTokenConstraint>(
                 json_pieces());
         }
+        // logprobs: /v1/completions takes an integer count; /v1/chat/
+        // completions takes a bool `logprobs` + integer `top_logprobs`.
+        engine::LogprobsOpt lp;
+        if (chat) {
+            if (body.value("logprobs", false)) {
+                lp.enabled = true;
+                lp.top = body.value("top_logprobs", 0);
+            }
+        } else if (body.contains("logprobs") &&
+                   body["logprobs"].is_number_unsigned()) {
+            lp.enabled = true;
+            lp.top = body["logprobs"].get<std::uint32_t>();
+        }
         auto prompt_ids = tok_.encode(prompt, true);
         const std::uint32_t n_prompt =
             static_cast<std::uint32_t>(prompt_ids.size());
@@ -420,7 +433,7 @@ void OpenAiServer::install_routes() {
                                        std::memory_order_relaxed);
         const std::uint64_t id = loop_.submit(
             std::move(prompt_ids), max_tokens, sampling, seed,
-            std::move(constraint));
+            std::move(constraint), lp);
         const std::string object =
             chat ? "chat.completion" : "text_completion";
         const std::string sse_object =
@@ -465,6 +478,47 @@ void OpenAiServer::install_routes() {
                           {"text", text},
                           {"finish_reason",
                            hit_eos ? "stop" : "length"}};
+            }
+            if (lp.enabled &&
+                choice.value("finish_reason", "") != "tool_calls") {
+                auto piece = [this](tok::TokenId t) {
+                    return tok_.decode({&t, 1});
+                };
+                if (chat) {
+                    // Chat shape: logprobs.content[] with per-token
+                    // {token, logprob, top_logprobs[]}.
+                    json content = json::array();
+                    for (const auto& e : v.logprobs) {
+                        json tops = json::array();
+                        for (const auto& a : e.top) {
+                            tops.push_back(
+                                {{"token", piece(a.token)},
+                                 {"logprob", a.logprob}});
+                        }
+                        content.push_back(
+                            {{"token", piece(e.token)},
+                             {"logprob", e.logprob},
+                             {"top_logprobs", tops}});
+                    }
+                    choice["logprobs"] = {{"content", content}};
+                } else {
+                    // Completions shape: parallel arrays.
+                    json toks = json::array();
+                    json tlp = json::array();
+                    json tops = json::array();
+                    for (const auto& e : v.logprobs) {
+                        toks.push_back(piece(e.token));
+                        tlp.push_back(e.logprob);
+                        json m = json::object();
+                        for (const auto& a : e.top) {
+                            m[piece(a.token)] = a.logprob;
+                        }
+                        tops.push_back(m);
+                    }
+                    choice["logprobs"] = {{"tokens", toks},
+                                          {"token_logprobs", tlp},
+                                          {"top_logprobs", tops}};
+                }
             }
             const auto n_completion =
                 static_cast<std::uint32_t>(v.generated.size());

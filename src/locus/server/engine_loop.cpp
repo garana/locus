@@ -19,12 +19,14 @@ EngineLoop::~EngineLoop() {
 std::uint64_t EngineLoop::submit(
     std::vector<tok::TokenId> prompt, std::uint32_t max_new_tokens,
     model::SamplingParams sampling, std::uint64_t seed,
-    std::unique_ptr<model::TokenConstraint> constraint) {
+    std::unique_ptr<model::TokenConstraint> constraint,
+    engine::LogprobsOpt logprobs) {
     std::uint64_t id;
     {
         std::lock_guard<std::mutex> lk(mu_);
         id = engine_.submit(std::move(prompt), max_new_tokens,
-                            sampling, seed, std::move(constraint));
+                            sampling, seed, std::move(constraint),
+                            logprobs);
     }
     work_cv_.notify_all();
     return id;
@@ -50,6 +52,7 @@ EngineLoop::View EngineLoop::snapshot_locked(
         v.status = r->status;
         v.generated = r->generated;
         v.error = r->error;
+        v.logprobs = r->logprobs;
     } else {
         v.status = engine::Status::kFailed;
         v.error = "unknown request id";

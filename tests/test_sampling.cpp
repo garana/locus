@@ -1,3 +1,4 @@
+#include <cmath>
 #include <random>
 #include <set>
 #include <vector>
@@ -97,4 +98,41 @@ TEST_CASE("a dominant logit is always chosen under temperature",
         std::vector<float> l{0.0f, 40.0f, 0.0f};  // token 1 wins
         REQUIRE(sample(l, p, none, rng) == 1);
     }
+}
+
+TEST_CASE("logprobs_from reports a normalized distribution",
+          "[sampling]") {
+    // Three logits; check log-softmax values and top ordering.
+    std::vector<float> l{1.0f, 2.0f, 3.0f};
+    float chosen_lp = 0.0f;
+    std::vector<locus::model::TokenLogprob> top;
+    locus::model::logprobs_from(l, /*chosen=*/2, /*n_top=*/3,
+                                chosen_lp, top);
+
+    // Sum of probabilities over the vocab must be ~1.
+    double psum = 0.0;
+    for (const auto& t : top) {
+        psum += std::exp(static_cast<double>(t.logprob));
+    }
+    REQUIRE(psum == Catch::Approx(1.0).margin(1e-5));
+
+    // Highest logit (token 2) is first and matches chosen_lp.
+    REQUIRE(top.size() == 3);
+    REQUIRE(top[0].token == 2);
+    REQUIRE(top[1].token == 1);
+    REQUIRE(top[2].token == 0);
+    REQUIRE(top[0].logprob == Catch::Approx(chosen_lp));
+    // All log-probabilities are <= 0.
+    for (const auto& t : top) {
+        REQUIRE(t.logprob <= 0.0f);
+    }
+
+    // n_top clamps and chosen logprob is independent of n_top.
+    std::vector<locus::model::TokenLogprob> one;
+    float lp2 = 0.0f;
+    locus::model::logprobs_from(l, /*chosen=*/0, /*n_top=*/1, lp2,
+                                one);
+    REQUIRE(one.size() == 1);
+    REQUIRE(one[0].token == 2);
+    REQUIRE(lp2 < chosen_lp);  // token 0 less likely than token 2
 }

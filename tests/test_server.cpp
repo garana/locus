@@ -118,6 +118,46 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(body["usage"]["completion_tokens"] == 16);
         REQUIRE(body["usage"]["total_tokens"] ==
                 body["usage"]["prompt_tokens"].get<int>() + 16);
+        // No logprobs unless requested.
+        REQUIRE(!body["choices"][0].contains("logprobs"));
+    }
+
+    SECTION("completions logprobs") {
+        json req{{"prompt", "Once upon a time"},
+                 {"max_tokens", 5},
+                 {"logprobs", 3}};
+        auto res = client.Post("/v1/completions", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto lp = json::parse(res->body)["choices"][0]["logprobs"];
+        REQUIRE(lp["tokens"].size() == 5);
+        REQUIRE(lp["token_logprobs"].size() == 5);
+        REQUIRE(lp["top_logprobs"].size() == 5);
+        // Each step lists 3 alternatives; all logprobs <= 0.
+        REQUIRE(lp["top_logprobs"][0].size() == 3);
+        for (const auto& v : lp["token_logprobs"]) {
+            REQUIRE(v.get<double>() <= 0.0);
+        }
+    }
+
+    SECTION("chat logprobs") {
+        json req{{"messages",
+                  json::array({{{"role", "user"},
+                                {"content", "Once upon a time"}}})},
+                 {"max_tokens", 4},
+                 {"logprobs", true},
+                 {"top_logprobs", 2}};
+        auto res = client.Post("/v1/chat/completions", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto content =
+            json::parse(res->body)["choices"][0]["logprobs"]
+                                  ["content"];
+        REQUIRE(content.size() == 4);
+        REQUIRE(content[0].contains("token"));
+        REQUIRE(content[0]["top_logprobs"].size() == 2);
     }
 
     SECTION("chat completions, non-streaming") {

@@ -24,6 +24,8 @@ class EngineLoop {
         engine::Status status = engine::Status::kWaiting;
         std::vector<tok::TokenId> generated;
         std::string error;
+        /** Per-token logprobs (empty unless requested at submit). */
+        std::vector<engine::LogprobEntry> logprobs;
     };
 
     EngineLoop(const model::LlamaModel& m, tok::TokenId eos,
@@ -38,7 +40,8 @@ class EngineLoop {
         std::vector<tok::TokenId> prompt,
         std::uint32_t max_new_tokens,
         model::SamplingParams sampling = {}, std::uint64_t seed = 0,
-        std::unique_ptr<model::TokenConstraint> constraint = nullptr);
+        std::unique_ptr<model::TokenConstraint> constraint = nullptr,
+        engine::LogprobsOpt logprobs = {});
 
     /** @returns A snapshot of the request's current state. */
     View view(std::uint64_t id);

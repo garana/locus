@@ -24,6 +24,20 @@ enum class Status {
     kFailed,
 };
 
+/** Per-request logprobs configuration (default: disabled). */
+struct LogprobsOpt {
+    bool enabled = false;
+    /** Alternatives to record per token, highest-probability first. */
+    std::uint32_t top = 0;
+};
+
+/** Chosen token's log-probability plus its top alternatives. */
+struct LogprobEntry {
+    tok::TokenId token = 0;
+    float logprob = 0.0f;
+    std::vector<model::TokenLogprob> top;
+};
+
 /** One generation request and its progress. */
 struct Request {
     std::uint64_t id = 0;
@@ -39,6 +53,10 @@ struct Request {
     std::mt19937_64 rng;
     /** Optional constrained-decoding filter (e.g. JSON grammar). */
     std::unique_ptr<model::TokenConstraint> constraint;
+    /** Logprobs request (disabled by default). */
+    LogprobsOpt logprobs_opt;
+    /** One entry per generated token when logprobs_opt.enabled. */
+    std::vector<LogprobEntry> logprobs;
 
     /** Cache handle (internal to the engine). */
     kv::PagedKvCache::Seq seq;
@@ -120,7 +138,8 @@ class Engine {
         std::vector<tok::TokenId> prompt,
         std::uint32_t max_new_tokens,
         model::SamplingParams sampling = {}, std::uint64_t seed = 0,
-        std::unique_ptr<model::TokenConstraint> constraint = nullptr);
+        std::unique_ptr<model::TokenConstraint> constraint = nullptr,
+        LogprobsOpt logprobs = {});
 
     /**
      * Runs one scheduling iteration.

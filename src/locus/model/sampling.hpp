@@ -3,10 +3,17 @@
 #include <cstdint>
 #include <random>
 #include <span>
+#include <vector>
 
 #include "locus/tok/tokenizer.hpp"
 
 namespace locus::model {
+
+/** A token paired with its natural-distribution log-probability. */
+struct TokenLogprob {
+    tok::TokenId token = 0;
+    float logprob = 0.0f;
+};
 
 /**
  * Token-sampling parameters. The default is greedy (temperature 0 ->
@@ -64,5 +71,21 @@ tok::TokenId sample(std::span<float> logits, const SamplingParams& p,
                     std::span<const tok::TokenId> history,
                     std::mt19937_64& rng,
                     const TokenConstraint* constraint = nullptr);
+
+/**
+ * Reports log-probabilities under the model's natural (softmax over
+ * raw logits, temperature 1) distribution -- independent of the
+ * sampling filters, matching the OpenAI logprobs convention.
+ *
+ * @param logits Raw, unmodified logits (read only).
+ * @param chosen The token that was actually sampled.
+ * @param n_top Number of highest-probability tokens to return.
+ * @param[out] chosen_lp log-probability of `chosen`.
+ * @param[out] top The `n_top` most probable tokens, descending.
+ */
+void logprobs_from(std::span<const float> logits,
+                   tok::TokenId chosen, std::uint32_t n_top,
+                   float& chosen_lp,
+                   std::vector<TokenLogprob>& top);
 
 }  // namespace locus::model
