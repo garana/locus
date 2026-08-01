@@ -456,6 +456,33 @@ void LlamaModel::forward(tok::TokenId token,
     seq.n_tokens = pos + 1;
 }
 
+void LlamaModel::embed(std::span<const tok::TokenId> tokens,
+                       kv::PagedKvCache& cache,
+                       kv::PagedKvCache::Seq& seq, Workspace& ws,
+                       std::span<float> out) const {
+    if (tokens.empty()) {
+        throw std::invalid_argument("embed: empty input");
+    }
+    if (out.size() != hp_.n_embd) {
+        throw std::invalid_argument("embed: out must be n_embd");
+    }
+    if (backend_->name == "vulkan") {
+        throw std::invalid_argument(
+            "embed: needs a CPU/CUDA backend");
+    }
+    // Run the sequence through the layer stack; forward() leaves the
+    // last token's final-normed hidden in ws.xb (the LM head reads
+    // it), which is the embedding under last-token pooling.
+    std::vector<float> logits(hp_.n_vocab);
+    for (tok::TokenId t : tokens) {
+        if (!cache.ensure_capacity(seq, 1)) {
+            throw std::runtime_error("embed: cache exhausted");
+        }
+        forward(t, cache, seq, ws, logits);
+    }
+    std::copy_n(ws.xb.data(), hp_.n_embd, out.data());
+}
+
 bool LlamaModel::supports_batch() const {
     // forward_batch batches the FFN through op.matvec and reuses
     // the per-token attention, so every CPU/CUDA arch (llama /

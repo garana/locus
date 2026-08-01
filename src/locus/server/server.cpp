@@ -1,5 +1,6 @@
 #include "locus/server/server.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <tuple>
 #include <utility>
@@ -185,12 +186,40 @@ class JsonTokenConstraint : public model::TokenConstraint {
 OpenAiServer::OpenAiServer(const model::LlamaModel& m,
                            const tok::Tokenizer& tok,
                            Options opt)
-    : tok_(tok),
+    : model_(m),
+      tok_(tok),
       opt_(std::move(opt)),
       loop_(m, tok.eos_id(), opt_.engine),
       http_(std::make_unique<httplib::Server>()),
       n_vocab_(m.hparams().n_vocab) {
     install_routes();
+}
+
+std::vector<float> OpenAiServer::embed_text(const std::string& text) {
+    std::call_once(embed_once_, [this] {
+        embed_cache_ = std::make_unique<kv::PagedKvCache>(
+            model_.make_cache());
+        embed_ws_ = model_.make_workspace();
+    });
+    const auto ids = tok_.encode(text, true);
+    std::vector<float> emb(model_.hparams().n_embd);
+    {
+        std::lock_guard<std::mutex> lk(embed_mu_);
+        kv::PagedKvCache::Seq seq;
+        model_.embed(ids, *embed_cache_, seq, embed_ws_, emb);
+        embed_cache_->release(seq);
+    }
+    double norm = 0.0;
+    for (float v : emb) {
+        norm += static_cast<double>(v) * v;
+    }
+    norm = std::sqrt(norm);
+    if (norm > 0.0) {
+        for (float& v : emb) {
+            v = static_cast<float>(v / norm);
+        }
+    }
+    return emb;
 }
 
 std::shared_ptr<const std::vector<std::string>>
@@ -622,6 +651,49 @@ void OpenAiServer::install_routes() {
                     handle(req, res, true);
                 });
     http_->Post("/v1/messages", handle_messages);
+
+    // OpenAI embeddings: pooled hidden state, L2-normalized. `input`
+    // is a string or an array of strings.
+    http_->Post(
+        "/v1/embeddings",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            try {
+                const json body = json::parse(req.body);
+                std::vector<std::string> inputs;
+                if (body.contains("input") &&
+                    body["input"].is_string()) {
+                    inputs.push_back(
+                        body["input"].get<std::string>());
+                } else if (body.contains("input") &&
+                           body["input"].is_array()) {
+                    for (const auto& s : body["input"]) {
+                        inputs.push_back(s.get<std::string>());
+                    }
+                }
+                if (inputs.empty()) {
+                    throw std::invalid_argument(
+                        "input must be a string or array of "
+                        "strings");
+                }
+                json data = json::array();
+                for (std::size_t i = 0; i < inputs.size(); ++i) {
+                    data.push_back(
+                        {{"object", "embedding"},
+                         {"index", i},
+                         {"embedding", embed_text(inputs[i])}});
+                }
+                res.set_content(
+                    json{{"object", "list"},
+                         {"data", data},
+                         {"model", opt_.model_name}}
+                        .dump(),
+                    "application/json");
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(make_error(e.what()).dump(),
+                                "application/json");
+            }
+        });
 }
 
 }  // namespace locus::server

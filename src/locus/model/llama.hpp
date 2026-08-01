@@ -143,6 +143,24 @@ class LlamaModel {
                  std::span<float> logits) const;
 
     /**
+     * Computes a sentence embedding for `tokens`: runs them through
+     * the layer stack (updating seq's KV) and returns the final
+     * normed hidden state of the LAST token (last-token pooling),
+     * n_embd floats, unnormalized. The caller L2-normalizes if it
+     * wants unit vectors.
+     *
+     * CPU/CUDA backends only -- the Vulkan full-forward does not
+     * surface the hidden state.
+     *
+     * @param out n_embd floats.
+     * @throws std::invalid_argument on an empty batch, wrong `out`
+     *     size, or a backend without a CPU-driver forward.
+     */
+    void embed(std::span<const tok::TokenId> tokens,
+               kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq,
+               Workspace& ws, std::span<float> out) const;
+
+    /**
      * Runs N tokens of one sequence in a single pass (R10 batched
      * forward): each weight is applied to all N tokens before the
      * next weight, so a streamed weight is read once per layer,

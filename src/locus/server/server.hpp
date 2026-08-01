@@ -83,7 +83,10 @@ class OpenAiServer {
     /** Lazily builds (once) and returns the token -> decoded-bytes
      * table used by constrained decoding. */
     std::shared_ptr<const std::vector<std::string>> json_pieces();
+    /** L2-normalized last-token embedding of `text` (serialized). */
+    std::vector<float> embed_text(const std::string& text);
 
+    const model::LlamaModel& model_;
     const tok::Tokenizer& tok_;
     Options opt_;
     EngineLoop loop_;
@@ -91,6 +94,12 @@ class OpenAiServer {
     std::uint32_t n_vocab_ = 0;
     std::once_flag pieces_once_;
     std::shared_ptr<const std::vector<std::string>> pieces_;
+
+    // Embeddings run on a dedicated cache/workspace, serialized.
+    std::mutex embed_mu_;
+    std::once_flag embed_once_;
+    std::unique_ptr<kv::PagedKvCache> embed_cache_;
+    model::LlamaModel::Workspace embed_ws_;
 };
 
 }  // namespace locus::server

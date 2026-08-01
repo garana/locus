@@ -3,6 +3,7 @@
 #include <thread>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/grammar.hpp"
 #include "locus/model/llama.hpp"
@@ -289,5 +290,48 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(t1 == t2);
         REQUIRE(t2 == t3);
         REQUIRE(!t1.empty());
+    }
+}
+
+TEST_CASE("embeddings endpoint returns normalized vectors",
+          "[server][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    // Embeddings need a CPU/CUDA backend (the Vulkan full-forward
+    // does not surface the hidden state); force the scalar backend.
+    model.use_backend(*locus::backend::find_backend("scalar"));
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    TestServer ts(model, tok);
+    httplib::Client client("127.0.0.1", ts.port);
+
+    SECTION("single input, unit-normalized, right dimension") {
+        json req{{"input", "Once upon a time"}};
+        auto res = client.Post("/v1/embeddings", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = json::parse(res->body);
+        REQUIRE(body["object"] == "list");
+        auto emb = body["data"][0]["embedding"];
+        REQUIRE(emb.size() == model.hparams().n_embd);
+        double n = 0.0;
+        for (double v : emb) {
+            n += v * v;
+        }
+        REQUIRE(n == Catch::Approx(1.0).margin(1e-4));
+    }
+
+    SECTION("batch input and determinism") {
+        json req{{"input", json::array({"hello", "hello"})}};
+        auto res = client.Post("/v1/embeddings", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto data = json::parse(res->body)["data"];
+        REQUIRE(data.size() == 2);
+        REQUIRE(data[0]["embedding"] == data[1]["embedding"]);
     }
 }
