@@ -856,6 +856,60 @@ sequential path before the engine ever calls it -- the
 6-model token-exact goldens keep guarding the default path
 throughout.
 
+## R12: table-stakes serving features
+
+Four features every production server exposes, each default-off /
+greedy-preserving so the 6-model token-exact goldens keep guarding
+the default path:
+
+- Sampling (model/sampling): temperature, top-k, top-p, min-p,
+  repeat/frequency/presence penalties, per-request seed. temperature
+  <= 0 short-circuits to argmax, so greedy stays bit-exact. Filter
+  order matches llama.cpp (penalties -> constraint -> top_k ->
+  temp/softmax -> top_p -> min_p -> draw).
+- Constrained decoding (model/grammar, server/tools): an incremental
+  JSON-grammar validator drives a TokenConstraint that masks tokens
+  whose decoded bytes would break the grammar; wired to
+  response_format json_object. Byte-exact when the grammar never
+  fires.
+- Prefix / prompt caching (engine/prefix_cache, kv retain/release):
+  exact token-prefix keys, ref-counted block pins, LRU eviction;
+  adopts the longest shared prefix (leaving >= 1 token so the last
+  logits are recomputed). Byte-exact; measured via
+  prefix_reused_tokens.
+- Speculative decoding (model/speculative): prompt-lookup (no draft
+  model) -- n-gram match against the context proposes drafts,
+  verified in ONE batched forward with all_logits; the longest
+  correct prefix is accepted. Greedy-only, so byte-exact to plain
+  greedy. Uses the per-token scheduler.
+
+## R13-R15: reach, footprint, scale
+
+Ranked by benefit to the streaming niche (stream weights when a
+model does not fit in RAM, batch inputs -- cache-friendlier, so a
+bigger model runs where it otherwise could not).
+
+- R14 embeddings/reranking (done): POST /v1/embeddings pools the
+  last-token post-out_norm hidden state, L2-normalized, on a
+  dedicated serialized cache/workspace (needs a CPU/CUDA backend --
+  the full-GPU Vulkan forward does not surface the hidden state).
+- R15 API polish (done): GET /v1/models (+ /{id}), GET /metrics
+  (Prometheus text: request/token counters, prefix-reuse and
+  speculative accepts, KV-pool gauges), and OpenAI-shaped logprobs
+  on the non-streaming completion paths (model::logprobs_from is a
+  log-softmax over the RAW logits -- the natural temperature-1
+  distribution, independent of the sampling filters). Usage
+  accounting added to the OpenAI responses.
+- R14 KV-cache quantization (next): store paged K/V as Q8/Q4 to
+  shrink the resident cache -- the footprint lever for long context
+  on streamed models.
+- R13 breadth (pending): more architectures (Qwen-MoE, DBRX) and
+  tiny quants (ternary TQ1_0/TQ2_0 + remaining IQ, with GPU
+  kernels), delegated to the CUDA/Vulkan hosts where model-dependent.
+- R15 weight-sharding multi-GPU pager (deferred): needs multi-GPU
+  hardware; not classic tensor parallelism -- shard the streamed
+  weight window across devices.
+
 ## 8. Testing strategy
 
 - Catch2 unit tests per component (allocator, scheduler invariants,

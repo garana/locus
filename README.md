@@ -37,6 +37,15 @@ threaded matvecs (LOCUS_THREADS) and static-weight pinning
 indexer is implemented, so its context is no longer capped at
 2048 tokens.
 
+The server exposes the table-stakes serving features (DESIGN.md
+R12), each default-off so greedy stays token-exact: sampling
+(temperature, top-k/p, min-p, penalties, seed), JSON-constrained
+decoding, prefix/prompt caching, and prompt-lookup speculative
+decoding. The API surface (DESIGN.md R14/R15) adds POST
+/v1/embeddings, GET /v1/models, GET /metrics (Prometheus), and
+OpenAI-shaped logprobs plus usage accounting, alongside the
+OpenAI and Anthropic (/v1/messages) chat/completion endpoints.
+
 ## Building
 
     cmake -B build -DCMAKE_BUILD_TYPE=Release
