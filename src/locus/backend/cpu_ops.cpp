@@ -476,6 +476,61 @@ void dequant_block_iq2_s(const std::byte* blk, float* y) {
     }
 }
 
+/** IQ3_S (110 bytes): d | qs[64] | qh[8] | signs[32] | scales[4].
+ *  Processed two 32-groups at a time: each element's 9-bit iq3s_grid
+ *  index is qs byte + one high bit from qh; grid entry is 4 u8; signs
+ *  are raw bytes; scale = d*(1+2*sub). Ports dequantize_row_iq3_s. */
+void dequant_block_iq3_s(const std::byte* blk, float* y) {
+    const float d = f16_to_f32(load_u16(blk));
+    const auto* qs = reinterpret_cast<const std::uint8_t*>(blk + 2);
+    const auto* qh = reinterpret_cast<const std::uint8_t*>(blk + 66);
+    const auto* signs =
+        reinterpret_cast<const std::uint8_t*>(blk + 74);
+    const auto* scales =
+        reinterpret_cast<const std::uint8_t*>(blk + 106);
+    for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+        const float db1 = d * (1 + 2 * (scales[ib32 / 2] & 0xf));
+        const float db2 = d * (1 + 2 * (scales[ib32 / 2] >> 4));
+        for (int l = 0; l < 4; ++l) {
+            const auto* g1 = reinterpret_cast<const std::uint8_t*>(
+                iq3s_grid + (qs[2 * l] | ((qh[0] << (8 - 2 * l)) &
+                                          256)));
+            const auto* g2 = reinterpret_cast<const std::uint8_t*>(
+                iq3s_grid + (qs[2 * l + 1] |
+                             ((qh[0] << (7 - 2 * l)) & 256)));
+            for (int j = 0; j < 4; ++j) {
+                y[j] = db1 * g1[j] *
+                       ((signs[l] & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                y[j + 4] = db1 * g2[j] *
+                           ((signs[l] & kmask_iq2xs[j + 4]) ? -1.0f
+                                                            : 1.0f);
+            }
+            y += 8;
+        }
+        qs += 8;
+        signs += 4;
+        for (int l = 0; l < 4; ++l) {
+            const auto* g1 = reinterpret_cast<const std::uint8_t*>(
+                iq3s_grid + (qs[2 * l] | ((qh[1] << (8 - 2 * l)) &
+                                          256)));
+            const auto* g2 = reinterpret_cast<const std::uint8_t*>(
+                iq3s_grid + (qs[2 * l + 1] |
+                             ((qh[1] << (7 - 2 * l)) & 256)));
+            for (int j = 0; j < 4; ++j) {
+                y[j] = db2 * g1[j] *
+                       ((signs[l] & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                y[j + 4] = db2 * g2[j] *
+                           ((signs[l] & kmask_iq2xs[j + 4]) ? -1.0f
+                                                            : 1.0f);
+            }
+            y += 8;
+        }
+        qh += 2;
+        qs += 8;
+        signs += 4;
+    }
+}
+
 /** TQ1_0 (54 bytes): qs[48] | qh[4] | d. Ternary (BitNet b1.58): each
  *  byte packs 5 base-3 digits (qs) or 4 (qh); digit n is recovered as
  *  ((byte*pow3[n]*3)>>8) in {0,1,2}, value (digit-1)*d in {-1,0,1}*d.
@@ -556,6 +611,8 @@ std::pair<std::size_t, BlockDequantFn> k_traits(
             return {74, &dequant_block_iq2_xs};
         case gguf::TensorType::kIQ2_S:
             return {82, &dequant_block_iq2_s};
+        case gguf::TensorType::kIQ3_S:
+            return {110, &dequant_block_iq3_s};
         case gguf::TensorType::kIQ3_XXS:
             return {98, &dequant_block_iq3_xxs};
         case gguf::TensorType::kIQ1_S:
@@ -605,6 +662,7 @@ std::size_t row_bytes(const Mat& w) {
         case gguf::TensorType::kIQ2_XS:
         case gguf::TensorType::kIQ2_S:
         case gguf::TensorType::kIQ3_XXS:
+        case gguf::TensorType::kIQ3_S:
         case gguf::TensorType::kIQ1_S:
         case gguf::TensorType::kIQ4_XS:
         case gguf::TensorType::kTQ1_0:

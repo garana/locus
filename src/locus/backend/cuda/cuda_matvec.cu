@@ -562,6 +562,88 @@ __global__ void matvec_iq2_s_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
+/** One IQ3_S super-block is 110 bytes: d | qs[64] | qh[8] | signs[32]
+ *  | scales[4]. Two 32-groups per outer step; each element's 9-bit
+ *  iq3s_grid index is a qs byte + one high bit from qh; grid entry is
+ *  4 u8; signs raw. `grid` = device iq3s_grid (u32). Matches
+ *  dequant_block_iq3_s. */
+__global__ void matvec_iq3_s_kernel(const std::uint8_t* w,
+                                    const std::uint32_t* grid,
+                                    const float* x, float* out,
+                                    std::uint32_t rows,
+                                    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 110;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            110;
+        const float d = ld_f16(blk);
+        const std::uint8_t* qs = blk + 2;
+        const std::uint8_t* qh = blk + 66;
+        const std::uint8_t* signs = blk + 74;
+        const std::uint8_t* scales = blk + 106;
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        float tmp[256];
+        float* y = tmp;
+        for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+            const float db1 = d * (1 + 2 * (scales[ib32 / 2] & 0xf));
+            const float db2 = d * (1 + 2 * (scales[ib32 / 2] >> 4));
+            for (int l = 0; l < 4; ++l) {
+                const std::uint8_t* g1 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (qs[2 * l] |
+                                ((qh[0] << (8 - 2 * l)) & 256)));
+                const std::uint8_t* g2 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (qs[2 * l + 1] |
+                                ((qh[0] << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[j] = db1 * g1[j] *
+                           ((signs[l] & (1 << j)) ? -1.0f : 1.0f);
+                    y[j + 4] =
+                        db1 * g2[j] *
+                        ((signs[l] & (1 << (j + 4))) ? -1.0f : 1.0f);
+                }
+                y += 8;
+            }
+            qs += 8;
+            signs += 4;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint8_t* g1 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (qs[2 * l] |
+                                ((qh[1] << (8 - 2 * l)) & 256)));
+                const std::uint8_t* g2 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (qs[2 * l + 1] |
+                                ((qh[1] << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[j] = db2 * g1[j] *
+                           ((signs[l] & (1 << j)) ? -1.0f : 1.0f);
+                    y[j + 4] =
+                        db2 * g2[j] *
+                        ((signs[l] & (1 << (j + 4))) ? -1.0f : 1.0f);
+                }
+                y += 8;
+            }
+            qh += 2;
+            qs += 8;
+            signs += 4;
+        }
+        for (int i = 0; i < 256; ++i) {
+            acc += tmp[i] * xb[i];
+        }
+    }
+    out[r] = acc;
+}
+
 /** One IQ3_XXS super-block is 98 bytes: d (f16) + qs[64] +
  *  scales_and_signs[32], 256 weights. Each 32-group picks 8 grid
  *  entries (4 u8 each) via qs and a sign byte; `grid` = device
@@ -1251,6 +1333,12 @@ const std::uint64_t* device_iq2s_grid() {
     return d;
 }
 
+const std::uint32_t* device_iq3s_grid() {
+    static const auto* d = static_cast<const std::uint32_t*>(
+        upload_table(iq3s_grid, sizeof(iq3s_grid)));
+    return d;
+}
+
 /** Sign lookup shared by IQ2_XXS and IQ3_XXS. */
 const std::uint8_t* device_ksigns() {
     static const auto* d = static_cast<const std::uint8_t*>(
@@ -1277,6 +1365,7 @@ enum class Kind {
     kIQ2_XS,
     kIQ2_S,
     kIQ3_XXS,
+    kIQ3_S,
     kIQ4_XS,
     kTQ1_0,
     kTQ2_0
@@ -1339,6 +1428,10 @@ void launch_kernel(Kind kind, const void* dw,
         case Kind::kIQ2_S:
             matvec_iq2_s_kernel<<<blocks, threads>>>(
                 dwb, t.g64, dxf, doutf, rows, cols);
+            break;
+        case Kind::kIQ3_S:
+            matvec_iq3_s_kernel<<<blocks, threads>>>(
+                dwb, t.g32, dxf, doutf, rows, cols);
             break;
         case Kind::kIQ3_XXS:
             matvec_iq3_xxs_kernel<<<blocks, threads>>>(
@@ -1435,6 +1528,9 @@ std::size_t device_weight_bytes(const Mat& w) {
         case gguf::TensorType::kIQ2_S:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 256ull) * 82ull;
+        case gguf::TensorType::kIQ3_S:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 110ull;
         case gguf::TensorType::kIQ3_XXS:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 256ull) * 98ull;
@@ -1472,6 +1568,8 @@ Kind kind_for(gguf::TensorType t) {
             return Kind::kIQ2_XS;
         case gguf::TensorType::kIQ2_S:
             return Kind::kIQ2_S;
+        case gguf::TensorType::kIQ3_S:
+            return Kind::kIQ3_S;
         case gguf::TensorType::kIQ3_XXS:
             return Kind::kIQ3_XXS;
         case gguf::TensorType::kIQ4_XS:
@@ -1566,6 +1664,10 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
             case gguf::TensorType::kIQ2_S:
                 t.g64 = device_iq2s_grid();
                 tables_ok = t.g64 != nullptr;
+                break;
+            case gguf::TensorType::kIQ3_S:
+                t.g32 = device_iq3s_grid();
+                tables_ok = t.g32 != nullptr;
                 break;
             case gguf::TensorType::kIQ3_XXS:
                 t.g32 = device_iq3xxs_grid();
