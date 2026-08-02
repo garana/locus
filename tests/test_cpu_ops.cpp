@@ -228,6 +228,8 @@ std::vector<std::byte> k_quant_row(TensorType t,
             case TensorType::kIQ2_XXS: return {66, 0, -1};
             case TensorType::kIQ3_XXS: return {98, 0, -1};
             case TensorType::kIQ1_S: return {50, 0, -1};
+            case TensorType::kTQ1_0: return {54, 52, -1};
+            case TensorType::kTQ2_0: return {66, 64, -1};
             default: return {136, 0, -1};  // kIQ4_XS
         }
     }();
@@ -268,7 +270,8 @@ TEST_CASE("k-quant matvec is consistent with dequant_row",
           TensorType::kQ4_K, TensorType::kQ5_K,
           TensorType::kQ6_K, TensorType::kIQ2_XXS,
           TensorType::kIQ3_XXS, TensorType::kIQ1_S,
-          TensorType::kIQ4_XS}) {
+          TensorType::kIQ4_XS, TensorType::kTQ1_0,
+          TensorType::kTQ2_0}) {
         auto row0 = k_quant_row(t, 2, 40);
         auto row1 = k_quant_row(t, 2, 41);
         auto row2 = k_quant_row(t, 2, 42);
@@ -295,6 +298,48 @@ TEST_CASE("k-quant matvec is consistent with dequant_row",
             nonzero = nonzero || v != 0.0f;
         }
         REQUIRE(nonzero);
+    }
+}
+
+// Hand-built golden blocks pin the ternary arithmetic to ggml's exact
+// layout: TQ2_0 is 2 bits/elem (value (v-1)*d); TQ1_0 packs base-3
+// digits per byte, digit n = ((uint8)(byte*pow3[n])*3)>>8 (uint8 wrap
+// is load-bearing). Fill order is sequential, matching dequant_row.
+TEST_CASE("ternary TQ1_0/TQ2_0 dequant matches the ggml layout",
+          "[ops][ternary]") {
+    using locus::backend::f32_to_f16;
+    std::vector<float> y(256);
+    // TQ2_0 (66B): qs[64] | d. qs[0]=0xE4 -> pairs l=0..3 = 0,1,2,3.
+    {
+        std::vector<std::byte> blk(66, std::byte{0});
+        const std::uint16_t d = f32_to_f16(1.0f);
+        std::memcpy(blk.data() + 64, &d, 2);
+        blk[0] = std::byte{0xE4};
+        Mat m{TensorType::kTQ2_0, blk.data(), 1, 256};
+        dequant_row(m, 0, y);
+        REQUIRE(y[0] == Approx(-1.0f));   // l=0 -> 0 -> -1
+        REQUIRE(y[32] == Approx(0.0f));   // l=1 -> 1 ->  0
+        REQUIRE(y[64] == Approx(1.0f));   // l=2 -> 2 ->  1
+        REQUIRE(y[96] == Approx(2.0f));   // l=3 -> 3 ->  2
+        REQUIRE(y[1] == Approx(-1.0f));   // qs[1]=0 -> -1
+    }
+    // TQ1_0 (54B): qs[48] | qh[4] | d.
+    {
+        std::vector<std::byte> blk(54, std::byte{0});
+        const std::uint16_t d = f32_to_f16(1.0f);
+        std::memcpy(blk.data() + 52, &d, 2);
+        Mat m{TensorType::kTQ1_0, blk.data(), 1, 256};
+        dequant_row(m, 0, y);
+        for (float v : y) {
+            REQUIRE(v == Approx(-1.0f));  // all-zero digits -> -d
+        }
+        // qs[0]=200: n=0 digit ((200*3)>>8)=2 -> +d at y[0];
+        // n=1 digit ((uint8)(200*3)=88; (88*3)>>8=1) -> 0 at y[32].
+        blk[0] = std::byte{200};
+        dequant_row(m, 0, y);
+        REQUIRE(y[0] == Approx(1.0f));
+        REQUIRE(y[32] == Approx(0.0f));
+        REQUIRE(y[1] == Approx(-1.0f));
     }
 }
 

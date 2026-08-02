@@ -40,6 +40,9 @@ TypeTraits traits(TensorType t) {
         case TensorType::kIQ3_XXS: return {256, 98};
         case TensorType::kIQ1_S: return {256, 50};
         case TensorType::kIQ4_XS: return {256, 136};
+        // Ternary (BitNet b1.58); dequant kernels in cpu_ops.
+        case TensorType::kTQ1_0: return {256, 54};
+        case TensorType::kTQ2_0: return {256, 66};
     }
     return {0, 0};
 }

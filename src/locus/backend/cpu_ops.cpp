@@ -415,6 +415,64 @@ void dequant_block_iq4_xs(const std::byte* blk, float* y) {
     }
 }
 
+/** TQ1_0 (54 bytes): qs[48] | qh[4] | d. Ternary (BitNet b1.58): each
+ *  byte packs 5 base-3 digits (qs) or 4 (qh); digit n is recovered as
+ *  ((byte*pow3[n]*3)>>8) in {0,1,2}, value (digit-1)*d in {-1,0,1}*d.
+ *  Ports ggml dequantize_row_tq1_0 exactly (uint8 wrap intended). */
+void dequant_block_tq1_0(const std::byte* blk, float* y) {
+    static constexpr std::uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+    const auto* qs = reinterpret_cast<const std::uint8_t*>(blk);
+    const auto* qh = reinterpret_cast<const std::uint8_t*>(blk + 48);
+    const float d = f16_to_f32(load_u16(blk + 52));
+    for (std::size_t j = 0; j < 32; j += 32) {  // first 32 qs bytes
+        for (std::size_t n = 0; n < 5; ++n) {
+            for (std::size_t m = 0; m < 32; ++m) {
+                std::uint8_t q =
+                    static_cast<std::uint8_t>(qs[j + m] * pow3[n]);
+                std::int16_t xi =
+                    (static_cast<std::uint16_t>(q) * 3) >> 8;
+                *y++ = static_cast<float>(xi - 1) * d;
+            }
+        }
+    }
+    for (std::size_t j = 32; j < 48; j += 16) {  // trailing 16 bytes
+        for (std::size_t n = 0; n < 5; ++n) {
+            for (std::size_t m = 0; m < 16; ++m) {
+                std::uint8_t q =
+                    static_cast<std::uint8_t>(qs[j + m] * pow3[n]);
+                std::int16_t xi =
+                    (static_cast<std::uint16_t>(q) * 3) >> 8;
+                *y++ = static_cast<float>(xi - 1) * d;
+            }
+        }
+    }
+    for (std::size_t n = 0; n < 4; ++n) {  // qh: 4 digits per byte
+        for (std::size_t j = 0; j < 4; ++j) {
+            std::uint8_t q =
+                static_cast<std::uint8_t>(qh[j] * pow3[n]);
+            std::int16_t xi = (static_cast<std::uint16_t>(q) * 3) >> 8;
+            *y++ = static_cast<float>(xi - 1) * d;
+        }
+    }
+}
+
+/** TQ2_0 (66 bytes): qs[64] | d. Ternary at 2 bits/element: element
+ *  (l,m) = (qs[j+m] >> 2l) & 3 in {0,1,2}, value (v-1)*d. Ports ggml
+ *  dequantize_row_tq2_0 exactly. */
+void dequant_block_tq2_0(const std::byte* blk, float* y) {
+    const auto* qs = reinterpret_cast<const std::uint8_t*>(blk);
+    const float d = f16_to_f32(load_u16(blk + 64));
+    for (std::size_t j = 0; j < 64; j += 32) {
+        for (std::size_t l = 0; l < 4; ++l) {
+            for (std::size_t m = 0; m < 32; ++m) {
+                std::int8_t q =
+                    static_cast<std::int8_t>((qs[j + m] >> (l * 2)) & 3);
+                *y++ = static_cast<float>(q - 1) * d;
+            }
+        }
+    }
+}
+
 using BlockDequantFn = void (*)(const std::byte*, float*);
 
 /** @returns {block_bytes, fn} for 256-elem super-block types. */
@@ -439,6 +497,10 @@ std::pair<std::size_t, BlockDequantFn> k_traits(
             return {50, &dequant_block_iq1_s};
         case gguf::TensorType::kIQ4_XS:
             return {136, &dequant_block_iq4_xs};
+        case gguf::TensorType::kTQ1_0:
+            return {54, &dequant_block_tq1_0};
+        case gguf::TensorType::kTQ2_0:
+            return {66, &dequant_block_tq2_0};
         default:
             return {0, nullptr};
     }
@@ -478,6 +540,8 @@ std::size_t row_bytes(const Mat& w) {
         case gguf::TensorType::kIQ3_XXS:
         case gguf::TensorType::kIQ1_S:
         case gguf::TensorType::kIQ4_XS:
+        case gguf::TensorType::kTQ1_0:
+        case gguf::TensorType::kTQ2_0:
             return w.cols / 256ull * k_traits(w.type).first;
         default:
             throw gguf::Error("no CPU kernel for this weight type");
