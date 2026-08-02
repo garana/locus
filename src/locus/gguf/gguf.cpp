@@ -27,6 +27,7 @@ TypeTraits traits(TensorType t) {
         case TensorType::kQ5_0: return {32, 22};
         case TensorType::kQ5_1: return {32, 24};
         case TensorType::kQ8_0: return {32, 34};
+        case TensorType::kIQ4_NL: return {32, 18};
         case TensorType::kQ8_1: return {32, 36};
         case TensorType::kQ2_K: return {256, 84};
         case TensorType::kQ3_K: return {256, 110};

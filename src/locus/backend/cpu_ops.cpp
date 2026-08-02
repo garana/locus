@@ -15,6 +15,7 @@ constexpr std::size_t kQ4_0BlockBytes = 18;
 /** Q5_0 block: 32 elems, f16 scale + 4 high-bit bytes + 16
  * nibble bytes (22 bytes). */
 constexpr std::size_t kQ5_0BlockBytes = 22;
+constexpr std::size_t kIQ4_NLBlockBytes = 18;
 
 std::uint16_t load_u16(const std::byte* p) {
     std::uint16_t v;
@@ -628,6 +629,29 @@ std::pair<std::size_t, BlockDequantFn> k_traits(
     }
 }
 
+/** IQ4_NL (18B/32 elems): d | qs[16]. A 32-element block (not a
+ *  super-block): low nibble -> first 16 lanes, high nibble -> next
+ *  16, each mapped through the kvalues_iq4nl codebook. Q4_0-style row
+ *  path. Matches ggml dequantize_row_iq4_nl. */
+float dot_iq4_nl(const std::byte* row, std::span<const float> x) {
+    float acc = 0.0f;
+    const std::size_t nb = x.size() / 32;
+    for (std::size_t b = 0; b < nb; ++b) {
+        const std::byte* blk = row + b * kIQ4_NLBlockBytes;
+        const float d = f16_to_f32(load_u16(blk));
+        const auto* q =
+            reinterpret_cast<const std::uint8_t*>(blk + 2);
+        float s = 0.0f;
+        for (std::size_t i = 0; i < 16; ++i) {
+            const float lo = kvalues_iq4nl[q[i] & 0x0f];
+            const float hi = kvalues_iq4nl[q[i] >> 4];
+            s += lo * x[b * 32 + i] + hi * x[b * 32 + i + 16];
+        }
+        acc += d * s;
+    }
+    return acc;
+}
+
 float dot_k_quant(const Mat& w, const std::byte* row,
                   std::span<const float> x) {
     const auto [bytes, fn] = k_traits(w.type);
@@ -653,6 +677,8 @@ std::size_t row_bytes(const Mat& w) {
             return w.cols / 32ull * kQ4_0BlockBytes;
         case gguf::TensorType::kQ5_0:
             return w.cols / 32ull * kQ5_0BlockBytes;
+        case gguf::TensorType::kIQ4_NL:
+            return w.cols / 32ull * kIQ4_NLBlockBytes;
         case gguf::TensorType::kQ2_K:
         case gguf::TensorType::kQ3_K:
         case gguf::TensorType::kQ4_K:
@@ -959,6 +985,9 @@ void matvec(const Mat& w, std::span<const float> x,
             case gguf::TensorType::kQ5_0:
                 out[r] = dot_q5_0(row, x);
                 break;
+            case gguf::TensorType::kIQ4_NL:
+                out[r] = dot_iq4_nl(row, x);
+                break;
             default:
                 out[r] = dot_k_quant(w, row, x);
                 break;
@@ -1000,6 +1029,9 @@ void matvec_batch_scalar(const Mat& w, std::span<const float> x_batch,
                     break;
                 case gguf::TensorType::kQ5_0:
                     o[t] = dot_q5_0(row, x);
+                    break;
+                case gguf::TensorType::kIQ4_NL:
+                    o[t] = dot_iq4_nl(row, x);
                     break;
                 default:
                     o[t] = dot_k_quant(w, row, x);
@@ -1052,6 +1084,20 @@ void dequant_row(const Mat& w, std::uint32_t row,
             for (std::uint32_t b = 0; b < w.cols / 32; ++b) {
                 dequant_block_q5_0(p + b * kQ5_0BlockBytes,
                                    out.data() + b * 32);
+            }
+            break;
+        }
+        case gguf::TensorType::kIQ4_NL: {
+            for (std::uint32_t b = 0; b < w.cols / 32; ++b) {
+                const std::byte* blk = p + b * kIQ4_NLBlockBytes;
+                const float d = f16_to_f32(load_u16(blk));
+                const auto* q =
+                    reinterpret_cast<const std::uint8_t*>(blk + 2);
+                for (std::uint32_t i = 0; i < 16; ++i) {
+                    out[b * 32 + i] = d * kvalues_iq4nl[q[i] & 0x0f];
+                    out[b * 32 + i + 16] =
+                        d * kvalues_iq4nl[q[i] >> 4];
+                }
             }
             break;
         }

@@ -347,6 +347,51 @@ TEST_CASE("ternary TQ1_0/TQ2_0 dequant matches the ggml layout",
     }
 }
 
+// IQ4_NL is a 32-ELEMENT block (18B), not a 256 super-block, so it
+// rides the Q4_0-style row path (dot_iq4_nl) rather than dot_k_quant.
+// Check matvec == dequant_row dot (scalar) and, when present, that the
+// CUDA kernel agrees.
+TEST_CASE("IQ4_NL 32-elem matvec matches dequant_row and CUDA",
+          "[ops][iq4nl]") {
+    constexpr std::uint32_t rows = 3, nblk = 4, cols = nblk * 32;
+    std::mt19937 rng(88);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = xd(rng);
+    }
+    std::vector<std::byte> w(static_cast<std::size_t>(rows) * nblk *
+                             18);
+    for (auto& b : w) {
+        b = static_cast<std::byte>(byte_d(rng));
+    }
+    for (std::uint32_t i = 0; i < rows * nblk; ++i) {  // sane scales
+        const std::uint16_t d = locus::backend::f32_to_f16(0.05f);
+        std::memcpy(w.data() + i * 18, &d, 2);
+    }
+    Mat m{TensorType::kIQ4_NL, w.data(), rows, cols};
+    std::vector<float> mv(rows), dq(cols);
+    matvec(m, x, mv);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        dequant_row(m, r, dq);
+        float ref = 0.0f;
+        for (std::uint32_t i = 0; i < cols; ++i) {
+            ref += dq[i] * x[i];
+        }
+        REQUIRE(mv[r] == Approx(ref).margin(1e-4));
+    }
+    if (cuda_backend_usable()) {
+        cuda_pool_reset();
+        std::vector<float> got(rows);
+        matvec_cuda(m, x, got);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(got[r] ==
+                    Approx(mv[r]).epsilon(1e-4).margin(1e-4));
+        }
+    }
+}
+
 #if defined(__aarch64__)
 TEST_CASE("matvec_neon matches the scalar reference for K-quants",
           "[ops][neon]") {

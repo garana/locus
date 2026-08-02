@@ -90,6 +90,39 @@ __global__ void matvec_q8_0_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
+/** IQ4_NL: 18-byte / 32-element block (d f16 + qs[16]). Low nibble ->
+ *  first 16 lanes, high nibble -> next 16, mapped through the
+ *  kvalues_iq4nl codebook. Same per-block accumulation as dot_iq4_nl. */
+__global__ void matvec_iq4_nl_kernel(const std::uint8_t* w,
+                                     const std::int8_t* kvalues,
+                                     const float* x, float* out,
+                                     std::uint32_t rows,
+                                     std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nblk = cols / 32;
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(nblk) * 18;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nblk; ++b) {
+        const std::uint8_t* blk = row + b * 18;
+        const float d = ld_f16(blk);
+        const std::uint8_t* q = blk + 2;
+        const float* xb = x + static_cast<std::size_t>(b) * 32;
+        float s = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            s += static_cast<float>(kvalues[q[i] & 0x0f]) * xb[i] +
+                 static_cast<float>(kvalues[q[i] >> 4]) * xb[i + 16];
+        }
+        acc += d * s;
+    }
+    out[r] = acc;
+}
+
 /** Unpacks the 6-bit scale/min of K-quant sub-block j from the
  *  packed 12-byte scales array (ggml get_scale_min_k4). */
 __device__ void scale_min_k4(int j, const std::uint8_t* q,
@@ -1367,6 +1400,7 @@ enum class Kind {
     kIQ3_XXS,
     kIQ3_S,
     kIQ4_XS,
+    kIQ4_NL,
     kTQ1_0,
     kTQ2_0
 };
@@ -1439,6 +1473,10 @@ void launch_kernel(Kind kind, const void* dw,
             break;
         case Kind::kIQ4_XS:
             matvec_iq4_xs_kernel<<<blocks, threads>>>(
+                dwb, t.kvalues, dxf, doutf, rows, cols);
+            break;
+        case Kind::kIQ4_NL:
+            matvec_iq4_nl_kernel<<<blocks, threads>>>(
                 dwb, t.kvalues, dxf, doutf, rows, cols);
             break;
         case Kind::kTQ1_0:
@@ -1537,6 +1575,9 @@ std::size_t device_weight_bytes(const Mat& w) {
         case gguf::TensorType::kIQ4_XS:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 256ull) * 136ull;
+        case gguf::TensorType::kIQ4_NL:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 32ull) * 18ull;
         case gguf::TensorType::kTQ1_0:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 256ull) * 54ull;
@@ -1574,6 +1615,8 @@ Kind kind_for(gguf::TensorType t) {
             return Kind::kIQ3_XXS;
         case gguf::TensorType::kIQ4_XS:
             return Kind::kIQ4_XS;
+        case gguf::TensorType::kIQ4_NL:
+            return Kind::kIQ4_NL;
         case gguf::TensorType::kTQ1_0:
             return Kind::kTQ1_0;
         case gguf::TensorType::kTQ2_0:
@@ -1675,6 +1718,7 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
                 tables_ok = t.g32 != nullptr && t.ksigns != nullptr;
                 break;
             case gguf::TensorType::kIQ4_XS:
+            case gguf::TensorType::kIQ4_NL:
                 t.kvalues = device_kvalues_iq4nl();
                 tables_ok = t.kvalues != nullptr;
                 break;
