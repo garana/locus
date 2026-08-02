@@ -226,6 +226,7 @@ std::vector<std::byte> k_quant_row(TensorType t,
             case TensorType::kQ5_K: return {176, 0, 2};
             case TensorType::kQ6_K: return {210, 208, -1};
             case TensorType::kIQ2_XXS: return {66, 0, -1};
+            case TensorType::kIQ2_XS: return {74, 0, -1};
             case TensorType::kIQ3_XXS: return {98, 0, -1};
             case TensorType::kIQ1_S: return {50, 0, -1};
             case TensorType::kTQ1_0: return {54, 52, -1};
@@ -269,9 +270,9 @@ TEST_CASE("k-quant matvec is consistent with dequant_row",
          {TensorType::kQ2_K, TensorType::kQ3_K,
           TensorType::kQ4_K, TensorType::kQ5_K,
           TensorType::kQ6_K, TensorType::kIQ2_XXS,
-          TensorType::kIQ3_XXS, TensorType::kIQ1_S,
-          TensorType::kIQ4_XS, TensorType::kTQ1_0,
-          TensorType::kTQ2_0}) {
+          TensorType::kIQ2_XS, TensorType::kIQ3_XXS,
+          TensorType::kIQ1_S, TensorType::kIQ4_XS,
+          TensorType::kTQ1_0, TensorType::kTQ2_0}) {
         auto row0 = k_quant_row(t, 2, 40);
         auto row1 = k_quant_row(t, 2, 41);
         auto row2 = k_quant_row(t, 2, 42);
@@ -481,9 +482,9 @@ TEST_CASE("matvec_cuda matches the scalar reference for K-/IQ-quants",
     for (TensorType t :
          {TensorType::kQ2_K, TensorType::kQ4_K, TensorType::kQ5_K,
           TensorType::kQ6_K, TensorType::kIQ1_S,
-          TensorType::kIQ2_XXS, TensorType::kIQ3_XXS,
-          TensorType::kIQ4_XS, TensorType::kTQ1_0,
-          TensorType::kTQ2_0}) {
+          TensorType::kIQ2_XXS, TensorType::kIQ2_XS,
+          TensorType::kIQ3_XXS, TensorType::kIQ4_XS,
+          TensorType::kTQ1_0, TensorType::kTQ2_0}) {
         std::vector<std::byte> w;
         for (std::uint32_t r = 0; r < rows; ++r) {
             auto row = k_quant_row(

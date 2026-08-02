@@ -415,6 +415,34 @@ void dequant_block_iq4_xs(const std::byte* blk, float* y) {
     }
 }
 
+/** IQ2_XS (74 bytes): d | qs[32] u16 | scales[8]. Each 32-group uses
+ *  scales[ib32] (two 4-bit sub-scales) and 4 grid entries: qs low 9
+ *  bits index iq2xs_grid (8 u8 each), high 7 bits index ksigns.
+ *  value = db[l/2] * grid[j] * sign. Ports ggml dequantize_row_iq2_xs. */
+void dequant_block_iq2_xs(const std::byte* blk, float* y) {
+    const float d = f16_to_f32(load_u16(blk));
+    const auto* scales =
+        reinterpret_cast<const std::uint8_t*>(blk + 66);
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+        const float db0 =
+            d * (0.5f + (scales[ib32] & 0xf)) * 0.25f;
+        const float db1 = d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+            const std::uint16_t q =
+                load_u16(blk + 2 + 2 * (4 * ib32 + l));
+            const auto* grid = reinterpret_cast<const std::uint8_t*>(
+                iq2xs_grid + (q & 511));
+            const std::uint8_t signs = ksigns_iq2xs[q >> 9];
+            const float db = (l / 2 == 0) ? db0 : db1;
+            for (int j = 0; j < 8; ++j) {
+                y[j] = db * grid[j] *
+                       ((signs & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+            }
+            y += 8;
+        }
+    }
+}
+
 /** TQ1_0 (54 bytes): qs[48] | qh[4] | d. Ternary (BitNet b1.58): each
  *  byte packs 5 base-3 digits (qs) or 4 (qh); digit n is recovered as
  *  ((byte*pow3[n]*3)>>8) in {0,1,2}, value (digit-1)*d in {-1,0,1}*d.
@@ -491,6 +519,8 @@ std::pair<std::size_t, BlockDequantFn> k_traits(
             return {210, &dequant_block_q6_k};
         case gguf::TensorType::kIQ2_XXS:
             return {66, &dequant_block_iq2_xxs};
+        case gguf::TensorType::kIQ2_XS:
+            return {74, &dequant_block_iq2_xs};
         case gguf::TensorType::kIQ3_XXS:
             return {98, &dequant_block_iq3_xxs};
         case gguf::TensorType::kIQ1_S:
@@ -537,6 +567,7 @@ std::size_t row_bytes(const Mat& w) {
         case gguf::TensorType::kQ5_K:
         case gguf::TensorType::kQ6_K:
         case gguf::TensorType::kIQ2_XXS:
+        case gguf::TensorType::kIQ2_XS:
         case gguf::TensorType::kIQ3_XXS:
         case gguf::TensorType::kIQ1_S:
         case gguf::TensorType::kIQ4_XS:
