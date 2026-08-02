@@ -557,6 +557,104 @@ __global__ void matvec_iq4_xs_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
+/** TQ1_0 (54B): qs[48] | qh[4] | d. Ternary base-3 packing (5 digits
+ *  per qs byte, 4 per qh byte); grid-free. Materialize then dot to
+ *  match dot_k_quant / dequant_block_tq1_0 exactly (uint8 wrap kept). */
+__global__ void matvec_tq1_0_kernel(const std::uint8_t* w,
+                                    const float* x, float* out,
+                                    std::uint32_t rows,
+                                    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 54;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            54;
+        const std::uint8_t* qs = blk;
+        const std::uint8_t* qh = blk + 48;
+        const float d = ld_f16(blk + 52);
+        float tmp[256];
+        float* y = tmp;
+        for (int n = 0; n < 5; ++n) {
+            for (int m = 0; m < 32; ++m) {
+                std::uint8_t q =
+                    static_cast<std::uint8_t>(qs[m] * pow3[n]);
+                std::int16_t xi =
+                    (static_cast<std::uint16_t>(q) * 3) >> 8;
+                *y++ = static_cast<float>(xi - 1) * d;
+            }
+        }
+        for (int n = 0; n < 5; ++n) {
+            for (int m = 0; m < 16; ++m) {
+                std::uint8_t q =
+                    static_cast<std::uint8_t>(qs[32 + m] * pow3[n]);
+                std::int16_t xi =
+                    (static_cast<std::uint16_t>(q) * 3) >> 8;
+                *y++ = static_cast<float>(xi - 1) * d;
+            }
+        }
+        for (int n = 0; n < 4; ++n) {
+            for (int j = 0; j < 4; ++j) {
+                std::uint8_t q =
+                    static_cast<std::uint8_t>(qh[j] * pow3[n]);
+                std::int16_t xi =
+                    (static_cast<std::uint16_t>(q) * 3) >> 8;
+                *y++ = static_cast<float>(xi - 1) * d;
+            }
+        }
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        for (int i = 0; i < 256; ++i) {
+            acc += tmp[i] * xb[i];
+        }
+    }
+    out[r] = acc;
+}
+
+/** TQ2_0 (66B): qs[64] | d. Ternary at 2 bits/element; grid-free.
+ *  Matches dequant_block_tq2_0. */
+__global__ void matvec_tq2_0_kernel(const std::uint8_t* w,
+                                    const float* x, float* out,
+                                    std::uint32_t rows,
+                                    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 66;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            66;
+        const std::uint8_t* qs = blk;
+        const float d = ld_f16(blk + 64);
+        float tmp[256];
+        float* y = tmp;
+        for (int j = 0; j < 64; j += 32) {
+            for (int l = 0; l < 4; ++l) {
+                for (int m = 0; m < 32; ++m) {
+                    const int q = (qs[j + m] >> (l * 2)) & 3;
+                    *y++ = static_cast<float>(q - 1) * d;
+                }
+            }
+        }
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        for (int i = 0; i < 256; ++i) {
+            acc += tmp[i] * xb[i];
+        }
+    }
+    out[r] = acc;
+}
+
 // R11 batched kernels: one launch, one thread per row, n token
 // accumulators. Each weight block is read from VRAM once and reused
 // across all n tokens (weight traffic ~n-fold down). Each token t's
@@ -1053,7 +1151,9 @@ enum class Kind {
     kQ2_K,
     kIQ2_XXS,
     kIQ3_XXS,
-    kIQ4_XS
+    kIQ4_XS,
+    kTQ1_0,
+    kTQ2_0
 };
 
 /** Device lookup tables threaded to the grid/codebook kernels; unused
@@ -1113,6 +1213,14 @@ void launch_kernel(Kind kind, const void* dw,
         case Kind::kIQ4_XS:
             matvec_iq4_xs_kernel<<<blocks, threads>>>(
                 dwb, t.kvalues, dxf, doutf, rows, cols);
+            break;
+        case Kind::kTQ1_0:
+            matvec_tq1_0_kernel<<<blocks, threads>>>(
+                dwb, dxf, doutf, rows, cols);
+            break;
+        case Kind::kTQ2_0:
+            matvec_tq2_0_kernel<<<blocks, threads>>>(
+                dwb, dxf, doutf, rows, cols);
             break;
     }
 }
@@ -1193,6 +1301,12 @@ std::size_t device_weight_bytes(const Mat& w) {
         case gguf::TensorType::kIQ4_XS:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 256ull) * 136ull;
+        case gguf::TensorType::kTQ1_0:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 54ull;
+        case gguf::TensorType::kTQ2_0:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 66ull;
         default:
             return 0;
     }
@@ -1218,6 +1332,10 @@ Kind kind_for(gguf::TensorType t) {
             return Kind::kIQ3_XXS;
         case gguf::TensorType::kIQ4_XS:
             return Kind::kIQ4_XS;
+        case gguf::TensorType::kTQ1_0:
+            return Kind::kTQ1_0;
+        case gguf::TensorType::kTQ2_0:
+            return Kind::kTQ2_0;
         default:
             return Kind::kF32;
     }

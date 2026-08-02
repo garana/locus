@@ -482,7 +482,8 @@ TEST_CASE("matvec_cuda matches the scalar reference for K-/IQ-quants",
          {TensorType::kQ2_K, TensorType::kQ4_K, TensorType::kQ5_K,
           TensorType::kQ6_K, TensorType::kIQ1_S,
           TensorType::kIQ2_XXS, TensorType::kIQ3_XXS,
-          TensorType::kIQ4_XS}) {
+          TensorType::kIQ4_XS, TensorType::kTQ1_0,
+          TensorType::kTQ2_0}) {
         std::vector<std::byte> w;
         for (std::uint32_t r = 0; r < rows; ++r) {
             auto row = k_quant_row(
@@ -494,6 +495,10 @@ TEST_CASE("matvec_cuda matches the scalar reference for K-/IQ-quants",
         Mat m{t, w.data(), rows, cols};
         std::vector<float> ref(rows), got(rows);
         matvec(m, x, ref);       // scalar reference
+        // Reset per type: w's address is recycled across iterations
+        // and some types share a byte size (TQ2_0 == IQ2_XXS = 396B),
+        // which the pool's size-check alone would not disambiguate.
+        cuda_pool_reset();
         matvec_cuda(m, x, got);  // device kernel
         for (std::uint32_t r = 0; r < rows; ++r) {
             INFO("type " << static_cast<int>(t) << " row " << r);
