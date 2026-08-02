@@ -380,6 +380,87 @@ __global__ void matvec_iq1_s_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
+/** One IQ1_M super-block is 56 bytes: qs[32] | qh[16] | scales[8]. No
+ *  d field -- the f16 scale is assembled from the top nibble of each
+ *  of 4 scale u16s; two 3-bit sub-scales per 32-group; grid index is a
+ *  qs byte + 3 high bits from qh; value dl*(grid[j] +/- 0.125).
+ *  `grid` = device iq1s_grid. Matches dequant_block_iq1_m. */
+__global__ void matvec_iq1_m_kernel(const std::uint8_t* w,
+                                    const std::uint64_t* grid,
+                                    const float* x, float* out,
+                                    std::uint32_t rows,
+                                    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    constexpr float kDelta = 0.125f;
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 56;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            56;
+        std::uint16_t sc[4];
+        for (int k = 0; k < 4; ++k) {
+            const std::uint8_t* p = blk + 48 + 2 * k;
+            sc[k] = static_cast<std::uint16_t>(p[0]) |
+                    (static_cast<std::uint16_t>(p[1]) << 8);
+        }
+        const std::uint16_t su16 =
+            (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+            ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+        const float d = __half2float(__ushort_as_half(su16));
+        const std::uint8_t* qsp = blk;
+        const std::uint8_t* qhp = blk + 32;
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        float tmp[256];
+        float* y = tmp;
+        for (int ib = 0; ib < 8; ++ib) {
+            const float dl1 =
+                d *
+                (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+            const float dl2 =
+                d *
+                (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+            std::uint16_t idx[4];
+            idx[0] = qsp[0] | ((qhp[0] << 8) & 0x700);
+            idx[1] = qsp[1] | ((qhp[0] << 4) & 0x700);
+            idx[2] = qsp[2] | ((qhp[1] << 8) & 0x700);
+            idx[3] = qsp[3] | ((qhp[1] << 4) & 0x700);
+            float delta[4];
+            delta[0] = (qhp[0] & 0x08) ? -kDelta : kDelta;
+            delta[1] = (qhp[0] & 0x80) ? -kDelta : kDelta;
+            delta[2] = (qhp[1] & 0x08) ? -kDelta : kDelta;
+            delta[3] = (qhp[1] & 0x80) ? -kDelta : kDelta;
+            for (int l = 0; l < 2; ++l) {
+                const std::int8_t* g =
+                    reinterpret_cast<const std::int8_t*>(grid +
+                                                         idx[l]);
+                for (int j = 0; j < 8; ++j) {
+                    *y++ = dl1 * (g[j] + delta[l]);
+                }
+            }
+            for (int l = 2; l < 4; ++l) {
+                const std::int8_t* g =
+                    reinterpret_cast<const std::int8_t*>(grid +
+                                                         idx[l]);
+                for (int j = 0; j < 8; ++j) {
+                    *y++ = dl2 * (g[j] + delta[l]);
+                }
+            }
+            qsp += 4;
+            qhp += 2;
+        }
+        for (int i = 0; i < 256; ++i) {
+            acc += tmp[i] * xb[i];
+        }
+    }
+    out[r] = acc;
+}
+
 /** One Q2_K super-block is 84 bytes: scales[16] + qs[64] + d,dmin
  *  (f16), 256 weights. The scalar fills y sequentially; we still
  *  materialize tmp[256] then dot i=0..255 so the accumulation order
@@ -1401,6 +1482,7 @@ enum class Kind {
     kIQ3_S,
     kIQ4_XS,
     kIQ4_NL,
+    kIQ1_M,
     kTQ1_0,
     kTQ2_0
 };
@@ -1445,6 +1527,10 @@ void launch_kernel(Kind kind, const void* dw,
             break;
         case Kind::kIQ1_S:
             matvec_iq1_s_kernel<<<blocks, threads>>>(
+                dwb, t.g64, dxf, doutf, rows, cols);
+            break;
+        case Kind::kIQ1_M:
+            matvec_iq1_m_kernel<<<blocks, threads>>>(
                 dwb, t.g64, dxf, doutf, rows, cols);
             break;
         case Kind::kQ2_K:
@@ -1578,6 +1664,9 @@ std::size_t device_weight_bytes(const Mat& w) {
         case gguf::TensorType::kIQ4_NL:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 32ull) * 18ull;
+        case gguf::TensorType::kIQ1_M:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 56ull;
         case gguf::TensorType::kTQ1_0:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 256ull) * 54ull;
@@ -1617,6 +1706,8 @@ Kind kind_for(gguf::TensorType t) {
             return Kind::kIQ4_XS;
         case gguf::TensorType::kIQ4_NL:
             return Kind::kIQ4_NL;
+        case gguf::TensorType::kIQ1_M:
+            return Kind::kIQ1_M;
         case gguf::TensorType::kTQ1_0:
             return Kind::kTQ1_0;
         case gguf::TensorType::kTQ2_0:
@@ -1691,6 +1782,7 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
         bool tables_ok = true;
         switch (w.type) {
             case gguf::TensorType::kIQ1_S:
+            case gguf::TensorType::kIQ1_M:
                 t.g64 = device_iq1s_grid();
                 tables_ok = t.g64 != nullptr;
                 break;

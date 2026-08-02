@@ -231,6 +231,7 @@ std::vector<std::byte> k_quant_row(TensorType t,
             case TensorType::kIQ3_S: return {110, 0, -1};
             case TensorType::kIQ3_XXS: return {98, 0, -1};
             case TensorType::kIQ1_S: return {50, 0, -1};
+            case TensorType::kIQ1_M: return {56, 0, -1};
             case TensorType::kTQ1_0: return {54, 52, -1};
             case TensorType::kTQ2_0: return {66, 64, -1};
             default: return {136, 0, -1};  // kIQ4_XS
@@ -371,6 +372,56 @@ TEST_CASE("IQ4_NL 32-elem matvec matches dequant_row and CUDA",
         std::memcpy(w.data() + i * 18, &d, 2);
     }
     Mat m{TensorType::kIQ4_NL, w.data(), rows, cols};
+    std::vector<float> mv(rows), dq(cols);
+    matvec(m, x, mv);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        dequant_row(m, r, dq);
+        float ref = 0.0f;
+        for (std::uint32_t i = 0; i < cols; ++i) {
+            ref += dq[i] * x[i];
+        }
+        REQUIRE(mv[r] == Approx(ref).margin(1e-4));
+    }
+    if (cuda_backend_usable()) {
+        cuda_pool_reset();
+        std::vector<float> got(rows);
+        matvec_cuda(m, x, got);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(got[r] ==
+                    Approx(mv[r]).epsilon(1e-4).margin(1e-4));
+        }
+    }
+}
+
+// IQ1_M has no d field -- its f16 scale is assembled from the top
+// nibbles of 4 scale u16s -- so random bytes could yield an inf/nan
+// scale. Build a block with a sane assembled scale (0.05) and zero
+// sub-scale bits, then check matvec == dequant_row dot and CUDA.
+TEST_CASE("IQ1_M matvec matches dequant_row and CUDA",
+          "[ops][iq1m]") {
+    constexpr std::uint32_t rows = 3, nsb = 2, cols = nsb * 256;
+    std::mt19937 rng(91);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = xd(rng);
+    }
+    const std::uint16_t T = locus::backend::f32_to_f16(0.05f);
+    std::uint16_t sc[4];
+    for (int k = 0; k < 4; ++k) {
+        sc[k] = static_cast<std::uint16_t>(((T >> (4 * k)) & 0xf)
+                                           << 12);
+    }
+    std::vector<std::byte> w(static_cast<std::size_t>(rows) * nsb *
+                             56);
+    for (auto& b : w) {
+        b = static_cast<std::byte>(byte_d(rng));
+    }
+    for (std::uint32_t i = 0; i < rows * nsb; ++i) {
+        std::memcpy(w.data() + i * 56 + 48, sc, 8);  // sane scale
+    }
+    Mat m{TensorType::kIQ1_M, w.data(), rows, cols};
     std::vector<float> mv(rows), dq(cols);
     matvec(m, x, mv);
     for (std::uint32_t r = 0; r < rows; ++r) {

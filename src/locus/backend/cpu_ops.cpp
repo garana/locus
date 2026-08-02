@@ -416,6 +416,59 @@ void dequant_block_iq4_xs(const std::byte* blk, float* y) {
     }
 }
 
+/** IQ1_M (56 bytes): qs[32] | qh[16] | scales[8]. No d field: the f16
+ *  scale is assembled from the top nibble of each of the 4 scale u16s;
+ *  each 32-group has two 3-bit sub-scales. Grid index = qs byte + 3
+ *  high bits from qh; value dl*(grid[j] + +/-0.125). Reuses iq1s_grid.
+ *  Ports ggml dequantize_row_iq1_m. */
+void dequant_block_iq1_m(const std::byte* blk, float* y) {
+    constexpr float kDelta = 0.125f;  // IQ1S_DELTA
+    const auto* qs = reinterpret_cast<const std::uint8_t*>(blk);
+    const auto* qh = reinterpret_cast<const std::uint8_t*>(blk + 32);
+    std::uint16_t sc[4];
+    for (int k = 0; k < 4; ++k) {
+        sc[k] = load_u16(blk + 48 + 2 * k);
+    }
+    const std::uint16_t su16 =
+        (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+        ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    const float d = f16_to_f32(su16);
+    const std::uint8_t* qsp = qs;
+    const std::uint8_t* qhp = qh;
+    for (int ib = 0; ib < 8; ++ib) {
+        const float dl1 =
+            d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+        const float dl2 =
+            d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+        std::uint16_t idx[4];
+        idx[0] = qsp[0] | ((qhp[0] << 8) & 0x700);
+        idx[1] = qsp[1] | ((qhp[0] << 4) & 0x700);
+        idx[2] = qsp[2] | ((qhp[1] << 8) & 0x700);
+        idx[3] = qsp[3] | ((qhp[1] << 4) & 0x700);
+        float delta[4];
+        delta[0] = (qhp[0] & 0x08) ? -kDelta : kDelta;
+        delta[1] = (qhp[0] & 0x80) ? -kDelta : kDelta;
+        delta[2] = (qhp[1] & 0x08) ? -kDelta : kDelta;
+        delta[3] = (qhp[1] & 0x80) ? -kDelta : kDelta;
+        for (int l = 0; l < 2; ++l) {
+            const auto* grid = reinterpret_cast<const std::int8_t*>(
+                iq1s_grid + idx[l]);
+            for (int j = 0; j < 8; ++j) {
+                *y++ = dl1 * (grid[j] + delta[l]);
+            }
+        }
+        for (int l = 2; l < 4; ++l) {
+            const auto* grid = reinterpret_cast<const std::int8_t*>(
+                iq1s_grid + idx[l]);
+            for (int j = 0; j < 8; ++j) {
+                *y++ = dl2 * (grid[j] + delta[l]);
+            }
+        }
+        qsp += 4;
+        qhp += 2;
+    }
+}
+
 /** IQ2_XS (74 bytes): d | qs[32] u16 | scales[8]. Each 32-group uses
  *  scales[ib32] (two 4-bit sub-scales) and 4 grid entries: qs low 9
  *  bits index iq2xs_grid (8 u8 each), high 7 bits index ksigns.
@@ -618,6 +671,8 @@ std::pair<std::size_t, BlockDequantFn> k_traits(
             return {98, &dequant_block_iq3_xxs};
         case gguf::TensorType::kIQ1_S:
             return {50, &dequant_block_iq1_s};
+        case gguf::TensorType::kIQ1_M:
+            return {56, &dequant_block_iq1_m};
         case gguf::TensorType::kIQ4_XS:
             return {136, &dequant_block_iq4_xs};
         case gguf::TensorType::kTQ1_0:
@@ -690,6 +745,7 @@ std::size_t row_bytes(const Mat& w) {
         case gguf::TensorType::kIQ3_XXS:
         case gguf::TensorType::kIQ3_S:
         case gguf::TensorType::kIQ1_S:
+        case gguf::TensorType::kIQ1_M:
         case gguf::TensorType::kIQ4_XS:
         case gguf::TensorType::kTQ1_0:
         case gguf::TensorType::kTQ2_0:
