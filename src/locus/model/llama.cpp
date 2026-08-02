@@ -341,11 +341,12 @@ LlamaModel::Workspace LlamaModel::make_workspace() const {
 }
 
 kv::PagedKvCache LlamaModel::make_cache(
-    std::uint32_t n_blocks) const {
+    std::uint32_t n_blocks, kv::KvType kv_type) const {
     kv::PagedKvCache::Geometry geom;
     geom.n_layers = hp_.n_layers;
     geom.kv_dim = spec_->kv_dim(hp_);
     geom.block_tokens = 16;
+    geom.kv_type = kv_type;
     // Default pool covers min(n_ctx, 4096) tokens: long-context
     // models (128k+) would otherwise demand tens of GB up front.
     // Callers wanting more pass n_blocks explicitly.
@@ -356,7 +357,10 @@ kv::PagedKvCache LlamaModel::make_cache(
             ? n_blocks
             : (cap_tokens + geom.block_tokens - 1) /
                   geom.block_tokens;
-    if (backend_->ops.alloc_kv != nullptr) {
+    // Quantized KV uses its own byte pool; GPU external storage is
+    // F32-only, so only reach for alloc_kv in the default mode.
+    if (kv_type == kv::KvType::kF32 &&
+        backend_->ops.alloc_kv != nullptr) {
         float* storage = backend_->ops.alloc_kv(
             kv::PagedKvCache::pool_floats(geom));
         if (storage != nullptr) {

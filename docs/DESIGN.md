@@ -900,9 +900,20 @@ bigger model runs where it otherwise could not).
   log-softmax over the RAW logits -- the natural temperature-1
   distribution, independent of the sampling filters). Usage
   accounting added to the OpenAI responses.
-- R14 KV-cache quantization (next): store paged K/V as Q8/Q4 to
-  shrink the resident cache -- the footprint lever for long context
-  on streamed models.
+- R14 KV-cache quantization (done, CPU GQA path): store paged K/V as
+  Q8/Q4 to shrink the resident cache -- the footprint lever for long
+  context on streamed models. A block-of-32 codec (kv_quant, ggml
+  Q8_0/Q4_0-style f16-scaled blocks) backs a separate byte pool in
+  PagedKvCache; the F32 pool, GPU external storage, and the MLA/DSA
+  paths are untouched (F32-gated). The standard GQA attention
+  (llama-family) computes each position's K/V into scratch, stores it
+  quantized, and dequantizes the layer's past rows into a transient
+  matrix so the attention math stays arithmetically identical to the
+  F32 zero-copy path. Enabled via Engine::Config.kv_type /
+  make_cache(kv_type); validated by a cosine-similarity e2e test
+  (Q8 > 0.999 vs the exact forward). MLA already shrinks KV by
+  design, so quantizing it is lower priority; the GPU KV path is
+  future work.
 - R13 breadth (pending): more architectures (Qwen-MoE, DBRX) and
   tiny quants (ternary TQ1_0/TQ2_0 + remaining IQ, with GPU
   kernels), delegated to the CUDA/Vulkan hosts where model-dependent.

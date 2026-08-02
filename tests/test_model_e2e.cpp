@@ -1,3 +1,4 @@
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -90,7 +91,77 @@ std::string generate_text(locus::model::LlamaModel& model,
     return tok.decode(ids);
 }
 
+/**
+ * Teacher-forces `ids` through a cache of `kv_type` and returns the
+ * next-token logits after each position (one row per input token).
+ */
+std::vector<std::vector<float>> teacher_forced_logits(
+    locus::model::LlamaModel& model,
+    const std::vector<locus::tok::TokenId>& ids,
+    locus::kv::KvType kv_type) {
+    auto cache = model.make_cache(0, kv_type);
+    auto ws = model.make_workspace();
+    locus::kv::PagedKvCache::Seq seq;
+    std::vector<float> logits(model.hparams().n_vocab);
+    std::vector<std::vector<float>> out;
+    for (auto id : ids) {
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(id, cache, seq, ws, logits);
+        out.push_back(logits);
+    }
+    cache.release(seq);
+    return out;
+}
+
+/** Cosine similarity of two equal-length vectors. */
+double cosine(const std::vector<float>& a,
+              const std::vector<float>& b) {
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        dot += static_cast<double>(a[i]) * b[i];
+        na += static_cast<double>(a[i]) * a[i];
+        nb += static_cast<double>(b[i]) * b[i];
+    }
+    return dot / (std::sqrt(na) * std::sqrt(nb) + 1e-12);
+}
+
 }  // namespace
+
+TEST_CASE("quantized KV cache tracks the F32 forward", "[e2e][kv]") {
+    const std::string path = model_path();
+    if (!std::filesystem::exists(path)) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    // Quantized KV runs on the CPU attention path; force a CPU
+    // backend so forward() does not route to the GPU.
+    model.use_backend(*locus::backend::find_backend("scalar"));
+
+    if (model.make_cache().geometry().kv_dim % 32 != 0) {
+        SKIP("model kv_dim is not a multiple of the quant block");
+    }
+
+    const auto ids = tok.encode("Once upon a time there was a", true);
+    const auto f32 = teacher_forced_logits(model, ids,
+                                           locus::kv::KvType::kF32);
+    const auto q8 = teacher_forced_logits(model, ids,
+                                          locus::kv::KvType::kQ8);
+    const auto q4 = teacher_forced_logits(model, ids,
+                                          locus::kv::KvType::kQ4);
+
+    REQUIRE(q8.size() == f32.size());
+    for (std::size_t i = 0; i < f32.size(); ++i) {
+        // Q8 KV closely approximates the exact forward; Q4 is coarser
+        // (this fixture is a tiny 64-wide toy model, so 4-bit blocks
+        // are noticeably lossier) but still strongly correlated, and
+        // never better than Q8.
+        REQUIRE(cosine(f32[i], q8[i]) > 0.999);
+        REQUIRE(cosine(f32[i], q4[i]) > 0.90);
+        REQUIRE(cosine(f32[i], q8[i]) >= cosine(f32[i], q4[i]) - 1e-6);
+    }
+}
 
 TEST_CASE("greedy decode matches the llama.cpp golden output",
           "[e2e]") {

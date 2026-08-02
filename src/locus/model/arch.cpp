@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include "locus/model/gguf_load.hpp"
 
@@ -60,15 +61,55 @@ void llama_attention(const LlamaModel& m,
         static_cast<std::size_t>(hp.n_kv_heads) * hd;
     const std::uint32_t group = hp.n_heads / hp.n_kv_heads;
 
-    float* krow = cache.k(seq, l, pos);
-    float* vrow = cache.v(seq, l, pos);
     op.matvec(lay.wq, ws.xb, ws.q);
-    op.matvec(lay.wk, ws.xb, {krow, kv_dim});
-    op.matvec(lay.wv, ws.xb, {vrow, kv_dim});
     rope_norm(ws.q, hp.n_heads, hd, pos, hp.rope_freq_base,
               m.rope_factors());
-    rope_norm({krow, kv_dim}, hp.n_kv_heads, hd, pos,
-              hp.rope_freq_base, m.rope_factors());
+
+    // Quantized KV (DESIGN.md R14): compute this position's K/V into
+    // scratch, store it quantized, and dequant the layer's past rows
+    // into a transient matrix so the attention math below is
+    // arithmetically identical to the F32 zero-copy path.
+    std::vector<float> kmat, vmat;
+    const float* kbase = nullptr;
+    const float* vbase = nullptr;
+    std::size_t k_stride = kv_dim;
+    if (cache.quantized()) {
+        std::vector<float> kbuf(kv_dim), vbuf(kv_dim);
+        op.matvec(lay.wk, ws.xb, kbuf);
+        op.matvec(lay.wv, ws.xb, vbuf);
+        rope_norm(kbuf, hp.n_kv_heads, hd, pos, hp.rope_freq_base,
+                  m.rope_factors());
+        cache.store_row(seq, l, pos, false, kbuf);
+        cache.store_row(seq, l, pos, true, vbuf);
+        const std::size_t n = pos + 1;
+        kmat.resize(n * kv_dim);
+        vmat.resize(n * kv_dim);
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            cache.load_row(seq, l, t, false,
+                           {kmat.data() + t * kv_dim, kv_dim});
+            cache.load_row(seq, l, t, true,
+                           {vmat.data() + t * kv_dim, kv_dim});
+        }
+        kbase = kmat.data();
+        vbase = vmat.data();
+    } else {
+        float* krow = cache.k(seq, l, pos);
+        float* vrow = cache.v(seq, l, pos);
+        op.matvec(lay.wk, ws.xb, {krow, kv_dim});
+        op.matvec(lay.wv, ws.xb, {vrow, kv_dim});
+        rope_norm({krow, kv_dim}, hp.n_kv_heads, hd, pos,
+                  hp.rope_freq_base, m.rope_factors());
+    }
+    // In F32 mode rows live in the cache with a fixed per-position
+    // stride; a lambda hides the two layouts from the head loops.
+    auto krow_at = [&](std::uint32_t t) -> const float* {
+        return kbase ? kbase + static_cast<std::size_t>(t) * k_stride
+                     : cache.k(seq, l, t);
+    };
+    auto vrow_at = [&](std::uint32_t t) -> const float* {
+        return vbase ? vbase + static_cast<std::size_t>(t) * k_stride
+                     : cache.v(seq, l, t);
+    };
 
     for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
         const float* qh =
@@ -77,7 +118,7 @@ void llama_attention(const LlamaModel& m,
             static_cast<std::size_t>(h / group) * hd;
         std::span<float> att(ws.att.data(), pos + 1);
         for (std::uint32_t t = 0; t <= pos; ++t) {
-            const float* kt = cache.k(seq, l, t) + kvh;
+            const float* kt = krow_at(t) + kvh;
             float s = 0.0f;
             for (std::uint32_t i = 0; i < hd; ++i) {
                 s += qh[i] * kt[i];
@@ -91,7 +132,7 @@ void llama_attention(const LlamaModel& m,
             oh[i] = 0.0f;
         }
         for (std::uint32_t t = 0; t <= pos; ++t) {
-            const float* vt = cache.v(seq, l, t) + kvh;
+            const float* vt = vrow_at(t) + kvh;
             const float a = att[t];
             for (std::uint32_t i = 0; i < hd; ++i) {
                 oh[i] += a * vt[i];

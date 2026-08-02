@@ -122,9 +122,14 @@ class LlamaModel {
     /**
      * @param n_blocks Pool size in blocks; 0 sizes the pool for
      *     one full context window.
+     * @param kv_type KV storage precision (DESIGN.md R14). kF32 is
+     *     the default; kQ8/kQ4 shrink the resident cache and require
+     *     a CPU backend (GPU external KV storage is F32-only).
      * @returns A paged cache with this model's geometry.
      */
-    kv::PagedKvCache make_cache(std::uint32_t n_blocks = 0) const;
+    kv::PagedKvCache make_cache(
+        std::uint32_t n_blocks = 0,
+        kv::KvType kv_type = kv::KvType::kF32) const;
 
     /**
      * Runs one token at position seq.n_tokens, appending K/V to

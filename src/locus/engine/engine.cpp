@@ -13,7 +13,7 @@ Engine::Engine(const model::LlamaModel& m, tok::TokenId eos,
     : model_(m),
       eos_(eos),
       cfg_(cfg),
-      cache_(m.make_cache(cfg.n_blocks)),
+      cache_(m.make_cache(cfg.n_blocks, cfg.kv_type)),
       ws_(m.make_workspace()),
       logits_(m.hparams().n_vocab) {
     if (cfg_.prefix_cache) {

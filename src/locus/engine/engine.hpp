@@ -83,6 +83,10 @@ class Engine {
     struct Config {
         /** Pool size in blocks; 0 = one full context window. */
         std::uint32_t n_blocks = 0;
+        /** KV-cache storage precision (DESIGN.md R14). kF32 default;
+         * kQ8/kQ4 shrink the resident cache and require a CPU
+         * backend (GPU external KV storage is F32-only). */
+        kv::KvType kv_type = kv::KvType::kF32;
         /** Max prompt tokens prefetched per step across seqs. */
         std::uint32_t prefill_budget = 64;
         /** Decode headroom required at admission, in tokens. */
