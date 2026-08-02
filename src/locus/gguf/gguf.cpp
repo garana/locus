@@ -38,6 +38,7 @@ TypeTraits traits(TensorType t) {
         // kernels are separate work.
         case TensorType::kIQ2_XXS: return {256, 66};
         case TensorType::kIQ2_XS: return {256, 74};
+        case TensorType::kIQ2_S: return {256, 82};
         case TensorType::kIQ3_XXS: return {256, 98};
         case TensorType::kIQ1_S: return {256, 50};
         case TensorType::kIQ4_XS: return {256, 136};

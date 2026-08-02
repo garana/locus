@@ -506,6 +506,62 @@ __global__ void matvec_iq2_xs_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
+/** One IQ2_S super-block is 82 bytes: d + qs[64] + qh[8] + scales[8].
+ *  qs = 32 grid-index bytes then 32 sign bytes; qh adds 2 high index
+ *  bits per element (10-bit iq2s_grid index); signs are raw bytes.
+ *  `grid` = device iq2s_grid (u64). Matches dequant_block_iq2_s. */
+__global__ void matvec_iq2_s_kernel(const std::uint8_t* w,
+                                    const std::uint64_t* grid,
+                                    const float* x, float* out,
+                                    std::uint32_t rows,
+                                    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 82;
+    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
+                                      row_bytes;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
+                                            82;
+        const float d = ld_f16(blk);
+        const std::uint8_t* qh = blk + 66;
+        const std::uint8_t* scales = blk + 74;
+        const std::uint8_t* qsp = blk + 2;
+        const std::uint8_t* signs = blk + 2 + 32;
+        const float* xb = x + static_cast<std::size_t>(b) * 256;
+        float tmp[256];
+        float* y = tmp;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const float db0 =
+                d * (0.5f + (scales[ib32] & 0xf)) * 0.25f;
+            const float db1 =
+                d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const float dl = (l / 2 == 0) ? db0 : db1;
+                const std::uint32_t idx =
+                    qsp[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);
+                const std::uint8_t* g =
+                    reinterpret_cast<const std::uint8_t*>(grid + idx);
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = dl * g[j] *
+                           ((signs[l] & (1 << j)) ? -1.0f : 1.0f);
+                }
+                y += 8;
+            }
+            qsp += 4;
+            signs += 4;
+        }
+        for (int i = 0; i < 256; ++i) {
+            acc += tmp[i] * xb[i];
+        }
+    }
+    out[r] = acc;
+}
+
 /** One IQ3_XXS super-block is 98 bytes: d (f16) + qs[64] +
  *  scales_and_signs[32], 256 weights. Each 32-group picks 8 grid
  *  entries (4 u8 each) via qs and a sign byte; `grid` = device
@@ -1189,6 +1245,12 @@ const std::uint64_t* device_iq2xs_grid() {
     return d;
 }
 
+const std::uint64_t* device_iq2s_grid() {
+    static const auto* d = static_cast<const std::uint64_t*>(
+        upload_table(iq2s_grid, sizeof(iq2s_grid)));
+    return d;
+}
+
 /** Sign lookup shared by IQ2_XXS and IQ3_XXS. */
 const std::uint8_t* device_ksigns() {
     static const auto* d = static_cast<const std::uint8_t*>(
@@ -1213,6 +1275,7 @@ enum class Kind {
     kQ2_K,
     kIQ2_XXS,
     kIQ2_XS,
+    kIQ2_S,
     kIQ3_XXS,
     kIQ4_XS,
     kTQ1_0,
@@ -1272,6 +1335,10 @@ void launch_kernel(Kind kind, const void* dw,
         case Kind::kIQ2_XS:
             matvec_iq2_xs_kernel<<<blocks, threads>>>(
                 dwb, t.g64, t.ksigns, dxf, doutf, rows, cols);
+            break;
+        case Kind::kIQ2_S:
+            matvec_iq2_s_kernel<<<blocks, threads>>>(
+                dwb, t.g64, dxf, doutf, rows, cols);
             break;
         case Kind::kIQ3_XXS:
             matvec_iq3_xxs_kernel<<<blocks, threads>>>(
@@ -1365,6 +1432,9 @@ std::size_t device_weight_bytes(const Mat& w) {
         case gguf::TensorType::kIQ2_XS:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 256ull) * 74ull;
+        case gguf::TensorType::kIQ2_S:
+            return static_cast<std::size_t>(w.rows) *
+                   (w.cols / 256ull) * 82ull;
         case gguf::TensorType::kIQ3_XXS:
             return static_cast<std::size_t>(w.rows) *
                    (w.cols / 256ull) * 98ull;
@@ -1400,6 +1470,8 @@ Kind kind_for(gguf::TensorType t) {
             return Kind::kIQ2_XXS;
         case gguf::TensorType::kIQ2_XS:
             return Kind::kIQ2_XS;
+        case gguf::TensorType::kIQ2_S:
+            return Kind::kIQ2_S;
         case gguf::TensorType::kIQ3_XXS:
             return Kind::kIQ3_XXS;
         case gguf::TensorType::kIQ4_XS:
@@ -1490,6 +1562,10 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
                 t.g64 = device_iq2xs_grid();
                 t.ksigns = device_ksigns();
                 tables_ok = t.g64 != nullptr && t.ksigns != nullptr;
+                break;
+            case gguf::TensorType::kIQ2_S:
+                t.g64 = device_iq2s_grid();
+                tables_ok = t.g64 != nullptr;
                 break;
             case gguf::TensorType::kIQ3_XXS:
                 t.g32 = device_iq3xxs_grid();

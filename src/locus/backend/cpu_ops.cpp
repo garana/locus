@@ -443,6 +443,39 @@ void dequant_block_iq2_xs(const std::byte* blk, float* y) {
     }
 }
 
+/** IQ2_S (82 bytes): d | qs[64] | qh[8] | scales[8]. The 64 qs bytes
+ *  split into 32 grid-index low bytes then 32 sign bytes; qh supplies
+ *  2 high index bits per element (10-bit iq2s_grid index). Signs are
+ *  the raw sign bytes (bit j), not a ksigns lookup. Ports ggml
+ *  dequantize_row_iq2_s. */
+void dequant_block_iq2_s(const std::byte* blk, float* y) {
+    const float d = f16_to_f32(load_u16(blk));
+    const auto* qs = reinterpret_cast<const std::uint8_t*>(blk + 2);
+    const auto* qh = reinterpret_cast<const std::uint8_t*>(blk + 66);
+    const auto* scales =
+        reinterpret_cast<const std::uint8_t*>(blk + 74);
+    const std::uint8_t* qsp = qs;
+    const std::uint8_t* signs = qs + 32;
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+        const float db0 =
+            d * (0.5f + (scales[ib32] & 0xf)) * 0.25f;
+        const float db1 = d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+            const float dl = (l / 2 == 0) ? db0 : db1;
+            const auto* grid = reinterpret_cast<const std::uint8_t*>(
+                iq2s_grid +
+                (qsp[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)));
+            for (int j = 0; j < 8; ++j) {
+                y[j] = dl * grid[j] *
+                       ((signs[l] & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+            }
+            y += 8;
+        }
+        qsp += 4;
+        signs += 4;
+    }
+}
+
 /** TQ1_0 (54 bytes): qs[48] | qh[4] | d. Ternary (BitNet b1.58): each
  *  byte packs 5 base-3 digits (qs) or 4 (qh); digit n is recovered as
  *  ((byte*pow3[n]*3)>>8) in {0,1,2}, value (digit-1)*d in {-1,0,1}*d.
@@ -521,6 +554,8 @@ std::pair<std::size_t, BlockDequantFn> k_traits(
             return {66, &dequant_block_iq2_xxs};
         case gguf::TensorType::kIQ2_XS:
             return {74, &dequant_block_iq2_xs};
+        case gguf::TensorType::kIQ2_S:
+            return {82, &dequant_block_iq2_s};
         case gguf::TensorType::kIQ3_XXS:
             return {98, &dequant_block_iq3_xxs};
         case gguf::TensorType::kIQ1_S:
@@ -568,6 +603,7 @@ std::size_t row_bytes(const Mat& w) {
         case gguf::TensorType::kQ6_K:
         case gguf::TensorType::kIQ2_XXS:
         case gguf::TensorType::kIQ2_XS:
+        case gguf::TensorType::kIQ2_S:
         case gguf::TensorType::kIQ3_XXS:
         case gguf::TensorType::kIQ1_S:
         case gguf::TensorType::kIQ4_XS:

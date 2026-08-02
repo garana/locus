@@ -58,6 +58,7 @@ enum class TensorType : std::uint32_t {
     kIQ2_XS = 17,
     kIQ3_XXS = 18,
     kIQ1_S = 19,
+    kIQ2_S = 22,
     kIQ4_XS = 23,
     kTQ1_0 = 34,
     kTQ2_0 = 35,
