@@ -4,11 +4,13 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/kv/kv_quant.hpp"
+#include "locus/kv/paged_cache.hpp"
 
 using locus::kv::KvType;
 using locus::kv::kv_dequantize_row;
 using locus::kv::kv_quantize_row;
 using locus::kv::kv_row_bytes;
+using locus::kv::PagedKvCache;
 
 namespace {
 
@@ -92,4 +94,70 @@ TEST_CASE("kv quant handles a single dominant spike", "[kv]") {
     x[5] = 9.0f;
     const auto y = round_trip(x, KvType::kQ8);
     REQUIRE(std::fabs(y[5] - 9.0f) < 0.1f);
+}
+
+TEST_CASE("quantized cache wraps external GPU-mapped byte storage",
+          "[kv]") {
+    PagedKvCache::Geometry geom;
+    geom.n_layers = 2;
+    geom.kv_dim = 64;  // 2 blocks of 32
+    geom.block_tokens = 16;
+    geom.n_blocks = 4;
+    geom.kv_type = KvType::kQ8;
+
+    // Caller-owned byte buffer (stands in for a GPU-mapped pool).
+    std::vector<std::uint8_t> storage(PagedKvCache::pool_bytes(geom));
+    PagedKvCache cache(geom, storage.data());
+    REQUIRE(cache.quantized());
+    REQUIRE(cache.qpool_data() == storage.data());
+    // Strides are exposed for the backend/shader to index the pool.
+    REQUIRE(cache.q_row_bytes() == kv_row_bytes(64, KvType::kQ8));
+    REQUIRE(cache.q_layer_stride() ==
+            geom.block_tokens * 2 * cache.q_row_bytes());
+    REQUIRE(cache.q_block_stride() ==
+            geom.n_layers * cache.q_layer_stride());
+
+    // The CPU codec round-trips through the external buffer (no GPU
+    // needed to validate the host seam).
+    PagedKvCache::Seq seq;
+    REQUIRE(cache.ensure_capacity(seq, 1));
+    std::vector<float> k(64), v(64), out(64);
+    for (int i = 0; i < 64; ++i) {
+        k[i] = 0.1f * static_cast<float>(i - 32);
+        v[i] = -0.05f * static_cast<float>(i);
+    }
+    cache.store_row(seq, /*layer=*/1, /*pos=*/0, /*value=*/false, k);
+    cache.store_row(seq, 1, 0, true, v);
+    // The write landed in the caller's buffer, not an internal pool.
+    bool nonzero = false;
+    for (std::uint8_t b : storage) {
+        nonzero = nonzero || b != 0;
+    }
+    REQUIRE(nonzero);
+    cache.load_row(seq, 1, 0, false, out);
+    double err = 0.0;
+    for (int i = 0; i < 64; ++i) {
+        err = std::max(err, std::abs(double(out[i] - k[i])));
+    }
+    REQUIRE(err < 0.05);  // Q8 block round-trip
+    cache.release(seq);
+}
+
+TEST_CASE("byte and float external ctors reject the wrong kv_type",
+          "[kv]") {
+    PagedKvCache::Geometry q;
+    q.n_layers = 1;
+    q.kv_dim = 32;
+    q.block_tokens = 16;
+    q.n_blocks = 1;
+    q.kv_type = KvType::kQ4;
+    std::vector<float> f(PagedKvCache::pool_floats(q));
+    // A quantized geometry cannot take float external storage...
+    REQUIRE_THROWS_AS(PagedKvCache(q, f.data()), std::invalid_argument);
+
+    PagedKvCache::Geometry g = q;
+    g.kv_type = KvType::kF32;
+    std::vector<std::uint8_t> b(64);
+    // ...and an F32 geometry cannot take byte external storage.
+    REQUIRE_THROWS_AS(PagedKvCache(g, b.data()), std::invalid_argument);
 }

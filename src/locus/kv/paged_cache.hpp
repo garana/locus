@@ -58,10 +58,27 @@ class PagedKvCache {
      */
     PagedKvCache(const Geometry& geom, float* storage);
 
+    /**
+     * Quantized counterpart: wraps caller-provided GPU-mapped byte
+     * storage for a quantized geometry (so a Vulkan/CUDA backend can
+     * bind the KV pool and read/write it in-shader). `storage` must
+     * hold pool_bytes(geom) bytes and outlive the cache. Requires a
+     * quantized kv_type. The CPU codec (store_row/load_row) still
+     * works against it, so it is unit-testable without a GPU.
+     */
+    PagedKvCache(const Geometry& geom, std::uint8_t* storage);
+
     /** @returns Floats an F32 pool for this geometry occupies. */
     static std::size_t pool_floats(const Geometry& geom) {
         return static_cast<std::size_t>(geom.n_blocks) *
                geom.n_layers * geom.block_tokens * geom.kv_dim * 2;
+    }
+
+    /** @returns Bytes a quantized pool for this geometry occupies. */
+    static std::size_t pool_bytes(const Geometry& geom) {
+        return static_cast<std::size_t>(geom.n_blocks) *
+               geom.n_layers * geom.block_tokens * 2 *
+               kv_row_bytes(geom.kv_dim, geom.kv_type);
     }
 
     /** @returns true when K/V are stored quantized (not kF32). */
@@ -69,6 +86,14 @@ class PagedKvCache {
 
     /** @returns The F32 pool base address (for backend lookup). */
     const float* pool_data() const { return pool_ptr_; }
+
+    /** @returns The quantized pool base (for backend binding). */
+    const std::uint8_t* qpool_data() const { return qpool_ptr_; }
+
+    /** Byte strides of the quantized pool (for shader indexing). */
+    std::size_t q_row_bytes() const { return q_row_bytes_; }
+    std::size_t q_layer_stride() const { return q_layer_stride_; }
+    std::size_t q_block_stride() const { return q_block_stride_; }
 
     /**
      * Ensures seq can hold n_more positions past seq.n_tokens,
@@ -170,7 +195,10 @@ class PagedKvCache {
     std::size_t q_row_bytes_ = 0;     // one K or V row
     std::size_t q_layer_stride_ = 0;  // block_tokens * 2 * row_bytes
     std::size_t q_block_stride_ = 0;  // n_layers * q_layer_stride_
+    /** Owned quant storage (empty when external). */
     std::vector<std::uint8_t> qpool_;
+    /** Points at qpool_.data() or the external byte storage. */
+    std::uint8_t* qpool_ptr_ = nullptr;
 };
 
 }  // namespace locus::kv

@@ -29,6 +29,7 @@ PagedKvCache::PagedKvCache(const Geometry& geom)
         q_block_stride_ =
             static_cast<std::size_t>(geom.n_layers) * q_layer_stride_;
         qpool_.resize(q_block_stride_ * geom.n_blocks);
+        qpool_ptr_ = qpool_.data();
     } else {
         pool_.resize(block_stride_ * geom.n_blocks);
         pool_ptr_ = pool_.data();
@@ -39,11 +40,23 @@ PagedKvCache::PagedKvCache(const Geometry& geom, float* storage)
     : PagedKvCache(geom) {
     if (quantized()) {
         throw std::invalid_argument(
-            "external storage requires an F32 KV cache");
+            "float external storage requires an F32 KV cache");
     }
     pool_.clear();
     pool_.shrink_to_fit();
     pool_ptr_ = storage;
+}
+
+PagedKvCache::PagedKvCache(const Geometry& geom,
+                           std::uint8_t* storage)
+    : PagedKvCache(geom) {
+    if (!quantized()) {
+        throw std::invalid_argument(
+            "byte external storage requires a quantized KV cache");
+    }
+    qpool_.clear();
+    qpool_.shrink_to_fit();
+    qpool_ptr_ = storage;
 }
 
 bool PagedKvCache::ensure_capacity(Seq& seq, std::uint32_t n_more) {
@@ -98,8 +111,8 @@ bool PagedKvCache::fork(const Seq& parent, Seq& child) {
         }
         copy_id = *id;
         if (quantized()) {
-            std::memcpy(qpool_.data() + *id * q_block_stride_,
-                        qpool_.data() +
+            std::memcpy(qpool_ptr_ + *id * q_block_stride_,
+                        qpool_ptr_ +
                             parent.blocks[full] * q_block_stride_,
                         q_block_stride_);
         } else {
@@ -151,8 +164,7 @@ std::uint8_t* PagedKvCache::qrow(const Seq& seq, std::uint32_t layer,
     const std::size_t b = pos / geom_.block_tokens;
     const std::size_t in_block = pos % geom_.block_tokens;
     // Per layer: block_tokens K rows, then block_tokens V rows.
-    return const_cast<std::uint8_t*>(qpool_.data()) +
-           seq.blocks[b] * q_block_stride_ +
+    return qpool_ptr_ + seq.blocks[b] * q_block_stride_ +
            layer * q_layer_stride_ +
            (value ? q_layer_stride_ / 2 : 0) +
            in_block * q_row_bytes_;

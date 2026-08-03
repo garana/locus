@@ -347,6 +347,14 @@ kv::PagedKvCache LlamaModel::make_cache(
     geom.kv_dim = spec_->kv_dim(hp_);
     geom.block_tokens = 16;
     geom.kv_type = kv_type;
+    // The Vulkan full-GPU forward reads K/V in-shader and cannot yet
+    // decode the quantized layout (R14 #45); fail fast instead of
+    // silently returning wrong tokens. CPU/CUDA use the quant-aware
+    // llama_attention path, so they are fine.
+    if (kv_type != kv::KvType::kF32 && backend_->name == "vulkan") {
+        throw std::invalid_argument(
+            "quantized KV not yet supported on the vulkan backend");
+    }
     // Default pool covers min(n_ctx, 4096) tokens: long-context
     // models (128k+) would otherwise demand tens of GB up front.
     // Callers wanting more pass n_blocks explicitly.
