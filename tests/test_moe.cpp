@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -106,6 +107,46 @@ class ModelBuilder {
         return {span.begin(), span.end()};
     }
 
+    /**
+     * Assembles a qwen2moe image (gated shared expert + q/k/v bias).
+     * The caller adds token_embd/norms via common(), the attention
+     * biases, the routed experts, the shared expert, and the shared-
+     * expert gate; routed/shared FFN widths come from tensor shapes.
+     */
+    std::vector<std::byte> build_qwen2moe(std::uint32_t n_expert,
+                                          std::uint32_t n_used) {
+        GgufBuilder b;
+        b.header(tensors_.size(), 10)
+            .kv_string("general.architecture", "qwen2moe")
+            .kv_u32("qwen2moe.embedding_length", kEmbd)
+            .kv_u32("qwen2moe.block_count", 1)
+            .kv_u32("qwen2moe.attention.head_count", 2)
+            .kv_u32("qwen2moe.attention.head_count_kv", 2)
+            .kv_u32("qwen2moe.feed_forward_length", kFf)
+            .kv_u32("qwen2moe.context_length", 32)
+            .kv_f32("qwen2moe.attention.layer_norm_rms_epsilon",
+                    1e-5f)
+            .kv_u32("qwen2moe.expert_count", n_expert)
+            .kv_u32("qwen2moe.expert_used_count", n_used);
+        std::uint64_t offset = 0;
+        for (const auto& t : tensors_) {
+            b.tensor(t.name, t.dims, 0 /* F32 */, offset);
+            offset = (offset + t.data.size() * 4 + 31) & ~31ull;
+        }
+        b.pad();
+        for (const auto& t : tensors_) {
+            bytes_append(b,
+                         reinterpret_cast<const std::byte*>(
+                             t.data.data()),
+                         t.data.size() * 4);
+            while (b.bytes().size() % 32 != 0) {
+                b.zeros(1);
+            }
+        }
+        auto span = b.bytes();
+        return {span.begin(), span.end()};
+    }
+
   private:
     struct T {
         std::string name;
@@ -148,6 +189,49 @@ std::vector<float> run(const std::vector<std::byte>& image,
 
 constexpr std::uint32_t kE = ModelBuilder::kEmbd;
 constexpr std::uint32_t kF = ModelBuilder::kFf;
+
+/**
+ * A tiny qwen2moe image with a gated shared expert. `gate_scale`
+ * multiplies the shared-expert gate weights (so the sigmoid gate
+ * differs between builds); `zero_shared` zeroes the shared down
+ * projection so the shared expert output is exactly 0.
+ */
+std::vector<std::byte> qwen_image(float gate_scale, bool zero_shared) {
+    constexpr std::uint32_t kNe = 4;    // experts
+    constexpr std::uint32_t kFsh = 32;  // shared ff (distinct from kF)
+    ModelBuilder mb;
+    mb.common();  // token_embd, norms, attn_{q,k,v,output}.weight
+    // Qwen carries q/k/v projection bias (kv_dim == kEmbd here).
+    mb.tensor("blk.0.attn_q.bias", {kE}, weights(kE, 40));
+    mb.tensor("blk.0.attn_k.bias", {kE}, weights(kE, 41));
+    mb.tensor("blk.0.attn_v.bias", {kE}, weights(kE, 42));
+    // Router + routed experts (width kF).
+    mb.tensor("blk.0.ffn_gate_inp.weight", {kE, kNe},
+              weights(kE * kNe, 43));
+    mb.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, kNe},
+              weights(kE * kF * kNe, 44));
+    mb.tensor("blk.0.ffn_up_exps.weight", {kE, kF, kNe},
+              weights(kE * kF * kNe, 45));
+    mb.tensor("blk.0.ffn_down_exps.weight", {kF, kE, kNe},
+              weights(kF * kE * kNe, 46));
+    // Shared expert at a DISTINCT width (kFsh != kF).
+    mb.tensor("blk.0.ffn_gate_shexp.weight", {kE, kFsh},
+              weights(kE * kFsh, 47));
+    mb.tensor("blk.0.ffn_up_shexp.weight", {kE, kFsh},
+              weights(kE * kFsh, 48));
+    auto down = weights(kFsh * kE, 49);
+    if (zero_shared) {
+        std::fill(down.begin(), down.end(), 0.0f);
+    }
+    mb.tensor("blk.0.ffn_down_shexp.weight", {kFsh, kE}, down);
+    // Shared-expert gate [n_embd -> 1].
+    auto gate = weights(kE, 50);
+    for (auto& g : gate) {
+        g *= gate_scale;
+    }
+    mb.tensor("blk.0.ffn_gate_inp_shexp.weight", {kE, 1}, gate);
+    return mb.build_qwen2moe(kNe, 2);
+}
 
 }  // namespace
 
@@ -730,5 +814,32 @@ TEST_CASE("dequant-amortized batch matvec matches per-token "
             REQUIRE(got == ref);
         }
         unsetenv("LOCUS_THREADS");
+    }
+}
+
+TEST_CASE("qwen2moe gated shared expert scales only the shared "
+          "expert",
+          "[moe]") {
+    const std::vector<locus::tok::TokenId> toks = {2, 5, 1};
+
+    // With an active shared expert, changing the gate changes the
+    // output (the sigmoid gate is wired into the forward).
+    auto a = run(qwen_image(+8.0f, /*zero_shared=*/false), toks);
+    auto b = run(qwen_image(-8.0f, /*zero_shared=*/false), toks);
+    REQUIRE(a.size() == b.size());
+    bool differ = false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        differ = differ || std::fabs(a[i] - b[i]) > 1e-4f;
+    }
+    REQUIRE(differ);
+
+    // With the shared expert output forced to zero, the gate has no
+    // effect at all -- so it touches ONLY the shared expert, nothing
+    // in the routed/attention path.
+    auto c = run(qwen_image(+8.0f, /*zero_shared=*/true), toks);
+    auto d = run(qwen_image(-8.0f, /*zero_shared=*/true), toks);
+    REQUIRE(c.size() == d.size());
+    for (std::size_t i = 0; i < c.size(); ++i) {
+        REQUIRE(c[i] == Catch::Approx(d[i]).margin(1e-6));
     }
 }
