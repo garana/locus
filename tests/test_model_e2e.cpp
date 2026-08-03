@@ -312,6 +312,50 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
     REQUIRE(tok->decode(ids) == golden);
 }
 
+// Same qwen2moe golden with the CUDA backend live: attention is CPU
+// but the projection / expert matvecs offload to the GPU, so this
+// proves the new arch is token-exact with GPU matvec in the loop
+// (Q4_K on device). Runtime-gated on a CUDA device.
+TEST_CASE("qwen2moe golden holds under the CUDA backend",
+          "[e2e][qwen][cuda]") {
+    if (!locus::backend::cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    const std::string path = qwen_moe_path();
+    if (!std::filesystem::exists(path)) {
+        SKIP("Qwen-MoE model not present (9.5GB, gitignored)");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+    model.use_backend(*locus::backend::find_backend("cuda"));
+
+    auto cache = model.make_cache();
+    auto ws = model.make_workspace();
+    locus::kv::PagedKvCache::Seq seq;
+    std::vector<float> logits(model.hparams().n_vocab);
+    auto ids = tok->encode("Once upon a time", true);
+    for (auto id : ids) {
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(id, cache, seq, ws, logits);
+    }
+    for (int i = 0; i < 32; ++i) {
+        const auto next = locus::model::argmax(logits);
+        if (next == tok->eos_id()) {
+            break;
+        }
+        ids.push_back(next);
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(next, cache, seq, ws, logits);
+    }
+    cache.release(seq);
+    const std::string golden =
+        "Once upon a time, there was a little girl who loved to "
+        "play with her dolls. She would spend hours dressing them "
+        "up, brushing their hair, and playing with them. One";
+    REQUIRE(tok->decode(ids) == golden);
+}
+
 TEST_CASE("greedy decode matches the llama.cpp golden output",
           "[e2e]") {
     const std::string path = model_path();
