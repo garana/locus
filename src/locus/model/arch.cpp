@@ -541,6 +541,160 @@ std::uint32_t glm_dsa_kv_dim(const Hparams& hp) {
     return hp.kv_lora_rank + hp.qk_rope_dim + hp.idx_dim;
 }
 
+// ---- qwen2moe (Qwen1.5/2 MoE): GQA + q/k/v bias + gated shared
+// expert. Reuses the llama GQA attention math (a clone with bias
+// adds, so llama_attention stays untouched) and the shared MoE
+// forward (gated shared expert via Layer.gate_inp_shexp, wired in
+// model/llama.cpp). ----
+
+void qwen2moe_hparams(const gguf::GgufFile& g, const std::string&,
+                      Hparams& hp) {
+    hp.arch = Arch::kLlama;  // GQA attention + standard MoE forward
+    if (hp.n_heads == 0 || hp.n_embd % hp.n_heads != 0) {
+        throw gguf::Error("invalid head configuration");
+    }
+    hp.head_dim = hp.n_embd / hp.n_heads;
+    if (hp.n_kv_heads == 0 || hp.n_heads % hp.n_kv_heads != 0) {
+        throw gguf::Error("invalid kv head configuration");
+    }
+    // Routed / shared expert widths are absent from this GGUF's
+    // metadata (only feed_forward_length); take them from the expert
+    // tensor shapes (ne[1]) so the loader's shape checks pass.
+    const auto* ge = g.find_tensor("blk.0.ffn_gate_exps.weight");
+    const auto* gs = g.find_tensor("blk.0.ffn_gate_shexp.weight");
+    if (ge == nullptr || gs == nullptr) {
+        throw gguf::Error("qwen2moe: missing expert tensors");
+    }
+    hp.n_ff_exp = static_cast<std::uint32_t>(ge->ne[1]);    // routed
+    hp.n_ff_shexp = static_cast<std::uint32_t>(gs->ne[1]);  // shared
+    hp.n_expert_shared = 1;  // one gated shared expert
+    hp.expert_weights_norm = false;  // Qwen1.5-MoE: raw softmax probs
+                                     // (norm_topk_prob=false)
+    hp.kq_scale =
+        1.0f / std::sqrt(static_cast<float>(hp.head_dim));
+}
+
+void qwen2moe_attention_tensors(const gguf::GgufFile& g,
+                                const std::string& bp,
+                                const Hparams& hp,
+                                LlamaModel::Layer& lay) {
+    const std::uint32_t kv_dim = hp.n_kv_heads * hp.head_dim;
+    lay.wq = need_mat(g, bp + "attn_q.weight", hp.n_embd, hp.n_embd);
+    lay.wk = need_mat(g, bp + "attn_k.weight", hp.n_embd, kv_dim);
+    lay.wv = need_mat(g, bp + "attn_v.weight", hp.n_embd, kv_dim);
+    lay.wo = need_mat(g, bp + "attn_output.weight", hp.n_embd,
+                      hp.n_embd);
+    // Qwen2 carries q/k/v projection bias (no output bias).
+    lay.wq_bias = need_vec(g, bp + "attn_q.bias", hp.n_embd);
+    lay.wk_bias = need_vec(g, bp + "attn_k.bias", kv_dim);
+    lay.wv_bias = need_vec(g, bp + "attn_v.bias", kv_dim);
+}
+
+// Clone of llama_attention with q/k/v projection bias added right
+// after each projection (before RoPE), matching Qwen2. llama_attention
+// itself is left untouched.
+void qwen2moe_attention(const LlamaModel& m,
+                        const LlamaModel::Layer& lay,
+                        kv::PagedKvCache& cache,
+                        kv::PagedKvCache::Seq& seq,
+                        LlamaModel::Workspace& ws, std::uint32_t l,
+                        std::uint32_t pos) {
+    using namespace locus::backend;
+    const Hparams& hp = m.hparams();
+    const Ops& op = m.active_backend().ops;
+    const std::uint32_t hd = hp.head_dim;
+    const std::size_t kv_dim =
+        static_cast<std::size_t>(hp.n_kv_heads) * hd;
+    const std::uint32_t group = hp.n_heads / hp.n_kv_heads;
+    auto add_bias = [](std::span<float> d,
+                       std::span<const float> b) {
+        if (!b.empty()) {
+            for (std::size_t i = 0; i < d.size(); ++i) {
+                d[i] += b[i];
+            }
+        }
+    };
+
+    op.matvec(lay.wq, ws.xb, ws.q);
+    add_bias({ws.q.data(), static_cast<std::size_t>(hp.n_embd)},
+             lay.wq_bias);
+    rope_neox_yarn(ws.q, hp.n_heads, hd, pos, hp.rope_freq_base,
+                   Yarn{});  // Qwen2 uses NEOX rope, not interleaved
+
+    std::vector<float> kmat, vmat;
+    const float* kbase = nullptr;
+    const float* vbase = nullptr;
+    std::size_t k_stride = kv_dim;
+    if (cache.quantized()) {
+        std::vector<float> kbuf(kv_dim), vbuf(kv_dim);
+        op.matvec(lay.wk, ws.xb, kbuf);
+        op.matvec(lay.wv, ws.xb, vbuf);
+        add_bias(kbuf, lay.wk_bias);
+        add_bias(vbuf, lay.wv_bias);
+        rope_neox_yarn(kbuf, hp.n_kv_heads, hd, pos,
+                       hp.rope_freq_base, Yarn{});
+        cache.store_row(seq, l, pos, false, kbuf);
+        cache.store_row(seq, l, pos, true, vbuf);
+        const std::size_t n = pos + 1;
+        kmat.resize(n * kv_dim);
+        vmat.resize(n * kv_dim);
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            cache.load_row(seq, l, t, false,
+                           {kmat.data() + t * kv_dim, kv_dim});
+            cache.load_row(seq, l, t, true,
+                           {vmat.data() + t * kv_dim, kv_dim});
+        }
+        kbase = kmat.data();
+        vbase = vmat.data();
+    } else {
+        float* krow = cache.k(seq, l, pos);
+        float* vrow = cache.v(seq, l, pos);
+        op.matvec(lay.wk, ws.xb, {krow, kv_dim});
+        op.matvec(lay.wv, ws.xb, {vrow, kv_dim});
+        add_bias({krow, kv_dim}, lay.wk_bias);
+        add_bias({vrow, kv_dim}, lay.wv_bias);
+        rope_neox_yarn({krow, kv_dim}, hp.n_kv_heads, hd, pos,
+                       hp.rope_freq_base, Yarn{});
+    }
+    auto krow_at = [&](std::uint32_t t) -> const float* {
+        return kbase ? kbase + static_cast<std::size_t>(t) * k_stride
+                     : cache.k(seq, l, t);
+    };
+    auto vrow_at = [&](std::uint32_t t) -> const float* {
+        return vbase ? vbase + static_cast<std::size_t>(t) * k_stride
+                     : cache.v(seq, l, t);
+    };
+
+    for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
+        const float* qh =
+            ws.q.data() + static_cast<std::size_t>(h) * hd;
+        const std::size_t kvh =
+            static_cast<std::size_t>(h / group) * hd;
+        std::span<float> att(ws.att.data(), pos + 1);
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            const float* kt = krow_at(t) + kvh;
+            float s = 0.0f;
+            for (std::uint32_t i = 0; i < hd; ++i) {
+                s += qh[i] * kt[i];
+            }
+            att[t] = s * hp.kq_scale;
+        }
+        softmax_inplace(att);
+        float* oh =
+            ws.out.data() + static_cast<std::size_t>(h) * hd;
+        for (std::uint32_t i = 0; i < hd; ++i) {
+            oh[i] = 0.0f;
+        }
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            const float* vt = vrow_at(t) + kvh;
+            const float a = att[t];
+            for (std::uint32_t i = 0; i < hd; ++i) {
+                oh[i] += a * vt[i];
+            }
+        }
+    }
+}
+
 const ArchSpec kArchs[] = {
     {"llama",
      "Llama family (dense or Mixtral-style MoE, GQA)",
@@ -555,6 +709,11 @@ const ArchSpec kArchs[] = {
      "indexer beyond top_k tokens)",
      &glm_dsa_hparams, &glm_dsa_attention_tensors,
      &glm_dsa_attention, &glm_dsa_kv_dim},
+    {"qwen2moe",
+     "Qwen1.5/2 MoE (GQA + q/k/v bias, routed + gated shared "
+     "expert)",
+     &qwen2moe_hparams, &qwen2moe_attention_tensors,
+     &qwen2moe_attention, &llama_kv_dim},
 };
 
 }  // namespace

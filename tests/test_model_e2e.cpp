@@ -25,6 +25,11 @@ std::string llama32_path() {
            "/tests/models/llama-3.2-1b-q8_0.gguf";
 }
 
+std::string qwen_moe_path() {
+    return std::string(LOCUS_SOURCE_DIR) +
+           "/tests/models/Qwen1.5-MoE-A2.7B.Q4_K_M.gguf";
+}
+
 }  // namespace
 
 TEST_CASE("loads a real Llama-family GGUF model", "[e2e]") {
@@ -263,6 +268,48 @@ TEST_CASE("quantized KV cache tracks F32 under the Vulkan backend",
         REQUIRE(cosine(f32[i], q8[i]) >=
                 cosine(f32[i], q4[i]) - 1e-6);
     }
+}
+
+// #37: qwen2moe (Qwen1.5-MoE-A2.7B) end-to-end. Greedy decode must
+// reproduce the llama.cpp golden (llama-simple, same Q4_K_M GGUF)
+// token-exact -- validates the whole arch: GQA + q/k/v bias + NEOX
+// rope + norm_topk=false routing + the gated shared expert. BPE
+// (gpt2) tokenizer, so use tokenizer_from_gguf, not SpmTokenizer.
+TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
+          "[e2e][qwen]") {
+    const std::string path = qwen_moe_path();
+    if (!std::filesystem::exists(path)) {
+        SKIP("Qwen-MoE model not present (9.5GB, gitignored)");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    REQUIRE(g.get_string("general.architecture") == "qwen2moe");
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+
+    auto cache = model.make_cache();
+    auto ws = model.make_workspace();
+    locus::kv::PagedKvCache::Seq seq;
+    std::vector<float> logits(model.hparams().n_vocab);
+    auto ids = tok->encode("Once upon a time", true);
+    for (auto id : ids) {
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(id, cache, seq, ws, logits);
+    }
+    for (int i = 0; i < 32; ++i) {
+        const auto next = locus::model::argmax(logits);
+        if (next == tok->eos_id()) {
+            break;
+        }
+        ids.push_back(next);
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(next, cache, seq, ws, logits);
+    }
+    cache.release(seq);
+    const std::string golden =
+        "Once upon a time, there was a little girl who loved to "
+        "play with her dolls. She would spend hours dressing them "
+        "up, brushing their hair, and playing with them. One";
+    REQUIRE(tok->decode(ids) == golden);
 }
 
 TEST_CASE("greedy decode matches the llama.cpp golden output",
