@@ -7,6 +7,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/llama.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -161,6 +162,66 @@ TEST_CASE("quantized KV cache tracks the F32 forward", "[e2e][kv]") {
         REQUIRE(cosine(f32[i], q4[i]) > 0.90);
         REQUIRE(cosine(f32[i], q8[i]) >= cosine(f32[i], q4[i]) - 1e-6);
     }
+}
+
+// #43 validation slice: quant-KV is a CPU path, but CUDA offloads the
+// wk/wv/wq matvecs -- so this reruns the KV-precision comparison with
+// the CUDA backend live (GPU matvec in the loop) to prove quant-KV is
+// correct on real GPU hardware, and pins the resident-cache footprint
+// shrink (the point of quantizing KV). Runtime-gated on a CUDA device.
+TEST_CASE("quantized KV cache tracks F32 under the CUDA backend",
+          "[e2e][kv][cuda]") {
+    if (!locus::backend::cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    const std::string path = model_path();
+    if (!std::filesystem::exists(path)) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    model.use_backend(*locus::backend::find_backend("cuda"));
+
+    const auto geom = model.make_cache().geometry();
+    if (geom.kv_dim % 32 != 0) {
+        SKIP("model kv_dim is not a multiple of the quant block");
+    }
+
+    const auto ids = tok.encode("Once upon a time there was a", true);
+    const auto f32 = teacher_forced_logits(model, ids,
+                                           locus::kv::KvType::kF32);
+    const auto q8 = teacher_forced_logits(model, ids,
+                                          locus::kv::KvType::kQ8);
+    const auto q4 = teacher_forced_logits(model, ids,
+                                          locus::kv::KvType::kQ4);
+    REQUIRE(q8.size() == f32.size());
+    for (std::size_t i = 0; i < f32.size(); ++i) {
+        REQUIRE(cosine(f32[i], q8[i]) > 0.999);
+        REQUIRE(cosine(f32[i], q4[i]) > 0.90);
+        REQUIRE(cosine(f32[i], q8[i]) >= cosine(f32[i], q4[i]) - 1e-6);
+    }
+
+    // Footprint: quantized KV rows are much smaller than F32. F32 is
+    // 4 B/elem; Q8 ~34 B/32-block (f16 scale + 32 int8), Q4 ~18 B/
+    // 32-block (f16 scale + 32 nibbles) -> ~3.76x / ~7.1x on the KV
+    // bytes (the f16 scale is the only overhead vs 4x / 8x).
+    const std::size_t f32_row =
+        static_cast<std::size_t>(geom.kv_dim) * sizeof(float);
+    const std::size_t q8_row =
+        locus::kv::kv_row_bytes(geom.kv_dim, locus::kv::KvType::kQ8);
+    const std::size_t q4_row =
+        locus::kv::kv_row_bytes(geom.kv_dim, locus::kv::KvType::kQ4);
+    const double q8_ratio =
+        static_cast<double>(f32_row) / static_cast<double>(q8_row);
+    const double q4_ratio =
+        static_cast<double>(f32_row) / static_cast<double>(q4_row);
+    WARN("KV footprint (kv_dim="
+         << geom.kv_dim << "): F32 " << f32_row << " B/row, Q8 "
+         << q8_row << " B (" << q8_ratio << "x), Q4 " << q4_row
+         << " B (" << q4_ratio << "x)");
+    REQUIRE(q8_ratio > 3.5);
+    REQUIRE(q4_ratio > 6.5);
 }
 
 TEST_CASE("greedy decode matches the llama.cpp golden output",
