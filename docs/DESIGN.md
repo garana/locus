@@ -18,7 +18,11 @@ NVIDIA-only with a heavy Python toolchain; LightLLM/vLLM/SGLang have
 both but sit on a large Python package ecosystem (supply-chain risk).
 
 locus targets that intersection: llama.cpp's footprint with a
-LightLLM-class serving core.
+LightLLM-class serving core. See docs/COMPARISON.md for the
+engine-by-engine landscape, including AirLLM -- the closest neighbor
+on the bigger-than-RAM streaming thesis (it streams layers too, but
+one sequence at a time with no batching, so it is I/O-bound; locus
+amortizes the same streaming across a batch).
 
 ## 2. MVP thesis
 
