@@ -44,6 +44,9 @@ struct Hparams {
     std::uint32_t n_dense_lead = 0;
     /** MoE: per-expert FFN width (deepseek2; else n_ff). */
     std::uint32_t n_ff_exp = 0;
+    /** MoE: shared-expert FFN width when it differs from the routed
+     * width (qwen2moe); 0 falls back to n_ff_exp * n_expert_shared. */
+    std::uint32_t n_ff_shexp = 0;
     /** MoE: routed-expert weight multiplier. */
     float expert_weights_scale = 1.0f;
     /** MoE: renormalize the top-k weights. */
@@ -233,6 +236,9 @@ class LlamaModel {
     struct Layer {
         std::span<const float> attn_norm, ffn_norm;
         backend::Mat wq, wk, wv, wo;
+        /** Optional attention q/k/v biases (qwen2moe); empty spans
+         * on arches without them (llama/deepseek2/glm) -> no-op. */
+        std::span<const float> wq_bias, wk_bias, wv_bias;
         /** Dense FFN (unused when the layer is MoE). */
         backend::Mat w_gate, w_up, w_down;
         /** MoE router and expert tensors. */
@@ -240,6 +246,9 @@ class LlamaModel {
         ExpertMat gate_exps, up_exps, down_exps;
         /** MoE shared experts (deepseek2; fused matrices). */
         backend::Mat gate_shexp, up_shexp, down_shexp;
+        /** MoE gated shared expert (qwen2moe): [n_embd->1] logit;
+         * empty when the shared expert is ungated (deepseek2). */
+        backend::Mat gate_inp_shexp;
         /** MLA (deepseek2): latent projections and norms. The
          * decompression weights come fused (wkv_b) in older
          * conversions or split (wk_b/wv_b, k_b pre-transposed)

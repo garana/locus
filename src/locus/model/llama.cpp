@@ -223,7 +223,9 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
             }
             if (hp.n_expert_shared > 0) {
                 const std::uint32_t sh =
-                    hp.n_ff_exp * hp.n_expert_shared;
+                    hp.n_ff_shexp > 0
+                        ? hp.n_ff_shexp
+                        : hp.n_ff_exp * hp.n_expert_shared;
                 lay.gate_shexp =
                     need_mat(g, bp + "ffn_gate_shexp.weight",
                              hp.n_embd, sh);
@@ -233,6 +235,14 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
                 lay.down_shexp =
                     need_mat(g, bp + "ffn_down_shexp.weight",
                              sh, hp.n_embd);
+                // qwen2moe gates the shared expert by sigmoid of a
+                // 1-logit projection; absent on deepseek2 (ungated).
+                if (g.find_tensor(bp + "ffn_gate_inp_shexp.weight") !=
+                    nullptr) {
+                    lay.gate_inp_shexp = need_mat(
+                        g, bp + "ffn_gate_inp_shexp.weight",
+                        hp.n_embd, 1);
+                }
             }
         } else {
             lay.w_gate = need_mat(g, bp + "ffn_gate.weight",
@@ -317,7 +327,7 @@ LlamaModel::Workspace LlamaModel::make_workspace() const {
     ws.att.resize(hp_.n_ctx);
     const std::uint32_t ff = std::max(
         {hp_.n_ff, hp_.n_ff_exp,
-         hp_.n_ff_exp * hp_.n_expert_shared});
+         hp_.n_ff_exp * hp_.n_expert_shared, hp_.n_ff_shexp});
     ws.gate.resize(ff);
     ws.up.resize(ff);
     ws.out.resize(mla ? hp_.n_heads * hp_.v_head_dim
@@ -992,9 +1002,19 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
         }
     }
     if (hp_.n_expert_shared > 0) {
+        const std::uint32_t shexp_ff =
+            hp_.n_ff_shexp > 0 ? hp_.n_ff_shexp
+                               : n_ff * hp_.n_expert_shared;
+        // qwen2moe gates the shared output by sigmoid(w_gate . x);
+        // deepseek2 (no gate tensor) keeps the ungated 1.0 scale.
+        float g = 1.0f;
+        if (lay.gate_inp_shexp.rows > 0) {
+            float logit = 0.0f;
+            op.matvec(lay.gate_inp_shexp, ws.xb, {&logit, 1});
+            g = 1.0f / (1.0f + std::exp(-logit));
+        }
         swiglu_into_acc(lay.gate_shexp, lay.up_shexp,
-                        lay.down_shexp,
-                        n_ff * hp_.n_expert_shared, 1.0f);
+                        lay.down_shexp, shexp_ff, g);
     }
 }
 
@@ -1118,7 +1138,9 @@ void LlamaModel::moe_ffn_batch(const Layer& lay,
     // then into the residual -- byte-identical to moe_ffn's
     // moe_acc accumulation followed by x += moe_acc.
     std::vector<float> acc(E);
-    const std::uint32_t ffs = ff * hp_.n_expert_shared;
+    const std::uint32_t ffs =
+        hp_.n_ff_shexp > 0 ? hp_.n_ff_shexp
+                           : ff * hp_.n_expert_shared;
     for (std::uint32_t t = 0; t < n; ++t) {
         std::fill(acc.begin(), acc.end(), 0.0f);
         for (std::uint32_t s = 0;
@@ -1132,12 +1154,19 @@ void LlamaModel::moe_ffn_batch(const Layer& lay,
             }
         }
         if (hp_.n_expert_shared > 0) {
+            const float* xt_in =
+                xbf.data() + static_cast<std::size_t>(t) * E;
+            float g = 1.0f;
+            if (lay.gate_inp_shexp.rows > 0) {
+                float logit = 0.0f;
+                op.matvec(lay.gate_inp_shexp, {xt_in, E},
+                          {&logit, 1});
+                g = 1.0f / (1.0f + std::exp(-logit));
+            }
             swiglu(lay.gate_shexp, lay.up_shexp, lay.down_shexp,
-                   ffs,
-                   xbf.data() + static_cast<std::size_t>(t) * E,
-                   down.data());
+                   ffs, xt_in, down.data());
             for (std::uint32_t i = 0; i < E; ++i) {
-                acc[i] += down[i];
+                acc[i] += g * down[i];
             }
         }
         float* xt = x.data() + static_cast<std::size_t>(t) * E;
