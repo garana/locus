@@ -1,0 +1,77 @@
+#version 450
+
+// R14 #45: quantize one F32 K/V row into the GPU-mapped quantized
+// KV pool, in the block-of-32 layout the host seam sizes
+// (paged_cache q_row_bytes). Single-invocation: it writes a whole
+// row of up-to-unaligned bytes (Q8 block = 34B, Q4 = 18B) with
+// read-modify-write on the uint view, so parallel invocations
+// could race on shared words -- one thread per row avoids that.
+// Faithful Q8/Q4 (amax/127, max/-8), not bit-identical to the CPU
+// codec; the correctness bar is cosine vs F32-KV.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer SRC { float src[]; };
+layout(std430, binding = 1) buffer POOL { uint pool[]; };
+
+layout(push_constant) uniform PC {
+    uint kv_dim;     // elements in the row (multiple of 32)
+    uint dst_byte;   // byte offset of this row's start in the pool
+    uint kv_type;    // 1 = Q8, 2 = Q4
+    uint src_off;    // float offset of the row inside SRC
+} pc;
+
+void put_byte(uint bidx, uint val) {
+    uint w = bidx >> 2u;
+    uint sh = (bidx & 3u) * 8u;
+    pool[w] = (pool[w] & ~(0xffu << sh)) | ((val & 0xffu) << sh);
+}
+
+void put_scale(uint bidx, float d) {
+    uint h = packHalf2x16(vec2(d, 0.0)) & 0xffffu;
+    put_byte(bidx, h & 0xffu);
+    put_byte(bidx + 1u, (h >> 8u) & 0xffu);
+}
+
+void main() {
+    uint nblk = pc.kv_dim / 32u;
+    uint blk_bytes = (pc.kv_type == 1u) ? 34u : 18u;
+    for (uint b = 0u; b < nblk; ++b) {
+        uint base = pc.src_off + b * 32u;
+        uint dst = pc.dst_byte + b * blk_bytes;
+        if (pc.kv_type == 1u) {
+            // Q8: amax/127, 32 signed int8.
+            float amax = 0.0;
+            for (uint j = 0u; j < 32u; ++j) {
+                amax = max(amax, abs(src[base + j]));
+            }
+            float d = amax / 127.0;
+            float id = d != 0.0 ? 1.0 / d : 0.0;
+            put_scale(dst, d);
+            for (uint j = 0u; j < 32u; ++j) {
+                int q = int(round(src[base + j] * id));
+                q = clamp(q, -127, 127);
+                put_byte(dst + 2u + j, uint(q) & 0xffu);
+            }
+        } else {
+            // Q4: d = max-magnitude / -8, 16 bytes of nibble pairs
+            // (low = elem j, high = elem j+16), dequant (nib-8)*d.
+            float amax = 0.0, vmax = 0.0;
+            for (uint j = 0u; j < 32u; ++j) {
+                float v = src[base + j];
+                if (abs(v) > amax) { amax = abs(v); vmax = v; }
+            }
+            float d = vmax / -8.0;
+            float id = d != 0.0 ? 1.0 / d : 0.0;
+            put_scale(dst, d);
+            for (uint j = 0u; j < 16u; ++j) {
+                int lo = clamp(int(src[base + j] * id + 8.5),
+                               0, 15);
+                int hi = clamp(int(src[base + j + 16u] * id + 8.5),
+                               0, 15);
+                put_byte(dst + 2u + j,
+                         uint(lo) | (uint(hi) << 4u));
+            }
+        }
+    }
+}

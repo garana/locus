@@ -347,14 +347,6 @@ kv::PagedKvCache LlamaModel::make_cache(
     geom.kv_dim = spec_->kv_dim(hp_);
     geom.block_tokens = 16;
     geom.kv_type = kv_type;
-    // The Vulkan full-GPU forward reads K/V in-shader and cannot yet
-    // decode the quantized layout (R14 #45); fail fast instead of
-    // silently returning wrong tokens. CPU/CUDA use the quant-aware
-    // llama_attention path, so they are fine.
-    if (kv_type != kv::KvType::kF32 && backend_->name == "vulkan") {
-        throw std::invalid_argument(
-            "quantized KV not yet supported on the vulkan backend");
-    }
     // Default pool covers min(n_ctx, 4096) tokens: long-context
     // models (128k+) would otherwise demand tens of GB up front.
     // Callers wanting more pass n_blocks explicitly.
@@ -365,14 +357,28 @@ kv::PagedKvCache LlamaModel::make_cache(
             ? n_blocks
             : (cap_tokens + geom.block_tokens - 1) /
                   geom.block_tokens;
-    // Quantized KV uses its own byte pool; GPU external storage is
-    // F32-only, so only reach for alloc_kv in the default mode.
-    if (kv_type == kv::KvType::kF32 &&
-        backend_->ops.alloc_kv != nullptr) {
-        float* storage = backend_->ops.alloc_kv(
-            kv::PagedKvCache::pool_floats(geom));
-        if (storage != nullptr) {
-            return kv::PagedKvCache(geom, storage);
+    // GPU-mapped KV pool when the backend provides one (alloc_kv is
+    // set only for Vulkan today; it hands back unified-memory float*).
+    if (backend_->ops.alloc_kv != nullptr) {
+        if (kv_type == kv::KvType::kF32) {
+            float* storage = backend_->ops.alloc_kv(
+                kv::PagedKvCache::pool_floats(geom));
+            if (storage != nullptr) {
+                return kv::PagedKvCache(geom, storage);
+            }
+        } else {
+            // R14 #45: quantized GPU-mapped KV pool. Size the float
+            // allocation to cover pool_bytes and reinterpret to the
+            // byte pool the Vulkan attention shaders quantize into
+            // and read back (block-of-32 Q8/Q4 layout).
+            const std::size_t bytes =
+                kv::PagedKvCache::pool_bytes(geom);
+            float* storage =
+                backend_->ops.alloc_kv((bytes + 3) / 4);
+            if (storage != nullptr) {
+                return kv::PagedKvCache(
+                    geom, reinterpret_cast<std::uint8_t*>(storage));
+            }
         }
     }
     return kv::PagedKvCache(geom);

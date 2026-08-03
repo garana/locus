@@ -1,0 +1,99 @@
+#version 450
+
+// R14 #45: paged causal attention reading QUANTIZED K/V from the
+// GPU-mapped byte pool (block-of-32 Q8/Q4). Same two-pass structure
+// as attn_paged.comp; the only difference is K/V come through
+// deq() instead of a direct float load. POOL is bound as a uint
+// view of the byte pool. Strides here are BYTES.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer Q { float q[]; };
+layout(std430, binding = 1) readonly buffer POOL { uint pool[]; };
+layout(std430, binding = 2) readonly buffer TABLE { uint table[]; };
+layout(std430, binding = 3) buffer ATT { float att[]; };
+layout(std430, binding = 4) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint n_heads;
+    uint group;          // n_heads / n_kv_heads
+    uint head_dim;
+    uint kv_dim;         // n_kv_heads * head_dim
+    uint n_pos;          // positions to attend over (pos + 1)
+    uint block_tokens;
+    uint block_stride;   // BYTES per block
+    uint layer_offset;   // BYTES: layer * q_layer_stride
+    uint v_offset;       // BYTES: K row -> V row delta
+    uint row_bytes;      // BYTES of one K or V row
+    uint kv_type;        // 1 = Q8, 2 = Q4
+} pc;
+
+uint get_byte(uint bidx) {
+    return (pool[bidx >> 2u] >> ((bidx & 3u) * 8u)) & 0xffu;
+}
+
+float get_scale(uint boff) {
+    uint h = get_byte(boff) | (get_byte(boff + 1u) << 8u);
+    return unpackHalf2x16(h).x;
+}
+
+// Dequantized element i of the row that starts at byte `row`.
+float deq(uint row, uint i) {
+    uint blk = i / 32u;
+    uint j = i & 31u;
+    uint blk_bytes = (pc.kv_type == 1u) ? 34u : 18u;
+    uint boff = row + blk * blk_bytes;
+    float d = get_scale(boff);
+    if (pc.kv_type == 1u) {
+        uint b = get_byte(boff + 2u + j);
+        int q = (b < 128u) ? int(b) : int(b) - 256;
+        return float(q) * d;
+    } else {
+        uint b = get_byte(boff + 2u + (j & 15u));
+        uint nib = (j < 16u) ? (b & 0xfu) : (b >> 4u);
+        return (float(nib) - 8.0) * d;
+    }
+}
+
+uint kv_base(uint t) {
+    uint blk = table[t / pc.block_tokens];
+    return blk * pc.block_stride + pc.layer_offset +
+           (t % pc.block_tokens) * pc.row_bytes;
+}
+
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= pc.n_heads) {
+        return;
+    }
+    uint qh = h * pc.head_dim;
+    uint kvh = (h / pc.group) * pc.head_dim;
+    uint arow = h * pc.n_pos;
+    float scale = inversesqrt(float(pc.head_dim));
+
+    float mx = -3.4e38;
+    for (uint t = 0; t < pc.n_pos; ++t) {
+        uint kb = kv_base(t);
+        float s = 0.0;
+        for (uint i = 0; i < pc.head_dim; ++i) {
+            s += q[qh + i] * deq(kb, kvh + i);
+        }
+        s *= scale;
+        att[arow + t] = s;
+        mx = max(mx, s);
+    }
+    float sum = 0.0;
+    for (uint t = 0; t < pc.n_pos; ++t) {
+        float e = exp(att[arow + t] - mx);
+        att[arow + t] = e;
+        sum += e;
+    }
+    for (uint i = 0; i < pc.head_dim; ++i) {
+        float acc = 0.0;
+        for (uint t = 0; t < pc.n_pos; ++t) {
+            uint vb = kv_base(t) + pc.v_offset;
+            acc += att[arow + t] * deq(vb, kvh + i);
+        }
+        o[qh + i] = acc / sum;
+    }
+}

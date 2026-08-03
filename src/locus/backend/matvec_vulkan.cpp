@@ -323,7 +323,10 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
                     std::span<float> logits) {
     const auto& hp = m.hparams();
     State& s = state();
-    auto pool_it = s.kv_pools.find(cache.pool_data());
+    const bool quant = cache.quantized();
+    auto pool_it = s.kv_pools.find(
+        quant ? static_cast<const void*>(cache.qpool_data())
+              : static_cast<const void*>(cache.pool_data()));
     if (pool_it == s.kv_pools.end()) {
         return false;  // cache pool is not GPU-mapped
     }
@@ -333,6 +336,11 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
         return false;
     }
     const bool mla = hp.arch == model::Arch::kDeepseek2;
+    if (quant && mla) {
+        // MLA caches a single latent row (no separate K/V); its
+        // quantized read is a #45 follow-up. Fall back to CPU.
+        return false;
+    }
     for (const auto& l : m.layers()) {
         if (matvec_kernel(l.wo) == Kernel::kCount_) {
             return false;
@@ -367,6 +375,17 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
         geom.block_tokens * kv_dim * 2;
     const std::uint32_t block_stride =
         hp.n_layers * layer_stride;
+    // Quantized byte strides (R14 #45); unused on the F32 path.
+    const std::uint32_t q_row_b =
+        quant ? static_cast<std::uint32_t>(cache.q_row_bytes()) : 0;
+    const std::uint32_t q_layer_b =
+        quant ? static_cast<std::uint32_t>(cache.q_layer_stride())
+              : 0;
+    const std::uint32_t q_block_b =
+        quant ? static_cast<std::uint32_t>(cache.q_block_stride())
+              : 0;
+    const std::uint32_t kv_code =
+        geom.kv_type == kv::KvType::kQ8 ? 1u : 2u;
 
     const std::uint32_t rank = hp.kv_lora_rank;
     const std::uint32_t nope = hp.qk_nope_dim;
@@ -475,9 +494,6 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
                 s.rope_divisors(m.rope_factors(),
                                 hp.head_dim / 2);
             rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
-            rec_matvec(s, lay.wk, s.xb, pool, row_off, false);
-            rec_matvec(s, lay.wv, s.xb, pool,
-                       row_off + layer_stride / 2, false);
             {
                 const VulkanContext::Buffer bufs[] = {s.q,
                                                       divisors};
@@ -487,27 +503,83 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
                 s.ctx.dispatch(Kernel::kRope, bufs, push,
                                hp.n_heads);
             }
-            {
-                const VulkanContext::Buffer bufs[] = {pool,
-                                                      divisors};
-                const std::uint32_t push[] = {
-                    hp.n_kv_heads, hp.head_dim, pos,
-                    row_off,       hp.head_dim, base_bits,
-                    fbits(1.0f),   0,           0};
-                s.ctx.dispatch(Kernel::kRope, bufs, push,
-                               hp.n_kv_heads);
-            }
-            {
-                const VulkanContext::Buffer bufs[] = {
-                    s.q, pool, s.table, s.att, s.attout};
-                const std::uint32_t push[] = {
-                    hp.n_heads,   group,
-                    hp.head_dim,  kv_dim,
-                    pos + 1,      geom.block_tokens,
-                    block_stride, l * layer_stride,
-                    layer_stride / 2};
-                s.ctx.dispatch(Kernel::kAttnPaged, bufs, push,
-                               hp.n_heads);
+            if (!quant) {
+                rec_matvec(s, lay.wk, s.xb, pool, row_off, false);
+                rec_matvec(s, lay.wv, s.xb, pool,
+                           row_off + layer_stride / 2, false);
+                {
+                    const VulkanContext::Buffer bufs[] = {
+                        pool, divisors};
+                    const std::uint32_t push[] = {
+                        hp.n_kv_heads, hp.head_dim, pos,
+                        row_off,       hp.head_dim, base_bits,
+                        fbits(1.0f),   0,           0};
+                    s.ctx.dispatch(Kernel::kRope, bufs, push,
+                                   hp.n_kv_heads);
+                }
+                {
+                    const VulkanContext::Buffer bufs[] = {
+                        s.q, pool, s.table, s.att, s.attout};
+                    const std::uint32_t push[] = {
+                        hp.n_heads,   group,
+                        hp.head_dim,  kv_dim,
+                        pos + 1,      geom.block_tokens,
+                        block_stride, l * layer_stride,
+                        layer_stride / 2};
+                    s.ctx.dispatch(Kernel::kAttnPaged, bufs, push,
+                                   hp.n_heads);
+                }
+            } else {
+                // R14 #45: K/V into F32 scratch (reuse the FFN
+                // gate/up buffers -- free until this layer's FFN),
+                // rope K, quantize-store into the byte pool, then
+                // attention decodes the quantized rows in-shader.
+                rec_matvec(s, lay.wk, s.xb, s.gate, 0, false);
+                rec_matvec(s, lay.wv, s.xb, s.up, 0, false);
+                {
+                    const VulkanContext::Buffer bufs[] = {
+                        s.gate, divisors};
+                    const std::uint32_t push[] = {
+                        hp.n_kv_heads, hp.head_dim, pos,
+                        0,             hp.head_dim, base_bits,
+                        fbits(1.0f),   0,           0};
+                    s.ctx.dispatch(Kernel::kRope, bufs, push,
+                                   hp.n_kv_heads);
+                }
+                const std::uint32_t dst_k = block * q_block_b +
+                                            l * q_layer_b +
+                                            in_block * q_row_b;
+                const std::uint32_t dst_v =
+                    dst_k + geom.block_tokens * q_row_b;
+                {
+                    const VulkanContext::Buffer bufs[] = {s.gate,
+                                                          pool};
+                    const std::uint32_t push[] = {kv_dim, dst_k,
+                                                  kv_code, 0};
+                    s.ctx.dispatch(Kernel::kKvStoreQ, bufs, push,
+                                   1);
+                }
+                {
+                    const VulkanContext::Buffer bufs[] = {s.up,
+                                                          pool};
+                    const std::uint32_t push[] = {kv_dim, dst_v,
+                                                  kv_code, 0};
+                    s.ctx.dispatch(Kernel::kKvStoreQ, bufs, push,
+                                   1);
+                }
+                {
+                    const VulkanContext::Buffer bufs[] = {
+                        s.q, pool, s.table, s.att, s.attout};
+                    const std::uint32_t push[] = {
+                        hp.n_heads,   group,
+                        hp.head_dim,  kv_dim,
+                        pos + 1,      geom.block_tokens,
+                        q_block_b,    l * q_layer_b,
+                        geom.block_tokens * q_row_b,
+                        q_row_b,      kv_code};
+                    s.ctx.dispatch(Kernel::kAttnPagedQ, bufs, push,
+                                   hp.n_heads);
+                }
             }
         } else {
             const bool split = lay.wk_b.rows > 0;

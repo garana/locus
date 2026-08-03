@@ -224,6 +224,47 @@ TEST_CASE("quantized KV cache tracks F32 under the CUDA backend",
     REQUIRE(q4_ratio > 6.5);
 }
 
+// #45 validation: quantized KV read/write in the Vulkan attention
+// shaders (attn_paged_q + kv_store_q) off the GPU-mapped byte pool.
+// Uses llama-1b (real kv_dim=512, a multiple of 32; ~0.8GB, in-RAM
+// safe on the 4GB Pi) because the stories260K toy is too narrow to
+// exercise the GPU path. Runtime-gated on a usable Vulkan device.
+TEST_CASE("quantized KV cache tracks F32 under the Vulkan backend",
+          "[e2e][kv][vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+        "/tests/models/llama-3.2-1b-q4_k_m.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("llama-3.2-1b model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+
+    const auto geom = model.make_cache().geometry();
+    if (geom.kv_dim % 32 != 0) {
+        SKIP("model kv_dim is not a multiple of the quant block");
+    }
+    const auto ids =
+        tok->encode("Once upon a time there was a", true);
+    const auto f32 = teacher_forced_logits(model, ids,
+                                           locus::kv::KvType::kF32);
+    const auto q8 = teacher_forced_logits(model, ids,
+                                          locus::kv::KvType::kQ8);
+    const auto q4 = teacher_forced_logits(model, ids,
+                                          locus::kv::KvType::kQ4);
+    REQUIRE(q8.size() == f32.size());
+    for (std::size_t i = 0; i < f32.size(); ++i) {
+        REQUIRE(cosine(f32[i], q8[i]) > 0.999);
+        REQUIRE(cosine(f32[i], q4[i]) > 0.90);
+        REQUIRE(cosine(f32[i], q8[i]) >=
+                cosine(f32[i], q4[i]) - 1e-6);
+    }
+}
+
 TEST_CASE("greedy decode matches the llama.cpp golden output",
           "[e2e]") {
     const std::string path = model_path();

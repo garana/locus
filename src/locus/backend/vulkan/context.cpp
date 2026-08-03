@@ -11,7 +11,9 @@
 #include <vector>
 
 #include "attn_mla_spv.h"
+#include "attn_paged_q_spv.h"
 #include "attn_paged_spv.h"
+#include "kv_store_q_spv.h"
 #include "matvec_f16_spv.h"
 #include "matvec_q4_0_spv.h"
 #include "matvec_q5_0_spv.h"
@@ -81,6 +83,10 @@ const KernelDesc& kernel_desc(Kernel k) {
          36},
         {locus_attn_mla_spv, sizeof(locus_attn_mla_spv), 6,
          36},
+        {locus_attn_paged_q_spv, sizeof(locus_attn_paged_q_spv),
+         5, 44},
+        {locus_kv_store_q_spv, sizeof(locus_kv_store_q_spv), 2,
+         16},
     };
     return descs[static_cast<int>(k)];
 }

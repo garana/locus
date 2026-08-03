@@ -109,7 +109,8 @@ if(Vulkan_FOUND)
             matvec matvec_f16 matvec_q8_0 matvec_q4_0 matvec_q5_0
             matvec_t matvec_q4_k matvec_q5_k matvec_q6_k matvec_q2_k
             matvec_iq2_xxs matvec_iq3_xxs matvec_iq4_xs
-            rmsnorm rope silu_mul attn_paged attn_mla)
+            rmsnorm rope silu_mul attn_paged attn_mla
+            attn_paged_q kv_store_q)
         set(SHADER_HDRS "")
         foreach(shader ${LOCUS_SHADERS})
             set(SRC ${CMAKE_SOURCE_DIR}/src/locus/backend/vulkan/${shader}.comp)

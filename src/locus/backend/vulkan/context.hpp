@@ -26,6 +26,8 @@ enum class Kernel {
     kSiluMul,
     kAttnPaged,
     kAttnMla,
+    kAttnPagedQ,
+    kKvStoreQ,
     kCount_,
 };
 
