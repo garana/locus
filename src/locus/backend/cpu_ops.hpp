@@ -32,6 +32,19 @@ std::uint16_t f32_to_f16(float f);
 void rmsnorm(std::span<const float> x, std::span<const float> w,
              float eps, std::span<float> out);
 
+/**
+ * LayerNorm (weight-only, no bias): centers x by its mean, scales by
+ * 1/sqrt(variance + eps), then multiplies by weight, into out. Used
+ * by arches whose norm is LayerNorm rather than RMSNorm (e.g. DBRX).
+ *
+ * @param x Input activations.
+ * @param w Per-channel scale; same length as x.
+ * @param eps Stabilizer added to the variance.
+ * @param out Output; same length as x, may alias x.
+ */
+void layernorm(std::span<const float> x, std::span<const float> w,
+               float eps, std::span<float> out);
+
 /** In-place numerically-stable softmax over x. */
 void softmax_inplace(std::span<float> x);
 

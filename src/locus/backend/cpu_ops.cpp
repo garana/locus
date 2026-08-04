@@ -837,6 +837,26 @@ void rmsnorm(std::span<const float> x, std::span<const float> w,
     }
 }
 
+void layernorm(std::span<const float> x, std::span<const float> w,
+               float eps, std::span<float> out) {
+    assert(x.size() == w.size() && x.size() == out.size());
+    const float n = static_cast<float>(x.size());
+    float mean = 0.0f;
+    for (float v : x) {
+        mean += v;
+    }
+    mean /= n;
+    float var = 0.0f;
+    for (float v : x) {
+        const float d = v - mean;
+        var += d * d;
+    }
+    const float scale = 1.0f / std::sqrt(var / n + eps);
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        out[i] = (x[i] - mean) * scale * w[i];
+    }
+}
+
 void softmax_inplace(std::span<float> x) {
     float mx = x[0];
     for (float v : x) {

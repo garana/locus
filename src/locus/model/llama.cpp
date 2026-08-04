@@ -199,8 +199,14 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
         Layer lay;
         lay.attn_norm = need_vec(g, bp + "attn_norm.weight",
                                  hp.n_embd);
-        lay.ffn_norm =
-            need_vec(g, bp + "ffn_norm.weight", hp.n_embd);
+        // Most arches name the pre-FFN norm ffn_norm.weight; a few
+        // (dbrx: attn_output_norm.weight) use a different name and
+        // fill lay.ffn_norm in their load_attention, so load it here
+        // only when present.
+        if (g.find_tensor(bp + "ffn_norm.weight") != nullptr) {
+            lay.ffn_norm =
+                need_vec(g, bp + "ffn_norm.weight", hp.n_embd);
+        }
         spec->load_attention(g, bp, hp, lay);
         const bool moe_layer =
             hp.n_expert > 0 && l >= hp.n_dense_lead;
@@ -452,14 +458,14 @@ void LlamaModel::forward(tok::TokenId token,
             }
         }
 
-        rmsnorm(ws.x, lay.attn_norm, hp_.rms_eps, ws.xb);
+        apply_norm(ws.x, lay.attn_norm, hp_.rms_eps, ws.xb);
         spec_->attention(*this, lay, cache, seq, ws, l, pos);
         matvec_mt(op, lay.wo, ws.out, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
             ws.x[i] += ws.xb2[i];
         }
 
-        rmsnorm(ws.x, lay.ffn_norm, hp_.rms_eps, ws.xb);
+        apply_norm(ws.x, lay.ffn_norm, hp_.rms_eps, ws.xb);
         if (!lay.is_moe()) {
             matvec_mt(op, lay.w_gate, ws.xb, ws.gate);
             matvec_mt(op, lay.w_up, ws.xb, ws.up);
@@ -479,7 +485,7 @@ void LlamaModel::forward(tok::TokenId token,
         }
     }
 
-    rmsnorm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
+    apply_norm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
     matvec_mt(op, out_w_, ws.xb, logits);
     seq.n_tokens = pos + 1;
 }
@@ -571,7 +577,7 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
         // weights not yet batched here.
         for (std::uint32_t t = 0; t < n; ++t) {
             const std::size_t o = static_cast<std::size_t>(t) * E;
-            rmsnorm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
+            apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
                     ws.xb);
             spec_->attention(*this, lay, cache, seq, ws, l,
                              base + t);
@@ -585,7 +591,7 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
             for (std::uint32_t t = 0; t < n; ++t) {
                 const std::size_t o =
                     static_cast<std::size_t>(t) * E;
-                rmsnorm({x.data() + o, E}, lay.ffn_norm,
+                apply_norm({x.data() + o, E}, lay.ffn_norm,
                         hp_.rms_eps, {xbf.data() + o, E});
             }
             matvec_batch(op, lay.w_gate, xbf, gate, n);
@@ -608,7 +614,7 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
             for (std::uint32_t t = 0; t < n; ++t) {
                 const std::size_t o =
                     static_cast<std::size_t>(t) * E;
-                rmsnorm({x.data() + o, E}, lay.ffn_norm,
+                apply_norm({x.data() + o, E}, lay.ffn_norm,
                         hp_.rms_eps, {xbf.data() + o, E});
             }
             moe_ffn_batch(lay, l, xbf, x, n, ws);
@@ -620,7 +626,7 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
     if (all_logits) {
         const std::uint32_t V = hp_.n_vocab;
         for (std::uint32_t t = 0; t < n; ++t) {
-            rmsnorm({x.data() + static_cast<std::size_t>(t) * E, E},
+            apply_norm({x.data() + static_cast<std::size_t>(t) * E, E},
                     out_norm_, hp_.rms_eps, ws.xb);
             matvec_mt(op, out_w_, ws.xb,
                       logits.subspan(static_cast<std::size_t>(t) * V,
@@ -628,7 +634,7 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
         }
     } else {
         const std::size_t last = static_cast<std::size_t>(n - 1) * E;
-        rmsnorm({x.data() + last, E}, out_norm_, hp_.rms_eps, ws.xb);
+        apply_norm({x.data() + last, E}, out_norm_, hp_.rms_eps, ws.xb);
         matvec_mt(op, out_w_, ws.xb, logits);
     }
     seq.n_tokens = base + n;
@@ -688,7 +694,7 @@ void LlamaModel::forward_batch_decode(
         // Attention: each token against ITS OWN sequence's cache.
         for (std::uint32_t t = 0; t < n; ++t) {
             const std::size_t o = static_cast<std::size_t>(t) * E;
-            rmsnorm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
+            apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
                     ws.xb);
             spec_->attention(*this, lay, cache, *seqs[t], ws, l,
                              pos[t]);
@@ -699,7 +705,7 @@ void LlamaModel::forward_batch_decode(
         }
         for (std::uint32_t t = 0; t < n; ++t) {
             const std::size_t o = static_cast<std::size_t>(t) * E;
-            rmsnorm({x.data() + o, E}, lay.ffn_norm, hp_.rms_eps,
+            apply_norm({x.data() + o, E}, lay.ffn_norm, hp_.rms_eps,
                     {xbf.data() + o, E});
         }
         if (!lay.is_moe()) {
@@ -724,7 +730,7 @@ void LlamaModel::forward_batch_decode(
     // Every decode token needs logits.
     for (std::uint32_t t = 0; t < n; ++t) {
         const std::size_t o = static_cast<std::size_t>(t) * E;
-        rmsnorm({x.data() + o, E}, out_norm_, hp_.rms_eps, ws.xb);
+        apply_norm({x.data() + o, E}, out_norm_, hp_.rms_eps, ws.xb);
         matvec_mt(op, out_w_, ws.xb,
                   logits.subspan(static_cast<std::size_t>(t) * V,
                                  V));
@@ -929,6 +935,16 @@ std::vector<std::pair<std::uint32_t, float>> moe_select(
             e, router[e] / wsum * hp.expert_weights_scale);
     }
     return out;
+}
+
+void LlamaModel::apply_norm(std::span<const float> x,
+                            std::span<const float> w, float eps,
+                            std::span<float> out) const {
+    if (hp_.norm_type == NormType::kLayerNorm) {
+        backend::layernorm(x, w, eps, out);
+    } else {
+        backend::rmsnorm(x, w, eps, out);
+    }
 }
 
 void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,

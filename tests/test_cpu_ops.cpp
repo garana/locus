@@ -34,6 +34,40 @@ TEST_CASE("rmsnorm matches the closed form", "[ops]") {
     REQUIRE(out[1] == Approx(4.0f * 2.0f * scale));
 }
 
+TEST_CASE("layernorm matches the closed form", "[ops][layernorm]") {
+    const float x[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float w[] = {1.0f, 1.0f, 1.0f, 2.0f};
+    float out[4];
+    layernorm(x, w, 0.0f, out);
+    // mean 2.5, variance ((1.5^2)*2 + (0.5^2)*2)/4 = 1.25.
+    const float mean = 2.5f;
+    const float scale = 1.0f / std::sqrt(1.25f);
+    REQUIRE(out[0] == Approx((1.0f - mean) * scale));
+    REQUIRE(out[1] == Approx((2.0f - mean) * scale));
+    REQUIRE(out[2] == Approx((3.0f - mean) * scale));
+    REQUIRE(out[3] == Approx((4.0f - mean) * scale * 2.0f));
+    // Centered output sums to ~0 (before per-channel weights).
+    float uw[4];
+    const float ones[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    layernorm(x, ones, 0.0f, uw);
+    REQUIRE(uw[0] + uw[1] + uw[2] + uw[3] == Approx(0.0f).margin(1e-6));
+}
+
+TEST_CASE("layernorm differs from rmsnorm on a non-zero mean",
+          "[ops][layernorm]") {
+    // A constant-offset input: rmsnorm keeps the offset, layernorm
+    // removes it (mean-centering), so they must diverge.
+    const float x[] = {5.0f, 5.0f, 5.0f, 5.0f};
+    const float w[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float rn[4], ln[4];
+    rmsnorm(x, w, 1e-5f, rn);
+    layernorm(x, w, 1e-5f, ln);
+    for (float v : ln) {
+        REQUIRE(v == Approx(0.0f).margin(1e-3));  // centered -> ~0
+    }
+    REQUIRE(rn[0] > 0.9f);  // rms keeps the constant
+}
+
 TEST_CASE("softmax normalizes and orders", "[ops]") {
     float x[] = {0.0f, std::log(3.0f)};
     softmax_inplace(x);

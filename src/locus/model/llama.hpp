@@ -24,6 +24,12 @@ enum class GatingFunc : std::uint32_t {
     kSigmoid = 2,
 };
 
+/** Pre-attention / pre-FFN / final normalization kind. */
+enum class NormType {
+    kRmsNorm,    /**< default: llama/deepseek2/glm/qwen */
+    kLayerNorm,  /**< weight-only LayerNorm (dbrx) */
+};
+
 /** Llama-family hyperparameters read from GGUF metadata. */
 struct Hparams {
     Arch arch = Arch::kLlama;
@@ -74,6 +80,8 @@ struct Hparams {
     std::uint32_t n_ctx = 0;
     float rms_eps = 1e-5f;
     float rope_freq_base = 10000.0f;
+    /** Normalization kind for attn/ffn/output norms (default RMS). */
+    NormType norm_type = NormType::kRmsNorm;
 };
 
 /**
@@ -285,6 +293,12 @@ class LlamaModel {
     }
 
   private:
+    /** Applies the model's norm (RMS or LayerNorm per hp_.norm_type)
+     * to x scaled by w, into out; uses hp_.rms_eps. */
+    void apply_norm(std::span<const float> x,
+                    std::span<const float> w, float eps,
+                    std::span<float> out) const;
+
     void moe_ffn(const Layer& lay, Workspace& ws,
                  std::uint32_t layer) const;
 
