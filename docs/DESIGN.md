@@ -925,6 +925,48 @@ bigger model runs where it otherwise could not).
   hardware; not classic tensor parallelism -- shard the streamed
   weight window across devices.
 
+## R16: Q8_K activation-dot (ggml-exact quantized matvec)
+
+llama.cpp does not dot quantized weights against f32 activations: for
+every QK_K super-block weight type it first quantizes the activation
+row to Q8_K (block_q8_K = f32 d + int8 qs[256] + int16 bsums[16]) and
+integer-dots the two quantized operands, folding the min corrections
+through the bsums. locus originally dequantized the weight and dotted
+in f32, which is close but not bit-identical -- on coarse quants over
+many layers the argmax eventually drifts (DBRX IQ2_XXS tips ~token 27,
+while Q4_K/IQ1_S held). R16 closes that gap so locus's quantized
+matvec matches llama.cpp bit-for-bit, and opens the door to integer
+matvec throughput.
+
+- Scalar core (done): backend::matvec_q8k is an additive public entry
+  beside matvec(); it quantizes x to Q8_K once (quantize_activation_
+  q8k -- ggml's iscale = -127/max, the 2^23 nearest_int, per-16
+  bsums) and dispatches a per-type vec_dot_<t>_q8_k integer dot ported
+  verbatim from ggml_vec_dot_<t>_q8_K_generic. Covers all 14 QK_K
+  types: Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, TQ1_0/TQ2_0, IQ2_XXS/IQ2_XS/IQ2_S,
+  IQ3_XXS/IQ3_S, IQ1_S/IQ1_M, IQ4_XS. (IQ4_NL stays on its own
+  q8_0-block dot -- 32-element blocks, not QK_K.) Validated by a
+  round-trip test: matvec_q8k(x) == f32 dot of the same Q8_K-rounded
+  x, to 1e-3 -- bit-exact modulo summation order, no ggml link.
+- Additive staging: matvec() stays the pure f32 reference every SIMD/
+  GPU variant is parity-tested against, so the flip to Q8_K cannot
+  land until each backend has its own Q8_K integer dots -- otherwise
+  the cross-backend parity test (variant == scalar matvec) breaks.
+  Hence the per-backend kernels come first, the model-dispatch flip
+  last, coordinated across CPU/CUDA/Vulkan.
+- CUDA (in progress): matvec_cuda_q8k mirrors the CPU path -- host-
+  quantize x, upload the shared flat quants (d[nsb]/qs[n]/bsums[nsb*
+  16]) beside the pooled weight, one thread per row replays the scalar
+  aux/isum accumulation order so the float result is identical. All
+  four k-quants (Q2_K/Q4_K/Q5_K/Q6_K) ported; IQ/ternary next. sm_50
+  has no __dp4a, so the int8 products use plain integer madd (same
+  integer result). Parity test asserts matvec_cuda_q8k == matvec_q8k.
+- Remaining: CUDA IQ/ternary kernels; SSE4 (this host is SSE4-only,
+  no AVX2) integer dots per the vectorized-dot plan (one variant file
+  per ISA + sys::detect() dispatch, not one #ifdef template); then
+  wire matvec_q8k as the model default and extend the coarse-quant
+  goldens (DBRX 20 -> 32 tokens) in lockstep across backends.
+
 ## 8. Testing strategy
 
 - Catch2 unit tests per component (allocator, scheduler invariants,
