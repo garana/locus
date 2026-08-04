@@ -23,6 +23,7 @@ add_library(locus
     src/locus/engine/engine.cpp
     src/locus/engine/prefix_cache.cpp
     src/locus/auth/token_cache.cpp
+    src/locus/auth/helper_message.cpp
     src/locus/gguf/gguf.cpp
     src/locus/kv/block_allocator.cpp
     src/locus/kv/paged_cache.cpp

@@ -22,6 +22,7 @@ add_executable(locus_tests
     test_paged_cache.cpp
     test_kv_quant.cpp
     test_token_cache.cpp
+    test_helper_message.cpp
     test_prefix_cache.cpp
     test_grammar.cpp
     test_sampling.cpp
