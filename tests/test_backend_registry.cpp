@@ -307,7 +307,7 @@ TEST_CASE("cuda matvec matches scalar", "[backend]") {
 
 // R16 ggml-parity: the CUDA Q8_K-activation dot must match the scalar
 // matvec_q8k bit-for-bit (same host quant, same accumulation order).
-TEST_CASE("cuda q8k matvec matches scalar q8k (k-quants)",
+TEST_CASE("cuda q8k matvec matches scalar q8k (k-quants + IQ2)",
           "[backend]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
@@ -329,9 +329,11 @@ TEST_CASE("cuda q8k matvec matches scalar q8k (k-quants)",
     for (auto& v : x) {
         v = dist(rng);
     }
-    for (const Q& q : {Q{TT::kQ2_K, 84, 80, 82}, Q{TT::kQ4_K, 144, 0, 2},
-                       Q{TT::kQ5_K, 176, 0, 2},
-                       Q{TT::kQ6_K, 210, 208, -1}}) {
+    for (const Q& q :
+         {Q{TT::kQ2_K, 84, 80, 82}, Q{TT::kQ4_K, 144, 0, 2},
+          Q{TT::kQ5_K, 176, 0, 2}, Q{TT::kQ6_K, 210, 208, -1},
+          Q{TT::kIQ2_XXS, 66, 0, -1}, Q{TT::kIQ2_XS, 74, 0, -1},
+          Q{TT::kIQ2_S, 82, 0, -1}}) {
         std::vector<std::byte> w(static_cast<std::size_t>(rows) *
                                  (cols / 256) * q.bytes);
         for (auto& b : w) {

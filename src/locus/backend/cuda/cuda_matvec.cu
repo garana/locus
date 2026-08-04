@@ -526,6 +526,172 @@ __global__ void matvec_q2_k_q8k_kernel(
     out[r] = sumf;
 }
 
+/** IQ2_XXS x Q8_K integer dot; bit-exact port of vec_dot_iq2_xxs_q8_k
+ *  (grid+ksigns lookup, per-32 scale from aux1>>28, 0.125 factor). */
+__global__ void matvec_iq2_xxs_q8k_kernel(
+    const std::uint8_t* w, const std::uint64_t* grid,
+    const std::uint8_t* ksigns, const float* d_y,
+    const std::int8_t* qs_y, float* out, std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 66;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * row_bytes;
+    float sumf = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk =
+            row + static_cast<std::size_t>(b) * 66;
+        const float d = ld_f16(blk) * d_y[b];
+        const std::int8_t* q8 = qs_y + static_cast<std::size_t>(b) * 256;
+        std::int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const std::uint8_t* a = blk + 2 + 8 * ib32;
+            const std::uint32_t aux1 = ld_u32(a + 4);
+            const std::uint32_t ls = 2 * (aux1 >> 28) + 1;
+            std::int32_t sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint8_t* g =
+                    reinterpret_cast<const std::uint8_t*>(grid + a[l]);
+                const std::uint8_t signs =
+                    ksigns[(aux1 >> (7 * l)) & 127];
+                for (int j = 0; j < 8; ++j) {
+                    sumi += g[j] * q8[j] * ((signs & (1 << j)) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            bsum += sumi * static_cast<std::int32_t>(ls);
+        }
+        sumf += d * static_cast<float>(bsum);
+    }
+    out[r] = 0.125f * sumf;
+}
+
+/** IQ2_XS x Q8_K integer dot; bit-exact port of vec_dot_iq2_xs_q8_k
+ *  (u16 low-9 grid index + high-7 ksigns, two 4-bit sub-scales). */
+__global__ void matvec_iq2_xs_q8k_kernel(
+    const std::uint8_t* w, const std::uint64_t* grid,
+    const std::uint8_t* ksigns, const float* d_y,
+    const std::int8_t* qs_y, float* out, std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 74;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * row_bytes;
+    float sumf = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk =
+            row + static_cast<std::size_t>(b) * 74;
+        const float d = ld_f16(blk) * d_y[b];
+        const std::uint8_t* sc = blk + 66;
+        const std::int8_t* q8 = qs_y + static_cast<std::size_t>(b) * 256;
+        std::int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const std::uint32_t ls1 = 2 * (sc[ib32] & 0xf) + 1;
+            const std::uint32_t ls2 = 2 * (sc[ib32] >> 4) + 1;
+            std::int32_t sumi = 0;
+            for (int l = 0; l < 2; ++l) {
+                const std::uint8_t* p = blk + 2 + 2 * (4 * ib32 + l);
+                const std::uint16_t q =
+                    static_cast<std::uint16_t>(p[0] | (p[1] << 8));
+                const std::uint8_t* g =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (q & 511));
+                const std::uint8_t signs = ksigns[q >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    sumi += g[j] * q8[j] * ((signs & (1 << j)) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            bsum += sumi * static_cast<std::int32_t>(ls1);
+            sumi = 0;
+            for (int l = 2; l < 4; ++l) {
+                const std::uint8_t* p = blk + 2 + 2 * (4 * ib32 + l);
+                const std::uint16_t q =
+                    static_cast<std::uint16_t>(p[0] | (p[1] << 8));
+                const std::uint8_t* g =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (q & 511));
+                const std::uint8_t signs = ksigns[q >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    sumi += g[j] * q8[j] * ((signs & (1 << j)) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            bsum += sumi * static_cast<std::int32_t>(ls2);
+        }
+        sumf += d * static_cast<float>(bsum);
+    }
+    out[r] = 0.125f * sumf;
+}
+
+/** IQ2_S x Q8_K integer dot; bit-exact port of vec_dot_iq2_s_q8_k
+ *  (qh high-bit grid extension, signs read inline -- no ksigns). */
+__global__ void matvec_iq2_s_q8k_kernel(
+    const std::uint8_t* w, const std::uint64_t* grid, const float* d_y,
+    const std::int8_t* qs_y, float* out, std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 82;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * row_bytes;
+    float sumf = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk =
+            row + static_cast<std::size_t>(b) * 82;
+        const float d = ld_f16(blk) * d_y[b];
+        const std::uint8_t* qsp = blk + 2;
+        const std::uint8_t* signs = blk + 34;
+        const std::uint8_t* qh = blk + 66;
+        const std::uint8_t* sc = blk + 74;
+        const std::int8_t* q8 = qs_y + static_cast<std::size_t>(b) * 256;
+        std::int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const int ls1 = 1 + 2 * (sc[ib32] & 0xf);
+            const int ls2 = 1 + 2 * (sc[ib32] >> 4);
+            std::int32_t sumi1 = 0, sumi2 = 0;
+            for (int l = 0; l < 2; ++l) {
+                const std::uint8_t* g =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (qsp[l] |
+                                ((qh[ib32] << (8 - 2 * l)) & 0x300)));
+                for (int j = 0; j < 8; ++j) {
+                    sumi1 += q8[j] * g[j] *
+                             ((signs[l] & (1 << j)) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            for (int l = 2; l < 4; ++l) {
+                const std::uint8_t* g =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (qsp[l] |
+                                ((qh[ib32] << (8 - 2 * l)) & 0x300)));
+                for (int j = 0; j < 8; ++j) {
+                    sumi2 += q8[j] * g[j] *
+                             ((signs[l] & (1 << j)) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            bsum += ls1 * sumi1 + ls2 * sumi2;
+            qsp += 4;
+            signs += 4;
+        }
+        sumf += d * static_cast<float>(bsum);
+    }
+    out[r] = 0.125f * sumf;
+}
+
 /** One Q5_K super-block is 176 bytes: d,dmin (f16) + scales[12] +
  *  qh[32] + ql[128], 256 weights. The 5th bit comes from qh, its bit
  *  position advancing per 64-group (u1/u2). Fill order is sequential,
@@ -2107,6 +2273,9 @@ bool cuda_has_q8k_kernel(gguf::TensorType type) {
         case gguf::TensorType::kQ4_K:
         case gguf::TensorType::kQ5_K:
         case gguf::TensorType::kQ6_K:
+        case gguf::TensorType::kIQ2_XXS:
+        case gguf::TensorType::kIQ2_XS:
+        case gguf::TensorType::kIQ2_S:
             return true;
         default:
             return false;
@@ -2119,7 +2288,8 @@ bool cuda_has_q8k_kernel(gguf::TensorType type) {
  *  on any CUDA failure so the caller can fall back to scalar. Only call
  *  for a type cuda_has_q8k_kernel() accepts. */
 bool run_matvec_q8k(const Mat& w, std::span<const float> x,
-                    std::span<float> out, std::size_t w_bytes) {
+                    std::span<float> out, std::size_t w_bytes,
+                    const CudaTables& t) {
     const void* dw = pool().acquire(w.data, w_bytes);
     const bool pooled = dw != nullptr;
     DevBuf dw_demand;
@@ -2178,6 +2348,20 @@ bool run_matvec_q8k(const Mat& w, std::span<const float> x,
                     matvec_q2_k_q8k_kernel<<<blocks, threads>>>(
                         dwb, ddf, dqsb, dbsb, doutf, w.rows, w.cols);
                     break;
+                case gguf::TensorType::kIQ2_XXS:
+                    matvec_iq2_xxs_q8k_kernel<<<blocks, threads>>>(
+                        dwb, t.g64, t.ksigns, ddf, dqsb, doutf, w.rows,
+                        w.cols);
+                    break;
+                case gguf::TensorType::kIQ2_XS:
+                    matvec_iq2_xs_q8k_kernel<<<blocks, threads>>>(
+                        dwb, t.g64, t.ksigns, ddf, dqsb, doutf, w.rows,
+                        w.cols);
+                    break;
+                case gguf::TensorType::kIQ2_S:
+                    matvec_iq2_s_q8k_kernel<<<blocks, threads>>>(
+                        dwb, t.g64, ddf, dqsb, doutf, w.rows, w.cols);
+                    break;
                 default:
                     break;
             }
@@ -2201,7 +2385,30 @@ void matvec_cuda_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
     if (cuda_has_q8k_kernel(w.type) && w.cols % 256 == 0) {
         const std::size_t bytes = device_weight_bytes(w);
-        if (bytes > 0 && run_matvec_q8k(w, x, out, bytes)) {
+        // IQ kernels need their grid/sign tables uploaded; if an upload
+        // fails, fall through to scalar for this call.
+        CudaTables t;
+        bool tables_ok = true;
+        switch (w.type) {
+            case gguf::TensorType::kIQ2_XXS:
+                t.g64 = device_iq2xxs_grid();
+                t.ksigns = device_ksigns();
+                tables_ok = t.g64 != nullptr && t.ksigns != nullptr;
+                break;
+            case gguf::TensorType::kIQ2_XS:
+                t.g64 = device_iq2xs_grid();
+                t.ksigns = device_ksigns();
+                tables_ok = t.g64 != nullptr && t.ksigns != nullptr;
+                break;
+            case gguf::TensorType::kIQ2_S:
+                t.g64 = device_iq2s_grid();
+                tables_ok = t.g64 != nullptr;
+                break;
+            default:
+                break;  // k-quants need no tables
+        }
+        if (bytes > 0 && tables_ok &&
+            run_matvec_q8k(w, x, out, bytes, t)) {
             return;
         }
     }
