@@ -1110,6 +1110,80 @@ float vec_dot_q3_k_q8_k(const std::byte* row, const BlockQ8K* xq,
     return sumf;
 }
 
+/** TQ1_0 (54B) x Q8_K integer dot; ports ggml_vec_dot_tq1_0_q8_K_
+ *  generic. The activation is consumed in the ternary fill order. */
+float vec_dot_tq1_0_q8_k(const std::byte* row, const BlockQ8K* xq,
+                         std::size_t nb) {
+    static constexpr std::uint8_t pow3[6] = {1, 3, 9, 27, 81, 243};
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 54;
+        const auto* qs = reinterpret_cast<const std::uint8_t*>(blk);
+        const auto* qh =
+            reinterpret_cast<const std::uint8_t*>(blk + 48);
+        const float bd = f16_to_f32(load_u16(blk + 52));
+        const std::int8_t* q8 = xq[i].qs;
+        int sum = 0;
+        for (int j = 0; j < 32; j += 32) {
+            for (int l = 0; l < 5; ++l) {
+                for (int m = 0; m < 32; ++m) {
+                    const std::uint8_t q =
+                        static_cast<std::uint8_t>(qs[j + m] * pow3[l]);
+                    const std::uint16_t xi =
+                        (static_cast<std::uint16_t>(q) * 3) >> 8;
+                    sum += (xi - 1) * q8[j * 5 + l * 32 + m];
+                }
+            }
+        }
+        for (int j = 32; j < 48; j += 16) {
+            for (int l = 0; l < 5; ++l) {
+                for (int m = 0; m < 16; ++m) {
+                    const std::uint8_t q =
+                        static_cast<std::uint8_t>(qs[j + m] * pow3[l]);
+                    const std::uint16_t xi =
+                        (static_cast<std::uint16_t>(q) * 3) >> 8;
+                    sum += (xi - 1) * q8[j * 5 + l * 16 + m];
+                }
+            }
+        }
+        for (int l = 0; l < 4; ++l) {
+            for (int j = 0; j < 4; ++j) {
+                const std::uint8_t q =
+                    static_cast<std::uint8_t>(qh[j] * pow3[l]);
+                const std::uint16_t xi =
+                    (static_cast<std::uint16_t>(q) * 3) >> 8;
+                sum += (xi - 1) * q8[48 * 5 + l * 4 + j];
+            }
+        }
+        sumf += static_cast<float>(sum) * (bd * xq[i].d);
+    }
+    return sumf;
+}
+
+/** TQ2_0 (66B) x Q8_K integer dot; ports ggml_vec_dot_tq2_0_q8_K_
+ *  generic. */
+float vec_dot_tq2_0_q8_k(const std::byte* row, const BlockQ8K* xq,
+                         std::size_t nb) {
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 66;
+        const auto* qs = reinterpret_cast<const std::uint8_t*>(blk);
+        const float bd = f16_to_f32(load_u16(blk + 64));
+        const std::int8_t* q8 = xq[i].qs;
+        std::int32_t sumi = 0;
+        for (int j = 0; j < 64; j += 32) {
+            for (int l = 0; l < 4; ++l) {
+                for (int k = 0; k < 32; ++k) {
+                    sumi += q8[j * 4 + l * 32 + k] *
+                            (((qs[j + k] >> (l * 2)) & 3) - 1);
+                }
+            }
+        }
+        sumf += static_cast<float>(sumi) * (xq[i].d * bd);
+    }
+    return sumf;
+}
+
 float dot_k_quant(const Mat& w, const std::byte* row,
                   std::span<const float> x) {
     const auto [bytes, fn] = k_traits(w.type);
@@ -1480,7 +1554,8 @@ void matvec_q8k(const Mat& w, std::span<const float> x,
     using T = gguf::TensorType;
     const bool ported = (w.type == T::kQ2_K || w.type == T::kQ3_K ||
                          w.type == T::kQ4_K || w.type == T::kQ5_K ||
-                         w.type == T::kQ6_K) &&
+                         w.type == T::kQ6_K || w.type == T::kTQ1_0 ||
+                         w.type == T::kTQ2_0) &&
                         x.size() % 256 == 0;
     if (!ported) {  // types without a Q8_K dot yet: keep the f32 path
         matvec(w, x, out);
@@ -1507,6 +1582,12 @@ void matvec_q8k(const Mat& w, std::span<const float> x,
                 break;
             case T::kQ6_K:
                 out[r] = vec_dot_q6_k_q8_k(row, xq.data(), nb);
+                break;
+            case T::kTQ1_0:
+                out[r] = vec_dot_tq1_0_q8_k(row, xq.data(), nb);
+                break;
+            case T::kTQ2_0:
+                out[r] = vec_dot_tq2_0_q8_k(row, xq.data(), nb);
                 break;
             default:
                 break;

@@ -523,7 +523,8 @@ TEST_CASE("Q8_K matvec matches the f32 dot of the Q8_K activation "
     const std::vector<float> xq = q8k_roundtrip(x);
     for (TensorType t : {TensorType::kQ2_K, TensorType::kQ3_K,
                          TensorType::kQ4_K, TensorType::kQ5_K,
-                         TensorType::kQ6_K}) {
+                         TensorType::kQ6_K, TensorType::kTQ1_0,
+                         TensorType::kTQ2_0}) {
         std::vector<std::byte> w;
         for (std::uint32_t r = 0; r < rows; ++r) {
             auto row = k_quant_row(
