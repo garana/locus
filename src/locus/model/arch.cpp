@@ -695,6 +695,148 @@ void qwen2moe_attention(const LlamaModel& m,
     }
 }
 
+// ---- dbrx (Databricks DBRX): GQA with a FUSED qkv projection +
+// clip_qkv clamp, LayerNorm (weight-only, via the norm-type seam),
+// and fine-grained MoE (16 experts / 4 active, no shared expert).
+// Attention is a new fn (fused split + clamp + NEOX rope); the norm
+// dispatch + gated-shexp-less MoE are the shared forward. ----
+
+void dbrx_hparams(const gguf::GgufFile& g, const std::string& p,
+                  Hparams& hp) {
+    hp.arch = Arch::kLlama;  // GQA attention + standard MoE forward
+    if (hp.n_heads == 0 || hp.n_embd % hp.n_heads != 0) {
+        throw gguf::Error("invalid head configuration");
+    }
+    hp.head_dim = hp.n_embd / hp.n_heads;
+    if (hp.n_kv_heads == 0 || hp.n_heads % hp.n_kv_heads != 0) {
+        throw gguf::Error("invalid kv head configuration");
+    }
+    hp.n_ff_exp = hp.n_ff;         // expert width = feed_forward_length
+    hp.n_expert_shared = 0;        // no shared expert
+    hp.expert_weights_norm = true;  // DBRX renormalizes the top-k
+    hp.norm_type = NormType::kLayerNorm;  // DBRX uses LayerNorm
+    hp.rms_eps =
+        get_float(g, p + "attention.layer_norm_epsilon", 1e-5f);
+    hp.kq_scale =
+        1.0f / std::sqrt(static_cast<float>(hp.head_dim));
+}
+
+void dbrx_attention_tensors(const gguf::GgufFile& g,
+                            const std::string& bp,
+                            const Hparams& hp,
+                            LlamaModel::Layer& lay) {
+    const std::uint32_t kv_dim = hp.n_kv_heads * hp.head_dim;
+    // Fused Wqkv [n_embd -> n_embd + 2*kv_dim]; held in wq, split at
+    // compute time (wk/wv stay empty). No projection bias.
+    lay.wq = need_mat(g, bp + "attn_qkv.weight", hp.n_embd,
+                      hp.n_embd + 2 * kv_dim);
+    lay.wo = need_mat(g, bp + "attn_output.weight", hp.n_embd,
+                      hp.n_embd);
+    // DBRX names the pre-MoE norm attn_output_norm (vs ffn_norm);
+    // attn_norm + output_norm load generically by common name.
+    lay.ffn_norm =
+        need_vec(g, bp + "attn_output_norm.weight", hp.n_embd);
+}
+
+// Fused-QKV GQA attention with clip_qkv clamp and NEOX rope. One
+// matvec produces [q|k|v], clamped to +/-8 (DBRX clamp_kqv), then
+// split; the rest mirrors llama_attention. llama_attention untouched.
+void dbrx_attention(const LlamaModel& m,
+                    const LlamaModel::Layer& lay,
+                    kv::PagedKvCache& cache,
+                    kv::PagedKvCache::Seq& seq,
+                    LlamaModel::Workspace& ws, std::uint32_t l,
+                    std::uint32_t pos) {
+    using namespace locus::backend;
+    const Hparams& hp = m.hparams();
+    const Ops& op = m.active_backend().ops;
+    const std::uint32_t hd = hp.head_dim;
+    const std::size_t kv_dim =
+        static_cast<std::size_t>(hp.n_kv_heads) * hd;
+    const std::size_t q_dim =
+        static_cast<std::size_t>(hp.n_heads) * hd;
+    const std::uint32_t group = hp.n_heads / hp.n_kv_heads;
+    constexpr float kClamp = 8.0f;  // DBRX clamp_kqv (gguf-confirmed)
+    const float rb = hp.rope_freq_base;
+
+    std::vector<float> qkv(q_dim + 2 * kv_dim);
+    op.matvec(lay.wq, ws.xb, qkv);  // fused q|k|v
+    for (float& v : qkv) {
+        v = std::clamp(v, -kClamp, kClamp);
+    }
+    std::copy(qkv.begin(), qkv.begin() + q_dim, ws.q.begin());
+    rope_neox_yarn(ws.q, hp.n_heads, hd, pos, rb, Yarn{});
+    const float* ksrc = qkv.data() + q_dim;
+    const float* vsrc = qkv.data() + q_dim + kv_dim;
+
+    std::vector<float> kmat, vmat;
+    const float* kbase = nullptr;
+    const float* vbase = nullptr;
+    const std::size_t k_stride = kv_dim;
+    if (cache.quantized()) {
+        std::vector<float> kbuf(ksrc, ksrc + kv_dim);
+        std::vector<float> vbuf(vsrc, vsrc + kv_dim);
+        rope_neox_yarn(kbuf, hp.n_kv_heads, hd, pos, rb, Yarn{});
+        cache.store_row(seq, l, pos, false, kbuf);
+        cache.store_row(seq, l, pos, true, vbuf);
+        const std::size_t n = pos + 1;
+        kmat.resize(n * kv_dim);
+        vmat.resize(n * kv_dim);
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            cache.load_row(seq, l, t, false,
+                           {kmat.data() + t * kv_dim, kv_dim});
+            cache.load_row(seq, l, t, true,
+                           {vmat.data() + t * kv_dim, kv_dim});
+        }
+        kbase = kmat.data();
+        vbase = vmat.data();
+    } else {
+        float* krow = cache.k(seq, l, pos);
+        float* vrow = cache.v(seq, l, pos);
+        std::copy(ksrc, ksrc + kv_dim, krow);
+        std::copy(vsrc, vsrc + kv_dim, vrow);
+        rope_neox_yarn({krow, kv_dim}, hp.n_kv_heads, hd, pos, rb,
+                       Yarn{});
+    }
+    auto krow_at = [&](std::uint32_t t) -> const float* {
+        return kbase ? kbase + static_cast<std::size_t>(t) * k_stride
+                     : cache.k(seq, l, t);
+    };
+    auto vrow_at = [&](std::uint32_t t) -> const float* {
+        return vbase ? vbase + static_cast<std::size_t>(t) * k_stride
+                     : cache.v(seq, l, t);
+    };
+
+    for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
+        const float* qh =
+            ws.q.data() + static_cast<std::size_t>(h) * hd;
+        const std::size_t kvh =
+            static_cast<std::size_t>(h / group) * hd;
+        std::span<float> att(ws.att.data(), pos + 1);
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            const float* kt = krow_at(t) + kvh;
+            float s = 0.0f;
+            for (std::uint32_t i = 0; i < hd; ++i) {
+                s += qh[i] * kt[i];
+            }
+            att[t] = s * hp.kq_scale;
+        }
+        softmax_inplace(att);
+        float* oh =
+            ws.out.data() + static_cast<std::size_t>(h) * hd;
+        for (std::uint32_t i = 0; i < hd; ++i) {
+            oh[i] = 0.0f;
+        }
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            const float* vt = vrow_at(t) + kvh;
+            const float a = att[t];
+            for (std::uint32_t i = 0; i < hd; ++i) {
+                oh[i] += a * vt[i];
+            }
+        }
+    }
+}
+
 const ArchSpec kArchs[] = {
     {"llama",
      "Llama family (dense or Mixtral-style MoE, GQA)",
@@ -714,6 +856,11 @@ const ArchSpec kArchs[] = {
      "expert)",
      &qwen2moe_hparams, &qwen2moe_attention_tensors,
      &qwen2moe_attention, &llama_kv_dim},
+    {"dbrx",
+     "DBRX (GQA, fused QKV + clip_qkv, LayerNorm, fine-grained "
+     "MoE 16x/4)",
+     &dbrx_hparams, &dbrx_attention_tensors, &dbrx_attention,
+     &llama_kv_dim},
 };
 
 }  // namespace

@@ -30,6 +30,11 @@ std::string qwen_moe_path() {
            "/tests/models/Qwen1.5-MoE-A2.7B.Q4_K_M.gguf";
 }
 
+std::string dbrx_path() {
+    return std::string(LOCUS_SOURCE_DIR) +
+           "/tests/models/dbrx-instruct-16x12b-iq2_xxs.gguf";
+}
+
 }  // namespace
 
 TEST_CASE("loads a real Llama-family GGUF model", "[e2e]") {
@@ -353,6 +358,48 @@ TEST_CASE("qwen2moe golden holds under the CUDA backend",
         "Once upon a time, there was a little girl who loved to "
         "play with her dolls. She would spend hours dressing them "
         "up, brushing their hair, and playing with them. One";
+    REQUIRE(tok->decode(ids) == golden);
+}
+
+// #50: DBRX end-to-end. Validates the arch (fused QKV + clip_qkv,
+// LayerNorm, NEOX rope, fine-grained MoE 16x/4 no-shared) against the
+// llama.cpp golden. 20 tokens: locus does an f32-activation dot while
+// llama.cpp quantizes activations to Q8_K, so on this 2-bit (IQ2_XXS)
+// model the argmax tips ~token 27; 20 is comfortably exact and pins
+// the arch. BPE (gpt2 fallback) tokenizer.
+TEST_CASE("dbrx greedy decode matches the llama.cpp golden",
+          "[e2e][dbrx]") {
+    const std::string path = dbrx_path();
+    if (!std::filesystem::exists(path)) {
+        SKIP("DBRX model not present (32GB, gitignored)");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    REQUIRE(g.get_string("general.architecture") == "dbrx");
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+
+    auto cache = model.make_cache();
+    auto ws = model.make_workspace();
+    locus::kv::PagedKvCache::Seq seq;
+    std::vector<float> logits(model.hparams().n_vocab);
+    auto ids = tok->encode("Once upon a time", true);
+    for (auto id : ids) {
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(id, cache, seq, ws, logits);
+    }
+    for (int i = 0; i < 20; ++i) {
+        const auto next = locus::model::argmax(logits);
+        if (next == tok->eos_id()) {
+            break;
+        }
+        ids.push_back(next);
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(next, cache, seq, ws, logits);
+    }
+    cache.release(seq);
+    const std::string golden =
+        "Once upon a time, there was a magical land called the "
+        "Internet. The Internet was a magical land because it was a";
     REQUIRE(tok->decode(ids) == golden);
 }
 
