@@ -525,7 +525,8 @@ TEST_CASE("Q8_K matvec matches the f32 dot of the Q8_K activation "
                          TensorType::kQ4_K, TensorType::kQ5_K,
                          TensorType::kQ6_K, TensorType::kTQ1_0,
                          TensorType::kTQ2_0, TensorType::kIQ2_XXS,
-                         TensorType::kIQ2_XS, TensorType::kIQ2_S}) {
+                         TensorType::kIQ2_XS, TensorType::kIQ2_S,
+                         TensorType::kIQ3_XXS, TensorType::kIQ3_S}) {
         std::vector<std::byte> w;
         for (std::uint32_t r = 0; r < rows; ++r) {
             auto row = k_quant_row(

@@ -1324,6 +1324,115 @@ float vec_dot_iq2_s_q8_k(const std::byte* row, const BlockQ8K* xq,
     return 0.125f * sumf;
 }
 
+/** IQ3_XXS (98B) x Q8_K integer dot; ports ggml_vec_dot_iq3_xxs_q8_K_
+ *  generic (0.25 block factor). */
+float vec_dot_iq3_xxs_q8_k(const std::byte* row, const BlockQ8K* xq,
+                           std::size_t nb) {
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 98;
+        const float d = f16_to_f32(load_u16(blk)) * xq[i].d;
+        const auto* q3 = reinterpret_cast<const std::uint8_t*>(blk + 2);
+        const auto* gas =
+            reinterpret_cast<const std::uint8_t*>(blk + 2 + 64);
+        const std::int8_t* q8 = xq[i].qs;
+        std::int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            std::uint32_t aux32;
+            std::memcpy(&aux32, gas, 4);
+            gas += 4;
+            const std::uint32_t ls = 2 * (aux32 >> 28) + 1;
+            std::int32_t sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const auto* g1 = reinterpret_cast<const std::uint8_t*>(
+                    iq3xxs_grid + q3[2 * l + 0]);
+                const auto* g2 = reinterpret_cast<const std::uint8_t*>(
+                    iq3xxs_grid + q3[2 * l + 1]);
+                const std::uint8_t signs =
+                    ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+                for (int j = 0; j < 4; ++j) {
+                    sumi += g1[j] * q8[j + 0] *
+                            ((signs & kmask_iq2xs[j + 0]) ? -1 : 1);
+                    sumi += g2[j] * q8[j + 4] *
+                            ((signs & kmask_iq2xs[j + 4]) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            q3 += 8;
+            bsum += sumi * static_cast<std::int32_t>(ls);
+        }
+        sumf += d * static_cast<float>(bsum);
+    }
+    return 0.25f * sumf;
+}
+
+/** IQ3_S (110B) x Q8_K integer dot; ports ggml_vec_dot_iq3_s_q8_K_
+ *  generic (two 32-groups per outer step, qh high bit + raw signs). */
+float vec_dot_iq3_s_q8_k(const std::byte* row, const BlockQ8K* xq,
+                         std::size_t nb) {
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 110;
+        const float d = f16_to_f32(load_u16(blk)) * xq[i].d;
+        const auto* qh =
+            reinterpret_cast<const std::uint8_t*>(blk + 66);
+        const auto* sc =
+            reinterpret_cast<const std::uint8_t*>(blk + 106);
+        const std::uint8_t* qsp =
+            reinterpret_cast<const std::uint8_t*>(blk + 2);
+        const std::uint8_t* signs =
+            reinterpret_cast<const std::uint8_t*>(blk + 74);
+        const std::int8_t* q8 = xq[i].qs;
+        std::int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+            const std::uint32_t ls1 = 2 * (sc[ib32 / 2] & 0xf) + 1;
+            const std::uint32_t ls2 = 2 * (sc[ib32 / 2] >> 4) + 1;
+            std::int32_t sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const auto* g1 = reinterpret_cast<const std::uint8_t*>(
+                    iq3s_grid + (qsp[2 * l] |
+                                 ((qh[ib32] << (8 - 2 * l)) & 256)));
+                const auto* g2 = reinterpret_cast<const std::uint8_t*>(
+                    iq3s_grid + (qsp[2 * l + 1] |
+                                 ((qh[ib32] << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    sumi += g1[j] * q8[j + 0] *
+                            ((signs[l] & kmask_iq2xs[j + 0]) ? -1 : 1);
+                    sumi += g2[j] * q8[j + 4] *
+                            ((signs[l] & kmask_iq2xs[j + 4]) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            qsp += 8;
+            signs += 4;
+            bsum += sumi * static_cast<std::int32_t>(ls1);
+            sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const auto* g1 = reinterpret_cast<const std::uint8_t*>(
+                    iq3s_grid + (qsp[2 * l] |
+                                 ((qh[ib32 + 1] << (8 - 2 * l)) &
+                                  256)));
+                const auto* g2 = reinterpret_cast<const std::uint8_t*>(
+                    iq3s_grid + (qsp[2 * l + 1] |
+                                 ((qh[ib32 + 1] << (7 - 2 * l)) &
+                                  256)));
+                for (int j = 0; j < 4; ++j) {
+                    sumi += g1[j] * q8[j + 0] *
+                            ((signs[l] & kmask_iq2xs[j + 0]) ? -1 : 1);
+                    sumi += g2[j] * q8[j + 4] *
+                            ((signs[l] & kmask_iq2xs[j + 4]) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            qsp += 8;
+            signs += 4;
+            bsum += sumi * static_cast<std::int32_t>(ls2);
+        }
+        sumf += d * static_cast<float>(bsum);
+    }
+    return sumf;
+}
+
 float dot_k_quant(const Mat& w, const std::byte* row,
                   std::span<const float> x) {
     const auto [bytes, fn] = k_traits(w.type);
@@ -1698,7 +1807,9 @@ void matvec_q8k(const Mat& w, std::span<const float> x,
                          w.type == T::kTQ2_0 ||
                          w.type == T::kIQ2_XXS ||
                          w.type == T::kIQ2_XS ||
-                         w.type == T::kIQ2_S) &&
+                         w.type == T::kIQ2_S ||
+                         w.type == T::kIQ3_XXS ||
+                         w.type == T::kIQ3_S) &&
                         x.size() % 256 == 0;
     if (!ported) {  // types without a Q8_K dot yet: keep the f32 path
         matvec(w, x, out);
@@ -1740,6 +1851,12 @@ void matvec_q8k(const Mat& w, std::span<const float> x,
                 break;
             case T::kIQ2_S:
                 out[r] = vec_dot_iq2_s_q8_k(row, xq.data(), nb);
+                break;
+            case T::kIQ3_XXS:
+                out[r] = vec_dot_iq3_xxs_q8_k(row, xq.data(), nb);
+                break;
+            case T::kIQ3_S:
+                out[r] = vec_dot_iq3_s_q8_k(row, xq.data(), nb);
                 break;
             default:
                 break;
