@@ -842,6 +842,158 @@ float vec_dot_q4_k_q8_k(const std::byte* row, const BlockQ8K* xq,
     return sumf;
 }
 
+/** Q6_K (210B) x Q8_K integer dot; ports ggml_vec_dot_q6_K_q8_K_
+ *  generic. No min term. */
+float vec_dot_q6_k_q8_k(const std::byte* row, const BlockQ8K* xq,
+                        std::size_t nb) {
+    std::int8_t aux8[256];
+    std::int16_t aux16[8];
+    float sums[8] = {0};
+    std::int32_t aux32[8];
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 210;
+        const auto* ql = reinterpret_cast<const std::uint8_t*>(blk);
+        const auto* qh =
+            reinterpret_cast<const std::uint8_t*>(blk + 128);
+        const auto* sc =
+            reinterpret_cast<const std::int8_t*>(blk + 192);
+        const float bd = f16_to_f32(load_u16(blk + 208));
+        const std::int8_t* q8 = xq[i].qs;
+        std::memset(aux32, 0, sizeof(aux32));
+        std::int8_t* a = aux8;
+        const std::uint8_t* q4 = ql;
+        const std::uint8_t* qhp = qh;
+        for (int j = 0; j < 256; j += 128) {
+            for (int l = 0; l < 32; ++l) {
+                a[l + 0] = static_cast<std::int8_t>(
+                    ((q4[l] & 0xF) | (((qhp[l] >> 0) & 3) << 4)) -
+                    32);
+                a[l + 32] = static_cast<std::int8_t>(
+                    ((q4[l + 32] & 0xF) | (((qhp[l] >> 2) & 3) << 4)) -
+                    32);
+                a[l + 64] = static_cast<std::int8_t>(
+                    ((q4[l] >> 4) | (((qhp[l] >> 4) & 3) << 4)) - 32);
+                a[l + 96] = static_cast<std::int8_t>(
+                    ((q4[l + 32] >> 4) | (((qhp[l] >> 6) & 3) << 4)) -
+                    32);
+            }
+            a += 128;
+            q4 += 64;
+            qhp += 32;
+        }
+        a = aux8;
+        int is = 0;
+        for (int j = 0; j < 16; ++j) {
+            const std::int32_t scale = sc[is++];
+            for (int k = 0; k < 2; ++k) {
+                for (int l = 0; l < 8; ++l) {
+                    aux16[l] = static_cast<std::int16_t>(q8[l] * a[l]);
+                }
+                for (int l = 0; l < 8; ++l) {
+                    aux32[l] += scale * aux16[l];
+                }
+                q8 += 8;
+                a += 8;
+            }
+        }
+        const float d = bd * xq[i].d;
+        for (int l = 0; l < 8; ++l) {
+            sums[l] += d * static_cast<float>(aux32[l]);
+        }
+    }
+    for (int l = 0; l < 8; ++l) {
+        sumf += sums[l];
+    }
+    return sumf;
+}
+
+/** Q5_K (176B) x Q8_K integer dot; ports ggml_vec_dot_q5_K_q8_K_
+ *  generic (5th bit from qh, min via bsums). */
+float vec_dot_q5_k_q8_k(const std::byte* row, const BlockQ8K* xq,
+                        std::size_t nb) {
+    constexpr std::uint32_t kmask1 = 0x3f3f3f3f;
+    constexpr std::uint32_t kmask2 = 0x0f0f0f0f;
+    constexpr std::uint32_t kmask3 = 0x03030303;
+    std::uint32_t utmp[4];
+    const auto* scales = reinterpret_cast<const std::uint8_t*>(&utmp[0]);
+    const auto* mins = reinterpret_cast<const std::uint8_t*>(&utmp[2]);
+    std::int8_t aux8[256];
+    std::int16_t aux16[8];
+    float sums[8] = {0};
+    std::int32_t aux32[8];
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 176;
+        const float bd = f16_to_f32(load_u16(blk));
+        const float bdmin = f16_to_f32(load_u16(blk + 2));
+        const auto* hm =
+            reinterpret_cast<const std::uint8_t*>(blk + 16);
+        const auto* q4 =
+            reinterpret_cast<const std::uint8_t*>(blk + 48);
+        const std::int8_t* q8 = xq[i].qs;
+        std::memset(aux32, 0, sizeof(aux32));
+        std::int8_t* a = aux8;
+        std::uint8_t m = 1;
+        for (int j = 0; j < 4; ++j) {
+            for (int l = 0; l < 32; ++l) {
+                a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
+            }
+            for (int l = 0; l < 32; ++l) {
+                a[l] = static_cast<std::int8_t>(a[l] +
+                                                ((hm[l] & m) ? 16 : 0));
+            }
+            a += 32;
+            m <<= 1;
+            for (int l = 0; l < 32; ++l) {
+                a[l] = static_cast<std::int8_t>(q4[l] >> 4);
+            }
+            for (int l = 0; l < 32; ++l) {
+                a[l] = static_cast<std::int8_t>(a[l] +
+                                                ((hm[l] & m) ? 16 : 0));
+            }
+            a += 32;
+            m <<= 1;
+            q4 += 32;
+        }
+        std::memcpy(utmp, blk + 4, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) |
+                  (((utmp[1] >> 6) & kmask3) << 4);
+        const std::uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+        int sumi = 0;
+        for (int j = 0; j < 16; ++j) {
+            sumi += xq[i].bsums[j] * mins[j / 2];
+        }
+        a = aux8;
+        int is = 0;
+        for (int j = 0; j < 8; ++j) {
+            const std::int32_t scale = scales[is++];
+            for (int k = 0; k < 4; ++k) {
+                for (int l = 0; l < 8; ++l) {
+                    aux16[l] = static_cast<std::int16_t>(q8[l] * a[l]);
+                }
+                for (int l = 0; l < 8; ++l) {
+                    aux32[l] += scale * aux16[l];
+                }
+                q8 += 8;
+                a += 8;
+            }
+        }
+        const float d = bd * xq[i].d;
+        for (int l = 0; l < 8; ++l) {
+            sums[l] += d * static_cast<float>(aux32[l]);
+        }
+        sumf -= bdmin * xq[i].d * static_cast<float>(sumi);
+    }
+    for (int l = 0; l < 8; ++l) {
+        sumf += sums[l];
+    }
+    return sumf;
+}
+
 float dot_k_quant(const Mat& w, const std::byte* row,
                   std::span<const float> x) {
     const auto [bytes, fn] = k_traits(w.type);
@@ -1209,8 +1361,11 @@ void matvec(const Mat& w, std::span<const float> x,
 void matvec_q8k(const Mat& w, std::span<const float> x,
                 std::span<float> out) {
     assert(x.size() == w.cols && out.size() == w.rows);
-    // Q8_K integer-dot path for Q4_K; other types keep the f32 dot.
-    if (w.type != gguf::TensorType::kQ4_K || x.size() % 256 != 0) {
+    using T = gguf::TensorType;
+    const bool ported = (w.type == T::kQ4_K || w.type == T::kQ5_K ||
+                         w.type == T::kQ6_K) &&
+                        x.size() % 256 == 0;
+    if (!ported) {  // types without a Q8_K dot yet: keep the f32 path
         matvec(w, x, out);
         return;
     }
@@ -1219,7 +1374,20 @@ void matvec_q8k(const Mat& w, std::span<const float> x,
     quantize_row_q8_k(x.data(), xq.data(), x.size());
     const std::size_t stride = row_bytes(w);
     for (std::uint32_t r = 0; r < w.rows; ++r) {
-        out[r] = vec_dot_q4_k_q8_k(w.data + r * stride, xq.data(), nb);
+        const std::byte* row = w.data + r * stride;
+        switch (w.type) {
+            case T::kQ4_K:
+                out[r] = vec_dot_q4_k_q8_k(row, xq.data(), nb);
+                break;
+            case T::kQ5_K:
+                out[r] = vec_dot_q5_k_q8_k(row, xq.data(), nb);
+                break;
+            case T::kQ6_K:
+                out[r] = vec_dot_q6_k_q8_k(row, xq.data(), nb);
+                break;
+            default:
+                break;
+        }
     }
 }
 

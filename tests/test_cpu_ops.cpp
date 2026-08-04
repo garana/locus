@@ -478,11 +478,40 @@ TEST_CASE("IQ1_M matvec matches dequant_row and CUDA",
 }
 
 // R16 Q8_K activation-dot: matvec_q8k quantizes x to Q8_K and does an
-// integer dot (ggml parity), vs matvec's f32-activation dot. On Q4_K
-// the two closely agree (8-bit activation quant), which validates the
-// port; the bit-exact-vs-llama.cpp property is covered by the model
-// goldens.
-TEST_CASE("Q8_K matvec approximates the f32 dot (Q4_K)",
+// integer dot (ggml parity), matching llama.cpp bit-for-bit on the
+// model goldens. Here we validate the integer dot TIGHTLY against an
+// f32 dot that uses the SAME Q8_K-rounded activation (x round-tripped
+// through Q8_K): the two are mathematically equal, differing only in
+// summation order, so a port bug shows up immediately.
+namespace {
+std::vector<float> q8k_roundtrip(const std::vector<float>& x) {
+    std::vector<float> y(x.size());
+    for (std::size_t b = 0; b * 256 < x.size(); ++b) {
+        float amax = 0.0f, mx = 0.0f;
+        for (int j = 0; j < 256; ++j) {
+            const float a = std::abs(x[b * 256 + j]);
+            if (a > amax) {
+                amax = a;
+                mx = x[b * 256 + j];
+            }
+        }
+        if (amax == 0.0f) {
+            continue;
+        }
+        const float iscale = -127.0f / mx, d = 1.0f / iscale;
+        for (int j = 0; j < 256; ++j) {
+            const int v = std::min(
+                127, static_cast<int>(
+                         std::lround(iscale * x[b * 256 + j])));
+            y[b * 256 + j] = d * static_cast<float>(v);
+        }
+    }
+    return y;
+}
+}  // namespace
+
+TEST_CASE("Q8_K matvec matches the f32 dot of the Q8_K activation "
+          "(K-quants)",
           "[ops][q8k]") {
     constexpr std::uint32_t rows = 4, cols = 512;  // 2 blocks/row
     std::mt19937 rng(19);
@@ -491,23 +520,28 @@ TEST_CASE("Q8_K matvec approximates the f32 dot (Q4_K)",
     for (auto& v : x) {
         v = dist(rng);
     }
-    std::vector<std::byte> w;
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        auto row = k_quant_row(TensorType::kQ4_K, 2, 200u + r);
-        w.insert(w.end(), row.begin(), row.end());
+    const std::vector<float> xq = q8k_roundtrip(x);
+    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ5_K,
+                         TensorType::kQ6_K}) {
+        std::vector<std::byte> w;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto row = k_quant_row(
+                t, 2, 200u + r + 7u * static_cast<std::uint32_t>(t));
+            w.insert(w.end(), row.begin(), row.end());
+        }
+        Mat m{t, w.data(), rows, cols};
+        std::vector<float> ref(rows), got(rows);
+        matvec(m, xq, ref);       // f32 dot, Q8_K-rounded activation
+        matvec_q8k(m, x, got);    // integer dot, Q8_K activation
+        bool nonzero = false;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            INFO("type " << static_cast<int>(t) << " row " << r);
+            REQUIRE(got[r] ==
+                    Approx(ref[r]).epsilon(1e-3).margin(1e-3));
+            nonzero = nonzero || got[r] != 0.0f;
+        }
+        REQUIRE(nonzero);
     }
-    Mat m{TensorType::kQ4_K, w.data(), rows, cols};
-    std::vector<float> f32(rows), q8k(rows);
-    matvec(m, x, f32);
-    matvec_q8k(m, x, q8k);
-    bool nonzero = false;
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        INFO("row " << r);
-        REQUIRE(q8k[r] ==
-                Approx(f32[r]).epsilon(0.03).margin(0.02));
-        nonzero = nonzero || q8k[r] != 0.0f;
-    }
-    REQUIRE(nonzero);
 }
 
 #if defined(__aarch64__)
