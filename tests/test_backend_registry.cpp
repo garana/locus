@@ -307,37 +307,53 @@ TEST_CASE("cuda matvec matches scalar", "[backend]") {
 
 // R16 ggml-parity: the CUDA Q8_K-activation dot must match the scalar
 // matvec_q8k bit-for-bit (same host quant, same accumulation order).
-TEST_CASE("cuda q8k matvec matches scalar q8k (Q4_K)", "[backend]") {
+TEST_CASE("cuda q8k matvec matches scalar q8k (k-quants)",
+          "[backend]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
     }
     cuda_pool_reset();
+    using TT = locus::gguf::TensorType;
+    // {type, super-block bytes, d offset, dmin offset (-1: none)}.
+    struct Q {
+        TT type;
+        std::size_t bytes;
+        std::size_t d_off;
+        int dmin_off;
+    };
     const std::uint32_t rows = 4, cols = 512;  // 2 blocks/row
     std::mt19937 rng(29);
     std::uniform_int_distribution<int> byte_d(0, 255);
-    std::vector<std::byte> w(static_cast<std::size_t>(rows) *
-                             (cols / 256) * 144);
-    for (auto& b : w) {
-        b = static_cast<std::byte>(byte_d(rng));
-    }
-    for (std::size_t bl = 0; bl < w.size() / 144; ++bl) {
-        std::byte* blk = w.data() + bl * 144;
-        const std::uint16_t d = f32_to_f16(0.01f);
-        const std::uint16_t dmin = f32_to_f16(0.005f);
-        std::memcpy(blk, &d, 2);
-        std::memcpy(blk + 2, &dmin, 2);
-    }
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::vector<float> x(cols);
     for (auto& v : x) {
         v = dist(rng);
     }
-    Mat m{locus::gguf::TensorType::kQ4_K, w.data(), rows, cols};
-    std::vector<float> a(rows), b(rows);
-    matvec_q8k(m, x, a);
-    matvec_cuda_q8k(m, x, b);
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-4));
+    for (const Q& q : {Q{TT::kQ2_K, 84, 80, 82}, Q{TT::kQ4_K, 144, 0, 2},
+                       Q{TT::kQ5_K, 176, 0, 2},
+                       Q{TT::kQ6_K, 210, 208, -1}}) {
+        std::vector<std::byte> w(static_cast<std::size_t>(rows) *
+                                 (cols / 256) * q.bytes);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / q.bytes; ++bl) {
+            std::byte* blk = w.data() + bl * q.bytes;
+            const std::uint16_t d = f32_to_f16(0.01f);
+            const std::uint16_t dmin = f32_to_f16(0.005f);
+            std::memcpy(blk + q.d_off, &d, 2);
+            if (q.dmin_off >= 0) {
+                std::memcpy(blk + q.dmin_off, &dmin, 2);
+            }
+        }
+        Mat m{q.type, w.data(), rows, cols};
+        std::vector<float> a(rows), b(rows);
+        matvec_q8k(m, x, a);
+        matvec_cuda_q8k(m, x, b);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            INFO("type " << static_cast<int>(q.type) << " row " << r);
+            REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-4));
+        }
     }
 }
 
