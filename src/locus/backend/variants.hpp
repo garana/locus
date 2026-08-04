@@ -84,6 +84,19 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
                  std::span<float> out);
 
 /**
+ * CUDA Q8_K-activation matvec (ggml parity, DESIGN.md R16): quantizes
+ * x to Q8_K once on the host, uploads the shared quants, and integer-
+ * dots them with the device-resident quantized weight -- bit-identical
+ * to the scalar matvec_q8k. Ported types run on the GPU; the rest
+ * delegate to scalar matvec_q8k. This is the device half of the eventual
+ * ggml-parity flip; kept additive so the f32 matvec_cuda parity path
+ * stays intact until the flip lands. Scalar-delegating stub on non-CUDA
+ * builds.
+ */
+void matvec_cuda_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out);
+
+/**
  * CUDA batched matvec (R11 Ops::matvec_batch, batch_self_parallel):
  * one kernel launch over all rows x n tokens. Q4_K/Q6_K read each
  * weight block from VRAM once and FMA it into n token accumulators

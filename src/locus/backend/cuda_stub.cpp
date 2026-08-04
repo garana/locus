@@ -14,6 +14,11 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
     matvec(w, x, out);
 }
 
+void matvec_cuda_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out) {
+    matvec_q8k(w, x, out);
+}
+
 void cuda_prefetch(const Mat&) {}
 
 void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,

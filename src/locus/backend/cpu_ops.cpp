@@ -1932,6 +1932,19 @@ void matvec(const Mat& w, std::span<const float> x,
     }
 }
 
+void quantize_activation_q8k(std::span<const float> x, float* d,
+                             std::int8_t* qs, std::int16_t* bsums) {
+    const std::size_t nb = x.size() / 256;
+    std::vector<BlockQ8K> tmp(nb);
+    quantize_row_q8_k(x.data(), tmp.data(), x.size());
+    for (std::size_t i = 0; i < nb; ++i) {
+        d[i] = tmp[i].d;
+        std::memcpy(qs + i * 256, tmp[i].qs, 256);
+        std::memcpy(bsums + i * 16, tmp[i].bsums,
+                    16 * sizeof(std::int16_t));
+    }
+}
+
 void matvec_q8k(const Mat& w, std::span<const float> x,
                 std::span<float> out) {
     assert(x.size() == w.cols && out.size() == w.rows);

@@ -103,6 +103,16 @@ void matvec_q8k(const Mat& w, std::span<const float> x,
                 std::span<float> out);
 
 /**
+ * Quantizes activation x to Q8_K, writing the block fields as flat
+ * arrays: d[n/256], qs[n] (int8), bsums[n/16] (int16), where n =
+ * x.size() (must be a multiple of 256). Bit-identical to the internal
+ * quant matvec_q8k applies, exposed so a GPU backend can upload the
+ * same quants and match matvec_q8k's integer dot on device.
+ */
+void quantize_activation_q8k(std::span<const float> x, float* d,
+                             std::int8_t* qs, std::int16_t* bsums);
+
+/**
  * Scalar reference for the R11 batched matvec (backend::Ops::
  * matvec_batch). Applies w to n token vectors (x_batch is n*w.cols,
  * token t at t*w.cols) and writes results row-major: out_batch is

@@ -193,6 +193,102 @@ __global__ void matvec_q4_k_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
+/** Q4_K x Q8_K integer dot on device; bit-exact port of the scalar
+ *  vec_dot_q4_k_q8_k (aux8 nibble unpack, per-8 int16 products, scale*
+ *  int32 accumulate over 8 lanes, bsums min-correction). Activation
+ *  quants arrive flat: d_y[nsb], qs_y[nsb*256], bsums_y[nsb*16]. One
+ *  thread per row keeps the scalar accumulation order, so the float
+ *  result is identical. */
+__global__ void matvec_q4_k_q8k_kernel(
+    const std::uint8_t* w, const float* d_y, const std::int8_t* qs_y,
+    const std::int16_t* bsums_y, float* out, std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 144;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * row_bytes;
+    const std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
+                        kmask3 = 0x03030303;
+    float sums[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float sumf = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk =
+            row + static_cast<std::size_t>(b) * 144;
+        const float bd = __half2float(__ushort_as_half(
+            static_cast<std::uint16_t>(blk[0] | (blk[1] << 8))));
+        const float bdmin = __half2float(__ushort_as_half(
+            static_cast<std::uint16_t>(blk[2] | (blk[3] << 8))));
+        const std::uint8_t* q4 = blk + 16;
+        const std::int8_t* q8 = qs_y + static_cast<std::size_t>(b) * 256;
+        std::int8_t aux8[256];
+        std::int8_t* a = aux8;
+        for (int j = 0; j < 4; ++j) {
+            for (int l = 0; l < 32; ++l) {
+                a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
+            }
+            a += 32;
+            for (int l = 0; l < 32; ++l) {
+                a[l] = static_cast<std::int8_t>(q4[l] >> 4);
+            }
+            a += 32;
+            q4 += 32;
+        }
+        std::uint32_t utmp[4];
+        const std::uint8_t* s = blk + 4;  // Q4_K scales[12]
+        for (int k = 0; k < 3; ++k) {
+            utmp[k] = static_cast<std::uint32_t>(s[4 * k]) |
+                      (static_cast<std::uint32_t>(s[4 * k + 1]) << 8) |
+                      (static_cast<std::uint32_t>(s[4 * k + 2]) << 16) |
+                      (static_cast<std::uint32_t>(s[4 * k + 3]) << 24);
+        }
+        utmp[3] = ((utmp[2] >> 4) & kmask2) |
+                  (((utmp[1] >> 6) & kmask3) << 4);
+        const std::uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+        const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
+        const auto* mins =
+            reinterpret_cast<const std::uint8_t*>(utmp + 2);
+        const std::int16_t* bs =
+            bsums_y + static_cast<std::size_t>(b) * 16;
+        int sumi = 0;
+        for (int j = 0; j < 16; ++j) {
+            sumi += bs[j] * mins[j / 2];
+        }
+        std::int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        a = aux8;
+        int is = 0;
+        for (int j = 0; j < 8; ++j) {
+            const std::int32_t scale = scales[is++];
+            for (int k = 0; k < 4; ++k) {
+                std::int16_t aux16[8];
+                for (int l = 0; l < 8; ++l) {
+                    aux16[l] = static_cast<std::int16_t>(q8[l] * a[l]);
+                }
+                for (int l = 0; l < 8; ++l) {
+                    aux32[l] += scale * aux16[l];
+                }
+                q8 += 8;
+                a += 8;
+            }
+        }
+        const float d = bd * d_y[b];
+        for (int l = 0; l < 8; ++l) {
+            sums[l] += d * static_cast<float>(aux32[l]);
+        }
+        sumf -= bdmin * d_y[b] * static_cast<float>(sumi);
+    }
+    for (int l = 0; l < 8; ++l) {
+        sumf += sums[l];
+    }
+    out[r] = sumf;
+}
+
 /** One Q5_K super-block is 176 bytes: d,dmin (f16) + scales[12] +
  *  qh[32] + ql[128], 256 weights. The 5th bit comes from qh, its bit
  *  position advancing per 64-group (u1/u2). Fill order is sequential,
@@ -1767,9 +1863,80 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
     return ok;
 }
 
+/** Q8_K-activation device matvec for Q4_K: host-quantizes x (the same
+ *  quant matvec_q8k uses), uploads the flat quants and the pooled/
+ *  uploaded weight, runs the integer-dot kernel. Returns false on any
+ *  CUDA failure so the caller can fall back to scalar. */
+bool run_matvec_q4_k_q8k(const Mat& w, std::span<const float> x,
+                         std::span<float> out, std::size_t w_bytes) {
+    const void* dw = pool().acquire(w.data, w_bytes);
+    const bool pooled = dw != nullptr;
+    DevBuf dw_demand;
+    if (!pooled) {
+        if (!dw_demand.alloc(w_bytes) ||
+            !cuda_ok(cudaMemcpy(dw_demand.p, w.data, w_bytes,
+                                cudaMemcpyHostToDevice))) {
+            return false;
+        }
+        dw = dw_demand.p;
+    }
+    const std::size_t nsb = x.size() / 256;
+    std::vector<float> hd(nsb);
+    std::vector<std::int8_t> hqs(x.size());
+    std::vector<std::int16_t> hbs(nsb * 16);
+    quantize_activation_q8k(x, hd.data(), hqs.data(), hbs.data());
+
+    bool ok = false;
+    {
+        DevBuf dd, dqs, dbs, dout;
+        const std::size_t out_bytes =
+            static_cast<std::size_t>(w.rows) * sizeof(float);
+        if (dd.alloc(nsb * sizeof(float)) &&
+            dqs.alloc(x.size() * sizeof(std::int8_t)) &&
+            dbs.alloc(nsb * 16 * sizeof(std::int16_t)) &&
+            dout.alloc(out_bytes) &&
+            cuda_ok(cudaMemcpy(dd.p, hd.data(), nsb * sizeof(float),
+                               cudaMemcpyHostToDevice)) &&
+            cuda_ok(cudaMemcpy(dqs.p, hqs.data(), x.size(),
+                               cudaMemcpyHostToDevice)) &&
+            cuda_ok(cudaMemcpy(dbs.p, hbs.data(),
+                               nsb * 16 * sizeof(std::int16_t),
+                               cudaMemcpyHostToDevice))) {
+            const std::uint32_t threads = 256;
+            const std::uint32_t blocks =
+                (w.rows + threads - 1) / threads;
+            matvec_q4_k_q8k_kernel<<<blocks, threads>>>(
+                static_cast<const std::uint8_t*>(dw),
+                static_cast<const float*>(dd.p),
+                static_cast<const std::int8_t*>(dqs.p),
+                static_cast<const std::int16_t*>(dbs.p),
+                static_cast<float*>(dout.p), w.rows, w.cols);
+            ok = cuda_ok(cudaGetLastError()) &&
+                 cuda_ok(cudaDeviceSynchronize()) &&
+                 cuda_ok(cudaMemcpy(out.data(), dout.p, out_bytes,
+                                    cudaMemcpyDeviceToHost));
+        }
+    }
+    if (pooled) {
+        pool().release(w.data);
+    }
+    return ok;
+}
+
 }  // namespace
 
 void cuda_pool_reset() { pool().reset(); }
+
+void matvec_cuda_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out) {
+    if (w.type == gguf::TensorType::kQ4_K && w.cols % 256 == 0) {
+        const std::size_t bytes = device_weight_bytes(w);
+        if (bytes > 0 && run_matvec_q4_k_q8k(w, x, out, bytes)) {
+            return;
+        }
+    }
+    matvec_q8k(w, x, out);  // other types / failure: scalar Q8_K
+}
 
 void matvec_cuda(const Mat& w, std::span<const float> x,
                  std::span<float> out) {
