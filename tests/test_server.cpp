@@ -203,6 +203,62 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(body["choices"][0].contains("message"));
     }
 
+    SECTION("chat tools + stream buffers and emits a final chunk") {
+        // With tools, the stream must BUFFER (a tool call can only be
+        // recognized from the whole completion) and emit one terminal
+        // chunk carrying finish_reason -- so an agent never sees raw
+        // tool JSON as incremental content. The toy model won't emit
+        // a real call, so finish_reason is stop/length and the text
+        // rides in the final delta.content.
+        json req{
+            {"messages",
+             json::array({{{"role", "user"},
+                           {"content", "Once upon a time"}}})},
+            {"max_tokens", 8},
+            {"stream", true},
+            {"tools",
+             json::array(
+                 {{{"type", "function"},
+                   {"function",
+                    {{"name", "get_weather"},
+                     {"description", "weather"},
+                     {"parameters", {{"type", "object"}}}}}}})}};
+        auto res = client.Post("/v1/chat/completions", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const std::string& sse = res->body;
+        REQUIRE(sse.find("data: [DONE]\n\n") != std::string::npos);
+
+        int content_chunks = 0, finish_chunks = 0;
+        std::size_t at = 0;
+        const std::string dp = "data: ";
+        while ((at = sse.find(dp, at)) != std::string::npos) {
+            const std::size_t nl = sse.find("\n\n", at);
+            const std::string line =
+                sse.substr(at + dp.size(),
+                           nl - at - dp.size());
+            at = nl + 2;
+            if (line == "[DONE]") {
+                continue;
+            }
+            auto chunk = json::parse(line);
+            const auto& choice = chunk["choices"][0];
+            if (choice.contains("finish_reason") &&
+                !choice["finish_reason"].is_null()) {
+                ++finish_chunks;
+            }
+            if (choice.contains("delta") &&
+                choice["delta"].contains("content")) {
+                ++content_chunks;
+            }
+        }
+        // Buffered: content is not streamed per token -- it arrives in
+        // the single terminal chunk, which also carries finish_reason.
+        REQUIRE(content_chunks == 1);
+        REQUIRE(finish_chunks == 1);
+    }
+
     SECTION("response_format json_object constrains to valid JSON") {
         json req{
             {"messages",

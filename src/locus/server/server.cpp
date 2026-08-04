@@ -536,34 +536,45 @@ void OpenAiServer::install_routes() {
             return;
         }
 
-        // SSE streaming: one chunk per token, then [DONE].
+        // SSE streaming: one chunk per token, then [DONE]. When
+        // tools are supplied (chat only) locus cannot recognize a
+        // tool call until the whole completion is parsed, so it
+        // BUFFERS -- emitting nothing token-by-token and, at the end,
+        // either a tool_calls delta or the buffered text -- so a
+        // streaming agent (Copilot CLI, etc.) never sees raw tool
+        // JSON as content.
         auto state = std::make_shared<std::size_t>(0);
+        auto tools_sp =
+            std::make_shared<std::vector<ToolSpec>>(std::move(tools));
+        const bool buffer_tools = chat && !tools_sp->empty();
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, id, chat, rid, sse_object, state](
-                std::size_t, httplib::DataSink& sink) {
+            [this, id, chat, rid, sse_object, state, tools_sp,
+             buffer_tools](std::size_t, httplib::DataSink& sink) {
                 auto v = loop_.wait_progress(id, *state);
                 std::string payload;
-                for (std::size_t i = *state;
-                     i < v.generated.size(); ++i) {
-                    const tok::TokenId t = v.generated[i];
-                    if (t == tok_.eos_id()) {
-                        continue;
+                if (!buffer_tools) {
+                    for (std::size_t i = *state;
+                         i < v.generated.size(); ++i) {
+                        const tok::TokenId t = v.generated[i];
+                        if (t == tok_.eos_id()) {
+                            continue;
+                        }
+                        const std::string piece =
+                            tok_.decode({&t, 1});
+                        json delta =
+                            chat ? json{{"index", 0},
+                                        {"delta",
+                                         {{"content", piece}}}}
+                                 : json{{"index", 0},
+                                        {"text", piece}};
+                        json chunk{{"id", rid},
+                                   {"object", sse_object},
+                                   {"choices",
+                                    json::array({delta})}};
+                        payload +=
+                            "data: " + chunk.dump() + "\n\n";
                     }
-                    const std::string piece =
-                        tok_.decode({&t, 1});
-                    json delta =
-                        chat ? json{{"index", 0},
-                                    {"delta",
-                                     {{"content", piece}}}}
-                             : json{{"index", 0},
-                                    {"text", piece}};
-                    json chunk{{"id", rid},
-                               {"object", sse_object},
-                               {"choices",
-                                json::array({delta})}};
-                    payload +=
-                        "data: " + chunk.dump() + "\n\n";
                 }
                 *state = v.generated.size();
                 const bool terminal =
@@ -573,6 +584,46 @@ void OpenAiServer::install_routes() {
                     completion_tokens_total_.fetch_add(
                         v.generated.size(),
                         std::memory_order_relaxed);
+                    if (buffer_tools) {
+                        // Emit the final chat chunk: a tool_calls
+                        // delta if the buffered completion parsed as
+                        // a call, else the buffered text as content.
+                        const bool hit_eos =
+                            !v.generated.empty() &&
+                            v.generated.back() == tok_.eos_id();
+                        const std::string text =
+                            tok_.decode(v.generated);
+                        json delta;
+                        std::string finish =
+                            hit_eos ? "stop" : "length";
+                        if (auto tc =
+                                detect_tool_call(text, *tools_sp)) {
+                            json call{
+                                {"index", 0},
+                                {"id",
+                                 "call_" + std::to_string(id)},
+                                {"type", "function"},
+                                {"function",
+                                 {{"name", tc->name},
+                                  {"arguments",
+                                   tc->arguments.dump()}}}};
+                            delta = {{"role", "assistant"},
+                                     {"tool_calls",
+                                      json::array({call})}};
+                            finish = "tool_calls";
+                        } else {
+                            delta = {{"content", text}};
+                        }
+                        json chunk{
+                            {"id", rid},
+                            {"object", sse_object},
+                            {"choices",
+                             json::array({{{"index", 0},
+                                           {"delta", delta},
+                                           {"finish_reason",
+                                            finish}}})}};
+                        payload += "data: " + chunk.dump() + "\n\n";
+                    }
                     payload += "data: [DONE]\n\n";
                 }
                 if (!payload.empty() &&
@@ -715,9 +766,15 @@ void OpenAiServer::install_routes() {
             bool started = false;
         };
         auto st = std::make_shared<St>();
+        auto tools_sp =
+            std::make_shared<std::vector<ToolSpec>>(std::move(tools));
+        // With tools, buffer until the whole completion is parsed:
+        // defer the content_block_start until we know whether it is a
+        // text or tool_use block (Anthropic streaming shape).
+        const bool buffer_tools = !tools_sp->empty();
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, id, rid, input_tokens, st](
+            [this, id, rid, input_tokens, st, tools_sp, buffer_tools](
                 std::size_t, httplib::DataSink& sink) {
                 std::string payload;
                 if (!st->started) {
@@ -736,33 +793,37 @@ void OpenAiServer::install_routes() {
                             {"output_tokens", 0}}}}}};
                     payload += "event: message_start\ndata: " +
                                start.dump() + "\n\n";
-                    payload +=
-                        "event: content_block_start\ndata: " +
-                        json{{"type", "content_block_start"},
-                             {"index", 0},
-                             {"content_block",
-                              {{"type", "text"},
-                               {"text", ""}}}}
-                            .dump() +
-                        "\n\n";
+                    if (!buffer_tools) {
+                        payload +=
+                            "event: content_block_start\ndata: " +
+                            json{{"type", "content_block_start"},
+                                 {"index", 0},
+                                 {"content_block",
+                                  {{"type", "text"},
+                                   {"text", ""}}}}
+                                .dump() +
+                            "\n\n";
+                    }
                     st->started = true;
                 }
                 auto v = loop_.wait_progress(id, st->emitted);
-                for (std::size_t i = st->emitted;
-                     i < v.generated.size(); ++i) {
-                    const tok::TokenId t = v.generated[i];
-                    if (t == tok_.eos_id()) {
-                        continue;
+                if (!buffer_tools) {
+                    for (std::size_t i = st->emitted;
+                         i < v.generated.size(); ++i) {
+                        const tok::TokenId t = v.generated[i];
+                        if (t == tok_.eos_id()) {
+                            continue;
+                        }
+                        payload +=
+                            "event: content_block_delta\ndata: " +
+                            json{{"type", "content_block_delta"},
+                                 {"index", 0},
+                                 {"delta",
+                                  {{"type", "text_delta"},
+                                   {"text", tok_.decode({&t, 1})}}}}
+                                .dump() +
+                            "\n\n";
                     }
-                    payload +=
-                        "event: content_block_delta\ndata: " +
-                        json{{"type", "content_block_delta"},
-                             {"index", 0},
-                             {"delta",
-                              {{"type", "text_delta"},
-                               {"text", tok_.decode({&t, 1})}}}}
-                            .dump() +
-                        "\n\n";
                 }
                 st->emitted = v.generated.size();
                 const bool terminal =
@@ -772,6 +833,65 @@ void OpenAiServer::install_routes() {
                     const bool hit_eos =
                         !v.generated.empty() &&
                         v.generated.back() == tok_.eos_id();
+                    std::string stop_reason =
+                        hit_eos ? "end_turn" : "max_tokens";
+                    if (buffer_tools) {
+                        // Emit the deferred block now that the type
+                        // is known: tool_use if the buffered text
+                        // parsed as a call, else a text block.
+                        const std::string text =
+                            tok_.decode(v.generated);
+                        if (auto tc =
+                                detect_tool_call(text, *tools_sp)) {
+                            payload +=
+                                "event: content_block_start\n"
+                                "data: " +
+                                json{{"type", "content_block_start"},
+                                     {"index", 0},
+                                     {"content_block",
+                                      {{"type", "tool_use"},
+                                       {"id",
+                                        "toolu_locus-" +
+                                            std::to_string(id)},
+                                       {"name", tc->name},
+                                       {"input", json::object()}}}}
+                                    .dump() +
+                                "\n\n";
+                            payload +=
+                                "event: content_block_delta\n"
+                                "data: " +
+                                json{{"type", "content_block_delta"},
+                                     {"index", 0},
+                                     {"delta",
+                                      {{"type", "input_json_delta"},
+                                       {"partial_json",
+                                        tc->arguments.dump()}}}}
+                                    .dump() +
+                                "\n\n";
+                            stop_reason = "tool_use";
+                        } else {
+                            payload +=
+                                "event: content_block_start\n"
+                                "data: " +
+                                json{{"type", "content_block_start"},
+                                     {"index", 0},
+                                     {"content_block",
+                                      {{"type", "text"},
+                                       {"text", ""}}}}
+                                    .dump() +
+                                "\n\n";
+                            payload +=
+                                "event: content_block_delta\n"
+                                "data: " +
+                                json{{"type", "content_block_delta"},
+                                     {"index", 0},
+                                     {"delta",
+                                      {{"type", "text_delta"},
+                                       {"text", text}}}}
+                                    .dump() +
+                                "\n\n";
+                        }
+                    }
                     payload +=
                         "event: content_block_stop\ndata: " +
                         json{{"type", "content_block_stop"},
@@ -782,9 +902,7 @@ void OpenAiServer::install_routes() {
                         "event: message_delta\ndata: " +
                         json{{"type", "message_delta"},
                              {"delta",
-                              {{"stop_reason",
-                                hit_eos ? "end_turn"
-                                        : "max_tokens"},
+                              {{"stop_reason", stop_reason},
                                {"stop_sequence", nullptr}}},
                              {"usage",
                               {{"output_tokens",
