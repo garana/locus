@@ -1433,6 +1433,98 @@ float vec_dot_iq3_s_q8_k(const std::byte* row, const BlockQ8K* xq,
     return sumf;
 }
 
+/** IQ1_S (50B) x Q8_K integer dot; ports ggml_vec_dot_iq1_s_q8_K_
+ *  generic (per-32 delta correction via the Q8_K bsums). */
+float vec_dot_iq1_s_q8_k(const std::byte* row, const BlockQ8K* xq,
+                         std::size_t nb) {
+    constexpr float kDelta = 0.125f;  // IQ1S_DELTA
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 50;
+        const float d = f16_to_f32(load_u16(blk)) * xq[i].d;
+        const auto* qs = reinterpret_cast<const std::uint8_t*>(blk + 2);
+        const auto* qh =
+            reinterpret_cast<const std::uint16_t*>(blk + 34);
+        const std::int8_t* q8 = xq[i].qs;
+        std::int32_t sumi = 0, sumi1 = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const int ls = 2 * ((qh[ib] >> 12) & 7) + 1;
+            const int delta = (qh[ib] & 0x8000) ? -1 : 1;
+            std::int32_t lsum = 0;
+            for (int l = 0; l < 4; ++l) {
+                const auto* grid = reinterpret_cast<const std::int8_t*>(
+                    iq1s_grid +
+                    (qs[l] | (((qh[ib] >> (3 * l)) & 7) << 8)));
+                for (int j = 0; j < 8; ++j) {
+                    lsum += q8[j] * grid[j];
+                }
+                q8 += 8;
+            }
+            sumi += ls * lsum;
+            sumi1 += ls * delta *
+                     (xq[i].bsums[2 * ib + 0] + xq[i].bsums[2 * ib + 1]);
+            qs += 4;
+        }
+        sumf += d * (static_cast<float>(sumi) +
+                     kDelta * static_cast<float>(sumi1));
+    }
+    return sumf;
+}
+
+/** IQ1_M (56B) x Q8_K integer dot; ports ggml_vec_dot_iq1_m_q8_K_
+ *  generic (scale assembled from 4 nibbles, per-8 delta on q8 sums). */
+float vec_dot_iq1_m_q8_k(const std::byte* row, const BlockQ8K* xq,
+                         std::size_t nb) {
+    constexpr float kDelta = 0.125f;  // IQ1M_DELTA
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 56;
+        const auto* qs = reinterpret_cast<const std::uint8_t*>(blk + 0);
+        const auto* qh =
+            reinterpret_cast<const std::uint8_t*>(blk + 32);
+        const auto* sc =
+            reinterpret_cast<const std::uint16_t*>(blk + 48);
+        const std::uint16_t scale_u16 =
+            (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+            ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+        const std::int8_t* q8 = xq[i].qs;
+        std::int32_t sumi1 = 0, sumi2 = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const int delta[4] = {(qh[0] & 0x08) ? -1 : 1,
+                                  (qh[0] & 0x80) ? -1 : 1,
+                                  (qh[1] & 0x08) ? -1 : 1,
+                                  (qh[1] & 0x80) ? -1 : 1};
+            std::int32_t sum1[2] = {0, 0}, sum2[2] = {0, 0};
+            for (int l = 0; l < 4; ++l) {
+                const auto* grid = reinterpret_cast<const std::int8_t*>(
+                    iq1s_grid +
+                    (qs[l] |
+                     ((static_cast<std::uint16_t>(qh[l / 2])
+                       << (8 - 4 * (l % 2))) &
+                      0x700)));
+                std::int32_t lsum1 = 0, lsum2 = 0;
+                for (int j = 0; j < 8; ++j) {
+                    lsum1 += q8[j] * grid[j];
+                    lsum2 += q8[j];
+                }
+                q8 += 8;
+                sum1[l / 2] += lsum1;
+                sum2[l / 2] += lsum2 * delta[l];
+            }
+            const int ls1 = 2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1;
+            const int ls2 = 2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1;
+            sumi1 += sum1[0] * ls1 + sum1[1] * ls2;
+            sumi2 += sum2[0] * ls1 + sum2[1] * ls2;
+            qs += 4;
+            qh += 2;
+        }
+        sumf += f16_to_f32(scale_u16) * xq[i].d *
+                (static_cast<float>(sumi1) +
+                 kDelta * static_cast<float>(sumi2));
+    }
+    return sumf;
+}
+
 float dot_k_quant(const Mat& w, const std::byte* row,
                   std::span<const float> x) {
     const auto [bytes, fn] = k_traits(w.type);
@@ -1809,7 +1901,9 @@ void matvec_q8k(const Mat& w, std::span<const float> x,
                          w.type == T::kIQ2_XS ||
                          w.type == T::kIQ2_S ||
                          w.type == T::kIQ3_XXS ||
-                         w.type == T::kIQ3_S) &&
+                         w.type == T::kIQ3_S ||
+                         w.type == T::kIQ1_S ||
+                         w.type == T::kIQ1_M) &&
                         x.size() % 256 == 0;
     if (!ported) {  // types without a Q8_K dot yet: keep the f32 path
         matvec(w, x, out);
@@ -1857,6 +1951,12 @@ void matvec_q8k(const Mat& w, std::span<const float> x,
                 break;
             case T::kIQ3_S:
                 out[r] = vec_dot_iq3_s_q8_k(row, xq.data(), nb);
+                break;
+            case T::kIQ1_S:
+                out[r] = vec_dot_iq1_s_q8_k(row, xq.data(), nb);
+                break;
+            case T::kIQ1_M:
+                out[r] = vec_dot_iq1_m_q8_k(row, xq.data(), nb);
                 break;
             default:
                 break;
