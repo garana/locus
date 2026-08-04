@@ -1,8 +1,10 @@
 #include "locus/backend/cpu_ops.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 namespace locus::backend {
 
@@ -707,6 +709,139 @@ float dot_iq4_nl(const std::byte* row, std::span<const float> x) {
     return acc;
 }
 
+// ---- Q8_K activation quantization (ggml parity). ggml's k-quant/IQ
+// matvec quantizes the ACTIVATION vector to Q8_K (256-block: f32 scale
+// + int8 quants + per-16 sums) and does an integer dot with the
+// quantized weight. Matching it makes locus bit-exact with llama.cpp
+// on quantized matvec (and enables integer-dot speed). ----
+
+/** ggml's round-to-nearest (the 2^23 magic-add trick); matches the
+ *  quantizer bit-for-bit, unlike std::lround (half-away-from-zero). */
+int nearest_int(float fval) {
+    float val = fval + 12582912.0f;
+    std::int32_t i;
+    std::memcpy(&i, &val, sizeof(i));
+    return (i & 0x007fffff) - 0x00400000;
+}
+
+/** One Q8_K block: 256 int8 quants, an f32 scale, and the sum of each
+ *  group of 16 quants (used by the weight-min correction). */
+struct BlockQ8K {
+    float d;
+    std::int8_t qs[256];
+    std::int16_t bsums[16];
+};
+
+/** Quantizes n floats (n % 256 == 0) into Q8_K blocks. Ports ggml
+ *  quantize_row_q8_K_ref exactly (iscale = -127/max). */
+void quantize_row_q8_k(const float* x, BlockQ8K* y, std::size_t n) {
+    const std::size_t nb = n / 256;
+    for (std::size_t i = 0; i < nb; ++i) {
+        float amax = 0.0f, max = 0.0f;
+        for (int j = 0; j < 256; ++j) {
+            const float ax = std::fabs(x[j]);
+            if (ax > amax) {
+                amax = ax;
+                max = x[j];
+            }
+        }
+        if (amax == 0.0f) {
+            y[i].d = 0.0f;
+            std::memset(y[i].qs, 0, 256);
+            std::memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            x += 256;
+            continue;
+        }
+        const float iscale = -127.0f / max;
+        for (int j = 0; j < 256; ++j) {
+            const int v = nearest_int(iscale * x[j]);
+            y[i].qs[j] = static_cast<std::int8_t>(std::min(127, v));
+        }
+        for (int j = 0; j < 16; ++j) {
+            int sum = 0;
+            for (int ii = 0; ii < 16; ++ii) {
+                sum += y[i].qs[j * 16 + ii];
+            }
+            y[i].bsums[j] = static_cast<std::int16_t>(sum);
+        }
+        y[i].d = 1.0f / iscale;
+        x += 256;
+    }
+}
+
+/** Q4_K (144B block) x Q8_K activation integer dot; ports ggml
+ *  ggml_vec_dot_q4_K_q8_K_generic. `xq` holds nb Q8_K blocks. */
+float vec_dot_q4_k_q8_k(const std::byte* row, const BlockQ8K* xq,
+                        std::size_t nb) {
+    constexpr std::uint32_t kmask1 = 0x3f3f3f3f;
+    constexpr std::uint32_t kmask2 = 0x0f0f0f0f;
+    constexpr std::uint32_t kmask3 = 0x03030303;
+    std::uint32_t utmp[4];
+    const auto* scales = reinterpret_cast<const std::uint8_t*>(&utmp[0]);
+    const auto* mins = reinterpret_cast<const std::uint8_t*>(&utmp[2]);
+    std::int8_t aux8[256];
+    std::int16_t aux16[8];
+    float sums[8] = {0};
+    std::int32_t aux32[8];
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 144;
+        const float bd = f16_to_f32(load_u16(blk));
+        const float bdmin = f16_to_f32(load_u16(blk + 2));
+        const auto* q4 =
+            reinterpret_cast<const std::uint8_t*>(blk + 16);
+        const std::int8_t* q8 = xq[i].qs;
+        std::memset(aux32, 0, sizeof(aux32));
+        std::int8_t* a = aux8;
+        for (int j = 0; j < 4; ++j) {
+            for (int l = 0; l < 32; ++l) {
+                a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
+            }
+            a += 32;
+            for (int l = 0; l < 32; ++l) {
+                a[l] = static_cast<std::int8_t>(q4[l] >> 4);
+            }
+            a += 32;
+            q4 += 32;
+        }
+        std::memcpy(utmp, blk + 4, 12);  // Q4_K scales[12]
+        utmp[3] = ((utmp[2] >> 4) & kmask2) |
+                  (((utmp[1] >> 6) & kmask3) << 4);
+        const std::uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+        int sumi = 0;
+        for (int j = 0; j < 16; ++j) {
+            sumi += xq[i].bsums[j] * mins[j / 2];
+        }
+        a = aux8;
+        int is = 0;
+        for (int j = 0; j < 8; ++j) {
+            const std::int32_t scale = scales[is++];
+            for (int k = 0; k < 4; ++k) {
+                for (int l = 0; l < 8; ++l) {
+                    aux16[l] = static_cast<std::int16_t>(q8[l] * a[l]);
+                }
+                for (int l = 0; l < 8; ++l) {
+                    aux32[l] += scale * aux16[l];
+                }
+                q8 += 8;
+                a += 8;
+            }
+        }
+        const float d = bd * xq[i].d;
+        for (int l = 0; l < 8; ++l) {
+            sums[l] += d * static_cast<float>(aux32[l]);
+        }
+        sumf -= bdmin * xq[i].d * static_cast<float>(sumi);
+    }
+    for (int l = 0; l < 8; ++l) {
+        sumf += sums[l];
+    }
+    return sumf;
+}
+
 float dot_k_quant(const Mat& w, const std::byte* row,
                   std::span<const float> x) {
     const auto [bytes, fn] = k_traits(w.type);
@@ -1068,6 +1203,23 @@ void matvec(const Mat& w, std::span<const float> x,
                 out[r] = dot_k_quant(w, row, x);
                 break;
         }
+    }
+}
+
+void matvec_q8k(const Mat& w, std::span<const float> x,
+                std::span<float> out) {
+    assert(x.size() == w.cols && out.size() == w.rows);
+    // Q8_K integer-dot path for Q4_K; other types keep the f32 dot.
+    if (w.type != gguf::TensorType::kQ4_K || x.size() % 256 != 0) {
+        matvec(w, x, out);
+        return;
+    }
+    const std::size_t nb = x.size() / 256;
+    std::vector<BlockQ8K> xq(nb);
+    quantize_row_q8_k(x.data(), xq.data(), x.size());
+    const std::size_t stride = row_bytes(w);
+    for (std::uint32_t r = 0; r < w.rows; ++r) {
+        out[r] = vec_dot_q4_k_q8_k(w.data + r * stride, xq.data(), nb);
     }
 }
 

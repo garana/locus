@@ -477,6 +477,39 @@ TEST_CASE("IQ1_M matvec matches dequant_row and CUDA",
     }
 }
 
+// R16 Q8_K activation-dot: matvec_q8k quantizes x to Q8_K and does an
+// integer dot (ggml parity), vs matvec's f32-activation dot. On Q4_K
+// the two closely agree (8-bit activation quant), which validates the
+// port; the bit-exact-vs-llama.cpp property is covered by the model
+// goldens.
+TEST_CASE("Q8_K matvec approximates the f32 dot (Q4_K)",
+          "[ops][q8k]") {
+    constexpr std::uint32_t rows = 4, cols = 512;  // 2 blocks/row
+    std::mt19937 rng(19);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    std::vector<std::byte> w;
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        auto row = k_quant_row(TensorType::kQ4_K, 2, 200u + r);
+        w.insert(w.end(), row.begin(), row.end());
+    }
+    Mat m{TensorType::kQ4_K, w.data(), rows, cols};
+    std::vector<float> f32(rows), q8k(rows);
+    matvec(m, x, f32);
+    matvec_q8k(m, x, q8k);
+    bool nonzero = false;
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        INFO("row " << r);
+        REQUIRE(q8k[r] ==
+                Approx(f32[r]).epsilon(0.03).margin(0.02));
+        nonzero = nonzero || q8k[r] != 0.0f;
+    }
+    REQUIRE(nonzero);
+}
+
 #if defined(__aarch64__)
 TEST_CASE("matvec_neon matches the scalar reference for K-quants",
           "[ops][neon]") {

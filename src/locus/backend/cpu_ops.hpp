@@ -92,6 +92,17 @@ void matvec(const Mat& w, std::span<const float> x,
             std::span<float> out);
 
 /**
+ * Q8_K-activation matvec (ggml parity, DESIGN.md R16): the activation
+ * x is quantized to Q8_K once and integer-dotted with the quantized
+ * weight rows, matching llama.cpp bit-for-bit on quantized matvec (vs
+ * the f32-activation dot in matvec). Currently the Q8_K path covers
+ * Q4_K; other types delegate to matvec. `x.size()` must be a multiple
+ * of 256 for the Q8_K types.
+ */
+void matvec_q8k(const Mat& w, std::span<const float> x,
+                std::span<float> out);
+
+/**
  * Scalar reference for the R11 batched matvec (backend::Ops::
  * matvec_batch). Applies w to n token vectors (x_batch is n*w.cols,
  * token t at t*w.cols) and writes results row-major: out_batch is
