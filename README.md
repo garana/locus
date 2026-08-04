@@ -10,7 +10,10 @@ between llama.cpp and the Python serving stacks (LightLLM, vLLM):
 - minimal, auditable, vendored dependency surface.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full MVP design and
-milestone plan.
+milestone plan, [docs/CLIENTS.md](docs/CLIENTS.md) for supported
+clients/endpoints (OpenAI + Anthropic, incl. Claude Code and GitHub
+Copilot CLI offline), and [docs/COMPARISON.md](docs/COMPARISON.md)
+for how locus compares to other engines.
 
 ## Status
 
