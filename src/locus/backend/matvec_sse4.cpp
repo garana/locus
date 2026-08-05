@@ -645,12 +645,87 @@ void q3_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8,
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
 }
 
+/** @returns The sum of the four int32 lanes of v. */
+int hsum_epi32_sse4(__m128i v) {
+    const __m128i hi = _mm_add_epi32(v, _mm_srli_si128(v, 8));
+    const __m128i lo = _mm_add_epi32(hi, _mm_srli_si128(hi, 4));
+    return _mm_cvtsi128_si32(lo);
+}
+
+/** SSE4 Q2_K x Q8_K: computes isum (the scaled 2-bit dot) and summs
+ *  (the bsums min term) for one super-block. isuml over 16 values is a
+ *  total, so maddubs pair-collapse is exact here (no overflow: 3*127
+ *  per product). Bit-identical to scalar vec_dot_q2_k_q8_k. */
+void q2_k_q8k_block_sse4(const std::byte* blk, const std::int8_t* q8,
+                         const std::int16_t* bsums, int& isum,
+                         int& summs) {
+    const auto* sc = reinterpret_cast<const std::uint8_t*>(blk);
+    const auto* q2 = reinterpret_cast<const std::uint8_t*>(blk + 16);
+    summs = 0;
+    for (int j = 0; j < 16; ++j) {
+        summs += bsums[j] * (sc[j] >> 4);
+    }
+    const __m128i ones = _mm_set1_epi16(1);
+    const __m128i m3 = _mm_set1_epi8(3);
+    isum = 0;
+    int is = 0;
+    for (int k = 0; k < 2; ++k) {
+        const __m128i q2lo = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(q2 + k * 32));
+        const __m128i q2hi = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(q2 + k * 32 + 16));
+        for (int j = 0; j < 4; ++j) {
+            const int shift = 2 * j;
+            const __m128i v0 = _mm_and_si128(
+                _mm_srli_epi16(q2lo, shift), m3);  // 16 x 2-bit
+            const __m128i v1 =
+                _mm_and_si128(_mm_srli_epi16(q2hi, shift), m3);
+            const __m128i qa = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(q8));
+            const __m128i qb = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(q8 + 16));
+            const int isum0 = hsum_epi32_sse4(
+                _mm_madd_epi16(_mm_maddubs_epi16(v0, qa), ones));
+            const int isum1 = hsum_epi32_sse4(
+                _mm_madd_epi16(_mm_maddubs_epi16(v1, qb), ones));
+            isum += (sc[is++] & 0xF) * isum0;
+            isum += (sc[is++] & 0xF) * isum1;
+            q8 += 32;
+        }
+    }
+}
+
 void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
     const bool q4k = w.type == gguf::TensorType::kQ4_K;
     const bool q5k = w.type == gguf::TensorType::kQ5_K;
     const bool q6k = w.type == gguf::TensorType::kQ6_K;
     const bool q3k = w.type == gguf::TensorType::kQ3_K;
+    const bool q2k = w.type == gguf::TensorType::kQ2_K;
+    if (q2k && x.size() % 256 == 0) {  // isum/summs, not the aux32 path
+        const std::size_t nb = x.size() / 256;
+        std::vector<float> hd(nb);
+        std::vector<std::int8_t> hqs(x.size());
+        std::vector<std::int16_t> hbs(nb * 16);
+        quantize_activation_q8k(x, hd.data(), hqs.data(), hbs.data());
+        const std::size_t row_bytes = nb * 84;
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            const std::byte* row = w.data + r * row_bytes;
+            float sumf = 0.0f;
+            for (std::size_t b = 0; b < nb; ++b) {
+                const std::byte* blk = row + b * 84;
+                const float bd = f16_to_f32(load_u16(blk + 80));
+                const float bdmin = f16_to_f32(load_u16(blk + 82));
+                int isum = 0, summs = 0;
+                q2_k_q8k_block_sse4(blk, hqs.data() + b * 256,
+                                    hbs.data() + b * 16, isum, summs);
+                sumf += hd[b] * bd * static_cast<float>(isum) -
+                        hd[b] * bdmin * static_cast<float>(summs);
+            }
+            out[r] = sumf;
+        }
+        return;
+    }
     if ((!q4k && !q5k && !q6k && !q3k) || x.size() % 256 != 0) {
         matvec_q8k(w, x, out);  // other types: scalar Q8_K
         return;

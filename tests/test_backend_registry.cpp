@@ -298,7 +298,7 @@ TEST_CASE("avx2 matvec matches scalar", "[backend]") {
 
 // R16 ggml-parity: SSE4 Q8_K-activation dot must equal scalar
 // matvec_q8k bit-for-bit (same host quant, widen-per-lane products).
-TEST_CASE("sse4 q8k matvec matches scalar q8k (Q3_K/Q4_K/Q5_K/Q6_K)",
+TEST_CASE("sse4 q8k matvec matches scalar q8k (all k-quants)",
           "[backend]") {
     if (!locus::sys::detect().sse4) {
         SKIP("CPU lacks SSE4.1");
@@ -319,8 +319,9 @@ TEST_CASE("sse4 q8k matvec matches scalar q8k (Q3_K/Q4_K/Q5_K/Q6_K)",
         v = dist(rng);
     }
     for (const Q& q :
-         {Q{TT::kQ3_K, 110, 108, -1}, Q{TT::kQ4_K, 144, 0, 2},
-          Q{TT::kQ5_K, 176, 0, 2}, Q{TT::kQ6_K, 210, 208, -1}}) {
+         {Q{TT::kQ2_K, 84, 80, 82}, Q{TT::kQ3_K, 110, 108, -1},
+          Q{TT::kQ4_K, 144, 0, 2}, Q{TT::kQ5_K, 176, 0, 2},
+          Q{TT::kQ6_K, 210, 208, -1}}) {
         std::vector<std::byte> w(static_cast<std::size_t>(rows) *
                                  (cols / 256) * q.bytes);
         for (auto& by : w) {
