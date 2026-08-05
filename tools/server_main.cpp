@@ -24,6 +24,18 @@ int main(int argc, char** argv) {
         locus_tools::print_archs();
         return 0;
     }
+    if (args.list_quants) {
+        locus_tools::print_quants();
+        return 0;
+    }
+    if (args.list_tokenizers) {
+        locus_tools::print_tokenizers();
+        return 0;
+    }
+    if (args.list_capabilities) {
+        locus_tools::print_capabilities();
+        return 0;
+    }
     if (args.help) {
         std::printf(
             "usage: %s [options] <model.gguf> [port]\n\n"

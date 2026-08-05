@@ -8,9 +8,34 @@
 #include <vector>
 
 #include "locus/backend/registry.hpp"
+#include "locus/gguf/gguf.hpp"
 #include "locus/model/arch.hpp"
+#include "locus/sys/features.hpp"
 
 namespace locus_tools {
+
+/** Why a compiled backend is unavailable on THIS machine (empty when
+ * available), derived from the detected CPU/GPU features. */
+inline std::string backend_unavail_reason(std::string_view name) {
+    const locus::sys::Features f = locus::sys::detect();
+    if (name == "neon") {
+        return f.neon ? "" : "not an ARM/NEON CPU";
+    }
+    if (name == "sse4") {
+        return f.sse4 ? "" : "CPU lacks SSE4 (not on this arch)";
+    }
+    if (name == "avx2") {
+        return f.avx2 ? "" : "CPU lacks AVX2 (not on this arch)";
+    }
+    if (name == "vulkan") {
+        return f.vulkan ? "Vulkan device unusable"
+                        : "no Vulkan loader on this machine";
+    }
+    if (name == "cuda") {
+        return "no CUDA device or non-CUDA build";
+    }
+    return "unavailable on this machine";
+}
 
 /** Prints the supported model architectures. */
 inline void print_archs() {
@@ -22,19 +47,101 @@ inline void print_archs() {
     }
 }
 
-/** Prints the backend registry, marking the auto-pick with '*'. */
+/** Prints the backend registry, marking the auto-pick with '*'.
+ * Compiled-but-unavailable backends are shown (not hidden) with the
+ * reason they are inactive on this machine. */
 inline void print_backends() {
     const auto& best = locus::backend::best_backend();
     std::printf("backends (best first):\n");
     for (const auto& b : locus::backend::backends()) {
-        const char* note = !b.available      ? "  [unavailable]"
-                           : !b.selectable   ? "  [not selectable]"
-                           : &b == &best     ? "  [default]"
-                                             : "";
+        std::string note;
+        if (!b.available) {
+            note = "  [unavailable: " +
+                   backend_unavail_reason(b.name) + "]";
+        } else if (!b.selectable) {
+            note = "  [not selectable]";
+        } else if (&b == &best) {
+            note = "  [default]";
+        }
         std::printf("%c %-8s %s%s\n", &b == &best ? '*' : ' ',
                     std::string(b.name).c_str(),
-                    std::string(b.description).c_str(), note);
+                    std::string(b.description).c_str(), note.c_str());
     }
+    // Variants compiled out for this architecture (e.g. the x86 SSE4/
+    // AVX2 backends on an ARM build) are absent from the registry;
+    // list them too so the operator sees the full matrix.
+    for (const char* n : {"scalar", "neon", "sse4", "avx2", "vulkan",
+                          "cuda"}) {
+        if (locus::backend::find_backend(n) == nullptr) {
+            std::printf(
+                "  %-8s [unavailable: not built for this "
+                "architecture]\n",
+                n);
+        }
+    }
+}
+
+/** Prints the quantization / tensor types locus can load. */
+inline void print_quants() {
+    using T = locus::gguf::TensorType;
+    struct Q {
+        T type;
+        const char* name;
+        const char* group;
+    };
+    static constexpr Q kQuants[] = {
+        {T::kF32, "F32", "float"},
+        {T::kF16, "F16", "float"},
+        {T::kQ4_0, "Q4_0", "legacy"},
+        {T::kQ4_1, "Q4_1", "legacy"},
+        {T::kQ5_0, "Q5_0", "legacy"},
+        {T::kQ5_1, "Q5_1", "legacy"},
+        {T::kQ8_0, "Q8_0", "legacy"},
+        {T::kQ8_1, "Q8_1", "legacy"},
+        {T::kQ2_K, "Q2_K", "k-quant"},
+        {T::kQ3_K, "Q3_K", "k-quant"},
+        {T::kQ4_K, "Q4_K", "k-quant"},
+        {T::kQ5_K, "Q5_K", "k-quant"},
+        {T::kQ6_K, "Q6_K", "k-quant"},
+        {T::kQ8_K, "Q8_K", "k-quant"},
+        {T::kIQ2_XXS, "IQ2_XXS", "iq"},
+        {T::kIQ2_XS, "IQ2_XS", "iq"},
+        {T::kIQ2_S, "IQ2_S", "iq"},
+        {T::kIQ3_XXS, "IQ3_XXS", "iq"},
+        {T::kIQ3_S, "IQ3_S", "iq"},
+        {T::kIQ1_S, "IQ1_S", "iq"},
+        {T::kIQ1_M, "IQ1_M", "iq"},
+        {T::kIQ4_NL, "IQ4_NL", "iq"},
+        {T::kIQ4_XS, "IQ4_XS", "iq"},
+        {T::kTQ1_0, "TQ1_0", "ternary/BitNet"},
+        {T::kTQ2_0, "TQ2_0", "ternary/BitNet"},
+    };
+    std::printf("quantization types (loadable weight formats):\n");
+    for (const Q& q : kQuants) {
+        std::printf("  %-9s %s\n", q.name, q.group);
+    }
+}
+
+/** Prints the tokenizer families locus understands. */
+inline void print_tokenizers() {
+    std::printf("tokenizers (by tokenizer.ggml.model):\n");
+    std::printf(
+        "  spm       SentencePiece unigram (model=llama)\n");
+    std::printf(
+        "  bpe       byte-level BPE (model=gpt2); "
+        "pretokenizers: gpt2, llama3\n");
+}
+
+/** Prints the full capability matrix: archs, backends, quants,
+ * tokenizers. */
+inline void print_capabilities() {
+    print_archs();
+    std::printf("\n");
+    print_backends();
+    std::printf("\n");
+    print_quants();
+    std::printf("\n");
+    print_tokenizers();
 }
 
 /** Flag lines shared by every tool's --help output. */
@@ -43,6 +150,10 @@ inline constexpr const char* kCommonHelp =
     "  --backend NAME   select the math backend (see --backends)\n"
     "  --backends       list available backends and exit\n"
     "  --archs          list supported architectures and exit\n"
+    "  --quants         list loadable quant types and exit\n"
+    "  --tokenizers     list tokenizer families and exit\n"
+    "  --capabilities   list archs+backends+quants+tokenizers, "
+    "exit\n"
     "  --ctx N          cap the KV pool at N tokens (bounds the\n"
     "                   dirty memory a run can allocate; default\n"
     "                   min(model context, 4096))\n"
@@ -97,6 +208,12 @@ struct BackendArgs {
     bool list = false;
     /** --archs was given: list architectures and exit. */
     bool list_archs = false;
+    /** --quants: list loadable quant types and exit. */
+    bool list_quants = false;
+    /** --tokenizers: list tokenizer families and exit. */
+    bool list_tokenizers = false;
+    /** --capabilities: dump archs+backends+quants+tokenizers. */
+    bool list_capabilities = false;
     /** --help / -h was given: print usage and exit. */
     bool help = false;
 };
@@ -109,6 +226,12 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.list = true;
         } else if (a == "--archs") {
             out.list_archs = true;
+        } else if (a == "--quants") {
+            out.list_quants = true;
+        } else if (a == "--tokenizers") {
+            out.list_tokenizers = true;
+        } else if (a == "--capabilities") {
+            out.list_capabilities = true;
         } else if (a == "--help" || a == "-h") {
             out.help = true;
         } else if (a == "--backend" && i + 1 < argc) {
