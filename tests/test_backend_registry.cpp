@@ -307,7 +307,7 @@ TEST_CASE("cuda matvec matches scalar", "[backend]") {
 
 // R16 ggml-parity: the CUDA Q8_K-activation dot must match the scalar
 // matvec_q8k bit-for-bit (same host quant, same accumulation order).
-TEST_CASE("cuda q8k matvec matches scalar q8k (k-quants + IQ2/IQ4/TQ)",
+TEST_CASE("cuda q8k matvec matches scalar q8k (all QK_K types)",
           "[backend]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
@@ -334,7 +334,9 @@ TEST_CASE("cuda q8k matvec matches scalar q8k (k-quants + IQ2/IQ4/TQ)",
           Q{TT::kQ5_K, 176, 0, 2}, Q{TT::kQ6_K, 210, 208, -1},
           Q{TT::kIQ2_XXS, 66, 0, -1}, Q{TT::kIQ2_XS, 74, 0, -1},
           Q{TT::kIQ2_S, 82, 0, -1}, Q{TT::kTQ1_0, 54, 52, -1},
-          Q{TT::kTQ2_0, 66, 64, -1}, Q{TT::kIQ4_XS, 136, 0, -1}}) {
+          Q{TT::kTQ2_0, 66, 64, -1}, Q{TT::kIQ4_XS, 136, 0, -1},
+          Q{TT::kIQ3_XXS, 98, 0, -1}, Q{TT::kIQ3_S, 110, 0, -1},
+          Q{TT::kIQ1_S, 50, 0, -1}, Q{TT::kIQ1_M, 56, 0, -1}}) {
         // Drop cached pages: successive w vectors can recycle a host
         // address, and different types cache different-sized pages
         // under it -- reset so no launch reads a stale/short page.

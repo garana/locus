@@ -838,6 +838,257 @@ __global__ void matvec_iq4_xs_q8k_kernel(
     out[r] = sumf;
 }
 
+/** IQ3_XXS x Q8_K integer dot; bit-exact port of vec_dot_iq3_xxs_q8_k
+ *  (iq3xxs_grid u32 entries + ksigns, per-32 scale, 0.25 factor). */
+__global__ void matvec_iq3_xxs_q8k_kernel(
+    const std::uint8_t* w, const std::uint32_t* grid,
+    const std::uint8_t* ksigns, const float* d_y,
+    const std::int8_t* qs_y, float* out, std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 98;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * row_bytes;
+    float sumf = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk =
+            row + static_cast<std::size_t>(b) * 98;
+        const float d = ld_f16(blk) * d_y[b];
+        const std::uint8_t* q3 = blk + 2;
+        const std::uint8_t* gas = blk + 66;
+        const std::int8_t* q8 = qs_y + static_cast<std::size_t>(b) * 256;
+        std::int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const std::uint32_t aux32 = ld_u32(gas);
+            gas += 4;
+            const std::uint32_t ls = 2 * (aux32 >> 28) + 1;
+            std::int32_t sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint8_t* g1 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + q3[2 * l + 0]);
+                const std::uint8_t* g2 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + q3[2 * l + 1]);
+                const std::uint8_t signs =
+                    ksigns[(aux32 >> (7 * l)) & 127];
+                for (int j = 0; j < 4; ++j) {
+                    sumi += g1[j] * q8[j + 0] *
+                            ((signs & (1 << (j + 0))) ? -1 : 1);
+                    sumi += g2[j] * q8[j + 4] *
+                            ((signs & (1 << (j + 4))) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            q3 += 8;
+            bsum += sumi * static_cast<std::int32_t>(ls);
+        }
+        sumf += d * static_cast<float>(bsum);
+    }
+    out[r] = 0.25f * sumf;
+}
+
+/** IQ3_S x Q8_K integer dot; bit-exact port of vec_dot_iq3_s_q8_k
+ *  (iq3s_grid u32 + qh 9th-bit extension, inline signs). */
+__global__ void matvec_iq3_s_q8k_kernel(
+    const std::uint8_t* w, const std::uint32_t* grid, const float* d_y,
+    const std::int8_t* qs_y, float* out, std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 110;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * row_bytes;
+    float sumf = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk =
+            row + static_cast<std::size_t>(b) * 110;
+        const float d = ld_f16(blk) * d_y[b];
+        const std::uint8_t* qh = blk + 66;
+        const std::uint8_t* sc = blk + 106;
+        const std::uint8_t* qsp = blk + 2;
+        const std::uint8_t* signs = blk + 74;
+        const std::int8_t* q8 = qs_y + static_cast<std::size_t>(b) * 256;
+        std::int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+            const std::uint32_t ls1 = 2 * (sc[ib32 / 2] & 0xf) + 1;
+            const std::uint32_t ls2 = 2 * (sc[ib32 / 2] >> 4) + 1;
+            std::int32_t sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint8_t* g1 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (qsp[2 * l] |
+                                ((qh[ib32] << (8 - 2 * l)) & 256)));
+                const std::uint8_t* g2 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (qsp[2 * l + 1] |
+                                ((qh[ib32] << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    sumi += g1[j] * q8[j + 0] *
+                            ((signs[l] & (1 << (j + 0))) ? -1 : 1);
+                    sumi += g2[j] * q8[j + 4] *
+                            ((signs[l] & (1 << (j + 4))) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            qsp += 8;
+            signs += 4;
+            bsum += sumi * static_cast<std::int32_t>(ls1);
+            sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const std::uint8_t* g1 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (qsp[2 * l] |
+                                ((qh[ib32 + 1] << (8 - 2 * l)) & 256)));
+                const std::uint8_t* g2 =
+                    reinterpret_cast<const std::uint8_t*>(
+                        grid + (qsp[2 * l + 1] |
+                                ((qh[ib32 + 1] << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    sumi += g1[j] * q8[j + 0] *
+                            ((signs[l] & (1 << (j + 0))) ? -1 : 1);
+                    sumi += g2[j] * q8[j + 4] *
+                            ((signs[l] & (1 << (j + 4))) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            qsp += 8;
+            signs += 4;
+            bsum += sumi * static_cast<std::int32_t>(ls2);
+        }
+        sumf += d * static_cast<float>(bsum);
+    }
+    out[r] = sumf;
+}
+
+/** IQ1_S x Q8_K integer dot; bit-exact port of vec_dot_iq1_s_q8_k
+ *  (iq1s_grid u64, per-32 delta folded through the Q8_K bsums). */
+__global__ void matvec_iq1_s_q8k_kernel(
+    const std::uint8_t* w, const std::uint64_t* grid, const float* d_y,
+    const std::int8_t* qs_y, const std::int16_t* bsums_y, float* out,
+    std::uint32_t rows, std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 50;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * row_bytes;
+    float sumf = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk =
+            row + static_cast<std::size_t>(b) * 50;
+        const float d = ld_f16(blk) * d_y[b];
+        const std::uint8_t* qs = blk + 2;
+        const std::uint8_t* qhb = blk + 34;
+        const std::int8_t* q8 = qs_y + static_cast<std::size_t>(b) * 256;
+        const std::int16_t* bs =
+            bsums_y + static_cast<std::size_t>(b) * 16;
+        std::int32_t sumi = 0, sumi1 = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const std::uint16_t qh = static_cast<std::uint16_t>(
+                qhb[2 * ib] | (qhb[2 * ib + 1] << 8));
+            const int ls = 2 * ((qh >> 12) & 7) + 1;
+            const int delta = (qh & 0x8000) ? -1 : 1;
+            std::int32_t lsum = 0;
+            for (int l = 0; l < 4; ++l) {
+                const std::int8_t* g =
+                    reinterpret_cast<const std::int8_t*>(
+                        grid + (qs[l] | (((qh >> (3 * l)) & 7) << 8)));
+                for (int j = 0; j < 8; ++j) {
+                    lsum += q8[j] * g[j];
+                }
+                q8 += 8;
+            }
+            sumi += ls * lsum;
+            sumi1 +=
+                ls * delta * (bs[2 * ib + 0] + bs[2 * ib + 1]);
+            qs += 4;
+        }
+        sumf += d * (static_cast<float>(sumi) +
+                     0.125f * static_cast<float>(sumi1));
+    }
+    out[r] = sumf;
+}
+
+/** IQ1_M x Q8_K integer dot; bit-exact port of vec_dot_iq1_m_q8_k
+ *  (iq1s_grid u64, scale from 4 nibbles, per-8 delta on q8 sums). */
+__global__ void matvec_iq1_m_q8k_kernel(
+    const std::uint8_t* w, const std::uint64_t* grid, const float* d_y,
+    const std::int8_t* qs_y, float* out, std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 56;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * row_bytes;
+    float sumf = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk =
+            row + static_cast<std::size_t>(b) * 56;
+        const std::uint8_t* qs = blk;
+        const std::uint8_t* qh = blk + 32;
+        const std::uint8_t* scb = blk + 48;
+        const std::uint16_t scv[4] = {
+            static_cast<std::uint16_t>(scb[0] | (scb[1] << 8)),
+            static_cast<std::uint16_t>(scb[2] | (scb[3] << 8)),
+            static_cast<std::uint16_t>(scb[4] | (scb[5] << 8)),
+            static_cast<std::uint16_t>(scb[6] | (scb[7] << 8))};
+        const std::uint16_t scale_u16 =
+            (scv[0] >> 12) | ((scv[1] >> 8) & 0x00f0) |
+            ((scv[2] >> 4) & 0x0f00) | (scv[3] & 0xf000);
+        const std::int8_t* q8 = qs_y + static_cast<std::size_t>(b) * 256;
+        std::int32_t sumi1 = 0, sumi2 = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const int delta[4] = {(qh[0] & 0x08) ? -1 : 1,
+                                  (qh[0] & 0x80) ? -1 : 1,
+                                  (qh[1] & 0x08) ? -1 : 1,
+                                  (qh[1] & 0x80) ? -1 : 1};
+            std::int32_t sum1[2] = {0, 0}, sum2[2] = {0, 0};
+            for (int l = 0; l < 4; ++l) {
+                const std::int8_t* g =
+                    reinterpret_cast<const std::int8_t*>(
+                        grid +
+                        (qs[l] |
+                         ((static_cast<std::uint16_t>(qh[l / 2])
+                           << (8 - 4 * (l % 2))) &
+                          0x700)));
+                std::int32_t lsum1 = 0, lsum2 = 0;
+                for (int j = 0; j < 8; ++j) {
+                    lsum1 += q8[j] * g[j];
+                    lsum2 += q8[j];
+                }
+                q8 += 8;
+                sum1[l / 2] += lsum1;
+                sum2[l / 2] += lsum2 * delta[l];
+            }
+            const int ls1 =
+                2 * ((scv[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1;
+            const int ls2 =
+                2 * ((scv[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1;
+            sumi1 += sum1[0] * ls1 + sum1[1] * ls2;
+            sumi2 += sum2[0] * ls1 + sum2[1] * ls2;
+            qs += 4;
+            qh += 2;
+        }
+        sumf += __half2float(__ushort_as_half(scale_u16)) * d_y[b] *
+                (static_cast<float>(sumi1) +
+                 0.125f * static_cast<float>(sumi2));
+    }
+    out[r] = sumf;
+}
+
 /** One Q5_K super-block is 176 bytes: d,dmin (f16) + scales[12] +
  *  qh[32] + ql[128], 256 weights. The 5th bit comes from qh, its bit
  *  position advancing per 64-group (u1/u2). Fill order is sequential,
@@ -2425,6 +2676,10 @@ bool cuda_has_q8k_kernel(gguf::TensorType type) {
         case gguf::TensorType::kTQ1_0:
         case gguf::TensorType::kTQ2_0:
         case gguf::TensorType::kIQ4_XS:
+        case gguf::TensorType::kIQ3_XXS:
+        case gguf::TensorType::kIQ3_S:
+        case gguf::TensorType::kIQ1_S:
+        case gguf::TensorType::kIQ1_M:
             return true;
         default:
             return false;
@@ -2524,6 +2779,24 @@ bool run_matvec_q8k(const Mat& w, std::span<const float> x,
                         dwb, t.kvalues, ddf, dqsb, doutf, w.rows,
                         w.cols);
                     break;
+                case gguf::TensorType::kIQ3_XXS:
+                    matvec_iq3_xxs_q8k_kernel<<<blocks, threads>>>(
+                        dwb, t.g32, t.ksigns, ddf, dqsb, doutf, w.rows,
+                        w.cols);
+                    break;
+                case gguf::TensorType::kIQ3_S:
+                    matvec_iq3_s_q8k_kernel<<<blocks, threads>>>(
+                        dwb, t.g32, ddf, dqsb, doutf, w.rows, w.cols);
+                    break;
+                case gguf::TensorType::kIQ1_S:
+                    matvec_iq1_s_q8k_kernel<<<blocks, threads>>>(
+                        dwb, t.g64, ddf, dqsb, dbsb, doutf, w.rows,
+                        w.cols);
+                    break;
+                case gguf::TensorType::kIQ1_M:
+                    matvec_iq1_m_q8k_kernel<<<blocks, threads>>>(
+                        dwb, t.g64, ddf, dqsb, doutf, w.rows, w.cols);
+                    break;
                 default:
                     break;
             }
@@ -2569,6 +2842,20 @@ void matvec_cuda_q8k(const Mat& w, std::span<const float> x,
             case gguf::TensorType::kIQ4_XS:
                 t.kvalues = device_kvalues_iq4nl();
                 tables_ok = t.kvalues != nullptr;
+                break;
+            case gguf::TensorType::kIQ3_XXS:
+                t.g32 = device_iq3xxs_grid();
+                t.ksigns = device_ksigns();
+                tables_ok = t.g32 != nullptr && t.ksigns != nullptr;
+                break;
+            case gguf::TensorType::kIQ3_S:
+                t.g32 = device_iq3s_grid();
+                tables_ok = t.g32 != nullptr;
+                break;
+            case gguf::TensorType::kIQ1_S:
+            case gguf::TensorType::kIQ1_M:
+                t.g64 = device_iq1s_grid();
+                tables_ok = t.g64 != nullptr;
                 break;
             default:
                 break;  // k-quants + ternary need no tables
