@@ -62,6 +62,9 @@ target_link_libraries(locus-server PRIVATE locus)
 
 add_executable(locus-gguf tools/gguf_info_main.cpp)
 target_link_libraries(locus-gguf PRIVATE locus)
+
+add_executable(locus-auth-helper tools/auth_helper_main.cpp)
+target_link_libraries(locus-auth-helper PRIVATE locus)
 target_include_directories(locus PUBLIC src)
 
 # ----------------------------------------------------------------

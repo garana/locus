@@ -15,6 +15,7 @@
 #include "locus/auth/auth_client.hpp"
 #include "locus/auth/helper_connection.hpp"
 #include "locus/auth/helper_message.hpp"
+#include "locus/auth/helper_spawn.hpp"
 #include "locus/auth/token_cache.hpp"
 
 using locus::auth::AuthClient;
@@ -169,6 +170,27 @@ TEST_CASE("auth fails closed and does not cache a timeout", "[auth]") {
     REQUIRE_FALSE(r2.ok);
     // Not cached: each attempt re-queried the helper.
     REQUIRE(f.helper->count("ghost") == 2);
+}
+
+TEST_CASE("auth resolves through the reference helper binary",
+          "[auth]") {
+    // End to end: spawn the real locus-auth-helper with an allow-list
+    // and resolve against it through AuthClient.
+    ManualClock clock;
+    std::string err;
+    auto conn =
+        locus::auth::spawn_helper({LOCUS_AUTH_HELPER_BIN, "sk-ok"},
+                                  &err);
+    REQUIRE(conn);
+    std::vector<std::unique_ptr<HelperConnection>> conns;
+    conns.push_back(std::move(conn));
+    AuthClient client(std::move(conns), clock, AuthConfig{});
+
+    auto good = client.resolve("sk-ok");
+    REQUIRE(good.ok);
+    REQUIRE(good.identity == "user:sk-ok");
+    auto bad = client.resolve("sk-nope");
+    REQUIRE_FALSE(bad.ok);
 }
 
 TEST_CASE("auth pushes fire-and-forget lifecycle events", "[auth]") {

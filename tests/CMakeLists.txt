@@ -51,6 +51,8 @@ target_include_directories(locus_tests PRIVATE
 )
 target_compile_definitions(locus_tests PRIVATE
     LOCUS_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    LOCUS_AUTH_HELPER_BIN="$<TARGET_FILE:locus-auth-helper>"
 )
+add_dependencies(locus_tests locus-auth-helper)
 
 add_test(NAME unit COMMAND locus_tests)
