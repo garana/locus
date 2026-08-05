@@ -475,3 +475,57 @@ TEST_CASE("embeddings endpoint returns normalized vectors",
         REQUIRE(data[0]["embedding"] == data[1]["embedding"]);
     }
 }
+
+TEST_CASE("auth gates protected routes via a helper", "[server][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    locus::server::OpenAiServer::Options opt;
+    opt.auth_helper_argv = {LOCUS_AUTH_HELPER_BIN, "sk-secret"};
+    locus::server::OpenAiServer server(model, tok, opt);
+    const int port = server.bind_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { server.listen_after_bind(); });
+    httplib::Client client("127.0.0.1", port);
+
+    const json req{{"prompt", "Once upon a time"}, {"max_tokens", 4}};
+    const std::string ct = "application/json";
+
+    // No credential -> 401.
+    auto r1 = client.Post("/v1/completions", req.dump(), ct);
+    REQUIRE(r1);
+    REQUIRE(r1->status == 401);
+
+    // Wrong credential -> 401.
+    auto r2 = client.Post("/v1/completions",
+                          {{"Authorization", "Bearer nope"}},
+                          req.dump(), ct);
+    REQUIRE(r2);
+    REQUIRE(r2->status == 401);
+
+    // Valid credential -> 200 (Bearer).
+    auto r3 = client.Post("/v1/completions",
+                          {{"Authorization", "Bearer sk-secret"}},
+                          req.dump(), ct);
+    REQUIRE(r3);
+    REQUIRE(r3->status == 200);
+
+    // Valid credential via x-api-key -> 200.
+    auto r4 = client.Post("/v1/completions",
+                          {{"x-api-key", "sk-secret"}}, req.dump(),
+                          ct);
+    REQUIRE(r4);
+    REQUIRE(r4->status == 200);
+
+    // /health is not protected.
+    auto h = client.Get("/health");
+    REQUIRE(h);
+    REQUIRE(h->status == 200);
+
+    server.stop();
+    th.join();
+}

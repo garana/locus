@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "locus/auth/auth_client.hpp"
 #include "locus/chat/template.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/model/llama.hpp"
@@ -14,6 +15,8 @@
 
 namespace httplib {
 class Server;
+struct Request;
+struct Response;
 }
 
 namespace locus::server {
@@ -56,6 +59,15 @@ class OpenAiServer {
          * Use chat::ChatTemplate::from_gguf for real chat
          * models. */
         chat::ChatTemplate chat_template;
+        /** Optional auth (DESIGN R15): when auth_helper_argv is
+         * non-empty, a request to a protected route must carry a
+         * credential (Authorization: Bearer <t>, or x-api-key: <t>)
+         * that a helper resolves; the same sockets also receive
+         * request-lifecycle event pushes. Empty = auth OFF (open,
+         * the default). auth_helpers helper processes are spawned. */
+        std::vector<std::string> auth_helper_argv;
+        std::size_t auth_helpers = 1;
+        auth::AuthConfig auth_cache;
     };
 
     OpenAiServer(const model::LlamaModel& m,
@@ -86,6 +98,17 @@ class OpenAiServer {
     std::shared_ptr<const std::vector<std::string>> json_pieces();
     /** L2-normalized last-token embedding of `text` (serialized). */
     std::vector<float> embed_text(const std::string& text);
+    /**
+     * Authorizes a request. When auth is off, allows (identity "").
+     * Otherwise reads the bearer/x-api-key credential and resolves
+     * it; on deny sets a 401 response and returns false.
+     */
+    bool authorize(const httplib::Request& req,
+                   httplib::Response& res, std::string& identity);
+    /** Fire-and-forget request-lifecycle event to the auth helper
+     * (no-op when auth is off). */
+    void auth_event(const char* event, const std::string& kind,
+                    const std::string& identity);
 
     const model::LlamaModel& model_;
     const tok::Tokenizer& tok_;
@@ -98,6 +121,10 @@ class OpenAiServer {
     std::atomic<std::uint64_t> requests_total_{0};
     std::atomic<std::uint64_t> prompt_tokens_total_{0};
     std::atomic<std::uint64_t> completion_tokens_total_{0};
+
+    // Optional auth (built from Options.auth_helper_argv; null=off).
+    auth::WallClock auth_clock_;
+    std::unique_ptr<auth::AuthClient> auth_;
 
     std::once_flag pieces_once_;
     std::shared_ptr<const std::vector<std::string>> pieces_;

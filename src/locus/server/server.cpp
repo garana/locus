@@ -1,13 +1,16 @@
 #include "locus/server/server.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <tuple>
 #include <utility>
 #include <vector>
 
 #include "httplib.h"
 #include "json.hpp"
+#include "locus/auth/helper_spawn.hpp"
 #include "locus/model/grammar.hpp"
 #include "locus/server/tools.hpp"
 
@@ -192,7 +195,71 @@ OpenAiServer::OpenAiServer(const model::LlamaModel& m,
       loop_(m, tok.eos_id(), opt_.engine),
       http_(std::make_unique<httplib::Server>()),
       n_vocab_(m.hparams().n_vocab) {
+    if (!opt_.auth_helper_argv.empty()) {
+        std::vector<std::unique_ptr<auth::HelperConnection>> conns;
+        for (std::size_t i = 0;
+             i < std::max<std::size_t>(1, opt_.auth_helpers); ++i) {
+            std::string err;
+            auto c = auth::spawn_helper(opt_.auth_helper_argv, &err);
+            if (!c) {
+                throw std::runtime_error("auth helper spawn: " + err);
+            }
+            conns.push_back(std::move(c));
+        }
+        auth_ = std::make_unique<auth::AuthClient>(
+            std::move(conns), auth_clock_, opt_.auth_cache);
+    }
     install_routes();
+}
+
+bool OpenAiServer::authorize(const httplib::Request& req,
+                             httplib::Response& res,
+                             std::string& identity) {
+    if (!auth_) {
+        identity.clear();
+        return true;  // auth disabled -> open
+    }
+    // Accept "Authorization: Bearer <token>" or "x-api-key: <token>".
+    std::string cred;
+    if (req.has_header("Authorization")) {
+        const std::string h = req.get_header_value("Authorization");
+        const std::string kw = "Bearer ";
+        cred = (h.rfind(kw, 0) == 0) ? h.substr(kw.size()) : h;
+    } else if (req.has_header("x-api-key")) {
+        cred = req.get_header_value("x-api-key");
+    }
+    auth::AuthClient::Result r =
+        cred.empty() ? auth::AuthClient::Result{}
+                     : auth_->resolve(cred);
+    if (!r.ok) {
+        res.status = 401;
+        res.set_content(
+            json{{"error",
+                  {{"type", "authentication_error"},
+                   {"message", "invalid or missing credential"}}}}
+                .dump(),
+            "application/json");
+        return false;
+    }
+    identity = std::move(r.identity);
+    return true;
+}
+
+void OpenAiServer::auth_event(const char* event,
+                              const std::string& kind,
+                              const std::string& identity) {
+    if (!auth_) {
+        return;
+    }
+    auth::HelperMessage ev;
+    ev.type = "request";
+    ev.set("event", event);
+    ev.set("kind", kind);
+    ev.set("model", opt_.model_name);
+    if (!identity.empty()) {
+        ev.set("identity", identity);
+    }
+    auth_->report_event(std::move(ev));
 }
 
 std::vector<float> OpenAiServer::embed_text(const std::string& text) {
@@ -356,6 +423,11 @@ void OpenAiServer::install_routes() {
     // how the prompt is built and how the response is shaped.
     auto handle = [this](const httplib::Request& req,
                          httplib::Response& res, bool chat) {
+        std::string identity;
+        if (!authorize(req, res, identity)) {
+            return;  // 401 already set
+        }
+        auth_event("create", chat ? "chat" : "completion", identity);
         json body;
         std::string prompt;
         std::uint32_t max_tokens = 16;
@@ -644,6 +716,11 @@ void OpenAiServer::install_routes() {
     // Code and the Anthropic SDK can target locus directly.
     auto handle_messages = [this](const httplib::Request& req,
                                   httplib::Response& res) {
+        std::string identity;
+        if (!authorize(req, res, identity)) {
+            return;
+        }
+        auth_event("create", "messages", identity);
         std::string prompt;
         std::uint32_t max_tokens = 16;
         std::uint32_t input_tokens = 0;
@@ -946,6 +1023,11 @@ void OpenAiServer::install_routes() {
     http_->Post(
         "/v1/embeddings",
         [this](const httplib::Request& req, httplib::Response& res) {
+            std::string identity;
+            if (!authorize(req, res, identity)) {
+                return;
+            }
+            auth_event("create", "embeddings", identity);
             try {
                 const json body = json::parse(req.body);
                 std::vector<std::string> inputs;
