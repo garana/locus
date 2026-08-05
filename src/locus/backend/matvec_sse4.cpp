@@ -585,12 +585,73 @@ void q5_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8,
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
 }
 
+/** SSE4 Q3_K x Q8_K aux32[8]: 2-bit + hmask 3rd-bit unpack (-4 offset),
+ *  6-bit scales unpacked from the packed 12 bytes, 16 groups x 2 with
+ *  scale=(scales[j]-32); no min term. Bit-identical to scalar
+ *  vec_dot_q3_k_q8_k. */
+void q3_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8,
+                         std::int32_t aux32[8]) {
+    constexpr std::uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+    const auto* hm = reinterpret_cast<const std::uint8_t*>(blk);
+    const auto* q3 = reinterpret_cast<const std::uint8_t*>(blk + 32);
+    std::int8_t aux8[256];
+    std::int8_t* a = aux8;
+    std::uint8_t m = 1;
+    const std::uint8_t* q3p = q3;
+    for (int j = 0; j < 256; j += 128) {
+        for (int sh = 0; sh < 8; sh += 2) {
+            for (int l = 0; l < 32; ++l) {
+                a[l] = static_cast<std::int8_t>((q3p[l] >> sh) & 3);
+            }
+            for (int l = 0; l < 32; ++l) {
+                a[l] = static_cast<std::int8_t>(
+                    a[l] - ((hm[l] & m) ? 0 : 4));
+            }
+            a += 32;
+            m <<= 1;
+        }
+        q3p += 32;
+    }
+    std::uint32_t auxs[4];
+    std::memcpy(auxs, blk + 96, 12);
+    const std::uint32_t tmp = auxs[2];
+    auxs[2] = ((auxs[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    auxs[3] = ((auxs[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    auxs[0] = (auxs[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    auxs[1] = (auxs[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const auto* scales = reinterpret_cast<const std::int8_t*>(auxs);
+    __m128i acc_lo = _mm_setzero_si128(), acc_hi = _mm_setzero_si128();
+    const std::int8_t* ap = aux8;
+    const std::int8_t* q8p = q8;
+    for (int j = 0; j < 16; ++j) {
+        const __m128i scv = _mm_set1_epi32(scales[j] - 32);
+        for (int k = 0; k < 2; ++k) {
+            const __m128i qv = _mm_cvtepi8_epi16(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q8p)));
+            const __m128i av = _mm_cvtepi8_epi16(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ap)));
+            const __m128i p = _mm_mullo_epi16(qv, av);
+            acc_lo = _mm_add_epi32(
+                acc_lo, _mm_mullo_epi32(_mm_cvtepi16_epi32(p), scv));
+            acc_hi = _mm_add_epi32(
+                acc_hi, _mm_mullo_epi32(
+                            _mm_cvtepi16_epi32(_mm_srli_si128(p, 8)),
+                            scv));
+            q8p += 8;
+            ap += 8;
+        }
+    }
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
+}
+
 void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
     const bool q4k = w.type == gguf::TensorType::kQ4_K;
     const bool q5k = w.type == gguf::TensorType::kQ5_K;
     const bool q6k = w.type == gguf::TensorType::kQ6_K;
-    if ((!q4k && !q5k && !q6k) || x.size() % 256 != 0) {
+    const bool q3k = w.type == gguf::TensorType::kQ3_K;
+    if ((!q4k && !q5k && !q6k && !q3k) || x.size() % 256 != 0) {
         matvec_q8k(w, x, out);  // other types: scalar Q8_K
         return;
     }
@@ -599,7 +660,8 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
     std::vector<std::int8_t> hqs(x.size());
     std::vector<std::int16_t> hbs(nb * 16);
     quantize_activation_q8k(x, hd.data(), hqs.data(), hbs.data());
-    const std::size_t blk_bytes = q4k ? 144 : (q5k ? 176 : 210);
+    const std::size_t blk_bytes =
+        q4k ? 144 : (q5k ? 176 : (q3k ? 110 : 210));
     const std::size_t row_bytes = nb * blk_bytes;
     for (std::uint32_t r = 0; r < w.rows; ++r) {
         const std::byte* row = w.data + r * row_bytes;
@@ -626,9 +688,16 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
                     sums[l] += d * static_cast<float>(aux32[l]);
                 }
                 sumf -= bdmin * hd[b] * static_cast<float>(sumi);
-            } else {  // Q6_K: no min term, f16 scale at blk+208
-                const float bd = f16_to_f32(load_u16(blk + 208));
-                q6_k_q8k_aux32_sse4(blk, hqs.data() + b * 256, aux32);
+            } else {  // Q3_K/Q6_K: no min term
+                const float bd = q3k ? f16_to_f32(load_u16(blk + 108))
+                                     : f16_to_f32(load_u16(blk + 208));
+                if (q3k) {
+                    q3_k_q8k_aux32_sse4(blk, hqs.data() + b * 256,
+                                        aux32);
+                } else {
+                    q6_k_q8k_aux32_sse4(blk, hqs.data() + b * 256,
+                                        aux32);
+                }
                 const float d = bd * hd[b];
                 for (int l = 0; l < 8; ++l) {
                     sums[l] += d * static_cast<float>(aux32[l]);
