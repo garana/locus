@@ -25,6 +25,7 @@ add_executable(locus_tests
     test_helper_message.cpp
     test_helper_connection.cpp
     test_auth_client.cpp
+    test_helper_spawn.cpp
     test_prefix_cache.cpp
     test_grammar.cpp
     test_sampling.cpp

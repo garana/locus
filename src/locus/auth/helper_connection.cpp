@@ -1,6 +1,7 @@
 #include "locus/auth/helper_connection.hpp"
 
 #include <poll.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -24,8 +25,13 @@ void ignore_sigpipe_once() {
 }  // namespace
 
 HelperConnection::HelperConnection(int read_fd, int write_fd)
+    : HelperConnection(read_fd, write_fd, -1) {}
+
+HelperConnection::HelperConnection(int read_fd, int write_fd,
+                                   pid_t child_pid)
     : read_fd_(read_fd),
       write_fd_(write_fd),
+      child_pid_(child_pid),
       reader_([this] { reader_loop(); }) {
     ignore_sigpipe_once();
 }
@@ -40,6 +46,12 @@ HelperConnection::~HelperConnection() {
     ::close(write_fd_);
     if (read_fd_ != write_fd_) {
         ::close(read_fd_);
+    }
+    // Reap a spawned child: the closed stdin gives it EOF; SIGTERM
+    // covers a helper that ignores that, so waitpid never hangs.
+    if (child_pid_ > 0) {
+        ::kill(child_pid_, SIGTERM);
+        ::waitpid(child_pid_, nullptr, 0);
     }
 }
 

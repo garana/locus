@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sys/types.h>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -31,6 +33,9 @@ class HelperConnection {
     /** Takes ownership of the fds (closed on destruction). read_fd
      * and write_fd may be the same fd (a bidirectional socket). */
     HelperConnection(int read_fd, int write_fd);
+    /** As above, and reaps `child_pid` on destruction (used by the
+     * spawn wrapper; the fds are the child's stdout/stdin pipes). */
+    HelperConnection(int read_fd, int write_fd, pid_t child_pid);
     ~HelperConnection();
 
     HelperConnection(const HelperConnection&) = delete;
@@ -69,6 +74,7 @@ class HelperConnection {
 
     int read_fd_;
     int write_fd_;
+    pid_t child_pid_ = -1;  // >0 when this owns a spawned helper
     std::atomic<std::uint64_t> next_id_{1};
     std::mutex write_mu_;  // serializes writes to write_fd_
     std::mutex mu_;        // guards pending_
