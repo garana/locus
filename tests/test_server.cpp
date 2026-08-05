@@ -529,3 +529,32 @@ TEST_CASE("auth gates protected routes via a helper", "[server][e2e]") {
     server.stop();
     th.join();
 }
+
+TEST_CASE("metrics path is configurable", "[server][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    locus::server::OpenAiServer::Options opt;
+    opt.metrics_path = "/internal/metrics";
+    locus::server::OpenAiServer server(model, tok, opt);
+    const int port = server.bind_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { server.listen_after_bind(); });
+    httplib::Client client("127.0.0.1", port);
+
+    auto m = client.Get("/internal/metrics");
+    REQUIRE(m);
+    REQUIRE(m->status == 200);
+    REQUIRE(m->body.find("locus_requests_total") != std::string::npos);
+    // The default path is no longer served.
+    auto d = client.Get("/metrics");
+    REQUIRE(d);
+    REQUIRE(d->status == 404);
+
+    server.stop();
+    th.join();
+}

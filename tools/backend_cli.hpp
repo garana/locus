@@ -48,6 +48,8 @@ inline constexpr const char* kCommonHelp =
     "                   min(model context, 4096))\n"
     "  --concurrent N   locus-run: submit the prompt N times and\n"
     "                   report aggregate tok/s (bench mode)\n"
+    "  --metrics-path P locus-server: serve Prometheus metrics at\n"
+    "                   path P (default /metrics)\n"
     "  --batch-decode   enable R10 cross-sequence batched decode\n"
     "  --no-batch-prefill  force per-token prompt ingestion\n"
     "  -h, --help       show this help and exit\n"
@@ -81,6 +83,9 @@ struct BackendArgs {
     std::string choice;
     /** From --ctx N: KV pool cap in tokens (0 = default). */
     std::uint32_t ctx = 0;
+    /** From --metrics-path P: locus-server metrics route (empty =
+     * default /metrics). */
+    std::string metrics_path;
     /** From --concurrent N: submit the prompt N times and report
      * aggregate throughput (bench mode; default 1 = normal run). */
     std::uint32_t concurrent = 1;
@@ -116,6 +121,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         } else if (a.rfind("--ctx=", 0) == 0) {
             out.ctx = static_cast<std::uint32_t>(
                 std::atol(std::string(a.substr(6)).c_str()));
+        } else if (a == "--metrics-path" && i + 1 < argc) {
+            out.metrics_path = argv[++i];
+        } else if (a.rfind("--metrics-path=", 0) == 0) {
+            out.metrics_path = std::string(a.substr(15));
         } else if (a == "--concurrent" && i + 1 < argc) {
             out.concurrent = static_cast<std::uint32_t>(
                 std::atol(argv[++i]));

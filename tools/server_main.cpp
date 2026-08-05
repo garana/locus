@@ -61,6 +61,9 @@ int main(int argc, char** argv) {
         }
         opt.chat_template =
             locus::chat::ChatTemplate::from_gguf(g);
+        if (!args.metrics_path.empty()) {
+            opt.metrics_path = args.metrics_path;
+        }
         locus::server::OpenAiServer server(model, tok, opt);
         std::fprintf(
             stderr,

@@ -362,7 +362,7 @@ void OpenAiServer::install_routes() {
     // Prometheus text-format metrics: request/token counters plus
     // engine gauges (KV pool, prefix reuse, speculative accepts).
     http_->Get(
-        "/metrics",
+        opt_.metrics_path,
         [this](const httplib::Request&, httplib::Response& res) {
             const auto s = loop_.stats();
             std::string b;

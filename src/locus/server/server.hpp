@@ -55,6 +55,9 @@ class OpenAiServer {
         engine::Engine::Config engine;
         /** Hard cap applied to requested max_tokens. */
         std::uint32_t max_tokens_cap = 1024;
+        /** Path the Prometheus metrics endpoint is served at
+         * (--metrics-path); default /metrics. */
+        std::string metrics_path = "/metrics";
         /** Formats /v1/chat/completions prompts (default plain).
          * Use chat::ChatTemplate::from_gguf for real chat
          * models. */
