@@ -13,6 +13,20 @@ namespace locus::backend {
 struct Ops {
     void (*matvec)(const Mat&, std::span<const float>,
                    std::span<float>);
+    /**
+     * Q8_K-activation matvec (ggml parity, DESIGN.md R16): quantizes
+     * the activation to Q8_K and integer-dots it with the quantized
+     * weight, bit-exact to llama.cpp on QK_K weight types (vs the
+     * f32-activation dot in `matvec`). Each backend points this at its
+     * own Q8_K entry (scalar matvec_q8k, matvec_cuda_q8k,
+     * matvec_sse4_q8k), all of which fall back to the scalar Q8_K dot
+     * for types they do not vectorize. Non-QK_K weight types delegate
+     * to `matvec` internally, so this is always safe to call. The model
+     * routes QK_K matvecs here once the ggml-parity flip lands; until
+     * then it is an additive entry that leaves `matvec` the default.
+     */
+    void (*matvec_q8k)(const Mat&, std::span<const float>,
+                       std::span<float>) = nullptr;
     void (*dequant_row)(const Mat&, std::uint32_t,
                         std::span<float>);
     /**

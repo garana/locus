@@ -30,6 +30,7 @@ const std::vector<Backend>& list() {
                      "ARM NEON vectorized matvec (F32/Q8_0)",
                      f.neon, true,
                      {.matvec = &matvec_neon,
+                      .matvec_q8k = &matvec_q8k,  // scalar (pi: NEON)
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_neon}});
 #endif
@@ -38,12 +39,14 @@ const std::vector<Backend>& list() {
                      "x86-64 AVX2 vectorized matvec (F32/Q8_0)",
                      f.avx2, true,
                      {.matvec = &matvec_avx2,
+                      .matvec_q8k = &matvec_q8k,  // scalar (no AVX2 Q8K)
                       .dequant_row = &dequant_row}});
         b.push_back({"sse4",
                      "x86-64 SSE4.1 vectorized matvec + batched "
                      "(F32/Q8_0; Q4_K/Q6_K register-blocked batch)",
                      f.sse4, true,
                      {.matvec = &matvec_sse4,
+                      .matvec_q8k = &matvec_sse4_q8k,
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_sse4}});
 #endif
@@ -55,6 +58,7 @@ const std::vector<Backend>& list() {
         b.push_back({"scalar", "portable reference (all types)",
                      true, true,
                      {.matvec = &matvec,
+                      .matvec_q8k = &matvec_q8k,
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_scalar}});
         const bool vk = f.vulkan && vulkan_backend_usable();
@@ -64,6 +68,7 @@ const std::vector<Backend>& list() {
                      "(F32/F16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K)",
                      vk, vk,
                      {.matvec = &matvec_vulkan,
+                      .matvec_q8k = &matvec_q8k,  // scalar (pi: Vulkan)
                       .dequant_row = &dequant_row,
                       .alloc_kv = &vulkan_alloc_kv,
                       .mt_safe = false}});
@@ -73,6 +78,7 @@ const std::vector<Backend>& list() {
                      "IQ1_S on GPU, pooled weights; other scalar)",
                      cu, cu,
                      {.matvec = &matvec_cuda,
+                      .matvec_q8k = &matvec_cuda_q8k,
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_cuda,
                       .batch_self_parallel = true,

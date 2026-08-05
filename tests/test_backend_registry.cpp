@@ -347,6 +347,48 @@ TEST_CASE("sse4 q8k matvec matches scalar q8k (Q3_K/Q4_K/Q5_K/Q6_K)",
 }
 #endif
 
+// The ggml-parity flip routes QK_K matvecs through ops.matvec_q8k;
+// every backend that exposes it must agree with scalar matvec_q8k.
+TEST_CASE("every backend ops.matvec_q8k matches scalar q8k (Q4_K)",
+          "[backend]") {
+    const std::uint32_t rows = 4, cols = 512;
+    std::mt19937 rng(37);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::vector<std::byte> w(static_cast<std::size_t>(rows) *
+                             (cols / 256) * 144);
+    for (auto& by : w) {
+        by = static_cast<std::byte>(byte_d(rng));
+    }
+    for (std::size_t bl = 0; bl < w.size() / 144; ++bl) {
+        std::byte* blk = w.data() + bl * 144;
+        const std::uint16_t d = f32_to_f16(0.01f);
+        const std::uint16_t dmin = f32_to_f16(0.005f);
+        std::memcpy(blk, &d, 2);
+        std::memcpy(blk + 2, &dmin, 2);
+    }
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    Mat m{locus::gguf::TensorType::kQ4_K, w.data(), rows, cols};
+    std::vector<float> ref(rows);
+    matvec_q8k(m, x, ref);
+    for (const Backend& be : backends()) {
+        if (!be.available || !be.selectable ||
+            be.ops.matvec_q8k == nullptr) {
+            continue;
+        }
+        cuda_pool_reset();  // avoid a stale pooled page aliasing
+        std::vector<float> got(rows);
+        be.ops.matvec_q8k(m, x, got);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            INFO("backend " << be.name << " row " << r);
+            REQUIRE(got[r] == Catch::Approx(ref[r]).margin(1e-4));
+        }
+    }
+}
+
 TEST_CASE("cuda matvec matches scalar", "[backend]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
