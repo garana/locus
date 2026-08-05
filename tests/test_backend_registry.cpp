@@ -330,8 +330,9 @@ TEST_CASE("cuda q8k matvec matches scalar q8k (all QK_K types)",
         v = dist(rng);
     }
     for (const Q& q :
-         {Q{TT::kQ2_K, 84, 80, 82}, Q{TT::kQ4_K, 144, 0, 2},
-          Q{TT::kQ5_K, 176, 0, 2}, Q{TT::kQ6_K, 210, 208, -1},
+         {Q{TT::kQ2_K, 84, 80, 82}, Q{TT::kQ3_K, 110, 108, -1},
+          Q{TT::kQ4_K, 144, 0, 2}, Q{TT::kQ5_K, 176, 0, 2},
+          Q{TT::kQ6_K, 210, 208, -1},
           Q{TT::kIQ2_XXS, 66, 0, -1}, Q{TT::kIQ2_XS, 74, 0, -1},
           Q{TT::kIQ2_S, 82, 0, -1}, Q{TT::kTQ1_0, 54, 52, -1},
           Q{TT::kTQ2_0, 66, 64, -1}, Q{TT::kIQ4_XS, 136, 0, -1},

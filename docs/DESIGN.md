@@ -942,7 +942,7 @@ matvec throughput.
   beside matvec(); it quantizes x to Q8_K once (quantize_activation_
   q8k -- ggml's iscale = -127/max, the 2^23 nearest_int, per-16
   bsums) and dispatches a per-type vec_dot_<t>_q8_k integer dot ported
-  verbatim from ggml_vec_dot_<t>_q8_K_generic. Covers all 14 QK_K
+  verbatim from ggml_vec_dot_<t>_q8_K_generic. Covers all 15 QK_K
   types: Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, TQ1_0/TQ2_0, IQ2_XXS/IQ2_XS/IQ2_S,
   IQ3_XXS/IQ3_S, IQ1_S/IQ1_M, IQ4_XS. (IQ4_NL stays on its own
   q8_0-block dot -- 32-element blocks, not QK_K.) Validated by a
@@ -954,18 +954,21 @@ matvec throughput.
   the cross-backend parity test (variant == scalar matvec) breaks.
   Hence the per-backend kernels come first, the model-dispatch flip
   last, coordinated across CPU/CUDA/Vulkan.
-- CUDA (in progress): matvec_cuda_q8k mirrors the CPU path -- host-
-  quantize x, upload the shared flat quants (d[nsb]/qs[n]/bsums[nsb*
-  16]) beside the pooled weight, one thread per row replays the scalar
-  aux/isum accumulation order so the float result is identical. All
-  four k-quants (Q2_K/Q4_K/Q5_K/Q6_K) ported; IQ/ternary next. sm_50
-  has no __dp4a, so the int8 products use plain integer madd (same
-  integer result). Parity test asserts matvec_cuda_q8k == matvec_q8k.
-- Remaining: CUDA IQ/ternary kernels; SSE4 (this host is SSE4-only,
-  no AVX2) integer dots per the vectorized-dot plan (one variant file
-  per ISA + sys::detect() dispatch, not one #ifdef template); then
-  wire matvec_q8k as the model default and extend the coarse-quant
-  goldens (DBRX 20 -> 32 tokens) in lockstep across backends.
+- CUDA (done): matvec_cuda_q8k mirrors the CPU path -- host-quantize
+  x, upload the shared flat quants (d[nsb]/qs[n]/bsums[nsb*16]) beside
+  the pooled weight, one thread per row replays the scalar aux/isum
+  accumulation order so the float result is identical. All 15 QK_K
+  types ported (k-quants, ternary, every IQ family). sm_50 has no
+  __dp4a, so the int8 products use plain integer madd (same integer
+  result). The [backend] parity test asserts matvec_cuda_q8k ==
+  matvec_q8k bit-for-bit across all 15 (margin 1e-4). Note Q3_K had no
+  CUDA kernel at all before this; its Q8_K kernel is the first GPU
+  Q3_K path (the f32 matvec_cuda still delegates Q3_K to scalar).
+- Remaining: SSE4 (this host is SSE4-only, no AVX2) integer dots per
+  the vectorized-dot plan (one variant file per ISA + sys::detect()
+  dispatch, not one #ifdef template); then wire matvec_q8k as the
+  model default and extend the coarse-quant goldens (DBRX 20 -> 32
+  tokens) in lockstep across backends.
 
 ## 8. Testing strategy
 
