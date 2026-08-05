@@ -91,7 +91,9 @@ class FakeHelper {
             }
             std::string wire;
             if (encode_text(r, wire)) {
-                ::write(fd_, wire.data(), wire.size());
+                // GCC flags an ignored write() (warn_unused_result).
+                [[maybe_unused]] const ssize_t wn =
+                    ::write(fd_, wire.data(), wire.size());
             }
         }
     }
