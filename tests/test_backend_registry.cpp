@@ -295,6 +295,41 @@ TEST_CASE("avx2 matvec matches scalar", "[backend]") {
     }
     check_matvec_variant_matches_scalar(&matvec_avx2);
 }
+
+// R16 ggml-parity: SSE4 Q8_K-activation dot must equal scalar
+// matvec_q8k bit-for-bit (same host quant, widen-per-lane products).
+TEST_CASE("sse4 q8k matvec matches scalar q8k (Q4_K)", "[backend]") {
+    if (!locus::sys::detect().sse4) {
+        SKIP("CPU lacks SSE4.1");
+    }
+    const std::uint32_t rows = 4, cols = 512;  // 2 blocks/row
+    std::mt19937 rng(31);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::vector<std::byte> w(static_cast<std::size_t>(rows) *
+                             (cols / 256) * 144);
+    for (auto& b : w) {
+        b = static_cast<std::byte>(byte_d(rng));
+    }
+    for (std::size_t bl = 0; bl < w.size() / 144; ++bl) {
+        std::byte* blk = w.data() + bl * 144;
+        const std::uint16_t d = f32_to_f16(0.01f);
+        const std::uint16_t dmin = f32_to_f16(0.005f);
+        std::memcpy(blk, &d, 2);
+        std::memcpy(blk + 2, &dmin, 2);
+    }
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    Mat m{locus::gguf::TensorType::kQ4_K, w.data(), rows, cols};
+    std::vector<float> a(rows), b(rows);
+    matvec_q8k(m, x, a);
+    matvec_sse4_q8k(m, x, b);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-4));
+    }
+}
 #endif
 
 TEST_CASE("cuda matvec matches scalar", "[backend]") {

@@ -399,6 +399,105 @@ void matvec_sse4(const Mat& w, std::span<const float> x,
     matvec(w, x, out);  // other types: scalar reference
 }
 
+/** SSE4 Q4_K x Q8_K integer dot for one super-block: computes the
+ *  scalar vec_dot_q4_k_q8_k's aux32[8] lanes with a widen-then-per-lane
+ *  multiply (int16 q8*a products sign-extended to int32, x scale) --
+ *  NO maddubs pair-collapse, so each lane equals the scalar's exactly.
+ *  Fills aux32[8] and sumi (the bsums min term). */
+void q4_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8,
+                         const std::int16_t* bsums,
+                         std::int32_t aux32[8], int& sumi) {
+    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
+                            kmask3 = 0x03030303;
+    const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 16);
+    std::int8_t aux8[256];
+    std::int8_t* a = aux8;
+    for (int j = 0; j < 4; ++j) {
+        for (int l = 0; l < 32; ++l) {
+            a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
+        }
+        a += 32;
+        for (int l = 0; l < 32; ++l) {
+            a[l] = static_cast<std::int8_t>(q4[l] >> 4);
+        }
+        a += 32;
+        q4 += 32;
+    }
+    std::uint32_t utmp[4];
+    std::memcpy(utmp, blk + 4, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const std::uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+    const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
+    const auto* mins = reinterpret_cast<const std::uint8_t*>(utmp + 2);
+    sumi = 0;
+    for (int j = 0; j < 16; ++j) {
+        sumi += bsums[j] * mins[j / 2];
+    }
+    __m128i acc_lo = _mm_setzero_si128(), acc_hi = _mm_setzero_si128();
+    const std::int8_t* ap = aux8;
+    const std::int8_t* q8p = q8;
+    int is = 0;
+    for (int j = 0; j < 8; ++j) {
+        const __m128i sc = _mm_set1_epi32(scales[is++]);
+        for (int k = 0; k < 4; ++k) {
+            const __m128i qv = _mm_cvtepi8_epi16(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q8p)));
+            const __m128i av = _mm_cvtepi8_epi16(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ap)));
+            const __m128i p = _mm_mullo_epi16(qv, av);  // 8x int16 q8*a
+            const __m128i plo = _mm_cvtepi16_epi32(p);
+            const __m128i phi =
+                _mm_cvtepi16_epi32(_mm_srli_si128(p, 8));
+            acc_lo = _mm_add_epi32(acc_lo, _mm_mullo_epi32(plo, sc));
+            acc_hi = _mm_add_epi32(acc_hi, _mm_mullo_epi32(phi, sc));
+            q8p += 8;
+            ap += 8;
+        }
+    }
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
+}
+
+void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out) {
+    if (w.type != gguf::TensorType::kQ4_K || x.size() % 256 != 0) {
+        matvec_q8k(w, x, out);  // only Q4_K vectorized so far
+        return;
+    }
+    const std::size_t nb = x.size() / 256;
+    std::vector<float> hd(nb);
+    std::vector<std::int8_t> hqs(x.size());
+    std::vector<std::int16_t> hbs(nb * 16);
+    quantize_activation_q8k(x, hd.data(), hqs.data(), hbs.data());
+    const std::size_t row_bytes = nb * 144;
+    for (std::uint32_t r = 0; r < w.rows; ++r) {
+        const std::byte* row = w.data + r * row_bytes;
+        float sums[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        float sumf = 0.0f;
+        for (std::size_t b = 0; b < nb; ++b) {
+            const std::byte* blk = row + b * 144;
+            const float bd = f16_to_f32(load_u16(blk));
+            const float bdmin = f16_to_f32(load_u16(blk + 2));
+            std::int32_t aux32[8];
+            int sumi = 0;
+            q4_k_q8k_aux32_sse4(blk, hqs.data() + b * 256,
+                                hbs.data() + b * 16, aux32, sumi);
+            const float d = bd * hd[b];
+            for (int l = 0; l < 8; ++l) {
+                sums[l] += d * static_cast<float>(aux32[l]);
+            }
+            sumf -= bdmin * hd[b] * static_cast<float>(sumi);
+        }
+        for (int l = 0; l < 8; ++l) {
+            sumf += sums[l];
+        }
+        out[r] = sumf;
+    }
+}
+
 void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n) {
     if (w.type == gguf::TensorType::kQ4_K) {
