@@ -399,68 +399,6 @@ void matvec_sse4(const Mat& w, std::span<const float> x,
     matvec(w, x, out);  // other types: scalar reference
 }
 
-/** SSE4 Q4_K x Q8_K integer dot for one super-block: computes the
- *  scalar vec_dot_q4_k_q8_k's aux32[8] lanes with a widen-then-per-lane
- *  multiply (int16 q8*a products sign-extended to int32, x scale) --
- *  NO maddubs pair-collapse, so each lane equals the scalar's exactly.
- *  Fills aux32[8] and sumi (the bsums min term). */
-void q4_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8,
-                         const std::int16_t* bsums,
-                         std::int32_t aux32[8], int& sumi) {
-    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
-                            kmask3 = 0x03030303;
-    const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 16);
-    std::int8_t aux8[256];
-    std::int8_t* a = aux8;
-    for (int j = 0; j < 4; ++j) {
-        for (int l = 0; l < 32; ++l) {
-            a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
-        }
-        a += 32;
-        for (int l = 0; l < 32; ++l) {
-            a[l] = static_cast<std::int8_t>(q4[l] >> 4);
-        }
-        a += 32;
-        q4 += 32;
-    }
-    std::uint32_t utmp[4];
-    std::memcpy(utmp, blk + 4, 12);
-    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-    const std::uint32_t uaux = utmp[1] & kmask1;
-    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-    utmp[2] = uaux;
-    utmp[0] &= kmask1;
-    const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
-    const auto* mins = reinterpret_cast<const std::uint8_t*>(utmp + 2);
-    sumi = 0;
-    for (int j = 0; j < 16; ++j) {
-        sumi += bsums[j] * mins[j / 2];
-    }
-    __m128i acc_lo = _mm_setzero_si128(), acc_hi = _mm_setzero_si128();
-    const std::int8_t* ap = aux8;
-    const std::int8_t* q8p = q8;
-    int is = 0;
-    for (int j = 0; j < 8; ++j) {
-        const __m128i sc = _mm_set1_epi32(scales[is++]);
-        for (int k = 0; k < 4; ++k) {
-            const __m128i qv = _mm_cvtepi8_epi16(
-                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q8p)));
-            const __m128i av = _mm_cvtepi8_epi16(
-                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ap)));
-            const __m128i p = _mm_mullo_epi16(qv, av);  // 8x int16 q8*a
-            const __m128i plo = _mm_cvtepi16_epi32(p);
-            const __m128i phi =
-                _mm_cvtepi16_epi32(_mm_srli_si128(p, 8));
-            acc_lo = _mm_add_epi32(acc_lo, _mm_mullo_epi32(plo, sc));
-            acc_hi = _mm_add_epi32(acc_hi, _mm_mullo_epi32(phi, sc));
-            q8p += 8;
-            ap += 8;
-        }
-    }
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
-}
-
 /** SSE4 Q6_K x Q8_K aux32[8]: same widen-per-lane core as Q4_K, but
  *  6-bit ql+qh unpack with the -32 offset and 16 int8 scales (2 k-iters
  *  per scale); no min term. Bit-identical to scalar vec_dot_q6_k_q8_k. */
@@ -695,6 +633,63 @@ void q2_k_q8k_block_sse4(const std::byte* blk, const std::int8_t* q8,
     }
 }
 
+/** SSE4 Q4_K x Q8_K, the FAST opt-in path (R16): nibbles extracted
+ *  in-register and int8-dotted with _mm_maddubs_epi16 (unsigned nibble
+ *  x signed q8), one integer group-sum per 6-bit scale -- no aux8[256]
+ *  scalar unpack and far fewer SIMD ops than the widen-per-lane
+ *  bit-exact path. Returns block_int = sum_j scale_j*groupsum_j (an
+ *  EXACT integer, same as the scalar aux32 total) and sumi (the bsums
+ *  min term). The caller does one f32 mul per block instead of the
+ *  scalar's 8-lane split, so it agrees with scalar matvec_q8k only to
+ *  ~1e-3 -- fine for the tolerance-based opt-in mode. */
+void q4_k_q8k_fast_sse4(const std::byte* blk, const std::int8_t* q8,
+                        const std::int16_t* bsums, int& block_int,
+                        int& sumi) {
+    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
+                            kmask3 = 0x03030303;
+    const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 16);
+    std::uint32_t utmp[4];
+    std::memcpy(utmp, blk + 4, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const std::uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+    const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
+    const auto* mins = reinterpret_cast<const std::uint8_t*>(utmp + 2);
+    sumi = 0;
+    for (int j = 0; j < 16; ++j) {
+        sumi += bsums[j] * mins[j / 2];
+    }
+    const __m128i lo4 = _mm_set1_epi8(0x0f);
+    const __m128i ones = _mm_set1_epi16(1);
+    block_int = 0;
+    for (int j = 0; j < 8; ++j) {
+        const std::uint8_t* q4b = q4 + (j / 2) * 32;
+        const std::int8_t* q8g = q8 + j * 32;
+        const __m128i r0 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b));
+        const __m128i r1 = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(q4b + 16));
+        __m128i n0, n1;
+        if ((j & 1) == 0) {  // low nibbles
+            n0 = _mm_and_si128(r0, lo4);
+            n1 = _mm_and_si128(r1, lo4);
+        } else {  // high nibbles
+            n0 = _mm_and_si128(_mm_srli_epi16(r0, 4), lo4);
+            n1 = _mm_and_si128(_mm_srli_epi16(r1, 4), lo4);
+        }
+        const __m128i a0 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
+        const __m128i a1 = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(q8g + 16));
+        const __m128i p = _mm_add_epi32(
+            _mm_madd_epi16(_mm_maddubs_epi16(n0, a0), ones),
+            _mm_madd_epi16(_mm_maddubs_epi16(n1, a1), ones));
+        block_int += static_cast<int>(scales[j]) * hsum_epi32_sse4(p);
+    }
+}
+
 void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
     const bool q4k = w.type == gguf::TensorType::kQ4_K;
@@ -745,19 +740,20 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
         for (std::size_t b = 0; b < nb; ++b) {
             const std::byte* blk = row + b * blk_bytes;
             std::int32_t aux32[8];
-            if (q4k || q5k) {  // d,dmin f16 at blk+0/+2; bsums min term
+            if (q4k) {  // fast maddubs path: one block_int, direct sumf
+                const float bd = f16_to_f32(load_u16(blk));
+                const float bdmin = f16_to_f32(load_u16(blk + 2));
+                int block_int = 0, sumi = 0;
+                q4_k_q8k_fast_sse4(blk, hqs.data() + b * 256,
+                                   hbs.data() + b * 16, block_int, sumi);
+                sumf += bd * hd[b] * static_cast<float>(block_int) -
+                        bdmin * hd[b] * static_cast<float>(sumi);
+            } else if (q5k) {  // widen-per-lane aux32 + bsums min
                 const float bd = f16_to_f32(load_u16(blk));
                 const float bdmin = f16_to_f32(load_u16(blk + 2));
                 int sumi = 0;
-                if (q4k) {
-                    q4_k_q8k_aux32_sse4(blk, hqs.data() + b * 256,
-                                        hbs.data() + b * 16, aux32,
-                                        sumi);
-                } else {
-                    q5_k_q8k_aux32_sse4(blk, hqs.data() + b * 256,
-                                        hbs.data() + b * 16, aux32,
-                                        sumi);
-                }
+                q5_k_q8k_aux32_sse4(blk, hqs.data() + b * 256,
+                                    hbs.data() + b * 16, aux32, sumi);
                 const float d = bd * hd[b];
                 for (int l = 0; l < 8; ++l) {
                     sums[l] += d * static_cast<float>(aux32[l]);
