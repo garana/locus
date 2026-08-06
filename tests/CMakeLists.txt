@@ -33,6 +33,7 @@ add_executable(locus_tests
     test_server.cpp
     test_tools.cpp
     test_vulkan.cpp
+    test_vulkan_reset.cpp
     test_tokenizer.cpp
     test_model_e2e.cpp
     test_moe.cpp

@@ -86,6 +86,16 @@ bool vulkan_backend_usable();
 float* vulkan_alloc_kv(std::size_t n_floats);
 
 /**
+ * Frees the process-lifetime Vulkan backend state: the weight pool
+ * buffers, the GPU-mapped KV pools, and activation scratch. TEST
+ * USE ONLY -- the singleton's pool is the intended resident working
+ * set in production (one model per process); this exists so a test
+ * process running many models across many cases does not accumulate
+ * GPU allocations until the device runs out. Call between tests.
+ */
+void vulkan_reset_state();
+
+/**
  * CUDA matvec: F32, Q8_0, Q2_K, Q4_K, Q5_K, Q6_K and the
  * IQ1_S/IQ2_XXS/IQ3_XXS/IQ4_XS families run on an NVIDIA GPU
  * (pooled/paged); other types delegate to scalar.

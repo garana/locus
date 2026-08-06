@@ -293,6 +293,51 @@ float* vulkan_alloc_kv(std::size_t n_floats) {
     return static_cast<float*>(map);
 }
 
+void vulkan_reset_state() {
+    State& s = state();
+    // Weight pool: every model's weights are uploaded once and kept
+    // resident (unbounded by default) -- the unbounded accumulator
+    // across a multi-model test process. Free them all.
+    for (auto& [ptr, e] : s.pool.map_) {
+        s.pool.destroy(e.buf);
+    }
+    s.pool.map_.clear();
+    for (auto& b : s.pool.transient_) {
+        s.pool.destroy(b);
+    }
+    s.pool.transient_.clear();
+    s.pool.used_ = 0;
+    // GPU-mapped KV pools: one per cache, never freed otherwise.
+    for (auto& [map, buf] : s.kv_pools) {
+        s.ctx.destroy_buffer(buf);
+    }
+    s.kv_pools.clear();
+    // Activation scratch: bounded, but release it too so a large
+    // model's buffers are not held across the rest of the run; each
+    // regrows on next use.
+    auto drop = [&](VulkanContext::Buffer& b, std::size_t& cap) {
+        if (cap != 0) {
+            s.ctx.destroy_buffer(b);
+            b = VulkanContext::Buffer{};
+            cap = 0;
+        }
+    };
+    drop(s.x, s.x_n);
+    drop(s.xb, s.xb_n);
+    drop(s.q, s.q_n);
+    drop(s.gate, s.gate_n);
+    drop(s.up, s.up_n);
+    drop(s.attout, s.attout_n);
+    drop(s.att, s.att_n);
+    drop(s.logits, s.logits_n);
+    drop(s.table, s.table_n);
+    drop(s.ones, s.ones_n);
+    drop(s.kv_a, s.kv_a_n);
+    drop(s.q_abs, s.q_abs_n);
+    drop(s.latent, s.latent_n);
+    drop(s.q_a, s.q_a_n);
+}
+
 void matvec_vulkan(const Mat& w, std::span<const float> x,
                    std::span<float> out) {
     if (matvec_kernel(w) == Kernel::kCount_) {
