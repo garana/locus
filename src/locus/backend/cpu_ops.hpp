@@ -103,6 +103,16 @@ void matvec_q8k(const Mat& w, std::span<const float> x,
                 std::span<float> out);
 
 /**
+ * @returns True for the 15 QK_K super-block weight types that have a
+ * Q8_K activation-dot (all k-quants, both ternary, the IQ2/IQ3/IQ1
+ * families, IQ4_XS). False for everything else, including IQ4_NL
+ * (32-element q8_0-style blocks, not QK_K) and the legacy/float types.
+ * The model routes these types through Ops::matvec_q8k for ggml
+ * parity; the rest stay on the f32 matvec.
+ */
+bool is_q8k_type(gguf::TensorType type);
+
+/**
  * Quantizes activation x to Q8_K, writing the block fields as flat
  * arrays: d[n/256], qs[n] (int8), bsums[n/16] (int16), where n =
  * x.size() (must be a multiple of 256). Bit-identical to the internal

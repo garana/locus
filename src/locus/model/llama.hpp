@@ -113,6 +113,22 @@ class LlamaModel {
         return *backend_;
     }
 
+    /**
+     * Opt-in ggml-parity mode (DESIGN.md R16): when enabled, QK_K
+     * weight matmuls integer-dot a Q8_K-quantized activation (matching
+     * llama.cpp's algorithm, lower quantization error than the default
+     * f32-activation dot) via Ops::matvec_q8k. Default off -- the f32
+     * path stays the default because it keeps the exact-string e2e
+     * goldens stable and cross-backend consistent, and Q8_K's final
+     * f32 accumulation order is implementation-specific (not bit-exact
+     * across backends). Enable when matching llama.cpp's quantization
+     * matters more than byte-stable output (e.g. coarse quants).
+     */
+    void use_q8k_activations(bool on) { q8k_activations_ = on; }
+
+    /** @returns Whether Q8_K-activation mode is enabled. */
+    bool q8k_activations() const { return q8k_activations_; }
+
     /** Reusable per-thread scratch buffers (no sequence state). */
     struct Workspace {
         std::vector<float> x, xb, xb2, q, att, gate, up, out;
@@ -319,6 +335,9 @@ class LlamaModel {
     Hparams hp_;
     const struct ArchSpec* spec_ = nullptr;
     const backend::Backend* backend_ = nullptr;
+    /** R16 Q8_K-activation opt-in (see use_q8k_activations); default
+     * off keeps the f32 path and stable cross-backend goldens. */
+    bool q8k_activations_ = false;
     /** Weights live in a read-only file mapping; gates the
      * LOCUS_WEIGHT_WINDOW DONTNEED policy (see gguf.hpp). */
     bool file_backed_ = false;

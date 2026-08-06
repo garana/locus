@@ -964,11 +964,38 @@ matvec throughput.
   matvec_q8k bit-for-bit across all 15 (margin 1e-4). Note Q3_K had no
   CUDA kernel at all before this; its Q8_K kernel is the first GPU
   Q3_K path (the f32 matvec_cuda still delegates Q3_K to scalar).
-- Remaining: SSE4 (this host is SSE4-only, no AVX2) integer dots per
-  the vectorized-dot plan (one variant file per ISA + sys::detect()
-  dispatch, not one #ifdef template); then wire matvec_q8k as the
-  model default and extend the coarse-quant goldens (DBRX 20 -> 32
-  tokens) in lockstep across backends.
+- SSE4 (done): matvec_sse4_q8k covers all five k-quants -- Q3/Q4/Q5/
+  Q6 via a widen-then-per-lane int32 accumulate (no maddubs, to keep
+  the scalar lane order), Q2_K via maddubs (its per-16 isuml is a
+  single total, so the pair-collapse is exact). Ternary + IQ delegate
+  to scalar. This host is SSE4-only (no AVX2/NEON here).
+- NOT the model default -- Q8_K is an OPT-IN mode
+  (LlamaModel::use_q8k_activations, default off). Why not the default:
+  "bit-exact with llama.cpp" is unachievable in principle -- ggml
+  itself is not bit-exact across its own backends, because the final
+  f32 d*Sigma accumulates in an implementation-specific order (SSE4 vs
+  AVX2 vs NEON vs CUDA vs generic). Q8_K's lower activation precision
+  puts argmaxes close enough that this order-noise tips tokens: qwen
+  (Q4_K) held 32 tokens under the f32 dot but tips at ~15 under Q8_K
+  with a different order, versus llama-simple's raw greedy (which
+  reproduces the old f32 golden). So flipping the default would (a)
+  regress robust-quant goldens and (b) break the single exact-string
+  e2e golden across backends (each backend's order tips differently).
+  Keeping f32 the default preserves stable, cross-backend goldens and
+  the tuned R11 register-blocked batched path. The opt-in mode nulls
+  Ops::matvec_q8k in the model's effective ops when off, so matvec_mt/
+  matvec_batch keep the f32 path; on, QK_K matmuls route to the
+  backend's Q8_K entry (batched -> per-token, byte-identical to
+  per-token). Validated by [e2e][qwen][q8k] (prefix smoke test, since
+  exact output is order-dependent) + the [backend] dot-parity tests.
+- Performance headroom (future, unlocked by NOT requiring bit-exact
+  cross-impl output): the opt-in mode's kernels are free to use the
+  fast int paths -- maddubs / AVX2-VNNI / CUDA __dp4a -- and a weight-
+  stationary Q8_K batch kernel to recover the batched-decode traffic
+  the per-token fallback gives up. Bit-exactness would forbid these
+  (they reorder the accumulation), which is the other reason not to
+  chase it. Q8_K exists for integer-matvec throughput, so this is
+  where its real win lands.
 
 ## 8. Testing strategy
 

@@ -317,6 +317,49 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
     REQUIRE(tok->decode(ids) == golden);
 }
 
+// R16 opt-in Q8_K-activation mode (use_q8k_activations): the QK_K
+// matmuls integer-dot a Q8_K-quantized activation instead of the f32
+// dot. Exact output is NOT byte-stable vs the f32 golden -- Q8_K's
+// final accumulation order is implementation-specific -- so this is a
+// prefix smoke test on the unambiguous opening, confirming the mode
+// runs end-to-end and stays coherent. Deeper reconciliation to the
+// llama.cpp reference is a per-model, tolerance-based exercise.
+TEST_CASE("qwen2moe runs under opt-in Q8_K-activation mode",
+          "[e2e][qwen][q8k]") {
+    const std::string path = qwen_moe_path();
+    if (!std::filesystem::exists(path)) {
+        SKIP("Qwen-MoE model not present (9.5GB, gitignored)");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::LlamaModel::load(g);
+    model.use_q8k_activations(true);  // the mode under test
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+    auto cache = model.make_cache();
+    auto ws = model.make_workspace();
+    locus::kv::PagedKvCache::Seq seq;
+    std::vector<float> logits(model.hparams().n_vocab);
+    auto ids = tok->encode("Once upon a time", true);
+    for (auto id : ids) {
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(id, cache, seq, ws, logits);
+    }
+    for (int i = 0; i < 20; ++i) {
+        const auto next = locus::model::argmax(logits);
+        if (next == tok->eos_id()) {
+            break;
+        }
+        ids.push_back(next);
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(next, cache, seq, ws, logits);
+    }
+    cache.release(seq);
+    // The opening sentence is argmax-unambiguous, so it holds across
+    // f32/Q8_K/llama.cpp regardless of accumulation order.
+    REQUIRE(tok->decode(ids).starts_with(
+        "Once upon a time, there was a little girl who loved to "
+        "play with her dolls."));
+}
+
 // Same qwen2moe golden with the CUDA backend live: attention is CPU
 // but the projection / expert matvecs offload to the GPU, so this
 // proves the new arch is token-exact with GPU matvec in the loop

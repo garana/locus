@@ -1945,25 +1945,36 @@ void quantize_activation_q8k(std::span<const float> x, float* d,
     }
 }
 
+bool is_q8k_type(gguf::TensorType type) {
+    using T = gguf::TensorType;
+    switch (type) {
+        case T::kQ2_K:
+        case T::kQ3_K:
+        case T::kQ4_K:
+        case T::kQ5_K:
+        case T::kQ6_K:
+        case T::kTQ1_0:
+        case T::kTQ2_0:
+        case T::kIQ2_XXS:
+        case T::kIQ2_XS:
+        case T::kIQ2_S:
+        case T::kIQ3_XXS:
+        case T::kIQ3_S:
+        case T::kIQ1_S:
+        case T::kIQ1_M:
+        case T::kIQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void matvec_q8k(const Mat& w, std::span<const float> x,
                 std::span<float> out) {
     assert(x.size() == w.cols && out.size() == w.rows);
     using T = gguf::TensorType;
-    const bool ported = (w.type == T::kQ2_K || w.type == T::kQ3_K ||
-                         w.type == T::kQ4_K || w.type == T::kQ5_K ||
-                         w.type == T::kQ6_K || w.type == T::kTQ1_0 ||
-                         w.type == T::kTQ2_0 ||
-                         w.type == T::kIQ2_XXS ||
-                         w.type == T::kIQ2_XS ||
-                         w.type == T::kIQ2_S ||
-                         w.type == T::kIQ3_XXS ||
-                         w.type == T::kIQ3_S ||
-                         w.type == T::kIQ1_S ||
-                         w.type == T::kIQ1_M ||
-                         w.type == T::kIQ4_XS) &&
-                        x.size() % 256 == 0;
-    if (!ported) {  // types without a Q8_K dot yet: keep the f32 path
-        matvec(w, x, out);
+    if (!is_q8k_type(w.type) || x.size() % 256 != 0) {
+        matvec(w, x, out);  // no Q8_K dot: keep the f32 path
         return;
     }
     const std::size_t nb = x.size() / 256;

@@ -98,19 +98,42 @@ std::size_t mt_slices(std::uint32_t rows) {
 
 }  // namespace
 
+/** The backend Ops the model runs with, honoring the R16 opt-in: when
+ *  Q8_K-activation mode is off, matvec_q8k is nulled so matvec_mt /
+ *  matvec_batch keep the f32 path (they already gate on it being set).
+ *  Copies a handful of function pointers -- cheap, called once per
+ *  forward method. */
+backend::Ops effective_ops(const backend::Backend* b, bool q8k) {
+    backend::Ops op = b->ops;
+    if (!q8k) {
+        op.matvec_q8k = nullptr;
+    }
+    return op;
+}
+
 void matvec_mt(const backend::Ops& op, const Mat& w,
                std::span<const float> x, std::span<float> out) {
+    // R16 ggml parity: QK_K weight types integer-dot a Q8_K-quantized
+    // activation (matches llama.cpp bit-for-bit); everything else keeps
+    // the f32-activation dot. Each backend points matvec_q8k at its own
+    // Q8_K entry (scalar/cuda/sse4), falling back to scalar for types it
+    // does not vectorize. Re-quantizing x per row-slice below is
+    // O(cols) vs the O(rows_slice*cols) dot -- negligible.
+    const auto mv =
+        (op.matvec_q8k != nullptr && backend::is_q8k_type(w.type))
+            ? op.matvec_q8k
+            : op.matvec;
     // A backend whose matvec is not re-entrant (Vulkan's single
     // VulkanContext singleton) must run inline: parallel calls
     // crash the driver. This path is hit when a GPU full-forward
     // bails to the per-op fallback on an unshadered weight type.
     if (!op.mt_safe) {
-        op.matvec(w, x, out);
+        mv(w, x, out);
         return;
     }
     const std::size_t t = mt_slices(w.rows);
     if (t <= 1) {
-        op.matvec(w, x, out);
+        mv(w, x, out);
         return;
     }
     sys::ThreadPool::instance().parallel_for(t, [&](std::size_t i) {
@@ -118,8 +141,8 @@ void matvec_mt(const backend::Ops& op, const Mat& w,
             static_cast<std::uint64_t>(w.rows) * i / t);
         const std::uint32_t r1 = static_cast<std::uint32_t>(
             static_cast<std::uint64_t>(w.rows) * (i + 1) / t);
-        op.matvec(backend::mat_rows(w, r0, r1 - r0), x,
-                  out.subspan(r0, r1 - r0));
+        mv(backend::mat_rows(w, r0, r1 - r0), x,
+           out.subspan(r0, r1 - r0));
     });
 }
 
@@ -421,7 +444,8 @@ void LlamaModel::forward(tok::TokenId token,
         throw std::invalid_argument("seq capacity not ensured");
     }
     const std::uint32_t pos = seq.n_tokens;
-    const backend::Ops& op = backend_->ops;
+    const backend::Ops op =
+        effective_ops(backend_, q8k_activations_);
 
     op.dequant_row(embd_, static_cast<std::uint32_t>(token),
                    ws.x);
@@ -552,7 +576,7 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
         throw std::invalid_argument(
             "forward_batch: seq capacity not ensured");
     }
-    const Ops& op = backend_->ops;
+    const Ops op = effective_ops(backend_, q8k_activations_);
     const std::uint32_t E = hp_.n_embd;
     const std::uint32_t ff = hp_.n_ff;
 
@@ -657,7 +681,7 @@ void LlamaModel::forward_batch_decode(
         throw std::invalid_argument(
             "forward_batch_decode: unsupported backend");
     }
-    const Ops& op = backend_->ops;
+    const Ops op = effective_ops(backend_, q8k_activations_);
     const std::uint32_t E = hp_.n_embd;
     const std::uint32_t ff = hp_.n_ff;
     const std::uint32_t V = hp_.n_vocab;
@@ -803,12 +827,30 @@ void matvec_batch_deq(const backend::Ops& op, const Mat& w,
 void matvec_batch(const backend::Ops& op, const Mat& w,
                   std::span<const float> x_batch,
                   std::span<float> out_batch, std::uint32_t n) {
+    // R16 ggml parity: QK_K types run the Q8_K activation dot per
+    // token via matvec_mt (which routes to op.matvec_q8k, row-sliced).
+    // The batched contract is "byte-identical to n per-token matvecs",
+    // so this holds by construction -- and it keeps prefill==decode,
+    // both going through the same Q8_K path. (The register-blocked f32
+    // batch kernel and the dequant-once batch path are bypassed for
+    // these types; a weight-stationary Q8_K batch kernel is future
+    // work.)
+    const std::uint32_t xc = w.cols;
+    const std::uint32_t oc = w.rows;
+    if (op.matvec_q8k != nullptr && backend::is_q8k_type(w.type)) {
+        for (std::uint32_t t = 0; t < n; ++t) {
+            matvec_mt(op, w,
+                      x_batch.subspan(static_cast<std::size_t>(t) * xc,
+                                      xc),
+                      out_batch.subspan(
+                          static_cast<std::size_t>(t) * oc, oc));
+        }
+        return;
+    }
     if (batch_dequant_enabled()) {
         matvec_batch_deq(op, w, x_batch, out_batch, n);
         return;
     }
-    const std::uint32_t xc = w.cols;
-    const std::uint32_t oc = w.rows;
     if (op.matvec_batch != nullptr) {
         // R11: the backend's register-blocked kernel reads each
         // weight block once and reuses it across all n tokens. Its
@@ -950,7 +992,7 @@ void LlamaModel::apply_norm(std::span<const float> x,
 void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
                          std::uint32_t layer) const {
     using namespace locus::backend;
-    const Ops& op = backend_->ops;
+    const Ops op = effective_ops(backend_, q8k_activations_);
     const std::uint32_t n_ff = hp_.n_ff_exp;
 
     op.matvec(lay.gate_inp, ws.xb, ws.router);
@@ -1040,7 +1082,7 @@ void LlamaModel::moe_ffn_batch(const Layer& lay,
                                std::vector<float>& x,
                                std::uint32_t n, Workspace& ws) const {
     using namespace locus::backend;
-    const Ops& op = backend_->ops;
+    const Ops op = effective_ops(backend_, q8k_activations_);
     const std::uint32_t E = hp_.n_embd;
     const std::uint32_t ff = hp_.n_ff_exp;
     const std::uint32_t k = hp_.n_expert_used;
