@@ -452,77 +452,6 @@ void q6_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8,
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
 }
 
-/** SSE4 Q5_K x Q8_K aux32[8]: Q4_K's widen-per-lane core with the hm
- *  5th-bit added to the unpack; utmp 6-bit scales/mins + bsums min term.
- *  Bit-identical to scalar vec_dot_q5_k_q8_k. */
-void q5_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8,
-                         const std::int16_t* bsums,
-                         std::int32_t aux32[8], int& sumi) {
-    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
-                            kmask3 = 0x03030303;
-    const auto* hm = reinterpret_cast<const std::uint8_t*>(blk + 16);
-    const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 48);
-    std::int8_t aux8[256];
-    std::int8_t* a = aux8;
-    std::uint8_t m = 1;
-    for (int j = 0; j < 4; ++j) {
-        for (int l = 0; l < 32; ++l) {
-            a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
-        }
-        for (int l = 0; l < 32; ++l) {
-            a[l] = static_cast<std::int8_t>(a[l] + ((hm[l] & m) ? 16 : 0));
-        }
-        a += 32;
-        m <<= 1;
-        for (int l = 0; l < 32; ++l) {
-            a[l] = static_cast<std::int8_t>(q4[l] >> 4);
-        }
-        for (int l = 0; l < 32; ++l) {
-            a[l] = static_cast<std::int8_t>(a[l] + ((hm[l] & m) ? 16 : 0));
-        }
-        a += 32;
-        m <<= 1;
-        q4 += 32;
-    }
-    std::uint32_t utmp[4];
-    std::memcpy(utmp, blk + 4, 12);
-    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-    const std::uint32_t uaux = utmp[1] & kmask1;
-    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-    utmp[2] = uaux;
-    utmp[0] &= kmask1;
-    const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
-    const auto* mins = reinterpret_cast<const std::uint8_t*>(utmp + 2);
-    sumi = 0;
-    for (int j = 0; j < 16; ++j) {
-        sumi += bsums[j] * mins[j / 2];
-    }
-    __m128i acc_lo = _mm_setzero_si128(), acc_hi = _mm_setzero_si128();
-    const std::int8_t* ap = aux8;
-    const std::int8_t* q8p = q8;
-    int is = 0;
-    for (int j = 0; j < 8; ++j) {
-        const __m128i scv = _mm_set1_epi32(scales[is++]);
-        for (int k = 0; k < 4; ++k) {
-            const __m128i qv = _mm_cvtepi8_epi16(
-                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q8p)));
-            const __m128i av = _mm_cvtepi8_epi16(
-                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ap)));
-            const __m128i p = _mm_mullo_epi16(qv, av);
-            acc_lo = _mm_add_epi32(
-                acc_lo, _mm_mullo_epi32(_mm_cvtepi16_epi32(p), scv));
-            acc_hi = _mm_add_epi32(
-                acc_hi, _mm_mullo_epi32(
-                            _mm_cvtepi16_epi32(_mm_srli_si128(p, 8)),
-                            scv));
-            q8p += 8;
-            ap += 8;
-        }
-    }
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
-}
-
 /** SSE4 Q3_K x Q8_K aux32[8]: 2-bit + hmask 3rd-bit unpack (-4 offset),
  *  6-bit scales unpacked from the packed 12 bytes, 16 groups x 2 with
  *  scale=(scales[j]-32); no min term. Bit-identical to scalar
@@ -690,6 +619,72 @@ void q4_k_q8k_fast_sse4(const std::byte* blk, const std::int8_t* q8,
     }
 }
 
+/** SSE4 Q5_K x Q8_K, the fast maddubs path (R16). Like q4_k_q8k_fast_
+ *  sse4 but each value gets the 5th bit from hm added in-register
+ *  (value stays unsigned [0,31], so maddubs still applies); 6-bit
+ *  scales + bsums min term as in Q4_K. Returns block_int + sumi. */
+void q5_k_q8k_fast_sse4(const std::byte* blk, const std::int8_t* q8,
+                        const std::int16_t* bsums, int& block_int,
+                        int& sumi) {
+    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
+                            kmask3 = 0x03030303;
+    const auto* hm = reinterpret_cast<const std::uint8_t*>(blk + 16);
+    const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 48);
+    std::uint32_t utmp[4];
+    std::memcpy(utmp, blk + 4, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const std::uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+    const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
+    const auto* mins = reinterpret_cast<const std::uint8_t*>(utmp + 2);
+    sumi = 0;
+    for (int j = 0; j < 16; ++j) {
+        sumi += bsums[j] * mins[j / 2];
+    }
+    const __m128i lo4 = _mm_set1_epi8(0x0f);
+    const __m128i s16 = _mm_set1_epi8(16);
+    const __m128i ones = _mm_set1_epi16(1);
+    const __m128i hm0 =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(hm));
+    const __m128i hm1 =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(hm + 16));
+    block_int = 0;
+    for (int j = 0; j < 8; ++j) {
+        const std::uint8_t* q4b = q4 + (j / 2) * 32;
+        const std::int8_t* q8g = q8 + j * 32;
+        const __m128i r0 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b));
+        const __m128i r1 = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(q4b + 16));
+        __m128i n0, n1;
+        if ((j & 1) == 0) {
+            n0 = _mm_and_si128(r0, lo4);
+            n1 = _mm_and_si128(r1, lo4);
+        } else {
+            n0 = _mm_and_si128(_mm_srli_epi16(r0, 4), lo4);
+            n1 = _mm_and_si128(_mm_srli_epi16(r1, 4), lo4);
+        }
+        // add 16 where the j-th hm bit is set (5th weight bit)
+        const __m128i bit = _mm_set1_epi8(static_cast<char>(1 << j));
+        n0 = _mm_add_epi8(
+            n0, _mm_and_si128(
+                    _mm_cmpeq_epi8(_mm_and_si128(hm0, bit), bit), s16));
+        n1 = _mm_add_epi8(
+            n1, _mm_and_si128(
+                    _mm_cmpeq_epi8(_mm_and_si128(hm1, bit), bit), s16));
+        const __m128i a0 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
+        const __m128i a1 = _mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(q8g + 16));
+        const __m128i p = _mm_add_epi32(
+            _mm_madd_epi16(_mm_maddubs_epi16(n0, a0), ones),
+            _mm_madd_epi16(_mm_maddubs_epi16(n1, a1), ones));
+        block_int += static_cast<int>(scales[j]) * hsum_epi32_sse4(p);
+    }
+}
+
 void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
     const bool q4k = w.type == gguf::TensorType::kQ4_K;
@@ -740,25 +735,21 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
         for (std::size_t b = 0; b < nb; ++b) {
             const std::byte* blk = row + b * blk_bytes;
             std::int32_t aux32[8];
-            if (q4k) {  // fast maddubs path: one block_int, direct sumf
+            if (q4k || q5k) {  // fast maddubs, direct sumf + bsums min
                 const float bd = f16_to_f32(load_u16(blk));
                 const float bdmin = f16_to_f32(load_u16(blk + 2));
                 int block_int = 0, sumi = 0;
-                q4_k_q8k_fast_sse4(blk, hqs.data() + b * 256,
-                                   hbs.data() + b * 16, block_int, sumi);
+                if (q4k) {
+                    q4_k_q8k_fast_sse4(blk, hqs.data() + b * 256,
+                                       hbs.data() + b * 16, block_int,
+                                       sumi);
+                } else {
+                    q5_k_q8k_fast_sse4(blk, hqs.data() + b * 256,
+                                       hbs.data() + b * 16, block_int,
+                                       sumi);
+                }
                 sumf += bd * hd[b] * static_cast<float>(block_int) -
                         bdmin * hd[b] * static_cast<float>(sumi);
-            } else if (q5k) {  // widen-per-lane aux32 + bsums min
-                const float bd = f16_to_f32(load_u16(blk));
-                const float bdmin = f16_to_f32(load_u16(blk + 2));
-                int sumi = 0;
-                q5_k_q8k_aux32_sse4(blk, hqs.data() + b * 256,
-                                    hbs.data() + b * 16, aux32, sumi);
-                const float d = bd * hd[b];
-                for (int l = 0; l < 8; ++l) {
-                    sums[l] += d * static_cast<float>(aux32[l]);
-                }
-                sumf -= bdmin * hd[b] * static_cast<float>(sumi);
             } else {  // Q3_K/Q6_K: no min term
                 const float bd = q3k ? f16_to_f32(load_u16(blk + 108))
                                      : f16_to_f32(load_u16(blk + 208));
