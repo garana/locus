@@ -10,10 +10,17 @@ namespace {
  * unbounded buffering before we reject the connection. */
 constexpr std::size_t kMaxTextRecord = 64 * 1024;
 
-/** A field key/value is wire-safe if it has no newline (which would
- * break framing); keys additionally may not contain '='. */
+/** A field key/value is wire-safe if it contains neither framing
+ * character; keys additionally may not contain '='. '\n' delimits
+ * lines, and '\r' must be rejected too: decode's trim_cr strips a
+ * trailing '\r', so a value like "secret\r" would silently
+ * canonicalize to "secret" -- two distinct inputs mapping to one
+ * decoded value (a client could authenticate with a real token plus
+ * a trailing CR under a distinct cache key). Fail closed on an
+ * ambiguous value rather than encode it. */
 bool value_ok(const std::string& s) {
-    return s.find('\n') == std::string::npos;
+    return s.find('\n') == std::string::npos &&
+           s.find('\r') == std::string::npos;
 }
 bool key_ok(const std::string& s) {
     return value_ok(s) && s.find('=') == std::string::npos;
