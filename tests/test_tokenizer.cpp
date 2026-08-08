@@ -94,3 +94,20 @@ TEST_CASE("rejects non-SPM tokenizers", "[tok]") {
     REQUIRE_THROWS_AS(SpmTokenizer::from_gguf(g),
                       locus::gguf::Error);
 }
+
+TEST_CASE("spm decode tolerates a malformed byte piece", "[tok]") {
+    // #60-5: a kByte piece "<0xNN>" with non-hex NN (crafted GGUF)
+    // must NOT throw -- decode runs in the SSE streaming lambdas
+    // outside any try/catch, so a throw would std::terminate. Emit
+    // the piece verbatim instead. Pre-fix std::stoi("ZZ",16) threw.
+    SpmTokenizer::Config cfg = tiny_vocab();
+    cfg.tokens.push_back("<0xZZ>");
+    cfg.scores.push_back(0.0f);
+    cfg.types.push_back(6);   // kByte
+    SpmTokenizer tok(cfg);
+    const TokenId bad =
+        static_cast<TokenId>(cfg.tokens.size() - 1);
+    std::string out;
+    REQUIRE_NOTHROW(out = tok.decode({&bad, 1}));
+    REQUIRE(out == "<0xZZ>");
+}

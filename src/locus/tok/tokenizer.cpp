@@ -1,5 +1,6 @@
 #include "locus/tok/tokenizer.hpp"
 
+#include <charconv>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
@@ -205,11 +206,18 @@ std::string SpmTokenizer::decode(std::span<const TokenId> ids) const {
             case TokenType::kUnused:
                 break;  // renders as nothing
             case TokenType::kByte: {
-                // Piece format is "<0xNN>".
-                if (p.size() == 6 && p.substr(0, 3) == "<0x") {
-                    out += static_cast<char>(
-                        std::stoi(std::string(p.substr(3, 2)),
-                                  nullptr, 16));
+                // Piece format is "<0xNN>". The piece is raw vocab
+                // from an untrusted GGUF, so parse without throwing:
+                // a malformed byte piece (non-hex NN) is emitted
+                // verbatim rather than aborting decode (which runs
+                // in the SSE lambdas outside any try/catch).
+                unsigned byte = 0;
+                if (p.size() == 6 && p.rfind("<0x", 0) == 0 &&
+                    p[5] == '>' &&
+                    std::from_chars(p.data() + 3, p.data() + 5,
+                                    byte, 16)
+                            .ec == std::errc()) {
+                    out += static_cast<char>(byte);
                 } else {
                     out += p;
                 }

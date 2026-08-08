@@ -257,8 +257,14 @@ BpeTokenizer::BpeTokenizer(Config config) : cfg_(std::move(config)) {
         token_to_id_.emplace(cfg_.tokens[i],
                              static_cast<TokenId>(i));
         const auto t = static_cast<TokenType>(cfg_.types[i]);
-        if (t == TokenType::kControl ||
-            t == TokenType::kUserDefined) {
+        // Skip EMPTY special pieces: an empty needle makes the
+        // encode split loop (text.find("", at) == at) match at the
+        // current position without advancing -> infinite loop +
+        // unbounded output. A hostile GGUF can declare an empty
+        // kControl/kUserDefined token, so guard here.
+        if ((t == TokenType::kControl ||
+             t == TokenType::kUserDefined) &&
+            !cfg_.tokens[i].empty()) {
             specials_.emplace_back(cfg_.tokens[i],
                                    static_cast<TokenId>(i));
         }
@@ -297,6 +303,9 @@ BpeTokenizer BpeTokenizer::from_gguf(const gguf::GgufFile& g) {
     Config cfg;
     cfg.tokens.reserve(tokens->size());
     for (const auto& v : *tokens) {
+        if (v.type != gguf::ValueType::kString) {
+            throw gguf::Error("token entry is not a string");
+        }
         cfg.tokens.push_back(v.s);
     }
     if (const auto* types =
@@ -307,6 +316,9 @@ BpeTokenizer BpeTokenizer::from_gguf(const gguf::GgufFile& g) {
     }
     cfg.merges.reserve(merges->size());
     for (const auto& v : *merges) {
+        if (v.type != gguf::ValueType::kString) {
+            throw gguf::Error("merge entry is not a string");
+        }
         cfg.merges.push_back(v.s);
     }
     if (auto pre = g.get_string("tokenizer.ggml.pre")) {
@@ -401,7 +413,11 @@ std::vector<TokenId> BpeTokenizer::encode(std::string_view text,
             break;
         }
         out.push_back(specials_[sp_idx].second);
-        at = sp_pos + specials_[sp_idx].first.size();
+        // Advance by at least one byte so a zero-width special can
+        // never stall the loop (defence-in-depth; empty specials are
+        // already filtered at construction).
+        const std::size_t adv = specials_[sp_idx].first.size();
+        at = sp_pos + (adv > 0 ? adv : 1);
     }
     return out;
 }

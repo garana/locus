@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "gguf_builder.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/tok/bpe_tokenizer.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -91,4 +92,32 @@ TEST_CASE("bpe matches llama.cpp goldens on Llama-3.2",
         // Byte-level BPE decodes losslessly (BOS renders empty).
         REQUIRE(tok->decode(c.ids) == c.text);
     }
+}
+
+TEST_CASE("empty special token does not stall encode", "[tok]") {
+    // #60-3: a hostile GGUF can declare an empty kControl/kUserDefined
+    // piece. Pre-fix, the encode split loop did text.find("", at) ==
+    // at and advanced by piece.size() == 0, so `at` never moved ->
+    // infinite loop + unbounded output. The empty special must be
+    // ignored and encode must terminate normally.
+    BpeTokenizer::Config cfg = tiny_vocab();
+    cfg.tokens.push_back("");   // empty special piece
+    cfg.types.push_back(3);     // kControl
+    BpeTokenizer tok(cfg);
+    REQUIRE(tok.encode("abc", false) == std::vector<TokenId>{7});
+}
+
+TEST_CASE("bpe from_gguf rejects a non-string token entry", "[tok]") {
+    // #59-C: token array elements must be strings; a non-string
+    // element (crafted GGUF) is rejected, not silently coerced to "".
+    const std::vector<std::int32_t> toks = {1, 2, 3};   // not strings
+    const std::vector<std::string_view> merges = {"a b"};
+    GgufBuilder b;
+    b.header(0, 3)
+        .kv_string("tokenizer.ggml.model", "gpt2")
+        .kv_i32_array("tokenizer.ggml.tokens", toks)
+        .kv_str_array("tokenizer.ggml.merges", merges);
+    auto g = locus::gguf::GgufFile::parse(b.bytes());
+    REQUIRE_THROWS_AS(BpeTokenizer::from_gguf(g),
+                      locus::gguf::Error);
 }
