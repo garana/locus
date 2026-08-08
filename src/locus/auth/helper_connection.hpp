@@ -69,7 +69,12 @@ class HelperConnection {
     };
 
     void reader_loop();
-    bool write_all(const std::string& bytes);
+    /** Writes all bytes, giving up (and marking the connection
+     * broken) if the peer stops draining for longer than `timeout` --
+     * a blocking write would otherwise wedge every caller under
+     * write_mu_ when a helper stalls. */
+    bool write_all(const std::string& bytes,
+                   std::chrono::milliseconds timeout);
     void fail_all();
 
     int read_fd_;

@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/auth/helper_connection.hpp"
@@ -171,4 +172,87 @@ TEST_CASE("helper connection breaks on helper EOF", "[auth]") {
     auto resp = conn.request(std::move(q), 2000ms);
     REQUIRE_FALSE(resp.has_value());
     REQUIRE(conn.broken());
+}
+
+TEST_CASE("reader drains a burst of replies before honoring EOF",
+          "[auth]") {
+    // R3: many replies (> one 4096 read chunk) queued in a single
+    // burst, immediately followed by the helper closing its end, so
+    // POLLIN and POLLHUP arrive together. The reader must decode
+    // EVERY buffered, correlated reply before honoring the hangup --
+    // pre-fix it read one chunk then fail_all()'d, dropping the rest
+    // as spurious auth failures.
+    int fds[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    HelperConnection conn(fds[0], fds[0]);
+
+    constexpr int kN = 8;
+    const std::string pad(1024, 'x');  // fat replies -> > 4096 total
+
+    std::thread helper([&] {
+        std::string buf;
+        std::vector<HelperMessage> reqs;
+        for (int i = 0; i < kN; ++i) {
+            HelperMessage r;
+            REQUIRE(read_one(fds[1], buf, r));
+            reqs.push_back(std::move(r));
+        }
+        // Burst all replies, then hang up with them still buffered.
+        for (const auto& r : reqs) {
+            write_msg(fds[1], reply_to(r, pad));
+        }
+        ::close(fds[1]);
+    });
+
+    std::vector<std::optional<HelperMessage>> res(kN);
+    std::vector<std::thread> ts;
+    for (int i = 0; i < kN; ++i) {
+        ts.emplace_back([&, i] {
+            HelperMessage q;
+            q.type = "auth";
+            q.set("credential", "c" + std::to_string(i));
+            res[i] = conn.request(std::move(q), 2000ms);
+        });
+    }
+    for (auto& t : ts) {
+        t.join();
+    }
+    helper.join();
+
+    int ok = 0;
+    for (const auto& r : res) {
+        if (r.has_value() && *r->get("result") == pad) {
+            ++ok;
+        }
+    }
+    REQUIRE(ok == kN);  // every reply delivered, none dropped on HUP
+}
+
+TEST_CASE("write_all fails closed when the helper stops draining",
+          "[auth]") {
+    // S2: a helper that never reads its stdin fills the pipe; a
+    // blocking write would wedge every caller under write_mu_. The
+    // bounded, non-blocking write must give up at the deadline and
+    // fail closed instead of hanging.
+    int fds[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    // Shrink the buffers so a modest payload overflows them.
+    int sz = 2048;
+    ::setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+    ::setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz);
+    HelperConnection conn(fds[0], fds[0]);
+    // fds[1] is never read: the pipe fills and stays full.
+
+    HelperMessage q;
+    q.type = "auth";
+    q.set("credential", std::string(256 * 1024, 'x'));  // >> buffer
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto resp = conn.request(std::move(q), 300ms);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    REQUIRE_FALSE(resp.has_value());  // fail closed, not a hang
+    REQUIRE(conn.broken());
+    REQUIRE(elapsed < 3s);  // bounded by the deadline, not forever
+    ::close(fds[1]);
 }

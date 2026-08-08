@@ -1,10 +1,12 @@
 #include "locus/auth/helper_connection.hpp"
 
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <ctime>
 #include <mutex>
@@ -30,6 +32,19 @@ void ignore_sigpipe_once() {
     static std::once_flag once;
     std::call_once(once, [] { std::signal(SIGPIPE, SIG_IGN); });
 }
+
+/** Puts an fd in non-blocking mode so reads can drain fully and
+ * writes never block indefinitely. Best-effort. */
+void set_nonblocking(int fd) {
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+}
+
+/** Cap on a fire-and-forget notify() write: bounds how long an event
+ * push can block on a stalled helper before we give up. */
+constexpr std::chrono::milliseconds kNotifyWriteTimeout{2000};
 }  // namespace
 
 HelperConnection::HelperConnection(int read_fd, int write_fd)
@@ -39,9 +54,17 @@ HelperConnection::HelperConnection(int read_fd, int write_fd,
                                    pid_t child_pid)
     : read_fd_(read_fd),
       write_fd_(write_fd),
-      child_pid_(child_pid),
-      reader_([this] { reader_loop(); }) {
+      child_pid_(child_pid) {
     ignore_sigpipe_once();
+    // Non-blocking both directions BEFORE the reader starts: the
+    // reader drains every buffered (correlated) reply before honoring
+    // a hangup, and write_all polls with a deadline so a stalled
+    // helper cannot wedge callers under write_mu_.
+    set_nonblocking(read_fd_);
+    if (write_fd_ != read_fd_) {
+        set_nonblocking(write_fd_);
+    }
+    reader_ = std::thread([this] { reader_loop(); });
 }
 
 HelperConnection::~HelperConnection() {
@@ -78,20 +101,44 @@ HelperConnection::~HelperConnection() {
     }
 }
 
-bool HelperConnection::write_all(const std::string& bytes) {
+bool HelperConnection::write_all(const std::string& bytes,
+                                 std::chrono::milliseconds timeout) {
     std::lock_guard<std::mutex> lk(write_mu_);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::size_t off = 0;
     while (off < bytes.size()) {
         const ssize_t n =
             ::write(write_fd_, bytes.data() + off, bytes.size() - off);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            broken_.store(true);
-            return false;
+        if (n > 0) {
+            off += static_cast<std::size_t>(n);
+            continue;
         }
-        off += static_cast<std::size_t>(n);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // Pipe full: the helper is not draining. Wait (bounded)
+            // for it to make room instead of blocking forever under
+            // write_mu_; on timeout fail closed.
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                fail_all();  // wake any other in-flight waiters too
+                return false;
+            }
+            const auto ms = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline - now)
+                                .count();
+            pollfd pfd{write_fd_, POLLOUT, 0};
+            const int pr = ::poll(&pfd, 1, static_cast<int>(ms));
+            if (pr <= 0 ||
+                (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                fail_all();  // timeout or peer gone; wake waiters
+                return false;
+            }
+            continue;
+        }
+        fail_all();  // EPIPE or other fatal write error; wake waiters
+        return false;
     }
     return true;
 }
@@ -118,46 +165,61 @@ void HelperConnection::reader_loop() {
         if (pr == 0) {
             continue;  // timeout: re-check stop_
         }
-        if ((pfd.revents & (POLLERR | POLLNVAL)) != 0) {
-            fail_all();
-            return;
-        }
-        if ((pfd.revents & POLLIN) != 0) {
-            const ssize_t n = ::read(read_fd_, chunk, sizeof chunk);
-            if (n < 0) {
+
+        // Drain ALL currently-readable bytes -- decoding correlated
+        // replies as we go -- BEFORE honoring a hangup or error. A
+        // POLLHUP can arrive together with the final replies still in
+        // the pipe buffer; failing without draining would discard
+        // valid, correlated responses and surface them as spurious
+        // auth failures. read_fd_ is non-blocking, so the loop ends
+        // at EAGAIN.
+        bool eof = false;
+        bool ioerr = false;
+        if ((pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+            for (;;) {
+                const ssize_t n =
+                    ::read(read_fd_, chunk, sizeof chunk);
+                if (n > 0) {
+                    buf.append(chunk, static_cast<std::size_t>(n));
+                    HelperMessage msg;
+                    std::string err;
+                    HelperDecode d;
+                    while ((d = decode_text(buf, msg, err)) ==
+                           HelperDecode::kComplete) {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        auto it = pending_.find(msg.req_id);
+                        if (it != pending_.end()) {
+                            it->second->resp = std::move(msg);
+                            it->second->done = true;
+                            cv_.notify_all();
+                        }
+                        // Unknown/0 req_id (event ack) is ignored.
+                        msg = HelperMessage{};
+                    }
+                    if (d == HelperDecode::kError) {
+                        fail_all();
+                        return;
+                    }
+                    continue;
+                }
+                if (n == 0) {
+                    eof = true;  // peer closed stdout; fully drained
+                    break;
+                }
                 if (errno == EINTR) {
                     continue;
                 }
-                fail_all();
-                return;
-            }
-            if (n == 0) {
-                fail_all();  // helper closed its stdout (EOF)
-                return;
-            }
-            buf.append(chunk, static_cast<std::size_t>(n));
-            HelperMessage msg;
-            std::string err;
-            HelperDecode d;
-            while ((d = decode_text(buf, msg, err)) ==
-                   HelperDecode::kComplete) {
-                std::lock_guard<std::mutex> lk(mu_);
-                auto it = pending_.find(msg.req_id);
-                if (it != pending_.end()) {
-                    it->second->resp = std::move(msg);
-                    it->second->done = true;
-                    cv_.notify_all();
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;  // no more readable data right now
                 }
-                // Unknown/0 req_id (e.g. an event ack) is ignored.
-                msg = HelperMessage{};
-            }
-            if (d == HelperDecode::kError) {
-                fail_all();
-                return;
+                ioerr = true;  // real read error
+                break;
             }
         }
-        if ((pfd.revents & POLLHUP) != 0) {
-            fail_all();  // hangup after draining readable data
+
+        if (eof || ioerr ||
+            (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            fail_all();  // drained above; now honor hangup/error
             return;
         }
     }
@@ -180,7 +242,7 @@ std::optional<HelperMessage> HelperConnection::request(
         std::lock_guard<std::mutex> lk(mu_);
         pending_.emplace(id, slot);
     }
-    if (!write_all(wire)) {
+    if (!write_all(wire, timeout)) {
         std::lock_guard<std::mutex> lk(mu_);
         pending_.erase(id);
         return std::nullopt;
@@ -202,7 +264,7 @@ bool HelperConnection::notify(HelperMessage msg) {
     if (!encode_text(msg, wire)) {
         return false;
     }
-    return write_all(wire);
+    return write_all(wire, kNotifyWriteTimeout);
 }
 
 }  // namespace locus::auth
