@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -35,6 +36,21 @@ inline std::string backend_unavail_reason(std::string_view name) {
         return "no CUDA device or non-CUDA build";
     }
     return "unavailable on this machine";
+}
+
+/**
+ * Public model id to advertise for a model file: the path's basename,
+ * never the full on-disk path. /v1/models and /metrics echo this to
+ * unauthenticated clients, so the absolute path (which leaks the
+ * server's filesystem layout and username) must not become the model
+ * id. Falls back to "locus" when the basename would be empty.
+ * @param model_path Path passed on the command line.
+ * @returns The basename, or "locus" when it would be empty.
+ */
+inline std::string public_model_id(const std::string& model_path) {
+    const std::string name =
+        std::filesystem::path(model_path).filename().string();
+    return name.empty() ? "locus" : name;
 }
 
 /** Prints the supported model architectures. */
