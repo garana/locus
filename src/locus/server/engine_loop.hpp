@@ -35,6 +35,13 @@ class EngineLoop {
     EngineLoop(const EngineLoop&) = delete;
     EngineLoop& operator=(const EngineLoop&) = delete;
 
+    /**
+     * Reason a prompt of n_prompt tokens can never be served by the
+     * KV pool (empty = admissible); callers reject at the HTTP edge
+     * so an oversized request never enters the wait queue.
+     */
+    std::string admit_error(std::uint32_t n_prompt);
+
     /** Enqueues a request and wakes the worker. */
     std::uint64_t submit(
         std::vector<tok::TokenId> prompt,

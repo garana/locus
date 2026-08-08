@@ -209,6 +209,10 @@ OpenAiServer::OpenAiServer(const model::LlamaModel& m,
         auth_ = std::make_unique<auth::AuthClient>(
             std::move(conns), auth_clock_, opt_.auth_cache);
     }
+    // Bound the request body httplib buffers into memory before any
+    // handler (and thus before authorize()) runs; without this the
+    // default is SIZE_MAX -- an unauthenticated OOM.
+    http_->set_payload_max_length(opt_.max_body_bytes);
     install_routes();
 }
 
@@ -500,6 +504,15 @@ void OpenAiServer::install_routes() {
         auto prompt_ids = tok_.encode(prompt, true);
         const std::uint32_t n_prompt =
             static_cast<std::uint32_t>(prompt_ids.size());
+        // Reject a prompt the KV pool can never hold BEFORE it enters
+        // the wait queue; an un-admissible request left waiting would
+        // otherwise starve the queue (and, pre-fix, wedge the loop).
+        if (const std::string why = loop_.admit_error(n_prompt);
+            !why.empty()) {
+            res.status = 400;
+            res.set_content(make_error(why).dump(), "application/json");
+            return;
+        }
         requests_total_.fetch_add(1, std::memory_order_relaxed);
         prompt_tokens_total_.fetch_add(n_prompt,
                                        std::memory_order_relaxed);
@@ -1037,6 +1050,14 @@ void OpenAiServer::install_routes() {
                         body["input"].get<std::string>());
                 } else if (body.contains("input") &&
                            body["input"].is_array()) {
+                    if (body["input"].size() >
+                        opt_.max_embeddings_inputs) {
+                        throw std::invalid_argument(
+                            "input array exceeds the " +
+                            std::to_string(
+                                opt_.max_embeddings_inputs) +
+                            "-element limit");
+                    }
                     for (const auto& s : body["input"]) {
                         inputs.push_back(s.get<std::string>());
                     }

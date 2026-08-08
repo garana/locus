@@ -305,3 +305,59 @@ TEST_CASE("oversized request fails instead of wedging",
     REQUIRE(engine.get(id)->status == Status::kFailed);
     REQUIRE(engine.free_blocks() == engine.total_blocks());
 }
+
+TEST_CASE("admit_error rejects prompts the pool can never hold",
+          "[engine]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    Engine engine(model, tok.eos_id());  // default full-context pool
+    const std::uint32_t n_ctx = model.hparams().n_ctx;
+
+    // A short prompt is admissible.
+    REQUIRE(engine.admit_error(1).empty());
+    // A prompt at or beyond the context window is not.
+    REQUIRE_FALSE(engine.admit_error(n_ctx).empty());
+    REQUIRE_FALSE(engine.admit_error(n_ctx + 100).empty());
+
+    // A tiny KV pool rejects a prompt that would not fit it even
+    // though the prompt is within the context window.
+    Engine::Config tiny;
+    tiny.n_blocks = 1;
+    Engine small(model, tok.eos_id(), tiny);
+    REQUIRE_FALSE(small.admit_error(n_ctx - 1).empty());
+}
+
+TEST_CASE("un-admissible prompt parks the loop instead of wedging it",
+          "[engine]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    Engine engine(model, tok.eos_id());
+    const std::uint32_t n_ctx = model.hparams().n_ctx;
+
+    // Bypass admit_error and hand the engine a prompt larger than the
+    // whole context: it can never be admitted. Pre-fix, step() would
+    // report "more work" forever and run_to_completion would spin
+    // (the server's worker held its mutex the whole time -> wedge).
+    std::vector<locus::tok::TokenId> huge(
+        static_cast<std::size_t>(n_ctx) + 50, 1);
+    const auto id = engine.submit(huge, 8);
+
+    REQUIRE_FALSE(engine.has_runnable_work());
+    engine.run_to_completion();  // must return, not hang
+    REQUIRE(engine.get(id)->status == Status::kWaiting);
+
+    // A well-sized request submitted alongside is still runnable.
+    Engine ok(model, tok.eos_id());
+    ok.submit(tok.encode("Once upon a time", true), 4);
+    REQUIRE(ok.has_runnable_work());
+}

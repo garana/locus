@@ -50,6 +50,43 @@ std::uint32_t Engine::blocks_for(std::uint32_t n_tokens) const {
     return (n_tokens + bt - 1) / bt;
 }
 
+std::string Engine::admit_error(std::uint32_t n_prompt) const {
+    const std::uint32_t n_ctx = model_.hparams().n_ctx;
+    if (n_prompt >= n_ctx) {
+        return "prompt length " + std::to_string(n_prompt) +
+               " exceeds context window " + std::to_string(n_ctx);
+    }
+    const std::uint32_t want =
+        blocks_for(n_prompt + cfg_.decode_headroom);
+    if (want > cache_.total_blocks()) {
+        return "prompt needs " + std::to_string(want) +
+               " KV blocks but the pool holds only " +
+               std::to_string(cache_.total_blocks());
+    }
+    return "";
+}
+
+bool Engine::has_runnable_work() const {
+    if (!running_.empty()) {
+        return true;  // running work always advances a step
+    }
+    if (waiting_.empty()) {
+        return false;
+    }
+    // step() admits FCFS: it only looks at the queue front and breaks
+    // if it does not fit, so runnability hinges on the front alone.
+    // With nothing running the whole pool is reclaimable for it (free
+    // blocks plus any evictable prefix-cache blocks == total_blocks);
+    // a front that still does not fit is one admit_error should have
+    // rejected -- park, do not spin.
+    const Request& r = *requests_[waiting_.front()];
+    const std::uint32_t want = blocks_for(
+        static_cast<std::uint32_t>(r.prompt.size()) +
+        static_cast<std::uint32_t>(r.generated.size()) +
+        cfg_.decode_headroom);
+    return want <= cache_.total_blocks();
+}
+
 bool Engine::step() {
     // Batched decode needs a model/backend that supports the
     // batched forward (Vulkan drives its own full forward and opts
@@ -334,7 +371,12 @@ bool Engine::spec_decode_step(Request& r) {
 }
 
 void Engine::run_to_completion() {
-    while (step()) {
+    // Stop when idle, or when the only backlog is a request too large
+    // for the pool: step() would otherwise report "more work" forever
+    // and spin. Such a request is left waiting (callers should reject
+    // it up front via admit_error).
+    while (!idle() && has_runnable_work()) {
+        step();
     }
 }
 

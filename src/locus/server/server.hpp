@@ -55,6 +55,15 @@ class OpenAiServer {
         engine::Engine::Config engine;
         /** Hard cap applied to requested max_tokens. */
         std::uint32_t max_tokens_cap = 1024;
+        /** Max HTTP request body accepted before the handler runs;
+         * httplib buffers the whole body into memory, so an
+         * unbounded Content-Length is an unauthenticated OOM. Bodies
+         * over this get 413. Default 16 MiB. */
+        std::size_t max_body_bytes = 16u * 1024 * 1024;
+        /** Max number of inputs one /v1/embeddings call may batch;
+         * each runs a serialized model forward, so an unbounded array
+         * is a CPU-exhaustion vector. Over this gets 400. */
+        std::size_t max_embeddings_inputs = 256;
         /** Path the Prometheus metrics endpoint is served at
          * (--metrics-path); default /metrics. */
         std::string metrics_path = "/metrics";

@@ -16,6 +16,11 @@ EngineLoop::~EngineLoop() {
     worker_.join();
 }
 
+std::string EngineLoop::admit_error(std::uint32_t n_prompt) {
+    std::lock_guard<std::mutex> lk(mu_);
+    return engine_.admit_error(n_prompt);
+}
+
 std::uint64_t EngineLoop::submit(
     std::vector<tok::TokenId> prompt, std::uint32_t max_new_tokens,
     model::SamplingParams sampling, std::uint64_t seed,
@@ -35,11 +40,15 @@ std::uint64_t EngineLoop::submit(
 void EngineLoop::run() {
     std::unique_lock<std::mutex> lk(mu_);
     while (!stop_) {
-        const bool more = engine_.step();
+        engine_.step();
         progress_cv_.notify_all();
-        if (!more) {
+        // Park unless there is work step() can make progress on now.
+        // Gating on has_runnable_work (not just idle) keeps the
+        // worker from busy-spinning while HOLDING mu_ on a backlog it
+        // cannot admit -- the failure that wedged the whole server.
+        if (!engine_.has_runnable_work()) {
             work_cv_.wait(lk, [this] {
-                return stop_ || !engine_.idle();
+                return stop_ || engine_.has_runnable_work();
             });
         }
     }

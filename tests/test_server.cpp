@@ -1,6 +1,7 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
@@ -23,9 +24,10 @@ std::string model_path() {
 
 /** Server bound to an ephemeral port, serving on a thread. */
 struct TestServer {
-    explicit TestServer(const locus::model::LlamaModel& m,
-                        const locus::tok::SpmTokenizer& tok)
-        : server(m, tok, {}) {
+    TestServer(const locus::model::LlamaModel& m,
+               const locus::tok::SpmTokenizer& tok,
+               locus::server::OpenAiServer::Options opt = {})
+        : server(m, tok, std::move(opt)) {
         port = server.bind_any_port("127.0.0.1");
         REQUIRE(port > 0);
         thread = std::thread([this] {
@@ -557,4 +559,46 @@ TEST_CASE("metrics path is configurable", "[server][e2e]") {
 
     server.stop();
     th.join();
+}
+
+TEST_CASE("request-edge size limits reject before work",
+          "[server][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    locus::server::OpenAiServer::Options opt;
+    opt.max_body_bytes = 2048;        // tiny body cap
+    opt.max_embeddings_inputs = 4;    // tiny embeddings cap
+    TestServer ts(model, tok, opt);
+    httplib::Client client("127.0.0.1", ts.port);
+
+    SECTION("oversized body is refused before the handler") {
+        // A body past the cap must not be buffered/parsed; httplib
+        // answers 413 without running the route (or authorize()).
+        const std::string big(8192, 'x');
+        const json body = {{"prompt", big}, {"max_tokens", 1}};
+        auto res = client.Post("/v1/completions", body.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 413);
+    }
+
+    SECTION("embeddings input array is bounded") {
+        json ok = {{"input", json::array({"a", "b"})}};
+        auto r1 = client.Post("/v1/embeddings", ok.dump(),
+                              "application/json");
+        REQUIRE(r1);
+        REQUIRE(r1->status == 200);
+
+        json over = {
+            {"input", json::array({"a", "b", "c", "d", "e"})}};
+        auto r2 = client.Post("/v1/embeddings", over.dump(),
+                              "application/json");
+        REQUIRE(r2);
+        REQUIRE(r2->status == 400);
+    }
 }

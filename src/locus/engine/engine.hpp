@@ -173,6 +173,27 @@ class Engine {
         return cache_.total_blocks();
     }
 
+    /**
+     * Reason a fresh prompt of n_prompt tokens can never be served by
+     * this engine (empty string = admissible). The whole KV pool may
+     * be too small to ever hold prompt + decode headroom, or the
+     * prompt may already exceed the context window. Callers reject at
+     * submit rather than parking an unsatisfiable request that would
+     * otherwise sit in the wait queue forever.
+     * @param n_prompt Prompt length in tokens.
+     * @returns A human-readable reason, or "" when the request fits.
+     */
+    std::string admit_error(std::uint32_t n_prompt) const;
+
+    /**
+     * @returns true when step() has work it can make progress on
+     * right now: a running request, or a waiting request whose blocks
+     * fit the currently free pool. The driver parks its worker on
+     * this instead of busy-spinning when the only backlog is a
+     * request too large for the pool.
+     */
+    bool has_runnable_work() const;
+
     /** Prompt positions served from the prefix cache (skipped
      * prefill), cumulative. 0 when prefix_cache is off. */
     std::uint64_t prefix_reused_tokens() const {
