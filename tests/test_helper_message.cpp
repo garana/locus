@@ -96,3 +96,28 @@ TEST_CASE("helper encode rejects newline in a value", "[auth]") {
     REQUIRE_FALSE(encode_text(m, wire));
     REQUIRE(wire.empty());
 }
+
+TEST_CASE("helper encode rejects carriage return in a value",
+          "[auth]") {
+    // A trailing '\r' would be stripped by decode's trim_cr, so
+    // "secret\r" would canonicalize to "secret" -- an ambiguous
+    // round-trip. Encode must fail closed on it (and on an embedded
+    // '\r' too), rather than emit a value that decodes differently.
+    for (const std::string bad : {"secret\r", "a\rb", "\r"}) {
+        HelperMessage m = make(1, "auth");
+        m.set("credential", bad);
+        std::string wire;
+        REQUIRE_FALSE(encode_text(m, wire));
+        REQUIRE(wire.empty());
+    }
+
+    // The real token still encodes and round-trips unchanged.
+    HelperMessage ok = make(2, "auth");
+    ok.set("credential", "secret");
+    std::string wire;
+    REQUIRE(encode_text(ok, wire));
+    HelperMessage out;
+    std::string err;
+    REQUIRE(decode_text(wire, out, err) == HelperDecode::kComplete);
+    REQUIRE(*out.get("credential") == "secret");
+}
