@@ -6,11 +6,19 @@
 
 #include <cerrno>
 #include <csignal>
+#include <ctime>
 #include <mutex>
 
 namespace locus::auth {
 
 namespace {
+
+/** Reaping a helper child: poll waitpid(WNOHANG) for up to
+ * kReapGraceTicks * kReapTickNs (1s) after SIGTERM before escalating
+ * to SIGKILL, so a helper that ignores EOF and SIGTERM cannot hang
+ * shutdown. */
+constexpr int kReapGraceTicks = 100;
+constexpr long kReapTickNs = 10L * 1000 * 1000;  // 10ms
 /**
  * Writing to a helper pipe/socket whose peer has closed raises
  * SIGPIPE, which by default kills the process. Per-fd suppression
@@ -47,11 +55,26 @@ HelperConnection::~HelperConnection() {
     if (read_fd_ != write_fd_) {
         ::close(read_fd_);
     }
-    // Reap a spawned child: the closed stdin gives it EOF; SIGTERM
-    // covers a helper that ignores that, so waitpid never hangs.
+    // Reap a spawned child. Closed stdin gives it EOF and SIGTERM
+    // asks it to quit, but a buggy helper may ignore BOTH; a plain
+    // blocking waitpid would then hang shutdown forever. Give it a
+    // bounded grace period, then SIGKILL (uncatchable) and reap.
     if (child_pid_ > 0) {
         ::kill(child_pid_, SIGTERM);
-        ::waitpid(child_pid_, nullptr, 0);
+        bool reaped = false;
+        for (int i = 0; i < kReapGraceTicks; ++i) {
+            const pid_t w = ::waitpid(child_pid_, nullptr, WNOHANG);
+            if (w == child_pid_ || (w < 0 && errno == ECHILD)) {
+                reaped = true;
+                break;
+            }
+            const timespec tick{0, kReapTickNs};
+            ::nanosleep(&tick, nullptr);
+        }
+        if (!reaped) {
+            ::kill(child_pid_, SIGKILL);
+            ::waitpid(child_pid_, nullptr, 0);
+        }
     }
 }
 
