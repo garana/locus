@@ -66,3 +66,19 @@ TEST_CASE("backend list includes compiled-out variants with a reason",
         }
     }
 }
+
+TEST_CASE("public_model_id exposes the basename, not the path",
+          "[cli]") {
+    REQUIRE(locus_tools::public_model_id(
+                "/srv/models/llama-3.gguf") == "llama-3.gguf");
+    REQUIRE(locus_tools::public_model_id("model.gguf") ==
+            "model.gguf");
+    REQUIRE(locus_tools::public_model_id(
+                "/home/alice/secret/path/q4.gguf") == "q4.gguf");
+    // Never leaks a directory component.
+    REQUIRE(locus_tools::public_model_id("/srv/models/x.gguf")
+                .find('/') == std::string::npos);
+    // Degenerate input (trailing separator) falls back to a stable
+    // id rather than an empty model name.
+    REQUIRE(locus_tools::public_model_id("/tmp/dir/") == "locus");
+}

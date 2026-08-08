@@ -67,7 +67,9 @@ int main(int argc, char** argv) {
         auto& tok = *tok_ptr;
 
         locus::server::OpenAiServer::Options opt;
-        opt.model_name = model_path;
+        // Advertise the basename, not the absolute path: /v1/models
+        // and /metrics echo model_name to unauthenticated clients.
+        opt.model_name = locus_tools::public_model_id(model_path);
         if (args.ctx > 0) {
             opt.engine.n_blocks = (args.ctx + 15) / 16;
         }
