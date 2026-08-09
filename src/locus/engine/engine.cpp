@@ -247,6 +247,17 @@ void Engine::finish(Request& r, Status s, std::string error) {
     r.status = s;
     r.error = std::move(error);
     r.n_fed = 0;
+    // Reclaim the heavy per-request buffers now the request is
+    // terminal and will never be stepped again: r.logits (n_vocab
+    // floats -- the largest buffer, pure sampling scratch) and
+    // r.prompt (already copied into the prefix cache above; not part
+    // of the client-visible result -- generated / logprobs stay for
+    // view()). Without this a long-lived server retains them for every
+    // finished request, so resident memory grows without bound with
+    // request count. swap-with-empty frees the capacity (clear/resize
+    // would keep it).
+    std::vector<float>().swap(r.logits);
+    std::vector<tok::TokenId>().swap(r.prompt);
 }
 
 void Engine::try_adopt(Request& r) {

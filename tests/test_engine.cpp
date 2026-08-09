@@ -361,3 +361,28 @@ TEST_CASE("un-admissible prompt parks the loop instead of wedging it",
     ok.submit(tok.encode("Once upon a time", true), 4);
     REQUIRE(ok.has_runnable_work());
 }
+
+// R2 (#59): a finished request must release its heavy scratch/input
+// buffers -- r.logits (n_vocab floats) and r.prompt -- or a long-lived
+// server retains them for every completed request and grows without
+// bound. The client result (generated / logprobs) is retained.
+TEST_CASE("finished requests reclaim their scratch buffers",
+          "[engine][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    Engine engine(model, tok.eos_id());
+    const auto id =
+        engine.submit(tok.encode("Once upon a time", true), 24);
+    engine.run_to_completion();
+
+    const auto* r = engine.get(id);
+    REQUIRE(r->status == Status::kDone);
+    REQUIRE_FALSE(r->generated.empty());       // result kept
+    // Pre-fix: logits.capacity()==n_vocab, prompt still populated.
+    REQUIRE(r->logits.capacity() == 0);        // n_vocab scratch freed
+    REQUIRE(r->prompt.empty());                // prompt freed
+}
