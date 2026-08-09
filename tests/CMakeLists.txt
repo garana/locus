@@ -14,6 +14,7 @@ add_executable(locus_tests
     test_arch_registry.cpp
     test_backend_registry.cpp
     test_bench.cpp
+    test_engine_loop.cpp
     test_bpe_tokenizer.cpp
     test_chat_template.cpp
     test_cpu_ops.cpp

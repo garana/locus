@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -78,7 +79,14 @@ class EngineLoop {
 
     std::mutex mu_;
     std::condition_variable work_cv_;
-    std::condition_variable progress_cv_;
+    /**
+     * Count of client threads currently trying to acquire mu_ for a
+     * read (view/wait_progress/wait_done/stats). The worker checks it
+     * between step()s and yields mu_ until pending readers have been
+     * serviced, so a reader is never starved behind a whole generation
+     * on the unfair std::mutex -- it waits at most one step().
+     */
+    std::atomic<int> read_waiters_{0};
     engine::Engine engine_;
     bool stop_ = false;
     std::thread worker_;

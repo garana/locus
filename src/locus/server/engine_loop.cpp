@@ -1,6 +1,17 @@
 #include "locus/server/engine_loop.hpp"
 
+#include <chrono>
+#include <thread>
+
 namespace locus::server {
+
+namespace {
+// Backoff between reader polls of the engine state. Small enough that
+// SSE latency stays imperceptible, large enough that an idle waiter
+// does not spin. The reader is serviced within one step() of a new
+// token via the read_waiters_ turnstile regardless.
+constexpr auto kPollBackoff = std::chrono::microseconds(200);
+}  // namespace
 
 EngineLoop::EngineLoop(const model::LlamaModel& m,
                        tok::TokenId eos,
@@ -41,7 +52,6 @@ void EngineLoop::run() {
     std::unique_lock<std::mutex> lk(mu_);
     while (!stop_) {
         engine_.step();
-        progress_cv_.notify_all();
         // Park unless there is work step() can make progress on now.
         // Gating on has_runnable_work (not just idle) keeps the
         // worker from busy-spinning while HOLDING mu_ on a backlog it
@@ -50,6 +60,20 @@ void EngineLoop::run() {
             work_cv_.wait(lk, [this] {
                 return stop_ || engine_.has_runnable_work();
             });
+        } else if (read_waiters_.load() > 0) {
+            // Active generation with a client reading: release mu_ and
+            // let every pending reader acquire it before the next
+            // step, so wait_progress/view observe each token (SSE
+            // streams) instead of blocking behind the whole
+            // generation. Spinning until read_waiters_ drains
+            // guarantees the reader wins the mu_ race on an unfair
+            // std::mutex -- the "at most one step()" contract.
+            // Unwatched generation skips this and runs full speed.
+            lk.unlock();
+            while (read_waiters_.load() > 0) {
+                std::this_thread::yield();
+            }
+            lk.lock();
         }
     }
 }
@@ -70,24 +94,39 @@ EngineLoop::View EngineLoop::snapshot_locked(
 }
 
 EngineLoop::View EngineLoop::view(std::uint64_t id) {
-    std::lock_guard<std::mutex> lk(mu_);
+    read_waiters_.fetch_add(1);
+    std::unique_lock<std::mutex> lk(mu_);
+    read_waiters_.fetch_sub(1);
     return snapshot_locked(id);
 }
 
 EngineLoop::View EngineLoop::wait_progress(std::uint64_t id,
                                            std::size_t n_seen) {
-    std::unique_lock<std::mutex> lk(mu_);
-    progress_cv_.wait(lk, [&] {
-        View v = snapshot_locked(id);
-        return v.generated.size() > n_seen ||
-               v.status == engine::Status::kDone ||
-               v.status == engine::Status::kFailed;
-    });
-    return snapshot_locked(id);
+    // Poll under the read_waiters_ turnstile: announce intent, take
+    // mu_ (the worker yields it between steps), snapshot, and either
+    // return or back off. Polling (vs a condvar) keeps the re-acquire
+    // fair -- a condvar wait would race the worker's relock and starve
+    // the reader for the whole generation.
+    for (;;) {
+        read_waiters_.fetch_add(1);
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            read_waiters_.fetch_sub(1);
+            const View v = snapshot_locked(id);
+            if (v.generated.size() > n_seen ||
+                v.status == engine::Status::kDone ||
+                v.status == engine::Status::kFailed) {
+                return v;
+            }
+        }
+        std::this_thread::sleep_for(kPollBackoff);
+    }
 }
 
 EngineLoop::Stats EngineLoop::stats() {
-    std::lock_guard<std::mutex> lk(mu_);
+    read_waiters_.fetch_add(1);
+    std::unique_lock<std::mutex> lk(mu_);
+    read_waiters_.fetch_sub(1);
     Stats s;
     s.free_blocks = engine_.free_blocks();
     s.total_blocks = engine_.total_blocks();
@@ -98,13 +137,19 @@ EngineLoop::Stats EngineLoop::stats() {
 }
 
 EngineLoop::View EngineLoop::wait_done(std::uint64_t id) {
-    std::unique_lock<std::mutex> lk(mu_);
-    progress_cv_.wait(lk, [&] {
-        View v = snapshot_locked(id);
-        return v.status == engine::Status::kDone ||
-               v.status == engine::Status::kFailed;
-    });
-    return snapshot_locked(id);
+    for (;;) {
+        read_waiters_.fetch_add(1);
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            read_waiters_.fetch_sub(1);
+            const View v = snapshot_locked(id);
+            if (v.status == engine::Status::kDone ||
+                v.status == engine::Status::kFailed) {
+                return v;
+            }
+        }
+        std::this_thread::sleep_for(kPollBackoff);
+    }
 }
 
 }  // namespace locus::server
