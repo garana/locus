@@ -1,3 +1,8 @@
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <chrono>
 #include <future>
 #include <string>
@@ -11,6 +16,7 @@
 
 using locus::auth::HelperMessage;
 using locus::auth::spawn_helper;
+using locus::auth::detail::SpawnedChild;
 using namespace std::chrono_literals;
 
 TEST_CASE("spawn_helper round-trips through a real process", "[auth]") {
@@ -83,4 +89,41 @@ TEST_CASE("helper dtor never hangs on a SIGTERM-ignoring child",
         t.detach();  // pre-fix: dtor hung; leak the worker
     }
     REQUIRE(returned);
+}
+
+TEST_CASE("SpawnedChild reaps the child and closes fds if not released",
+          "[auth]") {
+    // R4: models spawn_helper's error path -- a forked child + its
+    // parent-side pipe fds owned by a SpawnedChild that is destroyed
+    // WITHOUT release() (as when the HelperConnection ctor throws).
+    // It must reap the child (no zombie) and close both fds (no leak).
+    int in_pipe[2];
+    int out_pipe[2];
+    REQUIRE(::pipe(in_pipe) == 0);
+    REQUIRE(::pipe(out_pipe) == 0);
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        // Child: wait quietly to be killed (no Catch calls here).
+        ::close(in_pipe[1]);
+        ::close(out_pipe[0]);
+        ::pause();
+        _exit(0);
+    }
+    ::close(in_pipe[0]);
+    ::close(out_pipe[1]);
+    const int read_fd = out_pipe[0];
+    const int write_fd = in_pipe[1];
+
+    {
+        SpawnedChild child(pid, read_fd, write_fd);
+        // No release(): the destructor must clean everything up.
+    }
+
+    // Child reaped: a follow-up waitpid finds no such child.
+    REQUIRE(::waitpid(pid, nullptr, WNOHANG) == -1);
+    REQUIRE(errno == ECHILD);
+    // Both fds closed: fcntl on them now fails with EBADF.
+    REQUIRE(::fcntl(read_fd, F_GETFD) == -1);
+    REQUIRE(::fcntl(write_fd, F_GETFD) == -1);
 }

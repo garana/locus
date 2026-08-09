@@ -1,12 +1,38 @@
 #include "locus/auth/helper_spawn.hpp"
 
 #include <fcntl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <csignal>
 #include <cstring>
+#include <exception>
 
 namespace locus::auth {
+
+namespace detail {
+
+SpawnedChild::~SpawnedChild() {
+    if (!armed_) {
+        return;  // released into a HelperConnection; it owns them now
+    }
+    // Error teardown: close the retained fds and reap the child.
+    // SIGKILL is uncatchable, so the blocking waitpid returns.
+    ::close(read_fd_);
+    ::close(write_fd_);
+    ::kill(pid_, SIGKILL);
+    ::waitpid(pid_, nullptr, 0);
+}
+
+std::unique_ptr<HelperConnection> SpawnedChild::release() {
+    auto conn = std::make_unique<HelperConnection>(read_fd_, write_fd_,
+                                                   pid_);
+    armed_ = false;  // connection now owns the fds + child
+    return conn;
+}
+
+}  // namespace detail
 
 namespace {
 void close_all(int a, int b, int c, int d) {
@@ -76,8 +102,23 @@ std::unique_ptr<HelperConnection> spawn_helper(
     // Parent: keep in_pipe[1] (write to child) + out_pipe[0] (read).
     ::close(in_pipe[0]);
     ::close(out_pipe[1]);
-    return std::make_unique<HelperConnection>(
-        out_pipe[0] /*read*/, in_pipe[1] /*write*/, pid);
+    // Own the child + fds via RAII across construction: the
+    // HelperConnection ctor starts a reader thread that can throw
+    // (thread limit / OOM). Without this the exception would escape
+    // before the connection exists, leaving the forked child
+    // unreaped and the two pipe fds leaked. On throw, `child`'s dtor
+    // reaps and closes.
+    detail::SpawnedChild child(pid, out_pipe[0] /*read*/,
+                               in_pipe[1] /*write*/);
+    try {
+        return child.release();
+    } catch (const std::exception& e) {
+        if (err != nullptr) {
+            *err = std::string("spawn_helper: connection: ") +
+                   e.what();
+        }
+        return nullptr;
+    }
 }
 
 }  // namespace locus::auth
