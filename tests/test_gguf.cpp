@@ -65,6 +65,25 @@ TEST_CASE("metadata accessors are type-safe", "[gguf]") {
     REQUIRE((*arr)[1].f == -2.5);
 }
 
+TEST_CASE("oversized metadata array is rejected, not amplified",
+          "[gguf]") {
+    // #60-4: each array element is materialized as a heavyweight
+    // Value, so a large primitive array amplifies a modest file into
+    // GBs of RAM at parse. A count over the cap must be rejected up
+    // front. The bytes ARE present here (uint8 array with `count`
+    // bytes), so this is the amplification path, not a mere EOF --
+    // pre-fix it allocated ~1M Values (~100MB+) and parsed fine.
+    const std::uint64_t count = (1u << 20) + 1;  // > kMaxArrayElems
+    GgufBuilder b;
+    b.header(0, 1);
+    b.str("big.array")   // key
+        .u32(9)          // ValueType::kArray
+        .u32(0)          // element type: kUint8
+        .u64(count)      // declared element count
+        .zeros(count);   // backing bytes (so it is not an EOF)
+    REQUIRE_THROWS_AS(GgufFile::parse(b.bytes()), Error);
+}
+
 TEST_CASE("hostile images throw instead of crashing", "[gguf]") {
     SECTION("empty file") {
         REQUIRE_THROWS_AS(GgufFile::parse({}), Error);

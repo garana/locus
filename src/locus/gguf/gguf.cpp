@@ -11,6 +11,14 @@ namespace {
 
 constexpr std::uint32_t kMagic = 0x46554747;  // "GGUF" little-endian
 constexpr int kMaxArrayDepth = 8;
+// Every metadata-array element is materialized as a heavyweight Value
+// (~sizeof(Value) bytes resident) regardless of its wire size, so a
+// large primitive array (e.g. a multi-MB uint8/bool array) amplifies
+// a modest file into gigabytes of RAM at parse time -- an OOM DoS
+// from an otherwise unremarkable .gguf. Cap the element count well
+// above any real metadata array (vocabs are ~256K) so a crafted
+// array is rejected instead of exhausting memory.
+constexpr std::uint64_t kMaxArrayElems = 1u << 20;  // 1,048,576
 
 /** Per-tensor-type block geometry; {0, 0} marks unsupported ids. */
 struct TypeTraits {
@@ -133,10 +141,15 @@ Value parse_value(Reader& r, ValueType type, int depth) {
                 throw Error("array nesting too deep");
             }
             v.elem = static_cast<ValueType>(r.scalar<std::uint32_t>());
-            std::uint64_t count = r.scalar<std::uint64_t>();
-            // No reserve(count): growth is bounded by actual bytes
-            // parsed, so a huge declared count cannot balloon
-            // memory -- it just hits end-of-file.
+            const std::uint64_t count = r.scalar<std::uint64_t>();
+            // Reject an implausible count without allocating: each
+            // element is >=1 byte on the wire (so count can't exceed
+            // the bytes left), and each becomes a heavyweight Value
+            // (so a large primitive array would amplify file bytes
+            // into GBs of RAM -- cap it, see kMaxArrayElems).
+            if (count > r.remaining() || count > kMaxArrayElems) {
+                throw Error("array element count too large");
+            }
             for (std::uint64_t k = 0; k < count; ++k) {
                 v.arr.push_back(parse_value(r, v.elem, depth + 1));
             }
