@@ -333,7 +333,13 @@ void OpenAiServer::install_routes() {
     // OpenAI model listing: locus serves exactly one model.
     http_->Get(
         "/v1/models",
-        [this](const httplib::Request&, httplib::Response& res) {
+        [this](const httplib::Request& req, httplib::Response& res) {
+            // Gated when auth is on: the model id is deployment info.
+            // (authorize() is a no-op / returns true when auth off.)
+            std::string identity;
+            if (!authorize(req, res, identity)) {
+                return;
+            }
             json entry{{"id", opt_.model_name},
                        {"object", "model"},
                        {"created", 0},
@@ -348,6 +354,10 @@ void OpenAiServer::install_routes() {
     http_->Get(
         R"(/v1/models/(.+))",
         [this](const httplib::Request& req, httplib::Response& res) {
+            std::string identity;
+            if (!authorize(req, res, identity)) {
+                return;
+            }
             if (req.matches[1] != opt_.model_name) {
                 res.status = 404;
                 res.set_content(
@@ -367,7 +377,14 @@ void OpenAiServer::install_routes() {
     // engine gauges (KV pool, prefix reuse, speculative accepts).
     http_->Get(
         opt_.metrics_path,
-        [this](const httplib::Request&, httplib::Response& res) {
+        [this](const httplib::Request& req, httplib::Response& res) {
+            // Gated when auth is on: counters/gauges disclose traffic
+            // and capacity. Open (no-op) in the default no-auth mode,
+            // so unauthenticated scrapers keep working there.
+            std::string identity;
+            if (!authorize(req, res, identity)) {
+                return;
+            }
             const auto s = loop_.stats();
             std::string b;
             auto counter = [&](const char* name, const char* help,

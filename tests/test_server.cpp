@@ -528,6 +528,20 @@ TEST_CASE("auth gates protected routes via a helper", "[server][e2e]") {
     REQUIRE(h);
     REQUIRE(h->status == 200);
 
+    // Info routes are gated too (#60-S3): they disclose the model id
+    // and traffic/capacity counters, so with auth on they need a
+    // credential -- 401 without, 200 with.
+    for (const char* path : {"/v1/models", "/v1/models/locus",
+                             "/metrics"}) {
+        auto no = client.Get(path);
+        REQUIRE(no);
+        REQUIRE(no->status == 401);
+        auto ok = client.Get(
+            path, {{"Authorization", "Bearer sk-secret"}});
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+    }
+
     server.stop();
     th.join();
 }
