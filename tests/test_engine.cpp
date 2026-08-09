@@ -386,3 +386,48 @@ TEST_CASE("finished requests reclaim their scratch buffers",
     REQUIRE(r->logits.capacity() == 0);        // n_vocab scratch freed
     REQUIRE(r->prompt.empty());                // prompt freed
 }
+
+// R2 follow-up: even the small terminal Request RECORD must not
+// accumulate forever. release() drops it on consume, and a backstop
+// cap evicts the oldest terminal records so an abandoned request
+// (client never consumes) cannot grow requests_ without bound.
+TEST_CASE("finished request records are evicted (cap + release)",
+          "[engine]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    Engine::Config cfg;
+    cfg.max_retained_terminal = 3;  // tiny cap for the test
+    Engine engine(model, tok.eos_id(), cfg);
+
+    // Submit + drain one at a time so finish order == submit order.
+    std::vector<std::uint64_t> ids;
+    for (int i = 0; i < 8; ++i) {
+        ids.push_back(
+            engine.submit(tok.encode("Once upon a time", true), 2));
+        engine.run_to_completion();  // no release: "abandoned"
+    }
+
+    // Only the last `cap` terminal records survive; older ones are
+    // evicted oldest-first by the backstop.
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const bool retained = i >= ids.size() - cfg.max_retained_terminal;
+        if (retained) {
+            REQUIRE(engine.get(ids[i]) != nullptr);
+        } else {
+            REQUIRE(engine.get(ids[i]) == nullptr);  // evicted
+        }
+    }
+
+    // release() drops a retained terminal record on consume.
+    const std::uint64_t last = ids.back();
+    REQUIRE(engine.get(last) != nullptr);
+    engine.release(last);
+    REQUIRE(engine.get(last) == nullptr);
+    // release() on an unknown id is a harmless no-op.
+    engine.release(999999);
+}

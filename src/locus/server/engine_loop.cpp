@@ -152,4 +152,9 @@ EngineLoop::View EngineLoop::wait_done(std::uint64_t id) {
     }
 }
 
+void EngineLoop::release(std::uint64_t id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    engine_.release(id);
+}
+
 }  // namespace locus::server

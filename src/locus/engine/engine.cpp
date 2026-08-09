@@ -30,8 +30,9 @@ std::uint64_t Engine::submit(
     model::SamplingParams sampling, std::uint64_t seed,
     std::unique_ptr<model::TokenConstraint> constraint,
     LogprobsOpt logprobs) {
+    const std::uint64_t id = next_id_++;  // monotonic; never reused
     auto r = std::make_unique<Request>();
-    r->id = requests_.size();
+    r->id = id;
     r->prompt = std::move(prompt);
     r->max_new_tokens = max_new_tokens;
     r->sampling = sampling;
@@ -39,10 +40,10 @@ std::uint64_t Engine::submit(
     r->logprobs_opt = logprobs;
     r->rng.seed(seed != 0 ? seed
                           : std::random_device{}() ^
-                                (r->id * 0x9e3779b97f4a7c15ULL));
-    requests_.push_back(std::move(r));
-    waiting_.push_back(requests_.back()->id);
-    return requests_.back()->id;
+                                (id * 0x9e3779b97f4a7c15ULL));
+    requests_.emplace(id, std::move(r));
+    waiting_.push_back(id);
+    return id;
 }
 
 std::uint32_t Engine::blocks_for(std::uint32_t n_tokens) const {
@@ -79,7 +80,7 @@ bool Engine::has_runnable_work() const {
     // blocks plus any evictable prefix-cache blocks == total_blocks);
     // a front that still does not fit is one admit_error should have
     // rejected -- park, do not spin.
-    const Request& r = *requests_[waiting_.front()];
+    const Request& r = *requests_.at(waiting_.front());
     const std::uint32_t want = blocks_for(
         static_cast<std::uint32_t>(r.prompt.size()) +
         static_cast<std::uint32_t>(r.generated.size()) +
@@ -102,7 +103,7 @@ bool Engine::step() {
     // Admission: FCFS while the pool can cover prompt + headroom.
     while (!waiting_.empty() &&
            running_.size() < cfg_.max_running) {
-        Request& r = *requests_[waiting_.front()];
+        Request& r = *requests_.at(waiting_.front());
         // Readmitted victims recompute prompt + prior output, so
         // admission must cover their full committed length.
         const std::uint32_t want = blocks_for(
@@ -127,7 +128,7 @@ bool Engine::step() {
     // capped by the shared budget, decode always costs 1 token.
     std::uint32_t budget = cfg_.prefill_budget;
     for (std::size_t i = 0; i < running_.size();) {
-        Request& r = *requests_[running_[i]];
+        Request& r = *requests_.at(running_[i]);
         advance(r, budget);
         if (r.status != Status::kRunning) {
             running_.erase(running_.begin() +
@@ -227,7 +228,7 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
 }
 
 void Engine::preempt(std::uint64_t victim_id) {
-    Request& v = *requests_[victim_id];
+    Request& v = *requests_.at(victim_id);
     cache_.release(v.seq);
     v.n_fed = 0;  // full recompute when readmitted
     v.status = Status::kWaiting;
@@ -258,6 +259,29 @@ void Engine::finish(Request& r, Status s, std::string error) {
     // would keep it).
     std::vector<float>().swap(r.logits);
     std::vector<tok::TokenId>().swap(r.prompt);
+
+    // Record the terminal record for oldest-first cap eviction and
+    // enforce the backstop cap now, so an abandoned request (client
+    // never release()s it) cannot let terminal records accumulate
+    // without bound. Only terminals are ever evicted here.
+    terminal_fifo_.push_back(r.id);
+    while (terminal_fifo_.size() > cfg_.max_retained_terminal) {
+        const std::uint64_t old = terminal_fifo_.front();
+        terminal_fifo_.pop_front();
+        requests_.erase(old);  // no-op if already released
+    }
+}
+
+void Engine::release(std::uint64_t id) {
+    auto it = requests_.find(id);
+    if (it == requests_.end()) {
+        return;  // unknown or already released
+    }
+    const Status s = it->second->status;
+    if (s == Status::kDone || s == Status::kFailed) {
+        requests_.erase(it);  // terminal + consumed: drop the record
+    }
+    // A stale terminal_fifo_ entry for this id is skipped later.
 }
 
 void Engine::try_adopt(Request& r) {
@@ -392,7 +416,8 @@ void Engine::run_to_completion() {
 }
 
 const Request* Engine::get(std::uint64_t id) const {
-    return id < requests_.size() ? requests_[id].get() : nullptr;
+    const auto it = requests_.find(id);
+    return it == requests_.end() ? nullptr : it->second.get();
 }
 
 void Engine::sample_from(Request& r, std::span<float> logits) {
@@ -479,7 +504,7 @@ bool Engine::step_batched() {
     // Admission: same FCFS policy as step().
     while (!waiting_.empty() &&
            running_.size() < cfg_.max_running) {
-        Request& r = *requests_[waiting_.front()];
+        Request& r = *requests_.at(waiting_.front());
         const std::uint32_t want = blocks_for(
             static_cast<std::uint32_t>(r.prompt.size()) +
             static_cast<std::uint32_t>(r.generated.size()) +
@@ -501,7 +526,7 @@ bool Engine::step_batched() {
     // Phase 1: prefill each running request still on its prompt.
     std::uint32_t budget = cfg_.prefill_budget;
     for (std::size_t i = 0; i < running_.size();) {
-        Request& r = *requests_[running_[i]];
+        Request& r = *requests_.at(running_[i]);
         if (r.n_fed <
             static_cast<std::uint32_t>(r.prompt.size())) {
             if (!prefill_only(r, budget)) {
@@ -515,7 +540,7 @@ bool Engine::step_batched() {
 
     // Phase 2: sample from every request that has caught up.
     for (std::size_t i = 0; i < running_.size();) {
-        Request& r = *requests_[running_[i]];
+        Request& r = *requests_.at(running_[i]);
         const std::uint32_t n_total =
             static_cast<std::uint32_t>(r.prompt.size()) +
             static_cast<std::uint32_t>(r.generated.size());
@@ -538,7 +563,7 @@ bool Engine::step_batched() {
     std::vector<kv::PagedKvCache::Seq*> seqs;
     std::vector<std::uint64_t> ids;
     for (std::size_t i = 0; i < running_.size();) {
-        Request& r = *requests_[running_[i]];
+        Request& r = *requests_.at(running_[i]);
         const std::uint32_t n_prompt =
             static_cast<std::uint32_t>(r.prompt.size());
         const std::uint32_t n_total =
@@ -592,7 +617,7 @@ bool Engine::step_batched() {
             std::span<kv::PagedKvCache::Seq* const>(seqs), ws_,
             std::span<float>(batched_logits_.data(), need));
         for (std::size_t j = 0; j < ids.size(); ++j) {
-            Request& r = *requests_[ids[j]];
+            Request& r = *requests_.at(ids[j]);
             if (r.logits.size() != V) {
                 r.logits.assign(V, 0.0f);
             }

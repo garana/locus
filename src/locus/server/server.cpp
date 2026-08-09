@@ -545,6 +545,9 @@ void OpenAiServer::install_routes() {
 
         if (!stream) {
             auto v = loop_.wait_done(id);
+            // v is a full snapshot copy; drop the engine record now
+            // (evict-on-consume) -- nothing below touches the id.
+            loop_.release(id);
             if (v.status == engine::Status::kFailed) {
                 res.status = 500;
                 res.set_content(make_error(v.error).dump(),
@@ -727,6 +730,9 @@ void OpenAiServer::install_routes() {
                         payload += "data: " + chunk.dump() + "\n\n";
                     }
                     payload += "data: [DONE]\n\n";
+                    // Stream fully built from the snapshot v; drop the
+                    // engine record (the provider won't run again).
+                    loop_.release(id);
                 }
                 if (!payload.empty() &&
                     !sink.write(payload.data(),
@@ -817,6 +823,7 @@ void OpenAiServer::install_routes() {
 
         if (!stream) {
             auto v = loop_.wait_done(id);
+            loop_.release(id);  // consumed: drop the engine record
             if (v.status == engine::Status::kFailed) {
                 res.status = 500;
                 res.set_content(
@@ -1023,6 +1030,8 @@ void OpenAiServer::install_routes() {
                                "\n\n";
                     completion_tokens_total_.fetch_add(
                         st->emitted, std::memory_order_relaxed);
+                    // Stream fully built from v; drop the record.
+                    loop_.release(id);
                 }
                 if (!payload.empty() &&
                     !sink.write(payload.data(), payload.size())) {

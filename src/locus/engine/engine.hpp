@@ -6,6 +6,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "locus/engine/prefix_cache.hpp"
@@ -119,6 +120,19 @@ class Engine {
         std::uint32_t spec_ngram = 3;
         /** Max draft tokens proposed per step. */
         std::uint32_t spec_draft = 4;
+        /** Backstop cap on retained TERMINAL request records. The
+         * server release()s each record once the client consumes its
+         * result; this bounds the leak from ABANDONED requests (an
+         * SSE client that disconnects mid-stream never triggers that
+         * release), evicting the oldest terminal record past the cap.
+         * Records are small post-R2 (heavy buffers already freed).
+         * Trade-off: this also bounds how long an UNCONSUMED result is
+         * kept -- if more than this many requests finish before a slow
+         * client reads its own, that result is evicted and get()/
+         * wait_done report "unknown request id" (graceful, not a
+         * crash). Raise it to retain unconsumed results longer at the
+         * cost of memory. */
+        std::uint32_t max_retained_terminal = 1024;
     };
 
     /**
@@ -157,6 +171,14 @@ class Engine {
 
     /** @returns The request for id, or nullptr. */
     const Request* get(std::uint64_t id) const;
+
+    /**
+     * Drops a TERMINAL request record once the client has consumed
+     * its result (evict-on-consume). No-op if the id is unknown or
+     * still waiting/running. After release, get(id) returns nullptr.
+     * @param id Request id from submit().
+     */
+    void release(std::uint64_t id);
 
     /** @returns true when nothing is waiting or running. */
     bool idle() const {
@@ -245,7 +267,17 @@ class Engine {
     /** n * n_vocab scratch for the batched-decode step. */
     std::vector<float> batched_logits_;
 
-    std::vector<std::unique_ptr<Request>> requests_;
+    /** All live requests keyed by id. Terminal records linger until
+     * the client consumes them (release) or the cap evicts them; a
+     * monotonic next_id_ means ids are never reused, so a stale id
+     * can never alias a different request. */
+    std::unordered_map<std::uint64_t, std::unique_ptr<Request>>
+        requests_;
+    std::uint64_t next_id_ = 0;
+    /** Terminal ids in the order they finished, for oldest-first cap
+     * eviction. May hold already-released (erased) ids; enforcement
+     * skips them lazily. */
+    std::deque<std::uint64_t> terminal_fifo_;
     std::deque<std::uint64_t> waiting_;
     std::vector<std::uint64_t> running_;
 

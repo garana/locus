@@ -63,6 +63,11 @@ class EngineLoop {
     /** Blocks until the request is kDone or kFailed. */
     View wait_done(std::uint64_t id);
 
+    /** Drops a finished request's record once its result has been
+     * delivered to the client (evict-on-consume); no-op if it is not
+     * terminal. Call once, after the last view/wait_done for the id. */
+    void release(std::uint64_t id);
+
     /** Engine gauges for /metrics (snapshotted under the mutex). */
     struct Stats {
         std::uint32_t free_blocks = 0;
