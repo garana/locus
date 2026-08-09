@@ -446,8 +446,16 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
            std::max<std::size_t>(hp.n_embd, ff_max));
     s.grow(s.q, s.q_n,
            mla ? std::size_t{hp.n_heads} * qk : hp.n_embd);
-    s.grow(s.gate, s.gate_n, ff_max);
-    s.grow(s.up, s.up_n, ff_max);
+    // The non-MLA quantized-KV path reuses gate/up as F32 scratch
+    // for this token's K and V rows (kv_dim elements each), so they
+    // must be at least kv_dim wide, not just ff_max. Every real
+    // transformer has n_ff >= n_embd >= kv_dim so this is normally
+    // just ff_max, but a model with an inverted ratio would
+    // otherwise overrun the FFN scratch with a K/V write -- size
+    // defensively.
+    const std::size_t ff_kv = std::max<std::size_t>(ff_max, kv_dim);
+    s.grow(s.gate, s.gate_n, ff_kv);
+    s.grow(s.up, s.up_n, ff_kv);
     s.grow(s.attout, s.attout_n,
            mla ? std::size_t{hp.n_heads} * vd : hp.n_embd);
     s.grow(s.att, s.att_n,
