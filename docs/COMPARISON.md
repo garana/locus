@@ -1,6 +1,6 @@
 # locus vs other inference engines
 
-Positioning snapshot (2026-08-02). locus's niche is narrow and
+Positioning snapshot (2026-08-09). locus's niche is narrow and
 deliberate: **stream weights when the model does not fit in RAM/VRAM,
 and batch inputs**, so weight reads are amortized across concurrent
 requests and the page cache carries the hot working set. The engines
@@ -10,19 +10,21 @@ feature audit; verify specifics against upstream before quoting.
 
 ## Capability matrix
 
-| Engine    | Bigger-than-RAM/VRAM streaming            | Continuous batching (paged KV) | Vendor-neutral GPU        | Serving API             | Stack / deps             |
-|-----------|-------------------------------------------|--------------------------------|---------------------------|-------------------------|--------------------------|
-| locus     | yes: mmap + page-cache working set,       | yes                            | yes: Vulkan + CUDA + CPU  | OpenAI + Anthropic      | C++20, minimal vendored  |
-|           | routed-expert streaming                   |                                |                           |                         |                          |
-| llama.cpp | partial: mmap weights, -ngl offload split | limited: server parallel slots | yes: Metal/Vulkan/CUDA/   | OpenAI-ish (llama-      | C/C++, minimal           |
-|           | (no bigger-than-VRAM GPU streaming)       |                                | ROCm/SYCL                 | server)                 |                          |
-| Ollama    | via llama.cpp                             | via llama.cpp (limited)        | via llama.cpp             | own + OpenAI-compat     | Go + llama.cpp           |
-| vLLM      | no (model resident; some CPU swap)        | yes (originated PagedAttention)| mostly NVIDIA (+ROCm)     | OpenAI                  | heavy Python/CUDA        |
-| LightLLM  | no                                        | yes                            | mostly NVIDIA             | OpenAI                  | Python                   |
-| SGLang    | no                                        | yes (+ radix/prefix cache)     | mostly NVIDIA             | OpenAI                  | Python                   |
-| TGI       | no                                        | yes                            | NVIDIA (+ some AMD)       | own + OpenAI-compat     | Rust + Python            |
-| AirLLM    | yes (extreme): one layer/expert on GPU    | no                             | CUDA + Apple MLX + CPU    | none (library only)     | Python + PyTorch         |
-|           | at a time                                 |                                | (no AMD)                  |                         |                          |
+| Engine       | Bigger-than-RAM/VRAM streaming            | Continuous batching (paged KV) | Vendor-neutral GPU        | Serving API             | Stack / deps             |
+|--------------|-------------------------------------------|--------------------------------|---------------------------|-------------------------|--------------------------|
+| locus        | yes: mmap + page-cache working set,       | yes                            | yes: Vulkan + CUDA + CPU  | OpenAI + Anthropic      | C++20, minimal vendored  |
+|              | routed-expert streaming                   |                                |                           |                         |                          |
+| llama.cpp    | partial: mmap weights, -ngl offload split | limited: server parallel slots | yes: Metal/Vulkan/CUDA/   | OpenAI-ish (llama-      | C/C++, minimal           |
+|              | (no bigger-than-VRAM GPU streaming)       |                                | ROCm/SYCL                 | server)                 |                          |
+| Ollama       | via llama.cpp                             | via llama.cpp (limited)        | via llama.cpp             | own + OpenAI-compat     | Go + llama.cpp           |
+| vLLM         | no (model resident; some CPU swap)        | yes (originated PagedAttention)| mostly NVIDIA (+ROCm)     | OpenAI                  | heavy Python/CUDA        |
+| LightLLM     | no                                        | yes                            | mostly NVIDIA             | OpenAI                  | Python                   |
+| SGLang       | no                                        | yes (+ radix/prefix cache)     | mostly NVIDIA             | OpenAI                  | Python                   |
+| TGI          | no                                        | yes                            | NVIDIA (+ some AMD)       | own + OpenAI-compat     | Rust + Python            |
+| AirLLM       | yes (extreme): one layer/expert on GPU    | no                             | CUDA + Apple MLX + CPU    | none (library only)     | Python + PyTorch         |
+|              | at a time                                 |                                | (no AMD)                  |                         |                          |
+| kimi-k3-in-c | yes (extreme): routed 4-bit experts       | no (single sequence)           | no: CPU-only (AVX2+FMA)   | none (CLI + C library)  | C99 + OpenMP, no BLAS    |
+|              | streamed from disk per token (LRU)        |                                |                           |                         |                          |
 
 Two families: the Python GPU-serving stacks (vLLM/LightLLM/SGLang/
 TGI) assume the model fits in VRAM and optimize throughput on top of
@@ -98,3 +100,31 @@ model would make the streaming-niche claim concrete.
 Sources: AirLLM GitHub (github.com/lyogavin/airllm);
 "AirLLM: Layered Inference for Low-Memory Hardware" (B. Marie);
 "AirLLM and '70B on a 4GB GPU'" (R. Shirke).
+
+## kimi-k3-in-c -- the streaming thesis in portable C
+
+kimi-k3-in-c (FareedKhan-dev) is the other project built on locus's
+core idea, and it pushes it to an extreme: it runs the 2.78-trillion-
+parameter Kimi K3 on a single CPU in ~8.24 GB of RAM. Like AirLLM it
+keeps almost nothing resident. The 93-layer dense trunk (bf16) can
+stream from a packed file with a tunable pinned depth, and the ~82k
+routed experts (1.45 TB, packed ~4-bit) never load: each token
+activates 16 of 896 experts per layer and the rest "sit asleep on
+disk," multiplied straight out of their 4-bit form on demand, with an
+LRU cache for within-run reuse. It is portable C99 -- no BLAS, no
+framework, no GPU (AVX2 + FMA, OpenMP) -- Apache-2.0.
+
+On stack it is the closest neighbor of all: minimal C with mmap
+streaming, same as locus. It diverges on the same axis as AirLLM --
+amortization. It runs one sequence at a time (an optional
+`--incremental` KV flag; without it each step recomputes the prefix),
+has no continuous batching and no server (a CLI plus a C library,
+results written to a JSON file), and moves on the order of 100+ GB per
+token at small memory budgets, so it is I/O-bound by construction: a
+"make it run at all" tool. It is also model-specific (Kimi K3 only),
+where locus loads arbitrary GGUF models. locus takes the same
+stream-bigger-than-memory reach and divides the streaming cost across
+a batch of concurrent requests behind an OpenAI/Anthropic server --
+trading kimi-k3-in-c's single-CPU simplicity for throughput.
+
+Sources: kimi-k3-in-c GitHub (github.com/FareedKhan-dev/kimi-k3-in-c).
