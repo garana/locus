@@ -80,6 +80,12 @@ class OpenAiServer {
         std::vector<std::string> auth_helper_argv;
         std::size_t auth_helpers = 1;
         auth::AuthConfig auth_cache;
+        /** Prompt caching (KV prefix reuse) -- on by default. A
+         * request sharing a block-aligned prompt prefix with a recent
+         * finished request adopts its pinned KV and skips reprefill;
+         * byte-exact, reported via the API usage cache fields. Enables
+         * engine.prefix_cache. */
+        bool prompt_cache = true;
     };
 
     OpenAiServer(const model::LlamaModel& m,
@@ -104,6 +110,9 @@ class OpenAiServer {
     void stop();
 
   private:
+    /** Engine config with prompt caching resolved from Options:
+     * prefix_cache = engine.prefix_cache || prompt_cache. */
+    static engine::Engine::Config resolve_engine_cfg(const Options& o);
     void install_routes();
     /** Lazily builds (once) and returns the token -> decoded-bytes
      * table used by constrained decoding. */

@@ -63,6 +63,13 @@ struct Request {
     kv::PagedKvCache::Seq seq;
     /** Prompt + generated tokens fed through the model so far. */
     std::uint32_t n_fed = 0;
+    /** Prompt-cache accounting (prefix_cache on). reused = prompt
+     * tokens served from a cached KV prefix (skipped prefill), set at
+     * adopt time; cached = prompt tokens NEWLY written to the cache at
+     * finish (beyond what was reused). Surfaced as the API usage
+     * cache_read / cache_creation fields. */
+    std::uint32_t reused_prefix_tokens = 0;
+    std::uint32_t cached_prefix_tokens = 0;
     /** Logits of the last token fed (batched-decode path only,
      * where several sequences' forwards interleave in one step). */
     std::vector<float> logits;
@@ -244,6 +251,13 @@ class Engine {
     /** Samples the next token for r from r.logits, appends it, and
      * finishes r on EOS / max. @returns the sampled token. */
     void sample_from(Request& r, std::span<float> logits);
+    /** Tries to admit the FCFS-front waiting request. Adopts its
+     * cached prefix first so the pinned prefix cannot be evicted to
+     * make room for its own (now smaller) tail; evicts other cache
+     * entries only if the tail still does not fit. @returns true if
+     * admitted (moved to running_), false if it cannot fit now (the
+     * caller must stop admitting to keep FCFS order). */
+    bool try_admit_front();
     /** Releases r's blocks and moves it back to the wait queue. */
     void preempt(std::uint64_t victim_id);
     void finish(Request& r, Status s, std::string error = "");

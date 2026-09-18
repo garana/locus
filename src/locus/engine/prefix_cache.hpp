@@ -33,9 +33,11 @@ class PrefixCache {
 
     /** Registers `prompt`'s full block-aligned prefix, mapping it to
      * the leading blocks of `seq_blocks` and pinning them. No-op if
-     * the prefix is already cached (just refreshes LRU). */
-    void insert(std::span<const tok::TokenId> prompt,
-                const std::vector<kv::BlockId>& seq_blocks);
+     * the prefix is already cached (just refreshes LRU).
+     * @returns prompt tokens newly written to the cache (0 if the
+     *     prefix was already cached, or nothing was cacheable). */
+    std::uint32_t insert(std::span<const tok::TokenId> prompt,
+                         const std::vector<kv::BlockId>& seq_blocks);
 
     /** Evicts LRU entries until the pool has `need` free blocks or
      * the cache is empty. @returns blocks freed. */

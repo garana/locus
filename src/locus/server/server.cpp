@@ -186,13 +186,20 @@ class JsonTokenConstraint : public model::TokenConstraint {
 
 }  // namespace
 
+engine::Engine::Config OpenAiServer::resolve_engine_cfg(
+    const Options& o) {
+    engine::Engine::Config cfg = o.engine;
+    cfg.prefix_cache = cfg.prefix_cache || o.prompt_cache;
+    return cfg;
+}
+
 OpenAiServer::OpenAiServer(const model::LlamaModel& m,
                            const tok::Tokenizer& tok,
                            Options opt)
     : model_(m),
       tok_(tok),
       opt_(std::move(opt)),
-      loop_(m, tok.eos_id(), opt_.engine),
+      loop_(m, tok.eos_id(), resolve_engine_cfg(opt_)),
       http_(std::make_unique<httplib::Server>()),
       n_vocab_(m.hparams().n_vocab) {
     if (!opt_.auth_helper_argv.empty()) {
@@ -213,6 +220,16 @@ OpenAiServer::OpenAiServer(const model::LlamaModel& m,
     // handler (and thus before authorize()) runs; without this the
     // default is SIZE_MAX -- an unauthenticated OOM.
     http_->set_payload_max_length(opt_.max_body_bytes);
+    // Make stop() reliable. httplib's non-Windows default idle
+    // interval is 0, so the accept loop blocks directly in accept();
+    // on macOS/BSD closing the listen socket from stop() does not wake
+    // a thread already parked in accept(), so a graceful stop() (and a
+    // test's server teardown) can hang until an unrelated connection
+    // arrives. A small idle interval makes the loop poll the socket
+    // with select_read instead, so it notices the closed socket and
+    // exits within one interval. select_read still returns immediately
+    // when a connection is pending, so accept latency is unchanged.
+    http_->set_idle_interval(0, 10000);  // 10 ms
     install_routes();
 }
 
@@ -636,7 +653,12 @@ void OpenAiServer::install_routes() {
                      {"usage",
                       {{"prompt_tokens", n_prompt},
                        {"completion_tokens", n_completion},
-                       {"total_tokens", n_prompt + n_completion}}}};
+                       {"total_tokens", n_prompt + n_completion},
+                       // OpenAI shape: cached_tokens is a SUBSET of
+                       // prompt_tokens (prompt-cache KV reuse).
+                       {"prompt_tokens_details",
+                        {{"cached_tokens",
+                          v.reused_prefix_tokens}}}}}};
             res.set_content(out.dump(), "application/json");
             return;
         }
@@ -862,10 +884,17 @@ void OpenAiServer::install_routes() {
                 {"stop_reason", stop_reason},
                 {"stop_sequence", nullptr},
                 {"usage",
-                 {{"input_tokens", input_tokens},
+                 // Anthropic shape: input_tokens is the UNCACHED
+                 // remainder; cache_read + cache_creation are separate
+                 // and the three sum to the full prompt length.
+                 {{"input_tokens", input_tokens -
+                                       v.reused_prefix_tokens -
+                                       v.cached_prefix_tokens},
                   {"output_tokens",
-                   static_cast<std::uint32_t>(
-                       v.generated.size())}}}};
+                   static_cast<std::uint32_t>(v.generated.size())},
+                  {"cache_read_input_tokens", v.reused_prefix_tokens},
+                  {"cache_creation_input_tokens",
+                   v.cached_prefix_tokens}}}};
             completion_tokens_total_.fetch_add(
                 v.generated.size(), std::memory_order_relaxed);
             res.set_content(out.dump(), "application/json");
@@ -1018,10 +1047,17 @@ void OpenAiServer::install_routes() {
                              {"delta",
                               {{"stop_reason", stop_reason},
                                {"stop_sequence", nullptr}}},
+                             // Prompt-cache fields land here at
+                             // stream end (cache_creation is only
+                             // known once the request finishes).
                              {"usage",
                               {{"output_tokens",
                                 static_cast<std::uint32_t>(
-                                    st->emitted)}}}}
+                                    st->emitted)},
+                               {"cache_read_input_tokens",
+                                v.reused_prefix_tokens},
+                               {"cache_creation_input_tokens",
+                                v.cached_prefix_tokens}}}}
                             .dump() +
                         "\n\n";
                     payload += "event: message_stop\ndata: " +

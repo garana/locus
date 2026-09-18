@@ -103,25 +103,9 @@ bool Engine::step() {
     // Admission: FCFS while the pool can cover prompt + headroom.
     while (!waiting_.empty() &&
            running_.size() < cfg_.max_running) {
-        Request& r = *requests_.at(waiting_.front());
-        // Readmitted victims recompute prompt + prior output, so
-        // admission must cover their full committed length.
-        const std::uint32_t want = blocks_for(
-            static_cast<std::uint32_t>(r.prompt.size()) +
-            static_cast<std::uint32_t>(r.generated.size()) +
-            cfg_.decode_headroom);
-        if (want > cache_.free_blocks()) {
-            if (prefix_cache_) {
-                prefix_cache_->evict_until_free(want);
-            }
-            if (want > cache_.free_blocks()) {
-                break;  // FCFS: do not admit later arrivals first
-            }
+        if (!try_admit_front()) {
+            break;  // FCFS: do not admit later arrivals first
         }
-        r.status = Status::kRunning;
-        running_.push_back(r.id);
-        waiting_.pop_front();
-        try_adopt(r);
     }
 
     // One iteration: each running sequence advances; prefill is
@@ -227,10 +211,57 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
     }
 }
 
+bool Engine::try_admit_front() {
+    Request& r = *requests_.at(waiting_.front());
+    // Adopt any cached prefix BEFORE sizing the pool demand. Adoption
+    // shares the cache entry's already-allocated blocks (retain_prefix
+    // just bumps their refcount), so it consumes no free blocks, but
+    // it pins the prefix into r.seq -- the eviction below then cannot
+    // reclaim the very prefix we are about to reuse, and the block
+    // demand `want` drops to the un-adopted tail. Without this order
+    // (adopt after admission), a prompt whose pinned prefix leaves too
+    // few free blocks for its own FULL length would evict that prefix
+    // to admit itself, then find nothing to adopt -- a self-inflicted
+    // cache miss. Readmitted victims (n_fed reset but output present)
+    // do not adopt; they recompute in full.
+    try_adopt(r);
+    const std::uint32_t held =
+        static_cast<std::uint32_t>(r.seq.blocks.size());
+    // Readmitted victims recompute prompt + prior output, so admission
+    // must cover their full committed length.
+    const std::uint32_t need = blocks_for(
+        static_cast<std::uint32_t>(r.prompt.size()) +
+        static_cast<std::uint32_t>(r.generated.size()) +
+        cfg_.decode_headroom);
+    const std::uint32_t want = need > held ? need - held : 0;
+    if (want > cache_.free_blocks()) {
+        if (prefix_cache_) {
+            prefix_cache_->evict_until_free(want);
+        }
+        if (want > cache_.free_blocks()) {
+            return false;
+        }
+    }
+    r.status = Status::kRunning;
+    running_.push_back(r.id);
+    waiting_.pop_front();
+    return true;
+}
+
 void Engine::preempt(std::uint64_t victim_id) {
     Request& v = *requests_.at(victim_id);
     cache_.release(v.seq);
     v.n_fed = 0;  // full recompute when readmitted
+    // Discard the adopted-prefix accounting. Readmission recomputes
+    // from scratch -- try_adopt no-ops once any output exists, and even
+    // a still-in-prefill victim re-adopts fresh -- so this request no
+    // longer holds the prefix it was credited for. Roll the credit out
+    // of the global reuse metric and clear the per-request cache_read
+    // count; a later re-adopt re-adds it. Without this, a preempted
+    // request over-reports cache_read_input_tokens (it reused nothing)
+    // and the /metrics reuse counter double-counts on re-adopt.
+    prefix_reused_tokens_ -= v.reused_prefix_tokens;
+    v.reused_prefix_tokens = 0;
     v.status = Status::kWaiting;
     running_.erase(
         std::find(running_.begin(), running_.end(), victim_id));
@@ -242,7 +273,14 @@ void Engine::finish(Request& r, Status s, std::string error) {
     // Register the prompt's full-block prefix before releasing, so a
     // later request sharing it can adopt the (still-pinned) KV.
     if (prefix_cache_ && s == Status::kDone && !r.prompt.empty()) {
-        prefix_cache_->insert(r.prompt, r.seq.blocks);
+        const std::uint32_t written =
+            prefix_cache_->insert(r.prompt, r.seq.blocks);
+        // Report only tokens cached BEYOND the reused prefix (the
+        // reused portion was already resident) -- the cache_creation
+        // count in the API usage block.
+        r.cached_prefix_tokens = written > r.reused_prefix_tokens
+                                     ? written - r.reused_prefix_tokens
+                                     : 0;
     }
     cache_.release(r.seq);
     r.status = s;
@@ -307,6 +345,7 @@ void Engine::try_adopt(Request& r) {
     }
     cache_.retain_prefix(r.seq, blocks);
     r.n_fed = static_cast<std::uint32_t>(blocks.size()) * bt;
+    r.reused_prefix_tokens = r.n_fed;  // served from cache (cache_read)
     prefix_reused_tokens_ += r.n_fed;
 }
 
@@ -504,23 +543,9 @@ bool Engine::step_batched() {
     // Admission: same FCFS policy as step().
     while (!waiting_.empty() &&
            running_.size() < cfg_.max_running) {
-        Request& r = *requests_.at(waiting_.front());
-        const std::uint32_t want = blocks_for(
-            static_cast<std::uint32_t>(r.prompt.size()) +
-            static_cast<std::uint32_t>(r.generated.size()) +
-            cfg_.decode_headroom);
-        if (want > cache_.free_blocks()) {
-            if (prefix_cache_) {
-                prefix_cache_->evict_until_free(want);
-            }
-            if (want > cache_.free_blocks()) {
-                break;
-            }
+        if (!try_admit_front()) {
+            break;
         }
-        r.status = Status::kRunning;
-        running_.push_back(r.id);
-        waiting_.pop_front();
-        try_adopt(r);
     }
 
     // Phase 1: prefill each running request still on its prompt.

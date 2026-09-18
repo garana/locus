@@ -431,3 +431,85 @@ TEST_CASE("finished request records are evicted (cap + release)",
     // release() on an unknown id is a harmless no-op.
     engine.release(999999);
 }
+
+// Prompt caching (KV prefix reuse): the per-request accounting the API
+// usage block reports. First request writes the block-aligned prefix
+// to the cache (cached > 0, reused == 0); an identical second request
+// adopts it (reused > 0, cached == 0).
+TEST_CASE("prefix cache reports reused/cached token accounting",
+          "[engine]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    Engine::Config cfg;
+    cfg.prefix_cache = true;
+    Engine engine(model, tok.eos_id(), cfg);
+
+    // 64 tokens spans several KV blocks whatever the block size, so a
+    // cacheable block-aligned prefix exists. Token id 5 avoids BOS/EOS.
+    const std::vector<locus::tok::TokenId> prompt(64, 5);
+
+    const auto id1 = engine.submit(prompt, 2);
+    engine.run_to_completion();
+    const auto* r1 = engine.get(id1);
+    REQUIRE(r1 != nullptr);
+    REQUIRE(r1->status == Status::kDone);
+    REQUIRE(r1->reused_prefix_tokens == 0);  // nothing cached yet
+    REQUIRE(r1->cached_prefix_tokens > 0);   // wrote the prefix
+
+    const auto id2 = engine.submit(prompt, 2);
+    engine.run_to_completion();
+    const auto* r2 = engine.get(id2);
+    REQUIRE(r2 != nullptr);
+    REQUIRE(r2->status == Status::kDone);
+    REQUIRE(r2->reused_prefix_tokens > 0);   // adopted the cached prefix
+    REQUIRE(r2->cached_prefix_tokens == 0);  // already fully cached
+    // Reused can't exceed the prompt, and leaves >=1 token to reprefill.
+    REQUIRE(r2->reused_prefix_tokens < prompt.size());
+}
+
+TEST_CASE("prefix cache adopts a long prompt without self-eviction",
+          "[engine]") {
+    // Regression: admission must adopt the cached prefix BEFORE it
+    // sizes (and evicts for) the incoming prompt. A prompt long enough
+    // that its pinned prefix leaves too few free blocks for its own
+    // FULL length used to evict that prefix to admit itself, then find
+    // nothing to adopt -- so the second identical request re-prefilled
+    // from scratch instead of reusing.
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    std::string s;
+    for (int i = 0; i < 40; ++i) {
+        s += "the quick brown fox jumps over the lazy dog. ";
+    }
+    const auto prompt = tok.encode(s, true);
+
+    Engine::Config cfg;
+    cfg.prefix_cache = true;
+    Engine engine(model, tok.eos_id(), cfg);
+    CAPTURE(prompt.size(), engine.total_blocks());
+
+    const auto id1 = engine.submit(prompt, 2);
+    engine.run_to_completion();
+    CAPTURE(static_cast<int>(engine.get(id1)->status),
+            engine.free_blocks());
+    REQUIRE(engine.get(id1)->status == Status::kDone);
+
+    const auto id2 = engine.submit(prompt, 2);
+    engine.run_to_completion();
+    CAPTURE(static_cast<int>(engine.get(id2)->status),
+            engine.get(id2)->reused_prefix_tokens,
+            engine.free_blocks());
+    REQUIRE(engine.get(id2)->status == Status::kDone);
+    // The second identical request must ADOPT the cached prefix, not
+    // evict it to admit itself. Pre-fix this was 0.
+    REQUIRE(engine.get(id2)->reused_prefix_tokens > 0);
+}
