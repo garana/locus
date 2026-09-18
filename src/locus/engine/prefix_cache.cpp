@@ -26,12 +26,12 @@ std::vector<kv::BlockId> PrefixCache::match(
     return best;
 }
 
-void PrefixCache::insert(
+std::uint32_t PrefixCache::insert(
     std::span<const tok::TokenId> prompt,
     const std::vector<kv::BlockId>& seq_blocks) {
     const std::size_t full = prompt.size() / block_tokens_;
     if (full == 0 || full > seq_blocks.size()) {
-        return;
+        return 0;
     }
     const std::size_t klen = full * block_tokens_;
     for (auto it = entries_.begin(); it != entries_.end(); ++it) {
@@ -39,7 +39,7 @@ void PrefixCache::insert(
             std::equal(it->key.begin(), it->key.end(),
                        prompt.begin())) {
             entries_.splice(entries_.begin(), entries_, it);
-            return;  // already cached; refresh LRU only
+            return 0;  // already cached; refresh LRU only
         }
     }
     Entry e;
@@ -52,6 +52,7 @@ void PrefixCache::insert(
     while (entries_.size() > slots_) {
         evict_lru();
     }
+    return static_cast<std::uint32_t>(klen);
 }
 
 void PrefixCache::evict_lru() {

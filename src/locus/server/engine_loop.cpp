@@ -86,6 +86,8 @@ EngineLoop::View EngineLoop::snapshot_locked(
         v.generated = r->generated;
         v.error = r->error;
         v.logprobs = r->logprobs;
+        v.reused_prefix_tokens = r->reused_prefix_tokens;
+        v.cached_prefix_tokens = r->cached_prefix_tokens;
     } else {
         v.status = engine::Status::kFailed;
         v.error = "unknown request id";

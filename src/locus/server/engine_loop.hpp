@@ -27,6 +27,10 @@ class EngineLoop {
         std::string error;
         /** Per-token logprobs (empty unless requested at submit). */
         std::vector<engine::LogprobEntry> logprobs;
+        /** Prompt tokens served from a cached KV prefix (cache_read)
+         * and newly written to the cache (cache_creation). */
+        std::uint32_t reused_prefix_tokens = 0;
+        std::uint32_t cached_prefix_tokens = 0;
     };
 
     EngineLoop(const model::LlamaModel& m, tok::TokenId eos,

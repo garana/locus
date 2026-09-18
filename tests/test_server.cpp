@@ -46,6 +46,31 @@ struct TestServer {
 
 }  // namespace
 
+TEST_CASE("server stop() unblocks the listener after requests",
+          "[server][e2e]") {
+    // Regression: httplib's non-Windows default idle interval is 0, so
+    // the accept loop blocks directly in accept(); on macOS/BSD stop()
+    // closing the listen socket does not wake a thread already parked
+    // in accept(), so ~TestServer (server.stop()+thread.join()) hangs.
+    // A small server idle interval makes the loop poll with
+    // select_read so stop() is prompt. This test would hang (not fail)
+    // on regression, which the CI wall-clock timeout catches.
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    TestServer ts(model, tok);
+    httplib::Client client("127.0.0.1", ts.port);
+    const json req{{"prompt", "hello world"}, {"max_tokens", 2}};
+    auto a = client.Post("/v1/completions", req.dump(),
+                         "application/json");
+    REQUIRE(a);
+    REQUIRE(a->status == 200);
+    // ~TestServer runs here; it must not hang.
+}
+
 TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
         SKIP("model not present; run scripts/fetch-test-model.sh");
@@ -614,5 +639,78 @@ TEST_CASE("request-edge size limits reject before work",
                               "application/json");
         REQUIRE(r2);
         REQUIRE(r2->status == 400);
+    }
+}
+
+TEST_CASE("prompt caching reports cache-hit usage fields",
+          "[server][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    // Default Options: prompt caching is on.
+    TestServer ts(model, tok);
+    httplib::Client client("127.0.0.1", ts.port);
+
+    // Long enough to span several KV blocks so a cacheable
+    // block-aligned prefix exists (and survives whatever the block
+    // size is).
+    std::string prompt;
+    for (int i = 0; i < 40; ++i) {
+        prompt += "the quick brown fox jumps over the lazy dog. ";
+    }
+
+    SECTION("OpenAI: cached_tokens is a subset of prompt_tokens") {
+        const json req{{"prompt", prompt}, {"max_tokens", 2}};
+        auto a = client.Post("/v1/completions", req.dump(),
+                             "application/json");
+        REQUIRE(a);
+        REQUIRE(a->status == 200);
+        auto ua = json::parse(a->body)["usage"];
+        // First request: nothing cached yet.
+        REQUIRE(ua["prompt_tokens_details"]["cached_tokens"] == 0);
+
+        auto b = client.Post("/v1/completions", req.dump(),
+                             "application/json");
+        REQUIRE(b);
+        REQUIRE(b->status == 200);
+        auto ub = json::parse(b->body)["usage"];
+        const int cached =
+            ub["prompt_tokens_details"]["cached_tokens"].get<int>();
+        REQUIRE(cached > 0);  // second request hit the cache
+        // cached_tokens is a subset of the (unchanged) prompt_tokens.
+        REQUIRE(cached < ub["prompt_tokens"].get<int>());
+        REQUIRE(ub["prompt_tokens"] == ua["prompt_tokens"]);
+    }
+
+    SECTION("Anthropic: input_tokens splits into cache fields") {
+        const json req{
+            {"messages",
+             json::array({{{"role", "user"}, {"content", prompt}}})},
+            {"max_tokens", 2}};
+        auto a = client.Post("/v1/messages", req.dump(),
+                             "application/json");
+        REQUIRE(a);
+        REQUIRE(a->status == 200);
+        auto ua = json::parse(a->body)["usage"];
+        REQUIRE(ua["cache_read_input_tokens"] == 0);
+        const int full = ua["input_tokens"].get<int>() +
+                         ua["cache_creation_input_tokens"].get<int>();
+
+        auto b = client.Post("/v1/messages", req.dump(),
+                             "application/json");
+        REQUIRE(b);
+        REQUIRE(b->status == 200);
+        auto ub = json::parse(b->body)["usage"];
+        const int read = ub["cache_read_input_tokens"].get<int>();
+        REQUIRE(read > 0);  // second request read from the cache
+        // input + cache_read + cache_creation == the full prompt, and
+        // input_tokens is now the uncached remainder (smaller).
+        const int sum = ub["input_tokens"].get<int>() + read +
+                        ub["cache_creation_input_tokens"].get<int>();
+        REQUIRE(sum == full);
+        REQUIRE(ub["input_tokens"].get<int>() < full);
     }
 }
