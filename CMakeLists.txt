@@ -39,6 +39,7 @@ add_library(locus
     src/locus/model/sampling.cpp
     src/locus/model/speculative.cpp
     src/locus/pipeline/message.cpp
+    src/locus/pipeline/net.cpp
     src/locus/pipeline/stage.cpp
     src/locus/server/engine_loop.cpp
     src/locus/server/server.cpp

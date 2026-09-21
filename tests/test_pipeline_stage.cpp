@@ -14,6 +14,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/llama.hpp"
 #include "locus/pipeline/message.hpp"
+#include "locus/pipeline/net.hpp"
 #include "locus/pipeline/stage.hpp"
 #include "locus/tok/tokenizer.hpp"
 
@@ -80,35 +81,24 @@ TEST_CASE("pipeline stages reproduce single-process generation",
     // Runs generation across the stages defined by `bounds` (0..L),
     // each stage on its own thread, connected by socketpairs. Returns
     // the generated tokens (empty on a flow error).
-    auto pipeline = [&](const std::vector<std::uint32_t>& bounds) {
+    // connect_pair(writer, reader) wires one stream; swappable so the
+    // same chain runs over socketpairs or loopback TCP.
+    auto pipeline = [&](const std::vector<std::uint32_t>& bounds,
+                        auto&& connect_pair) {
         const std::size_t N = bounds.size() - 1;
         std::vector<std::unique_ptr<PipelineStage>> stages;
         for (std::size_t i = 0; i < N; ++i) {
             stages.push_back(std::make_unique<PipelineStage>(
                 model, bounds[i], bounds[i + 1]));
         }
-        // Per-stage in/out fds; socketpair convention: [1] writer,
-        // [0] reader.
+        // Links: entry -> s0 -> ... -> s(N-1) -> entry.
         std::vector<int> in_fd(N), out_fd(N);
         int entry_w = -1, entry_r = -1;
-        {
-            int p[2];
-            REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, p) == 0);
-            entry_w = p[1];
-            in_fd[0] = p[0];
-        }
+        connect_pair(entry_w, in_fd[0]);
         for (std::size_t i = 0; i + 1 < N; ++i) {
-            int p[2];
-            REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, p) == 0);
-            out_fd[i] = p[1];
-            in_fd[i + 1] = p[0];
+            connect_pair(out_fd[i], in_fd[i + 1]);
         }
-        {
-            int p[2];
-            REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, p) == 0);
-            out_fd[N - 1] = p[1];
-            entry_r = p[0];
-        }
+        connect_pair(out_fd[N - 1], entry_r);
 
         std::vector<int> results(N, 0);
         std::vector<std::thread> th;
@@ -171,16 +161,50 @@ TEST_CASE("pipeline stages reproduce single-process generation",
         return gen;
     };
 
-    SECTION("two stages, every split point") {
+    // A connected local stream: [1] is the send end, [0] the recv end.
+    auto sock_pair = [](int& w, int& r) {
+        int p[2];
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, p) == 0);
+        w = p[1];
+        r = p[0];
+    };
+    // The same over a loopback TCP connection (ephemeral port). connect
+    // completes into the listen backlog, so accept in the same thread
+    // returns without a separate accept thread.
+    auto tcp_pair = [](int& w, int& r) {
+        int port = 0;
+        const int l = locus::pipeline::listen_on("127.0.0.1", 0, &port);
+        REQUIRE(l >= 0);
+        w = locus::pipeline::connect_to("127.0.0.1", port);
+        REQUIRE(w >= 0);
+        r = locus::pipeline::accept_one(l);
+        REQUIRE(r >= 0);
+        ::close(l);
+    };
+
+    SECTION("two stages, every split point (socketpair)") {
         for (std::uint32_t k = 1; k < L; ++k) {
             CAPTURE(k);
-            REQUIRE(pipeline({0, k, L}) == ref);
+            REQUIRE(pipeline({0, k, L}, sock_pair) == ref);
         }
     }
 
-    SECTION("three stages (a middle stage relays hidden states)") {
+    SECTION("three stages, a middle stage relays (socketpair)") {
         if (L >= 3) {
-            REQUIRE(pipeline({0, 1, L - 1, L}) == ref);
+            REQUIRE(pipeline({0, 1, L - 1, L}, sock_pair) == ref);
+        }
+    }
+
+    SECTION("two stages, every split point (loopback TCP)") {
+        for (std::uint32_t k = 1; k < L; ++k) {
+            CAPTURE(k);
+            REQUIRE(pipeline({0, k, L}, tcp_pair) == ref);
+        }
+    }
+
+    SECTION("three stages over loopback TCP") {
+        if (L >= 3) {
+            REQUIRE(pipeline({0, 1, L - 1, L}, tcp_pair) == ref);
         }
     }
 }
