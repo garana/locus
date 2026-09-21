@@ -10,83 +10,98 @@
 #include "catch_amalgamated.hpp"
 #include "locus/pipeline/message.hpp"
 
-using locus::pipeline::Activation;
 using locus::pipeline::Decode;
+using locus::pipeline::Message;
+using locus::pipeline::MsgType;
 using locus::pipeline::ReadResult;
 
 namespace {
 
-Activation sample(std::uint64_t id, std::uint32_t pos, std::size_t n) {
-    Activation a;
-    a.request_id = id;
-    a.position = pos;
-    a.hidden.resize(n);
+Message activation(std::uint64_t id, std::uint32_t pos,
+                   std::size_t n) {
+    std::vector<float> h(n);
     for (std::size_t i = 0; i < n; ++i) {
-        a.hidden[i] = static_cast<float>(i) * 0.5f - 3.0f;
+        h[i] = static_cast<float>(i) * 0.5f - 3.0f;
     }
-    return a;
+    return locus::pipeline::make_activation(id, pos, std::move(h));
 }
 
 }  // namespace
 
-TEST_CASE("pipeline activation codec round-trips", "[pipeline]") {
-    SECTION("typical vector") {
-        const auto a = sample(42, 7, 64);
+TEST_CASE("pipeline message codec round-trips", "[pipeline]") {
+    SECTION("activation vector") {
+        const auto a = activation(42, 7, 64);
         std::string buf;
         locus::pipeline::encode(a, buf);
-        Activation out;
+        Message out;
         std::string err;
         REQUIRE(locus::pipeline::decode(buf, out, err) ==
                 Decode::kComplete);
-        REQUIRE(buf.empty());  // fully consumed
+        REQUIRE(buf.empty());
+        REQUIRE(out.type == MsgType::kActivation);
         REQUIRE(out.request_id == a.request_id);
         REQUIRE(out.position == a.position);
-        REQUIRE(out.hidden == a.hidden);  // bitwise-identical floats
+        REQUIRE(out.data == a.data);  // bitwise-identical floats
     }
 
-    SECTION("empty hidden vector") {
-        const auto a = sample(1, 0, 0);
+    SECTION("token message (no floats)") {
+        const auto t = locus::pipeline::make_token(5, 9, 12345);
         std::string buf;
-        locus::pipeline::encode(a, buf);
-        Activation out;
+        locus::pipeline::encode(t, buf);
+        Message out;
         std::string err;
         REQUIRE(locus::pipeline::decode(buf, out, err) ==
                 Decode::kComplete);
-        REQUIRE(out.hidden.empty());
-        REQUIRE(out.request_id == 1);
+        REQUIRE(out.type == MsgType::kToken);
+        REQUIRE(out.token == 12345);
+        REQUIRE(out.request_id == 5);
+        REQUIRE(out.position == 9);
+        REQUIRE(out.data.empty());
+    }
+
+    SECTION("logits message") {
+        const auto l = locus::pipeline::make_logits(
+            1, 0, std::vector<float>{0.1f, -2.0f, 3.5f});
+        std::string buf;
+        locus::pipeline::encode(l, buf);
+        Message out;
+        std::string err;
+        REQUIRE(locus::pipeline::decode(buf, out, err) ==
+                Decode::kComplete);
+        REQUIRE(out.type == MsgType::kLogits);
+        REQUIRE(out.data.size() == 3);
+        REQUIRE(out.data[1] == -2.0f);
     }
 
     SECTION("two frames decode in sequence (pipelining)") {
-        const auto a = sample(1, 2, 3);
-        const auto b = sample(9, 8, 5);
+        const auto a = activation(1, 2, 3);
+        const auto b = locus::pipeline::make_token(9, 8, 7);
         std::string buf;
         locus::pipeline::encode(a, buf);
         locus::pipeline::encode(b, buf);
-        Activation o1, o2;
+        Message o1, o2;
         std::string err;
         REQUIRE(locus::pipeline::decode(buf, o1, err) ==
                 Decode::kComplete);
         REQUIRE(locus::pipeline::decode(buf, o2, err) ==
                 Decode::kComplete);
         REQUIRE(buf.empty());
-        REQUIRE(o1.hidden == a.hidden);
-        REQUIRE(o2.request_id == 9);
-        REQUIRE(o2.hidden == b.hidden);
+        REQUIRE(o1.data == a.data);
+        REQUIRE(o2.type == MsgType::kToken);
+        REQUIRE(o2.token == 7);
     }
 
     SECTION("partial buffer is incomplete, not error") {
-        const auto a = sample(1, 1, 10);
+        const auto a = activation(1, 1, 10);
         std::string buf;
         locus::pipeline::encode(a, buf);
-        Activation out;
+        Message out;
         std::string err;
-        // Missing the trailing payload bytes.
         std::string part = buf.substr(0, buf.size() - 4);
         const std::size_t before = part.size();
         REQUIRE(locus::pipeline::decode(part, out, err) ==
                 Decode::kIncomplete);
-        REQUIRE(part.size() == before);  // left untouched
-        // Only part of the length prefix present.
+        REQUIRE(part.size() == before);
         std::string tiny = buf.substr(0, 3);
         REQUIRE(locus::pipeline::decode(tiny, out, err) ==
                 Decode::kIncomplete);
@@ -94,11 +109,11 @@ TEST_CASE("pipeline activation codec round-trips", "[pipeline]") {
 
     SECTION("a too-small frame length is an error") {
         std::string buf;
-        buf.push_back(3);  // frame_len = 3, below the header size
+        buf.push_back(3);
         buf.push_back(0);
         buf.push_back(0);
         buf.push_back(0);
-        Activation out;
+        Message out;
         std::string err;
         REQUIRE(locus::pipeline::decode(buf, out, err) ==
                 Decode::kError);
@@ -111,28 +126,30 @@ TEST_CASE("pipeline framed transport over a socketpair",
     int fds[2];
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
 
-    const std::vector<Activation> sent = {
-        sample(1, 0, 64), sample(2, 1, 64), sample(3, 2, 128)};
+    const std::vector<Message> sent = {
+        activation(1, 0, 64), locus::pipeline::make_token(2, 1, 99),
+        activation(3, 2, 128)};
 
     std::atomic<bool> wok{true};
     std::thread writer([&] {
-        for (const auto& a : sent) {
-            if (!locus::pipeline::write_message(fds[1], a)) {
+        for (const auto& m : sent) {
+            if (!locus::pipeline::write_message(fds[1], m)) {
                 wok = false;
             }
         }
-        ::close(fds[1]);  // clean EOF after the last frame
+        ::close(fds[1]);
     });
 
-    for (const auto& a : sent) {
-        Activation out;
+    for (const auto& m : sent) {
+        Message out;
         REQUIRE(locus::pipeline::read_message(fds[0], out) ==
                 ReadResult::kOk);
-        REQUIRE(out.request_id == a.request_id);
-        REQUIRE(out.position == a.position);
-        REQUIRE(out.hidden == a.hidden);
+        REQUIRE(out.type == m.type);
+        REQUIRE(out.request_id == m.request_id);
+        REQUIRE(out.token == m.token);
+        REQUIRE(out.data == m.data);
     }
-    Activation out;
+    Message out;
     REQUIRE(locus::pipeline::read_message(fds[0], out) ==
             ReadResult::kEof);
 
@@ -143,7 +160,7 @@ TEST_CASE("pipeline framed transport over a socketpair",
 
 TEST_CASE("pipeline read_message reports EOF and truncation",
           "[pipeline]") {
-    Activation out;
+    Message out;
 
     SECTION("clean EOF on an empty closed socket") {
         int fds[2];
@@ -168,10 +185,9 @@ TEST_CASE("pipeline read_message reports EOF and truncation",
     SECTION("length prefix but truncated payload is an error") {
         int fds[2];
         REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-        const auto a = sample(1, 0, 10);
+        const auto a = activation(1, 0, 10);
         std::string frame;
         locus::pipeline::encode(a, frame);
-        // Send the 4-byte length plus only 2 payload bytes, then close.
         REQUIRE(::send(fds[1], frame.data(), 6, 0) == 6);
         ::close(fds[1]);
         REQUIRE(locus::pipeline::read_message(fds[0], out) ==
