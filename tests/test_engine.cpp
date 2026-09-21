@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -512,4 +513,112 @@ TEST_CASE("prefix cache adopts a long prompt without self-eviction",
     // The second identical request must ADOPT the cached prefix, not
     // evict it to admit itself. Pre-fix this was 0.
     REQUIRE(engine.get(id2)->reused_prefix_tokens > 0);
+}
+
+// Multi-server (#71) increment 1: running the layer stack in slices
+// via forward_layers -- [0,k) then [k,L) against one shared cache --
+// must be byte-identical to a single forward(). This is the in-process
+// proof of the pipeline-parallel hand-off before any networking: the
+// hidden state handed between slices reconstructs the exact same logits
+// and the exact same greedy continuation.
+TEST_CASE("execute-slice: layer-range forward matches full forward",
+          "[engine][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    const std::uint32_t L = model.hparams().n_layers;
+    const std::uint32_t E = model.hparams().n_embd;
+    const std::uint32_t V = model.hparams().n_vocab;
+    REQUIRE(L >= 2);
+    const auto prompt =
+        tok.encode("Once upon a time, there was a little", true);
+    constexpr int kGen = 12;
+
+    // Drives prefill + greedy generation, feeding each token through
+    // `step`. Captures the next-token logits right after prefill (a
+    // tight bitwise check) and the generated token sequence.
+    auto drive = [&](auto&& step, std::vector<float>& first_logits,
+                     std::vector<locus::tok::TokenId>& gen) {
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(V);
+        for (auto t : prompt) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            step(t, cache, seq, ws, logits);
+        }
+        first_logits.assign(logits.begin(), logits.end());
+        for (int i = 0; i < kGen; ++i) {
+            const auto n = locus::model::argmax(logits);
+            gen.push_back(n);
+            if (n == tok.eos_id()) {
+                break;
+            }
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            step(n, cache, seq, ws, logits);
+        }
+    };
+
+    // Reference: the real single-call forward().
+    auto mono = [&](locus::tok::TokenId t, locus::kv::PagedKvCache& c,
+                    locus::kv::PagedKvCache::Seq& s,
+                    locus::model::LlamaModel::Workspace& w,
+                    std::span<float> out) {
+        model.forward(t, c, s, w, out);
+    };
+    std::vector<float> ref_logits;
+    std::vector<locus::tok::TokenId> ref_gen;
+    drive(mono, ref_logits, ref_gen);
+    REQUIRE(ref_gen.size() >= 1);
+
+    // Runs one token through the ordered stage boundaries `bounds`
+    // (0 .. L), handing the residual stream between slices.
+    auto sliced = [&](const std::vector<std::uint32_t>& bounds) {
+        return [&, bounds](locus::tok::TokenId t,
+                           locus::kv::PagedKvCache& c,
+                           locus::kv::PagedKvCache::Seq& s,
+                           locus::model::LlamaModel::Workspace& w,
+                           std::span<float> out) {
+            std::vector<float> hidden(E);
+            std::vector<float> prev;
+            for (std::size_t i = 0; i + 1 < bounds.size(); ++i) {
+                const std::uint32_t a = bounds[i], b = bounds[i + 1];
+                const bool firstS = i == 0;
+                const bool lastS = i + 2 == bounds.size();
+                std::span<const float> hin =
+                    firstS ? std::span<const float>{}
+                           : std::span<const float>(prev);
+                std::span<float> ob =
+                    lastS ? out : std::span<float>(hidden);
+                model.forward_layers(firstS ? t : 0, hin, a, b, c, s,
+                                     w, ob);
+                if (!lastS) {
+                    prev = hidden;  // hand off to the next slice
+                }
+            }
+        };
+    };
+
+    // Every 2-way split point must reproduce the reference exactly.
+    for (std::uint32_t k = 1; k < L; ++k) {
+        std::vector<float> k_logits;
+        std::vector<locus::tok::TokenId> k_gen;
+        drive(sliced({0, k, L}), k_logits, k_gen);
+        CAPTURE(k);
+        REQUIRE(k_gen == ref_gen);
+        REQUIRE(k_logits == ref_logits);  // bitwise-identical logits
+    }
+
+    // A 3-way split exercises a middle slice (hidden in AND out).
+    if (L >= 3) {
+        std::vector<float> m_logits;
+        std::vector<locus::tok::TokenId> m_gen;
+        drive(sliced({0, 1, L - 1, L}), m_logits, m_gen);
+        REQUIRE(m_gen == ref_gen);
+        REQUIRE(m_logits == ref_logits);
+    }
 }

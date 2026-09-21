@@ -437,6 +437,37 @@ void LlamaModel::forward(tok::TokenId token,
         vulkan_forward(*this, token, cache, seq, logits)) {
         return;
     }
+    // The whole stack is the [0, n_layers) slice. forward_layers holds
+    // the one shared implementation; pipeline stages run sub-ranges.
+    forward_layers(token, {}, 0, hp_.n_layers, cache, seq, ws, logits);
+}
+
+void LlamaModel::forward_layers(tok::TokenId token,
+                                std::span<const float> hidden_in,
+                                std::uint32_t layer_begin,
+                                std::uint32_t layer_end,
+                                kv::PagedKvCache& cache,
+                                kv::PagedKvCache::Seq& seq, Workspace& ws,
+                                std::span<float> out) const {
+    using namespace locus::backend;
+
+    if (layer_begin > layer_end || layer_end > hp_.n_layers) {
+        throw std::invalid_argument("forward_layers: bad layer range");
+    }
+    const bool first = layer_begin == 0;
+    const bool last = layer_end == hp_.n_layers;
+    if (first) {
+        if (token < 0 ||
+            static_cast<std::uint32_t>(token) >= hp_.n_vocab) {
+            throw std::invalid_argument("token id out of vocab");
+        }
+    } else if (hidden_in.size() != hp_.n_embd) {
+        throw std::invalid_argument(
+            "forward_layers: hidden_in must be n_embd");
+    }
+    if (out.size() != (last ? hp_.n_vocab : hp_.n_embd)) {
+        throw std::invalid_argument("forward_layers: wrong out size");
+    }
     if (seq.n_tokens >= hp_.n_ctx) {
         throw std::invalid_argument("context window exhausted");
     }
@@ -447,22 +478,29 @@ void LlamaModel::forward(tok::TokenId token,
     const backend::Ops op =
         effective_ops(backend_, q8k_activations_);
 
-    op.dequant_row(embd_, static_cast<std::uint32_t>(token),
-                   ws.x);
+    // Stage input: the first stage embeds the token; a later stage
+    // loads the residual stream handed over by the previous stage.
+    if (first) {
+        op.dequant_row(embd_, static_cast<std::uint32_t>(token),
+                       ws.x);
+    } else {
+        std::copy_n(hidden_in.data(), hp_.n_embd, ws.x.data());
+    }
 
     // R8 layer readahead: while layer l computes, ask the kernel
     // to page in layer l+1's static weights (and the output head
-    // after the last layer). Routed experts are covered
-    // separately at selection time (moe_ffn).
+    // after this stage's last layer, when it is the final stage).
+    // Routed experts are covered separately at selection time
+    // (moe_ffn). Prefetch stays within this stage's owned layers.
     const bool layer_ra = readahead_enabled();
 
-    for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
+    for (std::uint32_t l = layer_begin; l < layer_end; ++l) {
         const Layer& lay = layers_[l];
         if (layer_ra) {
             // The same one-step-ahead schedule feeds both tiers:
             // madvise (SSD -> page cache) and, on backends with
             // a weight pager, op.prefetch (host -> device).
-            if (l + 1 < hp_.n_layers) {
+            if (l + 1 < layer_end) {
                 advise_layer_statics(layers_[l + 1]);
                 if (op.prefetch != nullptr) {
                     for_each_static_mat(
@@ -474,7 +512,7 @@ void LlamaModel::forward(tok::TokenId token,
                             }
                         });
                 }
-            } else {
+            } else if (last) {
                 advise_mat(out_w_);
                 if (op.prefetch != nullptr) {
                     op.prefetch(out_w_);
@@ -509,9 +547,17 @@ void LlamaModel::forward(tok::TokenId token,
         }
     }
 
-    apply_norm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
-    matvec_mt(op, out_w_, ws.xb, logits);
-    seq.n_tokens = pos + 1;
+    if (last) {
+        // Final stage: normalize and project to logits, and only now
+        // consume the token (advance the sequence).
+        apply_norm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
+        matvec_mt(op, out_w_, ws.xb, out);
+        seq.n_tokens = pos + 1;
+    } else {
+        // Hand the residual stream to the next stage; the token is not
+        // consumed yet, so seq.n_tokens is left for the final stage.
+        std::copy_n(ws.x.data(), hp_.n_embd, out.data());
+    }
 }
 
 void LlamaModel::embed(std::span<const tok::TokenId> tokens,

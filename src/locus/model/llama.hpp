@@ -175,6 +175,46 @@ class LlamaModel {
                  std::span<float> logits) const;
 
     /**
+     * Runs the transformer layers [layer_begin, layer_end) for one
+     * token at position seq.n_tokens. This is the building block for
+     * pipeline-parallel execution: each pipeline stage owns a
+     * contiguous layer range and calls this for its slice.
+     *
+     * Input: when layer_begin == 0 the first stage embeds `token`;
+     * otherwise `hidden_in` (n_embd floats) is the residual stream
+     * handed over from the previous stage and `token` is ignored.
+     *
+     * Output: when layer_end == n_layers the last stage applies the
+     * final norm + output projection and `out` receives the logits
+     * (n_vocab floats); otherwise `out` receives the residual stream
+     * (n_embd floats) to hand to the next stage.
+     *
+     * seq.n_tokens advances only when layer_end == n_layers (the
+     * token is not fully consumed until the last layer runs), so the
+     * whole stack run as [0,k) then [k,n_layers) against one shared
+     * cache/seq is byte-identical to a single forward(). The KV cache
+     * is indexed by absolute layer number, so `cache` must cover the
+     * layers this call runs. CPU/CUDA backends only (the Vulkan
+     * full-forward does not surface the hidden state); forward()
+     * keeps the Vulkan path.
+     *
+     * @param token In-vocab token id (used only when layer_begin==0).
+     * @param hidden_in Residual stream from the previous stage, n_embd
+     *     floats (used only when layer_begin > 0; may be empty else).
+     * @param layer_begin First layer to run (inclusive).
+     * @param layer_end One past the last layer to run.
+     * @param out n_vocab floats when layer_end==n_layers, else n_embd.
+     * @throws std::invalid_argument on a bad range, vocab/context
+     *     misuse, or wrong hidden_in / out size.
+     */
+    void forward_layers(tok::TokenId token,
+                        std::span<const float> hidden_in,
+                        std::uint32_t layer_begin,
+                        std::uint32_t layer_end, kv::PagedKvCache& cache,
+                        kv::PagedKvCache::Seq& seq, Workspace& ws,
+                        std::span<float> out) const;
+
+    /**
      * Computes a sentence embedding for `tokens`: runs them through
      * the layer stack (updating seq's KV) and returns the final
      * normed hidden state of the LAST token (last-token pooling),
