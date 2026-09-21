@@ -9,6 +9,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/pipeline/message.hpp"
+#include "locus/pipeline/net.hpp"
 
 using locus::pipeline::Decode;
 using locus::pipeline::Message;
@@ -194,4 +195,53 @@ TEST_CASE("pipeline read_message reports EOF and truncation",
                 ReadResult::kError);
         ::close(fds[0]);
     }
+}
+
+TEST_CASE("pipeline transport over loopback TCP", "[pipeline]") {
+    int port = 0;
+    const int lfd = locus::pipeline::listen_on("127.0.0.1", 0, &port);
+    REQUIRE(lfd >= 0);
+    REQUIRE(port > 0);
+
+    // A large activation forces TCP to segment the frame across several
+    // reads, exercising read_message's read-until-complete loop.
+    const std::vector<Message> sent = {
+        activation(1, 0, 8192),
+        locus::pipeline::make_token(2, 1, 7),
+        locus::pipeline::make_logits(3, 2,
+                                     std::vector<float>(2048, 1.5f))};
+
+    std::atomic<bool> wok{true};
+    std::thread client([&] {
+        const int c = locus::pipeline::connect_to("127.0.0.1", port);
+        if (c < 0) {
+            wok = false;
+            return;
+        }
+        for (const auto& m : sent) {
+            if (!locus::pipeline::write_message(c, m)) {
+                wok = false;
+            }
+        }
+        ::close(c);
+    });
+
+    const int s = locus::pipeline::accept_one(lfd);
+    REQUIRE(s >= 0);
+    for (const auto& m : sent) {
+        Message out;
+        REQUIRE(locus::pipeline::read_message(s, out) ==
+                ReadResult::kOk);
+        REQUIRE(out.type == m.type);
+        REQUIRE(out.request_id == m.request_id);
+        REQUIRE(out.token == m.token);
+        REQUIRE(out.data == m.data);
+    }
+    Message out;
+    REQUIRE(locus::pipeline::read_message(s, out) == ReadResult::kEof);
+
+    client.join();
+    REQUIRE(wok.load());
+    ::close(s);
+    ::close(lfd);
 }
