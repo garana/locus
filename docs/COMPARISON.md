@@ -25,6 +25,7 @@ before quoting.
 | llama.cpp    | partial: mmap weights, -ngl offload split | limited: server parallel slots | yes: Metal/Vulkan/CUDA/   | OpenAI-ish (llama-      | C/C++, minimal           | partial: RPC + tensor-split                 |
 |              | (no bigger-than-VRAM GPU streaming)       |                                | ROCm/SYCL                 | server)                 |                          |                                             |
 | Ollama       | via llama.cpp                             | via llama.cpp (limited)        | via llama.cpp             | own + OpenAI-compat     | Go + llama.cpp           | via llama.cpp                               |
+| Apple MLX    | no (resident; scales via distribution)    | yes (mlx_lm.server)            | no: Apple Silicon only    | OpenAI-compat           | Python + MLX (C++ core)  | yes: pipeline + tensor (Ring/JACCL)         |
 | vLLM         | no (model resident; some CPU swap)        | yes (originated PagedAttention)| mostly NVIDIA (+ROCm)     | OpenAI                  | heavy Python/CUDA        | yes: tensor + pipeline parallel, multi-node |
 | LightLLM     | no                                        | yes                            | mostly NVIDIA             | OpenAI                  | Python                   | yes: tensor parallel                        |
 | SGLang       | no                                        | yes (+ radix/prefix cache)     | mostly NVIDIA             | OpenAI                  | Python                   | yes: tensor + pipeline parallel             |
@@ -56,7 +57,10 @@ capability matrix above).
 
 The Python GPU stacks (vLLM/SGLang/TGI/LightLLM) already do tensor and
 pipeline parallelism, but aimed at throughput on a model that fits the
-cluster's VRAM, over a fast interconnect (NVLink-class). locus's angle
+cluster's VRAM, over a fast interconnect (NVLink-class). Apple's MLX
+now does the same across Macs (pipeline + tensor over its Ring backend,
+or JACCL on Thunderbolt 5), the closest analog to locus's plan but
+Apple-Silicon only. locus's angle
 is the streaming niche again: pool the memory of cheap commodity hosts
 over a plain LAN to run a model none of them could hold alone, tolerant
 of network latency because only the small activation vector crosses the
