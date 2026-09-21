@@ -5,37 +5,57 @@
 #include <string>
 #include <vector>
 
+#include "locus/tok/tokenizer.hpp"
+
 namespace locus::pipeline {
 
 /**
  * Wire protocol for pipeline-parallel inference across hosts
- * (multi-server, DESIGN.md "R15+"). One pipeline stage owns a
- * contiguous range of layers and hands the residual stream (the
- * between-layers hidden state) to the next stage as an Activation
- * message. This module is the transport primitive: a binary,
- * length-prefixed codec plus blocking framed read/write over a socket
- * fd. Connection setup (TCP listen/connect) and the stage run loop
- * come in later increments.
+ * (multi-server, DESIGN.md "R15+"). A pipeline stage owns a contiguous
+ * range of layers. Three message kinds cross a connection:
+ *
+ *   kToken       entry -> first stage: the input token to embed.
+ *   kActivation  stage -> next stage: the residual stream (n_embd
+ *                floats) handed on after a stage's layers.
+ *   kLogits      last stage -> entry: the output logits (n_vocab
+ *                floats) for sampling.
+ *
+ * This module is the transport: a binary, length-prefixed codec plus
+ * blocking framed read/write over a socket fd. Connection setup (TCP
+ * listen/connect) and the stage run loop build on it.
  */
-
-/** Message kinds carried on a pipeline connection. */
 enum class MsgType : std::uint16_t {
-    kActivation = 1,  /**< A stage's output residual stream, one token. */
-    kResult = 2,      /**< Final stage's sampled token back to the entry
-                       *   host (reserved; not encoded yet). */
+    kToken = 1,       /**< Input token for the first stage. */
+    kActivation = 2,  /**< Residual stream between stages. */
+    kLogits = 3,      /**< Output logits from the last stage. */
 };
 
 /**
- * One token's residual stream handed from one stage to the next,
- * tagged with the sequence and token position so the receiving stage
- * writes its KV at the matching slot (forward_layers uses `position`
- * as `pos`).
+ * One pipeline message, tagged by kind. `request_id` and `position`
+ * identify the sequence and token position (position feeds
+ * forward_layers' pos on the receiving stage). `token` is meaningful
+ * only for kToken; `data` carries the floats for kActivation (the
+ * residual stream, n_embd) and kLogits (n_vocab), and is empty for
+ * kToken.
  */
-struct Activation {
-    std::uint64_t request_id = 0;  /**< Sequence this token belongs to. */
-    std::uint32_t position = 0;    /**< Token position in the sequence. */
-    std::vector<float> hidden;     /**< n_embd floats (residual stream). */
+struct Message {
+    MsgType type = MsgType::kActivation;
+    std::uint64_t request_id = 0;
+    std::uint32_t position = 0;
+    tok::TokenId token = 0;      /**< kToken only. */
+    std::vector<float> data;     /**< kActivation / kLogits payload. */
 };
+
+/** @returns A kToken message. */
+Message make_token(std::uint64_t request_id, std::uint32_t position,
+                   tok::TokenId token);
+/** @returns A kActivation message carrying `hidden` (n_embd floats). */
+Message make_activation(std::uint64_t request_id,
+                        std::uint32_t position,
+                        std::vector<float> hidden);
+/** @returns A kLogits message carrying `logits` (n_vocab floats). */
+Message make_logits(std::uint64_t request_id, std::uint32_t position,
+                    std::vector<float> logits);
 
 /** Outcome of a buffer decode attempt (mirrors auth::HelperDecode). */
 enum class Decode {
@@ -45,25 +65,24 @@ enum class Decode {
 };
 
 /**
- * Encodes `a` as a length-prefixed binary frame appended to `out`:
+ * Encodes `m` as a length-prefixed binary frame appended to `out`:
  *
  *     u32 frame_len | u16 type | u16 flags | u64 request_id |
- *     u32 position  | u32 n_floats | f32 hidden[n_floats]
+ *     u32 position  | i32 token | u32 n_floats | f32 data[n_floats]
  *
  * frame_len counts every byte after itself. All integers are
- * little-endian; the hidden floats are copied raw (IEEE-754). locus
- * targets a homogeneous little-endian cluster (x86-64 / arm64), so the
- * payload floats are not byte-swapped.
+ * little-endian; the floats are copied raw (IEEE-754). locus targets a
+ * homogeneous little-endian cluster (x86-64 / arm64), so the payload
+ * floats are not byte-swapped.
  */
-void encode(const Activation& a, std::string& out);
+void encode(const Message& m, std::string& out);
 
 /**
  * Decodes one frame from the front of `buf`. On kComplete the consumed
- * bytes are erased from `buf` and `out` is filled; on kIncomplete `buf`
- * is left intact; on kError `err` describes the fault and the caller
- * should close the connection.
+ * bytes are erased and `out` is filled; on kIncomplete `buf` is left
+ * intact; on kError `err` describes the fault.
  */
-Decode decode(std::string& buf, Activation& out, std::string& err);
+Decode decode(std::string& buf, Message& out, std::string& err);
 
 /** @returns The largest frame length accepted by decode/read_message;
  * guards against a desynced or hostile peer. */
@@ -76,15 +95,13 @@ std::uint32_t max_frame_bytes();
 /**
  * Writes all of `bytes` to `fd`, looping on partial writes and
  * retrying EINTR. Uses MSG_NOSIGNAL where available so a peer that
- * closed does not raise SIGPIPE.
- *
- * @returns false on a write error or a zero-length write (EOF).
+ * closed does not raise SIGPIPE. @returns false on a write error.
  */
 bool write_all(int fd, std::span<const char> bytes);
 
-/** Encodes `a` and writes the whole frame to `fd`. @returns false on a
+/** Encodes `m` and writes the whole frame to `fd`. @returns false on a
  * write error. */
-bool write_message(int fd, const Activation& a);
+bool write_message(int fd, const Message& m);
 
 /** Outcome of read_message. */
 enum class ReadResult {
@@ -97,10 +114,9 @@ enum class ReadResult {
  * Reads exactly one frame from `fd` (blocking): the length prefix, then
  * that many payload bytes, so nothing is buffered between calls.
  *
- * @param out Filled on kOk.
  * @returns kEof only when the peer closes before any byte of a new
  *     frame; a close mid-frame is kError.
  */
-ReadResult read_message(int fd, Activation& out);
+ReadResult read_message(int fd, Message& out);
 
 }  // namespace locus::pipeline
