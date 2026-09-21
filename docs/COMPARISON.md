@@ -10,21 +10,21 @@ feature audit; verify specifics against upstream before quoting.
 
 ## Capability matrix
 
-| Engine       | Bigger-than-RAM/VRAM streaming            | Continuous batching (paged KV) | Vendor-neutral GPU        | Serving API             | Stack / deps             |
-|--------------|-------------------------------------------|--------------------------------|---------------------------|-------------------------|--------------------------|
-| locus        | yes: mmap + page-cache working set,       | yes                            | yes: Vulkan + CUDA + CPU  | OpenAI + Anthropic      | C++20, minimal vendored  |
-|              | routed-expert streaming                   |                                |                           |                         |                          |
-| llama.cpp    | partial: mmap weights, -ngl offload split | limited: server parallel slots | yes: Metal/Vulkan/CUDA/   | OpenAI-ish (llama-      | C/C++, minimal           |
-|              | (no bigger-than-VRAM GPU streaming)       |                                | ROCm/SYCL                 | server)                 |                          |
-| Ollama       | via llama.cpp                             | via llama.cpp (limited)        | via llama.cpp             | own + OpenAI-compat     | Go + llama.cpp           |
-| vLLM         | no (model resident; some CPU swap)        | yes (originated PagedAttention)| mostly NVIDIA (+ROCm)     | OpenAI                  | heavy Python/CUDA        |
-| LightLLM     | no                                        | yes                            | mostly NVIDIA             | OpenAI                  | Python                   |
-| SGLang       | no                                        | yes (+ radix/prefix cache)     | mostly NVIDIA             | OpenAI                  | Python                   |
-| TGI          | no                                        | yes                            | NVIDIA (+ some AMD)       | own + OpenAI-compat     | Rust + Python            |
-| AirLLM       | yes (extreme): one layer/expert on GPU    | no                             | CUDA + Apple MLX + CPU    | none (library only)     | Python + PyTorch         |
-|              | at a time                                 |                                | (no AMD)                  |                         |                          |
-| kimi-k3-in-c | yes (extreme): routed 4-bit experts       | no (single sequence)           | no: CPU-only (AVX2+FMA)   | none (CLI + C library)  | C99 + OpenMP, no BLAS    |
-|              | streamed from disk per token (LRU)        |                                |                           |                         |                          |
+| Engine       | Bigger-than-RAM/VRAM streaming            | Continuous batching (paged KV) | Vendor-neutral GPU        | Serving API             | Stack / deps             | Multi-host scaling                          |
+|--------------|-------------------------------------------|--------------------------------|---------------------------|-------------------------|--------------------------|---------------------------------------------|
+| locus        | yes: mmap + page-cache working set,       | yes                            | yes: Vulkan + CUDA + CPU  | OpenAI + Anthropic      | C++20, minimal vendored  | planned: pipeline + expert parallel (R15+)  |
+|              | routed-expert streaming                   |                                |                           |                         |                          |                                             |
+| llama.cpp    | partial: mmap weights, -ngl offload split | limited: server parallel slots | yes: Metal/Vulkan/CUDA/   | OpenAI-ish (llama-      | C/C++, minimal           | partial: RPC + tensor-split                 |
+|              | (no bigger-than-VRAM GPU streaming)       |                                | ROCm/SYCL                 | server)                 |                          |                                             |
+| Ollama       | via llama.cpp                             | via llama.cpp (limited)        | via llama.cpp             | own + OpenAI-compat     | Go + llama.cpp           | via llama.cpp                               |
+| vLLM         | no (model resident; some CPU swap)        | yes (originated PagedAttention)| mostly NVIDIA (+ROCm)     | OpenAI                  | heavy Python/CUDA        | yes: tensor + pipeline parallel, multi-node |
+| LightLLM     | no                                        | yes                            | mostly NVIDIA             | OpenAI                  | Python                   | yes: tensor parallel                        |
+| SGLang       | no                                        | yes (+ radix/prefix cache)     | mostly NVIDIA             | OpenAI                  | Python                   | yes: tensor + pipeline parallel             |
+| TGI          | no                                        | yes                            | NVIDIA (+ some AMD)       | own + OpenAI-compat     | Rust + Python            | yes: tensor-parallel sharding               |
+| AirLLM       | yes (extreme): one layer/expert on GPU    | no                             | CUDA + Apple MLX + CPU    | none (library only)     | Python + PyTorch         | no (single device)                          |
+|              | at a time                                 |                                | (no AMD)                  |                         |                          |                                             |
+| kimi-k3-in-c | yes (extreme): routed 4-bit experts       | no (single sequence)           | no: CPU-only (AVX2+FMA)   | none (CLI + C library)  | C99 + OpenMP, no BLAS    | no (single CPU)                             |
+|              | streamed from disk per token (LRU)        |                                |                           |                         |                          |                                             |
 
 Two families: the Python GPU-serving stacks (vLLM/LightLLM/SGLang/
 TGI) assume the model fits in VRAM and optimize throughput on top of
@@ -33,6 +33,31 @@ footprint and reach. locus sits in the gap -- a llama.cpp-class
 footprint with a continuous-batching serving core -- and pushes on
 the axis neither family targets: running a model that does not fit,
 fast, by amortizing the streaming.
+
+## Multi-host scaling (pipeline parallelism; added 2026-09-21)
+
+The matrix above is single-host. A separate axis is spreading one
+model across several machines to fit a model too big for any single
+one of them (model-capacity scaling), which is distinct from
+replicating a resident model for throughput. locus is adding this as
+pipeline parallelism: split the layers across hosts, hand the residual
+stream (a few KB per token) from stage to stage, and keep each host's
+weights resident. Design in DESIGN.md "R15+"; in progress, not yet
+shipped or benchmarked (see the Multi-host scaling column in the
+capability matrix above).
+
+The Python GPU stacks (vLLM/SGLang/TGI/LightLLM) already do tensor and
+pipeline parallelism, but aimed at throughput on a model that fits the
+cluster's VRAM, over a fast interconnect (NVLink-class). locus's angle
+is the streaming niche again: pool the memory of cheap commodity hosts
+over a plain LAN to run a model none of them could hold alone, tolerant
+of network latency because only the small activation vector crosses the
+wire (not weights) and concurrency hides the hop. Tensor parallelism
+(an all-reduce every layer) is deliberately not the target, since it
+needs a fast interconnect; pipeline and expert parallelism suit a LAN.
+This is the distributed sibling of the multi-GPU weight-sharding pager
+(also R15) and composes with it (a stage can itself shard its layers
+across that host's GPUs).
 
 ## AirLLM -- the closest neighbor on the streaming thesis
 
