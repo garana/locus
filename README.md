@@ -1,13 +1,19 @@
 # locus
 
-A pure C/C++ LLM inference server aiming at the unfilled niche
-between llama.cpp and the Python serving stacks (LightLLM, vLLM):
+A pure C/C++ LLM inference server: a full serving engine whose
+distinctive lever is running models that do not fit in RAM/VRAM. It
+began by filling the gap between llama.cpp and the Python serving
+stacks (vLLM, LightLLM), and now spans:
 
-- vendor-neutral (CPU first, Vulkan for GPU later),
-- token-block paged KV cache with copy-on-write prefix sharing,
-- continuous (iteration-level) batching,
-- OpenAI-compatible HTTP API,
-- minimal, auditable, vendored dependency surface.
+- vendor-neutral compute: CPU, Vulkan (incl. Apple GPUs via MoltenVK),
+  and CUDA,
+- token-block paged KV cache with copy-on-write prefix sharing, and
+  continuous (iteration-level) batching,
+- OpenAI- and Anthropic-compatible HTTP API, with sampling,
+  constrained decoding, prompt caching, and speculative decoding,
+- weight streaming for bigger-than-memory models, now extending across
+  hosts (pipeline + expert parallelism, in progress) to pool memory,
+- a minimal, auditable, vendored dependency surface.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full MVP design and
 milestone plan, [docs/CLIENTS.md](docs/CLIENTS.md) for supported
