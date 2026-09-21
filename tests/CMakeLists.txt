@@ -29,6 +29,7 @@ add_executable(locus_tests
     test_auth_client.cpp
     test_helper_spawn.cpp
     test_prefix_cache.cpp
+    test_pipeline.cpp
     test_grammar.cpp
     test_sampling.cpp
     test_speculative.cpp
