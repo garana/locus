@@ -1,12 +1,20 @@
 # locus vs other inference engines
 
-Positioning snapshot (2026-08-09). locus's niche is narrow and
-deliberate: **stream weights when the model does not fit in RAM/VRAM,
-and batch inputs**, so weight reads are amortized across concurrent
-requests and the page cache carries the hot working set. The engines
-below are grouped by how they relate to that niche. Fast-moving
-projects -- treat the cells as architecture-level positioning, not a
-feature audit; verify specifics against upstream before quoting.
+Positioning snapshot (2026-08-09; multi-host axis added 2026-09-21).
+locus is a full inference server: continuous batching, paged KV,
+OpenAI- and Anthropic-compatible API, sampling, constrained decoding,
+prompt caching, and speculative decoding, over CPU, CUDA, and Vulkan
+(which reaches Apple GPUs via MoltenVK, so no separate Metal backend).
+Its distinctive lever is running models that do not fit. On one host
+it **streams weights when the model exceeds RAM/VRAM and batches
+inputs**, so weight reads are amortized across concurrent requests and
+the page cache carries the hot working set; and it is extending across
+machines (pipeline + expert parallelism, in progress) to pool memory
+and run a model too big for any single box. The engines below are
+grouped by how they relate to that "run bigger-than-memory, fast"
+thesis. Fast-moving projects -- treat the cells as architecture-level
+positioning, not a feature audit; verify specifics against upstream
+before quoting.
 
 ## Capability matrix
 
