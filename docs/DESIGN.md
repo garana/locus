@@ -925,6 +925,150 @@ bigger model runs where it otherwise could not).
   hardware; not classic tensor parallelism -- shard the streamed
   weight window across devices.
 
+## R15+: distributed multi-server inference (pipeline + expert)
+
+Deferred, design only; needs more than one reachable host. This
+extends the streaming niche (fit a model that does not fit one
+machine) from a single box to a cluster of commodity boxes, by
+pooling their memory. It is a capacity lever, not a throughput lever.
+
+### Why (capacity scaling, not throughput scaling)
+
+Two unrelated things get called "scaling":
+
+- Throughput scaling: serve more requests per second. The lever is
+  replication (run full independent copies behind a load balancer);
+  no model is split, each copy holds the whole model.
+- Model-capacity scaling: fit a larger model than one machine's
+  memory holds. The lever is model parallelism (split the model
+  across machines). This section is about this one.
+
+The payoff: run a heavy model on several cheaper machines instead of
+buying one expensive high-memory device, pooling the memory of boxes
+that individually could not hold the model. This is the distributed
+form of the existing thesis (stream weights so a bigger model runs
+where it otherwise could not); here we pool RAM/VRAM across hosts
+rather than streaming through one host's memory. Costs to keep
+honest: cheaper or older hardware is slower per token, so latency and
+throughput per dollar can be worse, and it adds orchestration and
+failure handling. It makes the model runnable, not fast.
+
+### Strategy: pipeline parallelism (layers split across hosts)
+
+Assign each host a contiguous block of layers. A token's hidden state
+flows host to host: host 1 runs layers [0, k), sends the resulting
+hidden vector to host 2 (layers [k, 2k)), and so on to the last host,
+which produces the logits and samples. Weights load once into each
+host's memory and stay resident, so there is no per-token RAM to VRAM
+weight streaming, provided a host's slice fits its memory. Only
+activations cross the network: one hidden-state vector per token per
+stage boundary (for a width-d model at 2 bytes, about 2*d bytes,
+kilobytes not gigabytes). That tiny payload is why this survives a
+LAN.
+
+Contrast with tensor parallelism (split each layer's matmul across
+devices, combine every layer with an all-reduce): it exchanges data
+every layer and needs an NVLink-class interconnect, so it is a poor
+fit for a LAN and is not the target here.
+
+### Latency versus throughput
+
+Latency rises: each boundary adds a network hop, so per-token latency
+grows by about (hops * one-way delay). Accepted, and it does not come
+back. Throughput need not fall, under two conditions:
+
+1. Sends are asynchronous: a stage hands its output downstream and
+   immediately starts the next unit, so transit time is time in
+   flight, not time the stage is busy. The throughput bottleneck is
+   then the slowest stage's compute, not the link.
+2. Enough requests are in flight to keep every stage busy. Decode is
+   autoregressive: a token traverses all layers in order and the next
+   token needs this one's logits, so a single conversation can never
+   have two of its own tokens in the pipe at once; you fill the
+   stages with other requests. The concurrency needed to saturate the
+   pipeline is about:
+
+       concurrency ~= stages * (1 + delay / per-stage-compute)
+
+   Network delay does not lower the throughput ceiling; it raises how
+   many concurrent requests are needed to reach it. On a fast LAN,
+   delay/compute is small, so a few requests per stage suffice and
+   throughput approaches the single-box aggregate. On a slow link, or
+   at low concurrency, throughput does suffer.
+
+Prefill (the prompt) is the easy case: all prompt tokens are known up
+front, so a long prompt can be chunked and streamed stage to stage,
+keeping the pipe full even for a single request. Decode is the case
+that needs concurrency.
+
+### KV cache maps cleanly onto stages
+
+The KV cache is per-layer by construction: each layer stores its own
+Key/Value vectors for every past token, because attention at layer L
+needs the K/V computed at layer L (from that layer's input, which is
+the previous layer's output, not the raw input). There is no
+single-layer place that could stand in for the rest; a cached prefix
+of N tokens over a model of Lyr layers is Lyr*N keys plus Lyr*N
+values.
+
+This lines up with pipeline stages at no extra cost: each stage
+already owns a contiguous block of layers, so it owns exactly that
+block's KV cache, stored locally. Prompt caching (KV prefix reuse)
+keeps working per stage; a cached prefix is distributed, each stage
+holding its layers' slice. The effect on prompt caching is not a
+per-prompt synergy but real headroom: the cache is not made cheaper
+or smarter, yet the cluster has more aggregate memory than one cheap
+box, so more cached prefixes (and longer contexts) can be retained
+before eviction.
+
+### Expert parallelism: a second LAN-friendly axis (MoE)
+
+For Mixture-of-Experts models (already supported: Qwen-MoE, DBRX,
+GLM), a feed-forward layer holds many expert sub-networks; each token
+is routed to a few, and the chosen experts run independently. That is
+genuine within-layer parallelism, and it maps onto expert
+parallelism: place different experts on different hosts, each
+processing the tokens routed to it. Routing adds its own
+communication (tokens must reach their experts and results return),
+but the experts themselves are independent, so this is a viable
+second distribution axis on a LAN, orthogonal to the pipeline split.
+
+Aside on architectures: some models (GPT-J, GPT-NeoX, PaLM, Falcon)
+run the attention and feed-forward sub-layers of a block in parallel
+(both read the same block input, outputs summed) rather than in
+series. That is intra-block parallelism, an architecture choice, not
+a distribution strategy, but it is the other place "layers run in
+parallel" is literally true. Across a single token, layer depth is
+otherwise strictly sequential.
+
+### Relation to the multi-GPU weight-sharding pager (above)
+
+Both are capacity levers; they differ on axis and compose. The
+multi-GPU pager shards the streamed weight window across GPUs within
+one host (fast local interconnect, activations stay on the box); this
+section shards layers across hosts over the network (activations
+cross the wire). A single pipeline stage can itself use the multi-GPU
+pager to hold its layer block across that host's local GPUs, so
+pipeline parallelism sits one level above it.
+
+### Sketch (when built)
+
+- Static layer assignment by config (host X owns layers [a, b)); each
+  host loads only its slice.
+- Transport: length-prefixed activations over TCP (or gRPC), each
+  message tagged (request_id, position) so stages stay ordered;
+  asynchronous send so round-trip time overlaps compute.
+- Reuse the engine loop per stage: a remote-input source feeds
+  activations in, a remote-output sink ships them downstream; the
+  last stage samples and streams tokens back to the entry host.
+- Health checks: a dead stage stalls the chain, so it needs detection
+  and a clean error.
+
+Exit test: a two-host layer split produces byte-identical output to
+the single-host run for the same prompt and seed; under concurrency
+at or above the pipeline depth, aggregate throughput approaches the
+single-box compute ceiling, with only latency raised by the hop.
+
 ## R16: Q8_K activation-dot (ggml-exact quantized matvec)
 
 llama.cpp does not dot quantized weights against f32 activations: for
