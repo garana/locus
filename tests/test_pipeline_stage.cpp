@@ -16,6 +16,7 @@
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/pipeline/stage.hpp"
+#include "locus/pipeline/stage_server.hpp"
 #include "locus/tok/tokenizer.hpp"
 
 using locus::pipeline::Message;
@@ -206,5 +207,138 @@ TEST_CASE("pipeline stages reproduce single-process generation",
         if (L >= 3) {
             REQUIRE(pipeline({0, 1, L - 1, L}, tcp_pair) == ref);
         }
+    }
+}
+
+// Multi-server (#71): stages run as servers via serve_stage (the
+// locus-stage CLI's core) -- listen, accept from an allowed peer,
+// connect downstream -- chained over loopback TCP, must reproduce
+// single-process generation byte-for-byte.
+TEST_CASE("pipeline serve_stage chain reproduces generation",
+          "[pipeline][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const std::uint32_t V = model.hparams().n_vocab;
+    REQUIRE(L >= 2);
+    const auto prompt =
+        tok.encode("Once upon a time, there was a little", true);
+    constexpr int kGen = 12;
+
+    auto mono = [&]() {
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(V);
+        for (auto t : prompt) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(t, cache, seq, ws, logits);
+        }
+        std::vector<locus::tok::TokenId> gen;
+        for (int i = 0; i < kGen; ++i) {
+            const auto n = locus::model::argmax(logits);
+            gen.push_back(n);
+            if (n == tok.eos_id()) {
+                break;
+            }
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(n, cache, seq, ws, logits);
+        }
+        return gen;
+    };
+    const auto ref = mono();
+
+    // Stages [0,k) and [k,L) served over loopback TCP; the entry drives
+    // tokens into stage 0 and reads logits back from stage 1. Listeners
+    // are created first so downstream ports are known before wiring.
+    auto serve_two = [&](std::uint32_t k) {
+        int p0 = 0, p1 = 0, pe = 0;
+        const int l0 = locus::pipeline::listen_on("127.0.0.1", 0, &p0);
+        const int l1 = locus::pipeline::listen_on("127.0.0.1", 0, &p1);
+        const int le = locus::pipeline::listen_on("127.0.0.1", 0, &pe);
+        REQUIRE(l0 >= 0);
+        REQUIRE(l1 >= 0);
+        REQUIRE(le >= 0);
+
+        PipelineStage s0(model, 0, k);
+        PipelineStage s1(model, k, L);
+        // Restrict incoming to loopback (exercises the allowlist path).
+        const std::vector<locus::pipeline::CidrV4> allow{
+            *locus::pipeline::CidrV4::parse("127.0.0.0/8")};
+
+        std::atomic<int> r0{-1}, r1{-1};
+        std::thread t0([&] {
+            r0 = locus::pipeline::serve_stage(s0, l0, allow,
+                                              "127.0.0.1", p1)
+                     ? 1
+                     : 0;
+        });
+        std::thread t1([&] {
+            r1 = locus::pipeline::serve_stage(s1, l1, allow,
+                                              "127.0.0.1", pe)
+                     ? 1
+                     : 0;
+        });
+
+        const int entry_w =
+            locus::pipeline::connect_to("127.0.0.1", p0);
+        REQUIRE(entry_w >= 0);
+        const int entry_r = locus::pipeline::accept_one(le, nullptr);
+        REQUIRE(entry_r >= 0);
+        ::close(le);
+
+        bool flow = true;
+        std::uint32_t pos = 0;
+        std::vector<float> logits;
+        auto round_trip = [&](locus::tok::TokenId t) {
+            const Message in = locus::pipeline::make_token(1, pos, t);
+            if (!locus::pipeline::write_message(entry_w, in)) {
+                flow = false;
+                return;
+            }
+            Message lg;
+            if (locus::pipeline::read_message(entry_r, lg) !=
+                    ReadResult::kOk ||
+                lg.type != MsgType::kLogits) {
+                flow = false;
+                return;
+            }
+            logits = std::move(lg.data);
+            ++pos;
+        };
+
+        std::vector<locus::tok::TokenId> gen;
+        for (auto t : prompt) {
+            round_trip(t);
+            if (!flow) {
+                break;
+            }
+        }
+        for (int i = 0; i < kGen && flow; ++i) {
+            const auto n = locus::model::argmax(logits);
+            gen.push_back(n);
+            if (n == tok.eos_id()) {
+                break;
+            }
+            round_trip(n);
+        }
+
+        ::close(entry_w);
+        t0.join();
+        t1.join();
+        ::close(entry_r);
+        REQUIRE(flow);
+        REQUIRE(r0.load() == 1);  // stage 0 exited cleanly
+        REQUIRE(r1.load() == 1);  // stage 1 exited cleanly
+        return gen;
+    };
+
+    for (std::uint32_t k = 1; k < L; ++k) {
+        CAPTURE(k);
+        REQUIRE(serve_two(k) == ref);
     }
 }
