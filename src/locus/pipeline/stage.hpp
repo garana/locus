@@ -60,6 +60,12 @@ class PipelineStage {
      */
     bool run(int in_fd, int out_fd);
 
+    /** Clears this stage's KV state so it can serve a fresh sequence:
+     * releases the sequence's cache blocks and resets its position.
+     * serve_stage calls this between sessions when it re-accepts after
+     * a connection ends. */
+    void reset();
+
     bool is_first() const { return layer_begin_ == 0; }
     bool is_last() const { return layer_end_ == n_layers_; }
 
