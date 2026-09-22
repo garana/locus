@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -45,50 +46,118 @@ int port_of(int fd) {
     return -1;
 }
 
+// Parses a numeric address into `out` (big-endian, v4 uses first 4)
+// and its family. @returns false if `s` is not a valid v4/v6 literal.
+bool parse_addr(const std::string& s, AddrFamily& fam,
+                std::array<std::uint8_t, 16>& out) {
+    out.fill(0);
+    if (s.find(':') != std::string::npos) {
+        in6_addr a6;
+        if (::inet_pton(AF_INET6, s.c_str(), &a6) != 1) {
+            return false;
+        }
+        std::memcpy(out.data(), &a6, 16);
+        fam = AddrFamily::kV6;
+        return true;
+    }
+    in_addr a4;
+    if (::inet_pton(AF_INET, s.c_str(), &a4) != 1) {
+        return false;
+    }
+    std::memcpy(out.data(), &a4, 4);
+    fam = AddrFamily::kV4;
+    return true;
+}
+
+// Zeroes the address bits beyond `bits` in the first `len` bytes.
+void mask_bytes(std::uint8_t* p, int bits, int len) {
+    for (int i = 0; i < len; ++i) {
+        if (bits >= (i + 1) * 8) {
+            continue;  // whole byte kept
+        }
+        if (bits <= i * 8) {
+            p[i] = 0;  // whole byte dropped
+            continue;
+        }
+        const int rem = bits - i * 8;  // 1..7 kept bits
+        p[i] &= static_cast<std::uint8_t>(0xFF << (8 - rem));
+    }
+}
+
+// @returns true if the first `bits` bits of a and b are equal.
+bool prefix_match(const std::uint8_t* a, const std::uint8_t* b,
+                  int bits) {
+    const int full = bits / 8;
+    const int rem = bits % 8;
+    if (full > 0 && std::memcmp(a, b, full) != 0) {
+        return false;
+    }
+    if (rem != 0) {
+        const std::uint8_t m = static_cast<std::uint8_t>(0xFF << (8 - rem));
+        if ((a[full] & m) != (b[full] & m)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
-std::optional<CidrV4> CidrV4::parse(const std::string& s) {
-    std::string ip = s;
-    int bits = 32;
+std::optional<Cidr> Cidr::parse(const std::string& s) {
+    std::string addr = s;
+    // Keep the prefix as a long until it is range-checked against the
+    // family's max: narrowing to int first would let a value that
+    // wraps into range (e.g. 2^32 + 8) be accepted as a smaller prefix.
+    long bits = -1;
     const auto slash = s.find('/');
     if (slash != std::string::npos) {
-        ip = s.substr(0, slash);
+        addr = s.substr(0, slash);
         const std::string nb = s.substr(slash + 1);
         if (nb.empty()) {
             return std::nullopt;
         }
         char* end = nullptr;
         const long v = std::strtol(nb.c_str(), &end, 10);
-        if (*end != '\0' || v < 0 || v > 32) {
+        if (*end != '\0' || v < 0) {
             return std::nullopt;
         }
-        bits = static_cast<int>(v);
+        bits = v;
     }
-    in_addr a;
-    if (::inet_pton(AF_INET, ip.c_str(), &a) != 1) {
+    Cidr c;
+    if (!parse_addr(addr, c.family, c.net)) {
         return std::nullopt;
     }
-    CidrV4 c;
-    c.mask = bits == 0 ? 0u : (0xFFFFFFFFu << (32 - bits));
-    c.network = ntohl(a.s_addr) & c.mask;
+    const long max_bits = c.family == AddrFamily::kV4 ? 32 : 128;
+    if (bits < 0) {
+        bits = max_bits;  // bare address == full-length prefix
+    }
+    if (bits > max_bits) {  // checked on the long, before narrowing
+        return std::nullopt;
+    }
+    c.bits = static_cast<std::uint8_t>(bits);
+    mask_bytes(c.net.data(), static_cast<int>(bits),
+               c.family == AddrFamily::kV4 ? 4 : 16);
     return c;
 }
 
-bool CidrV4::contains(const std::string& ipv4) const {
-    in_addr a;
-    if (::inet_pton(AF_INET, ipv4.c_str(), &a) != 1) {
+bool Cidr::contains(const std::string& ip) const {
+    AddrFamily fam;
+    std::array<std::uint8_t, 16> b;
+    if (!parse_addr(ip, fam, b)) {
         return false;
     }
-    return (ntohl(a.s_addr) & mask) == network;
+    if (fam != family) {
+        return false;
+    }
+    return prefix_match(net.data(), b.data(), bits);
 }
 
-bool ip_allowed(const std::string& ipv4,
-                const std::vector<CidrV4>& allow) {
+bool ip_allowed(const std::string& ip, const std::vector<Cidr>& allow) {
     if (allow.empty()) {
         return true;  // empty allowlist = allow all
     }
     for (const auto& c : allow) {
-        if (c.contains(ipv4)) {
+        if (c.contains(ip)) {
             return true;
         }
     }
@@ -108,19 +177,34 @@ int listen_on(const std::string& host, int port, int* out_port) {
         return -1;
     }
     int fd = -1;
-    for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
-        fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd < 0) {
-            continue;
+    // Prefer an IPv6 (dual-stack) socket so the wildcard bind behaves
+    // the same regardless of the host's getaddrinfo ordering. Pass 0
+    // tries AF_INET6 candidates; pass 1 the rest.
+    for (int pass = 0; pass < 2 && fd < 0; ++pass) {
+        for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
+            const bool is6 = p->ai_family == AF_INET6;
+            if ((pass == 0) != is6) {
+                continue;
+            }
+            fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+            if (fd < 0) {
+                continue;
+            }
+            int one = 1;
+            ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one,
+                         sizeof(one));
+            if (is6) {
+                int v6only = 0;  // accept IPv4-mapped too (dual-stack)
+                ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only,
+                             sizeof(v6only));
+            }
+            if (::bind(fd, p->ai_addr, p->ai_addrlen) == 0 &&
+                ::listen(fd, 16) == 0) {
+                break;
+            }
+            ::close(fd);
+            fd = -1;
         }
-        int one = 1;
-        ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        if (::bind(fd, p->ai_addr, p->ai_addrlen) == 0 &&
-            ::listen(fd, 16) == 0) {
-            break;  // bound + listening
-        }
-        ::close(fd);
-        fd = -1;
     }
     ::freeaddrinfo(res);
     if (fd < 0) {
@@ -152,10 +236,17 @@ int accept_one(int listen_fd, std::string* peer_ip) {
                     &reinterpret_cast<sockaddr_in*>(&ss)->sin_addr, buf,
                     sizeof(buf));
             } else if (ss.ss_family == AF_INET6) {
-                ::inet_ntop(
-                    AF_INET6,
-                    &reinterpret_cast<sockaddr_in6*>(&ss)->sin6_addr,
-                    buf, sizeof(buf));
+                auto* s6 = reinterpret_cast<sockaddr_in6*>(&ss);
+                if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
+                    // ::ffff:a.b.c.d -> a.b.c.d, so an IPv4 rule matches
+                    // an IPv4 client on a dual-stack socket.
+                    ::inet_ntop(AF_INET,
+                                &s6->sin6_addr.s6_addr[12], buf,
+                                sizeof(buf));
+                } else {
+                    ::inet_ntop(AF_INET6, &s6->sin6_addr, buf,
+                                sizeof(buf));
+                }
             }
             *peer_ip = buf;
         }
@@ -183,7 +274,7 @@ int connect_to(const std::string& host, int port) {
         }
         if (::connect(fd, p->ai_addr, p->ai_addrlen) == 0) {
             set_conn_opts(fd);
-            break;  // connected
+            break;
         }
         ::close(fd);
         fd = -1;

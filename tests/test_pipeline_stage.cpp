@@ -267,8 +267,8 @@ TEST_CASE("pipeline serve_stage chain reproduces generation",
         PipelineStage s0(model, 0, k);
         PipelineStage s1(model, k, L);
         // Restrict incoming to loopback (exercises the allowlist path).
-        const std::vector<locus::pipeline::CidrV4> allow{
-            *locus::pipeline::CidrV4::parse("127.0.0.0/8")};
+        const std::vector<locus::pipeline::Cidr> allow{
+            *locus::pipeline::Cidr::parse("127.0.0.0/8")};
 
         std::atomic<int> r0{-1}, r1{-1};
         std::thread t0([&] {

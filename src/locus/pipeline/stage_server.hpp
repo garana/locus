@@ -23,7 +23,7 @@ namespace locus::pipeline {
  *     failure or a stage error.
  */
 bool serve_stage(PipelineStage& stage, int listen_fd,
-                 const std::vector<CidrV4>& allow,
+                 const std::vector<Cidr>& allow,
                  const std::string& downstream_host,
                  int downstream_port);
 

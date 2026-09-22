@@ -24,15 +24,32 @@ const char* kUsage =
     "addresses may connect and is repeatable (e.g. --allow 10.0.0.0/8);\n"
     "with no --allow, any peer may connect.\n";
 
-// Splits "host:port" on the LAST colon (host may be empty).
+// Splits "host:port". Accepts a bracketed IPv6 host "[::1]:port"
+// (brackets stripped) as well as "host:port" and ":port" (empty host
+// == wildcard); a bare IPv6 literal would be ambiguous, so brackets
+// are the way to give one.
 bool split_hostport(const std::string& s, std::string& host,
                     int& port) {
-    const auto c = s.rfind(':');
-    if (c == std::string::npos) {
-        return false;
+    std::string p;
+    if (!s.empty() && s.front() == '[') {
+        const auto close = s.find(']');
+        if (close == std::string::npos) {
+            return false;
+        }
+        host = s.substr(1, close - 1);
+        std::string rest = s.substr(close + 1);
+        if (rest.empty() || rest.front() != ':') {
+            return false;
+        }
+        p = rest.substr(1);
+    } else {
+        const auto c = s.rfind(':');
+        if (c == std::string::npos) {
+            return false;
+        }
+        host = s.substr(0, c);
+        p = s.substr(c + 1);
     }
-    host = s.substr(0, c);
-    const std::string p = s.substr(c + 1);
     if (p.empty()) {
         return false;
     }
@@ -119,9 +136,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "bad --downstream (want HOST:PORT)\n");
         return 2;
     }
-    std::vector<locus::pipeline::CidrV4> allow;
+    std::vector<locus::pipeline::Cidr> allow;
     for (const auto& s : allow_str) {
-        const auto c = locus::pipeline::CidrV4::parse(s);
+        const auto c = locus::pipeline::Cidr::parse(s);
         if (!c) {
             std::fprintf(stderr, "bad --allow CIDR: %s\n", s.c_str());
             return 2;
