@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -371,4 +372,42 @@ TEST_CASE("pipeline wildcard/::1 listen + allowlist", "[pipeline]") {
         ::close(s);
         ::close(lfd);
     }
+}
+
+TEST_CASE("pipeline connect_to fails fast on a dead port",
+          "[pipeline]") {
+    // Reserve then release a port so nothing is listening there.
+    int port = 0;
+    const int l = locus::pipeline::listen_on("127.0.0.1", 0, &port);
+    REQUIRE(l >= 0);
+    ::close(l);
+    // The non-blocking connect must return failure quickly (refused),
+    // not hang on the multi-second OS default.
+    const auto t0 = std::chrono::steady_clock::now();
+    const int c = locus::pipeline::connect_to("127.0.0.1", port, 500);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    REQUIRE(c < 0);
+    REQUIRE(ms < 2000);
+    if (c >= 0) {
+        ::close(c);
+    }
+}
+
+TEST_CASE("pipeline recv timeout yields kTimeout", "[pipeline]") {
+    int fds[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    locus::pipeline::set_recv_timeout(fds[0], 100);  // 100 ms
+    Message m;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto r = locus::pipeline::read_message(fds[0], m);  // no data
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    REQUIRE(r == ReadResult::kTimeout);
+    REQUIRE(ms >= 80);    // waited about the timeout
+    REQUIRE(ms < 2000);
+    ::close(fds[0]);
+    ::close(fds[1]);
 }

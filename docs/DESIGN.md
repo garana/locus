@@ -1062,7 +1062,9 @@ pipeline parallelism sits one level above it.
   activations in, a remote-output sink ships them downstream; the
   last stage samples and streams tokens back to the entry host.
 - Health checks: a dead stage stalls the chain, so it needs detection
-  and a clean error.
+  and a clean error. A successful connect (the current health signal)
+  only proves the downstream's listener is up, not that its stage is
+  healthy; true liveness needs an app-level probe.
 
 Exit test: a two-host layer split produces byte-identical output to
 the single-host run for the same prompt and seed; under concurrency

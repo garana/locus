@@ -22,7 +22,18 @@ const char* kUsage =
     "sends its output to --downstream. --listen HOST may be empty for\n"
     "the wildcard address (\":PORT\"). --allow restricts which peer\n"
     "addresses may connect and is repeatable (e.g. --allow 10.0.0.0/8);\n"
-    "with no --allow, any peer may connect.\n";
+    "with no --allow, any peer may connect.\n"
+    "\n"
+    "Timeouts / reconnect (milliseconds):\n"
+    "  --connect-timeout N     downstream connect timeout "
+    "(default 5000; 0 = OS default)\n"
+    "  --reconnect-wait N      fixed wait between downstream connect\n"
+    "                          attempts, no backoff (default 1000; a\n"
+    "                          0 with retry-forever spins, so avoid it)\n"
+    "  --reconnect-attempts N  give up after N attempts "
+    "(default 0 = retry forever)\n"
+    "  --read-timeout N        input read timeout "
+    "(default 0 = block; else a stall fails the stage)\n";
 
 // Splits "host:port". Accepts a bracketed IPv6 host "[::1]:port"
 // (brackets stripped) as well as "host:port" and ":port" (empty host
@@ -87,6 +98,19 @@ bool parse_layers(const std::string& s, std::uint32_t& a,
 int main(int argc, char** argv) {
     std::string model_path, layers, listen, downstream;
     std::vector<std::string> allow_str;
+    int reconnect_wait = 1000, connect_timeout = 5000, read_timeout = 0,
+        reconnect_attempts = 0;
+    const auto as_int = [](const std::string& v,
+                           const char* name) -> int {
+        char* e = nullptr;
+        const long x = std::strtol(v.c_str(), &e, 10);
+        if (*e != '\0' || x < 0 || x > 2147483647L) {
+            std::fprintf(stderr, "%s must be a non-negative integer\n",
+                         name);
+            std::exit(2);
+        }
+        return static_cast<int>(x);
+    };
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* name) -> std::string {
@@ -106,6 +130,18 @@ int main(int argc, char** argv) {
             downstream = next("--downstream");
         } else if (a == "--allow") {
             allow_str.push_back(next("--allow"));
+        } else if (a == "--reconnect-wait") {
+            reconnect_wait =
+                as_int(next("--reconnect-wait"), "--reconnect-wait");
+        } else if (a == "--connect-timeout") {
+            connect_timeout =
+                as_int(next("--connect-timeout"), "--connect-timeout");
+        } else if (a == "--read-timeout") {
+            read_timeout =
+                as_int(next("--read-timeout"), "--read-timeout");
+        } else if (a == "--reconnect-attempts") {
+            reconnect_attempts = as_int(next("--reconnect-attempts"),
+                                        "--reconnect-attempts");
         } else if (a == "-h" || a == "--help") {
             std::printf("%s", kUsage);
             return 0;
@@ -165,8 +201,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "locus-stage: layers [%u,%u) on %s -> %s\n", la,
                      lb, listen.c_str(), downstream.c_str());
-        const bool ok =
-            locus::pipeline::serve_stage(stage, lfd, allow, dh, dp);
+        locus::pipeline::StageConn conn;
+        conn.connect_timeout_ms = connect_timeout;
+        conn.reconnect_wait_ms = reconnect_wait;
+        conn.reconnect_attempts = reconnect_attempts;
+        conn.recv_timeout_ms = read_timeout;
+        const bool ok = locus::pipeline::serve_stage(stage, lfd, allow,
+                                                     dh, dp, conn);
         return ok ? 0 : 1;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "locus-stage: %s\n", e.what());
