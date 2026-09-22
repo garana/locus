@@ -245,3 +245,32 @@ TEST_CASE("pipeline transport over loopback TCP", "[pipeline]") {
     ::close(s);
     ::close(lfd);
 }
+
+TEST_CASE("pipeline CIDR v4 incoming allowlist", "[pipeline]") {
+    using locus::pipeline::CidrV4;
+    using locus::pipeline::ip_allowed;
+
+    const auto lo = CidrV4::parse("127.0.0.0/8");
+    REQUIRE(lo.has_value());
+    REQUIRE(lo->contains("127.0.0.1"));
+    REQUIRE(lo->contains("127.5.5.5"));
+    REQUIRE_FALSE(lo->contains("10.0.0.1"));
+
+    const auto host = CidrV4::parse("192.168.1.4");  // bare == /32
+    REQUIRE(host.has_value());
+    REQUIRE(host->contains("192.168.1.4"));
+    REQUIRE_FALSE(host->contains("192.168.1.5"));
+
+    const auto any = CidrV4::parse("0.0.0.0/0");
+    REQUIRE(any.has_value());
+    REQUIRE(any->contains("8.8.8.8"));
+
+    REQUIRE_FALSE(CidrV4::parse("not-an-ip").has_value());
+    REQUIRE_FALSE(CidrV4::parse("10.0.0.0/33").has_value());
+
+    // Empty allowlist = allow all; non-empty = only matching ranges.
+    REQUIRE(ip_allowed("1.2.3.4", {}));
+    const std::vector<CidrV4> allow{*CidrV4::parse("10.0.0.0/8")};
+    REQUIRE(ip_allowed("10.9.9.9", allow));
+    REQUIRE_FALSE(ip_allowed("127.0.0.1", allow));
+}
