@@ -41,6 +41,7 @@ add_library(locus
     src/locus/pipeline/message.cpp
     src/locus/pipeline/net.cpp
     src/locus/pipeline/stage.cpp
+    src/locus/pipeline/stage_server.cpp
     src/locus/server/engine_loop.cpp
     src/locus/server/server.cpp
     src/locus/server/tools.cpp
@@ -68,6 +69,9 @@ target_link_libraries(locus-gguf PRIVATE locus)
 
 add_executable(locus-auth-helper tools/auth_helper_main.cpp)
 target_link_libraries(locus-auth-helper PRIVATE locus)
+
+add_executable(locus-stage tools/stage_main.cpp)
+target_link_libraries(locus-stage PRIVATE locus)
 target_include_directories(locus PUBLIC src)
 
 # ----------------------------------------------------------------
