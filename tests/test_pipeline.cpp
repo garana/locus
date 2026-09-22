@@ -246,31 +246,129 @@ TEST_CASE("pipeline transport over loopback TCP", "[pipeline]") {
     ::close(lfd);
 }
 
-TEST_CASE("pipeline CIDR v4 incoming allowlist", "[pipeline]") {
-    using locus::pipeline::CidrV4;
+TEST_CASE("pipeline CIDR incoming allowlist (v4 and v6)",
+          "[pipeline]") {
+    using locus::pipeline::Cidr;
     using locus::pipeline::ip_allowed;
 
-    const auto lo = CidrV4::parse("127.0.0.0/8");
-    REQUIRE(lo.has_value());
-    REQUIRE(lo->contains("127.0.0.1"));
-    REQUIRE(lo->contains("127.5.5.5"));
-    REQUIRE_FALSE(lo->contains("10.0.0.1"));
+    SECTION("IPv4") {
+        const auto lo = Cidr::parse("127.0.0.0/8");
+        REQUIRE(lo.has_value());
+        REQUIRE(lo->contains("127.0.0.1"));
+        REQUIRE(lo->contains("127.5.5.5"));
+        REQUIRE_FALSE(lo->contains("10.0.0.1"));
 
-    const auto host = CidrV4::parse("192.168.1.4");  // bare == /32
-    REQUIRE(host.has_value());
-    REQUIRE(host->contains("192.168.1.4"));
-    REQUIRE_FALSE(host->contains("192.168.1.5"));
+        const auto host = Cidr::parse("192.168.1.4");  // bare == /32
+        REQUIRE(host.has_value());
+        REQUIRE(host->contains("192.168.1.4"));
+        REQUIRE_FALSE(host->contains("192.168.1.5"));
 
-    const auto any = CidrV4::parse("0.0.0.0/0");
-    REQUIRE(any.has_value());
-    REQUIRE(any->contains("8.8.8.8"));
+        const auto any = Cidr::parse("0.0.0.0/0");
+        REQUIRE(any.has_value());
+        REQUIRE(any->contains("8.8.8.8"));
+    }
 
-    REQUIRE_FALSE(CidrV4::parse("not-an-ip").has_value());
-    REQUIRE_FALSE(CidrV4::parse("10.0.0.0/33").has_value());
+    SECTION("IPv6") {
+        const auto doc = Cidr::parse("2001:db8::/32");
+        REQUIRE(doc.has_value());
+        REQUIRE(doc->contains("2001:db8:1234::1"));
+        REQUIRE_FALSE(doc->contains("2001:dead::1"));
 
-    // Empty allowlist = allow all; non-empty = only matching ranges.
-    REQUIRE(ip_allowed("1.2.3.4", {}));
-    const std::vector<CidrV4> allow{*CidrV4::parse("10.0.0.0/8")};
-    REQUIRE(ip_allowed("10.9.9.9", allow));
-    REQUIRE_FALSE(ip_allowed("127.0.0.1", allow));
+        const auto lo6 = Cidr::parse("::1");  // bare == /128
+        REQUIRE(lo6.has_value());
+        REQUIRE(lo6->contains("::1"));
+        REQUIRE_FALSE(lo6->contains("::2"));
+
+        // Family mismatch never matches.
+        REQUIRE_FALSE(doc->contains("10.0.0.1"));
+        REQUIRE_FALSE(Cidr::parse("10.0.0.0/8")->contains("::1"));
+    }
+
+    SECTION("malformed") {
+        REQUIRE_FALSE(Cidr::parse("not-an-ip").has_value());
+        REQUIRE_FALSE(Cidr::parse("10.0.0.0/33").has_value());
+        REQUIRE_FALSE(Cidr::parse("2001:db8::/129").has_value());
+        // Out-of-range prefix must be rejected on the parsed long, not
+        // silently narrowed into range (2^32 + 8 must not become /8).
+        REQUIRE_FALSE(Cidr::parse("10.0.0.0/4294967304").has_value());
+        REQUIRE_FALSE(Cidr::parse("2001:db8::/4294967360").has_value());
+    }
+
+    SECTION("ip_allowed: empty = allow all; else only matches") {
+        REQUIRE(ip_allowed("1.2.3.4", {}));
+        REQUIRE(ip_allowed("::1", {}));
+        const std::vector<Cidr> allow{*Cidr::parse("10.0.0.0/8"),
+                                      *Cidr::parse("::1/128")};
+        REQUIRE(ip_allowed("10.9.9.9", allow));
+        REQUIRE(ip_allowed("::1", allow));
+        REQUIRE_FALSE(ip_allowed("127.0.0.1", allow));
+        REQUIRE_FALSE(ip_allowed("::2", allow));
+    }
+}
+
+// Regression: a wildcard bind on a dual-stack host takes IPv4 clients
+// as v4-mapped IPv6; accept_one must normalize them to a dotted quad so
+// a v4 allowlist rule matches. Also covers the "::1" bind path.
+TEST_CASE("pipeline wildcard/::1 listen + allowlist", "[pipeline]") {
+    using locus::pipeline::Cidr;
+
+    SECTION("wildcard bind, IPv4 client normalized + allowed") {
+        int port = 0;
+        const int lfd = locus::pipeline::listen_on("", 0, &port);
+        REQUIRE(lfd >= 0);
+        REQUIRE(port > 0);
+        std::atomic<bool> ok{false};
+        std::thread client([&] {
+            const int c = locus::pipeline::connect_to("127.0.0.1", port);
+            if (c >= 0) {
+                ok = locus::pipeline::write_message(
+                    c, locus::pipeline::make_token(1, 0, 5));
+                ::close(c);
+            }
+        });
+        std::string peer;
+        const int s = locus::pipeline::accept_one(lfd, &peer);
+        REQUIRE(s >= 0);
+        REQUIRE(peer == "127.0.0.1");  // v4-mapped normalized to quad
+        const std::vector<Cidr> allow{*Cidr::parse("127.0.0.0/8")};
+        REQUIRE(locus::pipeline::ip_allowed(peer, allow));
+        Message m;
+        REQUIRE(locus::pipeline::read_message(s, m) == ReadResult::kOk);
+        REQUIRE(m.token == 5);
+        client.join();
+        REQUIRE(ok.load());
+        ::close(s);
+        ::close(lfd);
+    }
+
+    SECTION("IPv6 loopback bind, v6 client allowed") {
+        int port = 0;
+        const int lfd = locus::pipeline::listen_on("::1", 0, &port);
+        if (lfd < 0) {
+            SKIP("no IPv6 loopback on this host");
+        }
+        REQUIRE(port > 0);
+        std::atomic<bool> ok{false};
+        std::thread client([&] {
+            const int c = locus::pipeline::connect_to("::1", port);
+            if (c >= 0) {
+                ok = locus::pipeline::write_message(
+                    c, locus::pipeline::make_token(1, 0, 9));
+                ::close(c);
+            }
+        });
+        std::string peer;
+        const int s = locus::pipeline::accept_one(lfd, &peer);
+        REQUIRE(s >= 0);
+        REQUIRE(peer == "::1");
+        const std::vector<Cidr> allow{*Cidr::parse("::1/128")};
+        REQUIRE(locus::pipeline::ip_allowed(peer, allow));
+        Message m;
+        REQUIRE(locus::pipeline::read_message(s, m) == ReadResult::kOk);
+        REQUIRE(m.token == 9);
+        client.join();
+        REQUIRE(ok.load());
+        ::close(s);
+        ::close(lfd);
+    }
 }
