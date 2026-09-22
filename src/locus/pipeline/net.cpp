@@ -361,4 +361,31 @@ void set_recv_timeout(int fd, int ms) {
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
+void set_keepalive(int fd, int idle_s, int intvl_s, int count) {
+    const int on = idle_s > 0 ? 1 : 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+    if (on == 0) {
+        return;  // keepalive disabled
+    }
+#if defined(TCP_KEEPIDLE)
+    ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_s,
+                 sizeof(idle_s));  // Linux: idle seconds
+#elif defined(TCP_KEEPALIVE)
+    ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle_s,
+                 sizeof(idle_s));  // macOS/BSD: idle seconds
+#endif
+#if defined(TCP_KEEPINTVL)
+    if (intvl_s > 0) {
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl_s,
+                     sizeof(intvl_s));
+    }
+#endif
+#if defined(TCP_KEEPCNT)
+    if (count > 0) {
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count,
+                     sizeof(count));
+    }
+#endif
+}
+
 }  // namespace locus::pipeline

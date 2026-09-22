@@ -270,17 +270,21 @@ TEST_CASE("pipeline serve_stage chain reproduces generation",
         // Restrict incoming to loopback (exercises the allowlist path).
         const std::vector<locus::pipeline::Cidr> allow{
             *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+        // One session then return (serve_stage otherwise serves
+        // forever, re-accepting after each disconnect).
+        locus::pipeline::StageConn conn;
+        conn.serve_sessions = 1;
 
         std::atomic<int> r0{-1}, r1{-1};
         std::thread t0([&] {
             r0 = locus::pipeline::serve_stage(s0, l0, allow,
-                                              "127.0.0.1", p1)
+                                              "127.0.0.1", p1, conn)
                      ? 1
                      : 0;
         });
         std::thread t1([&] {
             r1 = locus::pipeline::serve_stage(s1, l1, allow,
-                                              "127.0.0.1", pe)
+                                              "127.0.0.1", pe, conn)
                      ? 1
                      : 0;
         });
@@ -396,4 +400,119 @@ TEST_CASE("serve_stage reconnect gives up after N attempts",
     REQUIRE(ms >= 90);            // ~2 reconnect waits of 50 ms
     REQUIRE(ms < 4000);
     ::close(cin);  // lin and the accepted input fd are closed by serve_stage
+}
+
+// #15: serve_stage loops to re-serve successive sessions (automatic
+// reconnect), and PipelineStage::reset() gives each session a clean
+// sequence -- so a second client after the first disconnects gets a
+// byte-exact result, not one contaminated by the first session's KV.
+TEST_CASE("serve_stage re-serves sessions with reset",
+          "[pipeline][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const std::uint32_t V = model.hparams().n_vocab;
+    const auto prompt =
+        tok.encode("Once upon a time, there was a little", true);
+    constexpr int kGen = 12;
+
+    auto mono = [&]() {
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(V);
+        for (auto t : prompt) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(t, cache, seq, ws, logits);
+        }
+        std::vector<locus::tok::TokenId> gen;
+        for (int i = 0; i < kGen; ++i) {
+            const auto n = locus::model::argmax(logits);
+            gen.push_back(n);
+            if (n == tok.eos_id()) {
+                break;
+            }
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(n, cache, seq, ws, logits);
+        }
+        return gen;
+    };
+    const auto ref = mono();
+
+    // One stage covering all layers (first + last): input kToken,
+    // output kLogits back to the entry.
+    PipelineStage stage(model, 0, L);
+    int pin = 0, pe = 0;
+    const int lin = locus::pipeline::listen_on("127.0.0.1", 0, &pin);
+    const int le = locus::pipeline::listen_on("127.0.0.1", 0, &pe);
+    REQUIRE(lin >= 0);
+    REQUIRE(le >= 0);
+
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 2;
+    conn.connect_timeout_ms = 1000;
+    conn.reconnect_wait_ms = 50;
+    std::atomic<int> result{-1};
+    std::thread th([&] {
+        result = locus::pipeline::serve_stage(stage, lin, {},
+                                              "127.0.0.1", pe, conn)
+                     ? 1
+                     : 0;
+    });
+
+    for (int session = 0; session < 2; ++session) {
+        const int w = locus::pipeline::connect_to("127.0.0.1", pin);
+        REQUIRE(w >= 0);  // stage accepts this as input
+        const int r = locus::pipeline::accept_one(le, nullptr);
+        REQUIRE(r >= 0);  // stage connected downstream -> entry accepts
+
+        bool flow = true;
+        std::uint32_t pos = 0;
+        std::vector<float> logits;
+        auto round_trip = [&](locus::tok::TokenId t) {
+            const Message in = locus::pipeline::make_token(1, pos, t);
+            if (!locus::pipeline::write_message(w, in)) {
+                flow = false;
+                return;
+            }
+            Message lg;
+            if (locus::pipeline::read_message(r, lg) !=
+                    ReadResult::kOk ||
+                lg.type != MsgType::kLogits) {
+                flow = false;
+                return;
+            }
+            logits = std::move(lg.data);
+            ++pos;
+        };
+
+        std::vector<locus::tok::TokenId> gen;
+        for (auto t : prompt) {
+            round_trip(t);
+            if (!flow) {
+                break;
+            }
+        }
+        for (int i = 0; i < kGen && flow; ++i) {
+            const auto n = locus::model::argmax(logits);
+            gen.push_back(n);
+            if (n == tok.eos_id()) {
+                break;
+            }
+            round_trip(n);
+        }
+        ::close(w);  // EOF ends the session; serve_stage re-accepts
+        ::close(r);
+        CAPTURE(session);
+        REQUIRE(flow);
+        REQUIRE(gen == ref);  // reset() -> clean sequence each session
+    }
+
+    th.join();
+    ::close(le);
+    REQUIRE(result.load() == 1);  // served 2 sessions, then returned
 }

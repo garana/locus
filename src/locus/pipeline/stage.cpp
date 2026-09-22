@@ -105,4 +105,9 @@ bool PipelineStage::run(int in_fd, int out_fd) {
     return ok;
 }
 
+void PipelineStage::reset() {
+    cache_.release(seq_);
+    seq_ = kv::PagedKvCache::Seq{};
+}
+
 }  // namespace locus::pipeline

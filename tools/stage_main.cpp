@@ -33,7 +33,15 @@ const char* kUsage =
     "  --reconnect-attempts N  give up after N attempts "
     "(default 0 = retry forever)\n"
     "  --read-timeout N        input read timeout "
-    "(default 0 = block; else a stall fails the stage)\n";
+    "(default 0 = block; else a stall fails the stage)\n"
+    "\n"
+    "TCP keepalive (seconds) + sessions:\n"
+    "  --keepalive-idle N      idle before the first probe "
+    "(default 5; 0 disables keepalive)\n"
+    "  --keepalive-interval N  seconds between probes (default 2)\n"
+    "  --keepalive-count N     unacked probes before drop (default 3)\n"
+    "  --sessions N            serve N sessions then exit "
+    "(default 0 = serve forever; re-accept on each disconnect)\n";
 
 // Splits "host:port". Accepts a bracketed IPv6 host "[::1]:port"
 // (brackets stripped) as well as "host:port" and ":port" (empty host
@@ -99,7 +107,8 @@ int main(int argc, char** argv) {
     std::string model_path, layers, listen, downstream;
     std::vector<std::string> allow_str;
     int reconnect_wait = 1000, connect_timeout = 5000, read_timeout = 0,
-        reconnect_attempts = 0;
+        reconnect_attempts = 0, keepalive_idle = 5, keepalive_intvl = 2,
+        keepalive_count = 3, sessions = 0;
     const auto as_int = [](const std::string& v,
                            const char* name) -> int {
         char* e = nullptr;
@@ -142,6 +151,17 @@ int main(int argc, char** argv) {
         } else if (a == "--reconnect-attempts") {
             reconnect_attempts = as_int(next("--reconnect-attempts"),
                                         "--reconnect-attempts");
+        } else if (a == "--keepalive-idle") {
+            keepalive_idle =
+                as_int(next("--keepalive-idle"), "--keepalive-idle");
+        } else if (a == "--keepalive-interval") {
+            keepalive_intvl = as_int(next("--keepalive-interval"),
+                                     "--keepalive-interval");
+        } else if (a == "--keepalive-count") {
+            keepalive_count =
+                as_int(next("--keepalive-count"), "--keepalive-count");
+        } else if (a == "--sessions") {
+            sessions = as_int(next("--sessions"), "--sessions");
         } else if (a == "-h" || a == "--help") {
             std::printf("%s", kUsage);
             return 0;
@@ -206,6 +226,10 @@ int main(int argc, char** argv) {
         conn.reconnect_wait_ms = reconnect_wait;
         conn.reconnect_attempts = reconnect_attempts;
         conn.recv_timeout_ms = read_timeout;
+        conn.keepalive_idle_s = keepalive_idle;
+        conn.keepalive_intvl_s = keepalive_intvl;
+        conn.keepalive_count = keepalive_count;
+        conn.serve_sessions = sessions;
         const bool ok = locus::pipeline::serve_stage(stage, lfd, allow,
                                                      dh, dp, conn);
         return ok ? 0 : 1;

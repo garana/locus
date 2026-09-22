@@ -84,4 +84,20 @@ int connect_to(const std::string& host, int port, int timeout_ms = 0);
  */
 void set_recv_timeout(int fd, int ms);
 
+/**
+ * Enables and tunes TCP keepalive on `fd` so a silently-dropped peer
+ * (crash, cable pull, NAT timeout) is detected in a bounded time
+ * instead of a half-open connection hanging forever. idle_s <= 0
+ * disables keepalive.
+ *
+ * Detection takes roughly idle_s + intvl_s * count seconds. Per-OS
+ * knobs: Linux TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT; macOS/BSD
+ * TCP_KEEPALIVE (idle) plus TCP_KEEPINTVL/TCP_KEEPCNT where available.
+ *
+ * @param idle_s  Idle seconds before the first probe (<= 0 disables).
+ * @param intvl_s Seconds between probes.
+ * @param count   Unacked probes before the connection is dropped.
+ */
+void set_keepalive(int fd, int idle_s, int intvl_s, int count);
+
 }  // namespace locus::pipeline

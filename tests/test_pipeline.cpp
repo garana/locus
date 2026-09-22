@@ -411,3 +411,26 @@ TEST_CASE("pipeline recv timeout yields kTimeout", "[pipeline]") {
     ::close(fds[0]);
     ::close(fds[1]);
 }
+
+TEST_CASE("pipeline set_keepalive toggles SO_KEEPALIVE", "[pipeline]") {
+    int port = 0;
+    const int l = locus::pipeline::listen_on("127.0.0.1", 0, &port);
+    REQUIRE(l >= 0);
+    const int c = locus::pipeline::connect_to("127.0.0.1", port);
+    REQUIRE(c >= 0);
+    const int s = locus::pipeline::accept_one(l);
+    REQUIRE(s >= 0);
+
+    int on = -1;
+    socklen_t sl = sizeof(on);
+    locus::pipeline::set_keepalive(c, 5, 2, 3);  // enable
+    REQUIRE(::getsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &on, &sl) == 0);
+    REQUIRE(on != 0);  // enabled (macOS reads back the flag bit, not 1)
+    locus::pipeline::set_keepalive(c, 0, 2, 3);  // idle<=0 disables
+    REQUIRE(::getsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &on, &sl) == 0);
+    REQUIRE(on == 0);
+
+    ::close(c);
+    ::close(s);
+    ::close(l);
+}
