@@ -105,9 +105,13 @@ bool write_message(int fd, const Message& m);
 
 /** Outcome of read_message. */
 enum class ReadResult {
-    kOk,     /**< A complete message was read into `out`. */
-    kEof,    /**< Peer closed cleanly at a frame boundary. */
-    kError,  /**< Truncated frame, oversized frame, or bad data. */
+    kOk,      /**< A complete message was read into `out`. */
+    kEof,     /**< Peer closed cleanly at a frame boundary. */
+    kError,   /**< Truncated frame, oversized frame, or bad data. */
+    kTimeout, /**< Recv timeout (see set_recv_timeout) elapsed before a
+               *   complete frame arrived. TERMINAL for the connection,
+               *   like kError: a partial frame may already have been
+               *   consumed, so a caller must reconnect, not re-read. */
 };
 
 /**

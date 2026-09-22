@@ -68,9 +68,20 @@ int listen_on(const std::string& host, int port, int* out_port);
 int accept_one(int listen_fd, std::string* peer_ip = nullptr);
 
 /**
- * Connects to host:port (blocking).
- * @returns The connection fd (>= 0), or -1 on failure.
+ * Connects to host:port. With timeout_ms > 0 the connect uses a
+ * non-blocking socket and gives up after the timeout (so a dead or
+ * unreachable downstream fails fast instead of hanging on the OS
+ * default); timeout_ms == 0 is a blocking connect.
+ *
+ * @returns The connection fd (>= 0), or -1 on failure/timeout.
  */
-int connect_to(const std::string& host, int port);
+int connect_to(const std::string& host, int port, int timeout_ms = 0);
+
+/**
+ * Sets a receive timeout on `fd` (SO_RCVTIMEO): a blocking read that
+ * waits longer than `ms` fails with EAGAIN, which read_message reports
+ * as kTimeout. ms == 0 clears the timeout (block indefinitely).
+ */
+void set_recv_timeout(int fd, int ms);
 
 }  // namespace locus::pipeline

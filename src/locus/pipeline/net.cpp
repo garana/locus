@@ -1,14 +1,18 @@
 #include "locus/pipeline/net.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -255,7 +259,62 @@ int accept_one(int listen_fd, std::string* peer_ip) {
     }
 }
 
-int connect_to(const std::string& host, int port) {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+// Connects fd to (addr,len), giving up at `deadline` (time_point::max()
+// means block with the OS default). Retries poll on EINTR. Returns true
+// on success; leaves fd in blocking mode either way.
+bool connect_within(int fd, const sockaddr* addr, socklen_t len,
+                    Clock::time_point deadline) {
+    if (deadline == Clock::time_point::max()) {
+        return ::connect(fd, addr, len) == 0;  // blocking
+    }
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return false;
+    }
+    bool ok = false;
+    if (::connect(fd, addr, len) == 0) {
+        ok = true;  // connected immediately
+    } else if (errno == EINPROGRESS) {
+        for (;;) {
+            const auto now = Clock::now();
+            long rem = std::chrono::duration_cast<
+                           std::chrono::milliseconds>(deadline - now)
+                           .count();
+            if (rem < 0) {
+                rem = 0;
+            }
+            pollfd pfd{fd, POLLOUT, 0};
+            const int pr = ::poll(&pfd, 1, static_cast<int>(rem));
+            if (pr < 0) {
+                if (errno == EINTR) {
+                    continue;  // resume with the remaining budget
+                }
+                break;  // poll error
+            }
+            if (pr == 0) {
+                break;  // timed out
+            }
+            int soerr = 0;
+            socklen_t sl = sizeof(soerr);
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) ==
+                    0 &&
+                soerr == 0) {
+                ok = true;  // connection completed cleanly
+            }
+            break;
+        }
+    }
+    ::fcntl(fd, F_SETFL, flags);  // restore blocking
+    return ok;
+}
+
+}  // namespace
+
+int connect_to(const std::string& host, int port, int timeout_ms) {
     addrinfo hints;
     std::memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -266,13 +325,24 @@ int connect_to(const std::string& host, int port) {
         0) {
         return -1;
     }
+    // One deadline shared across all getaddrinfo candidates, so
+    // timeout_ms bounds the whole call rather than each address (a
+    // dual-stack host with a blackholed address otherwise costs up to
+    // 2x). max() == block with the OS default.
+    const Clock::time_point deadline =
+        timeout_ms > 0
+            ? Clock::now() + std::chrono::milliseconds(timeout_ms)
+            : Clock::time_point::max();
     int fd = -1;
     for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        if (timeout_ms > 0 && Clock::now() >= deadline) {
+            break;  // budget spent
+        }
         fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (fd < 0) {
             continue;
         }
-        if (::connect(fd, p->ai_addr, p->ai_addrlen) == 0) {
+        if (connect_within(fd, p->ai_addr, p->ai_addrlen, deadline)) {
             set_conn_opts(fd);
             break;
         }
@@ -281,6 +351,14 @@ int connect_to(const std::string& host, int port) {
     }
     ::freeaddrinfo(res);
     return fd;
+}
+
+void set_recv_timeout(int fd, int ms) {
+    // {0,0} clears the timeout (block indefinitely).
+    timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
 }  // namespace locus::pipeline

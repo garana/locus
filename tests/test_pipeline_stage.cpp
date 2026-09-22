@@ -1,4 +1,5 @@
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -341,4 +342,58 @@ TEST_CASE("pipeline serve_stage chain reproduces generation",
         CAPTURE(k);
         REQUIRE(serve_two(k) == ref);
     }
+}
+
+// #14: serve_stage retries the downstream connect on a fixed wait (no
+// backoff) and gives up after reconnect_attempts when the downstream
+// never comes up. The established connection is the health signal.
+TEST_CASE("serve_stage reconnect gives up after N attempts",
+          "[pipeline][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    // First+last stage; only its accept + downstream-connect phase runs
+    // here (the downstream never appears, so stage.run is not reached).
+    PipelineStage stage(model, 0, L);
+
+    int pin = 0;
+    const int lin = locus::pipeline::listen_on("127.0.0.1", 0, &pin);
+    REQUIRE(lin >= 0);
+    // A downstream port with nothing listening (reserve then release).
+    int pdn = 0;
+    {
+        const int t = locus::pipeline::listen_on("127.0.0.1", 0, &pdn);
+        REQUIRE(t >= 0);
+        ::close(t);
+    }
+
+    locus::pipeline::StageConn conn;
+    conn.connect_timeout_ms = 100;
+    conn.reconnect_wait_ms = 50;
+    conn.reconnect_attempts = 3;  // 2 waits between 3 attempts
+
+    std::atomic<int> result{-1};
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread th([&] {
+        result = locus::pipeline::serve_stage(stage, lin, {},
+                                              "127.0.0.1", pdn, conn)
+                     ? 1
+                     : 0;
+    });
+    // Provide the input connection so serve_stage passes its accept
+    // phase and reaches the (failing) downstream-connect loop.
+    const int cin = locus::pipeline::connect_to("127.0.0.1", pin);
+    REQUIRE(cin >= 0);
+    th.join();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+
+    REQUIRE(result.load() == 0);  // gave up: downstream never came up
+    REQUIRE(ms >= 90);            // ~2 reconnect waits of 50 ms
+    REQUIRE(ms < 4000);
+    ::close(cin);  // lin and the accepted input fd are closed by serve_stage
 }

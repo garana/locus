@@ -223,8 +223,18 @@ ReadResult read_message(int fd, Message& out) {
     if (g == 0) {
         return ReadResult::kEof;  // clean close at a frame boundary
     }
-    if (g < 0 || g != 4) {
-        return ReadResult::kError;  // error or truncated length prefix
+    if (g < 0) {
+        // A recv timeout (SO_RCVTIMEO) surfaces as EAGAIN/EWOULDBLOCK;
+        // report it distinctly (kTimeout) so a caller can tell a stalled
+        // peer from a broken one. Both are terminal for the connection:
+        // a partial frame may have been consumed, so the caller must
+        // reconnect, not re-read.
+        return (errno == EAGAIN || errno == EWOULDBLOCK)
+                   ? ReadResult::kTimeout
+                   : ReadResult::kError;
+    }
+    if (g != 4) {
+        return ReadResult::kError;  // truncated length prefix
     }
     const std::uint32_t frame_len = get_u32(lenb);
     if (frame_len < kHeaderBytes || frame_len > kMaxFrameBytes) {
@@ -233,6 +243,9 @@ ReadResult read_message(int fd, Message& out) {
     std::string payload(frame_len, '\0');
     const ssize_t p = read_some(fd, payload.data(), frame_len);
     if (p != static_cast<ssize_t>(frame_len)) {
+        if (p < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return ReadResult::kTimeout;
+        }
         return ReadResult::kError;  // close mid-frame is an error
     }
     if (!parse_payload(payload.data(), frame_len, out)) {
