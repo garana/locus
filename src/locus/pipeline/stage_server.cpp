@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <thread>
@@ -32,27 +33,49 @@ int accept_allowed(int listen_fd, const std::vector<Cidr>& allow) {
     }
 }
 
-// Connects to downstream_host:port, retrying on a fixed wait (no
-// backoff). @returns the fd, or -1 if it gives up (reconnect_attempts).
-int connect_downstream(const std::string& host, int port,
-                       const StageConn& conn) {
-    for (int attempt = 1;; ++attempt) {
-        const int fd = connect_to(host, port, conn.connect_timeout_ms);
-        if (fd >= 0) {
-            return fd;
+// Connects to one live downstream from `pool`, round-robin starting at
+// *cursor so successive sessions spread across the replicas. Each sweep
+// tries every host once, in order, and uses the first that accepts (an
+// established connection is the health check, so a dead replica is
+// skipped). A sweep that finds none live counts as one failed attempt;
+// per the reconnect policy it then waits reconnect_wait_ms and sweeps
+// again (no backoff). On success *cursor is left just past the chosen
+// host. @returns the fd, or -1 if it gives up (reconnect_attempts
+// sweeps). Precondition: `pool` is non-empty (the `% n` below divides
+// by pool.size()); serve_stage guarantees this before calling.
+int connect_pool(const std::vector<HostPort>& pool, std::size_t* cursor,
+                 const StageConn& conn) {
+    const std::size_t n = pool.size();
+    assert(n > 0 && "connect_pool requires a non-empty pool");
+    for (int sweep = 1;; ++sweep) {
+        for (std::size_t k = 0; k < n; ++k) {
+            const std::size_t idx = (*cursor + k) % n;
+            const HostPort& hp = pool[idx];
+            const int fd =
+                connect_to(hp.host, hp.port, conn.connect_timeout_ms);
+            if (fd >= 0) {
+                *cursor = (idx + 1) % n;  // next session starts here
+                return fd;
+            }
+            if (n > 1) {
+                std::fprintf(stderr,
+                             "serve_stage: downstream %s:%d unreachable, "
+                             "trying next in pool\n",
+                             hp.host.c_str(), hp.port);
+            }
         }
         if (conn.reconnect_attempts > 0 &&
-            attempt >= conn.reconnect_attempts) {
+            sweep >= conn.reconnect_attempts) {
             std::fprintf(stderr,
-                         "serve_stage: downstream %s:%d unreachable "
-                         "after %d attempt(s)\n",
-                         host.c_str(), port, attempt);
+                         "serve_stage: no live downstream in a pool of "
+                         "%zu after %d sweep(s)\n",
+                         n, sweep);
             return -1;
         }
         std::fprintf(stderr,
-                     "serve_stage: downstream %s:%d connect failed, "
-                     "retrying in %d ms\n",
-                     host.c_str(), port, conn.reconnect_wait_ms);
+                     "serve_stage: no live downstream, retrying in "
+                     "%d ms\n",
+                     conn.reconnect_wait_ms);
         std::this_thread::sleep_for(
             std::chrono::milliseconds(conn.reconnect_wait_ms));
     }
@@ -62,10 +85,16 @@ int connect_downstream(const std::string& host, int port,
 
 bool serve_stage(PipelineStage& stage, int listen_fd,
                  const std::vector<Cidr>& allow,
-                 const std::string& downstream_host,
-                 int downstream_port, const StageConn& conn) {
+                 const std::vector<HostPort>& downstreams,
+                 const StageConn& conn) {
+    if (downstreams.empty()) {
+        std::fprintf(stderr, "serve_stage: empty downstream pool\n");
+        ::close(listen_fd);
+        return false;
+    }
     int served = 0;
     bool all_clean = true;  // any session ended abnormally?
+    std::size_t cursor = 0;  // round-robin position in the pool
     for (;;) {
         // Automatic reconnect: each session re-accepts a fresh input
         // and re-dials the downstream, so a dropped peer (detected by
@@ -84,12 +113,11 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
             set_recv_timeout(in_fd, conn.recv_timeout_ms);
         }
 
-        const int out_fd =
-            connect_downstream(downstream_host, downstream_port, conn);
+        const int out_fd = connect_pool(downstreams, &cursor, conn);
         if (out_fd < 0) {
             ::close(in_fd);
             ::close(listen_fd);
-            return false;  // downstream unreachable within the budget
+            return false;  // no live downstream within the budget
         }
         set_keepalive(out_fd, conn.keepalive_idle_s,
                       conn.keepalive_intvl_s, conn.keepalive_count);
@@ -107,6 +135,14 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
             return all_clean;  // false if any session ended abnormally
         }
     }
+}
+
+bool serve_stage(PipelineStage& stage, int listen_fd,
+                 const std::vector<Cidr>& allow,
+                 const std::string& downstream_host,
+                 int downstream_port, const StageConn& conn) {
+    return serve_stage(stage, listen_fd, allow,
+                       {{downstream_host, downstream_port}}, conn);
 }
 
 }  // namespace locus::pipeline

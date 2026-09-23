@@ -15,12 +15,18 @@ namespace {
 
 const char* kUsage =
     "usage: locus-stage --model <m.gguf> --layers A:B "
-    "--listen HOST:PORT --downstream HOST:PORT [--allow CIDR]...\n"
+    "--listen HOST:PORT --downstream HOST:PORT... [--allow CIDR]...\n"
     "\n"
     "Runs one pipeline stage (multi-server, DESIGN.md R15+): accepts an\n"
     "input connection on --listen, runs the model's layers [A,B), and\n"
-    "sends its output to --downstream. --listen HOST may be empty for\n"
-    "the wildcard address (\":PORT\"). --allow restricts which peer\n"
+    "sends its output to a downstream. --listen HOST may be empty for\n"
+    "the wildcard address (\":PORT\"). --downstream is repeatable: give\n"
+    "it more than once to name a pool of interchangeable replicas (no\n"
+    "load balancer -- successive sessions round-robin across the pool,\n"
+    "and each connect uses the first replica that accepts, so a dead\n"
+    "one is skipped). A refused replica is skipped for free, but a\n"
+    "filtered (blackholed) one listed before a live one costs up to\n"
+    "--connect-timeout per session. --allow restricts which peer\n"
     "addresses may connect and is repeatable (e.g. --allow 10.0.0.0/8);\n"
     "with no --allow, any peer may connect.\n"
     "\n"
@@ -104,7 +110,8 @@ bool parse_layers(const std::string& s, std::uint32_t& a,
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model_path, layers, listen, downstream;
+    std::string model_path, layers, listen;
+    std::vector<std::string> downstream_str;
     std::vector<std::string> allow_str;
     int reconnect_wait = 1000, connect_timeout = 5000, read_timeout = 0,
         reconnect_attempts = 0, keepalive_idle = 5, keepalive_intvl = 2,
@@ -136,7 +143,7 @@ int main(int argc, char** argv) {
         } else if (a == "--listen") {
             listen = next("--listen");
         } else if (a == "--downstream") {
-            downstream = next("--downstream");
+            downstream_str.push_back(next("--downstream"));
         } else if (a == "--allow") {
             allow_str.push_back(next("--allow"));
         } else if (a == "--reconnect-wait") {
@@ -172,7 +179,7 @@ int main(int argc, char** argv) {
         }
     }
     if (model_path.empty() || layers.empty() || listen.empty() ||
-        downstream.empty()) {
+        downstream_str.empty()) {
         std::fprintf(stderr, "%s", kUsage);
         return 2;
     }
@@ -182,15 +189,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "bad --layers (want A:B with A < B)\n");
         return 2;
     }
-    std::string lh, dh;
-    int lp = 0, dp = 0;
+    std::string lh;
+    int lp = 0;
     if (!split_hostport(listen, lh, lp)) {
         std::fprintf(stderr, "bad --listen (want HOST:PORT)\n");
         return 2;
     }
-    if (!split_hostport(downstream, dh, dp)) {
-        std::fprintf(stderr, "bad --downstream (want HOST:PORT)\n");
-        return 2;
+    std::vector<locus::pipeline::HostPort> pool;
+    std::string pool_desc;  // for the startup log line
+    for (const auto& ds : downstream_str) {
+        std::string dh;
+        int dp = 0;
+        if (!split_hostport(ds, dh, dp)) {
+            std::fprintf(stderr,
+                         "bad --downstream (want HOST:PORT): %s\n",
+                         ds.c_str());
+            return 2;
+        }
+        pool.push_back({dh, dp});
+        if (!pool_desc.empty()) {
+            pool_desc += ", ";
+        }
+        pool_desc += ds;
     }
     std::vector<locus::pipeline::Cidr> allow;
     for (const auto& s : allow_str) {
@@ -220,7 +240,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr,
                      "locus-stage: layers [%u,%u) on %s -> %s\n", la,
-                     lb, listen.c_str(), downstream.c_str());
+                     lb, listen.c_str(), pool_desc.c_str());
         locus::pipeline::StageConn conn;
         conn.connect_timeout_ms = connect_timeout;
         conn.reconnect_wait_ms = reconnect_wait;
@@ -231,7 +251,7 @@ int main(int argc, char** argv) {
         conn.keepalive_count = keepalive_count;
         conn.serve_sessions = sessions;
         const bool ok = locus::pipeline::serve_stage(stage, lfd, allow,
-                                                     dh, dp, conn);
+                                                     pool, conn);
         return ok ? 0 : 1;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "locus-stage: %s\n", e.what());
