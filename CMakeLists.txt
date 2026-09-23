@@ -38,6 +38,7 @@ add_library(locus
     src/locus/model/moe_stats.cpp
     src/locus/model/sampling.cpp
     src/locus/model/speculative.cpp
+    src/locus/pipeline/driver.cpp
     src/locus/pipeline/message.cpp
     src/locus/pipeline/net.cpp
     src/locus/pipeline/stage.cpp
@@ -72,6 +73,9 @@ target_link_libraries(locus-auth-helper PRIVATE locus)
 
 add_executable(locus-stage tools/stage_main.cpp)
 target_link_libraries(locus-stage PRIVATE locus)
+
+add_executable(locus-driver tools/driver_main.cpp)
+target_link_libraries(locus-driver PRIVATE locus)
 target_include_directories(locus PUBLIC src)
 
 # ----------------------------------------------------------------

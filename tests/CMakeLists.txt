@@ -31,6 +31,7 @@ add_executable(locus_tests
     test_prefix_cache.cpp
     test_pipeline.cpp
     test_pipeline_stage.cpp
+    test_pipeline_driver.cpp
     test_grammar.cpp
     test_sampling.cpp
     test_speculative.cpp
@@ -57,7 +58,8 @@ target_include_directories(locus_tests PRIVATE
 target_compile_definitions(locus_tests PRIVATE
     LOCUS_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
     LOCUS_AUTH_HELPER_BIN="$<TARGET_FILE:locus-auth-helper>"
+    LOCUS_STAGE_BIN="$<TARGET_FILE:locus-stage>"
 )
-add_dependencies(locus_tests locus-auth-helper)
+add_dependencies(locus_tests locus-auth-helper locus-stage)
 
 add_test(NAME unit COMMAND locus_tests)
