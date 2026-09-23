@@ -516,3 +516,219 @@ TEST_CASE("serve_stage re-serves sessions with reset",
     ::close(le);
     REQUIRE(result.load() == 1);  // served 2 sessions, then returned
 }
+
+// #16: serve_stage takes a POOL of interchangeable downstream replicas
+// (no load balancer). Each connect sweeps the pool and uses the first
+// replica that accepts, so a dead one is skipped (an established
+// connection is the health check); and successive sessions round-robin
+// across the pool, so work spreads across the live replicas. Both are
+// proved end-to-end: the chain still reproduces single-process
+// generation byte-for-byte.
+TEST_CASE("serve_stage distributes across a downstream pool",
+          "[pipeline][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const std::uint32_t V = model.hparams().n_vocab;
+    REQUIRE(L >= 2);
+    const auto prompt =
+        tok.encode("Once upon a time, there was a little", true);
+    constexpr int kGen = 12;
+    const std::uint32_t k = 1;  // stage 0 = layer 0; downstream = [1, L)
+
+    auto mono = [&]() {
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(V);
+        for (auto t : prompt) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(t, cache, seq, ws, logits);
+        }
+        std::vector<locus::tok::TokenId> gen;
+        for (int i = 0; i < kGen; ++i) {
+            const auto n = locus::model::argmax(logits);
+            gen.push_back(n);
+            if (n == tok.eos_id()) {
+                break;
+            }
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(n, cache, seq, ws, logits);
+        }
+        return gen;
+    };
+    const auto ref = mono();
+
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+
+    // Drives one session over (w -> stage 0 input, r <- logits out).
+    // @returns {flow_ok, generated tokens}.
+    auto run_session = [&](int w, int r) {
+        bool flow = true;
+        std::uint32_t pos = 0;
+        std::vector<float> logits;
+        auto round_trip = [&](locus::tok::TokenId t) {
+            const Message in = locus::pipeline::make_token(1, pos, t);
+            if (!locus::pipeline::write_message(w, in)) {
+                flow = false;
+                return;
+            }
+            Message lg;
+            if (locus::pipeline::read_message(r, lg) !=
+                    ReadResult::kOk ||
+                lg.type != MsgType::kLogits) {
+                flow = false;
+                return;
+            }
+            logits = std::move(lg.data);
+            ++pos;
+        };
+        std::vector<locus::tok::TokenId> gen;
+        for (auto t : prompt) {
+            round_trip(t);
+            if (!flow) {
+                break;
+            }
+        }
+        for (int i = 0; i < kGen && flow; ++i) {
+            const auto n = locus::model::argmax(logits);
+            gen.push_back(n);
+            if (n == tok.eos_id()) {
+                break;
+            }
+            round_trip(n);
+        }
+        return std::make_pair(flow, gen);
+    };
+
+    SECTION("skips a dead replica and uses a live one") {
+        int p0 = 0, p1 = 0, pe = 0;
+        const int l0 = locus::pipeline::listen_on("127.0.0.1", 0, &p0);
+        const int l1 = locus::pipeline::listen_on("127.0.0.1", 0, &p1);
+        const int le = locus::pipeline::listen_on("127.0.0.1", 0, &pe);
+        REQUIRE(l0 >= 0);
+        REQUIRE(l1 >= 0);
+        REQUIRE(le >= 0);
+        // A downstream port with nothing listening (reserve, release).
+        int pdead = 0;
+        {
+            const int t =
+                locus::pipeline::listen_on("127.0.0.1", 0, &pdead);
+            REQUIRE(t >= 0);
+            ::close(t);
+        }
+
+        PipelineStage s0(model, 0, k);
+        PipelineStage s1(model, k, L);
+        locus::pipeline::StageConn conn0;
+        conn0.serve_sessions = 1;
+        conn0.connect_timeout_ms = 300;  // the dead one fails fast
+        conn0.reconnect_wait_ms = 50;
+        // Dead first, then the live replica -> the sweep must skip it.
+        const std::vector<locus::pipeline::HostPort> pool{
+            {"127.0.0.1", pdead}, {"127.0.0.1", p1}};
+        locus::pipeline::StageConn conn1;
+        conn1.serve_sessions = 1;
+
+        std::atomic<int> r0{-1}, r1{-1};
+        std::thread t0([&] {
+            r0 = locus::pipeline::serve_stage(s0, l0, allow, pool, conn0)
+                     ? 1
+                     : 0;
+        });
+        std::thread t1([&] {
+            r1 = locus::pipeline::serve_stage(s1, l1, allow,
+                                              "127.0.0.1", pe, conn1)
+                     ? 1
+                     : 0;
+        });
+
+        const int entry_w = locus::pipeline::connect_to("127.0.0.1", p0);
+        REQUIRE(entry_w >= 0);
+        const int entry_r = locus::pipeline::accept_one(le, nullptr);
+        REQUIRE(entry_r >= 0);
+        ::close(le);
+
+        const auto [flow, gen] = run_session(entry_w, entry_r);
+        ::close(entry_w);
+        t0.join();
+        t1.join();
+        ::close(entry_r);
+        REQUIRE(flow);
+        REQUIRE(r0.load() == 1);
+        REQUIRE(r1.load() == 1);
+        REQUIRE(gen == ref);  // dead replica skipped, live one served
+    }
+
+    SECTION("round-robins two sessions across two live replicas") {
+        int p0 = 0, pa = 0, pb = 0, pe = 0;
+        const int l0 = locus::pipeline::listen_on("127.0.0.1", 0, &p0);
+        const int la = locus::pipeline::listen_on("127.0.0.1", 0, &pa);
+        const int lb = locus::pipeline::listen_on("127.0.0.1", 0, &pb);
+        const int le = locus::pipeline::listen_on("127.0.0.1", 0, &pe);
+        REQUIRE(l0 >= 0);
+        REQUIRE(la >= 0);
+        REQUIRE(lb >= 0);
+        REQUIRE(le >= 0);
+
+        PipelineStage s0(model, 0, k);
+        PipelineStage sa(model, k, L);  // replica A of [k, L)
+        PipelineStage sb(model, k, L);  // replica B of [k, L)
+        locus::pipeline::StageConn conn0;
+        conn0.serve_sessions = 2;
+        conn0.connect_timeout_ms = 1000;
+        conn0.reconnect_wait_ms = 50;
+        const std::vector<locus::pipeline::HostPort> pool{
+            {"127.0.0.1", pa}, {"127.0.0.1", pb}};
+        locus::pipeline::StageConn conn1;
+        conn1.serve_sessions = 1;  // each replica serves exactly one
+
+        std::atomic<int> r0{-1}, ra{-1}, rb{-1};
+        std::thread t0([&] {
+            r0 = locus::pipeline::serve_stage(s0, l0, allow, pool, conn0)
+                     ? 1
+                     : 0;
+        });
+        std::thread ta([&] {
+            ra = locus::pipeline::serve_stage(sa, la, allow,
+                                              "127.0.0.1", pe, conn1)
+                     ? 1
+                     : 0;
+        });
+        std::thread tb([&] {
+            rb = locus::pipeline::serve_stage(sb, lb, allow,
+                                              "127.0.0.1", pe, conn1)
+                     ? 1
+                     : 0;
+        });
+
+        for (int session = 0; session < 2; ++session) {
+            const int w = locus::pipeline::connect_to("127.0.0.1", p0);
+            REQUIRE(w >= 0);
+            const int r = locus::pipeline::accept_one(le, nullptr);
+            REQUIRE(r >= 0);
+            const auto [flow, gen] = run_session(w, r);
+            ::close(w);
+            ::close(r);
+            CAPTURE(session);
+            REQUIRE(flow);
+            REQUIRE(gen == ref);
+        }
+
+        t0.join();
+        ta.join();
+        tb.join();
+        ::close(le);
+        REQUIRE(r0.load() == 1);  // stage 0 served both sessions cleanly
+        // Both replicas returned, so each served exactly one session:
+        // if stage 0 had not round-robined, one replica's serve_stage
+        // (serve_sessions == 1) would still be blocked in accept.
+        REQUIRE(ra.load() == 1);
+        REQUIRE(rb.load() == 1);
+    }
+}
