@@ -36,6 +36,19 @@ struct Cidr {
 bool ip_allowed(const std::string& ip, const std::vector<Cidr>& allow);
 
 /**
+ * Splits a "host:port" endpoint string (as a CLI takes) into its parts.
+ * Accepts a bracketed IPv6 literal ("[::1]:8000", brackets stripped),
+ * "host:port", and ":port" (empty host == wildcard, for a bind). A bare
+ * IPv6 literal is ambiguous with the port colon, so brackets are the
+ * way to give one. The port must be in [0, 65535].
+ *
+ * @param[out] host Receives the host part (may be empty for wildcard).
+ * @param[out] port Receives the parsed port.
+ * @returns false on a malformed string (host and port left unspecified).
+ */
+bool parse_hostport(const std::string& s, std::string& host, int& port);
+
+/**
  * TCP connection setup for pipeline-parallel inference across hosts
  * (multi-server). Thin blocking-socket helpers over getaddrinfo; the
  * returned fds carry pipeline::Message frames via write_message /
@@ -57,15 +70,22 @@ bool ip_allowed(const std::string& ip, const std::vector<Cidr>& allow);
 int listen_on(const std::string& host, int port, int* out_port);
 
 /**
- * Accepts one connection on a listen fd (blocking). An IPv4-mapped
- * IPv6 peer (::ffff:a.b.c.d, seen on a dual-stack socket) is
- * normalized to its dotted-quad form so an IPv4 allowlist rule still
- * matches an IPv4 client.
+ * Accepts one connection on a listen fd. An IPv4-mapped IPv6 peer
+ * (::ffff:a.b.c.d, seen on a dual-stack socket) is normalized to its
+ * dotted-quad form so an IPv4 allowlist rule still matches an IPv4
+ * client.
+ *
+ * With timeout_ms > 0 the wait for a peer is bounded (poll on the listen
+ * fd, retrying EINTR against a shared deadline) so a peer that never
+ * arrives -- e.g. a downstream chain that never wires up -- fails fast
+ * instead of blocking forever; timeout_ms == 0 blocks indefinitely.
  *
  * @param peer_ip If non-null, receives the peer's numeric address.
- * @returns The connection fd (>= 0), or -1 on failure.
+ * @param timeout_ms 0 blocks; otherwise give up after this many ms.
+ * @returns The connection fd (>= 0), or -1 on failure/timeout.
  */
-int accept_one(int listen_fd, std::string* peer_ip = nullptr);
+int accept_one(int listen_fd, std::string* peer_ip = nullptr,
+               int timeout_ms = 0);
 
 /**
  * Connects to host:port. With timeout_ms > 0 the connect uses a

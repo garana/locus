@@ -168,6 +168,39 @@ bool ip_allowed(const std::string& ip, const std::vector<Cidr>& allow) {
     return false;
 }
 
+bool parse_hostport(const std::string& s, std::string& host, int& port) {
+    std::string p;
+    if (!s.empty() && s.front() == '[') {  // bracketed IPv6: [::1]:port
+        const auto close = s.find(']');
+        if (close == std::string::npos) {
+            return false;
+        }
+        host = s.substr(1, close - 1);
+        const std::string rest = s.substr(close + 1);
+        if (rest.empty() || rest.front() != ':') {
+            return false;
+        }
+        p = rest.substr(1);
+    } else {
+        const auto c = s.rfind(':');
+        if (c == std::string::npos) {
+            return false;
+        }
+        host = s.substr(0, c);
+        p = s.substr(c + 1);
+    }
+    if (p.empty()) {
+        return false;
+    }
+    char* end = nullptr;
+    const long v = std::strtol(p.c_str(), &end, 10);
+    if (*end != '\0' || v < 0 || v > 65535) {
+        return false;
+    }
+    port = static_cast<int>(v);
+    return true;
+}
+
 int listen_on(const std::string& host, int port, int* out_port) {
     addrinfo hints;
     std::memset(&hints, 0, sizeof(hints));
@@ -220,7 +253,36 @@ int listen_on(const std::string& host, int port, int* out_port) {
     return fd;
 }
 
-int accept_one(int listen_fd, std::string* peer_ip) {
+int accept_one(int listen_fd, std::string* peer_ip, int timeout_ms) {
+    // Bound the wait for a peer with poll() against a shared deadline
+    // (retrying EINTR with the remaining budget), so a peer that never
+    // arrives fails fast instead of blocking in accept() forever.
+    if (timeout_ms > 0) {
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeout_ms);
+        for (;;) {
+            const auto now = std::chrono::steady_clock::now();
+            long rem = std::chrono::duration_cast<
+                           std::chrono::milliseconds>(deadline - now)
+                           .count();
+            if (rem < 0) {
+                rem = 0;
+            }
+            pollfd pfd{listen_fd, POLLIN, 0};
+            const int pr = ::poll(&pfd, 1, static_cast<int>(rem));
+            if (pr < 0) {
+                if (errno == EINTR) {
+                    continue;  // resume with the remaining budget
+                }
+                return -1;  // poll error
+            }
+            if (pr == 0) {
+                return -1;  // timed out: no peer arrived
+            }
+            break;  // readable: accept() below will not block
+        }
+    }
     for (;;) {
         sockaddr_storage ss;
         socklen_t sl = sizeof(ss);

@@ -13,8 +13,10 @@ description: Build and run the locus Catch2 unit tests. Use after
 
 - Run a subset with a tag filter: `./build/tests/locus_tests
   "[kv]"` (tags: [sanity], [kv], [sys], [gguf], [tok], [ops],
-  [backend], [engine], [server], [vulkan], [pipeline], [e2e]; keep
-  this list current as suites are added).
+  [backend], [engine], [server], [vulkan], [pipeline], [mp], [e2e];
+  keep this list current as suites are added).
+- [mp] spawns real locus-stage processes (multi-server driver chain);
+  it needs the test model and the locus-stage binary built.
 - [e2e] needs the ~1 MB test model: `scripts/fetch-test-model.sh`
   (gitignored under tests/models/; tests SKIP if absent). Larger
   optional models (llama-3.2-1b Q8_0/Q4_K_M, deepseek-v2-lite)

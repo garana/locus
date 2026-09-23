@@ -49,44 +49,6 @@ const char* kUsage =
     "  --sessions N            serve N sessions then exit "
     "(default 0 = serve forever; re-accept on each disconnect)\n";
 
-// Splits "host:port". Accepts a bracketed IPv6 host "[::1]:port"
-// (brackets stripped) as well as "host:port" and ":port" (empty host
-// == wildcard); a bare IPv6 literal would be ambiguous, so brackets
-// are the way to give one.
-bool split_hostport(const std::string& s, std::string& host,
-                    int& port) {
-    std::string p;
-    if (!s.empty() && s.front() == '[') {
-        const auto close = s.find(']');
-        if (close == std::string::npos) {
-            return false;
-        }
-        host = s.substr(1, close - 1);
-        std::string rest = s.substr(close + 1);
-        if (rest.empty() || rest.front() != ':') {
-            return false;
-        }
-        p = rest.substr(1);
-    } else {
-        const auto c = s.rfind(':');
-        if (c == std::string::npos) {
-            return false;
-        }
-        host = s.substr(0, c);
-        p = s.substr(c + 1);
-    }
-    if (p.empty()) {
-        return false;
-    }
-    char* end = nullptr;
-    const long v = std::strtol(p.c_str(), &end, 10);
-    if (*end != '\0' || v < 0 || v > 65535) {
-        return false;
-    }
-    port = static_cast<int>(v);
-    return true;
-}
-
 // Parses "A:B" into a half-open layer range, requiring A < B.
 bool parse_layers(const std::string& s, std::uint32_t& a,
                   std::uint32_t& b) {
@@ -191,7 +153,7 @@ int main(int argc, char** argv) {
     }
     std::string lh;
     int lp = 0;
-    if (!split_hostport(listen, lh, lp)) {
+    if (!locus::pipeline::parse_hostport(listen, lh, lp)) {
         std::fprintf(stderr, "bad --listen (want HOST:PORT)\n");
         return 2;
     }
@@ -200,7 +162,7 @@ int main(int argc, char** argv) {
     for (const auto& ds : downstream_str) {
         std::string dh;
         int dp = 0;
-        if (!split_hostport(ds, dh, dp)) {
+        if (!locus::pipeline::parse_hostport(ds, dh, dp)) {
             std::fprintf(stderr,
                          "bad --downstream (want HOST:PORT): %s\n",
                          ds.c_str());
