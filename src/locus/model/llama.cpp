@@ -164,7 +164,9 @@ float dsa_index_score(std::span<const float> q,
     return score;
 }
 
-LlamaModel LlamaModel::load(const GgufFile& g) {
+LlamaModel LlamaModel::load(const GgufFile& g,
+                            std::uint32_t layer_begin,
+                            std::uint32_t layer_end) {
     const auto arch_name = g.get_string("general.architecture");
     const ArchSpec* spec =
         find_arch(arch_name.value_or("<missing>"));
@@ -216,8 +218,26 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
     m.embd_ = need_mat(g, "token_embd.weight", hp.n_embd,
                        hp.n_vocab);
 
-    m.layers_.reserve(hp.n_layers);
+    // Slice-only loading (multi-server, DESIGN.md R15+): a stage loads
+    // only its owned layer range [layer_begin, layer_end); layer_end 0
+    // (or past the end) means the whole model. layers_ stays indexed by
+    // absolute layer number -- skipped layers are default-constructed
+    // and never touched -- so forward_layers' absolute layers_[l] needs
+    // no remap; only the pages of the owned layers ever fault in.
+    if (layer_end == 0 || layer_end > hp.n_layers) {
+        layer_end = hp.n_layers;
+    }
+    if (layer_begin >= layer_end) {
+        throw Error("invalid layer range for load");
+    }
+    m.layer_begin_ = layer_begin;
+    m.layer_end_ = layer_end;
+
+    m.layers_.resize(hp.n_layers);
     for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
+        if (l < layer_begin || l >= layer_end) {
+            continue;  // slice-only: skip layers this stage does not own
+        }
         const std::string bp = "blk." + std::to_string(l) + ".";
         Layer lay;
         lay.attn_norm = need_vec(g, bp + "attn_norm.weight",
@@ -281,7 +301,7 @@ LlamaModel LlamaModel::load(const GgufFile& g) {
             lay.w_down = need_mat(g, bp + "ffn_down.weight",
                                   hp.n_ff, hp.n_embd);
         }
-        m.layers_.push_back(lay);
+        m.layers_[l] = std::move(lay);  // absolute-indexed slot
     }
 
     m.backend_ = &backend::best_backend();
@@ -382,7 +402,12 @@ LlamaModel::Workspace LlamaModel::make_workspace() const {
 kv::PagedKvCache LlamaModel::make_cache(
     std::uint32_t n_blocks, kv::KvType kv_type) const {
     kv::PagedKvCache::Geometry geom;
-    geom.n_layers = hp_.n_layers;
+    // Size the cache to the layers this model actually loaded (the
+    // whole model for a normal load; a stage's slice under slice-only
+    // loading), and record the base so callers keep passing absolute
+    // layer indices while the cache stores only [layer_base, layer_end).
+    geom.n_layers = layer_end_ - layer_begin_;
+    geom.layer_base = layer_begin_;
     geom.kv_dim = spec_->kv_dim(hp_);
     geom.block_tokens = 16;
     geom.kv_type = kv_type;
@@ -453,6 +478,14 @@ void LlamaModel::forward_layers(tok::TokenId token,
 
     if (layer_begin > layer_end || layer_end > hp_.n_layers) {
         throw std::invalid_argument("forward_layers: bad layer range");
+    }
+    // Under slice-only loading only [layer_begin_, layer_end_) is
+    // resident; running outside it would read a default-constructed
+    // (empty) Layer. A full load has the whole model, so this never
+    // fires for the single-process path.
+    if (layer_begin < layer_begin_ || layer_end > layer_end_) {
+        throw std::invalid_argument(
+            "forward_layers: range outside the loaded layer slice");
     }
     const bool first = layer_begin == 0;
     const bool last = layer_end == hp_.n_layers;

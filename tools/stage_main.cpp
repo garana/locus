@@ -186,7 +186,11 @@ int main(int argc, char** argv) {
 
     try {
         auto g = locus::gguf::GgufFile::open(model_path);
-        auto model = locus::model::LlamaModel::load(g);
+        // Slice-only loading: this process wires up only layers [la, lb)
+        // (its share of the model), so cluster memory is ~1x the model.
+        // hparams().n_layers stays the full count, so the range check
+        // below still validates against the whole model.
+        auto model = locus::model::LlamaModel::load(g, la, lb);
         if (lb > model.hparams().n_layers) {
             std::fprintf(stderr,
                          "--layers end %u exceeds model n_layers %u\n",
