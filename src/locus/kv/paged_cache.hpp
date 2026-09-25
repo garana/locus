@@ -26,6 +26,15 @@ class PagedKvCache {
     /** Geometry of the cached tensors. */
     struct Geometry {
         std::uint32_t n_layers = 0;
+        /**
+         * Absolute index of the first layer this cache stores, for a
+         * pipeline stage that owns only a slice of the model's layers
+         * (multi-server, DESIGN.md R15+). The cache holds `n_layers`
+         * layers starting here; callers still pass absolute layer
+         * indices and the cache subtracts this base internally. 0 (the
+         * default) means a full-model cache indexed 0..n_layers.
+         */
+        std::uint32_t layer_base = 0;
         /** n_kv_heads * head_dim floats per position. */
         std::uint32_t kv_dim = 0;
         /** Positions per block (16 default per DESIGN.md). */

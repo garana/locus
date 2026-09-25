@@ -146,12 +146,14 @@ float* PagedKvCache::v(const Seq& seq, std::uint32_t layer,
 float* PagedKvCache::row(const Seq& seq, std::uint32_t layer,
                          std::uint32_t pos, bool value) {
     assert(!quantized() && "k()/v() are F32-only; use load_row");
-    assert(layer < geom_.n_layers);
+    assert(layer >= geom_.layer_base &&
+           layer - geom_.layer_base < geom_.n_layers);
     assert(pos < capacity(seq));
+    const std::uint32_t rel = layer - geom_.layer_base;  // slice-local
     const std::size_t b = pos / geom_.block_tokens;
     const std::size_t in_block = pos % geom_.block_tokens;
     return pool_ptr_ + seq.blocks[b] * block_stride_ +
-           layer * layer_stride_ +
+           rel * layer_stride_ +
            (value ? layer_stride_ / 2 : 0) +
            in_block * geom_.kv_dim;
 }
@@ -159,13 +161,15 @@ float* PagedKvCache::row(const Seq& seq, std::uint32_t layer,
 std::uint8_t* PagedKvCache::qrow(const Seq& seq, std::uint32_t layer,
                                  std::uint32_t pos,
                                  bool value) const {
-    assert(layer < geom_.n_layers);
+    assert(layer >= geom_.layer_base &&
+           layer - geom_.layer_base < geom_.n_layers);
     assert(pos < capacity(seq));
+    const std::uint32_t rel = layer - geom_.layer_base;  // slice-local
     const std::size_t b = pos / geom_.block_tokens;
     const std::size_t in_block = pos % geom_.block_tokens;
     // Per layer: block_tokens K rows, then block_tokens V rows.
     return qpool_ptr_ + seq.blocks[b] * q_block_stride_ +
-           layer * q_layer_stride_ +
+           rel * q_layer_stride_ +
            (value ? q_layer_stride_ / 2 : 0) +
            in_block * q_row_bytes_;
 }
@@ -192,10 +196,11 @@ void PagedKvCache::load_row(const Seq& seq, std::uint32_t layer,
                           dst.data(), geom_.kv_type);
     } else {
         // const row access without exposing the mutable helper.
+        const std::uint32_t rel = layer - geom_.layer_base;  // slice
         const std::size_t b = pos / geom_.block_tokens;
         const std::size_t in_block = pos % geom_.block_tokens;
         const float* r = pool_ptr_ + seq.blocks[b] * block_stride_ +
-                         layer * layer_stride_ +
+                         rel * layer_stride_ +
                          (value ? layer_stride_ / 2 : 0) +
                          in_block * geom_.kv_dim;
         std::memcpy(dst.data(), r, geom_.kv_dim * sizeof(float));

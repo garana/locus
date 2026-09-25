@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -731,4 +732,75 @@ TEST_CASE("serve_stage distributes across a downstream pool",
         REQUIRE(ra.load() == 1);
         REQUIRE(rb.load() == 1);
     }
+}
+
+// #18 slice-only loading: a model loaded for only [k, L) wires up just
+// those transformer blocks (the rest stay default-constructed and never
+// fault in), and running its slice against a slice-sized, base-remapped
+// KV cache produces the SAME logits as the full model executing the
+// same [k, L) slice. This is the unit-level guard behind the
+// multi-process [mp] byte-exactness: it isolates exactly what slice
+// loading changes (which layers load + the cache height/base) by
+// feeding both models an identical synthetic residual.
+TEST_CASE("slice-only load matches full model on its layer range",
+          "[pipeline]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto full = locus::model::LlamaModel::load(g);
+    const std::uint32_t L = full.hparams().n_layers;
+    const std::uint32_t V = full.hparams().n_vocab;
+    const std::uint32_t E = full.hparams().n_embd;
+    REQUIRE(L >= 2);
+    const std::uint32_t k = L / 2 > 0 ? L / 2 : 1;
+
+    auto slice = locus::model::LlamaModel::load(g, k, L);
+    // The slice records its range; hparams().n_layers stays the full
+    // count; layers_ stays absolute-indexed with only [k, L) wired up.
+    REQUIRE(slice.layer_begin() == k);
+    REQUIRE(slice.layer_end() == L);
+    REQUIRE(slice.hparams().n_layers == L);
+    REQUIRE(slice.layers().size() == L);
+    REQUIRE(slice.layers()[0].attn_norm.empty());       // not loaded
+    REQUIRE(slice.layers()[k].attn_norm.size() == E);    // loaded
+    REQUIRE(slice.layers()[L - 1].attn_norm.size() == E);
+
+    // Drive many positions with an identical deterministic residual
+    // stream (what the previous stage would hand over). Spanning several
+    // 16-token cache blocks exercises the block stride -- the term whose
+    // SIZE the slice changes -- not just the per-layer offset, so a
+    // remap slip surfaces here rather than only in the [mp] end-to-end.
+    constexpr std::uint32_t kPos = 40;  // > 2 blocks at block_tokens 16
+    auto run_tail = [&](locus::model::LlamaModel& m) {
+        auto cache = m.make_cache();
+        auto ws = m.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<std::vector<float>> all;
+        for (std::uint32_t p = 0; p < kPos; ++p) {
+            std::vector<float> hidden(E);
+            for (std::uint32_t i = 0; i < E; ++i) {
+                hidden[i] = 0.01f * static_cast<float>(
+                                        static_cast<int>((i + p) % 7) - 3);
+            }
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            std::vector<float> logits(V);
+            m.forward_layers(0, hidden, k, L, cache, seq, ws, logits);
+            all.push_back(std::move(logits));
+        }
+        return all;
+    };
+    const auto lf = run_tail(full);   // full cache, base 0
+    const auto ls = run_tail(slice);  // sliced cache (base k, height L-k)
+    REQUIRE(ls == lf);  // identical across every position and block
+
+    // The slice must refuse a range it did not load (layer 0 is absent).
+    auto cache = slice.make_cache();
+    auto ws = slice.make_workspace();
+    locus::kv::PagedKvCache::Seq seq;
+    std::vector<float> out(V);
+    REQUIRE(cache.ensure_capacity(seq, 1));
+    REQUIRE_THROWS_AS(
+        slice.forward_layers(0, {}, 0, L, cache, seq, ws, out),
+        std::invalid_argument);
 }

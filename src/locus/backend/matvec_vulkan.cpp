@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <bit>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -418,8 +419,17 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
     const std::uint32_t kv_dim = geom.kv_dim;
     const std::uint32_t layer_stride =
         geom.block_tokens * kv_dim * 2;
+    // Derive the block stride from the CACHE's layer count, not the
+    // model's: under slice-only loading (DESIGN.md R15+) they differ,
+    // and this stride must match the pool the offsets below index into.
+    // This full-forward path assumes a base-0 full-height cache (the
+    // loop below runs absolute layer l as the row index), which holds
+    // because Vulkan only runs the whole model in one process; a sliced
+    // cache would need l - geom.layer_base here and in the loop.
+    assert(geom.layer_base == 0 &&
+           "vulkan_forward assumes a base-0 full-height KV cache");
     const std::uint32_t block_stride =
-        hp.n_layers * layer_stride;
+        geom.n_layers * layer_stride;
     // Quantized byte strides (R14 #45); unused on the F32 path.
     const std::uint32_t q_row_b =
         quant ? static_cast<std::uint32_t>(cache.q_row_bytes()) : 0;

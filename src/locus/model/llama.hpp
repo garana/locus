@@ -95,10 +95,27 @@ class LlamaModel {
     /**
      * Wires up weights and validates shapes against hyperparams.
      *
+     * For slice-only loading (multi-server, DESIGN.md R15+) a pipeline
+     * stage loads only the layers it owns: pass [layer_begin, layer_end)
+     * and only those transformer blocks are wired up (their pages are
+     * the only per-layer weights that ever fault in). layer_end == 0
+     * (the default) means the whole model, so the single-process path is
+     * unchanged. Layers stay indexed by absolute number; a skipped
+     * layer's slot is a default-constructed (empty) Layer, so reading
+     * one is silent rather than loud -- forward_layers' range check is
+     * what turns an out-of-range run into a clear error. make_cache
+     * sizes the KV cache to the loaded range.
+     *
      * @param g A parsed model with general.architecture "llama".
-     * @throws gguf::Error on missing tensors or shape mismatches.
+     * @param layer_begin First layer to load (inclusive; default 0).
+     * @param layer_end One past the last layer to load; 0 (default) or
+     *     past the end means all layers.
+     * @throws gguf::Error on missing tensors or shape mismatches; Error
+     *     on an empty/inverted layer range.
      */
-    static LlamaModel load(const gguf::GgufFile& g);
+    static LlamaModel load(const gguf::GgufFile& g,
+                           std::uint32_t layer_begin = 0,
+                           std::uint32_t layer_end = 0);
 
     const Hparams& hparams() const { return hp_; }
 
@@ -334,6 +351,12 @@ class LlamaModel {
     };
 
     const std::vector<Layer>& layers() const { return layers_; }
+    /** First absolute layer index this model loaded (0 for a full
+     * load; a stage's slice start under slice-only loading). */
+    std::uint32_t layer_begin() const { return layer_begin_; }
+    /** One past the last absolute layer index this model loaded
+     * (n_layers for a full load). */
+    std::uint32_t layer_end() const { return layer_end_; }
     const backend::Mat& embedding() const { return embd_; }
     const backend::Mat& output_weight() const { return out_w_; }
     std::span<const float> output_norm() const {
@@ -386,6 +409,12 @@ class LlamaModel {
     std::span<const float> out_norm_;
     backend::Mat out_w_;
     std::vector<Layer> layers_;
+    /** Loaded layer range [layer_begin_, layer_end_) under slice-only
+     * loading; [0, n_layers) for a normal full load. layers_ is still
+     * sized to n_layers and indexed absolutely; entries outside this
+     * range are default-constructed and never accessed. */
+    std::uint32_t layer_begin_ = 0;
+    std::uint32_t layer_end_ = 0;
 };
 
 /** @returns The index of the largest logit (greedy sampling). */
