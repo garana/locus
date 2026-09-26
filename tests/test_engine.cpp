@@ -515,7 +515,7 @@ TEST_CASE("prefix cache adopts a long prompt without self-eviction",
     REQUIRE(engine.get(id2)->reused_prefix_tokens > 0);
 }
 
-// Multi-server (#71) increment 1: running the layer stack in slices
+// Multi-server (i#3) increment 1: running the layer stack in slices
 // via forward_layers -- [0,k) then [k,L) against one shared cache --
 // must be byte-identical to a single forward(). This is the in-process
 // proof of the pipeline-parallel hand-off before any networking: the

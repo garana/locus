@@ -35,7 +35,7 @@ std::string model_path() {
 
 }  // namespace
 
-// Multi-server (#71) increment 3: chaining PipelineStage workers, each
+// Multi-server (i#3) increment 3: chaining PipelineStage workers, each
 // owning a layer slice and its own KV cache, connected by sockets, must
 // reproduce a single-process generation byte-for-byte. This is the
 // in-process proof of the whole stage protocol (kToken in, kActivation
@@ -212,7 +212,7 @@ TEST_CASE("pipeline stages reproduce single-process generation",
     }
 }
 
-// Multi-server (#71): stages run as servers via serve_stage (the
+// Multi-server (i#3): stages run as servers via serve_stage (the
 // locus-stage CLI's core) -- listen, accept from an allowed peer,
 // connect downstream -- chained over loopback TCP, must reproduce
 // single-process generation byte-for-byte.
