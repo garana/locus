@@ -1,3 +1,4 @@
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -332,4 +333,63 @@ TEST_CASE("serve_stage_mux: EOF at a boundary is clean, mid-frame is not",
 
     REQUIRE(run_once(/*truncate=*/false) == 1);  // clean boundary EOF
     REQUIRE(run_once(/*truncate=*/true) == 0);    // mid-frame truncation
+}
+
+// A peer that RSTs while idle -- no pending write for the stage to fail
+// on -- must still be dropped promptly and counted unclean. The drop
+// comes only from the unconditional recv() draining to -1/ECONNRESET,
+// never from a flag. This is the shape where the two backends diverge
+// most (epoll: error=1, readable=0; kqueue: readable=1, error=0), so the
+// drop is reached by a different poller state on each while the outcome
+// -- serve returns false -- is the same. Covers the read_error half of
+// the clean predicate from the peer-RST direction, which the other
+// cases do not.
+TEST_CASE("serve_stage_mux drops an idle peer that resets the connection",
+          "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    const std::uint32_t L = model.hparams().n_layers;
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L);
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, {}, {{"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    const int to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(to_stage >= 0);
+    // Abortive close: with SO_LINGER timeout 0, close() sends a RST
+    // instead of a FIN, so the stage's input socket errors rather than
+    // seeing a clean EOF.
+    struct linger lg;
+    lg.l_onoff = 1;
+    lg.l_linger = 0;
+    REQUIRE(::setsockopt(to_stage, SOL_SOCKET, SO_LINGER, &lg,
+                         sizeof(lg)) == 0);
+    // Let the stage accept and dial back, so the session is fully
+    // established and idle before the reset (nothing is ever written to
+    // it, so a failed write can never be what notices the drop).
+    const int from_stage = locus::pipeline::accept_one(lc, nullptr);
+    REQUIRE(from_stage >= 0);
+    ::close(lc);
+
+    ::close(to_stage);  // RST to the stage's input fd
+    server.join();
+    ::close(from_stage);
+    REQUIRE(sres.load() == 0);  // dropped, counted unclean
 }
