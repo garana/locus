@@ -20,6 +20,7 @@ add_library(locus
     src/locus/backend/registry.cpp
     src/locus/backend/vulkan/context.cpp
     src/locus/chat/template.cpp
+    src/locus/config/config_file.cpp
     src/locus/engine/engine.cpp
     src/locus/engine/prefix_cache.cpp
     src/locus/auth/token_cache.cpp
