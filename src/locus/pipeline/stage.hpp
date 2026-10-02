@@ -51,6 +51,22 @@ class PipelineStage {
     Message step(const Message& in);
 
     /**
+     * Per-session variant: advances `seq` (a caller-owned KV sequence)
+     * instead of the stage's built-in one, so one stage can serve many
+     * concurrent sessions over its shared cache/workspace (the
+     * event-loop serving model, DESIGN.md i#24). All sessions share one
+     * KV pool and one forward-pass workspace; they must be stepped one
+     * at a time (the single-threaded event loop does exactly that), as
+     * the workspace is not reentrant.
+     *
+     * @param seq This session's KV sequence; its n_tokens must equal
+     *     in.position (the same lockstep rule as the built-in form).
+     * @throws std::invalid_argument on a role/size/lockstep mismatch,
+     *     std::runtime_error if the cache is exhausted.
+     */
+    Message step(kv::PagedKvCache::Seq& seq, const Message& in);
+
+    /**
      * Runs the read -> step -> write loop over the fds until in_fd
      * reaches EOF. Takes ownership of both fds and closes them before
      * returning (so a downstream stage sees EOF and the chain drains).
@@ -65,6 +81,12 @@ class PipelineStage {
      * serve_stage calls this between sessions when it re-accepts after
      * a connection ends. */
     void reset();
+
+    /** Per-session variant: releases `seq`'s blocks back to the shared
+     * pool and resets it. The event-loop server calls this when a
+     * session ends, so a dropped connection frees its KV at once rather
+     * than holding it until the stage exits. */
+    void reset(kv::PagedKvCache::Seq& seq);
 
     bool is_first() const { return layer_begin_ == 0; }
     bool is_last() const { return layer_end_ == n_layers_; }
