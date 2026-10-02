@@ -10,6 +10,8 @@
 
 namespace locus::pipeline {
 
+class Resolver;  // cached hostname resolver (resolver.hpp)
+
 /** A downstream endpoint (host + port) in a stage's downstream pool. */
 struct HostPort {
     std::string host;
@@ -31,6 +33,16 @@ struct StageConn {
     int keepalive_count = 3;
     int serve_sessions = 0;        /**< 0 = serve forever; else stop
                                     *   after N sessions (for tests). */
+    /**
+     * Optional cached hostname resolver (issue 40). When set, a
+     * downstream whose host is a name is resolved to an IP through this
+     * cache before connecting, so a per-dial getaddrinfo (and its
+     * blocking DNS round-trip on the serve loop) is avoided on the
+     * common path. nullptr (the default) keeps the old behavior:
+     * connect_to resolves the host itself each dial. Not owned here --
+     * the caller (stage_main) owns it and outlives serve_stage*.
+     */
+    Resolver* resolver = nullptr;
 };
 
 /**

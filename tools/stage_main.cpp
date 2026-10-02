@@ -212,6 +212,22 @@ int main(int argc, char** argv) {
                      rt.layer_begin, rt.layer_end, opt.listen.c_str(),
                      pool_desc.c_str());
 
+        // Cached hostname resolution for downstream names (i#40): the
+        // Resolver turns a name into a cached IP so a dial avoids a
+        // per-connection getaddrinfo; a numeric-IP downstream passes
+        // through untouched. Pre-warm the configured pool HERE, before
+        // serving, so the first dial hits the cache rather than blocking
+        // on DNS on the serve loop -- a blocking lookup is fine now
+        // because nothing is being served yet. (A reload adds new names
+        // with prime(), which is non-blocking, because reload.apply runs
+        // on the serve loop; see below.)
+        locus::pipeline::Resolver resolver(
+            locus_tools::resolver_options(opt));
+        for (const auto& hp : rt.pool) {
+            resolver.resolve(hp.host);
+        }
+        rt.conn.resolver = &resolver;
+
         // Hot reload (SIGHUP, i#19): re-read the config from the
         // immutable CLI baseline and apply the reloadable subset
         // (allowlist, pool, connection policy). model, layers and the
@@ -278,6 +294,15 @@ int main(int argc, char** argv) {
                         p = rt2.pool;
                         c = rt2.conn;
                         c.serve_sessions = rt.conn.serve_sessions;  // keep
+                        c.resolver = &resolver;  // rt2.conn cleared it
+                        // Warm any newly-added names WITHOUT blocking:
+                        // this runs on the serve loop, so prime() records
+                        // intent and the refresh thread fills it a tick
+                        // later. A blocking resolve() here would freeze
+                        // every active session for a DNS timeout.
+                        for (const auto& hp : p) {
+                            resolver.prime(hp.host);
+                        }
                         std::fprintf(stderr,
                                      "reload: applied %s (allow=%zu "
                                      "pool=%zu)\n",

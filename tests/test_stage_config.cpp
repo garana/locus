@@ -248,3 +248,39 @@ TEST_CASE("build_runtime validates and converts StageOptions",
     bad.downstream = {"missing-port"};
     REQUIRE_FALSE(locus_tools::build_runtime(bad, scratch).empty());
 }
+
+// i#40: the resolve-* knobs map onto Resolver::Options, with the refresh
+// percent converted to a fraction (the user-facing "75%" -> 0.75).
+TEST_CASE("resolver_options maps the resolve knobs (percent -> fraction)",
+          "[config]") {
+    locus_tools::StageOptions opt;  // defaults
+    REQUIRE(opt.resolve_ttl == 30);
+    REQUIRE(opt.resolve_max_ttl == 300);
+    REQUIRE(opt.resolve_refresh_percent == 75);
+
+    auto ro = locus_tools::resolver_options(opt);
+    REQUIRE(ro.default_ttl_s == 30);
+    REQUIRE(ro.max_ttl_s == 300);
+    REQUIRE(ro.refresh_frac > 0.749);
+    REQUIRE(ro.refresh_frac < 0.751);  // 75% -> 0.75
+
+    opt.resolve_refresh_percent = 50;
+    const double f = locus_tools::resolver_options(opt).refresh_frac;
+    REQUIRE(f > 0.499);
+    REQUIRE(f < 0.501);  // 50% -> 0.50
+}
+
+// The resolve-* flags are in the directive table and parse as ints.
+TEST_CASE("stage_spec parses the resolve-* knobs", "[config]") {
+    const auto spec = locus_tools::stage_spec();
+    locus_tools::StageOptions opt;
+    REQUIRE(spec.find("resolve-ttl") != nullptr);
+    REQUIRE(spec.find("resolve-max-ttl") != nullptr);
+    REQUIRE(spec.find("resolve-refresh-percent") != nullptr);
+    spec.apply(*spec.find("resolve-ttl"), opt, "12");
+    spec.apply(*spec.find("resolve-max-ttl"), opt, "120");
+    spec.apply(*spec.find("resolve-refresh-percent"), opt, "80");
+    REQUIRE(opt.resolve_ttl == 12);
+    REQUIRE(opt.resolve_max_ttl == 120);
+    REQUIRE(opt.resolve_refresh_percent == 80);
+}

@@ -7,6 +7,7 @@
 
 #include "cli_spec.hpp"
 #include "locus/pipeline/net.hpp"
+#include "locus/pipeline/resolver.hpp"
 #include "locus/pipeline/stage_server.hpp"
 
 namespace locus_tools {
@@ -39,6 +40,12 @@ struct StageOptions {
     int keepalive_interval = 2;           /**< --keepalive-interval s */
     int keepalive_count = 3;              /**< --keepalive-count */
     int sessions = 0;                     /**< --sessions (0=forever) */
+    int resolve_ttl = 30;                 /**< --resolve-ttl s (name
+                                           *   cache; fallback TTL until
+                                           *   record TTL is used) */
+    int resolve_max_ttl = 300;            /**< --resolve-max-ttl s cap */
+    int resolve_refresh_percent = 75;     /**< --resolve-refresh-percent
+                                           *   of the TTL */
 };
 
 /**
@@ -79,7 +86,27 @@ inline Spec<StageOptions> stage_spec() {
                    "unacked keepalive probes before drop"),
         D::integer("sessions", &O::sessions,
                    "serve N sessions then exit (0 = forever)"),
+        D::integer("resolve-ttl", &O::resolve_ttl,
+                   "downstream-name cache TTL s (fallback until the "
+                   "record TTL is used)"),
+        D::integer("resolve-max-ttl", &O::resolve_max_ttl,
+                   "cap on the downstream-name cache TTL s"),
+        D::integer("resolve-refresh-percent", &O::resolve_refresh_percent,
+                   "refresh a cached name at this percent of its TTL"),
     });
+}
+
+/** Builds the resolver policy from the resolve-* options. These are
+ * startup-fixed (the Resolver is long-lived): a SIGHUP reload does not
+ * re-tune an already-running resolver. */
+inline locus::pipeline::Resolver::Options resolver_options(
+    const StageOptions& opt) {
+    locus::pipeline::Resolver::Options ro;
+    ro.default_ttl_s = opt.resolve_ttl;
+    ro.max_ttl_s = opt.resolve_max_ttl;
+    ro.refresh_frac =
+        static_cast<double>(opt.resolve_refresh_percent) / 100.0;
+    return ro;
 }
 
 /** Parses "A:B" into a half-open layer range, requiring A < B. */
