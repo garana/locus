@@ -1,4 +1,6 @@
+#include <fcntl.h>
 #include <signal.h>
+#include <unistd.h>
 
 #include <csignal>
 #include <cstdint>
@@ -45,24 +47,48 @@ const char* kUsage =
     "\n"
     "Flags (and the matching config keys):\n";
 
-// SIGHUP reload flag (i#19). The handler does the only async-signal-
-// safe thing -- set a flag; serve_stage polls it between sessions and
-// does the actual reload. volatile sig_atomic_t is the type guaranteed
-// safe to touch from a handler.
+// SIGHUP reload plumbing (i#19). The handler does only async-signal-
+// safe work: set a flag and write one byte to the wake pipe. serve_stage
+// watches the pipe in its event loop (sys::Poller) and does the actual
+// reload between sessions. g_wake_w is the pipe write end.
 volatile std::sig_atomic_t g_reload = 0;
+volatile std::sig_atomic_t g_wake_w = -1;  // read in the handler too
 
-void on_sighup(int /*sig*/) { g_reload = 1; }
+void on_sighup(int /*sig*/) {
+    g_reload = 1;
+    if (g_wake_w >= 0) {
+        const char b = 1;
+        const ssize_t n = ::write(g_wake_w, &b, 1);  // signal-safe
+        (void)n;  // a full pipe (EAGAIN) is fine: a wake is already queued
+    }
+}
 
-// Installs the SIGHUP handler WITHOUT SA_RESTART, so SIGHUP interrupts
-// serve_stage's blocking poll (EINTR) and the reload is applied before
-// the next session rather than only when the next peer happens to
-// arrive.
 void install_sighup() {
     struct sigaction sa;
     sa.sa_handler = on_sighup;
     sigemptyset(&sa.sa_mask);  // macro on some platforms; no :: qualifier
-    sa.sa_flags = 0;  // no SA_RESTART
+    sa.sa_flags = 0;
     sigaction(SIGHUP, &sa, nullptr);
+}
+
+// Creates the self-pipe the SIGHUP handler pokes and serve_stage polls.
+// Both ends are non-blocking: the handler's write must never block, and
+// serve_stage drains the read end without blocking. @returns the read
+// end, or -1 on failure (reload then simply has no wake fd and falls
+// back to applying on the next peer).
+int make_wake_pipe() {
+    int fds[2];
+    if (::pipe(fds) != 0) {
+        return -1;
+    }
+    for (const int fd : fds) {
+        const int fl = ::fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) {
+            ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        }
+    }
+    g_wake_w = fds[1];
+    return fds[0];
 }
 
 }  // namespace
@@ -195,8 +221,11 @@ int main(int argc, char** argv) {
         // is kept.
         locus::pipeline::StageReload reload;
         if (!config_path.empty()) {
-            install_sighup();
+            // Create the wake pipe (sets g_wake_w) BEFORE installing the
+            // handler, so a SIGHUP can never run with g_wake_w == -1.
+            reload.wake_fd = make_wake_pipe();
             reload.flag = &g_reload;
+            install_sighup();
             reload.apply =
                 [&](std::vector<locus::pipeline::Cidr>& a,
                     std::vector<locus::pipeline::HostPort>& p,
