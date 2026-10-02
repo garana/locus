@@ -75,6 +75,18 @@ class Resolver {
      */
     std::string resolve(const std::string& host);
 
+    /**
+     * Registers `host` to be resolved WITHOUT doing the lookup now:
+     * inserts a due-now placeholder (if the name is not already cached)
+     * that the background refresh thread fills on its next tick. Unlike
+     * resolve(), this never blocks on DNS, so it is safe to call from a
+     * latency-sensitive context (e.g. a config reload applied on the
+     * serve loop): it records intent and the warm arrives off-thread a
+     * tick later. A name already cached (good or negative) is left
+     * untouched. No-op on a numeric IP.
+     */
+    void prime(const std::string& host);
+
     /** Runs one refresh pass now: re-resolves every cached name whose
      * refresh time has passed. The background thread calls this on a
      * tick; tests call it directly (with start_thread=false). */

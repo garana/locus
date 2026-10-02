@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "locus/pipeline/message.hpp"
+#include "locus/pipeline/resolver.hpp"
 #include "locus/sys/poller.hpp"
 
 namespace locus::pipeline {
@@ -61,8 +62,27 @@ int connect_pool(const std::vector<HostPort>& pool, std::size_t* cursor,
         for (std::size_t k = 0; k < n; ++k) {
             const std::size_t idx = (*cursor + k) % n;
             const HostPort& hp = pool[idx];
+            // With a resolver, turn a hostname into a cached IP first so
+            // the dial does not pay a getaddrinfo (its DNS round-trip)
+            // each time. An empty result (unresolved or a primed-but-
+            // not-yet-filled name) is treated like an unreachable
+            // replica: skip it and sweep on. Without a resolver,
+            // connect_to resolves the host itself, as before.
+            std::string target = hp.host;
+            if (conn.resolver != nullptr) {
+                target = conn.resolver->resolve(hp.host);
+                if (target.empty()) {
+                    if (n > 1) {
+                        std::fprintf(stderr,
+                                     "serve_stage: downstream %s "
+                                     "unresolved, trying next in pool\n",
+                                     hp.host.c_str());
+                    }
+                    continue;
+                }
+            }
             const int fd =
-                connect_to(hp.host, hp.port, conn.connect_timeout_ms);
+                connect_to(target, hp.port, conn.connect_timeout_ms);
             if (fd >= 0) {
                 *cursor = (idx + 1) % n;  // next session starts here
                 return fd;

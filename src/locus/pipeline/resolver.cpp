@@ -146,6 +146,22 @@ std::string Resolver::resolve(const std::string& host) {
                          : e.ips[e.cursor++ % e.ips.size()];
 }
 
+void Resolver::prime(const std::string& host) {
+    if (is_numeric_ip(host)) {
+        return;  // nothing to resolve
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    if (cache_.find(host) != cache_.end()) {
+        return;  // already cached (good or negative): leave it
+    }
+    // Insert a due-now placeholder (empty ip set). resolve() treats it as
+    // a negative hit (returns empty) until the background thread's next
+    // refresh_now() fills it -- so this records intent without a blocking
+    // lookup on the caller's thread.
+    Entry& e = cache_[host];
+    e.refresh_due_ms = now_ms();
+}
+
 void Resolver::refresh_now() {
     // Snapshot the names that are due, under the lock.
     std::vector<std::string> due;

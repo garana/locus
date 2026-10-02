@@ -18,6 +18,7 @@
 #include "locus/model/llama.hpp"
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/net.hpp"
+#include "locus/pipeline/resolver.hpp"
 #include "locus/pipeline/stage.hpp"
 #include "locus/pipeline/stage_server.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -933,4 +934,136 @@ TEST_CASE("serve_stage applies a hot reload between sessions",
     ::close(le);
     REQUIRE(result.load() == 1);  // both sessions ended cleanly
     REQUIRE(reloads == 1);        // the reload ran once, before session 2
+}
+
+// i#40: a downstream given by NAME (not a numeric IP) is dialed through
+// the cached Resolver -- connect_pool resolves the name to an IP before
+// connecting. A two-stage chain whose stage-0 downstream is the name
+// "stage1.test", resolved to loopback by an injected lookup, must
+// reproduce single-process generation byte-for-byte, proving the resolve
+// step sits correctly in the dial path.
+TEST_CASE("serve_stage dials a named downstream through the resolver",
+          "[pipeline][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const std::uint32_t V = model.hparams().n_vocab;
+    REQUIRE(L >= 2);
+    const std::uint32_t k = L / 2 == 0 ? 1 : L / 2;
+    const auto prompt = tok.encode("Once upon a time", true);
+    constexpr int kGen = 8;
+
+    auto mono = [&]() {
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(V);
+        for (auto t : prompt) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(t, cache, seq, ws, logits);
+        }
+        std::vector<locus::tok::TokenId> gen;
+        for (int i = 0; i < kGen; ++i) {
+            const auto n = locus::model::argmax(logits);
+            gen.push_back(n);
+            if (n == tok.eos_id()) break;
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(n, cache, seq, ws, logits);
+        }
+        return gen;
+    };
+    const auto ref = mono();
+
+    int p0 = 0, p1 = 0, pe = 0;
+    const int l0 = locus::pipeline::listen_on("127.0.0.1", 0, &p0);
+    const int l1 = locus::pipeline::listen_on("127.0.0.1", 0, &p1);
+    const int le = locus::pipeline::listen_on("127.0.0.1", 0, &pe);
+    REQUIRE(l0 >= 0);
+    REQUIRE(l1 >= 0);
+    REQUIRE(le >= 0);
+
+    PipelineStage s0(model, 0, k);
+    PipelineStage s1(model, k, L);
+    const std::vector<locus::pipeline::Cidr> allow;  // any
+
+    // The resolver maps the downstream NAME to loopback; no real DNS.
+    int lookups = 0;
+    locus::pipeline::Resolver::LookupFn lk = [&](const std::string& h) {
+        ++lookups;
+        REQUIRE(h == "stage1.test");
+        return std::vector<std::string>{"127.0.0.1"};
+    };
+    locus::pipeline::Resolver resolver(locus::pipeline::Resolver::Options{},
+                                       lk, {}, /*start_thread=*/false);
+
+    locus::pipeline::StageConn conn0;
+    conn0.serve_sessions = 1;
+    conn0.resolver = &resolver;  // stage 0 dials its downstream by name
+    locus::pipeline::StageConn conn1;
+    conn1.serve_sessions = 1;    // stage 1 -> entry collector, by IP
+
+    std::atomic<int> r0{-1}, r1{-1};
+    std::thread t0([&] {
+        r0 = locus::pipeline::serve_stage(
+                 s0, l0, allow, {{"stage1.test", p1}}, conn0)
+                 ? 1
+                 : 0;
+    });
+    std::thread t1([&] {
+        r1 = locus::pipeline::serve_stage(
+                 s1, l1, allow, {{"127.0.0.1", pe}}, conn1)
+                 ? 1
+                 : 0;
+    });
+
+    const int entry_w = locus::pipeline::connect_to("127.0.0.1", p0);
+    REQUIRE(entry_w >= 0);
+    const int entry_r = locus::pipeline::accept_one(le, nullptr);
+    REQUIRE(entry_r >= 0);
+    ::close(le);
+
+    bool flow = true;
+    std::uint32_t pos = 0;
+    std::vector<float> logits;
+    auto round_trip = [&](locus::tok::TokenId t) {
+        if (!locus::pipeline::write_message(
+                entry_w, locus::pipeline::make_token(1, pos, t))) {
+            flow = false;
+            return;
+        }
+        Message lg;
+        if (locus::pipeline::read_message(entry_r, lg) != ReadResult::kOk ||
+            lg.type != MsgType::kLogits) {
+            flow = false;
+            return;
+        }
+        logits = std::move(lg.data);
+        ++pos;
+    };
+
+    std::vector<locus::tok::TokenId> gen;
+    for (auto t : prompt) {
+        round_trip(t);
+        if (!flow) break;
+    }
+    for (int i = 0; i < kGen && flow; ++i) {
+        const auto n = locus::model::argmax(logits);
+        gen.push_back(n);
+        if (n == tok.eos_id()) break;
+        round_trip(n);
+    }
+
+    ::close(entry_w);
+    t0.join();
+    t1.join();
+    ::close(entry_r);
+    REQUIRE(flow);
+    REQUIRE(r0.load() == 1);
+    REQUIRE(r1.load() == 1);
+    REQUIRE(gen == ref);        // named downstream produced the same tokens
+    REQUIRE(lookups >= 1);      // the name really went through the resolver
 }

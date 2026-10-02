@@ -167,6 +167,37 @@ TEST_CASE("Resolver keeps the old IPs when a refresh lookup fails",
     REQUIRE(r.cached_count() == 1);
 }
 
+// prime() records a name to resolve WITHOUT a blocking lookup: it
+// inserts a due-now placeholder that the refresh pass fills later. Until
+// then resolve() returns empty (it does not block). This is what a
+// config reload uses on the serve loop, where a blocking lookup is not
+// allowed.
+TEST_CASE("Resolver.prime registers a name without a blocking lookup",
+          "[resolver]") {
+    FakeClock clk;
+    int calls = 0;
+    Resolver::LookupFn lk = [&](const std::string&) {
+        ++calls;
+        return std::vector<std::string>{"10.0.0.7"};
+    };
+    Resolver r(Resolver::Options{}, lk, clk.fn(), false);
+
+    r.prime("stage.local");
+    REQUIRE(calls == 0);             // prime did NOT look up
+    REQUIRE(r.cached_count() == 1);  // but recorded the name
+    REQUIRE(r.resolve("stage.local").empty());  // not filled yet, no block
+    REQUIRE(calls == 0);
+
+    r.refresh_now();  // the background thread's tick (due-now -> resolve)
+    REQUIRE(calls == 1);
+    REQUIRE(r.resolve("stage.local") == "10.0.0.7");  // now warm
+
+    // prime on an already-cached name is a no-op (does not clobber it).
+    r.prime("stage.local");
+    REQUIRE(r.resolve("stage.local") == "10.0.0.7");
+    REQUIRE(r.cached_count() == 1);
+}
+
 // A smoke test with the real background thread ON: it should run and
 // tear down cleanly under concurrent resolve()s. It asserts no timing
 // (the other cases pin TTL/refresh deterministically with the thread
