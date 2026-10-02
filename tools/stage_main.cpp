@@ -300,6 +300,16 @@ int main(int argc, char** argv) {
                         // intent and the refresh thread fills it a tick
                         // later. A blocking resolve() here would freeze
                         // every active session for a DNS timeout.
+                        //
+                        // Operator note: a reload that renames the WHOLE
+                        // pool leaves every replica primed-but-unfilled
+                        // until the next refresh tick (~1 s), during which
+                        // the next dial finds nothing live and retries per
+                        // the reconnect policy. With reconnect_attempts=0
+                        // (the default) that is a ~1 s stall; with a small
+                        // reconnect_attempts and reconnect_wait a one-shot
+                        // full rename can exhaust the budget and the stage
+                        // gives up before the names warm.
                         for (const auto& hp : p) {
                             resolver.prime(hp.host);
                         }
