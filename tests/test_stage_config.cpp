@@ -1,6 +1,8 @@
+#include <exception>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #include "catch_amalgamated.hpp"
 #include "cli_spec.hpp"
@@ -48,6 +50,27 @@ TEST_CASE("ConfigFile rejects a malformed line", "[config]") {
                       ConfigFile::Error);
     REQUIRE_THROWS_AS(ConfigFile::parse_string("= novalue\n"),
                       ConfigFile::Error);
+}
+
+// Regression guard: Error MUST be catchable as std::exception. The
+// SIGHUP reload path catches only std::exception; before this, Error
+// was a bare struct, so a malformed config on reload escaped to
+// std::terminate and killed the running stage.
+TEST_CASE("ConfigFile::Error is a std::exception (reload must catch it)",
+          "[config]") {
+    static_assert(
+        std::is_base_of_v<std::exception, ConfigFile::Error>,
+        "ConfigFile::Error must derive from std::exception so the "
+        "reload path's catch(const std::exception&) catches it");
+    bool caught_as_std = false;
+    try {
+        ConfigFile::parse_string("nonsense\n");  // malformed line
+    } catch (const std::exception& e) {
+        caught_as_std = true;
+        REQUIRE(std::string(e.what()).find("expected key = value") !=
+                std::string::npos);
+    }
+    REQUIRE(caught_as_std);
 }
 
 TEST_CASE("ConfigFile::parse throws on a missing file", "[config]") {
@@ -179,4 +202,49 @@ TEST_CASE("spec.first_missing_required tracks what was seen",
     // All required seen (allow/timeouts optional): nothing missing.
     seen = {"model", "layers", "listen", "downstream"};
     REQUIRE(spec.first_missing_required(seen).empty());
+}
+
+// ---- build_runtime: the shared startup/reload conversion ----
+
+TEST_CASE("build_runtime validates and converts StageOptions",
+          "[config]") {
+    StageOptions opt;
+    opt.layers = "2:5";
+    opt.listen = "127.0.0.1:8000";
+    opt.downstream = {"a:1", "[::1]:2"};  // bracketed IPv6 in the pool
+    opt.allow = {"10.0.0.0/8"};
+    opt.connect_timeout = 250;
+    opt.keepalive_idle = 9;
+    opt.sessions = 3;
+
+    locus_tools::StageRuntime rt;
+    REQUIRE(locus_tools::build_runtime(opt, rt).empty());
+    REQUIRE(rt.layer_begin == 2);
+    REQUIRE(rt.layer_end == 5);
+    REQUIRE(rt.listen_host == "127.0.0.1");
+    REQUIRE(rt.listen_port == 8000);
+    REQUIRE(rt.pool.size() == 2);
+    REQUIRE(rt.pool[0].host == "a");
+    REQUIRE(rt.pool[0].port == 1);
+    REQUIRE(rt.pool[1].host == "::1");  // brackets stripped
+    REQUIRE(rt.pool[1].port == 2);
+    REQUIRE(rt.allow.size() == 1);
+    REQUIRE(rt.conn.connect_timeout_ms == 250);
+    REQUIRE(rt.conn.keepalive_idle_s == 9);
+    REQUIRE(rt.conn.serve_sessions == 3);
+
+    // Bad formats return a message (not a throw); the caller decides.
+    locus_tools::StageRuntime scratch;
+    StageOptions bad = opt;
+    bad.layers = "5:2";  // A >= B
+    REQUIRE_FALSE(locus_tools::build_runtime(bad, scratch).empty());
+    bad = opt;
+    bad.listen = "noport";
+    REQUIRE_FALSE(locus_tools::build_runtime(bad, scratch).empty());
+    bad = opt;
+    bad.allow = {"not-a-cidr"};
+    REQUIRE_FALSE(locus_tools::build_runtime(bad, scratch).empty());
+    bad = opt;
+    bad.downstream = {"missing-port"};
+    REQUIRE_FALSE(locus_tools::build_runtime(bad, scratch).empty());
 }

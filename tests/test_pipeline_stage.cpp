@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -803,4 +804,133 @@ TEST_CASE("slice-only load matches full model on its layer range",
     REQUIRE_THROWS_AS(
         slice.forward_layers(0, {}, 0, L, cache, seq, ws, out),
         std::invalid_argument);
+}
+
+// #19 part 2: serve_stage applies a hot reload between sessions. When
+// the reload flag is set (a SIGHUP handler does this in locus-stage),
+// serve_stage runs the reload callback before the next session and
+// keeps serving. Here the callback is a no-op on the config (it only
+// records that it ran), so both sessions stay byte-exact -- proving the
+// flag->apply plumbing fires exactly once, before session 2, and does
+// not disturb generation. The config->runtime conversion the real
+// callback performs is covered by build_runtime's [config] test.
+TEST_CASE("serve_stage applies a hot reload between sessions",
+          "[pipeline][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const std::uint32_t V = model.hparams().n_vocab;
+    const auto prompt =
+        tok.encode("Once upon a time, there was a little", true);
+    constexpr int kGen = 12;
+
+    auto mono = [&]() {
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(V);
+        for (auto t : prompt) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(t, cache, seq, ws, logits);
+        }
+        std::vector<locus::tok::TokenId> gen;
+        for (int i = 0; i < kGen; ++i) {
+            const auto n = locus::model::argmax(logits);
+            gen.push_back(n);
+            if (n == tok.eos_id()) {
+                break;
+            }
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(n, cache, seq, ws, logits);
+        }
+        return gen;
+    };
+    const auto ref = mono();
+
+    PipelineStage stage(model, 0, L);
+    int pin = 0, pe = 0;
+    const int lin = locus::pipeline::listen_on("127.0.0.1", 0, &pin);
+    const int le = locus::pipeline::listen_on("127.0.0.1", 0, &pe);
+    REQUIRE(lin >= 0);
+    REQUIRE(le >= 0);
+
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 2;
+    conn.connect_timeout_ms = 1000;
+    conn.reconnect_wait_ms = 50;
+
+    volatile std::sig_atomic_t flag = 0;
+    int reloads = 0;
+    locus::pipeline::StageReload reload;
+    reload.flag = &flag;
+    reload.apply = [&](std::vector<locus::pipeline::Cidr>&,
+                       std::vector<locus::pipeline::HostPort>&,
+                       locus::pipeline::StageConn&) { ++reloads; };
+
+    std::atomic<int> result{-1};
+    std::thread th([&] {
+        result = locus::pipeline::serve_stage(
+                     stage, lin, {}, {{"127.0.0.1", pe}}, conn, reload)
+                     ? 1
+                     : 0;
+    });
+
+    for (int session = 0; session < 2; ++session) {
+        if (session == 1) {
+            flag = 1;  // request a reload before the second session
+        }
+        const int w = locus::pipeline::connect_to("127.0.0.1", pin);
+        REQUIRE(w >= 0);
+        const int r = locus::pipeline::accept_one(le, nullptr);
+        REQUIRE(r >= 0);
+
+        bool flow = true;
+        std::uint32_t pos = 0;
+        std::vector<float> logits;
+        auto round_trip = [&](locus::tok::TokenId t) {
+            const Message in = locus::pipeline::make_token(1, pos, t);
+            if (!locus::pipeline::write_message(w, in)) {
+                flow = false;
+                return;
+            }
+            Message lg;
+            if (locus::pipeline::read_message(r, lg) !=
+                    ReadResult::kOk ||
+                lg.type != MsgType::kLogits) {
+                flow = false;
+                return;
+            }
+            logits = std::move(lg.data);
+            ++pos;
+        };
+        std::vector<locus::tok::TokenId> gen;
+        for (auto t : prompt) {
+            round_trip(t);
+            if (!flow) {
+                break;
+            }
+        }
+        for (int i = 0; i < kGen && flow; ++i) {
+            const auto n = locus::model::argmax(logits);
+            gen.push_back(n);
+            if (n == tok.eos_id()) {
+                break;
+            }
+            round_trip(n);
+        }
+        ::close(w);
+        ::close(r);
+        CAPTURE(session);
+        REQUIRE(flow);
+        REQUIRE(gen == ref);  // reload between sessions stays byte-exact
+    }
+
+    th.join();
+    ::close(le);
+    REQUIRE(result.load() == 1);  // both sessions ended cleanly
+    REQUIRE(reloads == 1);        // the reload ran once, before session 2
 }

@@ -68,6 +68,9 @@ ConfigFile ConfigFile::parse(const std::string& path) {
     // than an error -- and silently applying nothing on a SIGHUP reload
     // (i#19 part 2) would read as a successful no-op.
     std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        throw Error{"config file does not exist: " + path};
+    }
     if (!std::filesystem::is_regular_file(path, ec)) {
         throw Error{"cannot read config file (not a regular file): " +
                     path};

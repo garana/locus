@@ -1,5 +1,7 @@
 #pragma once
 
+#include <csignal>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -29,6 +31,27 @@ struct StageConn {
     int keepalive_count = 3;
     int serve_sessions = 0;        /**< 0 = serve forever; else stop
                                     *   after N sessions (for tests). */
+};
+
+/**
+ * Hot-reload hook for serve_stage (i#19 SIGHUP reload). While serve_stage
+ * waits for the next peer it does so in an interruptible poll(), so a
+ * signal (installed without SA_RESTART) breaks the wait; if `flag` is
+ * then set, serve_stage clears it and calls `apply` to refresh the live
+ * allowlist, downstream pool and connection policy BEFORE accepting the
+ * next session. The reloaded values take effect from that session on;
+ * a signal arriving mid-session is applied at the next session boundary.
+ *
+ * `flag` must be the same object a SIGHUP handler sets (an async-signal-
+ * safe write to a volatile sig_atomic_t); serve_stage only reads and
+ * clears it. Default-constructed (both null) means no reload: serve_stage
+ * keeps its original behavior.
+ */
+struct StageReload {
+    volatile std::sig_atomic_t* flag = nullptr;
+    std::function<void(std::vector<Cidr>&, std::vector<HostPort>&,
+                       StageConn&)>
+        apply = nullptr;
 };
 
 /**
@@ -72,6 +95,11 @@ struct StageConn {
  * sessions (used by tests). The listen fd stays open across sessions
  * and is closed only when this function returns. CPU/CUDA only.
  *
+ * `reload` (optional) hot-reloads the allowlist, pool and policy between
+ * sessions on a signal; see StageReload. serve_stage works on mutable
+ * copies of `allow`/`downstreams`/`conn`, so the caller's originals are
+ * untouched.
+ *
  * @returns With serve_sessions > 0: true if all N sessions ended
  *     cleanly, false if any ended abnormally. Either way false on a
  *     fatal accept failure or no live downstream within
@@ -81,7 +109,8 @@ struct StageConn {
 bool serve_stage(PipelineStage& stage, int listen_fd,
                  const std::vector<Cidr>& allow,
                  const std::vector<HostPort>& downstreams,
-                 const StageConn& conn = {});
+                 const StageConn& conn = {},
+                 const StageReload& reload = {});
 
 /** serve_stage with a single downstream (a one-element pool). */
 bool serve_stage(PipelineStage& stage, int listen_fd,

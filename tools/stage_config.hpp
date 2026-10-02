@@ -1,9 +1,13 @@
 #pragma once
 
+#include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
 #include "cli_spec.hpp"
+#include "locus/pipeline/net.hpp"
+#include "locus/pipeline/stage_server.hpp"
 
 namespace locus_tools {
 
@@ -76,6 +80,85 @@ inline Spec<StageOptions> stage_spec() {
         D::integer("sessions", &O::sessions,
                    "serve N sessions then exit (0 = forever)"),
     });
+}
+
+/** Parses "A:B" into a half-open layer range, requiring A < B. */
+inline bool parse_layers(const std::string& s, std::uint32_t& a,
+                         std::uint32_t& b) {
+    const auto c = s.find(':');
+    if (c == std::string::npos) {
+        return false;
+    }
+    char* e1 = nullptr;
+    char* e2 = nullptr;
+    const long la = std::strtol(s.substr(0, c).c_str(), &e1, 10);
+    const std::string bs = s.substr(c + 1);
+    const long lb = std::strtol(bs.c_str(), &e2, 10);
+    if (*e1 != '\0' || *e2 != '\0' || la < 0 || lb < 0 || la >= lb) {
+        return false;
+    }
+    a = static_cast<std::uint32_t>(la);
+    b = static_cast<std::uint32_t>(lb);
+    return true;
+}
+
+/**
+ * The runtime values a StageOptions resolves to: the layer range and
+ * listen address (fixed for a running stage) and the allowlist, pool
+ * and connection policy (the reloadable subset). build_runtime is the
+ * one conversion+validation path, shared by startup and SIGHUP reload.
+ */
+struct StageRuntime {
+    std::uint32_t layer_begin = 0;
+    std::uint32_t layer_end = 0;
+    std::string listen_host;
+    int listen_port = 0;
+    std::vector<locus::pipeline::Cidr> allow;
+    std::vector<locus::pipeline::HostPort> pool;
+    locus::pipeline::StageConn conn;
+};
+
+/**
+ * Validates and converts `opt` into runtime values. @returns an empty
+ * string on success (out filled), else a human-readable error; the
+ * caller decides whether that is fatal (startup) or logged and skipped
+ * (reload).
+ */
+inline std::string build_runtime(const StageOptions& opt,
+                                 StageRuntime& out) {
+    if (!parse_layers(opt.layers, out.layer_begin, out.layer_end)) {
+        return "bad layers (want A:B with A < B): " + opt.layers;
+    }
+    if (!locus::pipeline::parse_hostport(opt.listen, out.listen_host,
+                                         out.listen_port)) {
+        return "bad listen (want HOST:PORT): " + opt.listen;
+    }
+    out.pool.clear();
+    for (const auto& ds : opt.downstream) {
+        std::string h;
+        int p = 0;
+        if (!locus::pipeline::parse_hostport(ds, h, p)) {
+            return "bad downstream (want HOST:PORT): " + ds;
+        }
+        out.pool.push_back({h, p});
+    }
+    out.allow.clear();
+    for (const auto& s : opt.allow) {
+        const auto c = locus::pipeline::Cidr::parse(s);
+        if (!c) {
+            return "bad allow CIDR: " + s;
+        }
+        out.allow.push_back(*c);
+    }
+    out.conn.connect_timeout_ms = opt.connect_timeout;
+    out.conn.reconnect_wait_ms = opt.reconnect_wait;
+    out.conn.reconnect_attempts = opt.reconnect_attempts;
+    out.conn.recv_timeout_ms = opt.read_timeout;
+    out.conn.keepalive_idle_s = opt.keepalive_idle;
+    out.conn.keepalive_intvl_s = opt.keepalive_interval;
+    out.conn.keepalive_count = opt.keepalive_count;
+    out.conn.serve_sessions = opt.sessions;
+    return "";
 }
 
 }  // namespace locus_tools
