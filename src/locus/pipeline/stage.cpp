@@ -26,17 +26,20 @@ PipelineStage::PipelineStage(const model::LlamaModel& model,
     }
 }
 
-Message PipelineStage::step(const Message& in) {
+Message PipelineStage::step(const Message& in) { return step(seq_, in); }
+
+Message PipelineStage::step(kv::PagedKvCache::Seq& seq,
+                            const Message& in) {
     const bool last = is_last();
-    const std::uint32_t before = seq_.n_tokens;
+    const std::uint32_t before = seq.n_tokens;
     // Every stage processes the same tokens in order, so the entry's
-    // position must match this stage's own next slot; a mismatch means
+    // position must match this session's own next slot; a mismatch means
     // the stages fell out of lockstep.
     if (in.position != before) {
         throw std::invalid_argument(
             "PipelineStage: position out of lockstep");
     }
-    if (!cache_.ensure_capacity(seq_, 1)) {
+    if (!cache_.ensure_capacity(seq, 1)) {
         throw std::runtime_error("PipelineStage: cache exhausted");
     }
 
@@ -47,7 +50,7 @@ Message PipelineStage::step(const Message& in) {
                 "PipelineStage: first stage expects a kToken message");
         }
         model_.forward_layers(in.token, {}, layer_begin_, layer_end_,
-                              cache_, seq_, ws_, out);
+                              cache_, seq, ws_, out);
     } else {
         if (in.type != MsgType::kActivation) {
             throw std::invalid_argument(
@@ -58,14 +61,14 @@ Message PipelineStage::step(const Message& in) {
                 "PipelineStage: activation size mismatch");
         }
         model_.forward_layers(0, in.data, layer_begin_, layer_end_,
-                              cache_, seq_, ws_, out);
+                              cache_, seq, ws_, out);
     }
 
     // forward_layers advances the sequence only on the final stage
     // (layer_end == n_layers); a non-final stage advances its own
     // position so the next token's KV lands at the right slot.
     if (!last) {
-        seq_.n_tokens = before + 1;
+        seq.n_tokens = before + 1;
     }
 
     if (last) {
@@ -105,9 +108,11 @@ bool PipelineStage::run(int in_fd, int out_fd) {
     return ok;
 }
 
-void PipelineStage::reset() {
-    cache_.release(seq_);
-    seq_ = kv::PagedKvCache::Seq{};
+void PipelineStage::reset() { reset(seq_); }
+
+void PipelineStage::reset(kv::PagedKvCache::Seq& seq) {
+    cache_.release(seq);
+    seq = kv::PagedKvCache::Seq{};
 }
 
 }  // namespace locus::pipeline

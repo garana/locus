@@ -128,4 +128,49 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
                  const std::string& downstream_host,
                  int downstream_port, const StageConn& conn = {});
 
+/**
+ * Concurrent (event-loop) serving model for one stage, the multiplexed
+ * counterpart to serve_stage (DESIGN.md i#24). Where serve_stage runs
+ * one session at a time -- accept, serve to EOF, re-accept -- this
+ * watches the listener and every active input connection together in a
+ * sys::Poller and interleaves them: one slow or idle peer never blocks
+ * the others, so N upstreams are served at once over a single thread.
+ *
+ * Each accepted connection becomes an independent session: it dials its
+ * own downstream from `downstreams` (round-robin, same pool semantics as
+ * serve_stage), gets its own KV sequence in the stage's shared cache
+ * (PipelineStage::step(seq, in)), and buffers its own partial input
+ * frame. Input sockets are made non-blocking and drained with recv();
+ * frames are assembled with the message codec's decode(), so a frame
+ * split across reads is reassembled rather than lost.
+ *
+ * Dropping a peer follows the sys::Poller contract exactly: a session is
+ * ended only after a read drains to 0 (clean EOF) or -1 with a
+ * non-retriable errno, never on a bare hangup/error flag, and any bytes
+ * already buffered are decoded and processed before the drop (so a
+ * hangup that arrives with a final frame still delivers it). A session
+ * that ends with a half-read frame or a socket error is counted as
+ * unclean. Ending a session frees its KV at once.
+ *
+ * Known limits this increment (follow-ups under i#24): downstream
+ * writes are still blocking (a stalled downstream can briefly block the
+ * loop; write-readiness in the poller comes later), and the connect to a
+ * new session's downstream is a blocking dial at accept time.
+ *
+ * `conn.serve_sessions` bounds the loop for tests: 0 serves forever
+ * (returns only on a fatal error), N stops once N sessions have ended.
+ * `reload` (optional) applies between wakeups to the allowlist, pool and
+ * policy used for FUTURE accepts; running sessions are untouched.
+ *
+ * @returns With serve_sessions > 0: true if all N sessions ended
+ *     cleanly, false if any ended abnormally or on a fatal accept / no
+ *     live downstream / poll error. With serve_sessions == 0: returns
+ *     only on such a fatal error (false). CPU/CUDA only.
+ */
+bool serve_stage_mux(PipelineStage& stage, int listen_fd,
+                     const std::vector<Cidr>& allow,
+                     const std::vector<HostPort>& downstreams,
+                     const StageConn& conn = {},
+                     const StageReload& reload = {});
+
 }  // namespace locus::pipeline
