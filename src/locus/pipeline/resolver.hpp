@@ -64,8 +64,14 @@ class Resolver {
      * Returns an IP for `host`. A numeric IP is returned unchanged (no
      * caching). On a cache hit, returns one of the cached IPs
      * round-robin without a lookup; on a miss, resolves once
-     * (synchronously, blocking), caches the result, and returns an IP.
-     * @returns the IP, or an empty string if resolution failed.
+     * (synchronously, blocking) and caches the result. A FAILURE is
+     * cached as a negative entry for a short negative TTL (min(TTL, 5 s))
+     * and then returns empty on subsequent calls without re-asking, so a
+     * bad or dead name costs one lookup per negative TTL rather than one
+     * per call; the background refresh clears it when the name resolves
+     * again.
+     * @returns the IP, or an empty string if resolution failed (or is
+     *     within a cached negative entry).
      */
     std::string resolve(const std::string& host);
 
@@ -86,6 +92,12 @@ class Resolver {
 
     std::int64_t now_ms();
     std::int64_t ttl_ms() const;  // clamped configured TTL
+    /** Delay until the next refresh of an entry just (re)resolved.
+     * Success: refresh_frac of the TTL. Failure: a short negative TTL
+     * (min(TTL, 5 s)) so a bad name is retried soon without re-asking
+     * every call -- the same policy for a failed initial resolve and a
+     * failed refresh. */
+    std::int64_t refresh_delay_ms(bool failed) const;
     void run();                   // background thread body
 
     Options opt_;

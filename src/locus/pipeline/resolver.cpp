@@ -106,31 +106,44 @@ std::int64_t Resolver::ttl_ms() const {
     return static_cast<std::int64_t>(ttl) * 1000;
 }
 
+std::int64_t Resolver::refresh_delay_ms(bool failed) const {
+    if (failed) {
+        // Short negative TTL: retry a bad name soon, but not every call.
+        return std::min<std::int64_t>(ttl_ms(), 5000);
+    }
+    return static_cast<std::int64_t>(static_cast<double>(ttl_ms()) *
+                                     opt_.refresh_frac);
+}
+
 std::string Resolver::resolve(const std::string& host) {
     if (is_numeric_ip(host)) {
         return host;  // already an address; nothing to cache
     }
     std::unique_lock<std::mutex> lk(mu_);
-    if (auto it = cache_.find(host);
-        it != cache_.end() && !it->second.ips.empty()) {
+    if (auto it = cache_.find(host); it != cache_.end()) {
         Entry& e = it->second;
-        return e.ips[e.cursor++ % e.ips.size()];
+        if (!e.ips.empty()) {
+            return e.ips[e.cursor++ % e.ips.size()];  // positive hit
+        }
+        // Negative hit: a recent lookup failed and is cached for a short
+        // negative TTL. Return empty WITHOUT re-asking -- the background
+        // refresh retries at refresh_due_ms. This bounds a bad or dead
+        // name to one lookup per negative TTL instead of one per call
+        // (which, with real getaddrinfo on the serve thread, would be a
+        // DNS query -- possibly a multi-second timeout -- every call).
+        return {};
     }
     // Miss: resolve once, synchronously, with the lock released so a slow
     // lookup does not stall other resolve() callers.
     lk.unlock();
     std::vector<std::string> ips = lookup_(host);
     lk.lock();
-    if (ips.empty()) {
-        return {};  // do not cache a failure: the next call retries
-    }
     Entry& e = cache_[host];
-    e.ips = std::move(ips);
+    e.ips = std::move(ips);  // empty == a cached negative entry
     e.cursor = 0;
-    e.refresh_due_ms =
-        now_ms() + static_cast<std::int64_t>(
-                       static_cast<double>(ttl_ms()) * opt_.refresh_frac);
-    return e.ips[e.cursor++ % e.ips.size()];
+    e.refresh_due_ms = now_ms() + refresh_delay_ms(e.ips.empty());
+    return e.ips.empty() ? std::string{}
+                         : e.ips[e.cursor++ % e.ips.size()];
 }
 
 void Resolver::refresh_now() {
@@ -155,18 +168,14 @@ void Resolver::refresh_now() {
         }
         Entry& e = it->second;
         if (!ips.empty()) {
-            e.ips = std::move(ips);
-            e.cursor = 0;
-            e.refresh_due_ms =
-                now_ms() + static_cast<std::int64_t>(
-                               static_cast<double>(ttl_ms()) *
-                               opt_.refresh_frac);
-        } else {
-            // Keep the stale set and retry sooner (do not drop a name
-            // just because one lookup failed).
-            const std::int64_t retry = std::min<std::int64_t>(ttl_ms(), 5000);
-            e.refresh_due_ms = now_ms() + retry;
+            e.ips = std::move(ips);  // refresh (or a negative entry
+            e.cursor = 0;            // recovering) -> now positive
         }
+        // On failure keep whatever is cached (a stale positive set, or
+        // an empty negative entry) and reschedule; refresh_delay_ms
+        // gives the short negative TTL so a failing name is retried soon
+        // without being dropped. Same policy for both failure paths.
+        e.refresh_due_ms = now_ms() + refresh_delay_ms(ips.empty());
     }
 }
 
