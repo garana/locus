@@ -475,3 +475,61 @@ TEST_CASE("serve_stage_mux parks a backlog for a slow downstream",
     ::close(from_stage);
     REQUIRE(sres.load() == 1);  // ended cleanly after the backlog drained
 }
+
+// A client that sends its last frame then half-closes its send side
+// (shutdown SHUT_WR) -- the "no more input, now give me the answer"
+// pattern -- still gets its answer. The stage sees the frame and a
+// recv()==0 EOF in the same batch, and because the drop is honored only
+// AFTER the batch's frames are processed and flushed, the logits are
+// delivered before the session is torn down. This pins the load-bearing
+// loop ordering: hoisting the drop above the frame loop would break this
+// while leaving every other test green (none half-close).
+TEST_CASE("serve_stage_mux answers a client that half-closes after a frame",
+          "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    const std::uint32_t L = model.hparams().n_layers;
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L);
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, {}, {{"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    const int to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(to_stage >= 0);
+    const int from_stage = locus::pipeline::accept_one(lc, nullptr);
+    REQUIRE(from_stage >= 0);
+    ::close(lc);
+
+    // One token, then half-close the send side: the stage must still
+    // answer before honoring the resulting EOF.
+    REQUIRE(locus::pipeline::write_message(
+        to_stage, locus::pipeline::make_token(1, 0, 1)));
+    REQUIRE(::shutdown(to_stage, SHUT_WR) == 0);
+
+    Message lg;
+    REQUIRE(locus::pipeline::read_message(from_stage, lg) ==
+            ReadResult::kOk);
+    REQUIRE(lg.type == MsgType::kLogits);  // answered despite the EOF
+
+    ::close(to_stage);
+    server.join();
+    ::close(from_stage);
+    REQUIRE(sres.load() == 1);  // ended cleanly (EOF at a frame boundary)
+}

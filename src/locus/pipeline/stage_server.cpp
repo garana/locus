@@ -465,6 +465,15 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                 }
             }
 
+            // Honor an EOF only HERE, after the frame loop above has
+            // decoded, stepped and flushed this batch's frames. This
+            // ordering is load-bearing: a client that sends its last
+            // frame and then half-closes its send side (shutdown SHUT_WR)
+            // produces the frame and a recv()==0 in the same batch, and
+            // still gets its answer because the drop runs after the
+            // frames are processed. Do NOT hoist this above the frame
+            // loop -- that would silently stop half-closing clients from
+            // getting answers, with every existing test still green.
             if (!dropped && gone) {
                 // Clean only if the peer closed at a frame boundary
                 // (nothing half-read) and the socket itself did not
