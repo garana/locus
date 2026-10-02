@@ -1,3 +1,6 @@
+#include <signal.h>
+
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -42,24 +45,24 @@ const char* kUsage =
     "\n"
     "Flags (and the matching config keys):\n";
 
-// Parses "A:B" into a half-open layer range, requiring A < B.
-bool parse_layers(const std::string& s, std::uint32_t& a,
-                  std::uint32_t& b) {
-    const auto c = s.find(':');
-    if (c == std::string::npos) {
-        return false;
-    }
-    char* e1 = nullptr;
-    char* e2 = nullptr;
-    const long la = std::strtol(s.substr(0, c).c_str(), &e1, 10);
-    const std::string bs = s.substr(c + 1);
-    const long lb = std::strtol(bs.c_str(), &e2, 10);
-    if (*e1 != '\0' || *e2 != '\0' || la < 0 || lb < 0 || la >= lb) {
-        return false;
-    }
-    a = static_cast<std::uint32_t>(la);
-    b = static_cast<std::uint32_t>(lb);
-    return true;
+// SIGHUP reload flag (i#19). The handler does the only async-signal-
+// safe thing -- set a flag; serve_stage polls it between sessions and
+// does the actual reload. volatile sig_atomic_t is the type guaranteed
+// safe to touch from a handler.
+volatile std::sig_atomic_t g_reload = 0;
+
+void on_sighup(int /*sig*/) { g_reload = 1; }
+
+// Installs the SIGHUP handler WITHOUT SA_RESTART, so SIGHUP interrupts
+// serve_stage's blocking poll (EINTR) and the reload is applied before
+// the next session rather than only when the next peer happens to
+// arrive.
+void install_sighup() {
+    struct sigaction sa;
+    sa.sa_handler = on_sighup;
+    sigemptyset(&sa.sa_mask);  // macro on some platforms; no :: qualifier
+    sa.sa_flags = 0;  // no SA_RESTART
+    sigaction(SIGHUP, &sa, nullptr);
 }
 
 }  // namespace
@@ -108,6 +111,12 @@ int main(int argc, char** argv) {
         seen.insert(name);
     }
 
+    // The CLI-only options, kept immutable as the reload baseline: each
+    // SIGHUP reload starts from a copy of this and re-overlays the file,
+    // so a key removed from the file reverts to its CLI value instead of
+    // sticking (i#19 part 2).
+    const locus_tools::StageOptions cli_baseline = opt;
+
     // CLI-then-file precedence: the config file overrides/adds to what
     // the flags set (the file wins). i#19, DESIGN.md R15+.
     if (!config_path.empty()) {
@@ -133,78 +142,133 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    std::uint32_t la = 0, lb = 0;
-    if (!parse_layers(opt.layers, la, lb)) {
-        std::fprintf(stderr, "bad --layers (want A:B with A < B)\n");
+    // One validation+conversion path, shared with reload.
+    locus_tools::StageRuntime rt;
+    if (const std::string err = locus_tools::build_runtime(opt, rt);
+        !err.empty()) {
+        std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
     }
-    std::string lh;
-    int lp = 0;
-    if (!locus::pipeline::parse_hostport(opt.listen, lh, lp)) {
-        std::fprintf(stderr, "bad --listen (want HOST:PORT)\n");
-        return 2;
-    }
-    std::vector<locus::pipeline::HostPort> pool;
     std::string pool_desc;  // for the startup log line
     for (const auto& ds : opt.downstream) {
-        std::string dh;
-        int dp = 0;
-        if (!locus::pipeline::parse_hostport(ds, dh, dp)) {
-            std::fprintf(stderr,
-                         "bad --downstream (want HOST:PORT): %s\n",
-                         ds.c_str());
-            return 2;
-        }
-        pool.push_back({dh, dp});
         if (!pool_desc.empty()) {
             pool_desc += ", ";
         }
         pool_desc += ds;
     }
-    std::vector<locus::pipeline::Cidr> allow;
-    for (const auto& s : opt.allow) {
-        const auto c = locus::pipeline::Cidr::parse(s);
-        if (!c) {
-            std::fprintf(stderr, "bad --allow CIDR: %s\n", s.c_str());
-            return 2;
-        }
-        allow.push_back(*c);
-    }
 
     try {
         auto g = locus::gguf::GgufFile::open(opt.model);
-        // Slice-only loading: this process wires up only layers [la, lb)
-        // (its share of the model), so cluster memory is ~1x the model.
-        // hparams().n_layers stays the full count, so the range check
-        // below still validates against the whole model.
-        auto model = locus::model::LlamaModel::load(g, la, lb);
-        if (lb > model.hparams().n_layers) {
+        // Slice-only loading: this process wires up only layers
+        // [begin, end) (its share of the model), so cluster memory is
+        // ~1x the model. hparams().n_layers stays the full count, so
+        // the range check still validates against the whole model.
+        auto model = locus::model::LlamaModel::load(g, rt.layer_begin,
+                                                    rt.layer_end);
+        if (rt.layer_end > model.hparams().n_layers) {
             std::fprintf(stderr,
                          "--layers end %u exceeds model n_layers %u\n",
-                         lb, model.hparams().n_layers);
+                         rt.layer_end, model.hparams().n_layers);
             return 2;
         }
-        locus::pipeline::PipelineStage stage(model, la, lb);
-        const int lfd = locus::pipeline::listen_on(lh, lp, nullptr);
+        locus::pipeline::PipelineStage stage(model, rt.layer_begin,
+                                             rt.layer_end);
+        const int lfd = locus::pipeline::listen_on(rt.listen_host,
+                                                   rt.listen_port,
+                                                   nullptr);
         if (lfd < 0) {
             std::fprintf(stderr, "listen on %s failed\n",
                          opt.listen.c_str());
             return 1;
         }
         std::fprintf(stderr,
-                     "locus-stage: layers [%u,%u) on %s -> %s\n", la,
-                     lb, opt.listen.c_str(), pool_desc.c_str());
-        locus::pipeline::StageConn conn;
-        conn.connect_timeout_ms = opt.connect_timeout;
-        conn.reconnect_wait_ms = opt.reconnect_wait;
-        conn.reconnect_attempts = opt.reconnect_attempts;
-        conn.recv_timeout_ms = opt.read_timeout;
-        conn.keepalive_idle_s = opt.keepalive_idle;
-        conn.keepalive_intvl_s = opt.keepalive_interval;
-        conn.keepalive_count = opt.keepalive_count;
-        conn.serve_sessions = opt.sessions;
-        const bool ok = locus::pipeline::serve_stage(stage, lfd, allow,
-                                                     pool, conn);
+                     "locus-stage: layers [%u,%u) on %s -> %s\n",
+                     rt.layer_begin, rt.layer_end, opt.listen.c_str(),
+                     pool_desc.c_str());
+
+        // Hot reload (SIGHUP, i#19): re-read the config from the
+        // immutable CLI baseline and apply the reloadable subset
+        // (allowlist, pool, connection policy). model, layers and the
+        // listen bind are fixed for a running stage -- a file that
+        // changes them is warned about and otherwise ignored. A reload
+        // that fails to parse/validate is logged and the running config
+        // is kept.
+        locus::pipeline::StageReload reload;
+        if (!config_path.empty()) {
+            install_sighup();
+            reload.flag = &g_reload;
+            reload.apply =
+                [&](std::vector<locus::pipeline::Cidr>& a,
+                    std::vector<locus::pipeline::HostPort>& p,
+                    locus::pipeline::StageConn& c) {
+                    // A reload must never kill a running stage, whatever
+                    // the file or parser throws (ConfigFile::Error, a
+                    // bad-int runtime_error, anything): catch everything
+                    // and keep the current config.
+                    try {
+                        locus_tools::StageOptions fresh = cli_baseline;
+                        const auto cfg =
+                            locus::config::ConfigFile::parse(config_path);
+                        std::set<std::string> rseen;
+                        spec.apply_config(cfg, fresh, rseen);
+                        locus_tools::StageRuntime rt2;
+                        if (const std::string err =
+                                locus_tools::build_runtime(fresh, rt2);
+                            !err.empty()) {
+                            std::fprintf(stderr,
+                                         "reload: %s; keeping current "
+                                         "config\n",
+                                         err.c_str());
+                            return;
+                        }
+                        // Fixed for a running stage: warn and ignore.
+                        // sessions is the lifetime budget compared
+                        // against a process-start counter, so reloading
+                        // it could exit a long-up stage immediately.
+                        if (fresh.model != opt.model) {
+                            std::fprintf(stderr,
+                                         "reload: model cannot change on "
+                                         "a running stage; ignoring\n");
+                        }
+                        if (fresh.layers != opt.layers) {
+                            std::fprintf(stderr,
+                                         "reload: layers cannot change "
+                                         "on a running stage; ignoring\n");
+                        }
+                        if (fresh.listen != opt.listen) {
+                            std::fprintf(stderr,
+                                         "reload: listen cannot change "
+                                         "on a running stage; ignoring\n");
+                        }
+                        if (fresh.sessions != opt.sessions) {
+                            std::fprintf(stderr,
+                                         "reload: sessions cannot change "
+                                         "on a running stage; ignoring\n");
+                        }
+                        a = rt2.allow;
+                        p = rt2.pool;
+                        c = rt2.conn;
+                        c.serve_sessions = rt.conn.serve_sessions;  // keep
+                        std::fprintf(stderr,
+                                     "reload: applied %s (allow=%zu "
+                                     "pool=%zu)\n",
+                                     config_path.c_str(), a.size(),
+                                     p.size());
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr,
+                                     "reload: %s; keeping current "
+                                     "config\n",
+                                     e.what());
+                    } catch (...) {
+                        std::fprintf(stderr,
+                                     "reload: unknown error; keeping "
+                                     "current config\n");
+                    }
+                };
+        }
+
+        const bool ok = locus::pipeline::serve_stage(
+            stage, lfd, rt.allow, rt.pool, rt.conn, reload);
         return ok ? 0 : 1;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "locus-stage: %s\n", e.what());

@@ -1,8 +1,10 @@
 #include "locus/pipeline/stage_server.hpp"
 
+#include <poll.h>
 #include <unistd.h>
 
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <thread>
@@ -86,41 +88,89 @@ int connect_pool(const std::vector<HostPort>& pool, std::size_t* cursor,
 bool serve_stage(PipelineStage& stage, int listen_fd,
                  const std::vector<Cidr>& allow,
                  const std::vector<HostPort>& downstreams,
-                 const StageConn& conn) {
+                 const StageConn& conn, const StageReload& reload) {
     if (downstreams.empty()) {
         std::fprintf(stderr, "serve_stage: empty downstream pool\n");
         ::close(listen_fd);
         return false;
     }
+    // Live, mutable copies so a hot reload (SIGHUP) can refresh the
+    // allowlist, pool and policy between sessions without disturbing the
+    // caller's originals.
+    std::vector<Cidr> allow_live = allow;
+    std::vector<HostPort> pool_live = downstreams;
+    StageConn conn_live = conn;
+
     int served = 0;
-    bool all_clean = true;  // any session ended abnormally?
+    bool all_clean = true;   // any session ended abnormally?
     std::size_t cursor = 0;  // round-robin position in the pool
     for (;;) {
+        // Wait for the next peer in an interruptible poll so a SIGHUP
+        // (handler installed without SA_RESTART) breaks the wait; a
+        // pending reload is applied before this session starts. A reload
+        // that arrives mid-session lands here, at the next boundary.
+        //
+        // Known narrow race: a SIGHUP delivered between the flag check
+        // and poll() entering the kernel is not pending during poll, so
+        // on an idle stage the reload waits for the next peer instead of
+        // applying immediately. Self-correcting (a second SIGHUP works)
+        // and the missing "reload: applied" line is the operator's cue.
+        // The portable close (a self-pipe the handler writes, polled
+        // alongside listen_fd) is deferred to the event-loop rework
+        // (i#24), which needs that wakeup mechanism anyway.
+        for (;;) {
+            if (reload.flag != nullptr && *reload.flag != 0 &&
+                reload.apply) {
+                *reload.flag = 0;  // clear first: a signal during apply
+                                   // re-fires and is caught next loop
+                reload.apply(allow_live, pool_live, conn_live);
+            }
+            pollfd pfd{listen_fd, POLLIN, 0};
+            const int pr = ::poll(&pfd, 1, -1);
+            if (pr < 0) {
+                if (errno == EINTR) {
+                    continue;  // a signal (maybe SIGHUP): recheck reload
+                }
+                ::close(listen_fd);
+                return false;  // poll error
+            }
+            // A reload may have been requested just as the peer arrived;
+            // apply it (loop back to the check) before accepting, so the
+            // new session uses the fresh config.
+            if (reload.flag != nullptr && *reload.flag != 0 &&
+                reload.apply) {
+                continue;
+            }
+            break;  // POLLIN: a peer is pending, accept will not block
+        }
+
         // Automatic reconnect: each session re-accepts a fresh input
         // and re-dials the downstream, so a dropped peer (detected by
         // keepalive, or a clean EOF) is recovered by serving the next
         // connection rather than exiting. Per the terminal-kTimeout
         // contract, a session that ends always tears its fds down (in
         // stage.run) and we re-accept -- never re-read a dead fd.
-        const int in_fd = accept_allowed(listen_fd, allow);
+        const int in_fd = accept_allowed(listen_fd, allow_live);
         if (in_fd < 0) {
             ::close(listen_fd);
             return false;  // accept failed (listener broken)
         }
-        set_keepalive(in_fd, conn.keepalive_idle_s,
-                      conn.keepalive_intvl_s, conn.keepalive_count);
-        if (conn.recv_timeout_ms > 0) {
-            set_recv_timeout(in_fd, conn.recv_timeout_ms);
+        set_keepalive(in_fd, conn_live.keepalive_idle_s,
+                      conn_live.keepalive_intvl_s,
+                      conn_live.keepalive_count);
+        if (conn_live.recv_timeout_ms > 0) {
+            set_recv_timeout(in_fd, conn_live.recv_timeout_ms);
         }
 
-        const int out_fd = connect_pool(downstreams, &cursor, conn);
+        const int out_fd = connect_pool(pool_live, &cursor, conn_live);
         if (out_fd < 0) {
             ::close(in_fd);
             ::close(listen_fd);
             return false;  // no live downstream within the budget
         }
-        set_keepalive(out_fd, conn.keepalive_idle_s,
-                      conn.keepalive_intvl_s, conn.keepalive_count);
+        set_keepalive(out_fd, conn_live.keepalive_idle_s,
+                      conn_live.keepalive_intvl_s,
+                      conn_live.keepalive_count);
 
         stage.reset();  // fresh KV state for this session's sequence
         if (!stage.run(in_fd, out_fd)) {  // closes in_fd and out_fd
@@ -130,7 +180,8 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
                          "re-accepting\n");
         }
         ++served;
-        if (conn.serve_sessions > 0 && served >= conn.serve_sessions) {
+        if (conn_live.serve_sessions > 0 &&
+            served >= conn_live.serve_sessions) {
             ::close(listen_fd);
             return all_clean;  // false if any session ended abnormally
         }

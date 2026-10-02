@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -26,8 +27,15 @@ namespace locus::config {
  */
 class ConfigFile {
   public:
-    /** Thrown on an unreadable file or a malformed line. */
-    struct Error {
+    /**
+     * Thrown on an unreadable file or a malformed line. Derives from
+     * std::runtime_error so a single `catch (const std::exception&)`
+     * (as the reload path and future callers use) catches it; `message`
+     * is kept for call sites that read it directly.
+     */
+    struct Error : std::runtime_error {
+        explicit Error(std::string msg)
+            : std::runtime_error(msg), message(std::move(msg)) {}
         std::string message;
     };
 
