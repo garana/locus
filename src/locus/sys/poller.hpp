@@ -24,15 +24,28 @@ namespace locus::sys {
 class Poller {
   public:
     /**
-     * One ready fd and what happened to it. `readable` means a read
-     * will not block (it may return data or 0 at EOF), so a caller
-     * always reads on it; `hangup` means the peer closed its end and
-     * `error` an error condition. A hung-up fd is reported with both
-     * `readable` and `hangup` set, so the read() that returns 0 is the
-     * authoritative "peer gone" signal on both backends; the flags are
-     * the explicit hint that lets a caller drop a connection without a
-     * zero-length read first. (epoll EPOLLIN/EPOLLHUP/EPOLLERR map to
-     * these; kqueue EVFILT_READ data / EV_EOF / EV_ERROR map to them.)
+     * One ready fd and what happened to it.
+     *
+     * - `readable`: a read will not block. It may return bytes, 0 at
+     *   EOF, or -1 with an error (e.g. ECONNRESET).
+     * - `hangup`: an advisory hint that the peer closed or half-closed.
+     *   It is NOT a reliable drop trigger: on epoll a clean socket FIN
+     *   raises no hangup (only `readable`), while on kqueue the same FIN
+     *   does set it; and on BOTH backends `hangup` can be set while
+     *   unread bytes are still buffered. Never drop a peer on `hangup`
+     *   alone, and never use it to decide when to unregister an fd.
+     * - `error`: the fd is unusable and `readable` is false; the caller
+     *   MUST remove or close it or wait() keeps reporting it. This is
+     *   effectively epoll-only: on kqueue a socket error such as a RST
+     *   surfaces as `readable` with the next read returning -1, not as
+     *   `error`.
+     *
+     * Portable rule for the serving loop: a `read()` returning 0 (clean
+     * EOF) or -1 with a non-retriable errno is the only cross-backend
+     * "peer gone" signal, so always drain to such a read before dropping
+     * a peer; treat `hangup` and `error` as hints, not the authority.
+     * (epoll EPOLLIN/EPOLLHUP/EPOLLERR and kqueue EVFILT_READ data /
+     * EV_EOF / EV_ERROR map onto these fields.)
      */
     struct Event {
         int fd = -1;
