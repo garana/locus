@@ -60,8 +60,8 @@ void Poller::remove(int fd) {
     ::kevent(poll_fd_, &ev, 1, nullptr, 0, nullptr);
 }
 
-int Poller::wait(std::vector<int>& ready, int timeout_ms) {
-    ready.clear();
+int Poller::wait(std::vector<Event>& events, int timeout_ms) {
+    events.clear();
     struct kevent evs[64];
     // Track a deadline so an EINTR retry resumes with the REMAINING
     // budget rather than restarting timeout_ms (honoring "waits up to
@@ -91,7 +91,13 @@ int Poller::wait(std::vector<int>& ready, int timeout_ms) {
             return -1;
         }
         for (int i = 0; i < n; ++i) {
-            ready.push_back(static_cast<int>(evs[i].ident));
+            Event e;
+            e.fd = static_cast<int>(evs[i].ident);
+            e.error = (evs[i].flags & EV_ERROR) != 0;
+            e.hangup = (evs[i].flags & EV_EOF) != 0;
+            // On EV_ERROR the data field is an errno, not a byte count.
+            e.readable = e.error ? false : (evs[i].data > 0 || e.hangup);
+            events.push_back(e);
         }
         return n;
     }
@@ -131,8 +137,8 @@ void Poller::remove(int fd) {
     ::epoll_ctl(poll_fd_, EPOLL_CTL_DEL, fd, nullptr);
 }
 
-int Poller::wait(std::vector<int>& ready, int timeout_ms) {
-    ready.clear();
+int Poller::wait(std::vector<Event>& events, int timeout_ms) {
+    events.clear();
     epoll_event evs[64];
     // Track a deadline so an EINTR retry resumes with the REMAINING
     // budget rather than restarting timeout_ms (honoring "waits up to
@@ -159,7 +165,16 @@ int Poller::wait(std::vector<int>& ready, int timeout_ms) {
             return -1;
         }
         for (int i = 0; i < n; ++i) {
-            ready.push_back(evs[i].data.fd);
+            Event e;
+            e.fd = evs[i].data.fd;
+            const auto bits = evs[i].events;
+            e.error = (bits & EPOLLERR) != 0;
+            e.hangup = (bits & EPOLLHUP) != 0;
+            // EPOLLIN or a hangup both mean a read won't block (it may
+            // return 0 at EOF); on an error we leave readable false.
+            e.readable =
+                e.error ? false : (bits & (EPOLLIN | EPOLLHUP)) != 0;
+            events.push_back(e);
         }
         return n;
     }
