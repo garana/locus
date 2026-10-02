@@ -1,13 +1,27 @@
+#include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
+#include <thread>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/sys/poller.hpp"
 
 using locus::sys::Poller;
+
+namespace {
+// Counts SIGALRM deliveries so the test knows how many of the burst
+// actually landed. `g = g + 1` (a plain load+store, serialized within
+// one thread's handler) rather than `++`, which on a volatile is
+// deprecated in C++20 (-Wvolatile) and would break the warning-clean
+// build.
+volatile std::sig_atomic_t g_alarms = 0;
+void on_alarm(int /*sig*/) { g_alarms = g_alarms + 1; }
+}  // namespace
 
 namespace {
 
@@ -113,4 +127,62 @@ TEST_CASE("Poller self-pipe wakes a blocked wait (the signal pattern)",
     REQUIRE(n == 1);
     REQUIRE(ready[0] == wake.fd[0]);
     REQUIRE(ms < 2000);  // returned well before the 5s timeout
+}
+
+// The EINTR branch of wait() is the one part no other case reaches
+// (they never deliver a signal), and it carries the deadline fix: a
+// retry must resume with the remaining budget, not restart timeout_ms.
+// Deliver a BOUNDED burst of SIGALRM to the waiting thread (handler
+// without SA_RESTART, so each interrupts epoll_wait/kevent with EINTR)
+// and check wait() still returns near the requested timeout. The burst
+// stops, so a regression returns late rather than hanging: with the fix
+// ~400 ms, without it the last signal (~250 ms) restarts a full 400 ms
+// -> ~650 ms, and the < 550 ms bound separates them with ~100 ms margin
+// either side.
+TEST_CASE("Poller.wait honors the deadline across EINTR retries",
+          "[poller]") {
+    struct sigaction sa;
+    sa.sa_handler = on_alarm;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  // no SA_RESTART: SIGALRM interrupts the wait
+    struct sigaction old_sa;
+    REQUIRE(::sigaction(SIGALRM, &sa, &old_sa) == 0);
+    g_alarms = 0;
+
+    int fds[2];
+    REQUIRE(::pipe(fds) == 0);  // read end never written -> never ready
+
+    Poller p;
+    p.add_read(fds[0]);
+
+    const pthread_t waiter = ::pthread_self();
+    std::thread burst([waiter] {
+        for (int i = 0; i < 5; ++i) {  // fire at ~50..250 ms, then stop
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            ::pthread_kill(waiter, SIGALRM);
+        }
+    });
+
+    std::vector<int> ready;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int n = p.wait(ready, 400);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    burst.join();
+    ::sigaction(SIGALRM, &old_sa, nullptr);  // restore
+    ::close(fds[0]);
+    ::close(fds[1]);
+
+    // Need most of the burst to have landed: with fewer signals a
+    // regression's return time (last-signal + 400 ms) can itself drop
+    // under 550 ms and pass vacuously. Require >= 4 of 5 so the < 550
+    // bound still discriminates.
+    if (g_alarms < 4) {
+        SKIP("only " << static_cast<int>(g_alarms)
+                     << " of 5 signals landed; inconclusive");
+    }
+    REQUIRE(n == 0);     // timed out: the pipe never became readable
+    REQUIRE(ms >= 350);  // did not return early on the first EINTR
+    REQUIRE(ms < 550);   // did not restart the 400 ms per signal
 }
