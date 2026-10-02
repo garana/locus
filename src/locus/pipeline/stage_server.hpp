@@ -34,21 +34,31 @@ struct StageConn {
 };
 
 /**
- * Hot-reload hook for serve_stage (i#19 SIGHUP reload). While serve_stage
- * waits for the next peer it does so in an interruptible poll(), so a
- * signal (installed without SA_RESTART) breaks the wait; if `flag` is
- * then set, serve_stage clears it and calls `apply` to refresh the live
- * allowlist, downstream pool and connection policy BEFORE accepting the
- * next session. The reloaded values take effect from that session on;
- * a signal arriving mid-session is applied at the next session boundary.
+ * Hot-reload hook for serve_stage (i#19 SIGHUP reload). serve_stage
+ * waits for the next peer in an event loop (sys::Poller) that also
+ * watches `wake_fd`; a SIGHUP handler sets `flag` and writes a byte to
+ * the wake pipe, which makes the poll return at once. serve_stage then
+ * clears `flag` and calls `apply` to refresh the live allowlist,
+ * downstream pool and connection policy BEFORE accepting the next
+ * session. Reloaded values take effect from that session on; a signal
+ * arriving mid-session is applied at the next session boundary.
  *
- * `flag` must be the same object a SIGHUP handler sets (an async-signal-
- * safe write to a volatile sig_atomic_t); serve_stage only reads and
- * clears it. Default-constructed (both null) means no reload: serve_stage
- * keeps its original behavior.
+ * The wake pipe closes the check-then-poll race a bare flag would have:
+ * because the written byte stays readable (level-triggered), a SIGHUP
+ * delivered between the flag check and the poll is still pending and
+ * wakes it, so an idle stage reloads promptly rather than waiting for
+ * the next peer.
+ *
+ * `flag` must be the object the handler sets, and `wake_fd` the read
+ * end of the pipe it writes (both async-signal-safe: a write to a
+ * volatile sig_atomic_t and a write() of one byte). serve_stage reads
+ * and clears `flag` and drains `wake_fd`. Default-constructed (flag
+ * null, wake_fd -1) means no reload: serve_stage keeps its original
+ * behavior, waiting on the listener alone.
  */
 struct StageReload {
     volatile std::sig_atomic_t* flag = nullptr;
+    int wake_fd = -1;  /**< self-pipe read end the handler writes. */
     std::function<void(std::vector<Cidr>&, std::vector<HostPort>&,
                        StageConn&)>
         apply = nullptr;

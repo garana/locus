@@ -1,13 +1,14 @@
 #include "locus/pipeline/stage_server.hpp"
 
-#include <poll.h>
 #include <unistd.h>
 
 #include <cassert>
-#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <thread>
+#include <vector>
+
+#include "locus/sys/poller.hpp"
 
 namespace locus::pipeline {
 
@@ -104,20 +105,25 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
     int served = 0;
     bool all_clean = true;   // any session ended abnormally?
     std::size_t cursor = 0;  // round-robin position in the pool
+
+    // Event loop: watch the listener (and the reload wake pipe, if any)
+    // for readiness rather than blocking in accept(), the foundation of
+    // the multi-worker serving model (DESIGN.md i#24).
+    sys::Poller poller;
+    poller.add_read(listen_fd);
+    if (reload.wake_fd >= 0) {
+        poller.add_read(reload.wake_fd);
+    }
+    std::vector<int> ready;
+
     for (;;) {
-        // Wait for the next peer in an interruptible poll so a SIGHUP
-        // (handler installed without SA_RESTART) breaks the wait; a
-        // pending reload is applied before this session starts. A reload
+        // Wait for the next peer. A SIGHUP handler sets reload.flag and
+        // writes reload.wake_fd; the poll returns and the reload is
+        // applied before this session starts. Because the written byte
+        // stays readable (level-triggered), a SIGHUP delivered in the
+        // check-then-wait window is still pending and wakes the poll, so
+        // an idle stage reloads promptly -- no lost-wakeup race. A reload
         // that arrives mid-session lands here, at the next boundary.
-        //
-        // Known narrow race: a SIGHUP delivered between the flag check
-        // and poll() entering the kernel is not pending during poll, so
-        // on an idle stage the reload waits for the next peer instead of
-        // applying immediately. Self-correcting (a second SIGHUP works)
-        // and the missing "reload: applied" line is the operator's cue.
-        // The portable close (a self-pipe the handler writes, polled
-        // alongside listen_fd) is deferred to the event-loop rework
-        // (i#24), which needs that wakeup mechanism anyway.
         for (;;) {
             if (reload.flag != nullptr && *reload.flag != 0 &&
                 reload.apply) {
@@ -125,23 +131,31 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
                                    // re-fires and is caught next loop
                 reload.apply(allow_live, pool_live, conn_live);
             }
-            pollfd pfd{listen_fd, POLLIN, 0};
-            const int pr = ::poll(&pfd, 1, -1);
+            const int pr = poller.wait(ready, -1);
             if (pr < 0) {
-                if (errno == EINTR) {
-                    continue;  // a signal (maybe SIGHUP): recheck reload
-                }
                 ::close(listen_fd);
                 return false;  // poll error
             }
-            // A reload may have been requested just as the peer arrived;
-            // apply it (loop back to the check) before accepting, so the
+            bool listen_ready = false;
+            for (const int fd : ready) {
+                if (fd == reload.wake_fd) {
+                    char buf[64];  // drain the (non-blocking) wake pipe
+                    while (::read(reload.wake_fd, buf, sizeof(buf)) > 0) {
+                    }
+                } else if (fd == listen_fd) {
+                    listen_ready = true;
+                }
+            }
+            // Apply a reload the wakeup signaled before accepting, so the
             // new session uses the fresh config.
             if (reload.flag != nullptr && *reload.flag != 0 &&
                 reload.apply) {
                 continue;
             }
-            break;  // POLLIN: a peer is pending, accept will not block
+            if (listen_ready) {
+                break;  // a peer is pending, accept will not block
+            }
+            // Woke only for a reload with no peer: loop to re-wait.
         }
 
         // Automatic reconnect: each session re-accepts a fresh input
