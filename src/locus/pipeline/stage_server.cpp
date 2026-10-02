@@ -102,15 +102,31 @@ bool set_nonblocking(int fd) {
     return ::fcntl(fd, F_SETFL, fl | O_NONBLOCK) == 0;
 }
 
+// Flags for send() on the downstream: MSG_NOSIGNAL on Linux so a write
+// to a closed peer returns EPIPE instead of raising SIGPIPE. macOS has
+// no MSG_NOSIGNAL but connect_to sets SO_NOSIGPIPE on the fd, so 0 is
+// safe there.
+#if defined(MSG_NOSIGNAL)
+constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+constexpr int kSendFlags = 0;
+#endif
+
 // One live session the mux loop multiplexes: an accepted upstream fd,
-// the downstream fd dialed for it, this session's own KV sequence, and
-// a buffer holding the bytes of a not-yet-complete input frame (so a
-// frame split across reads is reassembled, not lost).
+// the downstream fd dialed for it, this session's own KV sequence, a
+// buffer holding the bytes of a not-yet-complete INPUT frame (so a frame
+// split across reads is reassembled), and a buffer of OUTPUT bytes not
+// yet accepted by the downstream (so a stalled downstream parks its
+// backlog here instead of blocking the whole loop). `out_watched` is
+// true while out_fd is registered for write-readiness -- only while
+// outbuf has unsent bytes.
 struct MuxSession {
     int in_fd = -1;
     int out_fd = -1;
     kv::PagedKvCache::Seq seq;
     std::string inbuf;
+    std::string outbuf;
+    bool out_watched = false;
 };
 
 }  // namespace
@@ -267,16 +283,25 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
     // Keyed by input fd (the fd the poller reports). Each entry owns its
     // own downstream fd and KV sequence, so sessions are independent.
     std::unordered_map<int, MuxSession> sessions;
+    // Reverse index out_fd -> in_fd, so a write-readiness event on a
+    // downstream fd finds its session. Populated for a session's whole
+    // life (the fd is watched only while backpressured, but the mapping
+    // is cheap to keep).
+    std::unordered_map<int, int> out_index;
 
-    // Ends one session: unregister its input fd, free its KV, close both
-    // fds. `clean` records whether it ended at a frame boundary (for the
+    // Ends one session: unregister both fds, free its KV, close them.
+    // `clean` records whether it ended at a frame boundary (for the
     // return value and the serve_sessions count).
     auto drop = [&](int fd, bool clean) {
         auto it = sessions.find(fd);
         if (it == sessions.end()) {
             return;
         }
-        poller.remove(fd);
+        poller.remove(it->second.in_fd);
+        if (it->second.out_watched) {
+            poller.remove(it->second.out_fd);
+        }
+        out_index.erase(it->second.out_fd);
         stage.reset(it->second.seq);
         ::close(it->second.in_fd);
         ::close(it->second.out_fd);
@@ -285,6 +310,39 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
             all_clean = false;
         }
         ++completed;
+    };
+
+    // Pushes as much of `s.outbuf` to the downstream as it will take
+    // without blocking, keeping frame order. Starts watching out_fd for
+    // write-readiness when bytes remain (so the next writable event
+    // resumes the flush) and stops watching once drained.
+    // @returns 0 fully flushed, 1 partial (bytes still pending), -1 the
+    //     downstream errored and the session must be dropped.
+    auto flush_out = [&](MuxSession& s) -> int {
+        while (!s.outbuf.empty()) {
+            const ssize_t n = ::send(s.out_fd, s.outbuf.data(),
+                                     s.outbuf.size(), kSendFlags);
+            if (n > 0) {
+                s.outbuf.erase(0, static_cast<std::size_t>(n));
+                continue;
+            }
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (!s.out_watched) {
+                    poller.add(s.out_fd, sys::Poller::Dir::kWrite);
+                    s.out_watched = true;
+                }
+                return 1;  // backpressured; resume on the writable event
+            }
+            return -1;  // EPIPE / ECONNRESET etc: downstream is gone
+        }
+        if (s.out_watched) {
+            poller.remove(s.out_fd);  // nothing left to send
+            s.out_watched = false;
+        }
+        return 0;
     };
 
     // Tears down everything and returns `ok`; used on both the normal
@@ -318,6 +376,18 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
             }
             if (ev.fd == listen_fd) {
                 listen_ready = true;  // accept after the session fds
+                continue;
+            }
+            // A downstream (out) fd becomes writable: resume the parked
+            // flush for its session. (out_index is kept whether or not the
+            // fd is currently watched, so a stale entry is impossible; a
+            // session dropped earlier in this batch is already erased.)
+            if (const auto oit = out_index.find(ev.fd);
+                oit != out_index.end()) {
+                const auto sit = sessions.find(oit->second);
+                if (sit != sessions.end() && flush_out(sit->second) < 0) {
+                    drop(sit->second.in_fd, false);
+                }
                 continue;
             }
             // A session input fd. It may have been dropped earlier in
@@ -382,16 +452,28 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                     dropped = true;
                     break;
                 }
-                // Blocking write of a small per-token frame; a stalled
-                // downstream can briefly block the loop. Write-readiness
-                // in the poller is a later increment (i#24).
-                if (!write_message(s.out_fd, out)) {
+                // Queue the output frame and push what the downstream
+                // will take without blocking; a stalled downstream parks
+                // its backlog in outbuf and resumes on a writable event,
+                // so one slow peer no longer blocks the loop. Frames
+                // append in order, so ordering holds across backpressure.
+                encode(out, s.outbuf);
+                if (flush_out(s) < 0) {
                     drop(s.in_fd, false);
                     dropped = true;
                     break;
                 }
             }
 
+            // Honor an EOF only HERE, after the frame loop above has
+            // decoded, stepped and flushed this batch's frames. This
+            // ordering is load-bearing: a client that sends its last
+            // frame and then half-closes its send side (shutdown SHUT_WR)
+            // produces the frame and a recv()==0 in the same batch, and
+            // still gets its answer because the drop runs after the
+            // frames are processed. Do NOT hoist this above the frame
+            // loop -- that would silently stop half-closing clients from
+            // getting answers, with every existing test still green.
             if (!dropped && gone) {
                 // Clean only if the peer closed at a frame boundary
                 // (nothing half-read) and the socket itself did not
@@ -399,11 +481,14 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                 const bool clean = !read_error && s.inbuf.empty();
                 drop(s.in_fd, clean);
             }
+        }
 
-            if (conn_live.serve_sessions > 0 &&
-                completed >= conn_live.serve_sessions) {
-                return shutdown(all_clean);
-            }
+        // Stop once enough sessions have ended. Checked after the whole
+        // batch (not per event) so a drop from a downstream-flush event,
+        // not just an input event, is counted too.
+        if (conn_live.serve_sessions > 0 &&
+            completed >= conn_live.serve_sessions) {
+            return shutdown(all_clean);
         }
 
         // Apply a pending reload (set by the SIGHUP handler and signaled
@@ -436,7 +521,10 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
             set_keepalive(out_fd, conn_live.keepalive_idle_s,
                           conn_live.keepalive_intvl_s,
                           conn_live.keepalive_count);
-            if (!set_nonblocking(in_fd)) {
+            // Both ends non-blocking: in_fd so recv() drains without
+            // blocking, out_fd so a stalled downstream parks its backlog
+            // in outbuf (see flush_out) instead of blocking the loop.
+            if (!set_nonblocking(in_fd) || !set_nonblocking(out_fd)) {
                 ::close(in_fd);
                 ::close(out_fd);
                 return shutdown(false);
@@ -444,7 +532,8 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
             MuxSession s;
             s.in_fd = in_fd;
             s.out_fd = out_fd;
-            poller.add(in_fd);
+            poller.add(in_fd);  // out_fd is watched only while backpressured
+            out_index[out_fd] = in_fd;
             sessions.emplace(in_fd, std::move(s));
         }
     }

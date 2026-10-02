@@ -393,3 +393,143 @@ TEST_CASE("serve_stage_mux drops an idle peer that resets the connection",
     ::close(from_stage);
     REQUIRE(sres.load() == 0);  // dropped, counted unclean
 }
+
+// A downstream that does not read for a while must not block the loop or
+// lose frames: the stage parks the backlog in its per-session outbuf and
+// drains it on write-readiness, in order. The collector's receive buffer
+// is shrunk and left unread while the client sends a burst far larger
+// than any kernel socket buffer, so flush_out is forced to hit EAGAIN
+// and watch out_fd for write (the new path); then the collector drains
+// and every frame must arrive, in position order, none lost.
+TEST_CASE("serve_stage_mux parks a backlog for a slow downstream",
+          "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const std::uint32_t V = model.hparams().n_vocab;
+
+    // Burst enough bytes to dwarf any kernel send+recv buffering (~1.5 MB
+    // target), so the stage cannot have delivered them all without
+    // parking a backlog -- that is what forces the EAGAIN/out-watch path.
+    const std::size_t frame_bytes = 28 + static_cast<std::size_t>(V) * 4;
+    int n = static_cast<int>((1536u * 1024u) / frame_bytes) + 1;
+    n = std::max(400, std::min(n, 1200));
+    const std::uint32_t blocks =
+        static_cast<std::uint32_t>(n) / 16 + 8;  // KV room for n positions
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    // Shrink the receive buffer (inherited by the accepted fd) so the TCP
+    // window is small and the stage backpressures early.
+    int rcv = 4096;
+    ::setsockopt(lc, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof(rcv));
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L, blocks);
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, {}, {{"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    const int to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(to_stage >= 0);
+    const int from_stage = locus::pipeline::accept_one(lc, nullptr);
+    REQUIRE(from_stage >= 0);
+    ::close(lc);
+
+    // Send the whole burst WITHOUT reading any logits back, so the
+    // downstream (from_stage) stays unread and the stage's sends fill the
+    // tiny window and start parking in outbuf.
+    for (int i = 0; i < n; ++i) {
+        REQUIRE(locus::pipeline::write_message(
+            to_stage,
+            locus::pipeline::make_token(1, static_cast<std::uint32_t>(i),
+                                        1)));
+    }
+
+    // Now drain. Every frame must arrive, as kLogits, in position order
+    // 0..n-1 -- proving the parked backlog flushed completely and in
+    // order. (The bytes could not have fit in kernel buffers, so the
+    // park path necessarily ran.)
+    for (int i = 0; i < n; ++i) {
+        Message lg;
+        REQUIRE(locus::pipeline::read_message(from_stage, lg) ==
+                ReadResult::kOk);
+        REQUIRE(lg.type == MsgType::kLogits);
+        REQUIRE(lg.position == static_cast<std::uint32_t>(i));
+    }
+
+    ::close(to_stage);
+    server.join();
+    ::close(from_stage);
+    REQUIRE(sres.load() == 1);  // ended cleanly after the backlog drained
+}
+
+// A client that sends its last frame then half-closes its send side
+// (shutdown SHUT_WR) -- the "no more input, now give me the answer"
+// pattern -- still gets its answer. The stage sees the frame and a
+// recv()==0 EOF in the same batch, and because the drop is honored only
+// AFTER the batch's frames are processed and flushed, the logits are
+// delivered before the session is torn down. This pins the load-bearing
+// loop ordering: hoisting the drop above the frame loop would break this
+// while leaving every other test green (none half-close).
+TEST_CASE("serve_stage_mux answers a client that half-closes after a frame",
+          "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    const std::uint32_t L = model.hparams().n_layers;
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L);
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, {}, {{"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    const int to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(to_stage >= 0);
+    const int from_stage = locus::pipeline::accept_one(lc, nullptr);
+    REQUIRE(from_stage >= 0);
+    ::close(lc);
+
+    // One token, then half-close the send side: the stage must still
+    // answer before honoring the resulting EOF.
+    REQUIRE(locus::pipeline::write_message(
+        to_stage, locus::pipeline::make_token(1, 0, 1)));
+    REQUIRE(::shutdown(to_stage, SHUT_WR) == 0);
+
+    Message lg;
+    REQUIRE(locus::pipeline::read_message(from_stage, lg) ==
+            ReadResult::kOk);
+    REQUIRE(lg.type == MsgType::kLogits);  // answered despite the EOF
+
+    ::close(to_stage);
+    server.join();
+    ::close(from_stage);
+    REQUIRE(sres.load() == 1);  // ended cleanly (EOF at a frame boundary)
+}
