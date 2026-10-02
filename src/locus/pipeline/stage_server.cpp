@@ -114,7 +114,7 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
     if (reload.wake_fd >= 0) {
         poller.add_read(reload.wake_fd);
     }
-    std::vector<int> ready;
+    std::vector<sys::Poller::Event> events;
 
     for (;;) {
         // Wait for the next peer. A SIGHUP handler sets reload.flag and
@@ -131,18 +131,18 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
                                    // re-fires and is caught next loop
                 reload.apply(allow_live, pool_live, conn_live);
             }
-            const int pr = poller.wait(ready, -1);
+            const int pr = poller.wait(events, -1);
             if (pr < 0) {
                 ::close(listen_fd);
                 return false;  // poll error
             }
             bool listen_ready = false;
-            for (const int fd : ready) {
-                if (fd == reload.wake_fd) {
+            for (const auto& ev : events) {
+                if (ev.fd == reload.wake_fd) {
                     char buf[64];  // drain the (non-blocking) wake pipe
                     while (::read(reload.wake_fd, buf, sizeof(buf)) > 0) {
                     }
-                } else if (fd == listen_fd) {
+                } else if (ev.fd == listen_fd) {
                     listen_ready = true;
                 }
             }

@@ -35,6 +35,12 @@ struct Pipe {
     }
 };
 
+bool has_fd(const std::vector<Poller::Event>& evs, int fd) {
+    return std::any_of(
+        evs.begin(), evs.end(),
+        [fd](const Poller::Event& e) { return e.fd == fd; });
+}
+
 }  // namespace
 
 TEST_CASE("Poller reports a readable fd, not an idle one", "[poller]") {
@@ -44,17 +50,19 @@ TEST_CASE("Poller reports a readable fd, not an idle one", "[poller]") {
     p.add_read(a.fd[0]);
     p.add_read(b.fd[0]);
 
-    std::vector<int> ready;
+    std::vector<Poller::Event> events;
     // Nothing written yet: a short wait times out with no ready fds.
-    REQUIRE(p.wait(ready, 20) == 0);
-    REQUIRE(ready.empty());
+    REQUIRE(p.wait(events, 20) == 0);
+    REQUIRE(events.empty());
 
     // Write to b only: b's read end becomes readable, a's does not.
     const char x = 'x';
     REQUIRE(::write(b.fd[1], &x, 1) == 1);
-    REQUIRE(p.wait(ready, 1000) == 1);
-    REQUIRE(ready.size() == 1);
-    REQUIRE(ready[0] == b.fd[0]);
+    REQUIRE(p.wait(events, 1000) == 1);
+    REQUIRE(events.size() == 1);
+    REQUIRE(events[0].fd == b.fd[0]);
+    REQUIRE(events[0].readable);
+    REQUIRE_FALSE(events[0].hangup);
 }
 
 TEST_CASE("Poller is level-triggered: still ready until drained",
@@ -65,13 +73,13 @@ TEST_CASE("Poller is level-triggered: still ready until drained",
     const char two[2] = {'a', 'b'};
     REQUIRE(::write(a.fd[1], two, 2) == 2);
 
-    std::vector<int> ready;
-    REQUIRE(p.wait(ready, 1000) == 1);  // readable
+    std::vector<Poller::Event> events;
+    REQUIRE(p.wait(events, 1000) == 1);  // readable
     char one = 0;
     REQUIRE(::read(a.fd[0], &one, 1) == 1);  // drain only one byte
-    REQUIRE(p.wait(ready, 1000) == 1);  // still readable (1 byte left)
+    REQUIRE(p.wait(events, 1000) == 1);  // still readable (1 byte left)
     REQUIRE(::read(a.fd[0], &one, 1) == 1);  // drain the rest
-    REQUIRE(p.wait(ready, 20) == 0);  // now idle
+    REQUIRE(p.wait(events, 20) == 0);  // now idle
 }
 
 TEST_CASE("Poller reports several ready fds at once", "[poller]") {
@@ -86,14 +94,10 @@ TEST_CASE("Poller reports several ready fds at once", "[poller]") {
     REQUIRE(::write(a.fd[1], &x, 1) == 1);
     REQUIRE(::write(c.fd[1], &x, 1) == 1);
 
-    std::vector<int> ready;
-    REQUIRE(p.wait(ready, 1000) == 2);
-    const bool has_a =
-        std::find(ready.begin(), ready.end(), a.fd[0]) != ready.end();
-    const bool has_c =
-        std::find(ready.begin(), ready.end(), c.fd[0]) != ready.end();
-    REQUIRE(has_a);
-    REQUIRE(has_c);
+    std::vector<Poller::Event> events;
+    REQUIRE(p.wait(events, 1000) == 2);
+    REQUIRE(has_fd(events, a.fd[0]));
+    REQUIRE(has_fd(events, c.fd[0]));
 }
 
 TEST_CASE("Poller.remove stops reporting an fd", "[poller]") {
@@ -103,8 +107,8 @@ TEST_CASE("Poller.remove stops reporting an fd", "[poller]") {
     p.remove(a.fd[0]);
     const char x = 'x';
     REQUIRE(::write(a.fd[1], &x, 1) == 1);
-    std::vector<int> ready;
-    REQUIRE(p.wait(ready, 20) == 0);  // removed: not reported
+    std::vector<Poller::Event> events;
+    REQUIRE(p.wait(events, 20) == 0);  // removed: not reported
 }
 
 TEST_CASE("Poller self-pipe wakes a blocked wait (the signal pattern)",
@@ -116,16 +120,16 @@ TEST_CASE("Poller self-pipe wakes a blocked wait (the signal pattern)",
     Poller p;
     p.add_read(wake.fd[0]);
 
-    std::vector<int> ready;
+    std::vector<Poller::Event> events;
     const auto t0 = std::chrono::steady_clock::now();
     const char w = 1;
     REQUIRE(::write(wake.fd[1], &w, 1) == 1);  // "signal" before waiting
-    const int n = p.wait(ready, 5000);  // would block 5s with no wake
+    const int n = p.wait(events, 5000);  // would block 5s with no wake
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
     REQUIRE(n == 1);
-    REQUIRE(ready[0] == wake.fd[0]);
+    REQUIRE(events[0].fd == wake.fd[0]);
     REQUIRE(ms < 2000);  // returned well before the 5s timeout
 }
 
@@ -163,9 +167,9 @@ TEST_CASE("Poller.wait honors the deadline across EINTR retries",
         }
     });
 
-    std::vector<int> ready;
+    std::vector<Poller::Event> events;
     const auto t0 = std::chrono::steady_clock::now();
-    const int n = p.wait(ready, 400);
+    const int n = p.wait(events, 400);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
@@ -185,4 +189,26 @@ TEST_CASE("Poller.wait honors the deadline across EINTR retries",
     REQUIRE(n == 0);     // timed out: the pipe never became readable
     REQUIRE(ms >= 350);  // did not return early on the first EINTR
     REQUIRE(ms < 550);   // did not restart the 400 ms per signal
+}
+
+// A peer closing its end must surface as hangup (and readable, since a
+// read now returns 0 at EOF without blocking). This is the signal the
+// multiplexed loop uses to drop a gone connection; it was folded into
+// "readable" before the Event reshape, with no way to tell it apart.
+TEST_CASE("Poller reports hangup when the peer closes", "[poller]") {
+    int fds[2];
+    REQUIRE(::pipe(fds) == 0);
+    Poller p;
+    p.add_read(fds[0]);
+    ::close(fds[1]);  // peer closed its write end
+
+    std::vector<Poller::Event> events;
+    REQUIRE(p.wait(events, 1000) == 1);
+    REQUIRE(events[0].fd == fds[0]);
+    REQUIRE(events[0].hangup);
+    REQUIRE(events[0].readable);   // a read won't block; returns 0 (EOF)
+    REQUIRE_FALSE(events[0].error);
+    char c = 0;
+    REQUIRE(::read(fds[0], &c, 1) == 0);  // EOF is the authoritative cue
+    ::close(fds[0]);
 }

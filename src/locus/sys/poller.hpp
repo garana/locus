@@ -23,6 +23,24 @@ namespace locus::sys {
  */
 class Poller {
   public:
+    /**
+     * One ready fd and what happened to it. `readable` means a read
+     * will not block (it may return data or 0 at EOF), so a caller
+     * always reads on it; `hangup` means the peer closed its end and
+     * `error` an error condition. A hung-up fd is reported with both
+     * `readable` and `hangup` set, so the read() that returns 0 is the
+     * authoritative "peer gone" signal on both backends; the flags are
+     * the explicit hint that lets a caller drop a connection without a
+     * zero-length read first. (epoll EPOLLIN/EPOLLHUP/EPOLLERR map to
+     * these; kqueue EVFILT_READ data / EV_EOF / EV_ERROR map to them.)
+     */
+    struct Event {
+        int fd = -1;
+        bool readable = false;
+        bool hangup = false;
+        bool error = false;
+    };
+
     /** @throws std::runtime_error if the OS poll fd cannot be created. */
     Poller();
     ~Poller();
@@ -39,14 +57,14 @@ class Poller {
 
     /**
      * Waits up to `timeout_ms` (-1 = forever) for registered fds to
-     * become readable, retrying internally on EINTR. Clears `ready` and
-     * appends the readable fds (including error/hangup, which also read
-     * as readable).
+     * become ready, retrying internally on EINTR. Clears `events` and
+     * appends one Event per ready fd (readable / hangup / error; see
+     * Event).
      *
      * @returns the number of ready fds (0 on timeout), or -1 on a poll
      *     error (errno set).
      */
-    int wait(std::vector<int>& ready, int timeout_ms);
+    int wait(std::vector<Event>& events, int timeout_ms);
 
   private:
     int poll_fd_ = -1;  // epoll fd (Linux) or kqueue fd (BSD/macOS)
