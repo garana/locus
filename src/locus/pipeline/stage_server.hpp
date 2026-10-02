@@ -139,10 +139,16 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
  * Each accepted connection becomes an independent session: it dials its
  * own downstream from `downstreams` (round-robin, same pool semantics as
  * serve_stage), gets its own KV sequence in the stage's shared cache
- * (PipelineStage::step(seq, in)), and buffers its own partial input
- * frame. Input sockets are made non-blocking and drained with recv();
- * frames are assembled with the message codec's decode(), so a frame
- * split across reads is reassembled rather than lost.
+ * (PipelineStage::step(seq, in)), and buffers its own partial input and
+ * unsent output frames. Both sockets are non-blocking: input is drained
+ * with recv() and reassembled with the codec's decode() (a frame split
+ * across reads is not lost), and each output frame is queued and pushed
+ * with send() as far as the downstream will take it. A stalled
+ * downstream parks its backlog in the session's out buffer and the loop
+ * watches that fd for write-readiness (sys::Poller kWrite), resuming the
+ * flush on the writable event, so one slow downstream no longer blocks
+ * the other sessions. Frames append in order, so ordering holds across
+ * backpressure.
  *
  * Dropping a peer follows the sys::Poller contract exactly: a session is
  * ended only after a read drains to 0 (clean EOF) or -1 with a
@@ -150,12 +156,14 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
  * already buffered are decoded and processed before the drop (so a
  * hangup that arrives with a final frame still delivers it). A session
  * that ends with a half-read frame or a socket error is counted as
- * unclean. Ending a session frees its KV at once.
+ * unclean. An upstream EOF tears the session down including any unsent
+ * output: the request is abandoned, so the in-flight downstream frame is
+ * moot and the downstream sees its own EOF and drops in turn. Ending a
+ * session frees its KV at once.
  *
- * Known limits this increment (follow-ups under i#24): downstream
- * writes are still blocking (a stalled downstream can briefly block the
- * loop; write-readiness in the poller comes later), and the connect to a
- * new session's downstream is a blocking dial at accept time.
+ * Known limit this increment (follow-up under i#24): the connect to a
+ * new session's downstream is still a blocking dial at accept time (a
+ * slow/unreachable downstream can delay accepting the next session).
  *
  * `conn.serve_sessions` bounds the loop for tests: 0 serves forever
  * (returns only on a fatal error), N stops once N sessions have ended.
