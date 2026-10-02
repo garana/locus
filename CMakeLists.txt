@@ -42,6 +42,7 @@ add_library(locus
     src/locus/pipeline/driver.cpp
     src/locus/pipeline/message.cpp
     src/locus/pipeline/net.cpp
+    src/locus/pipeline/resolver.cpp
     src/locus/pipeline/stage.cpp
     src/locus/pipeline/stage_server.cpp
     src/locus/server/engine_loop.cpp
