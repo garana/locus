@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -91,8 +92,8 @@ TEST_CASE("Poller reports a readable fd, not an idle one", "[poller]") {
     Pipe a;
     Pipe b;
     Poller p;
-    p.add_read(a.fd[0]);
-    p.add_read(b.fd[0]);
+    p.add(a.fd[0]);
+    p.add(b.fd[0]);
 
     std::vector<Poller::Event> events;
     // Nothing written yet: a short wait times out with no ready fds.
@@ -113,7 +114,7 @@ TEST_CASE("Poller is level-triggered: still ready until drained",
           "[poller]") {
     Pipe a;
     Poller p;
-    p.add_read(a.fd[0]);
+    p.add(a.fd[0]);
     const char two[2] = {'a', 'b'};
     REQUIRE(::write(a.fd[1], two, 2) == 2);
 
@@ -131,9 +132,9 @@ TEST_CASE("Poller reports several ready fds at once", "[poller]") {
     Pipe b;
     Pipe c;
     Poller p;
-    p.add_read(a.fd[0]);
-    p.add_read(b.fd[0]);
-    p.add_read(c.fd[0]);
+    p.add(a.fd[0]);
+    p.add(b.fd[0]);
+    p.add(c.fd[0]);
     const char x = 'x';
     REQUIRE(::write(a.fd[1], &x, 1) == 1);
     REQUIRE(::write(c.fd[1], &x, 1) == 1);
@@ -147,7 +148,7 @@ TEST_CASE("Poller reports several ready fds at once", "[poller]") {
 TEST_CASE("Poller.remove stops reporting an fd", "[poller]") {
     Pipe a;
     Poller p;
-    p.add_read(a.fd[0]);
+    p.add(a.fd[0]);
     p.remove(a.fd[0]);
     const char x = 'x';
     REQUIRE(::write(a.fd[1], &x, 1) == 1);
@@ -162,7 +163,7 @@ TEST_CASE("Poller self-pipe wakes a blocked wait (the signal pattern)",
     // was asked to block for a long time.
     Pipe wake;
     Poller p;
-    p.add_read(wake.fd[0]);
+    p.add(wake.fd[0]);
 
     std::vector<Poller::Event> events;
     const auto t0 = std::chrono::steady_clock::now();
@@ -201,7 +202,7 @@ TEST_CASE("Poller.wait honors the deadline across EINTR retries",
     REQUIRE(::pipe(fds) == 0);  // read end never written -> never ready
 
     Poller p;
-    p.add_read(fds[0]);
+    p.add(fds[0]);
 
     const pthread_t waiter = ::pthread_self();
     std::thread burst([waiter] {
@@ -244,7 +245,7 @@ TEST_CASE("Poller: closed pipe writer -> readable+hangup, read()==0",
     int fds[2];
     REQUIRE(::pipe(fds) == 0);
     Poller p;
-    p.add_read(fds[0]);
+    p.add(fds[0]);
     ::close(fds[1]);  // peer closed its write end
 
     std::vector<Poller::Event> events;
@@ -270,7 +271,7 @@ TEST_CASE("Poller: hangup with bytes still buffered still reads them",
     REQUIRE(::write(fds[1], eight, 8) == 8);
     ::close(fds[1]);  // close AFTER writing: data + EOF both pending
     Poller p;
-    p.add_read(fds[0]);
+    p.add(fds[0]);
 
     std::vector<Poller::Event> events;
     REQUIRE(p.wait(events, 1000) == 1);
@@ -293,7 +294,7 @@ TEST_CASE("Poller: clean socket FIN -> readable, read()==0 (portable)",
         SKIP("could not set up a loopback TCP pair");
     }
     Poller p;
-    p.add_read(s.server);
+    p.add(s.server);
     ::close(s.client);  // client sends FIN
     s.client = -1;
 
@@ -327,7 +328,7 @@ TEST_CASE("Poller: socket RST -> peer gone via error flag or read()<0",
     lg.l_linger = 0;  // close() now sends RST instead of FIN
     ::setsockopt(s.client, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
     Poller p;
-    p.add_read(s.server);
+    p.add(s.server);
     ::close(s.client);
     s.client = -1;
 
@@ -345,4 +346,184 @@ TEST_CASE("Poller: socket RST -> peer gone via error flag or read()<0",
     REQUIRE(::read(s.server, &c, 1) < 0);  // the read carries the error
     REQUIRE(errno == ECONNRESET);
 #endif
+}
+
+namespace {
+// Binds and listens on an ephemeral loopback port; *port receives it.
+// @returns the listen fd, or -1 on failure.
+int listen_loopback(int* port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) < 0 ||
+        ::listen(fd, 1) < 0) {
+        ::close(fd);
+        return -1;
+    }
+    socklen_t al = sizeof(a);
+    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &al);
+    *port = ntohs(a.sin_port);
+    return fd;
+}
+
+// A non-blocking TCP socket with connect() already started to
+// 127.0.0.1:port. *done is set true if the connect completed
+// synchronously (common on loopback). @returns the fd, or -1 on a setup
+// failure or a synchronous error other than EINPROGRESS (errno left set).
+int start_nb_connect(int port, bool* done) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    const int fl = ::fcntl(fd, F_GETFL, 0);
+    ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(static_cast<uint16_t>(port));
+    *done = false;
+    errno = 0;
+    const int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+    if (rc == 0) {
+        *done = true;  // connected at once
+        return fd;
+    }
+    if (errno == EINPROGRESS) {
+        return fd;  // completes later; poll for writable
+    }
+    ::close(fd);  // a different synchronous error (e.g. ECONNREFUSED)
+    return -1;
+}
+}  // namespace
+
+// A connected socket with room in its send buffer is writable: add(fd,
+// kWrite) reports it, the baseline the mux loop's write-readiness rests
+// on. It is not reported readable (nothing to read).
+TEST_CASE("Poller reports a writable socket", "[poller]") {
+    TcpPair s;
+    if (!s.open()) {
+        SKIP("could not set up a loopback TCP pair");
+    }
+    Poller p;
+    p.add(s.server, Poller::Dir::kWrite);
+
+    std::vector<Poller::Event> events;
+    REQUIRE(p.wait(events, 1000) == 1);
+    REQUIRE(events[0].fd == s.server);
+    REQUIRE(events[0].writable);
+    REQUIRE_FALSE(events[0].readable);
+    REQUIRE_FALSE(events[0].error);
+}
+
+// A non-blocking connect that completes shows up as writable; the caller
+// confirms success with getsockopt(SO_ERROR) == 0. The flag means "a
+// write won't block", not "the connect succeeded" -- those are the
+// caller's two separate questions.
+TEST_CASE("Poller reports a completed non-blocking connect as writable",
+          "[poller]") {
+    int port = 0;
+    const int lst = listen_loopback(&port);
+    REQUIRE(lst >= 0);
+    bool done = false;
+    const int c = start_nb_connect(port, &done);
+    REQUIRE(c >= 0);  // 0 or EINPROGRESS, both fine
+
+    Poller p;
+    p.add(c, Poller::Dir::kWrite);
+    std::vector<Poller::Event> events;
+    REQUIRE(p.wait(events, 1000) == 1);
+    REQUIRE(events[0].fd == c);
+    REQUIRE(events[0].writable);
+    REQUIRE_FALSE(events[0].error);
+    int soerr = -1;
+    socklen_t sl = sizeof(soerr);
+    REQUIRE(::getsockopt(c, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0);
+    REQUIRE(soerr == 0);  // the connect succeeded
+
+    ::close(c);
+    ::close(lst);
+}
+
+// A non-blocking connect to a refused address must NEVER be reported
+// writable -- a failed connect is not a usable socket. On epoll it lands
+// as error=1 (EPOLLOUT suppressed by EPOLLERR), on kqueue as hangup=1
+// (EV_EOF); either way the caller confirms via getsockopt(SO_ERROR). On
+// loopback the refusal often comes back synchronously from connect(), in
+// which case there is no poller event -- the invariant "never writable on
+// failure" still holds, so that path is accepted too.
+TEST_CASE("Poller never reports a refused connect as writable",
+          "[poller]") {
+    int port = 0;
+    const int lst = listen_loopback(&port);
+    REQUIRE(lst >= 0);
+    ::close(lst);  // nothing listens on `port` now -> connects refuse
+
+    bool done = false;
+    errno = 0;
+    const int c = start_nb_connect(port, &done);
+    if (c < 0) {
+        // Refused synchronously (common on loopback): the failure is
+        // already visible, there was never a writable report.
+        REQUIRE(errno == ECONNREFUSED);
+        return;
+    }
+
+    Poller p;
+    p.add(c, Poller::Dir::kWrite);
+    std::vector<Poller::Event> events;
+    REQUIRE(p.wait(events, 1000) == 1);
+    REQUIRE(events[0].fd == c);
+    REQUIRE_FALSE(events[0].writable);  // the invariant
+    int soerr = 0;
+    socklen_t sl = sizeof(soerr);
+    REQUIRE(::getsockopt(c, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0);
+    REQUIRE(soerr == ECONNREFUSED);
+#if defined(__linux__)
+    REQUIRE(events[0].error);   // epoll: EPOLLERR on a failed connect
+#else
+    REQUIRE(events[0].hangup);  // kqueue: EV_EOF on a failed connect
+#endif
+    ::close(c);
+}
+
+// modify() must actually drop the write side. A fd watched kReadWrite
+// that is both readable and writable, narrowed to kRead, must stop being
+// reported writable. On kqueue this needs an explicit EV_DELETE of the
+// write filter (epoll replaces the whole mask in one call); a regression
+// that only re-adds the read filter would leave the write filter firing
+// forever -- a busy spin that would not show up on the epoll side.
+TEST_CASE("Poller.modify narrows kReadWrite to kRead and drops writable",
+          "[poller]") {
+    TcpPair s;
+    if (!s.open()) {
+        SKIP("could not set up a loopback TCP pair");
+    }
+    const char x = 'x';
+    REQUIRE(::write(s.client, &x, 1) == 1);  // make the server readable
+
+    Poller p;
+    p.add(s.server, Poller::Dir::kReadWrite);
+    std::vector<Poller::Event> events;
+    // Loop until the byte is actually readable: the socket is writable
+    // at once (empty send buffer), but on loopback the written byte may
+    // not have landed by the first wait, which would then report
+    // writable-only. Spin (wait returns immediately while writable) until
+    // readable also shows up, so the pre-narrow state is genuinely both.
+    bool both = false;
+    for (int i = 0; i < 100 && !both; ++i) {
+        REQUIRE(p.wait(events, 1000) == 1);
+        REQUIRE(events[0].fd == s.server);
+        both = events[0].readable && events[0].writable;
+    }
+    REQUIRE(both);  // readable+writable in one coalesced Event
+
+    p.modify(s.server, Poller::Dir::kRead);
+    // The unread byte keeps it readable; the write filter is gone.
+    REQUIRE(p.wait(events, 1000) == 1);
+    REQUIRE(events[0].fd == s.server);
+    REQUIRE(events[0].readable);
+    REQUIRE_FALSE(events[0].writable);
 }

@@ -139,9 +139,9 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
     // for readiness rather than blocking in accept(), the foundation of
     // the multi-worker serving model (DESIGN.md i#24).
     sys::Poller poller;
-    poller.add_read(listen_fd);
+    poller.add(listen_fd);
     if (reload.wake_fd >= 0) {
-        poller.add_read(reload.wake_fd);
+        poller.add(reload.wake_fd);
     }
     std::vector<sys::Poller::Event> events;
 
@@ -260,9 +260,9 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
     bool all_clean = true;   // any session ended abnormally?
 
     sys::Poller poller;
-    poller.add_read(listen_fd);
+    poller.add(listen_fd);
     if (reload.wake_fd >= 0) {
-        poller.add_read(reload.wake_fd);
+        poller.add(reload.wake_fd);
     }
     // Keyed by input fd (the fd the poller reports). Each entry owns its
     // own downstream fd and KV sequence, so sessions are independent.
@@ -444,7 +444,7 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
             MuxSession s;
             s.in_fd = in_fd;
             s.out_fd = out_fd;
-            poller.add_read(in_fd);
+            poller.add(in_fd);
             sessions.emplace(in_fd, std::move(s));
         }
     }
