@@ -316,6 +316,41 @@ class LlamaModel {
         Workspace& ws, std::span<float> logits) const;
 
     /**
+     * Batched, layer-range counterpart of forward_layers (event-loop
+     * executor, DESIGN.md i#24): runs N DIFFERENT sequences through
+     * layers [layer_begin, layer_end) in one pass -- each token or
+     * activation attends to its own seq, while the weight-bearing ops are
+     * batched across all N so each weight is read once per layer. The
+     * batched analog of a pipeline stage's step, byte-identical to N
+     * separate forward_layers calls.
+     *
+     * Role mirrors forward_layers. First stage (layer_begin == 0) embeds
+     * tokens[i]; a later stage loads hidden_in[i*n_embd ...]. Last stage
+     * (layer_end == n_layers) emits logits[i*n_vocab ...] and advances
+     * each seq by one; a non-final stage emits the residual stream into
+     * out[i*n_embd ...] and leaves the seqs (the final stage consumes the
+     * token). Advancing matches forward_layers, so the caller for a
+     * non-final stage bumps its seqs itself, exactly as PipelineStage
+     * does for the single path.
+     *
+     * @param tokens One in-vocab id per sequence (first stage); empty
+     *     when !first.
+     * @param hidden_in n*n_embd residual-stream floats (later stage);
+     *     empty when first.
+     * @param seqs One sequence per batch slot; each needs capacity for
+     *     one more position ensured.
+     * @param out n*n_vocab (last) or n*n_embd (otherwise), token-major.
+     * @throws std::invalid_argument on misuse, a bad or outside-slice
+     *     layer range, or an unsupported backend.
+     */
+    void forward_batch_layers(
+        std::span<const tok::TokenId> tokens,
+        std::span<const float> hidden_in, std::uint32_t layer_begin,
+        std::uint32_t layer_end, kv::PagedKvCache& cache,
+        std::span<kv::PagedKvCache::Seq* const> seqs, Workspace& ws,
+        std::span<float> out) const;
+
+    /**
      * A 3-D expert tensor: n_expert equally-sized matrices,
      * contiguous in the mapped file.
      */

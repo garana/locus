@@ -869,6 +869,139 @@ void LlamaModel::forward_batch_decode(
     }
 }
 
+void LlamaModel::forward_batch_layers(
+    std::span<const tok::TokenId> toks, std::span<const float> hidden_in,
+    std::uint32_t layer_begin, std::uint32_t layer_end,
+    kv::PagedKvCache& cache,
+    std::span<kv::PagedKvCache::Seq* const> seqs, Workspace& ws,
+    std::span<float> out) const {
+    using namespace locus::backend;
+    const auto n = static_cast<std::uint32_t>(seqs.size());
+    if (n == 0) {
+        throw std::invalid_argument("forward_batch_layers: empty");
+    }
+    if (!supports_batch()) {
+        throw std::invalid_argument(
+            "forward_batch_layers: unsupported backend");
+    }
+    if (layer_begin > layer_end || layer_end > hp_.n_layers) {
+        throw std::invalid_argument(
+            "forward_batch_layers: bad layer range");
+    }
+    // Only the loaded slice is resident under slice-only loading.
+    if (layer_begin < layer_begin_ || layer_end > layer_end_) {
+        throw std::invalid_argument(
+            "forward_batch_layers: range outside the loaded slice");
+    }
+    const bool first = layer_begin == 0;
+    const bool last = layer_end == hp_.n_layers;
+    const std::uint32_t E = hp_.n_embd;
+    const std::uint32_t ff = hp_.n_ff;
+    const std::uint32_t V = hp_.n_vocab;
+    if (first) {
+        if (toks.size() != n) {
+            throw std::invalid_argument(
+                "forward_batch_layers: tokens/seqs size mismatch");
+        }
+    } else if (hidden_in.size() != static_cast<std::size_t>(n) * E) {
+        throw std::invalid_argument(
+            "forward_batch_layers: hidden_in must be n*n_embd");
+    }
+    if (out.size() != static_cast<std::size_t>(n) * (last ? V : E)) {
+        throw std::invalid_argument(
+            "forward_batch_layers: wrong out size");
+    }
+
+    std::vector<std::uint32_t> pos(n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        pos[t] = seqs[t]->n_tokens;
+        if (pos[t] + 1 > hp_.n_ctx ||
+            pos[t] + 1 > cache.capacity(*seqs[t])) {
+            throw std::invalid_argument(
+                "forward_batch_layers: seq capacity not ensured");
+        }
+    }
+
+    const Ops op = effective_ops(backend_, q8k_activations_);
+    std::vector<float> x(static_cast<std::size_t>(n) * E);
+    std::vector<float> xbf(static_cast<std::size_t>(n) * E);
+    std::vector<float> xb2(static_cast<std::size_t>(n) * E);
+    std::vector<float> gate(static_cast<std::size_t>(n) * ff);
+    std::vector<float> up(static_cast<std::size_t>(n) * ff);
+
+    // First stage embeds each token; a later stage loads the residual
+    // stream handed over per sequence.
+    if (first) {
+        for (std::uint32_t t = 0; t < n; ++t) {
+            if (toks[t] < 0 ||
+                static_cast<std::uint32_t>(toks[t]) >= hp_.n_vocab) {
+                throw std::invalid_argument("token id out of vocab");
+            }
+            op.dequant_row(embd_, static_cast<std::uint32_t>(toks[t]),
+                           {x.data() + static_cast<std::size_t>(t) * E,
+                            E});
+        }
+    } else {
+        std::copy_n(hidden_in.data(),
+                    static_cast<std::size_t>(n) * E, x.data());
+    }
+
+    // Identical per-layer body to forward_batch_decode (which is
+    // byte-identical to per-sequence forward), just over [layer_begin,
+    // layer_end).
+    for (std::uint32_t l = layer_begin; l < layer_end; ++l) {
+        const Layer& lay = layers_[l];
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const std::size_t o = static_cast<std::size_t>(t) * E;
+            apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
+                       ws.xb);
+            spec_->attention(*this, lay, cache, *seqs[t], ws, l, pos[t]);
+            matvec_mt(op, lay.wo, ws.out, ws.xb2);
+            for (std::uint32_t i = 0; i < E; ++i) {
+                x[o + i] += ws.xb2[i];
+            }
+        }
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const std::size_t o = static_cast<std::size_t>(t) * E;
+            apply_norm({x.data() + o, E}, lay.ffn_norm, hp_.rms_eps,
+                       {xbf.data() + o, E});
+        }
+        if (!lay.is_moe()) {
+            matvec_batch(op, lay.w_gate, xbf, gate, n);
+            matvec_batch(op, lay.w_up, xbf, up, n);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const std::size_t o = static_cast<std::size_t>(t) * ff;
+                silu_mul({gate.data() + o, ff}, {up.data() + o, ff},
+                         {gate.data() + o, ff});
+            }
+            matvec_batch(op, lay.w_down, gate, xb2, n);
+            for (std::uint32_t i = 0;
+                 i < static_cast<std::size_t>(n) * E; ++i) {
+                x[i] += xb2[i];
+            }
+        } else {
+            moe_ffn_batch(lay, l, xbf, x, n, ws);
+        }
+    }
+
+    if (last) {
+        // Final stage: normalize, project to logits, consume the token.
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const std::size_t o = static_cast<std::size_t>(t) * E;
+            apply_norm({x.data() + o, E}, out_norm_, hp_.rms_eps, ws.xb);
+            matvec_mt(op, out_w_, ws.xb,
+                      out.subspan(static_cast<std::size_t>(t) * V, V));
+        }
+        for (std::uint32_t t = 0; t < n; ++t) {
+            seqs[t]->n_tokens = pos[t] + 1;
+        }
+    } else {
+        // Hand the residual streams on; the tokens are not consumed yet
+        // (the final stage advances the seqs), matching forward_layers.
+        std::copy_n(x.data(), static_cast<std::size_t>(n) * E, out.data());
+    }
+}
+
 namespace {
 
 /** Cached LOCUS_BATCH_DEQUANT toggle (read once). */
