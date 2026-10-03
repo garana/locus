@@ -209,6 +209,116 @@ TEST_CASE("serve_stage_mux serves two concurrent sessions in isolation",
     REQUIRE(sres.load() == 1);  // both sessions ended cleanly
 }
 
+// The multi-executor form (i#24 inc 3): two executors, two concurrent
+// sessions. The loop pins each session to a different (least-loaded)
+// executor, so they run on separate stages with separate KV caches. Each
+// client must still get the SAME tokens a single-process run would --
+// proving per-executor isolation and that session->executor routing
+// (step and release) goes to the right lane.
+TEST_CASE("serve_stage_mux spreads sessions across two executors",
+          "[pipeline][mux][batch][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const locus::tok::TokenId eos = tok.eos_id();
+    constexpr int kGen = 8;
+
+    const auto pa = tok.encode("Once upon a time, there was a little", true);
+    const auto pb = tok.encode("The quick brown fox jumped over the", true);
+    const auto ref_a = mono_generate(model, pa, eos, kGen);
+    const auto ref_b = mono_generate(model, pb, eos, kGen);
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    // Two stages -> two executors. The two concurrent sessions should be
+    // assigned one each (least-loaded: the second accept sees exec 0 at
+    // load 1, so it picks exec 1).
+    PipelineStage stage0(model, 0, L);
+    PipelineStage stage1(model, 0, L);
+    std::vector<PipelineStage*> stages{&stage0, &stage1};
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 2;
+
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stages, ls, allow, {{"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    Client a;
+    a.request_id = 101;
+    a.to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(a.to_stage >= 0);
+    a.from_stage = locus::pipeline::accept_one(lc, nullptr);
+    REQUIRE(a.from_stage >= 0);
+
+    Client b;
+    b.request_id = 202;
+    b.to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(b.to_stage >= 0);
+    b.from_stage = locus::pipeline::accept_one(lc, nullptr);
+    REQUIRE(b.from_stage >= 0);
+    ::close(lc);
+
+    const std::size_t pmax = std::max(pa.size(), pb.size());
+    for (std::size_t i = 0; i < pmax; ++i) {
+        if (i < pa.size()) {
+            a.round_trip(pa[i]);
+        }
+        if (i < pb.size()) {
+            b.round_trip(pb[i]);
+        }
+    }
+
+    std::vector<locus::tok::TokenId> gen_a, gen_b;
+    bool a_done = false, b_done = false;
+    for (int i = 0; i < kGen; ++i) {
+        if (!a_done && a.ok) {
+            const auto n = locus::model::argmax(a.logits);
+            gen_a.push_back(n);
+            if (n == eos) {
+                a_done = true;
+            } else {
+                a.round_trip(n);
+            }
+        }
+        if (!b_done && b.ok) {
+            const auto n = locus::model::argmax(b.logits);
+            gen_b.push_back(n);
+            if (n == eos) {
+                b_done = true;
+            } else {
+                b.round_trip(n);
+            }
+        }
+    }
+
+    ::close(a.to_stage);
+    ::close(b.to_stage);
+    server.join();
+    ::close(a.from_stage);
+    ::close(b.from_stage);
+
+    REQUIRE(a.ok);
+    REQUIRE(b.ok);
+    REQUIRE(gen_a == ref_a);
+    REQUIRE(gen_b == ref_b);
+    REQUIRE(sres.load() == 1);
+}
+
 // A frame split across two writes must be reassembled from the
 // per-connection buffer, not dropped: this is the decode()-buffer path
 // the blocking read_message never exercised. Write a token frame's bytes

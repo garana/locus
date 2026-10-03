@@ -162,6 +162,9 @@ struct MuxSession {
     bool eof = false;         // in_fd hit EOF/error; finish when idle
     bool read_error = false;  // that EOF was a socket error (unclean)
     bool clean_end = true;    // recorded cleanliness for the release
+    // Which executor this session is pinned to (index into `executors`).
+    // Fixed at accept for KV locality; its steps and release route here.
+    std::size_t exec = 0;
 };
 
 // A pipe whose ends close on destruction. The executor's completion
@@ -308,7 +311,23 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
 bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                      const std::vector<Cidr>& allow,
                      const std::vector<HostPort>& downstreams,
-                     const StageConn& conn, const StageReload& reload) {
+                     const StageConn& conn, const StageReload& reload,
+                     std::size_t max_batch) {
+    std::vector<PipelineStage*> one{&stage};
+    return serve_stage_mux(one, listen_fd, allow, downstreams, conn,
+                           reload, max_batch);
+}
+
+bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
+                     int listen_fd, const std::vector<Cidr>& allow,
+                     const std::vector<HostPort>& downstreams,
+                     const StageConn& conn, const StageReload& reload,
+                     std::size_t max_batch) {
+    if (stages.empty()) {
+        std::fprintf(stderr, "serve_stage_mux: no executors\n");
+        ::close(listen_fd);
+        return false;
+    }
     if (downstreams.empty()) {
         std::fprintf(stderr, "serve_stage_mux: empty downstream pool\n");
         ::close(listen_fd);
@@ -359,9 +378,22 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
     set_nonblocking(exec_wake.r);
     set_nonblocking(exec_wake.w);
     poller.add(exec_wake.r);
-    // Runs stage.step()/reset() off this loop thread. Owns ALL stage
-    // mutation; the loop never calls stage.step()/reset() itself.
-    StageExecutor executor(stage, exec_wake.w);
+    // One executor per stage, each a continuous-batching worker on its
+    // own stage (own KV cache + workspace). They share this one wake
+    // pipe (any completion wakes the loop, which drains them all). Owns
+    // ALL stage mutation; the loop never calls step()/reset() itself.
+    // Declared AFTER exec_wake so they destruct BEFORE it -- an
+    // executor's destructor drains its release backlog and writes wake
+    // bytes, which needs the pipe fd still open (and declared after
+    // `sessions`, so the seqs it touches then are still alive).
+    std::vector<std::unique_ptr<StageExecutor>> executors;
+    executors.reserve(stages.size());
+    for (PipelineStage* st : stages) {
+        executors.push_back(
+            std::make_unique<StageExecutor>(*st, exec_wake.w, max_batch));
+    }
+    // Live session count per executor, for least-loaded assignment.
+    std::vector<std::size_t> exec_load(stages.size(), 0);
 
     // Pushes as much of `s.outbuf` to the downstream as it will take
     // without blocking, keeping frame order. Starts watching out_fd for
@@ -415,6 +447,7 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
         if (!s.clean_end) {
             all_clean = false;
         }
+        --exec_load[s.exec];  // this executor has one fewer live session
         ++completed;
         sessions.erase(it);
     };
@@ -437,7 +470,7 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
             s.out_watched = false;
         }
         if (!s.in_flight && !s.releasing) {
-            executor.submit_release(s.in_fd, &s.seq);
+            executors[s.exec]->submit_release(s.in_fd, &s.seq);
             s.releasing = true;
         }
     };
@@ -463,7 +496,7 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
             begin_drop(s, false);
             return;
         }
-        executor.submit_step(s.in_fd, &s.seq, std::move(in));
+        executors[s.exec]->submit_step(s.in_fd, &s.seq, std::move(in));
         s.in_flight = true;
     };
 
@@ -503,7 +536,9 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                 while (::read(exec_wake.r, buf, sizeof(buf)) > 0) {
                 }
                 comps.clear();
-                executor.drain(comps);
+                for (auto& ex : executors) {
+                    ex->drain(comps);  // one wake may cover any executor
+                }
                 for (auto& c : comps) {
                     auto cit = sessions.find(c.session);
                     if (cit == sessions.end()) {
@@ -519,7 +554,8 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                         // Dropped mid-step: the step is done with the seq,
                         // so release it now and discard the output.
                         if (!s.releasing) {
-                            executor.submit_release(s.in_fd, &s.seq);
+                            executors[s.exec]->submit_release(s.in_fd,
+                                                              &s.seq);
                             s.releasing = true;
                         }
                         continue;
@@ -663,6 +699,17 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
             auto s = std::make_unique<MuxSession>();
             s->in_fd = in_fd;
             s->out_fd = out_fd;
+            // Pin to the least-loaded executor (fewest live sessions;
+            // ties to the lowest index) so load spreads across the CPU
+            // lanes and the session's KV stays in that executor's cache.
+            std::size_t best = 0;
+            for (std::size_t i = 1; i < exec_load.size(); ++i) {
+                if (exec_load[i] < exec_load[best]) {
+                    best = i;
+                }
+            }
+            s->exec = best;
+            ++exec_load[best];
             poller.add(in_fd);  // out_fd watched only while backpressured
             out_index[out_fd] = in_fd;
             sessions.emplace(in_fd, std::move(s));
@@ -679,7 +726,7 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
     for (auto& [fd, sp] : sessions) {
         (void)fd;
         if (!sp->releasing) {
-            executor.submit_release(sp->in_fd, &sp->seq);
+            executors[sp->exec]->submit_release(sp->in_fd, &sp->seq);
             sp->releasing = true;
         }
         ::close(sp->in_fd);

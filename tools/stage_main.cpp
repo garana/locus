@@ -9,6 +9,7 @@
 #include <exception>
 #include <set>
 #include <string>
+#include <memory>
 #include <vector>
 
 #include "locus/config/config_file.hpp"
@@ -198,21 +199,34 @@ int main(int argc, char** argv) {
                          rt.layer_end, model.hparams().n_layers);
             return 2;
         }
-        // Refuse to allocate a KV pool that would not fit in RAM, rather
-        // than letting malloc overcommit and the OS OOM-kill the stage
-        // once the pages are touched. One worker here (--workers is a
-        // later increment); its count multiplies per_worker_bytes then.
+        // Each executor (--executors, i#24 inc 3) owns its own KV pool,
+        // so N executors commit N pools. Refuse to allocate what would
+        // not fit in RAM, rather than letting malloc overcommit and the
+        // OS OOM-kill the stage once the pages are touched.
+        const int n_exec = opt.executors < 1 ? 1 : opt.executors;
+        const std::size_t max_batch =
+            static_cast<std::size_t>(opt.max_batch < 1 ? 1 : opt.max_batch);
         if (const std::string err = locus_tools::check_kv_memory(
                 model.kv_pool_bytes(
                     static_cast<std::uint32_t>(opt.kv_blocks)),
-                /*workers=*/1, locus::sys::total_ram_bytes());
+                n_exec, locus::sys::total_ram_bytes());
             !err.empty()) {
             std::fprintf(stderr, "%s\n", err.c_str());
             return 2;
         }
-        locus::pipeline::PipelineStage stage(
-            model, rt.layer_begin, rt.layer_end,
-            static_cast<std::uint32_t>(opt.kv_blocks));
+        // One stage per executor: each its own KV cache + workspace over
+        // the shared (slice-loaded) model.
+        std::vector<std::unique_ptr<locus::pipeline::PipelineStage>> stages;
+        std::vector<locus::pipeline::PipelineStage*> stage_ptrs;
+        stages.reserve(static_cast<std::size_t>(n_exec));
+        stage_ptrs.reserve(static_cast<std::size_t>(n_exec));
+        for (int i = 0; i < n_exec; ++i) {
+            stages.push_back(
+                std::make_unique<locus::pipeline::PipelineStage>(
+                    model, rt.layer_begin, rt.layer_end,
+                    static_cast<std::uint32_t>(opt.kv_blocks)));
+            stage_ptrs.push_back(stages.back().get());
+        }
         const int lfd = locus::pipeline::listen_on(rt.listen_host,
                                                    rt.listen_port,
                                                    nullptr);
@@ -346,15 +360,14 @@ int main(int argc, char** argv) {
         }
 
         // Serve on the concurrent event-loop model (serve_stage_mux):
-        // one thread multiplexes many client connections instead of one
-        // session at a time, so N upstreams are served at once. The
-        // sequential serve_stage remains for tests; the CLI uses the mux
-        // loop. Reload, the resolver and the pre-warmed pool all flow
-        // through the same conn/reload, so nothing else changes here.
-        // (Running several of these workers, one per CPU, is the next
-        // increment, i#24.)
+        // one I/O thread multiplexes many client connections and feeds
+        // `n_exec` CPU batching executors (i#24 inc 3), each on its own
+        // stage; new sessions are pinned to the least-loaded executor.
+        // The sequential serve_stage remains for tests; the CLI uses the
+        // mux loop. Reload, the resolver and the pre-warmed pool all flow
+        // through the same conn/reload.
         const bool ok = locus::pipeline::serve_stage_mux(
-            stage, lfd, rt.allow, rt.pool, rt.conn, reload);
+            stage_ptrs, lfd, rt.allow, rt.pool, rt.conn, reload, max_batch);
         return ok ? 0 : 1;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "locus-stage: %s\n", e.what());
