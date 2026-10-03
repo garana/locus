@@ -191,6 +191,39 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                      const std::vector<Cidr>& allow,
                      const std::vector<HostPort>& downstreams,
                      const StageConn& conn = {},
-                     const StageReload& reload = {});
+                     const StageReload& reload = {},
+                     std::size_t max_batch = 16);
+
+/**
+ * Multiple-executor form (i#24 increment 3, DESIGN.md "per-device
+ * batching executors"): serves sessions across one CPU executor per
+ * entry in `stages`. Each executor owns its own stage -- its own KV
+ * cache and workspace over the shared model -- and runs a continuous-
+ * batching worker thread, so the box's cores are split into
+ * stages.size() batching lanes instead of one.
+ *
+ * A new session is assigned to the least-loaded executor (fewest live
+ * sessions) and pinned to it for its whole life, so its KV sequence
+ * stays resident in that executor's cache. All executors share one
+ * completion wake pipe; the loop drains every executor per wake and
+ * routes each session's steps and its KV release to its own executor.
+ * Everything else (the I/O loop, backpressure, drop/cancel rules,
+ * reload) is identical to the single-stage form, which forwards here
+ * with one stage.
+ *
+ * @param stages One stage per executor; must be non-empty and each must
+ *     outlive the call. A single-element vector is exactly the
+ *     single-stage behaviour.
+ * @param max_batch Per-executor cap on the coalesced batch width
+ *     (StageExecutor); bounds the transient activation memory and the
+ *     first-queued session's wait.
+ * @returns Same contract as the single-stage form. CPU/CUDA only.
+ */
+bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
+                     int listen_fd, const std::vector<Cidr>& allow,
+                     const std::vector<HostPort>& downstreams,
+                     const StageConn& conn = {},
+                     const StageReload& reload = {},
+                     std::size_t max_batch = 16);
 
 }  // namespace locus::pipeline

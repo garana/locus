@@ -48,6 +48,12 @@ struct StageOptions {
                                            *   of the TTL */
     int kv_blocks = 0;                    /**< --kv-blocks per worker
                                            *   (0 = model default) */
+    int executors = 1;                    /**< --executors: CPU batching
+                                           *   lanes (sessions pinned one
+                                           *   per lane for KV locality) */
+    int max_batch = 16;                   /**< --max-batch: sessions
+                                           *   coalesced per executor
+                                           *   forward */
 };
 
 /**
@@ -97,6 +103,12 @@ inline Spec<StageOptions> stage_spec() {
                    "refresh a cached name at this percent of its TTL"),
         D::integer("kv-blocks", &O::kv_blocks,
                    "per-worker KV cache blocks (0 = model default)"),
+        D::integer("executors", &O::executors,
+                   "CPU batching executors; sessions pinned least-loaded "
+                   "for KV locality (default 1)"),
+        D::integer("max-batch", &O::max_batch,
+                   "sessions coalesced into one batched forward per "
+                   "executor (default 16)"),
     });
 }
 

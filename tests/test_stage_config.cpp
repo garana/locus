@@ -133,6 +133,22 @@ TEST_CASE("spec.apply sets fields by type and validates ints",
         std::runtime_error);
 }
 
+TEST_CASE("stage_spec parses --executors and --max-batch (i#24 inc 3)",
+          "[config]") {
+    const auto spec = locus_tools::stage_spec();
+    StageOptions opt;
+    REQUIRE(opt.executors == 1);  // defaults
+    REQUIRE(opt.max_batch == 16);
+    REQUIRE(spec.find("executors") != nullptr);
+    REQUIRE(spec.find("max-batch") != nullptr);
+    spec.apply(*spec.find("executors"), opt, "4");
+    spec.apply(*spec.find("max-batch"), opt, "8");
+    REQUIRE(opt.executors == 4);
+    REQUIRE(opt.max_batch == 8);
+    REQUIRE_THROWS_AS(spec.apply(*spec.find("executors"), opt, "-1"),
+                      std::runtime_error);
+}
+
 TEST_CASE("spec.apply_config: the file wins over CLI, and adds",
           "[config]") {
     const auto spec = locus_tools::stage_spec();
