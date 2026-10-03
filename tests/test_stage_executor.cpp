@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -71,6 +72,9 @@ TEST_CASE("StageExecutor runs steps off-thread and matches inline step",
 
     int wake[2];
     REQUIRE(::pipe(wake) == 0);
+    // Non-blocking write end, per the executor's contract (a blocking
+    // one could stall the worker if the loop fell behind on draining).
+    ::fcntl(wake[1], F_SETFL, ::fcntl(wake[1], F_GETFL, 0) | O_NONBLOCK);
 
     PipelineStage stage(model, 0, L);
     locus::kv::PagedKvCache::Seq seq;
@@ -122,6 +126,9 @@ TEST_CASE("StageExecutor reports a failed step rather than throwing",
 
     int wake[2];
     REQUIRE(::pipe(wake) == 0);
+    // Non-blocking write end, per the executor's contract (a blocking
+    // one could stall the worker if the loop fell behind on draining).
+    ::fcntl(wake[1], F_SETFL, ::fcntl(wake[1], F_GETFL, 0) | O_NONBLOCK);
     PipelineStage stage(model, 0, L);
     locus::kv::PagedKvCache::Seq seq;
     std::vector<StageExecutor::Completion> done;

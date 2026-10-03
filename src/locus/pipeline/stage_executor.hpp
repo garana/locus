@@ -25,15 +25,29 @@ namespace locus::pipeline {
  * KV cache) and release() (which frees a sequence's blocks) touch the
  * stage's shared cache and workspace, which are not thread-safe. Running
  * both only on this one worker thread keeps that access single-threaded.
- * The caller MUST route every stage mutation through here -- it must not
- * call stage.step()/reset() itself while an executor is attached.
+ * While an executor is running the caller MUST route every stage
+ * mutation through here -- it must not call stage.step()/reset() itself
+ * concurrently. The contract is about concurrency, not permanent
+ * ownership: once the executor is DESTROYED (joined) the stage is
+ * single-threaded again and direct step()/reset() is safe. The shutdown
+ * path relies on this -- destroy the executor, then reset any remaining
+ * sessions directly, rather than routing teardown releases through it.
+ * (The guarantee is a convention, not enforced: both the loop and the
+ * executor hold the same PipelineStage&.)
  *
  * One worker thread, so exactly one step runs at a time (increment 1
  * keeps today's one-forward-at-a-time behavior; batching is increment
  * 2). `session` is an opaque key the caller matches completions by; the
- * executor never interprets it. `seq` pointers must stay valid until
- * their completion is drained (the loop keeps an in-flight session's KV
- * alive -- the no-release-under-a-running-batch rule).
+ * executor never interprets it.
+ *
+ * A `seq` passed to submit_*() must outlive the EXECUTOR, not merely
+ * survive until its completion is drained: the destructor drains the
+ * queued backlog (so queued releases -- and steps -- still run at
+ * teardown), touching those seqs then. So the caller must not free a
+ * session's seq, or clear its session map, before the executor is
+ * destroyed. (Draining the backlog on stop is deliberate -- dropping
+ * queued releases would leak KV blocks -- and bounded: one step in
+ * flight per session caps the backlog at the session count.)
  *
  * Completion signalling: one byte is written to `wake_fd` whenever a
  * completion becomes available, so a poll loop can wait on it. It is
@@ -58,8 +72,12 @@ class StageExecutor {
     /**
      * @param stage The stage to run; must outlive the executor.
      * @param wake_fd Write end of a pipe the caller polls; the executor
-     *     writes one byte per completion batch. Must outlive the
-     *     executor; the executor does not close it.
+     *     writes one byte per completion. Must outlive the executor; the
+     *     executor does not close it. It MUST be non-blocking: the
+     *     executor discards the write result, so a blocking write end
+     *     whose completions are not being drained would stall the worker
+     *     inside write() and stop all job processing. (stage_main's
+     *     make_wake_pipe sets both ends non-blocking -- reuse it.)
      */
     StageExecutor(PipelineStage& stage, int wake_fd);
     ~StageExecutor();

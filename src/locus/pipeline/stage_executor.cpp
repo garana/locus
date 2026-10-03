@@ -89,8 +89,12 @@ void StageExecutor::run() {
         // ready completions per wake, so a coalesced read is fine.
         const char b = 1;
         ssize_t w = ::write(wake_fd_, &b, 1);
-        (void)w;  // a full/broken wake pipe cannot be handled here; the
-                  // loop's level-triggered drain recovers regardless.
+        (void)w;  // Result discarded: a full (EAGAIN) wake pipe already
+                  // has a pending byte, so the loop will still wake and
+                  // drain ALL completions; a broken pipe cannot be
+                  // handled here. This REQUIRES a non-blocking write end
+                  // (see the ctor doc) -- a blocking one would stall the
+                  // worker here if the loop were behind on draining.
     }
 }
 
