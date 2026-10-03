@@ -399,28 +399,54 @@ LlamaModel::Workspace LlamaModel::make_workspace() const {
     return ws;
 }
 
-kv::PagedKvCache LlamaModel::make_cache(
-    std::uint32_t n_blocks, kv::KvType kv_type) const {
+namespace {
+// The paged-cache geometry make_cache and kv_pool_bytes share, so a
+// pre-allocation size estimate matches what make_cache then allocates.
+// Sized to the layers this model loaded (the whole model for a normal
+// load; a stage's slice under slice-only loading), with layer_base
+// recorded so callers keep passing absolute layer indices while the
+// cache stores only [layer_base, layer_end).
+kv::PagedKvCache::Geometry cache_geometry(std::uint32_t n_layers_slice,
+                                          std::uint32_t layer_base,
+                                          std::uint32_t kv_dim,
+                                          std::uint32_t n_ctx,
+                                          std::uint32_t n_blocks,
+                                          kv::KvType kv_type) {
     kv::PagedKvCache::Geometry geom;
-    // Size the cache to the layers this model actually loaded (the
-    // whole model for a normal load; a stage's slice under slice-only
-    // loading), and record the base so callers keep passing absolute
-    // layer indices while the cache stores only [layer_base, layer_end).
-    geom.n_layers = layer_end_ - layer_begin_;
-    geom.layer_base = layer_begin_;
-    geom.kv_dim = spec_->kv_dim(hp_);
+    geom.n_layers = n_layers_slice;
+    geom.layer_base = layer_base;
+    geom.kv_dim = kv_dim;
     geom.block_tokens = 16;
     geom.kv_type = kv_type;
     // Default pool covers min(n_ctx, 4096) tokens: long-context
     // models (128k+) would otherwise demand tens of GB up front.
     // Callers wanting more pass n_blocks explicitly.
-    const std::uint32_t cap_tokens =
-        std::min(hp_.n_ctx, 4096u);
-    geom.n_blocks =
-        n_blocks != 0
-            ? n_blocks
-            : (cap_tokens + geom.block_tokens - 1) /
-                  geom.block_tokens;
+    const std::uint32_t cap_tokens = std::min(n_ctx, 4096u);
+    geom.n_blocks = n_blocks != 0
+                        ? n_blocks
+                        : (cap_tokens + geom.block_tokens - 1) /
+                              geom.block_tokens;
+    return geom;
+}
+}  // namespace
+
+std::size_t LlamaModel::kv_pool_bytes(std::uint32_t n_blocks,
+                                      kv::KvType kv_type) const {
+    const auto geom = cache_geometry(layer_end_ - layer_begin_,
+                                     layer_begin_, spec_->kv_dim(hp_),
+                                     hp_.n_ctx, n_blocks, kv_type);
+    // F32 commits pool_floats() floats; a quantized pool commits
+    // pool_bytes() bytes.
+    return kv_type == kv::KvType::kF32
+               ? kv::PagedKvCache::pool_floats(geom) * sizeof(float)
+               : kv::PagedKvCache::pool_bytes(geom);
+}
+
+kv::PagedKvCache LlamaModel::make_cache(
+    std::uint32_t n_blocks, kv::KvType kv_type) const {
+    const kv::PagedKvCache::Geometry geom =
+        cache_geometry(layer_end_ - layer_begin_, layer_begin_,
+                       spec_->kv_dim(hp_), hp_.n_ctx, n_blocks, kv_type);
     // GPU-mapped KV pool when the backend provides one (alloc_kv is
     // set only for Vulkan today; it hands back unified-memory float*).
     if (backend_->ops.alloc_kv != nullptr) {

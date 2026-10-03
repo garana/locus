@@ -1067,3 +1067,22 @@ TEST_CASE("serve_stage dials a named downstream through the resolver",
     REQUIRE(gen == ref);        // named downstream produced the same tokens
     REQUIRE(lookups >= 1);      // the name really went through the resolver
 }
+
+// i#24: kv_pool_bytes estimates the KV pool a model WOULD allocate at a
+// given --kv-blocks without allocating it, so the stage can budget RAM
+// before constructing caches. It must be positive and scale linearly in
+// the block count (the pool is n_blocks x per-block bytes).
+TEST_CASE("LlamaModel::kv_pool_bytes scales with the block count",
+          "[pipeline][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+
+    REQUIRE(model.kv_pool_bytes(0) > 0);  // the default pool is non-empty
+    const std::size_t b100 = model.kv_pool_bytes(100);
+    const std::size_t b200 = model.kv_pool_bytes(200);
+    REQUIRE(b100 > 0);
+    REQUIRE(b200 == 2 * b100);  // linear in n_blocks
+}
