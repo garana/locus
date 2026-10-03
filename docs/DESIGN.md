@@ -1071,6 +1071,106 @@ the single-host run for the same prompt and seed; under concurrency
 at or above the pipeline depth, aggregate throughput approaches the
 single-box compute ceiling, with only latency raised by the hop.
 
+### Stage serving: event loop + per-device batching executors (i#24)
+
+The "reuse the engine loop per stage" line above is the stub this
+expands. It is the serving model for one node (a single-process server
+or a pipeline stage): separate I/O from compute so one event loop can
+feed concurrent, batched, possibly multi-device execution.
+
+Four properties it must have, and why the obvious shortcut fails:
+
+1. Keep the event loop. One thread multiplexes all client connections
+   (sys::Poller), as serve_stage_mux already does. It must never block
+   on compute.
+2. Use all N CPU cores for a forward.
+3. Run on the GPU, and on more than one GPU when present.
+4. Batch requests: run many ready sequences through one forward so the
+   weight read is amortized -- the dominant cost on a GPU, and the
+   throughput core locus already implements for the single-process path
+   (engine::Engine, forward_batch_decode, matvec_batch; DESIGN.md 4.2).
+
+The shortcut that does NOT work is "run N independent event loops, one
+per core" (a worker-per-CPU fan-out). Each loop would compute one
+sequence at a time, so it neither batches (property 4) nor amortizes
+weights; it also forces an all-or-nothing CPU split (one loop using all
+cores, or N loops each pinned to one core, nothing between) because the
+process-wide thread pool serializes every parallel_for caller. That path
+is explicitly rejected.
+
+The structure that satisfies all four:
+
+- I/O loop (one thread). Owns every socket. On a readable connection it
+  decodes the frame (a kToken / kActivation), marks that session's next
+  unit "ready", and hands it to the session's executor; on a completion
+  it writes the output frame (kLogits / kActivation) back. It does no
+  model compute and never blocks on it.
+- Executor = one compute device running a continuous-batching loop.
+  Each iteration it gathers every ready session, runs ONE batched
+  forward over them (forward_batch_decode: the weight-bearing ops are
+  read once and shared across the batch -- property 4), and scatters the
+  per-sequence outputs back. It owns that device's paged KV pool
+  (already multi-sequence) and workspace. This is the engine::Engine
+  scheduler, reused, with its input/output coming from the loop's queues
+  instead of a local API.
+- One executor per device. The CPU is one executor whose batched forward
+  fans across all N cores via sys::ThreadPool (property 2, and now
+  amortized over the batch). Each GPU is another executor; several GPUs
+  are several executors (property 3). The loop spreads sessions across
+  them.
+- Session-to-executor affinity. A session is pinned to one executor for
+  its life so its KV sequence stays resident in that device's cache.
+  New sessions are assigned to balance load across executors/devices.
+- Coupling. Lock-protected ready/completion queues plus a self-pipe /
+  eventfd wake in both directions (the same wake pattern the SIGHUP
+  path already uses with the Poller): loop -> executor ("these sessions
+  are ready"), executor -> loop ("these outputs are done, write them").
+  All socket I/O stays on the loop thread, so connection fds need no
+  cross-thread locking.
+
+Reuse vs. new. Reused: the continuous-batching scheduler (engine::Engine)
+and the batched forward (forward_batch_decode / matvec_batch /
+supports_batch); the mux loop, sys::Poller and the self-pipe wake; paged
+multi-sequence KV; the per-worker KV RAM guard (sys::total_ram_bytes +
+check_kv_memory). New: wiring the loop to an executor instead of an
+inline step(); a BATCHED stage step (a batch of (session, token or
+activation) -> a batch of outputs), since the pipeline stage has only a
+single-item step() today while engine::Engine already batches;
+per-device executors with session affinity and assignment; and a GPU
+device-selection seam -- the Vulkan backend today uses a single implicit
+device, so multi-GPU needs enumerate-and-bind-per-device added first.
+
+CPU core division. With the single shared sys::ThreadPool there are only
+two non-contending settings: one executor using all cores (lowest
+single-request latency), or K executors each single-threaded (K-way
+throughput, one core per request). The useful middle -- a few executors
+each still multi-threaded -- needs per-executor thread pools (a
+ThreadPool threaded through forward_layers instead of the singleton);
+tracked separately. The first cut ships one CPU executor using all
+cores, which keeps today's single-request latency and adds batching.
+
+Increments (each its own PR, reviewed):
+
+1. Executor seam + queues/wake: the I/O loop hands forward work to a
+   single in-process CPU executor via ready/completion queues; behavior
+   matches today (one all-cores forward at a time) but compute no longer
+   runs on the loop thread.
+2. Batched stage step: the executor coalesces the ready sessions into
+   one forward_batch_decode per iteration; byte-identical to per-session
+   stepping, verified against the single-process engine.
+3. Multiple CPU executors + session affinity + assignment, with the RAM
+   guard sizing KV per executor.
+4. GPU device-selection seam, then a GPU executor; multi-GPU as several
+   GPU executors.
+
+Exit test: on one host, concurrent clients are served by a single event
+loop while their decode steps are coalesced into batched forwards
+(throughput rises with concurrency up to the batch width, single-request
+latency unchanged from the one-executor case); byte-identical output to
+the single-process engine for the same prompts and seed; and, once the
+device seam lands, sessions spread across multiple GPU executors with KV
+resident per device.
+
 ## R16: Q8_K activation-dot (ggml-exact quantized matvec)
 
 llama.cpp does not dot quantized weights against f32 activations: for
