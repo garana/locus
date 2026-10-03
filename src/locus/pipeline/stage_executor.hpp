@@ -35,10 +35,18 @@ namespace locus::pipeline {
  * (The guarantee is a convention, not enforced: both the loop and the
  * executor hold the same PipelineStage&.)
  *
- * One worker thread, so exactly one step runs at a time (increment 1
- * keeps today's one-forward-at-a-time behavior; batching is increment
- * 2). `session` is an opaque key the caller matches completions by; the
- * executor never interprets it.
+ * One worker thread, so exactly one forward runs at a time -- but that
+ * forward may be BATCHED (increment 2): when several step jobs are
+ * already queued as the worker wakes, it coalesces the leading run of
+ * them (up to the first release) into a single PipelineStage::step_batch
+ * call, so a layer's weights are read once for the whole batch. The
+ * sessions in a batch may sit at different positions; each is validated
+ * and completes independently, and one malformed frame fails only its
+ * own completion. Completions are emitted in submit (FIFO) order, so a
+ * session's own frames never reorder (the caller keeps at most one step
+ * in flight per session). A backend that cannot batch (Vulkan) falls
+ * back to one step() per job. `session` is an opaque key the caller
+ * matches completions by; the executor never interprets it.
  *
  * A `seq` passed to submit_*() must outlive the EXECUTOR, not merely
  * survive until its completion is drained: the destructor drains the
