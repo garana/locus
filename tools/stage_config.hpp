@@ -46,6 +46,8 @@ struct StageOptions {
     int resolve_max_ttl = 300;            /**< --resolve-max-ttl s cap */
     int resolve_refresh_percent = 75;     /**< --resolve-refresh-percent
                                            *   of the TTL */
+    int kv_blocks = 0;                    /**< --kv-blocks per worker
+                                           *   (0 = model default) */
 };
 
 /**
@@ -93,7 +95,49 @@ inline Spec<StageOptions> stage_spec() {
                    "cap on the downstream-name cache TTL s"),
         D::integer("resolve-refresh-percent", &O::resolve_refresh_percent,
                    "refresh a cached name at this percent of its TTL"),
+        D::integer("kv-blocks", &O::kv_blocks,
+                   "per-worker KV cache blocks (0 = model default)"),
     });
+}
+
+/**
+ * Guards a planned KV footprint against available RAM. `per_worker_bytes`
+ * is one worker's committed KV pool (LlamaModel::kv_pool_bytes); the
+ * model's weights are mmap'd (page cache, kernel-evictable) so they are
+ * not counted here. required = per_worker_bytes * max(workers, 1).
+ *
+ * @param avail_bytes total physical RAM (sys::total_ram_bytes()); 0 means
+ *     unknown, in which case this returns "" -- a guard must not refuse
+ *     to start just because it could not measure RAM.
+ * @param headroom fraction of RAM the KV pools may use, leaving the rest
+ *     for the resident weight pages, per-worker workspaces and the OS.
+ * @returns an error string if the pools would exceed the budget, else "".
+ */
+inline std::string check_kv_memory(std::size_t per_worker_bytes,
+                                   int workers, std::uint64_t avail_bytes,
+                                   double headroom = 0.8) {
+    if (avail_bytes == 0) {
+        return "";  // RAM unknown: do not block startup
+    }
+    const std::uint64_t n = workers < 1 ? 1 : static_cast<std::uint64_t>(
+                                                  workers);
+    const std::uint64_t required =
+        static_cast<std::uint64_t>(per_worker_bytes) * n;
+    const std::uint64_t budget =
+        static_cast<std::uint64_t>(static_cast<double>(avail_bytes) *
+                                   headroom);
+    if (required <= budget) {
+        return "";
+    }
+    const auto mib = [](std::uint64_t b) {
+        return b / (1024 * 1024);
+    };
+    return "KV cache needs ~" + std::to_string(mib(required)) + " MiB (" +
+           std::to_string(n) + " worker(s) x ~" +
+           std::to_string(mib(per_worker_bytes)) +
+           " MiB), over the ~" + std::to_string(mib(budget)) +
+           " MiB budget (" + std::to_string(mib(avail_bytes)) +
+           " MiB RAM); reduce --kv-blocks or --workers";
 }
 
 /** Builds the resolver policy from the resolve-* options. These are

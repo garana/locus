@@ -17,6 +17,7 @@
 #include "locus/pipeline/net.hpp"
 #include "locus/pipeline/stage.hpp"
 #include "locus/pipeline/stage_server.hpp"
+#include "locus/sys/meminfo.hpp"
 #include "stage_config.hpp"
 
 namespace {
@@ -197,8 +198,21 @@ int main(int argc, char** argv) {
                          rt.layer_end, model.hparams().n_layers);
             return 2;
         }
-        locus::pipeline::PipelineStage stage(model, rt.layer_begin,
-                                             rt.layer_end);
+        // Refuse to allocate a KV pool that would not fit in RAM, rather
+        // than letting malloc overcommit and the OS OOM-kill the stage
+        // once the pages are touched. One worker here (--workers is a
+        // later increment); its count multiplies per_worker_bytes then.
+        if (const std::string err = locus_tools::check_kv_memory(
+                model.kv_pool_bytes(
+                    static_cast<std::uint32_t>(opt.kv_blocks)),
+                /*workers=*/1, locus::sys::total_ram_bytes());
+            !err.empty()) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return 2;
+        }
+        locus::pipeline::PipelineStage stage(
+            model, rt.layer_begin, rt.layer_end,
+            static_cast<std::uint32_t>(opt.kv_blocks));
         const int lfd = locus::pipeline::listen_on(rt.listen_host,
                                                    rt.listen_port,
                                                    nullptr);

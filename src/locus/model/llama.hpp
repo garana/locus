@@ -176,6 +176,19 @@ class LlamaModel {
         kv::KvType kv_type = kv::KvType::kF32) const;
 
     /**
+     * Bytes the paged KV pool for this model would occupy at `n_blocks`
+     * (0 = the make_cache default), WITHOUT allocating it. Lets a caller
+     * budget memory before constructing caches -- e.g. the stage server
+     * refusing a --workers x --kv-blocks request that would exceed
+     * available RAM. Mirrors make_cache's geometry exactly, so the number
+     * matches what make_cache(n_blocks, kv_type) then allocates.
+     * @returns the pool size in bytes.
+     */
+    std::size_t kv_pool_bytes(
+        std::uint32_t n_blocks = 0,
+        kv::KvType kv_type = kv::KvType::kF32) const;
+
+    /**
      * Runs one token at position seq.n_tokens, appending K/V to
      * seq and advancing it. Routed to the GPU when the active
      * backend provides a full forward (vulkan); CPU ops

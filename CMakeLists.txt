@@ -33,6 +33,7 @@ add_library(locus
     src/locus/kv/paged_cache.cpp
     src/locus/kv/kv_quant.cpp
     src/locus/sys/features.cpp
+    src/locus/sys/meminfo.cpp
     src/locus/model/arch.cpp
     src/locus/model/grammar.cpp
     src/locus/model/llama.cpp

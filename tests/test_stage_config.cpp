@@ -284,3 +284,28 @@ TEST_CASE("stage_spec parses the resolve-* knobs", "[config]") {
     REQUIRE(opt.resolve_max_ttl == 120);
     REQUIRE(opt.resolve_refresh_percent == 80);
 }
+
+// i#40/i#24: the memory guard refuses a KV footprint that would exceed
+// available RAM (per-worker bytes x workers vs avail x headroom), and
+// no-ops when RAM is unknown.
+TEST_CASE("check_kv_memory guards KV against available RAM", "[config]") {
+    using locus_tools::check_kv_memory;
+    constexpr std::uint64_t MiB = 1024 * 1024;
+    constexpr std::uint64_t GiB = 1024 * MiB;
+
+    // 700 MiB x 1 under 0.8 x 1 GiB (~819 MiB): fits.
+    REQUIRE(check_kv_memory(700 * MiB, 1, GiB).empty());
+    // 900 MiB x 1: over the ~819 MiB budget.
+    REQUIRE_FALSE(check_kv_memory(900 * MiB, 1, GiB).empty());
+    // Worker count multiplies: 300 MiB x 2 fits, 500 MiB x 2 does not.
+    REQUIRE(check_kv_memory(300 * MiB, 2, GiB).empty());
+    REQUIRE_FALSE(check_kv_memory(500 * MiB, 2, GiB).empty());
+    // Unknown RAM (0) never blocks, even for an absurd request.
+    REQUIRE(check_kv_memory(100 * GiB, 8, 0).empty());
+    // workers < 1 is treated as 1 (not 0 bytes).
+    REQUIRE_FALSE(check_kv_memory(900 * MiB, 0, GiB).empty());
+    // The error message names the knobs to turn.
+    const std::string err = check_kv_memory(900 * MiB, 1, GiB);
+    REQUIRE(err.find("--kv-blocks") != std::string::npos);
+    REQUIRE(err.find("--workers") != std::string::npos);
+}
