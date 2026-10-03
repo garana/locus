@@ -111,6 +111,17 @@ void PipelineStage::step_batch(std::span<const BatchInput> ins,
                         "PipelineStage: first stage expects a kToken "
                         "message");
                 }
+                // Range-check the token HERE, per entry, so a bad id
+                // fails only its own slot. forward_batch_layers validates
+                // the range by throwing for the whole call, which would
+                // otherwise fail every co-batched session -- and token is
+                // an unchecked int32 off the wire, so any upstream can
+                // send one.
+                if (in.token < 0 ||
+                    static_cast<std::uint32_t>(in.token) >= n_vocab_) {
+                    throw std::invalid_argument(
+                        "PipelineStage: token id out of vocab");
+                }
             } else {
                 if (in.type != MsgType::kActivation) {
                     throw std::invalid_argument(
