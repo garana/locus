@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -16,6 +17,7 @@
 
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/resolver.hpp"
+#include "locus/pipeline/stage_executor.hpp"
 #include "locus/sys/poller.hpp"
 
 namespace locus::pipeline {
@@ -147,6 +149,19 @@ struct MuxSession {
     std::string inbuf;
     std::string outbuf;
     bool out_watched = false;
+    // Async-step state (executor seam, i#24 increment 1). A session has
+    // at most one step in flight on the executor at a time (the loop
+    // submits the next frame only on the previous completion), which is
+    // what keeps ordering free. Teardown is deferred so the executor is
+    // never holding this session's seq when it is freed: on a drop the
+    // session is marked `cancelled` and kept alive (fds open, entry in
+    // the map) until its KV release completes.
+    bool in_flight = false;   // a step is queued/running on the executor
+    bool cancelled = false;   // dropped; being torn down
+    bool releasing = false;   // a release has been submitted
+    bool eof = false;         // in_fd hit EOF/error; finish when idle
+    bool read_error = false;  // that EOF was a socket error (unclean)
+    bool clean_end = true;    // recorded cleanliness for the release
 };
 
 }  // namespace
@@ -300,42 +315,34 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
     if (reload.wake_fd >= 0) {
         poller.add(reload.wake_fd);
     }
-    // Keyed by input fd (the fd the poller reports). Each entry owns its
-    // own downstream fd and KV sequence, so sessions are independent.
-    std::unordered_map<int, MuxSession> sessions;
-    // Reverse index out_fd -> in_fd, so a write-readiness event on a
-    // downstream fd finds its session. Populated for a session's whole
-    // life (the fd is watched only while backpressured, but the mapping
-    // is cheap to keep).
+    // Keyed by input fd (the fd the poller reports). unique_ptr so a
+    // session's address -- and the seq* the executor holds across an
+    // in-flight step -- stays stable as the map rehashes. Declared
+    // BEFORE the executor so it is destroyed AFTER it (reverse order),
+    // keeping seqs alive while the executor's destructor drains any
+    // queued releases.
+    std::unordered_map<int, std::unique_ptr<MuxSession>> sessions;
+    // Reverse index out_fd -> in_fd for write-readiness events.
     std::unordered_map<int, int> out_index;
 
-    // Ends one session: unregister both fds, free its KV, close them.
-    // `clean` records whether it ended at a frame boundary (for the
-    // return value and the serve_sessions count).
-    auto drop = [&](int fd, bool clean) {
-        auto it = sessions.find(fd);
-        if (it == sessions.end()) {
-            return;
-        }
-        poller.remove(it->second.in_fd);
-        if (it->second.out_watched) {
-            poller.remove(it->second.out_fd);
-        }
-        out_index.erase(it->second.out_fd);
-        stage.reset(it->second.seq);
-        ::close(it->second.in_fd);
-        ::close(it->second.out_fd);
-        sessions.erase(it);
-        if (!clean) {
-            all_clean = false;
-        }
-        ++completed;
-    };
+    // Self-pipe carrying the executor's completion wakeups into the
+    // poller (same shape as the SIGHUP wake). Non-blocking write end, per
+    // the StageExecutor contract.
+    int exec_wake[2] = {-1, -1};
+    if (::pipe(exec_wake) != 0) {
+        ::close(listen_fd);
+        return false;
+    }
+    set_nonblocking(exec_wake[0]);
+    set_nonblocking(exec_wake[1]);
+    poller.add(exec_wake[0]);
+    // Runs stage.step()/reset() off this loop thread. Owns ALL stage
+    // mutation; the loop never calls stage.step()/reset() itself.
+    StageExecutor executor(stage, exec_wake[1]);
 
     // Pushes as much of `s.outbuf` to the downstream as it will take
     // without blocking, keeping frame order. Starts watching out_fd for
-    // write-readiness when bytes remain (so the next writable event
-    // resumes the flush) and stops watching once drained.
+    // write-readiness when bytes remain and stops once drained.
     // @returns 0 fully flushed, 1 partial (bytes still pending), -1 the
     //     downstream errored and the session must be dropped.
     auto flush_out = [&](MuxSession& s) -> int {
@@ -365,25 +372,96 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
         return 0;
     };
 
-    // Tears down everything and returns `ok`; used on both the normal
-    // serve_sessions stop and a fatal error.
-    auto shutdown = [&](bool ok) {
-        for (auto& [fd, s] : sessions) {
-            (void)fd;
-            stage.reset(s.seq);
-            ::close(s.in_fd);
-            ::close(s.out_fd);
+    // Frees a torn-down session once its KV release has completed on the
+    // executor (so the executor is no longer touching its seq): drop its
+    // fds and map entries and count it. Called only from a release
+    // completion.
+    auto free_session = [&](int fd) {
+        auto it = sessions.find(fd);
+        if (it == sessions.end()) {
+            return;
         }
-        sessions.clear();
-        ::close(listen_fd);
-        return ok;
+        MuxSession& s = *it->second;
+        poller.remove(s.in_fd);
+        if (s.out_watched) {
+            poller.remove(s.out_fd);
+        }
+        out_index.erase(s.out_fd);
+        ::close(s.in_fd);
+        ::close(s.out_fd);
+        if (!s.clean_end) {
+            all_clean = false;
+        }
+        ++completed;
+        sessions.erase(it);
     };
 
+    // Begins tearing a session down (EOF, error, decode/step/write
+    // failure). Never frees it here -- the executor may hold its seq.
+    // Stops watching its fds, records cleanliness, and routes the KV
+    // release through the executor; if a step is in flight the release is
+    // deferred to that step's completion (the no-release-under-a-running-
+    // step rule). free_session runs when the release completes.
+    auto begin_drop = [&](MuxSession& s, bool clean) {
+        if (s.cancelled) {
+            return;  // already tearing down
+        }
+        s.cancelled = true;
+        s.clean_end = clean;
+        poller.remove(s.in_fd);
+        if (s.out_watched) {
+            poller.remove(s.out_fd);
+            s.out_watched = false;
+        }
+        if (!s.in_flight && !s.releasing) {
+            executor.submit_release(s.in_fd, &s.seq);
+            s.releasing = true;
+        }
+    };
+
+    // Submits this session's next buffered frame to the executor if it
+    // is idle -- one step in flight per session, which keeps ordering
+    // free. A malformed frame tears the session down.
+    auto pump = [&](MuxSession& s) {
+        if (s.in_flight || s.cancelled) {
+            return;
+        }
+        Message in;
+        std::string err;
+        const Decode d = decode(s.inbuf, in, err);
+        if (d == Decode::kIncomplete) {
+            return;
+        }
+        if (d == Decode::kError) {
+            std::fprintf(stderr,
+                         "serve_stage_mux: session dropped: "
+                         "malformed frame: %s\n",
+                         err.c_str());
+            begin_drop(s, false);
+            return;
+        }
+        executor.submit_step(s.in_fd, &s.seq, std::move(in));
+        s.in_flight = true;
+    };
+
+    // After recv or a step completion: if the peer is gone and the
+    // session is idle (no step in flight, no complete frame left -- pump
+    // would have taken it), tear it down. Clean iff it closed at a frame
+    // boundary (nothing half-read) and the socket did not error.
+    auto maybe_finish = [&](MuxSession& s) {
+        if (s.eof && !s.in_flight && !s.cancelled) {
+            begin_drop(s, !s.read_error && s.inbuf.empty());
+        }
+    };
+
+    bool result = true;
     std::vector<sys::Poller::Event> events;
+    std::vector<StageExecutor::Completion> comps;
     for (;;) {
         const int pr = poller.wait(events, -1);
         if (pr < 0) {
-            return shutdown(false);  // poll error
+            result = false;
+            break;  // poll error
         }
 
         bool listen_ready = false;
@@ -394,43 +472,90 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                 }
                 continue;
             }
+            if (ev.fd == exec_wake[0]) {
+                // The executor finished one or more jobs. Drain the wake
+                // pipe and ALL completions (level-triggered: one wake may
+                // cover several), then act on each.
+                char buf[64];
+                while (::read(exec_wake[0], buf, sizeof(buf)) > 0) {
+                }
+                comps.clear();
+                executor.drain(comps);
+                for (auto& c : comps) {
+                    auto cit = sessions.find(c.session);
+                    if (cit == sessions.end()) {
+                        continue;  // already freed (should not happen)
+                    }
+                    if (c.is_release) {
+                        free_session(c.session);  // erases the session
+                        continue;
+                    }
+                    MuxSession& s = *cit->second;
+                    s.in_flight = false;
+                    if (s.cancelled) {
+                        // Dropped mid-step: the step is done with the seq,
+                        // so release it now and discard the output.
+                        if (!s.releasing) {
+                            executor.submit_release(s.in_fd, &s.seq);
+                            s.releasing = true;
+                        }
+                        continue;
+                    }
+                    if (!c.ok) {
+                        std::fprintf(stderr,
+                                     "serve_stage_mux: session dropped: "
+                                     "%s\n",
+                                     c.err.c_str());
+                        begin_drop(s, false);
+                        continue;
+                    }
+                    // Send the output downstream, then submit the next
+                    // buffered frame (or finish if the peer already left).
+                    encode(c.out, s.outbuf);
+                    if (flush_out(s) < 0) {
+                        std::fprintf(stderr,
+                                     "serve_stage_mux: session dropped: "
+                                     "downstream write failed\n");
+                        begin_drop(s, false);
+                        continue;
+                    }
+                    pump(s);
+                    maybe_finish(s);
+                }
+                continue;
+            }
             if (ev.fd == listen_fd) {
                 listen_ready = true;  // accept after the session fds
                 continue;
             }
             // A downstream (out) fd becomes writable: resume the parked
-            // flush for its session. (out_index is kept whether or not the
-            // fd is currently watched, so a stale entry is impossible; a
-            // session dropped earlier in this batch is already erased.)
+            // flush for its session.
             if (const auto oit = out_index.find(ev.fd);
                 oit != out_index.end()) {
                 const auto sit = sessions.find(oit->second);
-                if (sit != sessions.end() && flush_out(sit->second) < 0) {
+                if (sit != sessions.end() &&
+                    flush_out(*sit->second) < 0) {
                     std::fprintf(stderr,
                                  "serve_stage_mux: session dropped: "
                                  "downstream write failed\n");
-                    drop(sit->second.in_fd, false);
+                    begin_drop(*sit->second, false);
                 }
                 continue;
             }
-            // A session input fd. It may have been dropped earlier in
-            // this same batch; a reused fd number is only handed out by
-            // the accept below (which runs after this loop), so a
-            // missing entry just means "already gone" -- skip it.
+            // A session input fd. A missing entry means already gone.
             auto it = sessions.find(ev.fd);
             if (it == sessions.end()) {
                 continue;
             }
-            MuxSession& s = it->second;
+            MuxSession& s = *it->second;
+            if (s.cancelled) {
+                continue;  // torn down; ignore a late event
+            }
 
-            // Drain every currently-available byte into the frame
-            // buffer. read()==0 (clean EOF) or -1 with a non-retriable
-            // errno is the only portable "peer gone" signal (see the
-            // sys::Poller contract); the ev.hangup/ev.error flags are
-            // hints we deliberately do not act on alone, and any
-            // buffered bytes are decoded below before the drop.
-            bool gone = false;
-            bool read_error = false;
+            // Drain every available byte into the frame buffer. read()==0
+            // (clean EOF) or -1 with a non-retriable errno is the only
+            // portable "peer gone" signal (sys::Poller contract); the
+            // flags are hints and buffered bytes are processed first.
             for (;;) {
                 char buf[4096];
                 const ssize_t n = ::recv(s.in_fd, buf, sizeof(buf), 0);
@@ -439,7 +564,7 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                     continue;
                 }
                 if (n == 0) {
-                    gone = true;  // clean EOF
+                    s.eof = true;  // clean EOF
                     break;
                 }
                 if (errno == EINTR) {
@@ -448,104 +573,47 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     break;  // drained all that was ready
                 }
-                gone = true;
-                read_error = true;  // e.g. ECONNRESET
+                s.eof = true;
+                s.read_error = true;  // e.g. ECONNRESET
                 break;
             }
-
-            // Process every complete frame now buffered, in order.
-            bool dropped = false;
-            for (;;) {
-                Message in;
-                std::string err;
-                const Decode d = decode(s.inbuf, in, err);
-                if (d == Decode::kIncomplete) {
-                    break;  // wait for more bytes
-                }
-                if (d == Decode::kError) {
-                    std::fprintf(stderr,
-                                 "serve_stage_mux: session dropped: "
-                                 "malformed frame: %s\n",
-                                 err.c_str());
-                    drop(s.in_fd, false);
-                    dropped = true;
-                    break;
-                }
-                Message out;
-                try {
-                    out = stage.step(s.seq, in);
-                } catch (const std::exception& e) {
-                    // e.g. a cache-exhausted or lockstep error. Log the
-                    // reason -- without this a dropped session is
-                    // invisible from outside (the client's connection
-                    // just closes), which the sequential serve_stage did
-                    // not do.
-                    std::fprintf(stderr,
-                                 "serve_stage_mux: session dropped: %s\n",
-                                 e.what());
-                    drop(s.in_fd, false);
-                    dropped = true;
-                    break;
-                }
-                // Queue the output frame and push what the downstream
-                // will take without blocking; a stalled downstream parks
-                // its backlog in outbuf and resumes on a writable event,
-                // so one slow peer no longer blocks the loop. Frames
-                // append in order, so ordering holds across backpressure.
-                encode(out, s.outbuf);
-                if (flush_out(s) < 0) {
-                    std::fprintf(stderr,
-                                 "serve_stage_mux: session dropped: "
-                                 "downstream write failed\n");
-                    drop(s.in_fd, false);
-                    dropped = true;
-                    break;
-                }
+            if (s.eof) {
+                // Nothing more to read; stop the level-triggered EOF from
+                // re-firing while a step is still in flight.
+                poller.remove(s.in_fd);
             }
-
-            // Honor an EOF only HERE, after the frame loop above has
-            // decoded, stepped and flushed this batch's frames. This
-            // ordering is load-bearing: a client that sends its last
-            // frame and then half-closes its send side (shutdown SHUT_WR)
-            // produces the frame and a recv()==0 in the same batch, and
-            // still gets its answer because the drop runs after the
-            // frames are processed. Do NOT hoist this above the frame
-            // loop -- that would silently stop half-closing clients from
-            // getting answers, with every existing test still green.
-            if (!dropped && gone) {
-                // Clean only if the peer closed at a frame boundary
-                // (nothing half-read) and the socket itself did not
-                // error -- mirrors read_message's EOF-vs-truncation rule.
-                const bool clean = !read_error && s.inbuf.empty();
-                drop(s.in_fd, clean);
-            }
+            // Submit the next frame if idle, then (once idle with the
+            // peer gone) tear down. The drop is honored only AFTER the
+            // buffered frame is submitted, so a client that sends its last
+            // frame and half-closes still gets its answer.
+            pump(s);
+            maybe_finish(s);
         }
 
-        // Stop once enough sessions have ended. Checked after the whole
-        // batch (not per event) so a drop from a downstream-flush event,
-        // not just an input event, is counted too.
+        // Stop once enough sessions have ended (freed, i.e. their KV
+        // released). Checked after the whole batch so a drop reached from
+        // any event -- input, downstream flush, or a completion -- counts.
         if (conn_live.serve_sessions > 0 &&
             completed >= conn_live.serve_sessions) {
-            return shutdown(all_clean);
+            result = all_clean;
+            break;
         }
 
-        // Apply a pending reload (set by the SIGHUP handler and signaled
-        // on the wake pipe) before accepting, so a new session uses the
-        // fresh allowlist/pool/policy. Sessions already running keep the
-        // policy they started with.
+        // Apply a pending reload before accepting, so a new session uses
+        // the fresh allowlist/pool/policy. Running sessions keep theirs.
         if (reload.flag != nullptr && *reload.flag != 0 && reload.apply) {
             *reload.flag = 0;
             reload.apply(allow_live, pool_live, conn_live);
         }
 
-        // Accept at most one new session per wakeup (the listener is
-        // level-triggered, so a backlog re-fires on the next wait).
-        // Each session dials its own downstream and gets its own KV
-        // sequence, so concurrent sessions never share state.
+        // Accept at most one new session per wakeup (level-triggered, so
+        // a backlog re-fires). Each session dials its own downstream and
+        // gets its own KV sequence.
         if (listen_ready) {
             const int in_fd = accept_allowed(listen_fd, allow_live);
             if (in_fd < 0) {
-                return shutdown(false);  // listener broken
+                result = false;
+                break;  // listener broken
             }
             set_keepalive(in_fd, conn_live.keepalive_idle_s,
                           conn_live.keepalive_intvl_s,
@@ -554,7 +622,8 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                 connect_pool(pool_live, &cursor, conn_live);
             if (out_fd < 0) {
                 ::close(in_fd);
-                return shutdown(false);  // no live downstream in budget
+                result = false;
+                break;  // no live downstream in budget
             }
             set_keepalive(out_fd, conn_live.keepalive_idle_s,
                           conn_live.keepalive_intvl_s,
@@ -565,16 +634,38 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
             if (!set_nonblocking(in_fd) || !set_nonblocking(out_fd)) {
                 ::close(in_fd);
                 ::close(out_fd);
-                return shutdown(false);
+                result = false;
+                break;
             }
-            MuxSession s;
-            s.in_fd = in_fd;
-            s.out_fd = out_fd;
-            poller.add(in_fd);  // out_fd is watched only while backpressured
+            auto s = std::make_unique<MuxSession>();
+            s->in_fd = in_fd;
+            s->out_fd = out_fd;
+            poller.add(in_fd);  // out_fd watched only while backpressured
             out_index[out_fd] = in_fd;
             sessions.emplace(in_fd, std::move(s));
         }
     }
+
+    // Shutdown. The executor still owns every live seq, so route each
+    // remaining session's KV release through it (FIFO after any in-flight
+    // step) rather than touching the stage here. Close the fds now but
+    // leave the MuxSession objects alive: the executor's destructor --
+    // which runs when this function returns, BEFORE `sessions` is
+    // destroyed, since it is declared after it -- drains those queued
+    // releases, resetting the seqs; then `sessions` frees the objects.
+    for (auto& [fd, sp] : sessions) {
+        (void)fd;
+        if (!sp->releasing) {
+            executor.submit_release(sp->in_fd, &sp->seq);
+            sp->releasing = true;
+        }
+        ::close(sp->in_fd);
+        ::close(sp->out_fd);
+    }
+    ::close(exec_wake[0]);
+    ::close(exec_wake[1]);
+    ::close(listen_fd);
+    return result;
 }
 
 }  // namespace locus::pipeline
