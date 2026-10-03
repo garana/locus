@@ -112,6 +112,13 @@ inline Spec<StageOptions> stage_spec() {
  * @param headroom fraction of RAM the KV pools may use, leaving the rest
  *     for the resident weight pages, per-worker workspaces and the OS.
  * @returns an error string if the pools would exceed the budget, else "".
+ *
+ * This guards against an out-of-memory kill, NOT against page-cache
+ * starvation: every KV byte committed is a page the mmap'd weight window
+ * cannot keep resident, so a config that passes (say 79% of RAM) can
+ * still thrash on a streaming model whose throughput depends on the hot
+ * weights staying cached. "Fits" is not "performs" -- passing this check
+ * means the stage will start, not that it will be fast.
  */
 inline std::string check_kv_memory(std::size_t per_worker_bytes,
                                    int workers, std::uint64_t avail_bytes,

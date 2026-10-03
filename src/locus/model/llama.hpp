@@ -182,6 +182,11 @@ class LlamaModel {
      * refusing a --workers x --kv-blocks request that would exceed
      * available RAM. Mirrors make_cache's geometry exactly, so the number
      * matches what make_cache(n_blocks, kv_type) then allocates.
+     *
+     * Measures the HOST pool. When a backend provides its own KV
+     * allocator (Vulkan's alloc_kv), make_cache takes the pool from the
+     * device instead, and this host figure would not reflect it -- moot
+     * today, since pipeline stages run CPU/CUDA and never take that path.
      * @returns the pool size in bytes.
      */
     std::size_t kv_pool_bytes(
