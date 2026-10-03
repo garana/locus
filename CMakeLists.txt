@@ -45,6 +45,7 @@ add_library(locus
     src/locus/pipeline/net.cpp
     src/locus/pipeline/resolver.cpp
     src/locus/pipeline/stage.cpp
+    src/locus/pipeline/stage_executor.cpp
     src/locus/pipeline/stage_server.cpp
     src/locus/server/engine_loop.cpp
     src/locus/server/server.cpp
