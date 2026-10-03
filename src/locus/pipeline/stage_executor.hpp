@@ -1,6 +1,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -86,8 +87,16 @@ class StageExecutor {
      *     whose completions are not being drained would stall the worker
      *     inside write() and stop all job processing. (stage_main's
      *     make_wake_pipe sets both ends non-blocking -- reuse it.)
+     * @param max_batch Largest number of step jobs coalesced into one
+     *     batched forward. It bounds two things that otherwise grow with
+     *     the queue depth: the transient activation memory a batch
+     *     allocates (n * (3*n_embd + 2*n_ff) floats, which the #44 KV RAM
+     *     guard does not count), and the added latency the earliest-
+     *     queued session waits for the rest of its batch. A modest
+     *     default keeps both bounded under load; 0 is treated as 1.
      */
-    StageExecutor(PipelineStage& stage, int wake_fd);
+    StageExecutor(PipelineStage& stage, int wake_fd,
+                  std::size_t max_batch = 16);
     ~StageExecutor();
     StageExecutor(const StageExecutor&) = delete;
     StageExecutor& operator=(const StageExecutor&) = delete;
@@ -118,6 +127,7 @@ class StageExecutor {
 
     PipelineStage& stage_;
     int wake_fd_;
+    std::size_t max_batch_;
 
     std::mutex mu_;
     std::condition_variable cv_;

@@ -8,8 +8,11 @@
 
 namespace locus::pipeline {
 
-StageExecutor::StageExecutor(PipelineStage& stage, int wake_fd)
-    : stage_(stage), wake_fd_(wake_fd) {
+StageExecutor::StageExecutor(PipelineStage& stage, int wake_fd,
+                             std::size_t max_batch)
+    : stage_(stage),
+      wake_fd_(wake_fd),
+      max_batch_(max_batch == 0 ? 1 : max_batch) {
     thread_ = std::thread(&StageExecutor::run, this);
 }
 
@@ -86,8 +89,14 @@ void StageExecutor::run() {
                 // normal serving this never triggers (the caller keeps
                 // one step in flight per session); it makes the executor
                 // robust if it does.
+                // Cap the width at max_batch_ so a deep queue does not
+                // produce one huge forward: it bounds the transient
+                // activation memory per batch and the latency the first
+                // session waits for the rest. The overflow stays queued
+                // and runs in the next batch.
                 std::unordered_set<kv::PagedKvCache::Seq*> seen;
                 while (!jobs_.empty() && !jobs_.front().release &&
+                       steps.size() < max_batch_ &&
                        seen.find(jobs_.front().seq) == seen.end()) {
                     seen.insert(jobs_.front().seq);
                     steps.push_back(std::move(jobs_.front()));

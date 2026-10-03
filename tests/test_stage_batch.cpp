@@ -240,6 +240,50 @@ TEST_CASE("step_batch isolates a bad frame", "[pipeline][batch]") {
     require_eq(outs[2].out.data, r2);
 }
 
+// A token id outside the vocab must fail only its own slot. Without the
+// per-entry range check it would reach forward_batch_layers, which
+// throws for the whole call -- failing every co-batched session. token
+// is an unchecked int32 off the wire, so this is a cross-session
+// isolation / DoS concern, not a theoretical one.
+TEST_CASE("step_batch isolates an out-of-vocab token",
+          "[pipeline][batch]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const std::uint32_t V = model.hparams().n_vocab;
+
+    std::vector<float> r0, r2;
+    {
+        PipelineStage s(model, 0, L);
+        Seq a, b;
+        r0 = s.step(a, locus::pipeline::make_token(0, 0, 5)).data;
+        r2 = s.step(b, locus::pipeline::make_token(2, 0, 7)).data;
+    }
+
+    PipelineStage s(model, 0, L);
+    std::vector<Seq> seq(3);
+    std::vector<Message> ins;
+    ins.push_back(locus::pipeline::make_token(0, 0, 5));
+    ins.push_back(locus::pipeline::make_token(
+        1, 0, static_cast<locus::tok::TokenId>(V + 7)));  // out of vocab
+    ins.push_back(locus::pipeline::make_token(2, 0, 7));
+
+    auto b = make_batch(seq, ins);
+    std::vector<PipelineStage::BatchOutput> outs;
+    s.step_batch(b, outs);
+
+    REQUIRE(outs.size() == 3);
+    REQUIRE(outs[0].ok);
+    REQUIRE_FALSE(outs[1].ok);
+    REQUIRE_FALSE(outs[1].err.empty());
+    REQUIRE(outs[2].ok);
+    require_eq(outs[0].out.data, r0);
+    require_eq(outs[2].out.data, r2);
+}
+
 namespace {
 void collect(StageExecutor& ex, int wake_r,
              std::vector<StageExecutor::Completion>& out,
@@ -315,6 +359,64 @@ TEST_CASE("StageExecutor batches distinct sessions transparently",
         REQUIRE_FALSE(done[i].is_release);
         REQUIRE(done[i].ok);
         REQUIRE(done[i].out.type == MsgType::kLogits);
+        require_eq(done[i].out.data, ref[i]);
+    }
+}
+
+// The width cap splits a deep queue into several batches; that must stay
+// transparent. With max_batch = 2 and 5 distinct sessions, the run needs
+// at least three batches, yet every completion is still byte-identical to
+// a solo step() and in submit order.
+TEST_CASE("StageExecutor honours a small max_batch", "[executor][batch]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::LlamaModel::load(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const int N = 5;
+    const std::vector<locus::tok::TokenId> step_tok = {5, 6, 7, 8, 9};
+
+    std::vector<std::vector<float>> ref(N);
+    {
+        PipelineStage s(model, 0, L);
+        std::vector<Seq> seq(N);
+        for (int i = 0; i < N; ++i) {
+            ref[i] = s.step(seq[i], locus::pipeline::make_token(
+                                        i, 0, step_tok[i]))
+                         .data;
+        }
+    }
+
+    int wake[2];
+    REQUIRE(::pipe(wake) == 0);
+    ::fcntl(wake[1], F_SETFL,
+            ::fcntl(wake[1], F_GETFL, 0) | O_NONBLOCK);
+
+    PipelineStage stage(model, 0, L);
+    std::vector<Seq> seq(N);
+    std::vector<StageExecutor::Completion> done;
+    {
+        StageExecutor ex(stage, wake[1], /*max_batch=*/2);
+        for (int i = 0; i < N; ++i) {
+            ex.submit_step(200 + i, &seq[i],
+                           locus::pipeline::make_token(i, 0,
+                                                       step_tok[i]));
+        }
+        collect(ex, wake[0], done, N);
+        std::vector<StageExecutor::Completion> rel;
+        for (int i = 0; i < N; ++i) {
+            ex.submit_release(200 + i, &seq[i]);
+        }
+        collect(ex, wake[0], rel, N);
+    }
+    ::close(wake[0]);
+    ::close(wake[1]);
+
+    REQUIRE(done.size() == static_cast<std::size_t>(N));
+    for (int i = 0; i < N; ++i) {
+        REQUIRE(done[i].session == 200 + i);
+        REQUIRE(done[i].ok);
         require_eq(done[i].out.data, ref[i]);
     }
 }
