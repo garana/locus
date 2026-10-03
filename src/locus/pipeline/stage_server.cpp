@@ -532,6 +532,14 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 // The executor finished one or more jobs. Drain the wake
                 // pipe and ALL completions (level-triggered: one wake may
                 // cover several), then act on each.
+                // Read THEN drain -- the order is deliberate, not
+                // interchangeable. A completion that lands after the
+                // drain keeps its wake byte in the pipe, so the next poll
+                // wakes and drains again (at worst a spurious wake). The
+                // reverse (drain then read) is a lost-wakeup: a
+                // completion arriving between them writes a byte that the
+                // read then swallows, leaving its result in done_ with
+                // nothing left to wake on.
                 char buf[64];
                 while (::read(exec_wake.r, buf, sizeof(buf)) > 0) {
                 }
@@ -702,6 +710,15 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             // Pin to the least-loaded executor (fewest live sessions;
             // ties to the lowest index) so load spreads across the CPU
             // lanes and the session's KV stays in that executor's cache.
+            // This pin is fixed for the session's life, and that is a
+            // CORRECTNESS requirement, not only a locality one: the
+            // no-release-under-a-running-step rule holds because a seq's
+            // release is FIFO-ordered behind its step in the SAME
+            // executor's single queue. Migrating a live session to
+            // another executor would let a release on one executor run
+            // concurrently with an in-flight step on another for the same
+            // seq -- the use-after-free that rule exists to prevent. So
+            // do not rebalance a live session, however tempting for load.
             std::size_t best = 0;
             for (std::size_t i = 1; i < exec_load.size(); ++i) {
                 if (exec_load[i] < exec_load[best]) {
