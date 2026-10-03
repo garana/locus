@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
+#include <string>
+#include <vector>
 
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/llama.hpp"
@@ -65,6 +68,58 @@ class PipelineStage {
      *     std::runtime_error if the cache is exhausted.
      */
     Message step(kv::PagedKvCache::Seq& seq, const Message& in);
+
+    /** One entry of a batched step: a session's KV sequence and its
+     * input frame. Both must outlive the step_batch() call. */
+    struct BatchInput {
+        kv::PagedKvCache::Seq* seq;
+        const Message* in;
+    };
+
+    /** Result for one batched-step entry, matched by position to the
+     * BatchInput. On success `out` is the output frame; on failure `ok`
+     * is false and `err` is set -- a bad or out-of-lockstep frame, or a
+     * cache exhaustion, fails ONLY its own slot and the rest of the
+     * batch still runs. */
+    struct BatchOutput {
+        bool ok = true;
+        Message out;
+        std::string err;
+    };
+
+    /**
+     * Batched form of the per-session step: advances N caller-owned
+     * sequences in one pass through this stage's layer range, so a
+     * layer's weights are read once for the whole batch instead of once
+     * per session (the amortization increment 2 of the event-loop
+     * serving model, DESIGN.md i#24, exists for). The sessions may sit
+     * at DIFFERENT positions (ragged) -- each attends over its own KV --
+     * which is the normal case once the executor coalesces independent
+     * sessions.
+     *
+     * Byte-identical to calling step(seq, in) once per entry in order:
+     * same role gating, same lockstep rule, same per-stage advance (the
+     * final stage consumes the token; a non-final stage bumps each
+     * session's own position). Each entry is validated independently, so
+     * one malformed frame does not disturb the others.
+     *
+     * Requires supports_batch(); the backend floor is the model's
+     * (Vulkan cannot batch). At most one entry per sequence per call --
+     * the caller must not pass two frames for the same session in one
+     * batch (the executor inherits this from "one step in flight per
+     * session").
+     *
+     * @param ins One (seq, input) pair per session; order is preserved
+     *     in `outs`.
+     * @param outs Cleared and filled with one BatchOutput per input, by
+     *     position.
+     */
+    void step_batch(std::span<const BatchInput> ins,
+                    std::vector<BatchOutput>& outs);
+
+    /** @returns Whether the backend can run a batched forward (and thus
+     * step_batch); false means the caller must step one at a time. */
+    bool supports_batch() const { return model_.supports_batch(); }
 
     /**
      * Runs the read -> step -> write loop over the fds until in_fd

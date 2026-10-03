@@ -77,6 +77,104 @@ Message PipelineStage::step(kv::PagedKvCache::Seq& seq,
     return make_activation(in.request_id, in.position, std::move(out));
 }
 
+void PipelineStage::step_batch(std::span<const BatchInput> ins,
+                               std::vector<BatchOutput>& outs) {
+    outs.assign(ins.size(), BatchOutput{});
+    const bool first = is_first();
+    const bool last = is_last();
+
+    // Validate and reserve capacity per entry, collecting the ones that
+    // pass into a dense batch. A bad or out-of-lockstep frame, or a cache
+    // exhaustion, fails only its own slot; the rest of the batch runs.
+    std::vector<std::uint32_t> idx;  // original index of each batch member
+    std::vector<kv::PagedKvCache::Seq*> seqs;
+    std::vector<std::uint32_t> before;  // pre-step n_tokens per member
+    std::vector<tok::TokenId> toks;     // first stage only
+    std::vector<float> hidden;          // n*n_embd, non-first stage only
+    idx.reserve(ins.size());
+    seqs.reserve(ins.size());
+    before.reserve(ins.size());
+
+    for (std::uint32_t i = 0; i < ins.size(); ++i) {
+        const Message& in = *ins[i].in;
+        kv::PagedKvCache::Seq& seq = *ins[i].seq;
+        try {
+            // Same per-session lockstep rule as step(): the entry's
+            // position must equal this session's own next slot.
+            if (in.position != seq.n_tokens) {
+                throw std::invalid_argument(
+                    "PipelineStage: position out of lockstep");
+            }
+            if (first) {
+                if (in.type != MsgType::kToken) {
+                    throw std::invalid_argument(
+                        "PipelineStage: first stage expects a kToken "
+                        "message");
+                }
+            } else {
+                if (in.type != MsgType::kActivation) {
+                    throw std::invalid_argument(
+                        "PipelineStage: expects a kActivation message");
+                }
+                if (in.data.size() != n_embd_) {
+                    throw std::invalid_argument(
+                        "PipelineStage: activation size mismatch");
+                }
+            }
+            if (!cache_.ensure_capacity(seq, 1)) {
+                throw std::runtime_error("PipelineStage: cache exhausted");
+            }
+        } catch (const std::exception& e) {
+            outs[i].ok = false;
+            outs[i].err = e.what();
+            continue;
+        }
+        idx.push_back(i);
+        seqs.push_back(&seq);
+        before.push_back(seq.n_tokens);  // == in.position, unchanged above
+        if (first) {
+            toks.push_back(in.token);
+        } else {
+            hidden.insert(hidden.end(), in.data.begin(), in.data.end());
+        }
+    }
+
+    const std::uint32_t n = static_cast<std::uint32_t>(idx.size());
+    if (n == 0) {
+        return;  // every entry already failed validation
+    }
+
+    const std::uint32_t width = last ? n_vocab_ : n_embd_;
+    std::vector<float> out(static_cast<std::size_t>(n) * width);
+    model_.forward_batch_layers(
+        first ? std::span<const tok::TokenId>(toks)
+              : std::span<const tok::TokenId>(),
+        first ? std::span<const float>()
+              : std::span<const float>(hidden),
+        layer_begin_, layer_end_, cache_, seqs, ws_, out);
+
+    // forward_batch_layers advances each seq only on the final stage; a
+    // non-final stage bumps its own position so the next token's KV lands
+    // at the right slot (lockstep), exactly as step() does.
+    if (!last) {
+        for (std::uint32_t t = 0; t < n; ++t) {
+            seqs[t]->n_tokens = before[t] + 1;
+        }
+    }
+
+    for (std::uint32_t t = 0; t < n; ++t) {
+        const std::uint32_t i = idx[t];
+        const Message& in = *ins[i].in;
+        std::vector<float> slice(
+            out.begin() + static_cast<std::size_t>(t) * width,
+            out.begin() + static_cast<std::size_t>(t + 1) * width);
+        outs[i].out =
+            last ? make_logits(in.request_id, in.position, std::move(slice))
+                 : make_activation(in.request_id, in.position,
+                                   std::move(slice));
+    }
+}
+
 bool PipelineStage::run(int in_fd, int out_fd) {
     bool ok = true;
     for (;;) {
