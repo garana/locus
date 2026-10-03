@@ -331,7 +331,15 @@ int main(int argc, char** argv) {
                 };
         }
 
-        const bool ok = locus::pipeline::serve_stage(
+        // Serve on the concurrent event-loop model (serve_stage_mux):
+        // one thread multiplexes many client connections instead of one
+        // session at a time, so N upstreams are served at once. The
+        // sequential serve_stage remains for tests; the CLI uses the mux
+        // loop. Reload, the resolver and the pre-warmed pool all flow
+        // through the same conn/reload, so nothing else changes here.
+        // (Running several of these workers, one per CPU, is the next
+        // increment, i#24.)
+        const bool ok = locus::pipeline::serve_stage_mux(
             stage, lfd, rt.allow, rt.pool, rt.conn, reload);
         return ok ? 0 : 1;
     } catch (const std::exception& e) {
