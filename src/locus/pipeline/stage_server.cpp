@@ -164,6 +164,21 @@ struct MuxSession {
     bool clean_end = true;    // recorded cleanliness for the release
 };
 
+// A pipe whose ends close on destruction. The executor's completion
+// wake pipe is held in one of these, declared BEFORE the executor so it
+// destructs AFTER it: the executor's destructor writes a wake byte per
+// queued release while draining, so the write fd must still be open (and
+// its number not yet reusable by another thread -- e.g. the Resolver's
+// DNS thread opening sockets) until the executor is gone.
+struct WakePipe {
+    int r = -1;
+    int w = -1;
+    ~WakePipe() {
+        if (r >= 0) ::close(r);
+        if (w >= 0) ::close(w);
+    }
+};
+
 }  // namespace
 
 bool serve_stage(PipelineStage& stage, int listen_fd,
@@ -328,17 +343,25 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
     // Self-pipe carrying the executor's completion wakeups into the
     // poller (same shape as the SIGHUP wake). Non-blocking write end, per
     // the StageExecutor contract.
-    int exec_wake[2] = {-1, -1};
-    if (::pipe(exec_wake) != 0) {
-        ::close(listen_fd);
-        return false;
+    // Declared before the executor so its fds outlive the executor's
+    // destructor (see WakePipe); closed automatically, never in the
+    // function body.
+    WakePipe exec_wake;
+    {
+        int fds[2];
+        if (::pipe(fds) != 0) {
+            ::close(listen_fd);
+            return false;
+        }
+        exec_wake.r = fds[0];
+        exec_wake.w = fds[1];
     }
-    set_nonblocking(exec_wake[0]);
-    set_nonblocking(exec_wake[1]);
-    poller.add(exec_wake[0]);
+    set_nonblocking(exec_wake.r);
+    set_nonblocking(exec_wake.w);
+    poller.add(exec_wake.r);
     // Runs stage.step()/reset() off this loop thread. Owns ALL stage
     // mutation; the loop never calls stage.step()/reset() itself.
-    StageExecutor executor(stage, exec_wake[1]);
+    StageExecutor executor(stage, exec_wake.w);
 
     // Pushes as much of `s.outbuf` to the downstream as it will take
     // without blocking, keeping frame order. Starts watching out_fd for
@@ -472,12 +495,12 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                 }
                 continue;
             }
-            if (ev.fd == exec_wake[0]) {
+            if (ev.fd == exec_wake.r) {
                 // The executor finished one or more jobs. Drain the wake
                 // pipe and ALL completions (level-triggered: one wake may
                 // cover several), then act on each.
                 char buf[64];
-                while (::read(exec_wake[0], buf, sizeof(buf)) > 0) {
+                while (::read(exec_wake.r, buf, sizeof(buf)) > 0) {
                 }
                 comps.clear();
                 executor.drain(comps);
@@ -662,9 +685,10 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
         ::close(sp->in_fd);
         ::close(sp->out_fd);
     }
-    ::close(exec_wake[0]);
-    ::close(exec_wake[1]);
     ::close(listen_fd);
+    // exec_wake closes itself (WakePipe dtor), AFTER the executor's
+    // destructor has drained its release backlog -- so its write fd
+    // stays valid (and its number unreusable) throughout that drain.
     return result;
 }
 
