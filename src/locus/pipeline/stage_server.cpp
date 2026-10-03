@@ -406,6 +406,9 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                 oit != out_index.end()) {
                 const auto sit = sessions.find(oit->second);
                 if (sit != sessions.end() && flush_out(sit->second) < 0) {
+                    std::fprintf(stderr,
+                                 "serve_stage_mux: session dropped: "
+                                 "downstream write failed\n");
                     drop(sit->second.in_fd, false);
                 }
                 continue;
@@ -460,6 +463,10 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                     break;  // wait for more bytes
                 }
                 if (d == Decode::kError) {
+                    std::fprintf(stderr,
+                                 "serve_stage_mux: session dropped: "
+                                 "malformed frame: %s\n",
+                                 err.c_str());
                     drop(s.in_fd, false);
                     dropped = true;
                     break;
@@ -467,7 +474,15 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                 Message out;
                 try {
                     out = stage.step(s.seq, in);
-                } catch (const std::exception&) {
+                } catch (const std::exception& e) {
+                    // e.g. a cache-exhausted or lockstep error. Log the
+                    // reason -- without this a dropped session is
+                    // invisible from outside (the client's connection
+                    // just closes), which the sequential serve_stage did
+                    // not do.
+                    std::fprintf(stderr,
+                                 "serve_stage_mux: session dropped: %s\n",
+                                 e.what());
                     drop(s.in_fd, false);
                     dropped = true;
                     break;
@@ -479,6 +494,9 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                 // append in order, so ordering holds across backpressure.
                 encode(out, s.outbuf);
                 if (flush_out(s) < 0) {
+                    std::fprintf(stderr,
+                                 "serve_stage_mux: session dropped: "
+                                 "downstream write failed\n");
                     drop(s.in_fd, false);
                     dropped = true;
                     break;
