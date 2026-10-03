@@ -1071,6 +1071,179 @@ the single-host run for the same prompt and seed; under concurrency
 at or above the pipeline depth, aggregate throughput approaches the
 single-box compute ceiling, with only latency raised by the hop.
 
+### Stage serving: event loop + per-device batching executors (i#24)
+
+The "reuse the engine loop per stage" line above is the stub this
+expands. It is the serving model for one node (a single-process server
+or a pipeline stage): separate I/O from compute so one event loop can
+feed concurrent, batched, possibly multi-device execution.
+
+Four properties it must have, and why the obvious shortcut fails:
+
+1. Keep the event loop. One thread multiplexes all client connections
+   (sys::Poller), as serve_stage_mux already does. It must never block
+   on compute.
+2. Use all N CPU cores for a forward.
+3. Run on the GPU, and on more than one GPU when present.
+4. Batch requests: run many ready sequences through one forward so the
+   weight read is amortized -- the dominant cost on a GPU, and the
+   throughput core locus already implements for the single-process path
+   (engine::Engine, forward_batch_decode, matvec_batch; DESIGN.md 4.2).
+
+The shortcut that does NOT work is "run N independent event loops, one
+per core" (a worker-per-CPU fan-out). Each loop would compute one
+sequence at a time, so it neither batches (property 4) nor amortizes
+weights; it also forces an all-or-nothing CPU split (one loop using all
+cores, or N loops each pinned to one core, nothing between) because the
+process-wide thread pool serializes every parallel_for caller. That path
+is explicitly rejected.
+
+The structure that satisfies all four:
+
+- I/O loop (one thread). Owns every socket. On a readable connection it
+  decodes the frame (a kToken / kActivation), marks that session's next
+  unit "ready", and hands it to the session's executor; on a completion
+  it writes the output frame (kLogits / kActivation) back. It does no
+  model compute and never blocks on it.
+- Executor = one compute device running a continuous-batching loop.
+  Each iteration it gathers every ready session, runs ONE batched
+  forward over them (the weight-bearing ops are read once and shared
+  across the batch -- property 4), and scatters the per-sequence outputs
+  back. It owns that device's paged KV pool (already multi-sequence) and
+  workspace. This is a NEW component (StageExecutor) that PARALLELS
+  engine::Engine's scheduler shape (admission, a running set, a per-step
+  budget) but is not Engine and does not reuse the class -- see "Engine
+  is not the stage executor" below. What it does reuse is the batched
+  model ops underneath (forward_batch_decode / matvec_batch), which are
+  done and byte-exact.
+- One executor per device. The CPU is one executor whose batched forward
+  fans across all N cores via sys::ThreadPool (property 2, and now
+  amortized over the batch). Each GPU is another executor; several GPUs
+  are several executors (property 3). The loop spreads sessions across
+  them.
+- Session-to-executor affinity. A session is pinned to one executor for
+  its life so its KV sequence stays resident in that device's cache.
+  New sessions are assigned to balance load across executors/devices.
+- Coupling. Lock-protected ready/completion queues plus a self-pipe /
+  eventfd wake in both directions (the same wake pattern the SIGHUP
+  path already uses with the Poller): loop -> executor ("these sessions
+  are ready"), executor -> loop ("these outputs are done, write them").
+  All socket I/O stays on the loop thread, so connection fds need no
+  cross-thread locking.
+
+Three handoff rules make the two-thread split safe (all learned the hard
+way the first time, so stated up front):
+
+- A session in flight cannot be released. The loop owns the socket and
+  learns of an RST immediately, but the executor may be mid-batch holding
+  a pointer to that session's Seq and about to write KV into it; freeing
+  the sequence under a running batch is a use-after-free, and the
+  completion would then deliver to a closed fd. So a drop on an in-flight
+  session only MARKS it cancelled: the batch completes, the loop discards
+  the result at completion, and the KV is released then. This fails in
+  the direction that corrupts under load while passing idle-drop tests,
+  so it is a rule, not a race to be lucky about.
+- At most one frame per session in flight. A session is strictly
+  sequential (one token in, one answer out), so this holds naturally --
+  but only if the loop refuses to submit a session's next frame before
+  the first completes. It is what makes ordering free; a future
+  "pipeline two tokens for latency" change would break it silently, so
+  it is written down.
+- Completions drain in a loop, not one per wake. The wake is
+  level-triggered-style: one notification can cover many finished
+  sessions, so the loop drains the whole completion queue per wake rather
+  than assuming 1:1 (the same lesson as the self-pipe drain).
+
+Reuse vs. new. Reused: the batched model ops (forward_batch_decode /
+matvec_batch / supports_batch), which are done and proven byte-exact
+against N separate forwards -- the expensive half is already paid; the
+mux loop, sys::Poller and the self-pipe wake; paged multi-sequence KV;
+the per-executor KV RAM guard (sys::total_ram_bytes + check_kv_memory).
+New: the StageExecutor scheduler itself (parallels Engine, is not
+Engine); wiring the loop to it instead of an inline step(); a batched
+stage entry point forward_batch_layers (see below); per-device executors
+with session affinity and assignment; and the GPU prerequisites (see the
+Vulkan note).
+
+Engine is not the stage executor. engine::Engine is mechanically
+drivable (public step(), hooks), but it is a GENERATION engine
+throughout: submit() takes a prompt, max_new_tokens, sampling, seed,
+constraint, logprobs; a Request carries terminal status and an on_token
+hook. A pipeline stage has none of that -- no prompt (one activation or
+token per step), no stop rule (the driver decides), no sampling/EOS (the
+driver samples), and a MIDDLE stage emits no token at all, so on_token
+is meaningless there. A session simply ends when its socket does. So the
+executor copies Engine's scheduler STRUCTURE (admission, running set,
+preemption, per-step budget) over the batched ops, rather than
+instantiating Engine; generalising Engine to serve both would put
+sampling/EOS/prefix-cache concerns into the most load-bearing class in
+the project for a caller that needs none of them. This is called out
+because "reuse the continuous-batching loop" reads as less work than it
+is -- the kernels are free, the scheduler is new.
+
+The missing entry point. forward_batch_decode does per-sequence state
+correctly today (per-token seq and position, independent KV, matvecs
+batched across the batch) -- but only full-stack. The matrix:
+
+    full stack      single: forward()         batched: forward_batch_decode()
+    layer range     single: forward_layers()  batched: MISSING
+
+A batching STAGE needs the bottom-right: N hidden states (or N tokens at
+stage 0), a layer range [begin, end), N seqs, N outputs. That is a new
+forward_batch_layers shaped exactly like the transformation PR#5 did on
+the single-item path (parameterise the layer loop with begin/end, gate
+the embed on `first`, gate the final norm + output projection on `last`,
+take hidden_in when !first, emit hidden when !last) -- over machinery
+that already exists and is byte-exact. Not new kernels; PR#5's
+slice-vs-full byte-equality test transfers directly at batch width > 1.
+
+Vulkan cannot batch today (and the stage path needs two Vulkan pieces).
+supports_batch() returns false for Vulkan and forward_batch_decode
+throws: Vulkan has a monolithic vulkan_forward the batched CPU-driver
+path bypasses. Separately, forward_layers is already CPU/CUDA only --
+vulkan_forward does not surface the hidden state. So a Vulkan executor
+for a pipeline stage needs BOTH a batched Vulkan forward AND a
+layer-range/hidden-state Vulkan forward, both shader work. Consequence
+for the roadmap: GPU executors are CUDA-first; a Vulkan executor is
+"after two significant shader pieces", not "after device selection". The
+device enumerate/select seam is necessary but far from sufficient.
+
+CPU core division. With the single shared sys::ThreadPool there are only
+two non-contending settings: one executor using all cores (lowest
+single-request latency), or K executors each single-threaded (K-way
+throughput, one core per request). The useful middle -- a few executors
+each still multi-threaded -- needs per-executor thread pools (a
+ThreadPool threaded through forward_layers instead of the singleton);
+tracked separately. The first cut ships one CPU executor using all
+cores, which keeps today's single-request latency and adds batching.
+
+Increments (each its own PR, reviewed):
+
+1. Executor seam + queues/wake + the in-flight/cancel rules: the I/O
+   loop hands forward work to a single in-process CPU executor via
+   ready/completion queues; behavior matches today (one all-cores
+   forward at a time) but compute no longer runs on the loop thread.
+2. forward_batch_layers (the missing entry point, PR#5-shaped) + the
+   executor coalescing ready sessions into one batched forward per
+   iteration; byte-identical to per-session stepping and to the
+   single-process engine, at batch width > 1.
+3. Multiple CPU executors + session affinity + assignment, with the RAM
+   guard sizing KV per executor.
+4. CUDA GPU executor (CUDA already supports the batched + layer-range
+   forwards). Then multiple CUDA GPUs as several executors.
+5. (Larger, separate) Vulkan GPU executor: needs a batched Vulkan
+   forward and a layer-range/hidden-state Vulkan forward (shader work),
+   plus the multi-device enumerate/select seam. CUDA-first until these
+   land.
+
+Exit test: on one host, concurrent clients are served by a single event
+loop while their decode steps are coalesced into batched forwards
+(throughput rises with concurrency up to the batch width, single-request
+latency unchanged from the one-executor case); byte-identical output to
+the single-process engine for the same prompts and seed; and, once the
+device seam lands, sessions spread across multiple GPU executors with KV
+resident per device.
+
 ## R16: Q8_K activation-dot (ggml-exact quantized matvec)
 
 llama.cpp does not dot quantized weights against f32 activations: for
