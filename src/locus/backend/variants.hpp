@@ -134,6 +134,21 @@ void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
 bool cuda_backend_usable();
 
 /**
+ * Binds this process to CUDA device `ordinal` for all subsequent CUDA
+ * work (i#24 inc 4, the device-select seam). Validates the ordinal
+ * against the device count and fails LOUDLY -- throws std::out_of_range
+ * for an out-of-range ordinal and std::runtime_error when no CUDA
+ * device / non-CUDA build -- rather than silently falling back to
+ * device 0. Records the ordinal so every CUDA matvec entry re-binds its
+ * calling thread to it (CUDA's current device is per-thread, and the
+ * stage executor runs forwards on its own worker thread). Must be the
+ * first device-selecting CUDA call; cuda_backend_usable()'s
+ * cudaGetDeviceCount is safe to call before it (it binds no pool).
+ * @param ordinal Zero-based CUDA device index.
+ */
+void cuda_set_device(int ordinal);
+
+/**
  * Frees every resident page in the CUDA weight pool (test seam). The
  * pool keys weights by host pointer, valid only while that buffer is
  * live; tests reset it between cases so transient weight buffers whose

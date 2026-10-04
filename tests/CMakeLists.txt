@@ -37,6 +37,7 @@ add_executable(locus_tests
     test_pipeline_mux.cpp
     test_stage_executor.cpp
     test_stage_batch.cpp
+    test_stage_cuda.cpp
     test_resolver.cpp
     test_stage_config.cpp
     test_pipeline_driver.cpp

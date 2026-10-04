@@ -1230,7 +1230,31 @@ Increments (each its own PR, reviewed):
 3. Multiple CPU executors + session affinity + assignment, with the RAM
    guard sizing KV per executor.
 4. CUDA GPU executor (CUDA already supports the batched + layer-range
-   forwards). Then multiple CUDA GPUs as several executors.
+   forwards). Split into 4a (landed) and 4b (deferred):
+   - 4a: a device-select seam. locus-stage gains --backend NAME and
+     --device N; the stage binds that backend/device before the first
+     weight upload. Because CUDA's current device is per-thread and the
+     executor runs forwards on its own worker thread, each CUDA op entry
+     (the three matvecs + prefetch) re-binds its calling thread to the
+     selected device via a thread-local guard, and the weight pool THROWS
+     (not asserts; Release is -DNDEBUG) if a kernel ever runs on a
+     different device than the pool bound to. A bad ordinal or a
+     CUDA-less host fails loud at startup; never a silent fall back to
+     device 0. Byte-identical to CUDA per-token stepping at batch > 1
+     (both via step_batch and through the executor's worker thread), and
+     argmax-agrees with the CPU path (cross-backend logits are not
+     bitwise equal; float accumulation order differs). NOTE: under a
+     GPU backend, executors are per-device lanes, not per-core; one
+     CUDA device shares one primary context, so N executors on a single
+     device contend rather than scale; use one executor per device unless
+     measured otherwise.
+   - 4b: multiple CUDA GPUs as several executors in ONE process (per-
+     device weight pools, one device-bound model view per device, per-
+     executor device binding). Deferred: it needs a multi-GPU host to
+     byte-exact-validate, which the single-GPU dev host cannot provide.
+     The --device flag is already repeatable (one entry = whole process;
+     N entries = per-executor, rejected until 4b) so 4b fills the surface
+     in rather than changing a shipped flag's arity.
 5. (Larger, separate) Vulkan GPU executor: needs a batched Vulkan
    forward and a layer-range/hidden-state Vulkan forward (shader work),
    plus the multi-device enumerate/select seam. CUDA-first until these

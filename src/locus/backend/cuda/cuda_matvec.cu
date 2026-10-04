@@ -11,10 +11,13 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -26,6 +29,48 @@ namespace {
 
 /** Aborts to scalar on any CUDA error (caller falls back). */
 bool cuda_ok(cudaError_t e) { return e == cudaSuccess; }
+
+// i#24 inc 4: process-selected CUDA device ordinal (-1 = unset, i.e. the
+// runtime default device 0). Set once by cuda_set_device(). Every CUDA
+// matvec entry re-binds its calling thread to it via ensure_device(),
+// because CUDA's current device is per-thread and the stage executor
+// runs forwards on its own worker thread -- a cudaSetDevice on the main
+// thread would not bind the worker that actually launches the kernels.
+std::atomic<int> g_cuda_device{-1};
+
+/**
+ * Binds the calling thread to the process-selected CUDA device if one
+ * was chosen. Cheap (a thread-local set) and idempotent; called at the
+ * top of every CUDA matvec entry so whichever thread runs the forward
+ * lands on the selected device, and so the device set precedes the
+ * first weight-pool cudaMalloc by construction.
+ */
+void ensure_device() {
+    // Acquire pairs with the release store in cuda_set_device so a worker
+    // thread always observes the selected ordinal. In 4a the set precedes
+    // worker creation (thread start is already a happens-before), so this
+    // is belt-and-suspenders; it also keeps the seam correct if a device
+    // is ever selected after a worker is live (the 4b direction).
+    const int d = g_cuda_device.load(std::memory_order_acquire);
+    if (d < 0) {
+        return;  // no explicit device: the runtime default (device 0)
+    }
+    // One cudaSetDevice per thread per device change, not per call: the
+    // op entries hit this thousands of times per token. Storing the
+    // DEVICE (not a bool) keeps it correct under inc 4b, where different
+    // executor threads bind different devices -- a bool would freeze the
+    // first binding.
+    thread_local int bound = -1;
+    if (bound != d) {
+        // Cache the binding only on success: if cudaSetDevice fails,
+        // leave `bound` so the next call retries rather than believing a
+        // failed bind took. The pool device-match guard is the net if a
+        // kernel still runs misbound.
+        if (cuda_ok(cudaSetDevice(d))) {
+            bound = d;
+        }
+    }
+}
 
 /** Reads a little-endian IEEE half from two device bytes. */
 __device__ inline float ld_f16(const std::uint8_t* p) {
@@ -2126,6 +2171,7 @@ class WeightPool {
      *  page pinned, or nullptr if it cannot be cached. */
     const void* acquire(const void* host, std::size_t bytes) {
         std::lock_guard<std::mutex> lk(mu_);
+        bind_check_locked();
         if (budget_ == 0) {
             init_budget();
         }
@@ -2168,6 +2214,7 @@ class WeightPool {
     /** Fire-and-forget async upload into the pool (Ops.prefetch). */
     void prefetch(const void* host, std::size_t bytes) {
         std::lock_guard<std::mutex> lk(mu_);
+        bind_check_locked();
         if (budget_ == 0) {
             init_budget();
         }
@@ -2241,6 +2288,9 @@ class WeightPool {
         }
         table_.clear();
         used_ = 0;
+        device_ = -1;  // next access re-binds (i#24): a reset may precede
+                       // a rebind to a different device; a stale device_
+                       // would make bind_check_locked throw spuriously.
     }
 
     ~WeightPool() {
@@ -2332,6 +2382,35 @@ class WeightPool {
         return p;
     }
 
+    /**
+     * Records the device the pool first bound to (its first access) and
+     * throws if a later access runs on a DIFFERENT current device -- a
+     * device misbinding, e.g. cudaSetDevice ran too late or on the wrong
+     * thread. It THROWS rather than assert()s on purpose: a misbinding is
+     * a Release-only configuration failure, and Release is -DNDEBUG so an
+     * assert would compile out exactly where this matters (i#24 inc 4).
+     * ensure_device() at each matvec entry keeps the current device
+     * consistent, so in a correctly-started process this never fires.
+     * Caller holds mu_.
+     */
+    void bind_check_locked() {
+        int cur = -1;
+        if (!cuda_ok(cudaGetDevice(&cur))) {
+            return;  // cannot query the device; nothing to check
+        }
+        if (device_ < 0) {
+            device_ = cur;
+        } else if (cur != device_) {
+            throw std::runtime_error(
+                "CUDA weight pool bound to device " +
+                std::to_string(device_) +
+                " but a kernel is running on device " +
+                std::to_string(cur) +
+                "; cudaSetDevice must precede the first weight upload "
+                "(i#24 device-select)");
+        }
+    }
+
     bool evict_one() {
         auto victim = table_.end();
         std::uint64_t oldest = UINT64_MAX;
@@ -2355,6 +2434,7 @@ class WeightPool {
 
     std::unordered_map<const void*, Page> table_;
     cudaStream_t stream_ = nullptr;
+    int device_ = -1;  // device the pool bound to (i#24, bind_check_locked)
     std::size_t budget_ = 0;
     std::size_t used_ = 0;
     std::uint64_t clock_ = 0;
@@ -2907,6 +2987,7 @@ void cuda_pool_reset() { pool().reset(); }
 
 void matvec_cuda_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
+    ensure_device();
     if (cuda_has_q8k_kernel(w.type) && w.cols % 256 == 0) {
         const std::size_t bytes = device_weight_bytes(w);
         // IQ kernels need their grid/sign tables uploaded; if an upload
@@ -2959,6 +3040,7 @@ void matvec_cuda_q8k(const Mat& w, std::span<const float> x,
 
 void matvec_cuda(const Mat& w, std::span<const float> x,
                  std::span<float> out) {
+    ensure_device();
     const std::size_t bytes = device_weight_bytes(w);
     bool done = false;
     if (bytes > 0) {
@@ -3013,6 +3095,7 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
 }
 
 void cuda_prefetch(const Mat& w) {
+    ensure_device();
     const std::size_t bytes = device_weight_bytes(w);
     if (bytes > 0) {
         pool().prefetch(w.data, bytes);
@@ -3021,6 +3104,7 @@ void cuda_prefetch(const Mat& w) {
 
 void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n) {
+    ensure_device();
     // Q4_K/Q6_K get the one-launch register-blocked kernel; other
     // types (incl F32/Q8_0) fall back to n matvec_cuda() calls
     // scattered to row-major -- the same-backend fallback rule, so
@@ -3049,6 +3133,30 @@ void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
 bool cuda_backend_usable() {
     int n = 0;
     return cuda_ok(cudaGetDeviceCount(&n)) && n > 0;
+}
+
+void cuda_set_device(int ordinal) {
+    if (ordinal < 0) {
+        throw std::out_of_range(
+            "CUDA device ordinal must be >= 0, got " +
+            std::to_string(ordinal));
+    }
+    int count = 0;
+    if (!cuda_ok(cudaGetDeviceCount(&count)) || count <= 0) {
+        throw std::runtime_error(
+            "cannot select CUDA device " + std::to_string(ordinal) +
+            ": no CUDA device present on this host");
+    }
+    if (ordinal >= count) {
+        throw std::out_of_range(
+            "CUDA device " + std::to_string(ordinal) + " out of range; " +
+            std::to_string(count) + " device(s) present");
+    }
+    if (!cuda_ok(cudaSetDevice(ordinal))) {
+        throw std::runtime_error("cudaSetDevice(" +
+                                 std::to_string(ordinal) + ") failed");
+    }
+    g_cuda_device.store(ordinal, std::memory_order_release);
 }
 
 }  // namespace locus::backend

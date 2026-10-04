@@ -7,6 +7,9 @@
 
 #ifndef LOCUS_HAS_CUDA
 
+#include <stdexcept>
+#include <string>
+
 namespace locus::backend {
 
 void matvec_cuda(const Mat& w, std::span<const float> x,
@@ -27,6 +30,14 @@ void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
 }
 
 bool cuda_backend_usable() { return false; }
+
+void cuda_set_device(int ordinal) {
+    // Fail loud: a GPU executor was requested on a build with no CUDA
+    // toolkit. Never silently fall back to the CPU (i#24 inc 4).
+    throw std::runtime_error(
+        "cannot select CUDA device " + std::to_string(ordinal) +
+        ": this is a non-CUDA build");
+}
 
 void cuda_pool_reset() {}
 
