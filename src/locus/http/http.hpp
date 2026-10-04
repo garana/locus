@@ -70,7 +70,27 @@ struct ParseResult {
                                 *   after are the next request on a
                                 *   keep-alive connection. */
     std::string error;         /**< diagnostic when state == kError. */
+    int suggested_status = 400; /**< status the caller should answer on
+                                 *   kError: 400 malformed, 413 over a
+                                 *   size cap, 501 unimplemented method,
+                                 *   505 unsupported version. Lets the
+                                 *   connection loop map the condition
+                                 *   rather than match `error` text. */
 };
+
+/**
+ * Per-connection parse state the caller threads across feeds of one
+ * request and resets (a fresh value) once that request is kComplete or
+ * the connection errors.
+ *
+ * It exists to pin the parse API before the connection loop (increment
+ * 2) is written against it: the current implementation re-parses from
+ * the front of the buffer on every feed (simple and correct, but
+ * quadratic in the number of reads for a large chunked body, bounded by
+ * max_body_bytes). Issue 70 fills this with resume state so the re-scan
+ * is removed WITHOUT changing the loop's signature. Today it carries
+ * nothing; pass a default-constructed value, one per connection. */
+struct ParseContext {};
 
 /**
  * Parses ONE request from the front of `buf`. Pure: `buf` is not
@@ -85,17 +105,26 @@ struct ParseResult {
  * against sign/whitespace/overflow and rejected if duplicated; a request
  * bearing both Content-Length and Transfer-Encoding rejected (request
  * smuggling); Transfer-Encoding matched as a case-insensitive list whose
- * sole, final member must be `chunked`; chunk sizes overflow-guarded,
- * chunk-extensions rejected, trailers bounded; only HTTP/1.0 and 1.1
- * accepted.
+ * sole, final member must be `chunked`, and a repeated Transfer-Encoding
+ * header rejected (two `chunked` lines are the list `chunked, chunked`);
+ * chunk sizes overflow-guarded, chunk-extensions rejected, trailers
+ * bounded; only HTTP/1.0 and 1.1 accepted; the method restricted to the
+ * implemented set (GET, POST, HEAD) so a router cannot desync on an
+ * unexpected verb; header values restricted to RFC 9110 field-content
+ * (VCHAR, SP, HTAB, obs-text 0x80-0xFF) so a control byte -- NUL in
+ * particular, which truncates a `%s` log line -- cannot pass to a later
+ * consumer.
  *
  * @param buf The bytes read so far.
  * @param limits Size/count caps.
+ * @param ctx Per-connection resume state; one per connection, reset to a
+ *   fresh value after each kComplete (see ParseContext).
  * @param out Filled only when the result is kComplete.
- * @returns the parse state, bytes consumed, and an error diagnostic.
+ * @returns the parse state, bytes consumed, a suggested error status,
+ *   and an error diagnostic.
  */
 ParseResult parse_request(std::string_view buf, const Limits& limits,
-                          Request& out);
+                          ParseContext& ctx, Request& out);
 
 /** A response to serialize. `headers` must not contain Content-Length or
  * Transfer-Encoding; the writer sets framing itself. */

@@ -1,6 +1,5 @@
 #include "locus/http/http.hpp"
 
-#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -68,11 +67,30 @@ bool is_token(std::string_view s) {
     return true;
 }
 
-ParseResult err(std::string msg) {
+// @param status the status the caller should answer (default 400); pass
+// 413 for a size cap, 501 for an unimplemented method, 505 for a version.
+ParseResult err(std::string msg, int status = 400) {
     ParseResult r;
     r.state = ParseState::kError;
     r.error = std::move(msg);
+    r.suggested_status = status;
     return r;
+}
+
+// RFC 9110 field-value: a header value may hold VCHAR (0x21-0x7E), SP,
+// HTAB, and obs-text (0x80-0xFF); every other control byte is forbidden.
+// @returns false if `s` contains 0x00-0x08, 0x0A-0x1F, or 0x7F. Compared
+// through unsigned char: plain char is SIGNED on x86-64, so a signed
+// `c < 0x20` test would reject obs-text/UTF-8 (0x80+) on that platform
+// only -- the kind of asymmetry two arm64 reviewers would ship green.
+bool valid_field_value(std::string_view s) {
+    for (char c : s) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if ((uc < 0x20 && uc != '\t') || uc == 0x7F) {
+            return false;
+        }
+    }
+    return true;
 }
 
 ParseResult need_more() {
@@ -193,8 +211,23 @@ static std::size_t find_crlf(std::string_view buf, std::size_t from,
     return std::string_view::npos;
 }
 
+// Length of the line-so-far when no CRLF has arrived yet: everything in
+// [from, buf.size()) except a trailing CR still awaiting its LF. Using
+// this in the waiting branch makes the limit agree with the complete
+// branch (which measures up to, not including, the CR) at exactly the
+// cap -- so whether a line at the cap passes does not depend on how TCP
+// split it. (find_crlf guarantees any interior bare CR is already an
+// error, so a lone CR here can only be the last byte.)
+static std::size_t pending_len(std::string_view buf, std::size_t from) {
+    std::size_t end = buf.size();
+    if (end > from && buf[end - 1] == '\r') {
+        --end;
+    }
+    return end - from;
+}
+
 ParseResult parse_request(std::string_view buf, const Limits& limits,
-                          Request& out) {
+                          ParseContext&, Request& out) {
     out = Request{};
 
     // --- Request line: METHOD SP target SP HTTP/1.x CRLF ---
@@ -204,13 +237,13 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
         return err("bare LF in request line (CRLF required)");
     }
     if (rl_cr == std::string_view::npos) {
-        if (buf.size() > limits.max_request_line) {
-            return err("request line exceeds limit");
+        if (pending_len(buf, 0) > limits.max_request_line) {
+            return err("request line exceeds limit", 413);
         }
         return need_more();
     }
     if (rl_cr > limits.max_request_line) {
-        return err("request line exceeds limit");
+        return err("request line exceeds limit", 413);
     }
     std::string_view line = buf.substr(0, rl_cr);
     const std::size_t sp1 = line.find(' ');
@@ -227,6 +260,14 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
     if (!is_token(method)) {
         return err("invalid method");
     }
+    // Restrict to the implemented verbs. Methods are case-sensitive
+    // (RFC 9110), so "head" is NOT HEAD; accepting only the exact set
+    // stops a downstream router from routing "head" to the HEAD path
+    // while is_head is false (which would ship a body on a connection
+    // the client parses as bodyless and desync keep-alive).
+    if (method != "GET" && method != "POST" && method != "HEAD") {
+        return err("method not implemented", 501);
+    }
     if (target.empty() ||
         target.find(' ') != std::string_view::npos) {
         return err("invalid request target");
@@ -236,7 +277,7 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
     } else if (version == "HTTP/1.0") {
         out.minor_version = 0;
     } else {
-        return err("unsupported HTTP version");
+        return err("unsupported HTTP version", 505);
     }
     out.method.assign(method);
     out.target.assign(target);
@@ -263,12 +304,12 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
         }
         if (cr == std::string_view::npos) {
             // Bound the wait: headers must terminate within the budget.
-            // Here no complete line was found, so everything from
-            // header_start on is unterminated header prefix (the body
-            // cannot be past a line that has no CRLF yet) -- buf.size()
-            // is the right measure.
-            if (buf.size() - header_start > limits.max_header_bytes) {
-                return err("headers exceed limit");
+            // No complete line yet, so measure the header section so far
+            // excluding any trailing CR awaiting its LF -- the same
+            // measure the complete branch uses, so the two agree at the
+            // cap. (The body cannot be past a line with no CRLF.)
+            if (pending_len(buf, header_start) > limits.max_header_bytes) {
+                return err("headers exceed limit", 413);
             }
             return need_more();
         }
@@ -277,7 +318,7 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
         // is already in buf, and counting it here would reject a tiny-
         // header request with a large (but legal) body.
         if (cr - header_start > limits.max_header_bytes) {
-            return err("headers exceed limit");
+            return err("headers exceed limit", 413);
         }
         if (cr == pos) {
             pos += 2;  // blank line: end of headers
@@ -285,13 +326,13 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
         }
         std::string_view hline = buf.substr(pos, cr - pos);
         if (hline.size() > limits.max_header_line) {
-            return err("header line exceeds limit");
+            return err("header line exceeds limit", 413);
         }
         if (hline[0] == ' ' || hline[0] == '\t') {
             return err("obs-fold header continuation rejected");
         }
         if (out.headers.size() >= limits.max_header_count) {
-            return err("too many headers");
+            return err("too many headers", 413);
         }
         const std::size_t colon = hline.find(':');
         if (colon == std::string_view::npos || colon == 0) {
@@ -302,6 +343,9 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
             return err("invalid header name");
         }
         const std::string_view value = trim_ows(hline.substr(colon + 1));
+        if (!valid_field_value(value)) {
+            return err("control byte in header value");
+        }
         if (ci_equal(name, "content-length")) {
             ++content_length_seen;
             if (content_length_seen > 1) {
@@ -312,6 +356,13 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
             }
             have_content_length = true;
         } else if (ci_equal(name, "transfer-encoding")) {
+            // A repeated Transfer-Encoding is the list `chunked, chunked`
+            // (or worse); reject it for the same reason the single-line
+            // list below is sole-chunked-only -- so the two spellings of
+            // one message agree and cannot diverge from a front proxy.
+            if (has_te) {
+                return err("multiple Transfer-Encoding headers");
+            }
             has_te = true;
             // Only chunked, and only as the sole/final coding.
             if (!ci_equal(trim_ows(value), "chunked")) {
@@ -347,7 +398,7 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
             }
             if (cr == std::string_view::npos) {
                 if (buf.size() - p > limits.max_header_line) {
-                    return err("chunk-size line exceeds limit");
+                    return err("chunk-size line exceeds limit", 413);
                 }
                 return need_more();
             }
@@ -365,7 +416,7 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
             }
             if (csize > limits.max_body_bytes ||
                 body.size() + csize > limits.max_body_bytes) {
-                return err("chunked body exceeds limit");
+                return err("chunked body exceeds limit", 413);
             }
             // Need csize bytes of data + the trailing CRLF.
             if (buf.size() < p + csize + 2) {
@@ -387,13 +438,19 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
                 return err("bare LF in trailers (CRLF required)");
             }
             if (cr == std::string_view::npos) {
-                if (buf.size() - trailer_start > limits.max_trailer_bytes) {
-                    return err("trailers exceed limit");
+                if (pending_len(buf, trailer_start) >
+                    limits.max_trailer_bytes) {
+                    return err("trailers exceed limit", 413);
                 }
                 return need_more();
             }
-            if (buf.size() - trailer_start > limits.max_trailer_bytes) {
-                return err("trailers exceed limit");
+            // Bound by the trailer section's own extent, NOT buf.size():
+            // on a keep-alive connection the next pipelined request may
+            // already be buffered past the trailers, and counting it
+            // here would reject a valid request. (Same class as the
+            // header-section bound above.)
+            if (cr - trailer_start > limits.max_trailer_bytes) {
+                return err("trailers exceed limit", 413);
             }
             if (cr == p) {
                 p += 2;  // blank line ends trailers
@@ -411,7 +468,7 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
     // Content-Length (or none -> empty body).
     const std::uint64_t clen = have_content_length ? content_length : 0;
     if (clen > limits.max_body_bytes) {
-        return err("Content-Length exceeds limit");
+        return err("Content-Length exceeds limit", 413);
     }
     if (buf.size() - pos < clen) {
         return need_more();

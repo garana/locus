@@ -14,7 +14,8 @@ namespace {
 // Parses `buf` with default limits; returns the result + fills `out`.
 locus::http::ParseResult parse(std::string_view buf, Request& out,
                                Limits limits = {}) {
-    return parse_request(buf, limits, out);
+    locus::http::ParseContext ctx;
+    return parse_request(buf, limits, ctx, out);
 }
 }  // namespace
 
@@ -131,7 +132,8 @@ TEST_CASE("parse_request: chunked body decodes; trailers bounded",
 TEST_CASE("parse_request rejects the hostile shapes", "[http]") {
     auto is_error = [](std::string_view req, Limits lim = {}) {
         Request r;
-        return parse_request(req, lim, r).state == ParseState::kError;
+        locus::http::ParseContext ctx;
+        return parse_request(req, lim, ctx, r).state == ParseState::kError;
     };
 
     SECTION("bad / unsupported version") {
@@ -209,6 +211,74 @@ TEST_CASE("parse_request rejects the hostile shapes", "[http]") {
         REQUIRE(is_error(
             "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", small));
     }
+    SECTION("multiple Transfer-Encoding headers (two chunked lines)") {
+        // Two "chunked" lines are the list chunked,chunked -- the single-
+        // line list path already rejects non-sole-final-chunked, so the
+        // two spellings of one message must agree.
+        REQUIRE(is_error(
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n"
+            "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
+    }
+    SECTION("control bytes in a header value (incl. NUL)") {
+        // NUL would truncate a %s log line; every CTL but HTAB is barred.
+        std::string nul = "GET / HTTP/1.1\r\nX: a";  // embedded NUL built
+        nul.push_back('\0');                         // explicitly so the
+        nul += "b\r\n\r\n";                          // view keeps its len
+        REQUIRE(is_error(nul));
+        REQUIRE(is_error("GET / HTTP/1.1\r\nX: a\x01y\r\n\r\n"));
+        REQUIRE(is_error("GET / HTTP/1.1\r\nX: a\x1by\r\n\r\n"));  // ESC
+        REQUIRE(is_error("GET / HTTP/1.1\r\nX: a\x7fy\r\n\r\n"));  // DEL
+    }
+    SECTION("unimplemented methods rejected (routing desync guard)") {
+        REQUIRE(is_error("PUT / HTTP/1.1\r\nHost: h\r\n\r\n"));
+        REQUIRE(is_error("DELETE / HTTP/1.1\r\nHost: h\r\n\r\n"));
+        REQUIRE(is_error("OPTIONS / HTTP/1.1\r\nHost: h\r\n\r\n"));
+        // Methods are case-sensitive: "head" is not HEAD.
+        REQUIRE(is_error("head / HTTP/1.1\r\nHost: h\r\n\r\n"));
+    }
+}
+
+// A header value may carry obs-text (0x80-0xFF): UTF-8 model names,
+// user-agents, and echoed error strings must survive. The signed-char
+// trap: plain char is SIGNED on x86-64, so a naive `c < 0x20` test
+// rejects every 0x80+ byte on that platform only -- this asserts the
+// bytes are ACCEPTED, which a rejection-only suite cannot catch.
+TEST_CASE("parse_request: obs-text (UTF-8) header values are accepted",
+          "[http]") {
+    Request r;
+    const std::string req =
+        "GET / HTTP/1.1\r\n"
+        "X-Model: caf\xc3\xa9-7b\r\n"   // "café-7b" in UTF-8
+        "X-Hi: \xff\x80\xc3\r\n"          // raw high bytes + HTAB below
+        "X-Tab: a\tb\r\n"
+        "\r\n";
+    auto res = parse(req, r);
+    REQUIRE(res.state == ParseState::kComplete);
+    REQUIRE(r.get_header_value("X-Model") == "caf\xc3\xa9-7b");
+    REQUIRE(r.get_header_value("X-Tab") == "a\tb");  // interior HTAB kept
+}
+
+// The suggested_status lets the connection loop map the condition
+// without matching error text (an existing server test pins 413).
+TEST_CASE("parse_request: suggested_status distinguishes the 4xx/5xx",
+          "[http]") {
+    Request r;
+    locus::http::ParseContext ctx;
+    Limits small;
+    small.max_body_bytes = 4;
+    auto over = parse_request(
+        "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", small, ctx, r);
+    REQUIRE(over.state == ParseState::kError);
+    REQUIRE(over.suggested_status == 413);  // over a size cap
+
+    auto malformed = parse("GET / HTTP/1.1\r\nnocolon\r\n\r\n", r);
+    REQUIRE(malformed.suggested_status == 400);  // malformed
+
+    auto method = parse("PUT / HTTP/1.1\r\nHost: h\r\n\r\n", r);
+    REQUIRE(method.suggested_status == 501);  // unimplemented method
+
+    auto version = parse("GET / HTTP/2.0\r\nHost: h\r\n\r\n", r);
+    REQUIRE(version.suggested_status == 505);  // unsupported version
 }
 
 // ---- response writer ----
@@ -296,4 +366,135 @@ TEST_CASE("parse_request: a large body is not counted as header bytes",
     REQUIRE(res.consumed == req.size());
     REQUIRE(r.body.size() == payload.size());
     REQUIRE(r.body == payload);
+}
+
+// ---- parser invariants ----
+// These hold for ANY input. A parser that re-scans from the front can
+// silently break them, so they are pinned rather than left implicit.
+
+namespace {
+// Feeds `req` one byte at a time through a single ParseContext (what the
+// connection loop does). Sets `prefixes_ok` false if any STRICT prefix
+// was decided early (not kNeedMore/consumed==0). @returns the whole-buffer
+// result, filling `out`.
+locus::http::ParseResult feed_incremental(std::string_view req,
+                                          Request& out, bool& prefixes_ok,
+                                          Limits limits = {}) {
+    locus::http::ParseContext ctx;
+    prefixes_ok = true;
+    for (std::size_t n = 1; n < req.size(); ++n) {
+        Request tmp;
+        auto r = parse_request(req.substr(0, n), limits, ctx, tmp);
+        if (r.state != ParseState::kNeedMore || r.consumed != 0) {
+            prefixes_ok = false;
+        }
+    }
+    locus::http::ParseContext whole_ctx;
+    return parse_request(req, limits, whole_ctx, out);
+}
+}  // namespace
+
+TEST_CASE("parse_request invariant: byte-at-a-time equals whole",
+          "[http]") {
+    const std::string reqs[] = {
+        "GET /a?b=1 HTTP/1.1\r\nHost: h\r\nAccept: */*\r\n\r\n",
+        "POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello",
+        "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-T: v\r\n\r\n",
+        "HEAD / HTTP/1.0\r\n\r\n",
+    };
+    for (const auto& req : reqs) {
+        Request whole;
+        locus::http::ParseContext wc;
+        auto w = parse_request(req, Limits{}, wc, whole);
+        REQUIRE(w.state == ParseState::kComplete);
+
+        bool prefixes_ok = false;
+        Request inc;
+        auto i = feed_incremental(req, inc, prefixes_ok);
+        REQUIRE(prefixes_ok);               // no prefix decided early
+        REQUIRE(i.state == w.state);        // same terminal state
+        REQUIRE(i.consumed == w.consumed);  // same byte count
+        REQUIRE(inc.method == whole.method);
+        REQUIRE(inc.path == whole.path);
+        REQUIRE(inc.query == whole.query);
+        REQUIRE(inc.body == whole.body);
+        REQUIRE(inc.keep_alive == whole.keep_alive);
+        REQUIRE(inc.headers == whole.headers);
+    }
+}
+
+TEST_CASE("parse_request invariant: an errored prefix stays errored",
+          "[http]") {
+    // Appending bytes to an error must not yield kComplete, or a
+    // dribbling client bypasses every limit by error-then-recover.
+    const std::string bad = "GET / HTTP/2.0\r\n";  // unsupported version
+    Request r;
+    REQUIRE(parse(bad, r).state == ParseState::kError);
+    REQUIRE(parse(bad + "Host: h\r\n\r\n", r).state == ParseState::kError);
+    REQUIRE(parse(bad + std::string(100, 'x'), r).state ==
+            ParseState::kError);
+}
+
+TEST_CASE("parse_request invariant: kNeedMore is bounded", "[http]") {
+    // A buffer past every limit summed must be decided, never still
+    // kNeedMore (else the caller buffers without bound).
+    Limits lim;
+    const std::size_t sum = lim.max_request_line + lim.max_header_bytes +
+                            lim.max_body_bytes + lim.max_trailer_bytes;
+    Request r;
+    auto res = parse(std::string(sum + 1, 'x'), r);  // no CRLF ever
+    REQUIRE(res.state == ParseState::kError);
+}
+
+TEST_CASE("parse_request: a request line exactly at the cap is accepted "
+          "regardless of TCP segmentation", "[http]") {
+    Limits lim;
+    lim.max_request_line = 40;
+    const std::string target = "/" + std::string(26, 'a');   // 27 chars
+    const std::string line = "GET " + target + " HTTP/1.1";  // 40 chars
+    REQUIRE(line.size() == lim.max_request_line);
+    const std::string req = line + "\r\nHost: h\r\n\r\n";
+
+    Request whole;
+    REQUIRE(parse(req, whole, lim).state == ParseState::kComplete);
+    // The prefix is the whole line + its CR (one byte short of the LF):
+    // the segmentation the old buf.size() measure wrongly rejected.
+    Request r;
+    REQUIRE(parse(line + "\r", r, lim).state == ParseState::kNeedMore);
+}
+
+TEST_CASE("parse_request: a header section exactly at the cap is accepted "
+          "regardless of TCP segmentation", "[http]") {
+    Limits lim;
+    lim.max_header_bytes = 20;
+    const std::string hdr = "X: " + std::string(15, 'v');  // "X: " + 15
+    // the header line is 18 bytes; section measured at the blank line is
+    // 18 + the line CRLF's contribution == 20 == cap.
+    const std::string req = "GET / HTTP/1.1\r\n" + hdr + "\r\n\r\n";
+    Request whole;
+    REQUIRE(parse(req, whole, lim).state == ParseState::kComplete);
+    // Prefix ending at the blank-line CR: old buf.size() measure rejected.
+    Request r;
+    const std::string pre = "GET / HTTP/1.1\r\n" + hdr + "\r\n\r";
+    REQUIRE(parse(pre, r, lim).state == ParseState::kNeedMore);
+}
+
+TEST_CASE("parse_request: the trailer cap ignores a pipelined next "
+          "request on keep-alive", "[http]") {
+    // The trailer-bytes cap must measure the trailer section, not the
+    // whole buffer: a large 2nd request already buffered behind the
+    // chunked one must not be miscounted as trailer bytes.
+    Limits lim;
+    lim.max_trailer_bytes = 8;
+    const std::string first =
+        "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "4\r\nWiki\r\n0\r\n\r\n";  // zero trailers
+    const std::string next =
+        "GET /big HTTP/1.1\r\nX-Big: " + std::string(200, 'A') + "\r\n\r\n";
+    Request r;
+    auto res = parse(first + next, r, lim);
+    REQUIRE(res.state == ParseState::kComplete);
+    REQUIRE(res.consumed == first.size());  // only the first request
+    REQUIRE(r.body == "Wiki");
 }
