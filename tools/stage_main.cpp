@@ -12,6 +12,8 @@
 #include <memory>
 #include <vector>
 
+#include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/config/config_file.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/llama.hpp"
@@ -185,7 +187,30 @@ int main(int argc, char** argv) {
         pool_desc += ds;
     }
 
+    // Executor count (also the per-executor device-binding divisor).
+    const int n_exec = opt.executors < 1 ? 1 : opt.executors;
+
+    // Device-select seam (i#24 inc 4): validate --backend/--device
+    // before touching CUDA. A bad arity / non-cuda --device is a config
+    // error reported here; the actual device/backend binding (which can
+    // throw if the device or backend is unavailable) happens inside the
+    // try below so it shares the one error path.
+    locus_tools::DeviceBinding dev;
+    if (const std::string err =
+            locus_tools::resolve_device_binding(opt, n_exec, dev);
+        !err.empty()) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 2;
+    }
+
     try {
+        // Bind the CUDA device FIRST, before any model load or weight
+        // upload, so the weight pool allocates on the chosen device and
+        // not the default. cuda_set_device throws loudly for an out-of-
+        // range ordinal or a non-CUDA build -- never a silent fallback.
+        if (dev.device >= 0) {
+            locus::backend::cuda_set_device(dev.device);
+        }
         auto g = locus::gguf::GgufFile::open(opt.model);
         // Slice-only loading: this process wires up only layers
         // [begin, end) (its share of the model), so cluster memory is
@@ -199,11 +224,18 @@ int main(int argc, char** argv) {
                          rt.layer_end, model.hparams().n_layers);
             return 2;
         }
+        // Bind the chosen math backend (empty = the model's auto default,
+        // unchanged from before this seam). An unavailable backend (e.g.
+        // --backend cuda on a CPU-only host) throws here -- fail loud, no
+        // silent CPU fallback (i#24 inc 4).
+        if (!dev.backend.empty()) {
+            model.use_backend(
+                locus::backend::resolve_backend(dev.backend));
+        }
         // Each executor (--executors, i#24 inc 3) owns its own KV pool,
         // so N executors commit N pools. Refuse to allocate what would
         // not fit in RAM, rather than letting malloc overcommit and the
         // OS OOM-kill the stage once the pages are touched.
-        const int n_exec = opt.executors < 1 ? 1 : opt.executors;
         const std::size_t max_batch =
             static_cast<std::size_t>(opt.max_batch < 1 ? 1 : opt.max_batch);
         if (const std::string err = locus_tools::check_kv_memory(

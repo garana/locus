@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -54,6 +56,14 @@ struct StageOptions {
     int max_batch = 16;                   /**< --max-batch: sessions
                                            *   coalesced per executor
                                            *   forward */
+    std::string backend;                  /**< --backend NAME: math
+                                           *   backend for this stage
+                                           *   (empty = auto default) */
+    std::vector<std::string> device;      /**< --device N: CUDA device
+                                           *   ordinal(s). One entry binds
+                                           *   the whole process; >1 is
+                                           *   per-executor binding (inc
+                                           *   4b, not yet supported) */
 };
 
 /**
@@ -109,7 +119,83 @@ inline Spec<StageOptions> stage_spec() {
         D::integer("max-batch", &O::max_batch,
                    "sessions coalesced into one batched forward per "
                    "executor (default 16)"),
+        D::string_("backend", &O::backend,
+                   "math backend for this stage (see locus-run "
+                   "--backends); empty = auto-select"),
+        D::string_list("device", &O::device,
+                       "CUDA device ordinal; requires --backend cuda. "
+                       "One entry binds the whole process to that device. "
+                       "Under a GPU backend, executors are per-device "
+                       "lanes, not per-core -- use one executor per "
+                       "device unless measured otherwise"),
     });
+}
+
+/**
+ * Resolved device binding for a stage (i#24 inc 4). `device` < 0 means
+ * no explicit device was requested, so the stage runs on the backend's
+ * default device.
+ */
+struct DeviceBinding {
+    std::string backend;  /**< backend name to resolve ("" = auto) */
+    int device = -1;      /**< CUDA device ordinal, or -1 for none */
+};
+
+/**
+ * Validates --backend/--device and resolves them to a DeviceBinding.
+ * In inc 4a a single --device binds the WHOLE process to that CUDA
+ * ordinal. Multiple --device entries (one per executor) are inc 4b and
+ * rejected here, but the eventual rule (count is 1 or == --executors) is
+ * enforced NOW so 4b fills the flag surface in rather than changing its
+ * arity. A --device with a non-cuda backend, a non-integer ordinal, or a
+ * negative ordinal is an error.
+ *
+ * `out` is overwritten at entry (backend copied from opt, device reset
+ * to -1), so on an error return it holds opt.backend and device -1, not
+ * the caller's prior values.
+ * @param opt parsed options.
+ * @param n_exec the resolved executor count (--executors, >= 1).
+ * @param out device/backend binding; device >= 0 only on success.
+ * @returns "" on success, else a human-readable error.
+ */
+inline std::string resolve_device_binding(const StageOptions& opt,
+                                          int n_exec, DeviceBinding& out) {
+    out.backend = opt.backend;
+    out.device = -1;
+    if (opt.device.empty()) {
+        return "";  // no explicit device: the backend's default
+    }
+    // --device only means anything for CUDA. Check this first so the
+    // diagnostic names the real problem regardless of how many entries
+    // were given (not a confusing arity/4b message for a non-cuda
+    // backend).
+    if (opt.backend != "cuda") {
+        return "--device requires --backend cuda";
+    }
+    if (opt.device.size() > 1) {
+        if (static_cast<int>(opt.device.size()) != n_exec) {
+            return "multiple --device entries must match --executors (" +
+                   std::to_string(n_exec) + "), got " +
+                   std::to_string(opt.device.size());
+        }
+        return "per-executor device binding (multiple --device) is inc "
+               "4b and not yet supported; pass a single --device";
+    }
+    const std::string& s = opt.device.front();
+    errno = 0;
+    char* e = nullptr;
+    const long v = std::strtol(s.c_str(), &e, 10);
+    // Reject junk, a negative ordinal, AND an out-of-int value: strtol
+    // returns a long, so on LP64 a value above INT_MAX would pass v<0 and
+    // then truncate on the cast (2^31 becomes INT_MIN, negative), which
+    // would skip cuda_set_device yet still bind the backend (a silent
+    // wrong device). Fail loud instead.
+    if (s.empty() || *e != '\0' || errno == ERANGE || v < 0 ||
+        v > std::numeric_limits<int>::max()) {
+        return "bad --device (want a non-negative integer): " + s;
+    }
+    out.device = static_cast<int>(v);
+    return "";
 }
 
 /**

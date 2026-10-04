@@ -38,6 +38,17 @@ TEST_CASE("registry lists and resolves backends", "[backend]") {
         REQUIRE_THROWS_AS(resolve_backend("vulkan"),
                           std::invalid_argument);
     }
+    // Same for CUDA (i#24 inc 4): --backend cuda on a CUDA-less host
+    // must fail loud, never silently fall back to the CPU. The entry is
+    // absent entirely on a non-CUDA build, so gate on its presence.
+    if (find_backend("cuda") != nullptr) {
+        if (cuda_backend_usable()) {
+            REQUIRE(&resolve_backend("cuda") == find_backend("cuda"));
+        } else {
+            REQUIRE_THROWS_AS(resolve_backend("cuda"),
+                              std::invalid_argument);
+        }
+    }
 }
 
 #if defined(__aarch64__)

@@ -325,3 +325,90 @@ TEST_CASE("check_kv_memory guards KV against available RAM", "[config]") {
     REQUIRE(err.find("--kv-blocks") != std::string::npos);
     REQUIRE(err.find("--workers") != std::string::npos);
 }
+
+// ---- device-select seam (i#24 inc 4) ----
+
+TEST_CASE("resolve_device_binding: no device is the backend default",
+          "[config][device]") {
+    using locus_tools::DeviceBinding;
+    using locus_tools::resolve_device_binding;
+    StageOptions opt;
+    DeviceBinding db;
+    // No --device, no --backend: nothing bound, default device.
+    REQUIRE(resolve_device_binding(opt, 1, db).empty());
+    REQUIRE(db.device == -1);
+    REQUIRE(db.backend.empty());
+    // --backend without --device: backend carried, still default device.
+    opt.backend = "cuda";
+    REQUIRE(resolve_device_binding(opt, 1, db).empty());
+    REQUIRE(db.device == -1);
+    REQUIRE(db.backend == "cuda");
+}
+
+TEST_CASE("resolve_device_binding: a single CUDA device binds the process",
+          "[config][device]") {
+    using locus_tools::DeviceBinding;
+    using locus_tools::resolve_device_binding;
+    StageOptions opt;
+    opt.backend = "cuda";
+    opt.device = {"2"};
+    DeviceBinding db;
+    REQUIRE(resolve_device_binding(opt, 4, db).empty());
+    REQUIRE(db.device == 2);
+    REQUIRE(db.backend == "cuda");
+}
+
+TEST_CASE("resolve_device_binding: --device requires --backend cuda",
+          "[config][device]") {
+    using locus_tools::DeviceBinding;
+    using locus_tools::resolve_device_binding;
+    DeviceBinding db;
+    // --device with no backend.
+    StageOptions a;
+    a.device = {"0"};
+    REQUIRE(resolve_device_binding(a, 1, db).find("--backend cuda") !=
+            std::string::npos);
+    // --device with a non-cuda backend.
+    StageOptions b;
+    b.backend = "sse4";
+    b.device = {"0"};
+    REQUIRE(resolve_device_binding(b, 1, db).find("--backend cuda") !=
+            std::string::npos);
+}
+
+TEST_CASE("resolve_device_binding: a non-integer / negative device fails",
+          "[config][device]") {
+    using locus_tools::DeviceBinding;
+    using locus_tools::resolve_device_binding;
+    DeviceBinding db;
+    // Includes out-of-int values: strtol parses them into a positive
+    // long that would truncate to a negative/wrong int on the cast, so
+    // they must be rejected, not silently bound (i#24 fail-loud).
+    for (const char* bad : {"x", "1.5", "", "-1", "2147483648",
+                            "4294967298", "99999999999999999999"}) {
+        StageOptions opt;
+        opt.backend = "cuda";
+        opt.device = {bad};
+        REQUIRE(resolve_device_binding(opt, 1, db).find("bad --device") !=
+                std::string::npos);
+    }
+}
+
+TEST_CASE("resolve_device_binding: multiple --device is inc 4b, gated now",
+          "[config][device]") {
+    using locus_tools::DeviceBinding;
+    using locus_tools::resolve_device_binding;
+    DeviceBinding db;
+    StageOptions opt;
+    opt.backend = "cuda";
+    // Count must be 1 or == --executors: 3 devices vs 4 executors errors
+    // on the arity, naming --executors.
+    opt.device = {"0", "1", "2"};
+    REQUIRE(resolve_device_binding(opt, 4, db).find("--executors") !=
+            std::string::npos);
+    // Count == --executors (the eventual 4b per-executor shape) is
+    // accepted by the arity rule but rejected as not-yet-implemented, so
+    // the flag surface is fixed before 4b fills it in.
+    REQUIRE(resolve_device_binding(opt, 3, db).find("4b") !=
+            std::string::npos);
+}
