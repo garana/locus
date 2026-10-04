@@ -7,7 +7,7 @@
 #include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/grammar.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/server/server.hpp"
 #include "locus/tok/tokenizer.hpp"
 #include "httplib.h"
@@ -24,7 +24,7 @@ std::string model_path() {
 
 /** Server bound to an ephemeral port, serving on a thread. */
 struct TestServer {
-    TestServer(const locus::model::LlamaModel& m,
+    TestServer(const locus::model::TransformerModel& m,
                const locus::tok::SpmTokenizer& tok,
                locus::server::OpenAiServer::Options opt = {})
         : server(m, tok, std::move(opt)) {
@@ -59,7 +59,7 @@ TEST_CASE("server stop() unblocks the listener after requests",
         SKIP("model not present");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     TestServer ts(model, tok);
     httplib::Client client("127.0.0.1", ts.port);
@@ -76,7 +76,7 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     TestServer ts(model, tok);
     httplib::Client client("127.0.0.1", ts.port);
@@ -466,7 +466,7 @@ TEST_CASE("embeddings endpoint returns normalized vectors",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     // Embeddings need a CPU/CUDA backend (the Vulkan full-forward
     // does not surface the hidden state); force the scalar backend.
     model.use_backend(*locus::backend::find_backend("scalar"));
@@ -508,7 +508,7 @@ TEST_CASE("auth gates protected routes via a helper", "[server][e2e]") {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     locus::server::OpenAiServer::Options opt;
@@ -576,7 +576,7 @@ TEST_CASE("metrics path is configurable", "[server][e2e]") {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     locus::server::OpenAiServer::Options opt;
@@ -606,7 +606,7 @@ TEST_CASE("request-edge size limits reject before work",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     locus::server::OpenAiServer::Options opt;
@@ -648,7 +648,7 @@ TEST_CASE("prompt caching reports cache-hit usage fields",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     // Default Options: prompt caching is on.
     TestServer ts(model, tok);

@@ -3,7 +3,7 @@
 #include <span>
 
 #include "locus/kv/paged_cache.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/tok/tokenizer.hpp"
 
 namespace locus::backend {
@@ -19,7 +19,7 @@ namespace locus::backend {
  *     cache whose pool is not GPU-mapped -- so the caller falls
  *     back to the CPU path.
  */
-bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
+bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     kv::PagedKvCache& cache,
                     kv::PagedKvCache::Seq& seq,
                     std::span<float> logits);

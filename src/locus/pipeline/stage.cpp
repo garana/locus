@@ -9,7 +9,7 @@
 
 namespace locus::pipeline {
 
-PipelineStage::PipelineStage(const model::LlamaModel& model,
+PipelineStage::PipelineStage(const model::TransformerModel& model,
                              std::uint32_t layer_begin,
                              std::uint32_t layer_end,
                              std::uint32_t n_blocks)

@@ -16,7 +16,7 @@
 #include "locus/backend/variants.hpp"
 #include "locus/config/config_file.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/pipeline/stage.hpp"
 #include "locus/pipeline/stage_server.hpp"
@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
         // [begin, end) (its share of the model), so cluster memory is
         // ~1x the model. hparams().n_layers stays the full count, so
         // the range check still validates against the whole model.
-        auto model = locus::model::LlamaModel::load(g, rt.layer_begin,
+        auto model = locus::model::TransformerModel::load(g, rt.layer_begin,
                                                     rt.layer_end);
         if (rt.layer_end > model.hparams().n_layers) {
             std::fprintf(stderr,

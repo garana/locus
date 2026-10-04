@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "locus/kv/paged_cache.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/pipeline/message.hpp"
 
 namespace locus::pipeline {
@@ -15,7 +15,7 @@ namespace locus::pipeline {
  * One pipeline stage (multi-server, DESIGN.md "R15+"): owns a
  * contiguous layer range [layer_begin, layer_end) of a model and its
  * own KV cache, and transforms an input message into an output message
- * via LlamaModel::forward_layers.
+ * via TransformerModel::forward_layers.
  *
  * Role follows the range:
  *   - first stage (layer_begin == 0): input kToken, embeds it, runs
@@ -42,7 +42,7 @@ class PipelineStage {
      * @param n_blocks KV pool size in blocks (0 = model default).
      * @throws std::invalid_argument on a bad range.
      */
-    PipelineStage(const model::LlamaModel& model,
+    PipelineStage(const model::TransformerModel& model,
                   std::uint32_t layer_begin, std::uint32_t layer_end,
                   std::uint32_t n_blocks = 0);
 
@@ -147,14 +147,14 @@ class PipelineStage {
     bool is_last() const { return layer_end_ == n_layers_; }
 
   private:
-    const model::LlamaModel& model_;
+    const model::TransformerModel& model_;
     std::uint32_t layer_begin_;
     std::uint32_t layer_end_;
     std::uint32_t n_layers_;
     std::uint32_t n_embd_;
     std::uint32_t n_vocab_;
     kv::PagedKvCache cache_;
-    model::LlamaModel::Workspace ws_;
+    model::TransformerModel::Workspace ws_;
     kv::PagedKvCache::Seq seq_;
 };
 

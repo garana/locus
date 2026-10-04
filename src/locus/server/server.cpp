@@ -193,7 +193,7 @@ engine::Engine::Config OpenAiServer::resolve_engine_cfg(
     return cfg;
 }
 
-OpenAiServer::OpenAiServer(const model::LlamaModel& m,
+OpenAiServer::OpenAiServer(const model::TransformerModel& m,
                            const tok::Tokenizer& tok,
                            Options opt)
     : model_(m),

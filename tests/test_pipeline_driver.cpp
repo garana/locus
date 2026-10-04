@@ -12,7 +12,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/pipeline/driver.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -171,7 +171,7 @@ TEST_CASE("locus-driver drives a multi-process stage chain",
         SKIP("locus-stage binary not built");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
     auto& tok = *tok_ptr;
     const std::uint32_t L = model.hparams().n_layers;

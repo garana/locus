@@ -11,10 +11,10 @@
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "gguf_builder.hpp"
 
-using locus::model::LlamaModel;
+using locus::model::TransformerModel;
 
 namespace {
 
@@ -170,7 +170,7 @@ std::vector<float> run(const std::vector<std::byte>& image,
                            tokens,
                        const char* backend = nullptr) {
     auto g = locus::gguf::GgufFile::parse(image);
-    auto model = LlamaModel::load(g);
+    auto model = TransformerModel::load(g);
     if (backend != nullptr) {
         model.use_backend(
             *locus::backend::find_backend(backend));
@@ -445,7 +445,7 @@ TEST_CASE("weight window drops file-backed experts losslessly",
     {
         auto g = locus::gguf::GgufFile::open(path.string());
         REQUIRE(g.file_backed());
-        auto model = LlamaModel::load(g);
+        auto model = TransformerModel::load(g);
         auto cache = model.make_cache();
         auto ws = model.make_workspace();
         locus::kv::PagedKvCache::Seq seq;
@@ -480,7 +480,7 @@ TEST_CASE("batched forward matches N sequential forwards",
               weights(kF * kE, 42));
     auto img = mb.build(0, 0);  // dense llama
     auto g = locus::gguf::GgufFile::parse(img);
-    auto model = LlamaModel::load(g);
+    auto model = TransformerModel::load(g);
     REQUIRE(model.supports_batch());
 
     const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 5};
@@ -537,7 +537,7 @@ TEST_CASE("batched decode matches per-sequence decode",
               weights(kF * kE, 92));
     auto img = mb.build(0, 0);
     auto g = locus::gguf::GgufFile::parse(img);
-    auto model = LlamaModel::load(g);
+    auto model = TransformerModel::load(g);
     REQUIRE(model.supports_batch());
     const auto& hp = model.hparams();
     const std::uint32_t V = hp.n_vocab;
@@ -553,7 +553,7 @@ TEST_CASE("batched decode matches per-sequence decode",
     auto prefill = [&](locus::kv::PagedKvCache& cache,
                        std::vector<locus::kv::PagedKvCache::Seq>&
                            seqs,
-                       LlamaModel::Workspace& ws) {
+                       TransformerModel::Workspace& ws) {
         std::vector<float> logits(V);
         for (std::uint32_t i = 0; i < N; ++i) {
             for (auto t : ctx[i]) {
@@ -627,7 +627,7 @@ TEST_CASE("batched forward matches sequential (llama MoE)",
               weights(kF * kE * 4, 53));
     auto img = mb.build(4, 2);  // 4 experts, 2 routed
     auto g = locus::gguf::GgufFile::parse(img);
-    auto model = LlamaModel::load(g);
+    auto model = TransformerModel::load(g);
     REQUIRE(model.supports_batch());
 
     const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 5};

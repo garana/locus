@@ -3,7 +3,7 @@
 #include <string>
 
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 
 /** Shared loader helpers for arch hooks and the model loader. */
 namespace locus::model::load_util {
@@ -48,7 +48,7 @@ inline backend::Mat need_mat(const gguf::GgufFile& g,
 }
 
 /** Fetches a 3-D expert tensor, enforcing its shape. */
-inline LlamaModel::ExpertMat need_mat3(const gguf::GgufFile& g,
+inline TransformerModel::ExpertMat need_mat3(const gguf::GgufFile& g,
                                        const std::string& name,
                                        std::uint32_t cols,
                                        std::uint32_t rows,
@@ -61,7 +61,7 @@ inline LlamaModel::ExpertMat need_mat3(const gguf::GgufFile& g,
         t->ne[2] != n_expert || t->ne[3] != 1) {
         throw gguf::Error("unexpected shape for tensor: " + name);
     }
-    LlamaModel::ExpertMat em;
+    TransformerModel::ExpertMat em;
     em.base = backend::Mat{t->type, g.tensor_data(*t).data(),
                            rows, cols};
     em.expert_bytes = t->nbytes / n_expert;

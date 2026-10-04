@@ -26,7 +26,7 @@ TEST_CASE("unsupported architectures fail with a useful error",
     b.header(0, 1).kv_string("general.architecture", "qwen2");
     auto g = locus::gguf::GgufFile::parse(b.bytes());
     try {
-        LlamaModel::load(g);
+        TransformerModel::load(g);
         FAIL("expected gguf::Error");
     } catch (const locus::gguf::Error& e) {
         const std::string msg = e.what();

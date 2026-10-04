@@ -4,7 +4,7 @@
 #include <string>
 #include <string_view>
 
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 
 namespace locus::model {
 
@@ -34,18 +34,18 @@ struct ArchSpec {
     void (*load_attention)(const gguf::GgufFile& g,
                            const std::string& bp,
                            const Hparams& hp,
-                           LlamaModel::Layer& lay);
+                           TransformerModel::Layer& lay);
 
     /**
      * Computes one token's attention for layer l at pos: reads
      * ws.xb (post-norm activations), writes ws.out, and appends
      * this position's K/V (or latent) row to the cache.
      */
-    void (*attention)(const LlamaModel& m,
-                      const LlamaModel::Layer& lay,
+    void (*attention)(const TransformerModel& m,
+                      const TransformerModel::Layer& lay,
                       kv::PagedKvCache& cache,
                       kv::PagedKvCache::Seq& seq,
-                      LlamaModel::Workspace& ws, std::uint32_t l,
+                      TransformerModel::Workspace& ws, std::uint32_t l,
                       std::uint32_t pos);
 
     /** @returns Paged-cache row width in floats. */

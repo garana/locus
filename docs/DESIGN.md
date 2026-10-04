@@ -1313,8 +1313,8 @@ matvec throughput.
   single total, so the pair-collapse is exact). Ternary + IQ delegate
   to scalar. This host is SSE4-only (no AVX2/NEON here).
 - NOT the model default -- Q8_K is an OPT-IN mode
-  (LlamaModel::use_q8k_activations, default off). Why not the default:
-  "bit-exact with llama.cpp" is unachievable in principle -- ggml
+  (TransformerModel::use_q8k_activations, default off). Why not the
+  default: "bit-exact with llama.cpp" is unachievable in principle -- ggml
   itself is not bit-exact across its own backends, because the final
   f32 d*Sigma accumulates in an implementation-specific order (SSE4 vs
   AVX2 vs NEON vs CUDA vs generic). Q8_K's lower activation precision

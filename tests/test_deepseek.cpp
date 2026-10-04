@@ -7,7 +7,7 @@
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/tok/tokenizer.hpp"
 
 namespace {
@@ -34,7 +34,7 @@ TEST_CASE("deepseek-v2-lite matches llama.cpp token-exact",
              "set LOCUS_HEAVY_TESTS=1 to run it");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const auto& hp = model.hparams();
     REQUIRE(hp.arch == locus::model::Arch::kDeepseek2);
     REQUIRE(hp.kv_lora_rank == 512);

@@ -13,7 +13,7 @@ namespace {
 constexpr auto kPollBackoff = std::chrono::microseconds(200);
 }  // namespace
 
-EngineLoop::EngineLoop(const model::LlamaModel& m,
+EngineLoop::EngineLoop(const model::TransformerModel& m,
                        tok::TokenId eos,
                        engine::Engine::Config cfg)
     : engine_(m, eos, cfg), worker_([this] { run(); }) {}

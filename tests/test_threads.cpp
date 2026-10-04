@@ -6,7 +6,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/registry.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/sys/thread_pool.hpp"
 
 using locus::sys::ThreadPool;

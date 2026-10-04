@@ -9,7 +9,7 @@
 #include "locus/auth/auth_client.hpp"
 #include "locus/chat/template.hpp"
 #include "locus/engine/engine.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/server/engine_loop.hpp"
 #include "locus/tok/tokenizer.hpp"
 
@@ -88,7 +88,7 @@ class OpenAiServer {
         bool prompt_cache = true;
     };
 
-    OpenAiServer(const model::LlamaModel& m,
+    OpenAiServer(const model::TransformerModel& m,
                  const tok::Tokenizer& tok, Options opt);
     ~OpenAiServer();
 
@@ -131,7 +131,7 @@ class OpenAiServer {
     void auth_event(const char* event, const std::string& kind,
                     const std::string& identity);
 
-    const model::LlamaModel& model_;
+    const model::TransformerModel& model_;
     const tok::Tokenizer& tok_;
     Options opt_;
     EngineLoop loop_;
@@ -154,7 +154,7 @@ class OpenAiServer {
     std::mutex embed_mu_;
     std::once_flag embed_once_;
     std::unique_ptr<kv::PagedKvCache> embed_cache_;
-    model::LlamaModel::Workspace embed_ws_;
+    model::TransformerModel::Workspace embed_ws_;
 };
 
 }  // namespace locus::server

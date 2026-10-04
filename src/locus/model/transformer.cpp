@@ -1,4 +1,4 @@
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -49,7 +49,7 @@ void advise_mat(const backend::Mat& m) {
  * Shared by the R8 layer readahead and the R9 static pinning.
  */
 template <class F>
-void for_each_static_mat(const LlamaModel::Layer& lay, F&& f) {
+void for_each_static_mat(const TransformerModel::Layer& lay, F&& f) {
     f(lay.wq);
     f(lay.wk);
     f(lay.wv);
@@ -72,7 +72,7 @@ void for_each_static_mat(const LlamaModel::Layer& lay, F&& f) {
     f(lay.idx_q_b);
 }
 
-void advise_layer_statics(const LlamaModel::Layer& lay) {
+void advise_layer_statics(const TransformerModel::Layer& lay) {
     for_each_static_mat(
         lay, [](const backend::Mat& m) { advise_mat(m); });
 }
@@ -164,7 +164,7 @@ float dsa_index_score(std::span<const float> q,
     return score;
 }
 
-LlamaModel LlamaModel::load(const GgufFile& g,
+TransformerModel TransformerModel::load(const GgufFile& g,
                             std::uint32_t layer_begin,
                             std::uint32_t layer_end) {
     const auto arch_name = g.get_string("general.architecture");
@@ -181,7 +181,7 @@ LlamaModel LlamaModel::load(const GgufFile& g,
                     "\" (supported: " + supported + ")");
     }
 
-    LlamaModel m;
+    TransformerModel m;
     m.spec_ = spec;
     m.file_backed_ = g.file_backed();
     Hparams& hp = m.hp_;
@@ -366,7 +366,7 @@ LlamaModel LlamaModel::load(const GgufFile& g,
     return m;
 }
 
-LlamaModel::Workspace LlamaModel::make_workspace() const {
+TransformerModel::Workspace TransformerModel::make_workspace() const {
     Workspace ws;
     const bool mla = hp_.kv_lora_rank > 0;
     ws.x.resize(hp_.n_embd);
@@ -430,7 +430,7 @@ kv::PagedKvCache::Geometry cache_geometry(std::uint32_t n_layers_slice,
 }
 }  // namespace
 
-std::size_t LlamaModel::kv_pool_bytes(std::uint32_t n_blocks,
+std::size_t TransformerModel::kv_pool_bytes(std::uint32_t n_blocks,
                                       kv::KvType kv_type) const {
     const auto geom = cache_geometry(layer_end_ - layer_begin_,
                                      layer_begin_, spec_->kv_dim(hp_),
@@ -442,7 +442,7 @@ std::size_t LlamaModel::kv_pool_bytes(std::uint32_t n_blocks,
                : kv::PagedKvCache::pool_bytes(geom);
 }
 
-kv::PagedKvCache LlamaModel::make_cache(
+kv::PagedKvCache TransformerModel::make_cache(
     std::uint32_t n_blocks, kv::KvType kv_type) const {
     const kv::PagedKvCache::Geometry geom =
         cache_geometry(layer_end_ - layer_begin_, layer_begin_,
@@ -474,7 +474,7 @@ kv::PagedKvCache LlamaModel::make_cache(
     return kv::PagedKvCache(geom);
 }
 
-void LlamaModel::forward(tok::TokenId token,
+void TransformerModel::forward(tok::TokenId token,
                          kv::PagedKvCache& cache,
                          kv::PagedKvCache::Seq& seq, Workspace& ws,
                          std::span<float> logits) const {
@@ -493,7 +493,7 @@ void LlamaModel::forward(tok::TokenId token,
     forward_layers(token, {}, 0, hp_.n_layers, cache, seq, ws, logits);
 }
 
-void LlamaModel::forward_layers(tok::TokenId token,
+void TransformerModel::forward_layers(tok::TokenId token,
                                 std::span<const float> hidden_in,
                                 std::uint32_t layer_begin,
                                 std::uint32_t layer_end,
@@ -619,7 +619,7 @@ void LlamaModel::forward_layers(tok::TokenId token,
     }
 }
 
-void LlamaModel::embed(std::span<const tok::TokenId> tokens,
+void TransformerModel::embed(std::span<const tok::TokenId> tokens,
                        kv::PagedKvCache& cache,
                        kv::PagedKvCache::Seq& seq, Workspace& ws,
                        std::span<float> out) const {
@@ -646,7 +646,7 @@ void LlamaModel::embed(std::span<const tok::TokenId> tokens,
     std::copy_n(ws.xb.data(), hp_.n_embd, out.data());
 }
 
-bool LlamaModel::supports_batch() const {
+bool TransformerModel::supports_batch() const {
     // forward_batch batches the FFN through op.matvec and reuses
     // the per-token attention, so every CPU/CUDA arch (llama /
     // deepseek2 / glm-dsa, dense or MoE) is supported. The Vulkan
@@ -655,7 +655,7 @@ bool LlamaModel::supports_batch() const {
     return backend_->name != "vulkan";
 }
 
-void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
+void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                                kv::PagedKvCache& cache,
                                kv::PagedKvCache::Seq& seq,
                                Workspace& ws,
@@ -769,7 +769,7 @@ void LlamaModel::forward_batch(std::span<const tok::TokenId> toks,
     seq.n_tokens = base + n;
 }
 
-void LlamaModel::forward_batch_decode(
+void TransformerModel::forward_batch_decode(
     std::span<const tok::TokenId> toks, kv::PagedKvCache& cache,
     std::span<kv::PagedKvCache::Seq* const> seqs, Workspace& ws,
     std::span<float> logits) const {
@@ -869,7 +869,7 @@ void LlamaModel::forward_batch_decode(
     }
 }
 
-void LlamaModel::forward_batch_layers(
+void TransformerModel::forward_batch_layers(
     std::span<const tok::TokenId> toks, std::span<const float> hidden_in,
     std::uint32_t layer_begin, std::uint32_t layer_end,
     kv::PagedKvCache& cache,
@@ -1136,7 +1136,7 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
 }
 
 std::vector<std::pair<std::uint32_t, float>> moe_select(
-    const Hparams& hp, const LlamaModel::Layer& lay,
+    const Hparams& hp, const TransformerModel::Layer& lay,
     std::span<float> router) {
     if (hp.gating == GatingFunc::kSoftmax) {
         backend::softmax_inplace(router);
@@ -1217,7 +1217,7 @@ std::vector<std::pair<std::uint32_t, float>> moe_select(
     return out;
 }
 
-void LlamaModel::apply_norm(std::span<const float> x,
+void TransformerModel::apply_norm(std::span<const float> x,
                             std::span<const float> w, float eps,
                             std::span<float> out) const {
     if (hp_.norm_type == NormType::kLayerNorm) {
@@ -1227,7 +1227,7 @@ void LlamaModel::apply_norm(std::span<const float> x,
     }
 }
 
-void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
+void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
                          std::uint32_t layer) const {
     using namespace locus::backend;
     const Ops op = effective_ops(backend_, q8k_activations_);
@@ -1314,7 +1314,7 @@ void LlamaModel::moe_ffn(const Layer& lay, Workspace& ws,
     }
 }
 
-void LlamaModel::moe_ffn_batch(const Layer& lay,
+void TransformerModel::moe_ffn_batch(const Layer& lay,
                                std::uint32_t layer,
                                const std::vector<float>& xbf,
                                std::vector<float>& x,

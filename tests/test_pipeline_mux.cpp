@@ -13,7 +13,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/pipeline/stage.hpp"
@@ -35,7 +35,7 @@ std::string model_path() {
 // Greedy single-process generation of `n_gen` tokens after `prompt`,
 // the reference a multiplexed session must reproduce exactly.
 std::vector<locus::tok::TokenId> mono_generate(
-    const locus::model::LlamaModel& model,
+    const locus::model::TransformerModel& model,
     std::span<const locus::tok::TokenId> prompt,
     locus::tok::TokenId eos, int n_gen) {
     auto cache = model.make_cache();
@@ -105,7 +105,7 @@ TEST_CASE("serve_stage_mux serves two concurrent sessions in isolation",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     const std::uint32_t L = model.hparams().n_layers;
     const locus::tok::TokenId eos = tok.eos_id();
@@ -221,7 +221,7 @@ TEST_CASE("serve_stage_mux spreads sessions across two executors",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     const std::uint32_t L = model.hparams().n_layers;
     const locus::tok::TokenId eos = tok.eos_id();
@@ -329,7 +329,7 @@ TEST_CASE("serve_stage_mux reassembles a frame split across reads",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
 
     int pc = 0;
@@ -390,7 +390,7 @@ TEST_CASE("serve_stage_mux: EOF at a boundary is clean, mid-frame is not",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
 
     auto run_once = [&](bool truncate) {
@@ -460,7 +460,7 @@ TEST_CASE("serve_stage_mux drops an idle peer that resets the connection",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
 
     int pc = 0;
@@ -517,7 +517,7 @@ TEST_CASE("serve_stage_mux parks a backlog for a slow downstream",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
     const std::uint32_t V = model.hparams().n_vocab;
 
@@ -600,7 +600,7 @@ TEST_CASE("serve_stage_mux answers a client that half-closes after a frame",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
 
     int pc = 0;

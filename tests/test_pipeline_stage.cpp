@@ -15,7 +15,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/pipeline/resolver.hpp"
@@ -49,7 +49,7 @@ TEST_CASE("pipeline stages reproduce single-process generation",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     const std::uint32_t L = model.hparams().n_layers;
     const std::uint32_t V = model.hparams().n_vocab;
@@ -224,7 +224,7 @@ TEST_CASE("pipeline serve_stage chain reproduces generation",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     const std::uint32_t L = model.hparams().n_layers;
     const std::uint32_t V = model.hparams().n_vocab;
@@ -360,7 +360,7 @@ TEST_CASE("serve_stage reconnect gives up after N attempts",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
     // First+last stage; only its accept + downstream-connect phase runs
     // here (the downstream never appears, so stage.run is not reached).
@@ -415,7 +415,7 @@ TEST_CASE("serve_stage re-serves sessions with reset",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     const std::uint32_t L = model.hparams().n_layers;
     const std::uint32_t V = model.hparams().n_vocab;
@@ -533,7 +533,7 @@ TEST_CASE("serve_stage distributes across a downstream pool",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     const std::uint32_t L = model.hparams().n_layers;
     const std::uint32_t V = model.hparams().n_vocab;
@@ -750,14 +750,14 @@ TEST_CASE("slice-only load matches full model on its layer range",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto full = locus::model::LlamaModel::load(g);
+    auto full = locus::model::TransformerModel::load(g);
     const std::uint32_t L = full.hparams().n_layers;
     const std::uint32_t V = full.hparams().n_vocab;
     const std::uint32_t E = full.hparams().n_embd;
     REQUIRE(L >= 2);
     const std::uint32_t k = L / 2 > 0 ? L / 2 : 1;
 
-    auto slice = locus::model::LlamaModel::load(g, k, L);
+    auto slice = locus::model::TransformerModel::load(g, k, L);
     // The slice records its range; hparams().n_layers stays the full
     // count; layers_ stays absolute-indexed with only [k, L) wired up.
     REQUIRE(slice.layer_begin() == k);
@@ -774,7 +774,7 @@ TEST_CASE("slice-only load matches full model on its layer range",
     // SIZE the slice changes -- not just the per-layer offset, so a
     // remap slip surfaces here rather than only in the [mp] end-to-end.
     constexpr std::uint32_t kPos = 40;  // > 2 blocks at block_tokens 16
-    auto run_tail = [&](locus::model::LlamaModel& m) {
+    auto run_tail = [&](locus::model::TransformerModel& m) {
         auto cache = m.make_cache();
         auto ws = m.make_workspace();
         locus::kv::PagedKvCache::Seq seq;
@@ -821,7 +821,7 @@ TEST_CASE("serve_stage applies a hot reload between sessions",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     const std::uint32_t L = model.hparams().n_layers;
     const std::uint32_t V = model.hparams().n_vocab;
@@ -948,7 +948,7 @@ TEST_CASE("serve_stage dials a named downstream through the resolver",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     const std::uint32_t L = model.hparams().n_layers;
     const std::uint32_t V = model.hparams().n_vocab;
@@ -1072,13 +1072,13 @@ TEST_CASE("serve_stage dials a named downstream through the resolver",
 // given --kv-blocks without allocating it, so the stage can budget RAM
 // before constructing caches. It must be positive and scale linearly in
 // the block count (the pool is n_blocks x per-block bytes).
-TEST_CASE("LlamaModel::kv_pool_bytes scales with the block count",
+TEST_CASE("TransformerModel::kv_pool_bytes scales with the block count",
           "[pipeline][e2e]") {
     if (!std::filesystem::exists(model_path())) {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
 
     REQUIRE(model.kv_pool_bytes(0) > 0);  // the default pool is non-empty
     const std::size_t b100 = model.kv_pool_bytes(100);
