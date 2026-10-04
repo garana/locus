@@ -104,3 +104,67 @@ TEST_CASE("bench: k-quant matvec f32 vs Q8_K", "[.][bench]") {
     }
     SUCCEED();
 }
+
+// i#52 measure-first: the last stage projects out_w_ (the LM head, the
+// biggest tensor) once PER token via matvec. Amortizing it into one
+// matvec_batch reads the weight once for the whole batch; this measures
+// whether that actually wins on THIS GPU at the batch widths we run,
+// before committing a bigger activation buffer + a transpose to it.
+// Synthetic Q6_K LM head (the usual output.weight type) at vocab x embd.
+TEST_CASE("bench: out_w_ n x matvec_cuda vs matvec_batch_cuda",
+          "[.][bench][cuda]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    using TT = locus::gguf::TensorType;
+    const std::uint32_t rows = 32000;  // vocab
+    const std::uint32_t cols = 2048;   // embd
+    auto w = make_kquant(rows, cols, /*bytes=*/210, /*d_off=*/208,
+                         /*dmin_off=*/-1, 7);
+    Mat m{TT::kQ6_K, w.data(), rows, cols};
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    const int iters = 50;
+    for (std::uint32_t n : {1u, 4u, 8u, 16u}) {
+        std::vector<float> xb(static_cast<std::size_t>(n) * cols);
+        for (auto& v : xb) {
+            v = dist(rng);
+        }
+        std::vector<float> col(rows);
+        std::vector<float> outb(static_cast<std::size_t>(rows) * n);
+        cuda_pool_reset();
+        auto per_token = [&] {
+            for (std::uint32_t t = 0; t < n; ++t) {
+                matvec_cuda(m,
+                            {xb.data() + static_cast<std::size_t>(t) *
+                                             cols,
+                             cols},
+                            col);
+            }
+        };
+        auto batched = [&] { matvec_batch_cuda(m, xb, outb, n); };
+        for (int i = 0; i < 3; ++i) {  // warm (upload + JIT)
+            per_token();
+            batched();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            per_token();
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            batched();
+        }
+        const auto t2 = std::chrono::steady_clock::now();
+        const double per_ns =
+            std::chrono::duration<double, std::nano>(t1 - t0).count() /
+            iters;
+        const double bat_ns =
+            std::chrono::duration<double, std::nano>(t2 - t1).count() /
+            iters;
+        WARN("cuda out_w_ n=" << n << ": per-token=" << per_ns
+                              << "ns batched=" << bat_ns
+                              << "ns speedup=" << per_ns / bat_ns << "x");
+    }
+    SUCCEED();
+}
