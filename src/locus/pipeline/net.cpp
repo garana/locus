@@ -415,6 +415,54 @@ int connect_to(const std::string& host, int port, int timeout_ms) {
     return fd;
 }
 
+int dial_start(const std::string& ip, int port) {
+    addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    // Numeric host + service: no name/service lookup, so getaddrinfo
+    // does not block (the caller resolved the hostname to an IP first).
+    hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+    const std::string port_str = std::to_string(port);
+    addrinfo* res = nullptr;
+    if (::getaddrinfo(ip.c_str(), port_str.c_str(), &hints, &res) != 0) {
+        return -1;
+    }
+    int fd = -1;
+    for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        const int flags = ::fcntl(fd, F_GETFL, 0);
+        if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            ::close(fd);
+            fd = -1;
+            continue;
+        }
+        const int r = ::connect(fd, p->ai_addr, p->ai_addrlen);
+        if (r == 0 || errno == EINPROGRESS) {
+            set_conn_opts(fd);  // TCP_NODELAY etc, as connect_to does
+            break;              // connected, or handshaking in background
+        }
+        ::close(fd);  // synchronous refusal/error: try the next candidate
+        fd = -1;
+    }
+    ::freeaddrinfo(res);
+    return fd;
+}
+
+int connect_result(int fd) {
+    int soerr = 0;
+    socklen_t sl = sizeof(soerr);
+    // SO_ERROR is read-and-clear: this must be called exactly once per
+    // dial (a second read reports success on a failed connect).
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0) {
+        return errno;
+    }
+    return soerr;
+}
+
 void set_recv_timeout(int fd, int ms) {
     // {0,0} clears the timeout (block indefinitely).
     timeval tv;

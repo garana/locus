@@ -98,6 +98,34 @@ int accept_one(int listen_fd, std::string* peer_ip = nullptr,
 int connect_to(const std::string& host, int port, int timeout_ms = 0);
 
 /**
+ * Starts a NON-BLOCKING connect to a numeric `ip`:`port` and returns the
+ * socket fd immediately, without waiting for the handshake. The fd is
+ * left non-blocking; the caller registers it for write-readiness and,
+ * on the first writable event, calls connect_result() once to learn the
+ * outcome. `ip` must be a numeric address (resolve a hostname first,
+ * e.g. via Resolver), so this issues no DNS and never blocks -- it is
+ * the dial primitive for the event loop (issue 39).
+ *
+ * @returns The fd (>= 0), connecting in the background (or already
+ *     connected), or -1 if no socket could be opened / the address was
+ *     unparseable / every candidate failed synchronously (not
+ *     EINPROGRESS). A -1 is a same-as-failed dial the caller retries.
+ */
+int dial_start(const std::string& ip, int port);
+
+/**
+ * Reads the pending connect outcome on a fd from dial_start exactly ONCE
+ * -- SO_ERROR is read-and-clear, so a second read sees success on a
+ * failed connect (the lesson from the PR #37 review). Call it on the
+ * first write-ready event.
+ *
+ * @returns 0 if the connection completed, else the connect errno
+ *     (ECONNREFUSED, ETIMEDOUT, EHOSTUNREACH, ...) or errno if the
+ *     getsockopt itself failed.
+ */
+int connect_result(int fd);
+
+/**
  * Sets a receive timeout on `fd` (SO_RCVTIMEO): a blocking read that
  * waits longer than `ms` fails with EAGAIN, which read_message reports
  * as kTimeout. ms == 0 clears the timeout (block indefinitely).

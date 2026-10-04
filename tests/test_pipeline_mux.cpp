@@ -1,3 +1,4 @@
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -642,4 +643,219 @@ TEST_CASE("serve_stage_mux answers a client that half-closes after a frame",
     server.join();
     ::close(from_stage);
     REQUIRE(sres.load() == 1);  // ended cleanly (EOF at a frame boundary)
+}
+
+// ---- issue 39: non-blocking, poll-driven downstream connect ----
+
+namespace {
+// A bound-then-closed port: a connect there is refused -- synchronously
+// on some stacks, as an async error event on others, both of which the
+// dial-failure path must handle.
+int refused_port() {
+    int p = 0;
+    const int l = locus::pipeline::listen_on("127.0.0.1", 0, &p);
+    REQUIRE(l >= 0);
+    ::close(l);
+    return p;
+}
+}  // namespace
+
+// dial_start returns immediately with the handshake in flight; the fd
+// becomes writable and connect_result reports success. Runs for IPv4 and
+// IPv6 loopback, because dial_start must build the right sockaddr family
+// from the numeric literal (the resolver hands back v6 literals).
+TEST_CASE("dial_start connects v4 and v6 loopback, poll-driven",
+          "[net][connect]") {
+    for (const char* host : {"127.0.0.1", "::1"}) {
+        int port = 0;
+        const int l = locus::pipeline::listen_on(host, 0, &port);
+        if (l < 0) {
+            continue;  // this family not available on the host
+        }
+        const int fd = locus::pipeline::dial_start(host, port);
+        REQUIRE(fd >= 0);
+        pollfd pfd{fd, POLLOUT, 0};
+        REQUIRE(::poll(&pfd, 1, 2000) == 1);
+        REQUIRE(locus::pipeline::connect_result(fd) == 0);
+        ::close(fd);
+        ::close(l);
+    }
+}
+
+// A refused dial surfaces as a failure one way or the other: either
+// dial_start returns -1 synchronously, or the fd goes writable/errored
+// and connect_result returns non-zero. Never a silent success (the
+// SO_ERROR read-once contract).
+TEST_CASE("dial_start to a refused port reports failure, never success",
+          "[net][connect]") {
+    const int port = refused_port();
+    const int fd = locus::pipeline::dial_start("127.0.0.1", port);
+    if (fd < 0) {
+        SUCCEED("refused synchronously");
+        return;
+    }
+    pollfd pfd{fd, POLLOUT, 0};
+    ::poll(&pfd, 1, 2000);
+    REQUIRE(locus::pipeline::connect_result(fd) != 0);
+    ::close(fd);
+}
+
+// A refused pool entry is retried onto a live one WITHIN the dial, with
+// no blocking sleep: the session connects to the second entry and
+// produces output byte-identical to the single-process run. Proves the
+// dial walks the pool past a dead entry.
+TEST_CASE("serve_stage_mux dials across the pool past a refused entry",
+          "[pipeline][mux][connect][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const locus::tok::TokenId eos = tok.eos_id();
+    constexpr int kGen = 6;
+    const auto prompt = tok.encode("Once upon a time", true);
+    const auto ref = mono_generate(model, prompt, eos, kGen);
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+    const int dead = refused_port();
+
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, allow,
+                   {{"127.0.0.1", dead}, {"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    Client a;
+    a.request_id = 7;
+    a.to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(a.to_stage >= 0);
+    // The stage dials `dead` (fails), then `pc` (this accept completes).
+    a.from_stage = locus::pipeline::accept_one(lc, nullptr);
+    REQUIRE(a.from_stage >= 0);
+    ::close(lc);
+
+    for (auto t : prompt) {
+        a.round_trip(t);
+    }
+    std::vector<locus::tok::TokenId> gen;
+    for (int i = 0; i < kGen && a.ok; ++i) {
+        const auto n = locus::model::argmax(a.logits);
+        gen.push_back(n);
+        if (n == eos) {
+            break;
+        }
+        a.round_trip(n);
+    }
+    ::close(a.to_stage);
+    server.join();
+    ::close(a.from_stage);
+
+    REQUIRE(a.ok);
+    REQUIRE(gen == ref);
+    REQUIRE(sres.load() == 1);
+}
+
+// A session whose entire downstream pool is dead is DROPPED (per-session)
+// and the server stays up and returns -- it is not fatal, and the failed
+// dial does not busy-spin: a spin would never reach the drop, so
+// serve_sessions == 1 would never trip and server.join() would hang. The
+// join returning is the no-spin assertion.
+TEST_CASE("serve_stage_mux drops a session with a dead downstream pool",
+          "[pipeline][mux][connect][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    const std::uint32_t L = model.hparams().n_layers;
+
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+    const int dead = refused_port();
+
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+    conn.reconnect_attempts = 1;  // one sweep, then drop
+    conn.reconnect_wait_ms = 10;
+
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, allow, {{"127.0.0.1", dead}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    const int c = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(c >= 0);
+    // The stage accepts, dials the dead pool, exhausts it, drops. Server
+    // must RETURN (not hang) with an unclean result.
+    server.join();
+    REQUIRE(sres.load() == 0);
+    ::close(c);
+}
+
+// Issue 39: a non-numeric downstream with NO resolver can never be dialed
+// (the async dial needs a numeric address). The stage must detect that at
+// accept and drop the session promptly with a cause-specific message --
+// NOT burn reconnect_attempts x reconnect_wait_ms first, and NOT hang.
+TEST_CASE("serve_stage_mux drops a hostname downstream with no resolver",
+          "[pipeline][mux][connect][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    const std::uint32_t L = model.hparams().n_layers;
+
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;  // conn.resolver stays nullptr
+    conn.serve_sessions = 1;
+    // Large retry budget so a hang here (treating it as transient) would
+    // be obvious: the accept-time permanent-fail path must bypass it.
+    conn.reconnect_attempts = 1000;
+    conn.reconnect_wait_ms = 1000;
+
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, allow, {{"needs-a-resolver.invalid", 9}},
+                   conn)
+                   ? 1
+                   : 0;
+    });
+
+    const int c = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(c >= 0);
+    // Must return promptly (the big reconnect budget is never spent) with
+    // an unclean result.
+    server.join();
+    REQUIRE(sres.load() == 0);
+    ::close(c);
 }
