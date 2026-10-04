@@ -206,6 +206,25 @@ TEST_CASE("http server: a chunked stream decodes end to end",
     ::close(c);
 }
 
+TEST_CASE("http server: a HEAD to a streaming handler sends headers but "
+          "no chunks", "[http_server]") {
+    std::atomic<bool> provider_ran{false};
+    Fixture f([&](const Request&, ServerResponse& res) {
+        res.set_chunked_content_provider(
+            "text/event-stream", [&](locus::http::Sink& sink) {
+                provider_ran.store(true);
+                sink.write("should-not-be-sent");
+            });
+    });
+    const int c = client_connect(f.port);
+    send_all(c, "HEAD /s HTTP/1.1\r\nHost: h\r\n\r\n");
+    const std::string r = drain(c);
+    REQUIRE(r.find("Transfer-Encoding: chunked") != std::string::npos);
+    REQUIRE(r.find("should-not-be-sent") == std::string::npos);  // no body
+    REQUIRE_FALSE(provider_ran.load());  // provider skipped entirely
+    ::close(c);
+}
+
 TEST_CASE("http server: an empty chunk write is a no-op, not a premature "
           "end-of-stream", "[http_server]") {
     // encode_chunk("") is byte-identical to the terminator, so an empty
@@ -276,6 +295,51 @@ TEST_CASE("http server: a partial head trips the head deadline with 408",
     Fixture f(echo_handler, cfg);
     const int c = client_connect(f.port);
     send_all(c, "GET / HTTP/1.1\r\n");  // head never completes
+    const std::string r = drain(c, 1500);
+    REQUIRE(r.find("HTTP/1.1 408") != std::string::npos);
+    ::close(c);
+}
+
+TEST_CASE("http server: a slow-but-steady body upload is NOT cut (rate-"
+          "based, not a flat floor)", "[http_server]") {
+    // The upload spans longer than head_deadline_ms (the base grace) but
+    // sustains well above the minimum rate, so the token bucket keeps the
+    // deadline ahead and the request completes. A flat deadline would
+    // 408 this -- the regression the rate-based bound fixes.
+    ServerConfig cfg;
+    cfg.head_deadline_ms = 200;            // base grace
+    cfg.min_ingest_bytes_per_sec = 4096;   // 4 KB/s floor
+    Fixture f(
+        [](const Request& req, ServerResponse& res) {
+            res.status = 200;
+            res.set_content(std::to_string(req.body.size()), "text/plain");
+        },
+        cfg);
+    const int c = client_connect(f.port);
+    send_all(c,
+             "POST /up HTTP/1.1\r\nHost: h\r\nContent-Length: 8192\r\n\r\n");
+    // 8 KB in 1 KB steps, 80 ms apart: ~640 ms total (> the 200 ms grace)
+    // at ~12.5 KB/s (3x the floor).
+    const std::string kb(1024, 'y');
+    for (int i = 0; i < 8; ++i) {
+        send_all(c, kb);
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    }
+    const std::string r = drain(c);
+    REQUIRE(r.find("HTTP/1.1 200") != std::string::npos);
+    REQUIRE(r.find("8192") != std::string::npos);  // whole body received
+    ::close(c);
+}
+
+TEST_CASE("http server: a stalled body upload trips the body deadline",
+          "[http_server]") {
+    ServerConfig cfg;
+    cfg.head_deadline_ms = 200;  // body grace
+    Fixture f(echo_handler, cfg);
+    const int c = client_connect(f.port);
+    // Head promises a body, then the client sends nothing: no rate credit
+    // is earned, so the body deadline (grace) trips with a 408.
+    send_all(c, "POST /up HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\n");
     const std::string r = drain(c, 1500);
     REQUIRE(r.find("HTTP/1.1 408") != std::string::npos);
     ::close(c);

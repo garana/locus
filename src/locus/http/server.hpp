@@ -36,6 +36,16 @@ namespace locus::http {
  * limits.max_body_bytes (only a serving worker holds a body; queued
  * connections sit in the kernel). Budget it against the same RAM the
  * KV-cache guard reasons about.
+ *
+ * The cost of the pool shape: these bounds stop STALLED clients, not
+ * SLOW ones. A client that keeps making progress just above the minimum
+ * rates (ingest and per-write) holds its worker for as long as it keeps
+ * progressing, so the real bound on concurrent slow clients is
+ * worker_threads itself -- worker_threads slow-but-legal connections can
+ * occupy every worker and make others wait in the backlog. httplib had
+ * the same exposure with the same pool shape; it is inherent to model
+ * (A) and not removable with per-request bounds (an event loop would
+ * change it).
  */
 
 /**
@@ -98,13 +108,22 @@ struct ServerConfig {
      * refuses the connection (no 503, no parse, no read). */
     int listen_backlog = 128;
     int max_requests_per_conn = 100;  /**< then close (keep-alive). */
-    /** Wall time from a request's first byte to the WHOLE request being
-     * received (head AND body), as a deadline, NOT an inter-byte timer
-     * (a client dribbling 1 B / N s must still trip it). This also bounds
-     * a slow body upload, the same receive-direction slowloris as a slow
-     * head; a streaming RESPONSE is deliberately not bounded here (that
-     * is the per-write deadline's job). */
+    /** Flat wall deadline for receiving the request HEAD (first byte to
+     * the blank line), as a deadline NOT an inter-byte timer (a client
+     * dribbling 1 B / N s must still trip it). The head has no legitimate
+     * size, so a flat bound is right here. It also serves as the body
+     * phase's base grace (see min_ingest_bytes_per_sec). */
     int head_deadline_ms = 10000;
+    /** Minimum sustained body upload rate. Once the head is in, the body
+     * deadline is head_deadline_ms of grace plus credit earned at this
+     * rate, clamped so a burst cannot bank time: a client holding above
+     * this rate is never cut, one below it (a dribbler, a staller) trips.
+     * A flat body deadline would instead impose max_body_bytes / deadline
+     * as a FLOOR rate and fail a slow-but-honest upload. 0 disables the
+     * body-rate check. Works for chunked too (no declared length needed).
+     * A streaming RESPONSE is never bounded here -- that is the per-write
+     * deadline's job. */
+    int min_ingest_bytes_per_sec = 32 * 1024;
     int idle_timeout_ms = 5000;     /**< idle keep-alive connection. */
     int write_deadline_ms = 10000;  /**< a single BLOCKED write; not a
                                      *   produce-every-N timer (prefill

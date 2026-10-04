@@ -333,12 +333,14 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
     int nodelay = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
+    using clock = std::chrono::steady_clock;
     std::string buf;
     ParseContext ctx;
     int served = 0;
     bool req_in_flight = false;  // bytes of the current request have arrived
-    bool continue_done = false;  // 100-continue decided for this request
-    std::chrono::steady_clock::time_point head_deadline;
+    bool head_complete = false;  // this request's head is fully buffered
+    clock::time_point head_deadline;  // head phase (flat)
+    clock::time_point body_deadline;  // body phase (rate-credited)
 
     for (;;) {
         if (stopping_.load()) {
@@ -349,7 +351,7 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
         if (pr.state == ParseState::kComplete) {
             buf.erase(0, pr.consumed);  // #11: consume EXACTLY the request
             req_in_flight = false;
-            continue_done = false;
+            head_complete = false;
             ++served;
             const bool last = served >= cfg_.max_requests_per_conn;
             const bool keep = req.keep_alive && !last && !stopping_.load();
@@ -359,15 +361,20 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
             continue;  // parse the next (possibly pipelined) request
         }
         if (pr.state == ParseState::kError) {
-            write_status_response(fd, req.is_head, pr.suggested_status, false);
+            // A pre-parse error has no known method (the parser clears
+            // `out`), so head_request is false -- we may send a body.
+            write_status_response(fd, false, pr.suggested_status, false);
             return;  // #1: any parse error closes, never keep-alive
         }
 
-        // kNeedMore: offer 100-continue if the head is in and asks for it.
-        if (!continue_done) {
+        // kNeedMore. The head completing is also the head->body phase
+        // transition: decide 100-continue and arm the body deadline once.
+        if (!head_complete) {
             const std::size_t he = buf.find("\r\n\r\n");
             if (he != std::string_view::npos) {
-                continue_done = true;  // head complete: decision is made
+                head_complete = true;
+                body_deadline = clock::now() +
+                                std::chrono::milliseconds(cfg_.head_deadline_ms);
                 if (head_requests_continue(std::string_view(buf).substr(0,
                                                                         he))) {
                     static constexpr std::string_view k100 =
@@ -381,22 +388,24 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
             }
         }
 
-        int timeout_ms;
+        // Deadline for this wait, by phase. Idle: between requests. Head:
+        // a flat bound (no legitimate size). Body: a rate-credited bound
+        // (token bucket), so a slow-but-steady upload survives while a
+        // staller or dribbler trips. All three surface as poll()==0 below.
+        long rem;
         if (buf.empty()) {
-            timeout_ms = cfg_.idle_timeout_ms;  // between requests
-        } else {
+            rem = cfg_.idle_timeout_ms;  // between requests
+        } else if (!head_complete) {
             if (!req_in_flight) {
                 req_in_flight = true;
-                head_deadline = std::chrono::steady_clock::now() +
+                head_deadline = clock::now() +
                                 std::chrono::milliseconds(cfg_.head_deadline_ms);
             }
-            const long rem = ms_until(head_deadline);
-            if (rem <= 0) {
-                write_status_response(fd, false, 408, false);
-                return;
-            }
-            timeout_ms = static_cast<int>(rem);
+            rem = ms_until(head_deadline);
+        } else {
+            rem = ms_until(body_deadline);
         }
+        const int timeout_ms = rem < 0 ? 0 : static_cast<int>(rem);
 
         pollfd pfds[2] = {{fd, POLLIN, 0}, {wake_r_, POLLIN, 0}};
         const int prd = ::poll(pfds, 2, timeout_ms);
@@ -411,7 +420,7 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
                 return;  // idle keep-alive timeout: close silently
             }
             write_status_response(fd, false, 408, false);
-            return;  // head-receipt deadline tripped
+            return;  // head or body receipt deadline tripped
         }
         if ((pfds[1].revents & POLLIN) != 0) {
             return;  // shutdown
@@ -430,6 +439,21 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
                 return;  // read error
             }
             buf.append(tmp, static_cast<std::size_t>(n));
+            // Body phase: credit the deadline for the bytes just received
+            // (a token bucket). Clamp so a burst cannot bank more than the
+            // base grace ahead of now -- that is what keeps a burst-then-
+            // stall from holding the worker while still never cutting a
+            // client that sustains the minimum rate.
+            if (head_complete && cfg_.min_ingest_bytes_per_sec > 0) {
+                body_deadline += std::chrono::milliseconds(
+                    n * 1000 / cfg_.min_ingest_bytes_per_sec);
+                const auto cap =
+                    clock::now() +
+                    std::chrono::milliseconds(cfg_.head_deadline_ms);
+                if (body_deadline > cap) {
+                    body_deadline = cap;
+                }
+            }
         }
     }
 }
@@ -450,6 +474,13 @@ bool Server::handle_request(int fd, const Request& req, bool keep) {
         if (!write_all_deadline(fd, out, wake_r_, cfg_.write_deadline_ms,
                                 stopping_)) {
             return false;
+        }
+        if (req.is_head) {
+            // RFC 9110: a HEAD response carries the headers a GET would
+            // (Transfer-Encoding included) but NO body -- do not run the
+            // provider or write any chunk, or the client reads them as
+            // the next response and the keep-alive stream desyncs.
+            return keep;
         }
         ServerSink sink(fd, wake_r_, cfg_.write_deadline_ms, stopping_);
         res.provider(sink);
