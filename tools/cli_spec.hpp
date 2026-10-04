@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -8,6 +11,39 @@
 #include "locus/config/config_file.hpp"
 
 namespace locus_tools {
+
+/**
+ * Parses `s` as a non-negative value in [0, INT_MAX]. Returns true and
+ * sets `out` on success; false on empty input, trailing non-digit junk,
+ * a negative value, or a value out of range (ERANGE from strtol, or
+ * above INT_MAX before the narrowing cast).
+ *
+ * This is the ONE guarded integer parse behind every CLI integer flag
+ * (Spec kInt, --device, --layers). The guards exist because strtol
+ * returns a long: on LP64 a value above INT_MAX passes a `< 0` test and
+ * then truncates on the cast to int/uint32_t (2^31 -> INT_MIN, 2^32 ->
+ * 0), which silently yields a DIFFERENT value than the user typed. The
+ * three callers had drifted apart (one hardened, two not), so they now
+ * share this -- a fix here is a fix in all of them.
+ *
+ * @param s The candidate string (a whole token; no surrounding space).
+ * @param out Set to the parsed value only when the function returns true.
+ * @returns true iff `s` is a valid non-negative integer in [0, INT_MAX].
+ */
+inline bool parse_nonneg_int(const std::string& s, int& out) {
+    if (s.empty()) {
+        return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const long v = std::strtol(s.c_str(), &end, 10);
+    if (*end != '\0' || errno == ERANGE || v < 0 ||
+        v > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    out = static_cast<int>(v);
+    return true;
+}
 
 /**
  * Whether a directive takes a parameter, and of what type. One enum
@@ -194,18 +230,13 @@ class Spec {
 
   private:
     static int parse_int(const std::string& v, const std::string& name) {
-        try {
-            std::size_t used = 0;
-            const long x = std::stol(v, &used);
-            if (used != v.size() || x < 0 || x > 2147483647L) {
-                throw std::out_of_range(name);
-            }
-            return static_cast<int>(x);
-        } catch (const std::exception&) {
+        int out = 0;
+        if (!parse_nonneg_int(v, out)) {
             throw std::runtime_error(
                 "'" + name +
                 "' must be a non-negative integer, got '" + v + "'");
         }
+        return out;
     }
 
     std::vector<Directive<Opt>> d_;
