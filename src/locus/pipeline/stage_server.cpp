@@ -632,7 +632,17 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // would have taken it), tear it down. Clean iff it closed at a frame
     // boundary (nothing half-read) and the socket did not error.
     auto maybe_finish = [&](MuxSession& s) {
-        if (s.eof && !s.in_flight && !s.cancelled) {
+        // Also gate on `connecting`, for the same reason pump() does: a
+        // frame read while the dial is still in flight stays in inbuf
+        // (pump is a no-op), so in_flight is false, and finishing here
+        // would drop the session and discard that frame -- breaking the
+        // "a client that half-closes still gets its answer" rule below.
+        // Deferring cannot hang: dial_deadline / retry_at /
+        // reconnect_attempts bound the dial, and try_dial drops the
+        // session once the pool is exhausted. The connect-success branch
+        // re-runs pump() then maybe_finish() in that order, so a frame
+        // buffered mid-dial is delivered first and the EOF honored after.
+        if (s.eof && !s.in_flight && !s.cancelled && !s.connecting) {
             begin_drop(s, !s.read_error && s.inbuf.empty());
         }
     };
@@ -911,6 +921,27 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 ::close(in_fd);
                 result = false;
                 break;
+            }
+            // A SIGHUP can replace pool_live wholesale, and build_runtime
+            // accepts a config with no downstream directives, so the pool
+            // can be empty here even though the initial one was not. Drop
+            // the session (there is nothing to dial) rather than fall into
+            // the `% pool_live.size()` below -- a divide by zero. Same
+            // permanent-misconfig-at-accept shape as the no-resolver case;
+            // per-session, not fatal (a later reload may restore the pool).
+            if (pool_live.empty()) {
+                std::fprintf(stderr,
+                             "serve_stage_mux: session dropped: no "
+                             "downstream configured\n");
+                ::close(in_fd);
+                all_clean = false;
+                ++completed;
+                if (conn_live.serve_sessions > 0 &&
+                    completed >= conn_live.serve_sessions) {
+                    result = all_clean;
+                    break;
+                }
+                continue;
             }
             // Permanent misconfiguration, caught once at accept rather
             // than rediscovered each sweep: with no resolver the dial
