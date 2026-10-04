@@ -159,6 +159,23 @@ struct Response {
 bool write_response(const Response& res, bool head_request,
                     bool keep_alive, std::string& out, std::string& err);
 
+/**
+ * Serializes the HEAD of a CHUNKED (streaming) response into `out`
+ * (appended): status line, the caller's headers, `Transfer-Encoding:
+ * chunked`, and a Connection header from `keep_alive`. The body then
+ * follows as encode_chunk() calls terminated by last_chunk(). Used for
+ * SSE, where the length is not known up front.
+ *
+ * `res.body` is ignored (a stream has none). The same injection guard as
+ * write_response applies: a CR/LF/NUL in any header name/value, or a
+ * caller-set framing header (Content-Length / Transfer-Encoding /
+ * Connection), is an error (returns false, sets `err`, writes nothing).
+ *
+ * @returns true on success; false (with `err`) if a header is unsafe.
+ */
+bool write_chunked_head(const Response& res, bool keep_alive,
+                        std::string& out, std::string& err);
+
 /** @returns the reason phrase for a status code ("OK", "Not Found", ...),
  * or "" if the code is not one this server emits. */
 std::string status_reason(int status);

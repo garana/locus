@@ -524,6 +524,7 @@ std::string status_reason(int status) {
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
         case 503: return "Service Unavailable";
+        case 505: return "HTTP Version Not Supported";
         default:  return {};
     }
 }
@@ -538,10 +539,13 @@ bool header_safe(std::string_view s) {
            s.find('\0') == std::string_view::npos;
 }
 
-}  // namespace
-
-bool write_response(const Response& res, bool head_request,
-                    bool keep_alive, std::string& out, std::string& err) {
+// Validates and emits the status line + the caller's headers into `out`
+// (appended). Does NOT emit framing (Content-Length / Transfer-Encoding)
+// or the Connection header -- the caller owns those. On any failure `out`
+// is left untouched (every header is validated before the first byte is
+// written), so the "writes nothing on error" contract holds.
+bool write_status_and_headers(const Response& res, std::string& out,
+                              std::string& err) {
     const std::string reason = status_reason(res.status);
     if (reason.empty()) {
         err = "unsupported status code";
@@ -570,6 +574,16 @@ bool write_response(const Response& res, bool head_request,
         out += v;
         out += "\r\n";
     }
+    return true;
+}
+
+}  // namespace
+
+bool write_response(const Response& res, bool head_request,
+                    bool keep_alive, std::string& out, std::string& err) {
+    if (!write_status_and_headers(res, out, err)) {
+        return false;
+    }
     out += "Content-Length: ";
     out += std::to_string(res.body.size());
     out += "\r\n";
@@ -579,6 +593,18 @@ bool write_response(const Response& res, bool head_request,
     if (!head_request) {
         out += res.body;
     }
+    return true;
+}
+
+bool write_chunked_head(const Response& res, bool keep_alive,
+                        std::string& out, std::string& err) {
+    if (!write_status_and_headers(res, out, err)) {
+        return false;
+    }
+    out += "Transfer-Encoding: chunked\r\n";
+    out += "Connection: ";
+    out += keep_alive ? "keep-alive" : "close";
+    out += "\r\n\r\n";
     return true;
 }
 
