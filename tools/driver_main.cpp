@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "cli_spec.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/pipeline/driver.hpp"
 #include "locus/pipeline/net.hpp"
@@ -48,15 +49,19 @@ int main(int argc, char** argv) {
     double temp = 0.0;
     unsigned long long seed = 0;
 
+    // Shares the one guarded parse (parse_nonneg_int, cli_spec.hpp) with
+    // the stage tool's flags, so an empty value / junk / overflow is
+    // rejected here the same way -- the previous inline strtol let ""
+    // through as 0 (strtol does no conversion and leaves end at the
+    // start, which for "" is also the terminator).
     const auto as_int = [](const std::string& v, const char* name) -> int {
-        char* e = nullptr;
-        const long x = std::strtol(v.c_str(), &e, 10);
-        if (*e != '\0' || x < 0 || x > 2147483647L) {
+        int x = 0;
+        if (!locus_tools::parse_nonneg_int(v, x)) {
             std::fprintf(stderr, "%s must be a non-negative integer\n",
                          name);
             std::exit(2);
         }
-        return static_cast<int>(x);
+        return x;
     };
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
