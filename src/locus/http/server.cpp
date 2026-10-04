@@ -216,8 +216,10 @@ void ServerResponse::set_chunked_content_provider(std::string content_type,
     provider = std::move(p);
 }
 
-Server::Server(ServerConfig cfg, Handler handler)
-    : cfg_(std::move(cfg)), handler_(std::move(handler)) {}
+Server::Server(ServerConfig cfg, Handler handler, HeadHandler head_handler)
+    : cfg_(std::move(cfg)),
+      handler_(std::move(handler)),
+      head_handler_(std::move(head_handler)) {}
 
 Server::~Server() { stop(); }
 
@@ -336,9 +338,11 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
     using clock = std::chrono::steady_clock;
     std::string buf;
     ParseContext ctx;
+    RequestContext req_ctx;      // head stage -> handler, per request
     int served = 0;
     bool req_in_flight = false;  // bytes of the current request have arrived
-    bool head_complete = false;  // this request's head is fully buffered
+    bool head_seen = false;      // this request's head is fully buffered
+    bool continue_done = false;  // 100-continue decided for this request
     clock::time_point head_deadline;  // head phase (flat)
     clock::time_point body_start;     // when the head completed
     clock::time_point body_deadline;  // body phase (rate-credited)
@@ -348,16 +352,49 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
         if (stopping_.load()) {
             return;
         }
+
+        // The head completing is the head->body transition. Do it ONCE
+        // per request, at the top so it runs for a bodyless request too
+        // (a GET never reaches the kNeedMore path below): arm the body
+        // deadline and run the optional head stage (auth/policy) before
+        // the body is read and before any 100. A reject fills `res`
+        // (status AND body) and closes; a parse_head error is left for
+        // parse_request below to report identically.
+        if (!head_seen && buf.find("\r\n\r\n") != std::string_view::npos) {
+            head_seen = true;
+            body_start = clock::now();
+            body_bytes = 0;
+            body_deadline =
+                body_start + std::chrono::milliseconds(cfg_.head_deadline_ms);
+            if (head_handler_) {
+                Request head_req;
+                if (parse_head(buf, cfg_.limits, head_req).state ==
+                    ParseState::kComplete) {
+                    ServerResponse hres;
+                    if (head_handler_(head_req, hres, req_ctx)) {
+                        write_buffered_response(fd, hres, head_req.is_head,
+                                                false);
+                        return;  // reject on the head: no 100, close (#10/#1)
+                    }
+                }
+            }
+        }
+
         Request req;
         const ParseResult pr = parse_request(buf, cfg_.limits, ctx, req);
         if (pr.state == ParseState::kComplete) {
             buf.erase(0, pr.consumed);  // #11: consume EXACTLY the request
-            req_in_flight = false;
-            head_complete = false;
             ++served;
             const bool last = served >= cfg_.max_requests_per_conn;
             const bool keep = req.keep_alive && !last && !stopping_.load();
-            if (!handle_request(fd, req, keep) || !keep) {
+            const bool ok = handle_request(fd, req, req_ctx, keep);
+            // Reset per-request state before the next pipelined request.
+            head_seen = false;
+            req_in_flight = false;
+            continue_done = false;
+            body_bytes = 0;
+            req_ctx = RequestContext{};
+            if (!ok || !keep) {
                 return;  // write failed, or keep-alive declined: close
             }
             continue;  // parse the next (possibly pipelined) request
@@ -369,36 +406,17 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
             return;  // #1: any parse error closes, never keep-alive
         }
 
-        // kNeedMore. The head completing is also the head->body phase
-        // transition: decide 100-continue and arm the body deadline once.
-        if (!head_complete) {
+        // kNeedMore: the head is in (head_seen) and the body is pending.
+        // Offer 100-continue once, if the client asked for it.
+        if (head_seen && !continue_done) {
+            continue_done = true;
             const std::size_t he = buf.find("\r\n\r\n");
-            if (he != std::string_view::npos) {
-                head_complete = true;
-                body_start = clock::now();
-                body_bytes = 0;
-                body_deadline = body_start +
-                                std::chrono::milliseconds(cfg_.head_deadline_ms);
-                // INCREMENT 3 HOOK POINT. This is where a head-stage
-                // callback runs: the head is fully buffered, the body has
-                // not been read, and no 100 has been sent. Increment 3
-                // adds an optional head handler (a constructor argument
-                // beside Handler, NOT in ServerConfig -- config is data,
-                // callbacks are behaviour) invoked here with a head-only
-                // Request from parse_head(); if it returns a reject status
-                // we send that status, do NOT send 100, and close (rules
-                // #10 and #1), so auth/caps decide on the head and a 401
-                // never costs a full upload. See parse_head's contract in
-                // http.hpp.
-                if (head_requests_continue(std::string_view(buf).substr(0,
-                                                                        he))) {
-                    static constexpr std::string_view k100 =
-                        "HTTP/1.1 100 Continue\r\n\r\n";
-                    if (!write_all_deadline(fd, k100, wake_r_,
-                                            cfg_.write_deadline_ms,
-                                            stopping_)) {
-                        return;  // client gone
-                    }
+            if (head_requests_continue(std::string_view(buf).substr(0, he))) {
+                static constexpr std::string_view k100 =
+                    "HTTP/1.1 100 Continue\r\n\r\n";
+                if (!write_all_deadline(fd, k100, wake_r_,
+                                        cfg_.write_deadline_ms, stopping_)) {
+                    return;  // client gone
                 }
             }
         }
@@ -410,7 +428,7 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
         long rem;
         if (buf.empty()) {
             rem = cfg_.idle_timeout_ms;  // between requests
-        } else if (!head_complete) {
+        } else if (!head_seen) {
             if (!req_in_flight) {
                 req_in_flight = true;
                 head_deadline = clock::now() +
@@ -461,7 +479,7 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
             // would otherwise earn nothing). Clamp to now + grace so a
             // burst cannot bank time; a client sustaining the floor stays
             // pinned at the clamp, one below it falls behind and trips.
-            if (head_complete && cfg_.min_ingest_bytes_per_sec > 0) {
+            if (head_seen && cfg_.min_ingest_bytes_per_sec > 0) {
                 body_bytes += static_cast<std::size_t>(n);
                 body_deadline =
                     body_start +
@@ -480,9 +498,26 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
     }
 }
 
-bool Server::handle_request(int fd, const Request& req, bool keep) {
+bool Server::write_buffered_response(int fd, const ServerResponse& res,
+                                     bool head_request, bool keep) {
+    Response r;
+    r.status = res.status;
+    r.headers = res.headers;
+    r.body = res.body;
+    std::string out, werr;
+    if (!write_response(r, head_request, keep, out, werr)) {
+        // A framing/unsafe header from the handler: answer 500 and close.
+        write_status_response(fd, head_request, 500, false);
+        return false;
+    }
+    return write_all_deadline(fd, out, wake_r_, cfg_.write_deadline_ms,
+                              stopping_);
+}
+
+bool Server::handle_request(int fd, const Request& req,
+                            const RequestContext& ctx, bool keep) {
     ServerResponse res;
-    handler_(req, res);
+    handler_(req, res, ctx);
 
     if (res.provider) {
         Response head;
@@ -510,17 +545,7 @@ bool Server::handle_request(int fd, const Request& req, bool keep) {
         return sink.ok() && keep;
     }
 
-    Response r;
-    r.status = res.status;
-    r.headers = res.headers;
-    r.body = res.body;
-    std::string out, werr;
-    if (!write_response(r, req.is_head, keep, out, werr)) {
-        return write_status_response(fd, req.is_head, 500, false), false;
-    }
-    return write_all_deadline(fd, out, wake_r_, cfg_.write_deadline_ms,
-                              stopping_) &&
-           keep;
+    return write_buffered_response(fd, res, req.is_head, keep) && keep;
 }
 
 bool Server::write_status_response(int fd, bool head_request, int status,
