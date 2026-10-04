@@ -148,6 +148,12 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
  * list and repeated-TE rejection, obs-fold rejection, the CTL-in-value
  * rule, and the CL+TE smuggling rejection -- has exactly one home.
  *
+ * Unlike parse_request this takes no ParseContext, by design: the head
+ * is bounded by max_header_bytes, so re-scanning it from the front on
+ * every read is negligible (about that bound times the read count). The
+ * context exists for the UNBOUNDED body, whose re-scan is quadratic
+ * (i#70); the head never needs it.
+ *
  * @param buf The bytes read so far.
  * @param limits Size/count caps (head caps only apply).
  * @param out Filled on kComplete; body left empty.
