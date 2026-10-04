@@ -50,6 +50,7 @@ add_library(locus
     src/locus/server/engine_loop.cpp
     src/locus/server/server.cpp
     src/locus/server/tools.cpp
+    src/locus/http/http.cpp
     src/locus/sys/mmap_file.cpp
     src/locus/sys/poller.cpp
     src/locus/sys/thread_pool.cpp
