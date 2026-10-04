@@ -44,6 +44,7 @@ add_executable(locus_tests
     test_pipeline_driver.cpp
     test_grammar.cpp
     test_http.cpp
+    test_http_server.cpp
     test_sampling.cpp
     test_speculative.cpp
     test_server.cpp
