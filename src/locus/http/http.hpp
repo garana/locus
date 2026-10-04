@@ -129,29 +129,39 @@ struct ParseContext {};
 ParseResult parse_request(std::string_view buf, const Limits& limits,
                           ParseContext& ctx, Request& out);
 
-/*
- * PLANNED (increment 3): parse_head(buf, limits, out) -> ParseResult.
+/**
+ * Parses ONLY the request HEAD (through the blank line), for the
+ * connection server's head-stage hook -- so auth and caps can decide
+ * before the body is read and a 401 need not cost a full upload.
  *
- * A head-only parse for the connection server's head-stage hook (auth +
- * caps decided before the body is read, so a 401 does not cost a full
- * upload). Contract to implement against:
- *   - kComplete once the blank line is seen; `consumed` covers through
- *     the CRLFCRLF. It fills method, target, path, query, minor_version,
- *     is_head, keep_alive and headers; body is empty and MUST NOT be read
- *     as meaningful (the body has not arrived).
- *   - Only the head caps apply (max_request_line, max_header_line,
- *     max_header_count, max_header_bytes). NOT max_body_bytes, and no
- *     Content-Length / Transfer-Encoding body framing (that is the full
- *     parse's job).
- *   - It MUST be the existing head phase of parse_request FACTORED OUT,
- *     with parse_request calling it -- never a second head parser. Two
- *     implementations of "what a head means" is how a smuggling
- *     divergence appears, and every head hardening rule (duplicate
- *     Content-Length, the sole-chunked Transfer-Encoding list, obs-fold
- *     rejection, the CTL-in-value rule, the limits) must keep exactly one
- *     home. "Factor the head phase out" is a different change from "add a
- *     parse_head", so it is decided here, before the code lands.
+ * On kComplete `consumed` covers through the CRLFCRLF and `out` holds
+ * method, target, path, query, minor_version, is_head, keep_alive and
+ * headers; out.body is EMPTY and must not be read as meaningful (the body
+ * has not arrived). kNeedMore until the blank line; kError (with a
+ * suggested status) on a malformed head. Only the head caps apply
+ * (max_request_line, max_header_line, max_header_count, max_header_bytes),
+ * not max_body_bytes.
+ *
+ * This is the SAME head phase parse_request runs (one shared
+ * implementation, never a second head parser), so every head hardening
+ * rule -- duplicate Content-Length, the sole-chunked Transfer-Encoding
+ * list and repeated-TE rejection, obs-fold rejection, the CTL-in-value
+ * rule, and the CL+TE smuggling rejection -- has exactly one home.
+ *
+ * Unlike parse_request this takes no ParseContext, by design: the head
+ * is bounded by max_header_bytes, so re-scanning it from the front on
+ * every read is negligible (about that bound times the read count). The
+ * context exists for the UNBOUNDED body, whose re-scan is quadratic
+ * (i#70); the head never needs it.
+ *
+ * @param buf The bytes read so far.
+ * @param limits Size/count caps (head caps only apply).
+ * @param out Filled on kComplete; body left empty.
+ * @returns the parse state, bytes consumed through the head, a suggested
+ *   error status, and an error diagnostic.
  */
+ParseResult parse_head(std::string_view buf, const Limits& limits,
+                       Request& out);
 
 /** A response to serialize. `headers` must not contain Content-Length or
  * Transfer-Encoding; the writer sets framing itself. */

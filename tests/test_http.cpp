@@ -5,6 +5,7 @@
 #include "locus/http/http.hpp"
 
 using locus::http::Limits;
+using locus::http::parse_head;
 using locus::http::parse_request;
 using locus::http::ParseState;
 using locus::http::Request;
@@ -497,4 +498,79 @@ TEST_CASE("parse_request: the trailer cap ignores a pipelined next "
     REQUIRE(res.state == ParseState::kComplete);
     REQUIRE(res.consumed == first.size());  // only the first request
     REQUIRE(r.body == "Wiki");
+}
+
+// ---- parse_head: head-only parse for the connection server's head hook ----
+
+TEST_CASE("parse_head: returns on the head alone, before the body",
+          "[http]") {
+    // A declared 1000-byte body that has NOT arrived: parse_request would
+    // be kNeedMore, but parse_head completes on the head.
+    Request r;
+    const std::string head = "POST /x HTTP/1.1\r\nContent-Length: 1000\r\n\r\n";
+    auto res = parse_head(head, Limits{}, r);
+    REQUIRE(res.state == ParseState::kComplete);
+    REQUIRE(res.consumed == head.size());  // through the CRLFCRLF
+    REQUIRE(r.method == "POST");
+    REQUIRE(r.path == "/x");
+    REQUIRE(r.get_header_value("content-length") == "1000");
+    REQUIRE(r.body.empty());  // body not read
+
+    // parse_request on the same bytes still waits for the body.
+    Request r2;
+    locus::http::ParseContext ctx;
+    REQUIRE(parse_request(head, Limits{}, ctx, r2).state ==
+            ParseState::kNeedMore);
+}
+
+TEST_CASE("parse_head: a partial head is kNeedMore; a malformed head "
+          "carries the suggested status", "[http]") {
+    Request r;
+    REQUIRE(parse_head("GET / HTTP/1.1\r\nHost: h\r\n", Limits{}, r).state ==
+            ParseState::kNeedMore);  // no blank line yet
+    auto bad = parse_head("GET / HTTP/2.0\r\n\r\n", Limits{}, r);
+    REQUIRE(bad.state == ParseState::kError);
+    REQUIRE(bad.suggested_status == 505);  // same head rules as the full parse
+}
+
+TEST_CASE("parse_head: head caps apply, max_body_bytes does not", "[http]") {
+    // A huge declared body is a BODY concern; the head parses regardless,
+    // so the hook can run auth/caps and decide before reading the body.
+    Limits lim;
+    lim.max_body_bytes = 8;
+    Request r;
+    const std::string head =
+        "POST /x HTTP/1.1\r\nContent-Length: 100000\r\n\r\n";
+    REQUIRE(parse_head(head, lim, r).state == ParseState::kComplete);
+    // But a header-section cap still bites.
+    lim.max_header_bytes = 4;
+    Request r2;
+    REQUIRE(parse_head(head, lim, r2).state == ParseState::kError);
+}
+
+TEST_CASE("parse_head agrees with parse_request on the head (one home)",
+          "[http]") {
+    // The head-only parse and the full parse must produce the same head,
+    // since they share one implementation.
+    const std::string req =
+        "POST /a?b=1 HTTP/1.1\r\nHost: h\r\nX-One: y\r\n"
+        "Connection: close\r\nContent-Length: 2\r\n\r\nhi";
+    Request hr;
+    auto h = parse_head(req, Limits{}, hr);
+    REQUIRE(h.state == ParseState::kComplete);
+    Request fr;
+    locus::http::ParseContext ctx;
+    auto f = parse_request(req, Limits{}, ctx, fr);
+    REQUIRE(f.state == ParseState::kComplete);
+    REQUIRE(hr.method == fr.method);
+    REQUIRE(hr.target == fr.target);
+    REQUIRE(hr.path == fr.path);
+    REQUIRE(hr.query == fr.query);
+    REQUIRE(hr.minor_version == fr.minor_version);
+    REQUIRE(hr.is_head == fr.is_head);
+    REQUIRE(hr.keep_alive == fr.keep_alive);  // both see Connection: close
+    REQUIRE_FALSE(hr.keep_alive);
+    REQUIRE(hr.headers == fr.headers);
+    REQUIRE(hr.body.empty());      // head-only
+    REQUIRE(fr.body == "hi");      // full parse read the body
 }
