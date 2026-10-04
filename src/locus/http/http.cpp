@@ -226,11 +226,26 @@ static std::size_t pending_len(std::string_view buf, std::size_t from) {
     return end - from;
 }
 
-// The parse itself; re-scans from the front of `buf` each call and does
-// not touch ParseContext. The public parse_request wraps this and owns
-// the context lifetime (see below).
-static ParseResult parse_one(std::string_view buf, const Limits& limits,
-                             Request& out) {
+// Body-framing signals the head phase hands to the full parse.
+struct HeadInfo {
+    std::size_t body_pos = 0;         // offset just past the blank line
+    bool has_te = false;
+    bool have_content_length = false;
+    std::uint64_t content_length = 0;
+};
+
+// The HEAD phase, the single home for everything that validates a request
+// head: request line, the implemented-method and version checks, every
+// header rule (duplicate Content-Length, the sole-chunked Transfer-
+// Encoding list and the repeated-TE rejection, obs-fold, the CTL-in-value
+// rule, the size/count caps), the Connection keep-alive decision, and the
+// CL+TE smuggling rejection. Fills `out` (body untouched) and `info`; does
+// NOT read or frame the body. kComplete means the head is fully parsed and
+// info.body_pos is where the body begins. parse_one and the public
+// parse_head both call this -- there must never be a second head parser.
+static ParseResult parse_head_impl(std::string_view buf,
+                                   const Limits& limits, Request& out,
+                                   HeadInfo& info) {
     out = Request{};
 
     // --- Request line: METHOD SP target SP HTTP/1.x CRLF ---
@@ -384,12 +399,34 @@ static ParseResult parse_one(std::string_view buf, const Limits& limits,
         out.keep_alive = list_has_token(conn, "keep-alive");
     }
 
-    // --- Body framing. ---
+    // CL+TE together is a smuggling shape; reject it at the head.
     if (has_te && have_content_length) {
         return err("both Content-Length and Transfer-Encoding");
     }
+    info.body_pos = pos;
+    info.has_te = has_te;
+    info.have_content_length = have_content_length;
+    info.content_length = content_length;
+    ParseResult head_ok;
+    head_ok.state = ParseState::kComplete;
+    head_ok.consumed = pos;
+    return head_ok;
+}
 
-    if (has_te) {
+// The full parse: the head (above, the one home) plus body framing. Still
+// re-scans from the front each call and does not touch ParseContext; the
+// public parse_request wraps this and owns the context lifetime (below).
+static ParseResult parse_one(std::string_view buf, const Limits& limits,
+                             Request& out) {
+    HeadInfo info;
+    const ParseResult head = parse_head_impl(buf, limits, out, info);
+    if (head.state != ParseState::kComplete) {
+        return head;  // need more head bytes, or a head error
+    }
+    const std::size_t pos = info.body_pos;
+
+    // --- Body framing. ---
+    if (info.has_te) {
         // Chunked: [hexsize CRLF data CRLF]* 0 CRLF (trailers) CRLF.
         std::string body;
         std::size_t p = pos;
@@ -469,7 +506,8 @@ static ParseResult parse_one(std::string_view buf, const Limits& limits,
     }
 
     // Content-Length (or none -> empty body).
-    const std::uint64_t clen = have_content_length ? content_length : 0;
+    const std::uint64_t clen =
+        info.have_content_length ? info.content_length : 0;
     if (clen > limits.max_body_bytes) {
         return err("Content-Length exceeds limit", 413);
     }
@@ -496,6 +534,12 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
         ctx = ParseContext{};
     }
     return r;
+}
+
+ParseResult parse_head(std::string_view buf, const Limits& limits,
+                       Request& out) {
+    HeadInfo info;  // body-framing signals discarded: head-only
+    return parse_head_impl(buf, limits, out, info);
 }
 
 void Response::set_header(std::string name, std::string value) {
