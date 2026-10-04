@@ -926,9 +926,18 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             // accepts a config with no downstream directives, so the pool
             // can be empty here even though the initial one was not. Drop
             // the session (there is nothing to dial) rather than fall into
-            // the `% pool_live.size()` below -- a divide by zero. Same
-            // permanent-misconfig-at-accept shape as the no-resolver case;
-            // per-session, not fatal (a later reload may restore the pool).
+            // the `% pool_live.size()` below. That modulo is not merely a
+            // divide by zero: on x86-64 it raises SIGFPE and the stage
+            // dies, but on arm64 (UDIV by zero yields 0) it silently gives
+            // 0, falls into try_dial with an empty pool, and with the
+            // default reconnect_attempts == 0 retries forever -- the
+            // server livelocks and never returns. Same permanent-misconfig-
+            // at-accept shape as the no-resolver case; per-session, not
+            // fatal (a later reload may restore the pool). Reachable ONLY
+            // with a resolver set: without one, the no-numeric-entry check
+            // below already catches an empty pool vacuously, so only the
+            // resolver-configured path (what the CLI always uses) reaches
+            // the modulo -- which is why its test must install a resolver.
             if (pool_live.empty()) {
                 std::fprintf(stderr,
                              "serve_stage_mux: session dropped: no "
