@@ -226,8 +226,11 @@ static std::size_t pending_len(std::string_view buf, std::size_t from) {
     return end - from;
 }
 
-ParseResult parse_request(std::string_view buf, const Limits& limits,
-                          ParseContext&, Request& out) {
+// The parse itself; re-scans from the front of `buf` each call and does
+// not touch ParseContext. The public parse_request wraps this and owns
+// the context lifetime (see below).
+static ParseResult parse_one(std::string_view buf, const Limits& limits,
+                             Request& out) {
     out = Request{};
 
     // --- Request line: METHOD SP target SP HTTP/1.x CRLF ---
@@ -477,6 +480,21 @@ ParseResult parse_request(std::string_view buf, const Limits& limits,
     ParseResult r;
     r.state = ParseState::kComplete;
     r.consumed = pos + static_cast<std::size_t>(clen);
+    return r;
+}
+
+ParseResult parse_request(std::string_view buf, const Limits& limits,
+                          ParseContext& ctx, Request& out) {
+    ParseResult r = parse_one(buf, limits, out);
+    // The context is per-REQUEST, not per-connection-forever: it is only
+    // meaningful while a request is still being accumulated (kNeedMore).
+    // Reset it on any terminal result so the caller cannot carry stale
+    // state into the next request on a keep-alive connection -- the
+    // contract is enforced here, not left to a caller to remember (today
+    // ParseContext is empty so this is a no-op; i#70 relies on it).
+    if (r.state != ParseState::kNeedMore) {
+        ctx = ParseContext{};
+    }
     return r;
 }
 

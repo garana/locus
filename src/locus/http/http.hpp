@@ -80,8 +80,11 @@ struct ParseResult {
 
 /**
  * Per-connection parse state the caller threads across feeds of one
- * request and resets (a fresh value) once that request is kComplete or
- * the connection errors.
+ * request. The caller holds one per connection and passes it on every
+ * feed; it does NOT have to reset it -- parse_request clears the context
+ * itself on any terminal result (kComplete/kError), keeping state only
+ * across kNeedMore, so stale state cannot leak into the next request on
+ * a keep-alive connection.
  *
  * It exists to pin the parse API before the connection loop (increment
  * 2) is written against it: the current implementation re-parses from
