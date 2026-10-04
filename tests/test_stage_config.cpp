@@ -265,6 +265,45 @@ TEST_CASE("build_runtime validates and converts StageOptions",
     REQUIRE_FALSE(locus_tools::build_runtime(bad, scratch).empty());
 }
 
+// The shared guarded integer parse behind every CLI integer flag
+// (i#56): Spec kInt, --device and --layers all route through it, so the
+// overflow guard cannot drift between them again.
+TEST_CASE("parse_nonneg_int guards junk / sign / range", "[config]") {
+    int out = -1;
+    REQUIRE(locus_tools::parse_nonneg_int("0", out));
+    REQUIRE(out == 0);
+    REQUIRE(locus_tools::parse_nonneg_int("2147483647", out));  // INT_MAX
+    REQUIRE(out == 2147483647);
+    // Rejections: empty, trailing junk, negative, and the two overflow
+    // shapes that used to truncate silently.
+    REQUIRE_FALSE(locus_tools::parse_nonneg_int("", out));
+    REQUIRE_FALSE(locus_tools::parse_nonneg_int("12abc", out));
+    REQUIRE_FALSE(locus_tools::parse_nonneg_int("-1", out));
+    REQUIRE_FALSE(locus_tools::parse_nonneg_int("2147483648", out));  // >INT_MAX
+    REQUIRE_FALSE(
+        locus_tools::parse_nonneg_int("4294967296", out));  // 2^32 -> 0
+    REQUIRE_FALSE(locus_tools::parse_nonneg_int(
+        "99999999999999999999", out));  // ERANGE
+}
+
+// i#56: parse_layers must REJECT an out-of-range bound, not truncate it
+// long -> uint32_t and silently serve a different slice. Before the
+// shared helper, "4294967296:4294967301" narrowed to [0,5) and served.
+TEST_CASE("parse_layers rejects an overflowing bound (i#56)", "[config]") {
+    std::uint32_t a = 123, b = 456;
+    REQUIRE(locus_tools::parse_layers("0:4", a, b));  // normal still works
+    REQUIRE(a == 0);
+    REQUIRE(b == 4);
+    // 2^32 would truncate to 0 and 2^32+5 to 5 -> a silent [0,5); reject.
+    REQUIRE_FALSE(
+        locus_tools::parse_layers("4294967296:4294967301", a, b));
+    REQUIRE_FALSE(locus_tools::parse_layers("0:4294967296", a, b));
+    // And the existing contract holds: junk, empty half, A>=B rejected.
+    REQUIRE_FALSE(locus_tools::parse_layers("1:x", a, b));
+    REQUIRE_FALSE(locus_tools::parse_layers(":4", a, b));
+    REQUIRE_FALSE(locus_tools::parse_layers("4:4", a, b));
+}
+
 // i#40: the resolve-* knobs map onto Resolver::Options, with the refresh
 // percent converted to a fraction (the user-facing "75%" -> 0.75).
 TEST_CASE("resolver_options maps the resolve knobs (percent -> fraction)",

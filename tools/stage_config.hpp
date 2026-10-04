@@ -181,20 +181,18 @@ inline std::string resolve_device_binding(const StageOptions& opt,
         return "per-executor device binding (multiple --device) is inc "
                "4b and not yet supported; pass a single --device";
     }
+    // One guarded non-negative-int parse (parse_nonneg_int, cli_spec.hpp)
+    // shared with Spec kInt and parse_layers -- it rejects junk, a
+    // negative ordinal, and an out-of-int value (strtol returns a long,
+    // so on LP64 a value above INT_MAX would pass a < 0 test and then
+    // truncate on the cast, which here would skip cuda_set_device yet
+    // still bind the backend: a silent wrong device).
     const std::string& s = opt.device.front();
-    errno = 0;
-    char* e = nullptr;
-    const long v = std::strtol(s.c_str(), &e, 10);
-    // Reject junk, a negative ordinal, AND an out-of-int value: strtol
-    // returns a long, so on LP64 a value above INT_MAX would pass v<0 and
-    // then truncate on the cast (2^31 becomes INT_MIN, negative), which
-    // would skip cuda_set_device yet still bind the backend (a silent
-    // wrong device). Fail loud instead.
-    if (s.empty() || *e != '\0' || errno == ERANGE || v < 0 ||
-        v > std::numeric_limits<int>::max()) {
+    int dev = 0;
+    if (!parse_nonneg_int(s, dev)) {
         return "bad --device (want a non-negative integer): " + s;
     }
-    out.device = static_cast<int>(v);
+    out.device = dev;
     return "";
 }
 
@@ -258,19 +256,21 @@ inline locus::pipeline::Resolver::Options resolver_options(
     return ro;
 }
 
-/** Parses "A:B" into a half-open layer range, requiring A < B. */
+/** Parses "A:B" into a half-open layer range, requiring A < B. Both
+ * halves go through parse_nonneg_int (cli_spec.hpp), the shared guarded
+ * parse, so an out-of-range bound is REJECTED rather than truncating
+ * long -> uint32_t and silently serving a different slice (e.g.
+ * "4294967296:..." narrowing to 0). */
 inline bool parse_layers(const std::string& s, std::uint32_t& a,
                          std::uint32_t& b) {
     const auto c = s.find(':');
     if (c == std::string::npos) {
         return false;
     }
-    char* e1 = nullptr;
-    char* e2 = nullptr;
-    const long la = std::strtol(s.substr(0, c).c_str(), &e1, 10);
-    const std::string bs = s.substr(c + 1);
-    const long lb = std::strtol(bs.c_str(), &e2, 10);
-    if (*e1 != '\0' || *e2 != '\0' || la < 0 || lb < 0 || la >= lb) {
+    int la = 0;
+    int lb = 0;
+    if (!parse_nonneg_int(s.substr(0, c), la) ||
+        !parse_nonneg_int(s.substr(c + 1), lb) || la >= lb) {
         return false;
     }
     a = static_cast<std::uint32_t>(la);
