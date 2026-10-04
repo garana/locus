@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -17,6 +18,7 @@
 #include "locus/model/transformer.hpp"
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/net.hpp"
+#include "locus/pipeline/resolver.hpp"
 #include "locus/pipeline/stage.hpp"
 #include "locus/pipeline/stage_server.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -858,4 +860,69 @@ TEST_CASE("serve_stage_mux drops a hostname downstream with no resolver",
     server.join();
     REQUIRE(sres.load() == 0);
     ::close(c);
+}
+
+// Issue 39: a reload can replace the pool wholesale, and build_runtime
+// accepts a config with no downstream directives, so pool_live can be
+// empty at accept even though the initial pool was not. The accept path
+// must drop the session rather than reach `% pool_live.size()`: on
+// x86-64 that raises SIGFPE, and on arm64 (where UDIV by zero yields 0)
+// it falls into try_dial with an empty pool and, with the default
+// reconnect_attempts == 0, retries forever -- the server never returns.
+// No signal is needed to drive this: the reload flag is a plain variable
+// and apply() a callback (same harness as test_pipeline_stage's reload).
+TEST_CASE("serve_stage_mux drops a session when a reload empties the pool",
+          "[pipeline][mux][connect][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    const std::uint32_t L = model.hparams().n_layers;
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L);
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+    // A resolver MUST be set for this to reach the guard: with no
+    // resolver the no-numeric-entry check already catches an empty pool
+    // (vacuously, since there is no numeric entry), so only the
+    // resolver-configured path -- what the CLI always uses -- falls
+    // through to the `% pool_live.size()`.
+    locus::pipeline::Resolver resolver(
+        locus::pipeline::Resolver::Options{},
+        [](const std::string&) { return std::vector<std::string>{}; }, {},
+        /*start_thread=*/false);
+    conn.resolver = &resolver;
+
+    // Reload already pending: the loop applies it (emptying the pool) on
+    // the wakeup that the client's connect causes, before accepting.
+    volatile std::sig_atomic_t flag = 1;
+    locus::pipeline::StageReload reload;
+    reload.flag = &flag;
+    reload.apply = [](std::vector<locus::pipeline::Cidr>&,
+                      std::vector<locus::pipeline::HostPort>& p,
+                      locus::pipeline::StageConn&) { p.clear(); };
+
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(stage, ls, {},
+                                                {{"127.0.0.1", pc}}, conn,
+                                                reload)
+                   ? 1
+                   : 0;
+    });
+
+    const int c = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(c >= 0);
+    server.join();  // must return promptly: dropped, not hung, not crashed
+    ::close(c);
+    ::close(lc);
+    REQUIRE(sres.load() == 0);  // ended unclean (nothing to dial)
 }
