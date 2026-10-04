@@ -655,6 +655,40 @@ bool TransformerModel::supports_batch() const {
     return backend_->name != "vulkan";
 }
 
+void TransformerModel::project_head_batch(
+    const backend::Ops& op, std::span<const float> x,
+    std::span<float> xbf, std::span<float> logits,
+    std::uint32_t n) const {
+    // out_w_ (the LM head, n_vocab x n_embd) is the biggest tensor, so
+    // reading it once for the whole batch instead of once per token is a
+    // large win on a bandwidth-bound device (it also lowers single-
+    // request latency, so there is no latency/throughput tradeoff).
+    // Normalize each of the n token hidden states in x (token-major,
+    // n*E) into the scratch xbf, then project the whole batch with ONE
+    // matvec_batch into logits (token-major, n*n_vocab). matvec_batch
+    // already writes the token-major layout logits wants, so no
+    // transpose is needed. In the default path matvec_batch is byte-
+    // identical to n per-token matvec() calls (so the result is bit-for-
+    // bit the per-token head); under LOCUS_BATCH_DEQUANT it follows the
+    // same token-exact (not bit-identical) tradeoff as the rest of the
+    // batched forward.
+    // One bound check closes all three call sites (forward_batch and
+    // forward_batch_decode lack the span check forward_batch_layers
+    // has): logits is caller-supplied, so turn a silent out-of-bounds
+    // write into a thrown error.
+    if (logits.size() != static_cast<std::size_t>(n) * hp_.n_vocab) {
+        throw std::invalid_argument(
+            "project_head_batch: logits span must be n*n_vocab");
+    }
+    const std::uint32_t E = hp_.n_embd;
+    for (std::uint32_t t = 0; t < n; ++t) {
+        const std::size_t o = static_cast<std::size_t>(t) * E;
+        apply_norm({x.data() + o, E}, out_norm_, hp_.rms_eps,
+                   {xbf.data() + o, E});
+    }
+    matvec_batch(op, out_w_, xbf, logits, n);
+}
+
 void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                                kv::PagedKvCache& cache,
                                kv::PagedKvCache::Seq& seq,
@@ -753,14 +787,9 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     // Prefill needs only the last token's logits; speculative verify
     // needs every position's (logits is then n * n_vocab).
     if (all_logits) {
-        const std::uint32_t V = hp_.n_vocab;
-        for (std::uint32_t t = 0; t < n; ++t) {
-            apply_norm({x.data() + static_cast<std::size_t>(t) * E, E},
-                    out_norm_, hp_.rms_eps, ws.xb);
-            matvec_mt(op, out_w_, ws.xb,
-                      logits.subspan(static_cast<std::size_t>(t) * V,
-                                     V));
-        }
+        // Speculative verify needs every position's logits; amortize the
+        // head over all n positions (i#52).
+        project_head_batch(op, x, xbf, logits, n);
     } else {
         const std::size_t last = static_cast<std::size_t>(n - 1) * E;
         apply_norm({x.data() + last, E}, out_norm_, hp_.rms_eps, ws.xb);
@@ -789,7 +818,6 @@ void TransformerModel::forward_batch_decode(
     const Ops op = effective_ops(backend_, q8k_activations_);
     const std::uint32_t E = hp_.n_embd;
     const std::uint32_t ff = hp_.n_ff;
-    const std::uint32_t V = hp_.n_vocab;
 
     // Each token is an independent sequence at its own position.
     std::vector<std::uint32_t> pos(n);
@@ -856,14 +884,9 @@ void TransformerModel::forward_batch_decode(
         }
     }
 
-    // Every decode token needs logits.
-    for (std::uint32_t t = 0; t < n; ++t) {
-        const std::size_t o = static_cast<std::size_t>(t) * E;
-        apply_norm({x.data() + o, E}, out_norm_, hp_.rms_eps, ws.xb);
-        matvec_mt(op, out_w_, ws.xb,
-                  logits.subspan(static_cast<std::size_t>(t) * V,
-                                 V));
-    }
+    // Every decode token needs logits; amortize the head over the batch
+    // (i#52).
+    project_head_batch(op, x, xbf, logits, n);
     for (std::uint32_t t = 0; t < n; ++t) {
         seqs[t]->n_tokens = pos[t] + 1;
     }
@@ -985,13 +1008,9 @@ void TransformerModel::forward_batch_layers(
     }
 
     if (last) {
-        // Final stage: normalize, project to logits, consume the token.
-        for (std::uint32_t t = 0; t < n; ++t) {
-            const std::size_t o = static_cast<std::size_t>(t) * E;
-            apply_norm({x.data() + o, E}, out_norm_, hp_.rms_eps, ws.xb);
-            matvec_mt(op, out_w_, ws.xb,
-                      out.subspan(static_cast<std::size_t>(t) * V, V));
-        }
+        // Final stage: project to logits (amortized head, i#52), consume
+        // the token.
+        project_head_batch(op, x, xbf, out, n);
         for (std::uint32_t t = 0; t < n; ++t) {
             seqs[t]->n_tokens = pos[t] + 1;
         }

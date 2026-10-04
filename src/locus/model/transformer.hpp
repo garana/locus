@@ -431,6 +431,16 @@ class TransformerModel {
                     std::span<const float> w, float eps,
                     std::span<float> out) const;
 
+    /** Amortized LM-head projection shared by the batched-forward paths
+     * (i#52): normalizes n token hidden states and projects them through
+     * out_w_ with one matvec_batch instead of n per-token passes. See
+     * the definition for the layout and byte-exactness contract. */
+    void project_head_batch(const backend::Ops& op,
+                            std::span<const float> x,
+                            std::span<float> xbf,
+                            std::span<float> logits,
+                            std::uint32_t n) const;
+
     void moe_ffn(const Layer& lay, Workspace& ws,
                  std::uint32_t layer) const;
 
