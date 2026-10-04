@@ -152,6 +152,20 @@ void check_outw(TransformerModel& model) {
 // model object, so they always use the section's backend. Vulkan is
 // skipped (no batched forward). Convention: test_model_e2e.cpp.
 void sweep_backends(const std::string& path) {
+    // The wrapper's op.matvec fallback branch is reached only on a
+    // backend that leaves Ops::matvec_batch null, which today is avx2
+    // alone. The sweep below therefore cannot reach it on any host
+    // without avx2 (every arm64 one, and any pre-Haswell x86), leaving
+    // the layout path a default modern x86-64 run takes uncovered.
+    // Copying a real backend and nulling that one pointer reaches the
+    // fallback everywhere, so this stays a property of the test rather
+    // than of whoever happens to run it. Declared BEFORE `model` so it
+    // outlives it: use_backend() stores a pointer to the backend, and at
+    // scope exit `model` must not be left pointing into a destroyed `fb`.
+    locus::backend::Backend fb = locus::backend::best_backend();
+    fb.ops.matvec_batch = nullptr;
+    fb.name = "fallback (matvec_batch nulled)";
+
     auto g = locus::gguf::GgufFile::open(path);
     auto model = TransformerModel::load(g);
     REQUIRE(model.supports_batch());
@@ -162,6 +176,12 @@ void sweep_backends(const std::string& path) {
                 check_outw(model);
             }
         }
+    }
+    // Finally the synthetic fallback backend prepared above (see the
+    // comment at its declaration for why it is hoisted before `model`).
+    DYNAMIC_SECTION("backend " << fb.name) {
+        model.use_backend(fb);
+        check_outw(model);
     }
 }
 }  // namespace
