@@ -129,6 +129,30 @@ struct ParseContext {};
 ParseResult parse_request(std::string_view buf, const Limits& limits,
                           ParseContext& ctx, Request& out);
 
+/*
+ * PLANNED (increment 3): parse_head(buf, limits, out) -> ParseResult.
+ *
+ * A head-only parse for the connection server's head-stage hook (auth +
+ * caps decided before the body is read, so a 401 does not cost a full
+ * upload). Contract to implement against:
+ *   - kComplete once the blank line is seen; `consumed` covers through
+ *     the CRLFCRLF. It fills method, target, path, query, minor_version,
+ *     is_head, keep_alive and headers; body is empty and MUST NOT be read
+ *     as meaningful (the body has not arrived).
+ *   - Only the head caps apply (max_request_line, max_header_line,
+ *     max_header_count, max_header_bytes). NOT max_body_bytes, and no
+ *     Content-Length / Transfer-Encoding body framing (that is the full
+ *     parse's job).
+ *   - It MUST be the existing head phase of parse_request FACTORED OUT,
+ *     with parse_request calling it -- never a second head parser. Two
+ *     implementations of "what a head means" is how a smuggling
+ *     divergence appears, and every head hardening rule (duplicate
+ *     Content-Length, the sole-chunked Transfer-Encoding list, obs-fold
+ *     rejection, the CTL-in-value rule, the limits) must keep exactly one
+ *     home. "Factor the head phase out" is a different change from "add a
+ *     parse_head", so it is decided here, before the code lands.
+ */
+
 /** A response to serialize. `headers` must not contain Content-Length or
  * Transfer-Encoding; the writer sets framing itself. */
 struct Response {

@@ -340,7 +340,9 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
     bool req_in_flight = false;  // bytes of the current request have arrived
     bool head_complete = false;  // this request's head is fully buffered
     clock::time_point head_deadline;  // head phase (flat)
+    clock::time_point body_start;     // when the head completed
     clock::time_point body_deadline;  // body phase (rate-credited)
+    std::size_t body_bytes = 0;       // body bytes received this request
 
     for (;;) {
         if (stopping_.load()) {
@@ -373,8 +375,21 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
             const std::size_t he = buf.find("\r\n\r\n");
             if (he != std::string_view::npos) {
                 head_complete = true;
-                body_deadline = clock::now() +
+                body_start = clock::now();
+                body_bytes = 0;
+                body_deadline = body_start +
                                 std::chrono::milliseconds(cfg_.head_deadline_ms);
+                // INCREMENT 3 HOOK POINT. This is where a head-stage
+                // callback runs: the head is fully buffered, the body has
+                // not been read, and no 100 has been sent. Increment 3
+                // adds an optional head handler (a constructor argument
+                // beside Handler, NOT in ServerConfig -- config is data,
+                // callbacks are behaviour) invoked here with a head-only
+                // Request from parse_head(); if it returns a reject status
+                // we send that status, do NOT send 100, and close (rules
+                // #10 and #1), so auth/caps decide on the head and a 401
+                // never costs a full upload. See parse_head's contract in
+                // http.hpp.
                 if (head_requests_continue(std::string_view(buf).substr(0,
                                                                         he))) {
                     static constexpr std::string_view k100 =
@@ -439,14 +454,21 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
                 return;  // read error
             }
             buf.append(tmp, static_cast<std::size_t>(n));
-            // Body phase: credit the deadline for the bytes just received
-            // (a token bucket). Clamp so a burst cannot bank more than the
-            // base grace ahead of now -- that is what keeps a burst-then-
-            // stall from holding the worker while still never cutting a
-            // client that sustains the minimum rate.
+            // Body phase: a token bucket. The deadline is the base grace
+            // plus credit earned from the CUMULATIVE body bytes, so the
+            // ms conversion truncates at most once over the whole body
+            // (not per read -- a stream of sub-millisecond-credit reads
+            // would otherwise earn nothing). Clamp to now + grace so a
+            // burst cannot bank time; a client sustaining the floor stays
+            // pinned at the clamp, one below it falls behind and trips.
             if (head_complete && cfg_.min_ingest_bytes_per_sec > 0) {
-                body_deadline += std::chrono::milliseconds(
-                    n * 1000 / cfg_.min_ingest_bytes_per_sec);
+                body_bytes += static_cast<std::size_t>(n);
+                body_deadline =
+                    body_start +
+                    std::chrono::milliseconds(cfg_.head_deadline_ms) +
+                    std::chrono::milliseconds(
+                        static_cast<long long>(body_bytes) * 1000 /
+                        cfg_.min_ingest_bytes_per_sec);
                 const auto cap =
                     clock::now() +
                     std::chrono::milliseconds(cfg_.head_deadline_ms);
