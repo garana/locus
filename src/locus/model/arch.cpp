@@ -545,7 +545,7 @@ std::uint32_t glm_dsa_kv_dim(const Hparams& hp) {
 // expert. Reuses the llama GQA attention math (a clone with bias
 // adds, so llama_attention stays untouched) and the shared MoE
 // forward (gated shared expert via Layer.gate_inp_shexp, wired in
-// model/llama.cpp). ----
+// model/transformer.cpp). ----
 
 void qwen2moe_hparams(const gguf::GgufFile& g, const std::string&,
                       Hparams& hp) {
