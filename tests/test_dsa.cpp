@@ -4,10 +4,10 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "gguf_builder.hpp"
 
-using locus::model::LlamaModel;
+using locus::model::TransformerModel;
 
 namespace {
 
@@ -132,7 +132,7 @@ std::vector<std::vector<float>> run(
     const std::vector<std::byte>& image,
     const std::vector<locus::tok::TokenId>& tokens) {
     auto g = locus::gguf::GgufFile::parse(image);
-    auto model = LlamaModel::load(g);
+    auto model = TransformerModel::load(g);
     auto cache = model.make_cache();
     auto ws = model.make_workspace();
     locus::kv::PagedKvCache::Seq seq;
@@ -156,7 +156,7 @@ TEST_CASE("batched forward matches sequential (deepseek2 MLA)",
     // FFN batched).
     auto img = build_image("deepseek2");
     auto g = locus::gguf::GgufFile::parse(img);
-    auto model = LlamaModel::load(g);
+    auto model = TransformerModel::load(g);
     REQUIRE(model.supports_batch());
     const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 9};
     const auto& hp = model.hparams();

@@ -9,7 +9,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/stage.hpp"
 #include "locus/pipeline/stage_executor.hpp"
@@ -52,7 +52,7 @@ TEST_CASE("StageExecutor runs steps off-thread and matches inline step",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     const std::uint32_t L = model.hparams().n_layers;
     const auto prompt = tok.encode("Once upon a time", true);
@@ -121,7 +121,7 @@ TEST_CASE("StageExecutor reports a failed step rather than throwing",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
 
     int wake[2];

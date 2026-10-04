@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-#include "locus/model/llama.hpp"  // argmax
+#include "locus/model/transformer.hpp"  // argmax
 
 namespace locus::model {
 

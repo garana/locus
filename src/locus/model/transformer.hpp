@@ -90,7 +90,7 @@ struct Hparams {
  * sequences can interleave (DESIGN.md M2/M3). Weights stay in the
  * GGUF mapping; the GgufFile must outlive the model.
  */
-class LlamaModel {
+class TransformerModel {
   public:
     /**
      * Wires up weights and validates shapes against hyperparams.
@@ -113,7 +113,7 @@ class LlamaModel {
      * @throws gguf::Error on missing tensors or shape mismatches; Error
      *     on an empty/inverted layer range.
      */
-    static LlamaModel load(const gguf::GgufFile& g,
+    static TransformerModel load(const gguf::GgufFile& g,
                            std::uint32_t layer_begin = 0,
                            std::uint32_t layer_end = 0);
 
@@ -481,7 +481,7 @@ tok::TokenId argmax(std::span<const float> logits);
  * normalization and expert_weights_scale applied.
  */
 std::vector<std::pair<std::uint32_t, float>> moe_select(
-    const Hparams& hp, const LlamaModel::Layer& lay,
+    const Hparams& hp, const TransformerModel::Layer& lay,
     std::span<float> router_logits);
 
 /**

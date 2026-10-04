@@ -5,7 +5,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/chat/template.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/tok/tokenizer.hpp"
 #include "gguf_builder.hpp"
 
@@ -83,7 +83,7 @@ TEST_CASE("template rendering", "[chat]") {
 namespace {
 
 /** Greedy chat answer for a single user message. */
-std::string chat_answer(const locus::model::LlamaModel& model,
+std::string chat_answer(const locus::model::TransformerModel& model,
                         const locus::tok::Tokenizer& tok,
                         const ChatTemplate& tmpl,
                         const std::string& user, int max_new) {
@@ -122,7 +122,7 @@ TEST_CASE("llama-3.2 Q4_K_M chat matches llama.cpp on every "
         SKIP("model not present (llama-3.2-1b-q4_k_m.gguf)");
     }
     auto g = locus::gguf::GgufFile::open(path);
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::tokenizer_from_gguf(g);
     auto tmpl = ChatTemplate::from_gguf(g);
 
@@ -150,7 +150,7 @@ TEST_CASE("llama-3.2 chat matches the llama.cpp answer",
         SKIP("model not present (llama-3.2-1b-q8_0.gguf)");
     }
     auto g = locus::gguf::GgufFile::open(path);
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::tokenizer_from_gguf(g);
     auto tmpl = ChatTemplate::from_gguf(g);
     REQUIRE(tmpl.family() == Family::kLlama3);

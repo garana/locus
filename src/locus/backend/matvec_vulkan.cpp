@@ -363,7 +363,7 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
     s.ctx.read_buffer(s.xb, std::as_writable_bytes(out));
 }
 
-bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
+bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     kv::PagedKvCache& cache,
                     kv::PagedKvCache::Seq& seq,
                     std::span<float> logits) {
@@ -772,7 +772,7 @@ bool vulkan_forward(const model::LlamaModel& m, tok::TokenId token,
             // models on small hosts; only the picked experts are
             // ever read by the swiglu dispatches below.
             const auto up_expert =
-                [&](const model::LlamaModel::ExpertMat& em,
+                [&](const model::TransformerModel::ExpertMat& em,
                     std::uint32_t e) {
                     return s.upload(
                         em.expert(e).data,

@@ -8,7 +8,7 @@
 #include "backend_cli.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/sys/features.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
 
     try {
         auto g = locus::gguf::GgufFile::open(model_path);
-        auto model = locus::model::LlamaModel::load(g);
+        auto model = locus::model::TransformerModel::load(g);
         model.use_backend(
             locus::backend::resolve_backend(args.choice));
         auto tok_ptr = locus::tok::tokenizer_from_gguf(g);

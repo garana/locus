@@ -8,7 +8,7 @@
 #include "locus/backend/variants.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/tok/tokenizer.hpp"
 
 using locus::engine::Engine;
@@ -23,7 +23,7 @@ std::string model_path() {
 
 /** Single-sequence reference generation via the raw model API. */
 std::vector<locus::tok::TokenId> reference_generate(
-    const locus::model::LlamaModel& model,
+    const locus::model::TransformerModel& model,
     const locus::tok::SpmTokenizer& tok,
     const std::vector<locus::tok::TokenId>& prompt,
     std::uint32_t max_new) {
@@ -56,7 +56,7 @@ TEST_CASE("concurrent streams match single-sequence output",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     const std::vector<std::string> prompts = {
@@ -91,7 +91,7 @@ TEST_CASE("batched prefill matches per-token prefill (engine)",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     REQUIRE(model.supports_batch());  // stories260K is dense llama
     const auto prompt =
@@ -115,7 +115,7 @@ TEST_CASE("batched decode matches the per-sequence scheduler",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     REQUIRE(model.supports_batch());
 
@@ -156,7 +156,7 @@ TEST_CASE("preemption recomputes and still matches",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     auto p0 = tok.encode("Once upon a time", true);
@@ -188,7 +188,7 @@ TEST_CASE("prefix cache reuses KV and stays byte-exact",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     // A prompt longer than one block (16 tokens) so a full block is
     // cacheable.
@@ -226,7 +226,7 @@ TEST_CASE("speculative decoding matches greedy output",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     // A repetitive prompt makes the greedy continuation echo earlier
     // n-grams, so prompt-lookup drafts get accepted (exercises the
@@ -263,7 +263,7 @@ TEST_CASE("engine on the vulkan backend matches CPU output",
         SKIP("no usable Vulkan device / kernels not built");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     auto p0 = tok.encode("Once upon a time", true);
@@ -292,7 +292,7 @@ TEST_CASE("oversized request fails instead of wedging",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     Engine::Config cfg;
@@ -313,7 +313,7 @@ TEST_CASE("admit_error rejects prompts the pool can never hold",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     Engine engine(model, tok.eos_id());  // default full-context pool
@@ -339,7 +339,7 @@ TEST_CASE("un-admissible prompt parks the loop instead of wedging it",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     Engine engine(model, tok.eos_id());
@@ -373,7 +373,7 @@ TEST_CASE("finished requests reclaim their scratch buffers",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     Engine engine(model, tok.eos_id());
     const auto id =
@@ -398,7 +398,7 @@ TEST_CASE("finished request records are evicted (cap + release)",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     Engine::Config cfg;
@@ -443,7 +443,7 @@ TEST_CASE("prefix cache reports reused/cached token accounting",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     Engine::Config cfg;
@@ -485,7 +485,7 @@ TEST_CASE("prefix cache adopts a long prompt without self-eviction",
         SKIP("model not present");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     std::string s;
     for (int i = 0; i < 40; ++i) {
@@ -527,7 +527,7 @@ TEST_CASE("execute-slice: layer-range forward matches full forward",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     const std::uint32_t L = model.hparams().n_layers;
@@ -566,7 +566,7 @@ TEST_CASE("execute-slice: layer-range forward matches full forward",
     // Reference: the real single-call forward().
     auto mono = [&](locus::tok::TokenId t, locus::kv::PagedKvCache& c,
                     locus::kv::PagedKvCache::Seq& s,
-                    locus::model::LlamaModel::Workspace& w,
+                    locus::model::TransformerModel::Workspace& w,
                     std::span<float> out) {
         model.forward(t, c, s, w, out);
     };
@@ -581,7 +581,7 @@ TEST_CASE("execute-slice: layer-range forward matches full forward",
         return [&, bounds](locus::tok::TokenId t,
                            locus::kv::PagedKvCache& c,
                            locus::kv::PagedKvCache::Seq& s,
-                           locus::model::LlamaModel::Workspace& w,
+                           locus::model::TransformerModel::Workspace& w,
                            std::span<float> out) {
             std::vector<float> hidden(E);
             std::vector<float> prev;

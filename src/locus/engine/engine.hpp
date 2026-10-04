@@ -11,7 +11,7 @@
 
 #include "locus/engine/prefix_cache.hpp"
 #include "locus/kv/paged_cache.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/model/sampling.hpp"
 #include "locus/tok/tokenizer.hpp"
 
@@ -146,11 +146,11 @@ class Engine {
      * @param m Loaded model; must outlive the engine.
      * @param eos Token that terminates generation.
      */
-    Engine(const model::LlamaModel& m, tok::TokenId eos,
+    Engine(const model::TransformerModel& m, tok::TokenId eos,
            Config cfg);
 
     /** Same, with default Config. */
-    Engine(const model::LlamaModel& m, tok::TokenId eos);
+    Engine(const model::TransformerModel& m, tok::TokenId eos);
 
     /**
      * Enqueues a prompt for generation.
@@ -272,11 +272,11 @@ class Engine {
      * / overflow) so the caller uses the per-token path. */
     bool spec_decode_step(Request& r);
 
-    const model::LlamaModel& model_;
+    const model::TransformerModel& model_;
     tok::TokenId eos_;
     Config cfg_;
     kv::PagedKvCache cache_;
-    model::LlamaModel::Workspace ws_;
+    model::TransformerModel::Workspace ws_;
     std::vector<float> logits_;
     /** n * n_vocab scratch for the batched-decode step. */
     std::vector<float> batched_logits_;

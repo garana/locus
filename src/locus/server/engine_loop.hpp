@@ -33,7 +33,7 @@ class EngineLoop {
         std::uint32_t cached_prefix_tokens = 0;
     };
 
-    EngineLoop(const model::LlamaModel& m, tok::TokenId eos,
+    EngineLoop(const model::TransformerModel& m, tok::TokenId eos,
                engine::Engine::Config cfg);
     ~EngineLoop();
 

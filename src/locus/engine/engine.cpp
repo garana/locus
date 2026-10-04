@@ -8,7 +8,7 @@
 
 namespace locus::engine {
 
-Engine::Engine(const model::LlamaModel& m, tok::TokenId eos,
+Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
                Config cfg)
     : model_(m),
       eos_(eos),
@@ -22,7 +22,7 @@ Engine::Engine(const model::LlamaModel& m, tok::TokenId eos,
     }
 }
 
-Engine::Engine(const model::LlamaModel& m, tok::TokenId eos)
+Engine::Engine(const model::TransformerModel& m, tok::TokenId eos)
     : Engine(m, eos, Config{}) {}
 
 std::uint64_t Engine::submit(

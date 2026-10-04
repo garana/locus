@@ -9,7 +9,7 @@
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/tok/tokenizer.hpp"
 
 namespace {
@@ -77,7 +77,7 @@ std::string trim(std::string s) {
 namespace {
 
 /** Greedy generation returning the full decoded text. */
-std::string generate_text(locus::model::LlamaModel& model,
+std::string generate_text(locus::model::TransformerModel& model,
                           const locus::tok::SpmTokenizer& tok,
                           const std::string& prompt, int n_gen) {
     auto cache = model.make_cache();
@@ -107,7 +107,7 @@ std::string generate_text(locus::model::LlamaModel& model,
  * next-token logits after each position (one row per input token).
  */
 std::vector<std::vector<float>> teacher_forced_logits(
-    locus::model::LlamaModel& model,
+    locus::model::TransformerModel& model,
     const std::vector<locus::tok::TokenId>& ids,
     locus::kv::KvType kv_type) {
     auto cache = model.make_cache(0, kv_type);
@@ -144,7 +144,7 @@ TEST_CASE("quantized KV cache tracks the F32 forward", "[e2e][kv]") {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(path);
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     // Quantized KV runs on the CPU attention path; force a CPU
     // backend so forward() does not route to the GPU.
@@ -189,7 +189,7 @@ TEST_CASE("quantized KV cache tracks F32 under the CUDA backend",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(path);
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     model.use_backend(*locus::backend::find_backend("cuda"));
 
@@ -250,7 +250,7 @@ TEST_CASE("quantized KV cache tracks F32 under the Vulkan backend",
         SKIP("llama-3.2-1b model not present");
     }
     auto g = locus::gguf::GgufFile::open(path);
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::tokenizer_from_gguf(g);
     model.use_backend(*locus::backend::find_backend("vulkan"));
 
@@ -288,7 +288,7 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
     }
     auto g = locus::gguf::GgufFile::open(path);
     REQUIRE(g.get_string("general.architecture") == "qwen2moe");
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::tokenizer_from_gguf(g);
 
     auto cache = model.make_cache();
@@ -331,7 +331,7 @@ TEST_CASE("qwen2moe runs under opt-in Q8_K-activation mode",
         SKIP("Qwen-MoE model not present (9.5GB, gitignored)");
     }
     auto g = locus::gguf::GgufFile::open(path);
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     model.use_q8k_activations(true);  // the mode under test
     auto tok = locus::tok::tokenizer_from_gguf(g);
     auto cache = model.make_cache();
@@ -374,7 +374,7 @@ TEST_CASE("qwen2moe golden holds under the CUDA backend",
         SKIP("Qwen-MoE model not present (9.5GB, gitignored)");
     }
     auto g = locus::gguf::GgufFile::open(path);
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::tokenizer_from_gguf(g);
     model.use_backend(*locus::backend::find_backend("cuda"));
 
@@ -418,7 +418,7 @@ TEST_CASE("dbrx greedy decode matches the llama.cpp golden",
     }
     auto g = locus::gguf::GgufFile::open(path);
     REQUIRE(g.get_string("general.architecture") == "dbrx");
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::tokenizer_from_gguf(g);
 
     auto cache = model.make_cache();
@@ -462,7 +462,7 @@ TEST_CASE("greedy decode matches the llama.cpp golden output",
     const std::string golden = trim(ss.str());
 
     auto g = locus::gguf::GgufFile::open(path);
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     REQUIRE(trim(generate_text(model, tok, "Once upon a time",
@@ -475,7 +475,7 @@ TEST_CASE("llama-3.2 (BPE + scaled rope) runs consistently",
         SKIP("model not present (llama-3.2-1b-q8_0.gguf)");
     }
     auto g = locus::gguf::GgufFile::open(llama32_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
     REQUIRE(!model.rope_factors().empty());  // llama3 scaling
 
@@ -530,7 +530,7 @@ TEST_CASE("every selectable backend reproduces the golden output",
     const std::string golden = trim(ss.str());
 
     auto g = locus::gguf::GgufFile::open(path);
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     for (const auto& b : locus::backend::backends()) {

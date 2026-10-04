@@ -15,7 +15,7 @@
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/stage.hpp"
 #include "locus/pipeline/stage_executor.hpp"
@@ -159,7 +159,7 @@ TEST_CASE("CUDA stage executor is byte-exact at batch>1 and agrees w/ CPU",
     const int N = 4;
     const std::vector<locus::tok::TokenId> tok = {5, 6, 7, 8};
 
-    auto m_cuda = locus::model::LlamaModel::load(g);
+    auto m_cuda = locus::model::TransformerModel::load(g);
     m_cuda.use_backend(*locus::backend::find_backend("cuda"));
     const std::uint32_t L = m_cuda.hparams().n_layers;
 
@@ -233,7 +233,7 @@ TEST_CASE("CUDA stage executor is byte-exact at batch>1 and agrees w/ CPU",
     // accumulation order differs), so compare argmax, not bits.
     const locus::backend::Backend* cpu = some_cpu_backend();
     REQUIRE(cpu != nullptr);
-    auto m_cpu = locus::model::LlamaModel::load(g);
+    auto m_cpu = locus::model::TransformerModel::load(g);
     m_cpu.use_backend(*cpu);
     {
         PipelineStage s(m_cpu, 0, L);
@@ -271,7 +271,7 @@ TEST_CASE("CUDA batched Q4_K matvec is byte-exact vs per-token",
     locus::backend::cuda_set_device(0);
 
     auto g = locus::gguf::GgufFile::open(q4k_model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     model.use_backend(*locus::backend::find_backend("cuda"));
     const std::uint32_t L = model.hparams().n_layers;
     const int N = 3;

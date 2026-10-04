@@ -6,7 +6,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 
 namespace {
 std::string model_path() {
@@ -30,7 +30,7 @@ TEST_CASE("forward_batch_layers equals N forward_layers (two-stage)",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
     const std::uint32_t E = model.hparams().n_embd;
     const std::uint32_t V = model.hparams().n_vocab;
@@ -104,7 +104,7 @@ TEST_CASE("forward_batch_layers full stack equals N forward_layers",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
     const std::uint32_t V = model.hparams().n_vocab;
     const int N = 3;
@@ -156,7 +156,7 @@ TEST_CASE("forward_batch_layers ragged batch (mixed positions)",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
     const std::uint32_t V = model.hparams().n_vocab;
     const std::uint32_t k = L / 2 == 0 ? 1 : L / 2;

@@ -7,7 +7,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/server/engine_loop.hpp"
 #include "locus/tok/tokenizer.hpp"
 
@@ -38,7 +38,7 @@ TEST_CASE("EngineLoop streams progress incrementally, not all-at-once",
         SKIP("stories260K model not present");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
     locus::engine::Engine::Config cfg;
     locus::server::EngineLoop loop(model, tok.eos_id(), cfg);

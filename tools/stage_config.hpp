@@ -198,7 +198,7 @@ inline std::string resolve_device_binding(const StageOptions& opt,
 
 /**
  * Guards a planned KV footprint against available RAM. `per_worker_bytes`
- * is one worker's committed KV pool (LlamaModel::kv_pool_bytes); the
+ * is one worker's committed KV pool (TransformerModel::kv_pool_bytes); the
  * model's weights are mmap'd (page cache, kernel-evictable) so they are
  * not counted here. required = per_worker_bytes * max(workers, 1).
  *

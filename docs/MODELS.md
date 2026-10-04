@@ -631,15 +631,15 @@ And the two MoE models gate their experts differently:
 
 ## 13. Where each idea lives in the code
 
-| Stage                | Source                                        |
-|----------------------|-----------------------------------------------|
-| outer forward loop   | `LlamaModel::forward` (llama.cpp)             |
-| llama attention      | `llama_attention` (arch.cpp)                  |
-| MLA attention core   | `mla_attention` (arch.cpp)                    |
-| deepseek2 attention  | `deepseek2_attention` -> mla_attention        |
-| glm-dsa attention    | `glm_dsa_attention` (indexer + mla_attention) |
-| dense / MoE FFN      | `LlamaModel::forward` / `moe_ffn` (llama.cpp) |
-| expert routing       | `moe_select` (llama.cpp)                       |
+| Stage                | Source                                                    |
+|----------------------|-----------------------------------------------------------|
+| outer forward loop   | `TransformerModel::forward` (transformer.cpp)             |
+| llama attention      | `llama_attention` (arch.cpp)                              |
+| MLA attention core   | `mla_attention` (arch.cpp)                                |
+| deepseek2 attention  | `deepseek2_attention` -> mla_attention                    |
+| glm-dsa attention    | `glm_dsa_attention` (indexer + mla_attention)             |
+| dense / MoE FFN      | `TransformerModel::forward` / `moe_ffn` (transformer.cpp) |
+| expert routing       | `moe_select` (transformer.cpp)                            |
 
 ## 14. Acronyms
 

@@ -37,7 +37,7 @@ void llama_hparams(const gguf::GgufFile&, const std::string&,
 void llama_attention_tensors(const gguf::GgufFile& g,
                              const std::string& bp,
                              const Hparams& hp,
-                             LlamaModel::Layer& lay) {
+                             TransformerModel::Layer& lay) {
     const std::uint32_t kv_dim = hp.n_kv_heads * hp.head_dim;
     lay.wq = need_mat(g, bp + "attn_q.weight", hp.n_embd,
                       hp.n_embd);
@@ -47,11 +47,11 @@ void llama_attention_tensors(const gguf::GgufFile& g,
                       hp.n_embd);
 }
 
-void llama_attention(const LlamaModel& m,
-                     const LlamaModel::Layer& lay,
+void llama_attention(const TransformerModel& m,
+                     const TransformerModel::Layer& lay,
                      kv::PagedKvCache& cache,
                      kv::PagedKvCache::Seq& seq,
-                     LlamaModel::Workspace& ws, std::uint32_t l,
+                     TransformerModel::Workspace& ws, std::uint32_t l,
                      std::uint32_t pos) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
@@ -216,7 +216,7 @@ void deepseek2_hparams(const gguf::GgufFile& g,
 void deepseek2_attention_tensors(const gguf::GgufFile& g,
                                  const std::string& bp,
                                  const Hparams& hp,
-                                 LlamaModel::Layer& lay) {
+                                 TransformerModel::Layer& lay) {
     const std::uint32_t qk = hp.qk_nope_dim + hp.qk_rope_dim;
     if (hp.q_lora_rank > 0) {
         lay.wq_a = need_mat(g, bp + "attn_q_a.weight", hp.n_embd,
@@ -266,11 +266,11 @@ void deepseek2_attention_tensors(const gguf::GgufFile& g,
  * positions, which is the dense case and bit-identical to the
  * pre-DSA implementation.
  */
-void mla_attention(const LlamaModel& m,
-                   const LlamaModel::Layer& lay,
+void mla_attention(const TransformerModel& m,
+                   const TransformerModel::Layer& lay,
                    kv::PagedKvCache& cache,
                    kv::PagedKvCache::Seq& seq,
-                   LlamaModel::Workspace& ws, std::uint32_t l,
+                   TransformerModel::Workspace& ws, std::uint32_t l,
                    std::uint32_t pos, const std::uint32_t* sel,
                    std::uint32_t n_att) {
     using namespace locus::backend;
@@ -354,11 +354,11 @@ void mla_attention(const LlamaModel& m,
     }
 }
 
-void deepseek2_attention(const LlamaModel& m,
-                         const LlamaModel::Layer& lay,
+void deepseek2_attention(const TransformerModel& m,
+                         const TransformerModel::Layer& lay,
                          kv::PagedKvCache& cache,
                          kv::PagedKvCache::Seq& seq,
-                         LlamaModel::Workspace& ws,
+                         TransformerModel::Workspace& ws,
                          std::uint32_t l, std::uint32_t pos) {
     mla_attention(m, lay, cache, seq, ws, l, pos, nullptr,
                   pos + 1);
@@ -413,7 +413,7 @@ void glm_dsa_hparams(const gguf::GgufFile& g,
 void glm_dsa_attention_tensors(const gguf::GgufFile& g,
                                const std::string& bp,
                                const Hparams& hp,
-                               LlamaModel::Layer& lay) {
+                               TransformerModel::Layer& lay) {
     deepseek2_attention_tensors(g, bp, hp, lay);
     if (hp.idx_heads == 0) {
         return;
@@ -474,11 +474,11 @@ void rope_half(float* x, std::uint32_t d, std::uint32_t pos,
     }
 }
 
-void glm_dsa_attention(const LlamaModel& m,
-                       const LlamaModel::Layer& lay,
+void glm_dsa_attention(const TransformerModel& m,
+                       const TransformerModel::Layer& lay,
                        kv::PagedKvCache& cache,
                        kv::PagedKvCache::Seq& seq,
-                       LlamaModel::Workspace& ws, std::uint32_t l,
+                       TransformerModel::Workspace& ws, std::uint32_t l,
                        std::uint32_t pos) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
@@ -577,7 +577,7 @@ void qwen2moe_hparams(const gguf::GgufFile& g, const std::string&,
 void qwen2moe_attention_tensors(const gguf::GgufFile& g,
                                 const std::string& bp,
                                 const Hparams& hp,
-                                LlamaModel::Layer& lay) {
+                                TransformerModel::Layer& lay) {
     const std::uint32_t kv_dim = hp.n_kv_heads * hp.head_dim;
     lay.wq = need_mat(g, bp + "attn_q.weight", hp.n_embd, hp.n_embd);
     lay.wk = need_mat(g, bp + "attn_k.weight", hp.n_embd, kv_dim);
@@ -593,11 +593,11 @@ void qwen2moe_attention_tensors(const gguf::GgufFile& g,
 // Clone of llama_attention with q/k/v projection bias added right
 // after each projection (before RoPE), matching Qwen2. llama_attention
 // itself is left untouched.
-void qwen2moe_attention(const LlamaModel& m,
-                        const LlamaModel::Layer& lay,
+void qwen2moe_attention(const TransformerModel& m,
+                        const TransformerModel::Layer& lay,
                         kv::PagedKvCache& cache,
                         kv::PagedKvCache::Seq& seq,
-                        LlamaModel::Workspace& ws, std::uint32_t l,
+                        TransformerModel::Workspace& ws, std::uint32_t l,
                         std::uint32_t pos) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
@@ -724,7 +724,7 @@ void dbrx_hparams(const gguf::GgufFile& g, const std::string& p,
 void dbrx_attention_tensors(const gguf::GgufFile& g,
                             const std::string& bp,
                             const Hparams& hp,
-                            LlamaModel::Layer& lay) {
+                            TransformerModel::Layer& lay) {
     const std::uint32_t kv_dim = hp.n_kv_heads * hp.head_dim;
     // Fused Wqkv [n_embd -> n_embd + 2*kv_dim]; held in wq, split at
     // compute time (wk/wv stay empty). No projection bias.
@@ -741,11 +741,11 @@ void dbrx_attention_tensors(const gguf::GgufFile& g,
 // Fused-QKV GQA attention with clip_qkv clamp and NEOX rope. One
 // matvec produces [q|k|v], clamped to +/-8 (DBRX clamp_kqv), then
 // split; the rest mirrors llama_attention. llama_attention untouched.
-void dbrx_attention(const LlamaModel& m,
-                    const LlamaModel::Layer& lay,
+void dbrx_attention(const TransformerModel& m,
+                    const TransformerModel::Layer& lay,
                     kv::PagedKvCache& cache,
                     kv::PagedKvCache::Seq& seq,
-                    LlamaModel::Workspace& ws, std::uint32_t l,
+                    TransformerModel::Workspace& ws, std::uint32_t l,
                     std::uint32_t pos) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();

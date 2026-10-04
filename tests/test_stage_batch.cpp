@@ -9,7 +9,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
-#include "locus/model/llama.hpp"
+#include "locus/model/transformer.hpp"
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/stage.hpp"
 #include "locus/pipeline/stage_executor.hpp"
@@ -69,7 +69,7 @@ TEST_CASE("step_batch equals N step on a full stage (ragged)",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
     const int N = 4;
     const std::vector<int> pre = {2, 0, 3, 1};
@@ -126,7 +126,7 @@ TEST_CASE("step_batch two-stage equals serial step (first + last roles)",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
     REQUIRE(L >= 2);
     const std::uint32_t k = L / 2 == 0 ? 1 : L / 2;
@@ -206,7 +206,7 @@ TEST_CASE("step_batch isolates a bad frame", "[pipeline][batch]") {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
 
     // Solo reference for the two valid tokens (fresh seqs, position 0).
@@ -251,7 +251,7 @@ TEST_CASE("step_batch isolates an out-of-vocab token",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
     const std::uint32_t V = model.hparams().n_vocab;
 
@@ -310,7 +310,7 @@ TEST_CASE("StageExecutor batches distinct sessions transparently",
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
     const int N = 5;
     const std::vector<locus::tok::TokenId> step_tok = {5, 6, 7, 8, 9};
@@ -372,7 +372,7 @@ TEST_CASE("StageExecutor honours a small max_batch", "[executor][batch]") {
         SKIP("model not present; run scripts/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
-    auto model = locus::model::LlamaModel::load(g);
+    auto model = locus::model::TransformerModel::load(g);
     const std::uint32_t L = model.hparams().n_layers;
     const int N = 5;
     const std::vector<locus::tok::TokenId> step_tok = {5, 6, 7, 8, 9};
