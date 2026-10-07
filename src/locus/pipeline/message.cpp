@@ -22,7 +22,8 @@ constexpr std::uint32_t kMaxFrameBytes = 256u * 1024 * 1024;
 bool valid_type(std::uint16_t t) {
     return t == static_cast<std::uint16_t>(MsgType::kToken) ||
            t == static_cast<std::uint16_t>(MsgType::kActivation) ||
-           t == static_cast<std::uint16_t>(MsgType::kLogits);
+           t == static_cast<std::uint16_t>(MsgType::kLogits) ||
+           t == static_cast<std::uint16_t>(MsgType::kSessionEnd);
 }
 
 // Little-endian integer append helpers (portable regardless of host
@@ -147,6 +148,13 @@ Message make_logits(std::uint64_t request_id, std::uint32_t position,
     m.position = position;
     m.data = std::move(logits);
     return m;
+}
+
+Message make_session_end(std::uint64_t request_id) {
+    Message m;
+    m.type = MsgType::kSessionEnd;
+    m.request_id = request_id;
+    return m;  // no position/token/data
 }
 
 void encode(const Message& m, std::string& out) {

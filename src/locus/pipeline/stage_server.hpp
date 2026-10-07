@@ -32,7 +32,11 @@ struct StageConn {
     int keepalive_intvl_s = 2;
     int keepalive_count = 3;
     int serve_sessions = 0;        /**< 0 = serve forever; else stop
-                                    *   after N sessions (for tests). */
+                                    *   after N CONNECTIONS reach their
+                                    *   final end (for tests). A connection
+                                    *   reused across sequences (issue 76
+                                    *   SESSION_END) counts once, at its
+                                    *   teardown -- not per sequence. */
     /**
      * Optional cached hostname resolver (issue 40). When set, a
      * downstream whose host is a name is resolved to an IP through this
