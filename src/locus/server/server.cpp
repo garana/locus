@@ -8,7 +8,6 @@
 #include <utility>
 #include <vector>
 
-#include "httplib.h"
 #include "json.hpp"
 #include "locus/auth/helper_spawn.hpp"
 #include "locus/model/grammar.hpp"
@@ -200,7 +199,6 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
       tok_(tok),
       opt_(std::move(opt)),
       loop_(m, tok.eos_id(), resolve_engine_cfg(opt_)),
-      http_(std::make_unique<httplib::Server>()),
       n_vocab_(m.hparams().n_vocab) {
     if (!opt_.auth_helper_argv.empty()) {
         std::vector<std::unique_ptr<auth::HelperConnection>> conns;
@@ -216,25 +214,11 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         auth_ = std::make_unique<auth::AuthClient>(
             std::move(conns), auth_clock_, opt_.auth_cache);
     }
-    // Bound the request body httplib buffers into memory before any
-    // handler (and thus before authorize()) runs; without this the
-    // default is SIZE_MAX -- an unauthenticated OOM.
-    http_->set_payload_max_length(opt_.max_body_bytes);
-    // Make stop() reliable. httplib's non-Windows default idle
-    // interval is 0, so the accept loop blocks directly in accept();
-    // on macOS/BSD closing the listen socket from stop() does not wake
-    // a thread already parked in accept(), so a graceful stop() (and a
-    // test's server teardown) can hang until an unrelated connection
-    // arrives. A small idle interval makes the loop poll the socket
-    // with select_read instead, so it notices the closed socket and
-    // exits within one interval. select_read still returns immediately
-    // when a connection is pending, so accept latency is unchanged.
-    http_->set_idle_interval(0, 10000);  // 10 ms
     install_routes();
 }
 
-bool OpenAiServer::authorize(const httplib::Request& req,
-                             httplib::Response& res,
+bool OpenAiServer::authorize(const http::Request& req,
+                             http::ServerResponse& res,
                              std::string& identity) {
     if (!auth_) {
         identity.clear();
@@ -324,39 +308,101 @@ OpenAiServer::json_pieces() {
     return pieces_;
 }
 
-OpenAiServer::~OpenAiServer() { http_->stop(); }
+OpenAiServer::~OpenAiServer() {
+    if (http_) {
+        http_->stop();
+    }
+}
+
+OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
+                                           const std::string& path) const {
+    const bool get_like = (method == "GET" || method == "HEAD");
+    if (get_like) {
+        // metrics_path is configurable, so match it first.
+        if (path == opt_.metrics_path) {
+            return Route::kMetrics;
+        }
+        if (path == "/health") {
+            return Route::kHealth;
+        }
+        if (path == "/v1/models") {
+            return Route::kModels;
+        }
+        static const std::string kModelsPrefix = "/v1/models/";
+        if (path.rfind(kModelsPrefix, 0) == 0 &&
+            path.size() > kModelsPrefix.size()) {
+            return Route::kModelById;
+        }
+        return Route::kUnknown;
+    }
+    if (method == "POST") {
+        if (path == "/v1/completions") {
+            return Route::kCompletions;
+        }
+        if (path == "/v1/chat/completions") {
+            return Route::kChat;
+        }
+        if (path == "/v1/messages") {
+            return Route::kMessages;
+        }
+        if (path == "/v1/embeddings") {
+            return Route::kEmbeddings;
+        }
+        return Route::kUnknown;
+    }
+    return Route::kUnknown;
+}
+
+int OpenAiServer::build_and_start(const std::string& host, int port) {
+    http::ServerConfig cfg;
+    cfg.host = host;
+    cfg.port = port;
+    // Preserve the oversize-body 413-on-head cap httplib gave us via
+    // set_payload_max_length: the parser rejects a too-large declared
+    // body on the head, before the body is read.
+    cfg.limits.max_body_bytes = opt_.max_body_bytes;
+    http_ = std::make_unique<http::Server>(std::move(cfg), route_handler_,
+                                           auth_head_);
+    return http_->start();
+}
 
 bool OpenAiServer::listen(const std::string& host, int port) {
-    return http_->listen(host, port);
+    if (build_and_start(host, port) < 0) {
+        return false;
+    }
+    http_->wait();  // serve until stop()
+    return true;
 }
 
 int OpenAiServer::bind_any_port(const std::string& host) {
-    return http_->bind_to_any_port(host);
+    return build_and_start(host, 0);
 }
 
 bool OpenAiServer::listen_after_bind() {
-    return http_->listen_after_bind();
+    if (!http_) {
+        return false;
+    }
+    http_->wait();
+    return true;
 }
 
-void OpenAiServer::stop() { http_->stop(); }
+void OpenAiServer::stop() {
+    if (http_) {
+        http_->stop();
+    }
+}
 
 void OpenAiServer::install_routes() {
-    http_->Get("/health",
-               [](const httplib::Request&, httplib::Response& res) {
-                   res.set_content(json{{"status", "ok"}}.dump(),
-                                   "application/json");
-               });
+    auto handle_health = [](const http::Request&,
+                            http::ServerResponse& res) {
+        res.set_content(json{{"status", "ok"}}.dump(),
+                        "application/json");
+    };
 
-    // OpenAI model listing: locus serves exactly one model.
-    http_->Get(
-        "/v1/models",
-        [this](const httplib::Request& req, httplib::Response& res) {
-            // Gated when auth is on: the model id is deployment info.
-            // (authorize() is a no-op / returns true when auth off.)
-            std::string identity;
-            if (!authorize(req, res, identity)) {
-                return;
-            }
+    // OpenAI model listing: locus serves exactly one model. Auth (when
+    // on) is enforced by the head stage before this runs.
+    auto handle_models = [this](const http::Request&,
+                                http::ServerResponse& res) {
             json entry{{"id", opt_.model_name},
                        {"object", "model"},
                        {"created", 0},
@@ -366,16 +412,15 @@ void OpenAiServer::install_routes() {
                      {"data", json::array({entry})}}
                     .dump(),
                 "application/json");
-        });
-    // Retrieve a single model by id (OpenAI GET /v1/models/{id}).
-    http_->Get(
-        R"(/v1/models/(.+))",
-        [this](const httplib::Request& req, httplib::Response& res) {
-            std::string identity;
-            if (!authorize(req, res, identity)) {
-                return;
-            }
-            if (req.matches[1] != opt_.model_name) {
+    };
+    // Retrieve a single model by id (OpenAI GET /v1/models/{id}). The id
+    // is the path suffix after "/v1/models/" (prefix match; the regex
+    // route retired). Auth enforced by the head stage.
+    auto handle_model_by_id = [this](const http::Request& req,
+                                     http::ServerResponse& res) {
+            const std::string model_id =
+                req.path.substr(std::string("/v1/models/").size());
+            if (model_id != opt_.model_name) {
                 res.status = 404;
                 res.set_content(
                     make_error("model not found").dump(),
@@ -388,20 +433,13 @@ void OpenAiServer::install_routes() {
                                  {"owned_by", "locus"}}
                                 .dump(),
                             "application/json");
-        });
+    };
 
     // Prometheus text-format metrics: request/token counters plus
-    // engine gauges (KV pool, prefix reuse, speculative accepts).
-    http_->Get(
-        opt_.metrics_path,
-        [this](const httplib::Request& req, httplib::Response& res) {
-            // Gated when auth is on: counters/gauges disclose traffic
-            // and capacity. Open (no-op) in the default no-auth mode,
-            // so unauthenticated scrapers keep working there.
-            std::string identity;
-            if (!authorize(req, res, identity)) {
-                return;
-            }
+    // engine gauges (KV pool, prefix reuse, speculative accepts). Auth
+    // (when on) is enforced by the head stage before this runs.
+    auto handle_metrics = [this](const http::Request&,
+                                 http::ServerResponse& res) {
             const auto s = loop_.stats();
             std::string b;
             auto counter = [&](const char* name, const char* help,
@@ -455,17 +493,15 @@ void OpenAiServer::install_routes() {
             gauge("locus_kv_blocks_free", "Free KV cache blocks.",
                   s.free_blocks);
             res.set_content(b, "text/plain; version=0.0.4");
-        });
+    };
 
     // Both endpoints share one implementation; `chat` only changes
-    // how the prompt is built and how the response is shaped.
-    auto handle = [this](const httplib::Request& req,
-                         httplib::Response& res, bool chat) {
-        std::string identity;
-        if (!authorize(req, res, identity)) {
-            return;  // 401 already set
-        }
-        auth_event("create", chat ? "chat" : "completion", identity);
+    // how the prompt is built and how the response is shaped. Auth runs
+    // in the head stage; ctx.identity carries the authenticated id here.
+    auto handle = [this](const http::Request& req,
+                         http::ServerResponse& res,
+                         const http::RequestContext& ctx, bool chat) {
+        auth_event("create", chat ? "chat" : "completion", ctx.identity);
         json body;
         std::string prompt;
         std::uint32_t max_tokens = 16;
@@ -677,7 +713,10 @@ void OpenAiServer::install_routes() {
         res.set_chunked_content_provider(
             "text/event-stream",
             [this, id, chat, rid, sse_object, state, tools_sp,
-             buffer_tools](std::size_t, httplib::DataSink& sink) {
+             buffer_tools](http::Sink& sink) {
+              // The shim calls a provider ONCE; loop until terminal,
+              // one chunk per progress step (httplib re-invoked instead).
+              for (;;) {
                 auto v = loop_.wait_progress(id, *state);
                 std::string payload;
                 if (!buffer_tools) {
@@ -757,28 +796,25 @@ void OpenAiServer::install_routes() {
                     loop_.release(id);
                 }
                 if (!payload.empty() &&
-                    !sink.write(payload.data(),
-                                payload.size())) {
-                    return false;
+                    !sink.write(std::string_view(payload.data(),
+                                                 payload.size()))) {
+                    return;
                 }
                 if (terminal) {
                     sink.done();
-                    return false;
+                    return;
                 }
-                return true;
+              }
             });
     };
 
     // Anthropic Messages API (POST /v1/messages): same engine, its
     // own request/response shape and SSE event sequence, so Claude
     // Code and the Anthropic SDK can target locus directly.
-    auto handle_messages = [this](const httplib::Request& req,
-                                  httplib::Response& res) {
-        std::string identity;
-        if (!authorize(req, res, identity)) {
-            return;
-        }
-        auth_event("create", "messages", identity);
+    auto handle_messages = [this](const http::Request& req,
+                                  http::ServerResponse& res,
+                                  const http::RequestContext& ctx) {
+        auth_event("create", "messages", ctx.identity);
         std::string prompt;
         std::uint32_t max_tokens = 16;
         std::uint32_t input_tokens = 0;
@@ -918,7 +954,9 @@ void OpenAiServer::install_routes() {
         res.set_chunked_content_provider(
             "text/event-stream",
             [this, id, rid, input_tokens, st, tools_sp, buffer_tools](
-                std::size_t, httplib::DataSink& sink) {
+                http::Sink& sink) {
+              // Call-once provider: loop until terminal (see completions).
+              for (;;) {
                 std::string payload;
                 if (!st->started) {
                     json start{
@@ -1070,39 +1108,24 @@ void OpenAiServer::install_routes() {
                     loop_.release(id);
                 }
                 if (!payload.empty() &&
-                    !sink.write(payload.data(), payload.size())) {
-                    return false;
+                    !sink.write(std::string_view(payload.data(),
+                                                 payload.size()))) {
+                    return;
                 }
                 if (terminal) {
                     sink.done();
-                    return false;
+                    return;
                 }
-                return true;
+              }
             });
     };
 
-    http_->Post("/v1/completions",
-                [handle](const httplib::Request& req,
-                         httplib::Response& res) {
-                    handle(req, res, false);
-                });
-    http_->Post("/v1/chat/completions",
-                [handle](const httplib::Request& req,
-                         httplib::Response& res) {
-                    handle(req, res, true);
-                });
-    http_->Post("/v1/messages", handle_messages);
-
     // OpenAI embeddings: pooled hidden state, L2-normalized. `input`
-    // is a string or an array of strings.
-    http_->Post(
-        "/v1/embeddings",
-        [this](const httplib::Request& req, httplib::Response& res) {
-            std::string identity;
-            if (!authorize(req, res, identity)) {
-                return;
-            }
-            auth_event("create", "embeddings", identity);
+    // is a string or an array of strings. Auth runs in the head stage.
+    auto handle_embeddings = [this](const http::Request& req,
+                                    http::ServerResponse& res,
+                                    const http::RequestContext& ctx) {
+            auth_event("create", "embeddings", ctx.identity);
             try {
                 const json body = json::parse(req.body);
                 std::vector<std::string> inputs;
@@ -1147,7 +1170,51 @@ void OpenAiServer::install_routes() {
                 res.set_content(make_error(e.what()).dump(),
                                 "application/json");
             }
-        });
+    };
+
+    // One dispatch handler over all routes (route_of is the single home
+    // for routing, shared with the auth head stage below).
+    route_handler_ = [this, handle_health, handle_models,
+                      handle_model_by_id, handle_metrics, handle,
+                      handle_messages, handle_embeddings](
+                         const http::Request& req, http::ServerResponse& res,
+                         const http::RequestContext& ctx) {
+        switch (route_of(req.method, req.path)) {
+            case Route::kHealth:      handle_health(req, res); break;
+            case Route::kModels:      handle_models(req, res); break;
+            case Route::kModelById:   handle_model_by_id(req, res); break;
+            case Route::kMetrics:     handle_metrics(req, res); break;
+            case Route::kCompletions: handle(req, res, ctx, false); break;
+            case Route::kChat:        handle(req, res, ctx, true); break;
+            case Route::kMessages:    handle_messages(req, res, ctx); break;
+            case Route::kEmbeddings:  handle_embeddings(req, res, ctx); break;
+            case Route::kUnknown:
+                res.status = 404;  // httplib's default: 404, empty body
+                break;
+        }
+    };
+
+    // Auth on the HEAD, before the body: /health is open and an unknown
+    // path 404s without auth (both preserve the pre-port behaviour); every
+    // other route authenticates. On deny authorize() fills the 401 (the
+    // byte-identical shape-B body) and we reject; on allow we thread the
+    // identity to the handler via ctx and proceed.
+    auth_head_ = [this](const http::Request& head, http::ServerResponse& res,
+                        http::RequestContext& ctx) -> bool {
+        switch (route_of(head.method, head.path)) {
+            case Route::kHealth:
+            case Route::kUnknown:
+                return false;  // proceed without auth
+            default: {
+                std::string identity;
+                if (!authorize(head, res, identity)) {
+                    return true;  // reject with the 401 authorize() set
+                }
+                ctx.identity = std::move(identity);
+                return false;  // proceed
+            }
+        }
+    };
 }
 
 }  // namespace locus::server
