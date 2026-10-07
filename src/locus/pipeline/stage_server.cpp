@@ -711,9 +711,25 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         s.dial_deadline = Clock::time_point::max();
         s.retry_at = Clock::time_point::max();
         poller.add(s.in_fd);  // resume reading the next sequence
+        // Same empty-pool hazard the accept path guards (see there): a
+        // reload can empty pool_live after this connection was accepted,
+        // and the `% pool_live.size()` below is a divide by zero -- SIGFPE
+        // on x86-64, a silent reconnect-forever livelock on arm64. With no
+        // downstream to dial, drop the session rather than reach it. The
+        // seq was just reset above, so begin_drop releases an empty seq.
+        if (pool_live.empty()) {
+            std::fprintf(stderr, "serve_stage_mux: session dropped: no "
+                                 "downstream configured\n");
+            begin_drop(s, false);
+            return;
+        }
         s.dial_cursor = cursor;  // round-robin seed, as at accept
         cursor = (cursor + 1) % pool_live.size();
         try_dial(s);  // start the next downstream dial (out_fd was closed)
+        // decode() already consumed the SESSION_END frame (message.cpp
+        // erases it on kComplete), so this pump sees only the NEXT
+        // sequence's buffered bytes -- not SESSION_END again, which would
+        // cycle release/reset forever.
         pump(s);      // process any already-buffered next-sequence frames
     };
 
@@ -794,7 +810,13 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                         continue;  // already freed (should not happen)
                     }
                     if (c.is_release) {
-                        if (cit->second->resetting) {
+                        // resetting AND not cancelled: a drop that raced a
+                        // reset must win (free, not resurrect). Unreachable
+                        // today -- begin_reset unwatches the fds and
+                        // early-returns on cancelled, so nothing drops a
+                        // resetting session -- but the guard removes the
+                        // class rather than relying on that.
+                        if (cit->second->resetting && !cit->second->cancelled) {
                             reset_session(*cit->second);  // reuse the fd
                         } else {
                             free_session(c.session);  // erases the session

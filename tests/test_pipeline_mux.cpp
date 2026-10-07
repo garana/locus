@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -1027,4 +1028,95 @@ TEST_CASE("serve_stage_mux drops a session when a reload empties the pool",
     ::close(c);
     ::close(lc);
     REQUIRE(sres.load() == 0);  // ended unclean (nothing to dial)
+}
+
+// Issue 76 regression: the SESSION_END reset path has its OWN
+// round-robin modulo (cursor % pool_live.size()) and so needs the same
+// empty-pool guard the accept path carries. A reload that empties the
+// pool while a connection is live, then a SESSION_END on it, must DROP
+// the session -- not divide by zero (SIGFPE on x86-64, silent reconnect-
+// forever livelock on arm64). Deterministic: the reload's apply() signals
+// `applied`, and the test sends SESSION_END only after the pool is
+// confirmed emptied, so the reset is guaranteed to see an empty pool.
+TEST_CASE("serve_stage_mux: SESSION_END with an emptied pool drops, no "
+          "divide-by-zero", "[pipeline][mux][connect][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    const std::uint32_t L = model.hparams().n_layers;
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    // A wake pipe so a mid-session reload is applied promptly. The read
+    // end must be non-blocking: the loop drains it with while(read>0),
+    // which blocks on a blocking fd (the real SIGHUP self-pipe is
+    // non-blocking for the same reason).
+    int wfds[2];
+    REQUIRE(::pipe(wfds) == 0);
+    ::fcntl(wfds[0], F_SETFL, ::fcntl(wfds[0], F_GETFL, 0) | O_NONBLOCK);
+
+    PipelineStage stage(model, 0, L);
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+
+    std::atomic<bool> applied{false};
+    volatile std::sig_atomic_t flag = 0;
+    locus::pipeline::StageReload reload;
+    reload.flag = &flag;
+    reload.wake_fd = wfds[0];
+    reload.apply = [&applied](std::vector<locus::pipeline::Cidr>&,
+                              std::vector<locus::pipeline::HostPort>& p,
+                              locus::pipeline::StageConn&) {
+        p.clear();  // empty the pool
+        applied.store(true);
+    };
+
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(stage, ls, {},
+                                                {{"127.0.0.1", pc}}, conn,
+                                                reload)
+                   ? 1
+                   : 0;
+    });
+
+    // Bring a session up on the (non-empty) pool and run one token.
+    Client a;
+    a.request_id = 101;
+    a.to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(a.to_stage >= 0);
+    a.from_stage = locus::pipeline::accept_one(lc, nullptr);
+    REQUIRE(a.from_stage >= 0);
+    a.round_trip(1);
+    REQUIRE(a.ok);
+
+    // Empty the pool via reload, and WAIT until it is applied, so the
+    // SESSION_END below is guaranteed to reset against an empty pool.
+    flag = 1;
+    const char b = 1;
+    REQUIRE(::write(wfds[1], &b, 1) == 1);
+    for (int i = 0; i < 1000 && !applied.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    REQUIRE(applied.load());
+
+    // SESSION_END on the live connection: the reset hits the empty pool
+    // and must drop, not hang/crash.
+    REQUIRE(locus::pipeline::write_message(
+        a.to_stage, locus::pipeline::make_session_end(101)));
+
+    server.join();  // returns promptly iff the guard dropped the session
+    ::close(a.to_stage);
+    ::close(a.from_stage);
+    ::close(lc);
+    ::close(wfds[0]);
+    ::close(wfds[1]);
+    REQUIRE(sres.load() == 0);  // ended unclean: nothing left to dial
 }
