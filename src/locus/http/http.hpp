@@ -86,14 +86,24 @@ struct ParseResult {
  * across kNeedMore, so stale state cannot leak into the next request on
  * a keep-alive connection.
  *
- * It exists to pin the parse API before the connection loop (increment
- * 2) is written against it: the current implementation re-parses from
- * the front of the buffer on every feed (simple and correct, but
- * quadratic in the number of reads for a large chunked body, bounded by
- * max_body_bytes). Issue 70 fills this with resume state so the re-scan
- * is removed WITHOUT changing the loop's signature. Today it carries
- * nothing; pass a default-constructed value, one per connection. */
-struct ParseContext {};
+ * It resumes a CHUNKED body across feeds (issue 70): without it, each
+ * feed re-scanned and re-decoded every chunk received so far, which is
+ * quadratic in the read count for a large dribbled body. The head and a
+ * Content-Length body are cheap to re-scan (head bounded by
+ * max_header_bytes; a Content-Length body is copied only once, at
+ * completion), so only the chunked path carries state here. The fields
+ * are a checkpoint at the last COMPLETED chunk boundary; the outcome is
+ * byte-identical to the re-scan, just O(n). Do not read or write them
+ * directly -- pass a default-constructed value, one per connection. */
+struct ParseContext {
+    bool chunk_active = false;   /**< a chunked body is mid-resume. */
+    std::size_t head_end = 0;    /**< body start the checkpoint anchors to
+                                  *   (guards against a stale context). */
+    std::size_t scan_pos = 0;    /**< next buf offset to parse: the start
+                                  *   of the first not-yet-complete chunk. */
+    std::string body;            /**< decoded bytes of the complete chunks
+                                  *   so far. */
+};
 
 /**
  * Parses ONE request from the front of `buf`. Pure: `buf` is not

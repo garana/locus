@@ -574,3 +574,72 @@ TEST_CASE("parse_head agrees with parse_request on the head (one home)",
     REQUIRE(hr.body.empty());      // head-only
     REQUIRE(fr.body == "hi");      // full parse read the body
 }
+
+// ---- i#70: chunked body resumes across feeds via ParseContext ----
+
+namespace {
+// Feeds `req` to parse_request in growing prefixes `step` bytes at a time
+// through ONE ParseContext (the connection-loop pattern: the buffer grows,
+// the context persists across kNeedMore). Returns the feed that completes
+// (or the last feed) and fills `out` from it.
+locus::http::ParseResult feed_in_steps(std::string_view req, Request& out,
+                                       std::size_t step, Limits limits = {}) {
+    locus::http::ParseContext ctx;
+    locus::http::ParseResult r;
+    for (std::size_t n = step;; n += step) {
+        if (n > req.size()) {
+            n = req.size();
+        }
+        r = parse_request(req.substr(0, n), limits, ctx, out);
+        if (r.state != ParseState::kNeedMore || n == req.size()) {
+            return r;
+        }
+    }
+}
+}  // namespace
+
+TEST_CASE("parse_request: a chunked body resumes to the same result as a "
+          "whole parse (i#70)", "[http]") {
+    const std::string req =
+        "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "4\r\nWiki\r\n5\r\npedia\r\n3\r\n123\r\n0\r\nX-T: v\r\n\r\n";
+    Request whole;
+    locus::http::ParseContext wc;
+    auto w = parse_request(req, Limits{}, wc, whole);
+    REQUIRE(w.state == ParseState::kComplete);
+    REQUIRE(whole.body == "Wikipedia123");
+
+    // Incremental through ONE context, at several step sizes -- the resume
+    // must land on the same body, consumed count and state as the whole.
+    for (std::size_t step : {std::size_t{1}, std::size_t{2}, std::size_t{3},
+                             std::size_t{7}}) {
+        Request inc;
+        auto r = feed_in_steps(req, inc, step);
+        REQUIRE(r.state == ParseState::kComplete);
+        REQUIRE(r.consumed == w.consumed);
+        REQUIRE(inc.body == whole.body);
+    }
+}
+
+TEST_CASE("parse_request: chunked resume over many small chunks is correct",
+          "[http]") {
+    // 100 one-byte chunks: every chunk boundary falls on a separate feed
+    // when fed one byte at a time, exercising the resume checkpoint path.
+    std::string req =
+        "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    std::string expect;
+    for (int i = 0; i < 100; ++i) {
+        const char c = static_cast<char>('a' + (i % 26));
+        req += "1\r\n";
+        req += c;
+        req += "\r\n";
+        expect += c;
+    }
+    req += "0\r\n\r\n";
+
+    Request inc;
+    auto r = feed_in_steps(req, inc, 1);  // one byte per feed
+    REQUIRE(r.state == ParseState::kComplete);
+    REQUIRE(r.consumed == req.size());
+    REQUIRE(inc.body == expect);
+}
