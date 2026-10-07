@@ -75,6 +75,19 @@ TEST_CASE("pipeline message codec round-trips", "[pipeline]") {
         REQUIRE(out.data[1] == -2.0f);
     }
 
+    SECTION("session-end message") {
+        const auto e = locus::pipeline::make_session_end(42);
+        std::string buf;
+        locus::pipeline::encode(e, buf);
+        Message out;
+        std::string err;
+        REQUIRE(locus::pipeline::decode(buf, out, err) ==
+                Decode::kComplete);
+        REQUIRE(out.type == MsgType::kSessionEnd);
+        REQUIRE(out.request_id == 42);
+        REQUIRE(out.data.empty());
+    }
+
     SECTION("two frames decode in sequence (pipelining)") {
         const auto a = activation(1, 2, 3);
         const auto b = locus::pipeline::make_token(9, 8, 7);

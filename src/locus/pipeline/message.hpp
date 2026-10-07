@@ -28,6 +28,11 @@ enum class MsgType : std::uint16_t {
     kToken = 1,       /**< Input token for the first stage. */
     kActivation = 2,  /**< Residual stream between stages. */
     kLogits = 3,      /**< Output logits from the last stage. */
+    kSessionEnd = 4,  /**< End of a sequence on a KEPT-OPEN connection:
+                       *   the receiver frees that request_id's session
+                       *   (releases its KV) but does NOT close the fd, so
+                       *   the next request_id reuses the connection
+                       *   (issue 76 / the downstream pool). No payload. */
 };
 
 /**
@@ -56,6 +61,9 @@ Message make_activation(std::uint64_t request_id,
 /** @returns A kLogits message carrying `logits` (n_vocab floats). */
 Message make_logits(std::uint64_t request_id, std::uint32_t position,
                     std::vector<float> logits);
+/** @returns A kSessionEnd message for `request_id` (no payload); the
+ * receiver frees that session but keeps the connection open for reuse. */
+Message make_session_end(std::uint64_t request_id);
 
 /** Outcome of a buffer decode attempt (mirrors auth::HelperDecode). */
 enum class Decode {
