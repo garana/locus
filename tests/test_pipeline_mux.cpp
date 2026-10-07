@@ -212,6 +212,108 @@ TEST_CASE("serve_stage_mux serves two concurrent sessions in isolation",
     REQUIRE(sres.load() == 1);  // both sessions ended cleanly
 }
 
+// Issue 76: a SESSION_END frame ends a sequence but KEEPS the connection
+// open; the next request_id reuses the SAME inbound fd with a fresh KV
+// seq. The reused sequence must produce exactly what it would on a fresh
+// connection -- proving the reset released the first sequence's KV and
+// did not carry it into the second. A broken reset is silent cross-
+// session KV corruption, which is the hazard the i#68 downstream pool
+// would introduce without this receive-side seam.
+TEST_CASE("serve_stage_mux reuses a connection after SESSION_END, "
+          "KV-isolated", "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const locus::tok::TokenId eos = tok.eos_id();
+    constexpr int kGen = 8;
+
+    const auto pa = tok.encode("Once upon a time, there was a little", true);
+    const auto pb = tok.encode("The quick brown fox jumped over the", true);
+    const auto ref_a = mono_generate(model, pa, eos, kGen);
+    const auto ref_b = mono_generate(model, pb, eos, kGen);
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;  // the one reused connection ends once (after B)
+
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, allow, {{"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    // ONE upstream connection, reused for both sequences.
+    const int to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(to_stage >= 0);
+
+    // Runs a full sequence (prompt + greedy gen) over the shared
+    // connection; each sequence's downstream is the stage's dial, so it is
+    // a fresh accept on the collector. @returns the generated tokens.
+    auto run_seq = [&](std::uint64_t rid,
+                       const std::vector<locus::tok::TokenId>& prompt,
+                       int& from_out) {
+        Client c;
+        c.to_stage = to_stage;  // the shared, reused inbound connection
+        c.request_id = rid;
+        c.from_stage = locus::pipeline::accept_one(lc, nullptr);
+        REQUIRE(c.from_stage >= 0);
+        from_out = c.from_stage;
+        for (const auto t : prompt) {
+            c.round_trip(t);
+        }
+        std::vector<locus::tok::TokenId> gen;
+        for (int i = 0; i < kGen && c.ok; ++i) {
+            const auto n = locus::model::argmax(c.logits);
+            gen.push_back(n);
+            if (n == eos) {
+                break;
+            }
+            c.round_trip(n);
+        }
+        REQUIRE(c.ok);
+        return gen;
+    };
+
+    int a_from = -1, b_from = -1;
+    const auto gen_a = run_seq(101, pa, a_from);
+    REQUIRE(gen_a == ref_a);
+
+    // End sequence A but keep the connection: the stage releases A's KV,
+    // closes A's downstream, and re-dials a fresh one for the next.
+    REQUIRE(locus::pipeline::write_message(
+        to_stage, locus::pipeline::make_session_end(101)));
+
+    // Sequence B on the SAME connection, a new request_id.
+    const auto gen_b = run_seq(202, pb, b_from);
+    REQUIRE(gen_b == ref_b);  // fresh KV: B did not inherit A's cache
+
+    ::close(to_stage);  // ends the reused connection -> server stops
+    server.join();
+    if (a_from >= 0) {
+        ::close(a_from);
+    }
+    if (b_from >= 0) {
+        ::close(b_from);
+    }
+    ::close(lc);
+    REQUIRE(sres.load() == 1);  // the connection's final session ended clean
+}
+
 // The multi-executor form (i#24 inc 3): two executors, two concurrent
 // sessions. The loop pins each session to a different (least-loaded)
 // executor, so they run on separate stages with separate KV caches. Each

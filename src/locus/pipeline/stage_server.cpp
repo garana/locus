@@ -175,6 +175,7 @@ struct MuxSession {
     // the map) until its KV release completes.
     bool in_flight = false;   // a step is queued/running on the executor
     bool cancelled = false;   // dropped; being torn down
+    bool resetting = false;   // SESSION_END: release KV, then REUSE the fd
     bool releasing = false;   // a release has been submitted
     bool eof = false;         // in_fd hit EOF/error; finish when idle
     bool read_error = false;  // that EOF was a socket error (unclean)
@@ -508,6 +509,30 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         }
     };
 
+    // Issue 76: a SESSION_END frame ended the sequence but the peer is
+    // keeping the connection open to reuse it. Release this session's KV
+    // seq (so the next sequence starts clean) but KEEP in_fd; on the
+    // release completion reset_session re-initializes the slot for the
+    // next request_id. Only reached from pump, which decodes a frame only
+    // when !in_flight, so no step holds the seq and the release submits
+    // now. The session stays pinned to its executor (the FIFO release
+    // rule holds; exec_load is unchanged -- the session is still live).
+    auto begin_reset = [&](MuxSession& s) {
+        if (s.cancelled || s.resetting) {
+            return;
+        }
+        s.resetting = true;
+        poller.remove(s.in_fd);  // pause input until the slot is reset
+        if (s.out_watched) {
+            poller.remove(s.out_fd);
+            s.out_watched = false;
+        }
+        if (!s.in_flight && !s.releasing) {
+            executors[s.exec]->submit_release(s.in_fd, &s.seq);
+            s.releasing = true;
+        }
+    };
+
     // Issue 39: drive this session's NON-BLOCKING downstream dial. Tries
     // pool entries from s.dial_cursor within the current sweep, advancing
     // past each that fails synchronously, until one connect is in progress
@@ -623,6 +648,12 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             begin_drop(s, false);
             return;
         }
+        if (in.type == MsgType::kSessionEnd) {
+            // End of this sequence on a kept-open connection: reset the
+            // slot for the next request_id rather than compute anything.
+            begin_reset(s);
+            return;
+        }
         executors[s.exec]->submit_step(s.in_fd, &s.seq, std::move(in));
         s.in_flight = true;
     };
@@ -645,6 +676,45 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         if (s.eof && !s.in_flight && !s.cancelled && !s.connecting) {
             begin_drop(s, !s.read_error && s.inbuf.empty());
         }
+    };
+
+    // Issue 76: re-initialize a session slot after its KV release, on a
+    // SESSION_END (not a drop), so the SAME connection serves the next
+    // request_id. Keeps in_fd and the executor pin; closes the downstream
+    // (the next sequence re-dials -- pooling it is the dial side, i#68)
+    // and clears all per-sequence state to the fresh-session defaults.
+    // Not counted as completed and leaves exec_load untouched: the
+    // session is continuing, not finishing. Runs only from a release
+    // completion, so the executor is done with the old seq.
+    auto reset_session = [&](MuxSession& s) {
+        if (s.out_watched) {
+            poller.remove(s.out_fd);
+        }
+        if (s.out_fd >= 0) {
+            out_index.erase(s.out_fd);
+            ::close(s.out_fd);
+        }
+        s.out_fd = -1;
+        s.out_watched = false;
+        s.outbuf.clear();
+        s.seq = kv::PagedKvCache::Seq{};  // old blocks freed by the release
+        s.in_flight = false;
+        s.releasing = false;
+        s.resetting = false;
+        s.cancelled = false;
+        s.eof = false;
+        s.read_error = false;
+        s.clean_end = true;
+        s.connecting = false;
+        s.dial_tried = 0;
+        s.dial_sweeps = 0;
+        s.dial_deadline = Clock::time_point::max();
+        s.retry_at = Clock::time_point::max();
+        poller.add(s.in_fd);  // resume reading the next sequence
+        s.dial_cursor = cursor;  // round-robin seed, as at accept
+        cursor = (cursor + 1) % pool_live.size();
+        try_dial(s);  // start the next downstream dial (out_fd was closed)
+        pump(s);      // process any already-buffered next-sequence frames
     };
 
     bool result = true;
@@ -724,7 +794,11 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                         continue;  // already freed (should not happen)
                     }
                     if (c.is_release) {
-                        free_session(c.session);  // erases the session
+                        if (cit->second->resetting) {
+                            reset_session(*cit->second);  // reuse the fd
+                        } else {
+                            free_session(c.session);  // erases the session
+                        }
                         continue;
                     }
                     MuxSession& s = *cit->second;
