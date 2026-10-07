@@ -94,12 +94,7 @@ struct ParseResult {
  * completion), so only the chunked path carries state here. The fields
  * are a checkpoint at the last COMPLETED chunk boundary; the outcome is
  * byte-identical to the re-scan, just O(n). Do not read or write them
- * directly -- pass a default-constructed value, one per connection.
- *
- * The caller never resets it: parse_request clears the context on any
- * terminal result (kComplete/kError), keeping state only across
- * kNeedMore, so stale state cannot leak into the next request on a
- * keep-alive connection. */
+ * directly -- pass a default-constructed value, one per connection. */
 struct ParseContext {
     bool chunk_active = false;   /**< a chunked body is mid-resume. */
     std::size_t head_end = 0;    /**< body start the checkpoint anchors to
