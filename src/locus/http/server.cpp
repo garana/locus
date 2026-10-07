@@ -266,10 +266,23 @@ int Server::start() {
     return bound_port_;
 }
 
+void Server::wait() {
+    std::unique_lock<std::mutex> lk(wait_mu_);
+    wait_cv_.wait(lk, [this] { return stopping_.load(); });
+}
+
 void Server::stop() {
     if (stopping_.exchange(true)) {
         return;  // once
     }
+    // Wake any wait() caller. Taking the lock here (even empty) closes the
+    // check-then-block window in wait(): stopping_ is already set above, so
+    // a waiter either sees it and skips blocking, or is blocked and gets
+    // this notify.
+    {
+        std::lock_guard<std::mutex> lk(wait_mu_);
+    }
+    wait_cv_.notify_all();
     if (wake_w_ >= 0) {
         const char b = 1;
         ssize_t w = ::write(wake_w_, &b, 1);  // level-triggered wake-all

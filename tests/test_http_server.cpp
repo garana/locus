@@ -493,3 +493,17 @@ TEST_CASE("http server: a head reject on a POST never reads the body",
     REQUIRE(r.find("Connection: close") != std::string::npos);
     ::close(c);
 }
+
+TEST_CASE("http server: wait() blocks until stop()", "[http_server]") {
+    Fixture f(echo_handler);
+    std::atomic<bool> returned{false};
+    std::thread waiter([&] {
+        f.server.wait();
+        returned.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    REQUIRE_FALSE(returned.load());  // still blocked while serving
+    f.server.stop();
+    waiter.join();
+    REQUIRE(returned.load());  // wait() returned once stopped
+}

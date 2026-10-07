@@ -1,8 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -179,6 +181,10 @@ class Server {
      * pipe watched by each poll), closes the listen socket, and returns
      * once all workers have exited. Safe to call more than once. */
     void stop();
+    /** Blocks until stop() is called (from any thread). Lets a caller
+     * turn the background accept loop into a serve-forever call. Returns
+     * immediately if already stopping. */
+    void wait();
 
  private:
     void worker_loop();
@@ -209,6 +215,8 @@ class Server {
     std::vector<std::thread> workers_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> started_{false};
+    std::mutex wait_mu_;              /**< guards the wait() handoff. */
+    std::condition_variable wait_cv_; /**< signalled by stop(). */
 };
 
 }  // namespace locus::http
