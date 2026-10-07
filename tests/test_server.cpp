@@ -431,7 +431,21 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
                           "application/json");
         REQUIRE(res);
         REQUIRE(res->status == 400);
-        REQUIRE(json::parse(res->body).contains("error"));
+        // OpenAI flat envelope (shape A).
+        auto err_a = json::parse(res->body);
+        REQUIRE(err_a["error"]["type"] == "invalid_request_error");
+
+        // /v1/messages keeps the Anthropic NESTED envelope (shape C): an
+        // outer {"type":"error"} the other routes do not have. Pinned
+        // because the port is exactly when it would get flattened, and
+        // nothing else asserts it.
+        auto m = client.Post("/v1/messages", "{not json",
+                             "application/json");
+        REQUIRE(m);
+        REQUIRE(m->status == 400);
+        auto err_c = json::parse(m->body);
+        REQUIRE(err_c["type"] == "error");
+        REQUIRE(err_c["error"]["type"] == "invalid_request_error");
     }
 
     SECTION("concurrent clients are served") {
@@ -522,10 +536,14 @@ TEST_CASE("auth gates protected routes via a helper", "[server][e2e]") {
     const json req{{"prompt", "Once upon a time"}, {"max_tokens", 4}};
     const std::string ct = "application/json";
 
-    // No credential -> 401.
+    // No credential -> 401. Pin the auth-error envelope (shape B) so a
+    // later refactor cannot silently flatten it to the generic shape --
+    // SDKs branch on error.type to decide whether to re-auth.
     auto r1 = client.Post("/v1/completions", req.dump(), ct);
     REQUIRE(r1);
     REQUIRE(r1->status == 401);
+    REQUIRE(json::parse(r1->body)["error"]["type"] ==
+            "authentication_error");
 
     // Wrong credential -> 401.
     auto r2 = client.Post("/v1/completions",

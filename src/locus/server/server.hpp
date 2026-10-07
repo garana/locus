@@ -9,15 +9,10 @@
 #include "locus/auth/auth_client.hpp"
 #include "locus/chat/template.hpp"
 #include "locus/engine/engine.hpp"
+#include "locus/http/server.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/server/engine_loop.hpp"
 #include "locus/tok/tokenizer.hpp"
-
-namespace httplib {
-class Server;
-struct Request;
-struct Response;
-}
 
 namespace locus::server {
 
@@ -113,7 +108,22 @@ class OpenAiServer {
     /** Engine config with prompt caching resolved from Options:
      * prefix_cache = engine.prefix_cache || prompt_cache. */
     static engine::Engine::Config resolve_engine_cfg(const Options& o);
+    /** Which endpoint a (method, path) hits. One home for routing, used
+     * by both the dispatch handler and the auth head stage. */
+    enum class Route {
+        kHealth, kModels, kModelById, kMetrics,
+        kCompletions, kChat, kMessages, kEmbeddings, kUnknown
+    };
+    /** Classifies a request. GET and HEAD both match the GET routes;
+     * /v1/models/{id} matches by prefix (the regex route retired). */
+    Route route_of(const std::string& method,
+                   const std::string& path) const;
+    /** Builds the dispatch + auth-head handlers into route_handler_ /
+     * auth_head_ (called once, from the ctor). */
     void install_routes();
+    /** Constructs http_ bound to host:port and starts it; @returns the
+     * bound port (>0) or -1. */
+    int build_and_start(const std::string& host, int port);
     /** Lazily builds (once) and returns the token -> decoded-bytes
      * table used by constrained decoding. */
     std::shared_ptr<const std::vector<std::string>> json_pieces();
@@ -124,8 +134,8 @@ class OpenAiServer {
      * Otherwise reads the bearer/x-api-key credential and resolves
      * it; on deny sets a 401 response and returns false.
      */
-    bool authorize(const httplib::Request& req,
-                   httplib::Response& res, std::string& identity);
+    bool authorize(const http::Request& req,
+                   http::ServerResponse& res, std::string& identity);
     /** Fire-and-forget request-lifecycle event to the auth helper
      * (no-op when auth is off). */
     void auth_event(const char* event, const std::string& kind,
@@ -135,7 +145,9 @@ class OpenAiServer {
     const tok::Tokenizer& tok_;
     Options opt_;
     EngineLoop loop_;
-    std::unique_ptr<httplib::Server> http_;
+    http::Handler route_handler_;    /**< dispatch (built in ctor). */
+    http::HeadHandler auth_head_;    /**< auth head stage (built in ctor). */
+    std::unique_ptr<http::Server> http_;
     std::uint32_t n_vocab_ = 0;
 
     // Cumulative counters exposed at GET /metrics (Prometheus text).

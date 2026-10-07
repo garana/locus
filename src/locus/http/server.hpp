@@ -1,8 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -92,8 +94,35 @@ struct ServerResponse {
                                       StreamProvider provider);
 };
 
-/** Fills `res` from `req`, on the connection's worker thread. */
-using Handler = std::function<void(const Request& req, ServerResponse& res)>;
+/**
+ * Per-request state the head stage produces for the handler: whatever a
+ * HeadHandler decides on the head that the Handler needs later (today,
+ * the authenticated identity for the audit event). One per request.
+ */
+struct RequestContext {
+    std::string identity;  /**< set by the head handler; read by Handler. */
+};
+
+/**
+ * Runs once the request HEAD is buffered, BEFORE the body is read and
+ * before any 100-continue -- so auth and policy decide on the head and a
+ * rejected request (e.g. a 401) never buffers its body.
+ *
+ * Return true to REJECT: fill `res` with the full response (status AND
+ * body, so an error keeps its JSON shape); the server writes it and
+ * closes. Return false to PROCEED: `res` is DISCARDED (do NOT stage
+ * response state here -- anything that must reach the response goes
+ * through `ctx`), the body is read, and the Handler runs with the same
+ * `ctx`. `req` is a head-only parse: its body is empty.
+ */
+using HeadHandler = std::function<bool(const Request& head,
+                                       ServerResponse& res,
+                                       RequestContext& ctx)>;
+
+/** Fills `res` from `req` (and the head stage's `ctx`), on the
+ * connection's worker thread. */
+using Handler = std::function<void(const Request& req, ServerResponse& res,
+                                   const RequestContext& ctx)>;
 
 /** Server configuration; every bound is explicit (see the class note). */
 struct ServerConfig {
@@ -138,7 +167,9 @@ struct ServerConfig {
  */
 class Server {
  public:
-    Server(ServerConfig cfg, Handler handler);
+    /** @param head_handler optional; runs on the head before the body
+     * (auth/policy). Null = no head stage. */
+    Server(ServerConfig cfg, Handler handler, HeadHandler head_handler = {});
     ~Server();
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
@@ -150,6 +181,10 @@ class Server {
      * pipe watched by each poll), closes the listen socket, and returns
      * once all workers have exited. Safe to call more than once. */
     void stop();
+    /** Blocks until stop() is called (from any thread). Lets a caller
+     * turn the background accept loop into a serve-forever call. Returns
+     * immediately if already stopping. */
+    void wait();
 
  private:
     void worker_loop();
@@ -157,7 +192,14 @@ class Server {
     /** Runs the handler and writes its response (buffered or streamed).
      * @returns true iff the connection may be kept alive for the next
      * request (write succeeded AND `keep`). */
-    bool handle_request(int fd, const Request& req, bool keep);
+    bool handle_request(int fd, const Request& req, const RequestContext& ctx,
+                        bool keep);
+    /** Serializes a buffered ServerResponse (status + headers + body) and
+     * writes it; a HEAD omits the body. On a framing/unsafe header it
+     * sends a 500 and returns false. @returns true iff the write
+     * succeeded. */
+    bool write_buffered_response(int fd, const ServerResponse& res,
+                                 bool head_request, bool keep);
     /** Writes a minimal status-only response (the reason as a text body).
      * @returns true iff the write succeeded. */
     bool write_status_response(int fd, bool head_request, int status,
@@ -165,6 +207,7 @@ class Server {
 
     ServerConfig cfg_;
     Handler handler_;
+    HeadHandler head_handler_;  /**< optional; null = no head stage. */
     int listen_fd_ = -1;
     int bound_port_ = -1;
     int wake_r_ = -1;         /**< self-pipe read end (shutdown signal). */
@@ -172,6 +215,8 @@ class Server {
     std::vector<std::thread> workers_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> started_{false};
+    std::mutex wait_mu_;              /**< guards the wait() handoff. */
+    std::condition_variable wait_cv_; /**< signalled by stop(). */
 };
 
 }  // namespace locus::http

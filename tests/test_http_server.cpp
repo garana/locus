@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <string>
 #include <thread>
 
@@ -11,6 +12,7 @@
 #include "locus/pipeline/net.hpp"
 
 using locus::http::Request;
+using locus::http::RequestContext;
 using locus::http::Server;
 using locus::http::ServerConfig;
 using locus::http::ServerResponse;
@@ -60,13 +62,30 @@ std::string drain(int fd, int idle_ms = 300) {
     return out;
 }
 
+// Most tests do not care about the head stage, so they pass a 2-arg
+// handler; the fixture wraps it into the real 3-arg Handler.
+using SimpleHandler = std::function<void(const Request&, ServerResponse&)>;
+
 // A server fixture: owns the Server and the port it bound.
 struct Fixture {
     Server server;
     int port;
-    explicit Fixture(locus::http::Handler h, ServerConfig cfg = {})
-        : server(with_defaults(cfg), std::move(h)), port(server.start()) {
+    explicit Fixture(SimpleHandler h, ServerConfig cfg = {})
+        : server(with_defaults(cfg), wrap(std::move(h))), port(server.start()) {
         REQUIRE(port > 0);
+    }
+    // Full form for head-stage tests: a 3-arg Handler plus a HeadHandler.
+    Fixture(locus::http::Handler h, locus::http::HeadHandler hh,
+            ServerConfig cfg = {})
+        : server(with_defaults(cfg), std::move(h), std::move(hh)),
+          port(server.start()) {
+        REQUIRE(port > 0);
+    }
+    static locus::http::Handler wrap(SimpleHandler h) {
+        return [h = std::move(h)](const Request& req, ServerResponse& res,
+                                  const locus::http::RequestContext&) {
+            h(req, res);
+        };
     }
     static ServerConfig with_defaults(ServerConfig cfg) {
         cfg.host = "127.0.0.1";
@@ -390,4 +409,101 @@ TEST_CASE("http server: stop() returns promptly and closes live "
     REQUIRE(dt < 1000);  // not waiting out the 5 s idle timeout
     REQUIRE(drain(c).empty());  // connection closed by shutdown
     ::close(c);
+}
+
+// ---- head-stage hook (inc 3b) ----
+
+TEST_CASE("http server: a head handler reject sends its full response and "
+          "closes", "[http_server]") {
+    Fixture f(
+        [](const Request&, ServerResponse& res, const RequestContext&) {
+            res.set_content("HANDLER-RAN", "text/plain");  // must NOT run
+        },
+        [](const Request&, ServerResponse& res, RequestContext&) {
+            res.status = 401;
+            res.set_content(
+                "{\"error\":{\"type\":\"authentication_error\"}}",
+                "application/json");
+            return true;  // reject
+        });
+    const int c = client_connect(f.port);
+    send_all(c, "GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    const std::string r = drain(c);
+    REQUIRE(r.find("HTTP/1.1 401") != std::string::npos);
+    REQUIRE(r.find("authentication_error") != std::string::npos);  // body kept
+    REQUIRE(r.find("Connection: close") != std::string::npos);
+    REQUIRE(r.find("HANDLER-RAN") == std::string::npos);  // handler skipped
+    ::close(c);
+}
+
+TEST_CASE("http server: a head handler that proceeds has its res DISCARDED",
+          "[http_server]") {
+    // The proceed path must not let the head stage half-fill the response.
+    Fixture f(
+        [](const Request&, ServerResponse& res, const RequestContext&) {
+            res.set_content("REAL", "text/plain");
+        },
+        [](const Request&, ServerResponse& res, RequestContext&) {
+            res.set_header("X-Leak", "1");
+            res.set_content("LEAK", "text/plain");
+            return false;  // proceed -> res discarded
+        });
+    const int c = client_connect(f.port);
+    send_all(c, "GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    const std::string r = drain(c);
+    REQUIRE(r.find("REAL") != std::string::npos);
+    REQUIRE(r.find("LEAK") == std::string::npos);
+    REQUIRE(r.find("X-Leak") == std::string::npos);
+    ::close(c);
+}
+
+TEST_CASE("http server: the head stage threads identity to the handler",
+          "[http_server]") {
+    Fixture f(
+        [](const Request&, ServerResponse& res, const RequestContext& ctx) {
+            res.set_content("id=" + ctx.identity, "text/plain");
+        },
+        [](const Request&, ServerResponse&, RequestContext& ctx) {
+            ctx.identity = "alice";  // set at the head stage
+            return false;            // proceed
+        });
+    const int c = client_connect(f.port);
+    send_all(c, "GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    REQUIRE(drain(c).find("id=alice") != std::string::npos);
+    ::close(c);
+}
+
+TEST_CASE("http server: a head reject on a POST never reads the body",
+          "[http_server]") {
+    // Head promises a 1000-byte body we never send; the reject must come
+    // back anyway (decided on the head), so a 401 does not cost an upload.
+    Fixture f(
+        [](const Request&, ServerResponse& res, const RequestContext&) {
+            res.set_content("unreached", "text/plain");
+        },
+        [](const Request&, ServerResponse& res, RequestContext&) {
+            res.status = 401;
+            res.set_content("no", "text/plain");
+            return true;
+        });
+    const int c = client_connect(f.port);
+    send_all(c, "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 1000\r\n\r\n");
+    const std::string r = drain(c);
+    REQUIRE(r.find("HTTP/1.1 401") != std::string::npos);
+    REQUIRE(r.find("Connection: close") != std::string::npos);
+    ::close(c);
+}
+
+TEST_CASE("http server: wait() blocks until stop()", "[http_server]") {
+    Fixture f(echo_handler);
+    std::atomic<bool> returned{false};
+    std::thread waiter([&] {
+        f.server.wait();
+        returned.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    REQUIRE_FALSE(returned.load());  // still blocked while serving
+    f.server.stop();
+    waiter.join();
+    REQUIRE(returned.load());  // wait() returned once stopped
 }
