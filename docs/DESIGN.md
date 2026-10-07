@@ -880,7 +880,12 @@ the default path:
   exact token-prefix keys, ref-counted block pins, LRU eviction;
   adopts the longest shared prefix (leaving >= 1 token so the last
   logits are recomputed). Byte-exact; measured via
-  prefix_reused_tokens.
+  prefix_reused_tokens. Lookup is digest-indexed (i#65): keys are
+  block-aligned, so a 64-bit digest of each block boundary indexes
+  the candidates and a lookup costs O(prompt) instead of O(entries x
+  prompt). The digest is an index only -- the token sequence stays
+  the verified key, so a collision costs a comparison and never
+  returns a wrong prefix.
 - Speculative decoding (model/speculative): prompt-lookup (no draft
   model) -- n-gram match against the context proposes drafts,
   verified in ONE batched forward with all_logits; the longest
