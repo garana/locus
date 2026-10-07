@@ -413,11 +413,13 @@ static ParseResult parse_head_impl(std::string_view buf,
     return head_ok;
 }
 
-// The full parse: the head (above, the one home) plus body framing. Still
-// re-scans from the front each call and does not touch ParseContext; the
+// The full parse: the head (above, the one home) plus body framing. The
+// head and a Content-Length body re-scan from the front each call (both
+// cheap); a CHUNKED body resumes from `ctx` at the last completed chunk
+// boundary so it is scanned once total, not re-scanned every feed. The
 // public parse_request wraps this and owns the context lifetime (below).
 static ParseResult parse_one(std::string_view buf, const Limits& limits,
-                             Request& out) {
+                             ParseContext& ctx, Request& out) {
     HeadInfo info;
     const ParseResult head = parse_head_impl(buf, limits, out, info);
     if (head.state != ParseState::kComplete) {
@@ -428,9 +430,24 @@ static ParseResult parse_one(std::string_view buf, const Limits& limits,
     // --- Body framing. ---
     if (info.has_te) {
         // Chunked: [hexsize CRLF data CRLF]* 0 CRLF (trailers) CRLF.
+        // Resume from the last completed chunk boundary (see ParseContext)
+        // so each chunk is decoded ONCE across feeds, not re-scanned every
+        // feed. `body` moves in and out of the context -- never copied.
         std::string body;
-        std::size_t p = pos;
+        std::size_t p;
+        if (ctx.chunk_active && ctx.head_end == pos) {
+            p = ctx.scan_pos;            // a chunk-size-line boundary
+            body = std::move(ctx.body);  // chunks decoded so far
+        } else {
+            ctx.chunk_active = true;     // fresh chunked body
+            ctx.head_end = pos;
+            p = pos;
+        }
+        std::size_t zero_boundary = p;   // the "0" line, for trailer resume
         for (;;) {
+            // p is at a chunk-size line: the only safe resume point. On any
+            // kNeedMore below, checkpoint THIS boundary + the body so far.
+            const std::size_t boundary = p;
             bool blf = false;
             std::size_t cr = find_crlf(buf, p, blf);
             if (blf) {
@@ -440,6 +457,8 @@ static ParseResult parse_one(std::string_view buf, const Limits& limits,
                 if (buf.size() - p > limits.max_header_line) {
                     return err("chunk-size line exceeds limit", 413);
                 }
+                ctx.scan_pos = boundary;
+                ctx.body = std::move(body);
                 return need_more();
             }
             std::string_view sizeline = buf.substr(p, cr - p);
@@ -452,7 +471,8 @@ static ParseResult parse_one(std::string_view buf, const Limits& limits,
             }
             p = cr + 2;
             if (csize == 0) {
-                break;  // last chunk; trailers follow
+                zero_boundary = boundary;  // resume re-reads this cheaply
+                break;                     // last chunk; trailers follow
             }
             if (csize > limits.max_body_bytes ||
                 body.size() + csize > limits.max_body_bytes) {
@@ -460,6 +480,8 @@ static ParseResult parse_one(std::string_view buf, const Limits& limits,
             }
             // Need csize bytes of data + the trailing CRLF.
             if (buf.size() < p + csize + 2) {
+                ctx.scan_pos = boundary;  // re-read this size line next feed
+                ctx.body = std::move(body);
                 return need_more();
             }
             body.append(buf.substr(p, csize));
@@ -467,7 +489,7 @@ static ParseResult parse_one(std::string_view buf, const Limits& limits,
             if (buf[p] != '\r' || buf[p + 1] != '\n') {
                 return err("missing CRLF after chunk data");
             }
-            p += 2;
+            p += 2;  // chunk complete; next boundary becomes the checkpoint
         }
         // Trailers: header lines until a blank line, bounded.
         const std::size_t trailer_start = p;
@@ -482,6 +504,10 @@ static ParseResult parse_one(std::string_view buf, const Limits& limits,
                     limits.max_trailer_bytes) {
                     return err("trailers exceed limit", 413);
                 }
+                // Body complete; resume re-reads the "0" line + trailers
+                // (bounded, so cheap) and keeps the decoded body.
+                ctx.scan_pos = zero_boundary;
+                ctx.body = std::move(body);
                 return need_more();
             }
             // Bound by the trailer section's own extent, NOT buf.size():
@@ -523,7 +549,7 @@ static ParseResult parse_one(std::string_view buf, const Limits& limits,
 
 ParseResult parse_request(std::string_view buf, const Limits& limits,
                           ParseContext& ctx, Request& out) {
-    ParseResult r = parse_one(buf, limits, out);
+    ParseResult r = parse_one(buf, limits, ctx, out);
     // The context is per-REQUEST, not per-connection-forever: it is only
     // meaningful while a request is still being accumulated (kNeedMore).
     // Reset it on any terminal result so the caller cannot carry stale
