@@ -159,9 +159,15 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
 
         // R10: ingest the remaining prompt in one batched forward
         // when the model and config allow -- byte-identical to
-        // the per-token path, fewer weight reads. Falls through
-        // to per-token (which preempts) if the chunk cannot be
-        // capacity-ensured.
+        // the per-token path, fewer weight reads. On a capacity miss
+        // it falls through to the per-token path below, which reclaims
+        // prefix-cache blocks (and preempts) one step at a time.
+        // Deliberately NO reclaim_and_grow here: the per-token fallback
+        // reclaims only as much as each token needs, not a whole-chunk
+        // eviction up front. Trade-off: under a full pool a batched
+        // prefill degrades to per-token here, losing the i#24/i#52
+        // amortization -- a follow-up could reclaim for the chunk if
+        // that regresses throughput under memory pressure.
         if (prefilling && cfg_.batched_prefill &&
             model_.supports_batch()) {
             const std::uint32_t remaining = n_prompt - r.n_fed;
@@ -183,10 +189,11 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
             finish(r, Status::kFailed, "context overflow");
             return;
         }
-        if (!cache_.ensure_capacity(r.seq, 1)) {
-            // Pool dry: preempt the newest running sequence; if
-            // that is us, we cannot make progress right now (or
-            // ever, if the pool is just too small).
+        if (!reclaim_and_grow(r, 1)) {
+            // Pool still dry after reclaiming reusable prefix-cache
+            // blocks: preempt the newest running sequence; if that is
+            // us, we cannot make progress right now (or ever, if the
+            // pool is just too small).
             const std::uint64_t victim = running_.back();
             if (victim == r.id) {
                 if (running_.size() == 1) {
@@ -246,6 +253,33 @@ bool Engine::try_admit_front() {
     running_.push_back(r.id);
     waiting_.pop_front();
     return true;
+}
+
+bool Engine::reclaim_and_grow(Request& r, std::uint32_t n_more) {
+    if (cache_.ensure_capacity(r.seq, n_more)) {
+        return true;
+    }
+    if (!prefix_cache_) {
+        return false;
+    }
+    // Pool is physically full but evictable prefix-cache entries pin
+    // reusable blocks. Drop LRU entries until the growth fits, then
+    // retry. evict_until_free targets a free-block count, so size it
+    // by the blocks this growth still needs.
+    //
+    // Caveat (pre-existing in evict_until_free, shared with the
+    // admission path try_admit_front): an entry whose blocks are still
+    // shared with a RUNNING sequence frees nothing when dropped.
+    // evict_until_free drops LRU-first, and the oldest entries are the
+    // least likely to be pinned by a running seq, so the no-gain case
+    // needs essentially EVERY entry pinned -- a corner, not the common
+    // case. When it does hit, the pool is cleared for no gain and we
+    // fall through to preempt below. Correct and byte-neutral (a
+    // dropped prefix just recomputes; finish() re-inserts it); a
+    // follow-up could teach evict_until_free to skip fully-pinned
+    // entries.
+    prefix_cache_->evict_until_free(cache_.blocks_needed(r.seq, n_more));
+    return cache_.ensure_capacity(r.seq, n_more);
 }
 
 void Engine::preempt(std::uint64_t victim_id) {
@@ -499,6 +533,9 @@ bool Engine::prefill_only(Request& r, std::uint32_t& budget) {
         if (budget == 0) {
             return true;
         }
+        // Same batched-prefill fast path as advance(): on a capacity
+        // miss it falls through to the per-token loop below, which
+        // reclaims. Deliberately no reclaim here -- see advance().
         if (cfg_.batched_prefill && model_.supports_batch()) {
             const std::uint32_t remaining = n_prompt - r.n_fed;
             const std::uint32_t nb = std::min(remaining, budget);
@@ -518,7 +555,7 @@ bool Engine::prefill_only(Request& r, std::uint32_t& budget) {
             finish(r, Status::kFailed, "context overflow");
             return false;
         }
-        if (!cache_.ensure_capacity(r.seq, 1)) {
+        if (!reclaim_and_grow(r, 1)) {
             const std::uint64_t victim = running_.back();
             if (victim == r.id) {
                 if (running_.size() == 1) {
@@ -604,7 +641,7 @@ bool Engine::step_batched() {
                            static_cast<std::ptrdiff_t>(i));
             continue;
         }
-        if (!cache_.ensure_capacity(r.seq, 1)) {
+        if (!reclaim_and_grow(r, 1)) {
             const std::uint64_t victim = running_.back();
             if (victim == r.id) {
                 // Nothing newer to preempt. If we are the only
