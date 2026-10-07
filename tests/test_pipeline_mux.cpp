@@ -249,6 +249,14 @@ TEST_CASE("serve_stage_mux reuses a connection after SESSION_END, "
         *locus::pipeline::Cidr::parse("127.0.0.0/8")};
     locus::pipeline::StageConn conn;
     conn.serve_sessions = 1;  // the one reused connection ends once (after B)
+    // Isolate the RECEIVE-side reset (i#76): with downstream pooling off
+    // (issue 68), reset_session closes A's downstream and dials a fresh
+    // one for B, so each sequence is a fresh accept on the collector --
+    // the behaviour this test was written against. The dial-side reuse
+    // that pooling adds (same downstream fd serves both sequences) is
+    // covered by the issue-68 tests below, which drain the SESSION_END
+    // frame the stage sends on a pooled connection.
+    conn.downstream_idle_max = 0;
 
     std::atomic<int> sres{-1};
     std::thread server([&] {
@@ -313,6 +321,311 @@ TEST_CASE("serve_stage_mux reuses a connection after SESSION_END, "
     }
     ::close(lc);
     REQUIRE(sres.load() == 1);  // the connection's final session ended clean
+}
+
+// ---- issue 68: dial-side downstream connection pool ----
+
+// With the pool ON (the default), a SESSION_END that ends a sequence
+// returns the stage's downstream fd to the idle pool and the next
+// sequence on the SAME inbound connection REUSES it rather than dialing
+// fresh. The reused sequence must stay KV-isolated and byte-identical to
+// a fresh dial, and the collector must see exactly one downstream accept
+// across both sequences (no second dial). On the wire the reuse shows as
+// a SESSION_END frame -- echoing the forwarded request_id -- arriving on
+// the same downstream fd between A's logits and B's.
+TEST_CASE("serve_stage_mux reuses a pooled downstream (issue 68)",
+          "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const locus::tok::TokenId eos = tok.eos_id();
+    constexpr int kGen = 8;
+
+    const auto pa = tok.encode("Once upon a time, there was a little", true);
+    const auto pb = tok.encode("The quick brown fox jumped over the", true);
+    const auto ref_a = mono_generate(model, pa, eos, kGen);
+    const auto ref_b = mono_generate(model, pb, eos, kGen);
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;       // one inbound connection, reused for B
+    conn.downstream_idle_max = 8;  // pooling ON (also the default)
+
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, allow, {{"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    const int to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(to_stage >= 0);
+
+    // The stage dials its downstream once, for sequence A. That one fd
+    // carries A's logits, then the pool SESSION_END, then B's logits.
+    const int from_stage = locus::pipeline::accept_one(lc, nullptr, 5000);
+    REQUIRE(from_stage >= 0);
+    locus::pipeline::set_recv_timeout(from_stage, 5000);
+
+    Client a;
+    a.to_stage = to_stage;
+    a.from_stage = from_stage;
+    a.request_id = 101;
+    for (const auto t : pa) {
+        a.round_trip(t);
+    }
+    std::vector<locus::tok::TokenId> gen_a;
+    for (int i = 0; i < kGen && a.ok; ++i) {
+        const auto n = locus::model::argmax(a.logits);
+        gen_a.push_back(n);
+        if (n == eos) {
+            break;
+        }
+        a.round_trip(n);
+    }
+    REQUIRE(a.ok);
+    REQUIRE(gen_a == ref_a);
+
+    // End sequence A. The stage pools (does not close) its downstream and
+    // reuses it for B, so a SESSION_END echoing A's request_id arrives on
+    // the SAME downstream fd before any of B's logits.
+    REQUIRE(locus::pipeline::write_message(
+        to_stage, locus::pipeline::make_session_end(101)));
+    Message se;
+    REQUIRE(locus::pipeline::read_message(from_stage, se) ==
+            ReadResult::kOk);
+    REQUIRE(se.type == MsgType::kSessionEnd);
+    REQUIRE(se.request_id == 101);  // the forwarded id, echoed back
+
+    // No fresh dial happened: the collector gets no second accept.
+    REQUIRE(locus::pipeline::accept_one(lc, nullptr, 500) < 0);
+
+    // Sequence B over the reused downstream fd: byte-identical to a fresh
+    // dial and KV-isolated from A (a leaked A seq would corrupt these).
+    Client b;
+    b.to_stage = to_stage;
+    b.from_stage = from_stage;  // the SAME fd -- the reused downstream
+    b.request_id = 202;
+    for (const auto t : pb) {
+        b.round_trip(t);
+    }
+    std::vector<locus::tok::TokenId> gen_b;
+    for (int i = 0; i < kGen && b.ok; ++i) {
+        const auto n = locus::model::argmax(b.logits);
+        gen_b.push_back(n);
+        if (n == eos) {
+            break;
+        }
+        b.round_trip(n);
+    }
+    REQUIRE(b.ok);
+    REQUIRE(gen_b == ref_b);
+
+    ::close(to_stage);  // ends the reused connection -> server stops
+    server.join();
+    ::close(from_stage);
+    ::close(lc);
+    REQUIRE(sres.load() == 1);
+}
+
+// A downstream pooled by one client and found DEAD when the next client
+// checks it out (the peer closed while it sat idle) must degrade to a
+// fresh dial, never a failure. Client 1 ends (its downstream is pooled);
+// the collector then closes that downstream; client 2 dials, the stage's
+// checkout probe sees the dead fd, discards it, and dials fresh, so the
+// collector gets a SECOND accept and client 2 is served normally. This is
+// the cross-client reuse path (free_session), and the "stale pooled fd
+// always degrades to a fresh dial" invariant.
+TEST_CASE("serve_stage_mux replaces a dead pooled downstream (issue 68)",
+          "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const locus::tok::TokenId eos = tok.eos_id();
+    constexpr int kGen = 6;
+
+    const auto prompt = tok.encode("Once upon a time, there was a", true);
+    const auto ref = mono_generate(model, prompt, eos, kGen);
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 2;       // two separate inbound connections
+    conn.downstream_idle_max = 8;  // pooling ON
+
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, allow, {{"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    // Runs one client to completion over its own inbound connection and
+    // downstream accept; returns the collector-side downstream fd (left
+    // open) so the caller can inspect/kill it.
+    auto run_client = [&](std::uint64_t rid, int& from_out) {
+        const int to = locus::pipeline::connect_to("127.0.0.1", ps);
+        REQUIRE(to >= 0);
+        const int from = locus::pipeline::accept_one(lc, nullptr, 5000);
+        REQUIRE(from >= 0);
+        locus::pipeline::set_recv_timeout(from, 5000);
+        Client c;
+        c.to_stage = to;
+        c.from_stage = from;
+        c.request_id = rid;
+        for (const auto t : prompt) {
+            c.round_trip(t);
+        }
+        std::vector<locus::tok::TokenId> gen;
+        for (int i = 0; i < kGen && c.ok; ++i) {
+            const auto n = locus::model::argmax(c.logits);
+            gen.push_back(n);
+            if (n == eos) {
+                break;
+            }
+            c.round_trip(n);
+        }
+        REQUIRE(c.ok);
+        from_out = from;
+        return std::make_pair(to, gen);
+    };
+
+    // Client 1: run it, then end its inbound connection so its downstream
+    // is pooled. free_session sends a SESSION_END on that downstream as it
+    // pools it; reading that frame confirms the pool actually holds the fd
+    // BEFORE we kill it (so client 2 is guaranteed to probe a dead entry,
+    // not an empty pool).
+    int c1_from = -1;
+    auto [c1_to, gen1] = run_client(101, c1_from);
+    REQUIRE(gen1 == ref);
+    ::close(c1_to);  // clean EOF -> free_session pools the downstream
+    Message se;
+    REQUIRE(locus::pipeline::read_message(c1_from, se) == ReadResult::kOk);
+    REQUIRE(se.type == MsgType::kSessionEnd);  // pooled, confirmed
+    ::close(c1_from);  // the pooled peer dies while idle
+
+    // Client 2: the stage checks the pooled fd out, probes it, finds it
+    // dead, closes it, and dials fresh -- so a SECOND accept arrives and
+    // the generation still matches the reference.
+    int c2_from = -1;
+    auto [c2_to, gen2] = run_client(202, c2_from);
+    REQUIRE(gen2 == ref);  // fresh dial, correct output
+
+    ::close(c2_to);
+    server.join();
+    ::close(c2_from);
+    ::close(lc);
+    REQUIRE(sres.load() == 1);  // both inbound connections ended clean
+}
+
+// Downstreams still parked in the idle pool when the server stops are
+// closed at teardown (no fd leak). One client runs a sequence and
+// disconnects, so its downstream is pooled; when the server returns, the
+// collector sees that connection close (kEof) right after the SESSION_END
+// the pool handshake sent -- proving the teardown path closes idle fds.
+TEST_CASE("serve_stage_mux closes pooled downstreams at teardown (i#68)",
+          "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const locus::tok::TokenId eos = tok.eos_id();
+    constexpr int kGen = 6;
+
+    const auto prompt = tok.encode("The quick brown fox jumped", true);
+    const auto ref = mono_generate(model, prompt, eos, kGen);
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+    conn.downstream_idle_max = 8;  // pooling ON
+
+    std::atomic<int> sres{-1};
+    std::thread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, allow, {{"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    const int to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(to_stage >= 0);
+    const int from_stage = locus::pipeline::accept_one(lc, nullptr, 5000);
+    REQUIRE(from_stage >= 0);
+    locus::pipeline::set_recv_timeout(from_stage, 5000);
+
+    Client c;
+    c.to_stage = to_stage;
+    c.from_stage = from_stage;
+    c.request_id = 303;
+    for (const auto t : prompt) {
+        c.round_trip(t);
+    }
+    std::vector<locus::tok::TokenId> gen;
+    for (int i = 0; i < kGen && c.ok; ++i) {
+        const auto n = locus::model::argmax(c.logits);
+        gen.push_back(n);
+        if (n == eos) {
+            break;
+        }
+        c.round_trip(n);
+    }
+    REQUIRE(c.ok);
+    REQUIRE(gen == ref);
+
+    ::close(to_stage);  // clean EOF -> free_session pools the downstream
+    server.join();      // serve_sessions reached -> teardown runs
+
+    // On the pooled downstream: the SESSION_END from the pool handshake,
+    // then a clean EOF as teardown closes the idle fd.
+    Message se;
+    REQUIRE(locus::pipeline::read_message(from_stage, se) ==
+            ReadResult::kOk);
+    REQUIRE(se.type == MsgType::kSessionEnd);
+    REQUIRE(locus::pipeline::read_message(from_stage, se) ==
+            ReadResult::kEof);  // teardown closed the pooled fd
+    ::close(from_stage);
+    ::close(lc);
+    REQUIRE(sres.load() == 1);
 }
 
 // The multi-executor form (i#24 inc 3): two executors, two concurrent

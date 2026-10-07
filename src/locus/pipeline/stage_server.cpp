@@ -162,6 +162,13 @@ using Clock = std::chrono::steady_clock;
 struct MuxSession {
     int in_fd = -1;
     int out_fd = -1;
+    // issue 68 downstream pool: out_key is the resolved "ip:port" of
+    // out_fd (the bucket this fd returns to on a clean session end);
+    // last_request_id is the most recent request_id forwarded, echoed in
+    // the SESSION_END sent when the fd is pooled (the receiver resets by
+    // fd, but the id keeps the wire legible / future-proof).
+    std::string out_key;
+    std::uint64_t last_request_id = 0;
     kv::PagedKvCache::Seq seq;
     std::string inbuf;
     std::string outbuf;
@@ -390,6 +397,25 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     std::unordered_map<int, std::unique_ptr<MuxSession>> sessions;
     // Reverse index out_fd -> in_fd for write-readiness events.
     std::unordered_map<int, int> out_index;
+    // issue 68: idle downstream connections available for reuse, keyed by
+    // resolved "ip:port". free_session/reset_session return a clean, fully
+    // flushed, SESSION_END-terminated fd here (up to
+    // conn.downstream_idle_max per key) instead of closing it; try_dial
+    // checks one out, liveness-probes it, and reuses it before dialing.
+    // Touched only on the loop thread (the executors never see it).
+    //
+    // Operator note on executor distribution: reusing a pooled connection
+    // keeps the DOWNSTREAM stage's executor pin. The downstream treats a
+    // reused fd as the same session (issue 76: SESSION_END resets its KV
+    // but keeps the fd pinned to its original executor), so which
+    // downstream executor serves a connection is fixed when that
+    // connection is FIRST dialed and then rides every later reuse. Pool
+    // history, not least-loaded-at-accept, therefore shapes the
+    // downstream's executor load: a heavily reused connection concentrates
+    // on its first-assigned executor. Not a correctness issue (each
+    // session's KV is still isolated), but it can present as one
+    // downstream executor running hot with no apparent cause.
+    std::unordered_map<std::string, std::vector<int>> pool_idle;
 
     // Self-pipe carrying the executor's completion wakeups into the
     // poller (same shape as the SIGHUP wake). Non-blocking write end, per
@@ -459,6 +485,53 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         return 0;
     };
 
+    // issue 68: hand a session's downstream fd to the idle pool for reuse
+    // (keyed by its resolved ip:port) instead of closing it -- but ONLY
+    // when the stream is clean. Pooling must be on, the dial complete
+    // (not mid-connect), the inbound end clean, AND a best-effort
+    // SESSION_END must drain the write side COMPLETELY: a short write or
+    // a dead peer leaves a partial/desynced frame that would poison the
+    // next user (the probe cannot catch a mid-frame-but-alive socket), so
+    // that case closes. out_index is erased before the fd is pooled-or-
+    // closed (fd numbers recycle), and out_fd is cleared after any
+    // push_back. Loop-thread-only, like the pool itself.
+    auto release_downstream = [&](MuxSession& s) {
+        if (s.out_fd < 0) {
+            return;  // dropped mid-dial: no downstream to release
+        }
+        if (s.out_watched) {
+            poller.remove(s.out_fd);
+            s.out_watched = false;
+        }
+        bool pooled = false;
+        if (conn_live.downstream_idle_max > 0 && !s.connecting &&
+            s.clean_end) {
+            // SESSION_END echoes the last forwarded request_id (the
+            // receiver resets by fd; the id keeps the wire legible).
+            // flush_out: 0 = fully drained (poolable), 1 = backpressured
+            // (re-watched, partial), -1 = peer gone.
+            encode(make_session_end(s.last_request_id), s.outbuf);
+            const int fr = flush_out(s);
+            if (s.out_watched) {  // fr == 1 re-added the write watch; undo
+                poller.remove(s.out_fd);
+                s.out_watched = false;
+            }
+            out_index.erase(s.out_fd);
+            std::vector<int>& bucket = pool_idle[s.out_key];
+            if (fr == 0 && static_cast<int>(bucket.size()) <
+                               conn_live.downstream_idle_max) {
+                bucket.push_back(s.out_fd);  // clean + frame-aligned
+                pooled = true;
+            }
+        } else {
+            out_index.erase(s.out_fd);
+        }
+        if (!pooled) {
+            ::close(s.out_fd);  // off / unclean / short write / gone / cap
+        }
+        s.out_fd = -1;
+    };
+
     // Frees a torn-down session once its KV release has completed on the
     // executor (so the executor is no longer touching its seq): drop its
     // fds and map entries and count it. Called only from a release
@@ -470,14 +543,11 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         }
         MuxSession& s = *it->second;
         poller.remove(s.in_fd);
-        if (s.out_watched) {
-            poller.remove(s.out_fd);
-        }
-        out_index.erase(s.out_fd);
+        // issue 68: pool the downstream fd for a future (cross-client)
+        // session instead of closing it, when the stream is clean; this
+        // also handles the out_watch removal and out_index erase.
+        release_downstream(s);
         ::close(s.in_fd);
-        if (s.out_fd >= 0) {  // -1 if dropped mid-dial (no downstream yet)
-            ::close(s.out_fd);
-        }
         if (!s.clean_end) {
             all_clean = false;
         }
@@ -580,6 +650,64 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 conn_live.resolver != nullptr
                     ? conn_live.resolver->resolve(hp.host)
                     : hp.host;
+            const std::string key = ip + ":" + std::to_string(hp.port);
+            // issue 68: before dialing fresh, reuse an idle downstream
+            // pooled for this RESOLVED address. Probe each candidate with
+            // a non-blocking MSG_PEEK: a peer that closed while the fd sat
+            // idle shows readable (recv 0) or errors, and >0 would mean
+            // unexpected inbound bytes on a frame-aligned link -- any of
+            // those is stale, so close it and try the next. EAGAIN means
+            // alive; we adopt it as an in-progress connect (register for
+            // write) so the normal connect-success path finishes it, which
+            // keeps reuse and fresh-dial on one completion path. A stale
+            // entry degrades to a fresh dial, never a failure. The probe
+            // cannot see a FIN-less dead peer (we never read out_fd); TCP
+            // keepalive, re-applied here, is that failure detector.
+            //
+            // DEPENDS on the issue 39 phase dispatch: the completion
+            // handler keys on s.connecting, NOT on ev.writable. A pooled
+            // fd that died between the probe and this adoption arrives
+            // error=1/writable=0 on epoll; keying on connecting still
+            // dispatches it, connect_result returns the errno, and
+            // fail_dial redials -- so "stale pooled fd -> fresh dial" holds
+            // by construction, and SO_ERROR is a second liveness check for
+            // an RST that lands in the probe->writable window. If that
+            // dispatch is ever changed back to keying on ev.writable, a
+            // reused-but-dead fd would never resolve and the loop would
+            // spin: pooling breaks silently. Keep the phase dispatch.
+            if (!ip.empty() && conn_live.downstream_idle_max > 0) {
+                auto pit = pool_idle.find(key);
+                if (pit != pool_idle.end()) {
+                    while (!pit->second.empty()) {
+                        const int pfd = pit->second.back();
+                        pit->second.pop_back();
+                        char probe = 0;
+                        const ssize_t pk = ::recv(
+                            pfd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+                        if (pk < 0 &&
+                            (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                            set_keepalive(pfd, conn_live.keepalive_idle_s,
+                                          conn_live.keepalive_intvl_s,
+                                          conn_live.keepalive_count);
+                            s.out_fd = pfd;
+                            s.out_key = key;
+                            s.connecting = true;
+                            poller.add(pfd, sys::Poller::Dir::kWrite);
+                            s.out_watched = true;
+                            out_index[pfd] = s.in_fd;
+                            s.dial_deadline =
+                                conn_live.connect_timeout_ms > 0
+                                    ? Clock::now() +
+                                          std::chrono::milliseconds(
+                                              conn_live.connect_timeout_ms)
+                                    : Clock::time_point::max();
+                            s.retry_at = Clock::time_point::max();
+                            return;
+                        }
+                        ::close(pfd);  // FIN / unexpected data / error
+                    }
+                }
+            }
             ++s.dial_tried;
             const int fd = ip.empty() ? -1 : dial_start(ip, hp.port);
             s.dial_cursor = (s.dial_cursor + 1) % n;
@@ -588,6 +716,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                               conn_live.keepalive_intvl_s,
                               conn_live.keepalive_count);
                 s.out_fd = fd;
+                s.out_key = key;
                 s.connecting = true;
                 poller.add(fd, sys::Poller::Dir::kWrite);
                 s.out_watched = true;
@@ -654,6 +783,11 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             begin_reset(s);
             return;
         }
+        // issue 68: remember the id we forwarded so the SESSION_END we
+        // later send when pooling this downstream echoes it (the receiver
+        // resets by fd; the id keeps the wire legible). Read before the
+        // move.
+        s.last_request_id = in.request_id;
         executors[s.exec]->submit_step(s.in_fd, &s.seq, std::move(in));
         s.in_flight = true;
     };
@@ -687,15 +821,13 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // session is continuing, not finishing. Runs only from a release
     // completion, so the executor is done with the old seq.
     auto reset_session = [&](MuxSession& s) {
-        if (s.out_watched) {
-            poller.remove(s.out_fd);
-        }
-        if (s.out_fd >= 0) {
-            out_index.erase(s.out_fd);
-            ::close(s.out_fd);
-        }
-        s.out_fd = -1;
-        s.out_watched = false;
+        // issue 68: pool the downstream fd for this connection's NEXT
+        // sequence instead of closing it. release_downstream stops
+        // watching it, erases out_index, sends SESSION_END and either
+        // pools or closes it, and sets out_fd = -1. (begin_reset already
+        // cleared out_watched; the next dial below may check this very fd
+        // back out of the pool -- same-connection reuse.)
+        release_downstream(s);
         s.outbuf.clear();
         s.seq = kv::PagedKvCache::Seq{};  // old blocks freed by the release
         s.in_flight = false;
@@ -1132,6 +1264,19 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         }
         ::close(sp->in_fd);
         ::close(sp->out_fd);
+    }
+    // issue 68: close every downstream still parked in the idle pool.
+    // These have no live session, so there is no KV to release; just
+    // close the sockets (the peer sees EOF and tears down its side). Note
+    // the lifetime this implies: with conn.serve_sessions set (the test
+    // path), a pooled connection is closed HERE, when the loop exits,
+    // rather than when the pool would otherwise evict it -- so a pooled
+    // fd outlives the session that pooled it but not the serve loop.
+    for (auto& [key, bucket] : pool_idle) {
+        (void)key;
+        for (const int pfd : bucket) {
+            ::close(pfd);
+        }
     }
     ::close(listen_fd);
     // exec_wake closes itself (WakePipe dtor), AFTER the executor's

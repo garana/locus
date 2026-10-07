@@ -37,6 +37,14 @@ struct StageConn {
                                     *   reused across sequences (issue 76
                                     *   SESSION_END) counts once, at its
                                     *   teardown -- not per sequence. */
+    int downstream_idle_max = 8;   /**< issue 68: max idle DOWNSTREAM
+                                    *   connections pooled per resolved
+                                    *   ip:port. On a session end the stage
+                                    *   sends SESSION_END and returns the
+                                    *   downstream fd to this bucket
+                                    *   instead of closing it, so the next
+                                    *   session reuses it. 0 disables
+                                    *   pooling (dial-per-session). */
     /**
      * Optional cached hostname resolver (issue 40). When set, a
      * downstream whose host is a name is resolved to an IP through this
