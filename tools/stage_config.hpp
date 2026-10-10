@@ -42,6 +42,10 @@ struct StageOptions {
     int keepalive_interval = 2;           /**< --keepalive-interval s */
     int keepalive_count = 3;              /**< --keepalive-count */
     int sessions = 0;                     /**< --sessions (0=forever) */
+    int downstream_idle_max = 8;          /**< --downstream-idle-max:
+                                           *   idle downstream conns pooled
+                                           *   per resolved ip:port for
+                                           *   reuse (0 = no pooling) */
     int resolve_ttl = 30;                 /**< --resolve-ttl s (name
                                            *   cache; fallback TTL until
                                            *   record TTL is used) */
@@ -104,6 +108,9 @@ inline Spec<StageOptions> stage_spec() {
                    "unacked keepalive probes before drop"),
         D::integer("sessions", &O::sessions,
                    "serve N sessions then exit (0 = forever)"),
+        D::integer("downstream-idle-max", &O::downstream_idle_max,
+                   "idle downstream connections pooled per resolved "
+                   "ip:port for reuse (0 = dial per session)"),
         D::integer("resolve-ttl", &O::resolve_ttl,
                    "downstream-name cache TTL s (fallback until the "
                    "record TTL is used)"),
@@ -334,6 +341,7 @@ inline std::string build_runtime(const StageOptions& opt,
     out.conn.keepalive_intvl_s = opt.keepalive_interval;
     out.conn.keepalive_count = opt.keepalive_count;
     out.conn.serve_sessions = opt.sessions;
+    out.conn.downstream_idle_max = opt.downstream_idle_max;
     return "";
 }
 
