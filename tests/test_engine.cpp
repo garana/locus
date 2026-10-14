@@ -622,3 +622,66 @@ TEST_CASE("execute-slice: layer-range forward matches full forward",
         REQUIRE(m_logits == ref_logits);
     }
 }
+
+// i#64: a lone request whose decode outgrows its admitted headroom must
+// reclaim evictable (pinned-but-reusable) prefix-cache blocks to grow,
+// rather than failing "kv pool too small" while reclaimable blocks
+// exist. Pre-fix the growth path consulted only the raw free list and,
+// with nothing to preempt, failed the request. Fail-before/pass-after:
+// pre-fix the final request ends kFailed; post-fix it ends kDone with
+// byte-identical output.
+TEST_CASE("decode growth reclaims prefix-cache blocks before failing",
+          "[engine][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    // The lone request: 32 tokens == two full blocks (block_tokens 16),
+    // so with decode_headroom 0 admission reserves exactly the prompt
+    // and the first decode token already needs a fresh block. Token id
+    // 5 avoids BOS/EOS and shares no prefix with the fillers below.
+    const std::vector<locus::tok::TokenId> prompt(32, 5);
+    const std::uint32_t max_new = 24;
+
+    // Reference on a roomy, cache-free pool.
+    Engine baseline(model, tok.eos_id(), Engine::Config{});
+    const auto rid = baseline.submit(prompt, max_new);
+    baseline.run_to_completion();
+    REQUIRE(baseline.get(rid)->status == Status::kDone);
+    const auto want = baseline.get(rid)->generated;
+
+    Engine::Config cfg;
+    cfg.prefix_cache = true;
+    cfg.decode_headroom = 0;
+    cfg.n_blocks = 6;  // 96 positions; the run needs >2 blocks to grow
+    Engine engine(model, tok.eos_id(), cfg);
+
+    // Pin blocks with distinct one-block prefixes: each filler is 16
+    // tokens of a distinct id, run to completion, leaving its full
+    // block pinned in the prefix cache (the tail frees). Distinct ids
+    // mean the lone request shares no prefix and cannot adopt them.
+    for (locus::tok::TokenId id = 6; id <= 9; ++id) {
+        const std::vector<locus::tok::TokenId> filler(16, id);
+        const auto fid = engine.submit(filler, 1);
+        engine.run_to_completion();
+        REQUIRE(engine.get(fid)->status == Status::kDone);
+    }
+    // The pool is now mostly pinned by reusable prefix blocks.
+    CAPTURE(engine.free_blocks(), engine.total_blocks());
+    REQUIRE(engine.free_blocks() < engine.total_blocks());
+
+    // Admitted on headroom (prompt fits total_blocks), the lone request
+    // then grows past it; with no peer to preempt it must evict the
+    // pinned prefixes to make room instead of erroring.
+    const auto id = engine.submit(prompt, max_new);
+    engine.run_to_completion();
+    const auto* r = engine.get(id);
+    REQUIRE(r != nullptr);
+    CAPTURE(static_cast<int>(r->status), r->error,
+            engine.free_blocks());
+    REQUIRE(r->status == Status::kDone);  // pre-fix: kFailed
+    REQUIRE(r->generated == want);        // reclaim is byte-neutral
+}

@@ -258,6 +258,14 @@ class Engine {
      * admitted (moved to running_), false if it cannot fit now (the
      * caller must stop admitting to keep FCFS order). */
     bool try_admit_front();
+    /** Ensures r.seq can grow by n_more tokens, reclaiming reusable
+     * prefix-cache blocks if the pool is otherwise full. A reclaimed
+     * prefix entry is only a recomputable cache miss -- strictly
+     * cheaper than preempting a running peer -- so decode/prefill
+     * growth tries this before preempt/fail, mirroring admission,
+     * which already evicts the prefix cache before rejecting.
+     * @returns whether the growth now fits. */
+    bool reclaim_and_grow(Request& r, std::uint32_t n_more);
     /** Releases r's blocks and moves it back to the wait queue. */
     void preempt(std::uint64_t victim_id);
     void finish(Request& r, Status s, std::string error = "");

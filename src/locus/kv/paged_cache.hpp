@@ -112,6 +112,15 @@ class PagedKvCache {
     bool ensure_capacity(Seq& seq, std::uint32_t n_more);
 
     /**
+     * Number of blocks ensure_capacity(seq, n_more) would have to
+     * allocate to succeed (0 when the growth already fits). Lets a
+     * caller size a reclaim before retrying ensure_capacity.
+     * @returns additional blocks the growth needs.
+     */
+    std::uint32_t blocks_needed(const Seq& seq,
+                                std::uint32_t n_more) const;
+
+    /**
      * Releases every block of seq back to the pool (ref-counted:
      * blocks shared with a fork survive) and resets it.
      */

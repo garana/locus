@@ -59,14 +59,21 @@ PagedKvCache::PagedKvCache(const Geometry& geom,
     qpool_ptr_ = storage;
 }
 
-bool PagedKvCache::ensure_capacity(Seq& seq, std::uint32_t n_more) {
+std::uint32_t PagedKvCache::blocks_needed(const Seq& seq,
+                                          std::uint32_t n_more) const {
     const std::uint32_t want = seq.n_tokens + n_more;
-    std::uint32_t have = capacity(seq);
+    const std::uint32_t have = capacity(seq);
     if (want <= have) {
+        return 0;
+    }
+    return (want - have + geom_.block_tokens - 1) / geom_.block_tokens;
+}
+
+bool PagedKvCache::ensure_capacity(Seq& seq, std::uint32_t n_more) {
+    const std::uint32_t need_blocks = blocks_needed(seq, n_more);
+    if (need_blocks == 0) {
         return true;
     }
-    const std::uint32_t need_blocks =
-        (want - have + geom_.block_tokens - 1) / geom_.block_tokens;
     if (need_blocks > alloc_.free_blocks()) {
         return false;  // all-or-nothing
     }
