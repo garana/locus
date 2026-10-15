@@ -1,11 +1,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
@@ -906,4 +908,153 @@ TEST_CASE("server emits 499 + error envelope on a cancelled request",
         const auto b = json::parse(body_of(resp));
         REQUIRE(!b["choices"][0]["text"].get<std::string>().empty());
     }
+}
+
+namespace {
+
+/** Minimal HTTP/1.1 GET with Connection: close (for /health, /metrics). */
+std::string make_get(const std::string& path) {
+    return "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
+           "Connection: close\r\n\r\n";
+}
+
+/** Reads a Prometheus gauge/counter value line "name <number>" from a
+ *  /metrics body. Matches only a value line (name at column 0 followed
+ *  by a space and a digit), so it never picks up the "# HELP name" or
+ *  "# TYPE name" lines. @returns the value, or -1 if absent. */
+long metric_value(const std::string& body, const std::string& name) {
+    const std::string key = "\n" + name + " ";
+    // Allow a match at the very start of the body too.
+    std::size_t pos =
+        body.compare(0, name.size() + 1, name + " ") == 0 ? 0
+                                                           : body.find(key);
+    if (pos == std::string::npos) {
+        return -1;
+    }
+    const std::size_t num = (pos == 0 ? 0 : pos + 1) + name.size() + 1;
+    if (num >= body.size() || body[num] < '0' || body[num] > '9') {
+        return -1;
+    }
+    return std::atol(body.c_str() + num);
+}
+
+/** GETs /metrics and returns the named metric's value, or -1. */
+long scrape_metric(int port, const std::string& name) {
+    const int fd = locus::pipeline::connect_to("127.0.0.1", port, 2000);
+    if (fd < 0) {
+        return -1;
+    }
+    locus::pipeline::set_recv_timeout(fd, 3000);
+    const bool sent = send_all(fd, make_get("/metrics"));
+    const std::string resp = sent ? recv_to_eof(fd) : std::string();
+    ::close(fd);
+    return metric_value(body_of(resp), name);
+}
+
+}  // namespace
+
+// Follow-up to i#81 (cancel on disconnect) / i#85 + i#88 (fast-path
+// acceptor): the STREAMING cancel path is reached by the Sink write
+// FAILING, not by the liveness probe (server.cpp: the cancel lives only
+// in the !stream branch; the stream path cancels when sink.write returns
+// false). Under CONCURRENT mid-stream client aborts this path must not
+// race, hang a worker, double-free an id, or leak KV. The specific
+// hazards, all only reachable under real multi-core parallelism (an
+// arm64 CI box with 2 cores cannot drive them):
+//   - double release: a generation that finishes as its client dies runs
+//     BOTH the terminal release and the write-failure release for the
+//     same id; this must be idempotent under contention, not just in
+//     isolation.
+//   - turnstile: each streaming cancel joins the read_waiters_ turnstile
+//     against the running worker, so N concurrent aborts are N
+//     concurrent turnstile entries -- the lost-wakeup-adjacent surface.
+// Aborts are HARD closes (not shutdown(SHUT_WR)): only a hard close makes
+// the server's next send() fail, which is what the streaming path keys
+// on. Run under ASan to catch a use-after-free from the double release.
+TEST_CASE("server survives concurrent mid-stream SSE aborts",
+          "[server][e2e][stress]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    TestServer ts(model, tok);
+
+    // Baseline KV (also proves /metrics works before the storm).
+    const long free_before = scrape_metric(ts.port, "locus_kv_blocks_free");
+    REQUIRE(free_before > 0);
+
+    // Many concurrent clients that start an SSE stream, read a little
+    // (so the stream is actually flowing and a worker is engaged), then
+    // HARD close mid-stream. A short max_tokens makes some aborts land
+    // right as the generation finishes -> the double-release collision.
+    constexpr int kThreads = 24;
+    constexpr int kRounds = 4;
+    for (int round = 0; round < kRounds; ++round) {
+        std::vector<std::thread> aborters;
+        aborters.reserve(kThreads);
+        for (int i = 0; i < kThreads; ++i) {
+            aborters.emplace_back([&] {
+                const int c =
+                    locus::pipeline::connect_to("127.0.0.1", ts.port, 2000);
+                if (c < 0) {
+                    return;
+                }
+                const json req{{"prompt", "Once upon a time"},
+                               {"max_tokens", 8},
+                               {"stream", true}};
+                if (send_all(c, make_post("/v1/completions", req.dump()))) {
+                    // Read briefly so the stream has started, then abort.
+                    locus::pipeline::set_recv_timeout(c, 200);
+                    char buf[64];
+                    (void)::recv(c, buf, sizeof(buf), 0);
+                }
+                ::close(c);  // hard close -> server send() fails
+            });
+        }
+        for (auto& t : aborters) {
+            t.join();
+        }
+    }
+
+    // 1. The acceptor/fast path is still responsive (a wedged worker or
+    //    acceptor would stall this).
+    {
+        const int c =
+            locus::pipeline::connect_to("127.0.0.1", ts.port, 2000);
+        REQUIRE(c >= 0);
+        locus::pipeline::set_recv_timeout(c, 5000);
+        REQUIRE(send_all(c, make_get("/health")));
+        const std::string r = recv_to_eof(c);
+        ::close(c);
+        REQUIRE(status_of(r) == 200);
+    }
+
+    // 2. The engine is not wedged: a fresh non-streaming completion still
+    //    runs to completion and returns real content.
+    {
+        const int c =
+            locus::pipeline::connect_to("127.0.0.1", ts.port, 2000);
+        REQUIRE(c >= 0);
+        locus::pipeline::set_recv_timeout(c, 20000);
+        const json req{{"prompt", "Once upon a time"}, {"max_tokens", 4}};
+        REQUIRE(send_all(c, make_post("/v1/completions", req.dump())));
+        const std::string r = recv_to_eof(c);
+        ::close(c);
+        REQUIRE(status_of(r) == 200);
+    }
+
+    // 3. No KV leak: every aborted generation released its blocks, so
+    //    free returns to the baseline. Release is async behind the
+    //    worker, so poll (bounded) rather than reading once.
+    long free_after = -1;
+    for (int i = 0; i < 400; ++i) {
+        free_after = scrape_metric(ts.port, "locus_kv_blocks_free");
+        if (free_after >= free_before) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    REQUIRE(free_after == free_before);
 }

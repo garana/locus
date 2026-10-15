@@ -119,6 +119,18 @@ struct RequestContext {
      * work may be cancelled. A handler acting on this should emit a
      * diagnosable status/body (not a default empty 200) in case the
      * detection was wrong.
+     *
+     * Deliberately NOT used by the streaming (SSE) response path: a
+     * streamed handler has stronger evidence than this probe -- the Sink
+     * write itself. A write that fails is proof the client is gone, so
+     * the stream cancels on that and need not poll client_alive; and a
+     * client that merely half-closed still has its read side open to
+     * receive the stream, so cancelling it on a FIN would be wrong. The
+     * consequence (a design choice, not an oversight): the same
+     * half-close yields a 499 on a non-streaming request but a full
+     * stream on a streaming one. Do not "fix" this by adding a liveness
+     * check to the stream; the write-failure signal is the correct one
+     * there.
      */
     std::function<bool()> client_alive;
 };
