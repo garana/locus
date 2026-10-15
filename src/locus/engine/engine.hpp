@@ -23,7 +23,20 @@ enum class Status {
     kRunning,
     kDone,
     kFailed,
+    /** Stopped early by cancel() (e.g. the client disconnected)
+     * rather than reaching EOS/max or erroring. Terminal. */
+    kCancelled,
 };
+
+/**
+ * @returns true for a terminal status -- the request will never be
+ * stepped again (kDone, kFailed, kCancelled). The single source of
+ * truth so every runnable/terminal check accounts for every state.
+ */
+inline bool is_terminal(Status s) {
+    return s == Status::kDone || s == Status::kFailed ||
+           s == Status::kCancelled;
+}
 
 /** Per-request logprobs configuration (default: disabled). */
 struct LogprobsOpt {
@@ -186,6 +199,17 @@ class Engine {
      * @param id Request id from submit().
      */
     void release(std::uint64_t id);
+
+    /**
+     * Stops a non-terminal request early: drops it from the wait/run
+     * queues, frees its KV blocks, and marks it kCancelled. No-op if
+     * the id is unknown or already terminal. A cancelled finish never
+     * inserts into the prefix cache (only kDone does). Used when a
+     * client disconnects so the engine stops decoding an abandoned
+     * request instead of running it to max_tokens.
+     * @param id Request id from submit().
+     */
+    void cancel(std::uint64_t id);
 
     /** @returns true when nothing is waiting or running. */
     bool idle() const {

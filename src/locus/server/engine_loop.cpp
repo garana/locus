@@ -116,8 +116,7 @@ EngineLoop::View EngineLoop::wait_progress(std::uint64_t id,
             read_waiters_.fetch_sub(1);
             const View v = snapshot_locked(id);
             if (v.generated.size() > n_seen ||
-                v.status == engine::Status::kDone ||
-                v.status == engine::Status::kFailed) {
+                engine::is_terminal(v.status)) {
                 return v;
             }
         }
@@ -145,10 +144,32 @@ EngineLoop::View EngineLoop::wait_done(std::uint64_t id) {
             std::unique_lock<std::mutex> lk(mu_);
             read_waiters_.fetch_sub(1);
             const View v = snapshot_locked(id);
-            if (v.status == engine::Status::kDone ||
-                v.status == engine::Status::kFailed) {
+            if (engine::is_terminal(v.status)) {
                 return v;
             }
+        }
+        std::this_thread::sleep_for(kPollBackoff);
+    }
+}
+
+EngineLoop::View EngineLoop::wait_done_or_cancel(
+    std::uint64_t id, const std::function<bool()>& alive) {
+    for (;;) {
+        read_waiters_.fetch_add(1);
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            read_waiters_.fetch_sub(1);
+            const View v = snapshot_locked(id);
+            if (engine::is_terminal(v.status)) {
+                return v;
+            }
+        }
+        // Liveness syscall runs OUTSIDE mu_ so polling the socket never
+        // blocks the worker's next step(). A gone client -> cancel and
+        // return the now-terminal (kCancelled) snapshot.
+        if (alive && !alive()) {
+            cancel(id);
+            return view(id);
         }
         std::this_thread::sleep_for(kPollBackoff);
     }
@@ -157,6 +178,24 @@ EngineLoop::View EngineLoop::wait_done(std::uint64_t id) {
 void EngineLoop::release(std::uint64_t id) {
     std::lock_guard<std::mutex> lk(mu_);
     engine_.release(id);
+}
+
+void EngineLoop::cancel(std::uint64_t id) {
+    // Join the read_waiters_ turnstile, exactly like view()/wait_*: the
+    // worker does NOT release mu_ between steps while no reader is
+    // pending, so a plain lock here would block until the whole
+    // generation finished -- cancellation would never preempt a running
+    // request. Announcing intent makes the worker yield mu_ after its
+    // current step so cancel lands mid-generation.
+    read_waiters_.fetch_add(1);
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        read_waiters_.fetch_sub(1);
+        engine_.cancel(id);
+    }
+    // Wake the worker so it re-evaluates has_runnable_work and parks if
+    // the cancelled request was the only work (harmless if it was not).
+    work_cv_.notify_all();
 }
 
 }  // namespace locus::server

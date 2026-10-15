@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -64,8 +65,27 @@ class EngineLoop {
      */
     View wait_progress(std::uint64_t id, std::size_t n_seen);
 
-    /** Blocks until the request is kDone or kFailed. */
+    /** Blocks until the request reaches a terminal state. */
     View wait_done(std::uint64_t id);
+
+    /**
+     * Like wait_done, but between polls it checks `alive()` (a client
+     * liveness probe); when that returns false the request is
+     * cancel()ed and the cancelled snapshot returned, so a request
+     * whose client has disconnected stops decoding instead of running
+     * to max_tokens. An empty `alive` means "always alive" (behaves
+     * exactly like wait_done). The probe is called OUTSIDE the engine
+     * mutex so its syscall never stalls the worker.
+     * @param id Request id.
+     * @param alive Returns true while the client is still connected.
+     * @returns The terminal snapshot (kCancelled if the client left).
+     */
+    View wait_done_or_cancel(std::uint64_t id,
+                             const std::function<bool()>& alive);
+
+    /** Stops a non-terminal request early (client disconnected): the
+     * engine drops it and frees its KV. No-op if unknown/terminal. */
+    void cancel(std::uint64_t id);
 
     /** Drops a finished request's record once its result has been
      * delivered to the client (evict-on-consume); no-op if it is not

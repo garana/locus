@@ -101,7 +101,33 @@ struct ServerResponse {
  */
 struct RequestContext {
     std::string identity;  /**< set by the head handler; read by Handler. */
+    /**
+     * Client-liveness probe the server installs before dispatch:
+     * returns true while the peer is still connected, false once it
+     * has half-closed. A long-running Handler can poll this to abandon
+     * work for a client that has gone away. Empty for callers that do
+     * not install one (treat as always-connected).
+     *
+     * Limitation: TCP gives the server no way to distinguish an
+     * orderly half-close (a client that shut its write side but still
+     * waits for the response) from an abandoned connection -- both
+     * arrive as FIN. This probe reports BOTH as gone, so a client must
+     * not half-close its request before reading the response or its
+     * work may be cancelled. A handler acting on this should emit a
+     * diagnosable status/body (not a default empty 200) in case the
+     * detection was wrong.
+     */
+    std::function<bool()> client_alive;
 };
+
+/**
+ * @returns true when the peer on `fd` has half-closed (orderly EOF) or
+ * the socket is in error, detected WITHOUT consuming any pending
+ * request bytes (0-timeout poll + MSG_PEEK). Pending inbound data or a
+ * would-block both read as "still connected", so a pipelined next
+ * request never trips it. Basis for RequestContext::client_alive.
+ */
+bool peer_half_closed(int fd);
 
 /**
  * Runs once the request HEAD is buffered, BEFORE the body is read and
