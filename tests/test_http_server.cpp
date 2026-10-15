@@ -536,3 +536,97 @@ TEST_CASE("peer_half_closed detects a closed peer without consuming",
 
     ::close(sv[0]);
 }
+
+// i#85: a fast-path route (e.g. /metrics, /health) must be served even
+// when every worker is busy in a long request. With a single worker,
+// one blocking request saturates the pool; pre-fix the fast GET waited
+// in the kernel backlog until the slow one finished (the worker was the
+// only acceptor). Post-fix the dedicated acceptor serves it inline.
+TEST_CASE("http server: fast-path route answers while the pool is busy",
+          "[http_server]") {
+    std::atomic<bool> slow_started{false};
+    std::atomic<bool> release{false};
+    auto handler = [&](const Request& req, ServerResponse& res) {
+        if (req.path == "/fast") {
+            res.status = 200;
+            res.set_content("fast", "text/plain");
+            return;
+        }
+        // /slow occupies the lone worker until released, standing in for
+        // a long generation that holds the pool.
+        slow_started.store(true);
+        while (!release.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        res.status = 200;
+        res.set_content("slow", "text/plain");
+    };
+    ServerConfig cfg;
+    cfg.worker_threads = 1;  // one worker: a single /slow saturates it
+    cfg.fast_path = [](std::string_view m, std::string_view t) {
+        return m == "GET" && t == "/fast";
+    };
+    Fixture f(handler, cfg);
+
+    // Occupy the worker with /slow on its own connection.
+    std::thread slow([&] {
+        const int c = client_connect(f.port);
+        send_all(c, "GET /slow HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+        drain(c, 3000);  // blocks in the handler until released
+        ::close(c);
+    });
+    // Always release the slow handler and join, even if an assertion
+    // below throws and aborts the case (otherwise the un-joined thread
+    // would terminate the runner).
+    struct Releaser {
+        std::atomic<bool>& release;
+        std::thread& t;
+        ~Releaser() {
+            release.store(true);
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } releaser{release, slow};
+
+    for (int i = 0; i < 2000 && !slow_started.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(slow_started.load());  // the pool is now fully busy
+
+    // The fast-path GET must come back promptly, not after /slow ends.
+    const int c = client_connect(f.port);
+    send_all(c, "GET /fast HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    const std::string r = drain(c, 1000);
+    ::close(c);
+    REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
+    REQUIRE(r.find("fast") != std::string::npos);
+}
+
+// i#85 blocker: a fast-path connection must be served ONE request and
+// closed, even on a keep-alive request. serve_connection is a keep-alive
+// loop, so if the acceptor adopted the connection for more than one
+// request, a later non-fast (inference) request on that same connection
+// would run inline on the acceptor and stall ALL accept. Assert the
+// acceptor response forces Connection: close and the socket is closed
+// after one, so it can never be adopted for a second request.
+TEST_CASE("http server: a fast-path connection serves one request and "
+          "closes (no keep-alive escape)", "[http_server]") {
+    ServerConfig cfg;
+    cfg.fast_path = [](std::string_view m, std::string_view t) {
+        return m == "GET" && t == "/fast";
+    };
+    Fixture f(echo_handler, cfg);
+    const int c = client_connect(f.port);
+    // Keep-alive request (NO Connection: close): the acceptor must still
+    // answer once and close.
+    send_all(c, "GET /fast HTTP/1.1\r\nHost: h\r\n\r\n");
+    const std::string r1 = drain(c);
+    REQUIRE(r1.find("HTTP/1.1 200 OK") != std::string::npos);
+    REQUIRE(r1.find("Connection: close") != std::string::npos);
+    // A second request on the SAME socket gets nothing: it was closed,
+    // so the acceptor can never be carried into a later request.
+    send_all(c, "GET /fast HTTP/1.1\r\nHost: h\r\n\r\n");
+    REQUIRE(drain(c).empty());
+    ::close(c);
+}
