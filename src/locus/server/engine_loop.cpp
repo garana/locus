@@ -3,6 +3,8 @@
 #include <chrono>
 #include <thread>
 
+#include "locus/sys/perf_counters.hpp"
+
 namespace locus::server {
 
 namespace {
@@ -49,6 +51,10 @@ std::uint64_t EngineLoop::submit(
 }
 
 void EngineLoop::run() {
+    // The engine worker drives the forward pass and runs the inline
+    // matvec slice, so register its cache counters for /metrics too (the
+    // pool workers cover the fan-out). No-op unless perf is available.
+    locus::sys::perf::ThreadCounters perf_counters;
     std::unique_lock<std::mutex> lk(mu_);
     while (!stop_) {
         engine_.step();

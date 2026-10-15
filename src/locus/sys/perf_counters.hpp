@@ -1,0 +1,58 @@
+#pragma once
+
+#include <cstdint>
+
+// Per-thread CPU cache performance counters, summed across the inference
+// compute threads and surfaced on /metrics. Linux only (raw
+// perf_event_open, no dependency); a cleanly absent no-op elsewhere and
+// whenever the kernel denies the counters (perf_event_paranoid /
+// CAP_PERFMON). The point is to watch the cache-miss rate over time, the
+// signal that tells you CPU decode is memory-bandwidth-bound.
+namespace locus::sys::perf {
+
+/**
+ * @returns true when per-thread cache counters can be opened on this
+ * host (Linux, and perf_event_open permitted). Probed once and cached.
+ * When false, ThreadCounters is a no-op and read_totals() is zero, and
+ * callers should omit the metric rather than report zeros.
+ */
+bool available();
+
+/** Cache counters summed over all live registered compute threads.
+ *  All-zero when !available(). Counts are free-running and monotonic
+ *  for the life of each thread; a thread's contribution disappears when
+ *  it exits (so these are process-uptime counters, not all-time). */
+struct Totals {
+    std::uint64_t cache_references = 0;
+    std::uint64_t cache_misses = 0;
+    std::uint64_t llc_load_misses = 0;
+};
+
+/**
+ * Sums read() over every registered thread's counters. Cheap -- a
+ * handful of fds read under a short lock -- so it is safe on the
+ * /metrics accept path (see i#85). Returns zeros when !available().
+ */
+Totals read_totals();
+
+/**
+ * RAII guard: construct once at the top of a compute thread's body. On
+ * Linux with counters available it opens this thread's cache counters
+ * and registers them; it closes and unregisters them on destruction. A
+ * no-op when !available() or on non-Linux, so it is safe to place
+ * unconditionally.
+ */
+class ThreadCounters {
+  public:
+    ThreadCounters();
+    ~ThreadCounters();
+    ThreadCounters(const ThreadCounters&) = delete;
+    ThreadCounters& operator=(const ThreadCounters&) = delete;
+
+  private:
+    // Opaque registry handle (null = unregistered). maybe_unused: the
+    // non-Linux build's ctor/dtor are no-ops that never touch it.
+    [[maybe_unused]] void* entry_ = nullptr;
+};
+
+}  // namespace locus::sys::perf

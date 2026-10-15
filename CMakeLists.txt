@@ -55,6 +55,7 @@ add_library(locus
     src/locus/sys/mmap_file.cpp
     src/locus/sys/poller.cpp
     src/locus/sys/thread_pool.cpp
+    src/locus/sys/perf_counters.cpp
     src/locus/tok/bpe_tokenizer.cpp
     src/locus/tok/tokenizer.cpp
 )

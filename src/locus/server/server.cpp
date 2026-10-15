@@ -12,6 +12,7 @@
 #include "locus/auth/helper_spawn.hpp"
 #include "locus/model/grammar.hpp"
 #include "locus/server/tools.hpp"
+#include "locus/sys/perf_counters.hpp"
 
 namespace locus::server {
 
@@ -500,6 +501,26 @@ void OpenAiServer::install_routes() {
                   s.total_blocks);
             gauge("locus_kv_blocks_free", "Free KV cache blocks.",
                   s.free_blocks);
+            // CPU cache counters for the inference compute threads
+            // (Linux perf). Absent -- not zero -- when unavailable
+            // (non-Linux, or perf_event_paranoid denies it), so a
+            // scraper can tell "no counters" from "no misses". Read is a
+            // few fds summed under a short lock, cheap enough for the
+            // acceptor path this handler runs on (i#85).
+            if (locus::sys::perf::available()) {
+                const locus::sys::perf::Totals pc =
+                    locus::sys::perf::read_totals();
+                counter("locus_cpu_cache_references_total",
+                        "CPU cache references, inference compute threads.",
+                        pc.cache_references);
+                counter("locus_cpu_cache_misses_total",
+                        "CPU cache misses, inference compute threads.",
+                        pc.cache_misses);
+                counter("locus_cpu_llc_load_misses_total",
+                        "LLC load misses, inference compute threads "
+                        "(DRAM-traffic signal).",
+                        pc.llc_load_misses);
+            }
             res.set_content(b, "text/plain; version=0.0.4");
     };
 
