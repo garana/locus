@@ -1,3 +1,7 @@
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -8,6 +12,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/grammar.hpp"
 #include "locus/model/transformer.hpp"
+#include "locus/pipeline/net.hpp"
 #include "locus/server/server.hpp"
 #include "locus/tok/tokenizer.hpp"
 #include "httplib.h"
@@ -730,5 +735,175 @@ TEST_CASE("prompt caching reports cache-hit usage fields",
                         ub["cache_creation_input_tokens"].get<int>();
         REQUIRE(sum == full);
         REQUIRE(ub["input_tokens"].get<int>() < full);
+    }
+}
+
+namespace {
+
+/** Minimal HTTP/1.1 POST with a JSON body and Connection: close, so the
+ *  server frames the request by Content-Length and closes after
+ *  responding (the client then reads to EOF). */
+std::string make_post(const std::string& path, const std::string& body) {
+    return "POST " + path + " HTTP/1.1\r\n" +
+           "Host: 127.0.0.1\r\n" +
+           "Content-Type: application/json\r\n" +
+           "Content-Length: " + std::to_string(body.size()) + "\r\n" +
+           "Connection: close\r\n\r\n" + body;
+}
+
+bool send_all(int fd, const std::string& s) {
+    std::size_t off = 0;
+    while (off < s.size()) {
+        const ssize_t n = ::send(fd, s.data() + off, s.size() - off, 0);
+        if (n <= 0) {
+            return false;
+        }
+        off += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
+/** Reads the whole response to EOF (Connection: close). */
+std::string recv_to_eof(int fd) {
+    std::string out;
+    char buf[4096];
+    for (;;) {
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) {
+            break;
+        }
+        out.append(buf, static_cast<std::size_t>(n));
+    }
+    return out;
+}
+
+/** Parses the status code from an HTTP response's first line. */
+int status_of(const std::string& resp) {
+    // "HTTP/1.1 <code> <reason>\r\n"
+    const auto sp = resp.find(' ');
+    if (sp == std::string::npos) {
+        return -1;
+    }
+    return std::atoi(resp.c_str() + sp + 1);
+}
+
+/** The JSON body after the blank line, or "" if none. */
+std::string body_of(const std::string& resp) {
+    const auto hdr_end = resp.find("\r\n\r\n");
+    return hdr_end == std::string::npos
+               ? std::string()
+               : resp.substr(hdr_end + 4);
+}
+
+}  // namespace
+
+// i#83 (follow-up to i#81): the non-streaming cancelled path must emit
+// 499 Client Closed Request plus the route's error envelope, not a bare
+// empty 200 (which a half-closed client would read as a valid empty
+// completion). The loop-layer kCancelled wiring is covered elsewhere;
+// this pins the ROUTE-level 499 emission and the per-route body shape,
+// end to end through the real socket, peer_half_closed, and client_alive.
+//
+// Deterministic trigger (no sleep, no engine race): send the COMPLETE
+// request, then shutdown(SHUT_WR) with the read side open. The body is
+// buffered before dispatch, so the handler's first client_alive poll
+// sees peer_half_closed's EOF and cancels before the first decode step.
+// The negative control -- same request, no half-close -- returns 200
+// with real content, proving the half-close is what causes the 499.
+TEST_CASE("server emits 499 + error envelope on a cancelled request",
+          "[server][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    TestServer ts(model, tok);
+
+    // 64 new tokens so the request is still generating (not already
+    // terminal) when the handler's first liveness poll runs.
+    const json completions_body{{"prompt", "Once upon a time"},
+                                {"max_tokens", 64}};
+    const json chat_body{
+        {"messages", json::array({{{"role", "user"},
+                                   {"content", "Once upon a time"}}})},
+        {"max_tokens", 64}};
+
+    // Sends `body` to `path`, half-closes the write side, and returns the
+    // full response read to EOF.
+    auto cancel_via_halfclose = [&](const std::string& path,
+                                    const json& body) {
+        const int fd =
+            locus::pipeline::connect_to("127.0.0.1", ts.port, 2000);
+        REQUIRE(fd >= 0);
+        // Bound the read so a hung handler fails fast instead of wedging
+        // the whole suite (which runs with no external timeout). 5000 ms
+        // is a wide margin over the slowest LEGITIMATE wait here -- the
+        // negative control's full 64-token generation, tens of ms even on
+        // the slowest host -- while still well under any CI budget; it is
+        // a hang bound, not an idle-gap heuristic like drain()'s 300 ms.
+        // On a timeout recv returns -1/EAGAIN, recv_to_eof returns what it
+        // has (nothing), and status_of("") is -1, so a hang surfaces as a
+        // legible `-1 == 499` ("no response arrived"), not a wrong status.
+        locus::pipeline::set_recv_timeout(fd, 5000);
+        REQUIRE(send_all(fd, make_post(path, body.dump())));
+        // The whole request is now sent; closing just the write side
+        // delivers a FIN after it, which peer_half_closed reads as EOF.
+        REQUIRE(::shutdown(fd, SHUT_WR) == 0);
+        const std::string resp = recv_to_eof(fd);
+        ::close(fd);
+        return resp;
+    };
+
+    SECTION("/v1/completions -> 499, OpenAI flat error envelope") {
+        const std::string resp =
+            cancel_via_halfclose("/v1/completions", completions_body);
+        REQUIRE(status_of(resp) == 499);
+        const auto b = json::parse(body_of(resp));
+        REQUIRE(b.contains("error"));
+        // i#75 (error-body unification) tracks that this type is
+        // misdescriptive for a cancellation -- the request was well
+        // formed, the client left -- yet make_error hardcodes
+        // "invalid_request_error". Pinned as-is here; do NOT change the
+        // type in i#83 (client-visible; belongs to i#75's gate).
+        REQUIRE(b["error"]["type"] == "invalid_request_error");
+        REQUIRE(b["error"]["message"].get<std::string>().find(
+                    "cancelled") != std::string::npos);
+    }
+
+    SECTION("/v1/chat/completions -> 499, OpenAI flat error envelope") {
+        const std::string resp =
+            cancel_via_halfclose("/v1/chat/completions", chat_body);
+        REQUIRE(status_of(resp) == 499);
+        const auto b = json::parse(body_of(resp));
+        REQUIRE(b.contains("error"));
+        REQUIRE(b["error"]["type"] == "invalid_request_error");  // see i#75
+    }
+
+    SECTION("/v1/messages -> 499, Anthropic nested error envelope") {
+        const std::string resp =
+            cancel_via_halfclose("/v1/messages", chat_body);
+        REQUIRE(status_of(resp) == 499);
+        const auto b = json::parse(body_of(resp));
+        REQUIRE(b["type"] == "error");
+        REQUIRE(b["error"]["type"] == "api_error");
+        REQUIRE(b["error"]["message"].get<std::string>().find(
+                    "cancelled") != std::string::npos);
+    }
+
+    SECTION("negative control: no half-close -> 200 with real content") {
+        const int fd =
+            locus::pipeline::connect_to("127.0.0.1", ts.port, 2000);
+        REQUIRE(fd >= 0);
+        locus::pipeline::set_recv_timeout(fd, 5000);  // hang bound; see above
+        REQUIRE(send_all(fd, make_post("/v1/completions",
+                                       completions_body.dump())));
+        // No shutdown: the client stays connected, so client_alive holds
+        // and the request runs to completion.
+        const std::string resp = recv_to_eof(fd);
+        ::close(fd);
+        REQUIRE(status_of(resp) == 200);
+        const auto b = json::parse(body_of(resp));
+        REQUIRE(!b["choices"][0]["text"].get<std::string>().empty());
     }
 }
