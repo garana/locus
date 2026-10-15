@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <mutex>
 #include <vector>
 
@@ -21,8 +22,22 @@ struct Entry {
     int fd_llc = -1;
 };
 
+// LL (last-level) read-miss. Factored out because both the probe and
+// ThreadCounters open it, and it is the event ARM PMUs most often lack.
+constexpr std::uint64_t kLlcConfig =
+    static_cast<std::uint64_t>(PERF_COUNT_HW_CACHE_LL) |
+    (static_cast<std::uint64_t>(PERF_COUNT_HW_CACHE_OP_READ) << 8) |
+    (static_cast<std::uint64_t>(PERF_COUNT_HW_CACHE_RESULT_MISS) << 16);
+
 std::mutex g_mu;
 std::vector<Entry*> g_entries;  // live registered compute threads
+
+// Probed once (ensure_probed): whether perf_event_open is permitted at
+// all, and which of the three cache events this PMU actually implements.
+bool g_permitted = false;
+bool g_have_ref = false;
+bool g_have_miss = false;
+bool g_have_llc = false;
 
 // Open a per-THREAD (pid 0), any-CPU (cpu -1) counter, counting now.
 // exclude_kernel=1 keeps it to user space, which is what the common
@@ -41,37 +56,73 @@ int perf_open(std::uint32_t type, std::uint64_t config) {
     return static_cast<int>(fd);
 }
 
+// @returns true if the event can be opened here (permitted AND
+// implemented by the PMU).
+bool probe_event(std::uint32_t type, std::uint64_t config) {
+    const int fd = perf_open(type, config);
+    if (fd < 0) {
+        return false;
+    }
+    ::close(fd);
+    return true;
+}
+
+void ensure_probed() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        // A software event is permitted whenever perf is permitted at
+        // all, so it separates a blanket paranoid/CAP_PERFMON denial
+        // (whole feature absent) from a PMU that merely lacks a specific
+        // hardware event (just that one metric absent).
+        if (!probe_event(PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK)) {
+            return;  // denied outright; g_permitted stays false
+        }
+        g_permitted = true;
+        g_have_ref =
+            probe_event(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_REFERENCES);
+        g_have_miss =
+            probe_event(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES);
+        g_have_llc = probe_event(PERF_TYPE_HW_CACHE, kLlcConfig);
+    });
+}
+
 std::uint64_t read_one(int fd) {
     if (fd < 0) {
         return 0;
     }
-    std::uint64_t v = 0;
-    const ssize_t n = ::read(fd, &v, sizeof(v));
-    return n == static_cast<ssize_t>(sizeof(v)) ? v : 0;
+    for (;;) {
+        std::uint64_t v = 0;
+        const ssize_t n = ::read(fd, &v, sizeof(v));
+        if (n == static_cast<ssize_t>(sizeof(v))) {
+            return v;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;  // retry: never let a signal make a monotonic
+                       // counter dip (which a scraper reads as a reset)
+        }
+        return 0;
+    }
 }
 
 }  // namespace
 
 bool available() {
-    // Probe once: if the kernel lets us open a cache-references counter
-    // on this thread, per-thread counters work for the process.
-    static const bool ok = [] {
-        const int fd =
-            perf_open(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_REFERENCES);
-        if (fd < 0) {
-            return false;
-        }
-        ::close(fd);
-        return true;
-    }();
-    return ok;
+    ensure_probed();
+    return g_permitted;
 }
 
 Totals read_totals() {
     Totals t;
-    if (!available()) {
-        return t;
+    ensure_probed();
+    if (!g_permitted) {
+        return t;  // all values 0, all have_* false -> caller omits
     }
+    // Per-event validity: a PMU may implement some events and not
+    // others (e.g. ARM often lacks the LL event), so the caller omits a
+    // metric whose event is unavailable rather than report a false 0.
+    t.have_references = g_have_ref;
+    t.have_misses = g_have_miss;
+    t.have_llc = g_have_llc;
     std::lock_guard<std::mutex> lk(g_mu);
     for (const Entry* e : g_entries) {
         t.cache_references += read_one(e->fd_ref);
@@ -88,12 +139,7 @@ ThreadCounters::ThreadCounters() {
     auto* e = new Entry;
     e->fd_ref = perf_open(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_REFERENCES);
     e->fd_miss = perf_open(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES);
-    e->fd_llc = perf_open(
-        PERF_TYPE_HW_CACHE,
-        static_cast<std::uint64_t>(PERF_COUNT_HW_CACHE_LL) |
-            (static_cast<std::uint64_t>(PERF_COUNT_HW_CACHE_OP_READ) << 8) |
-            (static_cast<std::uint64_t>(PERF_COUNT_HW_CACHE_RESULT_MISS)
-             << 16));
+    e->fd_llc = perf_open(PERF_TYPE_HW_CACHE, kLlcConfig);
     if (e->fd_ref < 0 && e->fd_miss < 0 && e->fd_llc < 0) {
         delete e;  // nothing opened; stay unregistered
         return;

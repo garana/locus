@@ -19,13 +19,20 @@ namespace locus::sys::perf {
 bool available();
 
 /** Cache counters summed over all live registered compute threads.
- *  All-zero when !available(). Counts are free-running and monotonic
- *  for the life of each thread; a thread's contribution disappears when
- *  it exits (so these are process-uptime counters, not all-time). */
+ *  All-zero / all-invalid when !available(). Counts are free-running
+ *  and monotonic for the life of each thread; a thread's contribution
+ *  disappears when it exits (so these are process-uptime counters, not
+ *  all-time). Each have_* flag is false when that specific event is not
+ *  implemented by this host's PMU (common for the LLC event on ARM):
+ *  the caller must OMIT a metric whose event is invalid rather than
+ *  report a misleading zero. */
 struct Totals {
     std::uint64_t cache_references = 0;
     std::uint64_t cache_misses = 0;
     std::uint64_t llc_load_misses = 0;
+    bool have_references = false;
+    bool have_misses = false;
+    bool have_llc = false;
 };
 
 /**
@@ -41,6 +48,12 @@ Totals read_totals();
  * and registers them; it closes and unregisters them on destruction. A
  * no-op when !available() or on non-Linux, so it is safe to place
  * unconditionally.
+ *
+ * A registrant MUST outlive the /metrics scrape window: read_totals()
+ * sums only live registrants, so a thread that registers, counts, and
+ * exits makes the aggregate DROP -- which a Prometheus _total reads as
+ * a reset. Today every registrant is process-lifetime (the ThreadPool
+ * workers, the EngineLoop worker); keep it that way for anything new.
  */
 class ThreadCounters {
   public:

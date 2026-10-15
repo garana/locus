@@ -510,16 +510,26 @@ void OpenAiServer::install_routes() {
             if (locus::sys::perf::available()) {
                 const locus::sys::perf::Totals pc =
                     locus::sys::perf::read_totals();
-                counter("locus_cpu_cache_references_total",
-                        "CPU cache references, inference compute threads.",
-                        pc.cache_references);
-                counter("locus_cpu_cache_misses_total",
-                        "CPU cache misses, inference compute threads.",
-                        pc.cache_misses);
-                counter("locus_cpu_llc_load_misses_total",
-                        "LLC load misses, inference compute threads "
-                        "(DRAM-traffic signal).",
-                        pc.llc_load_misses);
+                // Emit each only if its event is implemented on this PMU
+                // (have_*): an unimplemented event is ABSENT, never a
+                // misleading 0 (ARM often lacks the LLC event).
+                if (pc.have_references) {
+                    counter("locus_cpu_cache_references_total",
+                            "CPU cache references, inference compute "
+                            "threads.",
+                            pc.cache_references);
+                }
+                if (pc.have_misses) {
+                    counter("locus_cpu_cache_misses_total",
+                            "CPU cache misses, inference compute threads.",
+                            pc.cache_misses);
+                }
+                if (pc.have_llc) {
+                    counter("locus_cpu_llc_load_misses_total",
+                            "LLC load misses, inference compute threads "
+                            "(DRAM-traffic signal).",
+                            pc.llc_load_misses);
+                }
             }
             res.set_content(b, "text/plain; version=0.0.4");
     };

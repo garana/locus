@@ -29,12 +29,21 @@ TEST_CASE("perf counters: register, read, unregister", "[perf]") {
         return;
     }
 
-    // Available: a registered thread doing real memory traffic must push
-    // the aggregate cache-references above zero, and after it exits (its
-    // ThreadCounters destructs and unregisters) the aggregate returns to
-    // zero.
-    std::thread worker([] {
-        ThreadCounters guard;  // registers this thread's counters
+    // Available: a registered thread doing real memory traffic must
+    // RAISE the aggregate while it runs, and its (large) contribution
+    // must DROP OUT when it exits and unregisters. Assertions are
+    // baseline-relative, not absolute: the matvec ThreadPool is a
+    // singleton whose workers register at first use and never exit, so
+    // other registered threads may already be counting; only the
+    // spawned worker's own delta is a reliable signal.
+    const Totals base = read_totals();  // whatever is already live
+    if (!base.have_references) {
+        SUCCEED("cache-references event not implemented on this PMU");
+        return;
+    }
+    Totals inside;
+    std::thread worker([&] {
+        ThreadCounters guard;  // registers THIS thread's counters
         std::vector<std::uint64_t> buf(1u << 20, 1);  // 8 MiB
         volatile std::uint64_t sum = 0;
         for (int pass = 0; pass < 50; ++pass) {
@@ -43,11 +52,11 @@ TEST_CASE("perf counters: register, read, unregister", "[perf]") {
             }
         }
         (void)sum;
-        const Totals t = read_totals();  // still registered here
-        REQUIRE(t.cache_references > 0);
+        inside = read_totals();  // base + this worker's own traffic
     });
     worker.join();
 
     const Totals after = read_totals();  // worker unregistered on exit
-    REQUIRE(after.cache_references == 0);
+    REQUIRE(inside.cache_references > base.cache_references);
+    REQUIRE(after.cache_references < inside.cache_references);
 }
