@@ -1,8 +1,10 @@
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -125,4 +127,49 @@ TEST_CASE("EngineLoop cancels a request when its client disconnects",
     // The engine reclaimed the slot: a fresh request still completes.
     const auto v2 = loop.wait_done(loop.submit(prompt, 4));
     REQUIRE(v2.status == locus::engine::Status::kDone);
+}
+
+// i#81 turnstile regression (deterministic): EngineLoop::cancel must
+// join the read_waiters_ turnstile, or it cannot preempt a running
+// worker -- run() holds mu_ across step() and yields it ONLY when a
+// read-waiter is pending, so a cancel that does not register one blocks
+// until the generation finishes and then no-ops on an already-terminal
+// request. The test above cannot guard this (its view() poll registers
+// a waiter and opens the gate anyway); this one can, by cancelling with
+// NO prior poll: read_waiters_ stays 0, the worker holds mu_ across
+// every step, so only a turnstile-registering cancel gets in mid-flight.
+// Discriminator is preemption (kCancelled, far short of max_new), not a
+// clock: with the turnstile cancel lands in ~1 ms a few dozen tokens in;
+// without it, it blocks to completion -> kDone at max_new. A huge
+// max_new with a never-emitted EOS keeps generation long on any host so
+// the fixed head start is always a small fraction of it.
+TEST_CASE("EngineLoop cancel preempts a running worker (turnstile)",
+          "[e2e][engine_loop]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::engine::Engine::Config cfg;
+    const locus::tok::TokenId never_eos = model.hparams().n_vocab;
+    locus::server::EngineLoop loop(model, never_eos, cfg);
+
+    const auto prompt = tok.encode("Once upon a time", true);
+    loop.wait_done(loop.submit(prompt, 4));  // warm the weights in
+
+    const std::uint32_t max_new = 4096;
+    const std::uint64_t id = loop.submit(prompt, max_new);
+
+    // Let the worker get into generation WITHOUT polling -- no view() or
+    // wait_* here, so read_waiters_ stays 0 and run() never yields mu_
+    // between steps. That is the exact condition a non-turnstile cancel
+    // could not break into.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    loop.cancel(id);
+    const auto v = loop.view(id);
+
+    REQUIRE(v.status == locus::engine::Status::kCancelled);  // preempted
+    REQUIRE(v.generated.size() < max_new);  // not run to completion
 }
