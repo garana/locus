@@ -591,6 +591,7 @@ std::string status_reason(int status) {
         case 408: return "Request Timeout";
         case 413: return "Content Too Large";
         case 429: return "Too Many Requests";
+        case 499: return "Client Closed Request";
         case 500: return "Internal Server Error";
         case 501: return "Not Implemented";
         case 503: return "Service Unavailable";

@@ -107,6 +107,15 @@ struct RequestContext {
      * has half-closed. A long-running Handler can poll this to abandon
      * work for a client that has gone away. Empty for callers that do
      * not install one (treat as always-connected).
+     *
+     * Limitation: TCP gives the server no way to distinguish an
+     * orderly half-close (a client that shut its write side but still
+     * waits for the response) from an abandoned connection -- both
+     * arrive as FIN. This probe reports BOTH as gone, so a client must
+     * not half-close its request before reading the response or its
+     * work may be cancelled. A handler acting on this should emit a
+     * diagnosable status/body (not a default empty 200) in case the
+     * detection was wrong.
      */
     std::function<bool()> client_alive;
 };

@@ -604,7 +604,20 @@ void OpenAiServer::install_routes() {
             // (evict-on-consume) -- nothing below touches the id.
             loop_.release(id);
             if (v.status == engine::Status::kCancelled) {
-                return;  // client gone: nothing to send
+                // Client disconnected before the response. Emit a
+                // diagnosable 499 rather than the default 200/empty: a
+                // client that merely half-closed its write side
+                // (indistinguishable from abandonment over TCP -- see
+                // http::RequestContext::client_alive) would otherwise
+                // read a bare 200 as a valid empty completion. The write
+                // is discarded when the client really is gone.
+                res.status = 499;
+                res.set_content(
+                    make_error("request cancelled: client closed the "
+                               "connection")
+                        .dump(),
+                    "application/json");
+                return;
             }
             if (v.status == engine::Status::kFailed) {
                 res.status = 500;
@@ -894,7 +907,19 @@ void OpenAiServer::install_routes() {
             auto v = loop_.wait_done_or_cancel(id, ctx.client_alive);
             loop_.release(id);  // consumed: drop the engine record
             if (v.status == engine::Status::kCancelled) {
-                return;  // client gone: nothing to send
+                // Client disconnected before the response (see the
+                // completions path and client_alive): 499 + the
+                // Anthropic error envelope, never a default 200/empty.
+                res.status = 499;
+                res.set_content(
+                    json{{"type", "error"},
+                         {"error",
+                          {{"type", "api_error"},
+                           {"message", "request cancelled: client "
+                                       "closed the connection"}}}}
+                        .dump(),
+                    "application/json");
+                return;
             }
             if (v.status == engine::Status::kFailed) {
                 res.status = 500;

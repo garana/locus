@@ -102,13 +102,21 @@ TEST_CASE("EngineLoop cancels a request when its client disconnects",
     const std::uint32_t max_new = 512;
     const std::uint64_t id = loop.submit(prompt, max_new);
 
-    // The client is already gone: the probe reports not-alive on the
-    // first poll, so wait_done_or_cancel cancels the request instead of
-    // blocking until the full generation completes. (The deterministic
-    // mid-flight cancel + KV reclaim is covered single-threaded by the
-    // engine test; here we only prove the loop's probe -> cancel
-    // wiring, free of a race with the tiny model's own completion.)
-    std::function<bool()> alive = [] { return false; };
+    // Stay "connected" until the request is a couple tokens into
+    // generation, then drop: this exercises a genuine MID-FLIGHT cancel
+    // through wait_done_or_cancel (probe -> cancel -> kCancelled), not
+    // just a pre-start one. The never-emitted EOS keeps the request
+    // running (512 tokens) so it cannot self-complete and race the
+    // cancel. NOTE: this is an integration test of the wiring, not a
+    // deterministic guard of the EngineLoop turnstile -- a polling loop
+    // cannot be one (the view() poll itself registers a read-waiter, so
+    // even a non-turnstile cancel can win the relock race). The
+    // turnstile is correct by inspection of run()'s contract, and
+    // engine_.cancel() is covered deterministically by the engine test.
+    // view() inside the probe is safe: it runs outside the wait's lock.
+    std::function<bool()> alive = [&loop, id] {
+        return loop.view(id).generated.size() < 2;
+    };
     const auto v = loop.wait_done_or_cancel(id, alive);
 
     REQUIRE(v.status == locus::engine::Status::kCancelled);
