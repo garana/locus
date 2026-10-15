@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -17,6 +18,18 @@
 namespace locus::http {
 
 namespace {
+
+// How long an accepted connection may sit unclassified before it is
+// handed to the worker pool. This is a DEADLINE enforced by the
+// acceptor's poll set, not a per-connection blocking wait: N clients
+// that connect and send nothing cost one wait of this length in total,
+// where the pre-i#88 blocking peek cost N x this, serially. Keeping the
+// value (rather than shrinking it) is deliberate: over a real network a
+// genuine fast-path request line arrives a round trip after connect, and
+// a short bound would misclassify those scrapes as non-fast and return
+// them to the pool, which is the starvation the fast path exists to
+// remove.
+constexpr int kClassifyDeadlineMs = 100;
 
 // send() flag that suppresses SIGPIPE on a write to a closed peer, where
 // the platform offers it (Linux). On macOS/BSD the same is achieved with
@@ -313,6 +326,13 @@ void Server::stop() {
         }
     }
     workers_.clear();
+    // Close any connections the acceptor accepted but never classified.
+    // No lock: the acceptor is the only writer and it has been joined
+    // above, so nothing can touch unclassified_ now.
+    for (const Unclassified& u : unclassified_) {
+        ::close(u.fd);
+    }
+    unclassified_.clear();
     // Close any connections the acceptor queued but no worker served.
     {
         std::lock_guard<std::mutex> lk(handoff_mu_);
@@ -361,16 +381,14 @@ void Server::worker_loop() {
 
 bool Server::peek_request_line(int fd, std::string& method,
                                std::string& target) {
-    // Non-consuming peek of "METHOD TARGET ..." bounded by a short poll
-    // and a small window, so a slow or partial client cannot stall the
-    // acceptor: anything not immediately a full request line is treated
-    // as non-fast and handed to the pool, where the head deadline rules.
-    constexpr int kPeekMs = 100;
+    // Non-consuming peek of "METHOD TARGET ..." from a fd the poll set
+    // has already reported readable. There is deliberately NO poll here:
+    // this used to wait up to 100 ms per connection, which serialized the
+    // sole acceptor at ~100 ms per silent client (i#88). Waiting for
+    // readability is now the poll set's job; the window stays small, so
+    // anything not a full request line is treated as non-fast and handed
+    // to the pool, where the head deadline rules.
     char buf[256];
-    pollfd p{fd, POLLIN, 0};
-    if (::poll(&p, 1, kPeekMs) <= 0 || (p.revents & POLLIN) == 0) {
-        return false;
-    }
     const ssize_t n = ::recv(fd, buf, sizeof(buf), MSG_PEEK | MSG_DONTWAIT);
     if (n <= 0) {
         return false;
@@ -394,10 +412,160 @@ bool Server::peek_request_line(int fd, std::string& method,
     return true;
 }
 
+bool Server::enqueue_handoff(int fd, const std::string& peer_ip) {
+    // Bound the queue so a flood of slow requests cannot grow userspace
+    // fds without limit: before the accept/serve split, connections
+    // beyond the pool waited UNREAD in the kernel backlog (no fd). Cap
+    // the handoff at the same backlog; beyond it the caller closes,
+    // shedding load rather than accumulating it.
+    const std::size_t cap =
+        cfg_.listen_backlog > 0
+            ? static_cast<std::size_t>(cfg_.listen_backlog)
+            : 128;
+    {
+        std::lock_guard<std::mutex> lk(handoff_mu_);
+        if (handoff_.size() >= cap) {
+            return false;
+        }
+        handoff_.push_back(Pending{fd, peer_ip});
+    }
+    handoff_cv_.notify_one();
+    return true;
+}
+
+void Server::unwatch_unclassified(int fd) {
+    unclassified_.erase(
+        std::remove_if(unclassified_.begin(), unclassified_.end(),
+                       [fd](const Unclassified& u) { return u.fd == fd; }),
+        unclassified_.end());
+}
+
+void Server::accept_one_conn() {
+    std::string peer_ip;
+    const int fd = locus::pipeline::accept_one(listen_fd_, &peer_ip, 0);
+    if (fd < 0) {
+        return;  // transient
+    }
+    if (!locus::pipeline::ip_allowed(peer_ip, cfg_.allow)) {
+        ::close(fd);
+        return;
+    }
+    // Nothing to classify without a fast_path predicate: straight to the
+    // pool, exactly as before the fast path existed.
+    if (!cfg_.fast_path) {
+        if (!enqueue_handoff(fd, peer_ip)) {
+            ::close(fd);
+        }
+        return;
+    }
+    // Cap the unclassified set for the same reason the handoff is capped:
+    // an unbounded one would just move the fd-accumulation vector here.
+    // Full means we stop classifying, not that we stop serving, so the
+    // connection goes to the pool (its head deadline rules there).
+    const std::size_t cap =
+        cfg_.listen_backlog > 0
+            ? static_cast<std::size_t>(cfg_.listen_backlog)
+            : 128;
+    if (unclassified_.size() >= cap) {
+        if (!enqueue_handoff(fd, peer_ip)) {
+            ::close(fd);
+        }
+        return;
+    }
+    unclassified_.push_back(
+        Unclassified{fd, peer_ip,
+                     std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(kClassifyDeadlineMs)});
+}
+
+void Server::classify_ready(int fd) {
+    const auto it =
+        std::find_if(unclassified_.begin(), unclassified_.end(),
+                     [fd](const Unclassified& u) { return u.fd == fd; });
+    if (it == unclassified_.end()) {
+        return;  // already classified this iteration
+    }
+    const std::string peer_ip = it->peer_ip;  // copy: unwatch erases it
+    unwatch_unclassified(fd);
+    // Fast path: serve a cheap control route inline so it is never queued
+    // behind the inference pool. serve_connection still runs the full
+    // head parse and head stage (so auth on /metrics is unchanged); only
+    // the thread differs. single_request: serve exactly one request and
+    // close, because serve_connection is a keep-alive loop and an adopted
+    // connection could otherwise carry a LATER non-fast (inference)
+    // request and run it inline, stalling accept.
+    std::string method, target;
+    if (peek_request_line(fd, method, target) &&
+        cfg_.fast_path(method, target)) {
+        serve_connection(fd, peer_ip, /*single_request=*/true);
+        ::close(fd);
+        return;
+    }
+    if (!enqueue_handoff(fd, peer_ip)) {
+        ::close(fd);
+    }
+}
+
+void Server::expire_unclassified() {
+    if (unclassified_.empty()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    // Collect first: unwatch_unclassified mutates unclassified_.
+    std::vector<Pending> due;
+    for (const Unclassified& u : unclassified_) {
+        if (u.deadline <= now) {
+            due.push_back(Pending{u.fd, u.peer_ip});
+        }
+    }
+    for (const Pending& p : due) {
+        unwatch_unclassified(p.fd);
+        if (!enqueue_handoff(p.fd, p.peer_ip)) {
+            ::close(p.fd);
+        }
+    }
+}
+
 void Server::acceptor_loop() {
+    // ONE poll covers accepting, shutdown, and classification, so no
+    // single peer can hold the acceptor: a connection is peeked only
+    // once it HAS data, and one that never sends just occupies a slot
+    // until its deadline (i#88). Before that, classification was a
+    // blocking per-connection peek, so N silent clients serialized the
+    // sole acceptor at ~100 ms each.
+    //
+    // The set is a pollfd array rebuilt per iteration rather than an
+    // epoll/kqueue registration (sys::Poller). These fds are few
+    // (capped at listen_backlog) and short-lived (registered on accept,
+    // dropped on classification ~one round trip later), so a readiness
+    // registration would never amortize, while it WOULD add a
+    // remove-before-close invariant whose failure mode is a stale
+    // registration on a recycled fd number. For a change whose purpose
+    // is robustness on the accept path, no persistent registration is
+    // the safer shape.
+    std::vector<pollfd> pfds;
     while (!stopping_.load()) {
-        pollfd pfds[2] = {{listen_fd_, POLLIN, 0}, {wake_r_, POLLIN, 0}};
-        const int pr = ::poll(pfds, 2, -1);
+        pfds.clear();
+        pfds.push_back(pollfd{listen_fd_, POLLIN, 0});
+        pfds.push_back(pollfd{wake_r_, POLLIN, 0});
+        for (const Unclassified& u : unclassified_) {
+            pfds.push_back(pollfd{u.fd, POLLIN, 0});
+        }
+        // Sleep until something is ready, or until the nearest
+        // classification deadline falls due.
+        int timeout_ms = -1;
+        if (!unclassified_.empty()) {
+            auto nearest = unclassified_.front().deadline;
+            for (const Unclassified& u : unclassified_) {
+                nearest = std::min(nearest, u.deadline);
+            }
+            const auto left =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    nearest - std::chrono::steady_clock::now())
+                    .count();
+            timeout_ms = left <= 0 ? 0 : static_cast<int>(left);
+        }
+        const int pr = ::poll(pfds.data(), pfds.size(), timeout_ms);
         if (pr < 0) {
             if (errno == EINTR) {
                 continue;
@@ -407,53 +575,26 @@ void Server::acceptor_loop() {
         if ((pfds[1].revents & POLLIN) != 0) {
             break;  // shutdown
         }
-        if ((pfds[0].revents & POLLIN) == 0) {
-            continue;
-        }
-        std::string peer_ip;
-        const int fd = locus::pipeline::accept_one(listen_fd_, &peer_ip, 0);
-        if (fd < 0) {
-            continue;  // transient
-        }
-        if (!locus::pipeline::ip_allowed(peer_ip, cfg_.allow)) {
-            ::close(fd);
-            continue;
-        }
-        // Fast path: serve a cheap control route inline so it is never
-        // queued behind the inference pool. serve_connection still runs
-        // the full head parse and head stage (so auth on /metrics is
-        // unchanged); only the thread differs.
-        if (cfg_.fast_path) {
-            std::string method, target;
-            if (peek_request_line(fd, method, target) &&
-                cfg_.fast_path(method, target)) {
-                // single_request: serve exactly one request and close.
-                // serve_connection is a keep-alive loop, so without this
-                // an adopted connection could carry a LATER non-fast
-                // (inference) request and run it inline, stalling accept.
-                serve_connection(fd, peer_ip, /*single_request=*/true);
-                ::close(fd);
-                continue;
+        // Classify the ready connections BEFORE accepting new ones, and
+        // snapshot their fds first: classify_ready mutates
+        // unclassified_, which pfds was built from.
+        std::vector<int> ready;
+        for (std::size_t i = 2; i < pfds.size(); ++i) {
+            if (pfds[i].revents != 0) {
+                ready.push_back(pfds[i].fd);
             }
         }
-        {
-            // Bound the queue so a flood of slow requests cannot grow
-            // userspace fds without limit: before the accept/serve
-            // split, connections beyond the pool waited UNREAD in the
-            // kernel backlog (no fd). Cap the handoff at the same
-            // backlog; beyond it, drop (close) rather than accumulate.
-            const std::size_t cap = cfg_.listen_backlog > 0
-                                        ? static_cast<std::size_t>(
-                                              cfg_.listen_backlog)
-                                        : 128;
-            std::lock_guard<std::mutex> lk(handoff_mu_);
-            if (handoff_.size() >= cap) {
-                ::close(fd);
-                continue;
-            }
-            handoff_.push_back(Pending{fd, peer_ip});
+        for (const int fd : ready) {
+            // A read error or EOF shows up as the peek failing, and a
+            // failed peek means "not fast", so the pool takes the
+            // connection and deals with the dead peer. That is what the
+            // blocking version did on a peek error too.
+            classify_ready(fd);
         }
-        handoff_cv_.notify_one();
+        if ((pfds[0].revents & POLLIN) != 0) {
+            accept_one_conn();
+        }
+        expire_unclassified();
     }
 }
 

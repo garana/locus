@@ -630,3 +630,119 @@ TEST_CASE("http server: a fast-path connection serves one request and "
     REQUIRE(drain(c).empty());
     ::close(c);
 }
+
+// i#88: classification must not serialize the acceptor. Before this, the
+// sole acceptor classified each connection with a BLOCKING peek bounded
+// by 100 ms, so N clients that connect and send nothing cost N x 100 ms
+// serially and delayed even fast-path accepts. Classification is now
+// event-driven: a connection is peeked only once it has data, so a
+// silent client occupies a slot and costs no wall time.
+//
+// Asserted as a SLOPE as well as a bound: the fast-path latency must not
+// grow with the number of silent connections. That is the invariant, and
+// it does not depend on how many the test happens to open.
+TEST_CASE("http server: silent connections do not stall the acceptor",
+          "[http_server]") {
+    ServerConfig cfg;
+    cfg.worker_threads = 1;
+    cfg.fast_path = [](std::string_view m, std::string_view t) {
+        return m == "GET" && t == "/fast";
+    };
+    Fixture f(echo_handler, cfg);
+
+    // Times one fast-path GET on a fresh connection, with `n_silent`
+    // connections already open that have sent nothing at all.
+    auto fast_ms_with_silent = [&](int n_silent) {
+        std::vector<int> silent;
+        for (int i = 0; i < n_silent; ++i) {
+            silent.push_back(client_connect(f.port));
+        }
+        // Let the acceptor see them all before we time anything.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const auto t0 = std::chrono::steady_clock::now();
+        const int c = client_connect(f.port);
+        send_all(c, "GET /fast HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+        const std::string r = drain(c, 3000);
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+        ::close(c);
+        for (const int s : silent) {
+            ::close(s);
+        }
+        REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
+        return ms;
+    };
+
+    const double few = fast_ms_with_silent(2);
+    const double many = fast_ms_with_silent(10);
+
+    // Pre-fix this was ~100 ms per silent connection, serially: ~200 ms
+    // for 2 and ~1000 ms for 10. Post-fix both are ~1 ms. The bound is
+    // generous (3x one classification window) so a loaded machine does
+    // not flake it, while still being far below the ~1000 ms the old
+    // blocking peek took for 10.
+    REQUIRE(many < 300.0);
+    // The slope is the real invariant: eight more silent connections
+    // must not add anything like eight classification windows.
+    REQUIRE(many - few < 100.0);
+}
+
+// i#88, the other half: event-driven classification must still classify
+// a GENUINE fast-path request whose line arrives a round trip AFTER
+// connect. This is why the fix is event-driven rather than a shorter
+// peek window -- a non-blocking peek at accept time would see an empty
+// socket, call it non-fast, and hand the scrape to the pool, which is
+// the starvation the fast path exists to remove. Guard it so nobody
+// "fixes" a future stall by shrinking the window to zero.
+TEST_CASE("http server: fast path still matches when the request line "
+          "arrives after connect", "[http_server]") {
+    ServerConfig cfg;
+    cfg.worker_threads = 1;
+    cfg.fast_path = [](std::string_view m, std::string_view t) {
+        return m == "GET" && t == "/fast";
+    };
+    std::atomic<bool> release{false};
+    auto handler = [&](const Request& req, ServerResponse& res) {
+        if (req.path == "/fast") {
+            res.status = 200;
+            res.set_content("fast", "text/plain");
+            return;
+        }
+        while (!release.load()) {  // occupies the lone worker
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        res.status = 200;
+        res.set_content("slow", "text/plain");
+    };
+    Fixture f(handler, cfg);
+
+    // Saturate the single worker, so a misclassified /fast (handed to
+    // the pool) would NOT come back and the test fails loudly.
+    std::thread slow([&] {
+        const int c = client_connect(f.port);
+        send_all(c, "GET /slow HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+        drain(c, 3000);
+        ::close(c);
+    });
+    struct Releaser {
+        std::atomic<bool>& release;
+        std::thread& t;
+        ~Releaser() {
+            release.store(true);
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } releaser{release, slow};
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Connect, stay silent past a round trip, THEN send the request line.
+    const int c = client_connect(f.port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    send_all(c, "GET /fast HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    const std::string r = drain(c, 2000);
+    ::close(c);
+    REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
+    REQUIRE(r.find("fast") != std::string::npos);
+}
