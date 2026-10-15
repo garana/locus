@@ -293,6 +293,16 @@ void Server::stop() {
         ssize_t w = ::write(wake_w_, &b, 1);  // level-triggered wake-all
         (void)w;
     }
+    // Close the check-then-block window on handoff_cv_ exactly as the
+    // wait_cv_ guard above does. stopping_ is already set, but it is set
+    // without handoff_mu_ held, so a worker between its wait predicate
+    // check and actually blocking could miss a bare notify and hang
+    // stop() at the join. Taking (then releasing) handoff_mu_ here means
+    // such a worker is either still before the check (will see
+    // stopping_) or already blocked (gets this notify).
+    {
+        std::lock_guard<std::mutex> lk(handoff_mu_);
+    }
     handoff_cv_.notify_all();  // wake workers blocked on the handoff queue
     if (acceptor_.joinable()) {
         acceptor_.join();  // its poll(wake_r_) breaks on the pipe write
@@ -307,7 +317,7 @@ void Server::stop() {
     {
         std::lock_guard<std::mutex> lk(handoff_mu_);
         while (!handoff_.empty()) {
-            ::close(handoff_.front());
+            ::close(handoff_.front().fd);
             handoff_.pop_front();
         }
     }
@@ -332,7 +342,7 @@ void Server::worker_loop() {
     // keeps accepting and serving fast-path routes regardless, so the
     // pool being fully busy never starves /metrics or /health.
     for (;;) {
-        int fd;
+        Pending c;
         {
             std::unique_lock<std::mutex> lk(handoff_mu_);
             handoff_cv_.wait(lk, [this] {
@@ -341,13 +351,11 @@ void Server::worker_loop() {
             if (stopping_.load()) {
                 return;  // stop() closes any fds still queued
             }
-            fd = handoff_.front();
+            c = std::move(handoff_.front());
             handoff_.pop_front();
         }
-        // The acceptor already enforced the allowlist; serve_connection
-        // ignores peer_ip (it is only an allowlist input).
-        serve_connection(fd, std::string());
-        ::close(fd);
+        serve_connection(c.fd, c.peer_ip);
+        ::close(c.fd);
     }
 }
 
@@ -419,7 +427,11 @@ void Server::acceptor_loop() {
             std::string method, target;
             if (peek_request_line(fd, method, target) &&
                 cfg_.fast_path(method, target)) {
-                serve_connection(fd, peer_ip);
+                // single_request: serve exactly one request and close.
+                // serve_connection is a keep-alive loop, so without this
+                // an adopted connection could carry a LATER non-fast
+                // (inference) request and run it inline, stalling accept.
+                serve_connection(fd, peer_ip, /*single_request=*/true);
                 ::close(fd);
                 continue;
             }
@@ -439,7 +451,7 @@ void Server::acceptor_loop() {
                 ::close(fd);
                 continue;
             }
-            handoff_.push_back(fd);
+            handoff_.push_back(Pending{fd, peer_ip});
         }
         handoff_cv_.notify_one();
     }
@@ -469,8 +481,9 @@ bool peer_half_closed(int fd) {
     return false;
 }
 
-void Server::serve_connection(int fd, const std::string& peer_ip) {
-    (void)peer_ip;  // allowlist already enforced by worker_loop
+void Server::serve_connection(int fd, const std::string& peer_ip,
+                              bool single_request) {
+    (void)peer_ip;  // allowlist already enforced at accept
     make_nonblocking(fd);
 #ifdef SO_NOSIGPIPE
     int on = 1;
@@ -529,7 +542,9 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
         if (pr.state == ParseState::kComplete) {
             buf.erase(0, pr.consumed);  // #11: consume EXACTLY the request
             ++served;
-            const bool last = served >= cfg_.max_requests_per_conn;
+            const int cap =
+                single_request ? 1 : cfg_.max_requests_per_conn;
+            const bool last = served >= cap;
             const bool keep = req.keep_alive && !last && !stopping_.load();
             // Liveness probe for a long-running Handler: lets it abandon
             // work (and cancel the generation) if this peer disconnects

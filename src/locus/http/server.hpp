@@ -188,10 +188,19 @@ struct ServerConfig {
     std::vector<locus::pipeline::Cidr> allow;  /**< empty == allow all. */
     /** Routes served on the fast-path acceptor thread rather than the
      * inference worker pool, so cheap control endpoints (/health,
-     * /metrics) are never starved when every worker is busy in a long
-     * generation. Matched on the request line, peeked without consuming.
-     * Empty (default) = no fast path; every request goes to the pool.
-     * The predicate must be cheap and must not block. */
+     * /metrics) are not starved when every worker is busy in a long
+     * generation. Matched on the request line, peeked without consuming;
+     * each fast-path connection is served exactly ONE request and closed,
+     * so a keep-alive connection can never carry a later (inference)
+     * request into the acceptor. Empty (default) = no fast path; every
+     * request goes to the pool. The predicate must be cheap and must not
+     * block.
+     *
+     * Scope: this removes starvation by a busy worker POOL. A fast route
+     * can still queue behind the acceptor's own per-connection peek -- a
+     * client that connects and sends nothing holds the single acceptor
+     * for up to the peek window. Making classification event-driven so
+     * one slow client cannot block the acceptor is tracked in i#88. */
     std::function<bool(std::string_view method, std::string_view target)>
         fast_path;
 };
@@ -234,7 +243,12 @@ class Server {
      * if a full request line was read; false (treat as non-fast) on a
      * short/slow/garbled head. */
     bool peek_request_line(int fd, std::string& method, std::string& target);
-    void serve_connection(int fd, const std::string& peer_ip);
+    /** @param single_request when true, serve at most ONE request and
+     * close (forces keep-alive off). The acceptor uses it for fast-path
+     * connections so an adopted keep-alive connection can never carry a
+     * later inference request into the acceptor thread. */
+    void serve_connection(int fd, const std::string& peer_ip,
+                          bool single_request = false);
     /** Runs the handler and writes its response (buffered or streamed).
      * @returns true iff the connection may be kept alive for the next
      * request (write succeeded AND `keep`). */
@@ -260,9 +274,16 @@ class Server {
     int wake_w_ = -1;         /**< self-pipe write end. */
     std::vector<std::thread> workers_;
     std::thread acceptor_;            /**< sole acceptor + fast-path. */
+    /** One accepted connection awaiting a pool worker: its fd and the
+     * peer IP (carried so pooled connections see the real client for
+     * any future peer-IP audit, not an empty string). */
+    struct Pending {
+        int fd;
+        std::string peer_ip;
+    };
     std::mutex handoff_mu_;           /**< guards handoff_. */
     std::condition_variable handoff_cv_; /**< acceptor -> workers. */
-    std::deque<int> handoff_;         /**< accepted fds for the pool. */
+    std::deque<Pending> handoff_;     /**< accepted conns for the pool. */
     std::atomic<bool> stopping_{false};
     std::atomic<bool> started_{false};
     std::mutex wait_mu_;              /**< guards the wait() handoff. */

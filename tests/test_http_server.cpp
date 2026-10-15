@@ -602,3 +602,31 @@ TEST_CASE("http server: fast-path route answers while the pool is busy",
     REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
     REQUIRE(r.find("fast") != std::string::npos);
 }
+
+// i#85 blocker: a fast-path connection must be served ONE request and
+// closed, even on a keep-alive request. serve_connection is a keep-alive
+// loop, so if the acceptor adopted the connection for more than one
+// request, a later non-fast (inference) request on that same connection
+// would run inline on the acceptor and stall ALL accept. Assert the
+// acceptor response forces Connection: close and the socket is closed
+// after one, so it can never be adopted for a second request.
+TEST_CASE("http server: a fast-path connection serves one request and "
+          "closes (no keep-alive escape)", "[http_server]") {
+    ServerConfig cfg;
+    cfg.fast_path = [](std::string_view m, std::string_view t) {
+        return m == "GET" && t == "/fast";
+    };
+    Fixture f(echo_handler, cfg);
+    const int c = client_connect(f.port);
+    // Keep-alive request (NO Connection: close): the acceptor must still
+    // answer once and close.
+    send_all(c, "GET /fast HTTP/1.1\r\nHost: h\r\n\r\n");
+    const std::string r1 = drain(c);
+    REQUIRE(r1.find("HTTP/1.1 200 OK") != std::string::npos);
+    REQUIRE(r1.find("Connection: close") != std::string::npos);
+    // A second request on the SAME socket gets nothing: it was closed,
+    // so the acceptor can never be carried into a later request.
+    send_all(c, "GET /fast HTTP/1.1\r\nHost: h\r\n\r\n");
+    REQUIRE(drain(c).empty());
+    ::close(c);
+}
