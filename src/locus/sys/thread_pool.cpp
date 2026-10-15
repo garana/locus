@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "locus/sys/perf_counters.hpp"
+
 namespace locus::sys {
 
 ThreadPool& ThreadPool::instance() {
@@ -55,6 +57,10 @@ void ThreadPool::drain() {
 }
 
 void ThreadPool::worker() {
+    // Register this worker's cache counters for /metrics: the matvec
+    // fan-out runs here, so this is where weight-read cache traffic
+    // lives. No-op unless perf counters are available (Linux, permitted).
+    perf::ThreadCounters perf_counters;
     std::uint64_t seen = 0;
     for (;;) {
         {

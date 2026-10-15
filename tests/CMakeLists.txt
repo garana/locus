@@ -56,6 +56,7 @@ add_executable(locus_tests
     test_moe.cpp
     test_dsa.cpp
     test_threads.cpp
+    test_perf_counters.cpp
     test_cli_args.cpp
     test_vulkan_pool.cpp
 )
