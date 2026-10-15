@@ -48,7 +48,10 @@ TEST_CASE("perf counters: register, read, unregister", "[perf]") {
         volatile std::uint64_t sum = 0;
         for (int pass = 0; pass < 50; ++pass) {
             for (std::uint64_t v : buf) {
-                sum += v;
+                sum = sum + v;  // not sum += v: compound assignment to a
+                                // volatile is deprecated in C++20 (GCC
+                                // -Wvolatile); plain assignment still
+                                // defeats the dead-loop elision.
             }
         }
         (void)sum;
