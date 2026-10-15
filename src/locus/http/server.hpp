@@ -1,10 +1,12 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -237,11 +239,33 @@ class Server {
      * waits on the inference workers; every other connection is pushed
      * to the handoff queue for the worker pool. */
     void acceptor_loop();
-    /** Peeks (MSG_PEEK, never consumes) the request line on a freshly
-     * accepted fd and extracts method + target, bounded by a short
-     * poll so a slow client cannot stall the acceptor. @returns true
-     * if a full request line was read; false (treat as non-fast) on a
-     * short/slow/garbled head. */
+    /** Accepts one connection and either hands it straight to the pool
+     * (no fast_path configured, or no room to classify) or adds it to
+     * the classification poll set. Never blocks on the new peer. */
+    void accept_one_conn();
+    /** Classifies an unclassified connection the poll set has reported
+     * readable: a matching fast_path route is served inline (one
+     * request, then closed); anything else goes to the pool. */
+    void classify_ready(int fd);
+    /** Hands every unclassified connection whose classification
+     * deadline has passed to the pool, which is where a client that has
+     * not sent a request line belongs (its head deadline rules there). */
+    void expire_unclassified();
+    /** Drops `fd` from the unclassified list. The readiness set is a
+     * pollfd array rebuilt from that list each iteration, so there is
+     * no persistent registration to unwind and no stale-registration or
+     * recycled-fd-number hazard. */
+    void unwatch_unclassified(int fd);
+    /** Pushes one accepted connection onto the worker handoff queue and
+     * wakes a worker. @returns false when the queue is at its cap, in
+     * which case the caller must close `fd` (shed, never accumulate). */
+    bool enqueue_handoff(int fd, const std::string& peer_ip);
+    /** Peeks (MSG_PEEK, never consumes) the request line on `fd` and
+     * extracts method + target. The caller must only call this for an
+     * fd already reported readable: there is no poll inside, because a
+     * blocking per-connection poll here serialized the sole acceptor
+     * (i#88). @returns true if a full request line was read; false
+     * (treat as non-fast) on a short/garbled head or a read error. */
     bool peek_request_line(int fd, std::string& method, std::string& target);
     /** @param single_request when true, serve at most ONE request and
      * close (forces keep-alive off). The acceptor uses it for fast-path
@@ -284,6 +308,25 @@ class Server {
     std::mutex handoff_mu_;           /**< guards handoff_. */
     std::condition_variable handoff_cv_; /**< acceptor -> workers. */
     std::deque<Pending> handoff_;     /**< accepted conns for the pool. */
+    /**
+     * One accepted connection not yet classified fast vs pool. The
+     * acceptor watches it for readability alongside the listen and wake
+     * fds and peeks it only once it HAS data, so a client that connects
+     * and sends nothing costs the acceptor nothing but a slot (i#88).
+     * `deadline` bounds that wait: past it the connection goes to the
+     * pool, the same decision the old blocking peek made on timeout,
+     * without holding the thread for it.
+     */
+    struct Unclassified {
+        int fd;
+        std::string peer_ip;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    /** Acceptor-thread only (no lock): the acceptor is the sole owner,
+     * and stop() drains this only after joining it. The readiness set
+     * passed to poll() is rebuilt from this each iteration (listen fd,
+     * wake fd, then these), so it holds no kernel-side registration. */
+    std::vector<Unclassified> unclassified_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> started_{false};
     std::mutex wait_mu_;              /**< guards the wait() handoff. */
