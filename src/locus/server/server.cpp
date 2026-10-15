@@ -597,10 +597,15 @@ void OpenAiServer::install_routes() {
             "locus-" + std::to_string(id);
 
         if (!stream) {
-            auto v = loop_.wait_done(id);
+            // Stop decoding if the client disconnects before we finish,
+            // instead of running the abandoned request to max_tokens.
+            auto v = loop_.wait_done_or_cancel(id, ctx.client_alive);
             // v is a full snapshot copy; drop the engine record now
             // (evict-on-consume) -- nothing below touches the id.
             loop_.release(id);
+            if (v.status == engine::Status::kCancelled) {
+                return;  // client gone: nothing to send
+            }
             if (v.status == engine::Status::kFailed) {
                 res.status = 500;
                 res.set_content(make_error(v.error).dump(),
@@ -798,6 +803,11 @@ void OpenAiServer::install_routes() {
                 if (!payload.empty() &&
                     !sink.write(std::string_view(payload.data(),
                                                  payload.size()))) {
+                    // Client vanished mid-stream: stop the generation
+                    // and drop the record (both no-ops if the terminal
+                    // path above already released it).
+                    loop_.cancel(id);
+                    loop_.release(id);
                     return;
                 }
                 if (terminal) {
@@ -880,8 +890,12 @@ void OpenAiServer::install_routes() {
         const std::string rid = "msg_locus-" + std::to_string(id);
 
         if (!stream) {
-            auto v = loop_.wait_done(id);
+            // Stop decoding if the client disconnects before we finish.
+            auto v = loop_.wait_done_or_cancel(id, ctx.client_alive);
             loop_.release(id);  // consumed: drop the engine record
+            if (v.status == engine::Status::kCancelled) {
+                return;  // client gone: nothing to send
+            }
             if (v.status == engine::Status::kFailed) {
                 res.status = 500;
                 res.set_content(
@@ -1110,6 +1124,11 @@ void OpenAiServer::install_routes() {
                 if (!payload.empty() &&
                     !sink.write(std::string_view(payload.data(),
                                                  payload.size()))) {
+                    // Client vanished mid-stream: stop the generation
+                    // and drop the record (both no-ops if the terminal
+                    // path above already released it).
+                    loop_.cancel(id);
+                    loop_.release(id);
                     return;
                 }
                 if (terminal) {

@@ -349,11 +349,35 @@ void Engine::release(std::uint64_t id) {
     if (it == requests_.end()) {
         return;  // unknown or already released
     }
-    const Status s = it->second->status;
-    if (s == Status::kDone || s == Status::kFailed) {
+    if (is_terminal(it->second->status)) {
         requests_.erase(it);  // terminal + consumed: drop the record
     }
     // A stale terminal_fifo_ entry for this id is skipped later.
+}
+
+void Engine::cancel(std::uint64_t id) {
+    auto it = requests_.find(id);
+    if (it == requests_.end() || is_terminal(it->second->status)) {
+        return;  // unknown or already terminal
+    }
+    Request& r = *it->second;
+    // Drop it from whichever queue holds it so running_/waiting_ (and
+    // thus idle()/has_runnable_work) are accurate the instant cancel
+    // returns, then finish as cancelled -- finish() frees the KV
+    // blocks and, gating prefix insertion on kDone, never caches a
+    // half-generated prompt. Safe to mutate the queues here because
+    // the loop holds mu_ across step() and only yields it between
+    // steps, so cancel() never races a step in flight.
+    auto rit = std::find(running_.begin(), running_.end(), id);
+    if (rit != running_.end()) {
+        running_.erase(rit);
+    } else {
+        auto wit = std::find(waiting_.begin(), waiting_.end(), id);
+        if (wit != waiting_.end()) {
+            waiting_.erase(wit);
+        }
+    }
+    finish(r, Status::kCancelled, "cancelled");
 }
 
 void Engine::try_adopt(Request& r) {

@@ -1,4 +1,5 @@
 #include <csignal>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -506,4 +507,32 @@ TEST_CASE("http server: wait() blocks until stop()", "[http_server]") {
     f.server.stop();
     waiter.join();
     REQUIRE(returned.load());  // wait() returned once stopped
+}
+
+// i#81: peer_half_closed is the liveness probe behind
+// RequestContext::client_alive. It must report a closed peer WITHOUT
+// consuming any pending request bytes, so a long-running handler can
+// abandon work for a client that has gone while never corrupting a
+// pipelined next request.
+TEST_CASE("peer_half_closed detects a closed peer without consuming",
+          "[http]") {
+    int sv[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    // Both ends open, nothing pending: not readable -> connected.
+    REQUIRE_FALSE(locus::http::peer_half_closed(sv[0]));
+
+    // Pending inbound data (e.g. a pipelined request) is NOT a close,
+    // and the peek must leave the byte in the socket buffer.
+    REQUIRE(::send(sv[1], "x", 1, 0) == 1);
+    REQUIRE_FALSE(locus::http::peer_half_closed(sv[0]));
+    char b = 0;
+    REQUIRE(::recv(sv[0], &b, 1, 0) == 1);  // still there to read
+    REQUIRE(b == 'x');
+
+    // Peer closes its end: orderly EOF -> reported closed.
+    ::close(sv[1]);
+    REQUIRE(locus::http::peer_half_closed(sv[0]));
+
+    ::close(sv[0]);
 }

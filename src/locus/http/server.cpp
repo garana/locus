@@ -338,6 +338,30 @@ void Server::worker_loop() {
     }
 }
 
+bool peer_half_closed(int fd) {
+    pollfd p{fd, POLLIN, 0};
+    if (::poll(&p, 1, 0) <= 0) {
+        return false;  // not readable and no error: treat as connected
+    }
+    if (p.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+        return true;
+    }
+    if (p.revents & POLLIN) {
+        char b;
+        // Peek without consuming: a pipelined next request (n > 0) or a
+        // transient would-block both mean still-connected; only an
+        // orderly EOF (0) or a hard error is a closed peer.
+        const ssize_t n = ::recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (n == 0) {
+            return true;
+        }
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Server::serve_connection(int fd, const std::string& peer_ip) {
     (void)peer_ip;  // allowlist already enforced by worker_loop
     make_nonblocking(fd);
@@ -400,6 +424,10 @@ void Server::serve_connection(int fd, const std::string& peer_ip) {
             ++served;
             const bool last = served >= cfg_.max_requests_per_conn;
             const bool keep = req.keep_alive && !last && !stopping_.load();
+            // Liveness probe for a long-running Handler: lets it abandon
+            // work (and cancel the generation) if this peer disconnects
+            // mid-request. Peeks fd without consuming request bytes.
+            req_ctx.client_alive = [fd] { return !peer_half_closed(fd); };
             const bool ok = handle_request(fd, req, req_ctx, keep);
             // Reset per-request state before the next pipelined request.
             head_seen = false;

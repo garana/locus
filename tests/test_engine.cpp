@@ -685,3 +685,54 @@ TEST_CASE("decode growth reclaims prefix-cache blocks before failing",
     REQUIRE(r->status == Status::kDone);  // pre-fix: kFailed
     REQUIRE(r->generated == want);        // reclaim is byte-neutral
 }
+
+// i#81: cancel() stops a RUNNING request early, frees its KV blocks,
+// and marks it kCancelled -- the primitive the server uses when a
+// client disconnects so an abandoned request does not run to
+// max_tokens. A peer admitted afterwards still generates normally
+// (cancel is byte-neutral to others), proving the pool was reclaimed.
+TEST_CASE("engine cancel frees a running request and is byte-neutral",
+          "[engine]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    const auto prompt = tok.encode("Once upon a time", true);
+    const std::uint32_t max_new = 256;
+
+    // Reference: what the prompt generates with 8 new tokens on a
+    // clean engine, to compare a post-cancel peer against.
+    Engine ref(model, tok.eos_id(), Engine::Config{});
+    const auto rid = ref.submit(prompt, 8);
+    ref.run_to_completion();
+    const auto want = ref.get(rid)->generated;
+
+    Engine engine(model, tok.eos_id(), Engine::Config{});
+    const auto id = engine.submit(prompt, max_new);
+    // Step until the request is running and has produced a token.
+    for (int i = 0; i < 16 && engine.get(id)->generated.empty(); ++i) {
+        engine.step();
+    }
+    REQUIRE(engine.get(id)->status == Status::kRunning);
+    REQUIRE(engine.free_blocks() < engine.total_blocks());  // holds KV
+
+    engine.cancel(id);
+    REQUIRE(engine.get(id)->status == Status::kCancelled);
+    REQUIRE(engine.get(id)->generated.size() < max_new);  // stopped early
+    REQUIRE(engine.free_blocks() == engine.total_blocks());  // KV freed
+    REQUIRE(engine.idle());  // nothing left to run
+
+    // A fresh request now runs normally on the reclaimed pool.
+    const auto pid = engine.submit(prompt, 8);
+    engine.run_to_completion();
+    REQUIRE(engine.get(pid)->status == Status::kDone);
+    REQUIRE(engine.get(pid)->generated == want);
+
+    // cancel() on a terminal or unknown id is a no-op.
+    engine.cancel(id);
+    engine.cancel(999999);
+    REQUIRE(engine.get(id)->status == Status::kCancelled);
+}

@@ -53,7 +53,10 @@ decoding, prefix/prompt caching, and prompt-lookup speculative
 decoding. The API surface (DESIGN.md R14/R15) adds POST
 /v1/embeddings, GET /v1/models, GET /metrics (Prometheus), and
 OpenAI-shaped logprobs plus usage accounting, alongside the
-OpenAI and Anthropic (/v1/messages) chat/completion endpoints.
+OpenAI and Anthropic (/v1/messages) chat/completion endpoints. A
+request whose client disconnects is cancelled (streaming and
+non-streaming), so the engine stops decoding it instead of running
+the abandoned request to max_tokens.
 
 ## Building
 

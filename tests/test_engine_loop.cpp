@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -68,4 +69,52 @@ TEST_CASE("EngineLoop streams progress incrementally, not all-at-once",
     INFO("observations=" << observations << " tokens=" << seen);
     // Pre-fix: exactly 1 (only observable once done). Post-fix: many.
     REQUIRE(observations > 1);
+}
+
+// i#81: a non-streaming request whose client disconnects mid-generation
+// must stop decoding rather than run to max_tokens. wait_done_or_cancel
+// polls a liveness probe between steps; once the probe reports the
+// client gone it cancels the request, which returns kCancelled having
+// generated far fewer than max_new tokens. Without the fix the handler
+// blocked in wait_done until the full generation completed, pinning a
+// core on an abandoned request.
+TEST_CASE("EngineLoop cancels a request when its client disconnects",
+          "[e2e][engine_loop]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::engine::Engine::Config cfg;
+    // Use an EOS id the model can never emit (vocab size is one past the
+    // last valid token) so generation always runs the FULL max_new and
+    // cannot finish early -- otherwise the worker could complete a short
+    // EOS-terminated story before the reader's first poll, racing the
+    // cancel. With no early stop, cancel deterministically lands while
+    // the request is still running.
+    const locus::tok::TokenId never_eos = model.hparams().n_vocab;
+    locus::server::EngineLoop loop(model, never_eos, cfg);
+
+    const auto prompt = tok.encode("Once upon a time", true);
+    loop.wait_done(loop.submit(prompt, 4));  // warm the weights in
+
+    const std::uint32_t max_new = 512;
+    const std::uint64_t id = loop.submit(prompt, max_new);
+
+    // The client is already gone: the probe reports not-alive on the
+    // first poll, so wait_done_or_cancel cancels the request instead of
+    // blocking until the full generation completes. (The deterministic
+    // mid-flight cancel + KV reclaim is covered single-threaded by the
+    // engine test; here we only prove the loop's probe -> cancel
+    // wiring, free of a race with the tiny model's own completion.)
+    std::function<bool()> alive = [] { return false; };
+    const auto v = loop.wait_done_or_cancel(id, alive);
+
+    REQUIRE(v.status == locus::engine::Status::kCancelled);
+    REQUIRE(v.generated.size() < max_new);  // stopped, not run to max
+
+    // The engine reclaimed the slot: a fresh request still completes.
+    const auto v2 = loop.wait_done(loop.submit(prompt, 4));
+    REQUIRE(v2.status == locus::engine::Status::kDone);
 }
