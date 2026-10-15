@@ -970,7 +970,14 @@ long scrape_metric(int port, const std::string& name) {
 //     concurrent turnstile entries -- the lost-wakeup-adjacent surface.
 // Aborts are HARD closes (not shutdown(SHUT_WR)): only a hard close makes
 // the server's next send() fail, which is what the streaming path keys
-// on. Run under ASan to catch a use-after-free from the double release.
+// on. ASan would catch a use-after-free from the double release, but it
+// does not build on x86 here (the SSE4 matvec intrinsics fail under
+// -fsanitize on GCC 13: "last argument must be an 8-bit immediate"); the
+// arm64 NEON path DOES build under ASan, so that memory-safety leg is
+// covered there, while this x86 case carries the real-parallelism one.
+// Here the double release is safe by construction anyway: request ids
+// are monotonic and never reused, and release()/cancel() no-op on an
+// absent/terminal id under the engine mutex.
 TEST_CASE("server survives concurrent mid-stream SSE aborts",
           "[server][e2e][stress]") {
     if (!std::filesystem::exists(model_path())) {
@@ -979,11 +986,25 @@ TEST_CASE("server survives concurrent mid-stream SSE aborts",
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
-    TestServer ts(model, tok);
+    // prompt_cache off (PR#92 review finding): a COMPLETED request --
+    // the step-2 fresh completion below -- otherwise caches its
+    // whole-block prefix and the prefix cache RETAINS it, so the
+    // free_after == free_before assertion would hold only while the
+    // prompt stays under one KV block (block_tokens 16). With it off the
+    // KV-baseline check means "the aborted generations released their
+    // blocks" for ANY prompt length, not a block-size coincidence. The
+    // aborted requests never cache regardless (insertion is gated on
+    // kDone).
+    locus::server::OpenAiServer::Options opt;
+    opt.prompt_cache = false;
+    TestServer ts(model, tok, opt);
 
-    // Baseline KV (also proves /metrics works before the storm).
+    // Baseline KV and request count (also proves /metrics works before
+    // the storm).
     const long free_before = scrape_metric(ts.port, "locus_kv_blocks_free");
     REQUIRE(free_before > 0);
+    const long reqs_before = scrape_metric(ts.port, "locus_requests_total");
+    REQUIRE(reqs_before >= 0);
 
     // Many concurrent clients that start an SSE stream, read a little
     // (so the stream is actually flowing and a worker is engaged), then
@@ -1017,6 +1038,19 @@ TEST_CASE("server survives concurrent mid-stream SSE aborts",
             t.join();
         }
     }
+
+    // Premise check (PR#92 review finding): the aborts actually reached
+    // the streaming route. locus_requests_total is incremented in the
+    // completions/messages route handler BEFORE submit, so a 404, a
+    // rejected request, or a refactor that stopped routing to the stream
+    // would NOT move it. Without this the whole case would pass even if
+    // every abort missed the streaming path (verified: pointing the
+    // aborters at a 404 route still passed), asserting only that an idle
+    // server is healthy. Each of the kThreads x kRounds aborters sends
+    // exactly one request, so the counter must have grown by at least
+    // that many.
+    const long reqs_after = scrape_metric(ts.port, "locus_requests_total");
+    REQUIRE(reqs_after - reqs_before >= kThreads * kRounds);
 
     // 1. The acceptor/fast path is still responsive (a wedged worker or
     //    acceptor would stall this).
