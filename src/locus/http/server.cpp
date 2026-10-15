@@ -263,6 +263,11 @@ int Server::start() {
     for (int i = 0; i < n; ++i) {
         workers_.emplace_back([this] { worker_loop(); });
     }
+    // Single acceptor: it owns accept(), serves fast-path routes inline,
+    // and hands every other connection to the worker pool. Decoupling
+    // accept from serve is what keeps control endpoints responsive while
+    // all workers are busy in long generations.
+    acceptor_ = std::thread([this] { acceptor_loop(); });
     return bound_port_;
 }
 
@@ -288,12 +293,24 @@ void Server::stop() {
         ssize_t w = ::write(wake_w_, &b, 1);  // level-triggered wake-all
         (void)w;
     }
+    handoff_cv_.notify_all();  // wake workers blocked on the handoff queue
+    if (acceptor_.joinable()) {
+        acceptor_.join();  // its poll(wake_r_) breaks on the pipe write
+    }
     for (auto& t : workers_) {
         if (t.joinable()) {
             t.join();
         }
     }
     workers_.clear();
+    // Close any connections the acceptor queued but no worker served.
+    {
+        std::lock_guard<std::mutex> lk(handoff_mu_);
+        while (!handoff_.empty()) {
+            ::close(handoff_.front());
+            handoff_.pop_front();
+        }
+    }
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
@@ -309,6 +326,67 @@ void Server::stop() {
 }
 
 void Server::worker_loop() {
+    // Consumers of the acceptor's handoff queue. A worker blocks here
+    // for the whole lifetime of the connection it picks up (including a
+    // full generation for an inference request); the single acceptor
+    // keeps accepting and serving fast-path routes regardless, so the
+    // pool being fully busy never starves /metrics or /health.
+    for (;;) {
+        int fd;
+        {
+            std::unique_lock<std::mutex> lk(handoff_mu_);
+            handoff_cv_.wait(lk, [this] {
+                return stopping_.load() || !handoff_.empty();
+            });
+            if (stopping_.load()) {
+                return;  // stop() closes any fds still queued
+            }
+            fd = handoff_.front();
+            handoff_.pop_front();
+        }
+        // The acceptor already enforced the allowlist; serve_connection
+        // ignores peer_ip (it is only an allowlist input).
+        serve_connection(fd, std::string());
+        ::close(fd);
+    }
+}
+
+bool Server::peek_request_line(int fd, std::string& method,
+                               std::string& target) {
+    // Non-consuming peek of "METHOD TARGET ..." bounded by a short poll
+    // and a small window, so a slow or partial client cannot stall the
+    // acceptor: anything not immediately a full request line is treated
+    // as non-fast and handed to the pool, where the head deadline rules.
+    constexpr int kPeekMs = 100;
+    char buf[256];
+    pollfd p{fd, POLLIN, 0};
+    if (::poll(&p, 1, kPeekMs) <= 0 || (p.revents & POLLIN) == 0) {
+        return false;
+    }
+    const ssize_t n = ::recv(fd, buf, sizeof(buf), MSG_PEEK | MSG_DONTWAIT);
+    if (n <= 0) {
+        return false;
+    }
+    const std::string_view line(buf, static_cast<std::size_t>(n));
+    const auto sp1 = line.find(' ');
+    if (sp1 == std::string_view::npos) {
+        return false;
+    }
+    const auto sp2 = line.find(' ', sp1 + 1);
+    if (sp2 == std::string_view::npos) {
+        return false;  // request-target not fully in the peeked window
+    }
+    std::string_view tgt = line.substr(sp1 + 1, sp2 - sp1 - 1);
+    const auto q = tgt.find('?');  // match on the path, drop any query
+    if (q != std::string_view::npos) {
+        tgt = tgt.substr(0, q);
+    }
+    method.assign(line.substr(0, sp1));
+    target.assign(tgt);
+    return true;
+}
+
+void Server::acceptor_loop() {
     while (!stopping_.load()) {
         pollfd pfds[2] = {{listen_fd_, POLLIN, 0}, {wake_r_, POLLIN, 0}};
         const int pr = ::poll(pfds, 2, -1);
@@ -327,14 +405,43 @@ void Server::worker_loop() {
         std::string peer_ip;
         const int fd = locus::pipeline::accept_one(listen_fd_, &peer_ip, 0);
         if (fd < 0) {
-            continue;  // another worker took it, or a transient error
+            continue;  // transient
         }
         if (!locus::pipeline::ip_allowed(peer_ip, cfg_.allow)) {
             ::close(fd);
             continue;
         }
-        serve_connection(fd, peer_ip);
-        ::close(fd);
+        // Fast path: serve a cheap control route inline so it is never
+        // queued behind the inference pool. serve_connection still runs
+        // the full head parse and head stage (so auth on /metrics is
+        // unchanged); only the thread differs.
+        if (cfg_.fast_path) {
+            std::string method, target;
+            if (peek_request_line(fd, method, target) &&
+                cfg_.fast_path(method, target)) {
+                serve_connection(fd, peer_ip);
+                ::close(fd);
+                continue;
+            }
+        }
+        {
+            // Bound the queue so a flood of slow requests cannot grow
+            // userspace fds without limit: before the accept/serve
+            // split, connections beyond the pool waited UNREAD in the
+            // kernel backlog (no fd). Cap the handoff at the same
+            // backlog; beyond it, drop (close) rather than accumulate.
+            const std::size_t cap = cfg_.listen_backlog > 0
+                                        ? static_cast<std::size_t>(
+                                              cfg_.listen_backlog)
+                                        : 128;
+            std::lock_guard<std::mutex> lk(handoff_mu_);
+            if (handoff_.size() >= cap) {
+                ::close(fd);
+                continue;
+            }
+            handoff_.push_back(fd);
+        }
+        handoff_cv_.notify_one();
     }
 }
 

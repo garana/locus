@@ -361,6 +361,14 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
     // set_payload_max_length: the parser rejects a too-large declared
     // body on the head, before the body is read.
     cfg.limits.max_body_bytes = opt_.max_body_bytes;
+    // Serve the cheap monitoring routes on the acceptor's fast path so
+    // they answer even when every worker is busy in a generation.
+    // serve_connection still runs the head stage, so auth on /metrics
+    // (when enabled) is unchanged -- only the serving thread differs.
+    cfg.fast_path = [mp = opt_.metrics_path](std::string_view method,
+                                             std::string_view target) {
+        return method == "GET" && (target == "/health" || target == mp);
+    };
     http_ = std::make_unique<http::Server>(std::move(cfg), route_handler_,
                                            auth_head_);
     return http_->start();

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -185,6 +186,14 @@ struct ServerConfig {
                                      *   may exceed it legitimately). */
     Limits limits;                  /**< parser caps. */
     std::vector<locus::pipeline::Cidr> allow;  /**< empty == allow all. */
+    /** Routes served on the fast-path acceptor thread rather than the
+     * inference worker pool, so cheap control endpoints (/health,
+     * /metrics) are never starved when every worker is busy in a long
+     * generation. Matched on the request line, peeked without consuming.
+     * Empty (default) = no fast path; every request goes to the pool.
+     * The predicate must be cheap and must not block. */
+    std::function<bool(std::string_view method, std::string_view target)>
+        fast_path;
 };
 
 /**
@@ -214,6 +223,17 @@ class Server {
 
  private:
     void worker_loop();
+    /** Sole acceptor: accepts connections, and for a fast_path route
+     * (peeked without consuming) serves it inline here so it never
+     * waits on the inference workers; every other connection is pushed
+     * to the handoff queue for the worker pool. */
+    void acceptor_loop();
+    /** Peeks (MSG_PEEK, never consumes) the request line on a freshly
+     * accepted fd and extracts method + target, bounded by a short
+     * poll so a slow client cannot stall the acceptor. @returns true
+     * if a full request line was read; false (treat as non-fast) on a
+     * short/slow/garbled head. */
+    bool peek_request_line(int fd, std::string& method, std::string& target);
     void serve_connection(int fd, const std::string& peer_ip);
     /** Runs the handler and writes its response (buffered or streamed).
      * @returns true iff the connection may be kept alive for the next
@@ -239,6 +259,10 @@ class Server {
     int wake_r_ = -1;         /**< self-pipe read end (shutdown signal). */
     int wake_w_ = -1;         /**< self-pipe write end. */
     std::vector<std::thread> workers_;
+    std::thread acceptor_;            /**< sole acceptor + fast-path. */
+    std::mutex handoff_mu_;           /**< guards handoff_. */
+    std::condition_variable handoff_cv_; /**< acceptor -> workers. */
+    std::deque<int> handoff_;         /**< accepted fds for the pool. */
     std::atomic<bool> stopping_{false};
     std::atomic<bool> started_{false};
     std::mutex wait_mu_;              /**< guards the wait() handoff. */
