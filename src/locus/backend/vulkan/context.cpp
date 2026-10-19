@@ -1,12 +1,43 @@
 #include "locus/backend/vulkan/context.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+
+namespace locus::backend::vk {
+
+bool VulkanContext::profiling() {
+    static const bool on = std::getenv("LOCUS_VK_PROFILE") != nullptr;
+    return on;
+}
+
+void VulkanContext::report_profile() const {
+    const Profile& p = profile();
+    if (!profiling() || p.batches == 0) {
+        return;
+    }
+    const double per = p.tokens > 0 ? static_cast<double>(p.tokens) : 1.0;
+    std::fprintf(stderr,
+                 "vk-profile: %llu tokens, %llu batches, %llu "
+                 "dispatches; per token: %.2f batches, %.1f "
+                 "dispatches, host %.2f ms, submit+wait %.2f ms, "
+                 "gpu %.2f ms\n",
+                 (unsigned long long)p.tokens,
+                 (unsigned long long)p.batches,
+                 (unsigned long long)p.dispatches,
+                 static_cast<double>(p.batches) / per,
+                 static_cast<double>(p.dispatches) / per,
+                 p.host_ms / per, p.wait_ms / per, p.gpu_ms / per);
+}
+
+}  // namespace locus::backend::vk
 
 #if defined(LOCUS_HAS_VULKAN_KERNELS)
 
 #include <vulkan/vulkan.h>
 
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <vector>
 
@@ -112,6 +143,12 @@ struct VulkanContext::Impl {
     /** Open batch state (begin_batch .. end_batch). */
     VkCommandBuffer batch_cmd = VK_NULL_HANDLE;
 
+    /** LOCUS_VK_PROFILE state: two timestamps per batch. */
+    Profile prof;
+    VkQueryPool qpool = VK_NULL_HANDLE;
+    double ts_period_ns = 0.0;
+    std::chrono::steady_clock::time_point batch_t0;
+
     struct HostBuffer {
         VkBuffer buf = VK_NULL_HANDLE;
         VkDeviceMemory mem = VK_NULL_HANDLE;
@@ -211,6 +248,18 @@ struct VulkanContext::Impl {
         check(vkCreateDescriptorPool(device, &dpi, nullptr,
                                      &dpool),
               "create descriptor pool");
+
+        if (VulkanContext::profiling()) {
+            VkPhysicalDeviceProperties pp;
+            vkGetPhysicalDeviceProperties(phys, &pp);
+            ts_period_ns = pp.limits.timestampPeriod;
+            VkQueryPoolCreateInfo qpi{};
+            qpi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qpi.queryCount = 2;
+            check(vkCreateQueryPool(device, &qpi, nullptr, &qpool),
+                  "create query pool");
+        }
     }
 
     void create_pipe(Kernel k) {
@@ -332,6 +381,9 @@ struct VulkanContext::Impl {
     ~Impl() {
         if (device != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device);
+            if (qpool != VK_NULL_HANDLE) {
+                vkDestroyQueryPool(device, qpool, nullptr);
+            }
             vkDestroyDescriptorPool(device, dpool, nullptr);
             for (const Pipe& p : pipes) {
                 vkDestroyPipeline(device, p.pipeline, nullptr);
@@ -407,6 +459,13 @@ void VulkanContext::begin_batch() {
     cbb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cbb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(im.batch_cmd, &cbb), "begin cmd");
+    if (im.qpool != VK_NULL_HANDLE) {
+        im.batch_t0 = std::chrono::steady_clock::now();
+        vkCmdResetQueryPool(im.batch_cmd, im.qpool, 0, 2);
+        vkCmdWriteTimestamp(im.batch_cmd,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            im.qpool, 0);
+    }
 }
 
 void VulkanContext::dispatch(Kernel k,
@@ -461,6 +520,7 @@ void VulkanContext::dispatch(Kernel k,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        kd.push_bytes, push.data());
     vkCmdDispatch(im.batch_cmd, groups_x, 1, 1);
+    ++im.prof.dispatches;
 
     // Serialize consecutive dispatches (writes feed reads).
     VkMemoryBarrier mb{};
@@ -476,7 +536,15 @@ void VulkanContext::dispatch(Kernel k,
 
 void VulkanContext::end_batch() {
     Impl& im = *impl_;
+    using clock = std::chrono::steady_clock;
+    const bool prof = im.qpool != VK_NULL_HANDLE;
+    if (prof) {
+        vkCmdWriteTimestamp(im.batch_cmd,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            im.qpool, 1);
+    }
     check(vkEndCommandBuffer(im.batch_cmd), "end cmd");
+    const clock::time_point t1 = clock::now();
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
@@ -484,10 +552,31 @@ void VulkanContext::end_batch() {
     check(vkQueueSubmit(im.queue, 1, &si, VK_NULL_HANDLE),
           "submit");
     check(vkQueueWaitIdle(im.queue), "wait idle");
+    ++im.prof.batches;
+    if (prof) {
+        const clock::time_point t2 = clock::now();
+        using ms = std::chrono::duration<double, std::milli>;
+        im.prof.host_ms += ms(t1 - im.batch_t0).count();
+        im.prof.wait_ms += ms(t2 - t1).count();
+        std::uint64_t ts[2] = {0, 0};
+        if (vkGetQueryPoolResults(
+                im.device, im.qpool, 0, 2, sizeof(ts), ts,
+                sizeof(ts[0]), VK_QUERY_RESULT_64_BIT) ==
+            VK_SUCCESS) {
+            im.prof.gpu_ms += static_cast<double>(ts[1] - ts[0]) *
+                              im.ts_period_ns / 1e6;
+        }
+    }
     vkFreeCommandBuffers(im.device, im.pool, 1, &im.batch_cmd);
     im.batch_cmd = VK_NULL_HANDLE;
     check(vkResetDescriptorPool(im.device, im.dpool, 0),
           "reset descriptor pool");
+}
+
+void VulkanContext::note_token() { ++impl_->prof.tokens; }
+
+const VulkanContext::Profile& VulkanContext::profile() const {
+    return impl_->prof;
 }
 
 void VulkanContext::copy_buffer(Buffer src, std::size_t src_off,
@@ -593,6 +682,10 @@ void VulkanContext::dispatch(Kernel, std::span<const Buffer>,
     no_kernels();
 }
 void VulkanContext::end_batch() { no_kernels(); }
+void VulkanContext::note_token() { no_kernels(); }
+const VulkanContext::Profile& VulkanContext::profile() const {
+    no_kernels();
+}
 void VulkanContext::copy_buffer(Buffer, std::size_t, Buffer,
                                 std::size_t, std::size_t) {
     no_kernels();

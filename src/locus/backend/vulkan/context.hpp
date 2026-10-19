@@ -53,6 +53,34 @@ class VulkanContext {
     /** @returns true when built with kernels and a device exists. */
     static bool available();
 
+    /**
+     * Per-process batch timing, collected when LOCUS_VK_PROFILE is
+     * set (GPU time via timestamp queries). host_ms covers
+     * begin_batch .. end_batch on the CPU (recording plus any host
+     * work between), wait_ms the submit + vkQueueWaitIdle, gpu_ms
+     * the device time between the batch's first and last command.
+     */
+    struct Profile {
+        std::uint64_t tokens = 0;
+        std::uint64_t batches = 0;
+        std::uint64_t dispatches = 0;
+        double host_ms = 0.0;
+        double wait_ms = 0.0;
+        double gpu_ms = 0.0;
+    };
+
+    /** @returns true when LOCUS_VK_PROFILE is set. */
+    static bool profiling();
+
+    /** Counts one forwarded token toward the profile. */
+    void note_token();
+
+    /** @returns The profile collected so far. */
+    const Profile& profile() const;
+
+    /** Prints the per-token profile to stderr (when profiling). */
+    void report_profile() const;
+
     /** @throws std::runtime_error when no usable device. */
     VulkanContext();
     ~VulkanContext();

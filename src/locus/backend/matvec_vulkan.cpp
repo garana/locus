@@ -141,7 +141,10 @@ struct State {
             ctx.destroy_buffer(b);
         };
     }
-    ~State() { pool.report(); }
+    ~State() {
+        pool.report();
+        ctx.report_profile();
+    }
 
     /** Activation buffers, sized on first use per model dims. */
     VulkanContext::Buffer x{}, xb{}, q{}, gate{}, up{}, attout{},
@@ -804,6 +807,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     s.pool.on_batch_end();
 
     s.ctx.read_buffer(s.logits, std::as_writable_bytes(logits));
+    s.ctx.note_token();
     seq.n_tokens = pos + 1;
     return true;
 }
