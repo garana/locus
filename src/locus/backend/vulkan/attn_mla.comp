@@ -1,13 +1,20 @@
 #version 450
 
-// MLA paged attention for one token, one layer: each invocation
-// handles one query head. Scores are dot products of the absorbed
-// query (QABS) and the roped q_pe part of Q against the cached
-// latent rows (rms-normed c_kv | roped k_pe), read through the
-// block table. Output is the softmax-weighted latent per head;
-// the W_uv projection runs as separate matvec dispatches.
+// MLA paged attention for one token, one layer. Scores are dot
+// products of the absorbed query (QABS) and the roped q_pe part of
+// Q against the cached latent rows (rms-normed c_kv | roped k_pe),
+// read through the block table. Output is the softmax-weighted
+// latent per head; the W_uv projection runs as separate matvec
+// dispatches.
+//
+// One workgroup per query head (dispatch n_heads groups): threads
+// split the positions for the scores and the softmax (max and sum
+// reduced through shared memory), then (dim, position-slice) pairs
+// for the weighted sum, whose slices are summed at the end.
 
-layout(local_size_x = 1) in;
+#define WG 128u
+
+layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer Q { float q[]; };
 layout(std430, binding = 1) readonly buffer QABS { float qa[]; };
@@ -28,6 +35,39 @@ layout(push_constant) uniform PC {
     float kq_scale;
 } pc;
 
+shared float red[WG];
+shared float part[512];  // P * head width; widths up to 512
+
+float reduce_max(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (tid < step) {
+            red[tid] = max(red[tid], red[tid + step]);
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+float reduce_sum(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (tid < step) {
+            red[tid] += red[tid + step];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
 uint row_base(uint t) {
     uint blk = table[t / pc.block_tokens];
     return blk * pc.block_stride + pc.layer_offset +
@@ -35,7 +75,8 @@ uint row_base(uint t) {
 }
 
 void main() {
-    uint h = gl_GlobalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
     if (h >= pc.n_heads) {
         return;
     }
@@ -45,7 +86,7 @@ void main() {
     uint arow = h * pc.n_pos;
 
     float mx = -3.4e38;
-    for (uint t = 0; t < pc.n_pos; ++t) {
+    for (uint t = tid; t < pc.n_pos; t += WG) {
         uint rb = row_base(t);
         float s = 0.0;
         for (uint i = 0; i < pc.rank; ++i) {
@@ -58,16 +99,30 @@ void main() {
         att[arow + t] = s;
         mx = max(mx, s);
     }
+    mx = reduce_max(mx);
     float sum = 0.0;
-    for (uint t = 0; t < pc.n_pos; ++t) {
+    for (uint t = tid; t < pc.n_pos; t += WG) {
         float e = exp(att[arow + t] - mx);
         att[arow + t] = e;
         sum += e;
     }
-    for (uint i = 0; i < pc.rank; ++i) {
+    memoryBarrierBuffer();
+    sum = reduce_sum(sum);
+
+    uint np = max(1u, WG / pc.rank);
+    for (uint idx = tid; idx < pc.rank * np; idx += WG) {
+        uint i = idx % pc.rank;
         float acc = 0.0;
-        for (uint t = 0; t < pc.n_pos; ++t) {
+        for (uint t = idx / pc.rank; t < pc.n_pos; t += np) {
             acc += att[arow + t] * pool[row_base(t) + i];
+        }
+        part[idx] = acc;
+    }
+    barrier();
+    for (uint i = tid; i < pc.rank; i += WG) {
+        float acc = 0.0;
+        for (uint p = 0; p < np; ++p) {
+            acc += part[p * pc.rank + i];
         }
         lat[qah + i] = acc / sum;
     }

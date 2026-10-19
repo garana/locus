@@ -1,9 +1,14 @@
 #version 450
 
 // F16 matvec: rows of half-precision weights, read through a
-// uint view (two halfs per word) via unpackHalf2x16.
+// uint view (two halfs per word) via unpackHalf2x16. Four rows per
+// workgroup, 32 lanes per row striding the columns (coalesced),
+// reduced through shared memory.
 
-layout(local_size_x = 64) in;
+#define LANES 32u
+#define ROWS 4u
+
+layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
@@ -19,22 +24,36 @@ layout(push_constant) uniform PC {
     float scale;
 } pc;
 
+shared float red[LANES * ROWS];
+
 float half_at(uint e) {
     vec2 pair = unpackHalf2x16(w[e >> 1]);
     return (e & 1u) != 0u ? pair.y : pair.x;
 }
 
 void main() {
-    uint r = gl_GlobalInvocationID.x;
-    if (r >= pc.rows) {
-        return;
-    }
-    uint base = pc.w_off + r * pc.cols;
+    uint lane = gl_LocalInvocationID.x % LANES;
+    uint slot = gl_LocalInvocationID.x / LANES;
+    uint r = gl_WorkGroupID.x * ROWS + slot;
     float acc = 0.0;
-    for (uint i = 0; i < pc.cols; ++i) {
-        acc += half_at(base + i) * x[pc.x_off + i];
+    if (r < pc.rows) {
+        uint base = pc.w_off + r * pc.cols;
+        for (uint i = lane; i < pc.cols; i += LANES) {
+            acc += half_at(base + i) * x[pc.x_off + i];
+        }
     }
-    uint at = pc.out_offset + r;
-    float v = acc * pc.scale;
-    o[at] = pc.accumulate != 0 ? o[at] + v : v;
+    red[gl_LocalInvocationID.x] = acc;
+    barrier();
+    for (uint step = LANES / 2u; step > 0u; step >>= 1) {
+        if (lane < step) {
+            red[gl_LocalInvocationID.x] +=
+                red[gl_LocalInvocationID.x + step];
+        }
+        barrier();
+    }
+    if (lane == 0u && r < pc.rows) {
+        uint at = pc.out_offset + r;
+        float v = red[gl_LocalInvocationID.x] * pc.scale;
+        o[at] = pc.accumulate != 0 ? o[at] + v : v;
+    }
 }

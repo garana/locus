@@ -88,7 +88,8 @@ TEST_CASE("vulkan q8_0 matvec matches the CPU reference",
     const std::uint32_t push[] = {
         rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
     ctx.dispatch(Kernel::kMatvecQ8_0, bufs, push,
-                 (rows + 63) / 64);
+                 VulkanContext::matvec_groups(Kernel::kMatvecQ8_0,
+                                              rows));
     ctx.end_batch();
     ctx.read_buffer(ob, std::as_writable_bytes(std::span(gpu)));
 
@@ -126,7 +127,8 @@ TEST_CASE("vulkan f16 and q4_0 matvec match the CPU reference",
         const VulkanContext::Buffer bufs[] = {wb, xb, ob};
         const std::uint32_t push[] = {
         rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
-        ctx.dispatch(k, bufs, push, (rows + 63) / 64);
+        ctx.dispatch(k, bufs, push,
+                     VulkanContext::matvec_groups(k, rows));
         ctx.end_batch();
         ctx.read_buffer(ob, std::as_writable_bytes(out));
         ctx.destroy_buffer(wb);
@@ -272,7 +274,8 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
         const VulkanContext::Buffer bufs[] = {wb, xb, ob};
         const std::uint32_t push[] = {
         rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
-        ctx.dispatch(c.kernel, bufs, push, (rows + 63) / 64);
+        ctx.dispatch(c.kernel, bufs, push,
+                     VulkanContext::matvec_groups(c.kernel, rows));
         ctx.end_batch();
         ctx.read_buffer(ob,
                         std::as_writable_bytes(std::span(gpu)));

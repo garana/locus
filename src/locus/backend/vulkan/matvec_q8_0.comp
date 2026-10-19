@@ -2,8 +2,16 @@
 
 // Q8_0 matvec: rows of 34-byte blocks (f16 scale + 32 int8), read
 // through a uint view since blocks are not 4-byte aligned.
+//
+// Four rows per workgroup, 32 lanes per row. Eight lanes share a
+// block, each taking one of its 8 quant words, so a 32-lane step
+// reads 4 consecutive blocks (136 contiguous bytes, coalesced); a
+// shared-memory tree then reduces the row.
 
-layout(local_size_x = 64) in;
+#define LANES 32u
+#define ROWS 4u
+
+layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
@@ -19,31 +27,52 @@ layout(push_constant) uniform PC {
     float scale;
 } pc;
 
-uint byte_at(uint i) {
-    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+shared float red[LANES * ROWS];
+
+/** The 4 bytes at byte offset b (any alignment). */
+uint word_at(uint b) {
+    uint i = b >> 2;
+    uint sh = (b & 3u) * 8u;
+    return sh == 0u ? w[i] : (w[i] >> sh) | (w[i + 1u] << (32u - sh));
 }
 
 void main() {
-    uint r = gl_GlobalInvocationID.x;
-    if (r >= pc.rows) {
-        return;
-    }
-    uint nb = pc.cols / 32u;
-    uint row_base = pc.w_off + r * nb * 34u;
+    uint lane = gl_LocalInvocationID.x % LANES;
+    uint slot = gl_LocalInvocationID.x / LANES;
+    uint r = gl_WorkGroupID.x * ROWS + slot;
     float acc = 0.0;
-    for (uint b = 0; b < nb; ++b) {
-        uint at = row_base + b * 34u;
-        float d = unpackHalf2x16(byte_at(at) |
-                                 (byte_at(at + 1u) << 8u)).x;
-        float s = 0.0;
-        for (uint i = 0; i < 32u; ++i) {
-            int q = bitfieldExtract(
-                int(byte_at(at + 2u + i)), 0, 8);
-            s += float(q) * x[pc.x_off + b * 32u + i];
+    if (r < pc.rows) {
+        uint nb = pc.cols / 32u;
+        uint row_base = pc.w_off + r * nb * 34u;
+        uint sub = lane & 3u;
+        for (uint b = lane >> 2; b < nb; b += LANES / 4u) {
+            uint at = row_base + b * 34u;
+            float d = unpackHalf2x16(word_at(at) & 0xffffu).x;
+            uint xi = pc.x_off + b * 32u + sub * 8u;
+            float s = 0.0;
+            for (uint k = 0u; k < 2u; ++k) {
+                int q = int(word_at(at + 2u + sub * 8u + k * 4u));
+                uint xk = xi + k * 4u;
+                s += float(bitfieldExtract(q, 0, 8)) * x[xk] +
+                     float(bitfieldExtract(q, 8, 8)) * x[xk + 1u] +
+                     float(bitfieldExtract(q, 16, 8)) * x[xk + 2u] +
+                     float(bitfieldExtract(q, 24, 8)) * x[xk + 3u];
+            }
+            acc += d * s;
         }
-        acc += d * s;
     }
-    uint at_out = pc.out_offset + r;
-    float v = acc * pc.scale;
-    o[at_out] = pc.accumulate != 0 ? o[at_out] + v : v;
+    red[gl_LocalInvocationID.x] = acc;
+    barrier();
+    for (uint step = LANES / 2u; step > 0u; step >>= 1) {
+        if (lane < step) {
+            red[gl_LocalInvocationID.x] +=
+                red[gl_LocalInvocationID.x + step];
+        }
+        barrier();
+    }
+    if (lane == 0u && r < pc.rows) {
+        uint at_out = pc.out_offset + r;
+        float v = red[gl_LocalInvocationID.x] * pc.scale;
+        o[at_out] = pc.accumulate != 0 ? o[at_out] + v : v;
+    }
 }

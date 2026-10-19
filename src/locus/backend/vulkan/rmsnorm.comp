@@ -1,11 +1,12 @@
 #version 450
 
 // RMS norm: out[out_off + i] = x[i] * w[i] / sqrt(mean+eps),
-// over the first n elements of X. Single invocation; n is small
-// (n_embd or kv_lora_rank) and this keeps the reduction
-// trivially correct.
+// over the first n elements of X. One workgroup: threads stride the
+// elements and the sum of squares is reduced in shared memory.
 
-layout(local_size_x = 1) in;
+#define WG 256u
+
+layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer X { float x[]; };
 layout(std430, binding = 1) readonly buffer W { float w[]; };
@@ -17,13 +18,24 @@ layout(push_constant) uniform PC {
     uint out_off;
 } pc;
 
+shared float red[WG];
+
 void main() {
+    uint tid = gl_LocalInvocationID.x;
     float ss = 0.0;
-    for (uint i = 0; i < pc.n; ++i) {
+    for (uint i = tid; i < pc.n; i += WG) {
         ss += x[i] * x[i];
     }
-    float scale = inversesqrt(ss / float(pc.n) + pc.eps);
-    for (uint i = 0; i < pc.n; ++i) {
+    red[tid] = ss;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (tid < step) {
+            red[tid] += red[tid + step];
+        }
+        barrier();
+    }
+    float scale = inversesqrt(red[0] / float(pc.n) + pc.eps);
+    for (uint i = tid; i < pc.n; i += WG) {
         o[pc.out_off + i] = x[i] * scale * w[i];
     }
 }

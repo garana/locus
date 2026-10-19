@@ -278,7 +278,8 @@ void rec_matvec(State& s, const Mat& w, VulkanContext::Buffer x,
                                   w_off_units(w, w_byte_off),
                                   x_off,
                                   fbits(scale)};
-    s.ctx.dispatch(k, {bufs, nbuf}, push, (w.rows + 63) / 64);
+    s.ctx.dispatch(k, {bufs, nbuf}, push,
+                   VulkanContext::matvec_groups(k, w.rows));
 }
 
 }  // namespace
@@ -360,7 +361,8 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
     const std::size_t nbuf = grid.impl != nullptr ? 4u : 3u;
     const std::uint32_t push[] = {w.rows, w.cols, 0, 0, 0, 0,
                                   fbits(1.0f)};
-    s.ctx.dispatch(k, {bufs, nbuf}, push, (w.rows + 63) / 64);
+    s.ctx.dispatch(k, {bufs, nbuf}, push,
+                   VulkanContext::matvec_groups(k, w.rows));
     s.ctx.end_batch();
     s.pool.on_batch_end();
     s.ctx.read_buffer(s.xb, std::as_writable_bytes(out));

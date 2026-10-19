@@ -1,10 +1,23 @@
 #include "locus/backend/vulkan/context.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 
 namespace locus::backend::vk {
+
+std::uint32_t VulkanContext::matvec_groups(Kernel k,
+                                           std::uint32_t rows) {
+    switch (k) {
+        case Kernel::kMatvecF32:
+        case Kernel::kMatvecF16:
+        case Kernel::kMatvecQ8_0:
+            return (rows + 3) / 4;
+        default:
+            return (rows + 63) / 64;
+    }
+}
 
 bool VulkanContext::profiling() {
     static const bool on = std::getenv("LOCUS_VK_PROFILE") != nullptr;
@@ -28,6 +41,35 @@ void VulkanContext::report_profile() const {
                  static_cast<double>(p.batches) / per,
                  static_cast<double>(p.dispatches) / per,
                  p.host_ms / per, p.wait_ms / per, p.gpu_ms / per);
+    static const char* const names[] = {
+        "matvec_f32",   "matvec_f16",   "matvec_q8_0",
+        "matvec_q4_0",  "matvec_q5_0",  "matvec_q4_k",
+        "matvec_q5_k",  "matvec_q6_k",  "matvec_q2_k",
+        "matvec_iq2_xxs", "matvec_iq3_xxs", "matvec_iq4_xs",
+        "matvec_t",     "rmsnorm",      "rope",
+        "silu_mul",     "attn_paged",   "attn_mla",
+        "attn_paged_q", "kv_store_q"};
+    static_assert(std::size(names) ==
+                  static_cast<std::size_t>(Kernel::kCount_));
+    int order[std::size(names)];
+    for (int k = 0; k < static_cast<int>(std::size(names)); ++k) {
+        order[k] = k;
+    }
+    std::sort(std::begin(order), std::end(order), [&](int a, int b) {
+        return p.kernel_ms[a] > p.kernel_ms[b];
+    });
+    for (int k : order) {
+        if (p.kernel_n[k] == 0) {
+            continue;
+        }
+        std::fprintf(stderr,
+                     "vk-profile:   %-14s %8.3f ms/token  %6.1f "
+                     "dispatches/token  %7.1f us each\n",
+                     names[k], p.kernel_ms[k] / per,
+                     static_cast<double>(p.kernel_n[k]) / per,
+                     1e3 * p.kernel_ms[k] /
+                         static_cast<double>(p.kernel_n[k]));
+    }
 }
 
 }  // namespace locus::backend::vk
@@ -143,8 +185,13 @@ struct VulkanContext::Impl {
     /** Open batch state (begin_batch .. end_batch). */
     VkCommandBuffer batch_cmd = VK_NULL_HANDLE;
 
-    /** LOCUS_VK_PROFILE state: two timestamps per batch. */
+    /**
+     * LOCUS_VK_PROFILE state: a timestamp at batch begin, one after
+     * each dispatch (its kernel in ts_kernel), one at batch end.
+     */
+    static constexpr std::uint32_t kMaxTs = 4096;
     Profile prof;
+    std::vector<int> ts_kernel;
     VkQueryPool qpool = VK_NULL_HANDLE;
     double ts_period_ns = 0.0;
     std::chrono::steady_clock::time_point batch_t0;
@@ -256,7 +303,7 @@ struct VulkanContext::Impl {
             VkQueryPoolCreateInfo qpi{};
             qpi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
             qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qpi.queryCount = 2;
+            qpi.queryCount = kMaxTs;
             check(vkCreateQueryPool(device, &qpi, nullptr, &qpool),
                   "create query pool");
         }
@@ -461,7 +508,8 @@ void VulkanContext::begin_batch() {
     check(vkBeginCommandBuffer(im.batch_cmd, &cbb), "begin cmd");
     if (im.qpool != VK_NULL_HANDLE) {
         im.batch_t0 = std::chrono::steady_clock::now();
-        vkCmdResetQueryPool(im.batch_cmd, im.qpool, 0, 2);
+        im.ts_kernel.clear();
+        vkCmdResetQueryPool(im.batch_cmd, im.qpool, 0, Impl::kMaxTs);
         vkCmdWriteTimestamp(im.batch_cmd,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                             im.qpool, 0);
@@ -521,6 +569,15 @@ void VulkanContext::dispatch(Kernel k,
                        kd.push_bytes, push.data());
     vkCmdDispatch(im.batch_cmd, groups_x, 1, 1);
     ++im.prof.dispatches;
+    // Slot 0 is the batch start; keep the last slot for its end.
+    if (im.qpool != VK_NULL_HANDLE &&
+        im.ts_kernel.size() + 2 < Impl::kMaxTs) {
+        im.ts_kernel.push_back(static_cast<int>(k));
+        vkCmdWriteTimestamp(
+            im.batch_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            im.qpool,
+            static_cast<std::uint32_t>(im.ts_kernel.size()));
+    }
 
     // Serialize consecutive dispatches (writes feed reads).
     VkMemoryBarrier mb{};
@@ -538,10 +595,12 @@ void VulkanContext::end_batch() {
     Impl& im = *impl_;
     using clock = std::chrono::steady_clock;
     const bool prof = im.qpool != VK_NULL_HANDLE;
+    const auto last_ts =
+        static_cast<std::uint32_t>(im.ts_kernel.size() + 1);
     if (prof) {
         vkCmdWriteTimestamp(im.batch_cmd,
                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                            im.qpool, 1);
+                            im.qpool, last_ts);
     }
     check(vkEndCommandBuffer(im.batch_cmd), "end cmd");
     const clock::time_point t1 = clock::now();
@@ -558,13 +617,21 @@ void VulkanContext::end_batch() {
         using ms = std::chrono::duration<double, std::milli>;
         im.prof.host_ms += ms(t1 - im.batch_t0).count();
         im.prof.wait_ms += ms(t2 - t1).count();
-        std::uint64_t ts[2] = {0, 0};
+        std::vector<std::uint64_t> ts(last_ts + 1);
         if (vkGetQueryPoolResults(
-                im.device, im.qpool, 0, 2, sizeof(ts), ts,
-                sizeof(ts[0]), VK_QUERY_RESULT_64_BIT) ==
-            VK_SUCCESS) {
-            im.prof.gpu_ms += static_cast<double>(ts[1] - ts[0]) *
-                              im.ts_period_ns / 1e6;
+                im.device, im.qpool, 0, last_ts + 1,
+                ts.size() * sizeof(ts[0]), ts.data(), sizeof(ts[0]),
+                VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            const auto to_ms = [&](std::uint64_t a, std::uint64_t b) {
+                return static_cast<double>(b - a) * im.ts_period_ns /
+                       1e6;
+            };
+            im.prof.gpu_ms += to_ms(ts[0], ts[last_ts]);
+            for (std::size_t i = 0; i < im.ts_kernel.size(); ++i) {
+                im.prof.kernel_ms[im.ts_kernel[i]] +=
+                    to_ms(ts[i], ts[i + 1]);
+                ++im.prof.kernel_n[im.ts_kernel[i]];
+            }
         }
     }
     vkFreeCommandBuffers(im.device, im.pool, 1, &im.batch_cmd);
@@ -612,7 +679,8 @@ void VulkanContext::matvec_f32(Buffer w, std::uint32_t rows,
     const Buffer bufs[] = {w, x, out};
     const std::uint32_t push[] = {
         rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
-    dispatch(Kernel::kMatvecF32, bufs, push, (rows + 63) / 64);
+    dispatch(Kernel::kMatvecF32, bufs, push,
+             matvec_groups(Kernel::kMatvecF32, rows));
     end_batch();
 }
 

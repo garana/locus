@@ -58,7 +58,9 @@ class VulkanContext {
      * set (GPU time via timestamp queries). host_ms covers
      * begin_batch .. end_batch on the CPU (recording plus any host
      * work between), wait_ms the submit + vkQueueWaitIdle, gpu_ms
-     * the device time between the batch's first and last command.
+     * the device time between the batch's first and last command;
+     * kernel_ms splits that per kernel (a timestamp after each
+     * dispatch, which the inter-dispatch barrier serializes).
      */
     struct Profile {
         std::uint64_t tokens = 0;
@@ -67,7 +69,19 @@ class VulkanContext {
         double host_ms = 0.0;
         double wait_ms = 0.0;
         double gpu_ms = 0.0;
+        double kernel_ms[static_cast<int>(Kernel::kCount_)] = {};
+        std::uint64_t kernel_n[static_cast<int>(Kernel::kCount_)] =
+            {};
     };
+
+    /**
+     * Workgroup count covering `rows` output rows of a matvec kernel
+     * (kMatvec*, not kMatvecT): row-parallel kernels map 4 rows to a
+     * workgroup, the older one-thread-per-row kernels 64.
+     *
+     * @returns The X group count to pass to dispatch().
+     */
+    static std::uint32_t matvec_groups(Kernel k, std::uint32_t rows);
 
     /** @returns true when LOCUS_VK_PROFILE is set. */
     static bool profiling();
