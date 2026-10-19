@@ -89,8 +89,9 @@ matmul shaders (F32/F16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K, weights
 resident, uploaded once), rmsnorm, RoPE, SwiGLU, and paged
 attention reading K/V from a GPU-mapped cache pool, all recorded
 as one command batch per token. MoE layers route on the GPU too
-(moe_route + batched expert matvecs) when every expert fits an
-unbudgeted pool; LOCUS_VK_PROFILE=1|2 prints per-token host, wait
+(moe_route + batched expert matvecs) when the pool is unbudgeted
+and all experts fit in 80% of available device memory, else on
+the host; LOCUS_VK_PROFILE=1|2 prints per-token host, wait
 and GPU time (2: per kernel). On an M4 Max (MoltenVK) decode runs
 ~95 tok/s on llama-3.2-1b Q8_0 and ~49 tok/s on
 deepseek-coder-v2-lite Q8_0 (#94). Every selectable backend must

@@ -52,6 +52,7 @@ add_executable(locus_tests
     test_vulkan.cpp
     test_vulkan_attn.cpp
     test_vulkan_moe.cpp
+    test_vulkan_mem_fit.cpp
     test_vulkan_reset.cpp
     test_tokenizer.cpp
     test_model_e2e.cpp

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -13,6 +14,7 @@
 #include "iq_grids.h"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
+#include "locus/backend/vulkan/mem_fit.hpp"
 #include "locus/backend/vulkan/weight_pool.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/moe_stats.hpp"
@@ -144,6 +146,8 @@ struct State {
     WeightPool pool;
     std::unordered_map<const void*, VulkanContext::Buffer>
         kv_pools;
+    /** Per-model GPU-routing verdict (memory fit), decided once. */
+    std::unordered_map<const void*, bool> moe_gpu_fits;
 
     State() {
         pool.create = [this](std::size_t n) {
@@ -383,6 +387,7 @@ void vulkan_reset_state() {
         s.ctx.destroy_buffer(buf);
     }
     s.kv_pools.clear();
+    s.moe_gpu_fits.clear();
     // Activation scratch: bounded, but release it too so a large
     // model's buffers are not held across the rest of the run; each
     // regrows on next use.
@@ -441,12 +446,16 @@ namespace {
 /**
  * Whether a MoE layer can route on the GPU (moe_route + batched
  * expert matvecs, no host sync). Needs every expert resident, so
- * not under a LOCUS_GPU_POOL_MB budget; not while LOCUS_MOE_STATS
- * wants host-side picks; byte offsets must fit the shaders' uint.
- * LOCUS_VK_CPU_ROUTE=1 forces the host-routed path.
+ * not under a LOCUS_GPU_POOL_MB budget, and only when all of the
+ * model's expert tensors fit in 80% of the device's available
+ * memory (decided once per model, before any is uploaded); not
+ * while LOCUS_MOE_STATS wants host-side picks; byte offsets must
+ * fit the shaders' uint. LOCUS_VK_CPU_ROUTE=1 forces the
+ * host-routed path.
  */
-bool gpu_route_ok(State& s, const model::Hparams& hp,
+bool gpu_route_ok(State& s, const model::TransformerModel& m,
                   const model::TransformerModel::Layer& lay) {
+    const auto& hp = m.hparams();
     static const bool forced_cpu =
         std::getenv("LOCUS_VK_CPU_ROUTE") != nullptr;
     if (forced_cpu || model::MoeStats::enabled()) {
@@ -469,7 +478,30 @@ bool gpu_route_ok(State& s, const model::Hparams& hp,
             return false;
         }
     }
-    return true;
+    auto fit = s.moe_gpu_fits.find(&m);
+    if (fit == s.moe_gpu_fits.end()) {
+        std::uint64_t experts = 0;
+        for (const auto& l : m.layers()) {
+            if (l.is_moe()) {
+                experts += (l.gate_exps.expert_bytes +
+                            l.up_exps.expert_bytes +
+                            l.down_exps.expert_bytes) *
+                           hp.n_expert;
+            }
+        }
+        const std::uint64_t avail = s.ctx.memory_available();
+        fit = s.moe_gpu_fits.emplace(&m, vk::moe_experts_fit(experts, avail))
+                  .first;
+        if (!fit->second) {
+            std::fprintf(stderr,
+                         "[vulkan] MoE experts (%llu MB) exceed 80%% of "
+                         "available device memory (%llu MB): routing "
+                         "on the host\n",
+                         static_cast<unsigned long long>(experts >> 20),
+                         static_cast<unsigned long long>(avail >> 20));
+        }
+    }
+    return fit->second;
 }
 
 }  // namespace
@@ -881,7 +913,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         if (!lay.is_moe()) {
             swiglu(lay.w_gate, lay.w_up, lay.w_down, hp.n_ff,
                    1.0f, 0, 0, 0, nullptr, nullptr, nullptr);
-        } else if (gpu_route_ok(s, hp, lay)) {
+        } else if (gpu_route_ok(s, m, lay)) {
             // Router, top-k and the routed experts all on the GPU
             // in the open batch: moe_route writes the picked ids
             // and weights, the batched matvecs read them.

@@ -1,5 +1,7 @@
 #include "locus/backend/vulkan/context.hpp"
 
+#include "locus/backend/vulkan/mem_fit.hpp"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -294,7 +296,28 @@ struct VulkanContext::Impl {
         VkBuffer buf = VK_NULL_HANDLE;
         VkDeviceMemory mem = VK_NULL_HANDLE;
         void* map = nullptr;
+        VkDeviceSize bytes = 0;
     };
+
+    /** VK_EXT_memory_budget present (and enabled). */
+    bool has_budget = false;
+    /** Bytes currently allocated through make_buffer. */
+    VkDeviceSize allocated = 0;
+
+    /** @returns The heap backing host-visible coherent memory. */
+    std::uint32_t host_heap() const {
+        VkPhysicalDeviceMemoryProperties props;
+        vkGetPhysicalDeviceMemoryProperties(phys, &props);
+        const VkMemoryPropertyFlags want =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (std::uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+            if ((props.memoryTypes[i].propertyFlags & want) == want) {
+                return props.memoryTypes[i].heapIndex;
+            }
+        }
+        return 0;
+    }
 
     void init() {
         VkApplicationInfo app{};
@@ -355,11 +378,29 @@ struct VulkanContext::Impl {
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
+        std::vector<const char*> dexts;
 #if defined(__APPLE__)
-        const char* dexts[] = {"VK_KHR_portability_subset"};
-        dci.enabledExtensionCount = 1;
-        dci.ppEnabledExtensionNames = dexts;
+        dexts.push_back("VK_KHR_portability_subset");
 #endif
+        {
+            std::uint32_t en = 0;
+            vkEnumerateDeviceExtensionProperties(phys, nullptr, &en,
+                                                 nullptr);
+            std::vector<VkExtensionProperties> exts(en);
+            vkEnumerateDeviceExtensionProperties(phys, nullptr, &en,
+                                                 exts.data());
+            for (const auto& e : exts) {
+                if (std::strcmp(e.extensionName,
+                                VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) ==
+                    0) {
+                    has_budget = true;
+                    dexts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+                }
+            }
+        }
+        dci.enabledExtensionCount =
+            static_cast<std::uint32_t>(dexts.size());
+        dci.ppEnabledExtensionNames = dexts.data();
         check(vkCreateDevice(phys, &dci, nullptr, &device),
               "create device");
         vkGetDeviceQueue(device, queue_family, 0, &queue);
@@ -490,6 +531,8 @@ struct VulkanContext::Impl {
         mai.memoryTypeIndex = type;
         check(vkAllocateMemory(device, &mai, nullptr, &b.mem),
               "allocate memory");
+        b.bytes = req.size;
+        allocated += req.size;
         check(vkBindBufferMemory(device, b.buf, b.mem, 0),
               "bind memory");
         check(vkMapMemory(device, b.mem, 0, size, 0, &b.map),
@@ -499,6 +542,7 @@ struct VulkanContext::Impl {
 
     void destroy_buffer(HostBuffer& b) {
         if (b.mem != VK_NULL_HANDLE) {
+            allocated -= b.bytes;
             vkUnmapMemory(device, b.mem);
             vkFreeMemory(device, b.mem, nullptr);
         }
@@ -730,6 +774,26 @@ void VulkanContext::end_batch() {
     }
 }
 
+std::uint64_t VulkanContext::memory_available() const {
+    const Impl& im = *impl_;
+    const std::uint32_t heap = im.host_heap();
+    if (im.has_budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+        budget.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        VkPhysicalDeviceMemoryProperties2 props{};
+        props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+        props.pNext = &budget;
+        vkGetPhysicalDeviceMemoryProperties2(im.phys, &props);
+        return memory_available_from(true, budget.heapBudget[heap],
+                                     budget.heapUsage[heap]);
+    }
+    VkPhysicalDeviceMemoryProperties props;
+    vkGetPhysicalDeviceMemoryProperties(im.phys, &props);
+    return memory_available_from(false, props.memoryHeaps[heap].size,
+                                 im.allocated);
+}
+
 void VulkanContext::note_token() { ++impl_->prof.tokens; }
 
 const VulkanContext::Profile& VulkanContext::profile() const {
@@ -841,6 +905,7 @@ void VulkanContext::dispatch(Kernel, std::span<const Buffer>,
 }
 void VulkanContext::end_batch() { no_kernels(); }
 void VulkanContext::note_token() { no_kernels(); }
+std::uint64_t VulkanContext::memory_available() const { no_kernels(); }
 const VulkanContext::Profile& VulkanContext::profile() const {
     no_kernels();
 }

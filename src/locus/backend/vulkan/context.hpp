@@ -92,6 +92,17 @@ class VulkanContext {
     /** @returns true when LOCUS_VK_PROFILE is set. */
     static bool profiling();
 
+    /**
+     * Device memory this context can still allocate, per
+     * memory_available_from() (mem_fit.hpp): VK_EXT_memory_budget
+     * when the device has it, else 3/4 of the heap minus this
+     * context's allocations (the heap backing its host-visible
+     * buffers).
+     *
+     * @returns Available bytes (0 when exhausted).
+     */
+    std::uint64_t memory_available() const;
+
     /** Counts one forwarded token toward the profile. */
     void note_token();
 
