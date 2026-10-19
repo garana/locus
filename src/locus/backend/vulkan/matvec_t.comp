@@ -2,7 +2,9 @@
 
 // Transposed f32 matvec: out[out_off + c] = sum_r w[r,c]*x[r],
 // over a row-slice of W starting at element w_off. Used by MLA's
-// weight absorption (q_abs = W_uk^T q_nope).
+// weight absorption (q_abs = W_uk^T q_nope). Workgroup row y (one
+// per head) shifts each offset by y times its *_y stride, so all
+// heads go in one dispatch.
 
 layout(local_size_x = 64) in;
 
@@ -16,6 +18,9 @@ layout(push_constant) uniform PC {
     uint w_off;   // element offset of the slice's first row
     uint x_off;
     uint out_off;
+    uint w_off_y;
+    uint x_off_y;
+    uint out_off_y;
 } pc;
 
 void main() {
@@ -23,9 +28,12 @@ void main() {
     if (c >= pc.cols) {
         return;
     }
+    uint y = gl_WorkGroupID.y;
+    uint w0 = pc.w_off + y * pc.w_off_y;
+    uint x0 = pc.x_off + y * pc.x_off_y;
     float acc = 0.0;
     for (uint r = 0; r < pc.rows; ++r) {
-        acc += w[pc.w_off + r * pc.cols + c] * x[pc.x_off + r];
+        acc += w[w0 + r * pc.cols + c] * x[x0 + r];
     }
-    o[pc.out_off + c] = acc;
+    o[pc.out_off + y * pc.out_off_y + c] = acc;
 }

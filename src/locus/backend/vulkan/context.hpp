@@ -28,6 +28,11 @@ enum class Kernel {
     kAttnMla,
     kAttnPagedQ,
     kKvStoreQ,
+    /** Batched (-DBATCHED) matvecs: one dispatch, several matrices. */
+    kMatvecF32B,
+    kMatvecF16B,
+    kMatvecQ8_0B,
+    kMoeRoute,
     kCount_,
 };
 
@@ -58,9 +63,10 @@ class VulkanContext {
      * set (GPU time via timestamp queries). host_ms covers
      * begin_batch .. end_batch on the CPU (recording plus any host
      * work between), wait_ms the submit + vkQueueWaitIdle, gpu_ms
-     * the device time between the batch's first and last command;
-     * kernel_ms splits that per kernel (a timestamp after each
-     * dispatch, which the inter-dispatch barrier serializes).
+     * the device time between the batch's first and last command.
+     * With LOCUS_VK_PROFILE=2, kernel_ms splits that per kernel (a
+     * timestamp after each dispatch, which the inter-dispatch
+     * barrier serializes; costs host time on some drivers).
      */
     struct Profile {
         std::uint64_t tokens = 0;
@@ -129,10 +135,11 @@ class VulkanContext {
      * @param k Kernel to run; buffer count must match its layout.
      * @param push Raw push constants (floats bit-cast to uint32).
      * @param groups_x X workgroup count.
+     * @param groups_y Y workgroup count (batched slots / heads).
      */
     void dispatch(Kernel k, std::span<const Buffer> buffers,
                   std::span<const std::uint32_t> push,
-                  std::uint32_t groups_x);
+                  std::uint32_t groups_x, std::uint32_t groups_y = 1);
 
     /** Submits the batch and waits for completion. */
     void end_batch();

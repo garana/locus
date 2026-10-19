@@ -13,6 +13,9 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecF32:
         case Kernel::kMatvecF16:
         case Kernel::kMatvecQ8_0:
+        case Kernel::kMatvecF32B:
+        case Kernel::kMatvecF16B:
+        case Kernel::kMatvecQ8_0B:
             return (rows + 3) / 4;
         default:
             return (rows + 63) / 64;
@@ -48,7 +51,8 @@ void VulkanContext::report_profile() const {
         "matvec_iq2_xxs", "matvec_iq3_xxs", "matvec_iq4_xs",
         "matvec_t",     "rmsnorm",      "rope",
         "silu_mul",     "attn_paged",   "attn_mla",
-        "attn_paged_q", "kv_store_q"};
+        "attn_paged_q", "kv_store_q",   "matvec_f32_b",
+        "matvec_f16_b", "matvec_q8_0_b", "moe_route"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -78,15 +82,19 @@ void VulkanContext::report_profile() const {
 
 #include <vulkan/vulkan.h>
 
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 #include "attn_mla_spv.h"
 #include "attn_paged_q_spv.h"
 #include "attn_paged_spv.h"
 #include "kv_store_q_spv.h"
+#include "matvec_b_spv.h"
+#include "matvec_f16_b_spv.h"
 #include "matvec_f16_spv.h"
 #include "matvec_q4_0_spv.h"
 #include "matvec_q5_0_spv.h"
@@ -97,7 +105,9 @@ void VulkanContext::report_profile() const {
 #include "matvec_iq2_xxs_spv.h"
 #include "matvec_iq3_xxs_spv.h"
 #include "matvec_iq4_xs_spv.h"
+#include "matvec_q8_0_b_spv.h"
 #include "matvec_q8_0_spv.h"
+#include "moe_route_spv.h"
 #include "matvec_spv.h"
 #include "matvec_t_spv.h"
 #include "rmsnorm_spv.h"
@@ -148,7 +158,7 @@ const KernelDesc& kernel_desc(Kernel k) {
         {locus_matvec_iq4_xs_spv,
          sizeof(locus_matvec_iq4_xs_spv), 3, 28},
         {locus_matvec_t_spv, sizeof(locus_matvec_t_spv), 3,
-         20},
+         32},
         {locus_rmsnorm_spv, sizeof(locus_rmsnorm_spv), 3, 12},
         {locus_rope_spv, sizeof(locus_rope_spv), 2, 36},
         {locus_silu_mul_spv, sizeof(locus_silu_mul_spv), 3, 4},
@@ -160,7 +170,15 @@ const KernelDesc& kernel_desc(Kernel k) {
          5, 44},
         {locus_kv_store_q_spv, sizeof(locus_kv_store_q_spv), 2,
          16},
+        {locus_matvec_b_spv, sizeof(locus_matvec_b_spv), 4, 48},
+        {locus_matvec_f16_b_spv, sizeof(locus_matvec_f16_b_spv), 4,
+         48},
+        {locus_matvec_q8_0_b_spv, sizeof(locus_matvec_q8_0_b_spv),
+         4, 48},
+        {locus_moe_route_spv, sizeof(locus_moe_route_spv), 3, 32},
     };
+    static_assert(std::size(descs) ==
+                  static_cast<std::size_t>(Kernel::kCount_));
     return descs[static_cast<int>(k)];
 }
 
@@ -173,7 +191,82 @@ struct VulkanContext::Impl {
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t queue_family = 0;
     VkCommandPool pool = VK_NULL_HANDLE;
-    VkDescriptorPool dpool = VK_NULL_HANDLE;
+
+    /**
+     * Descriptor sets cached by (kernel, buffers): a decode token
+     * replays the same dispatch sequence, so after the first token
+     * every set is a hit and recording skips the allocate + write.
+     * Sets come from a growing list of pools. Destroying any buffer
+     * drops the map at once (a recycled VkBuffer handle must never
+     * hit a stale set) and frees the pools at the next end_batch,
+     * when no recorded command can still reference them.
+     */
+    static constexpr std::size_t kMaxBufs = 8;
+    struct SetKey {
+        int kernel;
+        std::array<VkBuffer, kMaxBufs> bufs;
+        bool operator==(const SetKey&) const = default;
+    };
+    struct SetKeyHash {
+        std::size_t operator()(const SetKey& k) const {
+            std::size_t h = static_cast<std::size_t>(k.kernel);
+            for (VkBuffer b : k.bufs) {
+                h = h * 1000003u ^ std::hash<const void*>{}(b);
+            }
+            return h;
+        }
+    };
+    std::unordered_map<SetKey, VkDescriptorSet, SetKeyHash> sets;
+    std::vector<VkDescriptorPool> dpools;
+    std::size_t sets_live = 0;
+    bool sets_stale = false;
+
+    VkDescriptorPool new_dpool() {
+        VkDescriptorPoolSize dps{};
+        dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        dps.descriptorCount = 8192;
+        VkDescriptorPoolCreateInfo dpi{};
+        dpi.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpi.maxSets = 2048;
+        dpi.poolSizeCount = 1;
+        dpi.pPoolSizes = &dps;
+        VkDescriptorPool p;
+        check(vkCreateDescriptorPool(device, &dpi, nullptr, &p),
+              "create descriptor pool");
+        dpools.push_back(p);
+        return p;
+    }
+
+    VkDescriptorSet alloc_set(VkDescriptorSetLayout dsl) {
+        VkDescriptorSetAllocateInfo dsa{};
+        dsa.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsa.descriptorSetCount = 1;
+        dsa.pSetLayouts = &dsl;
+        dsa.descriptorPool = dpools.back();
+        VkDescriptorSet ds;
+        if (vkAllocateDescriptorSets(device, &dsa, &ds) != VK_SUCCESS) {
+            dsa.descriptorPool = new_dpool();
+            check(vkAllocateDescriptorSets(device, &dsa, &ds),
+                  "allocate descriptor set");
+        }
+        ++sets_live;
+        return ds;
+    }
+
+    /** Frees every cached set; only when no batch is pending. */
+    void reset_sets() {
+        sets.clear();
+        for (std::size_t i = 1; i < dpools.size(); ++i) {
+            vkDestroyDescriptorPool(device, dpools[i], nullptr);
+        }
+        dpools.resize(1);
+        check(vkResetDescriptorPool(device, dpools[0], 0),
+              "reset descriptor pool");
+        sets_live = 0;
+        sets_stale = false;
+    }
 
     struct Pipe {
         VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
@@ -192,6 +285,7 @@ struct VulkanContext::Impl {
     static constexpr std::uint32_t kMaxTs = 4096;
     Profile prof;
     std::vector<int> ts_kernel;
+    bool per_kernel = false;  // LOCUS_VK_PROFILE=2
     VkQueryPool qpool = VK_NULL_HANDLE;
     double ts_period_ns = 0.0;
     std::chrono::steady_clock::time_point batch_t0;
@@ -281,20 +375,7 @@ struct VulkanContext::Impl {
             create_pipe(static_cast<Kernel>(k));
         }
 
-        // Sized for the largest realistic per-token batch (a few
-        // hundred dispatches); reset after every end_batch().
-        VkDescriptorPoolSize dps{};
-        dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        dps.descriptorCount = 4096;
-        VkDescriptorPoolCreateInfo dpi{};
-        dpi.sType =
-            VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dpi.maxSets = 1024;
-        dpi.poolSizeCount = 1;
-        dpi.pPoolSizes = &dps;
-        check(vkCreateDescriptorPool(device, &dpi, nullptr,
-                                     &dpool),
-              "create descriptor pool");
+        new_dpool();
 
         if (VulkanContext::profiling()) {
             VkPhysicalDeviceProperties pp;
@@ -304,6 +385,8 @@ struct VulkanContext::Impl {
             qpi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
             qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
             qpi.queryCount = kMaxTs;
+            const char* level = std::getenv("LOCUS_VK_PROFILE");
+            per_kernel = level != nullptr && std::atoi(level) >= 2;
             check(vkCreateQueryPool(device, &qpi, nullptr, &qpool),
                   "create query pool");
         }
@@ -431,7 +514,9 @@ struct VulkanContext::Impl {
             if (qpool != VK_NULL_HANDLE) {
                 vkDestroyQueryPool(device, qpool, nullptr);
             }
-            vkDestroyDescriptorPool(device, dpool, nullptr);
+            for (VkDescriptorPool p : dpools) {
+                vkDestroyDescriptorPool(device, p, nullptr);
+            }
             for (const Pipe& p : pipes) {
                 vkDestroyPipeline(device, p.pipeline, nullptr);
                 vkDestroyPipelineLayout(device, p.layout,
@@ -470,6 +555,8 @@ VulkanContext::Buffer VulkanContext::create_buffer(
 void VulkanContext::destroy_buffer(Buffer b) {
     auto* hb = static_cast<Impl::HostBuffer*>(b.impl);
     if (hb != nullptr) {
+        impl_->sets.clear();
+        impl_->sets_stale = true;
         impl_->destroy_buffer(*hb);
         delete hb;
     }
@@ -519,44 +606,45 @@ void VulkanContext::begin_batch() {
 void VulkanContext::dispatch(Kernel k,
                              std::span<const Buffer> buffers,
                              std::span<const std::uint32_t> push,
-                             std::uint32_t groups_x) {
+                             std::uint32_t groups_x,
+                             std::uint32_t groups_y) {
     Impl& im = *impl_;
     const Impl::Pipe& p = im.pipes[static_cast<int>(k)];
     const KernelDesc& kd = kernel_desc(k);
     if (buffers.size() != kd.n_buffers ||
+        buffers.size() > Impl::kMaxBufs ||
         push.size() * 4 != kd.push_bytes) {
         throw std::runtime_error("vulkan: dispatch shape");
     }
 
-    VkDescriptorSetAllocateInfo dsa{};
-    dsa.sType =
-        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsa.descriptorPool = im.dpool;
-    dsa.descriptorSetCount = 1;
-    dsa.pSetLayouts = &p.dsl;
-    VkDescriptorSet ds;
-    check(vkAllocateDescriptorSets(im.device, &dsa, &ds),
-          "allocate descriptor set");
-
-    std::vector<VkDescriptorBufferInfo> infos(buffers.size());
-    std::vector<VkWriteDescriptorSet> writes(buffers.size());
+    Impl::SetKey key{static_cast<int>(k), {}};
     for (std::size_t i = 0; i < buffers.size(); ++i) {
-        auto* hb =
-            static_cast<Impl::HostBuffer*>(buffers[i].impl);
-        infos[i] = {hb->buf, 0, VK_WHOLE_SIZE};
-        writes[i] = {};
-        writes[i].sType =
-            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = ds;
-        writes[i].dstBinding = static_cast<std::uint32_t>(i);
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType =
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &infos[i];
+        key.bufs[i] = static_cast<Impl::HostBuffer*>(buffers[i].impl)->buf;
     }
-    vkUpdateDescriptorSets(
-        im.device, static_cast<std::uint32_t>(writes.size()),
-        writes.data(), 0, nullptr);
+    VkDescriptorSet ds;
+    if (auto it = im.sets.find(key); it != im.sets.end()) {
+        ds = it->second;
+    } else {
+        ds = im.alloc_set(p.dsl);
+        VkDescriptorBufferInfo infos[Impl::kMaxBufs];
+        VkWriteDescriptorSet writes[Impl::kMaxBufs];
+        for (std::size_t i = 0; i < buffers.size(); ++i) {
+            infos[i] = {key.bufs[i], 0, VK_WHOLE_SIZE};
+            writes[i] = {};
+            writes[i].sType =
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = ds;
+            writes[i].dstBinding = static_cast<std::uint32_t>(i);
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType =
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &infos[i];
+        }
+        vkUpdateDescriptorSets(
+            im.device, static_cast<std::uint32_t>(buffers.size()),
+            writes, 0, nullptr);
+        im.sets.emplace(key, ds);
+    }
 
     vkCmdBindPipeline(im.batch_cmd,
                       VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -567,11 +655,10 @@ void VulkanContext::dispatch(Kernel k,
     vkCmdPushConstants(im.batch_cmd, p.layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        kd.push_bytes, push.data());
-    vkCmdDispatch(im.batch_cmd, groups_x, 1, 1);
+    vkCmdDispatch(im.batch_cmd, groups_x, groups_y, 1);
     ++im.prof.dispatches;
     // Slot 0 is the batch start; keep the last slot for its end.
-    if (im.qpool != VK_NULL_HANDLE &&
-        im.ts_kernel.size() + 2 < Impl::kMaxTs) {
+    if (im.per_kernel && im.ts_kernel.size() + 2 < Impl::kMaxTs) {
         im.ts_kernel.push_back(static_cast<int>(k));
         vkCmdWriteTimestamp(
             im.batch_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -636,8 +723,11 @@ void VulkanContext::end_batch() {
     }
     vkFreeCommandBuffers(im.device, im.pool, 1, &im.batch_cmd);
     im.batch_cmd = VK_NULL_HANDLE;
-    check(vkResetDescriptorPool(im.device, im.dpool, 0),
-          "reset descriptor pool");
+    // Bound the cache when keys keep changing (e.g. a paging
+    // budget cycling per-expert buffers).
+    if (im.sets_stale || im.sets_live > 65536) {
+        im.reset_sets();
+    }
 }
 
 void VulkanContext::note_token() { ++impl_->prof.tokens; }
@@ -746,7 +836,7 @@ void* VulkanContext::mapped(Buffer) { no_kernels(); }
 void VulkanContext::begin_batch() { no_kernels(); }
 void VulkanContext::dispatch(Kernel, std::span<const Buffer>,
                              std::span<const std::uint32_t>,
-                             std::uint32_t) {
+                             std::uint32_t, std::uint32_t) {
     no_kernels();
 }
 void VulkanContext::end_batch() { no_kernels(); }

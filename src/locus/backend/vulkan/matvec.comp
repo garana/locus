@@ -3,6 +3,15 @@
 // Dense f32 matrix-vector product: o[r] = dot(w[r,:], x).
 // Four rows per workgroup, 32 lanes per row striding the columns
 // (coalesced), reduced through shared memory.
+//
+// Compiled a second time with -DBATCHED (the *_b kernels): one
+// dispatch covers several same-shape matrices. Slot y =
+// gl_WorkGroupID.y reads w_off + id * w_stride, x_off + y * x_stride
+// and writes out_offset + y * out_stride, where id = route[y] under
+// mode bit 1 (MoE expert ids picked on the GPU), else y. Mode bit 2
+// instead loops all n_slots inside each workgroup and sums them, each
+// weighted by route[n_slots + k] (float bits), into one output row:
+// the MoE down projection, without racing slots on one row.
 
 #define LANES 32u
 #define ROWS 4u
@@ -12,6 +21,9 @@ layout(local_size_x = 128) in;
 layout(std430, binding = 0) readonly buffer W { float w[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 2) buffer O { float o[]; };
+#ifdef BATCHED
+layout(std430, binding = 3) readonly buffer R { uint route[]; };
+#endif
 
 layout(push_constant) uniform PC {
     uint rows;
@@ -21,20 +33,51 @@ layout(push_constant) uniform PC {
     uint w_off;   // element offset (f32/f16), byte offset (quant)
     uint x_off;
     float scale;
+#ifdef BATCHED
+    uint w_stride;  // per slot, in w_off units
+    uint x_stride;
+    uint out_stride;
+    uint n_slots;
+    uint mode;      // 1 = ids from route[], 2 = weighted slot sum
+#endif
 } pc;
 
 shared float red[LANES * ROWS];
+
+/** This lane's share of dot(row r of the matrix at wbase, x). */
+float row_part(uint wbase, uint xbase, uint r, uint lane) {
+    uint base = wbase + r * pc.cols;
+    float acc = 0.0;
+    for (uint i = lane; i < pc.cols; i += LANES) {
+        acc += w[base + i] * x[xbase + i];
+    }
+    return acc;
+}
 
 void main() {
     uint lane = gl_LocalInvocationID.x % LANES;
     uint slot = gl_LocalInvocationID.x / LANES;
     uint r = gl_WorkGroupID.x * ROWS + slot;
+    uint at = pc.out_offset + r;
     float acc = 0.0;
     if (r < pc.rows) {
-        uint base = pc.w_off + r * pc.cols;
-        for (uint i = lane; i < pc.cols; i += LANES) {
-            acc += w[base + i] * x[pc.x_off + i];
+#ifdef BATCHED
+        uint y = gl_WorkGroupID.y;
+        bool sum = (pc.mode & 2u) != 0u;
+        uint k1 = sum ? pc.n_slots : y + 1u;
+        for (uint k = sum ? 0u : y; k < k1; ++k) {
+            uint id = (pc.mode & 1u) != 0u ? route[k] : k;
+            float wk = sum ? uintBitsToFloat(route[pc.n_slots + k])
+                           : 1.0;
+            acc += wk * row_part(pc.w_off + id * pc.w_stride,
+                                 pc.x_off + k * pc.x_stride, r, lane);
         }
+        if (!sum) {
+            at += y * pc.out_stride;
+        }
+#else
+        acc = row_part(pc.w_off, pc.x_off, r, lane);
+#endif
     }
     red[gl_LocalInvocationID.x] = acc;
     barrier();
@@ -46,7 +89,6 @@ void main() {
         barrier();
     }
     if (lane == 0u && r < pc.rows) {
-        uint at = pc.out_offset + r;
         float v = red[gl_LocalInvocationID.x] * pc.scale;
         o[at] = pc.accumulate != 0 ? o[at] + v : v;
     }

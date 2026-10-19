@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <bit>
 #include <cassert>
@@ -104,6 +106,16 @@ Kernel matvec_kernel(const Mat& w) {
     }
 }
 
+/** @returns The batched (*_b) matvec kernel for w, or kCount_. */
+Kernel batched_kernel(const Mat& w) {
+    switch (w.type) {
+        case gguf::TensorType::kF32: return Kernel::kMatvecF32B;
+        case gguf::TensorType::kF16: return Kernel::kMatvecF16B;
+        case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0B;
+        default: return Kernel::kCount_;
+    }
+}
+
 /** Converts a byte offset into shader w_off units for w's type. */
 std::uint32_t w_off_units(const Mat& w, std::uint64_t bytes) {
     switch (w.type) {
@@ -149,11 +161,27 @@ struct State {
     /** Activation buffers, sized on first use per model dims. */
     VulkanContext::Buffer x{}, xb{}, q{}, gate{}, up{}, attout{},
         att{}, logits{}, table{}, ones{}, kv_a{}, q_abs{},
-        latent{}, q_a{};
+        latent{}, q_a{}, router{}, route{};
     std::size_t x_n = 0, xb_n = 0, q_n = 0, gate_n = 0, up_n = 0,
                 attout_n = 0, att_n = 0, logits_n = 0,
                 table_n = 0, ones_n = 0, kv_a_n = 0, q_abs_n = 0,
-                latent_n = 0, q_a_n = 0;
+                latent_n = 0, q_a_n = 0, router_n = 0, route_n = 0;
+
+    /**
+     * Uploads a whole stacked expert tensor (every expert) as one
+     * buffer, keyed by the ExpertMat itself: its base pointer is
+     * also expert 0's key on the per-expert (CPU-routed) path.
+     */
+    VulkanContext::Buffer upload_experts(
+        const model::TransformerModel::ExpertMat& em,
+        std::uint32_t n_expert) {
+        const std::size_t bytes =
+            (static_cast<std::size_t>(em.expert_bytes) * n_expert + 3) &
+            ~std::size_t{3};
+        return pool.acquire(&em, bytes, [&](VulkanContext::Buffer b) {
+            ctx.write_buffer(b, {em.base.data, bytes});
+        });
+    }
 
     VulkanContext::Buffer upload(const void* ptr,
                                  std::size_t bytes) {
@@ -282,6 +310,44 @@ void rec_matvec(State& s, const Mat& w, VulkanContext::Buffer x,
                    VulkanContext::matvec_groups(k, w.rows));
 }
 
+/** Batched matvec mode bits (matvec*.comp, -DBATCHED). */
+constexpr std::uint32_t kRouteIds = 1;  // slot -> route[slot] id
+constexpr std::uint32_t kSlotSum = 2;   // weighted sum of slots
+
+/**
+ * Records one batched matvec: `slots` matrices of w's shape in
+ * `wb`, slot k at byte offset w_byte_off + id * w_stride_bytes
+ * reading x at x_off + k * x_stride. Split mode (no kSlotSum)
+ * runs a workgroup row per slot writing out_offset + k *
+ * out_stride; kSlotSum sums the slots, weighted by the route
+ * buffer, into one output row. `route` must be bound even when
+ * unused (pass any buffer).
+ */
+void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
+                  VulkanContext::Buffer x, VulkanContext::Buffer out,
+                  std::uint32_t out_offset, bool accumulate,
+                  std::uint64_t w_byte_off, std::uint32_t x_off,
+                  std::uint64_t w_stride_bytes, std::uint32_t x_stride,
+                  std::uint32_t out_stride, std::uint32_t slots,
+                  std::uint32_t mode, VulkanContext::Buffer route) {
+    const Kernel k = batched_kernel(w);
+    const VulkanContext::Buffer bufs[] = {wb, x, out, route};
+    const std::uint32_t push[] = {w.rows,
+                                  w.cols,
+                                  out_offset,
+                                  accumulate ? 1u : 0u,
+                                  w_off_units(w, w_byte_off),
+                                  x_off,
+                                  fbits(1.0f),
+                                  w_off_units(w, w_stride_bytes),
+                                  x_stride,
+                                  out_stride,
+                                  slots,
+                                  mode};
+    s.ctx.dispatch(k, bufs, push, VulkanContext::matvec_groups(k, w.rows),
+                   (mode & kSlotSum) != 0 ? 1u : slots);
+}
+
 }  // namespace
 
 bool vulkan_backend_usable() {
@@ -341,6 +407,8 @@ void vulkan_reset_state() {
     drop(s.q_abs, s.q_abs_n);
     drop(s.latent, s.latent_n);
     drop(s.q_a, s.q_a_n);
+    drop(s.router, s.router_n);
+    drop(s.route, s.route_n);
 }
 
 void matvec_vulkan(const Mat& w, std::span<const float> x,
@@ -367,6 +435,44 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
     s.pool.on_batch_end();
     s.ctx.read_buffer(s.xb, std::as_writable_bytes(out));
 }
+
+namespace {
+
+/**
+ * Whether a MoE layer can route on the GPU (moe_route + batched
+ * expert matvecs, no host sync). Needs every expert resident, so
+ * not under a LOCUS_GPU_POOL_MB budget; not while LOCUS_MOE_STATS
+ * wants host-side picks; byte offsets must fit the shaders' uint.
+ * LOCUS_VK_CPU_ROUTE=1 forces the host-routed path.
+ */
+bool gpu_route_ok(State& s, const model::Hparams& hp,
+                  const model::TransformerModel::Layer& lay) {
+    static const bool forced_cpu =
+        std::getenv("LOCUS_VK_CPU_ROUTE") != nullptr;
+    if (forced_cpu || model::MoeStats::enabled()) {
+        return false;
+    }
+    if (s.pool.budget_ == 0) {
+        s.pool.init_budget();
+    }
+    if (s.pool.budget_ != std::numeric_limits<std::size_t>::max()) {
+        return false;
+    }
+    if (hp.n_expert_used > 16 || hp.n_expert_used == 0 ||
+        hp.n_group > 32) {
+        return false;
+    }
+    for (const auto* em : {&lay.gate_exps, &lay.up_exps, &lay.down_exps}) {
+        if (batched_kernel(em->base) == Kernel::kCount_ ||
+            em->expert_bytes * hp.n_expert >
+                std::numeric_limits<std::uint32_t>::max()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
 
 bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     kv::PagedKvCache& cache,
@@ -468,7 +574,11 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     // just ff_max, but a model with an inverted ratio would
     // otherwise overrun the FFN scratch with a K/V write -- size
     // defensively.
-    const std::size_t ff_kv = std::max<std::size_t>(ff_max, kv_dim);
+    // GPU-routed MoE keeps all n_expert_used experts' gate/up rows
+    // side by side.
+    const std::size_t ff_kv = std::max<std::size_t>(
+        {ff_max, kv_dim,
+         std::size_t{hp.n_expert_used} * hp.n_ff_exp});
     s.grow(s.gate, s.gate_n, ff_kv);
     s.grow(s.up, s.up_n, ff_kv);
     s.grow(s.attout, s.attout_n,
@@ -477,6 +587,11 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
            static_cast<std::size_t>(hp.n_heads) * hp.n_ctx);
     s.grow(s.logits, s.logits_n, hp.n_vocab);
     s.grow(s.table, s.table_n, cache.total_blocks());
+    if (hp.n_expert > 0) {
+        s.grow(s.router, s.router_n, std::size_t{hp.n_expert} * 2);
+        s.grow(s.route, s.route_n,
+               std::max<std::size_t>(hp.n_expert_used * 2, 1));
+    }
     if (mla) {
         s.grow(s.kv_a, s.kv_a_n, rank + rope_d);
         s.grow(s.q_abs, s.q_abs_n,
@@ -688,9 +803,27 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 s.ctx.dispatch(Kernel::kRope, bufs, push,
                                hp.n_heads);
             }
-            for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
-                if (split) {
-                    // Pre-transposed k_b: plain matvec per head.
+            // Per-head weight absorption, all heads per dispatch
+            // where a batched kernel exists (head h = slot h).
+            if (!split) {
+                const VulkanContext::Buffer bufs[] = {wkv_b32, s.q,
+                                                      s.q_abs};
+                const std::uint32_t push[] = {
+                    nope, rank, 0, 0, 0, (nope + vd) * rank, qk,
+                    rank};
+                s.ctx.dispatch(Kernel::kMatvecT, bufs, push,
+                               (rank + 63) / 64, hp.n_heads);
+            } else if (batched_kernel(lay.wk_b) != Kernel::kCount_) {
+                // Pre-transposed k_b: one rank-row matvec per head.
+                Mat kb = lay.wk_b;
+                kb.rows = rank;
+                rec_matvec_b(
+                    s, kb, s.upload(lay.wk_b.data, weight_bytes(lay.wk_b)),
+                    s.q, s.q_abs, 0, false, 0, 0,
+                    std::uint64_t{rank} * mat_row_bytes(lay.wk_b), qk,
+                    rank, hp.n_heads, 0, s.q);
+            } else {
+                for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
                     Mat kb = lay.wk_b;
                     kb.rows = rank;
                     rec_matvec(
@@ -698,14 +831,6 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                         std::uint64_t{h} * rank *
                             mat_row_bytes(lay.wk_b),
                         h * qk, 1.0f);
-                } else {
-                    const VulkanContext::Buffer bufs[] = {
-                        wkv_b32, s.q, s.q_abs};
-                    const std::uint32_t push[] = {
-                        nope, rank, (h * (nope + vd)) * rank,
-                        h * qk, h * rank};
-                    s.ctx.dispatch(Kernel::kMatvecT, bufs, push,
-                                   (rank + 63) / 64);
                 }
             }
             {
@@ -721,8 +846,24 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 s.ctx.dispatch(Kernel::kAttnMla, bufs, push,
                                hp.n_heads);
             }
-            for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
-                if (split) {
+            if (!split) {
+                // W_uv rows of the dequantized fused wkv_b, head h
+                // at element (h * (nope + vd) + nope) * rank.
+                Mat uv{gguf::TensorType::kF32, nullptr, vd, rank};
+                rec_matvec_b(s, uv, wkv_b32, s.latent, s.attout, 0,
+                             false, std::uint64_t{nope} * rank * 4, 0,
+                             std::uint64_t{nope + vd} * rank * 4, rank,
+                             vd, hp.n_heads, 0, s.latent);
+            } else if (batched_kernel(lay.wv_b) != Kernel::kCount_) {
+                Mat vb = lay.wv_b;
+                vb.rows = vd;
+                rec_matvec_b(
+                    s, vb, s.upload(lay.wv_b.data, weight_bytes(lay.wv_b)),
+                    s.latent, s.attout, 0, false, 0, 0,
+                    std::uint64_t{vd} * mat_row_bytes(lay.wv_b), rank,
+                    vd, hp.n_heads, 0, s.latent);
+            } else {
+                for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
                     Mat vb = lay.wv_b;
                     vb.rows = vd;
                     rec_matvec(
@@ -731,15 +872,6 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                         std::uint64_t{h} * vd *
                             mat_row_bytes(lay.wv_b),
                         h * rank, 1.0f);
-                } else {
-                    Mat uv{gguf::TensorType::kF32, nullptr, vd,
-                           rank};
-                    rec_matvec(
-                        s, uv, s.latent, s.attout, h * vd,
-                        false,
-                        std::uint64_t{h * (nope + vd) + nope} *
-                            rank * 4,
-                        h * rank, 1.0f, &wkv_b32);
                 }
             }
         }
@@ -749,6 +881,61 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         if (!lay.is_moe()) {
             swiglu(lay.w_gate, lay.w_up, lay.w_down, hp.n_ff,
                    1.0f, 0, 0, 0, nullptr, nullptr, nullptr);
+        } else if (gpu_route_ok(s, hp, lay)) {
+            // Router, top-k and the routed experts all on the GPU
+            // in the open batch: moe_route writes the picked ids
+            // and weights, the batched matvecs read them.
+            const std::uint32_t k_used = hp.n_expert_used;
+            const std::uint32_t ff = hp.n_ff_exp;
+            rec_matvec(s, lay.gate_inp, s.xb, s.router, 0, false);
+            {
+                const bool has_bias = !lay.exp_probs_b.empty();
+                const VulkanContext::Buffer bufs[] = {
+                    s.router,
+                    has_bias ? s.upload(lay.exp_probs_b.data(),
+                                        lay.exp_probs_b.size() * 4)
+                             : s.router,
+                    s.route};
+                const std::uint32_t push[] = {
+                    hp.n_expert,
+                    k_used,
+                    hp.gating == model::GatingFunc::kSigmoid ? 1u : 0u,
+                    has_bias ? 1u : 0u,
+                    hp.n_group,
+                    hp.n_group_used,
+                    hp.expert_weights_norm ? 1u : 0u,
+                    fbits(hp.expert_weights_scale)};
+                s.ctx.dispatch(Kernel::kMoeRoute, bufs, push, 1);
+            }
+            Mat g = lay.gate_exps.expert(0), u = lay.up_exps.expert(0),
+                d = lay.down_exps.expert(0);
+            g.rows = ff;
+            u.rows = ff;
+            d.cols = ff;
+            rec_matvec_b(s, g, s.upload_experts(lay.gate_exps, hp.n_expert),
+                         s.xb, s.gate, 0, false, 0, 0,
+                         lay.gate_exps.expert_bytes, 0, ff, k_used,
+                         kRouteIds, s.route);
+            rec_matvec_b(s, u, s.upload_experts(lay.up_exps, hp.n_expert),
+                         s.xb, s.up, 0, false, 0, 0,
+                         lay.up_exps.expert_bytes, 0, ff, k_used,
+                         kRouteIds, s.route);
+            {
+                const VulkanContext::Buffer bufs[] = {s.gate, s.up,
+                                                      s.gate};
+                const std::uint32_t push[] = {k_used * ff};
+                s.ctx.dispatch(Kernel::kSiluMul, bufs, push,
+                               (k_used * ff + 63) / 64);
+            }
+            rec_matvec_b(s, d, s.upload_experts(lay.down_exps, hp.n_expert),
+                         s.gate, s.x, 0, true, 0, 0,
+                         lay.down_exps.expert_bytes, ff, 0, k_used,
+                         kRouteIds | kSlotSum, s.route);
+            if (hp.n_expert_shared > 0) {
+                swiglu(lay.gate_shexp, lay.up_shexp, lay.down_shexp,
+                       hp.n_ff_exp * hp.n_expert_shared, 1.0f, 0, 0, 0,
+                       nullptr, nullptr, nullptr);
+            }
         } else {
             // Router runs on the CPU: sync the batch, read the
             // normed activations, gate, then keep recording.
