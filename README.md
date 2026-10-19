@@ -88,7 +88,12 @@ CUDA 12.x). vulkan is the full GPU forward pass instead:
 matmul shaders (F32/F16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K, weights
 resident, uploaded once), rmsnorm, RoPE, SwiGLU, and paged
 attention reading K/V from a GPU-mapped cache pool, all recorded
-as one command batch per token. Every selectable backend must
+as one command batch per token. MoE layers route on the GPU too
+(moe_route + batched expert matvecs) when every expert fits an
+unbudgeted pool; LOCUS_VK_PROFILE=1|2 prints per-token host, wait
+and GPU time (2: per kernel). On an M4 Max (MoltenVK) decode runs
+~95 tok/s on llama-3.2-1b Q8_0 and ~49 tok/s on
+deepseek-coder-v2-lite Q8_0 (#94). Every selectable backend must
 reproduce the llama.cpp golden output token-exact (tested, single
 and concurrent streams). The Vulkan full-GPU path is validated
 end to end on a real MoE + MLA model: deepseek-v2-lite runs
