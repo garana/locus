@@ -186,6 +186,8 @@ inline constexpr const char* kCommonHelp =
     "                          same names as --backends\n"
     "  LOCUS_MOE_STATS=1       print expert-routing telemetry\n"
     "                          at exit (R8 working-set data)\n"
+    "  LOCUS_VK_PROFILE=1      print per-token Vulkan batch,\n"
+    "                          host, wait and GPU time at exit\n"
     "  LOCUS_BATCH_DEQUANT=1   in batched forward, dequant each\n"
     "                          weight row once then dot all N\n"
     "                          tokens (token-exact, not byte-\n"
