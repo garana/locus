@@ -444,9 +444,9 @@ void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
 
 /** matmul.comp tile sizes: weight rows and tokens per workgroup
  * (the MOE_ID variant's token tile is narrower). */
-constexpr std::uint32_t kMatmulRows = 64;
-constexpr std::uint32_t kMatmulToks = 64;
-constexpr std::uint32_t kMatmulToksId = 16;
+constexpr std::uint32_t kMatmulRows = VulkanContext::kMatmulTileRows;
+constexpr std::uint32_t kMatmulToks = VulkanContext::kMatmulTileToks;
+constexpr std::uint32_t kMatmulToksId = VulkanContext::kMatmulTileToks;
 
 /** @returns The prefill matmul kernel for w, or kCount_. */
 Kernel matmul_kernel(const Mat& w) {
