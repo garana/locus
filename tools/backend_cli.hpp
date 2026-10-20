@@ -179,6 +179,11 @@ inline constexpr const char* kCommonHelp =
     "                   path P (default /metrics)\n"
     "  --batch-decode   enable R10 cross-sequence batched decode\n"
     "  --no-batch-prefill  force per-token prompt ingestion\n"
+    "  --timing         locus-run: print prefill and decode\n"
+    "                   tok/s to stderr\n"
+    "  --warmup         locus-run: run a throwaway 1-token\n"
+    "                   request first (weight uploads, pipeline\n"
+    "                   warm-up) so --timing excludes them\n"
     "  -h, --help       show this help and exit\n"
     "\n"
     "environment:\n"
@@ -227,6 +232,10 @@ struct BackendArgs {
     bool batch_decode = false;
     /** --no-batch-prefill: force per-token prompt ingestion. */
     bool no_batch_prefill = false;
+    /** --timing: locus-run prints prefill/decode rates. */
+    bool timing = false;
+    /** --warmup: locus-run runs a throwaway request first. */
+    bool warmup = false;
     /** --backends was given: list and exit. */
     bool list = false;
     /** --archs was given: list architectures and exit. */
@@ -281,6 +290,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.batch_decode = true;
         } else if (a == "--no-batch-prefill") {
             out.no_batch_prefill = true;
+        } else if (a == "--timing") {
+            out.timing = true;
+        } else if (a == "--warmup") {
+            out.warmup = true;
         } else {
             out.positional.emplace_back(a);
         }
