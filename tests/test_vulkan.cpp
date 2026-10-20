@@ -1,5 +1,6 @@
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -470,4 +471,16 @@ TEST_CASE("vulkan memory_available drops as buffers are allocated",
     // Budget-backed drivers may report usage coarsely; require at
     // least half the allocation to show up.
     REQUIRE(during + bytes / 2 <= before);
+}
+
+TEST_CASE("LOCUS_VK_BARRIERS keeps dispatch barriers", "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    ::setenv("LOCUS_VK_BARRIERS", "1", 1);
+    {
+        VulkanContext ctx;
+        REQUIRE_FALSE(ctx.serial_dispatch());
+    }
+    ::unsetenv("LOCUS_VK_BARRIERS");
 }

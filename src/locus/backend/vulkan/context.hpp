@@ -57,7 +57,8 @@ enum class Kernel {
  *
  * Work is recorded in batches: begin_batch(), any number of
  * dispatch() calls (a memory barrier separates consecutive
- * dispatches), end_batch() submits once and waits. The full GPU
+ * dispatches, except where the driver serializes them anyway --
+ * see serial_dispatch()), end_batch() submits once and waits. The full GPU
  * forward records one batch per token, which is what makes the
  * backend usable -- a submit per op was ~20x slower.
  *
@@ -123,6 +124,15 @@ class VulkanContext {
      * @returns Available bytes (0 when exhausted).
      */
     std::uint64_t memory_available() const;
+
+    /**
+     * Whether dispatch() skips the barrier between dispatches
+     * because the driver already serializes them (MoltenVK; unless
+     * LOCUS_VK_BARRIERS is set).
+     *
+     * @returns true when barriers are elided.
+     */
+    bool serial_dispatch() const;
 
     /** Counts one forwarded token toward the profile. */
     void note_token();
