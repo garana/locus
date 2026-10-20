@@ -290,15 +290,33 @@ struct State {
         return chunk[c];
     }
 
+    /**
+     * Grows scratch buffer b to n_floats. The old buffer is retired,
+     * not destroyed: dispatches already recorded in the open batch
+     * may still reference it (e.g. a later, larger split-K plane in
+     * the same batch). end_batch() frees retired buffers.
+     */
     void grow(VulkanContext::Buffer& b, std::size_t& cap,
               std::size_t n_floats) {
         if (n_floats > cap) {
             if (cap != 0) {
-                ctx.destroy_buffer(b);
+                retired.push_back(b);
             }
             b = ctx.create_buffer(n_floats * 4);
             cap = n_floats;
         }
+    }
+
+    std::vector<VulkanContext::Buffer> retired;
+
+    /** Submits the open batch, then releases what it no longer needs. */
+    void end_batch() {
+        ctx.end_batch();
+        pool.on_batch_end();
+        for (auto b : retired) {
+            ctx.destroy_buffer(b);
+        }
+        retired.clear();
     }
 
     // IQ grid+signs tables (SSBO 3), uploaded once: the grid then
@@ -783,8 +801,7 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
                                   fbits(1.0f)};
     s.ctx.dispatch(k, {bufs, nbuf}, push,
                    VulkanContext::matvec_groups(k, w.rows));
-    s.ctx.end_batch();
-    s.pool.on_batch_end();
+    s.end_batch();
     s.ctx.read_buffer(s.xb, std::as_writable_bytes(out));
 }
 
@@ -1315,8 +1332,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         } else {
             // Router runs on the CPU: sync the batch, read the
             // normed activations, gate, then keep recording.
-            s.ctx.end_batch();
-            s.pool.on_batch_end();
+            s.end_batch();
             s.ctx.read_buffer(
                 s.xb,
                 std::as_writable_bytes(std::span<float>(
@@ -1367,8 +1383,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     }
     norm(m.output_norm(), s.x, s.xb, hp.n_embd, 0);
     rec_matvec(s, m.output_weight(), s.xb, s.logits, 0, false);
-    s.ctx.end_batch();
-    s.pool.on_batch_end();
+    s.end_batch();
 
     s.ctx.read_buffer(s.logits, std::as_writable_bytes(logits));
     s.ctx.note_token();
@@ -1732,8 +1747,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         norm_rows(m.output_norm(), bx, bxb, E, (n - 1) * E, 0, 0, 1);
         rec_matvec(s, out_w, bxb, blogits, 0, false);
     }
-    s.ctx.end_batch();
-    s.pool.on_batch_end();
+    s.end_batch();
 
     s.ctx.read_buffer(blogits, std::as_writable_bytes(logits));
     for (std::uint32_t t = 0; t < n; ++t) {

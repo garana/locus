@@ -387,6 +387,22 @@ TEST_CASE("vulkan batched prefill tracks per-token prefill",
             for (auto& t : prompt) {
                 t = id(rng);
             }
+            {
+                // A short prompt on freshly reset GPU state: one
+                // tiny chunk splits its matmuls' K (partials in a
+                // scratch buffer that grows mid-batch -- the old
+                // buffer must outlive the dispatches recorded on it).
+                locus::backend::vulkan_reset_state();
+                const std::vector<locus::tok::TokenId> short_p(
+                    prompt.begin(), prompt.begin() + 8);
+                const auto [one_l, one_gen] =
+                    prefill_run(model, short_p, 0, 8);
+                locus::backend::vulkan_reset_state();
+                const auto [batch_l, batch_gen] =
+                    prefill_run(model, short_p, 8, 8);
+                REQUIRE(cosine(batch_l, one_l) > 0.9999);
+                REQUIRE(batch_gen == one_gen);
+            }
             const auto [want_logits, want_gen] =
                 prefill_run(model, prompt, 0, 8);
             const auto [got_logits, got_gen] =
