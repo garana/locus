@@ -58,7 +58,7 @@ void VulkanContext::report_profile() const {
         "matmul_q8_0_id", "kv_scatter", "moe_group",
         "moe_combine",  "rmsnorm_b",    "rope_b",
         "moe_route_b",  "matmul_paged", "matmul_paged_t",
-        "attn_softmax", "sum_splits"};
+        "attn_softmax", "sum_splits",   "matvec_t_q8"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -130,6 +130,7 @@ void VulkanContext::report_profile() const {
 #include "rope_spv.h"
 #include "silu_mul_spv.h"
 #include "sum_splits_spv.h"
+#include "matvec_t_q8_spv.h"
 
 namespace locus::backend::vk {
 
@@ -205,6 +206,7 @@ const KernelDesc& kernel_desc(Kernel k) {
          sizeof(locus_matmul_paged_t_f32_spv), 4, 96},
         {locus_attn_softmax_spv, sizeof(locus_attn_softmax_spv), 1, 20},
         {locus_sum_splits_spv, sizeof(locus_sum_splits_spv), 2, 16},
+        {locus_matvec_t_q8_spv, sizeof(locus_matvec_t_q8_spv), 3, 32},
     };
     static_assert(std::size(descs) ==
                   static_cast<std::size_t>(Kernel::kCount_));

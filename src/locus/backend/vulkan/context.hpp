@@ -47,6 +47,7 @@ enum class Kernel {
     kMatmulPagedTF32,
     kAttnSoftmax,
     kSumSplits,
+    kMatvecTQ8,
     kCount_,
 };
 

@@ -8,8 +8,9 @@
 // activations per token in shared memory, then every thread
 // accumulates a TM x TN register block.
 //
-// Weight type by define: TYPE_Q8 (34-byte Q8_0 blocks, byte
-// offsets, cols % 32 == 0) or TYPE_F32 (element offsets).
+// Weight type by define: TYPE_Q8 (Q8_0 rows in the split GPU layout
+// of q8_layout.hpp, byte offsets, cols % 32 == 0) or TYPE_F32
+// (element offsets).
 //
 // TYPE_F32 can instead read W from the paged KV pool (attention as
 // matmuls), through the block table at binding 3: PAGED makes row r
@@ -198,9 +199,13 @@ void main() {
         uint r = r0 + lr;
 #ifdef TYPE_Q8
         if (r < pc.rows) {
-            uint at = wbase + r * (pc.cols / 32u) * 34u + (k0 / 32u) * 34u;
-            float d = unpackHalf2x16(word_at(at) & 0xffffu).x;
-            uint q0 = at + 2u + k0 % 32u + sub * VPT;
+            // Split GPU row layout (q8_layout.hpp): nb f16
+            // scales, then nb x 32 quants.
+            uint nb = pc.cols / 32u;
+            uint rb = wbase + r * nb * 34u;
+            uint sa = rb + (k0 / 32u) * 2u;
+            float d = unpackHalf2x16(w[sa >> 2] >> ((sa & 2u) * 8u)).x;
+            uint q0 = rb + 2u * nb + k0 + sub * VPT;
             for (uint h = 0u; h < VPT / 4u; ++h) {
                 int q = int(word_at(q0 + h * 4u));
                 uint c = sub * VPT + h * 4u;

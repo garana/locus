@@ -1,7 +1,7 @@
 #version 450
 
-// Q8_0 matvec: rows of 34-byte blocks (f16 scale + 32 int8), read
-// through a uint view since blocks are not 4-byte aligned.
+// Q8_0 matvec over rows in the split GPU layout (q8_layout.hpp:
+// nb f16 scales, then nb x 32 int8), read through a uint view.
 //
 // Four rows per workgroup, 32 lanes per row. Four lanes share a
 // block, each taking two of its 8 quant words, so a 32-lane step
@@ -55,19 +55,28 @@ uint word_at(uint b) {
     return sh == 0u ? w[i] : (w[i] >> sh) | (w[i + 1u] << (32u - sh));
 }
 
-/** This lane's share of dot(row r of the matrix at wbase, x). */
+/**
+ * This lane's share of dot(row r of the matrix at wbase, x). Rows
+ * are in the split GPU layout (q8_layout.hpp): nb f16 scales, then
+ * nb x 32 quants, 34 * nb bytes in all.
+ */
 float row_part(uint wbase, uint xbase, uint r, uint lane) {
     uint nb = pc.cols / 32u;
-    uint row_base = wbase + r * nb * 34u;
+    uint rb = wbase + r * nb * 34u;
+    uint qb = rb + 2u * nb;
     uint sub = lane & 3u;
+    // Whole-word quant loads unless the row start is misaligned
+    // (odd nb, or an odd w_off); scales are 2-byte aligned.
+    bool al = ((rb | qb) & 3u) == 0u;
     float acc = 0.0;
     for (uint b = lane >> 2; b < nb; b += LANES / 4u) {
-        uint at = row_base + b * 34u;
-        float d = unpackHalf2x16(word_at(at) & 0xffffu).x;
+        uint sa = rb + 2u * b;
+        float d = unpackHalf2x16(w[sa >> 2] >> ((sa & 2u) * 8u)).x;
+        uint qa = qb + b * 32u + sub * 8u;
         uint xi = xbase + b * 32u + sub * 8u;
         float s = 0.0;
         for (uint k = 0u; k < 2u; ++k) {
-            int q = int(word_at(at + 2u + sub * 8u + k * 4u));
+            int q = int(al ? w[(qa >> 2) + k] : word_at(qa + k * 4u));
             uint xk = xi + k * 4u;
             s += float(bitfieldExtract(q, 0, 8)) * x[xk] +
                  float(bitfieldExtract(q, 8, 8)) * x[xk + 1u] +
