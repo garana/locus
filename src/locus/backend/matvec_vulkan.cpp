@@ -1100,15 +1100,30 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         g2.rows = ff;
         u2.rows = ff;
         d2.cols = ff;
-        rec_matvec(s, g2, s.xb, s.gate, 0, false, off_g, 0, 1.0f,
-                   whole_g);
-        rec_matvec(s, u2, s.xb, s.up, 0, false, off_u, 0, 1.0f,
-                   whole_u);
-        const VulkanContext::Buffer bufs[] = {s.gate, s.up,
-                                              s.gate};
-        const std::uint32_t push[] = {ff};
-        s.ctx.dispatch(Kernel::kSiluMul, bufs, push,
-                       (ff + 63) / 64);
+        if (wg.type == gguf::TensorType::kQ8_0 &&
+            wu.type == gguf::TensorType::kQ8_0 && wg.cols == wu.cols &&
+            off_g == off_u) {
+            // Gate, up and silu_mul in one fused dispatch.
+            const VulkanContext::Buffer bufs[] = {
+                whole_g != nullptr ? *whole_g : s.upload_w(g2), s.xb,
+                s.gate, whole_u != nullptr ? *whole_u : s.upload_w(u2)};
+            const std::uint32_t push[] = {
+                ff, wg.cols, 0, 0, w_off_units(wg, off_g), 0,
+                fbits(1.0f)};
+            s.ctx.dispatch(Kernel::kMatvecQ8_0Glu, bufs, push,
+                           VulkanContext::matvec_groups(
+                               Kernel::kMatvecQ8_0Glu, ff));
+        } else {
+            rec_matvec(s, g2, s.xb, s.gate, 0, false, off_g, 0, 1.0f,
+                       whole_g);
+            rec_matvec(s, u2, s.xb, s.up, 0, false, off_u, 0, 1.0f,
+                       whole_u);
+            const VulkanContext::Buffer bufs[] = {s.gate, s.up,
+                                                  s.gate};
+            const std::uint32_t push[] = {ff};
+            s.ctx.dispatch(Kernel::kSiluMul, bufs, push,
+                           (ff + 63) / 64);
+        }
         rec_matvec(s, d2, s.gate, s.x, 0, true, off_d, 0, wgt,
                    whole_d);
     };
@@ -1398,15 +1413,34 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             g.rows = ff;
             u.rows = ff;
             d.cols = ff;
-            rec_matvec_b(s, g, s.upload_experts(lay.gate_exps, hp.n_expert),
-                         s.xb, s.gate, 0, false, 0, 0,
-                         lay.gate_exps.expert_bytes, 0, ff, k_used,
-                         kRouteIds, s.route);
-            rec_matvec_b(s, u, s.upload_experts(lay.up_exps, hp.n_expert),
-                         s.xb, s.up, 0, false, 0, 0,
-                         lay.up_exps.expert_bytes, 0, ff, k_used,
-                         kRouteIds, s.route);
-            {
+            if (g.type == gguf::TensorType::kQ8_0 &&
+                u.type == gguf::TensorType::kQ8_0 &&
+                lay.gate_exps.expert_bytes == lay.up_exps.expert_bytes) {
+                // Routed gate, up and silu_mul in one dispatch: slot
+                // y = picked expert y, its ff outputs at y * ff.
+                const VulkanContext::Buffer bufs[] = {
+                    s.upload_experts(lay.gate_exps, hp.n_expert), s.xb,
+                    s.gate, s.route,
+                    s.upload_experts(lay.up_exps, hp.n_expert)};
+                const std::uint32_t push[] = {
+                    ff, g.cols, 0, 0, 0, 0, fbits(1.0f),
+                    w_off_units(g, lay.gate_exps.expert_bytes), 0, ff,
+                    k_used, kRouteIds, 0};
+                s.ctx.dispatch(Kernel::kMatvecQ8_0GluB, bufs, push,
+                               VulkanContext::matvec_groups(
+                                   Kernel::kMatvecQ8_0GluB, ff),
+                               k_used);
+            } else {
+                rec_matvec_b(s, g,
+                             s.upload_experts(lay.gate_exps, hp.n_expert),
+                             s.xb, s.gate, 0, false, 0, 0,
+                             lay.gate_exps.expert_bytes, 0, ff, k_used,
+                             kRouteIds, s.route);
+                rec_matvec_b(s, u,
+                             s.upload_experts(lay.up_exps, hp.n_expert),
+                             s.xb, s.up, 0, false, 0, 0,
+                             lay.up_exps.expert_bytes, 0, ff, k_used,
+                             kRouteIds, s.route);
                 const VulkanContext::Buffer bufs[] = {s.gate, s.up,
                                                       s.gate};
                 const std::uint32_t push[] = {k_used * ff};

@@ -145,6 +145,8 @@ if(Vulkan_FOUND)
             matvec_b=matvec:BATCHED
             matvec_f16_b=matvec_f16:BATCHED
             matvec_q8_0_b=matvec_q8_0:BATCHED
+            matvec_q8_0_glu=matvec_q8_0:SWIGLU
+            matvec_q8_0_glu_b=matvec_q8_0:BATCHED,SWIGLU
             matmul_q8_0=matmul:TYPE_Q8
             matmul_f32=matmul:TYPE_F32
             matmul_q8_0_id=matmul:TYPE_Q8,MOE_ID

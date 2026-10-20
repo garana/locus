@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -297,6 +298,99 @@ TEST_CASE("vulkan transposed q8_0 matvec matches the CPU reference",
         REQUIRE(got[i] == Catch::Approx(want[i]).margin(1e-4));
     }
     for (auto b : {wb, xb, ob}) {
+        ctx.destroy_buffer(b);
+    }
+}
+
+TEST_CASE("vulkan fused SwiGLU q8_0 matvec matches the CPU reference",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(41);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    // 4 stacked "experts" of 7 x 96 per matrix; routed slots 3, 1.
+    const std::uint32_t rows = 7, cols = 96, n_mat = 4, slots = 2;
+    const std::size_t mat_bytes = rows * (cols / 32) * 34;
+    const auto wg = random_q8(rows * n_mat, cols, rng);
+    const auto wu = random_q8(rows * n_mat, cols, rng);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    const std::uint32_t ids[] = {3, 1};
+    std::vector<std::uint32_t> route = {ids[0], ids[1], fbits(1.0f),
+                                        fbits(1.0f)};
+    auto cpu_glu = [&](std::uint32_t id) {
+        locus::backend::Mat g{locus::gguf::TensorType::kQ8_0,
+                              wg.data() + id * mat_bytes, rows, cols};
+        locus::backend::Mat u{locus::gguf::TensorType::kQ8_0,
+                              wu.data() + id * mat_bytes, rows, cols};
+        std::vector<float> a(rows), b(rows);
+        locus::backend::matvec(g, x, a);
+        locus::backend::matvec(u, x, b);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            a[r] = a[r] / (1.0f + std::exp(-a[r])) * b[r];
+        }
+        return a;
+    };
+    auto split = [&](const std::vector<std::byte>& w) {
+        std::vector<std::byte> out(w.size());
+        locus::backend::vk::q8_0_split_rows(w.data(), out.data(),
+                                            rows * n_mat, cols);
+        auto b = ctx.create_buffer(out.size());
+        ctx.write_buffer(b, out);
+        return b;
+    };
+    auto gb = split(wg);
+    auto ub = split(wu);
+    auto xb = upload(ctx, x);
+    auto rb = upload(ctx, route);
+
+    SECTION("plain: one matrix pair at a byte offset") {
+        auto ob = ctx.create_buffer(rows * 4);
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {gb, xb, ob, ub};
+        const std::uint32_t push[] = {
+            rows, cols, 0, 0, static_cast<std::uint32_t>(2 * mat_bytes),
+            0, fbits(1.0f)};
+        ctx.dispatch(Kernel::kMatvecQ8_0Glu, bufs, push,
+                     VulkanContext::matvec_groups(Kernel::kMatvecQ8_0Glu,
+                                                  rows));
+        ctx.end_batch();
+        const auto got = download<float>(ctx, ob, rows);
+        const auto want = cpu_glu(2);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(got[r] == Catch::Approx(want[r]).margin(1e-4));
+        }
+        ctx.destroy_buffer(ob);
+    }
+    SECTION("batched: routed experts, one output block per slot") {
+        auto ob = ctx.create_buffer(rows * slots * 4);
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {gb, xb, ob, rb, ub};
+        const std::uint32_t push[] = {
+            rows, cols, 0, 0, 0, 0, fbits(1.0f),
+            static_cast<std::uint32_t>(mat_bytes), 0, rows, slots, 1u,
+            0u};
+        ctx.dispatch(Kernel::kMatvecQ8_0GluB, bufs, push,
+                     VulkanContext::matvec_groups(Kernel::kMatvecQ8_0GluB,
+                                                  rows),
+                     slots);
+        ctx.end_batch();
+        const auto got = download<float>(ctx, ob, rows * slots);
+        for (std::uint32_t k = 0; k < slots; ++k) {
+            const auto want = cpu_glu(ids[k]);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                REQUIRE(got[k * rows + r] ==
+                        Catch::Approx(want[r]).margin(1e-4));
+            }
+        }
+        ctx.destroy_buffer(ob);
+    }
+    for (auto b : {gb, ub, xb, rb}) {
         ctx.destroy_buffer(b);
     }
 }
