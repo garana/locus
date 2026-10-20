@@ -61,7 +61,8 @@ void VulkanContext::report_profile() const {
         "moe_combine",  "rmsnorm_b",    "rope_b",
         "moe_route_b",  "matmul_paged", "matmul_paged_t",
         "attn_softmax", "sum_splits",   "matvec_t_q8",
-        "matvec_q8_0_glu", "matvec_q8_0_glu_b"};
+        "matvec_q8_0_glu", "matvec_q8_0_glu_b", "attn_decode",
+        "attn_combine"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -136,6 +137,8 @@ void VulkanContext::report_profile() const {
 #include "matvec_t_q8_spv.h"
 #include "matvec_q8_0_glu_spv.h"
 #include "matvec_q8_0_glu_b_spv.h"
+#include "attn_decode_spv.h"
+#include "attn_combine_spv.h"
 
 namespace locus::backend::vk {
 
@@ -216,6 +219,8 @@ const KernelDesc& kernel_desc(Kernel k) {
          28},
         {locus_matvec_q8_0_glu_b_spv,
          sizeof(locus_matvec_q8_0_glu_b_spv), 5, 52},
+        {locus_attn_decode_spv, sizeof(locus_attn_decode_spv), 6, 64},
+        {locus_attn_combine_spv, sizeof(locus_attn_combine_spv), 2, 16},
     };
     static_assert(std::size(descs) ==
                   static_cast<std::size_t>(Kernel::kCount_));

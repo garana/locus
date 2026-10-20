@@ -167,11 +167,12 @@ struct State {
     /** Activation buffers, sized on first use per model dims. */
     VulkanContext::Buffer x{}, xb{}, q{}, gate{}, up{}, attout{},
         att{}, logits{}, table{}, ones{}, kv_a{}, q_abs{},
-        latent{}, q_a{}, router{}, route{};
+        latent{}, q_a{}, router{}, route{}, attn_part{};
     std::size_t x_n = 0, xb_n = 0, q_n = 0, gate_n = 0, up_n = 0,
                 attout_n = 0, att_n = 0, logits_n = 0,
                 table_n = 0, ones_n = 0, kv_a_n = 0, q_abs_n = 0,
-                latent_n = 0, q_a_n = 0, router_n = 0, route_n = 0;
+                latent_n = 0, q_a_n = 0, router_n = 0, route_n = 0,
+                attn_part_n = 0;
 
     /**
      * Uploads a whole stacked expert tensor (every expert) as one
@@ -694,12 +695,62 @@ void rec_softmax(State& s, VulkanContext::Buffer scores, std::uint32_t rows,
  * q_dim floats per token (head h at h * hd); scores holds
  * n * heads * (base + n) floats.
  */
+/** One attention segment set for rec_attn_decode (see attn_decode.comp). */
+struct DecodeAttn {
+    VulkanContext::Buffer q1, q2, out;
+    std::uint32_t k_off, v_off, kv_stride, group, d1, d2, q1_stride,
+        q2_stride, q2_off, dv, out_stride;
+    float scale;
+};
+
+/**
+ * Records flash-decoding attention for one query token over n_pos
+ * cache positions: attn_decode per (64-position block, head), plus
+ * attn_combine when there is more than one block.
+ */
+void rec_attn_decode(State& s, const PagedPool& pp, std::uint32_t n_pos,
+                     std::uint32_t heads, const DecodeAttn& a) {
+    constexpr std::uint32_t kBlock = 64;  // attn_decode.comp CH
+    const std::uint32_t blocks = (n_pos + kBlock - 1) / kBlock;
+    VulkanContext::Buffer part = a.out;
+    if (blocks > 1) {
+        s.grow(s.attn_part, s.attn_part_n,
+               std::size_t{blocks} * heads * (a.dv + 2));
+        part = s.attn_part;
+    }
+    const VulkanContext::Buffer bufs[] = {pp.pool, pp.table, a.q1,
+                                          a.q2,    a.out,    part};
+    const std::uint32_t push[] = {n_pos,       pp.block_tokens,
+                                  pp.block_stride, pp.row_w,
+                                  a.k_off,     a.v_off,
+                                  a.kv_stride, a.group,
+                                  a.d1,        a.d2,
+                                  a.q1_stride, a.q2_stride,
+                                  a.q2_off,    a.dv,
+                                  fbits(a.scale), a.out_stride};
+    s.ctx.dispatch(Kernel::kAttnDecode, bufs, push, blocks, heads);
+    if (blocks > 1) {
+        const VulkanContext::Buffer cbufs[] = {part, a.out};
+        const std::uint32_t cpush[] = {blocks, heads, a.dv, a.out_stride};
+        s.ctx.dispatch(Kernel::kAttnCombine, cbufs, cpush,
+                       (a.dv + 63) / 64, heads);
+    }
+}
+
 void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
                   VulkanContext::Buffer scores, VulkanContext::Buffer out,
                   std::uint32_t n, std::uint32_t base, std::uint32_t heads,
                   std::uint32_t group, std::uint32_t hd, std::uint32_t q_dim,
                   std::uint32_t layer_off, std::uint32_t v_offset) {
     const std::uint32_t n_pos = base + n;
+    if (n == 1) {
+        rec_attn_decode(
+            s, pp, n_pos, heads,
+            DecodeAttn{q, q, out, layer_off, layer_off + v_offset, hd,
+                       group, hd, 0, hd, 0, 0, hd, hd,
+                       1.0f / std::sqrt(static_cast<float>(hd))});
+        return;
+    }
     const std::uint32_t n_kv = heads / group;
     MatmulRows sr{n * group, 0, q_dim, 0, heads * n_pos};
     sr.n_batch = n_kv;
@@ -741,6 +792,18 @@ void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
                   std::uint32_t nope, std::uint32_t rope_d,
                   std::uint32_t layer_off, float kq_scale) {
     const std::uint32_t n_pos = base + n;
+    // Decode on a short context: flash-decoding, q_abs . latent +
+    // q_pe . k_pe with every head on the one shared latent row (group
+    // = heads). It reads the latent once per head, so past a few
+    // blocks the matmul form below (each latent tile read once for
+    // all heads) wins.
+    if (n == 1 && n_pos <= 256) {
+        rec_attn_decode(s, pp, n_pos, heads,
+                        DecodeAttn{q_abs, q, lat, layer_off, layer_off, 0,
+                                   heads, rank, rope_d, rank, nope + rope_d,
+                                   nope, rank, rank, kq_scale});
+        return;
+    }
     const std::uint32_t rows = n * heads;
     rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, rank, layer_off,
                      q_abs, scores, MatmulRows{rows, 0, rank, 0, n_pos},
@@ -817,6 +880,7 @@ void vulkan_reset_state() {
     drop(s.q_a, s.q_a_n);
     drop(s.router, s.router_n);
     drop(s.route, s.route_n);
+    drop(s.attn_part, s.attn_part_n);
     for (int c = 0; c < State::kChunkCount_; ++c) {
         drop(s.chunk[c], s.chunk_n[c]);
     }

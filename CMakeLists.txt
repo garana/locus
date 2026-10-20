@@ -139,7 +139,7 @@ if(Vulkan_FOUND)
             rmsnorm rope silu_mul
             attn_paged_q kv_store_q moe_route
             kv_scatter moe_group moe_combine attn_softmax sum_splits
-            matvec_t_q8
+            matvec_t_q8 attn_decode attn_combine
             # Variants: <kernel>=<source>:<define>[,<define>...], the
             # source compiled again with -D<define> for each.
             matvec_b=matvec:BATCHED

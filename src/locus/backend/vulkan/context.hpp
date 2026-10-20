@@ -51,6 +51,9 @@ enum class Kernel {
     /** Fused SwiGLU Q8_0 matvecs: silu(W x) * (WU x). */
     kMatvecQ8_0Glu,
     kMatvecQ8_0GluB,
+    /** Decode (one query token) flash attention and its merge. */
+    kAttnDecode,
+    kAttnCombine,
     kCount_,
 };
 

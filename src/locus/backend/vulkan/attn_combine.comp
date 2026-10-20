@@ -1,0 +1,38 @@
+#version 450
+
+// Merges attn_decode.comp's per-block partials for one query token:
+// out[h][i] = sum_c e_c o_c[h][i] / sum_c e_c l_c[h], with
+// e_c = exp(m_c[h] - max_c m_c[h]). One invocation per (head, i).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer PART { float part[]; };
+layout(std430, binding = 1) writeonly buffer OUT { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint n_blocks;
+    uint heads;
+    uint dv;
+    uint out_stride;    // OUT floats between heads
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint h = gl_WorkGroupID.y;
+    if (i >= pc.dv) {
+        return;
+    }
+    uint st = pc.n_blocks * pc.heads * pc.dv;
+    float mx = -3.4e38;
+    for (uint c = 0u; c < pc.n_blocks; ++c) {
+        mx = max(mx, part[st + (c * pc.heads + h) * 2u]);
+    }
+    float acc = 0.0, l = 0.0;
+    for (uint c = 0u; c < pc.n_blocks; ++c) {
+        uint s = st + (c * pc.heads + h) * 2u;
+        float e = exp(part[s] - mx);
+        l += e * part[s + 1u];
+        acc += e * part[(c * pc.heads + h) * pc.dv + i];
+    }
+    o[h * pc.out_stride + i] = acc / l;
+}
