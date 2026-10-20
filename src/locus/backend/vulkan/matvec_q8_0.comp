@@ -43,6 +43,7 @@ layout(push_constant) uniform PC {
     uint out_stride;
     uint n_slots;
     uint mode;      // 1 = ids from route[], 2 = weighted slot sum
+    uint row_stride;  // unused: Q8_0 rows are never column-split
 #endif
 } pc;
 

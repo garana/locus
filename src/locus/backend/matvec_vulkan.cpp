@@ -451,7 +451,8 @@ constexpr std::uint32_t kSlotSum = 2;   // weighted sum of slots
  * runs a workgroup row per slot writing out_offset + k *
  * out_stride; kSlotSum sums the slots, weighted by the route
  * buffer, into one output row. `route` must be bound even when
- * unused (pass any buffer).
+ * unused (pass any buffer). row_stride (F32/F16 only; 0 = w.cols)
+ * lets w.cols be a column chunk of wider rows.
  */
 void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
                   VulkanContext::Buffer x, VulkanContext::Buffer out,
@@ -459,7 +460,8 @@ void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
                   std::uint64_t w_byte_off, std::uint32_t x_off,
                   std::uint64_t w_stride_bytes, std::uint32_t x_stride,
                   std::uint32_t out_stride, std::uint32_t slots,
-                  std::uint32_t mode, VulkanContext::Buffer route) {
+                  std::uint32_t mode, VulkanContext::Buffer route,
+                  std::uint32_t row_stride = 0) {
     const Kernel k = batched_kernel(w);
     const VulkanContext::Buffer bufs[] = {wb, x, out, route};
     const std::uint32_t push[] = {w.rows,
@@ -473,7 +475,8 @@ void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   x_stride,
                                   out_stride,
                                   slots,
-                                  mode};
+                                  mode,
+                                  row_stride};
     s.ctx.dispatch(k, bufs, push, VulkanContext::matvec_groups(k, w.rows),
                    (mode & kSlotSum) != 0 ? 1u : slots);
 }
@@ -870,7 +873,7 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
         return false;
     }
     if (hp.n_expert_used > 16 || hp.n_expert_used == 0 ||
-        hp.n_group > 32 ||
+        hp.n_group > 32 || hp.n_expert > 256 ||
         (hp.n_group > 1 && hp.n_expert % hp.n_group != 0)) {
         return false;
     }
@@ -1345,7 +1348,31 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             // and weights, the batched matvecs read them.
             const std::uint32_t k_used = hp.n_expert_used;
             const std::uint32_t ff = hp.n_ff_exp;
-            rec_matvec(s, lay.gate_inp, s.xb, s.router, 0, false);
+            // Router logits as split-K partials over column chunks
+            // (one batched-matvec slot each, so the small router
+            // matrix spreads over many workgroups); moe_route sums
+            // the planes. Q8_0 rows are not column-contiguous in the
+            // GPU layout, so they take one plane.
+            const Mat& gi = lay.gate_inp;
+            const std::uint32_t chunk = 128;
+            const std::uint32_t splits =
+                gi.type != gguf::TensorType::kQ8_0 &&
+                        batched_kernel(gi) != Kernel::kCount_ &&
+                        gi.cols % chunk == 0
+                    ? gi.cols / chunk
+                    : 1;
+            if (splits > 1) {
+                Mat part = gi;
+                part.cols = chunk;
+                const std::uint64_t elt =
+                    gi.type == gguf::TensorType::kF32 ? 4 : 2;
+                // Slot y: columns y*chunk.., rows still gi.cols apart.
+                rec_matvec_b(s, part, s.upload_w(gi), s.xb, s.router, 0,
+                             false, 0, 0, chunk * elt, chunk, hp.n_expert,
+                             splits, 0, s.xb, gi.cols);
+            } else {
+                rec_matvec(s, gi, s.xb, s.router, 0, false);
+            }
             {
                 const bool has_bias = !lay.exp_probs_b.empty();
                 const VulkanContext::Buffer bufs[] = {
@@ -1362,7 +1389,8 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     hp.n_group,
                     hp.n_group_used,
                     hp.expert_weights_norm ? 1u : 0u,
-                    fbits(hp.expert_weights_scale)};
+                    fbits(hp.expert_weights_scale),
+                    splits};
                 s.ctx.dispatch(Kernel::kMoeRoute, bufs, push, 1);
             }
             Mat g = lay.gate_exps.expert(0), u = lay.up_exps.expert(0),
@@ -1766,6 +1794,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 hp.n_group_used,
                 hp.expert_weights_norm ? 1u : 0u,
                 fbits(hp.expert_weights_scale),
+                1u,
                 2 * ne,
                 2 * k_used};
             s.ctx.dispatch(Kernel::kMoeRouteB, bufs, push, 1, n);

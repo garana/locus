@@ -76,7 +76,7 @@ TEST_CASE("vulkan moe_route matches model::moe_select", "[vulkan]") {
          true, false, 2.5f},
         {"v3 sigmoid + bias + groups", 256, 8, 8, 4,
          GatingFunc::kSigmoid, true, true, false, 2.5f},
-        {"ties pick the lowest index", 300, 5, 1, 1,
+        {"ties pick the lowest index", 256, 5, 1, 1,
          GatingFunc::kSoftmax, false, false, true, 1.0f},
     };
     for (const Case& c : cases) {
@@ -108,8 +108,10 @@ TEST_CASE("vulkan moe_route matches model::moe_select", "[vulkan]") {
                 const auto want =
                     locus::model::moe_select(hp, lay, cpu_logits);
 
+                // Two partial-logit planes (split-K router): the
+                // logits, then zeros that must not change them.
                 std::vector<float> l2(logits);
-                l2.resize(c.n_expert * 2);
+                l2.resize(c.n_expert * 2, 0.0f);
                 auto lb = upload(ctx, l2);
                 auto bb = upload(ctx, bias);
                 auto rb = ctx.create_buffer(c.k * 2 * 4);
@@ -120,7 +122,7 @@ TEST_CASE("vulkan moe_route matches model::moe_select", "[vulkan]") {
                     c.gating == GatingFunc::kSigmoid ? 1u : 0u,
                     c.bias ? 1u : 0u, c.n_group,
                     c.n_group_used,   c.norm ? 1u : 0u,
-                    fbits(c.scale)};
+                    fbits(c.scale),   2u};
                 ctx.dispatch(Kernel::kMoeRoute, bufs, push, 1);
                 ctx.end_batch();
                 const auto route = download<std::uint32_t>(ctx, rb, c.k * 2);
@@ -190,7 +192,7 @@ TEST_CASE("vulkan batched q8_0 matvec covers split, routed and summed "
         const std::uint32_t push[] = {
             rows, cols, 0, mode & 2u ? 1u : 0u, 0, 0, fbits(1.0f),
             static_cast<std::uint32_t>(mat_bytes), cols, out_stride,
-            slots, mode};
+            slots, mode, 0u};
         ctx.dispatch(Kernel::kMatvecQ8_0B, bufs, push,
                      VulkanContext::matvec_groups(Kernel::kMatvecQ8_0B,
                                                   rows),
