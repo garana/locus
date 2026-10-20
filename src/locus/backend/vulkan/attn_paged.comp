@@ -8,6 +8,11 @@
 // split the positions for the scores and the softmax (max and sum
 // reduced through shared memory), then (dim, position-slice) pairs
 // for the weighted sum, whose slices are summed at the end.
+//
+// Compiled again with -DBATCHED (attn_paged_b): workgroup y is query token y
+// of a prefill chunk, at position n_pos - 1 + y (so it attends over
+// n_pos + y positions), with its Q/output rows at y * q_stride and
+// its ATT rows at (y * n_heads + h) * att_stride.
 
 #define WG 128u
 
@@ -29,6 +34,10 @@ layout(push_constant) uniform PC {
     uint block_stride;  // floats per block
     uint layer_offset;  // floats: layer * layer_stride
     uint v_offset;      // floats: K row -> V row delta
+#ifdef BATCHED
+    uint q_stride;      // floats between token rows of Q and O
+    uint att_stride;    // floats per ATT row (>= last n_pos)
+#endif
 } pc;
 
 shared float red[WG];
@@ -80,11 +89,19 @@ void main() {
     }
     uint qh = h * pc.head_dim;
     uint kvh = (h / pc.group) * pc.head_dim;
+#ifdef BATCHED
+    uint y = gl_WorkGroupID.y;
+    uint n_pos = pc.n_pos + y;
+    qh += y * pc.q_stride;
+    uint arow = (y * pc.n_heads + h) * pc.att_stride;
+#else
+    uint n_pos = pc.n_pos;
     uint arow = h * pc.n_pos;
+#endif
     float scale = inversesqrt(float(pc.head_dim));
 
     float mx = -3.4e38;
-    for (uint t = tid; t < pc.n_pos; t += WG) {
+    for (uint t = tid; t < n_pos; t += WG) {
         uint kb = kv_base(t) + kvh;
         float s = 0.0;
         for (uint i = 0; i < pc.head_dim; ++i) {
@@ -96,7 +113,7 @@ void main() {
     }
     mx = reduce_max(mx);
     float sum = 0.0;
-    for (uint t = tid; t < pc.n_pos; t += WG) {
+    for (uint t = tid; t < n_pos; t += WG) {
         float e = exp(att[arow + t] - mx);
         att[arow + t] = e;
         sum += e;
@@ -108,7 +125,7 @@ void main() {
     for (uint idx = tid; idx < pc.head_dim * np; idx += WG) {
         uint i = idx % pc.head_dim;
         float acc = 0.0;
-        for (uint t = idx / pc.head_dim; t < pc.n_pos; t += np) {
+        for (uint t = idx / pc.head_dim; t < n_pos; t += np) {
             acc += att[arow + t] *
                    pool[kv_base(t) + pc.v_offset + kvh + i];
         }

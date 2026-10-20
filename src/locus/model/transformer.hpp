@@ -275,6 +275,8 @@ class TransformerModel {
      * calls (weight-stationary, not a GEMM). Only the last token's
      * logits are produced (prefill semantics). Currently the dense
      * llama path only; MLA/MoE archs fall back is the caller's job.
+     * On the Vulkan backend the chunk runs as GPU matmuls
+     * (vulkan_forward_batch): token-exact, not byte-identical.
      *
      * @param tokens In-vocab token ids; capacity for tokens.size()
      *     more positions must already be ensured on seq.
@@ -293,6 +295,17 @@ class TransformerModel {
     /** @returns true when the batched forwards support this model
      * (every CPU/CUDA backend + arch; Vulkan opts out). */
     bool supports_batch() const;
+
+    /** @returns true when forward_batch can ingest a prompt chunk:
+     * every supports_batch() backend, plus Vulkan, which runs the
+     * chunk through its GPU batched forward (one token at a time
+     * when that path does not support the model). */
+    bool supports_batch_prefill() const;
+
+    /** @returns The prompt tokens per batched forward this backend
+     * prefers: 512 on Vulkan (a GPU matmul needs many token rows to
+     * fill the device), 64 elsewhere. */
+    std::uint32_t prefill_chunk() const;
 
     /**
      * Decodes one token from each of N DIFFERENT sequences in a

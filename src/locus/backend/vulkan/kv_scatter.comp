@@ -1,0 +1,35 @@
+#version 450
+
+// Writes n_tok contiguous rows (a prefill chunk's K, V or MLA latent
+// rows) into the paged pool: row t goes to position pos0 + t through
+// the block table, at dst_off within that position's row (the layer
+// and K/V offsets folded in). Workgroup y is the row; threads
+// stride its width.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer S { float src[]; };
+layout(std430, binding = 1) buffer POOL { float pool[]; };
+layout(std430, binding = 2) readonly buffer TABLE { uint table[]; };
+
+layout(push_constant) uniform PC {
+    uint width;         // floats per row
+    uint pos0;          // position of row 0
+    uint block_tokens;
+    uint block_stride;  // floats per block
+    uint row_w;         // floats per position within a block
+    uint dst_off;       // floats: layer (+ V) offset in a block
+    uint src_off;
+    uint src_stride;
+} pc;
+
+void main() {
+    uint t = gl_WorkGroupID.y;
+    uint pos = pc.pos0 + t;
+    uint dst = table[pos / pc.block_tokens] * pc.block_stride +
+               pc.dst_off + (pos % pc.block_tokens) * pc.row_w;
+    uint s = pc.src_off + t * pc.src_stride;
+    for (uint i = gl_LocalInvocationID.x; i < pc.width; i += 128u) {
+        pool[dst + i] = src[s + i];
+    }
+}

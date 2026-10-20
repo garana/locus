@@ -655,6 +655,14 @@ bool TransformerModel::supports_batch() const {
     return backend_->name != "vulkan";
 }
 
+bool TransformerModel::supports_batch_prefill() const {
+    return supports_batch() || backend_->name == "vulkan";
+}
+
+std::uint32_t TransformerModel::prefill_chunk() const {
+    return backend_->name == "vulkan" ? 512 : 64;
+}
+
 void TransformerModel::project_head_batch(
     const backend::Ops& op, std::span<const float> x,
     std::span<float> xbf, std::span<float> logits,
@@ -700,7 +708,7 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     if (n == 0) {
         throw std::invalid_argument("forward_batch: empty batch");
     }
-    if (!supports_batch()) {
+    if (!supports_batch_prefill()) {
         throw std::invalid_argument(
             "forward_batch: unsupported backend");
     }
@@ -714,6 +722,24 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     if (base + n > hp_.n_ctx || base + n > cache.capacity(seq)) {
         throw std::invalid_argument(
             "forward_batch: seq capacity not ensured");
+    }
+    if (backend_->name == "vulkan") {
+        if (vulkan_forward_batch(*this, toks, cache, seq, logits,
+                                 all_logits)) {
+            return;
+        }
+        // Unsupported on the GPU batch path: one forward() per
+        // token, which itself picks the GPU or the CPU.
+        const std::uint32_t V = hp_.n_vocab;
+        std::vector<float> scratch(V);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            std::span<float> out =
+                all_logits ? logits.subspan(std::size_t{t} * V, V)
+                : t + 1 == n ? logits
+                             : std::span<float>(scratch);
+            forward(toks[t], cache, seq, ws, out);
+        }
+        return;
     }
     const Ops op = effective_ops(backend_, q8k_activations_);
     const std::uint32_t E = hp_.n_embd;

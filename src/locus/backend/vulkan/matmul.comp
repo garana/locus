@@ -1,0 +1,200 @@
+#version 450
+
+// Tiled matmul for batched prefill: out[t][r] (+)= scale *
+// dot(W row r, X row t) for n_tok token rows at once, so each weight
+// tile is read once per BN tokens instead of once per token (the
+// matvec path). One workgroup computes a BM x BN tile (weight rows x
+// tokens): each K step stages BK dequantized weights per row and BK
+// activations per token in shared memory, then every thread
+// accumulates a TM x TN register block.
+//
+// Weight type by define: TYPE_Q8 (34-byte Q8_0 blocks, byte
+// offsets, cols % 32 == 0) or TYPE_F32 (element offsets).
+//
+// Workgroup y = b * tiles_n + tt: batch b shifts the weight, X and
+// out offsets by their *_bstride (MLA's per-head projections run as
+// one dispatch), tt picks the token tile. Token t's X row is at
+// x_off + t * x_stride, its output row at out_off + t * out_stride.
+//
+// With MOE_ID, b is an expert id and the token tile comes from that
+// expert's list in IDS (moe_group.comp: counts[n_expert], then
+// cap pair ids per expert); pair p reads X row p / x_div and writes
+// output row p. An expert sees ~n_tok * k / n_expert pairs, so the
+// MOE_ID token tile is 16 wide (a 64-token tile would multiply
+// mostly padding).
+
+#define BM 64u
+#define BK 32u
+#define TM 4u
+#ifdef MOE_ID
+#define BN 16u
+#define TN 1u
+#else
+#define BN 64u
+#define TN 4u
+#endif
+
+layout(local_size_x = 256) in;
+
+#ifdef TYPE_Q8
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+#else
+layout(std430, binding = 0) readonly buffer W { float w[]; };
+#endif
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+#ifdef MOE_ID
+layout(std430, binding = 3) readonly buffer IDS { uint ids[]; };
+#endif
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint n_tok;
+    uint accumulate;
+    uint w_off;       // bytes (Q8_0) or elements (F32)
+    uint x_off;
+    uint x_stride;
+    uint out_off;
+    uint out_stride;
+    float scale;
+    uint w_bstride;   // per batch / expert, in w_off units
+    uint x_bstride;
+    uint out_bstride;
+    uint tiles_n;     // token tiles per batch (y = b * tiles_n + tt)
+    uint x_div;       // MOE_ID: X row = pair / x_div
+    uint cap;         // MOE_ID: list capacity per expert
+} pc;
+
+shared float ws[BK][BM];
+shared float xs[BK][BN];
+shared uint rows_x[BN];
+shared uint rows_o[BN];
+
+#ifdef TYPE_Q8
+/** The 4 bytes at byte offset b (any alignment). */
+uint word_at(uint b) {
+    uint i = b >> 2;
+    uint sh = (b & 3u) * 8u;
+    return sh == 0u ? w[i] : (w[i] >> sh) | (w[i + 1u] << (32u - sh));
+}
+#endif
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint b = gl_WorkGroupID.y / pc.tiles_n;
+    uint tt = gl_WorkGroupID.y % pc.tiles_n;
+    uint r0 = gl_WorkGroupID.x * BM;
+    uint t0 = tt * BN;
+    uint wbase = pc.w_off + b * pc.w_bstride;
+
+#ifdef MOE_ID
+    uint n_here = ids[b];
+    if (t0 >= n_here) {
+        return;  // uniform: this expert has no tokens in this tile
+    }
+    n_here = min(BN, n_here - t0);
+    if (tid < n_here) {
+        // Lists start after the n_expert counts; the grid has
+        // n_expert * tiles_n workgroups in y.
+        uint n_exp = gl_NumWorkGroups.y / pc.tiles_n;
+        uint p = ids[n_exp + b * pc.cap + t0 + tid];
+        rows_x[tid] = pc.x_off + (p / pc.x_div) * pc.x_stride;
+        rows_o[tid] = pc.out_off + p * pc.out_stride;
+    }
+#else
+    uint n_here = t0 < pc.n_tok ? min(BN, pc.n_tok - t0) : 0u;
+    if (tid < BN) {
+        uint t = t0 + tid;
+        rows_x[tid] = pc.x_off + b * pc.x_bstride + t * pc.x_stride;
+        rows_o[tid] = pc.out_off + b * pc.out_bstride + t * pc.out_stride;
+    }
+#endif
+    barrier();
+
+    // Compute layout: 16 x 16 threads, each owning rows ty + 16 i
+    // and tokens tx + 16 j (strided so shared reads spread banks).
+    uint tx = tid % 16u;
+    uint ty = tid / 16u;
+    float acc[TM][TN];
+    for (uint i = 0u; i < TM; ++i) {
+        for (uint j = 0u; j < TN; ++j) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    // Weight loader: 4 threads per row, 8 values each.
+    uint lr = tid >> 2;
+    uint sub = tid & 3u;
+    for (uint k0 = 0u; k0 < pc.cols; k0 += BK) {
+        // Weights: row r0 + lr, columns k0 + sub*8 .. +8.
+        uint r = r0 + lr;
+#ifdef TYPE_Q8
+        if (r < pc.rows) {
+            uint at = wbase + r * (pc.cols / 32u) * 34u + (k0 / 32u) * 34u;
+            float d = unpackHalf2x16(word_at(at) & 0xffffu).x;
+            for (uint h = 0u; h < 2u; ++h) {
+                int q = int(word_at(at + 2u + sub * 8u + h * 4u));
+                uint c = sub * 8u + h * 4u;
+                ws[c][lr] = d * float(bitfieldExtract(q, 0, 8));
+                ws[c + 1u][lr] = d * float(bitfieldExtract(q, 8, 8));
+                ws[c + 2u][lr] = d * float(bitfieldExtract(q, 16, 8));
+                ws[c + 3u][lr] = d * float(bitfieldExtract(q, 24, 8));
+            }
+        } else {
+            for (uint c = sub * 8u; c < sub * 8u + 8u; ++c) {
+                ws[c][lr] = 0.0;
+            }
+        }
+#else
+        for (uint c = sub * 8u; c < sub * 8u + 8u; ++c) {
+            uint kc = k0 + c;
+            ws[c][lr] = (r < pc.rows && kc < pc.cols)
+                            ? w[wbase + r * pc.cols + kc]
+                            : 0.0;
+        }
+#endif
+        // Activations: BN tokens x BK columns, strided over threads.
+        for (uint idx = tid; idx < BN * BK; idx += 256u) {
+            uint tl = idx / BK;
+            uint c = idx % BK;
+            uint kc = k0 + c;
+            xs[c][tl] = (tl < n_here && kc < pc.cols)
+                            ? x[rows_x[tl] + kc]
+                            : 0.0;
+        }
+        barrier();
+        for (uint k = 0u; k < BK; ++k) {
+            float a[TM];
+            float bv[TN];
+            for (uint i = 0u; i < TM; ++i) {
+                a[i] = ws[k][ty + 16u * i];
+            }
+            for (uint j = 0u; j < TN; ++j) {
+                bv[j] = xs[k][tx + 16u * j];
+            }
+            for (uint i = 0u; i < TM; ++i) {
+                for (uint j = 0u; j < TN; ++j) {
+                    acc[i][j] += a[i] * bv[j];
+                }
+            }
+        }
+        barrier();
+    }
+
+    for (uint j = 0u; j < TN; ++j) {
+        uint tl = tx + 16u * j;
+        if (tl >= n_here) {
+            continue;
+        }
+        for (uint i = 0u; i < TM; ++i) {
+            uint r = r0 + ty + 16u * i;
+            if (r >= pc.rows) {
+                continue;
+            }
+            uint at = rows_o[tl] + r;
+            float v = acc[i][j] * pc.scale;
+            o[at] = pc.accumulate != 0u ? o[at] + v : v;
+        }
+    }
+}

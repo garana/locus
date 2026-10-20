@@ -719,7 +719,11 @@ batching are DONE.
   [batch] tests assert byte-identity to N forward() calls
   (logits + KV) on synthetic dense-llama, deepseek2-MLA and
   llama-MoE. supports_batch() is true for every CPU/CUDA backend
-  (Vulkan opts out -- it has its own full forward).
+  (Vulkan opts out -- it has its own full forward). Vulkan prompt
+  ingestion is separate: supports_batch_prefill() routes
+  forward_batch to vulkan_forward_batch (GPU matmuls over a chunk
+  of up to prefill_chunk() = 512 tokens; token-exact, not
+  byte-identical, to per-token).
 - (4a) commit 20d560c: Engine::advance() ingests the remaining
   prompt as one forward_batch (Config::batched_prefill, default
   on); [engine] A/B test confirms identical output to per-token.
@@ -1202,7 +1206,8 @@ take hidden_in when !first, emit hidden when !last) -- over machinery
 that already exists and is byte-exact. Not new kernels; PR#5's
 slice-vs-full byte-equality test transfers directly at batch width > 1.
 
-Vulkan cannot batch today (and the stage path needs two Vulkan pieces).
+Vulkan batches only one sequence's prompt chunk (vulkan_forward_batch),
+not decode (and the stage path needs two Vulkan pieces).
 supports_batch() returns false for Vulkan and forward_batch_decode
 throws: Vulkan has a monolithic vulkan_forward the batched CPU-driver
 path bypasses. Separately, forward_layers is already CPU/CUDA only --

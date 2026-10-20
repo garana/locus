@@ -1,0 +1,33 @@
+#version 450
+
+// Adds a prefill chunk's routed expert outputs into the residual:
+// x[t][i] += sum_slot weight[t][slot] * d[t * k + slot][i], with
+// the weights read from ROUTE (per token: k ids, then k weights as
+// float bits). Slots are summed in order, so the result does not
+// depend on how moe_group ordered the pairs. Workgroup y is the
+// token.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer D { float d[]; };
+layout(std430, binding = 1) readonly buffer R { uint route[]; };
+layout(std430, binding = 2) buffer X { float x[]; };
+
+layout(push_constant) uniform PC {
+    uint width;  // n_embd
+    uint k;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint t = gl_WorkGroupID.y;
+    if (i >= pc.width) {
+        return;
+    }
+    float acc = 0.0;
+    for (uint j = 0u; j < pc.k; ++j) {
+        float wj = uintBitsToFloat(route[t * 2u * pc.k + pc.k + j]);
+        acc += wj * d[(t * pc.k + j) * pc.width + i];
+    }
+    x[t * pc.width + i] += acc;
+}
