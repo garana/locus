@@ -48,6 +48,9 @@ enum class Kernel {
     kAttnSoftmax,
     kSumSplits,
     kMatvecTQ8,
+    /** Fused SwiGLU Q8_0 matvecs: silu(W x) * (WU x). */
+    kMatvecQ8_0Glu,
+    kMatvecQ8_0GluB,
     kCount_,
 };
 

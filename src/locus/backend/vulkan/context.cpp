@@ -18,6 +18,8 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecF32B:
         case Kernel::kMatvecF16B:
         case Kernel::kMatvecQ8_0B:
+        case Kernel::kMatvecQ8_0Glu:
+        case Kernel::kMatvecQ8_0GluB:
             return (rows + 3) / 4;
         default:
             return (rows + 63) / 64;
@@ -58,7 +60,8 @@ void VulkanContext::report_profile() const {
         "matmul_q8_0_id", "kv_scatter", "moe_group",
         "moe_combine",  "rmsnorm_b",    "rope_b",
         "moe_route_b",  "matmul_paged", "matmul_paged_t",
-        "attn_softmax", "sum_splits",   "matvec_t_q8"};
+        "attn_softmax", "sum_splits",   "matvec_t_q8",
+        "matvec_q8_0_glu", "matvec_q8_0_glu_b"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -131,6 +134,8 @@ void VulkanContext::report_profile() const {
 #include "silu_mul_spv.h"
 #include "sum_splits_spv.h"
 #include "matvec_t_q8_spv.h"
+#include "matvec_q8_0_glu_spv.h"
+#include "matvec_q8_0_glu_b_spv.h"
 
 namespace locus::backend::vk {
 
@@ -207,6 +212,10 @@ const KernelDesc& kernel_desc(Kernel k) {
         {locus_attn_softmax_spv, sizeof(locus_attn_softmax_spv), 1, 20},
         {locus_sum_splits_spv, sizeof(locus_sum_splits_spv), 2, 16},
         {locus_matvec_t_q8_spv, sizeof(locus_matvec_t_q8_spv), 3, 32},
+        {locus_matvec_q8_0_glu_spv, sizeof(locus_matvec_q8_0_glu_spv), 4,
+         28},
+        {locus_matvec_q8_0_glu_b_spv,
+         sizeof(locus_matvec_q8_0_glu_b_spv), 5, 52},
     };
     static_assert(std::size(descs) ==
                   static_cast<std::size_t>(Kernel::kCount_));

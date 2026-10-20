@@ -9,8 +9,9 @@
 //
 // One 256-thread workgroup, every score in shared memory (n_expert
 // <= 256). L holds n_splits planes of n_expert partial logits
-// (split-K router matvec), summed in plane order. Softmax runs on
-// thread 0 in expert order, as on the CPU; top-k is one parallel
+// (split-K router matvec), summed in plane order. Softmax sums its
+// exps on thread 0 in expert order, as on the CPU; top-k is one
+// parallel
 // pass: an expert's rank is the number of experts that beat it
 // (higher score, or equal and lower index), and rank j < k fills
 // route slot j. ROUTE receives ids[k] then the k weights as float
@@ -67,18 +68,31 @@ void main() {
         prob[t] = pc.sigmoid != 0u ? 1.0 / (1.0 + exp(-v)) : v;
     }
     barrier();
-    if (pc.sigmoid == 0u && t == 0u) {
+    if (pc.sigmoid == 0u) {
+        // Softmax: max and exps in parallel; the sum stays serial in
+        // expert order (the CPU's), broadcast through sel[0].
         float mx = prob[0];
         for (uint e = 1u; e < n; ++e) {
             mx = max(mx, prob[e]);
         }
-        float sum = 0.0;
-        for (uint e = 0u; e < n; ++e) {
-            prob[e] = exp(prob[e] - mx);
-            sum += prob[e];
+        float ex = t < n ? exp(prob[t] - mx) : 0.0;
+        barrier();
+        if (t < n) {
+            prob[t] = ex;
         }
-        for (uint e = 0u; e < n; ++e) {
-            prob[e] /= sum;
+        barrier();
+        if (t == 0u) {
+            float sum = 0.0;
+            for (uint e = 0u; e < n; ++e) {
+                sum += prob[e];
+            }
+            sel[0] = sum;
+        }
+        barrier();
+        float sum = sel[0];
+        barrier();
+        if (t < n) {
+            prob[t] = ex / sum;
         }
     }
     barrier();
