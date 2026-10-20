@@ -792,12 +792,12 @@ void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
                   std::uint32_t nope, std::uint32_t rope_d,
                   std::uint32_t layer_off, float kq_scale) {
     const std::uint32_t n_pos = base + n;
-    // Decode on a short context: flash-decoding, q_abs . latent +
+    // Decode up to ~1k positions: flash-decoding, q_abs . latent +
     // q_pe . k_pe with every head on the one shared latent row (group
-    // = heads). It reads the latent once per head, so past a few
-    // blocks the matmul form below (each latent tile read once for
-    // all heads) wins.
-    if (n == 1 && n_pos <= 256 && vk::attn_decode_fits(rank + rope_d)) {
+    // = heads). It reads the latent once per head, so on longer
+    // contexts the matmul form below (each latent tile read once for
+    // all heads) wins (M4 Max: flash ahead at 512, behind at 3k).
+    if (n == 1 && n_pos <= 1024 && vk::attn_decode_fits(rank + rope_d)) {
         rec_attn_decode(s, pp, n_pos, heads,
                         DecodeAttn{q_abs, q, lat, layer_off, layer_off, 0,
                                    heads, rank, rope_d, rank, nope + rope_d,
