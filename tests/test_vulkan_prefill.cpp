@@ -493,3 +493,51 @@ TEST_CASE("bench: vulkan matmul throughput", "[.][bench][vulkan]") {
         }
     }
 }
+
+// Hidden micro-benchmark: decode matvec bandwidth at real shapes.
+//   ./build/tests/locus_tests "bench: vulkan matvec"
+TEST_CASE("bench: vulkan matvec bandwidth", "[.][bench][vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(59);
+    const std::uint32_t reps = 2000;
+    struct Shape {
+        std::uint32_t rows, cols;
+    };
+    for (const Shape sh : {Shape{576, 2048}, Shape{2048, 2048},
+                           Shape{3072, 2048}, Shape{2816, 2048},
+                           Shape{2048, 2816}, Shape{10944, 2048},
+                           Shape{102400, 2048}}) {
+        const auto w = random_q8(sh.rows, sh.cols, rng);
+        const auto x = random_f32(sh.cols, rng);
+        auto wb = upload(ctx, w);
+        auto xb = upload(ctx, x);
+        auto ob = ctx.create_buffer(std::size_t{sh.rows} * 4);
+        const std::uint32_t push[] = {sh.rows, sh.cols, 0, 0, 0, 0,
+                                      fbits(1.0f)};
+        const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+        const std::uint32_t groups =
+            VulkanContext::matvec_groups(Kernel::kMatvecQ8_0, sh.rows);
+        auto run = [&](std::uint32_t n) {
+            ctx.begin_batch();
+            for (std::uint32_t i = 0; i < n; ++i) {
+                ctx.dispatch(Kernel::kMatvecQ8_0, bufs, push, groups);
+            }
+            ctx.end_batch();
+        };
+        run(4);
+        const auto t0 = std::chrono::steady_clock::now();
+        run(reps);
+        const double s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+        WARN("q8_0 matvec " << sh.rows << "x" << sh.cols << ": "
+                            << s / reps * 1e6 << " us, "
+                            << w.size() * double(reps) / s / 1e9 << " GB/s");
+        for (auto b : {wb, xb, ob}) {
+            ctx.destroy_buffer(b);
+        }
+    }
+}

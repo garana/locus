@@ -583,18 +583,29 @@ struct PagedPool {
  * position c), w_off floats into each position's cache row.
  * r.w_bstride_bytes moves w_off per weight slice.
  *
- * k_splits > 1 splits the K range over that many workgroups (decode:
- * too few output tiles to fill the GPU otherwise), each writing a
- * partial plane of `plane` floats -- the output's extent from
- * r.out_off, which must then be 0 -- that sum_splits adds into out.
+ * When the grid would be under kMinGroups workgroups (a decode
+ * token: few output tiles), the K range is split over more of them,
+ * each writing a partial plane of `plane` floats -- the output's
+ * extent from r.out_off, which must then be 0 -- that sum_splits
+ * adds into out.
  */
 void rec_paged_matmul(State& s, Kernel k, const PagedPool& pp,
                       std::uint32_t rows, std::uint32_t cols,
                       std::uint32_t w_off, VulkanContext::Buffer x,
                       VulkanContext::Buffer out, const MatmulRows& r,
-                      bool accumulate, std::uint32_t k_splits = 1,
-                      std::uint32_t plane = 0) {
+                      bool accumulate, std::uint32_t plane) {
+    // Fewer workgroups than this leave the GPU partly idle; a split
+    // keeps at least kSplitCols columns.
+    constexpr std::uint32_t kMinGroups = 128;
+    constexpr std::uint32_t kSplitCols = 32;
     const std::uint32_t tiles = (r.n_tok + kMatmulToks - 1) / kMatmulToks;
+    const std::uint32_t groups =
+        (rows + kMatmulRows - 1) / kMatmulRows * tiles * r.n_batch;
+    const std::uint32_t k_splits =
+        groups >= kMinGroups
+            ? 1
+            : std::clamp<std::uint32_t>((kMinGroups + groups - 1) / groups,
+                                        1, std::max(cols / kSplitCols, 1u));
     const VulkanContext::Buffer dst =
         k_splits > 1
             ? s.chunk_buf(State::kCSplit, std::size_t{k_splits} * plane)
@@ -622,16 +633,6 @@ void rec_paged_matmul(State& s, Kernel k, const PagedPool& pp,
                                        accumulate ? 1u : 0u};
         s.ctx.dispatch(Kernel::kSumSplits, sbufs, spush, (plane + 255) / 256);
     }
-}
-
-/**
- * @returns The split-K factor for attention's O = V^T P over n_pos
- * positions: ~256 positions per split for a single decode token (its
- * output is only a few tiles), 1 for a prefill chunk, whose many
- * token tiles already fill the GPU.
- */
-std::uint32_t attn_splits(std::uint32_t n, std::uint32_t n_pos) {
-    return n == 1 ? std::clamp<std::uint32_t>(n_pos / 256, 1, 32) : 1;
 }
 
 /** Records the causal softmax over `rows` score rows (attn_softmax). */
@@ -670,7 +671,7 @@ void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
     sr.x_inner = hd;
     sr.out_inner = n_pos;
     rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, hd, layer_off, q,
-                     scores, sr, false);
+                     scores, sr, false, n * heads * n_pos);
     rec_softmax(s, scores, n * heads, n_pos, heads, base,
                 1.0f / std::sqrt(static_cast<float>(hd)));
     MatmulRows orow{n * group, 0, heads * n_pos, 0, q_dim};
@@ -683,7 +684,7 @@ void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
     orow.out_inner = hd;
     rec_paged_matmul(s, Kernel::kMatmulPagedTF32, pp, hd, n_pos,
                      layer_off + v_offset, scores, out, orow, false,
-                     attn_splits(n, n_pos), n * q_dim);
+                     n * q_dim);
 }
 
 /**
@@ -704,14 +705,15 @@ void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
     const std::uint32_t rows = n * heads;
     rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, rank, layer_off,
                      q_abs, scores, MatmulRows{rows, 0, rank, 0, n_pos},
-                     false);
+                     false, rows * n_pos);
     rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, rope_d,
                      layer_off + rank, q, scores,
-                     MatmulRows{rows, nope, nope + rope_d, 0, n_pos}, true);
+                     MatmulRows{rows, nope, nope + rope_d, 0, n_pos}, true,
+                     rows * n_pos);
     rec_softmax(s, scores, rows, n_pos, heads, base, kq_scale);
     rec_paged_matmul(s, Kernel::kMatmulPagedTF32, pp, rank, n_pos, layer_off,
                      scores, lat, MatmulRows{rows, 0, n_pos, 0, rank}, false,
-                     attn_splits(n, n_pos), rows * rank);
+                     rows * rank);
 }
 
 }  // namespace
