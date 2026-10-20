@@ -11,10 +11,26 @@
 // Weight type by define: TYPE_Q8 (34-byte Q8_0 blocks, byte
 // offsets, cols % 32 == 0) or TYPE_F32 (element offsets).
 //
-// Workgroup y = b * tiles_n + tt: batch b shifts the weight, X and
-// out offsets by their *_bstride (MLA's per-head projections run as
-// one dispatch), tt picks the token tile. Token t's X row is at
-// x_off + t * x_stride, its output row at out_off + t * out_stride.
+// TYPE_F32 can instead read W from the paged KV pool (attention as
+// matmuls), through the block table at binding 3: PAGED makes row r
+// cache position r (scores: S = K Q^T), PAGED_T makes column c cache
+// position c (outputs: O = V^T P); w_off then offsets within a
+// position's row_w-float cache row.
+//
+// Split-K (k_splits > 1, decode attention: few output tiles, a long
+// K): workgroup y also picks a slice ks of the K range and writes its
+// partial sums to plane ks (split_stride floats apart) of the output,
+// for sum_splits.comp to add up; accumulate is then ignored.
+//
+// Workgroup y = (b * tiles_n + tt) * k_splits + ks: batch b shifts
+// the weight by
+// (b / w_bdiv) * w_bstride and X and out by their *_bstride (MLA's
+// per-head projections, or one query head per batch sharing its
+// GQA K/V head), tt picks the token tile. Token t's X row is at
+// x_off + (t / x_div) * x_stride + (t % x_div) * x_inner, its output
+// row at out_off + (t / x_div) * out_stride + (t % x_div) * out_inner
+// (x_div > 1: GQA attention, where a K/V head's query heads are
+// extra token rows sharing each K/V tile).
 //
 // With MOE_ID, b is an expert id and the token tile comes from that
 // expert's list in IDS (moe_group.comp: counts[n_expert], then
@@ -46,6 +62,9 @@ layout(std430, binding = 2) buffer O { float o[]; };
 #ifdef MOE_ID
 layout(std430, binding = 3) readonly buffer IDS { uint ids[]; };
 #endif
+#if defined(PAGED) || defined(PAGED_T)
+layout(std430, binding = 3) readonly buffer TABLE { uint table[]; };
+#endif
 
 layout(push_constant) uniform PC {
     uint rows;
@@ -64,12 +83,41 @@ layout(push_constant) uniform PC {
     uint tiles_n;     // token tiles per batch (y = b * tiles_n + tt)
     uint x_div;       // MOE_ID: X row = pair / x_div
     uint cap;         // MOE_ID: list capacity per expert
+    uint w_bdiv;      // batches per weight slice (GQA group), >= 1
+    uint block_tokens;  // PAGED/PAGED_T: positions per block
+    uint block_stride;  // floats per block
+    uint row_w;         // floats per position's cache row
+    uint k_splits;      // >= 1
+    uint split_stride;  // floats between partial planes
+    uint x_inner;       // x_div > 1 (not MOE_ID): see above
+    uint out_inner;
 } pc;
 
 shared float ws[BK][BM];
 shared float xs[BK][BN];
 shared uint rows_x[BN];
 shared uint rows_o[BN];
+
+#if defined(PAGED) || defined(PAGED_T)
+/** Float offset of cache position p's row in the pool. */
+uint pos_row(uint p) {
+    return table[p / pc.block_tokens] * pc.block_stride +
+           (p % pc.block_tokens) * pc.row_w;
+}
+#endif
+
+#ifndef TYPE_Q8
+/** W element (row r, column c) of the slice at wbase. */
+float w_at(uint wbase, uint r, uint c) {
+#if defined(PAGED)
+    return w[pos_row(r) + wbase + c];
+#elif defined(PAGED_T)
+    return w[pos_row(c) + wbase + r];
+#else
+    return w[wbase + r * pc.cols + c];
+#endif
+}
+#endif
 
 #ifdef TYPE_Q8
 /** The 4 bytes at byte offset b (any alignment). */
@@ -82,11 +130,18 @@ uint word_at(uint b) {
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint b = gl_WorkGroupID.y / pc.tiles_n;
-    uint tt = gl_WorkGroupID.y % pc.tiles_n;
+    uint ks = gl_WorkGroupID.y % pc.k_splits;
+    uint yb = gl_WorkGroupID.y / pc.k_splits;
+    uint b = yb / pc.tiles_n;
+    uint tt = yb % pc.tiles_n;
+    // This split's K range, whole BK steps (Q8_0 blocks stay whole).
+    uint k_per = ((pc.cols + pc.k_splits - 1u) / pc.k_splits + BK - 1u) /
+                 BK * BK;
+    uint k_begin = ks * k_per;
+    uint k_end = min(pc.cols, k_begin + k_per);
     uint r0 = gl_WorkGroupID.x * BM;
     uint t0 = tt * BN;
-    uint wbase = pc.w_off + b * pc.w_bstride;
+    uint wbase = pc.w_off + (b / pc.w_bdiv) * pc.w_bstride;
 
 #ifdef MOE_ID
     uint n_here = ids[b];
@@ -97,7 +152,7 @@ void main() {
     if (tid < n_here) {
         // Lists start after the n_expert counts; the grid has
         // n_expert * tiles_n workgroups in y.
-        uint n_exp = gl_NumWorkGroups.y / pc.tiles_n;
+        uint n_exp = gl_NumWorkGroups.y / (pc.tiles_n * pc.k_splits);
         uint p = ids[n_exp + b * pc.cap + t0 + tid];
         rows_x[tid] = pc.x_off + (p / pc.x_div) * pc.x_stride;
         rows_o[tid] = pc.out_off + p * pc.out_stride;
@@ -106,8 +161,12 @@ void main() {
     uint n_here = t0 < pc.n_tok ? min(BN, pc.n_tok - t0) : 0u;
     if (tid < BN) {
         uint t = t0 + tid;
-        rows_x[tid] = pc.x_off + b * pc.x_bstride + t * pc.x_stride;
-        rows_o[tid] = pc.out_off + b * pc.out_bstride + t * pc.out_stride;
+        uint tq = t / pc.x_div;
+        uint ti = t % pc.x_div;
+        rows_x[tid] = pc.x_off + b * pc.x_bstride + tq * pc.x_stride +
+                      ti * pc.x_inner;
+        rows_o[tid] = pc.out_off + b * pc.out_bstride +
+                      tq * pc.out_stride + ti * pc.out_inner;
     }
 #endif
     barrier();
@@ -126,7 +185,7 @@ void main() {
     // Weight loader: 4 threads per row, 8 values each.
     uint lr = tid >> 2;
     uint sub = tid & 3u;
-    for (uint k0 = 0u; k0 < pc.cols; k0 += BK) {
+    for (uint k0 = k_begin; k0 < k_end; k0 += BK) {
         // Weights: row r0 + lr, columns k0 + sub*8 .. +8.
         uint r = r0 + lr;
 #ifdef TYPE_Q8
@@ -149,8 +208,8 @@ void main() {
 #else
         for (uint c = sub * 8u; c < sub * 8u + 8u; ++c) {
             uint kc = k0 + c;
-            ws[c][lr] = (r < pc.rows && kc < pc.cols)
-                            ? w[wbase + r * pc.cols + kc]
+            ws[c][lr] = (r < pc.rows && kc < k_end)
+                            ? w_at(wbase, r, kc)
                             : 0.0;
         }
 #endif
@@ -159,7 +218,7 @@ void main() {
             uint tl = idx / BK;
             uint c = idx % BK;
             uint kc = k0 + c;
-            xs[c][tl] = (tl < n_here && kc < pc.cols)
+            xs[c][tl] = (tl < n_here && kc < k_end)
                             ? x[rows_x[tl] + kc]
                             : 0.0;
         }
@@ -192,9 +251,10 @@ void main() {
             if (r >= pc.rows) {
                 continue;
             }
-            uint at = rows_o[tl] + r;
+            uint at = rows_o[tl] + r + ks * pc.split_stride;
             float v = acc[i][j] * pc.scale;
-            o[at] = pc.accumulate != 0u ? o[at] + v : v;
+            o[at] = pc.accumulate != 0u && pc.k_splits == 1u ? o[at] + v
+                                                             : v;
         }
     }
 }

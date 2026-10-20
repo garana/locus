@@ -152,7 +152,9 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
                 const std::uint32_t push[] = {
                     rows,  c.cols, n_tok, acc ? 1u : 0u, 0,
                     0,     x_stride, 0,   out_stride,    fbits(scale),
-                    w_bstride, x_bstride, out_bstride, tiles, 1, 0};
+                    w_bstride, x_bstride, out_bstride, tiles, 1, 0,
+                    1,     0,      0,     0,         1,           0,
+                    0,     0};
                 ctx.dispatch(c.kernel, bufs, push, (rows + 63) / 64,
                              tiles * n_batch);
                 ctx.end_batch();
@@ -245,7 +247,8 @@ TEST_CASE("vulkan prefill MoE: route, group, expert matmul, combine",
         const VulkanContext::Buffer bufs[] = {wgb, xb, gb, idb};
         const std::uint32_t push[] = {
             ff, E, n_tok, 0, 0, 0, E, 0, ff, fbits(1.0f),
-            static_cast<std::uint32_t>(g_bytes), 0, 0, tiles, k, n_tok};
+            static_cast<std::uint32_t>(g_bytes), 0, 0, tiles, k, n_tok,
+            1, 0, 0, 0, 1, 0, 0, 0};
         ctx.dispatch(Kernel::kMatmulQ8_0Id, bufs, push, (ff + 63) / 64,
                      tiles * n_exp);
     }
@@ -253,7 +256,8 @@ TEST_CASE("vulkan prefill MoE: route, group, expert matmul, combine",
         const VulkanContext::Buffer bufs[] = {wdb, gb, db, idb};
         const std::uint32_t push[] = {
             E, ff, n_tok, 0, 0, 0, ff, 0, E, fbits(1.0f),
-            static_cast<std::uint32_t>(d_bytes), 0, 0, tiles, 1, n_tok};
+            static_cast<std::uint32_t>(d_bytes), 0, 0, tiles, 1, n_tok,
+            1, 0, 0, 0, 1, 0, 0, 0};
         ctx.dispatch(Kernel::kMatmulQ8_0Id, bufs, push, (E + 63) / 64,
                      tiles * n_exp);
     }
