@@ -7,6 +7,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/vulkan/context.hpp"
+#include "locus/backend/vulkan/q8_layout.hpp"
 #include "locus/model/transformer.hpp"
 
 using locus::backend::vk::Kernel;
@@ -173,7 +174,12 @@ TEST_CASE("vulkan batched q8_0 matvec covers split, routed and summed "
     };
 
     auto wb = ctx.create_buffer((w.size() + 3) & ~std::size_t{3});
-    ctx.write_buffer(wb, w);
+    {
+        std::vector<std::byte> wg(w.size());
+        locus::backend::vk::q8_0_split_rows(w.data(), wg.data(),
+                                            rows * n_mat, cols);
+        ctx.write_buffer(wb, wg);
+    }
     auto xb = upload(ctx, x);
     auto rb = upload(ctx, route);
     auto run = [&](std::uint32_t mode, std::uint32_t out_stride,
@@ -232,6 +238,63 @@ TEST_CASE("vulkan batched q8_0 matvec covers split, routed and summed "
         }
     }
     for (auto b : {wb, xb, rb}) {
+        ctx.destroy_buffer(b);
+    }
+}
+
+TEST_CASE("vulkan transposed q8_0 matvec matches the CPU reference",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(37);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    // Two "heads" of 10 rows x 256 cols each, stacked with 3 rows of
+    // padding between them (like wkv_b's W_uv rows after W_uk).
+    const std::uint32_t rows = 10, cols = 256, pad = 3, heads = 2;
+    const std::uint32_t stride_rows = rows + pad;
+    const std::size_t row_b = (cols / 32) * 34;
+    const auto w = random_q8(stride_rows * heads, cols, rng);
+    std::vector<float> x(heads * 16);  // head h's x at h * 16
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+
+    std::vector<float> want(heads * cols, 0.0f);
+    std::vector<float> row(cols);
+    for (std::uint32_t h = 0; h < heads; ++h) {
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            locus::backend::Mat m{locus::gguf::TensorType::kQ8_0,
+                                  w.data() + (h * stride_rows + r) * row_b,
+                                  1, cols};
+            locus::backend::dequant_row(m, 0, row);
+            for (std::uint32_t c = 0; c < cols; ++c) {
+                want[h * cols + c] += row[c] * x[h * 16 + r];
+            }
+        }
+    }
+
+    std::vector<std::byte> wg(w.size());
+    locus::backend::vk::q8_0_split_rows(w.data(), wg.data(),
+                                        stride_rows * heads, cols);
+    auto wb = ctx.create_buffer(wg.size());
+    ctx.write_buffer(wb, wg);
+    auto xb = upload(ctx, x);
+    auto ob = ctx.create_buffer(want.size() * 4);
+    ctx.begin_batch();
+    const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+    const std::uint32_t push[] = {
+        rows, cols, 0, 0, 0,
+        static_cast<std::uint32_t>(stride_rows * row_b), 16, cols};
+    ctx.dispatch(Kernel::kMatvecTQ8, bufs, push, cols / 128, heads);
+    ctx.end_batch();
+    const auto got = download<float>(ctx, ob, want.size());
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        REQUIRE(got[i] == Catch::Approx(want[i]).margin(1e-4));
+    }
+    for (auto b : {wb, xb, ob}) {
         ctx.destroy_buffer(b);
     }
 }

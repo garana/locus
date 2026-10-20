@@ -16,6 +16,7 @@
 #include "locus/backend/vulkan/context.hpp"
 #include "locus/backend/vulkan/limits.hpp"
 #include "locus/backend/vulkan/mem_fit.hpp"
+#include "locus/backend/vulkan/q8_layout.hpp"
 #include "locus/backend/vulkan/weight_pool.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/moe_stats.hpp"
@@ -180,9 +181,39 @@ struct State {
     VulkanContext::Buffer upload_experts(
         const model::TransformerModel::ExpertMat& em,
         std::uint32_t n_expert) {
-        return upload_keyed(
-            &em, em.base.data,
-            static_cast<std::size_t>(em.expert_bytes) * n_expert);
+        const std::uint64_t bytes = em.expert_bytes * n_expert;
+        return upload_rows(&em, em.base, bytes);
+    }
+
+    /**
+     * Uploads the first w.rows rows of weight matrix w, keyed by
+     * w.data. Q8_0 rows go up in the split GPU layout
+     * (q8_layout.hpp), other types as stored.
+     */
+    VulkanContext::Buffer upload_w(const Mat& w) {
+        return upload_rows(w.data, w, weight_bytes(w));
+    }
+
+    /**
+     * Uploads exactly `bytes` of w's rows from w.data under pool key
+     * `key`, repacking whole Q8_0 rows, into a gpu_alloc_bytes(bytes)
+     * buffer with the tail zeroed.
+     */
+    VulkanContext::Buffer upload_rows(const void* key, const Mat& w,
+                                      std::uint64_t bytes) {
+        const std::size_t n = static_cast<std::size_t>(bytes);
+        const std::size_t alloc = vk::gpu_alloc_bytes(n);
+        return pool.acquire(key, alloc, [&](VulkanContext::Buffer b) {
+            const auto* src = static_cast<const std::byte*>(w.data);
+            auto* dst = static_cast<std::byte*>(ctx.mapped(b));
+            if (w.type == gguf::TensorType::kQ8_0) {
+                const std::size_t row_bytes = (w.cols / 32) * 34;
+                vk::q8_0_split_rows(src, dst, n / row_bytes, w.cols);
+            } else {
+                std::memcpy(dst, src, n);
+            }
+            std::memset(dst + n, 0, alloc - n);
+        });
     }
 
     VulkanContext::Buffer upload(const void* ptr,
@@ -206,12 +237,17 @@ struct State {
         });
     }
 
-    /** Uploads w dequantized to F32 (any CPU-supported type). */
+    /**
+     * Uploads w dequantized to F32 (any CPU-supported type), keyed
+     * apart from w.data (upload_w's key for the same matrix as
+     * stored) -- like upload_kb_t's +1 key.
+     */
     VulkanContext::Buffer upload_f32(const Mat& w) {
         const std::size_t bytes =
             static_cast<std::size_t>(w.rows) * w.cols * 4;
         return pool.acquire(
-            w.data, bytes, [&](VulkanContext::Buffer b) {
+            static_cast<const std::byte*>(w.data) + 2, bytes,
+            [&](VulkanContext::Buffer b) {
                 std::vector<float> host(
                     static_cast<std::size_t>(w.rows) * w.cols);
                 for (std::uint32_t r = 0; r < w.rows; ++r) {
@@ -388,7 +424,7 @@ void rec_matvec(State& s, const Mat& w, VulkanContext::Buffer x,
                 VulkanContext::Buffer* whole = nullptr) {
     const VulkanContext::Buffer wb =
         whole != nullptr ? *whole
-                         : s.upload(w.data, weight_bytes(w));
+                         : s.upload_w(w);
     const Kernel k = matvec_kernel(w);
     const VulkanContext::Buffer grid = s.grid_for(k);
     const VulkanContext::Buffer bufs[] = {wb, x, out, grid};
@@ -791,7 +827,7 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
     }
     State& s = state();
     const Kernel k = matvec_kernel(w);
-    auto wb = s.upload(w.data, weight_bytes(w));
+    auto wb = s.upload_w(w);
     s.grow(s.x, s.x_n, x.size());
     s.grow(s.xb, s.xb_n, out.size());
     s.ctx.write_buffer(s.x, std::as_bytes(x));
@@ -1171,10 +1207,21 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             }
         } else {
             const bool split = lay.wk_b.rows > 0;
-            VulkanContext::Buffer wkv_b32{};
-            if (!split) {
+            // A Q8_0 fused wkv_b is read as stored (split rows): W_uk^T
+            // by the transposed Q8 matvec, W_uv by the batched one.
+            // Other types go through a dequantized F32 copy.
+            const bool kv_q8 = !split &&
+                               lay.wkv_b.type == gguf::TensorType::kQ8_0 &&
+                               rank % 128 == 0;
+            VulkanContext::Buffer wkv_b32{}, wkv_bq{};
+            if (kv_q8) {
+                wkv_bq = s.upload_w(lay.wkv_b);
+            } else if (!split) {
                 wkv_b32 = s.upload_f32(lay.wkv_b);
             }
+            const std::uint32_t kv_row_b =
+                kv_q8 ? static_cast<std::uint32_t>(mat_row_bytes(lay.wkv_b))
+                      : 0;
             const VulkanContext::Buffer divisors =
                 s.rope_divisors({}, rope_d / 2);
             if (hp.q_lora_rank > 0) {
@@ -1210,7 +1257,15 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             }
             // Per-head weight absorption, all heads per dispatch
             // where a batched kernel exists (head h = slot h).
-            if (!split) {
+            if (kv_q8) {
+                const VulkanContext::Buffer bufs[] = {wkv_bq, s.q,
+                                                      s.q_abs};
+                const std::uint32_t push[] = {
+                    nope, rank, 0, 0, 0, (nope + vd) * kv_row_b, qk,
+                    rank};
+                s.ctx.dispatch(Kernel::kMatvecTQ8, bufs, push, rank / 128,
+                               hp.n_heads);
+            } else if (!split) {
                 const VulkanContext::Buffer bufs[] = {wkv_b32, s.q,
                                                       s.q_abs};
                 const std::uint32_t push[] = {
@@ -1223,7 +1278,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 Mat kb = lay.wk_b;
                 kb.rows = rank;
                 rec_matvec_b(
-                    s, kb, s.upload(lay.wk_b.data, weight_bytes(lay.wk_b)),
+                    s, kb, s.upload_w(lay.wk_b),
                     s.q, s.q_abs, 0, false, 0, 0,
                     std::uint64_t{rank} * mat_row_bytes(lay.wk_b), qk,
                     rank, hp.n_heads, 0, s.q);
@@ -1241,7 +1296,15 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             rec_attn_mla(s, pp, s.q, s.q_abs, s.att, s.latent, 1, pos,
                          hp.n_heads, rank, nope, rope_d, l * layer_stride,
                          hp.kq_scale);
-            if (!split) {
+            if (kv_q8) {
+                // W_uv: head h's vd rows start at row h * (nope + vd)
+                // + nope of wkv_b.
+                Mat uv{gguf::TensorType::kQ8_0, lay.wkv_b.data, vd, rank};
+                rec_matvec_b(s, uv, wkv_bq, s.latent, s.attout, 0, false,
+                             std::uint64_t{nope} * kv_row_b, 0,
+                             std::uint64_t{nope + vd} * kv_row_b, rank, vd,
+                             hp.n_heads, 0, s.latent);
+            } else if (!split) {
                 // W_uv rows of the dequantized fused wkv_b, head h
                 // at element (h * (nope + vd) + nope) * rank.
                 Mat uv{gguf::TensorType::kF32, nullptr, vd, rank};
@@ -1253,7 +1316,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 Mat vb = lay.wv_b;
                 vb.rows = vd;
                 rec_matvec_b(
-                    s, vb, s.upload(lay.wv_b.data, weight_bytes(lay.wv_b)),
+                    s, vb, s.upload_w(lay.wv_b),
                     s.latent, s.attout, 0, false, 0, 0,
                     std::uint64_t{vd} * mat_row_bytes(lay.wv_b), rank,
                     vd, hp.n_heads, 0, s.latent);
@@ -1360,8 +1423,8 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             const auto up_expert =
                 [&](const model::TransformerModel::ExpertMat& em,
                     std::uint32_t e) {
-                    return s.upload(em.expert(e).data,
-                                    em.expert_bytes);
+                    const Mat m = em.expert(e);
+                    return s.upload_rows(m.data, m, em.expert_bytes);
                 };
             for (const auto& [e, wgt] : picked) {
                 VulkanContext::Buffer bg =
@@ -1551,12 +1614,12 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         u2.rows = ff;
         d2.cols = ff;
         const MatmulRows in{n, 0, E, 0, ff};
-        rec_matmul(s, g2, s.upload(wg.data, weight_bytes(g2)), bxb, bgate,
+        rec_matmul(s, g2, s.upload_w(g2), bxb, bgate,
                    in, false);
-        rec_matmul(s, u2, s.upload(wu.data, weight_bytes(u2)), bxb, bup,
+        rec_matmul(s, u2, s.upload_w(u2), bxb, bup,
                    in, false);
         silu_rows(std::size_t{n} * ff);
-        rec_matmul(s, d2, s.upload(wd.data, weight_bytes(wd)), bgate, bx,
+        rec_matmul(s, d2, s.upload_w(wd), bgate, bx,
                    MatmulRows{n, 0, ff, 0, E}, true);
     };
 
@@ -1573,11 +1636,11 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
             const auto bk = s.chunk_buf(C::kCK, std::size_t{n} * kv_dim);
             const auto bv = s.chunk_buf(C::kCV, std::size_t{n} * kv_dim);
             rec_matmul(s, lay.wq,
-                       s.upload(lay.wq.data, weight_bytes(lay.wq)), bxb,
+                       s.upload_w(lay.wq), bxb,
                        bq, MatmulRows{n, 0, E, 0, q_dim}, false);
-            rec_matmul(s, lay.wk, s.upload(lay.wk.data, weight_bytes(lay.wk)),
+            rec_matmul(s, lay.wk, s.upload_w(lay.wk),
                        bxb, bk, MatmulRows{n, 0, E, 0, kv_dim}, false);
-            rec_matmul(s, lay.wv, s.upload(lay.wv.data, weight_bytes(lay.wv)),
+            rec_matmul(s, lay.wv, s.upload_w(lay.wv),
                        bxb, bv, MatmulRows{n, 0, E, 0, kv_dim}, false);
             rope_rows(bq, divisors, H, hd, 0, hd, q_dim, false);
             rope_rows(bk, divisors, hp.n_kv_heads, hd, 0, hd, kv_dim,
@@ -1598,21 +1661,21 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 const std::uint32_t qr = hp.q_lora_rank;
                 const auto bqa = s.chunk_buf(C::kCQa, std::size_t{n} * qr);
                 rec_matmul(s, lay.wq_a,
-                           s.upload(lay.wq_a.data, weight_bytes(lay.wq_a)),
+                           s.upload_w(lay.wq_a),
                            bxb, bqa, MatmulRows{n, 0, E, 0, qr}, false);
                 norm_rows(lay.q_a_norm, bqa, bqa, qr, 0, qr, qr, n);
                 rec_matmul(s, lay.wq_b,
-                           s.upload(lay.wq_b.data, weight_bytes(lay.wq_b)),
+                           s.upload_w(lay.wq_b),
                            bqa, bq, MatmulRows{n, 0, qr, 0, q_dim}, false);
             } else {
                 rec_matmul(s, lay.wq,
-                           s.upload(lay.wq.data, weight_bytes(lay.wq)),
+                           s.upload_w(lay.wq),
                            bxb, bq, MatmulRows{n, 0, E, 0, q_dim}, false);
             }
             // Latent rows: rms-norm the c_kv part and rope the k_pe
             // part in place, then scatter the rows into the pool.
             rec_matmul(s, lay.wkv_a,
-                       s.upload(lay.wkv_a.data, weight_bytes(lay.wkv_a)),
+                       s.upload_w(lay.wkv_a),
                        bxb, bkva, MatmulRows{n, 0, E, 0, kvw}, false);
             norm_rows(lay.kv_a_norm, bkva, bkva, rank, 0, kvw, kvw, n);
             rope_rows(bkva, divisors, 1, rope_d, rank, 0, kvw, true);
@@ -1637,7 +1700,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 absorb.w_bstride_bytes =
                     std::uint64_t{rank} * mat_row_bytes(lay.wk_b);
                 rec_matmul(s, kb,
-                           s.upload(lay.wk_b.data, weight_bytes(lay.wk_b)),
+                           s.upload_w(lay.wk_b),
                            bq, bqabs, absorb, false);
             }
             rec_attn_mla(s, pp, bq, bqabs, batt, blat, n, base, H, rank, nope,
@@ -1658,11 +1721,11 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 uv_rows.w_bstride_bytes =
                     std::uint64_t{vd} * mat_row_bytes(lay.wv_b);
                 rec_matmul(s, vb,
-                           s.upload(lay.wv_b.data, weight_bytes(lay.wv_b)),
+                           s.upload_w(lay.wv_b),
                            blat, batt_out, uv_rows, false);
             }
         }
-        rec_matmul(s, lay.wo, s.upload(lay.wo.data, weight_bytes(lay.wo)),
+        rec_matmul(s, lay.wo, s.upload_w(lay.wo),
                    batt_out, bx, MatmulRows{n, 0, att_dim, 0, E}, true);
 
         norm_rows(lay.ffn_norm, bx, bxb, E, 0, E, E, n);
@@ -1684,7 +1747,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         const auto bdown =
             s.chunk_buf(C::kCDown, std::size_t{n} * k_used * E);
         rec_matmul(s, lay.gate_inp,
-                   s.upload(lay.gate_inp.data, weight_bytes(lay.gate_inp)),
+                   s.upload_w(lay.gate_inp),
                    bxb, brouter, MatmulRows{n, 0, E, 0, 2 * ne}, false);
         {
             const bool has_bias = !lay.exp_probs_b.empty();
@@ -1743,7 +1806,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const Mat& out_w = m.output_weight();
     if (all_logits) {
         norm_rows(m.output_norm(), bx, bxb, E, 0, E, E, n);
-        rec_matmul(s, out_w, s.upload(out_w.data, weight_bytes(out_w)), bxb,
+        rec_matmul(s, out_w, s.upload_w(out_w), bxb,
                    blogits, MatmulRows{n, 0, E, 0, hp.n_vocab}, false);
     } else {
         norm_rows(m.output_norm(), bx, bxb, E, (n - 1) * E, 0, 0, 1);

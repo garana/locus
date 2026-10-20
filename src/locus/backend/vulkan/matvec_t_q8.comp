@@ -1,0 +1,66 @@
+#version 450
+
+// Transposed Q8_0 matvec: out[out_off + c] = sum_r W[r][c] * x[x_off
+// + r] over `rows` rows of a Q8_0 matrix in the split GPU layout
+// (q8_layout.hpp), starting at byte w_off. MLA's weight absorption
+// (q_abs = W_uk^T q_nope) reading the fused wkv_b as stored, instead
+// of a 4x larger dequantized F32 copy.
+//
+// A workgroup covers 128 columns (32 lanes x 4 consecutive columns,
+// one quant word per row) and splits the rows into 4 slices, summed
+// through shared memory. Workgroup row y (one per head) shifts each
+// offset by y times its *_y stride.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;       // % 128 == 0
+    uint w_off;      // bytes
+    uint x_off;
+    uint out_off;
+    uint w_off_y;    // bytes
+    uint x_off_y;
+    uint out_off_y;
+} pc;
+
+shared vec4 red[4][32];
+
+void main() {
+    uint lane = gl_LocalInvocationID.x % 32u;
+    uint slice = gl_LocalInvocationID.x / 32u;
+    uint y = gl_WorkGroupID.y;
+    uint c = gl_WorkGroupID.x * 128u + lane * 4u;
+    uint nb = pc.cols / 32u;
+    uint row_bytes = nb * 34u;
+    uint wbase = pc.w_off + y * pc.w_off_y;
+    uint x0 = pc.x_off + y * pc.x_off_y;
+    uint per = (pc.rows + 3u) / 4u;
+    uint r_end = min(pc.rows, (slice + 1u) * per);
+    vec4 acc = vec4(0.0);
+    for (uint r = slice * per; r < r_end; ++r) {
+        uint rb = wbase + r * row_bytes;
+        uint sa = rb + (c / 32u) * 2u;
+        float d = unpackHalf2x16(w[sa >> 2] >> ((sa & 2u) * 8u)).x;
+        int q = int(w[(rb + 2u * nb + c) >> 2]);
+        vec4 v = vec4(bitfieldExtract(q, 0, 8), bitfieldExtract(q, 8, 8),
+                      bitfieldExtract(q, 16, 8),
+                      bitfieldExtract(q, 24, 8));
+        acc += v * (d * x[x0 + r]);
+    }
+    red[slice][lane] = acc;
+    barrier();
+    if (slice == 0u) {
+        vec4 s = red[0][lane] + red[1][lane] + red[2][lane] +
+                 red[3][lane];
+        uint ob = pc.out_off + y * pc.out_off_y + c;
+        o[ob] = s.x;
+        o[ob + 1u] = s.y;
+        o[ob + 2u] = s.z;
+        o[ob + 3u] = s.w;
+    }
+}
