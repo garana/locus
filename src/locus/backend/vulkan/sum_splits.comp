@@ -1,0 +1,30 @@
+#version 450
+
+// Adds split-K partial planes (matmul.comp, k_splits > 1) into the
+// output: o[out_off + i] (+)= sum_ks part[ks * plane + i] for i <
+// plane, the splits summed in order.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer P { float part[]; };
+layout(std430, binding = 1) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint plane;
+    uint splits;
+    uint out_off;
+    uint accumulate;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.plane) {
+        return;
+    }
+    float acc = 0.0;
+    for (uint ks = 0u; ks < pc.splits; ++ks) {
+        acc += part[ks * pc.plane + i];
+    }
+    uint at = pc.out_off + i;
+    o[at] = pc.accumulate != 0u ? o[at] + acc : acc;
+}

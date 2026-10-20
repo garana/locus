@@ -278,6 +278,7 @@ struct State {
         kCIds,     // MoE: per-expert pair lists (moe_group)
         kCDown,    // MoE: routed down outputs, n*k x n_embd
         kCLogits,
+        kCSplit,   // split-K partial planes (decode attention)
         kChunkCount_
     };
     VulkanContext::Buffer chunk[kChunkCount_]{};
@@ -447,6 +448,11 @@ struct MatmulRows {
     std::uint32_t n_batch = 1;
     std::uint64_t w_bstride_bytes = 0;
     std::uint32_t x_bstride = 0, out_bstride = 0;
+    /** Batches sharing one weight slice (W moves every w_bdiv). */
+    std::uint32_t w_bdiv = 1;
+    /** Two-level token rows (GQA): token t is (t / div, t % div),
+     * the inner index stepping X / out by these. */
+    std::uint32_t div = 1, x_inner = 0, out_inner = 0;
 };
 
 /**
@@ -489,8 +495,16 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   r.x_bstride,
                                   r.out_bstride,
                                   tiles,
+                                  r.div,
+                                  0,
+                                  r.w_bdiv,
+                                  0,
+                                  0,
+                                  0,
                                   1,
-                                  0};
+                                  0,
+                                  r.x_inner,
+                                  r.out_inner};
     s.ctx.dispatch(k, bufs, push, (w.rows + kMatmulRows - 1) / kMatmulRows,
                    tiles * r.n_batch);
 }
@@ -525,10 +539,161 @@ void rec_matmul_id(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   0,
                                   tiles,
                                   x_div,
-                                  n_tok};
+                                  n_tok,
+                                  1,
+                                  0,
+                                  0,
+                                  0,
+                                  1,
+                                  0,
+                                  0,
+                                  0};
     s.ctx.dispatch(Kernel::kMatmulQ8_0Id, bufs, push,
                    (w.rows + kMatmulRows - 1) / kMatmulRows,
                    tiles * n_expert);
+}
+
+/** The paged KV pool as a matmul weight operand. */
+struct PagedPool {
+    VulkanContext::Buffer pool, table;
+    std::uint32_t block_tokens, block_stride, row_w;
+};
+
+/**
+ * Records a matmul whose weight is the paged pool (kMatmulPagedF32:
+ * row r = cache position r; kMatmulPagedTF32: column c = cache
+ * position c), w_off floats into each position's cache row.
+ * r.w_bstride_bytes moves w_off per weight slice.
+ *
+ * k_splits > 1 splits the K range over that many workgroups (decode:
+ * too few output tiles to fill the GPU otherwise), each writing a
+ * partial plane of `plane` floats -- the output's extent from
+ * r.out_off, which must then be 0 -- that sum_splits adds into out.
+ */
+void rec_paged_matmul(State& s, Kernel k, const PagedPool& pp,
+                      std::uint32_t rows, std::uint32_t cols,
+                      std::uint32_t w_off, VulkanContext::Buffer x,
+                      VulkanContext::Buffer out, const MatmulRows& r,
+                      bool accumulate, std::uint32_t k_splits = 1,
+                      std::uint32_t plane = 0) {
+    const std::uint32_t tiles = (r.n_tok + kMatmulToks - 1) / kMatmulToks;
+    const VulkanContext::Buffer dst =
+        k_splits > 1
+            ? s.chunk_buf(State::kCSplit, std::size_t{k_splits} * plane)
+            : out;
+    const VulkanContext::Buffer bufs[] = {pp.pool, x, dst, pp.table};
+    const std::uint32_t push[] = {
+        rows,         cols,
+        r.n_tok,      accumulate ? 1u : 0u,
+        w_off,        r.x_off,
+        r.x_stride,   r.out_off,
+        r.out_stride, fbits(1.0f),
+        static_cast<std::uint32_t>(r.w_bstride_bytes / 4),
+        r.x_bstride,  r.out_bstride,
+        tiles,        r.div,
+        0,            r.w_bdiv,
+        pp.block_tokens, pp.block_stride,
+        pp.row_w,     k_splits,
+        plane,        r.x_inner,
+        r.out_inner};
+    s.ctx.dispatch(k, bufs, push, (rows + kMatmulRows - 1) / kMatmulRows,
+                   tiles * r.n_batch * k_splits);
+    if (k_splits > 1) {
+        const VulkanContext::Buffer sbufs[] = {dst, out};
+        const std::uint32_t spush[] = {plane, k_splits, 0,
+                                       accumulate ? 1u : 0u};
+        s.ctx.dispatch(Kernel::kSumSplits, sbufs, spush, (plane + 255) / 256);
+    }
+}
+
+/**
+ * @returns The split-K factor for attention's O = V^T P over n_pos
+ * positions: ~256 positions per split for a single decode token (its
+ * output is only a few tiles), 1 for a prefill chunk, whose many
+ * token tiles already fill the GPU.
+ */
+std::uint32_t attn_splits(std::uint32_t n, std::uint32_t n_pos) {
+    return n == 1 ? std::clamp<std::uint32_t>(n_pos / 256, 1, 32) : 1;
+}
+
+/** Records the causal softmax over `rows` score rows (attn_softmax). */
+void rec_softmax(State& s, VulkanContext::Buffer scores, std::uint32_t rows,
+                 std::uint32_t n_pos, std::uint32_t heads, std::uint32_t base,
+                 float scale) {
+    const VulkanContext::Buffer bufs[] = {scores};
+    const std::uint32_t push[] = {n_pos, heads, base, fbits(scale), rows};
+    const std::uint32_t gx = std::min<std::uint32_t>(rows, 65535);
+    s.ctx.dispatch(Kernel::kAttnSoftmax, bufs, push, gx,
+                   (rows + gx - 1) / gx);
+}
+
+/**
+ * Records causal GQA attention for n query tokens at positions
+ * base .. base + n - 1 of one layer as matmuls over the paged pool:
+ * S = K Q^T, masked softmax, O = V^T P, one batch per K/V head whose
+ * `group` query heads are extra token rows (row t * group + i), so
+ * each K/V tile is read once for all of them. Q and out rows are
+ * q_dim floats per token (head h at h * hd); scores holds
+ * n * heads * (base + n) floats.
+ */
+void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
+                  VulkanContext::Buffer scores, VulkanContext::Buffer out,
+                  std::uint32_t n, std::uint32_t base, std::uint32_t heads,
+                  std::uint32_t group, std::uint32_t hd, std::uint32_t q_dim,
+                  std::uint32_t layer_off, std::uint32_t v_offset) {
+    const std::uint32_t n_pos = base + n;
+    const std::uint32_t n_kv = heads / group;
+    MatmulRows sr{n * group, 0, q_dim, 0, heads * n_pos};
+    sr.n_batch = n_kv;
+    sr.x_bstride = group * hd;
+    sr.out_bstride = group * n_pos;
+    sr.w_bstride_bytes = std::uint64_t{hd} * 4;
+    sr.div = group;
+    sr.x_inner = hd;
+    sr.out_inner = n_pos;
+    rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, hd, layer_off, q,
+                     scores, sr, false);
+    rec_softmax(s, scores, n * heads, n_pos, heads, base,
+                1.0f / std::sqrt(static_cast<float>(hd)));
+    MatmulRows orow{n * group, 0, heads * n_pos, 0, q_dim};
+    orow.n_batch = n_kv;
+    orow.x_bstride = group * n_pos;
+    orow.out_bstride = group * hd;
+    orow.w_bstride_bytes = std::uint64_t{hd} * 4;
+    orow.div = group;
+    orow.x_inner = n_pos;
+    orow.out_inner = hd;
+    rec_paged_matmul(s, Kernel::kMatmulPagedTF32, pp, hd, n_pos,
+                     layer_off + v_offset, scores, out, orow, false,
+                     attn_splits(n, n_pos), n * q_dim);
+}
+
+/**
+ * Records causal MLA attention for n query tokens at positions
+ * base .. base + n - 1 of one layer. Every head reads the same
+ * latent rows, so the n * heads (token, head) pairs are the query
+ * rows of one matmul (each latent tile read once for all of them):
+ * S = C q_abs^T + K_pe q_pe^T, masked softmax, latent = C^T P.
+ * q is [token][head][nope + rope], q_abs and lat [token][head][rank].
+ */
+void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
+                  VulkanContext::Buffer q_abs, VulkanContext::Buffer scores,
+                  VulkanContext::Buffer lat, std::uint32_t n,
+                  std::uint32_t base, std::uint32_t heads, std::uint32_t rank,
+                  std::uint32_t nope, std::uint32_t rope_d,
+                  std::uint32_t layer_off, float kq_scale) {
+    const std::uint32_t n_pos = base + n;
+    const std::uint32_t rows = n * heads;
+    rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, rank, layer_off,
+                     q_abs, scores, MatmulRows{rows, 0, rank, 0, n_pos},
+                     false);
+    rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, rope_d,
+                     layer_off + rank, q, scores,
+                     MatmulRows{rows, nope, nope + rope_d, 0, n_pos}, true);
+    rec_softmax(s, scores, rows, n_pos, heads, base, kq_scale);
+    rec_paged_matmul(s, Kernel::kMatmulPagedTF32, pp, rank, n_pos, layer_off,
+                     scores, lat, MatmulRows{rows, 0, n_pos, 0, rank}, false,
+                     attn_splits(n, n_pos), rows * rank);
 }
 
 }  // namespace
@@ -840,6 +1005,8 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         std::as_bytes(std::span<const kv::BlockId>(seq.blocks)));
 
     const auto pool = pool_it->second;
+    const PagedPool pp{pool, s.table, geom.block_tokens, block_stride,
+                       kv_dim};
     const std::uint32_t eps_bits = fbits(hp.rms_eps);
     const std::uint32_t base_bits = fbits(hp.rope_freq_base);
     float corr_lo = 0.0f, corr_hi = 0.0f;
@@ -927,18 +1094,10 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     s.ctx.dispatch(Kernel::kRope, bufs, push,
                                    hp.n_kv_heads);
                 }
-                {
-                    const VulkanContext::Buffer bufs[] = {
-                        s.q, pool, s.table, s.att, s.attout};
-                    const std::uint32_t push[] = {
-                        hp.n_heads,   group,
-                        hp.head_dim,  kv_dim,
-                        pos + 1,      geom.block_tokens,
-                        block_stride, l * layer_stride,
-                        layer_stride / 2};
-                    s.ctx.dispatch(Kernel::kAttnPaged, bufs, push,
-                                   hp.n_heads);
-                }
+                rec_attn_gqa(s, pp, s.q, s.att, s.attout, 1, pos,
+                             hp.n_heads, group, hp.head_dim,
+                             hp.n_heads * hp.head_dim, l * layer_stride,
+                             layer_stride / 2);
             } else {
                 // R14 #45: K/V into F32 scratch (reuse the FFN
                 // gate/up buffers -- free until this layer's FFN),
@@ -1060,19 +1219,9 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                         h * qk, 1.0f);
                 }
             }
-            {
-                const VulkanContext::Buffer bufs[] = {
-                    s.q,   s.q_abs, pool,
-                    s.table, s.att,   s.latent};
-                const std::uint32_t push[] = {
-                    hp.n_heads,   rank,
-                    nope,         rope_d,
-                    pos + 1,      geom.block_tokens,
-                    block_stride, l * layer_stride,
-                    fbits(hp.kq_scale)};
-                s.ctx.dispatch(Kernel::kAttnMla, bufs, push,
-                               hp.n_heads);
-            }
+            rec_attn_mla(s, pp, s.q, s.q_abs, s.att, s.latent, 1, pos,
+                         hp.n_heads, rank, nope, rope_d, l * layer_stride,
+                         hp.kq_scale);
             if (!split) {
                 // W_uv rows of the dequantized fused wkv_b, head h
                 // at element (h * (nope + vd) + nope) * rank.
@@ -1319,6 +1468,8 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         std::as_bytes(std::span<const kv::BlockId>(seq.blocks)));
 
     const auto pool = pool_it->second;
+    const PagedPool pp{pool, s.table, geom.block_tokens, block_stride,
+                       kv_dim};
     const std::uint32_t eps_bits = fbits(hp.rms_eps);
     const std::uint32_t base_bits = fbits(hp.rope_freq_base);
     float corr_lo = 0.0f, corr_hi = 0.0f;
@@ -1416,14 +1567,8 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                       false);
             scatter_rows(bk, kv_dim, layer_off);
             scatter_rows(bv, kv_dim, layer_off + layer_stride / 2);
-            const VulkanContext::Buffer bufs[] = {bq, pool, s.table, batt,
-                                                  batt_out};
-            const std::uint32_t push[] = {
-                H,           group,           hd,
-                kv_dim,      base + 1,        geom.block_tokens,
-                block_stride, layer_off,      layer_stride / 2,
-                q_dim,       n_pos};
-            s.ctx.dispatch(Kernel::kAttnPagedB, bufs, push, H, n);
+            rec_attn_gqa(s, pp, bq, batt, batt_out, n, base, H, group, hd,
+                         q_dim, layer_off, layer_stride / 2);
         } else {
             const bool split = lay.wk_b.rows > 0;
             const auto divisors = s.rope_divisors({}, rope_d / 2);
@@ -1478,18 +1623,8 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                            s.upload(lay.wk_b.data, weight_bytes(lay.wk_b)),
                            bq, bqabs, absorb, false);
             }
-            {
-                const VulkanContext::Buffer bufs[] = {bq,   bqabs,   pool,
-                                                      s.table, batt, blat};
-                const std::uint32_t push[] = {
-                    H,            rank,
-                    nope,         rope_d,
-                    base + 1,     geom.block_tokens,
-                    block_stride, layer_off,
-                    fbits(hp.kq_scale), q_dim,
-                    H * rank,     n_pos};
-                s.ctx.dispatch(Kernel::kAttnMlaB, bufs, push, H, n);
-            }
+            rec_attn_mla(s, pp, bq, bqabs, batt, blat, n, base, H, rank, nope,
+                         rope_d, layer_off, hp.kq_scale);
             // Per-head W_uv projection of the latents.
             MatmulRows uv_rows{n, 0, H * rank, 0, att_dim};
             uv_rows.n_batch = H;

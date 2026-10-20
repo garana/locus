@@ -97,10 +97,14 @@ and GPU time (2: per kernel). On an M4 Max (MoltenVK) decode runs
 deepseek-coder-v2-lite Q8_0 (#94). Prompts ingest in chunks of up
 to 512 tokens as tiled GPU matmuls (vulkan_forward_batch: each
 weight read once per chunk, routed experts grouped per expert,
-token-exact to per-token prefill); on the same M4 Max prefill
-runs ~855 tok/s on a 2.5k-token prompt (llama-3.2-1b) and ~146
+token-exact to per-token prefill), and attention runs as matmuls
+over the paged pool (S = K Q^T, causal softmax, O = V^T P; a GQA
+group's query heads, or all MLA heads, share each K/V tile; a
+decode token splits O over positions). On the same M4 Max prefill
+runs ~1250 tok/s on a 2.5k-token prompt (llama-3.2-1b) and ~320
 tok/s on a 3.1k-token prompt (deepseek-coder-v2-lite), up from 66
-and 12 tok/s token by token. Every selectable backend must
+and 12 tok/s token by token, and decode after those prompts runs
+~67 and ~34 tok/s (was 37 and 5). Every selectable backend must
 reproduce the llama.cpp golden output token-exact (tested, single
 and concurrent streams). The Vulkan full-GPU path is validated
 end to end on a real MoE + MLA model: deepseek-v2-lite runs

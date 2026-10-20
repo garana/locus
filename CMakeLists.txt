@@ -136,9 +136,9 @@ if(Vulkan_FOUND)
             matvec matvec_f16 matvec_q8_0 matvec_q4_0 matvec_q5_0
             matvec_t matvec_q4_k matvec_q5_k matvec_q6_k matvec_q2_k
             matvec_iq2_xxs matvec_iq3_xxs matvec_iq4_xs
-            rmsnorm rope silu_mul attn_paged attn_mla
+            rmsnorm rope silu_mul
             attn_paged_q kv_store_q moe_route
-            kv_scatter moe_group moe_combine
+            kv_scatter moe_group moe_combine attn_softmax sum_splits
             # Variants: <kernel>=<source>:<define>[,<define>...], the
             # source compiled again with -D<define> for each.
             matvec_b=matvec:BATCHED
@@ -147,10 +147,10 @@ if(Vulkan_FOUND)
             matmul_q8_0=matmul:TYPE_Q8
             matmul_f32=matmul:TYPE_F32
             matmul_q8_0_id=matmul:TYPE_Q8,MOE_ID
+            matmul_paged_f32=matmul:TYPE_F32,PAGED
+            matmul_paged_t_f32=matmul:TYPE_F32,PAGED_T
             rmsnorm_b=rmsnorm:BATCHED
             rope_b=rope:BATCHED
-            attn_paged_b=attn_paged:BATCHED
-            attn_mla_b=attn_mla:BATCHED
             moe_route_b=moe_route:BATCHED)
         # Limits shared with the host, read from their one definition.
         set(LOCUS_VK_LIMITS

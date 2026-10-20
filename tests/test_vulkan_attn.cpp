@@ -64,6 +64,67 @@ void softmax(std::vector<double>& s) {
 
 }  // namespace
 
+namespace {
+
+/** Paged-pool geometry shared by the attention cases. */
+struct Paged {
+    VulkanContext::Buffer pool, table;
+    std::uint32_t bt, block_stride, row_w;
+};
+
+/** Split-K for a paged matmul: partial planes, then sum_splits. */
+struct Splits {
+    std::uint32_t n = 1;      // K splits
+    std::uint32_t plane = 0;  // output floats per partial plane
+    VulkanContext::Buffer scratch{};
+};
+
+/**
+ * Records one paged matmul (matmul.comp PAGED / PAGED_T) the way
+ * the forward does: W rows (or columns) are cache positions.
+ */
+void paged_matmul(VulkanContext& ctx, Kernel k, const Paged& pg,
+                  std::uint32_t rows, std::uint32_t cols,
+                  std::uint32_t n_tok, bool acc, std::uint32_t w_off,
+                  VulkanContext::Buffer x, std::uint32_t x_off,
+                  std::uint32_t x_stride, VulkanContext::Buffer out,
+                  std::uint32_t out_stride, std::uint32_t n_batch = 1,
+                  std::uint32_t w_bstride = 0, std::uint32_t x_bstride = 0,
+                  std::uint32_t out_bstride = 0, std::uint32_t w_bdiv = 1,
+                  std::uint32_t div = 1, std::uint32_t x_inner = 0,
+                  std::uint32_t out_inner = 0, const Splits& sp = {}) {
+    const std::uint32_t tiles = (n_tok + 63) / 64;
+    const VulkanContext::Buffer dst = sp.n > 1 ? sp.scratch : out;
+    const VulkanContext::Buffer bufs[] = {pg.pool, x, dst, pg.table};
+    const std::uint32_t push[] = {
+        rows,      cols,      n_tok,       acc ? 1u : 0u, w_off,
+        x_off,     x_stride,  0,           out_stride,    fbits(1.0f),
+        w_bstride, x_bstride, out_bstride, tiles,         div,
+        0,         w_bdiv,    pg.bt,       pg.block_stride, pg.row_w,
+        sp.n,      sp.plane,  x_inner,     out_inner};
+    ctx.dispatch(k, bufs, push, (rows + 63) / 64, tiles * n_batch * sp.n);
+    if (sp.n > 1) {
+        const VulkanContext::Buffer sbufs[] = {sp.scratch, out};
+        const std::uint32_t spush[] = {sp.plane, sp.n, 0, acc ? 1u : 0u};
+        ctx.dispatch(Kernel::kSumSplits, sbufs, spush,
+                     (sp.plane + 255) / 256);
+    }
+}
+
+void causal_softmax(VulkanContext& ctx, VulkanContext::Buffer s,
+                    std::uint32_t rows, std::uint32_t n_pos,
+                    std::uint32_t heads, std::uint32_t base, float scale) {
+    const VulkanContext::Buffer bufs[] = {s};
+    const std::uint32_t push[] = {n_pos, heads, base, fbits(scale), rows};
+    ctx.dispatch(Kernel::kAttnSoftmax, bufs, push, rows);
+}
+
+}  // namespace
+
+// Attention as matmuls over the paged pool (S = K Q^T, causal
+// softmax, O = V^T P), for n_q query tokens at the END of an n_pos
+// context: token t sits at position n_pos - n_q + t and attends to
+// positions 0 .. its own. n_q 1 is decode, n_q > 1 a prefill chunk.
 TEST_CASE("vulkan paged attention matches the CPU reference",
           "[vulkan]") {
     if (!VulkanContext::available()) {
@@ -72,83 +133,112 @@ TEST_CASE("vulkan paged attention matches the CPU reference",
     VulkanContext ctx;
     std::mt19937 rng(11);
 
-    // head_dim 160 > the 128-thread workgroup exercises the
-    // one-slice path; n_pos 300 > 128 the strided position loops.
+    // head_dim 160 is not a 64-row tile multiple; n_pos 37 leaves a
+    // ragged K step in O = V^T P; 300 spans several position tiles.
     const std::uint32_t head_dims[] = {64, 160};
     const std::uint32_t n_poss[] = {1, 37, 300};
+    const std::uint32_t n_qs[] = {1, 3};
     for (std::uint32_t head_dim : head_dims) {
         for (std::uint32_t n_pos : n_poss) {
-            DYNAMIC_SECTION("head_dim " << head_dim << " n_pos "
-                                        << n_pos) {
-                const std::uint32_t n_heads = 4, n_kv = 2;
-                const std::uint32_t group = n_heads / n_kv;
-                const std::uint32_t kv_dim = n_kv * head_dim;
-                const std::uint32_t bt = 16, n_layers = 2, layer = 1;
-                const std::uint32_t layer_stride = bt * kv_dim * 2;
-                const std::uint32_t block_stride =
-                    n_layers * layer_stride;
-                const std::uint32_t n_blocks = (n_pos + bt - 1) / bt;
-
-                auto q = random_floats(n_heads * head_dim, rng);
-                auto pool = random_floats(
-                    static_cast<std::size_t>(n_blocks) * block_stride,
-                    rng);
-                auto table = shuffled_table(n_blocks, rng);
-
-                auto kv_at = [&](std::uint32_t t, bool v,
-                                 std::uint32_t i) {
-                    return pool[table[t / bt] * block_stride +
-                                layer * layer_stride +
-                                (v ? layer_stride / 2 : 0) +
-                                (t % bt) * kv_dim + i];
-                };
-                std::vector<float> want(n_heads * head_dim);
-                for (std::uint32_t h = 0; h < n_heads; ++h) {
-                    const std::uint32_t kvh = (h / group) * head_dim;
-                    std::vector<double> s(n_pos);
-                    for (std::uint32_t t = 0; t < n_pos; ++t) {
-                        double d = 0.0;
-                        for (std::uint32_t i = 0; i < head_dim; ++i) {
-                            d += q[h * head_dim + i] *
-                                 kv_at(t, false, kvh + i);
-                        }
-                        s[t] = d / std::sqrt(double(head_dim));
-                    }
-                    softmax(s);
-                    for (std::uint32_t i = 0; i < head_dim; ++i) {
-                        double acc = 0.0;
-                        for (std::uint32_t t = 0; t < n_pos; ++t) {
-                            acc += s[t] * kv_at(t, true, kvh + i);
-                        }
-                        want[h * head_dim + i] =
-                            static_cast<float>(acc);
-                    }
+            for (std::uint32_t n_q : n_qs) {
+                if (n_q > n_pos) {
+                    continue;
                 }
+                DYNAMIC_SECTION("head_dim " << head_dim << " n_pos "
+                                            << n_pos << " n_q " << n_q) {
+                    const std::uint32_t n_heads = 4, n_kv = 2;
+                    const std::uint32_t group = n_heads / n_kv;
+                    const std::uint32_t kv_dim = n_kv * head_dim;
+                    const std::uint32_t q_dim = n_heads * head_dim;
+                    const std::uint32_t bt = 16, n_layers = 2, layer = 1;
+                    const std::uint32_t layer_stride = bt * kv_dim * 2;
+                    const std::uint32_t block_stride =
+                        n_layers * layer_stride;
+                    const std::uint32_t n_blocks = (n_pos + bt - 1) / bt;
+                    const std::uint32_t base = n_pos - n_q;
 
-                auto qb = upload(ctx, q);
-                auto pb = upload(ctx, pool);
-                auto tb = upload(ctx, table);
-                auto ab = ctx.create_buffer(n_heads * n_pos * 4);
-                auto ob = ctx.create_buffer(n_heads * head_dim * 4);
-                ctx.begin_batch();
-                const VulkanContext::Buffer bufs[] = {qb, pb, tb, ab,
-                                                      ob};
-                const std::uint32_t push[] = {
-                    n_heads,      group,
-                    head_dim,     kv_dim,
-                    n_pos,        bt,
-                    block_stride, layer * layer_stride,
-                    layer_stride / 2};
-                ctx.dispatch(Kernel::kAttnPaged, bufs, push, n_heads);
-                ctx.end_batch();
-                auto got = download(ctx, ob, want.size());
-                for (std::size_t i = 0; i < want.size(); ++i) {
-                    REQUIRE(got[i] == Catch::Approx(want[i])
-                                          .margin(1e-5)
-                                          .epsilon(1e-4));
-                }
-                for (auto b : {qb, pb, tb, ab, ob}) {
-                    ctx.destroy_buffer(b);
+                    auto q = random_floats(std::size_t{n_q} * q_dim, rng);
+                    auto pool = random_floats(
+                        static_cast<std::size_t>(n_blocks) * block_stride,
+                        rng);
+                    auto table = shuffled_table(n_blocks, rng);
+
+                    auto kv_at = [&](std::uint32_t t, bool v,
+                                     std::uint32_t i) {
+                        return pool[table[t / bt] * block_stride +
+                                    layer * layer_stride +
+                                    (v ? layer_stride / 2 : 0) +
+                                    (t % bt) * kv_dim + i];
+                    };
+                    std::vector<float> want(std::size_t{n_q} * q_dim);
+                    for (std::uint32_t tq = 0; tq < n_q; ++tq) {
+                        const std::uint32_t span = base + tq + 1;
+                        for (std::uint32_t h = 0; h < n_heads; ++h) {
+                            const std::uint32_t kvh = (h / group) * head_dim;
+                            const float* qh =
+                                q.data() + tq * q_dim + h * head_dim;
+                            std::vector<double> s(span);
+                            for (std::uint32_t t = 0; t < span; ++t) {
+                                double d = 0.0;
+                                for (std::uint32_t i = 0; i < head_dim; ++i) {
+                                    d += qh[i] * kv_at(t, false, kvh + i);
+                                }
+                                s[t] = d / std::sqrt(double(head_dim));
+                            }
+                            softmax(s);
+                            for (std::uint32_t i = 0; i < head_dim; ++i) {
+                                double acc = 0.0;
+                                for (std::uint32_t t = 0; t < span; ++t) {
+                                    acc += s[t] * kv_at(t, true, kvh + i);
+                                }
+                                want[tq * q_dim + h * head_dim + i] =
+                                    static_cast<float>(acc);
+                            }
+                        }
+                    }
+
+                    auto qb = upload(ctx, q);
+                    auto pb = upload(ctx, pool);
+                    auto tb = upload(ctx, table);
+                    auto sb = ctx.create_buffer(n_q * n_heads * n_pos * 4);
+                    auto ob = ctx.create_buffer(want.size() * 4);
+                    const Paged pg{pb, tb, bt, block_stride, kv_dim};
+                    // Decode splits O's K (positions) three ways.
+                    Splits sp;
+                    if (n_q == 1) {
+                        sp = {3, q_dim, ctx.create_buffer(3 * q_dim * 4)};
+                    }
+                    ctx.begin_batch();
+                    // One batch per K/V head; its query heads are
+                    // token rows t * group + i, as the forward does.
+                    paged_matmul(ctx, Kernel::kMatmulPagedF32, pg, n_pos,
+                                 head_dim, n_q * group, false,
+                                 layer * layer_stride, qb, 0, q_dim, sb,
+                                 n_heads * n_pos, n_kv, head_dim,
+                                 group * head_dim, group * n_pos, 1, group,
+                                 head_dim, n_pos);
+                    causal_softmax(ctx, sb, n_q * n_heads, n_pos, n_heads,
+                                   base,
+                                   1.0f / std::sqrt(float(head_dim)));
+                    paged_matmul(ctx, Kernel::kMatmulPagedTF32, pg, head_dim,
+                                 n_pos, n_q * group, false,
+                                 layer * layer_stride + layer_stride / 2, sb,
+                                 0, n_heads * n_pos, ob, q_dim, n_kv,
+                                 head_dim, group * n_pos, group * head_dim, 1,
+                                 group, n_pos, head_dim, sp);
+                    ctx.end_batch();
+                    if (sp.n > 1) {
+                        ctx.destroy_buffer(sp.scratch);
+                    }
+                    auto got = download(ctx, ob, want.size());
+                    for (std::size_t i = 0; i < want.size(); ++i) {
+                        REQUIRE(got[i] == Catch::Approx(want[i])
+                                              .margin(1e-5)
+                                              .epsilon(1e-4));
+                    }
+                    for (auto b : {qb, pb, tb, sb, ob}) {
+                        ctx.destroy_buffer(b);
+                    }
                 }
             }
         }
@@ -163,73 +253,92 @@ TEST_CASE("vulkan MLA attention matches the CPU reference",
     VulkanContext ctx;
     std::mt19937 rng(13);
 
-    // DeepSeek-V2-Lite geometry: rank 512 > the workgroup width.
+    // DeepSeek-V2-Lite geometry (rank 512, rope 64); the (token,
+    // head) pairs are the query rows of one matmul.
     const std::uint32_t n_poss[] = {5, 200};
+    const std::uint32_t n_qs[] = {1, 4};
     for (std::uint32_t n_pos : n_poss) {
-        DYNAMIC_SECTION("n_pos " << n_pos) {
-            const std::uint32_t n_heads = 3, rank = 512, nope = 128,
-                                rope = 64, qk = nope + rope;
-            const std::uint32_t row = rank + rope;
-            const std::uint32_t bt = 16, n_layers = 2, layer = 1;
-            const std::uint32_t layer_stride = bt * row;
-            const std::uint32_t block_stride = n_layers * layer_stride;
-            const std::uint32_t n_blocks = (n_pos + bt - 1) / bt;
-            const float kq_scale = 0.07f;
+        for (std::uint32_t n_q : n_qs) {
+            DYNAMIC_SECTION("n_pos " << n_pos << " n_q " << n_q) {
+                const std::uint32_t n_heads = 3, rank = 512, nope = 128,
+                                    rope = 64, qk = nope + rope;
+                const std::uint32_t row = rank + rope;
+                const std::uint32_t bt = 16, n_layers = 2, layer = 1;
+                const std::uint32_t layer_stride = bt * row;
+                const std::uint32_t block_stride = n_layers * layer_stride;
+                const std::uint32_t n_blocks = (n_pos + bt - 1) / bt;
+                const std::uint32_t base = n_pos - n_q;
+                const std::uint32_t rows = n_q * n_heads;
+                const float kq_scale = 0.07f;
 
-            auto q = random_floats(n_heads * qk, rng);
-            auto qa = random_floats(n_heads * rank, rng);
-            auto pool = random_floats(
-                static_cast<std::size_t>(n_blocks) * block_stride, rng);
-            auto table = shuffled_table(n_blocks, rng);
+                auto q = random_floats(std::size_t{rows} * qk, rng);
+                auto qa = random_floats(std::size_t{rows} * rank, rng);
+                auto pool = random_floats(
+                    static_cast<std::size_t>(n_blocks) * block_stride, rng);
+                auto table = shuffled_table(n_blocks, rng);
 
-            auto lat_at = [&](std::uint32_t t, std::uint32_t i) {
-                return pool[table[t / bt] * block_stride +
-                            layer * layer_stride + (t % bt) * row + i];
-            };
-            std::vector<float> want(n_heads * rank);
-            for (std::uint32_t h = 0; h < n_heads; ++h) {
-                std::vector<double> s(n_pos);
-                for (std::uint32_t t = 0; t < n_pos; ++t) {
-                    double d = 0.0;
+                auto lat_at = [&](std::uint32_t t, std::uint32_t i) {
+                    return pool[table[t / bt] * block_stride +
+                                layer * layer_stride + (t % bt) * row + i];
+                };
+                std::vector<float> want(std::size_t{rows} * rank);
+                for (std::uint32_t j = 0; j < rows; ++j) {
+                    const std::uint32_t span = base + j / n_heads + 1;
+                    std::vector<double> s(span);
+                    for (std::uint32_t t = 0; t < span; ++t) {
+                        double d = 0.0;
+                        for (std::uint32_t i = 0; i < rank; ++i) {
+                            d += qa[j * rank + i] * lat_at(t, i);
+                        }
+                        for (std::uint32_t i = 0; i < rope; ++i) {
+                            d += q[j * qk + nope + i] * lat_at(t, rank + i);
+                        }
+                        s[t] = d * kq_scale;
+                    }
+                    softmax(s);
                     for (std::uint32_t i = 0; i < rank; ++i) {
-                        d += qa[h * rank + i] * lat_at(t, i);
+                        double acc = 0.0;
+                        for (std::uint32_t t = 0; t < span; ++t) {
+                            acc += s[t] * lat_at(t, i);
+                        }
+                        want[j * rank + i] = static_cast<float>(acc);
                     }
-                    for (std::uint32_t i = 0; i < rope; ++i) {
-                        d += q[h * qk + nope + i] * lat_at(t, rank + i);
-                    }
-                    s[t] = d * kq_scale;
                 }
-                softmax(s);
-                for (std::uint32_t i = 0; i < rank; ++i) {
-                    double acc = 0.0;
-                    for (std::uint32_t t = 0; t < n_pos; ++t) {
-                        acc += s[t] * lat_at(t, i);
-                    }
-                    want[h * rank + i] = static_cast<float>(acc);
-                }
-            }
 
-            auto qb = upload(ctx, q);
-            auto qab = upload(ctx, qa);
-            auto pb = upload(ctx, pool);
-            auto tb = upload(ctx, table);
-            auto ab = ctx.create_buffer(n_heads * n_pos * 4);
-            auto lb = ctx.create_buffer(n_heads * rank * 4);
-            ctx.begin_batch();
-            const VulkanContext::Buffer bufs[] = {qb, qab, pb,
-                                                  tb, ab,  lb};
-            const std::uint32_t push[] = {
-                n_heads,      rank, nope, rope, n_pos, bt,
-                block_stride, layer * layer_stride, fbits(kq_scale)};
-            ctx.dispatch(Kernel::kAttnMla, bufs, push, n_heads);
-            ctx.end_batch();
-            auto got = download(ctx, lb, want.size());
-            for (std::size_t i = 0; i < want.size(); ++i) {
-                REQUIRE(got[i] ==
-                        Catch::Approx(want[i]).margin(1e-5).epsilon(1e-4));
-            }
-            for (auto b : {qb, qab, pb, tb, ab, lb}) {
-                ctx.destroy_buffer(b);
+                auto qb = upload(ctx, q);
+                auto qab = upload(ctx, qa);
+                auto pb = upload(ctx, pool);
+                auto tb = upload(ctx, table);
+                auto sb = ctx.create_buffer(rows * n_pos * 4);
+                auto lb = ctx.create_buffer(want.size() * 4);
+                const Paged pg{pb, tb, bt, block_stride, row};
+                const std::uint32_t lo = layer * layer_stride;
+                Splits sp;
+                if (n_q == 1) {
+                    const std::uint32_t plane = rows * rank;
+                    sp = {3, plane, ctx.create_buffer(3 * plane * 4)};
+                }
+                ctx.begin_batch();
+                paged_matmul(ctx, Kernel::kMatmulPagedF32, pg, n_pos, rank,
+                             rows, false, lo, qab, 0, rank, sb, n_pos);
+                paged_matmul(ctx, Kernel::kMatmulPagedF32, pg, n_pos, rope,
+                             rows, true, lo + rank, qb, nope, qk, sb, n_pos);
+                causal_softmax(ctx, sb, rows, n_pos, n_heads, base, kq_scale);
+                paged_matmul(ctx, Kernel::kMatmulPagedTF32, pg, rank, n_pos,
+                             rows, false, lo, sb, 0, n_pos, lb, rank, 1, 0,
+                             0, 0, 1, 1, 0, 0, sp);
+                ctx.end_batch();
+                if (sp.n > 1) {
+                    ctx.destroy_buffer(sp.scratch);
+                }
+                auto got = download(ctx, lb, want.size());
+                for (std::size_t i = 0; i < want.size(); ++i) {
+                    REQUIRE(got[i] ==
+                            Catch::Approx(want[i]).margin(1e-5).epsilon(1e-4));
+                }
+                for (auto b : {qb, qab, pb, tb, sb, lb}) {
+                    ctx.destroy_buffer(b);
+                }
             }
         }
     }
