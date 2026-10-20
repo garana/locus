@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -439,5 +440,56 @@ TEST_CASE("vulkan batched prefill tracks per-token prefill",
     }
     if (ran == 0) {
         SKIP("no prefill test model present (llama-3.2-1b-q8_0.gguf)");
+    }
+}
+
+// Hidden micro-benchmark for matmul.comp tuning; run explicitly:
+//   ./build/tests/locus_tests "bench: vulkan matmul"
+TEST_CASE("bench: vulkan matmul throughput", "[.][bench][vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(53);
+    const std::uint32_t n_tok = 512, reps = 20;
+    struct Shape {
+        std::uint32_t rows, cols;
+    };
+    for (const Shape sh : {Shape{2048, 2048}, Shape{8192, 2048},
+                           Shape{2048, 8192}}) {
+        const auto w = random_q8(sh.rows, sh.cols, rng);
+        const auto x = random_f32(std::size_t{n_tok} * sh.cols, rng);
+        auto wb = upload(ctx, w);
+        auto xb = upload(ctx, x);
+        auto ob = ctx.create_buffer(std::size_t{n_tok} * sh.rows * 4);
+        const std::uint32_t TR = VulkanContext::kMatmulTileRows;
+        const std::uint32_t TT = VulkanContext::kMatmulTileToks;
+        const std::uint32_t tiles = (n_tok + TT - 1) / TT;
+        const std::uint32_t push[] = {
+            sh.rows, sh.cols, n_tok, 0, 0, 0, sh.cols, 0, sh.rows,
+            fbits(1.0f), 0, 0, 0, tiles, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0};
+        const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+        auto run = [&](std::uint32_t n) {
+            ctx.begin_batch();
+            for (std::uint32_t i = 0; i < n; ++i) {
+                ctx.dispatch(Kernel::kMatmulQ8_0, bufs, push,
+                             (sh.rows + TR - 1) / TR, tiles);
+            }
+            ctx.end_batch();
+        };
+        run(2);  // warm-up
+        const auto t0 = std::chrono::steady_clock::now();
+        run(reps);
+        const double s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+        const double flop =
+            2.0 * sh.rows * sh.cols * n_tok * static_cast<double>(reps);
+        WARN("q8_0 " << sh.rows << "x" << sh.cols << " x " << n_tok
+                     << " tok: " << s / reps * 1e3 << " ms, "
+                     << flop / s / 1e12 << " TFLOPS");
+        for (auto b : {wb, xb, ob}) {
+            ctx.destroy_buffer(b);
+        }
     }
 }

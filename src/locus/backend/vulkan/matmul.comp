@@ -39,16 +39,24 @@
 // MOE_ID token tile is 16 wide (a 64-token tile would multiply
 // mostly padding).
 
-#define BM 64u
-#define BK 32u
-#define TM 4u
-#ifdef MOE_ID
-#define BN 16u
-#define TN 1u
-#else
-#define BN 64u
+// 16 x 16 threads, each owning TM contiguous weight rows by TN
+// contiguous tokens (both multiples of 4, read from shared memory as
+// vec4s): the tile is BM = 16 TM rows by BN = 16 TN tokens, staged BK
+// columns at a time (BK divides 32, so a K step never straddles a
+// Q8_0 block).
+#ifndef TM
+#define TM 8u
+#endif
+#ifndef TN
 #define TN 4u
 #endif
+#ifndef BK
+#define BK 32u
+#endif
+#define BM (16u * TM)
+#define BN (16u * TN)
+// Weight values each thread stages per K step (whole uint words).
+#define VPT (BM * BK / 256u)
 
 layout(local_size_x = 256) in;
 
@@ -93,8 +101,8 @@ layout(push_constant) uniform PC {
     uint out_inner;
 } pc;
 
-shared float ws[BK][BM];
-shared float xs[BK][BN];
+shared vec4 ws[BK][BM / 4u];
+shared vec4 xs[BK][BN / 4u];
 shared uint rows_x[BN];
 shared uint rows_o[BN];
 
@@ -171,20 +179,20 @@ void main() {
 #endif
     barrier();
 
-    // Compute layout: 16 x 16 threads, each owning rows ty + 16 i
-    // and tokens tx + 16 j (strided so shared reads spread banks).
+    // Compute layout: 16 x 16 threads; thread (tx, ty) owns rows
+    // ty * TM .. + TM and tokens tx * TN .. + TN of the tile.
     uint tx = tid % 16u;
     uint ty = tid / 16u;
-    float acc[TM][TN];
+    vec4 acc[TM][TN / 4u];
     for (uint i = 0u; i < TM; ++i) {
-        for (uint j = 0u; j < TN; ++j) {
-            acc[i][j] = 0.0;
+        for (uint j = 0u; j < TN / 4u; ++j) {
+            acc[i][j] = vec4(0.0);
         }
     }
 
-    // Weight loader: 4 threads per row, 8 values each.
-    uint lr = tid >> 2;
-    uint sub = tid & 3u;
+    // Weight loader: BK / VPT threads per row, VPT values each.
+    uint lr = tid / (BK / VPT);
+    uint sub = tid % (BK / VPT);
     for (uint k0 = k_begin; k0 < k_end; k0 += BK) {
         // Weights: row r0 + lr, columns k0 + sub*8 .. +8.
         uint r = r0 + lr;
@@ -192,25 +200,30 @@ void main() {
         if (r < pc.rows) {
             uint at = wbase + r * (pc.cols / 32u) * 34u + (k0 / 32u) * 34u;
             float d = unpackHalf2x16(word_at(at) & 0xffffu).x;
-            for (uint h = 0u; h < 2u; ++h) {
-                int q = int(word_at(at + 2u + sub * 8u + h * 4u));
-                uint c = sub * 8u + h * 4u;
-                ws[c][lr] = d * float(bitfieldExtract(q, 0, 8));
-                ws[c + 1u][lr] = d * float(bitfieldExtract(q, 8, 8));
-                ws[c + 2u][lr] = d * float(bitfieldExtract(q, 16, 8));
-                ws[c + 3u][lr] = d * float(bitfieldExtract(q, 24, 8));
+            uint q0 = at + 2u + k0 % 32u + sub * VPT;
+            for (uint h = 0u; h < VPT / 4u; ++h) {
+                int q = int(word_at(q0 + h * 4u));
+                uint c = sub * VPT + h * 4u;
+                ws[c][lr / 4u][lr % 4u] =
+                    d * float(bitfieldExtract(q, 0, 8));
+                ws[c + 1u][lr / 4u][lr % 4u] =
+                    d * float(bitfieldExtract(q, 8, 8));
+                ws[c + 2u][lr / 4u][lr % 4u] =
+                    d * float(bitfieldExtract(q, 16, 8));
+                ws[c + 3u][lr / 4u][lr % 4u] =
+                    d * float(bitfieldExtract(q, 24, 8));
             }
         } else {
-            for (uint c = sub * 8u; c < sub * 8u + 8u; ++c) {
-                ws[c][lr] = 0.0;
+            for (uint c = sub * VPT; c < sub * VPT + VPT; ++c) {
+                ws[c][lr / 4u][lr % 4u] = 0.0;
             }
         }
 #else
-        for (uint c = sub * 8u; c < sub * 8u + 8u; ++c) {
+        for (uint c = sub * VPT; c < sub * VPT + VPT; ++c) {
             uint kc = k0 + c;
-            ws[c][lr] = (r < pc.rows && kc < k_end)
-                            ? w_at(wbase, r, kc)
-                            : 0.0;
+            ws[c][lr / 4u][lr % 4u] = (r < pc.rows && kc < k_end)
+                                          ? w_at(wbase, r, kc)
+                                          : 0.0;
         }
 #endif
         // Activations: BN tokens x BK columns, strided over threads.
@@ -218,23 +231,23 @@ void main() {
             uint tl = idx / BK;
             uint c = idx % BK;
             uint kc = k0 + c;
-            xs[c][tl] = (tl < n_here && kc < k_end)
-                            ? x[rows_x[tl] + kc]
-                            : 0.0;
+            xs[c][tl / 4u][tl % 4u] = (tl < n_here && kc < k_end)
+                                          ? x[rows_x[tl] + kc]
+                                          : 0.0;
         }
         barrier();
         for (uint k = 0u; k < BK; ++k) {
-            float a[TM];
-            float bv[TN];
-            for (uint i = 0u; i < TM; ++i) {
-                a[i] = ws[k][ty + 16u * i];
+            vec4 a[TM / 4u];
+            vec4 bv[TN / 4u];
+            for (uint i = 0u; i < TM / 4u; ++i) {
+                a[i] = ws[k][ty * (TM / 4u) + i];
             }
-            for (uint j = 0u; j < TN; ++j) {
-                bv[j] = xs[k][tx + 16u * j];
+            for (uint j = 0u; j < TN / 4u; ++j) {
+                bv[j] = xs[k][tx * (TN / 4u) + j];
             }
             for (uint i = 0u; i < TM; ++i) {
-                for (uint j = 0u; j < TN; ++j) {
-                    acc[i][j] += a[i] * bv[j];
+                for (uint j = 0u; j < TN / 4u; ++j) {
+                    acc[i][j] += a[i / 4u][i % 4u] * bv[j];
                 }
             }
         }
@@ -242,17 +255,17 @@ void main() {
     }
 
     for (uint j = 0u; j < TN; ++j) {
-        uint tl = tx + 16u * j;
+        uint tl = tx * TN + j;
         if (tl >= n_here) {
             continue;
         }
         for (uint i = 0u; i < TM; ++i) {
-            uint r = r0 + ty + 16u * i;
+            uint r = r0 + ty * TM + i;
             if (r >= pc.rows) {
                 continue;
             }
             uint at = rows_o[tl] + r + ks * pc.split_stride;
-            float v = acc[i][j] * pc.scale;
+            float v = acc[i][j / 4u][j % 4u] * pc.scale;
             o[at] = pc.accumulate != 0u && pc.k_splits == 1u ? o[at] + v
                                                              : v;
         }

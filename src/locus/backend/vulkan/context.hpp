@@ -107,6 +107,13 @@ class VulkanContext {
     static bool profiling();
 
     /**
+     * matmul.comp tile: weight rows and tokens per workgroup (the
+     * shader's BM = 16 TM and BN = 16 TN; keep them in sync).
+     */
+    static constexpr std::uint32_t kMatmulTileRows = 128;
+    static constexpr std::uint32_t kMatmulTileToks = 64;
+
+    /**
      * Device memory this context can still allocate, per
      * memory_available_from() (mem_fit.hpp): VK_EXT_memory_budget
      * when the device has it, else 3/4 of the heap minus this
