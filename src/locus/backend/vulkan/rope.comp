@@ -3,6 +3,10 @@
 // Interleaved-pair RoPE, one invocation per head, rotating in
 // place at `offset + h*stride`. Supports llama frequency factors
 // (divisors buffer) and YARN corrections (freq_scale != 1).
+//
+// Compiled again with -DBATCHED (rope_b): workgroup y rotates row y
+// of a prefill chunk, at position pos + y and offset + y *
+// row_stride.
 
 layout(local_size_x = 1) in;
 
@@ -21,6 +25,9 @@ layout(push_constant) uniform PC {
     float freq_scale; // YARN: 1/scaling_factor; 1.0 = off
     float corr_lo;    // YARN correction dims (precomputed)
     float corr_hi;
+#ifdef BATCHED
+    uint row_stride;  // floats between consecutive token rows
+#endif
 } pc;
 
 void main() {
@@ -29,9 +36,14 @@ void main() {
         return;
     }
     uint base = pc.offset + h * pc.stride;
+    uint pos = pc.pos;
+#ifdef BATCHED
+    base += gl_WorkGroupID.y * pc.row_stride;
+    pos += gl_WorkGroupID.y;
+#endif
     for (uint i = 0; i + 1u < pc.head_dim; i += 2u) {
         float theta_extrap =
-            float(pc.pos) *
+            float(pos) *
             pow(pc.freq_base, -float(i) / float(pc.head_dim));
         float theta = theta_extrap;
         if (pc.freq_scale != 1.0) {

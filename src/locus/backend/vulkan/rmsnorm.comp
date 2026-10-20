@@ -3,6 +3,10 @@
 // RMS norm: out[out_off + i] = x[i] * w[i] / sqrt(mean+eps),
 // over the first n elements of X. One workgroup: threads stride the
 // elements and the sum of squares is reduced in shared memory.
+//
+// Compiled again with -DBATCHED (rmsnorm_b): workgroup y normalizes
+// row y, read at in_off + y * in_stride and written at out_off +
+// y * out_stride (a prefill chunk's rows in one dispatch).
 
 #define WG 256u
 
@@ -16,15 +20,27 @@ layout(push_constant) uniform PC {
     uint n;
     float eps;
     uint out_off;
+#ifdef BATCHED
+    uint in_off;
+    uint in_stride;
+    uint out_stride;
+#endif
 } pc;
 
 shared float red[WG];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
+#ifdef BATCHED
+    uint xi = pc.in_off + gl_WorkGroupID.y * pc.in_stride;
+    uint oi = pc.out_off + gl_WorkGroupID.y * pc.out_stride;
+#else
+    uint xi = 0u;
+    uint oi = pc.out_off;
+#endif
     float ss = 0.0;
     for (uint i = tid; i < pc.n; i += WG) {
-        ss += x[i] * x[i];
+        ss += x[xi + i] * x[xi + i];
     }
     red[tid] = ss;
     barrier();
@@ -36,6 +52,6 @@ void main() {
     }
     float scale = inversesqrt(red[0] / float(pc.n) + pc.eps);
     for (uint i = tid; i < pc.n; i += WG) {
-        o[pc.out_off + i] = x[i] * scale * w[i];
+        o[oi + i] = x[xi + i] * scale * w[i];
     }
 }

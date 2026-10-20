@@ -33,6 +33,19 @@ enum class Kernel {
     kMatvecF16B,
     kMatvecQ8_0B,
     kMoeRoute,
+    /** Prefill (batched forward over a chunk of tokens). */
+    kMatmulQ8_0,
+    kMatmulF32,
+    kMatmulQ8_0Id,
+    kKvScatter,
+    kMoeGroup,
+    kMoeCombine,
+    /** -DBATCHED variants: workgroup y = token row of the chunk. */
+    kRmsNormB,
+    kRopeB,
+    kAttnPagedB,
+    kAttnMlaB,
+    kMoeRouteB,
     kCount_,
 };
 

@@ -108,8 +108,9 @@ class Engine {
          * kQ8/kQ4 shrink the resident cache and require a CPU
          * backend (GPU external KV storage is F32-only). */
         kv::KvType kv_type = kv::KvType::kF32;
-        /** Max prompt tokens prefetched per step across seqs. */
-        std::uint32_t prefill_budget = 64;
+        /** Max prompt tokens prefetched per step across seqs;
+         * 0 = the model's preferred chunk (prefill_chunk()). */
+        std::uint32_t prefill_budget = 0;
         /** Decode headroom required at admission, in tokens. */
         std::uint32_t decode_headroom = 16;
         /** Cap on simultaneously running sequences. */

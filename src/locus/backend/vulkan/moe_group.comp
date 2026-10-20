@@ -1,0 +1,39 @@
+#version 450
+
+// Groups a prefill chunk's routed (token, slot) pairs by expert for
+// the MOE_ID matmul: reads ROUTE (per token: k ids, then k weights,
+// as moe_route writes them, token t at t * 2k) and writes IDS as
+// counts[n_expert] followed by n_expert lists of cap pair ids
+// (pair p = t * k + slot). One workgroup; the order within a list
+// is arbitrary, which is harmless since every pair's output row is
+// computed independently.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer R { uint route[]; };
+layout(std430, binding = 1) writeonly buffer IDS { uint ids[]; };
+
+layout(push_constant) uniform PC {
+    uint n_tok;
+    uint k;
+    uint n_expert;  // <= 256
+    uint cap;       // list capacity per expert (>= n_tok)
+} pc;
+
+shared uint cnt[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    cnt[tid] = 0u;
+    barrier();
+    for (uint p = tid; p < pc.n_tok * pc.k; p += 256u) {
+        uint t = p / pc.k;
+        uint e = route[t * 2u * pc.k + p % pc.k];
+        uint at = atomicAdd(cnt[e], 1u);
+        ids[pc.n_expert + e * pc.cap + at] = p;
+    }
+    barrier();
+    if (tid < pc.n_expert) {
+        ids[tid] = cnt[tid];
+    }
+}

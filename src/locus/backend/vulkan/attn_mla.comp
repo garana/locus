@@ -11,6 +11,12 @@
 // split the positions for the scores and the softmax (max and sum
 // reduced through shared memory), then (dim, position-slice) pairs
 // for the weighted sum, whose slices are summed at the end.
+//
+// Compiled again with -DBATCHED (attn_mla_b): workgroup y is query token y
+// of a prefill chunk, at position n_pos - 1 + y (so it attends over
+// n_pos + y positions), with its Q rows at y * q_stride, its
+// QABS/latent rows at y * qa_stride and its ATT rows at
+// (y * n_heads + h) * att_stride.
 
 #define WG 128u
 
@@ -33,6 +39,11 @@ layout(push_constant) uniform PC {
     uint block_stride;  // floats per block
     uint layer_offset;  // floats: layer * layer_stride
     float kq_scale;
+#ifdef BATCHED
+    uint q_stride;      // floats between token rows of Q
+    uint qa_stride;     // floats between token rows of QABS and L
+    uint att_stride;    // floats per ATT row (>= last n_pos)
+#endif
 } pc;
 
 shared float red[WG];
@@ -85,10 +96,19 @@ void main() {
     uint qk = pc.nope + pc.rope;
     uint qpe = h * qk + pc.nope;  // roped q_pe of this head
     uint qah = h * pc.rank;
+#ifdef BATCHED
+    uint y = gl_WorkGroupID.y;
+    uint n_pos = pc.n_pos + y;
+    qpe += y * pc.q_stride;
+    qah += y * pc.qa_stride;
+    uint arow = (y * pc.n_heads + h) * pc.att_stride;
+#else
+    uint n_pos = pc.n_pos;
     uint arow = h * pc.n_pos;
+#endif
 
     float mx = -3.4e38;
-    for (uint t = tid; t < pc.n_pos; t += WG) {
+    for (uint t = tid; t < n_pos; t += WG) {
         uint rb = row_base(t);
         float s = 0.0;
         for (uint i = 0; i < pc.rank; ++i) {
@@ -103,7 +123,7 @@ void main() {
     }
     mx = reduce_max(mx);
     float sum = 0.0;
-    for (uint t = tid; t < pc.n_pos; t += WG) {
+    for (uint t = tid; t < n_pos; t += WG) {
         float e = exp(att[arow + t] - mx);
         att[arow + t] = e;
         sum += e;
@@ -115,7 +135,7 @@ void main() {
     for (uint idx = tid; idx < pc.rank * np; idx += WG) {
         uint i = idx % pc.rank;
         float acc = 0.0;
-        for (uint t = idx / pc.rank; t < pc.n_pos; t += np) {
+        for (uint t = idx / pc.rank; t < n_pos; t += np) {
             acc += att[arow + t] * pool[row_base(t) + i];
         }
         part[idx] = acc;

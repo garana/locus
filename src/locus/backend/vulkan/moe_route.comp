@@ -13,6 +13,10 @@
 // gate probabilities) and selection-score scratch. ROUTE receives
 // ids[k] then the k weights as float bits -- the layout the
 // batched matvec kernels read.
+//
+// Compiled again with -DBATCHED (moe_route_b): workgroup y routes
+// token y of a prefill chunk, its L rows at y * l_stride and its
+// route at y * r_stride.
 
 layout(local_size_x = 256) in;
 
@@ -29,6 +33,10 @@ layout(push_constant) uniform PC {
     uint n_group_used;
     uint norm;          // normalize picked weights to sum 1
     float scale;
+#ifdef BATCHED
+    uint l_stride;
+    uint r_stride;
+#endif
 } pc;
 
 #define WG 256u
@@ -71,30 +79,37 @@ float reduce_sum(float v) {
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
+#ifdef BATCHED
+    uint lb = gl_WorkGroupID.y * pc.l_stride;
+    uint rb = gl_WorkGroupID.y * pc.r_stride;
+#else
+    uint lb = 0u;
+    uint rb = 0u;
+#endif
     uint n = pc.n_expert;
     if (pc.sigmoid == 0u) {
         float mx = TAKEN;
         for (uint e = tid; e < n; e += WG) {
-            mx = max(mx, l[e]);
+            mx = max(mx, l[lb + e]);
         }
         mx = reduce_max(mx);
         float sum = 0.0;
         for (uint e = tid; e < n; e += WG) {
-            float v = exp(l[e] - mx);
-            l[e] = v;
+            float v = exp(l[lb + e] - mx);
+            l[lb + e] = v;
             sum += v;
         }
         sum = reduce_sum(sum);
         for (uint e = tid; e < n; e += WG) {
-            l[e] /= sum;
+            l[lb + e] /= sum;
         }
     } else {
         for (uint e = tid; e < n; e += WG) {
-            l[e] = 1.0 / (1.0 + exp(-l[e]));
+            l[lb + e] = 1.0 / (1.0 + exp(-l[lb + e]));
         }
     }
     for (uint e = tid; e < n; e += WG) {
-        l[n + e] = l[e] + (pc.has_bias != 0u ? bias[e] : 0.0);
+        l[lb + n + e] = l[lb + e] + (pc.has_bias != 0u ? bias[e] : 0.0);
     }
     memoryBarrierBuffer();
     barrier();
@@ -110,7 +125,7 @@ void main() {
                 }
                 float top1 = -1e30, top2 = -1e30;
                 for (uint e = gi * per; e < (gi + 1u) * per; ++e) {
-                    float s = l[n + e];
+                    float s = l[lb + n + e];
                     if (s > top1) {
                         top2 = top1;
                         top1 = s;
@@ -128,7 +143,7 @@ void main() {
         }
         for (uint e = 0u; e < n; ++e) {
             if ((keep & (1u << (e / per))) == 0u) {
-                l[n + e] = -1e30;
+                l[lb + n + e] = -1e30;
             }
         }
     }
@@ -140,7 +155,7 @@ void main() {
         float bv = TAKEN;
         uint bi = n;
         for (uint e = tid; e < n; e += WG) {
-            float v = l[n + e];
+            float v = l[lb + n + e];
             if (bi == n || v > bv) {
                 bv = v;
                 bi = e;
@@ -163,7 +178,7 @@ void main() {
         }
         if (tid == 0u) {
             picked[j] = si[0];
-            l[n + si[0]] = TAKEN;
+            l[lb + n + si[0]] = TAKEN;
         }
         memoryBarrierBuffer();
         barrier();
@@ -171,15 +186,15 @@ void main() {
     if (tid == 0u) {
         float wsum = 0.0;
         for (uint j = 0u; j < pc.k; ++j) {
-            wsum += l[picked[j]];
+            wsum += l[lb + picked[j]];
         }
         if (pc.norm == 0u) {
             wsum = 1.0;
         }
         for (uint j = 0u; j < pc.k; ++j) {
-            route[j] = picked[j];
-            route[pc.k + j] =
-                floatBitsToUint(l[picked[j]] / wsum * pc.scale);
+            route[rb + j] = picked[j];
+            route[rb + pc.k + j] =
+                floatBitsToUint(l[lb + picked[j]] / wsum * pc.scale);
         }
     }
 }

@@ -54,7 +54,11 @@ void VulkanContext::report_profile() const {
         "matvec_t",     "rmsnorm",      "rope",
         "silu_mul",     "attn_paged",   "attn_mla",
         "attn_paged_q", "kv_store_q",   "matvec_f32_b",
-        "matvec_f16_b", "matvec_q8_0_b", "moe_route"};
+        "matvec_f16_b", "matvec_q8_0_b", "moe_route",
+        "matmul_q8_0",  "matmul_f32",   "matmul_q8_0_id",
+        "kv_scatter",   "moe_group",    "moe_combine",
+        "rmsnorm_b",    "rope_b",       "attn_paged_b",
+        "attn_mla_b",   "moe_route_b"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -91,10 +95,16 @@ void VulkanContext::report_profile() const {
 #include <unordered_map>
 #include <vector>
 
+#include "attn_mla_b_spv.h"
 #include "attn_mla_spv.h"
+#include "attn_paged_b_spv.h"
 #include "attn_paged_q_spv.h"
 #include "attn_paged_spv.h"
+#include "kv_scatter_spv.h"
 #include "kv_store_q_spv.h"
+#include "matmul_f32_spv.h"
+#include "matmul_q8_0_id_spv.h"
+#include "matmul_q8_0_spv.h"
 #include "matvec_b_spv.h"
 #include "matvec_f16_b_spv.h"
 #include "matvec_f16_spv.h"
@@ -109,10 +119,15 @@ void VulkanContext::report_profile() const {
 #include "matvec_iq4_xs_spv.h"
 #include "matvec_q8_0_b_spv.h"
 #include "matvec_q8_0_spv.h"
+#include "moe_combine_spv.h"
+#include "moe_group_spv.h"
+#include "moe_route_b_spv.h"
 #include "moe_route_spv.h"
 #include "matvec_spv.h"
 #include "matvec_t_spv.h"
+#include "rmsnorm_b_spv.h"
 #include "rmsnorm_spv.h"
+#include "rope_b_spv.h"
 #include "rope_spv.h"
 #include "silu_mul_spv.h"
 
@@ -178,6 +193,18 @@ const KernelDesc& kernel_desc(Kernel k) {
         {locus_matvec_q8_0_b_spv, sizeof(locus_matvec_q8_0_b_spv),
          4, 48},
         {locus_moe_route_spv, sizeof(locus_moe_route_spv), 3, 32},
+        {locus_matmul_q8_0_spv, sizeof(locus_matmul_q8_0_spv), 3, 64},
+        {locus_matmul_f32_spv, sizeof(locus_matmul_f32_spv), 3, 64},
+        {locus_matmul_q8_0_id_spv, sizeof(locus_matmul_q8_0_id_spv), 4,
+         64},
+        {locus_kv_scatter_spv, sizeof(locus_kv_scatter_spv), 3, 32},
+        {locus_moe_group_spv, sizeof(locus_moe_group_spv), 2, 16},
+        {locus_moe_combine_spv, sizeof(locus_moe_combine_spv), 3, 8},
+        {locus_rmsnorm_b_spv, sizeof(locus_rmsnorm_b_spv), 3, 24},
+        {locus_rope_b_spv, sizeof(locus_rope_b_spv), 2, 40},
+        {locus_attn_paged_b_spv, sizeof(locus_attn_paged_b_spv), 5, 44},
+        {locus_attn_mla_b_spv, sizeof(locus_attn_mla_b_spv), 6, 48},
+        {locus_moe_route_b_spv, sizeof(locus_moe_route_b_spv), 3, 40},
     };
     static_assert(std::size(descs) ==
                   static_cast<std::size_t>(Kernel::kCount_));

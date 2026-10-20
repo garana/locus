@@ -16,6 +16,9 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
       cache_(m.make_cache(cfg.n_blocks, cfg.kv_type)),
       ws_(m.make_workspace()),
       logits_(m.hparams().n_vocab) {
+    if (cfg_.prefill_budget == 0) {
+        cfg_.prefill_budget = m.prefill_chunk();
+    }
     if (cfg_.prefix_cache) {
         prefix_cache_ = std::make_unique<PrefixCache>(
             cache_, cfg_.prefix_cache_slots);
@@ -169,7 +172,7 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
         // amortization -- a follow-up could reclaim for the chunk if
         // that regresses throughput under memory pressure.
         if (prefilling && cfg_.batched_prefill &&
-            model_.supports_batch()) {
+            model_.supports_batch_prefill()) {
             const std::uint32_t remaining = n_prompt - r.n_fed;
             const std::uint32_t nb = std::min(remaining, budget);
             if (nb >= 2 &&
@@ -560,7 +563,7 @@ bool Engine::prefill_only(Request& r, std::uint32_t& budget) {
         // Same batched-prefill fast path as advance(): on a capacity
         // miss it falls through to the per-token loop below, which
         // reclaims. Deliberately no reclaim here -- see advance().
-        if (cfg_.batched_prefill && model_.supports_batch()) {
+        if (cfg_.batched_prefill && model_.supports_batch_prefill()) {
             const std::uint32_t remaining = n_prompt - r.n_fed;
             const std::uint32_t nb = std::min(remaining, budget);
             if (nb >= 2 &&
