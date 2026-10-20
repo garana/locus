@@ -52,6 +52,7 @@ layout(push_constant) uniform PC {
 shared float qs[ATTN_DECODE_Q_MAX];
 shared float sc[CH];
 shared float red[WG];
+shared uint rowb[CH];
 
 uint pos_row(uint p) {
     return table[p / pc.block_tokens] * pc.block_stride +
@@ -73,12 +74,18 @@ void main() {
 
     uint p0 = c * CH;
     uint np = min(CH, pc.n_pos - p0);
+    // Row bases once per block: the V loop below would otherwise pay
+    // a table load and a division per position, per thread.
+    if (t < np) {
+        rowb[t] = pos_row(p0 + t);
+    }
+    barrier();
     // Scores: TPP threads per position, interleaved over the key.
     uint lp = t / TPP;
     uint lane = t % TPP;
     float part_s = 0.0;
     if (lp < np) {
-        uint kb = pos_row(p0 + lp) + pc.k_off + kvh * pc.kv_stride;
+        uint kb = rowb[lp] + pc.k_off + kvh * pc.kv_stride;
         for (uint i = lane; i < dk; i += TPP) {
             part_s += qs[i] * pool[kb + i];
         }
@@ -107,11 +114,29 @@ void main() {
         l += sc[j];
     }
 
+    // Weighted V. A narrow head (dv < WG) splits the positions over
+    // nsl thread slices, summed through shared memory, so every
+    // thread works.
     uint vbase = pc.v_off + kvh * pc.kv_stride;
-    for (uint i = t; i < pc.dv; i += WG) {
+    uint nsl = pc.dv < WG ? WG / pc.dv : 1u;
+    uint sl = t / pc.dv;
+    for (uint i = t % pc.dv; i < pc.dv; i += WG) {
         float acc = 0.0;
-        for (uint j = 0u; j < np; ++j) {
-            acc += sc[j] * pool[pos_row(p0 + j) + vbase + i];
+        if (sl < nsl) {
+            for (uint j = sl; j < np; j += nsl) {
+                acc += sc[j] * pool[rowb[j] + vbase + i];
+            }
+        }
+        if (nsl > 1u) {
+            barrier();
+            red[t] = acc;
+            barrier();
+            if (sl != 0u) {
+                break;  // slice 0 writes the head's outputs
+            }
+            for (uint k = 1u; k < nsl; ++k) {
+                acc += red[k * pc.dv + i];
+            }
         }
         if (n_blocks == 1u) {
             o[h * pc.out_stride + i] = acc / l;
