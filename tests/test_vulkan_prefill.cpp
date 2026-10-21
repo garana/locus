@@ -561,7 +561,7 @@ TEST_CASE("bench: vulkan f32 matvec bandwidth", "[.][bench][vulkan]") {
     VulkanContext ctx;
     std::mt19937 rng(61);
     const std::uint32_t reps = 500;
-    for (const auto [rows, cols] :
+    for (const auto& [rows, cols] :
          {std::pair{2048u, 2048u}, std::pair{8192u, 2048u},
           std::pair{32768u, 2048u}}) {
         const auto w = random_f32(std::size_t{rows} * cols, rng);
