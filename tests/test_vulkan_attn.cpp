@@ -490,3 +490,106 @@ TEST_CASE("vulkan decode attention (flash) matches the CPU reference",
         }
     }
 }
+
+TEST_CASE("vulkan MLA decode attention (head groups) matches the CPU "
+          "reference",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(53);
+
+    // attn_decode_mla.comp: 32 positions x 16 heads per workgroup;
+    // V = the first dv floats of the shared latent key.
+    struct Case {
+        const char* name;
+        std::uint32_t heads, rank, rope_d, n_pos;
+    };
+    const Case cases[] = {
+        {"partial head group, one block", 3, 512, 64, 20},
+        {"one head group, blocks + combine", 16, 512, 64, 200},
+        {"two head groups, ragged last block", 20, 512, 64, 77},
+        {"narrow latent (8 head sets)", 16, 128, 32, 100},
+    };
+    for (const Case& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            const std::uint32_t dk = c.rank + c.rope_d;
+            const std::uint32_t k_off = 8;  // a layer's offset
+            const std::uint32_t row_w = dk + 12;
+            const std::uint32_t bt = 16;
+            const std::uint32_t n_blocks = (c.n_pos + bt - 1) / bt;
+            const std::uint32_t block_stride = bt * row_w;
+            auto pool = random_floats(
+                static_cast<std::size_t>(n_blocks) * block_stride, rng);
+            auto table = shuffled_table(n_blocks, rng);
+            const std::uint32_t q2_stride = c.rope_d + 40, q2_off = 40;
+            auto q1 = random_floats(c.heads * c.rank, rng);
+            auto q2 = random_floats(c.heads * q2_stride, rng);
+            const float scale = 0.07f;
+
+            auto row = [&](std::uint32_t p) {
+                return table[p / bt] * block_stride + (p % bt) * row_w +
+                       k_off;
+            };
+            std::vector<float> want(c.heads * c.rank);
+            for (std::uint32_t h = 0; h < c.heads; ++h) {
+                std::vector<double> s(c.n_pos);
+                for (std::uint32_t p = 0; p < c.n_pos; ++p) {
+                    double d = 0.0;
+                    for (std::uint32_t i = 0; i < c.rank; ++i) {
+                        d += q1[h * c.rank + i] * pool[row(p) + i];
+                    }
+                    for (std::uint32_t i = 0; i < c.rope_d; ++i) {
+                        d += q2[h * q2_stride + q2_off + i] *
+                             pool[row(p) + c.rank + i];
+                    }
+                    s[p] = d * scale;
+                }
+                softmax(s);
+                for (std::uint32_t i = 0; i < c.rank; ++i) {
+                    double acc = 0.0;
+                    for (std::uint32_t p = 0; p < c.n_pos; ++p) {
+                        acc += s[p] * pool[row(p) + i];
+                    }
+                    want[h * c.rank + i] = static_cast<float>(acc);
+                }
+            }
+
+            const std::uint32_t blocks = (c.n_pos + 31) / 32;
+            auto pb = upload(ctx, pool);
+            auto tb = upload(ctx, table);
+            auto q1b = upload(ctx, q1);
+            auto q2b = upload(ctx, q2);
+            auto ob = ctx.create_buffer(want.size() * 4);
+            auto partb = ctx.create_buffer(
+                std::size_t{blocks} * c.heads * (c.rank + 2) * 4);
+            ctx.begin_batch();
+            const VulkanContext::Buffer bufs[] = {pb, tb, q1b, q2b, ob,
+                                                  blocks > 1 ? partb : ob};
+            const std::uint32_t push[] = {
+                c.n_pos, bt,        block_stride, row_w,
+                k_off,   c.heads,   c.rank,       c.rope_d,
+                c.rank,  q2_stride, q2_off,       c.rank,
+                fbits(scale), c.rank};
+            ctx.dispatch(Kernel::kAttnDecodeMla, bufs, push, blocks,
+                         (c.heads + 15) / 16);
+            if (blocks > 1) {
+                const VulkanContext::Buffer cb[] = {partb, ob};
+                const std::uint32_t cp[] = {blocks, c.heads, c.rank,
+                                            c.rank};
+                ctx.dispatch(Kernel::kAttnCombine, cb, cp,
+                             (c.rank + 63) / 64, c.heads);
+            }
+            ctx.end_batch();
+            auto got = download(ctx, ob, want.size());
+            for (std::size_t i = 0; i < want.size(); ++i) {
+                REQUIRE(got[i] ==
+                        Catch::Approx(want[i]).margin(1e-5).epsilon(1e-4));
+            }
+            for (auto b : {pb, tb, q1b, q2b, ob, partb}) {
+                ctx.destroy_buffer(b);
+            }
+        }
+    }
+}

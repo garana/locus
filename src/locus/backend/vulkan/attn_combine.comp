@@ -1,10 +1,18 @@
 #version 450
 
-// Merges attn_decode.comp's per-block partials for one query token:
+// Merges attn_decode.comp's (or attn_decode_mla.comp's) per-block
+// partials for one query token:
 // out[h][i] = sum_c e_c o_c[h][i] / sum_c e_c l_c[h], with
-// e_c = exp(m_c[h] - max_c m_c[h]). One invocation per (head, i).
+// e_c = exp(m_c[h] - max_c m_c[h]). Workgroup (x = 64 outputs i,
+// y = head h): the whole group reduces the max and the weighted l
+// over the blocks, then SL slices of 64 threads each sum every SL-th
+// block for their i, added up through shared memory.
 
-layout(local_size_x = 64) in;
+#define WG 256u
+#define NI 64u              // outputs per workgroup
+#define SL (WG / NI)        // block slices
+
+layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer PART { float part[]; };
 layout(std430, binding = 1) writeonly buffer OUT { float o[]; };
@@ -16,23 +24,56 @@ layout(push_constant) uniform PC {
     uint out_stride;    // OUT floats between heads
 } pc;
 
-void main() {
-    uint i = gl_GlobalInvocationID.x;
-    uint h = gl_WorkGroupID.y;
-    if (i >= pc.dv) {
-        return;
+shared float red[WG];
+
+/** Tree-reduces v over the workgroup (max if is_max, else sum). */
+float reduce(float v, bool is_max) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (t < step) {
+            red[t] = is_max ? max(red[t], red[t + step])
+                            : red[t] + red[t + step];
+        }
+        barrier();
     }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint h = gl_WorkGroupID.y;
     uint st = pc.n_blocks * pc.heads * pc.dv;
     float mx = -3.4e38;
-    for (uint c = 0u; c < pc.n_blocks; ++c) {
+    for (uint c = t; c < pc.n_blocks; c += WG) {
         mx = max(mx, part[st + (c * pc.heads + h) * 2u]);
     }
-    float acc = 0.0, l = 0.0;
-    for (uint c = 0u; c < pc.n_blocks; ++c) {
+    mx = reduce(mx, true);
+    float l = 0.0;
+    for (uint c = t; c < pc.n_blocks; c += WG) {
         uint s = st + (c * pc.heads + h) * 2u;
-        float e = exp(part[s] - mx);
-        l += e * part[s + 1u];
-        acc += e * part[(c * pc.heads + h) * pc.dv + i];
+        l += exp(part[s] - mx) * part[s + 1u];
     }
-    o[h * pc.out_stride + i] = acc / l;
+    l = reduce(l, false);
+
+    uint i = gl_WorkGroupID.x * NI + t % NI;
+    uint sl = t / NI;
+    float acc = 0.0;
+    if (i < pc.dv) {
+        for (uint c = sl; c < pc.n_blocks; c += SL) {
+            float e = exp(part[st + (c * pc.heads + h) * 2u] - mx);
+            acc += e * part[(c * pc.heads + h) * pc.dv + i];
+        }
+    }
+    red[t] = acc;
+    barrier();
+    if (sl == 0u && i < pc.dv) {
+        for (uint k = 1u; k < SL; ++k) {
+            acc += red[k * NI + t];
+        }
+        o[h * pc.out_stride + i] = acc / l;
+    }
 }
