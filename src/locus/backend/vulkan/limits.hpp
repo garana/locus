@@ -10,8 +10,9 @@ namespace locus::backend::vk {
  * (attn_paged, attn_paged_q, attn_mla: ATTN_PART_MAX). They index
  * it up to head width * np with np = max(1, 128 / width), i.e. up to
  * max(128, width), so any head width or MLA rank above this must not
- * reach them. CMake reads this line and passes the same value to the
- * shaders as -DATTN_PART_MAX, so host and GLSL cannot drift.
+ * reach them. CMake reads this line (it must be the only one) and
+ * passes the value to the shaders as -DATTN_PART_MAX and to the
+ * locus target, where context.cpp static_asserts the two agree.
  */
 inline constexpr std::uint32_t kAttnPartMax = 512;
 
