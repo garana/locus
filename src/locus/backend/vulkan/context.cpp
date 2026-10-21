@@ -3,6 +3,7 @@
 #include "locus/backend/vulkan/mem_fit.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -162,6 +163,33 @@ void check(VkResult r, const char* what) {
     }
 }
 
+/**
+ * Validation errors seen through the debug messenger (opt-in, see
+ * LOCUS_VK_VALIDATION in Impl::init). Process-wide: the layer runs on
+ * one instance at a time in the test that enables it.
+ */
+std::atomic<std::uint32_t> g_validation_errors{0};
+
+/**
+ * Debug-messenger callback: counts error-severity messages (a
+ * GPU-assisted out-of-bounds buffer access is reported as an error)
+ * and echoes every warning and error to stderr so a failing test
+ * shows what the layer found.
+ */
+VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT,
+    const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+        g_validation_errors.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::fprintf(stderr, "[vk-validation] %s\n",
+                 data != nullptr && data->pMessage != nullptr
+                     ? data->pMessage
+                     : "(no message)");
+    return VK_FALSE;
+}
+
 /** Static description of each kernel's interface. */
 struct KernelDesc {
     const std::uint32_t* spv;
@@ -243,6 +271,7 @@ const KernelDesc& kernel_desc(Kernel k) {
 
 struct VulkanContext::Impl {
     VkInstance instance = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
     VkPhysicalDevice phys = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
@@ -380,6 +409,28 @@ struct VulkanContext::Impl {
         return 0;
     }
 
+    /** Installs the debug messenger that feeds debug_callback. */
+    void create_debug_messenger() {
+        auto create = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+            vkGetInstanceProcAddr(instance,
+                                  "vkCreateDebugUtilsMessengerEXT"));
+        if (create == nullptr) {
+            return;
+        }
+        VkDebugUtilsMessengerCreateInfoEXT ci{};
+        ci.sType =
+            VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+        ci.messageSeverity =
+            VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        ci.messageType =
+            VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+        ci.pfnUserCallback = debug_callback;
+        create(instance, &ci, nullptr, &messenger);
+    }
+
     void init() {
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -388,16 +439,44 @@ struct VulkanContext::Impl {
         VkInstanceCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         ici.pApplicationInfo = &app;
+        std::vector<const char*> ilayers;
+        std::vector<const char*> iexts;
 #if defined(__APPLE__)
-        const char* exts[] = {
-            "VK_KHR_portability_enumeration"};
-        ici.enabledExtensionCount = 1;
-        ici.ppEnabledExtensionNames = exts;
+        iexts.push_back("VK_KHR_portability_enumeration");
         ici.flags =
             VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
 #endif
+        // Opt-in validation (LOCUS_VK_VALIDATION): turn on the
+        // Khronos validation layer with GPU-assisted validation, so
+        // the layer bounds-checks shader buffer access on the device
+        // and reports an out-of-range SSBO read (e.g. a whole-word
+        // Q8_0 read past an under-sized weight buffer) through the
+        // debug messenger. Off, and zero cost, by default.
+        const bool validate =
+            std::getenv("LOCUS_VK_VALIDATION") != nullptr;
+        const VkValidationFeatureEnableEXT gpu_av[] = {
+            VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT};
+        VkValidationFeaturesEXT vf{};
+        if (validate) {
+            ilayers.push_back("VK_LAYER_KHRONOS_validation");
+            iexts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            vf.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+            vf.enabledValidationFeatureCount = 1;
+            vf.pEnabledValidationFeatures = gpu_av;
+            vf.pNext = ici.pNext;
+            ici.pNext = &vf;
+        }
+        ici.enabledLayerCount =
+            static_cast<std::uint32_t>(ilayers.size());
+        ici.ppEnabledLayerNames = ilayers.data();
+        ici.enabledExtensionCount =
+            static_cast<std::uint32_t>(iexts.size());
+        ici.ppEnabledExtensionNames = iexts.data();
         check(vkCreateInstance(&ici, nullptr, &instance),
               "create instance");
+        if (validate) {
+            create_debug_messenger();
+        }
 
         std::uint32_t n = 0;
         vkEnumeratePhysicalDevices(instance, &n, nullptr);
@@ -655,6 +734,15 @@ struct VulkanContext::Impl {
             vkDestroyCommandPool(device, pool, nullptr);
             vkDestroyDevice(device, nullptr);
         }
+        if (messenger != VK_NULL_HANDLE) {
+            auto destroy =
+                reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+                    vkGetInstanceProcAddr(
+                        instance, "vkDestroyDebugUtilsMessengerEXT"));
+            if (destroy != nullptr) {
+                destroy(instance, messenger, nullptr);
+            }
+        }
         if (instance != VK_NULL_HANDLE) {
             vkDestroyInstance(instance, nullptr);
         }
@@ -668,6 +756,10 @@ bool VulkanContext::available() {
     } catch (const std::exception&) {
         return false;
     }
+}
+
+std::uint32_t VulkanContext::validation_errors() {
+    return g_validation_errors.load(std::memory_order_relaxed);
 }
 
 VulkanContext::VulkanContext() : impl_(new Impl) { impl_->init(); }
@@ -960,6 +1052,8 @@ namespace locus::backend::vk {
 struct VulkanContext::Impl {};
 
 bool VulkanContext::available() { return false; }
+
+std::uint32_t VulkanContext::validation_errors() { return 0; }
 
 VulkanContext::VulkanContext() {
     throw std::runtime_error(
