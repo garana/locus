@@ -82,6 +82,14 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
 /** @returns true when a usable Vulkan device + kernels exist. */
 bool vulkan_backend_usable();
 
+/**
+ * Opt-in (--prefill-f16): the Vulkan prefill matmuls stage both
+ * operands as f16 in shared memory (~+18% prefill on an M4 Max). Off
+ * (the default) keeps prefill f32-exact.
+ * @param on Whether to stage in f16 from now on.
+ */
+void vulkan_set_prefill_f16(bool on);
+
 /** KV-pool allocator returning a GPU-mapped pointer (Ops hook). */
 float* vulkan_alloc_kv(std::size_t n_floats);
 

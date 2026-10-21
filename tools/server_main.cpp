@@ -63,6 +63,7 @@ int main(int argc, char** argv) {
         auto model = locus::model::TransformerModel::load(g);
         model.use_backend(
             locus::backend::resolve_backend(args.choice));
+        locus::backend::vulkan_set_prefill_f16(args.prefill_f16);
         auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
         auto& tok = *tok_ptr;
 

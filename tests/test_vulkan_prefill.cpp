@@ -121,10 +121,17 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
         locus::gguf::TensorType type;
         Kernel kernel;
         std::uint32_t cols;
+        float margin;  // f16 staging rounds both operands
     };
     const Case cases[] = {
-        {"q8_0", locus::gguf::TensorType::kQ8_0, Kernel::kMatmulQ8_0, 96},
-        {"f32", locus::gguf::TensorType::kF32, Kernel::kMatmulF32, 80},
+        {"q8_0", locus::gguf::TensorType::kQ8_0, Kernel::kMatmulQ8_0, 96,
+         1e-4f},
+        {"f32", locus::gguf::TensorType::kF32, Kernel::kMatmulF32, 80,
+         1e-4f},
+        {"q8_0 f16 staging", locus::gguf::TensorType::kQ8_0,
+         Kernel::kMatmulQ8_0H, 96, 2e-2f},
+        {"f32 f16 staging", locus::gguf::TensorType::kF32,
+         Kernel::kMatmulF32H, 80, 2e-2f},
     };
     const std::uint32_t rows = 100, n_tok = 70, n_batch = 3;
     const std::uint32_t x_stride = 300, out_stride = 333;
@@ -186,8 +193,8 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
                             INFO("acc " << acc << " batch " << b
                                         << " token " << t << " row "
                                         << r);
-                            REQUIRE(got[at] ==
-                                    Catch::Approx(want).margin(1e-4));
+                            REQUIRE(got[at] == Catch::Approx(want)
+                                                   .margin(c.margin));
                         }
                     }
                 }
@@ -446,6 +453,50 @@ TEST_CASE("vulkan batched prefill tracks per-token prefill",
             }
             cache.release(seq);
             ref_cache.release(ref_seq);
+        }
+    }
+    if (ran == 0) {
+        SKIP("no prefill test model present (llama-3.2-1b-q8_0.gguf)");
+    }
+}
+
+TEST_CASE("vulkan f16 prefill staging tracks the f32 prefill",
+          "[e2e][vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    // Opt-in (--prefill-f16): batched prefill with f16-staged matmul
+    // operands stays close to the exact f32 path (not bit-exact).
+    struct Restore {
+        ~Restore() { locus::backend::vulkan_set_prefill_f16(false); }
+    } restore;
+    const char* const models[] = {"llama-3.2-1b-q8_0.gguf",
+                                  "deepseek-coder-v2-lite-q8_0.gguf"};
+    std::size_t ran = 0;
+    for (const char* name : models) {
+        const std::string path = test_model(name);
+        if (!std::filesystem::exists(path)) {
+            continue;
+        }
+        DYNAMIC_SECTION(name) {
+            ++ran;
+            auto g = locus::gguf::GgufFile::open(path);
+            auto model = locus::model::TransformerModel::load(g);
+            model.use_backend(*locus::backend::find_backend("vulkan"));
+            std::mt19937 rng(67);
+            std::uniform_int_distribution<int> id(
+                100, static_cast<int>(model.hparams().n_vocab) - 100);
+            std::vector<locus::tok::TokenId> prompt(150);
+            for (auto& t : prompt) {
+                t = id(rng);
+            }
+            locus::backend::vulkan_set_prefill_f16(false);
+            const auto [f32_l, f32_gen] = prefill_run(model, prompt, 64, 0);
+            locus::backend::vulkan_set_prefill_f16(true);
+            const auto [f16_l, f16_gen] = prefill_run(model, prompt, 64, 0);
+            locus::backend::vulkan_set_prefill_f16(false);
+            REQUIRE(cosine(f16_l, f32_l) > 0.999);
+            REQUIRE(f16_l != f32_l);  // the staging really ran
         }
     }
     if (ran == 0) {

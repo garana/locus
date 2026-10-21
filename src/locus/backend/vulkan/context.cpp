@@ -67,7 +67,9 @@ void VulkanContext::report_profile() const {
         "attn_softmax", "sum_splits",   "matvec_t_q8",
         "matvec_q8_0_glu", "matvec_q8_0_glu_b", "attn_decode",
         "attn_combine", "matvec_q8_0_seg", "matvec_q8_0_sh_b",
-        "matvec_q8_0_glu_sh_b", "attn_decode_grp"};
+        "matvec_q8_0_glu_sh_b", "attn_decode_grp", "matmul_q8_0_h",
+        "matmul_f32_h", "matmul_q8_0_id_h", "matmul_paged_h",
+        "matmul_paged_t_h"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -165,6 +167,11 @@ static_assert(locus::backend::vk::kAttnDecodeQMax ==
 #include "matvec_q8_0_sh_b_spv.h"
 #include "matvec_q8_0_glu_sh_b_spv.h"
 #include "attn_decode_grp_spv.h"
+#include "matmul_q8_0_h_spv.h"
+#include "matmul_f32_h_spv.h"
+#include "matmul_q8_0_id_h_spv.h"
+#include "matmul_paged_f32_h_spv.h"
+#include "matmul_paged_t_f32_h_spv.h"
 
 namespace locus::backend::vk {
 
@@ -325,6 +332,14 @@ const KernelDesc& kernel_desc(Kernel k) {
          sizeof(locus_matvec_q8_0_glu_sh_b_spv), 7, 60},
         {locus_attn_decode_grp_spv, sizeof(locus_attn_decode_grp_spv), 6,
          64},
+        {locus_matmul_q8_0_h_spv, sizeof(locus_matmul_q8_0_h_spv), 3, 96},
+        {locus_matmul_f32_h_spv, sizeof(locus_matmul_f32_h_spv), 3, 96},
+        {locus_matmul_q8_0_id_h_spv, sizeof(locus_matmul_q8_0_id_h_spv), 4,
+         96},
+        {locus_matmul_paged_f32_h_spv, sizeof(locus_matmul_paged_f32_h_spv),
+         4, 96},
+        {locus_matmul_paged_t_f32_h_spv,
+         sizeof(locus_matmul_paged_t_f32_h_spv), 4, 96},
     };
     static_assert(std::size(descs) ==
                   static_cast<std::size_t>(Kernel::kCount_));

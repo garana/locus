@@ -100,3 +100,19 @@ TEST_CASE("--timing and --warmup parse as flags", "[cli]") {
     REQUIRE_FALSE(b.timing);
     REQUIRE_FALSE(b.warmup);
 }
+
+TEST_CASE("--prefill-f16 parses as a flag", "[cli]") {
+    std::array<const char*, 3> argv1 = {"prog", "--prefill-f16",
+                                        "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()),
+        const_cast<char**>(argv1.data()));
+    REQUIRE(a.prefill_f16);
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+
+    std::array<const char*, 2> argv2 = {"prog", "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()),
+        const_cast<char**>(argv2.data()));
+    REQUIRE_FALSE(b.prefill_f16);  // off by default: exact f32
+}

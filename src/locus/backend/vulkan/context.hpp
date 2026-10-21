@@ -61,6 +61,12 @@ enum class Kernel {
     kMatvecQ8_0GluShB,
     /** attn_decode reading each K/V row once for a head group. */
     kAttnDecodeGrp,
+    /** Prefill matmuls with f16 operand staging (--prefill-f16). */
+    kMatmulQ8_0H,
+    kMatmulF32H,
+    kMatmulQ8_0IdH,
+    kMatmulPagedF32H,
+    kMatmulPagedTF32H,
     kCount_,
 };
 

@@ -163,6 +163,11 @@ if(Vulkan_FOUND)
             matmul_q8_0_id_small=matmul:TYPE_Q8,MOE_ID,BK16
             matmul_paged_f32_small=matmul:TYPE_F32,PAGED,BK16
             matmul_paged_t_f32_small=matmul:TYPE_F32,PAGED_T,BK16
+            matmul_q8_0_h=matmul:TYPE_Q8,F16_STAGE
+            matmul_f32_h=matmul:TYPE_F32,F16_STAGE
+            matmul_q8_0_id_h=matmul:TYPE_Q8,MOE_ID,F16_STAGE
+            matmul_paged_f32_h=matmul:TYPE_F32,PAGED,F16_STAGE
+            matmul_paged_t_f32_h=matmul:TYPE_F32,PAGED_T,F16_STAGE
             rmsnorm_b=rmsnorm:BATCHED
             rope_b=rope:BATCHED
             moe_route_b=moe_route:BATCHED)
