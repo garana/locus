@@ -152,6 +152,14 @@ if(Vulkan_FOUND)
             matmul_q8_0_id=matmul:TYPE_Q8,MOE_ID
             matmul_paged_f32=matmul:TYPE_F32,PAGED
             matmul_paged_t_f32=matmul:TYPE_F32,PAGED_T
+            # BK16: smaller shared stage (12800 B vs 25088 B) for
+            # devices whose maxComputeSharedMemorySize cannot fit the
+            # default tile; create_pipe picks per the device limit.
+            matmul_q8_0_small=matmul:TYPE_Q8,BK16
+            matmul_f32_small=matmul:TYPE_F32,BK16
+            matmul_q8_0_id_small=matmul:TYPE_Q8,MOE_ID,BK16
+            matmul_paged_f32_small=matmul:TYPE_F32,PAGED,BK16
+            matmul_paged_t_f32_small=matmul:TYPE_F32,PAGED_T,BK16
             rmsnorm_b=rmsnorm:BATCHED
             rope_b=rope:BATCHED
             moe_route_b=moe_route:BATCHED)

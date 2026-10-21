@@ -116,10 +116,15 @@ static_assert(locus::backend::vk::kAttnDecodeQMax ==
 #include "attn_softmax_spv.h"
 #include "kv_scatter_spv.h"
 #include "kv_store_q_spv.h"
+#include "matmul_f32_small_spv.h"
 #include "matmul_f32_spv.h"
+#include "matmul_paged_f32_small_spv.h"
 #include "matmul_paged_f32_spv.h"
+#include "matmul_paged_t_f32_small_spv.h"
 #include "matmul_paged_t_f32_spv.h"
+#include "matmul_q8_0_id_small_spv.h"
 #include "matmul_q8_0_id_spv.h"
+#include "matmul_q8_0_small_spv.h"
 #include "matmul_q8_0_spv.h"
 #include "matvec_b_spv.h"
 #include "matvec_f16_b_spv.h"
@@ -196,7 +201,32 @@ struct KernelDesc {
     std::size_t spv_bytes;
     std::uint32_t n_buffers;
     std::uint32_t push_bytes;
+    /**
+     * Smaller-shared-memory variant, used when the device's
+     * maxComputeSharedMemorySize cannot fit `shared_bytes`. Null for
+     * kernels with no variant; `shared_bytes` 0 then means the kernel
+     * fits any device.
+     */
+    const std::uint32_t* alt_spv = nullptr;
+    std::size_t alt_spv_bytes = 0;
+    std::uint32_t shared_bytes = 0;
+    std::uint32_t alt_shared_bytes = 0;
 };
+
+/**
+ * Workgroup (shared) memory the tiled matmul (matmul.comp) declares
+ * for a given BK: ws[BK][BM/4] + xs[BK][BN/4] as vec4 (16 B each) +
+ * rows_x[BN] + rows_o[BN] (uint). Mirrors the shader's shared block;
+ * the static_asserts pin the two tiles so a change here or in the
+ * shader's BM/BN/BK forces a conscious update of both.
+ */
+constexpr std::uint32_t matmul_shared_bytes(std::uint32_t bk) {
+    constexpr std::uint32_t bm = VulkanContext::kMatmulTileRows;
+    constexpr std::uint32_t bn = VulkanContext::kMatmulTileToks;
+    return bk * (bm / 4u) * 16u + bk * (bn / 4u) * 16u + bn * 4u * 2u;
+}
+static_assert(matmul_shared_bytes(VulkanContext::kMatmulBK) == 25088);
+static_assert(matmul_shared_bytes(VulkanContext::kMatmulBKSmall) == 12800);
 
 const KernelDesc& kernel_desc(Kernel k) {
     static const KernelDesc descs[] = {
@@ -238,10 +268,21 @@ const KernelDesc& kernel_desc(Kernel k) {
         {locus_matvec_q8_0_b_spv, sizeof(locus_matvec_q8_0_b_spv),
          4, 52},
         {locus_moe_route_spv, sizeof(locus_moe_route_spv), 3, 36},
-        {locus_matmul_q8_0_spv, sizeof(locus_matmul_q8_0_spv), 3, 96},
-        {locus_matmul_f32_spv, sizeof(locus_matmul_f32_spv), 3, 96},
+        {locus_matmul_q8_0_spv, sizeof(locus_matmul_q8_0_spv), 3, 96,
+         locus_matmul_q8_0_small_spv,
+         sizeof(locus_matmul_q8_0_small_spv),
+         matmul_shared_bytes(VulkanContext::kMatmulBK),
+         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+        {locus_matmul_f32_spv, sizeof(locus_matmul_f32_spv), 3, 96,
+         locus_matmul_f32_small_spv,
+         sizeof(locus_matmul_f32_small_spv),
+         matmul_shared_bytes(VulkanContext::kMatmulBK),
+         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
         {locus_matmul_q8_0_id_spv, sizeof(locus_matmul_q8_0_id_spv), 4,
-         96},
+         96, locus_matmul_q8_0_id_small_spv,
+         sizeof(locus_matmul_q8_0_id_small_spv),
+         matmul_shared_bytes(VulkanContext::kMatmulBK),
+         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
         {locus_kv_scatter_spv, sizeof(locus_kv_scatter_spv), 3, 32},
         {locus_moe_group_spv, sizeof(locus_moe_group_spv), 2, 16},
         {locus_moe_combine_spv, sizeof(locus_moe_combine_spv), 3, 8},
@@ -249,9 +290,16 @@ const KernelDesc& kernel_desc(Kernel k) {
         {locus_rope_b_spv, sizeof(locus_rope_b_spv), 2, 40},
         {locus_moe_route_b_spv, sizeof(locus_moe_route_b_spv), 3, 44},
         {locus_matmul_paged_f32_spv, sizeof(locus_matmul_paged_f32_spv), 4,
-         96},
+         96, locus_matmul_paged_f32_small_spv,
+         sizeof(locus_matmul_paged_f32_small_spv),
+         matmul_shared_bytes(VulkanContext::kMatmulBK),
+         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
         {locus_matmul_paged_t_f32_spv,
-         sizeof(locus_matmul_paged_t_f32_spv), 4, 96},
+         sizeof(locus_matmul_paged_t_f32_spv), 4, 96,
+         locus_matmul_paged_t_f32_small_spv,
+         sizeof(locus_matmul_paged_t_f32_small_spv),
+         matmul_shared_bytes(VulkanContext::kMatmulBK),
+         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
         {locus_attn_softmax_spv, sizeof(locus_attn_softmax_spv), 1, 20},
         {locus_sum_splits_spv, sizeof(locus_sum_splits_spv), 2, 16},
         {locus_matvec_t_q8_spv, sizeof(locus_matvec_t_q8_spv), 3, 32},
@@ -374,6 +422,11 @@ struct VulkanContext::Impl {
     bool per_kernel = false;  // LOCUS_VK_PROFILE=2
     VkQueryPool qpool = VK_NULL_HANDLE;
     double ts_period_ns = 0.0;
+
+    /** Device maxComputeSharedMemorySize (bytes), read at init. */
+    std::uint32_t max_shared_mem = 0;
+    /** Whether the matmul smaller-tile step-down has been logged. */
+    bool matmul_stepdown_logged = false;
     std::chrono::steady_clock::time_point batch_t0;
 
     struct HostBuffer {
@@ -574,6 +627,11 @@ struct VulkanContext::Impl {
         check(vkCreateCommandPool(device, &cpi, nullptr, &pool),
               "create command pool");
 
+        {
+            VkPhysicalDeviceProperties pp;
+            vkGetPhysicalDeviceProperties(phys, &pp);
+            max_shared_mem = pp.limits.maxComputeSharedMemorySize;
+        }
         for (int k = 0; k < static_cast<int>(Kernel::kCount_);
              ++k) {
             create_pipe(static_cast<Kernel>(k));
@@ -632,11 +690,47 @@ struct VulkanContext::Impl {
                                      &p.layout),
               "create pipeline layout");
 
+        // Pick the smaller-tile variant when the device's shared
+        // memory cannot fit this kernel's default stage (LOCUS_VK_
+        // MATMUL_SMALL forces it so a roomy device can test the
+        // variant too). Keeps the GPU path on tight devices instead
+        // of failing pipeline creation or vanishing to the CPU.
+        const std::uint32_t* spv = kd.spv;
+        std::size_t spv_bytes = kd.spv_bytes;
+        if (kd.alt_spv != nullptr) {
+            const bool over = kd.shared_bytes > max_shared_mem;
+            const bool forced =
+                std::getenv("LOCUS_VK_MATMUL_SMALL") != nullptr;
+            if (over || forced) {
+                spv = kd.alt_spv;
+                spv_bytes = kd.alt_spv_bytes;
+                if (!matmul_stepdown_logged) {
+                    matmul_stepdown_logged = true;
+                    if (over) {
+                        std::fprintf(
+                            stderr,
+                            "locus: Vulkan matmul tile needs %u B "
+                            "shared memory, over this device's "
+                            "maxComputeSharedMemorySize %u B; using "
+                            "the smaller-tile variant (%u B).\n",
+                            kd.shared_bytes, max_shared_mem,
+                            kd.alt_shared_bytes);
+                    } else {
+                        std::fprintf(
+                            stderr,
+                            "locus: LOCUS_VK_MATMUL_SMALL set; using "
+                            "the smaller-tile matmul variant (%u B).\n",
+                            kd.alt_shared_bytes);
+                    }
+                }
+            }
+        }
+
         VkShaderModuleCreateInfo smi{};
         smi.sType =
             VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        smi.codeSize = kd.spv_bytes;
-        smi.pCode = kd.spv;
+        smi.codeSize = spv_bytes;
+        smi.pCode = spv;
         VkShaderModule sm;
         check(vkCreateShaderModule(device, &smi, nullptr, &sm),
               "create shader module");

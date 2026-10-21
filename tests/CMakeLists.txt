@@ -98,3 +98,17 @@ set_tests_properties(vulkan_oob_validation PROPERTIES
     # skipped, not failed, so a layerless host (CI or a peer without
     # the Khronos layer) does not report a spurious failure.
     SKIP_RETURN_CODE 4)
+
+# i#103: force the smaller-tile (BK=16) matmul variant and run the
+# Vulkan parity cases against the CPU. On a tight device (e.g. V3DV,
+# 16384) the backend already picks this variant, so this target lets a
+# roomy device (e.g. MoltenVK, 32768) exercise it too. The filter drops
+# the slow model e2e (~[e2e]) and the hidden throughput benches
+# (~[.]); selecting a tag force-includes hidden cases carrying it, and
+# the benches allocate buffers that OOM a 4 GB device. Cases skip
+# without a device; SKIP_RETURN_CODE reads that as skipped, not failed.
+add_test(NAME vulkan_matmul_small
+         COMMAND locus_tests "[vulkan]~[e2e]~[.]")
+set_tests_properties(vulkan_matmul_small PROPERTIES
+    ENVIRONMENT "LOCUS_VK_MATMUL_SMALL=1"
+    SKIP_RETURN_CODE 4)
