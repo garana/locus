@@ -54,6 +54,11 @@ enum class Kernel {
     /** Decode (one query token) flash attention and its merge. */
     kAttnDecode,
     kAttnCombine,
+    /** Q8_0 matvec over stacked matrices, rows to two outputs. */
+    kMatvecQ8_0Seg,
+    /** MoE batched matvecs with the shared experts as extra work. */
+    kMatvecQ8_0ShB,
+    kMatvecQ8_0GluShB,
     kCount_,
 };
 

@@ -22,6 +22,20 @@
 // each row gets both dot products, computed exactly as the plain
 // kernel would, and writes silu(gate) * up -- the gate, up and
 // silu_mul dispatches of a SwiGLU block in one (split slots only).
+//
+// With -DSHARED (BATCHED only) the MoE's shared experts ride along
+// with the routed ones. matvec_q8_0_sh_b, the down projection in
+// weighted-sum mode, adds the shared expert's row (sh_cols wide, WS,
+// reading x at sh_x_off) to each output. matvec_q8_0_glu_sh_b runs
+// extra slots y >= n_slots on the shared gate / up matrices (WSG /
+// WSU, sh_stride bytes per slot), writing at y * out_stride like the
+// routed ones.
+//
+// With -DSEGMENTS (matvec_q8_0_seg) W is several matrices of the same
+// width stacked by rows (e.g. wq | wk | wv) and the output rows go to
+// up to three places: rows [0, seg1) to O at out_offset, [seg1, seg2)
+// to O2 at off1, [seg2, rows) to O2 at off2 -- the projections that
+// read one input, in one dispatch.
 
 #define LANES 32u
 #define ROWS 4u
@@ -33,6 +47,17 @@ layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 2) buffer O { float o[]; };
 #ifdef BATCHED
 layout(std430, binding = 3) readonly buffer R { uint route[]; };
+#endif
+#ifdef SEGMENTS
+layout(std430, binding = 3) buffer O2 { float o2[]; };
+#endif
+#ifdef SHARED
+#ifdef SWIGLU
+layout(std430, binding = 5) readonly buffer WSG { uint wsg[]; };
+layout(std430, binding = 6) readonly buffer WSU { uint wsu[]; };
+#else
+layout(std430, binding = 4) readonly buffer WS { uint ws[]; };
+#endif
 #endif
 #ifdef SWIGLU
 #ifdef BATCHED
@@ -58,6 +83,21 @@ layout(push_constant) uniform PC {
     uint mode;      // 1 = ids from route[], 2 = weighted slot sum
     uint row_stride;  // unused: Q8_0 rows are never column-split
 #endif
+#ifdef SHARED
+#ifdef SWIGLU
+    uint sh_stride;  // bytes between shared slots in WSG / WSU
+    uint sh_unused;
+#else
+    uint sh_cols;    // shared down row width
+    uint sh_x_off;
+#endif
+#endif
+#ifdef SEGMENTS
+    uint seg1;  // first row written to O2 at off1
+    uint off1;
+    uint seg2;  // first row written to O2 at off2
+    uint off2;
+#endif
 } pc;
 
 shared float red[LANES * ROWS];
@@ -75,13 +115,12 @@ uint NAME(uint b) { \
 }
 
 /**
- * This lane's share of dot(row r of the matrix at wbase, x). Rows
- * are in the split GPU layout (q8_layout.hpp): nb f16 scales, then
- * nb x 32 quants, 34 * nb bytes in all.
+ * This lane's share of dot(row r of the matrix at wbase, x), nb
+ * blocks wide. Rows are in the split GPU layout (q8_layout.hpp): nb
+ * f16 scales, then nb x 32 quants, 34 * nb bytes in all.
  */
 #define DEFINE_ROW_PART(NAME, WORD, BUF) \
-float NAME(uint wbase, uint xbase, uint r, uint lane) { \
-    uint nb = pc.cols / 32u; \
+float NAME(uint wbase, uint xbase, uint r, uint lane, uint nb) { \
     uint rb = wbase + r * nb * 34u; \
     uint qb = rb + 2u * nb; \
     uint sub = lane & 3u; \
@@ -114,19 +153,31 @@ DEFINE_ROW_PART(row_part, word_at, w)
 DEFINE_WORD_AT(word_at_u, wu)
 DEFINE_ROW_PART(row_part_u, word_at_u, wu)
 #endif
+#ifdef SHARED
+#ifdef SWIGLU
+DEFINE_WORD_AT(word_at_sg, wsg)
+DEFINE_ROW_PART(row_part_sg, word_at_sg, wsg)
+DEFINE_WORD_AT(word_at_su, wsu)
+DEFINE_ROW_PART(row_part_su, word_at_su, wsu)
+#else
+DEFINE_WORD_AT(word_at_s, ws)
+DEFINE_ROW_PART(row_part_s, word_at_s, ws)
+#endif
+#endif
 
 void main() {
     uint lane = gl_LocalInvocationID.x % LANES;
     uint slot = gl_LocalInvocationID.x / LANES;
     uint r = gl_WorkGroupID.x * ROWS + slot;
     uint at = pc.out_offset + r;
+    uint nb = pc.cols / 32u;
     float acc = 0.0;
 #ifdef SWIGLU
     float acc_u = 0.0;
     if (r < pc.rows) {
 #ifdef BATCHED
         uint y = gl_WorkGroupID.y;
-        uint id = (pc.mode & 1u) != 0u ? route[y] : y;
+        uint id = (pc.mode & 1u) != 0u && y < pc.n_slots ? route[y] : y;
         uint wb = pc.w_off + id * pc.w_stride;
         uint xb = pc.x_off + y * pc.x_stride;
         at += y * pc.out_stride;
@@ -134,8 +185,17 @@ void main() {
         uint wb = pc.w_off;
         uint xb = pc.x_off;
 #endif
-        acc = row_part(wb, xb, r, lane);
-        acc_u = row_part_u(wb, xb, r, lane);
+#ifdef SHARED
+        if (gl_WorkGroupID.y >= pc.n_slots) {
+            uint sb = (gl_WorkGroupID.y - pc.n_slots) * pc.sh_stride;
+            acc = row_part_sg(sb, xb, r, lane, nb);
+            acc_u = row_part_su(sb, xb, r, lane, nb);
+        } else
+#endif
+        {
+            acc = row_part(wb, xb, r, lane, nb);
+            acc_u = row_part_u(wb, xb, r, lane, nb);
+        }
     }
     red_u[gl_LocalInvocationID.x] = acc_u;
 #else
@@ -149,13 +209,16 @@ void main() {
             float wk = sum ? uintBitsToFloat(route[pc.n_slots + k])
                            : 1.0;
             acc += wk * row_part(pc.w_off + id * pc.w_stride,
-                                 pc.x_off + k * pc.x_stride, r, lane);
+                                 pc.x_off + k * pc.x_stride, r, lane, nb);
         }
+#ifdef SHARED
+        acc += row_part_s(0u, pc.sh_x_off, r, lane, pc.sh_cols / 32u);
+#endif
         if (!sum) {
             at += y * pc.out_stride;
         }
 #else
-        acc = row_part(pc.w_off, pc.x_off, r, lane);
+        acc = row_part(pc.w_off, pc.x_off, r, lane, nb);
 #endif
     }
 #endif
@@ -178,6 +241,14 @@ void main() {
         // silu_mul.comp's formula on the gate and up outputs.
         float u = red_u[gl_LocalInvocationID.x] * pc.scale;
         o[at] = v / (1.0 + exp(-v)) * u;
+#elif defined(SEGMENTS)
+        if (r < pc.seg1) {
+            o[at] = pc.accumulate != 0 ? o[at] + v : v;
+        } else {
+            uint oi = r < pc.seg2 ? pc.off1 + (r - pc.seg1)
+                                  : pc.off2 + (r - pc.seg2);
+            o2[oi] = pc.accumulate != 0 ? o2[oi] + v : v;
+        }
 #else
         o[at] = pc.accumulate != 0 ? o[at] + v : v;
 #endif
