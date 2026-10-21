@@ -1,6 +1,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/vulkan/limits.hpp"
 
+using locus::backend::vk::attn_decode_fits;
 using locus::backend::vk::attn_width_fits;
 using locus::backend::vk::gpu_alloc_bytes;
 using locus::backend::vk::kAttnPartMax;
@@ -23,4 +24,12 @@ TEST_CASE("GPU weight allocations round up to 16 bytes", "[vulkan]") {
     // 3 rows x 1 Q8_0 block: 102 bytes, the last word ends past 102.
     REQUIRE(gpu_alloc_bytes(102) == 112);
     REQUIRE(gpu_alloc_bytes(714) == 720);  // 7 x 3 blocks
+}
+
+TEST_CASE("decode attention keys are bounded by attn_decode's stage",
+          "[vulkan]") {
+    REQUIRE(attn_decode_fits(64));     // GQA head_dim
+    REQUIRE(attn_decode_fits(576));    // MLA rank 512 + rope 64
+    REQUIRE(attn_decode_fits(1024));
+    REQUIRE_FALSE(attn_decode_fits(1025));
 }

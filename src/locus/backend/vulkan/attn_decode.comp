@@ -18,7 +18,6 @@
 #define WG 128u
 #define CH 64u          // positions per block
 #define TPP (WG / CH)   // threads per position for the scores
-#define MAX_DK 1024u
 
 layout(local_size_x = 128) in;
 
@@ -48,7 +47,9 @@ layout(push_constant) uniform PC {
     uint out_stride;    // OUT floats between heads
 } pc;
 
-shared float qs[MAX_DK];
+// ATTN_DECODE_Q_MAX is vk::kAttnDecodeQMax (limits.hpp), passed by
+// CMake; the host only dispatches keys that fit.
+shared float qs[ATTN_DECODE_Q_MAX];
 shared float sc[CH];
 shared float red[WG];
 

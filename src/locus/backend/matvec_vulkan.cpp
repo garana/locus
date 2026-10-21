@@ -743,7 +743,7 @@ void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
                   std::uint32_t group, std::uint32_t hd, std::uint32_t q_dim,
                   std::uint32_t layer_off, std::uint32_t v_offset) {
     const std::uint32_t n_pos = base + n;
-    if (n == 1) {
+    if (n == 1 && vk::attn_decode_fits(hd)) {
         rec_attn_decode(
             s, pp, n_pos, heads,
             DecodeAttn{q, q, out, layer_off, layer_off + v_offset, hd,
@@ -797,7 +797,7 @@ void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
     // = heads). It reads the latent once per head, so past a few
     // blocks the matmul form below (each latent tile read once for
     // all heads) wins.
-    if (n == 1 && n_pos <= 256) {
+    if (n == 1 && n_pos <= 256 && vk::attn_decode_fits(rank + rope_d)) {
         rec_attn_decode(s, pp, n_pos, heads,
                         DecodeAttn{q_abs, q, lat, layer_off, layer_off, 0,
                                    heads, rank, rope_d, rank, nope + rope_d,

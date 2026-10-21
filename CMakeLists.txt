@@ -165,11 +165,20 @@ if(Vulkan_FOUND)
         if(NOT LOCUS_ATTN_PART_MAX)
             message(FATAL_ERROR "kAttnPartMax not found in limits.hpp")
         endif()
+        file(STRINGS ${LOCUS_VK_LIMITS} _attn_q
+             REGEX "kAttnDecodeQMax = [0-9]+;")
+        string(REGEX MATCH "kAttnDecodeQMax = ([0-9]+)" _m "${_attn_q}")
+        set(LOCUS_ATTN_DECODE_Q_MAX "${CMAKE_MATCH_1}")
+        if(NOT LOCUS_ATTN_DECODE_Q_MAX)
+            message(FATAL_ERROR "kAttnDecodeQMax not found in limits.hpp")
+        endif()
         message(STATUS "locus Vulkan kernels: ATTN_PART_MAX "
-                       "${LOCUS_ATTN_PART_MAX}")
+                       "${LOCUS_ATTN_PART_MAX}, ATTN_DECODE_Q_MAX "
+                       "${LOCUS_ATTN_DECODE_Q_MAX}")
         set(SHADER_HDRS "")
         foreach(entry ${LOCUS_SHADERS})
-            set(DEFS -DATTN_PART_MAX=${LOCUS_ATTN_PART_MAX})
+            set(DEFS -DATTN_PART_MAX=${LOCUS_ATTN_PART_MAX}
+                     -DATTN_DECODE_Q_MAX=${LOCUS_ATTN_DECODE_Q_MAX})
             if(entry MATCHES "^([a-z0-9_]+)=([a-z0-9_]+):([A-Z0-9_,]+)$")
                 set(shader ${CMAKE_MATCH_1})
                 set(source ${CMAKE_MATCH_2})
