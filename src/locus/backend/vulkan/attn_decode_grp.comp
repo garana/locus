@@ -1,0 +1,235 @@
+#version 450
+
+// Flash-decoding attention for one query token where several query
+// heads read the same K/V rows: a GQA group (its KV head's rows), or
+// all MLA heads (the one shared latent row). A workgroup takes CH
+// positions for up to HG heads of one KV head and reads each row once
+// for all of them (attn_decode.comp reads it once per head).
+// Workgroup (x = position block c, y = kvh * chunks + chunk, chunks =
+// ceil(group / HG)); query head h = kvh * group + chunk * HG + j.
+//
+// Same push constants and segment layout as attn_decode.comp: scores
+// s[h][p] = Q1[h] . key[0, d1) + Q2[h] . key[d1, d1 + d2) with key at
+// pool[row + k_off + kvh * kv_stride], V the dv floats at row + v_off
+// + kvh * kv_stride (MLA: v_off = k_off, kv_stride 0, group = heads).
+// With one block it writes o / l to OUT; otherwise (o, m, l) partials
+// in attn_combine.comp's layout.
+//
+// The host dispatches only when dv % 4 == 0, dv / 4 <= WG / 2 and
+// v_off, kv_stride, row_w and block_stride are multiples of 4 (vec4
+// V loads).
+
+#define WG 256u
+#define CH 32u              // positions per block
+#define HG 16u              // heads per workgroup
+#define HP (WG / CH)        // head lanes per position (scores)
+#define HACC 8u             // max heads per thread (weighted V)
+#define KC 32u              // key floats per staged chunk
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer POOL { float pool[]; };
+layout(std430, binding = 0) readonly buffer POOL4 { vec4 pool4[]; };
+#define kv_at(i) pool[i]
+#define kv4_at(i) pool4[(i) >> 2]
+layout(std430, binding = 1) readonly buffer TABLE { uint table[]; };
+layout(std430, binding = 2) readonly buffer Q1 { float q1[]; };
+layout(std430, binding = 3) readonly buffer Q2 { float q2[]; };
+layout(std430, binding = 4) writeonly buffer OUT { float o[]; };
+layout(std430, binding = 5) writeonly buffer PART { float part[]; };
+
+layout(push_constant) uniform PC {
+    uint n_pos;
+    uint block_tokens;
+    uint block_stride;  // floats per pool block
+    uint row_w;         // floats per position row
+    uint k_off;         // floats into a row: key start
+    uint v_off;         // floats into a row: value start
+    uint kv_stride;     // floats between KV heads (0 = shared)
+    uint group;         // query heads per KV head
+    uint d1;
+    uint d2;
+    uint q1_stride;
+    uint q2_stride;
+    uint q2_off;
+    uint dv;
+    float scale;
+    uint out_stride;    // OUT floats between heads
+} pc;
+
+shared float sc[HG * CH];
+shared float mh[HG];
+shared float lh[HG];
+shared uint rowb[CH];
+shared float qs[HG * KC];
+shared float ks[CH * (KC + 1u)];
+shared vec4 red4[WG];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint c = gl_WorkGroupID.x;
+    uint chunks = (pc.group + HG - 1u) / HG;
+    uint kvh = gl_WorkGroupID.y / chunks;
+    uint g0 = (gl_WorkGroupID.y % chunks) * HG;  // first head in group
+    uint h0 = kvh * pc.group + g0;
+    uint heads = (gl_NumWorkGroups.y / chunks) * pc.group;
+    uint n_blocks = gl_NumWorkGroups.x;
+    uint nh = min(HG, pc.group - g0);
+    uint p0 = c * CH;
+    uint np = min(CH, pc.n_pos - p0);
+    if (t < np) {
+        uint p = p0 + t;
+        rowb[t] = table[p / pc.block_tokens] * pc.block_stride +
+                  (p % pc.block_tokens) * pc.row_w;
+    }
+    barrier();
+
+    // Scores, a small GEMM over KC-float chunks of the key staged in
+    // shared memory (loads run along the key, so they coalesce):
+    // thread (position lp, head lane hl) takes heads hl, hl + HP, ...
+    // Each chunk's global loads are issued into registers before the
+    // previous chunk is consumed (double buffering through rq / rk).
+    uint lp = t % CH;
+    uint hl = t / CH;
+    uint dk = pc.d1 + pc.d2;
+    uint kbase = pc.k_off + kvh * pc.kv_stride;
+    float s[HG / HP];
+    for (uint j = 0u; j < HG / HP; ++j) {
+        s[j] = 0.0;
+    }
+    float rq[HG * KC / WG];
+    float rk[CH * KC / WG];
+    for (uint k0 = 0u; k0 < dk + KC; k0 += KC) {
+        if (k0 > 0u) {
+            for (uint u = 0u; u < HG * KC / WG; ++u) {
+                qs[t + u * WG] = rq[u];
+            }
+            for (uint u = 0u; u < CH * KC / WG; ++u) {
+                uint e = t + u * WG;
+                ks[(e / KC) * (KC + 1u) + e % KC] = rk[u];
+            }
+            barrier();
+        }
+        if (k0 < dk) {
+            for (uint u = 0u; u < HG * KC / WG; ++u) {
+                uint e = t + u * WG;
+                uint i = k0 + e % KC;
+                uint h = h0 + min(e / KC, nh - 1u);
+                rq[u] = i < pc.d1 ? q1[h * pc.q1_stride + i]
+                      : i < dk    ? q2[h * pc.q2_stride + pc.q2_off + i -
+                                       pc.d1]
+                                  : 0.0;
+            }
+            for (uint u = 0u; u < CH * KC / WG; ++u) {
+                uint e = t + u * WG;
+                uint p = e / KC;
+                uint i = k0 + e % KC;
+                rk[u] = p < np && i < dk ? kv_at(rowb[p] + kbase + i)
+                                         : 0.0;
+            }
+        }
+        if (k0 > 0u) {
+            for (uint i = 0u; i < KC; ++i) {
+                float kv = ks[lp * (KC + 1u) + i];
+                for (uint j = 0u; j < HG / HP; ++j) {
+                    s[j] += qs[(hl + j * HP) * KC + i] * kv;
+                }
+            }
+            barrier();
+        }
+    }
+    for (uint j = 0u; j < HG / HP; ++j) {
+        sc[(hl + j * HP) * CH + lp] =
+            lp < np ? s[j] * pc.scale : -3.4e38;
+    }
+    barrier();
+    if (t < HG) {
+        float m = -3.4e38;
+        for (uint p = 0u; p < np; ++p) {
+            m = max(m, sc[t * CH + p]);
+        }
+        mh[t] = m;
+    }
+    barrier();
+    for (uint j = 0u; j < HG / HP; ++j) {
+        uint i = (hl + j * HP) * CH + lp;
+        sc[i] = lp < np ? exp(sc[i] - mh[hl + j * HP]) : 0.0;
+    }
+    barrier();
+    if (t < HG) {
+        float l = 0.0;
+        for (uint p = 0u; p < np; ++p) {
+            l += sc[t * CH + p];
+        }
+        lh[t] = l;
+    }
+    barrier();
+
+    // Weighted V: thread (vec4 column d4, head set hs, position slice
+    // sl) accumulates its 4 columns for heads hs * hps .. + hps over
+    // positions sl, sl + nsl, ..., each V vec4 loaded once for all of
+    // them. Slices (nsl > 1, only when hps == 1) keep narrow heads'
+    // threads busy and are summed through red4.
+    uint n4 = pc.dv / 4u;
+    uint hps = (nh * n4 + WG - 1u) / WG;
+    uint hsets = (nh + hps - 1u) / hps;
+    uint used = n4 * hsets;
+    uint nsl = max(WG / used, 1u);
+    uint d4 = t % n4;
+    uint hs = (t / n4) % hsets;
+    uint sl = t / used;
+    bool on = sl < nsl && hps <= HACC;
+    vec4 acc[HACC];
+    for (uint j = 0u; j < HACC; ++j) {
+        acc[j] = vec4(0.0);
+    }
+    uint vbase = pc.v_off + kvh * pc.kv_stride + d4 * 4u;
+    if (on) {
+        // Constant trip counts (guards inside) keep acc in registers.
+        for (uint p = sl; p < np; p += nsl) {
+            vec4 v = kv4_at(rowb[p] + vbase);
+            for (uint j = 0u; j < HACC; ++j) {
+                uint hh = min(hs * hps + j, HG - 1u);
+                acc[j] += sc[hh * CH + p] * v;
+            }
+        }
+    }
+    if (nsl > 1u) {
+        red4[t] = acc[0];
+        barrier();
+        if (on && sl == 0u) {
+            for (uint k = 1u; k < nsl; ++k) {
+                acc[0] += red4[k * used + t];
+            }
+        }
+    }
+    if (!on || sl != 0u) {
+        return;
+    }
+    for (uint j = 0u; j < HACC; ++j) {
+        uint hh = hs * hps + j;
+        if (j >= hps || hh >= nh) {
+            continue;
+        }
+        uint h = h0 + hh;
+        if (n_blocks == 1u) {
+            vec4 r = acc[j] / lh[hh];
+            uint ob = h * pc.out_stride + d4 * 4u;
+            o[ob] = r.x;
+            o[ob + 1u] = r.y;
+            o[ob + 2u] = r.z;
+            o[ob + 3u] = r.w;
+        } else {
+            uint pb = (c * heads + h) * pc.dv + d4 * 4u;
+            part[pb] = acc[j].x;
+            part[pb + 1u] = acc[j].y;
+            part[pb + 2u] = acc[j].z;
+            part[pb + 3u] = acc[j].w;
+            if (d4 == 0u) {
+                uint st = n_blocks * heads * pc.dv + (c * heads + h) * 2u;
+                part[st] = mh[hh];
+                part[st + 1u] = lh[hh];
+            }
+        }
+    }
+}
