@@ -148,6 +148,8 @@ struct State {
     WeightPool pool;
     std::unordered_map<const void*, VulkanContext::Buffer>
         kv_pools;
+    /** --prefill-f16: matmuls take their f16-staging variants. */
+    bool prefill_f16 = false;
     /** Per-model GPU-routing verdict (memory fit), decided once. */
     std::unordered_map<const void*, bool> moe_gpu_fits;
 
@@ -574,6 +576,21 @@ constexpr std::uint32_t kMatmulRows = VulkanContext::kMatmulTileRows;
 constexpr std::uint32_t kMatmulToks = VulkanContext::kMatmulTileToks;
 constexpr std::uint32_t kMatmulToksId = VulkanContext::kMatmulTileToks;
 
+/** @returns k's f16-staging variant under --prefill-f16, else k. */
+Kernel staged(const State& s, Kernel k) {
+    if (!s.prefill_f16) {
+        return k;
+    }
+    switch (k) {
+        case Kernel::kMatmulQ8_0: return Kernel::kMatmulQ8_0H;
+        case Kernel::kMatmulF32: return Kernel::kMatmulF32H;
+        case Kernel::kMatmulQ8_0Id: return Kernel::kMatmulQ8_0IdH;
+        case Kernel::kMatmulPagedF32: return Kernel::kMatmulPagedF32H;
+        case Kernel::kMatmulPagedTF32: return Kernel::kMatmulPagedTF32H;
+        default: return k;
+    }
+}
+
 /** @returns The prefill matmul kernel for w, or kCount_. */
 Kernel matmul_kernel(const Mat& w) {
     switch (w.type) {
@@ -670,7 +687,8 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   plane,
                                   r.x_inner,
                                   r.out_inner};
-    s.ctx.dispatch(k, bufs, push, row_tiles, tiles * r.n_batch * k_splits);
+    s.ctx.dispatch(staged(s, k), bufs, push, row_tiles,
+                   tiles * r.n_batch * k_splits);
     if (k_splits > 1) {
         const VulkanContext::Buffer sbufs[] = {dst, out};
         const std::uint32_t spush[] = {plane, k_splits, 0,
@@ -719,7 +737,7 @@ void rec_matmul_id(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   0,
                                   0,
                                   0};
-    s.ctx.dispatch(Kernel::kMatmulQ8_0Id, bufs, push,
+    s.ctx.dispatch(staged(s, Kernel::kMatmulQ8_0Id), bufs, push,
                    (w.rows + kMatmulRows - 1) / kMatmulRows,
                    tiles * n_expert);
 }
@@ -778,7 +796,8 @@ void rec_paged_matmul(State& s, Kernel k, const PagedPool& pp,
         pp.row_w,     k_splits,
         plane,        r.x_inner,
         r.out_inner};
-    s.ctx.dispatch(k, bufs, push, (rows + kMatmulRows - 1) / kMatmulRows,
+    s.ctx.dispatch(staged(s, k), bufs, push,
+                   (rows + kMatmulRows - 1) / kMatmulRows,
                    tiles * r.n_batch * k_splits);
     if (k_splits > 1) {
         const VulkanContext::Buffer sbufs[] = {dst, out};
@@ -960,6 +979,27 @@ void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
 }
 
 }  // namespace
+
+void vulkan_set_prefill_f16(bool on) {
+    // Tools call this unconditionally: on a box without a usable
+    // device it must not build the context (that throws).
+    if (!vulkan_backend_usable()) {
+        if (on) {
+            std::fprintf(stderr,
+                         "locus: --prefill-f16 ignored: no usable "
+                         "Vulkan device\n");
+        }
+        return;
+    }
+    State& s = state();
+    if (on && !s.ctx.has_f16()) {
+        std::fprintf(stderr,
+                     "locus: --prefill-f16 ignored: the Vulkan device "
+                     "has no shaderFloat16 (prefill stays f32)\n");
+        on = false;
+    }
+    s.prefill_f16 = on;
+}
 
 bool vulkan_backend_usable() {
     static const bool ok = VulkanContext::available();

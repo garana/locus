@@ -10,6 +10,19 @@
 
 namespace locus::backend::vk {
 
+bool VulkanContext::kernel_needs_f16(Kernel k) {
+    switch (k) {
+        case Kernel::kMatmulQ8_0H:
+        case Kernel::kMatmulF32H:
+        case Kernel::kMatmulQ8_0IdH:
+        case Kernel::kMatmulPagedF32H:
+        case Kernel::kMatmulPagedTF32H:
+            return true;
+        default:
+            return false;
+    }
+}
+
 std::uint32_t VulkanContext::matvec_groups(Kernel k,
                                            std::uint32_t rows) {
     switch (k) {
@@ -67,7 +80,9 @@ void VulkanContext::report_profile() const {
         "attn_softmax", "sum_splits",   "matvec_t_q8",
         "matvec_q8_0_glu", "matvec_q8_0_glu_b", "attn_decode",
         "attn_combine", "matvec_q8_0_seg", "matvec_q8_0_sh_b",
-        "matvec_q8_0_glu_sh_b", "attn_decode_grp"};
+        "matvec_q8_0_glu_sh_b", "attn_decode_grp", "matmul_q8_0_h",
+        "matmul_f32_h", "matmul_q8_0_id_h", "matmul_paged_h",
+        "matmul_paged_t_h"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -165,6 +180,11 @@ static_assert(locus::backend::vk::kAttnDecodeQMax ==
 #include "matvec_q8_0_sh_b_spv.h"
 #include "matvec_q8_0_glu_sh_b_spv.h"
 #include "attn_decode_grp_spv.h"
+#include "matmul_q8_0_h_spv.h"
+#include "matmul_f32_h_spv.h"
+#include "matmul_q8_0_id_h_spv.h"
+#include "matmul_paged_f32_h_spv.h"
+#include "matmul_paged_t_f32_h_spv.h"
 
 namespace locus::backend::vk {
 
@@ -325,6 +345,14 @@ const KernelDesc& kernel_desc(Kernel k) {
          sizeof(locus_matvec_q8_0_glu_sh_b_spv), 7, 60},
         {locus_attn_decode_grp_spv, sizeof(locus_attn_decode_grp_spv), 6,
          64},
+        {locus_matmul_q8_0_h_spv, sizeof(locus_matmul_q8_0_h_spv), 3, 96},
+        {locus_matmul_f32_h_spv, sizeof(locus_matmul_f32_h_spv), 3, 96},
+        {locus_matmul_q8_0_id_h_spv, sizeof(locus_matmul_q8_0_id_h_spv), 4,
+         96},
+        {locus_matmul_paged_f32_h_spv, sizeof(locus_matmul_paged_f32_h_spv),
+         4, 96},
+        {locus_matmul_paged_t_f32_h_spv,
+         sizeof(locus_matmul_paged_t_f32_h_spv), 4, 96},
     };
     static_assert(std::size(descs) ==
                   static_cast<std::size_t>(Kernel::kCount_));
@@ -460,6 +488,8 @@ struct VulkanContext::Impl {
      * compute-to-compute barrier.
      */
     bool serial_dispatch = false;
+    /** shaderFloat16 supported and enabled (f16 kernels built). */
+    bool has_f16 = false;
     /** Bytes currently allocated through make_buffer. */
     VkDeviceSize allocated = 0;
 
@@ -588,6 +618,10 @@ struct VulkanContext::Impl {
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
         std::vector<const char*> dexts;
+        // Enabled through dci.pNext when the device has it.
+        VkPhysicalDeviceShaderFloat16Int8Features f16f{};
+        f16f.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
 #if defined(__APPLE__)
         dexts.push_back("VK_KHR_portability_subset");
 #endif
@@ -599,7 +633,13 @@ struct VulkanContext::Impl {
             vkEnumerateDeviceExtensionProperties(phys, nullptr, &en,
                                                  exts.data());
             bool has_driver_props = false;
+            bool has_f16_ext = false;
             for (const auto& e : exts) {
+                has_f16_ext =
+                    has_f16_ext ||
+                    std::strcmp(e.extensionName,
+                                VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) ==
+                        0;
                 if (std::strcmp(e.extensionName,
                                 VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) ==
                     0) {
@@ -611,6 +651,25 @@ struct VulkanContext::Impl {
                     std::strcmp(e.extensionName,
                                 VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME) ==
                         0;
+            }
+            // LOCUS_VK_NO_F16=1 takes the no-shaderFloat16 path on any
+            // device (to check the fallback).
+            if (has_f16_ext && std::getenv("LOCUS_VK_NO_F16") == nullptr) {
+                // The f16 kernels (--prefill-f16) need shaderFloat16;
+                // without it they are not built and the flag is a
+                // no-op.
+                VkPhysicalDeviceFeatures2 f2{};
+                f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                f2.pNext = &f16f;
+                vkGetPhysicalDeviceFeatures2(phys, &f2);
+                has_f16 = f16f.shaderFloat16 == VK_TRUE;
+                if (has_f16) {
+                    dexts.push_back(
+                        VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+                    f16f.shaderInt8 = VK_FALSE;
+                    f16f.pNext = nullptr;
+                    dci.pNext = &f16f;
+                }
             }
             if (has_driver_props) {
                 VkPhysicalDeviceDriverProperties dp{};
@@ -648,9 +707,21 @@ struct VulkanContext::Impl {
             vkGetPhysicalDeviceProperties(phys, &pp);
             max_shared_mem = pp.limits.maxComputeSharedMemorySize;
         }
+        if (!has_f16) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                std::fprintf(stderr,
+                             "locus: Vulkan device has no shaderFloat16: "
+                             "f16 kernels skipped (--prefill-f16 off)\n");
+            }
+        }
         for (int k = 0; k < static_cast<int>(Kernel::kCount_);
              ++k) {
-            create_pipe(static_cast<Kernel>(k));
+            if (has_f16 ||
+                !VulkanContext::kernel_needs_f16(static_cast<Kernel>(k))) {
+                create_pipe(static_cast<Kernel>(k));
+            }
         }
 
         new_dpool();
@@ -1068,6 +1139,8 @@ bool VulkanContext::serial_dispatch() const {
     return impl_->serial_dispatch;
 }
 
+bool VulkanContext::has_f16() const { return impl_->has_f16; }
+
 std::uint64_t VulkanContext::memory_available() const {
     const Impl& im = *impl_;
     const std::uint32_t heap = im.host_heap();
@@ -1203,6 +1276,7 @@ void VulkanContext::end_batch() { no_kernels(); }
 void VulkanContext::note_token() { no_kernels(); }
 std::uint64_t VulkanContext::memory_available() const { no_kernels(); }
 bool VulkanContext::serial_dispatch() const { no_kernels(); }
+bool VulkanContext::has_f16() const { no_kernels(); }
 const VulkanContext::Profile& VulkanContext::profile() const {
     no_kernels();
 }

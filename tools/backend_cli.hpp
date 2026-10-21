@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/arch.hpp"
 #include "locus/sys/features.hpp"
@@ -177,6 +178,9 @@ inline constexpr const char* kCommonHelp =
     "                   report aggregate tok/s (bench mode)\n"
     "  --metrics-path P locus-server: serve Prometheus metrics at\n"
     "                   path P (default /metrics)\n"
+    "  --prefill-f16    Vulkan: stage prefill matmul operands in\n"
+    "                   f16 (faster prompt ingestion; opt-in, the\n"
+    "                   f32 default is exact)\n"
     "  --batch-decode   enable R10 cross-sequence batched decode\n"
     "  --no-batch-prefill  force per-token prompt ingestion\n"
     "  --timing         locus-run: print prefill and decode\n"
@@ -232,6 +236,8 @@ struct BackendArgs {
     /** From --concurrent N: submit the prompt N times and report
      * aggregate throughput (bench mode; default 1 = normal run). */
     std::uint32_t concurrent = 1;
+    /** --prefill-f16: f16 operand staging in Vulkan prefill. */
+    bool prefill_f16 = false;
     /** --batch-decode: enable R10 cross-sequence batched decode. */
     bool batch_decode = false;
     /** --no-batch-prefill: force per-token prompt ingestion. */
@@ -290,6 +296,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         } else if (a.rfind("--concurrent=", 0) == 0) {
             out.concurrent = static_cast<std::uint32_t>(
                 std::atol(std::string(a.substr(13)).c_str()));
+        } else if (a == "--prefill-f16") {
+            out.prefill_f16 = true;
         } else if (a == "--batch-decode") {
             out.batch_decode = true;
         } else if (a == "--no-batch-prefill") {

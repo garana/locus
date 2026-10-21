@@ -2,6 +2,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <random>
@@ -121,16 +122,26 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
         locus::gguf::TensorType type;
         Kernel kernel;
         std::uint32_t cols;
+        float margin;  // f16 staging rounds both operands
     };
     const Case cases[] = {
-        {"q8_0", locus::gguf::TensorType::kQ8_0, Kernel::kMatmulQ8_0, 96},
-        {"f32", locus::gguf::TensorType::kF32, Kernel::kMatmulF32, 80},
+        {"q8_0", locus::gguf::TensorType::kQ8_0, Kernel::kMatmulQ8_0, 96,
+         1e-4f},
+        {"f32", locus::gguf::TensorType::kF32, Kernel::kMatmulF32, 80,
+         1e-4f},
+        {"q8_0 f16 staging", locus::gguf::TensorType::kQ8_0,
+         Kernel::kMatmulQ8_0H, 96, 2e-2f},
+        {"f32 f16 staging", locus::gguf::TensorType::kF32,
+         Kernel::kMatmulF32H, 80, 2e-2f},
     };
     const std::uint32_t rows = 100, n_tok = 70, n_batch = 3;
     const std::uint32_t x_stride = 300, out_stride = 333;
     const std::uint32_t x_bstride = 7, out_bstride = 101;
     const float scale = 0.75f;
     for (const Case& c : cases) {
+        if (VulkanContext::kernel_needs_f16(c.kernel) && !ctx.has_f16()) {
+            continue;  // f16 kernels exist only with shaderFloat16
+        }
         DYNAMIC_SECTION(c.name) {
             const bool q8 = c.type == locus::gguf::TensorType::kQ8_0;
             const std::size_t mat_bytes =
@@ -186,8 +197,8 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
                             INFO("acc " << acc << " batch " << b
                                         << " token " << t << " row "
                                         << r);
-                            REQUIRE(got[at] ==
-                                    Catch::Approx(want).margin(1e-4));
+                            REQUIRE(got[at] == Catch::Approx(want)
+                                                   .margin(c.margin));
                         }
                     }
                 }
@@ -453,6 +464,53 @@ TEST_CASE("vulkan batched prefill tracks per-token prefill",
     }
 }
 
+TEST_CASE("vulkan f16 prefill staging tracks the f32 prefill",
+          "[e2e][vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    if (!VulkanContext().has_f16()) {
+        SKIP("device has no shaderFloat16: --prefill-f16 is a no-op");
+    }
+    // Opt-in (--prefill-f16): batched prefill with f16-staged matmul
+    // operands stays close to the exact f32 path (not bit-exact).
+    struct Restore {
+        ~Restore() { locus::backend::vulkan_set_prefill_f16(false); }
+    } restore;
+    const char* const models[] = {"llama-3.2-1b-q8_0.gguf",
+                                  "deepseek-coder-v2-lite-q8_0.gguf"};
+    std::size_t ran = 0;
+    for (const char* name : models) {
+        const std::string path = test_model(name);
+        if (!std::filesystem::exists(path)) {
+            continue;
+        }
+        DYNAMIC_SECTION(name) {
+            ++ran;
+            auto g = locus::gguf::GgufFile::open(path);
+            auto model = locus::model::TransformerModel::load(g);
+            model.use_backend(*locus::backend::find_backend("vulkan"));
+            std::mt19937 rng(67);
+            std::uniform_int_distribution<int> id(
+                100, static_cast<int>(model.hparams().n_vocab) - 100);
+            std::vector<locus::tok::TokenId> prompt(150);
+            for (auto& t : prompt) {
+                t = id(rng);
+            }
+            locus::backend::vulkan_set_prefill_f16(false);
+            const auto [f32_l, f32_gen] = prefill_run(model, prompt, 64, 0);
+            locus::backend::vulkan_set_prefill_f16(true);
+            const auto [f16_l, f16_gen] = prefill_run(model, prompt, 64, 0);
+            locus::backend::vulkan_set_prefill_f16(false);
+            REQUIRE(cosine(f16_l, f32_l) > 0.999);
+            REQUIRE(f16_l != f32_l);  // the staging really ran
+        }
+    }
+    if (ran == 0) {
+        SKIP("no prefill test model present (llama-3.2-1b-q8_0.gguf)");
+    }
+}
+
 // Hidden micro-benchmark for matmul.comp tuning; run explicitly:
 //   ./build/tests/locus_tests "bench: vulkan matmul"
 TEST_CASE("bench: vulkan matmul throughput", "[.][bench][vulkan]") {
@@ -592,5 +650,52 @@ TEST_CASE("bench: vulkan f32 matvec bandwidth", "[.][bench][vulkan]") {
         for (auto b : {wb, xb, ob}) {
             ctx.destroy_buffer(b);
         }
+    }
+}
+
+TEST_CASE("only the f16-staging matmuls need shaderFloat16", "[vulkan]") {
+    // Devices without shaderFloat16 skip exactly these pipelines, so
+    // the rest of the backend still comes up.
+    for (int k = 0; k < static_cast<int>(Kernel::kCount_); ++k) {
+        const auto kk = static_cast<Kernel>(k);
+        const bool h = kk == Kernel::kMatmulQ8_0H ||
+                       kk == Kernel::kMatmulF32H ||
+                       kk == Kernel::kMatmulQ8_0IdH ||
+                       kk == Kernel::kMatmulPagedF32H ||
+                       kk == Kernel::kMatmulPagedTF32H;
+        INFO("kernel " << k);
+        REQUIRE(VulkanContext::kernel_needs_f16(kk) == h);
+    }
+}
+
+TEST_CASE("vulkan comes up without shaderFloat16, f16 kernels skipped",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    // LOCUS_VK_NO_F16 forces the path a device without shaderFloat16
+    // takes: the context still builds, only the f16 kernels are absent.
+    setenv("LOCUS_VK_NO_F16", "1", 1);
+    struct Unset {
+        ~Unset() { unsetenv("LOCUS_VK_NO_F16"); }
+    } unset;
+    VulkanContext ctx;
+    REQUIRE_FALSE(ctx.has_f16());
+    // A non-f16 kernel still runs: 4 rows of an f32 matvec.
+    const std::vector<float> w = {1, 2, 3, 4, 5, 6, 7, 8};
+    const std::vector<float> x = {1, -1};
+    auto wb = upload(ctx, w);
+    auto xb = upload(ctx, x);
+    auto ob = ctx.create_buffer(4 * 4);
+    ctx.begin_batch();
+    const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+    const std::uint32_t push[] = {4, 2, 0, 0, 0, 0, fbits(1.0f)};
+    ctx.dispatch(Kernel::kMatvecF32, bufs, push,
+                 VulkanContext::matvec_groups(Kernel::kMatvecF32, 4));
+    ctx.end_batch();
+    const auto got = download<float>(ctx, ob, 4);
+    REQUIRE(got == std::vector<float>{-1, -1, -1, -1});
+    for (auto b : {wb, xb, ob}) {
+        ctx.destroy_buffer(b);
     }
 }

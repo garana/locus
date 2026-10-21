@@ -1,4 +1,7 @@
 #version 450
+#ifdef F16_STAGE
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 
 // Tiled matmul for batched prefill: out[t][r] (+)= scale *
 // dot(W row r, X row t) for n_tok token rows at once, so each weight
@@ -17,6 +20,11 @@
 // cache position r (scores: S = K Q^T), PAGED_T makes column c cache
 // position c (outputs: O = V^T P); w_off then offsets within a
 // position's row_w-float cache row.
+//
+// With F16_STAGE (the *_h variants, opt-in --prefill-f16) both
+// operands are staged in shared memory as f16 and widened back for
+// f32 math: half the shared traffic, at f16 rounding of the
+// dequantized weights and the activations (not bit-exact to f32).
 //
 // Split-K (k_splits > 1, decode attention: few output tiles, a long
 // K): workgroup y also picks a slice ks of the K range and writes its
@@ -110,8 +118,15 @@ layout(push_constant) uniform PC {
     uint out_inner;
 } pc;
 
-shared vec4 ws[BK][BM / 4u];
-shared vec4 xs[BK][BN / 4u];
+#ifdef F16_STAGE
+#define SVEC f16vec4
+#define SVAL(v) float16_t(v)
+#else
+#define SVEC vec4
+#define SVAL(v) (v)
+#endif
+shared SVEC ws[BK][BM / 4u];
+shared SVEC xs[BK][BN / 4u];
 shared uint rows_x[BN];
 shared uint rows_o[BN];
 
@@ -218,25 +233,25 @@ void main() {
                 int q = int(word_at(q0 + h * 4u));
                 uint c = sub * VPT + h * 4u;
                 ws[c][lr / 4u][lr % 4u] =
-                    d * float(bitfieldExtract(q, 0, 8));
+                    SVAL(d * float(bitfieldExtract(q, 0, 8)));
                 ws[c + 1u][lr / 4u][lr % 4u] =
-                    d * float(bitfieldExtract(q, 8, 8));
+                    SVAL(d * float(bitfieldExtract(q, 8, 8)));
                 ws[c + 2u][lr / 4u][lr % 4u] =
-                    d * float(bitfieldExtract(q, 16, 8));
+                    SVAL(d * float(bitfieldExtract(q, 16, 8)));
                 ws[c + 3u][lr / 4u][lr % 4u] =
-                    d * float(bitfieldExtract(q, 24, 8));
+                    SVAL(d * float(bitfieldExtract(q, 24, 8)));
             }
         } else {
             for (uint c = sub * VPT; c < sub * VPT + VPT; ++c) {
-                ws[c][lr / 4u][lr % 4u] = 0.0;
+                ws[c][lr / 4u][lr % 4u] = SVAL(0.0);
             }
         }
 #else
         for (uint c = sub * VPT; c < sub * VPT + VPT; ++c) {
             uint kc = k0 + c;
-            ws[c][lr / 4u][lr % 4u] = (r < pc.rows && kc < k_end)
-                                          ? w_at(wbase, r, kc)
-                                          : 0.0;
+            ws[c][lr / 4u][lr % 4u] = SVAL((r < pc.rows && kc < k_end)
+                                               ? w_at(wbase, r, kc)
+                                               : 0.0);
         }
 #endif
         // Activations: BN tokens x BK columns, strided over threads.
@@ -244,19 +259,19 @@ void main() {
             uint tl = idx / BK;
             uint c = idx % BK;
             uint kc = k0 + c;
-            xs[c][tl / 4u][tl % 4u] = (tl < n_here && kc < k_end)
-                                          ? x[rows_x[tl] + kc]
-                                          : 0.0;
+            xs[c][tl / 4u][tl % 4u] = SVAL((tl < n_here && kc < k_end)
+                                               ? x[rows_x[tl] + kc]
+                                               : 0.0);
         }
         barrier();
         for (uint k = 0u; k < BK; ++k) {
             vec4 a[TM / 4u];
             vec4 bv[TN / 4u];
             for (uint i = 0u; i < TM / 4u; ++i) {
-                a[i] = ws[k][ty * (TM / 4u) + i];
+                a[i] = vec4(ws[k][ty * (TM / 4u) + i]);
             }
             for (uint j = 0u; j < TN / 4u; ++j) {
-                bv[j] = xs[k][tx * (TN / 4u) + j];
+                bv[j] = vec4(xs[k][tx * (TN / 4u) + j]);
             }
             for (uint i = 0u; i < TM; ++i) {
                 for (uint j = 0u; j < TN / 4u; ++j) {

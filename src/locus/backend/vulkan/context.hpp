@@ -61,6 +61,12 @@ enum class Kernel {
     kMatvecQ8_0GluShB,
     /** attn_decode reading each K/V row once for a head group. */
     kAttnDecodeGrp,
+    /** Prefill matmuls with f16 operand staging (--prefill-f16). */
+    kMatmulQ8_0H,
+    kMatmulF32H,
+    kMatmulQ8_0IdH,
+    kMatmulPagedF32H,
+    kMatmulPagedTF32H,
     kCount_,
 };
 
@@ -168,6 +174,18 @@ class VulkanContext {
      * @returns true when barriers are elided.
      */
     bool serial_dispatch() const;
+
+    /**
+     * Whether the device does f16 shader arithmetic (shaderFloat16,
+     * enabled at device creation): the kernels that need it
+     * (kernel_needs_f16) exist only then.
+     *
+     * @returns true when the f16 kernels can be dispatched.
+     */
+    bool has_f16() const;
+
+    /** @returns Whether kernel k needs has_f16(). */
+    static bool kernel_needs_f16(Kernel k);
 
     /** Counts one forwarded token toward the profile. */
     void note_token();
