@@ -87,6 +87,7 @@ int main(int argc, char** argv) {
             cfg.n_blocks = (args.ctx + 15) / 16;
         }
         cfg.batched_decode = args.batch_decode;
+        cfg.speculative = args.speculative;
         cfg.batched_prefill = !args.no_batch_prefill;
         locus::engine::Engine engine(model, tok.eos_id(), cfg);
 
@@ -131,6 +132,15 @@ int main(int argc, char** argv) {
                     ids.size(), pf,
                     pf > 0 ? 1000.0 * ids.size() / pf : 0.0, n_out - 1,
                     dec, dec > 0 ? 1000.0 * (n_out - 1) / dec : 0.0);
+                if (cfg.speculative) {
+                    std::fprintf(stderr,
+                                 "speculative: %llu verify steps, %llu "
+                                 "drafts accepted\n",
+                                 static_cast<unsigned long long>(
+                                     engine.spec_steps()),
+                                 static_cast<unsigned long long>(
+                                     engine.spec_accepted_tokens()));
+                }
             }
         } else {
             // Bench: submit the prompt `conc` times and time the

@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
         if (args.ctx > 0) {
             opt.engine.n_blocks = (args.ctx + 15) / 16;
         }
+        opt.engine.speculative = args.speculative;
         opt.chat_template =
             locus::chat::ChatTemplate::from_gguf(g);
         if (!args.metrics_path.empty()) {

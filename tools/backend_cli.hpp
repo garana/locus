@@ -181,6 +181,10 @@ inline constexpr const char* kCommonHelp =
     "  --prefill-f16    Vulkan: stage prefill matmul operands in\n"
     "                   f16 (faster prompt ingestion; opt-in, the\n"
     "                   f32 default is exact)\n"
+    "  --speculative    prompt-lookup speculative decoding: draft\n"
+    "                   tokens from n-grams already in the context,\n"
+    "                   verified in one batched forward (greedy,\n"
+    "                   same output; wins when output repeats input)\n"
     "  --batch-decode   enable R10 cross-sequence batched decode\n"
     "  --no-batch-prefill  force per-token prompt ingestion\n"
     "  --timing         locus-run: print prefill and decode\n"
@@ -238,6 +242,8 @@ struct BackendArgs {
     std::uint32_t concurrent = 1;
     /** --prefill-f16: f16 operand staging in Vulkan prefill. */
     bool prefill_f16 = false;
+    /** --speculative: prompt-lookup speculative decoding. */
+    bool speculative = false;
     /** --batch-decode: enable R10 cross-sequence batched decode. */
     bool batch_decode = false;
     /** --no-batch-prefill: force per-token prompt ingestion. */
@@ -298,6 +304,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
                 std::atol(std::string(a.substr(13)).c_str()));
         } else if (a == "--prefill-f16") {
             out.prefill_f16 = true;
+        } else if (a == "--speculative") {
+            out.speculative = true;
         } else if (a == "--batch-decode") {
             out.batch_decode = true;
         } else if (a == "--no-batch-prefill") {

@@ -139,3 +139,19 @@ TEST_CASE("locus-run starts without a Vulkan device", "[cli]") {
         REQUIRE(std::system(cmd.c_str()) == 0);
     }
 }
+
+TEST_CASE("--speculative parses as a flag", "[cli]") {
+    std::array<const char*, 3> argv1 = {"prog", "--speculative",
+                                        "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()),
+        const_cast<char**>(argv1.data()));
+    REQUIRE(a.speculative);
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+
+    std::array<const char*, 2> argv2 = {"prog", "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()),
+        const_cast<char**>(argv2.data()));
+    REQUIRE_FALSE(b.speculative);  // off by default
+}
