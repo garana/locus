@@ -2,6 +2,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <random>
@@ -138,6 +139,9 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
     const std::uint32_t x_bstride = 7, out_bstride = 101;
     const float scale = 0.75f;
     for (const Case& c : cases) {
+        if (VulkanContext::kernel_needs_f16(c.kernel) && !ctx.has_f16()) {
+            continue;  // f16 kernels exist only with shaderFloat16
+        }
         DYNAMIC_SECTION(c.name) {
             const bool q8 = c.type == locus::gguf::TensorType::kQ8_0;
             const std::size_t mat_bytes =
@@ -465,6 +469,9 @@ TEST_CASE("vulkan f16 prefill staging tracks the f32 prefill",
     if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device / kernels not built");
     }
+    if (!VulkanContext().has_f16()) {
+        SKIP("device has no shaderFloat16: --prefill-f16 is a no-op");
+    }
     // Opt-in (--prefill-f16): batched prefill with f16-staged matmul
     // operands stays close to the exact f32 path (not bit-exact).
     struct Restore {
@@ -643,5 +650,52 @@ TEST_CASE("bench: vulkan f32 matvec bandwidth", "[.][bench][vulkan]") {
         for (auto b : {wb, xb, ob}) {
             ctx.destroy_buffer(b);
         }
+    }
+}
+
+TEST_CASE("only the f16-staging matmuls need shaderFloat16", "[vulkan]") {
+    // Devices without shaderFloat16 skip exactly these pipelines, so
+    // the rest of the backend still comes up.
+    for (int k = 0; k < static_cast<int>(Kernel::kCount_); ++k) {
+        const auto kk = static_cast<Kernel>(k);
+        const bool h = kk == Kernel::kMatmulQ8_0H ||
+                       kk == Kernel::kMatmulF32H ||
+                       kk == Kernel::kMatmulQ8_0IdH ||
+                       kk == Kernel::kMatmulPagedF32H ||
+                       kk == Kernel::kMatmulPagedTF32H;
+        INFO("kernel " << k);
+        REQUIRE(VulkanContext::kernel_needs_f16(kk) == h);
+    }
+}
+
+TEST_CASE("vulkan comes up without shaderFloat16, f16 kernels skipped",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    // LOCUS_VK_NO_F16 forces the path a device without shaderFloat16
+    // takes: the context still builds, only the f16 kernels are absent.
+    setenv("LOCUS_VK_NO_F16", "1", 1);
+    struct Unset {
+        ~Unset() { unsetenv("LOCUS_VK_NO_F16"); }
+    } unset;
+    VulkanContext ctx;
+    REQUIRE_FALSE(ctx.has_f16());
+    // A non-f16 kernel still runs: 4 rows of an f32 matvec.
+    const std::vector<float> w = {1, 2, 3, 4, 5, 6, 7, 8};
+    const std::vector<float> x = {1, -1};
+    auto wb = upload(ctx, w);
+    auto xb = upload(ctx, x);
+    auto ob = ctx.create_buffer(4 * 4);
+    ctx.begin_batch();
+    const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+    const std::uint32_t push[] = {4, 2, 0, 0, 0, 0, fbits(1.0f)};
+    ctx.dispatch(Kernel::kMatvecF32, bufs, push,
+                 VulkanContext::matvec_groups(Kernel::kMatvecF32, 4));
+    ctx.end_batch();
+    const auto got = download<float>(ctx, ob, 4);
+    REQUIRE(got == std::vector<float>{-1, -1, -1, -1});
+    for (auto b : {wb, xb, ob}) {
+        ctx.destroy_buffer(b);
     }
 }

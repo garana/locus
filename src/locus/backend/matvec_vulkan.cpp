@@ -980,7 +980,16 @@ void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
 
 }  // namespace
 
-void vulkan_set_prefill_f16(bool on) { state().prefill_f16 = on; }
+void vulkan_set_prefill_f16(bool on) {
+    State& s = state();
+    if (on && !s.ctx.has_f16()) {
+        std::fprintf(stderr,
+                     "locus: --prefill-f16 ignored: the Vulkan device "
+                     "has no shaderFloat16 (prefill stays f32)\n");
+        on = false;
+    }
+    s.prefill_f16 = on;
+}
 
 bool vulkan_backend_usable() {
     static const bool ok = VulkanContext::available();
