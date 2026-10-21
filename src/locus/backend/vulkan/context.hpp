@@ -28,6 +28,11 @@ enum class Kernel {
     kAttnMla,
     kAttnPagedQ,
     kKvStoreQ,
+    /** Batched (-DBATCHED) matvecs: one dispatch, several matrices. */
+    kMatvecF32B,
+    kMatvecF16B,
+    kMatvecQ8_0B,
+    kMoeRoute,
     kCount_,
 };
 
@@ -52,6 +57,60 @@ class VulkanContext {
   public:
     /** @returns true when built with kernels and a device exists. */
     static bool available();
+
+    /**
+     * Per-process batch timing, collected when LOCUS_VK_PROFILE is
+     * set (GPU time via timestamp queries). host_ms covers
+     * begin_batch .. end_batch on the CPU (recording plus any host
+     * work between), wait_ms the submit + vkQueueWaitIdle, gpu_ms
+     * the device time between the batch's first and last command.
+     * With LOCUS_VK_PROFILE=2, kernel_ms splits that per kernel (a
+     * timestamp after each dispatch, which the inter-dispatch
+     * barrier serializes; costs host time on some drivers).
+     */
+    struct Profile {
+        std::uint64_t tokens = 0;
+        std::uint64_t batches = 0;
+        std::uint64_t dispatches = 0;
+        double host_ms = 0.0;
+        double wait_ms = 0.0;
+        double gpu_ms = 0.0;
+        double kernel_ms[static_cast<int>(Kernel::kCount_)] = {};
+        std::uint64_t kernel_n[static_cast<int>(Kernel::kCount_)] =
+            {};
+    };
+
+    /**
+     * Workgroup count covering `rows` output rows of a matvec kernel
+     * (kMatvec*, not kMatvecT): row-parallel kernels map 4 rows to a
+     * workgroup, the older one-thread-per-row kernels 64.
+     *
+     * @returns The X group count to pass to dispatch().
+     */
+    static std::uint32_t matvec_groups(Kernel k, std::uint32_t rows);
+
+    /** @returns true when LOCUS_VK_PROFILE is set. */
+    static bool profiling();
+
+    /**
+     * Device memory this context can still allocate, per
+     * memory_available_from() (mem_fit.hpp): VK_EXT_memory_budget
+     * when the device has it, else 3/4 of the heap minus this
+     * context's allocations (the heap backing its host-visible
+     * buffers).
+     *
+     * @returns Available bytes (0 when exhausted).
+     */
+    std::uint64_t memory_available() const;
+
+    /** Counts one forwarded token toward the profile. */
+    void note_token();
+
+    /** @returns The profile collected so far. */
+    const Profile& profile() const;
+
+    /** Prints the per-token profile to stderr (when profiling). */
+    void report_profile() const;
 
     /** @throws std::runtime_error when no usable device. */
     VulkanContext();
@@ -87,10 +146,11 @@ class VulkanContext {
      * @param k Kernel to run; buffer count must match its layout.
      * @param push Raw push constants (floats bit-cast to uint32).
      * @param groups_x X workgroup count.
+     * @param groups_y Y workgroup count (batched slots / heads).
      */
     void dispatch(Kernel k, std::span<const Buffer> buffers,
                   std::span<const std::uint32_t> push,
-                  std::uint32_t groups_x);
+                  std::uint32_t groups_x, std::uint32_t groups_y = 1);
 
     /** Submits the batch and waits for completion. */
     void end_batch();

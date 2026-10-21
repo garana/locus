@@ -88,7 +88,8 @@ TEST_CASE("vulkan q8_0 matvec matches the CPU reference",
     const std::uint32_t push[] = {
         rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
     ctx.dispatch(Kernel::kMatvecQ8_0, bufs, push,
-                 (rows + 63) / 64);
+                 VulkanContext::matvec_groups(Kernel::kMatvecQ8_0,
+                                              rows));
     ctx.end_batch();
     ctx.read_buffer(ob, std::as_writable_bytes(std::span(gpu)));
 
@@ -126,7 +127,8 @@ TEST_CASE("vulkan f16 and q4_0 matvec match the CPU reference",
         const VulkanContext::Buffer bufs[] = {wb, xb, ob};
         const std::uint32_t push[] = {
         rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
-        ctx.dispatch(k, bufs, push, (rows + 63) / 64);
+        ctx.dispatch(k, bufs, push,
+                     VulkanContext::matvec_groups(k, rows));
         ctx.end_batch();
         ctx.read_buffer(ob, std::as_writable_bytes(out));
         ctx.destroy_buffer(wb);
@@ -272,7 +274,8 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
         const VulkanContext::Buffer bufs[] = {wb, xb, ob};
         const std::uint32_t push[] = {
         rows, cols, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(1.0f)};
-        ctx.dispatch(c.kernel, bufs, push, (rows + 63) / 64);
+        ctx.dispatch(c.kernel, bufs, push,
+                     VulkanContext::matvec_groups(c.kernel, rows));
         ctx.end_batch();
         ctx.read_buffer(ob,
                         std::as_writable_bytes(std::span(gpu)));
@@ -450,4 +453,21 @@ TEST_CASE("vulkan matvec validates sizes", "[vulkan]") {
     std::vector<float> w(6), x(3), out(1);  // out too small
     REQUIRE_THROWS_AS(ctx.matvec_f32(w, 2, 3, x, out),
                       std::runtime_error);
+}
+
+TEST_CASE("vulkan memory_available drops as buffers are allocated",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    const std::uint64_t before = ctx.memory_available();
+    REQUIRE(before > 0);
+    const std::size_t bytes = std::size_t{256} << 20;
+    auto b = ctx.create_buffer(bytes);
+    const std::uint64_t during = ctx.memory_available();
+    ctx.destroy_buffer(b);
+    // Budget-backed drivers may report usage coarsely; require at
+    // least half the allocation to show up.
+    REQUIRE(during + bytes / 2 <= before);
 }

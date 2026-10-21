@@ -1,0 +1,185 @@
+#version 450
+
+// MoE expert selection on the GPU, mirroring model::moe_select so a
+// MoE layer needs no host round-trip: gating (softmax or sigmoid)
+// over the router logits, optional selection bias (V3/K2),
+// group-limited routing (each group scored by its top-2), top-k
+// with lowest-index tie-break, then optional weight normalization
+// and scaling. One 256-thread workgroup: the gating and the k
+// argmax scans are parallel reductions; the (rare, V3-only) group
+// mask runs on thread 0.
+//
+// L holds 2 * n_expert floats: the logits (rewritten in place as
+// gate probabilities) and selection-score scratch. ROUTE receives
+// ids[k] then the k weights as float bits -- the layout the
+// batched matvec kernels read.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer L { float l[]; };
+layout(std430, binding = 1) readonly buffer B { float bias[]; };
+layout(std430, binding = 2) writeonly buffer R { uint route[]; };
+
+layout(push_constant) uniform PC {
+    uint n_expert;
+    uint k;
+    uint sigmoid;       // 0 = softmax gating, 1 = sigmoid
+    uint has_bias;
+    uint n_group;       // <= 32; 0 or 1 = no group limit
+    uint n_group_used;
+    uint norm;          // normalize picked weights to sum 1
+    float scale;
+} pc;
+
+#define WG 256u
+#define MAX_K 16u
+#define TAKEN -3.4e38
+
+shared float sv[WG];
+shared uint si[WG];
+shared uint picked[MAX_K];
+
+float reduce_max(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    sv[tid] = v;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (tid < step) {
+            sv[tid] = max(sv[tid], sv[tid + step]);
+        }
+        barrier();
+    }
+    float r = sv[0];
+    barrier();
+    return r;
+}
+
+float reduce_sum(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    sv[tid] = v;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (tid < step) {
+            sv[tid] += sv[tid + step];
+        }
+        barrier();
+    }
+    float r = sv[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint n = pc.n_expert;
+    if (pc.sigmoid == 0u) {
+        float mx = TAKEN;
+        for (uint e = tid; e < n; e += WG) {
+            mx = max(mx, l[e]);
+        }
+        mx = reduce_max(mx);
+        float sum = 0.0;
+        for (uint e = tid; e < n; e += WG) {
+            float v = exp(l[e] - mx);
+            l[e] = v;
+            sum += v;
+        }
+        sum = reduce_sum(sum);
+        for (uint e = tid; e < n; e += WG) {
+            l[e] /= sum;
+        }
+    } else {
+        for (uint e = tid; e < n; e += WG) {
+            l[e] = 1.0 / (1.0 + exp(-l[e]));
+        }
+    }
+    for (uint e = tid; e < n; e += WG) {
+        l[n + e] = l[e] + (pc.has_bias != 0u ? bias[e] : 0.0);
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (pc.n_group > 1u && tid == 0u) {
+        uint per = n / pc.n_group;
+        uint keep = 0u;
+        for (uint g = 0u; g < pc.n_group_used; ++g) {
+            uint best = pc.n_group;
+            float best_s = 0.0;
+            for (uint gi = 0u; gi < pc.n_group; ++gi) {
+                if ((keep & (1u << gi)) != 0u) {
+                    continue;
+                }
+                float top1 = -1e30, top2 = -1e30;
+                for (uint e = gi * per; e < (gi + 1u) * per; ++e) {
+                    float s = l[n + e];
+                    if (s > top1) {
+                        top2 = top1;
+                        top1 = s;
+                    } else if (s > top2) {
+                        top2 = s;
+                    }
+                }
+                float gs = top1 + (per > 1u ? top2 : 0.0);
+                if (best == pc.n_group || gs > best_s) {
+                    best = gi;
+                    best_s = gs;
+                }
+            }
+            keep |= 1u << best;
+        }
+        for (uint e = 0u; e < n; ++e) {
+            if ((keep & (1u << (e / per))) == 0u) {
+                l[n + e] = -1e30;
+            }
+        }
+    }
+    memoryBarrierBuffer();
+    barrier();
+    // k argmax scans; ties go to the lowest index (as on the CPU),
+    // and a picked expert drops below every masked one.
+    for (uint j = 0u; j < pc.k; ++j) {
+        float bv = TAKEN;
+        uint bi = n;
+        for (uint e = tid; e < n; e += WG) {
+            float v = l[n + e];
+            if (bi == n || v > bv) {
+                bv = v;
+                bi = e;
+            }
+        }
+        sv[tid] = bv;
+        si[tid] = bi;
+        barrier();
+        for (uint step = WG / 2u; step > 0u; step >>= 1) {
+            if (tid < step) {
+                float ov = sv[tid + step];
+                uint oi = si[tid + step];
+                if (oi != n && (si[tid] == n || ov > sv[tid] ||
+                                (ov == sv[tid] && oi < si[tid]))) {
+                    sv[tid] = ov;
+                    si[tid] = oi;
+                }
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            picked[j] = si[0];
+            l[n + si[0]] = TAKEN;
+        }
+        memoryBarrierBuffer();
+        barrier();
+    }
+    if (tid == 0u) {
+        float wsum = 0.0;
+        for (uint j = 0u; j < pc.k; ++j) {
+            wsum += l[picked[j]];
+        }
+        if (pc.norm == 0u) {
+            wsum = 1.0;
+        }
+        for (uint j = 0u; j < pc.k; ++j) {
+            route[j] = picked[j];
+            route[pc.k + j] =
+                floatBitsToUint(l[picked[j]] / wsum * pc.scale);
+        }
+    }
+}

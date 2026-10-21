@@ -137,21 +137,47 @@ if(Vulkan_FOUND)
             matvec_t matvec_q4_k matvec_q5_k matvec_q6_k matvec_q2_k
             matvec_iq2_xxs matvec_iq3_xxs matvec_iq4_xs
             rmsnorm rope silu_mul attn_paged attn_mla
-            attn_paged_q kv_store_q)
+            attn_paged_q kv_store_q moe_route
+            # Variants: <kernel>=<source>:<define>, the source
+            # compiled again with -D<define>.
+            matvec_b=matvec:BATCHED
+            matvec_f16_b=matvec_f16:BATCHED
+            matvec_q8_0_b=matvec_q8_0:BATCHED)
+        # Limits shared with the host, read from their one definition.
+        set(LOCUS_VK_LIMITS
+            ${CMAKE_SOURCE_DIR}/src/locus/backend/vulkan/limits.hpp)
+        file(STRINGS ${LOCUS_VK_LIMITS} _attn_part
+             REGEX "kAttnPartMax = [0-9]+;")
+        string(REGEX MATCH "kAttnPartMax = ([0-9]+)" _m "${_attn_part}")
+        set(LOCUS_ATTN_PART_MAX "${CMAKE_MATCH_1}")
+        if(NOT LOCUS_ATTN_PART_MAX)
+            message(FATAL_ERROR "kAttnPartMax not found in limits.hpp")
+        endif()
+        message(STATUS "locus Vulkan kernels: ATTN_PART_MAX "
+                       "${LOCUS_ATTN_PART_MAX}")
         set(SHADER_HDRS "")
-        foreach(shader ${LOCUS_SHADERS})
-            set(SRC ${CMAKE_SOURCE_DIR}/src/locus/backend/vulkan/${shader}.comp)
+        foreach(entry ${LOCUS_SHADERS})
+            set(DEFS -DATTN_PART_MAX=${LOCUS_ATTN_PART_MAX})
+            if(entry MATCHES "^([a-z0-9_]+)=([a-z0-9_]+):([A-Z_]+)$")
+                set(shader ${CMAKE_MATCH_1})
+                set(source ${CMAKE_MATCH_2})
+                list(APPEND DEFS -D${CMAKE_MATCH_3})
+            else()
+                set(shader ${entry})
+                set(source ${entry})
+            endif()
+            set(SRC ${CMAKE_SOURCE_DIR}/src/locus/backend/vulkan/${source}.comp)
             set(HDR ${CMAKE_BINARY_DIR}/shaders/${shader}_spv.h)
             if(GLSLANG_VALIDATOR)
                 add_custom_command(
                     OUTPUT ${HDR}
                     COMMAND ${CMAKE_COMMAND} -E make_directory
                             ${CMAKE_BINARY_DIR}/shaders
-                    COMMAND ${GLSLANG_VALIDATOR} -V
+                    COMMAND ${GLSLANG_VALIDATOR} -V ${DEFS}
                             --vn locus_${shader}_spv
                             ${SRC} -o ${HDR}
-                    DEPENDS ${SRC}
-                    COMMENT "Compiling ${shader}.comp -> SPIR-V")
+                    DEPENDS ${SRC} ${LOCUS_VK_LIMITS}
+                    COMMENT "Compiling ${source}.comp -> ${shader} SPIR-V")
             else()
                 # glslc has no header emitter; wrap its -mfmt=c.
                 add_custom_command(
@@ -159,15 +185,15 @@ if(Vulkan_FOUND)
                     COMMAND ${CMAKE_COMMAND} -E make_directory
                             ${CMAKE_BINARY_DIR}/shaders
                     COMMAND ${GLSLC} --target-env=vulkan1.1
-                            -mfmt=c ${SRC}
+                            ${DEFS} -mfmt=c ${SRC}
                             -o ${CMAKE_BINARY_DIR}/shaders/${shader}_spv.inc
                     COMMAND ${CMAKE_COMMAND}
                             -DIN=${CMAKE_BINARY_DIR}/shaders/${shader}_spv.inc
                             -DOUT=${HDR}
                             -DVAR=locus_${shader}_spv
                             -P ${CMAKE_SOURCE_DIR}/cmake/wrap_spv.cmake
-                    DEPENDS ${SRC}
-                    COMMENT "Compiling ${shader}.comp -> SPIR-V")
+                    DEPENDS ${SRC} ${LOCUS_VK_LIMITS}
+                    COMMENT "Compiling ${source}.comp -> ${shader} SPIR-V")
             endif()
             list(APPEND SHADER_HDRS ${HDR})
         endforeach()
