@@ -1379,13 +1379,15 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     const std::uint32_t group =
         hp.n_kv_heads > 0 ? hp.n_heads / hp.n_kv_heads : 1;
 
+    // out[out_off..] = rmsnorm(in[0, n)) then in[n, n + tail) as is.
     auto norm = [&](std::span<const float> w,
                     VulkanContext::Buffer in,
                     VulkanContext::Buffer out,
-                    std::uint32_t n, std::uint32_t out_off) {
+                    std::uint32_t n, std::uint32_t out_off,
+                    std::uint32_t tail = 0) {
         const VulkanContext::Buffer bufs[] = {
             in, s.upload(w.data(), w.size() * 4), out};
-        const std::uint32_t push[] = {n, eps_bits, out_off};
+        const std::uint32_t push[] = {n, eps_bits, out_off, tail};
         s.ctx.dispatch(Kernel::kRmsNorm, bufs, push, 1);
     };
     auto swiglu = [&](const Mat& wg, const Mat& wu, const Mat& wd,
@@ -1589,9 +1591,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
                 rec_matvec(s, lay.wkv_a, s.xb, s.kv_a, 0, false);
             }
-            norm(lay.kv_a_norm, s.kv_a, pool, rank, row_off);
-            s.ctx.copy_buffer(s.kv_a, rank * 4, pool,
-                              (row_off + rank) * 4, rope_d * 4);
+            norm(lay.kv_a_norm, s.kv_a, pool, rank, row_off, rope_d);
             if (!fused) {
                 {
                     const VulkanContext::Buffer bufs[] = {pool,

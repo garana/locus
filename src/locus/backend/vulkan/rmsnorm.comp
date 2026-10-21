@@ -2,7 +2,9 @@
 
 // RMS norm: out[out_off + i] = x[i] * w[i] / sqrt(mean+eps),
 // over the first n elements of X. One workgroup: threads stride the
-// elements and the sum of squares is reduced in shared memory.
+// elements and the sum of squares is reduced in shared memory. The
+// next `tail` elements are copied through unchanged (MLA's k_pe after
+// the normed latent: one dispatch instead of a norm and a copy).
 //
 // Compiled again with -DBATCHED (rmsnorm_b): workgroup y normalizes
 // row y, read at in_off + y * in_stride and written at out_off +
@@ -24,6 +26,8 @@ layout(push_constant) uniform PC {
     uint in_off;
     uint in_stride;
     uint out_stride;
+#else
+    uint tail;
 #endif
 } pc;
 
@@ -54,4 +58,9 @@ void main() {
     for (uint i = tid; i < pc.n; i += WG) {
         o[oi + i] = x[xi + i] * scale * w[i];
     }
+#ifndef BATCHED
+    for (uint i = pc.n + tid; i < pc.n + pc.tail; i += WG) {
+        o[oi + i] = x[xi + i];
+    }
+#endif
 }

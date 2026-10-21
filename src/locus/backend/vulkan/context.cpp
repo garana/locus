@@ -292,7 +292,7 @@ const KernelDesc& kernel_desc(Kernel k) {
          sizeof(locus_matvec_iq4_xs_spv), 3, 28},
         {locus_matvec_t_spv, sizeof(locus_matvec_t_spv), 3,
          32},
-        {locus_rmsnorm_spv, sizeof(locus_rmsnorm_spv), 3, 12},
+        {locus_rmsnorm_spv, sizeof(locus_rmsnorm_spv), 3, 16},
         {locus_rope_spv, sizeof(locus_rope_spv), 2, 36},
         {locus_silu_mul_spv, sizeof(locus_silu_mul_spv), 3, 4},
         {locus_attn_paged_q_spv, sizeof(locus_attn_paged_q_spv),
