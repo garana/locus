@@ -1,6 +1,6 @@
 #version 450
 
-// Merges attn_decode.comp's (or attn_decode_mla.comp's) per-block
+// Merges attn_decode.comp's (or attn_decode_grp.comp's) per-block
 // partials for one query token:
 // out[h][i] = sum_c e_c o_c[h][i] / sum_c e_c l_c[h], with
 // e_c = exp(m_c[h] - max_c m_c[h]). Workgroup (x = 64 outputs i,

@@ -817,14 +817,28 @@ struct DecodeAttn {
 };
 
 /**
+ * @returns Whether attn_decode_grp can run a: vec4 V loads (dv % 4,
+ * 4-float aligned V rows) and dv / 4 <= 128.
+ */
+bool grp_ok(const PagedPool& pp, const DecodeAttn& a) {
+    return a.dv % 4 == 0 && a.dv / 4 <= 128 && a.v_off % 4 == 0 &&
+           a.kv_stride % 4 == 0 && pp.row_w % 4 == 0 &&
+           pp.block_stride % 4 == 0;
+}
+
+/**
  * Records flash-decoding attention for one query token over n_pos
- * cache positions: attn_decode per (64-position block, head), plus
- * attn_combine when there is more than one block.
+ * cache positions, plus attn_combine when there is more than one
+ * block: attn_decode per (64-position block, head), or with
+ * `grouped` (grp_ok) attn_decode_grp per (32-position block, KV
+ * head), reading each K/V row once for the KV head's query heads.
  */
 void rec_attn_decode(State& s, const PagedPool& pp, std::uint32_t n_pos,
-                     std::uint32_t heads, const DecodeAttn& a) {
-    constexpr std::uint32_t kBlock = 64;  // attn_decode.comp CH
-    const std::uint32_t blocks = (n_pos + kBlock - 1) / kBlock;
+                     std::uint32_t heads, const DecodeAttn& a,
+                     bool grouped) {
+    // Positions per block: attn_decode_grp.comp / attn_decode.comp CH.
+    const std::uint32_t block = grouped ? 32 : 64;
+    const std::uint32_t blocks = (n_pos + block - 1) / block;
     VulkanContext::Buffer part = a.out;
     if (blocks > 1) {
         s.grow(s.attn_part, s.attn_part_n,
@@ -841,7 +855,14 @@ void rec_attn_decode(State& s, const PagedPool& pp, std::uint32_t n_pos,
                                   a.q1_stride, a.q2_stride,
                                   a.q2_off,    a.dv,
                                   fbits(a.scale), a.out_stride};
-    s.ctx.dispatch(Kernel::kAttnDecode, bufs, push, blocks, heads);
+    if (grouped) {
+        // Workgroup y: KV head x chunks of 16 (attn_decode_grp HG).
+        const std::uint32_t chunks = (a.group + 15) / 16;
+        s.ctx.dispatch(Kernel::kAttnDecodeGrp, bufs, push, blocks,
+                       heads / a.group * chunks);
+    } else {
+        s.ctx.dispatch(Kernel::kAttnDecode, bufs, push, blocks, heads);
+    }
     if (blocks > 1) {
         const VulkanContext::Buffer cbufs[] = {part, a.out};
         const std::uint32_t cpush[] = {blocks, heads, a.dv, a.out_stride};
@@ -856,12 +877,13 @@ void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
                   std::uint32_t group, std::uint32_t hd, std::uint32_t q_dim,
                   std::uint32_t layer_off, std::uint32_t v_offset) {
     const std::uint32_t n_pos = base + n;
-    if (n == 1 && vk::attn_decode_fits(hd)) {
-        rec_attn_decode(
-            s, pp, n_pos, heads,
-            DecodeAttn{q, q, out, layer_off, layer_off + v_offset, hd,
-                       group, hd, 0, hd, 0, 0, hd, hd,
-                       1.0f / std::sqrt(static_cast<float>(hd))});
+    const DecodeAttn da{q,  q,     out, layer_off, layer_off + v_offset,
+                        hd, group, hd,  0,         hd,
+                        0,  0,     hd,  hd,
+                        1.0f / std::sqrt(static_cast<float>(hd))};
+    const bool grouped = group > 1 && grp_ok(pp, da);
+    if (n == 1 && (grouped || vk::attn_decode_fits(hd))) {
+        rec_attn_decode(s, pp, n_pos, heads, da, grouped);
         return;
     }
     const std::uint32_t n_kv = heads / group;
@@ -905,49 +927,22 @@ void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
                   std::uint32_t nope, std::uint32_t rope_d,
                   std::uint32_t layer_off, float kq_scale) {
     const std::uint32_t n_pos = base + n;
-    // Decode: flash-decoding, q_abs . latent + q_pe . k_pe, with
-    // attn_decode_mla reading each latent row once for 16 heads (vec4
-    // latent loads: needs 4-float aligned rows and rank <= 512). M4
-    // Max, deepseek-coder-v2-lite decode at 3k: 64 -> 82 tok/s over
-    // the matmul form below.
-    if (n == 1 && rank % 4 == 0 && rank / 4 <= 128 &&
-        pp.block_stride % 4 == 0 && pp.row_w % 4 == 0 &&
-        layer_off % 4 == 0) {
-        constexpr std::uint32_t kBlock = 32;  // attn_decode_mla.comp CH
-        constexpr std::uint32_t kHeads = 16;  // attn_decode_mla.comp HG
-        const std::uint32_t blocks = (n_pos + kBlock - 1) / kBlock;
-        VulkanContext::Buffer part = lat;
-        if (blocks > 1) {
-            s.grow(s.attn_part, s.attn_part_n,
-                   std::size_t{blocks} * heads * (rank + 2));
-            part = s.attn_part;
-        }
-        const VulkanContext::Buffer bufs[] = {pp.pool, pp.table, q_abs,
-                                              q,       lat,      part};
-        const std::uint32_t push[] = {n_pos,  pp.block_tokens,
-                                      pp.block_stride, pp.row_w,
-                                      layer_off, heads,
-                                      rank,   rope_d,
-                                      rank,   nope + rope_d,
-                                      nope,   rank,
-                                      fbits(kq_scale), rank};
-        s.ctx.dispatch(Kernel::kAttnDecodeMla, bufs, push, blocks,
-                       (heads + kHeads - 1) / kHeads);
-        if (blocks > 1) {
-            const VulkanContext::Buffer cbufs[] = {part, lat};
-            const std::uint32_t cpush[] = {blocks, heads, rank, rank};
-            s.ctx.dispatch(Kernel::kAttnCombine, cbufs, cpush,
-                           (rank + 63) / 64, heads);
-        }
+    // Decode: flash-decoding, q_abs . latent + q_pe . k_pe on the
+    // one shared latent row (group = heads), with attn_decode_grp
+    // reading each row once for 16 heads (M4 Max,
+    // deepseek-coder-v2-lite decode at 3k: 64 -> 82 tok/s over the
+    // matmul form below). Else attn_decode per head up to ~1k
+    // positions (it reads the latent once per head).
+    const DecodeAttn da{q_abs, q,    lat,          layer_off, layer_off,
+                        0,     heads, rank,        rope_d,    rank,
+                        nope + rope_d, nope,       rank,      rank,
+                        kq_scale};
+    if (n == 1 && grp_ok(pp, da)) {
+        rec_attn_decode(s, pp, n_pos, heads, da, true);
         return;
     }
-    // Otherwise attn_decode per head up to ~1k positions (it reads
-    // the latent once per head; the matmul form wins beyond).
     if (n == 1 && n_pos <= 1024 && vk::attn_decode_fits(rank + rope_d)) {
-        rec_attn_decode(s, pp, n_pos, heads,
-                        DecodeAttn{q_abs, q, lat, layer_off, layer_off, 0,
-                                   heads, rank, rope_d, rank, nope + rope_d,
-                                   nope, rank, rank, kq_scale});
+        rec_attn_decode(s, pp, n_pos, heads, da, false);
         return;
     }
     const std::uint32_t rows = n * heads;

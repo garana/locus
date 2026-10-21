@@ -67,7 +67,7 @@ void VulkanContext::report_profile() const {
         "attn_softmax", "sum_splits",   "matvec_t_q8",
         "matvec_q8_0_glu", "matvec_q8_0_glu_b", "attn_decode",
         "attn_combine", "matvec_q8_0_seg", "matvec_q8_0_sh_b",
-        "matvec_q8_0_glu_sh_b", "attn_decode_mla"};
+        "matvec_q8_0_glu_sh_b", "attn_decode_grp"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -164,7 +164,7 @@ static_assert(locus::backend::vk::kAttnDecodeQMax ==
 #include "matvec_q8_0_seg_spv.h"
 #include "matvec_q8_0_sh_b_spv.h"
 #include "matvec_q8_0_glu_sh_b_spv.h"
-#include "attn_decode_mla_spv.h"
+#include "attn_decode_grp_spv.h"
 
 namespace locus::backend::vk {
 
@@ -323,8 +323,8 @@ const KernelDesc& kernel_desc(Kernel k) {
          60},
         {locus_matvec_q8_0_glu_sh_b_spv,
          sizeof(locus_matvec_q8_0_glu_sh_b_spv), 7, 60},
-        {locus_attn_decode_mla_spv, sizeof(locus_attn_decode_mla_spv), 6,
-         56},
+        {locus_attn_decode_grp_spv, sizeof(locus_attn_decode_grp_spv), 6,
+         64},
     };
     static_assert(std::size(descs) ==
                   static_cast<std::size_t>(Kernel::kCount_));

@@ -59,8 +59,8 @@ enum class Kernel {
     /** MoE batched matvecs with the shared experts as extra work. */
     kMatvecQ8_0ShB,
     kMatvecQ8_0GluShB,
-    /** attn_decode for MLA: one latent read for a group of heads. */
-    kAttnDecodeMla,
+    /** attn_decode reading each K/V row once for a head group. */
+    kAttnDecodeGrp,
     kCount_,
 };
 
