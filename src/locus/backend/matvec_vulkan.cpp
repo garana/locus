@@ -570,6 +570,10 @@ void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
                    (mode & kSlotSum) != 0 ? 1u : slots);
 }
 
+/** Token rows up to which a batched forward takes matvec-style
+ * kernels (matvec_q8_0_n.comp NT; MoE pair matvecs) over matmuls. */
+constexpr std::uint32_t kSmallBatch = 8;
+
 /** matmul.comp tile sizes: weight rows and tokens per workgroup
  * (the MOE_ID variant's token tile is narrower). */
 constexpr std::uint32_t kMatmulRows = VulkanContext::kMatmulTileRows;
@@ -643,6 +647,34 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
                            scale, &wb);
             }
         }
+        return;
+    }
+    // A short batch (a speculative verify, a tiny chunk): one weight
+    // read for all its tokens (matvec_q8_0_n / matvec_f32_n,
+    // bandwidth-bound) instead of a mostly-padding matmul tile.
+    const Kernel small = w.type == gguf::TensorType::kQ8_0
+                             ? Kernel::kMatvecQ8_0N
+                             : Kernel::kMatvecF32N;
+    if ((w.type == gguf::TensorType::kQ8_0 ||
+         w.type == gguf::TensorType::kF32) &&
+        r.n_tok <= kSmallBatch && r.div == 1 && r.w_bdiv == 1) {
+        const VulkanContext::Buffer bufs[] = {wb, x, out};
+        const std::uint32_t push[] = {w.rows,
+                                      w.cols,
+                                      r.out_off,
+                                      accumulate ? 1u : 0u,
+                                      w_off_units(w, w_byte_off),
+                                      r.x_off,
+                                      fbits(scale),
+                                      r.n_tok,
+                                      r.x_stride,
+                                      r.out_stride,
+                                      w_off_units(w, r.w_bstride_bytes),
+                                      r.x_bstride,
+                                      r.out_bstride};
+        s.ctx.dispatch(small, bufs, push,
+                       VulkanContext::matvec_groups(small, w.rows),
+                       r.n_batch);
         return;
     }
     const std::uint32_t tiles = (r.n_tok + kMatmulToks - 1) / kMatmulToks;
@@ -2148,26 +2180,63 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 2 * k_used};
             s.ctx.dispatch(Kernel::kMoeRouteB, bufs, push, 1, n);
         }
-        {
-            const VulkanContext::Buffer bufs[] = {broute, bids};
-            const std::uint32_t push[] = {n, k_used, ne, n};
-            s.ctx.dispatch(Kernel::kMoeGroup, bufs, push, 1);
-        }
         Mat g = lay.gate_exps.expert(0), u = lay.up_exps.expert(0),
             d = lay.down_exps.expert(0);
         g.rows = ff;
         u.rows = ff;
         d.cols = ff;
-        rec_matmul_id(s, g, s.upload_experts(lay.gate_exps, ne), bxb, bgate,
-                      bids, n, ne, lay.gate_exps.expert_bytes, E, k_used,
-                      ff);
-        rec_matmul_id(s, u, s.upload_experts(lay.up_exps, ne), bxb, bup,
-                      bids, n, ne, lay.up_exps.expert_bytes, E, k_used, ff);
-        silu_rows(std::size_t{n} * k_used * ff);
-        rec_matmul_id(s, d, s.upload_experts(lay.down_exps, ne), bgate,
-                      bdown, bids, n, ne, lay.down_exps.expert_bytes, ff, 1,
-                      E);
-        {
+        const auto q8 = gguf::TensorType::kQ8_0;
+        if (n <= kSmallBatch && g.type == q8 && u.type == q8 &&
+            d.type == q8 &&
+            lay.gate_exps.expert_bytes == lay.up_exps.expert_bytes) {
+            // A short batch (speculative verify): matvecs per (token,
+            // expert) pair read each picked expert once, instead of
+            // grouping pairs by expert into mostly-padding matmul
+            // tiles. Gate / up / silu per pair, then each token's
+            // weighted down sum straight into its residual row.
+            const std::uint32_t r_stride = 2 * k_used;
+            {
+                const VulkanContext::Buffer bufs[] = {
+                    s.upload_experts(lay.gate_exps, ne), bxb, bgate,
+                    broute, s.upload_experts(lay.up_exps, ne)};
+                const std::uint32_t push[] = {
+                    ff, g.cols, 0, 0, 0, 0, fbits(1.0f),
+                    w_off_units(g, lay.gate_exps.expert_bytes), E, ff,
+                    0, 0, 0, r_stride, k_used};
+                s.ctx.dispatch(Kernel::kMatvecQ8_0GluP, bufs, push,
+                               VulkanContext::matvec_groups(
+                                   Kernel::kMatvecQ8_0GluP, ff),
+                               n * k_used);
+            }
+            {
+                const VulkanContext::Buffer bufs[] = {
+                    s.upload_experts(lay.down_exps, ne), bgate, bx,
+                    broute};
+                const std::uint32_t push[] = {
+                    d.rows, ff, 0, 1, 0, 0, fbits(1.0f),
+                    w_off_units(d, lay.down_exps.expert_bytes), ff, E,
+                    0, 0, 0, r_stride, k_used};
+                s.ctx.dispatch(Kernel::kMatvecQ8_0P, bufs, push,
+                               VulkanContext::matvec_groups(
+                                   Kernel::kMatvecQ8_0P, d.rows),
+                               n);
+            }
+        } else {
+            {
+                const VulkanContext::Buffer bufs[] = {broute, bids};
+                const std::uint32_t push[] = {n, k_used, ne, n};
+                s.ctx.dispatch(Kernel::kMoeGroup, bufs, push, 1);
+            }
+            rec_matmul_id(s, g, s.upload_experts(lay.gate_exps, ne), bxb,
+                          bgate, bids, n, ne, lay.gate_exps.expert_bytes, E,
+                          k_used, ff);
+            rec_matmul_id(s, u, s.upload_experts(lay.up_exps, ne), bxb, bup,
+                          bids, n, ne, lay.up_exps.expert_bytes, E, k_used,
+                          ff);
+            silu_rows(std::size_t{n} * k_used * ff);
+            rec_matmul_id(s, d, s.upload_experts(lay.down_exps, ne), bgate,
+                          bdown, bids, n, ne, lay.down_exps.expert_bytes, ff,
+                          1, E);
             const VulkanContext::Buffer bufs[] = {bdown, broute, bx};
             const std::uint32_t push[] = {E, k_used};
             s.ctx.dispatch(Kernel::kMoeCombine, bufs, push, (E + 255) / 256,
