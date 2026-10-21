@@ -485,23 +485,44 @@ bool seg_ok(std::span<const Mat* const> ms) {
 }
 
 /**
+ * Epilogue rope for rec_matvec_seg (matvec_q8_0.comp SEGMENTS): rows
+ * of ms[0] (seg 0) and ms[1] (seg 1) are heads of hs rows whose rd
+ * rows from ro on rotate at pos, rope.comp style. rd 0 = no rope;
+ * hs, ro and rd must be even.
+ */
+struct SegRope {
+    std::uint32_t hs0 = 1, ro0 = 0, rd0 = 0;
+    std::uint32_t hs1 = 1, ro1 = 0, rd1 = 0;
+    std::uint32_t pos = 0;
+    std::uint32_t base_bits = 0, fs_bits = 0, lo_bits = 0, hi_bits = 0;
+    VulkanContext::Buffer divisors{};
+};
+
+/**
  * Records the matvecs of 2 or 3 matrices reading x (seg_ok) as one
  * dispatch over their stacked rows (State::upload_cat): ms[0]'s rows
  * to out at out_off, ms[1]'s to out2 at off1, ms[2]'s (if any) to
- * out2 at off2.
+ * out2 at off2, roped per `rope` (default: none).
  */
 void rec_matvec_seg(State& s, std::span<const Mat* const> ms,
                     VulkanContext::Buffer x, VulkanContext::Buffer out,
                     std::uint32_t out_off, VulkanContext::Buffer out2,
-                    std::uint32_t off1, std::uint32_t off2) {
+                    std::uint32_t off1, std::uint32_t off2,
+                    const SegRope& rope = {}) {
     const std::uint32_t seg1 = ms[0]->rows;
     const std::uint32_t seg2 = seg1 + ms[1]->rows;
     const std::uint32_t rows =
         seg2 + (ms.size() > 2 ? ms[2]->rows : 0);
-    const VulkanContext::Buffer bufs[] = {s.upload_cat(ms), x, out,
-                                          out2};
-    const std::uint32_t push[] = {rows, ms[0]->cols, out_off, 0, 0, 0,
-                                  fbits(1.0f), seg1, off1, seg2, off2};
+    const VulkanContext::Buffer bufs[] = {
+        s.upload_cat(ms), x, out, out2,
+        rope.divisors.impl != nullptr ? rope.divisors : x};
+    const std::uint32_t push[] = {
+        rows,         ms[0]->cols, out_off,     0,
+        0,            0,           fbits(1.0f), seg1,
+        off1,         seg2,        off2,        rope.hs0,
+        rope.ro0,     rope.rd0,    rope.hs1,    rope.ro1,
+        rope.rd1,     rope.pos,    rope.base_bits, rope.fs_bits,
+        rope.lo_bits, rope.hi_bits};
     s.ctx.dispatch(Kernel::kMatvecQ8_0Seg, bufs, push,
                    VulkanContext::matvec_groups(Kernel::kMatvecQ8_0Seg,
                                                 rows));
@@ -1422,14 +1443,23 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 s.rope_divisors(m.rope_factors(),
                                 hp.head_dim / 2);
             const Mat* qkv[] = {&lay.wq, &lay.wk, &lay.wv};
-            const bool fused = !quant && seg_ok(qkv);
+            const bool fused = !quant && seg_ok(qkv) &&
+                               hp.head_dim % 2 == 0;
             if (fused) {
+                // q and k roped in the epilogue (whole heads).
+                SegRope rope;
+                rope.hs0 = rope.rd0 = hp.head_dim;
+                rope.hs1 = rope.rd1 = hp.head_dim;
+                rope.pos = pos;
+                rope.base_bits = base_bits;
+                rope.fs_bits = fbits(1.0f);
+                rope.divisors = divisors;
                 rec_matvec_seg(s, qkv, s.xb, s.q, 0, pool, row_off,
-                               row_off + layer_stride / 2);
+                               row_off + layer_stride / 2, rope);
             } else {
                 rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
             }
-            {
+            if (!fused) {
                 const VulkanContext::Buffer bufs[] = {s.q,
                                                       divisors};
                 const std::uint32_t push[] = {
@@ -1443,8 +1473,6 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     rec_matvec(s, lay.wk, s.xb, pool, row_off, false);
                     rec_matvec(s, lay.wv, s.xb, pool,
                                row_off + layer_stride / 2, false);
-                }
-                {
                     const VulkanContext::Buffer bufs[] = {
                         pool, divisors};
                     const std::uint32_t push[] = {
@@ -1535,26 +1563,45 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                      hp.q_lora_rank, 0);
                 rec_matvec(s, lay.wq_b, s.q_a, s.q, 0, false);
                 rec_matvec(s, lay.wkv_a, s.xb, s.kv_a, 0, false);
-            } else if (const Mat* qkv[] = {&lay.wq, &lay.wkv_a};
-                       seg_ok(qkv)) {
-                rec_matvec_seg(s, qkv, s.xb, s.q, 0, s.kv_a, 0, 0);
-            } else {
+            }
+            // q | kv_a in one dispatch, q_pe and k_pe roped in its
+            // epilogue (rope widths even).
+            const Mat* qkv[] = {&lay.wq, &lay.wkv_a};
+            const bool fused = hp.q_lora_rank == 0 && seg_ok(qkv) &&
+                               rope_d % 2 == 0 && nope % 2 == 0 &&
+                               rank % 2 == 0;
+            if (fused) {
+                SegRope rope;
+                rope.hs0 = qk;
+                rope.ro0 = nope;
+                rope.rd0 = rope_d;
+                rope.hs1 = rank + rope_d;
+                rope.ro1 = rank;
+                rope.rd1 = rope_d;
+                rope.pos = pos;
+                rope.base_bits = base_bits;
+                rope.fs_bits = fs_bits;
+                rope.lo_bits = lo_bits;
+                rope.hi_bits = hi_bits;
+                rope.divisors = divisors;
+                rec_matvec_seg(s, qkv, s.xb, s.q, 0, s.kv_a, 0, 0, rope);
+            } else if (hp.q_lora_rank == 0) {
                 rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
                 rec_matvec(s, lay.wkv_a, s.xb, s.kv_a, 0, false);
             }
             norm(lay.kv_a_norm, s.kv_a, pool, rank, row_off);
             s.ctx.copy_buffer(s.kv_a, rank * 4, pool,
                               (row_off + rank) * 4, rope_d * 4);
-            {
-                const VulkanContext::Buffer bufs[] = {pool,
-                                                      divisors};
-                const std::uint32_t push[] = {
-                    1,       rope_d,  pos,     row_off + rank,
-                    0,       base_bits, fs_bits, lo_bits,
-                    hi_bits};
-                s.ctx.dispatch(Kernel::kRope, bufs, push, 1);
-            }
-            {
+            if (!fused) {
+                {
+                    const VulkanContext::Buffer bufs[] = {pool,
+                                                          divisors};
+                    const std::uint32_t push[] = {
+                        1,       rope_d,  pos,     row_off + rank,
+                        0,       base_bits, fs_bits, lo_bits,
+                        hi_bits};
+                    s.ctx.dispatch(Kernel::kRope, bufs, push, 1);
+                }
                 const VulkanContext::Buffer bufs[] = {s.q,
                                                       divisors};
                 const std::uint32_t push[] = {

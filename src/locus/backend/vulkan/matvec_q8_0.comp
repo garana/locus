@@ -35,7 +35,13 @@
 // width stacked by rows (e.g. wq | wk | wv) and the output rows go to
 // up to three places: rows [0, seg1) to O at out_offset, [seg1, seg2)
 // to O2 at off1, [seg2, rows) to O2 at off2 -- the projections that
-// read one input, in one dispatch.
+// read one input, in one dispatch. The first two segments can also
+// be roped in the epilogue (rope.comp's interleaved pairs and math):
+// segment k's rows are heads of hs_k rows whose rd_k rows from ro_k
+// on rotate at position pos (rd_k 0 = none). A pair (2i, 2i + 1)
+// is two rows of one workgroup (rows start at multiples of 4; the
+// host keeps seg1, hs, ro and rd even).
+//
 // With -DPAIRS (BATCHED only) the slots are a short batch's (token,
 // expert) pairs, routed per token: ROUTE holds one row per token,
 // r_stride apart, of kp expert ids then kp weights (moe_route_b's
@@ -58,6 +64,8 @@ layout(std430, binding = 3) readonly buffer R { uint route[]; };
 #endif
 #ifdef SEGMENTS
 layout(std430, binding = 3) buffer O2 { float o2[]; };
+// Per-pair rope frequency divisors (rope.comp's F).
+layout(std430, binding = 4) readonly buffer F { float f[]; };
 #endif
 #ifdef SHARED
 #ifdef SWIGLU
@@ -105,6 +113,13 @@ layout(push_constant) uniform PC {
     uint off1;
     uint seg2;  // first row written to O2 at off2
     uint off2;
+    uint hs0, ro0, rd0;  // segment 0 rope: head rows, offset, width
+    uint hs1, ro1, rd1;  // segment 1 rope
+    uint pos;
+    float freq_base;
+    float freq_scale;    // YARN: 1/scaling_factor; 1.0 = off
+    float corr_lo;
+    float corr_hi;
 #endif
 #ifdef PAIRS
     uint r_stride;  // ROUTE words per token row
@@ -175,6 +190,29 @@ DEFINE_ROW_PART(row_part_su, word_at_su, wsu)
 DEFINE_WORD_AT(word_at_s, ws)
 DEFINE_ROW_PART(row_part_s, word_at_s, ws)
 #endif
+#endif
+
+#ifdef SEGMENTS
+/**
+ * rope.comp's rotation of the pair (x0, x1) at pair offset i of an
+ * rd-wide rope span: the even element's result, or the odd one's.
+ */
+float rope_rot(float x0, float x1, uint i, uint rd, bool odd) {
+    float theta_extrap =
+        float(pc.pos) * pow(pc.freq_base, -float(i) / float(rd));
+    float theta = theta_extrap;
+    if (pc.freq_scale != 1.0) {
+        float y = (float(i / 2u) - pc.corr_lo) /
+                  max(0.001, pc.corr_hi - pc.corr_lo);
+        float ramp = 1.0 - min(1.0, max(0.0, y));
+        theta = pc.freq_scale * theta_extrap * (1.0 - ramp) +
+                theta_extrap * ramp;
+    }
+    theta /= f[i / 2u];
+    float c = cos(theta);
+    float s = sin(theta);
+    return odd ? x0 * s + x1 * c : x0 * c - x1 * s;
+}
 #endif
 
 void main() {
@@ -271,7 +309,19 @@ void main() {
         float u = red_u[gl_LocalInvocationID.x] * pc.scale;
         o[at] = v / (1.0 + exp(-v)) * u;
 #elif defined(SEGMENTS)
-        if (r < pc.seg1) {
+        bool s0 = r < pc.seg1;
+        uint j = s0 ? r : r - pc.seg1;  // row within segment 0 / 1
+        uint hs = s0 ? pc.hs0 : pc.hs1;
+        uint ro = s0 ? pc.ro0 : pc.ro1;
+        uint rd = s0 ? pc.rd0 : pc.rd1;
+        uint wi = rd != 0u && r < pc.seg2 ? j % hs : 0u;
+        if (rd != 0u && r < pc.seg2 && wi >= ro && wi < ro + rd) {
+            uint k = wi - ro;
+            bool odd = (k & 1u) != 0u;
+            float vp = red[(slot ^ 1u) * LANES] * pc.scale;
+            v = rope_rot(odd ? vp : v, odd ? v : vp, k & ~1u, rd, odd);
+        }
+        if (s0) {
             o[at] = pc.accumulate != 0 ? o[at] + v : v;
         } else {
             uint oi = r < pc.seg2 ? pc.off1 + (r - pc.seg1)
