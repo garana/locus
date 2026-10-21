@@ -660,7 +660,15 @@ bool TransformerModel::supports_batch_prefill() const {
 }
 
 std::uint32_t TransformerModel::prefill_chunk() const {
-    return backend_->name == "vulkan" ? 512 : 64;
+    if (backend_->name != "vulkan") {
+        return 64;
+    }
+    // MoE prefill groups each chunk's (token, expert) pairs per expert
+    // into 64-token matmul tiles: 1024 tokens give an expert ~1024 * k
+    // / n_expert pairs (DeepSeek-V2-Lite: ~96 vs ~48 at 512), so its
+    // tiles run fuller (M4 Max: +8% prefill). Dense models gain
+    // nothing and pay for the bigger attention score block.
+    return hp_.n_expert > 0 ? 1024 : 512;
 }
 
 void TransformerModel::project_head_batch(
