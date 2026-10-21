@@ -21,6 +21,9 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ8_0B:
         case Kernel::kMatvecQ8_0Glu:
         case Kernel::kMatvecQ8_0GluB:
+        case Kernel::kMatvecQ8_0Seg:
+        case Kernel::kMatvecQ8_0ShB:
+        case Kernel::kMatvecQ8_0GluShB:
             return (rows + 3) / 4;
         default:
             return (rows + 63) / 64;
@@ -63,7 +66,8 @@ void VulkanContext::report_profile() const {
         "moe_route_b",  "matmul_paged", "matmul_paged_t",
         "attn_softmax", "sum_splits",   "matvec_t_q8",
         "matvec_q8_0_glu", "matvec_q8_0_glu_b", "attn_decode",
-        "attn_combine"};
+        "attn_combine", "matvec_q8_0_seg", "matvec_q8_0_sh_b",
+        "matvec_q8_0_glu_sh_b"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -157,6 +161,9 @@ static_assert(locus::backend::vk::kAttnDecodeQMax ==
 #include "matvec_q8_0_glu_b_spv.h"
 #include "attn_decode_spv.h"
 #include "attn_combine_spv.h"
+#include "matvec_q8_0_seg_spv.h"
+#include "matvec_q8_0_sh_b_spv.h"
+#include "matvec_q8_0_glu_sh_b_spv.h"
 
 namespace locus::backend::vk {
 
@@ -309,6 +316,12 @@ const KernelDesc& kernel_desc(Kernel k) {
          sizeof(locus_matvec_q8_0_glu_b_spv), 5, 52},
         {locus_attn_decode_spv, sizeof(locus_attn_decode_spv), 6, 64},
         {locus_attn_combine_spv, sizeof(locus_attn_combine_spv), 2, 16},
+        {locus_matvec_q8_0_seg_spv, sizeof(locus_matvec_q8_0_seg_spv), 4,
+         44},
+        {locus_matvec_q8_0_sh_b_spv, sizeof(locus_matvec_q8_0_sh_b_spv), 5,
+         60},
+        {locus_matvec_q8_0_glu_sh_b_spv,
+         sizeof(locus_matvec_q8_0_glu_sh_b_spv), 7, 60},
     };
     static_assert(std::size(descs) ==
                   static_cast<std::size_t>(Kernel::kCount_));

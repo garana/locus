@@ -196,6 +196,33 @@ struct State {
     }
 
     /**
+     * Uploads same-width Q8_0 matrices stacked by rows (each row in
+     * the split GPU layout) as one buffer, keyed three bytes into the
+     * first one's tensor (upload_kb_t and upload_f32 own +1 and +2).
+     * Matrix i starts at the sum of the earlier weight_bytes.
+     */
+    VulkanContext::Buffer upload_cat(std::span<const Mat* const> ms) {
+        std::uint64_t total = 0;
+        for (const Mat* w : ms) {
+            total += weight_bytes(*w);
+        }
+        const std::size_t n = static_cast<std::size_t>(total);
+        const std::size_t alloc = vk::gpu_alloc_bytes(n);
+        return pool.acquire(
+            static_cast<const std::byte*>(ms[0]->data) + 3, alloc,
+            [&](VulkanContext::Buffer b) {
+                auto* dst = static_cast<std::byte*>(ctx.mapped(b));
+                for (const Mat* w : ms) {
+                    vk::q8_0_split_rows(
+                        static_cast<const std::byte*>(w->data), dst,
+                        w->rows, w->cols);
+                    dst += weight_bytes(*w);
+                }
+                std::memset(dst, 0, alloc - n);
+            });
+    }
+
+    /**
      * Uploads exactly `bytes` of w's rows from w.data under pool key
      * `key`, repacking whole Q8_0 rows, into a gpu_alloc_bytes(bytes)
      * buffer with the tail zeroed.
@@ -439,6 +466,65 @@ void rec_matvec(State& s, const Mat& w, VulkanContext::Buffer x,
                                   fbits(scale)};
     s.ctx.dispatch(k, {bufs, nbuf}, push,
                    VulkanContext::matvec_groups(k, w.rows));
+}
+
+/**
+ * @returns Whether ms (2 or 3 matrices) can run as one
+ * rec_matvec_seg dispatch: all Q8_0 of one width.
+ */
+bool seg_ok(std::span<const Mat* const> ms) {
+    for (const Mat* w : ms) {
+        if (w->type != gguf::TensorType::kQ8_0 ||
+            w->cols != ms[0]->cols) {
+            return false;
+        }
+    }
+    return ms.size() == 2 || ms.size() == 3;
+}
+
+/**
+ * Records the matvecs of 2 or 3 matrices reading x (seg_ok) as one
+ * dispatch over their stacked rows (State::upload_cat): ms[0]'s rows
+ * to out at out_off, ms[1]'s to out2 at off1, ms[2]'s (if any) to
+ * out2 at off2.
+ */
+void rec_matvec_seg(State& s, std::span<const Mat* const> ms,
+                    VulkanContext::Buffer x, VulkanContext::Buffer out,
+                    std::uint32_t out_off, VulkanContext::Buffer out2,
+                    std::uint32_t off1, std::uint32_t off2) {
+    const std::uint32_t seg1 = ms[0]->rows;
+    const std::uint32_t seg2 = seg1 + ms[1]->rows;
+    const std::uint32_t rows =
+        seg2 + (ms.size() > 2 ? ms[2]->rows : 0);
+    const VulkanContext::Buffer bufs[] = {s.upload_cat(ms), x, out,
+                                          out2};
+    const std::uint32_t push[] = {rows, ms[0]->cols, out_off, 0, 0, 0,
+                                  fbits(1.0f), seg1, off1, seg2, off2};
+    s.ctx.dispatch(Kernel::kMatvecQ8_0Seg, bufs, push,
+                   VulkanContext::matvec_groups(Kernel::kMatvecQ8_0Seg,
+                                                rows));
+}
+
+/**
+ * @returns Whether a GPU-routed MoE layer's shared experts can ride
+ * the routed dispatches (matvec_q8_0_glu_sh_b / _sh_b): all Q8_0,
+ * gate / up as wide as the routed expert g, and n_expert_shared
+ * slots of n_ff_exp rows each, d being the routed down slice.
+ */
+bool moe_shared_ok(const model::Hparams& hp,
+                   const model::TransformerModel::Layer& lay,
+                   const Mat& g, const Mat& d) {
+    const auto q8 = gguf::TensorType::kQ8_0;
+    const std::uint64_t ff_sh =
+        std::uint64_t{hp.n_ff_exp} * hp.n_expert_shared;
+    return hp.n_expert_shared > 0 && g.type == q8 && d.type == q8 &&
+           lay.up_exps.expert(0).type == q8 &&
+           lay.gate_exps.expert_bytes == lay.up_exps.expert_bytes &&
+           lay.gate_shexp.type == q8 && lay.up_shexp.type == q8 &&
+           lay.down_shexp.type == q8 && lay.gate_shexp.cols == g.cols &&
+           lay.up_shexp.cols == g.cols && lay.gate_shexp.rows >= ff_sh &&
+           lay.up_shexp.rows >= ff_sh && lay.down_shexp.cols == ff_sh &&
+           lay.down_shexp.rows == d.rows && ff_sh % 32 == 0;
 }
 
 /** Batched matvec mode bits (matvec*.comp, -DBATCHED). */
@@ -1116,10 +1202,11 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     // otherwise overrun the FFN scratch with a K/V write -- size
     // defensively.
     // GPU-routed MoE keeps all n_expert_used experts' gate/up rows
-    // side by side.
+    // side by side, then the shared experts' (moe_shared_ok).
     const std::size_t ff_kv = std::max<std::size_t>(
         {ff_max, kv_dim,
-         std::size_t{hp.n_expert_used} * hp.n_ff_exp});
+         std::size_t{hp.n_expert_used + hp.n_expert_shared} *
+             hp.n_ff_exp});
     s.grow(s.gate, s.gate_n, ff_kv);
     s.grow(s.up, s.up_n, ff_kv);
     s.grow(s.attout, s.attout_n,
@@ -1234,7 +1321,14 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             const VulkanContext::Buffer divisors =
                 s.rope_divisors(m.rope_factors(),
                                 hp.head_dim / 2);
-            rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
+            const Mat* qkv[] = {&lay.wq, &lay.wk, &lay.wv};
+            const bool fused = !quant && seg_ok(qkv);
+            if (fused) {
+                rec_matvec_seg(s, qkv, s.xb, s.q, 0, pool, row_off,
+                               row_off + layer_stride / 2);
+            } else {
+                rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
+            }
             {
                 const VulkanContext::Buffer bufs[] = {s.q,
                                                       divisors};
@@ -1245,9 +1339,11 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                                hp.n_heads);
             }
             if (!quant) {
-                rec_matvec(s, lay.wk, s.xb, pool, row_off, false);
-                rec_matvec(s, lay.wv, s.xb, pool,
-                           row_off + layer_stride / 2, false);
+                if (!fused) {
+                    rec_matvec(s, lay.wk, s.xb, pool, row_off, false);
+                    rec_matvec(s, lay.wv, s.xb, pool,
+                               row_off + layer_stride / 2, false);
+                }
                 {
                     const VulkanContext::Buffer bufs[] = {
                         pool, divisors};
@@ -1338,10 +1434,14 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 norm(lay.q_a_norm, s.q_a, s.q_a,
                      hp.q_lora_rank, 0);
                 rec_matvec(s, lay.wq_b, s.q_a, s.q, 0, false);
+                rec_matvec(s, lay.wkv_a, s.xb, s.kv_a, 0, false);
+            } else if (const Mat* qkv[] = {&lay.wq, &lay.wkv_a};
+                       seg_ok(qkv)) {
+                rec_matvec_seg(s, qkv, s.xb, s.q, 0, s.kv_a, 0, 0);
             } else {
                 rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
+                rec_matvec(s, lay.wkv_a, s.xb, s.kv_a, 0, false);
             }
-            rec_matvec(s, lay.wkv_a, s.xb, s.kv_a, 0, false);
             norm(lay.kv_a_norm, s.kv_a, pool, rank, row_off);
             s.ctx.copy_buffer(s.kv_a, rank * 4, pool,
                               (row_off + rank) * 4, rope_d * 4);
@@ -1504,9 +1604,34 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             g.rows = ff;
             u.rows = ff;
             d.cols = ff;
-            if (g.type == gguf::TensorType::kQ8_0 &&
-                u.type == gguf::TensorType::kQ8_0 &&
-                lay.gate_exps.expert_bytes == lay.up_exps.expert_bytes) {
+            const bool sh = moe_shared_ok(hp, lay, g, d);
+            const std::uint32_t n_sh = sh ? hp.n_expert_shared : 0;
+            Mat gs = lay.gate_shexp, us = lay.up_shexp,
+                ds = lay.down_shexp;
+            gs.rows = us.rows = hp.n_ff_exp * hp.n_expert_shared;
+            ds.cols = gs.rows;
+            if (sh) {
+                // Routed and shared experts in one dispatch: slots
+                // k_used.. run the shared gate / up, ff rows each.
+                const VulkanContext::Buffer bufs[] = {
+                    s.upload_experts(lay.gate_exps, hp.n_expert), s.xb,
+                    s.gate, s.route,
+                    s.upload_experts(lay.up_exps, hp.n_expert),
+                    s.upload_w(gs), s.upload_w(us)};
+                const std::uint32_t push[] = {
+                    ff, g.cols, 0, 0, 0, 0, fbits(1.0f),
+                    w_off_units(g, lay.gate_exps.expert_bytes), 0, ff,
+                    k_used, kRouteIds, 0,
+                    static_cast<std::uint32_t>(ff * mat_row_bytes(gs)),
+                    0};
+                s.ctx.dispatch(Kernel::kMatvecQ8_0GluShB, bufs, push,
+                               VulkanContext::matvec_groups(
+                                   Kernel::kMatvecQ8_0GluShB, ff),
+                               k_used + n_sh);
+            } else if (g.type == gguf::TensorType::kQ8_0 &&
+                       u.type == gguf::TensorType::kQ8_0 &&
+                       lay.gate_exps.expert_bytes ==
+                           lay.up_exps.expert_bytes) {
                 // Routed gate, up and silu_mul in one dispatch: slot
                 // y = picked expert y, its ff outputs at y * ff.
                 const VulkanContext::Buffer bufs[] = {
@@ -1538,11 +1663,27 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 s.ctx.dispatch(Kernel::kSiluMul, bufs, push,
                                (k_used * ff + 63) / 64);
             }
-            rec_matvec_b(s, d, s.upload_experts(lay.down_exps, hp.n_expert),
-                         s.gate, s.x, 0, true, 0, 0,
-                         lay.down_exps.expert_bytes, ff, 0, k_used,
-                         kRouteIds | kSlotSum, s.route);
-            if (hp.n_expert_shared > 0) {
+            if (sh) {
+                // Weighted routed sum plus the shared down row.
+                const VulkanContext::Buffer bufs[] = {
+                    s.upload_experts(lay.down_exps, hp.n_expert), s.gate,
+                    s.x, s.route, s.upload_w(ds)};
+                const std::uint32_t push[] = {
+                    d.rows, ff, 0, 1, 0, 0, fbits(1.0f),
+                    w_off_units(d, lay.down_exps.expert_bytes), ff, 0,
+                    k_used, kRouteIds | kSlotSum, 0, ds.cols,
+                    k_used * ff};
+                s.ctx.dispatch(Kernel::kMatvecQ8_0ShB, bufs, push,
+                               VulkanContext::matvec_groups(
+                                   Kernel::kMatvecQ8_0ShB, d.rows));
+            } else {
+                rec_matvec_b(s, d,
+                             s.upload_experts(lay.down_exps, hp.n_expert),
+                             s.gate, s.x, 0, true, 0, 0,
+                             lay.down_exps.expert_bytes, ff, 0, k_used,
+                             kRouteIds | kSlotSum, s.route);
+            }
+            if (hp.n_expert_shared > 0 && !sh) {
                 swiglu(lay.gate_shexp, lay.up_shexp, lay.down_shexp,
                        hp.n_ff_exp * hp.n_expert_shared, 1.0f, 0, 0, 0,
                        nullptr, nullptr, nullptr);
@@ -1788,13 +1929,22 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 s.rope_divisors(m.rope_factors(), hd / 2);
             const auto bk = s.chunk_buf(C::kCK, std::size_t{n} * kv_dim);
             const auto bv = s.chunk_buf(C::kCV, std::size_t{n} * kv_dim);
-            rec_matmul(s, lay.wq,
-                       s.upload_w(lay.wq), bxb,
+            // Decode's stacked q|k|v buffer when it has one (no
+            // second copy of the weights), else one per matrix.
+            const Mat* qkv[] = {&lay.wq, &lay.wk, &lay.wv};
+            const bool cat = seg_ok(qkv);
+            const auto wcat =
+                cat ? s.upload_cat(qkv) : VulkanContext::Buffer{};
+            const std::uint64_t k_at = weight_bytes(lay.wq);
+            const std::uint64_t v_at = k_at + weight_bytes(lay.wk);
+            rec_matmul(s, lay.wq, cat ? wcat : s.upload_w(lay.wq), bxb,
                        bq, MatmulRows{n, 0, E, 0, q_dim}, false);
-            rec_matmul(s, lay.wk, s.upload_w(lay.wk),
-                       bxb, bk, MatmulRows{n, 0, E, 0, kv_dim}, false);
-            rec_matmul(s, lay.wv, s.upload_w(lay.wv),
-                       bxb, bv, MatmulRows{n, 0, E, 0, kv_dim}, false);
+            rec_matmul(s, lay.wk, cat ? wcat : s.upload_w(lay.wk), bxb,
+                       bk, MatmulRows{n, 0, E, 0, kv_dim}, false,
+                       cat ? k_at : 0);
+            rec_matmul(s, lay.wv, cat ? wcat : s.upload_w(lay.wv), bxb,
+                       bv, MatmulRows{n, 0, E, 0, kv_dim}, false,
+                       cat ? v_at : 0);
             rope_rows(bq, divisors, H, hd, 0, hd, q_dim, false);
             rope_rows(bk, divisors, hp.n_kv_heads, hd, 0, hd, kv_dim,
                       false);
@@ -1820,16 +1970,22 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 rec_matmul(s, lay.wq_b,
                            s.upload_w(lay.wq_b),
                            bqa, bq, MatmulRows{n, 0, qr, 0, q_dim}, false);
-            } else {
-                rec_matmul(s, lay.wq,
-                           s.upload_w(lay.wq),
+            }
+            // Decode's stacked q|kv_a buffer when it has one.
+            const Mat* qkv[] = {&lay.wq, &lay.wkv_a};
+            const bool cat = hp.q_lora_rank == 0 && seg_ok(qkv);
+            const auto wcat =
+                cat ? s.upload_cat(qkv) : VulkanContext::Buffer{};
+            if (hp.q_lora_rank == 0) {
+                rec_matmul(s, lay.wq, cat ? wcat : s.upload_w(lay.wq),
                            bxb, bq, MatmulRows{n, 0, E, 0, q_dim}, false);
             }
             // Latent rows: rms-norm the c_kv part and rope the k_pe
             // part in place, then scatter the rows into the pool.
             rec_matmul(s, lay.wkv_a,
-                       s.upload_w(lay.wkv_a),
-                       bxb, bkva, MatmulRows{n, 0, E, 0, kvw}, false);
+                       cat ? wcat : s.upload_w(lay.wkv_a), bxb, bkva,
+                       MatmulRows{n, 0, E, 0, kvw}, false,
+                       cat ? weight_bytes(lay.wq) : 0);
             norm_rows(lay.kv_a_norm, bkva, bkva, rank, 0, kvw, kvw, n);
             rope_rows(bkva, divisors, 1, rope_d, rank, 0, kvw, true);
             scatter_rows(bkva, kvw, layer_off);
