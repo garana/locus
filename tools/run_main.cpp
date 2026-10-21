@@ -89,20 +89,48 @@ int main(int argc, char** argv) {
         cfg.batched_prefill = !args.no_batch_prefill;
         locus::engine::Engine engine(model, tok.eos_id(), cfg);
 
+        using clock = std::chrono::steady_clock;
+        if (args.warmup && !ids.empty()) {
+            // Throwaway request: first-touch weight uploads and
+            // pipeline warm-up land here, not in the timed run.
+            engine.submit({ids.front()}, 1);
+            engine.run_to_completion();
+        }
         const std::uint32_t conc = std::max(1u, args.concurrent);
         if (conc == 1) {
             std::printf("%s", tok.decode(ids).c_str());
+            clock::time_point t_first{}, t_last{};
+            std::size_t n_out = 0;
             engine.on_token = [&](const locus::engine::Request&,
                                   locus::tok::TokenId t) {
+                t_last = clock::now();
+                if (n_out++ == 0) {
+                    t_first = t_last;
+                }
                 if (t != tok.eos_id()) {
                     std::printf("%s", tok.decode({&t, 1}).c_str());
                     std::fflush(stdout);
                 }
             };
+            const clock::time_point t0 = clock::now();
             engine.submit(ids,
                           static_cast<std::uint32_t>(n_gen));
             engine.run_to_completion();
             std::printf("\n");
+            if (args.timing && n_out > 0) {
+                using ms = std::chrono::duration<double, std::milli>;
+                // Prefill: submit to first token (the prompt pass
+                // yields its logits); decode: the remaining tokens.
+                const double pf = ms(t_first - t0).count();
+                const double dec = ms(t_last - t_first).count();
+                std::fprintf(
+                    stderr,
+                    "timing: prefill %zu tok %.1f ms (%.1f tok/s) | "
+                    "decode %zu tok %.1f ms (%.1f tok/s)\n",
+                    ids.size(), pf,
+                    pf > 0 ? 1000.0 * ids.size() / pf : 0.0, n_out - 1,
+                    dec, dec > 0 ? 1000.0 * (n_out - 1) / dec : 0.0);
+            }
         } else {
             // Bench: submit the prompt `conc` times and time the
             // aggregate run (no per-token printing).

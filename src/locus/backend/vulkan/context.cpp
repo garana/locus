@@ -18,6 +18,8 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecF32B:
         case Kernel::kMatvecF16B:
         case Kernel::kMatvecQ8_0B:
+        case Kernel::kMatvecQ8_0Glu:
+        case Kernel::kMatvecQ8_0GluB:
             return (rows + 3) / 4;
         default:
             return (rows + 63) / 64;
@@ -58,7 +60,9 @@ void VulkanContext::report_profile() const {
         "matmul_q8_0_id", "kv_scatter", "moe_group",
         "moe_combine",  "rmsnorm_b",    "rope_b",
         "moe_route_b",  "matmul_paged", "matmul_paged_t",
-        "attn_softmax", "sum_splits"};
+        "attn_softmax", "sum_splits",   "matvec_t_q8",
+        "matvec_q8_0_glu", "matvec_q8_0_glu_b", "attn_decode",
+        "attn_combine"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -130,6 +134,11 @@ void VulkanContext::report_profile() const {
 #include "rope_spv.h"
 #include "silu_mul_spv.h"
 #include "sum_splits_spv.h"
+#include "matvec_t_q8_spv.h"
+#include "matvec_q8_0_glu_spv.h"
+#include "matvec_q8_0_glu_b_spv.h"
+#include "attn_decode_spv.h"
+#include "attn_combine_spv.h"
 
 namespace locus::backend::vk {
 
@@ -183,12 +192,12 @@ const KernelDesc& kernel_desc(Kernel k) {
          5, 44},
         {locus_kv_store_q_spv, sizeof(locus_kv_store_q_spv), 2,
          16},
-        {locus_matvec_b_spv, sizeof(locus_matvec_b_spv), 4, 48},
+        {locus_matvec_b_spv, sizeof(locus_matvec_b_spv), 4, 52},
         {locus_matvec_f16_b_spv, sizeof(locus_matvec_f16_b_spv), 4,
-         48},
+         52},
         {locus_matvec_q8_0_b_spv, sizeof(locus_matvec_q8_0_b_spv),
-         4, 48},
-        {locus_moe_route_spv, sizeof(locus_moe_route_spv), 3, 32},
+         4, 52},
+        {locus_moe_route_spv, sizeof(locus_moe_route_spv), 3, 36},
         {locus_matmul_q8_0_spv, sizeof(locus_matmul_q8_0_spv), 3, 96},
         {locus_matmul_f32_spv, sizeof(locus_matmul_f32_spv), 3, 96},
         {locus_matmul_q8_0_id_spv, sizeof(locus_matmul_q8_0_id_spv), 4,
@@ -198,13 +207,20 @@ const KernelDesc& kernel_desc(Kernel k) {
         {locus_moe_combine_spv, sizeof(locus_moe_combine_spv), 3, 8},
         {locus_rmsnorm_b_spv, sizeof(locus_rmsnorm_b_spv), 3, 24},
         {locus_rope_b_spv, sizeof(locus_rope_b_spv), 2, 40},
-        {locus_moe_route_b_spv, sizeof(locus_moe_route_b_spv), 3, 40},
+        {locus_moe_route_b_spv, sizeof(locus_moe_route_b_spv), 3, 44},
         {locus_matmul_paged_f32_spv, sizeof(locus_matmul_paged_f32_spv), 4,
          96},
         {locus_matmul_paged_t_f32_spv,
          sizeof(locus_matmul_paged_t_f32_spv), 4, 96},
         {locus_attn_softmax_spv, sizeof(locus_attn_softmax_spv), 1, 20},
         {locus_sum_splits_spv, sizeof(locus_sum_splits_spv), 2, 16},
+        {locus_matvec_t_q8_spv, sizeof(locus_matvec_t_q8_spv), 3, 32},
+        {locus_matvec_q8_0_glu_spv, sizeof(locus_matvec_q8_0_glu_spv), 4,
+         28},
+        {locus_matvec_q8_0_glu_b_spv,
+         sizeof(locus_matvec_q8_0_glu_b_spv), 5, 52},
+        {locus_attn_decode_spv, sizeof(locus_attn_decode_spv), 6, 64},
+        {locus_attn_combine_spv, sizeof(locus_attn_combine_spv), 2, 16},
     };
     static_assert(std::size(descs) ==
                   static_cast<std::size_t>(Kernel::kCount_));
@@ -328,6 +344,12 @@ struct VulkanContext::Impl {
 
     /** VK_EXT_memory_budget present (and enabled). */
     bool has_budget = false;
+    /**
+     * The driver runs dispatches in submission order with writes
+     * visible to later ones (MoltenVK), so dispatch() records no
+     * compute-to-compute barrier.
+     */
+    bool serial_dispatch = false;
     /** Bytes currently allocated through make_buffer. */
     VkDeviceSize allocated = 0;
 
@@ -416,6 +438,7 @@ struct VulkanContext::Impl {
             std::vector<VkExtensionProperties> exts(en);
             vkEnumerateDeviceExtensionProperties(phys, nullptr, &en,
                                                  exts.data());
+            bool has_driver_props = false;
             for (const auto& e : exts) {
                 if (std::strcmp(e.extensionName,
                                 VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) ==
@@ -423,6 +446,28 @@ struct VulkanContext::Impl {
                     has_budget = true;
                     dexts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
                 }
+                has_driver_props =
+                    has_driver_props ||
+                    std::strcmp(e.extensionName,
+                                VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME) ==
+                        0;
+            }
+            if (has_driver_props) {
+                VkPhysicalDeviceDriverProperties dp{};
+                dp.sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+                VkPhysicalDeviceProperties2 p2{};
+                p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                p2.pNext = &dp;
+                vkGetPhysicalDeviceProperties2(phys, &p2);
+                // MoltenVK records compute into serial Metal compute
+                // encoders: each dispatch completes, writes visible,
+                // before the next starts. A pipeline barrier there
+                // only splits the encoder (~19 us each on an M4 Max),
+                // so skip them; LOCUS_VK_BARRIERS=1 keeps them.
+                serial_dispatch =
+                    dp.driverID == VK_DRIVER_ID_MOLTENVK &&
+                    std::getenv("LOCUS_VK_BARRIERS") == nullptr;
             }
         }
         dci.enabledExtensionCount =
@@ -737,7 +782,11 @@ void VulkanContext::dispatch(Kernel k,
             static_cast<std::uint32_t>(im.ts_kernel.size()));
     }
 
-    // Serialize consecutive dispatches (writes feed reads).
+    // Serialize consecutive dispatches (writes feed reads), unless
+    // the driver already does (serial_dispatch).
+    if (im.serial_dispatch) {
+        return;
+    }
     VkMemoryBarrier mb{};
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -799,6 +848,10 @@ void VulkanContext::end_batch() {
     if (im.sets_stale || im.sets_live > 65536) {
         im.reset_sets();
     }
+}
+
+bool VulkanContext::serial_dispatch() const {
+    return impl_->serial_dispatch;
 }
 
 std::uint64_t VulkanContext::memory_available() const {
@@ -933,6 +986,7 @@ void VulkanContext::dispatch(Kernel, std::span<const Buffer>,
 void VulkanContext::end_batch() { no_kernels(); }
 void VulkanContext::note_token() { no_kernels(); }
 std::uint64_t VulkanContext::memory_available() const { no_kernels(); }
+bool VulkanContext::serial_dispatch() const { no_kernels(); }
 const VulkanContext::Profile& VulkanContext::profile() const {
     no_kernels();
 }

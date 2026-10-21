@@ -28,6 +28,20 @@ constexpr bool attn_width_fits(std::uint32_t width) {
 }
 
 /**
+ * Size, in floats, of attn_decode.comp's shared query stage
+ * (ATTN_DECODE_Q_MAX): one head's whole key, d1 + d2 floats (GQA
+ * head_dim; MLA kv_lora_rank + qk_rope_dim). Wider keys take the
+ * matmul attention path. CMake passes it to the shader like
+ * kAttnPartMax.
+ */
+inline constexpr std::uint32_t kAttnDecodeQMax = 1024;
+
+/** @returns Whether a decode attention key width fits attn_decode. */
+constexpr bool attn_decode_fits(std::uint32_t key_width) {
+    return key_width <= kAttnDecodeQMax;
+}
+
+/**
  * Bytes allocated for a GPU weight copy of `bytes`: rounded up to 16
  * so a kernel reading whole words (Q8_0's 34-byte blocks end
  * mid-word) never reads past the buffer. The padding is zeroed; the

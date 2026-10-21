@@ -1,5 +1,6 @@
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -8,6 +9,7 @@
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
+#include "locus/backend/vulkan/q8_layout.hpp"
 
 using locus::backend::vk::Kernel;
 using locus::backend::vk::VulkanContext;
@@ -81,7 +83,9 @@ TEST_CASE("vulkan q8_0 matvec matches the CPU reference",
     auto wb = ctx.create_buffer((w.size() + 3) & ~std::size_t{3});
     auto xb = ctx.create_buffer(x.size() * 4);
     auto ob = ctx.create_buffer(gpu.size() * 4);
-    ctx.write_buffer(wb, w);
+    std::vector<std::byte> wg(w.size());
+    locus::backend::vk::q8_0_split_rows(w.data(), wg.data(), rows, cols);
+    ctx.write_buffer(wb, wg);
     ctx.write_buffer(xb, std::as_bytes(std::span(x)));
     ctx.begin_batch();
     const VulkanContext::Buffer bufs[] = {wb, xb, ob};
@@ -470,4 +474,16 @@ TEST_CASE("vulkan memory_available drops as buffers are allocated",
     // Budget-backed drivers may report usage coarsely; require at
     // least half the allocation to show up.
     REQUIRE(during + bytes / 2 <= before);
+}
+
+TEST_CASE("LOCUS_VK_BARRIERS keeps dispatch barriers", "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    ::setenv("LOCUS_VK_BARRIERS", "1", 1);
+    {
+        VulkanContext ctx;
+        REQUIRE_FALSE(ctx.serial_dispatch());
+    }
+    ::unsetenv("LOCUS_VK_BARRIERS");
 }

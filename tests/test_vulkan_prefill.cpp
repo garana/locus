@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -12,6 +13,7 @@
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
+#include "locus/backend/vulkan/q8_layout.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 
@@ -36,6 +38,15 @@ std::vector<T> download(VulkanContext& ctx, VulkanContext::Buffer b,
                         std::size_t n) {
     std::vector<T> out(n);
     ctx.read_buffer(b, std::as_writable_bytes(std::span<T>(out)));
+    return out;
+}
+
+/** GGUF Q8_0 rows in the split GPU layout the shaders read. */
+std::vector<std::byte> gpu_q8(const std::vector<std::byte>& w,
+                              std::uint32_t cols) {
+    std::vector<std::byte> out(w.size());
+    locus::backend::vk::q8_0_split_rows(w.data(), out.data(),
+                                        w.size() / ((cols / 32) * 34), cols);
     return out;
 }
 
@@ -140,7 +151,7 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
                 std::size_t{n_tok} * out_stride + n_batch * out_bstride,
                 rng);
 
-            auto wb = upload(ctx, w);
+            auto wb = upload(ctx, q8 ? gpu_q8(w, c.cols) : w);
             auto xb = upload(ctx, x);
             for (const bool acc : {false, true}) {
                 auto ob = upload(ctx, init);
@@ -227,8 +238,8 @@ TEST_CASE("vulkan prefill MoE: route, group, expert matmul, combine",
         }
     }
 
-    auto wgb = upload(ctx, wg);
-    auto wdb = upload(ctx, wd);
+    auto wgb = upload(ctx, gpu_q8(wg, E));
+    auto wdb = upload(ctx, gpu_q8(wd, ff));
     auto xb = upload(ctx, x);
     auto rb = upload(ctx, route);
     auto idb = ctx.create_buffer((n_exp + std::size_t{n_exp} * n_tok) * 4);
@@ -439,5 +450,147 @@ TEST_CASE("vulkan batched prefill tracks per-token prefill",
     }
     if (ran == 0) {
         SKIP("no prefill test model present (llama-3.2-1b-q8_0.gguf)");
+    }
+}
+
+// Hidden micro-benchmark for matmul.comp tuning; run explicitly:
+//   ./build/tests/locus_tests "bench: vulkan matmul"
+TEST_CASE("bench: vulkan matmul throughput", "[.][bench][vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(53);
+    const std::uint32_t n_tok = 512, reps = 20;
+    struct Shape {
+        std::uint32_t rows, cols;
+    };
+    for (const Shape sh : {Shape{2048, 2048}, Shape{8192, 2048},
+                           Shape{2048, 8192}}) {
+        const auto w = random_q8(sh.rows, sh.cols, rng);
+        const auto x = random_f32(std::size_t{n_tok} * sh.cols, rng);
+        auto wb = upload(ctx, gpu_q8(w, sh.cols));
+        auto xb = upload(ctx, x);
+        auto ob = ctx.create_buffer(std::size_t{n_tok} * sh.rows * 4);
+        const std::uint32_t TR = VulkanContext::kMatmulTileRows;
+        const std::uint32_t TT = VulkanContext::kMatmulTileToks;
+        const std::uint32_t tiles = (n_tok + TT - 1) / TT;
+        const std::uint32_t push[] = {
+            sh.rows, sh.cols, n_tok, 0, 0, 0, sh.cols, 0, sh.rows,
+            fbits(1.0f), 0, 0, 0, tiles, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0};
+        const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+        auto run = [&](std::uint32_t n) {
+            ctx.begin_batch();
+            for (std::uint32_t i = 0; i < n; ++i) {
+                ctx.dispatch(Kernel::kMatmulQ8_0, bufs, push,
+                             (sh.rows + TR - 1) / TR, tiles);
+            }
+            ctx.end_batch();
+        };
+        run(2);  // warm-up
+        const auto t0 = std::chrono::steady_clock::now();
+        run(reps);
+        const double s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+        const double flop =
+            2.0 * sh.rows * sh.cols * n_tok * static_cast<double>(reps);
+        WARN("q8_0 " << sh.rows << "x" << sh.cols << " x " << n_tok
+                     << " tok: " << s / reps * 1e3 << " ms, "
+                     << flop / s / 1e12 << " TFLOPS");
+        for (auto b : {wb, xb, ob}) {
+            ctx.destroy_buffer(b);
+        }
+    }
+}
+
+// Hidden micro-benchmark: decode matvec bandwidth at real shapes.
+//   ./build/tests/locus_tests "bench: vulkan matvec"
+TEST_CASE("bench: vulkan matvec bandwidth", "[.][bench][vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(59);
+    const std::uint32_t reps = 2000;
+    struct Shape {
+        std::uint32_t rows, cols;
+    };
+    for (const Shape sh : {Shape{8, 32}, Shape{512, 2048},
+                           Shape{576, 2048}, Shape{2048, 2048},
+                           Shape{3072, 2048}, Shape{2816, 2048},
+                           Shape{2048, 2816}, Shape{10944, 2048},
+                           Shape{2048, 8192}, Shape{8192, 2048},
+                           Shape{128256, 2048}}) {
+        const auto w = random_q8(sh.rows, sh.cols, rng);
+        const auto x = random_f32(sh.cols, rng);
+        auto wb = upload(ctx, gpu_q8(w, sh.cols));
+        auto xb = upload(ctx, x);
+        auto ob = ctx.create_buffer(std::size_t{sh.rows} * 4);
+        const std::uint32_t push[] = {sh.rows, sh.cols, 0, 0, 0, 0,
+                                      fbits(1.0f)};
+        const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+        const std::uint32_t groups =
+            VulkanContext::matvec_groups(Kernel::kMatvecQ8_0, sh.rows);
+        auto run = [&](std::uint32_t n) {
+            ctx.begin_batch();
+            for (std::uint32_t i = 0; i < n; ++i) {
+                ctx.dispatch(Kernel::kMatvecQ8_0, bufs, push, groups);
+            }
+            ctx.end_batch();
+        };
+        run(4);
+        const auto t0 = std::chrono::steady_clock::now();
+        run(reps);
+        const double s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+        WARN("q8_0 matvec " << sh.rows << "x" << sh.cols << ": "
+                            << s / reps * 1e6 << " us, "
+                            << w.size() * double(reps) / s / 1e9 << " GB/s");
+        for (auto b : {wb, xb, ob}) {
+            ctx.destroy_buffer(b);
+        }
+    }
+}
+
+TEST_CASE("bench: vulkan f32 matvec bandwidth", "[.][bench][vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(61);
+    const std::uint32_t reps = 500;
+    for (const auto& [rows, cols] :
+         {std::pair{2048u, 2048u}, std::pair{8192u, 2048u},
+          std::pair{32768u, 2048u}}) {
+        const auto w = random_f32(std::size_t{rows} * cols, rng);
+        const auto x = random_f32(cols, rng);
+        auto wb = upload(ctx, w);
+        auto xb = upload(ctx, x);
+        auto ob = ctx.create_buffer(std::size_t{rows} * 4);
+        const std::uint32_t push[] = {rows, cols, 0, 0, 0, 0, fbits(1.0f)};
+        const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+        const std::uint32_t groups =
+            VulkanContext::matvec_groups(Kernel::kMatvecF32, rows);
+        auto run = [&](std::uint32_t n) {
+            ctx.begin_batch();
+            for (std::uint32_t i = 0; i < n; ++i) {
+                ctx.dispatch(Kernel::kMatvecF32, bufs, push, groups);
+            }
+            ctx.end_batch();
+        };
+        run(4);
+        const auto t0 = std::chrono::steady_clock::now();
+        run(reps);
+        const double s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+        WARN("f32 matvec " << rows << "x" << cols << ": "
+                           << s / reps * 1e6 << " us, "
+                           << w.size() * 4.0 * reps / s / 1e9 << " GB/s");
+        for (auto b : {wb, xb, ob}) {
+            ctx.destroy_buffer(b);
+        }
     }
 }

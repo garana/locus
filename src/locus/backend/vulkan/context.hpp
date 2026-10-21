@@ -47,6 +47,13 @@ enum class Kernel {
     kMatmulPagedTF32,
     kAttnSoftmax,
     kSumSplits,
+    kMatvecTQ8,
+    /** Fused SwiGLU Q8_0 matvecs: silu(W x) * (WU x). */
+    kMatvecQ8_0Glu,
+    kMatvecQ8_0GluB,
+    /** Decode (one query token) flash attention and its merge. */
+    kAttnDecode,
+    kAttnCombine,
     kCount_,
 };
 
@@ -57,7 +64,8 @@ enum class Kernel {
  *
  * Work is recorded in batches: begin_batch(), any number of
  * dispatch() calls (a memory barrier separates consecutive
- * dispatches), end_batch() submits once and waits. The full GPU
+ * dispatches, except where the driver serializes them anyway --
+ * see serial_dispatch()), end_batch() submits once and waits. The full GPU
  * forward records one batch per token, which is what makes the
  * backend usable -- a submit per op was ~20x slower.
  *
@@ -107,6 +115,13 @@ class VulkanContext {
     static bool profiling();
 
     /**
+     * matmul.comp tile: weight rows and tokens per workgroup (the
+     * shader's BM = 16 TM and BN = 16 TN; keep them in sync).
+     */
+    static constexpr std::uint32_t kMatmulTileRows = 128;
+    static constexpr std::uint32_t kMatmulTileToks = 64;
+
+    /**
      * Device memory this context can still allocate, per
      * memory_available_from() (mem_fit.hpp): VK_EXT_memory_budget
      * when the device has it, else 3/4 of the heap minus this
@@ -116,6 +131,15 @@ class VulkanContext {
      * @returns Available bytes (0 when exhausted).
      */
     std::uint64_t memory_available() const;
+
+    /**
+     * Whether dispatch() skips the barrier between dispatches
+     * because the driver already serializes them (MoltenVK; unless
+     * LOCUS_VK_BARRIERS is set).
+     *
+     * @returns true when barriers are elided.
+     */
+    bool serial_dispatch() const;
 
     /** Counts one forwarded token toward the profile. */
     void note_token();

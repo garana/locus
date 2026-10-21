@@ -1,7 +1,7 @@
 #version 450
 
-// Q8_0 matvec: rows of 34-byte blocks (f16 scale + 32 int8), read
-// through a uint view since blocks are not 4-byte aligned.
+// Q8_0 matvec over rows in the split GPU layout (q8_layout.hpp:
+// nb f16 scales, then nb x 32 int8), read through a uint view.
 //
 // Four rows per workgroup, 32 lanes per row. Four lanes share a
 // block, each taking two of its 8 quant words, so a 32-lane step
@@ -16,6 +16,12 @@
 // instead loops all n_slots inside each workgroup and sums them, each
 // weighted by route[n_slots + k] (float bits), into one output row:
 // the MoE down projection, without racing slots on one row.
+//
+// With -DSWIGLU (matvec_q8_0_glu, and _glu_b with BATCHED) W is the
+// gate matrix and WU (last binding) the up matrix of the same shape:
+// each row gets both dot products, computed exactly as the plain
+// kernel would, and writes silu(gate) * up -- the gate, up and
+// silu_mul dispatches of a SwiGLU block in one (split slots only).
 
 #define LANES 32u
 #define ROWS 4u
@@ -27,6 +33,13 @@ layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 2) buffer O { float o[]; };
 #ifdef BATCHED
 layout(std430, binding = 3) readonly buffer R { uint route[]; };
+#endif
+#ifdef SWIGLU
+#ifdef BATCHED
+layout(std430, binding = 4) readonly buffer WU { uint wu[]; };
+#else
+layout(std430, binding = 3) readonly buffer WU { uint wu[]; };
+#endif
 #endif
 
 layout(push_constant) uniform PC {
@@ -43,41 +56,64 @@ layout(push_constant) uniform PC {
     uint out_stride;
     uint n_slots;
     uint mode;      // 1 = ids from route[], 2 = weighted slot sum
+    uint row_stride;  // unused: Q8_0 rows are never column-split
 #endif
 } pc;
 
 shared float red[LANES * ROWS];
+#ifdef SWIGLU
+shared float red_u[LANES * ROWS];
+#endif
 
-/** The 4 bytes at byte offset b (any alignment). */
-uint word_at(uint b) {
-    uint i = b >> 2;
-    uint sh = (b & 3u) * 8u;
-    return sh == 0u ? w[i] : (w[i] >> sh) | (w[i + 1u] << (32u - sh));
+/** The 4 bytes at byte offset b (any alignment) of BUF. */
+#define DEFINE_WORD_AT(NAME, BUF) \
+uint NAME(uint b) { \
+    uint i = b >> 2; \
+    uint sh = (b & 3u) * 8u; \
+    return sh == 0u ? BUF[i] \
+                    : (BUF[i] >> sh) | (BUF[i + 1u] << (32u - sh)); \
 }
 
-/** This lane's share of dot(row r of the matrix at wbase, x). */
-float row_part(uint wbase, uint xbase, uint r, uint lane) {
-    uint nb = pc.cols / 32u;
-    uint row_base = wbase + r * nb * 34u;
-    uint sub = lane & 3u;
-    float acc = 0.0;
-    for (uint b = lane >> 2; b < nb; b += LANES / 4u) {
-        uint at = row_base + b * 34u;
-        float d = unpackHalf2x16(word_at(at) & 0xffffu).x;
-        uint xi = xbase + b * 32u + sub * 8u;
-        float s = 0.0;
-        for (uint k = 0u; k < 2u; ++k) {
-            int q = int(word_at(at + 2u + sub * 8u + k * 4u));
-            uint xk = xi + k * 4u;
-            s += float(bitfieldExtract(q, 0, 8)) * x[xk] +
-                 float(bitfieldExtract(q, 8, 8)) * x[xk + 1u] +
-                 float(bitfieldExtract(q, 16, 8)) * x[xk + 2u] +
-                 float(bitfieldExtract(q, 24, 8)) * x[xk + 3u];
-        }
-        acc += d * s;
-    }
-    return acc;
+/**
+ * This lane's share of dot(row r of the matrix at wbase, x). Rows
+ * are in the split GPU layout (q8_layout.hpp): nb f16 scales, then
+ * nb x 32 quants, 34 * nb bytes in all.
+ */
+#define DEFINE_ROW_PART(NAME, WORD, BUF) \
+float NAME(uint wbase, uint xbase, uint r, uint lane) { \
+    uint nb = pc.cols / 32u; \
+    uint rb = wbase + r * nb * 34u; \
+    uint qb = rb + 2u * nb; \
+    uint sub = lane & 3u; \
+    /* Whole-word quant loads unless the row start is misaligned \
+       (odd nb, or an odd w_off); scales are 2-byte aligned. */ \
+    bool al = ((rb | qb) & 3u) == 0u; \
+    float acc = 0.0; \
+    for (uint b = lane >> 2; b < nb; b += LANES / 4u) { \
+        uint sa = rb + 2u * b; \
+        float d = unpackHalf2x16(BUF[sa >> 2] >> ((sa & 2u) * 8u)).x; \
+        uint qa = qb + b * 32u + sub * 8u; \
+        uint xi = xbase + b * 32u + sub * 8u; \
+        float s = 0.0; \
+        for (uint k = 0u; k < 2u; ++k) { \
+            int q = int(al ? BUF[(qa >> 2) + k] : WORD(qa + k * 4u)); \
+            uint xk = xi + k * 4u; \
+            s += float(bitfieldExtract(q, 0, 8)) * x[xk] + \
+                 float(bitfieldExtract(q, 8, 8)) * x[xk + 1u] + \
+                 float(bitfieldExtract(q, 16, 8)) * x[xk + 2u] + \
+                 float(bitfieldExtract(q, 24, 8)) * x[xk + 3u]; \
+        } \
+        acc += d * s; \
+    } \
+    return acc; \
 }
+
+DEFINE_WORD_AT(word_at, w)
+DEFINE_ROW_PART(row_part, word_at, w)
+#ifdef SWIGLU
+DEFINE_WORD_AT(word_at_u, wu)
+DEFINE_ROW_PART(row_part_u, word_at_u, wu)
+#endif
 
 void main() {
     uint lane = gl_LocalInvocationID.x % LANES;
@@ -85,6 +121,24 @@ void main() {
     uint r = gl_WorkGroupID.x * ROWS + slot;
     uint at = pc.out_offset + r;
     float acc = 0.0;
+#ifdef SWIGLU
+    float acc_u = 0.0;
+    if (r < pc.rows) {
+#ifdef BATCHED
+        uint y = gl_WorkGroupID.y;
+        uint id = (pc.mode & 1u) != 0u ? route[y] : y;
+        uint wb = pc.w_off + id * pc.w_stride;
+        uint xb = pc.x_off + y * pc.x_stride;
+        at += y * pc.out_stride;
+#else
+        uint wb = pc.w_off;
+        uint xb = pc.x_off;
+#endif
+        acc = row_part(wb, xb, r, lane);
+        acc_u = row_part_u(wb, xb, r, lane);
+    }
+    red_u[gl_LocalInvocationID.x] = acc_u;
+#else
     if (r < pc.rows) {
 #ifdef BATCHED
         uint y = gl_WorkGroupID.y;
@@ -104,17 +158,28 @@ void main() {
         acc = row_part(pc.w_off, pc.x_off, r, lane);
 #endif
     }
+#endif
     red[gl_LocalInvocationID.x] = acc;
     barrier();
     for (uint step = LANES / 2u; step > 0u; step >>= 1) {
         if (lane < step) {
             red[gl_LocalInvocationID.x] +=
                 red[gl_LocalInvocationID.x + step];
+#ifdef SWIGLU
+            red_u[gl_LocalInvocationID.x] +=
+                red_u[gl_LocalInvocationID.x + step];
+#endif
         }
         barrier();
     }
     if (lane == 0u && r < pc.rows) {
         float v = red[gl_LocalInvocationID.x] * pc.scale;
+#ifdef SWIGLU
+        // silu_mul.comp's formula on the gate and up outputs.
+        float u = red_u[gl_LocalInvocationID.x] * pc.scale;
+        o[at] = v / (1.0 + exp(-v)) * u;
+#else
         o[at] = pc.accumulate != 0 ? o[at] + v : v;
+#endif
     }
 }

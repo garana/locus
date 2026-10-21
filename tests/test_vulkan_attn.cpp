@@ -382,3 +382,111 @@ TEST_CASE("vulkan rmsnorm matches the CPU reference", "[vulkan]") {
         ctx.destroy_buffer(b);
     }
 }
+
+TEST_CASE("vulkan decode attention (flash) matches the CPU reference",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(43);
+
+    struct Case {
+        const char* name;
+        std::uint32_t heads, group, d1, d2, dv, n_pos;
+        bool shared_kv;  // MLA: one latent row, V = its first dv
+    };
+    const Case cases[] = {
+        {"gqa one block", 4, 2, 64, 0, 64, 37, false},
+        {"gqa three blocks + combine", 4, 2, 64, 0, 64, 150, false},
+        {"mla two-segment key", 3, 3, 512, 64, 512, 61, true},
+        {"mla blocks + combine", 3, 3, 512, 64, 512, 200, true},
+    };
+    for (const Case& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            const std::uint32_t n_kv = c.heads / c.group;
+            const std::uint32_t dk = c.d1 + c.d2;
+            // Pool row: GQA K for every KV head then V; MLA latent.
+            const std::uint32_t kv_stride = c.shared_kv ? 0 : c.d1;
+            const std::uint32_t k_off = 5;  // a layer's offset
+            const std::uint32_t v_off =
+                c.shared_kv ? k_off : k_off + n_kv * c.d1;
+            const std::uint32_t row_w =
+                c.shared_kv ? dk + 7 : k_off + 2 * n_kv * c.d1 + 3;
+            const std::uint32_t bt = 16;
+            const std::uint32_t n_blocks = (c.n_pos + bt - 1) / bt;
+            const std::uint32_t block_stride = bt * row_w;
+            auto pool = random_floats(
+                static_cast<std::size_t>(n_blocks) * block_stride, rng);
+            auto table = shuffled_table(n_blocks, rng);
+            const std::uint32_t q1_stride = c.d1 + 3;
+            const std::uint32_t q2_stride = c.d2 + 9, q2_off = 4;
+            auto q1 = random_floats(c.heads * q1_stride, rng);
+            auto q2 = random_floats(c.heads * q2_stride + q2_off + 1, rng);
+            const float scale = 0.11f;
+
+            auto row = [&](std::uint32_t p) {
+                return table[p / bt] * block_stride + (p % bt) * row_w;
+            };
+            std::vector<float> want(c.heads * c.dv);
+            for (std::uint32_t h = 0; h < c.heads; ++h) {
+                const std::uint32_t kvh = h / c.group;
+                std::vector<double> s(c.n_pos);
+                for (std::uint32_t p = 0; p < c.n_pos; ++p) {
+                    const std::size_t kb = row(p) + k_off + kvh * kv_stride;
+                    double d = 0.0;
+                    for (std::uint32_t i = 0; i < c.d1; ++i) {
+                        d += q1[h * q1_stride + i] * pool[kb + i];
+                    }
+                    for (std::uint32_t i = 0; i < c.d2; ++i) {
+                        d += q2[h * q2_stride + q2_off + i] *
+                             pool[kb + c.d1 + i];
+                    }
+                    s[p] = d * scale;
+                }
+                softmax(s);
+                for (std::uint32_t i = 0; i < c.dv; ++i) {
+                    double acc = 0.0;
+                    for (std::uint32_t p = 0; p < c.n_pos; ++p) {
+                        acc += s[p] *
+                               pool[row(p) + v_off + kvh * kv_stride + i];
+                    }
+                    want[h * c.dv + i] = static_cast<float>(acc);
+                }
+            }
+
+            const std::uint32_t blocks = (c.n_pos + 63) / 64;
+            auto pb = upload(ctx, pool);
+            auto tb = upload(ctx, table);
+            auto q1b = upload(ctx, q1);
+            auto q2b = upload(ctx, q2);
+            auto ob = ctx.create_buffer(want.size() * 4);
+            auto partb = ctx.create_buffer(
+                std::size_t{blocks} * c.heads * (c.dv + 2) * 4);
+            ctx.begin_batch();
+            const VulkanContext::Buffer bufs[] = {pb, tb, q1b, q2b, ob,
+                                                  blocks > 1 ? partb : ob};
+            const std::uint32_t push[] = {
+                c.n_pos,   bt,      block_stride, row_w,
+                k_off,     v_off,   kv_stride,    c.group,
+                c.d1,      c.d2,    q1_stride,    q2_stride,
+                q2_off,    c.dv,    fbits(scale), c.dv};
+            ctx.dispatch(Kernel::kAttnDecode, bufs, push, blocks, c.heads);
+            if (blocks > 1) {
+                const VulkanContext::Buffer cb[] = {partb, ob};
+                const std::uint32_t cp[] = {blocks, c.heads, c.dv, c.dv};
+                ctx.dispatch(Kernel::kAttnCombine, cb, cp,
+                             (c.dv + 63) / 64, c.heads);
+            }
+            ctx.end_batch();
+            auto got = download(ctx, ob, want.size());
+            for (std::size_t i = 0; i < want.size(); ++i) {
+                REQUIRE(got[i] ==
+                        Catch::Approx(want[i]).margin(1e-5).epsilon(1e-4));
+            }
+            for (auto b : {pb, tb, q1b, q2b, ob, partb}) {
+                ctx.destroy_buffer(b);
+            }
+        }
+    }
+}

@@ -16,6 +16,7 @@
 #include "locus/backend/vulkan/context.hpp"
 #include "locus/backend/vulkan/limits.hpp"
 #include "locus/backend/vulkan/mem_fit.hpp"
+#include "locus/backend/vulkan/q8_layout.hpp"
 #include "locus/backend/vulkan/weight_pool.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/moe_stats.hpp"
@@ -166,11 +167,12 @@ struct State {
     /** Activation buffers, sized on first use per model dims. */
     VulkanContext::Buffer x{}, xb{}, q{}, gate{}, up{}, attout{},
         att{}, logits{}, table{}, ones{}, kv_a{}, q_abs{},
-        latent{}, q_a{}, router{}, route{};
+        latent{}, q_a{}, router{}, route{}, attn_part{};
     std::size_t x_n = 0, xb_n = 0, q_n = 0, gate_n = 0, up_n = 0,
                 attout_n = 0, att_n = 0, logits_n = 0,
                 table_n = 0, ones_n = 0, kv_a_n = 0, q_abs_n = 0,
-                latent_n = 0, q_a_n = 0, router_n = 0, route_n = 0;
+                latent_n = 0, q_a_n = 0, router_n = 0, route_n = 0,
+                attn_part_n = 0;
 
     /**
      * Uploads a whole stacked expert tensor (every expert) as one
@@ -180,9 +182,39 @@ struct State {
     VulkanContext::Buffer upload_experts(
         const model::TransformerModel::ExpertMat& em,
         std::uint32_t n_expert) {
-        return upload_keyed(
-            &em, em.base.data,
-            static_cast<std::size_t>(em.expert_bytes) * n_expert);
+        const std::uint64_t bytes = em.expert_bytes * n_expert;
+        return upload_rows(&em, em.base, bytes);
+    }
+
+    /**
+     * Uploads the first w.rows rows of weight matrix w, keyed by
+     * w.data. Q8_0 rows go up in the split GPU layout
+     * (q8_layout.hpp), other types as stored.
+     */
+    VulkanContext::Buffer upload_w(const Mat& w) {
+        return upload_rows(w.data, w, weight_bytes(w));
+    }
+
+    /**
+     * Uploads exactly `bytes` of w's rows from w.data under pool key
+     * `key`, repacking whole Q8_0 rows, into a gpu_alloc_bytes(bytes)
+     * buffer with the tail zeroed.
+     */
+    VulkanContext::Buffer upload_rows(const void* key, const Mat& w,
+                                      std::uint64_t bytes) {
+        const std::size_t n = static_cast<std::size_t>(bytes);
+        const std::size_t alloc = vk::gpu_alloc_bytes(n);
+        return pool.acquire(key, alloc, [&](VulkanContext::Buffer b) {
+            const auto* src = static_cast<const std::byte*>(w.data);
+            auto* dst = static_cast<std::byte*>(ctx.mapped(b));
+            if (w.type == gguf::TensorType::kQ8_0) {
+                const std::size_t row_bytes = (w.cols / 32) * 34;
+                vk::q8_0_split_rows(src, dst, n / row_bytes, w.cols);
+            } else {
+                std::memcpy(dst, src, n);
+            }
+            std::memset(dst + n, 0, alloc - n);
+        });
     }
 
     VulkanContext::Buffer upload(const void* ptr,
@@ -206,12 +238,17 @@ struct State {
         });
     }
 
-    /** Uploads w dequantized to F32 (any CPU-supported type). */
+    /**
+     * Uploads w dequantized to F32 (any CPU-supported type), keyed
+     * apart from w.data (upload_w's key for the same matrix as
+     * stored) -- like upload_kb_t's +1 key.
+     */
     VulkanContext::Buffer upload_f32(const Mat& w) {
         const std::size_t bytes =
             static_cast<std::size_t>(w.rows) * w.cols * 4;
         return pool.acquire(
-            w.data, bytes, [&](VulkanContext::Buffer b) {
+            static_cast<const std::byte*>(w.data) + 2, bytes,
+            [&](VulkanContext::Buffer b) {
                 std::vector<float> host(
                     static_cast<std::size_t>(w.rows) * w.cols);
                 for (std::uint32_t r = 0; r < w.rows; ++r) {
@@ -388,7 +425,7 @@ void rec_matvec(State& s, const Mat& w, VulkanContext::Buffer x,
                 VulkanContext::Buffer* whole = nullptr) {
     const VulkanContext::Buffer wb =
         whole != nullptr ? *whole
-                         : s.upload(w.data, weight_bytes(w));
+                         : s.upload_w(w);
     const Kernel k = matvec_kernel(w);
     const VulkanContext::Buffer grid = s.grid_for(k);
     const VulkanContext::Buffer bufs[] = {wb, x, out, grid};
@@ -415,7 +452,8 @@ constexpr std::uint32_t kSlotSum = 2;   // weighted sum of slots
  * runs a workgroup row per slot writing out_offset + k *
  * out_stride; kSlotSum sums the slots, weighted by the route
  * buffer, into one output row. `route` must be bound even when
- * unused (pass any buffer).
+ * unused (pass any buffer). row_stride (F32/F16 only; 0 = w.cols)
+ * lets w.cols be a column chunk of wider rows.
  */
 void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
                   VulkanContext::Buffer x, VulkanContext::Buffer out,
@@ -423,7 +461,8 @@ void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
                   std::uint64_t w_byte_off, std::uint32_t x_off,
                   std::uint64_t w_stride_bytes, std::uint32_t x_stride,
                   std::uint32_t out_stride, std::uint32_t slots,
-                  std::uint32_t mode, VulkanContext::Buffer route) {
+                  std::uint32_t mode, VulkanContext::Buffer route,
+                  std::uint32_t row_stride = 0) {
     const Kernel k = batched_kernel(w);
     const VulkanContext::Buffer bufs[] = {wb, x, out, route};
     const std::uint32_t push[] = {w.rows,
@@ -437,16 +476,17 @@ void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   x_stride,
                                   out_stride,
                                   slots,
-                                  mode};
+                                  mode,
+                                  row_stride};
     s.ctx.dispatch(k, bufs, push, VulkanContext::matvec_groups(k, w.rows),
                    (mode & kSlotSum) != 0 ? 1u : slots);
 }
 
 /** matmul.comp tile sizes: weight rows and tokens per workgroup
  * (the MOE_ID variant's token tile is narrower). */
-constexpr std::uint32_t kMatmulRows = 64;
-constexpr std::uint32_t kMatmulToks = 64;
-constexpr std::uint32_t kMatmulToksId = 16;
+constexpr std::uint32_t kMatmulRows = VulkanContext::kMatmulTileRows;
+constexpr std::uint32_t kMatmulToks = VulkanContext::kMatmulTileToks;
+constexpr std::uint32_t kMatmulToksId = VulkanContext::kMatmulTileToks;
 
 /** @returns The prefill matmul kernel for w, or kCount_. */
 Kernel matmul_kernel(const Mat& w) {
@@ -583,18 +623,29 @@ struct PagedPool {
  * position c), w_off floats into each position's cache row.
  * r.w_bstride_bytes moves w_off per weight slice.
  *
- * k_splits > 1 splits the K range over that many workgroups (decode:
- * too few output tiles to fill the GPU otherwise), each writing a
- * partial plane of `plane` floats -- the output's extent from
- * r.out_off, which must then be 0 -- that sum_splits adds into out.
+ * When the grid would be under kMinGroups workgroups (a decode
+ * token: few output tiles), the K range is split over more of them,
+ * each writing a partial plane of `plane` floats -- the output's
+ * extent from r.out_off, which must then be 0 -- that sum_splits
+ * adds into out.
  */
 void rec_paged_matmul(State& s, Kernel k, const PagedPool& pp,
                       std::uint32_t rows, std::uint32_t cols,
                       std::uint32_t w_off, VulkanContext::Buffer x,
                       VulkanContext::Buffer out, const MatmulRows& r,
-                      bool accumulate, std::uint32_t k_splits = 1,
-                      std::uint32_t plane = 0) {
+                      bool accumulate, std::uint32_t plane) {
+    // Fewer workgroups than this leave the GPU partly idle; a split
+    // keeps at least kSplitCols columns.
+    constexpr std::uint32_t kMinGroups = 128;
+    constexpr std::uint32_t kSplitCols = 32;
     const std::uint32_t tiles = (r.n_tok + kMatmulToks - 1) / kMatmulToks;
+    const std::uint32_t groups =
+        (rows + kMatmulRows - 1) / kMatmulRows * tiles * r.n_batch;
+    const std::uint32_t k_splits =
+        groups >= kMinGroups
+            ? 1
+            : std::clamp<std::uint32_t>((kMinGroups + groups - 1) / groups,
+                                        1, std::max(cols / kSplitCols, 1u));
     const VulkanContext::Buffer dst =
         k_splits > 1
             ? s.chunk_buf(State::kCSplit, std::size_t{k_splits} * plane)
@@ -624,16 +675,6 @@ void rec_paged_matmul(State& s, Kernel k, const PagedPool& pp,
     }
 }
 
-/**
- * @returns The split-K factor for attention's O = V^T P over n_pos
- * positions: ~256 positions per split for a single decode token (its
- * output is only a few tiles), 1 for a prefill chunk, whose many
- * token tiles already fill the GPU.
- */
-std::uint32_t attn_splits(std::uint32_t n, std::uint32_t n_pos) {
-    return n == 1 ? std::clamp<std::uint32_t>(n_pos / 256, 1, 32) : 1;
-}
-
 /** Records the causal softmax over `rows` score rows (attn_softmax). */
 void rec_softmax(State& s, VulkanContext::Buffer scores, std::uint32_t rows,
                  std::uint32_t n_pos, std::uint32_t heads, std::uint32_t base,
@@ -654,12 +695,62 @@ void rec_softmax(State& s, VulkanContext::Buffer scores, std::uint32_t rows,
  * q_dim floats per token (head h at h * hd); scores holds
  * n * heads * (base + n) floats.
  */
+/** One attention segment set for rec_attn_decode (see attn_decode.comp). */
+struct DecodeAttn {
+    VulkanContext::Buffer q1, q2, out;
+    std::uint32_t k_off, v_off, kv_stride, group, d1, d2, q1_stride,
+        q2_stride, q2_off, dv, out_stride;
+    float scale;
+};
+
+/**
+ * Records flash-decoding attention for one query token over n_pos
+ * cache positions: attn_decode per (64-position block, head), plus
+ * attn_combine when there is more than one block.
+ */
+void rec_attn_decode(State& s, const PagedPool& pp, std::uint32_t n_pos,
+                     std::uint32_t heads, const DecodeAttn& a) {
+    constexpr std::uint32_t kBlock = 64;  // attn_decode.comp CH
+    const std::uint32_t blocks = (n_pos + kBlock - 1) / kBlock;
+    VulkanContext::Buffer part = a.out;
+    if (blocks > 1) {
+        s.grow(s.attn_part, s.attn_part_n,
+               std::size_t{blocks} * heads * (a.dv + 2));
+        part = s.attn_part;
+    }
+    const VulkanContext::Buffer bufs[] = {pp.pool, pp.table, a.q1,
+                                          a.q2,    a.out,    part};
+    const std::uint32_t push[] = {n_pos,       pp.block_tokens,
+                                  pp.block_stride, pp.row_w,
+                                  a.k_off,     a.v_off,
+                                  a.kv_stride, a.group,
+                                  a.d1,        a.d2,
+                                  a.q1_stride, a.q2_stride,
+                                  a.q2_off,    a.dv,
+                                  fbits(a.scale), a.out_stride};
+    s.ctx.dispatch(Kernel::kAttnDecode, bufs, push, blocks, heads);
+    if (blocks > 1) {
+        const VulkanContext::Buffer cbufs[] = {part, a.out};
+        const std::uint32_t cpush[] = {blocks, heads, a.dv, a.out_stride};
+        s.ctx.dispatch(Kernel::kAttnCombine, cbufs, cpush,
+                       (a.dv + 63) / 64, heads);
+    }
+}
+
 void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
                   VulkanContext::Buffer scores, VulkanContext::Buffer out,
                   std::uint32_t n, std::uint32_t base, std::uint32_t heads,
                   std::uint32_t group, std::uint32_t hd, std::uint32_t q_dim,
                   std::uint32_t layer_off, std::uint32_t v_offset) {
     const std::uint32_t n_pos = base + n;
+    if (n == 1 && vk::attn_decode_fits(hd)) {
+        rec_attn_decode(
+            s, pp, n_pos, heads,
+            DecodeAttn{q, q, out, layer_off, layer_off + v_offset, hd,
+                       group, hd, 0, hd, 0, 0, hd, hd,
+                       1.0f / std::sqrt(static_cast<float>(hd))});
+        return;
+    }
     const std::uint32_t n_kv = heads / group;
     MatmulRows sr{n * group, 0, q_dim, 0, heads * n_pos};
     sr.n_batch = n_kv;
@@ -670,7 +761,7 @@ void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
     sr.x_inner = hd;
     sr.out_inner = n_pos;
     rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, hd, layer_off, q,
-                     scores, sr, false);
+                     scores, sr, false, n * heads * n_pos);
     rec_softmax(s, scores, n * heads, n_pos, heads, base,
                 1.0f / std::sqrt(static_cast<float>(hd)));
     MatmulRows orow{n * group, 0, heads * n_pos, 0, q_dim};
@@ -683,7 +774,7 @@ void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
     orow.out_inner = hd;
     rec_paged_matmul(s, Kernel::kMatmulPagedTF32, pp, hd, n_pos,
                      layer_off + v_offset, scores, out, orow, false,
-                     attn_splits(n, n_pos), n * q_dim);
+                     n * q_dim);
 }
 
 /**
@@ -701,17 +792,30 @@ void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
                   std::uint32_t nope, std::uint32_t rope_d,
                   std::uint32_t layer_off, float kq_scale) {
     const std::uint32_t n_pos = base + n;
+    // Decode on a short context: flash-decoding, q_abs . latent +
+    // q_pe . k_pe with every head on the one shared latent row (group
+    // = heads). It reads the latent once per head, so past a few
+    // blocks the matmul form below (each latent tile read once for
+    // all heads) wins.
+    if (n == 1 && n_pos <= 256 && vk::attn_decode_fits(rank + rope_d)) {
+        rec_attn_decode(s, pp, n_pos, heads,
+                        DecodeAttn{q_abs, q, lat, layer_off, layer_off, 0,
+                                   heads, rank, rope_d, rank, nope + rope_d,
+                                   nope, rank, rank, kq_scale});
+        return;
+    }
     const std::uint32_t rows = n * heads;
     rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, rank, layer_off,
                      q_abs, scores, MatmulRows{rows, 0, rank, 0, n_pos},
-                     false);
+                     false, rows * n_pos);
     rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, rope_d,
                      layer_off + rank, q, scores,
-                     MatmulRows{rows, nope, nope + rope_d, 0, n_pos}, true);
+                     MatmulRows{rows, nope, nope + rope_d, 0, n_pos}, true,
+                     rows * n_pos);
     rec_softmax(s, scores, rows, n_pos, heads, base, kq_scale);
     rec_paged_matmul(s, Kernel::kMatmulPagedTF32, pp, rank, n_pos, layer_off,
                      scores, lat, MatmulRows{rows, 0, n_pos, 0, rank}, false,
-                     attn_splits(n, n_pos), rows * rank);
+                     rows * rank);
 }
 
 }  // namespace
@@ -776,6 +880,7 @@ void vulkan_reset_state() {
     drop(s.q_a, s.q_a_n);
     drop(s.router, s.router_n);
     drop(s.route, s.route_n);
+    drop(s.attn_part, s.attn_part_n);
     for (int c = 0; c < State::kChunkCount_; ++c) {
         drop(s.chunk[c], s.chunk_n[c]);
     }
@@ -789,7 +894,7 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
     }
     State& s = state();
     const Kernel k = matvec_kernel(w);
-    auto wb = s.upload(w.data, weight_bytes(w));
+    auto wb = s.upload_w(w);
     s.grow(s.x, s.x_n, x.size());
     s.grow(s.xb, s.xb_n, out.size());
     s.ctx.write_buffer(s.x, std::as_bytes(x));
@@ -832,7 +937,7 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
         return false;
     }
     if (hp.n_expert_used > 16 || hp.n_expert_used == 0 ||
-        hp.n_group > 32 ||
+        hp.n_group > 32 || hp.n_expert > 256 ||
         (hp.n_group > 1 && hp.n_expert % hp.n_group != 0)) {
         return false;
     }
@@ -1059,15 +1164,30 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         g2.rows = ff;
         u2.rows = ff;
         d2.cols = ff;
-        rec_matvec(s, g2, s.xb, s.gate, 0, false, off_g, 0, 1.0f,
-                   whole_g);
-        rec_matvec(s, u2, s.xb, s.up, 0, false, off_u, 0, 1.0f,
-                   whole_u);
-        const VulkanContext::Buffer bufs[] = {s.gate, s.up,
-                                              s.gate};
-        const std::uint32_t push[] = {ff};
-        s.ctx.dispatch(Kernel::kSiluMul, bufs, push,
-                       (ff + 63) / 64);
+        if (wg.type == gguf::TensorType::kQ8_0 &&
+            wu.type == gguf::TensorType::kQ8_0 && wg.cols == wu.cols &&
+            off_g == off_u) {
+            // Gate, up and silu_mul in one fused dispatch.
+            const VulkanContext::Buffer bufs[] = {
+                whole_g != nullptr ? *whole_g : s.upload_w(g2), s.xb,
+                s.gate, whole_u != nullptr ? *whole_u : s.upload_w(u2)};
+            const std::uint32_t push[] = {
+                ff, wg.cols, 0, 0, w_off_units(wg, off_g), 0,
+                fbits(1.0f)};
+            s.ctx.dispatch(Kernel::kMatvecQ8_0Glu, bufs, push,
+                           VulkanContext::matvec_groups(
+                               Kernel::kMatvecQ8_0Glu, ff));
+        } else {
+            rec_matvec(s, g2, s.xb, s.gate, 0, false, off_g, 0, 1.0f,
+                       whole_g);
+            rec_matvec(s, u2, s.xb, s.up, 0, false, off_u, 0, 1.0f,
+                       whole_u);
+            const VulkanContext::Buffer bufs[] = {s.gate, s.up,
+                                                  s.gate};
+            const std::uint32_t push[] = {ff};
+            s.ctx.dispatch(Kernel::kSiluMul, bufs, push,
+                           (ff + 63) / 64);
+        }
         rec_matvec(s, d2, s.gate, s.x, 0, true, off_d, 0, wgt,
                    whole_d);
     };
@@ -1169,10 +1289,21 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             }
         } else {
             const bool split = lay.wk_b.rows > 0;
-            VulkanContext::Buffer wkv_b32{};
-            if (!split) {
+            // A Q8_0 fused wkv_b is read as stored (split rows): W_uk^T
+            // by the transposed Q8 matvec, W_uv by the batched one.
+            // Other types go through a dequantized F32 copy.
+            const bool kv_q8 = !split &&
+                               lay.wkv_b.type == gguf::TensorType::kQ8_0 &&
+                               rank % 128 == 0;
+            VulkanContext::Buffer wkv_b32{}, wkv_bq{};
+            if (kv_q8) {
+                wkv_bq = s.upload_w(lay.wkv_b);
+            } else if (!split) {
                 wkv_b32 = s.upload_f32(lay.wkv_b);
             }
+            const std::uint32_t kv_row_b =
+                kv_q8 ? static_cast<std::uint32_t>(mat_row_bytes(lay.wkv_b))
+                      : 0;
             const VulkanContext::Buffer divisors =
                 s.rope_divisors({}, rope_d / 2);
             if (hp.q_lora_rank > 0) {
@@ -1208,7 +1339,15 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             }
             // Per-head weight absorption, all heads per dispatch
             // where a batched kernel exists (head h = slot h).
-            if (!split) {
+            if (kv_q8) {
+                const VulkanContext::Buffer bufs[] = {wkv_bq, s.q,
+                                                      s.q_abs};
+                const std::uint32_t push[] = {
+                    nope, rank, 0, 0, 0, (nope + vd) * kv_row_b, qk,
+                    rank};
+                s.ctx.dispatch(Kernel::kMatvecTQ8, bufs, push, rank / 128,
+                               hp.n_heads);
+            } else if (!split) {
                 const VulkanContext::Buffer bufs[] = {wkv_b32, s.q,
                                                       s.q_abs};
                 const std::uint32_t push[] = {
@@ -1221,7 +1360,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 Mat kb = lay.wk_b;
                 kb.rows = rank;
                 rec_matvec_b(
-                    s, kb, s.upload(lay.wk_b.data, weight_bytes(lay.wk_b)),
+                    s, kb, s.upload_w(lay.wk_b),
                     s.q, s.q_abs, 0, false, 0, 0,
                     std::uint64_t{rank} * mat_row_bytes(lay.wk_b), qk,
                     rank, hp.n_heads, 0, s.q);
@@ -1239,7 +1378,15 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             rec_attn_mla(s, pp, s.q, s.q_abs, s.att, s.latent, 1, pos,
                          hp.n_heads, rank, nope, rope_d, l * layer_stride,
                          hp.kq_scale);
-            if (!split) {
+            if (kv_q8) {
+                // W_uv: head h's vd rows start at row h * (nope + vd)
+                // + nope of wkv_b.
+                Mat uv{gguf::TensorType::kQ8_0, lay.wkv_b.data, vd, rank};
+                rec_matvec_b(s, uv, wkv_bq, s.latent, s.attout, 0, false,
+                             std::uint64_t{nope} * kv_row_b, 0,
+                             std::uint64_t{nope + vd} * kv_row_b, rank, vd,
+                             hp.n_heads, 0, s.latent);
+            } else if (!split) {
                 // W_uv rows of the dequantized fused wkv_b, head h
                 // at element (h * (nope + vd) + nope) * rank.
                 Mat uv{gguf::TensorType::kF32, nullptr, vd, rank};
@@ -1251,7 +1398,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 Mat vb = lay.wv_b;
                 vb.rows = vd;
                 rec_matvec_b(
-                    s, vb, s.upload(lay.wv_b.data, weight_bytes(lay.wv_b)),
+                    s, vb, s.upload_w(lay.wv_b),
                     s.latent, s.attout, 0, false, 0, 0,
                     std::uint64_t{vd} * mat_row_bytes(lay.wv_b), rank,
                     vd, hp.n_heads, 0, s.latent);
@@ -1280,7 +1427,31 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             // and weights, the batched matvecs read them.
             const std::uint32_t k_used = hp.n_expert_used;
             const std::uint32_t ff = hp.n_ff_exp;
-            rec_matvec(s, lay.gate_inp, s.xb, s.router, 0, false);
+            // Router logits as split-K partials over column chunks
+            // (one batched-matvec slot each, so the small router
+            // matrix spreads over many workgroups); moe_route sums
+            // the planes. Q8_0 rows are not column-contiguous in the
+            // GPU layout, so they take one plane.
+            const Mat& gi = lay.gate_inp;
+            const std::uint32_t chunk = 128;
+            const std::uint32_t splits =
+                gi.type != gguf::TensorType::kQ8_0 &&
+                        batched_kernel(gi) != Kernel::kCount_ &&
+                        gi.cols % chunk == 0
+                    ? gi.cols / chunk
+                    : 1;
+            if (splits > 1) {
+                Mat part = gi;
+                part.cols = chunk;
+                const std::uint64_t elt =
+                    gi.type == gguf::TensorType::kF32 ? 4 : 2;
+                // Slot y: columns y*chunk.., rows still gi.cols apart.
+                rec_matvec_b(s, part, s.upload_w(gi), s.xb, s.router, 0,
+                             false, 0, 0, chunk * elt, chunk, hp.n_expert,
+                             splits, 0, s.xb, gi.cols);
+            } else {
+                rec_matvec(s, gi, s.xb, s.router, 0, false);
+            }
             {
                 const bool has_bias = !lay.exp_probs_b.empty();
                 const VulkanContext::Buffer bufs[] = {
@@ -1297,7 +1468,8 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     hp.n_group,
                     hp.n_group_used,
                     hp.expert_weights_norm ? 1u : 0u,
-                    fbits(hp.expert_weights_scale)};
+                    fbits(hp.expert_weights_scale),
+                    splits};
                 s.ctx.dispatch(Kernel::kMoeRoute, bufs, push, 1);
             }
             Mat g = lay.gate_exps.expert(0), u = lay.up_exps.expert(0),
@@ -1305,15 +1477,34 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             g.rows = ff;
             u.rows = ff;
             d.cols = ff;
-            rec_matvec_b(s, g, s.upload_experts(lay.gate_exps, hp.n_expert),
-                         s.xb, s.gate, 0, false, 0, 0,
-                         lay.gate_exps.expert_bytes, 0, ff, k_used,
-                         kRouteIds, s.route);
-            rec_matvec_b(s, u, s.upload_experts(lay.up_exps, hp.n_expert),
-                         s.xb, s.up, 0, false, 0, 0,
-                         lay.up_exps.expert_bytes, 0, ff, k_used,
-                         kRouteIds, s.route);
-            {
+            if (g.type == gguf::TensorType::kQ8_0 &&
+                u.type == gguf::TensorType::kQ8_0 &&
+                lay.gate_exps.expert_bytes == lay.up_exps.expert_bytes) {
+                // Routed gate, up and silu_mul in one dispatch: slot
+                // y = picked expert y, its ff outputs at y * ff.
+                const VulkanContext::Buffer bufs[] = {
+                    s.upload_experts(lay.gate_exps, hp.n_expert), s.xb,
+                    s.gate, s.route,
+                    s.upload_experts(lay.up_exps, hp.n_expert)};
+                const std::uint32_t push[] = {
+                    ff, g.cols, 0, 0, 0, 0, fbits(1.0f),
+                    w_off_units(g, lay.gate_exps.expert_bytes), 0, ff,
+                    k_used, kRouteIds, 0};
+                s.ctx.dispatch(Kernel::kMatvecQ8_0GluB, bufs, push,
+                               VulkanContext::matvec_groups(
+                                   Kernel::kMatvecQ8_0GluB, ff),
+                               k_used);
+            } else {
+                rec_matvec_b(s, g,
+                             s.upload_experts(lay.gate_exps, hp.n_expert),
+                             s.xb, s.gate, 0, false, 0, 0,
+                             lay.gate_exps.expert_bytes, 0, ff, k_used,
+                             kRouteIds, s.route);
+                rec_matvec_b(s, u,
+                             s.upload_experts(lay.up_exps, hp.n_expert),
+                             s.xb, s.up, 0, false, 0, 0,
+                             lay.up_exps.expert_bytes, 0, ff, k_used,
+                             kRouteIds, s.route);
                 const VulkanContext::Buffer bufs[] = {s.gate, s.up,
                                                       s.gate};
                 const std::uint32_t push[] = {k_used * ff};
@@ -1358,8 +1549,8 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             const auto up_expert =
                 [&](const model::TransformerModel::ExpertMat& em,
                     std::uint32_t e) {
-                    return s.upload(em.expert(e).data,
-                                    em.expert_bytes);
+                    const Mat m = em.expert(e);
+                    return s.upload_rows(m.data, m, em.expert_bytes);
                 };
             for (const auto& [e, wgt] : picked) {
                 VulkanContext::Buffer bg =
@@ -1549,12 +1740,12 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         u2.rows = ff;
         d2.cols = ff;
         const MatmulRows in{n, 0, E, 0, ff};
-        rec_matmul(s, g2, s.upload(wg.data, weight_bytes(g2)), bxb, bgate,
+        rec_matmul(s, g2, s.upload_w(g2), bxb, bgate,
                    in, false);
-        rec_matmul(s, u2, s.upload(wu.data, weight_bytes(u2)), bxb, bup,
+        rec_matmul(s, u2, s.upload_w(u2), bxb, bup,
                    in, false);
         silu_rows(std::size_t{n} * ff);
-        rec_matmul(s, d2, s.upload(wd.data, weight_bytes(wd)), bgate, bx,
+        rec_matmul(s, d2, s.upload_w(wd), bgate, bx,
                    MatmulRows{n, 0, ff, 0, E}, true);
     };
 
@@ -1571,11 +1762,11 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
             const auto bk = s.chunk_buf(C::kCK, std::size_t{n} * kv_dim);
             const auto bv = s.chunk_buf(C::kCV, std::size_t{n} * kv_dim);
             rec_matmul(s, lay.wq,
-                       s.upload(lay.wq.data, weight_bytes(lay.wq)), bxb,
+                       s.upload_w(lay.wq), bxb,
                        bq, MatmulRows{n, 0, E, 0, q_dim}, false);
-            rec_matmul(s, lay.wk, s.upload(lay.wk.data, weight_bytes(lay.wk)),
+            rec_matmul(s, lay.wk, s.upload_w(lay.wk),
                        bxb, bk, MatmulRows{n, 0, E, 0, kv_dim}, false);
-            rec_matmul(s, lay.wv, s.upload(lay.wv.data, weight_bytes(lay.wv)),
+            rec_matmul(s, lay.wv, s.upload_w(lay.wv),
                        bxb, bv, MatmulRows{n, 0, E, 0, kv_dim}, false);
             rope_rows(bq, divisors, H, hd, 0, hd, q_dim, false);
             rope_rows(bk, divisors, hp.n_kv_heads, hd, 0, hd, kv_dim,
@@ -1596,21 +1787,21 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 const std::uint32_t qr = hp.q_lora_rank;
                 const auto bqa = s.chunk_buf(C::kCQa, std::size_t{n} * qr);
                 rec_matmul(s, lay.wq_a,
-                           s.upload(lay.wq_a.data, weight_bytes(lay.wq_a)),
+                           s.upload_w(lay.wq_a),
                            bxb, bqa, MatmulRows{n, 0, E, 0, qr}, false);
                 norm_rows(lay.q_a_norm, bqa, bqa, qr, 0, qr, qr, n);
                 rec_matmul(s, lay.wq_b,
-                           s.upload(lay.wq_b.data, weight_bytes(lay.wq_b)),
+                           s.upload_w(lay.wq_b),
                            bqa, bq, MatmulRows{n, 0, qr, 0, q_dim}, false);
             } else {
                 rec_matmul(s, lay.wq,
-                           s.upload(lay.wq.data, weight_bytes(lay.wq)),
+                           s.upload_w(lay.wq),
                            bxb, bq, MatmulRows{n, 0, E, 0, q_dim}, false);
             }
             // Latent rows: rms-norm the c_kv part and rope the k_pe
             // part in place, then scatter the rows into the pool.
             rec_matmul(s, lay.wkv_a,
-                       s.upload(lay.wkv_a.data, weight_bytes(lay.wkv_a)),
+                       s.upload_w(lay.wkv_a),
                        bxb, bkva, MatmulRows{n, 0, E, 0, kvw}, false);
             norm_rows(lay.kv_a_norm, bkva, bkva, rank, 0, kvw, kvw, n);
             rope_rows(bkva, divisors, 1, rope_d, rank, 0, kvw, true);
@@ -1635,7 +1826,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 absorb.w_bstride_bytes =
                     std::uint64_t{rank} * mat_row_bytes(lay.wk_b);
                 rec_matmul(s, kb,
-                           s.upload(lay.wk_b.data, weight_bytes(lay.wk_b)),
+                           s.upload_w(lay.wk_b),
                            bq, bqabs, absorb, false);
             }
             rec_attn_mla(s, pp, bq, bqabs, batt, blat, n, base, H, rank, nope,
@@ -1656,11 +1847,11 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 uv_rows.w_bstride_bytes =
                     std::uint64_t{vd} * mat_row_bytes(lay.wv_b);
                 rec_matmul(s, vb,
-                           s.upload(lay.wv_b.data, weight_bytes(lay.wv_b)),
+                           s.upload_w(lay.wv_b),
                            blat, batt_out, uv_rows, false);
             }
         }
-        rec_matmul(s, lay.wo, s.upload(lay.wo.data, weight_bytes(lay.wo)),
+        rec_matmul(s, lay.wo, s.upload_w(lay.wo),
                    batt_out, bx, MatmulRows{n, 0, att_dim, 0, E}, true);
 
         norm_rows(lay.ffn_norm, bx, bxb, E, 0, E, E, n);
@@ -1682,7 +1873,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         const auto bdown =
             s.chunk_buf(C::kCDown, std::size_t{n} * k_used * E);
         rec_matmul(s, lay.gate_inp,
-                   s.upload(lay.gate_inp.data, weight_bytes(lay.gate_inp)),
+                   s.upload_w(lay.gate_inp),
                    bxb, brouter, MatmulRows{n, 0, E, 0, 2 * ne}, false);
         {
             const bool has_bias = !lay.exp_probs_b.empty();
@@ -1701,6 +1892,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 hp.n_group_used,
                 hp.expert_weights_norm ? 1u : 0u,
                 fbits(hp.expert_weights_scale),
+                1u,
                 2 * ne,
                 2 * k_used};
             s.ctx.dispatch(Kernel::kMoeRouteB, bufs, push, 1, n);
@@ -1741,7 +1933,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const Mat& out_w = m.output_weight();
     if (all_logits) {
         norm_rows(m.output_norm(), bx, bxb, E, 0, E, E, n);
-        rec_matmul(s, out_w, s.upload(out_w.data, weight_bytes(out_w)), bxb,
+        rec_matmul(s, out_w, s.upload_w(out_w), bxb,
                    blogits, MatmulRows{n, 0, E, 0, hp.n_vocab}, false);
     } else {
         norm_rows(m.output_norm(), bx, bxb, E, (n - 1) * E, 0, 0, 1);

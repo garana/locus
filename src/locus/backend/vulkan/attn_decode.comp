@@ -1,0 +1,130 @@
+#version 450
+
+// Flash-decoding attention for one query token (decode), reading
+// K/V straight from the paged pool. Workgroup (x = position block c,
+// y = head h) scores its CH positions, takes their local max m and
+// exp-sum l, and accumulates o = sum_t exp(s_t - m) V_t. With one
+// block (short contexts) it writes o / l to OUT directly; otherwise
+// it writes (o, m, l) partials for attn_combine.comp.
+//
+// The key is two segments: Q1 (d1 floats per head, q1_stride apart)
+// against pool[row + k_off + kvh * kv_stride ...], then Q2 (d2
+// floats) against the next d2 floats of the key -- MLA's [q_abs |
+// q_pe] against [latent | k_pe] (kv_stride 0: one shared latent);
+// GQA uses d2 = 0 and kvh = h / group. V is dv floats at row + v_off
+// + kvh * kv_stride. row = table[p / block_tokens] * block_stride +
+// (p % block_tokens) * row_w.
+
+#define WG 128u
+#define CH 64u          // positions per block
+#define TPP (WG / CH)   // threads per position for the scores
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer POOL { float pool[]; };
+layout(std430, binding = 1) readonly buffer TABLE { uint table[]; };
+layout(std430, binding = 2) readonly buffer Q1 { float q1[]; };
+layout(std430, binding = 3) readonly buffer Q2 { float q2[]; };
+layout(std430, binding = 4) writeonly buffer OUT { float o[]; };
+layout(std430, binding = 5) writeonly buffer PART { float part[]; };
+
+layout(push_constant) uniform PC {
+    uint n_pos;
+    uint block_tokens;
+    uint block_stride;  // floats per pool block
+    uint row_w;         // floats per position row
+    uint k_off;         // floats into a row: key start
+    uint v_off;         // floats into a row: value start
+    uint kv_stride;     // floats between KV heads (0 = shared)
+    uint group;         // query heads per KV head
+    uint d1;
+    uint d2;
+    uint q1_stride;
+    uint q2_stride;
+    uint q2_off;
+    uint dv;
+    float scale;
+    uint out_stride;    // OUT floats between heads
+} pc;
+
+// ATTN_DECODE_Q_MAX is vk::kAttnDecodeQMax (limits.hpp), passed by
+// CMake; the host only dispatches keys that fit.
+shared float qs[ATTN_DECODE_Q_MAX];
+shared float sc[CH];
+shared float red[WG];
+
+uint pos_row(uint p) {
+    return table[p / pc.block_tokens] * pc.block_stride +
+           (p % pc.block_tokens) * pc.row_w;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint c = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    uint n_blocks = gl_NumWorkGroups.x;
+    uint kvh = h / pc.group;
+    uint dk = pc.d1 + pc.d2;
+    for (uint i = t; i < dk; i += WG) {
+        qs[i] = i < pc.d1 ? q1[h * pc.q1_stride + i]
+                          : q2[h * pc.q2_stride + pc.q2_off + i - pc.d1];
+    }
+    barrier();
+
+    uint p0 = c * CH;
+    uint np = min(CH, pc.n_pos - p0);
+    // Scores: TPP threads per position, interleaved over the key.
+    uint lp = t / TPP;
+    uint lane = t % TPP;
+    float part_s = 0.0;
+    if (lp < np) {
+        uint kb = pos_row(p0 + lp) + pc.k_off + kvh * pc.kv_stride;
+        for (uint i = lane; i < dk; i += TPP) {
+            part_s += qs[i] * pool[kb + i];
+        }
+    }
+    red[t] = part_s;
+    barrier();
+    if (lane == 0u && lp < CH) {
+        float sv = 0.0;
+        for (uint j = 0u; j < TPP; ++j) {
+            sv += red[t + j];
+        }
+        sc[lp] = lp < np ? sv * pc.scale : -3.4e38;
+    }
+    barrier();
+    float m = sc[0];
+    for (uint j = 1u; j < np; ++j) {
+        m = max(m, sc[j]);
+    }
+    barrier();
+    if (t < CH) {
+        sc[t] = t < np ? exp(sc[t] - m) : 0.0;
+    }
+    barrier();
+    float l = 0.0;
+    for (uint j = 0u; j < np; ++j) {
+        l += sc[j];
+    }
+
+    uint vbase = pc.v_off + kvh * pc.kv_stride;
+    for (uint i = t; i < pc.dv; i += WG) {
+        float acc = 0.0;
+        for (uint j = 0u; j < np; ++j) {
+            acc += sc[j] * pool[pos_row(p0 + j) + vbase + i];
+        }
+        if (n_blocks == 1u) {
+            o[h * pc.out_stride + i] = acc / l;
+        } else {
+            // Partials: [block][head][dv], then [block][head] (m, l)
+            // after all of them.
+            uint heads = gl_NumWorkGroups.y;
+            part[(c * heads + h) * pc.dv + i] = acc;
+            if (i == 0u) {
+                uint st = n_blocks * heads * pc.dv + (c * heads + h) * 2u;
+                part[st] = m;
+                part[st + 1u] = l;
+            }
+        }
+    }
+}

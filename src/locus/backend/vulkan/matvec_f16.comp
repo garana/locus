@@ -40,6 +40,8 @@ layout(push_constant) uniform PC {
     uint out_stride;
     uint n_slots;
     uint mode;      // 1 = ids from route[], 2 = weighted slot sum
+    uint row_stride;  // elements between rows; 0 = cols (a slot may
+                      // cover a column chunk of wider rows)
 #endif
 } pc;
 
@@ -52,7 +54,11 @@ float half_at(uint e) {
 
 /** This lane's share of dot(row r of the matrix at wbase, x). */
 float row_part(uint wbase, uint xbase, uint r, uint lane) {
+#ifdef BATCHED
+    uint base = wbase + r * (pc.row_stride != 0u ? pc.row_stride : pc.cols);
+#else
     uint base = wbase + r * pc.cols;
+#endif
     float acc = 0.0;
     for (uint i = lane; i < pc.cols; i += LANES) {
         acc += half_at(base + i) * x[xbase + i];

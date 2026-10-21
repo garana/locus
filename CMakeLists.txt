@@ -139,11 +139,14 @@ if(Vulkan_FOUND)
             rmsnorm rope silu_mul
             attn_paged_q kv_store_q moe_route
             kv_scatter moe_group moe_combine attn_softmax sum_splits
+            matvec_t_q8 attn_decode attn_combine
             # Variants: <kernel>=<source>:<define>[,<define>...], the
             # source compiled again with -D<define> for each.
             matvec_b=matvec:BATCHED
             matvec_f16_b=matvec_f16:BATCHED
             matvec_q8_0_b=matvec_q8_0:BATCHED
+            matvec_q8_0_glu=matvec_q8_0:SWIGLU
+            matvec_q8_0_glu_b=matvec_q8_0:BATCHED,SWIGLU
             matmul_q8_0=matmul:TYPE_Q8
             matmul_f32=matmul:TYPE_F32
             matmul_q8_0_id=matmul:TYPE_Q8,MOE_ID
@@ -162,11 +165,20 @@ if(Vulkan_FOUND)
         if(NOT LOCUS_ATTN_PART_MAX)
             message(FATAL_ERROR "kAttnPartMax not found in limits.hpp")
         endif()
+        file(STRINGS ${LOCUS_VK_LIMITS} _attn_q
+             REGEX "kAttnDecodeQMax = [0-9]+;")
+        string(REGEX MATCH "kAttnDecodeQMax = ([0-9]+)" _m "${_attn_q}")
+        set(LOCUS_ATTN_DECODE_Q_MAX "${CMAKE_MATCH_1}")
+        if(NOT LOCUS_ATTN_DECODE_Q_MAX)
+            message(FATAL_ERROR "kAttnDecodeQMax not found in limits.hpp")
+        endif()
         message(STATUS "locus Vulkan kernels: ATTN_PART_MAX "
-                       "${LOCUS_ATTN_PART_MAX}")
+                       "${LOCUS_ATTN_PART_MAX}, ATTN_DECODE_Q_MAX "
+                       "${LOCUS_ATTN_DECODE_Q_MAX}")
         set(SHADER_HDRS "")
         foreach(entry ${LOCUS_SHADERS})
-            set(DEFS -DATTN_PART_MAX=${LOCUS_ATTN_PART_MAX})
+            set(DEFS -DATTN_PART_MAX=${LOCUS_ATTN_PART_MAX}
+                     -DATTN_DECODE_Q_MAX=${LOCUS_ATTN_DECODE_Q_MAX})
             if(entry MATCHES "^([a-z0-9_]+)=([a-z0-9_]+):([A-Z0-9_,]+)$")
                 set(shader ${CMAKE_MATCH_1})
                 set(source ${CMAKE_MATCH_2})
