@@ -24,8 +24,6 @@ enum class Kernel {
     kRmsNorm,
     kRope,
     kSiluMul,
-    kAttnPaged,
-    kAttnMla,
     kAttnPagedQ,
     kKvStoreQ,
     /** Batched (-DBATCHED) matvecs: one dispatch, several matrices. */
@@ -33,6 +31,22 @@ enum class Kernel {
     kMatvecF16B,
     kMatvecQ8_0B,
     kMoeRoute,
+    /** Prefill (batched forward over a chunk of tokens). */
+    kMatmulQ8_0,
+    kMatmulF32,
+    kMatmulQ8_0Id,
+    kKvScatter,
+    kMoeGroup,
+    kMoeCombine,
+    /** -DBATCHED variants: workgroup y = token row of the chunk. */
+    kRmsNormB,
+    kRopeB,
+    kMoeRouteB,
+    /** Attention as matmuls: W read from the paged KV pool. */
+    kMatmulPagedF32,
+    kMatmulPagedTF32,
+    kAttnSoftmax,
+    kSumSplits,
     kCount_,
 };
 

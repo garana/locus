@@ -52,9 +52,13 @@ void VulkanContext::report_profile() const {
         "matvec_q5_k",  "matvec_q6_k",  "matvec_q2_k",
         "matvec_iq2_xxs", "matvec_iq3_xxs", "matvec_iq4_xs",
         "matvec_t",     "rmsnorm",      "rope",
-        "silu_mul",     "attn_paged",   "attn_mla",
-        "attn_paged_q", "kv_store_q",   "matvec_f32_b",
-        "matvec_f16_b", "matvec_q8_0_b", "moe_route"};
+        "silu_mul",     "attn_paged_q", "kv_store_q",
+        "matvec_f32_b", "matvec_f16_b", "matvec_q8_0_b",
+        "moe_route",    "matmul_q8_0",  "matmul_f32",
+        "matmul_q8_0_id", "kv_scatter", "moe_group",
+        "moe_combine",  "rmsnorm_b",    "rope_b",
+        "moe_route_b",  "matmul_paged", "matmul_paged_t",
+        "attn_softmax", "sum_splits"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -91,10 +95,15 @@ void VulkanContext::report_profile() const {
 #include <unordered_map>
 #include <vector>
 
-#include "attn_mla_spv.h"
 #include "attn_paged_q_spv.h"
-#include "attn_paged_spv.h"
+#include "attn_softmax_spv.h"
+#include "kv_scatter_spv.h"
 #include "kv_store_q_spv.h"
+#include "matmul_f32_spv.h"
+#include "matmul_paged_f32_spv.h"
+#include "matmul_paged_t_f32_spv.h"
+#include "matmul_q8_0_id_spv.h"
+#include "matmul_q8_0_spv.h"
 #include "matvec_b_spv.h"
 #include "matvec_f16_b_spv.h"
 #include "matvec_f16_spv.h"
@@ -109,12 +118,18 @@ void VulkanContext::report_profile() const {
 #include "matvec_iq4_xs_spv.h"
 #include "matvec_q8_0_b_spv.h"
 #include "matvec_q8_0_spv.h"
+#include "moe_combine_spv.h"
+#include "moe_group_spv.h"
+#include "moe_route_b_spv.h"
 #include "moe_route_spv.h"
 #include "matvec_spv.h"
 #include "matvec_t_spv.h"
+#include "rmsnorm_b_spv.h"
 #include "rmsnorm_spv.h"
+#include "rope_b_spv.h"
 #include "rope_spv.h"
 #include "silu_mul_spv.h"
+#include "sum_splits_spv.h"
 
 namespace locus::backend::vk {
 
@@ -164,10 +179,6 @@ const KernelDesc& kernel_desc(Kernel k) {
         {locus_rmsnorm_spv, sizeof(locus_rmsnorm_spv), 3, 12},
         {locus_rope_spv, sizeof(locus_rope_spv), 2, 36},
         {locus_silu_mul_spv, sizeof(locus_silu_mul_spv), 3, 4},
-        {locus_attn_paged_spv, sizeof(locus_attn_paged_spv), 5,
-         36},
-        {locus_attn_mla_spv, sizeof(locus_attn_mla_spv), 6,
-         36},
         {locus_attn_paged_q_spv, sizeof(locus_attn_paged_q_spv),
          5, 44},
         {locus_kv_store_q_spv, sizeof(locus_kv_store_q_spv), 2,
@@ -178,6 +189,22 @@ const KernelDesc& kernel_desc(Kernel k) {
         {locus_matvec_q8_0_b_spv, sizeof(locus_matvec_q8_0_b_spv),
          4, 48},
         {locus_moe_route_spv, sizeof(locus_moe_route_spv), 3, 32},
+        {locus_matmul_q8_0_spv, sizeof(locus_matmul_q8_0_spv), 3, 96},
+        {locus_matmul_f32_spv, sizeof(locus_matmul_f32_spv), 3, 96},
+        {locus_matmul_q8_0_id_spv, sizeof(locus_matmul_q8_0_id_spv), 4,
+         96},
+        {locus_kv_scatter_spv, sizeof(locus_kv_scatter_spv), 3, 32},
+        {locus_moe_group_spv, sizeof(locus_moe_group_spv), 2, 16},
+        {locus_moe_combine_spv, sizeof(locus_moe_combine_spv), 3, 8},
+        {locus_rmsnorm_b_spv, sizeof(locus_rmsnorm_b_spv), 3, 24},
+        {locus_rope_b_spv, sizeof(locus_rope_b_spv), 2, 40},
+        {locus_moe_route_b_spv, sizeof(locus_moe_route_b_spv), 3, 40},
+        {locus_matmul_paged_f32_spv, sizeof(locus_matmul_paged_f32_spv), 4,
+         96},
+        {locus_matmul_paged_t_f32_spv,
+         sizeof(locus_matmul_paged_t_f32_spv), 4, 96},
+        {locus_attn_softmax_spv, sizeof(locus_attn_softmax_spv), 1, 20},
+        {locus_sum_splits_spv, sizeof(locus_sum_splits_spv), 2, 16},
     };
     static_assert(std::size(descs) ==
                   static_cast<std::size_t>(Kernel::kCount_));

@@ -1,0 +1,80 @@
+#version 450
+
+// Causal softmax over attention score rows, in place: row j = t *
+// heads + h holds query token t's scores against cache positions
+// 0 .. n_pos-1 (S = K Q^T from matmul.comp). Token t sits at
+// position base + t, so positions above it are masked: they get
+// probability 0, the rest exp(scale * s - max) / sum. One
+// workgroup per row; max and sum reduced in shared memory.
+
+#define WG 256u
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer S { float s[]; };
+
+layout(push_constant) uniform PC {
+    uint n_pos;   // floats per row (the chunk's last token's span)
+    uint heads;   // rows per token
+    uint base;    // position of the chunk's first token
+    float scale;
+    uint rows;    // rows in all (the grid may overshoot)
+} pc;
+
+shared float red[WG];
+
+float reduce_max(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (tid < step) {
+            red[tid] = max(red[tid], red[tid + step]);
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+float reduce_sum(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (tid < step) {
+            red[tid] += red[tid + step];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.rows) {
+        return;  // uniform per workgroup
+    }
+    uint valid = pc.base + row / pc.heads + 1u;
+    uint at = row * pc.n_pos;
+    float mx = -3.4e38;
+    for (uint p = tid; p < valid; p += WG) {
+        mx = max(mx, s[at + p] * pc.scale);
+    }
+    mx = reduce_max(mx);
+    float sum = 0.0;
+    for (uint p = tid; p < valid; p += WG) {
+        float e = exp(s[at + p] * pc.scale - mx);
+        s[at + p] = e;
+        sum += e;
+    }
+    sum = reduce_sum(sum);
+    float inv = 1.0 / sum;
+    for (uint p = tid; p < pc.n_pos; p += WG) {
+        s[at + p] = p < valid ? s[at + p] * inv : 0.0;
+    }
+}
