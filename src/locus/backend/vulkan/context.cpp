@@ -90,6 +90,18 @@ void VulkanContext::report_profile() const {
 
 #if defined(LOCUS_HAS_VULKAN_KERNELS)
 
+#include "locus/backend/vulkan/limits.hpp"
+
+// The shaders were compiled with the limits CMake extracted from
+// limits.hpp; the host must use the same values.
+static_assert(locus::backend::vk::kAttnPartMax ==
+                  LOCUS_VK_SHADER_ATTN_PART_MAX,
+              "kAttnPartMax differs from the shaders' ATTN_PART_MAX");
+static_assert(locus::backend::vk::kAttnDecodeQMax ==
+                  LOCUS_VK_SHADER_ATTN_DECODE_Q_MAX,
+              "kAttnDecodeQMax differs from the shaders' "
+              "ATTN_DECODE_Q_MAX");
+
 #include <vulkan/vulkan.h>
 
 #include <array>

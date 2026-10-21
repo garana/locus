@@ -158,20 +158,22 @@ if(Vulkan_FOUND)
         # Limits shared with the host, read from their one definition.
         set(LOCUS_VK_LIMITS
             ${CMAKE_SOURCE_DIR}/src/locus/backend/vulkan/limits.hpp)
-        file(STRINGS ${LOCUS_VK_LIMITS} _attn_part
-             REGEX "kAttnPartMax = [0-9]+;")
-        string(REGEX MATCH "kAttnPartMax = ([0-9]+)" _m "${_attn_part}")
-        set(LOCUS_ATTN_PART_MAX "${CMAKE_MATCH_1}")
-        if(NOT LOCUS_ATTN_PART_MAX)
-            message(FATAL_ERROR "kAttnPartMax not found in limits.hpp")
-        endif()
-        file(STRINGS ${LOCUS_VK_LIMITS} _attn_q
-             REGEX "kAttnDecodeQMax = [0-9]+;")
-        string(REGEX MATCH "kAttnDecodeQMax = ([0-9]+)" _m "${_attn_q}")
-        set(LOCUS_ATTN_DECODE_Q_MAX "${CMAKE_MATCH_1}")
-        if(NOT LOCUS_ATTN_DECODE_Q_MAX)
-            message(FATAL_ERROR "kAttnDecodeQMax not found in limits.hpp")
-        endif()
+        # Exactly one "<name> = N;" line, else configure fails; the
+        # C++ side static_asserts the same values (context.cpp).
+        function(locus_vk_limit name out)
+            file(STRINGS ${LOCUS_VK_LIMITS} _lines
+                 REGEX "${name} = [0-9]+;")
+            list(LENGTH _lines _n)
+            if(NOT _n EQUAL 1)
+                message(FATAL_ERROR
+                    "${name}: expected one definition in limits.hpp, "
+                    "found ${_n}")
+            endif()
+            string(REGEX MATCH "${name} = ([0-9]+)" _m "${_lines}")
+            set(${out} "${CMAKE_MATCH_1}" PARENT_SCOPE)
+        endfunction()
+        locus_vk_limit(kAttnPartMax LOCUS_ATTN_PART_MAX)
+        locus_vk_limit(kAttnDecodeQMax LOCUS_ATTN_DECODE_Q_MAX)
         message(STATUS "locus Vulkan kernels: ATTN_PART_MAX "
                        "${LOCUS_ATTN_PART_MAX}, ATTN_DECODE_Q_MAX "
                        "${LOCUS_ATTN_DECODE_Q_MAX}")
@@ -224,7 +226,9 @@ if(Vulkan_FOUND)
         target_include_directories(locus PRIVATE
             ${CMAKE_BINARY_DIR}/shaders)
         target_compile_definitions(locus PRIVATE
-            LOCUS_HAS_VULKAN_KERNELS=1)
+            LOCUS_HAS_VULKAN_KERNELS=1
+            LOCUS_VK_SHADER_ATTN_PART_MAX=${LOCUS_ATTN_PART_MAX}
+            LOCUS_VK_SHADER_ATTN_DECODE_Q_MAX=${LOCUS_ATTN_DECODE_Q_MAX})
         message(STATUS "locus Vulkan kernels: enabled")
     else()
         message(STATUS
