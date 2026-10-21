@@ -52,7 +52,15 @@
 #define TN 4u
 #endif
 #ifndef BK
+// Columns staged per K step. BK16 selects the smaller-shared-memory
+// tile for devices whose maxComputeSharedMemorySize cannot fit the
+// default (16/32 must match kMatmulBKSmall/kMatmulBK in context.hpp).
+// BK must divide 32 so a step never straddles a Q8_0 block.
+#ifdef BK16
+#define BK 16u
+#else
 #define BK 32u
+#endif
 #endif
 #define BM (16u * TM)
 #define BN (16u * TN)

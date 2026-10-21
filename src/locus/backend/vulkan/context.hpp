@@ -131,6 +131,18 @@ class VulkanContext {
     static constexpr std::uint32_t kMatmulTileToks = 64;
 
     /**
+     * matmul.comp columns staged per K step (the shader's BK). The
+     * default tile's shared stage is 25088 bytes; on a device whose
+     * maxComputeSharedMemorySize cannot fit it, the context builds the
+     * matmul pipelines from the BK16 variant instead (12800 bytes),
+     * which keeps the GPU prefill path on tight devices (e.g. V3DV,
+     * 16384). These must match matmul.comp's BK default and BK16
+     * override.
+     */
+    static constexpr std::uint32_t kMatmulBK = 32;
+    static constexpr std::uint32_t kMatmulBKSmall = 16;
+
+    /**
      * Device memory this context can still allocate, per
      * memory_available_from() (mem_fit.hpp): VK_EXT_memory_budget
      * when the device has it, else 3/4 of the heap minus this
