@@ -115,6 +115,15 @@ class VulkanContext {
     static bool profiling();
 
     /**
+     * @returns The count of Vulkan validation errors seen so far in
+     * this process. Nonzero only when LOCUS_VK_VALIDATION enabled the
+     * Khronos validation layer (with GPU-assisted validation) at
+     * instance creation; 0 otherwise and in a build without kernels.
+     * Used by the out-of-bounds (F2) regression test.
+     */
+    static std::uint32_t validation_errors();
+
+    /**
      * matmul.comp tile: weight rows and tokens per workgroup (the
      * shader's BM = 16 TM and BN = 16 TN; keep them in sync).
      */

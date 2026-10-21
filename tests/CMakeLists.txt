@@ -55,6 +55,7 @@ add_executable(locus_tests
     test_vulkan_prefill.cpp
     test_vulkan_mem_fit.cpp
     test_vulkan_limits.cpp
+    test_vulkan_oob.cpp
     test_q8_layout.cpp
     test_vulkan_reset.cpp
     test_tokenizer.cpp
@@ -82,3 +83,18 @@ target_compile_definitions(locus_tests PRIVATE
 add_dependencies(locus_tests locus-auth-helper locus-stage)
 
 add_test(NAME unit COMMAND locus_tests)
+
+# On-device out-of-bounds proof for the Q8_0 upload (F2). Runs the
+# hidden [validation] cases with the Khronos validation layer enabled
+# (GPU-assisted). Needs vulkan-validationlayers installed and a device;
+# the cases skip when LOCUS_VK_VALIDATION is unset, so they never run in
+# the plain "unit" test.
+add_test(NAME vulkan_oob_validation
+         COMMAND locus_tests "[validation]")
+set_tests_properties(vulkan_oob_validation PROPERTIES
+    ENVIRONMENT "LOCUS_VK_VALIDATION=1"
+    # Catch2 exits 4 when every selected case skips (no validation
+    # layer or no device); SKIP_RETURN_CODE makes ctest read that as
+    # skipped, not failed, so a layerless host (CI or a peer without
+    # the Khronos layer) does not report a spurious failure.
+    SKIP_RETURN_CODE 4)
