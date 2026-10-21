@@ -210,6 +210,7 @@ TEST_CASE("vulkan MoE pair matvecs match the CPU routed experts",
     const float wts[n_tok][k] = {{0.6f, 0.4f}, {-0.3f, 1.2f},
                                  {0.25f, 0.75f}};
     std::vector<std::uint32_t> route;
+    route.reserve(std::size_t{n_tok} * 2 * k);
     for (std::uint32_t t = 0; t < n_tok; ++t) {
         route.insert(route.end(), {ids[t][0], ids[t][1], fbits(wts[t][0]),
                                    fbits(wts[t][1])});

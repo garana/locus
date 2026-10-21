@@ -64,6 +64,9 @@ void main() {
     uint lane = tid % LANES;
     uint slot = tid / LANES;
     uint r = gl_WorkGroupID.x * ROWS + slot;
+    // Never more than NT tokens, whatever the host passes: lanes
+    // past NT would index red[] beyond its planes.
+    uint nt = min(pc.n_tok, NT);
     uint bt = gl_WorkGroupID.y;
     uint x_off = pc.x_off + bt * pc.x_bstride;
     uint w_off = pc.w_off + bt * pc.w_bstride;
@@ -80,7 +83,7 @@ void main() {
         for (uint c = lane; c < pc.cols; c += LANES) {
             float wv = w[rb + c];
             for (uint t = 0u; t < NT; ++t) {
-                if (t < pc.n_tok) {
+                if (t < nt) {
                     acc[t] += wv * x[x_off + t * pc.x_stride + c];
                 }
             }
@@ -113,7 +116,7 @@ void main() {
             // registers. Same per-token arithmetic order as
             // matvec_q8_0.comp; vec4 x loads when rows are 4-aligned.
             for (uint t = 0u; t < NT; ++t) {
-                if (t < pc.n_tok) {
+                if (t < nt) {
                     uint xi = xc + t * pc.x_stride;
                     float s = 0.0;
                     for (uint k = 0u; k < 2u; ++k) {
@@ -146,7 +149,7 @@ void main() {
         barrier();
     }
     // Lane t writes token t's output for this row.
-    if (lane < pc.n_tok && r < pc.rows) {
+    if (lane < nt && r < pc.rows) {
         float v = red[lane * LANES * ROWS + slot * LANES] * pc.scale;
         uint oi = pc.out_offset + bt * pc.out_bstride +
                   lane * pc.out_stride + r;
