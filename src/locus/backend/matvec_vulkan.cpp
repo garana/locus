@@ -518,6 +518,11 @@ struct MatmulRows {
  * batch b) in one matmul dispatch, reading each weight tile once per
  * kMatmulToks tokens. Weight types without a matmul kernel fall back
  * to one matvec per (batch, token): correct, just not amortized.
+ *
+ * A grid under kMinGroups workgroups (few weight rows, e.g. MLA's
+ * kv_a, or a short chunk) splits the K range over more of them, as
+ * rec_paged_matmul does, when the output is one tight plane (single
+ * batch, out_off 0, rows apart) that sum_splits can add up.
  */
 void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
                 VulkanContext::Buffer x, VulkanContext::Buffer out,
@@ -538,7 +543,23 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
         return;
     }
     const std::uint32_t tiles = (r.n_tok + kMatmulToks - 1) / kMatmulToks;
-    const VulkanContext::Buffer bufs[] = {wb, x, out};
+    constexpr std::uint32_t kMinGroups = 256;
+    constexpr std::uint32_t kSplitCols = 256;
+    const std::uint32_t row_tiles = (w.rows + kMatmulRows - 1) / kMatmulRows;
+    const std::uint32_t groups = row_tiles * tiles * r.n_batch;
+    const bool tight = r.n_batch == 1 && r.out_off == 0 &&
+                       r.out_stride == w.rows && r.div == 1;
+    const std::uint32_t k_splits =
+        !tight || groups >= kMinGroups
+            ? 1
+            : std::clamp<std::uint32_t>((kMinGroups + groups - 1) / groups,
+                                        1, std::max(w.cols / kSplitCols, 1u));
+    const std::uint32_t plane = r.n_tok * w.rows;
+    const VulkanContext::Buffer dst =
+        k_splits > 1
+            ? s.chunk_buf(State::kCSplit, std::size_t{k_splits} * plane)
+            : out;
+    const VulkanContext::Buffer bufs[] = {wb, x, dst};
     const std::uint32_t push[] = {w.rows,
                                   w.cols,
                                   r.n_tok,
@@ -559,12 +580,18 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   0,
                                   0,
                                   0,
-                                  1,
-                                  0,
+                                  k_splits,
+                                  plane,
                                   r.x_inner,
                                   r.out_inner};
-    s.ctx.dispatch(k, bufs, push, (w.rows + kMatmulRows - 1) / kMatmulRows,
-                   tiles * r.n_batch);
+    s.ctx.dispatch(k, bufs, push, row_tiles, tiles * r.n_batch * k_splits);
+    if (k_splits > 1) {
+        const VulkanContext::Buffer sbufs[] = {dst, out};
+        const std::uint32_t spush[] = {plane, k_splits, 0,
+                                       accumulate ? 1u : 0u};
+        s.ctx.dispatch(Kernel::kSumSplits, sbufs, spush,
+                       (plane + 255) / 256);
+    }
 }
 
 /**
@@ -792,12 +819,12 @@ void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
                   std::uint32_t nope, std::uint32_t rope_d,
                   std::uint32_t layer_off, float kq_scale) {
     const std::uint32_t n_pos = base + n;
-    // Decode on a short context: flash-decoding, q_abs . latent +
+    // Decode up to ~1k positions: flash-decoding, q_abs . latent +
     // q_pe . k_pe with every head on the one shared latent row (group
-    // = heads). It reads the latent once per head, so past a few
-    // blocks the matmul form below (each latent tile read once for
-    // all heads) wins.
-    if (n == 1 && n_pos <= 256 && vk::attn_decode_fits(rank + rope_d)) {
+    // = heads). It reads the latent once per head, so on longer
+    // contexts the matmul form below (each latent tile read once for
+    // all heads) wins (M4 Max: flash ahead at 512, behind at 3k).
+    if (n == 1 && n_pos <= 1024 && vk::attn_decode_fits(rank + rope_d)) {
         rec_attn_decode(s, pp, n_pos, heads,
                         DecodeAttn{q_abs, q, lat, layer_off, layer_off, 0,
                                    heads, rank, rope_d, rank, nope + rope_d,
