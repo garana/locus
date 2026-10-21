@@ -143,13 +143,25 @@ if(Vulkan_FOUND)
             matvec_b=matvec:BATCHED
             matvec_f16_b=matvec_f16:BATCHED
             matvec_q8_0_b=matvec_q8_0:BATCHED)
+        # Limits shared with the host, read from their one definition.
+        set(LOCUS_VK_LIMITS
+            ${CMAKE_SOURCE_DIR}/src/locus/backend/vulkan/limits.hpp)
+        file(STRINGS ${LOCUS_VK_LIMITS} _attn_part
+             REGEX "kAttnPartMax = [0-9]+;")
+        string(REGEX MATCH "kAttnPartMax = ([0-9]+)" _m "${_attn_part}")
+        set(LOCUS_ATTN_PART_MAX "${CMAKE_MATCH_1}")
+        if(NOT LOCUS_ATTN_PART_MAX)
+            message(FATAL_ERROR "kAttnPartMax not found in limits.hpp")
+        endif()
+        message(STATUS "locus Vulkan kernels: ATTN_PART_MAX "
+                       "${LOCUS_ATTN_PART_MAX}")
         set(SHADER_HDRS "")
         foreach(entry ${LOCUS_SHADERS})
-            set(DEFS "")
+            set(DEFS -DATTN_PART_MAX=${LOCUS_ATTN_PART_MAX})
             if(entry MATCHES "^([a-z0-9_]+)=([a-z0-9_]+):([A-Z_]+)$")
                 set(shader ${CMAKE_MATCH_1})
                 set(source ${CMAKE_MATCH_2})
-                set(DEFS -D${CMAKE_MATCH_3})
+                list(APPEND DEFS -D${CMAKE_MATCH_3})
             else()
                 set(shader ${entry})
                 set(source ${entry})
@@ -164,7 +176,7 @@ if(Vulkan_FOUND)
                     COMMAND ${GLSLANG_VALIDATOR} -V ${DEFS}
                             --vn locus_${shader}_spv
                             ${SRC} -o ${HDR}
-                    DEPENDS ${SRC}
+                    DEPENDS ${SRC} ${LOCUS_VK_LIMITS}
                     COMMENT "Compiling ${source}.comp -> ${shader} SPIR-V")
             else()
                 # glslc has no header emitter; wrap its -mfmt=c.
@@ -180,7 +192,7 @@ if(Vulkan_FOUND)
                             -DOUT=${HDR}
                             -DVAR=locus_${shader}_spv
                             -P ${CMAKE_SOURCE_DIR}/cmake/wrap_spv.cmake
-                    DEPENDS ${SRC}
+                    DEPENDS ${SRC} ${LOCUS_VK_LIMITS}
                     COMMENT "Compiling ${source}.comp -> ${shader} SPIR-V")
             endif()
             list(APPEND SHADER_HDRS ${HDR})

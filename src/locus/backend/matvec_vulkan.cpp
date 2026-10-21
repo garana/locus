@@ -14,6 +14,7 @@
 #include "iq_grids.h"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
+#include "locus/backend/vulkan/limits.hpp"
 #include "locus/backend/vulkan/mem_fit.hpp"
 #include "locus/backend/vulkan/weight_pool.hpp"
 #include "locus/backend/vulkan_forward.hpp"
@@ -30,7 +31,7 @@ std::uint32_t fbits(float v) {
     return std::bit_cast<std::uint32_t>(v);
 }
 
-/** @returns On-disk bytes of one weight matrix, 4-byte padded. */
+/** @returns On-disk bytes of one weight matrix (exact). */
 std::size_t weight_bytes(const Mat& w) {
     std::size_t b;
     switch (w.type) {
@@ -83,7 +84,7 @@ std::size_t weight_bytes(const Mat& w) {
         default:
             return 0;  // no GPU kernel for this type
     }
-    return (b + 3) & ~std::size_t{3};
+    return b;
 }
 
 /** @returns The matvec kernel for w, or kCount_ if unsupported. */
@@ -179,22 +180,30 @@ struct State {
     VulkanContext::Buffer upload_experts(
         const model::TransformerModel::ExpertMat& em,
         std::uint32_t n_expert) {
-        const std::size_t bytes =
-            (static_cast<std::size_t>(em.expert_bytes) * n_expert + 3) &
-            ~std::size_t{3};
-        return pool.acquire(&em, bytes, [&](VulkanContext::Buffer b) {
-            ctx.write_buffer(b, {em.base.data, bytes});
-        });
+        return upload_keyed(
+            &em, em.base.data,
+            static_cast<std::size_t>(em.expert_bytes) * n_expert);
     }
 
     VulkanContext::Buffer upload(const void* ptr,
                                  std::size_t bytes) {
-        return pool.acquire(
-            ptr, bytes, [&](VulkanContext::Buffer b) {
-                ctx.write_buffer(
-                    b, {static_cast<const std::byte*>(ptr),
-                        bytes});
-            });
+        return upload_keyed(ptr, ptr, bytes);
+    }
+
+    /**
+     * Uploads exactly `bytes` from src into a pooled buffer keyed by
+     * `key`, allocated gpu_alloc_bytes(bytes) with the tail zeroed
+     * (never reads past the tensor on the host or the buffer on the
+     * GPU).
+     */
+    VulkanContext::Buffer upload_keyed(const void* key, const void* src,
+                                       std::size_t bytes) {
+        const std::size_t alloc = vk::gpu_alloc_bytes(bytes);
+        return pool.acquire(key, alloc, [&](VulkanContext::Buffer b) {
+            auto* dst = static_cast<std::byte*>(ctx.mapped(b));
+            std::memcpy(dst, src, bytes);
+            std::memset(dst + bytes, 0, alloc - bytes);
+        });
     }
 
     /** Uploads w dequantized to F32 (any CPU-supported type). */
@@ -468,7 +477,8 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
         return false;
     }
     if (hp.n_expert_used > 16 || hp.n_expert_used == 0 ||
-        hp.n_group > 32) {
+        hp.n_group > 32 ||
+        (hp.n_group > 1 && hp.n_expert % hp.n_group != 0)) {
         return false;
     }
     for (const auto* em : {&lay.gate_exps, &lay.up_exps, &lay.down_exps}) {
@@ -525,6 +535,13 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         return false;
     }
     const bool mla = hp.arch == model::Arch::kDeepseek2;
+    // The attention kernels stage per-head slices in a fixed shared
+    // array (vk::kAttnPartMax floats): wider heads, or a larger MLA
+    // latent rank, take the CPU path instead of overrunning it.
+    if (!vk::attn_width_fits(hp.head_dim) ||
+        (mla && !vk::attn_width_fits(hp.kv_lora_rank))) {
+        return false;
+    }
     if (quant && mla) {
         // MLA caches a single latent row (no separate K/V); its
         // quantized read is a #45 follow-up. Fall back to CPU.
@@ -998,9 +1015,8 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             const auto up_expert =
                 [&](const model::TransformerModel::ExpertMat& em,
                     std::uint32_t e) {
-                    return s.upload(
-                        em.expert(e).data,
-                        (em.expert_bytes + 3) & ~std::uint64_t{3});
+                    return s.upload(em.expert(e).data,
+                                    em.expert_bytes);
                 };
             for (const auto& [e, wgt] : picked) {
                 VulkanContext::Buffer bg =

@@ -36,7 +36,9 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared float red[WG];
-shared float part[512];  // P * head width; widths up to 512
+// P * head width; ATTN_PART_MAX is vk::kAttnPartMax (limits.hpp),
+// passed by CMake; the host rejects wider heads.
+shared float part[ATTN_PART_MAX];
 
 float reduce_max(float v) {
     uint tid = gl_LocalInvocationID.x;
