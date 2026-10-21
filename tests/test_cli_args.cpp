@@ -1,4 +1,7 @@
 #include <array>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
 
 #include "catch_amalgamated.hpp"
 #include "backend_cli.hpp"
@@ -115,4 +118,24 @@ TEST_CASE("--prefill-f16 parses as a flag", "[cli]") {
         static_cast<int>(argv2.size()),
         const_cast<char**>(argv2.data()));
     REQUIRE_FALSE(b.prefill_f16);  // off by default: exact f32
+}
+
+TEST_CASE("locus-run starts without a Vulkan device", "[cli]") {
+    // Tools set backend options at startup (vulkan_set_prefill_f16);
+    // with no Vulkan driver visible that must not touch the device:
+    // a CPU run works, and --prefill-f16 only warns.
+    const std::string model =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/models/stories260K.gguf";
+    if (!std::filesystem::exists(model)) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    for (const char* flag : {"", "--prefill-f16 "}) {
+        const std::string cmd =
+            std::string("VK_ICD_FILENAMES=/nonexistent.json "
+                        "VK_DRIVER_FILES=/nonexistent.json '") +
+            LOCUS_RUN_BIN + "' " + flag + "--backend scalar '" + model +
+            "' 'Once upon' 4 >/dev/null 2>&1";
+        INFO(cmd);
+        REQUIRE(std::system(cmd.c_str()) == 0);
+    }
 }

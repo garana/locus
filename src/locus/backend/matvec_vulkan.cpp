@@ -981,6 +981,16 @@ void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
 }  // namespace
 
 void vulkan_set_prefill_f16(bool on) {
+    // Tools call this unconditionally: on a box without a usable
+    // device it must not build the context (that throws).
+    if (!vulkan_backend_usable()) {
+        if (on) {
+            std::fprintf(stderr,
+                         "locus: --prefill-f16 ignored: no usable "
+                         "Vulkan device\n");
+        }
+        return;
+    }
     State& s = state();
     if (on && !s.ctx.has_f16()) {
         std::fprintf(stderr,
