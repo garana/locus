@@ -695,6 +695,152 @@ void qwen2moe_attention(const TransformerModel& m,
     }
 }
 
+// ---- qwen3moe (Qwen3 MoE, Qwen3-Coder): GQA with per-head q/k RMS
+// norm before NEOX rope, head_dim from attention.key_length (so q is
+// n_heads * head_dim wide, not n_embd), no q/k/v bias, routed experts
+// only with renormalized top-k weights. ----
+
+void qwen3moe_hparams(const gguf::GgufFile& g, const std::string& p,
+                      Hparams& hp) {
+    hp.arch = Arch::kLlama;  // GQA attention + standard MoE forward
+    hp.head_dim = static_cast<std::uint32_t>(
+        g.get_uint(p + "attention.key_length").value_or(0));
+    if (hp.head_dim == 0 && hp.n_heads != 0) {
+        hp.head_dim = hp.n_embd / hp.n_heads;
+    }
+    const auto vlen = g.get_uint(p + "attention.value_length");
+    if (hp.head_dim == 0 || (vlen && *vlen != hp.head_dim)) {
+        throw gguf::Error("qwen3moe: unsupported key/value lengths");
+    }
+    if (hp.n_kv_heads == 0 || hp.n_heads % hp.n_kv_heads != 0) {
+        throw gguf::Error("invalid kv head configuration");
+    }
+    hp.n_ff_exp = static_cast<std::uint32_t>(
+        g.get_uint(p + "expert_feed_forward_length").value_or(0));
+    if (hp.n_expert > 0 && hp.n_ff_exp == 0) {
+        throw gguf::Error("qwen3moe: missing expert_feed_forward_length");
+    }
+    hp.n_expert_shared = 0;          // routed experts only
+    hp.expert_weights_norm = true;   // norm_topk_prob
+    hp.kq_scale =
+        1.0f / std::sqrt(static_cast<float>(hp.head_dim));
+}
+
+void qwen3moe_attention_tensors(const gguf::GgufFile& g,
+                                const std::string& bp,
+                                const Hparams& hp,
+                                TransformerModel::Layer& lay) {
+    const std::uint32_t q_dim = hp.n_heads * hp.head_dim;
+    const std::uint32_t kv_dim = hp.n_kv_heads * hp.head_dim;
+    lay.wq = need_mat(g, bp + "attn_q.weight", hp.n_embd, q_dim);
+    lay.wk = need_mat(g, bp + "attn_k.weight", hp.n_embd, kv_dim);
+    lay.wv = need_mat(g, bp + "attn_v.weight", hp.n_embd, kv_dim);
+    lay.wo = need_mat(g, bp + "attn_output.weight", q_dim, hp.n_embd);
+    lay.attn_q_norm = need_vec(g, bp + "attn_q_norm.weight", hp.head_dim);
+    lay.attn_k_norm = need_vec(g, bp + "attn_k_norm.weight", hp.head_dim);
+}
+
+// Clone of qwen2moe_attention without the q/k/v bias and with Qwen3's
+// per-head RMS norm on q and k right after their projections (before
+// NEOX rope). The rest of the attention math is unchanged.
+void qwen3moe_attention(const TransformerModel& m,
+                        const TransformerModel::Layer& lay,
+                        kv::PagedKvCache& cache,
+                        kv::PagedKvCache::Seq& seq,
+                        TransformerModel::Workspace& ws, std::uint32_t l,
+                        std::uint32_t pos) {
+    using namespace locus::backend;
+    const Hparams& hp = m.hparams();
+    const Ops& op = m.active_backend().ops;
+    const std::uint32_t hd = hp.head_dim;
+    const std::size_t q_dim = static_cast<std::size_t>(hp.n_heads) * hd;
+    const std::size_t kv_dim =
+        static_cast<std::size_t>(hp.n_kv_heads) * hd;
+    const std::uint32_t group = hp.n_heads / hp.n_kv_heads;
+    // Per-head RMS norm (weights head_dim wide) in place.
+    auto head_norm = [&](std::span<float> x, std::uint32_t heads,
+                         std::span<const float> w) {
+        for (std::uint32_t h = 0; h < heads; ++h) {
+            std::span<float> xh = x.subspan(std::size_t{h} * hd, hd);
+            rmsnorm(xh, w, hp.rms_eps, xh);
+        }
+    };
+
+    std::span<float> q(ws.q.data(), q_dim);
+    op.matvec(lay.wq, ws.xb, q);
+    head_norm(q, hp.n_heads, lay.attn_q_norm);
+    rope_neox_yarn(q, hp.n_heads, hd, pos, hp.rope_freq_base, Yarn{});
+
+    std::vector<float> kmat, vmat;
+    const float* kbase = nullptr;
+    const float* vbase = nullptr;
+    if (cache.quantized()) {
+        std::vector<float> kbuf(kv_dim), vbuf(kv_dim);
+        op.matvec(lay.wk, ws.xb, kbuf);
+        op.matvec(lay.wv, ws.xb, vbuf);
+        head_norm(kbuf, hp.n_kv_heads, lay.attn_k_norm);
+        rope_neox_yarn(kbuf, hp.n_kv_heads, hd, pos,
+                       hp.rope_freq_base, Yarn{});
+        cache.store_row(seq, l, pos, false, kbuf);
+        cache.store_row(seq, l, pos, true, vbuf);
+        const std::size_t n = pos + 1;
+        kmat.resize(n * kv_dim);
+        vmat.resize(n * kv_dim);
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            cache.load_row(seq, l, t, false,
+                           {kmat.data() + t * kv_dim, kv_dim});
+            cache.load_row(seq, l, t, true,
+                           {vmat.data() + t * kv_dim, kv_dim});
+        }
+        kbase = kmat.data();
+        vbase = vmat.data();
+    } else {
+        float* krow = cache.k(seq, l, pos);
+        float* vrow = cache.v(seq, l, pos);
+        op.matvec(lay.wk, ws.xb, {krow, kv_dim});
+        op.matvec(lay.wv, ws.xb, {vrow, kv_dim});
+        head_norm({krow, kv_dim}, hp.n_kv_heads, lay.attn_k_norm);
+        rope_neox_yarn({krow, kv_dim}, hp.n_kv_heads, hd, pos,
+                       hp.rope_freq_base, Yarn{});
+    }
+    auto krow_at = [&](std::uint32_t t) -> const float* {
+        return kbase ? kbase + static_cast<std::size_t>(t) * kv_dim
+                     : cache.k(seq, l, t);
+    };
+    auto vrow_at = [&](std::uint32_t t) -> const float* {
+        return vbase ? vbase + static_cast<std::size_t>(t) * kv_dim
+                     : cache.v(seq, l, t);
+    };
+
+    for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
+        const float* qh = q.data() + static_cast<std::size_t>(h) * hd;
+        const std::size_t kvh =
+            static_cast<std::size_t>(h / group) * hd;
+        std::span<float> att(ws.att.data(), pos + 1);
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            const float* kt = krow_at(t) + kvh;
+            float s = 0.0f;
+            for (std::uint32_t i = 0; i < hd; ++i) {
+                s += qh[i] * kt[i];
+            }
+            att[t] = s * hp.kq_scale;
+        }
+        softmax_inplace(att);
+        float* oh =
+            ws.out.data() + static_cast<std::size_t>(h) * hd;
+        for (std::uint32_t i = 0; i < hd; ++i) {
+            oh[i] = 0.0f;
+        }
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            const float* vt = vrow_at(t) + kvh;
+            const float a = att[t];
+            for (std::uint32_t i = 0; i < hd; ++i) {
+                oh[i] += a * vt[i];
+            }
+        }
+    }
+}
+
 // ---- dbrx (Databricks DBRX): GQA with a FUSED qkv projection +
 // clip_qkv clamp, LayerNorm (weight-only, via the norm-type seam),
 // and fine-grained MoE (16 experts / 4 active, no shared expert).
@@ -856,6 +1002,11 @@ const ArchSpec kArchs[] = {
      "expert)",
      &qwen2moe_hparams, &qwen2moe_attention_tensors,
      &qwen2moe_attention, &llama_kv_dim},
+    {"qwen3moe",
+     "Qwen3 MoE / Qwen3-Coder (GQA + per-head q/k norm, routed "
+     "experts)",
+     &qwen3moe_hparams, &qwen3moe_attention_tensors,
+     &qwen3moe_attention, &llama_kv_dim},
     {"dbrx",
      "DBRX (GQA, fused QKV + clip_qkv, LayerNorm, fine-grained "
      "MoE 16x/4)",

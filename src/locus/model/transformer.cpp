@@ -372,15 +372,20 @@ TransformerModel::Workspace TransformerModel::make_workspace() const {
     ws.x.resize(hp_.n_embd);
     ws.xb.resize(hp_.n_embd);
     ws.xb2.resize(hp_.n_embd);
-    ws.q.resize(mla ? hp_.n_heads * hp_.head_dim : hp_.n_embd);
+    // GQA q / attention output are n_heads * head_dim wide: n_embd
+    // on most arches, wider when head_dim != n_embd / n_heads
+    // (qwen3moe).
+    const std::uint32_t q_dim = hp_.n_heads * hp_.head_dim;
+    ws.q.resize(mla || q_dim > hp_.n_embd ? q_dim : hp_.n_embd);
     ws.att.resize(hp_.n_ctx);
     const std::uint32_t ff = std::max(
         {hp_.n_ff, hp_.n_ff_exp,
          hp_.n_ff_exp * hp_.n_expert_shared, hp_.n_ff_shexp});
     ws.gate.resize(ff);
     ws.up.resize(ff);
-    ws.out.resize(mla ? hp_.n_heads * hp_.v_head_dim
-                      : hp_.n_embd);
+    ws.out.resize(mla           ? hp_.n_heads * hp_.v_head_dim
+                  : q_dim > hp_.n_embd ? q_dim
+                                       : hp_.n_embd);
     ws.router.resize(hp_.n_expert);
     ws.moe_acc.resize(hp_.n_expert > 0 ? hp_.n_embd : 0);
     if (mla) {

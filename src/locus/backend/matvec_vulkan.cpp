@@ -1232,6 +1232,12 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
  * matvec kernel (fused wkv_b goes through the F32-dequant path). */
 bool gpu_weights_ok(const model::TransformerModel& m) {
     for (const auto& l : m.layers()) {
+        // The full GPU forward implements the llama / deepseek2
+        // attention only: q/k/v biases (qwen2moe) and per-head q/k
+        // norms with NEOX rope (qwen3moe) take the CPU path.
+        if (!l.wq_bias.empty() || !l.attn_q_norm.empty()) {
+            return false;
+        }
         if (matvec_kernel(l.wo) == Kernel::kCount_) {
             return false;
         }

@@ -125,10 +125,14 @@ std::vector<Chunk> pretokenize(std::string_view text,
     offs.push_back(text.size());
     const std::size_t n = cps.size();
     // llama3 caps digit runs at 3 and allows one leading
-    // non-letter before a letter run; gpt-2 style does not.
+    // non-letter before a letter run; gpt-2 style does not. qwen2
+    // (Qwen2/Qwen3) is llama3's split with single digits (`\p{N}`
+    // instead of `\p{N}{1,3}`).
+    const bool qwen2 = pre == "qwen2";
     const bool llama3 = pre == "llama-bpe" || pre == "llama3" ||
                         pre == "deepseek-v3" ||
-                        pre == "deepseek-r1-qwen";
+                        pre == "deepseek-r1-qwen" || qwen2;
+    const std::size_t digit_cap = qwen2 ? 1 : 3;
 
     std::vector<Chunk> out;
     std::size_t i = 0;
@@ -180,7 +184,7 @@ std::vector<Chunk> pretokenize(std::string_view text,
             }
             std::size_t run = 0;
             while (i < n && is_digit(cps[i]) &&
-                   (!llama3 || run < 3)) {
+                   (!llama3 || run < digit_cap)) {
                 ++i;
                 ++run;
             }

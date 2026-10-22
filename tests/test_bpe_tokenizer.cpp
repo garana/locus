@@ -121,3 +121,24 @@ TEST_CASE("bpe from_gguf rejects a non-string token entry", "[tok]") {
     REQUIRE_THROWS_AS(BpeTokenizer::from_gguf(g),
                       locus::gguf::Error);
 }
+
+TEST_CASE("bpe pretokenizers: qwen2 is llama3 with single digits",
+          "[tok]") {
+    // Merges ". a" -> ".a" and "1 2" -> "12". A merge only happens
+    // inside one pretokenized chunk, so the tokens show the split:
+    // llama3 and qwen2 keep ".a" together (one punctuation char may
+    // prefix a letter run), gpt2 splits it; gpt2 and llama3 keep the
+    // digit run "12", qwen2 splits digits one by one.
+    auto tok_for = [](const char* pre) {
+        BpeTokenizer::Config cfg;
+        cfg.tokens = {".", "a", "1", "2", ".a", "12"};
+        cfg.types = {1, 1, 1, 1, 1, 1};
+        cfg.merges = {". a", "1 2"};
+        cfg.pre = pre;
+        return BpeTokenizer(std::move(cfg));
+    };
+    using V = std::vector<TokenId>;
+    REQUIRE(tok_for("qwen2").encode(".a12", false) == V{4, 2, 3});
+    REQUIRE(tok_for("llama3").encode(".a12", false) == V{4, 5});
+    REQUIRE(tok_for("gpt2").encode(".a12", false) == V{0, 1, 5});
+}
