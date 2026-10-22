@@ -200,13 +200,16 @@ if(Vulkan_FOUND)
         endfunction()
         locus_vk_limit(kAttnPartMax LOCUS_ATTN_PART_MAX)
         locus_vk_limit(kAttnDecodeQMax LOCUS_ATTN_DECODE_Q_MAX)
+        locus_vk_limit(kAttnGrpDvMax LOCUS_ATTN_GRP_DV_MAX)
         message(STATUS "locus Vulkan kernels: ATTN_PART_MAX "
                        "${LOCUS_ATTN_PART_MAX}, ATTN_DECODE_Q_MAX "
-                       "${LOCUS_ATTN_DECODE_Q_MAX}")
+                       "${LOCUS_ATTN_DECODE_Q_MAX}, ATTN_GRP_DV_MAX "
+                       "${LOCUS_ATTN_GRP_DV_MAX}")
         set(SHADER_HDRS "")
         foreach(entry ${LOCUS_SHADERS})
             set(DEFS -DATTN_PART_MAX=${LOCUS_ATTN_PART_MAX}
-                     -DATTN_DECODE_Q_MAX=${LOCUS_ATTN_DECODE_Q_MAX})
+                     -DATTN_DECODE_Q_MAX=${LOCUS_ATTN_DECODE_Q_MAX}
+                     -DATTN_GRP_DV_MAX=${LOCUS_ATTN_GRP_DV_MAX})
             if(entry MATCHES "^([a-z0-9_]+)=([a-z0-9_]+):([A-Z0-9_,]+)$")
                 set(shader ${CMAKE_MATCH_1})
                 set(source ${CMAKE_MATCH_2})
@@ -254,7 +257,8 @@ if(Vulkan_FOUND)
         target_compile_definitions(locus PRIVATE
             LOCUS_HAS_VULKAN_KERNELS=1
             LOCUS_VK_SHADER_ATTN_PART_MAX=${LOCUS_ATTN_PART_MAX}
-            LOCUS_VK_SHADER_ATTN_DECODE_Q_MAX=${LOCUS_ATTN_DECODE_Q_MAX})
+            LOCUS_VK_SHADER_ATTN_DECODE_Q_MAX=${LOCUS_ATTN_DECODE_Q_MAX}
+            LOCUS_VK_SHADER_ATTN_GRP_DV_MAX=${LOCUS_ATTN_GRP_DV_MAX})
         message(STATUS "locus Vulkan kernels: enabled")
     else()
         message(STATUS
