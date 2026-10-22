@@ -399,6 +399,9 @@ TEST_CASE("vulkan batched prefill tracks per-token prefill",
             auto model = locus::model::TransformerModel::load(g);
             model.use_backend(*locus::backend::find_backend("vulkan"));
             REQUIRE(model.supports_batch_prefill());
+            // MoE models prefill in bigger chunks (fuller expert tiles).
+            REQUIRE(model.prefill_chunk() ==
+                    (model.hparams().n_expert > 0 ? 1024u : 512u));
 
             // 150 pseudo-random ids: three chunks of 64 (the last
             // one ragged), so later chunks attend over earlier ones.
