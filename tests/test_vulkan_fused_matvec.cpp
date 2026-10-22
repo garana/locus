@@ -107,9 +107,11 @@ TEST_CASE("vulkan segmented q8_0 matvec routes stacked rows to two "
     auto o2b = upload(ctx, std::vector<float>(32, -7.0f));
 
     ctx.begin_batch();
-    const VulkanContext::Buffer bufs[] = {wb, xb, ob, o2b};
+    const VulkanContext::Buffer bufs[] = {wb, xb, ob, o2b, xb};
+    // No rope (rd 0).
     const std::uint32_t push[] = {rows, cols, 3, 0, 0, 0, fbits(1.0f),
-                                  nq, 20, nq + nk, 2};
+                                  nq, 20, nq + nk, 2, 1, 0, 0, 1, 0, 0,
+                                  0, 0, 0, 0, 0};
     ctx.dispatch(Kernel::kMatvecQ8_0Seg, bufs, push,
                  VulkanContext::matvec_groups(Kernel::kMatvecQ8_0Seg, rows));
     ctx.end_batch();
@@ -137,6 +139,121 @@ TEST_CASE("vulkan segmented q8_0 matvec routes stacked rows to two "
     REQUIRE(o2[20 + nk] == -7.0f);
     for (auto b : {wb, xb, ob, o2b}) {
         ctx.destroy_buffer(b);
+    }
+}
+
+TEST_CASE("vulkan segmented q8_0 matvec ropes segments in its epilogue",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(61);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    // rope.comp's math on the CPU, pair offset i of an rd-wide span.
+    struct Rope {
+        std::uint32_t pos;
+        float base, fs, lo, hi;
+    };
+    auto rope_pair = [](const Rope& rp, const std::vector<float>& f,
+                        float& x0, float& x1, std::uint32_t i,
+                        std::uint32_t rd) {
+        const float te = static_cast<float>(rp.pos) *
+                         std::pow(rp.base, -static_cast<float>(i) /
+                                               static_cast<float>(rd));
+        float theta = te;
+        if (rp.fs != 1.0f) {
+            const float y = (static_cast<float>(i / 2) - rp.lo) /
+                            std::max(0.001f, rp.hi - rp.lo);
+            const float ramp = 1.0f - std::min(1.0f, std::max(0.0f, y));
+            theta = rp.fs * te * (1.0f - ramp) + te * ramp;
+        }
+        theta /= f[i / 2];
+        const float c = std::cos(theta), sn = std::sin(theta);
+        const float a = x0, b = x1;
+        x0 = a * c - b * sn;
+        x1 = a * sn + b * c;
+    };
+
+    struct Case {
+        const char* name;
+        std::uint32_t n0, n1, n2;     // segment rows
+        std::uint32_t hs0, ro0, rd0;  // segment 0 rope
+        std::uint32_t hs1, ro1, rd1;  // segment 1 rope
+        Rope rp;
+    };
+    const Case cases[] = {
+        // GQA: whole heads of q (2 x 8) and k (1 x 8) roped, v not.
+        {"gqa q/k heads", 16, 8, 6, 8, 0, 8, 8, 0, 8,
+         {37, 10000.0f, 1.0f, 0.0f, 0.0f}},
+        // MLA: q heads of 12 rows rope their last 4; kv_a (one head of
+        // 10) ropes rows 6..9; YARN on.
+        {"mla q_pe/k_pe tails, yarn", 24, 10, 0, 12, 8, 4, 10, 6, 4,
+         {123, 10000.0f, 0.25f, 0.5f, 1.5f}},
+    };
+    for (const Case& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            const std::uint32_t cols = 64;
+            const std::uint32_t rows = c.n0 + c.n1 + c.n2;
+            const auto w = random_q8(rows, cols, rng);
+            std::vector<float> x(cols);
+            for (auto& v : x) {
+                v = dist(rng);
+            }
+            std::vector<float> f(8);
+            for (auto& v : f) {
+                v = 1.0f + 0.5f * std::fabs(dist(rng));
+            }
+            auto wb = upload_q8(ctx, w, rows, cols);
+            auto xb = upload(ctx, x);
+            auto fb = upload(ctx, f);
+            auto ob = upload(ctx, std::vector<float>(c.n0, 0.0f));
+            auto o2b = upload(ctx, std::vector<float>(c.n1 + c.n2 + 1, 0.0f));
+            ctx.begin_batch();
+            const VulkanContext::Buffer bufs[] = {wb, xb, ob, o2b, fb};
+            const std::uint32_t push[] = {
+                rows,      cols,      0,         0,
+                0,         0,         fbits(1.0f), c.n0,
+                0,         c.n0 + c.n1, c.n1,    c.hs0,
+                c.ro0,     c.rd0,     c.hs1,     c.ro1,
+                c.rd1,     c.rp.pos,  fbits(c.rp.base), fbits(c.rp.fs),
+                fbits(c.rp.lo), fbits(c.rp.hi)};
+            ctx.dispatch(Kernel::kMatvecQ8_0Seg, bufs, push,
+                         VulkanContext::matvec_groups(
+                             Kernel::kMatvecQ8_0Seg, rows));
+            ctx.end_batch();
+            const auto o = download<float>(ctx, ob, c.n0);
+            const auto o2 = download<float>(ctx, o2b, c.n1 + c.n2);
+
+            auto seg = [&](std::uint32_t r0, std::uint32_t n,
+                           std::uint32_t hs, std::uint32_t ro,
+                           std::uint32_t rd) {
+                auto y = cpu_mv(w, r0, n, cols, x);
+                for (std::uint32_t h = 0; h + hs <= n; h += hs) {
+                    for (std::uint32_t i = 0; i + 1 < rd; i += 2) {
+                        rope_pair(c.rp, f, y[h + ro + i], y[h + ro + i + 1],
+                                  i, rd);
+                    }
+                }
+                return y;
+            };
+            const auto y0 = seg(0, c.n0, c.hs0, c.ro0, c.rd0);
+            const auto y1 = seg(c.n0, c.n1, c.hs1, c.ro1, c.rd1);
+            const auto y2 = cpu_mv(w, c.n0 + c.n1, c.n2, cols, x);
+            for (std::uint32_t r = 0; r < c.n0; ++r) {
+                REQUIRE(o[r] == Catch::Approx(y0[r]).margin(1e-4));
+            }
+            for (std::uint32_t r = 0; r < c.n1; ++r) {
+                REQUIRE(o2[r] == Catch::Approx(y1[r]).margin(1e-4));
+            }
+            for (std::uint32_t r = 0; r < c.n2; ++r) {
+                REQUIRE(o2[c.n1 + r] == Catch::Approx(y2[r]).margin(1e-4));
+            }
+            for (auto b : {wb, xb, fb, ob, o2b}) {
+                ctx.destroy_buffer(b);
+            }
+        }
     }
 }
 

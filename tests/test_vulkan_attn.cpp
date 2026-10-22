@@ -352,32 +352,38 @@ TEST_CASE("vulkan rmsnorm matches the CPU reference", "[vulkan]") {
     std::mt19937 rng(17);
 
     // Not a multiple of the 256-thread workgroup; written at an
-    // offset like the MLA kv_a_norm into the KV pool.
-    const std::uint32_t n = 2051, out_off = 9;
+    // offset like the MLA kv_a_norm into the KV pool, with a tail
+    // copied through unchanged (MLA's k_pe after the latent).
+    const std::uint32_t n = 2051, out_off = 9, tail = 67;
     const float eps = 1e-5f;
-    auto x = random_floats(n, rng);
+    auto x = random_floats(n + tail, rng);
     auto w = random_floats(n, rng);
     double ss = 0.0;
-    for (float v : x) {
-        ss += double(v) * v;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        ss += double(x[i]) * x[i];
     }
     const double scale = 1.0 / std::sqrt(ss / n + eps);
 
     auto xb = upload(ctx, x);
     auto wb = upload(ctx, w);
-    auto ob = ctx.create_buffer((n + out_off) * 4);
+    auto ob = upload(ctx, std::vector<float>(n + tail + out_off + 1, -7.0f));
     ctx.begin_batch();
     const VulkanContext::Buffer bufs[] = {xb, wb, ob};
-    const std::uint32_t push[] = {n, fbits(eps), out_off};
+    const std::uint32_t push[] = {n, fbits(eps), out_off, tail};
     ctx.dispatch(Kernel::kRmsNorm, bufs, push, 1);
     ctx.end_batch();
-    auto got = download(ctx, ob, n + out_off);
+    auto got = download(ctx, ob, n + tail + out_off + 1);
     for (std::uint32_t i = 0; i < n; ++i) {
         REQUIRE(got[out_off + i] ==
                 Catch::Approx(x[i] * scale * w[i])
                     .margin(1e-5)
                     .epsilon(1e-4));
     }
+    for (std::uint32_t i = n; i < n + tail; ++i) {
+        REQUIRE(got[out_off + i] == x[i]);
+    }
+    REQUIRE(got[out_off - 1] == -7.0f);
+    REQUIRE(got[out_off + n + tail] == -7.0f);
     for (auto b : {xb, wb, ob}) {
         ctx.destroy_buffer(b);
     }
