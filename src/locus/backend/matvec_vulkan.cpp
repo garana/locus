@@ -1235,7 +1235,7 @@ bool gpu_weights_ok(const model::TransformerModel& m) {
         // The full GPU forward implements the llama / deepseek2
         // attention only: q/k/v biases (qwen2moe) and per-head q/k
         // norms with NEOX rope (qwen3moe) take the CPU path.
-        if (!l.wq_bias.empty() || !l.attn_q_norm.empty()) {
+        if (l.has_attn_extras()) {
             return false;
         }
         if (matvec_kernel(l.wo) == Kernel::kCount_) {
