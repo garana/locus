@@ -83,6 +83,9 @@ enum class Kernel {
     /** NEOX-pair rope (Qwen2 / Qwen3): decode and prefill rows. */
     kRopeNeox,
     kRopeNeoxB,
+    /** Batched (route-id / slot-sum) Q4_K and Q6_K matvecs. */
+    kMatvecQ4_KB,
+    kMatvecQ6_KB,
     kCount_,
 };
 

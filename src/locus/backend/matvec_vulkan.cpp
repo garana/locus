@@ -116,6 +116,8 @@ Kernel batched_kernel(const Mat& w) {
         case gguf::TensorType::kF32: return Kernel::kMatvecF32B;
         case gguf::TensorType::kF16: return Kernel::kMatvecF16B;
         case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0B;
+        case gguf::TensorType::kQ4_K: return Kernel::kMatvecQ4_KB;
+        case gguf::TensorType::kQ6_K: return Kernel::kMatvecQ6_KB;
         default: return Kernel::kCount_;
     }
 }

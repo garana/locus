@@ -182,6 +182,8 @@ if(Vulkan_FOUND)
             rope_b=rope:BATCHED
             rope_neox=rope:NEOX
             rope_neox_b=rope:BATCHED,NEOX
+            matvec_q4_k_b=matvec_q4_k:BATCHED
+            matvec_q6_k_b=matvec_q6_k:BATCHED
             moe_route_b=moe_route:BATCHED)
         # Limits shared with the host, read from their one definition.
         set(LOCUS_VK_LIMITS
