@@ -24,6 +24,42 @@ TEST_CASE("f16 conversion round-trips", "[ops]") {
     REQUIRE(std::isinf(f16_to_f32(0x7c00)));
 }
 
+TEST_CASE("f16 conversion rounds ties to even including subnormals",
+          "[ops]") {
+    // An exact tie must land on the neighbour with an even pattern,
+    // which is what the GPU's packHalf2x16 does. Asserting "even"
+    // rather than a reference value keeps this independent of any
+    // second implementation.
+    const float kSubUlp = std::ldexp(1.0f, -24);  // f16 subnormal ulp
+    for (std::uint32_t k = 0; k < 1024; ++k) {
+        const float tie = (static_cast<float>(k) + 0.5f) * kSubUlp;
+        const std::uint16_t got = f32_to_f16(tie);
+        INFO("subnormal tie k=" << k);
+        REQUIRE((got == k || got == k + 1));  // a neighbour
+        REQUIRE((got & 1u) == 0u);            // the even one
+    }
+    // The smallest disagreeing case before the fix: 1.5 ulp rounded
+    // toward zero (0x0001) instead of to even (0x0002).
+    REQUIRE(f32_to_f16(1.5f * kSubUlp) == 0x0002);
+
+    // Away from a tie, subnormals still round to the nearer value.
+    for (std::uint32_t k = 1; k < 64; ++k) {
+        INFO("subnormal non-tie k=" << k);
+        REQUIRE(f32_to_f16((static_cast<float>(k) + 0.25f) * kSubUlp) ==
+                k);
+        REQUIRE(f32_to_f16((static_cast<float>(k) + 0.75f) * kSubUlp) ==
+                k + 1);
+    }
+
+    // Normal range, unchanged by the fix but worth pinning: halves
+    // near 1.0 step by 2^-10, so these two are exact ties.
+    REQUIRE(f32_to_f16(1.0f + std::ldexp(1.0f, -11)) == 0x3c00);
+    REQUIRE(f32_to_f16(1.0f + 1.5f * std::ldexp(1.0f, -10)) == 0x3c02);
+
+    // Signs are symmetric.
+    REQUIRE(f32_to_f16(-1.5f * kSubUlp) == (0x8000 | 0x0002));
+}
+
 TEST_CASE("rmsnorm matches the closed form", "[ops]") {
     const float x[] = {3.0f, 4.0f};
     const float w[] = {1.0f, 2.0f};

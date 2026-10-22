@@ -1670,9 +1670,15 @@ std::uint16_t f32_to_f16(float f) {
         const std::uint16_t sub =
             static_cast<std::uint16_t>(mant >> shift);
         const std::uint32_t rem = mant & ((1u << shift) - 1);
+        // Round to nearest even on the dropped bits, as below: an
+        // exact tie goes to the even neighbour, not toward zero, so
+        // subnormals agree with the GPU's packHalf2x16.
+        const std::uint32_t half = 1u << (shift - 1);
         return sign |
                static_cast<std::uint16_t>(
-                   sub + (rem > (1u << (shift - 1)) ? 1 : 0));
+                   sub + ((rem > half || (rem == half && (sub & 1)))
+                              ? 1
+                              : 0));
     }
     std::uint16_t out = static_cast<std::uint16_t>(
         sign | (exp << 10) | (mant >> 13));

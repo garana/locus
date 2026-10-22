@@ -18,7 +18,12 @@ namespace locus::backend {
 /** @returns The float value of an IEEE binary16 bit pattern. */
 float f16_to_f32(std::uint16_t h);
 
-/** @returns The binary16 bit pattern nearest to f. */
+/**
+ * @returns The binary16 bit pattern nearest to f, with an exact tie
+ * going to the even pattern (IEEE round-to-nearest-even), over the
+ * whole range including subnormals. Matches the GPU's packHalf2x16,
+ * so an f16 KV cache written on either side reads back the same.
+ */
 std::uint16_t f32_to_f16(float f);
 
 /**
