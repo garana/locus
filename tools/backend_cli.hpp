@@ -147,7 +147,7 @@ inline void print_tokenizers() {
         "  spm       SentencePiece unigram (model=llama)\n");
     std::printf(
         "  bpe       byte-level BPE (model=gpt2); "
-        "pretokenizers: gpt2, llama3\n");
+        "pretokenizers: gpt2, llama3, qwen2\n");
 }
 
 /** Prints the full capability matrix: archs, backends, quants,

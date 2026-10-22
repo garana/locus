@@ -30,6 +30,11 @@ std::string qwen_moe_path() {
            "/tests/models/Qwen1.5-MoE-A2.7B.Q4_K_M.gguf";
 }
 
+std::string qwen3_coder_path() {
+    return std::string(LOCUS_SOURCE_DIR) +
+           "/tests/models/qwen3-coder-30b-a3b-instruct-q4_k_m.gguf";
+}
+
 std::string dbrx_path() {
     return std::string(LOCUS_SOURCE_DIR) +
            "/tests/models/dbrx-instruct-16x12b-iq2_xxs.gguf";
@@ -321,6 +326,74 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
         "play with her dolls. She would spend hours dressing them "
         "up, brushing their hair, and playing with them. One";
     REQUIRE(tok->decode(ids) == golden);
+}
+
+// qwen3moe (Qwen3-Coder-30B-A3B-Instruct, unsloth Q4_K_M GGUF, 18.6GB:
+// huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF). Golden
+// prompt token counts and greedy continuations are llama.cpp's (via
+// ollama on the same GGUF: raw prompt, temperature 0, no repeat
+// penalty). The prompts exercise the qwen2 pretokenizer (a punctuation
+// char prefixing a word, tabs, single digits) and the arch (per-head
+// q/k norm, head_dim 128 != n_embd / n_heads, routed-only MoE).
+TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
+          "[e2e][qwen]") {
+    const std::string path = qwen3_coder_path();
+    if (!std::filesystem::exists(path)) {
+        SKIP("Qwen3-Coder model not present (18.6GB, gitignored)");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    REQUIRE(g.get_string("general.architecture") == "qwen3moe");
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+
+    // llama.cpp's prompt token counts (qwen2 pretokenizer; the gpt2
+    // fallback gave 6, 6, 10 and 31).
+    const std::pair<const char*, std::size_t> counts[] = {
+        {"x.append(item)", 4},
+        {"foo_bar(baz)", 5},
+        {"\tif (n<2) return n;", 9},
+        {"  for (int i = 0; i < 10; ++i) {\n\tprintf(\"%d\\n\", i);\n}",
+         27},
+    };
+    for (const auto& [text, n] : counts) {
+        INFO(text);
+        REQUIRE(tok->encode(text, true).size() == n);
+    }
+
+    struct Golden {
+        const char* prompt;
+        std::size_t prompt_tokens;
+        const char* continuation;  // llama.cpp, 24 tokens
+    };
+    const Golden goldens[] = {
+        {"def fibonacci(n):", 4,
+         "\n    if n <= 1:\n        return n\n    else:\n        "
+         "return fibonacci(n-1) + fibonacci"},
+        {"x.append(item)\n\tif (n<2) return n;", 13,
+         "\n\tfor (int i=2; i<n; i++) {\n\t\tif (x[i-1] > x"},
+    };
+    for (const Golden& gd : goldens) {
+        INFO(gd.prompt);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        auto ids = tok->encode(gd.prompt, true);
+        REQUIRE(ids.size() == gd.prompt_tokens);
+        for (auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
+        }
+        std::vector<locus::tok::TokenId> gen;
+        for (int i = 0; i < 24; ++i) {
+            const auto next = locus::model::argmax(logits);
+            gen.push_back(next);
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(next, cache, seq, ws, logits);
+        }
+        cache.release(seq);
+        REQUIRE(tok->decode(gen) == gd.continuation);
+    }
 }
 
 // R16 opt-in Q8_K-activation mode (use_q8k_activations): the QK_K

@@ -386,6 +386,9 @@ class TransformerModel {
         /** Optional attention q/k/v biases (qwen2moe); empty spans
          * on arches without them (llama/deepseek2/glm) -> no-op. */
         std::span<const float> wq_bias, wk_bias, wv_bias;
+        /** Optional per-head q/k RMS norm weights, head_dim wide
+         * (qwen3moe); empty on arches without them. */
+        std::span<const float> attn_q_norm, attn_k_norm;
         /** Dense FFN (unused when the layer is MoE). */
         backend::Mat w_gate, w_up, w_down;
         /** MoE router and expert tensors. */
