@@ -94,15 +94,15 @@ and all experts fit in 80% of available device memory, else on
 the host; LOCUS_VK_PROFILE=1|2 prints per-token host, wait
 and GPU time (2: per kernel). On an M4 Max (MoltenVK) decode runs
 ~204 tok/s on llama-3.2-1b Q8_0 and ~88 tok/s on
-deepseek-coder-v2-lite Q8_0 (#94, #104; projections sharing an
-input and MoE shared experts fold into one dispatch). Prompts
-ingest in chunks of up
-to 512 tokens as tiled GPU matmuls (vulkan_forward_batch: each
-weight read once per chunk, routed experts grouped per expert,
-token-exact to per-token prefill), and attention runs as matmuls
-over the paged pool (S = K Q^T, causal softmax, O = V^T P; a GQA
-group's query heads, or all MLA heads, share each K/V tile; a
-decode token splits O over positions). On the same M4 Max prefill
+deepseek-coder-v2-lite Q8_0, with same-input projections and a MoE
+layer's shared experts folded into one dispatch. Prompts ingest in
+chunks of up to 512 tokens (1024 for MoE models) as tiled GPU matmuls
+(vulkan_forward_batch: each weight read once per chunk, routed experts
+grouped per expert, token-exact to per-token prefill), and attention
+runs as matmuls over the paged pool (S = K Q^T, causal softmax,
+O = V^T P; a GQA group's query heads, or all MLA heads, share each K/V
+tile; a decode token splits O over positions, reading each K/V row
+once per head group). On the same M4 Max prefill
 runs ~1940 tok/s on a 2.5k-token prompt (llama-3.2-1b) and ~520
 tok/s on a 3.1k-token prompt (deepseek-coder-v2-lite), up from 66
 and 12 tok/s token by token, and decode after those prompts runs
