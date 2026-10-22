@@ -389,6 +389,19 @@ class TransformerModel {
         /** Optional per-head q/k RMS norm weights, head_dim wide
          * (qwen3moe); empty on arches without them. */
         std::span<const float> attn_q_norm, attn_k_norm;
+
+        /**
+         * @returns Whether the layer has any attention extra beyond
+         *     the llama / deepseek2 projections: a q/k/v bias
+         *     (qwen2moe) or a per-head q/k norm (qwen3moe). Backends
+         *     that implement only the plain attention check this, not
+         *     one member of a pair that happens to travel together.
+         */
+        bool has_attn_extras() const {
+            return !wq_bias.empty() || !wk_bias.empty() ||
+                   !wv_bias.empty() || !attn_q_norm.empty() ||
+                   !attn_k_norm.empty();
+        }
         /** Dense FFN (unused when the layer is MoE). */
         backend::Mat w_gate, w_up, w_down;
         /** MoE router and expert tensors. */

@@ -843,3 +843,21 @@ TEST_CASE("qwen2moe gated shared expert scales only the shared "
         REQUIRE(c[i] == Catch::Approx(d[i]).margin(1e-6));
     }
 }
+
+TEST_CASE("Layer::has_attn_extras flags any q/k/v bias or q/k norm",
+          "[model]") {
+    using Layer = locus::model::TransformerModel::Layer;
+    const float w[4] = {1, 1, 1, 1};
+    REQUIRE_FALSE(Layer{}.has_attn_extras());  // llama / deepseek2
+    // Each extra alone must flag the layer: a backend that implements
+    // only the plain attention must not rely on pairs travelling
+    // together.
+    std::span<const float> Layer::*fields[] = {
+        &Layer::wq_bias, &Layer::wk_bias, &Layer::wv_bias,
+        &Layer::attn_q_norm, &Layer::attn_k_norm};
+    for (auto f : fields) {
+        Layer lay;
+        lay.*f = w;
+        REQUIRE(lay.has_attn_extras());
+    }
+}
