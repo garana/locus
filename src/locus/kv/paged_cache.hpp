@@ -43,10 +43,11 @@ class PagedKvCache {
         std::uint32_t n_blocks = 0;
         /**
          * Storage precision (DESIGN.md R14). kF32 is the exact
-         * default and the only mode the GPU backends and the MLA/DSA
-         * paths use. Quantized modes (kQ8/kQ4) shrink the resident
-         * cache and are read on the CPU GQA attention path via
-         * store_row/load_row; kv_dim must be a multiple of kKvBlock.
+         * default. The other types ("quantized": a byte pool) shrink
+         * the resident cache and are read on the CPU GQA attention
+         * path via store_row/load_row; kv_dim must be a multiple of
+         * kKvBlock. kF16 keeps the F32 layout in halves, which the
+         * Vulkan path reads for GQA and MLA (#105).
          */
         KvType kv_type = KvType::kF32;
     };

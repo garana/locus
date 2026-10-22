@@ -37,6 +37,8 @@ std::size_t kv_row_bytes(std::size_t n, KvType type) {
             return (n / kKvBlock) * kQ8Block;
         case KvType::kQ4:
             return (n / kKvBlock) * kQ4Block;
+        case KvType::kF16:
+            return n * sizeof(std::uint16_t);
     }
     return 0;
 }
@@ -48,6 +50,12 @@ void kv_quantize_row(const float* src, std::size_t n, void* dst,
         return;
     }
     auto* out = static_cast<std::uint8_t*>(dst);
+    if (type == KvType::kF16) {
+        for (std::size_t i = 0; i < n; ++i) {
+            store_u16(out + 2 * i, f32_to_f16(src[i]));
+        }
+        return;
+    }
     const std::size_t nb = n / kKvBlock;
     for (std::size_t b = 0; b < nb; ++b) {
         const float* x = src + b * kKvBlock;
@@ -100,6 +108,12 @@ void kv_dequantize_row(const void* src, std::size_t n, float* dst,
         return;
     }
     const auto* in = static_cast<const std::uint8_t*>(src);
+    if (type == KvType::kF16) {
+        for (std::size_t i = 0; i < n; ++i) {
+            dst[i] = f16_to_f32(load_u16(in + 2 * i));
+        }
+        return;
+    }
     const std::size_t nb = n / kKvBlock;
     for (std::size_t b = 0; b < nb; ++b) {
         float* y = dst + b * kKvBlock;

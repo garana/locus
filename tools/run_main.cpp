@@ -48,6 +48,12 @@ int main(int argc, char** argv) {
             argv[0], locus_tools::kCommonHelp);
         return 0;
     }
+    if (!args.kv_type_ok) {
+        std::fprintf(stderr,
+                     "%s: unknown --kv-type '%s' (f32, f16, q8, q4)\n",
+                     argv[0], args.kv_type_name.c_str());
+        return 2;
+    }
     if (args.positional.size() < 2) {
         std::fprintf(stderr,
                      "usage: %s [--backend NAME] <model.gguf> "
@@ -86,6 +92,7 @@ int main(int argc, char** argv) {
         if (args.ctx > 0) {
             cfg.n_blocks = (args.ctx + 15) / 16;
         }
+        cfg.kv_type = args.kv_type;
         cfg.batched_decode = args.batch_decode;
         cfg.speculative = args.speculative;
         cfg.batched_prefill = !args.no_batch_prefill;

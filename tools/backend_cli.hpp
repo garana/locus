@@ -11,6 +11,7 @@
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
+#include "locus/kv/kv_quant.hpp"
 #include "locus/model/arch.hpp"
 #include "locus/sys/features.hpp"
 
@@ -185,6 +186,9 @@ inline constexpr const char* kCommonHelp =
     "                   tokens from n-grams already in the context,\n"
     "                   verified in one batched forward (greedy,\n"
     "                   same output; wins when output repeats input)\n"
+    "  --kv-type T      KV cache precision: f32 (default, exact),\n"
+    "                   f16 (half the cache and attention reads;\n"
+    "                   GPU-accelerated for GQA models), q8, q4\n"
     "  --batch-decode   enable R10 cross-sequence batched decode\n"
     "  --no-batch-prefill  force per-token prompt ingestion\n"
     "  --timing         locus-run: print prefill and decode\n"
@@ -244,6 +248,11 @@ struct BackendArgs {
     bool prefill_f16 = false;
     /** --speculative: prompt-lookup speculative decoding. */
     bool speculative = false;
+    /** From --kv-type T: KV cache precision (kv_type_ok false when
+     * T names no type; kv_type_name keeps it for the error). */
+    locus::kv::KvType kv_type = locus::kv::KvType::kF32;
+    bool kv_type_ok = true;
+    std::string kv_type_name;
     /** --batch-decode: enable R10 cross-sequence batched decode. */
     bool batch_decode = false;
     /** --no-batch-prefill: force per-token prompt ingestion. */
@@ -265,6 +274,28 @@ struct BackendArgs {
     /** --help / -h was given: print usage and exit. */
     bool help = false;
 };
+
+/**
+ * Parses a --kv-type value.
+ * @param name f32, f16, q8 or q4.
+ * @param out Set to the type when name is valid.
+ * @returns Whether name is valid.
+ */
+inline bool parse_kv_type(std::string_view name, locus::kv::KvType& out) {
+    using locus::kv::KvType;
+    if (name == "f32") {
+        out = KvType::kF32;
+    } else if (name == "f16") {
+        out = KvType::kF16;
+    } else if (name == "q8") {
+        out = KvType::kQ8;
+    } else if (name == "q4") {
+        out = KvType::kQ4;
+    } else {
+        return false;
+    }
+    return true;
+}
 
 inline BackendArgs parse_backend_args(int argc, char** argv) {
     BackendArgs out;
@@ -306,6 +337,11 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.prefill_f16 = true;
         } else if (a == "--speculative") {
             out.speculative = true;
+        } else if ((a == "--kv-type" && i + 1 < argc) ||
+                   a.rfind("--kv-type=", 0) == 0) {
+            out.kv_type_name =
+                a == "--kv-type" ? argv[++i] : std::string(a.substr(10));
+            out.kv_type_ok = parse_kv_type(out.kv_type_name, out.kv_type);
         } else if (a == "--batch-decode") {
             out.batch_decode = true;
         } else if (a == "--no-batch-prefill") {

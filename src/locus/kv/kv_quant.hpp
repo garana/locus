@@ -18,6 +18,7 @@ enum class KvType : std::uint8_t {
     kF32 = 0,
     kQ8 = 1,
     kQ4 = 2,
+    kF16 = 3,
 };
 
 /** Elements per quantization block (both Q8 and Q4). */
@@ -31,7 +32,8 @@ std::size_t kv_row_bytes(std::size_t n, KvType type);
 
 /**
  * Quantizes `n` floats from `src` into `dst` (kv_row_bytes(n, type)
- * bytes). No-op copy for kF32. `n % kKvBlock == 0` for kQ8/kQ4.
+ * bytes). No-op copy for kF32; round-to-nearest-even halves for
+ * kF16. `n % kKvBlock == 0` for kQ8/kQ4.
  */
 void kv_quantize_row(const float* src, std::size_t n, void* dst,
                      KvType type);

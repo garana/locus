@@ -104,9 +104,10 @@ class Engine {
     struct Config {
         /** Pool size in blocks; 0 = one full context window. */
         std::uint32_t n_blocks = 0;
-        /** KV-cache storage precision (DESIGN.md R14). kF32 default;
-         * kQ8/kQ4 shrink the resident cache and require a CPU
-         * backend (GPU external KV storage is F32-only). */
+        /** KV-cache storage precision (DESIGN.md R14). kF32 default
+         * (exact); kF16 (opt-in, #105) halves the cache and runs on
+         * the Vulkan GPU path; kQ8/kQ4 shrink it further (Vulkan
+         * decodes them for GQA only, token by token). */
         kv::KvType kv_type = kv::KvType::kF32;
         /** Max prompt tokens prefetched per step across seqs;
          * 0 = the model's preferred chunk (prefill_chunk()). */

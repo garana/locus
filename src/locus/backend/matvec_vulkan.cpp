@@ -799,6 +799,8 @@ void rec_matmul_id(State& s, const Mat& w, VulkanContext::Buffer wb,
 struct PagedPool {
     VulkanContext::Buffer pool, table;
     std::uint32_t block_tokens, block_stride, row_w;
+    /** F16 pool (opt-in, #105): same layout, halves for floats. */
+    bool f16 = false;
 };
 
 /**
@@ -834,6 +836,10 @@ void rec_paged_matmul(State& s, Kernel k, const PagedPool& pp,
         k_splits > 1
             ? s.chunk_buf(State::kCSplit, std::size_t{k_splits} * plane)
             : out;
+    if (pp.f16) {
+        k = k == Kernel::kMatmulPagedF32 ? Kernel::kMatmulPagedF16
+                                         : Kernel::kMatmulPagedTF16;
+    }
     const VulkanContext::Buffer bufs[] = {pp.pool, x, dst, pp.table};
     const std::uint32_t push[] = {
         rows,         cols,
@@ -930,10 +936,13 @@ void rec_attn_decode(State& s, const PagedPool& pp, std::uint32_t n_pos,
     if (grouped) {
         // Workgroup y: KV head x chunks of 16 (attn_decode_grp HG).
         const std::uint32_t chunks = (a.group + 15) / 16;
-        s.ctx.dispatch(Kernel::kAttnDecodeGrp, bufs, push, blocks,
-                       heads / a.group * chunks);
+        s.ctx.dispatch(
+            pp.f16 ? Kernel::kAttnDecodeGrpF16 : Kernel::kAttnDecodeGrp,
+            bufs, push, blocks, heads / a.group * chunks);
     } else {
-        s.ctx.dispatch(Kernel::kAttnDecode, bufs, push, blocks, heads);
+        s.ctx.dispatch(
+            pp.f16 ? Kernel::kAttnDecodeF16 : Kernel::kAttnDecode, bufs,
+            push, blocks, heads);
     }
     if (blocks > 1) {
         const VulkanContext::Buffer cbufs[] = {part, a.out};
@@ -1260,9 +1269,10 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         (mla && !vk::attn_width_fits(hp.kv_lora_rank))) {
         return false;
     }
-    if (quant && mla) {
-        // MLA caches a single latent row (no separate K/V); its
-        // quantized read is a #45 follow-up. Fall back to CPU.
+    if (quant && mla &&
+        cache.geometry().kv_type != kv::KvType::kF16) {
+        // MLA caches a single latent row (no separate K/V); its Q8/Q4
+        // read is a #45 follow-up. Fall back to CPU.
         return false;
     }
     if (!gpu_weights_ok(m)) {
@@ -1300,6 +1310,10 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
               : 0;
     const std::uint32_t kv_code =
         geom.kv_type == kv::KvType::kQ8 ? 1u : 2u;
+    // F16 keeps the F32 pool layout (strides above count halves);
+    // only Q8/Q4 take the block-codec path.
+    const bool f16 = geom.kv_type == kv::KvType::kF16;
+    const bool qblk = quant && !f16;
 
     const std::uint32_t rank = hp.kv_lora_rank;
     const std::uint32_t nope = hp.qk_nope_dim;
@@ -1325,7 +1339,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     // GPU-routed MoE keeps all n_expert_used experts' gate/up rows
     // side by side, then the shared experts' (moe_shared_ok).
     const std::size_t ff_kv = std::max<std::size_t>(
-        {ff_max, kv_dim,
+        {ff_max, std::size_t{2} * kv_dim,
          std::size_t{hp.n_expert_used + hp.n_expert_shared} *
              hp.n_ff_exp});
     s.grow(s.gate, s.gate_n, ff_kv);
@@ -1363,7 +1377,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
 
     const auto pool = pool_it->second;
     const PagedPool pp{pool, s.table, geom.block_tokens, block_stride,
-                       kv_dim};
+                       kv_dim, f16};
     const std::uint32_t eps_bits = fbits(hp.rms_eps);
     const std::uint32_t base_bits = fbits(hp.rope_freq_base);
     float corr_lo = 0.0f, corr_hi = 0.0f;
@@ -1445,8 +1459,17 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 s.rope_divisors(m.rope_factors(),
                                 hp.head_dim / 2);
             const Mat* qkv[] = {&lay.wq, &lay.wk, &lay.wv};
-            const bool fused = !quant && seg_ok(qkv) &&
+            const bool fused = !qblk && seg_ok(qkv) &&
                                hp.head_dim % 2 == 0;
+            // F32: K/V rows straight into the pool. F16: into F32
+            // scratch (K then V in s.gate, free until the FFN), then
+            // packed into the pool. Either way the fused projection
+            // ropes q and k in its epilogue; the unfused path ropes K
+            // where it lands, below.
+            const VulkanContext::Buffer kv_dst = f16 ? s.gate : pool;
+            const std::uint32_t k_at = f16 ? 0 : row_off;
+            const std::uint32_t v_at =
+                f16 ? kv_dim : row_off + layer_stride / 2;
             if (fused) {
                 // q and k roped in the epilogue (whole heads).
                 SegRope rope;
@@ -1456,8 +1479,8 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 rope.base_bits = base_bits;
                 rope.fs_bits = fbits(1.0f);
                 rope.divisors = divisors;
-                rec_matvec_seg(s, qkv, s.xb, s.q, 0, pool, row_off,
-                               row_off + layer_stride / 2, rope);
+                rec_matvec_seg(s, qkv, s.xb, s.q, 0, kv_dst, k_at, v_at,
+                               rope);
             } else {
                 rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
             }
@@ -1470,19 +1493,30 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 s.ctx.dispatch(Kernel::kRope, bufs, push,
                                hp.n_heads);
             }
-            if (!quant) {
+            if (!qblk) {
                 if (!fused) {
-                    rec_matvec(s, lay.wk, s.xb, pool, row_off, false);
-                    rec_matvec(s, lay.wv, s.xb, pool,
-                               row_off + layer_stride / 2, false);
+                    rec_matvec(s, lay.wk, s.xb, kv_dst, k_at, false);
+                    rec_matvec(s, lay.wv, s.xb, kv_dst, v_at, false);
                     const VulkanContext::Buffer bufs[] = {
-                        pool, divisors};
+                        kv_dst, divisors};
                     const std::uint32_t push[] = {
                         hp.n_kv_heads, hp.head_dim, pos,
-                        row_off,       hp.head_dim, base_bits,
+                        k_at,          hp.head_dim, base_bits,
                         fbits(1.0f),   0,           0};
                     s.ctx.dispatch(Kernel::kRope, bufs, push,
                                    hp.n_kv_heads);
+                }
+                if (f16) {
+                    // K and V rows (planes kv_dim apart) in one go.
+                    const VulkanContext::Buffer bufs[] = {s.gate, pool,
+                                                          s.table};
+                    const std::uint32_t push[] = {
+                        kv_dim, pos,           geom.block_tokens,
+                        block_stride, kv_dim,  l * layer_stride,
+                        0,      kv_dim,        kv_dim,
+                        layer_stride / 2};
+                    s.ctx.dispatch(Kernel::kKvScatterF16, bufs, push, 1,
+                                   1, 2);
                 }
                 rec_attn_gqa(s, pp, s.q, s.att, s.attout, 1, pos,
                              hp.n_heads, group, hp.head_dim,
@@ -1591,13 +1625,19 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
                 rec_matvec(s, lay.wkv_a, s.xb, s.kv_a, 0, false);
             }
-            norm(lay.kv_a_norm, s.kv_a, pool, rank, row_off, rope_d);
+            // Latent row [norm(c_kv) | k_pe] in one norm (k_pe as its
+            // tail, roped by the fused epilogue or just below): into
+            // the pool (F32), or into F32 scratch (s.gate, free until
+            // the FFN) and packed into the pool once roped (F16).
+            const VulkanContext::Buffer lat_dst = f16 ? s.gate : pool;
+            const std::uint32_t lat_at = f16 ? 0 : row_off;
+            norm(lay.kv_a_norm, s.kv_a, lat_dst, rank, lat_at, rope_d);
             if (!fused) {
                 {
-                    const VulkanContext::Buffer bufs[] = {pool,
+                    const VulkanContext::Buffer bufs[] = {lat_dst,
                                                           divisors};
                     const std::uint32_t push[] = {
-                        1,       rope_d,  pos,     row_off + rank,
+                        1,       rope_d,  pos,     lat_at + rank,
                         0,       base_bits, fs_bits, lo_bits,
                         hi_bits};
                     s.ctx.dispatch(Kernel::kRope, bufs, push, 1);
@@ -1610,6 +1650,16 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     hi_bits};
                 s.ctx.dispatch(Kernel::kRope, bufs, push,
                                hp.n_heads);
+            }
+            if (f16) {
+                const VulkanContext::Buffer bufs[] = {s.gate, pool,
+                                                      s.table};
+                const std::uint32_t push[] = {
+                    rank + rope_d, pos,      geom.block_tokens,
+                    block_stride,  kv_dim,   l * layer_stride,
+                    0,             0,        0,
+                    0};
+                s.ctx.dispatch(Kernel::kKvScatterF16, bufs, push, 1);
             }
             // Per-head weight absorption, all heads per dispatch
             // where a batched kernel exists (head h = slot h).
@@ -1906,16 +1956,19 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const auto& hp = m.hparams();
     State& s = state();
     const auto n = static_cast<std::uint32_t>(tokens.size());
-    if (n == 0 || cache.quantized() || hp.idx_top_k > 0 ||
-        !gpu_weights_ok(m)) {
+    const bool f16 = cache.geometry().kv_type == kv::KvType::kF16;
+    const bool mla = hp.arch == model::Arch::kDeepseek2;
+    // F16 is the one non-F32 pool the batched path reads.
+    if (n == 0 || (cache.quantized() && !f16) ||
+        hp.idx_top_k > 0 || !gpu_weights_ok(m)) {
         return false;
     }
-    auto pool_it =
-        s.kv_pools.find(static_cast<const void*>(cache.pool_data()));
+    auto pool_it = s.kv_pools.find(
+        f16 ? static_cast<const void*>(cache.qpool_data())
+            : static_cast<const void*>(cache.pool_data()));
     if (pool_it == s.kv_pools.end()) {
         return false;  // cache pool is not GPU-mapped
     }
-    const bool mla = hp.arch == model::Arch::kDeepseek2;
     const auto& geom = cache.geometry();
     const std::uint32_t kv_dim = geom.kv_dim;
     const std::uint32_t rank = hp.kv_lora_rank;
@@ -1990,7 +2043,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
 
     const auto pool = pool_it->second;
     const PagedPool pp{pool, s.table, geom.block_tokens, block_stride,
-                       kv_dim};
+                       kv_dim, f16};
     const std::uint32_t eps_bits = fbits(hp.rms_eps);
     const std::uint32_t base_bits = fbits(hp.rope_freq_base);
     float corr_lo = 0.0f, corr_hi = 0.0f;
@@ -2037,8 +2090,10 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         const std::uint32_t push[] = {width,        base,
                                       geom.block_tokens, block_stride,
                                       kv_dim,       dst_off,
-                                      0,            width};
-        s.ctx.dispatch(Kernel::kKvScatter, bufs, push, 1, n);
+                                      0,            width,
+                                      0,            0};
+        s.ctx.dispatch(f16 ? Kernel::kKvScatterF16 : Kernel::kKvScatter,
+                       bufs, push, 1, n);
     };
     auto silu_rows = [&](std::size_t count) {
         const VulkanContext::Buffer bufs[] = {bgate, bup, bgate};

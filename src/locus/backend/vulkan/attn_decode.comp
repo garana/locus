@@ -13,7 +13,9 @@
 // q_pe] against [latent | k_pe] (kv_stride 0: one shared latent);
 // GQA uses d2 = 0 and kvh = h / group. V is dv floats at row + v_off
 // + kvh * kv_stride. row = table[p / block_tokens] * block_stride +
-// (p % block_tokens) * row_w.
+// (p % block_tokens) * row_w. With KV_F16 (attn_decode_f16) the pool
+// holds IEEE halves in the same layout: offsets and strides count
+// halves.
 
 #define WG 128u
 #define CH 64u          // positions per block
@@ -21,7 +23,16 @@
 
 layout(local_size_x = 128) in;
 
+#ifdef KV_F16
+layout(std430, binding = 0) readonly buffer POOL { uint pool[]; };
+/** Pool element i (a half). */
+float kv_at(uint i) {
+    return unpackHalf2x16(pool[i >> 1] >> ((i & 1u) * 16u)).x;
+}
+#else
 layout(std430, binding = 0) readonly buffer POOL { float pool[]; };
+#define kv_at(i) pool[i]
+#endif
 layout(std430, binding = 1) readonly buffer TABLE { uint table[]; };
 layout(std430, binding = 2) readonly buffer Q1 { float q1[]; };
 layout(std430, binding = 3) readonly buffer Q2 { float q2[]; };
@@ -87,7 +98,7 @@ void main() {
     if (lp < np) {
         uint kb = rowb[lp] + pc.k_off + kvh * pc.kv_stride;
         for (uint i = lane; i < dk; i += TPP) {
-            part_s += qs[i] * pool[kb + i];
+            part_s += qs[i] * kv_at(kb + i);
         }
     }
     red[t] = part_s;
@@ -124,7 +135,7 @@ void main() {
         float acc = 0.0;
         if (sl < nsl) {
             for (uint j = sl; j < np; j += nsl) {
-                acc += sc[j] * pool[rowb[j] + vbase + i];
+                acc += sc[j] * kv_at(rowb[j] + vbase + i);
             }
         }
         if (nsl > 1u) {

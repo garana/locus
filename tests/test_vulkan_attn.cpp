@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/vulkan/context.hpp"
 
 using locus::backend::vk::Kernel;
@@ -523,8 +524,8 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
         {"gqa group 8, head dim 128", 16, 8, 128, 0, 128, 45, false},
     };
     for (const Case& c : cases) {
-        {
-            DYNAMIC_SECTION(c.name) {
+        for (const bool f16 : {false, true}) {
+            DYNAMIC_SECTION(c.name << (f16 ? " (f16 pool)" : "")) {
                 const std::uint32_t n_kv = c.heads / c.group;
                 const std::uint32_t dk = c.d1 + c.d2;
                 const std::uint32_t kv_stride = c.mla ? 0 : c.d1;
@@ -538,6 +539,13 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
                 const std::uint32_t block_stride = bt * row_w;
                 auto pool = random_floats(
                     static_cast<std::size_t>(n_blocks) * block_stride, rng);
+                if (f16) {
+                    // The reference reads what the GPU reads.
+                    for (auto& v : pool) {
+                        v = locus::backend::f16_to_f32(
+                            locus::backend::f32_to_f16(v));
+                    }
+                }
                 auto table = shuffled_table(n_blocks, rng);
                 const std::uint32_t q1_stride = c.d1 + 4;
                 const std::uint32_t q2_stride = c.d2 + 40, q2_off = 40;
@@ -576,7 +584,16 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
                     }
                 }
 
-                auto pb = upload(ctx, pool);
+                VulkanContext::Buffer pb;
+                if (f16) {
+                    std::vector<std::uint16_t> half(pool.size());
+                    for (std::size_t i = 0; i < pool.size(); ++i) {
+                        half[i] = locus::backend::f32_to_f16(pool[i]);
+                    }
+                    pb = upload(ctx, half);
+                } else {
+                    pb = upload(ctx, pool);
+                }
                 const std::uint32_t blocks = (c.n_pos + 31) / 32;
                 const std::uint32_t chunks = (c.group + 15) / 16;
                 auto tb = upload(ctx, table);
@@ -593,8 +610,9 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
                     k_off,     v_off,   kv_stride,    c.group,
                     c.d1,      c.d2,    q1_stride,    q2_stride,
                     q2_off,    c.dv,    fbits(scale), c.dv};
-                ctx.dispatch(Kernel::kAttnDecodeGrp, bufs, push, blocks,
-                             n_kv * chunks);
+                ctx.dispatch(f16 ? Kernel::kAttnDecodeGrpF16
+                                 : Kernel::kAttnDecodeGrp,
+                             bufs, push, blocks, n_kv * chunks);
                 if (blocks > 1) {
                     const VulkanContext::Buffer cb[] = {partb, ob};
                     const std::uint32_t cp[] = {blocks, c.heads, c.dv,
