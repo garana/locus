@@ -27,6 +27,14 @@
 #define HG 16u              // heads per workgroup
 #define HP (WG / CH)        // head lanes per position (scores)
 #define HACC 8u             // max heads per thread (weighted V)
+
+// Compile-time check (GLSL has no static_assert; a negative array size
+// fails the build): the widest dv the host may dispatch,
+// ATTN_GRP_DV_MAX (vk::kAttnGrpDvMax), must fit the weighted-V stage,
+// HG * (dv / 4) <= HACC * WG, or the kernel would silently write
+// nothing.
+const uint kGrpDvFits[(HG * (ATTN_GRP_DV_MAX / 4u) <= HACC * WG) ? 1 : -1] =
+    uint[](0u);
 #define KC 32u              // key floats per staged chunk
 
 layout(local_size_x = 256) in;

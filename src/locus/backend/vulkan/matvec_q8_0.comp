@@ -309,6 +309,10 @@ void main() {
         float u = red_u[gl_LocalInvocationID.x] * pc.scale;
         o[at] = v / (1.0 + exp(-v)) * u;
 #elif defined(SEGMENTS)
+        // The epilogue ropes the finished dot, then writes it: with
+        // accumulate set it would rotate only the new term and add it
+        // to an unrotated value, so the host never ropes and
+        // accumulates in one dispatch (rec_matvec_seg).
         bool s0 = r < pc.seg1;
         uint j = s0 ? r : r - pc.seg1;  // row within segment 0 / 1
         uint hs = s0 ? pc.hs0 : pc.hs1;

@@ -511,6 +511,17 @@ void rec_matvec_seg(State& s, std::span<const Mat* const> ms,
                     const SegRope& rope = {}) {
     const std::uint32_t seg1 = ms[0]->rows;
     const std::uint32_t seg2 = seg1 + ms[1]->rows;
+    // The epilogue's pairing assumptions (vk::seg_rope_fits, segment 1
+    // starting on an even row) hold for every caller by construction;
+    // check them so a new caller fails loudly instead of roping the
+    // wrong pairs. accumulate is always 0 here: rope then write.
+    if ((rope.rd0 != 0 || rope.rd1 != 0) &&
+        (seg1 % 2 != 0 ||
+         !vk::seg_rope_fits(seg1, rope.hs0, rope.ro0, rope.rd0) ||
+         !vk::seg_rope_fits(ms[1]->rows, rope.hs1, rope.ro1, rope.rd1))) {
+        throw std::logic_error("matvec_q8_0_seg: rope spec breaks the "
+                               "epilogue's pairing invariants");
+    }
     const std::uint32_t rows =
         seg2 + (ms.size() > 2 ? ms[2]->rows : 0);
     const VulkanContext::Buffer bufs[] = {
@@ -896,10 +907,10 @@ struct DecodeAttn {
 
 /**
  * @returns Whether attn_decode_grp can run a: vec4 V loads (dv % 4,
- * 4-float aligned V rows) and dv / 4 <= 128.
+ * 4-float aligned V rows) and dv within vk::kAttnGrpDvMax.
  */
 bool grp_ok(const PagedPool& pp, const DecodeAttn& a) {
-    return a.dv % 4 == 0 && a.dv / 4 <= 128 && a.v_off % 4 == 0 &&
+    return vk::attn_grp_dv_fits(a.dv) && a.v_off % 4 == 0 &&
            a.kv_stride % 4 == 0 && pp.row_w % 4 == 0 &&
            pp.block_stride % 4 == 0;
 }

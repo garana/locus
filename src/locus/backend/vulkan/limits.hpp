@@ -43,6 +43,40 @@ constexpr bool attn_decode_fits(std::uint32_t key_width) {
 }
 
 /**
+ * Widest V (dv floats, a multiple of 4) attn_decode_grp.comp handles
+ * (ATTN_GRP_DV_MAX). Its weighted-V stage gives each thread hps =
+ * ceil(HG * (dv / 4) / WG) heads of vec4 accumulators, at most HACC;
+ * past that every thread idles and the kernel writes nothing. So it
+ * needs HG * (dv / 4) <= HACC * WG: 16 * 128 <= 8 * 256 at 512, with
+ * no margin. CMake passes it to the shader, which fails to compile if
+ * HG / HACC / WG no longer cover it, and to the locus target, where
+ * context.cpp static_asserts the two agree.
+ */
+inline constexpr std::uint32_t kAttnGrpDvMax = 512;
+
+/** @returns Whether a V width (dv floats) fits attn_decode_grp. */
+constexpr bool attn_grp_dv_fits(std::uint32_t dv) {
+    return dv % 4 == 0 && dv <= kAttnGrpDvMax;
+}
+
+/**
+ * Whether a row segment of matvec_q8_0_seg can be roped in its
+ * epilogue: the segment is whole heads (n_rows % hs == 0) of hs rows
+ * whose rd rows from ro on rotate, with hs, ro and rd even and the
+ * span inside the head. The epilogue pairs row r with r ^ 1 inside
+ * its 4-row workgroup, so pairs must start on even rows -- the host
+ * also keeps the segment's first row even -- and the sibling of a
+ * roped row is then always in range. rd 0 (no rope) always fits.
+ *
+ * @returns Whether (n_rows, hs, ro, rd) meets those invariants.
+ */
+constexpr bool seg_rope_fits(std::uint32_t n_rows, std::uint32_t hs,
+                             std::uint32_t ro, std::uint32_t rd) {
+    return rd == 0 || (hs != 0 && hs % 2 == 0 && ro % 2 == 0 &&
+                       rd % 2 == 0 && ro + rd <= hs && n_rows % hs == 0);
+}
+
+/**
  * Bytes allocated for a GPU weight copy of `bytes`: rounded up to 16
  * so a kernel reading whole words (Q8_0's 34-byte blocks end
  * mid-word) never reads past the buffer. The padding is zeroed; the

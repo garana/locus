@@ -128,6 +128,9 @@ static_assert(locus::backend::vk::kAttnDecodeQMax ==
                   LOCUS_VK_SHADER_ATTN_DECODE_Q_MAX,
               "kAttnDecodeQMax differs from the shaders' "
               "ATTN_DECODE_Q_MAX");
+static_assert(locus::backend::vk::kAttnGrpDvMax ==
+                  LOCUS_VK_SHADER_ATTN_GRP_DV_MAX,
+              "kAttnGrpDvMax differs from the shaders' ATTN_GRP_DV_MAX");
 
 #include <vulkan/vulkan.h>
 
