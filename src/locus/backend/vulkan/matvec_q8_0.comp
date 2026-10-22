@@ -36,6 +36,14 @@
 // up to three places: rows [0, seg1) to O at out_offset, [seg1, seg2)
 // to O2 at off1, [seg2, rows) to O2 at off2 -- the projections that
 // read one input, in one dispatch.
+// With -DPAIRS (BATCHED only) the slots are a short batch's (token,
+// expert) pairs, routed per token: ROUTE holds one row per token,
+// r_stride apart, of kp expert ids then kp weights (moe_route_b's
+// layout). matvec_q8_0_glu_p runs workgroup y = pair p on expert
+// route[(p / kp) * r_stride + p % kp] with token p / kp's x row,
+// writing row p. matvec_q8_0_p runs workgroup y = token t, summing
+// its kp experts (x rows t * kp + j) weighted into output row t: a
+// few tokens' routed MoE without grouping pairs by expert.
 
 #define LANES 32u
 #define ROWS 4u
@@ -97,6 +105,10 @@ layout(push_constant) uniform PC {
     uint off1;
     uint seg2;  // first row written to O2 at off2
     uint off2;
+#endif
+#ifdef PAIRS
+    uint r_stride;  // ROUTE words per token row
+    uint kp;        // routed slots per token
 #endif
 } pc;
 
@@ -175,7 +187,14 @@ void main() {
 #ifdef SWIGLU
     float acc_u = 0.0;
     if (r < pc.rows) {
-#ifdef BATCHED
+#if defined(PAIRS)
+        uint y = gl_WorkGroupID.y;
+        uint tk = y / pc.kp;
+        uint id = route[tk * pc.r_stride + y % pc.kp];
+        uint wb = pc.w_off + id * pc.w_stride;
+        uint xb = pc.x_off + tk * pc.x_stride;
+        at += y * pc.out_stride;
+#elif defined(BATCHED)
         uint y = gl_WorkGroupID.y;
         uint id = (pc.mode & 1u) != 0u && y < pc.n_slots ? route[y] : y;
         uint wb = pc.w_off + id * pc.w_stride;
@@ -200,7 +219,17 @@ void main() {
     red_u[gl_LocalInvocationID.x] = acc_u;
 #else
     if (r < pc.rows) {
-#ifdef BATCHED
+#if defined(PAIRS)
+        uint y = gl_WorkGroupID.y;
+        uint rb = y * pc.r_stride;
+        for (uint k = 0u; k < pc.kp; ++k) {
+            acc += uintBitsToFloat(route[rb + pc.kp + k]) *
+                   row_part(pc.w_off + route[rb + k] * pc.w_stride,
+                            pc.x_off + (y * pc.kp + k) * pc.x_stride, r,
+                            lane, nb);
+        }
+        at += y * pc.out_stride;
+#elif defined(BATCHED)
         uint y = gl_WorkGroupID.y;
         bool sum = (pc.mode & 2u) != 0u;
         uint k1 = sum ? pc.n_slots : y + 1u;

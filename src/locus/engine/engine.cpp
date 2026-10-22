@@ -147,9 +147,12 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
         // Speculative decode: when a just-sampled token is pending
         // (greedy, unconstrained), verify n-gram drafts in one
         // batched forward instead of a single per-token forward.
+        // Verify needs only forward_batch with every position's
+        // logits, which the Vulkan backend has too (it opts out of
+        // cross-sequence batched decode, supports_batch()).
         if (cfg_.speculative && !prefilling && r.n_fed < n_total &&
             r.n_fed >= n_prompt && r.sampling.temperature <= 0.0f &&
-            !r.constraint && model_.supports_batch() &&
+            !r.constraint && model_.supports_batch_prefill() &&
             r.seq.n_tokens == r.n_fed) {
             if (spec_decode_step(r)) {
                 return;  // one spec step per iteration
@@ -428,6 +431,11 @@ bool Engine::spec_decode_step(Request& r) {
 
     const auto drafts = model::ngram_draft(ctx, cfg_.spec_ngram,
                                            cfg_.spec_draft);
+    if (drafts.empty()) {
+        // Nothing to verify: the per-token forward is the same step
+        // without a one-token batched forward's overhead.
+        return false;
+    }
     std::vector<tok::TokenId> batch;
     batch.push_back(pending);
     batch.insert(batch.end(), drafts.begin(), drafts.end());

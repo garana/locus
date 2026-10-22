@@ -67,6 +67,13 @@ enum class Kernel {
     kMatmulQ8_0IdH,
     kMatmulPagedF32H,
     kMatmulPagedTF32H,
+    /** Q8_0 matvec over a short batch of token rows (<= 8). */
+    kMatvecQ8_0N,
+    /** Short-batch routed MoE: (token, expert) pair matvecs. */
+    kMatvecQ8_0P,
+    kMatvecQ8_0GluP,
+    /** F32 counterpart of kMatvecQ8_0N. */
+    kMatvecF32N,
     kCount_,
 };
 

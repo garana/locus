@@ -1,0 +1,158 @@
+#version 450
+
+// Q8_0 matvec over up to NT token rows at once (a short batch: a
+// speculative verify, a tiny prefill chunk): out[t][r] (+)= scale *
+// dot(W row r, X row t) for t < n_tok. Each weight block is loaded
+// once for all the tokens, so the cost stays a single matvec's weight
+// read (bandwidth-bound) instead of a 64-token matmul tile's compute.
+//
+// Rows are in the split GPU layout (q8_layout.hpp: nb f16 scales,
+// then nb x 32 quants, 34 * nb bytes), as matvec_q8_0.comp: four rows
+// per workgroup, 32 lanes per row, four lanes per block. X row t is
+// at x_off + t * x_stride, output row t at out_offset + t *
+// out_stride. Workgroup y is a batch b (MLA's per-head projections),
+// shifting W, X and out by b * w_bstride (bytes), b * x_bstride and
+// b * out_bstride.
+//
+// matvec_f32_n (-DTYPE_F32) is the same over row-major F32 weights
+// (w_off and w_bstride in floats).
+
+#define LANES 32u
+#define ROWS 4u
+#define NT 8u           // max tokens per dispatch
+
+layout(local_size_x = 128) in;
+
+#ifdef TYPE_F32
+layout(std430, binding = 0) readonly buffer W { float w[]; };
+#else
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+#endif
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer X4 { vec4 x4[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint out_offset;
+    uint accumulate;
+    uint w_off;         // bytes
+    uint x_off;
+    float scale;
+    uint n_tok;         // <= NT
+    uint x_stride;
+    uint out_stride;
+    uint w_bstride;
+    uint x_bstride;
+    uint out_bstride;
+} pc;
+
+shared float red[NT * LANES * ROWS];
+
+#ifndef TYPE_F32
+/** The 4 bytes at byte offset b (any alignment). */
+uint word_at(uint b) {
+    uint i = b >> 2;
+    uint sh = (b & 3u) * 8u;
+    return sh == 0u ? w[i] : (w[i] >> sh) | (w[i + 1u] << (32u - sh));
+}
+#endif
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid % LANES;
+    uint slot = tid / LANES;
+    uint r = gl_WorkGroupID.x * ROWS + slot;
+    // Never more than NT tokens, whatever the host passes: lanes
+    // past NT would index red[] beyond its planes.
+    uint nt = min(pc.n_tok, NT);
+    uint bt = gl_WorkGroupID.y;
+    uint x_off = pc.x_off + bt * pc.x_bstride;
+    uint w_off = pc.w_off + bt * pc.w_bstride;
+    float acc[NT];
+    for (uint t = 0u; t < NT; ++t) {
+        acc[t] = 0.0;
+    }
+    bool xal = ((x_off | pc.x_stride) & 3u) == 0u;
+#ifdef TYPE_F32
+    if (r < pc.rows) {
+        // Lane l takes columns l, l + 32, ...: coalesced across the
+        // row's lanes; each weight is read once for every token.
+        uint rb = w_off + r * pc.cols;
+        for (uint c = lane; c < pc.cols; c += LANES) {
+            float wv = w[rb + c];
+            for (uint t = 0u; t < NT; ++t) {
+                if (t < nt) {
+                    acc[t] += wv * x[x_off + t * pc.x_stride + c];
+                }
+            }
+        }
+    }
+#else
+    if (r < pc.rows) {
+        uint nb = pc.cols / 32u;
+        uint rb = w_off + r * nb * 34u;
+        uint qb = rb + 2u * nb;
+        uint sub = lane & 3u;
+        bool al = ((rb | qb) & 3u) == 0u;
+        for (uint b = lane >> 2; b < nb; b += LANES / 4u) {
+            uint sa = rb + 2u * b;
+            float d = unpackHalf2x16(w[sa >> 2] >> ((sa & 2u) * 8u)).x;
+            uint qa = qb + b * 32u + sub * 8u;
+            int q0 = int(al ? w[qa >> 2] : word_at(qa));
+            int q1 = int(al ? w[(qa >> 2) + 1u] : word_at(qa + 4u));
+            float wq[8];
+            wq[0] = float(bitfieldExtract(q0, 0, 8));
+            wq[1] = float(bitfieldExtract(q0, 8, 8));
+            wq[2] = float(bitfieldExtract(q0, 16, 8));
+            wq[3] = float(bitfieldExtract(q0, 24, 8));
+            wq[4] = float(bitfieldExtract(q1, 0, 8));
+            wq[5] = float(bitfieldExtract(q1, 8, 8));
+            wq[6] = float(bitfieldExtract(q1, 16, 8));
+            wq[7] = float(bitfieldExtract(q1, 24, 8));
+            uint xc = x_off + b * 32u + sub * 8u;
+            // Constant trip count (guard inside) keeps acc in
+            // registers. Same per-token arithmetic order as
+            // matvec_q8_0.comp; vec4 x loads when rows are 4-aligned.
+            for (uint t = 0u; t < NT; ++t) {
+                if (t < nt) {
+                    uint xi = xc + t * pc.x_stride;
+                    float s = 0.0;
+                    for (uint k = 0u; k < 2u; ++k) {
+                        uint xk = xi + k * 4u;
+                        vec4 xv = xal ? x4[xk >> 2]
+                                      : vec4(x[xk], x[xk + 1u],
+                                             x[xk + 2u], x[xk + 3u]);
+                        s += wq[k * 4u] * xv.x +
+                             wq[k * 4u + 1u] * xv.y +
+                             wq[k * 4u + 2u] * xv.z +
+                             wq[k * 4u + 3u] * xv.w;
+                    }
+                    acc[t] += d * s;
+                }
+            }
+        }
+    }
+#endif
+    for (uint t = 0u; t < NT; ++t) {
+        red[t * LANES * ROWS + tid] = acc[t];
+    }
+    barrier();
+    for (uint step = LANES / 2u; step > 0u; step >>= 1) {
+        if (lane < step) {
+            for (uint t = 0u; t < NT; ++t) {
+                uint i = t * LANES * ROWS + tid;
+                red[i] += red[i + step];
+            }
+        }
+        barrier();
+    }
+    // Lane t writes token t's output for this row.
+    if (lane < nt && r < pc.rows) {
+        float v = red[lane * LANES * ROWS + slot * LANES] * pc.scale;
+        uint oi = pc.out_offset + bt * pc.out_bstride +
+                  lane * pc.out_stride + r;
+        o[oi] = pc.accumulate != 0u ? o[oi] + v : v;
+    }
+}

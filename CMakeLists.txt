@@ -139,7 +139,7 @@ if(Vulkan_FOUND)
             rmsnorm rope silu_mul
             attn_paged_q kv_store_q moe_route
             kv_scatter moe_group moe_combine attn_softmax sum_splits
-            matvec_t_q8 attn_decode attn_combine attn_decode_grp
+            matvec_t_q8 attn_decode attn_combine attn_decode_grp matvec_q8_0_n
             # Variants: <kernel>=<source>:<define>[,<define>...], the
             # source compiled again with -D<define> for each.
             matvec_b=matvec:BATCHED
@@ -150,6 +150,9 @@ if(Vulkan_FOUND)
             matvec_q8_0_seg=matvec_q8_0:SEGMENTS
             matvec_q8_0_sh_b=matvec_q8_0:BATCHED,SHARED
             matvec_q8_0_glu_sh_b=matvec_q8_0:BATCHED,SWIGLU,SHARED
+            matvec_q8_0_p=matvec_q8_0:BATCHED,PAIRS
+            matvec_f32_n=matvec_q8_0_n:TYPE_F32
+            matvec_q8_0_glu_p=matvec_q8_0:BATCHED,SWIGLU,PAIRS
             matmul_q8_0=matmul:TYPE_Q8
             matmul_f32=matmul:TYPE_F32
             matmul_q8_0_id=matmul:TYPE_Q8,MOE_ID

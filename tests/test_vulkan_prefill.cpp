@@ -434,29 +434,33 @@ TEST_CASE("vulkan batched prefill tracks per-token prefill",
             REQUIRE(got_gen == want_gen);
 
             // all_logits (speculative verify): one row per position.
-            auto cache = model.make_cache();
-            auto ws = model.make_workspace();
-            locus::kv::PagedKvCache::Seq seq;
-            const std::uint32_t V = model.hparams().n_vocab;
-            const std::uint32_t n = 20;
-            std::vector<float> rows(std::size_t{n} * V);
-            REQUIRE(cache.ensure_capacity(seq, n));
-            model.forward_batch({prompt.data(), n}, cache, seq, ws, rows,
-                                true);
-            REQUIRE(seq.n_tokens == n);
-            auto ref_cache = model.make_cache();
-            locus::kv::PagedKvCache::Seq ref_seq;
-            std::vector<float> one(V);
-            for (std::uint32_t t = 0; t < n; ++t) {
-                REQUIRE(ref_cache.ensure_capacity(ref_seq, 1));
-                model.forward(prompt[t], ref_cache, ref_seq, ws, one);
-                const std::vector<float> row(rows.begin() + t * V,
-                                             rows.begin() + (t + 1) * V);
-                INFO("position " << t);
-                REQUIRE(cosine(row, one) > 0.9999);
+            // 20 rows take the matmul path, 5 the short-batch
+            // matvecs (<= 8 rows; MoE pair matvecs).
+            for (const std::uint32_t n : {20u, 5u}) {
+                auto cache = model.make_cache();
+                auto ws = model.make_workspace();
+                locus::kv::PagedKvCache::Seq seq;
+                const std::uint32_t V = model.hparams().n_vocab;
+                std::vector<float> rows(std::size_t{n} * V);
+                REQUIRE(cache.ensure_capacity(seq, n));
+                model.forward_batch({prompt.data(), n}, cache, seq, ws, rows,
+                                    true);
+                REQUIRE(seq.n_tokens == n);
+                auto ref_cache = model.make_cache();
+                locus::kv::PagedKvCache::Seq ref_seq;
+                std::vector<float> one(V);
+                for (std::uint32_t t = 0; t < n; ++t) {
+                    REQUIRE(ref_cache.ensure_capacity(ref_seq, 1));
+                    model.forward(prompt[t], ref_cache, ref_seq, ws, one);
+                    const std::vector<float> row(
+                        rows.begin() + t * V, rows.begin() + (t + 1) * V);
+                    INFO("batch " << n << " position " << t);
+                    REQUIRE(cosine(row, one) > 0.9999);
+                    REQUIRE(argmax(row) == argmax(one));
+                }
+                cache.release(seq);
+                ref_cache.release(ref_seq);
             }
-            cache.release(seq);
-            ref_cache.release(ref_seq);
         }
     }
     if (ran == 0) {
