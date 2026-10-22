@@ -52,6 +52,12 @@ bool VulkanContext::profiling() {
     return on;
 }
 
+/**
+ * @returns Kernel k's profile label (its kernel table row; a
+ * placeholder in builds without Vulkan kernels, which never profile).
+ */
+const char* kernel_name(Kernel k);
+
 void VulkanContext::report_profile() const {
     const Profile& p = profile();
     if (!profiling() || p.batches == 0) {
@@ -69,31 +75,9 @@ void VulkanContext::report_profile() const {
                  static_cast<double>(p.batches) / per,
                  static_cast<double>(p.dispatches) / per,
                  p.host_ms / per, p.wait_ms / per, p.gpu_ms / per);
-    static const char* const names[] = {
-        "matvec_f32",   "matvec_f16",   "matvec_q8_0",
-        "matvec_q4_0",  "matvec_q5_0",  "matvec_q4_k",
-        "matvec_q5_k",  "matvec_q6_k",  "matvec_q2_k",
-        "matvec_iq2_xxs", "matvec_iq3_xxs", "matvec_iq4_xs",
-        "matvec_t",     "rmsnorm",      "rope",
-        "silu_mul",     "attn_paged_q", "kv_store_q",
-        "matvec_f32_b", "matvec_f16_b", "matvec_q8_0_b",
-        "moe_route",    "matmul_q8_0",  "matmul_f32",
-        "matmul_q8_0_id", "kv_scatter", "moe_group",
-        "moe_combine",  "rmsnorm_b",    "rope_b",
-        "moe_route_b",  "matmul_paged", "matmul_paged_t",
-        "attn_softmax", "sum_splits",   "matvec_t_q8",
-        "matvec_q8_0_glu", "matvec_q8_0_glu_b", "attn_decode",
-        "attn_combine", "matvec_q8_0_seg", "matvec_q8_0_sh_b",
-        "matvec_q8_0_glu_sh_b", "attn_decode_grp", "matmul_q8_0_h",
-        "matmul_f32_h", "matmul_q8_0_id_h", "matmul_paged_h",
-        "matmul_paged_t_h", "matvec_q8_0_n", "matvec_q8_0_p",
-        "matvec_q8_0_glu_p", "matvec_f32_n", "matmul_paged_f16",
-        "matmul_paged_t_f16", "attn_decode_f16", "kv_scatter_f16",
-        "attn_decode_grp_f16"};
-    static_assert(std::size(names) ==
-                  static_cast<std::size_t>(Kernel::kCount_));
-    int order[std::size(names)];
-    for (int k = 0; k < static_cast<int>(std::size(names)); ++k) {
+    constexpr int kKernels = static_cast<int>(Kernel::kCount_);
+    int order[kKernels];
+    for (int k = 0; k < kKernels; ++k) {
         order[k] = k;
     }
     std::sort(std::begin(order), std::end(order), [&](int a, int b) {
@@ -106,7 +90,8 @@ void VulkanContext::report_profile() const {
         std::fprintf(stderr,
                      "vk-profile:   %-14s %8.3f ms/token  %6.1f "
                      "dispatches/token  %7.1f us each\n",
-                     names[k], p.kernel_ms[k] / per,
+                     kernel_name(static_cast<Kernel>(k)),
+                     p.kernel_ms[k] / per,
                      static_cast<double>(p.kernel_n[k]) / per,
                      1e3 * p.kernel_ms[k] /
                          static_cast<double>(p.kernel_n[k]));
@@ -241,8 +226,14 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
     return VK_FALSE;
 }
 
-/** Static description of each kernel's interface. */
+/**
+ * Static description of each kernel's interface: one row per Kernel,
+ * in enum order (kDescs; the order is checked at compile time).
+ */
 struct KernelDesc {
+    Kernel kernel;
+    /** Profile label (LOCUS_VK_PROFILE=2). */
+    const char* name;
     const std::uint32_t* spv;
     std::size_t spv_bytes;
     std::uint32_t n_buffers;
@@ -274,133 +265,180 @@ constexpr std::uint32_t matmul_shared_bytes(std::uint32_t bk) {
 static_assert(matmul_shared_bytes(VulkanContext::kMatmulBK) == 25088);
 static_assert(matmul_shared_bytes(VulkanContext::kMatmulBKSmall) == 12800);
 
+/**
+ * Every kernel's interface, row i describing Kernel(i). One table
+ * instead of parallel enum / name / descriptor lists, so a misordered
+ * or missing row is a compile error (below), not a silent shift of
+ * every later kernel's SPIR-V, buffer count and push size.
+ */
+constexpr KernelDesc kDescs[] = {
+    {Kernel::kMatvecF32, "matvec_f32", locus_matvec_spv,
+     sizeof(locus_matvec_spv), 3, 28},
+    {Kernel::kMatvecF16, "matvec_f16", locus_matvec_f16_spv,
+     sizeof(locus_matvec_f16_spv), 3, 28},
+    {Kernel::kMatvecQ8_0, "matvec_q8_0", locus_matvec_q8_0_spv,
+     sizeof(locus_matvec_q8_0_spv), 3, 28},
+    {Kernel::kMatvecQ4_0, "matvec_q4_0", locus_matvec_q4_0_spv,
+     sizeof(locus_matvec_q4_0_spv), 3, 28},
+    {Kernel::kMatvecQ5_0, "matvec_q5_0", locus_matvec_q5_0_spv,
+     sizeof(locus_matvec_q5_0_spv), 3, 28},
+    {Kernel::kMatvecQ4_K, "matvec_q4_k", locus_matvec_q4_k_spv,
+     sizeof(locus_matvec_q4_k_spv), 3, 28},
+    {Kernel::kMatvecQ5_K, "matvec_q5_k", locus_matvec_q5_k_spv,
+     sizeof(locus_matvec_q5_k_spv), 3, 28},
+    {Kernel::kMatvecQ6_K, "matvec_q6_k", locus_matvec_q6_k_spv,
+     sizeof(locus_matvec_q6_k_spv), 3, 28},
+    {Kernel::kMatvecQ2_K, "matvec_q2_k", locus_matvec_q2_k_spv,
+     sizeof(locus_matvec_q2_k_spv), 3, 28},
+    {Kernel::kMatvecIQ2_XXS, "matvec_iq2_xxs", locus_matvec_iq2_xxs_spv,
+     sizeof(locus_matvec_iq2_xxs_spv), 4, 28},
+    {Kernel::kMatvecIQ3_XXS, "matvec_iq3_xxs", locus_matvec_iq3_xxs_spv,
+     sizeof(locus_matvec_iq3_xxs_spv), 4, 28},
+    {Kernel::kMatvecIQ4_XS, "matvec_iq4_xs", locus_matvec_iq4_xs_spv,
+     sizeof(locus_matvec_iq4_xs_spv), 3, 28},
+    {Kernel::kMatvecT, "matvec_t", locus_matvec_t_spv,
+     sizeof(locus_matvec_t_spv), 3, 32},
+    {Kernel::kRmsNorm, "rmsnorm", locus_rmsnorm_spv, sizeof(locus_rmsnorm_spv),
+     3, 16},
+    {Kernel::kRope, "rope", locus_rope_spv, sizeof(locus_rope_spv), 2, 36},
+    {Kernel::kSiluMul, "silu_mul", locus_silu_mul_spv,
+     sizeof(locus_silu_mul_spv), 3, 4},
+    {Kernel::kAttnPagedQ, "attn_paged_q", locus_attn_paged_q_spv,
+     sizeof(locus_attn_paged_q_spv), 5, 44},
+    {Kernel::kKvStoreQ, "kv_store_q", locus_kv_store_q_spv,
+     sizeof(locus_kv_store_q_spv), 2, 16},
+    {Kernel::kMatvecF32B, "matvec_f32_b", locus_matvec_b_spv,
+     sizeof(locus_matvec_b_spv), 4, 52},
+    {Kernel::kMatvecF16B, "matvec_f16_b", locus_matvec_f16_b_spv,
+     sizeof(locus_matvec_f16_b_spv), 4, 52},
+    {Kernel::kMatvecQ8_0B, "matvec_q8_0_b", locus_matvec_q8_0_b_spv,
+     sizeof(locus_matvec_q8_0_b_spv), 4, 52},
+    {Kernel::kMoeRoute, "moe_route", locus_moe_route_spv,
+     sizeof(locus_moe_route_spv), 3, 36},
+    {Kernel::kMatmulQ8_0, "matmul_q8_0", locus_matmul_q8_0_spv,
+     sizeof(locus_matmul_q8_0_spv), 3, 96, locus_matmul_q8_0_small_spv,
+     sizeof(locus_matmul_q8_0_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kMatmulF32, "matmul_f32", locus_matmul_f32_spv,
+     sizeof(locus_matmul_f32_spv), 3, 96, locus_matmul_f32_small_spv,
+     sizeof(locus_matmul_f32_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kMatmulQ8_0Id, "matmul_q8_0_id", locus_matmul_q8_0_id_spv,
+     sizeof(locus_matmul_q8_0_id_spv), 4, 96, locus_matmul_q8_0_id_small_spv,
+     sizeof(locus_matmul_q8_0_id_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kKvScatter, "kv_scatter", locus_kv_scatter_spv,
+     sizeof(locus_kv_scatter_spv), 3, 40},
+    {Kernel::kMoeGroup, "moe_group", locus_moe_group_spv,
+     sizeof(locus_moe_group_spv), 2, 16},
+    {Kernel::kMoeCombine, "moe_combine", locus_moe_combine_spv,
+     sizeof(locus_moe_combine_spv), 3, 8},
+    {Kernel::kRmsNormB, "rmsnorm_b", locus_rmsnorm_b_spv,
+     sizeof(locus_rmsnorm_b_spv), 3, 24},
+    {Kernel::kRopeB, "rope_b", locus_rope_b_spv, sizeof(locus_rope_b_spv), 2,
+     40},
+    {Kernel::kMoeRouteB, "moe_route_b", locus_moe_route_b_spv,
+     sizeof(locus_moe_route_b_spv), 3, 44},
+    {Kernel::kMatmulPagedF32, "matmul_paged", locus_matmul_paged_f32_spv,
+     sizeof(locus_matmul_paged_f32_spv), 4, 96,
+     locus_matmul_paged_f32_small_spv, sizeof(locus_matmul_paged_f32_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kMatmulPagedTF32, "matmul_paged_t", locus_matmul_paged_t_f32_spv,
+     sizeof(locus_matmul_paged_t_f32_spv), 4, 96,
+     locus_matmul_paged_t_f32_small_spv,
+     sizeof(locus_matmul_paged_t_f32_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kAttnSoftmax, "attn_softmax", locus_attn_softmax_spv,
+     sizeof(locus_attn_softmax_spv), 1, 20},
+    {Kernel::kSumSplits, "sum_splits", locus_sum_splits_spv,
+     sizeof(locus_sum_splits_spv), 2, 16},
+    {Kernel::kMatvecTQ8, "matvec_t_q8", locus_matvec_t_q8_spv,
+     sizeof(locus_matvec_t_q8_spv), 3, 32},
+    {Kernel::kMatvecQ8_0Glu, "matvec_q8_0_glu", locus_matvec_q8_0_glu_spv,
+     sizeof(locus_matvec_q8_0_glu_spv), 4, 28},
+    {Kernel::kMatvecQ8_0GluB, "matvec_q8_0_glu_b", locus_matvec_q8_0_glu_b_spv,
+     sizeof(locus_matvec_q8_0_glu_b_spv), 5, 52},
+    {Kernel::kAttnDecode, "attn_decode", locus_attn_decode_spv,
+     sizeof(locus_attn_decode_spv), 6, 64},
+    {Kernel::kAttnCombine, "attn_combine", locus_attn_combine_spv,
+     sizeof(locus_attn_combine_spv), 2, 16},
+    {Kernel::kMatvecQ8_0Seg, "matvec_q8_0_seg", locus_matvec_q8_0_seg_spv,
+     sizeof(locus_matvec_q8_0_seg_spv), 5, 88},
+    {Kernel::kMatvecQ8_0ShB, "matvec_q8_0_sh_b", locus_matvec_q8_0_sh_b_spv,
+     sizeof(locus_matvec_q8_0_sh_b_spv), 5, 60},
+    {Kernel::kMatvecQ8_0GluShB, "matvec_q8_0_glu_sh_b",
+     locus_matvec_q8_0_glu_sh_b_spv, sizeof(locus_matvec_q8_0_glu_sh_b_spv), 7,
+     60},
+    {Kernel::kAttnDecodeGrp, "attn_decode_grp", locus_attn_decode_grp_spv,
+     sizeof(locus_attn_decode_grp_spv), 6, 64},
+    {Kernel::kMatmulQ8_0H, "matmul_q8_0_h", locus_matmul_q8_0_h_spv,
+     sizeof(locus_matmul_q8_0_h_spv), 3, 96},
+    {Kernel::kMatmulF32H, "matmul_f32_h", locus_matmul_f32_h_spv,
+     sizeof(locus_matmul_f32_h_spv), 3, 96},
+    {Kernel::kMatmulQ8_0IdH, "matmul_q8_0_id_h", locus_matmul_q8_0_id_h_spv,
+     sizeof(locus_matmul_q8_0_id_h_spv), 4, 96},
+    {Kernel::kMatmulPagedF32H, "matmul_paged_h", locus_matmul_paged_f32_h_spv,
+     sizeof(locus_matmul_paged_f32_h_spv), 4, 96},
+    {Kernel::kMatmulPagedTF32H, "matmul_paged_t_h",
+     locus_matmul_paged_t_f32_h_spv, sizeof(locus_matmul_paged_t_f32_h_spv), 4,
+     96},
+    {Kernel::kMatvecQ8_0N, "matvec_q8_0_n", locus_matvec_q8_0_n_spv,
+     sizeof(locus_matvec_q8_0_n_spv), 3, 52},
+    {Kernel::kMatvecQ8_0P, "matvec_q8_0_p", locus_matvec_q8_0_p_spv,
+     sizeof(locus_matvec_q8_0_p_spv), 4, 60},
+    {Kernel::kMatvecQ8_0GluP, "matvec_q8_0_glu_p", locus_matvec_q8_0_glu_p_spv,
+     sizeof(locus_matvec_q8_0_glu_p_spv), 5, 60},
+    {Kernel::kMatvecF32N, "matvec_f32_n", locus_matvec_f32_n_spv,
+     sizeof(locus_matvec_f32_n_spv), 3, 52},
+    // F16-KV pool readers stage in f32 like the F32 ones, so they
+    // step down to BK16 on tight devices the same way.
+    {Kernel::kMatmulPagedF16, "matmul_paged_f16", locus_matmul_paged_f16_spv,
+     sizeof(locus_matmul_paged_f16_spv), 4, 96,
+     locus_matmul_paged_f16_small_spv, sizeof(locus_matmul_paged_f16_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kMatmulPagedTF16, "matmul_paged_t_f16",
+     locus_matmul_paged_t_f16_spv, sizeof(locus_matmul_paged_t_f16_spv), 4, 96,
+     locus_matmul_paged_t_f16_small_spv,
+     sizeof(locus_matmul_paged_t_f16_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kAttnDecodeF16, "attn_decode_f16", locus_attn_decode_f16_spv,
+     sizeof(locus_attn_decode_f16_spv), 6, 64},
+    {Kernel::kKvScatterF16, "kv_scatter_f16", locus_kv_scatter_f16_spv,
+     sizeof(locus_kv_scatter_f16_spv), 3, 40},
+    {Kernel::kAttnDecodeGrpF16, "attn_decode_grp_f16",
+     locus_attn_decode_grp_f16_spv, sizeof(locus_attn_decode_grp_f16_spv), 6,
+     64},
+};
+
+/** @returns Whether row i of kDescs is Kernel(i), for every kernel. */
+constexpr bool descs_in_enum_order() {
+    if (std::size(kDescs) != static_cast<std::size_t>(Kernel::kCount_)) {
+        return false;
+    }
+    for (std::size_t i = 0; i < std::size(kDescs); ++i) {
+        if (kDescs[i].kernel != static_cast<Kernel>(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(descs_in_enum_order(),
+              "kDescs rows must list every Kernel, in enum order");
+
 const KernelDesc& kernel_desc(Kernel k) {
-    static const KernelDesc descs[] = {
-        {locus_matvec_spv, sizeof(locus_matvec_spv), 3, 28},
-        {locus_matvec_f16_spv, sizeof(locus_matvec_f16_spv), 3,
-         28},
-        {locus_matvec_q8_0_spv, sizeof(locus_matvec_q8_0_spv),
-         3, 28},
-        {locus_matvec_q4_0_spv, sizeof(locus_matvec_q4_0_spv),
-         3, 28},
-        {locus_matvec_q5_0_spv, sizeof(locus_matvec_q5_0_spv),
-         3, 28},
-        {locus_matvec_q4_k_spv, sizeof(locus_matvec_q4_k_spv),
-         3, 28},
-        {locus_matvec_q5_k_spv, sizeof(locus_matvec_q5_k_spv),
-         3, 28},
-        {locus_matvec_q6_k_spv, sizeof(locus_matvec_q6_k_spv),
-         3, 28},
-        {locus_matvec_q2_k_spv, sizeof(locus_matvec_q2_k_spv),
-         3, 28},
-        {locus_matvec_iq2_xxs_spv,
-         sizeof(locus_matvec_iq2_xxs_spv), 4, 28},
-        {locus_matvec_iq3_xxs_spv,
-         sizeof(locus_matvec_iq3_xxs_spv), 4, 28},
-        {locus_matvec_iq4_xs_spv,
-         sizeof(locus_matvec_iq4_xs_spv), 3, 28},
-        {locus_matvec_t_spv, sizeof(locus_matvec_t_spv), 3,
-         32},
-        {locus_rmsnorm_spv, sizeof(locus_rmsnorm_spv), 3, 16},
-        {locus_rope_spv, sizeof(locus_rope_spv), 2, 36},
-        {locus_silu_mul_spv, sizeof(locus_silu_mul_spv), 3, 4},
-        {locus_attn_paged_q_spv, sizeof(locus_attn_paged_q_spv),
-         5, 44},
-        {locus_kv_store_q_spv, sizeof(locus_kv_store_q_spv), 2,
-         16},
-        {locus_matvec_b_spv, sizeof(locus_matvec_b_spv), 4, 52},
-        {locus_matvec_f16_b_spv, sizeof(locus_matvec_f16_b_spv), 4,
-         52},
-        {locus_matvec_q8_0_b_spv, sizeof(locus_matvec_q8_0_b_spv),
-         4, 52},
-        {locus_moe_route_spv, sizeof(locus_moe_route_spv), 3, 36},
-        {locus_matmul_q8_0_spv, sizeof(locus_matmul_q8_0_spv), 3, 96,
-         locus_matmul_q8_0_small_spv,
-         sizeof(locus_matmul_q8_0_small_spv),
-         matmul_shared_bytes(VulkanContext::kMatmulBK),
-         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
-        {locus_matmul_f32_spv, sizeof(locus_matmul_f32_spv), 3, 96,
-         locus_matmul_f32_small_spv,
-         sizeof(locus_matmul_f32_small_spv),
-         matmul_shared_bytes(VulkanContext::kMatmulBK),
-         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
-        {locus_matmul_q8_0_id_spv, sizeof(locus_matmul_q8_0_id_spv), 4,
-         96, locus_matmul_q8_0_id_small_spv,
-         sizeof(locus_matmul_q8_0_id_small_spv),
-         matmul_shared_bytes(VulkanContext::kMatmulBK),
-         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
-        {locus_kv_scatter_spv, sizeof(locus_kv_scatter_spv), 3, 40},
-        {locus_moe_group_spv, sizeof(locus_moe_group_spv), 2, 16},
-        {locus_moe_combine_spv, sizeof(locus_moe_combine_spv), 3, 8},
-        {locus_rmsnorm_b_spv, sizeof(locus_rmsnorm_b_spv), 3, 24},
-        {locus_rope_b_spv, sizeof(locus_rope_b_spv), 2, 40},
-        {locus_moe_route_b_spv, sizeof(locus_moe_route_b_spv), 3, 44},
-        {locus_matmul_paged_f32_spv, sizeof(locus_matmul_paged_f32_spv), 4,
-         96, locus_matmul_paged_f32_small_spv,
-         sizeof(locus_matmul_paged_f32_small_spv),
-         matmul_shared_bytes(VulkanContext::kMatmulBK),
-         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
-        {locus_matmul_paged_t_f32_spv,
-         sizeof(locus_matmul_paged_t_f32_spv), 4, 96,
-         locus_matmul_paged_t_f32_small_spv,
-         sizeof(locus_matmul_paged_t_f32_small_spv),
-         matmul_shared_bytes(VulkanContext::kMatmulBK),
-         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
-        {locus_attn_softmax_spv, sizeof(locus_attn_softmax_spv), 1, 20},
-        {locus_sum_splits_spv, sizeof(locus_sum_splits_spv), 2, 16},
-        {locus_matvec_t_q8_spv, sizeof(locus_matvec_t_q8_spv), 3, 32},
-        {locus_matvec_q8_0_glu_spv, sizeof(locus_matvec_q8_0_glu_spv), 4,
-         28},
-        {locus_matvec_q8_0_glu_b_spv,
-         sizeof(locus_matvec_q8_0_glu_b_spv), 5, 52},
-        {locus_attn_decode_spv, sizeof(locus_attn_decode_spv), 6, 64},
-        {locus_attn_combine_spv, sizeof(locus_attn_combine_spv), 2, 16},
-        {locus_matvec_q8_0_seg_spv, sizeof(locus_matvec_q8_0_seg_spv), 5,
-         88},
-        {locus_matvec_q8_0_sh_b_spv, sizeof(locus_matvec_q8_0_sh_b_spv), 5,
-         60},
-        {locus_matvec_q8_0_glu_sh_b_spv,
-         sizeof(locus_matvec_q8_0_glu_sh_b_spv), 7, 60},
-        {locus_attn_decode_grp_spv, sizeof(locus_attn_decode_grp_spv), 6,
-         64},
-        {locus_matmul_q8_0_h_spv, sizeof(locus_matmul_q8_0_h_spv), 3, 96},
-        {locus_matmul_f32_h_spv, sizeof(locus_matmul_f32_h_spv), 3, 96},
-        {locus_matmul_q8_0_id_h_spv, sizeof(locus_matmul_q8_0_id_h_spv), 4,
-         96},
-        {locus_matmul_paged_f32_h_spv, sizeof(locus_matmul_paged_f32_h_spv),
-         4, 96},
-        {locus_matmul_paged_t_f32_h_spv,
-         sizeof(locus_matmul_paged_t_f32_h_spv), 4, 96},
-        {locus_matvec_q8_0_n_spv, sizeof(locus_matvec_q8_0_n_spv), 3, 52},
-        {locus_matvec_q8_0_p_spv, sizeof(locus_matvec_q8_0_p_spv), 4, 60},
-        {locus_matvec_q8_0_glu_p_spv, sizeof(locus_matvec_q8_0_glu_p_spv), 5,
-         60},
-        {locus_matvec_f32_n_spv, sizeof(locus_matvec_f32_n_spv), 3, 52},
-        // F16-KV pool readers stage in f32 like the F32 ones, so they
-        // step down to BK16 on tight devices the same way.
-        {locus_matmul_paged_f16_spv, sizeof(locus_matmul_paged_f16_spv), 4,
-         96, locus_matmul_paged_f16_small_spv,
-         sizeof(locus_matmul_paged_f16_small_spv),
-         matmul_shared_bytes(VulkanContext::kMatmulBK),
-         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
-        {locus_matmul_paged_t_f16_spv,
-         sizeof(locus_matmul_paged_t_f16_spv), 4, 96,
-         locus_matmul_paged_t_f16_small_spv,
-         sizeof(locus_matmul_paged_t_f16_small_spv),
-         matmul_shared_bytes(VulkanContext::kMatmulBK),
-         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
-        {locus_attn_decode_f16_spv, sizeof(locus_attn_decode_f16_spv), 6,
-         64},
-        {locus_kv_scatter_f16_spv, sizeof(locus_kv_scatter_f16_spv), 3, 40},
-        {locus_attn_decode_grp_f16_spv,
-         sizeof(locus_attn_decode_grp_f16_spv), 6, 64},
-    };
-    static_assert(std::size(descs) ==
-                  static_cast<std::size_t>(Kernel::kCount_));
-    return descs[static_cast<int>(k)];
+    return kDescs[static_cast<int>(k)];
 }
 
 }  // namespace
+
+const char* kernel_name(Kernel k) { return kernel_desc(k).name; }
 
 struct VulkanContext::Impl {
     VkInstance instance = VK_NULL_HANDLE;
@@ -1286,6 +1324,8 @@ VulkanContext::VulkanContext() {
 }
 
 VulkanContext::~VulkanContext() = default;
+
+const char* kernel_name(Kernel) { return "kernel"; }
 
 namespace {
 
