@@ -74,6 +74,9 @@ struct Hparams {
     std::uint32_t v_head_dim = 0;
     /** Attention score scale (arch-dependent; yarn mscale^2). */
     float kq_scale = 0.0f;
+    /** GQA rope pairs (x[i], x[i + head_dim/2]) (NEOX: Qwen2 /
+     * Qwen3) instead of interleaved (x[2i], x[2i+1]). */
+    bool rope_neox = false;
     /** YARN rope correction (freq_scale 1 = off). */
     backend::Yarn yarn;
     /** Max context the model was trained for. */
@@ -396,12 +399,26 @@ class TransformerModel {
          *     (qwen2moe) or a per-head q/k norm (qwen3moe). Backends
          *     that implement only the plain attention check this, not
          *     one member of a pair that happens to travel together.
+         *     The DSA indexer (glm-dsa: idx_k_norm and friends) is not
+         *     covered: it is declined model-wide on hp.idx_top_k.
          */
         bool has_attn_extras() const {
-            return !wq_bias.empty() || !wk_bias.empty() ||
-                   !wv_bias.empty() || !attn_q_norm.empty() ||
+            return has_qkv_bias() || !attn_q_norm.empty() ||
                    !attn_k_norm.empty();
         }
+
+        /** @returns Whether any q/k/v projection bias is present. */
+        bool has_qkv_bias() const {
+            return !wq_bias.empty() || !wk_bias.empty() ||
+                   !wv_bias.empty();
+        }
+
+        /** @returns Whether both per-head q and k norms are present
+         * (qwen3moe); one without the other is not a known arch. */
+        bool has_qk_norm() const {
+            return !attn_q_norm.empty() && !attn_k_norm.empty();
+        }
+
         /** Dense FFN (unused when the layer is MoE). */
         backend::Mat w_gate, w_up, w_down;
         /** MoE router and expert tensors. */

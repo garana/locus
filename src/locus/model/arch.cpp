@@ -570,6 +570,7 @@ void qwen2moe_hparams(const gguf::GgufFile& g, const std::string&,
     hp.n_expert_shared = 1;  // one gated shared expert
     hp.expert_weights_norm = false;  // Qwen1.5-MoE: raw softmax probs
                                      // (norm_topk_prob=false)
+    hp.rope_neox = true;  // read by GPU backends
     hp.kq_scale =
         1.0f / std::sqrt(static_cast<float>(hp.head_dim));
 }
@@ -722,6 +723,7 @@ void qwen3moe_hparams(const gguf::GgufFile& g, const std::string& p,
     }
     hp.n_expert_shared = 0;          // routed experts only
     hp.expert_weights_norm = true;   // norm_topk_prob
+    hp.rope_neox = true;             // read by GPU backends
     hp.kq_scale =
         1.0f / std::sqrt(static_cast<float>(hp.head_dim));
 }

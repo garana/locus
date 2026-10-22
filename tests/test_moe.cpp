@@ -860,4 +860,16 @@ TEST_CASE("Layer::has_attn_extras flags any q/k/v bias or q/k norm",
         lay.*f = w;
         REQUIRE(lay.has_attn_extras());
     }
+    // The finer predicates GPU backends use: any bias, or the q/k
+    // norm pair (one norm alone is not a pair).
+    Layer bias;
+    bias.wv_bias = w;
+    REQUIRE(bias.has_qkv_bias());
+    REQUIRE_FALSE(bias.has_qk_norm());
+    Layer qk;
+    qk.attn_q_norm = w;
+    REQUIRE_FALSE(qk.has_qk_norm());
+    qk.attn_k_norm = w;
+    REQUIRE(qk.has_qk_norm());
+    REQUIRE_FALSE(qk.has_qkv_bias());
 }

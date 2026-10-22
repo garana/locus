@@ -80,6 +80,9 @@ enum class Kernel {
     kAttnDecodeF16,
     kKvScatterF16,
     kAttnDecodeGrpF16,
+    /** NEOX-pair rope (Qwen2 / Qwen3): decode and prefill rows. */
+    kRopeNeox,
+    kRopeNeoxB,
     kCount_,
 };
 

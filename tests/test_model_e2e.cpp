@@ -345,6 +345,15 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
     REQUIRE(g.get_string("general.architecture") == "qwen3moe");
     auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::tokenizer_from_gguf(g);
+    // The CPU path, and the Vulkan full GPU forward when a device is
+    // there (per-head q/k norm + NEOX rope on the GPU).
+    std::vector<const char*> backends = {"neon"};
+    if (locus::backend::find_backend("neon") == nullptr) {
+        backends = {"scalar"};
+    }
+    if (locus::backend::vulkan_backend_usable()) {
+        backends.push_back("vulkan");
+    }
 
     // llama.cpp's prompt token counts (qwen2 pretokenizer; the gpt2
     // fallback gave 6, 6, 10 and 31).
@@ -372,27 +381,53 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
         {"x.append(item)\n\tif (n<2) return n;", 13,
          "\n\tfor (int i=2; i<n; i++) {\n\t\tif (x[i-1] > x"},
     };
-    for (const Golden& gd : goldens) {
-        INFO(gd.prompt);
-        auto cache = model.make_cache();
-        auto ws = model.make_workspace();
-        locus::kv::PagedKvCache::Seq seq;
-        std::vector<float> logits(model.hparams().n_vocab);
-        auto ids = tok->encode(gd.prompt, true);
-        REQUIRE(ids.size() == gd.prompt_tokens);
-        for (auto id : ids) {
-            REQUIRE(cache.ensure_capacity(seq, 1));
-            model.forward(id, cache, seq, ws, logits);
+    for (const char* be : backends) {
+        model.use_backend(*locus::backend::find_backend(be));
+        for (const Golden& gd : goldens) {
+            INFO(be << ": " << gd.prompt);
+            auto cache = model.make_cache();
+            auto ws = model.make_workspace();
+            locus::kv::PagedKvCache::Seq seq;
+            std::vector<float> logits(model.hparams().n_vocab);
+            auto ids = tok->encode(gd.prompt, true);
+            REQUIRE(ids.size() == gd.prompt_tokens);
+            for (auto id : ids) {
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(id, cache, seq, ws, logits);
+            }
+            std::vector<locus::tok::TokenId> gen;
+            for (int i = 0; i < 24; ++i) {
+                const auto next = locus::model::argmax(logits);
+                gen.push_back(next);
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(next, cache, seq, ws, logits);
+            }
+            cache.release(seq);
+            REQUIRE(tok->decode(gen) == gd.continuation);
         }
-        std::vector<locus::tok::TokenId> gen;
-        for (int i = 0; i < 24; ++i) {
-            const auto next = locus::model::argmax(logits);
-            gen.push_back(next);
-            REQUIRE(cache.ensure_capacity(seq, 1));
-            model.forward(next, cache, seq, ws, logits);
+        // Batched prefill (per-head q/k norm and NEOX rope over a
+        // chunk's rows) ingesting the longer prompt, then decode.
+        if (model.supports_batch_prefill()) {
+            const Golden& gd = goldens[1];
+            INFO(be << " batched prefill: " << gd.prompt);
+            auto cache = model.make_cache();
+            auto ws = model.make_workspace();
+            locus::kv::PagedKvCache::Seq seq;
+            std::vector<float> logits(model.hparams().n_vocab);
+            const auto ids = tok->encode(gd.prompt, true);
+            REQUIRE(cache.ensure_capacity(
+                seq, static_cast<std::uint32_t>(ids.size())));
+            model.forward_batch(ids, cache, seq, ws, logits);
+            std::vector<locus::tok::TokenId> gen;
+            for (int i = 0; i < 24; ++i) {
+                const auto next = locus::model::argmax(logits);
+                gen.push_back(next);
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(next, cache, seq, ws, logits);
+            }
+            cache.release(seq);
+            REQUIRE(tok->decode(gen) == gd.continuation);
         }
-        cache.release(seq);
-        REQUIRE(tok->decode(gen) == gd.continuation);
     }
 }
 
