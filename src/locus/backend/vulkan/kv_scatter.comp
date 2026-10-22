@@ -3,13 +3,24 @@
 // Writes n_tok contiguous rows (a prefill chunk's K, V or MLA latent
 // rows) into the paged pool: row t goes to position pos0 + t through
 // the block table, at dst_off within that position's row (the layer
-// and K/V offsets folded in). Workgroup y is the row; threads
-// stride its width.
+// and K/V offsets folded in). Workgroup y is the row, z the plane
+// (z shifts the source by src_plane and the destination by
+// dst_plane: K and V of one token in one dispatch); threads stride
+// the width.
+//
+// With KV_F16 (kv_scatter_f16) the pool holds IEEE halves in the same
+// layout (destination offsets count halves; width, dst_off,
+// block_stride, row_w and dst_plane must be even): each thread packs
+// a pair into one word.
 
 layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer S { float src[]; };
+#ifdef KV_F16
+layout(std430, binding = 1) buffer POOL { uint pool[]; };
+#else
 layout(std430, binding = 1) buffer POOL { float pool[]; };
+#endif
 layout(std430, binding = 2) readonly buffer TABLE { uint table[]; };
 
 layout(push_constant) uniform PC {
@@ -21,15 +32,25 @@ layout(push_constant) uniform PC {
     uint dst_off;       // floats: layer (+ V) offset in a block
     uint src_off;
     uint src_stride;
+    uint src_plane;     // floats between planes in S
+    uint dst_plane;     // pool elements between planes
 } pc;
 
 void main() {
     uint t = gl_WorkGroupID.y;
     uint pos = pc.pos0 + t;
+    uint z = gl_WorkGroupID.z;
     uint dst = table[pos / pc.block_tokens] * pc.block_stride +
-               pc.dst_off + (pos % pc.block_tokens) * pc.row_w;
-    uint s = pc.src_off + t * pc.src_stride;
+               pc.dst_off + z * pc.dst_plane +
+               (pos % pc.block_tokens) * pc.row_w;
+    uint s = pc.src_off + t * pc.src_stride + z * pc.src_plane;
+#ifdef KV_F16
+    for (uint i = 2u * gl_LocalInvocationID.x; i < pc.width; i += 256u) {
+        pool[(dst + i) >> 1] = packHalf2x16(vec2(src[s + i], src[s + i + 1u]));
+    }
+#else
     for (uint i = gl_LocalInvocationID.x; i < pc.width; i += 128u) {
         pool[dst + i] = src[s + i];
     }
+#endif
 }

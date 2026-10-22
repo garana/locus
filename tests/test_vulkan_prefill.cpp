@@ -340,14 +340,16 @@ std::string test_model(const char* name) {
 /**
  * Prefills `prompt` on the Vulkan backend either in chunks of
  * `chunk` tokens through forward_batch, or one forward() per token
- * (chunk 0), then greedily decodes `n_gen` tokens. Returns the last
- * prompt position's logits followed by the generated ids.
+ * (chunk 0), then greedily decodes `n_gen` tokens, with a `kv_type`
+ * cache. Returns the last prompt position's logits followed by the
+ * generated ids.
  */
 std::pair<std::vector<float>, std::vector<locus::tok::TokenId>> prefill_run(
     const locus::model::TransformerModel& model,
     const std::vector<locus::tok::TokenId>& prompt, std::uint32_t chunk,
-    std::uint32_t n_gen) {
-    auto cache = model.make_cache();
+    std::uint32_t n_gen,
+    locus::kv::KvType kv_type = locus::kv::KvType::kF32) {
+    auto cache = model.make_cache(0, kv_type);
     auto ws = model.make_workspace();
     locus::kv::PagedKvCache::Seq seq;
     std::vector<float> logits(model.hparams().n_vocab);
@@ -511,6 +513,60 @@ TEST_CASE("vulkan f16 prefill staging tracks the f32 prefill",
             locus::backend::vulkan_set_prefill_f16(false);
             REQUIRE(cosine(f16_l, f32_l) > 0.999);
             REQUIRE(f16_l != f32_l);  // the staging really ran
+        }
+    }
+    if (ran == 0) {
+        SKIP("no prefill test model present (llama-3.2-1b-q8_0.gguf)");
+    }
+}
+
+TEST_CASE("vulkan f16 KV cache tracks the f32 cache", "[e2e][vulkan][kv]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    // GQA (llama-1b) and MLA (DeepSeek-Coder-V2-Lite, optional) both
+    // keep an F16 pool on the GPU: decode stores and reads halves,
+    // batched prefill scatters and reads them.
+    const char* const models[] = {"llama-3.2-1b-q8_0.gguf",
+                                  "deepseek-coder-v2-lite-q8_0.gguf"};
+    std::size_t ran = 0;
+    for (const char* name : models) {
+        const std::string path = test_model(name);
+        if (!std::filesystem::exists(path)) {
+            continue;
+        }
+        DYNAMIC_SECTION(name) {
+            ++ran;
+            auto g = locus::gguf::GgufFile::open(path);
+            auto model = locus::model::TransformerModel::load(g);
+            model.use_backend(*locus::backend::find_backend("vulkan"));
+            using locus::kv::KvType;
+            {
+                // The F16 pool really is half the F32 one.
+                const auto c32 = model.make_cache(0, KvType::kF32);
+                const auto c16 = model.make_cache(0, KvType::kF16);
+                REQUIRE(c16.q_row_bytes() * 2 ==
+                        c32.geometry().kv_dim * sizeof(float));
+            }
+            std::mt19937 rng(59);
+            std::uniform_int_distribution<int> id(
+                100, static_cast<int>(model.hparams().n_vocab) - 100);
+            std::vector<locus::tok::TokenId> prompt(150);
+            for (auto& t : prompt) {
+                t = id(rng);
+            }
+            // Per-token decode: F16 against F32 (precision only).
+            const auto [f32_l, f32_gen] =
+                prefill_run(model, prompt, 0, 4, KvType::kF32);
+            const auto [f16_l, f16_gen] =
+                prefill_run(model, prompt, 0, 4, KvType::kF16);
+            REQUIRE(cosine(f16_l, f32_l) > 0.999);
+            // Batched prefill into an F16 pool against per-token F16.
+            const auto [b16_l, b16_gen] =
+                prefill_run(model, prompt, 64, 4, KvType::kF16);
+            REQUIRE(cosine(b16_l, f16_l) > 0.9999);
+            REQUIRE(argmax(b16_l) == argmax(f16_l));
+            REQUIRE(b16_gen == f16_gen);
         }
     }
     if (ran == 0) {

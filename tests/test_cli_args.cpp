@@ -31,6 +31,28 @@ TEST_CASE("--ctx caps the KV pool from the command line",
     REQUIRE(c.ctx == 0);  // default: model-derived pool
 }
 
+TEST_CASE("--kv-type picks the KV cache precision", "[cli]") {
+    using locus::kv::KvType;
+    auto parse = [](std::vector<const char*> argv) {
+        return locus_tools::parse_backend_args(
+            static_cast<int>(argv.size()), const_cast<char**>(argv.data()));
+    };
+    auto a = parse({"prog", "m.gguf"});
+    REQUIRE(a.kv_type_ok);
+    REQUIRE(a.kv_type == KvType::kF32);  // default: exact
+    auto b = parse({"prog", "--kv-type", "f16", "m.gguf"});
+    REQUIRE(b.kv_type_ok);
+    REQUIRE(b.kv_type == KvType::kF16);
+    REQUIRE(b.positional == std::vector<std::string>{"m.gguf"});
+    REQUIRE(parse({"prog", "--kv-type=q8"}).kv_type == KvType::kQ8);
+    REQUIRE(parse({"prog", "--kv-type=q4"}).kv_type == KvType::kQ4);
+    REQUIRE(parse({"prog", "--kv-type=f32"}).kv_type == KvType::kF32);
+    auto bad = parse({"prog", "--kv-type", "bf16", "m.gguf"});
+    REQUIRE_FALSE(bad.kv_type_ok);
+    REQUIRE(bad.kv_type_name == "bf16");
+    REQUIRE(bad.positional == std::vector<std::string>{"m.gguf"});
+}
+
 TEST_CASE("list flags parse and don't consume the model path",
           "[cli]") {
     std::array<const char*, 3> a1 = {"prog", "--quants", "m.gguf"};

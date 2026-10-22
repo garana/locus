@@ -87,7 +87,9 @@ void VulkanContext::report_profile() const {
         "matvec_q8_0_glu_sh_b", "attn_decode_grp", "matmul_q8_0_h",
         "matmul_f32_h", "matmul_q8_0_id_h", "matmul_paged_h",
         "matmul_paged_t_h", "matvec_q8_0_n", "matvec_q8_0_p",
-        "matvec_q8_0_glu_p", "matvec_f32_n"};
+        "matvec_q8_0_glu_p", "matvec_f32_n", "matmul_paged_f16",
+        "matmul_paged_t_f16", "attn_decode_f16", "kv_scatter_f16",
+        "attn_decode_grp_f16"};
     static_assert(std::size(names) ==
                   static_cast<std::size_t>(Kernel::kCount_));
     int order[std::size(names)];
@@ -194,6 +196,13 @@ static_assert(locus::backend::vk::kAttnDecodeQMax ==
 #include "matvec_q8_0_p_spv.h"
 #include "matvec_q8_0_glu_p_spv.h"
 #include "matvec_f32_n_spv.h"
+#include "matmul_paged_f16_spv.h"
+#include "matmul_paged_t_f16_spv.h"
+#include "matmul_paged_f16_small_spv.h"
+#include "matmul_paged_t_f16_small_spv.h"
+#include "attn_decode_f16_spv.h"
+#include "kv_scatter_f16_spv.h"
+#include "attn_decode_grp_f16_spv.h"
 
 namespace locus::backend::vk {
 
@@ -320,7 +329,7 @@ const KernelDesc& kernel_desc(Kernel k) {
          sizeof(locus_matmul_q8_0_id_small_spv),
          matmul_shared_bytes(VulkanContext::kMatmulBK),
          matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
-        {locus_kv_scatter_spv, sizeof(locus_kv_scatter_spv), 3, 32},
+        {locus_kv_scatter_spv, sizeof(locus_kv_scatter_spv), 3, 40},
         {locus_moe_group_spv, sizeof(locus_moe_group_spv), 2, 16},
         {locus_moe_combine_spv, sizeof(locus_moe_combine_spv), 3, 8},
         {locus_rmsnorm_b_spv, sizeof(locus_rmsnorm_b_spv), 3, 24},
@@ -367,6 +376,24 @@ const KernelDesc& kernel_desc(Kernel k) {
         {locus_matvec_q8_0_glu_p_spv, sizeof(locus_matvec_q8_0_glu_p_spv), 5,
          60},
         {locus_matvec_f32_n_spv, sizeof(locus_matvec_f32_n_spv), 3, 52},
+        // F16-KV pool readers stage in f32 like the F32 ones, so they
+        // step down to BK16 on tight devices the same way.
+        {locus_matmul_paged_f16_spv, sizeof(locus_matmul_paged_f16_spv), 4,
+         96, locus_matmul_paged_f16_small_spv,
+         sizeof(locus_matmul_paged_f16_small_spv),
+         matmul_shared_bytes(VulkanContext::kMatmulBK),
+         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+        {locus_matmul_paged_t_f16_spv,
+         sizeof(locus_matmul_paged_t_f16_spv), 4, 96,
+         locus_matmul_paged_t_f16_small_spv,
+         sizeof(locus_matmul_paged_t_f16_small_spv),
+         matmul_shared_bytes(VulkanContext::kMatmulBK),
+         matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+        {locus_attn_decode_f16_spv, sizeof(locus_attn_decode_f16_spv), 6,
+         64},
+        {locus_kv_scatter_f16_spv, sizeof(locus_kv_scatter_f16_spv), 3, 40},
+        {locus_attn_decode_grp_f16_spv,
+         sizeof(locus_attn_decode_grp_f16_spv), 6, 64},
     };
     static_assert(std::size(descs) ==
                   static_cast<std::size_t>(Kernel::kCount_));
@@ -1022,7 +1049,8 @@ void VulkanContext::dispatch(Kernel k,
                              std::span<const Buffer> buffers,
                              std::span<const std::uint32_t> push,
                              std::uint32_t groups_x,
-                             std::uint32_t groups_y) {
+                             std::uint32_t groups_y,
+                             std::uint32_t groups_z) {
     Impl& im = *impl_;
     const Impl::Pipe& p = im.pipes[static_cast<int>(k)];
     const KernelDesc& kd = kernel_desc(k);
@@ -1070,7 +1098,7 @@ void VulkanContext::dispatch(Kernel k,
     vkCmdPushConstants(im.batch_cmd, p.layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        kd.push_bytes, push.data());
-    vkCmdDispatch(im.batch_cmd, groups_x, groups_y, 1);
+    vkCmdDispatch(im.batch_cmd, groups_x, groups_y, groups_z);
     ++im.prof.dispatches;
     // Slot 0 is the batch start; keep the last slot for its end.
     if (im.per_kernel && im.ts_kernel.size() + 2 < Impl::kMaxTs) {
@@ -1283,7 +1311,8 @@ void* VulkanContext::mapped(Buffer) { no_kernels(); }
 void VulkanContext::begin_batch() { no_kernels(); }
 void VulkanContext::dispatch(Kernel, std::span<const Buffer>,
                              std::span<const std::uint32_t>,
-                             std::uint32_t, std::uint32_t) {
+                             std::uint32_t, std::uint32_t,
+                             std::uint32_t) {
     no_kernels();
 }
 void VulkanContext::end_batch() { no_kernels(); }

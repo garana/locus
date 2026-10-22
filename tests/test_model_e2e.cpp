@@ -161,9 +161,15 @@ TEST_CASE("quantized KV cache tracks the F32 forward", "[e2e][kv]") {
                                           locus::kv::KvType::kQ8);
     const auto q4 = teacher_forced_logits(model, ids,
                                           locus::kv::KvType::kQ4);
+    const auto f16 = teacher_forced_logits(model, ids,
+                                           locus::kv::KvType::kF16);
 
     REQUIRE(q8.size() == f32.size());
+    REQUIRE(f16.size() == f32.size());
     for (std::size_t i = 0; i < f32.size(); ++i) {
+        // F16 KV keeps 11 significant bits: closest of the three.
+        REQUIRE(cosine(f32[i], f16[i]) > 0.9999);
+        REQUIRE(cosine(f32[i], f16[i]) >= cosine(f32[i], q8[i]) - 1e-6);
         // Q8 KV closely approximates the exact forward; Q4 is coarser
         // (this fixture is a tiny 64-wide toy model, so 4-bit blocks
         // are noticeably lossier) but still strongly correlated, and

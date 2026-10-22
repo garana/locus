@@ -40,6 +40,26 @@ TEST_CASE("kv_row_bytes matches the block layout", "[kv]") {
     REQUIRE(kv_row_bytes(128, KvType::kF32) == 128 * 4);
     REQUIRE(kv_row_bytes(128, KvType::kQ8) == 4 * (2 + 32));
     REQUIRE(kv_row_bytes(128, KvType::kQ4) == 4 * (2 + 16));
+    REQUIRE(kv_row_bytes(128, KvType::kF16) == 128 * 2);
+}
+
+TEST_CASE("kv F16 round-trips to half precision", "[kv]") {
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.0f, 3.0f);
+    std::vector<float> x(200);  // not a block multiple: F16 has none
+    for (auto& v : x) {
+        v = nd(rng);
+    }
+    x[0] = 0.5f;  // exactly representable values come back exactly
+    x[1] = -1.25f;
+    const auto y = round_trip(x, KvType::kF16);
+    REQUIRE(y[0] == 0.5f);
+    REQUIRE(y[1] == -1.25f);
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        // 11 significant bits: relative error <= 2^-11 (normals).
+        REQUIRE(std::fabs(y[i] - x[i]) <=
+                std::fabs(x[i]) * (1.0 / 2048.0) + 1e-7);
+    }
 }
 
 TEST_CASE("kv F32 round-trips exactly", "[kv]") {

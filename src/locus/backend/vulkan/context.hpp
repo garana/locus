@@ -74,6 +74,12 @@ enum class Kernel {
     kMatvecQ8_0GluP,
     /** F32 counterpart of kMatvecQ8_0N. */
     kMatvecF32N,
+    /** F16 KV pool (opt-in, #105) readers / writer. */
+    kMatmulPagedF16,
+    kMatmulPagedTF16,
+    kAttnDecodeF16,
+    kKvScatterF16,
+    kAttnDecodeGrpF16,
     kCount_,
 };
 
@@ -238,10 +244,12 @@ class VulkanContext {
      * @param push Raw push constants (floats bit-cast to uint32).
      * @param groups_x X workgroup count.
      * @param groups_y Y workgroup count (batched slots / heads).
+     * @param groups_z Z workgroup count (planes).
      */
     void dispatch(Kernel k, std::span<const Buffer> buffers,
                   std::span<const std::uint32_t> push,
-                  std::uint32_t groups_x, std::uint32_t groups_y = 1);
+                  std::uint32_t groups_x, std::uint32_t groups_y = 1,
+                  std::uint32_t groups_z = 1);
 
     /** Submits the batch and waits for completion. */
     void end_batch();

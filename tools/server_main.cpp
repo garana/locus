@@ -46,6 +46,12 @@ int main(int argc, char** argv) {
             argv[0], locus_tools::kCommonHelp);
         return 0;
     }
+    if (!args.kv_type_ok) {
+        std::fprintf(stderr,
+                     "%s: unknown --kv-type '%s' (f32, f16, q8, q4)\n",
+                     argv[0], args.kv_type_name.c_str());
+        return 2;
+    }
     if (args.positional.empty()) {
         std::fprintf(stderr,
                      "usage: %s [--backend NAME] <model.gguf> "
@@ -75,6 +81,7 @@ int main(int argc, char** argv) {
             opt.engine.n_blocks = (args.ctx + 15) / 16;
         }
         opt.engine.speculative = args.speculative;
+        opt.engine.kv_type = args.kv_type;
         opt.chat_template =
             locus::chat::ChatTemplate::from_gguf(g);
         if (!args.metrics_path.empty()) {

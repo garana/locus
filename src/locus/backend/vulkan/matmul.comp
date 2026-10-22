@@ -19,7 +19,8 @@
 // matmuls), through the block table at binding 3: PAGED makes row r
 // cache position r (scores: S = K Q^T), PAGED_T makes column c cache
 // position c (outputs: O = V^T P); w_off then offsets within a
-// position's row_w-float cache row.
+// position's row_w-float cache row. With KV_F16 the pool holds IEEE
+// halves in the same layout (offsets and strides count halves).
 //
 // With F16_STAGE (the *_h variants, opt-in --prefill-f16) both
 // operands are staged in shared memory as f16 and widened back for
@@ -77,7 +78,7 @@
 
 layout(local_size_x = 256) in;
 
-#ifdef TYPE_Q8
+#if defined(TYPE_Q8) || defined(KV_F16)
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 #else
 layout(std430, binding = 0) readonly buffer W { float w[]; };
@@ -139,12 +140,21 @@ uint pos_row(uint p) {
 #endif
 
 #ifndef TYPE_Q8
+#ifdef KV_F16
+/** Pool element i (a half). */
+float w_el(uint i) {
+    return unpackHalf2x16(w[i >> 1] >> ((i & 1u) * 16u)).x;
+}
+#else
+#define w_el(i) w[i]
+#endif
+
 /** W element (row r, column c) of the slice at wbase. */
 float w_at(uint wbase, uint r, uint c) {
 #if defined(PAGED)
-    return w[pos_row(r) + wbase + c];
+    return w_el(pos_row(r) + wbase + c);
 #elif defined(PAGED_T)
-    return w[pos_row(c) + wbase + r];
+    return w_el(pos_row(c) + wbase + r);
 #else
     return w[wbase + r * pc.cols + c];
 #endif
