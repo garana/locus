@@ -1,0 +1,26 @@
+{
+  "tokens": {
+    "band_base": 128266,
+    "stop_token": null,
+    "stop_token_name": null,
+    "terminated": false,
+    "audio_tokens": 98,
+    "frames": 14,
+    "voice": "tara",
+    "text": "The quick brown fox jumps over the lazy dog.",
+    "gguf": "orpheus-3b-0.1-ft-Q4_K_M.gguf"
+  },
+  "waveform": {
+    "samples": 28672,
+    "sample_rate": 24000,
+    "noise": "disabled",
+    "decode": "one-shot"
+  },
+  "sha256": {
+    "orpheus_codes.txt": "a2862b7e7e82bceedaf7517189fafcc36e661a44c80c2e873bfe3ba694e2f3b8",
+    "orpheus_golden.json": "8434b20fa0ff752ae97f1579ff7e221498f01d7f83e410658ffc00b6efb5d339",
+    "orpheus_tokens.txt": "6b0ddc7fea0e6e4d9a547a22e10928ee30e9a705b5c18683adcdb03e83ff137c",
+    "orpheus_waveform.f32": "dfa4a63f94ebc838f21d5f6392ddb6207ab24e7ab6d733c14c3c190d9b4efd21",
+    "orpheus_waveform.wav": "88e5dd478503eec7c649d3f5eb99e3b1e2f70477b650da05c90d827677d92fb2"
+  }
+}
