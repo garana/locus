@@ -41,6 +41,34 @@ void cuda_set_device(int ordinal) {
 
 void cuda_pool_reset() {}
 
+void conv1d_cuda(std::span<const float> in, std::uint32_t in_ch,
+                 std::uint32_t in_len, std::span<const float> weight,
+                 std::uint32_t out_ch, std::uint32_t k,
+                 std::span<const float> bias, std::uint32_t stride,
+                 std::uint32_t dilation, std::uint32_t pad,
+                 std::uint32_t groups, std::span<float> out) {
+    conv1d(in, in_ch, in_len, weight, out_ch, k, bias, stride, dilation,
+           pad, groups, out);
+}
+
+void conv1d_transpose_cuda(std::span<const float> in,
+                           std::uint32_t in_ch, std::uint32_t in_len,
+                           std::span<const float> weight,
+                           std::uint32_t out_ch, std::uint32_t k,
+                           std::span<const float> bias,
+                           std::uint32_t stride, std::uint32_t dilation,
+                           std::uint32_t pad, std::uint32_t groups,
+                           std::span<float> out) {
+    conv1d_transpose(in, in_ch, in_len, weight, out_ch, k, bias, stride,
+                     dilation, pad, groups, out);
+}
+
+void snake1d_cuda(std::span<float> x, std::uint32_t ch,
+                  std::uint32_t len, std::span<const float> alpha,
+                  float eps) {
+    snake1d(x, ch, len, alpha, eps);
+}
+
 }  // namespace locus::backend
 
 #endif  // !LOCUS_HAS_CUDA

@@ -1034,3 +1034,107 @@ TEST_CASE("conv1d out_len helpers match the kernels' shapes",
     REQUIRE(conv1d_transpose_out_len(3, 4, 2, 1, 1) == 6);  // upsample x2
     REQUIRE(conv1d_transpose_out_len(2, 2, 1, 1, 0) == 3);
 }
+
+namespace {
+
+/** Runs one conv (forward or transpose) on the GPU and on the scalar
+ *  reference over random data and asserts they agree. */
+void check_conv1d_cuda(bool transpose, std::uint32_t in_ch,
+                       std::uint32_t in_len, std::uint32_t out_ch,
+                       std::uint32_t k, std::uint32_t stride,
+                       std::uint32_t dilation, std::uint32_t pad,
+                       std::uint32_t groups, bool with_bias,
+                       std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    const std::uint32_t icg = in_ch / groups, ocg = out_ch / groups;
+    const std::uint32_t out_len =
+        transpose
+            ? conv1d_transpose_out_len(in_len, k, stride, dilation, pad)
+            : conv1d_out_len(in_len, k, stride, dilation, pad);
+    std::vector<float> in(static_cast<std::size_t>(in_ch) * in_len);
+    // Forward weight is [out_ch][icg][k]; transpose is [in_ch][ocg][k].
+    std::vector<float> w(transpose
+                             ? static_cast<std::size_t>(in_ch) * ocg * k
+                             : static_cast<std::size_t>(out_ch) * icg * k);
+    std::vector<float> bias(with_bias ? out_ch : 0u);
+    for (auto& v : in) v = d(rng);
+    for (auto& v : w) v = d(rng);
+    for (auto& v : bias) v = d(rng);
+    std::vector<float> ref(static_cast<std::size_t>(out_ch) * out_len);
+    std::vector<float> got(static_cast<std::size_t>(out_ch) * out_len);
+    if (transpose) {
+        conv1d_transpose(in, in_ch, in_len, w, out_ch, k, bias, stride,
+                         dilation, pad, groups, ref);
+        conv1d_transpose_cuda(in, in_ch, in_len, w, out_ch, k, bias, stride,
+                              dilation, pad, groups, got);
+    } else {
+        conv1d(in, in_ch, in_len, w, out_ch, k, bias, stride, dilation, pad,
+               groups, ref);
+        conv1d_cuda(in, in_ch, in_len, w, out_ch, k, bias, stride, dilation,
+                    pad, groups, got);
+    }
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        INFO("i=" << i);
+        REQUIRE(got[i] == Approx(ref[i]).epsilon(1e-5).margin(1e-5));
+    }
+}
+
+}  // namespace
+
+TEST_CASE("conv1d_cuda matches the scalar reference", "[conv1d][cuda]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    // Dense same-padded 1 -> 1, the hand case's shape.
+    check_conv1d_cuda(false, 1, 20, 1, 3, 1, 1, 1, 1, false, 1);
+    // The SNAC workhorse: depthwise k7 at dilation 1, 3, 9, 'same'
+    // padding = dilation * (k - 1) / 2 so length is preserved.
+    check_conv1d_cuda(false, 8, 24, 8, 7, 1, 1, 3, 8, false, 2);
+    check_conv1d_cuda(false, 8, 24, 8, 7, 1, 3, 9, 8, false, 3);
+    check_conv1d_cuda(false, 8, 24, 8, 7, 1, 9, 27, 8, false, 4);
+    // Pointwise k1 dense (channel mixing), and the final dense k7
+    // 64 -> 1 reduction.
+    check_conv1d_cuda(false, 16, 20, 32, 1, 1, 1, 0, 1, false, 5);
+    check_conv1d_cuda(false, 64, 12, 1, 7, 1, 1, 3, 1, false, 6);
+    // Stride + dilation, and a bias.
+    check_conv1d_cuda(false, 1, 16, 1, 2, 2, 2, 0, 1, false, 7);
+    check_conv1d_cuda(false, 4, 16, 6, 3, 1, 1, 1, 1, true, 8);
+}
+
+TEST_CASE("conv1d_transpose_cuda matches the scalar reference",
+          "[conv1d][cuda]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    // SNAC upsample blocks: dense, k = 2*stride, pad = stride / 2, so
+    // length scales by exactly the stride.
+    for (std::uint32_t s : {2u, 4u, 8u}) {
+        check_conv1d_cuda(true, 6, 10, 4, 2 * s, s, 1, s / 2, 1, false,
+                          100 + s);
+    }
+    // Grouped transpose (groups == 2), the input-channel-first weight.
+    check_conv1d_cuda(true, 4, 8, 2, 3, 2, 1, 1, 2, false, 120);
+    // With a bias.
+    check_conv1d_cuda(true, 2, 6, 2, 4, 2, 1, 1, 1, true, 121);
+}
+
+TEST_CASE("snake1d_cuda matches the scalar reference", "[conv1d][cuda]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    constexpr std::uint32_t ch = 5, len = 37;
+    std::mt19937 rng(9);
+    std::uniform_real_distribution<float> d(-3.0f, 3.0f);
+    std::uniform_real_distribution<float> da(0.2f, 2.0f);
+    std::vector<float> x(static_cast<std::size_t>(ch) * len), alpha(ch);
+    for (auto& v : x) v = d(rng);
+    for (auto& v : alpha) v = da(rng);
+    std::vector<float> ref = x, got = x;
+    snake1d(ref, ch, len, alpha);
+    snake1d_cuda(got, ch, len, alpha);
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        INFO("i=" << i);
+        REQUIRE(got[i] == Approx(ref[i]).epsilon(1e-5).margin(1e-5));
+    }
+}
