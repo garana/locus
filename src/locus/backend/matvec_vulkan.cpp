@@ -695,7 +695,8 @@ constexpr std::uint32_t kMatmulRows = VulkanContext::kMatmulTileRows;
 constexpr std::uint32_t kMatmulToks = VulkanContext::kMatmulTileToks;
 constexpr std::uint32_t kMatmulToksId = VulkanContext::kMatmulTileToks;
 
-/** @returns k's f16-staging variant under --prefill-f16, else k. */
+/** @returns k's f16-staging variant under --prefill-f16, else k
+ * (the K-quant matmuls have none: they always stage f32). */
 Kernel staged(const State& s, Kernel k) {
     if (!s.prefill_f16) {
         return k;
@@ -714,7 +715,20 @@ Kernel staged(const State& s, Kernel k) {
 Kernel matmul_kernel(const Mat& w) {
     switch (w.type) {
         case gguf::TensorType::kQ8_0: return Kernel::kMatmulQ8_0;
+        case gguf::TensorType::kQ4_K: return Kernel::kMatmulQ4_K;
+        case gguf::TensorType::kQ6_K: return Kernel::kMatmulQ6_K;
         case gguf::TensorType::kF32: return Kernel::kMatmulF32;
+        default: return Kernel::kCount_;
+    }
+}
+
+/** @returns The routed-expert (MOE_ID) matmul kernel for w, or
+ * kCount_. */
+Kernel matmul_id_kernel(const Mat& w) {
+    switch (w.type) {
+        case gguf::TensorType::kQ8_0: return Kernel::kMatmulQ8_0Id;
+        case gguf::TensorType::kQ4_K: return Kernel::kMatmulQ4_KId;
+        case gguf::TensorType::kQ6_K: return Kernel::kMatmulQ6_KId;
         default: return Kernel::kCount_;
     }
 }
@@ -849,7 +863,8 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
  * Records the routed-expert matmul for a prefill chunk: every
  * expert's weights (stacked in wb, expert_bytes apart) applied once
  * to the (token, slot) pairs moe_group listed for it in ids. Pair p
- * reads X row p / x_div and writes output row p. Q8_0 only.
+ * reads X row p / x_div and writes output row p. w must have a
+ * matmul_id_kernel.
  */
 void rec_matmul_id(State& s, const Mat& w, VulkanContext::Buffer wb,
                    VulkanContext::Buffer x, VulkanContext::Buffer out,
@@ -884,7 +899,7 @@ void rec_matmul_id(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   0,
                                   0,
                                   0};
-    s.ctx.dispatch(staged(s, Kernel::kMatmulQ8_0Id), bufs, push,
+    s.ctx.dispatch(staged(s, matmul_id_kernel(w)), bufs, push,
                    (w.rows + kMatmulRows - 1) / kMatmulRows,
                    tiles * n_expert);
 }
@@ -2092,14 +2107,14 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     if (mla && kv_dim != kvw) {
         return false;
     }
-    // Routed experts need GPU routing (all experts resident) and the
-    // Q8_0 id-matmul; moe_group handles up to 256 experts.
+    // Routed experts need GPU routing (all experts resident) and an
+    // id-matmul; moe_group handles up to 256 experts.
     for (const auto& lay : m.layers()) {
         if (lay.is_moe() &&
             (!gpu_route_ok(s, m, lay) || hp.n_expert > 256 ||
-             lay.gate_exps.base.type != gguf::TensorType::kQ8_0 ||
-             lay.up_exps.base.type != gguf::TensorType::kQ8_0 ||
-             lay.down_exps.base.type != gguf::TensorType::kQ8_0)) {
+             matmul_id_kernel(lay.gate_exps.base) == Kernel::kCount_ ||
+             matmul_id_kernel(lay.up_exps.base) == Kernel::kCount_ ||
+             matmul_id_kernel(lay.down_exps.base) == Kernel::kCount_)) {
             return false;
         }
     }

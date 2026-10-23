@@ -199,6 +199,14 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "rope_neox_b_spv.h"
 #include "matvec_q4_k_b_spv.h"
 #include "matvec_q6_k_b_spv.h"
+#include "matmul_q4_k_spv.h"
+#include "matmul_q6_k_spv.h"
+#include "matmul_q4_k_id_spv.h"
+#include "matmul_q6_k_id_spv.h"
+#include "matmul_q4_k_small_spv.h"
+#include "matmul_q6_k_small_spv.h"
+#include "matmul_q4_k_id_small_spv.h"
+#include "matmul_q6_k_id_small_spv.h"
 
 namespace locus::backend::vk {
 
@@ -434,6 +442,26 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_matvec_q4_k_b_spv), 4, 52},
     {Kernel::kMatvecQ6_KB, "matvec_q6_k_b", locus_matvec_q6_k_b_spv,
      sizeof(locus_matvec_q6_k_b_spv), 4, 52},
+    {Kernel::kMatmulQ4_K, "matmul_q4_k", locus_matmul_q4_k_spv,
+     sizeof(locus_matmul_q4_k_spv), 3, 96, locus_matmul_q4_k_small_spv,
+     sizeof(locus_matmul_q4_k_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kMatmulQ6_K, "matmul_q6_k", locus_matmul_q6_k_spv,
+     sizeof(locus_matmul_q6_k_spv), 3, 96, locus_matmul_q6_k_small_spv,
+     sizeof(locus_matmul_q6_k_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kMatmulQ4_KId, "matmul_q4_k_id", locus_matmul_q4_k_id_spv,
+     sizeof(locus_matmul_q4_k_id_spv), 4, 96, locus_matmul_q4_k_id_small_spv,
+     sizeof(locus_matmul_q4_k_id_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kMatmulQ6_KId, "matmul_q6_k_id", locus_matmul_q6_k_id_spv,
+     sizeof(locus_matmul_q6_k_id_spv), 4, 96, locus_matmul_q6_k_id_small_spv,
+     sizeof(locus_matmul_q6_k_id_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

@@ -12,8 +12,9 @@
 // accumulates a TM x TN register block.
 //
 // Weight type by define: TYPE_Q8 (Q8_0 rows in the split GPU layout
-// of q8_layout.hpp, byte offsets, cols % 32 == 0) or TYPE_F32
-// (element offsets).
+// of q8_layout.hpp, byte offsets, cols % 32 == 0), TYPE_Q4K / TYPE_Q6K
+// (ggml K-quant rows as on disk, byte offsets, cols % 256 == 0) or
+// TYPE_F32 (element offsets).
 //
 // TYPE_F32 can instead read W from the paged KV pool (attention as
 // matmuls), through the block table at binding 3: PAGED makes row r
@@ -78,7 +79,10 @@
 
 layout(local_size_x = 256) in;
 
-#if defined(TYPE_Q8) || defined(KV_F16)
+#if defined(TYPE_Q8) || defined(TYPE_Q4K) || defined(TYPE_Q6K)
+#define W_BYTES
+#endif
+#if defined(W_BYTES) || defined(KV_F16)
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 #else
 layout(std430, binding = 0) readonly buffer W { float w[]; };
@@ -97,7 +101,7 @@ layout(push_constant) uniform PC {
     uint cols;
     uint n_tok;
     uint accumulate;
-    uint w_off;       // bytes (Q8_0) or elements (F32)
+    uint w_off;       // bytes (quant) or elements (F32)
     uint x_off;
     uint x_stride;
     uint out_off;
@@ -139,7 +143,7 @@ uint pos_row(uint p) {
 }
 #endif
 
-#ifndef TYPE_Q8
+#ifndef W_BYTES
 #ifdef KV_F16
 /** Pool element i (a half). */
 float w_el(uint i) {
@@ -161,12 +165,37 @@ float w_at(uint wbase, uint r, uint c) {
 }
 #endif
 
-#ifdef TYPE_Q8
+#ifdef W_BYTES
 /** The 4 bytes at byte offset b (any alignment). */
 uint word_at(uint b) {
     uint i = b >> 2;
     uint sh = (b & 3u) * 8u;
     return sh == 0u ? w[i] : (w[i] >> sh) | (w[i + 1u] << (32u - sh));
+}
+#endif
+
+#if defined(TYPE_Q4K) || defined(TYPE_Q6K)
+uint byte_at(uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+float f16_at(uint i) {
+    return unpackHalf2x16(byte_at(i) | (byte_at(i + 1u) << 8u)).x;
+}
+#endif
+
+#ifdef TYPE_Q4K
+// ggml get_scale_min_k4 over the packed scales at byte `sc0`.
+void scale_min(uint j, uint sc0, out float d, out float m) {
+    if (j < 4u) {
+        d = float(byte_at(sc0 + j) & 63u);
+        m = float(byte_at(sc0 + j + 4u) & 63u);
+    } else {
+        d = float((byte_at(sc0 + j + 4u) & 0xfu) |
+                  ((byte_at(sc0 + j - 4u) >> 6u) << 4u));
+        m = float((byte_at(sc0 + j + 4u) >> 4u) |
+                  ((byte_at(sc0 + j) >> 6u) << 4u));
+    }
 }
 #endif
 
@@ -251,6 +280,64 @@ void main() {
                 ws[c + 3u][lr / 4u][lr % 4u] =
                     SVAL(d * float(bitfieldExtract(q, 24, 8)));
             }
+        } else {
+            for (uint c = sub * VPT; c < sub * VPT + VPT; ++c) {
+                ws[c][lr / 4u][lr % 4u] = SVAL(0.0);
+            }
+        }
+#elif defined(TYPE_Q4K) || defined(TYPE_Q6K)
+        // A thread's VPT (8 or 16) columns, starting at a multiple of
+        // VPT, sit in one Q4_K 32-column sub-block (one scale / min)
+        // or one Q6_K 16-column group (one scale).
+        if (r < pc.rows) {
+            uint nb = pc.cols / 256u;
+            uint kc = k0 + sub * VPT;
+            uint e = kc % 256u;
+#ifdef TYPE_Q4K
+            uint at = wbase + (r * nb + kc / 256u) * 144u;
+            uint sb = e / 32u;
+            float sc, mn;
+            scale_min(sb, at + 4u, sc, mn);
+            float d1 = f16_at(at) * sc;
+            float m1 = f16_at(at + 2u) * mn;
+            uint q0 = at + 16u + (sb / 2u) * 32u + e % 32u;
+            uint sh = (sb & 1u) * 4u;
+            for (uint h = 0u; h < VPT / 4u; ++h) {
+                uint v = word_at(q0 + h * 4u) >> sh;
+                uint c = sub * VPT + h * 4u;
+                for (uint i = 0u; i < 4u; ++i) {
+                    ws[c + i][lr / 4u][lr % 4u] =
+                        SVAL(d1 * float((v >> (8u * i)) & 0xfu) - m1);
+                }
+            }
+#else
+            // Half n of the block, quarter t (q1..q4 of matvec_q6_k),
+            // l0 the first of the half's 32 lanes.
+            uint at = wbase + (r * nb + kc / 256u) * 210u;
+            uint n = e / 128u;
+            uint t = (e % 128u) / 32u;
+            uint l0 = e % 32u;
+            float d1 = f16_at(at + 208u) *
+                       float(bitfieldExtract(
+                           int(byte_at(at + 192u + n * 8u + l0 / 16u +
+                                       2u * t)),
+                           0, 8));
+            uint ql = at + n * 64u + (t & 1u) * 32u + l0;
+            uint qh = at + 128u + n * 32u + l0;
+            uint lsh = (t >> 1) * 4u;
+            uint hsh = 2u * t;
+            for (uint h = 0u; h < VPT / 4u; ++h) {
+                uint lo = word_at(ql + h * 4u) >> lsh;
+                uint hi = word_at(qh + h * 4u) >> hsh;
+                uint c = sub * VPT + h * 4u;
+                for (uint i = 0u; i < 4u; ++i) {
+                    int q = int(((lo >> (8u * i)) & 0xfu) |
+                                (((hi >> (8u * i)) & 3u) << 4u)) -
+                            32;
+                    ws[c + i][lr / 4u][lr % 4u] = SVAL(d1 * float(q));
+                }
+            }
+#endif
         } else {
             for (uint c = sub * VPT; c < sub * VPT + VPT; ++c) {
                 ws[c][lr / 4u][lr % 4u] = SVAL(0.0);
