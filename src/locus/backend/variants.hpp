@@ -173,4 +173,45 @@ void cuda_pool_reset();
  */
 void cuda_prefetch(const Mat& w);
 
+/**
+ * CUDA 1D convolution (F32), the device half of the conv1d scalar
+ * reference (generative-media codec decoders). Same contract and
+ * channels-major layout as backend::conv1d: `out_len` comes from
+ * conv1d_out_len, weight is [out_ch][in_ch/groups][k], groups == in_ch
+ * is depthwise. One thread per output element. Falls back to the scalar
+ * reference on any CUDA error; a scalar-delegating stub on non-CUDA
+ * builds.
+ */
+void conv1d_cuda(std::span<const float> in, std::uint32_t in_ch,
+                 std::uint32_t in_len, std::span<const float> weight,
+                 std::uint32_t out_ch, std::uint32_t k,
+                 std::span<const float> bias, std::uint32_t stride,
+                 std::uint32_t dilation, std::uint32_t pad,
+                 std::uint32_t groups, std::span<float> out);
+
+/**
+ * CUDA transposed (upsampling) 1D convolution (F32); device half of
+ * backend::conv1d_transpose. `out_len` from conv1d_transpose_out_len,
+ * weight is input-channel-first [in_ch][out_ch/groups][k]. Each thread
+ * gathers one output element (ix = (ox + pad - t*dilation) / stride
+ * when it divides). Scalar fallback on error; stub on non-CUDA builds.
+ */
+void conv1d_transpose_cuda(std::span<const float> in,
+                           std::uint32_t in_ch, std::uint32_t in_len,
+                           std::span<const float> weight,
+                           std::uint32_t out_ch, std::uint32_t k,
+                           std::span<const float> bias,
+                           std::uint32_t stride, std::uint32_t dilation,
+                           std::uint32_t pad, std::uint32_t groups,
+                           std::span<float> out);
+
+/**
+ * CUDA Snake activation in place (per-channel), device half of
+ * backend::snake1d: x += (1 / (alpha + eps)) * sin(alpha * x)^2, one
+ * thread per element. Scalar fallback on error; stub on non-CUDA builds.
+ */
+void snake1d_cuda(std::span<float> x, std::uint32_t ch,
+                  std::uint32_t len, std::span<const float> alpha,
+                  float eps = 1e-9f);
+
 }  // namespace locus::backend
