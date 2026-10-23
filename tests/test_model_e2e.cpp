@@ -302,31 +302,51 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
     REQUIRE(g.get_string("general.architecture") == "qwen2moe");
     auto model = locus::model::TransformerModel::load(g);
     auto tok = locus::tok::tokenizer_from_gguf(g);
-
-    auto cache = model.make_cache();
-    auto ws = model.make_workspace();
-    locus::kv::PagedKvCache::Seq seq;
-    std::vector<float> logits(model.hparams().n_vocab);
-    auto ids = tok->encode("Once upon a time", true);
-    for (auto id : ids) {
-        REQUIRE(cache.ensure_capacity(seq, 1));
-        model.forward(id, cache, seq, ws, logits);
-    }
-    for (int i = 0; i < 32; ++i) {
-        const auto next = locus::model::argmax(logits);
-        if (next == tok->eos_id()) {
-            break;
-        }
-        ids.push_back(next);
-        REQUIRE(cache.ensure_capacity(seq, 1));
-        model.forward(next, cache, seq, ws, logits);
-    }
-    cache.release(seq);
     const std::string golden =
         "Once upon a time, there was a little girl who loved to "
         "play with her dolls. She would spend hours dressing them "
         "up, brushing their hair, and playing with them. One";
-    REQUIRE(tok->decode(ids) == golden);
+    // The CPU path, and the Vulkan full GPU forward when a device is
+    // there (q/k/v biases and the gated shared expert on the GPU).
+    std::vector<const char*> backends = {"neon"};
+    if (locus::backend::find_backend("neon") == nullptr) {
+        backends = {"scalar"};
+    }
+    if (locus::backend::vulkan_backend_usable()) {
+        backends.push_back("vulkan");
+    }
+    for (const char* be : backends) {
+        model.use_backend(*locus::backend::find_backend(be));
+        // The GPU batch path declines this model (biases, gated shared
+        // expert, and Q5_0 experts lacking batched kernels), so vulkan
+        // runs the full GPU forward token by token, routing on the host.
+        if (std::string(be) == "vulkan") {
+            REQUIRE(locus::backend::vulkan_forward_supported(model));
+        }
+        {
+            INFO(be);
+            auto cache = model.make_cache();
+            auto ws = model.make_workspace();
+            locus::kv::PagedKvCache::Seq seq;
+            std::vector<float> logits(model.hparams().n_vocab);
+            auto ids = tok->encode("Once upon a time", true);
+            for (auto id : ids) {
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(id, cache, seq, ws, logits);
+            }
+            for (int i = 0; i < 32; ++i) {
+                const auto next = locus::model::argmax(logits);
+                if (next == tok->eos_id()) {
+                    break;
+                }
+                ids.push_back(next);
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(next, cache, seq, ws, logits);
+            }
+            cache.release(seq);
+            REQUIRE(tok->decode(ids) == golden);
+        }
+    }
 }
 
 // qwen3moe (Qwen3-Coder-30B-A3B-Instruct, unsloth Q4_K_M GGUF, 18.6GB:

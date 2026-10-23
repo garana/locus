@@ -192,6 +192,7 @@ if(Vulkan_FOUND)
             matmul_q6_k_small=matmul:TYPE_Q6K,BK16
             matmul_q4_k_id_small=matmul:TYPE_Q4K,MOE_ID,BK16
             matmul_q6_k_id_small=matmul:TYPE_Q6K,MOE_ID,BK16
+            silu_mul_sg=silu_mul:SIG_GATE
             moe_route_b=moe_route:BATCHED)
         # Limits shared with the host, read from their one definition.
         set(LOCUS_VK_LIMITS
