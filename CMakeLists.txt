@@ -35,6 +35,7 @@ add_library(locus
     src/locus/sys/features.cpp
     src/locus/sys/meminfo.cpp
     src/locus/model/arch.cpp
+    src/locus/model/deepseek41.cpp
     src/locus/model/grammar.cpp
     src/locus/model/transformer.cpp
     src/locus/model/moe_stats.cpp

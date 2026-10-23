@@ -62,6 +62,22 @@ struct ArchSpec {
                   kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq,
                   TransformerModel::Workspace& ws, std::uint32_t l,
                   std::uint32_t pos) = nullptr;
+
+    /**
+     * Optional whole-token forward (archs with hp.custom_layer whose
+     * residual state spans layers: deepseek41's hyper-connections):
+     * embeds `token` at seq's next position (seq.n_tokens), runs
+     * every layer and writes logits; the caller then advances seq.
+     * Full-model, single-stage only.
+     */
+    void (*forward)(const TransformerModel& m, tok::TokenId token,
+                    kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq,
+                    TransformerModel::Workspace& ws,
+                    std::span<float> logits) = nullptr;
+
+    /** Optional paged-cache layer count (0 / nullptr = n_layers):
+     * archs that keep extra per-position rows (deepseek41). */
+    std::uint32_t (*cache_layers)(const Hparams& hp) = nullptr;
 };
 
 /** @returns All implemented architectures. */
