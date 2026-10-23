@@ -849,24 +849,19 @@ TEST_CASE("qwen2moe gated shared expert scales only the shared "
     }
 }
 
-TEST_CASE("Layer::has_attn_extras flags any q/k/v bias or q/k norm",
+TEST_CASE("Layer::has_qkv_bias and has_qk_norm flag their extras",
           "[model]") {
     using Layer = locus::model::TransformerModel::Layer;
     const float w[4] = {1, 1, 1, 1};
-    REQUIRE_FALSE(Layer{}.has_attn_extras());  // llama / deepseek2
-    // Each extra alone must flag the layer: a backend that implements
-    // only the plain attention must not rely on pairs travelling
-    // together.
-    std::span<const float> Layer::*fields[] = {
-        &Layer::wq_bias, &Layer::wk_bias, &Layer::wv_bias,
-        &Layer::attn_q_norm, &Layer::attn_k_norm};
-    for (auto f : fields) {
+    REQUIRE_FALSE(Layer{}.has_qkv_bias());  // llama / deepseek2
+    REQUIRE_FALSE(Layer{}.has_qk_norm());
+    // Any one bias flags the layer.
+    for (auto f : {&Layer::wq_bias, &Layer::wk_bias, &Layer::wv_bias}) {
         Layer lay;
         lay.*f = w;
-        REQUIRE(lay.has_attn_extras());
+        REQUIRE(lay.has_qkv_bias());
     }
-    // The finer predicates GPU backends use: any bias, or the q/k
-    // norm pair (one norm alone is not a pair).
+    // The q/k norm is a pair: one norm alone is not one.
     Layer bias;
     bias.wv_bias = w;
     REQUIRE(bias.has_qkv_bias());
