@@ -53,6 +53,7 @@ add_executable(locus_tests
     test_vulkan_attn.cpp
     test_vulkan_moe.cpp
     test_vulkan_rope.cpp
+    test_vulkan_conv1d.cpp
     test_vulkan_fused_matvec.cpp
     test_vulkan_small_batch.cpp
     test_vulkan_prefill.cpp

@@ -1,0 +1,51 @@
+#version 450
+
+// 1D convolution (F32), cross-correlation (no kernel flip), grouped /
+// dilated / strided with zero padding. Matches cpu_ops conv1d; one
+// invocation per output element (oc, ox). Bias binding is always
+// present; has_bias gates the read.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer I { float inp[]; };
+layout(std430, binding = 1) readonly buffer W { float wt[]; };
+layout(std430, binding = 2) readonly buffer B { float bias[]; };
+layout(std430, binding = 3) writeonly buffer O { float outp[]; };
+
+layout(push_constant) uniform PC {
+    uint in_ch;
+    uint in_len;
+    uint out_ch;
+    uint out_len;
+    uint k;
+    uint stride;
+    uint dilation;
+    uint pad;
+    uint groups;
+    uint has_bias;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.out_ch * pc.out_len) {
+        return;
+    }
+    uint oc = gid / pc.out_len;
+    uint ox = gid % pc.out_len;
+    uint icg = pc.in_ch / pc.groups;   // in-channels per group
+    uint ocg = pc.out_ch / pc.groups;  // out-channels per group
+    uint ic0 = (oc / ocg) * icg;       // this group's first in-channel
+    float acc = pc.has_bias != 0u ? bias[oc] : 0.0;
+    int base = int(ox) * int(pc.stride) - int(pc.pad);
+    for (uint ci = 0u; ci < icg; ++ci) {
+        uint inrow = (ic0 + ci) * pc.in_len;
+        uint wrow = (oc * icg + ci) * pc.k;
+        for (uint t = 0u; t < pc.k; ++t) {
+            int ix = base + int(t) * int(pc.dilation);
+            if (ix >= 0 && ix < int(pc.in_len)) {
+                acc += wt[wrow + t] * inp[inrow + uint(ix)];
+            }
+        }
+    }
+    outp[oc * pc.out_len + ox] = acc;
+}

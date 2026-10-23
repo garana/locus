@@ -94,6 +94,11 @@ enum class Kernel {
     /** silu_mul scaled per row by sigmoid(logit) (qwen2moe's gated
      * shared expert). */
     kSiluMulSg,
+    /** Neural-codec decoder ops (generative media): 1D convolution,
+     * its transpose (upsample), and the SNAC Snake activation. */
+    kConv1d,
+    kConv1dTranspose,
+    kSnake1d,
     kCount_,
 };
 

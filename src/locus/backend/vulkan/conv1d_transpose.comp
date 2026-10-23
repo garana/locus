@@ -1,0 +1,61 @@
+#version 450
+
+// Transposed (upsampling) 1D convolution (F32). Matches cpu_ops
+// conv1d_transpose: the gather form of the scatter definition
+// out[ox] += in[ix] * w, where ox = ix*stride - pad + t*dilation, so
+// ix = (ox + pad - t*dilation)/stride when it divides evenly. Weight
+// is INPUT-channel first ([in_ch][out_ch/groups][k]), as PyTorch's
+// ConvTranspose1d. One invocation per output element (oc, ox).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer I { float inp[]; };
+layout(std430, binding = 1) readonly buffer W { float wt[]; };
+layout(std430, binding = 2) readonly buffer B { float bias[]; };
+layout(std430, binding = 3) writeonly buffer O { float outp[]; };
+
+layout(push_constant) uniform PC {
+    uint in_ch;
+    uint in_len;
+    uint out_ch;
+    uint out_len;
+    uint k;
+    uint stride;
+    uint dilation;
+    uint pad;
+    uint groups;
+    uint has_bias;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.out_ch * pc.out_len) {
+        return;
+    }
+    uint oc = gid / pc.out_len;
+    uint ox = gid % pc.out_len;
+    uint icg = pc.in_ch / pc.groups;   // in-channels per group
+    uint ocg = pc.out_ch / pc.groups;  // out-channels per group
+    uint g = oc / ocg;
+    uint ocl = oc % ocg;               // group-local output index
+    uint ic0 = g * icg;
+    float acc = pc.has_bias != 0u ? bias[oc] : 0.0;
+    for (uint t = 0u; t < pc.k; ++t) {
+        int num = int(ox) + int(pc.pad) - int(t) * int(pc.dilation);
+        // num >= 0 is checked before the modulo (as in the CPU
+        // reference), so the % is on a non-negative value.
+        if (num < 0 || (num % int(pc.stride)) != 0) {
+            continue;
+        }
+        int ix = num / int(pc.stride);
+        if (ix < 0 || ix >= int(pc.in_len)) {
+            continue;
+        }
+        for (uint ci = 0u; ci < icg; ++ci) {
+            float iv = inp[(ic0 + ci) * pc.in_len + uint(ix)];
+            float wv = wt[((ic0 + ci) * ocg + ocl) * pc.k + t];
+            acc += iv * wv;
+        }
+    }
+    outp[oc * pc.out_len + ox] = acc;
+}
