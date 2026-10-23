@@ -863,6 +863,7 @@ void dbrx_hparams(const gguf::GgufFile& g, const std::string& p,
     hp.n_expert_shared = 0;        // no shared expert
     hp.expert_weights_norm = true;  // DBRX renormalizes the top-k
     hp.norm_type = NormType::kLayerNorm;  // DBRX uses LayerNorm
+    hp.rope_neox = true;  // dbrx_attention ropes NEOX pairs
     hp.rms_eps =
         get_float(g, p + "attention.layer_norm_epsilon", 1e-5f);
     hp.kq_scale =

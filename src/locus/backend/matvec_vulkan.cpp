@@ -1262,12 +1262,28 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
 /** @returns true when every weight the GPU forward reads has a
  * matvec kernel (fused wkv_b goes through the F32-dequant path). */
 bool gpu_weights_ok(const model::TransformerModel& m) {
+    const auto& hp = m.hparams();
+    // The GPU forward dispatches rmsnorm only (no LayerNorm: dbrx).
+    if (hp.norm_type != model::NormType::kRmsNorm) {
+        return false;
+    }
+    const bool mla = hp.arch == model::Arch::kDeepseek2;
+    const std::uint64_t q_rows = std::uint64_t{hp.n_heads} * hp.head_dim;
+    const std::uint64_t kv_rows =
+        std::uint64_t{hp.n_kv_heads} * hp.head_dim;
     for (const auto& l : m.layers()) {
         // The full GPU forward implements the llama / deepseek2
         // attention plus per-head q/k norms (qwen3moe); q/k/v biases
         // (qwen2moe) and any other extra take the CPU path.
         if (l.has_qkv_bias() ||
             (l.has_attn_extras() && !l.has_qk_norm())) {
+            return false;
+        }
+        // Outside MLA it reads separate q, k and v projections of the
+        // GQA shapes; anything else (dbrx's fused qkv held in wq, wk
+        // and wv empty) is declined rather than admitted by omission.
+        if (!mla && (l.wq.rows != q_rows || l.wk.rows != kv_rows ||
+                     l.wv.rows != kv_rows)) {
             return false;
         }
         if (matvec_kernel(l.wo) == Kernel::kCount_) {
@@ -1291,6 +1307,10 @@ bool gpu_weights_ok(const model::TransformerModel& m) {
 }
 
 }  // namespace
+
+bool vulkan_forward_supported(const model::TransformerModel& m) {
+    return gpu_weights_ok(m);
+}
 
 bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     kv::PagedKvCache& cache,
