@@ -164,6 +164,87 @@ struct State {
     ~State() {
         pool.report();
         ctx.report_profile();
+        // Free every GPU buffer while ctx (and its VkDevice) is still
+        // alive: ctx is the first member, so it is destroyed last. The
+        // tools (locus-run / locus-server) keep this singleton for the
+        // whole process, so without this the device was destroyed with
+        // buffers still live (VUID-vkDestroyDevice-device-00378, i#124).
+        free_buffers();
+    }
+
+    /**
+     * Destroys every GPU buffer this owns (weight pool, KV pools,
+     * activation and chunk scratch, buffers retired mid-batch, and the
+     * IQ grid tables), leaving ctx untouched. Called both to reset
+     * between models in a multi-model process and from ~State to tear
+     * the buffers down before ctx destroys the VkDevice.
+     */
+    void free_buffers() {
+        // Weight pool: every model's weights are uploaded once and kept
+        // resident (unbounded by default) -- the unbounded accumulator
+        // across a multi-model test process. Free them all.
+        for (auto& [ptr, e] : pool.map_) {
+            pool.destroy(e.buf);
+        }
+        pool.map_.clear();
+        for (auto& b : pool.transient_) {
+            pool.destroy(b);
+        }
+        pool.transient_.clear();
+        pool.used_ = 0;
+        // GPU-mapped KV pools: one per cache, never freed otherwise.
+        for (auto& [map, buf] : kv_pools) {
+            ctx.destroy_buffer(buf);
+        }
+        kv_pools.clear();
+        moe_gpu_fits.clear();
+        // Buffers retired by grow() mid-batch; end_batch frees these,
+        // but free them here too in case a batch never closed.
+        for (auto b : retired) {
+            ctx.destroy_buffer(b);
+        }
+        retired.clear();
+        // Activation scratch: bounded, but release it too so a large
+        // model's buffers are not held across the rest of the run; each
+        // regrows on next use.
+        auto drop = [&](VulkanContext::Buffer& b, std::size_t& cap) {
+            if (cap != 0) {
+                ctx.destroy_buffer(b);
+                b = VulkanContext::Buffer{};
+                cap = 0;
+            }
+        };
+        drop(x, x_n);
+        drop(xb, xb_n);
+        drop(q, q_n);
+        drop(gate, gate_n);
+        drop(up, up_n);
+        drop(attout, attout_n);
+        drop(att, att_n);
+        drop(logits, logits_n);
+        drop(table, table_n);
+        drop(ones, ones_n);
+        drop(kv_a, kv_a_n);
+        drop(q_abs, q_abs_n);
+        drop(latent, latent_n);
+        drop(q_a, q_a_n);
+        drop(router, router_n);
+        drop(route, route_n);
+        drop(attn_part, attn_part_n);
+        for (int c = 0; c < kChunkCount_; ++c) {
+            drop(chunk[c], chunk_n[c]);
+        }
+        // IQ grid+signs tables: uploaded once, resident; re-created
+        // lazily after a reset (the ready flag drives grid_table).
+        auto drop_tbl = [&](VulkanContext::Buffer& b, bool& ready) {
+            if (ready) {
+                ctx.destroy_buffer(b);
+                b = VulkanContext::Buffer{};
+                ready = false;
+            }
+        };
+        drop_tbl(iq2xxs_tbl, iq2xxs_tbl_ready);
+        drop_tbl(iq3xxs_tbl, iq3xxs_tbl_ready);
     }
 
     /** Activation buffers, sized on first use per model dims. */
@@ -1088,57 +1169,7 @@ float* vulkan_alloc_kv(std::size_t n_floats) {
     return static_cast<float*>(map);
 }
 
-void vulkan_reset_state() {
-    State& s = state();
-    // Weight pool: every model's weights are uploaded once and kept
-    // resident (unbounded by default) -- the unbounded accumulator
-    // across a multi-model test process. Free them all.
-    for (auto& [ptr, e] : s.pool.map_) {
-        s.pool.destroy(e.buf);
-    }
-    s.pool.map_.clear();
-    for (auto& b : s.pool.transient_) {
-        s.pool.destroy(b);
-    }
-    s.pool.transient_.clear();
-    s.pool.used_ = 0;
-    // GPU-mapped KV pools: one per cache, never freed otherwise.
-    for (auto& [map, buf] : s.kv_pools) {
-        s.ctx.destroy_buffer(buf);
-    }
-    s.kv_pools.clear();
-    s.moe_gpu_fits.clear();
-    // Activation scratch: bounded, but release it too so a large
-    // model's buffers are not held across the rest of the run; each
-    // regrows on next use.
-    auto drop = [&](VulkanContext::Buffer& b, std::size_t& cap) {
-        if (cap != 0) {
-            s.ctx.destroy_buffer(b);
-            b = VulkanContext::Buffer{};
-            cap = 0;
-        }
-    };
-    drop(s.x, s.x_n);
-    drop(s.xb, s.xb_n);
-    drop(s.q, s.q_n);
-    drop(s.gate, s.gate_n);
-    drop(s.up, s.up_n);
-    drop(s.attout, s.attout_n);
-    drop(s.att, s.att_n);
-    drop(s.logits, s.logits_n);
-    drop(s.table, s.table_n);
-    drop(s.ones, s.ones_n);
-    drop(s.kv_a, s.kv_a_n);
-    drop(s.q_abs, s.q_abs_n);
-    drop(s.latent, s.latent_n);
-    drop(s.q_a, s.q_a_n);
-    drop(s.router, s.router_n);
-    drop(s.route, s.route_n);
-    drop(s.attn_part, s.attn_part_n);
-    for (int c = 0; c < State::kChunkCount_; ++c) {
-        drop(s.chunk[c], s.chunk_n[c]);
-    }
-}
+void vulkan_reset_state() { state().free_buffers(); }
 
 void matvec_vulkan(const Mat& w, std::span<const float> x,
                    std::span<float> out) {
