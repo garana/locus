@@ -86,6 +86,11 @@ enum class Kernel {
     /** Batched (route-id / slot-sum) Q4_K and Q6_K matvecs. */
     kMatvecQ4_KB,
     kMatvecQ6_KB,
+    /** K-quant prefill matmuls (dense and MoE expert-id). */
+    kMatmulQ4_K,
+    kMatmulQ6_K,
+    kMatmulQ4_KId,
+    kMatmulQ6_KId,
     kCount_,
 };
 

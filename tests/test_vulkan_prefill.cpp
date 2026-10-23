@@ -69,6 +69,32 @@ std::vector<std::byte> random_q8(std::uint32_t rows, std::uint32_t cols,
     return w;
 }
 
+/**
+ * Random K-quant bytes for rows x cols: random quants and scales,
+ * the f16 d (at d_off in each block, dmin after it for Q4_K) pinned
+ * to a sane magnitude.
+ */
+std::vector<std::byte> random_kq(locus::gguf::TensorType type,
+                                 std::uint32_t rows, std::uint32_t cols,
+                                 std::mt19937& rng) {
+    const bool q4 = type == locus::gguf::TensorType::kQ4_K;
+    const std::size_t block = q4 ? 144 : 210, d_off = q4 ? 0 : 208;
+    std::uniform_int_distribution<int> bd(0, 255);
+    std::vector<std::byte> w(std::size_t{rows} * (cols / 256) * block);
+    for (auto& b : w) {
+        b = static_cast<std::byte>(bd(rng));
+    }
+    for (std::size_t at = d_off; at < w.size(); at += block) {
+        const std::uint16_t d = locus::backend::f32_to_f16(0.01f);
+        std::memcpy(&w[at], &d, 2);
+        if (q4) {
+            const std::uint16_t dmin = locus::backend::f32_to_f16(0.005f);
+            std::memcpy(&w[at + 2], &dmin, 2);
+        }
+    }
+    return w;
+}
+
 std::vector<float> random_f32(std::size_t n, std::mt19937& rng) {
     std::uniform_real_distribution<float> d(-1.0f, 1.0f);
     std::vector<float> v(n);
@@ -133,6 +159,10 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
          Kernel::kMatmulQ8_0H, 96, 2e-2f},
         {"f32 f16 staging", locus::gguf::TensorType::kF32,
          Kernel::kMatmulF32H, 80, 2e-2f},
+        {"q4_k", locus::gguf::TensorType::kQ4_K, Kernel::kMatmulQ4_K, 512,
+         1e-3f},
+        {"q6_k", locus::gguf::TensorType::kQ6_K, Kernel::kMatmulQ6_K, 512,
+         1e-3f},
     };
     const std::uint32_t rows = 100, n_tok = 70, n_batch = 3;
     const std::uint32_t x_stride = 300, out_stride = 333;
@@ -144,20 +174,28 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
         }
         DYNAMIC_SECTION(c.name) {
             const bool q8 = c.type == locus::gguf::TensorType::kQ8_0;
-            const std::size_t mat_bytes =
-                q8 ? std::size_t{rows} * (c.cols / 32) * 34
-                   : std::size_t{rows} * c.cols * 4;
+            const bool kq = c.type == locus::gguf::TensorType::kQ4_K ||
+                            c.type == locus::gguf::TensorType::kQ6_K;
             std::vector<std::byte> w;
             if (q8) {
                 w = random_q8(rows * n_batch, c.cols, rng);
+            } else if (kq) {
+                w = random_kq(c.type, rows * n_batch, c.cols, rng);
             } else {
                 auto f = random_f32(std::size_t{rows} * c.cols * n_batch,
                                     rng);
                 w.resize(f.size() * 4);
                 std::memcpy(w.data(), f.data(), w.size());
             }
+            // Q6_K's odd 210-byte super-blocks start off word
+            // alignment, exercising the shader's funnel reads.
+            const std::size_t mat_bytes = w.size() / n_batch;
+            // Rows overlap when cols > x_stride (the K-quants); the
+            // last one still ends inside x.
             const auto x = random_f32(
-                std::size_t{n_tok} * x_stride + n_batch * x_bstride, rng);
+                std::size_t{n_tok} * x_stride + n_batch * x_bstride +
+                    c.cols,
+                rng);
             const auto init = random_f32(
                 std::size_t{n_tok} * out_stride + n_batch * out_bstride,
                 rng);
@@ -168,7 +206,7 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
                 auto ob = upload(ctx, init);
                 const std::uint32_t tiles = (n_tok + 63) / 64;
                 const std::uint32_t w_bstride = static_cast<std::uint32_t>(
-                    q8 ? mat_bytes : mat_bytes / 4);
+                    q8 || kq ? mat_bytes : mat_bytes / 4);
                 ctx.begin_batch();
                 const VulkanContext::Buffer bufs[] = {wb, xb, ob};
                 const std::uint32_t push[] = {

@@ -8,6 +8,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan_forward.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -407,8 +408,9 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
         }
         // Batched prefill (per-head q/k norm and NEOX rope over a
         // chunk's rows) ingesting the longer prompt, then decode. On
-        // vulkan this still degrades to per-token decode: the batch
-        // path needs an expert id-matmul, which Q4_K / Q6_K lack.
+        // vulkan the GPU batch path itself must take the chunk (Q4_K /
+        // Q6_K matmuls and expert id-matmuls), not the per-token
+        // fallback forward_batch would quietly use.
         if (model.supports_batch_prefill()) {
             const Golden& gd = goldens[1];
             INFO(be << " batched prefill: " << gd.prompt);
@@ -419,7 +421,12 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
             const auto ids = tok->encode(gd.prompt, true);
             REQUIRE(cache.ensure_capacity(
                 seq, static_cast<std::uint32_t>(ids.size())));
-            model.forward_batch(ids, cache, seq, ws, logits);
+            if (std::string(be) == "vulkan") {
+                REQUIRE(locus::backend::vulkan_forward_batch(
+                    model, ids, cache, seq, logits, false));
+            } else {
+                model.forward_batch(ids, cache, seq, ws, logits);
+            }
             std::vector<locus::tok::TokenId> gen;
             for (int i = 0; i < 24; ++i) {
                 const auto next = locus::model::argmax(logits);

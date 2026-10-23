@@ -184,6 +184,14 @@ if(Vulkan_FOUND)
             rope_neox_b=rope:BATCHED,NEOX
             matvec_q4_k_b=matvec_q4_k:BATCHED
             matvec_q6_k_b=matvec_q6_k:BATCHED
+            matmul_q4_k=matmul:TYPE_Q4K
+            matmul_q6_k=matmul:TYPE_Q6K
+            matmul_q4_k_id=matmul:TYPE_Q4K,MOE_ID
+            matmul_q6_k_id=matmul:TYPE_Q6K,MOE_ID
+            matmul_q4_k_small=matmul:TYPE_Q4K,BK16
+            matmul_q6_k_small=matmul:TYPE_Q6K,BK16
+            matmul_q4_k_id_small=matmul:TYPE_Q4K,MOE_ID,BK16
+            matmul_q6_k_id_small=matmul:TYPE_Q6K,MOE_ID,BK16
             moe_route_b=moe_route:BATCHED)
         # Limits shared with the host, read from their one definition.
         set(LOCUS_VK_LIMITS
