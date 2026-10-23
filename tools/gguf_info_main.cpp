@@ -22,6 +22,7 @@ const char* type_name(TensorType t) {
     switch (t) {
         case TensorType::kF32: return "F32";
         case TensorType::kF16: return "F16";
+        case TensorType::kBF16: return "BF16";
         case TensorType::kQ4_0: return "Q4_0";
         case TensorType::kQ4_1: return "Q4_1";
         case TensorType::kQ5_0: return "Q5_0";

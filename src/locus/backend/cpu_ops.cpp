@@ -1,6 +1,7 @@
 #include "locus/backend/cpu_ops.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -38,6 +39,19 @@ float dot_f16(const std::byte* row, std::span<const float> x) {
     float acc = 0.0f;
     for (std::size_t i = 0; i < x.size(); ++i) {
         acc += f16_to_f32(load_u16(row + 2 * i)) * x[i];
+    }
+    return acc;
+}
+
+/** @returns The float whose high 16 bits are the bfloat16 `h`. */
+float bf16_to_f32(std::uint16_t h) {
+    return std::bit_cast<float>(static_cast<std::uint32_t>(h) << 16);
+}
+
+float dot_bf16(const std::byte* row, std::span<const float> x) {
+    float acc = 0.0f;
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        acc += bf16_to_f32(load_u16(row + 2 * i)) * x[i];
     }
     return acc;
 }
@@ -1586,7 +1600,8 @@ float dot_k_quant(const Mat& w, const std::byte* row,
 std::size_t row_bytes(const Mat& w) {
     switch (w.type) {
         case gguf::TensorType::kF32: return w.cols * 4ull;
-        case gguf::TensorType::kF16: return w.cols * 2ull;
+        case gguf::TensorType::kF16:
+        case gguf::TensorType::kBF16: return w.cols * 2ull;
         case gguf::TensorType::kQ8_0:
             return w.cols / 32ull * kQ8_0BlockBytes;
         case gguf::TensorType::kQ4_0:
@@ -1919,6 +1934,9 @@ void matvec(const Mat& w, std::span<const float> x,
             case gguf::TensorType::kF16:
                 out[r] = dot_f16(row, x);
                 break;
+            case gguf::TensorType::kBF16:
+                out[r] = dot_bf16(row, x);
+                break;
             case gguf::TensorType::kQ8_0:
                 out[r] = dot_q8_0(row, x);
                 break;
@@ -2067,6 +2085,9 @@ void matvec_batch_scalar(const Mat& w, std::span<const float> x_batch,
                 case gguf::TensorType::kF16:
                     o[t] = dot_f16(row, x);
                     break;
+                case gguf::TensorType::kBF16:
+                    o[t] = dot_bf16(row, x);
+                    break;
                 case gguf::TensorType::kQ8_0:
                     o[t] = dot_q8_0(row, x);
                     break;
@@ -2098,6 +2119,11 @@ void dequant_row(const Mat& w, std::uint32_t row,
         case gguf::TensorType::kF16:
             for (std::uint32_t i = 0; i < w.cols; ++i) {
                 out[i] = f16_to_f32(load_u16(p + 2 * i));
+            }
+            break;
+        case gguf::TensorType::kBF16:
+            for (std::uint32_t i = 0; i < w.cols; ++i) {
+                out[i] = bf16_to_f32(load_u16(p + 2 * i));
             }
             break;
         case gguf::TensorType::kQ8_0:
