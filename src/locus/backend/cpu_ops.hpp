@@ -203,4 +203,80 @@ inline Mat mat_rows(const Mat& w, std::uint32_t row0,
     return s;
 }
 
+/**
+ * @returns The output length conv1d produces for these shape
+ *     parameters: (in_len + 2*pad - dilation*(k - 1) - 1) / stride + 1.
+ *     The one definition callers and the GPU variants share, so a
+ *     caller's `out` buffer cannot disagree with the kernel. Domain:
+ *     in_len >= 1, k >= 1, stride >= 1, and in_len + 2*pad >= the tap
+ *     span dilation*(k - 1) + 1.
+ */
+std::uint32_t conv1d_out_len(std::uint32_t in_len, std::uint32_t k,
+                             std::uint32_t stride,
+                             std::uint32_t dilation, std::uint32_t pad);
+
+/**
+ * @returns The output length conv1d_transpose produces:
+ *     (in_len - 1) * stride - 2*pad + dilation*(k - 1) + 1 (no
+ *     output_padding). Domain: in_len >= 1, k >= 1, stride >= 1.
+ */
+std::uint32_t conv1d_transpose_out_len(std::uint32_t in_len,
+                                       std::uint32_t k,
+                                       std::uint32_t stride,
+                                       std::uint32_t dilation,
+                                       std::uint32_t pad);
+
+/**
+ * 1D convolution (F32), the building block of neural-codec decoders.
+ * Channels-major, row-major: `in` is [in_ch][in_len], `weight` is
+ * [out_ch][in_ch/groups][k], `bias` is [out_ch] or empty, `out` is
+ * [out_ch][out_len] with
+ *   out_len = (in_len + 2*pad - dilation*(k - 1) - 1) / stride + 1.
+ * `groups` partitions channels: groups == in_ch is depthwise,
+ * groups == 1 is dense; in_ch and out_ch must both divide by groups.
+ *
+ * @param in Input, in_ch * in_len floats.
+ * @param in_ch Input channels.
+ * @param in_len Input length.
+ * @param weight Filters, out_ch * (in_ch / groups) * k floats.
+ * @param out_ch Output channels.
+ * @param k Kernel width.
+ * @param bias Per-output-channel bias (out_ch), or empty for none.
+ * @param stride Output stride.
+ * @param dilation Spacing between kernel taps.
+ * @param pad Zero padding added to both ends of the input.
+ * @param groups Channel groups.
+ * @param out Output, out_ch * out_len floats.
+ */
+void conv1d(std::span<const float> in, std::uint32_t in_ch,
+            std::uint32_t in_len, std::span<const float> weight,
+            std::uint32_t out_ch, std::uint32_t k,
+            std::span<const float> bias, std::uint32_t stride,
+            std::uint32_t dilation, std::uint32_t pad,
+            std::uint32_t groups, std::span<float> out);
+
+/**
+ * Transposed (upsampling) 1D convolution (F32). Channels-major: `in`
+ * is [in_ch][in_len], `weight` is [in_ch][out_ch/groups][k], `bias` is
+ * [out_ch] or empty, `out` is [out_ch][out_len] with
+ *   out_len = (in_len - 1) * stride - 2*pad + dilation*(k - 1) + 1.
+ * No output_padding (the SNAC decoder upsamples with k = 2*stride and
+ * even stride, so length scales by exactly stride at pad = (k-stride)/2).
+ */
+void conv1d_transpose(std::span<const float> in, std::uint32_t in_ch,
+                      std::uint32_t in_len,
+                      std::span<const float> weight,
+                      std::uint32_t out_ch, std::uint32_t k,
+                      std::span<const float> bias, std::uint32_t stride,
+                      std::uint32_t dilation, std::uint32_t pad,
+                      std::uint32_t groups, std::span<float> out);
+
+/**
+ * Snake activation in place (per-channel, F32), the SNAC codec's
+ * nonlinearity: x += (1 / (alpha + eps)) * sin(alpha * x)^2, with one
+ * learnable alpha per channel. `x` is [ch][len], `alpha` is [ch].
+ */
+void snake1d(std::span<float> x, std::uint32_t ch, std::uint32_t len,
+             std::span<const float> alpha, float eps = 1e-9f);
+
 }  // namespace locus::backend

@@ -2157,4 +2157,137 @@ void dequant_row(const Mat& w, std::uint32_t row,
     }
 }
 
+std::uint32_t conv1d_out_len(std::uint32_t in_len, std::uint32_t k,
+                             std::uint32_t stride,
+                             std::uint32_t dilation, std::uint32_t pad) {
+    // Cast before the subtraction so k == 0 / in_len == 0 go negative
+    // rather than wrapping in uint32; floor (not truncate) at 0 so a
+    // kernel wider than the padded input yields 0, not 1.
+    const std::int64_t taps = static_cast<std::int64_t>(dilation) *
+                                  (static_cast<std::int64_t>(k) - 1) +
+                              1;
+    const std::int64_t num = static_cast<std::int64_t>(in_len) +
+                             2 * static_cast<std::int64_t>(pad) - taps;
+    return num < 0 ? 0u
+                   : static_cast<std::uint32_t>(
+                         num / static_cast<std::int64_t>(stride) + 1);
+}
+
+std::uint32_t conv1d_transpose_out_len(std::uint32_t in_len,
+                                       std::uint32_t k,
+                                       std::uint32_t stride,
+                                       std::uint32_t dilation,
+                                       std::uint32_t pad) {
+    const std::int64_t len =
+        (static_cast<std::int64_t>(in_len) - 1) *
+            static_cast<std::int64_t>(stride) -
+        2 * static_cast<std::int64_t>(pad) +
+        static_cast<std::int64_t>(dilation) *
+            (static_cast<std::int64_t>(k) - 1) +
+        1;
+    return len < 0 ? 0u : static_cast<std::uint32_t>(len);
+}
+
+void conv1d(std::span<const float> in, std::uint32_t in_ch,
+            std::uint32_t in_len, std::span<const float> weight,
+            std::uint32_t out_ch, std::uint32_t k,
+            std::span<const float> bias, std::uint32_t stride,
+            std::uint32_t dilation, std::uint32_t pad,
+            std::uint32_t groups, std::span<float> out) {
+    assert(groups != 0 && in_ch % groups == 0 && out_ch % groups == 0);
+    const std::uint32_t icg = in_ch / groups;   // in-channels per group
+    const std::uint32_t ocg = out_ch / groups;  // out-channels per group
+    const std::uint32_t out_len =
+        conv1d_out_len(in_len, k, stride, dilation, pad);
+    assert(in.size() == std::size_t{in_ch} * in_len);
+    assert(weight.size() == std::size_t{out_ch} * icg * k);
+    assert(bias.empty() || bias.size() == out_ch);
+    assert(out.size() == std::size_t{out_ch} * out_len);
+    for (std::uint32_t oc = 0; oc < out_ch; ++oc) {
+        const std::uint32_t ic0 = (oc / ocg) * icg;  // group's first in-ch
+        for (std::uint32_t ox = 0; ox < out_len; ++ox) {
+            float acc = bias.empty() ? 0.0f : bias[oc];
+            const std::int64_t base =
+                static_cast<std::int64_t>(ox) * stride - pad;
+            for (std::uint32_t ci = 0; ci < icg; ++ci) {
+                const float* inrow = &in[std::size_t{ic0 + ci} * in_len];
+                const float* wrow =
+                    &weight[(std::size_t{oc} * icg + ci) * k];
+                for (std::uint32_t t = 0; t < k; ++t) {
+                    const std::int64_t ix =
+                        base + static_cast<std::int64_t>(t) * dilation;
+                    if (ix >= 0 && ix < in_len) {
+                        acc += wrow[t] * inrow[ix];
+                    }
+                }
+            }
+            out[std::size_t{oc} * out_len + ox] = acc;
+        }
+    }
+}
+
+void conv1d_transpose(std::span<const float> in, std::uint32_t in_ch,
+                      std::uint32_t in_len,
+                      std::span<const float> weight,
+                      std::uint32_t out_ch, std::uint32_t k,
+                      std::span<const float> bias, std::uint32_t stride,
+                      std::uint32_t dilation, std::uint32_t pad,
+                      std::uint32_t groups, std::span<float> out) {
+    assert(groups != 0 && in_ch % groups == 0 && out_ch % groups == 0);
+    const std::uint32_t icg = in_ch / groups;   // in-channels per group
+    const std::uint32_t ocg = out_ch / groups;  // out-channels per group
+    const std::int64_t out_len =
+        conv1d_transpose_out_len(in_len, k, stride, dilation, pad);
+    assert(in.size() == std::size_t{in_ch} * in_len);
+    assert(weight.size() == std::size_t{in_ch} * ocg * k);
+    assert(bias.empty() || bias.size() == out_ch);
+    assert(out.size() == std::size_t{out_ch} * static_cast<std::size_t>(out_len));
+    for (std::uint32_t oc = 0; oc < out_ch; ++oc) {
+        const std::uint32_t g = oc / ocg;        // this oc's group
+        const std::uint32_t ocl = oc % ocg;      // its index in the group
+        const std::uint32_t ic0 = g * icg;       // group's first in-ch
+        for (std::int64_t ox = 0; ox < out_len; ++ox) {
+            float acc = bias.empty() ? 0.0f : bias[oc];
+            for (std::uint32_t t = 0; t < k; ++t) {
+                // ox = ix*stride - pad + t*dilation  =>  ix = (ox + pad
+                // - t*dilation) / stride, when that divides evenly.
+                const std::int64_t num =
+                    ox + pad - static_cast<std::int64_t>(t) * dilation;
+                if (num < 0 || num % stride != 0) {
+                    continue;
+                }
+                const std::int64_t ix = num / stride;
+                if (ix < 0 || ix >= in_len) {
+                    continue;
+                }
+                for (std::uint32_t ci = 0; ci < icg; ++ci) {
+                    const float inv = in[std::size_t{ic0 + ci} * in_len +
+                                         static_cast<std::size_t>(ix)];
+                    const float wv =
+                        weight[((std::size_t{ic0 + ci} * ocg) + ocl) * k +
+                               t];
+                    acc += inv * wv;
+                }
+            }
+            out[std::size_t{oc} * static_cast<std::size_t>(out_len) +
+                static_cast<std::size_t>(ox)] = acc;
+        }
+    }
+}
+
+void snake1d(std::span<float> x, std::uint32_t ch, std::uint32_t len,
+             std::span<const float> alpha, float eps) {
+    assert(x.size() == std::size_t{ch} * len);
+    assert(alpha.size() == ch);
+    for (std::uint32_t c = 0; c < ch; ++c) {
+        const float a = alpha[c];
+        const float inv = 1.0f / (a + eps);
+        float* row = &x[std::size_t{c} * len];
+        for (std::uint32_t i = 0; i < len; ++i) {
+            const float s = std::sin(a * row[i]);
+            row[i] += inv * s * s;
+        }
+    }
+}
+
 }  // namespace locus::backend
