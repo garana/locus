@@ -1,0 +1,60 @@
+Summarize the following design notes:
+
+# locus MVP Design
+
+Status: draft v1 (2026-07-17)
+
+## 1. The gap
+
+No pure C/C++ project today combines:
+
+- vendor-neutral GPU support (not NVIDIA-locked),
+- token/block-level paged KV cache,
+- continuous (iteration-level) batching,
+- a production serving front end,
+- a minimal, auditable dependency surface.
+
+llama.cpp has the portability and dependency discipline but not the
+high-concurrency scheduler; TensorRT-LLM has the scheduler but is
+NVIDIA-only with a heavy Python toolchain; LightLLM/vLLM/SGLang have
+both but sit on a large Python package ecosystem (supply-chain risk).
+
+locus targets that intersection: llama.cpp's footprint with a
+LightLLM-class serving core. See docs/COMPARISON.md for the
+engine-by-engine landscape, including AirLLM -- the closest neighbor
+on the bigger-than-RAM streaming thesis (it streams layers too, but
+one sequence at a time with no batching, so it is I/O-bound; locus
+amortizes the same streaming across a batch).
+
+## 2. MVP thesis
+
+The differentiating components are the KV-cache manager, the
+scheduler, and the batch executor -- not the kernels. Kernels are
+commodity and swappable. Therefore the MVP:
+
+1. Builds the serving core (paged KV, continuous batching) first,
+   against a simple CPU backend where paged attention is trivial to
+   implement correctly (a gather loop).
+2. Treats the compute backend as a narrow interface so a Vulkan
+   backend (vendor-neutral GPU) can be added without touching the
+   scheduler.
+3. Reuses the GGUF model format for ecosystem compatibility: every
+   quantized model published for llama.cpp becomes loadable here.
+
+Correctness first, single-node CPU throughput second, GPU third.
+
+## 3. Non-goals (MVP)
+
+- Training or fine-tuning.
+- Multi-node serving / tensor parallelism across hosts.
+- Non-Llama-family architectures (MoE, multimodal) before M5.
+- Python bindings.
+- Windows support (macOS + Linux only initially).
+
+## 4. Architecture
+
+    +------------------------------------------------------------+
+    | HTTP server (OpenAI-compatible, SSE streaming)         M4  |
+    +------------------------------------------------------------+
+    | Scheduler: admission, continuous batching, preemption  M3  |
+    +----
