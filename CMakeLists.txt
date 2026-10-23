@@ -37,6 +37,7 @@ add_library(locus
     src/locus/model/arch.cpp
     src/locus/model/codec.cpp
     src/locus/audio/snac.cpp
+    src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp
     src/locus/model/transformer.cpp
     src/locus/model/moe_stats.cpp

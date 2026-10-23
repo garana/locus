@@ -1,4 +1,5 @@
 #include "locus/audio/snac.hpp"
+#include "locus/audio/wav.hpp"
 
 #include <cmath>
 #include <filesystem>
@@ -87,4 +88,51 @@ TEST_CASE("snac decoder matches the reference waveform", "[snac][e2e]") {
     // for an actual graph difference.
     REQUIRE(max_abs < 1e-5);
     REQUIRE(rms < 1e-6);
+}
+
+namespace {
+
+std::uint32_t le32(const std::vector<std::byte>& b, std::size_t off) {
+    std::uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) {
+        v |= std::uint32_t(std::to_integer<unsigned>(b[off + i])) <<
+             (8 * i);
+    }
+    return v;
+}
+
+std::int16_t le16(const std::vector<std::byte>& b, std::size_t off) {
+    return static_cast<std::int16_t>(
+        std::to_integer<unsigned>(b[off]) |
+        (std::to_integer<unsigned>(b[off + 1]) << 8));
+}
+
+}  // namespace
+
+TEST_CASE("pcm encode writes a WAV header and clamped s16", "[wav]") {
+    const std::vector<float> s = {0.0f, 1.0f, -1.0f, 0.5f, 2.0f};
+    const auto wav =
+        locus::audio::encode_pcm(s, 24000, locus::audio::WaveFormat::kWav);
+
+    REQUIRE(wav.size() == 44 + s.size() * 2);
+    REQUIRE(std::memcmp(wav.data(), "RIFF", 4) == 0);
+    REQUIRE(std::memcmp(wav.data() + 8, "WAVE", 4) == 0);
+    REQUIRE(std::memcmp(wav.data() + 36, "data", 4) == 0);
+    REQUIRE(le32(wav, 4) == 36 + s.size() * 2);   // RIFF chunk size.
+    REQUIRE(le16(wav, 20) == 1);                   // PCM.
+    REQUIRE(le16(wav, 22) == 1);                   // mono.
+    REQUIRE(le32(wav, 24) == 24000);               // sample rate.
+    REQUIRE(le16(wav, 34) == 16);                  // bits/sample.
+    REQUIRE(le32(wav, 40) == s.size() * 2);        // data bytes.
+
+    REQUIRE(le16(wav, 44) == 0);                    // 0.0
+    REQUIRE(le16(wav, 46) == 32767);                // 1.0
+    REQUIRE(le16(wav, 48) == -32767);               // -1.0
+    REQUIRE(le16(wav, 50) == 16384);                // 0.5 -> round
+    REQUIRE(le16(wav, 52) == 32767);                // 2.0 clamped
+
+    const auto pcm = locus::audio::encode_pcm(
+        s, 24000, locus::audio::WaveFormat::kPcm16);
+    REQUIRE(pcm.size() == s.size() * 2);            // no header.
+    REQUIRE(le16(pcm, 2) == 32767);                 // same samples.
 }
