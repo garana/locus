@@ -970,6 +970,7 @@ TEST_CASE("vulkan_hparams_supported declines each hparam alone",
         h.norm_type = locus::model::NormType::kLayerNorm;
     }));
     REQUIRE_FALSE(with([](auto& h) { h.idx_top_k = 2048; }));  // glm
+    REQUIRE_FALSE(with([](auto& h) { h.custom_layer = true; }));  // muse
     REQUIRE_FALSE(with([](auto& h) { h.head_dim = 1024; }));
     // MLA: the latent rank must fit too; only MLA checks it.
     REQUIRE(with([](auto& h) { h.kv_lora_rank = 1024; }));

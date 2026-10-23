@@ -50,6 +50,18 @@ struct ArchSpec {
 
     /** @returns Paged-cache row width in floats. */
     std::uint32_t (*kv_dim)(const Hparams& hp);
+
+    /**
+     * Optional whole-layer body (archs with hp.custom_layer): runs
+     * layer l at pos on ws.x in place -- attention, FFN and both
+     * residuals -- instead of the shared norm / attention / FFN
+     * sequence. nullptr for every other arch.
+     */
+    void (*layer)(const TransformerModel& m,
+                  const TransformerModel::Layer& lay,
+                  kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq,
+                  TransformerModel::Workspace& ws, std::uint32_t l,
+                  std::uint32_t pos) = nullptr;
 };
 
 /** @returns All implemented architectures. */

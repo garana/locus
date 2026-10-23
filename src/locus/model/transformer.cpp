@@ -254,17 +254,21 @@ TransformerModel TransformerModel::load(const GgufFile& g,
         const bool moe_layer =
             hp.n_expert > 0 && l >= hp.n_dense_lead;
         if (moe_layer) {
+            // Experts read and write the latent width under a latent
+            // MoE (muse-spark); the router still reads the stream.
+            const std::uint32_t ew =
+                hp.moe_latent > 0 ? hp.moe_latent : hp.n_embd;
             lay.gate_inp = need_mat(g, bp + "ffn_gate_inp.weight",
                                     hp.n_embd, hp.n_expert);
             lay.gate_exps =
                 need_mat3(g, bp + "ffn_gate_exps.weight",
-                          hp.n_embd, hp.n_ff_exp, hp.n_expert);
+                          ew, hp.n_ff_exp, hp.n_expert);
             lay.up_exps =
                 need_mat3(g, bp + "ffn_up_exps.weight",
-                          hp.n_embd, hp.n_ff_exp, hp.n_expert);
+                          ew, hp.n_ff_exp, hp.n_expert);
             lay.down_exps =
                 need_mat3(g, bp + "ffn_down_exps.weight",
-                          hp.n_ff_exp, hp.n_embd, hp.n_expert);
+                          hp.n_ff_exp, ew, hp.n_expert);
             if (g.find_tensor(bp + "exp_probs_b.bias") !=
                 nullptr) {
                 lay.exp_probs_b = need_vec(
@@ -479,6 +483,20 @@ kv::PagedKvCache TransformerModel::make_cache(
     return kv::PagedKvCache(geom);
 }
 
+void TransformerModel::scale_logits(std::span<float> logits) const {
+    if (hp_.logit_scale != 1.0f) {
+        for (float& v : logits) {
+            v *= hp_.logit_scale;
+        }
+    }
+    if (hp_.final_logit_softcap > 0.0f) {
+        const float cap = hp_.final_logit_softcap;
+        for (float& v : logits) {
+            v = cap * std::tanh(v / cap);
+        }
+    }
+}
+
 void TransformerModel::forward(tok::TokenId token,
                          kv::PagedKvCache& cache,
                          kv::PagedKvCache::Seq& seq, Workspace& ws,
@@ -547,6 +565,9 @@ void TransformerModel::forward_layers(tok::TokenId token,
     if (first) {
         op.dequant_row(embd_, static_cast<std::uint32_t>(token),
                        ws.x);
+        if (hp_.embd_norm) {
+            backend::rmsnorm_unit(ws.x, hp_.rms_eps);
+        }
     } else {
         std::copy_n(hidden_in.data(), hp_.n_embd, ws.x.data());
     }
@@ -584,6 +605,10 @@ void TransformerModel::forward_layers(tok::TokenId token,
             }
         }
 
+        if (spec_->layer != nullptr) {
+            spec_->layer(*this, lay, cache, seq, ws, l, pos);
+            continue;
+        }
         apply_norm(ws.x, lay.attn_norm, hp_.rms_eps, ws.xb);
         spec_->attention(*this, lay, cache, seq, ws, l, pos);
         matvec_mt(op, lay.wo, ws.out, ws.xb2);
@@ -616,6 +641,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
         // consume the token (advance the sequence).
         apply_norm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
         matvec_mt(op, out_w_, ws.xb, out);
+        scale_logits(out);
         seq.n_tokens = pos + 1;
     } else {
         // Hand the residual stream to the next stage; the token is not
@@ -656,8 +682,9 @@ bool TransformerModel::supports_batch() const {
     // the per-token attention, so every CPU/CUDA arch (llama /
     // deepseek2 / glm-dsa, dense or MoE) is supported. The Vulkan
     // backend has its own full forward (vulkan_forward) that this
-    // CPU-driver path would bypass, so it opts out.
-    return backend_->name != "vulkan";
+    // CPU-driver path would bypass, so it opts out. Arches with their
+    // own layer body (hp.custom_layer) run single-token only.
+    return backend_->name != "vulkan" && !hp_.custom_layer;
 }
 
 bool TransformerModel::supports_batch_prefill() const {
