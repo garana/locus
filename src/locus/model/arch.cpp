@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include "locus/model/gguf_load.hpp"
@@ -986,6 +987,257 @@ void dbrx_attention(const TransformerModel& m,
     }
 }
 
+// Muse Spark (Meta; muse-spark). GQA attention with a sigmoid output
+// gate and a weightless per-head norm on its output; RoPE only on the
+// sliding-window layers (the others are NoPE and global); norm-
+// preserving residuals (stream * alpha + branch * beta) after
+// weightless post-branch norms; and a latent MoE: the router reads
+// the stream, the experts run in a moe_latent-wide space entered by
+// ffn_latent_down and left by ffn_latent_up. Mirrors llama.cpp's
+// llm_build_muse_spark graph.
+void muse_spark_hparams(const gguf::GgufFile& g, const std::string& p,
+                        Hparams& hp) {
+    hp.arch = Arch::kLlama;
+    hp.head_dim = static_cast<std::uint32_t>(
+        g.get_uint(p + "attention.key_length").value_or(0));
+    const auto vlen = g.get_uint(p + "attention.value_length");
+    if (hp.head_dim == 0 || (vlen && *vlen != hp.head_dim)) {
+        throw gguf::Error("muse-spark: unsupported key/value lengths");
+    }
+    if (hp.n_kv_heads == 0 || hp.n_heads % hp.n_kv_heads != 0) {
+        throw gguf::Error("invalid kv head configuration");
+    }
+    hp.n_ff_exp = static_cast<std::uint32_t>(
+        g.get_uint(p + "expert_feed_forward_length").value_or(0));
+    hp.moe_latent = static_cast<std::uint32_t>(
+        g.get_uint(p + "moe_latent_size").value_or(0));
+    if (hp.n_expert == 0 || hp.n_ff_exp == 0 || hp.moe_latent == 0) {
+        throw gguf::Error("muse-spark: missing latent MoE dims");
+    }
+    hp.n_expert_shared = 0;
+    hp.gating = static_cast<GatingFunc>(
+        g.get_uint(p + "expert_gating_func")
+            .value_or(static_cast<std::uint64_t>(GatingFunc::kSigmoid)));
+    hp.expert_weights_norm =
+        g.get_bool(p + "expert_weights_norm").value_or(true);
+    hp.expert_weights_scale =
+        get_float(g, p + "expert_weights_scale", 1.0f);
+    hp.post_norm_eps = get_float(g, p + "post_norm_epsilon", 1e-6f);
+    hp.logit_scale = get_float(g, p + "logit_scale", 1.0f);
+    hp.final_logit_softcap =
+        get_float(g, p + "final_logit_softcapping", 0.0f);
+    hp.swa_window = static_cast<std::uint32_t>(
+        g.get_uint(p + "attention.sliding_window").value_or(0));
+    hp.rope_freq_base_swa =
+        get_float(g, p + "rope.freq_base_swa", hp.rope_freq_base);
+    const auto* pat = g.get_array(p + "attention.sliding_window_pattern");
+    if (pat == nullptr || pat->size() != hp.n_layers ||
+        hp.swa_window == 0) {
+        throw gguf::Error("muse-spark: missing sliding-window layout");
+    }
+    hp.swa_layers.clear();
+    for (const auto& v : *pat) {
+        hp.swa_layers.push_back(v.b);
+    }
+    hp.embd_norm = true;
+    hp.custom_layer = true;
+    hp.kq_scale = 1.0f / std::sqrt(static_cast<float>(hp.head_dim));
+}
+
+void muse_spark_attention_tensors(const gguf::GgufFile& g,
+                                  const std::string& bp,
+                                  const Hparams& hp,
+                                  TransformerModel::Layer& lay) {
+    const std::uint32_t q_dim = hp.n_heads * hp.head_dim;
+    const std::uint32_t kv_dim = hp.n_kv_heads * hp.head_dim;
+    const std::uint32_t lat = hp.moe_latent;
+    lay.wq = need_mat(g, bp + "attn_q.weight", hp.n_embd, q_dim);
+    lay.wk = need_mat(g, bp + "attn_k.weight", hp.n_embd, kv_dim);
+    lay.wv = need_mat(g, bp + "attn_v.weight", hp.n_embd, kv_dim);
+    lay.wo = need_mat(g, bp + "attn_output.weight", q_dim, hp.n_embd);
+    lay.attn_gate = need_mat(g, bp + "attn_gate.weight", hp.n_embd, q_dim);
+    lay.attn_q_norm = need_vec(g, bp + "attn_q_norm.weight", hp.head_dim);
+    lay.attn_k_norm = need_vec(g, bp + "attn_k_norm.weight", hp.head_dim);
+    lay.attn_resid_alpha =
+        need_vec(g, bp + "attn_resid_alpha.weight", hp.n_embd);
+    lay.attn_resid_beta =
+        need_vec(g, bp + "attn_resid_beta.weight", hp.n_embd);
+    lay.ffn_resid_alpha =
+        need_vec(g, bp + "ffn_resid_alpha.weight", hp.n_embd);
+    lay.ffn_resid_beta =
+        need_vec(g, bp + "ffn_resid_beta.weight", hp.n_embd);
+    lay.post_ffw_norm = need_vec(g, bp + "post_ffw_norm.weight", hp.n_embd);
+    lay.ffn_latent_down =
+        need_mat(g, bp + "ffn_latent_down.weight", hp.n_embd, lat);
+    lay.ffn_latent_up =
+        need_mat(g, bp + "ffn_latent_up.weight", lat, hp.n_embd);
+    lay.ffn_pre_exp_norm = need_vec(g, bp + "ffn_pre_exp_norm.weight", lat);
+    lay.ffn_post_exp_norm =
+        need_vec(g, bp + "ffn_post_exp_norm.weight", lat);
+}
+
+/** Unused: muse-spark runs muse_spark_layer (hp.custom_layer turns
+ * off the batch paths that would call an attention hook alone). */
+void muse_spark_attention(const TransformerModel&,
+                          const TransformerModel::Layer&,
+                          kv::PagedKvCache&, kv::PagedKvCache::Seq&,
+                          TransformerModel::Workspace&, std::uint32_t,
+                          std::uint32_t) {
+    throw std::logic_error("muse-spark: attention runs in its layer body");
+}
+
+void muse_spark_layer(const TransformerModel& m,
+                      const TransformerModel::Layer& lay,
+                      kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq,
+                      TransformerModel::Workspace& ws, std::uint32_t l,
+                      std::uint32_t pos) {
+    using namespace locus::backend;
+    const Hparams& hp = m.hparams();
+    const Ops& op = m.active_backend().ops;
+    const std::uint32_t E = hp.n_embd;
+    const std::uint32_t hd = hp.head_dim;
+    const std::size_t q_dim = std::size_t{hp.n_heads} * hd;
+    const std::size_t kv_dim = std::size_t{hp.n_kv_heads} * hd;
+    const std::uint32_t group = hp.n_heads / hp.n_kv_heads;
+    const std::uint32_t lat = hp.moe_latent;
+    const bool swa = hp.swa_layers[l];
+    // Scratch beyond the shared workspace: gate logits, latent
+    // activation / expert output / accumulator.
+    thread_local std::vector<float> gate, lx, ly, lacc;
+    gate.resize(q_dim);
+    lx.resize(lat);
+    ly.resize(lat);
+    lacc.resize(lat);
+    auto head_norm = [&](std::span<float> x, std::uint32_t heads,
+                         std::span<const float> w) {
+        for (std::uint32_t h = 0; h < heads; ++h) {
+            std::span<float> xh = x.subspan(std::size_t{h} * hd, hd);
+            rmsnorm(xh, w, hp.rms_eps, xh);
+        }
+    };
+    auto rope = [&](std::span<float> x, std::uint32_t heads) {
+        if (swa) {  // the global layers are NoPE
+            rope_norm_yarn(x, heads, hd, pos, hp.rope_freq_base_swa,
+                           Yarn{});
+        }
+    };
+
+    // Attention.
+    rmsnorm(ws.x, lay.attn_norm, hp.rms_eps, ws.xb);
+    std::span<float> q(ws.q.data(), q_dim);
+    op.matvec(lay.wq, ws.xb, q);
+    op.matvec(lay.attn_gate, ws.xb, gate);
+    head_norm(q, hp.n_heads, lay.attn_q_norm);
+    rope(q, hp.n_heads);
+    std::vector<float> kbuf(kv_dim), vbuf(kv_dim);
+    op.matvec(lay.wk, ws.xb, kbuf);
+    op.matvec(lay.wv, ws.xb, vbuf);
+    head_norm(kbuf, hp.n_kv_heads, lay.attn_k_norm);
+    rope(kbuf, hp.n_kv_heads);
+    // Sliding-window layers see the last swa_window positions
+    // (llama.cpp's standard SWA mask: pos - t < window).
+    const std::uint32_t t0 =
+        swa && pos + 1 > hp.swa_window ? pos + 1 - hp.swa_window : 0;
+    const std::uint32_t n = pos + 1 - t0;
+    std::vector<float> kmat, vmat;
+    const float* kbase = nullptr;
+    const float* vbase = nullptr;
+    if (cache.quantized()) {
+        cache.store_row(seq, l, pos, false, kbuf);
+        cache.store_row(seq, l, pos, true, vbuf);
+        kmat.resize(n * kv_dim);
+        vmat.resize(n * kv_dim);
+        for (std::uint32_t t = t0; t <= pos; ++t) {
+            cache.load_row(seq, l, t, false,
+                           {kmat.data() + (t - t0) * kv_dim, kv_dim});
+            cache.load_row(seq, l, t, true,
+                           {vmat.data() + (t - t0) * kv_dim, kv_dim});
+        }
+        kbase = kmat.data();
+        vbase = vmat.data();
+    } else {
+        std::copy(kbuf.begin(), kbuf.end(), cache.k(seq, l, pos));
+        std::copy(vbuf.begin(), vbuf.end(), cache.v(seq, l, pos));
+    }
+    auto krow_at = [&](std::uint32_t t) -> const float* {
+        return kbase ? kbase + std::size_t{t - t0} * kv_dim
+                     : cache.k(seq, l, t);
+    };
+    auto vrow_at = [&](std::uint32_t t) -> const float* {
+        return vbase ? vbase + std::size_t{t - t0} * kv_dim
+                     : cache.v(seq, l, t);
+    };
+    for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
+        const float* qh = q.data() + std::size_t{h} * hd;
+        const std::size_t kvh = std::size_t{h / group} * hd;
+        std::span<float> att(ws.att.data(), n);
+        for (std::uint32_t t = t0; t <= pos; ++t) {
+            const float* kt = krow_at(t) + kvh;
+            float sc = 0.0f;
+            for (std::uint32_t i = 0; i < hd; ++i) {
+                sc += qh[i] * kt[i];
+            }
+            att[t - t0] = sc * hp.kq_scale;
+        }
+        softmax_inplace(att);
+        std::span<float> oh(ws.out.data() + std::size_t{h} * hd, hd);
+        std::fill(oh.begin(), oh.end(), 0.0f);
+        for (std::uint32_t t = t0; t <= pos; ++t) {
+            const float* vt = vrow_at(t) + kvh;
+            const float a = att[t - t0];
+            for (std::uint32_t i = 0; i < hd; ++i) {
+                oh[i] += a * vt[i];
+            }
+        }
+        // Weightless per-head norm, then the sigmoid output gate.
+        rmsnorm_unit(oh, hp.rms_eps);
+        for (std::uint32_t i = 0; i < hd; ++i) {
+            const float gl = gate[std::size_t{h} * hd + i];
+            oh[i] *= 1.0f / (1.0f + std::exp(-gl));
+        }
+    }
+    op.matvec(lay.wo, {ws.out.data(), q_dim}, ws.xb2);
+    rmsnorm_unit(ws.xb2, hp.post_norm_eps);
+    for (std::uint32_t i = 0; i < E; ++i) {
+        ws.x[i] = ws.x[i] * lay.attn_resid_alpha[i] +
+                  ws.xb2[i] * lay.attn_resid_beta[i];
+    }
+
+    // Latent MoE: route on the normed stream, run the experts in the
+    // latent space (each output scaled by post_exp_norm, then
+    // normalized), and project the weighted sum back.
+    rmsnorm(ws.x, lay.ffn_norm, hp.rms_eps, ws.xb);
+    op.matvec(lay.ffn_latent_down, ws.xb, lx);
+    rmsnorm(lx, lay.ffn_pre_exp_norm, hp.rms_eps, lx);
+    op.matvec(lay.gate_inp, ws.xb, ws.router);
+    const auto picked = moe_select(hp, lay, ws.router);
+    std::fill(lacc.begin(), lacc.end(), 0.0f);
+    const std::uint32_t ff = hp.n_ff_exp;
+    for (const auto& [e, wgt] : picked) {
+        op.matvec(lay.gate_exps.expert(e), lx, {ws.gate.data(), ff});
+        op.matvec(lay.up_exps.expert(e), lx, {ws.up.data(), ff});
+        silu_mul({ws.gate.data(), ff}, {ws.up.data(), ff},
+                 {ws.gate.data(), ff});
+        op.matvec(lay.down_exps.expert(e), {ws.gate.data(), ff}, ly);
+        for (std::uint32_t i = 0; i < lat; ++i) {
+            ly[i] *= lay.ffn_post_exp_norm[i];
+        }
+        rmsnorm_unit(ly, hp.post_norm_eps);
+        for (std::uint32_t i = 0; i < lat; ++i) {
+            lacc[i] += wgt * ly[i];
+        }
+    }
+    op.matvec(lay.ffn_latent_up, lacc, ws.xb2);
+    for (std::uint32_t i = 0; i < E; ++i) {
+        ws.xb2[i] *= lay.post_ffw_norm[i];
+    }
+    rmsnorm_unit(ws.xb2, hp.post_norm_eps);
+    for (std::uint32_t i = 0; i < E; ++i) {
+        ws.x[i] = ws.x[i] * lay.ffn_resid_alpha[i] +
+                  ws.xb2[i] * lay.ffn_resid_beta[i];
+    }
+}
+
 const ArchSpec kArchs[] = {
     {"llama",
      "Llama family (dense or Mixtral-style MoE, GQA)",
@@ -1015,6 +1267,11 @@ const ArchSpec kArchs[] = {
      "MoE 16x/4)",
      &dbrx_hparams, &dbrx_attention_tensors, &dbrx_attention,
      &llama_kv_dim},
+    {"muse-spark",
+     "Muse Spark (gated GQA, SWA / NoPE layers, norm-preserving "
+     "residuals, latent MoE)",
+     &muse_spark_hparams, &muse_spark_attention_tensors,
+     &muse_spark_attention, &llama_kv_dim, &muse_spark_layer},
 };
 
 }  // namespace

@@ -10,8 +10,9 @@ namespace locus::backend {
 
 /**
  * @returns Whether the full GPU forward implements a model with
- *     these hparams: RMSNorm, no DSA indexer, and head width (for
- *     MLA also the latent rank) within the attention kernels' stage.
+ *     these hparams: no custom layer body (muse-spark), RMSNorm, no
+ *     DSA indexer, and head width (for MLA also the latent rank)
+ *     within the attention kernels' stage.
  *     The hparam half of vulkan_forward_supported.
  */
 bool vulkan_hparams_supported(const model::Hparams& hp);

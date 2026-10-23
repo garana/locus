@@ -85,6 +85,26 @@ struct Hparams {
     float rope_freq_base = 10000.0f;
     /** Normalization kind for attn/ffn/output norms (default RMS). */
     NormType norm_type = NormType::kRmsNorm;
+    /** The arch runs its own layer body (ArchSpec::layer:
+     * muse-spark). Only the CPU single-token forward implements it:
+     * no batch paths, no GPU full forward. */
+    bool custom_layer = false;
+    /** Weightless RMS norm of the token embedding (muse-spark). */
+    bool embd_norm = false;
+    /** Logits multiplier, then tanh softcap at +/- this (0 = off). */
+    float logit_scale = 1.0f;
+    float final_logit_softcap = 0.0f;
+    /** Epsilon of the weightless post-branch norms (muse-spark). */
+    float post_norm_eps = 1e-6f;
+    /** Sliding-window attention: the window (0 = none) and which
+     * layers use it (muse-spark: those rope at rope_freq_base_swa;
+     * the others attend globally without rope). */
+    std::uint32_t swa_window = 0;
+    std::vector<bool> swa_layers;
+    float rope_freq_base_swa = 10000.0f;
+    /** Latent MoE: the width experts read and write (muse-spark
+     * moe_latent_size; 0 = n_embd). */
+    std::uint32_t moe_latent = 0;
 };
 
 /**
@@ -444,6 +464,17 @@ class TransformerModel {
         backend::Mat idx_proj, idx_k, idx_q_b;
         std::span<const float> idx_k_norm, idx_k_norm_b;
 
+        /** muse-spark: attention output gate [n_embd -> q_dim]
+         * (sigmoid), norm-preserving residual scales (stream alpha,
+         * branch beta), latent-MoE projections and norms, and the
+         * post-FFN norm weight. Empty on other arches. */
+        backend::Mat attn_gate;
+        std::span<const float> attn_resid_alpha, attn_resid_beta;
+        std::span<const float> ffn_resid_alpha, ffn_resid_beta;
+        backend::Mat ffn_latent_down, ffn_latent_up;
+        std::span<const float> ffn_pre_exp_norm, ffn_post_exp_norm;
+        std::span<const float> post_ffw_norm;
+
         /** @returns true when this layer routes experts. */
         bool is_moe() const { return gate_inp.rows > 0; }
     };
@@ -472,6 +503,10 @@ class TransformerModel {
   private:
     /** Applies the model's norm (RMS or LayerNorm per hp_.norm_type)
      * to x scaled by w, into out; uses hp_.rms_eps. */
+    /** Applies hp_.logit_scale and the final logit softcap in place
+     * (single-token path: only custom_layer arches set them). */
+    void scale_logits(std::span<float> logits) const;
+
     void apply_norm(std::span<const float> x,
                     std::span<const float> w, float eps,
                     std::span<float> out) const;

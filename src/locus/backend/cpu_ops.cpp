@@ -1719,6 +1719,18 @@ void rmsnorm(std::span<const float> x, std::span<const float> w,
     }
 }
 
+void rmsnorm_unit(std::span<float> x, float eps) {
+    float ss = 0.0f;
+    for (float v : x) {
+        ss += v * v;
+    }
+    const float scale =
+        1.0f / std::sqrt(ss / static_cast<float>(x.size()) + eps);
+    for (float& v : x) {
+        v *= scale;
+    }
+}
+
 void layernorm(std::span<const float> x, std::span<const float> w,
                float eps, std::span<float> out) {
     assert(x.size() == w.size() && x.size() == out.size());

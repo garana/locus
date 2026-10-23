@@ -1349,8 +1349,11 @@ bool vulkan_hparams_supported(const model::Hparams& hp) {
     // now. The attention kernels stage per-head slices in a fixed
     // shared array (vk::kAttnPartMax floats): wider heads, or a
     // larger MLA latent rank, would overrun it.
+    // Archs with their own layer body (muse-spark) run on the CPU
+    // single-token forward only.
     const bool mla = hp.arch == model::Arch::kDeepseek2;
-    return hp.norm_type == model::NormType::kRmsNorm &&
+    return !hp.custom_layer &&
+           hp.norm_type == model::NormType::kRmsNorm &&
            hp.idx_top_k == 0 && vk::attn_width_fits(hp.head_dim) &&
            (!mla || vk::attn_width_fits(hp.kv_lora_rank));
 }

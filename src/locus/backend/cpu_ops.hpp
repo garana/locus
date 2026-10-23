@@ -38,6 +38,14 @@ void rmsnorm(std::span<const float> x, std::span<const float> w,
              float eps, std::span<float> out);
 
 /**
+ * Weightless RMS norm in place: x /= sqrt(mean(x^2) + eps).
+ *
+ * @param x Activations, normalized in place.
+ * @param eps Stabilizer added to the mean square.
+ */
+void rmsnorm_unit(std::span<float> x, float eps);
+
+/**
  * LayerNorm (weight-only, no bias): centers x by its mean, scales by
  * 1/sqrt(variance + eps), then multiplies by weight, into out. Used
  * by arches whose norm is LayerNorm rather than RMSNorm (e.g. DBRX).
