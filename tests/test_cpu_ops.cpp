@@ -990,7 +990,9 @@ TEST_CASE("conv1d_transpose grouped path matches the scatter definition",
     // leave degenerate. Weight is input-channel-first (ConvTranspose1d).
     std::mt19937 rng(11);
     std::uniform_real_distribution<float> d(-1.0f, 1.0f);
-    const std::uint32_t ic = 4, oc = 2, groups = 2, k = 3, stride = 2,
+    // oc = 4, groups = 2 -> ocg = 2, so the group-local output index
+    // ocl takes both 0 and 1 (oc == 2 left it degenerate at 0).
+    const std::uint32_t ic = 4, oc = 4, groups = 2, k = 3, stride = 2,
                         pad = 1, ilen = 4;
     const std::uint32_t icg = ic / groups, ocg = oc / groups;
     const std::uint32_t olen =

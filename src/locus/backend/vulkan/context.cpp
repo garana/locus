@@ -208,6 +208,9 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matmul_q4_k_id_small_spv.h"
 #include "matmul_q6_k_id_small_spv.h"
 #include "silu_mul_sg_spv.h"
+#include "conv1d_spv.h"
+#include "conv1d_transpose_spv.h"
+#include "snake1d_spv.h"
 
 namespace locus::backend::vk {
 
@@ -465,6 +468,12 @@ constexpr KernelDesc kDescs[] = {
      matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
     {Kernel::kSiluMulSg, "silu_mul_sg", locus_silu_mul_sg_spv,
      sizeof(locus_silu_mul_sg_spv), 4, 8},
+    {Kernel::kConv1d, "conv1d", locus_conv1d_spv,
+     sizeof(locus_conv1d_spv), 4, 40},
+    {Kernel::kConv1dTranspose, "conv1d_transpose",
+     locus_conv1d_transpose_spv, sizeof(locus_conv1d_transpose_spv), 4, 40},
+    {Kernel::kSnake1d, "snake1d", locus_snake1d_spv,
+     sizeof(locus_snake1d_spv), 2, 12},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

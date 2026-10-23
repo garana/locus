@@ -1,0 +1,27 @@
+#version 450
+
+// Snake activation in place (F32), the SNAC codec's nonlinearity:
+// x += (1 / (alpha + eps)) * sin(alpha * x)^2, one alpha per channel.
+// Matches cpu_ops snake1d. One invocation per element; x is [ch][len],
+// alpha is [ch].
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer A { float alpha[]; };
+
+layout(push_constant) uniform PC {
+    uint ch;
+    uint len;
+    float eps;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.ch * pc.len) {
+        return;
+    }
+    float a = alpha[gid / pc.len];
+    float s = sin(a * x[gid]);
+    x[gid] += (1.0 / (a + pc.eps)) * s * s;
+}
