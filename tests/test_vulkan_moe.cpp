@@ -245,6 +245,123 @@ TEST_CASE("vulkan batched q8_0 matvec covers split, routed and summed "
     }
 }
 
+TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
+          "slots",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(37);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+
+    // 5 stacked 7 x 768 experts; 3 slots routed to 3, 0, 1. Q6_K's
+    // 4410-byte experts put odd ids off word alignment.
+    const std::uint32_t rows = 7, cols = 768, n_mat = 5, slots = 3;
+    struct KCase {
+        locus::gguf::TensorType type;
+        Kernel kernel;
+        std::size_t block_bytes;
+        std::size_t d_off;  // f16 d inside the block (dmin follows)
+        bool has_dmin;
+    };
+    const KCase cases[] = {
+        {locus::gguf::TensorType::kQ4_K, Kernel::kMatvecQ4_KB, 144, 0,
+         true},
+        {locus::gguf::TensorType::kQ6_K, Kernel::kMatvecQ6_KB, 210, 208,
+         false},
+    };
+    std::vector<float> x(cols * slots);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    const std::uint32_t ids[] = {3, 0, 1};
+    const float wts[] = {0.5f, -1.25f, 2.0f};
+    std::vector<std::uint32_t> route = {ids[0], ids[1], ids[2],
+                                        fbits(wts[0]), fbits(wts[1]),
+                                        fbits(wts[2])};
+    for (const auto& c : cases) {
+        INFO("type " << static_cast<int>(c.type));
+        const std::size_t mat_bytes = rows * (cols / 256) * c.block_bytes;
+        std::vector<std::byte> w(mat_bytes * n_mat);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t at = c.d_off; at < w.size(); at += c.block_bytes) {
+            const std::uint16_t d = locus::backend::f32_to_f16(0.01f);
+            std::memcpy(&w[at], &d, 2);
+            if (c.has_dmin) {
+                const std::uint16_t dmin =
+                    locus::backend::f32_to_f16(0.005f);
+                std::memcpy(&w[at + 2], &dmin, 2);
+            }
+        }
+        auto cpu_slot = [&](std::uint32_t id, std::uint32_t k) {
+            locus::backend::Mat m{c.type, w.data() + id * mat_bytes, rows,
+                                  cols};
+            std::vector<float> out(rows);
+            locus::backend::matvec(
+                m, std::span<const float>(x).subspan(k * cols, cols), out);
+            return out;
+        };
+        w.resize((w.size() + 3) & ~std::size_t{3});
+        auto wb = upload(ctx, w);
+        auto xb = upload(ctx, x);
+        auto rb = upload(ctx, route);
+        auto run = [&](std::uint32_t mode, std::size_t out_n,
+                       std::vector<float> init) {
+            auto ob = upload(ctx, init);
+            ctx.begin_batch();
+            const VulkanContext::Buffer bufs[] = {wb, xb, ob, rb};
+            const std::uint32_t push[] = {
+                rows, cols, 0, mode & 2u ? 1u : 0u, 0, 0, fbits(1.0f),
+                static_cast<std::uint32_t>(mat_bytes), cols, rows, slots,
+                mode, 0u};
+            ctx.dispatch(c.kernel, bufs, push,
+                         VulkanContext::matvec_groups(c.kernel, rows),
+                         mode & 2u ? 1u : slots);
+            ctx.end_batch();
+            auto got = download<float>(ctx, ob, out_n);
+            ctx.destroy_buffer(ob);
+            return got;
+        };
+
+        // The type in the name: plain SECTIONs in a loop are tracked
+        // by name, so they would run on the first type only.
+        DYNAMIC_SECTION("split slots, matrix = routed id, type "
+                        << static_cast<int>(c.type)) {
+            auto got = run(1, rows * slots,
+                           std::vector<float>(rows * slots, 0.0f));
+            for (std::uint32_t k = 0; k < slots; ++k) {
+                auto want = cpu_slot(ids[k], k);
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    REQUIRE(got[k * rows + r] ==
+                            Catch::Approx(want[r]).margin(1e-3));
+                }
+            }
+        }
+        DYNAMIC_SECTION("weighted sum of routed slots accumulates, type "
+                        << static_cast<int>(c.type)) {
+            std::vector<float> init(rows);
+            for (auto& v : init) {
+                v = dist(rng);
+            }
+            auto got = run(3, rows, init);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                float want = init[r];
+                for (std::uint32_t k = 0; k < slots; ++k) {
+                    want += wts[k] * cpu_slot(ids[k], k)[r];
+                }
+                REQUIRE(got[r] == Catch::Approx(want).margin(1e-3));
+            }
+        }
+        for (auto b : {wb, xb, rb}) {
+            ctx.destroy_buffer(b);
+        }
+    }
+}
+
 TEST_CASE("vulkan transposed q8_0 matvec matches the CPU reference",
           "[vulkan]") {
     if (!VulkanContext::available()) {

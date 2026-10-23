@@ -220,12 +220,6 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::uniform_int_distribution<int> byte_d(0, 255);
 
-    const std::uint32_t rows = 4, cols = 512;
-    std::vector<float> x(cols);
-    for (auto& v : x) {
-        v = dist(rng);
-    }
-
     struct KCase {
         locus::gguf::TensorType type;
         Kernel kernel;
@@ -243,8 +237,17 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
         {locus::gguf::TensorType::kQ2_K, Kernel::kMatvecQ2_K,
          84, 80, true},
     };
+    // 4 x 512: one workgroup, fewer units than lanes; 7 x 2304: a
+    // partial workgroup and several units per lane.
+    const std::uint32_t shapes[][2] = {{4, 512}, {7, 2304}};
+    for (const auto& [rows, cols] : shapes)
     for (const auto& c : cases) {
-        INFO("type " << static_cast<int>(c.type));
+        INFO("type " << static_cast<int>(c.type) << " " << rows << "x"
+                     << cols);
+        std::vector<float> x(cols);
+        for (auto& v : x) {
+            v = dist(rng);
+        }
         std::vector<std::byte> w(rows * (cols / 256) *
                                  c.block_bytes);
         for (auto& b : w) {

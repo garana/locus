@@ -116,6 +116,8 @@ Kernel batched_kernel(const Mat& w) {
         case gguf::TensorType::kF32: return Kernel::kMatvecF32B;
         case gguf::TensorType::kF16: return Kernel::kMatvecF16B;
         case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0B;
+        case gguf::TensorType::kQ4_K: return Kernel::kMatvecQ4_KB;
+        case gguf::TensorType::kQ6_K: return Kernel::kMatvecQ6_KB;
         default: return Kernel::kCount_;
     }
 }
@@ -1363,9 +1365,13 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     // only Q8/Q4 take the block-codec path.
     const bool f16 = geom.kv_type == kv::KvType::kF16;
     const bool qblk = quant && !f16;
-    if (qblk && hp.rope_neox) {
-        // The Q8/Q4 KV store path ropes interleaved and has no q/k
-        // norm; NEOX models keep that combination on the CPU.
+    if (qblk && (hp.rope_neox ||
+                 std::ranges::any_of(m.layers(), [](const auto& l) {
+                     return l.has_qk_norm();
+                 }))) {
+        // The Q8/Q4 KV store path norms and ropes K inside the store:
+        // interleaved pairs only, no per-head norm. Those models keep
+        // that combination on the CPU.
         return false;
     }
 
@@ -2170,7 +2176,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
             row_stride};
         // GQA rows of NEOX models (qwen3moe) rotate NEOX pairs; MLA's
         // yarn rope is interleaved.
-        s.ctx.dispatch(!yarn && hp.rope_neox ? Kernel::kRopeNeoxB
+        s.ctx.dispatch(!mla && hp.rope_neox ? Kernel::kRopeNeoxB
                                              : Kernel::kRopeB,
                        bufs, push, heads, n);
     };

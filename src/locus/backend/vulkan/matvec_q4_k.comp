@@ -1,13 +1,32 @@
 #version 450
 
-// Q4_K matvec: 144-byte super-blocks of 256 elements -- f16
-// d/dmin, 12 packed 6-bit scale/min pairs, 128 nibble bytes.
+// Q4_K matvec: 144-byte super-blocks of 256 elements -- f16 d and
+// dmin, 12 packed 6-bit scale/min pairs, 128 nibble bytes. Sub-block
+// s = 2j + h (h = 0 low nibbles, 1 high) of super-block b covers the
+// 32 elements 64j + 32h .. of the block, from bytes 32j .. 32j + 31.
+//
+// Four rows per workgroup, 32 lanes per row, as matvec_q8_0.comp:
+// lanes stride over the row's 32-element sub-blocks (word loads of
+// their 32 nibble bytes), each adding d*sc*sum(q*x) - dmin*m*sum(x),
+// and a shared-memory tree reduces the row.
+//
+// Compiled again with -DBATCHED (matvec_q4_k_b): slots as in
+// matvec_q8_0.comp -- slot y reads w_off + id * w_stride (bytes) and
+// x_off + y * x_stride, id = route[y] under mode bit 1; mode bit 2
+// sums all n_slots weighted by route[n_slots + k] into one row (the
+// MoE down projection).
 
-layout(local_size_x = 64) in;
+#define LANES 32u
+#define ROWS 4u
+
+layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 2) buffer O { float o[]; };
+#ifdef BATCHED
+layout(std430, binding = 3) readonly buffer R { uint route[]; };
+#endif
 
 layout(push_constant) uniform PC {
     uint rows;
@@ -17,10 +36,27 @@ layout(push_constant) uniform PC {
     uint w_off;   // element offset (f32/f16), byte offset (quant)
     uint x_off;
     float scale;
+#ifdef BATCHED
+    uint w_stride;  // per slot, bytes
+    uint x_stride;
+    uint out_stride;
+    uint n_slots;
+    uint mode;      // 1 = ids from route[], 2 = weighted slot sum
+    uint row_stride;  // unused: K-quant rows are never column-split
+#endif
 } pc;
+
+shared float red[LANES * ROWS];
 
 uint byte_at(uint i) {
     return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+/** The 4 bytes at byte offset b (any alignment). */
+uint word_at(uint b) {
+    uint i = b >> 2;
+    uint sh = (b & 3u) * 8u;
+    return sh == 0u ? w[i] : (w[i] >> sh) | (w[i + 1u] << (32u - sh));
 }
 
 float f16_at(uint i) {
@@ -40,36 +76,75 @@ void scale_min(uint j, uint sc0, out float d, out float m) {
     }
 }
 
-void main() {
-    uint r = gl_GlobalInvocationID.x;
-    if (r >= pc.rows) {
-        return;
-    }
+/** This lane's share of dot(row r of the matrix at wbase, x). */
+float row_part(uint wbase, uint xbase, uint r, uint lane) {
     uint nb = pc.cols / 256u;
+    uint rb = wbase + r * nb * 144u;
     float acc = 0.0;
-    for (uint b = 0; b < nb; ++b) {
-        uint at = pc.w_off + (r * nb + b) * 144u;
+    for (uint u = lane; u < nb * 8u; u += LANES) {
+        uint b = u >> 3;
+        uint s = u & 7u;          // sub-block 2j + h
+        uint j = s >> 1;
+        uint sh = (s & 1u) * 4u;  // nibble shift
+        uint at = rb + b * 144u;
         float d = f16_at(at);
         float dmin = f16_at(at + 2u);
-        uint xb = pc.x_off + b * 256u;
-        uint q = at + 16u;
-        for (uint j = 0; j < 4u; ++j) {
-            float sc, mn;
-            scale_min(2u * j, at + 4u, sc, mn);
-            float d1 = d * sc, m1 = dmin * mn;
-            scale_min(2u * j + 1u, at + 4u, sc, mn);
-            float d2 = d * sc, m2 = dmin * mn;
-            for (uint l = 0; l < 32u; ++l) {
-                uint v = byte_at(q + l);
-                acc += (d1 * float(v & 0xfu) - m1) * x[xb + l];
-                acc += (d2 * float(v >> 4u) - m2) *
-                       x[xb + 32u + l];
-            }
-            q += 32u;
-            xb += 64u;
+        float sc, mn;
+        scale_min(s, at + 4u, sc, mn);
+        uint q = at + 16u + j * 32u;
+        uint xi = xbase + b * 256u + j * 64u + (s & 1u) * 32u;
+        float sq = 0.0, sx = 0.0;
+        for (uint k = 0u; k < 8u; ++k) {
+            uint v = word_at(q + k * 4u) >> sh;
+            uint xk = xi + k * 4u;
+            float x0 = x[xk], x1 = x[xk + 1u];
+            float x2 = x[xk + 2u], x3 = x[xk + 3u];
+            sq += float(v & 0xfu) * x0 + float((v >> 8u) & 0xfu) * x1 +
+                  float((v >> 16u) & 0xfu) * x2 +
+                  float((v >> 24u) & 0xfu) * x3;
+            sx += x0 + x1 + x2 + x3;
         }
+        acc += d * sc * sq - dmin * mn * sx;
     }
-    uint at_out = pc.out_offset + r;
-    float v = acc * pc.scale;
-    o[at_out] = pc.accumulate != 0 ? o[at_out] + v : v;
+    return acc;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x % LANES;
+    uint slot = gl_LocalInvocationID.x / LANES;
+    uint r = gl_WorkGroupID.x * ROWS + slot;
+    uint at = pc.out_offset + r;
+    float acc = 0.0;
+    if (r < pc.rows) {
+#ifdef BATCHED
+        uint y = gl_WorkGroupID.y;
+        bool sum = (pc.mode & 2u) != 0u;
+        uint k1 = sum ? pc.n_slots : y + 1u;
+        for (uint k = sum ? 0u : y; k < k1; ++k) {
+            uint id = (pc.mode & 1u) != 0u ? route[k] : k;
+            float wk = sum ? uintBitsToFloat(route[pc.n_slots + k])
+                           : 1.0;
+            acc += wk * row_part(pc.w_off + id * pc.w_stride,
+                                 pc.x_off + k * pc.x_stride, r, lane);
+        }
+        if (!sum) {
+            at += y * pc.out_stride;
+        }
+#else
+        acc = row_part(pc.w_off, pc.x_off, r, lane);
+#endif
+    }
+    red[gl_LocalInvocationID.x] = acc;
+    barrier();
+    for (uint step = LANES / 2u; step > 0u; step >>= 1) {
+        if (lane < step) {
+            red[gl_LocalInvocationID.x] +=
+                red[gl_LocalInvocationID.x + step];
+        }
+        barrier();
+    }
+    if (lane == 0u && r < pc.rows) {
+        float v = red[gl_LocalInvocationID.x] * pc.scale;
+        o[at] = pc.accumulate != 0 ? o[at] + v : v;
+    }
 }
