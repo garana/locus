@@ -841,3 +841,154 @@ TEST_CASE("matvec_batch_neon is byte-identical to per-token neon",
     }
 }
 #endif
+
+TEST_CASE("conv1d dense matches a hand-computed same-padded case",
+          "[ops][conv1d]") {
+    // 1 -> 1 channel, k=3, stride 1, pad 1 (same length), filter
+    // [1,0,-1] is a discrete first-difference.
+    const float in[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const float w[] = {1.0f, 0.0f, -1.0f};
+    float out[4];
+    conv1d(in, 1, 4, w, 1, 3, {}, 1, 1, 1, 1, out);
+    const float want[] = {-2.0f, -2.0f, -2.0f, 3.0f};
+    for (int i = 0; i < 4; ++i) {
+        REQUIRE(out[i] == Approx(want[i]));
+    }
+}
+
+TEST_CASE("conv1d depthwise convolves each channel with its own filter",
+          "[ops][conv1d]") {
+    // in_ch == out_ch == groups == 2, k=3, pad 1. ch0 filter is all
+    // ones (box), ch1 filter [0,1,0] is identity.
+    const float in[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    const float w[] = {1.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f};
+    float out[6];
+    conv1d(in, 2, 3, w, 2, 3, {}, 1, 1, 1, 2, out);
+    const float want[] = {3.0f, 6.0f, 5.0f, 4.0f, 5.0f, 6.0f};
+    for (int i = 0; i < 6; ++i) {
+        REQUIRE(out[i] == Approx(want[i]));
+    }
+}
+
+TEST_CASE("conv1d honors stride and dilation", "[ops][conv1d]") {
+    // k=2, dilation 2 (taps span 3), stride 2, no pad: out_len 2.
+    const float in[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    const float w[] = {1.0f, 1.0f};
+    float out[2];
+    conv1d(in, 1, 6, w, 1, 2, {}, 2, 2, 0, 1, out);
+    REQUIRE(out[0] == Approx(4.0f));  // in[0] + in[2]
+    REQUIRE(out[1] == Approx(8.0f));  // in[2] + in[4]
+}
+
+TEST_CASE("conv1d_transpose matches the scatter definition",
+          "[ops][conv1d]") {
+    // The hand case: 1 -> 1, k=2, stride 1. out = [a w0, a w1 + b w0,
+    // b w1].
+    const float in[] = {2.0f, 3.0f};
+    const float w[] = {1.0f, 10.0f};
+    float out[3];
+    conv1d_transpose(in, 1, 2, w, 1, 2, {}, 1, 1, 0, 1, out);
+    REQUIRE(out[0] == Approx(2.0f));
+    REQUIRE(out[1] == Approx(23.0f));
+    REQUIRE(out[2] == Approx(30.0f));
+
+    // A SNAC-shaped upsample (k = 2*stride, pad = (k-stride)/2) scales
+    // length by exactly the stride; cross-check the gather against an
+    // independent scatter on random weights.
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    const std::uint32_t ic = 2, oc = 2, k = 4, stride = 2, pad = 1,
+                        ilen = 3;
+    const std::uint32_t olen = (ilen - 1) * stride - 2 * pad + (k - 1) + 1;
+    REQUIRE(olen == ilen * stride);
+    std::vector<float> x(ic * ilen), wt(ic * oc * k);
+    for (auto& v : x) v = d(rng);
+    for (auto& v : wt) v = d(rng);
+    std::vector<float> got(oc * olen), ref(oc * olen, 0.0f);
+    conv1d_transpose(x, ic, ilen, wt, oc, k, {}, stride, 1, pad, 1, got);
+    for (std::uint32_t c = 0; c < ic; ++c) {
+        for (std::uint32_t ix = 0; ix < ilen; ++ix) {
+            for (std::uint32_t t = 0; t < k; ++t) {
+                const long ox = (long)ix * stride - (long)pad + (long)t;
+                if (ox < 0 || ox >= (long)olen) continue;
+                for (std::uint32_t o = 0; o < oc; ++o) {
+                    ref[o * olen + ox] +=
+                        x[c * ilen + ix] * wt[(c * oc + o) * k + t];
+                }
+            }
+        }
+    }
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        REQUIRE(got[i] == Approx(ref[i]));
+    }
+}
+
+TEST_CASE("snake1d applies the per-channel nonlinearity",
+          "[ops][conv1d]") {
+    // x + (1/(alpha+eps)) * sin(alpha*x)^2, one alpha per channel.
+    std::vector<float> x = {0.0f, 1.0f, 2.0f, 0.5f, -1.0f, 3.0f};
+    const float alpha[] = {1.0f, 2.0f};
+    std::vector<float> want = x;
+    for (std::uint32_t c = 0; c < 2; ++c) {
+        const float a = alpha[c];
+        for (std::uint32_t i = 0; i < 3; ++i) {
+            const float v = x[c * 3 + i];
+            const float s = std::sin(a * v);
+            want[c * 3 + i] = v + (1.0f / (a + 1e-9f)) * s * s;
+        }
+    }
+    snake1d(x, 2, 3, alpha);
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        REQUIRE(x[i] == Approx(want[i]));
+    }
+}
+
+TEST_CASE("conv1d_transpose grouped path matches the scatter definition",
+          "[conv1d]") {
+    // groups == 2: in-ch {0,1} -> out-ch {0}, {2,3} -> {1}. Exercises
+    // the ic0 / ocl / weight[ic][ocl][k] indexing the groups==1 cases
+    // leave degenerate. Weight is input-channel-first (ConvTranspose1d).
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    const std::uint32_t ic = 4, oc = 2, groups = 2, k = 3, stride = 2,
+                        pad = 1, ilen = 4;
+    const std::uint32_t icg = ic / groups, ocg = oc / groups;
+    const std::uint32_t olen =
+        conv1d_transpose_out_len(ilen, k, stride, 1, pad);
+    std::vector<float> x(ic * ilen), wt(static_cast<std::size_t>(ic) *
+                                        ocg * k);
+    for (auto& v : x) v = d(rng);
+    for (auto& v : wt) v = d(rng);
+    std::vector<float> got(oc * olen), ref(oc * olen, 0.0f);
+    conv1d_transpose(x, ic, ilen, wt, oc, k, {}, stride, 1, pad, groups,
+                     got);
+    for (std::uint32_t g = 0; g < groups; ++g) {
+        for (std::uint32_t ci = 0; ci < icg; ++ci) {
+            const std::uint32_t c = g * icg + ci;
+            for (std::uint32_t ix = 0; ix < ilen; ++ix) {
+                for (std::uint32_t t = 0; t < k; ++t) {
+                    const long ox = (long)ix * stride - (long)pad + (long)t;
+                    if (ox < 0 || ox >= (long)olen) continue;
+                    for (std::uint32_t ol = 0; ol < ocg; ++ol) {
+                        const std::uint32_t o = g * ocg + ol;
+                        ref[o * olen + ox] +=
+                            x[c * ilen + ix] * wt[(c * ocg + ol) * k + t];
+                    }
+                }
+            }
+        }
+    }
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        REQUIRE(got[i] == Approx(ref[i]));
+    }
+}
+
+TEST_CASE("conv1d out_len helpers match the kernels' shapes",
+          "[conv1d]") {
+    // The shared shape definition #151/#152 also use.
+    REQUIRE(conv1d_out_len(4, 3, 1, 1, 1) == 4);   // same padding
+    REQUIRE(conv1d_out_len(6, 2, 2, 2, 0) == 2);   // stride+dilation
+    REQUIRE(conv1d_out_len(3, 8, 1, 1, 0) == 0);   // kernel wider -> 0
+    REQUIRE(conv1d_transpose_out_len(3, 4, 2, 1, 1) == 6);  // upsample x2
+    REQUIRE(conv1d_transpose_out_len(2, 2, 1, 1, 0) == 3);
+}
