@@ -39,9 +39,11 @@ in docs/DESIGN.md section 7. Greedy output is validated
 token-exact against llama.cpp on stories260K, Llama-3.2-1B
 (Q8_0 and Q4_K_M), DeepSeek-V2-Lite, Moonlight-16B-A3B,
 Qwen1.5-MoE-A2.7B (qwen2moe, Q4_K_M; CPU and Vulkan),
-Qwen3-Coder-30B-A3B (qwen3moe, Q4_K_M; CPU and Vulkan), and GLM-5.2
+Qwen3-Coder-30B-A3B (qwen3moe, Q4_K_M; CPU and Vulkan), GLM-5.2
 744B (UD-IQ1_S, streamed from a 203GB split GGUF on a 32GB machine --
-see the R8 notes in DESIGN.md). Streaming
+see the R8 notes in DESIGN.md), and Muse Spark Open 816B-A42B
+(muse-spark, UD-IQ1_S, 176GB streamed on the CPU; one prompt
+token-exact, one checked teacher-forced past a near-tie). Streaming
 models decode with madvise readahead (default-on), optional
 threaded matvecs (LOCUS_THREADS) and static-weight pinning
 (LOCUS_PIN_STATIC) per DESIGN.md R9; GLM-5.2's DSA lightning
