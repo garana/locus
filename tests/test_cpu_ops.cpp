@@ -171,6 +171,46 @@ TEST_CASE("matvec f32 and f16 agree", "[ops]") {
     REQUIRE(out[1] == Approx(11.0f));
 }
 
+TEST_CASE("bf16 matvec, batch matvec and dequant read the high half",
+          "[ops]") {
+    // bfloat16 is the top 16 bits of an f32: these values (and the
+    // sign / exponent edge ones) are exact in bf16.
+    const std::vector<float> wf = {1.5f, -2.0f, 0.15625f,
+                                   65536.0f, -0.0f, 3.0e-39f};  // 2x3
+    std::vector<std::uint16_t> wb(wf.size());
+    for (std::size_t i = 0; i < wf.size(); ++i) {
+        std::uint32_t u;
+        std::memcpy(&u, &wf[i], 4);
+        wb[i] = static_cast<std::uint16_t>(u >> 16);
+    }
+    Mat m{TensorType::kBF16, reinterpret_cast<const std::byte*>(wb.data()),
+          2, 3};
+    std::vector<float> row(3);
+    for (std::uint32_t r = 0; r < 2; ++r) {
+        dequant_row(m, r, row);
+        for (std::uint32_t c = 0; c < 3; ++c) {
+            float want = wf[r * 3 + c];
+            std::uint32_t u;
+            std::memcpy(&u, &want, 4);
+            u &= 0xffff0000u;  // 3e-39 (subnormal) truncates
+            std::memcpy(&want, &u, 4);
+            REQUIRE(row[c] == want);
+        }
+    }
+    const float x[] = {2.0f, 1.0f, -4.0f};
+    float out[2];
+    matvec(m, x, out);
+    REQUIRE(out[0] == Approx(3.0f - 2.0f - 0.625f));
+    REQUIRE(out[1] == Approx(131072.0f));
+    // Two tokens through the batch path: rows x tokens, row-major.
+    const float xs[] = {2.0f, 1.0f, -4.0f, 1.0f, 1.0f, 1.0f};
+    float ob[4];
+    matvec_batch_scalar(m, xs, ob, 2);
+    REQUIRE(ob[0] == Approx(out[0]));
+    REQUIRE(ob[1] == Approx(1.5f - 2.0f + 0.15625f));
+    REQUIRE(ob[2] == Approx(out[1]));
+}
+
 namespace {
 
 /** Builds one Q8_0 row (single block) with scale d and quants q. */

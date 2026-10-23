@@ -30,6 +30,7 @@ TypeTraits traits(TensorType t) {
     switch (t) {
         case TensorType::kF32: return {1, 4};
         case TensorType::kF16: return {1, 2};
+        case TensorType::kBF16: return {1, 2};
         case TensorType::kQ4_0: return {32, 18};
         case TensorType::kQ4_1: return {32, 20};
         case TensorType::kQ5_0: return {32, 22};

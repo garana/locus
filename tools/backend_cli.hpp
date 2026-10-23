@@ -110,6 +110,7 @@ inline void print_quants() {
     static constexpr Q kQuants[] = {
         {T::kF32, "F32", "float"},
         {T::kF16, "F16", "float"},
+        {T::kBF16, "BF16", "float"},
         {T::kQ4_0, "Q4_0", "legacy"},
         {T::kQ4_1, "Q4_1", "legacy"},
         {T::kQ5_0, "Q5_0", "legacy"},
