@@ -180,6 +180,8 @@ if(Vulkan_FOUND)
             kv_scatter_f16=kv_scatter:KV_F16
             rmsnorm_b=rmsnorm:BATCHED
             rope_b=rope:BATCHED
+            rope_neox=rope:NEOX
+            rope_neox_b=rope:BATCHED,NEOX
             moe_route_b=moe_route:BATCHED)
         # Limits shared with the host, read from their one definition.
         set(LOCUS_VK_LIMITS

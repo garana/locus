@@ -7,6 +7,11 @@
 // Compiled again with -DBATCHED (rope_b): workgroup y rotates row y
 // of a prefill chunk, at position pos + y and offset + y *
 // row_stride.
+//
+// With -DNEOX (rope_neox, rope_neox_b) the pairs are NEOX-style,
+// (x[j], x[j + head_dim / 2]) for j < head_dim / 2, with the same
+// angle for pair j as the interleaved pair (2j, 2j + 1) above (Qwen2 /
+// Qwen3; the CPU's rope_neox_yarn).
 
 layout(local_size_x = 1) in;
 
@@ -56,9 +61,16 @@ void main() {
         theta /= f[i / 2u];
         float c = cos(theta);
         float s = sin(theta);
-        float x0 = x[base + i];
-        float x1 = x[base + i + 1u];
-        x[base + i] = x0 * c - x1 * s;
-        x[base + i + 1u] = x0 * s + x1 * c;
+#ifdef NEOX
+        uint a = base + i / 2u;
+        uint b = a + pc.head_dim / 2u;
+#else
+        uint a = base + i;
+        uint b = a + 1u;
+#endif
+        float x0 = x[a];
+        float x1 = x[b];
+        x[a] = x0 * c - x1 * s;
+        x[b] = x0 * s + x1 * c;
     }
 }

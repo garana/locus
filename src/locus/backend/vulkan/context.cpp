@@ -191,6 +191,8 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "attn_decode_f16_spv.h"
 #include "kv_scatter_f16_spv.h"
 #include "attn_decode_grp_f16_spv.h"
+#include "rope_neox_spv.h"
+#include "rope_neox_b_spv.h"
 
 namespace locus::backend::vk {
 
@@ -418,6 +420,10 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kAttnDecodeGrpF16, "attn_decode_grp_f16",
      locus_attn_decode_grp_f16_spv, sizeof(locus_attn_decode_grp_f16_spv), 6,
      64},
+    {Kernel::kRopeNeox, "rope_neox", locus_rope_neox_spv,
+     sizeof(locus_rope_neox_spv), 2, 36},
+    {Kernel::kRopeNeoxB, "rope_neox_b", locus_rope_neox_b_spv,
+     sizeof(locus_rope_neox_b_spv), 2, 40},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

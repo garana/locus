@@ -1264,9 +1264,10 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
 bool gpu_weights_ok(const model::TransformerModel& m) {
     for (const auto& l : m.layers()) {
         // The full GPU forward implements the llama / deepseek2
-        // attention only: q/k/v biases (qwen2moe) and per-head q/k
-        // norms with NEOX rope (qwen3moe) take the CPU path.
-        if (l.has_attn_extras()) {
+        // attention plus per-head q/k norms (qwen3moe); q/k/v biases
+        // (qwen2moe) and any other extra take the CPU path.
+        if (l.has_qkv_bias() ||
+            (l.has_attn_extras() && !l.has_qk_norm())) {
             return false;
         }
         if (matvec_kernel(l.wo) == Kernel::kCount_) {
@@ -1362,6 +1363,11 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     // only Q8/Q4 take the block-codec path.
     const bool f16 = geom.kv_type == kv::KvType::kF16;
     const bool qblk = quant && !f16;
+    if (qblk && hp.rope_neox) {
+        // The Q8/Q4 KV store path ropes interleaved and has no q/k
+        // norm; NEOX models keep that combination on the CPU.
+        return false;
+    }
 
     const std::uint32_t rank = hp.kv_lora_rank;
     const std::uint32_t nope = hp.qk_nope_dim;
@@ -1375,8 +1381,12 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
          hp.n_ff_exp * hp.n_expert_shared});
     s.grow(s.xb, s.xb_n,
            std::max<std::size_t>(hp.n_embd, ff_max));
-    s.grow(s.q, s.q_n,
-           mla ? std::size_t{hp.n_heads} * qk : hp.n_embd);
+    // GQA q / attention output: n_heads * head_dim, which exceeds
+    // n_embd when head_dim != n_embd / n_heads (qwen3moe).
+    const std::size_t gqa_q =
+        std::max<std::size_t>(hp.n_embd, std::size_t{hp.n_heads} *
+                                             hp.head_dim);
+    s.grow(s.q, s.q_n, mla ? std::size_t{hp.n_heads} * qk : gqa_q);
     // The non-MLA quantized-KV path reuses gate/up as F32 scratch
     // for this token's K and V rows (kv_dim elements each), so they
     // must be at least kv_dim wide, not just ff_max. Every real
@@ -1393,7 +1403,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     s.grow(s.gate, s.gate_n, ff_kv);
     s.grow(s.up, s.up_n, ff_kv);
     s.grow(s.attout, s.attout_n,
-           mla ? std::size_t{hp.n_heads} * vd : hp.n_embd);
+           mla ? std::size_t{hp.n_heads} * vd : gqa_q);
     s.grow(s.att, s.att_n,
            static_cast<std::size_t>(hp.n_heads) * hp.n_ctx);
     s.grow(s.logits, s.logits_n, hp.n_vocab);
@@ -1509,50 +1519,78 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             const Mat* qkv[] = {&lay.wq, &lay.wk, &lay.wv};
             const bool fused = !qblk && seg_ok(qkv) &&
                                hp.head_dim % 2 == 0;
+            // The seg epilogue ropes interleaved pairs and has no q/k
+            // norm, so NEOX / q-k-norm models (qwen3moe) still stack
+            // the projection but norm and rope q and k afterwards.
+            const bool qk_norm = lay.has_qk_norm();
+            const bool epi_rope = fused && !hp.rope_neox && !qk_norm;
+            const Kernel rope_k =
+                hp.rope_neox ? Kernel::kRopeNeox : Kernel::kRope;
+            // Per-head RMS norm in place: `heads` rows of head_dim
+            // floats from `off`, each scaled by the same weights.
+            auto head_norm = [&](VulkanContext::Buffer buf,
+                                 std::uint32_t off, std::uint32_t heads,
+                                 std::span<const float> w) {
+                const VulkanContext::Buffer bufs[] = {
+                    buf, s.upload(w.data(), w.size() * 4), buf};
+                const std::uint32_t push[] = {
+                    hp.head_dim, eps_bits, off, off, hp.head_dim,
+                    hp.head_dim};
+                s.ctx.dispatch(Kernel::kRmsNormB, bufs, push, 1, heads);
+            };
             // F32: K/V rows straight into the pool. F16: into F32
             // scratch (K then V in s.gate, free until the FFN), then
-            // packed into the pool. Either way the fused projection
-            // ropes q and k in its epilogue; the unfused path ropes K
-            // where it lands, below.
+            // packed into the pool. With epi_rope the fused projection
+            // ropes q and k in its epilogue; otherwise q and K are
+            // normed (qk_norm) and roped where they land, below.
             const VulkanContext::Buffer kv_dst = f16 ? s.gate : pool;
             const std::uint32_t k_at = f16 ? 0 : row_off;
             const std::uint32_t v_at =
                 f16 ? kv_dim : row_off + layer_stride / 2;
             if (fused) {
-                // q and k roped in the epilogue (whole heads).
-                SegRope rope;
-                rope.hs0 = rope.rd0 = hp.head_dim;
-                rope.hs1 = rope.rd1 = hp.head_dim;
-                rope.pos = pos;
-                rope.base_bits = base_bits;
-                rope.fs_bits = fbits(1.0f);
-                rope.divisors = divisors;
+                SegRope rope;  // rd 0: no epilogue rope
+                if (epi_rope) {
+                    // q and k roped in the epilogue (whole heads).
+                    rope.hs0 = rope.rd0 = hp.head_dim;
+                    rope.hs1 = rope.rd1 = hp.head_dim;
+                    rope.pos = pos;
+                    rope.base_bits = base_bits;
+                    rope.fs_bits = fbits(1.0f);
+                    rope.divisors = divisors;
+                }
                 rec_matvec_seg(s, qkv, s.xb, s.q, 0, kv_dst, k_at, v_at,
                                rope);
             } else {
                 rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
             }
-            if (!fused) {
+            if (!epi_rope) {
+                if (qk_norm) {
+                    head_norm(s.q, 0, hp.n_heads, lay.attn_q_norm);
+                }
                 const VulkanContext::Buffer bufs[] = {s.q,
                                                       divisors};
                 const std::uint32_t push[] = {
                     hp.n_heads, hp.head_dim, pos, 0, hp.head_dim,
                     base_bits,  fbits(1.0f), 0,   0};
-                s.ctx.dispatch(Kernel::kRope, bufs, push,
-                               hp.n_heads);
+                s.ctx.dispatch(rope_k, bufs, push, hp.n_heads);
             }
             if (!qblk) {
                 if (!fused) {
                     rec_matvec(s, lay.wk, s.xb, kv_dst, k_at, false);
                     rec_matvec(s, lay.wv, s.xb, kv_dst, v_at, false);
+                }
+                if (!epi_rope) {
+                    if (qk_norm) {
+                        head_norm(kv_dst, k_at, hp.n_kv_heads,
+                                  lay.attn_k_norm);
+                    }
                     const VulkanContext::Buffer bufs[] = {
                         kv_dst, divisors};
                     const std::uint32_t push[] = {
                         hp.n_kv_heads, hp.head_dim, pos,
                         k_at,          hp.head_dim, base_bits,
                         fbits(1.0f),   0,           0};
-                    s.ctx.dispatch(Kernel::kRope, bufs, push,
-                                   hp.n_kv_heads);
+                    s.ctx.dispatch(rope_k, bufs, push, hp.n_kv_heads);
                 }
                 if (f16) {
                     // K and V rows (planes kv_dim apart) in one go.
@@ -2130,7 +2168,11 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
             yarn ? lo_bits : 0u,
             yarn ? hi_bits : 0u,
             row_stride};
-        s.ctx.dispatch(Kernel::kRopeB, bufs, push, heads, n);
+        // GQA rows of NEOX models (qwen3moe) rotate NEOX pairs; MLA's
+        // yarn rope is interleaved.
+        s.ctx.dispatch(!yarn && hp.rope_neox ? Kernel::kRopeNeoxB
+                                             : Kernel::kRopeB,
+                       bufs, push, heads, n);
     };
     auto scatter_rows = [&](VulkanContext::Buffer src, std::uint32_t width,
                             std::uint32_t dst_off) {
@@ -2195,6 +2237,13 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
             rec_matmul(s, lay.wv, cat ? wcat : s.upload_w(lay.wv), bxb,
                        bv, MatmulRows{n, 0, E, 0, kv_dim}, false,
                        cat ? v_at : 0);
+            if (lay.has_qk_norm()) {
+                // Per-head q / k RMS norm (qwen3moe) before rope: n *
+                // heads rows of hd floats, in place.
+                norm_rows(lay.attn_q_norm, bq, bq, hd, 0, hd, hd, n * H);
+                norm_rows(lay.attn_k_norm, bk, bk, hd, 0, hd, hd,
+                          n * hp.n_kv_heads);
+            }
             rope_rows(bq, divisors, H, hd, 0, hd, q_dim, false);
             rope_rows(bk, divisors, hp.n_kv_heads, hd, 0, hd, kv_dim,
                       false);
