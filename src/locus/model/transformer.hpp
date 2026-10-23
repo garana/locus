@@ -393,20 +393,6 @@ class TransformerModel {
          * (qwen3moe); empty on arches without them. */
         std::span<const float> attn_q_norm, attn_k_norm;
 
-        /**
-         * @returns Whether the layer has any attention extra beyond
-         *     the llama / deepseek2 projections: a q/k/v bias
-         *     (qwen2moe) or a per-head q/k norm (qwen3moe). Backends
-         *     that implement only the plain attention check this, not
-         *     one member of a pair that happens to travel together.
-         *     The DSA indexer (glm-dsa: idx_k_norm and friends) is not
-         *     covered: it is declined model-wide on hp.idx_top_k.
-         */
-        bool has_attn_extras() const {
-            return has_qkv_bias() || !attn_q_norm.empty() ||
-                   !attn_k_norm.empty();
-        }
-
         /** @returns Whether any q/k/v projection bias is present. */
         bool has_qkv_bias() const {
             return !wq_bias.empty() || !wk_bias.empty() ||
