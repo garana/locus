@@ -406,7 +406,9 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
             REQUIRE(tok->decode(gen) == gd.continuation);
         }
         // Batched prefill (per-head q/k norm and NEOX rope over a
-        // chunk's rows) ingesting the longer prompt, then decode.
+        // chunk's rows) ingesting the longer prompt, then decode. On
+        // vulkan this still degrades to per-token decode: the batch
+        // path needs an expert id-matmul, which Q4_K / Q6_K lack.
         if (model.supports_batch_prefill()) {
             const Golden& gd = goldens[1];
             INFO(be << " batched prefill: " << gd.prompt);
