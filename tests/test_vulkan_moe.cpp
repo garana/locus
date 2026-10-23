@@ -327,7 +327,10 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
             return got;
         };
 
-        SECTION("split slots, matrix = routed id") {
+        // The type in the name: plain SECTIONs in a loop are tracked
+        // by name, so they would run on the first type only.
+        DYNAMIC_SECTION("split slots, matrix = routed id, type "
+                        << static_cast<int>(c.type)) {
             auto got = run(1, rows * slots,
                            std::vector<float>(rows * slots, 0.0f));
             for (std::uint32_t k = 0; k < slots; ++k) {
@@ -338,7 +341,8 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
                 }
             }
         }
-        SECTION("weighted sum of routed slots accumulates") {
+        DYNAMIC_SECTION("weighted sum of routed slots accumulates, type "
+                        << static_cast<int>(c.type)) {
             std::vector<float> init(rows);
             for (auto& v : init) {
                 v = dist(rng);
