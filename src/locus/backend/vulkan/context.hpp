@@ -91,6 +91,9 @@ enum class Kernel {
     kMatmulQ6_K,
     kMatmulQ4_KId,
     kMatmulQ6_KId,
+    /** silu_mul scaled per row by sigmoid(logit) (qwen2moe's gated
+     * shared expert). */
+    kSiluMulSg,
     kCount_,
 };
 

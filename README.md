@@ -38,8 +38,9 @@ Attention -- the path to DeepSeek V3/R1, Kimi K2, and Kimi K3) is
 in docs/DESIGN.md section 7. Greedy output is validated
 token-exact against llama.cpp on stories260K, Llama-3.2-1B
 (Q8_0 and Q4_K_M), DeepSeek-V2-Lite, Moonlight-16B-A3B,
-Qwen3-Coder-30B-A3B (qwen3moe, Q4_K_M; CPU and Vulkan), and GLM-5.2 744B
-(UD-IQ1_S, streamed from a 203GB split GGUF on a 32GB machine --
+Qwen1.5-MoE-A2.7B (qwen2moe, Q4_K_M; CPU and Vulkan),
+Qwen3-Coder-30B-A3B (qwen3moe, Q4_K_M; CPU and Vulkan), and GLM-5.2
+744B (UD-IQ1_S, streamed from a 203GB split GGUF on a 32GB machine --
 see the R8 notes in DESIGN.md). Streaming
 models decode with madvise readahead (default-on), optional
 threaded matvecs (LOCUS_THREADS) and static-weight pinning

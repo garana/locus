@@ -634,7 +634,10 @@ bool moe_shared_ok(const model::Hparams& hp,
     const auto q8 = gguf::TensorType::kQ8_0;
     const std::uint64_t ff_sh =
         std::uint64_t{hp.n_ff_exp} * hp.n_expert_shared;
-    return hp.n_expert_shared > 0 && g.type == q8 && d.type == q8 &&
+    // A gated shared expert (qwen2moe) needs its sigmoid scale; the
+    // fused routed + shared kernels have none.
+    return hp.n_expert_shared > 0 && hp.n_ff_shexp == 0 &&
+           lay.gate_inp_shexp.rows == 0 && g.type == q8 && d.type == q8 &&
            lay.up_exps.expert(0).type == q8 &&
            lay.gate_exps.expert_bytes == lay.up_exps.expert_bytes &&
            lay.gate_shexp.type == q8 && lay.up_shexp.type == q8 &&
@@ -642,6 +645,13 @@ bool moe_shared_ok(const model::Hparams& hp,
            lay.up_shexp.cols == g.cols && lay.gate_shexp.rows >= ff_sh &&
            lay.up_shexp.rows >= ff_sh && lay.down_shexp.cols == ff_sh &&
            lay.down_shexp.rows == d.rows && ff_sh % 32 == 0;
+}
+
+/** @returns The shared-expert FFN width (n_ff_shexp when it differs
+ * from the routed width: qwen2moe), as the CPU forward uses it. */
+std::uint32_t shexp_ff(const model::Hparams& hp) {
+    return hp.n_ff_shexp > 0 ? hp.n_ff_shexp
+                             : hp.n_ff_exp * hp.n_expert_shared;
 }
 
 /** Batched matvec mode bits (matvec*.comp, -DBATCHED). */
@@ -857,6 +867,20 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
         s.ctx.dispatch(Kernel::kSumSplits, sbufs, spush,
                        (plane + 255) / 256);
     }
+}
+
+/**
+ * Records out[out_off + r] += bias[r]: an F32 matvec of the bias
+ * column by a constant 1, accumulated (q / k / v biases, qwen2moe,
+ * without a dedicated kernel).
+ */
+void rec_bias(State& s, std::span<const float> bias,
+              VulkanContext::Buffer out, std::uint32_t out_off) {
+    static const float kOne = 1.0f;
+    const Mat b{gguf::TensorType::kF32,
+                reinterpret_cast<const std::byte*>(bias.data()),
+                static_cast<std::uint32_t>(bias.size()), 1};
+    rec_matvec(s, b, s.upload(&kOne, sizeof kOne), out, out_off, true);
 }
 
 /**
@@ -1286,8 +1310,9 @@ bool gpu_weights_ok(const model::TransformerModel& m) {
         // The full GPU forward implements the llama / deepseek2
         // attention plus per-head q/k norms (qwen3moe); q/k/v biases
         // (qwen2moe) and any other extra take the CPU path.
-        if (l.has_qkv_bias() ||
-            (l.has_attn_extras() && !l.has_qk_norm())) {
+        // q / k / v biases (qwen2moe) are added after the
+        // projections; a lone q or k norm is not a known arch.
+        if (l.attn_q_norm.empty() != l.attn_k_norm.empty()) {
             return false;
         }
         // Outside MLA it reads separate q, k and v projections of the
@@ -1395,7 +1420,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     const bool qblk = quant && !f16;
     if (qblk && (hp.rope_neox ||
                  std::ranges::any_of(m.layers(), [](const auto& l) {
-                     return l.has_qk_norm();
+                     return l.has_qk_norm() || l.has_qkv_bias();
                  }))) {
         // The Q8/Q4 KV store path norms and ropes K inside the store:
         // interleaved pairs only, no per-head norm. Those models keep
@@ -1410,9 +1435,8 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     const std::uint32_t qk = nope + rope_d;
 
     s.grow(s.x, s.x_n, hp.n_embd);
-    const std::uint32_t ff_max = std::max(
-        {hp.n_ff, hp.n_ff_exp,
-         hp.n_ff_exp * hp.n_expert_shared});
+    const std::uint32_t ff_max =
+        std::max({hp.n_ff, hp.n_ff_exp, shexp_ff(hp)});
     s.grow(s.xb, s.xb_n,
            std::max<std::size_t>(hp.n_embd, ff_max));
     // GQA q / attention output: n_heads * head_dim, which exceeds
@@ -1502,12 +1526,27 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                       std::uint64_t off_d,
                       VulkanContext::Buffer* whole_g,
                       VulkanContext::Buffer* whole_u,
-                      VulkanContext::Buffer* whole_d) {
+                      VulkanContext::Buffer* whole_d,
+                      const Mat* sh_gate = nullptr) {
         Mat g2 = wg, u2 = wu, d2 = wd;
         g2.rows = ff;
         u2.rows = ff;
         d2.cols = ff;
-        if (wg.type == gguf::TensorType::kQ8_0 &&
+        if (sh_gate != nullptr) {
+            // Gated shared expert (qwen2moe): the activation is also
+            // scaled by sigmoid(sh_gate . x), its 1-wide logit (in
+            // s.router: routing has consumed it by now).
+            rec_matvec(s, *sh_gate, s.xb, s.router, 0, false);
+            rec_matvec(s, g2, s.xb, s.gate, 0, false, off_g, 0, 1.0f,
+                       whole_g);
+            rec_matvec(s, u2, s.xb, s.up, 0, false, off_u, 0, 1.0f,
+                       whole_u);
+            const VulkanContext::Buffer bufs[] = {s.gate, s.up, s.gate,
+                                                  s.router};
+            const std::uint32_t push[] = {ff, ff};
+            s.ctx.dispatch(Kernel::kSiluMulSg, bufs, push,
+                           (ff + 63) / 64);
+        } else if (wg.type == gguf::TensorType::kQ8_0 &&
             wu.type == gguf::TensorType::kQ8_0 && wg.cols == wu.cols &&
             off_g == off_u) {
             // Gate, up and silu_mul in one fused dispatch.
@@ -1557,7 +1596,10 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             // norm, so NEOX / q-k-norm models (qwen3moe) still stack
             // the projection but norm and rope q and k afterwards.
             const bool qk_norm = lay.has_qk_norm();
-            const bool epi_rope = fused && !hp.rope_neox && !qk_norm;
+            const bool bias = lay.has_qkv_bias();
+            // Biases land before rope, so no epilogue rope with them.
+            const bool epi_rope =
+                fused && !hp.rope_neox && !qk_norm && !bias;
             const Kernel rope_k =
                 hp.rope_neox ? Kernel::kRopeNeox : Kernel::kRope;
             // Per-head RMS norm in place: `heads` rows of head_dim
@@ -1597,6 +1639,9 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             } else {
                 rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
             }
+            if (!lay.wq_bias.empty()) {
+                rec_bias(s, lay.wq_bias, s.q, 0);
+            }
             if (!epi_rope) {
                 if (qk_norm) {
                     head_norm(s.q, 0, hp.n_heads, lay.attn_q_norm);
@@ -1612,6 +1657,12 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 if (!fused) {
                     rec_matvec(s, lay.wk, s.xb, kv_dst, k_at, false);
                     rec_matvec(s, lay.wv, s.xb, kv_dst, v_at, false);
+                }
+                if (!lay.wk_bias.empty()) {
+                    rec_bias(s, lay.wk_bias, kv_dst, k_at);
+                }
+                if (!lay.wv_bias.empty()) {
+                    rec_bias(s, lay.wv_bias, kv_dst, v_at);
                 }
                 if (!epi_rope) {
                     if (qk_norm) {
@@ -2002,8 +2053,10 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             }
             if (hp.n_expert_shared > 0 && !sh) {
                 swiglu(lay.gate_shexp, lay.up_shexp, lay.down_shexp,
-                       hp.n_ff_exp * hp.n_expert_shared, 1.0f, 0, 0, 0,
-                       nullptr, nullptr, nullptr);
+                       shexp_ff(hp), 1.0f, 0, 0, 0, nullptr, nullptr,
+                       nullptr,
+                       lay.gate_inp_shexp.rows > 0 ? &lay.gate_inp_shexp
+                                                   : nullptr);
             }
         } else {
             // Router runs on the CPU: sync the batch, read the
@@ -2050,10 +2103,11 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                        0, 0, &bg, &bu, &bd);
             }
             if (hp.n_expert_shared > 0) {
-                swiglu(lay.gate_shexp, lay.up_shexp,
-                       lay.down_shexp,
-                       hp.n_ff_exp * hp.n_expert_shared, 1.0f, 0,
-                       0, 0, nullptr, nullptr, nullptr);
+                swiglu(lay.gate_shexp, lay.up_shexp, lay.down_shexp,
+                       shexp_ff(hp), 1.0f, 0, 0, 0, nullptr, nullptr,
+                       nullptr,
+                       lay.gate_inp_shexp.rows > 0 ? &lay.gate_inp_shexp
+                                                   : nullptr);
             }
         }
     }
@@ -2102,6 +2156,13 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     }
     // Routed experts need GPU routing (all experts resident) and an
     // id-matmul; moe_group handles up to 256 experts.
+    // q / k / v biases and the gated shared expert (qwen2moe) run on
+    // the GPU decode path only so far.
+    for (const auto& lay : m.layers()) {
+        if (lay.has_qkv_bias() || lay.gate_inp_shexp.rows > 0) {
+            return false;
+        }
+    }
     for (const auto& lay : m.layers()) {
         if (lay.is_moe() &&
             (!gpu_route_ok(s, m, lay) || hp.n_expert > 256 ||
@@ -2126,8 +2187,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const std::uint32_t att_dim = mla ? H * vd : H * hp.head_dim;
     const std::uint32_t n_pos = base + n;  // last token's span
     const std::uint32_t k_used = hp.n_expert_used;
-    const std::uint32_t ff_dense =
-        std::max(hp.n_ff, hp.n_ff_exp * hp.n_expert_shared);
+    const std::uint32_t ff_dense = std::max(hp.n_ff, shexp_ff(hp));
     const std::size_t ff_rows = std::max<std::size_t>(
         std::size_t{n} * ff_dense,
         std::size_t{n} * k_used * hp.n_ff_exp);
@@ -2477,7 +2537,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         }
         if (hp.n_expert_shared > 0) {
             swiglu_rows(lay.gate_shexp, lay.up_shexp, lay.down_shexp,
-                        hp.n_ff_exp * hp.n_expert_shared);
+                        shexp_ff(hp));
         }
     }
 
