@@ -925,5 +925,65 @@ TEST_CASE("the full GPU forward declines dbrx's fused qkv and LayerNorm",
     REQUIRE(hp.norm_type == locus::model::NormType::kLayerNorm);
     REQUIRE(hp.rope_neox);
     REQUIRE(model.layers()[0].wk.rows == 0);
+    // dbrx trips both conditions at once; the two cases below cover
+    // each alone through its predicate.
+    REQUIRE_FALSE(model.layers()[0].has_separate_qkv(hp));
+    REQUIRE_FALSE(locus::backend::vulkan_hparams_supported(hp));
     REQUIRE_FALSE(locus::backend::vulkan_forward_supported(model));
+}
+
+TEST_CASE("Layer::has_separate_qkv wants the GQA q / k / v shapes",
+          "[model]") {
+    using Layer = TransformerModel::Layer;
+    locus::model::Hparams hp;
+    hp.n_heads = 4;
+    hp.n_kv_heads = 2;
+    hp.head_dim = 8;
+    auto mat = [](std::uint32_t rows) {
+        locus::backend::Mat m{};
+        m.rows = rows;
+        m.cols = 32;
+        return m;
+    };
+    Layer gqa;
+    gqa.wq = mat(32);
+    gqa.wk = mat(16);
+    gqa.wv = mat(16);
+    REQUIRE(gqa.has_separate_qkv(hp));
+    Layer fused;  // dbrx: [q|k|v] in wq, wk / wv empty
+    fused.wq = mat(32 + 2 * 16);
+    REQUIRE_FALSE(fused.has_separate_qkv(hp));
+    Layer narrow = gqa;  // any one projection off its shape
+    narrow.wv = mat(8);
+    REQUIRE_FALSE(narrow.has_separate_qkv(hp));
+    REQUIRE_FALSE(Layer{}.has_separate_qkv(hp));  // MLA: no wq / wk
+}
+
+TEST_CASE("vulkan_hparams_supported declines each hparam alone",
+          "[model]") {
+    // i#142: the same model-level decisions vulkan_forward makes,
+    // one at a time (no device needed).
+    locus::model::Hparams hp;
+    hp.head_dim = 128;
+    REQUIRE(locus::backend::vulkan_hparams_supported(hp));
+    auto with = [&](auto change) {
+        locus::model::Hparams h = hp;
+        change(h);
+        return locus::backend::vulkan_hparams_supported(h);
+    };
+    REQUIRE_FALSE(with([](auto& h) {
+        h.norm_type = locus::model::NormType::kLayerNorm;
+    }));
+    REQUIRE_FALSE(with([](auto& h) { h.idx_top_k = 2048; }));  // glm
+    REQUIRE_FALSE(with([](auto& h) { h.head_dim = 1024; }));
+    // MLA: the latent rank must fit too; only MLA checks it.
+    REQUIRE(with([](auto& h) { h.kv_lora_rank = 1024; }));
+    REQUIRE_FALSE(with([](auto& h) {
+        h.arch = locus::model::Arch::kDeepseek2;
+        h.kv_lora_rank = 1024;
+    }));
+    REQUIRE(with([](auto& h) {
+        h.arch = locus::model::Arch::kDeepseek2;
+        h.kv_lora_rank = 512;
+    }));
 }

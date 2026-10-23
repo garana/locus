@@ -9,10 +9,21 @@
 namespace locus::backend {
 
 /**
+ * @returns Whether the full GPU forward implements a model with
+ *     these hparams: RMSNorm, no DSA indexer, and head width (for
+ *     MLA also the latent rank) within the attention kernels' stage.
+ *     The hparam half of vulkan_forward_supported.
+ */
+bool vulkan_hparams_supported(const model::Hparams& hp);
+
+/**
  * @returns Whether the full GPU forward (vulkan_forward and
- *     vulkan_forward_batch) implements m's architecture and weight
- *     types. Device-independent: false means those always decline
- *     for m; true still needs a device and a GPU-mapped cache.
+ *     vulkan_forward_batch) implements m: its hparams
+ *     (vulkan_hparams_supported), every layer's attention shape, and
+ *     its weight types. Device-independent and the same decision both
+ *     forwards make from the model: false means they always decline
+ *     m; true leaves only device, cache and KV-type conditions (a
+ *     GPU-mapped pool, the KV types each path reads).
  */
 bool vulkan_forward_supported(const model::TransformerModel& m);
 
