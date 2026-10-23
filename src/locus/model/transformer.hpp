@@ -419,6 +419,19 @@ class TransformerModel {
             return !attn_q_norm.empty() && !attn_k_norm.empty();
         }
 
+        /**
+         * @returns Whether q, k and v are separate projections of the
+         *     GQA shapes (n_heads * head_dim and n_kv_heads * head_dim
+         *     rows). False for dbrx's fused qkv (held in wq, wk and wv
+         *     empty) and for MLA layers (no wk / wv).
+         */
+        bool has_separate_qkv(const Hparams& hp) const {
+            const std::uint64_t kv =
+                std::uint64_t{hp.n_kv_heads} * hp.head_dim;
+            return wq.rows == std::uint64_t{hp.n_heads} * hp.head_dim &&
+                   wk.rows == kv && wv.rows == kv;
+        }
+
         /** Dense FFN (unused when the layer is MoE). */
         backend::Mat w_gate, w_up, w_down;
         /** MoE router and expert tensors. */

@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/vulkan_forward.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "gguf_builder.hpp"
@@ -245,4 +246,21 @@ TEST_CASE("glm-dsa selects top_k positions beyond the cap",
         }
     }
     REQUIRE(diverged);
+}
+
+TEST_CASE("the full GPU forward support check matches its declines "
+          "(glm-dsa)",
+          "[dsa]") {
+    // i#142: vulkan_forward declines DSA indexer models on every
+    // token, so the inspectable check must say so too; the same
+    // weights as deepseek2 MLA are admitted.
+    auto glm_img = build_image("glm-dsa");
+    auto glm_g = locus::gguf::GgufFile::parse(glm_img);
+    auto glm = TransformerModel::load(glm_g);
+    REQUIRE(glm.hparams().idx_top_k > 0);
+    REQUIRE_FALSE(locus::backend::vulkan_forward_supported(glm));
+    auto ds_img = build_image("deepseek2");
+    auto ds_g = locus::gguf::GgufFile::parse(ds_img);
+    auto ds = TransformerModel::load(ds_g);
+    REQUIRE(locus::backend::vulkan_forward_supported(ds));
 }

@@ -1261,18 +1261,12 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
     return fit->second;
 }
 
-/** @returns true when every weight the GPU forward reads has a
- * matvec kernel (fused wkv_b goes through the F32-dequant path). */
+/** @returns true when every layer has the attention shape the GPU
+ * forward implements and every weight it reads has a matvec kernel
+ * (fused wkv_b goes through the F32-dequant path). */
 bool gpu_weights_ok(const model::TransformerModel& m) {
     const auto& hp = m.hparams();
-    // The GPU forward dispatches rmsnorm only (no LayerNorm: dbrx).
-    if (hp.norm_type != model::NormType::kRmsNorm) {
-        return false;
-    }
     const bool mla = hp.arch == model::Arch::kDeepseek2;
-    const std::uint64_t q_rows = std::uint64_t{hp.n_heads} * hp.head_dim;
-    const std::uint64_t kv_rows =
-        std::uint64_t{hp.n_kv_heads} * hp.head_dim;
     for (const auto& l : m.layers()) {
         // The full GPU forward implements the llama / deepseek2
         // attention plus per-head q/k norms (qwen3moe); q/k/v biases
@@ -1284,8 +1278,7 @@ bool gpu_weights_ok(const model::TransformerModel& m) {
         // Outside MLA it reads separate q, k and v projections of the
         // GQA shapes; anything else (dbrx's fused qkv held in wq, wk
         // and wv empty) is declined rather than admitted by omission.
-        if (!mla && (l.wq.rows != q_rows || l.wk.rows != kv_rows ||
-                     l.wv.rows != kv_rows)) {
+        if (!mla && !l.has_separate_qkv(hp)) {
             return false;
         }
         if (matvec_kernel(l.wo) == Kernel::kCount_) {
@@ -1310,8 +1303,20 @@ bool gpu_weights_ok(const model::TransformerModel& m) {
 
 }  // namespace
 
+bool vulkan_hparams_supported(const model::Hparams& hp) {
+    // rmsnorm only (no LayerNorm: dbrx). DSA indexer models: the
+    // 704-float cache row and the top-k selection are CPU-only for
+    // now. The attention kernels stage per-head slices in a fixed
+    // shared array (vk::kAttnPartMax floats): wider heads, or a
+    // larger MLA latent rank, would overrun it.
+    const bool mla = hp.arch == model::Arch::kDeepseek2;
+    return hp.norm_type == model::NormType::kRmsNorm &&
+           hp.idx_top_k == 0 && vk::attn_width_fits(hp.head_dim) &&
+           (!mla || vk::attn_width_fits(hp.kv_lora_rank));
+}
+
 bool vulkan_forward_supported(const model::TransformerModel& m) {
-    return gpu_weights_ok(m);
+    return vulkan_hparams_supported(m.hparams()) && gpu_weights_ok(m);
 }
 
 bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
@@ -1327,26 +1332,14 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     if (pool_it == s.kv_pools.end()) {
         return false;  // cache pool is not GPU-mapped
     }
-    if (hp.idx_top_k > 0) {
-        // DSA indexer models: the 704-float cache row and the
-        // top-k selection are CPU-only for now.
+    if (!vulkan_forward_supported(m)) {
         return false;
     }
     const bool mla = hp.arch == model::Arch::kDeepseek2;
-    // The attention kernels stage per-head slices in a fixed shared
-    // array (vk::kAttnPartMax floats): wider heads, or a larger MLA
-    // latent rank, take the CPU path instead of overrunning it.
-    if (!vk::attn_width_fits(hp.head_dim) ||
-        (mla && !vk::attn_width_fits(hp.kv_lora_rank))) {
-        return false;
-    }
     if (quant && mla &&
         cache.geometry().kv_type != kv::KvType::kF16) {
         // MLA caches a single latent row (no separate K/V); its Q8/Q4
         // read is a #45 follow-up. Fall back to CPU.
-        return false;
-    }
-    if (!gpu_weights_ok(m)) {
         return false;
     }
 
@@ -2072,7 +2065,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const bool mla = hp.arch == model::Arch::kDeepseek2;
     // F16 is the one non-F32 pool the batched path reads.
     if (n == 0 || (cache.quantized() && !f16) ||
-        hp.idx_top_k > 0 || !gpu_weights_ok(m)) {
+        !vulkan_forward_supported(m)) {
         return false;
     }
     auto pool_it = s.kv_pools.find(
