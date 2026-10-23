@@ -10,6 +10,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan_forward.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "gguf_builder.hpp"
@@ -68,25 +69,29 @@ class ModelBuilder {
         }
     }
 
-    /** @returns The complete GGUF image. */
+    /**
+     * @returns The complete GGUF image, its hparams keyed under
+     *     `arch` (llama by default; dbrx reads the same keys).
+     */
     std::vector<std::byte> build(std::uint32_t n_expert,
-                                 std::uint32_t n_used) {
+                                 std::uint32_t n_used,
+                                 const std::string& arch = "llama") {
         GgufBuilder b;
         const std::uint32_t n_kv =
             n_expert > 0 ? 10u : 8u;
         b.header(tensors_.size(), n_kv)
-            .kv_string("general.architecture", "llama")
-            .kv_u32("llama.embedding_length", kEmbd)
-            .kv_u32("llama.block_count", 1)
-            .kv_u32("llama.attention.head_count", 2)
-            .kv_u32("llama.attention.head_count_kv", 2)
-            .kv_u32("llama.feed_forward_length", kFf)
-            .kv_u32("llama.context_length", 32)
-            .kv_f32("llama.attention.layer_norm_rms_epsilon",
+            .kv_string("general.architecture", arch)
+            .kv_u32(arch + ".embedding_length", kEmbd)
+            .kv_u32(arch + ".block_count", 1)
+            .kv_u32(arch + ".attention.head_count", 2)
+            .kv_u32(arch + ".attention.head_count_kv", 2)
+            .kv_u32(arch + ".feed_forward_length", kFf)
+            .kv_u32(arch + ".context_length", 32)
+            .kv_f32(arch + ".attention.layer_norm_rms_epsilon",
                     1e-5f);
         if (n_expert > 0) {
-            b.kv_u32("llama.expert_count", n_expert)
-                .kv_u32("llama.expert_used_count", n_used);
+            b.kv_u32(arch + ".expert_count", n_expert)
+                .kv_u32(arch + ".expert_used_count", n_used);
         }
         std::uint64_t offset = 0;
         for (const auto& t : tensors_) {
@@ -872,4 +877,53 @@ TEST_CASE("Layer::has_attn_extras flags any q/k/v bias or q/k norm",
     qk.attn_k_norm = w;
     REQUIRE(qk.has_qk_norm());
     REQUIRE_FALSE(qk.has_qkv_bias());
+}
+
+TEST_CASE("the full GPU forward declines dbrx's fused qkv and LayerNorm",
+          "[model]") {
+    // i#138: the gate is positive, so an attention shape the GPU
+    // forward does not implement is declined, not admitted because
+    // it lacks a known extra. Device-independent (weight types and
+    // shapes only).
+    constexpr std::uint32_t kNe = 4;
+    auto experts = [](ModelBuilder& mb) {
+        mb.tensor("blk.0.ffn_gate_inp.weight", {kE, kNe},
+                  weights(kE * kNe, 60));
+        mb.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, kNe},
+                  weights(kE * kF * kNe, 61));
+        mb.tensor("blk.0.ffn_up_exps.weight", {kE, kF, kNe},
+                  weights(kE * kF * kNe, 62));
+        mb.tensor("blk.0.ffn_down_exps.weight", {kF, kE, kNe},
+                  weights(kF * kE * kNe, 63));
+    };
+    {
+        // The same MoE as a llama: separate q / k / v, RMSNorm.
+        ModelBuilder mb;
+        mb.common();
+        experts(mb);
+        auto g = locus::gguf::GgufFile::parse(mb.build(kNe, 2));
+        auto model = TransformerModel::load(g);
+        REQUIRE(locus::backend::vulkan_forward_supported(model));
+    }
+    // dbrx: one fused [q|k|v] in wq (kv_dim == kE: 2 kv heads of 4),
+    // wk / wv empty, LayerNorm, NEOX rope.
+    ModelBuilder mb;
+    mb.tensor("token_embd.weight", {kE, ModelBuilder::kVocab},
+              weights(kE * ModelBuilder::kVocab, 1));
+    mb.tensor("blk.0.attn_norm.weight", {kE},
+              std::vector<float>(kE, 1.0f));
+    mb.tensor("output_norm.weight", {kE}, std::vector<float>(kE, 1.0f));
+    mb.tensor("blk.0.attn_qkv.weight", {kE, 3 * kE},
+              weights(kE * 3 * kE, 64));
+    mb.tensor("blk.0.attn_output.weight", {kE, kE}, weights(kE * kE, 65));
+    mb.tensor("blk.0.attn_output_norm.weight", {kE},
+              std::vector<float>(kE, 1.0f));
+    experts(mb);
+    auto g = locus::gguf::GgufFile::parse(mb.build(kNe, 2, "dbrx"));
+    auto model = TransformerModel::load(g);
+    const auto& hp = model.hparams();
+    REQUIRE(hp.norm_type == locus::model::NormType::kLayerNorm);
+    REQUIRE(hp.rope_neox);
+    REQUIRE(model.layers()[0].wk.rows == 0);
+    REQUIRE_FALSE(locus::backend::vulkan_forward_supported(model));
 }

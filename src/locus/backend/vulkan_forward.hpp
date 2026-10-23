@@ -9,6 +9,14 @@
 namespace locus::backend {
 
 /**
+ * @returns Whether the full GPU forward (vulkan_forward and
+ *     vulkan_forward_batch) implements m's architecture and weight
+ *     types. Device-independent: false means those always decline
+ *     for m; true still needs a device and a GPU-mapped cache.
+ */
+bool vulkan_forward_supported(const model::TransformerModel& m);
+
+/**
  * Runs one full token forward on the GPU: all matmuls (F32/Q8_0
  * shaders), rmsnorm, RoPE, SwiGLU, and paged attention reading
  * K/V straight from the GPU-mapped cache pool, recorded as one
