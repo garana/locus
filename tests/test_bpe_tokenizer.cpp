@@ -142,3 +142,26 @@ TEST_CASE("bpe pretokenizers: qwen2 is llama3 with single digits",
     REQUIRE(tok_for("llama3").encode(".a12", false) == V{4, 5});
     REQUIRE(tok_for("gpt2").encode(".a12", false) == V{0, 1, 5});
 }
+
+TEST_CASE("bpe pretokenizers: gpt-4o splits case runs and keeps "
+          "contraction suffixes",
+          "[tok]") {
+    // Merges "o B" -> "oB" and "t '" -> "t'" show the chunks: llama3
+    // keeps "foBar" whole (one letter run) and splits "t's" into "t"
+    // and the contraction "'s"; gpt-4o (o200k, Muse Spark) splits
+    // "fo" | "Bar" at the case boundary and keeps "t's" as one word
+    // with its contraction suffix.
+    auto tok_for = [](const char* pre) {
+        BpeTokenizer::Config cfg;
+        cfg.tokens = {"f", "o", "B", "a", "r", "t", "'", "s", "oB", "t'"};
+        cfg.types = std::vector<std::int32_t>(cfg.tokens.size(), 1);
+        cfg.merges = {"o B", "t '"};
+        cfg.pre = pre;
+        return BpeTokenizer(std::move(cfg));
+    };
+    using V = std::vector<TokenId>;
+    REQUIRE(tok_for("gpt-4o").encode("foBar", false) == V{0, 1, 2, 3, 4});
+    REQUIRE(tok_for("llama3").encode("foBar", false) == V{0, 8, 3, 4});
+    REQUIRE(tok_for("gpt-4o").encode("t's", false) == V{9, 7});
+    REQUIRE(tok_for("llama3").encode("t's", false) == V{5, 6, 7});
+}

@@ -129,10 +129,23 @@ std::vector<Chunk> pretokenize(std::string_view text,
     // (Qwen2/Qwen3) is llama3's split with single digits (`\p{N}`
     // instead of `\p{N}{1,3}`).
     const bool qwen2 = pre == "qwen2";
+    // gpt-4o (o200k; Muse Spark) also splits case runs, as llama.cpp
+    // does, with letters that are not a-z as "upper" and letters that
+    // are not A-Z as "lower" (so non-ASCII is both):
+    //   [^\r\n\p{L}\p{N}]?U*L+C? | [^\r\n\p{L}\p{N}]?U+L*C?
+    // C is a case-insensitive contraction suffix (there is no
+    // standalone one), and punctuation runs also take trailing '/'.
+    const bool gpt4o = pre == "gpt-4o";
     const bool llama3 = pre == "llama-bpe" || pre == "llama3" ||
                         pre == "deepseek-v3" ||
-                        pre == "deepseek-r1-qwen" || qwen2;
+                        pre == "deepseek-r1-qwen" || qwen2 || gpt4o;
     const std::size_t digit_cap = qwen2 ? 1 : 3;
+    auto is_upper = [&](std::size_t k) {
+        return is_letter(cps[k]) && !(cps[k] >= 'a' && cps[k] <= 'z');
+    };
+    auto is_lower = [&](std::size_t k) {
+        return is_letter(cps[k]) && !(cps[k] >= 'A' && cps[k] <= 'Z');
+    };
 
     std::vector<Chunk> out;
     std::size_t i = 0;
@@ -161,7 +174,35 @@ std::vector<Chunk> pretokenize(std::string_view text,
 
     while (i < n) {
         const std::size_t start = i;
-        if (std::size_t len = is_contraction(i)) {
+        if (gpt4o && (is_letter(cps[i]) ||
+                      (cps[i] != '\r' && cps[i] != '\n' &&
+                       !is_digit(cps[i]) && i + 1 < n &&
+                       is_letter(cps[i + 1])))) {
+            if (!is_letter(cps[i])) {
+                ++i;  // the optional prefix char
+            }
+            // U*L+: the longest upper run, backed off to the last
+            // position that can start the lower run; else U+L*.
+            std::size_t j = i;
+            while (j < n && is_upper(j)) {
+                ++j;
+            }
+            std::size_t k = j;
+            while (k > i && !(k < n && is_lower(k))) {
+                --k;
+            }
+            if (k < n && is_lower(k)) {
+                while (k < n && is_lower(k)) {
+                    ++k;
+                }
+                i = k;
+            } else {
+                i = j;  // U+ with no lower letter after it
+            }
+            if (i < n) {
+                i += is_contraction(i);
+            }
+        } else if (std::size_t len = gpt4o ? 0 : is_contraction(i)) {
             i += len;
         } else if (is_letter(cps[i]) ||
                    // llama3: `[^\r\n\p{L}\p{N}]?\p{L}+` -- any
@@ -203,7 +244,8 @@ std::vector<Chunk> pretokenize(std::string_view text,
             }
             if (llama3) {
                 while (i < n &&
-                       (cps[i] == '\r' || cps[i] == '\n')) {
+                       (cps[i] == '\r' || cps[i] == '\n' ||
+                        (gpt4o && cps[i] == '/'))) {
                     ++i;
                 }
             }
