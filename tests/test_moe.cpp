@@ -1038,3 +1038,112 @@ TEST_CASE("vulkan_hparams_supported declines each hparam alone",
         h.kv_lora_rank = 512;
     }));
 }
+
+TEST_CASE("batched prefill keeps the Q8_0-activation dot of decode",
+          "[batch]") {
+    // ec2's #197 note: with R16 on, matvec_mt sends Q8_0 weights to
+    // the Q8_0-activation dot; matvec_batch must too, or prefill (f32)
+    // and decode (Q8_0) disagree. A llama with Q8_0 attention and FFN
+    // weights (widths 32, whole blocks), batched vs per-token.
+    constexpr std::uint32_t E = 32, F = 32, V = 16;
+    std::uint32_t seed = 90;
+    auto q8 = [&](std::uint32_t rows, std::uint32_t cols) {
+        std::vector<std::byte> b;
+        const auto v = weights(std::size_t{rows} * cols, seed++);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            for (std::uint32_t blk = 0; blk < cols / 32; ++blk) {
+                const std::uint16_t d = locus::backend::f32_to_f16(0.004f);
+                const auto* dp = reinterpret_cast<const std::byte*>(&d);
+                b.insert(b.end(), dp, dp + 2);
+                for (int j = 0; j < 32; ++j) {
+                    const float x = v[std::size_t{r} * cols + blk * 32 + j];
+                    b.push_back(static_cast<std::byte>(
+                        static_cast<std::int8_t>(std::lround(x * 1000.0f))));
+                }
+            }
+        }
+        return b;
+    };
+    struct T {
+        std::string name;
+        std::vector<std::uint64_t> dims;
+        std::uint32_t type;
+        std::vector<std::byte> bytes;
+    };
+    auto f32 = [](std::vector<float> v) {
+        std::vector<std::byte> b(v.size() * 4);
+        std::memcpy(b.data(), v.data(), b.size());
+        return b;
+    };
+    std::vector<T> ts = {
+        {"token_embd.weight", {E, V}, 0, f32(weights(E * V, 1))},
+        {"output_norm.weight", {E}, 0, f32(std::vector<float>(E, 1.0f))},
+        {"blk.0.attn_norm.weight", {E}, 0, f32(std::vector<float>(E, 1.0f))},
+        {"blk.0.ffn_norm.weight", {E}, 0, f32(std::vector<float>(E, 1.0f))},
+    };
+    for (const char* n : {"attn_q", "attn_k", "attn_v", "attn_output"}) {
+        ts.push_back({std::string("blk.0.") + n + ".weight", {E, E}, 8,
+                      q8(E, E)});
+    }
+    ts.push_back({"blk.0.ffn_gate.weight", {E, F}, 8, q8(F, E)});
+    ts.push_back({"blk.0.ffn_up.weight", {E, F}, 8, q8(F, E)});
+    ts.push_back({"blk.0.ffn_down.weight", {F, E}, 8, q8(E, F)});
+    GgufBuilder b;
+    b.header(ts.size(), 8)
+        .kv_string("general.architecture", "llama")
+        .kv_u32("llama.embedding_length", E)
+        .kv_u32("llama.block_count", 1)
+        .kv_u32("llama.attention.head_count", 2)
+        .kv_u32("llama.attention.head_count_kv", 2)
+        .kv_u32("llama.feed_forward_length", F)
+        .kv_u32("llama.context_length", 32)
+        .kv_f32("llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    std::uint64_t offset = 0;
+    for (const auto& t : ts) {
+        b.tensor(t.name, t.dims, t.type, offset);
+        offset = (offset + t.bytes.size() + 31) & ~31ull;
+    }
+    b.pad();
+    for (const auto& t : ts) {
+        for (auto by : t.bytes) {
+            b.u8(static_cast<std::uint8_t>(by));
+        }
+        while (b.bytes().size() % 32 != 0) {
+            b.zeros(1);
+        }
+    }
+    auto span = b.bytes();
+    const std::vector<std::byte> img(span.begin(), span.end());
+    auto g = locus::gguf::GgufFile::parse(img);
+    auto model = TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("scalar"));
+    REQUIRE(model.supports_batch());
+    const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 5};
+    auto last = [&](bool batched) {
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        if (batched) {
+            REQUIRE(cache.ensure_capacity(seq, toks.size()));
+            model.forward_batch(toks, cache, seq, ws, logits);
+        } else {
+            for (auto t : toks) {
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(t, cache, seq, ws, logits);
+            }
+        }
+        cache.release(seq);
+        return logits;
+    };
+    for (const bool q8k : {false, true}) {
+        INFO("q8k " << q8k);
+        model.use_q8k_activations(q8k);
+        REQUIRE(last(true) == last(false));  // prefill == decode
+    }
+    // And the flag reaches these weights at all.
+    model.use_q8k_activations(false);
+    const auto f = last(false);
+    model.use_q8k_activations(true);
+    REQUIRE(last(false) != f);
+}

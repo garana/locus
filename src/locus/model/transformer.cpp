@@ -180,8 +180,7 @@ namespace {
 decltype(backend::Ops::matvec) matvec_kernel(const backend::Ops& op,
                                              const Mat& w) {
     return (op.matvec_q8k != nullptr &&
-            (backend::is_q8k_type(w.type) ||
-             backend::is_q8_0_act_type(w.type)))
+            backend::uses_quantized_activation(w.type))
                ? op.matvec_q8k
                : op.matvec;
 }
@@ -1341,8 +1340,9 @@ void matvec_batch_deq(const backend::Ops& op, const Mat& w,
 void matvec_batch(const backend::Ops& op, const Mat& w,
                   std::span<const float> x_batch,
                   std::span<float> out_batch, std::uint32_t n) {
-    // R16 ggml parity: QK_K types run the Q8_K activation dot per
-    // token via matvec_mt (which routes to op.matvec_q8k, row-sliced).
+    // R16 ggml parity: QK_K types (Q8_K) and block-32 types (Q8_0) run
+    // the quantized-activation dot per token via matvec_mt (which
+    // routes to op.matvec_q8k, row-sliced).
     // The batched contract is "byte-identical to n per-token matvecs",
     // so this holds by construction -- and it keeps prefill==decode,
     // both going through the same Q8_K path. (The register-blocked f32
@@ -1351,7 +1351,8 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
     // work.)
     const std::uint32_t xc = w.cols;
     const std::uint32_t oc = w.rows;
-    if (op.matvec_q8k != nullptr && backend::is_q8k_type(w.type)) {
+    if (op.matvec_q8k != nullptr &&
+        backend::uses_quantized_activation(w.type)) {
         for (std::uint32_t t = 0; t < n; ++t) {
             matvec_mt(op, w,
                       x_batch.subspan(static_cast<std::size_t>(t) * xc,

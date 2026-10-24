@@ -133,6 +133,15 @@ bool is_q8k_type(gguf::TensorType type);
 bool is_q8_0_act_type(gguf::TensorType type);
 
 /**
+ * @returns Whether matvec_q8k takes a quantized-activation dot for w
+ *     (is_q8k_type or is_q8_0_act_type). The one predicate every
+ *     dispatch to matvec_q8k uses, so decode and batched prefill agree.
+ */
+inline bool uses_quantized_activation(gguf::TensorType type) {
+    return is_q8k_type(type) || is_q8_0_act_type(type);
+}
+
+/**
  * Quantizes activation x to Q8_K, writing the block fields as flat
  * arrays: d[n/256], qs[n] (int8), bsums[n/16] (int16), where n =
  * x.size() (must be a multiple of 256). Bit-identical to the internal

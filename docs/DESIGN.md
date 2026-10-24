@@ -1373,7 +1373,10 @@ matvec throughput.
 - Block-32 weights (#189): the same mode dots Q8_0 / Q4_0 / IQ4_NL
   weights against a Q8_0-quantized activation (llama.cpp's vec_dot_type
   for them: d = amax / 127 as f16, quants rounded to nearest even),
-  accumulated in ggml's NEON lane order.
+  accumulated in the order of ggml's non-repacked NEON
+  vec_dot_q8_0_q8_0 (Q4_0 / IQ4_NL reuse it, so they match ggml to
+  rounding only; its repacked kernels have their own orders). The
+  evidence is the token-exact Muse Spark golden.
 - Per-arch default (#189): an arch whose goldens are llama.cpp's sets
   Hparams::q8k_default, so the mode is on at load (muse-spark,
   deepseek41); use_q8k_activations still overrides it. Every arch hook

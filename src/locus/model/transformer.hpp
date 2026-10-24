@@ -219,8 +219,9 @@ class TransformerModel {
     /**
      * @returns The active backend's ops as the forward uses them:
      *     Ops::matvec_q8k cleared unless Q8_K-activation mode is on.
-     *     Arch hooks take these, never active_backend().ops directly,
-     *     so use_q8k_activations holds for every arch.
+     *     Arch hooks take these, never the backend's raw ops, so
+     *     use_q8k_activations holds for every arch (a test greps
+     *     src/locus/model for the raw accessor).
      */
     backend::Ops ops() const;
 

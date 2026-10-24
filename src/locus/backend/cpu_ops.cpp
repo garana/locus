@@ -2045,9 +2045,13 @@ float unpack_block32(gguf::TensorType type, const std::byte* row,
 
 /**
  * dot(block-32 weight row, Q8_0 activation), in the order of ggml's
- * NEON vec_dot_*_q8_0: two blocks per step, each folding its int sums
- * into four float lanes (lane l holds quants 4l..4l+3 of both halves);
- * a pairwise lane reduction; then a scalar tail for an odd last block.
+ * non-repacked NEON vec_dot_q8_0_q8_0: two blocks per step, each
+ * folding its int sums into four float lanes (lane l holds quants
+ * 4l..4l+3 of both halves); a pairwise lane reduction; then a scalar
+ * tail for an odd last block. Q4_0 and IQ4_NL weights reuse it; ggml's
+ * own kernels for those group the scale products differently (and its
+ * repacked kernels have orders of their own), so they match llama.cpp
+ * to rounding, not bit for bit.
  */
 float vec_dot_block32_q8_0(gguf::TensorType type, const std::byte* row,
                            const BlockQ8_0Act* xq, std::size_t nb) {
