@@ -1,4 +1,5 @@
 #include <cmath>
+#include <limits>
 #include <random>
 #include <set>
 #include <vector>
@@ -32,9 +33,12 @@ TEST_CASE("default sampling is greedy (argmax)", "[sampling]") {
 
 // i#180: a float denormal temperature made 1 / T inf and the top
 // weight NaN, which picked the LEAST likely token every time. Below
-// kMinTemperature the sampler is greedy instead.
+// kMinTemperature the sampler is greedy instead. i#192: so is NaN
+// (driver_main --temp nan), which failed the same way.
 TEST_CASE("a near-zero temperature is greedy", "[sampling]") {
-    for (const float t : {1e-45f, 1e-40f, 2e-39f, 1e-38f, 1e-7f}) {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    for (const float t : {1e-45f, 1e-40f, 2e-39f, 1e-38f, 1e-7f, nan,
+                          -nan}) {
         INFO("temperature " << t);
         SamplingParams p;
         p.temperature = t;
