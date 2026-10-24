@@ -1225,6 +1225,9 @@ TEST_CASE("audio speech returns a WAV end to end",
     REQUIRE_RES(s1);
     REQUIRE_RES(s2);
     REQUIRE(s1->body == s2->body);
+    // The seed changes the audio, so the replay check above is not empty
+    // (a server-drawn seed equal to 7 is a 1 in 2^64 chance).
+    REQUIRE(s1->body != res->body);
 
     // True greedy (temperature 0 AND no repetition penalty; temperature
     // 0 alone is argmax after the 1.3 penalty): deterministic without a

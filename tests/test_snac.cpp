@@ -159,7 +159,11 @@ struct SynthOpts {
     std::string drop;     ///< tensor to leave out
     std::string shorten;  ///< tensor to write one value short
     std::uint32_t n_codebooks = 3;
-    int noise = -1;       ///< -1: no snac.noise key; 0/1: write it
+    // Layout keys: -1 leaves the key out, 0/1 writes it as a bool, and 2
+    // writes it as a u32 0 (a wrong type).
+    int depthwise = -1;
+    int noise = -1;
+    int attention = -1;
 };
 
 /**
@@ -245,8 +249,14 @@ std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
     add("decoder.model." + tail_conv + ".weight", {1, ch, 7});
     add("decoder.model." + tail_conv + ".bias", {1});
 
+    const std::pair<const char*, int> layout[] = {
+        {"snac.depthwise", o.depthwise},
+        {"snac.noise", o.noise},
+        {"snac.attention", o.attention}};
+    std::uint64_t n_kv = 9;
+    for (const auto& [key, v] : layout) n_kv += v >= 0 ? 1 : 0;
     GgufBuilder g;
-    g.header(ts.size(), o.noise >= 0 ? 10 : 9);
+    g.header(ts.size(), n_kv);
     g.kv_string("general.architecture", "snac");
     g.kv_u32("snac.sampling_rate", 24000);
     g.kv_u32("snac.decoder_dim", kDec);
@@ -258,7 +268,13 @@ std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
     g.kv_i32_array("snac.decoder_rates", r);
     const std::vector<std::int32_t> strides = {4, 2, 1};
     g.kv_i32_array("snac.vq_strides", strides);
-    if (o.noise >= 0) g.kv_bool("snac.noise", o.noise != 0);
+    for (const auto& [key, v] : layout) {
+        if (v == 2) {
+            g.kv_u32(key, 0);
+        } else if (v >= 0) {
+            g.kv_bool(key, v != 0);
+        }
+    }
     std::uint64_t offset = 0;
     for (const auto& t : ts) {
         g.tensor(t.name, t.dims, 0 /* F32 */, offset);
@@ -276,9 +292,15 @@ std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
 /** Codes for F frames, cycling through the codebook. */
 locus::model::SnacCodes synth_codes(std::uint32_t frames, int shift = 0) {
     locus::model::SnacCodes c;
-    for (std::uint32_t i = 0; i < frames; ++i) c.coarse.push_back((i + shift) % 4);
-    for (std::uint32_t i = 0; i < 2 * frames; ++i) c.mid.push_back((i + 1) % 4);
-    for (std::uint32_t i = 0; i < 4 * frames; ++i) c.fine.push_back((i + 2) % 4);
+    for (std::uint32_t i = 0; i < frames; ++i) {
+        c.coarse.push_back((i + shift) % 4);
+    }
+    for (std::uint32_t i = 0; i < 2 * frames; ++i) {
+        c.mid.push_back((i + 1) % 4);
+    }
+    for (std::uint32_t i = 0; i < 4 * frames; ++i) {
+        c.fine.push_back((i + 2) % 4);
+    }
     return c;
 }
 
@@ -373,11 +395,28 @@ TEST_CASE("snac decoder rejects malformed models and codes", "[snac]") {
         REQUIRE_THROWS_AS(load({3, 2}, SynthOpts{}), locus::gguf::Error);
     }
     SECTION("a recorded layout locus does not run") {
-        SynthOpts o;
-        o.noise = 0;
-        REQUIRE_THROWS_AS(load({2, 2}, o), locus::gguf::Error);
-        o.noise = 1;  // the supported layout still loads
-        REQUIRE_NOTHROW(load({2, 2}, o));
+        // One key at a time; the others hold the supported value.
+        const auto with = [](int depthwise, int noise, int attention) {
+            SynthOpts o;
+            o.depthwise = depthwise;
+            o.noise = noise;
+            o.attention = attention;
+            return o;
+        };
+        REQUIRE_THROWS_AS(load({2, 2}, with(0, 1, 0)), locus::gguf::Error);
+        REQUIRE_THROWS_AS(load({2, 2}, with(1, 0, 0)), locus::gguf::Error);
+        REQUIRE_THROWS_AS(load({2, 2}, with(1, 1, 1)), locus::gguf::Error);
+        // The supported layout still loads.
+        REQUIRE_NOTHROW(load({2, 2}, with(1, 1, 0)));
+    }
+    SECTION("a layout key that is not a bool") {
+        // A u32 0 must not read as "key absent" (= the default layout).
+        for (int k = 0; k < 3; ++k) {
+            INFO("key " << k);
+            SynthOpts o;
+            (k == 0 ? o.depthwise : k == 1 ? o.noise : o.attention) = 2;
+            REQUIRE_THROWS_AS(load({2, 2}, o), locus::gguf::Error);
+        }
     }
     SECTION("a tensor one value short") {
         for (const char* name :
