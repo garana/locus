@@ -5,10 +5,11 @@
 // s = 2j + h (h = 0 low nibbles, 1 high) of super-block b covers the
 // 32 elements 64j + 32h .. of the block, from bytes 32j .. 32j + 31.
 //
-// Four rows per workgroup, 32 lanes per row, as matvec_q8_0.comp:
-// lanes stride over the row's 32-element sub-blocks (word loads of
-// their 32 nibble bytes), each adding d*sc*sum(q*x) - dmin*m*sum(x),
-// and a shared-memory tree reduces the row.
+// Eight rows per workgroup, 16 lanes per row: lanes stride over the
+// row's 32-element sub-blocks (word loads of their 32 nibble bytes,
+// decoded two at a time through an f16 mantissa; vec4 activation
+// loads), each adding d*sc*sum(q*x) - dmin*m*sum(x), and a
+// shared-memory tree reduces the row.
 //
 // Compiled again with -DBATCHED (matvec_q4_k_b): slots as in
 // matvec_q8_0.comp -- slot y reads w_off + id * w_stride (bytes) and
@@ -24,7 +25,9 @@ layout(local_size_x = 128) in;
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
 // The same activations as vec4s (one load for four weights) when the
-// slot's base is 16-byte aligned.
+// slot's base is 16-byte aligned. An element offset divisible by 4 is
+// a 16-byte address only because VulkanContext binds every buffer at
+// offset 0.
 layout(std430, binding = 1) readonly buffer X4 { vec4 x4[]; };
 layout(std430, binding = 2) buffer O { float o[]; };
 #ifdef BATCHED
