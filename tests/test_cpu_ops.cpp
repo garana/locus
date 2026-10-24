@@ -1082,6 +1082,104 @@ void check_conv1d_cuda(bool transpose, std::uint32_t in_ch,
 
 }  // namespace
 
+// The threaded kernels sum each output in the scalar kernels' order, so
+// they must match them bit for bit, not just within a tolerance. Shapes
+// span several 1024-wide tiles (and a ragged last one), padding on both
+// edges, groups and every SNAC upsample stride (i#173).
+TEST_CASE("conv1d_mt and conv1d_transpose_mt are bit-identical to the "
+          "scalar kernels",
+          "[ops][conv1d]") {
+    std::mt19937 rng(17);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    auto fill = [&](std::size_t n) {
+        std::vector<float> v(n);
+        for (auto& x : v) x = d(rng);
+        return v;
+    };
+    struct C {
+        bool transpose;
+        std::uint32_t in_ch, in_len, out_ch, k, stride, dil, pad, groups;
+        bool bias;
+    };
+    const C cases[] = {
+        // conv1d: SNAC's depthwise k7 at dilations 1/3/9, the pointwise
+        // 1x1, the 64 -> 1 tail, and a strided one (scalar fallback).
+        {false, 8, 2500, 8, 7, 1, 1, 3, 8, true},
+        {false, 8, 2500, 8, 7, 1, 3, 9, 8, true},
+        {false, 8, 2500, 8, 7, 1, 9, 27, 8, true},
+        {false, 16, 3000, 24, 1, 1, 1, 0, 1, true},
+        {false, 64, 1100, 1, 7, 1, 1, 3, 1, true},
+        {false, 6, 40, 4, 3, 1, 1, 1, 2, false},
+        {false, 4, 300, 4, 3, 2, 1, 1, 1, true},
+        // conv1d_transpose: k = 2s, pad = s/2 for s = 2/4/8, grouped,
+        // no bias, and a dilated one (scalar fallback).
+        {true, 6, 700, 4, 4, 2, 1, 1, 1, true},
+        {true, 6, 300, 4, 8, 4, 1, 2, 1, true},
+        {true, 6, 200, 4, 16, 8, 1, 4, 1, true},
+        {true, 4, 900, 2, 3, 2, 1, 1, 2, false},
+        // Several m-tiles per phase (m_end 2501, 3 tiles of 1024), so
+        // the tile bounds run without the SNAC GGUFs.
+        {true, 4, 2500, 2, 4, 2, 1, 1, 1, true},
+        {true, 3, 50, 2, 5, 3, 1, 0, 1, true},
+        {true, 2, 40, 2, 3, 2, 2, 1, 1, true},
+    };
+    for (const auto& c : cases) {
+        INFO("transpose " << c.transpose << " in " << c.in_ch << "x"
+                          << c.in_len << " out_ch " << c.out_ch << " k "
+                          << c.k << " s " << c.stride << " d " << c.dil
+                          << " p " << c.pad << " g " << c.groups);
+        const auto in = fill(std::size_t{c.in_ch} * c.in_len);
+        const auto bias = c.bias ? fill(c.out_ch) : std::vector<float>{};
+        std::vector<float> ref, got;
+        if (!c.transpose) {
+            const auto w = fill(std::size_t{c.out_ch} *
+                                (c.in_ch / c.groups) * c.k);
+            const std::uint32_t ol = locus::backend::conv1d_out_len(
+                c.in_len, c.k, c.stride, c.dil, c.pad);
+            ref.assign(std::size_t{c.out_ch} * ol, 0.0f);
+            got.assign(ref.size(), -1.0f);
+            conv1d(in, c.in_ch, c.in_len, w, c.out_ch, c.k, bias, c.stride,
+                   c.dil, c.pad, c.groups, ref);
+            locus::backend::conv1d_mt(in, c.in_ch, c.in_len, w, c.out_ch,
+                                      c.k, bias, c.stride, c.dil, c.pad,
+                                      c.groups, got);
+        } else {
+            const auto w = fill(std::size_t{c.in_ch} *
+                                (c.out_ch / c.groups) * c.k);
+            const std::uint32_t ol =
+                locus::backend::conv1d_transpose_out_len(
+                    c.in_len, c.k, c.stride, c.dil, c.pad);
+            ref.assign(std::size_t{c.out_ch} * ol, 0.0f);
+            got.assign(ref.size(), -1.0f);
+            conv1d_transpose(in, c.in_ch, c.in_len, w, c.out_ch, c.k, bias,
+                             c.stride, c.dil, c.pad, c.groups, ref);
+            locus::backend::conv1d_transpose_mt(
+                in, c.in_ch, c.in_len, w, c.out_ch, c.k, bias, c.stride,
+                c.dil, c.pad, c.groups, got);
+        }
+        REQUIRE(!ref.empty());
+        // memcmp: bit-identical, and every output written (got starts
+        // at -1, which no output here equals bit for bit by chance).
+        REQUIRE(std::memcmp(ref.data(), got.data(),
+                            ref.size() * sizeof(float)) == 0);
+    }
+}
+
+TEST_CASE("snake1d_mt is bit-identical to snake1d", "[ops][conv1d]") {
+    constexpr std::uint32_t ch = 5, len = 2600;
+    std::mt19937 rng(9);
+    std::uniform_real_distribution<float> d(-3.0f, 3.0f);
+    std::uniform_real_distribution<float> da(0.2f, 2.0f);
+    std::vector<float> x(static_cast<std::size_t>(ch) * len), alpha(ch);
+    for (auto& v : x) v = d(rng);
+    for (auto& v : alpha) v = da(rng);
+    std::vector<float> ref = x, got = x;
+    snake1d(ref, ch, len, alpha);
+    locus::backend::snake1d_mt(got, ch, len, alpha);
+    REQUIRE(std::memcmp(ref.data(), got.data(),
+                        ref.size() * sizeof(float)) == 0);
+}
+
 TEST_CASE("conv1d_cuda matches the scalar reference", "[conv1d][cuda]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");

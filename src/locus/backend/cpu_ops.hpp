@@ -287,4 +287,37 @@ void conv1d_transpose(std::span<const float> in, std::uint32_t in_ch,
 void snake1d(std::span<float> x, std::uint32_t ch, std::uint32_t len,
              std::span<const float> alpha, float eps = 1e-9f);
 
+/**
+ * conv1d across the thread pool, with a loop order the compiler can
+ * vectorize (one contiguous output run per tap). Each output sums the
+ * same terms in the same order as conv1d, so the result is
+ * bit-identical. Same arguments as conv1d; stride != 1 runs conv1d.
+ */
+void conv1d_mt(std::span<const float> in, std::uint32_t in_ch,
+               std::uint32_t in_len, std::span<const float> weight,
+               std::uint32_t out_ch, std::uint32_t k,
+               std::span<const float> bias, std::uint32_t stride,
+               std::uint32_t dilation, std::uint32_t pad,
+               std::uint32_t groups, std::span<float> out);
+
+/**
+ * conv1d_transpose across the thread pool. Outputs are split by phase
+ * (ox + pad) mod stride, so each phase is a contiguous run fed by every
+ * stride-th tap; each output sums the same terms in the same order as
+ * conv1d_transpose, so the result is bit-identical. Same arguments as
+ * conv1d_transpose; dilation != 1 runs conv1d_transpose.
+ */
+void conv1d_transpose_mt(std::span<const float> in, std::uint32_t in_ch,
+                         std::uint32_t in_len,
+                         std::span<const float> weight,
+                         std::uint32_t out_ch, std::uint32_t k,
+                         std::span<const float> bias,
+                         std::uint32_t stride, std::uint32_t dilation,
+                         std::uint32_t pad, std::uint32_t groups,
+                         std::span<float> out);
+
+/** snake1d across the thread pool; bit-identical to snake1d. */
+void snake1d_mt(std::span<float> x, std::uint32_t ch, std::uint32_t len,
+                std::span<const float> alpha, float eps = 1e-9f);
+
 }  // namespace locus::backend

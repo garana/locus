@@ -7,6 +7,8 @@
 #include <cstring>
 #include <vector>
 
+#include "locus/sys/thread_pool.hpp"
+
 namespace locus::backend {
 
 namespace {
@@ -2326,6 +2328,166 @@ void snake1d(std::span<float> x, std::uint32_t ch, std::uint32_t len,
             row[i] += inv * s * s;
         }
     }
+}
+
+namespace {
+
+/** Output positions per work item of the *_mt conv kernels: enough
+ * work to amortize the item setup, small enough to stay in L1. */
+constexpr std::uint32_t kConvTile = 1024;
+
+}  // namespace
+
+void conv1d_mt(std::span<const float> in, std::uint32_t in_ch,
+               std::uint32_t in_len, std::span<const float> weight,
+               std::uint32_t out_ch, std::uint32_t k,
+               std::span<const float> bias, std::uint32_t stride,
+               std::uint32_t dilation, std::uint32_t pad,
+               std::uint32_t groups, std::span<float> out) {
+    if (stride != 1) {
+        conv1d(in, in_ch, in_len, weight, out_ch, k, bias, stride,
+               dilation, pad, groups, out);
+        return;
+    }
+    assert(groups != 0 && in_ch % groups == 0 && out_ch % groups == 0);
+    const std::uint32_t icg = in_ch / groups;
+    const std::uint32_t ocg = out_ch / groups;
+    const std::uint32_t out_len =
+        conv1d_out_len(in_len, k, stride, dilation, pad);
+    assert(in.size() == std::size_t{in_ch} * in_len);
+    assert(weight.size() == std::size_t{out_ch} * icg * k);
+    assert(bias.empty() || bias.size() == out_ch);
+    assert(out.size() == std::size_t{out_ch} * out_len);
+    const std::uint32_t tiles = (out_len + kConvTile - 1) / kConvTile;
+    // One (out channel, output tile) per item. Per output the terms
+    // add in conv1d's order (bias, then ci, then t), so the vector loop
+    // over ox changes nothing but speed.
+    sys::ThreadPool::instance().parallel_for(
+        std::size_t{out_ch} * tiles, [&](std::size_t item) {
+            const auto oc = static_cast<std::uint32_t>(item / tiles);
+            const auto x0 =
+                static_cast<std::int64_t>(item % tiles) * kConvTile;
+            const std::int64_t x1 =
+                std::min<std::int64_t>(out_len, x0 + kConvTile);
+            float* o = &out[std::size_t{oc} * out_len];
+            const float b = bias.empty() ? 0.0f : bias[oc];
+            for (std::int64_t ox = x0; ox < x1; ++ox) o[ox] = b;
+            const std::uint32_t ic0 = (oc / ocg) * icg;
+            for (std::uint32_t ci = 0; ci < icg; ++ci) {
+                const float* inrow = &in[std::size_t{ic0 + ci} * in_len];
+                const float* wrow =
+                    &weight[(std::size_t{oc} * icg + ci) * k];
+                for (std::uint32_t t = 0; t < k; ++t) {
+                    const float w = wrow[t];
+                    // Input index ix = ox + shift, valid in [0, in_len).
+                    const std::int64_t shift =
+                        static_cast<std::int64_t>(t) * dilation - pad;
+                    const std::int64_t lo = std::max(x0, -shift);
+                    const std::int64_t hi = std::min(
+                        x1, static_cast<std::int64_t>(in_len) - shift);
+                    for (std::int64_t ox = lo; ox < hi; ++ox) {
+                        o[ox] += w * inrow[ox + shift];
+                    }
+                }
+            }
+        });
+}
+
+void conv1d_transpose_mt(std::span<const float> in, std::uint32_t in_ch,
+                         std::uint32_t in_len,
+                         std::span<const float> weight,
+                         std::uint32_t out_ch, std::uint32_t k,
+                         std::span<const float> bias,
+                         std::uint32_t stride, std::uint32_t dilation,
+                         std::uint32_t pad, std::uint32_t groups,
+                         std::span<float> out) {
+    if (dilation != 1) {
+        conv1d_transpose(in, in_ch, in_len, weight, out_ch, k, bias,
+                         stride, dilation, pad, groups, out);
+        return;
+    }
+    assert(groups != 0 && in_ch % groups == 0 && out_ch % groups == 0);
+    const std::uint32_t icg = in_ch / groups;
+    const std::uint32_t ocg = out_ch / groups;
+    const std::int64_t out_len =
+        conv1d_transpose_out_len(in_len, k, stride, dilation, pad);
+    assert(in.size() == std::size_t{in_ch} * in_len);
+    assert(weight.size() == std::size_t{in_ch} * ocg * k);
+    assert(bias.empty() || bias.size() == out_ch);
+    assert(out.size() ==
+           std::size_t{out_ch} * static_cast<std::size_t>(out_len));
+    const std::int64_t s = stride;
+    // Output ox with ox + pad = r + m*s (phase r) takes taps
+    // t = r + j*s from input ix = m - j. Each phase is a contiguous run
+    // over m; items are (out channel, phase, tile of m).
+    const std::int64_t m_end = (out_len + pad + s - 1) / s;  // > every m
+    const auto tiles = static_cast<std::uint32_t>(
+        (m_end + kConvTile - 1) / kConvTile);
+    sys::ThreadPool::instance().parallel_for(
+        std::size_t{out_ch} * stride * tiles, [&](std::size_t item) {
+            const auto tile = static_cast<std::int64_t>(item % tiles);
+            const std::size_t rest = item / tiles;
+            const auto r = static_cast<std::int64_t>(rest % stride);
+            const auto oc = static_cast<std::uint32_t>(rest / stride);
+            // m with 0 <= ox = r + m*s - pad < out_len, in this tile.
+            const std::int64_t m_first =
+                pad > r ? (pad - r + s - 1) / s : 0;
+            const std::int64_t m_last =  // exclusive
+                out_len + pad > r ? (out_len + pad - r + s - 1) / s : 0;
+            const std::int64_t m0 =
+                std::max(m_first, tile * std::int64_t{kConvTile});
+            const std::int64_t m1 =
+                std::min(m_last, (tile + 1) * std::int64_t{kConvTile});
+            if (m0 >= m1) return;
+            float acc[kConvTile];
+            const float b = bias.empty() ? 0.0f : bias[oc];
+            for (std::int64_t m = m0; m < m1; ++m) acc[m - m0] = b;
+            const std::uint32_t ocl = oc % ocg;
+            const std::uint32_t ic0 = (oc / ocg) * icg;
+            // Taps ascending, then in-channels: conv1d_transpose's order.
+            for (std::int64_t j = 0; r + j * s < k; ++j) {
+                const auto t = static_cast<std::uint32_t>(r + j * s);
+                const std::int64_t lo = std::max(m0, j);
+                const std::int64_t hi =
+                    std::min(m1, static_cast<std::int64_t>(in_len) + j);
+                for (std::uint32_t ci = 0; ci < icg; ++ci) {
+                    const float* inrow =
+                        &in[std::size_t{ic0 + ci} * in_len];
+                    const float w =
+                        weight[((std::size_t{ic0 + ci} * ocg) + ocl) * k +
+                               t];
+                    for (std::int64_t m = lo; m < hi; ++m) {
+                        acc[m - m0] += inrow[m - j] * w;
+                    }
+                }
+            }
+            float* o = &out[std::size_t{oc} *
+                            static_cast<std::size_t>(out_len)];
+            for (std::int64_t m = m0; m < m1; ++m) {
+                o[r + m * s - pad] = acc[m - m0];
+            }
+        });
+}
+
+void snake1d_mt(std::span<float> x, std::uint32_t ch, std::uint32_t len,
+                std::span<const float> alpha, float eps) {
+    assert(x.size() == std::size_t{ch} * len);
+    assert(alpha.size() == ch);
+    const std::uint32_t tiles = (len + kConvTile - 1) / kConvTile;
+    sys::ThreadPool::instance().parallel_for(
+        std::size_t{ch} * tiles, [&](std::size_t item) {
+            const auto c = static_cast<std::uint32_t>(item / tiles);
+            const std::uint32_t i0 =
+                static_cast<std::uint32_t>(item % tiles) * kConvTile;
+            const std::uint32_t i1 = std::min(len, i0 + kConvTile);
+            const float a = alpha[c];
+            const float inv = 1.0f / (a + eps);
+            float* row = &x[std::size_t{c} * len];
+            for (std::uint32_t i = i0; i < i1; ++i) {
+                const float s = std::sin(a * row[i]);
+                row[i] += inv * s * s;
+            }
+        });
 }
 
 }  // namespace locus::backend

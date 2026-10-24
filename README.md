@@ -86,9 +86,11 @@ tests/models/snac_24khz_decoder.gguf` makes the SNAC GGUF from the
 torch checkpoint (dev-time: needs torch and network; it checks its own
 weight fold and pins its tested versions and output sha256).
 Speech is still slower than real time on an M2 Pro (i#173): a 3.8 s
-clip takes 91 s on the CPU and 36 s with `--backend vulkan`, where the
-SNAC decode (still on the CPU, 21 s) is most of it. The response's
-Server-Timing header gives the prefill, generate and decode times.
+clip takes 70 s on the CPU and 15 s with `--backend vulkan`. The SNAC
+decode takes 0.5 s on threaded CPU kernels, so token generation is
+most of it (22 tokens/s on Vulkan; real time needs about 82). The
+response's Server-Timing header gives the prefill, generate and decode
+times.
 
 ## Building
 
