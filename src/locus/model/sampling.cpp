@@ -1,7 +1,9 @@
 #include "locus/model/sampling.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -41,6 +43,35 @@ void apply_penalties(std::span<float> logits, const SamplingParams& p,
 }
 
 }  // namespace
+
+// std::sort here cost 9 ms per token on a 157k vocab (i#173). It left
+// the order of equal logits unspecified, so only exact ties can draw a
+// different token than before.
+void sort_by_logit_desc(std::vector<std::pair<float, std::uint32_t>>& cand) {
+    const std::size_t n = cand.size();
+    // Key that orders as the float, then inverted for descending:
+    // negatives flip every bit, positives only the sign bit.
+    std::vector<std::uint32_t> key(n), key2(n);
+    std::vector<std::pair<float, std::uint32_t>> tmp(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto b = std::bit_cast<std::uint32_t>(cand[i].first);
+        key[i] = ~((b & 0x80000000u) ? ~b : (b | 0x80000000u));
+    }
+    for (int shift = 0; shift < 32; shift += 8) {
+        std::size_t count[257] = {};
+        for (std::size_t i = 0; i < n; ++i) {
+            ++count[((key[i] >> shift) & 0xFFu) + 1];
+        }
+        for (int d = 0; d < 256; ++d) count[d + 1] += count[d];
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t at = count[(key[i] >> shift) & 0xFFu]++;
+            tmp[at] = cand[i];
+            key2[at] = key[i];
+        }
+        cand.swap(tmp);
+        key.swap(key2);
+    }
+}
 
 tok::TokenId sample(std::span<float> logits, const SamplingParams& p,
                     std::span<const tok::TokenId> history,
@@ -93,7 +124,7 @@ tok::TokenId sample(std::span<float> logits, const SamplingParams& p,
                           cand.end(), by_logit);
         cand.resize(p.top_k);
     } else {
-        std::sort(cand.begin(), cand.end(), by_logit);
+        sort_by_logit_desc(cand);
     }
 
     // Temperature-scaled softmax weights (subtract the max for

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <random>
@@ -24,6 +25,39 @@ struct AllowSet : locus::model::TokenConstraint {
     void commit(TokenId) override {}
 };
 }  // namespace
+
+// i#173: the radix sort must give exactly std::stable_sort's order
+// (descending logit, ties in input order), including negatives, -0 and
+// +0, infinities and many exact ties.
+TEST_CASE("sort_by_logit_desc matches a stable descending sort",
+          "[sampling]") {
+    std::mt19937 g(5);
+    std::uniform_int_distribution<int> coarse(-6, 6);  // forces ties
+    std::normal_distribution<float> fine(0.0f, 4.0f);
+    for (const std::size_t n : {std::size_t{0}, std::size_t{1},
+                                std::size_t{7}, std::size_t{156940}}) {
+        INFO("n " << n);
+        std::vector<std::pair<float, std::uint32_t>> cand(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            float v = i % 3 == 0 ? static_cast<float>(coarse(g)) : fine(g);
+            if (i % 101 == 5) v = -0.0f;
+            if (i % 101 == 6) v = 0.0f;
+            if (i % 997 == 7) v = -std::numeric_limits<float>::infinity();
+            if (i % 997 == 8) v = std::numeric_limits<float>::infinity();
+            cand[i] = {v, i};
+        }
+        auto ref = cand;
+        // -0 sorts below +0 in the radix order; compare that way too.
+        std::stable_sort(ref.begin(), ref.end(),
+                         [](const auto& a, const auto& b) {
+                             if (a.first != b.first) return a.first > b.first;
+                             return !std::signbit(a.first) &&
+                                    std::signbit(b.first);
+                         });
+        locus::model::sort_by_logit_desc(cand);
+        REQUIRE(cand == ref);
+    }
+}
 
 TEST_CASE("default sampling is greedy (argmax)", "[sampling]") {
     std::vector<float> logits{1.0f, 3.0f, 2.0f, 0.5f};
