@@ -648,6 +648,14 @@ void matvec_mt(const backend::Ops& op, const backend::Mat& w,
                std::span<const float> x, std::span<float> out);
 
 /**
+ * matvec_mt that always runs op.matvec, the f32-activation dot, even
+ * when R16 Q8 activations are on: the attention projections keep
+ * their single-threaded arithmetic, only spread across the pool.
+ */
+void matvec_mt_f32(const backend::Ops& op, const backend::Mat& w,
+                   std::span<const float> x, std::span<float> out);
+
+/**
  * Weight-stationary batched matvec (R10): applies w to each of
  * the n input vectors (x_batch is n * w.cols contiguous) into
  * out_batch (n * w.rows contiguous). The batch loop is inside so

@@ -115,19 +115,13 @@ backend::Ops TransformerModel::ops() const {
     return effective_ops(backend_, q8k_activations_);
 }
 
-void matvec_mt(const backend::Ops& op, const Mat& w,
-               std::span<const float> x, std::span<float> out) {
-    // R16 ggml parity: QK_K weight types integer-dot a Q8_K-quantized
-    // activation (matches llama.cpp bit-for-bit); everything else keeps
-    // the f32-activation dot. Each backend points matvec_q8k at its own
-    // Q8_K entry (scalar/cuda/sse4), falling back to scalar for types it
-    // does not vectorize. Re-quantizing x per row-slice below is
-    // O(cols) vs the O(rows_slice*cols) dot -- negligible.
-    const auto mv =
-        (op.matvec_q8k != nullptr && (backend::is_q8k_type(w.type) ||
-                                      backend::is_q8_0_act_type(w.type)))
-            ? op.matvec_q8k
-            : op.matvec;
+namespace {
+
+/** Row-splits w across the pool through kernel mv (see matvec_mt). */
+void matvec_rows_mt(const backend::Ops& op,
+                    decltype(backend::Ops::matvec) mv,
+                    const Mat& w, std::span<const float> x,
+                    std::span<float> out) {
     // A backend whose matvec is not re-entrant (Vulkan's single
     // VulkanContext singleton) must run inline: parallel calls
     // crash the driver. This path is hit when a GPU full-forward
@@ -149,6 +143,29 @@ void matvec_mt(const backend::Ops& op, const Mat& w,
         mv(backend::mat_rows(w, r0, r1 - r0), x,
            out.subspan(r0, r1 - r0));
     });
+}
+
+}  // namespace
+
+void matvec_mt(const backend::Ops& op, const Mat& w,
+               std::span<const float> x, std::span<float> out) {
+    // R16 ggml parity: QK_K weight types integer-dot a Q8_K-quantized
+    // activation (matches llama.cpp bit-for-bit); everything else keeps
+    // the f32-activation dot. Each backend points matvec_q8k at its own
+    // Q8_K entry (scalar/cuda/sse4), falling back to scalar for types it
+    // does not vectorize. Re-quantizing x per row-slice below is
+    // O(cols) vs the O(rows_slice*cols) dot -- negligible.
+    const auto mv =
+        (op.matvec_q8k != nullptr && (backend::is_q8k_type(w.type) ||
+                                      backend::is_q8_0_act_type(w.type)))
+            ? op.matvec_q8k
+            : op.matvec;
+    matvec_rows_mt(op, mv, w, x, out);
+}
+
+void matvec_mt_f32(const backend::Ops& op, const Mat& w,
+                   std::span<const float> x, std::span<float> out) {
+    matvec_rows_mt(op, op.matvec, w, x, out);
 }
 
 float dsa_index_score(std::span<const float> q,
