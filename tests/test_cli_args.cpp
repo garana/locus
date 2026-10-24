@@ -249,3 +249,30 @@ TEST_CASE("--speculative parses as a flag", "[cli]") {
         const_cast<char**>(argv2.data()));
     REQUIRE_FALSE(b.speculative);  // off by default
 }
+
+// i#198: the positional numbers went through atoi, so "-1" tokens wrapped
+// to 4294967295 and a mistyped port bound an OS-assigned one. Both
+// checks run before the model loads, so no model is needed; a valid
+// value with a missing model exits 1, which keeps these from passing
+// emptily.
+TEST_CASE("bad positional numbers exit 2", "[cli]") {
+    const auto status = [](const std::string& bin,
+                           const std::string& args) {
+        const std::string cmd =
+            "'" + bin + "' " + args + " >/dev/null 2>&1";
+        INFO(cmd);
+        const int rc = std::system(cmd.c_str());
+        REQUIRE(WIFEXITED(rc));
+        return WEXITSTATUS(rc);
+    };
+    for (const char* n : {"-1", "abc", "12abc", ""}) {
+        REQUIRE(status(LOCUS_RUN_BIN, std::string("missing.gguf x '") +
+                                          n + "'") == 2);
+    }
+    REQUIRE(status(LOCUS_RUN_BIN, "missing.gguf x 4") == 1);
+    for (const char* p : {"-1", "0", "808O", "65536", "70000"}) {
+        REQUIRE(status(LOCUS_SERVER_BIN,
+                       std::string("missing.gguf '") + p + "'") == 2);
+    }
+    REQUIRE(status(LOCUS_SERVER_BIN, "missing.gguf 8080") == 1);
+}
