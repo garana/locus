@@ -24,7 +24,11 @@ build dependency (DESIGN.md section 6). Tested with Python 3.10, torch
     python3 scripts/convert-snac.py --out tests/models/snac_24khz_decoder.gguf
 
 For hubertsiuzdak/snac_24khz with those versions the output sha256 is
-08acf9b1e8a00626ac82662ddc54b5b2ca7fd8fd99be236c87b94b6a6f60009e.
+f45bd16e26a56355549f6091441daa20ca04f6f4a868713fe272d08e25efa0f4.
+
+It refuses SNAC variants whose decoder layout locus does not run
+(decoder attention, non-depthwise, or no NoiseBlock), and records those
+layout flags as snac.depthwise / snac.noise / snac.attention.
 """
 import argparse
 import sys
@@ -132,6 +136,28 @@ def check_fold(model, sd, frames, seed):
     return diff, rms
 
 
+def check_layout(model):
+    """
+    Refuses SNAC variants whose decoder layout locus does not run. The
+    tensor names locus reads depend on three config flags that SNAC
+    does not keep on the model object, so detect them from the
+    structure: `depthwise` adds the second input conv (model.1),
+    `noise` puts a NoiseBlock at block.2 (so the residual units are
+    .3/.4/.5), and a non-null attn_window_size adds a LocalMHA.
+    """
+    dec = model.decoder.model
+    if model.attn_window_size is not None:
+        sys.exit("this SNAC has decoder attention; locus runs only "
+                 "attn_window_size null (the 24 kHz model)")
+    first = dec[0]
+    if getattr(first, "groups", 1) != model.latent_dim:
+        sys.exit("this SNAC is not depthwise; locus runs only "
+                 "depthwise=true")
+    if not isinstance(dec[2].block[2], snac_mod.layers.NoiseBlock):
+        sys.exit("this SNAC has no NoiseBlock; locus expects noise=true "
+                 "(residual units at block.3/.4/.5)")
+
+
 def emit_gguf(model, sd, path):
     """
     Writes the folded decoder as a GGUF (arch "snac"): every
@@ -152,6 +178,11 @@ def emit_gguf(model, sd, path):
     out.add_uint32("snac.codebook_size", model.codebook_size)
     out.add_uint32("snac.codebook_dim", model.codebook_dim)
     out.add_uint32("snac.n_codebooks", model.n_codebooks)
+    # The layout flags the tensor names depend on (see check_layout),
+    # so the loader can refuse a GGUF made for a different layout.
+    out.add_bool("snac.depthwise", True)
+    out.add_bool("snac.noise", True)
+    out.add_bool("snac.attention", False)
 
     def put(name, t):
         out.add_tensor(name, t.detach().cpu().numpy().astype(np.float32))
@@ -195,9 +226,7 @@ def main():
     # without, so compare against the same deterministic graph.
     snac_mod.layers.NoiseBlock.forward = lambda self, x: x
     model = snac_mod.SNAC.from_pretrained(a.repo).eval()
-    if model.attn_window_size is not None:
-        sys.exit("this SNAC has decoder attention; locus supports only "
-                 "attn_window_size null (the 24 kHz model)")
+    check_layout(model)
     sd = model.state_dict()
 
     diff, rms = check_fold(model, sd, a.check_frames, a.seed)
