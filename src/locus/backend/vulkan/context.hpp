@@ -99,6 +99,9 @@ enum class Kernel {
     kConv1d,
     kConv1dTranspose,
     kSnake1d,
+    /** attn_decode_grp with 8 heads per workgroup (GQA group <= 8). */
+    kAttnDecodeGrp8,
+    kAttnDecodeGrp8F16,
     kCount_,
 };
 
