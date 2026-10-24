@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
@@ -34,6 +35,16 @@ void forward(const TransformerModel& m, tok::TokenId token,
 void engram_rows(const Hparams::Ds41& d, std::uint32_t e,
                  std::span<const std::int64_t> toks,
                  std::span<std::uint32_t> rows);
+
+/**
+ * @returns The routed experts' weights for `picked` (indices into the
+ *     router probabilities): normalized to sum 1 when
+ *     hp.expert_weights_norm and more than one expert is picked, then
+ *     scaled by hp.expert_weights_scale. Exposed for tests.
+ */
+std::vector<float> moe_weights(const Hparams& hp,
+                               std::span<const float> probs,
+                               std::span<const std::uint32_t> picked);
 
 /**
  * Sinkhorn-normalizes the hc x hc mHC combine matrix in place

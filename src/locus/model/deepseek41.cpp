@@ -510,14 +510,12 @@ void moe_layer(const Hparams& hp, const TransformerModel::Layer& lay,
                    (lay.exp_probs_b.empty() ? 0.0f : lay.exp_probs_b[e]);
     }
     const auto picked = top_k(s.sel, hp.n_expert_used);
-    float wsum = 0.0f;
-    for (auto e : picked) {
-        wsum += s.router[e];
-    }
+    const auto weights = moe_weights(hp, s.router, picked);
     s.f.assign(E, 0.0f);
     s.y.resize(E);
-    for (auto e : picked) {
-        const float w = s.router[e] / (wsum + 1e-20f) * hp.expert_weights_scale;
+    for (std::size_t k = 0; k < picked.size(); ++k) {
+        const auto e = picked[k];
+        const float w = weights[k];
         swiglu_clamped(op, lay.gate_exps.expert(e), lay.up_exps.expert(e),
                        lay.down_exps.expert(e), d.clamp_exp[l], s, s.y);
         for (std::uint32_t i = 0; i < E; ++i) {
@@ -534,6 +532,25 @@ void moe_layer(const Hparams& hp, const TransformerModel::Layer& lay,
 }
 
 }  // namespace
+
+std::vector<float> moe_weights(const Hparams& hp,
+                               std::span<const float> probs,
+                               std::span<const std::uint32_t> picked) {
+    // The reference renormalizes only with expert_weights_norm and
+    // more than one expert: a lone expert keeps its raw probability.
+    const bool norm = hp.expert_weights_norm && picked.size() > 1;
+    float wsum = 0.0f;
+    for (auto e : picked) {
+        wsum += probs[e];
+    }
+    std::vector<float> w;
+    w.reserve(picked.size());
+    for (auto e : picked) {
+        w.push_back((norm ? probs[e] / (wsum + 1e-20f) : probs[e]) *
+                    hp.expert_weights_scale);
+    }
+    return w;
+}
 
 void sinkhorn(std::span<float> m, std::uint32_t hc, std::uint32_t iters,
               float eps) {
