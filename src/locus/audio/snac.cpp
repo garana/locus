@@ -139,11 +139,17 @@ std::vector<float> SnacDecoder::decode(
     const std::vector<const std::vector<int>*> streams = {
         &codes.coarse, &codes.mid, &codes.fine};
 
-    using backend::conv1d;
+    // The threaded kernels: bit-identical to the scalar conv1d /
+    // conv1d_transpose / snake1d, about N cores times faster (i#173).
+    const auto conv1d = backend::conv1d_mt;
+    const auto conv1d_transpose = backend::conv1d_transpose_mt;
+    const auto snake1d = [](std::span<float> x, std::uint32_t ch,
+                            std::uint32_t len,
+                            std::span<const float> alpha) {
+        backend::snake1d_mt(x, ch, len, alpha);
+    };
     using backend::conv1d_out_len;
-    using backend::conv1d_transpose;
     using backend::conv1d_transpose_out_len;
-    using backend::snake1d;
 
     // --- from_codes: sum of the stride-upsampled out-projections. ---
     const std::uint32_t T = F * strides_.front();  // aligned length.

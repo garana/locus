@@ -348,7 +348,10 @@ TEST_CASE("snac decoder matches torch on a synthetic model", "[snac]") {
                               std::vector<std::uint32_t>{4, 2, 2, 2}}) {
         std::string name = "snac_synth_r";
         for (std::size_t i = 0; i < rates.size(); ++i) {
-            name += (i ? "-" : "") + std::to_string(rates[i]);
+            // Two appends: GCC 12 warns (-Wrestrict, a false positive)
+            // on "literal" + std::string here.
+            name += i ? "-" : "";
+            name += std::to_string(rates[i]);
         }
         INFO(name);
         const auto ref = read_f32(golden_dir() + "/" + name + ".f32");
