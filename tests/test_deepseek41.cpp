@@ -249,6 +249,27 @@ TEST_CASE("deepseek41 sinkhorn normalizes rows and columns", "[ds41]") {
     }
 }
 
+TEST_CASE("deepseek41 expert weights renormalize only past one expert",
+          "[ds41]") {
+    // ec2's #166 note: the reference normalizes the top-k weights only
+    // with expert_weights_norm and n_expert_used > 1.
+    locus::model::Hparams hp;
+    hp.expert_weights_norm = true;
+    hp.expert_weights_scale = 1.5f;
+    const float probs[] = {0.2f, 0.9f, 0.3f};  // picked pair sums 1.2
+    const std::uint32_t two[] = {1, 2};
+    auto w = ds41::moe_weights(hp, probs, two);
+    REQUIRE(w[0] == Catch::Approx(0.9f / 1.2f * 1.5f));
+    REQUIRE(w[1] == Catch::Approx(0.3f / 1.2f * 1.5f));
+    const std::uint32_t one[] = {1};
+    w = ds41::moe_weights(hp, probs, one);  // a lone expert: raw prob
+    REQUIRE(w[0] == Catch::Approx(0.9f * 1.5f));
+    hp.expert_weights_norm = false;  // flag off: never normalized
+    w = ds41::moe_weights(hp, probs, two);
+    REQUIRE(w[0] == Catch::Approx(0.9f * 1.5f));
+    REQUIRE(w[1] == Catch::Approx(0.3f * 1.5f));
+}
+
 TEST_CASE("deepseek41 engram rows hash the n-gram per order and head",
           "[ds41]") {
     locus::model::Hparams::Ds41 d;
