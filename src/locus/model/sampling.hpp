@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <random>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "locus/tok/tokenizer.hpp"
@@ -53,6 +54,14 @@ inline constexpr float kMinTemperature = 1e-6f;
 inline bool is_greedy(const SamplingParams& p) {
     return !(p.temperature >= kMinTemperature);
 }
+
+/**
+ * Sorts (logit, token) candidates by logit, highest first, in O(n) (an
+ * LSD radix sort on the float bits); sample() uses it when top_k is
+ * off. Equal logits keep their input order, as std::stable_sort would.
+ * @param cand Candidates to sort in place.
+ */
+void sort_by_logit_desc(std::vector<std::pair<float, std::uint32_t>>& cand);
 
 /**
  * A per-request token-level constraint for constrained decoding
