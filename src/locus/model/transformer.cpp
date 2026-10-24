@@ -11,6 +11,7 @@
 #include "locus/model/arch.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/model/gguf_load.hpp"
+#include "locus/sys/meminfo.hpp"
 #include "locus/sys/thread_pool.hpp"
 
 namespace locus::model {
@@ -26,12 +27,21 @@ namespace {
 /**
  * R8 readahead (expert + layer) is on by default: it measured
  * 33% faster cold streaming on GLM-5.2 with bit-identical
- * output, and madvise on resident pages is a no-op for warm
- * models. LOCUS_NO_READAHEAD=1 opts out (A/B benchmarks).
+ * output. The madvise half runs only for models that stream
+ * (weights_stream); the pager's op.prefetch half always does.
+ * LOCUS_NO_READAHEAD=1 opts out of both (A/B benchmarks).
  */
 bool readahead_enabled() {
     return std::getenv("LOCUS_NO_READAHEAD") == nullptr;
 }
+
+}  // namespace
+
+bool weights_stream(std::uint64_t weight_bytes, std::uint64_t ram_bytes) {
+    return ram_bytes == 0 || weight_bytes > ram_bytes / 2;
+}
+
+namespace {
 
 /** Hints a whole matrix for readahead; empty mats are skipped. */
 void advise_mat(const backend::Mat& m) {
@@ -184,6 +194,12 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     TransformerModel m;
     m.spec_ = spec;
     m.file_backed_ = g.file_backed();
+    std::uint64_t weight_bytes = 0;
+    for (const TensorInfo& t : g.tensors()) {
+        weight_bytes += t.nbytes;
+    }
+    m.advise_weights_ = readahead_enabled() &&
+                        weights_stream(weight_bytes, sys::total_ram_bytes());
     Hparams& hp = m.hp_;
     const std::string p = std::string(spec->name) + ".";
 
@@ -605,7 +621,9 @@ void TransformerModel::forward_layers(tok::TokenId token,
             // madvise (SSD -> page cache) and, on backends with
             // a weight pager, op.prefetch (host -> device).
             if (l + 1 < layer_end) {
-                advise_layer_statics(layers_[l + 1]);
+                if (advise_weights_) {
+                    advise_layer_statics(layers_[l + 1]);
+                }
                 if (op.prefetch != nullptr) {
                     for_each_static_mat(
                         layers_[l + 1],
@@ -617,7 +635,9 @@ void TransformerModel::forward_layers(tok::TokenId token,
                         });
                 }
             } else if (last) {
-                advise_mat(out_w_);
+                if (advise_weights_) {
+                    advise_mat(out_w_);
+                }
                 if (op.prefetch != nullptr) {
                     op.prefetch(out_w_);
                 }
@@ -1350,12 +1370,14 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
     // in one by one.
     if (readahead_enabled()) {
         for (const auto& [e, wgt] : picked) {
-            sys::advise_willneed(lay.gate_exps.expert(e).data,
-                                 lay.gate_exps.expert_bytes);
-            sys::advise_willneed(lay.up_exps.expert(e).data,
-                                 lay.up_exps.expert_bytes);
-            sys::advise_willneed(lay.down_exps.expert(e).data,
-                                 lay.down_exps.expert_bytes);
+            if (advise_weights_) {
+                sys::advise_willneed(lay.gate_exps.expert(e).data,
+                                     lay.gate_exps.expert_bytes);
+                sys::advise_willneed(lay.up_exps.expert(e).data,
+                                     lay.up_exps.expert_bytes);
+                sys::advise_willneed(lay.down_exps.expert(e).data,
+                                     lay.down_exps.expert_bytes);
+            }
             // Pager tier: expert(e) yields the same .data the
             // matmuls below pass to matvec -- the page key.
             if (op.prefetch != nullptr) {
@@ -1474,9 +1496,11 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
             const Mat g = lay.gate_exps.expert(u.e);
             const Mat up = lay.up_exps.expert(u.e);
             const Mat d = lay.down_exps.expert(u.e);
-            sys::advise_willneed(g.data, lay.gate_exps.expert_bytes);
-            sys::advise_willneed(up.data, lay.up_exps.expert_bytes);
-            sys::advise_willneed(d.data, lay.down_exps.expert_bytes);
+            if (advise_weights_) {
+                sys::advise_willneed(g.data, lay.gate_exps.expert_bytes);
+                sys::advise_willneed(up.data, lay.up_exps.expert_bytes);
+                sys::advise_willneed(d.data, lay.down_exps.expert_bytes);
+            }
             if (op.prefetch != nullptr) {
                 op.prefetch(g);
                 op.prefetch(up);

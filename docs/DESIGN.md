@@ -262,6 +262,12 @@ Notes:
   Both policies are DEFAULT-ON since then (the flags
   LOCUS_EXPERT_READAHEAD / LOCUS_LAYER_READAHEAD are gone);
   LOCUS_NO_READAHEAD=1 restores passive streaming for A/Bs.
+  Since 2026-10-24 the madvise hints run only when the weights
+  may stream (weights_stream: more than half of RAM, or RAM
+  unknown); a model that fits stays resident after one pass, and
+  hinting resident pages per token is not free (Orpheus 3B on
+  M4: ~4.5 ms/token, 17% of decode). The pager's op.prefetch
+  hints are unaffected.
 - Future work (2026-07-21): overlap I/O with compute one step
   ahead. Mechanism notes: each shard is mmap'd once, whole-file
   (PROT_READ MAP_PRIVATE, never written) -- weight pages are
