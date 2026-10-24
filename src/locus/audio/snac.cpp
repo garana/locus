@@ -18,10 +18,19 @@ struct Act {
 
 }  // namespace
 
-std::span<const float> SnacDecoder::t(const std::string& name) const {
+std::span<const float> SnacDecoder::t(const std::string& name,
+                                      std::size_t n) const {
     auto it = w_.find(name);
     if (it == w_.end()) {
         throw gguf::Error("snac: missing tensor " + name);
+    }
+    // The conv kernels check sizes only with assert(), which Release
+    // builds compile out, so a short tensor from the GGUF would be read
+    // out of bounds. Check the size the graph needs here instead.
+    if (it->second.size() != n) {
+        throw gguf::Error("snac: tensor " + name + " has " +
+                          std::to_string(it->second.size()) +
+                          " values, expected " + std::to_string(n));
     }
     return it->second;
 }
@@ -66,6 +75,38 @@ SnacDecoder SnacDecoder::load(const gguf::GgufFile& g) {
             dst.push_back(as_u32(e));
         }
     }
+    // decode() carries exactly the three SnacCodes streams (F, 2F and 4F
+    // codes) and aligns them at T = 4F, which holds only for strides
+    // [4, 2, 1]. Each upsample halves the width and its transposed conv
+    // uses pad rate/2 with no output_padding, which needs an even rate.
+    if (d.n_codebooks_ != 3 ||
+        d.strides_ != std::vector<std::uint32_t>{4, 2, 1}) {
+        throw gguf::Error("snac: need 3 codebooks with vq_strides [4,2,1]");
+    }
+    if (d.rates_.empty() || d.rates_.size() > 16 ||
+        (d.decoder_dim_ >> d.rates_.size()) == 0) {
+        throw gguf::Error("snac: decoder_dim too small for its rates");
+    }
+    for (auto r : d.rates_) {
+        if (r == 0 || r % 2 != 0) {
+            throw gguf::Error("snac: decoder rates must be even");
+        }
+    }
+    if (d.latent_dim_ == 0 || d.codebook_dim_ == 0 ||
+        d.codebook_size_ == 0) {
+        throw gguf::Error("snac: zero latent/codebook size");
+    }
+    // The tensor names follow SNAC's depthwise + noise, attention-free
+    // decoder layout; refuse a GGUF that records another one (keys
+    // written by scripts/convert-snac.py; older files lack them).
+    const auto depthwise = g.get_bool("snac.depthwise");
+    const auto noise = g.get_bool("snac.noise");
+    const auto attention = g.get_bool("snac.attention");
+    if ((depthwise && !*depthwise) || (noise && !*noise) ||
+        (attention && *attention)) {
+        throw gguf::Error("snac: unsupported decoder layout (needs "
+                          "depthwise, noise, no attention)");
+    }
     // Copy every F32 tensor by name so the mapping need not outlive us.
     for (const auto& ti : g.tensors()) {
         if (ti.type != gguf::TensorType::kF32) continue;
@@ -104,10 +145,18 @@ std::vector<float> SnacDecoder::decode(
         const std::uint32_t li = static_cast<std::uint32_t>(s.size());
         const std::string q =
             "quantizer.quantizers." + std::to_string(i);
-        const auto cb = t(q + ".codebook.weight");
+        const auto cb = t(q + ".codebook.weight",
+                          std::size_t(codebook_size_) * codebook_dim_);
         // Codebook lookup, transposed to [codebook_dim][li].
         std::vector<float> zp(std::size_t(codebook_dim_) * li);
         for (std::uint32_t j = 0; j < li; ++j) {
+            if (s[j] < 0 ||
+                static_cast<std::uint32_t>(s[j]) >= codebook_size_) {
+                throw std::invalid_argument(
+                    "snac decode: code " + std::to_string(s[j]) +
+                    " outside the codebook (size " +
+                    std::to_string(codebook_size_) + ")");
+            }
             const std::size_t base =
                 std::size_t(s[j]) * codebook_dim_;
             for (std::uint32_t c = 0; c < codebook_dim_; ++c) {
@@ -116,8 +165,11 @@ std::vector<float> SnacDecoder::decode(
         }
         // 1x1 out-projection: codebook_dim -> latent_dim.
         std::vector<float> zo(std::size_t(latent_dim_) * li);
-        conv1d(zp, codebook_dim_, li, t(q + ".out_proj.weight"),
-               latent_dim_, 1, t(q + ".out_proj.bias"), 1, 1, 0, 1, zo);
+        conv1d(zp, codebook_dim_, li,
+               t(q + ".out_proj.weight",
+                 std::size_t(latent_dim_) * codebook_dim_),
+               latent_dim_, 1, t(q + ".out_proj.bias", latent_dim_), 1, 1,
+               0, 1, zo);
         // repeat_interleave(stride) along time, accumulate into zq.
         const std::uint32_t st = strides_[i];
         for (std::uint32_t ch = 0; ch < latent_dim_; ++ch) {
@@ -136,12 +188,15 @@ std::vector<float> SnacDecoder::decode(
                     std::uint32_t groups) {
         const std::uint32_t ol = conv1d_out_len(in.len, k, 1, dil, pad);
         Act o{std::vector<float>(std::size_t(out_ch) * ol), out_ch, ol};
-        conv1d(in.data, in.ch, in.len, t(name + ".weight"), out_ch, k,
-               t(name + ".bias"), 1, dil, pad, groups, o.data);
+        conv1d(in.data, in.ch, in.len,
+               t(name + ".weight",
+                 std::size_t(out_ch) * (in.ch / groups) * k),
+               out_ch, k, t(name + ".bias", out_ch), 1, dil, pad, groups,
+               o.data);
         return o;
     };
     auto snake = [&](Act& a, const std::string& name) {
-        snake1d(a.data, a.ch, a.len, t(name));
+        snake1d(a.data, a.ch, a.len, t(name, a.ch));
     };
 
     // Decoder in-convs: depthwise k7 then 1x1 to the decoder width.
@@ -162,9 +217,11 @@ std::vector<float> SnacDecoder::decode(
         const std::uint32_t ol = conv1d_transpose_out_len(
             x.len, 2 * rate, rate, 1, rate / 2);
         Act up{std::vector<float>(std::size_t(out_ch) * ol), out_ch, ol};
-        conv1d_transpose(x.data, x.ch, x.len, t(p + ".1.weight"), out_ch,
-                         2 * rate, t(p + ".1.bias"), rate, 1, rate / 2, 1,
-                         up.data);
+        conv1d_transpose(
+            x.data, x.ch, x.len,
+            t(p + ".1.weight", std::size_t(x.ch) * out_ch * 2 * rate),
+            out_ch, 2 * rate, t(p + ".1.bias", out_ch), rate, 1, rate / 2,
+            1, up.data);
         x = std::move(up);
         ch = out_ch;
         // Three dilated residual units (block.3/4/5): each a depthwise

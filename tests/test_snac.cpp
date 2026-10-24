@@ -114,21 +114,30 @@ std::int16_t le16(const std::vector<std::byte>& b, std::size_t off) {
 
 namespace {
 
+/** Deliberate defects for synth_snac, to test the decoder's checks. */
+struct SynthOpts {
+    std::string drop;     ///< tensor to leave out
+    std::string shorten;  ///< tensor to write one value short
+    std::uint32_t n_codebooks = 3;
+    int noise = -1;       ///< -1: no snac.noise key; 0/1: write it
+};
+
 /**
  * A tiny synthetic "snac" GGUF image: the decoder graph with small
- * dimensions and pseudo-random weights, so the graph (channel
- * progression, rate order, transposed-conv lengths, tensor names) is
- * tested without the real model. Three codebooks with strides [4,2,1]
- * (what SnacCodes carries), latent 4, codebook 4 x 2, and a decoder
- * width of 4 * 2^rates halved per upsample block, so it ends at 4
- * channels whatever the rate count (the real model: 1024 -> 64).
+ * dimensions and pseudo-random weights, so the graph structure
+ * (channel progression, transposed-conv lengths, block count, tensor
+ * names) is tested without the real model. It pins structure, not
+ * values: a wrong dilation keeps every length (see i#172). Three
+ * codebooks with strides [4,2,1] (what SnacCodes carries), latent 4,
+ * codebook 4 x 2, and a decoder width of 4 * 2^rates halved per
+ * upsample block, so it ends at 4 channels whatever the rate count
+ * (the real model: 1024 -> 64).
  *
- * @param rates The decoder upsample rates (even, as in SNAC 24 kHz).
- * @param drop A tensor name to leave out (to test the missing-tensor
- *     error), or empty.
+ * @param rates The decoder upsample rates.
+ * @param o Defects to inject (none by default).
  */
 std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
-                                  const std::string& drop = "") {
+                                  const SynthOpts& o = {}) {
     constexpr std::uint32_t kLatent = 4, kCbSize = 4, kCbDim = 2;
     const std::uint32_t kDec = 4u << rates.size();
     struct T {
@@ -145,11 +154,16 @@ std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
     // PyTorch shape {d0, d1, d2} -> GGUF dims reversed.
     auto add = [&](const std::string& n,
                    std::vector<std::uint64_t> shape, bool ones = false) {
-        if (n == drop) return;
+        if (n == o.drop) return;
         std::uint64_t count = 1;
         for (auto d : shape) count *= d;
         std::vector<float> v(count);
         for (auto& x : v) x = ones ? 1.0f : rnd();
+        if (n == o.shorten) {  // a well-formed but one-short tensor
+            v.pop_back();
+            ts.push_back({n, {count - 1}, std::move(v)});
+            return;
+        }
         ts.push_back({n, {shape.rbegin(), shape.rend()}, std::move(v)});
     };
     for (int i = 0; i < 3; ++i) {
@@ -188,18 +202,19 @@ std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
     add("decoder.model." + tail_conv + ".bias", {1});
 
     GgufBuilder g;
-    g.header(ts.size(), 9);
+    g.header(ts.size(), o.noise >= 0 ? 10 : 9);
     g.kv_string("general.architecture", "snac");
     g.kv_u32("snac.sampling_rate", 24000);
     g.kv_u32("snac.decoder_dim", kDec);
     g.kv_u32("snac.latent_dim", kLatent);
     g.kv_u32("snac.codebook_size", kCbSize);
     g.kv_u32("snac.codebook_dim", kCbDim);
-    g.kv_u32("snac.n_codebooks", 3);
+    g.kv_u32("snac.n_codebooks", o.n_codebooks);
     const std::vector<std::int32_t> r(rates.begin(), rates.end());
     g.kv_i32_array("snac.decoder_rates", r);
     const std::vector<std::int32_t> strides = {4, 2, 1};
     g.kv_i32_array("snac.vq_strides", strides);
+    if (o.noise >= 0) g.kv_bool("snac.noise", o.noise != 0);
     std::uint64_t offset = 0;
     for (const auto& t : ts) {
         g.tensor(t.name, t.dims, 0 /* F32 */, offset);
@@ -258,10 +273,62 @@ TEST_CASE("snac decoder graph on a synthetic model", "[snac]") {
 }
 
 TEST_CASE("snac decoder reports a missing tensor", "[snac]") {
-    const auto img = synth_snac({2, 2}, "decoder.model.3.block.1.weight");
+    SynthOpts o;
+    o.drop = "decoder.model.3.block.1.weight";
+    const auto img = synth_snac({2, 2}, o);
     auto g = locus::gguf::GgufFile::parse(img);
     const auto dec = locus::audio::SnacDecoder::load(g);
     REQUIRE_THROWS_AS(dec.decode(synth_codes(1)), locus::gguf::Error);
+}
+
+// Malformed models and codes must throw, not read out of bounds: the
+// conv kernels check sizes only with assert(), which Release builds
+// compile out (i#183).
+TEST_CASE("snac decoder rejects malformed models and codes", "[snac]") {
+    auto load = [](const std::vector<std::uint32_t>& rates,
+                   const SynthOpts& o) {
+        const auto img = synth_snac(rates, o);
+        auto g = locus::gguf::GgufFile::parse(img);
+        return locus::audio::SnacDecoder::load(g);
+    };
+    SECTION("n_codebooks other than 3") {
+        SynthOpts o;
+        o.n_codebooks = 4;  // decode() carries exactly three streams
+        REQUIRE_THROWS_AS(load({2, 2}, o), locus::gguf::Error);
+    }
+    SECTION("an odd upsample rate") {
+        REQUIRE_THROWS_AS(load({3, 2}, SynthOpts{}), locus::gguf::Error);
+    }
+    SECTION("a recorded layout locus does not run") {
+        SynthOpts o;
+        o.noise = 0;
+        REQUIRE_THROWS_AS(load({2, 2}, o), locus::gguf::Error);
+        o.noise = 1;  // the supported layout still loads
+        REQUIRE_NOTHROW(load({2, 2}, o));
+    }
+    SECTION("a tensor one value short") {
+        for (const char* name :
+             {"quantizer.quantizers.1.codebook.weight",
+              "quantizer.quantizers.0.out_proj.weight",
+              "decoder.model.2.block.1.weight",       // transposed conv
+              "decoder.model.3.block.4.block.0.alpha",  // snake
+              "decoder.model.5.weight"}) {             // tail conv
+            INFO(name);
+            SynthOpts o;
+            o.shorten = name;
+            const auto dec = load({2, 2}, o);
+            REQUIRE_THROWS_AS(dec.decode(synth_codes(1)),
+                              locus::gguf::Error);
+        }
+    }
+    SECTION("a code outside the codebook") {
+        const auto dec = load({2, 2}, SynthOpts{});
+        auto c = synth_codes(1);
+        c.fine[2] = 4;  // codebook_size is 4
+        REQUIRE_THROWS_AS(dec.decode(c), std::invalid_argument);
+        c.fine[2] = -1;
+        REQUIRE_THROWS_AS(dec.decode(c), std::invalid_argument);
+    }
 }
 
 TEST_CASE("pcm encode writes a WAV header and clamped s16", "[wav]") {
