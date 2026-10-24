@@ -38,6 +38,12 @@ std::string muse_spark_path() {
            "00005.gguf";
 }
 
+std::string deepseek41_path() {
+    return std::string(LOCUS_SOURCE_DIR) +
+           "/tests/models/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00001-of-"
+           "00005.gguf";
+}
+
 std::string qwen3_coder_path() {
     return std::string(LOCUS_SOURCE_DIR) +
            "/tests/models/qwen3-coder-30b-a3b-instruct-q4_k_m.gguf";
@@ -762,5 +768,78 @@ TEST_CASE("muse-spark decode matches the llama.cpp golden",
             }
         }
         cache.release(seq);
+    }
+}
+
+// deepseek41 (DeepSeek-V4.1-Flash-1017, unsloth UD-IQ1_S, 233GB in 5
+// shards: huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF; the
+// Engram table alone is the 110GB shard 5), streamed on the CPU.
+// Goldens are the draft reference's (ggml-org/llama.cpp#30817 built
+// from danielhanchen/llama.cpp@deepseek41, llama-completion, greedy,
+// CPU), on chat-mode prompts. Prompt 2 (529 tokens) runs past the
+// 128-token window, fills every compressed cache and, on the ratio-1
+// layers, crosses the indexer's top-512 selection.
+TEST_CASE("deepseek41 decode matches the reference golden",
+          "[e2e][ds41]") {
+    const std::string path = deepseek41_path();
+    if (!std::filesystem::exists(path)) {
+        SKIP("DeepSeek-V4.1-Flash not present (233GB, gitignored)");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    REQUIRE(g.get_string("general.architecture") == "deepseek41");
+    auto model = locus::model::TransformerModel::load(g);
+    if (locus::backend::find_backend("neon") != nullptr) {
+        model.use_backend(*locus::backend::find_backend("neon"));
+    }
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+    std::ifstream notes(std::string(LOCUS_SOURCE_DIR) +
+                        "/tests/golden/design_notes_prompt.txt");
+    std::stringstream notes_text;
+    notes_text << notes.rdbuf();
+    // DeepSeek's chat markers: U+FF5C (fullwidth bar) and U+2581.
+    const std::string bar = "\xef\xbd\x9c", sp = "\xe2\x96\x81";
+    const std::string user = "<" + bar + "begin" + sp + "of" + sp +
+                             "sentence" + bar + "><" + bar + "User" + bar +
+                             ">";
+    const std::string assistant = "<" + bar + "Assistant" + bar + "></think>";
+    struct Golden {
+        std::string prompt;
+        std::size_t prompt_tokens;
+        const char* continuation;  // the reference's 16 tokens
+    };
+    const Golden goldens[] = {
+        {user +
+             "Write a Python function that returns the n-th Fibonacci "
+             "number." +
+             assistant,
+         16,
+         "Here are a few different ways to write a Python function "
+         "that returns the n-th"},
+        {user + "Summarize this design document in one sentence.\n\n" +
+             notes_text.str() + assistant,
+         529, "The design document outlines an MVP for \"locus,\" a pure "
+              "C/C++"},
+    };
+    std::vector<float> logits(model.hparams().n_vocab);
+    for (const Golden& gd : goldens) {
+        INFO(gd.prompt_tokens << "-token prompt");
+        auto cache = model.make_cache(48);  // 768 positions
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        const auto ids = tok->encode(gd.prompt, true);
+        REQUIRE(ids.size() == gd.prompt_tokens);
+        for (auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
+        }
+        std::vector<locus::tok::TokenId> gen;
+        for (int i = 0; i < 16; ++i) {
+            const auto next = locus::model::argmax(logits);
+            gen.push_back(next);
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(next, cache, seq, ws, logits);
+        }
+        cache.release(seq);
+        REQUIRE(tok->decode(gen) == gd.continuation);
     }
 }

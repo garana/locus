@@ -41,9 +41,13 @@ token-exact against llama.cpp on stories260K, Llama-3.2-1B
 Qwen1.5-MoE-A2.7B (qwen2moe, Q4_K_M; CPU and Vulkan),
 Qwen3-Coder-30B-A3B (qwen3moe, Q4_K_M; CPU and Vulkan), GLM-5.2
 744B (UD-IQ1_S, streamed from a 203GB split GGUF on a 32GB machine --
-see the R8 notes in DESIGN.md), and Muse Spark Open 816B-A42B
+see the R8 notes in DESIGN.md), Muse Spark Open 816B-A42B
 (muse-spark, UD-IQ1_S, 176GB streamed on the CPU; one prompt
-token-exact, one checked teacher-forced past a near-tie). Streaming
+token-exact, one checked teacher-forced past a near-tie), and
+DeepSeek-V4.1-Flash-1017 (deepseek41, UD-IQ1_S, 233GB streamed on the
+CPU; token-exact against the draft llama.cpp#30817, including a
+529-token prompt through the compressed history and indexer).
+Streaming
 models decode with madvise readahead (default-on), optional
 threaded matvecs (LOCUS_THREADS) and static-weight pinning
 (LOCUS_PIN_STATIC) per DESIGN.md R9; GLM-5.2's DSA lightning

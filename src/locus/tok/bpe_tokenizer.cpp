@@ -137,7 +137,7 @@ std::vector<Chunk> pretokenize(std::string_view text,
     // standalone one), and punctuation runs also take trailing '/'.
     const bool gpt4o = pre == "gpt-4o";
     const bool llama3 = pre == "llama-bpe" || pre == "llama3" ||
-                        pre == "deepseek-v3" ||
+                        pre == "deepseek-v3" || pre == "joyai-llm" ||
                         pre == "deepseek-r1-qwen" || qwen2 || gpt4o;
     const std::size_t digit_cap = qwen2 ? 1 : 3;
     auto is_upper = [&](std::size_t k) {

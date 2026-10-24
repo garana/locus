@@ -105,6 +105,36 @@ struct Hparams {
     /** Latent MoE: the width experts read and write (muse-spark
      * moe_latent_size; 0 = n_embd). */
     std::uint32_t moe_latent = 0;
+
+    /** deepseek41 (DeepSeek-V4.1): see deepseek41.cpp. */
+    struct Ds41 {
+        /** Per layer: compression ratio (0 = window only), the layer
+         * whose compressed rows it reads, and the layer whose top-k
+         * it reuses (-1 when the ratio is 0). */
+        std::vector<std::uint32_t> ratio;
+        std::vector<std::int32_t> kv_src, topk_src;
+        std::uint32_t window = 0;
+        float compress_rope_base = 0.0f;
+        std::uint32_t rope_dims = 0;
+        std::uint32_t idx_heads = 0, idx_dim = 0, idx_top_k = 0;
+        std::int32_t cand_src = -1;
+        std::uint32_t cand_blocks = 0, cand_block_size = 0;
+        std::uint32_t out_groups = 0, out_rank = 0;
+        std::uint32_t hc = 0, sinkhorn_iters = 0;
+        float hc_eps = 0.0f;
+        std::vector<float> clamp_exp, clamp_shexp;
+        /** Engram: layers, n-gram size, heads per n-gram, row width,
+         * per-layer multipliers / bucket offsets / bucket counts, pad
+         * id and the token -> compressed-id map. */
+        std::vector<std::uint32_t> engram_layers;
+        std::uint32_t ngram = 0, ngram_heads = 0, engram_dim = 0;
+        std::vector<std::uint64_t> engram_mult, engram_off, engram_size;
+        std::uint32_t engram_pad = 0;
+        std::vector<std::int32_t> token_map;
+        /** Cache layer of kv-source layer l's compressed rows. */
+        std::vector<std::int32_t> comp_slot;
+    };
+    Ds41 ds41;
 };
 
 /**
@@ -185,6 +215,10 @@ class TransformerModel {
 
     /** @returns A workspace sized for this model. */
     Workspace make_workspace() const;
+
+    /** @returns Paged-cache layers: the loaded slice, or the arch's
+     * own count (ArchSpec::cache_layers). */
+    std::uint32_t cache_layer_count() const;
 
     /**
      * @param n_blocks Pool size in blocks; 0 sizes the pool for
@@ -474,6 +508,21 @@ class TransformerModel {
         backend::Mat ffn_latent_down, ffn_latent_up;
         std::span<const float> ffn_pre_exp_norm, ffn_post_exp_norm;
         std::span<const float> post_ffw_norm;
+
+        /** deepseek41: attention sinks, grouped output LoRA, mHC
+         * mixes (fn / base / scale per sublayer), the KV compressor
+         * (kv-source layers) and the Engram embedding (its layers;
+         * engram_table is the shared per_layer_token_embd). The q
+         * LoRA, kv projection and indexer reuse wq_a / q_a_norm /
+         * wq_b, wkv_a / kv_a_norm and idx_*. */
+        std::span<const float> attn_sinks;
+        backend::Mat attn_out_a, attn_out_b;
+        backend::Mat hc_attn_fn, hc_ffn_fn;
+        std::span<const float> hc_attn_base, hc_attn_scale;
+        std::span<const float> hc_ffn_base, hc_ffn_scale;
+        backend::Mat comp_kv, comp_gate;
+        std::span<const float> comp_norm;
+        backend::Mat engram_kv, engram_gate, engram_table;
 
         /** @returns true when this layer routes experts. */
         bool is_moe() const { return gate_inp.rows > 0; }

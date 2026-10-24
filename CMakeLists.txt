@@ -36,6 +36,7 @@ add_library(locus
     src/locus/sys/meminfo.cpp
     src/locus/model/arch.cpp
     src/locus/model/codec.cpp
+    src/locus/model/deepseek41.cpp
     src/locus/audio/snac.cpp
     src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp

@@ -69,6 +69,7 @@ add_executable(locus_tests
     test_muse_spark.cpp
     test_codec.cpp
     test_snac.cpp
+    test_deepseek41.cpp
     test_threads.cpp
     test_perf_counters.cpp
     test_cli_args.cpp

@@ -193,7 +193,10 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     hp.n_kv_heads = static_cast<std::uint32_t>(
         g.get_uint(p + "attention.head_count_kv")
             .value_or(hp.n_heads));
-    hp.n_ff = need_uint(g, p + "feed_forward_length");
+    // All-MoE arches (deepseek41) carry no dense width; a dense
+    // layer's need_mat still rejects n_ff 0.
+    hp.n_ff = static_cast<std::uint32_t>(
+        g.get_uint(p + "feed_forward_length").value_or(0));
     hp.n_ctx = need_uint(g, p + "context_length");
     hp.n_expert = static_cast<std::uint32_t>(
         g.get_uint(p + "expert_count").value_or(0));
@@ -439,9 +442,14 @@ kv::PagedKvCache::Geometry cache_geometry(std::uint32_t n_layers_slice,
 }
 }  // namespace
 
+std::uint32_t TransformerModel::cache_layer_count() const {
+    return spec_->cache_layers != nullptr ? spec_->cache_layers(hp_)
+                                          : layer_end_ - layer_begin_;
+}
+
 std::size_t TransformerModel::kv_pool_bytes(std::uint32_t n_blocks,
                                       kv::KvType kv_type) const {
-    const auto geom = cache_geometry(layer_end_ - layer_begin_,
+    const auto geom = cache_geometry(cache_layer_count(),
                                      layer_begin_, spec_->kv_dim(hp_),
                                      hp_.n_ctx, n_blocks, kv_type);
     // F32 commits pool_floats() floats; a quantized pool commits
@@ -454,7 +462,7 @@ std::size_t TransformerModel::kv_pool_bytes(std::uint32_t n_blocks,
 kv::PagedKvCache TransformerModel::make_cache(
     std::uint32_t n_blocks, kv::KvType kv_type) const {
     const kv::PagedKvCache::Geometry geom =
-        cache_geometry(layer_end_ - layer_begin_, layer_begin_,
+        cache_geometry(cache_layer_count(), layer_begin_,
                        spec_->kv_dim(hp_), hp_.n_ctx, n_blocks, kv_type);
     // GPU-mapped KV pool when the backend provides one (alloc_kv is
     // set only for Vulkan today; it hands back unified-memory float*).
@@ -555,6 +563,17 @@ void TransformerModel::forward_layers(tok::TokenId token,
     }
     if (seq.n_tokens >= cache.capacity(seq)) {
         throw std::invalid_argument("seq capacity not ensured");
+    }
+    if (spec_->forward != nullptr) {
+        // The arch's own whole-token forward (residual state spans
+        // layers): full model, one stage.
+        if (!first || !last) {
+            throw std::invalid_argument(
+                "forward_layers: this arch runs the whole model only");
+        }
+        spec_->forward(*this, token, cache, seq, ws, out);
+        seq.n_tokens += 1;
+        return;
     }
     const std::uint32_t pos = seq.n_tokens;
     const backend::Ops op =

@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "locus/model/deepseek41.hpp"
 #include "locus/model/gguf_load.hpp"
 
 namespace locus::model {
@@ -1272,6 +1273,12 @@ const ArchSpec kArchs[] = {
      "residuals, latent MoE)",
      &muse_spark_hparams, &muse_spark_attention_tensors,
      &muse_spark_attention, &llama_kv_dim, &muse_spark_layer},
+    {"deepseek41",
+     "DeepSeek-V4.1-Flash (hyper-connections, MQA with compressed / "
+     "indexed history and sinks, Engram, sqrt-softplus MoE)",
+     &deepseek41::load_hparams, &deepseek41::load_layer,
+     &deepseek41::attention, &deepseek41::kv_dim, nullptr,
+     &deepseek41::forward, &deepseek41::cache_layers},
 };
 
 }  // namespace
