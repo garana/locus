@@ -87,6 +87,7 @@ int main(int argc, char** argv) {
         if (!args.metrics_path.empty()) {
             opt.metrics_path = args.metrics_path;
         }
+        opt.audio_decoder_path = args.audio_decoder;
         locus::server::OpenAiServer server(model, tok, opt);
         std::fprintf(
             stderr,

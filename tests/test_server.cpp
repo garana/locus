@@ -1092,3 +1092,69 @@ TEST_CASE("server survives concurrent mid-stream SSE aborts",
     }
     REQUIRE(free_after == free_before);
 }
+
+TEST_CASE("audio speech 503 when no decoder configured",
+          "[server][audio]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    TestServer ts(model, tok);  // no audio_decoder_path in Options.
+    httplib::Client client("127.0.0.1", ts.port);
+    auto res = client.Post("/v1/audio/speech",
+                           json{{"input", "hi"}}.dump(),
+                           "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+}
+
+namespace {
+std::string orpheus_path() {
+    return std::string(LOCUS_SOURCE_DIR) +
+           "/tests/models/orpheus-3b-0.1-ft-Q4_K_M.gguf";
+}
+std::string snac_path() {
+    return std::string(LOCUS_SOURCE_DIR) +
+           "/tests/models/snac_24khz_decoder.gguf";
+}
+}  // namespace
+
+// End-to-end wiring: a real Orpheus model + SNAC decoder, a tiny gen
+// cap so the test stays quick, and a WAV back out. The decode math is
+// pinned bit-exact in test_snac.cpp; this proves only the HTTP path
+// (prompt wrapping -> greedy -> codec sampler -> decoder -> WAV).
+TEST_CASE("audio speech returns a WAV end to end",
+          "[server][audio][e2e]") {
+    if (!std::filesystem::exists(orpheus_path()) ||
+        !std::filesystem::exists(snac_path())) {
+        SKIP("orpheus model or snac decoder absent");
+    }
+    auto g = locus::gguf::GgufFile::open(orpheus_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+
+    locus::server::OpenAiServer::Options opt;
+    opt.audio_decoder_path = snac_path();
+    opt.max_tokens_cap = 14;  // 2 frames: keep the test quick.
+    locus::server::OpenAiServer server(model, *tok, std::move(opt));
+    const int port = server.bind_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { server.listen_after_bind(); });
+
+    httplib::Client client("127.0.0.1", port);
+    const json req{{"input", "The quick brown fox."},
+                   {"voice", "tara"},
+                   {"response_format", "wav"}};
+    auto res = client.Post("/v1/audio/speech", req.dump(),
+                           "application/json");
+    server.stop();
+    th.join();
+
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(res->get_header_value("Content-Type") == "audio/wav");
+    REQUIRE(res->body.size() > 44);          // header + some audio.
+    REQUIRE(res->body.substr(0, 4) == "RIFF");
+}

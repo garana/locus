@@ -101,6 +101,27 @@ TEST_CASE("orpheus sampler buffers audio, stops on non-audio",
     REQUIRE(out.fine == std::vector<int>{1575, 543, 3389, 219});
 }
 
+TEST_CASE("orpheus sampler codes_lenient drops a desynced frame",
+          "[codec]") {
+    OrpheusCodecSampler s(kBase);
+    const int good[7] = {948, 1988, 1575, 543, 1988, 3389, 219};
+    for (auto t : frame(good)) {
+        REQUIRE(s.push(t) == OrpheusCodecSampler::Status::kAudio);
+    }
+    // A second frame of all-band-base ids: position 1 decodes to -4096,
+    // so the frame is out of range (a desync).
+    for (int i = 0; i < 7; ++i) {
+        REQUIRE(s.push(kBase) == OrpheusCodecSampler::Status::kAudio);
+    }
+    REQUIRE(s.frames() == 2);
+    REQUIRE_THROWS_AS(s.codes(), std::invalid_argument);  // strict.
+
+    const auto lenient = s.codes_lenient();  // drops the bad frame.
+    REQUIRE(lenient.coarse == std::vector<int>{948});
+    REQUIRE(lenient.mid == std::vector<int>{1988, 1988});
+    REQUIRE(lenient.fine == std::vector<int>{1575, 543, 3389, 219});
+}
+
 namespace {
 
 std::string golden_dir() {
