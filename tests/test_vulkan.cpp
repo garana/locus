@@ -238,8 +238,11 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
          84, 80, true},
     };
     // 4 x 512: one workgroup, fewer units than lanes; 7 x 2304: a
-    // partial workgroup and several units per lane.
-    const std::uint32_t shapes[][2] = {{4, 512}, {7, 2304}};
+    // partial workgroup and several units per lane; the rest span many
+    // workgroups (1000 rows: a partial last one).
+    const std::uint32_t shapes[][2] = {{4, 512},    {7, 2304},
+                                       {512, 2048}, {2048, 768},
+                                       {1000, 2048}};
     for (const auto& [rows, cols] : shapes)
     for (const auto& c : cases) {
         INFO("type " << static_cast<int>(c.type) << " " << rows << "x"

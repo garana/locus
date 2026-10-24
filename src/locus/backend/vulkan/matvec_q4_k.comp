@@ -16,8 +16,8 @@
 // sums all n_slots weighted by route[n_slots + k] into one row (the
 // MoE down projection).
 
-#define LANES 32u
-#define ROWS 4u
+#define LANES 16u
+#define ROWS 8u
 
 layout(local_size_x = 128) in;
 
@@ -116,8 +116,12 @@ float row_part(uint wbase, uint xbase, uint r, uint lane) {
             uint xk = xi + k * 4u;
             vec4 xv = xal ? x4[xk >> 2]
                           : vec4(x[xk], x[xk + 1u], x[xk + 2u], x[xk + 3u]);
-            vec4 qv = vec4(float(v & 0xfu), float((v >> 8u) & 0xfu),
-                           float((v >> 16u) & 0xfu), float((v >> 24u) & 0xfu));
+            // Two nibbles at a time: each lands in the mantissa of an
+            // f16 1024 + n (exact), so one unpack yields two values.
+            vec2 n02 = unpackHalf2x16((v & 0x000f000fu) | 0x64006400u);
+            vec2 n13 =
+                unpackHalf2x16(((v >> 8u) & 0x000f000fu) | 0x64006400u);
+            vec4 qv = vec4(n02.x, n13.x, n02.y, n13.y) - 1024.0;
             sq += dot(qv, xv);
             sx += xv.x + xv.y + xv.z + xv.w;
         }
