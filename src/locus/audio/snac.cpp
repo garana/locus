@@ -98,10 +98,19 @@ SnacDecoder SnacDecoder::load(const gguf::GgufFile& g) {
     }
     // The tensor names follow SNAC's depthwise + noise, attention-free
     // decoder layout; refuse a GGUF that records another one (keys
-    // written by scripts/convert-snac.py; older files lack them).
-    const auto depthwise = g.get_bool("snac.depthwise");
-    const auto noise = g.get_bool("snac.noise");
-    const auto attention = g.get_bool("snac.attention");
+    // written by scripts/convert-snac.py; older files lack them). A key
+    // of another type is an error: get_bool would read it as absent.
+    const auto flag = [&g](const char* key) {
+        const gguf::Value* v = g.find(key);
+        if (v != nullptr && v->type != gguf::ValueType::kBool) {
+            throw gguf::Error(std::string("snac: ") + key +
+                              " must be a bool");
+        }
+        return g.get_bool(key);
+    };
+    const auto depthwise = flag("snac.depthwise");
+    const auto noise = flag("snac.noise");
+    const auto attention = flag("snac.attention");
     if ((depthwise && !*depthwise) || (noise && !*noise) ||
         (attention && *attention)) {
         throw gguf::Error("snac: unsupported decoder layout (needs "
