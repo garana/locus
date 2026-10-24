@@ -184,9 +184,13 @@ std::vector<float> SnacDecoder::decode(
         }
     }
 
-    // Tail: snake, 1-channel k7 conv, tanh.
-    snake(x, "decoder.model.6.alpha");
-    x = conv(x, "decoder.model.7", 1, 7, 1, 3, 1);
+    // Tail: snake, 1-channel k7 conv, tanh. It sits right after the
+    // last DecoderBlock in the Sequential, so its index follows the
+    // number of upsample rates (model.6/.7 for the 24 kHz model's 4).
+    const std::string tail = std::to_string(2 + rates_.size());
+    const std::string tail_conv = std::to_string(3 + rates_.size());
+    snake(x, "decoder.model." + tail + ".alpha");
+    x = conv(x, "decoder.model." + tail_conv, 1, 7, 1, 3, 1);
     for (auto& v : x.data) v = std::tanh(v);
     return std::move(x.data);
 }

@@ -2,6 +2,8 @@
 #include "locus/audio/wav.hpp"
 
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -9,6 +11,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "gguf_builder.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/codec.hpp"
 
@@ -108,6 +111,158 @@ std::int16_t le16(const std::vector<std::byte>& b, std::size_t off) {
 }
 
 }  // namespace
+
+namespace {
+
+/**
+ * A tiny synthetic "snac" GGUF image: the decoder graph with small
+ * dimensions and pseudo-random weights, so the graph (channel
+ * progression, rate order, transposed-conv lengths, tensor names) is
+ * tested without the real model. Three codebooks with strides [4,2,1]
+ * (what SnacCodes carries), latent 4, codebook 4 x 2, and a decoder
+ * width of 4 * 2^rates halved per upsample block, so it ends at 4
+ * channels whatever the rate count (the real model: 1024 -> 64).
+ *
+ * @param rates The decoder upsample rates (even, as in SNAC 24 kHz).
+ * @param drop A tensor name to leave out (to test the missing-tensor
+ *     error), or empty.
+ */
+std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
+                                  const std::string& drop = "") {
+    constexpr std::uint32_t kLatent = 4, kCbSize = 4, kCbDim = 2;
+    const std::uint32_t kDec = 4u << rates.size();
+    struct T {
+        std::string name;
+        std::vector<std::uint64_t> dims;  // GGUF order (fastest first)
+        std::vector<float> data;
+    };
+    std::vector<T> ts;
+    std::uint32_t lcg = 12345;
+    auto rnd = [&] {  // deterministic, in [-0.5, 0.5)
+        lcg = lcg * 1664525u + 1013904223u;
+        return static_cast<float>(lcg >> 8) / 16777216.0f - 0.5f;
+    };
+    // PyTorch shape {d0, d1, d2} -> GGUF dims reversed.
+    auto add = [&](const std::string& n,
+                   std::vector<std::uint64_t> shape, bool ones = false) {
+        if (n == drop) return;
+        std::uint64_t count = 1;
+        for (auto d : shape) count *= d;
+        std::vector<float> v(count);
+        for (auto& x : v) x = ones ? 1.0f : rnd();
+        ts.push_back({n, {shape.rbegin(), shape.rend()}, std::move(v)});
+    };
+    for (int i = 0; i < 3; ++i) {
+        const std::string q = "quantizer.quantizers." + std::to_string(i);
+        add(q + ".codebook.weight", {kCbSize, kCbDim});
+        add(q + ".out_proj.weight", {kLatent, kCbDim, 1});
+        add(q + ".out_proj.bias", {kLatent});
+    }
+    add("decoder.model.0.weight", {kLatent, 1, 7});  // depthwise
+    add("decoder.model.0.bias", {kLatent});
+    add("decoder.model.1.weight", {kDec, kLatent, 1});
+    add("decoder.model.1.bias", {kDec});
+    std::uint32_t ch = kDec;
+    for (std::size_t b = 0; b < rates.size(); ++b) {
+        const std::string p =
+            "decoder.model." + std::to_string(2 + b) + ".block";
+        const std::uint32_t out = ch / 2;
+        add(p + ".0.alpha", {1, ch, 1}, true);
+        add(p + ".1.weight", {ch, out, 2 * rates[b]});  // transpose
+        add(p + ".1.bias", {out});
+        for (int u = 3; u <= 5; ++u) {
+            const std::string rp = p + "." + std::to_string(u) + ".block";
+            add(rp + ".0.alpha", {1, out, 1}, true);
+            add(rp + ".1.weight", {out, 1, 7});
+            add(rp + ".1.bias", {out});
+            add(rp + ".2.alpha", {1, out, 1}, true);
+            add(rp + ".3.weight", {out, out, 1});
+            add(rp + ".3.bias", {out});
+        }
+        ch = out;
+    }
+    const std::string tail = std::to_string(2 + rates.size());
+    const std::string tail_conv = std::to_string(3 + rates.size());
+    add("decoder.model." + tail + ".alpha", {1, ch, 1}, true);
+    add("decoder.model." + tail_conv + ".weight", {1, ch, 7});
+    add("decoder.model." + tail_conv + ".bias", {1});
+
+    GgufBuilder g;
+    g.header(ts.size(), 9);
+    g.kv_string("general.architecture", "snac");
+    g.kv_u32("snac.sampling_rate", 24000);
+    g.kv_u32("snac.decoder_dim", kDec);
+    g.kv_u32("snac.latent_dim", kLatent);
+    g.kv_u32("snac.codebook_size", kCbSize);
+    g.kv_u32("snac.codebook_dim", kCbDim);
+    g.kv_u32("snac.n_codebooks", 3);
+    const std::vector<std::int32_t> r(rates.begin(), rates.end());
+    g.kv_i32_array("snac.decoder_rates", r);
+    const std::vector<std::int32_t> strides = {4, 2, 1};
+    g.kv_i32_array("snac.vq_strides", strides);
+    std::uint64_t offset = 0;
+    for (const auto& t : ts) {
+        g.tensor(t.name, t.dims, 0 /* F32 */, offset);
+        offset = (offset + t.data.size() * 4 + 31) & ~31ull;
+    }
+    g.pad();
+    for (const auto& t : ts) {
+        for (float v : t.data) g.f32(v);
+        while (g.bytes().size() % 32 != 0) g.zeros(1);
+    }
+    auto span = g.bytes();
+    return {span.begin(), span.end()};
+}
+
+/** Codes for F frames, cycling through the codebook. */
+locus::model::SnacCodes synth_codes(std::uint32_t frames, int shift = 0) {
+    locus::model::SnacCodes c;
+    for (std::uint32_t i = 0; i < frames; ++i) c.coarse.push_back((i + shift) % 4);
+    for (std::uint32_t i = 0; i < 2 * frames; ++i) c.mid.push_back((i + 1) % 4);
+    for (std::uint32_t i = 0; i < 4 * frames; ++i) c.fine.push_back((i + 2) % 4);
+    return c;
+}
+
+}  // namespace
+
+// The decode graph without the real model (runs on every host): output
+// length is exactly strides.front() * product(rates) per frame, values
+// are finite, decoding is bit-identical across runs, and the codes
+// actually reach the output. Two different rate lists check that the
+// structure (block count, tail position) follows the metadata.
+TEST_CASE("snac decoder graph on a synthetic model", "[snac]") {
+    for (const auto& rates : {std::vector<std::uint32_t>{2, 2},
+                              std::vector<std::uint32_t>{4, 2, 2, 2}}) {
+        std::uint32_t prod = 1;
+        for (auto r : rates) prod *= r;
+        INFO("rates " << rates.size() << ", product " << prod);
+        const auto img = synth_snac(rates);
+        auto g = locus::gguf::GgufFile::parse(img);
+        const auto dec = locus::audio::SnacDecoder::load(g);
+        for (std::uint32_t frames : {1u, 2u, 5u}) {
+            INFO(frames << " frames");
+            const auto codes = synth_codes(frames);
+            const auto a = dec.decode(codes);
+            REQUIRE(a.size() == std::size_t(frames) * 4 * prod);
+            bool finite = true, nonzero = false;
+            for (float v : a) {
+                finite = finite && std::isfinite(v);
+                nonzero = nonzero || v != 0.0f;
+            }
+            REQUIRE(finite);
+            REQUIRE(nonzero);
+            REQUIRE(dec.decode(codes) == a);  // no leaked state
+            REQUIRE(dec.decode(synth_codes(frames, 1)) != a);  // codes count
+        }
+    }
+}
+
+TEST_CASE("snac decoder reports a missing tensor", "[snac]") {
+    const auto img = synth_snac({2, 2}, "decoder.model.3.block.1.weight");
+    auto g = locus::gguf::GgufFile::parse(img);
+    const auto dec = locus::audio::SnacDecoder::load(g);
+    REQUIRE_THROWS_AS(dec.decode(synth_codes(1)), locus::gguf::Error);
+}
 
 TEST_CASE("pcm encode writes a WAV header and clamped s16", "[wav]") {
     const std::vector<float> s = {0.0f, 1.0f, -1.0f, 0.5f, 2.0f};
