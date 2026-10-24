@@ -207,7 +207,7 @@ void engram(const TransformerModel& m, const TransformerModel::Layer& lay,
             std::uint32_t pos, Scratch& s) {
     const Hparams& hp = m.hparams();
     const auto& d = hp.ds41;
-    const backend::Ops& op = m.active_backend().ops;
+    const backend::Ops op = m.ops();
     const std::uint32_t E = hp.n_embd;
     const std::int64_t dead = -1;
     auto cid = [&](std::int64_t t) -> std::int64_t {
@@ -287,7 +287,7 @@ void attention_layer(const TransformerModel& m,
                      std::uint32_t l, std::uint32_t pos, Scratch& s) {
     const Hparams& hp = m.hparams();
     const auto& d = hp.ds41;
-    const backend::Ops& op = m.active_backend().ops;
+    const backend::Ops op = m.ops();
     const std::uint32_t H = hp.n_heads, Dh = hp.head_dim, R = d.rope_dims;
     const Rope rope = rope_of(hp, l);
     const float neg_inf = -std::numeric_limits<float>::infinity();
@@ -624,6 +624,7 @@ void load_hparams(const gguf::GgufFile& g, const std::string& p,
     auto& d = hp.ds41;
     hp.arch = Arch::kLlama;
     hp.custom_layer = true;
+    hp.q8k_default = true;  // the goldens are the reference's
     hp.head_dim = need_uint(g, p + "attention.key_length");
     if (g.get_uint(p + "attention.value_length").value_or(hp.head_dim) !=
             hp.head_dim ||
@@ -831,7 +832,7 @@ void forward(const TransformerModel& m, tok::TokenId token,
     }
     const Hparams& hp = m.hparams();
     const auto& d = hp.ds41;
-    const backend::Ops& op = m.active_backend().ops;
+    const backend::Ops op = m.ops();
     const std::uint32_t E = hp.n_embd, L = hp.n_layers;
     const std::uint32_t pos = seq.n_tokens;
     Scratch& s = scratch();

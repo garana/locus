@@ -705,14 +705,12 @@ TEST_CASE("every selectable backend reproduces the golden output",
 // muse-spark (Muse Spark Open 816B-A42B, unsloth UD-IQ1_S, 176GB in 5
 // shards: huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF),
 // streamed from disk on the CPU. Goldens are llama.cpp's
-// (llama-completion, same GGUF, greedy, CPU). Prompt 1 is token-exact.
-// Prompt 2 passes through near-ties a 1-bit model makes fragile: with
-// f32-activation dots locus picked "-" over llama.cpp's "*" after
-// " else return n"; with the Q8_K activation dots matvec_mt shares
-// with llama.cpp it follows through "*fac(n-1)" and parts later, after
-// the newline. So it is checked teacher-forced: along llama.cpp's
-// continuation every reference token must sit within 0.25 of locus's
-// top logit.
+// (llama-completion, same GGUF, greedy, CPU); both prompts are
+// token-exact. Prompt 2 passes through near-ties that only hold with
+// llama.cpp's quantized activations, which the arch turns on by
+// default: Q8_K for its Q6_K and IQ1_S matvecs, Q8_0 for its Q8_0 ones
+// (#189). With f32 activations it parts from the golden after
+// " else return n".
 TEST_CASE("muse-spark decode matches the llama.cpp golden",
           "[e2e][muse]") {
     const std::string path = muse_spark_path();
@@ -751,25 +749,24 @@ TEST_CASE("muse-spark decode matches the llama.cpp golden",
     }
     {
         const std::string prompt = "x.append(item)\n\tif (n<2) return n;";
-        const std::string cont = " else return n*fac(n-1";
-        const auto np = tok->encode(prompt, true).size();
-        REQUIRE(np == 14);
-        const auto ids = tok->encode(prompt + cont, true);
         auto cache = model.make_cache(8);
         auto ws = model.make_workspace();
         locus::kv::PagedKvCache::Seq seq;
-        for (std::size_t i = 0; i + 1 < ids.size(); ++i) {
+        const auto ids = tok->encode(prompt, true);
+        REQUIRE(ids.size() == 14);  // llama.cpp's prompt count
+        for (auto id : ids) {
             REQUIRE(cache.ensure_capacity(seq, 1));
-            model.forward(ids[i], cache, seq, ws, logits);
-            if (i + 1 >= np) {
-                const float top =
-                    *std::max_element(logits.begin(), logits.end());
-                INFO("position " << i + 1);
-                REQUIRE(logits[static_cast<std::size_t>(ids[i + 1])] >=
-                        top - 0.25f);
-            }
+            model.forward(id, cache, seq, ws, logits);
+        }
+        std::vector<locus::tok::TokenId> gen;
+        for (int i = 0; i < 16; ++i) {
+            const auto next = locus::model::argmax(logits);
+            gen.push_back(next);
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(next, cache, seq, ws, logits);
         }
         cache.release(seq);
+        REQUIRE(tok->decode(gen) == " else return n*fac(n-1)\n\t\t# 1. ");
     }
 }
 

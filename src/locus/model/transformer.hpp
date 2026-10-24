@@ -79,6 +79,10 @@ struct Hparams {
     bool rope_neox = false;
     /** YARN rope correction (freq_scale 1 = off). */
     backend::Yarn yarn;
+    /** Quantized-activation (R16) mode on by default: archs validated
+     * against llama.cpp, which quantizes the activations
+     * (muse-spark, deepseek41). use_q8k_activations overrides it. */
+    bool q8k_default = false;
     /** Max context the model was trained for. */
     std::uint32_t n_ctx = 0;
     float rms_eps = 1e-5f;
@@ -185,9 +189,11 @@ class TransformerModel {
 
     /**
      * Opt-in ggml-parity mode (DESIGN.md R16): when enabled, QK_K
-     * weight matmuls integer-dot a Q8_K-quantized activation (matching
-     * llama.cpp's algorithm, lower quantization error than the default
-     * f32-activation dot) via Ops::matvec_q8k. Default off -- the f32
+     * weight matmuls integer-dot a Q8_K-quantized activation, and
+     * block-32 weights (Q8_0 / Q4_0 / IQ4_NL) a Q8_0-quantized one
+     * (matching llama.cpp's algorithm, lower quantization error than the
+     * default f32-activation dot) via Ops::matvec_q8k. Default off
+     * (on for arches whose hparams set q8k_default) -- the f32
      * path stays the default because it keeps the exact-string e2e
      * goldens stable and cross-backend consistent, and Q8_K's final
      * f32 accumulation order is implementation-specific (not bit-exact
@@ -198,6 +204,14 @@ class TransformerModel {
 
     /** @returns Whether Q8_K-activation mode is enabled. */
     bool q8k_activations() const { return q8k_activations_; }
+
+    /**
+     * @returns The active backend's ops as the forward uses them:
+     *     Ops::matvec_q8k cleared unless Q8_K-activation mode is on.
+     *     Arch hooks take these, never active_backend().ops directly,
+     *     so use_q8k_activations holds for every arch.
+     */
+    backend::Ops ops() const;
 
     /** Reusable per-thread scratch buffers (no sequence state). */
     struct Workspace {

@@ -1981,6 +1981,112 @@ void quantize_activation_q8k(std::span<const float> x, float* d,
     }
 }
 
+/** A Q8_0-quantized activation block: 32 int8 quants and their
+ * f16-rounded scale (ggml block_q8_0 as vec_dot_type). */
+struct BlockQ8_0Act {
+    float d;
+    std::int8_t qs[32];
+};
+
+/**
+ * ggml's quantize_row_q8_0 (its NEON form): d = amax / 127 rounded to
+ * f16; quants round x / d (with 1 / d from the unrounded d) to nearest
+ * even.
+ */
+void quantize_row_q8_0_act(const float* x, BlockQ8_0Act* y, std::size_t n) {
+    for (std::size_t b = 0; b < n / 32; ++b) {
+        const float* xb = x + b * 32;
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            amax = std::max(amax, std::fabs(xb[j]));
+        }
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        y[b].d = f16_to_f32(f32_to_f16(d));
+        for (int j = 0; j < 32; ++j) {
+            y[b].qs[j] = static_cast<std::int8_t>(std::nearbyint(xb[j] * id));
+        }
+    }
+}
+
+/** Block b of a block-32 weight row as 32 int8 values and its scale. */
+float unpack_block32(gguf::TensorType type, const std::byte* row,
+                     std::size_t b, std::int8_t* q) {
+    using T = gguf::TensorType;
+    switch (type) {
+        case T::kQ8_0: {
+            const std::byte* blk = row + b * kQ8_0BlockBytes;
+            std::memcpy(q, blk + 2, 32);
+            return f16_to_f32(load_u16(blk));
+        }
+        case T::kQ4_0: {
+            const std::byte* blk = row + b * kQ4_0BlockBytes;
+            const auto* qs = reinterpret_cast<const std::uint8_t*>(blk + 2);
+            for (int i = 0; i < 16; ++i) {
+                q[i] = static_cast<std::int8_t>((qs[i] & 0x0f) - 8);
+                q[i + 16] = static_cast<std::int8_t>((qs[i] >> 4) - 8);
+            }
+            return f16_to_f32(load_u16(blk));
+        }
+        default: {  // kIQ4_NL
+            const std::byte* blk = row + b * kIQ4_NLBlockBytes;
+            const auto* qs = reinterpret_cast<const std::uint8_t*>(blk + 2);
+            for (int i = 0; i < 16; ++i) {
+                q[i] = kvalues_iq4nl[qs[i] & 0x0f];
+                q[i + 16] = kvalues_iq4nl[qs[i] >> 4];
+            }
+            return f16_to_f32(load_u16(blk));
+        }
+    }
+}
+
+/**
+ * dot(block-32 weight row, Q8_0 activation), in the order of ggml's
+ * NEON vec_dot_*_q8_0: two blocks per step, each folding its int sums
+ * into four float lanes (lane l holds quants 4l..4l+3 of both halves);
+ * a pairwise lane reduction; then a scalar tail for an odd last block.
+ */
+float vec_dot_block32_q8_0(gguf::TensorType type, const std::byte* row,
+                           const BlockQ8_0Act* xq, std::size_t nb) {
+    float s0[4] = {}, s1[4] = {};
+    std::int8_t q0[32], q1[32];
+    std::size_t b = 0;
+    auto lanes = [](const std::int8_t* q, const std::int8_t* x, int l) {
+        int p = 0;
+        for (int k = 0; k < 4; ++k) {
+            p += q[4 * l + k] * x[4 * l + k] + q[16 + 4 * l + k] * x[16 + 4 * l + k];
+        }
+        return p;
+    };
+    for (; b + 1 < nb; b += 2) {
+        const float d0 = unpack_block32(type, row, b, q0) * xq[b].d;
+        const float d1 = unpack_block32(type, row, b + 1, q1) * xq[b + 1].d;
+        for (int l = 0; l < 4; ++l) {
+            const float m0 = static_cast<float>(lanes(q0, xq[b].qs, l)) * d0;
+            s0[l] = s0[l] + m0;
+            const float m1 =
+                static_cast<float>(lanes(q1, xq[b + 1].qs, l)) * d1;
+            s1[l] = s1[l] + m1;
+        }
+    }
+    float sum = ((s0[0] + s0[1]) + (s0[2] + s0[3])) +
+                ((s1[0] + s1[1]) + (s1[2] + s1[3]));
+    for (; b < nb; ++b) {
+        const float d = unpack_block32(type, row, b, q0) * xq[b].d;
+        int p = 0;
+        for (int j = 0; j < 32; ++j) {
+            p += q0[j] * xq[b].qs[j];
+        }
+        sum += static_cast<float>(p) * d;
+    }
+    return sum;
+}
+
+bool is_q8_0_act_type(gguf::TensorType type) {
+    using T = gguf::TensorType;
+    return type == T::kQ8_0 || type == T::kQ4_0 || type == T::kIQ4_NL;
+}
+
 bool is_q8k_type(gguf::TensorType type) {
     using T = gguf::TensorType;
     switch (type) {
@@ -2009,8 +2115,20 @@ void matvec_q8k(const Mat& w, std::span<const float> x,
                 std::span<float> out) {
     assert(x.size() == w.cols && out.size() == w.rows);
     using T = gguf::TensorType;
+    if (is_q8_0_act_type(w.type) && x.size() % 32 == 0) {
+        // Block-32 weights: llama.cpp's vec_dot_type is Q8_0.
+        const std::size_t nb = x.size() / 32;
+        std::vector<BlockQ8_0Act> xq(nb);
+        quantize_row_q8_0_act(x.data(), xq.data(), x.size());
+        const std::size_t stride = row_bytes(w);
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            out[r] = vec_dot_block32_q8_0(w.type, w.data + r * stride,
+                                          xq.data(), nb);
+        }
+        return;
+    }
     if (!is_q8k_type(w.type) || x.size() % 256 != 0) {
-        matvec(w, x, out);  // no Q8_K dot: keep the f32 path
+        matvec(w, x, out);  // no quantized-activation dot: f32 path
         return;
     }
     const std::size_t nb = x.size() / 256;

@@ -40,7 +40,11 @@ void engram_rows(const Hparams::Ds41& d, std::uint32_t e,
  * @returns The routed experts' weights for `picked` (indices into the
  *     router probabilities): normalized to sum 1 when
  *     hp.expert_weights_norm and more than one expert is picked, then
- *     scaled by hp.expert_weights_scale. Exposed for tests.
+ *     scaled by hp.expert_weights_scale. The normalizer's + 1e-20 is
+ *     deepseek41's own (its model.py, special-cased in the reference);
+ *     llama.cpp's generic MoE clamps the sum at the smallest f16
+ *     normal instead, so other arches should not reuse this. Exposed
+ *     for tests.
  */
 std::vector<float> moe_weights(const Hparams& hp,
                                std::span<const float> probs,
