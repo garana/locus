@@ -1126,13 +1126,13 @@ void muse_spark_layer(const TransformerModel& m,
     // Attention.
     rmsnorm(ws.x, lay.attn_norm, hp.rms_eps, ws.xb);
     std::span<float> q(ws.q.data(), q_dim);
-    op.matvec(lay.wq, ws.xb, q);
-    op.matvec(lay.attn_gate, ws.xb, gate);
+    matvec_mt(op, lay.wq, ws.xb, q);
+    matvec_mt(op, lay.attn_gate, ws.xb, gate);
     head_norm(q, hp.n_heads, lay.attn_q_norm);
     rope(q, hp.n_heads);
     std::vector<float> kbuf(kv_dim), vbuf(kv_dim);
-    op.matvec(lay.wk, ws.xb, kbuf);
-    op.matvec(lay.wv, ws.xb, vbuf);
+    matvec_mt(op, lay.wk, ws.xb, kbuf);
+    matvec_mt(op, lay.wv, ws.xb, vbuf);
     head_norm(kbuf, hp.n_kv_heads, lay.attn_k_norm);
     rope(kbuf, hp.n_kv_heads);
     // Sliding-window layers see the last swa_window positions
@@ -1197,7 +1197,7 @@ void muse_spark_layer(const TransformerModel& m,
             oh[i] *= 1.0f / (1.0f + std::exp(-gl));
         }
     }
-    op.matvec(lay.wo, {ws.out.data(), q_dim}, ws.xb2);
+    matvec_mt(op, lay.wo, {ws.out.data(), q_dim}, ws.xb2);
     rmsnorm_unit(ws.xb2, hp.post_norm_eps);
     for (std::uint32_t i = 0; i < E; ++i) {
         ws.x[i] = ws.x[i] * lay.attn_resid_alpha[i] +
@@ -1208,18 +1208,18 @@ void muse_spark_layer(const TransformerModel& m,
     // latent space (each output scaled by post_exp_norm, then
     // normalized), and project the weighted sum back.
     rmsnorm(ws.x, lay.ffn_norm, hp.rms_eps, ws.xb);
-    op.matvec(lay.ffn_latent_down, ws.xb, lx);
+    matvec_mt(op, lay.ffn_latent_down, ws.xb, lx);
     rmsnorm(lx, lay.ffn_pre_exp_norm, hp.rms_eps, lx);
     op.matvec(lay.gate_inp, ws.xb, ws.router);
     const auto picked = moe_select(hp, lay, ws.router);
     std::fill(lacc.begin(), lacc.end(), 0.0f);
     const std::uint32_t ff = hp.n_ff_exp;
     for (const auto& [e, wgt] : picked) {
-        op.matvec(lay.gate_exps.expert(e), lx, {ws.gate.data(), ff});
-        op.matvec(lay.up_exps.expert(e), lx, {ws.up.data(), ff});
+        matvec_mt(op, lay.gate_exps.expert(e), lx, {ws.gate.data(), ff});
+        matvec_mt(op, lay.up_exps.expert(e), lx, {ws.up.data(), ff});
         silu_mul({ws.gate.data(), ff}, {ws.up.data(), ff},
                  {ws.gate.data(), ff});
-        op.matvec(lay.down_exps.expert(e), {ws.gate.data(), ff}, ly);
+        matvec_mt(op, lay.down_exps.expert(e), {ws.gate.data(), ff}, ly);
         for (std::uint32_t i = 0; i < lat; ++i) {
             ly[i] *= lay.ffn_post_exp_norm[i];
         }
@@ -1228,7 +1228,7 @@ void muse_spark_layer(const TransformerModel& m,
             lacc[i] += wgt * ly[i];
         }
     }
-    op.matvec(lay.ffn_latent_up, lacc, ws.xb2);
+    matvec_mt(op, lay.ffn_latent_up, lacc, ws.xb2);
     for (std::uint32_t i = 0; i < E; ++i) {
         ws.xb2[i] *= lay.post_ffw_norm[i];
     }
