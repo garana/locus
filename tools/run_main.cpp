@@ -54,6 +54,13 @@ int main(int argc, char** argv) {
                      argv[0], args.kv_type_name.c_str());
         return 2;
     }
+    if (!args.bad_number_flag.empty()) {
+        std::fprintf(stderr,
+                     "%s: %s needs a non-negative integer, got '%s'\n",
+                     argv[0], args.bad_number_flag.c_str(),
+                     args.bad_number_value.c_str());
+        return 2;
+    }
     if (args.positional.size() < 2) {
         std::fprintf(stderr,
                      "usage: %s [--backend NAME] <model.gguf> "
