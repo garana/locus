@@ -12,7 +12,7 @@ namespace {
  * Shared by the free function and the sampler.
  */
 SnacCodes deband_frames(std::span<const tok::TokenId> audio,
-                        tok::TokenId band_base) {
+                        tok::TokenId band_base, bool drop_invalid) {
     constexpr int kN = OrpheusCodec::kCodesPerFrame;
     constexpr int kB = OrpheusCodec::kCodebook;
     if (audio.size() % kN != 0) {
@@ -27,10 +27,15 @@ SnacCodes deband_frames(std::span<const tok::TokenId> audio,
     out.fine.reserve(nframes * 4);
     for (std::size_t f = 0; f < nframes; ++f) {
         int code[kN];
+        bool ok = true;
         for (int i = 0; i < kN; ++i) {
             const long c = static_cast<long>(audio[f * kN + i]) -
                            band_base - static_cast<long>(i) * kB;
             if (c < 0 || c >= kB) {
+                if (drop_invalid) {
+                    ok = false;
+                    break;
+                }
                 throw std::invalid_argument(
                     "orpheus de-band: frame " + std::to_string(f) +
                     " position " + std::to_string(i) +
@@ -38,6 +43,7 @@ SnacCodes deband_frames(std::span<const tok::TokenId> audio,
             }
             code[i] = static_cast<int>(c);
         }
+        if (!ok) continue;  // drop the desynced frame (lenient path).
         // vq_strides [4, 2, 1]: position 0 coarse; 1,4 mid; 2,3,5,6
         // fine (see SnacCodes).
         out.coarse.push_back(code[0]);
@@ -55,7 +61,7 @@ SnacCodes deband_frames(std::span<const tok::TokenId> audio,
 
 SnacCodes orpheus_deband(std::span<const tok::TokenId> audio_tokens,
                          tok::TokenId band_base) {
-    return deband_frames(audio_tokens, band_base);
+    return deband_frames(audio_tokens, band_base, false);
 }
 
 tok::TokenId orpheus_band_base(const tok::Tokenizer& tok) {
@@ -86,7 +92,16 @@ SnacCodes OrpheusCodecSampler::codes() const {
     const std::size_t whole =
         frames() * OrpheusCodec::kCodesPerFrame;
     return deband_frames(
-        std::span<const tok::TokenId>(audio_.data(), whole), band_base_);
+        std::span<const tok::TokenId>(audio_.data(), whole), band_base_,
+        false);
+}
+
+SnacCodes OrpheusCodecSampler::codes_lenient() const {
+    const std::size_t whole =
+        frames() * OrpheusCodec::kCodesPerFrame;
+    return deband_frames(
+        std::span<const tok::TokenId>(audio_.data(), whole), band_base_,
+        true);
 }
 
 }  // namespace locus::model

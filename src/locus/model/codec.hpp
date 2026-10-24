@@ -124,6 +124,19 @@ class OrpheusCodecSampler {
      */
     SnacCodes codes() const;
 
+    /**
+     * Like {@link codes}, but drops any frame whose codes fall out of
+     * range instead of throwing. This is the server/decode path: a
+     * desynchronised token glitches one 85 ms frame rather than failing
+     * the whole utterance (the reference decoder behaves this way). The
+     * strict {@link codes} stays for tests and callers that want the
+     * loud failure.
+     *
+     * @returns The three SNAC streams for the well-formed complete
+     *     frames.
+     */
+    SnacCodes codes_lenient() const;
+
     /** @returns The stop token seen, or -1 if none yet. */
     tok::TokenId stop_token() const { return stop_; }
 
