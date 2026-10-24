@@ -75,9 +75,12 @@ built from its conv1d kernels and matching the torch reference to
 repetition_penalty 1.3, each overridable, plus seed and max_tokens);
 greedy decoding never ends the utterance on this model and decodes to
 near-silence. `--audio-max-tokens N` caps a request (default 1024; 7
-tokens per 85 ms frame). The converter that makes the SNAC GGUF from
-the torch checkpoint is not in the repo yet (i#174). Generation is
-still about 24x slower than real time on an M2 Pro CPU (i#173).
+tokens per 85 ms frame). `scripts/convert-snac.py --out
+tests/models/snac_24khz_decoder.gguf` makes the SNAC GGUF from the
+torch checkpoint (dev-time: needs torch and network; it checks its own
+weight fold and pins its tested versions and output sha256).
+Generation is still about 24x slower than real time on an M2 Pro CPU
+(i#173).
 
 ## Building
 
