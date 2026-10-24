@@ -1207,6 +1207,16 @@ TEST_CASE("audio speech returns a WAV end to end",
     REQUIRE(res->body.substr(0, 4) == "RIFF");
     REQUIRE(std::stoul(res->get_header_value("X-Audio-Tokens")) <= 28);
 
+    // A seedless request reports the seed the server drew; replaying it
+    // reproduces the audio byte for byte.
+    REQUIRE(res->has_header("X-Audio-Seed"));
+    json replay = base;
+    replay["seed"] = static_cast<std::int64_t>(
+        std::stoull(res->get_header_value("X-Audio-Seed")));
+    auto rp = as.post(replay);
+    REQUIRE_RES(rp);
+    REQUIRE(rp->body == res->body);
+
     // A fixed seed reproduces the audio byte for byte.
     json seeded = base;
     seeded["seed"] = 7;
@@ -1216,9 +1226,12 @@ TEST_CASE("audio speech returns a WAV end to end",
     REQUIRE_RES(s2);
     REQUIRE(s1->body == s2->body);
 
-    // temperature 0 is the greedy path: deterministic without a seed.
+    // True greedy (temperature 0 AND no repetition penalty; temperature
+    // 0 alone is argmax after the 1.3 penalty): deterministic without a
+    // seed.
     json greedy = base;
     greedy["temperature"] = 0;
+    greedy["repetition_penalty"] = 1;
     auto g1 = as.post(greedy);
     auto g2 = as.post(greedy);
     REQUIRE_RES(g1);
