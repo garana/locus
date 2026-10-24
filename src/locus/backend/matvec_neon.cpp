@@ -10,10 +10,20 @@
 #include <vector>
 
 #include "iq_grids.h"
+#include "locus/backend/cpu_ops.hpp"
 
 namespace locus::backend {
 
 namespace {
+/** f16 bits -> f32 through the hardware convert: exact for every
+ *  half (the conversion only widens), unlike the out-of-line portable
+ *  f16_to_f32, which the per-block scale loads were spending a third
+ *  of the kernel time in. */
+inline float half_to_float(std::uint16_t h) {
+    return vget_lane_f32(
+        vget_low_f32(vcvt_f32_f16(vreinterpret_f16_u16(vdup_n_u16(h)))), 0);
+}
+
 
 std::uint16_t load_u16(const std::byte* p) {
     std::uint16_t v;
@@ -37,7 +47,7 @@ float dot_f32_neon(const float* w, const float* x,
 
 /** One Q8_0 block: f16 scale + 32 int8 quants (34 bytes). */
 float dot_q8_0_block_neon(const std::byte* blk, const float* x) {
-    const float d = f16_to_f32(load_u16(blk));
+    const float d = half_to_float(load_u16(blk));
     const auto* q = reinterpret_cast<const std::int8_t*>(blk + 2);
     float32x4_t acc = vdupq_n_f32(0.0f);
     for (std::size_t g = 0; g < 32; g += 8) {
@@ -135,8 +145,8 @@ Q4kGroup q4k_group(const std::uint8_t* scales, int is, float d,
  */
 float dot_q4_k_block_neon(const std::byte* blk, const float* x,
                           const float* xs) {
-    const float d = f16_to_f32(load_u16(blk));
-    const float dmin = f16_to_f32(load_u16(blk + 2));
+    const float d = half_to_float(load_u16(blk));
+    const float dmin = half_to_float(load_u16(blk + 2));
     const auto* scales = reinterpret_cast<const std::uint8_t*>(blk + 4);
     const auto* q = reinterpret_cast<const std::uint8_t*>(blk + 16);
     const uint8x16_t mask = vdupq_n_u8(0x0f);
@@ -217,7 +227,7 @@ float dot_q6_k_block_neon(const std::byte* blk, const float* x) {
         reinterpret_cast<const std::uint8_t*>(blk + 128);
     const auto* sc =
         reinterpret_cast<const std::int8_t*>(blk + 192);
-    const float d = f16_to_f32(load_u16(blk + 208));
+    const float d = half_to_float(load_u16(blk + 208));
     float32x4_t acc = vdupq_n_f32(0.0f);
     for (int n = 0; n < 256; n += 128) {
         acc = stream_q6k<false, 0>(acc, ql, qh, d * sc[0], x + n);
@@ -249,7 +259,7 @@ float dot_q6_k_block_neon(const std::byte* blk, const float* x) {
  */
 float dot_iq1_s_block_neon(const std::byte* blk, const float* x) {
     constexpr float kIq1sDelta = 0.125f;
-    const float d = f16_to_f32(load_u16(blk));
+    const float d = half_to_float(load_u16(blk));
     const auto* qs =
         reinterpret_cast<const std::uint8_t*>(blk + 2);
     float32x4_t acc = vdupq_n_f32(0.0f);
@@ -282,6 +292,138 @@ float dot_iq1_s_block_neon(const std::byte* blk, const float* x) {
         qs += 4;
     }
     return vaddvq_f32(acc);
+}
+
+/** ggml_vdotq_s32: the dotprod instruction, or its vmull/vpaddl
+ *  equivalent (same exact integer result) on cores without it. */
+inline int32x4_t vdot_s8(int32x4_t acc, int8x16_t a, int8x16_t b) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    return vdotq_s32(acc, a, b);
+#else
+    const int16x8_t p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+    const int16x8_t p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
+    return vaddq_s32(acc, vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
+#endif
+}
+
+/** One Q4_K super-block x Q8_K block (y_d, q8[256], bsums[16]) into
+ *  the row sum: llama.cpp's NEON ggml_vec_dot_q4_K_q8_K body, with its
+ *  two in-place updates of sumf (so the float rounding matches). */
+void dot_q4_k_q8k_neon(const std::byte* blk, float y_d,
+                       const std::int8_t* q8, const std::int16_t* bsums,
+                       float& sumf) {
+    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
+                            kmask3 = 0x03030303;
+    const float d = y_d * half_to_float(load_u16(blk));
+    const float dmin = y_d * half_to_float(load_u16(blk + 2));
+    const int16x8_t q8sums =
+        vpaddq_s16(vld1q_s16(bsums), vld1q_s16(bsums + 8));
+    std::uint32_t utmp[4];
+    std::memcpy(utmp, blk + 4, 12);
+    uint32x2_t mins8 = vdup_n_u32(0);
+    mins8 = vset_lane_u32(utmp[1] & kmask1, mins8, 0);
+    mins8 = vset_lane_u32(((utmp[2] >> 4) & kmask2) |
+                              (((utmp[1] >> 6) & kmask3) << 4),
+                          mins8, 1);
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[0] &= kmask1;
+    const int16x8_t mins =
+        vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(mins8)));
+    const int32x4_t prod =
+        vaddq_s32(vmull_s16(vget_low_s16(q8sums), vget_low_s16(mins)),
+                  vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins)));
+    sumf -= dmin * static_cast<float>(vaddvq_s32(prod));
+    const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
+    const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 16);
+    const uint8x16_t m4b = vdupq_n_u8(0x0f);
+    const int32x4_t zero = vdupq_n_s32(0);
+    std::int32_t sumi1 = 0, sumi2 = 0;
+    for (int j = 0; j < 4; ++j, q4 += 32, q8 += 64) {
+        const uint8x16_t b0 = vld1q_u8(q4);
+        const uint8x16_t b1 = vld1q_u8(q4 + 16);
+        const int32x4_t p1 = vdot_s8(
+            vdot_s8(zero, vreinterpretq_s8_u8(vandq_u8(b0, m4b)),
+                    vld1q_s8(q8)),
+            vreinterpretq_s8_u8(vandq_u8(b1, m4b)), vld1q_s8(q8 + 16));
+        sumi1 += vaddvq_s32(p1) * scales[2 * j];
+        const int32x4_t p2 = vdot_s8(
+            vdot_s8(zero, vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)),
+                    vld1q_s8(q8 + 32)),
+            vreinterpretq_s8_u8(vshrq_n_u8(b1, 4)), vld1q_s8(q8 + 48));
+        sumi2 += vaddvq_s32(p2) * scales[2 * j + 1];
+    }
+    sumf += d * static_cast<float>(sumi1 + sumi2);
+}
+
+/** The int8 dot of one 16-byte Q6_K quant vector with q8, x scale. */
+inline std::int32_t q6_part(uint8x16_t q, const std::int8_t* q8,
+                            std::int8_t scale) {
+    return vaddvq_s32(vdot_s8(vdupq_n_s32(0), vreinterpretq_s8_u8(q),
+                              vld1q_s8(q8))) *
+           scale;
+}
+
+/** The 2-bit qh field at SH, moved to bits 4..5 of each byte. */
+template <int SH>
+uint8x16_t q6_high(uint8x16_t h) {
+    const uint8x16_t m3 = vdupq_n_u8(3);
+    if constexpr (SH == 0) {
+        return vshlq_n_u8(vandq_u8(m3, h), 4);
+    } else {
+        return vshlq_n_u8(vandq_u8(m3, vshrq_n_u8(h, SH)), 4);
+    }
+}
+
+/** One Q6_K super-block x Q8_K block into the row sum: llama.cpp's
+ *  NEON ggml_vec_dot_q6_K_q8_K body (raw 6-bit codes dotted, the -32
+ *  bias folded in through bsums). */
+void dot_q6_k_q8k_neon(const std::byte* blk, float y_d,
+                       const std::int8_t* q8, const std::int16_t* bsums,
+                       float& sum) {
+    const auto* q6 = reinterpret_cast<const std::uint8_t*>(blk);
+    const auto* qh = reinterpret_cast<const std::uint8_t*>(blk + 128);
+    const auto* scale = reinterpret_cast<const std::int8_t*>(blk + 192);
+    const float d_all = half_to_float(load_u16(blk + 208));
+    const int8x16_t sc = vld1q_s8(scale);
+    const int16x8_t s0 = vmovl_s8(vget_low_s8(sc));
+    const int16x8_t s1 = vmovl_s8(vget_high_s8(sc));
+    const int16x8_t b0 = vld1q_s16(bsums);
+    const int16x8_t b1 = vld1q_s16(bsums + 8);
+    const int32x4_t prod = vaddq_s32(
+        vaddq_s32(vmull_s16(vget_low_s16(b0), vget_low_s16(s0)),
+                  vmull_s16(vget_high_s16(b0), vget_high_s16(s0))),
+        vaddq_s32(vmull_s16(vget_low_s16(b1), vget_low_s16(s1)),
+                  vmull_s16(vget_high_s16(b1), vget_high_s16(s1))));
+    const std::int32_t isum_mins = vaddvq_s32(prod);
+    const uint8x16_t m4b = vdupq_n_u8(0x0f);
+    std::int32_t isum = 0;
+    for (int j = 0; j < 2; ++j, q6 += 64, qh += 32) {
+        const uint8x16_t h0 = vld1q_u8(qh);
+        const uint8x16_t h1 = vld1q_u8(qh + 16);
+        const uint8x16_t l0 = vld1q_u8(q6);
+        const uint8x16_t l1 = vld1q_u8(q6 + 16);
+        const uint8x16_t l2 = vld1q_u8(q6 + 32);
+        const uint8x16_t l3 = vld1q_u8(q6 + 48);
+        isum += q6_part(vorrq_u8(vandq_u8(l0, m4b), q6_high<0>(h0)), q8,
+                        scale[0]) +
+                q6_part(vorrq_u8(vandq_u8(l1, m4b), q6_high<0>(h1)), q8 + 16,
+                        scale[1]) +
+                q6_part(vorrq_u8(vandq_u8(l2, m4b), q6_high<2>(h0)), q8 + 32,
+                        scale[2]) +
+                q6_part(vorrq_u8(vandq_u8(l3, m4b), q6_high<2>(h1)), q8 + 48,
+                        scale[3]);
+        isum += q6_part(vorrq_u8(vshrq_n_u8(l0, 4), q6_high<4>(h0)), q8 + 64,
+                        scale[4]) +
+                q6_part(vorrq_u8(vshrq_n_u8(l1, 4), q6_high<4>(h1)), q8 + 80,
+                        scale[5]) +
+                q6_part(vorrq_u8(vshrq_n_u8(l2, 4), q6_high<6>(h0)), q8 + 96,
+                        scale[6]) +
+                q6_part(vorrq_u8(vshrq_n_u8(l3, 4), q6_high<6>(h1)), q8 + 112,
+                        scale[7]);
+        scale += 8;
+        q8 += 128;
+    }
+    sum += d_all * y_d * static_cast<float>(isum - 32 * isum_mins);
 }
 
 }  // namespace
@@ -360,6 +502,39 @@ void matvec_neon(const Mat& w, std::span<const float> x,
     matvec(w, x, out);  // other types: scalar reference
 }
 
+void matvec_neon_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out) {
+    const bool q4k = w.type == gguf::TensorType::kQ4_K;
+    const bool q6k = w.type == gguf::TensorType::kQ6_K;
+    if ((!q4k && !q6k) || x.size() % 256 != 0) {
+        matvec_q8k(w, x, out);  // other types: scalar Q8_K
+        return;
+    }
+    const std::size_t nb = x.size() / 256;
+    thread_local std::vector<float> yd;
+    thread_local std::vector<std::int8_t> yq;
+    thread_local std::vector<std::int16_t> ys;
+    yd.resize(nb);
+    yq.resize(x.size());
+    ys.resize(nb * 16);
+    quantize_activation_q8k(x, yd.data(), yq.data(), ys.data());
+    const std::size_t bb = q4k ? 144 : 210;
+    for (std::uint32_t r = 0; r < w.rows; ++r) {
+        const std::byte* row = w.data + r * nb * bb;
+        float sumf = 0.0f;
+        for (std::size_t b = 0; b < nb; ++b) {
+            if (q4k) {
+                dot_q4_k_q8k_neon(row + b * bb, yd[b], yq.data() + b * 256,
+                                  ys.data() + b * 16, sumf);
+            } else {
+                dot_q6_k_q8k_neon(row + b * bb, yd[b], yq.data() + b * 256,
+                                  ys.data() + b * 16, sumf);
+            }
+        }
+        out[r] = sumf;
+    }
+}
+
 void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch,
                        std::uint32_t n) {
@@ -394,8 +569,8 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
             }
             for (std::size_t b = 0; b < nblk; ++b) {
                 const std::byte* blk = row + b * 144;
-                const float d = f16_to_f32(load_u16(blk));
-                const float dmin = f16_to_f32(load_u16(blk + 2));
+                const float d = half_to_float(load_u16(blk));
+                const float dmin = half_to_float(load_u16(blk + 2));
                 const auto* scales =
                     reinterpret_cast<const std::uint8_t*>(blk + 4);
                 const auto* q =
@@ -480,7 +655,7 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
                     reinterpret_cast<const std::uint8_t*>(blk + 128);
                 const auto* sc =
                     reinterpret_cast<const std::int8_t*>(blk + 192);
-                const float d = f16_to_f32(load_u16(blk + 208));
+                const float d = half_to_float(load_u16(blk + 208));
                 for (std::uint32_t t = 0; t < n; ++t) {
                     vacc[t] = vdupq_n_f32(0.0f);
                 }
