@@ -9,7 +9,11 @@
 #include <vector>
 
 #include "json.hpp"
+#include "locus/audio/snac.hpp"
+#include "locus/audio/wav.hpp"
 #include "locus/auth/helper_spawn.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/model/codec.hpp"
 #include "locus/model/grammar.hpp"
 #include "locus/server/tools.hpp"
 #include "locus/sys/perf_counters.hpp"
@@ -215,6 +219,18 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         auth_ = std::make_unique<auth::AuthClient>(
             std::move(conns), auth_clock_, opt_.auth_cache);
     }
+    if (!opt_.audio_decoder_path.empty()) {
+        auto g = gguf::GgufFile::open(opt_.audio_decoder_path);
+        snac_ = std::make_unique<audio::SnacDecoder>(
+            audio::SnacDecoder::load(g));
+        // Resolve the Orpheus audio band base by name; a non-TTS model
+        // lacks <custom_token_10>, which leaves the endpoint a 503.
+        try {
+            audio_band_base_ = model::orpheus_band_base(tok_);
+        } catch (const std::exception&) {
+            audio_band_base_ = -1;
+        }
+    }
     install_routes();
 }
 
@@ -348,6 +364,9 @@ OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
         }
         if (path == "/v1/embeddings") {
             return Route::kEmbeddings;
+        }
+        if (path == "/v1/audio/speech") {
+            return Route::kAudioSpeech;
         }
         return Route::kUnknown;
     }
@@ -1255,11 +1274,122 @@ void OpenAiServer::install_routes() {
             }
     };
 
+    // POST /v1/audio/speech (OpenAI shape): text -> Orpheus tokens ->
+    // SNAC waveform. 503 unless --audio-decoder loaded a decoder AND the
+    // model is an Orpheus-TTS checkpoint (audio_band_base_ >= 0). The
+    // decode is serialized on a dedicated cache, like embeddings.
+    auto handle_audio = [this](const http::Request& req,
+                               http::ServerResponse& res,
+                               const http::RequestContext& ctx) {
+            auth_event("create", "audio.speech", ctx.identity);
+            if (!snac_ || audio_band_base_ < 0) {
+                res.status = 503;
+                res.set_content(
+                    make_error("audio speech is not configured (needs "
+                               "--audio-decoder and an Orpheus-TTS "
+                               "model)")
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            try {
+                const json body = json::parse(req.body);
+                if (!body.contains("input") ||
+                    !body["input"].is_string()) {
+                    throw std::invalid_argument("input must be a string");
+                }
+                const auto input = body["input"].get<std::string>();
+                std::string voice = "tara";
+                if (body.contains("voice") && body["voice"].is_string()) {
+                    voice = body["voice"].get<std::string>();
+                }
+                std::string fmt = "wav";
+                if (body.contains("response_format") &&
+                    body["response_format"].is_string()) {
+                    fmt = body["response_format"].get<std::string>();
+                }
+                audio::WaveFormat wf;
+                std::string ctype;
+                if (fmt == "wav") {
+                    wf = audio::WaveFormat::kWav;
+                    ctype = "audio/wav";
+                } else if (fmt == "pcm") {
+                    wf = audio::WaveFormat::kPcm16;
+                    ctype = "audio/L16";
+                } else {
+                    throw std::invalid_argument(
+                        "response_format must be wav or pcm");
+                }
+
+                // Orpheus reference prompt wrapping: a start marker, the
+                // "voice: text" tokenization (with BOS), then the four
+                // end markers.
+                constexpr tok::TokenId kStart = 128259;
+                const tok::TokenId kEnd[4] = {128009, 128260, 128261,
+                                              128257};
+                auto btoks = tok_.encode(voice + ": " + input, true);
+                std::vector<tok::TokenId> ids;
+                ids.reserve(btoks.size() + 5);
+                ids.push_back(kStart);
+                ids.insert(ids.end(), btoks.begin(), btoks.end());
+                for (auto e : kEnd) ids.push_back(e);
+
+                const std::uint32_t cap = opt_.max_tokens_cap;
+                model::OrpheusCodecSampler sampler(audio_band_base_);
+                std::vector<float> wav;
+                {
+                    std::lock_guard<std::mutex> lk(audio_mu_);
+                    if (!audio_cache_) {
+                        audio_cache_ = std::make_unique<kv::PagedKvCache>(
+                            model_.make_cache());
+                        audio_ws_ = model_.make_workspace();
+                    }
+                    std::vector<float> logits(n_vocab_);
+                    kv::PagedKvCache::Seq seq;
+                    bool ok = true;
+                    for (auto id : ids) {
+                        if (!audio_cache_->ensure_capacity(seq, 1)) {
+                            ok = false;
+                            break;
+                        }
+                        model_.forward(id, *audio_cache_, seq, audio_ws_,
+                                       logits);
+                    }
+                    for (std::uint32_t i = 0; ok && i < cap; ++i) {
+                        if (ctx.client_alive && !ctx.client_alive()) {
+                            break;
+                        }
+                        const auto next = model::argmax(logits);
+                        if (sampler.push(next) ==
+                            model::OrpheusCodecSampler::Status::kStop) {
+                            break;
+                        }
+                        if (!audio_cache_->ensure_capacity(seq, 1)) break;
+                        model_.forward(next, *audio_cache_, seq, audio_ws_,
+                                       logits);
+                    }
+                    audio_cache_->release(seq);
+                    wav = snac_->decode(sampler.codes_lenient());
+                }
+                auto bytes =
+                    audio::encode_pcm(wav, snac_->sample_rate(), wf);
+                res.set_content(
+                    std::string(
+                        reinterpret_cast<const char*>(bytes.data()),
+                        bytes.size()),
+                    ctype);
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(make_error(e.what()).dump(),
+                                "application/json");
+            }
+    };
+
     // One dispatch handler over all routes (route_of is the single home
     // for routing, shared with the auth head stage below).
     route_handler_ = [this, handle_health, handle_models,
                       handle_model_by_id, handle_metrics, handle,
-                      handle_messages, handle_embeddings](
+                      handle_messages, handle_embeddings, handle_audio](
                          const http::Request& req, http::ServerResponse& res,
                          const http::RequestContext& ctx) {
         switch (route_of(req.method, req.path)) {
@@ -1271,6 +1401,7 @@ void OpenAiServer::install_routes() {
             case Route::kChat:        handle(req, res, ctx, true); break;
             case Route::kMessages:    handle_messages(req, res, ctx); break;
             case Route::kEmbeddings:  handle_embeddings(req, res, ctx); break;
+            case Route::kAudioSpeech: handle_audio(req, res, ctx); break;
             case Route::kUnknown:
                 res.status = 404;  // httplib's default: 404, empty body
                 break;

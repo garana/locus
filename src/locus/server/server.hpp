@@ -14,6 +14,10 @@
 #include "locus/server/engine_loop.hpp"
 #include "locus/tok/tokenizer.hpp"
 
+namespace locus::audio {
+class SnacDecoder;
+}
+
 namespace locus::server {
 
 /**
@@ -62,6 +66,12 @@ class OpenAiServer {
         /** Path the Prometheus metrics endpoint is served at
          * (--metrics-path); default /metrics. */
         std::string metrics_path = "/metrics";
+        /** Path to the neural-codec decoder GGUF (arch "snac") that
+         * enables POST /v1/audio/speech (--audio-decoder). Empty =
+         * the endpoint is off and returns 503. Loaded at construction;
+         * the loaded model must be an Orpheus-TTS checkpoint for the
+         * endpoint to produce audio. */
+        std::string audio_decoder_path;
         /** Formats /v1/chat/completions prompts (default plain).
          * Use chat::ChatTemplate::from_gguf for real chat
          * models. */
@@ -112,7 +122,8 @@ class OpenAiServer {
      * by both the dispatch handler and the auth head stage. */
     enum class Route {
         kHealth, kModels, kModelById, kMetrics,
-        kCompletions, kChat, kMessages, kEmbeddings, kUnknown
+        kCompletions, kChat, kMessages, kEmbeddings, kAudioSpeech,
+        kUnknown
     };
     /** Classifies a request. GET and HEAD both match the GET routes;
      * /v1/models/{id} matches by prefix (the regex route retired). */
@@ -167,6 +178,16 @@ class OpenAiServer {
     std::once_flag embed_once_;
     std::unique_ptr<kv::PagedKvCache> embed_cache_;
     model::TransformerModel::Workspace embed_ws_;
+
+    // /v1/audio/speech: the SNAC decoder (null when --audio-decoder was
+    // not given) and the Orpheus audio band base resolved from the
+    // vocab (-1 when the loaded model is not a TTS checkpoint). The
+    // decode runs on a serialized dedicated cache, like embeddings.
+    std::unique_ptr<audio::SnacDecoder> snac_;
+    tok::TokenId audio_band_base_ = -1;
+    std::mutex audio_mu_;
+    std::unique_ptr<kv::PagedKvCache> audio_cache_;
+    model::TransformerModel::Workspace audio_ws_;
 };
 
 }  // namespace locus::server

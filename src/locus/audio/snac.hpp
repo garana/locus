@@ -1,0 +1,67 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "locus/gguf/gguf.hpp"
+#include "locus/model/codec.hpp"
+
+namespace locus::audio {
+
+/**
+ * SNAC neural-codec decoder (the "snac" GGUF written by
+ * .local-dev/golden/convert_snac.py). Turns the three residual-vector-
+ * quantizer code streams that Orpheus produces (see
+ * locus::model::SnacCodes) into a mono waveform, using only the
+ * conv1d / conv1d_transpose / snake1d CPU kernels.
+ *
+ * The graph is SNAC's decoder with the stochastic NoiseBlock removed
+ * (the golden disables it, so the decode is deterministic): per-code
+ * codebook lookup and a 1x1 out-projection per quantizer, summed after
+ * a stride upsample (from_codes); a depthwise in-conv then a 1x1 conv
+ * to the decoder width; a DecoderBlock per upsample rate (snake, a
+ * transposed conv that upsamples by the rate, then three dilated
+ * residual units); and a final snake, 1x1-tap conv to one channel and
+ * tanh. All sizes come from the GGUF metadata; the structure is fixed.
+ */
+class SnacDecoder {
+  public:
+    /**
+     * Loads a "snac" GGUF (copies the tensors it needs, so the
+     * GgufFile need not outlive the decoder).
+     *
+     * @param g A parsed GGUF whose general.architecture is "snac".
+     * @throws gguf::Error on a wrong architecture or a missing tensor.
+     */
+    static SnacDecoder load(const gguf::GgufFile& g);
+
+    /**
+     * Decodes the three code streams to a mono f32 waveform.
+     *
+     * @param codes The coarse/mid/fine streams; sizes must be F, 2F
+     *     and 4F for F frames (as orpheus_deband produces).
+     * @returns `prod(rates) * 4 * F` samples in [-1, 1].
+     * @throws std::invalid_argument on inconsistent stream lengths.
+     */
+    std::vector<float> decode(const model::SnacCodes& codes) const;
+
+    /** @returns The codec sample rate (Hz). */
+    std::uint32_t sample_rate() const { return sample_rate_; }
+
+  private:
+    std::span<const float> t(const std::string& name) const;
+
+    std::unordered_map<std::string, std::vector<float>> w_;
+    std::vector<std::uint32_t> rates_;    ///< decoder upsample rates.
+    std::vector<std::uint32_t> strides_;  ///< per-codebook vq stride.
+    std::uint32_t latent_dim_ = 0;
+    std::uint32_t decoder_dim_ = 0;
+    std::uint32_t codebook_dim_ = 0;
+    std::uint32_t codebook_size_ = 0;
+    std::uint32_t n_codebooks_ = 0;
+    std::uint32_t sample_rate_ = 0;
+};
+
+}  // namespace locus::audio

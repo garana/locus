@@ -67,6 +67,8 @@ add_executable(locus_tests
     test_moe.cpp
     test_dsa.cpp
     test_muse_spark.cpp
+    test_codec.cpp
+    test_snac.cpp
     test_deepseek41.cpp
     test_threads.cpp
     test_perf_counters.cpp
