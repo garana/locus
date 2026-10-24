@@ -282,8 +282,11 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
     std::vector<std::uint32_t> route = {ids[0], ids[1], ids[2],
                                         fbits(wts[0]), fbits(wts[1]),
                                         fbits(wts[2])};
+    // x_off 1 puts every slot's activations (x_off + k * cols) off
+    // 16-byte alignment: the kernels' scalar-load fallback.
+    for (const std::uint32_t x_off : {0u, 1u})
     for (const auto& c : cases) {
-        INFO("type " << static_cast<int>(c.type));
+        INFO("type " << static_cast<int>(c.type) << " x_off " << x_off);
         const std::size_t mat_bytes = rows * (cols / 256) * c.block_bytes;
         std::vector<std::byte> w(mat_bytes * n_mat);
         for (auto& b : w) {
@@ -308,7 +311,9 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
         };
         w.resize((w.size() + 3) & ~std::size_t{3});
         auto wb = upload(ctx, w);
-        auto xb = upload(ctx, x);
+        std::vector<float> xs(x_off, 0.0f);
+        xs.insert(xs.end(), x.begin(), x.end());
+        auto xb = upload(ctx, xs);
         auto rb = upload(ctx, route);
         auto run = [&](std::uint32_t mode, std::size_t out_n,
                        std::vector<float> init) {
@@ -316,7 +321,7 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
             ctx.begin_batch();
             const VulkanContext::Buffer bufs[] = {wb, xb, ob, rb};
             const std::uint32_t push[] = {
-                rows, cols, 0, mode & 2u ? 1u : 0u, 0, 0, fbits(1.0f),
+                rows, cols, 0, mode & 2u ? 1u : 0u, 0, x_off, fbits(1.0f),
                 static_cast<std::uint32_t>(mat_bytes), cols, rows, slots,
                 mode, 0u};
             ctx.dispatch(c.kernel, bufs, push,
@@ -331,7 +336,8 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
         // The type in the name: plain SECTIONs in a loop are tracked
         // by name, so they would run on the first type only.
         DYNAMIC_SECTION("split slots, matrix = routed id, type "
-                        << static_cast<int>(c.type)) {
+                        << static_cast<int>(c.type) << " x_off "
+                        << x_off) {
             auto got = run(1, rows * slots,
                            std::vector<float>(rows * slots, 0.0f));
             for (std::uint32_t k = 0; k < slots; ++k) {
@@ -343,7 +349,8 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
             }
         }
         DYNAMIC_SECTION("weighted sum of routed slots accumulates, type "
-                        << static_cast<int>(c.type)) {
+                        << static_cast<int>(c.type) << " x_off "
+                        << x_off) {
             std::vector<float> init(rows);
             for (auto& v : init) {
                 v = dist(rng);
