@@ -1,11 +1,13 @@
 #include "locus/audio/snac.hpp"
 #include "locus/audio/wav.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -54,43 +56,81 @@ std::vector<float> read_f32(const std::string& path) {
 
 }  // namespace
 
-// Sample-close parity: decoding the golden codes with locus's SNAC
-// decoder reproduces the reference waveform (torch + snac, noise
-// disabled, one-shot). Both are f32 and the ops are identical, so the
-// only spread is floating-point summation order in the convolutions.
-TEST_CASE("snac decoder matches the reference waveform", "[snac][e2e]") {
-    const auto gguf = snac_gguf_path();
-    const auto wav = golden_dir() + "/orpheus_waveform.f32";
-    if (!std::filesystem::exists(gguf) ||
-        !std::filesystem::exists(wav)) {
-        SKIP("snac decoder GGUF or golden waveform absent; run "
-             ".local-dev/golden/convert_snac.py and run.sh");
-    }
-    auto g = locus::gguf::GgufFile::open(gguf);
+namespace {
+
+/**
+ * Decodes the codes in `codes_file` with the real SNAC GGUF and
+ * requires the result to match the torch reference in `wav_file`
+ * (torch + snac, noise disabled, one-shot). Both are f32 and the ops are
+ * the same, so the only spread is conv summation order / FMA across
+ * toolchains (~1e-8 on m2), not a graph difference.
+ *
+ * @returns The reference waveform's RMS, for the caller's own checks.
+ */
+double require_snac_parity(const std::string& codes_file,
+                           const std::string& wav_file) {
+    auto g = locus::gguf::GgufFile::open(snac_gguf_path());
     auto dec = locus::audio::SnacDecoder::load(g);
     REQUIRE(dec.sample_rate() == 24000);
 
-    const auto codes = read_codes(golden_dir() + "/orpheus_codes.txt");
+    const auto codes = read_codes(codes_file);
     const auto got = dec.decode(codes);
-    const auto ref = read_f32(wav);
-
+    const auto ref = read_f32(wav_file);
     REQUIRE(got.size() == ref.size());
     REQUIRE(got.size() == std::size_t(codes.coarse.size()) * 2048);
 
-    double max_abs = 0.0, sum_sq = 0.0;
+    double max_abs = 0.0, sum_sq = 0.0, ref_sq = 0.0;
     for (std::size_t i = 0; i < got.size(); ++i) {
         const double d = std::abs(double(got[i]) - double(ref[i]));
         max_abs = std::max(max_abs, d);
         sum_sq += d * d;
+        ref_sq += double(ref[i]) * ref[i];
     }
     const double rms = std::sqrt(sum_sq / got.size());
     INFO("max_abs=" << max_abs << " rms=" << rms);
-    // The decoder is the same f32 math as the reference, so the match
-    // is essentially bit-exact (~7e-9 on m2); these bounds leave room
-    // only for conv summation-order / FMA spread across toolchains, not
-    // for an actual graph difference.
     REQUIRE(max_abs < 1e-5);
     REQUIRE(rms < 1e-6);
+    return std::sqrt(ref_sq / ref.size());
+}
+
+/** SKIPs unless the SNAC GGUF and the given goldens are present. */
+bool snac_e2e_inputs(std::initializer_list<std::string> goldens) {
+    if (!std::filesystem::exists(snac_gguf_path())) return false;
+    for (const auto& f : goldens) {
+        if (!std::filesystem::exists(golden_dir() + "/" + f)) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+// Parity on the greedy Orpheus golden. Its codes decode to near-silence
+// (RMS ~0.0014), so on its own it says little about loud signals; see
+// the sampled-speech case below.
+TEST_CASE("snac decoder matches the reference waveform", "[snac][e2e]") {
+    if (!snac_e2e_inputs({"orpheus_codes.txt", "orpheus_waveform.f32"})) {
+        SKIP("snac GGUF absent; make it with scripts/convert-snac.py");
+    }
+    require_snac_parity(golden_dir() + "/orpheus_codes.txt",
+                        golden_dir() + "/orpheus_waveform.f32");
+}
+
+// Parity on REAL speech (i#172): Orpheus sampled with the reference
+// settings and a fixed seed (by llama-cpp-python, independent of
+// locus's sampler), decoded by torch SNAC. The golden is audible speech
+// that the model ended itself, so a decoder error that a near-silent
+// signal would hide shows up here. Made by scripts/make-snac-goldens.py
+// speech.
+TEST_CASE("snac decoder matches the reference on sampled speech",
+          "[snac][e2e]") {
+    if (!snac_e2e_inputs(
+            {"snac_speech_codes.txt", "snac_speech_waveform.f32"})) {
+        SKIP("snac GGUF absent; make it with scripts/convert-snac.py");
+    }
+    const double ref_rms = require_snac_parity(
+        golden_dir() + "/snac_speech_codes.txt",
+        golden_dir() + "/snac_speech_waveform.f32");
+    REQUIRE(ref_rms > 0.02);  // the golden is speech, not near-silence
 }
 
 namespace {
@@ -147,9 +187,13 @@ std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
     };
     std::vector<T> ts;
     std::uint32_t lcg = 12345;
-    auto rnd = [&] {  // deterministic, in [-0.5, 0.5)
+    // Deterministic, in [-0.25, 0.25): small enough that the tail tanh
+    // stays linear, so the value fixtures are not saturated at +-1.
+    // scripts/make-snac-goldens.py (lcg_weights) ports this generator
+    // to build the torch reference; keep the two in sync.
+    auto rnd = [&] {
         lcg = lcg * 1664525u + 1013904223u;
-        return static_cast<float>(lcg >> 8) / 16777216.0f - 0.5f;
+        return (static_cast<float>(lcg >> 8) / 16777216.0f - 0.5f) * 0.5f;
     };
     // PyTorch shape {d0, d1, d2} -> GGUF dims reversed.
     auto add = [&](const std::string& n,
@@ -269,6 +313,35 @@ TEST_CASE("snac decoder graph on a synthetic model", "[snac]") {
             REQUIRE(dec.decode(codes) == a);  // no leaked state
             REQUIRE(dec.decode(synth_codes(frames, 1)) != a);  // codes count
         }
+    }
+}
+
+// VALUES, not just structure: the same synthetic model decoded by the
+// real torch snac.SNAC (scripts/make-snac-goldens.py synth) must match
+// locus sample for sample. Runs on every host (the fixtures are
+// committed and tiny). A wrong dilation, weight layout or snake formula
+// keeps every length the graph test checks, but changes these values.
+TEST_CASE("snac decoder matches torch on a synthetic model", "[snac]") {
+    for (const auto& rates : {std::vector<std::uint32_t>{2, 2},
+                              std::vector<std::uint32_t>{4, 2, 2, 2}}) {
+        std::string name = "snac_synth_r";
+        for (std::size_t i = 0; i < rates.size(); ++i) {
+            name += (i ? "-" : "") + std::to_string(rates[i]);
+        }
+        INFO(name);
+        const auto ref = read_f32(golden_dir() + "/" + name + ".f32");
+        const auto img = synth_snac(rates);
+        auto g = locus::gguf::GgufFile::parse(img);
+        const auto got = locus::audio::SnacDecoder::load(g).decode(
+            synth_codes(2));
+        REQUIRE(got.size() == ref.size());
+        double max_abs = 0.0;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            max_abs = std::max(max_abs,
+                               std::abs(double(got[i]) - double(ref[i])));
+        }
+        INFO("max_abs " << max_abs);
+        REQUIRE(max_abs < 1e-5);
     }
 }
 
