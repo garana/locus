@@ -24,10 +24,11 @@ build dependency (DESIGN.md section 6). Tested with Python 3.10, torch
     python3 scripts/convert-snac.py --out tests/models/snac_24khz_decoder.gguf
 
 For hubertsiuzdak/snac_24khz with those versions the output sha256 is
-f45bd16e26a56355549f6091441daa20ca04f6f4a868713fe272d08e25efa0f4.
+2f12c040fe04e5db18596a08b0a402d01a21a7eb027885b049ff31bfe24b3048.
 
-It refuses SNAC variants whose decoder layout locus does not run
-(decoder attention, non-depthwise, or no NoiseBlock), and records those
+It refuses SNAC variants locus does not run (decoder attention, not
+depthwise, no NoiseBlock, codebooks other than 3 with strides [4,2,1],
+or an odd rate; the 32 and 44 kHz models are refused), and records the
 layout flags as snac.depthwise / snac.noise / snac.attention.
 """
 import argparse
@@ -138,21 +139,36 @@ def check_fold(model, sd, frames, seed):
 
 def check_layout(model):
     """
-    Refuses SNAC variants whose decoder layout locus does not run. The
-    tensor names locus reads depend on three config flags that SNAC
-    does not keep on the model object, so detect them from the
-    structure: `depthwise` adds the second input conv (model.1),
-    `noise` puts a NoiseBlock at block.2 (so the residual units are
-    .3/.4/.5), and a non-null attn_window_size adds a LocalMHA.
+    Refuses SNAC variants that locus::audio::SnacDecoder does not run.
+
+    The tensor names locus reads depend on three config flags. SNAC
+    keeps attn_window_size on the model (non-null adds a LocalMHA), but
+    not `depthwise` (adds the second input conv, model.1) or `noise`
+    (puts a NoiseBlock at block.2, so the residual units are .3/.4/.5),
+    so those two are detected from the structure. Beyond the layout,
+    locus also needs 3 codebooks with vq_strides [4, 2, 1] (its F, 2F,
+    4F code streams) and even upsample rates (its transposed conv uses
+    pad rate/2 with no output_padding). The 32 and 44 kHz models fail
+    all three: attention, 4 codebooks, and a rate of 3.
     """
     dec = model.decoder.model
     if model.attn_window_size is not None:
         sys.exit("this SNAC has decoder attention; locus runs only "
                  "attn_window_size null (the 24 kHz model)")
+    if model.n_codebooks != 3 or list(model.vq_strides) != [4, 2, 1]:
+        sys.exit(f"this SNAC has {model.n_codebooks} codebooks with "
+                 f"vq_strides {list(model.vq_strides)}; locus runs only "
+                 "3 with [4, 2, 1]")
+    if any(r % 2 for r in model.decoder_rates):
+        sys.exit(f"this SNAC has an odd decoder rate "
+                 f"({list(model.decoder_rates)}); locus runs only even "
+                 "rates")
     first = dec[0]
     if getattr(first, "groups", 1) != model.latent_dim:
         sys.exit("this SNAC is not depthwise; locus runs only "
                  "depthwise=true")
+    # Valid only after the two layout checks above: with attention or
+    # without the depthwise conv, dec[2] is not the first DecoderBlock.
     if not isinstance(dec[2].block[2], snac_mod.layers.NoiseBlock):
         sys.exit("this SNAC has no NoiseBlock; locus expects noise=true "
                  "(residual units at block.3/.4/.5)")
@@ -178,8 +194,8 @@ def emit_gguf(model, sd, path):
     out.add_uint32("snac.codebook_size", model.codebook_size)
     out.add_uint32("snac.codebook_dim", model.codebook_dim)
     out.add_uint32("snac.n_codebooks", model.n_codebooks)
-    # The layout flags the tensor names depend on (see check_layout),
-    # so the loader can refuse a GGUF made for a different layout.
+    # The layout flags the tensor names depend on (see check_layout);
+    # SnacDecoder::load refuses a GGUF that records another layout.
     out.add_bool("snac.depthwise", True)
     out.add_bool("snac.noise", True)
     out.add_bool("snac.attention", False)
@@ -189,7 +205,9 @@ def emit_gguf(model, sd, path):
 
     def wanted(k):
         if k.startswith("decoder."):
-            return True
+            # The NoiseBlock (DecoderBlock .block.2) is skipped by locus,
+            # so its folded `linear` is never read.
+            return ".block.2.linear" not in k
         return k.startswith("quantizer.") and \
             ("out_proj" in k or "codebook.weight" in k)
 
