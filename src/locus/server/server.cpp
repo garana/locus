@@ -1339,8 +1339,10 @@ void OpenAiServer::install_routes() {
                 // Sampling. Defaults are the Orpheus reference settings
                 // (temperature 0.6, top_p 0.8, repetition penalty 1.3);
                 // greedy decoding never ends the utterance and decodes
-                // to near-silence on this model. temperature 0 keeps
-                // the greedy path (the parity tests use it).
+                // to near-silence on this model. temperature 0 is
+                // deterministic but is argmax AFTER the repetition
+                // penalty (as in vLLM); true greedy also needs
+                // repetition_penalty 1.
                 auto num = [&](const char* k, double def) {
                     if (!body.contains(k)) return def;
                     if (!body[k].is_number()) {
@@ -1432,6 +1434,9 @@ void OpenAiServer::install_routes() {
                 res.set_header("X-Audio-Tokens", std::to_string(generated));
                 res.set_header("X-Audio-Stop-Token",
                                std::to_string(sampler.stop_token()));
+                // The seed actually used (drawn by the server when the
+                // request sent none), so any utterance can be replayed.
+                res.set_header("X-Audio-Seed", std::to_string(seed));
                 res.set_content(
                     std::string(
                         reinterpret_cast<const char*>(bytes.data()),

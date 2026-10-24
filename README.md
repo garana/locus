@@ -72,10 +72,12 @@ Orpheus-TTS model, POST /v1/audio/speech {input, voice} returns a
 audio as codec tokens; locus decodes them with the SNAC neural codec,
 built from its conv1d kernels and matching the torch reference to
 7e-9. Tokens are sampled (defaults temperature 0.6, top_p 0.8,
-repetition_penalty 1.3, each overridable, plus seed and max_tokens);
-greedy decoding never ends the utterance on this model and decodes to
-near-silence. `--audio-max-tokens N` caps a request (default 1024; 7
-tokens per 85 ms frame). `scripts/convert-snac.py --out
+repetition_penalty 1.3, each overridable, plus seed and max_tokens;
+the seed used is returned in X-Audio-Seed so any utterance can be
+replayed); greedy decoding never ends the utterance on this model and
+decodes to near-silence (true greedy is temperature 0 plus
+repetition_penalty 1). `--audio-max-tokens N` caps a request (default
+1024; 7 tokens per 85 ms frame). `scripts/convert-snac.py --out
 tests/models/snac_24khz_decoder.gguf` makes the SNAC GGUF from the
 torch checkpoint (dev-time: needs torch and network; it checks its own
 weight fold and pins its tested versions and output sha256).
