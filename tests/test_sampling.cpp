@@ -30,6 +30,26 @@ TEST_CASE("default sampling is greedy (argmax)", "[sampling]") {
     REQUIRE(sample(logits, p, none, rng) == 1);
 }
 
+// i#180: a float denormal temperature made 1 / T inf and the top
+// weight NaN, which picked the LEAST likely token every time. Below
+// kMinTemperature the sampler is greedy instead.
+TEST_CASE("a near-zero temperature is greedy", "[sampling]") {
+    for (const float t : {1e-45f, 1e-40f, 2e-39f, 1e-38f, 1e-7f}) {
+        INFO("temperature " << t);
+        SamplingParams p;
+        p.temperature = t;
+        REQUIRE(locus::model::is_greedy(p));
+        for (int seed = 0; seed < 20; ++seed) {
+            std::vector<float> logits{5.0f, 1.0f, 0.5f, -2.0f};
+            std::mt19937_64 r(seed);
+            REQUIRE(sample(logits, p, none, r) == 0);
+        }
+    }
+    SamplingParams p;
+    p.temperature = locus::model::kMinTemperature;
+    REQUIRE_FALSE(locus::model::is_greedy(p));
+}
+
 TEST_CASE("repeat_penalty can shift the argmax", "[sampling]") {
     std::vector<float> logits{5.0f, 4.9f};
     std::vector<TokenId> hist{0};

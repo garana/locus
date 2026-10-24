@@ -38,7 +38,7 @@ struct DriverResult {
  * The stages own their KV caches and advance the position per stage, so
  * the driver keeps no cache and loads no model weights; it only needs
  * the eos id to stop (the logits width comes from the kLogits frame).
- * Greedy sampling (the default SamplingParams, temperature <= 0)
+ * Greedy sampling (the default SamplingParams, model::is_greedy)
  * reproduces single-process argmax generation byte-for-byte.
  *
  * @param head_fd   Connected socket to the first stage's input.

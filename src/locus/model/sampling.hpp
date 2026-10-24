@@ -21,7 +21,8 @@ struct TokenLogprob {
  * behaviour the goldens rely on.
  */
 struct SamplingParams {
-    /** <= 0 selects greedy/argmax; otherwise softmax temperature. */
+    /** Below kMinTemperature (0 included) selects greedy/argmax;
+     * otherwise softmax temperature. */
     float temperature = 0.0f;
     /** Keep only the top_k highest-logit tokens (0 = disabled). */
     std::uint32_t top_k = 0;
@@ -38,6 +39,19 @@ struct SamplingParams {
     /** How many trailing history tokens the penalties consider. */
     std::uint32_t repeat_last_n = 64;
 };
+
+/**
+ * Temperatures below this sample greedily. 1 / T overflows to inf for
+ * a float denormal T (below ~2.9e-39), and the top candidate's weight
+ * becomes exp(0 * inf) = NaN, which picked the least likely token
+ * (i#180). At 1e-6 a logit gap of 1e-3 already scales to 1e3.
+ */
+inline constexpr float kMinTemperature = 1e-6f;
+
+/** @returns Whether `p` samples greedily (argmax after penalties). */
+inline bool is_greedy(const SamplingParams& p) {
+    return p.temperature < kMinTemperature;
+}
 
 /**
  * A per-request token-level constraint for constrained decoding
@@ -62,7 +76,7 @@ class TokenConstraint {
  * non-null, restricts the choice to allowed tokens (falling back to
  * unconstrained if it would leave no candidate).
  *
- * temperature <= 0 short-circuits to argmax (rng unused, no
+ * is_greedy(p) short-circuits to argmax (rng unused, no
  * constraint) so greedy decoding stays bit-exact. Filter order
  * matches llama.cpp: penalties -> constraint -> top_k ->
  * temperature/softmax -> top_p -> min_p -> sample.

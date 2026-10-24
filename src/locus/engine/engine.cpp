@@ -151,7 +151,7 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
         // logits, which the Vulkan backend has too (it opts out of
         // cross-sequence batched decode, supports_batch()).
         if (cfg_.speculative && !prefilling && r.n_fed < n_total &&
-            r.n_fed >= n_prompt && r.sampling.temperature <= 0.0f &&
+            r.n_fed >= n_prompt && model::is_greedy(r.sampling) &&
             !r.constraint && model_.supports_batch_prefill() &&
             r.seq.n_tokens == r.n_fed) {
             if (spec_decode_step(r)) {
