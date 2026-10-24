@@ -49,7 +49,7 @@ tok::TokenId sample(std::span<float> logits, const SamplingParams& p,
     apply_penalties(logits, p, history);
 
     // Greedy: highest-logit token (allowed one, if constrained).
-    if (p.temperature <= 0.0f) {
+    if (is_greedy(p)) {
         if (constraint == nullptr) {
             return argmax(logits);
         }
