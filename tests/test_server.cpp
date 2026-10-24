@@ -2,8 +2,12 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1121,40 +1125,153 @@ std::string snac_path() {
 }
 }  // namespace
 
-// End-to-end wiring: a real Orpheus model + SNAC decoder, a tiny gen
-// cap so the test stays quick, and a WAV back out. The decode math is
-// pinned bit-exact in test_snac.cpp; this proves only the HTTP path
-// (prompt wrapping -> greedy -> codec sampler -> decoder -> WAV).
+namespace {
+
+/** A real Orpheus + SNAC server on an ephemeral port, for audio e2e. */
+struct AudioServer {
+    explicit AudioServer(std::uint32_t audio_max_tokens)
+        : g(locus::gguf::GgufFile::open(orpheus_path())),
+          model(locus::model::TransformerModel::load(g)),
+          tok(locus::tok::tokenizer_from_gguf(g)),
+          server(model, *tok, [&] {
+              locus::server::OpenAiServer::Options o;
+              o.audio_decoder_path = snac_path();
+              o.audio_max_tokens = audio_max_tokens;
+              return o;
+          }()) {
+        port = server.bind_any_port("127.0.0.1");
+        REQUIRE(port > 0);
+        th = std::thread([this] { server.listen_after_bind(); });
+    }
+    ~AudioServer() {
+        server.stop();
+        th.join();
+    }
+    httplib::Result post(const json& req) {
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(600, 0);
+        return c.Post("/v1/audio/speech", req.dump(), "application/json");
+    }
+
+    locus::gguf::GgufFile g;
+    locus::model::TransformerModel model;
+    std::unique_ptr<locus::tok::Tokenizer> tok;
+    locus::server::OpenAiServer server;
+    int port = -1;
+    std::thread th;
+};
+
+/** REQUIRE that a request got a response; on failure, report why
+ * (connection refused, read timeout, ...) instead of a bare false. */
+#define REQUIRE_RES(r)                                                \
+    do {                                                              \
+        INFO("httplib error: " << httplib::to_string((r).error()));   \
+        REQUIRE(r);                                                   \
+    } while (0)
+
+/** RMS of a 16-bit mono WAV body (after the 44-byte header). */
+double wav_rms(const std::string& body) {
+    double sum = 0.0;
+    std::size_t n = 0;
+    for (std::size_t i = 44; i + 1 < body.size(); i += 2) {
+        std::int16_t s;
+        std::memcpy(&s, body.data() + i, 2);
+        const double v = s / 32768.0;
+        sum += v * v;
+        ++n;
+    }
+    return n ? std::sqrt(sum / n) : 0.0;
+}
+
+}  // namespace
+
+// End-to-end wiring on a real Orpheus + SNAC: the HTTP path (prompt
+// wrapping -> sampling -> codec sampler -> decoder -> WAV), with a
+// 4-frame cap so each request stays quick. The decode math is pinned
+// bit-exact in test_snac.cpp.
 TEST_CASE("audio speech returns a WAV end to end",
           "[server][audio][e2e]") {
     if (!std::filesystem::exists(orpheus_path()) ||
         !std::filesystem::exists(snac_path())) {
         SKIP("orpheus model or snac decoder absent");
     }
-    auto g = locus::gguf::GgufFile::open(orpheus_path());
-    auto model = locus::model::TransformerModel::load(g);
-    auto tok = locus::tok::tokenizer_from_gguf(g);
+    AudioServer as(28);  // 4 frames.
+    const json base{{"input", "The quick brown fox."}, {"voice", "tara"}};
 
-    locus::server::OpenAiServer::Options opt;
-    opt.audio_decoder_path = snac_path();
-    opt.max_tokens_cap = 14;  // 2 frames: keep the test quick.
-    locus::server::OpenAiServer server(model, *tok, std::move(opt));
-    const int port = server.bind_any_port("127.0.0.1");
-    REQUIRE(port > 0);
-    std::thread th([&] { server.listen_after_bind(); });
-
-    httplib::Client client("127.0.0.1", port);
-    const json req{{"input", "The quick brown fox."},
-                   {"voice", "tara"},
-                   {"response_format", "wav"}};
-    auto res = client.Post("/v1/audio/speech", req.dump(),
-                           "application/json");
-    server.stop();
-    th.join();
-
-    REQUIRE(res);
+    // Default request: sampled (Orpheus reference settings), a RIFF WAV,
+    // and generation bounded by the server cap.
+    auto res = as.post(base);
+    REQUIRE_RES(res);
     REQUIRE(res->status == 200);
     REQUIRE(res->get_header_value("Content-Type") == "audio/wav");
-    REQUIRE(res->body.size() > 44);          // header + some audio.
     REQUIRE(res->body.substr(0, 4) == "RIFF");
+    REQUIRE(std::stoul(res->get_header_value("X-Audio-Tokens")) <= 28);
+
+    // A fixed seed reproduces the audio byte for byte.
+    json seeded = base;
+    seeded["seed"] = 7;
+    auto s1 = as.post(seeded);
+    auto s2 = as.post(seeded);
+    REQUIRE_RES(s1);
+    REQUIRE_RES(s2);
+    REQUIRE(s1->body == s2->body);
+
+    // temperature 0 is the greedy path: deterministic without a seed.
+    json greedy = base;
+    greedy["temperature"] = 0;
+    auto g1 = as.post(greedy);
+    auto g2 = as.post(greedy);
+    REQUIRE_RES(g1);
+    REQUIRE_RES(g2);
+    REQUIRE(g1->body == g2->body);
+
+    // A request's max_tokens is clamped to the server cap; a smaller one
+    // is honoured (7 tokens = at most one frame = 2048 samples).
+    json big = base;
+    big["max_tokens"] = 1000;
+    auto b = as.post(big);
+    REQUIRE_RES(b);
+    REQUIRE(std::stoul(b->get_header_value("X-Audio-Tokens")) <= 28);
+    json small = base;
+    small["max_tokens"] = 7;
+    auto sm = as.post(small);
+    REQUIRE_RES(sm);
+    REQUIRE(std::stoul(sm->get_header_value("X-Audio-Tokens")) <= 7);
+    REQUIRE(sm->body.size() <= 44 + 2048 * 2);
+
+    // Out-of-range sampling parameters are a 400, not a silent clamp.
+    json bad = base;
+    bad["top_p"] = 0;
+    auto r = as.post(bad);
+    REQUIRE_RES(r);
+    REQUIRE(r->status == 400);
+}
+
+// The point of sampling: greedy decoding never ends the utterance and
+// decodes to near-silence (RMS ~0.001), while sampling ends speech on
+// its own with audible output. Takes about 90 s on m2, so it is opt-in.
+TEST_CASE("audio speech sampling ends the utterance with real audio",
+          "[server][audio][e2e]") {
+    if (!std::filesystem::exists(orpheus_path()) ||
+        !std::filesystem::exists(snac_path())) {
+        SKIP("orpheus model or snac decoder absent");
+    }
+    if (std::getenv("LOCUS_HEAVY_TESTS") == nullptr) {
+        SKIP("full-utterance TTS takes ~90 s; set LOCUS_HEAVY_TESTS=1");
+    }
+    AudioServer as(1024);
+    auto res = as.post({{"input",
+                         "The quick brown fox jumps over the lazy dog."},
+                        {"voice", "tara"},
+                        {"seed", 42}});
+    REQUIRE_RES(res);
+    REQUIRE(res->status == 200);
+    const long stop = std::stol(res->get_header_value("X-Audio-Stop-Token"));
+    const unsigned long n =
+        std::stoul(res->get_header_value("X-Audio-Tokens"));
+    INFO("stop token " << stop << ", " << n << " audio tokens, rms "
+                       << wav_rms(res->body));
+    REQUIRE(stop >= 0);     // the model ended speech itself...
+    REQUIRE(n < 1024);      // ...before the cap,
+    REQUIRE(wav_rms(res->body) > 0.02);  // with audible audio.
 }

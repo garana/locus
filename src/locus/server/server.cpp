@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <random>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -15,6 +16,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/codec.hpp"
 #include "locus/model/grammar.hpp"
+#include "locus/model/sampling.hpp"
 #include "locus/server/tools.hpp"
 #include "locus/sys/perf_counters.hpp"
 
@@ -1334,8 +1336,57 @@ void OpenAiServer::install_routes() {
                 ids.insert(ids.end(), btoks.begin(), btoks.end());
                 for (auto e : kEnd) ids.push_back(e);
 
-                const std::uint32_t cap = opt_.max_tokens_cap;
+                // Sampling. Defaults are the Orpheus reference settings
+                // (temperature 0.6, top_p 0.8, repetition penalty 1.3);
+                // greedy decoding never ends the utterance and decodes
+                // to near-silence on this model. temperature 0 keeps
+                // the greedy path (the parity tests use it).
+                auto num = [&](const char* k, double def) {
+                    if (!body.contains(k)) return def;
+                    if (!body[k].is_number()) {
+                        throw std::invalid_argument(
+                            std::string(k) + " must be a number");
+                    }
+                    return body[k].get<double>();
+                };
+                model::SamplingParams sp;
+                sp.temperature = static_cast<float>(num("temperature", 0.6));
+                sp.top_p = static_cast<float>(num("top_p", 0.8));
+                sp.repeat_penalty =
+                    static_cast<float>(num("repetition_penalty", 1.3));
+                // Penalize over the whole history (prompt + generated),
+                // as HF/vLLM repetition_penalty does, not a 64 window.
+                sp.repeat_last_n = UINT32_MAX;
+                if (sp.temperature < 0.0f || sp.top_p <= 0.0f ||
+                    sp.top_p > 1.0f || sp.repeat_penalty <= 0.0f) {
+                    throw std::invalid_argument(
+                        "need temperature >= 0, 0 < top_p <= 1, "
+                        "repetition_penalty > 0");
+                }
+                std::uint32_t cap = opt_.audio_max_tokens;
+                if (body.contains("max_tokens")) {
+                    if (!body["max_tokens"].is_number_unsigned() ||
+                        body["max_tokens"].get<std::uint64_t>() == 0) {
+                        throw std::invalid_argument(
+                            "max_tokens must be a positive integer");
+                    }
+                    cap = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                        cap, body["max_tokens"].get<std::uint64_t>()));
+                }
+                std::uint64_t seed = std::random_device{}();
+                if (body.contains("seed")) {
+                    if (!body["seed"].is_number_integer()) {
+                        throw std::invalid_argument(
+                            "seed must be an integer");
+                    }
+                    seed = static_cast<std::uint64_t>(
+                        body["seed"].get<std::int64_t>());
+                }
+                std::mt19937_64 rng(seed);
+
                 model::OrpheusCodecSampler sampler(audio_band_base_);
+                std::vector<tok::TokenId> history = ids;
+                std::uint32_t generated = 0;
                 std::vector<float> wav;
                 {
                     std::lock_guard<std::mutex> lk(audio_mu_);
@@ -1359,11 +1410,14 @@ void OpenAiServer::install_routes() {
                         if (ctx.client_alive && !ctx.client_alive()) {
                             break;
                         }
-                        const auto next = model::argmax(logits);
+                        const auto next =
+                            model::sample(logits, sp, history, rng);
                         if (sampler.push(next) ==
                             model::OrpheusCodecSampler::Status::kStop) {
                             break;
                         }
+                        history.push_back(next);
+                        ++generated;
                         if (!audio_cache_->ensure_capacity(seq, 1)) break;
                         model_.forward(next, *audio_cache_, seq, audio_ws_,
                                        logits);
@@ -1373,6 +1427,11 @@ void OpenAiServer::install_routes() {
                 }
                 auto bytes =
                     audio::encode_pcm(wav, snac_->sample_rate(), wf);
+                // How generation ended: the stop token id when the model
+                // ended speech itself, -1 when it ran to the cap.
+                res.set_header("X-Audio-Tokens", std::to_string(generated));
+                res.set_header("X-Audio-Stop-Token",
+                               std::to_string(sampler.stop_token()));
                 res.set_content(
                     std::string(
                         reinterpret_cast<const char*>(bytes.data()),

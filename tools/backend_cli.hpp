@@ -182,6 +182,9 @@ inline constexpr const char* kCommonHelp =
     "                   path P (default /metrics)\n"
     "  --audio-decoder P locus-server: enable /v1/audio/speech with\n"
     "                   the neural-codec decoder GGUF at path P\n"
+    "  --audio-max-tokens N locus-server: cap one /v1/audio/speech\n"
+    "                   request at N audio tokens (7 per 85 ms\n"
+    "                   frame; default 1024)\n"
     "  --prefill-f16    Vulkan: stage prefill matmul operands in\n"
     "                   f16 (faster prompt ingestion; opt-in, the\n"
     "                   f32 default is exact)\n"
@@ -248,6 +251,9 @@ struct BackendArgs {
      * (arch "snac") enabling locus-server's /v1/audio/speech; empty =
      * the endpoint is disabled (503). */
     std::string audio_decoder;
+    /** From --audio-max-tokens N: per-request audio-token cap for
+     * /v1/audio/speech (0 = the server default). */
+    std::uint32_t audio_max_tokens = 0;
     /** From --concurrent N: submit the prompt N times and report
      * aggregate throughput (bench mode; default 1 = normal run). */
     std::uint32_t concurrent = 1;
@@ -338,6 +344,12 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.audio_decoder = argv[++i];
         } else if (a.rfind("--audio-decoder=", 0) == 0) {
             out.audio_decoder = std::string(a.substr(16));
+        } else if (a == "--audio-max-tokens" && i + 1 < argc) {
+            out.audio_max_tokens = static_cast<std::uint32_t>(
+                std::atol(argv[++i]));
+        } else if (a.rfind("--audio-max-tokens=", 0) == 0) {
+            out.audio_max_tokens = static_cast<std::uint32_t>(
+                std::atol(std::string(a.substr(19)).c_str()));
         } else if (a == "--concurrent" && i + 1 < argc) {
             out.concurrent = static_cast<std::uint32_t>(
                 std::atol(argv[++i]));
