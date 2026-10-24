@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -33,7 +34,10 @@ class SnacDecoder {
      * GgufFile need not outlive the decoder).
      *
      * @param g A parsed GGUF whose general.architecture is "snac".
-     * @throws gguf::Error on a wrong architecture or a missing tensor.
+     * @throws gguf::Error on a wrong architecture, missing metadata, a
+     *     config locus cannot run (codebooks other than 3 with strides
+     *     [4,2,1], odd or too many rates, a recorded layout that is not
+     *     depthwise + noise without attention).
      */
     static SnacDecoder load(const gguf::GgufFile& g);
 
@@ -43,7 +47,9 @@ class SnacDecoder {
      * @param codes The coarse/mid/fine streams; sizes must be F, 2F
      *     and 4F for F frames (as orpheus_deband produces).
      * @returns `prod(rates) * 4 * F` samples in [-1, 1].
-     * @throws std::invalid_argument on inconsistent stream lengths.
+     * @throws std::invalid_argument on inconsistent stream lengths or a
+     *     code outside [0, codebook_size).
+     * @throws gguf::Error on a missing or wrong-sized tensor.
      */
     std::vector<float> decode(const model::SnacCodes& codes) const;
 
@@ -51,7 +57,11 @@ class SnacDecoder {
     std::uint32_t sample_rate() const { return sample_rate_; }
 
   private:
-    std::span<const float> t(const std::string& name) const;
+    /**
+     * @returns The tensor `name`, which must hold exactly `n` floats.
+     * @throws gguf::Error if it is missing or another size.
+     */
+    std::span<const float> t(const std::string& name, std::size_t n) const;
 
     std::unordered_map<std::string, std::vector<float>> w_;
     std::vector<std::uint32_t> rates_;    ///< decoder upsample rates.
