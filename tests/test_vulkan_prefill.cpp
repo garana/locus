@@ -713,6 +713,62 @@ TEST_CASE("bench: vulkan matvec bandwidth", "[.][bench][vulkan]") {
     }
 }
 
+TEST_CASE("bench: vulkan k-quant matvec bandwidth", "[.][bench][vulkan]") {
+    // Qwen3-Coder-30B-A3B's decode shapes: an expert's gate / up and
+    // down, q, o, and the Q6_K output head.
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(61);
+    const std::uint32_t reps = 1000;
+    struct Case {
+        locus::gguf::TensorType type;
+        Kernel kernel;
+        const char* name;
+        std::uint32_t rows, cols;
+    };
+    const auto q4 = locus::gguf::TensorType::kQ4_K;
+    const auto q6 = locus::gguf::TensorType::kQ6_K;
+    for (const Case c :
+         {Case{q4, Kernel::kMatvecQ4_K, "q4_k", 768, 2048},
+          Case{q6, Kernel::kMatvecQ6_K, "q6_k", 2048, 768},
+          Case{q4, Kernel::kMatvecQ4_K, "q4_k", 4096, 2048},
+          Case{q4, Kernel::kMatvecQ4_K, "q4_k", 2048, 4096},
+          Case{q6, Kernel::kMatvecQ6_K, "q6_k", 151936, 2048}}) {
+        const auto w = random_kq(c.type, c.rows, c.cols, rng);
+        const auto x = random_f32(c.cols, rng);
+        auto wb = upload(ctx, w);
+        auto xb = upload(ctx, x);
+        auto ob = ctx.create_buffer(std::size_t{c.rows} * 4);
+        const std::uint32_t push[] = {c.rows, c.cols, 0, 0, 0, 0,
+                                      fbits(1.0f)};
+        const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+        const std::uint32_t groups =
+            VulkanContext::matvec_groups(c.kernel, c.rows);
+        auto run = [&](std::uint32_t n) {
+            ctx.begin_batch();
+            for (std::uint32_t i = 0; i < n; ++i) {
+                ctx.dispatch(c.kernel, bufs, push, groups);
+            }
+            ctx.end_batch();
+        };
+        run(4);
+        const auto t0 = std::chrono::steady_clock::now();
+        run(reps);
+        const double sec = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+        WARN(c.name << " matvec " << c.rows << "x" << c.cols << ": "
+                                   << sec / reps * 1e6 << " us, "
+                                   << w.size() * double(reps) / sec / 1e9
+                                   << " GB/s");
+        for (auto b : {wb, xb, ob}) {
+            ctx.destroy_buffer(b);
+        }
+    }
+}
+
 TEST_CASE("bench: vulkan f32 matvec bandwidth", "[.][bench][vulkan]") {
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");

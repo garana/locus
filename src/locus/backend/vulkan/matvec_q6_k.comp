@@ -26,6 +26,9 @@ layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
+// The same activations as vec4s (one load for four weights) when the
+// slot's base is 16-byte aligned.
+layout(std430, binding = 1) readonly buffer X4 { vec4 x4[]; };
 layout(std430, binding = 2) buffer O { float o[]; };
 #ifdef BATCHED
 layout(std430, binding = 3) readonly buffer R { uint route[]; };
@@ -70,6 +73,7 @@ float f16_at(uint i) {
 float row_part(uint wbase, uint xbase, uint r, uint lane) {
     uint nb = pc.cols / 256u;
     uint rb = wbase + r * nb * 210u;
+    bool xal = (xbase & 3u) == 0u;
     float acc = 0.0;
     // Group g = 16 per super-block: n = g >> 3, t = (g >> 1) & 3
     // (which of q1..q4), h = g & 1 (l in [16h, 16h + 16)).
@@ -95,12 +99,14 @@ float row_part(uint wbase, uint xbase, uint r, uint lane) {
             uint lo = word_at(ql + k * 4u) >> lsh;
             uint hi = word_at(qh + k * 4u) >> hsh;
             uint xk = xi + k * 4u;
-            for (uint e = 0u; e < 4u; ++e) {
-                int q = int(((lo >> (8u * e)) & 0xfu) |
-                            (((hi >> (8u * e)) & 3u) << 4u)) -
-                        32;
-                s += float(q) * x[xk + e];
-            }
+            vec4 xv = xal ? x4[xk >> 2]
+                          : vec4(x[xk], x[xk + 1u], x[xk + 2u], x[xk + 3u]);
+            // Four 6-bit quants (low nibble | 2 high bits), minus 32.
+            uint q4 = (lo & 0x0f0f0f0fu) | ((hi & 0x03030303u) << 4u);
+            vec4 qv = vec4(float(q4 & 0xffu), float((q4 >> 8u) & 0xffu),
+                           float((q4 >> 16u) & 0xffu), float(q4 >> 24u)) -
+                      32.0;
+            s += dot(qv, xv);
         }
         acc += d * sc * s;
     }

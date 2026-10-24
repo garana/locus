@@ -23,6 +23,9 @@ layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
+// The same activations as vec4s (one load for four weights) when the
+// slot's base is 16-byte aligned.
+layout(std430, binding = 1) readonly buffer X4 { vec4 x4[]; };
 layout(std430, binding = 2) buffer O { float o[]; };
 #ifdef BATCHED
 layout(std430, binding = 3) readonly buffer R { uint route[]; };
@@ -63,23 +66,37 @@ float f16_at(uint i) {
     return unpackHalf2x16(byte_at(i) | (byte_at(i + 1u) << 8u)).x;
 }
 
-// ggml get_scale_min_k4 over the packed scales at byte `sc0`.
-void scale_min(uint j, uint sc0, out float d, out float m) {
+/** Byte k (0..11) of the 12 packed scale bytes held in s0, s1, s2. */
+uint sbyte(uint s0, uint s1, uint s2, uint k) {
+    uint wd = k < 4u ? s0 : (k < 8u ? s1 : s2);
+    return (wd >> ((k & 3u) * 8u)) & 0xffu;
+}
+
+/**
+ * ggml get_scale_min_k4 for sub-block j, from the 12 scale bytes read
+ * as three words.
+ */
+void scale_min(uint j, uint s0, uint s1, uint s2, out float d,
+               out float m) {
     if (j < 4u) {
-        d = float(byte_at(sc0 + j) & 63u);
-        m = float(byte_at(sc0 + j + 4u) & 63u);
+        d = float(sbyte(s0, s1, s2, j) & 63u);
+        m = float(sbyte(s0, s1, s2, j + 4u) & 63u);
     } else {
-        d = float((byte_at(sc0 + j + 4u) & 0xfu) |
-                  ((byte_at(sc0 + j - 4u) >> 6u) << 4u));
-        m = float((byte_at(sc0 + j + 4u) >> 4u) |
-                  ((byte_at(sc0 + j) >> 6u) << 4u));
+        uint hi = sbyte(s0, s1, s2, j + 4u);
+        d = float((hi & 0xfu) | ((sbyte(s0, s1, s2, j - 4u) >> 6u) << 4u));
+        m = float((hi >> 4u) | ((sbyte(s0, s1, s2, j) >> 6u) << 4u));
     }
 }
 
-/** This lane's share of dot(row r of the matrix at wbase, x). */
+/**
+ * This lane's share of dot(row r of the matrix at wbase, x): per
+ * 32-element sub-block, one word for d / dmin, three for the scales,
+ * eight for the nibbles, and eight vec4 activation loads.
+ */
 float row_part(uint wbase, uint xbase, uint r, uint lane) {
     uint nb = pc.cols / 256u;
     uint rb = wbase + r * nb * 144u;
+    bool xal = (xbase & 3u) == 0u;
     float acc = 0.0;
     for (uint u = lane; u < nb * 8u; u += LANES) {
         uint b = u >> 3;
@@ -87,24 +104,24 @@ float row_part(uint wbase, uint xbase, uint r, uint lane) {
         uint j = s >> 1;
         uint sh = (s & 1u) * 4u;  // nibble shift
         uint at = rb + b * 144u;
-        float d = f16_at(at);
-        float dmin = f16_at(at + 2u);
+        vec2 dm = unpackHalf2x16(word_at(at));
         float sc, mn;
-        scale_min(s, at + 4u, sc, mn);
+        scale_min(s, word_at(at + 4u), word_at(at + 8u), word_at(at + 12u),
+                  sc, mn);
         uint q = at + 16u + j * 32u;
         uint xi = xbase + b * 256u + j * 64u + (s & 1u) * 32u;
         float sq = 0.0, sx = 0.0;
         for (uint k = 0u; k < 8u; ++k) {
             uint v = word_at(q + k * 4u) >> sh;
             uint xk = xi + k * 4u;
-            float x0 = x[xk], x1 = x[xk + 1u];
-            float x2 = x[xk + 2u], x3 = x[xk + 3u];
-            sq += float(v & 0xfu) * x0 + float((v >> 8u) & 0xfu) * x1 +
-                  float((v >> 16u) & 0xfu) * x2 +
-                  float((v >> 24u) & 0xfu) * x3;
-            sx += x0 + x1 + x2 + x3;
+            vec4 xv = xal ? x4[xk >> 2]
+                          : vec4(x[xk], x[xk + 1u], x[xk + 2u], x[xk + 3u]);
+            vec4 qv = vec4(float(v & 0xfu), float((v >> 8u) & 0xfu),
+                           float((v >> 16u) & 0xfu), float((v >> 24u) & 0xfu));
+            sq += dot(qv, xv);
+            sx += xv.x + xv.y + xv.z + xv.w;
         }
-        acc += d * sc * sq - dmin * mn * sx;
+        acc += dm.x * sc * sq - dm.y * mn * sx;
     }
     return acc;
 }
