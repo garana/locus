@@ -706,11 +706,13 @@ TEST_CASE("every selectable backend reproduces the golden output",
 // shards: huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF),
 // streamed from disk on the CPU. Goldens are llama.cpp's
 // (llama-completion, same GGUF, greedy, CPU). Prompt 1 is token-exact.
-// Prompt 2 reaches a near-tie: after " else return n" locus scores
-// "-" 0.08 above "*", which llama.cpp picks (its Q8_K-quantized
-// activations in the IQ1_S dots tip it). So it is checked teacher-
-// forced: along llama.cpp's continuation every reference token must
-// sit within 0.25 of locus's top logit.
+// Prompt 2 passes through near-ties a 1-bit model makes fragile: with
+// f32-activation dots locus picked "-" over llama.cpp's "*" after
+// " else return n"; with the Q8_K activation dots matvec_mt shares
+// with llama.cpp it follows through "*fac(n-1)" and parts later, after
+// the newline. So it is checked teacher-forced: along llama.cpp's
+// continuation every reference token must sit within 0.25 of locus's
+// top logit.
 TEST_CASE("muse-spark decode matches the llama.cpp golden",
           "[e2e][muse]") {
     const std::string path = muse_spark_path();
