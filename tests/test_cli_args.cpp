@@ -31,6 +31,29 @@ TEST_CASE("--ctx caps the KV pool from the command line",
     REQUIRE(c.ctx == 0);  // default: model-derived pool
 }
 
+TEST_CASE("--audio-max-tokens sets the speech token cap", "[cli]") {
+    std::array<const char*, 4> argv1 = {"prog", "--audio-max-tokens",
+                                        "350", "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()),
+        const_cast<char**>(argv1.data()));
+    REQUIRE(a.audio_max_tokens == 350);
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+
+    std::array<const char*, 3> argv2 = {"prog", "--audio-max-tokens=70",
+                                        "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()),
+        const_cast<char**>(argv2.data()));
+    REQUIRE(b.audio_max_tokens == 70);
+
+    std::array<const char*, 2> argv3 = {"prog", "m.gguf"};
+    auto c = locus_tools::parse_backend_args(
+        static_cast<int>(argv3.size()),
+        const_cast<char**>(argv3.data()));
+    REQUIRE(c.audio_max_tokens == 0);  // default: the server's 1024
+}
+
 TEST_CASE("--kv-type picks the KV cache precision", "[cli]") {
     using locus::kv::KvType;
     auto parse = [](std::vector<const char*> argv) {

@@ -72,6 +72,10 @@ class OpenAiServer {
          * the loaded model must be an Orpheus-TTS checkpoint for the
          * endpoint to produce audio. */
         std::string audio_decoder_path;
+        /** Per-request cap on generated audio tokens for
+         * /v1/audio/speech (--audio-max-tokens); a request's own
+         * max_tokens is clamped to it. 7 tokens = one 85 ms frame. */
+        std::uint32_t audio_max_tokens = 1024;
         /** Formats /v1/chat/completions prompts (default plain).
          * Use chat::ChatTemplate::from_gguf for real chat
          * models. */

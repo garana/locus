@@ -66,6 +66,19 @@ request whose client disconnects is cancelled (streaming and
 non-streaming), so the engine stops decoding it instead of running
 the abandoned request to max_tokens.
 
+Text-to-speech: with `--audio-decoder <snac.gguf>` and an
+Orpheus-TTS model, POST /v1/audio/speech {input, voice} returns a
+24 kHz WAV (or raw PCM16 with response_format "pcm"). Orpheus emits
+audio as codec tokens; locus decodes them with the SNAC neural codec,
+built from its conv1d kernels and matching the torch reference to
+7e-9. Tokens are sampled (defaults temperature 0.6, top_p 0.8,
+repetition_penalty 1.3, each overridable, plus seed and max_tokens);
+greedy decoding never ends the utterance on this model and decodes to
+near-silence. `--audio-max-tokens N` caps a request (default 1024; 7
+tokens per 85 ms frame). The converter that makes the SNAC GGUF from
+the torch checkpoint is not in the repo yet (i#174). Generation is
+still about 24x slower than real time on an M2 Pro CPU (i#173).
+
 ## Building
 
     cmake -B build -DCMAKE_BUILD_TYPE=Release
