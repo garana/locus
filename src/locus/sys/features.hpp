@@ -33,6 +33,15 @@ struct Features {
 Features detect();
 
 /**
+ * Fastest-tier physical core count on a heterogeneous CPU (Apple
+ * silicon's performance cores, hw.perflevel0.physicalcpu).
+ *
+ * @returns The count, or 0 where the platform does not report one
+ *     (callers then treat every core as equal).
+ */
+unsigned performance_cores();
+
+/**
  * @param f A capability set from detect().
  * @returns Human-readable one-line summary, e.g. for server logs.
  */
