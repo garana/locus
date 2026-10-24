@@ -3,6 +3,8 @@
 #include <filesystem>
 #include <string>
 
+#include <sys/wait.h>
+
 #include "catch_amalgamated.hpp"
 #include "backend_cli.hpp"
 
@@ -52,6 +54,43 @@ TEST_CASE("--audio-max-tokens sets the speech token cap", "[cli]") {
         static_cast<int>(argv3.size()),
         const_cast<char**>(argv3.data()));
     REQUIRE(c.audio_max_tokens == 0);  // default: the server's 1024
+}
+
+// i#176: these flags used atol + a uint32_t cast, so "-1" wrapped to
+// 4294967295 (no audio cap, a huge KV pool) instead of failing.
+TEST_CASE("numeric flags reject negative, huge and junk values",
+          "[cli]") {
+    for (const char* flag : {"--ctx", "--concurrent",
+                             "--audio-max-tokens"}) {
+        for (const char* v : {"-1", "4294967297", "12abc", ""}) {
+            INFO(flag << " '" << v << "'");
+            std::array<const char*, 4> sep = {"prog", flag, v, "m.gguf"};
+            auto a = locus_tools::parse_backend_args(
+                static_cast<int>(sep.size()),
+                const_cast<char**>(sep.data()));
+            REQUIRE(a.bad_number_flag == flag);
+            REQUIRE(a.bad_number_value == v);
+
+            const std::string eq = std::string(flag) + "=" + v;
+            std::array<const char*, 3> joined = {"prog", eq.c_str(),
+                                                 "m.gguf"};
+            auto b = locus_tools::parse_backend_args(
+                static_cast<int>(joined.size()),
+                const_cast<char**>(joined.data()));
+            REQUIRE(b.bad_number_flag == flag);
+            REQUIRE(b.bad_number_value == v);
+        }
+    }
+    // The first bad flag is reported; valid flags still parse.
+    std::array<const char*, 6> argv = {"prog", "--ctx",   "64",
+                                       "--concurrent=-2",
+                                       "--audio-max-tokens=x", "m.gguf"};
+    auto c = locus_tools::parse_backend_args(
+        static_cast<int>(argv.size()), const_cast<char**>(argv.data()));
+    REQUIRE(c.ctx == 64);
+    REQUIRE(c.bad_number_flag == "--concurrent");
+    REQUIRE(c.bad_number_value == "-2");
+    REQUIRE(c.positional == std::vector<std::string>{"m.gguf"});
 }
 
 TEST_CASE("--kv-type picks the KV cache precision", "[cli]") {
@@ -183,6 +222,16 @@ TEST_CASE("locus-run starts without a Vulkan device", "[cli]") {
         INFO(cmd);
         REQUIRE(std::system(cmd.c_str()) == 0);
     }
+}
+
+TEST_CASE("locus-run exits 2 on a negative numeric flag", "[cli]") {
+    // The check runs before the model loads, so no model is needed.
+    const std::string cmd = std::string("'") + LOCUS_RUN_BIN +
+                            "' --ctx -1 missing.gguf 'x' >/dev/null 2>&1";
+    INFO(cmd);
+    const int rc = std::system(cmd.c_str());
+    REQUIRE(WIFEXITED(rc));
+    REQUIRE(WEXITSTATUS(rc) == 2);
 }
 
 TEST_CASE("--speculative parses as a flag", "[cli]") {
