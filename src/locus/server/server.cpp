@@ -1,6 +1,7 @@
 #include "locus/server/server.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <random>
@@ -1390,6 +1391,7 @@ void OpenAiServer::install_routes() {
                 std::vector<tok::TokenId> history = ids;
                 std::uint32_t generated = 0;
                 std::vector<float> wav;
+                std::string timing;
                 {
                     std::lock_guard<std::mutex> lk(audio_mu_);
                     if (!audio_cache_) {
@@ -1400,14 +1402,33 @@ void OpenAiServer::install_routes() {
                     std::vector<float> logits(n_vocab_);
                     kv::PagedKvCache::Seq seq;
                     bool ok = true;
-                    for (auto id : ids) {
-                        if (!audio_cache_->ensure_capacity(seq, 1)) {
+                    // Prompt in chunks through the batched forward where
+                    // the backend has one (one token at a time otherwise),
+                    // the way the engine prefills.
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const std::size_t chunk = model_.prefill_chunk();
+                    for (std::size_t at = 0; ok && at < ids.size();) {
+                        const std::size_t nb =
+                            std::min(chunk, ids.size() - at);
+                        if (!audio_cache_->ensure_capacity(
+                                seq, static_cast<std::uint32_t>(nb))) {
                             ok = false;
                             break;
                         }
-                        model_.forward(id, *audio_cache_, seq, audio_ws_,
-                                       logits);
+                        if (nb >= 2 && model_.supports_batch_prefill()) {
+                            model_.forward_batch(
+                                std::span<const tok::TokenId>(
+                                    ids.data() + at, nb),
+                                *audio_cache_, seq, audio_ws_, logits);
+                        } else {
+                            for (std::size_t k = 0; k < nb; ++k) {
+                                model_.forward(ids[at + k], *audio_cache_,
+                                               seq, audio_ws_, logits);
+                            }
+                        }
+                        at += nb;
                     }
+                    const auto t1 = std::chrono::steady_clock::now();
                     for (std::uint32_t i = 0; ok && i < cap; ++i) {
                         if (ctx.client_alive && !ctx.client_alive()) {
                             break;
@@ -1425,7 +1446,19 @@ void OpenAiServer::install_routes() {
                                        logits);
                     }
                     audio_cache_->release(seq);
+                    const auto t2 = std::chrono::steady_clock::now();
                     wav = snac_->decode(sampler.codes_lenient());
+                    const auto t3 = std::chrono::steady_clock::now();
+                    const auto ms = [](auto a, auto b) {
+                        return std::to_string(
+                            std::chrono::duration<double, std::milli>(b - a)
+                                .count());
+                    };
+                    // Where the time went: prompt prefill, token
+                    // generation and the SNAC decode (i#173).
+                    timing = "prefill;dur=" + ms(t0, t1) +
+                             ", generate;dur=" + ms(t1, t2) +
+                             ", decode;dur=" + ms(t2, t3);
                 }
                 auto bytes =
                     audio::encode_pcm(wav, snac_->sample_rate(), wf);
@@ -1437,6 +1470,7 @@ void OpenAiServer::install_routes() {
                 // The seed actually used (drawn by the server when the
                 // request sent none), so any utterance can be replayed.
                 res.set_header("X-Audio-Seed", std::to_string(seed));
+                res.set_header("Server-Timing", timing);
                 res.set_content(
                     std::string(
                         reinterpret_cast<const char*>(bytes.data()),

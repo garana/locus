@@ -1210,6 +1210,16 @@ TEST_CASE("audio speech returns a WAV end to end",
     // A seedless request reports the seed the server drew; replaying it
     // reproduces the audio byte for byte.
     REQUIRE(res->has_header("X-Audio-Seed"));
+    // Where the time went (i#173): one entry per stage, in order.
+    const auto timing = res->get_header_value("Server-Timing");
+    INFO(timing);
+    const auto p = timing.find("prefill;dur=");
+    const auto g = timing.find("generate;dur=");
+    const auto d = timing.find("decode;dur=");
+    REQUIRE(p == 0);
+    REQUIRE(g != std::string::npos);
+    REQUIRE(d != std::string::npos);
+    REQUIRE((p < g && g < d));
     json replay = base;
     replay["seed"] = static_cast<std::int64_t>(
         std::stoull(res->get_header_value("X-Audio-Seed")));
