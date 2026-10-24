@@ -519,3 +519,84 @@ TEST_CASE("vulkan fused SwiGLU q8_0 matvec matches the CPU reference",
         ctx.destroy_buffer(b);
     }
 }
+
+TEST_CASE("vulkan fused SwiGLU q4_k experts match the CPU reference",
+          "[vulkan]") {
+    // matvec_q4_k_glu_b: routed gate and up rows over stacked Q4_K
+    // experts, written as silu(gate) * up -- what the gate, up and
+    // silu_mul dispatches compute separately.
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(41);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    const std::uint32_t rows = 21, cols = 512, n_mat = 5, slots = 3;
+    const std::size_t mat_bytes = rows * (cols / 256) * 144;
+    auto quant = [&] {
+        std::vector<std::byte> w(mat_bytes * n_mat);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t at = 0; at < w.size(); at += 144) {
+            const std::uint16_t d = locus::backend::f32_to_f16(0.01f);
+            const std::uint16_t dmin = locus::backend::f32_to_f16(0.005f);
+            std::memcpy(&w[at], &d, 2);
+            std::memcpy(&w[at + 2], &dmin, 2);
+        }
+        return w;
+    };
+    const auto wg = quant(), wu = quant();
+    std::vector<float> x(cols * slots);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    const std::uint32_t ids[] = {3, 0, 1};
+    std::vector<std::uint32_t> route = {ids[0], ids[1], ids[2],
+                                        fbits(1.0f), fbits(1.0f),
+                                        fbits(1.0f)};
+    auto cpu_row = [&](const std::vector<std::byte>& w, std::uint32_t id,
+                       std::uint32_t k) {
+        locus::backend::Mat m{locus::gguf::TensorType::kQ4_K,
+                              w.data() + id * mat_bytes, rows, cols};
+        std::vector<float> out(rows);
+        locus::backend::matvec(
+            m, std::span<const float>(x).subspan(k * cols, cols), out);
+        return out;
+    };
+    for (const std::uint32_t x_off : {0u, 1u}) {
+        INFO("x_off " << x_off);
+        std::vector<float> xs(x_off, 0.0f);
+        xs.insert(xs.end(), x.begin(), x.end());
+        auto gb = upload(ctx, wg);
+        auto ub = upload(ctx, wu);
+        auto xb = upload(ctx, xs);
+        auto rb = upload(ctx, route);
+        auto ob = upload(ctx, std::vector<float>(rows * slots, 0.0f));
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {gb, xb, ob, rb, ub};
+        const std::uint32_t push[] = {
+            rows, cols, 0, 0, 0, x_off, fbits(1.0f),
+            static_cast<std::uint32_t>(mat_bytes), cols, rows, slots, 1u,
+            0u};
+        ctx.dispatch(Kernel::kMatvecQ4_KGluB, bufs, push,
+                     VulkanContext::matvec_groups(Kernel::kMatvecQ4_KGluB,
+                                                  rows),
+                     slots);
+        ctx.end_batch();
+        const auto got = download<float>(ctx, ob, rows * slots);
+        for (std::uint32_t k = 0; k < slots; ++k) {
+            const auto g = cpu_row(wg, ids[k], k);
+            const auto u = cpu_row(wu, ids[k], k);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                const float want = g[r] / (1.0f + std::exp(-g[r])) * u[r];
+                REQUIRE(got[k * rows + r] ==
+                        Catch::Approx(want).epsilon(1e-4).margin(1e-3));
+            }
+        }
+        for (auto b : {gb, ub, xb, rb, ob}) {
+            ctx.destroy_buffer(b);
+        }
+    }
+}
