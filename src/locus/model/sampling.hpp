@@ -48,9 +48,10 @@ struct SamplingParams {
  */
 inline constexpr float kMinTemperature = 1e-6f;
 
-/** @returns Whether `p` samples greedily (argmax after penalties). */
+/** @returns Whether `p` samples greedily (argmax after penalties).
+ * Spelled so a NaN temperature is greedy too (i#192). */
 inline bool is_greedy(const SamplingParams& p) {
-    return p.temperature < kMinTemperature;
+    return !(p.temperature >= kMinTemperature);
 }
 
 /**
