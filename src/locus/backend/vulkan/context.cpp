@@ -41,11 +41,12 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ8_0P:
         case Kernel::kMatvecQ8_0GluP:
         case Kernel::kMatvecF32N:
-        case Kernel::kMatvecQ4_K:
-        case Kernel::kMatvecQ6_K:
-        case Kernel::kMatvecQ4_KB:
-        case Kernel::kMatvecQ6_KB:
             return (rows + 3) / 4;
+        case Kernel::kMatvecQ4_K:  // 8 rows of 16 lanes
+        case Kernel::kMatvecQ4_KB:
+        case Kernel::kMatvecQ6_K:
+        case Kernel::kMatvecQ6_KB:
+            return (rows + 7) / 8;
         default:
             return (rows + 63) / 64;
     }

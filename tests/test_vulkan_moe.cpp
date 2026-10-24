@@ -256,9 +256,10 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::uniform_int_distribution<int> byte_d(0, 255);
 
-    // 5 stacked 7 x 768 experts; 3 slots routed to 3, 0, 1. Q6_K's
-    // 4410-byte experts put odd ids off word alignment.
-    const std::uint32_t rows = 7, cols = 768, n_mat = 5, slots = 3;
+    // 5 stacked 21 x 768 experts (several 8-row workgroups); 3 slots
+    // routed to 3, 0, 1. Q6_K's 13230-byte experts put odd ids off word
+    // alignment.
+    const std::uint32_t rows = 21, cols = 768, n_mat = 5, slots = 3;
     struct KCase {
         locus::gguf::TensorType type;
         Kernel kernel;
