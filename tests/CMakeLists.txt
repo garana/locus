@@ -88,8 +88,10 @@ target_compile_definitions(locus_tests PRIVATE
     LOCUS_AUTH_HELPER_BIN="$<TARGET_FILE:locus-auth-helper>"
     LOCUS_STAGE_BIN="$<TARGET_FILE:locus-stage>"
     LOCUS_RUN_BIN="$<TARGET_FILE:locus-run>"
+    LOCUS_SERVER_BIN="$<TARGET_FILE:locus-server>"
 )
-add_dependencies(locus_tests locus-auth-helper locus-stage locus-run)
+add_dependencies(locus_tests locus-auth-helper locus-stage locus-run
+                 locus-server)
 
 add_test(NAME unit COMMAND locus_tests)
 

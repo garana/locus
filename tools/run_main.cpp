@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "backend_cli.hpp"
+#include "cli_spec.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
@@ -70,9 +71,17 @@ int main(int argc, char** argv) {
     }
     const std::string model_path = args.positional[0];
     const std::string prompt = args.positional[1];
-    const int n_gen = args.positional.size() > 2
-                          ? std::atoi(args.positional[2].c_str())
-                          : 64;
+    // Guarded parse: atoi wrapped "-1" to 4294967295 tokens and read
+    // "abc" as 0 (i#198).
+    int n_gen = 64;
+    if (args.positional.size() > 2 &&
+        !locus_tools::parse_nonneg_int(args.positional[2], n_gen)) {
+        std::fprintf(stderr,
+                     "%s: n_tokens needs a non-negative integer, got "
+                     "'%s'\n",
+                     argv[0], args.positional[2].c_str());
+        return 2;
+    }
 
     try {
         auto g = locus::gguf::GgufFile::open(model_path);
