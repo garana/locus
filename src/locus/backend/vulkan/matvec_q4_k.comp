@@ -16,6 +16,12 @@
 // x_off + y * x_stride, id = route[y] under mode bit 1; mode bit 2
 // sums all n_slots weighted by route[n_slots + k] into one row (the
 // MoE down projection).
+//
+// With -DSWIGLU too (matvec_q4_k_glu_b) W is the routed gate and WU
+// (binding 4) the up matrix of the same shape: each row gets both dot
+// products, exactly as the plain kernel computes them, and writes
+// silu(gate) * up -- the gate, up and silu_mul dispatches of an MoE
+// expert in one, reading the activations once (split slots only).
 
 #define LANES 16u
 #define ROWS 8u
@@ -32,6 +38,9 @@ layout(std430, binding = 1) readonly buffer X4 { vec4 x4[]; };
 layout(std430, binding = 2) buffer O { float o[]; };
 #ifdef BATCHED
 layout(std430, binding = 3) readonly buffer R { uint route[]; };
+#endif
+#ifdef SWIGLU
+layout(std430, binding = 4) readonly buffer WU { uint wu[]; };
 #endif
 
 layout(push_constant) uniform PC {
@@ -53,16 +62,31 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared float red[LANES * ROWS];
+#ifdef SWIGLU
+shared float red_u[LANES * ROWS];
+#endif
 
 uint byte_at(uint i) {
     return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
 }
 
+/** Word i of the weights: W, or WU when `up` (always a constant at
+ * the call site, so it folds away). */
+uint wword(uint i, bool up) {
+#ifdef SWIGLU
+    return up ? wu[i] : w[i];
+#else
+    return w[i];
+#endif
+}
+
 /** The 4 bytes at byte offset b (any alignment). */
-uint word_at(uint b) {
+uint word_at(uint b, bool up) {
     uint i = b >> 2;
     uint sh = (b & 3u) * 8u;
-    return sh == 0u ? w[i] : (w[i] >> sh) | (w[i + 1u] << (32u - sh));
+    return sh == 0u ? wword(i, up)
+                    : (wword(i, up) >> sh) |
+                          (wword(i + 1u, up) << (32u - sh));
 }
 
 float f16_at(uint i) {
@@ -96,7 +120,7 @@ void scale_min(uint j, uint s0, uint s1, uint s2, out float d,
  * 32-element sub-block, one word for d / dmin, three for the scales,
  * eight for the nibbles, and eight vec4 activation loads.
  */
-float row_part(uint wbase, uint xbase, uint r, uint lane) {
+float row_part(uint wbase, uint xbase, uint r, uint lane, bool up) {
     uint nb = pc.cols / 256u;
     uint rb = wbase + r * nb * 144u;
     bool xal = (xbase & 3u) == 0u;
@@ -107,15 +131,15 @@ float row_part(uint wbase, uint xbase, uint r, uint lane) {
         uint j = s >> 1;
         uint sh = (s & 1u) * 4u;  // nibble shift
         uint at = rb + b * 144u;
-        vec2 dm = unpackHalf2x16(word_at(at));
+        vec2 dm = unpackHalf2x16(word_at(at, up));
         float sc, mn;
-        scale_min(s, word_at(at + 4u), word_at(at + 8u), word_at(at + 12u),
-                  sc, mn);
+        scale_min(s, word_at(at + 4u, up), word_at(at + 8u, up),
+                  word_at(at + 12u, up), sc, mn);
         uint q = at + 16u + j * 32u;
         uint xi = xbase + b * 256u + j * 64u + (s & 1u) * 32u;
         float sq = 0.0, sx = 0.0;
         for (uint k = 0u; k < 8u; ++k) {
-            uint v = word_at(q + k * 4u) >> sh;
+            uint v = word_at(q + k * 4u, up) >> sh;
             uint xk = xi + k * 4u;
             vec4 xv = xal ? x4[xk >> 2]
                           : vec4(x[xk], x[xk + 1u], x[xk + 2u], x[xk + 3u]);
@@ -139,6 +163,9 @@ void main() {
     uint r = gl_WorkGroupID.x * ROWS + slot;
     uint at = pc.out_offset + r;
     float acc = 0.0;
+#ifdef SWIGLU
+    float acc_u = 0.0;
+#endif
     if (r < pc.rows) {
 #ifdef BATCHED
         uint y = gl_WorkGroupID.y;
@@ -148,27 +175,44 @@ void main() {
             uint id = (pc.mode & 1u) != 0u ? route[k] : k;
             float wk = sum ? uintBitsToFloat(route[pc.n_slots + k])
                            : 1.0;
-            acc += wk * row_part(pc.w_off + id * pc.w_stride,
-                                 pc.x_off + k * pc.x_stride, r, lane);
+            uint wb = pc.w_off + id * pc.w_stride;
+            uint xb = pc.x_off + k * pc.x_stride;
+            acc += wk * row_part(wb, xb, r, lane, false);
+#ifdef SWIGLU
+            acc_u += wk * row_part(wb, xb, r, lane, true);
+#endif
         }
         if (!sum) {
             at += y * pc.out_stride;
         }
 #else
-        acc = row_part(pc.w_off, pc.x_off, r, lane);
+        acc = row_part(pc.w_off, pc.x_off, r, lane, false);
 #endif
     }
     red[gl_LocalInvocationID.x] = acc;
+#ifdef SWIGLU
+    red_u[gl_LocalInvocationID.x] = acc_u;
+#endif
     barrier();
     for (uint step = LANES / 2u; step > 0u; step >>= 1) {
         if (lane < step) {
             red[gl_LocalInvocationID.x] +=
                 red[gl_LocalInvocationID.x + step];
+#ifdef SWIGLU
+            red_u[gl_LocalInvocationID.x] +=
+                red_u[gl_LocalInvocationID.x + step];
+#endif
         }
         barrier();
     }
     if (lane == 0u && r < pc.rows) {
         float v = red[gl_LocalInvocationID.x] * pc.scale;
+#ifdef SWIGLU
+        // silu_mul.comp's formula on the gate and up outputs.
+        float u = red_u[gl_LocalInvocationID.x] * pc.scale;
+        o[at] = v / (1.0 + exp(-v)) * u;
+#else
         o[at] = pc.accumulate != 0 ? o[at] + v : v;
+#endif
     }
 }
