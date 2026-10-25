@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <tuple>
@@ -233,6 +234,22 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             audio_band_base_ = model::orpheus_band_base(tok_);
         } catch (const std::exception&) {
             audio_band_base_ = -1;
+        }
+        // Speech samples only Orpheus's own tokens, <custom_token_0>
+        // (10 below the band: the stop and marker ids) through the
+        // end of the 7 code bands, so the head computes just those
+        // rows (i#173). If the vocab is not laid out that way, keep
+        // the whole head.
+        if (audio_band_base_ >= 10) {
+            const auto first =
+                static_cast<std::uint32_t>(audio_band_base_ - 10);
+            const std::uint32_t end = std::min<std::uint32_t>(
+                n_vocab_, static_cast<std::uint32_t>(audio_band_base_) +
+                              7u * 4096u);
+            if (tok_.piece(static_cast<tok::TokenId>(first)) ==
+                "<custom_token_0>") {
+                audio_rows_ = {first, end};
+            }
         }
     }
     install_routes();
@@ -1443,10 +1460,22 @@ void OpenAiServer::install_routes() {
                         } else {
                             for (std::size_t k = 0; k < nb; ++k) {
                                 model_.forward(ids[at + k], *audio_cache_,
-                                               seq, audio_ws_, logits);
+                                               seq, audio_ws_, logits,
+                                               audio_rows_);
                             }
                         }
                         at += nb;
+                    }
+                    // The batched prefill computes the whole head; mask
+                    // it to the same rows the decode steps compute, so
+                    // the first draw sees the same candidate set.
+                    if (audio_rows_.end != 0) {
+                        const float ninf =
+                            -std::numeric_limits<float>::infinity();
+                        std::fill(logits.begin(),
+                                  logits.begin() + audio_rows_.begin, ninf);
+                        std::fill(logits.begin() + audio_rows_.end,
+                                  logits.end(), ninf);
                     }
                     r.t1 = Clock::now();
                     for (std::uint32_t i = 0; ok && i < cap; ++i) {
@@ -1463,7 +1492,7 @@ void OpenAiServer::install_routes() {
                         if (sampler.frames() > before && !on_frame()) break;
                         if (!audio_cache_->ensure_capacity(seq, 1)) break;
                         model_.forward(next, *audio_cache_, seq, audio_ws_,
-                                       logits);
+                                       logits, audio_rows_);
                     }
                     audio_cache_->release(seq);
                     r.t2 = Clock::now();
