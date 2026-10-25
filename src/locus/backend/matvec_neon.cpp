@@ -68,14 +68,13 @@ void scale_min_k4_neon(int j, const std::uint8_t* q,
 }
 
 /**
- * FMAs four dequantized vectors f[0..3] against 16 consecutive x
- * floats at xp into acc, four lanes at a time. Shared by the
- * single-token dot kernels and the R11 batched kernel so both use
- * the identical accumulation order (byte-exactness).
+ * Dot of four weight vectors f[0..3] with 16 consecutive x floats at
+ * xp, in a fresh accumulator. Shared by the single-token K-quant
+ * dots and the R11 batched kernel so both use the identical
+ * accumulation order (byte-exactness).
  */
-float32x4_t fma16(float32x4_t acc, const float32x4_t f[4],
-                  const float* xp) {
-    acc = vfmaq_f32(acc, f[0], vld1q_f32(xp));
+float32x4_t dot16(const float32x4_t f[4], const float* xp) {
+    float32x4_t acc = vmulq_f32(f[0], vld1q_f32(xp));
     acc = vfmaq_f32(acc, f[1], vld1q_f32(xp + 4));
     acc = vfmaq_f32(acc, f[2], vld1q_f32(xp + 8));
     acc = vfmaq_f32(acc, f[3], vld1q_f32(xp + 12));
@@ -83,84 +82,94 @@ float32x4_t fma16(float32x4_t acc, const float32x4_t f[4],
 }
 
 /**
- * Dequantizes 16 Q4_K nibbles into f[0..3] = d*v - m. `vals` holds
- * the 16 nibble values already masked/shifted to 0..15. Weight-only
- * (token-independent), so the R11 batched kernel computes it once
- * and reuses it across all tokens.
+ * Widens 16 Q4_K nibbles (already masked/shifted to 0..15) to f32 in
+ * f[0..3], unscaled. Weight-only, so the R11 batched kernel converts
+ * once and reuses it across all tokens.
  */
-void dq16_q4k(uint8x16_t vals, float d, float m, float32x4_t f[4]) {
+void cvt16_q4k(uint8x16_t vals, float32x4_t f[4]) {
     const uint16x8_t vlo = vmovl_u8(vget_low_u8(vals));
     const uint16x8_t vhi = vmovl_u8(vget_high_u8(vals));
     f[0] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vlo)));
     f[1] = vcvtq_f32_u32(vmovl_u16(vget_high_u16(vlo)));
     f[2] = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vhi)));
     f[3] = vcvtq_f32_u32(vmovl_u16(vget_high_u16(vhi)));
-    const float32x4_t dv = vdupq_n_f32(d);
-    const float32x4_t mv = vdupq_n_f32(m);
-    f[0] = vsubq_f32(vmulq_f32(f[0], dv), mv);
-    f[1] = vsubq_f32(vmulq_f32(f[1], dv), mv);
-    f[2] = vsubq_f32(vmulq_f32(f[2], dv), mv);
-    f[3] = vsubq_f32(vmulq_f32(f[3], dv), mv);
 }
 
 /**
- * Accumulates 16 dequantized nibbles into acc: for each 4-bit
- * value v, adds (d*v - m) * x. `vals` holds the 16 nibble values
- * already masked/shifted to 0..15; `xp` points at 16 floats.
+ * Sums x over each 32-element sub-block into xs (cols / 32 floats):
+ * the Q4_K min term dmin*mn*sum(x) needs it once per sub-block, and
+ * it is shared by every row of the matvec.
  */
-float32x4_t accum16_q4k(float32x4_t acc, uint8x16_t vals, float d,
-                        float m, const float* xp) {
-    float32x4_t f[4];
-    dq16_q4k(vals, d, m, f);
-    return fma16(acc, f, xp);
+void subblock_sums(const float* x, std::size_t cols, float* xs) {
+    for (std::size_t s = 0; s < cols / 32; ++s) {
+        float32x4_t a = vld1q_f32(x + s * 32);
+        for (int k = 4; k < 32; k += 4) {
+            a = vaddq_f32(a, vld1q_f32(x + s * 32 + k));
+        }
+        xs[s] = vaddvq_f32(a);
+    }
+}
+
+/** The Q4_K scales of one 64-element group (sub-blocks is, is+1). */
+struct Q4kGroup {
+    float d1, d2;  // d * sc
+    float mins;    // dmin*mn0*xs[is] + dmin*mn1*xs[is+1]
+};
+
+Q4kGroup q4k_group(const std::uint8_t* scales, int is, float d,
+                   float dmin, const float* xs) {
+    std::uint8_t sc0, mn0, sc1, mn1;
+    scale_min_k4_neon(is, scales, sc0, mn0);
+    scale_min_k4_neon(is + 1, scales, sc1, mn1);
+    return {d * sc0, d * sc1,
+            dmin * mn0 * xs[is] + dmin * mn1 * xs[is + 1]};
 }
 
 /**
- * One Q4_K super-block (256 elements, 144 bytes): fused dequant +
- * dot against x. Follows dequant_block_q4_k's layout -- eight
- * 32-element sub-blocks paired into 64-element groups, low nibbles
- * then high nibbles, each with its own (d*sc, dmin*mn) scale/min.
+ * One Q4_K super-block (256 elements, 144 bytes) against x. Follows
+ * dequant_block_q4_k's layout -- eight 32-element sub-blocks paired
+ * into 64-element groups, low nibbles then high nibbles -- factored
+ * per sub-block s as d*sc_s * sum(q * x) - dmin*mn_s * xs[s], with
+ * xs = subblock_sums(x) for this block. Each 16-value quant dot runs
+ * in a fresh accumulator, so they pipeline instead of chaining.
  */
-float dot_q4_k_block_neon(const std::byte* blk, const float* x) {
+float dot_q4_k_block_neon(const std::byte* blk, const float* x,
+                          const float* xs) {
     const float d = f16_to_f32(load_u16(blk));
     const float dmin = f16_to_f32(load_u16(blk + 2));
-    const auto* scales =
-        reinterpret_cast<const std::uint8_t*>(blk + 4);
-    const auto* q =
-        reinterpret_cast<const std::uint8_t*>(blk + 16);
+    const auto* scales = reinterpret_cast<const std::uint8_t*>(blk + 4);
+    const auto* q = reinterpret_cast<const std::uint8_t*>(blk + 16);
     const uint8x16_t mask = vdupq_n_u8(0x0f);
     float32x4_t acc = vdupq_n_f32(0.0f);
-    int is = 0;
-    for (int j = 0; j < 256; j += 64) {
-        std::uint8_t sc, mn;
-        scale_min_k4_neon(is + 0, scales, sc, mn);
-        const float d1 = d * sc, m1 = dmin * mn;
-        scale_min_k4_neon(is + 1, scales, sc, mn);
-        const float d2 = d * sc, m2 = dmin * mn;
+    float mins = 0.0f;
+    for (int j = 0, is = 0; j < 256; j += 64, is += 2, q += 32) {
+        const Q4kGroup g = q4k_group(scales, is, d, dmin, xs);
         const uint8x16_t qb0 = vld1q_u8(q);
         const uint8x16_t qb1 = vld1q_u8(q + 16);
-        acc = accum16_q4k(acc, vandq_u8(qb0, mask), d1, m1, x + j);
-        acc = accum16_q4k(acc, vandq_u8(qb1, mask), d1, m1,
-                          x + j + 16);
-        acc = accum16_q4k(acc, vshrq_n_u8(qb0, 4), d2, m2,
-                          x + j + 32);
-        acc = accum16_q4k(acc, vshrq_n_u8(qb1, 4), d2, m2,
-                          x + j + 48);
-        q += 32;
-        is += 2;
+        float32x4_t f0[4], f1[4], f2[4], f3[4];
+        cvt16_q4k(vandq_u8(qb0, mask), f0);
+        cvt16_q4k(vandq_u8(qb1, mask), f1);
+        cvt16_q4k(vshrq_n_u8(qb0, 4), f2);
+        cvt16_q4k(vshrq_n_u8(qb1, 4), f3);
+        acc = vfmaq_n_f32(
+            acc, vaddq_f32(dot16(f0, x + j), dot16(f1, x + j + 16)), g.d1);
+        acc = vfmaq_n_f32(
+            acc, vaddq_f32(dot16(f2, x + j + 32), dot16(f3, x + j + 48)),
+            g.d2);
+        mins += g.mins;
     }
-    return vaddvq_f32(acc);
+    return vaddvq_f32(acc) - mins;
 }
 
 /**
- * Accumulates 16 Q6_K values into acc: reconstructs each 6-bit
- * quant from the low/high nibble of ql (HIGH picks the high
- * nibble) and 2 bits of qh at QH_SHIFT, subtracts the 32 bias,
- * scales by dsc = d*sc, and multiplies by x.
+ * Widens one 16-value Q6_K stream to f32 in g[0..3], unscaled:
+ * reconstructs each 6-bit quant from the low/high nibble of ql (HIGH
+ * picks the high nibble) and 2 bits of qh at QH_SHIFT, minus the 32
+ * bias. The d*sc scale is applied once per stream by the caller.
  */
 template <bool HIGH, int QH_SHIFT>
-void dq16_q6k(const std::uint8_t* ql16, const std::uint8_t* qh16,
-              float dsc, float32x4_t g[4]) {
+void cvt16_q6k(const std::uint8_t* ql16, const std::uint8_t* qh16,
+               float32x4_t g[4]) {
     const uint8x16_t qlb = vld1q_u8(ql16);
     const uint8x16_t qhb = vld1q_u8(qh16);
     const uint8x16_t low =
@@ -178,28 +187,20 @@ void dq16_q6k(const std::uint8_t* ql16, const std::uint8_t* qh16,
         vreinterpretq_s8_u8(vorrq_u8(low, high)), vdupq_n_s8(32));
     const int16x8_t vlo = vmovl_s8(vget_low_s8(v));
     const int16x8_t vhi = vmovl_s8(vget_high_s8(v));
-    const float32x4_t f0 =
-        vcvtq_f32_s32(vmovl_s16(vget_low_s16(vlo)));
-    const float32x4_t f1 =
-        vcvtq_f32_s32(vmovl_s16(vget_high_s16(vlo)));
-    const float32x4_t f2 =
-        vcvtq_f32_s32(vmovl_s16(vget_low_s16(vhi)));
-    const float32x4_t f3 =
-        vcvtq_f32_s32(vmovl_s16(vget_high_s16(vhi)));
-    const float32x4_t s = vdupq_n_f32(dsc);
-    g[0] = vmulq_f32(f0, s);
-    g[1] = vmulq_f32(f1, s);
-    g[2] = vmulq_f32(f2, s);
-    g[3] = vmulq_f32(f3, s);
+    g[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vlo)));
+    g[1] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vlo)));
+    g[2] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vhi)));
+    g[3] = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vhi)));
 }
 
+/** acc += d*sc * dot(stream, x): one Q6_K stream of 16 values. */
 template <bool HIGH, int QH_SHIFT>
-float32x4_t accum16_q6k(float32x4_t acc, const std::uint8_t* ql16,
-                        const std::uint8_t* qh16, float dsc,
-                        const float* xp) {
+float32x4_t stream_q6k(float32x4_t acc, const std::uint8_t* ql16,
+                       const std::uint8_t* qh16, float dsc,
+                       const float* xp) {
     float32x4_t g[4];
-    dq16_q6k<HIGH, QH_SHIFT>(ql16, qh16, dsc, g);
-    return fma16(acc, g, xp);
+    cvt16_q6k<HIGH, QH_SHIFT>(ql16, qh16, g);
+    return vfmaq_n_f32(acc, dot16(g, xp), dsc);
 }
 
 /**
@@ -207,7 +208,8 @@ float32x4_t accum16_q6k(float32x4_t acc, const std::uint8_t* ql16,
  * dot. Follows dequant_block_q6_k -- two 128-element halves, each
  * with four 32-value streams (ql low/high nibble x qh 2-bit pair)
  * scaled by one of eight int8 scales (two per stream, split at
- * lane 16).
+ * lane 16). Each 16-value stream is dotted raw in a fresh
+ * accumulator and scaled once by d*sc.
  */
 float dot_q6_k_block_neon(const std::byte* blk, const float* x) {
     const auto* ql = reinterpret_cast<const std::uint8_t*>(blk);
@@ -218,22 +220,20 @@ float dot_q6_k_block_neon(const std::byte* blk, const float* x) {
     const float d = f16_to_f32(load_u16(blk + 208));
     float32x4_t acc = vdupq_n_f32(0.0f);
     for (int n = 0; n < 256; n += 128) {
-        acc = accum16_q6k<false, 0>(acc, ql, qh, d * sc[0],
-                                    x + n);
-        acc = accum16_q6k<false, 0>(acc, ql + 16, qh + 16,
-                                    d * sc[1], x + n + 16);
-        acc = accum16_q6k<false, 2>(acc, ql + 32, qh, d * sc[2],
-                                    x + n + 32);
-        acc = accum16_q6k<false, 2>(acc, ql + 48, qh + 16,
-                                    d * sc[3], x + n + 48);
-        acc = accum16_q6k<true, 4>(acc, ql, qh, d * sc[4],
-                                   x + n + 64);
-        acc = accum16_q6k<true, 4>(acc, ql + 16, qh + 16,
-                                   d * sc[5], x + n + 80);
-        acc = accum16_q6k<true, 6>(acc, ql + 32, qh, d * sc[6],
-                                   x + n + 96);
-        acc = accum16_q6k<true, 6>(acc, ql + 48, qh + 16,
-                                   d * sc[7], x + n + 112);
+        acc = stream_q6k<false, 0>(acc, ql, qh, d * sc[0], x + n);
+        acc = stream_q6k<false, 0>(acc, ql + 16, qh + 16, d * sc[1],
+                                   x + n + 16);
+        acc = stream_q6k<false, 2>(acc, ql + 32, qh, d * sc[2],
+                                   x + n + 32);
+        acc = stream_q6k<false, 2>(acc, ql + 48, qh + 16, d * sc[3],
+                                   x + n + 48);
+        acc = stream_q6k<true, 4>(acc, ql, qh, d * sc[4], x + n + 64);
+        acc = stream_q6k<true, 4>(acc, ql + 16, qh + 16, d * sc[5],
+                                  x + n + 80);
+        acc = stream_q6k<true, 6>(acc, ql + 32, qh, d * sc[6],
+                                  x + n + 96);
+        acc = stream_q6k<true, 6>(acc, ql + 48, qh + 16, d * sc[7],
+                                  x + n + 112);
         ql += 64;
         qh += 32;
         sc += 8;
@@ -314,12 +314,16 @@ void matvec_neon(const Mat& w, std::span<const float> x,
     if (w.type == gguf::TensorType::kQ4_K) {
         const std::size_t row_bytes = w.cols / 256ull * 144ull;
         const std::size_t nblk = w.cols / 256;
+        thread_local std::vector<float> xs;
+        xs.resize(w.cols / 32);
+        subblock_sums(x.data(), w.cols, xs.data());
         for (std::uint32_t r = 0; r < w.rows; ++r) {
             const std::byte* row = w.data + r * row_bytes;
             float acc = 0.0f;
             for (std::size_t b = 0; b < nblk; ++b) {
-                acc += dot_q4_k_block_neon(
-                    row + b * 144, x.data() + b * 256);
+                acc += dot_q4_k_block_neon(row + b * 144,
+                                           x.data() + b * 256,
+                                           xs.data() + b * 8);
             }
             out[r] = acc;
         }
@@ -360,21 +364,29 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch,
                        std::uint32_t n) {
     const std::size_t cols = w.cols;
-    // Register-blocked Q4_K: read+dequant each weight block once,
-    // FMA into all n per-token accumulators. Weight DRAM traffic
+    // Register-blocked Q4_K: read+widen each weight block once, dot
+    // it into all n per-token accumulators. Weight DRAM traffic
     // ~n-fold lower than n matvec() calls. Byte-identical to
-    // dot_q4_k_block_neon summed by matvec_neon: reduce each block's
-    // vector accumulator (vaddvq) and add to a per-token scalar, in
-    // the same per-block/per-chunk order -- NOT one reduction at the
-    // end (float addition is not associative).
+    // dot_q4_k_block_neon summed by matvec_neon: the same dot16 /
+    // q4k_group steps in the same order, each block's vector
+    // accumulator reduced (vaddvq) and added to a per-token scalar --
+    // NOT one reduction at the end (float addition is not
+    // associative).
     if (w.type == gguf::TensorType::kQ4_K) {
         const std::size_t nblk = cols / 256;
         const std::size_t rb = nblk * 144;
+        const std::size_t nsub = cols / 32;
         const uint8x16_t mask = vdupq_n_u8(0x0f);
         thread_local std::vector<float32x4_t> vacc;
-        thread_local std::vector<float> sacc;
+        thread_local std::vector<float> sacc, mins, xs;
         vacc.resize(n);
         sacc.resize(n);
+        mins.resize(n);
+        xs.resize(n * nsub);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            subblock_sums(x_batch.data() + t * cols, cols,
+                          xs.data() + t * nsub);
+        }
         for (std::uint32_t r = 0; r < w.rows; ++r) {
             const std::byte* row = w.data + r * rb;
             for (std::uint32_t t = 0; t < n; ++t) {
@@ -391,46 +403,38 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
                 const std::size_t xb = b * 256;
                 for (std::uint32_t t = 0; t < n; ++t) {
                     vacc[t] = vdupq_n_f32(0.0f);
+                    mins[t] = 0.0f;
                 }
-                int is = 0;
-                for (int j = 0; j < 256; j += 64) {
-                    std::uint8_t sc, mn;
-                    scale_min_k4_neon(is + 0, scales, sc, mn);
-                    const float d1 = d * sc, m1 = dmin * mn;
-                    scale_min_k4_neon(is + 1, scales, sc, mn);
-                    const float d2 = d * sc, m2 = dmin * mn;
+                for (int j = 0, is = 0; j < 256;
+                     j += 64, is += 2, q += 32) {
                     const uint8x16_t qb0 = vld1q_u8(q);
                     const uint8x16_t qb1 = vld1q_u8(q + 16);
-                    float32x4_t f[4];
-                    dq16_q4k(vandq_u8(qb0, mask), d1, m1, f);
+                    float32x4_t f0[4], f1[4], f2[4], f3[4];
+                    cvt16_q4k(vandq_u8(qb0, mask), f0);
+                    cvt16_q4k(vandq_u8(qb1, mask), f1);
+                    cvt16_q4k(vshrq_n_u8(qb0, 4), f2);
+                    cvt16_q4k(vshrq_n_u8(qb1, 4), f3);
                     for (std::uint32_t t = 0; t < n; ++t) {
-                        vacc[t] = fma16(vacc[t], f,
-                                        x_batch.data() + t * cols +
-                                            xb + j);
+                        const float* xt =
+                            x_batch.data() + t * cols + xb + j;
+                        const Q4kGroup g =
+                            q4k_group(scales, is, d, dmin,
+                                      xs.data() + t * nsub + b * 8);
+                        vacc[t] = vfmaq_n_f32(
+                            vacc[t],
+                            vaddq_f32(dot16(f0, xt),
+                                      dot16(f1, xt + 16)),
+                            g.d1);
+                        vacc[t] = vfmaq_n_f32(
+                            vacc[t],
+                            vaddq_f32(dot16(f2, xt + 32),
+                                      dot16(f3, xt + 48)),
+                            g.d2);
+                        mins[t] += g.mins;
                     }
-                    dq16_q4k(vandq_u8(qb1, mask), d1, m1, f);
-                    for (std::uint32_t t = 0; t < n; ++t) {
-                        vacc[t] = fma16(vacc[t], f,
-                                        x_batch.data() + t * cols +
-                                            xb + j + 16);
-                    }
-                    dq16_q4k(vshrq_n_u8(qb0, 4), d2, m2, f);
-                    for (std::uint32_t t = 0; t < n; ++t) {
-                        vacc[t] = fma16(vacc[t], f,
-                                        x_batch.data() + t * cols +
-                                            xb + j + 32);
-                    }
-                    dq16_q4k(vshrq_n_u8(qb1, 4), d2, m2, f);
-                    for (std::uint32_t t = 0; t < n; ++t) {
-                        vacc[t] = fma16(vacc[t], f,
-                                        x_batch.data() + t * cols +
-                                            xb + j + 48);
-                    }
-                    q += 32;
-                    is += 2;
                 }
                 for (std::uint32_t t = 0; t < n; ++t) {
-                    sacc[t] += vaddvq_f32(vacc[t]);
+                    sacc[t] += vaddvq_f32(vacc[t]) - mins[t];
                 }
             }
             float* orow = out_batch.data() +
@@ -455,11 +459,12 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
                           std::size_t xoff, auto high,
                           auto qh_shift) {
             float32x4_t g[4];
-            dq16_q6k<decltype(high)::value,
-                     decltype(qh_shift)::value>(ql16, qh16, dsc, g);
+            cvt16_q6k<decltype(high)::value,
+                      decltype(qh_shift)::value>(ql16, qh16, g);
             for (std::uint32_t t = 0; t < n; ++t) {
-                vacc[t] = fma16(vacc[t], g,
-                                x_batch.data() + t * cols + xoff);
+                vacc[t] = vfmaq_n_f32(
+                    vacc[t], dot16(g, x_batch.data() + t * cols + xoff),
+                    dsc);
             }
         };
         for (std::uint32_t r = 0; r < w.rows; ++r) {

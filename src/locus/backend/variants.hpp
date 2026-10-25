@@ -43,8 +43,8 @@ void matvec_sse4(const Mat& w, std::span<const float> x,
 /**
  * SSE4 Q8_K-activation matvec (ggml parity, DESIGN.md R16): quantizes
  * x to Q8_K once and integer-dots it with the quantized weight using
- * SSE4.1 (widen-then-per-lane products, bit-identical to scalar
- * matvec_q8k). Q4_K is vectorized; other types delegate to scalar
+ * SSE4.1 (per-lane integer sums, bit-identical to scalar matvec_q8k).
+ * Q2_K..Q6_K are vectorized; other types delegate to scalar
  * matvec_q8k. The device half of the eventual ggml-parity flip on the
  * x86 CPU path; kept additive so the f32 matvec_sse4 parity path stays
  * intact until the flip lands.
