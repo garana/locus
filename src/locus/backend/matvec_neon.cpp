@@ -312,17 +312,19 @@ inline void mla8(int32x4_t& lo, int32x4_t& hi, int16x8_t p,
     hi = vmlal_high_n_s16(hi, p, scale);
 }
 
-/** The scalar dots' float epilogue for one row: sums[l] += d *
- *  aux32[l] per block (vectorized, the same fused multiply-add), then
- *  sumf += sums[0] .. sums[7] in order. */
-inline float finish8(float32x4_t s_lo, float32x4_t s_hi, float sumf) {
-    float sums[8];
-    vst1q_f32(sums, s_lo);
-    vst1q_f32(sums + 4, s_hi);
+/**
+ * The scalar dots' per-block float step, sums[l] += d * aux32[l],
+ * written as the same C++ expression so every compiler contracts it
+ * the same way in both (clang fuses it to an FMA; GCC under -std=c++20
+ * keeps the mul and add).
+ */
+inline void add8(float sums[8], int32x4_t a_lo, int32x4_t a_hi, float d) {
+    std::int32_t aux32[8];
+    vst1q_s32(aux32, a_lo);
+    vst1q_s32(aux32 + 4, a_hi);
     for (int l = 0; l < 8; ++l) {
-        sumf += sums[l];
+        sums[l] += d * static_cast<float>(aux32[l]);
     }
-    return sumf;
 }
 
 /**
@@ -337,7 +339,7 @@ float row_q4_k_q8k_neon(const std::byte* row, std::size_t nb,
     constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
                             kmask3 = 0x03030303;
     const uint8x16_t m4b = vdupq_n_u8(0x0f);
-    float32x4_t s_lo = vdupq_n_f32(0.0f), s_hi = vdupq_n_f32(0.0f);
+    float sums[8] = {0};
     float sumf = 0.0f;
     for (std::size_t i = 0; i < nb; ++i) {
         const std::byte* blk = row + i * 144;
@@ -380,11 +382,13 @@ float row_q4_k_q8k_neon(const std::byte* row, std::size_t nb,
                  scales[2 * j + 1]);
         }
         const float d = bd * yd[i];
-        s_lo = vfmaq_n_f32(s_lo, vcvtq_f32_s32(a_lo), d);
-        s_hi = vfmaq_n_f32(s_hi, vcvtq_f32_s32(a_hi), d);
+        add8(sums, a_lo, a_hi, d);
         sumf -= bdmin * yd[i] * static_cast<float>(sumi);
     }
-    return finish8(s_lo, s_hi, sumf);
+    for (int l = 0; l < 8; ++l) {
+        sumf += sums[l];
+    }
+    return sumf;
 }
 
 /** The 2-bit qh field at SH, moved to bits 4..5 of each byte. */
@@ -413,7 +417,7 @@ inline int8x16_t q6_codes(uint8x16_t low, uint8x16_t high) {
 float row_q6_k_q8k_neon(const std::byte* row, std::size_t nb,
                         const float* yd, const std::int8_t* yq) {
     const uint8x16_t m4b = vdupq_n_u8(0x0f);
-    float32x4_t s_lo = vdupq_n_f32(0.0f), s_hi = vdupq_n_f32(0.0f);
+    float sums[8] = {0};
     for (std::size_t i = 0; i < nb; ++i) {
         const std::byte* blk = row + i * 210;
         const auto* ql = reinterpret_cast<const std::uint8_t*>(blk);
@@ -445,10 +449,13 @@ float row_q6_k_q8k_neon(const std::byte* row, std::size_t nb,
             }
         }
         const float d = bd * yd[i];
-        s_lo = vfmaq_n_f32(s_lo, vcvtq_f32_s32(a_lo), d);
-        s_hi = vfmaq_n_f32(s_hi, vcvtq_f32_s32(a_hi), d);
+        add8(sums, a_lo, a_hi, d);
     }
-    return finish8(s_lo, s_hi, 0.0f);
+    float sumf = 0.0f;
+    for (int l = 0; l < 8; ++l) {
+        sumf += sums[l];
+    }
+    return sumf;
 }
 
 }  // namespace
