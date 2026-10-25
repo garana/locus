@@ -267,7 +267,10 @@ Notes:
   unknown); a model that fits stays resident after one pass, and
   hinting resident pages per token is not free (Orpheus 3B on
   M4: ~4.5 ms/token, 17% of decode). The pager's op.prefetch
-  hints are unaffected.
+  hints are unaffected. The cost: a model under half of RAM
+  loads its first pass cold without the hints (the 33% GLM gain
+  was cold streaming). A later refinement could keep them for the
+  first N tokens.
 - Future work (2026-07-21): overlap I/O with compute one step
   ahead. Mechanism notes: each shard is mmap'd once, whole-file
   (PROT_READ MAP_PRIVATE, never written) -- weight pages are
