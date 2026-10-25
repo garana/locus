@@ -1318,11 +1318,14 @@ matvec throughput.
   matvec_q8k bit-for-bit across all 15 (margin 1e-4). Note Q3_K had no
   CUDA kernel at all before this; its Q8_K kernel is the first GPU
   Q3_K path (the f32 matvec_cuda still delegates Q3_K to scalar).
-- SSE4 (done): matvec_sse4_q8k covers all five k-quants -- Q3/Q4/Q5/
-  Q6 via a widen-then-per-lane int32 accumulate (no maddubs, to keep
-  the scalar lane order), Q2_K via maddubs (its per-16 isuml is a
-  single total, so the pair-collapse is exact). Ternary + IQ delegate
-  to scalar. This host is SSE4-only (no AVX2/NEON here).
+- SSE4 (done): matvec_sse4_q8k covers all five k-quants, bit-for-bit
+  with scalar matvec_q8k. Q4/Q5/Q6 use maddubs on bytes shuffled to
+  (0,8,1,9,...), so each pair-sum stays in one scalar lane (e % 8);
+  Q3 widens per lane; Q2_K maddubs directly (its per-16 isuml is a
+  single total). An earlier fast path summed each block into one
+  float; that order flipped muse's greedy tokens on x86 (PR#197).
+  Ternary + IQ delegate to scalar. This host is SSE4-only (no
+  AVX2/NEON here).
 - NOT the model default -- Q8_K is an OPT-IN mode
   (TransformerModel::use_q8k_activations, default off). Why not the
   default: "bit-exact with llama.cpp" is unachievable in principle -- ggml

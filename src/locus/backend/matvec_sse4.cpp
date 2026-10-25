@@ -509,18 +509,32 @@ void q2_k_q8k_block_sse4(const std::byte* blk, const std::int8_t* q8,
     }
 }
 
-/** SSE4 Q4_K x Q8_K, the FAST opt-in path (R16): nibbles extracted
- *  in-register and int8-dotted with _mm_maddubs_epi16 (unsigned nibble
- *  x signed q8), one integer group-sum per 6-bit scale -- no aux8[256]
- *  scalar unpack and far fewer SIMD ops than the widen-per-lane
- *  bit-exact path. Returns block_int = sum_j scale_j*groupsum_j (an
- *  EXACT integer, same as the scalar aux32 total) and sumi (the bsums
- *  min term). The caller does one f32 mul per block instead of the
- *  scalar's 8-lane split, so it agrees with scalar matvec_q8k only to
- *  ~1e-3 -- fine for the tolerance-based opt-in mode. */
-void q4_k_q8k_fast_sse4(const std::byte* blk, const std::int8_t* q8,
-                        const std::int16_t* bsums, int& block_int,
-                        int& sumi) {
+/** Byte order (0,8,1,9,...,7,15) inside each 16-byte chunk. Applied to
+ *  both weights and q8, it makes each _mm_maddubs_epi16 pair-sum add
+ *  elements e and e+8, which share the scalar lane e % 8. */
+__m128i lane_pairs_mask() {
+    return _mm_setr_epi8(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14,
+                         7, 15);
+}
+
+/** Adds scale * s (8 int16 per-lane sums) to the int32 lanes lo (0..3)
+ *  and hi (4..7). */
+void add_scaled_lanes(__m128i s, int scale, __m128i& lo, __m128i& hi) {
+    const __m128i scv = _mm_set1_epi32(scale);
+    lo = _mm_add_epi32(lo, _mm_mullo_epi32(_mm_cvtepi16_epi32(s), scv));
+    hi = _mm_add_epi32(
+        hi, _mm_mullo_epi32(_mm_cvtepi16_epi32(_mm_srli_si128(s, 8)), scv));
+}
+
+/** SSE4 Q4_K x Q8_K: fills aux32[8] and sumi (the bsums min term)
+ *  exactly as scalar vec_dot_q4_k_q8_k does, so the caller's f32 sums
+ *  match bit-for-bit. q8il is the block's q8 in lane_pairs_mask order;
+ *  the nibbles get the same shuffle, so _mm_maddubs_epi16 (unsigned
+ *  nibble x signed q8) sums two products of one lane. Integer sums are
+ *  exact, so the add order inside a lane does not matter. */
+void q4_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
+                         const std::int16_t* bsums, std::int32_t aux32[8],
+                         int& sumi) {
     constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
                             kmask3 = 0x03030303;
     const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 16);
@@ -538,15 +552,16 @@ void q4_k_q8k_fast_sse4(const std::byte* blk, const std::int8_t* q8,
         sumi += bsums[j] * mins[j / 2];
     }
     const __m128i lo4 = _mm_set1_epi8(0x0f);
-    const __m128i ones = _mm_set1_epi16(1);
-    block_int = 0;
+    const __m128i il = lane_pairs_mask();
+    __m128i acc_lo = _mm_setzero_si128(), acc_hi = _mm_setzero_si128();
     for (int j = 0; j < 8; ++j) {
         const std::uint8_t* q4b = q4 + (j / 2) * 32;
-        const std::int8_t* q8g = q8 + j * 32;
-        const __m128i r0 =
-            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b));
-        const __m128i r1 = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(q4b + 16));
+        const std::int8_t* q8g = q8il + j * 32;
+        const __m128i r0 = _mm_shuffle_epi8(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b)), il);
+        const __m128i r1 = _mm_shuffle_epi8(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b + 16)),
+            il);
         __m128i n0, n1;
         if ((j & 1) == 0) {  // low nibbles
             n0 = _mm_and_si128(r0, lo4);
@@ -559,20 +574,22 @@ void q4_k_q8k_fast_sse4(const std::byte* blk, const std::int8_t* q8,
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
         const __m128i a1 = _mm_loadu_si128(
             reinterpret_cast<const __m128i*>(q8g + 16));
-        const __m128i p = _mm_add_epi32(
-            _mm_madd_epi16(_mm_maddubs_epi16(n0, a0), ones),
-            _mm_madd_epi16(_mm_maddubs_epi16(n1, a1), ones));
-        block_int += static_cast<int>(scales[j]) * hsum_epi32_sse4(p);
+        // 4 products per lane, |sum| <= 4*15*127: no int16 overflow
+        const __m128i s = _mm_add_epi16(_mm_maddubs_epi16(n0, a0),
+                                        _mm_maddubs_epi16(n1, a1));
+        add_scaled_lanes(s, scales[j], acc_lo, acc_hi);
     }
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
 }
 
-/** SSE4 Q5_K x Q8_K, the fast maddubs path (R16). Like q4_k_q8k_fast_
- *  sse4 but each value gets the 5th bit from hm added in-register
- *  (value stays unsigned [0,31], so maddubs still applies); 6-bit
- *  scales + bsums min term as in Q4_K. Returns block_int + sumi. */
-void q5_k_q8k_fast_sse4(const std::byte* blk, const std::int8_t* q8,
-                        const std::int16_t* bsums, int& block_int,
-                        int& sumi) {
+/** SSE4 Q5_K x Q8_K: like q4_k_q8k_aux32_sse4, plus the 5th bit from
+ *  hm (shuffled the same way) added in-register; the value stays
+ *  unsigned [0,31], so maddubs still applies. Bit-identical to scalar
+ *  vec_dot_q5_k_q8_k. */
+void q5_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
+                         const std::int16_t* bsums, std::int32_t aux32[8],
+                         int& sumi) {
     constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
                             kmask3 = 0x03030303;
     const auto* hm = reinterpret_cast<const std::uint8_t*>(blk + 16);
@@ -592,19 +609,20 @@ void q5_k_q8k_fast_sse4(const std::byte* blk, const std::int8_t* q8,
     }
     const __m128i lo4 = _mm_set1_epi8(0x0f);
     const __m128i s16 = _mm_set1_epi8(16);
-    const __m128i ones = _mm_set1_epi16(1);
-    const __m128i hm0 =
-        _mm_loadu_si128(reinterpret_cast<const __m128i*>(hm));
-    const __m128i hm1 =
-        _mm_loadu_si128(reinterpret_cast<const __m128i*>(hm + 16));
-    block_int = 0;
+    const __m128i il = lane_pairs_mask();
+    const __m128i hm0 = _mm_shuffle_epi8(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(hm)), il);
+    const __m128i hm1 = _mm_shuffle_epi8(
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(hm + 16)), il);
+    __m128i acc_lo = _mm_setzero_si128(), acc_hi = _mm_setzero_si128();
     for (int j = 0; j < 8; ++j) {
         const std::uint8_t* q4b = q4 + (j / 2) * 32;
-        const std::int8_t* q8g = q8 + j * 32;
-        const __m128i r0 =
-            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b));
-        const __m128i r1 = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(q4b + 16));
+        const std::int8_t* q8g = q8il + j * 32;
+        const __m128i r0 = _mm_shuffle_epi8(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b)), il);
+        const __m128i r1 = _mm_shuffle_epi8(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b + 16)),
+            il);
         __m128i n0, n1;
         if ((j & 1) == 0) {
             n0 = _mm_and_si128(r0, lo4);
@@ -625,20 +643,23 @@ void q5_k_q8k_fast_sse4(const std::byte* blk, const std::int8_t* q8,
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
         const __m128i a1 = _mm_loadu_si128(
             reinterpret_cast<const __m128i*>(q8g + 16));
-        const __m128i p = _mm_add_epi32(
-            _mm_madd_epi16(_mm_maddubs_epi16(n0, a0), ones),
-            _mm_madd_epi16(_mm_maddubs_epi16(n1, a1), ones));
-        block_int += static_cast<int>(scales[j]) * hsum_epi32_sse4(p);
+        // 4 products per lane, |sum| <= 4*31*127: no int16 overflow
+        const __m128i s = _mm_add_epi16(_mm_maddubs_epi16(n0, a0),
+                                        _mm_maddubs_epi16(n1, a1));
+        add_scaled_lanes(s, scales[j], acc_lo, acc_hi);
     }
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
 }
 
-/** SSE4 Q6_K x Q8_K, the fast maddubs path (R16). Q6_K values are
- *  signed (raw6-32), so maddubs (unsigned x signed) needs the offset
- *  trick: sum((raw6-32)*q8) = sum(raw6*q8) - 32*sum(q8). raw6 (the
- *  ql-nibble | qh-2bit code, [0,63]) is reconstructed in-register, then
- *  each 16-value group gives sum(raw6*q8) and sum(q8) via two maddubs;
- *  x the int8 scale, no min term. Returns block_int. */
-int q6_k_q8k_fast_sse4(const std::byte* blk, const std::int8_t* q8) {
+/** SSE4 Q6_K x Q8_K: fills aux32[8] exactly as scalar
+ *  vec_dot_q6_k_q8_k does (no min term). Q6_K values are signed
+ *  (raw6-32), so maddubs (unsigned x signed) needs the offset trick
+ *  per lane: sum((raw6-32)*q8) = sum(raw6*q8) - 32*sum(q8). raw6 (the
+ *  ql-nibble | qh-2bit code, [0,63]) is reconstructed in-register,
+ *  then shuffled to lane_pairs_mask order to match q8il. */
+void q6_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
+                         std::int32_t aux32[8]) {
     const auto* sc = reinterpret_cast<const std::int8_t*>(blk + 192);
     const __m128i m3 = _mm_set1_epi8(3);
     const __m128i lo4 = _mm_set1_epi8(0x0f);
@@ -682,21 +703,23 @@ int q6_k_q8k_fast_sse4(const std::byte* blk, const std::int8_t* q8) {
         qh += 32;
         a += 128;
     }
-    const __m128i ones = _mm_set1_epi16(1);
+    const __m128i il = lane_pairs_mask();
     const __m128i u1 = _mm_set1_epi8(1);
-    int block_int = 0;
+    __m128i acc_lo = _mm_setzero_si128(), acc_hi = _mm_setzero_si128();
     for (int j = 0; j < 16; ++j) {
-        const __m128i rv = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(aux + j * 16));
+        const __m128i rv = _mm_shuffle_epi8(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(aux + j * 16)),
+            il);
         const __m128i qv = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(q8 + j * 16));
-        const int sum_rq = hsum_epi32_sse4(
-            _mm_madd_epi16(_mm_maddubs_epi16(rv, qv), ones));
-        const int sum_q = hsum_epi32_sse4(
-            _mm_madd_epi16(_mm_maddubs_epi16(u1, qv), ones));
-        block_int += static_cast<int>(sc[j]) * (sum_rq - 32 * sum_q);
+            reinterpret_cast<const __m128i*>(q8il + j * 16));
+        // per lane: |raw6*q8 pair| <= 2*63*127, 32*|q8 pair| <= 32*254
+        const __m128i s = _mm_sub_epi16(
+            _mm_maddubs_epi16(rv, qv),
+            _mm_slli_epi16(_mm_maddubs_epi16(u1, qv), 5));
+        add_scaled_lanes(s, sc[j], acc_lo, acc_hi);
     }
-    return block_int;
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
 }
 
 void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
@@ -739,43 +762,49 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
     std::vector<std::int8_t> hqs(x.size());
     std::vector<std::int16_t> hbs(nb * 16);
     quantize_activation_q8k(x, hd.data(), hqs.data(), hbs.data());
+    if (!q3k) {  // q8 in lane_pairs_mask order, once for all rows
+        const __m128i il = lane_pairs_mask();
+        for (std::size_t i = 0; i < x.size(); i += 16) {
+            auto* p = reinterpret_cast<__m128i*>(hqs.data() + i);
+            _mm_storeu_si128(p, _mm_shuffle_epi8(_mm_loadu_si128(p), il));
+        }
+    }
     const std::size_t blk_bytes =
         q4k ? 144 : (q5k ? 176 : (q3k ? 110 : 210));
     const std::size_t row_bytes = nb * blk_bytes;
+    // Same f32 order as scalar matvec_q8k: 8 lane sums per row, the
+    // min term subtracted from sumf per block, the lanes added last.
     for (std::uint32_t r = 0; r < w.rows; ++r) {
         const std::byte* row = w.data + r * row_bytes;
         float sums[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         float sumf = 0.0f;
         for (std::size_t b = 0; b < nb; ++b) {
             const std::byte* blk = row + b * blk_bytes;
+            const std::int8_t* q8 = hqs.data() + b * 256;
             std::int32_t aux32[8];
-            if (q4k || q5k) {  // fast maddubs, direct sumf + bsums min
-                const float bd = f16_to_f32(load_u16(blk));
+            float bd = 0.0f;
+            if (q4k || q5k) {  // bsums min term
+                bd = f16_to_f32(load_u16(blk));
                 const float bdmin = f16_to_f32(load_u16(blk + 2));
-                int block_int = 0, sumi = 0;
+                int sumi = 0;
                 if (q4k) {
-                    q4_k_q8k_fast_sse4(blk, hqs.data() + b * 256,
-                                       hbs.data() + b * 16, block_int,
-                                       sumi);
+                    q4_k_q8k_aux32_sse4(blk, q8, hbs.data() + b * 16,
+                                        aux32, sumi);
                 } else {
-                    q5_k_q8k_fast_sse4(blk, hqs.data() + b * 256,
-                                       hbs.data() + b * 16, block_int,
-                                       sumi);
+                    q5_k_q8k_aux32_sse4(blk, q8, hbs.data() + b * 16,
+                                        aux32, sumi);
                 }
-                sumf += bd * hd[b] * static_cast<float>(block_int) -
-                        bdmin * hd[b] * static_cast<float>(sumi);
-            } else if (q3k) {  // Q3_K: widen-per-lane aux32, no min
-                const float bd = f16_to_f32(load_u16(blk + 108));
-                q3_k_q8k_aux32_sse4(blk, hqs.data() + b * 256, aux32);
-                const float d = bd * hd[b];
-                for (int l = 0; l < 8; ++l) {
-                    sums[l] += d * static_cast<float>(aux32[l]);
-                }
-            } else {  // Q6_K: fast maddubs, direct sumf, no min
-                const float bd = f16_to_f32(load_u16(blk + 208));
-                const int block_int =
-                    q6_k_q8k_fast_sse4(blk, hqs.data() + b * 256);
-                sumf += bd * hd[b] * static_cast<float>(block_int);
+                sumf -= bdmin * hd[b] * static_cast<float>(sumi);
+            } else if (q3k) {  // no min
+                bd = f16_to_f32(load_u16(blk + 108));
+                q3_k_q8k_aux32_sse4(blk, q8, aux32);
+            } else {  // Q6_K, no min
+                bd = f16_to_f32(load_u16(blk + 208));
+                q6_k_q8k_aux32_sse4(blk, q8, aux32);
+            }
+            const float d = bd * hd[b];
+            for (int l = 0; l < 8; ++l) {
+                sums[l] += d * static_cast<float>(aux32[l]);
             }
         }
         for (int l = 0; l < 8; ++l) {
