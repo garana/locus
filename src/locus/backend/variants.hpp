@@ -15,6 +15,17 @@ void matvec_neon(const Mat& w, std::span<const float> x,
                  std::span<float> out);
 
 /**
+ * NEON Q8_K-activation matvec (R16): quantizes x to Q8_K once and
+ * integer-dots it (vdotq_s32; vmull/vpadal without the dotprod
+ * extension) with Q4_K / Q6_K rows, in llama.cpp's NEON
+ * ggml_vec_dot_q{4,6}_K_q8_K order: exact integer sums, one float
+ * combination per super-block. Agrees with scalar matvec_q8k to float
+ * rounding; other types delegate to it.
+ */
+void matvec_neon_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out);
+
+/**
  * NEON register-blocked batched matvec (R11, Ops::matvec_batch):
  * applies w to all n token vectors in x_batch (token-major, token t
  * at t*w.cols) into out_batch (row-major, out[r*n + t]). Q4_K and
