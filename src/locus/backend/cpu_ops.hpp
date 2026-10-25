@@ -320,4 +320,49 @@ void conv1d_transpose_mt(std::span<const float> in, std::uint32_t in_ch,
 void snake1d_mt(std::span<float> x, std::uint32_t ch, std::uint32_t len,
                 std::span<const float> alpha, float eps = 1e-9f);
 
+/**
+ * 2D convolution (F32), the image VQ decoder's workhorse (i#222):
+ * cross-correlation (no kernel flip), grouped and strided, with zero
+ * padding, the same stride and padding on both axes. Channels-major:
+ * `in` is [in_ch][in_h][in_w], `weight` is [out_ch][in_ch/groups][kh]
+ * [kw], `bias` is [out_ch] or empty, `out` is [out_ch][out_h][out_w]
+ * with out_h = conv1d_out_len(in_h, kh, stride, 1, pad) (out_w alike).
+ * The scalar reference for every other variant.
+ *
+ * @param in Input, in_ch * in_h * in_w floats.
+ * @param in_ch Input channels.
+ * @param in_h Input height.
+ * @param in_w Input width.
+ * @param weight Filters, out_ch * (in_ch / groups) * kh * kw floats.
+ * @param out_ch Output channels.
+ * @param kh Kernel height.
+ * @param kw Kernel width.
+ * @param bias Per-output-channel bias (out_ch), or empty for none.
+ * @param stride Output stride (both axes).
+ * @param pad Zero padding on every edge.
+ * @param groups Channel groups.
+ * @param out Output, out_ch * out_h * out_w floats.
+ */
+void conv2d(std::span<const float> in, std::uint32_t in_ch,
+            std::uint32_t in_h, std::uint32_t in_w,
+            std::span<const float> weight, std::uint32_t out_ch,
+            std::uint32_t kh, std::uint32_t kw, std::span<const float> bias,
+            std::uint32_t stride, std::uint32_t pad, std::uint32_t groups,
+            std::span<float> out);
+
+/**
+ * conv2d across the thread pool, one item per (output channel, output
+ * row), with the inner loop over contiguous output columns (one per
+ * tap) so the compiler vectorizes it. Each output adds the same terms
+ * in the same order as conv2d (bias, then ci, ky, kx), so the result is
+ * bit-identical. Same arguments as conv2d; stride != 1 runs conv2d.
+ */
+void conv2d_mt(std::span<const float> in, std::uint32_t in_ch,
+               std::uint32_t in_h, std::uint32_t in_w,
+               std::span<const float> weight, std::uint32_t out_ch,
+               std::uint32_t kh, std::uint32_t kw,
+               std::span<const float> bias, std::uint32_t stride,
+               std::uint32_t pad, std::uint32_t groups,
+               std::span<float> out);
+
 }  // namespace locus::backend

@@ -1,0 +1,71 @@
+#version 450
+
+// 2D convolution (F32), cross-correlation (no kernel flip), grouped /
+// strided with zero padding, the same stride and padding on both axes.
+// Matches cpu_ops conv2d; one invocation per output element
+// (oc, oy, ox), summing ci, ky, kx in the reference's order. Bias
+// binding is always present; has_bias gates the read.
+//
+// Grid: workgroup y is the output channel and x tiles its output plane
+// in 64s, so the x count stays well under Vulkan's guaranteed 65535 at
+// image-decoder sizes (384 x 384 is 2304 groups) where a flat grid
+// over every output would not be.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer I { float inp[]; };
+layout(std430, binding = 1) readonly buffer W { float wt[]; };
+layout(std430, binding = 2) readonly buffer B { float bias[]; };
+layout(std430, binding = 3) writeonly buffer O { float outp[]; };
+
+layout(push_constant) uniform PC {
+    uint in_ch;
+    uint in_h;
+    uint in_w;
+    uint out_ch;
+    uint out_h;
+    uint out_w;
+    uint kh;
+    uint kw;
+    uint stride;
+    uint pad;
+    uint groups;
+    uint has_bias;
+} pc;
+
+void main() {
+    uint p = gl_GlobalInvocationID.x;  // position in the output plane
+    uint plane_out = pc.out_h * pc.out_w;
+    uint oc = gl_WorkGroupID.y;
+    if (p >= plane_out || oc >= pc.out_ch) {
+        return;
+    }
+    uint gid = oc * plane_out + p;
+    uint oy = p / pc.out_w;
+    uint ox = p % pc.out_w;
+    uint icg = pc.in_ch / pc.groups;   // in-channels per group
+    uint ocg = pc.out_ch / pc.groups;  // out-channels per group
+    uint ic0 = (oc / ocg) * icg;       // this group's first in-channel
+    float acc = pc.has_bias != 0u ? bias[oc] : 0.0;
+    int by = int(oy) * int(pc.stride) - int(pc.pad);
+    int bx = int(ox) * int(pc.stride) - int(pc.pad);
+    uint plane_in = pc.in_h * pc.in_w;
+    for (uint ci = 0u; ci < icg; ++ci) {
+        uint ip = (ic0 + ci) * plane_in;
+        uint wp = (oc * icg + ci) * pc.kh * pc.kw;
+        for (uint ky = 0u; ky < pc.kh; ++ky) {
+            int iy = by + int(ky);
+            if (iy < 0 || iy >= int(pc.in_h)) {
+                continue;
+            }
+            for (uint kx = 0u; kx < pc.kw; ++kx) {
+                int ix = bx + int(kx);
+                if (ix >= 0 && ix < int(pc.in_w)) {
+                    acc += wt[wp + ky * pc.kw + kx] *
+                           inp[ip + uint(iy) * pc.in_w + uint(ix)];
+                }
+            }
+        }
+    }
+    outp[gid] = acc;
+}
