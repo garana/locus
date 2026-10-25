@@ -147,6 +147,21 @@ void matvec_rows_mt(const backend::Ops& op,
 
 }  // namespace
 
+namespace {
+
+/** The kernel matvec_mt runs for w: matvec_q8k for the quantized-
+ *  activation types when the R16 mode is on, else matvec. */
+decltype(backend::Ops::matvec) matvec_kernel(const backend::Ops& op,
+                                             const Mat& w) {
+    return (op.matvec_q8k != nullptr &&
+            (backend::is_q8k_type(w.type) ||
+             backend::is_q8_0_act_type(w.type)))
+               ? op.matvec_q8k
+               : op.matvec;
+}
+
+}  // namespace
+
 void matvec_mt(const backend::Ops& op, const Mat& w,
                std::span<const float> x, std::span<float> out) {
     // R16 ggml parity: QK_K weight types integer-dot a Q8_K-quantized
@@ -155,17 +170,55 @@ void matvec_mt(const backend::Ops& op, const Mat& w,
     // Q8_K entry (scalar/cuda/sse4), falling back to scalar for types it
     // does not vectorize. Re-quantizing x per row-slice below is
     // O(cols) vs the O(rows_slice*cols) dot -- negligible.
-    const auto mv =
-        (op.matvec_q8k != nullptr && (backend::is_q8k_type(w.type) ||
-                                      backend::is_q8_0_act_type(w.type)))
-            ? op.matvec_q8k
-            : op.matvec;
-    matvec_rows_mt(op, mv, w, x, out);
+    matvec_rows_mt(op, matvec_kernel(op, w), w, x, out);
 }
 
 void matvec_mt_f32(const backend::Ops& op, const Mat& w,
                    std::span<const float> x, std::span<float> out) {
     matvec_rows_mt(op, op.matvec, w, x, out);
+}
+
+void matvec_mt_group(const backend::Ops& op,
+                     std::span<const MatvecJob> jobs, bool f32) {
+    std::uint64_t total = 0;
+    for (const MatvecJob& j : jobs) {
+        total += j.w.rows;
+    }
+    const std::size_t t =
+        op.mt_safe ? mt_slices(static_cast<std::uint32_t>(total)) : 0;
+    if (t <= 1) {
+        for (const MatvecJob& j : jobs) {
+            (f32 ? op.matvec : matvec_kernel(op, j.w))(j.w, j.x, j.out);
+        }
+        return;
+    }
+    // (job, first row, row count) per slice, at least one per job.
+    struct Slice {
+        std::size_t job;
+        std::uint32_t r0, n;
+    };
+    thread_local std::vector<Slice> slices;
+    slices.clear();
+    for (std::size_t k = 0; k < jobs.size(); ++k) {
+        const std::uint32_t rows = jobs[k].w.rows;
+        const std::uint64_t s =
+            std::max<std::uint64_t>(1, (rows * t + total / 2) / total);
+        for (std::uint64_t i = 0; i < s; ++i) {
+            const auto r0 = static_cast<std::uint32_t>(rows * i / s);
+            const auto r1 = static_cast<std::uint32_t>(rows * (i + 1) / s);
+            if (r1 > r0) {
+                slices.push_back({k, r0, r1 - r0});
+            }
+        }
+    }
+    const std::vector<Slice>& sl = slices;
+    sys::ThreadPool::instance().parallel_for(
+        sl.size(), [&](std::size_t i) {
+            const MatvecJob& j = jobs[sl[i].job];
+            const auto mv = f32 ? op.matvec : matvec_kernel(op, j.w);
+            mv(backend::mat_rows(j.w, sl[i].r0, sl[i].n), j.x,
+               j.out.subspan(sl[i].r0, sl[i].n));
+        });
 }
 
 float dsa_index_score(std::span<const float> q,
@@ -660,8 +713,9 @@ void TransformerModel::forward_layers(tok::TokenId token,
 
         apply_norm(ws.x, lay.ffn_norm, hp_.rms_eps, ws.xb);
         if (!lay.is_moe()) {
-            matvec_mt(op, lay.w_gate, ws.xb, ws.gate);
-            matvec_mt(op, lay.w_up, ws.xb, ws.up);
+            const MatvecJob gu[] = {{lay.w_gate, ws.xb, ws.gate},
+                                    {lay.w_up, ws.xb, ws.up}};
+            matvec_mt_group(op, gu);
             silu_mul({ws.gate.data(), hp_.n_ff},
                      {ws.up.data(), hp_.n_ff},
                      {ws.gate.data(), hp_.n_ff});
@@ -1392,8 +1446,9 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
     auto swiglu_into_acc = [&](const Mat& wg, const Mat& wu,
                                const Mat& wd, std::uint32_t ff,
                                float wgt) {
-        matvec_mt(op, wg, ws.xb, {ws.gate.data(), ff});
-        matvec_mt(op, wu, ws.xb, {ws.up.data(), ff});
+        const MatvecJob gu[] = {{wg, ws.xb, {ws.gate.data(), ff}},
+                                {wu, ws.xb, {ws.up.data(), ff}}};
+        matvec_mt_group(op, gu);
         silu_mul({ws.gate.data(), ff}, {ws.up.data(), ff},
                  {ws.gate.data(), ff});
         matvec_mt(op, wd, {ws.gate.data(), ff}, ws.xb2);

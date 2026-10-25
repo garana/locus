@@ -63,10 +63,6 @@ void llama_attention(const TransformerModel& m,
         static_cast<std::size_t>(hp.n_kv_heads) * hd;
     const std::uint32_t group = hp.n_heads / hp.n_kv_heads;
 
-    matvec_mt_f32(op, lay.wq, ws.xb, ws.q);
-    rope_norm(ws.q, hp.n_heads, hd, pos, hp.rope_freq_base,
-              m.rope_factors());
-
     // Quantized KV (DESIGN.md R14): compute this position's K/V into
     // scratch, store it quantized, and dequant the layer's past rows
     // into a transient matrix so the attention math below is
@@ -77,8 +73,12 @@ void llama_attention(const TransformerModel& m,
     std::size_t k_stride = kv_dim;
     if (cache.quantized()) {
         std::vector<float> kbuf(kv_dim), vbuf(kv_dim);
-        matvec_mt_f32(op, lay.wk, ws.xb, kbuf);
-        matvec_mt_f32(op, lay.wv, ws.xb, vbuf);
+        const MatvecJob qkv[] = {{lay.wq, ws.xb, ws.q},
+                                 {lay.wk, ws.xb, kbuf},
+                                 {lay.wv, ws.xb, vbuf}};
+        matvec_mt_group(op, qkv, /*f32=*/true);
+        rope_norm(ws.q, hp.n_heads, hd, pos, hp.rope_freq_base,
+                  m.rope_factors());
         rope_norm(kbuf, hp.n_kv_heads, hd, pos, hp.rope_freq_base,
                   m.rope_factors());
         cache.store_row(seq, l, pos, false, kbuf);
@@ -97,8 +97,12 @@ void llama_attention(const TransformerModel& m,
     } else {
         float* krow = cache.k(seq, l, pos);
         float* vrow = cache.v(seq, l, pos);
-        matvec_mt_f32(op, lay.wk, ws.xb, {krow, kv_dim});
-        matvec_mt_f32(op, lay.wv, ws.xb, {vrow, kv_dim});
+        const MatvecJob qkv[] = {{lay.wq, ws.xb, ws.q},
+                                 {lay.wk, ws.xb, {krow, kv_dim}},
+                                 {lay.wv, ws.xb, {vrow, kv_dim}}};
+        matvec_mt_group(op, qkv, /*f32=*/true);
+        rope_norm(ws.q, hp.n_heads, hd, pos, hp.rope_freq_base,
+                  m.rope_factors());
         rope_norm({krow, kv_dim}, hp.n_kv_heads, hd, pos,
                   hp.rope_freq_base, m.rope_factors());
     }
