@@ -105,6 +105,54 @@ TEST_CASE("neon matvec matches scalar", "[backend]") {
         }
     }
 }
+
+// R16 on NEON: the int8 Q4_K / Q6_K dots are bit-identical to scalar
+// matvec_q8k (ggml's generic order, which the llama.cpp-golden models
+// were validated on); other types delegate to it.
+TEST_CASE("neon q8k matvec matches scalar q8k", "[backend]") {
+    using TT = locus::gguf::TensorType;
+    struct Q {
+        TT type;
+        std::size_t bytes;
+        std::size_t d_off;
+        int dmin_off;
+    };
+    const std::uint32_t rows = 5, cols = 768;  // 3 blocks/row
+    std::mt19937 rng(43);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    for (const Q& q : {Q{TT::kQ4_K, 144, 0, 2}, Q{TT::kQ6_K, 210, 208, -1},
+                       Q{TT::kQ5_K, 176, 0, 2}}) {
+        std::vector<std::byte> w(static_cast<std::size_t>(rows) *
+                                 (cols / 256) * q.bytes);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / q.bytes; ++bl) {
+            std::byte* blk = w.data() + bl * q.bytes;
+            // Per-block scales, so the float steps see varied values.
+            const std::uint16_t d = f32_to_f16(scale_d(rng));
+            const std::uint16_t dmin = f32_to_f16(scale_d(rng));
+            std::memcpy(blk + q.d_off, &d, 2);
+            if (q.dmin_off >= 0) {
+                std::memcpy(blk + q.dmin_off, &dmin, 2);
+            }
+        }
+        Mat m{q.type, w.data(), rows, cols};
+        std::vector<float> a(rows), b(rows);
+        matvec_q8k(m, x, a);
+        matvec_neon_q8k(m, x, b);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            INFO("type " << static_cast<int>(q.type) << " row " << r);
+            REQUIRE(b[r] == a[r]);
+        }
+    }
+}
 #endif
 
 namespace {
