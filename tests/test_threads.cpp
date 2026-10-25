@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 #include <vector>
@@ -6,6 +8,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/model/gqa_attend.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/sys/thread_pool.hpp"
 
@@ -180,4 +183,59 @@ TEST_CASE("matvec_mt_group is bit-identical to one matvec_mt per job",
         }
     }
     unsetenv("LOCUS_THREADS");
+}
+
+TEST_CASE("gqa_attend is bit-identical across thread counts",
+          "[threads]") {
+    // 6 query heads over 2 KV heads (group 3), 37 positions; min_work 0
+    // forces the pool path, LOCUS_THREADS 1 the inline one.
+    constexpr std::uint32_t heads = 6, group = 3, hd = 20, pos = 36;
+    constexpr std::uint32_t kv = heads / group * hd;
+    std::uint32_t s = 99;
+    auto rnd = [&s] {
+        s = s * 1664525u + 1013904223u;
+        return static_cast<float>(s >> 8) / (1u << 24) - 0.5f;
+    };
+    std::vector<float> q(heads * hd), k((pos + 1) * kv), v((pos + 1) * kv);
+    for (auto* vec : {&q, &k, &v}) {
+        for (auto& x : *vec) {
+            x = rnd();
+        }
+    }
+    auto krow = [&](std::uint32_t t) { return k.data() + t * kv; };
+    auto vrow = [&](std::uint32_t t) { return v.data() + t * kv; };
+    auto run = [&](const char* threads) {
+        setenv("LOCUS_THREADS", threads, 1);
+        std::vector<float> out(heads * hd, -1.0f);
+        locus::model::gqa_attend(q.data(), out.data(), heads, hd, group,
+                                 pos, 0.25f, krow, vrow, /*min_work=*/0);
+        return out;
+    };
+    const auto ref = run("1");
+    for (const char* t : {"2", "4", "16"}) {
+        REQUIRE(run(t) == ref);
+    }
+    unsetenv("LOCUS_THREADS");
+    // Head 0 against a direct evaluation of its softmax-weighted sum.
+    std::vector<double> sc(pos + 1);
+    double mx = -1e30, sum = 0.0;
+    for (std::uint32_t t = 0; t <= pos; ++t) {
+        double d = 0.0;
+        for (std::uint32_t i = 0; i < hd; ++i) {
+            d += q[i] * krow(t)[i];
+        }
+        sc[t] = d * 0.25;
+        mx = std::max(mx, sc[t]);
+    }
+    for (auto& x : sc) {
+        x = std::exp(x - mx);
+        sum += x;
+    }
+    for (std::uint32_t i = 0; i < hd; ++i) {
+        double o = 0.0;
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            o += sc[t] / sum * vrow(t)[i];
+        }
+        REQUIRE(ref[i] == Catch::Approx(o).margin(1e-5));
+    }
 }

@@ -85,6 +85,12 @@ void advise_layer_statics(const TransformerModel::Layer& lay) {
  */
 std::size_t mt_slices(std::uint32_t rows) {
     constexpr std::uint32_t kMinRowsPerSlice = 64;
+    return std::min<std::size_t>(mt_fanout(), rows / kMinRowsPerSlice);
+}
+
+}  // namespace
+
+std::size_t mt_fanout() {
     std::size_t t = sys::ThreadPool::instance().parallelism();
     if (const char* env = std::getenv("LOCUS_THREADS")) {
         const long v = std::atol(env);
@@ -93,10 +99,8 @@ std::size_t mt_slices(std::uint32_t rows) {
                 t, static_cast<std::size_t>(v));
         }
     }
-    return std::min<std::size_t>(t, rows / kMinRowsPerSlice);
+    return t;
 }
-
-}  // namespace
 
 /** The backend Ops the model runs with, honoring the R16 opt-in: when
  *  Q8_K-activation mode is off, matvec_q8k is nulled so matvec_mt /

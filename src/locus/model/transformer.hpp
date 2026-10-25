@@ -638,6 +638,12 @@ std::vector<std::pair<std::uint32_t, float>> moe_select(
     std::span<float> router_logits);
 
 /**
+ * @returns How many pool threads model-level parallel loops may use:
+ *     the pool width, capped by LOCUS_THREADS (1 runs inline).
+ */
+std::size_t mt_fanout();
+
+/**
  * Row-split matvec across the R9 thread pool: slices w into row
  * ranges dispatched through the SAME backend kernel into
  * disjoint spans of out, so logits are bit-identical for every

@@ -7,6 +7,7 @@
 
 #include "locus/model/deepseek41.hpp"
 #include "locus/model/gguf_load.hpp"
+#include "locus/model/gqa_attend.hpp"
 
 namespace locus::model {
 
@@ -15,6 +16,7 @@ namespace {
 using namespace load_util;
 using backend::Mat;
 using backend::Ops;
+
 
 // ----------------------------------------------------------------
 // llama (dense or Mixtral-style MoE, GQA attention)
@@ -117,34 +119,8 @@ void llama_attention(const TransformerModel& m,
                      : cache.v(seq, l, t);
     };
 
-    for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
-        const float* qh =
-            ws.q.data() + static_cast<std::size_t>(h) * hd;
-        const std::size_t kvh =
-            static_cast<std::size_t>(h / group) * hd;
-        std::span<float> att(ws.att.data(), pos + 1);
-        for (std::uint32_t t = 0; t <= pos; ++t) {
-            const float* kt = krow_at(t) + kvh;
-            float s = 0.0f;
-            for (std::uint32_t i = 0; i < hd; ++i) {
-                s += qh[i] * kt[i];
-            }
-            att[t] = s * hp.kq_scale;
-        }
-        softmax_inplace(att);
-        float* oh =
-            ws.out.data() + static_cast<std::size_t>(h) * hd;
-        for (std::uint32_t i = 0; i < hd; ++i) {
-            oh[i] = 0.0f;
-        }
-        for (std::uint32_t t = 0; t <= pos; ++t) {
-            const float* vt = vrow_at(t) + kvh;
-            const float a = att[t];
-            for (std::uint32_t i = 0; i < hd; ++i) {
-                oh[i] += a * vt[i];
-            }
-        }
-    }
+    gqa_attend(ws.q.data(), ws.out.data(), hp.n_heads, hd, group, pos,
+               hp.kq_scale, krow_at, vrow_at);
 }
 
 std::uint32_t llama_kv_dim(const Hparams& hp) {
@@ -672,34 +648,8 @@ void qwen2moe_attention(const TransformerModel& m,
                      : cache.v(seq, l, t);
     };
 
-    for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
-        const float* qh =
-            ws.q.data() + static_cast<std::size_t>(h) * hd;
-        const std::size_t kvh =
-            static_cast<std::size_t>(h / group) * hd;
-        std::span<float> att(ws.att.data(), pos + 1);
-        for (std::uint32_t t = 0; t <= pos; ++t) {
-            const float* kt = krow_at(t) + kvh;
-            float s = 0.0f;
-            for (std::uint32_t i = 0; i < hd; ++i) {
-                s += qh[i] * kt[i];
-            }
-            att[t] = s * hp.kq_scale;
-        }
-        softmax_inplace(att);
-        float* oh =
-            ws.out.data() + static_cast<std::size_t>(h) * hd;
-        for (std::uint32_t i = 0; i < hd; ++i) {
-            oh[i] = 0.0f;
-        }
-        for (std::uint32_t t = 0; t <= pos; ++t) {
-            const float* vt = vrow_at(t) + kvh;
-            const float a = att[t];
-            for (std::uint32_t i = 0; i < hd; ++i) {
-                oh[i] += a * vt[i];
-            }
-        }
-    }
+    gqa_attend(ws.q.data(), ws.out.data(), hp.n_heads, hd, group, pos,
+               hp.kq_scale, krow_at, vrow_at);
 }
 
 // ---- qwen3moe (Qwen3 MoE, Qwen3-Coder): GQA with per-head q/k RMS
@@ -820,33 +770,8 @@ void qwen3moe_attention(const TransformerModel& m,
                      : cache.v(seq, l, t);
     };
 
-    for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
-        const float* qh = q.data() + static_cast<std::size_t>(h) * hd;
-        const std::size_t kvh =
-            static_cast<std::size_t>(h / group) * hd;
-        std::span<float> att(ws.att.data(), pos + 1);
-        for (std::uint32_t t = 0; t <= pos; ++t) {
-            const float* kt = krow_at(t) + kvh;
-            float s = 0.0f;
-            for (std::uint32_t i = 0; i < hd; ++i) {
-                s += qh[i] * kt[i];
-            }
-            att[t] = s * hp.kq_scale;
-        }
-        softmax_inplace(att);
-        float* oh =
-            ws.out.data() + static_cast<std::size_t>(h) * hd;
-        for (std::uint32_t i = 0; i < hd; ++i) {
-            oh[i] = 0.0f;
-        }
-        for (std::uint32_t t = 0; t <= pos; ++t) {
-            const float* vt = vrow_at(t) + kvh;
-            const float a = att[t];
-            for (std::uint32_t i = 0; i < hd; ++i) {
-                oh[i] += a * vt[i];
-            }
-        }
-    }
+    gqa_attend(q.data(), ws.out.data(), hp.n_heads, hd, group, pos,
+               hp.kq_scale, krow_at, vrow_at);
 }
 
 // ---- dbrx (Databricks DBRX): GQA with a FUSED qkv projection +
@@ -962,34 +887,8 @@ void dbrx_attention(const TransformerModel& m,
                      : cache.v(seq, l, t);
     };
 
-    for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
-        const float* qh =
-            ws.q.data() + static_cast<std::size_t>(h) * hd;
-        const std::size_t kvh =
-            static_cast<std::size_t>(h / group) * hd;
-        std::span<float> att(ws.att.data(), pos + 1);
-        for (std::uint32_t t = 0; t <= pos; ++t) {
-            const float* kt = krow_at(t) + kvh;
-            float s = 0.0f;
-            for (std::uint32_t i = 0; i < hd; ++i) {
-                s += qh[i] * kt[i];
-            }
-            att[t] = s * hp.kq_scale;
-        }
-        softmax_inplace(att);
-        float* oh =
-            ws.out.data() + static_cast<std::size_t>(h) * hd;
-        for (std::uint32_t i = 0; i < hd; ++i) {
-            oh[i] = 0.0f;
-        }
-        for (std::uint32_t t = 0; t <= pos; ++t) {
-            const float* vt = vrow_at(t) + kvh;
-            const float a = att[t];
-            for (std::uint32_t i = 0; i < hd; ++i) {
-                oh[i] += a * vt[i];
-            }
-        }
-    }
+    gqa_attend(ws.q.data(), ws.out.data(), hp.n_heads, hd, group, pos,
+               hp.kq_scale, krow_at, vrow_at);
 }
 
 // Muse Spark (Meta; muse-spark). GQA attention with a sigmoid output
