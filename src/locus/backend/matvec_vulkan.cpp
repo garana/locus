@@ -1067,11 +1067,17 @@ void rec_attn_decode(State& s, const PagedPool& pp, std::uint32_t n_pos,
                                   a.q2_off,    a.dv,
                                   fbits(a.scale), a.out_stride};
     if (grouped) {
-        // Workgroup y: KV head x chunks of 16 (attn_decode_grp HG).
-        const std::uint32_t chunks = (a.group + 15) / 16;
-        s.ctx.dispatch(
-            pp.f16 ? Kernel::kAttnDecodeGrpF16 : Kernel::kAttnDecodeGrp,
-            bufs, push, blocks, heads / a.group * chunks);
+        // Workgroup y: KV head x chunks of hg heads (attn_decode_grp
+        // HG): 8 for a group that fits, so no duplicate-head lanes.
+        const bool hg8 = a.group <= 8;
+        const std::uint32_t hg = hg8 ? 8 : 16;
+        const std::uint32_t chunks = (a.group + hg - 1) / hg;
+        const Kernel k =
+            hg8 ? (pp.f16 ? Kernel::kAttnDecodeGrp8F16
+                          : Kernel::kAttnDecodeGrp8)
+                : (pp.f16 ? Kernel::kAttnDecodeGrpF16
+                          : Kernel::kAttnDecodeGrp);
+        s.ctx.dispatch(k, bufs, push, blocks, heads / a.group * chunks);
     } else {
         s.ctx.dispatch(
             pp.f16 ? Kernel::kAttnDecodeF16 : Kernel::kAttnDecode, bufs,

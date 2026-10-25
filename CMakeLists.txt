@@ -183,6 +183,8 @@ if(Vulkan_FOUND)
             matmul_paged_t_f16_small=matmul:TYPE_F32,PAGED_T,KV_F16,BK16
             attn_decode_f16=attn_decode:KV_F16
             attn_decode_grp_f16=attn_decode_grp:KV_F16
+            attn_decode_grp8=attn_decode_grp:HG8
+            attn_decode_grp8_f16=attn_decode_grp:HG8,KV_F16
             kv_scatter_f16=kv_scatter:KV_F16
             rmsnorm_b=rmsnorm:BATCHED
             rope_b=rope:BATCHED

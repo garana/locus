@@ -506,9 +506,9 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
     VulkanContext ctx;
     std::mt19937 rng(53);
 
-    // attn_decode_grp.comp: 32 positions x up to 16 heads of one KV
-    // head per workgroup. MLA: one shared latent row, V = its first
-    // dv floats; GQA: K then V rows per KV head.
+    // attn_decode_grp.comp: 32 positions x up to 16 heads (8 in the HG8
+    // build) of one KV head per workgroup. MLA: one shared latent row,
+    // V = its first dv floats; GQA: K then V rows per KV head.
     struct Case {
         const char* name;
         std::uint32_t heads, group, d1, d2, dv, n_pos;
@@ -524,8 +524,11 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
         {"gqa group 8, head dim 128", 16, 8, 128, 0, 128, 45, false},
     };
     for (const Case& c : cases) {
-        for (const bool f16 : {false, true}) {
-            DYNAMIC_SECTION(c.name << (f16 ? " (f16 pool)" : "")) {
+        for (const unsigned v : {0u, 1u, 2u, 3u}) {
+            const bool f16 = (v & 1u) != 0u;
+            const std::uint32_t hg = (v & 2u) != 0u ? 8 : 16;
+            DYNAMIC_SECTION(c.name << (f16 ? " (f16 pool)" : "")
+                                   << " hg " << hg) {
                 const std::uint32_t n_kv = c.heads / c.group;
                 const std::uint32_t dk = c.d1 + c.d2;
                 const std::uint32_t kv_stride = c.mla ? 0 : c.d1;
@@ -595,7 +598,7 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
                     pb = upload(ctx, pool);
                 }
                 const std::uint32_t blocks = (c.n_pos + 31) / 32;
-                const std::uint32_t chunks = (c.group + 15) / 16;
+                const std::uint32_t chunks = (c.group + hg - 1) / hg;
                 auto tb = upload(ctx, table);
                 auto q1b = upload(ctx, q1);
                 auto q2b = upload(ctx, q2);
@@ -610,9 +613,12 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
                     k_off,     v_off,   kv_stride,    c.group,
                     c.d1,      c.d2,    q1_stride,    q2_stride,
                     q2_off,    c.dv,    fbits(scale), c.dv};
-                ctx.dispatch(f16 ? Kernel::kAttnDecodeGrpF16
-                                 : Kernel::kAttnDecodeGrp,
-                             bufs, push, blocks, n_kv * chunks);
+                const Kernel k =
+                    hg == 8 ? (f16 ? Kernel::kAttnDecodeGrp8F16
+                                   : Kernel::kAttnDecodeGrp8)
+                            : (f16 ? Kernel::kAttnDecodeGrpF16
+                                   : Kernel::kAttnDecodeGrp);
+                ctx.dispatch(k, bufs, push, blocks, n_kv * chunks);
                 if (blocks > 1) {
                     const VulkanContext::Buffer cb[] = {partb, ob};
                     const std::uint32_t cp[] = {blocks, c.heads, c.dv,
