@@ -1361,7 +1361,8 @@ matvec throughput.
   this, the hooks that call matvec_mt (deepseek2's MLA, glm-dsa's
   indexer, muse-spark, deepseek41) took Q8_K with the flag off. With
   the Q8_0 dots, Muse Spark's second golden prompt became token-exact
-  against llama.cpp.
+  against llama.cpp on arm64 NEON; x86 SSE4 still tips it on the f32
+  side, so the test stays teacher-forced on every lane.
 
 ## 8. Testing strategy
 
