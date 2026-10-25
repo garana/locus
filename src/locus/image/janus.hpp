@@ -4,6 +4,7 @@
 #include <functional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -72,7 +73,9 @@ class JanusImageGen {
     /**
      * Wraps a text prompt as the reference does (Janus's "deepseek" SFT
      * template, empty system prompt) and tokenizes it: BOS, then
-     * "User: <text>\n\nAssistant:", then begin_of_image().
+     * "User: <text>\n\nAssistant:", then begin_of_image(). The text is
+     * stripped of leading and trailing whitespace first, as Python's
+     * str.strip() does in the reference.
      *
      * @param tok The model's tokenizer (from the same GGUF).
      * @param text The image description.

@@ -45,8 +45,15 @@ TEST_CASE("janus prompt wrapping reproduces the reference ids",
     const auto tok = locus::tok::tokenizer_from_gguf(g);
     const auto gen = locus::image::JanusImageGen::load(
         g, static_cast<std::uint32_t>(*g.get_uint("llama.embedding_length")));
-    REQUIRE(gen.prompt_ids(*tok, "A red apple on a wooden table.") ==
-            std::vector<locus::tok::TokenId>(want.begin(), want.end()));
+    const std::vector<locus::tok::TokenId> ids(want.begin(), want.end());
+    REQUIRE(gen.prompt_ids(*tok, "A red apple on a wooden table.") == ids);
+    // The reference strips the text (str.strip()): ASCII and Unicode
+    // spaces at both ends (U+3000 3 bytes, U+00A0 2 bytes) change
+    // nothing; an inner U+00A0 stays.
+    REQUIRE(gen.prompt_ids(*tok, "\xe3\x80\x80 \tA red apple on a wooden "
+                                 "table.\xc2\xa0\n") == ids);
+    REQUIRE(gen.prompt_ids(*tok, "A red\xc2\xa0" "apple on a wooden table.") !=
+            ids);
 }
 
 // i#226: Janus-Pro text-to-image codes, token-exact against the torch
