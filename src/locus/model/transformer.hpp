@@ -596,6 +596,8 @@ class TransformerModel {
     /** Weights live in a read-only file mapping; gates the
      * LOCUS_WEIGHT_WINDOW DONTNEED policy (see gguf.hpp). */
     bool file_backed_ = false;
+    /** R8 madvise readahead runs per token (see weights_stream). */
+    bool advise_weights_ = false;
     std::span<const float> rope_factors_;
     backend::Mat embd_;
     std::span<const float> out_norm_;
@@ -622,6 +624,18 @@ tok::TokenId argmax(std::span<const float> logits);
 std::vector<std::pair<std::uint32_t, float>> moe_select(
     const Hparams& hp, const TransformerModel::Layer& lay,
     std::span<float> router_logits);
+
+/**
+ * Whether a model's weights are expected to stream from storage while
+ * it runs, which is when the per-token R8 madvise readahead pays: more
+ * than half of RAM, or RAM unknown. A model that fits stays resident
+ * after its first pass, and madvise on resident pages is not free (on
+ * macOS a 3B model's per-layer hints cost ~4.5 ms per token).
+ *
+ * @param weight_bytes Total tensor bytes of the model.
+ * @param ram_bytes Physical RAM (sys::total_ram_bytes(); 0 = unknown).
+ */
+bool weights_stream(std::uint64_t weight_bytes, std::uint64_t ram_bytes);
 
 /**
  * Row-split matvec across the R9 thread pool: slices w into row

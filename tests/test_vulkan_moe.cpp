@@ -586,6 +586,29 @@ TEST_CASE("vulkan fused SwiGLU q4_k experts match the CPU reference",
                      slots);
         ctx.end_batch();
         const auto got = download<float>(ctx, ob, rows * slots);
+        // The unfused GPU chain (q4_k_b gate, q4_k_b up, silu_mul) must
+        // give the same bits: the fused kernel is a separate SPIR-V
+        // module, so a driver could contract a*b+c differently in it.
+        auto og = upload(ctx, std::vector<float>(rows * slots, 0.0f));
+        auto ou = upload(ctx, std::vector<float>(rows * slots, 0.0f));
+        ctx.begin_batch();
+        for (const auto& [w, o] : {std::pair{gb, og}, std::pair{ub, ou}}) {
+            const VulkanContext::Buffer mb[] = {w, xb, o, rb};
+            ctx.dispatch(Kernel::kMatvecQ4_KB, mb, push,
+                         VulkanContext::matvec_groups(Kernel::kMatvecQ4_KB,
+                                                      rows),
+                         slots);
+        }
+        const VulkanContext::Buffer sb[] = {og, ou, og};
+        const std::uint32_t spush[] = {rows * slots};
+        ctx.dispatch(Kernel::kSiluMul, sb, spush,
+                     (rows * slots + 63) / 64);
+        ctx.end_batch();
+        const auto unfused = download<float>(ctx, og, rows * slots);
+        REQUIRE(std::memcmp(got.data(), unfused.data(),
+                            got.size() * sizeof(float)) == 0);
+        ctx.destroy_buffer(og);
+        ctx.destroy_buffer(ou);
         for (std::uint32_t k = 0; k < slots; ++k) {
             const auto g = cpu_row(wg, ids[k], k);
             const auto u = cpu_row(wu, ids[k], k);
