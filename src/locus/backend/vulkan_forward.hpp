@@ -34,6 +34,9 @@ bool vulkan_forward_supported(const model::TransformerModel& m);
  * K/V straight from the GPU-mapped cache pool, recorded as one
  * command batch per token (DESIGN.md M5).
  *
+ * @param row_begin First output-head row to compute.
+ * @param row_end One past the last (0: every row). Logits outside the
+ *     range are left unspecified; TransformerModel::forward sets them.
  * @returns true when it ran (seq advanced, logits filled); false
  *     when unsupported -- weights in types without shaders, or a
  *     cache whose pool is not GPU-mapped -- so the caller falls
@@ -42,7 +45,8 @@ bool vulkan_forward_supported(const model::TransformerModel& m);
 bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     kv::PagedKvCache& cache,
                     kv::PagedKvCache::Seq& seq,
-                    std::span<float> logits);
+                    std::span<float> logits, std::uint32_t row_begin = 0,
+                    std::uint32_t row_end = 0);
 
 /**
  * Runs N tokens of one sequence (a prefill chunk) through the GPU

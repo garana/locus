@@ -1365,7 +1365,8 @@ bool vulkan_forward_supported(const model::TransformerModel& m) {
 bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     kv::PagedKvCache& cache,
                     kv::PagedKvCache::Seq& seq,
-                    std::span<float> logits) {
+                    std::span<float> logits, std::uint32_t row_begin,
+                    std::uint32_t row_end) {
     const auto& hp = m.hparams();
     State& s = state();
     const bool quant = cache.quantized();
@@ -2133,7 +2134,20 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         }
     }
     norm(m.output_norm(), s.x, s.xb, hp.n_embd, 0);
-    rec_matvec(s, m.output_weight(), s.xb, s.logits, 0, false);
+    const Mat& out_w = m.output_weight();
+    if (row_end == 0 || (row_begin == 0 && row_end == out_w.rows)) {
+        rec_matvec(s, out_w, s.xb, s.logits, 0, false);
+    } else {
+        // Only head rows [row_begin, row_end): the same kernel over a
+        // row view of the uploaded weights, written at the same logit
+        // offsets, so each computed row is bit-identical to the full
+        // head's.
+        VulkanContext::Buffer whole = s.upload_w(out_w);
+        rec_matvec(s, mat_rows(out_w, row_begin, row_end - row_begin),
+                   s.xb, s.logits, row_begin, false,
+                   std::uint64_t{row_begin} * mat_row_bytes(out_w), 0, 1.0f,
+                   &whole);
+    }
     s.end_batch();
 
     s.ctx.read_buffer(s.logits, std::as_writable_bytes(logits));
