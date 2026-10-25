@@ -319,7 +319,8 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     hp.rope_freq_base =
         get_float(g, p + "rope.freq_base", 10000.0f);
     spec->load_hparams(g, p, hp);
-    m.q8k_activations_ = hp.q8k_default;
+    m.q8k_activations_ = hp.q8k_default &&
+                         std::getenv("LOCUS_F32_ACTIVATIONS") == nullptr;
 
     const TensorInfo* embd = g.find_tensor("token_embd.weight");
     if (embd == nullptr) {

@@ -1341,9 +1341,9 @@ matvec throughput.
   float; that order flipped muse's greedy tokens on x86 (PR#197).
   Ternary + IQ delegate to scalar. This host is SSE4-only (no
   AVX2/NEON here).
-- NOT the model default -- Q8_K is an OPT-IN mode
-  (TransformerModel::use_q8k_activations, default off). Why not the
-  default: "bit-exact with llama.cpp" is unachievable in principle -- ggml
+- (History: until 2026-10-25 Q8_K was an OPT-IN mode, default off;
+  see the last bullet for the flip.) TransformerModel::
+  use_q8k_activations toggles it. Why it was not the default: "bit-exact with llama.cpp" is unachievable in principle -- ggml
   itself is not bit-exact across its own backends, because the final
   f32 d*Sigma accumulates in an implementation-specific order (SSE4 vs
   AVX2 vs NEON vs CUDA vs generic). Q8_K's lower activation precision
@@ -1384,6 +1384,15 @@ matvec throughput.
   side, so the test stays teacher-forced on every lane. Likewise the
   deepseek41 goldens (prompt 1's third token tips on x86, and on arm64
   since #237's NEON BF16 dot): teacher-forced on every lane.
+- Default ON (2026-10-25, owner decision, #206): with the NEON int8
+  dots (matvec_neon_q8k, bit-identical to scalar matvec_q8k) the Q8
+  path is 1.7x faster than the f32 dot on CPU decode (Orpheus 3B on
+  M4: 24.6 -> 41.5 tok/s), so Hparams::q8k_default is now true for
+  every arch. The f32-activation dot stays as the opt-in reference
+  for exactness checks: LOCUS_F32_ACTIVATIONS=1, or
+  use_q8k_activations(false). Goldens: only qwen2moe tipped (as
+  predicted above, ~token 15); its test pins the f32 path, which
+  still reproduces llama-simple's 32 tokens. No Q8_0 golden moved.
 
 ## 8. Testing strategy
 
