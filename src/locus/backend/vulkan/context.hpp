@@ -101,6 +101,8 @@ enum class Kernel {
     kSnake1d,
     /** Fused routed gate / up / silu over Q4_K experts. */
     kMatvecQ4_KGluB,
+    /** 2D convolution for the image VQ decoder (i#222). */
+    kConv2d,
     kCount_,
 };
 

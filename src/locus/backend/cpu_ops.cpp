@@ -2490,4 +2490,109 @@ void snake1d_mt(std::span<float> x, std::uint32_t ch, std::uint32_t len,
         });
 }
 
+void conv2d(std::span<const float> in, std::uint32_t in_ch,
+            std::uint32_t in_h, std::uint32_t in_w,
+            std::span<const float> weight, std::uint32_t out_ch,
+            std::uint32_t kh, std::uint32_t kw, std::span<const float> bias,
+            std::uint32_t stride, std::uint32_t pad, std::uint32_t groups,
+            std::span<float> out) {
+    assert(groups != 0 && in_ch % groups == 0 && out_ch % groups == 0);
+    const std::uint32_t icg = in_ch / groups;
+    const std::uint32_t ocg = out_ch / groups;
+    const std::uint32_t out_h = conv1d_out_len(in_h, kh, stride, 1, pad);
+    const std::uint32_t out_w = conv1d_out_len(in_w, kw, stride, 1, pad);
+    assert(in.size() == std::size_t{in_ch} * in_h * in_w);
+    assert(weight.size() == std::size_t{out_ch} * icg * kh * kw);
+    assert(bias.empty() || bias.size() == out_ch);
+    assert(out.size() == std::size_t{out_ch} * out_h * out_w);
+    const std::size_t plane = std::size_t{in_h} * in_w;
+    for (std::uint32_t oc = 0; oc < out_ch; ++oc) {
+        const std::uint32_t ic0 = (oc / ocg) * icg;
+        for (std::uint32_t oy = 0; oy < out_h; ++oy) {
+            for (std::uint32_t ox = 0; ox < out_w; ++ox) {
+                float acc = bias.empty() ? 0.0f : bias[oc];
+                for (std::uint32_t ci = 0; ci < icg; ++ci) {
+                    const float* ip = &in[(ic0 + ci) * plane];
+                    const float* wp =
+                        &weight[(std::size_t{oc} * icg + ci) * kh * kw];
+                    for (std::uint32_t ky = 0; ky < kh; ++ky) {
+                        const std::int64_t iy =
+                            std::int64_t{oy} * stride - pad + ky;
+                        if (iy < 0 || iy >= in_h) continue;
+                        for (std::uint32_t kx = 0; kx < kw; ++kx) {
+                            const std::int64_t ix =
+                                std::int64_t{ox} * stride - pad + kx;
+                            if (ix >= 0 && ix < in_w) {
+                                acc += wp[ky * kw + kx] *
+                                       ip[iy * in_w + ix];
+                            }
+                        }
+                    }
+                }
+                out[(std::size_t{oc} * out_h + oy) * out_w + ox] = acc;
+            }
+        }
+    }
+}
+
+void conv2d_mt(std::span<const float> in, std::uint32_t in_ch,
+               std::uint32_t in_h, std::uint32_t in_w,
+               std::span<const float> weight, std::uint32_t out_ch,
+               std::uint32_t kh, std::uint32_t kw,
+               std::span<const float> bias, std::uint32_t stride,
+               std::uint32_t pad, std::uint32_t groups,
+               std::span<float> out) {
+    if (stride != 1) {
+        conv2d(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias, stride,
+               pad, groups, out);
+        return;
+    }
+    assert(groups != 0 && in_ch % groups == 0 && out_ch % groups == 0);
+    const std::uint32_t icg = in_ch / groups;
+    const std::uint32_t ocg = out_ch / groups;
+    const std::uint32_t out_h = conv1d_out_len(in_h, kh, 1, 1, pad);
+    const std::uint32_t out_w = conv1d_out_len(in_w, kw, 1, 1, pad);
+    assert(in.size() == std::size_t{in_ch} * in_h * in_w);
+    assert(weight.size() == std::size_t{out_ch} * icg * kh * kw);
+    assert(bias.empty() || bias.size() == out_ch);
+    assert(out.size() == std::size_t{out_ch} * out_h * out_w);
+    const std::size_t plane = std::size_t{in_h} * in_w;
+    // One (out channel, output row) per item. Per output the terms add
+    // in conv2d's order (bias, then ci, ky, kx, with the same skips), so
+    // the vector loop over ox changes nothing but speed.
+    sys::ThreadPool::instance().parallel_for(
+        std::size_t{out_ch} * out_h, [&](std::size_t item) {
+            const auto oc = static_cast<std::uint32_t>(item / out_h);
+            const auto oy = static_cast<std::int64_t>(item % out_h);
+            float* o = &out[(std::size_t{oc} * out_h + oy) * out_w];
+            const float b = bias.empty() ? 0.0f : bias[oc];
+            for (std::uint32_t ox = 0; ox < out_w; ++ox) o[ox] = b;
+            const std::uint32_t ic0 = (oc / ocg) * icg;
+            for (std::uint32_t ci = 0; ci < icg; ++ci) {
+                const float* ip = &in[(ic0 + ci) * plane];
+                const float* wp =
+                    &weight[(std::size_t{oc} * icg + ci) * kh * kw];
+                for (std::uint32_t ky = 0; ky < kh; ++ky) {
+                    const std::int64_t iy = oy - pad + ky;
+                    if (iy < 0 || iy >= in_h) continue;
+                    const float* irow = ip + iy * in_w;
+                    for (std::uint32_t kx = 0; kx < kw; ++kx) {
+                        const float w = wp[ky * kw + kx];
+                        // Input column ix = ox + shift, valid in
+                        // [0, in_w).
+                        const std::int64_t shift =
+                            static_cast<std::int64_t>(kx) - pad;
+                        const std::int64_t lo = std::max<std::int64_t>(
+                            0, -shift);
+                        const std::int64_t hi = std::min<std::int64_t>(
+                            out_w, static_cast<std::int64_t>(in_w) - shift);
+                        for (std::int64_t ox = lo; ox < hi; ++ox) {
+                            o[ox] += w * irow[ox + shift];
+                        }
+                    }
+                }
+            }
+        });
+}
+
 }  // namespace locus::backend

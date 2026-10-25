@@ -1,5 +1,6 @@
-// The Vulkan conv1d / conv1d_transpose / snake1d shaders against the
-// CPU scalar reference (cpu_ops), the oracle for every backend.
+// The Vulkan conv1d / conv1d_transpose / snake1d / conv2d shaders
+// against the CPU scalar reference (cpu_ops), the oracle for every
+// backend.
 
 #include <bit>
 #include <cstdint>
@@ -179,4 +180,68 @@ TEST_CASE("vulkan snake1d matches the CPU reference", "[vulkan]") {
         REQUIRE(got[i] == Catch::Approx(want[i]).margin(1e-4));
     }
     for (auto b : {xb, ab}) ctx.destroy_buffer(b);
+}
+
+// i#222: conv2d.comp against the scalar reference, on image-decoder
+// shapes (3x3 same and 1x1, a channel count past one workgroup, groups,
+// no bias, stride 2).
+TEST_CASE("vulkan conv2d matches the CPU reference", "[vulkan][conv2d]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(93);
+
+    struct Case {
+        const char* name;
+        std::uint32_t in_ch, in_h, in_w, out_ch, k, stride, pad, groups,
+            has_bias;
+    };
+    const Case cases[] = {
+        {"3x3 same", 8, 17, 23, 12, 3, 1, 1, 1, 1},
+        {"1x1", 70, 9, 11, 5, 1, 1, 0, 1, 1},
+        {"grouped no bias", 6, 12, 12, 6, 3, 1, 1, 3, 0},
+        {"stride 2", 4, 11, 13, 6, 3, 2, 1, 1, 1},
+        // 3 x 1200 x 1200 = 4.32M outputs: a flat grid of 64-wide
+        // groups would need 67,500 > 65535 (Vulkan's guaranteed x
+        // count), as the decoder's 384 x 384 x 128 convs would.
+        {"past the 1-D group limit", 1, 1200, 1200, 3, 3, 1, 1, 1, 1},
+    };
+    for (const auto& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            const std::uint32_t icg = c.in_ch / c.groups;
+            const std::uint32_t oh = locus::backend::conv1d_out_len(
+                c.in_h, c.k, c.stride, 1, c.pad);
+            const std::uint32_t ow = locus::backend::conv1d_out_len(
+                c.in_w, c.k, c.stride, 1, c.pad);
+            auto in = randvec(std::size_t{c.in_ch} * c.in_h * c.in_w, rng);
+            auto w = randvec(std::size_t{c.out_ch} * icg * c.k * c.k, rng);
+            auto bias = randvec(c.out_ch, rng);
+            std::vector<float> want(std::size_t{c.out_ch} * oh * ow);
+            locus::backend::conv2d(
+                in, c.in_ch, c.in_h, c.in_w, w, c.out_ch, c.k, c.k,
+                c.has_bias ? std::span<const float>(bias)
+                           : std::span<const float>{},
+                c.stride, c.pad, c.groups, want);
+            auto ib = upload(ctx, in), wb = upload(ctx, w),
+                 bb = upload(ctx, bias);
+            auto ob = upload(ctx, std::vector<float>(want.size(), 0.0f));
+            ctx.begin_batch();
+            const VulkanContext::Buffer bufs[] = {ib, wb, bb, ob};
+            const std::uint32_t push[] = {c.in_ch,  c.in_h,    c.in_w,
+                                          c.out_ch, oh,        ow,
+                                          c.k,      c.k,       c.stride,
+                                          c.pad,    c.groups,  c.has_bias};
+            // x tiles one output plane in 64s; y is the out channel.
+            ctx.dispatch(Kernel::kConv2d, bufs, push, (oh * ow + 63) / 64,
+                         c.out_ch);
+            ctx.end_batch();
+            auto got = download(ctx, ob, want.size());
+            for (std::size_t i = 0; i < want.size(); ++i) {
+                INFO("element " << i);
+                REQUIRE(got[i] == Catch::Approx(want[i]).margin(1e-4));
+            }
+            for (auto b : {ib, wb, bb, ob}) ctx.destroy_buffer(b);
+        }
+    }
 }
