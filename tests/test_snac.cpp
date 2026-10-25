@@ -472,4 +472,85 @@ TEST_CASE("pcm encode writes a WAV header and clamped s16", "[wav]") {
         s, 24000, locus::audio::WaveFormat::kPcm16);
     REQUIRE(pcm.size() == s.size() * 2);            // no header.
     REQUIRE(le16(pcm, 2) == 32767);                 // same samples.
+
+    // A stream's header: the same fields, unknown-length sizes.
+    const auto hdr = locus::audio::wav_stream_header(24000);
+    REQUIRE(hdr.size() == 44);
+    REQUIRE(std::memcmp(hdr.data(), wav.data(), 4) == 0);         // RIFF
+    REQUIRE(std::memcmp(hdr.data() + 8, wav.data() + 8, 32) == 0);
+    REQUIRE(le32(hdr, 4) == 0xFFFFFFFFu);
+    REQUIRE(le32(hdr, 40) == 0xFFFFFFFFu);
+}
+
+namespace {
+
+/**
+ * Requires that decode_range over every partition of the frames into
+ * runs of `chunk` reassembles decode(codes) bit for bit, for several
+ * chunk sizes (streaming emits such runs).
+ */
+void require_ranges_match(const locus::audio::SnacDecoder& dec,
+                          const locus::model::SnacCodes& codes) {
+    const auto full = dec.decode(codes);
+    const auto F = static_cast<std::uint32_t>(codes.coarse.size());
+    for (const std::uint32_t chunk : {1u, 2u, 3u, 8u, F}) {
+        INFO("chunk " << chunk << " of " << F << " frames");
+        std::vector<float> got;
+        for (std::uint32_t f = 0; f < F; f += chunk) {
+            const auto part =
+                dec.decode_range(codes, f, std::min(F, f + chunk));
+            got.insert(got.end(), part.begin(), part.end());
+        }
+        REQUIRE(got.size() == full.size());
+        REQUIRE(std::memcmp(got.data(), full.data(),
+                            full.size() * sizeof(float)) == 0);
+    }
+}
+
+}  // namespace
+
+// i#173 streaming: a frame range decoded from a window with
+// context_frames() of context on each side equals the same slice of the
+// full decode, and never depends on frames past that context.
+TEST_CASE("snac decode_range is bit-identical to the full decode",
+          "[snac]") {
+    for (const auto& rates : {std::vector<std::uint32_t>{2, 2},
+                              std::vector<std::uint32_t>{4, 2, 2, 2}}) {
+        INFO("rates " << rates.size());
+        const auto img = synth_snac(rates);
+        auto g = locus::gguf::GgufFile::parse(img);
+        const auto dec = locus::audio::SnacDecoder::load(g);
+        const auto codes = synth_codes(30, 1);
+        require_ranges_match(dec, codes);
+
+        // Frames from f1 + ctx on can change without moving [f0, f1).
+        const std::uint32_t ctx = dec.context_frames();
+        const std::uint32_t f0 = 4, f1 = 9;
+        auto changed = codes;
+        for (std::uint32_t f = f1 + ctx; f < 30; ++f) {
+            changed.coarse[f] = (changed.coarse[f] + 1) % 4;
+            for (int k = 0; k < 2; ++k) {
+                changed.mid[2 * f + k] = (changed.mid[2 * f + k] + 3) % 4;
+            }
+            for (int k = 0; k < 4; ++k) {
+                changed.fine[4 * f + k] = (changed.fine[4 * f + k] + 2) % 4;
+            }
+        }
+        REQUIRE(dec.decode_range(changed, f0, f1) ==
+                dec.decode_range(codes, f0, f1));
+        REQUIRE(dec.decode(changed) != dec.decode(codes));
+    }
+}
+
+TEST_CASE("snac decode_range matches the full decode on real speech",
+          "[snac][e2e]") {
+    if (!snac_e2e_inputs({"snac_speech_codes.txt"})) {
+        SKIP("snac GGUF absent; make it with scripts/convert-snac.py");
+    }
+    auto g = locus::gguf::GgufFile::open(snac_gguf_path());
+    const auto dec = locus::audio::SnacDecoder::load(g);
+    REQUIRE(dec.context_frames() == 5);
+    REQUIRE(dec.samples_per_frame() == 2048);
+    require_ranges_match(dec,
+                         read_codes(golden_dir() + "/snac_speech_codes.txt"));
 }

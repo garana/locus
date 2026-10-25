@@ -1273,6 +1273,51 @@ TEST_CASE("audio speech returns a WAV end to end",
     REQUIRE(r->status == 400);
 }
 
+// i#173 streaming: "stream": true sends the audio as a chunked body,
+// frame ranges going out as their lookahead arrives. A 7-frame cap is
+// past the first emit (1 frame once 5 more exist), so the stream has an
+// early range and a final flush. Same seed, same bytes as the buffered
+// response (the decode ranges are bit-exact, test_snac.cpp); a WAV
+// stream differs only in its header's unknown-length sizes.
+TEST_CASE("audio speech streams the same audio as the buffered response",
+          "[server][audio][e2e]") {
+    if (!std::filesystem::exists(orpheus_path()) ||
+        !std::filesystem::exists(snac_path())) {
+        SKIP("orpheus model or snac decoder absent");
+    }
+    AudioServer as(49);  // 7 frames.
+    json req{{"input", "The quick brown fox."}, {"voice", "tara"},
+             {"seed", 9}, {"response_format", "pcm"}};
+    auto buffered = as.post(req);
+    REQUIRE_RES(buffered);
+    REQUIRE(buffered->status == 200);
+    REQUIRE(!buffered->body.empty());
+
+    req["stream"] = true;
+    auto streamed = as.post(req);
+    REQUIRE_RES(streamed);
+    REQUIRE(streamed->status == 200);
+    REQUIRE(streamed->get_header_value("Transfer-Encoding") == "chunked");
+    REQUIRE(streamed->get_header_value("X-Audio-Seed") == "9");
+    REQUIRE(streamed->body == buffered->body);
+
+    req["response_format"] = "wav";
+    auto wav = as.post(req);
+    REQUIRE_RES(wav);
+    REQUIRE(wav->status == 200);
+    REQUIRE(wav->body.size() == 44 + buffered->body.size());
+    REQUIRE(wav->body.substr(0, 4) == "RIFF");
+    REQUIRE(wav->body.substr(4, 4) == std::string(4, '\xFF'));
+    REQUIRE(wav->body.substr(40, 4) == std::string(4, '\xFF'));
+    REQUIRE(wav->body.substr(44) == buffered->body);
+
+    json bad = req;
+    bad["stream"] = "yes";
+    auto r = as.post(bad);
+    REQUIRE_RES(r);
+    REQUIRE(r->status == 400);
+}
+
 // The point of sampling: greedy decoding never ends the utterance and
 // decodes to near-silence (RMS ~0.001), while sampling ends speech on
 // its own with audible output. Takes about 90 s on m2, so it is opt-in.

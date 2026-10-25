@@ -356,7 +356,8 @@ TEST_CASE("avx2 matvec matches scalar", "[backend]") {
 }
 
 // R16 ggml-parity: SSE4 Q8_K-activation dot must equal scalar
-// matvec_q8k bit-for-bit (same host quant, widen-per-lane products).
+// matvec_q8k bit-for-bit (same host quant, same per-lane f32 order),
+// so an x86 greedy run picks the same tokens as the scalar one.
 TEST_CASE("sse4 q8k matvec matches scalar q8k (all k-quants)",
           "[backend]") {
     if (!locus::sys::detect().sse4) {
@@ -401,7 +402,7 @@ TEST_CASE("sse4 q8k matvec matches scalar q8k (all k-quants)",
         matvec_sse4_q8k(m, x, b);
         for (std::uint32_t r = 0; r < rows; ++r) {
             INFO("type " << static_cast<int>(q.type) << " row " << r);
-            REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-4));
+            REQUIRE(b[r] == a[r]);
         }
     }
 }

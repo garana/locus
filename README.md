@@ -75,20 +75,24 @@ under 1e-6 on sampled speech (fixtures from
 scripts/make-snac-goldens.py). Tokens are sampled (defaults
 temperature 0.6, top_p 0.8, repetition_penalty 1.3, each overridable,
 plus seed and max_tokens; the seed used is returned in X-Audio-Seed so
-any utterance can be replayed on the same commit and backend, since
-float order differs across CPU, CUDA and Vulkan); greedy decoding never
-ends the
-utterance on this model and decodes to near-silence (true greedy is
-temperature 0 plus repetition_penalty 1). `--audio-max-tokens N` caps
-a request (default 1024; 7 tokens per 85 ms frame).
+any utterance can be replayed on the same commit, backend and machine
+type, since float rounding differs across them); greedy decoding never
+ends the utterance on this model and decodes to near-silence (true
+greedy is temperature 0 plus repetition_penalty 1).
+`--audio-max-tokens N` caps a request (default 1024; 7 tokens per 85
+ms frame). `"stream": true` returns the same audio as a chunked body,
+each piece sent once the 5 frames (425 ms) after it exist, so playback
+can start early; a streamed WAV header has 0xFFFFFFFF sizes, and the
+token count, stop token and timing headers are not sent.
 `scripts/convert-snac.py --out
 tests/models/snac_24khz_decoder.gguf` makes the SNAC GGUF from the
 torch checkpoint (dev-time: needs torch and network; it checks its own
 weight fold and pins its tested versions and output sha256).
 Speech is still slower than real time on an M2 Pro (i#173): a 3.8 s
-clip takes 70 s on the CPU and 15 s with `--backend vulkan`. The SNAC
-decode takes 0.5 s on threaded CPU kernels, so token generation is
-most of it (22 tokens/s on Vulkan; real time needs about 82). The
+clip takes 67 s on the CPU and 13 to 15 s with `--backend vulkan`,
+where a stream's first audio arrives after 2.8 s. The SNAC decode takes
+0.5 s on threaded CPU kernels, so token generation is most of it (24
+to 27 tokens/s on Vulkan, run to run; real time needs about 82). The
 response's Server-Timing header gives the prefill, generate and decode
 times.
 

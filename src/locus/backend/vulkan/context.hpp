@@ -99,6 +99,8 @@ enum class Kernel {
     kConv1d,
     kConv1dTranspose,
     kSnake1d,
+    /** Fused routed gate / up / silu over Q4_K experts. */
+    kMatvecQ4_KGluB,
     kCount_,
 };
 
