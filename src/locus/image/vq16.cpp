@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
 
@@ -156,7 +157,8 @@ std::vector<float> Vq16Decoder::decode(std::span<const std::int32_t> codes,
         }
         return h;
     };
-    // AttnBlock: single head over the h*w positions, scale c^-0.5.
+    // AttnBlock: single head over the h*w positions, scale c^-0.5,
+    // threaded over the queries.
     auto attention = [&](const Act& x, const std::string& p) {
         Act h = x;
         norm(h, p + ".norm");
@@ -166,8 +168,12 @@ std::vector<float> Vq16Decoder::decode(std::span<const std::int32_t> codes,
         const std::uint32_t n = x.plane(), c = x.ch;
         const float scale = 1.0f / std::sqrt(static_cast<float>(c));
         Act o{std::vector<float>(std::size_t{c} * n, 0.0f), c, x.h, x.w};
-        std::vector<float> wrow(n);
-        for (std::uint32_t i = 0; i < n; ++i) {
+        // One query per item: each writes only its own output column, so
+        // the threads share nothing and the result does not depend on
+        // the thread count.
+        sys::ThreadPool::instance().parallel_for(n, [&](std::size_t qi) {
+            const auto i = static_cast<std::uint32_t>(qi);
+            std::vector<float> wrow(n);
             // Scores of query i over every key j, then softmax over j.
             float mx = -INFINITY;
             for (std::uint32_t j = 0; j < n; ++j) {
@@ -193,7 +199,7 @@ std::vector<float> Vq16Decoder::decode(std::span<const std::int32_t> codes,
                 }
                 o.data[std::size_t{cc} * n + i] = acc * inv;
             }
-        }
+        });
         Act out = conv(o, p + ".proj_out", c, 1);
         add(out, x);
         return out;
