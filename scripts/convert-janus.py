@@ -16,8 +16,9 @@ encoder, the backbone and the image-token heads come from one file.
   codes), plus janus.image_tokens / image_grid / begin_of_image / pad
   / cfg_scale.
 
-Matrices are written as F16 (the checkpoint is bf16) or F32 with
---outtype f32; norms and the janus.* tensors are F32.
+Matrices are written as BF16 by default, the checkpoint's own type,
+so every weight is exact (F16 would round the smallest ones); --outtype
+f16 / f32 are the alternatives. Norms and the janus.* tensors are F32.
 
 Dev-time tool: needs the Janus-Pro snapshot (pytorch_model.bin,
 loaded with torch's weights_only default, tokenizer.json, config.json).
@@ -53,7 +54,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="Janus-Pro snapshot")
     ap.add_argument("--out", required=True, help="output .gguf path")
-    ap.add_argument("--outtype", choices=["f16", "f32"], default="f16")
+    ap.add_argument("--outtype", choices=["bf16", "f16", "f32"],
+                    default="bf16")
     args = ap.parse_args()
     d = pathlib.Path(args.model)
     cfg = json.loads((d / "config.json").read_text())["language_config"]
@@ -71,9 +73,10 @@ def main():
     n_head = cfg["num_attention_heads"]
     n_kv = cfg.get("num_key_value_heads", n_head)
     n_layer = cfg["num_hidden_layers"]
-    big = np.float16 if args.outtype == "f16" else np.float32
+    big = {"bf16": "bf16", "f16": np.float16, "f32": np.float32}[
+        args.outtype]
 
-    from gguf import GGUFWriter, TokenType  # noqa: E402
+    from gguf import GGUFWriter, GGMLQuantizationType, TokenType, quants
     out = GGUFWriter(args.out, "llama")
     out.add_name("Janus-Pro-1B")
     out.add_context_length(cfg["max_position_embeddings"])
@@ -125,7 +128,13 @@ def main():
         return sd[name].detach().float().numpy()
 
     def put(name, arr, dtype):
-        out.add_tensor(name, np.ascontiguousarray(arr.astype(dtype)))
+        if dtype == "bf16":
+            # Exact: the values came from bf16 (bf16 -> f32 -> bf16).
+            raw = quants.quantize(np.ascontiguousarray(arr, np.float32),
+                                  GGMLQuantizationType.BF16)
+            out.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.BF16)
+        else:
+            out.add_tensor(name, np.ascontiguousarray(arr.astype(dtype)))
 
     put("token_embd.weight", t(LM + "model.embed_tokens.weight"), big)
     for i in range(n_layer):

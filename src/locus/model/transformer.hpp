@@ -307,7 +307,10 @@ class TransformerModel {
      *
      * @param token In-vocab token id (used only when layer_begin==0).
      * @param hidden_in Residual stream from the previous stage, n_embd
-     *     floats (used only when layer_begin > 0; may be empty else).
+     *     floats, when layer_begin > 0. At layer_begin == 0 it is empty
+     *     (embed `token`) or an n_embd input embedding used instead of
+     *     the token's row (Janus image tokens; not for arches with their
+     *     own forward).
      * @param layer_begin First layer to run (inclusive).
      * @param layer_end One past the last layer to run.
      * @param out n_vocab floats when layer_end==n_layers, else n_embd.
