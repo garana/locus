@@ -56,6 +56,30 @@ TEST_CASE("neon matvec matches scalar", "[backend]") {
     std::mt19937 rng(11);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
+    SECTION("bf16, with a non-multiple-of-8 tail") {
+        const std::uint32_t rows = 5, cols = 67;  // 8 steps + 3 tail
+        std::vector<std::uint16_t> w(static_cast<std::size_t>(rows) *
+                                     cols);
+        std::vector<float> x(cols);
+        for (auto& v : w) {
+            const float f = dist(rng);
+            std::uint32_t u;
+            std::memcpy(&u, &f, sizeof u);
+            v = static_cast<std::uint16_t>(u >> 16);  // truncate to bf16
+        }
+        for (auto& v : x) {
+            v = dist(rng);
+        }
+        Mat m{locus::gguf::TensorType::kBF16,
+              reinterpret_cast<const std::byte*>(w.data()), rows, cols};
+        std::vector<float> a(rows), b(rows);
+        matvec(m, x, a);
+        matvec_neon(m, x, b);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-4));
+        }
+    }
+
     SECTION("f32, with a non-multiple-of-4 tail") {
         const std::uint32_t rows = 5, cols = 67;
         std::vector<float> w(static_cast<std::size_t>(rows) *
