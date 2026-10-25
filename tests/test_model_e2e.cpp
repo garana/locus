@@ -834,9 +834,9 @@ TEST_CASE("deepseek41 decode matches the reference golden",
         REQUIRE(ids.size() == gd.prompt_tokens);
         // Teacher-forced on every lane: along the reference's
         // continuation each reference token must sit within 0.25 of the
-        // top logit. Greedy decode is token-exact on arm64 NEON, but x86
-        // tips prompt 1's third token (" several" over " a") on the f32
-        // side, as with muse prompt 2.
+        // top logit. Greedy decode tips prompt 1's third token (" several"
+        // over " a") on x86 and, since #237's NEON BF16 dot, on arm64 too,
+        // as with muse prompt 2.
         const auto all = tok->encode(gd.prompt + gd.continuation, true);
         REQUIRE(std::equal(ids.begin(), ids.end(), all.begin()));
         for (std::size_t i = 0; i + 1 < all.size(); ++i) {
@@ -851,22 +851,5 @@ TEST_CASE("deepseek41 decode matches the reference golden",
             }
         }
         cache.release(seq);
-#if defined(__aarch64__)
-        // arm64: also token-exact greedy, from a fresh cache.
-        locus::kv::PagedKvCache::Seq seq2;
-        for (auto id : ids) {
-            REQUIRE(cache.ensure_capacity(seq2, 1));
-            model.forward(id, cache, seq2, ws, logits);
-        }
-        std::vector<locus::tok::TokenId> gen;
-        for (int i = 0; i < 16; ++i) {
-            const auto next = locus::model::argmax(logits);
-            gen.push_back(next);
-            REQUIRE(cache.ensure_capacity(seq2, 1));
-            model.forward(next, cache, seq2, ws, logits);
-        }
-        cache.release(seq2);
-        REQUIRE(tok->decode(gen) == gd.continuation);
-#endif
     }
 }

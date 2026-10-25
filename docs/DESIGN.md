@@ -1363,8 +1363,8 @@ matvec throughput.
   the Q8_0 dots, Muse Spark's second golden prompt became token-exact
   against llama.cpp on arm64 NEON; x86 SSE4 still tips it on the f32
   side, so the test stays teacher-forced on every lane. Likewise the
-  deepseek41 goldens (x86 tips prompt 1's third token): teacher-forced
-  on every lane, plus the exact greedy check on arm64.
+  deepseek41 goldens (prompt 1's third token tips on x86, and on arm64
+  since #237's NEON BF16 dot): teacher-forced on every lane.
 
 ## 8. Testing strategy
 
