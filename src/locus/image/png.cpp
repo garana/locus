@@ -69,7 +69,7 @@ std::vector<std::uint8_t> to_rgb8(std::span<const float> chw,
 }
 
 std::vector<std::byte> encode_png(std::span<const std::uint8_t> rgb,
-                                  std::uint32_t w, std::uint32_t h) {
+                                  std::uint32_t h, std::uint32_t w) {
     if (w == 0 || h == 0 || rgb.size() != std::size_t{w} * h * 3) {
         throw std::invalid_argument("encode_png: need w * h * 3 bytes");
     }

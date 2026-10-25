@@ -33,7 +33,7 @@ TEST_CASE("png encodes RGB with valid CRCs and Adler-32", "[image][png]") {
         INFO(w << " x " << h);
         std::vector<std::uint8_t> rgb(std::size_t{w} * h * 3);
         for (auto& v : rgb) v = static_cast<std::uint8_t>(rng());
-        const auto png = locus::image::encode_png(rgb, w, h);
+        const auto png = locus::image::encode_png(rgb, h, w);
         const auto back = png_test::parse_stored_png(png);
         REQUIRE(back.w == w);
         REQUIRE(back.h == h);
