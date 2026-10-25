@@ -30,7 +30,7 @@ const std::vector<Backend>& list() {
                      "ARM NEON vectorized matvec (F32/Q8_0)",
                      f.neon, true,
                      {.matvec = &matvec_neon,
-                      .matvec_q8k = &matvec_q8k,  // scalar (pi: NEON)
+                      .matvec_q8k = &matvec_neon_q8k,
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_neon}});
 #endif
