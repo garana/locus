@@ -314,6 +314,11 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
     auto g = locus::gguf::GgufFile::open(path);
     REQUIRE(g.get_string("general.architecture") == "qwen2moe");
     auto model = locus::model::TransformerModel::load(g);
+    // Pinned to the f32-activation dot: this golden is llama-simple's
+    // raw greedy, which the f32 path reproduces for all 32 tokens; with
+    // Q8 activations (the R16 default) the argmax tips at ~token 15
+    // (DESIGN.md R16), so the exact string checks the f32 path.
+    model.use_q8k_activations(false);
     auto tok = locus::tok::tokenizer_from_gguf(g);
     const std::string golden =
         "Once upon a time, there was a little girl who loved to "

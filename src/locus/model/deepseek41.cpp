@@ -624,7 +624,6 @@ void load_hparams(const gguf::GgufFile& g, const std::string& p,
     auto& d = hp.ds41;
     hp.arch = Arch::kLlama;
     hp.custom_layer = true;
-    hp.q8k_default = true;  // the goldens are the reference's
     hp.head_dim = need_uint(g, p + "attention.key_length");
     if (g.get_uint(p + "attention.value_length").value_or(hp.head_dim) !=
             hp.head_dim ||
