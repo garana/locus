@@ -3,9 +3,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -172,6 +174,48 @@ TEST_CASE("vq16 decoder matches torch on a synthetic model",
     INFO("max_abs " << max_abs);
     REQUIRE(std::sqrt(ref_sq / ref.size()) > 0.05);  // not a flat output
     REQUIRE(max_abs < 1e-5);
+}
+
+// The real Janus-Pro VQ-16 decoder on the golden image tokens (CFG
+// argmax, scripts/make-janus-goldens.py tokens) against torch's f32
+// decode of the same tokens (`decode`). The bound is i#221's 1e-4:
+// deeper than SNAC, with GroupNorm and softmax in the path.
+TEST_CASE("vq16 decoder matches the reference on Janus-Pro tokens",
+          "[vq16][image][e2e]") {
+    const std::string gguf = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/janus-vq16-decoder.gguf";
+    const std::string golden = std::string(LOCUS_SOURCE_DIR) +
+                               "/tests/golden/";
+    if (!std::filesystem::exists(gguf) ||
+        !std::filesystem::exists(golden + "janus_tokens.txt") ||
+        !std::filesystem::exists(golden + "janus_decode.f32")) {
+        SKIP("vq16 GGUF or Janus goldens absent; see "
+             "scripts/convert-janus-vq16.py");
+    }
+    std::ifstream f(golden + "janus_tokens.txt");
+    std::string line;
+    for (int i = 0; i < 3; ++i) REQUIRE(std::getline(f, line));
+    std::vector<std::int32_t> codes;
+    std::istringstream ls(line);
+    for (std::int32_t v; ls >> v;) codes.push_back(v);
+    REQUIRE(codes.size() == 576);
+
+    auto g = locus::gguf::GgufFile::open(gguf);
+    const auto dec = locus::image::Vq16Decoder::load(g);
+    REQUIRE(dec.upscale() == 16);
+    const auto got = dec.decode(codes, 24, 24);
+    const auto ref = read_f32(golden + "janus_decode.f32");
+    REQUIRE(got.size() == std::size_t{3} * 384 * 384);
+    REQUIRE(ref.size() == got.size());
+    double max_abs = 0.0, sum_sq = 0.0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        const double d = std::abs(double(got[i]) - double(ref[i]));
+        max_abs = std::max(max_abs, d);
+        sum_sq += d * d;
+    }
+    INFO("max_abs " << max_abs << " rms "
+                    << std::sqrt(sum_sq / got.size()));
+    REQUIRE(max_abs < 1e-4);
 }
 
 TEST_CASE("vq16 decoder rejects layouts and codes it does not run",

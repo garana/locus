@@ -24,7 +24,18 @@ SRC is a checkout of github.com/deepseek-ai/Janus and DIR the
 deepseek-ai/Janus-Pro-1B snapshot (pytorch_model.bin, loaded with
 torch's weights_only default). Tested with Python 3.10, torch 2.14.1,
 transformers 4.47.1, numpy 2.2.6, Janus commit 1daa72f, Janus-Pro-1B
-revision 960ab33191f61342a4c60ae74d8dc356a39fafcb.
+revision 960ab33191f61342a4c60ae74d8dc356a39fafcb. With those, the
+outputs' sha256 (on an M2 Pro, CPU):
+
+  janus_tokens.txt
+    360d135a15e24bcf3853ef1316556917a2c950c55c413c8ce3dc09d03a129d55
+  janus_decode.f32
+    6eb8a8a315141546007f61f4158a8e8c1e9ba6d6c3fadcad1106af4bd543095b
+  janus_decode.png
+    4b786def5918794634836cb8d1024bd7fa398874c861bb3df359cd96efee2628
+
+The tokens are an f32 CPU argmax, so another machine can tip a near
+tie; regenerate there and compare before trusting a mismatch.
 """
 import argparse
 import pathlib
