@@ -214,6 +214,7 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "conv1d_spv.h"
 #include "conv1d_transpose_spv.h"
 #include "snake1d_spv.h"
+#include "conv2d_spv.h"
 
 namespace locus::backend::vk {
 
@@ -479,6 +480,8 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_snake1d_spv), 2, 12},
     {Kernel::kMatvecQ4_KGluB, "matvec_q4_k_glu_b",
      locus_matvec_q4_k_glu_b_spv, sizeof(locus_matvec_q4_k_glu_b_spv), 5, 52},
+    {Kernel::kConv2d, "conv2d", locus_conv2d_spv, sizeof(locus_conv2d_spv),
+     4, 48},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

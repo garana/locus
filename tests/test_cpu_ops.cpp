@@ -1180,6 +1180,88 @@ TEST_CASE("snake1d_mt is bit-identical to snake1d", "[ops][conv1d]") {
                         ref.size() * sizeof(float)) == 0);
 }
 
+// i#222: the scalar conv2d is the oracle for every other variant, so
+// it is pinned against hand-computed values first.
+TEST_CASE("conv2d matches a hand-computed 3x3 same-padded case",
+          "[ops][conv2d]") {
+    // One 3x3 input channel, one 3x3 all-ones filter, padding 1: each
+    // output is the sum of the input's in-bounds 3x3 neighbourhood.
+    const std::vector<float> in = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    const std::vector<float> w(9, 1.0f);
+    const std::vector<float> bias = {0.5f};
+    std::vector<float> out(9);
+    locus::backend::conv2d(in, 1, 3, 3, w, 1, 3, 3, bias, 1, 1, 1, out);
+    const std::vector<float> want = {12.5f, 21.5f, 16.5f, 27.5f, 45.5f,
+                                     33.5f, 24.5f, 39.5f, 28.5f};
+    REQUIRE(out == want);
+
+    // Stride 2, no padding, 2 groups of 1 in / 1 out channel, 2x2
+    // filters (+1 and -1): each group reads only its own channel.
+    // 2 channels of 3 rows x 4 columns.
+    const std::vector<float> in2 = {1,  2,  3,  4,   // channel 0
+                                    5,  6,  7,  8,
+                                    9,  10, 11, 12,
+                                    13, 14, 15, 16,  // channel 1
+                                    0,  0,  0,  0,
+                                    1,  1,  1,  1};
+    const std::vector<float> w2 = {1, 1, 1, 1, -1, -1, -1, -1};
+    std::vector<float> out2(2 * 1 * 2);  // out 1 x 2 (k2, s2, no pad)
+    locus::backend::conv2d(in2, 2, 3, 4, w2, 2, 2, 2, {}, 2, 0, 2, out2);
+    // Channel 0, rows 0-1: windows {1,2,5,6} = 14 and {3,4,7,8} = 22.
+    // Channel 1, rows 0-1: -(13+14+0+0) and -(15+16+0+0).
+    REQUIRE(out2 == std::vector<float>{14, 22, -27, -31});
+}
+
+// The threaded conv2d sums each output in the reference's order, so it
+// must match bit for bit: memcmp, over decoder-shaped cases (3x3 and
+// 1x1, padding on every edge, odd sizes, groups, no bias) and the
+// stride-2 fallback.
+TEST_CASE("conv2d_mt is bit-identical to conv2d", "[ops][conv2d]") {
+    std::mt19937 rng(23);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    auto fill = [&](std::size_t n) {
+        std::vector<float> v(n);
+        for (auto& x : v) x = d(rng);
+        return v;
+    };
+    struct C {
+        std::uint32_t in_ch, in_h, in_w, out_ch, k, stride, pad, groups;
+        bool bias;
+    };
+    const C cases[] = {
+        {8, 17, 23, 12, 3, 1, 1, 1, true},   // 3x3 same
+        {16, 9, 31, 8, 1, 1, 0, 1, true},    // 1x1
+        {6, 12, 12, 6, 3, 1, 1, 3, false},   // grouped, no bias
+        {4, 5, 7, 4, 3, 1, 0, 1, true},      // valid (no padding)
+        {3, 40, 40, 5, 3, 1, 2, 1, true},    // padding wider than 1
+        {4, 11, 13, 6, 3, 2, 1, 1, true},    // stride 2 (fallback)
+    };
+    for (const auto& c : cases) {
+        INFO("in " << c.in_ch << "x" << c.in_h << "x" << c.in_w
+                   << " out_ch " << c.out_ch << " k " << c.k << " s "
+                   << c.stride << " p " << c.pad << " g " << c.groups);
+        const auto in = fill(std::size_t{c.in_ch} * c.in_h * c.in_w);
+        const auto w =
+            fill(std::size_t{c.out_ch} * (c.in_ch / c.groups) * c.k * c.k);
+        const auto bias = c.bias ? fill(c.out_ch) : std::vector<float>{};
+        const std::uint32_t oh = locus::backend::conv1d_out_len(
+            c.in_h, c.k, c.stride, 1, c.pad);
+        const std::uint32_t ow = locus::backend::conv1d_out_len(
+            c.in_w, c.k, c.stride, 1, c.pad);
+        std::vector<float> ref(std::size_t{c.out_ch} * oh * ow, 0.0f);
+        std::vector<float> got(ref.size(), -1.0f);
+        locus::backend::conv2d(in, c.in_ch, c.in_h, c.in_w, w, c.out_ch,
+                               c.k, c.k, bias, c.stride, c.pad, c.groups,
+                               ref);
+        locus::backend::conv2d_mt(in, c.in_ch, c.in_h, c.in_w, w,
+                                  c.out_ch, c.k, c.k, bias, c.stride,
+                                  c.pad, c.groups, got);
+        REQUIRE(!ref.empty());
+        REQUIRE(std::memcmp(ref.data(), got.data(),
+                            ref.size() * sizeof(float)) == 0);
+    }
+}
+
 TEST_CASE("conv1d_cuda matches the scalar reference", "[conv1d][cuda]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
