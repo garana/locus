@@ -86,3 +86,15 @@ TEST_CASE("matvec_mt is bit-identical to the plain matvec",
     locus::model::matvec_mt(op, m, x, got);
     REQUIRE(got == ref);
 }
+
+TEST_CASE("weights_stream: madvise readahead only for models that "
+          "may not stay resident",
+          "[threads]") {
+    using locus::model::weights_stream;
+    constexpr std::uint64_t gib = 1ull << 30;
+    REQUIRE_FALSE(weights_stream(2 * gib, 36 * gib));  // 3B on 36 GB
+    REQUIRE_FALSE(weights_stream(18 * gib, 36 * gib));  // exactly half
+    REQUIRE(weights_stream(19 * gib, 36 * gib));
+    REQUIRE(weights_stream(250 * gib, 36 * gib));  // GLM-class stream
+    REQUIRE(weights_stream(1, 0));  // RAM unknown: keep the old default
+}
