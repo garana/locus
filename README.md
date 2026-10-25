@@ -89,12 +89,15 @@ tests/models/snac_24khz_decoder.gguf` makes the SNAC GGUF from the
 torch checkpoint (dev-time: needs torch and network; it checks its own
 weight fold and pins its tested versions and output sha256).
 Speech is still slower than real time on an M2 Pro (i#173): a 3.8 s
-clip takes 67 s on the CPU and 13 to 15 s with `--backend vulkan`,
-where a stream's first audio arrives after 2.8 s. The SNAC decode takes
-0.5 s on threaded CPU kernels, so token generation is most of it (24
-to 27 tokens/s on Vulkan, run to run; real time needs about 82). The
-response's Server-Timing header gives the prefill, generate and decode
-times.
+clip takes about 39 s on the CPU and 12 s with `--backend vulkan`,
+where a stream's first audio arrives after 1.7 s (3.6 s on the first
+request after start, which sets up the GPU pipelines). Only the head
+rows of Orpheus's own tokens (the stop and marker ids and the 7 code
+bands, 18% of the 157k vocab) are computed; other tokens cannot be
+sampled. The SNAC decode takes 0.5 s on threaded CPU kernels, so token
+generation is most of it (about 30 tokens/s on Vulkan; real time needs
+about 82). The response's Server-Timing header gives the prefill,
+generate and decode times.
 
 ## Building
 

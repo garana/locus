@@ -138,6 +138,18 @@ struct Hparams {
 };
 
 /**
+ * Output-head rows a forward computes: logits [begin, end) only, the
+ * rest -inf. The default (end 0) is every row. A caller that can only
+ * sample a known token range (speech: the audio band) skips the rest of
+ * the head, which for a large vocabulary is a big share of the weights
+ * read per token.
+ */
+struct LogitRows {
+    std::uint32_t begin = 0;
+    std::uint32_t end = 0;  ///< one past the last row; 0 = all rows
+};
+
+/**
  * Llama-family runtime over the scalar CPU backend, reading and
  * writing KV state through the paged cache so any number of
  * sequences can interleave (DESIGN.md M2/M3). Weights stay in the
@@ -260,11 +272,14 @@ class TransformerModel {
      * @param cache Cache the sequence lives in; capacity for one
      *     more position must already be ensured.
      * @param logits Out; n_vocab floats.
-     * @throws std::invalid_argument on vocab/context misuse.
+     * @param rows Head rows to compute; logits outside them are -inf
+     *     on every backend (default: all rows).
+     * @throws std::invalid_argument on vocab/context misuse or a bad
+     *     row range.
      */
     void forward(tok::TokenId token, kv::PagedKvCache& cache,
                  kv::PagedKvCache::Seq& seq, Workspace& ws,
-                 std::span<float> logits) const;
+                 std::span<float> logits, LogitRows rows = {}) const;
 
     /**
      * Runs the transformer layers [layer_begin, layer_end) for one
@@ -296,6 +311,8 @@ class TransformerModel {
      * @param layer_begin First layer to run (inclusive).
      * @param layer_end One past the last layer to run.
      * @param out n_vocab floats when layer_end==n_layers, else n_embd.
+     * @param rows Head rows the last stage computes (see forward());
+     *     here only a hint: rows outside it are left unspecified.
      * @throws std::invalid_argument on a bad range, vocab/context
      *     misuse, or wrong hidden_in / out size.
      */
@@ -304,7 +321,7 @@ class TransformerModel {
                         std::uint32_t layer_begin,
                         std::uint32_t layer_end, kv::PagedKvCache& cache,
                         kv::PagedKvCache::Seq& seq, Workspace& ws,
-                        std::span<float> out) const;
+                        std::span<float> out, LogitRows rows = {}) const;
 
     /**
      * Computes a sentence embedding for `tokens`: runs them through

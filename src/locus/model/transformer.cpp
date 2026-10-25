@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -533,20 +534,33 @@ void TransformerModel::scale_logits(std::span<float> logits) const {
 void TransformerModel::forward(tok::TokenId token,
                          kv::PagedKvCache& cache,
                          kv::PagedKvCache::Seq& seq, Workspace& ws,
-                         std::span<float> logits) const {
+                         std::span<float> logits, LogitRows rows) const {
     using namespace locus::backend;
 
     if (token < 0 ||
         static_cast<std::uint32_t>(token) >= hp_.n_vocab) {
         throw std::invalid_argument("token id out of vocab");
     }
-    if (backend_->name == "vulkan" &&
-        vulkan_forward(*this, token, cache, seq, logits)) {
-        return;
+    if (rows.end == 0) {
+        rows = {0, hp_.n_vocab};
     }
-    // The whole stack is the [0, n_layers) slice. forward_layers holds
-    // the one shared implementation; pipeline stages run sub-ranges.
-    forward_layers(token, {}, 0, hp_.n_layers, cache, seq, ws, logits);
+    if (rows.begin >= rows.end || rows.end > hp_.n_vocab) {
+        throw std::invalid_argument("forward: bad logit row range");
+    }
+    if (!(backend_->name == "vulkan" &&
+          vulkan_forward(*this, token, cache, seq, logits, rows.begin,
+                         rows.end))) {
+        // The whole stack is the [0, n_layers) slice. forward_layers
+        // holds the one shared implementation; pipeline stages run
+        // sub-ranges.
+        forward_layers(token, {}, 0, hp_.n_layers, cache, seq, ws, logits,
+                       rows);
+    }
+    // Rows outside the range are -inf on every path, whether or not the
+    // path skipped them (an arch hook may compute the whole head).
+    const float ninf = -std::numeric_limits<float>::infinity();
+    std::fill(logits.begin(), logits.begin() + rows.begin, ninf);
+    std::fill(logits.begin() + rows.end, logits.begin() + hp_.n_vocab, ninf);
 }
 
 void TransformerModel::forward_layers(tok::TokenId token,
@@ -555,7 +569,8 @@ void TransformerModel::forward_layers(tok::TokenId token,
                                 std::uint32_t layer_end,
                                 kv::PagedKvCache& cache,
                                 kv::PagedKvCache::Seq& seq, Workspace& ws,
-                                std::span<float> out) const {
+                                std::span<float> out,
+                                LogitRows rows) const {
     using namespace locus::backend;
 
     if (layer_begin > layer_end || layer_end > hp_.n_layers) {
@@ -688,7 +703,13 @@ void TransformerModel::forward_layers(tok::TokenId token,
         // Final stage: normalize and project to logits, and only now
         // consume the token (advance the sequence).
         apply_norm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
-        matvec_mt(op, out_w_, ws.xb, out);
+        if (rows.end == 0 || (rows.begin == 0 && rows.end == hp_.n_vocab)) {
+            matvec_mt(op, out_w_, ws.xb, out);
+        } else {
+            // Only the requested head rows (e.g. speech's audio band).
+            matvec_mt(op, mat_rows(out_w_, rows.begin, rows.end - rows.begin),
+                      ws.xb, out.subspan(rows.begin, rows.end - rows.begin));
+        }
         scale_logits(out);
         seq.n_tokens = pos + 1;
     } else {

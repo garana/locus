@@ -189,6 +189,9 @@ class OpenAiServer {
     // decode runs on a serialized dedicated cache, like embeddings.
     std::unique_ptr<audio::SnacDecoder> snac_;
     tok::TokenId audio_band_base_ = -1;
+    /** Head rows speech samples from (Orpheus's own tokens); all rows
+     * when the vocab is not laid out as expected. */
+    model::LogitRows audio_rows_;
     std::mutex audio_mu_;
     std::unique_ptr<kv::PagedKvCache> audio_cache_;
     model::TransformerModel::Workspace audio_ws_;

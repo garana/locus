@@ -365,4 +365,37 @@ void conv2d_mt(std::span<const float> in, std::uint32_t in_ch,
                std::uint32_t pad, std::uint32_t groups,
                std::span<float> out);
 
+/**
+ * GroupNorm in place (F32), as torch.nn.GroupNorm: `x` is [ch][plane];
+ * channels are split into `groups` equal groups, each normalised over
+ * all its channels' elements with the biased variance, then scaled per
+ * channel: y = (x - mean) / sqrt(var + eps) * gamma[c] + beta[c]. The
+ * mean and variance are accumulated in double.
+ *
+ * @param x Activations, ch * plane floats, normalised in place.
+ * @param ch Channels (a multiple of groups).
+ * @param plane Elements per channel (H * W for an image).
+ * @param groups Channel groups.
+ * @param gamma Per-channel scale (ch).
+ * @param beta Per-channel shift (ch).
+ * @param eps Added to the variance.
+ */
+void group_norm(std::span<float> x, std::uint32_t ch, std::uint32_t plane,
+                std::uint32_t groups, std::span<const float> gamma,
+                std::span<const float> beta, float eps);
+
+/** SiLU / Swish in place: x = x * sigmoid(x) = x / (1 + exp(-x)). */
+void silu(std::span<float> x);
+
+/**
+ * Nearest-neighbour 2x upsample (torch F.interpolate, scale 2,
+ * "nearest"): out[c][y][x] = in[c][y / 2][x / 2].
+ *
+ * @param in [ch][h][w].
+ * @param out [ch][2h][2w].
+ */
+void upsample_nearest2x(std::span<const float> in, std::uint32_t ch,
+                        std::uint32_t h, std::uint32_t w,
+                        std::span<float> out);
+
 }  // namespace locus::backend
