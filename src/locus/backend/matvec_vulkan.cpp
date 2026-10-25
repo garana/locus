@@ -2023,6 +2023,24 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                                VulkanContext::matvec_groups(
                                    Kernel::kMatvecQ8_0GluB, ff),
                                k_used);
+            } else if (g.type == gguf::TensorType::kQ4_K &&
+                       u.type == gguf::TensorType::kQ4_K &&
+                       lay.gate_exps.expert_bytes ==
+                           lay.up_exps.expert_bytes) {
+                // The same fusion over Q4_K experts (matvec_q4_k_glu_b):
+                // one dispatch, the activations read once.
+                const VulkanContext::Buffer bufs[] = {
+                    s.upload_experts(lay.gate_exps, hp.n_expert), s.xb,
+                    s.gate, s.route,
+                    s.upload_experts(lay.up_exps, hp.n_expert)};
+                const std::uint32_t push[] = {
+                    ff, g.cols, 0, 0, 0, 0, fbits(1.0f),
+                    w_off_units(g, lay.gate_exps.expert_bytes), 0, ff,
+                    k_used, kRouteIds, 0};
+                s.ctx.dispatch(Kernel::kMatvecQ4_KGluB, bufs, push,
+                               VulkanContext::matvec_groups(
+                                   Kernel::kMatvecQ4_KGluB, ff),
+                               k_used);
             } else {
                 rec_matvec_b(s, g,
                              s.upload_experts(lay.gate_exps, hp.n_expert),

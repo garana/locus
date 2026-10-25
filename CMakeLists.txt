@@ -191,6 +191,7 @@ if(Vulkan_FOUND)
             rope_neox_b=rope:BATCHED,NEOX
             matvec_q4_k_b=matvec_q4_k:BATCHED
             matvec_q6_k_b=matvec_q6_k:BATCHED
+            matvec_q4_k_glu_b=matvec_q4_k:BATCHED,SWIGLU
             matmul_q4_k=matmul:TYPE_Q4K
             matmul_q6_k=matmul:TYPE_Q6K
             matmul_q4_k_id=matmul:TYPE_Q4K,MOE_ID

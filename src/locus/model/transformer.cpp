@@ -11,6 +11,7 @@
 #include "locus/model/arch.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/model/gguf_load.hpp"
+#include "locus/sys/features.hpp"
 #include "locus/sys/thread_pool.hpp"
 
 namespace locus::model {
@@ -82,15 +83,23 @@ void advise_layer_statics(const TransformerModel::Layer& lay) {
  * thread-pool width, capped by LOCUS_THREADS and by keeping at
  * least kMinRowsPerSlice rows per slice so dispatch overhead never
  * dominates. Returns <= 1 when the work should run inline.
+ *
+ * Without LOCUS_THREADS, a heterogeneous CPU defaults to its
+ * performance-core count: the slices are equal, so one landing on an
+ * efficiency core finishes last and the whole matvec waits for it
+ * (M4 Max Orpheus decode: 14 slices 19.7 tok/s, 10 slices 22.0).
  */
 std::size_t mt_slices(std::uint32_t rows) {
     constexpr std::uint32_t kMinRowsPerSlice = 64;
-    std::size_t t = sys::ThreadPool::instance().parallelism();
+    const std::size_t pool = sys::ThreadPool::instance().parallelism();
+    static const unsigned pcores = sys::performance_cores();
+    std::size_t t =
+        pcores > 0 ? std::min<std::size_t>(pool, pcores) : pool;
     if (const char* env = std::getenv("LOCUS_THREADS")) {
         const long v = std::atol(env);
         if (v >= 1) {
             t = std::min<std::size_t>(
-                t, static_cast<std::size_t>(v));
+                pool, static_cast<std::size_t>(v));
         }
     }
     return std::min<std::size_t>(t, rows / kMinRowsPerSlice);
