@@ -45,6 +45,34 @@ float dot_f32_neon(const float* w, const float* x,
     return s;
 }
 
+/**
+ * BF16 row . f32 x. A bf16 is the top half of an f32, so a 16-bit left
+ * shift widens it exactly; the products go into two 4-lane FMA chains
+ * (8 weights per step), summed at the end, so the order differs from
+ * the scalar dot's single chain (agrees to float rounding).
+ */
+float dot_bf16_neon(const std::uint16_t* w, const float* x,
+                    std::size_t n) {
+    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const uint16x8_t v = vld1q_u16(w + i);
+        a0 = vfmaq_f32(a0,
+                       vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v), 16)),
+                       vld1q_f32(x + i));
+        a1 = vfmaq_f32(a1, vreinterpretq_f32_u32(vshll_high_n_u16(v, 16)),
+                       vld1q_f32(x + i + 4));
+    }
+    float s = vaddvq_f32(vaddq_f32(a0, a1));
+    for (; i < n; ++i) {
+        const std::uint32_t u = static_cast<std::uint32_t>(w[i]) << 16;
+        float f;
+        std::memcpy(&f, &u, sizeof f);
+        s += f * x[i];
+    }
+    return s;
+}
+
 /** One Q8_0 block: f16 scale + 32 int8 quants (34 bytes). */
 float dot_q8_0_block_neon(const std::byte* blk, const float* x) {
     const float d = half_to_float(load_u16(blk));
@@ -462,6 +490,15 @@ void matvec_neon(const Mat& w, std::span<const float> x,
             out[r] = dot_f32_neon(
                 rows + static_cast<std::size_t>(r) * w.cols,
                 x.data(), w.cols);
+        }
+        return;
+    }
+    if (w.type == gguf::TensorType::kBF16) {
+        const auto* rows = reinterpret_cast<const std::uint16_t*>(w.data);
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            out[r] = dot_bf16_neon(
+                rows + static_cast<std::size_t>(r) * w.cols, x.data(),
+                w.cols);
         }
         return;
     }
