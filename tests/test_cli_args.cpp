@@ -33,6 +33,24 @@ TEST_CASE("--ctx caps the KV pool from the command line",
     REQUIRE(c.ctx == 0);  // default: model-derived pool
 }
 
+TEST_CASE("--image-decoder takes the VQ-16 decoder path", "[cli]") {
+    std::array<const char*, 4> argv1 = {"prog", "--image-decoder",
+                                        "vq.gguf", "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()),
+        const_cast<char**>(argv1.data()));
+    REQUIRE(a.image_decoder == "vq.gguf");
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+
+    std::array<const char*, 3> argv2 = {"prog", "--image-decoder=v2.gguf",
+                                        "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()),
+        const_cast<char**>(argv2.data()));
+    REQUIRE(b.image_decoder == "v2.gguf");
+    REQUIRE(b.positional == std::vector<std::string>{"m.gguf"});
+}
+
 TEST_CASE("--audio-max-tokens sets the speech token cap", "[cli]") {
     std::array<const char*, 4> argv1 = {"prog", "--audio-max-tokens",
                                         "350", "m.gguf"};

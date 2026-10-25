@@ -187,6 +187,9 @@ inline constexpr const char* kCommonHelp =
     "  --audio-max-tokens N locus-server: cap one /v1/audio/speech\n"
     "                   request at N audio tokens (7 per 85 ms\n"
     "                   frame; default 1024)\n"
+    "  --image-decoder P locus-server: enable /v1/images/generations\n"
+    "                   (Janus-Pro models) with the VQ-16 decoder\n"
+    "                   GGUF at path P\n"
     "  --prefill-f16    Vulkan: stage prefill matmul operands in\n"
     "                   f16 (faster prompt ingestion; opt-in, the\n"
     "                   f32 default is exact)\n"
@@ -256,6 +259,10 @@ struct BackendArgs {
     /** From --audio-max-tokens N: per-request audio-token cap for
      * /v1/audio/speech (0 = the server default). */
     std::uint32_t audio_max_tokens = 0;
+    /** From --image-decoder P: path to the VQ-16 decoder GGUF (arch
+     * "vq16") enabling locus-server's /v1/images/generations; empty =
+     * the endpoint is disabled (503). */
+    std::string image_decoder;
     /** From --concurrent N: submit the prompt N times and report
      * aggregate throughput (bench mode; default 1 = normal run). */
     std::uint32_t concurrent = 1;
@@ -366,6 +373,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         } else if (a.rfind("--audio-max-tokens=", 0) == 0) {
             number("--audio-max-tokens", std::string(a.substr(19)),
                    out.audio_max_tokens);
+        } else if (a == "--image-decoder" && i + 1 < argc) {
+            out.image_decoder = argv[++i];
+        } else if (a.rfind("--image-decoder=", 0) == 0) {
+            out.image_decoder = std::string(a.substr(16));
         } else if (a == "--concurrent" && i + 1 < argc) {
             number("--concurrent", argv[++i], out.concurrent);
         } else if (a.rfind("--concurrent=", 0) == 0) {

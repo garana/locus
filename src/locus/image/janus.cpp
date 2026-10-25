@@ -128,6 +128,16 @@ void JanusImageGen::image_logits(std::span<const float> h,
     for (std::uint32_t i = 0; i < codes_; ++i) out[i] += ob[i];
 }
 
+std::vector<tok::TokenId> JanusImageGen::prompt_ids(
+    const tok::Tokenizer& tok, std::string_view text) const {
+    // The tag is appended as its id: the reference's text ends in
+    // "<begin_of_image>", which its tokenizer maps to this one id.
+    auto ids = tok.encode("User: " + std::string(text) + "\n\nAssistant:",
+                          true);
+    ids.push_back(begin_of_image_);
+    return ids;
+}
+
 std::vector<tok::TokenId> JanusImageGen::unconditional(
     std::span<const tok::TokenId> prompt) const {
     std::vector<tok::TokenId> u(prompt.begin(), prompt.end());
