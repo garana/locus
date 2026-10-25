@@ -59,6 +59,7 @@ add_executable(locus_tests
     test_vulkan_prefill.cpp
     test_vulkan_mem_fit.cpp
     test_vulkan_limits.cpp
+    test_vulkan_rope.cpp
     test_vulkan_oob.cpp
     test_q8_layout.cpp
     test_vulkan_reset.cpp
