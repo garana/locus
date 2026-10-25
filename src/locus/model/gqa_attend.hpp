@@ -20,6 +20,10 @@ namespace locus::model {
  * work is large enough; each head's arithmetic is the same either way
  * (bit-identical for every thread count).
  *
+ * Call it from the forward's own thread, never from inside a pool task:
+ * the pool runs one parallel_for at a time, so a nested one would wait
+ * on itself.
+ *
  * @param krow_at Position t -> its key row (all KV heads).
  * @param vrow_at Position t -> its value row.
  * @param min_work Multiply-adds below which the heads run inline (a
