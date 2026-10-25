@@ -314,9 +314,9 @@ inline void mla8(int32x4_t& lo, int32x4_t& hi, int16x8_t p,
 
 /**
  * The scalar dots' per-block float step, sums[l] += d * aux32[l],
- * written as the same C++ expression so every compiler contracts it
- * the same way in both (clang fuses it to an FMA; GCC under -std=c++20
- * keeps the mul and add).
+ * written as the same C++ expression as the scalar dot, so whatever
+ * the compiler does with it (contract to an FMA or not), it does the
+ * same in both.
  */
 inline void add8(float sums[8], int32x4_t a_lo, int32x4_t a_hi, float d) {
     std::int32_t aux32[8];
