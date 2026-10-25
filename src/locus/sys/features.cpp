@@ -5,6 +5,9 @@
 #if defined(LOCUS_HAS_VULKAN)
 #include <vulkan/vulkan.h>
 #endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 namespace locus::sys {
 
@@ -23,6 +26,19 @@ Features detect() {
                version != 0;
 #endif
     return f;
+}
+
+unsigned performance_cores() {
+#if defined(__APPLE__)
+    int n = 0;
+    std::size_t len = sizeof(n);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &n, &len, nullptr,
+                     0) == 0 &&
+        n > 0) {
+        return static_cast<unsigned>(n);
+    }
+#endif
+    return 0;
 }
 
 std::string to_string(const Features& f) {

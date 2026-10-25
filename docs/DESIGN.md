@@ -537,7 +537,8 @@ floor.
   ACTIVE backend's op.matvec into a disjoint out span. Each
   row's dot is computed by the same kernel code as today, so
   logits are bit-identical for every thread count. Knob
-  LOCUS_THREADS (default: hardware cores, 1 disables). Applies
+  LOCUS_THREADS (default: hardware cores -- performance cores on
+  Apple silicon -- 1 disables). Applies
   to the CPU forward's large matvecs (attention projections,
   dense FFN, expert FFN, output head); matvec_t (small latent
   ops) and the vulkan full forward are untouched. Parallel
