@@ -2595,4 +2595,61 @@ void conv2d_mt(std::span<const float> in, std::uint32_t in_ch,
         });
 }
 
+void group_norm(std::span<float> x, std::uint32_t ch, std::uint32_t plane,
+                std::uint32_t groups, std::span<const float> gamma,
+                std::span<const float> beta, float eps) {
+    assert(groups != 0 && ch % groups == 0);
+    assert(x.size() == std::size_t{ch} * plane);
+    assert(gamma.size() == ch && beta.size() == ch);
+    const std::uint32_t cpg = ch / groups;
+    const std::size_t n = std::size_t{cpg} * plane;
+    sys::ThreadPool::instance().parallel_for(groups, [&](std::size_t g) {
+        float* p = &x[g * n];
+        double sum = 0.0, sq = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            sum += p[i];
+            sq += static_cast<double>(p[i]) * p[i];
+        }
+        const double mean = sum / static_cast<double>(n);
+        const double var = std::max(0.0, sq / static_cast<double>(n) -
+                                              mean * mean);
+        const float m = static_cast<float>(mean);
+        const float inv = static_cast<float>(1.0 / std::sqrt(var + eps));
+        for (std::uint32_t c = 0; c < cpg; ++c) {
+            const std::uint32_t cc = static_cast<std::uint32_t>(g) * cpg + c;
+            const float a = inv * gamma[cc];
+            const float b = beta[cc];
+            float* row = p + std::size_t{c} * plane;
+            for (std::uint32_t i = 0; i < plane; ++i) {
+                row[i] = (row[i] - m) * a + b;
+            }
+        }
+    });
+}
+
+void silu(std::span<float> x) {
+    for (float& v : x) {
+        v = v / (1.0f + std::exp(-v));
+    }
+}
+
+void upsample_nearest2x(std::span<const float> in, std::uint32_t ch,
+                        std::uint32_t h, std::uint32_t w,
+                        std::span<float> out) {
+    assert(in.size() == std::size_t{ch} * h * w);
+    assert(out.size() == std::size_t{ch} * 4 * h * w);
+    const std::size_t ow = std::size_t{w} * 2;
+    for (std::uint32_t c = 0; c < ch; ++c) {
+        const float* ip = &in[std::size_t{c} * h * w];
+        float* op = &out[std::size_t{c} * 4 * h * w];
+        for (std::uint32_t y = 0; y < 2 * h; ++y) {
+            const float* irow = ip + std::size_t{y / 2} * w;
+            float* orow = op + y * ow;
+            for (std::size_t x = 0; x < ow; ++x) {
+                orow[x] = irow[x / 2];
+            }
+        }
+    }
+}
+
 }  // namespace locus::backend
