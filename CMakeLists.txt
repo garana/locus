@@ -39,6 +39,8 @@ add_library(locus
     src/locus/model/deepseek41.cpp
     src/locus/audio/snac.cpp
     src/locus/image/vq16.cpp
+    src/locus/image/janus.cpp
+    src/locus/image/png.cpp
     src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp
     src/locus/model/transformer.cpp

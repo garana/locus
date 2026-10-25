@@ -586,7 +586,16 @@ void TransformerModel::forward_layers(tok::TokenId token,
     }
     const bool first = layer_begin == 0;
     const bool last = layer_end == hp_.n_layers;
-    if (first) {
+    // At layer 0 a non-empty hidden_in is the input embedding itself,
+    // used instead of the token's row (Janus image tokens enter through
+    // their own embedding and aligner).
+    const bool embed_in = first && !hidden_in.empty();
+    if (embed_in) {
+        if (hidden_in.size() != hp_.n_embd) {
+            throw std::invalid_argument(
+                "forward_layers: an input embedding must be n_embd");
+        }
+    } else if (first) {
         if (token < 0 ||
             static_cast<std::uint32_t>(token) >= hp_.n_vocab) {
             throw std::invalid_argument("token id out of vocab");
@@ -607,7 +616,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
     if (spec_->forward != nullptr) {
         // The arch's own whole-token forward (residual state spans
         // layers): full model, one stage.
-        if (!first || !last) {
+        if (!first || !last || embed_in) {
             throw std::invalid_argument(
                 "forward_layers: this arch runs the whole model only");
         }
@@ -621,7 +630,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
 
     // Stage input: the first stage embeds the token; a later stage
     // loads the residual stream handed over by the previous stage.
-    if (first) {
+    if (first && !embed_in) {
         op.dequant_row(embd_, static_cast<std::uint32_t>(token),
                        ws.x);
         if (hp_.embd_norm) {
