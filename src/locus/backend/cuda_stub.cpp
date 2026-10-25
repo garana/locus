@@ -69,6 +69,19 @@ void snake1d_cuda(std::span<float> x, std::uint32_t ch,
     snake1d(x, ch, len, alpha, eps);
 }
 
+void conv2d_cuda(std::span<const float> in, std::uint32_t in_ch,
+                 std::uint32_t in_h, std::uint32_t in_w,
+                 std::span<const float> weight, std::uint32_t out_ch,
+                 std::uint32_t kh, std::uint32_t kw,
+                 std::span<const float> bias, std::uint32_t stride,
+                 std::uint32_t pad, std::uint32_t groups,
+                 std::span<float> out) {
+    conv2d_check_args(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias,
+                      stride, pad, groups, out);
+    conv2d(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias, stride, pad,
+           groups, out);
+}
+
 }  // namespace locus::backend
 
 #endif  // !LOCUS_HAS_CUDA

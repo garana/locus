@@ -3185,6 +3185,120 @@ bool run_snake1d_dev(std::span<float> x, std::uint32_t ch,
                               cudaMemcpyDeviceToHost));
 }
 
+// --- conv2d (image VQ decoder, F32, i#223) ---------------------------
+// One thread per output element, summing in the scalar reference's
+// order (bias, then ci, ky, kx, skipping padded taps). __fmul_rn /
+// __fadd_rn stop nvcc from fusing the multiply-add, so the result is
+// bit-identical to backend::conv2d on a host whose scalar conv2d cannot
+// fuse either (the x86 baseline has no FMA; aarch64 and FMA x86 builds
+// fuse the scalar reference), not just within fp32 rounding.
+
+__global__ void conv2d_kernel(const float* in, const float* weight,
+                              const float* bias, float* out,
+                              std::uint32_t in_h, std::uint32_t in_w,
+                              std::uint32_t out_ch, std::uint32_t out_h,
+                              std::uint32_t out_w, std::uint32_t kh,
+                              std::uint32_t kw, std::uint32_t stride,
+                              std::uint32_t pad, std::uint32_t icg,
+                              std::uint32_t ocg) {
+    const std::size_t idx =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t oplane = static_cast<std::size_t>(out_h) * out_w;
+    if (idx >= out_ch * oplane) {
+        return;
+    }
+    const auto oc = static_cast<std::uint32_t>(idx / oplane);
+    const std::size_t rem = idx % oplane;
+    const auto oy = static_cast<std::uint32_t>(rem / out_w);
+    const auto ox = static_cast<std::uint32_t>(rem % out_w);
+    const std::uint32_t ic0 = (oc / ocg) * icg;  // group's first in-ch
+    const std::size_t iplane = static_cast<std::size_t>(in_h) * in_w;
+    const long long by =
+        static_cast<long long>(oy) * stride - static_cast<long long>(pad);
+    const long long bx =
+        static_cast<long long>(ox) * stride - static_cast<long long>(pad);
+    float acc = bias != nullptr ? bias[oc] : 0.0f;
+    for (std::uint32_t ci = 0; ci < icg; ++ci) {
+        const float* ip = in + (ic0 + ci) * iplane;
+        const float* wp =
+            weight + (static_cast<std::size_t>(oc) * icg + ci) * kh * kw;
+        for (std::uint32_t ky = 0; ky < kh; ++ky) {
+            const long long iy = by + ky;
+            if (iy < 0 || iy >= static_cast<long long>(in_h)) {
+                continue;
+            }
+            for (std::uint32_t kx = 0; kx < kw; ++kx) {
+                const long long ix = bx + kx;
+                if (ix >= 0 && ix < static_cast<long long>(in_w)) {
+                    acc = __fadd_rn(acc, __fmul_rn(wp[ky * kw + kx],
+                                                   ip[iy * in_w + ix]));
+                }
+            }
+        }
+    }
+    out[idx] = acc;
+}
+
+/** Uploads in/weight/(bias), runs conv2d_kernel, copies out back. The
+ *  caller has run conv2d_check_args, so false means only a device
+ *  problem (a grid past the limit, or any CUDA error); the caller then
+ *  runs the scalar path. */
+bool run_conv2d_dev(std::span<const float> in, std::uint32_t in_ch,
+                    std::uint32_t in_h, std::uint32_t in_w,
+                    std::span<const float> weight, std::uint32_t out_ch,
+                    std::uint32_t kh, std::uint32_t kw,
+                    std::span<const float> bias, std::uint32_t stride,
+                    std::uint32_t pad, std::uint32_t groups,
+                    std::span<float> out) {
+    const std::uint32_t icg = in_ch / groups;   // in-channels per group
+    const std::uint32_t ocg = out_ch / groups;  // out-channels per group
+    const std::uint32_t out_h = conv1d_out_len(in_h, kh, stride, 1, pad);
+    const std::uint32_t out_w = conv1d_out_len(in_w, kw, stride, 1, pad);
+    if (out.empty()) {
+        return true;  // out_ch, out_h or out_w is 0: nothing to compute
+    }
+    const std::size_t threads = 256;
+    const std::size_t blocks = (out.size() + threads - 1) / threads;
+    if (blocks > 0x7fffffffu) {
+        return false;  // past sm_50's gridDim.x limit (2^31 - 1)
+    }
+    DevBuf din, dw, db, dout;
+    if (!din.alloc(in.size() * sizeof(float)) ||
+        !dw.alloc(weight.size() * sizeof(float)) ||
+        !dout.alloc(out.size() * sizeof(float))) {
+        return false;
+    }
+    const float* dbias = nullptr;
+    if (!bias.empty()) {
+        if (!db.alloc(bias.size() * sizeof(float))) {
+            return false;
+        }
+        dbias = static_cast<const float*>(db.p);
+    }
+    if (!cuda_ok(cudaMemcpy(din.p, in.data(), in.size() * sizeof(float),
+                            cudaMemcpyHostToDevice)) ||
+        !cuda_ok(cudaMemcpy(dw.p, weight.data(),
+                            weight.size() * sizeof(float),
+                            cudaMemcpyHostToDevice))) {
+        return false;
+    }
+    if (dbias != nullptr &&
+        !cuda_ok(cudaMemcpy(db.p, bias.data(), bias.size() * sizeof(float),
+                            cudaMemcpyHostToDevice))) {
+        return false;
+    }
+    conv2d_kernel<<<static_cast<unsigned>(blocks),
+                    static_cast<unsigned>(threads)>>>(
+        static_cast<const float*>(din.p), static_cast<const float*>(dw.p),
+        dbias, static_cast<float*>(dout.p), in_h, in_w, out_ch, out_h,
+        out_w, kh, kw, stride, pad, icg, ocg);
+    if (!cuda_ok(cudaGetLastError()) || !cuda_ok(cudaDeviceSynchronize())) {
+        return false;
+    }
+    return cuda_ok(cudaMemcpy(out.data(), dout.p, out.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+}
+
 }  // namespace
 
 void cuda_pool_reset() { pool().reset(); }
@@ -3399,6 +3513,25 @@ void snake1d_cuda(std::span<float> x, std::uint32_t ch,
     ensure_device();
     if (!run_snake1d_dev(x, ch, len, alpha, eps)) {
         snake1d(x, ch, len, alpha, eps);
+    }
+}
+
+void conv2d_cuda(std::span<const float> in, std::uint32_t in_ch,
+                 std::uint32_t in_h, std::uint32_t in_w,
+                 std::span<const float> weight, std::uint32_t out_ch,
+                 std::uint32_t kh, std::uint32_t kw,
+                 std::span<const float> bias, std::uint32_t stride,
+                 std::uint32_t pad, std::uint32_t groups,
+                 std::span<float> out) {
+    // A bad shape throws here; the scalar fallback below is only for a
+    // device failure, never for arguments conv2d would misread.
+    conv2d_check_args(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias,
+                      stride, pad, groups, out);
+    ensure_device();
+    if (!run_conv2d_dev(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias,
+                        stride, pad, groups, out)) {
+        conv2d(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias, stride,
+               pad, groups, out);
     }
 }
 

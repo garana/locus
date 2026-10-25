@@ -224,4 +224,21 @@ void snake1d_cuda(std::span<float> x, std::uint32_t ch,
                   std::uint32_t len, std::span<const float> alpha,
                   float eps = 1e-9f);
 
+/**
+ * CUDA 2D convolution (F32), the device half of backend::conv2d (image
+ * VQ decoder, i#223). Same arguments and channels-major layout as
+ * conv2d. One thread per output element, summed in conv2d's order
+ * without fused multiply-add, so it is bit-identical to conv2d when the
+ * host compiler does not contract either. A bad shape throws
+ * std::invalid_argument (conv2d_check_args); a CUDA error falls back to
+ * the scalar conv2d; the non-CUDA stub checks, then runs conv2d.
+ */
+void conv2d_cuda(std::span<const float> in, std::uint32_t in_ch,
+                 std::uint32_t in_h, std::uint32_t in_w,
+                 std::span<const float> weight, std::uint32_t out_ch,
+                 std::uint32_t kh, std::uint32_t kw,
+                 std::span<const float> bias, std::uint32_t stride,
+                 std::uint32_t pad, std::uint32_t groups,
+                 std::span<float> out);
+
 }  // namespace locus::backend

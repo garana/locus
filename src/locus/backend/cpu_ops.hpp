@@ -351,6 +351,23 @@ void conv2d(std::span<const float> in, std::uint32_t in_ch,
             std::span<float> out);
 
 /**
+ * Checks conv2d's argument contract, which conv2d itself only asserts:
+ * groups non-zero and dividing both channel counts, stride non-zero,
+ * and every span the size the layout needs. A device variant calls it
+ * before its device attempt, so a bad shape fails loudly instead of
+ * reaching the scalar fallback (Release has no asserts).
+ *
+ * @throws std::invalid_argument naming the first violated rule.
+ */
+void conv2d_check_args(std::span<const float> in, std::uint32_t in_ch,
+                       std::uint32_t in_h, std::uint32_t in_w,
+                       std::span<const float> weight, std::uint32_t out_ch,
+                       std::uint32_t kh, std::uint32_t kw,
+                       std::span<const float> bias, std::uint32_t stride,
+                       std::uint32_t pad, std::uint32_t groups,
+                       std::span<const float> out);
+
+/**
  * conv2d across the thread pool, one item per (output channel, output
  * row), with the inner loop over contiguous output columns (one per
  * tap) so the compiler vectorizes it. Each output adds the same terms
