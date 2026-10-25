@@ -1,8 +1,10 @@
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "json.hpp"
 #include "gguf_builder.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/tok/bpe_tokenizer.hpp"
@@ -164,4 +166,36 @@ TEST_CASE("bpe pretokenizers: gpt-4o splits case runs and keeps "
     REQUIRE(tok_for("llama3").encode("foBar", false) == V{0, 8, 3, 4});
     REQUIRE(tok_for("gpt-4o").encode("t's", false) == V{9, 7});
     REQUIRE(tok_for("llama3").encode("t's", false) == V{5, 6, 7});
+}
+
+// i#226: the deepseek-llm pre-tokenizer (Janus-Pro), token-exact
+// against the HF tokenizer on a corpus that covers its splits:
+// newlines, letter and punctuation runs with their optional leading
+// space, trailing whitespace, CJK / Hangul / kana runs, single digits
+// (ASCII and other numerics), fullwidth forms, emoji, tabs. The ids come
+// from scripts/make-janus-goldens.py tokenizer.
+TEST_CASE("deepseek-llm pre-tokenizer matches the HF tokenizer",
+          "[tok][e2e]") {
+    const std::string model = std::string(LOCUS_SOURCE_DIR) +
+                              "/tests/models/janus-pro-1b-f16.gguf";
+    if (!std::filesystem::exists(model)) {
+        SKIP("janus-pro-1b-f16.gguf absent; see scripts/convert-janus.py");
+    }
+    auto g = locus::gguf::GgufFile::open(model);
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    std::ifstream f(std::string(LOCUS_SOURCE_DIR) +
+                    "/tests/golden/janus_tokenizer.jsonl");
+    REQUIRE(f.good());
+    int cases = 0;
+    for (std::string line; std::getline(f, line);) {
+        const auto j = nlohmann::json::parse(line);
+        const auto text = j["text"].get<std::string>();
+        const auto want = j["ids"].get<std::vector<TokenId>>();
+        INFO("text " << j["text"].dump());
+        REQUIRE(tok->encode(text, false) == want);
+        ++cases;
+    }
+    REQUIRE(cases >= 20);
+    // add_bos_token is written explicitly by the converter.
+    REQUIRE(tok->encode("hi", true).front() == 100000);
 }
