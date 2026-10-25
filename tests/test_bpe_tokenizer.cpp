@@ -168,6 +168,26 @@ TEST_CASE("bpe pretokenizers: gpt-4o splits case runs and keeps "
     REQUIRE(tok_for("llama3").encode("t's", false) == V{5, 6, 7});
 }
 
+// i#226, model-free: merges "1 2" and "\n \n" (Ċ Ċ in the byte
+// alphabet) would join across the deepseek-llm split points. It splits
+// every digit and isolates every newline, so neither merge applies;
+// gpt2 keeps the digit run and the newline run whole.
+TEST_CASE("bpe pretokenizers: deepseek-llm splits digits and newlines",
+          "[tok]") {
+    auto tok_for = [](const char* pre) {
+        BpeTokenizer::Config cfg;
+        cfg.tokens = {"1", "2", "12", "\xC4\x8A", "\xC4\x8A\xC4\x8A"};
+        cfg.types = std::vector<std::int32_t>(cfg.tokens.size(), 1);
+        cfg.merges = {"1 2", "\xC4\x8A \xC4\x8A"};
+        cfg.pre = pre;
+        return BpeTokenizer(std::move(cfg));
+    };
+    using V = std::vector<TokenId>;
+    REQUIRE(tok_for("deepseek-llm").encode("12\n\n", false) ==
+            V{0, 1, 3, 3});
+    REQUIRE(tok_for("gpt2").encode("12\n\n", false) == V{2, 4});
+}
+
 // i#226: the deepseek-llm pre-tokenizer (Janus-Pro), token-exact
 // against the HF tokenizer on a corpus that covers its splits:
 // newlines, letter and punctuation runs with their optional leading
