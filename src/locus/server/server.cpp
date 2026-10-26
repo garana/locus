@@ -34,6 +34,11 @@ namespace {
 
 using nlohmann::json;
 
+/** dump()'s error handler for every response body: invalid UTF-8 (a
+ * parse error quoting the request, text cut mid-character) becomes
+ * U+FFFD instead of throwing type_error.316 out of a handler (i#243). */
+constexpr auto kLossy = json::error_handler_t::replace;
+
 json make_error(const std::string& message) {
     return json{{"error", {{"message", message},
                            {"type", "invalid_request_error"}}}};
@@ -46,9 +51,9 @@ void set_error(http::ServerResponse& res, const std::exception& e) {
     res.status = http_status_for(e);
     const char* type =
         res.status == 400 ? "invalid_request_error" : "server_error";
-    res.set_content(
-        json{{"error", {{"message", e.what()}, {"type", type}}}}.dump(),
-        "application/json");
+    res.set_content(json{{"error", {{"message", e.what()}, {"type", type}}}}
+                        .dump(-1, ' ', false, kLossy),
+                    "application/json");
 }
 
 /** Parses and validates the OpenAI messages array. */
@@ -312,7 +317,7 @@ bool OpenAiServer::authorize(const http::Request& req,
             json{{"error",
                   {{"type", "authentication_error"},
                    {"message", "invalid or missing credential"}}}}
-                .dump(),
+                .dump(-1, ' ', false, kLossy),
             "application/json");
         return false;
     }
@@ -479,7 +484,7 @@ void OpenAiServer::stop() {
 void OpenAiServer::install_routes() {
     auto handle_health = [](const http::Request&,
                             http::ServerResponse& res) {
-        res.set_content(json{{"status", "ok"}}.dump(),
+        res.set_content(json{{"status", "ok"}}.dump(-1, ' ', false, kLossy),
                         "application/json");
     };
 
@@ -494,7 +499,7 @@ void OpenAiServer::install_routes() {
             res.set_content(
                 json{{"object", "list"},
                      {"data", json::array({entry})}}
-                    .dump(),
+                    .dump(-1, ' ', false, kLossy),
                 "application/json");
     };
     // Retrieve a single model by id (OpenAI GET /v1/models/{id}). The id
@@ -507,7 +512,7 @@ void OpenAiServer::install_routes() {
             if (model_id != opt_.model_name) {
                 res.status = 404;
                 res.set_content(
-                    make_error("model not found").dump(),
+                    make_error("model not found").dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
@@ -515,7 +520,7 @@ void OpenAiServer::install_routes() {
                                  {"object", "model"},
                                  {"created", 0},
                                  {"owned_by", "locus"}}
-                                .dump(),
+                                .dump(-1, ' ', false, kLossy),
                             "application/json");
     };
 
@@ -661,7 +666,7 @@ void OpenAiServer::install_routes() {
             stream = body.value("stream", false);
         } catch (const std::exception& e) {
             res.status = 400;
-            res.set_content(make_error(e.what()).dump(),
+            res.set_content(make_error(e.what()).dump(-1, ' ', false, kLossy),
                             "application/json");
             return;
         }
@@ -694,7 +699,8 @@ void OpenAiServer::install_routes() {
         if (const std::string why = loop_.admit_error(n_prompt);
             !why.empty()) {
             res.status = 400;
-            res.set_content(make_error(why).dump(), "application/json");
+            res.set_content(make_error(why).dump(-1, ' ', false, kLossy),
+                            "application/json");
             return;
         }
         requests_total_.fetch_add(1, std::memory_order_relaxed);
@@ -729,14 +735,15 @@ void OpenAiServer::install_routes() {
                 res.set_content(
                     make_error("request cancelled: client closed the "
                                "connection")
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
             if (v.status == engine::Status::kFailed) {
                 res.status = 500;
-                res.set_content(make_error(v.error).dump(),
-                                "application/json");
+                res.set_content(
+                    make_error(v.error).dump(-1, ' ', false, kLossy),
+                    "application/json");
                 return;
             }
             std::string text = tok_.decode(v.generated);
@@ -749,7 +756,8 @@ void OpenAiServer::install_routes() {
                           {"type", "function"},
                           {"function",
                            {{"name", tc->name},
-                            {"arguments", tc->arguments.dump()}}}};
+                            {"arguments",
+                             tc->arguments.dump(-1, ' ', false, kLossy)}}}};
                 choice = {{"index", 0},
                           {"message",
                            {{"role", "assistant"},
@@ -827,7 +835,8 @@ void OpenAiServer::install_routes() {
                        {"prompt_tokens_details",
                         {{"cached_tokens",
                           v.reused_prefix_tokens}}}}}};
-            res.set_content(out.dump(), "application/json");
+            res.set_content(out.dump(-1, ' ', false, kLossy),
+                            "application/json");
             return;
         }
 
@@ -870,8 +879,9 @@ void OpenAiServer::install_routes() {
                                    {"object", sse_object},
                                    {"choices",
                                     json::array({delta})}};
-                        payload +=
-                            "data: " + chunk.dump() + "\n\n";
+                        payload += "data: " +
+                                   chunk.dump(-1, ' ', false, kLossy) +
+                                   "\n\n";
                     }
                 }
                 *state = v.generated.size();
@@ -904,7 +914,8 @@ void OpenAiServer::install_routes() {
                                 {"function",
                                  {{"name", tc->name},
                                   {"arguments",
-                                   tc->arguments.dump()}}}};
+                                   tc->arguments.dump(-1, ' ', false,
+                                                      kLossy)}}}};
                             delta = {{"role", "assistant"},
                                      {"tool_calls",
                                       json::array({call})}};
@@ -920,7 +931,9 @@ void OpenAiServer::install_routes() {
                                            {"delta", delta},
                                            {"finish_reason",
                                             finish}}})}};
-                        payload += "data: " + chunk.dump() + "\n\n";
+                        payload += "data: " +
+                                   chunk.dump(-1, ' ', false, kLossy) +
+                                   "\n\n";
                     }
                     payload += "data: [DONE]\n\n";
                     // Stream fully built from the snapshot v; drop the
@@ -1003,7 +1016,7 @@ void OpenAiServer::install_routes() {
                      {"error",
                       {{"type", "invalid_request_error"},
                        {"message", e.what()}}}}
-                    .dump(),
+                    .dump(-1, ' ', false, kLossy),
                 "application/json");
             return;
         }
@@ -1031,7 +1044,7 @@ void OpenAiServer::install_routes() {
                           {{"type", "api_error"},
                            {"message", "request cancelled: client "
                                        "closed the connection"}}}}
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
@@ -1042,7 +1055,7 @@ void OpenAiServer::install_routes() {
                          {"error",
                           {{"type", "api_error"},
                            {"message", v.error}}}}
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
@@ -1086,7 +1099,8 @@ void OpenAiServer::install_routes() {
                    v.cached_prefix_tokens}}}};
             completion_tokens_total_.fetch_add(
                 v.generated.size(), std::memory_order_relaxed);
-            res.set_content(out.dump(), "application/json");
+            res.set_content(out.dump(-1, ' ', false, kLossy),
+                            "application/json");
             return;
         }
 
@@ -1126,7 +1140,7 @@ void OpenAiServer::install_routes() {
                            {{"input_tokens", input_tokens},
                             {"output_tokens", 0}}}}}};
                     payload += "event: message_start\ndata: " +
-                               start.dump() + "\n\n";
+                               start.dump(-1, ' ', false, kLossy) + "\n\n";
                     if (!buffer_tools) {
                         payload +=
                             "event: content_block_start\ndata: " +
@@ -1135,7 +1149,7 @@ void OpenAiServer::install_routes() {
                                  {"content_block",
                                   {{"type", "text"},
                                    {"text", ""}}}}
-                                .dump() +
+                                .dump(-1, ' ', false, kLossy) +
                             "\n\n";
                     }
                     st->started = true;
@@ -1155,7 +1169,7 @@ void OpenAiServer::install_routes() {
                                  {"delta",
                                   {{"type", "text_delta"},
                                    {"text", tok_.decode({&t, 1})}}}}
-                                .dump() +
+                                .dump(-1, ' ', false, kLossy) +
                             "\n\n";
                     }
                 }
@@ -1189,7 +1203,7 @@ void OpenAiServer::install_routes() {
                                             std::to_string(id)},
                                        {"name", tc->name},
                                        {"input", json::object()}}}}
-                                    .dump() +
+                                    .dump(-1, ' ', false, kLossy) +
                                 "\n\n";
                             payload +=
                                 "event: content_block_delta\n"
@@ -1199,8 +1213,9 @@ void OpenAiServer::install_routes() {
                                      {"delta",
                                       {{"type", "input_json_delta"},
                                        {"partial_json",
-                                        tc->arguments.dump()}}}}
-                                    .dump() +
+                                        tc->arguments.dump(-1, ' ', false,
+                                                           kLossy)}}}}
+                                    .dump(-1, ' ', false, kLossy) +
                                 "\n\n";
                             stop_reason = "tool_use";
                         } else {
@@ -1212,7 +1227,7 @@ void OpenAiServer::install_routes() {
                                      {"content_block",
                                       {{"type", "text"},
                                        {"text", ""}}}}
-                                    .dump() +
+                                    .dump(-1, ' ', false, kLossy) +
                                 "\n\n";
                             payload +=
                                 "event: content_block_delta\n"
@@ -1222,7 +1237,7 @@ void OpenAiServer::install_routes() {
                                      {"delta",
                                       {{"type", "text_delta"},
                                        {"text", text}}}}
-                                    .dump() +
+                                    .dump(-1, ' ', false, kLossy) +
                                 "\n\n";
                         }
                     }
@@ -1230,7 +1245,7 @@ void OpenAiServer::install_routes() {
                         "event: content_block_stop\ndata: " +
                         json{{"type", "content_block_stop"},
                              {"index", 0}}
-                            .dump() +
+                            .dump(-1, ' ', false, kLossy) +
                         "\n\n";
                     payload +=
                         "event: message_delta\ndata: " +
@@ -1249,11 +1264,11 @@ void OpenAiServer::install_routes() {
                                 v.reused_prefix_tokens},
                                {"cache_creation_input_tokens",
                                 v.cached_prefix_tokens}}}}
-                            .dump() +
+                            .dump(-1, ' ', false, kLossy) +
                         "\n\n";
                     payload += "event: message_stop\ndata: " +
                                json{{"type", "message_stop"}}
-                                   .dump() +
+                                   .dump(-1, ' ', false, kLossy) +
                                "\n\n";
                     completion_tokens_total_.fetch_add(
                         st->emitted, std::memory_order_relaxed);
@@ -1321,12 +1336,13 @@ void OpenAiServer::install_routes() {
                     json{{"object", "list"},
                          {"data", data},
                          {"model", opt_.model_name}}
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
             } catch (const std::exception& e) {
                 res.status = 400;
-                res.set_content(make_error(e.what()).dump(),
-                                "application/json");
+                res.set_content(
+                    make_error(e.what()).dump(-1, ' ', false, kLossy),
+                    "application/json");
             }
     };
 
@@ -1344,7 +1360,7 @@ void OpenAiServer::install_routes() {
                     make_error("audio speech is not configured (needs "
                                "--audio-decoder and an Orpheus-TTS "
                                "model)")
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
@@ -1664,7 +1680,7 @@ void OpenAiServer::install_routes() {
                 res.set_content(
                     make_error("image generation is not configured (needs "
                                "--image-decoder and a Janus-Pro model)")
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
@@ -1776,7 +1792,7 @@ void OpenAiServer::install_routes() {
                          {"data", json::array({json{
                                       {"b64_json",
                                        http::base64_encode(png)}}})}}
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
             } catch (const std::exception& e) {
                 set_error(res, e);

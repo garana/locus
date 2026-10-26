@@ -5,7 +5,9 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "catch_amalgamated.hpp"
@@ -745,4 +747,73 @@ TEST_CASE("http server: fast path still matches when the request line "
     ::close(c);
     REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
     REQUIRE(r.find("fast") != std::string::npos);
+}
+
+namespace {
+
+/** One request on a fresh connection; @returns the raw response. */
+std::string one_request(int port, std::string_view req) {
+    const int c = client_connect(port);
+    send_all(c, req);
+    std::string r = drain(c);
+    ::close(c);
+    return r;
+}
+
+}  // namespace
+
+// i#243: an exception that escapes the handler, the streaming provider
+// or the head stage used to end the worker thread with std::terminate,
+// taking the whole process down. Each case checks the failed request's
+// response, then that a NEW connection is still served.
+TEST_CASE("http server: a throwing handler answers 500 and the server lives",
+          "[http_server]") {
+    Fixture f([](const Request& req, ServerResponse& res) {
+        if (req.path == "/boom") throw std::runtime_error("handler bug");
+        echo_handler(req, res);
+    });
+    const std::string r =
+        one_request(f.port, "GET /boom HTTP/1.1\r\nHost: h\r\n\r\n");
+    REQUIRE(r.find("HTTP/1.1 500") != std::string::npos);
+    REQUIRE(r.find("Connection: close") != std::string::npos);
+    REQUIRE(one_request(f.port, "GET /ok HTTP/1.1\r\nHost: h\r\n\r\n")
+                .find("GET /ok") != std::string::npos);
+}
+
+TEST_CASE("http server: a provider that throws mid-stream ends that stream "
+          "only", "[http_server]") {
+    Fixture f([](const Request& req, ServerResponse& res) {
+        if (req.path != "/s") {
+            echo_handler(req, res);
+            return;
+        }
+        res.set_chunked_content_provider(
+            "text/event-stream", [](locus::http::Sink& sink) {
+                sink.write("a");
+                throw std::runtime_error("provider bug");
+            });
+    });
+    const std::string r =
+        one_request(f.port, "GET /s HTTP/1.1\r\nHost: h\r\n\r\n");
+    REQUIRE(r.find("1\r\na\r\n") != std::string::npos);    // sent so far
+    REQUIRE(r.find("0\r\n\r\n") == std::string::npos);     // no terminator
+    REQUIRE(one_request(f.port, "GET /ok HTTP/1.1\r\nHost: h\r\n\r\n")
+                .find("GET /ok") != std::string::npos);
+}
+
+TEST_CASE("http server: a throwing head stage answers 500 and the server "
+          "lives", "[http_server]") {
+    Fixture f(
+        [](const Request& req, ServerResponse& res, const RequestContext&) {
+            echo_handler(req, res);
+        },
+        [](const Request& head, ServerResponse&, RequestContext&) -> bool {
+            if (head.path == "/boom") throw std::runtime_error("auth bug");
+            return false;  // proceed
+        });
+    const std::string r =
+        one_request(f.port, "GET /boom HTTP/1.1\r\nHost: h\r\n\r\n");
+    REQUIRE(r.find("HTTP/1.1 500") != std::string::npos);
+    REQUIRE(one_request(f.port, "GET /ok HTTP/1.1\r\nHost: h\r\n\r\n")
+                .find("GET /ok") != std::string::npos);
 }

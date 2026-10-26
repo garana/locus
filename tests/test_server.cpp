@@ -1396,6 +1396,36 @@ std::vector<std::byte> unbase64(const std::string& s) {
 
 }  // namespace
 
+// i#243: a JSON parse error quotes the bad input in what(); when that
+// input is not valid UTF-8, the strict dump() of the error body threw
+// inside the handler's catch, and the escaped exception terminated
+// locus-server. Now the error body is lossy (U+FFFD) and the server
+// keeps serving.
+TEST_CASE("a body that is not UTF-8 gets a 400 and the server lives",
+          "[server]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    TestServer ts(model, tok);
+    httplib::Client client("127.0.0.1", ts.port);
+    for (const char* path : {"/v1/completions", "/v1/chat/completions",
+                             "/v1/messages", "/v1/embeddings"}) {
+        INFO(path);
+        auto res = client.Post(path, std::string("\xff\xfe{", 3),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 400);
+        // The body is valid JSON with the bad bytes replaced.
+        REQUIRE(json::parse(res->body).contains("error"));
+    }
+    auto health = client.Get("/health");
+    REQUIRE(health);
+    REQUIRE(health->status == 200);
+}
+
 TEST_CASE("images 503 unless a decoder and a Janus model are loaded",
           "[server][image]") {
     if (!std::filesystem::exists(model_path())) {
