@@ -1,3 +1,6 @@
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 
 #include "catch_amalgamated.hpp"
@@ -33,5 +36,24 @@ TEST_CASE("unsupported architectures fail with a useful error",
         REQUIRE(msg.find("qwen2") != std::string::npos);
         REQUIRE(msg.find("llama") != std::string::npos);
         REQUIRE(msg.find("deepseek2") != std::string::npos);
+    }
+}
+
+TEST_CASE("arch hooks take the model's ops, never the raw backend's",
+          "[model]") {
+    // #189: TransformerModel::ops() applies use_q8k_activations; a hook
+    // reading active_backend().ops would bypass it (as deepseek2's MLA,
+    // glm-dsa's indexer, muse-spark and deepseek41 once did).
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(LOCUS_SOURCE_DIR) / "src/locus/model";
+    for (const auto& e : fs::directory_iterator(dir)) {
+        if (e.path().extension() != ".cpp") {
+            continue;
+        }
+        std::ifstream f(e.path());
+        const std::string text((std::istreambuf_iterator<char>(f)),
+                               std::istreambuf_iterator<char>());
+        INFO(e.path().filename().string());
+        REQUIRE(text.find("active_backend().ops") == std::string::npos);
     }
 }

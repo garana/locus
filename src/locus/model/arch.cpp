@@ -57,7 +57,7 @@ void llama_attention(const TransformerModel& m,
                      std::uint32_t pos) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
-    const Ops& op = m.active_backend().ops;
+    const Ops op = m.ops();
     const std::uint32_t hd = hp.head_dim;
     const std::size_t kv_dim =
         static_cast<std::size_t>(hp.n_kv_heads) * hd;
@@ -277,7 +277,7 @@ void mla_attention(const TransformerModel& m,
                    std::uint32_t n_att) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
-    const Ops& op = m.active_backend().ops;
+    const Ops op = m.ops();
     const std::uint32_t rank = hp.kv_lora_rank;
     const std::uint32_t nope = hp.qk_nope_dim;
     const std::uint32_t rope = hp.qk_rope_dim;
@@ -484,7 +484,7 @@ void glm_dsa_attention(const TransformerModel& m,
                        std::uint32_t pos) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
-    const Ops& op = m.active_backend().ops;
+    const Ops op = m.ops();
     const std::uint32_t n_pos = pos + 1;
     const std::uint32_t* sel = nullptr;
     std::uint32_t n_att = n_pos;
@@ -604,7 +604,7 @@ void qwen2moe_attention(const TransformerModel& m,
                         std::uint32_t pos) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
-    const Ops& op = m.active_backend().ops;
+    const Ops op = m.ops();
     const std::uint32_t hd = hp.head_dim;
     const std::size_t kv_dim =
         static_cast<std::size_t>(hp.n_kv_heads) * hd;
@@ -755,7 +755,7 @@ void qwen3moe_attention(const TransformerModel& m,
                         std::uint32_t pos) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
-    const Ops& op = m.active_backend().ops;
+    const Ops op = m.ops();
     const std::uint32_t hd = hp.head_dim;
     const std::size_t q_dim = static_cast<std::size_t>(hp.n_heads) * hd;
     const std::size_t kv_dim =
@@ -900,7 +900,7 @@ void dbrx_attention(const TransformerModel& m,
                     std::uint32_t pos) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
-    const Ops& op = m.active_backend().ops;
+    const Ops op = m.ops();
     const std::uint32_t hd = hp.head_dim;
     const std::size_t kv_dim =
         static_cast<std::size_t>(hp.n_kv_heads) * hd;
@@ -1042,6 +1042,7 @@ void muse_spark_hparams(const gguf::GgufFile& g, const std::string& p,
     }
     hp.embd_norm = true;
     hp.custom_layer = true;
+    hp.q8k_default = true;  // the goldens are llama.cpp's
     hp.kq_scale = 1.0f / std::sqrt(static_cast<float>(hp.head_dim));
 }
 
@@ -1094,7 +1095,7 @@ void muse_spark_layer(const TransformerModel& m,
                       std::uint32_t pos) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
-    const Ops& op = m.active_backend().ops;
+    const Ops op = m.ops();
     const std::uint32_t E = hp.n_embd;
     const std::uint32_t hd = hp.head_dim;
     const std::size_t q_dim = std::size_t{hp.n_heads} * hd;

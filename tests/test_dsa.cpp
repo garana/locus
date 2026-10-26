@@ -36,11 +36,18 @@ constexpr std::uint32_t kV = 16;
 constexpr std::uint32_t kFf = 16;
 constexpr std::uint32_t kTopK = 4;
 
-std::vector<std::byte> build_image(const std::string& arch) {
+/**
+ * @param q8_wq_b Store attn_q_b as Q8_0 (q_lora_rank 32 so its rows
+ *     are whole blocks): a quantized weight on MLA's matvec_mt path.
+ */
+std::vector<std::byte> build_image(const std::string& arch,
+                                   bool q8_wq_b = false) {
     struct T {
         std::string name;
         std::vector<std::uint64_t> dims;
         std::vector<float> data;
+        std::vector<std::byte> raw = {};  // non-F32 bytes (type below)
+        std::uint32_t type = 0;           // ggml type id (0 = F32)
     };
     std::vector<T> ts;
     auto add = [&](std::string name,
@@ -63,11 +70,29 @@ std::vector<std::byte> build_image(const std::string& arch) {
     ts.push_back({"blk.0.ffn_norm.weight",
                   {kE},
                   std::vector<float>(kE, 1.0f)});
-    add("blk.0.attn_q_a.weight", {kE, 4}, 2);
+    const std::uint32_t q_rank = q8_wq_b ? 32 : 4;
+    add("blk.0.attn_q_a.weight", {kE, q_rank}, 2);
     ts.push_back({"blk.0.attn_q_a_norm.weight",
-                  {4},
-                  std::vector<float>(4, 1.0f)});
-    add("blk.0.attn_q_b.weight", {4, 8}, 3);
+                  {q_rank},
+                  std::vector<float>(q_rank, 1.0f)});
+    if (q8_wq_b) {
+        // 8 rows of one Q8_0 block: f16 d, then 32 int8 quants.
+        T t{"blk.0.attn_q_b.weight", {32, 8}, {}};
+        t.type = 8;
+        const auto q = weights(8 * 32, 3);
+        for (int r = 0; r < 8; ++r) {
+            const std::uint16_t d = locus::backend::f32_to_f16(0.01f);
+            const auto* dp = reinterpret_cast<const std::byte*>(&d);
+            t.raw.insert(t.raw.end(), dp, dp + 2);
+            for (int j = 0; j < 32; ++j) {
+                t.raw.push_back(static_cast<std::byte>(static_cast<std::int8_t>(
+                    std::lround(q[r * 32 + j] * 1000.0f))));
+            }
+        }
+        ts.push_back(std::move(t));
+    } else {
+        add("blk.0.attn_q_b.weight", {4, 8}, 3);
+    }
     add("blk.0.attn_kv_a_mqa.weight", {kE, 6}, 4);
     ts.push_back({"blk.0.attn_kv_a_norm.weight",
                   {4},
@@ -98,7 +123,7 @@ std::vector<std::byte> build_image(const std::string& arch) {
         .kv_u32(p + "feed_forward_length", kFf)
         .kv_u32(p + "context_length", 32)
         .kv_f32(p + "attention.layer_norm_rms_epsilon", 1e-5f)
-        .kv_u32(p + "attention.q_lora_rank", 4)
+        .kv_u32(p + "attention.q_lora_rank", q_rank)
         .kv_u32(p + "attention.kv_lora_rank", 4)
         .kv_u32(p + "rope.dimension_count", 2)
         .kv_u32(p + "attention.key_length", 4)
@@ -110,14 +135,20 @@ std::vector<std::byte> build_image(const std::string& arch) {
     }
     std::uint64_t offset = 0;
     for (const auto& t : ts) {
-        b.tensor(t.name, t.dims, 0 /* F32 */, offset);
-        offset = (offset + t.data.size() * 4 + 31) & ~31ull;
+        b.tensor(t.name, t.dims, t.type, offset);
+        const std::size_t bytes =
+            t.raw.empty() ? t.data.size() * 4 : t.raw.size();
+        offset = (offset + bytes + 31) & ~31ull;
     }
     b.pad();
     for (const auto& t : ts) {
-        const auto* p8 = reinterpret_cast<const std::byte*>(
-            t.data.data());
-        for (std::size_t i = 0; i < t.data.size() * 4; ++i) {
+        const auto* p8 = t.raw.empty()
+                             ? reinterpret_cast<const std::byte*>(
+                                   t.data.data())
+                             : t.raw.data();
+        const std::size_t n =
+            t.raw.empty() ? t.data.size() * 4 : t.raw.size();
+        for (std::size_t i = 0; i < n; ++i) {
             b.u8(static_cast<std::uint8_t>(p8[i]));
         }
         while (b.bytes().size() % 32 != 0) {
@@ -263,4 +294,34 @@ TEST_CASE("the full GPU forward support check matches its declines "
     auto ds_g = locus::gguf::GgufFile::parse(ds_img);
     auto ds = TransformerModel::load(ds_g);
     REQUIRE(locus::backend::vulkan_forward_supported(ds));
+}
+
+TEST_CASE("deepseek2's MLA honors use_q8k_activations", "[dsa]") {
+    // #189: mla_attention runs wq_b through matvec_mt; it once took the
+    // raw backend ops, so a quantized wq_b integer-dotted a quantized
+    // activation even with R16 off. Now flag off is the f32 path.
+    auto img = build_image("deepseek2", /*q8_wq_b=*/true);
+    auto g = locus::gguf::GgufFile::parse(img);
+    auto model = TransformerModel::load(g);
+    REQUIRE_FALSE(model.q8k_activations());  // the shared-loop default
+    const auto* scalar = locus::backend::find_backend("scalar");
+    locus::backend::Backend no_q8k = *scalar;
+    no_q8k.ops.matvec_q8k = nullptr;
+    auto last = [&](const locus::backend::Backend& b, bool q8k) {
+        model.use_backend(b);
+        model.use_q8k_activations(q8k);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        for (locus::tok::TokenId t : {3, 7, 1, 9}) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(t, cache, seq, ws, logits);
+        }
+        cache.release(seq);
+        return logits;
+    };
+    const auto off = last(*scalar, false);
+    REQUIRE(off == last(no_q8k, true));  // flag off == no Q8 path at all
+    REQUIRE(off != last(*scalar, true));  // and the flag does route wq_b
 }

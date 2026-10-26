@@ -197,3 +197,18 @@ TEST_CASE("muse-spark sliding-window layers see only the window",
         }
     }
 }
+
+TEST_CASE("muse-spark defaults to quantized activations; the flag is "
+          "honest",
+          "[model][muse]") {
+    // #189: the arch's goldens are llama.cpp's, which quantizes the
+    // activations, so it turns R16 on at load; turning it off clears
+    // Ops::matvec_q8k for its hooks too (they take m.ops()).
+    auto img = build_image(true);
+    auto g = locus::gguf::GgufFile::parse(img);
+    auto model = TransformerModel::load(g);
+    REQUIRE(model.q8k_activations());
+    REQUIRE(model.ops().matvec_q8k != nullptr);
+    model.use_q8k_activations(false);
+    REQUIRE(model.ops().matvec_q8k == nullptr);
+}

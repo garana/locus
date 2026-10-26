@@ -131,6 +131,10 @@ backend::Ops effective_ops(const backend::Backend* b, bool q8k) {
     return op;
 }
 
+backend::Ops TransformerModel::ops() const {
+    return effective_ops(backend_, q8k_activations_);
+}
+
 void matvec_mt(const backend::Ops& op, const Mat& w,
                std::span<const float> x, std::span<float> out) {
     // R16 ggml parity: QK_K weight types integer-dot a Q8_K-quantized
@@ -140,7 +144,8 @@ void matvec_mt(const backend::Ops& op, const Mat& w,
     // does not vectorize. Re-quantizing x per row-slice below is
     // O(cols) vs the O(rows_slice*cols) dot -- negligible.
     const auto mv =
-        (op.matvec_q8k != nullptr && backend::is_q8k_type(w.type))
+        (op.matvec_q8k != nullptr && (backend::is_q8k_type(w.type) ||
+                                      backend::is_q8_0_act_type(w.type)))
             ? op.matvec_q8k
             : op.matvec;
     // A backend whose matvec is not re-entrant (Vulkan's single
@@ -238,6 +243,7 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     hp.rope_freq_base =
         get_float(g, p + "rope.freq_base", 10000.0f);
     spec->load_hparams(g, p, hp);
+    m.q8k_activations_ = hp.q8k_default;
 
     const TensorInfo* embd = g.find_tensor("token_embd.weight");
     if (embd == nullptr) {

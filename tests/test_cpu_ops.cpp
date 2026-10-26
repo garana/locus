@@ -1422,3 +1422,84 @@ TEST_CASE("snake1d_cuda matches the scalar reference", "[conv1d][cuda]") {
         REQUIRE(got[i] == Approx(ref[i]).epsilon(1e-5).margin(1e-5));
     }
 }
+
+TEST_CASE("matvec_q8k dots block-32 weights against a Q8_0 activation",
+          "[ops]") {
+    // llama.cpp's vec_dot_type for Q8_0 / Q4_0 / IQ4_NL is Q8_0: the
+    // activation is quantized per 32 (d = amax / 127 as f16, quants
+    // rounded to nearest even) and integer-dotted.
+    std::mt19937 rng(73);
+    std::uniform_int_distribution<int> qd(-127, 127), bd(0, 255);
+    SECTION("an exactly representable activation matches the f32 dot") {
+        // amax 127 per block: d = 1, so x quantizes losslessly.
+        std::vector<float> x(96);
+        for (std::size_t i = 0; i < x.size(); ++i) {
+            x[i] = static_cast<float>(i % 32 == 0 ? 127 : qd(rng));
+        }
+        std::vector<std::byte> w(5 * 3 * 34);
+        for (std::size_t b = 0; b < 15; ++b) {
+            const std::uint16_t h = f32_to_f16(0.0625f);
+            std::memcpy(&w[b * 34], &h, 2);
+            for (int j = 0; j < 32; ++j) {
+                w[b * 34 + 2 + j] = static_cast<std::byte>(
+                    static_cast<std::int8_t>(qd(rng)));
+            }
+        }
+        const Mat m{TensorType::kQ8_0, w.data(), 5, 96};
+        std::vector<float> f32(5), q8(5);
+        matvec(m, x, f32);
+        matvec_q8k(m, x, q8);
+        for (int r = 0; r < 5; ++r) {
+            REQUIRE(q8[r] == f32[r]);  // small exact integers
+        }
+    }
+    SECTION("quants round half to even") {
+        // d = 1: 2.5 -> 2 and 0.5 -> 0 (round-away would give 3 and 1).
+        std::vector<float> x(32, 0.0f);
+        x[0] = 127.0f;
+        x[1] = 2.5f;
+        x[2] = 0.5f;
+        std::vector<std::byte> w(34);
+        const std::uint16_t one = f32_to_f16(1.0f);
+        std::memcpy(w.data(), &one, 2);
+        for (int j = 0; j < 32; ++j) {
+            w[2 + j] = static_cast<std::byte>(1);
+        }
+        const Mat m{TensorType::kQ8_0, w.data(), 1, 32};
+        float out = 0.0f;
+        matvec_q8k(m, x, {&out, 1});
+        REQUIRE(out == 129.0f);
+    }
+    SECTION("Q8_0, Q4_0 and IQ4_NL track the f32 dot") {
+        std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+        std::vector<float> x(96);  // 3 blocks: the odd tail runs too
+        for (auto& v : x) {
+            v = xd(rng);
+        }
+        struct C {
+            TensorType type;
+            std::size_t block;
+        };
+        for (const C c : {C{TensorType::kQ8_0, 34}, C{TensorType::kQ4_0, 18},
+                          C{TensorType::kIQ4_NL, 18}}) {
+            INFO("type " << static_cast<int>(c.type));
+            std::vector<std::byte> w(7 * 3 * c.block);
+            for (auto& b : w) {
+                b = static_cast<std::byte>(bd(rng));
+            }
+            for (std::size_t b = 0; b < 21; ++b) {
+                const std::uint16_t h = f32_to_f16(0.01f);
+                std::memcpy(&w[b * c.block], &h, 2);
+            }
+            const Mat m{c.type, w.data(), 7, 96};
+            std::vector<float> f32(7), q8(7);
+            matvec(m, x, f32);
+            matvec_q8k(m, x, q8);
+            for (int r = 0; r < 7; ++r) {
+                // Q8_0 activation error: about amax / 254 per element,
+                // so about 1% of a 96-term dot.
+                REQUIRE(q8[r] == Approx(f32[r]).epsilon(0.01).margin(0.05));
+            }
+        }
+    }
+}

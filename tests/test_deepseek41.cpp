@@ -298,6 +298,9 @@ TEST_CASE("deepseek41 tiny model decodes through every layer class",
     REQUIRE(d.kv_src == std::vector<std::int32_t>{-1, 1, 1, 3, 3});
     REQUIRE(d.topk_src == std::vector<std::int32_t>{-1, 1, 1, 3, 4});
     REQUIRE(model.cache_layer_count() == kL + 2);
+    // Its goldens are the reference's, which quantizes the activations
+    // (#189): R16 is on by default.
+    REQUIRE(model.q8k_activations());
     REQUIRE_FALSE(model.supports_batch());
     REQUIRE_FALSE(locus::backend::vulkan_forward_supported(model));
     // 14 tokens: past the window (3), past top-k (3 rows) on every

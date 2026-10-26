@@ -126,6 +126,13 @@ void matvec_q8k(const Mat& w, std::span<const float> x,
 bool is_q8k_type(gguf::TensorType type);
 
 /**
+ * @returns Whether matvec_q8k dots w against a Q8_0-quantized
+ *     activation (block-32 weights: Q8_0, Q4_0, IQ4_NL), llama.cpp's
+ *     vec_dot_type for them.
+ */
+bool is_q8_0_act_type(gguf::TensorType type);
+
+/**
  * Quantizes activation x to Q8_K, writing the block fields as flat
  * arrays: d[n/256], qs[n] (int8), bsums[n/16] (int16), where n =
  * x.size() (must be a multiple of 256). Bit-identical to the internal

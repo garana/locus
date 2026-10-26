@@ -1362,6 +1362,22 @@ matvec throughput.
   (they reorder the accumulation), which is the other reason not to
   chase it. Q8_K exists for integer-matvec throughput, so this is
   where its real win lands.
+- Block-32 weights (#189): the same mode dots Q8_0 / Q4_0 / IQ4_NL
+  weights against a Q8_0-quantized activation (llama.cpp's vec_dot_type
+  for them: d = amax / 127 as f16, quants rounded to nearest even),
+  accumulated in ggml's NEON lane order.
+- Per-arch default (#189): an arch whose goldens are llama.cpp's sets
+  Hparams::q8k_default, so the mode is on at load (muse-spark,
+  deepseek41); use_q8k_activations still overrides it. Every arch hook
+  takes TransformerModel::ops() (the effective ops), never the raw
+  backend ops; a test greps model/ for active_backend().ops. Before
+  this, the hooks that call matvec_mt (deepseek2's MLA, glm-dsa's
+  indexer, muse-spark, deepseek41) took Q8_K with the flag off. With
+  the Q8_0 dots, Muse Spark's second golden prompt became token-exact
+  against llama.cpp on arm64 NEON; x86 SSE4 still tips it on the f32
+  side, so the test stays teacher-forced on every lane. Likewise the
+  deepseek41 goldens (prompt 1's third token tips on x86, and on arm64
+  since #237's NEON BF16 dot): teacher-forced on every lane.
 
 ## 8. Testing strategy
 
