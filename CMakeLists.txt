@@ -41,6 +41,7 @@ add_library(locus
     src/locus/image/vq16.cpp
     src/locus/image/janus.cpp
     src/locus/image/png.cpp
+    src/locus/image/image_input.cpp
     src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp
     src/locus/model/transformer.cpp
@@ -71,6 +72,7 @@ target_include_directories(locus SYSTEM PRIVATE
     third_party/ggml
     third_party/httplib
     third_party/json
+    third_party/stb
 )
 find_package(Threads REQUIRED)
 target_link_libraries(locus PUBLIC Threads::Threads)
