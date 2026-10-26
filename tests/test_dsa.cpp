@@ -303,7 +303,9 @@ TEST_CASE("deepseek2's MLA honors use_q8k_activations", "[dsa]") {
     auto img = build_image("deepseek2", /*q8_wq_b=*/true);
     auto g = locus::gguf::GgufFile::parse(img);
     auto model = TransformerModel::load(g);
-    REQUIRE(model.q8k_activations());  // the R16 default
+    // The R16 default follows the backend (Ops::prefers_q8k).
+    REQUIRE(model.q8k_activations() ==
+            model.active_backend().ops.prefers_q8k);
     const auto* scalar = locus::backend::find_backend("scalar");
     locus::backend::Backend no_q8k = *scalar;
     no_q8k.ops.matvec_q8k = nullptr;

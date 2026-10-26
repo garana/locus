@@ -95,6 +95,15 @@ struct Ops {
      * backend's matvec() is reached through matvec_mt.
      */
     bool mt_safe = true;
+    /**
+     * True when matvec_q8k is this backend's FAST path, so the R16
+     * Q8-activation mode is its default (DESIGN.md R16): neon, sse4
+     * and the scalar reference. avx2 (scalar Q8 dot vs its AVX2 f32
+     * one), cuda (no block-32 Q8 kernel) and vulkan (scalar, inline
+     * per-op fallback) keep the f32 dot unless the arch or the caller
+     * asks for Q8.
+     */
+    bool prefers_q8k = false;
 };
 
 /**

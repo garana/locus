@@ -79,11 +79,10 @@ struct Hparams {
     bool rope_neox = false;
     /** YARN rope correction (freq_scale 1 = off). */
     backend::Yarn yarn;
-    /** Quantized-activation (R16) mode at load: on for every arch
-     * (llama.cpp's algorithm, and the fast CPU int8 dots);
-     * LOCUS_F32_ACTIVATIONS=1 or use_q8k_activations(false) keeps
-     * the f32-activation dot for exactness checks. */
-    bool q8k_default = true;
+    /** The arch REQUIRES the quantized-activation (R16) mode on every
+     * backend: its goldens are llama.cpp's (muse-spark, deepseek41).
+     * Other arches follow the backend's Ops::prefers_q8k. */
+    bool q8k_default = false;
     /** Max context the model was trained for. */
     std::uint32_t n_ctx = 0;
     float rms_eps = 1e-5f;
@@ -201,20 +200,20 @@ class TransformerModel {
     }
 
     /**
-     * Opt-in ggml-parity mode (DESIGN.md R16): when enabled, QK_K
-     * weight matmuls integer-dot a Q8_K-quantized activation, and
-     * block-32 weights (Q8_0 / Q4_0 / IQ4_NL) a Q8_0-quantized one
-     * (matching llama.cpp's algorithm) via Ops::matvec_q8k. On by
-     * default (Hparams::q8k_default) since the CPU int8 dots made it
-     * 1.7x faster than the f32-activation dot on NEON (the scalar,
-     * NEON and CUDA Q8_K dots replay one accumulation order). Off
-     * (or LOCUS_F32_ACTIVATIONS=1) keeps the f32 dot, the reference
-     * for exactness checks.
+     * The ggml-parity mode (DESIGN.md R16): QK_K weight matmuls
+     * integer-dot a Q8_K-quantized activation, and block-32 weights
+     * (Q8_0 / Q4_0 / IQ4_NL) a Q8_0-quantized one (llama.cpp's
+     * algorithm), via Ops::matvec_q8k. Unless set here, it is on when
+     * the arch requires it (Hparams::q8k_default) or the backend's Q8
+     * dot is its fast path (Ops::prefers_q8k: neon, sse4, scalar),
+     * and off with LOCUS_F32_ACTIVATIONS set to anything but "0" or
+     * empty -- the f32-activation dot, the reference for exactness
+     * checks. Calling this overrides all of that.
      */
-    void use_q8k_activations(bool on) { q8k_activations_ = on; }
+    void use_q8k_activations(bool on) { q8k_override_ = on ? 1 : 0; }
 
-    /** @returns Whether Q8_K-activation mode is enabled. */
-    bool q8k_activations() const { return q8k_activations_; }
+    /** @returns Whether the Q8-activation mode is in effect. */
+    bool q8k_activations() const;
 
     /**
      * @returns The active backend's ops as the forward uses them:
@@ -653,9 +652,9 @@ class TransformerModel {
     Hparams hp_;
     const struct ArchSpec* spec_ = nullptr;
     const backend::Backend* backend_ = nullptr;
-    /** R16 Q8_K-activation opt-in (see use_q8k_activations); default
-     * off keeps the f32 path and stable cross-backend goldens. */
-    bool q8k_activations_ = false;
+    /** use_q8k_activations' choice: -1 none (the default rule), 0 off,
+     * 1 on. */
+    int q8k_override_ = -1;
     /** Weights live in a read-only file mapping; gates the
      * LOCUS_WEIGHT_WINDOW DONTNEED policy (see gguf.hpp). */
     bool file_backed_ = false;

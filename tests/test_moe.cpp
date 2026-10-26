@@ -899,8 +899,10 @@ TEST_CASE("the full GPU forward declines dbrx's fused qkv and LayerNorm",
         auto g = locus::gguf::GgufFile::parse(mb.build(kNe, 2));
         auto model = TransformerModel::load(g);
         REQUIRE(locus::backend::vulkan_forward_supported(model));
-        // Q8 activations by default (R16); off restores the f32 ops.
-        REQUIRE(model.q8k_activations());
+        // The R16 default follows the backend; off restores the f32
+        // ops.
+        REQUIRE(model.q8k_activations() ==
+                model.active_backend().ops.prefers_q8k);
         model.use_q8k_activations(false);
         REQUIRE(model.ops().matvec_q8k == nullptr);
     }
@@ -1146,4 +1148,53 @@ TEST_CASE("batched prefill keeps the Q8_0-activation dot of decode",
     const auto f = last(false);
     model.use_q8k_activations(true);
     REQUIRE(last(false) != f);
+}
+
+TEST_CASE("the R16 default follows the backend, the arch and the switch",
+          "[moe]") {
+    constexpr std::uint32_t kNe = 4;
+    ModelBuilder mb;
+    mb.common();
+    mb.tensor("blk.0.ffn_gate_inp.weight", {kE, kNe},
+              weights(kE * kNe, 60));
+    mb.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, kNe},
+              weights(kE * kF * kNe, 61));
+    mb.tensor("blk.0.ffn_up_exps.weight", {kE, kF, kNe},
+              weights(kE * kF * kNe, 62));
+    mb.tensor("blk.0.ffn_down_exps.weight", {kF, kE, kNe},
+              weights(kF * kE * kNe, 63));
+    auto g = locus::gguf::GgufFile::parse(mb.build(kNe, 2));
+    auto model = TransformerModel::load(g);
+    const auto& scalar = *locus::backend::find_backend("scalar");
+    REQUIRE(scalar.ops.prefers_q8k);
+    locus::backend::Backend f32_backend = scalar;  // an avx2 / vulkan
+    f32_backend.ops.prefers_q8k = false;
+    unsetenv("LOCUS_F32_ACTIVATIONS");
+    model.use_backend(scalar);
+    REQUIRE(model.q8k_activations());
+    REQUIRE(model.ops().matvec_q8k != nullptr);
+    model.use_backend(f32_backend);
+    REQUIRE_FALSE(model.q8k_activations());
+    REQUIRE(model.ops().matvec_q8k == nullptr);
+    // LOCUS_F32_ACTIVATIONS: any value but "0" or empty selects f32.
+    model.use_backend(scalar);
+    for (const char* v : {"1", "yes"}) {
+        setenv("LOCUS_F32_ACTIVATIONS", v, 1);
+        REQUIRE_FALSE(model.q8k_activations());
+    }
+    for (const char* v : {"0", ""}) {
+        setenv("LOCUS_F32_ACTIVATIONS", v, 1);
+        REQUIRE(model.q8k_activations());
+    }
+    unsetenv("LOCUS_F32_ACTIVATIONS");
+    // An explicit choice wins over backend and environment.
+    model.use_q8k_activations(true);
+    model.use_backend(f32_backend);
+    REQUIRE(model.q8k_activations());
+    setenv("LOCUS_F32_ACTIVATIONS", "1", 1);
+    REQUIRE(model.q8k_activations());
+    unsetenv("LOCUS_F32_ACTIVATIONS");
+    model.use_q8k_activations(false);
+    model.use_backend(scalar);
+    REQUIRE_FALSE(model.q8k_activations());
 }

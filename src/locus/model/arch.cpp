@@ -945,6 +945,7 @@ void muse_spark_hparams(const gguf::GgufFile& g, const std::string& p,
     }
     hp.embd_norm = true;
     hp.custom_layer = true;
+    hp.q8k_default = true;  // the goldens are llama.cpp's
     hp.kq_scale = 1.0f / std::sqrt(static_cast<float>(hp.head_dim));
 }
 

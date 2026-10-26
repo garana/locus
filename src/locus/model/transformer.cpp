@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/arch.hpp"
@@ -137,8 +138,20 @@ backend::Ops effective_ops(const backend::Backend* b, bool q8k) {
     return op;
 }
 
+bool TransformerModel::q8k_activations() const {
+    if (q8k_override_ >= 0) {
+        return q8k_override_ == 1;
+    }
+    if (const char* e = std::getenv("LOCUS_F32_ACTIVATIONS");
+        e != nullptr && *e != '\0' && std::string_view(e) != "0") {
+        return false;
+    }
+    return hp_.q8k_default ||
+           (backend_ != nullptr && backend_->ops.prefers_q8k);
+}
+
 backend::Ops TransformerModel::ops() const {
-    return effective_ops(backend_, q8k_activations_);
+    return effective_ops(backend_, q8k_activations());
 }
 
 namespace {
@@ -313,8 +326,6 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     hp.rope_freq_base =
         get_float(g, p + "rope.freq_base", 10000.0f);
     spec->load_hparams(g, p, hp);
-    m.q8k_activations_ = hp.q8k_default &&
-                         std::getenv("LOCUS_F32_ACTIVATIONS") == nullptr;
 
     const TensorInfo* embd = g.find_tensor("token_embd.weight");
     if (embd == nullptr) {
@@ -735,7 +746,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
     }
     const std::uint32_t pos = seq.n_tokens;
     const backend::Ops op =
-        effective_ops(backend_, q8k_activations_);
+        effective_ops(backend_, q8k_activations());
 
     // Stage input: the first stage embeds the token; a later stage
     // loads the residual stream handed over by the previous stage.
@@ -971,7 +982,7 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
         }
         return;
     }
-    const Ops op = effective_ops(backend_, q8k_activations_);
+    const Ops op = effective_ops(backend_, q8k_activations());
     const std::uint32_t E = hp_.n_embd;
     const std::uint32_t ff = hp_.n_ff;
 
@@ -1071,7 +1082,7 @@ void TransformerModel::forward_batch_decode(
         throw std::invalid_argument(
             "forward_batch_decode: unsupported backend");
     }
-    const Ops op = effective_ops(backend_, q8k_activations_);
+    const Ops op = effective_ops(backend_, q8k_activations());
     const std::uint32_t E = hp_.n_embd;
     const std::uint32_t ff = hp_.n_ff;
 
@@ -1201,7 +1212,7 @@ void TransformerModel::forward_batch_layers(
         }
     }
 
-    const Ops op = effective_ops(backend_, q8k_activations_);
+    const Ops op = effective_ops(backend_, q8k_activations());
     std::vector<float> x(static_cast<std::size_t>(n) * E);
     std::vector<float> xbf(static_cast<std::size_t>(n) * E);
     std::vector<float> xb2(static_cast<std::size_t>(n) * E);
@@ -1507,7 +1518,7 @@ void TransformerModel::apply_norm(std::span<const float> x,
 void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
                          std::uint32_t layer) const {
     using namespace locus::backend;
-    const Ops op = effective_ops(backend_, q8k_activations_);
+    const Ops op = effective_ops(backend_, q8k_activations());
     const std::uint32_t n_ff = hp_.n_ff_exp;
 
     op.matvec(lay.gate_inp, ws.xb, ws.router);
@@ -1600,7 +1611,7 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
                                std::vector<float>& x,
                                std::uint32_t n, Workspace& ws) const {
     using namespace locus::backend;
-    const Ops op = effective_ops(backend_, q8k_activations_);
+    const Ops op = effective_ops(backend_, q8k_activations());
     const std::uint32_t E = hp_.n_embd;
     const std::uint32_t ff = hp_.n_ff_exp;
     const std::uint32_t k = hp_.n_expert_used;
