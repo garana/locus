@@ -106,6 +106,9 @@ enum class Kernel {
     /** attn_decode_grp with 8 heads per workgroup (GQA group <= 8). */
     kAttnDecodeGrp8,
     kAttnDecodeGrp8F16,
+    /** matvec_f16 with -DBF16: bfloat16 weights (Janus-Pro, i#247). */
+    kMatvecBF16,
+    kMatvecBF16B,
     kCount_,
 };
 
