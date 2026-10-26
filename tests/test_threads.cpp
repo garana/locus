@@ -27,6 +27,24 @@ TEST_CASE("parallel_for covers every index exactly once",
     }
 }
 
+TEST_CASE("parallel_for wakes only the workers a job needs",
+          "[threads]") {
+    // Jobs smaller than the pool wake n - 1 workers (the caller drains
+    // too); thousands of back-to-back tiny jobs must neither lose an
+    // index nor hang on a wakeup that went to a worker still busy.
+    auto& pool = ThreadPool::instance();
+    for (std::size_t n : {2u, 3u, 5u}) {
+        for (int round = 0; round < 2000; ++round) {
+            std::vector<std::atomic<int>> hits(n);
+            pool.parallel_for(
+                n, [&](std::size_t i) { hits[i].fetch_add(1); });
+            for (std::size_t i = 0; i < n; ++i) {
+                REQUIRE(hits[i].load() == 1);
+            }
+        }
+    }
+}
+
 TEST_CASE("parallel_for rethrows a worker exception",
           "[threads]") {
     auto& pool = ThreadPool::instance();
@@ -85,6 +103,18 @@ TEST_CASE("matvec_mt is bit-identical to the plain matvec",
     std::fill(got.begin(), got.end(), 0.0f);
     locus::model::matvec_mt(op, m, x, got);
     REQUIRE(got == ref);
+}
+
+TEST_CASE("weights_stream: madvise readahead only for models that "
+          "may not stay resident",
+          "[threads]") {
+    using locus::model::weights_stream;
+    constexpr std::uint64_t gib = 1ull << 30;
+    REQUIRE_FALSE(weights_stream(2 * gib, 36 * gib));  // 3B on 36 GB
+    REQUIRE_FALSE(weights_stream(18 * gib, 36 * gib));  // exactly half
+    REQUIRE(weights_stream(19 * gib, 36 * gib));
+    REQUIRE(weights_stream(250 * gib, 36 * gib));  // GLM-class stream
+    REQUIRE(weights_stream(1, 0));  // RAM unknown: keep the old default
 }
 
 TEST_CASE("matvec_mt_f32 threads the f32-activation dot under R16",

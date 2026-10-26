@@ -53,6 +53,34 @@ class SnacDecoder {
      */
     std::vector<float> decode(const model::SnacCodes& codes) const;
 
+    /**
+     * Decodes frames [f0, f1) only, from a window of `codes` that adds
+     * context_frames() frames on each side (clipped at the ends). The
+     * result is bit-identical to the same slice of decode(codes): every
+     * output sample sees the same inputs in the same order. Frames past
+     * f1 + context_frames() are never read, so a stream can emit a
+     * range before the codes after it exist.
+     *
+     * @param codes The streams, as for decode().
+     * @param f0 First frame to return.
+     * @param f1 One past the last frame (f0 <= f1 <= frame count).
+     * @returns (f1 - f0) * samples_per_frame() samples.
+     * @throws std::invalid_argument on a bad range, or as decode().
+     */
+    std::vector<float> decode_range(const model::SnacCodes& codes,
+                                    std::uint32_t f0,
+                                    std::uint32_t f1) const;
+
+    /**
+     * @returns Frames of codes on each side of a sample that can change
+     *     it: a bound on the decoder's receptive field, from its rates,
+     *     kernels and dilations (5 for the 24 kHz model, 425 ms).
+     */
+    std::uint32_t context_frames() const;
+
+    /** @returns Output samples per code frame (2048 at 24 kHz). */
+    std::uint32_t samples_per_frame() const;
+
     /** @returns The codec sample rate (Hz). */
     std::uint32_t sample_rate() const { return sample_rate_; }
 

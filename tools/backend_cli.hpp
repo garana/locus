@@ -15,6 +15,8 @@
 #include "locus/model/arch.hpp"
 #include "locus/sys/features.hpp"
 
+#include "cli_spec.hpp"
+
 namespace locus_tools {
 
 /** Why a compiled backend is unavailable on THIS machine (empty when
@@ -185,6 +187,9 @@ inline constexpr const char* kCommonHelp =
     "  --audio-max-tokens N locus-server: cap one /v1/audio/speech\n"
     "                   request at N audio tokens (7 per 85 ms\n"
     "                   frame; default 1024)\n"
+    "  --image-decoder P locus-server: enable /v1/images/generations\n"
+    "                   (Janus-Pro models) with the VQ-16 decoder\n"
+    "                   GGUF at path P\n"
     "  --prefill-f16    Vulkan: stage prefill matmul operands in\n"
     "                   f16 (faster prompt ingestion; opt-in, the\n"
     "                   f32 default is exact)\n"
@@ -254,6 +259,10 @@ struct BackendArgs {
     /** From --audio-max-tokens N: per-request audio-token cap for
      * /v1/audio/speech (0 = the server default). */
     std::uint32_t audio_max_tokens = 0;
+    /** From --image-decoder P: path to the VQ-16 decoder GGUF (arch
+     * "vq16") enabling locus-server's /v1/images/generations; empty =
+     * the endpoint is disabled (503). */
+    std::string image_decoder;
     /** From --concurrent N: submit the prompt N times and report
      * aggregate throughput (bench mode; default 1 = normal run). */
     std::uint32_t concurrent = 1;
@@ -286,6 +295,11 @@ struct BackendArgs {
     bool list_capabilities = false;
     /** --help / -h was given: print usage and exit. */
     bool help = false;
+    /** The first numeric flag (--ctx, --concurrent, --audio-max-tokens)
+     * whose value is not an integer in [0, INT_MAX], e.g. "--ctx"; empty
+     * when all parsed. bad_number_value keeps the value for the error. */
+    std::string bad_number_flag;
+    std::string bad_number_value;
 };
 
 /**
@@ -312,6 +326,18 @@ inline bool parse_kv_type(std::string_view name, locus::kv::KvType& out) {
 
 inline BackendArgs parse_backend_args(int argc, char** argv) {
     BackendArgs out;
+    // Through parse_nonneg_int, so "-1" is an error instead of wrapping
+    // to 4294967295 on the cast to uint32_t (i#176).
+    const auto number = [&out](std::string_view flag,
+                               const std::string& v, std::uint32_t& dst) {
+        int n = 0;
+        if (parse_nonneg_int(v, n)) {
+            dst = static_cast<std::uint32_t>(n);
+        } else if (out.bad_number_flag.empty()) {
+            out.bad_number_flag = std::string(flag);
+            out.bad_number_value = v;
+        }
+    };
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
         if (a == "--backends") {
@@ -331,11 +357,9 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         } else if (a.rfind("--backend=", 0) == 0) {
             out.choice = std::string(a.substr(10));
         } else if (a == "--ctx" && i + 1 < argc) {
-            out.ctx = static_cast<std::uint32_t>(
-                std::atol(argv[++i]));
+            number("--ctx", argv[++i], out.ctx);
         } else if (a.rfind("--ctx=", 0) == 0) {
-            out.ctx = static_cast<std::uint32_t>(
-                std::atol(std::string(a.substr(6)).c_str()));
+            number("--ctx", std::string(a.substr(6)), out.ctx);
         } else if (a == "--metrics-path" && i + 1 < argc) {
             out.metrics_path = argv[++i];
         } else if (a.rfind("--metrics-path=", 0) == 0) {
@@ -345,17 +369,19 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         } else if (a.rfind("--audio-decoder=", 0) == 0) {
             out.audio_decoder = std::string(a.substr(16));
         } else if (a == "--audio-max-tokens" && i + 1 < argc) {
-            out.audio_max_tokens = static_cast<std::uint32_t>(
-                std::atol(argv[++i]));
+            number("--audio-max-tokens", argv[++i], out.audio_max_tokens);
         } else if (a.rfind("--audio-max-tokens=", 0) == 0) {
-            out.audio_max_tokens = static_cast<std::uint32_t>(
-                std::atol(std::string(a.substr(19)).c_str()));
+            number("--audio-max-tokens", std::string(a.substr(19)),
+                   out.audio_max_tokens);
+        } else if (a == "--image-decoder" && i + 1 < argc) {
+            out.image_decoder = argv[++i];
+        } else if (a.rfind("--image-decoder=", 0) == 0) {
+            out.image_decoder = std::string(a.substr(16));
         } else if (a == "--concurrent" && i + 1 < argc) {
-            out.concurrent = static_cast<std::uint32_t>(
-                std::atol(argv[++i]));
+            number("--concurrent", argv[++i], out.concurrent);
         } else if (a.rfind("--concurrent=", 0) == 0) {
-            out.concurrent = static_cast<std::uint32_t>(
-                std::atol(std::string(a.substr(13)).c_str()));
+            number("--concurrent", std::string(a.substr(13)),
+                   out.concurrent);
         } else if (a == "--prefill-f16") {
             out.prefill_f16 = true;
         } else if (a == "--speculative") {

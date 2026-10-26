@@ -262,6 +262,15 @@ Notes:
   Both policies are DEFAULT-ON since then (the flags
   LOCUS_EXPERT_READAHEAD / LOCUS_LAYER_READAHEAD are gone);
   LOCUS_NO_READAHEAD=1 restores passive streaming for A/Bs.
+  Since 2026-10-24 the madvise hints run only when the weights
+  may stream (weights_stream: more than half of RAM, or RAM
+  unknown); a model that fits stays resident after one pass, and
+  hinting resident pages per token is not free (Orpheus 3B on
+  M4: ~4.5 ms/token, 17% of decode). The pager's op.prefetch
+  hints are unaffected. The cost: a model under half of RAM
+  loads its first pass cold without the hints (the 33% GLM gain
+  was cold streaming). A later refinement could keep them for the
+  first N tokens.
 - Future work (2026-07-21): overlap I/O with compute one step
   ahead. Mechanism notes: each shard is mmap'd once, whole-file
   (PROT_READ MAP_PRIVATE, never written) -- weight pages are
@@ -537,7 +546,8 @@ floor.
   ACTIVE backend's op.matvec into a disjoint out span. Each
   row's dot is computed by the same kernel code as today, so
   logits are bit-identical for every thread count. Knob
-  LOCUS_THREADS (default: hardware cores, 1 disables). Applies
+  LOCUS_THREADS (default: hardware cores -- performance cores on
+  Apple silicon -- 1 disables). Applies
   to the CPU forward's large matvecs (attention projections,
   dense FFN, expert FFN, output head); matvec_t (small latent
   ops) and the vulkan full forward are untouched. Parallel
@@ -1323,11 +1333,14 @@ matvec throughput.
   matvec_q8k bit-for-bit across all 15 (margin 1e-4). Note Q3_K had no
   CUDA kernel at all before this; its Q8_K kernel is the first GPU
   Q3_K path (the f32 matvec_cuda still delegates Q3_K to scalar).
-- SSE4 (done): matvec_sse4_q8k covers all five k-quants -- Q3/Q4/Q5/
-  Q6 via a widen-then-per-lane int32 accumulate (no maddubs, to keep
-  the scalar lane order), Q2_K via maddubs (its per-16 isuml is a
-  single total, so the pair-collapse is exact). Ternary + IQ delegate
-  to scalar. This host is SSE4-only (no AVX2/NEON here).
+- SSE4 (done): matvec_sse4_q8k covers all five k-quants, bit-for-bit
+  with scalar matvec_q8k. Q4/Q5/Q6 use maddubs on bytes shuffled to
+  (0,8,1,9,...), so each pair-sum stays in one scalar lane (e % 8);
+  Q3 widens per lane; Q2_K maddubs directly (its per-16 isuml is a
+  single total). An earlier fast path summed each block into one
+  float; that order flipped muse's greedy tokens on x86 (PR#197).
+  Ternary + IQ delegate to scalar. This host is SSE4-only (no
+  AVX2/NEON here).
 - NOT the model default -- Q8_K is an OPT-IN mode
   (TransformerModel::use_q8k_activations, default off). Why not the
   default: "bit-exact with llama.cpp" is unachievable in principle -- ggml
@@ -1367,7 +1380,10 @@ matvec throughput.
   this, the hooks that call matvec_mt (deepseek2's MLA, glm-dsa's
   indexer, muse-spark, deepseek41) took Q8_K with the flag off. With
   the Q8_0 dots, Muse Spark's second golden prompt became token-exact
-  against llama.cpp.
+  against llama.cpp on arm64 NEON; x86 SSE4 still tips it on the f32
+  side, so the test stays teacher-forced on every lane. Likewise the
+  deepseek41 goldens (prompt 1's third token tips on x86, and on arm64
+  since #237's NEON BF16 dot): teacher-forced on every lane.
 
 ## 8. Testing strategy
 

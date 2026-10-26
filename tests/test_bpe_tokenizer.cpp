@@ -1,8 +1,10 @@
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "json.hpp"
 #include "gguf_builder.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/tok/bpe_tokenizer.hpp"
@@ -164,4 +166,56 @@ TEST_CASE("bpe pretokenizers: gpt-4o splits case runs and keeps "
     REQUIRE(tok_for("llama3").encode("foBar", false) == V{0, 8, 3, 4});
     REQUIRE(tok_for("gpt-4o").encode("t's", false) == V{9, 7});
     REQUIRE(tok_for("llama3").encode("t's", false) == V{5, 6, 7});
+}
+
+// i#226, model-free: merges "1 2" and "\n \n" (Ċ Ċ in the byte
+// alphabet) would join across the deepseek-llm split points. It splits
+// every digit and isolates every newline, so neither merge applies;
+// gpt2 keeps the digit run and the newline run whole.
+TEST_CASE("bpe pretokenizers: deepseek-llm splits digits and newlines",
+          "[tok]") {
+    auto tok_for = [](const char* pre) {
+        BpeTokenizer::Config cfg;
+        cfg.tokens = {"1", "2", "12", "\xC4\x8A", "\xC4\x8A\xC4\x8A"};
+        cfg.types = std::vector<std::int32_t>(cfg.tokens.size(), 1);
+        cfg.merges = {"1 2", "\xC4\x8A \xC4\x8A"};
+        cfg.pre = pre;
+        return BpeTokenizer(std::move(cfg));
+    };
+    using V = std::vector<TokenId>;
+    REQUIRE(tok_for("deepseek-llm").encode("12\n\n", false) ==
+            V{0, 1, 3, 3});
+    REQUIRE(tok_for("gpt2").encode("12\n\n", false) == V{2, 4});
+}
+
+// i#226: the deepseek-llm pre-tokenizer (Janus-Pro), token-exact
+// against the HF tokenizer on a corpus that covers its splits:
+// newlines, letter and punctuation runs with their optional leading
+// space, trailing whitespace, CJK / Hangul / kana runs, single digits
+// (ASCII and other numerics), fullwidth forms, emoji, tabs. The ids come
+// from scripts/make-janus-goldens.py tokenizer.
+TEST_CASE("deepseek-llm pre-tokenizer matches the HF tokenizer",
+          "[tok][e2e]") {
+    const std::string model = std::string(LOCUS_SOURCE_DIR) +
+                              "/tests/models/janus-pro-1b-f16.gguf";
+    if (!std::filesystem::exists(model)) {
+        SKIP("janus-pro-1b-f16.gguf absent; see scripts/convert-janus.py");
+    }
+    auto g = locus::gguf::GgufFile::open(model);
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    std::ifstream f(std::string(LOCUS_SOURCE_DIR) +
+                    "/tests/golden/janus_tokenizer.jsonl");
+    REQUIRE(f.good());
+    int cases = 0;
+    for (std::string line; std::getline(f, line);) {
+        const auto j = nlohmann::json::parse(line);
+        const auto text = j["text"].get<std::string>();
+        const auto want = j["ids"].get<std::vector<TokenId>>();
+        INFO("text " << j["text"].dump());
+        REQUIRE(tok->encode(text, false) == want);
+        ++cases;
+    }
+    REQUIRE(cases >= 20);
+    // add_bos_token is written explicitly by the converter.
+    REQUIRE(tok->encode("hi", true).front() == 100000);
 }

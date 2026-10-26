@@ -159,7 +159,11 @@ struct SynthOpts {
     std::string drop;     ///< tensor to leave out
     std::string shorten;  ///< tensor to write one value short
     std::uint32_t n_codebooks = 3;
-    int noise = -1;       ///< -1: no snac.noise key; 0/1: write it
+    // Layout keys: -1 leaves the key out, 0/1 writes it as a bool, and 2
+    // writes it as a u32 0 (a wrong type).
+    int depthwise = -1;
+    int noise = -1;
+    int attention = -1;
 };
 
 /**
@@ -245,8 +249,14 @@ std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
     add("decoder.model." + tail_conv + ".weight", {1, ch, 7});
     add("decoder.model." + tail_conv + ".bias", {1});
 
+    const std::pair<const char*, int> layout[] = {
+        {"snac.depthwise", o.depthwise},
+        {"snac.noise", o.noise},
+        {"snac.attention", o.attention}};
+    std::uint64_t n_kv = 9;
+    for (const auto& [key, v] : layout) n_kv += v >= 0 ? 1 : 0;
     GgufBuilder g;
-    g.header(ts.size(), o.noise >= 0 ? 10 : 9);
+    g.header(ts.size(), n_kv);
     g.kv_string("general.architecture", "snac");
     g.kv_u32("snac.sampling_rate", 24000);
     g.kv_u32("snac.decoder_dim", kDec);
@@ -258,7 +268,13 @@ std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
     g.kv_i32_array("snac.decoder_rates", r);
     const std::vector<std::int32_t> strides = {4, 2, 1};
     g.kv_i32_array("snac.vq_strides", strides);
-    if (o.noise >= 0) g.kv_bool("snac.noise", o.noise != 0);
+    for (const auto& [key, v] : layout) {
+        if (v == 2) {
+            g.kv_u32(key, 0);
+        } else if (v >= 0) {
+            g.kv_bool(key, v != 0);
+        }
+    }
     std::uint64_t offset = 0;
     for (const auto& t : ts) {
         g.tensor(t.name, t.dims, 0 /* F32 */, offset);
@@ -276,9 +292,15 @@ std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
 /** Codes for F frames, cycling through the codebook. */
 locus::model::SnacCodes synth_codes(std::uint32_t frames, int shift = 0) {
     locus::model::SnacCodes c;
-    for (std::uint32_t i = 0; i < frames; ++i) c.coarse.push_back((i + shift) % 4);
-    for (std::uint32_t i = 0; i < 2 * frames; ++i) c.mid.push_back((i + 1) % 4);
-    for (std::uint32_t i = 0; i < 4 * frames; ++i) c.fine.push_back((i + 2) % 4);
+    for (std::uint32_t i = 0; i < frames; ++i) {
+        c.coarse.push_back((i + shift) % 4);
+    }
+    for (std::uint32_t i = 0; i < 2 * frames; ++i) {
+        c.mid.push_back((i + 1) % 4);
+    }
+    for (std::uint32_t i = 0; i < 4 * frames; ++i) {
+        c.fine.push_back((i + 2) % 4);
+    }
     return c;
 }
 
@@ -326,7 +348,10 @@ TEST_CASE("snac decoder matches torch on a synthetic model", "[snac]") {
                               std::vector<std::uint32_t>{4, 2, 2, 2}}) {
         std::string name = "snac_synth_r";
         for (std::size_t i = 0; i < rates.size(); ++i) {
-            name += (i ? "-" : "") + std::to_string(rates[i]);
+            // Two appends: GCC 12 warns (-Wrestrict, a false positive)
+            // on "literal" + std::string here.
+            name += i ? "-" : "";
+            name += std::to_string(rates[i]);
         }
         INFO(name);
         const auto ref = read_f32(golden_dir() + "/" + name + ".f32");
@@ -373,11 +398,28 @@ TEST_CASE("snac decoder rejects malformed models and codes", "[snac]") {
         REQUIRE_THROWS_AS(load({3, 2}, SynthOpts{}), locus::gguf::Error);
     }
     SECTION("a recorded layout locus does not run") {
-        SynthOpts o;
-        o.noise = 0;
-        REQUIRE_THROWS_AS(load({2, 2}, o), locus::gguf::Error);
-        o.noise = 1;  // the supported layout still loads
-        REQUIRE_NOTHROW(load({2, 2}, o));
+        // One key at a time; the others hold the supported value.
+        const auto with = [](int depthwise, int noise, int attention) {
+            SynthOpts o;
+            o.depthwise = depthwise;
+            o.noise = noise;
+            o.attention = attention;
+            return o;
+        };
+        REQUIRE_THROWS_AS(load({2, 2}, with(0, 1, 0)), locus::gguf::Error);
+        REQUIRE_THROWS_AS(load({2, 2}, with(1, 0, 0)), locus::gguf::Error);
+        REQUIRE_THROWS_AS(load({2, 2}, with(1, 1, 1)), locus::gguf::Error);
+        // The supported layout still loads.
+        REQUIRE_NOTHROW(load({2, 2}, with(1, 1, 0)));
+    }
+    SECTION("a layout key that is not a bool") {
+        // A u32 0 must not read as "key absent" (= the default layout).
+        for (int k = 0; k < 3; ++k) {
+            INFO("key " << k);
+            SynthOpts o;
+            (k == 0 ? o.depthwise : k == 1 ? o.noise : o.attention) = 2;
+            REQUIRE_THROWS_AS(load({2, 2}, o), locus::gguf::Error);
+        }
     }
     SECTION("a tensor one value short") {
         for (const char* name :
@@ -430,4 +472,85 @@ TEST_CASE("pcm encode writes a WAV header and clamped s16", "[wav]") {
         s, 24000, locus::audio::WaveFormat::kPcm16);
     REQUIRE(pcm.size() == s.size() * 2);            // no header.
     REQUIRE(le16(pcm, 2) == 32767);                 // same samples.
+
+    // A stream's header: the same fields, unknown-length sizes.
+    const auto hdr = locus::audio::wav_stream_header(24000);
+    REQUIRE(hdr.size() == 44);
+    REQUIRE(std::memcmp(hdr.data(), wav.data(), 4) == 0);         // RIFF
+    REQUIRE(std::memcmp(hdr.data() + 8, wav.data() + 8, 32) == 0);
+    REQUIRE(le32(hdr, 4) == 0xFFFFFFFFu);
+    REQUIRE(le32(hdr, 40) == 0xFFFFFFFFu);
+}
+
+namespace {
+
+/**
+ * Requires that decode_range over every partition of the frames into
+ * runs of `chunk` reassembles decode(codes) bit for bit, for several
+ * chunk sizes (streaming emits such runs).
+ */
+void require_ranges_match(const locus::audio::SnacDecoder& dec,
+                          const locus::model::SnacCodes& codes) {
+    const auto full = dec.decode(codes);
+    const auto F = static_cast<std::uint32_t>(codes.coarse.size());
+    for (const std::uint32_t chunk : {1u, 2u, 3u, 8u, F}) {
+        INFO("chunk " << chunk << " of " << F << " frames");
+        std::vector<float> got;
+        for (std::uint32_t f = 0; f < F; f += chunk) {
+            const auto part =
+                dec.decode_range(codes, f, std::min(F, f + chunk));
+            got.insert(got.end(), part.begin(), part.end());
+        }
+        REQUIRE(got.size() == full.size());
+        REQUIRE(std::memcmp(got.data(), full.data(),
+                            full.size() * sizeof(float)) == 0);
+    }
+}
+
+}  // namespace
+
+// i#173 streaming: a frame range decoded from a window with
+// context_frames() of context on each side equals the same slice of the
+// full decode, and never depends on frames past that context.
+TEST_CASE("snac decode_range is bit-identical to the full decode",
+          "[snac]") {
+    for (const auto& rates : {std::vector<std::uint32_t>{2, 2},
+                              std::vector<std::uint32_t>{4, 2, 2, 2}}) {
+        INFO("rates " << rates.size());
+        const auto img = synth_snac(rates);
+        auto g = locus::gguf::GgufFile::parse(img);
+        const auto dec = locus::audio::SnacDecoder::load(g);
+        const auto codes = synth_codes(30, 1);
+        require_ranges_match(dec, codes);
+
+        // Frames from f1 + ctx on can change without moving [f0, f1).
+        const std::uint32_t ctx = dec.context_frames();
+        const std::uint32_t f0 = 4, f1 = 9;
+        auto changed = codes;
+        for (std::uint32_t f = f1 + ctx; f < 30; ++f) {
+            changed.coarse[f] = (changed.coarse[f] + 1) % 4;
+            for (int k = 0; k < 2; ++k) {
+                changed.mid[2 * f + k] = (changed.mid[2 * f + k] + 3) % 4;
+            }
+            for (int k = 0; k < 4; ++k) {
+                changed.fine[4 * f + k] = (changed.fine[4 * f + k] + 2) % 4;
+            }
+        }
+        REQUIRE(dec.decode_range(changed, f0, f1) ==
+                dec.decode_range(codes, f0, f1));
+        REQUIRE(dec.decode(changed) != dec.decode(codes));
+    }
+}
+
+TEST_CASE("snac decode_range matches the full decode on real speech",
+          "[snac][e2e]") {
+    if (!snac_e2e_inputs({"snac_speech_codes.txt"})) {
+        SKIP("snac GGUF absent; make it with scripts/convert-snac.py");
+    }
+    auto g = locus::gguf::GgufFile::open(snac_gguf_path());
+    const auto dec = locus::audio::SnacDecoder::load(g);
+    REQUIRE(dec.context_frames() == 5);
+    REQUIRE(dec.samples_per_frame() == 2048);
+    require_ranges_match(dec,
+                         read_codes(golden_dir() + "/snac_speech_codes.txt"));
 }
