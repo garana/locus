@@ -13,6 +13,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan_forward.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
@@ -147,6 +148,8 @@ TEST_CASE("janus CFG codes on the Vulkan forward (teacher-forced)",
     auto g = locus::gguf::GgufFile::open(model);
     auto m = locus::model::TransformerModel::load(g);
     m.use_backend(*locus::backend::find_backend("vulkan"));
+    // Else forward_embedding quietly runs the per-op path.
+    REQUIRE(locus::backend::vulkan_forward_supported(m));
     const auto gen =
         locus::image::JanusImageGen::load(g, m.hparams().n_embd);
     const std::vector<locus::tok::TokenId> ids(prompt.begin(), prompt.end());

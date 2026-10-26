@@ -563,6 +563,18 @@ void TransformerModel::forward_embedding(
         throw std::invalid_argument(
             "forward_embedding: normed_out must hold n_embd floats");
     }
+    // forward()'s checks: vulkan_forward reads the token's row and the
+    // head rows unchecked.
+    if (embd_in.empty() &&
+        (token < 0 || static_cast<std::uint32_t>(token) >= hp_.n_vocab)) {
+        throw std::invalid_argument("token id out of vocab");
+    }
+    if (rows.end == 0) {
+        rows = {0, hp_.n_vocab};
+    }
+    if (rows.begin >= rows.end || rows.end > hp_.n_vocab) {
+        throw std::invalid_argument("forward_embedding: bad logit row range");
+    }
     if (backend_->name == "vulkan" &&
         backend::vulkan_forward(*this, embd_in.empty() ? token : 0, cache,
                                 seq, logits, rows.begin, rows.end, embd_in,

@@ -358,7 +358,9 @@ class TransformerModel {
      * @param normed_out n_embd floats that receive the normed hidden
      *     state.
      * @throws std::invalid_argument on a wrong embd_in / normed_out
-     *     size, or an input embedding for an arch with its own forward.
+     *     size, a token out of vocab (when embd_in is empty), a bad
+     *     row range, or an input embedding for an arch with its own
+     *     forward.
      */
     void forward_embedding(tok::TokenId token,
                            std::span<const float> embd_in,
