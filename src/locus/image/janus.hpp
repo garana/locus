@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -42,6 +43,9 @@ class JanusImageGen {
 
     /**
      * Loads the janus.* tensors (F32) and keys from the model's GGUF.
+     * The tensors are views into g's mapping, not copies, so g must
+     * outlive the JanusImageGen. A GPU backend then caches them by
+     * their mapped address, as it does the model's weights.
      * @throws gguf::Error when they are missing or the wrong size.
      */
     static JanusImageGen load(const gguf::GgufFile& g, std::uint32_t n_embd);
@@ -55,14 +59,28 @@ class JanusImageGen {
     /** @returns The <begin_of_image> id that ends the prompt. */
     tok::TokenId begin_of_image() const { return begin_of_image_; }
 
-    /** The input embedding of image code `id`: gen_aligner(gen_embed). */
-    void image_embed(std::int32_t id, std::span<float> out) const;
-
-    /** Image-code logits from a final normed hidden state (gen_head). */
-    void image_logits(std::span<const float> h, std::span<float> out) const;
+    /**
+     * The input embedding of image code `id`: gen_aligner(gen_embed).
+     *
+     * @param gpu When set, the two matvecs run through gpu->matvec,
+     *     one whole-matrix call each (a GPU backend's ops); otherwise
+     *     on the CPU thread pool.
+     */
+    void image_embed(std::int32_t id, std::span<float> out,
+                     const backend::Ops* gpu = nullptr) const;
 
     /**
-     * Generates one image's codes, row-major, on the model's CPU ops.
+     * Image-code logits from a final normed hidden state (gen_head).
+     *
+     * @param gpu As for image_embed.
+     */
+    void image_logits(std::span<const float> h, std::span<float> out,
+                      const backend::Ops* gpu = nullptr) const;
+
+    /**
+     * Generates one image's codes, row-major. The backbone runs on the
+     * model's backend; on vulkan the image heads run on the GPU too
+     * (i#247), elsewhere on the CPU thread pool.
      *
      * @param m The Janus-Pro backbone.
      * @param prompt The conditional prompt ids, BOS first and
@@ -100,7 +118,7 @@ class JanusImageGen {
   private:
     std::span<const float> t(const std::string& name, std::size_t n) const;
 
-    std::unordered_map<std::string, std::vector<float>> w_;
+    std::unordered_map<std::string, std::span<const float>> w_;
     std::uint32_t n_embd_ = 0;
     std::uint32_t codes_ = 0;  ///< codebook size (16384)
     std::uint32_t grid_ = 0;

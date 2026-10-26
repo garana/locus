@@ -460,10 +460,12 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         // endpoint a 503; one that has it but fails to load is a broken
         // file and stops the server here.
         if (!opt_.model_path.empty()) {
-            auto mg = gguf::GgufFile::open(opt_.model_path);
-            if (mg.find("janus.image_tokens") != nullptr) {
+            auto mg = std::make_unique<gguf::GgufFile>(
+                gguf::GgufFile::open(opt_.model_path));
+            if (mg->find("janus.image_tokens") != nullptr) {
                 janus_ = std::make_unique<image::JanusImageGen>(
-                    image::JanusImageGen::load(mg, m.hparams().n_embd));
+                    image::JanusImageGen::load(*mg, m.hparams().n_embd));
+                janus_gguf_ = std::move(mg);
             }
         }
     }

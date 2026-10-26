@@ -104,7 +104,7 @@ JanusImageGen JanusImageGen::load(const gguf::GgufFile& g,
         }
         auto bytes = g.tensor_data(ti);
         const auto* p = reinterpret_cast<const float*>(bytes.data());
-        j.w_.emplace(ti.name, std::vector<float>(p, p + ti.nelements()));
+        j.w_.emplace(ti.name, std::span<const float>(p, ti.nelements()));
     }
     // Every tensor at its expected size now, so a bad file fails at
     // load, not mid-generation.
@@ -145,10 +145,21 @@ void matvec_pool(const backend::Mat& w, std::span<const float> x,
     });
 }
 
+/** matvec_pool, or one whole-matrix gpu->matvec call when gpu is set
+ * (i#247: the heads on the GPU next to the fused forward). */
+void head_matvec(const backend::Mat& w, std::span<const float> x,
+                 std::span<float> out, const backend::Ops* gpu) {
+    if (gpu != nullptr) {
+        gpu->matvec(w, x, out);
+        return;
+    }
+    matvec_pool(w, x, out);
+}
+
 }  // namespace
 
-void JanusImageGen::image_embed(std::int32_t id,
-                                std::span<float> out) const {
+void JanusImageGen::image_embed(std::int32_t id, std::span<float> out,
+                                const backend::Ops* gpu) const {
     if (id < 0 || static_cast<std::uint32_t>(id) >= codes_) {
         throw std::invalid_argument("janus: image code out of range");
     }
@@ -156,41 +167,42 @@ void JanusImageGen::image_embed(std::int32_t id,
     const auto emb = t("janus.gen_embed.weight", std::size_t{codes_} * 8)
                          .subspan(std::size_t(id) * 8, 8);
     std::vector<float> h(e);
-    matvec_pool({gguf::TensorType::kF32,
+    head_matvec({gguf::TensorType::kF32,
                  reinterpret_cast<const std::byte*>(
                      t("janus.gen_aligner.0.weight", e * 8).data()),
                  n_embd_, 8},
-                emb, h);
+                emb, h, gpu);
     const auto b0 = t("janus.gen_aligner.0.bias", e);
     for (std::size_t i = 0; i < e; ++i) h[i] += b0[i];
     gelu(h);
-    matvec_pool({gguf::TensorType::kF32,
+    head_matvec({gguf::TensorType::kF32,
                  reinterpret_cast<const std::byte*>(
                      t("janus.gen_aligner.2.weight", e * e).data()),
                  n_embd_, n_embd_},
-                h, out);
+                h, out, gpu);
     const auto b2 = t("janus.gen_aligner.2.bias", e);
     for (std::size_t i = 0; i < e; ++i) out[i] += b2[i];
 }
 
 void JanusImageGen::image_logits(std::span<const float> h,
-                                 std::span<float> out) const {
+                                 std::span<float> out,
+                                 const backend::Ops* gpu) const {
     const std::size_t e = n_embd_;
     std::vector<float> p(e);
-    matvec_pool({gguf::TensorType::kF32,
+    head_matvec({gguf::TensorType::kF32,
                  reinterpret_cast<const std::byte*>(
                      t("janus.gen_head.proj.weight", e * e).data()),
                  n_embd_, n_embd_},
-                h, p);
+                h, p, gpu);
     const auto pb = t("janus.gen_head.proj.bias", e);
     for (std::size_t i = 0; i < e; ++i) p[i] += pb[i];
     gelu(p);
-    matvec_pool({gguf::TensorType::kF32,
+    head_matvec({gguf::TensorType::kF32,
                  reinterpret_cast<const std::byte*>(
                      t("janus.gen_head.out.weight", std::size_t{codes_} * e)
                          .data()),
                  codes_, n_embd_},
-                p, out);
+                p, out, gpu);
     const auto ob = t("janus.gen_head.out.bias", codes_);
     for (std::uint32_t i = 0; i < codes_; ++i) out[i] += ob[i];
 }
@@ -232,6 +244,11 @@ std::vector<std::int32_t> JanusImageGen::generate(
     // forward_embedding returns the final normed hidden state (on the
     // fused GPU forward when the backend has it, i#247).
     const model::LogitRows one{0, 1};
+    // On vulkan the heads run on the GPU as well (i#247); the
+    // backend's matvec caches their weights by mapped address.
+    const backend::Ops* gpu = m.active_backend().name == "vulkan"
+                                  ? &m.active_backend().ops
+                                  : nullptr;
     const std::vector<tok::TokenId> uncond = unconditional(prompt);
     kv::PagedKvCache::Seq seq[2];
     const std::span<const tok::TokenId> ids[2] = {prompt, uncond};
@@ -245,7 +262,7 @@ std::vector<std::int32_t> JanusImageGen::generate(
             m.forward_embedding(id, {}, cache, seq[s], ws, logits, one,
                                 normed);
         }
-        image_logits(normed, img[s]);
+        image_logits(normed, img[s], gpu);
     }
 
     model::SamplingParams sp;
@@ -265,11 +282,11 @@ std::vector<std::int32_t> JanusImageGen::generate(
             model::sample(guided, sp, {}, rng));
         out.push_back(code);
         if (i + 1 == image_tokens()) break;
-        image_embed(code, emb);
+        image_embed(code, emb, gpu);
         for (int s = 0; s < 2; ++s) {
             m.forward_embedding(0, emb, cache, seq[s], ws, logits, one,
                                 normed);
-            image_logits(normed, img[s]);
+            image_logits(normed, img[s], gpu);
         }
     }
     for (auto& s : seq) cache.release(s);

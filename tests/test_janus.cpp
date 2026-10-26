@@ -152,6 +152,8 @@ TEST_CASE("janus CFG codes on the Vulkan forward (teacher-forced)",
     REQUIRE(locus::backend::vulkan_forward_supported(m));
     const auto gen =
         locus::image::JanusImageGen::load(g, m.hparams().n_embd);
+    // The heads on the GPU too, as generate() runs them on vulkan.
+    const auto* gpu = &m.active_backend().ops;
     const std::vector<locus::tok::TokenId> ids(prompt.begin(), prompt.end());
 
     // Free-running: time and the first differing code.
@@ -193,7 +195,7 @@ TEST_CASE("janus CFG codes on the Vulkan forward (teacher-forced)",
             m.forward_embedding(id, {}, cache, seq[k], ws, logits, one,
                                 normed);
         }
-        gen.image_logits(normed, img[k]);
+        gen.image_logits(normed, img[k], gpu);
     }
     float worst = 0.0f;
     std::size_t argmax_hits = 0;
@@ -209,11 +211,11 @@ TEST_CASE("janus CFG codes on the Vulkan forward (teacher-forced)",
         INFO("code " << i << ": gap " << gap);
         REQUIRE(gap <= kMargin);
         if (i + 1 == codes.size()) break;
-        gen.image_embed(codes[i], emb);
+        gen.image_embed(codes[i], emb, gpu);
         for (int k = 0; k < 2; ++k) {
             m.forward_embedding(0, emb, cache, seq[k], ws, logits, one,
                                 normed);
-            gen.image_logits(normed, img[k]);
+            gen.image_logits(normed, img[k], gpu);
         }
     }
     WARN("vulkan teacher-forced: " << argmax_hits << " of 576 argmax, worst "
