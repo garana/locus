@@ -24,6 +24,7 @@
 #include "locus/model/codec.hpp"
 #include "locus/model/grammar.hpp"
 #include "locus/model/sampling.hpp"
+#include "locus/server/errors.hpp"
 #include "locus/server/tools.hpp"
 #include "locus/sys/perf_counters.hpp"
 
@@ -36,6 +37,18 @@ using nlohmann::json;
 json make_error(const std::string& message) {
     return json{{"error", {{"message", message},
                            {"type", "invalid_request_error"}}}};
+}
+
+/** Fills res for an exception a handler caught: 400 with
+ * invalid_request_error for a client error, else 500 with server_error
+ * (see http_status_for). */
+void set_error(http::ServerResponse& res, const std::exception& e) {
+    res.status = http_status_for(e);
+    const char* type =
+        res.status == 400 ? "invalid_request_error" : "server_error";
+    res.set_content(
+        json{{"error", {{"message", e.what()}, {"type", type}}}}.dump(),
+        "application/json");
 }
 
 /** Parses and validates the OpenAI messages array. */
@@ -1634,9 +1647,7 @@ void OpenAiServer::install_routes() {
                         bytes.size()),
                     ctype);
             } catch (const std::exception& e) {
-                res.status = 400;
-                res.set_content(make_error(e.what()).dump(),
-                                "application/json");
+                set_error(res, e);
             }
     };
 
@@ -1768,9 +1779,7 @@ void OpenAiServer::install_routes() {
                         .dump(),
                     "application/json");
             } catch (const std::exception& e) {
-                res.status = 400;
-                res.set_content(make_error(e.what()).dump(),
-                                "application/json");
+                set_error(res, e);
             }
     };
 

@@ -55,6 +55,7 @@ add_library(locus
     src/locus/pipeline/stage_executor.cpp
     src/locus/pipeline/stage_server.cpp
     src/locus/server/engine_loop.cpp
+    src/locus/server/errors.cpp
     src/locus/server/server.cpp
     src/locus/server/tools.cpp
     src/locus/http/base64.cpp
