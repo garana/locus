@@ -227,9 +227,10 @@ std::vector<std::int32_t> JanusImageGen::generate(
         static_cast<std::uint32_t>(prompt.size()) + image_tokens();
     auto cache = m.make_cache();
     auto ws = m.make_workspace();
-    std::vector<float> logits(hp.n_vocab);
-    // The backbone's text head is not needed: one row keeps it cheap,
-    // and ws.xb still holds the final normed hidden state.
+    std::vector<float> logits(hp.n_vocab), normed(hp.n_embd);
+    // The backbone's text head is not needed: one row keeps it cheap.
+    // forward_embedding returns the final normed hidden state (on the
+    // fused GPU forward when the backend has it, i#247).
     const model::LogitRows one{0, 1};
     const std::vector<tok::TokenId> uncond = unconditional(prompt);
     kv::PagedKvCache::Seq seq[2];
@@ -241,11 +242,10 @@ std::vector<std::int32_t> JanusImageGen::generate(
             throw std::runtime_error("janus: KV cache too small");
         }
         for (const tok::TokenId id : ids[s]) {
-            m.forward_layers(id, {}, 0, hp.n_layers, cache, seq[s], ws,
-                             logits, one);
+            m.forward_embedding(id, {}, cache, seq[s], ws, logits, one,
+                                normed);
         }
-        image_logits(std::span<const float>(ws.xb).first(hp.n_embd),
-                     img[s]);
+        image_logits(normed, img[s]);
     }
 
     model::SamplingParams sp;
@@ -267,10 +267,9 @@ std::vector<std::int32_t> JanusImageGen::generate(
         if (i + 1 == image_tokens()) break;
         image_embed(code, emb);
         for (int s = 0; s < 2; ++s) {
-            m.forward_layers(0, emb, 0, hp.n_layers, cache, seq[s], ws,
-                             logits, one);
-            image_logits(std::span<const float>(ws.xb).first(hp.n_embd),
-                         img[s]);
+            m.forward_embedding(0, emb, cache, seq[s], ws, logits, one,
+                                normed);
+            image_logits(normed, img[s]);
         }
     }
     for (auto& s : seq) cache.release(s);

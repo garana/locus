@@ -37,6 +37,11 @@ bool vulkan_forward_supported(const model::TransformerModel& m);
  * @param row_begin First output-head row to compute.
  * @param row_end One past the last (0: every row). Logits outside the
  *     range are left unspecified; TransformerModel::forward sets them.
+ * @param embd_in When not empty, the n_embd input embedding used
+ *     instead of token's row (Janus image codes, i#247); token is then
+ *     ignored.
+ * @param normed_out When not empty, receives the n_embd normed hidden
+ *     state after the final norm (what the head reads).
  * @returns true when it ran (seq advanced, logits filled); false
  *     when unsupported -- weights in types without shaders, or a
  *     cache whose pool is not GPU-mapped -- so the caller falls
@@ -46,7 +51,9 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     kv::PagedKvCache& cache,
                     kv::PagedKvCache::Seq& seq,
                     std::span<float> logits, std::uint32_t row_begin = 0,
-                    std::uint32_t row_end = 0);
+                    std::uint32_t row_end = 0,
+                    std::span<const float> embd_in = {},
+                    std::span<float> normed_out = {});
 
 /**
  * Runs N tokens of one sequence (a prefill chunk) through the GPU
