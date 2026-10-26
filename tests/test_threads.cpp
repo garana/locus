@@ -120,51 +120,6 @@ TEST_CASE("weights_stream: madvise readahead only for models that "
     REQUIRE(weights_stream(1, 0));  // RAM unknown: keep the old default
 }
 
-TEST_CASE("matvec_mt_f32 threads the f32-activation dot under R16",
-          "[threads]") {
-    using locus::backend::Mat;
-    // Q4_K, a type matvec_mt would send to matvec_q8k when it is set.
-    constexpr std::uint32_t rows = 301;
-    constexpr std::uint32_t cols = 512;
-    std::vector<std::byte> w(static_cast<std::size_t>(rows) * cols /
-                             256 * 144);
-    std::uint32_t s = 777;
-    for (auto& b : w) {
-        s = s * 1664525u + 1013904223u;
-        b = static_cast<std::byte>(s >> 24);
-    }
-    for (std::size_t b = 0; b < w.size() / 144; ++b) {
-        w[b * 144 + 1] = std::byte{0x20};  // d, dmin: small normals
-        w[b * 144 + 3] = std::byte{0x20};
-    }
-    std::vector<float> x(cols);
-    for (auto& v : x) {
-        s = s * 1664525u + 1013904223u;
-        v = static_cast<float>(s >> 8) /
-                static_cast<float>(1u << 24) - 0.5f;
-    }
-    Mat m;
-    m.type = locus::gguf::TensorType::kQ4_K;
-    m.data = w.data();
-    m.rows = rows;
-    m.cols = cols;
-
-    const auto& op = locus::backend::find_backend("scalar")->ops;
-    REQUIRE(op.matvec_q8k != nullptr);
-    std::vector<float> ref(rows), q8(rows), got(rows);
-    op.matvec(m, x, ref);
-    op.matvec_q8k(m, x, q8);
-    REQUIRE(q8 != ref);  // the two dots differ, so the test can tell
-    for (const char* t : {"1", "5"}) {
-        setenv("LOCUS_THREADS", t, 1);
-        locus::model::matvec_mt_f32(op, m, x, got);
-        REQUIRE(got == ref);
-        locus::model::matvec_mt(op, m, x, got);
-        REQUIRE(got == q8);
-    }
-    unsetenv("LOCUS_THREADS");
-}
-
 TEST_CASE("matvec_mt_group is bit-identical to one matvec_mt per job",
           "[threads]") {
     using locus::backend::Mat;
@@ -197,20 +152,16 @@ TEST_CASE("matvec_mt_group is bit-identical to one matvec_mt per job",
     const Mat b{locus::gguf::TensorType::kF32,
                 reinterpret_cast<const std::byte*>(wf.data()), 70, cols};
     const auto& op = locus::backend::find_backend("scalar")->ops;
-    for (const bool f32 : {false, true}) {
-        INFO("f32 " << f32);
-        std::vector<float> ra(a.rows), rb(b.rows);
-        (f32 ? locus::model::matvec_mt_f32 : locus::model::matvec_mt)(
-            op, a, x, ra);
-        locus::model::matvec_mt(op, b, x, rb);
-        for (const char* t : {"1", "3", "8"}) {
-            setenv("LOCUS_THREADS", t, 1);
-            std::vector<float> ga(a.rows), gb(b.rows);
-            const MatvecJob jobs[] = {{a, x, ga}, {b, x, gb}};
-            locus::model::matvec_mt_group(op, jobs, f32);
-            REQUIRE(ga == ra);
-            REQUIRE(gb == rb);
-        }
+    std::vector<float> ra(a.rows), rb(b.rows);
+    locus::model::matvec_mt(op, a, x, ra);
+    locus::model::matvec_mt(op, b, x, rb);
+    for (const char* t : {"1", "3", "8"}) {
+        setenv("LOCUS_THREADS", t, 1);
+        std::vector<float> ga(a.rows), gb(b.rows);
+        const MatvecJob jobs[] = {{a, x, ga}, {b, x, gb}};
+        locus::model::matvec_mt_group(op, jobs);
+        REQUIRE(ga == ra);
+        REQUIRE(gb == rb);
     }
     unsetenv("LOCUS_THREADS");
 }

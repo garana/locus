@@ -199,13 +199,8 @@ void matvec_mt(const backend::Ops& op, const Mat& w,
     matvec_rows_mt(op, matvec_kernel(op, w), w, x, out);
 }
 
-void matvec_mt_f32(const backend::Ops& op, const Mat& w,
-                   std::span<const float> x, std::span<float> out) {
-    matvec_rows_mt(op, op.matvec, w, x, out);
-}
-
 void matvec_mt_group(const backend::Ops& op,
-                     std::span<const MatvecJob> jobs, bool f32) {
+                     std::span<const MatvecJob> jobs) {
     std::uint64_t total = 0;
     for (const MatvecJob& j : jobs) {
         total += j.w.rows;
@@ -214,7 +209,7 @@ void matvec_mt_group(const backend::Ops& op,
         op.mt_safe ? mt_slices(static_cast<std::uint32_t>(total)) : 0;
     if (t <= 1) {
         for (const MatvecJob& j : jobs) {
-            (f32 ? op.matvec : matvec_kernel(op, j.w))(j.w, j.x, j.out);
+            matvec_kernel(op, j.w)(j.w, j.x, j.out);
         }
         return;
     }
@@ -241,8 +236,8 @@ void matvec_mt_group(const backend::Ops& op,
     sys::ThreadPool::instance().parallel_for(
         sl.size(), [&](std::size_t i) {
             const MatvecJob& j = jobs[sl[i].job];
-            const auto mv = f32 ? op.matvec : matvec_kernel(op, j.w);
-            mv(backend::mat_rows(j.w, sl[i].r0, sl[i].n), j.x,
+            matvec_kernel(op, j.w)(
+                backend::mat_rows(j.w, sl[i].r0, sl[i].n), j.x,
                j.out.subspan(sl[i].r0, sl[i].n));
         });
 }

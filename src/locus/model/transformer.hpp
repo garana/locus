@@ -688,14 +688,6 @@ std::size_t mt_fanout();
 void matvec_mt(const backend::Ops& op, const backend::Mat& w,
                std::span<const float> x, std::span<float> out);
 
-/**
- * matvec_mt that always runs op.matvec, the f32-activation dot, even
- * when R16 Q8 activations are on: the attention projections keep
- * their single-threaded arithmetic, only spread across the pool.
- */
-void matvec_mt_f32(const backend::Ops& op, const backend::Mat& w,
-                   std::span<const float> x, std::span<float> out);
-
 /** One matvec of a matvec_mt_group: out = w * x. */
 struct MatvecJob {
     const backend::Mat& w;
@@ -708,11 +700,11 @@ struct MatvecJob {
  * pool dispatch: their rows are sliced together, each job getting
  * slices in proportion to its rows, so the pool wakes once instead of
  * once per matrix. Each row is computed by the same kernel as
- * matvec_mt (or matvec_mt_f32 when `f32`), so outputs are bit-identical
- * to issuing the jobs one by one.
+ * matvec_mt, so outputs are bit-identical to issuing the jobs one by
+ * one.
  */
 void matvec_mt_group(const backend::Ops& op,
-                     std::span<const MatvecJob> jobs, bool f32 = false);
+                     std::span<const MatvecJob> jobs);
 
 /**
  * Weight-stationary batched matvec (R10): applies w to each of

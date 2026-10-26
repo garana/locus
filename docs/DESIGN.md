@@ -555,10 +555,10 @@ floor.
   which is the second half of the win on streamed models.
   The llama-family arch hooks (llama, qwen2moe, qwen3moe,
   dbrx, glm-dsa, MLA) had drifted to an inline op.matvec for
-  q/k/v; they now go through matvec_mt_f32, which threads
-  op.matvec without the R16 Q8-activation switch, so the
-  arithmetic is unchanged (Orpheus 3B neon decode on M4 Max,
-  10 threads: 9.6 -> 15.6 tok/s).
+  q/k/v; they were threaded again in #207 (Orpheus 3B neon
+  decode on M4 Max, 10 threads: 9.6 -> 15.6 tok/s), on the f32
+  dot at first, and since the R16 default flip through matvec_mt
+  like every other projection.
 - R9.2 static pinning. LOCUS_PIN_STATIC=1 mlocks every
   non-expert weight (attention, norms via their mats, dense
   FFN, shared experts, router, embeddings, output head) at
@@ -1343,7 +1343,8 @@ matvec throughput.
   AVX2/NEON here).
 - (History: until 2026-10-25 Q8_K was an OPT-IN mode, default off;
   see the last bullet for the flip.) TransformerModel::
-  use_q8k_activations toggles it. Why it was not the default: "bit-exact with llama.cpp" is unachievable in principle -- ggml
+  use_q8k_activations toggles it. Why it was not the default:
+  "bit-exact with llama.cpp" is unachievable in principle -- ggml
   itself is not bit-exact across its own backends, because the final
   f32 d*Sigma accumulates in an implementation-specific order (SSE4 vs
   AVX2 vs NEON vs CUDA vs generic). Q8_K's lower activation precision
@@ -1386,9 +1387,10 @@ matvec throughput.
   since #237's NEON BF16 dot): teacher-forced on every lane.
 - Default ON (2026-10-25, owner decision, #206): with the NEON int8
   dots (matvec_neon_q8k, bit-identical to scalar matvec_q8k) the Q8
-  path is 1.7x faster than the f32 dot on CPU decode (Orpheus 3B on
-  M4: 24.6 -> 41.5 tok/s), so Hparams::q8k_default is now true for
-  every arch. The f32-activation dot stays as the opt-in reference
+  path is 2.1x faster than the f32 dot on CPU decode (Orpheus 3B on
+  M4, default threads: 29.4 -> 63.0 tok/s), so Hparams::q8k_default
+  is now true for every arch, and the attention projections take
+  matvec_mt like every other matvec (llama.cpp quantizes them too). The f32-activation dot stays as the opt-in reference
   for exactness checks: LOCUS_F32_ACTIVATIONS=1, or
   use_q8k_activations(false). Goldens: only qwen2moe tipped (as
   predicted above, ~token 15); its test pins the f32 path, which
