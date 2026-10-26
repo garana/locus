@@ -107,17 +107,33 @@ model with classifier-free guidance (each step mixes the outputs for
 the prompt and for an empty prompt, u + cfg * (c - u)); locus decodes
 the codes with the VQ-16 image decoder, built from its conv2d kernels.
 At temperature 0 the codes equal the torch reference's for a test
-prompt, and the pixels match the reference image (11 of 442,368 RGB
+prompt, and the pixels match the reference image (9 of 442,368 RGB
 values off by 1). cfg (default 5), temperature (default 1) and seed
 are overridable; the seed used is returned in X-Image-Seed and
 Server-Timing gives the generate and decode times. One image takes
-about 150 s on an M2 Pro CPU (145 s for the codes, 6 s for the
-decode): generation runs token by token on the CPU (NEON BF16 dots),
-and the image heads are still single-threaded.
+about 80 s on an M2 Pro CPU (74 s for the codes, 6 s for the decode):
+generation runs token by token on the CPU (NEON BF16 dots, the image
+heads split across threads).
 `scripts/convert-janus.py --model <snapshot> --out
 tests/models/janus-pro-1b-bf16.gguf` makes the model GGUF (BF16, the
 checkpoint's own type) and `scripts/convert-janus-vq16.py` the decoder
 GGUF (dev-time: both need torch and the Janus-Pro snapshot).
+
+Image input: with a Janus-Pro model whose GGUF has the vision tower
+(the converter writes it), /v1/chat/completions and /v1/messages accept
+images in user turns: an OpenAI image_url part with a base64 `data:`
+URL, or an Anthropic image block with a base64 source (locus never
+fetches a URL). PNG and JPEG are decoded with a vendored, capped
+stb_image, resized and padded exactly as the reference preprocessor
+does (Pillow's bicubic, ported bit-exact), and turned into 576 input
+embeddings by the SigLIP-L/16 tower and the aligner, which match the
+torch reference to an error RMS of about 2e-5. Asked "What is on the
+table?" about the reference image, locus answers like the reference,
+"There is an apple on the table." One question about one image takes
+about a minute on an M2 Pro CPU (the 630-token prompt is fed one
+position at a time). Not yet with images: streaming, tools and JSON
+mode (each a 400). A model without the vision tower answers an image
+request with a 400.
 
 ## Building
 

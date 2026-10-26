@@ -285,6 +285,10 @@ class Server {
      * later inference request into the acceptor thread. */
     void serve_connection(int fd, const std::string& peer_ip,
                           bool single_request = false);
+    /** serve_connection behind a catch-all, so no exception can end the
+     * worker or acceptor thread (and so the process). */
+    void serve_connection_guarded(int fd, const std::string& peer_ip,
+                                  bool single_request);
     /** Runs the handler and writes its response (buffered or streamed).
      * @returns true iff the connection may be kept alive for the next
      * request (write succeeded AND `keep`). */

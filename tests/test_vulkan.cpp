@@ -105,7 +105,7 @@ TEST_CASE("vulkan q8_0 matvec matches the CPU reference",
     ctx.destroy_buffer(ob);
 }
 
-TEST_CASE("vulkan f16 and q4_0 matvec match the CPU reference",
+TEST_CASE("vulkan f16 bf16 and q4_0 matvec match the CPU reference",
           "[vulkan]") {
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");
@@ -152,6 +152,30 @@ TEST_CASE("vulkan f16 and q4_0 matvec match the CPU reference",
             cols};
         locus::backend::matvec(m, x, cpu);
         run_kernel(Kernel::kMatvecF16,
+                   std::as_bytes(std::span(w)), gpu);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(gpu[r] ==
+                    Catch::Approx(cpu[r]).margin(1e-3));
+        }
+    }
+
+    SECTION("bf16") {
+        // bfloat16: the top 16 bits of an f32 (truncated here), the
+        // type Janus-Pro ships in (i#247).
+        std::vector<std::uint16_t> w(rows * cols);
+        for (auto& v : w) {
+            const float f = dist(rng);
+            std::uint32_t u;
+            std::memcpy(&u, &f, sizeof u);
+            v = static_cast<std::uint16_t>(u >> 16);
+        }
+        std::vector<float> cpu(rows), gpu(rows);
+        locus::backend::Mat m{
+            locus::gguf::TensorType::kBF16,
+            reinterpret_cast<const std::byte*>(w.data()), rows,
+            cols};
+        locus::backend::matvec(m, x, cpu);
+        run_kernel(Kernel::kMatvecBF16,
                    std::as_bytes(std::span(w)), gpu);
         for (std::uint32_t r = 0; r < rows; ++r) {
             REQUIRE(gpu[r] ==

@@ -40,6 +40,7 @@ std::size_t weight_bytes(const Mat& w) {
             b = static_cast<std::size_t>(w.rows) * w.cols * 4;
             break;
         case gguf::TensorType::kF16:
+        case gguf::TensorType::kBF16:
             b = static_cast<std::size_t>(w.rows) * w.cols * 2;
             break;
         case gguf::TensorType::kQ8_0:
@@ -93,6 +94,7 @@ Kernel matvec_kernel(const Mat& w) {
     switch (w.type) {
         case gguf::TensorType::kF32: return Kernel::kMatvecF32;
         case gguf::TensorType::kF16: return Kernel::kMatvecF16;
+        case gguf::TensorType::kBF16: return Kernel::kMatvecBF16;
         case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0;
         case gguf::TensorType::kQ4_0: return Kernel::kMatvecQ4_0;
         case gguf::TensorType::kQ5_0: return Kernel::kMatvecQ5_0;
@@ -115,6 +117,7 @@ Kernel batched_kernel(const Mat& w) {
     switch (w.type) {
         case gguf::TensorType::kF32: return Kernel::kMatvecF32B;
         case gguf::TensorType::kF16: return Kernel::kMatvecF16B;
+        case gguf::TensorType::kBF16: return Kernel::kMatvecBF16B;
         case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0B;
         case gguf::TensorType::kQ4_K: return Kernel::kMatvecQ4_KB;
         case gguf::TensorType::kQ6_K: return Kernel::kMatvecQ6_KB;
@@ -128,6 +131,7 @@ std::uint32_t w_off_units(const Mat& w, std::uint64_t bytes) {
         case gguf::TensorType::kF32:
             return static_cast<std::uint32_t>(bytes / 4);
         case gguf::TensorType::kF16:
+        case gguf::TensorType::kBF16:
             return static_cast<std::uint32_t>(bytes / 2);
         default:
             return static_cast<std::uint32_t>(bytes);
@@ -1372,7 +1376,8 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     kv::PagedKvCache& cache,
                     kv::PagedKvCache::Seq& seq,
                     std::span<float> logits, std::uint32_t row_begin,
-                    std::uint32_t row_end) {
+                    std::uint32_t row_end, std::span<const float> embd_in,
+                    std::span<float> normed_out) {
     const auto& hp = m.hparams();
     State& s = state();
     const bool quant = cache.quantized();
@@ -1491,10 +1496,19 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                std::max<std::size_t>(hp.q_lora_rank, 1));
     }
 
-    // CPU side: embedding lookup and this token's block table.
+    // CPU side: embedding lookup (or the given input embedding) and
+    // this token's block table.
     std::vector<float> x_host(hp.n_embd);
-    dequant_row(m.embedding(), static_cast<std::uint32_t>(token),
-                x_host);
+    if (!embd_in.empty()) {
+        if (embd_in.size() != hp.n_embd) {
+            throw std::invalid_argument(
+                "vulkan_forward: an input embedding must be n_embd");
+        }
+        std::copy(embd_in.begin(), embd_in.end(), x_host.begin());
+    } else {
+        dequant_row(m.embedding(), static_cast<std::uint32_t>(token),
+                    x_host);
+    }
     s.ctx.write_buffer(
         s.x, std::as_bytes(std::span<const float>(x_host)));
     s.ctx.write_buffer(
@@ -2157,6 +2171,10 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     s.end_batch();
 
     s.ctx.read_buffer(s.logits, std::as_writable_bytes(logits));
+    if (!normed_out.empty()) {
+        s.ctx.read_buffer(
+            s.xb, std::as_writable_bytes(normed_out.first(hp.n_embd)));
+    }
     s.ctx.note_token();
     seq.n_tokens = pos + 1;
     return true;

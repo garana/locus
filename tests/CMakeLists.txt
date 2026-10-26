@@ -49,6 +49,7 @@ add_executable(locus_tests
     test_sampling.cpp
     test_speculative.cpp
     test_server.cpp
+    test_server_errors.cpp
     test_tools.cpp
     test_vulkan.cpp
     test_vulkan_attn.cpp
@@ -72,7 +73,9 @@ add_executable(locus_tests
     test_snac.cpp
     test_vq16.cpp
     test_janus.cpp
+    test_janus_vision.cpp
     test_png.cpp
+    test_image_input.cpp
     test_base64.cpp
     test_deepseek41.cpp
     test_threads.cpp

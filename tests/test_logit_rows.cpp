@@ -80,6 +80,56 @@ TEST_CASE("forward with a logit row range matches the full head",
                       std::invalid_argument);
 }
 
+// i#247: forward_embedding from a token gives forward()'s logits, and
+// checks the token and the rows before any backend runs (the Vulkan
+// forward reads both unchecked).
+TEST_CASE("forward_embedding checks its token and rows like forward",
+          "[model][e2e]") {
+    const std::string path = model_dir() + "stories260K.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    const auto V = static_cast<std::int32_t>(model.hparams().n_vocab);
+    auto ws = model.make_workspace();
+    auto a = model.make_cache(64), b = model.make_cache(64);
+    locus::kv::PagedKvCache::Seq sa, sb;
+    std::vector<float> want(V), got(V), normed(model.hparams().n_embd);
+    REQUIRE(a.ensure_capacity(sa, 1));
+    REQUIRE(b.ensure_capacity(sb, 1));
+    model.forward(9, a, sa, ws, want);
+    model.forward_embedding(9, {}, b, sb, ws, got, {}, normed);
+    REQUIRE(std::memcmp(want.data(), got.data(), V * sizeof(float)) == 0);
+
+    std::vector<locus::model::TransformerModel> models;
+    models.push_back(std::move(model));
+    if (locus::backend::vulkan_backend_usable()) {
+        models.push_back(locus::model::TransformerModel::load(g));
+        models.back().use_backend(*locus::backend::find_backend("vulkan"));
+    }
+    for (const auto& m : models) {
+        INFO("backend " << m.active_backend().name);
+        auto c = m.make_cache(64);
+        locus::kv::PagedKvCache::Seq s;
+        REQUIRE(c.ensure_capacity(s, 1));
+        for (const locus::tok::TokenId t : {V, -1}) {
+            REQUIRE_THROWS_AS(
+                m.forward_embedding(t, {}, c, s, ws, got, {}, normed),
+                std::invalid_argument);
+        }
+        const std::uint32_t U = static_cast<std::uint32_t>(V);
+        for (const locus::model::LogitRows r :
+             {locus::model::LogitRows{5, 5},
+              locus::model::LogitRows{0, U + 1}}) {
+            REQUIRE_THROWS_AS(
+                m.forward_embedding(1, {}, c, s, ws, got, r, normed),
+                std::invalid_argument);
+        }
+        REQUIRE(s.n_tokens == 0);  // nothing ran
+    }
+}
+
 // The same on the Vulkan full forward, on a model it runs (a Q6_K tied
 // head, like Orpheus's), so the row view's byte offset into the
 // uploaded head is exercised.
