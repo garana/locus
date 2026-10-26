@@ -234,6 +234,121 @@ TEST_CASE("vulkan f16 bf16 and q4_0 matvec match the CPU reference",
     }
 }
 
+// The batched f16 / bf16 kernels (matvec_f16.comp -DBATCHED), which
+// only the MoE and MLA paths of the GPU forward reach: slot y reads
+// matrix route[y] (mode 1), or every slot is summed into one row with
+// the weights in route[n_slots..] (mode 1 | 2), as for MoE experts.
+// 33 columns, so rows and matrices start on both halves of a word.
+TEST_CASE("vulkan batched f16 and bf16 matvec match the CPU per slot",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(37);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    const std::uint32_t rows = 5, cols = 33, n_mat = 3, slots = 2;
+    const std::uint32_t ids[slots] = {2, 0};
+    const float mix[slots] = {0.75f, -1.5f};
+    std::vector<float> x(slots * cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    std::vector<std::uint32_t> route(2 * slots);
+    for (std::uint32_t k = 0; k < slots; ++k) {
+        route[k] = ids[k];
+        route[slots + k] = std::bit_cast<std::uint32_t>(mix[k]);
+    }
+
+    struct Case {
+        const char* name;
+        locus::gguf::TensorType type;
+        Kernel kernel;
+        std::uint16_t (*to16)(float);
+    };
+    const Case cases[] = {
+        {"f16", locus::gguf::TensorType::kF16, Kernel::kMatvecF16B,
+         [](float f) { return locus::backend::f32_to_f16(f); }},
+        {"bf16", locus::gguf::TensorType::kBF16, Kernel::kMatvecBF16B,
+         [](float f) {
+             return static_cast<std::uint16_t>(
+                 std::bit_cast<std::uint32_t>(f) >> 16);
+         }},
+    };
+    for (const auto& c : cases) {
+        INFO(c.name);
+        std::vector<std::uint16_t> w(n_mat * rows * cols);
+        for (auto& v : w) {
+            v = c.to16(dist(rng));
+        }
+        // CPU reference: each (matrix, x slot) product on its own.
+        auto cpu_dot = [&](std::uint32_t mat, std::uint32_t slot) {
+            std::vector<float> out(rows);
+            const locus::backend::Mat m{
+                c.type,
+                reinterpret_cast<const std::byte*>(
+                    w.data() + std::size_t{mat} * rows * cols),
+                rows, cols};
+            locus::backend::matvec(
+                m, std::span(x).subspan(slot * cols, cols), out);
+            return out;
+        };
+        auto wb = ctx.create_buffer((w.size() * 2 + 3) & ~std::size_t{3});
+        auto xb = ctx.create_buffer(x.size() * 4);
+        auto rb = ctx.create_buffer(route.size() * 4);
+        auto ob = ctx.create_buffer(slots * rows * 4);
+        ctx.write_buffer(wb, std::as_bytes(std::span(w)));
+        ctx.write_buffer(xb, std::as_bytes(std::span(x)));
+        ctx.write_buffer(rb, std::as_bytes(std::span(route)));
+        auto run = [&](std::uint32_t mode) {
+            const bool sum = (mode & 2u) != 0u;
+            std::vector<float> out(sum ? rows : slots * rows);
+            const VulkanContext::Buffer bufs[] = {wb, xb, ob, rb};
+            // rows, cols, out_offset, accumulate, w_off, x_off,
+            // scale, w_stride, x_stride, out_stride, n_slots, mode,
+            // row_stride (0 = cols).
+            const std::uint32_t push[] = {
+                rows,       cols, 0,     0,    0, 0,
+                std::bit_cast<std::uint32_t>(1.0f),
+                rows * cols, cols, rows, slots, mode, 0};
+            ctx.begin_batch();
+            ctx.dispatch(c.kernel, bufs, push,
+                         VulkanContext::matvec_groups(c.kernel, rows),
+                         sum ? 1u : slots);
+            ctx.end_batch();
+            ctx.read_buffer(ob, std::as_writable_bytes(std::span(out)));
+            return out;
+        };
+
+        const auto split = run(1u);
+        for (std::uint32_t y = 0; y < slots; ++y) {
+            const auto want = cpu_dot(ids[y], y);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                INFO("split slot " << y << " row " << r);
+                REQUIRE(split[y * rows + r] ==
+                        Catch::Approx(want[r]).margin(1e-3));
+            }
+        }
+        const auto summed = run(1u | 2u);
+        std::vector<float> want(rows, 0.0f);
+        for (std::uint32_t k = 0; k < slots; ++k) {
+            const auto part = cpu_dot(ids[k], k);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                want[r] += mix[k] * part[r];
+            }
+        }
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            INFO("sum row " << r);
+            REQUIRE(summed[r] == Catch::Approx(want[r]).margin(1e-3));
+        }
+        ctx.destroy_buffer(wb);
+        ctx.destroy_buffer(xb);
+        ctx.destroy_buffer(rb);
+        ctx.destroy_buffer(ob);
+    }
+}
+
 TEST_CASE("vulkan k-quant matvec matches the CPU reference",
           "[vulkan]") {
     if (!VulkanContext::available()) {
