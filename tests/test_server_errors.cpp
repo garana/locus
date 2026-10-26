@@ -32,7 +32,11 @@ TEST_CASE("handler errors map to 400 for the client, 500 for the server",
     // the wrong type.
     REQUIRE(status_of([] { throw std::invalid_argument("n must be 1"); }) ==
             400);
-    REQUIRE(status_of([] { (void)json::parse("{\"prompt\": "); }) == 400);
+    // A named result, since GCC does not let a (void) cast silence
+    // json::parse's warn_unused_result.
+    REQUIRE(status_of([] {
+                [[maybe_unused]] const auto j = json::parse("{\"prompt\": ");
+            }) == 400);
     REQUIRE(status_of([] { (void)json(1).get<std::string>(); }) == 400);
     REQUIRE(status_of([] { (void)json::object().at("prompt"); }) == 400);
     // Server-side failures.
