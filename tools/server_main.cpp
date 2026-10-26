@@ -38,13 +38,21 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (args.help) {
-        std::printf(
-            "usage: %s [options] <model.gguf> [port]\n\n"
-            "OpenAI + Anthropic compatible inference server "
-            "(default port 8080):\n  POST /v1/completions\n  POST "
-            "/v1/chat/completions\n  POST /v1/messages  "
-            "(Anthropic)\n  GET  /health\n\n%s",
-            argv[0], locus_tools::kCommonHelp);
+        std::printf(R"(usage: %s [options] <model.gguf> [port]
+
+OpenAI + Anthropic compatible inference server (default port 8080):
+  POST /v1/completions
+  POST /v1/chat/completions
+  POST /v1/messages            (Anthropic)
+  POST /v1/embeddings          (CPU and CUDA backends)
+  GET  /v1/models
+  POST /v1/audio/speech        (needs --audio-decoder)
+  POST /v1/images/generations  (needs --image-decoder)
+  GET  /health
+  GET  /metrics                (path set by --metrics-path)
+
+%s)",
+                    argv[0], locus_tools::kCommonHelp);
         return 0;
     }
     if (!args.kv_type_ok) {
