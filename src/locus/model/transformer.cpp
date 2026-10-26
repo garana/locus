@@ -710,7 +710,9 @@ void TransformerModel::forward_layers(tok::TokenId token,
 
     if (last) {
         // Final stage: normalize and project to logits, and only now
-        // consume the token (advance the sequence).
+        // consume the token (advance the sequence). ws.xb keeps the
+        // normed hidden state after return: Janus's image head reads it
+        // (image/janus.cpp), so keep it there.
         apply_norm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
         if (rows.end == 0 || (rows.begin == 0 && rows.end == hp_.n_vocab)) {
             matvec_mt(op, out_w_, ws.xb, out);

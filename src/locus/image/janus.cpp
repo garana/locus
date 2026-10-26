@@ -19,6 +19,46 @@ void gelu(std::span<float> x) {
     }
 }
 
+/** Python's str.isspace() set (what str.strip() removes). */
+bool py_space(char32_t c) {
+    return (c >= 0x09 && c <= 0x0D) || (c >= 0x1C && c <= 0x20) ||
+           c == 0x85 || c == 0xA0 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 ||
+           c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+/** Decodes the UTF-8 code point at s[at] (bad bytes decode as 0xFFFD,
+ * which is not space); n is set to its byte length. */
+char32_t utf8_at(std::string_view s, std::size_t at, std::size_t& n) {
+    const auto b0 = static_cast<unsigned char>(s[at]);
+    n = b0 < 0x80 ? 1 : b0 >= 0xF0 ? 4 : b0 >= 0xE0 ? 3 : b0 >= 0xC0 ? 2 : 1;
+    if (n == 1) return b0 < 0x80 ? b0 : 0xFFFD;
+    if (at + n > s.size()) {
+        n = 1;
+        return 0xFFFD;
+    }
+    char32_t c = b0 & (0x7F >> n);
+    for (std::size_t k = 1; k < n; ++k) {
+        c = (c << 6) | (static_cast<unsigned char>(s[at + k]) & 0x3F);
+    }
+    return c;
+}
+
+/** str.strip(): drops leading and trailing Python whitespace. */
+std::string_view py_strip(std::string_view s) {
+    std::size_t n = 0;
+    while (!s.empty() && py_space(utf8_at(s, 0, n))) s.remove_prefix(n);
+    while (!s.empty()) {
+        std::size_t at = s.size() - 1;  // back to the last lead byte
+        while (at > 0 && (static_cast<unsigned char>(s[at]) & 0xC0) == 0x80) {
+            --at;
+        }
+        if (!py_space(utf8_at(s, at, n)) || at + n != s.size()) break;
+        s.remove_suffix(n);
+    }
+    return s;
+}
+
 }  // namespace
 
 std::span<const float> JanusImageGen::t(const std::string& name,
@@ -126,6 +166,17 @@ void JanusImageGen::image_logits(std::span<const float> h,
                     p, out);
     const auto ob = t("janus.gen_head.out.bias", codes_);
     for (std::uint32_t i = 0; i < codes_; ++i) out[i] += ob[i];
+}
+
+std::vector<tok::TokenId> JanusImageGen::prompt_ids(
+    const tok::Tokenizer& tok, std::string_view text) const {
+    // The reference strips the message (Python str.strip()) before the
+    // wrap. The tag is appended as its id: the reference's text ends in
+    // "<begin_of_image>", which its tokenizer maps to this one id.
+    auto ids = tok.encode(
+        "User: " + std::string(py_strip(text)) + "\n\nAssistant:", true);
+    ids.push_back(begin_of_image_);
+    return ids;
 }
 
 std::vector<tok::TokenId> JanusImageGen::unconditional(

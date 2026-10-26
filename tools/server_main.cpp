@@ -106,6 +106,8 @@ int main(int argc, char** argv) {
         if (args.audio_max_tokens > 0) {
             opt.audio_max_tokens = args.audio_max_tokens;
         }
+        opt.image_decoder_path = args.image_decoder;
+        opt.model_path = model_path;
         locus::server::OpenAiServer server(model, tok, opt);
         std::fprintf(
             stderr,

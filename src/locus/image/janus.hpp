@@ -4,6 +4,7 @@
 #include <functional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -68,6 +69,20 @@ class JanusImageGen {
         const model::TransformerModel& m,
         std::span<const tok::TokenId> prompt, const Params& p,
         const std::function<bool()>& alive = {}) const;
+
+    /**
+     * Wraps a text prompt as the reference does (Janus's "deepseek" SFT
+     * template, empty system prompt) and tokenizes it: BOS, then
+     * "User: <text>\n\nAssistant:", then begin_of_image(). The text is
+     * stripped of leading and trailing whitespace first, as Python's
+     * str.strip() does in the reference.
+     *
+     * @param tok The model's tokenizer (from the same GGUF).
+     * @param text The image description.
+     * @returns The conditional prompt for generate().
+     */
+    std::vector<tok::TokenId> prompt_ids(const tok::Tokenizer& tok,
+                                         std::string_view text) const;
 
     /** @returns The unconditional prompt for `prompt`: the same ids with
      * every position but the first and last set to the pad id. */

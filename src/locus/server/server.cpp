@@ -17,6 +17,10 @@
 #include "locus/audio/wav.hpp"
 #include "locus/auth/helper_spawn.hpp"
 #include "locus/gguf/gguf.hpp"
+#include "locus/http/base64.hpp"
+#include "locus/image/janus.hpp"
+#include "locus/image/png.hpp"
+#include "locus/image/vq16.hpp"
 #include "locus/model/codec.hpp"
 #include "locus/model/grammar.hpp"
 #include "locus/model/sampling.hpp"
@@ -252,6 +256,21 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             }
         }
     }
+    if (!opt_.image_decoder_path.empty()) {
+        auto g = gguf::GgufFile::open(opt_.image_decoder_path);
+        vq16_ = std::make_unique<image::Vq16Decoder>(
+            image::Vq16Decoder::load(g));
+        // A model without janus.image_tokens is not Janus and leaves the
+        // endpoint a 503; one that has it but fails to load is a broken
+        // file and stops the server here.
+        if (!opt_.model_path.empty()) {
+            auto mg = gguf::GgufFile::open(opt_.model_path);
+            if (mg.find("janus.image_tokens") != nullptr) {
+                janus_ = std::make_unique<image::JanusImageGen>(
+                    image::JanusImageGen::load(mg, m.hparams().n_embd));
+            }
+        }
+    }
     install_routes();
 }
 
@@ -388,6 +407,9 @@ OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
         }
         if (path == "/v1/audio/speech") {
             return Route::kAudioSpeech;
+        }
+        if (path == "/v1/images/generations") {
+            return Route::kImages;
         }
         return Route::kUnknown;
     }
@@ -1618,11 +1640,146 @@ void OpenAiServer::install_routes() {
             }
     };
 
+    // POST /v1/images/generations (OpenAI shape): prompt -> Janus-Pro
+    // image codes (CFG) -> VQ-16 pixels -> PNG, returned as b64_json.
+    // 503 unless --image-decoder loaded a decoder AND the model is a
+    // Janus-Pro checkpoint. One image at a time, under image_mu_.
+    auto handle_images = [this](const http::Request& req,
+                                http::ServerResponse& res,
+                                const http::RequestContext& ctx) {
+            auth_event("create", "images.generations", ctx.identity);
+            if (!vq16_ || !janus_) {
+                res.status = 503;
+                res.set_content(
+                    make_error("image generation is not configured (needs "
+                               "--image-decoder and a Janus-Pro model)")
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            try {
+                const json body = json::parse(req.body);
+                if (!body.contains("prompt") ||
+                    !body["prompt"].is_string() ||
+                    body["prompt"].get<std::string>().empty()) {
+                    throw std::invalid_argument(
+                        "prompt must be a non-empty string");
+                }
+                const auto prompt = body["prompt"].get<std::string>();
+                if (body.contains("n") &&
+                    (!body["n"].is_number_integer() ||
+                     body["n"].get<std::int64_t>() != 1)) {
+                    throw std::invalid_argument("n must be 1");
+                }
+                // The model makes one fixed size: grid codes per side,
+                // upscale() pixels per code (24 * 16 = 384).
+                const std::uint32_t side = janus_->grid() * vq16_->upscale();
+                const std::string size =
+                    std::to_string(side) + "x" + std::to_string(side);
+                if (body.contains("size") &&
+                    (!body["size"].is_string() ||
+                     body["size"].get<std::string>() != size)) {
+                    throw std::invalid_argument("size must be " + size);
+                }
+                if (body.contains("response_format") &&
+                    (!body["response_format"].is_string() ||
+                     body["response_format"].get<std::string>() !=
+                         "b64_json")) {
+                    throw std::invalid_argument(
+                        "response_format must be b64_json");
+                }
+                // Guidance and sampling; the defaults are the
+                // reference's (CFG 5, temperature 1). temperature 0
+                // picks the argmax code at each step.
+                image::JanusImageGen::Params p;
+                p.cfg = janus_->cfg_scale();
+                auto num = [&](const char* k, float& dst) {
+                    if (!body.contains(k)) return;
+                    if (!body[k].is_number()) {
+                        throw std::invalid_argument(
+                            std::string(k) + " must be a number");
+                    }
+                    dst = body[k].get<float>();
+                };
+                num("cfg", p.cfg);
+                num("temperature", p.temperature);
+                if (!std::isfinite(p.cfg) || p.cfg < 0.0f ||
+                    !std::isfinite(p.temperature) || p.temperature < 0.0f) {
+                    throw std::invalid_argument(
+                        "need finite cfg >= 0 and temperature >= 0");
+                }
+                p.seed = std::random_device{}();
+                if (body.contains("seed")) {
+                    if (!body["seed"].is_number_integer()) {
+                        throw std::invalid_argument(
+                            "seed must be an integer");
+                    }
+                    p.seed = static_cast<std::uint64_t>(
+                        body["seed"].get<std::int64_t>());
+                }
+
+                using Clock = std::chrono::steady_clock;
+                const auto ids = janus_->prompt_ids(tok_, prompt);
+                std::vector<std::int32_t> codes;
+                std::vector<float> chw;
+                Clock::time_point t0, t1, t2;
+                {
+                    std::lock_guard<std::mutex> lk(image_mu_);
+                    t0 = Clock::now();
+                    codes = janus_->generate(model_, ids, p,
+                                             ctx.client_alive);
+                    t1 = Clock::now();
+                    if (codes.size() == janus_->image_tokens()) {
+                        chw = vq16_->decode(codes, janus_->grid(),
+                                            janus_->grid());
+                    }
+                    t2 = Clock::now();
+                }
+                if (chw.empty()) {
+                    // The client went away mid-generation; nobody reads
+                    // this.
+                    res.status = 499;
+                    return;
+                }
+                const auto png =
+                    image::encode_png(image::to_rgb8(chw, side, side), side,
+                                      side);
+                const auto ms = [](auto a, auto b) {
+                    return std::to_string(
+                        std::chrono::duration<double, std::milli>(b - a)
+                            .count());
+                };
+                // The seed actually used, so any image can be replayed;
+                // and where the time went (codes, then pixels).
+                res.set_header("X-Image-Seed", std::to_string(p.seed));
+                res.set_header("Server-Timing", "generate;dur=" +
+                                                    ms(t0, t1) +
+                                                    ", decode;dur=" +
+                                                    ms(t1, t2));
+                const auto created =
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+                res.set_content(
+                    json{{"created", created},
+                         {"data", json::array({json{
+                                      {"b64_json",
+                                       http::base64_encode(png)}}})}}
+                        .dump(),
+                    "application/json");
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(make_error(e.what()).dump(),
+                                "application/json");
+            }
+    };
+
     // One dispatch handler over all routes (route_of is the single home
     // for routing, shared with the auth head stage below).
     route_handler_ = [this, handle_health, handle_models,
                       handle_model_by_id, handle_metrics, handle,
-                      handle_messages, handle_embeddings, handle_audio](
+                      handle_messages, handle_embeddings, handle_audio,
+                      handle_images](
                          const http::Request& req, http::ServerResponse& res,
                          const http::RequestContext& ctx) {
         switch (route_of(req.method, req.path)) {
@@ -1635,6 +1792,7 @@ void OpenAiServer::install_routes() {
             case Route::kMessages:    handle_messages(req, res, ctx); break;
             case Route::kEmbeddings:  handle_embeddings(req, res, ctx); break;
             case Route::kAudioSpeech: handle_audio(req, res, ctx); break;
+            case Route::kImages:      handle_images(req, res, ctx); break;
             case Route::kUnknown:
                 res.status = 404;  // httplib's default: 404, empty body
                 break;

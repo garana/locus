@@ -26,9 +26,11 @@ std::vector<std::uint8_t> to_rgb8(std::span<const float> chw,
  * response.
  *
  * @param rgb h * w * 3 bytes, row-major.
+ * @param h Image height (rows); height first, as in to_rgb8.
+ * @param w Image width.
  * @returns The PNG file bytes.
  */
 std::vector<std::byte> encode_png(std::span<const std::uint8_t> rgb,
-                                  std::uint32_t w, std::uint32_t h);
+                                  std::uint32_t h, std::uint32_t w);
 
 }  // namespace locus::image

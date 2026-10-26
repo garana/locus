@@ -17,6 +17,10 @@
 namespace locus::audio {
 class SnacDecoder;
 }
+namespace locus::image {
+class JanusImageGen;
+class Vq16Decoder;
+}
 
 namespace locus::server {
 
@@ -76,6 +80,15 @@ class OpenAiServer {
          * /v1/audio/speech (--audio-max-tokens); a request's own
          * max_tokens is clamped to it. 7 tokens = one 85 ms frame. */
         std::uint32_t audio_max_tokens = 1024;
+        /** Path to the VQ-16 image decoder GGUF (arch "vq16") that
+         * enables POST /v1/images/generations (--image-decoder). Empty
+         * = the endpoint is off and returns 503. The loaded model must
+         * be a Janus-Pro checkpoint, whose janus.* tensors are read
+         * from model_path. */
+        std::string image_decoder_path;
+        /** Path of the loaded model's GGUF; the image endpoint reads
+         * the janus.* tensors from it. */
+        std::string model_path;
         /** Formats /v1/chat/completions prompts (default plain).
          * Use chat::ChatTemplate::from_gguf for real chat
          * models. */
@@ -127,7 +140,7 @@ class OpenAiServer {
     enum class Route {
         kHealth, kModels, kModelById, kMetrics,
         kCompletions, kChat, kMessages, kEmbeddings, kAudioSpeech,
-        kUnknown
+        kImages, kUnknown
     };
     /** Classifies a request. GET and HEAD both match the GET routes;
      * /v1/models/{id} matches by prefix (the regex route retired). */
@@ -195,6 +208,14 @@ class OpenAiServer {
     std::mutex audio_mu_;
     std::unique_ptr<kv::PagedKvCache> audio_cache_;
     model::TransformerModel::Workspace audio_ws_;
+
+    // /v1/images/generations: the VQ-16 decoder (null when
+    // --image-decoder was not given) and the Janus image heads (null
+    // when the model has no janus.* tensors). One image at a time, under
+    // image_mu_: a generation holds its own KV cache for two sequences.
+    std::unique_ptr<image::Vq16Decoder> vq16_;
+    std::unique_ptr<image::JanusImageGen> janus_;
+    std::mutex image_mu_;
 };
 
 }  // namespace locus::server

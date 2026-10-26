@@ -1,12 +1,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -23,6 +25,7 @@
 #include "locus/tok/tokenizer.hpp"
 #include "httplib.h"
 #include "json.hpp"
+#include "png_parse.hpp"
 
 using nlohmann::json;
 
@@ -1345,4 +1348,179 @@ TEST_CASE("audio speech sampling ends the utterance with real audio",
     REQUIRE(stop >= 0);     // the model ended speech itself...
     REQUIRE(n < 1024);      // ...before the cap,
     REQUIRE(wav_rms(res->body) > 0.02);  // with audible audio.
+}
+
+namespace {
+
+std::string janus_path() {
+    return std::string(LOCUS_SOURCE_DIR) +
+           "/tests/models/janus-pro-1b-bf16.gguf";
+}
+std::string vq16_path() {
+    return std::string(LOCUS_SOURCE_DIR) +
+           "/tests/models/janus-vq16-decoder.gguf";
+}
+
+/** Decodes standard base64 (the test's side of b64_json). */
+std::vector<std::byte> unbase64(const std::string& s) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    REQUIRE(s.size() % 4 == 0);
+    std::vector<std::byte> out;
+    for (std::size_t i = 0; i < s.size(); i += 4) {
+        std::uint32_t v = 0;
+        int pad = 0;
+        for (int k = 0; k < 4; ++k) {
+            const char c = s[i + k];
+            if (c == '=') {
+                ++pad;
+                v <<= 6;
+                continue;
+            }
+            const int d = val(c);
+            REQUIRE(d >= 0);
+            v = (v << 6) | static_cast<std::uint32_t>(d);
+        }
+        out.push_back(static_cast<std::byte>(v >> 16));
+        if (pad < 2) out.push_back(static_cast<std::byte>((v >> 8) & 0xFF));
+        if (pad < 1) out.push_back(static_cast<std::byte>(v & 0xFF));
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("images 503 unless a decoder and a Janus model are loaded",
+          "[server][image]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const json req{{"prompt", "an apple"}};
+    {
+        TestServer ts(model, tok);  // no image_decoder_path
+        httplib::Client client("127.0.0.1", ts.port);
+        auto res = client.Post("/v1/images/generations", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+    }
+    if (!std::filesystem::exists(vq16_path())) {
+        SKIP("janus-vq16-decoder.gguf absent");
+    }
+    // A decoder but a model without janus.* tensors: still 503.
+    locus::server::OpenAiServer::Options o;
+    o.image_decoder_path = vq16_path();
+    o.model_path = model_path();
+    TestServer ts(model, tok, o);
+    httplib::Client client("127.0.0.1", ts.port);
+    auto res = client.Post("/v1/images/generations", req.dump(),
+                           "application/json");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+}
+
+// The whole HTTP path on Janus-Pro: request checks, prompt wrapping,
+// CFG generation, VQ-16 decode, PNG and base64, against the reference
+// image for the golden prompt (argmax, so deterministic). The codes are
+// pinned in test_janus.cpp and the decode in test_vq16.cpp; this checks
+// the wiring.
+TEST_CASE("images endpoint returns the reference image end to end",
+          "[server][image][e2e]") {
+    const std::string golden =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/golden/janus_decode.png";
+    if (!std::filesystem::exists(janus_path()) ||
+        !std::filesystem::exists(vq16_path()) ||
+        !std::filesystem::exists(golden)) {
+        SKIP("janus model, vq16 decoder or janus_decode.png absent");
+    }
+    auto g = locus::gguf::GgufFile::open(janus_path());
+    auto model = locus::model::TransformerModel::load(g);
+    const auto* neon = locus::backend::find_backend("neon");
+    if (neon != nullptr && neon->available) model.use_backend(*neon);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+    locus::server::OpenAiServer::Options o;
+    o.image_decoder_path = vq16_path();
+    o.model_path = janus_path();
+    locus::server::OpenAiServer server(model, *tok, o);
+    const int port = server.bind_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { server.listen_after_bind(); });
+    struct Join {
+        locus::server::OpenAiServer& s;
+        std::thread& t;
+        ~Join() {
+            s.stop();
+            t.join();
+        }
+    } join{server, th};
+    httplib::Client c("127.0.0.1", port);
+    c.set_read_timeout(1800, 0);
+    auto post = [&](const json& j) {
+        return c.Post("/v1/images/generations", j.dump(),
+                      "application/json");
+    };
+
+    const std::string prompt = "A red apple on a wooden table.";
+    // Refused before any generation, so these are quick.
+    for (const json& bad :
+         {json{{"prompt", ""}}, json{{"prompt", prompt}, {"n", 2}},
+          json{{"prompt", prompt}, {"size", "512x512"}},
+          json{{"prompt", prompt}, {"response_format", "url"}},
+          json{{"prompt", prompt}, {"cfg", -1}},
+          json{{"prompt", prompt}, {"temperature", "hot"}},
+          json{{"prompt", prompt}, {"seed", 1.5}}}) {
+        INFO(bad.dump());
+        auto res = post(bad);
+        REQUIRE_RES(res);
+        REQUIRE(res->status == 400);
+    }
+
+    if (std::getenv("LOCUS_HEAVY_TESTS") == nullptr) {
+        SKIP("a full image takes minutes on a CPU; set LOCUS_HEAVY_TESTS=1");
+    }
+    auto res = post({{"prompt", prompt},
+                     {"n", 1},
+                     {"size", "384x384"},
+                     {"response_format", "b64_json"},
+                     {"temperature", 0}});
+    REQUIRE_RES(res);
+    INFO(res->body.substr(0, 200));
+    REQUIRE(res->status == 200);
+    INFO("Server-Timing: " << res->get_header_value("Server-Timing"));
+    REQUIRE(res->has_header("X-Image-Seed"));
+    const json body = json::parse(res->body);
+    REQUIRE(body["data"].size() == 1);
+    const auto got = png_test::parse_stored_png(
+        unbase64(body["data"][0]["b64_json"].get<std::string>()));
+
+    std::ifstream f(golden, std::ios::binary);
+    std::vector<char> raw((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+    std::vector<std::byte> bytes(raw.size());
+    std::memcpy(bytes.data(), raw.data(), raw.size());
+    const auto want = png_test::parse_stored_png(bytes);
+    REQUIRE(got.w == want.w);
+    REQUIRE(got.h == want.h);
+    // The decode matches the reference to about 1.5e-5 (test_vq16), so
+    // a value that lands on a truncation edge may differ by one.
+    std::size_t differ = 0;
+    int worst = 0;
+    for (std::size_t i = 0; i < want.rgb.size(); ++i) {
+        const int d = std::abs(int(got.rgb[i]) - int(want.rgb[i]));
+        differ += d != 0;
+        worst = std::max(worst, d);
+    }
+    INFO(differ << " of " << want.rgb.size() << " values differ, worst "
+                << worst);
+    REQUIRE(worst <= 1);
+    REQUIRE(differ * 1000 <= want.rgb.size());
 }
