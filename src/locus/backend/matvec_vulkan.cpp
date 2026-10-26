@@ -2229,11 +2229,21 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
                           std::uint32_t row_end) {
     const auto& hp = m.hparams();
     const auto n = static_cast<std::uint32_t>(steps.size());
+    // Every weight needs a short-batch kernel: otherwise its projection
+    // is a mostly-padding matmul tile or one matvec per row, and two
+    // vulkan_forward calls (with their fused kernels) are faster.
+    const auto short_ok = [n](const Mat& w) {
+        return small_batch_kernel(w, n) != Kernel::kCount_;
+    };
     if (n == 0 || n > State::kMultiMax || n > kSmallBatch ||
         cache.quantized() || hp.arch == model::Arch::kDeepseek2 ||
         hp.n_expert > 0 || !vulkan_forward_supported(m) ||
-        std::ranges::any_of(m.layers(), [](const auto& l) {
-            return l.is_moe() || l.has_qk_norm() || l.has_qkv_bias();
+        !short_ok(m.output_weight()) ||
+        std::ranges::any_of(m.layers(), [&](const auto& l) {
+            return l.is_moe() || l.has_qk_norm() || l.has_qkv_bias() ||
+                   !short_ok(l.wq) || !short_ok(l.wk) || !short_ok(l.wv) ||
+                   !short_ok(l.wo) || !short_ok(l.w_gate) ||
+                   !short_ok(l.w_up) || !short_ok(l.w_down);
         })) {
         return false;
     }

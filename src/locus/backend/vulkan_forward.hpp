@@ -64,7 +64,9 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
  * vulkan_forward would do with the same inputs.
  *
  * Dense llama-family models only: no MLA, no MoE, no q / k norm or
- * qkv bias, and an F32 KV cache. The caller has checked every step
+ * qkv bias, an F32 KV cache, and every weight F32, F16, BF16 or Q8_0
+ * (the types with a short-batch kernel; K-quant models are faster as
+ * one vulkan_forward per sequence). The caller has checked every step
  * (TransformerModel::forward_embeddings).
  *
  * @param row_begin First head row to compute (row_end > row_begin).

@@ -671,6 +671,11 @@ void TransformerModel::forward_embeddings(std::span<const EmbedStep> steps,
              static_cast<std::uint32_t>(st.token) >= hp_.n_vocab)) {
             throw std::invalid_argument("token id out of vocab");
         }
+        // All or nothing: no step may fail after another has advanced.
+        if (st.seq->n_tokens >= hp_.n_ctx ||
+            st.seq->n_tokens >= cache.capacity(*st.seq)) {
+            throw std::invalid_argument("seq capacity not ensured");
+        }
         for (std::size_t j = 0; j < i; ++j) {
             if (steps[j].seq == st.seq) {
                 throw std::invalid_argument(

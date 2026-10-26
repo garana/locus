@@ -216,6 +216,16 @@ TEST_CASE("forward_embeddings matches forward_embedding per sequence",
                     std::max_element(ref_lb.begin(), ref_lb.end()) -
                         ref_lb.begin());
         }
+        // All or nothing: a step without capacity throws before any
+        // sequence advances.
+        locus::kv::PagedKvCache::Seq fresh;
+        REQUIRE(multi.ensure_capacity(ma, 1));
+        const auto before = ma.n_tokens;
+        const locus::model::EmbedStep bad[2] = {{1, {}, &ma, la, na},
+                                                {1, {}, &fresh, lb, nb}};
+        REQUIRE_THROWS_AS(model.forward_embeddings(bad, multi, ws, {}),
+                          std::invalid_argument);
+        REQUIRE(ma.n_tokens == before);
     }
 }
 
