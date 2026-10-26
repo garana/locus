@@ -32,7 +32,8 @@ const std::vector<Backend>& list() {
                      {.matvec = &matvec_neon,
                       .matvec_q8k = &matvec_neon_q8k,
                       .dequant_row = &dequant_row,
-                      .matvec_batch = &matvec_batch_neon}});
+                      .matvec_batch = &matvec_batch_neon,
+                      .prefers_q8k = true}});
 #endif
 #if defined(__x86_64__)
         b.push_back({"avx2",
@@ -48,7 +49,8 @@ const std::vector<Backend>& list() {
                      {.matvec = &matvec_sse4,
                       .matvec_q8k = &matvec_sse4_q8k,
                       .dequant_row = &dequant_row,
-                      .matvec_batch = &matvec_batch_sse4}});
+                      .matvec_batch = &matvec_batch_sse4,
+                      .prefers_q8k = true}});
 #endif
         // The scalar backend ships the R11 batched reference; neon
         // ships its register-blocked kernel (Q4_K/Q6_K + per-token
@@ -60,7 +62,8 @@ const std::vector<Backend>& list() {
                      {.matvec = &matvec,
                       .matvec_q8k = &matvec_q8k,
                       .dequant_row = &dequant_row,
-                      .matvec_batch = &matvec_batch_scalar}});
+                      .matvec_batch = &matvec_batch_scalar,
+                      .prefers_q8k = true}});
         const bool vk = f.vulkan && vulkan_backend_usable();
         b.push_back({"vulkan",
                      "GPU forward pass via Vulkan: paged/MLA "

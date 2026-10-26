@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/arch.hpp"
@@ -137,8 +138,20 @@ backend::Ops effective_ops(const backend::Backend* b, bool q8k) {
     return op;
 }
 
+bool TransformerModel::q8k_activations() const {
+    if (q8k_override_ >= 0) {
+        return q8k_override_ == 1;
+    }
+    if (const char* e = std::getenv("LOCUS_F32_ACTIVATIONS");
+        e != nullptr && *e != '\0' && std::string_view(e) != "0") {
+        return false;
+    }
+    return hp_.q8k_default ||
+           (backend_ != nullptr && backend_->ops.prefers_q8k);
+}
+
 backend::Ops TransformerModel::ops() const {
-    return effective_ops(backend_, q8k_activations_);
+    return effective_ops(backend_, q8k_activations());
 }
 
 namespace {
@@ -180,8 +193,7 @@ namespace {
 decltype(backend::Ops::matvec) matvec_kernel(const backend::Ops& op,
                                              const Mat& w) {
     return (op.matvec_q8k != nullptr &&
-            (backend::is_q8k_type(w.type) ||
-             backend::is_q8_0_act_type(w.type)))
+            backend::uses_quantized_activation(w.type))
                ? op.matvec_q8k
                : op.matvec;
 }
@@ -199,13 +211,8 @@ void matvec_mt(const backend::Ops& op, const Mat& w,
     matvec_rows_mt(op, matvec_kernel(op, w), w, x, out);
 }
 
-void matvec_mt_f32(const backend::Ops& op, const Mat& w,
-                   std::span<const float> x, std::span<float> out) {
-    matvec_rows_mt(op, op.matvec, w, x, out);
-}
-
 void matvec_mt_group(const backend::Ops& op,
-                     std::span<const MatvecJob> jobs, bool f32) {
+                     std::span<const MatvecJob> jobs) {
     std::uint64_t total = 0;
     for (const MatvecJob& j : jobs) {
         total += j.w.rows;
@@ -214,7 +221,7 @@ void matvec_mt_group(const backend::Ops& op,
         op.mt_safe ? mt_slices(static_cast<std::uint32_t>(total)) : 0;
     if (t <= 1) {
         for (const MatvecJob& j : jobs) {
-            (f32 ? op.matvec : matvec_kernel(op, j.w))(j.w, j.x, j.out);
+            matvec_kernel(op, j.w)(j.w, j.x, j.out);
         }
         return;
     }
@@ -241,8 +248,8 @@ void matvec_mt_group(const backend::Ops& op,
     sys::ThreadPool::instance().parallel_for(
         sl.size(), [&](std::size_t i) {
             const MatvecJob& j = jobs[sl[i].job];
-            const auto mv = f32 ? op.matvec : matvec_kernel(op, j.w);
-            mv(backend::mat_rows(j.w, sl[i].r0, sl[i].n), j.x,
+            matvec_kernel(op, j.w)(
+                backend::mat_rows(j.w, sl[i].r0, sl[i].n), j.x,
                j.out.subspan(sl[i].r0, sl[i].n));
         });
 }
@@ -319,7 +326,6 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     hp.rope_freq_base =
         get_float(g, p + "rope.freq_base", 10000.0f);
     spec->load_hparams(g, p, hp);
-    m.q8k_activations_ = hp.q8k_default;
 
     const TensorInfo* embd = g.find_tensor("token_embd.weight");
     if (embd == nullptr) {
@@ -789,7 +795,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
     }
     const std::uint32_t pos = seq.n_tokens;
     const backend::Ops op =
-        effective_ops(backend_, q8k_activations_);
+        effective_ops(backend_, q8k_activations());
 
     // Stage input: the first stage embeds the token; a later stage
     // loads the residual stream handed over by the previous stage.
@@ -1025,7 +1031,7 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
         }
         return;
     }
-    const Ops op = effective_ops(backend_, q8k_activations_);
+    const Ops op = effective_ops(backend_, q8k_activations());
     const std::uint32_t E = hp_.n_embd;
     const std::uint32_t ff = hp_.n_ff;
 
@@ -1125,7 +1131,7 @@ void TransformerModel::forward_batch_decode(
         throw std::invalid_argument(
             "forward_batch_decode: unsupported backend");
     }
-    const Ops op = effective_ops(backend_, q8k_activations_);
+    const Ops op = effective_ops(backend_, q8k_activations());
     const std::uint32_t E = hp_.n_embd;
     const std::uint32_t ff = hp_.n_ff;
 
@@ -1255,7 +1261,7 @@ void TransformerModel::forward_batch_layers(
         }
     }
 
-    const Ops op = effective_ops(backend_, q8k_activations_);
+    const Ops op = effective_ops(backend_, q8k_activations());
     std::vector<float> x(static_cast<std::size_t>(n) * E);
     std::vector<float> xbf(static_cast<std::size_t>(n) * E);
     std::vector<float> xb2(static_cast<std::size_t>(n) * E);
@@ -1394,8 +1400,9 @@ void matvec_batch_deq(const backend::Ops& op, const Mat& w,
 void matvec_batch(const backend::Ops& op, const Mat& w,
                   std::span<const float> x_batch,
                   std::span<float> out_batch, std::uint32_t n) {
-    // R16 ggml parity: QK_K types run the Q8_K activation dot per
-    // token via matvec_mt (which routes to op.matvec_q8k, row-sliced).
+    // R16 ggml parity: QK_K types (Q8_K) and block-32 types (Q8_0) run
+    // the quantized-activation dot per token via matvec_mt (which
+    // routes to op.matvec_q8k, row-sliced).
     // The batched contract is "byte-identical to n per-token matvecs",
     // so this holds by construction -- and it keeps prefill==decode,
     // both going through the same Q8_K path. (The register-blocked f32
@@ -1404,7 +1411,8 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
     // work.)
     const std::uint32_t xc = w.cols;
     const std::uint32_t oc = w.rows;
-    if (op.matvec_q8k != nullptr && backend::is_q8k_type(w.type)) {
+    if (op.matvec_q8k != nullptr &&
+        backend::uses_quantized_activation(w.type)) {
         for (std::uint32_t t = 0; t < n; ++t) {
             matvec_mt(op, w,
                       x_batch.subspan(static_cast<std::size_t>(t) * xc,
@@ -1559,7 +1567,7 @@ void TransformerModel::apply_norm(std::span<const float> x,
 void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
                          std::uint32_t layer) const {
     using namespace locus::backend;
-    const Ops op = effective_ops(backend_, q8k_activations_);
+    const Ops op = effective_ops(backend_, q8k_activations());
     const std::uint32_t n_ff = hp_.n_ff_exp;
 
     op.matvec(lay.gate_inp, ws.xb, ws.router);
@@ -1652,7 +1660,7 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
                                std::vector<float>& x,
                                std::uint32_t n, Workspace& ws) const {
     using namespace locus::backend;
-    const Ops op = effective_ops(backend_, q8k_activations_);
+    const Ops op = effective_ops(backend_, q8k_activations());
     const std::uint32_t E = hp_.n_embd;
     const std::uint32_t ff = hp_.n_ff_exp;
     const std::uint32_t k = hp_.n_expert_used;

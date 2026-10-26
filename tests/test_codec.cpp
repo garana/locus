@@ -1,5 +1,6 @@
 #include "locus/model/codec.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -225,13 +226,39 @@ TEST_CASE("orpheus model drives the codec sampler", "[codec][e2e]") {
 
     auto cache = model.make_cache();
     auto ws = model.make_workspace();
-    locus::kv::PagedKvCache::Seq seq;
     std::vector<float> logits(model.hparams().n_vocab);
+
+    // First frame against the golden, teacher-forced: before each
+    // golden code is fed, it must sit within 0.25 of the top logit.
+    // Greedy decode follows the golden on arm64, but x86 SSE4's
+    // default Q8 activations tip a near-tie in the first frame, as
+    // with muse prompt 2 and deepseek41; this keeps the default path
+    // checked on every lane.
+    auto golden_flat = read_ids(golden_dir() + "/orpheus_tokens.txt");
+    if (!golden_flat.empty()) {
+        locus::kv::PagedKvCache::Seq tf;
+        for (auto id : ids) {
+            REQUIRE(cache.ensure_capacity(tf, 1));
+            model.forward(id, cache, tf, ws, logits);
+        }
+        for (int i = 0; i < OrpheusCodec::kCodesPerFrame; ++i) {
+            const float top =
+                *std::max_element(logits.begin(), logits.end());
+            INFO("code " << i);
+            REQUIRE(logits[static_cast<std::size_t>(golden_flat[i])] >=
+                    top - 0.25f);
+            REQUIRE(cache.ensure_capacity(tf, 1));
+            model.forward(golden_flat[i], cache, tf, ws, logits);
+        }
+        cache.release(tf);
+    }
+
+    // Then the sampler drives greedy decode to at least one frame.
+    locus::kv::PagedKvCache::Seq seq;
     for (auto id : ids) {
         REQUIRE(cache.ensure_capacity(seq, 1));
         model.forward(id, cache, seq, ws, logits);
     }
-
     OrpheusCodecSampler sampler(kBase);
     std::vector<TokenId> gen;
     for (int i = 0; i < OrpheusCodec::kCodesPerFrame * 96; ++i) {
@@ -246,12 +273,4 @@ TEST_CASE("orpheus model drives the codec sampler", "[codec][e2e]") {
     cache.release(seq);
 
     REQUIRE(sampler.frames() >= 1);
-
-    // First frame token-exact against the golden.
-    auto golden_flat = read_ids(golden_dir() + "/orpheus_tokens.txt");
-    if (!golden_flat.empty()) {
-        for (int i = 0; i < OrpheusCodec::kCodesPerFrame; ++i) {
-            REQUIRE(gen[i] == golden_flat[i]);
-        }
-    }
 }

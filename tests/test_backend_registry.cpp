@@ -177,6 +177,42 @@ TEST_CASE("neon q8k matvec matches scalar q8k", "[backend]") {
         }
     }
 }
+TEST_CASE("neon q8k block-32 dots match scalar q8k", "[backend]") {
+    // Q8_0 / Q4_0 / IQ4_NL weights x a Q8_0 activation; 25 blocks per
+    // row, so the odd-block scalar tail runs too.
+    using TT = locus::gguf::TensorType;
+    const std::uint32_t rows = 5, cols = 800;
+    std::mt19937 rng(47);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    for (const auto& [type, bytes] :
+         {std::pair{TT::kQ8_0, std::size_t{34}},
+          std::pair{TT::kQ4_0, std::size_t{18}},
+          std::pair{TT::kIQ4_NL, std::size_t{18}}}) {
+        std::vector<std::byte> w(static_cast<std::size_t>(rows) *
+                                 (cols / 32) * bytes);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / bytes; ++bl) {
+            const std::uint16_t d = f32_to_f16(scale_d(rng));
+            std::memcpy(w.data() + bl * bytes, &d, 2);
+        }
+        Mat m{type, w.data(), rows, cols};
+        std::vector<float> a(rows), b(rows);
+        matvec_q8k(m, x, a);
+        matvec_neon_q8k(m, x, b);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            INFO("type " << static_cast<int>(type) << " row " << r);
+            REQUIRE(b[r] == a[r]);
+        }
+    }
+}
 #endif
 
 namespace {

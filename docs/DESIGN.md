@@ -556,10 +556,10 @@ floor.
   which is the second half of the win on streamed models.
   The llama-family arch hooks (llama, qwen2moe, qwen3moe,
   dbrx, glm-dsa, MLA) had drifted to an inline op.matvec for
-  q/k/v; they now go through matvec_mt_f32, which threads
-  op.matvec without the R16 Q8-activation switch, so the
-  arithmetic is unchanged (Orpheus 3B neon decode on M4 Max,
-  10 threads: 9.6 -> 15.6 tok/s).
+  q/k/v; they were threaded again in #207 (Orpheus 3B neon
+  decode on M4 Max, 10 threads: 9.6 -> 15.6 tok/s), on the f32
+  dot at first, and since the R16 default flip through matvec_mt
+  like every other projection.
 - R9.2 static pinning. LOCUS_PIN_STATIC=1 mlocks every
   non-expert weight (attention, norms via their mats, dense
   FFN, shared experts, router, embeddings, output head) at
@@ -1342,9 +1342,10 @@ matvec throughput.
   float; that order flipped muse's greedy tokens on x86 (PR#197).
   Ternary + IQ delegate to scalar. This host is SSE4-only (no
   AVX2/NEON here).
-- NOT the model default -- Q8_K is an OPT-IN mode
-  (TransformerModel::use_q8k_activations, default off). Why not the
-  default: "bit-exact with llama.cpp" is unachievable in principle -- ggml
+- (History: until 2026-10-25 Q8_K was an OPT-IN mode, default off;
+  see the last bullet for the flip.) TransformerModel::
+  use_q8k_activations toggles it. Why it was not the default:
+  "bit-exact with llama.cpp" is unachievable in principle -- ggml
   itself is not bit-exact across its own backends, because the final
   f32 d*Sigma accumulates in an implementation-specific order (SSE4 vs
   AVX2 vs NEON vs CUDA vs generic). Q8_K's lower activation precision
@@ -1372,7 +1373,10 @@ matvec throughput.
 - Block-32 weights (#189): the same mode dots Q8_0 / Q4_0 / IQ4_NL
   weights against a Q8_0-quantized activation (llama.cpp's vec_dot_type
   for them: d = amax / 127 as f16, quants rounded to nearest even),
-  accumulated in ggml's NEON lane order.
+  accumulated in the order of ggml's non-repacked NEON
+  vec_dot_q8_0_q8_0 (Q4_0 / IQ4_NL reuse it, so they match ggml to
+  rounding only; its repacked kernels have their own orders). The
+  evidence is the token-exact Muse Spark golden.
 - Per-arch default (#189): an arch whose goldens are llama.cpp's sets
   Hparams::q8k_default, so the mode is on at load (muse-spark,
   deepseek41); use_q8k_activations still overrides it. Every arch hook
@@ -1385,6 +1389,24 @@ matvec throughput.
   side, so the test stays teacher-forced on every lane. Likewise the
   deepseek41 goldens (prompt 1's third token tips on x86, and on arm64
   since #237's NEON BF16 dot): teacher-forced on every lane.
+- Default ON where it is fast (2026-10-25, owner decision, #206):
+  with the NEON int8 dots (matvec_neon_q8k, bit-identical to scalar
+  matvec_q8k) the Q8 path is 2.1x faster than the f32 dot on CPU
+  decode (Orpheus 3B on M4, default threads: 29.4 -> 63.0 tok/s). The
+  mode is on when the arch requires it (Hparams::q8k_default:
+  muse-spark, deepseek41) or the backend's Q8 dot is its fast path
+  (Ops::prefers_q8k: neon, sse4, scalar). avx2 (scalar Q8 dot vs its
+  AVX2 f32 one), cuda (no block-32 Q8 kernel) and vulkan's per-op
+  fallback (scalar, inline) keep the f32 dot. The attention
+  projections take matvec_mt like every other matvec (llama.cpp
+  quantizes them too), and batched prefill gates on the same types
+  as decode (uses_quantized_activation), so prefill == decode holds
+  for block-32 weights too. LOCUS_F32_ACTIVATIONS (any value but "0"
+  or empty) or use_q8k_activations(false) selects the f32 path, the
+  reference for exactness checks; use_q8k_activations overrides
+  everything. Goldens pinned to f32 because Q8 tips a near-tie:
+  qwen2moe (~token 15, as predicted above) and deepseek-v2-lite
+  (neon leg, after 15 tokens). No Q8_0 golden moved.
 
 ## 8. Testing strategy
 

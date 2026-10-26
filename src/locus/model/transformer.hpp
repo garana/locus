@@ -79,9 +79,9 @@ struct Hparams {
     bool rope_neox = false;
     /** YARN rope correction (freq_scale 1 = off). */
     backend::Yarn yarn;
-    /** Quantized-activation (R16) mode on by default: archs validated
-     * against llama.cpp, which quantizes the activations
-     * (muse-spark, deepseek41). use_q8k_activations overrides it. */
+    /** The arch REQUIRES the quantized-activation (R16) mode on every
+     * backend: its goldens are llama.cpp's (muse-spark, deepseek41).
+     * Other arches follow the backend's Ops::prefers_q8k. */
     bool q8k_default = false;
     /** Max context the model was trained for. */
     std::uint32_t n_ctx = 0;
@@ -212,28 +212,27 @@ class TransformerModel {
     }
 
     /**
-     * Opt-in ggml-parity mode (DESIGN.md R16): when enabled, QK_K
-     * weight matmuls integer-dot a Q8_K-quantized activation, and
-     * block-32 weights (Q8_0 / Q4_0 / IQ4_NL) a Q8_0-quantized one
-     * (matching llama.cpp's algorithm, lower quantization error than the
-     * default f32-activation dot) via Ops::matvec_q8k. Default off
-     * (on for arches whose hparams set q8k_default) -- the f32
-     * path stays the default because it keeps the exact-string e2e
-     * goldens stable and cross-backend consistent, and Q8_K's final
-     * f32 accumulation order is implementation-specific (not bit-exact
-     * across backends). Enable when matching llama.cpp's quantization
-     * matters more than byte-stable output (e.g. coarse quants).
+     * The ggml-parity mode (DESIGN.md R16): QK_K weight matmuls
+     * integer-dot a Q8_K-quantized activation, and block-32 weights
+     * (Q8_0 / Q4_0 / IQ4_NL) a Q8_0-quantized one (llama.cpp's
+     * algorithm), via Ops::matvec_q8k. Unless set here, it is on when
+     * the arch requires it (Hparams::q8k_default) or the backend's Q8
+     * dot is its fast path (Ops::prefers_q8k: neon, sse4, scalar),
+     * and off with LOCUS_F32_ACTIVATIONS set to anything but "0" or
+     * empty -- the f32-activation dot, the reference for exactness
+     * checks. Calling this overrides all of that.
      */
-    void use_q8k_activations(bool on) { q8k_activations_ = on; }
+    void use_q8k_activations(bool on) { q8k_override_ = on ? 1 : 0; }
 
-    /** @returns Whether Q8_K-activation mode is enabled. */
-    bool q8k_activations() const { return q8k_activations_; }
+    /** @returns Whether the Q8-activation mode is in effect. */
+    bool q8k_activations() const;
 
     /**
      * @returns The active backend's ops as the forward uses them:
      *     Ops::matvec_q8k cleared unless Q8_K-activation mode is on.
-     *     Arch hooks take these, never active_backend().ops directly,
-     *     so use_q8k_activations holds for every arch.
+     *     Arch hooks take these, never the backend's raw ops, so
+     *     use_q8k_activations holds for every arch (a test greps
+     *     src/locus/model for the raw accessor).
      */
     backend::Ops ops() const;
 
@@ -681,9 +680,9 @@ class TransformerModel {
     Hparams hp_;
     const struct ArchSpec* spec_ = nullptr;
     const backend::Backend* backend_ = nullptr;
-    /** R16 Q8_K-activation opt-in (see use_q8k_activations); default
-     * off keeps the f32 path and stable cross-backend goldens. */
-    bool q8k_activations_ = false;
+    /** use_q8k_activations' choice: -1 none (the default rule), 0 off,
+     * 1 on. */
+    int q8k_override_ = -1;
     /** Weights live in a read-only file mapping; gates the
      * LOCUS_WEIGHT_WINDOW DONTNEED policy (see gguf.hpp). */
     bool file_backed_ = false;
@@ -746,14 +745,6 @@ std::size_t mt_fanout();
 void matvec_mt(const backend::Ops& op, const backend::Mat& w,
                std::span<const float> x, std::span<float> out);
 
-/**
- * matvec_mt that always runs op.matvec, the f32-activation dot, even
- * when R16 Q8 activations are on: the attention projections keep
- * their single-threaded arithmetic, only spread across the pool.
- */
-void matvec_mt_f32(const backend::Ops& op, const backend::Mat& w,
-                   std::span<const float> x, std::span<float> out);
-
 /** One matvec of a matvec_mt_group: out = w * x. */
 struct MatvecJob {
     const backend::Mat& w;
@@ -766,11 +757,11 @@ struct MatvecJob {
  * pool dispatch: their rows are sliced together, each job getting
  * slices in proportion to its rows, so the pool wakes once instead of
  * once per matrix. Each row is computed by the same kernel as
- * matvec_mt (or matvec_mt_f32 when `f32`), so outputs are bit-identical
- * to issuing the jobs one by one.
+ * matvec_mt, so outputs are bit-identical to issuing the jobs one by
+ * one.
  */
 void matvec_mt_group(const backend::Ops& op,
-                     std::span<const MatvecJob> jobs, bool f32 = false);
+                     std::span<const MatvecJob> jobs);
 
 /**
  * Weight-stationary batched matvec (R10): applies w to each of

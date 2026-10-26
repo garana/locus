@@ -47,7 +47,8 @@ TEST_CASE("arch hooks take the model's ops, never the raw backend's",
     namespace fs = std::filesystem;
     const fs::path dir = fs::path(LOCUS_SOURCE_DIR) / "src/locus/model";
     for (const auto& e : fs::directory_iterator(dir)) {
-        if (e.path().extension() != ".cpp") {
+        if (e.path().extension() != ".cpp" &&
+            e.path().extension() != ".hpp") {
             continue;
         }
         std::ifstream f(e.path());

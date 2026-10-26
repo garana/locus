@@ -78,7 +78,7 @@ void llama_attention(const TransformerModel& m,
         const MatvecJob qkv[] = {{lay.wq, ws.xb, ws.q},
                                  {lay.wk, ws.xb, kbuf},
                                  {lay.wv, ws.xb, vbuf}};
-        matvec_mt_group(op, qkv, /*f32=*/true);
+        matvec_mt_group(op, qkv);
         rope_norm(ws.q, hp.n_heads, hd, pos, hp.rope_freq_base,
                   m.rope_factors());
         rope_norm(kbuf, hp.n_kv_heads, hd, pos, hp.rope_freq_base,
@@ -102,7 +102,7 @@ void llama_attention(const TransformerModel& m,
         const MatvecJob qkv[] = {{lay.wq, ws.xb, ws.q},
                                  {lay.wk, ws.xb, {krow, kv_dim}},
                                  {lay.wv, ws.xb, {vrow, kv_dim}}};
-        matvec_mt_group(op, qkv, /*f32=*/true);
+        matvec_mt_group(op, qkv);
         rope_norm(ws.q, hp.n_heads, hd, pos, hp.rope_freq_base,
                   m.rope_factors());
         rope_norm({krow, kv_dim}, hp.n_kv_heads, hd, pos,
@@ -266,14 +266,14 @@ void mla_attention(const TransformerModel& m,
 
     // Query: direct, or through the compressed q_lora path.
     if (hp.q_lora_rank > 0) {
-        matvec_mt_f32(op, lay.wq_a, ws.xb, ws.q_a);
+        matvec_mt(op, lay.wq_a, ws.xb, ws.q_a);
         rmsnorm(ws.q_a, lay.q_a_norm, hp.rms_eps, ws.q_a);
         matvec_mt(op, lay.wq_b, ws.q_a, ws.q);
     } else {
         matvec_mt(op, lay.wq, ws.xb, ws.q);
     }
     // Latent row: rms-normed c_kv followed by roped shared k_pe.
-    matvec_mt_f32(op, lay.wkv_a, ws.xb, ws.kv_a);
+    matvec_mt(op, lay.wkv_a, ws.xb, ws.kv_a);
     float* row = cache.k(seq, l, pos);
     rmsnorm({ws.kv_a.data(), rank}, lay.kv_a_norm, hp.rms_eps,
             {row, rank});
@@ -476,14 +476,14 @@ void glm_dsa_attention(const TransformerModel& m,
         // Compute and cache this position's indexer key:
         // layernorm(W_k x), roped half-split on the rope dims.
         float* krow = cache.k(seq, l, pos) + off;
-        matvec_mt_f32(op, lay.idx_k, ws.xb, {krow, d});
+        matvec_mt(op, lay.idx_k, ws.xb, {krow, d});
         layernorm_inplace({krow, d}, lay.idx_k_norm,
                           lay.idx_k_norm_b, hp.rms_eps);
         rope_half(krow, hp.qk_rope_dim, pos, hp.rope_freq_base);
 
         if (n_pos > hp.idx_top_k) {
             // Indexer queries share the MLA q latent path.
-            matvec_mt_f32(op, lay.wq_a, ws.xb, ws.q_a);
+            matvec_mt(op, lay.wq_a, ws.xb, ws.q_a);
             rmsnorm(ws.q_a, lay.q_a_norm, hp.rms_eps, ws.q_a);
             matvec_mt(op, lay.idx_q_b, ws.q_a, ws.idx_q);
             for (std::uint32_t h = 0; h < hp.idx_heads; ++h) {
@@ -492,7 +492,7 @@ void glm_dsa_attention(const TransformerModel& m,
                           hp.qk_rope_dim, pos,
                           hp.rope_freq_base);
             }
-            matvec_mt_f32(op, lay.idx_proj, ws.xb, ws.idx_w);
+            matvec_mt(op, lay.idx_proj, ws.xb, ws.idx_w);
             for (std::uint32_t t = 0; t < n_pos; ++t) {
                 ws.idx_scores[t] = dsa_index_score(
                     ws.idx_q, ws.idx_w,
@@ -598,7 +598,7 @@ void qwen2moe_attention(const TransformerModel& m,
         }
     };
 
-    matvec_mt_f32(op, lay.wq, ws.xb, ws.q);
+    matvec_mt(op, lay.wq, ws.xb, ws.q);
     add_bias({ws.q.data(), static_cast<std::size_t>(hp.n_embd)},
              lay.wq_bias);
     rope_neox_yarn(ws.q, hp.n_heads, hd, pos, hp.rope_freq_base,
@@ -610,8 +610,8 @@ void qwen2moe_attention(const TransformerModel& m,
     std::size_t k_stride = kv_dim;
     if (cache.quantized()) {
         std::vector<float> kbuf(kv_dim), vbuf(kv_dim);
-        matvec_mt_f32(op, lay.wk, ws.xb, kbuf);
-        matvec_mt_f32(op, lay.wv, ws.xb, vbuf);
+        matvec_mt(op, lay.wk, ws.xb, kbuf);
+        matvec_mt(op, lay.wv, ws.xb, vbuf);
         add_bias(kbuf, lay.wk_bias);
         add_bias(vbuf, lay.wv_bias);
         rope_neox_yarn(kbuf, hp.n_kv_heads, hd, pos,
@@ -632,8 +632,8 @@ void qwen2moe_attention(const TransformerModel& m,
     } else {
         float* krow = cache.k(seq, l, pos);
         float* vrow = cache.v(seq, l, pos);
-        matvec_mt_f32(op, lay.wk, ws.xb, {krow, kv_dim});
-        matvec_mt_f32(op, lay.wv, ws.xb, {vrow, kv_dim});
+        matvec_mt(op, lay.wk, ws.xb, {krow, kv_dim});
+        matvec_mt(op, lay.wv, ws.xb, {vrow, kv_dim});
         add_bias({krow, kv_dim}, lay.wk_bias);
         add_bias({vrow, kv_dim}, lay.wv_bias);
         rope_neox_yarn({krow, kv_dim}, hp.n_kv_heads, hd, pos,
@@ -725,7 +725,7 @@ void qwen3moe_attention(const TransformerModel& m,
     };
 
     std::span<float> q(ws.q.data(), q_dim);
-    matvec_mt_f32(op, lay.wq, ws.xb, q);
+    matvec_mt(op, lay.wq, ws.xb, q);
     head_norm(q, hp.n_heads, lay.attn_q_norm);
     rope_neox_yarn(q, hp.n_heads, hd, pos, hp.rope_freq_base, Yarn{});
 
@@ -734,8 +734,8 @@ void qwen3moe_attention(const TransformerModel& m,
     const float* vbase = nullptr;
     if (cache.quantized()) {
         std::vector<float> kbuf(kv_dim), vbuf(kv_dim);
-        matvec_mt_f32(op, lay.wk, ws.xb, kbuf);
-        matvec_mt_f32(op, lay.wv, ws.xb, vbuf);
+        matvec_mt(op, lay.wk, ws.xb, kbuf);
+        matvec_mt(op, lay.wv, ws.xb, vbuf);
         head_norm(kbuf, hp.n_kv_heads, lay.attn_k_norm);
         rope_neox_yarn(kbuf, hp.n_kv_heads, hd, pos,
                        hp.rope_freq_base, Yarn{});
@@ -755,8 +755,8 @@ void qwen3moe_attention(const TransformerModel& m,
     } else {
         float* krow = cache.k(seq, l, pos);
         float* vrow = cache.v(seq, l, pos);
-        matvec_mt_f32(op, lay.wk, ws.xb, {krow, kv_dim});
-        matvec_mt_f32(op, lay.wv, ws.xb, {vrow, kv_dim});
+        matvec_mt(op, lay.wk, ws.xb, {krow, kv_dim});
+        matvec_mt(op, lay.wv, ws.xb, {vrow, kv_dim});
         head_norm({krow, kv_dim}, hp.n_kv_heads, lay.attn_k_norm);
         rope_neox_yarn({krow, kv_dim}, hp.n_kv_heads, hd, pos,
                        hp.rope_freq_base, Yarn{});
@@ -840,7 +840,7 @@ void dbrx_attention(const TransformerModel& m,
     const float rb = hp.rope_freq_base;
 
     std::vector<float> qkv(q_dim + 2 * kv_dim);
-    matvec_mt_f32(op, lay.wq, ws.xb, qkv);  // fused q|k|v
+    matvec_mt(op, lay.wq, ws.xb, qkv);  // fused q|k|v
     for (float& v : qkv) {
         v = std::clamp(v, -kClamp, kClamp);
     }

@@ -486,6 +486,81 @@ float row_q6_k_q8k_neon(const std::byte* row, std::size_t nb,
     return sumf;
 }
 
+/** One block-32 weight block as 2 x 16 int8 values (low, high
+ *  halves) and its f16 scale. */
+inline float unpack_block32_neon(gguf::TensorType type, const std::byte* blk,
+                                 int8x16_t& lo, int8x16_t& hi) {
+    const float d = half_to_float(load_u16(blk));
+    const auto* q = reinterpret_cast<const std::uint8_t*>(blk + 2);
+    if (type == gguf::TensorType::kQ8_0) {
+        lo = vld1q_s8(reinterpret_cast<const std::int8_t*>(q));
+        hi = vld1q_s8(reinterpret_cast<const std::int8_t*>(q + 16));
+        return d;
+    }
+    const uint8x16_t v = vld1q_u8(q);
+    const uint8x16_t nlo = vandq_u8(v, vdupq_n_u8(0x0f));
+    const uint8x16_t nhi = vshrq_n_u8(v, 4);
+    if (type == gguf::TensorType::kQ4_0) {
+        lo = vsubq_s8(vreinterpretq_s8_u8(nlo), vdupq_n_s8(8));
+        hi = vsubq_s8(vreinterpretq_s8_u8(nhi), vdupq_n_s8(8));
+    } else {  // kIQ4_NL
+        const int8x16_t tbl = vld1q_s8(kvalues_iq4nl);
+        lo = vqtbl1q_s8(tbl, nlo);
+        hi = vqtbl1q_s8(tbl, nhi);
+    }
+    return d;
+}
+
+/** Lane l = sum over quants 4l..4l+3 of both halves (dotprod, or the
+ *  same exact integers through widening multiplies without it). */
+inline int32x4_t lanes32(int8x16_t qlo, int8x16_t qhi, const std::int8_t* x) {
+    const int8x16_t xlo = vld1q_s8(x), xhi = vld1q_s8(x + 16);
+#if defined(__ARM_FEATURE_DOTPROD)
+    return vdotq_s32(vdotq_s32(vdupq_n_s32(0), qlo, xlo), qhi, xhi);
+#else
+    auto d4 = [](int8x16_t a, int8x16_t b) {
+        const int16x8_t p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+        const int16x8_t p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
+        return vpaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1));
+    };
+    return vaddq_s32(d4(qlo, xlo), d4(qhi, xhi));
+#endif
+}
+
+/**
+ * dot(block-32 weight row, Q8_0 activation), bit-identical to the
+ * scalar vec_dot_block32_q8_0 (ggml's non-repacked NEON
+ * vec_dot_q8_0_q8_0 order): two blocks per step into four float lanes
+ * each (a mul, then an add), the pairwise lane reduction, a scalar
+ * tail for an odd last block.
+ */
+float row_block32_q8_0_neon(gguf::TensorType type, const std::byte* row,
+                            std::size_t bb, std::size_t nb, const float* yd,
+                            const std::int8_t* yq) {
+    float32x4_t s0 = vdupq_n_f32(0.0f), s1 = vdupq_n_f32(0.0f);
+    std::size_t b = 0;
+    int8x16_t lo, hi;
+    for (; b + 1 < nb; b += 2) {
+        const float d0 = unpack_block32_neon(type, row + b * bb, lo, hi) *
+                         yd[b];
+        const int32x4_t p0 = lanes32(lo, hi, yq + b * 32);
+        const float d1 =
+            unpack_block32_neon(type, row + (b + 1) * bb, lo, hi) *
+            yd[b + 1];
+        const int32x4_t p1 = lanes32(lo, hi, yq + (b + 1) * 32);
+        s0 = vaddq_f32(s0, vmulq_n_f32(vcvtq_f32_s32(p0), d0));
+        s1 = vaddq_f32(s1, vmulq_n_f32(vcvtq_f32_s32(p1), d1));
+    }
+    float sum = vaddvq_f32(s0) + vaddvq_f32(s1);
+    for (; b < nb; ++b) {
+        const float d =
+            unpack_block32_neon(type, row + b * bb, lo, hi) * yd[b];
+        const int p = vaddvq_s32(lanes32(lo, hi, yq + b * 32));
+        sum += static_cast<float>(p) * d;
+    }
+    return sum;
+}
+
 }  // namespace
 
 void matvec_neon(const Mat& w, std::span<const float> x,
@@ -573,6 +648,22 @@ void matvec_neon(const Mat& w, std::span<const float> x,
 
 void matvec_neon_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
+    if (uses_quantized_activation(w.type) && !is_q8k_type(w.type) &&
+        x.size() % 32 == 0) {
+        // Block-32 weights x a Q8_0 activation (llama.cpp's vec_dot_type).
+        const std::size_t nb = x.size() / 32;
+        thread_local std::vector<float> d8;
+        thread_local std::vector<std::int8_t> q8;
+        d8.resize(nb);
+        q8.resize(x.size());
+        quantize_activation_q8_0(x, d8.data(), q8.data());
+        const std::size_t bb = w.type == gguf::TensorType::kQ8_0 ? 34 : 18;
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            out[r] = row_block32_q8_0_neon(w.type, w.data + r * nb * bb, bb,
+                                           nb, d8.data(), q8.data());
+        }
+        return;
+    }
     const bool q4k = w.type == gguf::TensorType::kQ4_K;
     const bool q6k = w.type == gguf::TensorType::kQ6_K;
     if ((!q4k && !q6k) || x.size() % 256 != 0) {

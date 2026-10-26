@@ -2012,6 +2012,17 @@ void quantize_row_q8_0_act(const float* x, BlockQ8_0Act* y, std::size_t n) {
     }
 }
 
+void quantize_activation_q8_0(std::span<const float> x, float* d,
+                              std::int8_t* qs) {
+    const std::size_t nb = x.size() / 32;
+    std::vector<BlockQ8_0Act> tmp(nb);
+    quantize_row_q8_0_act(x.data(), tmp.data(), x.size());
+    for (std::size_t b = 0; b < nb; ++b) {
+        d[b] = tmp[b].d;
+        std::memcpy(qs + b * 32, tmp[b].qs, 32);
+    }
+}
+
 /** Block b of a block-32 weight row as 32 int8 values and its scale. */
 float unpack_block32(gguf::TensorType type, const std::byte* row,
                      std::size_t b, std::int8_t* q) {
@@ -2045,9 +2056,13 @@ float unpack_block32(gguf::TensorType type, const std::byte* row,
 
 /**
  * dot(block-32 weight row, Q8_0 activation), in the order of ggml's
- * NEON vec_dot_*_q8_0: two blocks per step, each folding its int sums
- * into four float lanes (lane l holds quants 4l..4l+3 of both halves);
- * a pairwise lane reduction; then a scalar tail for an odd last block.
+ * non-repacked NEON vec_dot_q8_0_q8_0: two blocks per step, each
+ * folding its int sums into four float lanes (lane l holds quants
+ * 4l..4l+3 of both halves); a pairwise lane reduction; then a scalar
+ * tail for an odd last block. Q4_0 and IQ4_NL weights reuse it; ggml's
+ * own kernels for those group the scale products differently (and its
+ * repacked kernels have orders of their own), so they match llama.cpp
+ * to rounding, not bit for bit.
  */
 float vec_dot_block32_q8_0(gguf::TensorType type, const std::byte* row,
                            const BlockQ8_0Act* xq, std::size_t nb) {
