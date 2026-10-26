@@ -1,8 +1,11 @@
+#include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -636,4 +639,56 @@ TEST_CASE("LOCUS_VK_BARRIERS keeps dispatch barriers", "[vulkan]") {
         REQUIRE_FALSE(ctx.serial_dispatch());
     }
     ::unsetenv("LOCUS_VK_BARRIERS");
+}
+
+// i#268: the server reaches the backend from the engine thread and from
+// HTTP threads (image, vision, embeddings, audio) at once. Every
+// matvec_vulkan from four threads must still equal the CPU result.
+TEST_CASE("matvec_vulkan is safe from several threads", "[vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    constexpr int kThreads = 4, kIters = 200;
+    const std::uint32_t rows = 96, cols = 256;
+    struct Job {
+        std::vector<float> w, x, want;
+    };
+    std::vector<Job> jobs(kThreads);
+    std::mt19937 rng(41);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& j : jobs) {
+        j.w.resize(std::size_t{rows} * cols);
+        j.x.resize(cols);
+        j.want.resize(rows);
+        for (auto& v : j.w) v = dist(rng);
+        for (auto& v : j.x) v = dist(rng);
+        locus::backend::matvec(
+            {locus::gguf::TensorType::kF32,
+             reinterpret_cast<const std::byte*>(j.w.data()), rows, cols},
+            j.x, j.want);
+    }
+    std::atomic<int> bad{0};
+    std::vector<std::thread> threads;
+    for (auto& j : jobs) {
+        threads.emplace_back([&j, &bad] {
+            std::vector<float> got(rows);
+            const locus::backend::Mat m{
+                locus::gguf::TensorType::kF32,
+                reinterpret_cast<const std::byte*>(j.w.data()), rows, cols};
+            for (int i = 0; i < kIters; ++i) {
+                locus::backend::matvec_vulkan(m, j.x, got);
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    if (!(std::abs(got[r] - j.want[r]) <= 1e-3f)) {
+                        ++bad;
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+    // The weights are freed below; drop their uploads, which are keyed
+    // by host pointer.
+    locus::backend::vulkan_reset_state();
+    REQUIRE(bad.load() == 0);
 }
