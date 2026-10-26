@@ -86,7 +86,7 @@ float row_part(uint wbase, uint xbase, uint r, uint lane) {
         uint t = (g >> 1) & 3u;
         uint h = g & 1u;
         uint at = rb + b * 210u;
-        float d = f16_at(at + 208u);
+        float d = unpackHalf2x16(word_at(at + 208u)).x;
         float sc = float(bitfieldExtract(
             int(byte_at(at + 192u + n * 8u + h + 2u * t)), 0, 8));
         // q1 / q3 read ql[l], q2 / q4 ql[l + 32]; q3 / q4 the high
@@ -97,9 +97,28 @@ float row_part(uint wbase, uint xbase, uint r, uint lane) {
         uint hsh = 2u * t;
         uint xi = xbase + b * 256u + n * 128u + t * 32u + h * 16u;
         float s = 0.0;
+        // The 16 ql and 16 qh bytes as 4 words each; a block at a
+        // 2-mod-4 offset (210-byte blocks) reads 5 words and shifts.
+        uint lw[4], hw[4];
+        uint lsft = (ql & 3u) * 8u, hsft = (qh & 3u) * 8u;
+        if (lsft == 0u) {
+            for (uint k = 0u; k < 4u; ++k) {
+                lw[k] = w[(ql >> 2) + k];
+                hw[k] = w[(qh >> 2) + k];
+            }
+        } else {
+            uint l0 = w[ql >> 2], h0 = w[qh >> 2];
+            for (uint k = 0u; k < 4u; ++k) {
+                uint l1 = w[(ql >> 2) + k + 1u], h1 = w[(qh >> 2) + k + 1u];
+                lw[k] = (l0 >> lsft) | (l1 << (32u - lsft));
+                hw[k] = (h0 >> hsft) | (h1 << (32u - hsft));
+                l0 = l1;
+                h0 = h1;
+            }
+        }
         for (uint k = 0u; k < 4u; ++k) {
-            uint lo = word_at(ql + k * 4u) >> lsh;
-            uint hi = word_at(qh + k * 4u) >> hsh;
+            uint lo = lw[k] >> lsh;
+            uint hi = hw[k] >> hsh;
             uint xk = xi + k * 4u;
             vec4 xv = xal ? x4[xk >> 2]
                           : vec4(x[xk], x[xk + 1u], x[xk + 2u], x[xk + 3u]);
