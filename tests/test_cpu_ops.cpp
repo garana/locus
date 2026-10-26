@@ -1,6 +1,8 @@
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -1297,6 +1299,108 @@ TEST_CASE("conv1d_transpose_cuda matches the scalar reference",
     check_conv1d_cuda(true, 4, 8, 2, 3, 2, 1, 1, 2, false, 120);
     // With a bias.
     check_conv1d_cuda(true, 2, 6, 2, 4, 2, 1, 1, 1, true, 121);
+}
+
+// conv2d_cuda sums each output in conv2d's order with no fused
+// multiply-add, so on a host whose build has no FMA (the x86 baseline)
+// it must match the reference bit for bit: memcmp. aarch64 and FMA x86
+// builds fuse the scalar reference, so this holds only without FMA.
+// Cases cover 3x3 and 1x1, a non-square kernel, padding on every edge
+// and wider than 1, groups, stride 2, no bias, a kernel wider than the
+// padded input (empty output), and a plane big enough for many blocks
+// with a ragged tail.
+TEST_CASE("conv2d_cuda is bit-identical to conv2d", "[conv2d][cuda]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    std::mt19937 rng(29);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    auto fill = [&](std::size_t n) {
+        std::vector<float> v(n);
+        for (auto& x : v) x = d(rng);
+        return v;
+    };
+    struct C {
+        std::uint32_t in_ch, in_h, in_w, out_ch, kh, kw, stride, pad, groups;
+        bool bias;
+    };
+    const C cases[] = {
+        {8, 17, 23, 12, 3, 3, 1, 1, 1, true},     // 3x3 same
+        {16, 9, 31, 8, 1, 1, 1, 0, 1, true},      // 1x1
+        {6, 12, 12, 6, 3, 3, 1, 1, 3, false},     // grouped, no bias
+        {6, 10, 10, 6, 3, 3, 1, 1, 6, true},      // depthwise
+        {4, 5, 7, 4, 3, 3, 1, 0, 1, true},        // valid (no padding)
+        {3, 40, 40, 5, 3, 3, 1, 2, 1, true},      // padding wider than 1
+        {4, 11, 13, 6, 3, 3, 2, 1, 1, true},      // stride 2
+        {5, 9, 14, 3, 2, 4, 1, 1, 1, true},       // non-square kernel
+        {64, 24, 24, 32, 3, 3, 1, 1, 1, true},    // decoder-like width
+        {3, 301, 299, 4, 3, 3, 1, 1, 1, true},    // many blocks, ragged
+        {2, 2, 2, 3, 5, 5, 1, 0, 1, true},        // empty output
+    };
+    for (const auto& c : cases) {
+        INFO("in " << c.in_ch << "x" << c.in_h << "x" << c.in_w
+                   << " out_ch " << c.out_ch << " k " << c.kh << "x" << c.kw
+                   << " s " << c.stride << " p " << c.pad << " g "
+                   << c.groups);
+        const auto in = fill(std::size_t{c.in_ch} * c.in_h * c.in_w);
+        const auto w = fill(std::size_t{c.out_ch} * (c.in_ch / c.groups) *
+                            c.kh * c.kw);
+        const auto bias = c.bias ? fill(c.out_ch) : std::vector<float>{};
+        const std::uint32_t oh = conv1d_out_len(c.in_h, c.kh, c.stride, 1,
+                                                c.pad);
+        const std::uint32_t ow = conv1d_out_len(c.in_w, c.kw, c.stride, 1,
+                                                c.pad);
+        std::vector<float> ref(std::size_t{c.out_ch} * oh * ow, 0.0f);
+        std::vector<float> got(ref.size(), -1.0f);
+        conv2d(in, c.in_ch, c.in_h, c.in_w, w, c.out_ch, c.kh, c.kw, bias,
+               c.stride, c.pad, c.groups, ref);
+        conv2d_cuda(in, c.in_ch, c.in_h, c.in_w, w, c.out_ch, c.kh, c.kw,
+                    bias, c.stride, c.pad, c.groups, got);
+        REQUIRE(std::memcmp(ref.data(), got.data(),
+                            ref.size() * sizeof(float)) == 0);
+    }
+}
+
+// A bad shape must throw, not reach the scalar fallback: conv2d only
+// asserts its contract, so in Release stride 0 divides by zero and a
+// short span reads or writes out of bounds. Runs on every build (the
+// non-CUDA stub checks the same way), no device needed.
+TEST_CASE("conv2d_cuda rejects bad shapes", "[conv2d]") {
+    // A valid 2 -> 2 3x3 same-padded case on a 4x4 plane, then one
+    // argument broken at a time.
+    const std::vector<float> in(2 * 4 * 4, 1.0f), w(2 * 2 * 3 * 3, 1.0f),
+        bias(2, 0.0f);
+    std::vector<float> out(2 * 4 * 4);
+    REQUIRE_NOTHROW(conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias, 1, 1, 1, out));
+    // stride 0
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias, 0, 1, 1, out),
+        std::invalid_argument);
+    // short weight span
+    const std::span<const float> w_short(w.data(), w.size() - 1);
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w_short, 2, 3, 3, bias, 1, 1, 1, out),
+        std::invalid_argument);
+    // groups 0, and groups not dividing the channels
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias, 1, 1, 0, out),
+        std::invalid_argument);
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias, 1, 1, 3, out),
+        std::invalid_argument);
+    // short input, wrong-size bias, short output
+    const std::span<const float> in_short(in.data(), in.size() - 1);
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in_short, 2, 4, 4, w, 2, 3, 3, bias, 1, 1, 1, out),
+        std::invalid_argument);
+    const std::vector<float> bias3(3, 0.0f);
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias3, 1, 1, 1, out),
+        std::invalid_argument);
+    const std::span<float> out_short(out.data(), out.size() - 1);
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias, 1, 1, 1, out_short),
+        std::invalid_argument);
 }
 
 TEST_CASE("snake1d_cuda matches the scalar reference", "[conv1d][cuda]") {

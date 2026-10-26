@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #include "locus/sys/thread_pool.hpp"
@@ -2532,6 +2533,37 @@ void conv2d(std::span<const float> in, std::uint32_t in_ch,
                 out[(std::size_t{oc} * out_h + oy) * out_w + ox] = acc;
             }
         }
+    }
+}
+
+void conv2d_check_args(std::span<const float> in, std::uint32_t in_ch,
+                       std::uint32_t in_h, std::uint32_t in_w,
+                       std::span<const float> weight, std::uint32_t out_ch,
+                       std::uint32_t kh, std::uint32_t kw,
+                       std::span<const float> bias, std::uint32_t stride,
+                       std::uint32_t pad, std::uint32_t groups,
+                       std::span<const float> out) {
+    if (groups == 0 || in_ch % groups != 0 || out_ch % groups != 0) {
+        throw std::invalid_argument(
+            "conv2d: groups must be non-zero and divide in_ch and out_ch");
+    }
+    if (stride == 0) {
+        throw std::invalid_argument("conv2d: stride must be non-zero");
+    }
+    if (in.size() != std::size_t{in_ch} * in_h * in_w) {
+        throw std::invalid_argument("conv2d: in is not in_ch*in_h*in_w");
+    }
+    if (weight.size() != std::size_t{out_ch} * (in_ch / groups) * kh * kw) {
+        throw std::invalid_argument(
+            "conv2d: weight is not out_ch*(in_ch/groups)*kh*kw");
+    }
+    if (!bias.empty() && bias.size() != out_ch) {
+        throw std::invalid_argument("conv2d: bias is neither empty nor out_ch");
+    }
+    const std::uint32_t out_h = conv1d_out_len(in_h, kh, stride, 1, pad);
+    const std::uint32_t out_w = conv1d_out_len(in_w, kw, stride, 1, pad);
+    if (out.size() != std::size_t{out_ch} * out_h * out_w) {
+        throw std::invalid_argument("conv2d: out is not out_ch*out_h*out_w");
     }
 }
 
