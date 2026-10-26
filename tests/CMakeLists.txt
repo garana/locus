@@ -72,6 +72,7 @@ add_executable(locus_tests
     test_snac.cpp
     test_vq16.cpp
     test_janus.cpp
+    test_janus_vision.cpp
     test_png.cpp
     test_base64.cpp
     test_deepseek41.cpp

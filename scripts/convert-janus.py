@@ -15,10 +15,16 @@ encoder, the backbone and the image-token heads come from one file.
   residual stream) and gen_head (Linear, GELU, Linear to the image
   codes), plus janus.image_tokens / image_grid / begin_of_image / pad
   / cfg_scale.
+- The image-understanding encoder (i#241) under vit.*: the SigLIP-L/16
+  vision tower (patch_embd conv, pos_embd, 24 pre-norm blocks of
+  ln1 / attn_qkv / attn_out / ln2 / ffn_up / ffn_down, post_ln) and the
+  aligner (Linear, GELU, Linear, 1024 -> 2048), plus the janus.vision.*
+  keys (sizes, eps, and the placeholder / end_of_image ids).
 
 Matrices are written as BF16 by default, the checkpoint's own type,
 so every weight is exact (F16 would round the smallest ones); --outtype
-f16 / f32 are the alternatives. Norms and the janus.* tensors are F32.
+f16 / f32 are the alternatives. Norms, biases, the patch-embed conv,
+the position table and the janus.* tensors are F32.
 
 Dev-time tool: needs the Janus-Pro snapshot (pytorch_model.bin,
 loaded with torch's weights_only default, tokenizer.json, config.json).
@@ -28,8 +34,12 @@ Janus-Pro-1B revision 960ab33191f61342a4c60ae74d8dc356a39fafcb:
     python3 scripts/convert-janus.py --model DIR \\
         --out tests/models/janus-pro-1b-f16.gguf
 
-With those versions the F16 output (3.5 GB) has sha256
-977b8a1ced63a2bdf2c20f00d6530b8f43f3d3bacc06907d6e02d27396cf7fc5.
+With those versions the F16 output (3.5 GB, written before the vit.*
+tensors) has sha256
+977b8a1ced63a2bdf2c20f00d6530b8f43f3d3bacc06907d6e02d27396cf7fc5,
+and the default BF16 output with vit.* (4.1 GB,
+tests/models/janus-pro-1b-bf16.gguf) has sha256
+2145ae9c090dfbac33e78df79a438e9ff27c46d24ff44c780bef3f467666e51a.
 Check: locus-run on "The capital of France is" continues with the
 same 12 tokens as HF's f32 greedy decode.
 """
@@ -170,6 +180,56 @@ def main():
     }
     for dst, src in extras.items():
         put(dst, t(src), np.float32)
+
+    # Image understanding (i#241): the SigLIP-L/16 tower and the aligner.
+    vcfg = json.loads((d / "config.json").read_text())["vision_config"]
+    if vcfg["params"]["model_name"] != "siglip_large_patch16_384":
+        sys.exit("vision tower is not siglip_large_patch16_384")
+    ids = {s: i for i, s in enumerate(tokens)}
+    for tag in ("<image_placeholder>", "<begin_of_image>", "<end_of_image>"):
+        if tag not in ids:
+            sys.exit(f"tokenizer has no {tag}")
+    V = "vision_model.vision_tower."
+    n_vlayer = 24
+    out.add_uint32("janus.vision.image_size", 384)
+    out.add_uint32("janus.vision.patch_size", 16)
+    out.add_uint32("janus.vision.embedding_length", 1024)
+    out.add_uint32("janus.vision.block_count", n_vlayer)
+    out.add_uint32("janus.vision.head_count", 16)
+    out.add_uint32("janus.vision.feed_forward_length", 4096)
+    out.add_float32("janus.vision.layer_norm_eps", 1e-6)
+    out.add_uint32("janus.vision.image_placeholder", ids["<image_placeholder>"])
+    out.add_uint32("janus.vision.end_of_image", ids["<end_of_image>"])
+    put("vit.patch_embd.weight", t(V + "patch_embed.proj.weight"), np.float32)
+    put("vit.patch_embd.bias", t(V + "patch_embed.proj.bias"), np.float32)
+    put("vit.pos_embd", t(V + "pos_embed")[0], np.float32)
+    for i in range(n_vlayer):
+        p = f"{V}blocks.{i}."
+        b = f"vit.blk.{i}."
+        if f"{p}ls1.gamma" in sd or f"{p}attn.q_norm.weight" in sd:
+            sys.exit("vision block has layer scale or qk norm")
+        for dst, src, typ in (
+                ("ln1.weight", "norm1.weight", np.float32),
+                ("ln1.bias", "norm1.bias", np.float32),
+                ("attn_qkv.weight", "attn.qkv.weight", big),
+                ("attn_qkv.bias", "attn.qkv.bias", np.float32),
+                ("attn_out.weight", "attn.proj.weight", big),
+                ("attn_out.bias", "attn.proj.bias", np.float32),
+                ("ln2.weight", "norm2.weight", np.float32),
+                ("ln2.bias", "norm2.bias", np.float32),
+                ("ffn_up.weight", "mlp.fc1.weight", big),
+                ("ffn_up.bias", "mlp.fc1.bias", np.float32),
+                ("ffn_down.weight", "mlp.fc2.weight", big),
+                ("ffn_down.bias", "mlp.fc2.bias", np.float32)):
+            put(b + dst, t(p + src), typ)
+    if f"{V}blocks.{n_vlayer}.norm1.weight" in sd:
+        sys.exit(f"vision tower has more than {n_vlayer} blocks")
+    put("vit.post_ln.weight", t(V + "norm.weight"), np.float32)
+    put("vit.post_ln.bias", t(V + "norm.bias"), np.float32)
+    put("vit.aligner.0.weight", t("aligner.layers.0.weight"), big)
+    put("vit.aligner.0.bias", t("aligner.layers.0.bias"), np.float32)
+    put("vit.aligner.2.weight", t("aligner.layers.2.weight"), big)
+    put("vit.aligner.2.bias", t("aligner.layers.2.bias"), np.float32)
 
     out.write_header_to_file()
     out.write_kv_data_to_file()

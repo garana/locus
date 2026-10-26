@@ -15,10 +15,19 @@ that locus's image path is compared against (i#221 section 6).
   decode  The real VQ-16 decoder in float32 on the tokens from
           `tokens`. Writes the (3, 384, 384) f32 output and the PNG,
           with the reference's truncating uint8 conversion.
+  vision  Image understanding (i#241) on janus_decode.png, which is
+          384 x 384, so the preprocessing has no resize and no pad.
+          The reference processor and SFT template with one question,
+          then greedy decoding. Writes janus_vision.f32 (VISION_ROWS
+          sampled patches of the SigLIP output, 1024 wide, then the
+          same rows of the aligner output, 2048 wide) and
+          janus_understand.txt (the expanded prompt ids, the answer
+          ids, then the RMS of the whole vision and aligner outputs).
 
     python3 scripts/make-janus-goldens.py synth
     python3 scripts/make-janus-goldens.py tokens --janus SRC --model DIR
     python3 scripts/make-janus-goldens.py decode --janus SRC --model DIR
+    python3 scripts/make-janus-goldens.py vision --janus SRC --model DIR
 
 SRC is a checkout of github.com/deepseek-ai/Janus and DIR the
 deepseek-ai/Janus-Pro-1B snapshot (pytorch_model.bin, loaded with
@@ -33,6 +42,10 @@ outputs' sha256 (on an M2 Pro, CPU):
     6eb8a8a315141546007f61f4158a8e8c1e9ba6d6c3fadcad1106af4bd543095b
   janus_decode.png
     4b786def5918794634836cb8d1024bd7fa398874c861bb3df359cd96efee2628
+  janus_vision.f32
+    99379afcac1e6a73f5acbc6d41c195d9ed2c6a612fe8edb845bd862c69ee0225
+  janus_understand.txt
+    4601fa660873d3afea11598690170056bc7fed7bcf20419ee4324e14c1bcfb07
 
 The tokens are an f32 CPU argmax, so another machine can tip a near
 tie; regenerate there and compare before trusting a mismatch.
@@ -53,6 +66,11 @@ CFG = 5.0
 IMAGE_TOKENS = 576
 GRID = 24
 PAD_ID = 100002
+
+# Image understanding (keep in sync with tests/test_janus_vision.cpp).
+QUESTION = "What is on the table?"
+VISION_ROWS = list(range(0, 576, 36))  # 16 sampled patches
+ANSWER_TOKENS = 24
 
 # The synthetic decoder (keep in sync with tests/test_vq16.cpp).
 SYNTH = dict(z_channels=32, ch=32, ch_mult=(1, 2), num_res_blocks=1)
@@ -198,16 +216,57 @@ def cmd_decode(args):
     print(f"wrote janus_decode.f32 {tuple(a.shape)} and janus_decode.png")
 
 
+@torch.inference_mode()
+def cmd_vision(args):
+    from PIL import Image  # noqa: E402
+    proc, model = load_janus(args)
+    img = Image.open(GOLDEN / "janus_decode.png").convert("RGB")
+    assert img.size == (384, 384), img.size
+    conv = [{"role": "User",
+             "content": "<image_placeholder>\n" + QUESTION},
+            {"role": "Assistant", "content": ""}]
+    inp = proc(conversations=conv, images=[img], force_batchify=True)
+    # The processor's pixels must be exactly (x / 255 - 0.5) / 0.5 here.
+    raw = torch.from_numpy(np.asarray(img, dtype=np.float32)).permute(2, 0, 1)
+    want = (raw / 255.0 - 0.5) / 0.5
+    px = inp.pixel_values[0, 0]
+    print(f"pixel max |diff| vs (x/255-0.5)/0.5: "
+          f"{float((px - want).abs().max()):.3g}")
+    vis = model.vision_model(inp.pixel_values[0])[0]  # (576, 1024)
+    ali = model.aligner(vis.unsqueeze(0))[0]          # (576, 2048)
+    rows = torch.tensor(VISION_ROWS)
+    out = np.concatenate([vis[rows].numpy().ravel(),
+                          ali[rows].numpy().ravel()]).astype("<f4")
+    (GOLDEN / "janus_vision.f32").write_bytes(out.tobytes())
+    embeds = model.prepare_inputs_embeds(**inp)
+    gen = model.language_model.generate(
+        inputs_embeds=embeds, attention_mask=inp.attention_mask,
+        pad_token_id=proc.tokenizer.eos_token_id,
+        bos_token_id=proc.tokenizer.bos_token_id,
+        eos_token_id=proc.tokenizer.eos_token_id,
+        max_new_tokens=ANSWER_TOKENS, do_sample=False, use_cache=True)
+    answer = gen[0].tolist()
+    ids = inp.input_ids[0].tolist()
+
+    def rms(t):
+        return float(t.pow(2).mean().sqrt())
+    (GOLDEN / "janus_understand.txt").write_text(
+        " ".join(map(str, ids)) + "\n" + " ".join(map(str, answer)) + "\n" +
+        f"{rms(vis):.9g} {rms(ali):.9g}\n")
+    print(f"prompt {len(ids)} ids, answer {len(answer)} ids: "
+          f"{proc.tokenizer.decode(answer)!r}")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("stage", choices=["synth", "tokens", "decode"])
+    ap.add_argument("stage", choices=["synth", "tokens", "decode", "vision"])
     ap.add_argument("--janus", help="checkout of deepseek-ai/Janus")
     ap.add_argument("--model", help="Janus-Pro-1B snapshot directory")
     args = ap.parse_args()
     if args.stage != "synth" and not (args.janus and args.model):
         sys.exit("tokens / decode need --janus and --model")
-    {"synth": cmd_synth, "tokens": cmd_tokens,
-     "decode": cmd_decode}[args.stage](args)
+    {"synth": cmd_synth, "tokens": cmd_tokens, "decode": cmd_decode,
+     "vision": cmd_vision}[args.stage](args)
 
 
 if __name__ == "__main__":
