@@ -44,6 +44,7 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
             return (rows + 3) / 4;
         case Kernel::kMatvecQ4_K:  // 8 rows of 16 lanes
         case Kernel::kMatvecQ4_KB:
+        case Kernel::kMatvecQ4_KGluB:
         case Kernel::kMatvecQ6_K:
         case Kernel::kMatvecQ6_KB:
             return (rows + 7) / 8;
@@ -196,10 +197,13 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "attn_decode_f16_spv.h"
 #include "kv_scatter_f16_spv.h"
 #include "attn_decode_grp_f16_spv.h"
+#include "attn_decode_grp8_spv.h"
+#include "attn_decode_grp8_f16_spv.h"
 #include "rope_neox_spv.h"
 #include "rope_neox_b_spv.h"
 #include "matvec_q4_k_b_spv.h"
 #include "matvec_q6_k_b_spv.h"
+#include "matvec_q4_k_glu_b_spv.h"
 #include "matmul_q4_k_spv.h"
 #include "matmul_q6_k_spv.h"
 #include "matmul_q4_k_id_spv.h"
@@ -212,6 +216,7 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "conv1d_spv.h"
 #include "conv1d_transpose_spv.h"
 #include "snake1d_spv.h"
+#include "conv2d_spv.h"
 
 namespace locus::backend::vk {
 
@@ -475,6 +480,15 @@ constexpr KernelDesc kDescs[] = {
      locus_conv1d_transpose_spv, sizeof(locus_conv1d_transpose_spv), 4, 40},
     {Kernel::kSnake1d, "snake1d", locus_snake1d_spv,
      sizeof(locus_snake1d_spv), 2, 12},
+    {Kernel::kMatvecQ4_KGluB, "matvec_q4_k_glu_b",
+     locus_matvec_q4_k_glu_b_spv, sizeof(locus_matvec_q4_k_glu_b_spv), 5, 52},
+    {Kernel::kConv2d, "conv2d", locus_conv2d_spv, sizeof(locus_conv2d_spv),
+     4, 48},
+    {Kernel::kAttnDecodeGrp8, "attn_decode_grp8",
+     locus_attn_decode_grp8_spv, sizeof(locus_attn_decode_grp8_spv), 6, 64},
+    {Kernel::kAttnDecodeGrp8F16, "attn_decode_grp8_f16",
+     locus_attn_decode_grp8_f16_spv,
+     sizeof(locus_attn_decode_grp8_f16_spv), 6, 64},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

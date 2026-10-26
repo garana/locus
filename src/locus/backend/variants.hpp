@@ -15,6 +15,16 @@ void matvec_neon(const Mat& w, std::span<const float> x,
                  std::span<float> out);
 
 /**
+ * NEON Q8_K-activation matvec (R16): quantizes x to Q8_K once and
+ * integer-dots it with Q4_K / Q6_K rows -- per-lane widening products
+ * (vmull_s8) for the scalar dot's exact aux32 integers, then its float
+ * steps verbatim -- so the result is bit-identical to scalar
+ * matvec_q8k (ggml's generic order). Other types delegate to it.
+ */
+void matvec_neon_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out);
+
+/**
  * NEON register-blocked batched matvec (R11, Ops::matvec_batch):
  * applies w to all n token vectors in x_batch (token-major, token t
  * at t*w.cols) into out_batch (row-major, out[r*n + t]). Q4_K and
@@ -43,8 +53,8 @@ void matvec_sse4(const Mat& w, std::span<const float> x,
 /**
  * SSE4 Q8_K-activation matvec (ggml parity, DESIGN.md R16): quantizes
  * x to Q8_K once and integer-dots it with the quantized weight using
- * SSE4.1 (widen-then-per-lane products, bit-identical to scalar
- * matvec_q8k). Q4_K is vectorized; other types delegate to scalar
+ * SSE4.1 (per-lane integer sums, bit-identical to scalar matvec_q8k).
+ * Q2_K..Q6_K are vectorized; other types delegate to scalar
  * matvec_q8k. The device half of the eventual ggml-parity flip on the
  * x86 CPU path; kept additive so the f32 matvec_sse4 parity path stays
  * intact until the flip lands.
@@ -213,5 +223,22 @@ void conv1d_transpose_cuda(std::span<const float> in,
 void snake1d_cuda(std::span<float> x, std::uint32_t ch,
                   std::uint32_t len, std::span<const float> alpha,
                   float eps = 1e-9f);
+
+/**
+ * CUDA 2D convolution (F32), the device half of backend::conv2d (image
+ * VQ decoder, i#223). Same arguments and channels-major layout as
+ * conv2d. One thread per output element, summed in conv2d's order
+ * without fused multiply-add, so it is bit-identical to conv2d when the
+ * host compiler does not contract either. A bad shape throws
+ * std::invalid_argument (conv2d_check_args); a CUDA error falls back to
+ * the scalar conv2d; the non-CUDA stub checks, then runs conv2d.
+ */
+void conv2d_cuda(std::span<const float> in, std::uint32_t in_ch,
+                 std::uint32_t in_h, std::uint32_t in_w,
+                 std::span<const float> weight, std::uint32_t out_ch,
+                 std::uint32_t kh, std::uint32_t kw,
+                 std::span<const float> bias, std::uint32_t stride,
+                 std::uint32_t pad, std::uint32_t groups,
+                 std::span<float> out);
 
 }  // namespace locus::backend

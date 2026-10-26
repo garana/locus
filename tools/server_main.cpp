@@ -3,6 +3,7 @@
 #include <string>
 
 #include "backend_cli.hpp"
+#include "cli_spec.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/server/server.hpp"
@@ -52,6 +53,13 @@ int main(int argc, char** argv) {
                      argv[0], args.kv_type_name.c_str());
         return 2;
     }
+    if (!args.bad_number_flag.empty()) {
+        std::fprintf(stderr,
+                     "%s: %s needs a non-negative integer, got '%s'\n",
+                     argv[0], args.bad_number_flag.c_str(),
+                     args.bad_number_value.c_str());
+        return 2;
+    }
     if (args.positional.empty()) {
         std::fprintf(stderr,
                      "usage: %s [--backend NAME] <model.gguf> "
@@ -60,9 +68,16 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string model_path = args.positional[0];
-    const int port = args.positional.size() > 1
-                         ? std::atoi(args.positional[1].c_str())
-                         : 8080;
+    // Guarded parse: atoi read "808O" or "abc" as 0, which binds an
+    // OS-assigned port, and let values above 65535 through (i#198).
+    int port = 8080;
+    if (args.positional.size() > 1 &&
+        (!locus_tools::parse_nonneg_int(args.positional[1], port) ||
+         port < 1 || port > 65535)) {
+        std::fprintf(stderr, "%s: port must be 1..65535, got '%s'\n",
+                     argv[0], args.positional[1].c_str());
+        return 2;
+    }
 
     try {
         auto g = locus::gguf::GgufFile::open(model_path);
@@ -91,6 +106,8 @@ int main(int argc, char** argv) {
         if (args.audio_max_tokens > 0) {
             opt.audio_max_tokens = args.audio_max_tokens;
         }
+        opt.image_decoder_path = args.image_decoder;
+        opt.model_path = model_path;
         locus::server::OpenAiServer server(model, tok, opt);
         std::fprintf(
             stderr,

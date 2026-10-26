@@ -98,10 +98,19 @@ SnacDecoder SnacDecoder::load(const gguf::GgufFile& g) {
     }
     // The tensor names follow SNAC's depthwise + noise, attention-free
     // decoder layout; refuse a GGUF that records another one (keys
-    // written by scripts/convert-snac.py; older files lack them).
-    const auto depthwise = g.get_bool("snac.depthwise");
-    const auto noise = g.get_bool("snac.noise");
-    const auto attention = g.get_bool("snac.attention");
+    // written by scripts/convert-snac.py; older files lack them). A key
+    // of another type is an error: get_bool would read it as absent.
+    const auto flag = [&g](const char* key) {
+        const gguf::Value* v = g.find(key);
+        if (v != nullptr && v->type != gguf::ValueType::kBool) {
+            throw gguf::Error(std::string("snac: ") + key +
+                              " must be a bool");
+        }
+        return g.get_bool(key);
+    };
+    const auto depthwise = flag("snac.depthwise");
+    const auto noise = flag("snac.noise");
+    const auto attention = flag("snac.attention");
     if ((depthwise && !*depthwise) || (noise && !*noise) ||
         (attention && *attention)) {
         throw gguf::Error("snac: unsupported decoder layout (needs "
@@ -130,11 +139,17 @@ std::vector<float> SnacDecoder::decode(
     const std::vector<const std::vector<int>*> streams = {
         &codes.coarse, &codes.mid, &codes.fine};
 
-    using backend::conv1d;
+    // The threaded kernels: bit-identical to the scalar conv1d /
+    // conv1d_transpose / snake1d, about N cores times faster (i#173).
+    const auto conv1d = backend::conv1d_mt;
+    const auto conv1d_transpose = backend::conv1d_transpose_mt;
+    const auto snake1d = [](std::span<float> x, std::uint32_t ch,
+                            std::uint32_t len,
+                            std::span<const float> alpha) {
+        backend::snake1d_mt(x, ch, len, alpha);
+    };
     using backend::conv1d_out_len;
-    using backend::conv1d_transpose;
     using backend::conv1d_transpose_out_len;
-    using backend::snake1d;
 
     // --- from_codes: sum of the stride-upsampled out-projections. ---
     const std::uint32_t T = F * strides_.front();  // aligned length.
@@ -250,6 +265,58 @@ std::vector<float> SnacDecoder::decode(
     x = conv(x, "decoder.model." + tail_conv, 1, 7, 1, 3, 1);
     for (auto& v : x.data) v = std::tanh(v);
     return std::move(x.data);
+}
+
+std::uint32_t SnacDecoder::samples_per_frame() const {
+    std::uint32_t n = strides_.front();
+    for (auto r : rates_) n *= r;
+    return n;
+}
+
+std::uint32_t SnacDecoder::context_frames() const {
+    // Receptive radius in final-output samples, from the output back:
+    // the tail k7 conv (3 taps each side); per DecoderBlock, three
+    // residual k7 convs at dilations 1, 3, 9 (3 * 13 steps of that
+    // block's output) and the transposed conv (under 3 input steps);
+    // then the depthwise k7 in-conv at the latent rate. Snake and the
+    // 1x1 convs are pointwise in time.
+    std::uint64_t step = 1;  // final samples per step at this level
+    std::uint64_t radius = 3;
+    for (std::size_t b = rates_.size(); b-- > 0;) {
+        radius += 39 * step;          // residual units, block output
+        step *= rates_[b];            // the block's input rate
+        radius += 3 * step;           // transposed conv
+    }
+    radius += 3 * step;               // depthwise in-conv (latent)
+    const std::uint64_t latent = (radius + step - 1) / step;
+    return static_cast<std::uint32_t>(
+        (latent + strides_.front() - 1) / strides_.front() + 1);
+}
+
+std::vector<float> SnacDecoder::decode_range(const model::SnacCodes& codes,
+                                             std::uint32_t f0,
+                                             std::uint32_t f1) const {
+    const auto F = static_cast<std::uint32_t>(codes.coarse.size());
+    if (f0 > f1 || f1 > F) {
+        throw std::invalid_argument("snac decode_range: bad frame range");
+    }
+    if (f0 == f1) return {};
+    const std::uint32_t ctx = context_frames();
+    const std::uint32_t a = f0 > ctx ? f0 - ctx : 0;
+    const std::uint32_t b = std::min(F, f1 + ctx);
+    if (codes.mid.size() < std::size_t{b} * 2 ||
+        codes.fine.size() < std::size_t{b} * 4) {
+        throw std::invalid_argument(
+            "snac decode: stream sizes must be F, 2F, 4F");
+    }
+    model::SnacCodes w;
+    w.coarse.assign(codes.coarse.begin() + a, codes.coarse.begin() + b);
+    w.mid.assign(codes.mid.begin() + 2 * a, codes.mid.begin() + 2 * b);
+    w.fine.assign(codes.fine.begin() + 4 * a, codes.fine.begin() + 4 * b);
+    const auto all = decode(w);
+    const std::size_t spf = samples_per_frame();
+    return std::vector<float>(all.begin() + (f0 - a) * spf,
+                              all.begin() + (f1 - a) * spf);
 }
 
 }  // namespace locus::audio

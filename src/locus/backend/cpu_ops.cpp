@@ -5,7 +5,10 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
+
+#include "locus/sys/thread_pool.hpp"
 
 namespace locus::backend {
 
@@ -2442,6 +2445,359 @@ void snake1d(std::span<float> x, std::uint32_t ch, std::uint32_t len,
         for (std::uint32_t i = 0; i < len; ++i) {
             const float s = std::sin(a * row[i]);
             row[i] += inv * s * s;
+        }
+    }
+}
+
+namespace {
+
+/** Output positions per work item of the *_mt conv kernels: enough
+ * work to amortize the item setup, small enough to stay in L1. */
+constexpr std::uint32_t kConvTile = 1024;
+
+}  // namespace
+
+void conv1d_mt(std::span<const float> in, std::uint32_t in_ch,
+               std::uint32_t in_len, std::span<const float> weight,
+               std::uint32_t out_ch, std::uint32_t k,
+               std::span<const float> bias, std::uint32_t stride,
+               std::uint32_t dilation, std::uint32_t pad,
+               std::uint32_t groups, std::span<float> out) {
+    if (stride != 1) {
+        conv1d(in, in_ch, in_len, weight, out_ch, k, bias, stride,
+               dilation, pad, groups, out);
+        return;
+    }
+    assert(groups != 0 && in_ch % groups == 0 && out_ch % groups == 0);
+    const std::uint32_t icg = in_ch / groups;
+    const std::uint32_t ocg = out_ch / groups;
+    const std::uint32_t out_len =
+        conv1d_out_len(in_len, k, stride, dilation, pad);
+    assert(in.size() == std::size_t{in_ch} * in_len);
+    assert(weight.size() == std::size_t{out_ch} * icg * k);
+    assert(bias.empty() || bias.size() == out_ch);
+    assert(out.size() == std::size_t{out_ch} * out_len);
+    const std::uint32_t tiles = (out_len + kConvTile - 1) / kConvTile;
+    // One (out channel, output tile) per item. Per output the terms
+    // add in conv1d's order (bias, then ci, then t), so the vector loop
+    // over ox changes nothing but speed.
+    sys::ThreadPool::instance().parallel_for(
+        std::size_t{out_ch} * tiles, [&](std::size_t item) {
+            const auto oc = static_cast<std::uint32_t>(item / tiles);
+            const auto x0 =
+                static_cast<std::int64_t>(item % tiles) * kConvTile;
+            const std::int64_t x1 =
+                std::min<std::int64_t>(out_len, x0 + kConvTile);
+            float* o = &out[std::size_t{oc} * out_len];
+            const float b = bias.empty() ? 0.0f : bias[oc];
+            for (std::int64_t ox = x0; ox < x1; ++ox) o[ox] = b;
+            const std::uint32_t ic0 = (oc / ocg) * icg;
+            for (std::uint32_t ci = 0; ci < icg; ++ci) {
+                const float* inrow = &in[std::size_t{ic0 + ci} * in_len];
+                const float* wrow =
+                    &weight[(std::size_t{oc} * icg + ci) * k];
+                for (std::uint32_t t = 0; t < k; ++t) {
+                    const float w = wrow[t];
+                    // Input index ix = ox + shift, valid in [0, in_len).
+                    const std::int64_t shift =
+                        static_cast<std::int64_t>(t) * dilation - pad;
+                    const std::int64_t lo = std::max(x0, -shift);
+                    const std::int64_t hi = std::min(
+                        x1, static_cast<std::int64_t>(in_len) - shift);
+                    for (std::int64_t ox = lo; ox < hi; ++ox) {
+                        o[ox] += w * inrow[ox + shift];
+                    }
+                }
+            }
+        });
+}
+
+void conv1d_transpose_mt(std::span<const float> in, std::uint32_t in_ch,
+                         std::uint32_t in_len,
+                         std::span<const float> weight,
+                         std::uint32_t out_ch, std::uint32_t k,
+                         std::span<const float> bias,
+                         std::uint32_t stride, std::uint32_t dilation,
+                         std::uint32_t pad, std::uint32_t groups,
+                         std::span<float> out) {
+    if (dilation != 1) {
+        conv1d_transpose(in, in_ch, in_len, weight, out_ch, k, bias,
+                         stride, dilation, pad, groups, out);
+        return;
+    }
+    assert(groups != 0 && in_ch % groups == 0 && out_ch % groups == 0);
+    const std::uint32_t icg = in_ch / groups;
+    const std::uint32_t ocg = out_ch / groups;
+    const std::int64_t out_len =
+        conv1d_transpose_out_len(in_len, k, stride, dilation, pad);
+    assert(in.size() == std::size_t{in_ch} * in_len);
+    assert(weight.size() == std::size_t{in_ch} * ocg * k);
+    assert(bias.empty() || bias.size() == out_ch);
+    assert(out.size() ==
+           std::size_t{out_ch} * static_cast<std::size_t>(out_len));
+    const std::int64_t s = stride;
+    // Output ox with ox + pad = r + m*s (phase r) takes taps
+    // t = r + j*s from input ix = m - j. Each phase is a contiguous run
+    // over m; items are (out channel, phase, tile of m).
+    const std::int64_t m_end = (out_len + pad + s - 1) / s;  // > every m
+    const auto tiles = static_cast<std::uint32_t>(
+        (m_end + kConvTile - 1) / kConvTile);
+    sys::ThreadPool::instance().parallel_for(
+        std::size_t{out_ch} * stride * tiles, [&](std::size_t item) {
+            const auto tile = static_cast<std::int64_t>(item % tiles);
+            const std::size_t rest = item / tiles;
+            const auto r = static_cast<std::int64_t>(rest % stride);
+            const auto oc = static_cast<std::uint32_t>(rest / stride);
+            // m with 0 <= ox = r + m*s - pad < out_len, in this tile.
+            const std::int64_t m_first =
+                pad > r ? (pad - r + s - 1) / s : 0;
+            const std::int64_t m_last =  // exclusive
+                out_len + pad > r ? (out_len + pad - r + s - 1) / s : 0;
+            const std::int64_t m0 =
+                std::max(m_first, tile * std::int64_t{kConvTile});
+            const std::int64_t m1 =
+                std::min(m_last, (tile + 1) * std::int64_t{kConvTile});
+            if (m0 >= m1) return;
+            float acc[kConvTile];
+            const float b = bias.empty() ? 0.0f : bias[oc];
+            for (std::int64_t m = m0; m < m1; ++m) acc[m - m0] = b;
+            const std::uint32_t ocl = oc % ocg;
+            const std::uint32_t ic0 = (oc / ocg) * icg;
+            // Taps ascending, then in-channels: conv1d_transpose's order.
+            for (std::int64_t j = 0; r + j * s < k; ++j) {
+                const auto t = static_cast<std::uint32_t>(r + j * s);
+                const std::int64_t lo = std::max(m0, j);
+                const std::int64_t hi =
+                    std::min(m1, static_cast<std::int64_t>(in_len) + j);
+                for (std::uint32_t ci = 0; ci < icg; ++ci) {
+                    const float* inrow =
+                        &in[std::size_t{ic0 + ci} * in_len];
+                    const float w =
+                        weight[((std::size_t{ic0 + ci} * ocg) + ocl) * k +
+                               t];
+                    for (std::int64_t m = lo; m < hi; ++m) {
+                        acc[m - m0] += inrow[m - j] * w;
+                    }
+                }
+            }
+            float* o = &out[std::size_t{oc} *
+                            static_cast<std::size_t>(out_len)];
+            for (std::int64_t m = m0; m < m1; ++m) {
+                o[r + m * s - pad] = acc[m - m0];
+            }
+        });
+}
+
+void snake1d_mt(std::span<float> x, std::uint32_t ch, std::uint32_t len,
+                std::span<const float> alpha, float eps) {
+    assert(x.size() == std::size_t{ch} * len);
+    assert(alpha.size() == ch);
+    const std::uint32_t tiles = (len + kConvTile - 1) / kConvTile;
+    sys::ThreadPool::instance().parallel_for(
+        std::size_t{ch} * tiles, [&](std::size_t item) {
+            const auto c = static_cast<std::uint32_t>(item / tiles);
+            const std::uint32_t i0 =
+                static_cast<std::uint32_t>(item % tiles) * kConvTile;
+            const std::uint32_t i1 = std::min(len, i0 + kConvTile);
+            const float a = alpha[c];
+            const float inv = 1.0f / (a + eps);
+            float* row = &x[std::size_t{c} * len];
+            for (std::uint32_t i = i0; i < i1; ++i) {
+                const float s = std::sin(a * row[i]);
+                row[i] += inv * s * s;
+            }
+        });
+}
+
+void conv2d(std::span<const float> in, std::uint32_t in_ch,
+            std::uint32_t in_h, std::uint32_t in_w,
+            std::span<const float> weight, std::uint32_t out_ch,
+            std::uint32_t kh, std::uint32_t kw, std::span<const float> bias,
+            std::uint32_t stride, std::uint32_t pad, std::uint32_t groups,
+            std::span<float> out) {
+    assert(groups != 0 && in_ch % groups == 0 && out_ch % groups == 0);
+    const std::uint32_t icg = in_ch / groups;
+    const std::uint32_t ocg = out_ch / groups;
+    const std::uint32_t out_h = conv1d_out_len(in_h, kh, stride, 1, pad);
+    const std::uint32_t out_w = conv1d_out_len(in_w, kw, stride, 1, pad);
+    assert(in.size() == std::size_t{in_ch} * in_h * in_w);
+    assert(weight.size() == std::size_t{out_ch} * icg * kh * kw);
+    assert(bias.empty() || bias.size() == out_ch);
+    assert(out.size() == std::size_t{out_ch} * out_h * out_w);
+    const std::size_t plane = std::size_t{in_h} * in_w;
+    for (std::uint32_t oc = 0; oc < out_ch; ++oc) {
+        const std::uint32_t ic0 = (oc / ocg) * icg;
+        for (std::uint32_t oy = 0; oy < out_h; ++oy) {
+            for (std::uint32_t ox = 0; ox < out_w; ++ox) {
+                float acc = bias.empty() ? 0.0f : bias[oc];
+                for (std::uint32_t ci = 0; ci < icg; ++ci) {
+                    const float* ip = &in[(ic0 + ci) * plane];
+                    const float* wp =
+                        &weight[(std::size_t{oc} * icg + ci) * kh * kw];
+                    for (std::uint32_t ky = 0; ky < kh; ++ky) {
+                        const std::int64_t iy =
+                            std::int64_t{oy} * stride - pad + ky;
+                        if (iy < 0 || iy >= in_h) continue;
+                        for (std::uint32_t kx = 0; kx < kw; ++kx) {
+                            const std::int64_t ix =
+                                std::int64_t{ox} * stride - pad + kx;
+                            if (ix >= 0 && ix < in_w) {
+                                acc += wp[ky * kw + kx] *
+                                       ip[iy * in_w + ix];
+                            }
+                        }
+                    }
+                }
+                out[(std::size_t{oc} * out_h + oy) * out_w + ox] = acc;
+            }
+        }
+    }
+}
+
+void conv2d_check_args(std::span<const float> in, std::uint32_t in_ch,
+                       std::uint32_t in_h, std::uint32_t in_w,
+                       std::span<const float> weight, std::uint32_t out_ch,
+                       std::uint32_t kh, std::uint32_t kw,
+                       std::span<const float> bias, std::uint32_t stride,
+                       std::uint32_t pad, std::uint32_t groups,
+                       std::span<const float> out) {
+    if (groups == 0 || in_ch % groups != 0 || out_ch % groups != 0) {
+        throw std::invalid_argument(
+            "conv2d: groups must be non-zero and divide in_ch and out_ch");
+    }
+    if (stride == 0) {
+        throw std::invalid_argument("conv2d: stride must be non-zero");
+    }
+    if (in.size() != std::size_t{in_ch} * in_h * in_w) {
+        throw std::invalid_argument("conv2d: in is not in_ch*in_h*in_w");
+    }
+    if (weight.size() != std::size_t{out_ch} * (in_ch / groups) * kh * kw) {
+        throw std::invalid_argument(
+            "conv2d: weight is not out_ch*(in_ch/groups)*kh*kw");
+    }
+    if (!bias.empty() && bias.size() != out_ch) {
+        throw std::invalid_argument("conv2d: bias is neither empty nor out_ch");
+    }
+    const std::uint32_t out_h = conv1d_out_len(in_h, kh, stride, 1, pad);
+    const std::uint32_t out_w = conv1d_out_len(in_w, kw, stride, 1, pad);
+    if (out.size() != std::size_t{out_ch} * out_h * out_w) {
+        throw std::invalid_argument("conv2d: out is not out_ch*out_h*out_w");
+    }
+}
+
+void conv2d_mt(std::span<const float> in, std::uint32_t in_ch,
+               std::uint32_t in_h, std::uint32_t in_w,
+               std::span<const float> weight, std::uint32_t out_ch,
+               std::uint32_t kh, std::uint32_t kw,
+               std::span<const float> bias, std::uint32_t stride,
+               std::uint32_t pad, std::uint32_t groups,
+               std::span<float> out) {
+    if (stride != 1) {
+        conv2d(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias, stride,
+               pad, groups, out);
+        return;
+    }
+    assert(groups != 0 && in_ch % groups == 0 && out_ch % groups == 0);
+    const std::uint32_t icg = in_ch / groups;
+    const std::uint32_t ocg = out_ch / groups;
+    const std::uint32_t out_h = conv1d_out_len(in_h, kh, 1, 1, pad);
+    const std::uint32_t out_w = conv1d_out_len(in_w, kw, 1, 1, pad);
+    assert(in.size() == std::size_t{in_ch} * in_h * in_w);
+    assert(weight.size() == std::size_t{out_ch} * icg * kh * kw);
+    assert(bias.empty() || bias.size() == out_ch);
+    assert(out.size() == std::size_t{out_ch} * out_h * out_w);
+    const std::size_t plane = std::size_t{in_h} * in_w;
+    // One (out channel, output row) per item. Per output the terms add
+    // in conv2d's order (bias, then ci, ky, kx, with the same skips), so
+    // the vector loop over ox changes nothing but speed.
+    sys::ThreadPool::instance().parallel_for(
+        std::size_t{out_ch} * out_h, [&](std::size_t item) {
+            const auto oc = static_cast<std::uint32_t>(item / out_h);
+            const auto oy = static_cast<std::int64_t>(item % out_h);
+            float* o = &out[(std::size_t{oc} * out_h + oy) * out_w];
+            const float b = bias.empty() ? 0.0f : bias[oc];
+            for (std::uint32_t ox = 0; ox < out_w; ++ox) o[ox] = b;
+            const std::uint32_t ic0 = (oc / ocg) * icg;
+            for (std::uint32_t ci = 0; ci < icg; ++ci) {
+                const float* ip = &in[(ic0 + ci) * plane];
+                const float* wp =
+                    &weight[(std::size_t{oc} * icg + ci) * kh * kw];
+                for (std::uint32_t ky = 0; ky < kh; ++ky) {
+                    const std::int64_t iy = oy - pad + ky;
+                    if (iy < 0 || iy >= in_h) continue;
+                    const float* irow = ip + iy * in_w;
+                    for (std::uint32_t kx = 0; kx < kw; ++kx) {
+                        const float w = wp[ky * kw + kx];
+                        // Input column ix = ox + shift, valid in
+                        // [0, in_w).
+                        const std::int64_t shift =
+                            static_cast<std::int64_t>(kx) - pad;
+                        const std::int64_t lo = std::max<std::int64_t>(
+                            0, -shift);
+                        const std::int64_t hi = std::min<std::int64_t>(
+                            out_w, static_cast<std::int64_t>(in_w) - shift);
+                        for (std::int64_t ox = lo; ox < hi; ++ox) {
+                            o[ox] += w * irow[ox + shift];
+                        }
+                    }
+                }
+            }
+        });
+}
+
+void group_norm(std::span<float> x, std::uint32_t ch, std::uint32_t plane,
+                std::uint32_t groups, std::span<const float> gamma,
+                std::span<const float> beta, float eps) {
+    assert(groups != 0 && ch % groups == 0);
+    assert(x.size() == std::size_t{ch} * plane);
+    assert(gamma.size() == ch && beta.size() == ch);
+    const std::uint32_t cpg = ch / groups;
+    const std::size_t n = std::size_t{cpg} * plane;
+    sys::ThreadPool::instance().parallel_for(groups, [&](std::size_t g) {
+        float* p = &x[g * n];
+        double sum = 0.0, sq = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            sum += p[i];
+            sq += static_cast<double>(p[i]) * p[i];
+        }
+        const double mean = sum / static_cast<double>(n);
+        const double var = std::max(0.0, sq / static_cast<double>(n) -
+                                              mean * mean);
+        const float m = static_cast<float>(mean);
+        const float inv = static_cast<float>(1.0 / std::sqrt(var + eps));
+        for (std::uint32_t c = 0; c < cpg; ++c) {
+            const std::uint32_t cc = static_cast<std::uint32_t>(g) * cpg + c;
+            const float a = inv * gamma[cc];
+            const float b = beta[cc];
+            float* row = p + std::size_t{c} * plane;
+            for (std::uint32_t i = 0; i < plane; ++i) {
+                row[i] = (row[i] - m) * a + b;
+            }
+        }
+    });
+}
+
+void silu(std::span<float> x) {
+    for (float& v : x) {
+        v = v / (1.0f + std::exp(-v));
+    }
+}
+
+void upsample_nearest2x(std::span<const float> in, std::uint32_t ch,
+                        std::uint32_t h, std::uint32_t w,
+                        std::span<float> out) {
+    assert(in.size() == std::size_t{ch} * h * w);
+    assert(out.size() == std::size_t{ch} * 4 * h * w);
+    const std::size_t ow = std::size_t{w} * 2;
+    for (std::uint32_t c = 0; c < ch; ++c) {
+        const float* ip = &in[std::size_t{c} * h * w];
+        float* op = &out[std::size_t{c} * 4 * h * w];
+        for (std::uint32_t y = 0; y < 2 * h; ++y) {
+            const float* irow = ip + std::size_t{y / 2} * w;
+            float* orow = op + y * ow;
+            for (std::size_t x = 0; x < ow; ++x) {
+                orow[x] = irow[x / 2];
+            }
         }
     }
 }

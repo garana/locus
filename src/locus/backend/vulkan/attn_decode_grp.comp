@@ -18,13 +18,21 @@
 // With KV_F16 (attn_decode_grp_f16) the pool holds IEEE halves in the
 // same layout: offsets and strides count halves.
 //
+// With HG8 (attn_decode_grp8, attn_decode_grp8_f16) a workgroup takes
+// 8 heads, not 16: for a GQA group of 8 or fewer the 16-head build
+// computes scores for duplicated heads (#117).
+//
 // The host dispatches only when dv % 4 == 0, dv / 4 <= WG / 2 and
 // v_off, kv_stride, row_w and block_stride are multiples of 4 (vec4
 // V loads).
 
 #define WG 256u
 #define CH 32u              // positions per block
+#ifdef HG8
+#define HG 8u               // heads per workgroup (attn_decode_grp8)
+#else
 #define HG 16u              // heads per workgroup
+#endif
 #define HP (WG / CH)        // head lanes per position (scores)
 #define HACC 8u             // max heads per thread (weighted V)
 

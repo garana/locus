@@ -1,8 +1,11 @@
 #include "locus/server/server.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <tuple>
@@ -14,6 +17,10 @@
 #include "locus/audio/wav.hpp"
 #include "locus/auth/helper_spawn.hpp"
 #include "locus/gguf/gguf.hpp"
+#include "locus/http/base64.hpp"
+#include "locus/image/janus.hpp"
+#include "locus/image/png.hpp"
+#include "locus/image/vq16.hpp"
 #include "locus/model/codec.hpp"
 #include "locus/model/grammar.hpp"
 #include "locus/model/sampling.hpp"
@@ -232,6 +239,37 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         } catch (const std::exception&) {
             audio_band_base_ = -1;
         }
+        // Speech samples only Orpheus's own tokens, <custom_token_0>
+        // (10 below the band: the stop and marker ids) through the
+        // end of the 7 code bands, so the head computes just those
+        // rows (i#173). If the vocab is not laid out that way, keep
+        // the whole head.
+        if (audio_band_base_ >= 10) {
+            const auto first =
+                static_cast<std::uint32_t>(audio_band_base_ - 10);
+            const std::uint32_t end = std::min<std::uint32_t>(
+                n_vocab_, static_cast<std::uint32_t>(audio_band_base_) +
+                              7u * 4096u);
+            if (tok_.piece(static_cast<tok::TokenId>(first)) ==
+                "<custom_token_0>") {
+                audio_rows_ = {first, end};
+            }
+        }
+    }
+    if (!opt_.image_decoder_path.empty()) {
+        auto g = gguf::GgufFile::open(opt_.image_decoder_path);
+        vq16_ = std::make_unique<image::Vq16Decoder>(
+            image::Vq16Decoder::load(g));
+        // A model without janus.image_tokens is not Janus and leaves the
+        // endpoint a 503; one that has it but fails to load is a broken
+        // file and stops the server here.
+        if (!opt_.model_path.empty()) {
+            auto mg = gguf::GgufFile::open(opt_.model_path);
+            if (mg.find("janus.image_tokens") != nullptr) {
+                janus_ = std::make_unique<image::JanusImageGen>(
+                    image::JanusImageGen::load(mg, m.hparams().n_embd));
+            }
+        }
     }
     install_routes();
 }
@@ -369,6 +407,9 @@ OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
         }
         if (path == "/v1/audio/speech") {
             return Route::kAudioSpeech;
+        }
+        if (path == "/v1/images/generations") {
+            return Route::kImages;
         }
         return Route::kUnknown;
     }
@@ -1384,13 +1425,33 @@ void OpenAiServer::install_routes() {
                     seed = static_cast<std::uint64_t>(
                         body["seed"].get<std::int64_t>());
                 }
-                std::mt19937_64 rng(seed);
+                bool stream = false;
+                if (body.contains("stream")) {
+                    if (!body["stream"].is_boolean()) {
+                        throw std::invalid_argument(
+                            "stream must be a boolean");
+                    }
+                    stream = body["stream"].get<bool>();
+                }
 
-                model::OrpheusCodecSampler sampler(audio_band_base_);
-                std::vector<tok::TokenId> history = ids;
-                std::uint32_t generated = 0;
-                std::vector<float> wav;
-                {
+                // Prefill + sampling on the dedicated cache, under
+                // audio_mu_. on_frame runs after each token that
+                // completes a frame and returns false to stop early;
+                // alive (may be empty) is polled before each token.
+                // Returns the audio tokens generated and the prefill /
+                // generate end times.
+                using Clock = std::chrono::steady_clock;
+                struct Run {
+                    std::uint32_t generated = 0;
+                    Clock::time_point t0, t1, t2;
+                };
+                auto run = [this, ids, sp, cap](
+                               std::mt19937_64& rng,
+                               model::OrpheusCodecSampler& sampler,
+                               const std::function<bool()>& on_frame,
+                               const std::function<bool()>& alive) {
+                    Run r;
+                    std::vector<tok::TokenId> history = ids;
                     std::lock_guard<std::mutex> lk(audio_mu_);
                     if (!audio_cache_) {
                         audio_cache_ = std::make_unique<kv::PagedKvCache>(
@@ -1400,33 +1461,165 @@ void OpenAiServer::install_routes() {
                     std::vector<float> logits(n_vocab_);
                     kv::PagedKvCache::Seq seq;
                     bool ok = true;
-                    for (auto id : ids) {
-                        if (!audio_cache_->ensure_capacity(seq, 1)) {
+                    // Prompt in chunks through the batched forward where
+                    // the backend has one (one token at a time otherwise),
+                    // the way the engine prefills.
+                    r.t0 = Clock::now();
+                    const std::size_t chunk = model_.prefill_chunk();
+                    for (std::size_t at = 0; ok && at < ids.size();) {
+                        const std::size_t nb =
+                            std::min(chunk, ids.size() - at);
+                        if (!audio_cache_->ensure_capacity(
+                                seq, static_cast<std::uint32_t>(nb))) {
                             ok = false;
                             break;
                         }
-                        model_.forward(id, *audio_cache_, seq, audio_ws_,
-                                       logits);
-                    }
-                    for (std::uint32_t i = 0; ok && i < cap; ++i) {
-                        if (ctx.client_alive && !ctx.client_alive()) {
-                            break;
+                        if (nb >= 2 && model_.supports_batch_prefill()) {
+                            model_.forward_batch(
+                                std::span<const tok::TokenId>(
+                                    ids.data() + at, nb),
+                                *audio_cache_, seq, audio_ws_, logits);
+                        } else {
+                            for (std::size_t k = 0; k < nb; ++k) {
+                                model_.forward(ids[at + k], *audio_cache_,
+                                               seq, audio_ws_, logits,
+                                               audio_rows_);
+                            }
                         }
+                        at += nb;
+                    }
+                    // The batched prefill computes the whole head; mask
+                    // it to the same rows the decode steps compute, so
+                    // the first draw sees the same candidate set.
+                    if (audio_rows_.end != 0) {
+                        const float ninf =
+                            -std::numeric_limits<float>::infinity();
+                        std::fill(logits.begin(),
+                                  logits.begin() + audio_rows_.begin, ninf);
+                        std::fill(logits.begin() + audio_rows_.end,
+                                  logits.end(), ninf);
+                    }
+                    r.t1 = Clock::now();
+                    for (std::uint32_t i = 0; ok && i < cap; ++i) {
+                        if (alive && !alive()) break;
                         const auto next =
                             model::sample(logits, sp, history, rng);
+                        const std::size_t before = sampler.frames();
                         if (sampler.push(next) ==
                             model::OrpheusCodecSampler::Status::kStop) {
                             break;
                         }
                         history.push_back(next);
-                        ++generated;
+                        ++r.generated;
+                        if (sampler.frames() > before && !on_frame()) break;
                         if (!audio_cache_->ensure_capacity(seq, 1)) break;
                         model_.forward(next, *audio_cache_, seq, audio_ws_,
-                                       logits);
+                                       logits, audio_rows_);
                     }
                     audio_cache_->release(seq);
-                    wav = snac_->decode(sampler.codes_lenient());
+                    r.t2 = Clock::now();
+                    return r;
+                };
+
+                // The seed actually used (drawn by the server when the
+                // request sent none), so any utterance can be replayed.
+                res.set_header("X-Audio-Seed", std::to_string(seed));
+
+                if (stream) {
+                    // Chunked body: each frame range goes out as soon as
+                    // the context_frames() frames after it exist (that is
+                    // all decode_range reads), so playback starts after
+                    // the first few frames. The bytes equal the buffered
+                    // response's, except that a WAV header carries
+                    // 0xFFFFFFFF sizes. The token count and stop token
+                    // are not known when the head is sent, so they are
+                    // not reported.
+                    res.set_chunked_content_provider(
+                        ctype, [this, run, seed, wf](http::Sink& sink) {
+                            const std::uint32_t rate = snac_->sample_rate();
+                            const std::uint32_t lookahead =
+                                snac_->context_frames();
+                            std::mt19937_64 rng(seed);
+                            model::OrpheusCodecSampler sampler(
+                                audio_band_base_);
+                            std::uint32_t emitted = 0;
+                            bool alive = true;
+                            auto send = [&](const std::vector<std::byte>& b) {
+                                alive = alive &&
+                                        sink.write(std::string_view(
+                                            reinterpret_cast<const char*>(
+                                                b.data()),
+                                            b.size()));
+                                return alive;
+                            };
+                            // Decodes and sends frames [emitted, upto).
+                            auto emit = [&](const model::SnacCodes& codes,
+                                            std::uint32_t upto) {
+                                if (upto <= emitted) return alive;
+                                const auto pcm = snac_->decode_range(
+                                    codes, emitted, upto);
+                                emitted = upto;
+                                return send(audio::encode_pcm(
+                                    pcm, rate, audio::WaveFormat::kPcm16));
+                            };
+                            try {
+                                if (wf == audio::WaveFormat::kWav &&
+                                    !send(audio::wav_stream_header(rate))) {
+                                    return;
+                                }
+                                run(rng, sampler,
+                                    [&] {
+                                        const auto codes =
+                                            sampler.codes_lenient();
+                                        const auto n =
+                                            static_cast<std::uint32_t>(
+                                                codes.coarse.size());
+                                        const std::uint32_t ready =
+                                            n > lookahead ? n - lookahead
+                                                          : 0;
+                                        // One frame first (latency),
+                                        // then 8-frame runs (the window
+                                        // overhead per run is fixed).
+                                        const std::uint32_t min_run =
+                                            emitted == 0 ? 1 : 8;
+                                        if (ready >= emitted + min_run) {
+                                            return emit(codes, ready);
+                                        }
+                                        return alive;
+                                    },
+                                    {});
+                                if (alive) {
+                                    const auto codes =
+                                        sampler.codes_lenient();
+                                    emit(codes, static_cast<std::uint32_t>(
+                                                    codes.coarse.size()));
+                                }
+                            } catch (const std::exception&) {
+                                // The head is out; end the stream short.
+                            }
+                        });
+                    return;
                 }
+
+                model::OrpheusCodecSampler sampler(audio_band_base_);
+                std::mt19937_64 rng(seed);
+                const Run r = run(rng, sampler, [] { return true; },
+                                  ctx.client_alive);
+                const auto t3a = Clock::now();
+                const auto wav = snac_->decode(sampler.codes_lenient());
+                const auto t3 = Clock::now();
+                const std::uint32_t generated = r.generated;
+                const auto ms = [](auto a, auto b) {
+                    return std::to_string(
+                        std::chrono::duration<double, std::milli>(b - a)
+                            .count());
+                };
+                // Where the time went: prompt prefill, token generation
+                // and the SNAC decode (i#173).
+                const std::string timing = "prefill;dur=" + ms(r.t0, r.t1) +
+                                           ", generate;dur=" +
+                                           ms(r.t1, r.t2) +
+                                           ", decode;dur=" + ms(t3a, t3);
                 auto bytes =
                     audio::encode_pcm(wav, snac_->sample_rate(), wf);
                 // How generation ended: the stop token id when the model
@@ -1434,9 +1627,7 @@ void OpenAiServer::install_routes() {
                 res.set_header("X-Audio-Tokens", std::to_string(generated));
                 res.set_header("X-Audio-Stop-Token",
                                std::to_string(sampler.stop_token()));
-                // The seed actually used (drawn by the server when the
-                // request sent none), so any utterance can be replayed.
-                res.set_header("X-Audio-Seed", std::to_string(seed));
+                res.set_header("Server-Timing", timing);
                 res.set_content(
                     std::string(
                         reinterpret_cast<const char*>(bytes.data()),
@@ -1449,11 +1640,146 @@ void OpenAiServer::install_routes() {
             }
     };
 
+    // POST /v1/images/generations (OpenAI shape): prompt -> Janus-Pro
+    // image codes (CFG) -> VQ-16 pixels -> PNG, returned as b64_json.
+    // 503 unless --image-decoder loaded a decoder AND the model is a
+    // Janus-Pro checkpoint. One image at a time, under image_mu_.
+    auto handle_images = [this](const http::Request& req,
+                                http::ServerResponse& res,
+                                const http::RequestContext& ctx) {
+            auth_event("create", "images.generations", ctx.identity);
+            if (!vq16_ || !janus_) {
+                res.status = 503;
+                res.set_content(
+                    make_error("image generation is not configured (needs "
+                               "--image-decoder and a Janus-Pro model)")
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            try {
+                const json body = json::parse(req.body);
+                if (!body.contains("prompt") ||
+                    !body["prompt"].is_string() ||
+                    body["prompt"].get<std::string>().empty()) {
+                    throw std::invalid_argument(
+                        "prompt must be a non-empty string");
+                }
+                const auto prompt = body["prompt"].get<std::string>();
+                if (body.contains("n") &&
+                    (!body["n"].is_number_integer() ||
+                     body["n"].get<std::int64_t>() != 1)) {
+                    throw std::invalid_argument("n must be 1");
+                }
+                // The model makes one fixed size: grid codes per side,
+                // upscale() pixels per code (24 * 16 = 384).
+                const std::uint32_t side = janus_->grid() * vq16_->upscale();
+                const std::string size =
+                    std::to_string(side) + "x" + std::to_string(side);
+                if (body.contains("size") &&
+                    (!body["size"].is_string() ||
+                     body["size"].get<std::string>() != size)) {
+                    throw std::invalid_argument("size must be " + size);
+                }
+                if (body.contains("response_format") &&
+                    (!body["response_format"].is_string() ||
+                     body["response_format"].get<std::string>() !=
+                         "b64_json")) {
+                    throw std::invalid_argument(
+                        "response_format must be b64_json");
+                }
+                // Guidance and sampling; the defaults are the
+                // reference's (CFG 5, temperature 1). temperature 0
+                // picks the argmax code at each step.
+                image::JanusImageGen::Params p;
+                p.cfg = janus_->cfg_scale();
+                auto num = [&](const char* k, float& dst) {
+                    if (!body.contains(k)) return;
+                    if (!body[k].is_number()) {
+                        throw std::invalid_argument(
+                            std::string(k) + " must be a number");
+                    }
+                    dst = body[k].get<float>();
+                };
+                num("cfg", p.cfg);
+                num("temperature", p.temperature);
+                if (!std::isfinite(p.cfg) || p.cfg < 0.0f ||
+                    !std::isfinite(p.temperature) || p.temperature < 0.0f) {
+                    throw std::invalid_argument(
+                        "need finite cfg >= 0 and temperature >= 0");
+                }
+                p.seed = std::random_device{}();
+                if (body.contains("seed")) {
+                    if (!body["seed"].is_number_integer()) {
+                        throw std::invalid_argument(
+                            "seed must be an integer");
+                    }
+                    p.seed = static_cast<std::uint64_t>(
+                        body["seed"].get<std::int64_t>());
+                }
+
+                using Clock = std::chrono::steady_clock;
+                const auto ids = janus_->prompt_ids(tok_, prompt);
+                std::vector<std::int32_t> codes;
+                std::vector<float> chw;
+                Clock::time_point t0, t1, t2;
+                {
+                    std::lock_guard<std::mutex> lk(image_mu_);
+                    t0 = Clock::now();
+                    codes = janus_->generate(model_, ids, p,
+                                             ctx.client_alive);
+                    t1 = Clock::now();
+                    if (codes.size() == janus_->image_tokens()) {
+                        chw = vq16_->decode(codes, janus_->grid(),
+                                            janus_->grid());
+                    }
+                    t2 = Clock::now();
+                }
+                if (chw.empty()) {
+                    // The client went away mid-generation; nobody reads
+                    // this.
+                    res.status = 499;
+                    return;
+                }
+                const auto png =
+                    image::encode_png(image::to_rgb8(chw, side, side), side,
+                                      side);
+                const auto ms = [](auto a, auto b) {
+                    return std::to_string(
+                        std::chrono::duration<double, std::milli>(b - a)
+                            .count());
+                };
+                // The seed actually used, so any image can be replayed;
+                // and where the time went (codes, then pixels).
+                res.set_header("X-Image-Seed", std::to_string(p.seed));
+                res.set_header("Server-Timing", "generate;dur=" +
+                                                    ms(t0, t1) +
+                                                    ", decode;dur=" +
+                                                    ms(t1, t2));
+                const auto created =
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+                res.set_content(
+                    json{{"created", created},
+                         {"data", json::array({json{
+                                      {"b64_json",
+                                       http::base64_encode(png)}}})}}
+                        .dump(),
+                    "application/json");
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(make_error(e.what()).dump(),
+                                "application/json");
+            }
+    };
+
     // One dispatch handler over all routes (route_of is the single home
     // for routing, shared with the auth head stage below).
     route_handler_ = [this, handle_health, handle_models,
                       handle_model_by_id, handle_metrics, handle,
-                      handle_messages, handle_embeddings, handle_audio](
+                      handle_messages, handle_embeddings, handle_audio,
+                      handle_images](
                          const http::Request& req, http::ServerResponse& res,
                          const http::RequestContext& ctx) {
         switch (route_of(req.method, req.path)) {
@@ -1466,6 +1792,7 @@ void OpenAiServer::install_routes() {
             case Route::kMessages:    handle_messages(req, res, ctx); break;
             case Route::kEmbeddings:  handle_embeddings(req, res, ctx); break;
             case Route::kAudioSpeech: handle_audio(req, res, ctx); break;
+            case Route::kImages:      handle_images(req, res, ctx); break;
             case Route::kUnknown:
                 res.status = 404;  // httplib's default: 404, empty body
                 break;

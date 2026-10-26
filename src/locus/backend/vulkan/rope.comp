@@ -1,8 +1,9 @@
 #version 450
 
-// Interleaved-pair RoPE, one invocation per head, rotating in
-// place at `offset + h*stride`. Supports llama frequency factors
-// (divisors buffer) and YARN corrections (freq_scale != 1).
+// Interleaved-pair RoPE, one workgroup per head (64 invocations
+// striding over its pairs), rotating in place at `offset +
+// h*stride`. Supports llama frequency factors (divisors buffer) and
+// YARN corrections (freq_scale != 1).
 //
 // Compiled again with -DBATCHED (rope_b): workgroup y rotates row y
 // of a prefill chunk, at position pos + y and offset + y *
@@ -13,7 +14,7 @@
 // angle for pair j as the interleaved pair (2j, 2j + 1) above (Qwen2 /
 // Qwen3; the CPU's rope_neox_yarn).
 
-layout(local_size_x = 1) in;
+layout(local_size_x = 64) in;
 
 layout(std430, binding = 0) buffer X { float x[]; };
 // Per-pair frequency divisors (rope_freqs.weight for llama3
@@ -36,7 +37,7 @@ layout(push_constant) uniform PC {
 } pc;
 
 void main() {
-    uint h = gl_GlobalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
     if (h >= pc.n_heads) {
         return;
     }
@@ -46,7 +47,8 @@ void main() {
     base += gl_WorkGroupID.y * pc.row_stride;
     pos += gl_WorkGroupID.y;
 #endif
-    for (uint i = 0; i + 1u < pc.head_dim; i += 2u) {
+    for (uint i = 2u * gl_LocalInvocationID.x; i + 1u < pc.head_dim;
+         i += 128u) {
         float theta_extrap =
             float(pos) *
             pow(pc.freq_base, -float(i) / float(pc.head_dim));

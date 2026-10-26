@@ -1,6 +1,8 @@
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -1082,6 +1084,186 @@ void check_conv1d_cuda(bool transpose, std::uint32_t in_ch,
 
 }  // namespace
 
+// The threaded kernels sum each output in the scalar kernels' order, so
+// they must match them bit for bit, not just within a tolerance. Shapes
+// span several 1024-wide tiles (and a ragged last one), padding on both
+// edges, groups and every SNAC upsample stride (i#173).
+TEST_CASE("conv1d_mt and conv1d_transpose_mt are bit-identical to the "
+          "scalar kernels",
+          "[ops][conv1d]") {
+    std::mt19937 rng(17);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    auto fill = [&](std::size_t n) {
+        std::vector<float> v(n);
+        for (auto& x : v) x = d(rng);
+        return v;
+    };
+    struct C {
+        bool transpose;
+        std::uint32_t in_ch, in_len, out_ch, k, stride, dil, pad, groups;
+        bool bias;
+    };
+    const C cases[] = {
+        // conv1d: SNAC's depthwise k7 at dilations 1/3/9, the pointwise
+        // 1x1, the 64 -> 1 tail, and a strided one (scalar fallback).
+        {false, 8, 2500, 8, 7, 1, 1, 3, 8, true},
+        {false, 8, 2500, 8, 7, 1, 3, 9, 8, true},
+        {false, 8, 2500, 8, 7, 1, 9, 27, 8, true},
+        {false, 16, 3000, 24, 1, 1, 1, 0, 1, true},
+        {false, 64, 1100, 1, 7, 1, 1, 3, 1, true},
+        {false, 6, 40, 4, 3, 1, 1, 1, 2, false},
+        {false, 4, 300, 4, 3, 2, 1, 1, 1, true},
+        // conv1d_transpose: k = 2s, pad = s/2 for s = 2/4/8, grouped,
+        // no bias, and a dilated one (scalar fallback).
+        {true, 6, 700, 4, 4, 2, 1, 1, 1, true},
+        {true, 6, 300, 4, 8, 4, 1, 2, 1, true},
+        {true, 6, 200, 4, 16, 8, 1, 4, 1, true},
+        {true, 4, 900, 2, 3, 2, 1, 1, 2, false},
+        // Several m-tiles per phase (m_end 2501, 3 tiles of 1024), so
+        // the tile bounds run without the SNAC GGUFs.
+        {true, 4, 2500, 2, 4, 2, 1, 1, 1, true},
+        {true, 3, 50, 2, 5, 3, 1, 0, 1, true},
+        {true, 2, 40, 2, 3, 2, 2, 1, 1, true},
+    };
+    for (const auto& c : cases) {
+        INFO("transpose " << c.transpose << " in " << c.in_ch << "x"
+                          << c.in_len << " out_ch " << c.out_ch << " k "
+                          << c.k << " s " << c.stride << " d " << c.dil
+                          << " p " << c.pad << " g " << c.groups);
+        const auto in = fill(std::size_t{c.in_ch} * c.in_len);
+        const auto bias = c.bias ? fill(c.out_ch) : std::vector<float>{};
+        std::vector<float> ref, got;
+        if (!c.transpose) {
+            const auto w = fill(std::size_t{c.out_ch} *
+                                (c.in_ch / c.groups) * c.k);
+            const std::uint32_t ol = locus::backend::conv1d_out_len(
+                c.in_len, c.k, c.stride, c.dil, c.pad);
+            ref.assign(std::size_t{c.out_ch} * ol, 0.0f);
+            got.assign(ref.size(), -1.0f);
+            conv1d(in, c.in_ch, c.in_len, w, c.out_ch, c.k, bias, c.stride,
+                   c.dil, c.pad, c.groups, ref);
+            locus::backend::conv1d_mt(in, c.in_ch, c.in_len, w, c.out_ch,
+                                      c.k, bias, c.stride, c.dil, c.pad,
+                                      c.groups, got);
+        } else {
+            const auto w = fill(std::size_t{c.in_ch} *
+                                (c.out_ch / c.groups) * c.k);
+            const std::uint32_t ol =
+                locus::backend::conv1d_transpose_out_len(
+                    c.in_len, c.k, c.stride, c.dil, c.pad);
+            ref.assign(std::size_t{c.out_ch} * ol, 0.0f);
+            got.assign(ref.size(), -1.0f);
+            conv1d_transpose(in, c.in_ch, c.in_len, w, c.out_ch, c.k, bias,
+                             c.stride, c.dil, c.pad, c.groups, ref);
+            locus::backend::conv1d_transpose_mt(
+                in, c.in_ch, c.in_len, w, c.out_ch, c.k, bias, c.stride,
+                c.dil, c.pad, c.groups, got);
+        }
+        REQUIRE(!ref.empty());
+        // memcmp: bit-identical, and every output written (got starts
+        // at -1, which no output here equals bit for bit by chance).
+        REQUIRE(std::memcmp(ref.data(), got.data(),
+                            ref.size() * sizeof(float)) == 0);
+    }
+}
+
+TEST_CASE("snake1d_mt is bit-identical to snake1d", "[ops][conv1d]") {
+    constexpr std::uint32_t ch = 5, len = 2600;
+    std::mt19937 rng(9);
+    std::uniform_real_distribution<float> d(-3.0f, 3.0f);
+    std::uniform_real_distribution<float> da(0.2f, 2.0f);
+    std::vector<float> x(static_cast<std::size_t>(ch) * len), alpha(ch);
+    for (auto& v : x) v = d(rng);
+    for (auto& v : alpha) v = da(rng);
+    std::vector<float> ref = x, got = x;
+    snake1d(ref, ch, len, alpha);
+    locus::backend::snake1d_mt(got, ch, len, alpha);
+    REQUIRE(std::memcmp(ref.data(), got.data(),
+                        ref.size() * sizeof(float)) == 0);
+}
+
+// i#222: the scalar conv2d is the oracle for every other variant, so
+// it is pinned against hand-computed values first.
+TEST_CASE("conv2d matches a hand-computed 3x3 same-padded case",
+          "[ops][conv2d]") {
+    // One 3x3 input channel, one 3x3 all-ones filter, padding 1: each
+    // output is the sum of the input's in-bounds 3x3 neighbourhood.
+    const std::vector<float> in = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    const std::vector<float> w(9, 1.0f);
+    const std::vector<float> bias = {0.5f};
+    std::vector<float> out(9);
+    locus::backend::conv2d(in, 1, 3, 3, w, 1, 3, 3, bias, 1, 1, 1, out);
+    const std::vector<float> want = {12.5f, 21.5f, 16.5f, 27.5f, 45.5f,
+                                     33.5f, 24.5f, 39.5f, 28.5f};
+    REQUIRE(out == want);
+
+    // Stride 2, no padding, 2 groups of 1 in / 1 out channel, 2x2
+    // filters (+1 and -1): each group reads only its own channel.
+    // 2 channels of 3 rows x 4 columns.
+    const std::vector<float> in2 = {1,  2,  3,  4,   // channel 0
+                                    5,  6,  7,  8,
+                                    9,  10, 11, 12,
+                                    13, 14, 15, 16,  // channel 1
+                                    0,  0,  0,  0,
+                                    1,  1,  1,  1};
+    const std::vector<float> w2 = {1, 1, 1, 1, -1, -1, -1, -1};
+    std::vector<float> out2(2 * 1 * 2);  // out 1 x 2 (k2, s2, no pad)
+    locus::backend::conv2d(in2, 2, 3, 4, w2, 2, 2, 2, {}, 2, 0, 2, out2);
+    // Channel 0, rows 0-1: windows {1,2,5,6} = 14 and {3,4,7,8} = 22.
+    // Channel 1, rows 0-1: -(13+14+0+0) and -(15+16+0+0).
+    REQUIRE(out2 == std::vector<float>{14, 22, -27, -31});
+}
+
+// The threaded conv2d sums each output in the reference's order, so it
+// must match bit for bit: memcmp, over decoder-shaped cases (3x3 and
+// 1x1, padding on every edge, odd sizes, groups, no bias) and the
+// stride-2 fallback.
+TEST_CASE("conv2d_mt is bit-identical to conv2d", "[ops][conv2d]") {
+    std::mt19937 rng(23);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    auto fill = [&](std::size_t n) {
+        std::vector<float> v(n);
+        for (auto& x : v) x = d(rng);
+        return v;
+    };
+    struct C {
+        std::uint32_t in_ch, in_h, in_w, out_ch, k, stride, pad, groups;
+        bool bias;
+    };
+    const C cases[] = {
+        {8, 17, 23, 12, 3, 1, 1, 1, true},   // 3x3 same
+        {16, 9, 31, 8, 1, 1, 0, 1, true},    // 1x1
+        {6, 12, 12, 6, 3, 1, 1, 3, false},   // grouped, no bias
+        {4, 5, 7, 4, 3, 1, 0, 1, true},      // valid (no padding)
+        {3, 40, 40, 5, 3, 1, 2, 1, true},    // padding wider than 1
+        {4, 11, 13, 6, 3, 2, 1, 1, true},    // stride 2 (fallback)
+    };
+    for (const auto& c : cases) {
+        INFO("in " << c.in_ch << "x" << c.in_h << "x" << c.in_w
+                   << " out_ch " << c.out_ch << " k " << c.k << " s "
+                   << c.stride << " p " << c.pad << " g " << c.groups);
+        const auto in = fill(std::size_t{c.in_ch} * c.in_h * c.in_w);
+        const auto w =
+            fill(std::size_t{c.out_ch} * (c.in_ch / c.groups) * c.k * c.k);
+        const auto bias = c.bias ? fill(c.out_ch) : std::vector<float>{};
+        const std::uint32_t oh = locus::backend::conv1d_out_len(
+            c.in_h, c.k, c.stride, 1, c.pad);
+        const std::uint32_t ow = locus::backend::conv1d_out_len(
+            c.in_w, c.k, c.stride, 1, c.pad);
+        std::vector<float> ref(std::size_t{c.out_ch} * oh * ow, 0.0f);
+        std::vector<float> got(ref.size(), -1.0f);
+        locus::backend::conv2d(in, c.in_ch, c.in_h, c.in_w, w, c.out_ch,
+                               c.k, c.k, bias, c.stride, c.pad, c.groups,
+                               ref);
+        locus::backend::conv2d_mt(in, c.in_ch, c.in_h, c.in_w, w,
+                                  c.out_ch, c.k, c.k, bias, c.stride,
+                                  c.pad, c.groups, got);
+        REQUIRE(!ref.empty());
+        REQUIRE(std::memcmp(ref.data(), got.data(),
+                            ref.size() * sizeof(float)) == 0);
+    }
+}
+
 TEST_CASE("conv1d_cuda matches the scalar reference", "[conv1d][cuda]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
@@ -1117,6 +1299,108 @@ TEST_CASE("conv1d_transpose_cuda matches the scalar reference",
     check_conv1d_cuda(true, 4, 8, 2, 3, 2, 1, 1, 2, false, 120);
     // With a bias.
     check_conv1d_cuda(true, 2, 6, 2, 4, 2, 1, 1, 1, true, 121);
+}
+
+// conv2d_cuda sums each output in conv2d's order with no fused
+// multiply-add, so on a host whose build has no FMA (the x86 baseline)
+// it must match the reference bit for bit: memcmp. aarch64 and FMA x86
+// builds fuse the scalar reference, so this holds only without FMA.
+// Cases cover 3x3 and 1x1, a non-square kernel, padding on every edge
+// and wider than 1, groups, stride 2, no bias, a kernel wider than the
+// padded input (empty output), and a plane big enough for many blocks
+// with a ragged tail.
+TEST_CASE("conv2d_cuda is bit-identical to conv2d", "[conv2d][cuda]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    std::mt19937 rng(29);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    auto fill = [&](std::size_t n) {
+        std::vector<float> v(n);
+        for (auto& x : v) x = d(rng);
+        return v;
+    };
+    struct C {
+        std::uint32_t in_ch, in_h, in_w, out_ch, kh, kw, stride, pad, groups;
+        bool bias;
+    };
+    const C cases[] = {
+        {8, 17, 23, 12, 3, 3, 1, 1, 1, true},     // 3x3 same
+        {16, 9, 31, 8, 1, 1, 1, 0, 1, true},      // 1x1
+        {6, 12, 12, 6, 3, 3, 1, 1, 3, false},     // grouped, no bias
+        {6, 10, 10, 6, 3, 3, 1, 1, 6, true},      // depthwise
+        {4, 5, 7, 4, 3, 3, 1, 0, 1, true},        // valid (no padding)
+        {3, 40, 40, 5, 3, 3, 1, 2, 1, true},      // padding wider than 1
+        {4, 11, 13, 6, 3, 3, 2, 1, 1, true},      // stride 2
+        {5, 9, 14, 3, 2, 4, 1, 1, 1, true},       // non-square kernel
+        {64, 24, 24, 32, 3, 3, 1, 1, 1, true},    // decoder-like width
+        {3, 301, 299, 4, 3, 3, 1, 1, 1, true},    // many blocks, ragged
+        {2, 2, 2, 3, 5, 5, 1, 0, 1, true},        // empty output
+    };
+    for (const auto& c : cases) {
+        INFO("in " << c.in_ch << "x" << c.in_h << "x" << c.in_w
+                   << " out_ch " << c.out_ch << " k " << c.kh << "x" << c.kw
+                   << " s " << c.stride << " p " << c.pad << " g "
+                   << c.groups);
+        const auto in = fill(std::size_t{c.in_ch} * c.in_h * c.in_w);
+        const auto w = fill(std::size_t{c.out_ch} * (c.in_ch / c.groups) *
+                            c.kh * c.kw);
+        const auto bias = c.bias ? fill(c.out_ch) : std::vector<float>{};
+        const std::uint32_t oh = conv1d_out_len(c.in_h, c.kh, c.stride, 1,
+                                                c.pad);
+        const std::uint32_t ow = conv1d_out_len(c.in_w, c.kw, c.stride, 1,
+                                                c.pad);
+        std::vector<float> ref(std::size_t{c.out_ch} * oh * ow, 0.0f);
+        std::vector<float> got(ref.size(), -1.0f);
+        conv2d(in, c.in_ch, c.in_h, c.in_w, w, c.out_ch, c.kh, c.kw, bias,
+               c.stride, c.pad, c.groups, ref);
+        conv2d_cuda(in, c.in_ch, c.in_h, c.in_w, w, c.out_ch, c.kh, c.kw,
+                    bias, c.stride, c.pad, c.groups, got);
+        REQUIRE(std::memcmp(ref.data(), got.data(),
+                            ref.size() * sizeof(float)) == 0);
+    }
+}
+
+// A bad shape must throw, not reach the scalar fallback: conv2d only
+// asserts its contract, so in Release stride 0 divides by zero and a
+// short span reads or writes out of bounds. Runs on every build (the
+// non-CUDA stub checks the same way), no device needed.
+TEST_CASE("conv2d_cuda rejects bad shapes", "[conv2d]") {
+    // A valid 2 -> 2 3x3 same-padded case on a 4x4 plane, then one
+    // argument broken at a time.
+    const std::vector<float> in(2 * 4 * 4, 1.0f), w(2 * 2 * 3 * 3, 1.0f),
+        bias(2, 0.0f);
+    std::vector<float> out(2 * 4 * 4);
+    REQUIRE_NOTHROW(conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias, 1, 1, 1, out));
+    // stride 0
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias, 0, 1, 1, out),
+        std::invalid_argument);
+    // short weight span
+    const std::span<const float> w_short(w.data(), w.size() - 1);
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w_short, 2, 3, 3, bias, 1, 1, 1, out),
+        std::invalid_argument);
+    // groups 0, and groups not dividing the channels
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias, 1, 1, 0, out),
+        std::invalid_argument);
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias, 1, 1, 3, out),
+        std::invalid_argument);
+    // short input, wrong-size bias, short output
+    const std::span<const float> in_short(in.data(), in.size() - 1);
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in_short, 2, 4, 4, w, 2, 3, 3, bias, 1, 1, 1, out),
+        std::invalid_argument);
+    const std::vector<float> bias3(3, 0.0f);
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias3, 1, 1, 1, out),
+        std::invalid_argument);
+    const std::span<float> out_short(out.data(), out.size() - 1);
+    REQUIRE_THROWS_AS(
+        conv2d_cuda(in, 2, 4, 4, w, 2, 3, 3, bias, 1, 1, 1, out_short),
+        std::invalid_argument);
 }
 
 TEST_CASE("snake1d_cuda matches the scalar reference", "[conv1d][cuda]") {
