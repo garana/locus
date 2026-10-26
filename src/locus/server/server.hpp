@@ -231,7 +231,10 @@ class OpenAiServer {
     // --image-decoder was not given) and the Janus image heads (null
     // when the model has no janus.* tensors). One image at a time, under
     // image_mu_: a generation holds its own KV cache for two sequences.
+    // The heads point into janus_gguf_'s mapping (declared first, so it
+    // is destroyed last).
     std::unique_ptr<image::Vq16Decoder> vq16_;
+    std::unique_ptr<gguf::GgufFile> janus_gguf_;
     std::unique_ptr<image::JanusImageGen> janus_;
     std::mutex image_mu_;
 
