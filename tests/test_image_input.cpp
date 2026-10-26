@@ -48,6 +48,51 @@ std::vector<std::uint8_t> read_rgb(const std::string& name,
 /** The pattern as Pillow decodes src.png: the reference's RGB. */
 Rgb8 source() { return decode_image(read_bytes(kDir + "src.png")); }
 
+/**
+ * A w x h 8-bit RGB PNG whose IDAT holds raw_len bytes of zeros
+ * (filter 0 rows, black pixels) in stored deflate blocks, with valid
+ * CRCs and Adler-32. raw_len may exceed the (w * 3 + 1) * h the header
+ * implies.
+ */
+std::vector<std::byte> png_with_raw(std::uint32_t w, std::uint32_t h,
+                                    std::size_t raw_len) {
+    std::vector<std::byte> out;
+    const auto be32 = [](std::vector<std::byte>& o, std::uint32_t v) {
+        for (int s = 24; s >= 0; s -= 8) o.push_back(std::byte(v >> s));
+    };
+    const auto chunk = [&](const char* type,
+                           const std::vector<std::byte>& d) {
+        be32(out, static_cast<std::uint32_t>(d.size()));
+        const std::size_t at = out.size();
+        for (int i = 0; i < 4; ++i) out.push_back(std::byte(type[i]));
+        out.insert(out.end(), d.begin(), d.end());
+        be32(out, png_test::crc32_ref(&out[at], 4 + d.size()));
+    };
+    static const unsigned char sig[8] = {0x89, 'P',  'N',  'G',
+                                         '\r', '\n', 0x1A, '\n'};
+    for (unsigned char c : sig) out.push_back(std::byte(c));
+    std::vector<std::byte> ihdr;
+    be32(ihdr, w);
+    be32(ihdr, h);
+    for (int v : {8, 2, 0, 0, 0}) ihdr.push_back(std::byte(v));
+    chunk("IHDR", ihdr);
+    std::vector<std::byte> z = {std::byte{0x78}, std::byte{0x01}};
+    for (std::size_t at = 0; at < raw_len;) {
+        const std::size_t n = std::min<std::size_t>(65535, raw_len - at);
+        z.push_back(std::byte(at + n == raw_len ? 1 : 0));
+        z.push_back(std::byte(n & 0xFF));
+        z.push_back(std::byte(n >> 8));
+        z.push_back(std::byte(~n & 0xFF));
+        z.push_back(std::byte((~n >> 8) & 0xFF));
+        z.insert(z.end(), n, std::byte{0});
+        at += n;
+    }
+    be32(z, 1);  // Adler-32 of all-zero data: a = 1, b = 0
+    chunk("IDAT", z);
+    chunk("IEND", {});
+    return out;
+}
+
 }  // namespace
 
 TEST_CASE("decode_image reads PNGs as Pillow does", "[image][decode]") {
@@ -181,6 +226,16 @@ TEST_CASE("decode_image refuses bad and oversized input",
         huge[20 + i] = std::byte((20000u >> (24 - 8 * i)) & 0xFF);
     }
     REQUIRE_THROWS_AS(decode_image(huge), std::invalid_argument);
+    // A 16 x 16 PNG whose data inflates to 4 MB instead of the 784
+    // bytes its header implies. stb accepts excess data, and its
+    // inflate buffer grows by doubling, so without the allocation cap a
+    // shaped input could make it allocate gigabytes; the cap (twice the
+    // header's need plus slack) refuses it. The exact size decodes.
+    const std::uint32_t pw = 16, ph = 16;
+    const std::size_t need = (std::size_t{pw} * 3 + 1) * ph;
+    REQUIRE(decode_image(png_with_raw(pw, ph, need)).w == pw);
+    REQUIRE_THROWS_AS(decode_image(png_with_raw(pw, ph, std::size_t{4} << 20)),
+                      std::invalid_argument);
     // The caps themselves.
     locus::image::DecodeLimits small;
     small.max_pixels = 100;

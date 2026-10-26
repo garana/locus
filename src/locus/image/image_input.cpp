@@ -2,12 +2,39 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
+namespace {
+
+/**
+ * The largest single allocation stb may make during this thread's
+ * decode_image call. stb's PNG inflate grows its output buffer by
+ * doubling and accepts data past the header's size, so without this a
+ * small shaped request could make it allocate gigabytes; decode_image
+ * sets the cap from the header's dimensions.
+ */
+thread_local std::size_t stbi_alloc_cap = SIZE_MAX;
+
+void* stbi_capped_malloc(std::size_t n) {
+    return n > stbi_alloc_cap ? nullptr : std::malloc(n);
+}
+
+void* stbi_capped_realloc(void* p, std::size_t n) {
+    return n > stbi_alloc_cap ? nullptr : std::realloc(p, n);
+}
+
+}  // namespace
+
 // stb_image, vendored (third_party/stb, a SYSTEM include so its own
 // warnings stay out of ours): PNG and JPEG only, no stdio, no HDR /
-// linear float paths, everything static to this file.
+// linear float paths, everything static to this file, every
+// allocation through the capped hooks above.
+#define STBI_MALLOC(sz) stbi_capped_malloc(sz)
+#define STBI_REALLOC(p, newsz) stbi_capped_realloc(p, newsz)
+#define STBI_FREE(p) std::free(p)
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_STATIC
 #define STBI_ONLY_PNG
@@ -152,6 +179,12 @@ Rgb8 decode_image(std::span<const std::byte> data, const DecodeLimits& lim) {
     const auto* p = reinterpret_cast<const stbi_uc*>(data.data());
     const int len = static_cast<int>(data.size());
     int w = 0, h = 0, comp = 0;
+    // Restores the allocation cap when this call ends, however it ends.
+    struct CapScope {
+        explicit CapScope(std::size_t c) { stbi_alloc_cap = c; }
+        ~CapScope() { stbi_alloc_cap = SIZE_MAX; }
+        void set(std::size_t c) { stbi_alloc_cap = c; }
+    } cap(std::size_t{1} << 20);  // reading a header needs little
     // The header alone: refuse a format we do not build, and a pixel
     // count over the cap, before any pixel buffer exists.
     if (!stbi_info_from_memory(p, len, &w, &h, &comp)) {
@@ -163,6 +196,14 @@ Rgb8 decode_image(std::span<const std::byte> data, const DecodeLimits& lim) {
         std::uint64_t(w) * std::uint64_t(h) > lim.max_pixels) {
         throw std::invalid_argument("image: dimensions over the limit");
     }
+    // The biggest buffer a valid file of this size needs is the PNG
+    // filtered data at 16-bit RGBA, 8 bytes per pixel plus a filter
+    // byte per row (more for Adam7's passes). Allow twice that (stb
+    // doubles while inflating) plus slack; JPEG's buffers are smaller.
+    const std::uint64_t need =
+        (std::uint64_t(w) * std::uint64_t(h) + std::uint64_t(w) +
+         std::uint64_t(h)) * 8;
+    cap.set(static_cast<std::size_t>(2 * need + (std::uint64_t{1} << 20)));
     stbi_uc* px = stbi_load_from_memory(p, len, &w, &h, &comp, 3);
     if (px == nullptr) {
         throw std::invalid_argument(std::string("image: decode failed (") +
