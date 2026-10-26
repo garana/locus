@@ -341,6 +341,33 @@ class TransformerModel {
                         std::span<float> out, LogitRows rows = {}) const;
 
     /**
+     * One position through the whole model, like forward(), with two
+     * additions for models that feed embeddings and read the hidden
+     * state (Janus image codes, i#247): an optional input embedding in
+     * place of `token`'s row, and the final normed hidden state (what
+     * the head reads) copied out. Runs the fused Vulkan forward when
+     * the backend is Vulkan and supports the model, else
+     * forward_layers, so the CPU result is unchanged.
+     *
+     * @param token The token (ignored when embd_in is set).
+     * @param embd_in Empty, or n_embd floats used instead of the
+     *     token's embedding row.
+     * @param logits n_vocab floats; rows outside `rows` are
+     *     unspecified.
+     * @param rows Head rows to compute (see forward()).
+     * @param normed_out n_embd floats that receive the normed hidden
+     *     state.
+     * @throws std::invalid_argument on a wrong embd_in / normed_out
+     *     size, or an input embedding for an arch with its own forward.
+     */
+    void forward_embedding(tok::TokenId token,
+                           std::span<const float> embd_in,
+                           kv::PagedKvCache& cache,
+                           kv::PagedKvCache::Seq& seq, Workspace& ws,
+                           std::span<float> logits, LogitRows rows,
+                           std::span<float> normed_out) const;
+
+    /**
      * Computes a sentence embedding for `tokens`: runs them through
      * the layer stack (updating seq's KV) and returns the final
      * normed hidden state of the LAST token (last-token pooling),

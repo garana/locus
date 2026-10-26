@@ -82,8 +82,10 @@ void matvec_avx2(const Mat& w, std::span<const float> x,
 #endif
 
 /**
- * Vulkan matvec: F32 weights run on the GPU (uploaded once,
- * resident); other types delegate to the scalar reference.
+ * Vulkan matvec: weights with a kernel (F32, F16, BF16, Q8_0,
+ * Q4_0, Q5_0, Q2_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ3_XXS, IQ4_XS) run
+ * on the GPU (uploaded once, resident, cached by host pointer);
+ * other types delegate to the scalar reference.
  * Attention and norms stay on the CPU (hybrid backend).
  */
 void matvec_vulkan(const Mat& w, std::span<const float> x,

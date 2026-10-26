@@ -554,6 +554,26 @@ void TransformerModel::scale_logits(std::span<float> logits) const {
     }
 }
 
+void TransformerModel::forward_embedding(
+    tok::TokenId token, std::span<const float> embd_in,
+    kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq, Workspace& ws,
+    std::span<float> logits, LogitRows rows,
+    std::span<float> normed_out) const {
+    if (normed_out.size() < hp_.n_embd) {
+        throw std::invalid_argument(
+            "forward_embedding: normed_out must hold n_embd floats");
+    }
+    if (backend_->name == "vulkan" &&
+        backend::vulkan_forward(*this, embd_in.empty() ? token : 0, cache,
+                                seq, logits, rows.begin, rows.end, embd_in,
+                                normed_out)) {
+        return;
+    }
+    forward_layers(token, embd_in, 0, hp_.n_layers, cache, seq, ws, logits,
+                   rows);
+    std::copy_n(ws.xb.begin(), hp_.n_embd, normed_out.begin());
+}
+
 void TransformerModel::forward(tok::TokenId token,
                          kv::PagedKvCache& cache,
                          kv::PagedKvCache::Seq& seq, Workspace& ws,
