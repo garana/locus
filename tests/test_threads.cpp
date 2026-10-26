@@ -161,3 +161,53 @@ TEST_CASE("matvec_mt_f32 threads the f32-activation dot under R16",
     }
     unsetenv("LOCUS_THREADS");
 }
+
+TEST_CASE("matvec_mt_group is bit-identical to one matvec_mt per job",
+          "[threads]") {
+    using locus::backend::Mat;
+    using locus::model::MatvecJob;
+    // Q4_K (a matvec_q8k type) and F32 jobs of uneven heights sharing
+    // one x, like q / k / v.
+    constexpr std::uint32_t cols = 512;
+    std::uint32_t s = 4242;
+    auto next = [&s] {
+        s = s * 1664525u + 1013904223u;
+        return s;
+    };
+    std::vector<std::byte> wq(static_cast<std::size_t>(300) * cols / 256 *
+                              144);
+    for (auto& b : wq) {
+        b = static_cast<std::byte>(next() >> 24);
+    }
+    for (std::size_t b = 0; b < wq.size() / 144; ++b) {
+        wq[b * 144 + 1] = std::byte{0x20};
+        wq[b * 144 + 3] = std::byte{0x20};
+    }
+    std::vector<float> wf(static_cast<std::size_t>(70) * cols), x(cols);
+    for (auto& v : wf) {
+        v = static_cast<float>(next() >> 8) / (1u << 24) - 0.5f;
+    }
+    for (auto& v : x) {
+        v = static_cast<float>(next() >> 8) / (1u << 24) - 0.5f;
+    }
+    const Mat a{locus::gguf::TensorType::kQ4_K, wq.data(), 300, cols};
+    const Mat b{locus::gguf::TensorType::kF32,
+                reinterpret_cast<const std::byte*>(wf.data()), 70, cols};
+    const auto& op = locus::backend::find_backend("scalar")->ops;
+    for (const bool f32 : {false, true}) {
+        INFO("f32 " << f32);
+        std::vector<float> ra(a.rows), rb(b.rows);
+        (f32 ? locus::model::matvec_mt_f32 : locus::model::matvec_mt)(
+            op, a, x, ra);
+        locus::model::matvec_mt(op, b, x, rb);
+        for (const char* t : {"1", "3", "8"}) {
+            setenv("LOCUS_THREADS", t, 1);
+            std::vector<float> ga(a.rows), gb(b.rows);
+            const MatvecJob jobs[] = {{a, x, ga}, {b, x, gb}};
+            locus::model::matvec_mt_group(op, jobs, f32);
+            REQUIRE(ga == ra);
+            REQUIRE(gb == rb);
+        }
+    }
+    unsetenv("LOCUS_THREADS");
+}
