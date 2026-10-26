@@ -27,6 +27,24 @@ TEST_CASE("parallel_for covers every index exactly once",
     }
 }
 
+TEST_CASE("parallel_for wakes only the workers a job needs",
+          "[threads]") {
+    // Jobs smaller than the pool wake n - 1 workers (the caller drains
+    // too); thousands of back-to-back tiny jobs must neither lose an
+    // index nor hang on a wakeup that went to a worker still busy.
+    auto& pool = ThreadPool::instance();
+    for (std::size_t n : {2u, 3u, 5u}) {
+        for (int round = 0; round < 2000; ++round) {
+            std::vector<std::atomic<int>> hits(n);
+            pool.parallel_for(
+                n, [&](std::size_t i) { hits[i].fetch_add(1); });
+            for (std::size_t i = 0; i < n; ++i) {
+                REQUIRE(hits[i].load() == 1);
+            }
+        }
+    }
+}
+
 TEST_CASE("parallel_for rethrows a worker exception",
           "[threads]") {
     auto& pool = ThreadPool::instance();
