@@ -930,10 +930,15 @@ TEST_CASE("the full GPU forward declines dbrx's fused qkv and LayerNorm",
     REQUIRE_FALSE(locus::backend::vulkan_forward_supported(model));
 }
 
-TEST_CASE("dbrx CPU decode is finite and thread-count invariant",
+TEST_CASE("dbrx CPU decode runs and is finite (synthetic, inline)",
           "[moe]") {
     // The only CPU run of dbrx_attention without the 32GB model: the
     // fused [q|k|v] split, NEOX rope and gqa_attend over 6 positions.
+    // The shapes stay under gqa_attend's min_work and matvec_mt's 64
+    // rows per slice, so LOCUS_THREADS 1 and 8 both run inline here:
+    // this pins the call-site wiring, not threading. The threaded
+    // paths are pinned by the [threads] gqa_attend (min_work 0) and
+    // matvec_mt cases.
     constexpr std::uint32_t kNe = 4;
     auto experts = [](ModelBuilder& mb) {
         mb.tensor("blk.0.ffn_gate_inp.weight", {kE, kNe},
