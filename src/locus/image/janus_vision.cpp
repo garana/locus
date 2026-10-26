@@ -84,6 +84,7 @@ JanusVision JanusVision::load(const gguf::GgufFile& g, std::uint32_t n_embd) {
     v.placeholder_ =
         static_cast<tok::TokenId>(u("janus.vision.image_placeholder"));
     v.end_ = static_cast<tok::TokenId>(u("janus.vision.end_of_image"));
+    v.begin_ = static_cast<tok::TokenId>(u("janus.begin_of_image"));
     const gguf::Value* eps = g.find("janus.vision.layer_norm_eps");
     if (eps == nullptr || eps->type != gguf::ValueType::kFloat32) {
         throw gguf::Error("janus vision: missing layer_norm_eps");

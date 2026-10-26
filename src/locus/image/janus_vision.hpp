@@ -42,6 +42,8 @@ class JanusVision {
     tok::TokenId placeholder() const { return placeholder_; }
     /** @returns The <end_of_image> id. */
     tok::TokenId end_of_image() const { return end_; }
+    /** @returns The <begin_of_image> id. */
+    tok::TokenId begin_of_image() const { return begin_; }
 
     /**
      * The vision tower's output for one image.
@@ -83,7 +85,7 @@ class JanusVision {
     std::uint32_t image_ = 0, patch_ = 0, grid_ = 0, width_ = 0, heads_ = 0,
                   ffn_ = 0, n_embd_ = 0;
     float eps_ = 0.0f;
-    tok::TokenId placeholder_ = 0, end_ = 0;
+    tok::TokenId placeholder_ = 0, end_ = 0, begin_ = 0;
     std::span<const float> patch_w_, patch_b_, pos_, post_w_, post_b_,
         align0_b_, align2_b_;
     backend::Mat align0_, align2_;
