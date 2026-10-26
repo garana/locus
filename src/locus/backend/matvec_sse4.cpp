@@ -68,19 +68,27 @@ void scale_min_k4_sse(int j, const std::uint8_t* q,
     }
 }
 
+/** One step of accum16_q4k_sse: values K..K+3. K is a template
+ * argument because _mm_srli_si128 takes an 8-bit immediate; a loop
+ * variable there only compiled where -O3 unrolled the loop. */
+template <int K>
+__m128 accum4_q4k_sse(__m128 acc, __m128i vals, __m128 dv, __m128 mv,
+                      const float* xp) {
+    const __m128i v4 = _mm_srli_si128(vals, K);
+    __m128 f = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(v4));
+    f = _mm_sub_ps(_mm_mul_ps(f, dv), mv);
+    return _mm_add_ps(acc, _mm_mul_ps(f, _mm_loadu_ps(xp + K)));
+}
+
 /** Accumulates 16 unsigned nibble values (each byte 0..15) as
  * (d*v - m)*x into acc. */
 __m128 accum16_q4k_sse(__m128 acc, __m128i vals, float d, float m,
                        const float* xp) {
     const __m128 dv = _mm_set1_ps(d), mv = _mm_set1_ps(m);
-    for (int k = 0; k < 16; k += 4) {
-        const __m128i v4 = _mm_srli_si128(vals, k);
-        __m128 f = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(v4));
-        f = _mm_sub_ps(_mm_mul_ps(f, dv), mv);
-        acc = _mm_add_ps(acc,
-                         _mm_mul_ps(f, _mm_loadu_ps(xp + k)));
-    }
-    return acc;
+    acc = accum4_q4k_sse<0>(acc, vals, dv, mv, xp);
+    acc = accum4_q4k_sse<4>(acc, vals, dv, mv, xp);
+    acc = accum4_q4k_sse<8>(acc, vals, dv, mv, xp);
+    return accum4_q4k_sse<12>(acc, vals, dv, mv, xp);
 }
 
 /** One Q4_K super-block (256 elems, 144 bytes): fused dequant +
@@ -121,21 +129,27 @@ float dot_q4_k_block_sse4(const std::byte* blk, const float* x) {
     return hsum(acc);
 }
 
+/** One step of accum16_q6k_sse: values K..K+3 (K an immediate, as in
+ * accum4_q4k_sse). */
+template <int K>
+__m128 accum4_q6k_sse(__m128 acc, __m128i sv, __m128 s,
+                      const float* xp) {
+    const __m128i v4 = _mm_srli_si128(sv, K);
+    const __m128 f = _mm_cvtepi32_ps(_mm_cvtepi8_epi32(v4));
+    return _mm_add_ps(
+        acc, _mm_mul_ps(_mm_mul_ps(f, s), _mm_loadu_ps(xp + K)));
+}
+
 /** Accumulates 16 Q6_K combined values (each byte 0..63) as
  * (v - 32) * dsc * x into acc. */
 __m128 accum16_q6k_sse(__m128 acc, __m128i vals, float dsc,
                        const float* xp) {
     const __m128i sv = _mm_sub_epi8(vals, _mm_set1_epi8(32));
     const __m128 s = _mm_set1_ps(dsc);
-    for (int k = 0; k < 16; k += 4) {
-        const __m128i v4 = _mm_srli_si128(sv, k);
-        const __m128 f =
-            _mm_cvtepi32_ps(_mm_cvtepi8_epi32(v4));
-        acc = _mm_add_ps(
-            acc, _mm_mul_ps(_mm_mul_ps(f, s),
-                            _mm_loadu_ps(xp + k)));
-    }
-    return acc;
+    acc = accum4_q6k_sse<0>(acc, sv, s, xp);
+    acc = accum4_q6k_sse<4>(acc, sv, s, xp);
+    acc = accum4_q6k_sse<8>(acc, sv, s, xp);
+    return accum4_q6k_sse<12>(acc, sv, s, xp);
 }
 
 /** Reconstructs 16 Q6_K combined values (0..63) from ql (high
