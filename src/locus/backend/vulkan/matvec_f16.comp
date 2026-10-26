@@ -47,10 +47,21 @@ layout(push_constant) uniform PC {
 
 shared float red[LANES * ROWS];
 
+#ifdef BF16
+// Compiled with -DBF16 (the matvec_bf16* kernels): the 16-bit values
+// are bfloat16, the top half of an f32, so widening is exact: the low
+// value of a word moves up 16 bits, the high one is masked in place.
+float half_at(uint e) {
+    uint word = w[e >> 1];
+    return uintBitsToFloat((e & 1u) != 0u ? (word & 0xFFFF0000u)
+                                          : (word << 16));
+}
+#else
 float half_at(uint e) {
     vec2 pair = unpackHalf2x16(w[e >> 1]);
     return (e & 1u) != 0u ? pair.y : pair.x;
 }
+#endif
 
 /** This lane's share of dot(row r of the matrix at wbase, x). */
 float row_part(uint wbase, uint xbase, uint r, uint lane) {

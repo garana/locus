@@ -374,8 +374,20 @@ void Server::worker_loop() {
             c = std::move(handoff_.front());
             handoff_.pop_front();
         }
-        serve_connection(c.fd, c.peer_ip);
+        serve_connection_guarded(c.fd, c.peer_ip, false);
         ::close(c.fd);
+    }
+}
+
+void Server::serve_connection_guarded(int fd, const std::string& peer_ip,
+                                      bool single_request) {
+    // handle_request already turns a handler exception into a 500; this
+    // catches the rest (an allocation failure while buffering, a throw
+    // from writing that 500), so neither a worker nor the acceptor
+    // thread can end the process (i#243). The caller closes fd.
+    try {
+        serve_connection(fd, peer_ip, single_request);
+    } catch (...) {
     }
 }
 
@@ -497,7 +509,7 @@ void Server::classify_ready(int fd) {
     std::string method, target;
     if (peek_request_line(fd, method, target) &&
         cfg_.fast_path(method, target)) {
-        serve_connection(fd, peer_ip, /*single_request=*/true);
+        serve_connection_guarded(fd, peer_ip, /*single_request=*/true);
         ::close(fd);
         return;
     }
@@ -669,7 +681,16 @@ void Server::serve_connection(int fd, const std::string& peer_ip,
                 if (parse_head(buf, cfg_.limits, head_req).state ==
                     ParseState::kComplete) {
                     ServerResponse hres;
-                    if (head_handler_(head_req, hres, req_ctx)) {
+                    bool reject = false;
+                    try {
+                        reject = head_handler_(head_req, hres, req_ctx);
+                    } catch (...) {
+                        // As in handle_request: 500 and close (i#243).
+                        write_status_response(fd, head_req.is_head, 500,
+                                              false);
+                        return;
+                    }
+                    if (reject) {
                         write_buffered_response(fd, hres, head_req.is_head,
                                                 false);
                         return;  // reject on the head: no 100, close (#10/#1)
@@ -821,7 +842,13 @@ bool Server::write_buffered_response(int fd, const ServerResponse& res,
 bool Server::handle_request(int fd, const Request& req,
                             const RequestContext& ctx, bool keep) {
     ServerResponse res;
-    handler_(req, res, ctx);
+    try {
+        handler_(req, res, ctx);
+    } catch (...) {
+        // Last resort (i#243): an exception that escapes a handler must
+        // not end the process. Answer 500 and close the connection.
+        return write_status_response(fd, req.is_head, 500, false), false;
+    }
 
     if (res.provider) {
         Response head;
@@ -844,7 +871,14 @@ bool Server::handle_request(int fd, const Request& req,
             return keep;
         }
         ServerSink sink(fd, wake_r_, cfg_.write_deadline_ms, stopping_);
-        res.provider(sink);
+        try {
+            res.provider(sink);
+        } catch (...) {
+            // The head is already out, so no 500 is possible: close
+            // without the terminating chunk, which the client sees as a
+            // truncated stream (i#243).
+            return false;
+        }
         sink.done();  // terminating chunk (idempotent if the handler did)
         return sink.ok() && keep;
     }
