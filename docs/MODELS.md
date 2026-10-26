@@ -21,7 +21,7 @@ Notation used throughout:
 - $W x$ is the matrix-vector product (a result in $\mathbb{R}^m$).
 - $\langle a, b \rangle = \sum_i a_i b_i$ is the dot product of two
   vectors.
-- $a \odot b$ is elementwise multiplication; $c\,x$ is a scalar times a
+- $a \odot b$ is elementwise multiplication; $c\ x$ is a scalar times a
   vector.
 - A "token" is one chunk of input text (a word or word-piece),
   identified by an integer id. The "sequence" is the tokens seen so
@@ -79,7 +79,9 @@ means the model favors that token more. Logits are not yet
 probabilities. To read them as probabilities one applies the softmax
 function, which exponentiates every entry and divides by the total:
 
-$$\mathrm{softmax}(z)_i = \frac{e^{z_i}}{\sum_j e^{z_j}}$$
+```math
+\mathrm{softmax}(z)_i = \frac{e^{z_i}}{\sum_j e^{z_j}}
+```
 
 The values are then nonnegative and sum to 1. (This function reappears
 inside attention, Section 5.2.) The name "logit" is historical: it is
@@ -130,7 +132,9 @@ position through a stack of $L$ identical layers. This running vector
 is called the residual stream. Each layer reads $x$, computes a
 correction, and adds it back:
 
-$$x \leftarrow x + \mathrm{correction}$$
+```math
+x \leftarrow x + \mathrm{correction}
+```
 
 Because every update is additive, a layer is "the identity plus a
 learned perturbation." That additive structure is what lets the stack
@@ -146,7 +150,9 @@ As corrections accumulate, the magnitude of $x$ could drift. So before
 each layer uses $x$, it normalizes a copy. The models use RMSNorm
 (Root-Mean-Square Normalization):
 
-$$\mathrm{rmsnorm}(x)_i = \frac{x_i}{\sqrt{\frac{1}{d} \sum_j x_j^2 + \epsilon}}\; g_i$$
+```math
+\mathrm{rmsnorm}(x)_i = \frac{x_i}{\sqrt{\frac{1}{d} \sum_j x_j^2 + \epsilon}}\; g_i
+```
 
 It divides every entry by the root-mean-square of the vector (making
 it unit length in the RMS sense), then multiplies elementwise by a
@@ -178,11 +184,11 @@ numbers.
 
 Two shapes recur:
 
-- a down-projection $W \in \mathbb{R}^{r \times d}$ with $r < d$:
+- a down-projection $W \in \mathbb{R}^{r \times d}$ with $r \lt d$:
   compress a vector into a smaller $r$-dimensional space;
 - an up-projection $W \in \mathbb{R}^{d \times r}$: expand back to $d$.
 
-Chaining a down- then an up-projection, $W_{up} (W_{down}\, x)$, routes
+Chaining a down- then an up-projection, $W_{up} (W_{down}\  x)$, routes
 a large $d \times d$ transformation through a thin $r$-dimensional
 bottleneck, using far fewer parameters than a full $d \times d$
 matrix. This low-rank factorization idea returns twice later (query
@@ -209,7 +215,9 @@ layers (Section 4) produce three vectors:
 The position we are computing (the query, at position $n$) compares
 itself against every earlier position $t$ by a scaled dot product:
 
-$$s_t = \frac{\langle q_n, k_t \rangle}{\sqrt{d_{head}}}$$
+```math
+s_t = \frac{\langle q_n, k_t \rangle}{\sqrt{d_{head}}}
+```
 
 Here $d_{head}$ is the length of the query and key vectors. (We are
 describing one attention "head"; Section 5.5 splits the work into
@@ -220,13 +228,17 @@ vectors are high-dimensional: a dot product of two $d_{head}$-vectors
 with unit-scale entries grows like $\sqrt{d_{head}}$. The scores
 become weights through the softmax function (Section 1):
 
-$$a_t = \frac{e^{s_t}}{\sum_{t'} e^{s_{t'}}}$$
+```math
+a_t = \frac{e^{s_t}}{\sum_{t'} e^{s_{t'}}}
+```
 
 The $a_t$ are nonnegative and sum to 1: a probability distribution
 over earlier positions. The head's output is the weighted average of
 those positions' values:
 
-$$\mathrm{out} = \sum_t a_t\, v_t$$
+```math
+\mathrm{out} = \sum_t a_t\  v_t
+```
 
 So each position pulls in a blend of earlier values, weighted by how
 well its query matches each earlier key.
@@ -267,7 +279,7 @@ The KV cache stores $h$ keys and $h$ values per position, the dominant
 memory cost at long context (a long sequence, meaning many past
 positions to keep). GQA (Grouped-Query Attention) reduces it: keep all
 $h$ query heads, but let groups of query heads share a single
-key/value head, so the cache holds only $h_{kv} < h$ keys and values
+key/value head, so the cache holds only $h_{kv} \lt h$ keys and values
 per token. Our `llama-3.2-1b` uses 32 query heads over 8 KV heads (4:1
 sharing); `stories260K` uses 8 over 8, that is no sharing, which is
 plain MHA. The quality cost is small and the cache shrinks by the
@@ -284,7 +296,9 @@ Writing $R(\theta)$ for the $2 \times 2$ rotation matrix, the query at
 position $n$ is rotated by $R(n f)$ and the key at position $t$ by
 $R(t f)$. Their dot product then depends on
 
-$$R(n f)^\top R(t f) = R((t - n) f)$$
+```math
+R(n f)^\top R(t f) = R((t - n) f)
+```
 
 a function of the relative offset $t - n$ only. So attention
 perceives relative distance, with no extra inputs.
@@ -325,18 +339,22 @@ position on its own. It is a feed-forward network (FFN), also called
 an MLP (Multi-Layer Perceptron). Our models use the gated variant
 SwiGLU (Swish-Gated Linear Unit):
 
-$$\mathrm{FFN}(x) = W_{down} \left( \mathrm{silu}(W_{gate}\, x) \odot (W_{up}\, x) \right)$$
+```math
+\mathrm{FFN}(x) = W_{down} \left( \mathrm{silu}(W_{gate}\  x) \odot (W_{up}\  x) \right)
+```
 
 Two up-projections widen $x$ to a larger inner dimension ($W_{gate}$
 and $W_{up}$), an elementwise gate multiplies them, and a
 down-projection returns to $\mathbb{R}^d$. The nonlinearity is silu
 (Sigmoid Linear Unit):
 
-$$\mathrm{silu}(z) = z\, \sigma(z), \qquad \sigma(z) = \frac{1}{1 + e^{-z}}$$
+```math
+\mathrm{silu}(z) = z\  \sigma(z), \qquad \sigma(z) = \frac{1}{1 + e^{-z}}
+```
 
 The sigmoid $\sigma$ is the S-shaped curve that squashes any real
 number into the open interval $(0, 1)$. The "gate" term
-$\mathrm{silu}(W_{gate}\, x)$ modulates the "up" term elementwise
+$\mathrm{silu}(W_{gate}\  x)$ modulates the "up" term elementwise
 before the down-projection. Without a nonlinearity the whole stack
 would collapse to a single linear map, so this is where the model's
 expressive power beyond linear algebra enters. The FFN runs
@@ -346,9 +364,13 @@ identically and independently at every position.
 
 We now have both sublayers. One layer is:
 
-$$x \leftarrow x + \mathrm{Attention}(\mathrm{rmsnorm}(x)) \qquad \text{(mix across positions)}$$
+```math
+x \leftarrow x + \mathrm{Attention}(\mathrm{rmsnorm}(x)) \qquad \text{(mix across positions)}
+```
 
-$$x \leftarrow x + \mathrm{FFN}(\mathrm{rmsnorm}(x)) \qquad \text{(transform each position)}$$
+```math
+x \leftarrow x + \mathrm{FFN}(\mathrm{rmsnorm}(x)) \qquad \text{(transform each position)}
+```
 
 Note the normalization before each sublayer and the residual add
 around it (this "pre-norm" arrangement is what Sections 2 and 3 set
@@ -382,7 +404,9 @@ The first few blocks may use the dense FFN and the rest MoE (the
 Stack $L$ such layers. After the last one, a final RMSNorm and one
 more linear map produce the logits:
 
-$$z = W_{out}\, \mathrm{rmsnorm}(x) \in \mathbb{R}^V$$
+```math
+z = W_{out}\  \mathrm{rmsnorm}(x) \in \mathbb{R}^V
+```
 
 Often $W_{out}$ is not stored separately: tied embeddings reuse the
 embedding matrix, $W_{out} = E$, so $z_t = \langle E_t, x \rangle$
@@ -434,7 +458,7 @@ deal but computes with little at a time.
 
 The selection procedure (the `moe_select` routine in the code):
 
-- router logits $r = W_{router}\, x \in \mathbb{R}^N$: one score per
+- router logits $r = W_{router}\  x \in \mathbb{R}^N$: one score per
   expert.
 - turn the scores into gate weights, one of two ways: softmax across
   all experts, so they compete for a shared budget
@@ -449,7 +473,7 @@ The selection procedure (the `moe_select` routine in the code):
   streamed from disk, how many bytes are read per token.
 - pick the top-k experts; optionally renormalize their weights to sum
   to 1 and multiply by a constant.
-- output: $\sum_{e \in \mathrm{chosen}} w_e\, \mathrm{FFN}_e(x)$.
+- output: $\sum_{e \in \mathrm{chosen}} w_e\  \mathrm{FFN}_e(x)$.
 
 Two further details our models use:
 
@@ -489,7 +513,9 @@ rotary key $k_{pe}$. The trick that keeps attention correct without
 ever rebuilding per-head keys is weight absorption, a plain algebraic
 identity:
 
-$$\langle q, W_{uk}\, c \rangle = \langle W_{uk}^\top q, c \rangle$$
+```math
+\langle q, W_{uk}\  c \rangle = \langle W_{uk}^\top q, c \rangle
+```
 
 Here $W_{uk}$ is the up-projection that would reconstruct a head's key
 from the latent. Rather than reconstruct the key (left side), we fold
@@ -499,7 +525,9 @@ latent $c_{kv}$. The value side works the same way, with an
 up-projection $W_{uv}$ applied after the weighted average, so values
 are never materialized per token either:
 
-$$\mathrm{out}_{head} = W_{uv} \sum_t a_t\, c_{kv}(t)$$
+```math
+\mathrm{out}_{head} = W_{uv} \sum_t a_t\  c_{kv}(t)
+```
 
 The score has two parts: the compressed part
 $\langle q_{abs}, c_{kv} \rangle$ plus a rotary part
@@ -514,7 +542,7 @@ through $W_{q,a}$ (down to a small rank), an RMSNorm, then $W_{q,b}$
 query directly.
 
 The net effect: the cache is one $r$-vector per token instead of
-$2\, h_{kv}\, d_{head}$ numbers, roughly an order of magnitude smaller,
+$2\  h_{kv}\  d_{head}$ numbers, roughly an order of magnitude smaller,
 at the price of a little extra arithmetic (the absorptions). This is
 the deepseek2 family: MLA attention with an MoE feed-forward.
 
@@ -546,16 +574,14 @@ indexer" that, past a cutoff, lets each query attend to only the
 A cheap secondary scorer runs before the main MLA attention:
 
 - each position caches a small indexer key
-  $k_{idx} = \mathrm{LayerNorm}(W_{ik}\, x)$. This is the one place
+  $k_{idx} = \mathrm{LayerNorm}(W_{ik}\  x)$. This is the one place
   LayerNorm (mean-centered, Section 3) is used, followed by RoPE in
   the half-split convention.
 - the query builds per-head indexer queries $q_h$ (from the same query
-  latent as MLA) and per-head scalar weights $w_h = W_{wproj}\, x$.
-- an earlier position $t$ gets a relevance score
-
-  $$\mathrm{score}(t) = \sum_h w_h\, \mathrm{ReLU}(\langle q_h, k_{idx}(t) \rangle)$$
-
-  a head-weighted sum of rectified query-key similarities. ReLU, the
+  latent as MLA) and per-head scalar weights $w_h = W_{wproj}\  x$.
+- an earlier position $t$ gets a relevance score $s(t)$, a
+  head-weighted sum of rectified query-key similarities:
+  $s(t) = \sum_h w_h \mathrm{ReLU}(q_h \cdot k_{idx}(t))$. ReLU, the
   Rectified Linear Unit, is $\mathrm{ReLU}(z) = \max(0, z)$; it zeroes
   out heads that correlate negatively.
 - keep the `top_k` highest-scoring positions; MLA then attends only
@@ -604,8 +630,8 @@ before the matvec, or performs an equivalent integer dot product.
 | F32    | 32    | IEEE-754 single precision; the reference, no quantization                                               |
 | F16    | 16    | IEEE-754 half precision; about 3 decimal digits of precision                                            |
 | BF16   | 16    | the top half of an F32: the same range, about 2 decimal digits                                          |
-| Q8_0   | ~8.5  | blocks of 32 weights share one F16 scale $d$; each weight is an int8 $q$, and $w = d\,q$; near-lossless |
-| Q4_K_M | ~4.5  | a "K-quant": 4-bit weights in super-blocks of 256, $w = d_{sub}\,q + m_{sub}$ (below)                   |
+| Q8_0   | ~8.5  | blocks of 32 weights share one F16 scale $d$; each weight is an int8 $q$, and $w = d\ q$; near-lossless |
+| Q4_K_M | ~4.5  | a "K-quant": 4-bit weights in super-blocks of 256, $w = d_{sub}\ q + m_{sub}$ (below)                   |
 | IQ1_S  | ~1.56 | importance-aware: a codebook index per group of weights, times a per-block scale (below)                |
 
 Q4_K_M's sub-blocks each carry a 6-bit scale and min, over an F16

@@ -319,15 +319,13 @@ not capped at `attention.indexer.top_k` (2048).
 - Per layer and token, with $x$ the layer input:
   - the cached key: $k_{idx}(s) = \mathrm{LayerNorm}(W_k x_s)$, 128
     values;
-  - the query: $q_{idx}(t) = W_{qb}\, q_a(t)$, viewed as 32 heads of
+  - the query: $q_{idx}(t) = W_{qb}\  q_a(t)$, viewed as 32 heads of
     128;
-  - the head weights: $w(t) = W_{proj}\, x_t$, 32 values.
+  - the head weights: $w(t) = W_{proj}\  x_t$, 32 values.
 - Rope on the first 64 dimensions of both $q_{idx}$ and $k_{idx}$,
   half-split (not interleaved, unlike the main attention).
 - Score:
-
-  $$\mathrm{score}(t, s) = \sum_h w_h(t)\, \mathrm{ReLU}(q_h(t) \cdot k_{idx}(s))$$
-
+  $\mathrm{score}(t, s) = \sum_h w_h(t) \mathrm{ReLU}(q_h(t) \cdot k_{idx}(s))$.
   Global scale factors do not change the top-k order, so selection
   ignores them.
 - Attention and its softmax run over the top-scoring
@@ -468,7 +466,9 @@ Latency rises by about (hops x one-way delay). Throughput need not
 fall, if sends are asynchronous and enough requests are in flight to
 keep every stage busy:
 
-$$\mathrm{concurrency} \approx \mathrm{stages} \times \left(1 + \frac{\mathrm{delay}}{\mathrm{compute\ per\ stage}}\right)$$
+```math
+\mathrm{concurrency} \approx \mathrm{stages} \times \left(1 + \frac{\mathrm{delay}}{\mathrm{compute\ per\ stage}}\right)
+```
 
 Network delay does not lower the throughput ceiling; it raises the
 concurrency needed to reach it. Prefill can be chunked and streamed
