@@ -554,6 +554,12 @@ floor.
   ops) and the vulkan full forward are untouched. Parallel
   slices also mean parallel page faults -- deeper NVMe queue,
   which is the second half of the win on streamed models.
+  The llama-family arch hooks (llama, qwen2moe, qwen3moe,
+  dbrx, glm-dsa, MLA) had drifted to an inline op.matvec for
+  q/k/v; they now go through matvec_mt_f32, which threads
+  op.matvec without the R16 Q8-activation switch, so the
+  arithmetic is unchanged (Orpheus 3B neon decode on M4 Max,
+  10 threads: 9.6 -> 15.6 tok/s).
 - R9.2 static pinning. LOCUS_PIN_STATIC=1 mlocks every
   non-expert weight (attention, norms via their mats, dense
   FFN, shared experts, router, embeddings, output head) at
