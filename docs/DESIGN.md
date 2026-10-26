@@ -1389,16 +1389,24 @@ matvec throughput.
   side, so the test stays teacher-forced on every lane. Likewise the
   deepseek41 goldens (prompt 1's third token tips on x86, and on arm64
   since #237's NEON BF16 dot): teacher-forced on every lane.
-- Default ON (2026-10-25, owner decision, #206): with the NEON int8
-  dots (matvec_neon_q8k, bit-identical to scalar matvec_q8k) the Q8
-  path is 2.1x faster than the f32 dot on CPU decode (Orpheus 3B on
-  M4, default threads: 29.4 -> 63.0 tok/s), so Hparams::q8k_default
-  is now true for every arch, and the attention projections take
-  matvec_mt like every other matvec (llama.cpp quantizes them too). The f32-activation dot stays as the opt-in reference
-  for exactness checks: LOCUS_F32_ACTIVATIONS=1, or
-  use_q8k_activations(false). Goldens: only qwen2moe tipped (as
-  predicted above, ~token 15); its test pins the f32 path, which
-  still reproduces llama-simple's 32 tokens. No Q8_0 golden moved.
+- Default ON where it is fast (2026-10-25, owner decision, #206):
+  with the NEON int8 dots (matvec_neon_q8k, bit-identical to scalar
+  matvec_q8k) the Q8 path is 2.1x faster than the f32 dot on CPU
+  decode (Orpheus 3B on M4, default threads: 29.4 -> 63.0 tok/s). The
+  mode is on when the arch requires it (Hparams::q8k_default:
+  muse-spark, deepseek41) or the backend's Q8 dot is its fast path
+  (Ops::prefers_q8k: neon, sse4, scalar). avx2 (scalar Q8 dot vs its
+  AVX2 f32 one), cuda (no block-32 Q8 kernel) and vulkan's per-op
+  fallback (scalar, inline) keep the f32 dot. The attention
+  projections take matvec_mt like every other matvec (llama.cpp
+  quantizes them too), and batched prefill gates on the same types
+  as decode (uses_quantized_activation), so prefill == decode holds
+  for block-32 weights too. LOCUS_F32_ACTIVATIONS (any value but "0"
+  or empty) or use_q8k_activations(false) selects the f32 path, the
+  reference for exactness checks; use_q8k_activations overrides
+  everything. Goldens pinned to f32 because Q8 tips a near-tie:
+  qwen2moe (~token 15, as predicted above) and deepseek-v2-lite
+  (neon leg, after 15 tokens). No Q8_0 golden moved.
 
 ## 8. Testing strategy
 
