@@ -2012,6 +2012,17 @@ void quantize_row_q8_0_act(const float* x, BlockQ8_0Act* y, std::size_t n) {
     }
 }
 
+void quantize_activation_q8_0(std::span<const float> x, float* d,
+                              std::int8_t* qs) {
+    const std::size_t nb = x.size() / 32;
+    std::vector<BlockQ8_0Act> tmp(nb);
+    quantize_row_q8_0_act(x.data(), tmp.data(), x.size());
+    for (std::size_t b = 0; b < nb; ++b) {
+        d[b] = tmp[b].d;
+        std::memcpy(qs + b * 32, tmp[b].qs, 32);
+    }
+}
+
 /** Block b of a block-32 weight row as 32 int8 values and its scale. */
 float unpack_block32(gguf::TensorType type, const std::byte* row,
                      std::size_t b, std::int8_t* q) {

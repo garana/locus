@@ -152,6 +152,15 @@ void quantize_activation_q8k(std::span<const float> x, float* d,
                              std::int8_t* qs, std::int16_t* bsums);
 
 /**
+ * Quantizes activation x to Q8_0 (the block-32 vec_dot_type), writing
+ * d[n/32] (f16-rounded scales) and qs[n] (int8), n = x.size() (a
+ * multiple of 32). Bit-identical to the quant matvec_q8k applies to
+ * Q8_0 / Q4_0 / IQ4_NL weights, for SIMD variants of that dot.
+ */
+void quantize_activation_q8_0(std::span<const float> x, float* d,
+                              std::int8_t* qs);
+
+/**
  * Scalar reference for the R11 batched matvec (backend::Ops::
  * matvec_batch). Applies w to n token vectors (x_batch is n*w.cols,
  * token t at t*w.cols) and writes results row-major: out_batch is
