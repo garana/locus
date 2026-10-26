@@ -91,17 +91,25 @@ void advise_layer_statics(const TransformerModel::Layer& lay) {
 
 /**
  * How many row-slices to split a `rows`-row matvec across: the
- * thread-pool width, capped by LOCUS_THREADS and by keeping at
- * least kMinRowsPerSlice rows per slice so dispatch overhead never
- * dominates. Returns <= 1 when the work should run inline.
- *
- * Without LOCUS_THREADS, a heterogeneous CPU defaults to its
- * performance-core count: the slices are equal, so one landing on an
- * efficiency core finishes last and the whole matvec waits for it
- * (M4 Max Orpheus decode: 14 slices 19.7 tok/s, 10 slices 22.0).
+ * fan-out (mt_fanout), capped by keeping at least kMinRowsPerSlice
+ * rows per slice so dispatch overhead never dominates. Returns <= 1
+ * when the work should run inline.
  */
 std::size_t mt_slices(std::uint32_t rows) {
     constexpr std::uint32_t kMinRowsPerSlice = 64;
+    return std::min<std::size_t>(mt_fanout(), rows / kMinRowsPerSlice);
+}
+
+}  // namespace
+
+/*
+ * Without LOCUS_THREADS, a heterogeneous CPU defaults to its
+ * performance-core count: work is split evenly, so a share landing on
+ * an efficiency core finishes last and everything waits for it (M4 Max
+ * Orpheus decode: 14 slices 19.7 tok/s, 10 slices 22.0). An explicit
+ * LOCUS_THREADS still reaches the full pool.
+ */
+std::size_t mt_fanout() {
     const std::size_t pool = sys::ThreadPool::instance().parallelism();
     static const unsigned pcores = sys::performance_cores();
     std::size_t t =
@@ -113,10 +121,8 @@ std::size_t mt_slices(std::uint32_t rows) {
                 pool, static_cast<std::size_t>(v));
         }
     }
-    return std::min<std::size_t>(t, rows / kMinRowsPerSlice);
+    return t;
 }
-
-}  // namespace
 
 /** The backend Ops the model runs with, honoring the R16 opt-in: when
  *  Q8_K-activation mode is off, matvec_q8k is nulled so matvec_mt /

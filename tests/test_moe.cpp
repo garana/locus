@@ -930,6 +930,57 @@ TEST_CASE("the full GPU forward declines dbrx's fused qkv and LayerNorm",
     REQUIRE_FALSE(locus::backend::vulkan_forward_supported(model));
 }
 
+TEST_CASE("dbrx CPU decode is finite and thread-count invariant",
+          "[moe]") {
+    // The only CPU run of dbrx_attention without the 32GB model: the
+    // fused [q|k|v] split, NEOX rope and gqa_attend over 6 positions.
+    constexpr std::uint32_t kNe = 4;
+    auto experts = [](ModelBuilder& mb) {
+        mb.tensor("blk.0.ffn_gate_inp.weight", {kE, kNe},
+                  weights(kE * kNe, 60));
+        mb.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, kNe},
+                  weights(kE * kF * kNe, 61));
+        mb.tensor("blk.0.ffn_up_exps.weight", {kE, kF, kNe},
+                  weights(kE * kF * kNe, 62));
+        mb.tensor("blk.0.ffn_down_exps.weight", {kF, kE, kNe},
+                  weights(kF * kE * kNe, 63));
+    };
+    ModelBuilder mb;
+    mb.tensor("token_embd.weight", {kE, ModelBuilder::kVocab},
+              weights(kE * ModelBuilder::kVocab, 1));
+    mb.tensor("blk.0.attn_norm.weight", {kE},
+              std::vector<float>(kE, 1.0f));
+    mb.tensor("output_norm.weight", {kE}, std::vector<float>(kE, 1.0f));
+    mb.tensor("blk.0.attn_qkv.weight", {kE, 3 * kE},
+              weights(kE * 3 * kE, 64));
+    mb.tensor("blk.0.attn_output.weight", {kE, kE}, weights(kE * kE, 65));
+    mb.tensor("blk.0.attn_output_norm.weight", {kE},
+              std::vector<float>(kE, 1.0f));
+    experts(mb);
+    auto g = locus::gguf::GgufFile::parse(mb.build(kNe, 2, "dbrx"));
+    auto model = TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("scalar"));
+    auto run = [&](const char* threads) {
+        setenv("LOCUS_THREADS", threads, 1);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        for (const int t : {1, 5, 2, 7, 3, 4}) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(t, cache, seq, ws, logits);
+        }
+        cache.release(seq);
+        return logits;
+    };
+    const auto a = run("1");
+    for (const float v : a) {
+        REQUIRE(std::isfinite(v));
+    }
+    REQUIRE(run("8") == a);
+    unsetenv("LOCUS_THREADS");
+}
+
 TEST_CASE("Layer::has_separate_qkv wants the GQA q / k / v shapes",
           "[model]") {
     using Layer = TransformerModel::Layer;

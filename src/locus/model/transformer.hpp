@@ -701,6 +701,14 @@ std::vector<std::pair<std::uint32_t, float>> moe_select(
 bool weights_stream(std::uint64_t weight_bytes, std::uint64_t ram_bytes);
 
 /**
+ * @returns How many pool threads model-level parallel loops may use:
+ *     the performance-core count on heterogeneous CPUs, else the pool
+ *     width; an explicit LOCUS_THREADS overrides it, up to the pool
+ *     (1 runs inline).
+ */
+std::size_t mt_fanout();
+
+/**
  * Row-split matvec across the R9 thread pool: slices w into row
  * ranges dispatched through the SAME backend kernel into
  * disjoint spans of out, so logits are bit-identical for every
