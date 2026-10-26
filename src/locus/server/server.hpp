@@ -19,7 +19,11 @@ class SnacDecoder;
 }
 namespace locus::image {
 class JanusImageGen;
+class JanusVision;
 class Vq16Decoder;
+}
+namespace locus::server {
+struct VisionChat;
 }
 
 namespace locus::server {
@@ -168,6 +172,20 @@ class OpenAiServer {
      * (no-op when auth is off). */
     void auth_event(const char* event, const std::string& kind,
                     const std::string& identity);
+    /**
+     * Answers a chat (OpenAI) or messages (Anthropic) request whose
+     * messages carry images (i#241): the Janus vision encoder turns
+     * each image into its placeholder embeddings, then the reply is
+     * decoded on a dedicated cache, serialized under vision_mu_.
+     * Non-streaming.
+     *
+     * @param anthropic Answer in the /v1/messages shape.
+     * @param chat The parsed request (turns, images, max_tokens,
+     *     sampling).
+     */
+    void vision_chat(bool anthropic, const VisionChat& chat,
+                     http::ServerResponse& res,
+                     const http::RequestContext& ctx);
 
     const model::TransformerModel& model_;
     const tok::Tokenizer& tok_;
@@ -216,6 +234,16 @@ class OpenAiServer {
     std::unique_ptr<image::Vq16Decoder> vq16_;
     std::unique_ptr<image::JanusImageGen> janus_;
     std::mutex image_mu_;
+
+    // Image input (i#241): the Janus vision encoder, loaded when the
+    // model's GGUF has vit.* tensors (null otherwise: a request with an
+    // image then gets a 400). Its matrices point into vision_gguf_'s
+    // mapping. Replies run one at a time on a dedicated cache.
+    std::unique_ptr<gguf::GgufFile> vision_gguf_;
+    std::unique_ptr<image::JanusVision> vision_;
+    std::mutex vision_mu_;
+    std::unique_ptr<kv::PagedKvCache> vision_cache_;
+    model::TransformerModel::Workspace vision_ws_;
 };
 
 }  // namespace locus::server
