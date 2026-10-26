@@ -27,7 +27,9 @@ const std::vector<Backend>& list() {
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #if defined(__aarch64__)
         b.push_back({"neon",
-                     "ARM NEON vectorized matvec (F32/Q8_0)",
+                     "ARM NEON vectorized matvec (F32/BF16/Q8_0/"
+                     "Q4_K/Q6_K/IQ1_S) and 8-bit activation dots "
+                     "(Q4_K/Q6_K/Q8_0/Q4_0/IQ4_NL)",
                      f.neon, true,
                      {.matvec = &matvec_neon,
                       .matvec_q8k = &matvec_neon_q8k,
@@ -43,8 +45,9 @@ const std::vector<Backend>& list() {
                       .matvec_q8k = &matvec_q8k,  // scalar (no AVX2 Q8K)
                       .dequant_row = &dequant_row}});
         b.push_back({"sse4",
-                     "x86-64 SSE4.1 vectorized matvec + batched "
-                     "(F32/Q8_0; Q4_K/Q6_K register-blocked batch)",
+                     "x86-64 SSE4.1 vectorized matvec (F32/Q8_0/"
+                     "Q4_K/Q6_K), 8-bit activation dots (K-quants), "
+                     "Q4_K/Q6_K register-blocked batch",
                      f.sse4, true,
                      {.matvec = &matvec_sse4,
                       .matvec_q8k = &matvec_sse4_q8k,
@@ -68,7 +71,8 @@ const std::vector<Backend>& list() {
         b.push_back({"vulkan",
                      "GPU forward pass via Vulkan: paged/MLA "
                      "attention and MoE experts on GPU "
-                     "(F32/F16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K)",
+                     "(F32/F16/BF16/Q8_0/Q4_0/Q5_0/Q2_K/Q4_K/Q5_K/"
+                     "Q6_K/IQ2_XXS/IQ3_XXS/IQ4_XS)",
                      vk, vk,
                      {.matvec = &matvec_vulkan,
                       .matvec_q8k = &matvec_q8k,  // scalar (pi: Vulkan)
@@ -77,8 +81,10 @@ const std::vector<Backend>& list() {
                       .mt_safe = false}});
         const bool cu = cuda_backend_usable();
         b.push_back({"cuda",
-                     "NVIDIA CUDA matvec (F32/Q8_0/Q4_K/Q5_K/Q6_K/"
-                     "IQ1_S on GPU, pooled weights; other scalar)",
+                     "NVIDIA CUDA matvec (F32/Q8_0/Q2_K/Q4_K/Q5_K/"
+                     "Q6_K, IQ1_S/IQ1_M/IQ2_*/IQ3_XXS/IQ3_S/IQ4_NL/"
+                     "IQ4_XS, TQ1_0/TQ2_0 on GPU, pooled weights; "
+                     "other scalar)",
                      cu, cu,
                      {.matvec = &matvec_cuda,
                       .matvec_q8k = &matvec_cuda_q8k,
