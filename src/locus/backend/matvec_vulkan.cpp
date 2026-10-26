@@ -40,6 +40,7 @@ std::size_t weight_bytes(const Mat& w) {
             b = static_cast<std::size_t>(w.rows) * w.cols * 4;
             break;
         case gguf::TensorType::kF16:
+        case gguf::TensorType::kBF16:
             b = static_cast<std::size_t>(w.rows) * w.cols * 2;
             break;
         case gguf::TensorType::kQ8_0:
@@ -93,6 +94,7 @@ Kernel matvec_kernel(const Mat& w) {
     switch (w.type) {
         case gguf::TensorType::kF32: return Kernel::kMatvecF32;
         case gguf::TensorType::kF16: return Kernel::kMatvecF16;
+        case gguf::TensorType::kBF16: return Kernel::kMatvecBF16;
         case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0;
         case gguf::TensorType::kQ4_0: return Kernel::kMatvecQ4_0;
         case gguf::TensorType::kQ5_0: return Kernel::kMatvecQ5_0;
@@ -115,6 +117,7 @@ Kernel batched_kernel(const Mat& w) {
     switch (w.type) {
         case gguf::TensorType::kF32: return Kernel::kMatvecF32B;
         case gguf::TensorType::kF16: return Kernel::kMatvecF16B;
+        case gguf::TensorType::kBF16: return Kernel::kMatvecBF16B;
         case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0B;
         case gguf::TensorType::kQ4_K: return Kernel::kMatvecQ4_KB;
         case gguf::TensorType::kQ6_K: return Kernel::kMatvecQ6_KB;
@@ -128,6 +131,7 @@ std::uint32_t w_off_units(const Mat& w, std::uint64_t bytes) {
         case gguf::TensorType::kF32:
             return static_cast<std::uint32_t>(bytes / 4);
         case gguf::TensorType::kF16:
+        case gguf::TensorType::kBF16:
             return static_cast<std::uint32_t>(bytes / 2);
         default:
             return static_cast<std::uint32_t>(bytes);
