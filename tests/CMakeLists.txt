@@ -34,6 +34,7 @@ add_executable(locus_tests
     test_pipeline.cpp
     test_pipeline_stage.cpp
     test_forward_batch_layers.cpp
+    test_logit_rows.cpp
     test_outw_batch.cpp
     test_pipeline_mux.cpp
     test_stage_executor.cpp
@@ -69,6 +70,10 @@ add_executable(locus_tests
     test_muse_spark.cpp
     test_codec.cpp
     test_snac.cpp
+    test_vq16.cpp
+    test_janus.cpp
+    test_png.cpp
+    test_base64.cpp
     test_deepseek41.cpp
     test_threads.cpp
     test_perf_counters.cpp
@@ -88,8 +93,10 @@ target_compile_definitions(locus_tests PRIVATE
     LOCUS_AUTH_HELPER_BIN="$<TARGET_FILE:locus-auth-helper>"
     LOCUS_STAGE_BIN="$<TARGET_FILE:locus-stage>"
     LOCUS_RUN_BIN="$<TARGET_FILE:locus-run>"
+    LOCUS_SERVER_BIN="$<TARGET_FILE:locus-server>"
 )
-add_dependencies(locus_tests locus-auth-helper locus-stage locus-run)
+add_dependencies(locus_tests locus-auth-helper locus-stage locus-run
+                 locus-server)
 
 add_test(NAME unit COMMAND locus_tests)
 

@@ -294,4 +294,132 @@ void conv1d_transpose(std::span<const float> in, std::uint32_t in_ch,
 void snake1d(std::span<float> x, std::uint32_t ch, std::uint32_t len,
              std::span<const float> alpha, float eps = 1e-9f);
 
+/**
+ * conv1d across the thread pool, with a loop order the compiler can
+ * vectorize (one contiguous output run per tap). Each output sums the
+ * same terms in the same order as conv1d, so the result is
+ * bit-identical. Same arguments as conv1d; stride != 1 runs conv1d.
+ */
+void conv1d_mt(std::span<const float> in, std::uint32_t in_ch,
+               std::uint32_t in_len, std::span<const float> weight,
+               std::uint32_t out_ch, std::uint32_t k,
+               std::span<const float> bias, std::uint32_t stride,
+               std::uint32_t dilation, std::uint32_t pad,
+               std::uint32_t groups, std::span<float> out);
+
+/**
+ * conv1d_transpose across the thread pool. Outputs are split by phase
+ * (ox + pad) mod stride, so each phase is a contiguous run fed by every
+ * stride-th tap; each output sums the same terms in the same order as
+ * conv1d_transpose, so the result is bit-identical. Same arguments as
+ * conv1d_transpose; dilation != 1 runs conv1d_transpose.
+ */
+void conv1d_transpose_mt(std::span<const float> in, std::uint32_t in_ch,
+                         std::uint32_t in_len,
+                         std::span<const float> weight,
+                         std::uint32_t out_ch, std::uint32_t k,
+                         std::span<const float> bias,
+                         std::uint32_t stride, std::uint32_t dilation,
+                         std::uint32_t pad, std::uint32_t groups,
+                         std::span<float> out);
+
+/** snake1d across the thread pool; bit-identical to snake1d. */
+void snake1d_mt(std::span<float> x, std::uint32_t ch, std::uint32_t len,
+                std::span<const float> alpha, float eps = 1e-9f);
+
+/**
+ * 2D convolution (F32), the image VQ decoder's workhorse (i#222):
+ * cross-correlation (no kernel flip), grouped and strided, with zero
+ * padding, the same stride and padding on both axes. Channels-major:
+ * `in` is [in_ch][in_h][in_w], `weight` is [out_ch][in_ch/groups][kh]
+ * [kw], `bias` is [out_ch] or empty, `out` is [out_ch][out_h][out_w]
+ * with out_h = conv1d_out_len(in_h, kh, stride, 1, pad) (out_w alike).
+ * The scalar reference for every other variant.
+ *
+ * @param in Input, in_ch * in_h * in_w floats.
+ * @param in_ch Input channels.
+ * @param in_h Input height.
+ * @param in_w Input width.
+ * @param weight Filters, out_ch * (in_ch / groups) * kh * kw floats.
+ * @param out_ch Output channels.
+ * @param kh Kernel height.
+ * @param kw Kernel width.
+ * @param bias Per-output-channel bias (out_ch), or empty for none.
+ * @param stride Output stride (both axes).
+ * @param pad Zero padding on every edge.
+ * @param groups Channel groups.
+ * @param out Output, out_ch * out_h * out_w floats.
+ */
+void conv2d(std::span<const float> in, std::uint32_t in_ch,
+            std::uint32_t in_h, std::uint32_t in_w,
+            std::span<const float> weight, std::uint32_t out_ch,
+            std::uint32_t kh, std::uint32_t kw, std::span<const float> bias,
+            std::uint32_t stride, std::uint32_t pad, std::uint32_t groups,
+            std::span<float> out);
+
+/**
+ * Checks conv2d's argument contract, which conv2d itself only asserts:
+ * groups non-zero and dividing both channel counts, stride non-zero,
+ * and every span the size the layout needs. A device variant calls it
+ * before its device attempt, so a bad shape fails loudly instead of
+ * reaching the scalar fallback (Release has no asserts).
+ *
+ * @throws std::invalid_argument naming the first violated rule.
+ */
+void conv2d_check_args(std::span<const float> in, std::uint32_t in_ch,
+                       std::uint32_t in_h, std::uint32_t in_w,
+                       std::span<const float> weight, std::uint32_t out_ch,
+                       std::uint32_t kh, std::uint32_t kw,
+                       std::span<const float> bias, std::uint32_t stride,
+                       std::uint32_t pad, std::uint32_t groups,
+                       std::span<const float> out);
+
+/**
+ * conv2d across the thread pool, one item per (output channel, output
+ * row), with the inner loop over contiguous output columns (one per
+ * tap) so the compiler vectorizes it. Each output adds the same terms
+ * in the same order as conv2d (bias, then ci, ky, kx), so the result is
+ * bit-identical. Same arguments as conv2d; stride != 1 runs conv2d.
+ */
+void conv2d_mt(std::span<const float> in, std::uint32_t in_ch,
+               std::uint32_t in_h, std::uint32_t in_w,
+               std::span<const float> weight, std::uint32_t out_ch,
+               std::uint32_t kh, std::uint32_t kw,
+               std::span<const float> bias, std::uint32_t stride,
+               std::uint32_t pad, std::uint32_t groups,
+               std::span<float> out);
+
+/**
+ * GroupNorm in place (F32), as torch.nn.GroupNorm: `x` is [ch][plane];
+ * channels are split into `groups` equal groups, each normalised over
+ * all its channels' elements with the biased variance, then scaled per
+ * channel: y = (x - mean) / sqrt(var + eps) * gamma[c] + beta[c]. The
+ * mean and variance are accumulated in double.
+ *
+ * @param x Activations, ch * plane floats, normalised in place.
+ * @param ch Channels (a multiple of groups).
+ * @param plane Elements per channel (H * W for an image).
+ * @param groups Channel groups.
+ * @param gamma Per-channel scale (ch).
+ * @param beta Per-channel shift (ch).
+ * @param eps Added to the variance.
+ */
+void group_norm(std::span<float> x, std::uint32_t ch, std::uint32_t plane,
+                std::uint32_t groups, std::span<const float> gamma,
+                std::span<const float> beta, float eps);
+
+/** SiLU / Swish in place: x = x * sigmoid(x) = x / (1 + exp(-x)). */
+void silu(std::span<float> x);
+
+/**
+ * Nearest-neighbour 2x upsample (torch F.interpolate, scale 2,
+ * "nearest"): out[c][y][x] = in[c][y / 2][x / 2].
+ *
+ * @param in [ch][h][w].
+ * @param out [ch][2h][2w].
+ */
+void upsample_nearest2x(std::span<const float> in, std::uint32_t ch,
+                        std::uint32_t h, std::uint32_t w,
+                        std::span<float> out);
+
 }  // namespace locus::backend

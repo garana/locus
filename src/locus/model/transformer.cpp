@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -11,6 +12,8 @@
 #include "locus/model/arch.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/model/gguf_load.hpp"
+#include "locus/sys/features.hpp"
+#include "locus/sys/meminfo.hpp"
 #include "locus/sys/thread_pool.hpp"
 
 namespace locus::model {
@@ -26,12 +29,21 @@ namespace {
 /**
  * R8 readahead (expert + layer) is on by default: it measured
  * 33% faster cold streaming on GLM-5.2 with bit-identical
- * output, and madvise on resident pages is a no-op for warm
- * models. LOCUS_NO_READAHEAD=1 opts out (A/B benchmarks).
+ * output. The madvise half runs only for models that stream
+ * (weights_stream); the pager's op.prefetch half always does.
+ * LOCUS_NO_READAHEAD=1 opts out of both (A/B benchmarks).
  */
 bool readahead_enabled() {
     return std::getenv("LOCUS_NO_READAHEAD") == nullptr;
 }
+
+}  // namespace
+
+bool weights_stream(std::uint64_t weight_bytes, std::uint64_t ram_bytes) {
+    return ram_bytes == 0 || weight_bytes > ram_bytes / 2;
+}
+
+namespace {
 
 /** Hints a whole matrix for readahead; empty mats are skipped. */
 void advise_mat(const backend::Mat& m) {
@@ -79,9 +91,9 @@ void advise_layer_statics(const TransformerModel::Layer& lay) {
 
 /**
  * How many row-slices to split a `rows`-row matvec across: the
- * thread-pool width, capped by LOCUS_THREADS and by keeping at
- * least kMinRowsPerSlice rows per slice so dispatch overhead never
- * dominates. Returns <= 1 when the work should run inline.
+ * fan-out (mt_fanout), capped by keeping at least kMinRowsPerSlice
+ * rows per slice so dispatch overhead never dominates. Returns <= 1
+ * when the work should run inline.
  */
 std::size_t mt_slices(std::uint32_t rows) {
     constexpr std::uint32_t kMinRowsPerSlice = 64;
@@ -90,13 +102,23 @@ std::size_t mt_slices(std::uint32_t rows) {
 
 }  // namespace
 
+/*
+ * Without LOCUS_THREADS, a heterogeneous CPU defaults to its
+ * performance-core count: work is split evenly, so a share landing on
+ * an efficiency core finishes last and everything waits for it (M4 Max
+ * Orpheus decode: 14 slices 19.7 tok/s, 10 slices 22.0). An explicit
+ * LOCUS_THREADS still reaches the full pool.
+ */
 std::size_t mt_fanout() {
-    std::size_t t = sys::ThreadPool::instance().parallelism();
+    const std::size_t pool = sys::ThreadPool::instance().parallelism();
+    static const unsigned pcores = sys::performance_cores();
+    std::size_t t =
+        pcores > 0 ? std::min<std::size_t>(pool, pcores) : pool;
     if (const char* env = std::getenv("LOCUS_THREADS")) {
         const long v = std::atol(env);
         if (v >= 1) {
             t = std::min<std::size_t>(
-                t, static_cast<std::size_t>(v));
+                pool, static_cast<std::size_t>(v));
         }
     }
     return t;
@@ -263,6 +285,12 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     TransformerModel m;
     m.spec_ = spec;
     m.file_backed_ = g.file_backed();
+    std::uint64_t weight_bytes = 0;
+    for (const TensorInfo& t : g.tensors()) {
+        weight_bytes += t.nbytes;
+    }
+    m.advise_weights_ = readahead_enabled() &&
+                        weights_stream(weight_bytes, sys::total_ram_bytes());
     Hparams& hp = m.hp_;
     const std::string p = std::string(spec->name) + ".";
 
@@ -588,20 +616,33 @@ void TransformerModel::scale_logits(std::span<float> logits) const {
 void TransformerModel::forward(tok::TokenId token,
                          kv::PagedKvCache& cache,
                          kv::PagedKvCache::Seq& seq, Workspace& ws,
-                         std::span<float> logits) const {
+                         std::span<float> logits, LogitRows rows) const {
     using namespace locus::backend;
 
     if (token < 0 ||
         static_cast<std::uint32_t>(token) >= hp_.n_vocab) {
         throw std::invalid_argument("token id out of vocab");
     }
-    if (backend_->name == "vulkan" &&
-        vulkan_forward(*this, token, cache, seq, logits)) {
-        return;
+    if (rows.end == 0) {
+        rows = {0, hp_.n_vocab};
     }
-    // The whole stack is the [0, n_layers) slice. forward_layers holds
-    // the one shared implementation; pipeline stages run sub-ranges.
-    forward_layers(token, {}, 0, hp_.n_layers, cache, seq, ws, logits);
+    if (rows.begin >= rows.end || rows.end > hp_.n_vocab) {
+        throw std::invalid_argument("forward: bad logit row range");
+    }
+    if (!(backend_->name == "vulkan" &&
+          vulkan_forward(*this, token, cache, seq, logits, rows.begin,
+                         rows.end))) {
+        // The whole stack is the [0, n_layers) slice. forward_layers
+        // holds the one shared implementation; pipeline stages run
+        // sub-ranges.
+        forward_layers(token, {}, 0, hp_.n_layers, cache, seq, ws, logits,
+                       rows);
+    }
+    // Rows outside the range are -inf on every path, whether or not the
+    // path skipped them (an arch hook may compute the whole head).
+    const float ninf = -std::numeric_limits<float>::infinity();
+    std::fill(logits.begin(), logits.begin() + rows.begin, ninf);
+    std::fill(logits.begin() + rows.end, logits.begin() + hp_.n_vocab, ninf);
 }
 
 void TransformerModel::forward_layers(tok::TokenId token,
@@ -610,7 +651,8 @@ void TransformerModel::forward_layers(tok::TokenId token,
                                 std::uint32_t layer_end,
                                 kv::PagedKvCache& cache,
                                 kv::PagedKvCache::Seq& seq, Workspace& ws,
-                                std::span<float> out) const {
+                                std::span<float> out,
+                                LogitRows rows) const {
     using namespace locus::backend;
 
     if (layer_begin > layer_end || layer_end > hp_.n_layers) {
@@ -626,7 +668,16 @@ void TransformerModel::forward_layers(tok::TokenId token,
     }
     const bool first = layer_begin == 0;
     const bool last = layer_end == hp_.n_layers;
-    if (first) {
+    // At layer 0 a non-empty hidden_in is the input embedding itself,
+    // used instead of the token's row (Janus image tokens enter through
+    // their own embedding and aligner).
+    const bool embed_in = first && !hidden_in.empty();
+    if (embed_in) {
+        if (hidden_in.size() != hp_.n_embd) {
+            throw std::invalid_argument(
+                "forward_layers: an input embedding must be n_embd");
+        }
+    } else if (first) {
         if (token < 0 ||
             static_cast<std::uint32_t>(token) >= hp_.n_vocab) {
             throw std::invalid_argument("token id out of vocab");
@@ -647,7 +698,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
     if (spec_->forward != nullptr) {
         // The arch's own whole-token forward (residual state spans
         // layers): full model, one stage.
-        if (!first || !last) {
+        if (!first || !last || embed_in) {
             throw std::invalid_argument(
                 "forward_layers: this arch runs the whole model only");
         }
@@ -661,7 +712,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
 
     // Stage input: the first stage embeds the token; a later stage
     // loads the residual stream handed over by the previous stage.
-    if (first) {
+    if (first && !embed_in) {
         op.dequant_row(embd_, static_cast<std::uint32_t>(token),
                        ws.x);
         if (hp_.embd_norm) {
@@ -685,7 +736,9 @@ void TransformerModel::forward_layers(tok::TokenId token,
             // madvise (SSD -> page cache) and, on backends with
             // a weight pager, op.prefetch (host -> device).
             if (l + 1 < layer_end) {
-                advise_layer_statics(layers_[l + 1]);
+                if (advise_weights_) {
+                    advise_layer_statics(layers_[l + 1]);
+                }
                 if (op.prefetch != nullptr) {
                     for_each_static_mat(
                         layers_[l + 1],
@@ -697,7 +750,9 @@ void TransformerModel::forward_layers(tok::TokenId token,
                         });
                 }
             } else if (last) {
-                advise_mat(out_w_);
+                if (advise_weights_) {
+                    advise_mat(out_w_);
+                }
                 if (op.prefetch != nullptr) {
                     op.prefetch(out_w_);
                 }
@@ -738,9 +793,17 @@ void TransformerModel::forward_layers(tok::TokenId token,
 
     if (last) {
         // Final stage: normalize and project to logits, and only now
-        // consume the token (advance the sequence).
+        // consume the token (advance the sequence). ws.xb keeps the
+        // normed hidden state after return: Janus's image head reads it
+        // (image/janus.cpp), so keep it there.
         apply_norm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
-        matvec_mt(op, out_w_, ws.xb, out);
+        if (rows.end == 0 || (rows.begin == 0 && rows.end == hp_.n_vocab)) {
+            matvec_mt(op, out_w_, ws.xb, out);
+        } else {
+            // Only the requested head rows (e.g. speech's audio band).
+            matvec_mt(op, mat_rows(out_w_, rows.begin, rows.end - rows.begin),
+                      ws.xb, out.subspan(rows.begin, rows.end - rows.begin));
+        }
         scale_logits(out);
         seq.n_tokens = pos + 1;
     } else {
@@ -1431,12 +1494,14 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
     // in one by one.
     if (readahead_enabled()) {
         for (const auto& [e, wgt] : picked) {
-            sys::advise_willneed(lay.gate_exps.expert(e).data,
-                                 lay.gate_exps.expert_bytes);
-            sys::advise_willneed(lay.up_exps.expert(e).data,
-                                 lay.up_exps.expert_bytes);
-            sys::advise_willneed(lay.down_exps.expert(e).data,
-                                 lay.down_exps.expert_bytes);
+            if (advise_weights_) {
+                sys::advise_willneed(lay.gate_exps.expert(e).data,
+                                     lay.gate_exps.expert_bytes);
+                sys::advise_willneed(lay.up_exps.expert(e).data,
+                                     lay.up_exps.expert_bytes);
+                sys::advise_willneed(lay.down_exps.expert(e).data,
+                                     lay.down_exps.expert_bytes);
+            }
             // Pager tier: expert(e) yields the same .data the
             // matmuls below pass to matvec -- the page key.
             if (op.prefetch != nullptr) {
@@ -1556,9 +1621,11 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
             const Mat g = lay.gate_exps.expert(u.e);
             const Mat up = lay.up_exps.expert(u.e);
             const Mat d = lay.down_exps.expert(u.e);
-            sys::advise_willneed(g.data, lay.gate_exps.expert_bytes);
-            sys::advise_willneed(up.data, lay.up_exps.expert_bytes);
-            sys::advise_willneed(d.data, lay.down_exps.expert_bytes);
+            if (advise_weights_) {
+                sys::advise_willneed(g.data, lay.gate_exps.expert_bytes);
+                sys::advise_willneed(up.data, lay.up_exps.expert_bytes);
+                sys::advise_willneed(d.data, lay.down_exps.expert_bytes);
+            }
             if (op.prefetch != nullptr) {
                 op.prefetch(g);
                 op.prefetch(up);

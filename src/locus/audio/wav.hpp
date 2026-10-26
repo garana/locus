@@ -29,4 +29,14 @@ std::vector<std::byte> encode_pcm(std::span<const float> samples,
                                   std::uint32_t sample_rate,
                                   WaveFormat format);
 
+/**
+ * The 44-byte WAV header for a stream whose length is not known yet:
+ * the RIFF and data sizes are 0xFFFFFFFF, which players read as "until
+ * the end of the stream". kPcm16 chunks of encode_pcm follow it.
+ *
+ * @param sample_rate Samples per second.
+ * @returns The header bytes.
+ */
+std::vector<std::byte> wav_stream_header(std::uint32_t sample_rate);
+
 }  // namespace locus::audio

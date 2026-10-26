@@ -282,8 +282,11 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
     std::vector<std::uint32_t> route = {ids[0], ids[1], ids[2],
                                         fbits(wts[0]), fbits(wts[1]),
                                         fbits(wts[2])};
+    // x_off 1 puts every slot's activations (x_off + k * cols) off
+    // 16-byte alignment: the kernels' scalar-load fallback.
+    for (const std::uint32_t x_off : {0u, 1u})
     for (const auto& c : cases) {
-        INFO("type " << static_cast<int>(c.type));
+        INFO("type " << static_cast<int>(c.type) << " x_off " << x_off);
         const std::size_t mat_bytes = rows * (cols / 256) * c.block_bytes;
         std::vector<std::byte> w(mat_bytes * n_mat);
         for (auto& b : w) {
@@ -308,7 +311,9 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
         };
         w.resize((w.size() + 3) & ~std::size_t{3});
         auto wb = upload(ctx, w);
-        auto xb = upload(ctx, x);
+        std::vector<float> xs(x_off, 0.0f);
+        xs.insert(xs.end(), x.begin(), x.end());
+        auto xb = upload(ctx, xs);
         auto rb = upload(ctx, route);
         auto run = [&](std::uint32_t mode, std::size_t out_n,
                        std::vector<float> init) {
@@ -316,7 +321,7 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
             ctx.begin_batch();
             const VulkanContext::Buffer bufs[] = {wb, xb, ob, rb};
             const std::uint32_t push[] = {
-                rows, cols, 0, mode & 2u ? 1u : 0u, 0, 0, fbits(1.0f),
+                rows, cols, 0, mode & 2u ? 1u : 0u, 0, x_off, fbits(1.0f),
                 static_cast<std::uint32_t>(mat_bytes), cols, rows, slots,
                 mode, 0u};
             ctx.dispatch(c.kernel, bufs, push,
@@ -331,7 +336,8 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
         // The type in the name: plain SECTIONs in a loop are tracked
         // by name, so they would run on the first type only.
         DYNAMIC_SECTION("split slots, matrix = routed id, type "
-                        << static_cast<int>(c.type)) {
+                        << static_cast<int>(c.type) << " x_off "
+                        << x_off) {
             auto got = run(1, rows * slots,
                            std::vector<float>(rows * slots, 0.0f));
             for (std::uint32_t k = 0; k < slots; ++k) {
@@ -343,7 +349,8 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
             }
         }
         DYNAMIC_SECTION("weighted sum of routed slots accumulates, type "
-                        << static_cast<int>(c.type)) {
+                        << static_cast<int>(c.type) << " x_off "
+                        << x_off) {
             std::vector<float> init(rows);
             for (auto& v : init) {
                 v = dist(rng);
@@ -510,5 +517,109 @@ TEST_CASE("vulkan fused SwiGLU q8_0 matvec matches the CPU reference",
     }
     for (auto b : {gb, ub, xb, rb}) {
         ctx.destroy_buffer(b);
+    }
+}
+
+TEST_CASE("vulkan fused SwiGLU q4_k experts match the CPU reference",
+          "[vulkan]") {
+    // matvec_q4_k_glu_b: routed gate and up rows over stacked Q4_K
+    // experts, written as silu(gate) * up -- what the gate, up and
+    // silu_mul dispatches compute separately.
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(41);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    const std::uint32_t rows = 21, cols = 512, n_mat = 5, slots = 3;
+    const std::size_t mat_bytes = rows * (cols / 256) * 144;
+    auto quant = [&] {
+        std::vector<std::byte> w(mat_bytes * n_mat);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t at = 0; at < w.size(); at += 144) {
+            const std::uint16_t d = locus::backend::f32_to_f16(0.01f);
+            const std::uint16_t dmin = locus::backend::f32_to_f16(0.005f);
+            std::memcpy(&w[at], &d, 2);
+            std::memcpy(&w[at + 2], &dmin, 2);
+        }
+        return w;
+    };
+    const auto wg = quant(), wu = quant();
+    std::vector<float> x(cols * slots);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    const std::uint32_t ids[] = {3, 0, 1};
+    std::vector<std::uint32_t> route = {ids[0], ids[1], ids[2],
+                                        fbits(1.0f), fbits(1.0f),
+                                        fbits(1.0f)};
+    auto cpu_row = [&](const std::vector<std::byte>& w, std::uint32_t id,
+                       std::uint32_t k) {
+        locus::backend::Mat m{locus::gguf::TensorType::kQ4_K,
+                              w.data() + id * mat_bytes, rows, cols};
+        std::vector<float> out(rows);
+        locus::backend::matvec(
+            m, std::span<const float>(x).subspan(k * cols, cols), out);
+        return out;
+    };
+    for (const std::uint32_t x_off : {0u, 1u}) {
+        INFO("x_off " << x_off);
+        std::vector<float> xs(x_off, 0.0f);
+        xs.insert(xs.end(), x.begin(), x.end());
+        auto gb = upload(ctx, wg);
+        auto ub = upload(ctx, wu);
+        auto xb = upload(ctx, xs);
+        auto rb = upload(ctx, route);
+        auto ob = upload(ctx, std::vector<float>(rows * slots, 0.0f));
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {gb, xb, ob, rb, ub};
+        const std::uint32_t push[] = {
+            rows, cols, 0, 0, 0, x_off, fbits(1.0f),
+            static_cast<std::uint32_t>(mat_bytes), cols, rows, slots, 1u,
+            0u};
+        ctx.dispatch(Kernel::kMatvecQ4_KGluB, bufs, push,
+                     VulkanContext::matvec_groups(Kernel::kMatvecQ4_KGluB,
+                                                  rows),
+                     slots);
+        ctx.end_batch();
+        const auto got = download<float>(ctx, ob, rows * slots);
+        // The unfused GPU chain (q4_k_b gate, q4_k_b up, silu_mul) must
+        // give the same bits: the fused kernel is a separate SPIR-V
+        // module, so a driver could contract a*b+c differently in it.
+        auto og = upload(ctx, std::vector<float>(rows * slots, 0.0f));
+        auto ou = upload(ctx, std::vector<float>(rows * slots, 0.0f));
+        ctx.begin_batch();
+        for (const auto& [w, o] : {std::pair{gb, og}, std::pair{ub, ou}}) {
+            const VulkanContext::Buffer mb[] = {w, xb, o, rb};
+            ctx.dispatch(Kernel::kMatvecQ4_KB, mb, push,
+                         VulkanContext::matvec_groups(Kernel::kMatvecQ4_KB,
+                                                      rows),
+                         slots);
+        }
+        const VulkanContext::Buffer sb[] = {og, ou, og};
+        const std::uint32_t spush[] = {rows * slots};
+        ctx.dispatch(Kernel::kSiluMul, sb, spush,
+                     (rows * slots + 63) / 64);
+        ctx.end_batch();
+        const auto unfused = download<float>(ctx, og, rows * slots);
+        REQUIRE(std::memcmp(got.data(), unfused.data(),
+                            got.size() * sizeof(float)) == 0);
+        ctx.destroy_buffer(og);
+        ctx.destroy_buffer(ou);
+        for (std::uint32_t k = 0; k < slots; ++k) {
+            const auto g = cpu_row(wg, ids[k], k);
+            const auto u = cpu_row(wu, ids[k], k);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                const float want = g[r] / (1.0f + std::exp(-g[r])) * u[r];
+                REQUIRE(got[k * rows + r] ==
+                        Catch::Approx(want).epsilon(1e-4).margin(1e-3));
+            }
+        }
+        for (auto b : {gb, ub, xb, rb, ob}) {
+            ctx.destroy_buffer(b);
+        }
     }
 }

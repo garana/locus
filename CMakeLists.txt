@@ -38,6 +38,9 @@ add_library(locus
     src/locus/model/codec.cpp
     src/locus/model/deepseek41.cpp
     src/locus/audio/snac.cpp
+    src/locus/image/vq16.cpp
+    src/locus/image/janus.cpp
+    src/locus/image/png.cpp
     src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp
     src/locus/model/transformer.cpp
@@ -54,6 +57,7 @@ add_library(locus
     src/locus/server/engine_loop.cpp
     src/locus/server/server.cpp
     src/locus/server/tools.cpp
+    src/locus/http/base64.cpp
     src/locus/http/http.cpp
     src/locus/http/server.cpp
     src/locus/sys/mmap_file.cpp
@@ -141,7 +145,7 @@ if(Vulkan_FOUND)
             matvec_t matvec_q4_k matvec_q5_k matvec_q6_k matvec_q2_k
             matvec_iq2_xxs matvec_iq3_xxs matvec_iq4_xs
             rmsnorm rope silu_mul
-            conv1d conv1d_transpose snake1d
+            conv1d conv1d_transpose snake1d conv2d
             attn_paged_q kv_store_q moe_route
             kv_scatter moe_group moe_combine attn_softmax sum_splits
             matvec_t_q8 attn_decode attn_combine attn_decode_grp matvec_q8_0_n
@@ -182,6 +186,8 @@ if(Vulkan_FOUND)
             matmul_paged_t_f16_small=matmul:TYPE_F32,PAGED_T,KV_F16,BK16
             attn_decode_f16=attn_decode:KV_F16
             attn_decode_grp_f16=attn_decode_grp:KV_F16
+            attn_decode_grp8=attn_decode_grp:HG8
+            attn_decode_grp8_f16=attn_decode_grp:HG8,KV_F16
             kv_scatter_f16=kv_scatter:KV_F16
             rmsnorm_b=rmsnorm:BATCHED
             rope_b=rope:BATCHED
@@ -189,6 +195,7 @@ if(Vulkan_FOUND)
             rope_neox_b=rope:BATCHED,NEOX
             matvec_q4_k_b=matvec_q4_k:BATCHED
             matvec_q6_k_b=matvec_q6_k:BATCHED
+            matvec_q4_k_glu_b=matvec_q4_k:BATCHED,SWIGLU
             matmul_q4_k=matmul:TYPE_Q4K
             matmul_q6_k=matmul:TYPE_Q6K
             matmul_q4_k_id=matmul:TYPE_Q4K,MOE_ID
