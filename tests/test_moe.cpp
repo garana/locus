@@ -896,7 +896,8 @@ TEST_CASE("the full GPU forward declines dbrx's fused qkv and LayerNorm",
         ModelBuilder mb;
         mb.common();
         experts(mb);
-        auto g = locus::gguf::GgufFile::parse(mb.build(kNe, 2));
+        auto img = mb.build(kNe, 2);  // parse() keeps a view of it
+        auto g = locus::gguf::GgufFile::parse(img);
         auto model = TransformerModel::load(g);
         REQUIRE(locus::backend::vulkan_forward_supported(model));
         // Shared-loop arches keep the f32 activation default (#189).
@@ -917,7 +918,8 @@ TEST_CASE("the full GPU forward declines dbrx's fused qkv and LayerNorm",
     mb.tensor("blk.0.attn_output_norm.weight", {kE},
               std::vector<float>(kE, 1.0f));
     experts(mb);
-    auto g = locus::gguf::GgufFile::parse(mb.build(kNe, 2, "dbrx"));
+    auto img = mb.build(kNe, 2, "dbrx");  // parse() keeps a view of it
+    auto g = locus::gguf::GgufFile::parse(img);
     auto model = TransformerModel::load(g);
     const auto& hp = model.hparams();
     REQUIRE(hp.norm_type == locus::model::NormType::kLayerNorm);
@@ -962,7 +964,8 @@ TEST_CASE("dbrx CPU decode runs and is finite (synthetic; inline)",
     mb.tensor("blk.0.attn_output_norm.weight", {kE},
               std::vector<float>(kE, 1.0f));
     experts(mb);
-    auto g = locus::gguf::GgufFile::parse(mb.build(kNe, 2, "dbrx"));
+    auto img = mb.build(kNe, 2, "dbrx");  // parse() keeps a view of it
+    auto g = locus::gguf::GgufFile::parse(img);
     auto model = TransformerModel::load(g);
     model.use_backend(*locus::backend::find_backend("scalar"));
     auto run = [&](const char* threads) {
