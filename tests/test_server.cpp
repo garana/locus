@@ -18,6 +18,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
+#include "locus/http/base64.hpp"
 #include "locus/model/grammar.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/pipeline/net.hpp"
@@ -1396,6 +1397,36 @@ std::vector<std::byte> unbase64(const std::string& s) {
 
 }  // namespace
 
+// i#243: a JSON parse error quotes the bad input in what(); when that
+// input is not valid UTF-8, the strict dump() of the error body threw
+// inside the handler's catch, and the escaped exception terminated
+// locus-server. Now the error body is lossy (U+FFFD) and the server
+// keeps serving.
+TEST_CASE("a body that is not UTF-8 gets a 400 and the server lives",
+          "[server]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    TestServer ts(model, tok);
+    httplib::Client client("127.0.0.1", ts.port);
+    for (const char* path : {"/v1/completions", "/v1/chat/completions",
+                             "/v1/messages", "/v1/embeddings"}) {
+        INFO(path);
+        auto res = client.Post(path, std::string("\xff\xfe{", 3),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 400);
+        // The body is valid JSON with the bad bytes replaced.
+        REQUIRE(json::parse(res->body).contains("error"));
+    }
+    auto health = client.Get("/health");
+    REQUIRE(health);
+    REQUIRE(health->status == 200);
+}
+
 TEST_CASE("images 503 unless a decoder and a Janus model are loaded",
           "[server][image]") {
     if (!std::filesystem::exists(model_path())) {
@@ -1523,4 +1554,168 @@ TEST_CASE("images endpoint returns the reference image end to end",
                 << worst);
     REQUIRE(worst <= 1);
     REQUIRE(differ * 1000 <= want.rgb.size());
+}
+
+namespace {
+
+/** The vision test image (tests/golden/janus_apple.png) as base64. */
+std::string golden_png_b64() {
+    std::ifstream f(std::string(LOCUS_SOURCE_DIR) +
+                        "/tests/golden/janus_apple.png",
+                    std::ios::binary);
+    REQUIRE(f.good());
+    const std::string raw((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+    return locus::http::base64_encode(std::as_bytes(std::span(raw)));
+}
+
+/** An OpenAI chat body: one user turn with an image then text. */
+json openai_image_chat(const std::string& url, const std::string& text) {
+    return json{{"messages",
+                 json::array({{{"role", "user"},
+                               {"content",
+                                json::array({{{"type", "image_url"},
+                                              {"image_url", {{"url", url}}}},
+                                             {{"type", "text"},
+                                              {"text", text}}})}}})},
+                {"max_tokens", 24},
+                {"temperature", 0}};
+}
+
+/** The same turn in the Anthropic /v1/messages shape. */
+json anthropic_image_chat(const std::string& b64, const std::string& text) {
+    return json{{"messages",
+                 json::array(
+                     {{{"role", "user"},
+                       {"content",
+                        json::array({{{"type", "image"},
+                                      {"source",
+                                       {{"type", "base64"},
+                                        {"media_type", "image/png"},
+                                        {"data", b64}}}},
+                                     {{"type", "text"}, {"text", text}}})}}})},
+                {"max_tokens", 24},
+                {"temperature", 0}};
+}
+
+}  // namespace
+
+// i#241: a text-only model refuses image input with a clear 400 on
+// both chat APIs (it never silently drops the image, as it once did).
+TEST_CASE("image input on a text-only model is a 400", "[server][image]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::server::OpenAiServer::Options o;
+    o.model_path = model_path();
+    TestServer ts(model, tok, o);
+    httplib::Client client("127.0.0.1", ts.port);
+    const std::string url = "data:image/png;base64," + golden_png_b64();
+    auto a = client.Post("/v1/chat/completions",
+                         openai_image_chat(url, "What is this?").dump(),
+                         "application/json");
+    REQUIRE(a);
+    REQUIRE(a->status == 400);
+    REQUIRE(a->body.find("does not accept image input") != std::string::npos);
+    auto b = client.Post(
+        "/v1/messages",
+        anthropic_image_chat(golden_png_b64(), "What is this?").dump(),
+        "application/json");
+    REQUIRE(b);
+    REQUIRE(b->status == 400);
+    REQUIRE(json::parse(b->body)["type"] == "error");
+}
+
+// i#241 end to end on Janus-Pro: the reference image and the golden
+// question through both chat APIs, greedy, give the reference's answer
+// (scripts/make-janus-goldens.py vision) from its 630-id prompt.
+// Malformed image requests are refused first, before any generation.
+TEST_CASE("chat with an image answers like the reference",
+          "[server][image][vision][e2e]") {
+    if (!std::filesystem::exists(janus_path())) {
+        SKIP("janus-pro-1b-bf16.gguf absent");
+    }
+    auto g = locus::gguf::GgufFile::open(janus_path());
+    if (g.find_tensor("vit.patch_embd.weight") == nullptr) {
+        SKIP("janus-pro-1b-bf16.gguf has no vit.* (old conversion)");
+    }
+    auto model = locus::model::TransformerModel::load(g);
+    const auto* neon = locus::backend::find_backend("neon");
+    if (neon != nullptr && neon->available) model.use_backend(*neon);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+    locus::server::OpenAiServer::Options o;
+    o.model_path = janus_path();
+    locus::server::OpenAiServer server(model, *tok, o);
+    const int port = server.bind_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { server.listen_after_bind(); });
+    struct Join {
+        locus::server::OpenAiServer& s;
+        std::thread& t;
+        ~Join() {
+            s.stop();
+            t.join();
+        }
+    } join{server, th};
+    httplib::Client c("127.0.0.1", port);
+    c.set_read_timeout(1800, 0);
+    const std::string q = "What is on the table?";
+    const std::string b64 = golden_png_b64();
+    const std::string url = "data:image/png;base64," + b64;
+
+    // Refused before generation.
+    const std::string not_png = "\x89PNG\r\n\x1a\n not a png";
+    const std::string bad_png =
+        locus::http::base64_encode(std::as_bytes(std::span(not_png)));
+    json in_assistant = openai_image_chat(url, q);
+    in_assistant["messages"][0]["role"] = "assistant";
+    in_assistant["messages"].push_back({{"role", "user"}, {"content", "hi"}});
+    json streamed = openai_image_chat(url, q);
+    streamed["stream"] = true;
+    for (const json& bad :
+         {openai_image_chat("https://example.com/a.png", q),
+          openai_image_chat("data:image/png;base64,!!!!", q),
+          openai_image_chat("data:image/png;base64," + bad_png, q),
+          openai_image_chat(url, "<image_placeholder> twice"), streamed,
+          in_assistant}) {
+        INFO(bad.dump().substr(0, 160));
+        auto r = c.Post("/v1/chat/completions", bad.dump(),
+                        "application/json");
+        REQUIRE_RES(r);
+        REQUIRE(r->status == 400);
+    }
+    // The Anthropic top-level system text is checked too (it was a 500).
+    json sys = anthropic_image_chat(b64, q);
+    sys["system"] = "see <image_placeholder>";
+    auto rs = c.Post("/v1/messages", sys.dump(), "application/json");
+    REQUIRE_RES(rs);
+    REQUIRE(rs->status == 400);
+
+    if (std::getenv("LOCUS_HEAVY_TESTS") == nullptr) {
+        SKIP("a 630-token image prompt takes over a minute on a CPU; set "
+             "LOCUS_HEAVY_TESTS=1");
+    }
+    const std::string want = "There is an apple on the table.";
+    auto r = c.Post("/v1/chat/completions", openai_image_chat(url, q).dump(),
+                    "application/json");
+    REQUIRE_RES(r);
+    INFO(r->body.substr(0, 300));
+    REQUIRE(r->status == 200);
+    const json a = json::parse(r->body);
+    REQUIRE(a["choices"][0]["message"]["content"] == want);
+    REQUIRE(a["choices"][0]["finish_reason"] == "stop");
+    REQUIRE(a["usage"]["prompt_tokens"] == 630);
+
+    auto m = c.Post("/v1/messages", anthropic_image_chat(b64, q).dump(),
+                    "application/json");
+    REQUIRE_RES(m);
+    INFO(m->body.substr(0, 300));
+    REQUIRE(m->status == 200);
+    const json b = json::parse(m->body);
+    REQUIRE(b["content"][0]["text"] == want);
+    REQUIRE(b["stop_reason"] == "end_turn");
+    REQUIRE(b["usage"]["input_tokens"] == 630);
 }

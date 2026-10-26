@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <tuple>
@@ -18,12 +19,16 @@
 #include "locus/auth/helper_spawn.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/http/base64.hpp"
+#include "locus/image/image_input.hpp"
 #include "locus/image/janus.hpp"
+#include "locus/image/janus_chat.hpp"
+#include "locus/image/janus_vision.hpp"
 #include "locus/image/png.hpp"
 #include "locus/image/vq16.hpp"
 #include "locus/model/codec.hpp"
 #include "locus/model/grammar.hpp"
 #include "locus/model/sampling.hpp"
+#include "locus/server/errors.hpp"
 #include "locus/server/tools.hpp"
 #include "locus/sys/perf_counters.hpp"
 
@@ -33,9 +38,26 @@ namespace {
 
 using nlohmann::json;
 
+/** dump()'s error handler for every response body: invalid UTF-8 (a
+ * parse error quoting the request, text cut mid-character) becomes
+ * U+FFFD instead of throwing type_error.316 out of a handler (i#243). */
+constexpr auto kLossy = json::error_handler_t::replace;
+
 json make_error(const std::string& message) {
     return json{{"error", {{"message", message},
                            {"type", "invalid_request_error"}}}};
+}
+
+/** Fills res for an exception a handler caught: 400 with
+ * invalid_request_error for a client error, else 500 with server_error
+ * (see http_status_for). */
+void set_error(http::ServerResponse& res, const std::exception& e) {
+    res.status = http_status_for(e);
+    const char* type =
+        res.status == 400 ? "invalid_request_error" : "server_error";
+    res.set_content(json{{"error", {{"message", e.what()}, {"type", type}}}}
+                        .dump(-1, ' ', false, kLossy),
+                    "application/json");
 }
 
 /** Parses and validates the OpenAI messages array. */
@@ -199,6 +221,180 @@ class JsonTokenConstraint : public model::TokenConstraint {
 
 }  // namespace
 
+/** A chat request with images (i#241), parsed for vision_chat. */
+struct VisionChat {
+    bool has_system = false;  ///< the request set a system prompt
+    std::string system;
+    std::vector<image::ChatTurn> turns;
+    std::vector<std::vector<std::byte>> images;  ///< encoded, in order
+    std::uint32_t max_tokens = 16;
+    model::SamplingParams sampling;
+    std::uint64_t seed = 0;
+};
+
+namespace {
+
+/** The bytes of an OpenAI image_url: a base64 data: URL only. */
+std::vector<std::byte> data_url_bytes(const json& image_url,
+                                      std::size_t max_bytes) {
+    const json& u = image_url.is_object() ? image_url.value("url", json())
+                                          : image_url;
+    if (!u.is_string()) {
+        throw std::invalid_argument("image_url.url must be a string");
+    }
+    const std::string url = u.get<std::string>();
+    if (url.rfind("data:", 0) != 0) {
+        throw std::invalid_argument(
+            "image_url must be a data: URL (locus does not fetch URLs)");
+    }
+    const std::size_t comma = url.find(',');
+    if (comma == std::string::npos || comma < 12 ||
+        url.compare(comma - 7, 7, ";base64") != 0) {
+        throw std::invalid_argument("image_url data: URL must be base64");
+    }
+    return http::base64_decode(std::string_view(url).substr(comma + 1),
+                               max_bytes);
+}
+
+/** @returns Whether a message's content holds an image part. */
+bool has_image_part(const json& content, bool anthropic) {
+    if (!content.is_array()) return false;
+    for (const auto& p : content) {
+        const std::string type = p.value("type", "");
+        if (type == (anthropic ? "image" : "image_url")) return true;
+    }
+    return false;
+}
+
+/**
+ * One turn's text from its content: text parts as they are, each image
+ * as the placeholder, joined by "\n" (the reference's
+ * "<image_placeholder>\n<question>" form); image bytes are appended to
+ * `images`. A text part may not contain the placeholder itself.
+ */
+std::string vision_turn_text(const json& content, bool anthropic,
+                             bool allow_images, std::size_t max_bytes,
+                             std::vector<std::vector<std::byte>>& images) {
+    const auto checked = [](std::string t) {
+        if (t.find(image::kImagePlaceholder) != std::string::npos) {
+            throw std::invalid_argument(
+                "message text may not contain <image_placeholder>");
+        }
+        return t;
+    };
+    if (content.is_string()) return checked(content.get<std::string>());
+    if (!content.is_array()) {
+        throw std::invalid_argument(
+            "content must be a string or an array of parts");
+    }
+    std::string out;
+    for (const auto& p : content) {
+        const std::string type = p.value("type", "");
+        std::string piece;
+        if (type == "text") {
+            piece = checked(p.at("text").get<std::string>());
+        } else if (type == (anthropic ? "image" : "image_url")) {
+            if (!allow_images) {
+                throw std::invalid_argument(
+                    "images are only accepted in user messages");
+            }
+            if (anthropic) {
+                const json& src = p.at("source");
+                if (src.value("type", "") != "base64") {
+                    throw std::invalid_argument(
+                        "image source must be base64 (locus does not "
+                        "fetch URLs)");
+                }
+                images.push_back(http::base64_decode(
+                    src.at("data").get<std::string>(), max_bytes));
+            } else {
+                images.push_back(
+                    data_url_bytes(p.at("image_url"), max_bytes));
+            }
+            piece = std::string(image::kImagePlaceholder);
+        } else {
+            throw std::invalid_argument("unsupported content part: " +
+                                        type);
+        }
+        if (!out.empty()) out += "\n";
+        out += piece;
+    }
+    return out;
+}
+
+/**
+ * Parses a chat (OpenAI messages[]) or messages (Anthropic, with a
+ * top-level system) body that carries images.
+ *
+ * @returns nullopt when no message has an image part, so the request
+ *     takes the text path unchanged.
+ */
+std::optional<VisionChat> parse_vision_chat(const json& body,
+                                            bool anthropic,
+                                            std::uint32_t max_tokens_cap,
+                                            std::size_t max_bytes) {
+    const json& msgs = body.at("messages");
+    bool any = false;
+    for (const auto& m : msgs) {
+        if (m.contains("content") && has_image_part(m["content"], anthropic)) {
+            any = true;
+        }
+    }
+    if (!any) return std::nullopt;
+
+    VisionChat vc;
+    if (anthropic && body.contains("system") && !body["system"].is_null()) {
+        vc.system = anthropic_text(body["system"]);
+        vc.has_system = true;
+        // Like every turn's text: a typed placeholder would add an
+        // image slot with no image.
+        if (vc.system.find(image::kImagePlaceholder) != std::string::npos) {
+            throw std::invalid_argument(
+                "system text may not contain <image_placeholder>");
+        }
+    }
+    for (const auto& m : msgs) {
+        const std::string role = m.value("role", "user");
+        if (!m.contains("content")) {
+            throw std::invalid_argument("message must have content");
+        }
+        if (role == "system" && !anthropic) {
+            if (!vc.system.empty()) vc.system += "\n";
+            vc.system += vision_turn_text(m["content"], false, false,
+                                          max_bytes, vc.images);
+            vc.has_system = true;
+        } else if (role == "user" || role == "assistant") {
+            vc.turns.push_back(
+                {role, vision_turn_text(m["content"], anthropic,
+                                        role == "user", max_bytes,
+                                        vc.images)});
+        } else {
+            throw std::invalid_argument("unsupported message role: " + role);
+        }
+    }
+    if (body.value("stream", false)) {
+        throw std::invalid_argument(
+            "stream is not supported with image input yet");
+    }
+    if (body.contains("tools") || wants_json(body)) {
+        throw std::invalid_argument(
+            "tools and JSON mode are not supported with image input yet");
+    }
+    if (body.contains("max_tokens")) {
+        const auto& v = body["max_tokens"];
+        if (!v.is_number_unsigned() || v.get<std::uint64_t>() == 0) {
+            throw std::invalid_argument(
+                "max_tokens must be a positive integer");
+        }
+        vc.max_tokens = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(v.get<std::uint64_t>(), max_tokens_cap));
+    }
+    std::tie(vc.sampling, vc.seed) = parse_sampling(body);
+    return vc;
+}
+
+}  // namespace
+
 engine::Engine::Config OpenAiServer::resolve_engine_cfg(
     const Options& o) {
     engine::Engine::Config cfg = o.engine;
@@ -271,6 +467,18 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             }
         }
     }
+    // Image input (i#241): on when the model's GGUF carries the Janus
+    // vision tower. A tower that is present but broken stops the
+    // server here, like the image heads above.
+    if (!opt_.model_path.empty()) {
+        auto vg = std::make_unique<gguf::GgufFile>(
+            gguf::GgufFile::open(opt_.model_path));
+        if (vg->find_tensor("vit.patch_embd.weight") != nullptr) {
+            vision_ = std::make_unique<image::JanusVision>(
+                image::JanusVision::load(*vg, m.hparams().n_embd));
+            vision_gguf_ = std::move(vg);
+        }
+    }
     install_routes();
 }
 
@@ -299,7 +507,7 @@ bool OpenAiServer::authorize(const http::Request& req,
             json{{"error",
                   {{"type", "authentication_error"},
                    {"message", "invalid or missing credential"}}}}
-                .dump(),
+                .dump(-1, ' ', false, kLossy),
             "application/json");
         return false;
     }
@@ -349,6 +557,173 @@ std::vector<float> OpenAiServer::embed_text(const std::string& text) {
         }
     }
     return emb;
+}
+
+void OpenAiServer::vision_chat(bool anthropic, const VisionChat& chat,
+                               http::ServerResponse& res,
+                               const http::RequestContext& ctx) {
+    // Each API's own error envelope.
+    const auto fail = [&](int status, const std::string& msg) {
+        res.status = status;
+        const char* type = status == 400
+                               ? "invalid_request_error"
+                               : (anthropic ? "api_error" : "server_error");
+        const json body =
+            anthropic ? json{{"type", "error"},
+                             {"error", {{"type", type}, {"message", msg}}}}
+                      : json{{"error", {{"message", msg}, {"type", type}}}};
+        res.set_content(body.dump(-1, ' ', false, kLossy),
+                        "application/json");
+    };
+    if (!vision_) {
+        fail(400, "this model does not accept image input");
+        return;
+    }
+    const auto alive = [&] { return !ctx.client_alive || ctx.client_alive(); };
+    try {
+        const auto& op = model_.active_backend().ops;
+        const auto& hp = model_.hparams();
+        std::lock_guard<std::mutex> lk(vision_mu_);
+
+        // Each image: decode, the reference preprocessing (the long side
+        // to image_size, at least min_size 14, padded with gray 127, as
+        // in the Janus preprocessor_config.json), then tower + aligner.
+        image::DecodeLimits lim;
+        lim.max_bytes = opt_.max_body_bytes;
+        std::vector<std::vector<float>> embs;
+        for (const auto& bytes : chat.images) {
+            const auto sq = image::fit_square(image::decode_image(bytes, lim),
+                                              vision_->image_size(), 14,
+                                              {127, 127, 127});
+            embs.push_back(vision_->align(
+                vision_->features(vision_->to_pixels(sq.rgb), op), op));
+        }
+        const std::string text = image::janus_chat_text(
+            chat.turns,
+            chat.has_system ? std::string_view(chat.system)
+                            : image::kJanusSystemPrompt,
+            tok_.piece(tok_.eos_id()));
+        std::size_t n_images = 0;
+        const auto ids = image::janus_chat_ids(tok_, text, *vision_, n_images);
+        if (n_images != embs.size()) {
+            throw std::runtime_error("vision chat: image count mismatch");
+        }
+
+        if (!vision_cache_) {
+            vision_cache_ =
+                std::make_unique<kv::PagedKvCache>(model_.make_cache());
+            vision_ws_ = model_.make_workspace();
+        }
+        kv::PagedKvCache::Seq seq;
+        struct Release {
+            kv::PagedKvCache& c;
+            kv::PagedKvCache::Seq& s;
+            ~Release() { c.release(s); }
+        } release{*vision_cache_, seq};
+        const auto need =
+            static_cast<std::uint32_t>(ids.size() + chat.max_tokens);
+        if (!vision_cache_->ensure_capacity(seq, need)) {
+            throw std::invalid_argument(
+                "the prompt (" + std::to_string(ids.size()) +
+                " tokens with the images) plus max_tokens does not fit the "
+                "context");
+        }
+        requests_total_.fetch_add(1, std::memory_order_relaxed);
+        prompt_tokens_total_.fetch_add(ids.size(), std::memory_order_relaxed);
+
+        // Prefill. The image's embeddings take its placeholder slots in
+        // order; only the last position computes the whole head (the
+        // others need no logits, so one row keeps the head cheap).
+        std::vector<float> logits(n_vocab_);
+        std::size_t img = 0, row = 0;
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (!alive()) {
+                res.status = 499;
+                return;
+            }
+            const model::LogitRows rows = i + 1 == ids.size()
+                                              ? model::LogitRows{}
+                                              : model::LogitRows{0, 1};
+            if (ids[i] == vision_->placeholder()) {
+                const auto emb = std::span<const float>(embs[img]).subspan(
+                    row * hp.n_embd, hp.n_embd);
+                model_.forward_layers(0, emb, 0, hp.n_layers, *vision_cache_,
+                                      seq, vision_ws_, logits, rows);
+                if (++row == vision_->tokens()) {
+                    row = 0;
+                    ++img;
+                }
+            } else {
+                model_.forward_layers(ids[i], {}, 0, hp.n_layers,
+                                      *vision_cache_, seq, vision_ws_, logits,
+                                      rows);
+            }
+        }
+
+        // Decode to eos or max_tokens.
+        std::mt19937_64 rng(chat.seed != 0 ? chat.seed
+                                           : std::random_device{}());
+        std::vector<tok::TokenId> history(ids.begin(), ids.end());
+        std::vector<tok::TokenId> out;
+        bool hit_eos = false;
+        for (std::uint32_t n = 0; n < chat.max_tokens; ++n) {
+            if (!alive()) {
+                res.status = 499;
+                return;
+            }
+            const tok::TokenId t =
+                model::sample(logits, chat.sampling, history, rng);
+            if (t == tok_.eos_id()) {
+                hit_eos = true;
+                break;
+            }
+            out.push_back(t);
+            history.push_back(t);
+            if (n + 1 == chat.max_tokens) break;
+            model_.forward_layers(t, {}, 0, hp.n_layers, *vision_cache_, seq,
+                                  vision_ws_, logits);
+        }
+        const auto n_prompt = static_cast<std::uint32_t>(ids.size());
+        const auto n_out = static_cast<std::uint32_t>(out.size() + hit_eos);
+        completion_tokens_total_.fetch_add(n_out, std::memory_order_relaxed);
+        const std::string reply = tok_.decode(out);
+        const std::string rid =
+            std::to_string(requests_total_.load(std::memory_order_relaxed));
+        json body;
+        if (anthropic) {
+            body = {{"id", "msg_locus-vision-" + rid},
+                    {"type", "message"},
+                    {"role", "assistant"},
+                    {"model", opt_.model_name},
+                    {"content", json::array({{{"type", "text"},
+                                              {"text", reply}}})},
+                    {"stop_reason", hit_eos ? "end_turn" : "max_tokens"},
+                    {"stop_sequence", nullptr},
+                    {"usage",
+                     {{"input_tokens", n_prompt},
+                      {"output_tokens", n_out},
+                      {"cache_read_input_tokens", 0},
+                      {"cache_creation_input_tokens", 0}}}};
+        } else {
+            body = {{"id", "locus-vision-" + rid},
+                    {"object", "chat.completion"},
+                    {"model", opt_.model_name},
+                    {"choices",
+                     json::array({{{"index", 0},
+                                   {"message",
+                                    {{"role", "assistant"},
+                                     {"content", reply}}},
+                                   {"finish_reason",
+                                    hit_eos ? "stop" : "length"}}})},
+                    {"usage",
+                     {{"prompt_tokens", n_prompt},
+                      {"completion_tokens", n_out},
+                      {"total_tokens", n_prompt + n_out}}}};
+        }
+        res.set_content(body.dump(-1, ' ', false, kLossy), "application/json");
+    } catch (const std::exception& e) {
+        fail(http_status_for(e), e.what());
+    }
 }
 
 std::shared_ptr<const std::vector<std::string>>
@@ -466,7 +841,7 @@ void OpenAiServer::stop() {
 void OpenAiServer::install_routes() {
     auto handle_health = [](const http::Request&,
                             http::ServerResponse& res) {
-        res.set_content(json{{"status", "ok"}}.dump(),
+        res.set_content(json{{"status", "ok"}}.dump(-1, ' ', false, kLossy),
                         "application/json");
     };
 
@@ -481,7 +856,7 @@ void OpenAiServer::install_routes() {
             res.set_content(
                 json{{"object", "list"},
                      {"data", json::array({entry})}}
-                    .dump(),
+                    .dump(-1, ' ', false, kLossy),
                 "application/json");
     };
     // Retrieve a single model by id (OpenAI GET /v1/models/{id}). The id
@@ -494,7 +869,7 @@ void OpenAiServer::install_routes() {
             if (model_id != opt_.model_name) {
                 res.status = 404;
                 res.set_content(
-                    make_error("model not found").dump(),
+                    make_error("model not found").dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
@@ -502,7 +877,7 @@ void OpenAiServer::install_routes() {
                                  {"object", "model"},
                                  {"created", 0},
                                  {"owned_by", "locus"}}
-                                .dump(),
+                                .dump(-1, ' ', false, kLossy),
                             "application/json");
     };
 
@@ -608,6 +983,7 @@ void OpenAiServer::install_routes() {
         std::uint32_t max_tokens = 16;
         bool stream = false;
         std::vector<ToolSpec> tools;
+        std::optional<VisionChat> vision;  // a chat with images (i#241)
         try {
             body = json::parse(req.body);
             if (chat) {
@@ -617,6 +993,10 @@ void OpenAiServer::install_routes() {
                     throw std::invalid_argument(
                         "messages must be a non-empty array");
                 }
+                vision = parse_vision_chat(body, false, opt_.max_tokens_cap,
+                                           opt_.max_body_bytes);
+            }
+            if (chat && !vision) {
                 auto msgs = parse_messages(body["messages"]);
                 tools = parse_tools(body, /*anthropic=*/false);
                 if (!tools.empty()) {
@@ -625,7 +1005,7 @@ void OpenAiServer::install_routes() {
                                  render_tools_system(tools)});
                 }
                 prompt = opt_.chat_template.apply(msgs);
-            } else {
+            } else if (!chat) {
                 if (!body.contains("prompt") ||
                     !body["prompt"].is_string()) {
                     throw std::invalid_argument(
@@ -648,8 +1028,12 @@ void OpenAiServer::install_routes() {
             stream = body.value("stream", false);
         } catch (const std::exception& e) {
             res.status = 400;
-            res.set_content(make_error(e.what()).dump(),
+            res.set_content(make_error(e.what()).dump(-1, ' ', false, kLossy),
                             "application/json");
+            return;
+        }
+        if (vision) {
+            vision_chat(false, *vision, res, ctx);
             return;
         }
 
@@ -681,7 +1065,8 @@ void OpenAiServer::install_routes() {
         if (const std::string why = loop_.admit_error(n_prompt);
             !why.empty()) {
             res.status = 400;
-            res.set_content(make_error(why).dump(), "application/json");
+            res.set_content(make_error(why).dump(-1, ' ', false, kLossy),
+                            "application/json");
             return;
         }
         requests_total_.fetch_add(1, std::memory_order_relaxed);
@@ -716,14 +1101,15 @@ void OpenAiServer::install_routes() {
                 res.set_content(
                     make_error("request cancelled: client closed the "
                                "connection")
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
             if (v.status == engine::Status::kFailed) {
                 res.status = 500;
-                res.set_content(make_error(v.error).dump(),
-                                "application/json");
+                res.set_content(
+                    make_error(v.error).dump(-1, ' ', false, kLossy),
+                    "application/json");
                 return;
             }
             std::string text = tok_.decode(v.generated);
@@ -736,7 +1122,8 @@ void OpenAiServer::install_routes() {
                           {"type", "function"},
                           {"function",
                            {{"name", tc->name},
-                            {"arguments", tc->arguments.dump()}}}};
+                            {"arguments",
+                             tc->arguments.dump(-1, ' ', false, kLossy)}}}};
                 choice = {{"index", 0},
                           {"message",
                            {{"role", "assistant"},
@@ -814,7 +1201,8 @@ void OpenAiServer::install_routes() {
                        {"prompt_tokens_details",
                         {{"cached_tokens",
                           v.reused_prefix_tokens}}}}}};
-            res.set_content(out.dump(), "application/json");
+            res.set_content(out.dump(-1, ' ', false, kLossy),
+                            "application/json");
             return;
         }
 
@@ -857,8 +1245,9 @@ void OpenAiServer::install_routes() {
                                    {"object", sse_object},
                                    {"choices",
                                     json::array({delta})}};
-                        payload +=
-                            "data: " + chunk.dump() + "\n\n";
+                        payload += "data: " +
+                                   chunk.dump(-1, ' ', false, kLossy) +
+                                   "\n\n";
                     }
                 }
                 *state = v.generated.size();
@@ -891,7 +1280,8 @@ void OpenAiServer::install_routes() {
                                 {"function",
                                  {{"name", tc->name},
                                   {"arguments",
-                                   tc->arguments.dump()}}}};
+                                   tc->arguments.dump(-1, ' ', false,
+                                                      kLossy)}}}};
                             delta = {{"role", "assistant"},
                                      {"tool_calls",
                                       json::array({call})}};
@@ -907,7 +1297,9 @@ void OpenAiServer::install_routes() {
                                            {"delta", delta},
                                            {"finish_reason",
                                             finish}}})}};
-                        payload += "data: " + chunk.dump() + "\n\n";
+                        payload += "data: " +
+                                   chunk.dump(-1, ' ', false, kLossy) +
+                                   "\n\n";
                     }
                     payload += "data: [DONE]\n\n";
                     // Stream fully built from the snapshot v; drop the
@@ -948,6 +1340,7 @@ void OpenAiServer::install_routes() {
         model::SamplingParams sampling;
         std::uint64_t seed = 0;
         std::unique_ptr<model::TokenConstraint> constraint;
+        std::optional<VisionChat> vision;  // a chat with images (i#241)
         try {
             const json body = json::parse(req.body);
             if (!body.contains("messages") ||
@@ -956,33 +1349,37 @@ void OpenAiServer::install_routes() {
                 throw std::invalid_argument(
                     "messages must be a non-empty array");
             }
-            if (wants_json(body)) {
-                constraint = std::make_unique<JsonTokenConstraint>(
-                    json_pieces());
-            }
-            auto msgs = parse_anthropic_messages(body);
-            tools = parse_tools(body, /*anthropic=*/true);
-            if (!tools.empty()) {
-                msgs.insert(msgs.begin(),
-                            {"system", render_tools_system(tools)});
-            }
-            prompt = opt_.chat_template.apply(msgs);
-            if (body.contains("max_tokens")) {
-                const auto v = body["max_tokens"];
-                if (!v.is_number_unsigned() ||
-                    v.get<std::uint64_t>() == 0) {
-                    throw std::invalid_argument(
-                        "max_tokens must be a positive integer");
+            vision = parse_vision_chat(body, true, opt_.max_tokens_cap,
+                                       opt_.max_body_bytes);
+            if (!vision) {
+                if (wants_json(body)) {
+                    constraint = std::make_unique<JsonTokenConstraint>(
+                        json_pieces());
                 }
-                max_tokens = static_cast<std::uint32_t>(
-                    std::min<std::uint64_t>(
-                        v.get<std::uint64_t>(),
-                        opt_.max_tokens_cap));
+                auto msgs = parse_anthropic_messages(body);
+                tools = parse_tools(body, /*anthropic=*/true);
+                if (!tools.empty()) {
+                    msgs.insert(msgs.begin(),
+                                {"system", render_tools_system(tools)});
+                }
+                prompt = opt_.chat_template.apply(msgs);
+                if (body.contains("max_tokens")) {
+                    const auto v = body["max_tokens"];
+                    if (!v.is_number_unsigned() ||
+                        v.get<std::uint64_t>() == 0) {
+                        throw std::invalid_argument(
+                            "max_tokens must be a positive integer");
+                    }
+                    max_tokens = static_cast<std::uint32_t>(
+                        std::min<std::uint64_t>(
+                            v.get<std::uint64_t>(),
+                            opt_.max_tokens_cap));
+                }
+                stream = body.value("stream", false);
+                std::tie(sampling, seed) = parse_sampling(body);
+                ids = tok_.encode(prompt, true);
+                input_tokens = static_cast<std::uint32_t>(ids.size());
             }
-            stream = body.value("stream", false);
-            std::tie(sampling, seed) = parse_sampling(body);
-            ids = tok_.encode(prompt, true);
-            input_tokens = static_cast<std::uint32_t>(ids.size());
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(
@@ -990,8 +1387,12 @@ void OpenAiServer::install_routes() {
                      {"error",
                       {{"type", "invalid_request_error"},
                        {"message", e.what()}}}}
-                    .dump(),
+                    .dump(-1, ' ', false, kLossy),
                 "application/json");
+            return;
+        }
+        if (vision) {
+            vision_chat(true, *vision, res, ctx);
             return;
         }
 
@@ -1018,7 +1419,7 @@ void OpenAiServer::install_routes() {
                           {{"type", "api_error"},
                            {"message", "request cancelled: client "
                                        "closed the connection"}}}}
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
@@ -1029,7 +1430,7 @@ void OpenAiServer::install_routes() {
                          {"error",
                           {{"type", "api_error"},
                            {"message", v.error}}}}
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
@@ -1073,7 +1474,8 @@ void OpenAiServer::install_routes() {
                    v.cached_prefix_tokens}}}};
             completion_tokens_total_.fetch_add(
                 v.generated.size(), std::memory_order_relaxed);
-            res.set_content(out.dump(), "application/json");
+            res.set_content(out.dump(-1, ' ', false, kLossy),
+                            "application/json");
             return;
         }
 
@@ -1113,7 +1515,7 @@ void OpenAiServer::install_routes() {
                            {{"input_tokens", input_tokens},
                             {"output_tokens", 0}}}}}};
                     payload += "event: message_start\ndata: " +
-                               start.dump() + "\n\n";
+                               start.dump(-1, ' ', false, kLossy) + "\n\n";
                     if (!buffer_tools) {
                         payload +=
                             "event: content_block_start\ndata: " +
@@ -1122,7 +1524,7 @@ void OpenAiServer::install_routes() {
                                  {"content_block",
                                   {{"type", "text"},
                                    {"text", ""}}}}
-                                .dump() +
+                                .dump(-1, ' ', false, kLossy) +
                             "\n\n";
                     }
                     st->started = true;
@@ -1142,7 +1544,7 @@ void OpenAiServer::install_routes() {
                                  {"delta",
                                   {{"type", "text_delta"},
                                    {"text", tok_.decode({&t, 1})}}}}
-                                .dump() +
+                                .dump(-1, ' ', false, kLossy) +
                             "\n\n";
                     }
                 }
@@ -1176,7 +1578,7 @@ void OpenAiServer::install_routes() {
                                             std::to_string(id)},
                                        {"name", tc->name},
                                        {"input", json::object()}}}}
-                                    .dump() +
+                                    .dump(-1, ' ', false, kLossy) +
                                 "\n\n";
                             payload +=
                                 "event: content_block_delta\n"
@@ -1186,8 +1588,9 @@ void OpenAiServer::install_routes() {
                                      {"delta",
                                       {{"type", "input_json_delta"},
                                        {"partial_json",
-                                        tc->arguments.dump()}}}}
-                                    .dump() +
+                                        tc->arguments.dump(-1, ' ', false,
+                                                           kLossy)}}}}
+                                    .dump(-1, ' ', false, kLossy) +
                                 "\n\n";
                             stop_reason = "tool_use";
                         } else {
@@ -1199,7 +1602,7 @@ void OpenAiServer::install_routes() {
                                      {"content_block",
                                       {{"type", "text"},
                                        {"text", ""}}}}
-                                    .dump() +
+                                    .dump(-1, ' ', false, kLossy) +
                                 "\n\n";
                             payload +=
                                 "event: content_block_delta\n"
@@ -1209,7 +1612,7 @@ void OpenAiServer::install_routes() {
                                      {"delta",
                                       {{"type", "text_delta"},
                                        {"text", text}}}}
-                                    .dump() +
+                                    .dump(-1, ' ', false, kLossy) +
                                 "\n\n";
                         }
                     }
@@ -1217,7 +1620,7 @@ void OpenAiServer::install_routes() {
                         "event: content_block_stop\ndata: " +
                         json{{"type", "content_block_stop"},
                              {"index", 0}}
-                            .dump() +
+                            .dump(-1, ' ', false, kLossy) +
                         "\n\n";
                     payload +=
                         "event: message_delta\ndata: " +
@@ -1236,11 +1639,11 @@ void OpenAiServer::install_routes() {
                                 v.reused_prefix_tokens},
                                {"cache_creation_input_tokens",
                                 v.cached_prefix_tokens}}}}
-                            .dump() +
+                            .dump(-1, ' ', false, kLossy) +
                         "\n\n";
                     payload += "event: message_stop\ndata: " +
                                json{{"type", "message_stop"}}
-                                   .dump() +
+                                   .dump(-1, ' ', false, kLossy) +
                                "\n\n";
                     completion_tokens_total_.fetch_add(
                         st->emitted, std::memory_order_relaxed);
@@ -1308,12 +1711,13 @@ void OpenAiServer::install_routes() {
                     json{{"object", "list"},
                          {"data", data},
                          {"model", opt_.model_name}}
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
             } catch (const std::exception& e) {
                 res.status = 400;
-                res.set_content(make_error(e.what()).dump(),
-                                "application/json");
+                res.set_content(
+                    make_error(e.what()).dump(-1, ' ', false, kLossy),
+                    "application/json");
             }
     };
 
@@ -1331,7 +1735,7 @@ void OpenAiServer::install_routes() {
                     make_error("audio speech is not configured (needs "
                                "--audio-decoder and an Orpheus-TTS "
                                "model)")
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
@@ -1634,9 +2038,7 @@ void OpenAiServer::install_routes() {
                         bytes.size()),
                     ctype);
             } catch (const std::exception& e) {
-                res.status = 400;
-                res.set_content(make_error(e.what()).dump(),
-                                "application/json");
+                set_error(res, e);
             }
     };
 
@@ -1653,7 +2055,7 @@ void OpenAiServer::install_routes() {
                 res.set_content(
                     make_error("image generation is not configured (needs "
                                "--image-decoder and a Janus-Pro model)")
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
@@ -1765,12 +2167,10 @@ void OpenAiServer::install_routes() {
                          {"data", json::array({json{
                                       {"b64_json",
                                        http::base64_encode(png)}}})}}
-                        .dump(),
+                        .dump(-1, ' ', false, kLossy),
                     "application/json");
             } catch (const std::exception& e) {
-                res.status = 400;
-                res.set_content(make_error(e.what()).dump(),
-                                "application/json");
+                set_error(res, e);
             }
     };
 

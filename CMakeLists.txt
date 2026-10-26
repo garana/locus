@@ -40,7 +40,10 @@ add_library(locus
     src/locus/audio/snac.cpp
     src/locus/image/vq16.cpp
     src/locus/image/janus.cpp
+    src/locus/image/janus_vision.cpp
+    src/locus/image/janus_chat.cpp
     src/locus/image/png.cpp
+    src/locus/image/image_input.cpp
     src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp
     src/locus/model/transformer.cpp
@@ -55,6 +58,7 @@ add_library(locus
     src/locus/pipeline/stage_executor.cpp
     src/locus/pipeline/stage_server.cpp
     src/locus/server/engine_loop.cpp
+    src/locus/server/errors.cpp
     src/locus/server/server.cpp
     src/locus/server/tools.cpp
     src/locus/http/base64.cpp
@@ -71,7 +75,13 @@ target_include_directories(locus SYSTEM PRIVATE
     third_party/ggml
     third_party/httplib
     third_party/json
+    third_party/stb
 )
+# stb_image's scalar JPEG IDCT can overflow int on a corrupted file
+# (UBSan on the Pi); request bytes are untrusted, so define signed
+# overflow as wrapping in the file that builds it.
+set_source_files_properties(src/locus/image/image_input.cpp
+    PROPERTIES COMPILE_OPTIONS "-fwrapv")
 find_package(Threads REQUIRED)
 target_link_libraries(locus PUBLIC Threads::Threads)
 
@@ -205,7 +215,9 @@ if(Vulkan_FOUND)
             matmul_q4_k_id_small=matmul:TYPE_Q4K,MOE_ID,BK16
             matmul_q6_k_id_small=matmul:TYPE_Q6K,MOE_ID,BK16
             silu_mul_sg=silu_mul:SIG_GATE
-            moe_route_b=moe_route:BATCHED)
+            moe_route_b=moe_route:BATCHED
+            matvec_bf16=matvec_f16:BF16
+            matvec_bf16_b=matvec_f16:BATCHED,BF16)
         # Limits shared with the host, read from their one definition.
         set(LOCUS_VK_LIMITS
             ${CMAKE_SOURCE_DIR}/src/locus/backend/vulkan/limits.hpp)

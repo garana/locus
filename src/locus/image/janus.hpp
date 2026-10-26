@@ -15,6 +15,13 @@
 namespace locus::image {
 
 /**
+ * Python's str.strip(): drops leading and trailing whitespace from
+ * str.isspace()'s set (ASCII and Unicode), decoding UTF-8 at both
+ * ends. The Janus reference strips every message with it.
+ */
+std::string_view python_strip(std::string_view s);
+
+/**
  * Janus-Pro text-to-image generation (i#221 sections 2-3) on a llama
  * backbone loaded from the same GGUF (scripts/convert-janus.py). Image
  * tokens do not live in the text vocabulary: each one enters the
@@ -73,9 +80,10 @@ class JanusImageGen {
     /**
      * Wraps a text prompt as the reference does (Janus's "deepseek" SFT
      * template, empty system prompt) and tokenizes it: BOS, then
-     * "User: <text>\n\nAssistant:", then begin_of_image(). The text is
-     * stripped of leading and trailing whitespace first, as Python's
-     * str.strip() does in the reference.
+     * "<|User|>: <text>\n\n<|Assistant|>:", then begin_of_image(). The
+     * roles are Janus-Pro's special tokens (not Janus-1.3B's "User").
+     * The text is stripped of leading and trailing whitespace first, as
+     * Python's str.strip() does in the reference.
      *
      * @param tok The model's tokenizer (from the same GGUF).
      * @param text The image description.

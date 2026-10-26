@@ -165,7 +165,8 @@ stays CPU-bound by per-token dispatch overhead.
 - Vendored (in-tree, pinned, sha256 recorded in the commit that
   imports them, license files alongside): Catch2 v3.7.1 (BSL-1.0,
   tests only), cpp-httplib v0.18.3 (MIT), nlohmann/json v3.11.3
-  (MIT).
+  (MIT), stb_image v2.30 (MIT or public domain; PNG and JPEG only,
+  for image input, until our own decoders replace it, i#250).
 - No FetchContent/network at configure or build time.
 - Optional system deps behind CMake flags: BLAS/Accelerate, Vulkan.
 
