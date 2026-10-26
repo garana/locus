@@ -930,7 +930,7 @@ TEST_CASE("the full GPU forward declines dbrx's fused qkv and LayerNorm",
     REQUIRE_FALSE(locus::backend::vulkan_forward_supported(model));
 }
 
-TEST_CASE("dbrx CPU decode runs and is finite (synthetic, inline)",
+TEST_CASE("dbrx CPU decode runs and is finite (synthetic; inline)",
           "[moe]") {
     // The only CPU run of dbrx_attention without the 32GB model: the
     // fused [q|k|v] split, NEOX rope and gqa_attend over 6 positions.
