@@ -1163,7 +1163,9 @@ TEST_CASE("the R16 default follows the backend and the switch",
               weights(kE * kF * kNe, 62));
     mb.tensor("blk.0.ffn_down_exps.weight", {kF, kE, kNe},
               weights(kF * kE * kNe, 63));
-    auto g = locus::gguf::GgufFile::parse(mb.build(kNe, 2));
+    // GgufFile::parse keeps a span: the image must outlive the model.
+    const auto img = mb.build(kNe, 2);
+    auto g = locus::gguf::GgufFile::parse(img);
     auto model = TransformerModel::load(g);
     const auto& scalar = *locus::backend::find_backend("scalar");
     REQUIRE(scalar.ops.prefers_q8k);
