@@ -14,8 +14,11 @@ tests/models
 /models
 
 # Internal Claude Code build skill: references the private multi-host
-# setup (m2 / vx / pi), so it stays local on each host, out of git.
+# setup, so it stays local on each host, out of git.
 /.claude/skills/build/
+
+# Local plan and status files (per host, out of git).
+*.local.*
 
 # IDE files
 .idea/
