@@ -460,7 +460,7 @@ Each host owns a contiguous block of layers. A token's hidden state
 flows host to host; the last host produces the logits. Weights load
 once and stay resident on each host. Only activations cross the
 network: one hidden vector per token per boundary, about $2d$ bytes
-for a width-$d$ model at 16 bits. That small payload is why this
+at 16 bits for a model of width $d$. That small payload is why this
 works over a LAN. Tensor parallelism instead exchanges data inside
 every layer and needs an NVLink-class link, so it is not the target.
 
