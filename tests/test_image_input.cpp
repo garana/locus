@@ -1,9 +1,9 @@
 #include "locus/image/image_input.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -43,6 +43,23 @@ std::vector<std::uint8_t> read_rgb(const std::string& name,
     std::vector<std::uint8_t> v(size);
     std::memcpy(v.data(), b.data(), size);
     return v;
+}
+
+/**
+ * REQUIREs a == b byte for byte, reporting the size or the first
+ * differing byte. (A plain REQUIRE(a == b) on 65K-element vectors
+ * makes Catch2 stringify both, which its console reporter mishandles.)
+ */
+void require_same(const std::vector<std::uint8_t>& a,
+                  const std::vector<std::uint8_t>& b) {
+    REQUIRE(a.size() == b.size());
+    const auto m = std::mismatch(a.begin(), a.end(), b.begin());
+    const std::size_t at = static_cast<std::size_t>(m.first - a.begin());
+    INFO("first difference at byte " << at << " of " << a.size());
+    if (m.first != a.end()) {
+        INFO("got " << int{*m.first} << ", want " << int{*m.second});
+        REQUIRE(m.first == a.end());
+    }
 }
 
 /** The pattern as Pillow decodes src.png: the reference's RGB. */
@@ -103,7 +120,7 @@ TEST_CASE("decode_image reads PNGs as Pillow does", "[image][decode]") {
     // the resize goldens start from these exact pixels.
     const auto rgba = decode_image(read_bytes(kDir + "src_rgba.png"));
     REQUIRE(rgba.w == kW);
-    REQUIRE(rgba.rgb == src.rgb);  // alpha dropped, as convert("RGB")
+    require_same(rgba.rgb, src.rgb);  // alpha dropped, as convert("RGB")
     // Gray: L -> RGB replicates the one channel.
     const auto gray = decode_image(read_bytes(kDir + "src_gray.png"));
     REQUIRE(gray.w == kW);
@@ -113,7 +130,7 @@ TEST_CASE("decode_image reads PNGs as Pillow does", "[image][decode]") {
     }
     // locus's own stored-deflate PNG round-trips too.
     const auto ours = locus::image::encode_png(src.rgb, src.h, src.w);
-    REQUIRE(decode_image(ours).rgb == src.rgb);
+    require_same(decode_image(ours).rgb, src.rgb);
 }
 
 // JPEG decoders may round the IDCT and the chroma upsampling
@@ -147,12 +164,12 @@ TEST_CASE("resize_bicubic is bit-exact with Pillow", "[image][decode]") {
         const auto r = resize_bicubic(src, w, h);
         REQUIRE(r.w == w);
         REQUIRE(r.h == h);
-        REQUIRE(r.rgb == read_rgb("resize_" + std::to_string(w) + "x" +
-                                      std::to_string(h) + ".rgb",
-                                  std::size_t{w} * h * 3));
+        require_same(r.rgb, read_rgb("resize_" + std::to_string(w) + "x" +
+                                         std::to_string(h) + ".rgb",
+                                     std::size_t{w} * h * 3));
     }
     // The same size is a copy.
-    REQUIRE(resize_bicubic(src, kW, kH).rgb == src.rgb);
+    require_same(resize_bicubic(src, kW, kH).rgb, src.rgb);
 }
 
 TEST_CASE("fit_square matches the Janus reference preprocessing",
@@ -161,7 +178,7 @@ TEST_CASE("fit_square matches the Janus reference preprocessing",
     const auto wide = fit_square(src, 32, 4, {127, 127, 127});
     REQUIRE(wide.w == 32);
     REQUIRE(wide.h == 32);
-    REQUIRE(wide.rgb == read_rgb("fit32_wide.rgb", 32 * 32 * 3));
+    require_same(wide.rgb, read_rgb("fit32_wide.rgb", 32 * 32 * 3));
     // The transpose (37 wide, 61 tall): the pad goes left and right.
     Rgb8 tall{kH, kW, std::vector<std::uint8_t>(src.rgb.size())};
     for (std::uint32_t y = 0; y < kH; ++y) {
@@ -172,8 +189,8 @@ TEST_CASE("fit_square matches the Janus reference preprocessing",
             }
         }
     }
-    REQUIRE(fit_square(tall, 32, 4, {127, 127, 127}).rgb ==
-            read_rgb("fit32_tall.rgb", 32 * 32 * 3));
+    require_same(fit_square(tall, 32, 4, {127, 127, 127}).rgb,
+                 read_rgb("fit32_tall.rgb", 32 * 32 * 3));
 }
 
 // Request bytes are untrusted: every bad input is an exception, never

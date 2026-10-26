@@ -1,0 +1,7 @@
+# Raw-byte test fixtures: never text (no EOL conversion, no text diff).
+# Some .rgb files contain CR / LF bytes and no NUL, so git would
+# otherwise guess text.
+tests/golden/**/*.rgb binary
+tests/golden/**/*.f32 binary
+tests/golden/**/*.png binary
+tests/golden/**/*.jpg binary
