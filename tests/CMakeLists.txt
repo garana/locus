@@ -49,6 +49,7 @@ add_executable(locus_tests
     test_sampling.cpp
     test_speculative.cpp
     test_server.cpp
+    test_server_errors.cpp
     test_tools.cpp
     test_vulkan.cpp
     test_vulkan_attn.cpp
