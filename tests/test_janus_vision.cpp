@@ -1,5 +1,10 @@
 #include "locus/image/janus_vision.hpp"
 
+#include <stdexcept>
+
+#include "locus/image/janus_chat.hpp"
+#include "locus/tok/tokenizer.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -98,7 +103,7 @@ Golden read_golden() {
 /** The reference image (384 x 384) as pixels in [-1, 1]. */
 std::vector<float> golden_pixels(const locus::image::JanusVision& v) {
     const auto png = png_test::parse_stored_png(
-        read_bytes(kDir + "golden/janus_decode.png"));
+        read_bytes(kDir + "golden/janus_apple.png"));
     REQUIRE(png.w == v.image_size());
     REQUIRE(png.h == v.image_size());
     return v.to_pixels(png.rgb);
@@ -113,6 +118,62 @@ bool have_model() {
 }
 
 }  // namespace
+
+// The reference's apply_sft_template_for_multi_turn_prompts output for
+// this conversation with Janus-Pro's roles (printed from the Janus
+// processor), with the default system prompt and with none: stripped
+// turns, "\n\n" after a user turn, eos after an assistant turn,
+// "<|Assistant|>:" at the end.
+TEST_CASE("janus chat text matches the reference template",
+          "[janus][image][vision]") {
+    using locus::image::ChatTurn;
+    const std::vector<ChatTurn> turns = {
+        {"user", "<image_placeholder>\nWhat is on the table?"},
+        {"assistant", "An apple."},
+        {"user", "  What color is it?  "}};
+    // <｜end▁of▁sentence｜>, the eos token's text.
+    const std::string eos = "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81"
+                            "sentence\xef\xbd\x9c>";
+    const std::string body =
+        "<|User|>: <image_placeholder>\nWhat is on the table?\n\n"
+        "<|Assistant|>: An apple." + eos +
+        "<|User|>: What color is it?\n\n<|Assistant|>:";
+    REQUIRE(locus::image::janus_chat_text(turns,
+                                          locus::image::kJanusSystemPrompt,
+                                          eos) ==
+            std::string(locus::image::kJanusSystemPrompt) + "\n\n" + body);
+    REQUIRE(locus::image::janus_chat_text(turns, "", eos) == body);
+    // The reply always follows a user turn.
+    REQUIRE_THROWS_AS(locus::image::janus_chat_text(
+                          std::vector<ChatTurn>{{"assistant", "x"}}, "", eos),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(locus::image::janus_chat_text({}, "", eos),
+                      std::invalid_argument);
+}
+
+// The prompt ids the reference fed the model for the golden question,
+// from the chat turns: system prompt, template, BOS, and the image
+// placeholder expanded to 576 slots between begin and end of image.
+TEST_CASE("janus chat ids match the reference prompt",
+          "[janus][image][vision]") {
+    if (!have_model()) {
+        SKIP("janus-pro-1b-bf16.gguf with vit.* absent");
+    }
+    const Golden ref = read_golden();
+    auto g = locus::gguf::GgufFile::open(kModel);
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    const auto v = locus::image::JanusVision::load(
+        g, static_cast<std::uint32_t>(*g.get_uint("llama.embedding_length")));
+    const std::vector<locus::image::ChatTurn> turns = {
+        {"user", "<image_placeholder>\nWhat is on the table?"}};
+    const std::string text = locus::image::janus_chat_text(
+        turns, locus::image::kJanusSystemPrompt, tok->piece(tok->eos_id()));
+    std::size_t images = 0;
+    const auto ids = locus::image::janus_chat_ids(*tok, text, v, images);
+    REQUIRE(images == 1);
+    REQUIRE(ids == std::vector<locus::tok::TokenId>(ref.prompt.begin(),
+                                                    ref.prompt.end()));
+}
 
 // i#241: the SigLIP tower and the aligner on the reference image,
 // against the torch f32 reference (scripts/make-janus-goldens.py

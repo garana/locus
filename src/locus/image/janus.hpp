@@ -15,6 +15,13 @@
 namespace locus::image {
 
 /**
+ * Python's str.strip(): drops leading and trailing whitespace from
+ * str.isspace()'s set (ASCII and Unicode), decoding UTF-8 at both
+ * ends. The Janus reference strips every message with it.
+ */
+std::string_view python_strip(std::string_view s);
+
+/**
  * Janus-Pro text-to-image generation (i#221 sections 2-3) on a llama
  * backbone loaded from the same GGUF (scripts/convert-janus.py). Image
  * tokens do not live in the text vocabulary: each one enters the

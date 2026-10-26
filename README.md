@@ -119,6 +119,22 @@ tests/models/janus-pro-1b-bf16.gguf` makes the model GGUF (BF16, the
 checkpoint's own type) and `scripts/convert-janus-vq16.py` the decoder
 GGUF (dev-time: both need torch and the Janus-Pro snapshot).
 
+Image input: with a Janus-Pro model whose GGUF has the vision tower
+(the converter writes it), /v1/chat/completions and /v1/messages accept
+images in user turns: an OpenAI image_url part with a base64 `data:`
+URL, or an Anthropic image block with a base64 source (locus never
+fetches a URL). PNG and JPEG are decoded with a vendored, capped
+stb_image, resized and padded exactly as the reference preprocessor
+does (Pillow's bicubic, ported bit-exact), and turned into 576 input
+embeddings by the SigLIP-L/16 tower and the aligner, which match the
+torch reference to an error RMS of about 2e-5. Asked "What is on the
+table?" about the reference image, locus answers like the reference,
+"There is an apple on the table." One question about one image takes
+about a minute on an M2 Pro CPU (the 630-token prompt is fed one
+position at a time). Not yet with images: streaming, tools and JSON
+mode (each a 400). A model without the vision tower answers an image
+request with a 400.
+
 ## Building
 
     cmake -B build -DCMAKE_BUILD_TYPE=Release

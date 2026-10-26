@@ -44,8 +44,9 @@ char32_t utf8_at(std::string_view s, std::size_t at, std::size_t& n) {
     return c;
 }
 
-/** str.strip(): drops leading and trailing Python whitespace. */
-std::string_view py_strip(std::string_view s) {
+}  // namespace
+
+std::string_view python_strip(std::string_view s) {
     std::size_t n = 0;
     while (!s.empty() && py_space(utf8_at(s, 0, n))) s.remove_prefix(n);
     while (!s.empty()) {
@@ -58,8 +59,6 @@ std::string_view py_strip(std::string_view s) {
     }
     return s;
 }
-
-}  // namespace
 
 std::span<const float> JanusImageGen::t(const std::string& name,
                                         std::size_t n) const {
@@ -174,7 +173,7 @@ std::vector<tok::TokenId> JanusImageGen::prompt_ids(
     // wrap. The tag is appended as its id: the reference's text ends in
     // "<begin_of_image>", which its tokenizer maps to this one id.
     auto ids = tok.encode(
-        "User: " + std::string(py_strip(text)) + "\n\nAssistant:", true);
+        "User: " + std::string(python_strip(text)) + "\n\nAssistant:", true);
     ids.push_back(begin_of_image_);
     return ids;
 }
