@@ -111,9 +111,9 @@ prompt, and the pixels match the reference image (9 of 442,368 RGB
 values off by 1). cfg (default 5), temperature (default 1) and seed
 are overridable; the seed used is returned in X-Image-Seed and
 Server-Timing gives the generate and decode times. One image takes
-about 150 s on an M2 Pro CPU (145 s for the codes, 6 s for the
-decode): generation runs token by token on the CPU (NEON BF16 dots),
-and the image heads are still single-threaded.
+about 80 s on an M2 Pro CPU (74 s for the codes, 6 s for the decode):
+generation runs token by token on the CPU (NEON BF16 dots, the image
+heads split across threads).
 `scripts/convert-janus.py --model <snapshot> --out
 tests/models/janus-pro-1b-bf16.gguf` makes the model GGUF (BF16, the
 checkpoint's own type) and `scripts/convert-janus-vq16.py` the decoder
