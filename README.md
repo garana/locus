@@ -22,8 +22,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   K-quants, IQ quants, TQ1_0 and TQ2_0.
 - **Tokenizers:** SentencePiece and byte-level BPE (gpt2, llama3 and
   qwen2 pretokenizers), with chat templates.
-- **Backends:** neon, sse4 and scalar on the CPU; vulkan (the whole
-  forward pass on the GPU); cuda (matvec on the GPU).
+- **Backends:** neon, avx2, sse4 and scalar on the CPU; vulkan (the
+  whole forward pass on the GPU); cuda (matvec on the GPU).
 - **Serving:** continuous batching; a paged KV cache with
   copy-on-write prefix sharing; f32, f16, q8 or q4 KV.
 - **API:** `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
@@ -41,7 +41,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   data URLs, Anthropic image blocks) with Janus-Pro-1B.
 - **Tools:** `locus-server`; `locus-run` (one prompt); `locus-gguf`
   (inspect a GGUF); `locus-stage` and `locus-driver` (multi-server
-  pipeline, experimental).
+  pipeline, experimental); `locus-auth-helper` (a reference auth
+  helper, see docs/CLIENTS.md).
 
 Greedy decoding is the default; sampling and the other decoding
 features are opt-in per request. A request whose client disconnects
@@ -68,8 +69,8 @@ logit, for prompts where greedy decoding tips at a near-tie.
 | DBRX-Instruct 16x12B          | dbrx       | IQ2_XXS, 32 GB   | token-exact                                        |
 | Muse Spark Open 816B-A42B     | muse-spark | UD-IQ1_S, 176 GB | one prompt token-exact, one teacher-forced         |
 | DeepSeek-V4.1-Flash-1017      | deepseek41 | UD-IQ1_S, 233 GB | teacher-forced, against llama.cpp#30817            |
-| Orpheus-TTS 3B                | llama      | Q4_K_M           | first audio frame teacher-forced; SNAC within 1e-6 |
-| Janus-Pro-1B                  | llama      | BF16             | 576 image codes exact; vision tower RMS 2e-5       |
+| Orpheus-TTS 3B                | llama      | Q4_K_M           | first audio frame teacher-forced; SNAC RMS < 1e-6  |
+| Janus-Pro-1B                  | llama      | BF16             | 576 image codes exact; vision tower RMS < 1e-4 rel |
 
 Two goldens run with f32 activations, because 8-bit activations tip
 their greedy text at a near-tie: Qwen1.5-MoE and DeepSeek-V2-Lite.
@@ -126,12 +127,13 @@ and tokenizers of the build. Speech needs `--audio-decoder
 ## Backends
 
 Every backend is compiled into the one binary, and the best one the
-machine supports is picked at startup. Pick one with `--backend NAME`
-or `LOCUS_BACKEND=NAME`.
+machine supports is picked at startup (on x86, avx2 before sse4). Pick
+one with `--backend NAME` or `LOCUS_BACKEND=NAME`.
 
 | Backend | Runs                                                                                     |
 |---------|------------------------------------------------------------------------------------------|
 | neon    | arm64; vectorized matvec and int8 dots, the rest scalar                                  |
+| avx2    | x86-64 with AVX2; vectorized F32 / Q8_0 matvec, f32 activations; not yet validated (#61) |
 | sse4    | x86-64; vectorized matvec and int8 dots, the rest scalar                                 |
 | scalar  | portable reference, every weight type                                                    |
 | vulkan  | the whole forward pass on the GPU: matmuls, norms, RoPE, paged attention, MoE routing    |
@@ -146,6 +148,7 @@ runs, but slower than neon.
 
 No runtime dependencies beyond the C and C++ libraries and the OS.
 Vendored, pinned and checksummed (see DESIGN.md section 6): Catch2
-(tests only), cpp-httplib, nlohmann/json, stb_image. Optional, found
+(tests only), cpp-httplib, nlohmann/json, stb_image, and ggml's IQ
+lookup tables. Optional, found
 at configure time: the Vulkan loader and a shader compiler, the CUDA
 toolkit.

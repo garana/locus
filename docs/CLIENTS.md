@@ -87,6 +87,10 @@ calling. Reliable agent use therefore needs a capable instruct model.
 - Content blocks: `tool_use` and `tool_result` blocks in requests are
   dropped; only text (and images, with a vision model) reaches the
   model.
+- Content arrays: on `/v1/chat/completions`, a message whose content
+  is an array of parts with no image (the OpenAI multimodal shape,
+  which some clients send for plain text too) is rejected with a 400;
+  send plain text as a string.
 - Chat formatting: the chat endpoints use the chat template the GGUF
   carries, matched to a known family (DESIGN.md 4.5); an unknown
   template falls back to plain concatenation.

@@ -64,7 +64,7 @@ Correctness first, then CPU throughput, then GPU.
     | Model runtime: per-architecture forward pass (ArchSpec)    |
     +------------------------------------------------------------+
     | Backend interface: matvec, dequant, batched matvec, ...    |
-    |   neon / sse4 / scalar (CPU)   vulkan   cuda               |
+    |   neon / avx2 / sse4 / scalar (CPU)   vulkan   cuda        |
     +------------------------------------------------------------+
     | GGUF loader (hardened) + tokenizers + chat templates       |
     +------------------------------------------------------------+
@@ -178,7 +178,8 @@ The areas built after the MVP:
   license files alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
   cpp-httplib v0.18.3 (MIT), nlohmann/json v3.11.3 (MIT), stb_image
   v2.30 (MIT or public domain; PNG and JPEG only, for image input,
-  until our own decoders replace it, #250).
+  until our own decoders replace it, #250), and ggml's IQ lookup
+  tables (`third_party/ggml/iq_grids.h`, MIT).
 - No FetchContent and no network at configure or build time.
 - Optional system dependencies, found at configure time: the Vulkan
   loader and a shader compiler, the CUDA toolkit.
@@ -582,7 +583,8 @@ logit.
   reference (llama.cpp, or the torch reference for multimedia models)
   token for token, or teacher-forced within a margin where a near-tie
   tips greedy decoding.
-- Every selectable backend runs the goldens.
+- stories260K runs on every selectable backend; the larger goldens
+  run on the CPU and on Vulkan (qwen2moe also on CUDA).
 - A malformed-GGUF corpus for the loader (truncations, overflowing
   offsets, hostile metadata).
 - Scheduler property tests: no block leaked, no double free, ref
