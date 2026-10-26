@@ -1,18 +1,19 @@
 # locus
 
-Pure C/C++ LLM inference server: vendor-neutral GPU (Vulkan),
-paged KV cache, continuous batching, OpenAI-compatible API, with a
-minimal vendored dependency surface. Full design and milestone
-plan: docs/DESIGN.md. Current milestone status: README.md.
+Pure C/C++ LLM inference server: CPU, Vulkan and CUDA backends,
+paged KV cache, continuous batching, OpenAI and Anthropic APIs, with a
+minimal vendored dependency surface. Design and rationale:
+docs/DESIGN.md. Current state: README.md.
 
 ## Resuming a session
 
-1. Read the Status table in README.md and docs/DESIGN.md section 5
-   to find the current milestone.
-2. Continue the first milestone not marked done; DESIGN.md defines
-   each milestone's exit test.
-3. Keep README.md (status table) and this file up to date as work
-   progresses -- update them in the same commit as the work.
+1. Read the Status section of README.md (what works, and what is
+   pending).
+2. Work is tracked in GitHub issues; the pending list in README.md
+   links the open ones.
+3. Keep README.md and this file in step with the code: update them in
+   the same commit as the work. They describe the current state, not
+   the history of changes.
 
 ## Build and test
 
@@ -28,6 +29,9 @@ Use the `build` and `test` skills (.claude/skills/). Quick form:
   APIs; only when adding or updating a comment.
 - Text files wrap at 80 columns; markdown tables plain ascii with
   content-aligned widths.
+- Documentation: terse, plain text; the current state, not a work
+  log; no `--` joining ideas in a sentence; math as GitHub-rendered
+  LaTeX (`$...$`, `$$...$$` or a ` ```math ` block).
 - Unit tests with vendored Catch2 for every component; all tests
   green before any commit.
 - Commit as each unit of work completes. No Co-Authored-By lines.
