@@ -170,10 +170,13 @@ void JanusImageGen::image_logits(std::span<const float> h,
 std::vector<tok::TokenId> JanusImageGen::prompt_ids(
     const tok::Tokenizer& tok, std::string_view text) const {
     // The reference strips the message (Python str.strip()) before the
-    // wrap. The tag is appended as its id: the reference's text ends in
-    // "<begin_of_image>", which its tokenizer maps to this one id.
-    auto ids = tok.encode(
-        "User: " + std::string(python_strip(text)) + "\n\nAssistant:", true);
+    // wrap; the roles are Janus-Pro's own special tokens (the README's
+    // Janus-Pro example). The tag is appended as its id: the
+    // reference's text ends in "<begin_of_image>", which its tokenizer
+    // maps to this one id.
+    auto ids = tok.encode("<|User|>: " + std::string(python_strip(text)) +
+                              "\n\n<|Assistant|>:",
+                          true);
     ids.push_back(begin_of_image_);
     return ids;
 }

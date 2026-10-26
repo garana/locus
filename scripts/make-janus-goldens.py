@@ -40,11 +40,11 @@ revision 960ab33191f61342a4c60ae74d8dc356a39fafcb. With those, the
 outputs' sha256 (on an M2 Pro, CPU):
 
   janus_tokens.txt
-    360d135a15e24bcf3853ef1316556917a2c950c55c413c8ce3dc09d03a129d55
+    0ce2d1d59db0d0d99471cd275c0ce37be9eceb824eb9f9e1820bf1bf122df703
   janus_decode.f32
-    6eb8a8a315141546007f61f4158a8e8c1e9ba6d6c3fadcad1106af4bd543095b
+    f14949e191b8bc16924312e52d8d4e8d07a2816e2882d170ff0597bb743206a8
   janus_decode.png
-    4b786def5918794634836cb8d1024bd7fa398874c861bb3df359cd96efee2628
+    f30912bd5a7ae5a120960ea564d566eee5c984ea3c2414b83aef285476672412
   janus_vision.f32
     99379afcac1e6a73f5acbc6d41c195d9ed2c6a612fe8edb845bd862c69ee0225
   janus_understand.txt
@@ -148,8 +148,10 @@ def load_janus(args):
 
 
 def prompt_ids(proc):
-    conv = [{"role": "User", "content": PROMPT},
-            {"role": "Assistant", "content": ""}]
+    # Janus-Pro's roles (its own special tokens, the README's Janus-Pro
+    # text-to-image example); "User" / "Assistant" are Janus-1.3B's.
+    conv = [{"role": "<|User|>", "content": PROMPT},
+            {"role": "<|Assistant|>", "content": ""}]
     text = proc.apply_sft_template_for_multi_turn_prompts(
         conversations=conv, sft_format=proc.sft_format, system_prompt="")
     text += proc.image_start_tag

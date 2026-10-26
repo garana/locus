@@ -107,7 +107,7 @@ model with classifier-free guidance (each step mixes the outputs for
 the prompt and for an empty prompt, u + cfg * (c - u)); locus decodes
 the codes with the VQ-16 image decoder, built from its conv2d kernels.
 At temperature 0 the codes equal the torch reference's for a test
-prompt, and the pixels match the reference image (11 of 442,368 RGB
+prompt, and the pixels match the reference image (9 of 442,368 RGB
 values off by 1). cfg (default 5), temperature (default 1) and seed
 are overridable; the seed used is returned in X-Image-Seed and
 Server-Timing gives the generate and decode times. One image takes
