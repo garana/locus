@@ -352,6 +352,85 @@ TEST_CASE("vulkan batched f16 and bf16 matvec match the CPU per slot",
     }
 }
 
+// i#267: the short-batch f16 / bf16 kernels (matvec_q8_0_n.comp
+// TYPE_F16), the 8-token and the 2-token (NT2) builds. Each token's
+// output row must equal the CPU matvec of that token. 64 columns take
+// the word path; 33 columns with the matrix one half into the buffer
+// put rows on odd halves, the per-element path.
+TEST_CASE("vulkan f16 and bf16 short-batch matvec match the CPU per token",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(43);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    const std::uint32_t rows = 7;
+    struct Case {
+        const char* name;
+        locus::gguf::TensorType type;
+        Kernel kernel;
+        std::uint32_t n_tok;
+    };
+    const Case cases[] = {
+        {"f16 n", locus::gguf::TensorType::kF16, Kernel::kMatvecF16N, 5},
+        {"bf16 n", locus::gguf::TensorType::kBF16, Kernel::kMatvecBF16N, 5},
+        {"f16 n2", locus::gguf::TensorType::kF16, Kernel::kMatvecF16N2, 2},
+        {"bf16 n2", locus::gguf::TensorType::kBF16, Kernel::kMatvecBF16N2,
+         2},
+    };
+    for (const std::uint32_t cols : {64u, 33u}) {
+        const std::uint32_t lead = cols % 2;  // halves before the matrix
+        for (const auto& c : cases) {
+            INFO(c.name << ", " << cols << " columns");
+            const bool bf = c.type == locus::gguf::TensorType::kBF16;
+            std::vector<std::uint16_t> w(lead + std::size_t{rows} * cols + 1);
+            for (auto& v : w) {
+                const float f = dist(rng);
+                v = bf ? static_cast<std::uint16_t>(
+                             std::bit_cast<std::uint32_t>(f) >> 16)
+                       : locus::backend::f32_to_f16(f);
+            }
+            std::vector<float> x(std::size_t{c.n_tok} * cols);
+            for (auto& v : x) v = dist(rng);
+            std::vector<float> gpu(std::size_t{c.n_tok} * rows);
+            auto wb = ctx.create_buffer((w.size() * 2 + 3) & ~std::size_t{3});
+            auto xb = ctx.create_buffer(x.size() * 4);
+            auto ob = ctx.create_buffer(gpu.size() * 4);
+            ctx.write_buffer(wb, std::as_bytes(std::span(w)));
+            ctx.write_buffer(xb, std::as_bytes(std::span(x)));
+            const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+            // rows, cols, out_offset, accumulate, w_off (halves), x_off,
+            // scale, n_tok, x_stride, out_stride, w/x/out bstride.
+            const std::uint32_t push[] = {
+                rows, cols, 0, 0, lead, 0,
+                std::bit_cast<std::uint32_t>(1.0f), c.n_tok, cols, rows,
+                0, 0, 0};
+            ctx.begin_batch();
+            ctx.dispatch(c.kernel, bufs, push,
+                         VulkanContext::matvec_groups(c.kernel, rows));
+            ctx.end_batch();
+            ctx.read_buffer(ob, std::as_writable_bytes(std::span(gpu)));
+            const locus::backend::Mat m{
+                c.type, reinterpret_cast<const std::byte*>(w.data() + lead),
+                rows, cols};
+            for (std::uint32_t t = 0; t < c.n_tok; ++t) {
+                std::vector<float> cpu(rows);
+                locus::backend::matvec(
+                    m, std::span(x).subspan(std::size_t{t} * cols, cols), cpu);
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    INFO("token " << t << " row " << r);
+                    REQUIRE(gpu[std::size_t{t} * rows + r] ==
+                            Catch::Approx(cpu[r]).margin(1e-3));
+                }
+            }
+            ctx.destroy_buffer(wb);
+            ctx.destroy_buffer(xb);
+            ctx.destroy_buffer(ob);
+        }
+    }
+}
+
 TEST_CASE("vulkan k-quant matvec matches the CPU reference",
           "[vulkan]") {
     if (!VulkanContext::available()) {

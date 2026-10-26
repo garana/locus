@@ -56,6 +56,30 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     std::span<float> normed_out = {});
 
 /**
+ * Runs one position for each of several sequences of one cache in a
+ * single command batch (i#267: Janus's two CFG sequences). Every
+ * projection reads its weights once for all the sequences (the
+ * matvec_*_n kernels, up to 8 rows); rope, the KV store and attention
+ * run per sequence over its own pages. Each step is what
+ * vulkan_forward would do with the same inputs.
+ *
+ * Dense llama-family models only: no MLA, no MoE, no q / k norm or
+ * qkv bias, an F32 KV cache, and every weight F32, F16, BF16 or Q8_0
+ * (the types with a short-batch kernel; K-quant models are faster as
+ * one vulkan_forward per sequence). The caller has checked every step
+ * (TransformerModel::forward_embeddings).
+ *
+ * @param row_begin First head row to compute (row_end > row_begin).
+ * @returns true when it ran (each seq advanced; logits[row_begin,
+ *     row_end) and normed_out filled); false when unsupported, before
+ *     any state changes, so the caller runs the steps one at a time.
+ */
+bool vulkan_forward_multi(const model::TransformerModel& m,
+                          std::span<const model::EmbedStep> steps,
+                          kv::PagedKvCache& cache, std::uint32_t row_begin,
+                          std::uint32_t row_end);
+
+/**
  * Runs N tokens of one sequence (a prefill chunk) through the GPU
  * in one command batch: every projection is a tiled matmul over
  * the chunk's token rows, so each weight is read once per chunk

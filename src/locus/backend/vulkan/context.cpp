@@ -43,6 +43,10 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ8_0P:
         case Kernel::kMatvecQ8_0GluP:
         case Kernel::kMatvecF32N:
+        case Kernel::kMatvecF16N:
+        case Kernel::kMatvecBF16N:
+        case Kernel::kMatvecF16N2:
+        case Kernel::kMatvecBF16N2:
             return (rows + 3) / 4;
         case Kernel::kMatvecQ4_K:  // 8 rows of 16 lanes
         case Kernel::kMatvecQ4_KB:
@@ -203,6 +207,11 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "attn_decode_grp8_f16_spv.h"
 #include "matvec_bf16_b_spv.h"
 #include "matvec_bf16_spv.h"
+#include "matvec_f16_n_spv.h"
+#include "matvec_bf16_n_spv.h"
+#include "matvec_f16_n2_spv.h"
+#include "matvec_bf16_n2_spv.h"
+#include "copy_spv.h"
 #include "rope_neox_spv.h"
 #include "rope_neox_b_spv.h"
 #include "matvec_q4_k_b_spv.h"
@@ -497,6 +506,15 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_matvec_bf16_spv), 3, 28},
     {Kernel::kMatvecBF16B, "matvec_bf16_b", locus_matvec_bf16_b_spv,
      sizeof(locus_matvec_bf16_b_spv), 4, 52},
+    {Kernel::kMatvecF16N, "matvec_f16_n", locus_matvec_f16_n_spv,
+     sizeof(locus_matvec_f16_n_spv), 3, 52},
+    {Kernel::kMatvecBF16N, "matvec_bf16_n", locus_matvec_bf16_n_spv,
+     sizeof(locus_matvec_bf16_n_spv), 3, 52},
+    {Kernel::kMatvecF16N2, "matvec_f16_n2", locus_matvec_f16_n2_spv,
+     sizeof(locus_matvec_f16_n2_spv), 3, 52},
+    {Kernel::kMatvecBF16N2, "matvec_bf16_n2", locus_matvec_bf16_n2_spv,
+     sizeof(locus_matvec_bf16_n2_spv), 3, 52},
+    {Kernel::kCopy, "copy", locus_copy_spv, sizeof(locus_copy_spv), 2, 12},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

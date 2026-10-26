@@ -159,6 +159,7 @@ if(Vulkan_FOUND)
             attn_paged_q kv_store_q moe_route
             kv_scatter moe_group moe_combine attn_softmax sum_splits
             matvec_t_q8 attn_decode attn_combine attn_decode_grp matvec_q8_0_n
+            copy
             # Variants: <kernel>=<source>:<define>[,<define>...], the
             # source compiled again with -D<define> for each.
             matvec_b=matvec:BATCHED
@@ -217,7 +218,11 @@ if(Vulkan_FOUND)
             silu_mul_sg=silu_mul:SIG_GATE
             moe_route_b=moe_route:BATCHED
             matvec_bf16=matvec_f16:BF16
-            matvec_bf16_b=matvec_f16:BATCHED,BF16)
+            matvec_bf16_b=matvec_f16:BATCHED,BF16
+            matvec_f16_n=matvec_q8_0_n:TYPE_F16
+            matvec_bf16_n=matvec_q8_0_n:TYPE_F16,BF16
+            matvec_f16_n2=matvec_q8_0_n:TYPE_F16,NT2
+            matvec_bf16_n2=matvec_q8_0_n:TYPE_F16,BF16,NT2)
         # Limits shared with the host, read from their one definition.
         set(LOCUS_VK_LIMITS
             ${CMAKE_SOURCE_DIR}/src/locus/backend/vulkan/limits.hpp)

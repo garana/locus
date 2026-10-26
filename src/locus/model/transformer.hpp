@@ -154,6 +154,18 @@ struct LogitRows {
 };
 
 /**
+ * One sequence's position for TransformerModel::forward_embeddings: the
+ * same inputs and outputs as forward_embedding, per sequence.
+ */
+struct EmbedStep {
+    tok::TokenId token = 0;          ///< ignored when embd_in is set
+    std::span<const float> embd_in;  ///< empty, or n_embd floats
+    kv::PagedKvCache::Seq* seq = nullptr;
+    std::span<float> logits;      ///< n_vocab floats
+    std::span<float> normed_out;  ///< n_embd floats
+};
+
+/**
  * Llama-family runtime over the scalar CPU backend, reading and
  * writing KV state through the paged cache so any number of
  * sequences can interleave (DESIGN.md M2/M3). Weights stay in the
@@ -368,6 +380,22 @@ class TransformerModel {
                            kv::PagedKvCache::Seq& seq, Workspace& ws,
                            std::span<float> logits, LogitRows rows,
                            std::span<float> normed_out) const;
+
+    /**
+     * forward_embedding for several sequences of one cache, one
+     * position each (Janus's two CFG sequences, i#267). On the vulkan
+     * backend a dense model takes vulkan_forward_multi: one command
+     * batch, each weight read once for all the sequences. Otherwise,
+     * or when that path declines, each step runs forward_embedding in
+     * turn.
+     *
+     * @param steps Distinct sequences, each with capacity ensured.
+     * @param rows Head rows to compute, for every step.
+     * @throws std::invalid_argument as forward_embedding, per step.
+     */
+    void forward_embeddings(std::span<const EmbedStep> steps,
+                            kv::PagedKvCache& cache, Workspace& ws,
+                            LogitRows rows) const;
 
     /**
      * Computes a sentence embedding for `tokens`: runs them through

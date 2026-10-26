@@ -1,0 +1,24 @@
+#version 450
+
+// Copies n floats: o[dst_off + i] = s[src_off + i]. The multi-sequence
+// decode (i#267) moves one sequence's row between its rows buffer and
+// the single-row buffers the decode attention reads and writes, which
+// take no offset.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer S { float s[]; };
+layout(std430, binding = 1) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint src_off;
+    uint dst_off;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n) {
+        o[pc.dst_off + i] = s[pc.src_off + i];
+    }
+}

@@ -1,8 +1,11 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -127,6 +130,102 @@ TEST_CASE("forward_embedding checks its token and rows like forward",
                 std::invalid_argument);
         }
         REQUIRE(s.n_tokens == 0);  // nothing ran
+    }
+}
+
+// i#267: forward_embeddings (two sequences at different positions, one
+// from a token and one from an input embedding, three steps) against
+// forward_embedding per sequence. The CPU loops forward_embedding, so
+// it is bit-identical; vulkan_forward_multi sums in another order than
+// vulkan_forward (the short-batch kernels), so within 1e-3, same
+// argmax.
+TEST_CASE("forward_embeddings matches forward_embedding per sequence",
+          "[model][e2e]") {
+    const std::string path = model_dir() + "stories260K.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    std::vector<const locus::backend::Backend*> backends = {nullptr};
+    if (locus::backend::vulkan_backend_usable()) {
+        backends.push_back(locus::backend::find_backend("vulkan"));
+    }
+    for (const auto* b : backends) {
+        auto model = locus::model::TransformerModel::load(g);
+        if (b != nullptr) {
+            model.use_backend(*b);
+            REQUIRE(locus::backend::vulkan_forward_supported(model));
+        }
+        INFO("backend " << model.active_backend().name);
+        const auto& hp = model.hparams();
+        const std::uint32_t V = hp.n_vocab, E = hp.n_embd;
+        std::vector<float> emb(E);
+        for (std::uint32_t i = 0; i < E; ++i) {
+            emb[i] = 0.01f * static_cast<float>(int(i * 7 % 13) - 6);
+        }
+        auto ws = model.make_workspace();
+        // ref: one sequence at a time; multi: both at once.
+        auto ref = model.make_cache(64), multi = model.make_cache(64);
+        locus::kv::PagedKvCache::Seq ra, rb, ma, mb;
+        std::vector<float> lr(V), nr(E), la(V), lb(V), na(E), nb(E);
+        auto feed = [&](locus::kv::PagedKvCache& c,
+                        locus::kv::PagedKvCache::Seq& s,
+                        std::initializer_list<locus::tok::TokenId> ts) {
+            for (const auto t : ts) {
+                REQUIRE(c.ensure_capacity(s, 1));
+                model.forward_embedding(t, {}, c, s, ws, lr, {}, nr);
+            }
+        };
+        feed(ref, ra, {1, 9, 23});
+        feed(ref, rb, {1, 5});
+        feed(multi, ma, {1, 9, 23});
+        feed(multi, mb, {1, 5});
+        for (const locus::tok::TokenId t : {7, 11, 3}) {
+            INFO("step token " << t);
+            for (auto* s : {&ra, &rb, &ma, &mb}) {
+                REQUIRE((s == &ra || s == &rb ? ref : multi)
+                            .ensure_capacity(*s, 1));
+            }
+            std::vector<float> ref_la(V), ref_na(E), ref_lb(V), ref_nb(E);
+            model.forward_embedding(t, {}, ref, ra, ws, ref_la, {}, ref_na);
+            model.forward_embedding(0, emb, ref, rb, ws, ref_lb, {}, ref_nb);
+            const locus::model::EmbedStep steps[2] = {
+                {t, {}, &ma, la, na}, {0, emb, &mb, lb, nb}};
+            model.forward_embeddings(steps, multi, ws, {});
+            REQUIRE(ma.n_tokens == ra.n_tokens);
+            REQUIRE(mb.n_tokens == rb.n_tokens);
+            const std::pair<const std::vector<float>*,
+                            const std::vector<float>*>
+                pairs[] = {{&ref_la, &la}, {&ref_lb, &lb},
+                           {&ref_na, &na}, {&ref_nb, &nb}};
+            for (const auto& [want, got] : pairs) {
+                if (b == nullptr) {
+                    REQUIRE(std::memcmp(want->data(), got->data(),
+                                        want->size() * 4) == 0);
+                    continue;
+                }
+                for (std::size_t i = 0; i < want->size(); ++i) {
+                    REQUIRE((*got)[i] ==
+                            Catch::Approx((*want)[i]).margin(1e-3));
+                }
+            }
+            REQUIRE(std::max_element(la.begin(), la.end()) - la.begin() ==
+                    std::max_element(ref_la.begin(), ref_la.end()) -
+                        ref_la.begin());
+            REQUIRE(std::max_element(lb.begin(), lb.end()) - lb.begin() ==
+                    std::max_element(ref_lb.begin(), ref_lb.end()) -
+                        ref_lb.begin());
+        }
+        // All or nothing: a step without capacity throws before any
+        // sequence advances.
+        locus::kv::PagedKvCache::Seq fresh;
+        REQUIRE(multi.ensure_capacity(ma, 1));
+        const auto before = ma.n_tokens;
+        const locus::model::EmbedStep bad[2] = {{1, {}, &ma, la, na},
+                                                {1, {}, &fresh, lb, nb}};
+        REQUIRE_THROWS_AS(model.forward_embeddings(bad, multi, ws, {}),
+                          std::invalid_argument);
+        REQUIRE(ma.n_tokens == before);
     }
 }
 
