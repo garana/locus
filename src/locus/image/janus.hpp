@@ -80,9 +80,10 @@ class JanusImageGen {
     /**
      * Wraps a text prompt as the reference does (Janus's "deepseek" SFT
      * template, empty system prompt) and tokenizes it: BOS, then
-     * "User: <text>\n\nAssistant:", then begin_of_image(). The text is
-     * stripped of leading and trailing whitespace first, as Python's
-     * str.strip() does in the reference.
+     * "<|User|>: <text>\n\n<|Assistant|>:", then begin_of_image(). The
+     * roles are Janus-Pro's special tokens (not Janus-1.3B's "User").
+     * The text is stripped of leading and trailing whitespace first, as
+     * Python's str.strip() does in the reference.
      *
      * @param tok The model's tokenizer (from the same GGUF).
      * @param text The image description.
