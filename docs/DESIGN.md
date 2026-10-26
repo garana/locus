@@ -1,1420 +1,591 @@
-# locus MVP Design
+# locus design
 
-Status: draft v1 (2026-07-17)
+Why locus is built the way it is, and the measurements behind the
+decisions. README.md has the current state and the pending work. The
+`R<n>` labels name design areas; code comments and `--help` refer to
+them.
 
 ## 1. The gap
 
-No pure C/C++ project today combines:
+No pure C/C++ project combined:
 
-- vendor-neutral GPU support (not NVIDIA-locked),
-- token/block-level paged KV cache,
-- continuous (iteration-level) batching,
-- a production serving front end,
+- vendor-neutral GPU support (not NVIDIA-locked);
+- a token-block paged KV cache;
+- continuous (iteration-level) batching;
+- a production serving front end;
 - a minimal, auditable dependency surface.
 
-llama.cpp has the portability and dependency discipline but not the
-high-concurrency scheduler; TensorRT-LLM has the scheduler but is
-NVIDIA-only with a heavy Python toolchain; LightLLM/vLLM/SGLang have
-both but sit on a large Python package ecosystem (supply-chain risk).
+llama.cpp has the portability and the dependency discipline, but not
+a high-concurrency scheduler. TensorRT-LLM has the scheduler, but is
+NVIDIA-only with a heavy Python toolchain. vLLM, SGLang and LightLLM
+have both, but sit on a large Python package ecosystem (a supply-chain
+risk).
 
 locus targets that intersection: llama.cpp's footprint with a
-LightLLM-class serving core. See docs/COMPARISON.md for the
-engine-by-engine landscape, including AirLLM -- the closest neighbor
-on the bigger-than-RAM streaming thesis (it streams layers too, but
-one sequence at a time with no batching, so it is I/O-bound; locus
-amortizes the same streaming across a batch).
+LightLLM-class serving core. Its distinctive lever is running models
+that do not fit in memory, by streaming weights and amortizing the
+stream across a batch. AirLLM also streams layers, but one sequence at
+a time with no batching, so it is I/O-bound (docs/COMPARISON.md).
 
-## 2. MVP thesis
+## 2. Thesis
 
-The differentiating components are the KV-cache manager, the
-scheduler, and the batch executor -- not the kernels. Kernels are
-commodity and swappable. Therefore the MVP:
+The differentiating parts are the KV-cache manager, the scheduler and
+the batch executor, not the kernels. Kernels are commodity and
+swappable. So:
 
-1. Builds the serving core (paged KV, continuous batching) first,
-   against a simple CPU backend where paged attention is trivial to
-   implement correctly (a gather loop).
-2. Treats the compute backend as a narrow interface so a Vulkan
-   backend (vendor-neutral GPU) can be added without touching the
-   scheduler.
-3. Reuses the GGUF model format for ecosystem compatibility: every
-   quantized model published for llama.cpp becomes loadable here.
+1. The serving core (paged KV, continuous batching) came first, on a
+   simple CPU backend where paged attention is a plain gather loop.
+2. The compute backend is a narrow interface, so a GPU backend plugs
+   in without touching the scheduler.
+3. The model format is GGUF, so every quantized model published for
+   llama.cpp loads here.
 
-Correctness first, single-node CPU throughput second, GPU third.
+Correctness first, then CPU throughput, then GPU.
 
-## 3. Non-goals (MVP)
+## 3. Non-goals
 
 - Training or fine-tuning.
-- Multi-node serving / tensor parallelism across hosts.
-- Non-Llama-family architectures (MoE, multimodal) before M5.
+- Tensor parallelism across hosts (section 14 explains why pipeline
+  and expert parallelism are the multi-host axes instead).
 - Python bindings.
-- Windows support (macOS + Linux only initially).
+- Windows (macOS and Linux only).
 
 ## 4. Architecture
 
     +------------------------------------------------------------+
-    | HTTP server (OpenAI-compatible, SSE streaming)         M4  |
+    | HTTP server: OpenAI + Anthropic APIs, SSE streaming        |
     +------------------------------------------------------------+
-    | Scheduler: admission, continuous batching, preemption  M3  |
+    | Scheduler: admission, continuous batching, preemption      |
     +---------------------+--------------------------------------+
-    | PagedKvCache        | BatchExecutor                     M3 |
+    | PagedKvCache        | Batch executor                       |
     | block alloc,        | ragged batch assembly,               |
-    | ref-count/COW       | one forward pass per iteration       |
+    | ref-count / COW     | one forward pass per iteration       |
     +---------------------+--------------------------------------+
-    | Model runtime: Llama-family forward pass               M2  |
+    | Model runtime: per-architecture forward pass (ArchSpec)    |
     +------------------------------------------------------------+
-    | Backend interface: matmul, rmsnorm, rope, attention        |
-    |   CpuBackend (M2)  ...  VulkanBackend (M5)                 |
+    | Backend interface: matvec, dequant, batched matvec, ...    |
+    |   neon / sse4 / scalar (CPU)   vulkan   cuda               |
     +------------------------------------------------------------+
-    | GGUF loader (hardened) + tokenizer                     M1  |
+    | GGUF loader (hardened) + tokenizers + chat templates       |
     +------------------------------------------------------------+
 
 ### 4.1 PagedKvCache
 
-- KV memory is a pool of fixed-size blocks (default 16 tokens per
-  block, configurable). A sequence's cache is a list of block ids;
-  blocks need not be contiguous.
-- Blocks are ref-counted so sequences forked from a shared prefix
-  (system prompts, beam candidates) share blocks copy-on-write.
-- `BlockAllocator` (implemented, `src/locus/kv/`) owns the free
-  list, ref counts, and utilization stats. It is pure bookkeeping:
-  no tensor memory, so it is unit-testable in isolation and reused
-  unchanged by every backend.
+- KV memory is a pool of fixed-size blocks (16 tokens by default). A
+  sequence's cache is a list of block ids; blocks need not be
+  contiguous.
+- Blocks are ref-counted, so sequences forked from a shared prefix
+  (system prompts) share blocks copy-on-write.
+- `BlockAllocator` (`src/locus/kv/`) owns the free list, the ref
+  counts and the usage stats. It holds no tensor memory, so it is
+  unit-tested alone and shared by every backend.
+- The pool can hold f32, f16, q8 or q4 rows (R14). On Vulkan the pool
+  is GPU-mapped, so attention reads K and V where they are written.
 
 ### 4.2 Scheduler (continuous batching)
 
-- Iteration-level: after every forward pass, finished sequences
-  leave the batch and queued sequences join it. No static batches.
-- Admission control: a request is admitted when the allocator can
-  cover its prompt blocks plus a configurable decode headroom.
-- Preemption (when the pool runs dry): evict the newest sequence
-  and recompute it later (MVP policy: recompute, not swap-to-host).
-- Fairness: FCFS with a cap on per-iteration prefill tokens so long
-  prompts cannot starve decoding sequences (chunked prefill).
+- Iteration-level: after every forward pass, finished sequences leave
+  the batch and queued ones join. No static batches.
+- Admission: a request is admitted when the allocator can cover its
+  prompt blocks plus a decode headroom.
+- Preemption, when the pool runs dry: evict the newest sequence and
+  recompute it later (recompute, not swap to host).
+- Fairness: first come, first served, with a cap on prefill tokens per
+  iteration (chunked prefill), so long prompts do not starve decoding
+  sequences.
 
 ### 4.3 Backend interface
 
-Narrow, tensor-op level API (about 8 entry points): embedding
-lookup, matmul (weights possibly quantized), rmsnorm, rope, paged
-attention (takes a block table, not a contiguous cache), silu/mul,
-softmax, sampling helpers. CPU implementation uses plain C++ with
-optional Accelerate/BLAS; correctness reference for all later
-backends. Vulkan is the chosen GPU path because it is the only
-vendor-neutral option that ships on macOS (MoltenVK), Linux/AMD,
-and Linux/NVIDIA without per-vendor toolchains.
+A narrow, op-level table (`backend::Ops`): matvec, dequant, batched
+matvec, the 8-bit activation matvec (R16), an optional prefetch hook
+and a KV allocator. The scalar CPU backend is the correctness
+reference for all others. Vulkan is the GPU path because it is the
+only vendor-neutral option that ships on macOS (MoltenVK), on Linux
+with AMD, and on Linux with NVIDIA, without a per-vendor toolchain.
+CUDA is a second GPU path for NVIDIA hosts.
 
-Backends are runtime-selectable: a registry (backend/registry.cpp)
-lists every compiled variant with availability on the running
-machine; the model routes heavy ops (matvec, dequant) through the
-chosen entry. Selection order: --backend flag > LOCUS_BACKEND env
-var > best available. `--backends` prints the registry. Every
-variant must match the scalar reference in tests, and the golden
-e2e runs through whatever backend is the machine's default.
+Backends are selected at runtime. A registry lists every compiled
+variant and whether the machine supports it; `--backend` beats
+`LOCUS_BACKEND`, which beats the best available. Every variant must
+match the scalar reference in tests, and the golden end-to-end tests
+run on every selectable backend.
 
-Vectorized CPU kernels follow the scheme proven in ../pbw: each
-SIMD variant (neon, sse4, avx2, avx512) lives in its own source
-file compiled with only that variant's flags, gated at configure
-time by check_cxx_compiler_flag; `locus::sys::detect()` probes
-the running machine and the backend picks the best variant at
-runtime. This keeps one binary portable across CPU generations.
-Build-time detection for both SIMD and Vulkan (find_package +
-loader link, later glslc-to-embedded-SPIR-V as in pbw) is wired
-up since M0; the kernels themselves land in M2 (CPU) and M5
-(Vulkan).
+SIMD kernels follow the scheme of the sibling `pbw` project: each
+variant (neon, sse4, avx2) is its own source file, compiled with only
+that variant's flags and gated at configure time;
+`locus::sys::detect()` probes the running machine. One binary stays
+portable across CPU generations. Vulkan shaders are compiled to
+SPIR-V and embedded at build time.
 
 ### 4.4 GGUF loader
 
-Parsing untrusted model files is an attack surface (llama.cpp has
-had parser CVEs). Rules: bounds-check every offset against file
-size, no allocation sized by unvalidated fields, fuzz corpus in
-tests from day one, mmap read-only.
+Parsing untrusted model files is an attack surface (llama.cpp has had
+parser CVEs). Rules: bounds-check every offset against the file size;
+no allocation sized by an unvalidated field; a fuzz corpus in the
+tests; mmap read-only.
 
 ### 4.5 HTTP server
 
-OpenAI-compatible `/v1/completions` and `/v1/chat/completions`
-with SSE streaming, plus `/health`. Decision (M4): vendored
-cpp-httplib (MIT) for HTTP and nlohmann/json (MIT) for parsing
-untrusted request bodies -- hand-rolled JSON parsing is exactly
-where API vulnerabilities come from. A worker thread drives
-Engine::step(); handler threads submit and wait on a condition
-variable (EngineLoop). Chat messages are formatted by
-chat::ChatTemplate (R2): the GGUF Jinja source is fingerprinted
-to a known family (llama3, chatml, llama2, zephyr, deepseek) and
-rendered by a hardcoded formatter; unknown templates fall back to
-plain concatenation.
+Vendored cpp-httplib for HTTP and nlohmann/json for untrusted request
+bodies: hand-rolled JSON parsing is where API vulnerabilities come
+from. A worker thread drives `Engine::step()`; handler threads submit
+and wait (`EngineLoop`). Chat messages are formatted by
+`chat::ChatTemplate`: the GGUF's Jinja source is fingerprinted to a
+known family (llama3, chatml, llama2, zephyr, deepseek) and rendered
+by a hardcoded formatter; an unknown template falls back
+to plain concatenation. Endpoints that run the model on their own
+thread (images, vision chat, audio) share the GPU backend through one
+process-wide lock (#268).
 
 ## 5. Milestones
+
+The MVP milestones, each with its exit test:
 
 | Milestone | Deliverable                                  | Exit test                                   |
 |-----------|----------------------------------------------|---------------------------------------------|
 | M0        | Repo, CMake, Catch2, BlockAllocator          | unit tests green                            |
-| M1        | GGUF loader + tokenizer                      | loads TinyLlama GGUF; fuzz corpus passes    |
+| M1        | GGUF loader + tokenizer                      | loads a TinyLlama GGUF; fuzz corpus passes  |
 | M2        | CPU forward pass, greedy decode, 1 sequence  | token-exact vs llama.cpp golden output      |
-| M3        | PagedKvCache + scheduler + batch executor    | N concurrent streams, correct + no leaks    |
-| M4        | HTTP server, SSE streaming                   | OpenAI client works against it              |
-| M5        | Vulkan backend with paged attention          | M2/M3 tests pass on GPU, faster than CPU    |
+| M3        | PagedKvCache + scheduler + batch executor    | N concurrent streams, correct, no leaks     |
+| M4        | HTTP server, SSE streaming                   | an OpenAI client works against it           |
+| M5        | Vulkan backend with paged attention          | M2/M3 tests pass on the GPU                 |
 
-M5 exit status (2026-07-18): golden and engine tests pass on the
-vulkan backend (full GPU forward incl. paged attention over the
-GPU-mapped pool); "faster than CPU" holds at real-model matrix
-sizes (2048^2 matvec ~4.7x vs scalar), while the 260K test model
-stays CPU-bound by per-token dispatch overhead.
+The areas built after the MVP:
+
+| Area | What                                                        | Section |
+|------|-------------------------------------------------------------|---------|
+| R1   | byte-level BPE tokenizer, llama3 rope scaling               |         |
+| R2   | chat templates (fingerprinted families, no Jinja engine)    | 4.5     |
+| R3   | K-quants on CPU and Vulkan                                  |         |
+| R4   | MoE FFN: router, 3-D expert tensors, per-expert matvec      |         |
+| R5   | MLA and the deepseek2 architecture                          |         |
+| R6   | architecture registry (`ArchSpec`; `--archs`)               |         |
+| R8   | weight streaming and GPU weight paging                      | 7, 8    |
+| R9   | threaded matvec and static pinning                          | 9       |
+| R10  | batched forward: prefill and continuous-batch decode        | 11      |
+| R11  | cache-blocked batched matvec                                | 12      |
+| R12  | sampling, JSON mode, prompt caching, speculative decoding   | 13      |
+| R13  | more architectures and quant types                          | 13      |
+| R14  | embeddings, KV-cache quantization                           | 13      |
+| R15  | API polish; multi-server inference                          | 13, 14  |
+| R16  | 8-bit activations (llama.cpp's Q8_K / Q8_0 dots)            | 15      |
 
 ## 6. Dependency policy
 
-- Runtime deps: libc, libc++, OS APIs. Nothing else by default.
-- Vendored (in-tree, pinned, sha256 recorded in the commit that
-  imports them, license files alongside): Catch2 v3.7.1 (BSL-1.0,
-  tests only), cpp-httplib v0.18.3 (MIT), nlohmann/json v3.11.3
-  (MIT), stb_image v2.30 (MIT or public domain; PNG and JPEG only,
-  for image input, until our own decoders replace it, i#250).
-- No FetchContent/network at configure or build time.
-- Optional system deps behind CMake flags: BLAS/Accelerate, Vulkan.
-
-## 7. Post-MVP roadmap: DeepSeek-family and Kimi K3
-
-Goal: run DeepSeek V3/R1-class models (which also covers Kimi K2,
-same "deepseek2" GGUF architecture) and eventually Kimi K3. Phases
-are ordered so each lands independently testable on hardware we
-have; the big-model phases are correctness-first via small
-same-architecture models (e.g. DeepSeek-V2-Lite, 16B total / 2.4B
-active) before any large-scale run.
-
-| Phase | Deliverable                       | Unblocks                    |
-|-------|-----------------------------------|-----------------------------|
-| R1    | Byte-level BPE tokenizer (done    | all non-SPM models          |
-|       | 2026-07-18, incl. llama3 rope     |                             |
-|       | scaling via rope_freqs.weight)    |                             |
-| R2    | Chat templates (done 2026-07-18:  | instruct/chat checkpoints   |
-|       | fingerprinted families, no Jinja) |                             |
-| R3    | K-quants (Q4_K/Q5_K/Q6_K) CPU +   | most published GGUFs of     |
-|       | Vulkan kernels (done 2026-07-19)  | large models                |
-| R4    | MoE FFN: top-k router, 3-D expert | Mixtral-style llama-arch    |
-|       | tensors, per-expert matvec (done  | MoE; DeepSeek gating        |
-|       | 2026-07-19: softmax gating,       | (sigmoid+bias, shared       |
-|       | Mixtral-style; GPU MoE dispatch   | experts) moves to R5 with   |
-|       | added 2026-07-20)                 | the deepseek2 arch          |
-| R5    | MLA + deepseek2 arch (done        | DeepSeek-V2 verified        |
-|       | 2026-07-19: absorbed latent-KV    | token-exact vs llama.cpp;   |
-|       | cache, interleaved YARN rope,     | V3/R1/K2 still need         |
-|       | DeepSeek gating, shared experts,  | q_lora_rank + sigmoid       |
-|       | Q5_0; full GPU MLA+MoE dispatch   | gating at scale             |
-|       | added 2026-07-20, 3x NEON on      |                             |
-|       | V2-Lite)                          |                             |
-| R6    | Architecture registry (done       | new arch = one ArchSpec     |
-|       | 2026-07-20: ArchSpec hooks for    | entry; --archs lists them   |
-|       | hparams/tensors/attention/kv_dim) |                             |
-| R7    | Kimi K3: Kimi Delta Attention     | K3 once weights + GGUF      |
-|       | (per-layer recurrent state        | support exist (due          |
-|       | alongside paged KV), MXFP4        | 2026-07-27); arch id not    |
-|       | blocks, AttnRes                   | yet upstreamed              |
-| R8    | Scale-out ergonomics: expert      | practical big-MoE hosting   |
-|       | weights served straight from the  | on big-RAM hosts            |
-|       | read-only mmap (OS page cache as  |                             |
-|       | the working set), multi-token     |                             |
-|       | GPU batching for prefill          |                             |
-
-Notes:
-- MoE fits the existing design well: the scheduler, paged KV, and
-  server layers are unchanged; the work concentrates in the
-  loader (3-D tensors, new quant types), the FFN block, and the
-  backend op tables (per-expert matvec).
-- MLA *shrinks* the KV cache (latents instead of full K/V), which
-  compounds with paged allocation; KDA layers instead carry fixed
-  -size recurrent state per sequence -- a new cache kind next to
-  the paged pool, owned by the same allocator story.
-- Hardware reality: K3-class (2.8T, ~1.5 TB MXFP4) stays
-  cluster/big-RAM territory regardless of engine quality. The
-  roadmap therefore optimizes for correctness on small
-  same-architecture models locally, with mmap + page-cache
-  residency as the path to "runs on a 2 TB RAM host".
-- R8 starts with measurement, not code: on the first real
-  bigger-than-RAM model we can load (GLM-5.2 target), record the
-  passive-streaming baseline -- peak RSS vs model size, page
-  faults, cold/warm tokens/sec, and unique experts touched per
-  token window (the true working set). Deliberate residency and
-  prefetch policies are only justified by beating that baseline;
-  the same numbers gate the Vulkan/CUDA paging designs.
-- Baseline, first cut (2026-07-21, GLM-5.2 UD-IQ1_S 216 GB,
-  neon, cold cache, 8 forwards): 509 s wall (~60 s/token), peak
-  RSS 15.4 GB (~7% of the model; only ~1 GB dirty -- the rest is
-  evictable page cache), 8.7 M page faults. Expert telemetry via
-  LOCUS_MOE_STATS (locus-run prints it at exit); Moonlight
-  reference point: 11 forwards touch 43.8% of layer-expert
-  slots, so routing spreads fast -- prefetch wins, if any, come
-  from *within-token* expert readahead (overlap SSD reads across
-  the 8 routed experts per layer), not from cross-token reuse.
-- First policy result (2026-07-21): LOCUS_EXPERT_READAHEAD
-  (madvise WILLNEED on all routed experts at selection time)
-  measures 12% faster wall (524.4s -> 461.7s over 8 cold
-  forwards) at equal fault counts (8.74M both legs -- proof both
-  ran equally cold) and -23% sys time. Output identical. Next
-  levers: readahead one layer AHEAD (route layer l while l-1
-  computes is not possible -- routing depends on l's input -- but
-  shared-expert and dense tensors of l+1 are known statically);
-  and larger overlap via aggregating madvise calls per layer.
-- Second policy result (2026-07-21): LOCUS_LAYER_READAHEAD
-  (hint layer l+1's static weights at the start of layer l)
-  stacked on expert readahead measures 351.4s over the same 8
-  cold forwards -- 33% under the 524.4s passive baseline and
-  24% under expert-readahead alone (461.7s), at equal fault
-  counts (8.74M; equally cold) with sys time down 60.9s ->
-  22.9s. RSS rises 9.2GB -> 13.2GB (~6% of the model) as
-  readahead keeps more of the window resident. ~44s/token.
-  Both policies are DEFAULT-ON since then (the flags
-  LOCUS_EXPERT_READAHEAD / LOCUS_LAYER_READAHEAD are gone);
-  LOCUS_NO_READAHEAD=1 restores passive streaming for A/Bs.
-  Since 2026-10-24 the madvise hints run only when the weights
-  may stream (weights_stream: more than half of RAM, or RAM
-  unknown); a model that fits stays resident after one pass, and
-  hinting resident pages per token is not free (Orpheus 3B on
-  M4: ~4.5 ms/token, 17% of decode). The pager's op.prefetch
-  hints are unaffected. The cost: a model under half of RAM
-  loads its first pass cold without the hints (the 33% GLM gain
-  was cold streaming). A later refinement could keep them for the
-  first N tokens.
-- Future work (2026-07-21): overlap I/O with compute one step
-  ahead. Mechanism notes: each shard is mmap'd once, whole-file
-  (PROT_READ MAP_PRIVATE, never written) -- weight pages are
-  clean file-backed, so eviction drops them and re-reads from
-  the GGUF; they never hit swap. WILLNEED is already async
-  kernel readahead, so a thread touching the SAME pages the
-  hints cover would only duplicate it (Gonzalo's observation).
-  Plan, in order: (1) hints-first -- at the start of layer l,
-  WILLNEED layer l+1's statically-known tensors (attn, dense,
-  shared expert), which today get no hint at all; (2) A/B it;
-  (3) PARKED (Gonzalo, 2026-07-21): a forcing prefetch thread
-  that touches pages. Revisit only if, after wider hints, large
-  sys time remains as evidence the kernel drops or caps
-  advisory readahead.
-- GLM-5.2 correctness + telemetry (2026-07-21): bounded
-  CPU-only llama-completion (-ngl 0 --no-warmup -c 512; Metal
-  full-offload wired 216GB and crashed the host -- never again)
-  produces "Once upon a time, there was a" -- token-exact with
-  locus at 4 greedy tokens. LOCUS_MOE_STATS over the same 8
-  forwards: 4256 activations, 29-52 unique experts per MoE
-  layer, 14.7% of the 76x256 layer-expert slots touched.
-  Moonlight hit 43.8% in 11 forwards; at 256 experts the
-  working set disperses slower in relative terms but the
-  absolute bytes stay huge -- confirms within-token prefetch
-  over cross-token caching at GLM scale too.
-- GLM-5.2 re-anchored after the nextn/blk.78 exclusion
-  (2026-07-23, on vx): locus (sse4) and a CPU-only llama.cpp
-  (llama-simple, GGML_CUDA=OFF, -ngl 0, build b1-e8e6c7a)
-  agree BYTE-EXACT on 16 greedy tokens for "Once upon a time":
-  "Once upon a time, there was a little girl named Lily who
-  loved to explore the world around her". Confirms the MTP
-  block exclusion is correct past the old 4-token anchor.
-  256-expert telemetry over 16 forwards: 11400 activations,
-  52-108 unique experts per MoE layer, 27.4% of the 75x256
-  slots touched. Cold llama.cpp on the vx RAID: ~124 s/tok
-  (67min load + 33min decode), 171k major faults, 28.5GB RSS;
-  locus's 40min run was warm-cache (ran second) so not a fair
-  cold perf comparison -- the ~124 s/tok cold reference is the
-  real "GLM on spinning disk" datapoint.
-- Cold(-ish) locus (2026-07-23, GLM shards fadvise-evicted on
-  vx): 50.7 min total for 16 tok (~190 s/tok all-in; lazy mmap,
-  no separate load step), 82.5 GB read, 28.3 GB reclaimable RSS.
-  So locus is faster END-TO-END than the cold llama.cpp
-  reference (50.7 vs 92 min) because it streams lazily instead
-  of front-loading the whole model. Methodology caveat to
-  remember: locus major-fault counts are a FALSE coldness signal
-  -- R8 readahead faults pages in ahead of access, so they never
-  count as major faults (55.8k cold vs 54.6k warm, ~equal); use
-  bytes-read (82.5 GB cold vs 70 GB warm) to judge coldness. The
-  16-tok working set (27.4% of slots) exceeds the 28 GB page
-  cache, so GLM is disk-bound regardless of warmth on that RAID.
-- Memory bounding (2026-07-22, after llama.cpp's Metal
-  full-offload crashed the 32GB host): locus's dirty memory is
-  the KV pool + workspaces; weights are clean file-backed pages
-  the kernel can always evict. Two knobs tighten it further:
-  --ctx N caps the KV pool in tokens from the CLI, and
-  LOCUS_WEIGHT_WINDOW=1 madvises DONTNEED (inward-aligned) on
-  each layer's routed experts right after use so streamed
-  models never build up page-cache pressure -- gated on the
-  weights being file-backed, because DONTNEED on an anonymous
-  in-memory image would discard the contents. Statics, shared
-  experts and pinned weights are never dropped.
-- Multimodal (K3 vision) is explicitly out of scope until the
-  text path is proven.
-
-### R8-GPU: weight paging (Vulkan; mirrored on CUDA)
-
-Problem. The GPU backends have no middle ground today: Vulkan
-uploads every weight once into an unbounded resident map
-(matvec_vulkan State::resident, keyed by host pointer, never
-evicted), so a model must fit in device memory; CUDA re-uploads
-per matvec call, so nothing is ever reused. Neither serves
-bigger-than-VRAM models.
-
-Design: a weight pager per GPU backend.
-
-- Page unit: one whole tensor for static weights; one expert
-  slice (ExpertMat::expert_bytes) for routed-expert tensors, so
-  paging granularity matches routing granularity.
-- Budget: fixed device-byte budget. Knob LOCUS_GPU_POOL_MB;
-  default queries the device-local heap and takes ~80% after
-  the KV pool and activation buffers. The budget counts bytes
-  as uploaded, which differs per backend (agreed with
-  claude-vx-locus 2026-07-21): both CUDA and Vulkan keep
-  weights QUANTIZED on-device for types their kernels dequant
-  in-shader (Q4_K is ~0.5 B/weight, so ~8x more model fits in
-  2GB VRAM); paths that dequantize at upload count F32 size
-  (fused wkv_b on both backends; on Vulkan also any type
-  without a matvec shader).
-- Page table: host pointer -> {buffer, last_use, pin count}.
-  Pages referenced by the command batch being recorded are
-  pinned; unpinned pages evict LRU when an upload would exceed
-  the budget. Eviction frees the device buffer only -- the
-  source of truth stays the host mmap, exactly like the kernel
-  page cache story on the CPU side.
-- Prefetch: same schedule that won 33% on the CPU. While layer
-  l's compute is recorded/submitted, upload layer l+1's static
-  tensors; at MoE selection time (routing is already CPU-side
-  per layer) upload the routed experts before their matmuls.
-  Vulkan uses a dedicated transfer queue when the device has
-  one (semaphore into the compute submit), else copies batch
-  ahead of the compute dispatches on the same queue. CUDA
-  mirrors with cudaMemcpyAsync on a second stream + events.
-  LOCUS_NO_READAHEAD=1 disables prefetch (demand-only paging),
-  keeping one opt-out for the whole R8 family.
-- Pipeline composition: the CPU-side WILLNEED hints stay on --
-  SSD -> page cache (kernel readahead) -> VRAM (pager) overlap
-  the same one-step-ahead schedule end to end.
-- Telemetry: pool hit rate, bytes uploaded/token, evictions,
-  printed with the LOCUS_MOE_STATS report.
-
-Exit test: deepseek-v2-lite Q4_K on vulkan with
-LOCUS_GPU_POOL_MB set below the model's weight bytes must
-reproduce the llama.cpp golden token-exact with evictions > 0
-in telemetry -- paging proven, not mere residency. The CUDA
-mirror validates the same way on vx (2GB VRAM makes the
-sub-model budget the natural case).
-
-Full-GPU GLM Vulkan quant coverage (done): GLM-5.2 uses four quant
-types Vulkan previously fell back to host scalar on -- Q2_K (5c1a6e2)
-and IQ2_XXS/IQ3_XXS/IQ4_XS (abe0b1a, 830966c). Each ports its
-cpu_ops dequant_block_* into a GLSL matvec (dequant fused into the
-dot), validated on the M2 (MoltenVK) vs the scalar reference in
-[vulkan]. The IQ2/IQ3 grid tables reach the GPU the way CUDA does
-(device_iq1s_grid): a persistent SSBO of grid + ksigns_iq2xs bound
-as a 4th input for those kernels (the pipe table already carries a
-per-kernel binding count); IQ4_XS is grid-free (kvalues_iq4nl
-embedded as a GLSL const). So every GLM quant type now has a Vulkan
-matvec -- no host-scalar fallback. The CUDA twin (Q2_K + IQ2/IQ3/IQ4
-device kernels) is the remaining gap for full-GPU GLM on CUDA.
-
-Prefetch hook contract (agreed with claude-vx-locus
-2026-07-21): backend::Ops grows an optional
-`void (*prefetch)(const Mat& w)` -- the backend MAY begin an
-async host-to-device upload of w so a later matvec(w) finds it
-resident; fire-and-forget; nullptr on backends without a pager
-(CPU always; Vulkan/CUDA until theirs lands). The model calls
-it, gated by the same readahead-enabled condition as the
-madvise hints and mirroring those sites 1:1: forward() fires
-it for layer l+1's static Mats next to advise_layer_statics,
-moe_ffn() for the three expert(e) slices next to
-advise_willneed. Invariant: the Mat passed to prefetch is
-IDENTICAL (same host .data) to the one later passed to matvec
--- that pointer is the pager's page-table key.
-
-Rollout order: (1) pager with demand paging only, default
-budget = unbounded to preserve today's behavior; (2) LRU +
-pinning under an explicit budget; (3) the prefetch schedule;
-(4) IQ shaders. Phases 1-2 for CUDA are backend-internal and
-started on vx; the Ops::prefetch field + llama.cpp call sites
-land together once the registry side exists.
-
-Vulkan pager status (2026-07-24): phases 1-2 landed
-(matvec_vulkan WeightPool, header src/locus/backend/vulkan/
-weight_pool.hpp). Host-pointer-keyed device buffers, byte
-budget via LOCUS_GPU_POOL_MB (default unbounded = identical to
-the old resident map), LRU eviction, buffers pinned for the
-open command batch and unpinned at end_batch, transient
-(uncached) fallback for a weight too big or when all resident
-buffers are pinned, [vulkan-pool] telemetry. The eviction core
-is unit-tested GPU-free via an injected buffer factory
-(test_vulkan_pool.cpp). One structural limit: Vulkan records a
-whole command batch per (sub-)token and end_batch submits+waits,
-so eviction only frees buffers between batches -- a single
-batch's working set must still fit device memory. A model whose
-per-batch working set exceeds VRAM needs finer batch splitting
-(future work); this is why deepseek-v2-lite on MoltenVK/M2
-(~10GB uploaded in one batch) fails with "end cmd" both with
-and without the pager -- a device limit, not a pager bug.
-Validation host: the Raspberry Pi 5 (VideoCore VII Vulkan,
-small VRAM) forces real cross-batch eviction on modest models
-and is where the real-model exit test runs; heavy runs stay off
-the 32GB MacBook.
-
-Exit test PASSED (2026-07-24, Raspberry Pi 5): llama-3.2-1b
-Q4_K_M on --backend vulkan produces byte-identical output to the
-scalar and unbounded-vulkan runs ("Once upon a time, in a small
-village nestled in the", 8 greedy tokens) under
-LOCUS_GPU_POOL_MB=64. Telemetry: budget 64MB, resident 63MB,
-hits 378, misses 1566, evictions 341, uploaded 8483MB (the
-0.8GB model re-streamed ~10x under the sub-working-set budget).
-So eviction fires and stays token-exact -- paging proven, not
-mere residency. (The Pi's tile GPU is slower than its CPU here,
-so the "GPU faster than CPU" perf assertion is a reported WARN,
-not a gate.)
-
-Prefetch (phase 3) DROPPED for Vulkan (2026-07-24, measured on
-V3D by profiling matvec_vulkan). On llama-3.2-1b, compute
-(end_batch submit+wait over the matvec shaders) is a fixed
-~66.8s for 16 tokens whether the pool is unbounded or paging
-hard; upload (a plain memcpy into HOST_COHERENT unified memory,
-no DMA engine) is 0.28% of compute unbounded and only 4.5% even
-under pathological paging (589 evictions, 14GB re-uploaded). So
-prefetch's absolute ceiling is <5%, and the overlap-with-compute
-fraction on a synchronous end_batch is realistically <2% -- not
-worth a second queue or a warm() pool variant. The measure-first
-plan paid off: the numbers killed it before any code landed.
-
-The real Vulkan MoE inefficiency (found in the same pass, now
-the next item): the MoE path uploads ALL hp.n_expert experts per
-layer per token via whole(), though only expert_used_count are
-routed (64 vs 6 on deepseek-v2-lite) -- ~10x wasted memcpy and
-residency. Fix: pool.acquire per PICKED expert (each
-expert(e).data is a distinct key, matching the pager's
-per-expert granularity), remapping the shader w_off from
-e*expert_bytes to the compact per-expert buffer. Likely the
-cause of, and fix for, the Pi's 10GB-MoE Vulkan crash: on the
-4GB Pi, deepseek-v2-lite on --backend vulkan SIGSEGVs
-(pool=2048MB) / OOM-kills (pool=256MB) because the whole-expert
-upload plus F32 dequant temporaries exceed RAM on top of the
-mmap -- it crashes rather than degrading. A graceful
-device-alloc guard (clean throw instead of SIGSEGV) is a
-secondary follow-up.
-
-deepseek-on-Vulkan root cause (2026-07-24, gdb on the Pi by
-claude-pi-locus -- NOT memory, as first assumed): the model has
-mixed expert quant (ffn_down_exps is Q5_0 in 14 of 26 MoE
-layers), and Vulkan has no Q5_0 matvec shader, so
-vulkan_forward() returns false at the first Q5_0 tensor and the
-model falls back to the generic per-op forward. That path drives
-ops.matvec through R9's matvec_mt (the thread pool), but the
-Vulkan matvec drives a single VulkanContext singleton -> N
-threads doing begin/dispatch/end_batch concurrently SIGSEGV in
-V3DV. Two fixes: (a) matvec_mt now runs a backend inline when
-Ops::mt_safe is false (vulkan) -- so ANY unshadered-type model
-degrades instead of crashing (commit cc5dfc1); (b) add a Q5_0
-Vulkan matvec shader so deepseek stays on the full-GPU path
-(claude-pi-locus). With routed-expert upload for residency,
-deepseek should then run on the 4GB Pi. (Q5_0 is the sole
-unshadered type deepseek needs; Q5_1 is a companion but unused
-here.) Operational note: do not run deepseek-on-Vulkan on the
-4GB Pi until Q5_0 lands -- it thrashes hard enough to trip the
-OOM killer on unrelated processes.
-
-MILESTONE -- first full-GPU MoE+MLA on real hardware (2026-07-24,
-Raspberry Pi 5 V3D, after Q5_0 f099051 + routed-expert 0daa990):
-deepseek-v2-lite-q4_k_m on --backend vulkan is token-exact with
---backend scalar ("Once upon a time, there was a", 4 tok) and
-FITS -- vulkan peak RSS 2011MB / min MemAvailable 1850MB on the
-4GB box (a 10GB model on the GPU path; scalar peaked higher,
-3114MB, since it dequants into host memory while the vulkan pool
-stays leaner). Confirms the full-GPU MLA + DeepSeek-MoE path end
-to end on a real model -- unvalidatable before (M2 MoltenVK
-can't run it, vx has no Vulkan device). Routed-expert upload
-verified staging ~6 experts/token not 64 ([vulkan-pool] @768MB:
-uploaded 13.6GB, hits 0, evictions 5627 -- pure streaming,
-per-token working set >> budget; that residency cut is what
-moved peak RSS from OOM-kill to 2.0GB). PERFORMANCE reality on
-V3D: vulkan 85s vs scalar/NEON 21s for prompt+4tok -- the GPU is
-~4x SLOWER here, consistent with the prefetch profiling (V3D is
-compute-bound and this run re-streams 13.6GB through the pager).
-Takeaway: on the Pi, Vulkan is a CAPABILITY win (correct full-GPU
-path, leaner RSS), not a speed win for bigger-than-pool models --
-NEON CPU wins those; Vulkan pays off only for models that FIT the
-pool (no re-streaming).
-
-### R9: threaded execution and static pinning (CPU)
-
-Motivation (measured, GLM-5.2 on the 32GB m2). With readahead
-default-on the profile is 78% single-core compute, ~15% I/O
-stall: we are compute-bound on ONE core. llama-completion on
-the same machine/model does 14.3 s/token CPU-only by using all
-cores. Faults say ~18GB streams per token: ~8.4GB routed
-experts (irreducible at temp-0 decode) + ~13GB statics that
-are identical every token. Ladder: threading -> ~15 s/token
-(then I/O-bound); + pinned statics and deeper overlap ->
-~4-6 s/token; MTP on top approaches the ~2-3 s/token disk
-floor.
-
-- R9.1 threaded matvec. Model-level row split: a heavy matvec
-  becomes T slices via mat_rows(w, r0, n) dispatched to a
-  persistent locus::sys::ThreadPool, each slice through the
-  ACTIVE backend's op.matvec into a disjoint out span. Each
-  row's dot is computed by the same kernel code as today, so
-  logits are bit-identical for every thread count. Knob
-  LOCUS_THREADS (default: hardware cores -- performance cores on
-  Apple silicon -- 1 disables). Applies
-  to the CPU forward's large matvecs (attention projections,
-  dense FFN, expert FFN, output head); matvec_t (small latent
-  ops) and the vulkan full forward are untouched. Parallel
-  slices also mean parallel page faults -- deeper NVMe queue,
-  which is the second half of the win on streamed models.
-  The llama-family arch hooks (llama, qwen2moe, qwen3moe,
-  dbrx, glm-dsa, MLA) had drifted to an inline op.matvec for
-  q/k/v; they were threaded again in #207 (Orpheus 3B neon
-  decode on M4 Max, 10 threads: 9.6 -> 15.6 tok/s), on the f32
-  dot at first, and since the R16 default flip through matvec_mt
-  like every other projection.
-- R9.2 static pinning. LOCUS_PIN_STATIC=1 mlocks every
-  non-expert weight (attention, norms via their mats, dense
-  FFN, shared experts, router, embeddings, output head) at
-  load. Best-effort like advise_willneed: on failure (rlimit)
-  it stays a plain fault-in. Opt-in because wiring ~13GB is a
-  policy decision on a 32GB machine, not a default.
-- R9.3 (parked): MTP decode via the nextn tensors GLM/DeepSeek
-  ship -- each accepted speculative token amortizes the per-
-  token weight stream. Revisit after R9.1/R9.2 measurements.
-
-Exit test: logits bit-identical across LOCUS_THREADS=1/2/8 on
-the synthetic models and the real-model goldens (validated on
-vx); GLM-5.2 wall time at or below llama.cpp's measured 14.3
-s/token on the same machine.
-
-Status (2026-07-22): R9.1/R9.2 landed with the DSA indexer
-(commit 0ffd1df); vx validated the full suite green plus cuda
-under LOCUS_THREADS=4 token-exact -- concurrent matvec slices
-compose with the weight pager (95% hit rate with prefetch, up
-from 92.3% demand-only; 22% vs 0% under a thrashing 512MB
-budget). R8-GPU phase 3 (op.prefetch model wiring + cuda
-second-stream pipeline) is complete end-to-end.
-
-GLM-5.2 wall-time exit test (2026-07-27, PASS, on vx -- 750 Ti /
-31GB RAM / 7200rpm SATA HDD, GLM-5.2 UD-IQ1_S 216GB, 16 tokens,
-cold, same box/model/prompt, all token-exact):
-  llama.cpp (CPU)  5523 s  345 s/tok  1.00x
-  locus sse4       3042 s  190 s/tok  1.82x
-  locus CUDA       1793 s  112 s/tok  3.08x  (fastest)
-locus <= llama.cpp: PASS, hardest on CUDA. This is the
-bigger-than-RAM streaming thesis realized: a 216GB model on a 31GB
-box (resident set ~15-28GB) served up to 3x faster than llama.cpp.
-The CUDA path validates the Q2_K/IQ2/IQ3/IQ4 device kernels on the
-real model (beyond synthetic units) AND is the fastest backend here
-despite the 750 Ti's ~1.2GB usable VRAM starving the pager (12.4%
-hit, 323k evictions, 601GB re-uploaded over PCIe for 16 tok): those
-re-uploads are host-RAM -> GPU (experts stay in page cache), cheap
-enough that GPU matvec still dominates sse4. Bigger VRAM would make
-CUDA even faster (less PCIe churn), not rescue a loss. (An earlier
-6-token CUDA sample wrongly read as a loss -- the cold first token
-was 1/6 of that average; matched 16-token counts settle it.)
-
-### DSA indexer: GLM-5.2 beyond top_k tokens
-
-Today glm-dsa runs dense-equivalent attention with n_ctx
-capped at attention.indexer.top_k (2048); the model's real
-context_length is 1M. The lightning indexer (DeepSeek-V3.2
-reference implementation, inference/model.py -- GLM-5.2 ships
-the same DSA) selects which cached tokens the MLA attention
-sees:
-
-- Per layer, per token: k_idx(s) = LayerNorm_{w,b}(
-  W_k x_s) in R^128, cached; q_idx(t) = W_qb q_a(t) viewed as
-  32 heads x 128; head weights w(t) = W_proj x_t in R^32.
-- Rope: applied to the FIRST rope.dimension_count (64) dims of
-  BOTH q_idx and k_idx, HALF-SPLIT (non-interleaved) -- the
-  reference is explicit that the indexer differs from the main
-  attention's interleaved rope here.
-- Score(t,s) = sum_h w_h(t) * ReLU(q_h(t) . k_idx(s)). Global
-  scale factors (n_heads^-0.5, softmax scale) do not change
-  the top-k ORDER, so selection ignores them.
-- Selection: top min(top_k, positions) scores; attention and
-  its softmax then run over the selected positions only. For
-  sequences <= top_k every position is selected, so the
-  existing dense-equivalent golden anchors correctness of the
-  whole path below 2048 tokens bit-exactly.
-- Storage: glm-dsa's cache row grows kv_dim 576 -> 704 (576
-  MLA latent+rope || 128 post-norm post-rope k_idx).
-- The n_ctx cap lifts for glm-dsa once the indexer is active
-  (KV pool still defaults to min(n_ctx, 4096) tokens).
-
-Validation limits, recorded honestly: llama.cpp IGNORES the
-indexer tensors (dense full-context fallback), so there is no
-external golden beyond top_k. Long-context real-model runs are
-impractical on current hardware (>2048 sequential forwards at
-tens of s/token). So: synthetic-model unit tests assert (a)
-short sequences reproduce the dense path bit-exactly, (b)
-beyond top_k exactly k positions are attended and outputs stay
-finite, (c) selection picks the positions a scalar reference
-scores highest. Real-model long-context quality is future work
-on faster hardware.
-
-### R10: batched forward (prefill + continuous-batch decode)
-
-The executor -- Engine::advance() -> model_.forward() -- runs ONE
-token per call. So it processes N tokens as N full passes over
-the weights, whether those N are prompt positions or N
-concurrent sequences' decode tokens. locus already does
-continuous batching at the SCHEDULER level (admits/tracks N
-running sequences, shared paged-KV pool, no head-of-line
-blocking) but NOT at the executor: it gets continuous batching's
-memory/scheduling benefits without its compute/bandwidth
-benefit. R10 closes that gap with a batched forward.
-
-Where the batch of N comes from -- one mechanism, three
-consumers:
-1. PREFILL: N prompt positions of one sequence. Cuts prompt-
-   ingestion I/O ~N x (largest for long prompts / RAG).
-2. CONTINUOUS-BATCH DECODE (the throughput core, the LightLLM/
-   vLLM niche this project targets): N concurrent requests each
-   emit one decode token per step -> batch across sequences.
-   Serving N users drops from N weight-passes/step to one;
-   aggregate throughput scales ~N x, per-served-token weight I/O
-   drops ~N x. This is what makes serving a bigger-than-RAM
-   model to multiple users viable -- they share one weight
-   stream per step.
-3. SPECULATIVE / MTP (future, R9.3): draft K tokens via the
-   nextn head, verify all K in one batched forward -- the batch
-   win inside a single stream. Same machinery.
-Single-stream, non-speculative decode cannot batch (auto-
-regressive); that is the only case R10 does not help.
-
-The win, three ways, all in the weight-bearing ops (projections,
-dense/expert FFN):
-- disk I/O: each weight read/faulted once, not N times
-  (streaming models).
-- DRAM bandwidth: matvec is memory-bound; a weight ROW is a few
-  KB (fits L1), so reading it once and reusing it across the N
-  tokens cuts weight DRAM traffic ~N x (in-RAM large models --
-  prefill is bandwidth-bound today).
-- dequant compute: OPTIONAL follow-on kernel, NOT part of the
-  byte-identical core. A dedicated batched kernel can dequantize
-  each weight block ONCE and reuse the F32 across the N tokens
-  (the ~78%-single-core cost on GLM's IQ1_S is dequant). It
-  matches the SCALAR path exactly but reorders sums vs the fused
-  neon/sse4 kernels, so it rides the token-exact bar (like the
-  SIMD kernels), not the byte-identical check. The disk-I/O and
-  DRAM-bandwidth wins above do NOT need it.
-
-Safety property of the byte-identical core: forward_batch does
-EXACTLY the sequential per-token matvecs, only reordered so each
-weight is used for all N tokens before moving to the next
-weight. Each output y[row][token] = dot(W[row], x[token]) (via
-the active backend's matvec) is unchanged regardless of loop
-order -- weight-stationary, NOT a GEMM that reorders summation.
-So forward_batch(t_1..t_N) must produce a KV cache and logits
-BYTE-IDENTICAL to N sequential forward() calls -- the exit test.
-(The dequant-once kernel trades this byte-identity for the
-compute win and is validated token-exact instead.)
-
-Shape:
-- Primitive matvec_batch(W, x[0..N], out[0..N]): a weight-
-  stationary loop calling the backend's matvec per token, so the
-  weight stays hot in cache / page cache across the batch.
-  Byte-identical to N matvec() calls. Carries the disk-I/O and
-  cache-residency wins; dequant-amortization is the separate
-  kernel noted above.
-- Position-wise ops batch through it: wq/wk/wv/wo, dense/expert
-  FFN, embedding; the output head runs only for tokens that need
-  logits (the last prompt token in prefill; every token in
-  decode).
-- Attention uses no large weights, so it stays PER TOKEN: after
-  the batched Q/K/V projection, each token does scores/softmax/
-  weighted-sum against ITS OWN sequence's KV (prefill tokens
-  share one causal KV; decode tokens each hit their sequence's
-  cache). No amortization lost there.
-- MoE routing is per token; the union of experts a layer's N
-  tokens pick is faulted once and each applied to the tokens
-  that chose it.
-- Memory: neutral. Weights (mmap) and the KV pool are unchanged;
-  only activations go N-wide (~7-14MB at N=64 across our models);
-  logits stay 1-wide where only the last token is sampled. The
-  attention scores buffer stays 1-wide (reused per token) -- a
-  naive N-wide att would be N x n_ctx and is the one trap to
-  avoid.
-
-Rollout (status 2026-07-25): (1) matvec_batch, (2)
-forward_batch, (3) all-arch coverage, and (4a) engine prefill
-batching are DONE.
-- (1)+(2) commit f954a65; (3) commit 42846d4 refactored
-  forward_batch to reuse the shared per-token attention
-  (spec_->attention) so llama / deepseek2 (MLA) / glm-dsa are
-  all covered, dense FFN batched via matvec_batch, MoE per token.
-  [batch] tests assert byte-identity to N forward() calls
-  (logits + KV) on synthetic dense-llama, deepseek2-MLA and
-  llama-MoE. supports_batch() is true for every CPU/CUDA backend
-  (Vulkan opts out -- it has its own full forward). Vulkan prompt
-  ingestion is separate: supports_batch_prefill() routes
-  forward_batch to vulkan_forward_batch (GPU matmuls over a chunk
-  of up to prefill_chunk() = 512 tokens; token-exact, not
-  byte-identical, to per-token).
-- (4a) commit 20d560c: Engine::advance() ingests the remaining
-  prompt as one forward_batch (Config::batched_prefill, default
-  on); [engine] A/B test confirms identical output to per-token.
-- (3b) commit 77cfc0e: moe_ffn_batch applies routed experts
-  WEIGHT-STATIONARY (route all n, group (token,slot) by expert,
-  read each expert once across the tokens that picked it; union
-  read-ahead/prefetch/weight-window once). Byte-identical:
-  each token's mixture is summed in moe_select order (routed
-  then shared) before adding to the residual, matching moe_ffn.
-  forward_batch's MoE layers now use it. [batch] llama-MoE test
-  covers it.
-- (4b, model) commit d76fa7f: forward_batch_decode decodes one
-  token from each of N different sequences in a pass -- per-token
-  attention against each sequence's own KV, weight-bearing ops
-  batched across all N. Byte-identical to N forward() calls
-  ([batch] test: 4 sequences, distinct contexts). This is the
-  executor-level continuous-batching primitive.
-- (4b, engine) commit 724ff13: step_batched() (Config::
-  batched_decode, default OFF) runs prefill -> sample -> ONE
-  forward_batch_decode for every running sequence with a pending
-  token, with per-request logits and preemption confined to the
-  not-yet-gathered tail. Byte-identical to the per-sequence
-  scheduler: [engine] A/B test matches generated tokens across 4
-  streams on a comfortable pool AND a tight pool (forces
-  preemption + recompute in both paths).
-So the whole batched-forward stack -- prefill + continuous-batch
-decode, all archs, batched MoE experts -- is byte-identical and
-in place. Optional step (5) is now landed too: the
-dequant-amortization batched kernel (matvec_batch_deq)
-dequantizes each weight row to f32 once, then dots it against all
-n token columns -- cutting dequant work from once-per-(row,token)
-to once-per-row. Because it dequants the whole row before the
-dot rather than interleaving (as the fused SIMD matvec does), it
-is token-exact and deterministic but NOT byte-identical, so it is
-opt-in behind LOCUS_BATCH_DEQUANT and matvec_batch routes to it
-only when that is set. Its own [batch] test proves f32 stays
-byte-identical (dequant_row is a copy there) and q8_0 matches the
-fused matvec within a 1e-5 margin.
-
-(5b, threading) The first Pi measurement caught a real gap:
-matvec_batch was single-threaded (a serial `for t in n:
-op.matvec`), while the sequential forward's FFN uses the R9
-threaded matvec_mt. So on a large model over multiple cores,
-batched decode forfeited multicore and lost to the per-token path
-(Pi llama-1b in-RAM: 3.2 -> 1.8 tok/s), even though it won on tiny
-models where matvec_mt inlines (stories260K: ~2x on both Pi and
-M2). Fix: matvec_batch (and matvec_batch_deq) now row-slice across
-the ThreadPool via the shared mt_slices()/for_row_slices() helper,
-exactly like matvec_mt (honors mt_safe and LOCUS_THREADS). Each
-slice carries the whole n-token batch, so it keeps the weight-
-stationary reuse AND regains multicore -- batched decode should be
->= per-token in every regime. Byte-identity holds (row-split is
-bitwise-equal per row); the [batch] test now checks the threaded
-fused path at THREADS=1/2/4 on a 200-row matrix.
-
-(6, done) Measured on Pi (NEON) and vx (x86/sse4): with the
-threading fix, batched decode is >= per-token in every regime --
-Pi 1B in-RAM ties (4.5 vs 4.4 tok/s), tiny model wins (1.4-2x),
-deepseek streaming cuts disk bytes; vx 1B ties (4.4 vs 4.3). So
-batched_decode is now default-ON (Engine::Config), with step()
-falling back to the per-token scheduler when the model does not
-support batching (Vulkan drives its own forward) so the default is
-safe on every backend. Prefill batching stays a clean I/O win on
-the Pi (deepseek: 2.44x fewer bytes read, 1.74x faster).
-
-Measurement also pinned the ceiling: decode is memory-bandwidth-
-bound (vx callgrind: matvec 95% of instructions; 66% parallel
-efficiency at 4 cores on DDR3), and the current fused matvec_batch
-re-streams each weight row N times (per-token op.matvec loop), so
-it saves no DRAM traffic on a large in-RAM model -- hence the tie,
-not a win. That motivates R11.
-
-## R11: cache-blocked batched matvec
-
-The batched decode of N concurrent sequences is a skinny GEMM
-Y = W . X^T (X is N x cols). Today's kernel loops op.matvec per
-token, streaming |W| from DRAM N times. Reorder to weight-
-stationary at the register level: outer loop over weight rows/col-
-blocks, inner loop over the N tokens, so each weight block is
-loaded+dequantized ONCE and reused across all N token dots while
-hot in vector registers (N running SIMD accumulators). Weight DRAM
-traffic drops ~N-fold; the kernel moves from memory-bound toward
-compute-bound. Needs N >= 2 (single-stream decode has no reuse and
-stays bandwidth-bound); the win scales with N until the N-vector X
-tile spills L1, past which cols is cache-tiled. Byte-identity is
-preservable: if the blocked SIMD kernel keeps the same per-col-
-block accumulation order as op.matvec, each token's dot is
-bitwise-unchanged (unlike matvec_batch_deq, which reordered sums).
-
-Plan: add an optional matvec_batch hook to backend::Ops (nullptr
--> today's per-token fallback); wire model matvec_batch() to
-prefer it. Scalar reference + byte-exact test here; per-arch SIMD
-kernels for the hot quants (Q4_K/Q6_K): NEON owner claude-pi-locus,
-sse4/avx2 owner claude-vx-locus. Cheap pre-validation before any
-SIMD: re-measure the now-threaded matvec_batch_deq (row read once,
-scalar dots) on the 1B -- if it ties/beats the fused per-token path
-despite ~8x more compute, that confirms traffic is the wall.
-
-Status (done for CPU Q4_K/Q6_K). Hook landed a04f269
-(Ops::matvec_batch; output row-major out[r*n+t] so the model row-
-slices it across threads then transposes back; scalar reference +
-[ops][batch] byte-test). Pre-validation on vx confirmed the wall:
-threaded matvec_batch_deq did ~8x more compute for only 16% slow-
-down -- the fingerprint of a memory-bound loop. SIMD kernels then
-landed: sse4 6c3ecdb, neon 2e6e15e, both Q4_K/Q6_K register-blocked
-(read+dequant each block once, FMA into n per-token accumulators).
-Byte-identity held by keeping matvec's exact per-block reduction
-order (a single end-of-row reduction diverges -- float add is not
-associative); [ops][batch][sse4]/[neon] byte-tests are bit-exact,
-[moe][batch] e2e token-exact at THREADS=1/2/4.
-
-Measured ratio (fused-fallback vs kernel, 1B Q4_K, --concurrent 8,
-in-RAM warm):
-  cuda / GTX 750 Ti   : 2.2 -> 3.4 tok/s  = 1.55x
-  neon / LPDDR4X (Pi) : 4.4 -> 6.2 tok/s  = ~1.35x
-  sse4 / DDR3   (vx)  : 4.5 -> 4.9 tok/s  = 1.09x
-The more bandwidth-starved box gets the bigger traffic-amortization
-win, as predicted; after the n-fold weight-traffic cut the loop
-goes SIMD-compute-bound, so 128-bit sse4 caps vx's ratio (avx2 +
-DDR5 would show more). The CUDA kernel (07736a4) wins most: one
-launch replaces ~N*slices tiny per-token launches AND each weight
-block is read from VRAM once for all n tokens ([cuda-pool] identical
-both sides, so the gain is pure kernel). It uses batch_self_parallel
-(the model hands it the whole matrix, one grid over all rows) plus
-the weight-pool device pointer, so it stacks on the pager's shared-
-upload win; a modern GPU raises the ratio further. A backend kernel
-that special-cases only some types must fall back to n calls of the
-SAME backend's matvec() (scattered row-major), never the scalar
-reference -- else F32/Q8_0 diverge from that backend's per-token
-path (contract note in registry.hpp). Target set is Q4_K/Q6_K (the
-Q4_K_M tensors we run); Q5_K/Q5_0 register-blocking is parked until a
-served model needs it. Remaining R11: avx2 only (parked until a
-Haswell+ cloud box; sse4 is the template).
-
-Risk note: forward_batch duplicates the forward + per-arch
-attention shape, so it lands as NEW code validated against the
-sequential path before the engine ever calls it -- the
-6-model token-exact goldens keep guarding the default path
-throughout.
-
-## R12: table-stakes serving features
-
-Four features every production server exposes, each default-off /
-greedy-preserving so the 6-model token-exact goldens keep guarding
-the default path:
-
-- Sampling (model/sampling): temperature, top-k, top-p, min-p,
-  repeat/frequency/presence penalties, per-request seed. temperature
-  <= 0 short-circuits to argmax, so greedy stays bit-exact. Filter
-  order matches llama.cpp (penalties -> constraint -> top_k ->
-  temp/softmax -> top_p -> min_p -> draw).
-- Constrained decoding (model/grammar, server/tools): an incremental
-  JSON-grammar validator drives a TokenConstraint that masks tokens
-  whose decoded bytes would break the grammar; wired to
-  response_format json_object. Byte-exact when the grammar never
-  fires.
-- Prefix / prompt caching (engine/prefix_cache, kv retain/release):
-  exact token-prefix keys, ref-counted block pins, LRU eviction;
-  adopts the longest shared prefix (leaving >= 1 token so the last
-  logits are recomputed). Byte-exact; measured via
-  prefix_reused_tokens. Lookup is digest-indexed (i#65): keys are
-  block-aligned, so a 64-bit digest of each block boundary indexes
-  the candidates and a lookup costs O(prompt) instead of O(entries x
-  prompt). The digest is an index only -- the token sequence stays
-  the verified key, so a collision costs a comparison and never
-  returns a wrong prefix.
-- Speculative decoding (model/speculative): prompt-lookup (no draft
-  model) -- n-gram match against the context proposes drafts,
-  verified in ONE batched forward with all_logits; the longest
-  correct prefix is accepted. Greedy-only, so byte-exact to plain
-  greedy. Uses the per-token scheduler.
-
-## R13-R15: reach, footprint, scale
-
-Ranked by benefit to the streaming niche (stream weights when a
-model does not fit in RAM, batch inputs -- cache-friendlier, so a
-bigger model runs where it otherwise could not).
-
-- R14 embeddings/reranking (done): POST /v1/embeddings pools the
-  last-token post-out_norm hidden state, L2-normalized, on a
-  dedicated serialized cache/workspace (needs a CPU/CUDA backend --
-  the full-GPU Vulkan forward does not surface the hidden state).
-- R15 API polish (done): GET /v1/models (+ /{id}), GET /metrics
-  (Prometheus text: request/token counters, prefix-reuse and
-  speculative accepts, KV-pool gauges), and OpenAI-shaped logprobs
-  on the non-streaming completion paths (model::logprobs_from is a
-  log-softmax over the RAW logits -- the natural temperature-1
-  distribution, independent of the sampling filters). Usage
-  accounting added to the OpenAI responses.
-- R14 KV-cache quantization (done, CPU GQA path): store paged K/V as
-  Q8/Q4 to shrink the resident cache -- the footprint lever for long
-  context on streamed models. A block-of-32 codec (kv_quant, ggml
-  Q8_0/Q4_0-style f16-scaled blocks) backs a separate byte pool in
-  PagedKvCache; the F32 pool, GPU external storage, and the MLA/DSA
-  paths are untouched (F32-gated). The standard GQA attention
-  (llama-family) computes each position's K/V into scratch, stores it
-  quantized, and dequantizes the layer's past rows into a transient
-  matrix so the attention math stays arithmetically identical to the
-  F32 zero-copy path. Enabled via Engine::Config.kv_type /
-  make_cache(kv_type); validated by a cosine-similarity e2e test
-  (Q8 > 0.999 vs the exact forward). MLA already shrinks KV by
-  design, so quantizing it is lower priority; the GPU KV path is
-  future work.
-- R13 breadth (pending): more architectures (Qwen-MoE, DBRX) and
-  tiny quants (ternary TQ1_0/TQ2_0 + remaining IQ, with GPU
-  kernels), delegated to the CUDA/Vulkan hosts where model-dependent.
-- R15 weight-sharding multi-GPU pager (deferred): needs multi-GPU
-  hardware; not classic tensor parallelism -- shard the streamed
-  weight window across devices.
-
-## R15+: distributed multi-server inference (pipeline + expert)
-
-Deferred, design only; needs more than one reachable host. This
-extends the streaming niche (fit a model that does not fit one
-machine) from a single box to a cluster of commodity boxes, by
-pooling their memory. It is a capacity lever, not a throughput lever.
-
-### Why (capacity scaling, not throughput scaling)
-
-Two unrelated things get called "scaling":
-
-- Throughput scaling: serve more requests per second. The lever is
-  replication (run full independent copies behind a load balancer);
-  no model is split, each copy holds the whole model.
-- Model-capacity scaling: fit a larger model than one machine's
-  memory holds. The lever is model parallelism (split the model
-  across machines). This section is about this one.
-
-The payoff: run a heavy model on several cheaper machines instead of
-buying one expensive high-memory device, pooling the memory of boxes
-that individually could not hold the model. This is the distributed
-form of the existing thesis (stream weights so a bigger model runs
-where it otherwise could not); here we pool RAM/VRAM across hosts
-rather than streaming through one host's memory. Costs to keep
-honest: cheaper or older hardware is slower per token, so latency and
-throughput per dollar can be worse, and it adds orchestration and
-failure handling. It makes the model runnable, not fast.
-
-### Strategy: pipeline parallelism (layers split across hosts)
-
-Assign each host a contiguous block of layers. A token's hidden state
-flows host to host: host 1 runs layers [0, k), sends the resulting
-hidden vector to host 2 (layers [k, 2k)), and so on to the last host,
-which produces the logits and samples. Weights load once into each
-host's memory and stay resident, so there is no per-token RAM to VRAM
-weight streaming, provided a host's slice fits its memory. Only
-activations cross the network: one hidden-state vector per token per
-stage boundary (for a width-d model at 2 bytes, about 2*d bytes,
-kilobytes not gigabytes). That tiny payload is why this survives a
-LAN.
-
-Contrast with tensor parallelism (split each layer's matmul across
-devices, combine every layer with an all-reduce): it exchanges data
-every layer and needs an NVLink-class interconnect, so it is a poor
-fit for a LAN and is not the target here.
-
-### Latency versus throughput
-
-Latency rises: each boundary adds a network hop, so per-token latency
-grows by about (hops * one-way delay). Accepted, and it does not come
-back. Throughput need not fall, under two conditions:
-
-1. Sends are asynchronous: a stage hands its output downstream and
-   immediately starts the next unit, so transit time is time in
-   flight, not time the stage is busy. The throughput bottleneck is
-   then the slowest stage's compute, not the link.
-2. Enough requests are in flight to keep every stage busy. Decode is
-   autoregressive: a token traverses all layers in order and the next
-   token needs this one's logits, so a single conversation can never
-   have two of its own tokens in the pipe at once; you fill the
-   stages with other requests. The concurrency needed to saturate the
-   pipeline is about:
-
-       concurrency ~= stages * (1 + delay / per-stage-compute)
-
-   Network delay does not lower the throughput ceiling; it raises how
-   many concurrent requests are needed to reach it. On a fast LAN,
-   delay/compute is small, so a few requests per stage suffice and
-   throughput approaches the single-box aggregate. On a slow link, or
-   at low concurrency, throughput does suffer.
-
-Prefill (the prompt) is the easy case: all prompt tokens are known up
-front, so a long prompt can be chunked and streamed stage to stage,
-keeping the pipe full even for a single request. Decode is the case
-that needs concurrency.
-
-### KV cache maps cleanly onto stages
-
-The KV cache is per-layer by construction: each layer stores its own
-Key/Value vectors for every past token, because attention at layer L
-needs the K/V computed at layer L (from that layer's input, which is
-the previous layer's output, not the raw input). There is no
-single-layer place that could stand in for the rest; a cached prefix
-of N tokens over a model of Lyr layers is Lyr*N keys plus Lyr*N
-values.
-
-This lines up with pipeline stages at no extra cost: each stage
-already owns a contiguous block of layers, so it owns exactly that
-block's KV cache, stored locally. Prompt caching (KV prefix reuse)
-keeps working per stage; a cached prefix is distributed, each stage
-holding its layers' slice. The effect on prompt caching is not a
-per-prompt synergy but real headroom: the cache is not made cheaper
-or smarter, yet the cluster has more aggregate memory than one cheap
-box, so more cached prefixes (and longer contexts) can be retained
-before eviction.
-
-### Expert parallelism: a second LAN-friendly axis (MoE)
-
-For Mixture-of-Experts models (already supported: Qwen-MoE, DBRX,
-GLM), a feed-forward layer holds many expert sub-networks; each token
-is routed to a few, and the chosen experts run independently. That is
-genuine within-layer parallelism, and it maps onto expert
-parallelism: place different experts on different hosts, each
-processing the tokens routed to it. Routing adds its own
-communication (tokens must reach their experts and results return),
-but the experts themselves are independent, so this is a viable
-second distribution axis on a LAN, orthogonal to the pipeline split.
-
-Aside on architectures: some models (GPT-J, GPT-NeoX, PaLM, Falcon)
-run the attention and feed-forward sub-layers of a block in parallel
-(both read the same block input, outputs summed) rather than in
-series. That is intra-block parallelism, an architecture choice, not
-a distribution strategy, but it is the other place "layers run in
-parallel" is literally true. Across a single token, layer depth is
-otherwise strictly sequential.
-
-### Relation to the multi-GPU weight-sharding pager (above)
-
-Both are capacity levers; they differ on axis and compose. The
-multi-GPU pager shards the streamed weight window across GPUs within
-one host (fast local interconnect, activations stay on the box); this
-section shards layers across hosts over the network (activations
-cross the wire). A single pipeline stage can itself use the multi-GPU
-pager to hold its layer block across that host's local GPUs, so
-pipeline parallelism sits one level above it.
-
-### Sketch (when built)
-
-- Static layer assignment by config (host X owns layers [a, b)); each
-  host loads only its slice.
-- Transport: length-prefixed activations over TCP (or gRPC), each
-  message tagged (request_id, position) so stages stay ordered;
-  asynchronous send so round-trip time overlaps compute.
-- Reuse the engine loop per stage: a remote-input source feeds
-  activations in, a remote-output sink ships them downstream; the
-  last stage samples and streams tokens back to the entry host.
-- Health checks: a dead stage stalls the chain, so it needs detection
-  and a clean error. A successful connect (the current health signal)
-  only proves the downstream's listener is up, not that its stage is
-  healthy; true liveness needs an app-level probe.
-
-Exit test: a two-host layer split produces byte-identical output to
-the single-host run for the same prompt and seed; under concurrency
-at or above the pipeline depth, aggregate throughput approaches the
-single-box compute ceiling, with only latency raised by the hop.
-
-### Stage serving: event loop + per-device batching executors (i#24)
-
-The "reuse the engine loop per stage" line above is the stub this
-expands. It is the serving model for one node (a single-process server
-or a pipeline stage): separate I/O from compute so one event loop can
-feed concurrent, batched, possibly multi-device execution.
-
-Four properties it must have, and why the obvious shortcut fails:
-
-1. Keep the event loop. One thread multiplexes all client connections
-   (sys::Poller), as serve_stage_mux already does. It must never block
-   on compute.
-2. Use all N CPU cores for a forward.
-3. Run on the GPU, and on more than one GPU when present.
-4. Batch requests: run many ready sequences through one forward so the
-   weight read is amortized -- the dominant cost on a GPU, and the
-   throughput core locus already implements for the single-process path
-   (engine::Engine, forward_batch_decode, matvec_batch; DESIGN.md 4.2).
-
-The shortcut that does NOT work is "run N independent event loops, one
-per core" (a worker-per-CPU fan-out). Each loop would compute one
-sequence at a time, so it neither batches (property 4) nor amortizes
-weights; it also forces an all-or-nothing CPU split (one loop using all
-cores, or N loops each pinned to one core, nothing between) because the
-process-wide thread pool serializes every parallel_for caller. That path
-is explicitly rejected.
-
-The structure that satisfies all four:
-
-- I/O loop (one thread). Owns every socket. On a readable connection it
-  decodes the frame (a kToken / kActivation), marks that session's next
-  unit "ready", and hands it to the session's executor; on a completion
-  it writes the output frame (kLogits / kActivation) back. It does no
-  model compute and never blocks on it.
-- Executor = one compute device running a continuous-batching loop.
-  Each iteration it gathers every ready session, runs ONE batched
-  forward over them (the weight-bearing ops are read once and shared
-  across the batch -- property 4), and scatters the per-sequence outputs
-  back. It owns that device's paged KV pool (already multi-sequence) and
-  workspace. This is a NEW component (StageExecutor) that PARALLELS
-  engine::Engine's scheduler shape (admission, a running set, a per-step
-  budget) but is not Engine and does not reuse the class -- see "Engine
-  is not the stage executor" below. What it does reuse is the batched
-  model ops underneath (forward_batch_decode / matvec_batch), which are
-  done and byte-exact.
-- One executor per device. The CPU is one executor whose batched forward
-  fans across all N cores via sys::ThreadPool (property 2, and now
-  amortized over the batch). Each GPU is another executor; several GPUs
-  are several executors (property 3). The loop spreads sessions across
-  them.
-- Session-to-executor affinity. A session is pinned to one executor for
-  its life so its KV sequence stays resident in that device's cache.
-  New sessions are assigned to balance load across executors/devices.
-- Coupling. Lock-protected ready/completion queues plus a self-pipe /
-  eventfd wake in both directions (the same wake pattern the SIGHUP
-  path already uses with the Poller): loop -> executor ("these sessions
-  are ready"), executor -> loop ("these outputs are done, write them").
-  All socket I/O stays on the loop thread, so connection fds need no
-  cross-thread locking.
-
-Three handoff rules make the two-thread split safe (all learned the hard
-way the first time, so stated up front):
-
-- A session in flight cannot be released. The loop owns the socket and
-  learns of an RST immediately, but the executor may be mid-batch holding
-  a pointer to that session's Seq and about to write KV into it; freeing
-  the sequence under a running batch is a use-after-free, and the
-  completion would then deliver to a closed fd. So a drop on an in-flight
-  session only MARKS it cancelled: the batch completes, the loop discards
-  the result at completion, and the KV is released then. This fails in
-  the direction that corrupts under load while passing idle-drop tests,
-  so it is a rule, not a race to be lucky about.
-- At most one frame per session in flight. A session is strictly
-  sequential (one token in, one answer out), so this holds naturally --
-  but only if the loop refuses to submit a session's next frame before
-  the first completes. It is what makes ordering free; a future
-  "pipeline two tokens for latency" change would break it silently, so
-  it is written down.
-- Completions drain in a loop, not one per wake. The wake is
-  level-triggered-style: one notification can cover many finished
-  sessions, so the loop drains the whole completion queue per wake rather
-  than assuming 1:1 (the same lesson as the self-pipe drain).
-
-Reuse vs. new. Reused: the batched model ops (forward_batch_decode /
-matvec_batch / supports_batch), which are done and proven byte-exact
-against N separate forwards -- the expensive half is already paid; the
-mux loop, sys::Poller and the self-pipe wake; paged multi-sequence KV;
-the per-executor KV RAM guard (sys::total_ram_bytes + check_kv_memory).
-New: the StageExecutor scheduler itself (parallels Engine, is not
-Engine); wiring the loop to it instead of an inline step(); a batched
-stage entry point forward_batch_layers (see below); per-device executors
-with session affinity and assignment; and the GPU prerequisites (see the
-Vulkan note).
-
-Engine is not the stage executor. engine::Engine is mechanically
-drivable (public step(), hooks), but it is a GENERATION engine
-throughout: submit() takes a prompt, max_new_tokens, sampling, seed,
-constraint, logprobs; a Request carries terminal status and an on_token
-hook. A pipeline stage has none of that -- no prompt (one activation or
-token per step), no stop rule (the driver decides), no sampling/EOS (the
-driver samples), and a MIDDLE stage emits no token at all, so on_token
-is meaningless there. A session simply ends when its socket does. So the
-executor copies Engine's scheduler STRUCTURE (admission, running set,
-preemption, per-step budget) over the batched ops, rather than
-instantiating Engine; generalising Engine to serve both would put
-sampling/EOS/prefix-cache concerns into the most load-bearing class in
-the project for a caller that needs none of them. This is called out
-because "reuse the continuous-batching loop" reads as less work than it
-is -- the kernels are free, the scheduler is new.
-
-The missing entry point. forward_batch_decode does per-sequence state
-correctly today (per-token seq and position, independent KV, matvecs
-batched across the batch) -- but only full-stack. The matrix:
-
-    full stack      single: forward()         batched: forward_batch_decode()
-    layer range     single: forward_layers()  batched: MISSING
-
-A batching STAGE needs the bottom-right: N hidden states (or N tokens at
-stage 0), a layer range [begin, end), N seqs, N outputs. That is a new
-forward_batch_layers shaped exactly like the transformation PR#5 did on
-the single-item path (parameterise the layer loop with begin/end, gate
-the embed on `first`, gate the final norm + output projection on `last`,
-take hidden_in when !first, emit hidden when !last) -- over machinery
-that already exists and is byte-exact. Not new kernels; PR#5's
-slice-vs-full byte-equality test transfers directly at batch width > 1.
-
-Vulkan batches only one sequence's prompt chunk (vulkan_forward_batch),
-not decode (and the stage path needs two Vulkan pieces).
-supports_batch() returns false for Vulkan and forward_batch_decode
-throws: Vulkan has a monolithic vulkan_forward the batched CPU-driver
-path bypasses. Separately, forward_layers is already CPU/CUDA only --
-vulkan_forward does not surface the hidden state. So a Vulkan executor
-for a pipeline stage needs BOTH a batched Vulkan forward AND a
-layer-range/hidden-state Vulkan forward, both shader work. Consequence
-for the roadmap: GPU executors are CUDA-first; a Vulkan executor is
-"after two significant shader pieces", not "after device selection". The
-device enumerate/select seam is necessary but far from sufficient.
-
-CPU core division. With the single shared sys::ThreadPool there are only
-two non-contending settings: one executor using all cores (lowest
-single-request latency), or K executors each single-threaded (K-way
-throughput, one core per request). The useful middle -- a few executors
-each still multi-threaded -- needs per-executor thread pools (a
-ThreadPool threaded through forward_layers instead of the singleton);
-tracked separately. The first cut ships one CPU executor using all
-cores, which keeps today's single-request latency and adds batching.
-
-Increments (each its own PR, reviewed):
-
-1. Executor seam + queues/wake + the in-flight/cancel rules: the I/O
-   loop hands forward work to a single in-process CPU executor via
-   ready/completion queues; behavior matches today (one all-cores
-   forward at a time) but compute no longer runs on the loop thread.
-2. forward_batch_layers (the missing entry point, PR#5-shaped) + the
-   executor coalescing ready sessions into one batched forward per
-   iteration; byte-identical to per-session stepping and to the
-   single-process engine, at batch width > 1.
-3. Multiple CPU executors + session affinity + assignment, with the RAM
-   guard sizing KV per executor.
-4. CUDA GPU executor (CUDA already supports the batched + layer-range
-   forwards). Split into 4a (landed) and 4b (deferred):
-   - 4a: a device-select seam. locus-stage gains --backend NAME and
-     --device N; the stage binds that backend/device before the first
-     weight upload. Because CUDA's current device is per-thread and the
-     executor runs forwards on its own worker thread, each CUDA op entry
-     (the three matvecs + prefetch) re-binds its calling thread to the
-     selected device via a thread-local guard, and the weight pool THROWS
-     (not asserts; Release is -DNDEBUG) if a kernel ever runs on a
-     different device than the pool bound to. A bad ordinal or a
-     CUDA-less host fails loud at startup; never a silent fall back to
-     device 0. Byte-identical to CUDA per-token stepping at batch > 1
-     (both via step_batch and through the executor's worker thread), and
-     argmax-agrees with the CPU path (cross-backend logits are not
-     bitwise equal; float accumulation order differs). NOTE: under a
-     GPU backend, executors are per-device lanes, not per-core; one
-     CUDA device shares one primary context, so N executors on a single
-     device contend rather than scale; use one executor per device unless
-     measured otherwise.
-   - 4b: multiple CUDA GPUs as several executors in ONE process (per-
-     device weight pools, one device-bound model view per device, per-
-     executor device binding). Deferred: it needs a multi-GPU host to
-     byte-exact-validate, which the single-GPU dev host cannot provide.
-     The --device flag is already repeatable (one entry = whole process;
-     N entries = per-executor, rejected until 4b) so 4b fills the surface
-     in rather than changing a shipped flag's arity.
-5. (Larger, separate) Vulkan GPU executor: needs a batched Vulkan
-   forward and a layer-range/hidden-state Vulkan forward (shader work),
-   plus the multi-device enumerate/select seam. CUDA-first until these
-   land.
-
-Exit test: on one host, concurrent clients are served by a single event
-loop while their decode steps are coalesced into batched forwards
-(throughput rises with concurrency up to the batch width, single-request
-latency unchanged from the one-executor case); byte-identical output to
-the single-process engine for the same prompts and seed; and, once the
-device seam lands, sessions spread across multiple GPU executors with KV
-resident per device.
-
-## R16: Q8_K activation-dot (ggml-exact quantized matvec)
-
-llama.cpp does not dot quantized weights against f32 activations: for
-every QK_K super-block weight type it first quantizes the activation
-row to Q8_K (block_q8_K = f32 d + int8 qs[256] + int16 bsums[16]) and
-integer-dots the two quantized operands, folding the min corrections
-through the bsums. locus originally dequantized the weight and dotted
-in f32, which is close but not bit-identical -- on coarse quants over
-many layers the argmax eventually drifts (DBRX IQ2_XXS tips ~token 27,
-while Q4_K/IQ1_S held). R16 closes that gap so locus's quantized
-matvec matches llama.cpp bit-for-bit, and opens the door to integer
-matvec throughput.
-
-- Scalar core (done): backend::matvec_q8k is an additive public entry
-  beside matvec(); it quantizes x to Q8_K once (quantize_activation_
-  q8k -- ggml's iscale = -127/max, the 2^23 nearest_int, per-16
-  bsums) and dispatches a per-type vec_dot_<t>_q8_k integer dot ported
-  verbatim from ggml_vec_dot_<t>_q8_K_generic. Covers all 15 QK_K
-  types: Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, TQ1_0/TQ2_0, IQ2_XXS/IQ2_XS/IQ2_S,
-  IQ3_XXS/IQ3_S, IQ1_S/IQ1_M, IQ4_XS. (IQ4_NL stays on its own
-  q8_0-block dot -- 32-element blocks, not QK_K.) Validated by a
-  round-trip test: matvec_q8k(x) == f32 dot of the same Q8_K-rounded
-  x, to 1e-3 -- bit-exact modulo summation order, no ggml link.
-- Additive staging: matvec() stays the pure f32 reference every SIMD/
-  GPU variant is parity-tested against, so the flip to Q8_K cannot
-  land until each backend has its own Q8_K integer dots -- otherwise
-  the cross-backend parity test (variant == scalar matvec) breaks.
-  Hence the per-backend kernels come first, the model-dispatch flip
-  last, coordinated across CPU/CUDA/Vulkan.
-- CUDA (done): matvec_cuda_q8k mirrors the CPU path -- host-quantize
-  x, upload the shared flat quants (d[nsb]/qs[n]/bsums[nsb*16]) beside
-  the pooled weight, one thread per row replays the scalar aux/isum
-  accumulation order so the float result is identical. All 15 QK_K
-  types ported (k-quants, ternary, every IQ family). sm_50 has no
-  __dp4a, so the int8 products use plain integer madd (same integer
-  result). The [backend] parity test asserts matvec_cuda_q8k ==
-  matvec_q8k bit-for-bit across all 15 (margin 1e-4). Note Q3_K had no
-  CUDA kernel at all before this; its Q8_K kernel is the first GPU
-  Q3_K path (the f32 matvec_cuda still delegates Q3_K to scalar).
-- SSE4 (done): matvec_sse4_q8k covers all five k-quants, bit-for-bit
-  with scalar matvec_q8k. Q4/Q5/Q6 use maddubs on bytes shuffled to
-  (0,8,1,9,...), so each pair-sum stays in one scalar lane (e % 8);
-  Q3 widens per lane; Q2_K maddubs directly (its per-16 isuml is a
-  single total). An earlier fast path summed each block into one
-  float; that order flipped muse's greedy tokens on x86 (PR#197).
-  Ternary + IQ delegate to scalar. This host is SSE4-only (no
-  AVX2/NEON here).
-- (History: until 2026-10-25 Q8_K was an OPT-IN mode, default off;
-  see the last bullet for the flip.) TransformerModel::
-  use_q8k_activations toggles it. Why it was not the default:
-  "bit-exact with llama.cpp" is unachievable in principle -- ggml
-  itself is not bit-exact across its own backends, because the final
-  f32 d*Sigma accumulates in an implementation-specific order (SSE4 vs
-  AVX2 vs NEON vs CUDA vs generic). Q8_K's lower activation precision
-  puts argmaxes close enough that this order-noise tips tokens: qwen
-  (Q4_K) held 32 tokens under the f32 dot but tips at ~15 under Q8_K
-  with a different order, versus llama-simple's raw greedy (which
-  reproduces the old f32 golden). So flipping the default would (a)
-  regress robust-quant goldens and (b) break the single exact-string
-  e2e golden across backends (each backend's order tips differently).
-  Keeping f32 the default preserves stable, cross-backend goldens and
-  the tuned R11 register-blocked batched path. The opt-in mode nulls
-  Ops::matvec_q8k in the model's effective ops when off, so matvec_mt/
-  matvec_batch keep the f32 path; on, QK_K matmuls route to the
-  backend's Q8_K entry (batched -> per-token, byte-identical to
-  per-token). Validated by [e2e][qwen][q8k] (prefix smoke test, since
-  exact output is order-dependent) + the [backend] dot-parity tests.
-- Performance headroom (future, unlocked by NOT requiring bit-exact
-  cross-impl output): the opt-in mode's kernels are free to use the
-  fast int paths -- maddubs / AVX2-VNNI / CUDA __dp4a -- and a weight-
-  stationary Q8_K batch kernel to recover the batched-decode traffic
-  the per-token fallback gives up. Bit-exactness would forbid these
-  (they reorder the accumulation), which is the other reason not to
-  chase it. Q8_K exists for integer-matvec throughput, so this is
-  where its real win lands.
-- Block-32 weights (#189): the same mode dots Q8_0 / Q4_0 / IQ4_NL
-  weights against a Q8_0-quantized activation (llama.cpp's vec_dot_type
-  for them: d = amax / 127 as f16, quants rounded to nearest even),
-  accumulated in the order of ggml's non-repacked NEON
-  vec_dot_q8_0_q8_0 (Q4_0 / IQ4_NL reuse it, so they match ggml to
-  rounding only; its repacked kernels have their own orders). The
-  evidence is the token-exact Muse Spark golden.
-- Per-arch default (#189): an arch whose goldens are llama.cpp's sets
-  Hparams::q8k_default, so the mode is on at load (muse-spark,
-  deepseek41); use_q8k_activations still overrides it. Every arch hook
-  takes TransformerModel::ops() (the effective ops), never the raw
-  backend ops; a test greps model/ for active_backend().ops. Before
-  this, the hooks that call matvec_mt (deepseek2's MLA, glm-dsa's
-  indexer, muse-spark, deepseek41) took Q8_K with the flag off. With
-  the Q8_0 dots, Muse Spark's second golden prompt became token-exact
-  against llama.cpp on arm64 NEON; x86 SSE4 still tips it on the f32
-  side, so the test stays teacher-forced on every lane. Likewise the
-  deepseek41 goldens (prompt 1's third token tips on x86, and on arm64
-  since #237's NEON BF16 dot): teacher-forced on every lane.
-- Default ON where it is fast (2026-10-25, owner decision, #206):
-  with the NEON int8 dots (matvec_neon_q8k, bit-identical to scalar
-  matvec_q8k) the Q8 path is 2.1x faster than the f32 dot on CPU
-  decode (Orpheus 3B on M4, default threads: 29.4 -> 63.0 tok/s). The
-  mode is on when the arch requires it (Hparams::q8k_default:
-  muse-spark, deepseek41) or the backend's Q8 dot is its fast path
-  (Ops::prefers_q8k: neon, sse4, scalar). avx2 (scalar Q8 dot vs its
-  AVX2 f32 one), cuda (no block-32 Q8 kernel) and vulkan's per-op
-  fallback (scalar, inline) keep the f32 dot. The attention
-  projections take matvec_mt like every other matvec (llama.cpp
-  quantizes them too), and batched prefill gates on the same types
-  as decode (uses_quantized_activation), so prefill == decode holds
-  for block-32 weights too. LOCUS_F32_ACTIVATIONS (any value but "0"
-  or empty) or use_q8k_activations(false) selects the f32 path, the
-  reference for exactness checks; use_q8k_activations overrides
-  everything. Goldens pinned to f32 because Q8 tips a near-tie:
-  qwen2moe (~token 15, as predicted above) and deepseek-v2-lite
-  (neon leg, after 15 tokens). No Q8_0 golden moved.
-
-## 8. Testing strategy
+- Runtime dependencies: libc, libc++, OS APIs. Nothing else by
+  default.
+- Vendored in-tree, pinned, sha256 recorded in the importing commit,
+  license files alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
+  cpp-httplib v0.18.3 (MIT), nlohmann/json v3.11.3 (MIT), stb_image
+  v2.30 (MIT or public domain; PNG and JPEG only, for image input,
+  until our own decoders replace it, #250).
+- No FetchContent and no network at configure or build time.
+- Optional system dependencies, found at configure time: the Vulkan
+  loader and a shader compiler, the CUDA toolkit.
+
+## 7. Weight streaming (R8)
+
+A model larger than RAM runs by streaming its weights. Each GGUF
+shard is mmap'd once, read-only and private, so weight pages are clean
+and file-backed: the kernel can always evict them, and they never go
+to swap. The dirty memory of a run is only the KV pool and the
+workspaces.
+
+### Readahead
+
+Streaming is CPU-bound only if reads overlap compute. Two hints,
+issued with `madvise(WILLNEED)`:
+
+- at MoE routing time, on the routed experts of the current layer;
+- at the start of layer l, on layer l+1's static tensors (attention,
+  dense FFN, shared experts), which are known ahead.
+
+Measured on GLM-5.2 (UD-IQ1_S, 216 GB, neon, 8 cold forwards, equal
+fault counts):
+
+| Policy                        | Wall time | Sys time |
+|-------------------------------|-----------|----------|
+| passive streaming             | 524.4 s   | 60.9 s   |
+| + expert readahead            | 461.7 s   |          |
+| + next-layer readahead        | 351.4 s   | 22.9 s   |
+
+Both hints are on by default when the weights may stream (the model is
+over half of RAM, or RAM is unknown). A model that fits stays resident
+after one pass, and hinting resident pages every token is not free
+(about 4.5 ms per token on Orpheus 3B). `LOCUS_NO_READAHEAD=1`
+restores passive streaming for comparisons.
+
+A thread that touches the same pages would only duplicate the
+kernel's asynchronous readahead, so there is none. It is worth
+revisiting only if large sys time remains with the hints on.
+
+### Working set
+
+Routing spreads fast. On Moonlight, 11 forwards touch 43.8% of the
+layer-expert slots; on GLM-5.2 (256 experts), 16 forwards touch 27.4%.
+So prefetch pays within a token (overlap the reads of the routed
+experts), not across tokens (an expert cache). `LOCUS_MOE_STATS=1`
+prints this telemetry.
+
+On a cold spinning disk, GLM-5.2 runs faster end to end than a
+CPU-only llama.cpp (50.7 versus 92 minutes for 16 tokens), because
+locus streams lazily instead of loading the whole model first. Major
+fault counts are a false coldness signal under readahead (pages fault
+in ahead of access); bytes read are the reliable one.
+
+### Memory bounding
+
+- `--ctx N` caps the KV pool in tokens.
+- `LOCUS_WEIGHT_WINDOW=1` drops each layer's routed-expert pages right
+  after use (`madvise(DONTNEED)`, inward-aligned), so a streamed model
+  builds no page-cache pressure. It applies only to file-backed
+  weights: on an anonymous in-memory image, DONTNEED would discard the
+  contents. Static, shared and pinned weights are never dropped.
+
+## 8. GPU weight paging (R8-GPU)
+
+Each GPU backend keeps weights in a pager, so a model larger than
+device memory still runs.
+
+- Page unit: a whole tensor for static weights; one expert slice for
+  routed experts, so paging granularity matches routing granularity.
+- Budget: `LOCUS_GPU_POOL_MB`; unbounded by default, so a model that
+  fits stays resident. Weights stay quantized on the device for every
+  type whose kernel dequantizes in-shader (Q4_K is about 0.5 bytes per
+  weight).
+- Page table: host pointer to {buffer, last use, pinned}. Buffers used
+  by the command batch being recorded are pinned; unpinned ones evict
+  least-recently-used. The host mmap stays the source of truth.
+- Prefetch (CUDA): `Ops::prefetch` starts an async upload of the next
+  layer's static tensors and of each routed expert at selection time,
+  on a second stream. The model calls it at the same sites as the
+  `madvise` hints, with the same `Mat` (same host pointer, the page
+  table key) that the later matvec uses.
+- Vulkan has no prefetch. On the Pi's V3D, upload (a memcpy into
+  host-coherent unified memory) is 0.28% of compute with an unbounded
+  pool and 4.5% even under heavy paging, so prefetch could gain at
+  most a few percent.
+- Vulkan uploads only the routed experts of a token, not every expert
+  of the layer (6 of 64 on DeepSeek-V2-Lite).
+
+Vulkan records one command batch per token and frees buffers only
+between batches, so one batch's working set must fit device memory.
+
+Validated: Llama-3.2-1B Q4_K_M under `LOCUS_GPU_POOL_MB=64` on the Pi
+5 is byte-identical to the unbounded and scalar runs, with 341
+evictions. DeepSeek-V2-Lite (10 GB, MoE + MLA) runs token-exact on the
+Pi 5's GPU within about 2 GB of RSS.
+
+On a tile GPU streaming a model larger than its pool, Vulkan runs but
+slower than the CPU (DeepSeek-V2-Lite on the Pi: 85 s against 21 s for
+NEON). There it is a capability win, not a speed win.
+
+## 9. Threaded execution and static pinning (R9)
+
+- R9.1, threaded matvec: a large matvec splits into row slices
+  (`mat_rows`) on a persistent thread pool, each slice through the
+  active backend's matvec into a disjoint output span. Each row's dot
+  is the same code, so logits are bit-identical for every thread
+  count. `LOCUS_THREADS` caps the fan-out (default: the performance
+  cores; 1 runs single-threaded). Parallel slices also issue parallel
+  page faults, a deeper NVMe queue on streamed models. Independent
+  matvecs reading the same input (q/k/v, gate/up) share one pool
+  dispatch, and decode attention spreads its heads across the pool.
+- R9.2, static pinning: `LOCUS_PIN_STATIC=1` mlocks every non-expert
+  weight at load. Opt-in, because wiring about 13 GB on a 32 GB
+  machine is a policy decision.
+- R9.3, MTP decode through the nextn tensors that GLM and DeepSeek
+  ship: not built.
+
+GLM-5.2 (UD-IQ1_S, 216 GB) on a 31 GB host with a GTX 750 Ti and a
+7200 rpm disk, 16 tokens cold, all token-exact:
+
+| Engine             | Time    | Per token | Speed-up |
+|--------------------|---------|-----------|----------|
+| llama.cpp (CPU)    | 5523 s  | 345 s     | 1.00x    |
+| locus, sse4        | 3042 s  | 190 s     | 1.82x    |
+| locus, CUDA        | 1793 s  | 112 s     | 3.08x    |
+
+CUDA wins despite about 1.2 GB of usable VRAM (12.4% pool hits, 601 GB
+re-uploaded over PCIe): the experts stay in the host page cache, so
+re-uploads are cheap next to the GPU matvec.
+
+## 10. DSA indexer (GLM-5.2 beyond top_k)
+
+GLM-5.2 ships DeepSeek-V3.2's sparse attention: a lightning indexer
+selects which cached tokens the MLA attention sees, so the context is
+not capped at `attention.indexer.top_k` (2048).
+
+- Per layer and token, with $x$ the layer input:
+  - the cached key: $k_{idx}(s) = \mathrm{LayerNorm}(W_k x_s)$, 128
+    values;
+  - the query: $q_{idx}(t) = W_{qb}\, q_a(t)$, viewed as 32 heads of
+    128;
+  - the head weights: $w(t) = W_{proj}\, x_t$, 32 values.
+- Rope on the first 64 dimensions of both $q_{idx}$ and $k_{idx}$,
+  half-split (not interleaved, unlike the main attention).
+- Score:
+
+  $$\mathrm{score}(t, s) = \sum_h w_h(t)\, \mathrm{ReLU}(q_h(t) \cdot k_{idx}(s))$$
+
+  Global scale factors do not change the top-k order, so selection
+  ignores them.
+- Attention and its softmax run over the top-scoring
+  $\min(\mathrm{topk}, n)$ positions only, of the $n$ cached. Up to
+  top_k tokens every position is selected, so the dense golden anchors
+  the whole path below 2048 tokens.
+- The cache row grows from 576 to 704 floats (the MLA row plus the 128
+  of $k_{idx}$).
+
+llama.cpp ignores the indexer tensors (dense fallback), so there is no
+external golden beyond top_k, and long real-model runs are impractical
+at tens of seconds per token. Unit tests on synthetic models check
+that short sequences match the dense path bit-exactly, that exactly k
+positions are attended beyond top_k, and that selection picks the
+positions a scalar reference scores highest.
+
+## 11. Batched forward (R10)
+
+A one-token forward reads every weight once per token. A batch of N
+tokens can share that read, from three sources:
+
+1. Prefill: N prompt positions of one sequence.
+2. Continuous-batch decode: one token from each of N running
+   sequences. N users then share one weight stream per step, which is
+   what makes serving a bigger-than-RAM model to several users viable.
+3. Speculative decoding: verify K drafted tokens in one forward.
+
+Single-stream decode without speculation cannot batch.
+
+The weight-bearing ops (projections, dense and expert FFN, output
+head) run weight-stationary: each weight is used for all N tokens
+before the next weight. Each output $y_{r,t} = W_r \cdot x_t$ comes
+from the same backend matvec as in the per-token path, so
+`forward_batch` gives a KV cache and logits byte-identical to N
+`forward()` calls; the tests assert it. Attention reads no large
+weights, so it stays per token, each against its own sequence's KV.
+MoE layers route per token, then apply each picked expert once to all
+the tokens that chose it. Activations go N wide; the attention scores
+buffer stays one wide (an N-wide one would be N x n_ctx).
+
+- `forward_batch_decode` decodes one token from each of N sequences in
+  one pass. The engine uses it by default (`Engine::Config::
+  batched_decode`); `locus-run` enables it with `--batch-decode`.
+- Prompt ingestion is batched by default (`--no-batch-prefill` turns
+  it off). Vulkan has its own chunked prefill, `vulkan_forward_batch`
+  (chunks of up to 512 tokens, 1024 for MoE; token-exact, not
+  byte-identical, to per-token prefill).
+- `LOCUS_BATCH_DEQUANT=1` selects a kernel that dequantizes each
+  weight row once for all N tokens. It sums in another order, so it is
+  token-exact, not byte-identical, and opt-in.
+- The batched matvec row-slices across the thread pool like the
+  per-token one, so batching never loses the cores.
+
+## 12. Cache-blocked batched matvec (R11)
+
+Batched decode is a skinny GEMM, $Y = W X^\top$ with $X$ of N rows.
+Looping the per-token matvec streams $W$ from DRAM N times. The
+register-blocked kernels load and dequantize each weight block once
+and keep N accumulators, so weight traffic drops about N-fold. They
+keep matvec's per-block reduction order, so each token's dot is
+bitwise unchanged (a single end-of-row reduction would differ: float
+addition is not associative).
+
+`Ops::matvec_batch` is the hook. Kernels exist for Q4_K and Q6_K on
+sse4 and neon, and on CUDA (one launch for all N tokens). A backend
+kernel that covers only some types falls back to N calls of the same
+backend's matvec, never the scalar reference, so its batched and
+per-token paths agree.
+
+Llama-3.2-1B Q4_K, 8 concurrent streams, in RAM:
+
+| Backend and memory        | Fallback  | Kernel    | Ratio  |
+|---------------------------|-----------|-----------|--------|
+| cuda, GTX 750 Ti          | 2.2 tok/s | 3.4 tok/s | 1.55x  |
+| neon, LPDDR4X (Pi 5)      | 4.4 tok/s | 6.2 tok/s | 1.35x  |
+| sse4, DDR3                | 4.5 tok/s | 4.9 tok/s | 1.09x  |
+
+The box with less bandwidth gains more. After the weight-traffic cut,
+the loop is compute-bound, so 128-bit sse4 caps the x86 ratio. An
+avx2 kernel waits on an AVX2 host (#61).
+
+## 13. Serving features (R12 to R15)
+
+Each is off by default or greedy-preserving, so the goldens keep
+guarding the default path.
+
+- Sampling: temperature, top-k, top-p, min-p, repeat / frequency /
+  presence penalties, per-request seed. Temperature 0 is argmax. The
+  filter order matches llama.cpp (penalties, constraint, top-k,
+  temperature and softmax, top-p, min-p, draw).
+- JSON mode: an incremental JSON-grammar validator masks tokens whose
+  bytes would break the grammar (`response_format: json_object`).
+- Prompt caching: exact token-prefix keys, ref-counted block pins, LRU
+  eviction; the longest shared prefix is adopted, leaving at least one
+  token to recompute the last logits. Lookup is indexed by a 64-bit
+  digest of each block boundary, so it costs O(prompt); the token
+  sequence stays the verified key, so a collision never returns a
+  wrong prefix.
+- Speculative decoding: prompt lookup (no draft model). An n-gram
+  match against the context proposes drafts, verified in one batched
+  forward; the longest correct prefix is accepted. Greedy only, so
+  byte-exact to plain greedy.
+- Embeddings: `/v1/embeddings` returns the last token's final-normed
+  hidden state, L2-normalized, on a dedicated cache. CPU and CUDA
+  backends only (`TransformerModel::embed` refuses vulkan).
+- API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
+  (a log-softmax over the raw logits) and usage accounting.
+- KV-cache quantization: Q8 or Q4 blocks of 32 (f16 scale) in a
+  separate byte pool, for the llama-family attention. Each layer's
+  past rows are dequantized into scratch, so the attention math is the
+  f32 path's. Checked by cosine similarity (Q8 above 0.999). F16 KV
+  also runs on the GPU for GQA models. MLA already shrinks the KV
+  cache, so its quantized path is low priority (#63).
+- More architectures and quant types: qwen2moe, qwen3moe, dbrx, glm-
+  dsa, muse-spark, deepseek41; ternary TQ1_0 / TQ2_0 and the IQ
+  family.
+- Multi-GPU weight sharding (#62): shard the streamed weight window
+  across the GPUs of one host. Needs multi-GPU hardware.
+
+## 14. Multi-server inference (R15+)
+
+Pooling the memory of several hosts runs a model that fits none of
+them. It is a capacity lever, not a throughput lever: throughput
+scales by replication (full copies behind a load balancer), capacity
+by splitting the model.
+
+### Pipeline parallelism
+
+Each host owns a contiguous block of layers. A token's hidden state
+flows host to host; the last host produces the logits. Weights load
+once and stay resident on each host. Only activations cross the
+network: one hidden vector per token per boundary, about $2d$ bytes
+for a width-$d$ model at 16 bits. That small payload is why this
+works over a LAN. Tensor parallelism instead exchanges data inside
+every layer and needs an NVLink-class link, so it is not the target.
+
+Latency rises by about (hops x one-way delay). Throughput need not
+fall, if sends are asynchronous and enough requests are in flight to
+keep every stage busy:
+
+$$\mathrm{concurrency} \approx \mathrm{stages} \times \left(1 + \frac{\mathrm{delay}}{\mathrm{compute\ per\ stage}}\right)$$
+
+Network delay does not lower the throughput ceiling; it raises the
+concurrency needed to reach it. Prefill can be chunked and streamed
+stage to stage, so it fills the pipe even for a single request.
+
+The KV cache is per layer, so each stage owns exactly its layers'
+cache. Prompt caching works per stage, and the cluster's larger
+memory keeps more prefixes.
+
+### Expert parallelism
+
+For MoE models, experts can live on different hosts, each processing
+the tokens routed to it. Routing adds traffic, but experts are
+independent, so this is a second axis that also suits a LAN. The
+multi-GPU pager (#62) shards weights within one host; a pipeline stage
+can use it underneath.
+
+### Stage serving
+
+`locus-stage` runs a layer range and `locus-driver` drives generation
+across a stage chain. Activations travel as length-prefixed frames
+over TCP, tagged by request and position. A connect proves only that
+the downstream listener is up; liveness needs an app-level probe.
+
+A node separates I/O from compute (#24):
+
+- One I/O thread owns every socket (`sys::Poller`), decodes frames and
+  marks sessions ready. It never blocks on compute.
+- An executor is one compute device running a continuous-batching
+  loop: each iteration it gathers the ready sessions, runs one batched
+  forward (`forward_batch_layers`), and returns the outputs. It owns
+  that device's paged KV pool.
+- One executor per device; a session is pinned to one executor, so its
+  KV stays on that device.
+- The two sides talk through lock-protected queues and a self-pipe
+  wake in each direction; all socket I/O stays on the I/O thread.
+
+Three handoff rules keep the split safe:
+
+- A session in flight is only marked cancelled when its client drops;
+  its KV is released when the batch completes. Freeing it mid-batch is
+  a use-after-free.
+- At most one frame per session is in flight, which makes ordering
+  free.
+- One wake can cover many completions, so the I/O thread drains the
+  whole completion queue per wake.
+
+The executor copies the engine's scheduler structure (admission,
+running set, preemption, budget) but is not `engine::Engine`: a stage
+has no prompt, no stop rule and no sampling, and a middle stage emits
+no token.
+
+CPU executors share one thread pool, so the useful middle setting (a
+few executors, each multi-threaded) needs per-executor pools (#45). A
+CUDA executor binds its device per thread and fails loudly on a bad
+device; several GPUs in one process need a multi-GPU host to validate.
+A Vulkan executor needs a batched, layer-range Vulkan forward (#48)
+and a device-select seam (#47).
+
+Exit test: a two-host split gives byte-identical output to the
+single-host run; at concurrency at or above the pipeline depth,
+throughput approaches the single-box ceiling, with only the hop
+latency added.
+
+## 15. 8-bit activations (R16)
+
+llama.cpp does not dot quantized weights against f32 activations. For
+QK_K weights it quantizes the activation row to Q8_K (an f32 scale,
+256 int8 values, 16 int16 block sums) and integer-dots the two; for
+block-32 weights (Q8_0, Q4_0, IQ4_NL) it uses a Q8_0 activation.
+locus ports those dots (`backend::matvec_q8k`):
+
+| Backend | 8-bit activation dots                                         |
+|---------|---------------------------------------------------------------|
+| scalar  | all 15 QK_K types and the block-32 types                      |
+| neon    | Q4_K, Q6_K and the block-32 types; the rest through scalar    |
+| sse4    | the five K-quants; the rest through scalar                    |
+| cuda    | all 15 QK_K types                                             |
+
+The vectorized and CUDA dots replay the scalar accumulation order, so
+they are bit-identical to it.
+
+"Bit-exact with llama.cpp" is unreachable in principle: ggml is not
+bit-exact across its own backends, because the final f32 sum runs in
+an implementation-specific order. With 8-bit activations, argmaxes sit
+close enough that this order noise tips tokens on some goldens.
+
+The mode is on when the architecture requires it
+(`Hparams::q8k_default`: muse-spark, deepseek41) or when the backend's
+8-bit dot is its fast path (`Ops::prefers_q8k`: neon, sse4, scalar).
+avx2, cuda and the Vulkan per-op fallback keep the f32 dot.
+`LOCUS_F32_ACTIVATIONS` (any value but "0" or empty) or
+`use_q8k_activations(false)` selects the f32 path, the reference for
+exactness checks. On the M4 Max CPU, Orpheus 3B Q4_K_M decodes at 63
+tok/s with 8-bit activations against 29.4 with f32.
+
+Prefill and decode take the same gate (`uses_quantized_activation`),
+so they agree. F32, F16 and BF16 weights always take the f32 dot.
+
+Goldens: Qwen1.5-MoE and DeepSeek-V2-Lite are pinned to f32, because
+8-bit activations tip their greedy text at a near-tie. Muse Spark's
+second prompt, DeepSeek-V4.1 and the Orpheus codec frame are checked
+teacher-forced: each reference token must be within 0.25 of the top
+logit.
+
+## 16. Testing strategy
 
 - Catch2 unit tests per component (allocator, scheduler invariants,
-  GGUF parser, tokenizer round-trips).
-- Golden-token integration tests: fixed prompt + greedy sampling
-  must reproduce llama.cpp output token-for-token per model.
-- Malformed-GGUF corpus for the loader (truncations, overflowing
+  GGUF parser, tokenizers, kernels against the scalar reference).
+- Golden tests: a fixed prompt and greedy decoding reproduce the
+  reference (llama.cpp, or the torch reference for multimedia models)
+  token for token, or teacher-forced within a margin where a near-tie
+  tips greedy decoding.
+- Every selectable backend runs the goldens.
+- A malformed-GGUF corpus for the loader (truncations, overflowing
   offsets, hostile metadata).
 - Scheduler property tests: no block leaked, no double free, ref
-  counts return to zero after every simulated workload.
+  counts back to zero after every workload.
+- Tests that need a model file skip without it; heavy ones also need
+  `LOCUS_HEAVY_TESTS=1`.
