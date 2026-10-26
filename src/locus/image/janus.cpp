@@ -1,12 +1,15 @@
 #include "locus/image/janus.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <random>
 #include <stdexcept>
+#include <thread>
 
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/sampling.hpp"
+#include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
 
@@ -118,6 +121,32 @@ JanusImageGen JanusImageGen::load(const gguf::GgufFile& g,
     return j;
 }
 
+namespace {
+
+/**
+ * backend::matvec (the scalar f32 dot) with the rows split across the
+ * thread pool. Each row is still computed whole by one thread with the
+ * same code, so the result is bit-identical to the single call (i#246:
+ * the image heads were single-threaded).
+ */
+void matvec_pool(const backend::Mat& w, std::span<const float> x,
+                 std::span<float> out) {
+    const std::uint32_t threads =
+        std::max(1u, std::thread::hardware_concurrency());
+    const std::uint32_t slices =
+        std::max(1u, std::min(w.rows / 256, 2 * threads));
+    const std::uint32_t per = (w.rows + slices - 1) / slices;
+    sys::ThreadPool::instance().parallel_for(slices, [&](std::size_t s) {
+        const std::uint32_t r0 = static_cast<std::uint32_t>(s) * per;
+        if (r0 >= w.rows) return;
+        const std::uint32_t nr = std::min(per, w.rows - r0);
+        backend::matvec(backend::mat_rows(w, r0, nr), x,
+                        out.subspan(r0, nr));
+    });
+}
+
+}  // namespace
+
 void JanusImageGen::image_embed(std::int32_t id,
                                 std::span<float> out) const {
     if (id < 0 || static_cast<std::uint32_t>(id) >= codes_) {
@@ -127,19 +156,19 @@ void JanusImageGen::image_embed(std::int32_t id,
     const auto emb = t("janus.gen_embed.weight", std::size_t{codes_} * 8)
                          .subspan(std::size_t(id) * 8, 8);
     std::vector<float> h(e);
-    backend::matvec({gguf::TensorType::kF32,
-                     reinterpret_cast<const std::byte*>(
-                         t("janus.gen_aligner.0.weight", e * 8).data()),
-                     n_embd_, 8},
-                    emb, h);
+    matvec_pool({gguf::TensorType::kF32,
+                 reinterpret_cast<const std::byte*>(
+                     t("janus.gen_aligner.0.weight", e * 8).data()),
+                 n_embd_, 8},
+                emb, h);
     const auto b0 = t("janus.gen_aligner.0.bias", e);
     for (std::size_t i = 0; i < e; ++i) h[i] += b0[i];
     gelu(h);
-    backend::matvec({gguf::TensorType::kF32,
-                     reinterpret_cast<const std::byte*>(
-                         t("janus.gen_aligner.2.weight", e * e).data()),
-                     n_embd_, n_embd_},
-                    h, out);
+    matvec_pool({gguf::TensorType::kF32,
+                 reinterpret_cast<const std::byte*>(
+                     t("janus.gen_aligner.2.weight", e * e).data()),
+                 n_embd_, n_embd_},
+                h, out);
     const auto b2 = t("janus.gen_aligner.2.bias", e);
     for (std::size_t i = 0; i < e; ++i) out[i] += b2[i];
 }
@@ -148,21 +177,20 @@ void JanusImageGen::image_logits(std::span<const float> h,
                                  std::span<float> out) const {
     const std::size_t e = n_embd_;
     std::vector<float> p(e);
-    backend::matvec({gguf::TensorType::kF32,
-                     reinterpret_cast<const std::byte*>(
-                         t("janus.gen_head.proj.weight", e * e).data()),
-                     n_embd_, n_embd_},
-                    h, p);
+    matvec_pool({gguf::TensorType::kF32,
+                 reinterpret_cast<const std::byte*>(
+                     t("janus.gen_head.proj.weight", e * e).data()),
+                 n_embd_, n_embd_},
+                h, p);
     const auto pb = t("janus.gen_head.proj.bias", e);
     for (std::size_t i = 0; i < e; ++i) p[i] += pb[i];
     gelu(p);
-    backend::matvec({gguf::TensorType::kF32,
-                     reinterpret_cast<const std::byte*>(
-                         t("janus.gen_head.out.weight",
-                           std::size_t{codes_} * e)
-                             .data()),
-                     codes_, n_embd_},
-                    p, out);
+    matvec_pool({gguf::TensorType::kF32,
+                 reinterpret_cast<const std::byte*>(
+                     t("janus.gen_head.out.weight", std::size_t{codes_} * e)
+                         .data()),
+                 codes_, n_embd_},
+                p, out);
     const auto ob = t("janus.gen_head.out.bias", codes_);
     for (std::uint32_t i = 0; i < codes_; ++i) out[i] += ob[i];
 }
