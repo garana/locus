@@ -209,6 +209,14 @@ TEST_CASE("muse-spark defaults to quantized activations; the flag is "
     auto model = TransformerModel::load(g);
     REQUIRE(model.q8k_activations());
     REQUIRE(model.ops().matvec_q8k != nullptr);
+    // The arch requirement holds on a backend that does not prefer Q8
+    // (an avx2 / vulkan stand-in).
+    locus::backend::Backend f32_backend =
+        *locus::backend::find_backend("scalar");
+    f32_backend.ops.prefers_q8k = false;
+    model.use_backend(f32_backend);
+    REQUIRE(model.q8k_activations());
+    REQUIRE(model.ops().matvec_q8k != nullptr);
     model.use_q8k_activations(false);
     REQUIRE(model.ops().matvec_q8k == nullptr);
 }

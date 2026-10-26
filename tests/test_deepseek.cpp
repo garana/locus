@@ -37,9 +37,9 @@ TEST_CASE("deepseek-v2-lite matches llama.cpp token-exact",
     auto model = locus::model::TransformerModel::load(g);
     // Pinned to the f32-activation dot: this golden is llama.cpp's
     // greedy text, which the f32 path reproduces on every leg; with
-    // the R16 Q8 activations (the CPU default) the neon leg tips after
-    // 15 generated tokens (" a little bit shy" vs " a girl who was
-    // born"), a near-tie like qwen2moe's.
+    // the R16 Q8 activations (the CPU default) the neon leg parts from
+    // it after 15 generated tokens (" a little bit shy" vs " a girl who
+    // was born"), as qwen2moe's does.
     model.use_q8k_activations(false);
     const auto& hp = model.hparams();
     REQUIRE(hp.arch == locus::model::Arch::kDeepseek2);

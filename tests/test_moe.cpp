@@ -1150,7 +1150,7 @@ TEST_CASE("batched prefill keeps the Q8_0-activation dot of decode",
     REQUIRE(last(false) != f);
 }
 
-TEST_CASE("the R16 default follows the backend, the arch and the switch",
+TEST_CASE("the R16 default follows the backend and the switch",
           "[moe]") {
     constexpr std::uint32_t kNe = 4;
     ModelBuilder mb;
