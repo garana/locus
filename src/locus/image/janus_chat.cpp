@@ -20,13 +20,16 @@ std::string janus_chat_text(std::span<const ChatTurn> turns,
         out += system;
         out += "\n\n";
     }
+    // Janus-Pro's role labels (its own special tokens, as in the
+    // README's Janus-Pro examples; the plain "User" / "Assistant" of
+    // the repo's inference.py are Janus-1.3B's).
     for (const ChatTurn& t : turns) {
         if (t.role == "user") {
-            out += "User: ";
+            out += "<|User|>: ";
             out += python_strip(t.text);
             out += "\n\n";
         } else if (t.role == "assistant") {
-            out += "Assistant: ";
+            out += "<|Assistant|>: ";
             out += python_strip(t.text);
             out += eos;
         } else {
@@ -34,7 +37,7 @@ std::string janus_chat_text(std::span<const ChatTurn> turns,
                                         t.role);
         }
     }
-    out += "Assistant:";
+    out += "<|Assistant|>:";
     return out;
 }
 

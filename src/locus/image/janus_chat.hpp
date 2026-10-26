@@ -30,9 +30,10 @@ struct ChatTurn {
  * The Janus reference's prompt text for a chat
  * (apply_sft_template_for_multi_turn_prompts, sft_format "deepseek"):
  * the system prompt and "\n\n" when it is not empty, then each user
- * turn as "User: <text>\n\n" and each assistant turn as
- * "Assistant: <text>" + eos, every text Python-stripped, then
- * "Assistant:" for the reply.
+ * turn as "<|User|>: <text>\n\n" and each assistant turn as
+ * "<|Assistant|>: <text>" + eos, every text Python-stripped, then
+ * "<|Assistant|>:" for the reply. The role labels are Janus-Pro's own
+ * special tokens (its README's examples).
  *
  * @param turns The conversation; the last turn must be the user's.
  * @param system The system prompt (kJanusSystemPrompt by default in

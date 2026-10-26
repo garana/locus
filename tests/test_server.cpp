@@ -1558,10 +1558,10 @@ TEST_CASE("images endpoint returns the reference image end to end",
 
 namespace {
 
-/** The reference image (tests/golden/janus_decode.png) as base64. */
+/** The vision test image (tests/golden/janus_apple.png) as base64. */
 std::string golden_png_b64() {
     std::ifstream f(std::string(LOCUS_SOURCE_DIR) +
-                        "/tests/golden/janus_decode.png",
+                        "/tests/golden/janus_apple.png",
                     std::ios::binary);
     REQUIRE(f.good());
     const std::string raw((std::istreambuf_iterator<char>(f)),
@@ -1687,6 +1687,12 @@ TEST_CASE("chat with an image answers like the reference",
         REQUIRE_RES(r);
         REQUIRE(r->status == 400);
     }
+    // The Anthropic top-level system text is checked too (it was a 500).
+    json sys = anthropic_image_chat(b64, q);
+    sys["system"] = "see <image_placeholder>";
+    auto rs = c.Post("/v1/messages", sys.dump(), "application/json");
+    REQUIRE_RES(rs);
+    REQUIRE(rs->status == 400);
 
     if (std::getenv("LOCUS_HEAVY_TESTS") == nullptr) {
         SKIP("a 630-token image prompt takes over a minute on a CPU; set "

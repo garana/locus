@@ -103,7 +103,7 @@ Golden read_golden() {
 /** The reference image (384 x 384) as pixels in [-1, 1]. */
 std::vector<float> golden_pixels(const locus::image::JanusVision& v) {
     const auto png = png_test::parse_stored_png(
-        read_bytes(kDir + "golden/janus_decode.png"));
+        read_bytes(kDir + "golden/janus_apple.png"));
     REQUIRE(png.w == v.image_size());
     REQUIRE(png.h == v.image_size());
     return v.to_pixels(png.rgb);
@@ -120,9 +120,10 @@ bool have_model() {
 }  // namespace
 
 // The reference's apply_sft_template_for_multi_turn_prompts output for
-// this conversation (printed from the Janus processor), with the
-// default system prompt and with none: stripped turns, "\n\n" after a
-// user turn, eos after an assistant turn, "Assistant:" at the end.
+// this conversation with Janus-Pro's roles (printed from the Janus
+// processor), with the default system prompt and with none: stripped
+// turns, "\n\n" after a user turn, eos after an assistant turn,
+// "<|Assistant|>:" at the end.
 TEST_CASE("janus chat text matches the reference template",
           "[janus][image][vision]") {
     using locus::image::ChatTurn;
@@ -134,8 +135,9 @@ TEST_CASE("janus chat text matches the reference template",
     const std::string eos = "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81"
                             "sentence\xef\xbd\x9c>";
     const std::string body =
-        "User: <image_placeholder>\nWhat is on the table?\n\nAssistant: "
-        "An apple." + eos + "User: What color is it?\n\nAssistant:";
+        "<|User|>: <image_placeholder>\nWhat is on the table?\n\n"
+        "<|Assistant|>: An apple." + eos +
+        "<|User|>: What color is it?\n\n<|Assistant|>:";
     REQUIRE(locus::image::janus_chat_text(turns,
                                           locus::image::kJanusSystemPrompt,
                                           eos) ==

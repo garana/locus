@@ -346,6 +346,12 @@ std::optional<VisionChat> parse_vision_chat(const json& body,
     if (anthropic && body.contains("system") && !body["system"].is_null()) {
         vc.system = anthropic_text(body["system"]);
         vc.has_system = true;
+        // Like every turn's text: a typed placeholder would add an
+        // image slot with no image.
+        if (vc.system.find(image::kImagePlaceholder) != std::string::npos) {
+            throw std::invalid_argument(
+                "system text may not contain <image_placeholder>");
+        }
     }
     for (const auto& m : msgs) {
         const std::string role = m.value("role", "user");

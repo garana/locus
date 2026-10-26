@@ -15,11 +15,14 @@ that locus's image path is compared against (i#221 section 6).
   decode  The real VQ-16 decoder in float32 on the tokens from
           `tokens`. Writes the (3, 384, 384) f32 output and the PNG,
           with the reference's truncating uint8 conversion.
-  vision  Image understanding (i#241) on janus_decode.png, which is
-          384 x 384, so the preprocessing has no resize and no pad.
-          The reference processor and SFT template with one question,
-          then greedy decoding. Writes janus_vision.f32 (VISION_ROWS
-          sampled patches of the SigLIP output, 1024 wide, then the
+  vision  Image understanding (i#241) on janus_apple.png (a copy of
+          an earlier janus_decode.png, kept apart so the generation
+          goldens can change), which is 384 x 384, so the
+          preprocessing has no resize and no pad. The reference
+          processor and SFT template with Janus-Pro's <|User|> /
+          <|Assistant|> roles and one question, then greedy decoding.
+          Writes janus_vision.f32 (VISION_ROWS sampled patches of the
+          SigLIP output, 1024 wide, then the
           same rows of the aligner output, 2048 wide) and
           janus_understand.txt (the expanded prompt ids, the answer
           ids, then the RMS of the whole vision and aligner outputs).
@@ -45,7 +48,7 @@ outputs' sha256 (on an M2 Pro, CPU):
   janus_vision.f32
     99379afcac1e6a73f5acbc6d41c195d9ed2c6a612fe8edb845bd862c69ee0225
   janus_understand.txt
-    4601fa660873d3afea11598690170056bc7fed7bcf20419ee4324e14c1bcfb07
+    6f91da23cbd9ceade9a62e416fa5934bf7b3c8e7ce45fd99256a628501279105
 
 The tokens are an f32 CPU argmax, so another machine can tip a near
 tie; regenerate there and compare before trusting a mismatch.
@@ -220,11 +223,13 @@ def cmd_decode(args):
 def cmd_vision(args):
     from PIL import Image  # noqa: E402
     proc, model = load_janus(args)
-    img = Image.open(GOLDEN / "janus_decode.png").convert("RGB")
+    img = Image.open(GOLDEN / "janus_apple.png").convert("RGB")
     assert img.size == (384, 384), img.size
-    conv = [{"role": "User",
+    # Janus-Pro's roles (its own special tokens, the README's Janus-Pro
+    # examples); "User" / "Assistant" are Janus-1.3B's.
+    conv = [{"role": "<|User|>",
              "content": "<image_placeholder>\n" + QUESTION},
-            {"role": "Assistant", "content": ""}]
+            {"role": "<|Assistant|>", "content": ""}]
     inp = proc(conversations=conv, images=[img], force_batchify=True)
     # The processor's pixels must be exactly (x / 255 - 0.5) / 0.5 here.
     raw = torch.from_numpy(np.asarray(img, dtype=np.float32)).permute(2, 0, 1)
