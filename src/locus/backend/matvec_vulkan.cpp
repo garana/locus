@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <bit>
 #include <cassert>
@@ -530,6 +531,19 @@ struct State {
 State& state() {
     static State s;
     return s;
+}
+
+/**
+ * Serializes every exported entry point that touches state() (i#268).
+ * The server reaches the backend from the engine thread and from HTTP
+ * threads (image, vision, embeddings, audio) at once, and State's
+ * scratch buffers, open command batch and weight pool are shared.
+ * Recursive, so an entry point may reach another through the model's
+ * ops while holding it.
+ */
+std::recursive_mutex& state_mu() {
+    static std::recursive_mutex mu;
+    return mu;
 }
 
 /** Records one matvec dispatch into the open batch. */
@@ -1196,6 +1210,7 @@ void vulkan_set_prefill_f16(bool on) {
         }
         return;
     }
+    std::lock_guard lk(state_mu());
     State& s = state();
     if (on && !s.ctx.has_f16()) {
         std::fprintf(stderr,
@@ -1212,6 +1227,7 @@ bool vulkan_backend_usable() {
 }
 
 float* vulkan_alloc_kv(std::size_t n_floats) {
+    std::lock_guard lk(state_mu());
     State& s = state();
     auto buf = s.ctx.create_buffer(n_floats * 4);
     void* map = s.ctx.mapped(buf);
@@ -1220,7 +1236,10 @@ float* vulkan_alloc_kv(std::size_t n_floats) {
     return static_cast<float*>(map);
 }
 
-void vulkan_reset_state() { state().free_buffers(); }
+void vulkan_reset_state() {
+    std::lock_guard lk(state_mu());
+    state().free_buffers();
+}
 
 void matvec_vulkan(const Mat& w, std::span<const float> x,
                    std::span<float> out) {
@@ -1228,6 +1247,7 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
         matvec(w, x, out);  // no shader for this weight type
         return;
     }
+    std::lock_guard lk(state_mu());
     State& s = state();
     const Kernel k = matvec_kernel(w);
     auto wb = s.upload_w(w);
@@ -1379,6 +1399,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     std::uint32_t row_end, std::span<const float> embd_in,
                     std::span<float> normed_out) {
     const auto& hp = m.hparams();
+    std::lock_guard lk(state_mu());
     State& s = state();
     const bool quant = cache.quantized();
     auto pool_it = s.kv_pools.find(
@@ -2187,6 +2208,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                           std::span<float> logits, bool all_logits) {
     using C = State::Chunk;
     const auto& hp = m.hparams();
+    std::lock_guard lk(state_mu());
     State& s = state();
     const auto n = static_cast<std::uint32_t>(tokens.size());
     const bool f16 = cache.geometry().kv_type == kv::KvType::kF16;
