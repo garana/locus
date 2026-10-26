@@ -40,6 +40,7 @@ add_library(locus
     src/locus/audio/snac.cpp
     src/locus/image/vq16.cpp
     src/locus/image/janus.cpp
+    src/locus/image/janus_vision.cpp
     src/locus/image/png.cpp
     src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp
