@@ -239,10 +239,13 @@ std::vector<std::int32_t> JanusImageGen::generate(
         static_cast<std::uint32_t>(prompt.size()) + image_tokens();
     auto cache = m.make_cache();
     auto ws = m.make_workspace();
-    std::vector<float> logits(hp.n_vocab), normed(hp.n_embd);
+    std::vector<float> logits[2] = {std::vector<float>(hp.n_vocab),
+                                    std::vector<float>(hp.n_vocab)};
+    std::vector<float> normed[2] = {std::vector<float>(hp.n_embd),
+                                    std::vector<float>(hp.n_embd)};
     // The backbone's text head is not needed: one row keeps it cheap.
-    // forward_embedding returns the final normed hidden state (on the
-    // fused GPU forward when the backend has it, i#247).
+    // forward_embeddings returns the final normed hidden states, both
+    // sequences in one GPU forward when the backend has it (i#267).
     const model::LogitRows one{0, 1};
     // On vulkan the heads run on the GPU as well (i#247); the
     // backend's matvec caches their weights by mapped address.
@@ -258,11 +261,21 @@ std::vector<std::int32_t> JanusImageGen::generate(
         if (!cache.ensure_capacity(seq[s], total)) {
             throw std::runtime_error("janus: KV cache too small");
         }
-        for (const tok::TokenId id : ids[s]) {
-            m.forward_embedding(id, {}, cache, seq[s], ws, logits, one,
-                                normed);
-        }
-        image_logits(normed, img[s], gpu);
+    }
+    // One position of both sequences: the prompts (same length) and
+    // then each image code, which both sequences take.
+    auto step = [&](tok::TokenId t0, tok::TokenId t1,
+                    std::span<const float> embd) {
+        const model::EmbedStep st[2] = {
+            {t0, embd, &seq[0], logits[0], normed[0]},
+            {t1, embd, &seq[1], logits[1], normed[1]}};
+        m.forward_embeddings(st, cache, ws, one);
+    };
+    for (std::size_t j = 0; j < prompt.size(); ++j) {
+        step(ids[0][j], ids[1][j], {});
+    }
+    for (int s = 0; s < 2; ++s) {
+        image_logits(normed[s], img[s], gpu);
     }
 
     model::SamplingParams sp;
@@ -283,10 +296,9 @@ std::vector<std::int32_t> JanusImageGen::generate(
         out.push_back(code);
         if (i + 1 == image_tokens()) break;
         image_embed(code, emb, gpu);
+        step(0, 0, emb);
         for (int s = 0; s < 2; ++s) {
-            m.forward_embedding(0, emb, cache, seq[s], ws, logits, one,
-                                normed);
-            image_logits(normed, img[s], gpu);
+            image_logits(normed[s], img[s], gpu);
         }
     }
     for (auto& s : seq) cache.release(s);

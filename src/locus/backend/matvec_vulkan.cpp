@@ -241,6 +241,9 @@ struct State {
         for (int c = 0; c < kChunkCount_; ++c) {
             drop(chunk[c], chunk_n[c]);
         }
+        for (std::size_t i = 0; i < kMultiMax; ++i) {
+            drop(mtable[i], mtable_n[i]);
+        }
         // IQ grid+signs tables: uploaded once, resident; re-created
         // lazily after a reset (the ready flag drives grid_table).
         auto drop_tbl = [&](VulkanContext::Buffer& b, bool& ready) {
@@ -437,6 +440,11 @@ struct State {
     };
     VulkanContext::Buffer chunk[kChunkCount_]{};
     std::size_t chunk_n[kChunkCount_]{};
+
+    /** vulkan_forward_multi: one block table per sequence. */
+    static constexpr std::size_t kMultiMax = 8;
+    VulkanContext::Buffer mtable[kMultiMax]{};
+    std::size_t mtable_n[kMultiMax]{};
 
     /** @returns Chunk buffer c, grown to at least n_floats. */
     VulkanContext::Buffer chunk_buf(Chunk c, std::size_t n_floats) {
@@ -761,6 +769,22 @@ Kernel matmul_id_kernel(const Mat& w) {
     }
 }
 
+/** @returns The short-batch (matvec_q8_0_n family) kernel for w over
+ * n_tok <= kSmallBatch tokens, or kCount_. 16-bit weights take the
+ * NT 2 build for up to 2 tokens (matvec_q8_0_n.comp). */
+Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
+    const bool two = n_tok <= 2;
+    switch (w.type) {
+        case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0N;
+        case gguf::TensorType::kF32: return Kernel::kMatvecF32N;
+        case gguf::TensorType::kF16:
+            return two ? Kernel::kMatvecF16N2 : Kernel::kMatvecF16N;
+        case gguf::TensorType::kBF16:
+            return two ? Kernel::kMatvecBF16N2 : Kernel::kMatvecBF16N;
+        default: return Kernel::kCount_;
+    }
+}
+
 /** Token-row layout of one prefill matmul operand set. */
 struct MatmulRows {
     std::uint32_t n_tok;
@@ -792,29 +816,13 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
                 VulkanContext::Buffer x, VulkanContext::Buffer out,
                 const MatmulRows& r, bool accumulate,
                 std::uint64_t w_byte_off = 0, float scale = 1.0f) {
-    const Kernel k = matmul_kernel(w);
-    if (k == Kernel::kCount_) {
-        for (std::uint32_t b = 0; b < r.n_batch; ++b) {
-            for (std::uint32_t t = 0; t < r.n_tok; ++t) {
-                rec_matvec(s, w, x, out,
-                           r.out_off + b * r.out_bstride +
-                               t * r.out_stride,
-                           accumulate, w_byte_off + b * r.w_bstride_bytes,
-                           r.x_off + b * r.x_bstride + t * r.x_stride,
-                           scale, &wb);
-            }
-        }
-        return;
-    }
-    // A short batch (a speculative verify, a tiny chunk): one weight
-    // read for all its tokens (matvec_q8_0_n / matvec_f32_n,
-    // bandwidth-bound) instead of a mostly-padding matmul tile.
-    const Kernel small = w.type == gguf::TensorType::kQ8_0
-                             ? Kernel::kMatvecQ8_0N
-                             : Kernel::kMatvecF32N;
-    if ((w.type == gguf::TensorType::kQ8_0 ||
-         w.type == gguf::TensorType::kF32) &&
-        r.n_tok <= kSmallBatch && r.div == 1 && r.w_bdiv == 1) {
+    // A short batch (a speculative verify, a tiny chunk, the CFG pair of
+    // vulkan_forward_multi): one weight read for all its tokens
+    // (matvec_*_n, bandwidth-bound) instead of a mostly-padding matmul
+    // tile, or, for F16 / BF16 (no matmul kernel), one matvec per token.
+    const Kernel small = small_batch_kernel(w, r.n_tok);
+    if (small != Kernel::kCount_ && r.n_tok <= kSmallBatch && r.div == 1 &&
+        r.w_bdiv == 1) {
         const VulkanContext::Buffer bufs[] = {wb, x, out};
         const std::uint32_t push[] = {w.rows,
                                       w.cols,
@@ -832,6 +840,20 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
         s.ctx.dispatch(small, bufs, push,
                        VulkanContext::matvec_groups(small, w.rows),
                        r.n_batch);
+        return;
+    }
+    const Kernel k = matmul_kernel(w);
+    if (k == Kernel::kCount_) {
+        for (std::uint32_t b = 0; b < r.n_batch; ++b) {
+            for (std::uint32_t t = 0; t < r.n_tok; ++t) {
+                rec_matvec(s, w, x, out,
+                           r.out_off + b * r.out_bstride +
+                               t * r.out_stride,
+                           accumulate, w_byte_off + b * r.w_bstride_bytes,
+                           r.x_off + b * r.x_bstride + t * r.x_stride,
+                           scale, &wb);
+            }
+        }
         return;
     }
     const std::uint32_t tiles = (r.n_tok + kMatmulToks - 1) / kMatmulToks;
@@ -2198,6 +2220,191 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     }
     s.ctx.note_token();
     seq.n_tokens = pos + 1;
+    return true;
+}
+
+bool vulkan_forward_multi(const model::TransformerModel& m,
+                          std::span<const model::EmbedStep> steps,
+                          kv::PagedKvCache& cache, std::uint32_t row_begin,
+                          std::uint32_t row_end) {
+    const auto& hp = m.hparams();
+    const auto n = static_cast<std::uint32_t>(steps.size());
+    if (n == 0 || n > State::kMultiMax || n > kSmallBatch ||
+        cache.quantized() || hp.arch == model::Arch::kDeepseek2 ||
+        hp.n_expert > 0 || !vulkan_forward_supported(m) ||
+        std::ranges::any_of(m.layers(), [](const auto& l) {
+            return l.is_moe() || l.has_qk_norm() || l.has_qkv_bias();
+        })) {
+        return false;
+    }
+    std::lock_guard lk(state_mu());
+    State& s = state();
+    auto pool_it =
+        s.kv_pools.find(static_cast<const void*>(cache.pool_data()));
+    if (pool_it == s.kv_pools.end()) {
+        return false;  // cache pool is not GPU-mapped
+    }
+    for (const auto& st : steps) {
+        if (st.seq->n_tokens >= hp.n_ctx ||
+            st.seq->n_tokens >= cache.capacity(*st.seq)) {
+            throw std::invalid_argument("seq capacity not ensured");
+        }
+    }
+    const auto& geom = cache.geometry();
+    assert(geom.layer_base == 0 &&
+           "vulkan_forward_multi assumes a base-0 full-height KV cache");
+    const std::uint32_t E = hp.n_embd, hd = hp.head_dim, H = hp.n_heads;
+    const std::uint32_t ff = hp.n_ff;
+    const std::uint32_t kv_dim = geom.kv_dim;
+    const std::uint32_t q_dim = H * hd;
+    const std::uint32_t layer_stride = geom.block_tokens * kv_dim * 2;
+    const std::uint32_t block_stride = geom.n_layers * layer_stride;
+    const std::uint32_t group =
+        hp.n_kv_heads > 0 ? H / hp.n_kv_heads : 1;
+    const std::uint32_t n_rows = row_end - row_begin;
+
+    // Rows of all the sequences side by side: residual, normed, q, K
+    // then V, FFN, attention output, head rows.
+    using C = State::Chunk;
+    const auto bx = s.chunk_buf(C::kCX, std::size_t{n} * E);
+    const auto bxb = s.chunk_buf(C::kCXb, std::size_t{n} * E);
+    const auto bq = s.chunk_buf(C::kCQ, std::size_t{n} * q_dim);
+    const auto bkv = s.chunk_buf(C::kCK, std::size_t{2} * n * kv_dim);
+    const auto bgate = s.chunk_buf(C::kCGate, std::size_t{n} * ff);
+    const auto bup = s.chunk_buf(C::kCUp, std::size_t{n} * ff);
+    const auto batt = s.chunk_buf(C::kCAttOut, std::size_t{n} * q_dim);
+    const auto blog = s.chunk_buf(C::kCLogits, std::size_t{n} * n_rows);
+    // The decode attention reads q and writes its output at offset 0:
+    // one sequence at a time goes through these.
+    s.grow(s.q, s.q_n, q_dim);
+    s.grow(s.attout, s.attout_n, q_dim);
+    s.grow(s.att, s.att_n, static_cast<std::size_t>(H) * hp.n_ctx);
+
+    std::vector<float> x_host(std::size_t{n} * E);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const auto& st = steps[i];
+        auto row = std::span<float>(x_host).subspan(std::size_t{i} * E, E);
+        if (!st.embd_in.empty()) {
+            std::copy(st.embd_in.begin(), st.embd_in.end(), row.begin());
+        } else {
+            dequant_row(m.embedding(), static_cast<std::uint32_t>(st.token),
+                        row);
+        }
+        s.grow(s.mtable[i], s.mtable_n[i], cache.total_blocks());
+        s.ctx.write_buffer(s.mtable[i],
+                           std::as_bytes(std::span<const kv::BlockId>(
+                               st.seq->blocks)));
+    }
+    s.ctx.write_buffer(bx, std::as_bytes(std::span<const float>(x_host)));
+
+    const auto pool = pool_it->second;
+    const std::uint32_t eps_bits = fbits(hp.rms_eps);
+    const std::uint32_t base_bits = fbits(hp.rope_freq_base);
+    const Kernel rope_k = hp.rope_neox ? Kernel::kRopeNeox : Kernel::kRope;
+    const VulkanContext::Buffer divisors =
+        s.rope_divisors(m.rope_factors(), hd / 2);
+
+    // Every row of `in` RMS-normed into `out` (rows E apart).
+    auto norm_rows = [&](std::span<const float> w, VulkanContext::Buffer in,
+                         VulkanContext::Buffer out) {
+        const VulkanContext::Buffer bufs[] = {
+            in, s.upload(w.data(), w.size() * 4), out};
+        const std::uint32_t push[] = {E, eps_bits, 0, 0, E, E};
+        s.ctx.dispatch(Kernel::kRmsNormB, bufs, push, 1, n);
+    };
+    // out row i (+)= w x row i, every row in one weight read.
+    auto proj = [&](const Mat& w, VulkanContext::Buffer x,
+                    std::uint32_t x_stride, VulkanContext::Buffer out,
+                    std::uint32_t out_off, std::uint32_t out_stride,
+                    bool acc) {
+        rec_matmul(s, w, s.upload_w(w), x, out,
+                   MatmulRows{n, 0, x_stride, out_off, out_stride}, acc);
+    };
+    auto copy = [&](VulkanContext::Buffer src, std::uint32_t src_off,
+                    VulkanContext::Buffer dst, std::uint32_t dst_off,
+                    std::uint32_t count) {
+        const VulkanContext::Buffer bufs[] = {src, dst};
+        const std::uint32_t push[] = {count, src_off, dst_off};
+        s.ctx.dispatch(Kernel::kCopy, bufs, push, (count + 255) / 256);
+    };
+
+    s.ctx.begin_batch();
+    for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
+        const auto& lay = m.layers()[l];
+        norm_rows(lay.attn_norm, bx, bxb);
+        proj(lay.wq, bxb, E, bq, 0, q_dim, false);
+        proj(lay.wk, bxb, E, bkv, 0, kv_dim, false);
+        proj(lay.wv, bxb, E, bkv, n * kv_dim, kv_dim, false);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const std::uint32_t pos = steps[i].seq->n_tokens;
+            {
+                const VulkanContext::Buffer bufs[] = {bq, divisors};
+                const std::uint32_t push[] = {
+                    H,         hd, pos, i * q_dim, hd, base_bits,
+                    fbits(1.0f), 0, 0};
+                s.ctx.dispatch(rope_k, bufs, push, H);
+            }
+            {
+                const VulkanContext::Buffer bufs[] = {bkv, divisors};
+                const std::uint32_t push[] = {
+                    hp.n_kv_heads, hd, pos, i * kv_dim, hd, base_bits,
+                    fbits(1.0f),   0,  0};
+                s.ctx.dispatch(rope_k, bufs, push, hp.n_kv_heads);
+            }
+            {
+                // This sequence's K and V rows (planes n * kv_dim apart)
+                // into its own block, through its own table.
+                const VulkanContext::Buffer bufs[] = {bkv, pool,
+                                                      s.mtable[i]};
+                const std::uint32_t push[] = {
+                    kv_dim,       pos,        geom.block_tokens,
+                    block_stride, kv_dim,     l * layer_stride,
+                    i * kv_dim,   kv_dim,     n * kv_dim,
+                    layer_stride / 2};
+                s.ctx.dispatch(Kernel::kKvScatter, bufs, push, 1, 1, 2);
+            }
+            copy(bq, i * q_dim, s.q, 0, q_dim);
+            const PagedPool pp{pool, s.mtable[i], geom.block_tokens,
+                               block_stride, kv_dim, false};
+            rec_attn_gqa(s, pp, s.q, s.att, s.attout, 1, pos, H, group, hd,
+                         q_dim, l * layer_stride, layer_stride / 2);
+            copy(s.attout, 0, batt, i * q_dim, q_dim);
+        }
+        proj(lay.wo, batt, q_dim, bx, 0, E, true);
+
+        norm_rows(lay.ffn_norm, bx, bxb);
+        proj(lay.w_gate, bxb, E, bgate, 0, ff, false);
+        proj(lay.w_up, bxb, E, bup, 0, ff, false);
+        {
+            const VulkanContext::Buffer bufs[] = {bgate, bup, bgate};
+            const std::uint32_t push[] = {n * ff};
+            s.ctx.dispatch(Kernel::kSiluMul, bufs, push,
+                           (n * ff + 63) / 64);
+        }
+        proj(lay.w_down, bgate, ff, bx, 0, E, true);
+    }
+    norm_rows(m.output_norm(), bx, bxb);
+    // Head rows [row_begin, row_end) of every sequence: a row view of
+    // the uploaded head, as vulkan_forward's partial head.
+    const Mat& out_w = m.output_weight();
+    rec_matmul(s, mat_rows(out_w, row_begin, n_rows), s.upload_w(out_w),
+               bxb, blog, MatmulRows{n, 0, E, 0, n_rows}, false,
+               std::uint64_t{row_begin} * mat_row_bytes(out_w));
+    s.end_batch();
+
+    std::vector<float> logits_host(std::size_t{n} * n_rows);
+    std::vector<float> normed_host(std::size_t{n} * E);
+    s.ctx.read_buffer(blog, std::as_writable_bytes(std::span(logits_host)));
+    s.ctx.read_buffer(bxb, std::as_writable_bytes(std::span(normed_host)));
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const auto& st = steps[i];
+        std::copy_n(logits_host.begin() + std::size_t{i} * n_rows, n_rows,
+                    st.logits.begin() + row_begin);
+        std::copy_n(normed_host.begin() + std::size_t{i} * E, E,
+                    st.normed_out.begin());
+        st.seq->n_tokens += 1;
+        s.ctx.note_token();
+    }
     return true;
 }
 

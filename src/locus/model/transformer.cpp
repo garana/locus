@@ -645,6 +645,50 @@ void TransformerModel::forward_embedding(
     std::copy_n(ws.xb.begin(), hp_.n_embd, normed_out.begin());
 }
 
+void TransformerModel::forward_embeddings(std::span<const EmbedStep> steps,
+                                          kv::PagedKvCache& cache,
+                                          Workspace& ws,
+                                          LogitRows rows) const {
+    if (rows.end == 0) {
+        rows = {0, hp_.n_vocab};
+    }
+    if (rows.begin >= rows.end || rows.end > hp_.n_vocab) {
+        throw std::invalid_argument(
+            "forward_embeddings: bad logit row range");
+    }
+    // forward_embedding's checks for every step first, so the GPU path
+    // never sees a bad one; and no sequence twice.
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        const EmbedStep& st = steps[i];
+        if (st.seq == nullptr || st.normed_out.size() < hp_.n_embd ||
+            st.logits.size() < hp_.n_vocab ||
+            (!st.embd_in.empty() && st.embd_in.size() != hp_.n_embd)) {
+            throw std::invalid_argument(
+                "forward_embeddings: bad step buffers");
+        }
+        if (st.embd_in.empty() &&
+            (st.token < 0 ||
+             static_cast<std::uint32_t>(st.token) >= hp_.n_vocab)) {
+            throw std::invalid_argument("token id out of vocab");
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            if (steps[j].seq == st.seq) {
+                throw std::invalid_argument(
+                    "forward_embeddings: a sequence appears twice");
+            }
+        }
+    }
+    if (steps.size() > 1 && backend_->name == "vulkan" &&
+        backend::vulkan_forward_multi(*this, steps, cache, rows.begin,
+                                      rows.end)) {
+        return;
+    }
+    for (const EmbedStep& st : steps) {
+        forward_embedding(st.token, st.embd_in, cache, *st.seq, ws,
+                          st.logits, rows, st.normed_out);
+    }
+}
+
 void TransformerModel::forward(tok::TokenId token,
                          kv::PagedKvCache& cache,
                          kv::PagedKvCache::Seq& seq, Workspace& ws,

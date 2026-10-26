@@ -15,11 +15,23 @@
 // b * out_bstride.
 //
 // matvec_f32_n (-DTYPE_F32) is the same over row-major F32 weights
-// (w_off and w_bstride in floats).
+// (w_off and w_bstride in floats). matvec_f16_n (-DTYPE_F16) and
+// matvec_bf16_n (-DTYPE_F16 -DBF16) read 16-bit rows, a word (two
+// weights) per load where rows are word-aligned (w_off and w_bstride
+// in halves); i#267, both CFG sequences of Janus-Pro (BF16).
+//
+// -DNT2 (the *_n2 builds) caps the tokens at 2: the 8-wide token loop
+// and its 8-plane reduction cost as much as the weight read, so two
+// tokens through the NT 8 build took as long as two matvecs; the NT 2
+// build takes as long as one (MoltenVK, 5632 x 2048 BF16).
 
 #define LANES 32u
 #define ROWS 4u
+#ifdef NT2
+#define NT 2u           // max tokens per dispatch (the *_n2 builds)
+#else
 #define NT 8u           // max tokens per dispatch
+#endif
 
 layout(local_size_x = 128) in;
 
@@ -50,7 +62,27 @@ layout(push_constant) uniform PC {
 
 shared float red[NT * LANES * ROWS];
 
-#ifndef TYPE_F32
+#ifdef TYPE_F16
+#ifdef BF16
+// bfloat16 is the top half of an f32: widening is exact.
+vec2 pair_at(uint i) {
+    uint word = w[i];
+    return vec2(uintBitsToFloat(word << 16),
+                uintBitsToFloat(word & 0xFFFF0000u));
+}
+#else
+vec2 pair_at(uint i) {
+    return unpackHalf2x16(w[i]);
+}
+#endif
+/** Element e (in halves) of the weights. */
+float half_at(uint e) {
+    vec2 pair = pair_at(e >> 1);
+    return (e & 1u) != 0u ? pair.y : pair.x;
+}
+#endif
+
+#if !defined(TYPE_F32) && !defined(TYPE_F16)
 /** The 4 bytes at byte offset b (any alignment). */
 uint word_at(uint b) {
     uint i = b >> 2;
@@ -85,6 +117,34 @@ void main() {
             for (uint t = 0u; t < NT; ++t) {
                 if (t < nt) {
                     acc[t] += wv * x[x_off + t * pc.x_stride + c];
+                }
+            }
+        }
+    }
+#elif defined(TYPE_F16)
+    if (r < pc.rows) {
+        uint rb = w_off + r * pc.cols;
+        if (((rb | pc.cols) & 1u) == 0u) {
+            // Whole words: lane l takes the pairs l, l + 32, ..., two
+            // weights per load (the kernel is ALU-bound otherwise).
+            uint wb = rb >> 1;
+            for (uint c = lane; c < pc.cols >> 1; c += LANES) {
+                vec2 wv = pair_at(wb + c);
+                uint xc = x_off + 2u * c;
+                for (uint t = 0u; t < NT; ++t) {
+                    if (t < nt) {
+                        uint xi = xc + t * pc.x_stride;
+                        acc[t] += wv.x * x[xi] + wv.y * x[xi + 1u];
+                    }
+                }
+            }
+        } else {
+            for (uint c = lane; c < pc.cols; c += LANES) {
+                float wv = half_at(rb + c);
+                for (uint t = 0u; t < NT; ++t) {
+                    if (t < nt) {
+                        acc[t] += wv * x[x_off + t * pc.x_stride + c];
+                    }
                 }
             }
         }

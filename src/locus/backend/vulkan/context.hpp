@@ -109,6 +109,14 @@ enum class Kernel {
     /** matvec_f16 with -DBF16: bfloat16 weights (Janus-Pro, i#247). */
     kMatvecBF16,
     kMatvecBF16B,
+    /** matvec_q8_0_n over F16 / BF16 rows (i#267); the N2 builds
+     * take at most 2 tokens, with a lighter token loop. */
+    kMatvecF16N,
+    kMatvecBF16N,
+    kMatvecF16N2,
+    kMatvecBF16N2,
+    /** Plain float copy between buffer offsets (copy.comp, i#267). */
+    kCopy,
     kCount_,
 };
 
