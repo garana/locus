@@ -51,6 +51,7 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ4_K:  // 8 rows of 16 lanes
         case Kernel::kMatvecQ4_KB:
         case Kernel::kMatvecQ4_KGluB:
+        case Kernel::kMatvecQ4_KSeg:
         case Kernel::kMatvecQ6_K:
         case Kernel::kMatvecQ6_KB:
             return (rows + 7) / 8;
@@ -212,6 +213,7 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matvec_f16_n2_spv.h"
 #include "matvec_bf16_n2_spv.h"
 #include "copy_spv.h"
+#include "matvec_q4_k_seg_spv.h"
 #include "rope_neox_spv.h"
 #include "rope_neox_b_spv.h"
 #include "matvec_q4_k_b_spv.h"
@@ -515,6 +517,8 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kMatvecBF16N2, "matvec_bf16_n2", locus_matvec_bf16_n2_spv,
      sizeof(locus_matvec_bf16_n2_spv), 3, 52},
     {Kernel::kCopy, "copy", locus_copy_spv, sizeof(locus_copy_spv), 2, 12},
+    {Kernel::kMatvecQ4_KSeg, "matvec_q4_k_seg", locus_matvec_q4_k_seg_spv,
+     sizeof(locus_matvec_q4_k_seg_spv), 6, 44},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

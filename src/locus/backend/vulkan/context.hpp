@@ -117,6 +117,8 @@ enum class Kernel {
     kMatvecBF16N2,
     /** Plain float copy between buffer offsets (copy.comp, i#267). */
     kCopy,
+    /** matvec_q4_k over q / k / v from separate buffers (SEGMENTS). */
+    kMatvecQ4_KSeg,
     kCount_,
 };
 

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -528,6 +529,93 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
         ctx.destroy_buffer(xb);
         ctx.destroy_buffer(ob);
     }
+}
+
+TEST_CASE("vulkan q4_k seg matvec routes each matrix to its output",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(53);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    const std::uint32_t cols = 768;
+    auto random_q4k = [&](std::uint32_t rows) {
+        std::vector<std::byte> w(rows * (cols / 256) * 144);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t at = 0; at < w.size(); at += 144) {
+            const std::uint16_t dd[] = {locus::backend::f32_to_f16(0.01f),
+                                        locus::backend::f32_to_f16(0.005f)};
+            std::memcpy(&w[at], dd, 4);
+        }
+        return w;
+    };
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    auto xb = ctx.create_buffer(x.size() * 4);
+    ctx.write_buffer(xb, std::as_bytes(std::span(x)));
+
+    // Row counts off the 8-row workgroup grid, so workgroups straddle
+    // segments; out at offset 3, the other two at off1 / off2 of out2.
+    const std::uint32_t rows[] = {20, 12, 7};
+    const std::uint32_t out_off = 3, off1 = 5, off2 = 40;
+    for (const std::uint32_t n_seg : {2u, 3u}) {
+        DYNAMIC_SECTION(n_seg << " segments") {
+            std::vector<std::vector<std::byte>> ws;
+            std::vector<VulkanContext::Buffer> wb;
+            for (std::uint32_t i = 0; i < n_seg; ++i) {
+                ws.push_back(random_q4k(rows[i]));
+                wb.push_back(ctx.create_buffer(ws.back().size()));
+                ctx.write_buffer(wb.back(), ws.back());
+            }
+            std::vector<float> init(64, -7.0f);
+            auto ob = ctx.create_buffer(init.size() * 4);
+            auto o2b = ctx.create_buffer(init.size() * 4);
+            ctx.write_buffer(ob, std::as_bytes(std::span(init)));
+            ctx.write_buffer(o2b, std::as_bytes(std::span(init)));
+            const std::uint32_t seg1 = rows[0], seg2 = seg1 + rows[1];
+            const std::uint32_t total = n_seg == 3 ? seg2 + rows[2] : seg2;
+            const VulkanContext::Buffer bufs[] = {
+                wb[0], xb, ob, o2b, wb[1], n_seg == 3 ? wb[2] : wb[1]};
+            const std::uint32_t push[] = {
+                total, cols, out_off, 0, 0, 0,
+                std::bit_cast<std::uint32_t>(1.0f), seg1, off1, seg2, off2};
+            ctx.begin_batch();
+            ctx.dispatch(Kernel::kMatvecQ4_KSeg, bufs, push,
+                         VulkanContext::matvec_groups(Kernel::kMatvecQ4_KSeg,
+                                                      total));
+            ctx.end_batch();
+            std::vector<float> o(64), o2(64);
+            ctx.read_buffer(ob, std::as_writable_bytes(std::span(o)));
+            ctx.read_buffer(o2b, std::as_writable_bytes(std::span(o2)));
+            std::vector<float> want_o = init, want_o2 = init;
+            const std::uint32_t at[] = {out_off, off1, off2};
+            for (std::uint32_t i = 0; i < n_seg; ++i) {
+                std::vector<float> cpu(rows[i]);
+                locus::backend::Mat m{locus::gguf::TensorType::kQ4_K,
+                                      ws[i].data(), rows[i], cols};
+                locus::backend::matvec(m, x, cpu);
+                auto& dst = i == 0 ? want_o : want_o2;
+                std::copy(cpu.begin(), cpu.end(), dst.begin() + at[i]);
+            }
+            for (std::size_t i = 0; i < o.size(); ++i) {
+                INFO("row " << i);
+                REQUIRE(o[i] == Catch::Approx(want_o[i]).margin(1e-3));
+                REQUIRE(o2[i] == Catch::Approx(want_o2[i]).margin(1e-3));
+            }
+            for (auto b : wb) {
+                ctx.destroy_buffer(b);
+            }
+            ctx.destroy_buffer(ob);
+            ctx.destroy_buffer(o2b);
+        }
+    }
+    ctx.destroy_buffer(xb);
 }
 
 TEST_CASE("vulkan IQ2_XXS matvec matches the CPU reference",
