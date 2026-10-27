@@ -48,7 +48,9 @@ Any API key is accepted (see Auth below).
 
 - Anthropic Python and JS SDKs: set the base URL to locus.
 - Claude Code: `ANTHROPIC_BASE_URL=http://host:port` runs it against a
-  locally served model.
+  locally served model. Its first request is about 18k tokens (system
+  prompt and tool list), so start the server with `--ctx 32768` or
+  more.
 
 ### GitHub Copilot CLI (offline)
 
