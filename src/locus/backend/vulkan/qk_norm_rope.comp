@@ -1,0 +1,89 @@
+#version 450
+
+// Per-head RMS norm then RoPE of q and k in one dispatch (qwen3 /
+// qwen3moe decode): workgroup g < n_q norms and ropes q head g in Q at
+// q_off + g * head_dim, workgroup n_q + g k head g in K at k_off +
+// g * head_dim, in place, each head scaled by its tensor's norm
+// weights (QW, KW).
+//
+// The norm is rmsnorm.comp's (256 threads striding the head, the same
+// shared-memory tree, x * scale * w) and the rope rope.comp's for
+// pair i (interleaved, or NEOX when pc.neox), so the result matches
+// rmsnorm_b followed by rope / rope_neox bit for bit. The normed head
+// stays in shared memory between the two. The norm reads its input
+// from the buffer, not shared memory, exactly as rmsnorm.comp: with
+// the inputs staged in shared memory the Metal compiler (fast math
+// under MoltenVK) rounded x * scale * w differently.
+
+#define WG 256u
+#define HD_MAX 512u
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Q { float q[]; };
+layout(std430, binding = 1) buffer K { float k[]; };
+layout(std430, binding = 2) readonly buffer QW { float qw[]; };
+layout(std430, binding = 3) readonly buffer KW { float kw[]; };
+// Per-pair frequency divisors, as rope.comp.
+layout(std430, binding = 4) readonly buffer F { float f[]; };
+
+layout(push_constant) uniform PC {
+    uint n_q;
+    uint head_dim;    // even, <= HD_MAX
+    float eps;
+    uint q_off;
+    uint k_off;
+    uint pos;
+    float freq_base;
+    uint neox;
+} pc;
+
+shared float red[WG];
+shared float hv[HD_MAX];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    bool is_q = gl_WorkGroupID.x < pc.n_q;
+    uint hd = pc.head_dim;
+    uint base = is_q ? pc.q_off + gl_WorkGroupID.x * hd
+                     : pc.k_off + (gl_WorkGroupID.x - pc.n_q) * hd;
+    float ss = 0.0;
+    for (uint i = tid; i < hd; i += WG) {
+        float v = is_q ? q[base + i] : k[base + i];
+        ss += v * v;
+    }
+    red[tid] = ss;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (tid < step) {
+            red[tid] += red[tid + step];
+        }
+        barrier();
+    }
+    float scale = inversesqrt(red[0] / float(hd) + pc.eps);
+    for (uint i = tid; i < hd; i += WG) {
+        hv[i] = is_q ? q[base + i] * scale * qw[i]
+                     : k[base + i] * scale * kw[i];
+    }
+    barrier();
+    for (uint i = 2u * tid; i + 1u < hd; i += 2u * WG) {
+        float theta =
+            float(pc.pos) * pow(pc.freq_base, -float(i) / float(hd));
+        theta /= f[i / 2u];
+        float c = cos(theta);
+        float s = sin(theta);
+        uint a = pc.neox != 0u ? i / 2u : i;
+        uint b = pc.neox != 0u ? a + hd / 2u : a + 1u;
+        float x0 = hv[a];
+        float x1 = hv[b];
+        float r0 = x0 * c - x1 * s;
+        float r1 = x0 * s + x1 * c;
+        if (is_q) {
+            q[base + a] = r0;
+            q[base + b] = r1;
+        } else {
+            k[base + a] = r0;
+            k[base + b] = r1;
+        }
+    }
+}

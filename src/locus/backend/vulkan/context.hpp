@@ -117,6 +117,8 @@ enum class Kernel {
     kMatvecBF16N2,
     /** Plain float copy between buffer offsets (copy.comp, i#267). */
     kCopy,
+    /** Per-head q / k RMS norm and rope in one dispatch (qwen3). */
+    kQkNormRope,
     kCount_,
 };
 
@@ -204,6 +206,9 @@ class VulkanContext {
      */
     static constexpr std::uint32_t kMatmulBK = 32;
     static constexpr std::uint32_t kMatmulBKSmall = 16;
+
+    /** Widest head qk_norm_rope.comp takes (its HD_MAX). */
+    static constexpr std::uint32_t kQkNormRopeHdMax = 512;
 
     /**
      * Device memory this context can still allocate, per
