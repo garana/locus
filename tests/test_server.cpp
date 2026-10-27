@@ -221,6 +221,42 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
                      .empty());
     }
 
+    SECTION("chat content as text parts equals the joined string") {
+        // The OpenAI multimodal shape with text parts only: the parts
+        // join with newlines, so the greedy reply equals the string's.
+        auto reply = [&](const json& content) {
+            json req{{"messages",
+                      json::array({{{"role", "user"},
+                                    {"content", content}}})},
+                     {"max_tokens", 8}};
+            auto res = client.Post("/v1/chat/completions", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            INFO(res->body);
+            REQUIRE(res->status == 200);
+            return json::parse(res->body)["choices"][0]["message"]
+                                         ["content"]
+                .get<std::string>();
+        };
+        const json parts = json::array(
+            {{{"type", "text"}, {"text", "Once upon"}},
+             {{"type", "text"}, {"text", "a time"}}});
+        REQUIRE(reply(parts) == reply("Once upon\na time"));
+
+        auto bad = [&](const json& content) {
+            json req{{"messages",
+                      json::array({{{"role", "user"},
+                                    {"content", content}}})},
+                     {"max_tokens", 4}};
+            auto res = client.Post("/v1/chat/completions", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            return res->status;
+        };
+        REQUIRE(bad(json::array({{{"type", "input_audio"}}})) == 400);
+        REQUIRE(bad(42) == 400);
+    }
+
     SECTION("chat completions with tools is accepted") {
         // The toy model won't emit a valid tool call, so this just
         // confirms the tools plumbing (system injection + response

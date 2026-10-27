@@ -60,14 +60,40 @@ void set_error(http::ServerResponse& res, const std::exception& e) {
                     "application/json");
 }
 
+/**
+ * The text of an OpenAI message's content: a string, or an array of
+ * parts (the multimodal shape, which some clients send for plain text
+ * too) whose "text" parts are joined with newlines, as the vision path
+ * joins them. Image requests never get here (parse_vision_chat takes
+ * them first), so any other part type is unsupported.
+ */
+std::string openai_text(const json& content) {
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    if (!content.is_array()) {
+        throw std::invalid_argument(
+            "message content must be a string or an array of parts");
+    }
+    std::string out;
+    for (const auto& p : content) {
+        const std::string type = p.is_object() ? p.value("type", "") : "";
+        if (type != "text" || !p.contains("text") || !p["text"].is_string()) {
+            throw std::invalid_argument("unsupported content part: " +
+                                        (type.empty() ? "(none)" : type));
+        }
+        if (!out.empty()) out += "\n";
+        out += p["text"].get<std::string>();
+    }
+    return out;
+}
+
 /** Parses and validates the OpenAI messages array. */
 std::vector<chat::Message> parse_messages(const json& messages) {
     std::vector<chat::Message> out;
     for (const auto& m : messages) {
-        if (!m.contains("content") ||
-            !m["content"].is_string()) {
-            throw std::invalid_argument(
-                "message content must be a string");
+        if (!m.contains("content")) {
+            throw std::invalid_argument("message content is missing");
         }
         chat::Message msg;
         msg.role = m.value("role", "user");
@@ -76,7 +102,7 @@ std::vector<chat::Message> parse_messages(const json& messages) {
             throw std::invalid_argument(
                 "unsupported message role: " + msg.role);
         }
-        msg.content = m["content"].get<std::string>();
+        msg.content = openai_text(m["content"]);
         out.push_back(std::move(msg));
     }
     return out;

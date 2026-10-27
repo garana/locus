@@ -46,6 +46,7 @@ OpenAI + Anthropic compatible inference server (default port 8080):
   POST /v1/messages            (Anthropic)
   POST /v1/embeddings          (CPU and CUDA backends)
   GET  /v1/models
+  GET  /v1/models/{id}
   POST /v1/audio/speech        (needs --audio-decoder)
   POST /v1/images/generations  (needs --image-decoder)
   GET  /health

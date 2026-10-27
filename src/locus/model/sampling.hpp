@@ -86,8 +86,9 @@ class TokenConstraint {
  * non-null, restricts the choice to allowed tokens (falling back to
  * unconstrained if it would leave no candidate).
  *
- * is_greedy(p) short-circuits to argmax (rng unused, no
- * constraint) so greedy decoding stays bit-exact. Filter order
+ * is_greedy(p) short-circuits to the highest-logit token, the
+ * highest allowed one when constrained (rng unused), so greedy
+ * decoding stays bit-exact. Filter order
  * matches llama.cpp: penalties -> constraint -> top_k ->
  * temperature/softmax -> top_p -> min_p -> sample.
  */
