@@ -398,6 +398,46 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(json::parse(res->body)["type"] == "message");
     }
 
+    SECTION("anthropic system messages join the top-level system") {
+        // Claude Code sends a system-role entry after the first user
+        // turn; its text goes after the top-level system text.
+        const auto reply = [&](const json& req) {
+            auto res = client.Post("/v1/messages", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            return json::parse(res->body)["content"][0]["text"]
+                .get<std::string>();
+        };
+        const json user{{"role", "user"}, {"content", "Once upon a time"}};
+        const std::string joined =
+            reply({{"system", "You are\na storyteller."},
+                   {"messages", json::array({user})},
+                   {"max_tokens", 12}});
+        REQUIRE(reply({{"system", "You are"},
+                       {"messages",
+                        json::array({user,
+                                     {{"role", "system"},
+                                      {"content",
+                                       json::array({{{"type", "text"},
+                                                     {"text",
+                                                      "a storyteller."}}})}}})},
+                       {"max_tokens", 12}}) == joined);
+        REQUIRE(reply({{"messages",
+                        json::array({{{"role", "system"},
+                                      {"content", "You are\na storyteller."}},
+                                     user})},
+                       {"max_tokens", 12}}) == joined);
+
+        json bad{{"messages",
+                  json::array({user, {{"role", "tool"}, {"content", "x"}}})},
+                 {"max_tokens", 4}};
+        auto res = client.Post("/v1/messages", bad.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 400);
+    }
+
     SECTION("anthropic messages, streaming SSE") {
         json req{{"messages",
                   json::array({{{"role", "user"},
