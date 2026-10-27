@@ -463,14 +463,16 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
     // units per lane; the rest span many workgroups (1000 rows: a
     // partial last one for the 64-row kernels). x_off 1 puts the
     // activations off 16-byte alignment: the scalar-load fallback.
+    // w_off 4 does the same for the weights (word loads, not quads).
     const std::uint32_t shapes[][2] = {{4, 512},    {7, 2304},
                                        {512, 2048}, {2048, 768},
                                        {1000, 2048}};
+    for (const std::uint32_t w_off : {0u, 4u})
     for (const std::uint32_t x_off : {0u, 1u})
     for (const auto& [rows, cols] : shapes)
     for (const auto& c : cases) {
         INFO("type " << static_cast<int>(c.type) << " " << rows << "x"
-                     << cols << " x_off " << x_off);
+                     << cols << " x_off " << x_off << " w_off " << w_off);
         std::vector<float> x(cols);
         for (auto& v : x) {
             v = dist(rng);
@@ -498,18 +500,21 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
         locus::backend::Mat m{c.type, w.data(), rows, cols};
         locus::backend::matvec(m, x, cpu);
 
+        std::vector<std::byte> ws(w_off);
+        ws.insert(ws.end(), w.begin(), w.end());
         auto wb =
-            ctx.create_buffer((w.size() + 3) & ~std::size_t{3});
+            ctx.create_buffer((ws.size() + 3) & ~std::size_t{3});
         std::vector<float> xs(x_off, 0.0f);
         xs.insert(xs.end(), x.begin(), x.end());
         auto xb = ctx.create_buffer(xs.size() * 4);
         auto ob = ctx.create_buffer(gpu.size() * 4);
-        ctx.write_buffer(wb, w);
+        ctx.write_buffer(wb, ws);
         ctx.write_buffer(xb, std::as_bytes(std::span(xs)));
         ctx.begin_batch();
         const VulkanContext::Buffer bufs[] = {wb, xb, ob};
         const std::uint32_t push[] = {
-        rows, cols, 0, 0, 0, x_off, std::bit_cast<std::uint32_t>(1.0f)};
+        rows, cols, 0,     0,
+        w_off, x_off, std::bit_cast<std::uint32_t>(1.0f)};
         ctx.dispatch(c.kernel, bufs, push,
                      VulkanContext::matvec_groups(c.kernel, rows));
         ctx.end_batch();
