@@ -183,61 +183,6 @@ __device__ void scale_min_k4(int j, const std::uint8_t* q,
     }
 }
 
-/** One Q4_K super-block is 144 bytes: d,dmin (f16) + scales[12] +
- *  qs[128], 256 weights. Dequant + accumulate in the exact element
- *  order of the scalar dequant_block_q4_k / dot_k_quant so the dot
- *  is token-exact with the CPU reference. */
-__global__ void matvec_q4_k_kernel(const std::uint8_t* w,
-                                   const float* x, float* out,
-                                   std::uint32_t rows,
-                                   std::uint32_t cols) {
-    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) {
-        return;
-    }
-    const std::uint32_t nsb = cols / 256;
-    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 144;
-    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
-                                      row_bytes;
-    float acc = 0.0f;
-    for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
-                                            144;
-        const std::uint16_t db =
-            static_cast<std::uint16_t>(blk[0]) |
-            (static_cast<std::uint16_t>(blk[1]) << 8);
-        const std::uint16_t dmb =
-            static_cast<std::uint16_t>(blk[2]) |
-            (static_cast<std::uint16_t>(blk[3]) << 8);
-        const float d = __half2float(__ushort_as_half(db));
-        const float dmin = __half2float(__ushort_as_half(dmb));
-        const std::uint8_t* scales = blk + 4;
-        const std::uint8_t* q = blk + 16;
-        const float* xb = x + static_cast<std::size_t>(b) * 256;
-        int is = 0, yi = 0;
-        for (int j = 0; j < 256; j += 64) {
-            std::uint8_t sc, mn;
-            scale_min_k4(is + 0, scales, sc, mn);
-            const float d1 = d * sc, m1 = dmin * mn;
-            scale_min_k4(is + 1, scales, sc, mn);
-            const float d2 = d * sc, m2 = dmin * mn;
-            for (int l = 0; l < 32; ++l) {
-                const float val =
-                    d1 * static_cast<float>(q[l] & 0x0f) - m1;
-                acc += val * xb[yi++];
-            }
-            for (int l = 0; l < 32; ++l) {
-                const float val =
-                    d2 * static_cast<float>(q[l] >> 4) - m2;
-                acc += val * xb[yi++];
-            }
-            q += 32;
-            is += 2;
-        }
-    }
-    out[r] = acc;
-}
-
 /** Q4_K x Q8_K integer dot on device; bit-exact port of the scalar
  *  vec_dot_q4_k_q8_k (aux8 nibble unpack, per-8 int16 products, scale*
  *  int32 accumulate over 8 lanes, bsums min-correction). Activation
@@ -1283,71 +1228,162 @@ __global__ void matvec_q5_k_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
-/** One Q6_K super-block is 210 bytes: ql[128] + qh[64] + sc[16]int8
- *  + d (f16), 256 weights. The scalar fills y in a scattered order
- *  (y[l], y[l+32], y[l+64], y[l+96]); to keep the dot bit-identical
- *  to dot_k_quant we materialize the block then accumulate i=0..255. */
-__global__ void matvec_q6_k_kernel(const std::uint8_t* w,
-                                   const float* x, float* out,
+/** Rows per block of the staged K-quant kernels (their blockDim). */
+constexpr std::uint32_t kStagedRows = 128;
+
+/**
+ * Copies super-block `b` of rows [row0, row0 + kStagedRows) into
+ * shared memory (row t at sw + t * Stride bytes) and the matching 256
+ * activations into sx, then syncs. Consecutive threads read
+ * consecutive Word-sized pieces of one row, so the global reads
+ * coalesce (one row per thread does not: rows are row_bytes apart).
+ * Stride pads each row so a warp reading one byte per row hits
+ * distinct banks. Rows past `rows` are not loaded. BlkBytes, b's
+ * offset and row_bytes must be multiples of sizeof(Word).
+ */
+template <std::uint32_t BlkBytes, std::uint32_t Stride, typename Word>
+__device__ void stage_kquant_block(const std::uint8_t* w,
+                                   const float* x, std::uint32_t b,
+                                   std::uint32_t row0,
                                    std::uint32_t rows,
-                                   std::uint32_t cols) {
-    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) {
-        return;
+                                   std::size_t row_bytes,
+                                   std::uint8_t* sw, float* sx) {
+    constexpr std::uint32_t kWords = BlkBytes / sizeof(Word);
+    const std::uint32_t nrow = min(kStagedRows, rows - row0);
+    for (std::uint32_t i = threadIdx.x; i < nrow * kWords;
+         i += blockDim.x) {
+        const std::uint32_t t = i / kWords, k = i % kWords;
+        const std::uint8_t* src =
+            w + static_cast<std::size_t>(row0 + t) * row_bytes +
+            static_cast<std::size_t>(b) * BlkBytes + sizeof(Word) * k;
+        *reinterpret_cast<Word*>(sw + t * Stride + sizeof(Word) * k) =
+            *reinterpret_cast<const Word*>(src);
     }
+    for (std::uint32_t i = threadIdx.x; i < 256; i += blockDim.x) {
+        sx[i] = x[static_cast<std::size_t>(b) * 256 + i];
+    }
+    __syncthreads();
+}
+
+/** One Q4_K super-block is 144 bytes: d,dmin (f16) + scales[12] +
+ *  qs[128], 256 weights. Each thread owns one row and dequantizes +
+ *  accumulates in the element order of the scalar dequant_block_q4_k
+ *  / dot_k_quant; each super-block is first staged in shared memory
+ *  (stage_kquant_block) so the global reads coalesce. Launch with
+ *  kStagedRows threads per block. */
+__global__ void matvec_q4_k_staged_kernel(const std::uint8_t* w,
+                                          const float* x, float* out,
+                                          std::uint32_t rows,
+                                          std::uint32_t cols) {
+    constexpr std::uint32_t kStride = 148;  // 144 + 4: 37 words
+    __shared__ __align__(16) std::uint8_t sw[kStagedRows * kStride];
+    __shared__ float sx[256];
+    const std::uint32_t row0 = blockIdx.x * kStagedRows;
+    const std::uint32_t r = row0 + threadIdx.x;
     const std::uint32_t nsb = cols / 256;
-    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 210;
-    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
-                                      row_bytes;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 144;
     float acc = 0.0f;
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
-                                            210;
-        const std::uint8_t* qlp = blk;
-        const std::uint8_t* qhp = blk + 128;
-        const std::int8_t* scp =
-            reinterpret_cast<const std::int8_t*>(blk + 192);
-        const std::uint16_t db =
-            static_cast<std::uint16_t>(blk[208]) |
-            (static_cast<std::uint16_t>(blk[209]) << 8);
-        const float d = __half2float(__ushort_as_half(db));
-        const float* xb = x + static_cast<std::size_t>(b) * 256;
-        float tmp[256];
-        float* y = tmp;
-        for (int n = 0; n < 256; n += 128) {
-            for (int l = 0; l < 32; ++l) {
-                const int is = l / 16;
-                const int q1 = static_cast<int>(
-                                   (qlp[l] & 0x0f) |
-                                   (((qhp[l] >> 0) & 3) << 4)) -
-                               32;
-                const int q2 = static_cast<int>(
-                                   (qlp[l + 32] & 0x0f) |
-                                   (((qhp[l] >> 2) & 3) << 4)) -
-                               32;
-                const int q3 = static_cast<int>(
-                                   (qlp[l] >> 4) |
-                                   (((qhp[l] >> 4) & 3) << 4)) -
-                               32;
-                const int q4 = static_cast<int>(
-                                   (qlp[l + 32] >> 4) |
-                                   (((qhp[l] >> 6) & 3) << 4)) -
-                               32;
-                y[l] = d * scp[is] * static_cast<float>(q1);
-                y[l + 32] = d * scp[is + 2] * static_cast<float>(q2);
-                y[l + 64] = d * scp[is + 4] * static_cast<float>(q3);
-                y[l + 96] = d * scp[is + 6] * static_cast<float>(q4);
+        stage_kquant_block<144, kStride, std::uint32_t>(
+            w, x, b, row0, rows, row_bytes, sw, sx);
+        if (r < rows) {
+            const std::uint8_t* blk = sw + threadIdx.x * kStride;
+            const std::uint16_t db =
+                static_cast<std::uint16_t>(blk[0]) |
+                (static_cast<std::uint16_t>(blk[1]) << 8);
+            const std::uint16_t dmb =
+                static_cast<std::uint16_t>(blk[2]) |
+                (static_cast<std::uint16_t>(blk[3]) << 8);
+            const float d = __half2float(__ushort_as_half(db));
+            const float dmin = __half2float(__ushort_as_half(dmb));
+            const std::uint8_t* scales = blk + 4;
+            const std::uint8_t* q = blk + 16;
+            int is = 0, yi = 0;
+            for (int j = 0; j < 256; j += 64) {
+                std::uint8_t sc, mn;
+                scale_min_k4(is + 0, scales, sc, mn);
+                const float d1 = d * sc, m1 = dmin * mn;
+                scale_min_k4(is + 1, scales, sc, mn);
+                const float d2 = d * sc, m2 = dmin * mn;
+                for (int l = 0; l < 32; ++l) {
+                    const float val =
+                        d1 * static_cast<float>(q[l] & 0x0f) - m1;
+                    acc += val * sx[yi++];
+                }
+                for (int l = 0; l < 32; ++l) {
+                    const float val =
+                        d2 * static_cast<float>(q[l] >> 4) - m2;
+                    acc += val * sx[yi++];
+                }
+                q += 32;
+                is += 2;
             }
-            y += 128;
-            qlp += 64;
-            qhp += 32;
-            scp += 8;
         }
-        for (int i = 0; i < 256; ++i) {
-            acc += tmp[i] * xb[i];
-        }
+        __syncthreads();  // the next stage overwrites sw / sx
     }
-    out[r] = acc;
+    if (r < rows) {
+        out[r] = acc;
+    }
+}
+
+/** One Q6_K super-block is 210 bytes: ql[128] + qh[64] + sc[16]int8
+ *  + d (f16), 256 weights, staged like matvec_q4_k_staged_kernel. The
+ *  scalar dequant fills y in a scattered order (y[l], y[l+32],
+ *  y[l+64], y[l+96]) and dot_k_quant then sums y[i] * x[i] for
+ *  i = 0..255; this computes y[i] in that i order (h, g, l below) and
+ *  sums as it goes, without a per-thread y array (local memory).
+ *  Launch with kStagedRows threads per block. */
+__global__ void matvec_q6_k_staged_kernel(const std::uint8_t* w,
+                                          const float* x, float* out,
+                                          std::uint32_t rows,
+                                          std::uint32_t cols) {
+    constexpr std::uint32_t kStride = 212;  // 210 + 2: 53 words
+    __shared__ __align__(16) std::uint8_t sw[kStagedRows * kStride];
+    __shared__ float sx[256];
+    const std::uint32_t row0 = blockIdx.x * kStagedRows;
+    const std::uint32_t r = row0 + threadIdx.x;
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 210;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        stage_kquant_block<210, kStride, std::uint16_t>(
+            w, x, b, row0, rows, row_bytes, sw, sx);
+        if (r < rows) {
+            const std::uint8_t* blk = sw + threadIdx.x * kStride;
+            const std::uint16_t db =
+                static_cast<std::uint16_t>(blk[208]) |
+                (static_cast<std::uint16_t>(blk[209]) << 8);
+            const float d = __half2float(__ushort_as_half(db));
+            int i = 0;
+            for (int h = 0; h < 2; ++h) {
+                const std::uint8_t* qlp = blk + 64 * h;
+                const std::uint8_t* qhp = blk + 128 + 32 * h;
+                const std::int8_t* scp =
+                    reinterpret_cast<const std::int8_t*>(blk + 192) +
+                    8 * h;
+                for (int g = 0; g < 4; ++g) {
+                    const std::uint8_t* ql = qlp + (g & 1) * 32;
+                    const int lo_shift = (g >> 1) * 4;
+                    const int hi_shift = g * 2;
+                    for (int l = 0; l < 32; ++l) {
+                        const int is = l / 16;
+                        const int q = static_cast<int>(
+                                          ((ql[l] >> lo_shift) & 0x0f) |
+                                          (((qhp[l] >> hi_shift) & 3)
+                                           << 4)) -
+                                      32;
+                        const float y = d * scp[is + 2 * g] *
+                                        static_cast<float>(q);
+                        acc += y * sx[i++];
+                    }
+                }
+            }
+        }
+        __syncthreads();  // the next stage overwrites sw / sx
+    }
+    if (r < rows) {
+        out[r] = acc;
+    }
 }
 
 /** One IQ1_S super-block is 50 bytes: d (f16) + qs[32] + qh[8]u16,
@@ -2574,7 +2610,8 @@ void launch_kernel(Kind kind, const void* dw,
                 dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kQ4_K:
-            matvec_q4_k_kernel<<<blocks, threads>>>(
+            matvec_q4_k_staged_kernel<<<
+                (rows + kStagedRows - 1) / kStagedRows, kStagedRows>>>(
                 dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kQ5_K:
@@ -2582,7 +2619,8 @@ void launch_kernel(Kind kind, const void* dw,
                 dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kQ6_K:
-            matvec_q6_k_kernel<<<blocks, threads>>>(
+            matvec_q6_k_staged_kernel<<<
+                (rows + kStagedRows - 1) / kStagedRows, kStagedRows>>>(
                 dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kIQ1_S:
