@@ -47,6 +47,23 @@ void set_cloexec(int fd) {
         ::fcntl(fd, F_SETFD, f | FD_CLOEXEC);
     }
 }
+/**
+ * pipe() with both ends close-on-exec. Linux sets the flag
+ * atomically; macOS has no pipe2, so a fork+exec on another thread
+ * between pipe() and fcntl() can still inherit the fds.
+ */
+int cloexec_pipe(int fds[2]) {
+#if defined(__linux__)
+    return ::pipe2(fds, O_CLOEXEC);
+#else
+    if (::pipe(fds) != 0) {
+        return -1;
+    }
+    set_cloexec(fds[0]);
+    set_cloexec(fds[1]);
+    return 0;
+#endif
+}
 }  // namespace
 
 std::unique_ptr<HelperConnection> spawn_helper(
@@ -64,20 +81,20 @@ std::unique_ptr<HelperConnection> spawn_helper(
         return nullptr;
     }
     // in_pipe: parent writes -> child stdin. out_pipe: child stdout
-    // -> parent reads. (no pipe2 on macOS; set CLOEXEC by hand.)
+    // -> parent reads. All four ends are close-on-exec, so no other
+    // child (another helper, or one forked on another thread) inherits
+    // them: an inherited out_pipe write end would keep the parent from
+    // ever seeing EOF when this helper dies.
     int in_pipe[2];
     int out_pipe[2];
-    if (::pipe(in_pipe) != 0) {
+    if (cloexec_pipe(in_pipe) != 0) {
         return fail("pipe");
     }
-    if (::pipe(out_pipe) != 0) {
+    if (cloexec_pipe(out_pipe) != 0) {
         ::close(in_pipe[0]);
         ::close(in_pipe[1]);
         return fail("pipe");
     }
-    // The parent-retained ends must not leak into the next helper.
-    set_cloexec(in_pipe[1]);
-    set_cloexec(out_pipe[0]);
 
     const pid_t pid = ::fork();
     if (pid < 0) {
