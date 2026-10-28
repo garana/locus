@@ -25,6 +25,7 @@ constexpr std::uint8_t kDezigzag[64] = {
     58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
 
 constexpr int kMaxDim = 16384;  // as the stb_image build this replaces
+constexpr int kMaxScans = 100;  // libjpeg-turbo's max-scans idea
 
 /** A Huffman table (JPEG F.2.2.3: per-length code ranges). */
 struct Huffman {
@@ -466,7 +467,9 @@ void Decoder::decode_block(Bits& b, std::int16_t* data, Component& c) {
                   static_cast<std::int16_t>(dq[0]))) {
         bad("DC coefficient overflow");
     }
-    data[0] = static_cast<std::int16_t>(c.dc_pred * dq[0]);
+    // 64-bit, then narrowed: the 16-bit wrap stb_image relies on,
+    // without int overflow (mul_fits checks the narrowed operands).
+    data[0] = static_cast<std::int16_t>(std::int64_t{c.dc_pred} * dq[0]);
     const Huffman& ac = huff_ac_[c.ha];
     for (int k = 1; k < 64;) {
         const int rs = b.decode(ac);
@@ -496,7 +499,8 @@ void Decoder::prog_dc(Bits& b, std::int16_t* data, Component& c) {
                       static_cast<std::int16_t>(1 << al_))) {
             bad("DC coefficient overflow");
         }
-        data[0] = static_cast<std::int16_t>(c.dc_pred * (1 << al_));
+        data[0] = static_cast<std::int16_t>(std::int64_t{c.dc_pred} *
+                                            (1 << al_));
     } else if (b.bit()) {
         data[0] = static_cast<std::int16_t>(data[0] + (1 << al_));
     }
@@ -607,7 +611,14 @@ void Decoder::scan() {
         if (ss_ != 0 || ah_ != 0 || al_ != 0) bad("bad SOS parameters");
         se_ = 63;
     }
-    ++scans_;
+    // Each scan is a full pass over the image even with no data behind
+    // it (missing data reads as zero bits), so a small file of many scan
+    // headers could hold a core for a long time. Real files use about
+    // 10 to 20 progressive scans, and one per component when sequential.
+    if (++scans_ > kMaxScans) bad("too many scans");
+    if (!progressive_ && scans_ > static_cast<int>(comp_.size())) {
+        bad("more sequential scans than components");
+    }
 
     Bits b(p_, n_, pos_);
     auto restart = [&] {

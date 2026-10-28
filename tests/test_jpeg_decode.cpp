@@ -109,6 +109,42 @@ TEST_CASE("jpeg decoder refuses broken files cleanly", "[image][jpeg]") {
         REQUIRE_THROWS_WITH(decode_jpeg(f, {}),
                             Catch::Matchers::ContainsSubstring("limit"));
     }
+    SECTION("empty scans are capped") {
+        // Copies of the file's first scan header, with no data behind
+        // them, before EOI: each would be a full pass over the image.
+        auto with_scans = [](const std::vector<std::byte>& f, int copies) {
+            std::size_t sos = 0;
+            for (std::size_t i = 2; i + 3 < f.size(); ++i) {
+                if (f[i] == std::byte{0xFF} && f[i + 1] == std::byte{0xDA}) {
+                    sos = i;
+                    break;
+                }
+            }
+            REQUIRE(sos != 0);
+            const std::size_t len =
+                (std::to_integer<std::size_t>(f[sos + 2]) << 8) |
+                std::to_integer<std::size_t>(f[sos + 3]);
+            const std::vector<std::byte> hdr(f.begin() + sos,
+                                             f.begin() + sos + 2 + len);
+            REQUIRE(f[f.size() - 2] == std::byte{0xFF});
+            REQUIRE(f[f.size() - 1] == std::byte{0xD9});
+            std::vector<std::byte> out(f.begin(), f.end() - 2);
+            for (int i = 0; i < copies; ++i) {
+                out.insert(out.end(), hdr.begin(), hdr.end());
+            }
+            out.push_back(std::byte{0xFF});
+            out.push_back(std::byte{0xD9});
+            return out;
+        };
+        // Baseline 4:2:0 (one interleaved scan, three components): two
+        // more scans are allowed, a third is one too many.
+        REQUIRE_NOTHROW(decode_jpeg(with_scans(base, 2), {}));
+        REQUIRE_THROWS_WITH(decode_jpeg(with_scans(base, 3), {}),
+                            Catch::Matchers::ContainsSubstring("scans"));
+        // Progressive: refused past 100 scans in all.
+        REQUIRE_THROWS_WITH(decode_jpeg(with_scans(prog, 100), {}),
+                            Catch::Matchers::ContainsSubstring("too many scans"));
+    }
     SECTION("every truncation decodes or refuses") {
         for (const auto* file : {&base, &prog}) {
             for (std::size_t n = 0; n < file->size(); ++n) {
