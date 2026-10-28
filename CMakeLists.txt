@@ -42,6 +42,7 @@ add_library(locus
     src/locus/image/vq16.cpp
     src/locus/image/janus.cpp
     src/locus/image/janus_vision.cpp
+    src/locus/image/t5_encoder.cpp
     src/locus/image/janus_chat.cpp
     src/locus/image/png.cpp
     src/locus/image/inflate.cpp

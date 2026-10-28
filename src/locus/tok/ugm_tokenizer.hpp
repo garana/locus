@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -29,6 +30,9 @@ namespace locus::tok {
  *    (`Model::EncodeOptimized`): the best sum of piece scores over
  *    the normal pieces, one unknown token per character no piece
  *    covers (scored min_score - 10), and runs of unknowns merged.
+ *    Recent sentencepiece also rebases the running score once it
+ *    passes 1e5 in magnitude; this class does not, so float rounding
+ *    could pick a different near-tie only after thousands of pieces.
  * 4. With add_special, EOS is appended (T5 has no BOS).
  */
 class UgmTokenizer final : public Tokenizer {
@@ -102,6 +106,8 @@ class UgmTokenizer final : public Tokenizer {
     std::unordered_map<std::string, TokenId, ViewHash, std::equal_to<>>
         pieces_;
     std::vector<std::pair<std::string, TokenId>> user_defined_;
+    /** True for a byte that starts some user-defined token. */
+    std::array<bool, 256> ud_first_{};
     std::size_t max_piece_len_ = 0;
     float min_score_ = 0;
 };

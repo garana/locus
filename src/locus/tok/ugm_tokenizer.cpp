@@ -137,6 +137,7 @@ UgmTokenizer::UgmTokenizer(Config config) : cfg_(std::move(config)) {
             min_score_ = std::min(min_score_, cfg_.scores[i]);
         } else if (type == TokenType::kUserDefined && !tok.empty()) {
             user_defined_.emplace_back(tok, static_cast<TokenId>(i));
+            ud_first_[static_cast<unsigned char>(tok.front())] = true;
         }
     }
     if (pieces_.empty()) {
@@ -353,16 +354,24 @@ std::vector<TokenId> UgmTokenizer::encode(std::string_view text,
                                           bool add_special) const {
     std::vector<TokenId> out;
     // Split at user-defined tokens; strip whitespace on both sides of
-    // each, as HF's lstrip/rstrip added tokens do.
+    // each, as HF's lstrip/rstrip added tokens do. Only ASCII
+    // whitespace: Python's strip also takes Unicode spaces (U+00A0,
+    // U+3000), which PixArt's prompt cleaning removes anyway.
     std::string_view rest = text;
     while (!rest.empty()) {
+        // One pass: the earliest position, and there the longest token
+        // (user_defined_ is sorted longest first), reading no byte past
+        // the hit.
         std::size_t at = std::string_view::npos;
         const std::pair<std::string, TokenId>* hit = nullptr;
-        for (const auto& ud : user_defined_) {
-            const std::size_t p = rest.find(ud.first);
-            if (p < at) {
-                at = p;
-                hit = &ud;
+        for (std::size_t i = 0; i < rest.size() && hit == nullptr; ++i) {
+            if (!ud_first_[static_cast<unsigned char>(rest[i])]) continue;
+            for (const auto& ud : user_defined_) {
+                if (rest.substr(i).starts_with(ud.first)) {
+                    at = i;
+                    hit = &ud;
+                    break;
+                }
             }
         }
         if (hit == nullptr) {
