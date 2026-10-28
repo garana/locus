@@ -1009,9 +1009,9 @@ void OpenAiServer::install_routes() {
                     "Prompt tokens computed (not reused) by completed "
                     "requests.",
                     em.prefill_tokens.load(kRelaxed));
-            mt.counter("locus_prefill_seconds_total",
-                       "Prefill wall time of completed requests.",
-                       secs(em.prefill_ns.load(kRelaxed)));
+            // Prefill wall time is locus_prefill_seconds_sum: a
+            // locus_prefill_seconds_total counter would repeat it and
+            // share the histogram's OpenMetrics family name.
             counter("locus_decode_tokens_total",
                     "Tokens after the first, of completed requests.",
                     em.decode_tokens.load(kRelaxed));

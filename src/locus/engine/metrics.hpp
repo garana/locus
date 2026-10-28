@@ -12,9 +12,10 @@ namespace locus::engine {
 /**
  * A Prometheus-style histogram of durations with fixed bucket bounds.
  * One thread writes (the engine worker); any thread reads, without a
- * lock: every field is a relaxed atomic, so a reader may see a count
- * one observation ahead of a bucket, never a torn value. observe()
- * costs a short bucket scan and three relaxed adds.
+ * lock: every field is a relaxed atomic, so a reader may see the sum
+ * one observation apart from the buckets, never a torn value (the
+ * count is the bucket total). observe() costs a short bucket scan and
+ * two relaxed adds.
  */
 class Histogram {
   public:
@@ -42,7 +43,6 @@ class Histogram {
     std::size_t n_bounds_ = 0;
     /** Per-bucket (not cumulative) counts; the last one is +Inf. */
     std::array<std::atomic<std::uint64_t>, kMaxBounds + 1> buckets_{};
-    std::atomic<std::uint64_t> count_{0};
     std::atomic<std::uint64_t> sum_ns_{0};
 };
 
@@ -68,9 +68,9 @@ struct EngineMetrics {
     Histogram request;
 
     /** Completed requests' prompt tokens that were computed (not
-     * reused from the prefix cache), and their prefill wall time. */
+     * reused from the prefix cache); their prefill wall time is the
+     * prefill histogram's sum. */
     std::atomic<std::uint64_t> prefill_tokens{0};
-    std::atomic<std::uint64_t> prefill_ns{0};
     /** Completed requests' tokens after the first, and their decode
      * wall time. */
     std::atomic<std::uint64_t> decode_tokens{0};

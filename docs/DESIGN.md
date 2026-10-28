@@ -439,8 +439,9 @@ guarding the default path.
   Request counters and KV gauges sit beside per-request histograms
   (`locus_queue_seconds`, `locus_prefill_seconds`,
   `locus_time_to_first_token_seconds`, `locus_decode_token_seconds`,
-  `locus_request_seconds`), token and wall-time counters for prefill
-  and decode, the engine's step time (`locus_engine_busy_seconds_total`,
+  `locus_request_seconds`), token counters for prefill and decode, the
+  decode wall time, the engine's step time
+  (`locus_engine_busy_seconds_total`,
   `locus_engine_steps_total`) and the running and waiting counts. The
   engine writes them as relaxed atomics, a few clock reads per request
   and two per step, and `/metrics` reads them without the engine lock;

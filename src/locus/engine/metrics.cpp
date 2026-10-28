@@ -35,7 +35,6 @@ void Histogram::observe(std::uint64_t ns) {
         ++b;
     }
     buckets_[b].fetch_add(1, kRelaxed);
-    count_.fetch_add(1, kRelaxed);
     sum_ns_.fetch_add(ns, kRelaxed);
 }
 

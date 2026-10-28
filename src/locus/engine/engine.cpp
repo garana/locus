@@ -351,7 +351,6 @@ void Engine::observe_done(const Request& r) {
         n_prompt > r.reused_prefix_tokens ? n_prompt - r.reused_prefix_tokens
                                           : 0,
         kRelaxed);
-    metrics_.prefill_ns.fetch_add(prefill, kRelaxed);
     if (r.generated.size() > 1) {
         const std::uint64_t decode = ns(r.t_first, now);
         const std::uint64_t n = r.generated.size() - 1;
