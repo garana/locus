@@ -946,11 +946,12 @@ std::uint32_t TransformerModel::prefill_chunk() const {
         return 64;
     }
     // MoE prefill groups each chunk's (token, expert) pairs per expert
-    // into 64-token matmul tiles: 1024 tokens give an expert ~1024 * k
-    // / n_expert pairs (DeepSeek-V2-Lite: ~96 vs ~48 at 512), so its
-    // tiles run fuller (M4 Max: +8% prefill). Dense models gain
+    // into 64-token matmul tiles: 2048 tokens give an expert ~2048 * k
+    // / n_expert pairs (Qwen3-Coder: ~128 vs ~64 at 1024), so its
+    // tiles run fuller (M4 Max, Qwen3-Coder: +4 to +6% over 1024,
+    // which gained 8% over 512 on DeepSeek-V2-Lite). Dense models gain
     // nothing and pay for the bigger attention score block.
-    return hp_.n_expert > 0 ? 1024 : 512;
+    return hp_.n_expert > 0 ? 2048 : 512;
 }
 
 void TransformerModel::project_head_batch(

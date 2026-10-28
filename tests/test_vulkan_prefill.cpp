@@ -257,10 +257,12 @@ TEST_CASE("vulkan prefill MoE: route, group, expert matmul, combine",
     VulkanContext ctx;
     std::mt19937 rng(43);
 
-    // 37 tokens, top-3 of 8 experts; a gate-like projection (E -> ff,
+    // 150 tokens, top-3 of 8 experts; a gate-like projection (E -> ff,
     // X row = token) then a down-like one (ff -> E, X row = pair),
-    // combined with the route weights into a residual.
-    const std::uint32_t n_tok = 37, k = 3, n_exp = 8;
+    // combined with the route weights into a residual. Every token's
+    // first slot is expert 0, so its 150 pairs span 3 token tiles of
+    // the work list and the others get partial tiles.
+    const std::uint32_t n_tok = 150, k = 3, n_exp = 8;
     const std::uint32_t E = 64, ff = 96;
     const auto wg = random_q8(ff * n_exp, E, rng);
     const auto wd = random_q8(E * n_exp, ff, rng);
@@ -277,7 +279,7 @@ TEST_CASE("vulkan prefill MoE: route, group, expert matmul, combine",
         for (std::uint32_t e = 0; e < n_exp; ++e) {
             ids[e] = e;
         }
-        std::shuffle(ids.begin(), ids.end(), rng);
+        std::shuffle(ids.begin() + 1, ids.end(), rng);
         for (std::uint32_t j = 0; j < k; ++j) {
             const float wj =
                 std::uniform_real_distribution<float>(0.1f, 1.0f)(rng);
@@ -291,35 +293,39 @@ TEST_CASE("vulkan prefill MoE: route, group, expert matmul, combine",
     auto wdb = upload(ctx, gpu_q8(wd, ff));
     auto xb = upload(ctx, x);
     auto rb = upload(ctx, route);
-    auto idb = ctx.create_buffer((n_exp + std::size_t{n_exp} * n_tok) * 4);
+    // Counts, per-expert lists, then the tile list (count + entries).
+    const std::uint32_t TT = VulkanContext::kMatmulTileToks;
+    const std::uint32_t TR = VulkanContext::kMatmulTileRows;
+    const std::uint32_t max_tiles = (n_tok * k + TT - 1) / TT + n_exp;
+    const std::size_t lb = n_exp + std::size_t{n_exp} * n_tok;
+    auto idb = ctx.create_buffer((lb + 1 + max_tiles) * 4);
     auto gb = ctx.create_buffer(std::size_t{n_tok} * k * ff * 4);
     auto db = ctx.create_buffer(std::size_t{n_tok} * k * E * 4);
     auto residb = upload(ctx, resid);
-    const std::uint32_t tiles = (n_tok + 15) / 16;
 
     ctx.begin_batch();
     {
         const VulkanContext::Buffer bufs[] = {rb, idb};
-        const std::uint32_t push[] = {n_tok, k, n_exp, n_tok};
+        const std::uint32_t push[] = {n_tok, k, n_exp, n_tok, TT};
         ctx.dispatch(Kernel::kMoeGroup, bufs, push, 1);
     }
     {
         const VulkanContext::Buffer bufs[] = {wgb, xb, gb, idb};
         const std::uint32_t push[] = {
             ff, E, n_tok, 0, 0, 0, E, 0, ff, fbits(1.0f),
-            static_cast<std::uint32_t>(g_bytes), 0, 0, tiles, k, n_tok,
+            static_cast<std::uint32_t>(g_bytes), 0, 0, n_exp, k, n_tok,
             1, 0, 0, 0, 1, 0, 0, 0};
-        ctx.dispatch(Kernel::kMatmulQ8_0Id, bufs, push, (ff + 63) / 64,
-                     tiles * n_exp);
+        ctx.dispatch(Kernel::kMatmulQ8_0Id, bufs, push, (ff + TR - 1) / TR,
+                     max_tiles);
     }
     {
         const VulkanContext::Buffer bufs[] = {wdb, gb, db, idb};
         const std::uint32_t push[] = {
             E, ff, n_tok, 0, 0, 0, ff, 0, E, fbits(1.0f),
-            static_cast<std::uint32_t>(d_bytes), 0, 0, tiles, 1, n_tok,
+            static_cast<std::uint32_t>(d_bytes), 0, 0, n_exp, 1, n_tok,
             1, 0, 0, 0, 1, 0, 0, 0};
-        ctx.dispatch(Kernel::kMatmulQ8_0Id, bufs, push, (E + 63) / 64,
-                     tiles * n_exp);
+        ctx.dispatch(Kernel::kMatmulQ8_0Id, bufs, push, (E + TR - 1) / TR,
+                     max_tiles);
     }
     {
         const VulkanContext::Buffer bufs[] = {db, rb, residb};
@@ -329,12 +335,23 @@ TEST_CASE("vulkan prefill MoE: route, group, expert matmul, combine",
     }
     ctx.end_batch();
 
-    const auto counts = download<std::uint32_t>(ctx, idb, n_exp);
-    std::uint32_t total = 0;
-    for (auto c : counts) {
-        total += c;
+    const auto ids = download<std::uint32_t>(ctx, idb, lb + 1 + max_tiles);
+    std::uint32_t total = 0, want_tiles = 0;
+    for (std::uint32_t e = 0; e < n_exp; ++e) {
+        total += ids[e];
+        want_tiles += (ids[e] + TT - 1) / TT;
     }
     REQUIRE(total == n_tok * k);
+    REQUIRE(ids[0] == n_tok);
+    // The tile list: each expert's tiles 0 .. ceil(count / TT) - 1,
+    // once each, in expert order.
+    REQUIRE(ids[lb] == want_tiles);
+    std::size_t at = lb + 1;
+    for (std::uint32_t e = 0; e < n_exp; ++e) {
+        for (std::uint32_t i = 0; i < (ids[e] + TT - 1) / TT; ++i) {
+            REQUIRE(ids[at++] == ((e << 16) | i));
+        }
+    }
 
     const auto g = download<float>(ctx, gb, std::size_t{n_tok} * k * ff);
     const auto got = download<float>(ctx, residb, resid.size());
@@ -441,7 +458,7 @@ TEST_CASE("vulkan batched prefill tracks per-token prefill",
             REQUIRE(model.supports_batch_prefill());
             // MoE models prefill in bigger chunks (fuller expert tiles).
             REQUIRE(model.prefill_chunk() ==
-                    (model.hparams().n_expert > 0 ? 1024u : 512u));
+                    (model.hparams().n_expert > 0 ? 2048u : 512u));
 
             // 150 pseudo-random ids: three chunks of 64 (the last
             // one ragged), so later chunks attend over earlier ones.
