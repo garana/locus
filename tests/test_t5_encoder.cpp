@@ -52,8 +52,14 @@ std::vector<Tensor> synth_tensors() {
     return t;
 }
 
-/** A t5encoder GGUF image with the script's F32 weights. */
-std::vector<std::byte> synth_t5() {
+/**
+ * A t5encoder GGUF image with the script's F32 weights.
+ *
+ * @param heads, head_dim The values written to the keys (the tensors
+ *     keep the script's shapes).
+ */
+std::vector<std::byte> synth_t5(std::uint32_t heads = kHeads,
+                                std::uint32_t head_dim = kHeadDim) {
     const auto tensors = synth_tensors();
     std::vector<std::vector<float>> data;
     std::uint32_t lcg = 146;
@@ -73,8 +79,8 @@ std::vector<std::byte> synth_t5() {
     g.kv_u32("t5encoder.embedding_length", kWidth);
     g.kv_u32("t5encoder.feed_forward_length", kFfn);
     g.kv_u32("t5encoder.block_count", kBlocks);
-    g.kv_u32("t5encoder.attention.head_count", kHeads);
-    g.kv_u32("t5encoder.attention.key_length", kHeadDim);
+    g.kv_u32("t5encoder.attention.head_count", heads);
+    g.kv_u32("t5encoder.attention.key_length", head_dim);
     g.kv_u32("t5encoder.attention.relative_buckets_count", kBuckets);
     g.kv_u32("t5encoder.attention.relative_max_distance", kMaxDist);
     g.kv_f32("t5encoder.attention.layer_norm_rms_epsilon", 1e-6f);
@@ -174,6 +180,17 @@ TEST_CASE("t5 encoder matches torch on a synthetic model", "[t5][image]") {
     const std::vector<TokenId> bad{static_cast<TokenId>(kVocab)};
     REQUIRE_THROWS_AS(enc.encode(bad, op), std::invalid_argument);
     REQUIRE_THROWS_AS(enc.encode({}, op), std::invalid_argument);
+}
+
+// heads x head_dim = 2^32 wraps to 0 in 32 bits; the loader must refuse
+// it before sizing any buffer, and refuse heads that do not match q.
+TEST_CASE("t5 encoder rejects inconsistent head sizes", "[t5][image]") {
+    const auto wrap = synth_t5(1u << 16, 1u << 16);
+    auto g1 = locus::gguf::GgufFile::parse(wrap);
+    REQUIRE_THROWS_AS(T5Encoder::load(g1), locus::gguf::Error);
+    const auto wide = synth_t5(kHeads * 2, kHeadDim);
+    auto g2 = locus::gguf::GgufFile::parse(wide);
+    REQUIRE_THROWS_AS(T5Encoder::load(g2), locus::gguf::Error);
 }
 
 // PixArt's T5 v1.1 XXL (F16) against the torch F32 run of the same

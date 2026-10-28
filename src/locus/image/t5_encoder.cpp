@@ -117,6 +117,12 @@ T5Encoder T5Encoder::load(const gguf::GgufFile& g) {
         e.max_distance_ <= e.buckets_ / 4) {
         throw gguf::Error("t5: bad relative attention buckets");
     }
+    // In 64 bits, so a hostile pair cannot wrap to a small width.
+    if (std::uint64_t{e.heads_} * e.head_dim_ > (1u << 20) ||
+        std::uint64_t{e.width_} > (1u << 20) ||
+        std::uint64_t{e.ffn_} > (1u << 20)) {
+        throw gguf::Error("t5: sizes too large");
+    }
     const std::uint32_t inner = e.heads_ * e.head_dim_;
 
     const auto info = [&](const std::string& name) {

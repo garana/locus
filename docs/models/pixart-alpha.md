@@ -789,8 +789,8 @@ rounds to uint8).
 ### 7.2 T5 encoder
 
 `general.architecture = "t5encoder"`, with llama.cpp's key and tensor
-names, so llama.cpp's T5 encoder GGUFs load too (an exception to 7.1's
-checkpoint names). scripts/convert-t5-encoder.py writes it; the
+names (an exception to 7.1's checkpoint names; loading a GGUF from
+llama.cpp's own converter is not tested). scripts/convert-t5-encoder.py writes it; the
 tokenizer values are checked against T5Tokenizer (section 2).
 
 | key                                         | type   | value                |
