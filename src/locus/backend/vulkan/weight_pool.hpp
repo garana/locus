@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -116,6 +117,30 @@ struct WeightPoolT {
         fill(b);
         map_.emplace(ptr, Entry{b, bytes, ++clock_, true});
         used_ += bytes;
+        return b;
+    }
+
+    /**
+     * Like acquire, for a buffer over host memory used in place (the
+     * mmap'd weights imported, not copied): on a miss `make` builds it,
+     * and the entry counts 0 bytes against the budget.
+     * @returns The buffer, or nullopt when make can't (the caller
+     *          then copies through acquire).
+     */
+    std::optional<Buffer> acquire_external(
+        const void* ptr,
+        const std::function<std::optional<Buffer>()>& make) {
+        if (auto it = map_.find(ptr); it != map_.end()) {
+            it->second.last_use = ++clock_;
+            it->second.pinned = true;
+            ++hits_;
+            return it->second.buf;
+        }
+        std::optional<Buffer> b = make();
+        if (b) {
+            ++misses_;
+            map_.emplace(ptr, Entry{*b, 0, ++clock_, true});
+        }
         return b;
     }
 

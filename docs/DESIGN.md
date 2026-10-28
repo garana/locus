@@ -270,6 +270,18 @@ device memory still runs.
   most a few percent.
 - Vulkan uploads only the routed experts of a token, not every expert
   of the layer (6 of 64 on DeepSeek-V2-Lite).
+- Where the device has `VK_EXT_external_memory_host` (MoltenVK),
+  Vulkan imports a tensor's mmap'd pages instead of copying them, for
+  every type stored as the shaders read it (all but Q8_0, which is
+  repacked) and 64 KB or larger. The buffer binds at the memory
+  alignment below the tensor and its descriptors start at the tensor.
+  Imported weights cost no device memory of their own and don't count
+  toward the pool budget or the MoE expert fit. Qwen3-Coder-30B Q4_K_M
+  on an M4 Max: peak footprint 21.2 GB to 2.8 GB, and a cold first
+  prefill 18.6 s to 7.4 s, at the same speed once warm.
+  `LOCUS_VK_NO_IMPORT=1` keeps the copies. Like the copies, imported
+  buffers are keyed by host pointer, so the pool must be released
+  before a model's mapping goes away.
 
 Vulkan records one command batch per token and frees buffers only
 between batches, so one batch's working set must fit device memory.

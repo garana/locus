@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <bit>
 #include <cassert>
@@ -319,12 +320,31 @@ struct State {
     /**
      * Uploads exactly `bytes` of w's rows from w.data under pool key
      * `key`, repacking whole Q8_0 rows, into a gpu_alloc_bytes(bytes)
-     * buffer with the tail zeroed.
+     * buffer with the tail zeroed. Rows stored as the GPU reads them
+     * (every type but Q8_0) of at least kImportMin bytes are imported
+     * in place instead where the device can (#317): the mmap'd
+     * weights are not copied, and the tail is whatever follows the
+     * tensor in its last page.
      */
     VulkanContext::Buffer upload_rows(const void* key, const Mat& w,
                                       std::uint64_t bytes) {
         const std::size_t n = static_cast<std::size_t>(bytes);
         const std::size_t alloc = vk::gpu_alloc_bytes(n);
+        constexpr std::size_t kImportMin = std::size_t{64} << 10;
+        if (w.type != gguf::TensorType::kQ8_0 && n >= kImportMin &&
+            ctx.host_import()) {
+            auto b = pool.acquire_external(
+                key, [&]() -> std::optional<VulkanContext::Buffer> {
+                    auto ib = ctx.import_host(w.data, alloc, n);
+                    if (ib.impl == nullptr) {
+                        return std::nullopt;
+                    }
+                    return ib;
+                });
+            if (b) {
+                return *b;
+            }
+        }
         return pool.acquire(key, alloc, [&](VulkanContext::Buffer b) {
             const auto* src = static_cast<const std::byte*>(w.data);
             auto* dst = static_cast<std::byte*>(ctx.mapped(b));
@@ -1380,13 +1400,18 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
     }
     auto fit = s.moe_gpu_fits.find(&m);
     if (fit == s.moe_gpu_fits.end()) {
+        // Experts imported in place (#317: every type but Q8_0's
+        // repacked rows) take no device memory of their own.
         std::uint64_t experts = 0;
         for (const auto& l : m.layers()) {
-            if (l.is_moe()) {
-                experts += (l.gate_exps.expert_bytes +
-                            l.up_exps.expert_bytes +
-                            l.down_exps.expert_bytes) *
-                           hp.n_expert;
+            if (!l.is_moe()) {
+                continue;
+            }
+            for (const auto* em : {&l.gate_exps, &l.up_exps, &l.down_exps}) {
+                if (!s.ctx.host_import() ||
+                    em->base.type == gguf::TensorType::kQ8_0) {
+                    experts += em->expert_bytes * hp.n_expert;
+                }
             }
         }
         const std::uint64_t avail = s.ctx.memory_available();

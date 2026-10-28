@@ -9,6 +9,9 @@
 #include <thread>
 #include <vector>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/variants.hpp"
@@ -863,4 +866,54 @@ TEST_CASE("matvec_vulkan is safe from several threads", "[vulkan]") {
     // by host pointer.
     locus::backend::vulkan_reset_state();
     REQUIRE(bad.load() == 0);
+}
+
+TEST_CASE("vulkan import_host reads host memory in place", "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    if (!ctx.host_import()) {
+        SKIP("device has no VK_EXT_external_memory_host");
+    }
+    // Three anonymous pages; the "tensor" starts 32 bytes into the
+    // second, off the 256-byte alignment imports bind at, as GGUF
+    // tensors do.
+    const long page = sysconf(_SC_PAGESIZE);
+    const std::size_t span = static_cast<std::size_t>(page) * 3;
+    void* map = mmap(nullptr, span, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANON, -1, 0);
+    REQUIRE(map != MAP_FAILED);
+    auto* base = static_cast<std::byte*>(map);
+    const std::size_t n = 1000;
+    auto* src = reinterpret_cast<float*>(base + page + 32);
+    for (std::size_t i = 0; i < n; ++i) {
+        src[i] = static_cast<float>(i) * 0.5f - 7.0f;
+    }
+    {
+        auto b = ctx.import_host(src, n * 4, n * 4);
+        REQUIRE(b.impl != nullptr);
+        REQUIRE(ctx.mapped(b) == src);
+        // A kernel reads it through the descriptor offset: element 0
+        // is src[0], not the 256-aligned word below it.
+        auto out = ctx.create_buffer(n * 4);
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {b, out};
+        const std::uint32_t push[] = {static_cast<std::uint32_t>(n), 0,
+                                      0};
+        ctx.dispatch(Kernel::kCopy, bufs, push, (n + 255) / 256);
+        ctx.end_batch();
+        std::vector<float> got(n);
+        ctx.read_buffer(out, std::as_writable_bytes(std::span(got)));
+        for (std::size_t i = 0; i < n; ++i) {
+            REQUIRE(got[i] == src[i]);
+        }
+        ctx.destroy_buffer(out);
+        ctx.destroy_buffer(b);
+    }
+    // Padding that would reach past the last mapped page is refused
+    // (the caller then copies).
+    auto* tail = base + span - 64;
+    REQUIRE(ctx.import_host(tail, 128, 64).impl == nullptr);
+    munmap(map, span);
 }

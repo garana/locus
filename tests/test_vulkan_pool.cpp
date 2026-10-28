@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <optional>
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/vulkan/weight_pool.hpp"
@@ -114,4 +115,33 @@ TEST_CASE("unbounded budget never evicts", "[vulkan-pool]") {
     }
     REQUIRE(h.pool.evictions_ == 0);
     REQUIRE(h.pool.map_.size() == 50);
+}
+
+TEST_CASE("weight pool keeps imported buffers out of the budget",
+          "[vulkan-pool]") {
+    Harness h;
+    h.pool.budget_ = 100;
+    int made = 0;
+    auto import = [&]() -> std::optional<FakeBuf> {
+        ++made;
+        return FakeBuf{1000 + made};
+    };
+    // A miss builds it; a hit returns it without building again.
+    auto a1 = h.pool.acquire_external(A, import);
+    auto a2 = h.pool.acquire_external(A, import);
+    REQUIRE(a1);
+    REQUIRE(a2);
+    REQUIRE(a1->id == a2->id);
+    REQUIRE(made == 1);
+    // In-place buffers cost nothing: a full-budget copy still fits.
+    REQUIRE(h.pool.used_ == 0);
+    h.pool.on_batch_end();
+    h.get(B, 100);
+    REQUIRE(h.pool.used_ == 100);
+    REQUIRE(h.pool.transient_.empty());
+    // When the import can't be made, nothing is cached.
+    auto none = h.pool.acquire_external(
+        C, []() -> std::optional<FakeBuf> { return std::nullopt; });
+    REQUIRE_FALSE(none);
+    REQUIRE(h.pool.map_.count(C) == 0);
 }

@@ -569,6 +569,18 @@ const KernelDesc& kernel_desc(Kernel k) {
 
 const char* kernel_name(Kernel k) { return kernel_desc(k).name; }
 
+/** @returns phys's minImportedHostPointerAlignment. */
+static VkDeviceSize host_import_align(VkPhysicalDevice phys) {
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{};
+    hp.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+    VkPhysicalDeviceProperties2 p2{};
+    p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    p2.pNext = &hp;
+    vkGetPhysicalDeviceProperties2(phys, &p2);
+    return hp.minImportedHostPointerAlignment;
+}
+
 struct VulkanContext::Impl {
     VkInstance instance = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
@@ -686,7 +698,21 @@ struct VulkanContext::Impl {
         VkDeviceMemory mem = VK_NULL_HANDLE;
         void* map = nullptr;
         VkDeviceSize bytes = 0;
+        /** Host memory imported in place (import_host): not mapped
+         *  through Vulkan, not counted in `allocated`. */
+        bool imported = false;
+        /** Where the data starts in buf: descriptors and copies add
+         *  it (an import binds buf below the tensor, at the memory
+         *  alignment, and starts here). */
+        VkDeviceSize desc_off = 0;
     };
+
+    /** VK_EXT_external_memory_host enabled: import_host works. */
+    bool has_host_import = false;
+    /** minImportedHostPointerAlignment (page size on Apple). */
+    VkDeviceSize import_align = 0;
+    /** minStorageBufferOffsetAlignment: a descriptor's offset step. */
+    VkDeviceSize storage_align = 0;
 
     /** VK_EXT_memory_budget present (and enabled). */
     bool has_budget = false;
@@ -853,6 +879,23 @@ struct VulkanContext::Impl {
                     0) {
                     has_budget = true;
                     dexts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+                }
+                // LOCUS_VK_NO_IMPORT=1 keeps copying weights (to check
+                // the copy path, or compare).
+                if (std::strcmp(e.extensionName,
+                                VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) ==
+                        0 &&
+                    std::getenv("LOCUS_VK_NO_IMPORT") == nullptr) {
+                    import_align = host_import_align(phys);
+                    VkPhysicalDeviceProperties pp;
+                    vkGetPhysicalDeviceProperties(phys, &pp);
+                    storage_align =
+                        pp.limits.minStorageBufferOffsetAlignment;
+                    has_host_import = import_align > 0;
+                    if (has_host_import) {
+                        dexts.push_back(
+                            VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+                    }
                 }
                 has_driver_props =
                     has_driver_props ||
@@ -1092,8 +1135,114 @@ struct VulkanContext::Impl {
         return b;
     }
 
+    /**
+     * import_host's work: the pages around [ptr, ptr + mapped) as
+     * imported host memory, a buffer of `bytes` bound at ptr.
+     * @returns The buffer, or an empty one (b.buf null) on any
+     *          mismatch.
+     */
+    HostBuffer import_buffer(const void* ptr, VkDeviceSize bytes,
+                             VkDeviceSize mapped) {
+        HostBuffer b;
+        if (!has_host_import || bytes == 0 || mapped == 0 ||
+            mapped > bytes) {
+            return b;
+        }
+        const auto p = reinterpret_cast<std::uintptr_t>(ptr);
+        const std::uintptr_t base = p / import_align * import_align;
+        const std::uintptr_t end =
+            (p + mapped + import_align - 1) / import_align * import_align;
+        if (p + bytes > end) {
+            return b;  // the padding would reach an unmapped page
+        }
+        auto props_fn =
+            reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+                vkGetDeviceProcAddr(device,
+                                    "vkGetMemoryHostPointerPropertiesEXT"));
+        if (props_fn == nullptr) {
+            return b;
+        }
+        VkMemoryHostPointerPropertiesEXT hpp{};
+        hpp.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+        if (props_fn(device,
+                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                     reinterpret_cast<void*>(base), &hpp) != VK_SUCCESS) {
+            return b;
+        }
+        VkExternalMemoryBufferCreateInfo ebci{};
+        ebci.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+        ebci.handleTypes =
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        // The buffer is bound at the memory alignment below ptr (MoltenVK
+        // wants 256 for imports; GGUF tensors are 32-aligned) and its
+        // descriptors start at the remainder.
+        const VkDeviceSize off = p - base;
+        VkBufferCreateInfo bci{};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.pNext = &ebci;
+        bci.size = bytes + 256;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(device, &bci, nullptr, &b.buf) != VK_SUCCESS) {
+            b.buf = VK_NULL_HANDLE;
+            return b;
+        }
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(device, b.buf, &req);
+        const VkDeviceSize bind = off / req.alignment * req.alignment;
+        const VkDeviceSize rem = off - bind;
+        if (req.alignment <= 256) {
+            // Now the alignment is known: exactly rem + bytes.
+            vkDestroyBuffer(device, b.buf, nullptr);
+            bci.size = rem + bytes;
+            if (vkCreateBuffer(device, &bci, nullptr, &b.buf) !=
+                VK_SUCCESS) {
+                return HostBuffer{};
+            }
+            vkGetBufferMemoryRequirements(device, b.buf, &req);
+        }
+        std::uint32_t type = ~0u;
+        const std::uint32_t bits = req.memoryTypeBits & hpp.memoryTypeBits;
+        for (std::uint32_t i = 0; i < 32; ++i) {
+            if ((bits & (1u << i)) != 0) {
+                type = i;
+                break;
+            }
+        }
+        if (type == ~0u || req.alignment > 256 || storage_align == 0 ||
+            rem % storage_align != 0 || bind + req.size > end - base) {
+            vkDestroyBuffer(device, b.buf, nullptr);
+            return HostBuffer{};
+        }
+        VkImportMemoryHostPointerInfoEXT imp{};
+        imp.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+        imp.handleType =
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        imp.pHostPointer = reinterpret_cast<void*>(base);
+        VkMemoryAllocateInfo mai{};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.pNext = &imp;
+        mai.allocationSize = end - base;
+        mai.memoryTypeIndex = type;
+        if (vkAllocateMemory(device, &mai, nullptr, &b.mem) != VK_SUCCESS ||
+            vkBindBufferMemory(device, b.buf, b.mem, bind) != VK_SUCCESS) {
+            if (b.mem != VK_NULL_HANDLE) {
+                vkFreeMemory(device, b.mem, nullptr);
+            }
+            vkDestroyBuffer(device, b.buf, nullptr);
+            return HostBuffer{};
+        }
+        b.map = const_cast<void*>(ptr);
+        b.bytes = end - base;
+        b.imported = true;
+        b.desc_off = rem;
+        return b;
+    }
+
     void destroy_buffer(HostBuffer& b) {
-        if (b.mem != VK_NULL_HANDLE) {
+        if (b.mem != VK_NULL_HANDLE && b.imported) {
+            vkFreeMemory(device, b.mem, nullptr);
+        } else if (b.mem != VK_NULL_HANDLE) {
             allocated -= b.bytes;
             vkUnmapMemory(device, b.mem);
             vkFreeMemory(device, b.mem, nullptr);
@@ -1160,6 +1309,18 @@ VulkanContext::Buffer VulkanContext::create_buffer(
     auto* hb = new Impl::HostBuffer(impl_->make_buffer(bytes));
     return Buffer{hb};
 }
+
+VulkanContext::Buffer VulkanContext::import_host(const void* ptr,
+                                                 std::size_t bytes,
+                                                 std::size_t mapped) {
+    Impl::HostBuffer hb = impl_->import_buffer(ptr, bytes, mapped);
+    if (hb.buf == VK_NULL_HANDLE) {
+        return Buffer{};
+    }
+    return Buffer{new Impl::HostBuffer(hb)};
+}
+
+bool VulkanContext::host_import() const { return impl_->has_host_import; }
 
 void VulkanContext::destroy_buffer(Buffer b) {
     auto* hb = static_cast<Impl::HostBuffer*>(b.impl);
@@ -1239,7 +1400,10 @@ void VulkanContext::dispatch(Kernel k,
         VkDescriptorBufferInfo infos[Impl::kMaxBufs];
         VkWriteDescriptorSet writes[Impl::kMaxBufs];
         for (std::size_t i = 0; i < buffers.size(); ++i) {
-            infos[i] = {key.bufs[i], 0, VK_WHOLE_SIZE};
+            infos[i] = {key.bufs[i],
+                        static_cast<Impl::HostBuffer*>(buffers[i].impl)
+                            ->desc_off,
+                        VK_WHOLE_SIZE};
             writes[i] = {};
             writes[i].sType =
                 VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1388,7 +1552,10 @@ void VulkanContext::copy_buffer(Buffer src, std::size_t src_off,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
                          &mb, 0, nullptr, 0, nullptr);
-    VkBufferCopy region{src_off, dst_off, bytes};
+    VkBufferCopy region{
+        src_off + static_cast<Impl::HostBuffer*>(src.impl)->desc_off,
+        dst_off + static_cast<Impl::HostBuffer*>(dst.impl)->desc_off,
+        bytes};
     vkCmdCopyBuffer(im.batch_cmd,
                     static_cast<Impl::HostBuffer*>(src.impl)->buf,
                     static_cast<Impl::HostBuffer*>(dst.impl)->buf,
@@ -1468,6 +1635,11 @@ namespace {
 VulkanContext::Buffer VulkanContext::create_buffer(std::size_t) {
     no_kernels();
 }
+VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
+                                                 std::size_t) {
+    no_kernels();
+}
+bool VulkanContext::host_import() const { no_kernels(); }
 void VulkanContext::destroy_buffer(Buffer) { no_kernels(); }
 void VulkanContext::write_buffer(Buffer,
                                  std::span<const std::byte>) {
