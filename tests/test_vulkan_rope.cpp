@@ -157,8 +157,9 @@ TEST_CASE("vulkan rope matches the CPU across the pair stride",
 }
 
 // The norm must match bit for bit (pos 0: rope is the identity). The
-// roped values only to the rope tests' tolerance: Metal fast math may
-// evaluate pow/sin/cos differently in two shaders (seen on M2).
+// roped values only to 1e-3: Metal fast math may evaluate pow/sin/cos
+// differently in two shaders, about 1e-4 apart at the ~1000 rad angles
+// of pos 1234 (seen on M2).
 TEST_CASE("vulkan qk_norm_rope matches rmsnorm_b then rope", "[vulkan]") {
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");
@@ -236,7 +237,7 @@ TEST_CASE("vulkan qk_norm_rope matches rmsnorm_b then rope", "[vulkan]") {
                             REQUIRE(fbits(got[i]) == fbits(want[i]));
                         } else {
                             REQUIRE(got[i] == Catch::Approx(want[i])
-                                                  .margin(1e-4)
+                                                  .margin(1e-3)
                                                   .epsilon(1e-3));
                         }
                     }
