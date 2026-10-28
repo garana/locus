@@ -100,6 +100,13 @@ TEST_CASE("t5 tokenizer matches transformers' T5Tokenizer",
         ++cases;
     }
     REQUIRE(cases == 20);
+    // Many markers in a row: each is one id (and the split is one pass,
+    // not a search of the whole rest per marker).
+    std::string many;
+    for (int i = 0; i < 20000; ++i) many += "<extra_id_1>";
+    const auto mids = tok->encode(many, true);
+    REQUIRE(mids.size() == 20001);
+    REQUIRE(mids.front() == 32098);
 
     const auto* ugm = dynamic_cast<const UgmTokenizer*>(tok.get());
     REQUIRE(ugm != nullptr);

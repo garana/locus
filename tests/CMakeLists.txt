@@ -69,6 +69,7 @@ add_executable(locus_tests
     test_vulkan_reset.cpp
     test_tokenizer.cpp
     test_t5_tokenizer.cpp
+    test_t5_encoder.cpp
     test_model_e2e.cpp
     test_moe.cpp
     test_dsa.cpp

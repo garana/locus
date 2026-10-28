@@ -788,34 +788,36 @@ rounds to uint8).
 
 ### 7.2 T5 encoder
 
-`general.architecture = "t5encoder"` (the name llama.cpp uses for T5
-encoder GGUFs, assumption).
+`general.architecture = "t5encoder"`, with llama.cpp's key and tensor
+names, so llama.cpp's T5 encoder GGUFs load too (an exception to 7.1's
+checkpoint names). scripts/convert-t5-encoder.py writes it; the
+tokenizer values are checked against T5Tokenizer (section 2).
 
-| key                                         | type   | value             |
-|---------------------------------------------|--------|-------------------|
-| t5encoder.block_count                       | u32    | 24                |
-| t5encoder.embedding_length                  | u32    | 4096              |
-| t5encoder.feed_forward_length               | u32    | 10240             |
-| t5encoder.attention.head_count              | u32    | 64                |
-| t5encoder.attention.key_length              | u32    | 64                |
-| t5encoder.attention.layer_norm_rms_epsilon  | f32    | 1e-6              |
-| t5encoder.attention.relative_buckets_count  | u32    | 32                |
-| t5encoder.attention.relative_max_distance   | u32    | 128               |
-| t5encoder.feed_forward_activation           | str    | gated_gelu_tanh   |
-| tokenizer.ggml.model                        | str    | t5 (unigram)      |
-| tokenizer.ggml.tokens / scores / token_type | arrays | from spiece.model |
-| tokenizer.ggml.eos_token_id                 | u32    | 1                 |
-| tokenizer.ggml.padding_token_id             | u32    | 0                 |
-| tokenizer.ggml.unknown_token_id             | u32    | 2                 |
-| tokenizer.ggml.add_eos_token                | bool   | true              |
+| key                                         | type   | value                |
+|---------------------------------------------|--------|----------------------|
+| t5encoder.block_count                       | u32    | 24                   |
+| t5encoder.embedding_length                  | u32    | 4096                 |
+| t5encoder.feed_forward_length               | u32    | 10240                |
+| t5encoder.attention.head_count              | u32    | 64                   |
+| t5encoder.attention.key_length              | u32    | 64                   |
+| t5encoder.attention.layer_norm_rms_epsilon  | f32    | 1e-6                 |
+| t5encoder.attention.relative_buckets_count  | u32    | 32                   |
+| t5encoder.attention.relative_max_distance   | u32    | absent: 128          |
+| tokenizer.ggml.model                        | str    | t5 (unigram)         |
+| tokenizer.ggml.tokens / scores / token_type | arrays | spiece.model + added |
+| tokenizer.ggml.precompiled_charsmap         | u8[]   | the NFKC trie        |
+| tokenizer.ggml.eos_token_id                 | u32    | 1                    |
+| tokenizer.ggml.padding_token_id             | u32    | 0                    |
+| tokenizer.ggml.unknown_token_id             | u32    | 2                    |
+| tokenizer.ggml.add_eos_token                | bool   | true                 |
 
-The tokenizer values are assumptions (section 2). Tensors:
-`shared.weight`, `encoder.block.N.layer.0.layer_norm.weight`,
-`encoder.block.N.layer.0.SelfAttention.{q,k,v,o}.weight`,
-`encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight`,
-`encoder.block.N.layer.1.layer_norm.weight`,
-`encoder.block.N.layer.1.DenseReluDense.{wi_0,wi_1,wo}.weight`,
-`encoder.final_layer_norm.weight`.
+Tensors (checkpoint name in parentheses, `P = encoder.block.N.layer`):
+`token_embd` (`shared`), `enc.blk.N.attn_norm` (`P.0.layer_norm`),
+`enc.blk.N.attn_{q,k,v,o}` (`P.0.SelfAttention.{q,k,v,o}`),
+`enc.blk.0.attn_rel_b` (block 0's `relative_attention_bias`),
+`enc.blk.N.ffn_norm` (`P.1.layer_norm`),
+`enc.blk.N.ffn_{gate,up,down}` (`P.1.DenseReluDense.{wi_0,wi_1,wo}`),
+`enc.output_norm` (`encoder.final_layer_norm`), each with `.weight`.
 
 ### 7.3 PixArt DiT
 
