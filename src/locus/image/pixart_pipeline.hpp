@@ -25,9 +25,11 @@ namespace locus::image {
  *
  * Differences from the reference, by design:
  * - Prompt cleaning is diffusers' clean_caption=False path: strip the
- *   ASCII whitespace at both ends, lowercase ASCII letters. The full
- *   _clean_caption (URLs, HTML, CJK removal, ...) is not implemented;
- *   both give the same ids for plain English prompts.
+ *   ASCII whitespace at both ends, lowercase ASCII letters (Python's
+ *   lower and strip also handle non-ASCII). The pipeline's default,
+ *   clean_caption=True (URLs, HTML, CJK removal, ...; it needs bs4
+ *   and ftfy), is not implemented; both give the same ids for plain
+ *   English prompts.
  * - The start latent comes from locus's own seeded normal sampler, not
  *   torch's, so a seed gives a different (but repeatable) image.
  */

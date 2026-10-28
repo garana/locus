@@ -2225,12 +2225,14 @@ void OpenAiServer::install_routes() {
                         throw std::invalid_argument(
                             "guidance_scale must be a number");
                     }
-                    p.guidance = body["guidance_scale"].get<float>();
-                    if (!std::isfinite(p.guidance) || p.guidance < 0.0f ||
-                        p.guidance > 100.0f) {
+                    // Checked as a double: a JSON value past float's range
+                    // would make the cast undefined.
+                    const double g = body["guidance_scale"].get<double>();
+                    if (!std::isfinite(g) || g < 0.0 || g > 100.0) {
                         throw std::invalid_argument(
                             "guidance_scale must be from 0 to 100");
                     }
+                    p.guidance = static_cast<float>(g);
                 }
                 p.seed = std::random_device{}();
                 if (body.contains("seed")) {
@@ -2241,11 +2243,26 @@ void OpenAiServer::install_routes() {
                     p.seed = static_cast<std::uint64_t>(
                         body["seed"].get<std::int64_t>());
                 }
+                // The image models run on a CPU backend (the CPU entries
+                // come first), whatever --backend picked for the LLM.
                 const auto& op = backend::best_backend().ops;
                 image::PixArtPipeline::Timing took;
                 std::vector<std::uint8_t> rgb;
                 {
-                    std::lock_guard<std::mutex> lk(image_mu_);
+                    // An image takes minutes: a second request gets a
+                    // 503 instead of holding a server thread in a queue.
+                    std::unique_lock<std::mutex> lk(image_mu_,
+                                                    std::try_to_lock);
+                    if (!lk.owns_lock()) {
+                        res.status = 503;
+                        res.set_header("Retry-After", "60");
+                        res.set_content(
+                            make_error("an image is already being "
+                                       "generated; retry later")
+                                .dump(-1, ' ', false, kLossy),
+                            "application/json");
+                        return;
+                    }
                     rgb = pixart_->generate(p, op, ctx.client_alive, &took);
                 }
                 if (rgb.empty()) {
