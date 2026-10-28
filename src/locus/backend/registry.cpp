@@ -90,7 +90,7 @@ const std::vector<Backend>& list() {
                       .matvec_q8k = &matvec_cuda_q8k,
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_cuda,
-                      .batch_self_parallel = true,
+                      .self_parallel = true,
                       .prefetch = &cuda_prefetch}});
 #pragma GCC diagnostic pop
         return b;
