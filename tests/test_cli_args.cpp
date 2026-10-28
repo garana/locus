@@ -74,6 +74,32 @@ TEST_CASE("--audio-max-tokens sets the speech token cap", "[cli]") {
     REQUIRE(c.audio_max_tokens == 0);  // default: the server's 1024
 }
 
+TEST_CASE("--max-tokens sets the output token cap", "[cli]") {
+    std::array<const char*, 5> argv1 = {"prog", "--max-tokens", "8192",
+                                        "--audio-max-tokens=70", "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()),
+        const_cast<char**>(argv1.data()));
+    REQUIRE(a.max_tokens == 8192);
+    REQUIRE(a.audio_max_tokens == 70);  // a different flag
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+
+    std::array<const char*, 3> argv2 = {"prog", "--max-tokens=16",
+                                        "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()),
+        const_cast<char**>(argv2.data()));
+    REQUIRE(b.max_tokens == 16);
+    REQUIRE(b.audio_max_tokens == 0);
+
+    std::array<const char*, 3> argv3 = {"prog", "--max-tokens=-1",
+                                        "m.gguf"};
+    auto c = locus_tools::parse_backend_args(
+        static_cast<int>(argv3.size()),
+        const_cast<char**>(argv3.data()));
+    REQUIRE(c.bad_number_flag == "--max-tokens");
+}
+
 // i#176: these flags used atol + a uint32_t cast, so "-1" wrapped to
 // 4294967295 (no audio cap, a huge KV pool) instead of failing.
 TEST_CASE("numeric flags reject negative, huge and junk values",

@@ -20,8 +20,12 @@ constexpr const char* kToolResultNote =
 /**
  * The text of a message item's content: a string, or parts whose
  * input_text / output_text / text entries are joined with newlines.
+ * An image or file part is a 400, except in a tool's output
+ * (`in_tool_output`), where it becomes "[image omitted]": a tool such
+ * as Codex's view_image returns one, and a 400 there would fail every
+ * later request of the session.
  */
-std::string item_text(const json& content) {
+std::string item_text(const json& content, bool in_tool_output = false) {
     if (content.is_string()) {
         return content.get<std::string>();
     }
@@ -33,8 +37,14 @@ std::string item_text(const json& content) {
     for (const auto& p : content) {
         const std::string type = p.is_object() ? p.value("type", "") : "";
         if (type == "input_image" || type == "input_file") {
-            throw std::invalid_argument(type +
-                                        " is not supported on /v1/responses");
+            if (!in_tool_output) {
+                throw std::invalid_argument(
+                    type + " is not supported on /v1/responses");
+            }
+            if (!out.empty()) out += "\n";
+            out += type == "input_image" ? "[image omitted]"
+                                         : "[file omitted]";
+            continue;
         }
         if (type != "input_text" && type != "output_text" &&
             type != "text") {
@@ -116,14 +126,21 @@ ResponsesRequest parse_responses_request(const json& body) {
             }
         }
     }
+    // One leading system message: the tool instruction, instructions,
+    // then every system / developer item, joined with newlines (chat
+    // templates expect a single system turn first; llama2 keeps only
+    // the last one). Codex sends developer items inside the history.
+    std::string system;
+    auto add_system = [&](const std::string& text) {
+        if (text.empty()) return;
+        if (!system.empty()) system += "\n";
+        system += text;
+    };
     if (!out.tools.empty()) {
-        out.messages.push_back(
-            {"system", render_tools_system(out.tools) + kToolResultNote});
+        add_system(render_tools_system(out.tools) + kToolResultNote);
     }
-    if (body.contains("instructions") && body["instructions"].is_string() &&
-        !body["instructions"].get<std::string>().empty()) {
-        out.messages.push_back(
-            {"system", body["instructions"].get<std::string>()});
+    if (body.contains("instructions") && body["instructions"].is_string()) {
+        add_system(body["instructions"].get<std::string>());
     }
 
     const json& input = body["input"];
@@ -148,7 +165,12 @@ ResponsesRequest parse_responses_request(const json& body) {
                 if (!item.contains("content")) {
                     throw std::invalid_argument("message content is missing");
                 }
-                out.messages.push_back({role, item_text(item["content"])});
+                if (role == "system") {
+                    add_system(item_text(item["content"]));
+                } else {
+                    out.messages.push_back(
+                        {role, item_text(item["content"])});
+                }
             } else if (type == "function_call") {
                 const std::string name = flat_name(item);
                 call_names[item.value("call_id", "")] = name;
@@ -173,7 +195,7 @@ ResponsesRequest parse_responses_request(const json& body) {
                 }
                 text += ":\n";
                 if (item.contains("output")) {
-                    text += item_text(item["output"]);
+                    text += item_text(item["output"], true);
                 }
                 out.messages.push_back({"user", std::move(text)});
             }
@@ -182,6 +204,10 @@ ResponsesRequest parse_responses_request(const json& body) {
         }
     } else {
         throw std::invalid_argument("input must be a string or an array");
+    }
+    if (!system.empty()) {
+        out.messages.insert(out.messages.begin(),
+                            chat::Message{"system", std::move(system)});
     }
 
     if (body.contains("max_output_tokens") &&

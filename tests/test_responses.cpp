@@ -122,24 +122,65 @@ TEST_CASE("responses request: Codex-shaped items and tools",
     CHECK(r.namespaced.at("agents.spawn").first == "agents");
     CHECK(r.namespaced.at("agents.spawn").second == "spawn");
 
-    REQUIRE(r.messages.size() == 8);
-    CHECK(r.messages[0].role == "system");  // the tool instruction
-    CHECK(r.messages[0].content.find("exec_command") != std::string::npos);
-    CHECK(r.messages[0].content.find("Tool result") != std::string::npos);
-    CHECK(r.messages[1].role == "system");  // developer
-    CHECK(r.messages[1].content == "rules");
-    CHECK(r.messages[2].role == "user");
-    CHECK(r.messages[2].content == "a\nb");
+    REQUIRE(r.messages.size() == 7);
+    // One leading system message: the tool instruction, then the
+    // developer text.
+    const std::string& sys = r.messages[0].content;
+    CHECK(r.messages[0].role == "system");
+    CHECK(sys.find("exec_command") != std::string::npos);
+    CHECK(sys.find("Tool result") != std::string::npos);
+    CHECK(sys.size() > 6);
+    CHECK(sys.substr(sys.size() - 6) == "\nrules");
+    CHECK(r.messages[1].role == "user");
+    CHECK(r.messages[1].content == "a\nb");
     // The reasoning item adds nothing; the call is the model's JSON.
-    CHECK(r.messages[3].role == "assistant");
-    CHECK(json::parse(r.messages[3].content) ==
+    CHECK(r.messages[2].role == "assistant");
+    CHECK(json::parse(r.messages[2].content) ==
           json{{"name", "exec_command"}, {"arguments", {{"cmd", "ls"}}}});
-    CHECK(r.messages[4].role == "user");
-    CHECK(r.messages[4].content == "Tool result (exec_command):\nfile.txt");
-    CHECK(json::parse(r.messages[5].content)["name"] == "agents.spawn");
-    CHECK(r.messages[6].content == "Tool result (agents.spawn):\nok");
-    CHECK(r.messages[7].role == "assistant");
-    CHECK(r.messages[7].content == "done");
+    CHECK(r.messages[3].role == "user");
+    CHECK(r.messages[3].content == "Tool result (exec_command):\nfile.txt");
+    CHECK(json::parse(r.messages[4].content)["name"] == "agents.spawn");
+    CHECK(r.messages[5].content == "Tool result (agents.spawn):\nok");
+    CHECK(r.messages[6].role == "assistant");
+    CHECK(r.messages[6].content == "done");
+}
+
+TEST_CASE("responses request: developer items join one system message",
+          "[responses]") {
+    // Codex also sends developer items later in the history; they must
+    // not become a second system turn (llama2 keeps only the last).
+    const auto r = parse_responses_request(
+        {{"instructions", "first"},
+         {"input",
+          json::array({{{"role", "user"}, {"content", "q1"}},
+                       {{"role", "developer"}, {"content", "later"}},
+                       {{"role", "system"}, {"content", "too"}},
+                       {{"role", "user"}, {"content", "q2"}}})}});
+    REQUIRE(r.messages.size() == 3);
+    CHECK(r.messages[0].role == "system");
+    CHECK(r.messages[0].content == "first\nlater\ntoo");
+    CHECK(r.messages[1].content == "q1");
+    CHECK(r.messages[2].content == "q2");
+}
+
+TEST_CASE("responses request: an image in a tool's output is a placeholder",
+          "[responses]") {
+    const auto r = parse_responses_request(
+        {{"input",
+          json::array(
+              {{{"type", "function_call"},
+                {"call_id", "c"},
+                {"name", "view_image"},
+                {"arguments", "{}"}},
+               {{"type", "function_call_output"},
+                {"call_id", "c"},
+                {"output",
+                 json::array({{{"type", "input_text"}, {"text", "shot:"}},
+                              {{"type", "input_image"},
+                               {"image_url", "data:image/png;base64,AA"}}})}}})}});
+    REQUIRE(r.messages.size() == 2);
+    CHECK(r.messages[1].content ==
+          "Tool result (view_image):\nshot:\n[image omitted]");
 }
 
 TEST_CASE("responses request: tool_choice none drops the tools",

@@ -112,6 +112,9 @@ OpenAI + Anthropic compatible inference server (default port 8080):
             opt.metrics_path = args.metrics_path;
         }
         opt.audio_decoder_path = args.audio_decoder;
+        if (args.max_tokens > 0) {
+            opt.max_tokens_cap = args.max_tokens;
+        }
         if (args.audio_max_tokens > 0) {
             opt.audio_max_tokens = args.audio_max_tokens;
         }

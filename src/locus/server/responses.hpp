@@ -23,8 +23,9 @@ namespace locus::server {
 
 /** A /v1/responses request, parsed into chat messages and tools. */
 struct ResponsesRequest {
-    /** The conversation: `instructions` and the tool instruction as
-     * system messages first, then each input item in order. */
+    /** The conversation: one system message first (the tool
+     * instruction, `instructions`, and every system / developer item,
+     * joined), then the other input items in order. */
     std::vector<chat::Message> messages;
     /** The function tools the model may call, under flat names. */
     std::vector<ToolSpec> tools;
@@ -39,12 +40,13 @@ struct ResponsesRequest {
 /**
  * Parses a /v1/responses body. `input` is a string (one user turn) or
  * a list of items: `message` items (roles user, assistant, and system
- * or developer, which become system messages in place), with string
- * content or `input_text` / `output_text` parts; `function_call`
- * items, rendered as the assistant's JSON tool call; and
- * `function_call_output` items, rendered as a user turn that starts
- * with "Tool result". Other item types (reasoning, web search calls)
- * are history locus did not produce and are skipped. Function tools
+ * or developer, whose text joins the leading system message), with
+ * string content or `input_text` / `output_text` parts;
+ * `function_call` items, rendered as the assistant's JSON tool call;
+ * and `function_call_output` items, rendered as a user turn that
+ * starts with "Tool result" (an image there becomes "[image
+ * omitted]"). Other item types (reasoning, web search calls) are
+ * history locus did not produce and are skipped. Function tools
  * come flat ({type:"function", name, parameters}) or grouped in a
  * {type:"namespace", name, tools} entry, whose tools get the flat name
  * "<namespace>.<name>"; other tool types are skipped. tool_choice
