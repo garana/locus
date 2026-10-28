@@ -283,11 +283,20 @@ PixArtDit PixArtDit::load(const gguf::GgufFile& g) {
     if (d.sample_ == 128) {
         throw gguf::Error("pixart: the 1024 model is not supported");
     }
+    // Small caps keep in_ch * p * p and p * p * out_ch far from a
+    // 32-bit wrap.
     if (std::uint64_t{d.heads_} * d.head_dim_ != d.width_ ||
+        d.patch_ > 16 || d.in_ch_ > 64 || d.out_ch_ > 64 ||
         d.sample_ % d.patch_ != 0 || d.width_ % 4 != 0 || d.t_ch_ % 2 != 0 ||
-        !(interp > 0.0f) || g.get_bool("pixart.timestep.flip_sin_to_cos")
-                                    .value_or(false) != true) {
+        !(interp > 0.0f)) {
         throw gguf::Error("pixart: inconsistent sizes");
+    }
+    // timestep_features implements only this variant.
+    if (g.get_bool("pixart.timestep.flip_sin_to_cos").value_or(false) !=
+            true ||
+        f("pixart.timestep.freq_shift") != 0.0f) {
+        throw gguf::Error("pixart: timestep features must be cos first, "
+                          "shift 0");
     }
     d.grid_ = d.sample_ / d.patch_;
 
