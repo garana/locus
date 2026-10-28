@@ -5,10 +5,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <mutex>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 namespace locus::sys {
 
@@ -18,7 +22,33 @@ namespace {
     throw std::system_error(errno, std::generic_category(), what);
 }
 
+/** Live mappings as [begin, end) (in_file_mapping). */
+struct Registry {
+    std::mutex mu;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> live;
+};
+
+Registry& registry() {
+    static Registry r;
+    return r;
+}
+
+std::atomic<void (*)(const void*, std::size_t)> unmap_hook{nullptr};
+
 }  // namespace
+
+bool in_file_mapping(const void* p, std::size_t n) {
+    const auto b = reinterpret_cast<std::uintptr_t>(p);
+    Registry& r = registry();
+    std::lock_guard lk(r.mu);
+    return std::any_of(r.live.begin(), r.live.end(), [&](const auto& m) {
+        return b >= m.first && b <= m.second && n <= m.second - b;
+    });
+}
+
+void set_unmap_hook(void (*hook)(const void* p, std::size_t n)) {
+    unmap_hook.store(hook);
+}
 
 MappedFile::MappedFile(const std::string& path) {
     int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -38,6 +68,10 @@ MappedFile::MappedFile(const std::string& path) {
             ::close(fd);
             fail("mmap");
         }
+        const auto b = reinterpret_cast<std::uintptr_t>(data_);
+        Registry& r = registry();
+        std::lock_guard lk(r.mu);
+        r.live.emplace_back(b, b + size_);
     }
     ::close(fd);
 }
@@ -57,6 +91,15 @@ MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
 
 MappedFile::~MappedFile() {
     if (data_ != nullptr) {
+        if (auto hook = unmap_hook.load()) {
+            hook(data_, size_);
+        }
+        {
+            const auto b = reinterpret_cast<std::uintptr_t>(data_);
+            Registry& r = registry();
+            std::lock_guard lk(r.mu);
+            std::erase(r.live, std::pair{b, b + size_});
+        }
         ::munmap(data_, size_);
     }
 }

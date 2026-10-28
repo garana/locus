@@ -127,8 +127,8 @@ TEST_CASE("weight pool keeps imported buffers out of the budget",
         return FakeBuf{1000 + made};
     };
     // A miss builds it; a hit returns it without building again.
-    auto a1 = h.pool.acquire_external(A, import);
-    auto a2 = h.pool.acquire_external(A, import);
+    auto a1 = h.pool.acquire_external(A, A, import);
+    auto a2 = h.pool.acquire_external(A, A, import);
     REQUIRE(a1);
     REQUIRE(a2);
     REQUIRE(a1->id == a2->id);
@@ -141,7 +141,37 @@ TEST_CASE("weight pool keeps imported buffers out of the budget",
     REQUIRE(h.pool.transient_.empty());
     // When the import can't be made, nothing is cached.
     auto none = h.pool.acquire_external(
-        C, []() -> std::optional<FakeBuf> { return std::nullopt; });
+        C, C, []() -> std::optional<FakeBuf> { return std::nullopt; });
     REQUIRE_FALSE(none);
     REQUIRE(h.pool.map_.count(C) == 0);
+}
+
+TEST_CASE("weight pool releases the entries over a freed range",
+          "[vulkan-pool]") {
+    Harness h;
+    h.pool.budget_ = 1000;
+    char mapping[64];  // stands in for a model file's mapping
+    char other[8];
+    int made = 0;
+    auto import = [&]() -> std::optional<FakeBuf> {
+        ++made;
+        ++h.live;
+        return FakeBuf{2000 + made};
+    };
+    // An import keyed elsewhere (as upload_experts keys by its
+    // ExpertMat) but reading the mapping; a copy keyed inside it; one
+    // outside it.
+    h.pool.acquire_external(other + 1, mapping + 8, import);
+    h.get(mapping + 32, 10);
+    h.get(other, 20);
+    REQUIRE(h.pool.map_.size() == 3);
+    REQUIRE(h.live == 3);
+    h.pool.release_range(mapping, sizeof mapping);
+    REQUIRE(h.pool.map_.size() == 1);
+    REQUIRE(h.pool.map_.count(other) == 1);
+    REQUIRE(h.live == 1);
+    REQUIRE(h.pool.used_ == 20);
+    // The import is made again for a later model, not served stale.
+    h.pool.acquire_external(other + 1, mapping + 8, import);
+    REQUIRE(made == 2);
 }

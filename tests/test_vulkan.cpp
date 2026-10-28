@@ -3,9 +3,12 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -17,6 +20,7 @@
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
 #include "locus/backend/vulkan/q8_layout.hpp"
+#include "locus/sys/mmap_file.hpp"
 
 using locus::backend::vk::Kernel;
 using locus::backend::vk::VulkanContext;
@@ -916,4 +920,55 @@ TEST_CASE("vulkan import_host reads host memory in place", "[vulkan]") {
     auto* tail = base + span - 64;
     REQUIRE(ctx.import_host(tail, 128, 64).impl == nullptr);
     munmap(map, span);
+}
+
+TEST_CASE("vulkan drops imported weights when their file is unmapped",
+          "[vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    // A 64 x 512 F32 matrix (128 KB, a 16-byte multiple: imported where
+    // the device can) in a file mapped, used, unmapped, then rewritten
+    // with other weights and mapped again (usually at the same
+    // address). The second matvec must see the new weights: the unmap
+    // hook dropped the first import, so no stale buffer (over freed
+    // pages) is hit by the reused pointer.
+    const std::uint32_t rows = 64, cols = 512;
+    const std::string path =
+        (std::filesystem::temp_directory_path() /
+         ("locus_import_" + std::to_string(::getpid()) + ".bin"))
+            .string();
+    std::vector<float> x(cols);
+    std::mt19937 rng(91);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    const void* first = nullptr;
+    for (const float shift : {0.0f, 3.0f}) {
+        std::vector<float> w(std::size_t{rows} * cols);
+        for (auto& v : w) {
+            v = dist(rng) + shift;
+        }
+        {
+            std::FILE* f = std::fopen(path.c_str(), "wb");
+            REQUIRE(f != nullptr);
+            REQUIRE(std::fwrite(w.data(), 4, w.size(), f) == w.size());
+            std::fclose(f);
+        }
+        locus::sys::MappedFile mf(path);
+        const void* data = mf.bytes().data();
+        INFO("mapping " << data << (data == first ? " (same address)" : ""));
+        first = first == nullptr ? data : first;
+        const locus::backend::Mat m{locus::gguf::TensorType::kF32,
+                                    static_cast<const std::byte*>(data),
+                                    rows, cols};
+        std::vector<float> want(rows), got(rows);
+        locus::backend::matvec(m, x, want);
+        locus::backend::matvec_vulkan(m, x, got);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(got[r] == Catch::Approx(want[r]).margin(1e-3));
+        }
+    }
+    std::remove(path.c_str());
 }

@@ -1201,6 +1201,10 @@ struct VulkanContext::Impl {
             }
             vkGetBufferMemoryRequirements(device, b.buf, &req);
         }
+        if (bind % req.alignment != 0) {
+            vkDestroyBuffer(device, b.buf, nullptr);
+            return HostBuffer{};
+        }
         std::uint32_t type = ~0u;
         const std::uint32_t bits = req.memoryTypeBits & hpp.memoryTypeBits;
         for (std::uint32_t i = 0; i < 32; ++i) {

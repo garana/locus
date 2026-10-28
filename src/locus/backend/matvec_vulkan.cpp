@@ -22,6 +22,7 @@
 #include "locus/backend/vulkan/weight_pool.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/moe_stats.hpp"
+#include "locus/sys/mmap_file.hpp"
 
 namespace locus::backend {
 
@@ -143,6 +144,8 @@ std::uint32_t w_off_units(const Mat& w, std::uint64_t bytes) {
 
 using WeightPool = WeightPoolT<VulkanContext::Buffer>;
 
+void on_unmap(const void* p, std::size_t n);
+
 /**
  * Process-lifetime GPU state: one context, a weight pager for
  * weights and norm vectors (keyed by their mmap pointers, stable
@@ -169,8 +172,11 @@ struct State {
         pool.destroy = [this](VulkanContext::Buffer b) {
             ctx.destroy_buffer(b);
         };
+        // A model file unmapped drops the buffers over its pages.
+        sys::set_unmap_hook(&on_unmap);
     }
     ~State() {
+        sys::set_unmap_hook(nullptr);
         pool.report();
         ctx.report_profile();
         // Free every GPU buffer while ctx (and its VkDevice) is still
@@ -321,10 +327,13 @@ struct State {
      * Uploads exactly `bytes` of w's rows from w.data under pool key
      * `key`, repacking whole Q8_0 rows, into a gpu_alloc_bytes(bytes)
      * buffer with the tail zeroed. Rows stored as the GPU reads them
-     * (every type but Q8_0) of at least kImportMin bytes are imported
-     * in place instead where the device can (#317): the mmap'd
-     * weights are not copied, and the tail is whatever follows the
-     * tensor in its last page.
+     * (every type but Q8_0) of at least kImportMin bytes, inside a
+     * model file's mapping, are imported in place instead where the
+     * device can (#317): the mmap'd weights are not copied. Only
+     * tensors whose size is already a multiple of 16 import, so an
+     * imported buffer is exactly the tensor, with no padding tail that
+     * would hold the next tensor's bytes instead of zeros. The unmap
+     * hook drops imports before their mapping goes away.
      */
     VulkanContext::Buffer upload_rows(const void* key, const Mat& w,
                                       std::uint64_t bytes) {
@@ -332,9 +341,10 @@ struct State {
         const std::size_t alloc = vk::gpu_alloc_bytes(n);
         constexpr std::size_t kImportMin = std::size_t{64} << 10;
         if (w.type != gguf::TensorType::kQ8_0 && n >= kImportMin &&
-            ctx.host_import()) {
+            alloc == n && ctx.host_import() &&
+            sys::in_file_mapping(w.data, n)) {
             auto b = pool.acquire_external(
-                key, [&]() -> std::optional<VulkanContext::Buffer> {
+                key, w.data, [&]() -> std::optional<VulkanContext::Buffer> {
                     auto ib = ctx.import_host(w.data, alloc, n);
                     if (ib.impl == nullptr) {
                         return std::nullopt;
@@ -570,6 +580,17 @@ State& state() {
  * Recursive, so an entry point may reach another through the model's
  * ops while holding it.
  */
+std::recursive_mutex& state_mu();
+
+/**
+ * sys unmap hook (set while State lives): a model file's mapping is
+ * going away, so drop every pool buffer over its pages (#317).
+ */
+void on_unmap(const void* p, std::size_t n) {
+    std::lock_guard lk(state_mu());
+    state().pool.release_range(p, n);
+}
+
 std::recursive_mutex& state_mu() {
     static std::recursive_mutex mu;
     return mu;
