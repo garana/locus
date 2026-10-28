@@ -493,6 +493,23 @@ TEST_CASE("vulkan batched prefill tracks per-token prefill",
             REQUIRE(argmax(got_logits) == argmax(want_logits));
             REQUIRE(got_gen == want_gen);
 
+            // Attention in query sub-blocks (i#313): a scratch cap of
+            // 16 tokens' rows at 32 heads x 150 positions splits each
+            // chunk's queries into several blocks.
+            struct CapReset {
+                ~CapReset() {
+                    locus::backend::vulkan_set_attn_scratch_floats(0);
+                }
+            } cap_reset;
+            locus::backend::vulkan_set_attn_scratch_floats(
+                std::size_t{32} * 150 * 16);
+            const auto [sub_logits, sub_gen] =
+                prefill_run(model, prompt, 64, 8);
+            locus::backend::vulkan_set_attn_scratch_floats(0);
+            REQUIRE(cosine(sub_logits, want_logits) > 0.9999);
+            REQUIRE(argmax(sub_logits) == argmax(want_logits));
+            REQUIRE(sub_gen == want_gen);
+
             // all_logits (speculative verify): one row per position.
             // 20 rows take the matmul path, 5 the short-batch
             // matvecs (<= 8 rows; MoE pair matvecs).
@@ -525,6 +542,35 @@ TEST_CASE("vulkan batched prefill tracks per-token prefill",
     }
     if (ran == 0) {
         SKIP("no prefill test model present (llama-3.2-1b-q8_0.gguf)");
+    }
+}
+
+TEST_CASE("vulkan prefill attention sub-blocks fit the scratch cap",
+          "[vulkan]") {
+    using locus::backend::vulkan_attn_block;
+    const std::size_t cap = std::size_t{1} << 28;  // 1 GiB of floats
+    // Up to the cap the whole chunk is one block.
+    REQUIRE(vulkan_attn_block(2048, 32, 4096) == 2048);
+    REQUIRE(vulkan_attn_block(5, 8, 100) == 5);
+    struct Shape {
+        std::uint32_t n, heads, n_pos;
+    };
+    // Qwen3-Coder at a 40k context; 64 heads past the uint32 wrap
+    // (~32k); 128 heads at 128k; one row longer than the cap.
+    for (const Shape c : {Shape{2048, 32, 40960}, Shape{2048, 64, 32768},
+                          Shape{2048, 128, 131072},
+                          Shape{1, 64, 1u << 23}}) {
+        const std::uint32_t m = vulkan_attn_block(c.n, c.heads, c.n_pos);
+        const std::size_t row = std::size_t{c.heads} * c.n_pos;
+        INFO("n " << c.n << " heads " << c.heads << " n_pos " << c.n_pos);
+        REQUIRE(m >= 1);
+        REQUIRE(m <= c.n);
+        if (row <= cap) {
+            REQUIRE(m * row <= cap);
+        }
+        if (m < c.n && m > 1) {
+            REQUIRE((m + 1) * row > cap);  // the largest block that fits
+        }
     }
 }
 

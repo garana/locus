@@ -102,6 +102,22 @@ bool vulkan_backend_usable();
  */
 void vulkan_set_prefill_f16(bool on);
 
+/**
+ * @returns The query tokens per attention sub-block of the batched
+ * Vulkan prefill for n queries of `heads` heads over n_pos positions:
+ * as many as keep the heads x n_pos score rows within the scratch cap
+ * (1 GiB of floats by default), at least 1 and at most n (i#313).
+ */
+std::uint32_t vulkan_attn_block(std::uint32_t n, std::uint32_t heads,
+                                std::uint32_t n_pos);
+
+/**
+ * Sets the batched prefill's attention scratch cap to `floats` (0
+ * restores the default). TEST USE ONLY: lets a small model run its
+ * chunk's queries in several sub-blocks.
+ */
+void vulkan_set_attn_scratch_floats(std::size_t floats);
+
 /** KV-pool allocator returning a GPU-mapped pointer (Ops hook). */
 float* vulkan_alloc_kv(std::size_t n_floats);
 
