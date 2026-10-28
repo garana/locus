@@ -86,7 +86,8 @@ float row_part(uint wbase, uint xbase, uint r, uint lane) {
         uint t = (g >> 1) & 3u;
         uint h = g & 1u;
         uint at = rb + b * 210u;
-        float d = unpackHalf2x16(word_at(at + 208u)).x;
+        // Bytes 206..209: a second word never starts past the block.
+        float d = unpackHalf2x16(word_at(at + 206u) >> 16u).x;
         float sc = float(bitfieldExtract(
             int(byte_at(at + 192u + n * 8u + h + 2u * t)), 0, 8));
         // q1 / q3 read ql[l], q2 / q4 ql[l + 32]; q3 / q4 the high
