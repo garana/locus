@@ -43,12 +43,12 @@
 // (x_div > 1: GQA attention, where a K/V head's query heads are
 // extra token rows sharing each K/V tile).
 //
-// With MOE_ID, b is an expert id and the token tile comes from that
-// expert's list in IDS (moe_group.comp: counts[n_expert], then
-// cap pair ids per expert); pair p reads X row p / x_div and writes
-// output row p. An expert sees ~n_tok * k / n_expert pairs, so the
-// MOE_ID token tile is 16 wide (a 64-token tile would multiply
-// mostly padding).
+// With MOE_ID, tiles_n holds n_expert and workgroup y picks entry y
+// of the work list moe_group.comp appends to IDS (after
+// counts[n_expert] and the n_expert lists of cap pair ids: a tile
+// count, then expert << 16 | token tile per tile; y past the count
+// exits). b is that expert and the token tile comes from its list;
+// pair p reads X row p / x_div and writes output row p.
 
 // 16 x 16 threads, each owning TM contiguous weight rows by TN
 // contiguous tokens (both multiples of 4, read from shared memory as
@@ -110,7 +110,8 @@ layout(push_constant) uniform PC {
     uint w_bstride;   // per batch / expert, in w_off units
     uint x_bstride;
     uint out_bstride;
-    uint tiles_n;     // token tiles per batch (y = b * tiles_n + tt)
+    uint tiles_n;     // token tiles per batch (y = b * tiles_n + tt);
+                      // MOE_ID: n_expert
     uint x_div;       // MOE_ID: X row = pair / x_div
     uint cap;         // MOE_ID: list capacity per expert
     uint w_bdiv;      // batches per weight slice (GQA group), >= 1
@@ -203,8 +204,18 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint ks = gl_WorkGroupID.y % pc.k_splits;
     uint yb = gl_WorkGroupID.y / pc.k_splits;
+#ifdef MOE_ID
+    uint lb = pc.tiles_n + pc.tiles_n * pc.cap;
+    if (yb >= ids[lb]) {
+        return;  // uniform: past the work list
+    }
+    uint ent = ids[lb + 1u + yb];
+    uint b = ent >> 16;
+    uint tt = ent & 0xffffu;
+#else
     uint b = yb / pc.tiles_n;
     uint tt = yb % pc.tiles_n;
+#endif
     // This split's K range, whole BK steps (Q8_0 blocks stay whole).
     uint k_per = ((pc.cols + pc.k_splits - 1u) / pc.k_splits + BK - 1u) /
                  BK * BK;
@@ -221,10 +232,8 @@ void main() {
     }
     n_here = min(BN, n_here - t0);
     if (tid < n_here) {
-        // Lists start after the n_expert counts; the grid has
-        // n_expert * tiles_n workgroups in y.
-        uint n_exp = gl_NumWorkGroups.y / (pc.tiles_n * pc.k_splits);
-        uint p = ids[n_exp + b * pc.cap + t0 + tid];
+        // Lists start after the n_expert counts.
+        uint p = ids[pc.tiles_n + b * pc.cap + t0 + tid];
         rows_x[tid] = pc.x_off + (p / pc.x_div) * pc.x_stride;
         rows_o[tid] = pc.out_off + p * pc.out_stride;
     }
