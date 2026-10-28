@@ -44,6 +44,8 @@ add_library(locus
     src/locus/image/janus_vision.cpp
     src/locus/image/pixart_dit.cpp
     src/locus/image/pixart_sampler.cpp
+    src/locus/image/dense.cpp
+    src/locus/image/sd_vae.cpp
     src/locus/image/t5_encoder.cpp
     src/locus/image/janus_chat.cpp
     src/locus/image/png.cpp
