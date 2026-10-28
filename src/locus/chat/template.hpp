@@ -36,6 +36,7 @@ class ChatTemplate {
         kZephyr,    // <|user|> ... </s> (TinyLlama-chat)
         kDeepSeek,  // <<U+FF5C>User<U+FF5C>> markers (DeepSeek-V3)
         kDeepSeek2, // "User: " / "Assistant: " (DeepSeek-V2)
+        kDeepSeekCoder,  // "### Instruction:" / <|EOT|> (Coder V1)
     };
 
     ChatTemplate() = default;

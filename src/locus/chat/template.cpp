@@ -45,6 +45,11 @@ ChatTemplate ChatTemplate::from_gguf(const gguf::GgufFile& g) {
     if (has("'Assistant: ' + message['content'] + eos_token")) {
         return ChatTemplate(Family::kDeepSeek2);
     }
+    // DeepSeek-Coder V1 instruct (deepseek-coder-33b-instruct), with
+    // llama.cpp's fingerprint.
+    if (has("### Instruction:") && has("<|EOT|>")) {
+        return ChatTemplate(Family::kDeepSeekCoder);
+    }
     return ChatTemplate(Family::kPlain);
 }
 
@@ -134,6 +139,21 @@ std::string ChatTemplate::apply(std::span<const Message> messages,
             }
             break;
         }
+        case Family::kDeepSeekCoder: {
+            for (const Message& m : messages) {
+                if (m.role == "user") {
+                    out += "### Instruction:\n" + m.content + "\n";
+                } else if (m.role == "assistant") {
+                    out += "### Response:\n" + m.content + "\n<|EOT|>\n";
+                } else {
+                    out += m.content;
+                }
+            }
+            if (add_assistant_prompt) {
+                out += "### Response:\n";
+            }
+            break;
+        }
         case Family::kPlain: {
             for (const Message& m : messages) {
                 if (!out.empty()) {
@@ -155,6 +175,7 @@ std::string_view ChatTemplate::name() const {
         case Family::kZephyr: return "zephyr";
         case Family::kDeepSeek: return "deepseek";
         case Family::kDeepSeek2: return "deepseek2";
+        case Family::kDeepSeekCoder: return "deepseek-coder";
         case Family::kPlain: return "plain";
     }
     return "plain";
