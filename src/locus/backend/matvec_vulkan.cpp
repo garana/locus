@@ -1669,6 +1669,11 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 fused && !hp.rope_neox && !qk_norm && !bias;
             const Kernel rope_k =
                 hp.rope_neox ? Kernel::kRopeNeox : Kernel::kRope;
+            // q-k-norm models norm and rope q and K in one dispatch,
+            // once K has landed (below).
+            const bool qk_fused = !epi_rope && qk_norm && !qblk &&
+                                  hp.head_dim <=
+                                      VulkanContext::kQkNormRopeHdMax;
             // Per-head RMS norm in place: `heads` rows of head_dim
             // floats from `off`, each scaled by the same weights.
             auto head_norm = [&](VulkanContext::Buffer buf,
@@ -1709,7 +1714,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             if (!lay.wq_bias.empty()) {
                 rec_bias(s, lay.wq_bias, s.q, 0);
             }
-            if (!epi_rope) {
+            if (!epi_rope && !qk_fused) {
                 if (qk_norm) {
                     head_norm(s.q, 0, hp.n_heads, lay.attn_q_norm);
                 }
@@ -1731,7 +1736,21 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 if (!lay.wv_bias.empty()) {
                     rec_bias(s, lay.wv_bias, kv_dst, v_at);
                 }
-                if (!epi_rope) {
+                if (qk_fused) {
+                    const VulkanContext::Buffer bufs[] = {
+                        s.q, kv_dst,
+                        s.upload(lay.attn_q_norm.data(),
+                                 lay.attn_q_norm.size() * 4),
+                        s.upload(lay.attn_k_norm.data(),
+                                 lay.attn_k_norm.size() * 4),
+                        divisors};
+                    const std::uint32_t push[] = {
+                        hp.n_heads, hp.head_dim, eps_bits,
+                        0,          k_at,        pos,
+                        base_bits,  hp.rope_neox ? 1u : 0u};
+                    s.ctx.dispatch(Kernel::kQkNormRope, bufs, push,
+                                   hp.n_heads + hp.n_kv_heads);
+                } else if (!epi_rope) {
                     if (qk_norm) {
                         head_norm(kv_dst, k_at, hp.n_kv_heads,
                                   lay.attn_k_norm);
