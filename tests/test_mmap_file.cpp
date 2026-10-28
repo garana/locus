@@ -42,21 +42,27 @@ TEST_CASE("mapped files are registered and report their unmap",
     std::vector<int> heap(64);
     REQUIRE_FALSE(in_file_mapping(heap.data(), sizeof(int)));
 
-    // Put the previous hook back afterwards: the Vulkan backend's, if
-    // an earlier test built its state (i#331).
-    const locus::sys::UnmapHook prev =
-        locus::sys::set_unmap_hook(&record_unmap);
     const std::byte* data = nullptr;
     {
-        locus::sys::MappedFile mf(path);
-        data = mf.bytes().data();
-        REQUIRE(in_file_mapping(data, 10000));
-        REQUIRE(in_file_mapping(data + 100, 50));
-        // Past the end, or straddling it, is not inside the mapping.
-        REQUIRE_FALSE(in_file_mapping(data + 9990, 20));
-        REQUIRE_FALSE(in_file_mapping(data + 20000, 1));
+        // The previous hook (the Vulkan backend's, if an earlier test
+        // built its state) goes back even when a check below throws, or
+        // the rest of the process would keep ours (i#331).
+        struct HookGuard {
+            locus::sys::UnmapHook prev;
+            ~HookGuard() { locus::sys::set_unmap_hook(prev); }
+        } guard{locus::sys::set_unmap_hook(&record_unmap)};
+        {
+            locus::sys::MappedFile mf(path);
+            data = mf.bytes().data();
+            REQUIRE(in_file_mapping(data, 10000));
+            REQUIRE(in_file_mapping(data + 100, 50));
+            // Past the end, or straddling it, is not inside the mapping.
+            REQUIRE_FALSE(in_file_mapping(data + 9990, 20));
+            REQUIRE_FALSE(in_file_mapping(data + 20000, 1));
+        }
+        // The slot still held ours when the file unmapped.
+        REQUIRE(locus::sys::set_unmap_hook(&record_unmap) == &record_unmap);
     }
-    REQUIRE(locus::sys::set_unmap_hook(prev) == &record_unmap);
     REQUIRE(hook_p == data);
     REQUIRE(hook_n == 10000);
     REQUIRE(hook_saw_live);
