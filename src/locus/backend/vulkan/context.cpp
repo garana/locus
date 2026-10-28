@@ -47,6 +47,8 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecBF16N:
         case Kernel::kMatvecF16N2:
         case Kernel::kMatvecBF16N2:
+        case Kernel::kMatvecQ5_0:
+        case Kernel::kMatvecQ5_0B:
             return (rows + 3) / 4;
         case Kernel::kMatvecQ4_K:  // 8 rows of 16 lanes
         case Kernel::kMatvecQ4_KB:
@@ -215,6 +217,12 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "copy_spv.h"
 #include "qk_norm_rope_spv.h"
 #include "matvec_q4_k_seg_spv.h"
+#include "bias_rows_spv.h"
+#include "matmul_q5_0_spv.h"
+#include "matmul_q5_0_id_spv.h"
+#include "matmul_q5_0_small_spv.h"
+#include "matmul_q5_0_id_small_spv.h"
+#include "matvec_q5_0_b_spv.h"
 #include "rope_neox_spv.h"
 #include "rope_neox_b_spv.h"
 #include "matvec_q4_k_b_spv.h"
@@ -522,6 +530,20 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_qk_norm_rope_spv), 5, 32},
     {Kernel::kMatvecQ4_KSeg, "matvec_q4_k_seg", locus_matvec_q4_k_seg_spv,
      sizeof(locus_matvec_q4_k_seg_spv), 6, 44},
+    {Kernel::kBiasRows, "bias_rows", locus_bias_rows_spv,
+     sizeof(locus_bias_rows_spv), 2, 16},
+    {Kernel::kMatmulQ5_0, "matmul_q5_0", locus_matmul_q5_0_spv,
+     sizeof(locus_matmul_q5_0_spv), 3, 96, locus_matmul_q5_0_small_spv,
+     sizeof(locus_matmul_q5_0_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kMatmulQ5_0Id, "matmul_q5_0_id", locus_matmul_q5_0_id_spv,
+     sizeof(locus_matmul_q5_0_id_spv), 4, 96,
+     locus_matmul_q5_0_id_small_spv, sizeof(locus_matmul_q5_0_id_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kMatvecQ5_0B, "matvec_q5_0_b", locus_matvec_q5_0_b_spv,
+     sizeof(locus_matvec_q5_0_b_spv), 4, 52},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */
