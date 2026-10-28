@@ -143,7 +143,8 @@ class OpenAiServer {
      * by both the dispatch handler and the auth head stage. */
     enum class Route {
         kHealth, kModels, kModelById, kMetrics,
-        kCompletions, kChat, kMessages, kEmbeddings, kAudioSpeech,
+        kCompletions, kChat, kMessages, kResponses, kEmbeddings,
+        kAudioSpeech,
         kImages, kUnknown
     };
     /** Classifies a request. GET and HEAD both match the GET routes;

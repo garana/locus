@@ -184,6 +184,10 @@ inline constexpr const char* kCommonHelp =
     "                   path P (default /metrics)\n"
     "  --audio-decoder P locus-server: enable /v1/audio/speech with\n"
     "                   the neural-codec decoder GGUF at path P\n"
+    "  --max-tokens N   locus-server: cap one request's output at N\n"
+    "                   tokens (default 1024); also the length of a\n"
+    "                   /v1/responses reply that sets no\n"
+    "                   max_output_tokens (Codex sets none)\n"
     "  --audio-max-tokens N locus-server: cap one /v1/audio/speech\n"
     "                   request at N audio tokens (7 per 85 ms\n"
     "                   frame; default 1024)\n"
@@ -256,6 +260,9 @@ struct BackendArgs {
      * (arch "snac") enabling locus-server's /v1/audio/speech; empty =
      * the endpoint is disabled (503). */
     std::string audio_decoder;
+    /** From --max-tokens N: per-request output-token cap (0 = the
+     * server default). */
+    std::uint32_t max_tokens = 0;
     /** From --audio-max-tokens N: per-request audio-token cap for
      * /v1/audio/speech (0 = the server default). */
     std::uint32_t audio_max_tokens = 0;
@@ -368,6 +375,11 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.audio_decoder = argv[++i];
         } else if (a.rfind("--audio-decoder=", 0) == 0) {
             out.audio_decoder = std::string(a.substr(16));
+        } else if (a == "--max-tokens" && i + 1 < argc) {
+            number("--max-tokens", argv[++i], out.max_tokens);
+        } else if (a.rfind("--max-tokens=", 0) == 0) {
+            number("--max-tokens", std::string(a.substr(13)),
+                   out.max_tokens);
         } else if (a == "--audio-max-tokens" && i + 1 < argc) {
             number("--audio-max-tokens", argv[++i], out.audio_max_tokens);
         } else if (a.rfind("--audio-max-tokens=", 0) == 0) {

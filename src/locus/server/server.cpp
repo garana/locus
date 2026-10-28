@@ -29,6 +29,7 @@
 #include "locus/model/grammar.hpp"
 #include "locus/model/sampling.hpp"
 #include "locus/server/errors.hpp"
+#include "locus/server/responses.hpp"
 #include "locus/server/tools.hpp"
 #include "locus/sys/perf_counters.hpp"
 
@@ -818,6 +819,9 @@ OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
         }
         if (path == "/v1/messages") {
             return Route::kMessages;
+        }
+        if (path == "/v1/responses") {
+            return Route::kResponses;
         }
         if (path == "/v1/embeddings") {
             return Route::kEmbeddings;
@@ -2216,12 +2220,165 @@ void OpenAiServer::install_routes() {
             }
     };
 
+    // OpenAI Responses API (POST /v1/responses), stateless (i#279):
+    // OpenAI Codex speaks only this. The request becomes chat messages
+    // (responses.hpp); the reply is one output item, a message or a
+    // function call. With tools offered the text is buffered until the
+    // end, as on the chat path, so a tool call never streams as text.
+    auto handle_responses = [this](const http::Request& req,
+                                   http::ServerResponse& res,
+                                   const http::RequestContext& ctx) {
+        auth_event("create", "responses", ctx.identity);
+        json body;
+        ResponsesRequest rq;
+        try {
+            body = json::parse(req.body);
+            rq = parse_responses_request(body);
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(make_error(e.what()).dump(-1, ' ', false, kLossy),
+                            "application/json");
+            return;
+        }
+        // No max_output_tokens means "as long as needed" in this API
+        // (Codex sends none), so the cap is the default here.
+        const auto max_tokens = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                rq.max_output_tokens.value_or(opt_.max_tokens_cap),
+                opt_.max_tokens_cap));
+        auto [sampling, seed] = parse_sampling(body);
+        auto prompt_ids =
+            tok_.encode(opt_.chat_template.apply(rq.messages), true);
+        const auto n_prompt = static_cast<std::uint32_t>(prompt_ids.size());
+        if (const std::string why = loop_.admit_error(n_prompt);
+            !why.empty()) {
+            res.status = 400;
+            res.set_content(make_error(why).dump(-1, ' ', false, kLossy),
+                            "application/json");
+            return;
+        }
+        requests_total_.fetch_add(1, std::memory_order_relaxed);
+        prompt_tokens_total_.fetch_add(n_prompt, std::memory_order_relaxed);
+        const std::uint64_t id = loop_.submit(std::move(prompt_ids),
+                                              max_tokens, sampling, seed,
+                                              nullptr, {});
+        auto r = std::make_shared<ResponsesResult>();
+        r->id = "resp_" + std::to_string(id);
+        r->model = opt_.model_name;
+        r->created_at = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now()
+                                .time_since_epoch())
+                            .count();
+        r->input_tokens = n_prompt;
+        auto rq_sp = std::make_shared<ResponsesRequest>(std::move(rq));
+        // Fills r from a finished generation.
+        auto settle = [this, r, rq_sp](const EngineLoop::View& v) {
+            const bool hit_eos = !v.generated.empty() &&
+                                 v.generated.back() == tok_.eos_id();
+            r->text = tok_.decode(v.generated);
+            r->call = detect_tool_call(r->text, rq_sp->tools);
+            if (r->call) r->text.clear();
+            r->incomplete = !hit_eos && !r->call;
+            r->cached_tokens = v.reused_prefix_tokens;
+            r->output_tokens = static_cast<std::uint32_t>(v.generated.size());
+            completion_tokens_total_.fetch_add(r->output_tokens,
+                                               std::memory_order_relaxed);
+        };
+
+        if (!rq_sp->stream) {
+            auto v = loop_.wait_done_or_cancel(id, ctx.client_alive);
+            loop_.release(id);
+            if (v.status == engine::Status::kCancelled) {
+                res.status = 499;
+                res.set_content(
+                    make_error("request cancelled: client closed the "
+                               "connection")
+                        .dump(-1, ' ', false, kLossy),
+                    "application/json");
+                return;
+            }
+            if (v.status == engine::Status::kFailed) {
+                res.status = 500;
+                res.set_content(make_error(v.error).dump(-1, ' ', false, kLossy),
+                                "application/json");
+                return;
+            }
+            settle(v);
+            res.set_content(
+                responses_object(*r,
+                                 json::array({responses_output_item(*r,
+                                                                    *rq_sp)}),
+                                 r->incomplete ? "incomplete" : "completed")
+                    .dump(-1, ' ', false, kLossy),
+                "application/json");
+            return;
+        }
+
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [this, id, r, rq_sp, settle](http::Sink& sink) {
+                ResponsesSse sse;
+                std::size_t seen = 0;
+                bool opened = false;
+                const bool live = rq_sp->tools.empty();
+                std::string payload = sse.start(*r);
+                for (;;) {
+                    auto v = loop_.wait_progress(id, seen);
+                    if (live) {
+                        for (std::size_t i = seen; i < v.generated.size();
+                             ++i) {
+                            const tok::TokenId t = v.generated[i];
+                            if (t == tok_.eos_id()) continue;
+                            if (!opened) {
+                                payload += sse.message_open(*r);
+                                opened = true;
+                            }
+                            payload += sse.text_delta(*r, tok_.decode({&t, 1}));
+                        }
+                    }
+                    seen = v.generated.size();
+                    const bool terminal = v.status == engine::Status::kDone ||
+                                          v.status == engine::Status::kFailed;
+                    if (terminal) {
+                        if (v.status == engine::Status::kFailed) {
+                            payload += sse.event(
+                                {{"type", "response.failed"},
+                                 {"response",
+                                  [&] {
+                                      json o = responses_object(
+                                          *r, json::array(), "failed");
+                                      o["error"] = {{"code", "server_error"},
+                                                    {"message", v.error}};
+                                      return o;
+                                  }()}});
+                        } else {
+                            settle(v);
+                            payload += sse.finish(*r, *rq_sp, opened);
+                        }
+                        loop_.release(id);
+                    }
+                    if (!payload.empty() &&
+                        !sink.write(std::string_view(payload.data(),
+                                                     payload.size()))) {
+                        loop_.cancel(id);
+                        loop_.release(id);
+                        return;
+                    }
+                    payload.clear();
+                    if (terminal) {
+                        sink.done();
+                        return;
+                    }
+                }
+            });
+    };
+
     // One dispatch handler over all routes (route_of is the single home
     // for routing, shared with the auth head stage below).
     route_handler_ = [this, handle_health, handle_models,
                       handle_model_by_id, handle_metrics, handle,
-                      handle_messages, handle_embeddings, handle_audio,
-                      handle_images](
+                      handle_messages, handle_responses, handle_embeddings,
+                      handle_audio, handle_images](
                          const http::Request& req, http::ServerResponse& res,
                          const http::RequestContext& ctx) {
         switch (route_of(req.method, req.path)) {
@@ -2232,6 +2389,7 @@ void OpenAiServer::install_routes() {
             case Route::kCompletions: handle(req, res, ctx, false); break;
             case Route::kChat:        handle(req, res, ctx, true); break;
             case Route::kMessages:    handle_messages(req, res, ctx); break;
+            case Route::kResponses:   handle_responses(req, res, ctx); break;
             case Route::kEmbeddings:  handle_embeddings(req, res, ctx); break;
             case Route::kAudioSpeech: handle_audio(req, res, ctx); break;
             case Route::kImages:      handle_images(req, res, ctx); break;
