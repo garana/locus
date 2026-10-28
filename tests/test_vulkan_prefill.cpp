@@ -77,10 +77,14 @@ std::vector<std::byte> random_q8(std::uint32_t rows, std::uint32_t cols,
 std::vector<std::byte> random_kq(locus::gguf::TensorType type,
                                  std::uint32_t rows, std::uint32_t cols,
                                  std::mt19937& rng) {
+    // Q4_K / Q6_K super-blocks of 256, or Q5_0 blocks of 32 (d first).
     const bool q4 = type == locus::gguf::TensorType::kQ4_K;
-    const std::size_t block = q4 ? 144 : 210, d_off = q4 ? 0 : 208;
+    const bool q5 = type == locus::gguf::TensorType::kQ5_0;
+    const std::size_t block = q5 ? 22 : q4 ? 144 : 210;
+    const std::size_t d_off = q5 || q4 ? 0 : 208;
+    const std::uint32_t per = q5 ? 32 : 256;
     std::uniform_int_distribution<int> bd(0, 255);
-    std::vector<std::byte> w(std::size_t{rows} * (cols / 256) * block);
+    std::vector<std::byte> w(std::size_t{rows} * (cols / per) * block);
     for (auto& b : w) {
         b = static_cast<std::byte>(bd(rng));
     }
@@ -163,6 +167,9 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
          1e-3f},
         {"q6_k", locus::gguf::TensorType::kQ6_K, Kernel::kMatmulQ6_K, 512,
          1e-3f},
+        // 22-byte blocks: rows and halves start off word alignment.
+        {"q5_0", locus::gguf::TensorType::kQ5_0, Kernel::kMatmulQ5_0, 96,
+         1e-3f},
     };
     const std::uint32_t rows = 100, n_tok = 70, n_batch = 3;
     const std::uint32_t x_stride = 300, out_stride = 333;
@@ -175,7 +182,8 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
         DYNAMIC_SECTION(c.name) {
             const bool q8 = c.type == locus::gguf::TensorType::kQ8_0;
             const bool kq = c.type == locus::gguf::TensorType::kQ4_K ||
-                            c.type == locus::gguf::TensorType::kQ6_K;
+                            c.type == locus::gguf::TensorType::kQ6_K ||
+                            c.type == locus::gguf::TensorType::kQ5_0;
             std::vector<std::byte> w;
             if (q8) {
                 w = random_q8(rows * n_batch, c.cols, rng);
@@ -424,9 +432,12 @@ TEST_CASE("vulkan batched prefill tracks per-token prefill",
         SKIP("no usable Vulkan device / kernels not built");
     }
     // llama-1b exercises the dense GPU path; DeepSeek-Coder-V2-Lite
-    // Q8_0 (optional, 16GB) the MLA + GPU-routed MoE path.
+    // Q8_0 (optional, 16GB) the MLA + GPU-routed MoE path;
+    // Qwen1.5-MoE Q4_K_M (optional, 9GB) q / k / v biases, the gated
+    // shared expert and the Q4_K expert matmuls.
     const char* const models[] = {"llama-3.2-1b-q8_0.gguf",
-                                  "deepseek-coder-v2-lite-q8_0.gguf"};
+                                  "deepseek-coder-v2-lite-q8_0.gguf",
+                                  "Qwen1.5-MoE-A2.7B.Q4_K_M.gguf"};
     std::size_t ran = 0;
     for (const char* name : models) {
         const std::string path = test_model(name);

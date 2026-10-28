@@ -1,0 +1,27 @@
+#version 450
+
+// Adds a bias vector to n rows in place: o[off + t * stride + i] +=
+// b[i] for i < dim, t < n (a prefill chunk's q / k / v projections,
+// qwen2). Grid-stride over n * dim.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B { float b[]; };
+layout(std430, binding = 1) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint dim;
+    uint n;
+    uint off;
+    uint stride;
+} pc;
+
+void main() {
+    uint step = gl_NumWorkGroups.x * 256u;
+    for (uint e = gl_GlobalInvocationID.x; e < pc.n * pc.dim; e += step) {
+        uint t = e / pc.dim;
+        uint i = e % pc.dim;
+        uint at = pc.off + t * pc.stride + i;
+        o[at] = o[at] + b[i];
+    }
+}

@@ -13,8 +13,9 @@
 //
 // Weight type by define: TYPE_Q8 (Q8_0 rows in the split GPU layout
 // of q8_layout.hpp, byte offsets, cols % 32 == 0), TYPE_Q4K / TYPE_Q6K
-// (ggml K-quant rows as on disk, byte offsets, cols % 256 == 0) or
-// TYPE_F32 (element offsets).
+// (ggml K-quant rows as on disk, byte offsets, cols % 256 == 0),
+// TYPE_Q5_0 (ggml Q5_0 rows as on disk, byte offsets, cols % 32 == 0)
+// or TYPE_F32 (element offsets).
 //
 // TYPE_F32 can instead read W from the paged KV pool (attention as
 // matmuls), through the block table at binding 3: PAGED makes row r
@@ -79,7 +80,8 @@
 
 layout(local_size_x = 256) in;
 
-#if defined(TYPE_Q8) || defined(TYPE_Q4K) || defined(TYPE_Q6K)
+#if defined(TYPE_Q8) || defined(TYPE_Q4K) || defined(TYPE_Q6K) || \
+    defined(TYPE_Q5_0)
 #define W_BYTES
 #endif
 #if defined(W_BYTES) || defined(KV_F16)
@@ -174,7 +176,7 @@ uint word_at(uint b) {
 }
 #endif
 
-#if defined(TYPE_Q4K) || defined(TYPE_Q6K)
+#if defined(TYPE_Q4K) || defined(TYPE_Q6K) || defined(TYPE_Q5_0)
 uint byte_at(uint i) {
     return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
 }
@@ -338,6 +340,31 @@ void main() {
                 }
             }
 #endif
+        } else {
+            for (uint c = sub * VPT; c < sub * VPT + VPT; ++c) {
+                ws[c][lr / 4u][lr % 4u] = SVAL(0.0);
+            }
+        }
+#elif defined(TYPE_Q5_0)
+        // A thread's VPT (8 or 16) columns sit in one half of a 22-byte
+        // block (f16 d, u32 qh, 16 nibble bytes): element j < 16 is
+        // qs[j]'s low nibble, j + 16 its high nibble, each with 5th bit
+        // qh bit j (or j + 16), offset by -16 (matvec_q5_0).
+        if (r < pc.rows) {
+            uint nb = pc.cols / 32u;
+            uint kc = k0 + sub * VPT;
+            uint e = kc % 32u;
+            uint at = wbase + (r * nb + kc / 32u) * 22u;
+            float d = f16_at(at);
+            uint qh = word_at(at + 2u) >> e;
+            uint sh = e >= 16u ? 4u : 0u;
+            uint q0 = at + 6u + e % 16u;
+            for (uint c = 0u; c < VPT; ++c) {
+                uint q = ((byte_at(q0 + c) >> sh) & 0xfu) |
+                         (((qh >> c) & 1u) << 4u);
+                ws[sub * VPT + c][lr / 4u][lr % 4u] =
+                    SVAL(d * (float(q) - 16.0));
+            }
         } else {
             for (uint c = sub * VPT; c < sub * VPT + VPT; ++c) {
                 ws[c][lr / 4u][lr % 4u] = SVAL(0.0);

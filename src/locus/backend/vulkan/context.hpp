@@ -121,6 +121,13 @@ enum class Kernel {
     kQkNormRope,
     /** matvec_q4_k over q / k / v from separate buffers (SEGMENTS). */
     kMatvecQ4_KSeg,
+    /** Bias added to each of n rows (bias_rows.comp: prefill q/k/v). */
+    kBiasRows,
+    /** Prefill matmuls over Q5_0 weights (matmul.comp TYPE_Q5_0). */
+    kMatmulQ5_0,
+    kMatmulQ5_0Id,
+    /** Batched (MoE slot) matvec over Q5_0 weights. */
+    kMatvecQ5_0B,
     kCount_,
 };
 

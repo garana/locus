@@ -122,6 +122,7 @@ Kernel batched_kernel(const Mat& w) {
         case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0B;
         case gguf::TensorType::kQ4_K: return Kernel::kMatvecQ4_KB;
         case gguf::TensorType::kQ6_K: return Kernel::kMatvecQ6_KB;
+        case gguf::TensorType::kQ5_0: return Kernel::kMatvecQ5_0B;
         default: return Kernel::kCount_;
     }
 }
@@ -790,6 +791,7 @@ Kernel matmul_kernel(const Mat& w) {
         case gguf::TensorType::kQ8_0: return Kernel::kMatmulQ8_0;
         case gguf::TensorType::kQ4_K: return Kernel::kMatmulQ4_K;
         case gguf::TensorType::kQ6_K: return Kernel::kMatmulQ6_K;
+        case gguf::TensorType::kQ5_0: return Kernel::kMatmulQ5_0;
         case gguf::TensorType::kF32: return Kernel::kMatmulF32;
         default: return Kernel::kCount_;
     }
@@ -801,6 +803,7 @@ Kernel matmul_id_kernel(const Mat& w) {
     switch (w.type) {
         case gguf::TensorType::kQ8_0: return Kernel::kMatmulQ8_0Id;
         case gguf::TensorType::kQ4_K: return Kernel::kMatmulQ4_KId;
+        case gguf::TensorType::kQ5_0: return Kernel::kMatmulQ5_0Id;
         case gguf::TensorType::kQ6_K: return Kernel::kMatmulQ6_KId;
         default: return Kernel::kCount_;
     }
@@ -2519,13 +2522,6 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     }
     // Routed experts need GPU routing (all experts resident) and an
     // id-matmul; moe_group handles up to 256 experts.
-    // q / k / v biases and the gated shared expert (qwen2moe) run on
-    // the GPU decode path only so far.
-    for (const auto& lay : m.layers()) {
-        if (lay.has_qkv_bias() || lay.gate_inp_shexp.rows > 0) {
-            return false;
-        }
-    }
     for (const auto& lay : m.layers()) {
         if (lay.is_moe() &&
             (!gpu_route_ok(s, m, lay) || hp.n_expert > 256 ||
@@ -2650,8 +2646,11 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                            (count + 63) / 64, 65535)));
     };
     // Dense SwiGLU over the normed rows in bxb, accumulated into bx.
+    // sh_gate: qwen2moe's gated shared expert, its activation rows
+    // also scaled by sigmoid(sh_gate . x) (one logit per token, in
+    // the router buffer, free once routing is done).
     auto swiglu_rows = [&](const Mat& wg, const Mat& wu, const Mat& wd,
-                           std::uint32_t ff) {
+                           std::uint32_t ff, const Mat* sh_gate = nullptr) {
         Mat g2 = wg, u2 = wu, d2 = wd;
         g2.rows = ff;
         u2.rows = ff;
@@ -2661,9 +2660,35 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                    in, false);
         rec_matmul(s, u2, s.upload_w(u2), bxb, bup,
                    in, false);
-        silu_rows(std::size_t{n} * ff);
+        if (sh_gate != nullptr) {
+            const auto blogit = s.chunk_buf(
+                C::kCRouter, std::size_t{n} * 2 * hp.n_expert);
+            rec_matmul(s, *sh_gate, s.upload_w(*sh_gate), bxb, blogit,
+                       MatmulRows{n, 0, E, 0, 1}, false);
+            const VulkanContext::Buffer bufs[] = {bgate, bup, bgate,
+                                                  blogit};
+            const std::uint32_t push[] = {n * ff, ff};
+            s.ctx.dispatch(Kernel::kSiluMulSg, bufs, push,
+                           std::min<std::uint32_t>((n * ff + 63) / 64,
+                                                   65535));
+        } else {
+            silu_rows(std::size_t{n} * ff);
+        }
         rec_matmul(s, d2, s.upload_w(wd), bgate, bx,
                    MatmulRows{n, 0, ff, 0, E}, true);
+    };
+    // q / k / v biases (qwen2): bias added to each of n rows, in place.
+    auto bias_rows = [&](std::span<const float> b, VulkanContext::Buffer o,
+                         std::uint32_t dim) {
+        if (b.empty()) {
+            return;
+        }
+        const VulkanContext::Buffer bufs[] = {
+            s.upload(b.data(), b.size() * 4), o};
+        const std::uint32_t push[] = {dim, n, 0, dim};
+        s.ctx.dispatch(Kernel::kBiasRows, bufs, push,
+                       std::min<std::uint32_t>((n * dim + 255) / 256,
+                                               65535));
     };
 
     s.ctx.begin_batch();
@@ -2694,6 +2719,9 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
             rec_matmul(s, lay.wv, cat ? wcat : s.upload_w(lay.wv), bxb,
                        bv, MatmulRows{n, 0, E, 0, kv_dim}, false,
                        cat ? v_at : 0);
+            bias_rows(lay.wq_bias, bq, q_dim);
+            bias_rows(lay.wk_bias, bk, kv_dim);
+            bias_rows(lay.wv_bias, bv, kv_dim);
             if (lay.has_qk_norm()) {
                 // Per-head q / k RMS norm (qwen3moe) before rope: n *
                 // heads rows of hd floats, in place.
@@ -2900,7 +2928,9 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         }
         if (hp.n_expert_shared > 0) {
             swiglu_rows(lay.gate_shexp, lay.up_shexp, lay.down_shexp,
-                        shexp_ff(hp));
+                        shexp_ff(hp),
+                        lay.gate_inp_shexp.rows > 0 ? &lay.gate_inp_shexp
+                                                    : nullptr);
         }
     }
 
