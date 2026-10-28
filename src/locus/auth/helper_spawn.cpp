@@ -41,12 +41,14 @@ void close_all(int a, int b, int c, int d) {
     ::close(c);
     ::close(d);
 }
+#if !defined(__linux__)
 void set_cloexec(int fd) {
     const int f = ::fcntl(fd, F_GETFD);
     if (f != -1) {
         ::fcntl(fd, F_SETFD, f | FD_CLOEXEC);
     }
 }
+#endif
 /**
  * pipe() with both ends close-on-exec. Linux sets the flag
  * atomically; macOS has no pipe2, so a fork+exec on another thread
