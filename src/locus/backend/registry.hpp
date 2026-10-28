@@ -59,17 +59,18 @@ struct Ops {
     void (*matvec_batch)(const Mat&, std::span<const float>,
                          std::span<float>, std::uint32_t n) = nullptr;
     /**
-     * True when matvec_batch parallelizes the weight rows itself and
-     * wants the WHOLE matrix in one call (a GPU backend: its kernel
-     * grids over all rows in a single launch). The model then skips
-     * the CPU row-slice fan-out (for_row_slices) for the batched
-     * path and calls matvec_batch once. Distinct from mt_safe, which
-     * only says matvec() is re-entrant: a GPU backend is both
-     * mt_safe (per-op fallback) AND batch_self_parallel. CPU SIMD
-     * backends leave this false so the model still splits rows across
-     * cores.
+     * True when the backend parallelizes the weight rows itself and
+     * wants the WHOLE matrix in each matvec, matvec_q8k and
+     * matvec_batch call (a GPU backend: its kernel grids over all
+     * rows in a single launch). The model then skips the CPU
+     * row-slice fan-out (see splits_rows). Row slices would also
+     * defeat a weight pool keyed by host pointer: slice 0 shares the
+     * whole weight's pointer with a different size. Distinct from
+     * mt_safe, which only says matvec() is re-entrant: CUDA is both.
+     * CPU SIMD backends leave this false so the model still splits
+     * rows across cores.
      */
-    bool batch_self_parallel = false;
+    bool self_parallel = false;
     /**
      * Optional KV-pool allocator (nullptr: heap). The vulkan
      * backend hands out a GPU-mapped pointer so the paged cache
@@ -91,9 +92,7 @@ struct Ops {
      * threads (the R9 row-split, matvec_mt). The CPU kernels and
      * the CUDA pager are re-entrant; the Vulkan backend drives a
      * single-threaded VulkanContext singleton, so it sets this
-     * false and matvec_mt runs it inline. Applies to the
-     * per-op fallback path, which is the only time a GPU
-     * backend's matvec() is reached through matvec_mt.
+     * false and matvec_mt runs it inline.
      */
     bool mt_safe = true;
     /**
@@ -106,6 +105,15 @@ struct Ops {
      */
     bool prefers_q8k = false;
 };
+
+/**
+ * @returns true when the model should split a matvec's weight rows
+ *     across CPU threads for `op`: matvec is re-entrant (mt_safe) and
+ *     the backend does not grid over all rows itself (self_parallel).
+ */
+inline bool splits_rows(const Ops& op) {
+    return op.mt_safe && !op.self_parallel;
+}
 
 /**
  * One selectable math implementation. All variants are always

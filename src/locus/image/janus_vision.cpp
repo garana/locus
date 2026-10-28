@@ -29,7 +29,8 @@ void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
  * out[t][r] = w[r] . x[t] + bias[r] for n tokens, token-major in and
  * out. The rows are split across threads; each thread runs its slice
  * over every token, so the slice stays in cache while the tokens
- * stream past it. A backend that is not mt_safe runs as one slice.
+ * stream past it. A backend that does not split rows (see
+ * backend::splits_rows) runs as one slice.
  */
 void linear(const backend::Ops& op, const backend::Mat& w,
             std::span<const float> bias, std::span<const float> x,
@@ -38,7 +39,9 @@ void linear(const backend::Ops& op, const backend::Mat& w,
     const std::uint32_t threads =
         std::max(1u, std::thread::hardware_concurrency());
     const std::uint32_t slices =
-        op.mt_safe ? std::max(1u, std::min(rows / 64, 2 * threads)) : 1;
+        backend::splits_rows(op)
+            ? std::max(1u, std::min(rows / 64, 2 * threads))
+            : 1;
     const std::uint32_t per = (rows + slices - 1) / slices;
     parallel(slices, [&](std::size_t s) {
         const std::uint32_t r0 = static_cast<std::uint32_t>(s) * per;

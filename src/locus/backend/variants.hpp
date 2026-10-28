@@ -155,7 +155,7 @@ void matvec_cuda_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out);
 
 /**
- * CUDA batched matvec (R11 Ops::matvec_batch, batch_self_parallel):
+ * CUDA batched matvec (R11 Ops::matvec_batch, self_parallel):
  * one kernel launch over all rows x n tokens. Q4_K/Q6_K read each
  * weight block from VRAM once and FMA it into n token accumulators
  * (bit-identical to n matvec_cuda() calls, ~n-fold less VRAM weight

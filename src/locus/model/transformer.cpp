@@ -163,9 +163,9 @@ void matvec_rows_mt(const backend::Ops& op,
                     std::span<float> out) {
     // A backend whose matvec is not re-entrant (Vulkan's single
     // VulkanContext singleton) must run inline: parallel calls
-    // crash the driver. This path is hit when a GPU full-forward
-    // bails to the per-op fallback on an unshadered weight type.
-    if (!op.mt_safe) {
+    // crash the driver. A self-parallel one (CUDA) gets the whole
+    // matrix: one launch, and one weight-pool page per weight.
+    if (!backend::splits_rows(op)) {
         mv(w, x, out);
         return;
     }
@@ -218,7 +218,9 @@ void matvec_mt_group(const backend::Ops& op,
         total += j.w.rows;
     }
     const std::size_t t =
-        op.mt_safe ? mt_slices(static_cast<std::uint32_t>(total)) : 0;
+        backend::splits_rows(op)
+            ? mt_slices(static_cast<std::uint32_t>(total))
+            : 0;
     if (t <= 1) {
         for (const MatvecJob& j : jobs) {
             matvec_kernel(op, j.w)(j.w, j.x, j.out);
@@ -1473,7 +1475,7 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
         // row-slice is a contiguous span we can thread. Then
         // transpose back to the token-major layout downstream wants.
         std::vector<float> rt(static_cast<std::size_t>(oc) * n);
-        if (op.batch_self_parallel) {
+        if (op.self_parallel) {
             // A GPU kernel grids over all rows in one launch: hand it
             // the whole matrix rather than fanning slices across CPU
             // threads (which would issue one launch per slice).
@@ -1498,7 +1500,7 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
         }
         return;
     }
-    for_row_slices(op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+    const auto per_token = [&](std::uint32_t r0, std::uint32_t r1) {
         const Mat sub = backend::mat_rows(w, r0, r1 - r0);
         for (std::uint32_t t = 0; t < n; ++t) {
             op.matvec(
@@ -1509,7 +1511,14 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
                     static_cast<std::size_t>(t) * oc + r0,
                     r1 - r0));
         }
-    });
+    };
+    // for_row_slices splits on mt_safe alone (it also fans out CPU
+    // dequant work); backend calls follow splits_rows.
+    if (backend::splits_rows(op)) {
+        for_row_slices(op, oc, per_token);
+    } else {
+        per_token(0u, oc);
+    }
 }
 
 std::vector<std::pair<std::uint32_t, float>> moe_select(
