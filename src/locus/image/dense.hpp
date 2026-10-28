@@ -11,8 +11,9 @@ namespace locus::image::dense {
 
 /**
  * out[t][r] = w[r] . x[t] + b[r] for n tokens, token-major in and out
- * (b may be empty for no bias). Rows are split across threads; each
- * slice runs the backend's batched matvec over blocks of 64 tokens.
+ * (b may be empty for no bias). Rows are split across threads when
+ * backend::splits_rows(op); each slice runs the backend's batched
+ * matvec over blocks of 64 tokens.
  */
 void linear(const backend::Ops& op, const backend::Mat& w,
             std::span<const float> b, std::span<const float> x,

@@ -52,7 +52,9 @@ void linear(const backend::Ops& op, const backend::Mat& w,
     const std::uint32_t threads =
         std::max(1u, std::thread::hardware_concurrency());
     const std::uint32_t slices =
-        op.mt_safe ? std::max(1u, std::min(rows / 16, 2 * threads)) : 1;
+        backend::splits_rows(op)
+            ? std::max(1u, std::min(rows / 16, 2 * threads))
+            : 1;
     const std::uint32_t per = (rows + slices - 1) / slices;
     parallel(slices, [&](std::size_t s) {
         const std::uint32_t r0 = static_cast<std::uint32_t>(s) * per;
