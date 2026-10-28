@@ -569,6 +569,64 @@ TEST_CASE("cuda matvec matches scalar", "[backend]") {
     check_matvec_variant_matches_scalar(&matvec_cuda);
 }
 
+// The Q4_K / Q6_K kernels stage 128 rows per block in shared memory:
+// cover one partial block, exact blocks, and a partial last block,
+// with several super-blocks per row.
+TEST_CASE("cuda q4_k / q6_k matvec matches scalar across row blocks",
+          "[backend]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    using TT = locus::gguf::TensorType;
+    std::mt19937 rng(4242);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.02f);
+    struct Q {
+        TT type;
+        std::size_t bytes;
+        std::size_t d_off;
+        int dmin_off;
+    };
+    for (const Q& q : {Q{TT::kQ4_K, 144, 0, 2}, Q{TT::kQ6_K, 210, 208, -1}}) {
+        for (std::uint32_t rows : {1u, 127u, 128u, 129u, 300u}) {
+            for (std::uint32_t cols : {256u, 1280u}) {
+                const std::size_t nblk =
+                    static_cast<std::size_t>(rows) * (cols / 256);
+                std::vector<std::byte> w(nblk * q.bytes);
+                for (auto& by : w) {
+                    by = static_cast<std::byte>(byte_d(rng));
+                }
+                for (std::size_t bl = 0; bl < nblk; ++bl) {
+                    std::byte* blk = w.data() + bl * q.bytes;
+                    const std::uint16_t d = f32_to_f16(scale_d(rng));
+                    const std::uint16_t dmin = f32_to_f16(scale_d(rng));
+                    std::memcpy(blk + q.d_off, &d, 2);
+                    if (q.dmin_off >= 0) {
+                        std::memcpy(blk + q.dmin_off, &dmin, 2);
+                    }
+                }
+                std::vector<float> x(cols);
+                for (auto& v : x) {
+                    v = dist(rng);
+                }
+                Mat m{q.type, w.data(), rows, cols};
+                std::vector<float> a(rows), b(rows);
+                matvec(m, x, a);
+                cuda_pool_reset();
+                matvec_cuda(m, x, b);
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    INFO("type " << static_cast<int>(q.type) << " rows "
+                                 << rows << " cols " << cols << " row "
+                                 << r);
+                    REQUIRE(b[r] ==
+                            Catch::Approx(a[r]).epsilon(1e-4).margin(1e-3));
+                }
+            }
+        }
+    }
+}
+
 // R16 ggml-parity: the CUDA Q8_K-activation dot must match the scalar
 // matvec_q8k bit-for-bit (same host quant, same accumulation order).
 TEST_CASE("cuda q8k matvec matches scalar q8k (all QK_K types)",
