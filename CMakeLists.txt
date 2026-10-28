@@ -44,6 +44,8 @@ add_library(locus
     src/locus/image/janus_vision.cpp
     src/locus/image/janus_chat.cpp
     src/locus/image/png.cpp
+    src/locus/image/inflate.cpp
+    src/locus/image/png_decode.cpp
     src/locus/image/image_input.cpp
     src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp

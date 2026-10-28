@@ -22,10 +22,11 @@ struct DecodeLimits {
 };
 
 /**
- * Decodes a PNG or JPEG (request input, so untrusted bytes) to RGB with
- * the vendored stb_image, built with only those two formats. Gray and
- * palette images become RGB; an alpha channel is dropped, as Pillow's
- * convert("RGB") does.
+ * Decodes a PNG or JPEG (request input, so untrusted bytes) to RGB:
+ * PNG with locus's own decoder (png_decode.hpp), JPEG with the vendored
+ * stb_image, built with only those two formats. Gray and palette images
+ * become RGB; an alpha channel is dropped, as Pillow's convert("RGB")
+ * does.
  *
  * @param data The encoded file.
  * @param lim Size caps.
@@ -34,6 +35,14 @@ struct DecodeLimits {
  */
 Rgb8 decode_image(std::span<const std::byte> data,
                   const DecodeLimits& lim = {});
+
+namespace detail {
+/** decode_image through stb_image for any PNG or JPEG: the reference
+ * the tests compare locus's PNG decoder with, until stb_image goes
+ * (i#250). */
+Rgb8 decode_image_stb(std::span<const std::byte> data,
+                      const DecodeLimits& lim = {});
+}  // namespace detail
 
 /**
  * Pillow's Image.resize((w, h), BICUBIC) for an RGB image, bit-exact:

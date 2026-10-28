@@ -7,6 +7,9 @@
 
 namespace locus::image {
 
+/** @returns The CRC-32 (ISO-HDLC, as PNG chunks and zlib use) of d. */
+std::uint32_t crc32(std::span<const std::byte> d);
+
 /**
  * The reference's pixel conversion for a decoder output in about
  * [-1, 1]: clip((x + 1) / 2 * 255, 0, 255) in f32, then a TRUNCATING

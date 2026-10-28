@@ -181,8 +181,9 @@ The areas built after the MVP:
 - Vendored in-tree, pinned, sha256 recorded in the importing commit,
   license files alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
   cpp-httplib v0.18.3 (MIT), nlohmann/json v3.11.3 (MIT), stb_image
-  v2.30 (MIT or public domain; PNG and JPEG only, for image input,
-  until our own decoders replace it, #250), and ggml's IQ lookup
+  v2.30 (MIT or public domain; JPEG input only, until our own decoder
+  replaces it, #250; PNG input uses locus's own inflate and PNG
+  decoder), and ggml's IQ lookup
   tables (`third_party/ggml/iq_grids.h`, MIT).
 - No FetchContent and no network at configure or build time.
 - Optional system dependencies, found at configure time: the Vulkan
