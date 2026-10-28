@@ -104,7 +104,8 @@ std::vector<std::byte> png_with_raw(std::uint32_t w, std::uint32_t h,
         z.insert(z.end(), n, std::byte{0});
         at += n;
     }
-    be32(z, 1);  // Adler-32 of all-zero data: a = 1, b = 0
+    // Adler-32 of raw_len zero bytes: a stays 1, b adds a per byte.
+    be32(z, static_cast<std::uint32_t>(((raw_len % 65521) << 16) | 1));
     chunk("IDAT", z);
     chunk("IEND", {});
     return out;

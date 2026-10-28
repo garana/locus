@@ -1,5 +1,7 @@
 #include "locus/image/image_input.hpp"
 
+#include "locus/image/png_decode.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -176,6 +178,20 @@ Rgb8 decode_image(std::span<const std::byte> data, const DecodeLimits& lim) {
         data.size() > static_cast<std::size_t>(INT32_MAX)) {
         throw std::invalid_argument("image: over the size limit");
     }
+    if (is_png(data)) {
+        return decode_png(data, lim);  // locus's own decoder (i#250)
+    }
+    return detail::decode_image_stb(data, lim);
+}
+
+namespace detail {
+
+Rgb8 decode_image_stb(std::span<const std::byte> data,
+                      const DecodeLimits& lim) {
+    if (data.empty() || data.size() > lim.max_bytes ||
+        data.size() > static_cast<std::size_t>(INT32_MAX)) {
+        throw std::invalid_argument("image: over the size limit");
+    }
     const auto* p = reinterpret_cast<const stbi_uc*>(data.data());
     const int len = static_cast<int>(data.size());
     int w = 0, h = 0, comp = 0;
@@ -215,6 +231,8 @@ Rgb8 decode_image(std::span<const std::byte> data, const DecodeLimits& lim) {
     stbi_image_free(px);
     return out;
 }
+
+}  // namespace detail
 
 Rgb8 resize_bicubic(const Rgb8& in, std::uint32_t w, std::uint32_t h) {
     if (w == 0 || h == 0 || in.w == 0 || in.h == 0) {

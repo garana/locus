@@ -94,8 +94,8 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 ### Pending
 
 - Multimedia (#143): diffusion images (#146), video (#148), real-time
-  speech (#173), faster image input (#257), own PNG and JPEG decoders
-  in place of stb_image (#250).
+  speech (#173), faster image input (#257), an own JPEG decoder in
+  place of stb_image (#250; PNG already uses locus's decoder).
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
 - Multi-server inference, pipeline and expert parallel (#3, #24).

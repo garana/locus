@@ -23,15 +23,6 @@ const std::array<std::uint32_t, 256>& crc_table() {
     return t;
 }
 
-std::uint32_t crc32(std::span<const std::byte> d) {
-    std::uint32_t c = 0xFFFFFFFFu;
-    for (std::byte b : d) {
-        c = crc_table()[(c ^ std::to_integer<std::uint32_t>(b)) & 0xFFu] ^
-            (c >> 8);
-    }
-    return c ^ 0xFFFFFFFFu;
-}
-
 void put_be32(std::vector<std::byte>& o, std::uint32_t v) {
     for (int s = 24; s >= 0; s -= 8) {
         o.push_back(static_cast<std::byte>((v >> s) & 0xFFu));
@@ -49,6 +40,15 @@ void chunk(std::vector<std::byte>& o, const char* type,
 }
 
 }  // namespace
+
+std::uint32_t crc32(std::span<const std::byte> d) {
+    std::uint32_t c = 0xFFFFFFFFu;
+    for (std::byte b : d) {
+        c = crc_table()[(c ^ std::to_integer<std::uint32_t>(b)) & 0xFFu] ^
+            (c >> 8);
+    }
+    return c ^ 0xFFFFFFFFu;
+}
 
 std::vector<std::uint8_t> to_rgb8(std::span<const float> chw,
                                   std::uint32_t h, std::uint32_t w) {
