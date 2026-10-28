@@ -159,7 +159,7 @@ if(Vulkan_FOUND)
             attn_paged_q kv_store_q moe_route
             kv_scatter moe_group moe_combine attn_softmax sum_splits
             matvec_t_q8 attn_decode attn_combine attn_decode_grp matvec_q8_0_n
-            copy qk_norm_rope
+            copy qk_norm_rope bias_rows
             # Variants: <kernel>=<source>:<define>[,<define>...], the
             # source compiled again with -D<define> for each.
             matvec_b=matvec:BATCHED
@@ -206,6 +206,7 @@ if(Vulkan_FOUND)
             rope_neox_b=rope:BATCHED,NEOX
             matvec_q4_k_b=matvec_q4_k:BATCHED
             matvec_q6_k_b=matvec_q6_k:BATCHED
+            matvec_q5_0_b=matvec_q5_0:BATCHED
             matvec_q4_k_glu_b=matvec_q4_k:BATCHED,SWIGLU
             matvec_q4_k_seg=matvec_q4_k:SEGMENTS
             matmul_q4_k=matmul:TYPE_Q4K
@@ -216,6 +217,10 @@ if(Vulkan_FOUND)
             matmul_q6_k_small=matmul:TYPE_Q6K,BK16
             matmul_q4_k_id_small=matmul:TYPE_Q4K,MOE_ID,BK16
             matmul_q6_k_id_small=matmul:TYPE_Q6K,MOE_ID,BK16
+            matmul_q5_0=matmul:TYPE_Q5_0
+            matmul_q5_0_id=matmul:TYPE_Q5_0,MOE_ID
+            matmul_q5_0_small=matmul:TYPE_Q5_0,BK16
+            matmul_q5_0_id_small=matmul:TYPE_Q5_0,MOE_ID,BK16
             silu_mul_sg=silu_mul:SIG_GATE
             moe_route_b=moe_route:BATCHED
             matvec_bf16=matvec_f16:BF16

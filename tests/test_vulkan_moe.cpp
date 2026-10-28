@@ -266,12 +266,17 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
         std::size_t block_bytes;
         std::size_t d_off;  // f16 d inside the block (dmin follows)
         bool has_dmin;
+        std::uint32_t per;  // elements per block
     };
+    // Q5_0's 22-byte blocks put rows and odd experts off word
+    // alignment too.
     const KCase cases[] = {
         {locus::gguf::TensorType::kQ4_K, Kernel::kMatvecQ4_KB, 144, 0,
-         true},
+         true, 256},
         {locus::gguf::TensorType::kQ6_K, Kernel::kMatvecQ6_KB, 210, 208,
-         false},
+         false, 256},
+        {locus::gguf::TensorType::kQ5_0, Kernel::kMatvecQ5_0B, 22, 0,
+         false, 32},
     };
     std::vector<float> x(cols * slots);
     for (auto& v : x) {
@@ -287,7 +292,7 @@ TEST_CASE("vulkan batched k-quant matvecs cover routed and summed "
     for (const std::uint32_t x_off : {0u, 1u})
     for (const auto& c : cases) {
         INFO("type " << static_cast<int>(c.type) << " x_off " << x_off);
-        const std::size_t mat_bytes = rows * (cols / 256) * c.block_bytes;
+        const std::size_t mat_bytes = rows * (cols / c.per) * c.block_bytes;
         std::vector<std::byte> w(mat_bytes * n_mat);
         for (auto& b : w) {
             b = static_cast<std::byte>(byte_d(rng));
