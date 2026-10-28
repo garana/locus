@@ -23,6 +23,7 @@
 #include "locus/image/janus.hpp"
 #include "locus/image/janus_chat.hpp"
 #include "locus/image/janus_vision.hpp"
+#include "locus/image/pixart_pipeline.hpp"
 #include "locus/image/png.hpp"
 #include "locus/image/vq16.hpp"
 #include "locus/model/codec.hpp"
@@ -521,6 +522,10 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
                 janus_gguf_ = std::move(mg);
             }
         }
+    }
+    // A broken PixArt directory stops the server here too.
+    if (!opt_.image_model_dir.empty()) {
+        pixart_ = image::PixArtPipeline::load_dir(opt_.image_model_dir);
     }
     // Image input (i#241): on when the model's GGUF carries the Janus
     // vision tower. A tower that is present but broken stops the
@@ -2163,19 +2168,163 @@ void OpenAiServer::install_routes() {
             }
     };
 
+    // POST /v1/images/generations with the PixArt pipeline
+    // (--image-model): prompt -> T5 -> DiT and DPM-Solver++ with CFG ->
+    // VAE -> PNG, as b64_json. Extensions to the OpenAI shape:
+    // negative_prompt, steps (default 20), guidance_scale (default the
+    // GGUF's, 4.5) and seed. One image at a time, under image_mu_.
+    auto handle_pixart = [this](const http::Request& req,
+                                http::ServerResponse& res,
+                                const http::RequestContext& ctx) {
+            try {
+                const json body = json::parse(req.body);
+                auto str = [&](const char* k) -> std::string {
+                    if (!body.contains(k)) return {};
+                    if (!body[k].is_string()) {
+                        throw std::invalid_argument(std::string(k) +
+                                                    " must be a string");
+                    }
+                    return body[k].get<std::string>();
+                };
+                image::PixArtPipeline::Request p;
+                p.prompt = str("prompt");
+                if (p.prompt.empty()) {
+                    throw std::invalid_argument(
+                        "prompt must be a non-empty string");
+                }
+                p.negative_prompt = str("negative_prompt");
+                if (body.contains("n") &&
+                    (!body["n"].is_number_integer() ||
+                     body["n"].get<std::int64_t>() != 1)) {
+                    throw std::invalid_argument("n must be 1");
+                }
+                const std::uint32_t side = pixart_->image_size();
+                const std::string size =
+                    std::to_string(side) + "x" + std::to_string(side);
+                if (body.contains("size") && str("size") != size) {
+                    throw std::invalid_argument("size must be " + size);
+                }
+                if (body.contains("response_format") &&
+                    str("response_format") != "b64_json") {
+                    throw std::invalid_argument(
+                        "response_format must be b64_json");
+                }
+                if (body.contains("steps")) {
+                    if (!body["steps"].is_number_integer() ||
+                        body["steps"].get<std::int64_t>() < 1 ||
+                        body["steps"].get<std::int64_t>() > 100) {
+                        throw std::invalid_argument(
+                            "steps must be an integer from 1 to 100");
+                    }
+                    p.steps = static_cast<std::uint32_t>(
+                        body["steps"].get<std::int64_t>());
+                }
+                p.guidance = pixart_->default_guidance();
+                if (body.contains("guidance_scale")) {
+                    if (!body["guidance_scale"].is_number()) {
+                        throw std::invalid_argument(
+                            "guidance_scale must be a number");
+                    }
+                    // Checked as a double: a JSON value past float's range
+                    // would make the cast undefined.
+                    const double g = body["guidance_scale"].get<double>();
+                    if (!std::isfinite(g) || g < 0.0 || g > 100.0) {
+                        throw std::invalid_argument(
+                            "guidance_scale must be from 0 to 100");
+                    }
+                    p.guidance = static_cast<float>(g);
+                }
+                p.seed = std::random_device{}();
+                if (body.contains("seed")) {
+                    if (!body["seed"].is_number_integer()) {
+                        throw std::invalid_argument(
+                            "seed must be an integer");
+                    }
+                    p.seed = static_cast<std::uint64_t>(
+                        body["seed"].get<std::int64_t>());
+                }
+                // The image models run on a CPU backend (the CPU entries
+                // come first), whatever --backend picked for the LLM.
+                const auto& op = backend::best_backend().ops;
+                image::PixArtPipeline::Timing took;
+                std::vector<std::uint8_t> rgb;
+                {
+                    // An image takes minutes: a second request gets a
+                    // 503 instead of holding a server thread in a queue.
+                    std::unique_lock<std::mutex> lk(image_mu_,
+                                                    std::try_to_lock);
+                    if (!lk.owns_lock()) {
+                        res.status = 503;
+                        res.set_header("Retry-After", "60");
+                        res.set_content(
+                            make_error("an image is already being "
+                                       "generated; retry later")
+                                .dump(-1, ' ', false, kLossy),
+                            "application/json");
+                        return;
+                    }
+                    rgb = pixart_->generate(p, op, ctx.client_alive, &took);
+                }
+                if (rgb.empty()) {
+                    res.status = 499;  // the client went away
+                    return;
+                }
+                const auto png = image::encode_png(rgb, side, side);
+                res.set_header("X-Image-Seed", std::to_string(p.seed));
+                res.set_header(
+                    "Server-Timing",
+                    "encode;dur=" + std::to_string(took.encode) +
+                        ", denoise;dur=" + std::to_string(took.denoise) +
+                        ", decode;dur=" + std::to_string(took.decode));
+                const auto created =
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+                res.set_content(
+                    json{{"created", created},
+                         {"data", json::array({json{
+                                      {"b64_json",
+                                       http::base64_encode(png)}}})}}
+                        .dump(-1, ' ', false, kLossy),
+                    "application/json");
+            } catch (const std::exception& e) {
+                set_error(res, e);
+            }
+    };
+
     // POST /v1/images/generations (OpenAI shape): prompt -> Janus-Pro
     // image codes (CFG) -> VQ-16 pixels -> PNG, returned as b64_json.
     // 503 unless --image-decoder loaded a decoder AND the model is a
-    // Janus-Pro checkpoint. One image at a time, under image_mu_.
-    auto handle_images = [this](const http::Request& req,
-                                http::ServerResponse& res,
-                                const http::RequestContext& ctx) {
+    // Janus-Pro checkpoint, or --image-model loaded PixArt (then a
+    // request whose model starts with "pixart", or every request when
+    // Janus is not loaded, goes to handle_pixart). One image at a time,
+    // under image_mu_.
+    auto handle_images = [this, handle_pixart](
+                             const http::Request& req,
+                             http::ServerResponse& res,
+                             const http::RequestContext& ctx) {
             auth_event("create", "images.generations", ctx.identity);
+            if (pixart_) {
+                bool named = false;
+                try {
+                    const json b = json::parse(req.body);
+                    named = b.contains("model") && b["model"].is_string() &&
+                            b["model"].get<std::string>().rfind("pixart",
+                                                                0) == 0;
+                } catch (const std::exception&) {
+                    // handle_pixart reports the parse error
+                }
+                if (named || !vq16_ || !janus_) {
+                    handle_pixart(req, res, ctx);
+                    return;
+                }
+            }
             if (!vq16_ || !janus_) {
                 res.status = 503;
                 res.set_content(
                     make_error("image generation is not configured (needs "
-                               "--image-decoder and a Janus-Pro model)")
+                               "--image-decoder and a Janus-Pro model, or "
+                               "--image-model)")
                         .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;

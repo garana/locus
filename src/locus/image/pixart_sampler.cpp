@@ -152,12 +152,12 @@ void DpmSolverPP::step(std::span<const float> eps, std::span<float> x) {
     ++index_;
 }
 
-void pixart_denoise(const PixArtDit& dit, DpmSolverPP& sched,
+bool pixart_denoise(const PixArtDit& dit, DpmSolverPP& sched,
                     std::span<float> latent, std::span<const float> neg,
                     std::uint32_t n_neg, std::span<const float> pos,
                     std::uint32_t n_pos, float guidance,
                     const backend::Ops& op,
-                    const std::function<void(std::uint32_t)>& on_step) {
+                    const std::function<bool(std::uint32_t)>& keep_going) {
     const std::size_t plane = latent.size() / dit.in_channels();
     const std::size_t noise = plane * dit.in_channels();
     if (sched.index() != 0 || dit.out_channels() < dit.in_channels()) {
@@ -165,6 +165,9 @@ void pixart_denoise(const PixArtDit& dit, DpmSolverPP& sched,
     }
     std::vector<float> eps(noise);
     for (const std::int32_t t : sched.timesteps()) {
+        if (keep_going && !keep_going(sched.index())) {
+            return false;
+        }
         const float tf = static_cast<float>(t);
         const auto e0 = dit.forward(latent, tf, neg, n_neg, op);
         const auto e1 = dit.forward(latent, tf, pos, n_pos, op);
@@ -174,10 +177,9 @@ void pixart_denoise(const PixArtDit& dit, DpmSolverPP& sched,
             const float gd = guidance * d;
             eps[j] = e0[j] + gd;
         }
-        const std::uint32_t i = sched.index();
         sched.step(eps, latent);
-        if (on_step) on_step(i);
     }
+    return true;
 }
 
 }  // namespace locus::image

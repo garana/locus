@@ -37,7 +37,9 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Speech:** `/v1/audio/speech` with Orpheus-TTS and the SNAC codec;
   24 kHz WAV or PCM, whole or streamed.
 - **Image output:** `/v1/images/generations` with Janus-Pro-1B and
-  the VQ-16 decoder; one 384 x 384 PNG.
+  the VQ-16 decoder (one 384 x 384 PNG), or with PixArt-alpha 512
+  (T5-XXL encoder, DiT, DPM-Solver++, SD VAE; one 512 x 512 PNG, on
+  the CPU for now).
 - **Image input:** PNG and JPEG in chat requests (OpenAI `image_url`
   data URLs, Anthropic image blocks) with Janus-Pro-1B.
 - **Tools:** `locus-server`; `locus-run` (one prompt); `locus-gguf`
@@ -72,6 +74,7 @@ logit, for prompts where greedy decoding tips at a near-tie.
 | DeepSeek-V4.1-Flash-1017      | deepseek41 | UD-IQ1_S, 233 GB | teacher-forced, against llama.cpp#30817            |
 | Orpheus-TTS 3B                | llama      | Q4_K_M           | first audio frame teacher-forced; SNAC RMS < 1e-6  |
 | Janus-Pro-1B                  | llama      | BF16             | 576 image codes exact; vision tower RMS < 1e-4 rel |
+| PixArt-XL-2-512x512           | pixart     | F32, T5 F16      | each stage vs diffusers; 8-step latent RMS 9e-5    |
 
 Two goldens run with f32 activations, because 8-bit activations tip
 their greedy text at a near-tie: Qwen1.5-MoE and DeepSeek-V2-Lite.
@@ -94,7 +97,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 
 ### Pending
 
-- Multimedia (#143): diffusion images (#146), video (#148), real-time
+- Multimedia (#143): diffusion image speed (#146), video (#148), real-time
   speech (#173), faster image input (#257).
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
@@ -122,7 +125,10 @@ heavy also need `LOCUS_HEAVY_TESTS=1`.
 `locus-server --help` lists the options and environment variables;
 `--capabilities` lists the architectures, backends, weight formats
 and tokenizers of the build. Speech needs `--audio-decoder
-<snac.gguf>`, image generation `--image-decoder <vq16.gguf>`.
+<snac.gguf>`, image generation `--image-decoder <vq16.gguf>` (Janus)
+or `--image-model <dir>` (PixArt: a directory with the GGUFs from
+`scripts/convert-t5-encoder.py`, `convert-pixart.py` and
+`convert-sd-vae.py`).
 
 ## Backends
 
