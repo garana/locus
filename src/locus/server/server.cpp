@@ -693,7 +693,11 @@ void OpenAiServer::vision_chat(bool anthropic, const VisionChat& chat,
             }
         }
         if (model_.supports_batch_prefill()) {
-            const std::size_t chunk = model_.prefill_chunk();
+            // At most 64 positions between client checks: on vulkan a
+            // chunk with embeddings runs one GPU forward per position,
+            // so its 512-token prefill_chunk would check almost never.
+            const std::size_t chunk =
+                std::min<std::size_t>(model_.prefill_chunk(), 64);
             for (std::size_t at = 0; at < ids.size(); at += chunk) {
                 if (!alive()) {
                     res.status = 499;
