@@ -1357,7 +1357,6 @@ bool VulkanContext::batch_open() const { return impl_->batch_is_open; }
 
 void VulkanContext::begin_batch() {
     Impl& im = *impl_;
-    im.batch_is_open = true;
     VkCommandBufferAllocateInfo cba{};
     cba.sType =
         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -1379,6 +1378,9 @@ void VulkanContext::begin_batch() {
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                             im.qpool, 0);
     }
+    // Open only once the command buffer exists and recording began: a
+    // throw above leaves no batch (and no BatchScope) behind.
+    im.batch_is_open = true;
 }
 
 void VulkanContext::dispatch(Kernel k,
@@ -1466,7 +1468,10 @@ void VulkanContext::dispatch(Kernel k,
 
 void VulkanContext::end_batch() {
     Impl& im = *impl_;
-    // Closed from here on, even if submit or wait throws below.
+    // Closed from here on, even if submit or wait throws below. If the
+    // submit succeeds and the wait fails (device lost), work may still
+    // be in flight and the command buffer is not freed; that process
+    // does not recover or unload cleanly anyway.
     im.batch_is_open = false;
     using clock = std::chrono::steady_clock;
     const bool prof = im.qpool != VK_NULL_HANDLE;
