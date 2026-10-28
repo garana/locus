@@ -1500,7 +1500,7 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
         }
         return;
     }
-    for_row_slices(op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+    const auto per_token = [&](std::uint32_t r0, std::uint32_t r1) {
         const Mat sub = backend::mat_rows(w, r0, r1 - r0);
         for (std::uint32_t t = 0; t < n; ++t) {
             op.matvec(
@@ -1511,7 +1511,14 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
                     static_cast<std::size_t>(t) * oc + r0,
                     r1 - r0));
         }
-    });
+    };
+    // for_row_slices splits on mt_safe alone (it also fans out CPU
+    // dequant work); backend calls follow splits_rows.
+    if (backend::splits_rows(op)) {
+        for_row_slices(op, oc, per_token);
+    } else {
+        per_token(0u, oc);
+    }
 }
 
 std::vector<std::pair<std::uint32_t, float>> moe_select(
