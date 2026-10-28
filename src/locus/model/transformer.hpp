@@ -431,13 +431,19 @@ class TransformerModel {
      *     n * n_vocab (one per position, in order) when all_logits.
      * @param all_logits Emit every position's logits (speculative
      *     verify) instead of only the last (prefill).
+     * @param embd Empty, or one entry per token: nullptr to embed the
+     *     token, or n_embd floats used instead of its row (Janus image
+     *     slots, as forward_layers' input embedding; that token is
+     *     ignored). With any embedding on the Vulkan backend the chunk
+     *     runs one forward_embedding per position (on the GPU).
      * @throws std::invalid_argument on misuse or unsupported arch.
      */
     void forward_batch(std::span<const tok::TokenId> tokens,
                        kv::PagedKvCache& cache,
                        kv::PagedKvCache::Seq& seq, Workspace& ws,
                        std::span<float> logits,
-                       bool all_logits = false) const;
+                       bool all_logits = false,
+                       std::span<const float* const> embd = {}) const;
 
     /** @returns true when the batched forwards support this model
      * (every CPU/CUDA backend + arch; Vulkan opts out). */
