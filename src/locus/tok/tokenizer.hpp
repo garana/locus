@@ -49,7 +49,8 @@ class Tokenizer {
 
 /**
  * Builds the right tokenizer for a model file, dispatching on
- * `tokenizer.ggml.model` ("llama" -> SPM, "gpt2" -> BPE).
+ * `tokenizer.ggml.model` ("llama" -> SPM, "gpt2" -> BPE, "t5" ->
+ * unigram).
  *
  * @throws gguf::Error on unknown tokenizer families.
  */

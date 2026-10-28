@@ -76,6 +76,7 @@ add_library(locus
     src/locus/sys/perf_counters.cpp
     src/locus/tok/bpe_tokenizer.cpp
     src/locus/tok/tokenizer.cpp
+    src/locus/tok/ugm_tokenizer.cpp
 )
 target_include_directories(locus SYSTEM PRIVATE
     third_party/ggml
