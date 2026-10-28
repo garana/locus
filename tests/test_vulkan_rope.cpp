@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <bit>
 #include <random>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -151,5 +153,101 @@ TEST_CASE("vulkan rope matches the CPU across the pair stride",
         }
         ctx.destroy_buffer(xb);
         ctx.destroy_buffer(fb);
+    }
+}
+
+// The norm must match bit for bit (pos 0: rope is the identity). The
+// roped values only to 1e-3: Metal fast math may evaluate pow/sin/cos
+// differently in two shaders, about 1e-4 apart at the ~1000 rad angles
+// of pos 1234 (seen on M2).
+TEST_CASE("vulkan qk_norm_rope matches rmsnorm_b then rope", "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(89);
+    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+    std::uniform_real_distribution<float> fd(0.5f, 4.0f);
+    const float eps = 1e-6f, base = 1000000.0f;
+
+    // 5 q heads at offset 3 of Q, 2 k heads at offset 7 of K; head
+    // dims from one pair per thread up to a strided second pass.
+    for (const std::uint32_t hd : {64u, 128u, 512u}) {
+        const std::uint32_t nq = 5, nk = 2, q_off = 3, k_off = 7;
+        std::vector<float> q(q_off + nq * hd), k(k_off + nk * hd + 5);
+        std::vector<float> qw(hd), kw(hd), div(hd / 2);
+        for (auto* v : {&q, &k, &qw, &kw}) {
+            for (auto& e : *v) {
+                e = dist(rng);
+            }
+        }
+        for (auto& e : div) {
+            e = fd(rng);
+        }
+        for (const auto& [neox, pos] :
+             {std::pair{false, 0u}, std::pair{false, 1234u},
+              std::pair{true, 0u}, std::pair{true, 1234u}}) {
+            DYNAMIC_SECTION("head dim " << hd
+                                        << (neox ? " neox" : " interleaved")
+                                        << " pos " << pos) {
+                auto fb = upload(ctx, div);
+                auto qwb = upload(ctx, qw);
+                auto kwb = upload(ctx, kw);
+                // Reference: rmsnorm_b over the heads, then rope.
+                auto qr = upload(ctx, q);
+                auto kr = upload(ctx, k);
+                const Kernel rk = neox ? Kernel::kRopeNeox : Kernel::kRope;
+                ctx.begin_batch();
+                for (const auto& [b, wb, off, n] :
+                     {std::tuple{qr, qwb, q_off, nq},
+                      std::tuple{kr, kwb, k_off, nk}}) {
+                    const VulkanContext::Buffer nb[] = {b, wb, b};
+                    const std::uint32_t np[] = {hd, fbits(eps), off,
+                                                off, hd, hd};
+                    ctx.dispatch(Kernel::kRmsNormB, nb, np, 1, n);
+                    const VulkanContext::Buffer rb[] = {b, fb};
+                    const std::uint32_t rp[] = {n,           hd, pos, off,
+                                                hd, fbits(base),
+                                                fbits(1.0f), 0,   0};
+                    ctx.dispatch(rk, rb, rp, n);
+                }
+                ctx.end_batch();
+                // Fused.
+                auto qf = upload(ctx, q);
+                auto kf = upload(ctx, k);
+                ctx.begin_batch();
+                const VulkanContext::Buffer fbufs[] = {qf, kf, qwb, kwb,
+                                                       fb};
+                const std::uint32_t fp[] = {nq,    hd,          fbits(eps),
+                                            q_off, k_off,       pos,
+                                            fbits(base), neox ? 1u : 0u};
+                ctx.dispatch(Kernel::kQkNormRope, fbufs, fp, nq + nk);
+                ctx.end_batch();
+                const auto qwant = download(ctx, qr, q.size());
+                const auto kwant = download(ctx, kr, k.size());
+                const auto qgot = download(ctx, qf, q.size());
+                const auto kgot = download(ctx, kf, k.size());
+                const bool exact = pos == 0;
+                const auto check = [exact](const char* what,
+                                           const std::vector<float>& got,
+                                           const std::vector<float>& want) {
+                    for (std::size_t i = 0; i < got.size(); ++i) {
+                        INFO(what << " " << i);
+                        if (exact) {
+                            REQUIRE(fbits(got[i]) == fbits(want[i]));
+                        } else {
+                            REQUIRE(got[i] == Catch::Approx(want[i])
+                                                  .margin(1e-3)
+                                                  .epsilon(1e-3));
+                        }
+                    }
+                };
+                check("q", qgot, qwant);
+                check("k", kgot, kwant);
+                for (auto b : {fb, qwb, kwb, qr, kr, qf, kf}) {
+                    ctx.destroy_buffer(b);
+                }
+            }
+        }
     }
 }

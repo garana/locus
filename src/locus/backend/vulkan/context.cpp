@@ -213,6 +213,7 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matvec_f16_n2_spv.h"
 #include "matvec_bf16_n2_spv.h"
 #include "copy_spv.h"
+#include "qk_norm_rope_spv.h"
 #include "matvec_q4_k_seg_spv.h"
 #include "rope_neox_spv.h"
 #include "rope_neox_b_spv.h"
@@ -517,6 +518,8 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kMatvecBF16N2, "matvec_bf16_n2", locus_matvec_bf16_n2_spv,
      sizeof(locus_matvec_bf16_n2_spv), 3, 52},
     {Kernel::kCopy, "copy", locus_copy_spv, sizeof(locus_copy_spv), 2, 12},
+    {Kernel::kQkNormRope, "qk_norm_rope", locus_qk_norm_rope_spv,
+     sizeof(locus_qk_norm_rope_spv), 5, 32},
     {Kernel::kMatvecQ4_KSeg, "matvec_q4_k_seg", locus_matvec_q4_k_seg_spv,
      sizeof(locus_matvec_q4_k_seg_spv), 6, 44},
 };
