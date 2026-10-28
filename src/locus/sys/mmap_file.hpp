@@ -48,12 +48,18 @@ class MappedFile {
  */
 bool in_file_mapping(const void* p, std::size_t n);
 
+/** A function MappedFile calls with its range before unmapping it. */
+using UnmapHook = void (*)(const void* p, std::size_t n);
+
 /**
  * Sets the function each MappedFile calls with its range just before
- * unmapping it (the Vulkan backend drops the GPU buffers that import
- * those pages, #317). One slot; nullptr clears it. Thread-safe.
+ * unmapping it (the Vulkan backend drops the GPU buffers over those
+ * pages, #317). One slot; nullptr clears it. Thread-safe. A caller
+ * that sets it temporarily must put back the hook this returns, or
+ * the backend's is lost for the rest of the process (i#331).
+ * @returns The hook it replaces.
  */
-void set_unmap_hook(void (*hook)(const void* p, std::size_t n));
+UnmapHook set_unmap_hook(UnmapHook hook);
 
 /**
  * Asks the OS to start faulting in [p, p+n) asynchronously
