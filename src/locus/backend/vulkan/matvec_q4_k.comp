@@ -6,10 +6,13 @@
 // 32 elements 64j + 32h .. of the block, from bytes 32j .. 32j + 31.
 //
 // Eight rows per workgroup, 16 lanes per row: lanes stride over the
-// row's 32-element sub-blocks (word loads of their 32 nibble bytes,
-// decoded two at a time through an f16 mantissa; vec4 activation
-// loads), each adding d*sc*sum(q*x) - dmin*m*sum(x), and a
-// shared-memory tree reduces the row.
+// row's sub-block pairs 2j, 2j + 1, which share their 32 nibble bytes
+// (low and high nibbles), so each byte is loaded once. A lane reads
+// the block header (d, dmin, scales) and its nibbles as three 16-byte
+// loads when the slot's weights start 16-byte aligned (word loads
+// otherwise), decodes nibbles two at a time through an f16 mantissa,
+// loads activations as vec4s, and adds d*sc*sum(q*x) - dmin*m*sum(x)
+// per sub-block; a shared-memory tree reduces the row.
 //
 // Compiled again with -DBATCHED (matvec_q4_k_b): slots as in
 // matvec_q8_0.comp -- slot y reads w_off + id * w_stride (bytes) and
@@ -29,6 +32,9 @@
 layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
+// The same weights as 16-byte quads, read when the slot's byte offset
+// is a multiple of 16 (blocks are 144 bytes, so every block is then).
+layout(std430, binding = 0) readonly buffer W4 { uvec4 w4[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
 // The same activations as vec4s (one load for four weights) when the
 // slot's base is 16-byte aligned. An element offset divisible by 4 is
@@ -41,6 +47,7 @@ layout(std430, binding = 3) readonly buffer R { uint route[]; };
 #endif
 #ifdef SWIGLU
 layout(std430, binding = 4) readonly buffer WU { uint wu[]; };
+layout(std430, binding = 4) readonly buffer WU4 { uvec4 wu4[]; };
 #endif
 
 layout(push_constant) uniform PC {
@@ -80,6 +87,15 @@ uint wword(uint i, bool up) {
 #endif
 }
 
+/** The 16 bytes at byte offset b, b % 16 == 0. */
+uvec4 wquad(uint b, bool up) {
+#ifdef SWIGLU
+    return up ? wu4[b >> 4] : w4[b >> 4];
+#else
+    return w4[b >> 4];
+#endif
+}
+
 /** The 4 bytes at byte offset b (any alignment). */
 uint word_at(uint b, bool up) {
     uint i = b >> 2;
@@ -115,44 +131,67 @@ void scale_min(uint j, uint s0, uint s1, uint s2, out float d,
     }
 }
 
+/** sum(q * x) and sum(x) over 4 nibbles of v at shift sh. */
+void nib4(uint v, uint sh, vec4 xv, inout float sq, inout float sx) {
+    // Two nibbles at a time: each lands in the mantissa of an f16
+    // 1024 + n (exact), so one unpack yields two values.
+    vec2 n02 = unpackHalf2x16(((v >> sh) & 0x000f000fu) | 0x64006400u);
+    vec2 n13 =
+        unpackHalf2x16(((v >> (sh + 8u)) & 0x000f000fu) | 0x64006400u);
+    vec4 qv = vec4(n02.x, n13.x, n02.y, n13.y) - 1024.0;
+    sq += dot(qv, xv);
+    sx += xv.x + xv.y + xv.z + xv.w;
+}
+
+/** Activations xk .. xk + 3, one vec4 load when xal. */
+vec4 xload(uint xk, bool xal) {
+    return xal ? x4[xk >> 2]
+               : vec4(x[xk], x[xk + 1u], x[xk + 2u], x[xk + 3u]);
+}
+
 /**
  * This lane's share of dot(row r of the matrix at wbase, x): per
- * 32-element sub-block, one word for d / dmin, three for the scales,
- * eight for the nibbles, and eight vec4 activation loads.
+ * sub-block pair, the 16-byte header, 32 nibble bytes and 16 vec4
+ * activation loads.
  */
 float row_part(uint wbase, uint xbase, uint r, uint lane, bool up) {
     uint nb = pc.cols / 256u;
     uint rb = wbase + r * nb * 144u;
     bool xal = (xbase & 3u) == 0u;
+    bool wal = (wbase & 15u) == 0u;
     float acc = 0.0;
-    for (uint u = lane; u < nb * 8u; u += LANES) {
-        uint b = u >> 3;
-        uint s = u & 7u;          // sub-block 2j + h
-        uint j = s >> 1;
-        uint sh = (s & 1u) * 4u;  // nibble shift
+    for (uint u = lane; u < nb * 4u; u += LANES) {
+        uint b = u >> 2;
+        uint j = u & 3u;
         uint at = rb + b * 144u;
-        vec2 dm = unpackHalf2x16(word_at(at, up));
-        float sc, mn;
-        scale_min(s, word_at(at + 4u, up), word_at(at + 8u, up),
-                  word_at(at + 12u, up), sc, mn);
         uint q = at + 16u + j * 32u;
-        uint xi = xbase + b * 256u + j * 64u + (s & 1u) * 32u;
-        float sq = 0.0, sx = 0.0;
-        for (uint k = 0u; k < 8u; ++k) {
-            uint v = word_at(q + k * 4u, up) >> sh;
-            uint xk = xi + k * 4u;
-            vec4 xv = xal ? x4[xk >> 2]
-                          : vec4(x[xk], x[xk + 1u], x[xk + 2u], x[xk + 3u]);
-            // Two nibbles at a time: each lands in the mantissa of an
-            // f16 1024 + n (exact), so one unpack yields two values.
-            vec2 n02 = unpackHalf2x16((v & 0x000f000fu) | 0x64006400u);
-            vec2 n13 =
-                unpackHalf2x16(((v >> 8u) & 0x000f000fu) | 0x64006400u);
-            vec4 qv = vec4(n02.x, n13.x, n02.y, n13.y) - 1024.0;
-            sq += dot(qv, xv);
-            sx += xv.x + xv.y + xv.z + xv.w;
+        uvec4 hd, qa, qb;
+        if (wal) {
+            hd = wquad(at, up);
+            qa = wquad(q, up);
+            qb = wquad(q + 16u, up);
+        } else {
+            hd = uvec4(word_at(at, up), word_at(at + 4u, up),
+                       word_at(at + 8u, up), word_at(at + 12u, up));
+            qa = uvec4(word_at(q, up), word_at(q + 4u, up),
+                       word_at(q + 8u, up), word_at(q + 12u, up));
+            qb = uvec4(word_at(q + 16u, up), word_at(q + 20u, up),
+                       word_at(q + 24u, up), word_at(q + 28u, up));
         }
-        acc += dm.x * sc * sq - dm.y * mn * sx;
+        vec2 dm = unpackHalf2x16(hd.x);
+        float sc0, mn0, sc1, mn1;
+        scale_min(2u * j, hd.y, hd.z, hd.w, sc0, mn0);
+        scale_min(2u * j + 1u, hd.y, hd.z, hd.w, sc1, mn1);
+        uint xi = xbase + b * 256u + j * 64u;
+        float sq0 = 0.0, sx0 = 0.0, sq1 = 0.0, sx1 = 0.0;
+        for (uint k = 0u; k < 8u; ++k) {
+            uint v = k < 4u ? qa[k] : qb[k - 4u];
+            uint xk = xi + k * 4u;
+            nib4(v, 0u, xload(xk, xal), sq0, sx0);
+            nib4(v, 4u, xload(xk + 32u, xal), sq1, sx1);
+        }
+        acc += dm.x * sc0 * sq0 - dm.y * mn0 * sx0;
+        acc += dm.x * sc1 * sq1 - dm.y * mn1 * sx1;
     }
     return acc;
 }
