@@ -205,6 +205,16 @@ void main() {
     // threads busy and are summed through red4.
     uint n4 = pc.dv / 4u;
     uint hps = (nh * n4 + WG - 1u) / WG;
+#ifdef HG8
+    // When one head per thread already fills the workgroup (nh * dv/4
+    // >= WG, e.g. 8 heads of 128), take all heads per thread with the
+    // positions sliced instead: each V vec4 is then loaded once for
+    // every head, not once per head. Smaller shapes keep the
+    // head-per-thread split, which already slices positions.
+    if (nh * n4 >= WG && nh <= HACC) {
+        hps = nh;
+    }
+#endif
     uint hsets = (nh + hps - 1u) / hps;
     uint used = n4 * hsets;
     uint nsl = max(WG / used, 1u);
@@ -217,7 +227,16 @@ void main() {
         acc[j] = vec4(0.0);
     }
     uint vbase = pc.v_off + kvh * pc.kv_stride + d4 * 4u;
-    if (on) {
+    if (on && hps == 1u) {
+        // One head per thread (every GQA group of 8 or fewer at
+        // dv <= 128): only acc[0] is live, so skip the other HACC - 1
+        // multiply-adds the general loop computes and discards. The
+        // same operations on acc[0], so the same bits.
+        uint hh = min(hs, HG - 1u);
+        for (uint p = sl; p < np; p += nsl) {
+            acc[0] += sc[hh * CH + p] * kv4_at(rowb[p] + vbase);
+        }
+    } else if (on) {
         // Constant trip counts (guards inside) keep acc in registers.
         for (uint p = sl; p < np; p += nsl) {
             vec4 v = kv4_at(rowb[p] + vbase);
@@ -228,12 +247,18 @@ void main() {
         }
     }
     if (nsl > 1u) {
-        red4[t] = acc[0];
-        barrier();
-        if (on && sl == 0u) {
-            for (uint k = 1u; k < nsl; ++k) {
-                acc[0] += red4[k * used + t];
+        for (uint j = 0u; j < HACC; ++j) {
+            if (j >= hps) {
+                break;
             }
+            red4[t] = acc[j];
+            barrier();
+            if (on && sl == 0u) {
+                for (uint k = 1u; k < nsl; ++k) {
+                    acc[j] += red4[k * used + t];
+                }
+            }
+            barrier();
         }
     }
     if (!on || sl != 0u) {

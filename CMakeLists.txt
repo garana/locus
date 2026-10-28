@@ -62,6 +62,7 @@ add_library(locus
     src/locus/server/errors.cpp
     src/locus/server/server.cpp
     src/locus/server/metrics_text.cpp
+    src/locus/server/responses.cpp
     src/locus/server/tools.cpp
     src/locus/http/base64.cpp
     src/locus/http/http.cpp
@@ -161,7 +162,7 @@ if(Vulkan_FOUND)
             attn_paged_q kv_store_q moe_route
             kv_scatter moe_group moe_combine attn_softmax sum_splits
             matvec_t_q8 attn_decode attn_combine attn_decode_grp matvec_q8_0_n
-            copy
+            copy qk_norm_rope
             # Variants: <kernel>=<source>:<define>[,<define>...], the
             # source compiled again with -D<define> for each.
             matvec_b=matvec:BATCHED

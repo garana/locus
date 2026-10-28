@@ -501,6 +501,65 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(!text.empty());
     }
 
+    SECTION("responses: the stream carries the buffered reply") {
+        // Greedy, so the streamed deltas must rebuild the same text the
+        // non-streamed response returns, and both end the same way.
+        json req{{"instructions", "Tell a story."},
+                 {"input", "Once upon a time"},
+                 {"max_output_tokens", 8}};
+        auto plain = client.Post("/v1/responses", req.dump(),
+                                 "application/json");
+        REQUIRE(plain);
+        REQUIRE(plain->status == 200);
+        const auto body = json::parse(plain->body);
+        REQUIRE(body["object"] == "response");
+        REQUIRE(body["output"].size() == 1);
+        const auto& item = body["output"][0];
+        REQUIRE(item["type"] == "message");
+        const std::string text =
+            item["content"][0]["text"].get<std::string>();
+        REQUIRE(!text.empty());
+        REQUIRE(body["usage"]["output_tokens"].get<int>() > 0);
+        REQUIRE(body["usage"]["input_tokens"].get<int>() > 0);
+        const std::string status = body["status"].get<std::string>();
+
+        req["stream"] = true;
+        auto res = client.Post("/v1/responses", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        REQUIRE(res->get_header_value("Content-Type") ==
+                "text/event-stream");
+        const std::string& sse = res->body;
+        REQUIRE(sse.find("event: response.created\n") == 0);
+        std::string streamed, last;
+        std::size_t at = 0;
+        const std::string dp = "data: ";
+        while ((at = sse.find(dp, at)) != std::string::npos) {
+            at += dp.size();
+            const std::size_t end = sse.find("\n\n", at);
+            const auto j = json::parse(sse.substr(at, end - at));
+            last = j["type"].get<std::string>();
+            if (last == "response.output_text.delta") {
+                streamed += j["delta"].get<std::string>();
+            }
+            at = end;
+        }
+        REQUIRE(streamed == text);
+        REQUIRE(last == "response." + status);
+    }
+
+    SECTION("responses: previous_response_id is a 400") {
+        json req{{"input", "hi"}, {"previous_response_id", "resp_0"}};
+        auto res = client.Post("/v1/responses", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 400);
+        REQUIRE(json::parse(res->body)["error"]["message"]
+                    .get<std::string>()
+                    .find("previous_response_id") != std::string::npos);
+    }
+
     SECTION("completions, streaming SSE") {
         json req{{"prompt", "Once upon a time"},
                  {"max_tokens", 8},

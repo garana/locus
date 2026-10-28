@@ -38,6 +38,33 @@ TEST_CASE("template family detection", "[chat]") {
                 .family() == Family::kDeepSeek);
     REQUIRE(detect("something else").family() == Family::kPlain);
 
+    // DeepSeek-Coder-V2-Lite-Instruct's tokenizer.chat_template.
+    const std::string_view v2 =
+        R"({% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{{ bos_token }}{% for message in messages %}{% if message['role'] == 'user' %}{{ 'User: ' + message['content'] + '
+
+' }}{% elif message['role'] == 'assistant' %}{{ 'Assistant: ' + message['content'] + eos_token }}{% elif message['role'] == 'system' %}{{ message['content'] + '
+
+' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %})";
+    REQUIRE(detect(v2).family() == Family::kDeepSeek2);
+
+    // deepseek-coder-33b-instruct's chat_template (the loop part).
+    const std::string_view coder = R"({%- for message in messages %}
+    {%- if message['role'] == 'system' %}
+{{ message['content'] }}
+    {%- else %}
+        {%- if message['role'] == 'user' %}
+{{'### Instruction:\n' + message['content'] + '\n'}}
+        {%- else %}
+{{'### Response:\n' + message['content'] + '\n<|EOT|>\n'}}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{% if add_generation_prompt %}
+{{'### Response:'}}
+{% endif %})";
+    REQUIRE(detect(coder).family() == Family::kDeepSeekCoder);
+    REQUIRE(detect(coder).name() == "deepseek-coder");
+
     GgufBuilder none;
     none.header(0, 0);
     auto g = locus::gguf::GgufFile::parse(none.bytes());
@@ -77,6 +104,40 @@ TEST_CASE("template rendering", "[chat]") {
         const std::vector<Message> msgs = {{"user", "a"},
                                            {"assistant", "b"}};
         REQUIRE(t.apply(msgs) == "a\nb");
+    }
+    // Expected strings are llama.cpp's llama_chat_apply_template
+    // output (deepseek3 / deepseek2) for the same four messages.
+    const std::vector<Message> multi = {{"system", "sys"},
+                                        {"user", "hi"},
+                                        {"assistant", "ok"},
+                                        {"user", "again"}};
+    SECTION("deepseek (V3 markers)") {
+        ChatTemplate t(Family::kDeepSeek);
+        REQUIRE(t.apply(multi) ==
+                "sys\n\n"
+                "<\xef\xbd\x9cUser\xef\xbd\x9c>hi"
+                "<\xef\xbd\x9c" "Assistant\xef\xbd\x9c>ok"
+                "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81"
+                "sentence\xef\xbd\x9c>"
+                "<\xef\xbd\x9cUser\xef\xbd\x9c>again"
+                "<\xef\xbd\x9c" "Assistant\xef\xbd\x9c>");
+    }
+    SECTION("deepseek2") {
+        ChatTemplate t(Family::kDeepSeek2);
+        REQUIRE(t.apply(multi) ==
+                "sys\n\nUser: hi\n\nAssistant: ok"
+                "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81"
+                "sentence\xef\xbd\x9c>"
+                "User: again\n\nAssistant:");
+    }
+    SECTION("deepseek-coder (V1)") {
+        ChatTemplate t(Family::kDeepSeekCoder);
+        REQUIRE(t.apply(multi) ==
+                "sys"
+                "### Instruction:\nhi\n"
+                "### Response:\nok\n<|EOT|>\n"
+                "### Instruction:\nagain\n"
+                "### Response:\n");
     }
 }
 

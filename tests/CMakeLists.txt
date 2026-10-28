@@ -49,6 +49,7 @@ add_executable(locus_tests
     test_http_server.cpp
     test_sampling.cpp
     test_speculative.cpp
+    test_responses.cpp
     test_server.cpp
     test_server_errors.cpp
     test_tools.cpp

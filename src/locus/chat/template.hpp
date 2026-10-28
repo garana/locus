@@ -34,7 +34,9 @@ class ChatTemplate {
         kLlama3,    // <|start_header_id|>...<|eot_id|>
         kChatML,    // <|im_start|>...<|im_end|> (Qwen and kin)
         kZephyr,    // <|user|> ... </s> (TinyLlama-chat)
-        kDeepSeek,  // <U+FF5C>User/Assistant markers
+        kDeepSeek,  // <<U+FF5C>User<U+FF5C>> markers (DeepSeek-V3)
+        kDeepSeek2, // "User: " / "Assistant: " (DeepSeek-V2)
+        kDeepSeekCoder,  // "### Instruction:" / <|EOT|> (Coder V1)
     };
 
     ChatTemplate() = default;

@@ -145,4 +145,29 @@ const Backend& resolve_backend(std::string_view choice) {
     return *b;
 }
 
+bool backend_defaulted(std::string_view choice) {
+    const char* env = std::getenv("LOCUS_BACKEND");
+    return choice.empty() && (env == nullptr || *env == '\0');
+}
+
+std::string gpu_idle_warning(bool defaulted, const Backend& picked,
+                             std::span<const Backend> list) {
+    auto is_gpu = [](std::string_view name) {
+        return name == "vulkan" || name == "cuda";
+    };
+    if (!defaulted || is_gpu(picked.name)) {
+        return {};
+    }
+    for (const Backend& b : list) {
+        if (is_gpu(b.name) && b.available && b.selectable) {
+            const std::string gpu(b.name);
+            return "warning: running on the CPU (" +
+                   std::string(picked.name) +
+                   ") by default; a GPU is usable: pass --backend " +
+                   gpu + " (or set LOCUS_BACKEND=" + gpu + ")";
+        }
+    }
+    return {};
+}
+
 }  // namespace locus::backend

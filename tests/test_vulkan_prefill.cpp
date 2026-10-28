@@ -735,6 +735,7 @@ TEST_CASE("bench: vulkan k-quant matvec bandwidth", "[.][bench][vulkan]") {
           Case{q6, Kernel::kMatvecQ6_K, "q6_k", 2048, 768},
           Case{q4, Kernel::kMatvecQ4_K, "q4_k", 4096, 2048},
           Case{q4, Kernel::kMatvecQ4_K, "q4_k", 2048, 4096},
+          Case{q4, Kernel::kMatvecQ4_K, "q4_k", 16384, 4096},
           Case{q6, Kernel::kMatvecQ6_K, "q6_k", 151936, 2048}}) {
         const auto w = random_kq(c.type, c.rows, c.cols, rng);
         const auto x = random_f32(c.cols, rng);

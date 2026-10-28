@@ -27,7 +27,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Serving:** continuous batching; a paged KV cache with
   copy-on-write prefix sharing; f32, f16, q8 or q4 KV.
 - **API:** `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
-  `/v1/embeddings`, `/v1/models`, `/metrics`, `/health`.
+  `/v1/responses` (stateless), `/v1/embeddings`, `/v1/models`,
+  `/metrics`, `/health`.
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
   penalties, seed), JSON mode, prompt caching, logprobs, prompt-lookup
   speculative decoding.

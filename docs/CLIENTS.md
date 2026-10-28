@@ -16,11 +16,13 @@ own docs.
 | POST /v1/audio/speech         | OpenAI    | Orpheus-TTS; needs `--audio-decoder`        |
 | POST /v1/images/generations   | OpenAI    | Janus-Pro; needs `--image-decoder`          |
 | POST /v1/messages             | Anthropic | Messages API, SSE stream, tools, images     |
+| POST /v1/responses            | OpenAI    | Responses API, stateless, SSE stream, tools |
 | GET  /health                  |           | liveness                                    |
 | GET  /metrics                 |           | Prometheus text                             |
 
-Both chat endpoints accept a `tools` list and return structured tool
-calls (OpenAI `tool_calls`, Anthropic `tool_use`), streamed or not.
+The chat endpoints and `/v1/responses` accept a `tools` list and
+return structured tool calls (OpenAI `tool_calls`, Anthropic
+`tool_use`, Responses `function_call` items), streamed or not.
 The OpenAI paths also support `logprobs`, `response_format:
 json_object` (constrained decoding) and `usage` accounting.
 
@@ -52,6 +54,27 @@ Any API key is accepted (see Auth below).
   prompt and tool list), so start the server with `--ctx 32768` or
   more.
 
+### OpenAI Codex
+
+Codex speaks only the Responses API. Add a provider to
+`~/.codex/config.toml`:
+
+    model_provider = "locus"
+    model = "<the model name locus reports>"
+
+    [model_providers.locus]
+    name = "locus"
+    base_url = "http://host:port/v1"
+    wire_api = "responses"
+
+Its first request is about 22k tokens (developer prompt and a long
+tool list), so start the server with `--ctx 40960` or more, and use a
+model that calls tools well. Codex sets no output limit and treats a
+reply cut at the server's cap as an error, so raise the cap too
+(`--max-tokens 8192`). Codex logs that it cannot decode the
+`/v1/models` reply (it expects its own catalog format) and then uses
+default model metadata; that is harmless.
+
 ### GitHub Copilot CLI (offline)
 
 Copilot CLI can target any OpenAI Chat Completions endpoint:
@@ -66,7 +89,7 @@ for local models.
 
 ## Agentic clients
 
-Agent CLIs (Copilot CLI, Claude Code, Aider) drive a tool loop, so
+Agent CLIs (Copilot CLI, Claude Code, Codex, Aider) drive a tool loop, so
 they need streaming and tool calling. locus recognizes a tool call
 only from the whole completion, so a streamed request with `tools` is
 buffered: the call (or the text) arrives in the final chunk, and the
@@ -92,6 +115,17 @@ calling. Reliable agent use therefore needs a capable instruct model.
 - Content arrays: on `/v1/chat/completions`, content may be a string
   or an array of parts (the OpenAI multimodal shape); text parts are
   joined with newlines. A part other than text or an image is a 400.
+- Responses API: stateless, so `previous_response_id` is a 400 (send
+  the whole conversation, as Codex does). `instructions` and every
+  system or `developer` message join one leading system message;
+  `function_call` and `function_call_output` items go back to the
+  model as its JSON call and a "Tool result" user turn (an image in a
+  tool's output becomes "[image omitted]"); reasoning and other
+  foreign items are skipped. Only function tools are offered; a tool
+  inside a `namespace` entry is shown to the model as
+  `<namespace>.<name>` and called back under its own name. Image and
+  file inputs from the user are a 400. With no `max_output_tokens`,
+  the server's output cap applies (`--max-tokens`, default 1024).
 - Chat formatting: the chat endpoints use the chat template the GGUF
   carries, matched to a known family (DESIGN.md 4.5); an unknown
   template falls back to plain concatenation.

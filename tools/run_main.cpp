@@ -86,8 +86,9 @@ int main(int argc, char** argv) {
     try {
         auto g = locus::gguf::GgufFile::open(model_path);
         auto model = locus::model::TransformerModel::load(g);
-        model.use_backend(
-            locus::backend::resolve_backend(args.choice));
+        const auto& backend =
+            locus::backend::resolve_backend(args.choice);
+        model.use_backend(backend);
         locus::backend::vulkan_set_prefill_f16(args.prefill_f16);
         auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
         auto& tok = *tok_ptr;
@@ -101,6 +102,11 @@ int main(int argc, char** argv) {
                          .c_str(),
                      hp.n_layers, hp.n_embd, hp.n_heads,
                      hp.n_kv_heads, hp.n_vocab);
+        const std::string gpu_warn = locus::backend::gpu_idle_warning(
+            locus::backend::backend_defaulted(args.choice), backend);
+        if (!gpu_warn.empty()) {
+            std::fprintf(stderr, "%s\n", gpu_warn.c_str());
+        }
 
         auto ids = tok.encode(prompt, true);
 
