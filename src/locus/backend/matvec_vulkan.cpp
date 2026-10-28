@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <bit>
 #include <cassert>
@@ -1352,6 +1353,24 @@ namespace {
  * fit the shaders' uint. LOCUS_VK_CPU_ROUTE=1 forces the
  * host-routed path.
  */
+/**
+ * Logs, once per reason, that vulkan_forward_batch declined: the
+ * caller then prefills one token at a time (i#321). Called under
+ * state_mu.
+ * @param why A string literal naming the reason.
+ * @returns false, for `return batch_declined(...)`.
+ */
+bool batch_declined(const char* why) {
+    static std::set<const char*> seen;
+    if (seen.insert(why).second) {
+        std::fprintf(stderr,
+                     "[vulkan] batched prefill off (%s): prompts "
+                     "prefill one token at a time\n",
+                     why);
+    }
+    return false;
+}
+
 bool gpu_route_ok(State& s, const model::TransformerModel& m,
                   const model::TransformerModel::Layer& lay) {
     const auto& hp = m.hparams();
@@ -1396,7 +1415,8 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
             std::fprintf(stderr,
                          "[vulkan] MoE experts (%llu MB) exceed 80%% of "
                          "available device memory (%llu MB): routing "
-                         "on the host\n",
+                         "on the host (a smaller --ctx or --kv-type "
+                         "f16 frees room)\n",
                          static_cast<unsigned long long>(experts >> 20),
                          static_cast<unsigned long long>(avail >> 20));
         }
@@ -2511,15 +2531,17 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const bool f16 = cache.geometry().kv_type == kv::KvType::kF16;
     const bool mla = hp.arch == model::Arch::kDeepseek2;
     // F16 is the one non-F32 pool the batched path reads.
-    if (n == 0 || (cache.quantized() && !f16) ||
-        !vulkan_forward_supported(m)) {
+    if (n == 0 || !vulkan_forward_supported(m)) {
         return false;
+    }
+    if (cache.quantized() && !f16) {
+        return batch_declined("quantized KV cache");
     }
     auto pool_it = s.kv_pools.find(
         f16 ? static_cast<const void*>(cache.qpool_data())
             : static_cast<const void*>(cache.pool_data()));
     if (pool_it == s.kv_pools.end()) {
-        return false;  // cache pool is not GPU-mapped
+        return batch_declined("KV pool not GPU-mapped");
     }
     const auto& geom = cache.geometry();
     const std::uint32_t kv_dim = geom.kv_dim;
@@ -2530,17 +2552,21 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const std::uint32_t qk = nope + rope_d;
     const std::uint32_t kvw = rank + rope_d;  // MLA latent row
     if (mla && kv_dim != kvw) {
-        return false;
+        return batch_declined("MLA cache row is not rank + rope");
     }
     // Routed experts need GPU routing (all experts resident) and an
     // id-matmul; moe_group handles up to 256 experts.
     for (const auto& lay : m.layers()) {
-        if (lay.is_moe() &&
-            (!gpu_route_ok(s, m, lay) || hp.n_expert > 256 ||
-             matmul_id_kernel(lay.gate_exps.base) == Kernel::kCount_ ||
-             matmul_id_kernel(lay.up_exps.base) == Kernel::kCount_ ||
-             matmul_id_kernel(lay.down_exps.base) == Kernel::kCount_)) {
-            return false;
+        if (!lay.is_moe()) {
+            continue;
+        }
+        if (!gpu_route_ok(s, m, lay) || hp.n_expert > 256) {
+            return batch_declined("MoE experts routed on the host");
+        }
+        if (matmul_id_kernel(lay.gate_exps.base) == Kernel::kCount_ ||
+            matmul_id_kernel(lay.up_exps.base) == Kernel::kCount_ ||
+            matmul_id_kernel(lay.down_exps.base) == Kernel::kCount_) {
+            return batch_declined("no expert matmul for a weight type");
         }
     }
     const std::uint32_t base = seq.n_tokens;
