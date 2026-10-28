@@ -47,6 +47,24 @@ TEST_CASE("template family detection", "[chat]") {
 ' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %})";
     REQUIRE(detect(v2).family() == Family::kDeepSeek2);
 
+    // deepseek-coder-33b-instruct's chat_template (the loop part).
+    const std::string_view coder = R"({%- for message in messages %}
+    {%- if message['role'] == 'system' %}
+{{ message['content'] }}
+    {%- else %}
+        {%- if message['role'] == 'user' %}
+{{'### Instruction:\n' + message['content'] + '\n'}}
+        {%- else %}
+{{'### Response:\n' + message['content'] + '\n<|EOT|>\n'}}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{% if add_generation_prompt %}
+{{'### Response:'}}
+{% endif %})";
+    REQUIRE(detect(coder).family() == Family::kDeepSeekCoder);
+    REQUIRE(detect(coder).name() == "deepseek-coder");
+
     GgufBuilder none;
     none.header(0, 0);
     auto g = locus::gguf::GgufFile::parse(none.bytes());
@@ -111,6 +129,15 @@ TEST_CASE("template rendering", "[chat]") {
                 "<\xef\xbd\x9c" "end\xe2\x96\x81of\xe2\x96\x81"
                 "sentence\xef\xbd\x9c>"
                 "User: again\n\nAssistant:");
+    }
+    SECTION("deepseek-coder (V1)") {
+        ChatTemplate t(Family::kDeepSeekCoder);
+        REQUIRE(t.apply(multi) ==
+                "sys"
+                "### Instruction:\nhi\n"
+                "### Response:\nok\n<|EOT|>\n"
+                "### Instruction:\nagain\n"
+                "### Response:\n");
     }
 }
 
