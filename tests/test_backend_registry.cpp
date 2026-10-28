@@ -627,6 +627,50 @@ TEST_CASE("cuda q4_k / q6_k matvec matches scalar across row blocks",
     }
 }
 
+// The Q8_0 kernel runs 4 rows (a warp each) per block, lane L taking
+// blocks L, L + 32, ...: cover partial and full row blocks, rows with
+// fewer blocks than lanes, and rows where lanes wrap to a second block.
+TEST_CASE("cuda q8_0 matvec matches scalar across row blocks",
+          "[backend]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    std::mt19937 rng(4343);
+    std::uniform_int_distribution<int> qd(-127, 127);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.02f);
+    for (std::uint32_t rows : {1u, 5u, 9u, 130u}) {
+        for (std::uint32_t cols : {64u, 1024u, 1312u, 2048u}) {
+            const std::size_t nblk =
+                static_cast<std::size_t>(rows) * (cols / 32);
+            std::vector<std::byte> w(nblk * 34);
+            for (std::size_t b = 0; b < nblk; ++b) {
+                std::byte* blk = w.data() + b * 34;
+                const std::uint16_t d = f32_to_f16(scale_d(rng));
+                std::memcpy(blk, &d, 2);
+                for (int i = 0; i < 32; ++i) {
+                    blk[2 + i] = static_cast<std::byte>(
+                        static_cast<std::int8_t>(qd(rng)));
+                }
+            }
+            std::vector<float> x(cols);
+            for (auto& v : x) {
+                v = dist(rng);
+            }
+            Mat m{locus::gguf::TensorType::kQ8_0, w.data(), rows, cols};
+            std::vector<float> a(rows), b(rows);
+            matvec(m, x, a);
+            cuda_pool_reset();
+            matvec_cuda(m, x, b);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                INFO("rows " << rows << " cols " << cols << " row " << r);
+                REQUIRE(b[r] ==
+                        Catch::Approx(a[r]).epsilon(1e-4).margin(1e-3));
+            }
+        }
+    }
+}
+
 // R16 ggml-parity: the CUDA Q8_K-activation dot must match the scalar
 // matvec_q8k bit-for-bit (same host quant, same accumulation order).
 TEST_CASE("cuda q8k matvec matches scalar q8k (all QK_K types)",
