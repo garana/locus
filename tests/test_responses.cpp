@@ -289,10 +289,13 @@ TEST_CASE("responses SSE: event order for text and for a tool call",
     SECTION("live text") {
         ResponsesSse sse;
         r.text = "ab";
-        const std::string s = sse.start(r) + sse.message_open(r) +
-                              sse.text_delta(r, "a") +
-                              sse.text_delta(r, "b") +
-                              sse.finish(r, rq, true);
+        // One call per statement, as the server writes them (the
+        // operands of `+` may run in either order).
+        std::string s = sse.start(r);
+        s += sse.message_open(r);
+        s += sse.text_delta(r, "a");
+        s += sse.text_delta(r, "b");
+        s += sse.finish(r, rq, true);
         CHECK(event_types(s) ==
               std::vector<std::string>{
                   "response.created", "response.in_progress",
@@ -312,7 +315,8 @@ TEST_CASE("responses SSE: event order for text and for a tool call",
         ResponsesSse sse;
         r.text = "ab";
         r.incomplete = true;
-        const std::string s = sse.start(r) + sse.finish(r, rq, false);
+        std::string s = sse.start(r);
+        s += sse.finish(r, rq, false);
         const auto types = event_types(s);
         CHECK(types.back() == "response.incomplete");
         CHECK(std::count(types.begin(), types.end(),
@@ -322,7 +326,8 @@ TEST_CASE("responses SSE: event order for text and for a tool call",
     SECTION("function call") {
         ResponsesSse sse;
         r.call = ToolCall{"f", {{"k", "v"}}};
-        const std::string s = sse.start(r) + sse.finish(r, rq, false);
+        std::string s = sse.start(r);
+        s += sse.finish(r, rq, false);
         CHECK(event_types(s) ==
               std::vector<std::string>{
                   "response.created", "response.in_progress",

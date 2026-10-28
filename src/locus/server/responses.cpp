@@ -286,22 +286,27 @@ std::string ResponsesSse::event(json ev) {
     return "event: " + type + "\ndata: " + dump(ev) + "\n\n";
 }
 
+// Events are appended one statement at a time: each event() takes the
+// next sequence number, and the operands of `a + b` may run in either
+// order (GCC runs the right one first).
 std::string ResponsesSse::start(const ResponsesResult& r) {
     const json resp = responses_object(r, json::array(), "in_progress");
-    return event({{"type", "response.created"}, {"response", resp}}) +
-           event({{"type", "response.in_progress"}, {"response", resp}});
+    std::string out =
+        event({{"type", "response.created"}, {"response", resp}});
+    out += event({{"type", "response.in_progress"}, {"response", resp}});
+    return out;
 }
 
 std::string ResponsesSse::message_open(const ResponsesResult& r) {
-    return event({{"type", "response.output_item.added"},
-                  {"output_index", 0},
-                  {"item",
-                   {{"type", "message"},
-                    {"id", "msg_" + r.id},
-                    {"status", "in_progress"},
-                    {"role", "assistant"},
-                    {"content", json::array()}}}}) +
-           event({{"type", "response.content_part.added"},
+    std::string out = event({{"type", "response.output_item.added"},
+                             {"output_index", 0},
+                             {"item",
+                              {{"type", "message"},
+                               {"id", "msg_" + r.id},
+                               {"status", "in_progress"},
+                               {"role", "assistant"},
+                               {"content", json::array()}}}});
+    out += event({{"type", "response.content_part.added"},
                   {"item_id", "msg_" + r.id},
                   {"output_index", 0},
                   {"content_index", 0},
@@ -309,6 +314,7 @@ std::string ResponsesSse::message_open(const ResponsesResult& r) {
                    {{"type", "output_text"},
                     {"text", ""},
                     {"annotations", json::array()}}}});
+    return out;
 }
 
 std::string ResponsesSse::text_delta(const ResponsesResult& r,
