@@ -25,6 +25,13 @@
 // products, exactly as the plain kernel computes them, and writes
 // silu(gate) * up -- the gate, up and silu_mul dispatches of an MoE
 // expert in one, reading the activations once (split slots only).
+//
+// With -DSEGMENTS (matvec_q4_k_seg) the rows are those of up to three
+// same-width matrices read from their own buffers (W, W1 at binding
+// 4, W2 at binding 5), as if stacked: rows [0, seg1) of W go to O at
+// out_offset, the next seg2 - seg1 rows (W1) to O2 at off1, the rest
+// (W2) to O2 at off2. The q, k and v projections in one dispatch,
+// without a concatenated copy of the weights; w_off must be 0.
 
 #define LANES 16u
 #define ROWS 8u
@@ -49,6 +56,13 @@ layout(std430, binding = 3) readonly buffer R { uint route[]; };
 layout(std430, binding = 4) readonly buffer WU { uint wu[]; };
 layout(std430, binding = 4) readonly buffer WU4 { uvec4 wu4[]; };
 #endif
+#ifdef SEGMENTS
+layout(std430, binding = 3) buffer O2 { float o2[]; };
+layout(std430, binding = 4) readonly buffer W1 { uint w1[]; };
+layout(std430, binding = 4) readonly buffer W14 { uvec4 w14[]; };
+layout(std430, binding = 5) readonly buffer W2 { uint w2[]; };
+layout(std430, binding = 5) readonly buffer W24 { uvec4 w24[]; };
+#endif
 
 layout(push_constant) uniform PC {
     uint rows;
@@ -66,7 +80,17 @@ layout(push_constant) uniform PC {
     uint mode;      // 1 = ids from route[], 2 = weighted slot sum
     uint row_stride;  // unused: K-quant rows are never column-split
 #endif
+#ifdef SEGMENTS
+    uint seg1;  // first row of W1
+    uint off1;
+    uint seg2;  // first row of W2
+    uint off2;
+#endif
 } pc;
+
+#ifdef SEGMENTS
+uint g_seg;  // this thread's matrix: 0 = W, 1 = W1, 2 = W2
+#endif
 
 shared float red[LANES * ROWS];
 #ifdef SWIGLU
@@ -82,6 +106,8 @@ uint byte_at(uint i) {
 uint wword(uint i, bool up) {
 #ifdef SWIGLU
     return up ? wu[i] : w[i];
+#elif defined(SEGMENTS)
+    return g_seg == 0u ? w[i] : (g_seg == 1u ? w1[i] : w2[i]);
 #else
     return w[i];
 #endif
@@ -91,6 +117,9 @@ uint wword(uint i, bool up) {
 uvec4 wquad(uint b, bool up) {
 #ifdef SWIGLU
     return up ? wu4[b >> 4] : w4[b >> 4];
+#elif defined(SEGMENTS)
+    return g_seg == 0u ? w4[b >> 4]
+                       : (g_seg == 1u ? w14[b >> 4] : w24[b >> 4]);
 #else
     return w4[b >> 4];
 #endif
@@ -224,6 +253,12 @@ void main() {
         if (!sum) {
             at += y * pc.out_stride;
         }
+#elif defined(SEGMENTS)
+        g_seg = r >= pc.seg2 ? 2u : (r >= pc.seg1 ? 1u : 0u);
+        uint lr = r - (g_seg == 2u ? pc.seg2 : (g_seg == 1u ? pc.seg1 : 0u));
+        acc = row_part(0u, pc.x_off, lr, lane, false);
+        at = g_seg == 2u ? pc.off2 + lr
+           : (g_seg == 1u ? pc.off1 + lr : pc.out_offset + lr);
 #else
         acc = row_part(pc.w_off, pc.x_off, r, lane, false);
 #endif
@@ -250,6 +285,12 @@ void main() {
         // silu_mul.comp's formula on the gate and up outputs.
         float u = red_u[gl_LocalInvocationID.x] * pc.scale;
         o[at] = v / (1.0 + exp(-v)) * u;
+#elif defined(SEGMENTS)
+        if (g_seg == 0u) {
+            o[at] = v;
+        } else {
+            o2[at] = v;
+        }
 #else
         o[at] = pc.accumulate != 0 ? o[at] + v : v;
 #endif

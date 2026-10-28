@@ -119,6 +119,8 @@ enum class Kernel {
     kCopy,
     /** Per-head q / k RMS norm and rope in one dispatch (qwen3). */
     kQkNormRope,
+    /** matvec_q4_k over q / k / v from separate buffers (SEGMENTS). */
+    kMatvecQ4_KSeg,
     kCount_,
 };
 

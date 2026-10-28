@@ -649,6 +649,43 @@ void rec_matvec_seg(State& s, std::span<const Mat* const> ms,
 }
 
 /**
+ * @returns How many of q, k, v (in that order) can run as one
+ * rec_matvec_q4k_seg dispatch: q and k Q4_K of one width (2), and v
+ * too when it matches them (3); 0 otherwise.
+ */
+std::size_t q4k_seg_count(const Mat& q, const Mat& k, const Mat& v) {
+    const auto q4 = gguf::TensorType::kQ4_K;
+    if (q.type != q4 || k.type != q4 || k.cols != q.cols) {
+        return 0;
+    }
+    return v.type == q4 && v.cols == q.cols ? 3 : 2;
+}
+
+/**
+ * Records the matvecs of 2 or 3 Q4_K matrices reading x
+ * (q4k_seg_count) as one matvec_q4_k_seg dispatch, each read from its
+ * own upload: ms[0]'s rows to out at out_off, ms[1]'s to out2 at off1,
+ * ms[2]'s (if any) to out2 at off2.
+ */
+void rec_matvec_q4k_seg(State& s, std::span<const Mat* const> ms,
+                        VulkanContext::Buffer x, VulkanContext::Buffer out,
+                        std::uint32_t out_off, VulkanContext::Buffer out2,
+                        std::uint32_t off1, std::uint32_t off2) {
+    const std::uint32_t seg1 = ms[0]->rows;
+    const std::uint32_t seg2 = seg1 + ms[1]->rows;
+    const std::uint32_t rows = seg2 + (ms.size() > 2 ? ms[2]->rows : 0);
+    const VulkanContext::Buffer w1 = s.upload_w(*ms[1]);
+    const VulkanContext::Buffer bufs[] = {
+        s.upload_w(*ms[0]), x, out, out2, w1,
+        ms.size() > 2 ? s.upload_w(*ms[2]) : w1};
+    const std::uint32_t push[] = {rows, ms[0]->cols, out_off, 0, 0, 0,
+                                  fbits(1.0f), seg1, off1, seg2, off2};
+    s.ctx.dispatch(Kernel::kMatvecQ4_KSeg, bufs, push,
+                   VulkanContext::matvec_groups(Kernel::kMatvecQ4_KSeg,
+                                                rows));
+}
+
+/**
  * @returns Whether a GPU-routed MoE layer's shared experts can ride
  * the routed dispatches (matvec_q8_0_glu_sh_b / _sh_b): all Q8_0,
  * gate / up as wide as the routed expert g, and n_expert_shared
@@ -1659,6 +1696,10 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             const Mat* qkv[] = {&lay.wq, &lay.wk, &lay.wv};
             const bool fused = !qblk && seg_ok(qkv) &&
                                hp.head_dim % 2 == 0;
+            // Q4_K q and k (and v when it is Q4_K too) in one dispatch.
+            const std::size_t n_q4k_seg =
+                fused || qblk ? 0
+                              : q4k_seg_count(lay.wq, lay.wk, lay.wv);
             // The seg epilogue ropes interleaved pairs and has no q/k
             // norm, so NEOX / q-k-norm models (qwen3moe) still stack
             // the projection but norm and rope q and k afterwards.
@@ -1708,6 +1749,9 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 }
                 rec_matvec_seg(s, qkv, s.xb, s.q, 0, kv_dst, k_at, v_at,
                                rope);
+            } else if (n_q4k_seg > 0) {
+                rec_matvec_q4k_seg(s, {qkv, n_q4k_seg}, s.xb, s.q, 0,
+                                   kv_dst, k_at, v_at);
             } else {
                 rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
             }
@@ -1726,8 +1770,10 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 s.ctx.dispatch(rope_k, bufs, push, hp.n_heads);
             }
             if (!qblk) {
-                if (!fused) {
+                if (!fused && n_q4k_seg == 0) {
                     rec_matvec(s, lay.wk, s.xb, kv_dst, k_at, false);
+                }
+                if (!fused && n_q4k_seg < 3) {
                     rec_matvec(s, lay.wv, s.xb, kv_dst, v_at, false);
                 }
                 if (!lay.wk_bias.empty()) {
