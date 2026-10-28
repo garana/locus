@@ -1,7 +1,9 @@
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -48,6 +50,55 @@ TEST_CASE("registry lists and resolves backends", "[backend]") {
             REQUIRE_THROWS_AS(resolve_backend("cuda"),
                               std::invalid_argument);
         }
+    }
+}
+
+TEST_CASE("gpu_idle_warning flags a default CPU pick with a GPU usable",
+          "[backend]") {
+    const Backend cpu{"neon", "", true, true, {}};
+    const Backend vk{"vulkan", "", true, true, {}};
+    const Backend vk_off{"vulkan", "", false, false, {}};
+    const Backend cuda{"cuda", "", true, true, {}};
+
+    SECTION("default CPU pick with a usable GPU warns") {
+        const Backend list[] = {cpu, vk};
+        REQUIRE(gpu_idle_warning(true, cpu, list) ==
+                "warning: running on the CPU (neon) by default; a GPU "
+                "is usable: pass --backend vulkan (or set "
+                "LOCUS_BACKEND=vulkan)");
+        const Backend list_cuda[] = {cpu, cuda};
+        REQUIRE(gpu_idle_warning(true, cpu, list_cuda).find(
+                    "--backend cuda") != std::string::npos);
+    }
+    SECTION("an explicit choice does not warn") {
+        const Backend list[] = {cpu, vk};
+        REQUIRE(gpu_idle_warning(false, cpu, list).empty());
+    }
+    SECTION("a GPU pick does not warn") {
+        const Backend list[] = {cpu, vk};
+        REQUIRE(gpu_idle_warning(true, vk, list).empty());
+    }
+    SECTION("no usable GPU does not warn") {
+        const Backend list[] = {cpu, vk_off};
+        REQUIRE(gpu_idle_warning(true, cpu, list).empty());
+    }
+}
+
+TEST_CASE("backend_defaulted needs no choice and no LOCUS_BACKEND",
+          "[backend]") {
+    const char* old = std::getenv("LOCUS_BACKEND");
+    const std::string saved = old != nullptr ? old : "";
+    ::unsetenv("LOCUS_BACKEND");
+    CHECK(backend_defaulted(""));
+    CHECK_FALSE(backend_defaulted("neon"));
+    ::setenv("LOCUS_BACKEND", "scalar", 1);
+    CHECK_FALSE(backend_defaulted(""));
+    ::setenv("LOCUS_BACKEND", "", 1);
+    CHECK(backend_defaulted(""));
+    if (old != nullptr) {
+        ::setenv("LOCUS_BACKEND", saved.c_str(), 1);
+    } else {
+        ::unsetenv("LOCUS_BACKEND");
     }
 }
 

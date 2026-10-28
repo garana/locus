@@ -1,6 +1,7 @@
 #pragma once
 
 #include <span>
+#include <string>
 #include <string_view>
 
 #include "locus/backend/cpu_ops.hpp"
@@ -138,5 +139,27 @@ const Backend& best_backend();
  * @throws std::invalid_argument on unknown or unusable names.
  */
 const Backend& resolve_backend(std::string_view choice);
+
+/**
+ * True when resolve_backend(choice) picks by default: no CLI choice
+ * and no LOCUS_BACKEND.
+ *
+ * @param choice Backend name from the CLI, or empty.
+ */
+bool backend_defaulted(std::string_view choice);
+
+/**
+ * The startup warning for a default pick that leaves a GPU idle: the
+ * picked backend runs on the CPU while a GPU backend (vulkan, cuda) in
+ * `list` is available and selectable.
+ *
+ * @param defaulted Whether the backend was picked by default.
+ * @param picked The backend in use.
+ * @param list The backends to look for a usable GPU in.
+ * @returns One line naming the GPU backend to pass, or empty when
+ *     there is nothing to warn about.
+ */
+std::string gpu_idle_warning(bool defaulted, const Backend& picked,
+                             std::span<const Backend> list = backends());
 
 }  // namespace locus::backend

@@ -106,7 +106,10 @@ CUDA is a second GPU path for NVIDIA hosts.
 
 Backends are selected at runtime. A registry lists every compiled
 variant and whether the machine supports it; `--backend` beats
-`LOCUS_BACKEND`, which beats the best available. Every variant must
+`LOCUS_BACKEND`, which beats the best available (the first usable
+entry, a CPU one). When that default leaves a usable GPU idle,
+locus-run and locus-server print a warning naming the `--backend` to
+pass. Every variant must
 match the scalar reference in tests, and the golden end-to-end tests
 run on every selectable backend.
 

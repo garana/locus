@@ -91,8 +91,11 @@ OpenAI + Anthropic compatible inference server (default port 8080):
     try {
         auto g = locus::gguf::GgufFile::open(model_path);
         auto model = locus::model::TransformerModel::load(g);
-        model.use_backend(
-            locus::backend::resolve_backend(args.choice));
+        const auto& backend =
+            locus::backend::resolve_backend(args.choice);
+        model.use_backend(backend);
+        const std::string gpu_warn = locus::backend::gpu_idle_warning(
+            locus::backend::backend_defaulted(args.choice), backend);
         locus::backend::vulkan_set_prefill_f16(args.prefill_f16);
         auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
         auto& tok = *tok_ptr;
@@ -123,12 +126,14 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         locus::server::OpenAiServer server(model, tok, opt);
         std::fprintf(
             stderr,
-            "%s\nbackend: %s | chat template: %s\n"
-            "locus-server listening on :%d\n",
+            "%s\nbackend: %s | chat template: %s\n",
             locus::sys::to_string(locus::sys::detect()).c_str(),
             std::string(model.active_backend().name).c_str(),
-            std::string(opt.chat_template.name()).c_str(),
-            port);
+            std::string(opt.chat_template.name()).c_str());
+        if (!gpu_warn.empty()) {
+            std::fprintf(stderr, "%s\n", gpu_warn.c_str());
+        }
+        std::fprintf(stderr, "locus-server listening on :%d\n", port);
         if (!server.listen("0.0.0.0", port)) {
             std::fprintf(stderr, "error: cannot bind port %d\n",
                          port);
