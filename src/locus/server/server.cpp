@@ -112,7 +112,9 @@ std::vector<chat::Message> parse_messages(const json& messages) {
  * Anthropic content is either a plain string or an array of content
  * blocks; we take the text of every {"type":"text"} block and
  * ignore the rest (images, tool_use/tool_result -- no tool support
- * yet). @returns the concatenated text.
+ * yet). @returns the text blocks joined with newlines, as the vision
+ * path joins them (Claude Code sends its system prompt as several
+ * blocks; with no separator their words would run together).
  */
 std::string anthropic_text(const json& content) {
     if (content.is_string()) {
@@ -124,6 +126,7 @@ std::string anthropic_text(const json& content) {
             if (block.value("type", "") == "text" &&
                 block.contains("text") &&
                 block["text"].is_string()) {
+                if (!out.empty()) out += "\n";
                 out += block["text"].get<std::string>();
             }
         }
@@ -395,9 +398,10 @@ std::optional<VisionChat> parse_vision_chat(const json& body,
         if (role == "system") {
             // Anthropic: as parse_anthropic_messages, after the
             // top-level system text.
-            if (!vc.system.empty()) vc.system += "\n";
-            vc.system += vision_turn_text(m["content"], anthropic, false,
-                                          max_bytes, vc.images);
+            const std::string text = vision_turn_text(
+                m["content"], anthropic, false, max_bytes, vc.images);
+            if (!vc.system.empty() && !text.empty()) vc.system += "\n";
+            vc.system += text;
             vc.has_system = true;
         } else if (role == "user" || role == "assistant") {
             vc.turns.push_back(

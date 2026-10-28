@@ -400,20 +400,39 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
 
     SECTION("anthropic system messages join the top-level system") {
         // Claude Code sends a system-role entry after the first user
-        // turn; its text goes after the top-level system text.
+        // turn; its text goes after the top-level system text. The
+        // reply, and the prompt length (stories260K's reply does not
+        // depend on the system text), must match the joined request.
         const auto reply = [&](const json& req) {
             auto res = client.Post("/v1/messages", req.dump(),
                                    "application/json");
             REQUIRE(res);
             REQUIRE(res->status == 200);
-            return json::parse(res->body)["content"][0]["text"]
-                .get<std::string>();
+            const auto body = json::parse(res->body);
+            const auto& u = body["usage"];
+            const int prompt = u["input_tokens"].get<int>() +
+                               u.value("cache_read_input_tokens", 0) +
+                               u.value("cache_creation_input_tokens", 0);
+            return std::make_pair(body["content"][0]["text"]
+                                      .get<std::string>(),
+                                  prompt);
         };
         const json user{{"role", "user"}, {"content", "Once upon a time"}};
-        const std::string joined =
+        const auto joined =
             reply({{"system", "You are\na storyteller."},
                    {"messages", json::array({user})},
                    {"max_tokens", 12}});
+        REQUIRE(joined.second >
+                reply({{"messages", json::array({user})},
+                       {"max_tokens", 12}})
+                    .second);
+        // Text blocks join with newlines, at the top level too.
+        REQUIRE(reply({{"system",
+                        json::array({{{"type", "text"}, {"text", "You are"}},
+                                     {{"type", "text"},
+                                      {"text", "a storyteller."}}})},
+                       {"messages", json::array({user})},
+                       {"max_tokens", 12}}) == joined);
         REQUIRE(reply({{"system", "You are"},
                        {"messages",
                         json::array({user,
