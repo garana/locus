@@ -357,17 +357,20 @@ struct State {
                 return *b;
             }
         }
-        return pool.acquire(key, alloc, [&](VulkanContext::Buffer b) {
-            const auto* src = static_cast<const std::byte*>(w.data);
-            auto* dst = static_cast<std::byte*>(ctx.mapped(b));
-            if (w.type == gguf::TensorType::kQ8_0) {
-                const std::size_t row_bytes = (w.cols / 32) * 34;
-                vk::q8_0_split_rows(src, dst, n / row_bytes, w.cols);
-            } else {
-                std::memcpy(dst, src, n);
-            }
-            std::memset(dst + n, 0, alloc - n);
-        });
+        return pool.acquire(
+            key, alloc,
+            [&](VulkanContext::Buffer b) {
+                const auto* src = static_cast<const std::byte*>(w.data);
+                auto* dst = static_cast<std::byte*>(ctx.mapped(b));
+                if (w.type == gguf::TensorType::kQ8_0) {
+                    const std::size_t row_bytes = (w.cols / 32) * 34;
+                    vk::q8_0_split_rows(src, dst, n / row_bytes, w.cols);
+                } else {
+                    std::memcpy(dst, src, n);
+                }
+                std::memset(dst + n, 0, alloc - n);
+            },
+            w.data);
     }
 
     VulkanContext::Buffer upload(const void* ptr,

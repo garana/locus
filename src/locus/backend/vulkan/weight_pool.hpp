@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -35,7 +36,9 @@ struct WeightPoolT {
         std::size_t bytes;
         std::uint64_t last_use;
         bool pinned;
-        /** Host memory an external entry reads in place (else null). */
+        /** Host memory the buffer was made from (read in place for an
+         *  external entry, copied otherwise); null when unknown, and
+         *  then release_range matches the key. */
         const void* src = nullptr;
     };
 
@@ -94,10 +97,12 @@ struct WeightPoolT {
     /**
      * Returns a buffer holding `bytes` for host pointer `ptr`,
      * resident and pinned for the current batch. `fill` populates
-     * a freshly created buffer on a miss.
+     * a freshly created buffer on a miss. `src`, when given, is the
+     * host memory `fill` copies from (release_range matches it).
      */
     Buffer acquire(const void* ptr, std::size_t bytes,
-                   const std::function<void(Buffer)>& fill) {
+                   const std::function<void(Buffer)>& fill,
+                   const void* src = nullptr) {
         if (budget_ == 0) {
             init_budget();
         }
@@ -117,7 +122,7 @@ struct WeightPoolT {
         }
         Buffer b = create(bytes);
         fill(b);
-        map_.emplace(ptr, Entry{b, bytes, ++clock_, true});
+        map_.emplace(ptr, Entry{b, bytes, ++clock_, true, src});
         used_ += bytes;
         return b;
     }
@@ -148,11 +153,13 @@ struct WeightPoolT {
     }
 
     /**
-     * Destroys the entries over host memory in [p, p + n): external
-     * entries whose src lies there, and copies keyed there. Called
+     * Destroys the entries made from host memory in [p, p + n): those
+     * whose src lies there, or, without a src, whose key does. Called
      * before that memory goes away (a model file unmapped), so no
-     * buffer outlives the pages it imports, and a later mapping at the
-     * same address never hits a stale entry.
+     * buffer outlives the pages it imports, and a later mapping (or a
+     * later model's heap) at the same address never hits a stale
+     * entry. No released entry may be pinned: an open batch could
+     * still use it.
      */
     void release_range(const void* p, std::size_t n) {
         const auto b = reinterpret_cast<std::uintptr_t>(p);
@@ -160,6 +167,8 @@ struct WeightPoolT {
             const auto at = reinterpret_cast<std::uintptr_t>(
                 it->second.src != nullptr ? it->second.src : it->first);
             if (at >= b && at - b < n) {
+                assert(!it->second.pinned &&
+                       "release_range under an open batch");
                 destroy(it->second.buf);
                 used_ -= it->second.bytes;
                 it = map_.erase(it);

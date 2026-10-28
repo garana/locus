@@ -159,13 +159,16 @@ TEST_CASE("weight pool releases the entries over a freed range",
         return FakeBuf{2000 + made};
     };
     // An import keyed elsewhere (as upload_experts keys by its
-    // ExpertMat) but reading the mapping; a copy keyed inside it; one
-    // outside it.
+    // ExpertMat) but reading the mapping; a copy keyed elsewhere too
+    // but made from the mapping (a Q8_0 expert copy); a copy keyed
+    // inside it; one outside it.
     h.pool.acquire_external(other + 1, mapping + 8, import);
+    h.pool.acquire(other + 2, 30, [](FakeBuf) {}, mapping + 16);
     h.get(mapping + 32, 10);
     h.get(other, 20);
-    REQUIRE(h.pool.map_.size() == 3);
-    REQUIRE(h.live == 3);
+    REQUIRE(h.pool.map_.size() == 4);
+    REQUIRE(h.live == 4);
+    h.pool.on_batch_end();  // nothing may be pinned when released
     h.pool.release_range(mapping, sizeof mapping);
     REQUIRE(h.pool.map_.size() == 1);
     REQUIRE(h.pool.map_.count(other) == 1);
