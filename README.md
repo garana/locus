@@ -95,8 +95,8 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 ### Pending
 
 - Multimedia (#143): diffusion images (#146), video (#148), real-time
-  speech (#173), faster image input (#257), an own JPEG decoder in
-  place of stb_image (#250; PNG already uses locus's decoder).
+  speech (#173), faster image input (#257), dropping stb_image, now
+  only the tests' reference for locus's PNG and JPEG decoders (#250).
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
@@ -149,7 +149,7 @@ runs, but slower than neon.
 
 No runtime dependencies beyond the C and C++ libraries and the OS.
 Vendored, pinned and checksummed (see DESIGN.md section 6): Catch2
-(tests only), cpp-httplib, nlohmann/json, stb_image, and ggml's IQ
-lookup tables. Optional, found
+(tests only), cpp-httplib, nlohmann/json, stb_image (tests'
+reference only), and ggml's IQ lookup tables. Optional, found
 at configure time: the Vulkan loader and a shader compiler, the CUDA
 toolkit.
