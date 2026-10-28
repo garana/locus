@@ -22,11 +22,10 @@ struct DecodeLimits {
 };
 
 /**
- * Decodes a PNG or JPEG (request input, so untrusted bytes) to RGB:
- * PNG with locus's own decoder (png_decode.hpp), JPEG with the vendored
- * stb_image, built with only those two formats. Gray and palette images
- * become RGB; an alpha channel is dropped, as Pillow's convert("RGB")
- * does.
+ * Decodes a PNG or JPEG (request input, so untrusted bytes) to RGB with
+ * locus's own decoders (png_decode.hpp, jpeg_decode.hpp), which give
+ * stb_image's 3-channel result. Gray and palette images become RGB; an
+ * alpha channel is dropped, as Pillow's convert("RGB") does.
  *
  * @param data The encoded file.
  * @param lim Size caps.

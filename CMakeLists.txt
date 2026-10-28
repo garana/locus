@@ -46,6 +46,7 @@ add_library(locus
     src/locus/image/png.cpp
     src/locus/image/inflate.cpp
     src/locus/image/png_decode.cpp
+    src/locus/image/jpeg_decode.cpp
     src/locus/image/image_input.cpp
     src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp

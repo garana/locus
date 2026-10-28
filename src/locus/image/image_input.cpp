@@ -1,5 +1,6 @@
 #include "locus/image/image_input.hpp"
 
+#include "locus/image/jpeg_decode.hpp"
 #include "locus/image/png_decode.hpp"
 
 #include <algorithm>
@@ -178,10 +179,10 @@ Rgb8 decode_image(std::span<const std::byte> data, const DecodeLimits& lim) {
         data.size() > static_cast<std::size_t>(INT32_MAX)) {
         throw std::invalid_argument("image: over the size limit");
     }
-    if (is_png(data)) {
-        return decode_png(data, lim);  // locus's own decoder (i#250)
-    }
-    return detail::decode_image_stb(data, lim);
+    // locus's own decoders (i#250).
+    if (is_png(data)) return decode_png(data, lim);
+    if (is_jpeg(data)) return decode_jpeg(data, lim);
+    throw std::invalid_argument("image: not a PNG or JPEG");
 }
 
 namespace detail {
