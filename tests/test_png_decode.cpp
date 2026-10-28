@@ -76,7 +76,7 @@ void decode_or_refuse(const std::vector<std::byte>& f) {
 
 }  // namespace
 
-TEST_CASE("png decoder matches the corpus and stb_image", "[image][png]") {
+TEST_CASE("png decoder matches the corpus", "[image][png]") {
     const auto names = corpus();
     REQUIRE(names.size() >= 37);
     for (const auto& n : names) {
@@ -89,10 +89,6 @@ TEST_CASE("png decoder matches the corpus and stb_image", "[image][png]") {
                            [](std::uint8_t a, std::byte b) {
                                return a == std::to_integer<std::uint8_t>(b);
                            }));
-        const auto ref = locus::image::detail::decode_image_stb(png);
-        REQUIRE(got.w == ref.w);
-        REQUIRE(got.h == ref.h);
-        REQUIRE(got.rgb == ref.rgb);
         // decode_image routes PNG here.
         REQUIRE(locus::image::decode_image(png).rgb == got.rgb);
     }

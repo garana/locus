@@ -35,14 +35,6 @@ struct DecodeLimits {
 Rgb8 decode_image(std::span<const std::byte> data,
                   const DecodeLimits& lim = {});
 
-namespace detail {
-/** decode_image through stb_image for any PNG or JPEG: the reference
- * the tests compare locus's PNG decoder with, until stb_image goes
- * (i#250). */
-Rgb8 decode_image_stb(std::span<const std::byte> data,
-                      const DecodeLimits& lim = {});
-}  // namespace detail
-
 /**
  * Pillow's Image.resize((w, h), BICUBIC) for an RGB image, bit-exact:
  * the same separable passes (horizontal, then vertical, each only when

@@ -180,11 +180,8 @@ The areas built after the MVP:
   default.
 - Vendored in-tree, pinned, sha256 recorded in the importing commit,
   license files alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
-  cpp-httplib v0.18.3 (MIT), nlohmann/json v3.11.3 (MIT), stb_image
-  v2.30 (MIT or public domain; only the reference the tests compare
-  locus's own PNG and JPEG decoders with, until it is dropped, #250),
-  and ggml's IQ lookup
-  tables (`third_party/ggml/iq_grids.h`, MIT).
+  cpp-httplib v0.18.3 (MIT), nlohmann/json v3.11.3 (MIT), and ggml's
+  IQ lookup tables (`third_party/ggml/iq_grids.h`, MIT).
 - No FetchContent and no network at configure or build time.
 - Optional system dependencies, found at configure time: the Vulkan
   loader and a shader compiler, the CUDA toolkit.

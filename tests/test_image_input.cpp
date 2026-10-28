@@ -136,8 +136,8 @@ TEST_CASE("decode_image reads PNGs as Pillow does", "[image][decode]") {
 
 // JPEG decoders may round the IDCT and the chroma upsampling
 // differently (Pillow uses libjpeg-turbo), so this is a tolerance. On
-// the M2: mean 0.084, worst 2; the limits leave room for stb's other
-// SIMD paths.
+// the M2: mean 0.084, worst 2 (locus's decoder is integer-only, so the
+// same on every host).
 TEST_CASE("decode_image reads a JPEG close to Pillow", "[image][decode]") {
     const auto jpg = decode_image(read_bytes(kDir + "src.jpg"));
     REQUIRE(jpg.w == kW);
@@ -237,7 +237,7 @@ TEST_CASE("decode_image refuses bad and oversized input",
     REQUIRE_THROWS_AS(decode_image(std::as_bytes(std::span(text))),
                       std::invalid_argument);
     // A valid header claiming 20000 x 20000: refused on the header
-    // (over STBI_MAX_DIMENSIONS and over max_pixels).
+    // (over max_pixels).
     std::vector<std::byte> huge(png.begin(), png.begin() + 33);
     for (int i = 0; i < 4; ++i) {
         huge[16 + i] = std::byte((20000u >> (24 - 8 * i)) & 0xFF);
@@ -245,10 +245,9 @@ TEST_CASE("decode_image refuses bad and oversized input",
     }
     REQUIRE_THROWS_AS(decode_image(huge), std::invalid_argument);
     // A 16 x 16 PNG whose data inflates to 4 MB instead of the 784
-    // bytes its header implies. stb accepts excess data, and its
-    // inflate buffer grows by doubling, so without the allocation cap a
-    // shaped input could make it allocate gigabytes; the cap (twice the
-    // header's need plus slack) refuses it. The exact size decodes.
+    // bytes its header implies: inflate is capped at the header's need,
+    // so a shaped input cannot make it allocate more. The exact size
+    // decodes.
     const std::uint32_t pw = 16, ph = 16;
     const std::size_t need = (std::size_t{pw} * 3 + 1) * ph;
     REQUIRE(decode_image(png_with_raw(pw, ph, need)).w == pw);
