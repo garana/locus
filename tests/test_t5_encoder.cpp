@@ -34,8 +34,9 @@ struct Tensor {
 /** The script's tensor list, in its LCG order. */
 std::vector<Tensor> synth_tensors() {
     const std::uint64_t w = kWidth, inner = kHeads * kHeadDim;
-    std::vector<Tensor> t = {{"token_embd.weight", {kVocab, w}},
-                             {"enc.blk.0.attn_rel_b.weight", {kBuckets, kHeads}}};
+    std::vector<Tensor> t = {
+        {"token_embd.weight", {kVocab, w}},
+        {"enc.blk.0.attn_rel_b.weight", {kBuckets, kHeads}}};
     for (std::uint32_t n = 0; n < kBlocks; ++n) {
         const std::string b = "enc.blk." + std::to_string(n) + ".";
         t.push_back({b + "attn_norm.weight", {w}});
