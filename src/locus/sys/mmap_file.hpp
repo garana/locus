@@ -42,6 +42,20 @@ class MappedFile {
 };
 
 /**
+ * @returns true when [p, p + n) lies inside one live MappedFile
+ *     mapping (not heap or anonymous memory), so pages imported from
+ *     it stay valid until that mapping's unmap hook runs.
+ */
+bool in_file_mapping(const void* p, std::size_t n);
+
+/**
+ * Sets the function each MappedFile calls with its range just before
+ * unmapping it (the Vulkan backend drops the GPU buffers that import
+ * those pages, #317). One slot; nullptr clears it. Thread-safe.
+ */
+void set_unmap_hook(void (*hook)(const void* p, std::size_t n));
+
+/**
  * Asks the OS to start faulting in [p, p+n) asynchronously
  * (madvise WILLNEED, page-aligned). Best-effort: errors are
  * ignored. Used by the R8 expert-readahead policy to overlap the

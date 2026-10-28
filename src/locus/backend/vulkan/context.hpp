@@ -278,6 +278,28 @@ class VulkanContext {
 
     /** @throws std::runtime_error when allocation fails. */
     Buffer create_buffer(std::size_t bytes);
+
+    /**
+     * Wraps host memory [ptr, ptr + bytes) as a buffer without copying
+     * (VK_EXT_external_memory_host: on unified memory the GPU reads the
+     * mmap'd weights in place). Imports the whole pages from ptr's page
+     * through the page holding byte ptr + `mapped` - 1, which the caller
+     * guarantees are mapped. The buffer starts at ptr and doesn't count
+     * toward memory_available(). Never written by the GPU.
+     *
+     * @param ptr Start of the range (read-only is fine).
+     * @param bytes Buffer size; ptr + bytes must stay in those pages.
+     * @param mapped Bytes from ptr known to be mapped (<= bytes).
+     * @returns The buffer, or an empty Buffer (impl == nullptr) when the
+     *          device can't import, the alignment doesn't fit, or bytes
+     *          runs past the last mapped page.
+     */
+    Buffer import_host(const void* ptr, std::size_t bytes,
+                       std::size_t mapped);
+
+    /** @returns Whether import_host can work on this device. */
+    bool host_import() const;
+
     void destroy_buffer(Buffer b);
     void write_buffer(Buffer b, std::span<const std::byte> data);
     void read_buffer(Buffer b, std::span<std::byte> out);

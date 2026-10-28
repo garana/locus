@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -34,6 +35,8 @@ struct WeightPoolT {
         std::size_t bytes;
         std::uint64_t last_use;
         bool pinned;
+        /** Host memory an external entry reads in place (else null). */
+        const void* src = nullptr;
     };
 
     /** Allocates a device buffer of `bytes`. */
@@ -117,6 +120,53 @@ struct WeightPoolT {
         map_.emplace(ptr, Entry{b, bytes, ++clock_, true});
         used_ += bytes;
         return b;
+    }
+
+    /**
+     * Like acquire, for a buffer over host memory used in place (the
+     * mmap'd weights imported, not copied): on a miss `make` builds it,
+     * and the entry counts 0 bytes against the budget.
+     * @param src The host memory the buffer reads (release_range).
+     * @returns The buffer, or nullopt when make can't (the caller
+     *          then copies through acquire).
+     */
+    std::optional<Buffer> acquire_external(
+        const void* ptr, const void* src,
+        const std::function<std::optional<Buffer>()>& make) {
+        if (auto it = map_.find(ptr); it != map_.end()) {
+            it->second.last_use = ++clock_;
+            it->second.pinned = true;
+            ++hits_;
+            return it->second.buf;
+        }
+        std::optional<Buffer> b = make();
+        if (b) {
+            ++misses_;
+            map_.emplace(ptr, Entry{*b, 0, ++clock_, true, src});
+        }
+        return b;
+    }
+
+    /**
+     * Destroys the entries over host memory in [p, p + n): external
+     * entries whose src lies there, and copies keyed there. Called
+     * before that memory goes away (a model file unmapped), so no
+     * buffer outlives the pages it imports, and a later mapping at the
+     * same address never hits a stale entry.
+     */
+    void release_range(const void* p, std::size_t n) {
+        const auto b = reinterpret_cast<std::uintptr_t>(p);
+        for (auto it = map_.begin(); it != map_.end();) {
+            const auto at = reinterpret_cast<std::uintptr_t>(
+                it->second.src != nullptr ? it->second.src : it->first);
+            if (at >= b && at - b < n) {
+                destroy(it->second.buf);
+                used_ -= it->second.bytes;
+                it = map_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     /** End-of-batch: unpin all and drop transient buffers. */
