@@ -85,13 +85,16 @@ class DpmSolverPP {
  * @param pos, n_pos The valid T5 rows of the prompt.
  * @param guidance The CFG scale (4.5).
  * @param op The backend ops.
- * @param on_step Called after each step with its index, may be empty.
+ * @param keep_going Called before each DiT call with the step index,
+ *     may be empty; returning false stops the loop (a client that went
+ *     away).
+ * @returns true when every step ran, false when keep_going stopped it.
  */
-void pixart_denoise(const PixArtDit& dit, DpmSolverPP& sched,
-                    std::span<float> latent, std::span<const float> neg,
-                    std::uint32_t n_neg, std::span<const float> pos,
-                    std::uint32_t n_pos, float guidance,
-                    const backend::Ops& op,
-                    const std::function<void(std::uint32_t)>& on_step = {});
+bool pixart_denoise(
+    const PixArtDit& dit, DpmSolverPP& sched, std::span<float> latent,
+    std::span<const float> neg, std::uint32_t n_neg,
+    std::span<const float> pos, std::uint32_t n_pos, float guidance,
+    const backend::Ops& op,
+    const std::function<bool(std::uint32_t)>& keep_going = {});
 
 }  // namespace locus::image

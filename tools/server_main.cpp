@@ -48,7 +48,7 @@ OpenAI + Anthropic compatible inference server (default port 8080):
   GET  /v1/models
   GET  /v1/models/{id}
   POST /v1/audio/speech        (needs --audio-decoder)
-  POST /v1/images/generations  (needs --image-decoder)
+  POST /v1/images/generations  (needs --image-decoder or --image-model)
   GET  /health
   GET  /metrics                (path set by --metrics-path)
 
@@ -125,6 +125,7 @@ OpenAI + Anthropic compatible inference server (default port 8080):
             opt.audio_max_tokens = args.audio_max_tokens;
         }
         opt.image_decoder_path = args.image_decoder;
+        opt.image_model_dir = args.image_model;
         opt.model_path = model_path;
         locus::server::OpenAiServer server(model, tok, opt);
         std::fprintf(

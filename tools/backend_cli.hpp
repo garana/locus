@@ -194,6 +194,10 @@ inline constexpr const char* kCommonHelp =
     "  --image-decoder P locus-server: enable /v1/images/generations\n"
     "                   (Janus-Pro models) with the VQ-16 decoder\n"
     "                   GGUF at path P\n"
+    "  --image-model D  locus-server: enable /v1/images/generations\n"
+    "                   with the PixArt-alpha pipeline in directory D\n"
+    "                   (its t5encoder, pixart and autoencoder_kl\n"
+    "                   GGUFs)\n"
     "  --prefill-f16    Vulkan: stage prefill matmul operands in\n"
     "                   f16 (faster prompt ingestion; opt-in, the\n"
     "                   f32 default is exact)\n"
@@ -270,6 +274,10 @@ struct BackendArgs {
      * "vq16") enabling locus-server's /v1/images/generations; empty =
      * the endpoint is disabled (503). */
     std::string image_decoder;
+    /** From --image-model D: directory of the PixArt-alpha pipeline's
+     * GGUFs, enabling locus-server's /v1/images/generations for it;
+     * empty = off. */
+    std::string image_model;
     /** From --concurrent N: submit the prompt N times and report
      * aggregate throughput (bench mode; default 1 = normal run). */
     std::uint32_t concurrent = 1;
@@ -389,6 +397,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.image_decoder = argv[++i];
         } else if (a.rfind("--image-decoder=", 0) == 0) {
             out.image_decoder = std::string(a.substr(16));
+        } else if (a == "--image-model" && i + 1 < argc) {
+            out.image_model = argv[++i];
+        } else if (a.rfind("--image-model=", 0) == 0) {
+            out.image_model = std::string(a.substr(14));
         } else if (a == "--concurrent" && i + 1 < argc) {
             number("--concurrent", argv[++i], out.concurrent);
         } else if (a.rfind("--concurrent=", 0) == 0) {

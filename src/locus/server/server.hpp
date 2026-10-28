@@ -20,6 +20,7 @@ class SnacDecoder;
 namespace locus::image {
 class JanusImageGen;
 class JanusVision;
+class PixArtPipeline;
 class Vq16Decoder;
 }
 namespace locus::server {
@@ -93,6 +94,12 @@ class OpenAiServer {
          * be a Janus-Pro checkpoint, whose janus.* tensors are read
          * from model_path. */
         std::string image_decoder_path;
+        /** Directory of a PixArt-alpha pipeline (--image-model): the
+         * t5encoder, pixart and autoencoder_kl GGUFs. It also enables
+         * POST /v1/images/generations, for requests whose model is
+         * "pixart" (or every request when no Janus model is loaded).
+         * Empty = off. */
+        std::string image_model_dir;
         /** Path of the loaded model's GGUF; the image endpoint reads
          * the janus.* tensors from it. */
         std::string model_path;
@@ -240,6 +247,9 @@ class OpenAiServer {
     std::unique_ptr<image::Vq16Decoder> vq16_;
     std::unique_ptr<gguf::GgufFile> janus_gguf_;
     std::unique_ptr<image::JanusImageGen> janus_;
+    // The PixArt pipeline (--image-model; null when not given). It owns
+    // its GGUF mappings and shares image_mu_ with Janus.
+    std::unique_ptr<image::PixArtPipeline> pixart_;
     std::mutex image_mu_;
 
     // Image input (i#241): the Janus vision encoder, loaded when the
