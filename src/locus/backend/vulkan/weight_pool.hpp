@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -158,8 +157,7 @@ struct WeightPoolT {
      * before that memory goes away (a model file unmapped), so no
      * buffer outlives the pages it imports, and a later mapping (or a
      * later model's heap) at the same address never hits a stale
-     * entry. No released entry may be pinned: an open batch could
-     * still use it.
+     * entry. The caller makes sure no open batch still uses them.
      */
     void release_range(const void* p, std::size_t n) {
         const auto b = reinterpret_cast<std::uintptr_t>(p);
@@ -167,8 +165,6 @@ struct WeightPoolT {
             const auto at = reinterpret_cast<std::uintptr_t>(
                 it->second.src != nullptr ? it->second.src : it->first);
             if (at >= b && at - b < n) {
-                assert(!it->second.pinned &&
-                       "release_range under an open batch");
                 destroy(it->second.buf);
                 used_ -= it->second.bytes;
                 it = map_.erase(it);

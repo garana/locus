@@ -168,7 +168,7 @@ TEST_CASE("weight pool releases the entries over a freed range",
     h.get(other, 20);
     REQUIRE(h.pool.map_.size() == 4);
     REQUIRE(h.live == 4);
-    h.pool.on_batch_end();  // nothing may be pinned when released
+    h.pool.on_batch_end();  // released between batches, as in use
     h.pool.release_range(mapping, sizeof mapping);
     REQUIRE(h.pool.map_.size() == 1);
     REQUIRE(h.pool.map_.count(other) == 1);

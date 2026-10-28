@@ -972,3 +972,27 @@ TEST_CASE("vulkan drops imported weights when their file is unmapped",
     }
     std::remove(path.c_str());
 }
+
+TEST_CASE("vulkan reports whether a batch is open or abandoned",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    // The unmap hook aborts while a batch is open (its weights would be
+    // freed under recorded commands), so the state must be exact.
+    VulkanContext ctx;
+    REQUIRE_FALSE(ctx.batch_open());
+    ctx.begin_batch();
+    REQUIRE(ctx.batch_open());
+    ctx.end_batch();
+    REQUIRE_FALSE(ctx.batch_open());
+    // An abandoned batch (the unwind path) closes too, and the next
+    // batch runs normally.
+    ctx.begin_batch();
+    ctx.abandon_batch();
+    REQUIRE_FALSE(ctx.batch_open());
+    ctx.begin_batch();
+    REQUIRE(ctx.batch_open());
+    ctx.end_batch();
+    REQUIRE_FALSE(ctx.batch_open());
+}

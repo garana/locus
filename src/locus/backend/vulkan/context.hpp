@@ -310,6 +310,16 @@ class VulkanContext {
     /** Opens a command batch; dispatches record until end_batch. */
     void begin_batch();
 
+    /** @returns Whether a batch is open (begin_batch .. end_batch). */
+    bool batch_open() const;
+
+    /**
+     * Drops the open batch without submitting it (its recorded work
+     * is discarded): the unwind path when an exception escapes between
+     * begin_batch and end_batch. A no-op when none is open.
+     */
+    void abandon_batch();
+
     /**
      * Records one compute dispatch into the open batch.
      *

@@ -507,6 +507,37 @@ struct State {
 
     std::vector<VulkanContext::Buffer> retired;
 
+    /**
+     * Drops the open batch unsubmitted and releases what it pinned,
+     * as end_batch would (an exception escaped mid-forward).
+     */
+    void abandon_batch() {
+        ctx.abandon_batch();
+        pool.on_batch_end();
+        for (auto b : retired) {
+            ctx.destroy_buffer(b);
+        }
+        retired.clear();
+    }
+
+    /**
+     * Abandons the batch still open when the scope unwinds, so an
+     * exception escaping a forward never leaves a batch open with its
+     * weights pinned (on_unmap would then abort when the model
+     * unloads). A no-op once end_batch has run.
+     */
+    struct BatchScope {
+        State& s;
+        explicit BatchScope(State& st) : s(st) {}
+        BatchScope(const BatchScope&) = delete;
+        BatchScope& operator=(const BatchScope&) = delete;
+        ~BatchScope() {
+            if (s.ctx.batch_open()) {
+                s.abandon_batch();
+            }
+        }
+    };
+
     /** Submits the open batch, then releases what it no longer needs. */
     void end_batch() {
         ctx.end_batch();
@@ -593,7 +624,16 @@ std::recursive_mutex& state_mu();
  */
 void on_unmap(const void* p, std::size_t n) {
     std::lock_guard lk(state_mu());
-    state().pool.release_range(p, n);
+    State& s = state();
+    if (s.ctx.batch_open()) {
+        // A recorded batch still references these weights; freeing
+        // them under it is undefined. Runs from ~MappedFile: no throw.
+        std::fprintf(stderr,
+                     "[vulkan] model file unmapped while a batch still "
+                     "uses its weights\n");
+        std::abort();
+    }
+    s.pool.release_range(p, n);
 }
 
 std::recursive_mutex& state_mu() {
@@ -1424,6 +1464,7 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
     s.ctx.write_buffer(s.x, std::as_bytes(x));
     const VulkanContext::Buffer grid = s.grid_for(k);
     s.ctx.begin_batch();
+    State::BatchScope batch_scope{s};
     const VulkanContext::Buffer bufs[] = {wb, s.x, s.xb, grid};
     const std::size_t nbuf = grid.impl != nullptr ? 4u : 3u;
     const std::uint32_t push[] = {w.rows, w.cols, 0, 0, 0, 0,
@@ -1815,6 +1856,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     std::vector<float> router(hp.n_expert);
 
     s.ctx.begin_batch();
+    State::BatchScope batch_scope{s};
     for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
         const auto& lay = m.layers()[l];
         const std::uint32_t row_off = block * block_stride +
@@ -2537,6 +2579,7 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
     };
 
     s.ctx.begin_batch();
+    State::BatchScope batch_scope{s};
     for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
         const auto& lay = m.layers()[l];
         norm_rows(lay.attn_norm, bx, bxb);
@@ -2829,6 +2872,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     };
 
     s.ctx.begin_batch();
+    State::BatchScope batch_scope{s};
     for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
         const auto& lay = m.layers()[l];
         const std::uint32_t layer_off = l * layer_stride;
