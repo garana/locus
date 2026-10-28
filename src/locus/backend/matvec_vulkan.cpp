@@ -1,9 +1,11 @@
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <bit>
 #include <cassert>
@@ -1111,7 +1113,7 @@ void rec_paged_matmul(State& s, Kernel k, const PagedPool& pp,
         rows,         cols,
         r.n_tok,      accumulate ? 1u : 0u,
         w_off,        r.x_off,
-        r.x_stride,   r.out_off,
+        r.x_stride,   k_splits > 1 ? 0 : r.out_off,
         r.out_stride, fbits(1.0f),
         static_cast<std::uint32_t>(r.w_bstride_bytes / 4),
         r.x_bstride,  r.out_bstride,
@@ -1125,11 +1127,32 @@ void rec_paged_matmul(State& s, Kernel k, const PagedPool& pp,
                    (rows + kMatmulRows - 1) / kMatmulRows,
                    tiles * r.n_batch * k_splits);
     if (k_splits > 1) {
+        // Partial planes start at 0; out_off moves the sum (an
+        // attention query sub-block's rows).
         const VulkanContext::Buffer sbufs[] = {dst, out};
-        const std::uint32_t spush[] = {plane, k_splits, 0,
+        const std::uint32_t spush[] = {plane, k_splits, r.out_off,
                                        accumulate ? 1u : 0u};
         s.ctx.dispatch(Kernel::kSumSplits, sbufs, spush, (plane + 255) / 256);
     }
+}
+
+/**
+ * Attention score scratch cap, in floats (1 GiB): one buffer stays
+ * within maxStorageBufferRange on every device and its indices far
+ * below 2^32 (i#313).
+ */
+constexpr std::size_t kAttnScratchFloats = std::size_t{1} << 28;
+
+/** The cap in use (vulkan_set_attn_scratch_floats; tests only). */
+std::atomic<std::size_t> attn_scratch_floats{kAttnScratchFloats};
+
+/** vulkan_attn_block at the cap in use. */
+std::uint32_t attn_block(std::uint32_t n, std::uint32_t heads,
+                         std::uint32_t n_pos) {
+    const std::size_t per = std::size_t{heads} * n_pos;
+    return static_cast<std::uint32_t>(std::clamp<std::size_t>(
+        attn_scratch_floats.load() / std::max<std::size_t>(per, 1), 1,
+        std::max(n, 1u)));
 }
 
 /** Records the causal softmax over `rows` score rows (attn_softmax). */
@@ -1149,8 +1172,9 @@ void rec_softmax(State& s, VulkanContext::Buffer scores, std::uint32_t rows,
  * S = K Q^T, masked softmax, O = V^T P, one batch per K/V head whose
  * `group` query heads are extra token rows (row t * group + i), so
  * each K/V tile is read once for all of them. Q and out rows are
- * q_dim floats per token (head h at h * hd); scores holds
- * n * heads * (base + n) floats.
+ * q_dim floats per token (head h at h * hd). Queries run in
+ * sub-blocks of attn_block(n, heads, base + n) tokens, each over the
+ * positions it can see; scores holds one sub-block's rows.
  */
 /** One attention segment set for rec_attn_decode (see attn_decode.comp). */
 struct DecodeAttn {
@@ -1240,29 +1264,35 @@ void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
         return;
     }
     const std::uint32_t n_kv = heads / group;
-    MatmulRows sr{n * group, 0, q_dim, 0, heads * n_pos};
-    sr.n_batch = n_kv;
-    sr.x_bstride = group * hd;
-    sr.out_bstride = group * n_pos;
-    sr.w_bstride_bytes = std::uint64_t{hd} * 4;
-    sr.div = group;
-    sr.x_inner = hd;
-    sr.out_inner = n_pos;
-    rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, hd, layer_off, q,
-                     scores, sr, false, n * heads * n_pos);
-    rec_softmax(s, scores, n * heads, n_pos, heads, base,
-                1.0f / std::sqrt(static_cast<float>(hd)));
-    MatmulRows orow{n * group, 0, heads * n_pos, 0, q_dim};
-    orow.n_batch = n_kv;
-    orow.x_bstride = group * n_pos;
-    orow.out_bstride = group * hd;
-    orow.w_bstride_bytes = std::uint64_t{hd} * 4;
-    orow.div = group;
-    orow.x_inner = n_pos;
-    orow.out_inner = hd;
-    rec_paged_matmul(s, Kernel::kMatmulPagedTF32, pp, hd, n_pos,
-                     layer_off + v_offset, scores, out, orow, false,
-                     n * q_dim);
+    const std::uint32_t mb = attn_block(n, heads, n_pos);
+    for (std::uint32_t t0 = 0; t0 < n; t0 += mb) {
+        // Queries t0 .. t0 + m - 1 see positions [0, np).
+        const std::uint32_t m = std::min(mb, n - t0);
+        const std::uint32_t np = base + t0 + m;
+        MatmulRows sr{m * group, t0 * q_dim, q_dim, 0, heads * np};
+        sr.n_batch = n_kv;
+        sr.x_bstride = group * hd;
+        sr.out_bstride = group * np;
+        sr.w_bstride_bytes = std::uint64_t{hd} * 4;
+        sr.div = group;
+        sr.x_inner = hd;
+        sr.out_inner = np;
+        rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, np, hd, layer_off,
+                         q, scores, sr, false, m * heads * np);
+        rec_softmax(s, scores, m * heads, np, heads, base + t0,
+                    1.0f / std::sqrt(static_cast<float>(hd)));
+        MatmulRows orow{m * group, 0, heads * np, t0 * q_dim, q_dim};
+        orow.n_batch = n_kv;
+        orow.x_bstride = group * np;
+        orow.out_bstride = group * hd;
+        orow.w_bstride_bytes = std::uint64_t{hd} * 4;
+        orow.div = group;
+        orow.x_inner = np;
+        orow.out_inner = hd;
+        rec_paged_matmul(s, Kernel::kMatmulPagedTF32, pp, hd, np,
+                         layer_off + v_offset, scores, out, orow, false,
+                         m * q_dim);
+    }
 }
 
 /**
@@ -1298,18 +1328,29 @@ void rec_attn_mla(State& s, const PagedPool& pp, VulkanContext::Buffer q,
         rec_attn_decode(s, pp, n_pos, heads, da, false);
         return;
     }
-    const std::uint32_t rows = n * heads;
-    rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, rank, layer_off,
-                     q_abs, scores, MatmulRows{rows, 0, rank, 0, n_pos},
-                     false, rows * n_pos);
-    rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, n_pos, rope_d,
-                     layer_off + rank, q, scores,
-                     MatmulRows{rows, nope, nope + rope_d, 0, n_pos}, true,
-                     rows * n_pos);
-    rec_softmax(s, scores, rows, n_pos, heads, base, kq_scale);
-    rec_paged_matmul(s, Kernel::kMatmulPagedTF32, pp, rank, n_pos, layer_off,
-                     scores, lat, MatmulRows{rows, 0, n_pos, 0, rank}, false,
-                     rows * rank);
+    // Query sub-blocks as rec_attn_gqa: tokens t0 .. t0 + m - 1 are
+    // rows t0 * heads .. of q_abs / q / lat and see positions [0, np).
+    const std::uint32_t qw = nope + rope_d;
+    const std::uint32_t mb = attn_block(n, heads, n_pos);
+    for (std::uint32_t t0 = 0; t0 < n; t0 += mb) {
+        const std::uint32_t m = std::min(mb, n - t0);
+        const std::uint32_t np = base + t0 + m;
+        const std::uint32_t rows = m * heads;
+        const std::uint32_t r0 = t0 * heads;
+        rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, np, rank,
+                         layer_off, q_abs, scores,
+                         MatmulRows{rows, r0 * rank, rank, 0, np}, false,
+                         rows * np);
+        rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, np, rope_d,
+                         layer_off + rank, q, scores,
+                         MatmulRows{rows, r0 * qw + nope, qw, 0, np}, true,
+                         rows * np);
+        rec_softmax(s, scores, rows, np, heads, base + t0, kq_scale);
+        rec_paged_matmul(s, Kernel::kMatmulPagedTF32, pp, rank, np,
+                         layer_off, scores, lat,
+                         MatmulRows{rows, 0, np, r0 * rank, rank}, false,
+                         rows * rank);
+    }
 }
 
 }  // namespace
@@ -1334,6 +1375,15 @@ void vulkan_set_prefill_f16(bool on) {
         on = false;
     }
     s.prefill_f16 = on;
+}
+
+std::uint32_t vulkan_attn_block(std::uint32_t n, std::uint32_t heads,
+                                std::uint32_t n_pos) {
+    return attn_block(n, heads, n_pos);
+}
+
+void vulkan_set_attn_scratch_floats(std::size_t floats) {
+    attn_scratch_floats.store(floats != 0 ? floats : kAttnScratchFloats);
 }
 
 bool vulkan_backend_usable() {
@@ -1393,6 +1443,24 @@ namespace {
  * fit the shaders' uint. LOCUS_VK_CPU_ROUTE=1 forces the
  * host-routed path.
  */
+/**
+ * Logs, once per reason, that vulkan_forward_batch declined: the
+ * caller then prefills one token at a time (i#321). Called under
+ * state_mu.
+ * @param why A string literal naming the reason.
+ * @returns false, for `return batch_declined(...)`.
+ */
+bool batch_declined(const char* why) {
+    static std::set<const char*> seen;
+    if (seen.insert(why).second) {
+        std::fprintf(stderr,
+                     "[vulkan] batched prefill off (%s): prompts "
+                     "prefill one token at a time\n",
+                     why);
+    }
+    return false;
+}
+
 bool gpu_route_ok(State& s, const model::TransformerModel& m,
                   const model::TransformerModel::Layer& lay) {
     const auto& hp = m.hparams();
@@ -1442,7 +1510,8 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
             std::fprintf(stderr,
                          "[vulkan] MoE experts (%llu MB) exceed 80%% of "
                          "available device memory (%llu MB): routing "
-                         "on the host\n",
+                         "on the host (a smaller --ctx or --kv-type "
+                         "f16 frees room)\n",
                          static_cast<unsigned long long>(experts >> 20),
                          static_cast<unsigned long long>(avail >> 20));
         }
@@ -2557,15 +2626,17 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const bool f16 = cache.geometry().kv_type == kv::KvType::kF16;
     const bool mla = hp.arch == model::Arch::kDeepseek2;
     // F16 is the one non-F32 pool the batched path reads.
-    if (n == 0 || (cache.quantized() && !f16) ||
-        !vulkan_forward_supported(m)) {
+    if (n == 0 || !vulkan_forward_supported(m)) {
         return false;
+    }
+    if (cache.quantized() && !f16) {
+        return batch_declined("quantized KV cache");
     }
     auto pool_it = s.kv_pools.find(
         f16 ? static_cast<const void*>(cache.qpool_data())
             : static_cast<const void*>(cache.pool_data()));
     if (pool_it == s.kv_pools.end()) {
-        return false;  // cache pool is not GPU-mapped
+        return batch_declined("KV pool not GPU-mapped");
     }
     const auto& geom = cache.geometry();
     const std::uint32_t kv_dim = geom.kv_dim;
@@ -2576,17 +2647,21 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const std::uint32_t qk = nope + rope_d;
     const std::uint32_t kvw = rank + rope_d;  // MLA latent row
     if (mla && kv_dim != kvw) {
-        return false;
+        return batch_declined("MLA cache row is not rank + rope");
     }
     // Routed experts need GPU routing (all experts resident) and an
     // id-matmul; moe_group handles up to 256 experts.
     for (const auto& lay : m.layers()) {
-        if (lay.is_moe() &&
-            (!gpu_route_ok(s, m, lay) || hp.n_expert > 256 ||
-             matmul_id_kernel(lay.gate_exps.base) == Kernel::kCount_ ||
-             matmul_id_kernel(lay.up_exps.base) == Kernel::kCount_ ||
-             matmul_id_kernel(lay.down_exps.base) == Kernel::kCount_)) {
-            return false;
+        if (!lay.is_moe()) {
+            continue;
+        }
+        if (!gpu_route_ok(s, m, lay) || hp.n_expert > 256) {
+            return batch_declined("MoE experts routed on the host");
+        }
+        if (matmul_id_kernel(lay.gate_exps.base) == Kernel::kCount_ ||
+            matmul_id_kernel(lay.up_exps.base) == Kernel::kCount_ ||
+            matmul_id_kernel(lay.down_exps.base) == Kernel::kCount_) {
+            return batch_declined("no expert matmul for a weight type");
         }
     }
     const std::uint32_t base = seq.n_tokens;
@@ -2622,7 +2697,8 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const auto bup = s.chunk_buf(C::kCUp, ff_rows);
     const auto batt_out = s.chunk_buf(C::kCAttOut, std::size_t{n} * att_dim);
     const auto batt =
-        s.chunk_buf(C::kCAtt, std::size_t{n} * H * n_pos);
+        s.chunk_buf(C::kCAtt, std::size_t{attn_block(n, H, n_pos)} * H *
+                                  n_pos);
     const auto blogits = s.chunk_buf(C::kCLogits, n_logits);
     s.grow(s.table, s.table_n, cache.total_blocks());
 
