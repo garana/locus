@@ -17,6 +17,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/http/base64.hpp"
 #include "locus/model/grammar.hpp"
@@ -1813,4 +1814,54 @@ TEST_CASE("chat with an image answers like the reference",
     REQUIRE(b["content"][0]["text"] == want);
     REQUIRE(b["stop_reason"] == "end_turn");
     REQUIRE(b["usage"]["input_tokens"] == 630);
+}
+
+TEST_CASE("chat with an image answers like the reference on vulkan",
+          "[server][image][vision][e2e][vulkan]") {
+    // The prompt prefills through forward_batch with input embeddings
+    // (i#257), which on vulkan runs each position on the GPU. Before
+    // that, image chat on vulkan answered garbage.
+    if (!std::filesystem::exists(janus_path())) {
+        SKIP("janus-pro-1b-bf16.gguf absent");
+    }
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device");
+    }
+    if (std::getenv("LOCUS_HEAVY_TESTS") == nullptr) {
+        SKIP("a 630-token image prompt; set LOCUS_HEAVY_TESTS=1");
+    }
+    auto g = locus::gguf::GgufFile::open(janus_path());
+    if (g.find_tensor("vit.patch_embd.weight") == nullptr) {
+        SKIP("janus-pro-1b-bf16.gguf has no vit.* (old conversion)");
+    }
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(locus::backend::resolve_backend("vulkan"));
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+    locus::server::OpenAiServer::Options o;
+    o.model_path = janus_path();
+    locus::server::OpenAiServer server(model, *tok, o);
+    const int port = server.bind_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { server.listen_after_bind(); });
+    struct Join {
+        locus::server::OpenAiServer& s;
+        std::thread& t;
+        ~Join() {
+            s.stop();
+            t.join();
+        }
+    } join{server, th};
+    httplib::Client c("127.0.0.1", port);
+    c.set_read_timeout(1800, 0);
+    const std::string url = "data:image/png;base64," + golden_png_b64();
+    auto r = c.Post("/v1/chat/completions",
+                    openai_image_chat(url, "What is on the table?").dump(),
+                    "application/json");
+    REQUIRE_RES(r);
+    INFO(r->body.substr(0, 300));
+    REQUIRE(r->status == 200);
+    const json a = json::parse(r->body);
+    REQUIRE(a["choices"][0]["message"]["content"] ==
+            "There is an apple on the table.");
+    REQUIRE(a["usage"]["prompt_tokens"] == 630);
 }

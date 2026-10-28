@@ -674,31 +674,53 @@ void OpenAiServer::vision_chat(bool anthropic, const VisionChat& chat,
         prompt_tokens_total_.fetch_add(ids.size(), std::memory_order_relaxed);
 
         // Prefill. The image's embeddings take its placeholder slots in
-        // order; only the last position computes the whole head (the
-        // others need no logits, so one row keeps the head cheap).
+        // order. Where the backend has a batched prefill the prompt
+        // runs in chunks (i#257: each weight read once per chunk, not
+        // once per position); otherwise one position at a time, where
+        // only the last position computes the whole head (the others
+        // need no logits, so one row keeps the head cheap).
         std::vector<float> logits(n_vocab_);
-        std::size_t img = 0, row = 0;
-        for (std::size_t i = 0; i < ids.size(); ++i) {
-            if (!alive()) {
-                res.status = 499;
-                return;
-            }
-            const model::LogitRows rows = i + 1 == ids.size()
-                                              ? model::LogitRows{}
-                                              : model::LogitRows{0, 1};
-            if (ids[i] == vision_->placeholder()) {
-                const auto emb = std::span<const float>(embs[img]).subspan(
-                    row * hp.n_embd, hp.n_embd);
-                model_.forward_layers(0, emb, 0, hp.n_layers, *vision_cache_,
-                                      seq, vision_ws_, logits, rows);
+        std::vector<const float*> embd(ids.size(), nullptr);
+        {
+            std::size_t img = 0, row = 0;
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                if (ids[i] != vision_->placeholder()) continue;
+                embd[i] = embs[img].data() + row * hp.n_embd;
                 if (++row == vision_->tokens()) {
                     row = 0;
                     ++img;
                 }
-            } else {
-                model_.forward_layers(ids[i], {}, 0, hp.n_layers,
-                                      *vision_cache_, seq, vision_ws_, logits,
-                                      rows);
+            }
+        }
+        if (model_.supports_batch_prefill()) {
+            const std::size_t chunk = model_.prefill_chunk();
+            for (std::size_t at = 0; at < ids.size(); at += chunk) {
+                if (!alive()) {
+                    res.status = 499;
+                    return;
+                }
+                const std::size_t nb = std::min(chunk, ids.size() - at);
+                model_.forward_batch(
+                    std::span<const tok::TokenId>(ids.data() + at, nb),
+                    *vision_cache_, seq, vision_ws_, logits, false,
+                    std::span<const float* const>(embd.data() + at, nb));
+            }
+        } else {
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                if (!alive()) {
+                    res.status = 499;
+                    return;
+                }
+                const model::LogitRows rows = i + 1 == ids.size()
+                                                  ? model::LogitRows{}
+                                                  : model::LogitRows{0, 1};
+                const auto emb =
+                    embd[i] != nullptr
+                        ? std::span<const float>(embd[i], hp.n_embd)
+                        : std::span<const float>();
+                model_.forward_layers(embd[i] != nullptr ? 0 : ids[i], emb,
+                                      0, hp.n_layers, *vision_cache_, seq,
+                                      vision_ws_, logits, rows);
             }
         }
 

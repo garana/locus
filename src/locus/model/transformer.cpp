@@ -992,7 +992,8 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                                kv::PagedKvCache::Seq& seq,
                                Workspace& ws,
                                std::span<float> logits,
-                               bool all_logits) const {
+                               bool all_logits,
+                               std::span<const float* const> embd) const {
     using namespace locus::backend;
     const auto n = static_cast<std::uint32_t>(toks.size());
     if (n == 0) {
@@ -1002,16 +1003,50 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
         throw std::invalid_argument(
             "forward_batch: unsupported backend");
     }
+    if (!embd.empty() && embd.size() != n) {
+        throw std::invalid_argument(
+            "forward_batch: embd needs one entry per token");
+    }
+    const bool any_embd =
+        std::any_of(embd.begin(), embd.end(),
+                    [](const float* e) { return e != nullptr; });
+    if (any_embd && spec_->forward != nullptr) {
+        throw std::invalid_argument(
+            "forward_batch: this arch takes no input embeddings");
+    }
     const std::uint32_t base = seq.n_tokens;
-    for (auto t : toks) {
-        if (t < 0 ||
-            static_cast<std::uint32_t>(t) >= hp_.n_vocab) {
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const auto t = toks[i];
+        if ((embd.empty() || embd[i] == nullptr) &&
+            (t < 0 || static_cast<std::uint32_t>(t) >= hp_.n_vocab)) {
             throw std::invalid_argument("token id out of vocab");
         }
     }
     if (base + n > hp_.n_ctx || base + n > cache.capacity(seq)) {
         throw std::invalid_argument(
             "forward_batch: seq capacity not ensured");
+    }
+    if (backend_->name == "vulkan" && any_embd) {
+        // vulkan_forward_batch takes token ids only (#247), so a chunk
+        // with input embeddings runs one GPU forward per position.
+        const std::uint32_t V = hp_.n_vocab;
+        std::vector<float> scratch(V);
+        std::vector<float> normed(hp_.n_embd);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const bool keep = all_logits || t + 1 == n;
+            std::span<float> out =
+                all_logits ? logits.subspan(std::size_t{t} * V, V)
+                : t + 1 == n ? logits
+                             : std::span<float>(scratch);
+            const std::span<const float> e =
+                embd[t] != nullptr
+                    ? std::span<const float>(embd[t], hp_.n_embd)
+                    : std::span<const float>();
+            forward_embedding(toks[t], e, cache, seq, ws, out,
+                              keep ? LogitRows{} : LogitRows{0, 1},
+                              normed);
+        }
+        return;
     }
     if (backend_->name == "vulkan") {
         if (vulkan_forward_batch(*this, toks, cache, seq, logits,
@@ -1043,9 +1078,13 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     std::vector<float> up(static_cast<std::size_t>(n) * ff);
 
     for (std::uint32_t t = 0; t < n; ++t) {
-        op.dequant_row(embd_, static_cast<std::uint32_t>(toks[t]),
-                       {x.data() + static_cast<std::size_t>(t) * E,
-                        E});
+        float* row = x.data() + static_cast<std::size_t>(t) * E;
+        if (!embd.empty() && embd[t] != nullptr) {
+            std::copy_n(embd[t], E, row);  // an input embedding
+        } else {
+            op.dequant_row(embd_, static_cast<std::uint32_t>(toks[t]),
+                           {row, E});
+        }
     }
 
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
