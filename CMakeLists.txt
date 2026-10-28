@@ -44,6 +44,9 @@ add_library(locus
     src/locus/image/janus_vision.cpp
     src/locus/image/janus_chat.cpp
     src/locus/image/png.cpp
+    src/locus/image/inflate.cpp
+    src/locus/image/png_decode.cpp
+    src/locus/image/jpeg_decode.cpp
     src/locus/image/image_input.cpp
     src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp
@@ -78,13 +81,7 @@ target_include_directories(locus SYSTEM PRIVATE
     third_party/ggml
     third_party/httplib
     third_party/json
-    third_party/stb
 )
-# stb_image's scalar JPEG IDCT can overflow int on a corrupted file
-# (UBSan on the Pi); request bytes are untrusted, so define signed
-# overflow as wrapping in the file that builds it.
-set_source_files_properties(src/locus/image/image_input.cpp
-    PROPERTIES COMPILE_OPTIONS "-fwrapv")
 find_package(Threads REQUIRED)
 target_link_libraries(locus PUBLIC Threads::Threads)
 

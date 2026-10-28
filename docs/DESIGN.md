@@ -180,10 +180,8 @@ The areas built after the MVP:
   default.
 - Vendored in-tree, pinned, sha256 recorded in the importing commit,
   license files alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
-  cpp-httplib v0.18.3 (MIT), nlohmann/json v3.11.3 (MIT), stb_image
-  v2.30 (MIT or public domain; PNG and JPEG only, for image input,
-  until our own decoders replace it, #250), and ggml's IQ lookup
-  tables (`third_party/ggml/iq_grids.h`, MIT).
+  cpp-httplib v0.18.3 (MIT), nlohmann/json v3.11.3 (MIT), and ggml's
+  IQ lookup tables (`third_party/ggml/iq_grids.h`, MIT).
 - No FetchContent and no network at configure or build time.
 - Optional system dependencies, found at configure time: the Vulkan
   loader and a shader compiler, the CUDA toolkit.
@@ -376,7 +374,7 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   batched_decode`); `locus-run` enables it with `--batch-decode`.
 - Prompt ingestion is batched by default (`--no-batch-prefill` turns
   it off). Vulkan has its own chunked prefill, `vulkan_forward_batch`
-  (chunks of up to 512 tokens, 1024 for MoE; token-exact, not
+  (chunks of up to 512 tokens, 2048 for MoE; token-exact, not
   byte-identical, to per-token prefill).
 - `LOCUS_BATCH_DEQUANT=1` selects a kernel that dequantizes each
   weight row once for all N tokens. It sums in another order, so it is

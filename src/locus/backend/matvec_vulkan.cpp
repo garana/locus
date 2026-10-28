@@ -964,20 +964,32 @@ void rec_bias(State& s, std::span<const float> bias,
 }
 
 /**
+ * @returns The most MOE_ID matmul token tiles n_tok tokens' n_tok * k
+ * pairs can fill across n_expert experts: every expert's last tile
+ * may be partial, so ceil(pairs / tile) + n_expert, and never more
+ * than n_expert times one expert's worst case.
+ */
+std::uint32_t moe_tiles_max(std::uint32_t n_tok, std::uint32_t k,
+                            std::uint32_t n_expert) {
+    const std::uint32_t pairs = n_tok * k;
+    return std::min((pairs + kMatmulToksId - 1) / kMatmulToksId + n_expert,
+                    n_expert * ((n_tok + kMatmulToksId - 1) / kMatmulToksId));
+}
+
+/**
  * Records the routed-expert matmul for a prefill chunk: every
  * expert's weights (stacked in wb, expert_bytes apart) applied once
- * to the (token, slot) pairs moe_group listed for it in ids. Pair p
- * reads X row p / x_div and writes output row p. w must have a
- * matmul_id_kernel.
+ * to the (token, slot) pairs moe_group listed for it in ids, one
+ * workgroup row per entry of moe_group's tile list (n_tok tokens of
+ * k slots each). Pair p reads X row p / x_div and writes output row p.
+ * w must have a matmul_id_kernel.
  */
 void rec_matmul_id(State& s, const Mat& w, VulkanContext::Buffer wb,
                    VulkanContext::Buffer x, VulkanContext::Buffer out,
                    VulkanContext::Buffer ids, std::uint32_t n_tok,
-                   std::uint32_t n_expert, std::uint64_t expert_bytes,
-                   std::uint32_t x_stride, std::uint32_t x_div,
-                   std::uint32_t out_stride) {
-    const std::uint32_t tiles =
-        (n_tok + kMatmulToksId - 1) / kMatmulToksId;
+                   std::uint32_t k, std::uint32_t n_expert,
+                   std::uint64_t expert_bytes, std::uint32_t x_stride,
+                   std::uint32_t x_div, std::uint32_t out_stride) {
     const VulkanContext::Buffer bufs[] = {wb, x, out, ids};
     const std::uint32_t push[] = {w.rows,
                                   w.cols,
@@ -992,7 +1004,7 @@ void rec_matmul_id(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   static_cast<std::uint32_t>(expert_bytes),
                                   0,
                                   0,
-                                  tiles,
+                                  n_expert,
                                   x_div,
                                   n_tok,
                                   1,
@@ -1005,7 +1017,7 @@ void rec_matmul_id(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   0};
     s.ctx.dispatch(staged(s, matmul_id_kernel(w)), bufs, push,
                    (w.rows + kMatmulRows - 1) / kMatmulRows,
-                   tiles * n_expert);
+                   moe_tiles_max(n_tok, k, n_expert));
 }
 
 /** The paged KV pool as a matmul weight operand. */
@@ -2835,8 +2847,10 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
             s.chunk_buf(C::kCRouter, std::size_t{n} * 2 * ne);
         const auto broute =
             s.chunk_buf(C::kCRoute, std::size_t{n} * 2 * k_used);
+        // Counts, per-expert lists, then moe_group's tile list.
         const auto bids =
-            s.chunk_buf(C::kCIds, ne + std::size_t{ne} * n);
+            s.chunk_buf(C::kCIds, ne + std::size_t{ne} * n + 1 +
+                                      moe_tiles_max(n, k_used, ne));
         const auto bdown =
             s.chunk_buf(C::kCDown, std::size_t{n} * k_used * E);
         rec_matmul(s, lay.gate_inp,
@@ -2908,19 +2922,20 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         } else {
             {
                 const VulkanContext::Buffer bufs[] = {broute, bids};
-                const std::uint32_t push[] = {n, k_used, ne, n};
+                const std::uint32_t push[] = {n, k_used, ne, n,
+                                              kMatmulToksId};
                 s.ctx.dispatch(Kernel::kMoeGroup, bufs, push, 1);
             }
             rec_matmul_id(s, g, s.upload_experts(lay.gate_exps, ne), bxb,
-                          bgate, bids, n, ne, lay.gate_exps.expert_bytes, E,
-                          k_used, ff);
+                          bgate, bids, n, k_used, ne,
+                          lay.gate_exps.expert_bytes, E, k_used, ff);
             rec_matmul_id(s, u, s.upload_experts(lay.up_exps, ne), bxb, bup,
-                          bids, n, ne, lay.up_exps.expert_bytes, E, k_used,
-                          ff);
+                          bids, n, k_used, ne, lay.up_exps.expert_bytes, E,
+                          k_used, ff);
             silu_rows(std::size_t{n} * k_used * ff);
             rec_matmul_id(s, d, s.upload_experts(lay.down_exps, ne), bgate,
-                          bdown, bids, n, ne, lay.down_exps.expert_bytes, ff,
-                          1, E);
+                          bdown, bids, n, k_used, ne,
+                          lay.down_exps.expert_bytes, ff, 1, E);
             const VulkanContext::Buffer bufs[] = {bdown, broute, bx};
             const std::uint32_t push[] = {E, k_used};
             s.ctx.dispatch(Kernel::kMoeCombine, bufs, push, (E + 255) / 256,

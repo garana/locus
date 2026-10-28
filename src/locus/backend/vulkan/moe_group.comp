@@ -7,6 +7,11 @@
 // (pair p = t * k + slot). One workgroup; the order within a list
 // is arbitrary, which is harmless since every pair's output row is
 // computed independently.
+//
+// After the lists it appends the MOE_ID matmul's work list: the tile
+// count, then one entry (expert << 16 | token tile) per tile of
+// `tile` pairs, so the matmul's grid covers the tiles that hold pairs
+// rather than n_expert times the worst case.
 
 layout(local_size_x = 256) in;
 
@@ -18,9 +23,11 @@ layout(push_constant) uniform PC {
     uint k;
     uint n_expert;  // <= 256
     uint cap;       // list capacity per expert (>= n_tok)
+    uint tile;      // pairs per MOE_ID matmul token tile
 } pc;
 
 shared uint cnt[256];
+shared uint pre[256];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -33,7 +40,25 @@ void main() {
         ids[pc.n_expert + e * pc.cap + at] = p;
     }
     barrier();
+    uint nt = 0u;
     if (tid < pc.n_expert) {
         ids[tid] = cnt[tid];
+        nt = (cnt[tid] + pc.tile - 1u) / pc.tile;
+    }
+    // Inclusive prefix sum of the tile counts (Hillis-Steele).
+    pre[tid] = nt;
+    barrier();
+    for (uint step = 1u; step < 256u; step <<= 1) {
+        uint v = tid >= step ? pre[tid - step] : 0u;
+        barrier();
+        pre[tid] += v;
+        barrier();
+    }
+    uint lb = pc.n_expert + pc.n_expert * pc.cap;
+    if (tid == 255u) {
+        ids[lb] = pre[255];
+    }
+    for (uint i = 0u; i < nt; ++i) {
+        ids[lb + 1u + pre[tid] - nt + i] = (tid << 16) | i;
     }
 }

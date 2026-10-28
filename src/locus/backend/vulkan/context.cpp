@@ -386,7 +386,7 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kKvScatter, "kv_scatter", locus_kv_scatter_spv,
      sizeof(locus_kv_scatter_spv), 3, 40},
     {Kernel::kMoeGroup, "moe_group", locus_moe_group_spv,
-     sizeof(locus_moe_group_spv), 2, 16},
+     sizeof(locus_moe_group_spv), 2, 20},
     {Kernel::kMoeCombine, "moe_combine", locus_moe_combine_spv,
      sizeof(locus_moe_combine_spv), 3, 8},
     {Kernel::kRmsNormB, "rmsnorm_b", locus_rmsnorm_b_spv,

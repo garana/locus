@@ -79,6 +79,9 @@ add_executable(locus_tests
     test_janus_vision.cpp
     test_png.cpp
     test_image_input.cpp
+    test_png_decode.cpp
+    test_jpeg_decode.cpp
+    test_jpeg_speed.cpp
     test_base64.cpp
     test_deepseek41.cpp
     test_threads.cpp
