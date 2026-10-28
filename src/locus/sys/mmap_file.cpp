@@ -33,7 +33,7 @@ Registry& registry() {
     return r;
 }
 
-std::atomic<void (*)(const void*, std::size_t)> unmap_hook{nullptr};
+std::atomic<UnmapHook> unmap_hook{nullptr};
 
 }  // namespace
 
@@ -46,8 +46,8 @@ bool in_file_mapping(const void* p, std::size_t n) {
     });
 }
 
-void set_unmap_hook(void (*hook)(const void* p, std::size_t n)) {
-    unmap_hook.store(hook);
+UnmapHook set_unmap_hook(UnmapHook hook) {
+    return unmap_hook.exchange(hook);
 }
 
 MappedFile::MappedFile(const std::string& path) {

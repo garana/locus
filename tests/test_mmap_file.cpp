@@ -42,7 +42,10 @@ TEST_CASE("mapped files are registered and report their unmap",
     std::vector<int> heap(64);
     REQUIRE_FALSE(in_file_mapping(heap.data(), sizeof(int)));
 
-    locus::sys::set_unmap_hook(&record_unmap);
+    // Put the previous hook back afterwards: the Vulkan backend's, if
+    // an earlier test built its state (i#331).
+    const locus::sys::UnmapHook prev =
+        locus::sys::set_unmap_hook(&record_unmap);
     const std::byte* data = nullptr;
     {
         locus::sys::MappedFile mf(path);
@@ -53,7 +56,7 @@ TEST_CASE("mapped files are registered and report their unmap",
         REQUIRE_FALSE(in_file_mapping(data + 9990, 20));
         REQUIRE_FALSE(in_file_mapping(data + 20000, 1));
     }
-    locus::sys::set_unmap_hook(nullptr);
+    REQUIRE(locus::sys::set_unmap_hook(prev) == &record_unmap);
     REQUIRE(hook_p == data);
     REQUIRE(hook_n == 10000);
     REQUIRE(hook_saw_live);
