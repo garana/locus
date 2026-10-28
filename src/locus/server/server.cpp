@@ -60,14 +60,40 @@ void set_error(http::ServerResponse& res, const std::exception& e) {
                     "application/json");
 }
 
+/**
+ * The text of an OpenAI message's content: a string, or an array of
+ * parts (the multimodal shape, which some clients send for plain text
+ * too) whose "text" parts are joined with newlines, as the vision path
+ * joins them. Image requests never get here (parse_vision_chat takes
+ * them first), so any other part type is unsupported.
+ */
+std::string openai_text(const json& content) {
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    if (!content.is_array()) {
+        throw std::invalid_argument(
+            "message content must be a string or an array of parts");
+    }
+    std::string out;
+    for (const auto& p : content) {
+        const std::string type = p.is_object() ? p.value("type", "") : "";
+        if (type != "text" || !p.contains("text") || !p["text"].is_string()) {
+            throw std::invalid_argument("unsupported content part: " +
+                                        (type.empty() ? "(none)" : type));
+        }
+        if (!out.empty()) out += "\n";
+        out += p["text"].get<std::string>();
+    }
+    return out;
+}
+
 /** Parses and validates the OpenAI messages array. */
 std::vector<chat::Message> parse_messages(const json& messages) {
     std::vector<chat::Message> out;
     for (const auto& m : messages) {
-        if (!m.contains("content") ||
-            !m["content"].is_string()) {
-            throw std::invalid_argument(
-                "message content must be a string");
+        if (!m.contains("content")) {
+            throw std::invalid_argument("message content is missing");
         }
         chat::Message msg;
         msg.role = m.value("role", "user");
@@ -76,7 +102,7 @@ std::vector<chat::Message> parse_messages(const json& messages) {
             throw std::invalid_argument(
                 "unsupported message role: " + msg.role);
         }
-        msg.content = m["content"].get<std::string>();
+        msg.content = openai_text(m["content"]);
         out.push_back(std::move(msg));
     }
     return out;
@@ -86,7 +112,9 @@ std::vector<chat::Message> parse_messages(const json& messages) {
  * Anthropic content is either a plain string or an array of content
  * blocks; we take the text of every {"type":"text"} block and
  * ignore the rest (images, tool_use/tool_result -- no tool support
- * yet). @returns the concatenated text.
+ * yet). @returns the text blocks joined with newlines, as the vision
+ * path joins them (Claude Code sends its system prompt as several
+ * blocks; with no separator their words would run together).
  */
 std::string anthropic_text(const json& content) {
     if (content.is_string()) {
@@ -98,6 +126,7 @@ std::string anthropic_text(const json& content) {
             if (block.value("type", "") == "text" &&
                 block.contains("text") &&
                 block["text"].is_string()) {
+                if (!out.empty()) out += "\n";
                 out += block["text"].get<std::string>();
             }
         }
@@ -109,24 +138,24 @@ std::string anthropic_text(const json& content) {
 
 /**
  * Parses an Anthropic /v1/messages body into chat::Message list:
- * the top-level `system` (string or blocks) becomes a leading
- * system message, then each messages[] entry (user/assistant).
+ * one leading system message, then each user/assistant entry of
+ * messages[]. The system text is the top-level `system` (string or
+ * blocks) followed by every system-role entry of messages[], joined
+ * with newlines: Claude Code sends one after the first user turn,
+ * and chat templates expect a single system message first.
  */
 std::vector<chat::Message> parse_anthropic_messages(
     const json& body) {
     std::vector<chat::Message> out;
+    std::string system;
     if (body.contains("system") && !body["system"].is_null()) {
-        chat::Message sys;
-        sys.role = "system";
-        sys.content = anthropic_text(body["system"]);
-        if (!sys.content.empty()) {
-            out.push_back(std::move(sys));
-        }
+        system = anthropic_text(body["system"]);
     }
     for (const auto& m : body.at("messages")) {
         chat::Message msg;
         msg.role = m.value("role", "user");
-        if (msg.role != "user" && msg.role != "assistant") {
+        if (msg.role != "user" && msg.role != "assistant" &&
+            msg.role != "system") {
             throw std::invalid_argument(
                 "unsupported message role: " + msg.role);
         }
@@ -135,7 +164,15 @@ std::vector<chat::Message> parse_anthropic_messages(
                 "message must have content");
         }
         msg.content = anthropic_text(m["content"]);
+        if (msg.role == "system") {
+            if (!system.empty() && !msg.content.empty()) system += "\n";
+            system += msg.content;
+            continue;
+        }
         out.push_back(std::move(msg));
+    }
+    if (!system.empty()) {
+        out.insert(out.begin(), chat::Message{"system", system});
     }
     return out;
 }
@@ -358,10 +395,13 @@ std::optional<VisionChat> parse_vision_chat(const json& body,
         if (!m.contains("content")) {
             throw std::invalid_argument("message must have content");
         }
-        if (role == "system" && !anthropic) {
-            if (!vc.system.empty()) vc.system += "\n";
-            vc.system += vision_turn_text(m["content"], false, false,
-                                          max_bytes, vc.images);
+        if (role == "system") {
+            // Anthropic: as parse_anthropic_messages, after the
+            // top-level system text.
+            const std::string text = vision_turn_text(
+                m["content"], anthropic, false, max_bytes, vc.images);
+            if (!vc.system.empty() && !text.empty()) vc.system += "\n";
+            vc.system += text;
             vc.has_system = true;
         } else if (role == "user" || role == "assistant") {
             vc.turns.push_back(

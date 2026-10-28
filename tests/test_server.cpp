@@ -221,6 +221,42 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
                      .empty());
     }
 
+    SECTION("chat content as text parts equals the joined string") {
+        // The OpenAI multimodal shape with text parts only: the parts
+        // join with newlines, so the greedy reply equals the string's.
+        auto reply = [&](const json& content) {
+            json req{{"messages",
+                      json::array({{{"role", "user"},
+                                    {"content", content}}})},
+                     {"max_tokens", 8}};
+            auto res = client.Post("/v1/chat/completions", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            INFO(res->body);
+            REQUIRE(res->status == 200);
+            return json::parse(res->body)["choices"][0]["message"]
+                                         ["content"]
+                .get<std::string>();
+        };
+        const json parts = json::array(
+            {{{"type", "text"}, {"text", "Once upon"}},
+             {{"type", "text"}, {"text", "a time"}}});
+        REQUIRE(reply(parts) == reply("Once upon\na time"));
+
+        auto bad = [&](const json& content) {
+            json req{{"messages",
+                      json::array({{{"role", "user"},
+                                    {"content", content}}})},
+                     {"max_tokens", 4}};
+            auto res = client.Post("/v1/chat/completions", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            return res->status;
+        };
+        REQUIRE(bad(json::array({{{"type", "input_audio"}}})) == 400);
+        REQUIRE(bad(42) == 400);
+    }
+
     SECTION("chat completions with tools is accepted") {
         // The toy model won't emit a valid tool call, so this just
         // confirms the tools plumbing (system injection + response
@@ -360,6 +396,65 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(res);
         REQUIRE(res->status == 200);
         REQUIRE(json::parse(res->body)["type"] == "message");
+    }
+
+    SECTION("anthropic system messages join the top-level system") {
+        // Claude Code sends a system-role entry after the first user
+        // turn; its text goes after the top-level system text. The
+        // reply, and the prompt length (stories260K's reply does not
+        // depend on the system text), must match the joined request.
+        const auto reply = [&](const json& req) {
+            auto res = client.Post("/v1/messages", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            const auto body = json::parse(res->body);
+            const auto& u = body["usage"];
+            const int prompt = u["input_tokens"].get<int>() +
+                               u.value("cache_read_input_tokens", 0) +
+                               u.value("cache_creation_input_tokens", 0);
+            return std::make_pair(body["content"][0]["text"]
+                                      .get<std::string>(),
+                                  prompt);
+        };
+        const json user{{"role", "user"}, {"content", "Once upon a time"}};
+        const auto joined =
+            reply({{"system", "You are\na storyteller."},
+                   {"messages", json::array({user})},
+                   {"max_tokens", 12}});
+        REQUIRE(joined.second >
+                reply({{"messages", json::array({user})},
+                       {"max_tokens", 12}})
+                    .second);
+        // Text blocks join with newlines, at the top level too.
+        REQUIRE(reply({{"system",
+                        json::array({{{"type", "text"}, {"text", "You are"}},
+                                     {{"type", "text"},
+                                      {"text", "a storyteller."}}})},
+                       {"messages", json::array({user})},
+                       {"max_tokens", 12}}) == joined);
+        REQUIRE(reply({{"system", "You are"},
+                       {"messages",
+                        json::array({user,
+                                     {{"role", "system"},
+                                      {"content",
+                                       json::array({{{"type", "text"},
+                                                     {"text",
+                                                      "a storyteller."}}})}}})},
+                       {"max_tokens", 12}}) == joined);
+        REQUIRE(reply({{"messages",
+                        json::array({{{"role", "system"},
+                                      {"content", "You are\na storyteller."}},
+                                     user})},
+                       {"max_tokens", 12}}) == joined);
+
+        json bad{{"messages",
+                  json::array({user, {{"role", "tool"}, {"content", "x"}}})},
+                 {"max_tokens", 4}};
+        auto res = client.Post("/v1/messages", bad.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 400);
     }
 
     SECTION("anthropic messages, streaming SSE") {

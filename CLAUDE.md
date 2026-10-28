@@ -31,7 +31,10 @@ Use the `build` and `test` skills (.claude/skills/). Quick form:
   content-aligned widths.
 - Documentation: terse, plain text; the current state, not a work
   log; no `--` joining ideas in a sentence; math as GitHub-rendered
-  LaTeX (`$...$`, `$$...$$` or a ` ```math ` block).
+  LaTeX: display math in a ` ```math ` block (not indented in a
+  list), inline `$...$` on one line with no backslash before
+  punctuation (GitHub strips it: use `\ `, not `\,`) and `\lt`, not
+  `<`.
 - Unit tests with vendored Catch2 for every component; all tests
   green before any commit.
 - Commit as each unit of work completes. No Co-Authored-By lines.
