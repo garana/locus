@@ -29,6 +29,7 @@
 #include "locus/model/grammar.hpp"
 #include "locus/model/sampling.hpp"
 #include "locus/server/errors.hpp"
+#include "locus/server/metrics_text.hpp"
 #include "locus/server/tools.hpp"
 #include "locus/sys/perf_counters.hpp"
 
@@ -205,6 +206,17 @@ std::pair<model::SamplingParams, std::uint64_t> parse_sampling(
         seed = body["seed"].get<std::uint64_t>();
     }
     return {p, seed};
+}
+
+/** @returns The --kv-type name of `t`, for the locus_info series. */
+std::string kv_type_name(kv::KvType t) {
+    switch (t) {
+        case kv::KvType::kF32: return "f32";
+        case kv::KvType::kF16: return "f16";
+        case kv::KvType::kQ8: return "q8";
+        case kv::KvType::kQ4: return "q4";
+    }
+    return "f32";
 }
 
 /** True when the caller asked for JSON output (OpenAI
@@ -929,35 +941,23 @@ void OpenAiServer::install_routes() {
     auto handle_metrics = [this](const http::Request&,
                                  http::ServerResponse& res) {
             const auto s = loop_.stats();
-            std::string b;
+            // Every series carries the model and backend (i#285).
+            const std::string backend(model_.active_backend().name);
+            MetricsText mt({{"model", opt_.model_name},
+                            {"backend", backend}});
             auto counter = [&](const char* name, const char* help,
                                std::uint64_t v) {
-                b += "# HELP ";
-                b += name;
-                b += ' ';
-                b += help;
-                b += "\n# TYPE ";
-                b += name;
-                b += " counter\n";
-                b += name;
-                b += ' ';
-                b += std::to_string(v);
-                b += '\n';
+                mt.counter(name, help, v);
             };
             auto gauge = [&](const char* name, const char* help,
                              std::uint64_t v) {
-                b += "# HELP ";
-                b += name;
-                b += ' ';
-                b += help;
-                b += "\n# TYPE ";
-                b += name;
-                b += " gauge\n";
-                b += name;
-                b += ' ';
-                b += std::to_string(v);
-                b += '\n';
+                mt.gauge(name, help, v);
             };
+            mt.info("locus_info", "What this server runs.",
+                    {{"arch", opt_.model_arch},
+                     {"chat_template",
+                      std::string(opt_.chat_template.name())},
+                     {"kv_type", kv_type_name(loop_.kv_type())}});
             counter("locus_requests_total",
                     "Completion requests accepted.",
                     requests_total_.load());
@@ -980,6 +980,55 @@ void OpenAiServer::install_routes() {
                   s.total_blocks);
             gauge("locus_kv_blocks_free", "Free KV cache blocks.",
                   s.free_blocks);
+            // Timings and scheduler state, read without the engine
+            // lock. Phase times are per-request wall time, so with
+            // concurrent requests their sums exceed the elapsed time;
+            // engine_busy is the engine's own step time.
+            const engine::EngineMetrics& em = loop_.metrics();
+            constexpr auto kRelaxed = std::memory_order_relaxed;
+            auto secs = [](std::uint64_t ns) {
+                return static_cast<double>(ns) / 1e9;
+            };
+            mt.histogram("locus_queue_seconds",
+                         "Submit to first admission, per request.",
+                         em.queue.snapshot());
+            mt.histogram("locus_prefill_seconds",
+                         "First admission to first token, per request.",
+                         em.prefill.snapshot());
+            mt.histogram("locus_time_to_first_token_seconds",
+                         "Submit to first token, per request.",
+                         em.ttft.snapshot());
+            mt.histogram("locus_decode_token_seconds",
+                         "Time per generated token after the first, per "
+                         "request.",
+                         em.decode_token.snapshot());
+            mt.histogram("locus_request_seconds",
+                         "Submit to done, per completed request.",
+                         em.request.snapshot());
+            counter("locus_prefill_tokens_total",
+                    "Prompt tokens computed (not reused) by completed "
+                    "requests.",
+                    em.prefill_tokens.load(kRelaxed));
+            mt.counter("locus_prefill_seconds_total",
+                       "Prefill wall time of completed requests.",
+                       secs(em.prefill_ns.load(kRelaxed)));
+            counter("locus_decode_tokens_total",
+                    "Tokens after the first, of completed requests.",
+                    em.decode_tokens.load(kRelaxed));
+            mt.counter("locus_decode_seconds_total",
+                       "Decode wall time of completed requests.",
+                       secs(em.decode_ns.load(kRelaxed)));
+            mt.counter("locus_engine_busy_seconds_total",
+                       "Time the engine spent in scheduling steps.",
+                       secs(em.busy_ns.load(kRelaxed)));
+            counter("locus_engine_steps_total", "Engine scheduling steps.",
+                    em.steps.load(kRelaxed));
+            gauge("locus_sequences_running",
+                  "Sequences running after the last step.",
+                  em.running.load(kRelaxed));
+            gauge("locus_requests_waiting",
+                  "Requests waiting for admission after the last step.",
+                  em.waiting.load(kRelaxed));
             // CPU cache counters for the inference compute threads
             // (Linux perf). Absent -- not zero -- when unavailable
             // (non-Linux, or perf_event_paranoid denies it), so a
@@ -1010,7 +1059,7 @@ void OpenAiServer::install_routes() {
                             pc.llc_load_misses);
                 }
             }
-            res.set_content(b, "text/plain; version=0.0.4");
+            res.set_content(mt.text(), "text/plain; version=0.0.4");
     };
 
     // Both endpoints share one implementation; `chat` only changes

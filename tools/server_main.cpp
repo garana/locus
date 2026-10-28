@@ -101,6 +101,9 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         // Advertise the basename, not the absolute path: /v1/models
         // and /metrics echo model_name to unauthenticated clients.
         opt.model_name = locus_tools::public_model_id(model_path);
+        if (const auto a = g.get_string("general.architecture")) {
+            opt.model_arch = std::string(*a);
+        }
         if (args.ctx > 0) {
             opt.engine.n_blocks = (args.ctx + 15) / 16;
         }

@@ -140,8 +140,11 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(b.find("locus_kv_blocks_total") !=
                 std::string::npos);
         // At least the request we just issued is counted.
-        REQUIRE(b.find("locus_requests_total 0\n") ==
-                std::string::npos);
+        const std::size_t at = b.find("\nlocus_requests_total{");
+        REQUIRE(at != std::string::npos);
+        const std::size_t sp = b.find("} ", at);
+        REQUIRE(sp != std::string::npos);
+        REQUIRE(b.compare(sp, 4, "} 0\n") != 0);
     }
 
     SECTION("completions, non-streaming") {
@@ -1026,19 +1029,25 @@ std::string make_get(const std::string& path) {
  *  by a space and a digit), so it never picks up the "# HELP name" or
  *  "# TYPE name" lines. @returns the value, or -1 if absent. */
 long metric_value(const std::string& body, const std::string& name) {
-    const std::string key = "\n" + name + " ";
-    // Allow a match at the very start of the body too.
-    std::size_t pos =
-        body.compare(0, name.size() + 1, name + " ") == 0 ? 0
-                                                           : body.find(key);
-    if (pos == std::string::npos) {
-        return -1;
+    // A sample line is `name value` or `name{labels} value`, at the
+    // start of the body or after a newline.
+    for (std::size_t at = 0; at < body.size();) {
+        const std::size_t eol = body.find('\n', at);
+        const std::size_t end = eol == std::string::npos ? body.size() : eol;
+        if (body.compare(at, name.size(), name) == 0) {
+            std::size_t p = at + name.size();
+            if (p < end && body[p] == '{') {
+                p = body.find('}', p);
+                p = p == std::string::npos || p >= end ? end : p + 1;
+            }
+            if (p < end && body[p] == ' ' && p + 1 < end &&
+                body[p + 1] >= '0' && body[p + 1] <= '9') {
+                return std::atol(body.c_str() + p + 1);
+            }
+        }
+        at = end + 1;
     }
-    const std::size_t num = (pos == 0 ? 0 : pos + 1) + name.size() + 1;
-    if (num >= body.size() || body[num] < '0' || body[num] > '9') {
-        return -1;
-    }
-    return std::atol(body.c_str() + num);
+    return -1;
 }
 
 /** GETs /metrics and returns the named metric's value, or -1. */
@@ -1055,6 +1064,82 @@ long scrape_metric(int port, const std::string& name) {
 }
 
 }  // namespace
+
+TEST_CASE("metrics carry labels and timings in well-formed histograms",
+          "[server][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::server::OpenAiServer::Options opt;
+    opt.model_name = "m\"1";  // a quote, to check label escaping
+    opt.model_arch = "llama";
+    TestServer ts(model, tok, opt);
+    httplib::Client client("127.0.0.1", ts.port);
+    for (int i = 0; i < 2; ++i) {
+        const json req{{"prompt", "Once upon a time"}, {"max_tokens", 4}};
+        auto r = client.Post("/v1/completions", req.dump(),
+                             "application/json");
+        REQUIRE(r);
+        REQUIRE(r->status == 200);
+    }
+    auto res = client.Get("/metrics");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const std::string& b = res->body;
+
+    // Every sample line carries the model (escaped) and backend.
+    const std::string labels = std::string("model=\"m\\\"1\",backend=\"") +
+                               std::string(model.active_backend().name) +
+                               "\"";
+    int samples = 0;
+    std::size_t at = 0;
+    while (at < b.size()) {
+        const std::size_t eol = b.find('\n', at);
+        const std::string line = b.substr(at, eol - at);
+        at = eol == std::string::npos ? b.size() : eol + 1;
+        if (line.empty() || line[0] == '#') continue;
+        ++samples;
+        INFO(line);
+        REQUIRE(line.rfind("locus_", 0) == 0);
+        REQUIRE(line.find("{" + labels) != std::string::npos);
+    }
+    REQUIRE(samples > 20);
+    REQUIRE(b.find("\nlocus_info{" + labels +
+                   ",arch=\"llama\",chat_template=\"") !=
+            std::string::npos);
+
+    REQUIRE(metric_value(b, "locus_engine_steps_total") > 0);
+    REQUIRE(metric_value(b, "locus_decode_tokens_total") >= 6);  // 2 x 3
+    REQUIRE(metric_value(b, "locus_prefill_tokens_total") > 0);
+    REQUIRE(metric_value(b, "locus_requests_waiting") == 0);
+
+    // Histogram: buckets cumulative, +Inf equals _count, which counts
+    // both requests.
+    for (const char* h :
+         {"locus_request_seconds", "locus_time_to_first_token_seconds",
+          "locus_decode_token_seconds", "locus_queue_seconds",
+          "locus_prefill_seconds"}) {
+        INFO(h);
+        const std::string bucket = std::string("\n") + h + "_bucket{";
+        long prev = 0;
+        long inf = -1;
+        for (std::size_t p = b.find(bucket); p != std::string::npos;
+             p = b.find(bucket, p + 1)) {
+            const std::size_t le = b.find("le=\"", p) + 4;
+            const std::string bound = b.substr(le, b.find('"', le) - le);
+            const long v = std::atol(b.c_str() + b.find("} ", p) + 2);
+            REQUIRE(v >= prev);
+            prev = v;
+            if (bound == "+Inf") inf = v;
+        }
+        REQUIRE(inf == 2);
+        REQUIRE(metric_value(b, std::string(h) + "_count") == 2);
+        REQUIRE(b.find(std::string("\n") + h + "_sum{") != std::string::npos);
+    }
+}
 
 // Follow-up to i#81 (cancel on disconnect) / i#85 + i#88 (fast-path
 // acceptor): the STREAMING cancel path is reached by the Sink write

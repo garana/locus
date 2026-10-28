@@ -434,6 +434,17 @@ guarding the default path.
   backends only (`TransformerModel::embed` refuses vulkan).
 - API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
   (a log-softmax over the raw logits) and usage accounting.
+- Metrics: every `/metrics` series carries `model` and `backend`
+  labels, and `locus_info` adds `arch`, `chat_template` and `kv_type`.
+  Request counters and KV gauges sit beside per-request histograms
+  (`locus_queue_seconds`, `locus_prefill_seconds`,
+  `locus_time_to_first_token_seconds`, `locus_decode_token_seconds`,
+  `locus_request_seconds`), token and wall-time counters for prefill
+  and decode, the engine's step time (`locus_engine_busy_seconds_total`,
+  `locus_engine_steps_total`) and the running and waiting counts. The
+  engine writes them as relaxed atomics, a few clock reads per request
+  and two per step, and `/metrics` reads them without the engine lock;
+  decode speed is unchanged within noise.
 - KV-cache quantization: Q8 or Q4 blocks of 32 (f16 scale) in a
   separate byte pool, for the llama-family attention. Each layer's
   past rows are dequantized into scratch, so the attention math is the

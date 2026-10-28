@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -9,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "locus/engine/metrics.hpp"
 #include "locus/engine/prefix_cache.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
@@ -86,6 +88,12 @@ struct Request {
     /** Logits of the last token fed (batched-decode path only,
      * where several sequences' forwards interleave in one step). */
     std::vector<float> logits;
+
+    /** Timestamps for EngineMetrics: submit, first admission (a
+     * preempted request keeps its first), first generated token. */
+    std::chrono::steady_clock::time_point t_submit{};
+    std::chrono::steady_clock::time_point t_admit{};
+    std::chrono::steady_clock::time_point t_first{};
 };
 
 /**
@@ -261,8 +269,15 @@ class Engine {
     }
     /** Speculative verify forwards run, cumulative. */
     std::uint64_t spec_steps() const { return spec_steps_; }
+    /** Timing and scheduler metrics; safe to read from any thread
+     * without the lock that serializes step(). */
+    const EngineMetrics& metrics() const { return metrics_; }
 
   private:
+    /** One scheduling iteration (step() times it). */
+    bool step_once();
+    /** Adds a completed request's phase times to metrics_. */
+    void observe_done(const Request& r);
     /** Feeds up to `budget` tokens of r; samples when caught up. */
     void advance(Request& r, std::uint32_t& budget);
 
@@ -333,6 +348,7 @@ class Engine {
     std::uint64_t prefix_reused_tokens_ = 0;
     std::uint64_t spec_accepted_ = 0;
     std::uint64_t spec_steps_ = 0;
+    EngineMetrics metrics_;
 };
 
 }  // namespace locus::engine

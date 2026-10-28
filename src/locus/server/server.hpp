@@ -59,6 +59,9 @@ class OpenAiServer {
     struct Options {
         /** Reported in responses' "model" field. */
         std::string model_name = "locus";
+        /** The GGUF's general.architecture, for the /metrics
+         * locus_info series (empty when unknown). */
+        std::string model_arch;
         engine::Engine::Config engine;
         /** Hard cap applied to requested max_tokens. */
         std::uint32_t max_tokens_cap = 1024;
