@@ -186,7 +186,13 @@ TEST_CASE("auth resolves through the reference helper binary",
     REQUIRE(conn);
     std::vector<std::unique_ptr<HelperConnection>> conns;
     conns.push_back(std::move(conn));
-    AuthClient client(std::move(conns), clock, AuthConfig{});
+    // The first request waits for the helper process to start, which
+    // on a loaded machine can take longer than the 1 s default
+    // (i#219). Timeouts are covered by "auth fails closed and does not
+    // cache a timeout".
+    AuthConfig cfg;
+    cfg.request_timeout = 30s;
+    AuthClient client(std::move(conns), clock, cfg);
 
     auto good = client.resolve("sk-ok");
     REQUIRE(good.ok);
