@@ -675,6 +675,7 @@ struct VulkanContext::Impl {
 
     /** Open batch state (begin_batch .. end_batch). */
     VkCommandBuffer batch_cmd = VK_NULL_HANDLE;
+    bool batch_is_open = false;
 
     /**
      * LOCUS_VK_PROFILE state: a timestamp at batch begin, one after
@@ -1352,6 +1353,8 @@ void* VulkanContext::mapped(Buffer b) {
     return static_cast<Impl::HostBuffer*>(b.impl)->map;
 }
 
+bool VulkanContext::batch_open() const { return impl_->batch_is_open; }
+
 void VulkanContext::begin_batch() {
     Impl& im = *impl_;
     VkCommandBufferAllocateInfo cba{};
@@ -1375,6 +1378,9 @@ void VulkanContext::begin_batch() {
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                             im.qpool, 0);
     }
+    // Open only once the command buffer exists and recording began: a
+    // throw above leaves no batch (and no BatchScope) behind.
+    im.batch_is_open = true;
 }
 
 void VulkanContext::dispatch(Kernel k,
@@ -1462,6 +1468,11 @@ void VulkanContext::dispatch(Kernel k,
 
 void VulkanContext::end_batch() {
     Impl& im = *impl_;
+    // Closed from here on, even if submit or wait throws below. If the
+    // submit succeeds and the wait fails (device lost), work may still
+    // be in flight and the command buffer is not freed; that process
+    // does not recover or unload cleanly anyway.
+    im.batch_is_open = false;
     using clock = std::chrono::steady_clock;
     const bool prof = im.qpool != VK_NULL_HANDLE;
     const auto last_ts =
@@ -1509,6 +1520,16 @@ void VulkanContext::end_batch() {
     // budget cycling per-expert buffers).
     if (im.sets_stale || im.sets_live > 65536) {
         im.reset_sets();
+    }
+}
+
+void VulkanContext::abandon_batch() {
+    Impl& im = *impl_;
+    im.batch_is_open = false;
+    if (im.batch_cmd != VK_NULL_HANDLE) {
+        // Never submitted (or its submit failed): free it as is.
+        vkFreeCommandBuffers(im.device, im.pool, 1, &im.batch_cmd);
+        im.batch_cmd = VK_NULL_HANDLE;
     }
 }
 
@@ -1654,6 +1675,8 @@ void VulkanContext::read_buffer(Buffer, std::span<std::byte>) {
 }
 void* VulkanContext::mapped(Buffer) { no_kernels(); }
 void VulkanContext::begin_batch() { no_kernels(); }
+bool VulkanContext::batch_open() const { no_kernels(); }
+void VulkanContext::abandon_batch() { no_kernels(); }
 void VulkanContext::dispatch(Kernel, std::span<const Buffer>,
                              std::span<const std::uint32_t>,
                              std::uint32_t, std::uint32_t,
