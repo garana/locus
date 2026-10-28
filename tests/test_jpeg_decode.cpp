@@ -47,6 +47,8 @@ void decode_or_refuse(std::span<const std::byte> f) {
 
 }  // namespace
 
+// NAME.rgb is stb_image's 3-channel output for NAME.jpg, written while
+// it was still vendored (it was the reference this decoder matched).
 TEST_CASE("jpeg decoder matches stb_image on the corpus", "[image][jpeg]") {
     const auto names = corpus();
     REQUIRE(names.size() >= 27);
@@ -60,13 +62,13 @@ TEST_CASE("jpeg decoder matches stb_image on the corpus", "[image][jpeg]") {
             continue;
         }
         const auto got = decode_jpeg(jpg, {});
-        const auto ref = locus::image::detail::decode_image_stb(jpg);
-        REQUIRE(got.w == ref.w);
-        REQUIRE(got.h == ref.h);
+        const auto ref = read_file(kCorpus + n + ".rgb");
+        REQUIRE(got.rgb.size() == ref.size());
         int worst = 0;
         std::size_t diffs = 0;
         for (std::size_t i = 0; i < got.rgb.size(); ++i) {
-            const int d = std::abs(int(got.rgb[i]) - int(ref.rgb[i]));
+            const int d = std::abs(int(got.rgb[i]) -
+                                   std::to_integer<int>(ref[i]));
             worst = std::max(worst, d);
             diffs += d != 0;
         }

@@ -5,8 +5,13 @@ Synthetic photo-like sources (gradients, edges, noise) go through
 cjpeg (libjpeg-turbo) with the encodings image input meets: every
 common chroma subsampling and some unusual ones, baseline, optimized
 and progressive scans, restart intervals, grayscale, RGB colorspace,
-16-bit quantization tables (quality 1), odd sizes. The tests compare
-locus's decoder with stb_image on each file.
+16-bit quantization tables (quality 1), odd sizes. The script writes
+only the .jpg files. Each NAME.rgb next to them is stb_image v2.30's
+3-channel output, written while stb_image was vendored (locus's
+decoder matched it byte for byte); the tests compare with those. A
+new file needs a reference made the same way. libjpeg-turbo's djpeg
+(-dct int) is only a sanity check: it rounds differently, by up to 2
+in about 3% of the bytes even at 4:4:4.
 
 arith_*.jpg uses arithmetic coding, which the decoder refuses.
 
