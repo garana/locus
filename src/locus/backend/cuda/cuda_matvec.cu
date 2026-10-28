@@ -11,6 +11,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -2209,6 +2210,78 @@ struct DevBuf {
 };
 
 /**
+ * One set of reusable device buffers for a matvec call's activations
+ * and outputs, on one device. Each slot only grows, so after the first
+ * calls a matvec needs no cudaMalloc / cudaFree.
+ */
+struct ScratchSet {
+    static constexpr int kSlots = 4;
+    int device = 0;
+    void* p[kSlots] = {};
+    std::size_t cap[kSlots] = {};
+};
+
+std::mutex g_scratch_mu;
+std::vector<ScratchSet*> g_scratch_free;
+
+/**
+ * Leases a ScratchSet for the calling thread's current device: one
+ * from the free list, or a new one, returned to the list when the
+ * lease ends. Concurrent calls each get their own set, so the number of
+ * sets is the peak number of concurrent CUDA matvecs. Sets are never
+ * freed; process exit releases the device memory, as for the weight
+ * pool (no cudaFree racing context teardown).
+ */
+class ScratchLease {
+  public:
+    ScratchLease() {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        std::lock_guard<std::mutex> lk(g_scratch_mu);
+        for (auto it = g_scratch_free.begin(); it != g_scratch_free.end();
+             ++it) {
+            if ((*it)->device == dev) {
+                set_ = *it;
+                g_scratch_free.erase(it);
+                return;
+            }
+        }
+        set_ = new ScratchSet;
+        set_->device = dev;
+    }
+    ~ScratchLease() {
+        std::lock_guard<std::mutex> lk(g_scratch_mu);
+        g_scratch_free.push_back(set_);
+    }
+    ScratchLease(const ScratchLease&) = delete;
+    ScratchLease& operator=(const ScratchLease&) = delete;
+
+    /** @returns slot i's buffer, grown to at least `bytes` (at least 1),
+     *  or nullptr if the device allocation failed. */
+    void* get(int i, std::size_t bytes) {
+        bytes = std::max<std::size_t>(bytes, 1);
+        if (set_->cap[i] >= bytes) {
+            return set_->p[i];
+        }
+        if (set_->p[i] != nullptr) {
+            cudaFree(set_->p[i]);
+            set_->p[i] = nullptr;
+            set_->cap[i] = 0;
+        }
+        void* p = nullptr;
+        if (!cuda_ok(cudaMalloc(&p, bytes))) {
+            return nullptr;
+        }
+        set_->p[i] = p;
+        set_->cap[i] = bytes;
+        return p;
+    }
+
+  private:
+    ScratchSet* set_ = nullptr;
+};
+
+/**
  * Device weight pool (R8-GPU pager). Caches one device buffer per
  * weight, keyed by host pointer, so a weight is uploaded once and
  * reused across tokens under a byte budget with LRU eviction.
@@ -2717,20 +2790,20 @@ bool run_matvec(const Mat& w, std::span<const float> x,
 
     bool ok = false;
     {
-        DevBuf dx, dout;  // transient: change every call
+        ScratchLease scratch;  // x / out buffers, reused across calls
         const std::size_t x_bytes = x.size() * sizeof(float);
         const std::size_t out_bytes =
             static_cast<std::size_t>(w.rows) * sizeof(float);
-        if (dx.alloc(x_bytes) && dout.alloc(out_bytes) &&
-            cuda_ok(cudaMemcpy(dx.p, x.data(), x_bytes,
+        void* dx = scratch.get(0, x_bytes);
+        void* dout = scratch.get(1, out_bytes);
+        if (dx != nullptr && dout != nullptr &&
+            cuda_ok(cudaMemcpy(dx, x.data(), x_bytes,
                                cudaMemcpyHostToDevice))) {
-            launch_kernel(kind, dw, t,
-                          static_cast<const float*>(dx.p),
-                          static_cast<float*>(dout.p), w.rows,
-                          w.cols);
+            launch_kernel(kind, dw, t, static_cast<const float*>(dx),
+                          static_cast<float*>(dout), w.rows, w.cols);
             ok = cuda_ok(cudaGetLastError()) &&
                  cuda_ok(cudaDeviceSynchronize()) &&
-                 cuda_ok(cudaMemcpy(out.data(), dout.p, out_bytes,
+                 cuda_ok(cudaMemcpy(out.data(), dout, out_bytes,
                                     cudaMemcpyDeviceToHost));
         }
     }
@@ -2857,17 +2930,19 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
     }
     bool ok = false;
     {
-        DevBuf dx, dout;
+        ScratchLease scratch;
         const std::size_t x_bytes = x_batch.size() * sizeof(float);
         const std::size_t out_bytes = out_batch.size() * sizeof(float);
-        if (dx.alloc(x_bytes) && dout.alloc(out_bytes) &&
-            cuda_ok(cudaMemcpy(dx.p, x_batch.data(), x_bytes,
+        void* dx = scratch.get(0, x_bytes);
+        void* dout = scratch.get(1, out_bytes);
+        if (dx != nullptr && dout != nullptr &&
+            cuda_ok(cudaMemcpy(dx, x_batch.data(), x_bytes,
                                cudaMemcpyHostToDevice))) {
             const std::uint32_t blocks =
                 (w.rows + kWarpRows - 1) / kWarpRows;
             const auto* dwb = static_cast<const std::uint8_t*>(dw);
-            const auto* dxf = static_cast<const float*>(dx.p);
-            auto* doutf = static_cast<float*>(dout.p);
+            const auto* dxf = static_cast<const float*>(dx);
+            auto* doutf = static_cast<float*>(dout);
             if (q6) {
                 matvec_batch_q6_k_kernel<<<blocks, 32 * kWarpRows>>>(
                     dwb, dxf, doutf, w.rows, w.cols, n);
@@ -2877,8 +2952,7 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
             }
             ok = cuda_ok(cudaGetLastError()) &&
                  cuda_ok(cudaDeviceSynchronize()) &&
-                 cuda_ok(cudaMemcpy(out_batch.data(), dout.p,
-                                    out_bytes,
+                 cuda_ok(cudaMemcpy(out_batch.data(), dout, out_bytes,
                                     cudaMemcpyDeviceToHost));
         }
     }
@@ -2939,28 +3013,30 @@ bool run_matvec_q8k(const Mat& w, std::span<const float> x,
 
     bool ok = false;
     {
-        DevBuf dd, dqs, dbs, dout;
+        ScratchLease scratch;
         const std::size_t out_bytes =
             static_cast<std::size_t>(w.rows) * sizeof(float);
-        if (dd.alloc(nsb * sizeof(float)) &&
-            dqs.alloc(x.size() * sizeof(std::int8_t)) &&
-            dbs.alloc(nsb * 16 * sizeof(std::int16_t)) &&
-            dout.alloc(out_bytes) &&
-            cuda_ok(cudaMemcpy(dd.p, hd.data(), nsb * sizeof(float),
+        void* dd = scratch.get(0, nsb * sizeof(float));
+        void* dqs = scratch.get(1, x.size() * sizeof(std::int8_t));
+        void* dbs = scratch.get(2, nsb * 16 * sizeof(std::int16_t));
+        void* dout = scratch.get(3, out_bytes);
+        if (dd != nullptr && dqs != nullptr && dbs != nullptr &&
+            dout != nullptr &&
+            cuda_ok(cudaMemcpy(dd, hd.data(), nsb * sizeof(float),
                                cudaMemcpyHostToDevice)) &&
-            cuda_ok(cudaMemcpy(dqs.p, hqs.data(), x.size(),
+            cuda_ok(cudaMemcpy(dqs, hqs.data(), x.size(),
                                cudaMemcpyHostToDevice)) &&
-            cuda_ok(cudaMemcpy(dbs.p, hbs.data(),
+            cuda_ok(cudaMemcpy(dbs, hbs.data(),
                                nsb * 16 * sizeof(std::int16_t),
                                cudaMemcpyHostToDevice))) {
             const std::uint32_t threads = 256;
             const std::uint32_t blocks =
                 (w.rows + threads - 1) / threads;
             const auto* dwb = static_cast<const std::uint8_t*>(dw);
-            const auto* ddf = static_cast<const float*>(dd.p);
-            const auto* dqsb = static_cast<const std::int8_t*>(dqs.p);
-            const auto* dbsb = static_cast<const std::int16_t*>(dbs.p);
-            auto* doutf = static_cast<float*>(dout.p);
+            const auto* ddf = static_cast<const float*>(dd);
+            const auto* dqsb = static_cast<const std::int8_t*>(dqs);
+            const auto* dbsb = static_cast<const std::int16_t*>(dbs);
+            auto* doutf = static_cast<float*>(dout);
             switch (w.type) {
                 case gguf::TensorType::kQ4_K:
                     matvec_q4_k_q8k_kernel<<<blocks, threads>>>(
@@ -3032,7 +3108,7 @@ bool run_matvec_q8k(const Mat& w, std::span<const float> x,
             }
             ok = cuda_ok(cudaGetLastError()) &&
                  cuda_ok(cudaDeviceSynchronize()) &&
-                 cuda_ok(cudaMemcpy(out.data(), dout.p, out_bytes,
+                 cuda_ok(cudaMemcpy(out.data(), dout, out_bytes,
                                     cudaMemcpyDeviceToHost));
         }
     }
