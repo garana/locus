@@ -69,6 +69,12 @@ TEST_CASE("pixart sampler timesteps and sigmas match the scheduler",
     REQUIRE(s20.timesteps().front() == 999);
     REQUIRE(s20.timesteps()[1] == 949);
     REQUIRE(s20.timesteps().back() == 50);
+    // numpy's i * (999 / 30) at i = 15 is just under 499.5: 499, where
+    // 999 * 15 / 30 would round to 500.
+    const DpmSolverPP s30(30);
+    REQUIRE(s30.timesteps()[14] == 533);
+    REQUIRE(s30.timesteps()[15] == 499);
+    REQUIRE(s30.timesteps()[16] == 466);
     REQUIRE_THROWS_AS(DpmSolverPP(0), std::invalid_argument);
 }
 

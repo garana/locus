@@ -46,9 +46,14 @@ DpmSolverPP::DpmSolverPP(std::uint32_t steps, std::uint32_t train_steps,
         train_sigma[k] = std::sqrt((1.0f - abar) / abar);
     }
     // linspace timestep spacing: round(linspace(0, T - 1, steps + 1)),
-    // high to low, the 0 dropped; numpy rounds half to even.
+    // high to low, the 0 dropped; numpy rounds half to even. numpy's
+    // arithmetic: i * ((T - 1) / steps), the last value set to T - 1.
+    // (T - 1) * i / steps differs at some halves: 30 steps, i 15 is
+    // 499.49999999999994 (499), not 499.5 (500).
+    const double last = static_cast<double>(train_steps - 1);
+    const double delta = last / steps;
     for (std::uint32_t i = steps; i >= 1; --i) {
-        const double v = static_cast<double>(train_steps - 1) * i / steps;
+        const double v = i == steps ? last : static_cast<double>(i) * delta;
         t_.push_back(static_cast<std::int32_t>(std::nearbyint(v)));
     }
     for (const std::int32_t t : t_) {
