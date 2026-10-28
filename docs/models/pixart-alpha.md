@@ -257,10 +257,10 @@ compare only the rows where `mask == 1`.
 ### 3.6 Precision of the reference
 
 The golden script loads the fp16 weights with `torch_dtype=bfloat16`. The
-cast from fp16 (10 mantissa bits) to bf16 (7 bits) loses precision. As far
-as the author knows, transformers keeps `wo` in F32 for T5
-(`_keep_in_fp32_modules = ["wo"]`) and casts the FFN input to F32 before
-`wo`, so the residual stream turns F32 after the first FFN (assumption).
+cast from fp16 (10 mantissa bits) to bf16 (7 bits) loses precision.
+transformers 4.46.3 keeps `wo` in F32 for T5 (`_keep_in_fp32_modules =
+["wo"]`, checked) and casts the FFN input to `wo`'s dtype, so the
+residual stream turns F32 after the first FFN.
 The rms norm computes in F32 and casts to the weight dtype (bf16). locus
 runs F16 weights with F32 math, so it will differ from `t5_out` by about
 bf16 rounding.
@@ -461,10 +461,9 @@ h = h + gate_mlp * FFN(f)
   skipping masked keys gives the same result.
 - `FFN(f) = ff.net.2 · gelu_tanh(ff.net.0.proj · f + b) + b`, 1152 to
   4608 to 1152. `FeedForward` builds `GELU(dim, inner_dim,
-  approximate="tanh")` for "gelu-approximate". The `GELU` class lives in
-  `activations.py`, which is not in the inputs; it is a Linear named
-  `proj` followed by the tanh GELU (assumption; the tensor names
-  `ff.net.0.proj` and `ff.net.2` agree). `net.1` is a dropout.
+  approximate="tanh")` for "gelu-approximate". The `GELU` class
+  (`activations.py`) is a Linear named `proj` followed by
+  `F.gelu(approximate="tanh")` (checked). `net.1` is a dropout.
 
 ### 4.7 Final layer and unpatchify
 
