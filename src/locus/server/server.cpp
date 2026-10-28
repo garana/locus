@@ -2323,7 +2323,8 @@ void OpenAiServer::install_routes() {
                 res.status = 503;
                 res.set_content(
                     make_error("image generation is not configured (needs "
-                               "--image-decoder and a Janus-Pro model)")
+                               "--image-decoder and a Janus-Pro model, or "
+                               "--image-model)")
                         .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
