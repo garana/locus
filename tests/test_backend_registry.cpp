@@ -569,10 +569,9 @@ TEST_CASE("cuda matvec matches scalar", "[backend]") {
     check_matvec_variant_matches_scalar(&matvec_cuda);
 }
 
-// The Q6_K kernel stages 128 rows per block, the Q4_K one runs 4
-// rows (a warp each) per block: cover one partial block, exact
-// blocks, and a partial last block, with several super-blocks per
-// row.
+// The Q4_K / Q6_K kernels run 4 rows (a warp each) per block: cover
+// one partial block, exact blocks, and a partial last block, with
+// several super-blocks per row.
 TEST_CASE("cuda q4_k / q6_k matvec matches scalar across row blocks",
           "[backend]") {
     if (!cuda_backend_usable()) {

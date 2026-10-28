@@ -1228,44 +1228,7 @@ __global__ void matvec_q5_k_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
-/** Rows per block of the staged K-quant kernels (their blockDim). */
-constexpr std::uint32_t kStagedRows = 128;
-
-/**
- * Copies super-block `b` of rows [row0, row0 + kStagedRows) into
- * shared memory (row t at sw + t * Stride bytes) and the matching 256
- * activations into sx, then syncs. Consecutive threads read
- * consecutive Word-sized pieces of one row, so the global reads
- * coalesce (one row per thread does not: rows are row_bytes apart).
- * Stride pads each row so a warp reading one byte per row hits
- * distinct banks. Rows past `rows` are not loaded. BlkBytes, b's
- * offset and row_bytes must be multiples of sizeof(Word).
- */
-template <std::uint32_t BlkBytes, std::uint32_t Stride, typename Word>
-__device__ void stage_kquant_block(const std::uint8_t* w,
-                                   const float* x, std::uint32_t b,
-                                   std::uint32_t row0,
-                                   std::uint32_t rows,
-                                   std::size_t row_bytes,
-                                   std::uint8_t* sw, float* sx) {
-    constexpr std::uint32_t kWords = BlkBytes / sizeof(Word);
-    const std::uint32_t nrow = min(kStagedRows, rows - row0);
-    for (std::uint32_t i = threadIdx.x; i < nrow * kWords;
-         i += blockDim.x) {
-        const std::uint32_t t = i / kWords, k = i % kWords;
-        const std::uint8_t* src =
-            w + static_cast<std::size_t>(row0 + t) * row_bytes +
-            static_cast<std::size_t>(b) * BlkBytes + sizeof(Word) * k;
-        *reinterpret_cast<Word*>(sw + t * Stride + sizeof(Word) * k) =
-            *reinterpret_cast<const Word*>(src);
-    }
-    for (std::uint32_t i = threadIdx.x; i < 256; i += blockDim.x) {
-        sx[i] = x[static_cast<std::size_t>(b) * 256 + i];
-    }
-    __syncthreads();
-}
-
-/** Rows (one warp each) per block of matvec_q4_k_warp_kernel. */
+/** Rows (one warp each) per block of the warp K-quant kernels. */
 constexpr std::uint32_t kWarpRows = 4;
 
 /** @returns the sum of v over the 32 lanes, in every lane. */
@@ -1338,64 +1301,95 @@ __global__ void matvec_q4_k_warp_kernel(const std::uint8_t* w,
     }
 }
 
-/** One Q6_K super-block is 210 bytes: ql[128] + qh[64] + sc[16]int8
- *  + d (f16), 256 weights. Each super-block of kStagedRows rows is
- *  staged in shared memory (stage_kquant_block), then each thread
- *  dots its own row there. The scalar dequant fills y in a scattered
- *  order (y[l], y[l+32], y[l+64], y[l+96]) and dot_k_quant then sums
- *  y[i] * x[i] for i = 0..255; this computes y[i] in that i order (h,
- *  g, l below) and sums as it goes, without a per-thread y array
- *  (local memory).
- *  Launch with kStagedRows threads per block. */
-__global__ void matvec_q6_k_staged_kernel(const std::uint8_t* w,
-                                          const float* x, float* out,
-                                          std::uint32_t rows,
-                                          std::uint32_t cols) {
-    constexpr std::uint32_t kStride = 212;  // 210 + 2: 53 words
-    __shared__ __align__(16) std::uint8_t sw[kStagedRows * kStride];
-    __shared__ float sx[256];
-    const std::uint32_t row0 = blockIdx.x * kStagedRows;
-    const std::uint32_t r = row0 + threadIdx.x;
+/**
+ * Per-lane share of one Q6_K super-block for the warp kernels. A
+ * Q6_K super-block is 210 bytes: ql[128] + qh[64] + sc[16] int8 + d
+ * (f16), 256 weights. Element i = 128h + 32g + l (g = 0..3,
+ * l = 0..31) takes the low nibble of ql[64h + 32(g & 1) + l] for
+ * g < 2 and the high nibble for g >= 2, bits 2g..2g+1 of
+ * qh[32h + l], and scale sc[8h + l / 16 + 2g]. Lane L owns the 4 ql
+ * bytes at 4L (h = L / 16, g & 1 = (L % 16) / 8, l = 4 (L % 8) ..
+ * +3), so a warp reads ql in one coalesced pass; each byte yields
+ * element g (low nibble) and g + 2 (high nibble), 8 values in all.
+ * The block is only 2-byte aligned (210-byte blocks), so it reads
+ * 16-bit words. Writes the 8 dequantized values (y = d * sc * q, the
+ * scalar's expression) to ylo[k] / yhi[k] and returns the offset of
+ * ylo[0]'s element in the super-block (yhi[k] is 64 further).
+ */
+__device__ std::uint32_t q6_k_lane_values(const std::uint8_t* blk,
+                                          std::uint32_t lane,
+                                          float ylo[4], float yhi[4]) {
+    const std::uint32_t h = lane / 16;
+    const std::uint32_t g = (lane % 16) / 8;
+    const std::uint32_t l0 = 4 * (lane % 8);
+    const auto* ql16 =
+        reinterpret_cast<const std::uint16_t*>(blk + 4 * lane);
+    const auto* qh16 =
+        reinterpret_cast<const std::uint16_t*>(blk + 128 + 32 * h + l0);
+    const std::uint32_t ql =
+        static_cast<std::uint32_t>(ql16[0]) |
+        (static_cast<std::uint32_t>(ql16[1]) << 16);
+    const std::uint32_t qh =
+        static_cast<std::uint32_t>(qh16[0]) |
+        (static_cast<std::uint32_t>(qh16[1]) << 16);
+    const std::uint16_t db =
+        static_cast<std::uint16_t>(blk[208]) |
+        (static_cast<std::uint16_t>(blk[209]) << 8);
+    const float d = __half2float(__ushort_as_half(db));
+    const auto* sc = reinterpret_cast<const std::int8_t*>(blk + 192);
+    const std::uint32_t is = 8 * h + l0 / 16 + 2 * g;
+    const std::int8_t s_lo = sc[is], s_hi = sc[is + 4];
+    for (int k = 0; k < 4; ++k) {
+        const std::uint32_t lb = (ql >> (8 * k)) & 0xff;
+        const std::uint32_t hb = (qh >> (8 * k)) & 0xff;
+        const int q_lo = static_cast<int>((lb & 0x0f) |
+                                          (((hb >> (2 * g)) & 3) << 4)) -
+                         32;
+        const int q_hi = static_cast<int>((lb >> 4) |
+                                          (((hb >> (2 * g + 4)) & 3)
+                                           << 4)) -
+                         32;
+        ylo[k] = d * s_lo * static_cast<float>(q_lo);
+        yhi[k] = d * s_hi * static_cast<float>(q_hi);
+    }
+    return 128 * h + 32 * g + l0;
+}
+
+/** Q6_K matvec, one warp per row (q6_k_lane_values for the lane
+ *  mapping): each lane accumulates its 8 products over the row, then
+ *  the warp sums the lanes. The summation order is not the scalar
+ *  one, so the result matches the CPU only to rounding. Launch with
+ *  32 * kWarpRows threads per block. */
+__global__ void matvec_q6_k_warp_kernel(const std::uint8_t* w,
+                                        const float* x, float* out,
+                                        std::uint32_t rows,
+                                        std::uint32_t cols) {
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t r = blockIdx.x * kWarpRows + threadIdx.x / 32;
+    if (r >= rows) {
+        return;  // a whole warp leaves together: no partial shuffles
+    }
     const std::uint32_t nsb = cols / 256;
-    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 210;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * nsb * 210;
     float acc = 0.0f;
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        stage_kquant_block<210, kStride, std::uint16_t>(
-            w, x, b, row0, rows, row_bytes, sw, sx);
-        if (r < rows) {
-            const std::uint8_t* blk = sw + threadIdx.x * kStride;
-            const std::uint16_t db =
-                static_cast<std::uint16_t>(blk[208]) |
-                (static_cast<std::uint16_t>(blk[209]) << 8);
-            const float d = __half2float(__ushort_as_half(db));
-            int i = 0;
-            for (int h = 0; h < 2; ++h) {
-                const std::uint8_t* qlp = blk + 64 * h;
-                const std::uint8_t* qhp = blk + 128 + 32 * h;
-                const std::int8_t* scp =
-                    reinterpret_cast<const std::int8_t*>(blk + 192) +
-                    8 * h;
-                for (int g = 0; g < 4; ++g) {
-                    const std::uint8_t* ql = qlp + (g & 1) * 32;
-                    const int lo_shift = (g >> 1) * 4;
-                    const int hi_shift = g * 2;
-                    for (int l = 0; l < 32; ++l) {
-                        const int is = l / 16;
-                        const int q = static_cast<int>(
-                                          ((ql[l] >> lo_shift) & 0x0f) |
-                                          (((qhp[l] >> hi_shift) & 3)
-                                           << 4)) -
-                                      32;
-                        const float y = d * scp[is + 2 * g] *
-                                        static_cast<float>(q);
-                        acc += y * sx[i++];
-                    }
-                }
-            }
+        float ylo[4], yhi[4];
+        const std::uint32_t e = q6_k_lane_values(
+            row + static_cast<std::size_t>(b) * 210, lane, ylo, yhi);
+        const float* xb = x + static_cast<std::size_t>(b) * 256 + e;
+        const float4 xlo = __ldg(reinterpret_cast<const float4*>(xb));
+        const float4 xhi =
+            __ldg(reinterpret_cast<const float4*>(xb + 64));
+        const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
+        const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
+        for (int k = 0; k < 4; ++k) {
+            acc += ylo[k] * xl[k];
+            acc += yhi[k] * xh[k];
         }
-        __syncthreads();  // the next stage overwrites sw / sx
     }
-    if (r < rows) {
+    acc = warp_sum(acc);
+    if (lane == 0) {
         out[r] = acc;
     }
 }
@@ -2038,8 +2032,8 @@ __global__ void matvec_tq2_0_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
-// R11 batched kernels: one launch, n token accumulators per thread
-// (Q6_K: one thread per row; Q4_K: one warp per row). Each weight
+// R11 batched kernels: one launch, one warp per row, n token
+// accumulators per lane. Each weight
 // block is read from VRAM once and reused across all n tokens (weight
 // traffic ~n-fold down). Each token t's accumulator runs the identical
 // dequant+FMA order as the per-token kernel, so the result is
@@ -2118,76 +2112,51 @@ __global__ void matvec_batch_q4_k_kernel(const std::uint8_t* w,
     }
 }
 
+/** Batched matvec_q6_k_warp_kernel: one warp per row, each lane with
+ *  n token accumulators fed in the per-token kernel's order, the same
+ *  warp sum per token, so the result is byte-identical to n per-token
+ *  calls. Launch with 32 * kWarpRows threads per block. */
 __global__ void matvec_batch_q6_k_kernel(const std::uint8_t* w,
                                          const float* x, float* out,
                                          std::uint32_t rows,
                                          std::uint32_t cols,
                                          std::uint32_t n) {
-    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t r = blockIdx.x * kWarpRows + threadIdx.x / 32;
     if (r >= rows) {
-        return;
+        return;  // a whole warp leaves together: no partial shuffles
     }
     const std::uint32_t nsb = cols / 256;
-    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 210;
-    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
-                                      row_bytes;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * nsb * 210;
     float acc[kMaxBatch];
     for (std::uint32_t t = 0; t < n; ++t) {
         acc[t] = 0.0f;
     }
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
-                                            210;
-        const std::uint8_t* qlp = blk;
-        const std::uint8_t* qhp = blk + 128;
-        const std::int8_t* scp =
-            reinterpret_cast<const std::int8_t*>(blk + 192);
-        const std::uint16_t db =
-            static_cast<std::uint16_t>(blk[208]) |
-            (static_cast<std::uint16_t>(blk[209]) << 8);
-        const float d = __half2float(__ushort_as_half(db));
-        float tmp[256];
-        float* y = tmp;
-        for (int nn = 0; nn < 256; nn += 128) {
-            for (int l = 0; l < 32; ++l) {
-                const int is = l / 16;
-                const int q1 = static_cast<int>(
-                                   (qlp[l] & 0x0f) |
-                                   (((qhp[l] >> 0) & 3) << 4)) -
-                               32;
-                const int q2 = static_cast<int>(
-                                   (qlp[l + 32] & 0x0f) |
-                                   (((qhp[l] >> 2) & 3) << 4)) -
-                               32;
-                const int q3 = static_cast<int>(
-                                   (qlp[l] >> 4) |
-                                   (((qhp[l] >> 4) & 3) << 4)) -
-                               32;
-                const int q4 = static_cast<int>(
-                                   (qlp[l + 32] >> 4) |
-                                   (((qhp[l] >> 6) & 3) << 4)) -
-                               32;
-                y[l] = d * scp[is] * static_cast<float>(q1);
-                y[l + 32] = d * scp[is + 2] * static_cast<float>(q2);
-                y[l + 64] = d * scp[is + 4] * static_cast<float>(q3);
-                y[l + 96] = d * scp[is + 6] * static_cast<float>(q4);
-            }
-            y += 128;
-            qlp += 64;
-            qhp += 32;
-            scp += 8;
-        }
-        const std::size_t xoff = static_cast<std::size_t>(b) * 256;
-        for (int i = 0; i < 256; ++i) {
-            for (std::uint32_t t = 0; t < n; ++t) {
-                acc[t] += tmp[i] *
-                          x[static_cast<std::size_t>(t) * cols +
-                            xoff + i];
+        float ylo[4], yhi[4];
+        const std::uint32_t e = q6_k_lane_values(
+            row + static_cast<std::size_t>(b) * 210, lane, ylo, yhi);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const float* xb = x + static_cast<std::size_t>(t) * cols +
+                              static_cast<std::size_t>(b) * 256 + e;
+            const float4 xlo =
+                __ldg(reinterpret_cast<const float4*>(xb));
+            const float4 xhi =
+                __ldg(reinterpret_cast<const float4*>(xb + 64));
+            const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
+            const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
+            for (int k = 0; k < 4; ++k) {
+                acc[t] += ylo[k] * xl[k];
+                acc[t] += yhi[k] * xh[k];
             }
         }
     }
     for (std::uint32_t t = 0; t < n; ++t) {
-        out[static_cast<std::size_t>(r) * n + t] = acc[t];
+        const float s = warp_sum(acc[t]);
+        if (lane == 0) {
+            out[static_cast<std::size_t>(r) * n + t] = s;
+        }
     }
 }
 
@@ -2638,8 +2607,8 @@ void launch_kernel(Kind kind, const void* dw,
                 dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kQ6_K:
-            matvec_q6_k_staged_kernel<<<
-                (rows + kStagedRows - 1) / kStagedRows, kStagedRows>>>(
+            matvec_q6_k_warp_kernel<<<
+                (rows + kWarpRows - 1) / kWarpRows, 32 * kWarpRows>>>(
                 dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kIQ1_S:
@@ -2858,19 +2827,17 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
         if (dx.alloc(x_bytes) && dout.alloc(out_bytes) &&
             cuda_ok(cudaMemcpy(dx.p, x_batch.data(), x_bytes,
                                cudaMemcpyHostToDevice))) {
-            const std::uint32_t threads = 256;
             const std::uint32_t blocks =
-                (w.rows + threads - 1) / threads;
+                (w.rows + kWarpRows - 1) / kWarpRows;
             const auto* dwb = static_cast<const std::uint8_t*>(dw);
             const auto* dxf = static_cast<const float*>(dx.p);
             auto* doutf = static_cast<float*>(dout.p);
             if (q6) {
-                matvec_batch_q6_k_kernel<<<blocks, threads>>>(
+                matvec_batch_q6_k_kernel<<<blocks, 32 * kWarpRows>>>(
                     dwb, dxf, doutf, w.rows, w.cols, n);
             } else {
-                matvec_batch_q4_k_kernel<<<
-                    (w.rows + kWarpRows - 1) / kWarpRows,
-                    32 * kWarpRows>>>(dwb, dxf, doutf, w.rows, w.cols, n);
+                matvec_batch_q4_k_kernel<<<blocks, 32 * kWarpRows>>>(
+                    dwb, dxf, doutf, w.rows, w.cols, n);
             }
             ok = cuda_ok(cudaGetLastError()) &&
                  cuda_ok(cudaDeviceSynchronize()) &&
