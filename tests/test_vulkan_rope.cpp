@@ -6,6 +6,7 @@
 #include <bit>
 #include <random>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -155,8 +156,10 @@ TEST_CASE("vulkan rope matches the CPU across the pair stride",
     }
 }
 
-TEST_CASE("vulkan qk_norm_rope matches rmsnorm_b then rope bit for bit",
-          "[vulkan]") {
+// The norm must match bit for bit (pos 0: rope is the identity). The
+// roped values only to the rope tests' tolerance: Metal fast math may
+// evaluate pow/sin/cos differently in two shaders (seen on M2).
+TEST_CASE("vulkan qk_norm_rope matches rmsnorm_b then rope", "[vulkan]") {
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");
     }
@@ -165,7 +168,6 @@ TEST_CASE("vulkan qk_norm_rope matches rmsnorm_b then rope bit for bit",
     std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
     std::uniform_real_distribution<float> fd(0.5f, 4.0f);
     const float eps = 1e-6f, base = 1000000.0f;
-    const std::uint32_t pos = 1234;
 
     // 5 q heads at offset 3 of Q, 2 k heads at offset 7 of K; head
     // dims from one pair per thread up to a strided second pass.
@@ -181,9 +183,12 @@ TEST_CASE("vulkan qk_norm_rope matches rmsnorm_b then rope bit for bit",
         for (auto& e : div) {
             e = fd(rng);
         }
-        for (const bool neox : {false, true}) {
+        for (const auto& [neox, pos] :
+             {std::pair{false, 0u}, std::pair{false, 1234u},
+              std::pair{true, 0u}, std::pair{true, 1234u}}) {
             DYNAMIC_SECTION("head dim " << hd
-                                        << (neox ? " neox" : " interleaved")) {
+                                        << (neox ? " neox" : " interleaved")
+                                        << " pos " << pos) {
                 auto fb = upload(ctx, div);
                 auto qwb = upload(ctx, qw);
                 auto kwb = upload(ctx, kw);
@@ -221,14 +226,23 @@ TEST_CASE("vulkan qk_norm_rope matches rmsnorm_b then rope bit for bit",
                 const auto kwant = download(ctx, kr, k.size());
                 const auto qgot = download(ctx, qf, q.size());
                 const auto kgot = download(ctx, kf, k.size());
-                for (std::size_t i = 0; i < q.size(); ++i) {
-                    INFO("q " << i);
-                    REQUIRE(fbits(qgot[i]) == fbits(qwant[i]));
-                }
-                for (std::size_t i = 0; i < k.size(); ++i) {
-                    INFO("k " << i);
-                    REQUIRE(fbits(kgot[i]) == fbits(kwant[i]));
-                }
+                const bool exact = pos == 0;
+                const auto check = [exact](const char* what,
+                                           const std::vector<float>& got,
+                                           const std::vector<float>& want) {
+                    for (std::size_t i = 0; i < got.size(); ++i) {
+                        INFO(what << " " << i);
+                        if (exact) {
+                            REQUIRE(fbits(got[i]) == fbits(want[i]));
+                        } else {
+                            REQUIRE(got[i] == Catch::Approx(want[i])
+                                                  .margin(1e-4)
+                                                  .epsilon(1e-3));
+                        }
+                    }
+                };
+                check("q", qgot, qwant);
+                check("k", kgot, kwant);
                 for (auto b : {fb, qwb, kwb, qr, kr, qf, kf}) {
                     ctx.destroy_buffer(b);
                 }
