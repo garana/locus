@@ -804,7 +804,8 @@ TEST_CASE("matvec_batch_cuda Q4_K/Q6_K byte-identical to per-token "
         SKIP("no CUDA device or non-CUDA build");
     }
     cuda_pool_reset();  // drop any stale pages from prior test cases
-    constexpr std::uint32_t rows = 3, nblk = 2, cols = nblk * 256,
+    // 9 rows: two full 4-row (one warp per row) blocks and a partial one.
+    constexpr std::uint32_t rows = 9, nblk = 2, cols = nblk * 256,
                             n = 5;
     std::mt19937 rng(41);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);

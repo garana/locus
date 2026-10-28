@@ -1265,73 +1265,87 @@ __device__ void stage_kquant_block(const std::uint8_t* w,
     __syncthreads();
 }
 
-/** One Q4_K super-block is 144 bytes: d,dmin (f16) + scales[12] +
- *  qs[128], 256 weights. Each thread owns one row and dequantizes +
- *  accumulates in the element order of the scalar dequant_block_q4_k
- *  / dot_k_quant; each super-block is first staged in shared memory
- *  (stage_kquant_block) so the global reads coalesce. Launch with
- *  kStagedRows threads per block. */
-__global__ void matvec_q4_k_staged_kernel(const std::uint8_t* w,
-                                          const float* x, float* out,
-                                          std::uint32_t rows,
-                                          std::uint32_t cols) {
-    constexpr std::uint32_t kStride = 148;  // 144 + 4: 37 words
-    __shared__ __align__(16) std::uint8_t sw[kStagedRows * kStride];
-    __shared__ float sx[256];
-    const std::uint32_t row0 = blockIdx.x * kStagedRows;
-    const std::uint32_t r = row0 + threadIdx.x;
+/** Rows (one warp each) per block of matvec_q4_k_warp_kernel. */
+constexpr std::uint32_t kWarpRows = 4;
+
+/** @returns the sum of v over the 32 lanes, in every lane. */
+__device__ float warp_sum(float v) {
+    for (int off = 16; off > 0; off >>= 1) {
+        v += __shfl_xor_sync(0xffffffffu, v, off);
+    }
+    return v;
+}
+
+/**
+ * One Q4_K super-block is 144 bytes: d,dmin (f16) + scales[12] +
+ * qs[128], 256 weights. One warp per row: lane `l` reads the 4 qs
+ * bytes at 4l (one coalesced 128-byte read per warp and super-block),
+ * which hold the low nibbles of elements 64j + c and the high nibbles
+ * of 64j + 32 + c, with j = l / 8 and c = 4 (l % 8) .. +3; it
+ * accumulates those 8 products over the row, then the warp sums the
+ * lanes. The summation order is not the scalar one, so the result
+ * matches the CPU only to rounding. Launch with 32 * kWarpRows
+ * threads per block.
+ */
+__global__ void matvec_q4_k_warp_kernel(const std::uint8_t* w,
+                                        const float* x, float* out,
+                                        std::uint32_t rows,
+                                        std::uint32_t cols) {
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t r = blockIdx.x * kWarpRows + threadIdx.x / 32;
+    if (r >= rows) {
+        return;  // a whole warp leaves together: no partial shuffles
+    }
     const std::uint32_t nsb = cols / 256;
-    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 144;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * nsb * 144;
+    const std::uint32_t j = lane / 8;
+    const std::uint32_t c = 4 * (lane % 8);
     float acc = 0.0f;
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        stage_kquant_block<144, kStride, std::uint32_t>(
-            w, x, b, row0, rows, row_bytes, sw, sx);
-        if (r < rows) {
-            const std::uint8_t* blk = sw + threadIdx.x * kStride;
-            const std::uint16_t db =
-                static_cast<std::uint16_t>(blk[0]) |
-                (static_cast<std::uint16_t>(blk[1]) << 8);
-            const std::uint16_t dmb =
-                static_cast<std::uint16_t>(blk[2]) |
-                (static_cast<std::uint16_t>(blk[3]) << 8);
-            const float d = __half2float(__ushort_as_half(db));
-            const float dmin = __half2float(__ushort_as_half(dmb));
-            const std::uint8_t* scales = blk + 4;
-            const std::uint8_t* q = blk + 16;
-            int is = 0, yi = 0;
-            for (int j = 0; j < 256; j += 64) {
-                std::uint8_t sc, mn;
-                scale_min_k4(is + 0, scales, sc, mn);
-                const float d1 = d * sc, m1 = dmin * mn;
-                scale_min_k4(is + 1, scales, sc, mn);
-                const float d2 = d * sc, m2 = dmin * mn;
-                for (int l = 0; l < 32; ++l) {
-                    const float val =
-                        d1 * static_cast<float>(q[l] & 0x0f) - m1;
-                    acc += val * sx[yi++];
-                }
-                for (int l = 0; l < 32; ++l) {
-                    const float val =
-                        d2 * static_cast<float>(q[l] >> 4) - m2;
-                    acc += val * sx[yi++];
-                }
-                q += 32;
-                is += 2;
-            }
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 144;
+        const std::uint16_t db =
+            static_cast<std::uint16_t>(blk[0]) |
+            (static_cast<std::uint16_t>(blk[1]) << 8);
+        const std::uint16_t dmb =
+            static_cast<std::uint16_t>(blk[2]) |
+            (static_cast<std::uint16_t>(blk[3]) << 8);
+        const float d = __half2float(__ushort_as_half(db));
+        const float dmin = __half2float(__ushort_as_half(dmb));
+        std::uint8_t sc, mn;
+        scale_min_k4(2 * j, blk + 4, sc, mn);
+        const float d1 = d * sc, m1 = dmin * mn;
+        scale_min_k4(2 * j + 1, blk + 4, sc, mn);
+        const float d2 = d * sc, m2 = dmin * mn;
+        const std::uint32_t q4 =
+            reinterpret_cast<const std::uint32_t*>(blk + 16)[lane];
+        const float* xb =
+            x + static_cast<std::size_t>(b) * 256 + 64 * j + c;
+        const float4 xlo = __ldg(reinterpret_cast<const float4*>(xb));
+        const float4 xhi =
+            __ldg(reinterpret_cast<const float4*>(xb + 32));
+        const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
+        const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
+        for (int k = 0; k < 4; ++k) {
+            const std::uint32_t q = (q4 >> (8 * k)) & 0xff;
+            acc += (d1 * static_cast<float>(q & 0x0f) - m1) * xl[k];
+            acc += (d2 * static_cast<float>(q >> 4) - m2) * xh[k];
         }
-        __syncthreads();  // the next stage overwrites sw / sx
     }
-    if (r < rows) {
+    acc = warp_sum(acc);
+    if (lane == 0) {
         out[r] = acc;
     }
 }
 
 /** One Q6_K super-block is 210 bytes: ql[128] + qh[64] + sc[16]int8
- *  + d (f16), 256 weights, staged like matvec_q4_k_staged_kernel. The
- *  scalar dequant fills y in a scattered order (y[l], y[l+32],
- *  y[l+64], y[l+96]) and dot_k_quant then sums y[i] * x[i] for
- *  i = 0..255; this computes y[i] in that i order (h, g, l below) and
- *  sums as it goes, without a per-thread y array (local memory).
+ *  + d (f16), 256 weights. Each super-block of kStagedRows rows is
+ *  staged in shared memory (stage_kquant_block), then each thread
+ *  dots its own row there. The scalar dequant fills y in a scattered
+ *  order (y[l], y[l+32], y[l+64], y[l+96]) and dot_k_quant then sums
+ *  y[i] * x[i] for i = 0..255; this computes y[i] in that i order (h,
+ *  g, l below) and sums as it goes, without a per-thread y array
+ *  (local memory).
  *  Launch with kStagedRows threads per block. */
 __global__ void matvec_q6_k_staged_kernel(const std::uint8_t* w,
                                           const float* x, float* out,
@@ -2024,34 +2038,41 @@ __global__ void matvec_tq2_0_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
-// R11 batched kernels: one launch, one thread per row, n token
-// accumulators. Each weight block is read from VRAM once and reused
-// across all n tokens (weight traffic ~n-fold down). Each token t's
-// accumulator runs the identical dequant+FMA order as the per-token
-// kernel, so the result is byte-identical to n matvec_cuda() calls.
+// R11 batched kernels: one launch, n token accumulators per thread
+// (Q6_K: one thread per row; Q4_K: one warp per row). Each weight
+// block is read from VRAM once and reused across all n tokens (weight
+// traffic ~n-fold down). Each token t's accumulator runs the identical
+// dequant+FMA order as the per-token kernel, so the result is
+// byte-identical to n matvec_cuda() calls.
 // out is row-major: out[r*n + t]. x is token-major: token t at t*cols.
 constexpr std::uint32_t kMaxBatch = 32;
 
+/** Batched matvec_q4_k_warp_kernel: one warp per row, each lane with
+ *  n token accumulators. Per token, each lane runs the per-token
+ *  kernel's products in its order and the warp sums them the same
+ *  way, so the result is byte-identical to n per-token calls. Launch
+ *  with 32 * kWarpRows threads per block. */
 __global__ void matvec_batch_q4_k_kernel(const std::uint8_t* w,
                                          const float* x, float* out,
                                          std::uint32_t rows,
                                          std::uint32_t cols,
                                          std::uint32_t n) {
-    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t r = blockIdx.x * kWarpRows + threadIdx.x / 32;
     if (r >= rows) {
-        return;
+        return;  // a whole warp leaves together: no partial shuffles
     }
     const std::uint32_t nsb = cols / 256;
-    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 144;
-    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
-                                      row_bytes;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * nsb * 144;
+    const std::uint32_t j = lane / 8;
+    const std::uint32_t c = 4 * (lane % 8);
     float acc[kMaxBatch];
     for (std::uint32_t t = 0; t < n; ++t) {
         acc[t] = 0.0f;
     }
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
-                                            144;
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 144;
         const std::uint16_t db =
             static_cast<std::uint16_t>(blk[0]) |
             (static_cast<std::uint16_t>(blk[1]) << 8);
@@ -2060,42 +2081,40 @@ __global__ void matvec_batch_q4_k_kernel(const std::uint8_t* w,
             (static_cast<std::uint16_t>(blk[3]) << 8);
         const float d = __half2float(__ushort_as_half(db));
         const float dmin = __half2float(__ushort_as_half(dmb));
-        const std::uint8_t* scales = blk + 4;
-        const std::uint8_t* q = blk + 16;
-        const std::size_t xoff = static_cast<std::size_t>(b) * 256;
-        int is = 0, yi = 0;
-        for (int j = 0; j < 256; j += 64) {
-            std::uint8_t sc, mn;
-            scale_min_k4(is + 0, scales, sc, mn);
-            const float d1 = d * sc, m1 = dmin * mn;
-            scale_min_k4(is + 1, scales, sc, mn);
-            const float d2 = d * sc, m2 = dmin * mn;
-            for (int l = 0; l < 32; ++l) {
-                const float val =
-                    d1 * static_cast<float>(q[l] & 0x0f) - m1;
-                for (std::uint32_t t = 0; t < n; ++t) {
-                    acc[t] += val *
-                              x[static_cast<std::size_t>(t) * cols +
-                                xoff + yi];
-                }
-                ++yi;
+        std::uint8_t sc, mn;
+        scale_min_k4(2 * j, blk + 4, sc, mn);
+        const float d1 = d * sc, m1 = dmin * mn;
+        scale_min_k4(2 * j + 1, blk + 4, sc, mn);
+        const float d2 = d * sc, m2 = dmin * mn;
+        const std::uint32_t q4 =
+            reinterpret_cast<const std::uint32_t*>(blk + 16)[lane];
+        float vlo[4], vhi[4];
+        for (int k = 0; k < 4; ++k) {
+            const std::uint32_t q = (q4 >> (8 * k)) & 0xff;
+            vlo[k] = d1 * static_cast<float>(q & 0x0f) - m1;
+            vhi[k] = d2 * static_cast<float>(q >> 4) - m2;
+        }
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const float* xb = x + static_cast<std::size_t>(t) * cols +
+                              static_cast<std::size_t>(b) * 256 +
+                              64 * j + c;
+            const float4 xlo =
+                __ldg(reinterpret_cast<const float4*>(xb));
+            const float4 xhi =
+                __ldg(reinterpret_cast<const float4*>(xb + 32));
+            const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
+            const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
+            for (int k = 0; k < 4; ++k) {
+                acc[t] += vlo[k] * xl[k];
+                acc[t] += vhi[k] * xh[k];
             }
-            for (int l = 0; l < 32; ++l) {
-                const float val =
-                    d2 * static_cast<float>(q[l] >> 4) - m2;
-                for (std::uint32_t t = 0; t < n; ++t) {
-                    acc[t] += val *
-                              x[static_cast<std::size_t>(t) * cols +
-                                xoff + yi];
-                }
-                ++yi;
-            }
-            q += 32;
-            is += 2;
         }
     }
     for (std::uint32_t t = 0; t < n; ++t) {
-        out[static_cast<std::size_t>(r) * n + t] = acc[t];
+        const float s = warp_sum(acc[t]);
+        if (lane == 0) {
+            out[static_cast<std::size_t>(r) * n + t] = s;
+        }
     }
 }
 
@@ -2610,8 +2629,8 @@ void launch_kernel(Kind kind, const void* dw,
                 dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kQ4_K:
-            matvec_q4_k_staged_kernel<<<
-                (rows + kStagedRows - 1) / kStagedRows, kStagedRows>>>(
+            matvec_q4_k_warp_kernel<<<
+                (rows + kWarpRows - 1) / kWarpRows, 32 * kWarpRows>>>(
                 dwb, dxf, doutf, rows, cols);
             break;
         case Kind::kQ5_K:
@@ -2849,8 +2868,9 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
                 matvec_batch_q6_k_kernel<<<blocks, threads>>>(
                     dwb, dxf, doutf, w.rows, w.cols, n);
             } else {
-                matvec_batch_q4_k_kernel<<<blocks, threads>>>(
-                    dwb, dxf, doutf, w.rows, w.cols, n);
+                matvec_batch_q4_k_kernel<<<
+                    (w.rows + kWarpRows - 1) / kWarpRows,
+                    32 * kWarpRows>>>(dwb, dxf, doutf, w.rows, w.cols, n);
             }
             ok = cuda_ok(cudaGetLastError()) &&
                  cuda_ok(cudaDeviceSynchronize()) &&
