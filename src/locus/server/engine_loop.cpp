@@ -18,7 +18,9 @@ constexpr auto kPollBackoff = std::chrono::microseconds(200);
 EngineLoop::EngineLoop(const model::TransformerModel& m,
                        tok::TokenId eos,
                        engine::Engine::Config cfg)
-    : engine_(m, eos, cfg), worker_([this] { run(); }) {}
+    : engine_(m, eos, cfg),
+      kv_type_(cfg.kv_type),
+      worker_([this] { run(); }) {}
 
 EngineLoop::~EngineLoop() {
     {

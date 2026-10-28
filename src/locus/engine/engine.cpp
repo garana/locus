@@ -44,6 +44,7 @@ std::uint64_t Engine::submit(
     r->rng.seed(seed != 0 ? seed
                           : std::random_device{}() ^
                                 (id * 0x9e3779b97f4a7c15ULL));
+    r->t_submit = std::chrono::steady_clock::now();
     requests_.emplace(id, std::move(r));
     waiting_.push_back(id);
     return id;
@@ -92,6 +93,21 @@ bool Engine::has_runnable_work() const {
 }
 
 bool Engine::step() {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool more = step_once();
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0);
+    metrics_.busy_ns.fetch_add(static_cast<std::uint64_t>(ns.count()),
+                               std::memory_order_relaxed);
+    metrics_.steps.fetch_add(1, std::memory_order_relaxed);
+    metrics_.running.store(static_cast<std::uint32_t>(running_.size()),
+                           std::memory_order_relaxed);
+    metrics_.waiting.store(static_cast<std::uint32_t>(waiting_.size()),
+                           std::memory_order_relaxed);
+    return more;
+}
+
+bool Engine::step_once() {
     // Batched decode needs a model/backend that supports the
     // batched forward (Vulkan drives its own full forward and opts
     // out); fall back to the per-token scheduler otherwise so
@@ -256,6 +272,9 @@ bool Engine::try_admit_front() {
         }
     }
     r.status = Status::kRunning;
+    if (r.t_admit == std::chrono::steady_clock::time_point{}) {
+        r.t_admit = std::chrono::steady_clock::now();
+    }
     running_.push_back(r.id);
     waiting_.pop_front();
     return true;
@@ -309,6 +328,38 @@ void Engine::preempt(std::uint64_t victim_id) {
     waiting_.push_front(victim_id);
 }
 
+void Engine::observe_done(const Request& r) {
+    using Clock = std::chrono::steady_clock;
+    constexpr Clock::time_point kUnset{};
+    if (r.t_admit == kUnset || r.t_first == kUnset) {
+        return;  // finished without being stepped (nothing to time)
+    }
+    const auto now = Clock::now();
+    auto ns = [](Clock::time_point a, Clock::time_point b) {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(b - a)
+                .count());
+    };
+    constexpr auto kRelaxed = std::memory_order_relaxed;
+    metrics_.queue.observe(ns(r.t_submit, r.t_admit));
+    const std::uint64_t prefill = ns(r.t_admit, r.t_first);
+    metrics_.prefill.observe(prefill);
+    metrics_.ttft.observe(ns(r.t_submit, r.t_first));
+    metrics_.request.observe(ns(r.t_submit, now));
+    const auto n_prompt = static_cast<std::uint64_t>(r.prompt.size());
+    metrics_.prefill_tokens.fetch_add(
+        n_prompt > r.reused_prefix_tokens ? n_prompt - r.reused_prefix_tokens
+                                          : 0,
+        kRelaxed);
+    if (r.generated.size() > 1) {
+        const std::uint64_t decode = ns(r.t_first, now);
+        const std::uint64_t n = r.generated.size() - 1;
+        metrics_.decode_token.observe(decode / n);
+        metrics_.decode_tokens.fetch_add(n, kRelaxed);
+        metrics_.decode_ns.fetch_add(decode, kRelaxed);
+    }
+}
+
 void Engine::finish(Request& r, Status s, std::string error) {
     // Register the prompt's full-block prefix before releasing, so a
     // later request sharing it can adopt the (still-pinned) KV.
@@ -321,6 +372,9 @@ void Engine::finish(Request& r, Status s, std::string error) {
         r.cached_prefix_tokens = written > r.reused_prefix_tokens
                                      ? written - r.reused_prefix_tokens
                                      : 0;
+    }
+    if (s == Status::kDone) {
+        observe_done(r);
     }
     cache_.release(r.seq);
     r.status = s;
@@ -541,6 +595,9 @@ void Engine::sample_from(Request& r, std::span<float> logits) {
         r.constraint->commit(next);
     }
     r.generated.push_back(next);
+    if (r.generated.size() == 1) {
+        r.t_first = std::chrono::steady_clock::now();
+    }
     if (r.logprobs_opt.enabled) {
         LogprobEntry e;
         e.token = next;

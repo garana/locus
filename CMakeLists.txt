@@ -22,6 +22,7 @@ add_library(locus
     src/locus/chat/template.cpp
     src/locus/config/config_file.cpp
     src/locus/engine/engine.cpp
+    src/locus/engine/metrics.cpp
     src/locus/engine/prefix_cache.cpp
     src/locus/auth/token_cache.cpp
     src/locus/auth/helper_message.cpp
@@ -60,6 +61,7 @@ add_library(locus
     src/locus/server/engine_loop.cpp
     src/locus/server/errors.cpp
     src/locus/server/server.cpp
+    src/locus/server/metrics_text.cpp
     src/locus/server/responses.cpp
     src/locus/server/tools.cpp
     src/locus/http/base64.cpp

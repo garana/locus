@@ -101,6 +101,13 @@ class EngineLoop {
         std::uint64_t spec_steps = 0;
     };
     Stats stats();
+    /** The engine's timing metrics; read without the lock, so
+     * /metrics never waits for a step. */
+    const engine::EngineMetrics& metrics() const {
+        return engine_.metrics();
+    }
+    /** The engine's KV cache precision (fixed at construction). */
+    kv::KvType kv_type() const { return kv_type_; }
 
   private:
     void run();
@@ -117,6 +124,7 @@ class EngineLoop {
      */
     std::atomic<int> read_waiters_{0};
     engine::Engine engine_;
+    kv::KvType kv_type_;
     bool stop_ = false;
     std::thread worker_;
 };
