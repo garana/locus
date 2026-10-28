@@ -46,7 +46,7 @@ A Linear weight is `[out, in]` and maps an `in` vector to an `out` vector:
   (assumption: the formulas come from PyTorch and transformers, not from
   the inputs). No model here uses the erf GELU.
 - `D = 1152` (DiT width), `H = 16` (DiT heads), `Dh = 72` (DiT head dim),
-  `L = 28` (DiT blocks), `F = 4608` (DiT FFN width), `T = 4096` (image
+  `L = 28` (DiT blocks), `F = 4608` (DiT FFN width), `T = 1024` (image
   tokens), `S = 120` (text tokens), `C = 4` (latent channels).
 
 ---------------------------------------------------------------------------
@@ -86,12 +86,12 @@ are estimates from the shapes, with one multiply-add counted as 2 FLOP.
 3. Draw the start latent: `x ~ N(0, 1)` of shape `[1, 4, 64, 64]`
    (section 5.6).
 4. Run 8 steps. Each step runs the DiT once on a batch of 2 (row 0 is the
-   negative prompt, row 1 is the prompt). Each row has 4096 image tokens
-   of width 1152 and cross-attends to its 120 text tokens. One row costs
-   about 6.5 TFLOP; the 16 rows of the 8 steps cost about 104 TFLOP. The
-   step then combines the two rows (CFG, classifier-free guidance), keeps
-   the noise half of the 8 output channels, and updates `x` with the
-   sampler.
+   negative prompt, row 1 is the prompt). Each row has 1024 image tokens
+   (32 x 32 patches) of width 1152 and cross-attends to its 120 text
+   tokens. One row costs about 1.2 TFLOP; the 16 rows of the 8 steps cost
+   about 19 TFLOP. The step then combines the two rows (CFG,
+   classifier-free guidance), keeps the noise half of the 8 output
+   channels, and updates `x` with the sampler.
 5. Decode `x / 0.18215` with the VAE to `y`, of shape `[1, 3, 512, 512]`
    and in about [-1, 1]. About 2.5 TFLOP.
 6. Map `y` to pixels: `clamp(y / 2 + 0.5, 0, 1) * 255`.
@@ -432,7 +432,7 @@ attribute, so diffusers never uses that checkpoint tensor; CFG uses T5 of
 | 4   | scale_mlp | scale after norm2: `* (1 + scale_mlp)`   |
 | 5   | gate_mlp  | multiplies the FFN output                |
 
-Each row is a 1152-vector that broadcasts over the 4096 tokens:
+Each row is a 1152-vector that broadcasts over the 1024 tokens:
 
 ```
 a = ln(h) * (1 + scale_msa) + shift_msa      # norm1, eps 1e-6
@@ -446,13 +446,13 @@ h = h + gate_mlp * FFN(f)
   isn't applied here" and uses `norm2` for the FFN instead. There is no
   `norm3` on this path.
 - `SelfAttn(a)` (`attention_processor.py:AttnProcessor2_0`): `q = to_q·a +
-  b`, `k = to_k·a + b`, `v = to_v·a + b`, each `[4096, 1152]`. Head `g`
+  b`, `k = to_k·a + b`, `v = to_v·a + b`, each `[1024, 1152]`. Head `g`
   uses dims `72g .. 72g+71`. The scores are `dot(q_g[i], k_g[j]) /
-  sqrt(72)`, softmax over the 4096 keys, no mask (the pipeline passes no
+  sqrt(72)`, softmax over the 1024 keys, no mask (the pipeline passes no
   `attention_mask`). The output is `to_out.0 · concat_g(o_g) + b`.
   `F.scaled_dot_product_attention` uses its default scale `1/sqrt(72)`;
   `Attention.scale = dim_head**-0.5` is the same value.
-- `CrossAttn(h, u, mask)`: `q = to_q·h + b` (4096 rows), `k = to_k·u + b`
+- `CrossAttn(h, u, mask)`: `q = to_q·h + b` (1024 rows), `k = to_k·u + b`
   and `v = to_v·u + b` (120 rows). The scores are `dot(q_g[i], k_g[j]) /
   sqrt(72) + bias[j]`, where `bias[j] = (1 - mask[j]) * -10000`
   (`PixArtTransformer2DModel.forward` turns the `[batch, 120]` mask into
@@ -473,7 +473,7 @@ h = h + gate_mlp * FFN(f)
 shift = scale_shift_table[0] + c             # c = embedded_timestep (4.4)
 scale = scale_shift_table[1] + c
 o = ln(h) * (1 + scale) + shift              # norm_out, eps 1e-6, no affine
-y = proj_out · o + b                         # [4096, 32]
+y = proj_out · o + b                         # [1024, 32]
 ```
 
 The final layer uses `c` itself: not `silu(c)` and not `m`.
