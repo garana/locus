@@ -131,8 +131,8 @@ bodies: hand-rolled JSON parsing is where API vulnerabilities come
 from. A worker thread drives `Engine::step()`; handler threads submit
 and wait (`EngineLoop`). Chat messages are formatted by
 `chat::ChatTemplate`: the GGUF's Jinja source is fingerprinted to a
-known family (llama3, chatml, llama2, zephyr, deepseek) and rendered
-by a hardcoded formatter; an unknown template falls back
+known family (llama3, chatml, llama2, zephyr, deepseek, deepseek2) and
+rendered by a hardcoded formatter; an unknown template falls back
 to plain concatenation. Endpoints that run the model on their own
 thread (images, vision chat, audio) share the GPU backend through one
 process-wide lock (#268).

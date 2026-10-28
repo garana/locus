@@ -2,6 +2,19 @@
 
 namespace locus::chat {
 
+namespace {
+
+// DeepSeek control tokens; U+FF5C is the fullwidth bar, U+2581 the
+// SentencePiece space.
+const std::string kDsUser = "<\xef\xbd\x9cUser\xef\xbd\x9c>";
+const std::string kDsAssistant = "<\xef\xbd\x9c"
+                                 "Assistant\xef\xbd\x9c>";
+const std::string kDsEos = "<\xef\xbd\x9c"
+                           "end\xe2\x96\x81of\xe2\x96\x81sentence"
+                           "\xef\xbd\x9c>";
+
+}  // namespace
+
 ChatTemplate ChatTemplate::from_gguf(const gguf::GgufFile& g) {
     const auto t = g.get_string("tokenizer.chat_template");
     if (!t) {
@@ -23,9 +36,14 @@ ChatTemplate ChatTemplate::from_gguf(const gguf::GgufFile& g) {
     if (has("<|user|>")) {
         return ChatTemplate(Family::kZephyr);
     }
-    // DeepSeek uses fullwidth-bar markers like <U+FF5C>User<U+FF5C>.
+    // DeepSeek-V3 uses fullwidth-bar markers like <U+FF5C>User<U+FF5C>.
     if (has("\xef\xbd\x9cUser\xef\xbd\x9c")) {
         return ChatTemplate(Family::kDeepSeek);
+    }
+    // DeepSeek-V2 (and Coder-V2): plain "User: " / "Assistant: "
+    // turns; the same fingerprint llama.cpp uses.
+    if (has("'Assistant: ' + message['content'] + eos_token")) {
+        return ChatTemplate(Family::kDeepSeek2);
     }
     return ChatTemplate(Family::kPlain);
 }
@@ -89,19 +107,30 @@ std::string ChatTemplate::apply(std::span<const Message> messages,
         case Family::kDeepSeek: {
             for (const Message& m : messages) {
                 if (m.role == "user") {
-                    out += "\xef\xbd\x9cUser\xef\xbd\x9c" +
-                           m.content;
+                    out += kDsUser + m.content;
                 } else if (m.role == "assistant") {
-                    out += "\xef\xbd\x9c"
-                           "Assistant\xef\xbd\x9c" +
-                           m.content;
+                    out += kDsAssistant + m.content + kDsEos;
                 } else {
-                    out += m.content;
+                    out += m.content + "\n\n";
                 }
             }
             if (add_assistant_prompt) {
-                out += "\xef\xbd\x9c"
-                       "Assistant\xef\xbd\x9c";
+                out += kDsAssistant;
+            }
+            break;
+        }
+        case Family::kDeepSeek2: {
+            for (const Message& m : messages) {
+                if (m.role == "user") {
+                    out += "User: " + m.content + "\n\n";
+                } else if (m.role == "assistant") {
+                    out += "Assistant: " + m.content + kDsEos;
+                } else {
+                    out += m.content + "\n\n";
+                }
+            }
+            if (add_assistant_prompt) {
+                out += "Assistant:";
             }
             break;
         }
@@ -125,6 +154,7 @@ std::string_view ChatTemplate::name() const {
         case Family::kChatML: return "chatml";
         case Family::kZephyr: return "zephyr";
         case Family::kDeepSeek: return "deepseek";
+        case Family::kDeepSeek2: return "deepseek2";
         case Family::kPlain: return "plain";
     }
     return "plain";
