@@ -31,6 +31,9 @@ namespace locus::image {
  */
 class SdVaeDecoder {
   public:
+    /** The largest latent side decode accepts (128: a 1024 px image). */
+    static constexpr std::uint32_t kMaxLatent = 128;
+
     /**
      * @param g A GGUF whose general.architecture is "autoencoder_kl".
      * @throws gguf::Error on a missing or wrong key or tensor.
@@ -47,7 +50,8 @@ class SdVaeDecoder {
      *     (not yet divided by the scaling factor).
      * @param op The backend ops for the attention's matrices.
      * @returns [3][h * upscale][w * upscale], about [-1, 1], unclamped.
-     * @throws std::invalid_argument on a wrong size.
+     * @throws std::invalid_argument on a wrong size or a side over
+     *     kMaxLatent.
      */
     std::vector<float> decode(std::span<const float> latent, std::uint32_t h,
                               std::uint32_t w, const backend::Ops& op) const;

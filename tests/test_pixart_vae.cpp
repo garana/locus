@@ -69,6 +69,8 @@ TEST_CASE("vae decoder matches torch on a synthetic model",
     const auto got = vae.decode(z, 8, 8, op);
     REQUIRE(rel_error(got, ref) <= 1e-5);
     REQUIRE_THROWS_AS(vae.decode(z, 4, 8, op), std::invalid_argument);
+    const std::vector<float> big(std::size_t{4} * 129 * 1);
+    REQUIRE_THROWS_AS(vae.decode(big, 129, 1, op), std::invalid_argument);
 }
 
 // The PixArt VAE on the golden final latent, against the pipeline's

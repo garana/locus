@@ -134,7 +134,9 @@ SdVaeDecoder SdVaeDecoder::load(const gguf::GgufFile& g) {
 std::vector<float> SdVaeDecoder::decode(std::span<const float> latent,
                                         std::uint32_t h, std::uint32_t w,
                                         const backend::Ops& op) const {
-    if (h == 0 || w == 0 || h > 1024 || w > 1024 ||
+    // 128 is a 1024 px image; larger latents make the mid attention
+    // (one head over h * w tokens) and the activations unreasonable.
+    if (h == 0 || w == 0 || h > kMaxLatent || w > kMaxLatent ||
         latent.size() != std::size_t{latent_} * h * w) {
         throw std::invalid_argument("vae: latent is not C x h x w");
     }
