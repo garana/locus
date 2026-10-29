@@ -9,7 +9,8 @@ to two GGUFs (i#357):
   come from the checkpoint's "config" metadata;
 - an "ltxv_vae" GGUF with the VAE decoder: vae.decoder.* and
   vae.per_channel_statistics.* without the "vae." prefix, all F32 (the
-  conv kernels read F32); the encoder is left out.
+  conv kernels read F32); the encoder is left out. Without --vae-out
+  only the DiT is written (the synthetic goldens have no VAE).
 
 The checkpoint is BF16, which safetensors.numpy cannot load, so this
 reads the safetensors header and tensor bytes itself.
@@ -193,7 +194,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True, help="ltxv-*.safetensors")
     ap.add_argument("--dit-out", required=True)
-    ap.add_argument("--vae-out", required=True)
+    ap.add_argument("--vae-out",
+                    help="the decoder GGUF; omitted, only the DiT is written")
     a = ap.parse_args()
 
     hdr, meta, base = read_header(a.ckpt)
@@ -210,7 +212,8 @@ def main():
             vae.append((name[len("vae."):], load(mm, base, hdr[name])))
     write_dit(a.dit_out, cfg["transformer"], cfg["scheduler"],
               cfg.get("allowed_inference_steps", []), dit)
-    write_vae(a.vae_out, cfg["vae"], vae)
+    if a.vae_out:
+        write_vae(a.vae_out, cfg["vae"], vae)
 
 
 if __name__ == "__main__":
