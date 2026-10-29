@@ -73,6 +73,58 @@ float dot_bf16_neon(const std::uint16_t* w, const float* x,
     return s;
 }
 
+/**
+ * R BF16 rows . T tokens, each dot in dot_bf16_neon's exact order (two
+ * 4-lane chains, summed at the end, then the scalar tail), so each
+ * result is byte-identical to it. Each 8-weight step is widened once
+ * and used for all T tokens; each x load is used for all R rows.
+ *
+ * @param w The first row; row k starts at w + k * cols.
+ * @param x The first token; token j starts at x + j * cols.
+ * @param out out[k * stride + j] receives row k . token j.
+ */
+template <int R, int T>
+void bf16_tile_neon(const std::uint16_t* w, const float* x,
+                    std::size_t cols, float* out, std::size_t stride) {
+    float32x4_t a0[R][T], a1[R][T];
+    for (int k = 0; k < R; ++k) {
+        for (int j = 0; j < T; ++j) {
+            a0[k][j] = vdupq_n_f32(0.0f);
+            a1[k][j] = vdupq_n_f32(0.0f);
+        }
+    }
+    std::size_t i = 0;
+    for (; i + 8 <= cols; i += 8) {
+        float32x4_t lo[R], hi[R];
+        for (int k = 0; k < R; ++k) {
+            const uint16x8_t v = vld1q_u16(w + k * cols + i);
+            lo[k] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v), 16));
+            hi[k] = vreinterpretq_f32_u32(vshll_high_n_u16(v, 16));
+        }
+        for (int j = 0; j < T; ++j) {
+            const float32x4_t x0 = vld1q_f32(x + j * cols + i);
+            const float32x4_t x1 = vld1q_f32(x + j * cols + i + 4);
+            for (int k = 0; k < R; ++k) {
+                a0[k][j] = vfmaq_f32(a0[k][j], lo[k], x0);
+                a1[k][j] = vfmaq_f32(a1[k][j], hi[k], x1);
+            }
+        }
+    }
+    for (int k = 0; k < R; ++k) {
+        for (int j = 0; j < T; ++j) {
+            float s = vaddvq_f32(vaddq_f32(a0[k][j], a1[k][j]));
+            for (std::size_t e = i; e < cols; ++e) {
+                const std::uint32_t u =
+                    static_cast<std::uint32_t>(w[k * cols + e]) << 16;
+                float f;
+                std::memcpy(&f, &u, sizeof f);
+                s += f * x[j * cols + e];
+            }
+            out[k * stride + j] = s;
+        }
+    }
+}
+
 /** One Q8_0 block: f16 scale + 32 int8 quants (34 bytes). */
 float dot_q8_0_block_neon(const std::byte* blk, const float* x) {
     const float d = half_to_float(load_u16(blk));
@@ -843,6 +895,35 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
                           static_cast<std::size_t>(r) * n;
             for (std::uint32_t t = 0; t < n; ++t) {
                 orow[t] = sacc[t];
+            }
+        }
+        return;
+    }
+    // Register-blocked BF16: 2-row x 4-token tiles (bf16_tile_neon),
+    // byte-identical to dot_bf16_neon per token. Token blocks are the
+    // outer loop, so a block's 4 x rows stay in L1 while the weight
+    // rows stream past them.
+    if (w.type == gguf::TensorType::kBF16) {
+        const auto* rows = reinterpret_cast<const std::uint16_t*>(w.data);
+        float* out = out_batch.data();
+        std::uint32_t t = 0;
+        for (; t + 4 <= n; t += 4) {
+            const float* xt = x_batch.data() + t * cols;
+            std::uint32_t r = 0;
+            for (; r + 2 <= w.rows; r += 2) {
+                bf16_tile_neon<2, 4>(rows + r * cols, xt, cols,
+                                     out + std::size_t{r} * n + t, n);
+            }
+            if (r < w.rows) {
+                bf16_tile_neon<1, 4>(rows + r * cols, xt, cols,
+                                     out + std::size_t{r} * n + t, n);
+            }
+        }
+        for (; t < n; ++t) {
+            const float* xt = x_batch.data() + t * cols;
+            for (std::uint32_t r = 0; r < w.rows; ++r) {
+                out[std::size_t{r} * n + t] =
+                    dot_bf16_neon(rows + r * cols, xt, cols);
             }
         }
         return;

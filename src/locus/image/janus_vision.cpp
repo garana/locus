@@ -30,7 +30,9 @@ void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
  * out. The rows are split across threads; each thread runs its slice
  * over every token, so the slice stays in cache while the tokens
  * stream past it. A backend that does not split rows (see
- * backend::splits_rows) runs as one slice.
+ * backend::splits_rows) runs as one slice. With a batched kernel
+ * (Ops::matvec_batch, byte-identical to per-token matvec) a slice runs
+ * all tokens in one call.
  */
 void linear(const backend::Ops& op, const backend::Mat& w,
             std::span<const float> bias, std::span<const float> x,
@@ -48,6 +50,19 @@ void linear(const backend::Ops& op, const backend::Mat& w,
         if (r0 >= rows) return;
         const std::uint32_t nr = std::min(per, rows - r0);
         const backend::Mat ws = backend::mat_rows(w, r0, nr);
+        if (op.matvec_batch != nullptr) {
+            // Row-major [nr][n] out of the kernel, token-major here.
+            thread_local std::vector<float> rm;
+            rm.resize(std::size_t{nr} * n);
+            op.matvec_batch(ws, x.subspan(0, std::size_t{n} * cols), rm, n);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                float* o = &out[std::size_t{t} * rows + r0];
+                for (std::uint32_t r = 0; r < nr; ++r) {
+                    o[r] = rm[std::size_t{r} * n + t] + bias[r0 + r];
+                }
+            }
+            return;
+        }
         for (std::uint32_t t = 0; t < n; ++t) {
             const auto o = out.subspan(std::size_t{t} * rows + r0, nr);
             op.matvec(ws, x.subspan(std::size_t{t} * cols, cols), o);
