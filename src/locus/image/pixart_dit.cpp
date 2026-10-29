@@ -296,26 +296,40 @@ std::vector<float> PixArtDit::forward(std::span<const float> latent, float t,
         const float* scale2 = &mod[4 * w];
         const float* gate2 = &mod[5 * w];
 
+        // The elementwise steps run one token row per thread item.
+        const auto add_gated = [&](const float* gate) {
+            parallel(n, [&](std::size_t t) {
+                float* hr = &h[t * w];
+                const float* orow = &o[t * w];
+                for (std::uint32_t i = 0; i < w; ++i) {
+                    hr[i] += gate != nullptr ? gate[i] * orow[i] : orow[i];
+                }
+            });
+        };
+
         ln_modulate(h, n, w, eps_, shift1, scale1, a);
         linear(op, b.q1.w, b.q1.b, a, n, q);
         linear(op, b.k1.w, b.k1.b, a, n, k);
         linear(op, b.v1.w, b.v1.b, a, n, v);
         attention(op, q, n, k, v, n, heads_, head_dim_, att);
         linear(op, b.o1.w, b.o1.b, att, n, o);
-        for (std::size_t i = 0; i < h.size(); ++i) h[i] += gate1[i % w] * o[i];
+        add_gated(gate1);
 
         linear(op, b.q2.w, b.q2.b, h, n, q);
         linear(op, b.k2.w, b.k2.b, u, n_text, kc);
         linear(op, b.v2.w, b.v2.b, u, n_text, vc);
         attention(op, q, n, kc, vc, n_text, heads_, head_dim_, att);
         linear(op, b.o2.w, b.o2.b, att, n, o);
-        for (std::size_t i = 0; i < h.size(); ++i) h[i] += o[i];
+        add_gated(nullptr);
 
         ln_modulate(h, n, w, eps_, shift2, scale2, a);
         linear(op, b.up.w, b.up.b, a, n, up);
-        for (float& x : up) x = gelu_tanh(x);
+        parallel(n, [&](std::size_t t) {
+            float* ur = &up[t * ffn_];
+            for (std::uint32_t i = 0; i < ffn_; ++i) ur[i] = gelu_tanh(ur[i]);
+        });
         linear(op, b.down.w, b.down.b, up, n, o);
-        for (std::size_t i = 0; i < h.size(); ++i) h[i] += gate2[i % w] * o[i];
+        add_gated(gate2);
     }
 
     // Final layer: shift and scale from the table plus c itself.

@@ -107,8 +107,34 @@ void matvec_batch_vulkan(const Mat& w, std::span<const float> x,
  * whole matrices and all tokens at once. Kept apart from the vulkan
  * backend entry, whose language-model paths do their own batching.
  */
+/**
+ * matvec_batch_vulkan's GPU work with the output token-major
+ * (out[t * rows + r]), as the image models hold activations, so no
+ * transpose either way. Same weight rule: stable (mmapped) weights only.
+ */
+void vulkan_linear_tokens(const Mat& w, std::span<const float> x,
+                          std::uint32_t n, std::span<float> out);
+
 struct Ops;
 const Ops& vulkan_image_ops();
+
+/**
+ * Multi-head attention without a mask on the GPU, in one batch:
+ * S_h = Q_h K_h^T / sqrt(hd), a softmax per row, O_h = P_h V_h. The
+ * operands go to scratch buffers rewritten every call (never the weight
+ * pool), so temporary host buffers are fine here.
+ *
+ * @param q nq rows of heads * hd floats (head h at h * hd).
+ * @param kh Per-head keys: [heads][nk][hd].
+ * @param vt Per-head values, transposed: [heads][hd][nk].
+ * @param out nq rows of heads * hd floats.
+ * @throws std::invalid_argument on short spans or a score buffer past
+ *     2^32 floats.
+ */
+void vulkan_attention(std::span<const float> q, std::uint32_t nq,
+                      std::span<const float> kh, std::span<const float> vt,
+                      std::uint32_t nk, std::uint32_t heads, std::uint32_t hd,
+                      std::span<float> out);
 
 /**
  * @returns true when the Vulkan device can import host memory in
