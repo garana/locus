@@ -9,6 +9,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/image/sd_vae.hpp"
 
@@ -68,6 +69,11 @@ TEST_CASE("vae decoder matches torch on a synthetic model",
     const auto& op = locus::backend::best_backend().ops;
     const auto got = vae.decode(z, 8, 8, op);
     REQUIRE(rel_error(got, ref) <= 1e-5);
+    // The GPU convolutions, linears and attention, when Vulkan is usable.
+    if (locus::backend::vulkan_backend_usable()) {
+        const auto gpu = vae.decode(z, 8, 8, locus::backend::vulkan_image_ops());
+        REQUIRE(rel_error(gpu, ref) <= 1e-5);
+    }
     REQUIRE_THROWS_AS(vae.decode(z, 4, 8, op), std::invalid_argument);
     const std::vector<float> big(std::size_t{4} * 129 * 1);
     REQUIRE_THROWS_AS(vae.decode(big, 129, 1, op), std::invalid_argument);
@@ -86,33 +92,43 @@ TEST_CASE("pixart vae decode matches the reference image",
     const auto z = read_f32(kDir + "golden/pixart/latent_final.f32");
     const auto ref = read_f32(kDir + "golden/pixart/vae_image_s4.f32");
     REQUIRE(ref.size() == std::size_t{128} * 128 * 3);
-    const auto& op = locus::backend::best_backend().ops;
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto img = vae.decode(z, 64, 64, op);
-    const double secs =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
-            .count();
-    REQUIRE(img.size() == std::size_t{3} * 512 * 512);
-    // clamp(y / 2 + 0.5, 0, 1) * 255, HWC, at the sampled pixels.
-    std::vector<float> got(ref.size());
-    const std::size_t plane = std::size_t{512} * 512;
-    double worst = 0.0;
-    for (std::uint32_t r = 0; r < 128; ++r) {
-        for (std::uint32_t c = 0; c < 128; ++c) {
-            for (std::uint32_t ch = 0; ch < 3; ++ch) {
-                const float y = img[ch * plane + std::size_t{4 * r} * 512 +
-                                    4 * c];
-                const float px =
-                    std::clamp(y / 2.0f + 0.5f, 0.0f, 1.0f) * 255.0f;
-                const std::size_t i = (std::size_t{r} * 128 + c) * 3 + ch;
-                got[i] = px;
-                worst = std::max(worst, double{std::fabs(px - ref[i])});
+    // The CPU backend, and the GPU when a Vulkan device is usable.
+    std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
+        {"cpu", &locus::backend::best_backend().ops}};
+    if (locus::backend::vulkan_backend_usable()) {
+        legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    for (const auto& [name, op] : legs) {
+        INFO(name);
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto img = vae.decode(z, 64, 64, *op);
+        const double secs = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+        REQUIRE(img.size() == std::size_t{3} * 512 * 512);
+        // clamp(y / 2 + 0.5, 0, 1) * 255, HWC, at the sampled pixels.
+        std::vector<float> got(ref.size());
+        const std::size_t plane = std::size_t{512} * 512;
+        double worst = 0.0;
+        for (std::uint32_t r = 0; r < 128; ++r) {
+            for (std::uint32_t c = 0; c < 128; ++c) {
+                for (std::uint32_t ch = 0; ch < 3; ++ch) {
+                    const float y = img[ch * plane +
+                                        std::size_t{4 * r} * 512 + 4 * c];
+                    const float px =
+                        std::clamp(y / 2.0f + 0.5f, 0.0f, 1.0f) * 255.0f;
+                    const std::size_t i =
+                        (std::size_t{r} * 128 + c) * 3 + ch;
+                    got[i] = px;
+                    worst = std::max(worst, double{std::fabs(px - ref[i])});
+                }
             }
         }
+        // Measured on macOS arm64 (CPU): 0.0015 of 255 (1.2e-5 of the
+        // RMS).
+        WARN("pixart vae " << name << ": max |diff| " << worst
+                           << " of 255, max diff / rms "
+                           << rel_error(got, ref) << ", " << secs << " s");
+        CHECK(worst <= 0.1);
     }
-    // Measured on macOS arm64: 0.0015 of 255 (1.2e-5 of the RMS).
-    WARN("pixart vae: max |diff| " << worst << " of 255, max diff / rms "
-                                   << rel_error(got, ref) << ", " << secs
-                                   << " s");
-    CHECK(worst <= 0.1);
 }

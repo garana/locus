@@ -239,6 +239,8 @@ struct State {
         drop(img_v, img_v_n);
         drop(img_s, img_s_n);
         drop(img_o, img_o_n);
+        drop(conv_in, conv_in_n);
+        drop(conv_out, conv_out_n);
         drop(q, q_n);
         drop(gate, gate_n);
         drop(up, up_n);
@@ -279,6 +281,9 @@ struct State {
     VulkanContext::Buffer img_q{}, img_k{}, img_v{}, img_s{}, img_o{};
     std::size_t img_q_n = 0, img_k_n = 0, img_v_n = 0, img_s_n = 0,
                 img_o_n = 0;
+    /** conv2d_vulkan's input and output (scratch). */
+    VulkanContext::Buffer conv_in{}, conv_out{};
+    std::size_t conv_in_n = 0, conv_out_n = 0;
 
     /** Activation buffers, sized on first use per model dims. */
     VulkanContext::Buffer x{}, xb{}, q{}, gate{}, up{}, attout{},
@@ -1635,6 +1640,38 @@ void vulkan_attention(std::span<const float> q, std::uint32_t nq,
     }
     s.end_batch();
     s.ctx.read_buffer(s.img_o, std::as_writable_bytes(out.first(qn)));
+}
+
+void conv2d_vulkan(std::span<const float> in, std::uint32_t in_ch,
+                   std::uint32_t in_h, std::uint32_t in_w,
+                   std::span<const float> weight, std::uint32_t out_ch,
+                   std::uint32_t kh, std::uint32_t kw,
+                   std::span<const float> bias, std::uint32_t stride,
+                   std::uint32_t pad, std::uint32_t groups,
+                   std::span<float> out) {
+    conv2d_check_args(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias,
+                      stride, pad, groups, out);
+    const std::uint32_t oh = conv1d_out_len(in_h, kh, stride, 1, pad);
+    const std::uint32_t ow = conv1d_out_len(in_w, kw, stride, 1, pad);
+    std::lock_guard lk(state_mu());
+    State& s = state();
+    // Weights and bias come from the model file (stable pointers): the
+    // pool keeps them. Input and output are scratch.
+    const auto wb = s.upload(weight.data(), weight.size_bytes());
+    const auto bb = bias.empty() ? wb : s.upload(bias.data(), bias.size_bytes());
+    s.grow(s.conv_in, s.conv_in_n, in.size());
+    s.grow(s.conv_out, s.conv_out_n, out.size());
+    s.ctx.write_buffer(s.conv_in, std::as_bytes(in));
+    s.ctx.begin_batch();
+    State::BatchScope batch_scope{s};
+    const VulkanContext::Buffer bufs[] = {s.conv_in, wb, bb, s.conv_out};
+    const std::uint32_t push[] = {in_ch, in_h,   in_w,   out_ch,
+                                  oh,    ow,     kh,     kw,
+                                  stride, pad,   groups, bias.empty() ? 0u : 1u};
+    // x tiles one output plane in 64s; y is the output channel.
+    s.ctx.dispatch(Kernel::kConv2d, bufs, push, (oh * ow + 63) / 64, out_ch);
+    s.end_batch();
+    s.ctx.read_buffer(s.conv_out, std::as_writable_bytes(out));
 }
 
 bool vulkan_imports_host_memory() {

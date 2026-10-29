@@ -115,6 +115,20 @@ void matvec_batch_vulkan(const Mat& w, std::span<const float> x,
 void vulkan_linear_tokens(const Mat& w, std::span<const float> x,
                           std::uint32_t n, std::span<float> out);
 
+/**
+ * conv2d on the GPU (conv2d.comp: one invocation per output, summing
+ * ci, ky, kx in conv2d's order), same arguments and checks
+ * (conv2d_check_args). The weight and bias are cached by host pointer
+ * like the matvec weights, so pass only stable (mmapped) ones.
+ */
+void conv2d_vulkan(std::span<const float> in, std::uint32_t in_ch,
+                   std::uint32_t in_h, std::uint32_t in_w,
+                   std::span<const float> weight, std::uint32_t out_ch,
+                   std::uint32_t kh, std::uint32_t kw,
+                   std::span<const float> bias, std::uint32_t stride,
+                   std::uint32_t pad, std::uint32_t groups,
+                   std::span<float> out);
+
 struct Ops;
 const Ops& vulkan_image_ops();
 
