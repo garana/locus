@@ -462,7 +462,15 @@ guarding the default path.
   `locus_engine_steps_total`) and the running and waiting counts. The
   engine writes them as relaxed atomics, a few clock reads per request
   and two per step, and `/metrics` reads them without the engine lock;
-  decode speed is unchanged within noise.
+  decode speed is unchanged within noise. The HTTP layer adds, per
+  route (the server's routes, anything else as `other`):
+  `locus_http_requests_total{route,code}` for every answered request
+  (head-stage rejects and parse or deadline errors included), the
+  request and response body sizes (`locus_http_request_bytes`,
+  `locus_http_response_bytes`, stream payload included), the time from
+  head received to response written (`locus_http_request_seconds`)
+  and `locus_http_requests_in_flight`. A request costs a route lookup
+  and a few relaxed adds, about 27 ns on the M2 Pro.
 - KV-cache quantization: Q8 or Q4 blocks of 32 (f16 scale) in a
   separate byte pool, for the llama-family attention. Each layer's
   past rows are dequantized into scratch, so the attention math is the

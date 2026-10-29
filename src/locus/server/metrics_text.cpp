@@ -46,7 +46,15 @@ std::string MetricsText::escape(std::string_view v) {
     return out;
 }
 
-void MetricsText::header(std::string_view name, std::string_view help,
+std::string MetricsText::label(std::string_view key, std::string_view v) {
+    std::string out(key);
+    out += "=\"";
+    out += escape(v);
+    out += '"';
+    return out;
+}
+
+void MetricsText::family(std::string_view name, std::string_view help,
                          std::string_view type) {
     out_ += "# HELP ";
     out_ += name;
@@ -74,40 +82,59 @@ void MetricsText::sample(std::string_view name, std::string_view extra,
     out_ += '\n';
 }
 
+void MetricsText::value(std::string_view name, std::string_view extra,
+                        std::uint64_t v) {
+    sample(name, extra, std::to_string(v));
+}
+
+void MetricsText::value(std::string_view name, std::string_view extra,
+                        double v) {
+    sample(name, extra, format_double(v));
+}
+
 void MetricsText::counter(std::string_view name, std::string_view help,
                           std::uint64_t v) {
-    header(name, help, "counter");
-    sample(name, "", std::to_string(v));
+    family(name, help, "counter");
+    value(name, "", v);
 }
 
 void MetricsText::counter(std::string_view name, std::string_view help,
                           double v) {
-    header(name, help, "counter");
-    sample(name, "", format_double(v));
+    family(name, help, "counter");
+    value(name, "", v);
 }
 
 void MetricsText::gauge(std::string_view name, std::string_view help,
                         std::uint64_t v) {
-    header(name, help, "gauge");
-    sample(name, "", std::to_string(v));
+    family(name, help, "gauge");
+    value(name, "", v);
 }
 
-void MetricsText::histogram(std::string_view name, std::string_view help,
-                            const engine::Histogram::Snapshot& s) {
-    header(name, help, "histogram");
+void MetricsText::histogram_series(std::string_view name,
+                                   std::string_view extra,
+                                   const sys::Histogram::Snapshot& s) {
     const std::string bucket = std::string(name) + "_bucket";
+    const std::string pre =
+        extra.empty() ? std::string() : std::string(extra) + ",";
     for (std::size_t i = 0; i < s.cumulative.size(); ++i) {
         const std::string le =
             i < s.bounds.size() ? format_double(s.bounds[i]) : "+Inf";
-        sample(bucket, "le=\"" + le + "\"", std::to_string(s.cumulative[i]));
+        sample(bucket, pre + "le=\"" + le + "\"",
+               std::to_string(s.cumulative[i]));
     }
-    sample(std::string(name) + "_sum", "", format_double(s.sum_seconds));
-    sample(std::string(name) + "_count", "", std::to_string(s.count));
+    sample(std::string(name) + "_sum", extra, format_double(s.sum));
+    sample(std::string(name) + "_count", extra, std::to_string(s.count));
+}
+
+void MetricsText::histogram(std::string_view name, std::string_view help,
+                            const sys::Histogram::Snapshot& s) {
+    family(name, help, "histogram");
+    histogram_series(name, "", s);
 }
 
 void MetricsText::info(std::string_view name, std::string_view help,
                        const std::vector<Label>& extra) {
-    header(name, help, "gauge");
+    family(name, help, "gauge");
     sample(name, render_labels(extra), "1");
 }
 

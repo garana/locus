@@ -186,6 +186,7 @@ class ServerSink : public Sink {
             ok_ = false;
             return false;
         }
+        bytes_ += data.size();
         return true;
     }
 
@@ -201,6 +202,8 @@ class ServerSink : public Sink {
     }
 
     bool ok() const { return ok_; }
+    /** @returns The payload bytes written (without chunk framing). */
+    std::uint64_t bytes() const { return bytes_; }
 
  private:
     int fd_;
@@ -209,6 +212,37 @@ class ServerSink : public Sink {
     const std::atomic<bool>& stopping_;
     bool ok_ = true;
     bool done_ = false;
+    std::uint64_t bytes_ = 0;
+};
+
+/** @returns The body size write_status_response sends for `status`. */
+std::uint64_t status_body_bytes(int status, bool head_request) {
+    return head_request ? 0 : status_reason(status).size() + 1;
+}
+
+/** Counts one request in HttpMetrics::in_flight while it is open. */
+class InFlight {
+ public:
+    explicit InFlight(HttpMetrics* m) : m_(m) {}
+    ~InFlight() { stop(); }
+    InFlight(const InFlight&) = delete;
+    InFlight& operator=(const InFlight&) = delete;
+    void start() {
+        if (m_ != nullptr && !on_) {
+            m_->in_flight.fetch_add(1, std::memory_order_relaxed);
+            on_ = true;
+        }
+    }
+    void stop() {
+        if (on_) {
+            m_->in_flight.fetch_sub(1, std::memory_order_relaxed);
+            on_ = false;
+        }
+    }
+
+ private:
+    HttpMetrics* m_;
+    bool on_ = false;
 };
 
 }  // namespace
@@ -657,6 +691,15 @@ void Server::serve_connection(int fd, const std::string& peer_ip,
     clock::time_point body_start;     // when the head completed
     clock::time_point body_deadline;  // body phase (rate-credited)
     std::size_t body_bytes = 0;       // body bytes received this request
+    InFlight in_flight(cfg_.metrics.get());
+    // The path of the request whose head is buffered, for an error that
+    // ends it before parse_request completes ("" = not known: "other").
+    const auto head_path = [&]() -> std::string {
+        Request h;
+        return parse_head(buf, cfg_.limits, h).state == ParseState::kComplete
+                   ? h.path
+                   : std::string();
+    };
 
     for (;;) {
         if (stopping_.load()) {
@@ -676,6 +719,7 @@ void Server::serve_connection(int fd, const std::string& peer_ip,
             body_bytes = 0;
             body_deadline =
                 body_start + std::chrono::milliseconds(cfg_.head_deadline_ms);
+            in_flight.start();
             if (head_handler_) {
                 Request head_req;
                 if (parse_head(buf, cfg_.limits, head_req).state ==
@@ -688,11 +732,17 @@ void Server::serve_connection(int fd, const std::string& peer_ip,
                         // As in handle_request: 500 and close (i#243).
                         write_status_response(fd, head_req.is_head, 500,
                                               false);
+                        record(head_req.path, 500, 0,
+                               status_body_bytes(500, head_req.is_head),
+                               body_start);
                         return;
                     }
                     if (reject) {
+                        Sent sent;
                         write_buffered_response(fd, hres, head_req.is_head,
-                                                false);
+                                                false, &sent);
+                        record(head_req.path, sent.status, 0,
+                               sent.body_bytes, body_start);
                         return;  // reject on the head: no 100, close (#10/#1)
                     }
                 }
@@ -712,7 +762,8 @@ void Server::serve_connection(int fd, const std::string& peer_ip,
             // work (and cancel the generation) if this peer disconnects
             // mid-request. Peeks fd without consuming request bytes.
             req_ctx.client_alive = [fd] { return !peer_half_closed(fd); };
-            const bool ok = handle_request(fd, req, req_ctx, keep);
+            const bool ok = handle_request(fd, req, req_ctx, keep, body_start);
+            in_flight.stop();
             // Reset per-request state before the next pipelined request.
             head_seen = false;
             req_in_flight = false;
@@ -728,6 +779,9 @@ void Server::serve_connection(int fd, const std::string& peer_ip,
             // A pre-parse error has no known method (the parser clears
             // `out`), so head_request is false -- we may send a body.
             write_status_response(fd, false, pr.suggested_status, false);
+            record(head_path(), pr.suggested_status, 0,
+                   status_body_bytes(pr.suggested_status, false),
+                   head_seen ? body_start : clock::now());
             return;  // #1: any parse error closes, never keep-alive
         }
 
@@ -778,6 +832,9 @@ void Server::serve_connection(int fd, const std::string& peer_ip,
                 return;  // idle keep-alive timeout: close silently
             }
             write_status_response(fd, false, 408, false);
+            record(head_path(), 408, body_bytes, status_body_bytes(408, false),
+                   head_seen ? body_start : head_deadline -
+                       std::chrono::milliseconds(cfg_.head_deadline_ms));
             return;  // head or body receipt deadline tripped
         }
         if ((pfds[1].revents & POLLIN) != 0) {
@@ -824,7 +881,8 @@ void Server::serve_connection(int fd, const std::string& peer_ip,
 }
 
 bool Server::write_buffered_response(int fd, const ServerResponse& res,
-                                     bool head_request, bool keep) {
+                                     bool head_request, bool keep,
+                                     Sent* sent) {
     Response r;
     r.status = res.status;
     r.headers = res.headers;
@@ -833,21 +891,44 @@ bool Server::write_buffered_response(int fd, const ServerResponse& res,
     if (!write_response(r, head_request, keep, out, werr)) {
         // A framing/unsafe header from the handler: answer 500 and close.
         write_status_response(fd, head_request, 500, false);
+        if (sent != nullptr) {
+            *sent = {500, status_body_bytes(500, head_request)};
+        }
         return false;
+    }
+    if (sent != nullptr) {
+        *sent = {res.status, head_request ? 0 : res.body.size()};
     }
     return write_all_deadline(fd, out, wake_r_, cfg_.write_deadline_ms,
                               stopping_);
 }
 
+void Server::record(std::string_view path, int status,
+                    std::uint64_t req_bytes, std::uint64_t resp_bytes,
+                    std::chrono::steady_clock::time_point start) {
+    HttpMetrics* m = cfg_.metrics.get();
+    if (m == nullptr) return;
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    m->record(m->route(path), status, req_bytes, resp_bytes,
+              ns > 0 ? static_cast<std::uint64_t>(ns) : 0);
+}
+
 bool Server::handle_request(int fd, const Request& req,
-                            const RequestContext& ctx, bool keep) {
+                            const RequestContext& ctx, bool keep,
+                            std::chrono::steady_clock::time_point start) {
+    const std::uint64_t req_bytes = req.body.size();
     ServerResponse res;
     try {
         handler_(req, res, ctx);
     } catch (...) {
         // Last resort (i#243): an exception that escapes a handler must
         // not end the process. Answer 500 and close the connection.
-        return write_status_response(fd, req.is_head, 500, false), false;
+        write_status_response(fd, req.is_head, 500, false);
+        record(req.path, 500, req_bytes, status_body_bytes(500, req.is_head),
+               start);
+        return false;
     }
 
     if (res.provider) {
@@ -857,10 +938,14 @@ bool Server::handle_request(int fd, const Request& req,
         std::string out, werr;
         if (!write_chunked_head(head, keep, out, werr)) {
             // Handler set a framing/unsafe header: answer 500 and close.
-            return write_status_response(fd, req.is_head, 500, false), false;
+            write_status_response(fd, req.is_head, 500, false);
+            record(req.path, 500, req_bytes,
+                   status_body_bytes(500, req.is_head), start);
+            return false;
         }
         if (!write_all_deadline(fd, out, wake_r_, cfg_.write_deadline_ms,
                                 stopping_)) {
+            record(req.path, res.status, req_bytes, 0, start);
             return false;
         }
         if (req.is_head) {
@@ -868,22 +953,30 @@ bool Server::handle_request(int fd, const Request& req,
             // (Transfer-Encoding included) but NO body -- do not run the
             // provider or write any chunk, or the client reads them as
             // the next response and the keep-alive stream desyncs.
+            record(req.path, res.status, req_bytes, 0, start);
             return keep;
         }
         ServerSink sink(fd, wake_r_, cfg_.write_deadline_ms, stopping_);
+        bool threw = false;
         try {
             res.provider(sink);
         } catch (...) {
             // The head is already out, so no 500 is possible: close
             // without the terminating chunk, which the client sees as a
             // truncated stream (i#243).
-            return false;
+            threw = true;
         }
-        sink.done();  // terminating chunk (idempotent if the handler did)
-        return sink.ok() && keep;
+        if (!threw) {
+            sink.done();  // terminating chunk (idempotent if the handler did)
+        }
+        record(req.path, res.status, req_bytes, sink.bytes(), start);
+        return !threw && sink.ok() && keep;
     }
 
-    return write_buffered_response(fd, res, req.is_head, keep) && keep;
+    Sent sent;
+    const bool ok = write_buffered_response(fd, res, req.is_head, keep, &sent);
+    record(req.path, sent.status, req_bytes, sent.body_bytes, start);
+    return ok && keep;
 }
 
 bool Server::write_status_response(int fd, bool head_request, int status,

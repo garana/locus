@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "locus/http/http.hpp"
+#include "locus/http/metrics.hpp"
 #include "locus/pipeline/net.hpp"
 
 namespace locus::http {
@@ -217,6 +218,10 @@ struct ServerConfig {
      * one slow client cannot block the acceptor is tracked in i#88. */
     std::function<bool(std::string_view method, std::string_view target)>
         fast_path;
+    /** Per-route request metrics, recorded for every answered request
+     * (handler responses, head-stage rejects, parse and deadline
+     * errors); null records nothing. */
+    std::shared_ptr<HttpMetrics> metrics;
 };
 
 /**
@@ -289,17 +294,29 @@ class Server {
      * worker or acceptor thread (and so the process). */
     void serve_connection_guarded(int fd, const std::string& peer_ip,
                                   bool single_request);
-    /** Runs the handler and writes its response (buffered or streamed).
+    /** Runs the handler and writes its response (buffered or streamed),
+     * then records it in cfg_.metrics (when set) from `start`, the time
+     * the head was complete.
      * @returns true iff the connection may be kept alive for the next
      * request (write succeeded AND `keep`). */
     bool handle_request(int fd, const Request& req, const RequestContext& ctx,
-                        bool keep);
+                        bool keep, std::chrono::steady_clock::time_point start);
+    /** Records one answered request in cfg_.metrics (when set). */
+    void record(std::string_view path, int status, std::uint64_t req_bytes,
+                std::uint64_t resp_bytes,
+                std::chrono::steady_clock::time_point start);
     /** Serializes a buffered ServerResponse (status + headers + body) and
      * writes it; a HEAD omits the body. On a framing/unsafe header it
-     * sends a 500 and returns false. @returns true iff the write
-     * succeeded. */
+     * sends a 500 and returns false. When `sent` is not null it gets the
+     * status and body size actually sent (the 500's on that path), for
+     * the metrics. @returns true iff the write succeeded. */
+    struct Sent {
+        int status = 0;
+        std::uint64_t body_bytes = 0;
+    };
     bool write_buffered_response(int fd, const ServerResponse& res,
-                                 bool head_request, bool keep);
+                                 bool head_request, bool keep,
+                                 Sent* sent = nullptr);
     /** Writes a minimal status-only response (the reason as a text body).
      * @returns true iff the write succeeded. */
     bool write_status_response(int fd, bool head_request, int status,

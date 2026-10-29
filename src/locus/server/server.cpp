@@ -229,6 +229,58 @@ std::pair<model::SamplingParams, std::uint64_t> parse_sampling(
     return {p, seed};
 }
 
+/**
+ * The per-route HTTP series (i#285): requests by route and status code
+ * (only codes seen), the request and response body sizes, the time from
+ * head received to response written, and the requests in flight.
+ */
+void render_http_metrics(MetricsText& mt, const http::HttpMetrics& hm) {
+    constexpr auto kRelaxed = std::memory_order_relaxed;
+    const auto names = hm.names();
+    mt.family("locus_http_requests_total",
+              "HTTP requests answered, by route and status code.",
+              "counter");
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        const auto& r = hm.at(i);
+        const std::string route = MetricsText::label("route", names[i]);
+        for (std::size_t c = 0; c < r.codes.size(); ++c) {
+            const std::uint64_t v = r.codes[c].load(kRelaxed);
+            if (v == 0) continue;
+            mt.value("locus_http_requests_total",
+                     route + "," + MetricsText::label(
+                                       "code", std::to_string(
+                                                   http::HttpMetrics::kMinCode +
+                                                   static_cast<int>(c))),
+                     v);
+        }
+        if (const std::uint64_t v = r.out_of_range.load(kRelaxed); v != 0) {
+            mt.value("locus_http_requests_total",
+                     route + "," + MetricsText::label("code", "other"), v);
+        }
+    }
+    const auto per_route = [&](const char* name, const char* help,
+                               auto pick) {
+        mt.family(name, help, "histogram");
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            mt.histogram_series(name, MetricsText::label("route", names[i]),
+                                pick(hm.at(i)).snapshot());
+        }
+    };
+    per_route("locus_http_request_bytes", "Request body size, per route.",
+              [](const auto& r) -> const auto& { return r.request_bytes; });
+    per_route("locus_http_response_bytes",
+              "Response body bytes written (stream payload included), per "
+              "route.",
+              [](const auto& r) -> const auto& { return r.response_bytes; });
+    per_route("locus_http_request_seconds",
+              "Request head received to response written, per route.",
+              [](const auto& r) -> const auto& { return r.seconds; });
+    const std::int64_t f = hm.in_flight.load(kRelaxed);
+    mt.gauge("locus_http_requests_in_flight",
+             "Requests between head received and response written.",
+             f > 0 ? static_cast<std::uint64_t>(f) : 0);
+}
+
 /** @returns The --kv-type name of `t`, for the locus_info series. */
 std::string kv_type_name(kv::KvType t) {
     switch (t) {
@@ -922,6 +974,14 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
                                              std::string_view target) {
         return method == "GET" && (target == "/health" || target == mp);
     };
+    // Every route route_of serves; anything else counts as "other".
+    http_metrics_ = std::make_shared<http::HttpMetrics>(
+        std::vector<std::string>{
+            opt_.metrics_path, "/health", "/v1/models", "/v1/models/",
+            "/v1/completions", "/v1/chat/completions", "/v1/messages",
+            "/v1/responses", "/v1/embeddings", "/v1/audio/speech",
+            "/v1/images/generations"});
+    cfg.metrics = http_metrics_;
     http_ = std::make_unique<http::Server>(std::move(cfg), route_handler_,
                                            auth_head_);
     return http_->start();
@@ -1120,6 +1180,7 @@ void OpenAiServer::install_routes() {
                             pc.llc_load_misses);
                 }
             }
+            if (http_metrics_) render_http_metrics(mt, *http_metrics_);
             res.set_content(mt.text(), "text/plain; version=0.0.4");
     };
 

@@ -13,6 +13,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/http/metrics.hpp"
 #include "locus/sys/features.hpp"
 
 using namespace locus::backend;
@@ -219,4 +220,29 @@ TEST_CASE("bench: cuda iq matvec", "[.][bench][cuda]") {
                      << " us per matvec");
     }
     SUCCEED();
+}
+
+// i#285: what the HTTP metrics add to each answered request: the route
+// lookup (the server's 11 routes, the path last in the list) and one
+// record() (a code count, three histogram observations).
+TEST_CASE("bench: http metrics per request", "[.][bench]") {
+    locus::http::HttpMetrics m({"/metrics", "/health", "/v1/models",
+                                "/v1/models/", "/v1/completions",
+                                "/v1/chat/completions", "/v1/messages",
+                                "/v1/responses", "/v1/embeddings",
+                                "/v1/audio/speech",
+                                "/v1/images/generations"});
+    constexpr int kN = 1'000'000;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kN; ++i) {
+        m.record(m.route("/v1/images/generations"), 200, 1234,
+                 static_cast<std::uint64_t>(i), 5'000'000);
+    }
+    const double ns = std::chrono::duration<double, std::nano>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count() /
+                      kN;
+    WARN("http metrics: " << ns << " ns per request (route + record)");
+    REQUIRE(m.at(m.route("/v1/images/generations")).seconds.snapshot()
+                .count == static_cast<std::uint64_t>(kN));
 }

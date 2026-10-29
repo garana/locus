@@ -1,50 +1,15 @@
 #pragma once
 
-#include <array>
 #include <atomic>
-#include <cstddef>
 #include <cstdint>
-#include <span>
-#include <vector>
+
+#include "locus/sys/histogram.hpp"
 
 namespace locus::engine {
 
-/**
- * A Prometheus-style histogram of durations with fixed bucket bounds.
- * One thread writes (the engine worker); any thread reads, without a
- * lock: every field is a relaxed atomic, so a reader may see the sum
- * one observation apart from the buckets, never a torn value (the
- * count is the bucket total). observe() costs a short bucket scan and
- * two relaxed adds.
- */
-class Histogram {
-  public:
-    /** Upper bounds in seconds (ascending), plus the implicit +Inf. */
-    static constexpr std::size_t kMaxBounds = 16;
-
-    /** @param bounds Ascending upper bounds in seconds (at most
-     *     kMaxBounds). */
-    explicit Histogram(std::span<const double> bounds);
-
-    /** Records one duration of `ns` nanoseconds. */
-    void observe(std::uint64_t ns);
-
-    /** A consistent-enough copy for rendering. */
-    struct Snapshot {
-        std::vector<double> bounds;          ///< seconds
-        std::vector<std::uint64_t> cumulative;  ///< per bound, then +Inf
-        std::uint64_t count = 0;
-        double sum_seconds = 0;
-    };
-    Snapshot snapshot() const;
-
-  private:
-    std::array<std::uint64_t, kMaxBounds> bounds_ns_{};
-    std::size_t n_bounds_ = 0;
-    /** Per-bucket (not cumulative) counts; the last one is +Inf. */
-    std::array<std::atomic<std::uint64_t>, kMaxBounds + 1> buckets_{};
-    std::atomic<std::uint64_t> sum_ns_{0};
-};
+/** Durations in nanoseconds, rendered in seconds (sys::Histogram's
+ * default unit). */
+using Histogram = sys::Histogram;
 
 /**
  * Timing and scheduler metrics of one engine (i#285), written by the
