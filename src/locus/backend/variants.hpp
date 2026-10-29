@@ -110,6 +110,15 @@ void matvec_batch_vulkan(const Mat& w, std::span<const float> x,
 struct Ops;
 const Ops& vulkan_image_ops();
 
+/**
+ * @returns true when the Vulkan device imports host memory in place
+ * (VK_EXT_external_memory_host, unified memory as on Apple): mmapped
+ * weights then cost it no device memory. Without it the image models'
+ * weights (T5-XXL alone is 9.5 GB) would be copied into the weight
+ * pool next to a language model's.
+ */
+bool vulkan_imports_host_memory();
+
 /** @returns true when a usable Vulkan device + kernels exist. */
 bool vulkan_backend_usable();
 

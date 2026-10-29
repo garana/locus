@@ -1513,14 +1513,23 @@ void matvec_batch_vulkan(const Mat& w, std::span<const float> x,
 
 const Ops& vulkan_image_ops() {
     // Not the vulkan backend entry's Ops: that one leaves matvec_batch
-    // null so the language-model paths keep their own batching.
+    // null so the language-model paths keep their own batching. No
+    // matvec_q8k: the image models do not use it, and the CPU kernel
+    // would run on one thread under self_parallel.
     static const Ops ops{.matvec = &matvec_vulkan,
-                         .matvec_q8k = &matvec_q8k,
                          .dequant_row = &dequant_row,
                          .matvec_batch = &matvec_batch_vulkan,
                          .self_parallel = true,
                          .mt_safe = false};
     return ops;
+}
+
+bool vulkan_imports_host_memory() {
+    if (!vulkan_backend_usable()) {
+        return false;
+    }
+    std::lock_guard lk(state_mu());
+    return state().ctx.host_import();
 }
 
 namespace {

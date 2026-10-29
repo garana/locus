@@ -2244,11 +2244,14 @@ void OpenAiServer::install_routes() {
                     p.seed = static_cast<std::uint64_t>(
                         body["seed"].get<std::int64_t>());
                 }
-                // The image models' linears run on the GPU when a Vulkan
-                // device is usable (vulkan_image_ops), else on the CPU
-                // backend, whatever --backend picked for the LLM; their
-                // attention and convolutions stay on the CPU.
-                const auto& op = backend::vulkan_backend_usable()
+                // The image models' linears run on the GPU when the
+                // Vulkan device imports host memory (unified memory:
+                // their mmapped weights cost it nothing), else on the
+                // CPU backend, whatever --backend picked for the LLM.
+                // A discrete GPU would copy 12 GB of weights into the
+                // pool, evicting the LLM's. Attention and convolutions
+                // stay on the CPU.
+                const auto& op = backend::vulkan_imports_host_memory()
                                      ? backend::vulkan_image_ops()
                                      : backend::best_backend().ops;
                 image::PixArtPipeline::Timing took;

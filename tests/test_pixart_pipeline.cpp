@@ -138,9 +138,9 @@ TEST_CASE("pixart pipeline draws the reference image",
     req.prompt = "A small red apple on a wooden table, soft morning light.";
     req.steps = 8;
     const auto x = read_f32(kDir + "golden/pixart/dit_in.f32");
-    // The server's choice: the GPU when a Vulkan device is usable (the
-    // per-stage tests cover the CPU too).
-    const bool gpu = locus::backend::vulkan_backend_usable();
+    // The server's choice: the GPU when the Vulkan device imports host
+    // memory (the per-stage tests cover the CPU too).
+    const bool gpu = locus::backend::vulkan_imports_host_memory();
     const auto& op = gpu ? locus::backend::vulkan_image_ops()
                          : locus::backend::best_backend().ops;
     PixArtPipeline::Timing tm;
