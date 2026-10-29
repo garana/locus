@@ -673,10 +673,11 @@ TEST_CASE("cuda q8_0 matvec matches scalar across row blocks",
     }
 }
 
-// The IQ4_XS / IQ4_NL kernels run 4 rows (a warp each) per block;
-// IQ4_NL lanes take blocks L, L + 32, ...: cover partial and full row
-// blocks, rows with fewer blocks than lanes, and lanes wrapping.
-TEST_CASE("cuda iq4_xs / iq4_nl matvec matches scalar across row blocks",
+// The IQ warp kernels run 4 rows (a warp each) per block; IQ4_NL lanes
+// take blocks L, L + 32, ...: cover partial and full row blocks, rows
+// with fewer blocks than lanes, and lanes wrapping. Random bytes are
+// valid for every type: any grid index, sign index and scale.
+TEST_CASE("cuda iq matvec matches scalar across row blocks",
           "[backend]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
@@ -693,7 +694,9 @@ TEST_CASE("cuda iq4_xs / iq4_nl matvec matches scalar across row blocks",
         std::uint32_t cols[2];
     };
     for (const C& c : {C{TT::kIQ4_XS, 256, 136, {256, 1280}},
-                       C{TT::kIQ4_NL, 32, 18, {64, 1312}}}) {
+                       C{TT::kIQ4_NL, 32, 18, {64, 1312}},
+                       C{TT::kIQ3_XXS, 256, 98, {256, 1280}},
+                       C{TT::kIQ3_S, 256, 110, {256, 1280}}}) {
         for (std::uint32_t rows : {1u, 5u, 9u, 130u}) {
             for (std::uint32_t cols : c.cols) {
                 const std::size_t nblk =
