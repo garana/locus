@@ -1454,13 +1454,21 @@ __global__ void matvec_iq4_nl_warp_kernel(const std::uint8_t* w,
             const std::uint32_t b = b0 + lane;
             const std::uint16_t* blk16 = mine + lane * 9;
             const float d = __half2float(__ushort_as_half(blk16[0]));
-            const float* xb = x + static_cast<std::size_t>(b) * 32;
+            const auto* x4 = reinterpret_cast<const float4*>(
+                x + static_cast<std::size_t>(b) * 32);
             float s = 0.0f;
-            for (int i = 0; i < 16; ++i) {
-                const std::uint32_t q =
-                    (blk16[1 + i / 2] >> (8 * (i % 2))) & 0xff;
-                s += static_cast<float>(skv[q & 0x0f]) * __ldg(xb + i) +
-                     static_cast<float>(skv[q >> 4]) * __ldg(xb + i + 16);
+            for (int k = 0; k < 4; ++k) {  // elements 4k .. 4k + 3
+                const float4 lo4 = __ldg(x4 + k);
+                const float4 hi4 = __ldg(x4 + 4 + k);
+                const float xl[4] = {lo4.x, lo4.y, lo4.z, lo4.w};
+                const float xh[4] = {hi4.x, hi4.y, hi4.z, hi4.w};
+                for (int m = 0; m < 4; ++m) {
+                    const int i = 4 * k + m;
+                    const std::uint32_t q =
+                        (blk16[1 + i / 2] >> (8 * (i % 2))) & 0xff;
+                    s += static_cast<float>(skv[q & 0x0f]) * xl[m] +
+                         static_cast<float>(skv[q >> 4]) * xh[m];
+                }
             }
             acc += d * s;
         }
