@@ -376,9 +376,15 @@ void render_gpu_metrics(MetricsText& mt) {
                 return secs(gm.wait_ns.load(kRelaxed));
             });
     counter("locus_gpu_device_seconds_total",
-            "Device time by GPU timestamps, first to last command (vulkan).",
+            "Device time by GPU timestamps, estimated from sampled batches "
+            "(vulkan).",
             [&](const backend::GpuMetrics& gm) {
                 return secs(gm.device_ns.load(kRelaxed));
+            });
+    counter("locus_gpu_device_samples_total",
+            "Batches timed for the device time estimate (vulkan).",
+            [&](const backend::GpuMetrics& gm) {
+                return static_cast<double>(gm.device_samples.load(kRelaxed));
             });
     mt.family("locus_gpu_memory_bytes",
               "Device memory this process holds, per kind.", "gauge");

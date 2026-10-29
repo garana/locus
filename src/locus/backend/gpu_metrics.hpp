@@ -35,7 +35,10 @@ const char* gpu_api_name(GpuApi a);
  *   submit (Vulkan only).
  * - wait_ns: host time from the submit to the result being ready.
  * - device_ns: device time between a batch's first and last command, by
- *   GPU timestamps (Vulkan, when the queue has them); 0 elsewhere.
+ *   GPU timestamps (Vulkan, when the queue has them); 0 elsewhere. An
+ *   estimate: about 1 batch in 16 is timed and counts 16 times.
+ * - device_samples: the batches timed for device_ns. Few samples mean
+ *   a rough estimate (a short request may sample none of its prefill).
  * - bytes: device memory this process holds, per MemKind.
  */
 struct GpuMetrics {
@@ -44,6 +47,7 @@ struct GpuMetrics {
     std::atomic<std::uint64_t> record_ns{0};
     std::atomic<std::uint64_t> wait_ns{0};
     std::atomic<std::uint64_t> device_ns{0};
+    std::atomic<std::uint64_t> device_samples{0};
     std::atomic<std::int64_t> bytes[static_cast<int>(MemKind::kCount)] = {};
 
     /** Adds `n` (negative to free) to the bytes held for kind k. */

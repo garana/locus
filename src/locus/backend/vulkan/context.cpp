@@ -696,6 +696,25 @@ struct VulkanContext::Impl {
     /** Whether the matmul smaller-tile step-down has been logged. */
     bool matmul_stepdown_logged = false;
     std::chrono::steady_clock::time_point batch_t0;
+    /**
+     * Device time samples about 1 batch in kTimeEvery (every batch
+     * under LOCUS_VK_PROFILE) and scales it: on MoltenVK each timestamp
+     * splits the compute encoder, about 0.5% of a decode token. The
+     * pick is pseudo-random (xorshift32, fixed seed), so a workload
+     * with a fixed batch pattern per token is not always sampled at the
+     * same batch.
+     */
+    static constexpr std::uint32_t kTimeEvery = 16;
+    std::uint32_t sample_rng = 0x9e3779b9u;
+    bool batch_timed = false;  ///< the open batch carries timestamps
+
+    /** @returns true for about 1 call in kTimeEvery. */
+    bool sample_batch() {
+        sample_rng ^= sample_rng << 13;
+        sample_rng ^= sample_rng >> 17;
+        sample_rng ^= sample_rng << 5;
+        return sample_rng % kTimeEvery == 0;
+    }
     /** Dispatches recorded in the open batch (added to the metrics at
      *  end_batch, one atomic add per batch). */
     std::uint64_t batch_dispatches = 0;
@@ -988,8 +1007,9 @@ struct VulkanContext::Impl {
 
         new_dpool();
 
-        // Two timestamps per batch, always (the device time metric);
-        // LOCUS_VK_PROFILE=2 adds one per dispatch.
+        // Two timestamps on a sampled batch (the device time metric;
+        // every batch under LOCUS_VK_PROFILE); LOCUS_VK_PROFILE=2 adds
+        // one per dispatch.
         VkPhysicalDeviceProperties pp;
         vkGetPhysicalDeviceProperties(phys, &pp);
         if (VulkanContext::profiling() ||
@@ -1398,8 +1418,11 @@ void VulkanContext::begin_batch() {
     cbb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(im.batch_cmd, &cbb), "begin cmd");
     im.batch_t0 = std::chrono::steady_clock::now();
-    if (im.qpool != VK_NULL_HANDLE) {
-        im.ts_kernel.clear();
+    im.ts_kernel.clear();
+    im.batch_timed =
+        im.qpool != VK_NULL_HANDLE &&
+        (VulkanContext::profiling() || im.sample_batch());
+    if (im.batch_timed) {
         // Only the per-kernel profile uses more than the two ends.
         vkCmdResetQueryPool(im.batch_cmd, im.qpool, 0,
                             im.per_kernel ? Impl::kMaxTs : 2);
@@ -1472,7 +1495,8 @@ void VulkanContext::dispatch(Kernel k,
     ++im.prof.dispatches;
     ++im.batch_dispatches;
     // Slot 0 is the batch start; keep the last slot for its end.
-    if (im.per_kernel && im.ts_kernel.size() + 2 < Impl::kMaxTs) {
+    if (im.per_kernel && im.batch_timed &&
+        im.ts_kernel.size() + 2 < Impl::kMaxTs) {
         im.ts_kernel.push_back(static_cast<int>(k));
         vkCmdWriteTimestamp(
             im.batch_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -1504,7 +1528,7 @@ void VulkanContext::end_batch() {
     // does not recover or unload cleanly anyway.
     im.batch_is_open = false;
     using clock = std::chrono::steady_clock;
-    const bool prof = im.qpool != VK_NULL_HANDLE;
+    const bool prof = im.batch_timed;
     const auto last_ts =
         static_cast<std::uint32_t>(im.ts_kernel.size() + 1);
     if (prof) {
@@ -1562,9 +1586,14 @@ void VulkanContext::end_batch() {
             const auto to_ms = [&](std::uint64_t a, std::uint64_t b) {
                 return ticks(a, b) / 1e6;
             };
+            // A sampled batch stands for the kTimeEvery it represents.
+            const double scale =
+                VulkanContext::profiling() ? 1.0 : Impl::kTimeEvery;
             gm.device_ns.fetch_add(
-                static_cast<std::uint64_t>(ticks(ts[0], ts[last_ts])),
+                static_cast<std::uint64_t>(ticks(ts[0], ts[last_ts]) *
+                                           scale),
                 std::memory_order_relaxed);
+            gm.device_samples.fetch_add(1, std::memory_order_relaxed);
             im.prof.gpu_ms += to_ms(ts[0], ts[last_ts]);
             for (std::size_t i = 0; i < im.ts_kernel.size(); ++i) {
                 im.prof.kernel_ms[im.ts_kernel[i]] +=

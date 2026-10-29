@@ -322,7 +322,10 @@ class VulkanContext {
     /** @returns Whether import_host can work on this device. */
     bool host_import() const;
 
-    /** @returns Whether batches carry GPU timestamps (device time). */
+    /**
+     * @returns Whether batches can carry GPU timestamps (device time):
+     *     every batch under LOCUS_VK_PROFILE, else about 1 in 16.
+     */
     bool timestamps() const;
 
     void destroy_buffer(Buffer b);
