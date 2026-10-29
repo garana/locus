@@ -5,6 +5,8 @@
 #include <span>
 #include <string>
 
+#include "locus/backend/gpu_metrics.hpp"
+
 namespace locus::backend::vk {
 
 /** Compute kernels compiled into the binary as SPIR-V. */
@@ -291,8 +293,13 @@ class VulkanContext {
         void* impl = nullptr;
     };
 
-    /** @throws std::runtime_error when allocation fails. */
-    Buffer create_buffer(std::size_t bytes);
+    /**
+     * @param bytes Buffer size.
+     * @param kind What it holds, for the memory-by-kind metrics.
+     * @throws std::runtime_error when allocation fails.
+     */
+    Buffer create_buffer(std::size_t bytes,
+                         MemKind kind = MemKind::kScratch);
 
     /**
      * Wraps host memory [ptr, ptr + bytes) as a buffer without copying
@@ -314,6 +321,9 @@ class VulkanContext {
 
     /** @returns Whether import_host can work on this device. */
     bool host_import() const;
+
+    /** @returns Whether batches carry GPU timestamps (device time). */
+    bool timestamps() const;
 
     void destroy_buffer(Buffer b);
     void write_buffer(Buffer b, std::span<const std::byte> data);

@@ -687,6 +687,8 @@ struct VulkanContext::Impl {
     bool per_kernel = false;  // LOCUS_VK_PROFILE=2
     VkQueryPool qpool = VK_NULL_HANDLE;
     double ts_period_ns = 0.0;
+    /** The queue's timestampValidBits (0: no timestamps). */
+    std::uint32_t ts_valid_bits = 0;
 
     /** Device maxComputeSharedMemorySize (bytes), read at init. */
     std::uint32_t max_shared_mem = 0;
@@ -694,6 +696,9 @@ struct VulkanContext::Impl {
     /** Whether the matmul smaller-tile step-down has been logged. */
     bool matmul_stepdown_logged = false;
     std::chrono::steady_clock::time_point batch_t0;
+    /** Dispatches recorded in the open batch (added to the metrics at
+     *  end_batch, one atomic add per batch). */
+    std::uint64_t batch_dispatches = 0;
 
     struct HostBuffer {
         VkBuffer buf = VK_NULL_HANDLE;
@@ -703,6 +708,8 @@ struct VulkanContext::Impl {
         /** Host memory imported in place (import_host): not mapped
          *  through Vulkan, not counted in `allocated`. */
         bool imported = false;
+        /** What it holds, for the memory-by-kind metrics. */
+        MemKind kind = MemKind::kScratch;
         /** Where the data starts in buf: descriptors and copies add
          *  it (an import binds buf below the tensor, at the memory
          *  alignment, and starts here). */
@@ -832,6 +839,7 @@ struct VulkanContext::Impl {
                 if (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
                     phys = d;
                     queue_family = i;
+                    ts_valid_bits = qs[i].timestampValidBits;
                     break;
                 }
             }
@@ -980,9 +988,12 @@ struct VulkanContext::Impl {
 
         new_dpool();
 
-        if (VulkanContext::profiling()) {
-            VkPhysicalDeviceProperties pp;
-            vkGetPhysicalDeviceProperties(phys, &pp);
+        // Two timestamps per batch, always (the device time metric);
+        // LOCUS_VK_PROFILE=2 adds one per dispatch.
+        VkPhysicalDeviceProperties pp;
+        vkGetPhysicalDeviceProperties(phys, &pp);
+        if (VulkanContext::profiling() ||
+            (ts_valid_bits > 0 && pp.limits.timestampPeriod > 0.0f)) {
             ts_period_ns = pp.limits.timestampPeriod;
             VkQueryPoolCreateInfo qpi{};
             qpi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -1092,8 +1103,9 @@ struct VulkanContext::Impl {
         vkDestroyShaderModule(device, sm, nullptr);
     }
 
-    HostBuffer make_buffer(VkDeviceSize size) {
+    HostBuffer make_buffer(VkDeviceSize size, MemKind kind) {
         HostBuffer b;
+        b.kind = kind;
         VkBufferCreateInfo bci{};
         bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bci.size = size;
@@ -1131,6 +1143,8 @@ struct VulkanContext::Impl {
               "allocate memory");
         b.bytes = req.size;
         allocated += req.size;
+        gpu_metrics(GpuApi::kVulkan)
+            .add_bytes(kind, static_cast<std::int64_t>(req.size));
         check(vkBindBufferMemory(device, b.buf, b.mem, 0),
               "bind memory");
         check(vkMapMemory(device, b.mem, 0, size, 0, &b.map),
@@ -1242,11 +1256,18 @@ struct VulkanContext::Impl {
         b.map = const_cast<void*>(ptr);
         b.bytes = end - base;
         b.imported = true;
+        b.kind = MemKind::kMapped;
         b.desc_off = rem;
+        gpu_metrics(GpuApi::kVulkan)
+            .add_bytes(b.kind, static_cast<std::int64_t>(b.bytes));
         return b;
     }
 
     void destroy_buffer(HostBuffer& b) {
+        if (b.mem != VK_NULL_HANDLE) {
+            gpu_metrics(GpuApi::kVulkan)
+                .add_bytes(b.kind, -static_cast<std::int64_t>(b.bytes));
+        }
         if (b.mem != VK_NULL_HANDLE && b.imported) {
             vkFreeMemory(device, b.mem, nullptr);
         } else if (b.mem != VK_NULL_HANDLE) {
@@ -1311,9 +1332,9 @@ VulkanContext::VulkanContext() : impl_(new Impl) { impl_->init(); }
 
 VulkanContext::~VulkanContext() = default;
 
-VulkanContext::Buffer VulkanContext::create_buffer(
-    std::size_t bytes) {
-    auto* hb = new Impl::HostBuffer(impl_->make_buffer(bytes));
+VulkanContext::Buffer VulkanContext::create_buffer(std::size_t bytes,
+                                                   MemKind kind) {
+    auto* hb = new Impl::HostBuffer(impl_->make_buffer(bytes, kind));
     return Buffer{hb};
 }
 
@@ -1328,6 +1349,10 @@ VulkanContext::Buffer VulkanContext::import_host(const void* ptr,
 }
 
 bool VulkanContext::host_import() const { return impl_->has_host_import; }
+
+bool VulkanContext::timestamps() const {
+    return impl_->qpool != VK_NULL_HANDLE;
+}
 
 void VulkanContext::destroy_buffer(Buffer b) {
     auto* hb = static_cast<Impl::HostBuffer*>(b.impl);
@@ -1372,10 +1397,12 @@ void VulkanContext::begin_batch() {
     cbb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cbb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(im.batch_cmd, &cbb), "begin cmd");
+    im.batch_t0 = std::chrono::steady_clock::now();
     if (im.qpool != VK_NULL_HANDLE) {
-        im.batch_t0 = std::chrono::steady_clock::now();
         im.ts_kernel.clear();
-        vkCmdResetQueryPool(im.batch_cmd, im.qpool, 0, Impl::kMaxTs);
+        // Only the per-kernel profile uses more than the two ends.
+        vkCmdResetQueryPool(im.batch_cmd, im.qpool, 0,
+                            im.per_kernel ? Impl::kMaxTs : 2);
         vkCmdWriteTimestamp(im.batch_cmd,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                             im.qpool, 0);
@@ -1443,6 +1470,7 @@ void VulkanContext::dispatch(Kernel k,
                        kd.push_bytes, push.data());
     vkCmdDispatch(im.batch_cmd, groups_x, groups_y, groups_z);
     ++im.prof.dispatches;
+    ++im.batch_dispatches;
     // Slot 0 is the batch start; keep the last slot for its end.
     if (im.per_kernel && im.ts_kernel.size() + 2 < Impl::kMaxTs) {
         im.ts_kernel.push_back(static_cast<int>(k));
@@ -1494,20 +1522,49 @@ void VulkanContext::end_batch() {
           "submit");
     check(vkQueueWaitIdle(im.queue), "wait idle");
     ++im.prof.batches;
+    const clock::time_point t2 = clock::now();
+    GpuMetrics& gm = gpu_metrics(GpuApi::kVulkan);
+    const auto ns = [](clock::duration d) {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(d)
+                .count());
+    };
+    gm.submits.fetch_add(1, std::memory_order_relaxed);
+    gm.dispatches.fetch_add(im.batch_dispatches, std::memory_order_relaxed);
+    gm.record_ns.fetch_add(ns(t1 - im.batch_t0), std::memory_order_relaxed);
+    gm.wait_ns.fetch_add(ns(t2 - t1), std::memory_order_relaxed);
+    im.batch_dispatches = 0;
     if (prof) {
-        const clock::time_point t2 = clock::now();
         using ms = std::chrono::duration<double, std::milli>;
         im.prof.host_ms += ms(t1 - im.batch_t0).count();
         im.prof.wait_ms += ms(t2 - t1).count();
-        std::vector<std::uint64_t> ts(last_ts + 1);
+        // Two slots when not per kernel: avoid the larger read.
+        const std::uint32_t n_ts = last_ts + 1;
+        std::uint64_t ts_small[2];
+        std::vector<std::uint64_t> ts_big;
+        std::uint64_t* ts = ts_small;
+        if (n_ts > 2) {
+            ts_big.resize(n_ts);
+            ts = ts_big.data();
+        }
         if (vkGetQueryPoolResults(
-                im.device, im.qpool, 0, last_ts + 1,
-                ts.size() * sizeof(ts[0]), ts.data(), sizeof(ts[0]),
-                VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-            const auto to_ms = [&](std::uint64_t a, std::uint64_t b) {
-                return static_cast<double>(b - a) * im.ts_period_ns /
-                       1e6;
+                im.device, im.qpool, 0, n_ts, n_ts * sizeof(ts[0]), ts,
+                sizeof(ts[0]), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            // Timestamps wrap at timestampValidBits.
+            const std::uint64_t mask =
+                im.ts_valid_bits >= 64 || im.ts_valid_bits == 0
+                    ? ~std::uint64_t{0}
+                    : (std::uint64_t{1} << im.ts_valid_bits) - 1;
+            const auto ticks = [&](std::uint64_t a, std::uint64_t b) {
+                return static_cast<double>((b - a) & mask) *
+                       im.ts_period_ns;
             };
+            const auto to_ms = [&](std::uint64_t a, std::uint64_t b) {
+                return ticks(a, b) / 1e6;
+            };
+            gm.device_ns.fetch_add(
+                static_cast<std::uint64_t>(ticks(ts[0], ts[last_ts])),
+                std::memory_order_relaxed);
             im.prof.gpu_ms += to_ms(ts[0], ts[last_ts]);
             for (std::size_t i = 0; i < im.ts_kernel.size(); ++i) {
                 im.prof.kernel_ms[im.ts_kernel[i]] +=
@@ -1528,6 +1585,7 @@ void VulkanContext::end_batch() {
 void VulkanContext::abandon_batch() {
     Impl& im = *impl_;
     im.batch_is_open = false;
+    im.batch_dispatches = 0;
     if (im.batch_cmd != VK_NULL_HANDLE) {
         // Never submitted (or its submit failed): free it as is.
         vkFreeCommandBuffers(im.device, im.pool, 1, &im.batch_cmd);
@@ -1676,7 +1734,7 @@ namespace {
 
 }  // namespace
 
-VulkanContext::Buffer VulkanContext::create_buffer(std::size_t) {
+VulkanContext::Buffer VulkanContext::create_buffer(std::size_t, MemKind) {
     no_kernels();
 }
 VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
@@ -1684,6 +1742,7 @@ VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
     no_kernels();
 }
 bool VulkanContext::host_import() const { no_kernels(); }
+bool VulkanContext::timestamps() const { no_kernels(); }
 void VulkanContext::destroy_buffer(Buffer) { no_kernels(); }
 void VulkanContext::write_buffer(Buffer,
                                  std::span<const std::byte>) {

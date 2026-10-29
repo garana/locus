@@ -6,6 +6,7 @@
 // IQ1_S/IQ2_XXS/IQ3_XXS/IQ4_XS families on-device (the pool stores the
 // source quantized bytes); other types delegate to scalar.
 
+#include "locus/backend/gpu_metrics.hpp"
 #include "locus/backend/variants.hpp"
 
 #include <cuda_fp16.h>
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -2272,15 +2274,46 @@ __global__ void matvec_batch_q6_k_kernel(const std::uint8_t* w,
     }
 }
 
+/**
+ * cudaDeviceSynchronize after a launch, charging the wait to the CUDA
+ * metrics (i#285): one submit and the host time until the device is
+ * done. A call may launch more than one kernel, so dispatches stays 0.
+ *
+ * @returns Whether the sync succeeded.
+ */
+bool sync_counted() {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = cuda_ok(cudaDeviceSynchronize());
+    const auto dt = std::chrono::steady_clock::now() - t0;
+    GpuMetrics& gm = gpu_metrics(GpuApi::kCuda);
+    gm.submits.fetch_add(1, std::memory_order_relaxed);
+    gm.wait_ns.fetch_add(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(dt)
+                .count()),
+        std::memory_order_relaxed);
+    return ok;
+}
+
 /** RAII-ish scoped device buffer; frees on scope exit. */
 struct DevBuf {
     void* p = nullptr;
+    std::size_t bytes_ = 0;
     bool alloc(std::size_t bytes) {
-        return cuda_ok(cudaMalloc(&p, bytes));
+        if (!cuda_ok(cudaMalloc(&p, bytes))) {
+            return false;
+        }
+        bytes_ = bytes;
+        gpu_metrics(GpuApi::kCuda)
+            .add_bytes(MemKind::kScratch, static_cast<std::int64_t>(bytes));
+        return true;
     }
     ~DevBuf() {
         if (p != nullptr) {
             cudaFree(p);
+            gpu_metrics(GpuApi::kCuda)
+                .add_bytes(MemKind::kScratch,
+                           -static_cast<std::int64_t>(bytes_));
         }
     }
 };
@@ -2341,8 +2374,11 @@ class ScratchLease {
         if (set_->cap[i] >= bytes) {
             return set_->p[i];
         }
+        GpuMetrics& gm = gpu_metrics(GpuApi::kCuda);
         if (set_->p[i] != nullptr) {
             cudaFree(set_->p[i]);
+            gm.add_bytes(MemKind::kScratch,
+                         -static_cast<std::int64_t>(set_->cap[i]));
             set_->p[i] = nullptr;
             set_->cap[i] = 0;
         }
@@ -2350,6 +2386,7 @@ class ScratchLease {
         if (!cuda_ok(cudaMalloc(&p, bytes))) {
             return nullptr;
         }
+        gm.add_bytes(MemKind::kScratch, static_cast<std::int64_t>(bytes));
         set_->p[i] = p;
         set_->cap[i] = bytes;
         return p;
@@ -2402,6 +2439,7 @@ class WeightPool {
             wait_ready(it->second);
             cudaFree(it->second.dptr);
             used_ -= it->second.bytes;
+            note_used();
             table_.erase(it);
         }
         void* dptr = alloc(bytes);
@@ -2412,6 +2450,7 @@ class WeightPool {
                                 cudaMemcpyHostToDevice))) {
             cudaFree(dptr);
             used_ -= bytes;
+            note_used();
             return nullptr;
         }
         upload_bytes_ += bytes;
@@ -2440,6 +2479,7 @@ class WeightPool {
             wait_ready(it->second);  // recycled address: drop stale
             cudaFree(it->second.dptr);
             used_ -= it->second.bytes;
+            note_used();
             table_.erase(it);
         }
         ensure_stream();
@@ -2469,6 +2509,7 @@ class WeightPool {
                                 cudaMemcpyHostToDevice))) {
             cudaFree(dptr);
             used_ -= bytes;
+            note_used();
             return;
         }
         upload_bytes_ += bytes;
@@ -2498,6 +2539,7 @@ class WeightPool {
         }
         table_.clear();
         used_ = 0;
+        note_used();
         device_ = -1;  // next access re-binds (i#24): a reset may precede
                        // a rebind to a different device; a stale device_
                        // would make bind_check_locked throw spuriously.
@@ -2589,6 +2631,7 @@ class WeightPool {
             }
         }
         used_ += bytes;
+        note_used();
         return p;
     }
 
@@ -2637,9 +2680,18 @@ class WeightPool {
         wait_ready(victim->second);  // don't free mid-copy
         cudaFree(victim->second.dptr);
         used_ -= victim->second.bytes;
+        note_used();
         evictions_++;
         table_.erase(victim);
         return true;
+    }
+
+    /** Mirrors used_ into the weights gauge (the only weight pool). */
+    void note_used() {
+        gpu_metrics(GpuApi::kCuda)
+            .bytes[static_cast<int>(MemKind::kWeights)]
+            .store(static_cast<std::int64_t>(used_),
+                   std::memory_order_relaxed);
     }
 
     std::unordered_map<const void*, Page> table_;
@@ -2673,6 +2725,8 @@ const std::uint64_t* device_iq1s_grid() {
             cudaFree(p);
             return nullptr;
         }
+        gpu_metrics(GpuApi::kCuda)
+            .add_bytes(MemKind::kTable, sizeof(iq1s_grid));
         return static_cast<const std::uint64_t*>(p);
     }();
     return d;
@@ -2690,6 +2744,8 @@ const void* upload_table(const void* host, std::size_t bytes) {
         cudaFree(p);
         return nullptr;
     }
+    gpu_metrics(GpuApi::kCuda)
+        .add_bytes(MemKind::kTable, static_cast<std::int64_t>(bytes));
     return p;
 }
 
@@ -2890,7 +2946,7 @@ bool run_matvec(const Mat& w, std::span<const float> x,
             launch_kernel(kind, dw, t, static_cast<const float*>(dx),
                           static_cast<float*>(dout), w.rows, w.cols);
             ok = cuda_ok(cudaGetLastError()) &&
-                 cuda_ok(cudaDeviceSynchronize()) &&
+                 sync_counted() &&
                  cuda_ok(cudaMemcpy(out.data(), dout, out_bytes,
                                     cudaMemcpyDeviceToHost));
         }
@@ -3039,7 +3095,7 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
                     dwb, dxf, doutf, w.rows, w.cols, n);
             }
             ok = cuda_ok(cudaGetLastError()) &&
-                 cuda_ok(cudaDeviceSynchronize()) &&
+                 sync_counted() &&
                  cuda_ok(cudaMemcpy(out_batch.data(), dout, out_bytes,
                                     cudaMemcpyDeviceToHost));
         }
@@ -3195,7 +3251,7 @@ bool run_matvec_q8k(const Mat& w, std::span<const float> x,
                     break;
             }
             ok = cuda_ok(cudaGetLastError()) &&
-                 cuda_ok(cudaDeviceSynchronize()) &&
+                 sync_counted() &&
                  cuda_ok(cudaMemcpy(out.data(), dout, out_bytes,
                                     cudaMemcpyDeviceToHost));
         }
@@ -3369,7 +3425,7 @@ bool run_conv1d_dev(bool transpose, std::span<const float> in,
             static_cast<float*>(dout.p), in_len, out_ch, out_len, k, stride,
             dilation, pad, icg, ocg);
     }
-    if (!cuda_ok(cudaGetLastError()) || !cuda_ok(cudaDeviceSynchronize())) {
+    if (!cuda_ok(cudaGetLastError()) || !sync_counted()) {
         return false;
     }
     return cuda_ok(cudaMemcpy(out.data(), dout.p, out.size() * sizeof(float),
@@ -3403,7 +3459,7 @@ bool run_snake1d_dev(std::span<float> x, std::uint32_t ch,
     snake1d_kernel<<<blocks, threads>>>(static_cast<float*>(dx.p),
                                         static_cast<const float*>(da.p), ch,
                                         len, eps);
-    if (!cuda_ok(cudaGetLastError()) || !cuda_ok(cudaDeviceSynchronize())) {
+    if (!cuda_ok(cudaGetLastError()) || !sync_counted()) {
         return false;
     }
     return cuda_ok(cudaMemcpy(x.data(), dx.p, x.size() * sizeof(float),
@@ -3517,7 +3573,7 @@ bool run_conv2d_dev(std::span<const float> in, std::uint32_t in_ch,
         static_cast<const float*>(din.p), static_cast<const float*>(dw.p),
         dbias, static_cast<float*>(dout.p), in_h, in_w, out_ch, out_h,
         out_w, kh, kw, stride, pad, icg, ocg);
-    if (!cuda_ok(cudaGetLastError()) || !cuda_ok(cudaDeviceSynchronize())) {
+    if (!cuda_ok(cudaGetLastError()) || !sync_counted()) {
         return false;
     }
     return cuda_ok(cudaMemcpy(out.data(), dout.p, out.size() * sizeof(float),
