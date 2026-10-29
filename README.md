@@ -38,9 +38,11 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   24 kHz WAV or PCM, whole or streamed.
 - **Image output:** `/v1/images/generations` with Janus-Pro-1B and
   the VQ-16 decoder (one 384 x 384 PNG), or with PixArt-alpha 512
-  (T5-XXL encoder, DiT, DPM-Solver++, SD VAE; one 512 x 512 PNG; the
-  linears on a Vulkan GPU with unified memory, whatever backend the
-  language model uses; attention and convolutions on the CPU).
+  (T5-XXL encoder, DiT, DPM-Solver++, SD VAE; one 512 x 512 PNG). On
+  a Vulkan GPU with unified memory, whatever backend the language
+  model uses, the linears, the DiT's attention and the VAE's
+  convolutions run on the GPU; T5's attention stays on the CPU.
+  Request fields: docs/CLIENTS.md.
 - **Image input:** PNG and JPEG in chat requests (OpenAI `image_url`
   data URLs, Anthropic image blocks) with Janus-Pro-1B.
 - **Tools:** `locus-server`; `locus-run` (one prompt); `locus-gguf`
