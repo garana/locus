@@ -10,7 +10,8 @@ namespace locus::model {
 /** The parts of a forward step that StageMetrics times. */
 enum class Stage : std::uint8_t {
     kEmbed,      ///< the token's embedding row (no layer)
-    kNorm,       ///< a layer's attention or FFN norm; the final norm
+    kNorm,       ///< a layer's attention or FFN norm; the final norm of
+                 ///< one-token steps (batch paths count it in kHead)
     kAttention,  ///< q / k / v, the KV write, attention and the output
     kFfn,        ///< the dense gate / up / down feed-forward
     kMoe,        ///< the router and the routed and shared experts

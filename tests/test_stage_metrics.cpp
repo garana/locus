@@ -55,14 +55,18 @@ TEST_CASE("stage lap charges the time between laps", "[metrics]") {
     REQUIRE(m.stage_ns(Stage::kHead) == 0);
 }
 
-// The hardware label: a name on every box the tests run on (macOS's
-// brand string, x86 Linux's model name, an ARM board's device-tree
-// model), with no surrounding spaces.
+// The hardware label: macOS's brand string, x86 Linux's model name, an
+// ARM board's device-tree model or an ARM server's implementer and part,
+// with no surrounding spaces. A host with none of these (a container
+// without /proc/cpuinfo) gets "" and skips.
 TEST_CASE("cpu name is found and trimmed", "[metrics]") {
     const std::string n = locus::sys::cpu_name();
     INFO(n);
-    REQUIRE(!n.empty());
+    if (n.empty()) {
+        SKIP("no CPU name source on this host");
+    }
     REQUIRE(n.front() != ' ');
     REQUIRE(n.back() != ' ');
+    REQUIRE(n.back() != '\r');
     REQUIRE(n.find('\0') == std::string::npos);
 }

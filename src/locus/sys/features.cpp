@@ -49,7 +49,7 @@ namespace {
 /** @returns s without leading and trailing spaces, tabs and NULs. */
 std::string trim(std::string s) {
     const auto keep = [](char c) {
-        return c != ' ' && c != '\t' && c != '\n' && c != '\0';
+        return c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\0';
     };
     std::size_t b = 0, e = s.size();
     while (b < e && !keep(s[b])) ++b;
@@ -71,19 +71,28 @@ std::string cpu_name() {
     return "";
 #else
     std::ifstream cpuinfo("/proc/cpuinfo");
-    std::string line;
+    std::string line, implementer, part;
     while (std::getline(cpuinfo, line)) {
+        const std::size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        const std::string value = trim(line.substr(colon + 1));
         if (line.rfind("model name", 0) == 0) {
-            const std::size_t colon = line.find(':');
-            if (colon != std::string::npos) {
-                return trim(line.substr(colon + 1));
-            }
+            return value;
+        }
+        if (line.rfind("CPU implementer", 0) == 0 && implementer.empty()) {
+            implementer = value;
+        } else if (line.rfind("CPU part", 0) == 0 && part.empty()) {
+            part = value;
         }
     }
     std::ifstream board("/proc/device-tree/model");
     std::string model((std::istreambuf_iterator<char>(board)),
                       std::istreambuf_iterator<char>());
-    return trim(model);
+    model = trim(model);
+    if (model.empty() && !implementer.empty() && !part.empty()) {
+        model = "arm " + implementer + ":" + part;
+    }
+    return model;
 #endif
 }
 
