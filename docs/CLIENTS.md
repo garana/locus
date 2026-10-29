@@ -14,7 +14,7 @@ own docs.
 | POST /v1/embeddings           | OpenAI    | string or array input; CPU and CUDA only    |
 | GET  /v1/models (and /{id})   | OpenAI    | model discovery                             |
 | POST /v1/audio/speech         | OpenAI    | Orpheus-TTS; needs `--audio-decoder`        |
-| POST /v1/images/generations   | OpenAI    | Janus-Pro; needs `--image-decoder`          |
+| POST /v1/images/generations   | OpenAI    | Janus-Pro or PixArt-alpha; see Image output |
 | POST /v1/messages             | Anthropic | Messages API, SSE stream, tools, images     |
 | POST /v1/responses            | OpenAI    | Responses API, stateless, SSE stream, tools |
 | GET  /health                  |           | liveness                                    |
@@ -31,6 +31,36 @@ Images in chat requests (an OpenAI `image_url` part with a base64
 model whose GGUF holds the vision tower. locus never fetches a URL.
 Requests with images do not support streaming, tools or JSON mode
 yet (each is a 400).
+
+### Image output
+
+`/v1/images/generations` returns one PNG as `b64_json`, from either
+model the server loaded:
+
+| Model           | Server flag                    | Image   | Extra fields (defaults)                                                             |
+|-----------------|--------------------------------|---------|-------------------------------------------------------------------------------------|
+| Janus-Pro-1B    | `--image-decoder <vq16.gguf>`  | 384x384 | `cfg` (5), `temperature` (1; 0 = argmax), `seed` (random)                           |
+| PixArt-alpha    | `--image-model <dir>`          | 512x512 | `steps` (20, up to 100), `guidance_scale` (4.5), `seed` (random), `negative_prompt` |
+
+A request whose `model` starts with `pixart` goes to PixArt, and so
+does every request unless both a Janus-Pro model and its
+`--image-decoder` are loaded. The seed used comes back in the
+`X-Image-Seed` response header; send it again to repeat an image (with
+the OpenAI SDK, `client.images.with_raw_response.generate(...)` gives
+the headers). `n` must be 1,
+`size` must be the model's, and `response_format` must be `b64_json`
+(others are a 400). The PixArt directory holds the three GGUFs from
+`scripts/convert-t5-encoder.py`, `convert-pixart.py` and
+`convert-sd-vae.py`. One image runs at a time; a second request while
+one runs gets a 503 with `Retry-After`.
+
+With the OpenAI SDK, pass the extra fields in `extra_body`:
+
+```python
+img = client.images.generate(
+    model="pixart", prompt="a red fox in fresh snow", size="512x512",
+    response_format="b64_json", extra_body={"steps": 20, "seed": 1})
+```
 
 ## Clients
 

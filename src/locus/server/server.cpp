@@ -2270,8 +2270,9 @@ void OpenAiServer::install_routes() {
                 // their mmapped weights cost it nothing), else on the
                 // CPU backend, whatever --backend picked for the LLM.
                 // A discrete GPU would copy 12 GB of weights into the
-                // pool, evicting the LLM's. Attention and convolutions
-                // stay on the CPU.
+                // pool, evicting the LLM's. With these ops the DiT's
+                // attention and the VAE's convolutions run on the GPU
+                // too; T5's attention stays on the CPU.
                 const auto& op = backend::vulkan_imports_host_memory()
                                      ? backend::vulkan_image_ops()
                                      : backend::best_backend().ops;
