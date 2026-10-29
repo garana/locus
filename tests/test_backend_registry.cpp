@@ -673,6 +673,60 @@ TEST_CASE("cuda q8_0 matvec matches scalar across row blocks",
     }
 }
 
+// The IQ4_XS / IQ4_NL kernels run 4 rows (a warp each) per block;
+// IQ4_NL lanes take blocks L, L + 32, ...: cover partial and full row
+// blocks, rows with fewer blocks than lanes, and lanes wrapping.
+TEST_CASE("cuda iq4_xs / iq4_nl matvec matches scalar across row blocks",
+          "[backend]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    using TT = locus::gguf::TensorType;
+    std::mt19937 rng(4545);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.02f);
+    struct C {
+        TT type;
+        std::uint32_t block;  // weights per block
+        std::size_t bytes;    // bytes per block
+        std::uint32_t cols[2];
+    };
+    for (const C& c : {C{TT::kIQ4_XS, 256, 136, {256, 1280}},
+                       C{TT::kIQ4_NL, 32, 18, {64, 1312}}}) {
+        for (std::uint32_t rows : {1u, 5u, 9u, 130u}) {
+            for (std::uint32_t cols : c.cols) {
+                const std::size_t nblk =
+                    static_cast<std::size_t>(rows) * (cols / c.block);
+                std::vector<std::byte> w(nblk * c.bytes);
+                for (auto& by : w) {
+                    by = static_cast<std::byte>(byte_d(rng));
+                }
+                for (std::size_t bl = 0; bl < nblk; ++bl) {
+                    const std::uint16_t d = f32_to_f16(scale_d(rng));
+                    std::memcpy(w.data() + bl * c.bytes, &d, 2);
+                }
+                std::vector<float> x(cols);
+                for (auto& v : x) {
+                    v = dist(rng);
+                }
+                Mat m{c.type, w.data(), rows, cols};
+                std::vector<float> a(rows), b(rows);
+                matvec(m, x, a);
+                cuda_pool_reset();
+                matvec_cuda(m, x, b);
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    INFO("type " << static_cast<int>(c.type) << " rows "
+                                 << rows << " cols " << cols << " row "
+                                 << r);
+                    REQUIRE(b[r] ==
+                            Catch::Approx(a[r]).epsilon(1e-4).margin(1e-3));
+                }
+            }
+        }
+    }
+}
+
 // R16 ggml-parity: the CUDA Q8_K-activation dot must match the scalar
 // matvec_q8k bit-for-bit (same host quant, same accumulation order).
 TEST_CASE("cuda q8k matvec matches scalar q8k (all QK_K types)",
