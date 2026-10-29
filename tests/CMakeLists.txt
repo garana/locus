@@ -76,6 +76,7 @@ add_executable(locus_tests
     test_pixart_vae.cpp
     test_pixart_pipeline.cpp
     test_ltxv_dit.cpp
+    test_ltxv_vae.cpp
     test_model_e2e.cpp
     test_moe.cpp
     test_dsa.cpp

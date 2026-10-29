@@ -134,11 +134,16 @@ void LtxvDit::rope(std::span<const float> coords, std::uint32_t n,
         throw std::invalid_argument("ltxv: rope sizes");
     }
     // torch, float32: theta ** linspace(0, 1, dim // 6), times pi, / 2.
+    // torch's linspace steps from the start for the first half and back
+    // from the end for the rest, so the exponents match it bit for bit.
     constexpr float kPi = 3.14159265358979323846f;
     const std::uint32_t nf = dim / 6, pad = dim % 6;
+    const float step = 1.0f / static_cast<float>(nf - 1);
     std::vector<float> freq(nf);
     for (std::uint32_t k = 0; k < nf; ++k) {
-        const float e = static_cast<float>(k) / static_cast<float>(nf - 1);
+        const float e = k < nf / 2
+                            ? step * static_cast<float>(k)
+                            : 1.0f - step * static_cast<float>(nf - 1 - k);
         freq[k] = std::pow(theta, e) * kPi / 2.0f;
     }
     for (std::uint32_t t = 0; t < n; ++t) {
