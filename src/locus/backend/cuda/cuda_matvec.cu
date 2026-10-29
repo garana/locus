@@ -3804,7 +3804,8 @@ void conv1d_cuda(std::span<const float> in, std::uint32_t in_ch,
     ensure_device();
     if (!run_conv1d_dev(false, in, in_ch, in_len, weight, out_ch, k, bias,
                         stride, dilation, pad, groups, out)) {
-        static Fallback& f = fallback("cuda", "cpu", "conv1d device error");
+        static Fallback& f = fallback(
+            "cuda", "cpu", "conv1d device error or unsupported shape");
         f.add();
         conv1d(in, in_ch, in_len, weight, out_ch, k, bias, stride, dilation,
                pad, groups, out);
@@ -3822,8 +3823,9 @@ void conv1d_transpose_cuda(std::span<const float> in,
     ensure_device();
     if (!run_conv1d_dev(true, in, in_ch, in_len, weight, out_ch, k, bias,
                         stride, dilation, pad, groups, out)) {
-        static Fallback& f =
-            fallback("cuda", "cpu", "conv1d_transpose device error");
+        static Fallback& f = fallback(
+            "cuda", "cpu",
+            "conv1d_transpose device error or unsupported shape");
         f.add();
         conv1d_transpose(in, in_ch, in_len, weight, out_ch, k, bias, stride,
                          dilation, pad, groups, out);
@@ -3835,7 +3837,8 @@ void snake1d_cuda(std::span<float> x, std::uint32_t ch,
                   float eps) {
     ensure_device();
     if (!run_snake1d_dev(x, ch, len, alpha, eps)) {
-        static Fallback& f = fallback("cuda", "cpu", "snake1d device error");
+        static Fallback& f = fallback(
+            "cuda", "cpu", "snake1d device error or unsupported shape");
         f.add();
         snake1d(x, ch, len, alpha, eps);
     }
@@ -3855,7 +3858,8 @@ void conv2d_cuda(std::span<const float> in, std::uint32_t in_ch,
     ensure_device();
     if (!run_conv2d_dev(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias,
                         stride, pad, groups, out)) {
-        static Fallback& f = fallback("cuda", "cpu", "conv2d device error");
+        static Fallback& f = fallback(
+            "cuda", "cpu", "conv2d device error or unsupported shape");
         f.add();
         conv2d(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias, stride,
                pad, groups, out);

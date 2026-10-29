@@ -3,18 +3,19 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <string>
 
 namespace locus::backend {
 
 /**
  * One fallback counter (i#285): how often a faster path handed its work
  * to a slower one, for example a GPU forward to the host's per-op loop.
- * The three names are string literals and live as long as the process.
+ * The registry copies the three names, so any string works.
  */
 struct Fallback {
-    const char* from;    ///< the path that declined ("vulkan", "cuda")
-    const char* to;      ///< where the work went ("cpu", "per_op", ...)
-    const char* reason;  ///< why, in a few words
+    std::string from;    ///< the path that declined ("vulkan", "cuda")
+    std::string to;      ///< where the work went ("cpu", "per_op", ...)
+    std::string reason;  ///< why, in a few words
     std::atomic<std::uint64_t> n{0};
 
     Fallback(const char* f, const char* t, const char* r)
@@ -26,13 +27,15 @@ struct Fallback {
 
 /**
  * Finds or registers the counter for (from, to, reason). The reference
- * stays valid for the process, so a call site keeps it in a static:
+ * stays valid for the process (the registry is never destroyed, so a
+ * thread still running at exit cannot reach freed memory), so a call
+ * site keeps it in a static:
  *
  *     static Fallback& f = fallback("cuda", "cpu", "device error");
  *     f.add();
  *
- * Literals with equal text share one counter. Takes a mutex; the add
- * on the returned counter does not.
+ * Equal text shares one counter. Takes a mutex; the add on the
+ * returned counter does not.
  *
  * @returns The counter.
  */

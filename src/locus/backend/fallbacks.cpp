@@ -1,6 +1,5 @@
 #include "locus/backend/fallbacks.hpp"
 
-#include <cstring>
 #include <deque>
 #include <mutex>
 
@@ -8,15 +7,17 @@ namespace locus::backend {
 
 namespace {
 
+// Both are leaked on purpose: a GPU thread still running during static
+// destruction at exit must not lock or append to destroyed objects.
 std::mutex& registry_mu() {
-    static std::mutex mu;
-    return mu;
+    static auto* mu = new std::mutex;
+    return *mu;
 }
 
 /** A deque: registering never moves the counters already handed out. */
 std::deque<Fallback>& registry() {
-    static std::deque<Fallback> r;
-    return r;
+    static auto* r = new std::deque<Fallback>;
+    return *r;
 }
 
 }  // namespace
@@ -24,8 +25,7 @@ std::deque<Fallback>& registry() {
 Fallback& fallback(const char* from, const char* to, const char* reason) {
     std::lock_guard lk(registry_mu());
     for (Fallback& f : registry()) {
-        if (std::strcmp(f.from, from) == 0 && std::strcmp(f.to, to) == 0 &&
-            std::strcmp(f.reason, reason) == 0) {
+        if (f.from == from && f.to == to && f.reason == reason) {
             return f;
         }
     }

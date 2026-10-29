@@ -1,5 +1,5 @@
 #include <cstddef>
-#include <cstring>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -19,8 +19,7 @@ std::uint64_t count_of(const char* from, const char* to,
                        const char* reason) {
     std::uint64_t n = 0;
     locus::backend::for_each_fallback([&](const Fallback& f) {
-        if (std::strcmp(f.from, from) == 0 && std::strcmp(f.to, to) == 0 &&
-            std::strcmp(f.reason, reason) == 0) {
+        if (f.from == from && f.to == to && f.reason == reason) {
             n = f.n.load();
         }
     });
@@ -40,6 +39,15 @@ TEST_CASE("fallback counters register once and count", "[metrics]") {
     a.add();
     a.add();
     REQUIRE(count_of("test", "cpu", "test reason") == n0 + 2);
+
+    // The registry copies the names: a first registration from a
+    // temporary string stays readable after the string is gone.
+    {
+        std::string tmp = "temporary reason";
+        fallback("test", "cpu", tmp.c_str()).add();
+        tmp.assign(tmp.size(), 'x');
+    }
+    REQUIRE(count_of("test", "cpu", "temporary reason") == 1);
 }
 
 // Q3_K has no Vulkan matvec shader: matvec_vulkan computes it on the
