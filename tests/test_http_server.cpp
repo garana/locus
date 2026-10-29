@@ -829,7 +829,7 @@ TEST_CASE("http server: metrics count each request by route and status",
     ServerConfig cfg;
     cfg.metrics = std::make_shared<locus::http::HttpMetrics>(
         std::vector<std::string>{"/ok", "/stream", "/denied", "/missing",
-                                 "/v/"});
+                                 "/v/", "/bad"});
     const auto m = cfg.metrics;
     Fixture f(
         [](const Request& req, ServerResponse& res, const RequestContext&) {
@@ -848,6 +848,8 @@ TEST_CASE("http server: metrics count each request by route and status",
                 return;
             }
             res.set_content("hello", "text/plain");
+            // The writer owns framing: the server answers a 500 instead.
+            if (req.path == "/bad") res.set_header("Content-Length", "5");
         },
         [](const Request& head, ServerResponse& res, RequestContext&) {
             if (head.path != "/denied") return false;
@@ -864,6 +866,8 @@ TEST_CASE("http server: metrics count each request by route and status",
     one_request(f.port, "GET /v/abc HTTP/1.1\r\nHost: h\r\n\r\n");
     one_request(f.port, "GET /nowhere HTTP/1.1\r\nHost: h\r\n\r\n");
     one_request(f.port, "GET / HTTP/2.0\r\nHost: h\r\n\r\n");  // 505
+    REQUIRE(one_request(f.port, "GET /bad HTTP/1.1\r\nHost: h\r\n\r\n")
+                .find("HTTP/1.1 500") != std::string::npos);
 
     const auto code = [&](std::size_t route, int status) {
         return m->at(route).codes[static_cast<std::size_t>(
@@ -893,5 +897,12 @@ TEST_CASE("http server: metrics count each request by route and status",
     REQUIRE(m->at(den).request_bytes.snapshot().sum == 0.0);
     REQUIRE(m->at(ok).seconds.snapshot().count == 2);
     REQUIRE(m->at(other).seconds.snapshot().count == 2);
+    // What was sent, not what the handler set: a 500 and its text body.
+    const std::size_t bad = m->route("/bad");
+    REQUIRE(code(bad, 500) == 1);
+    REQUIRE(code(bad, 200) == 0);
+    REQUIRE(m->at(bad).response_bytes.snapshot().sum ==
+            static_cast<double>(
+                locus::http::status_reason(500).size() + 1));
     REQUIRE(m->in_flight.load() == 0);
 }

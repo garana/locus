@@ -45,7 +45,9 @@ class HttpMetrics {
      *
      * @param status The status written (a code outside 100..599 counts
      *     in Route::out_of_range).
-     * @param request_bytes The request body size.
+     * @param request_bytes The request body size (for a 408, the body
+     *     bytes counted for the upload-rate check: those read after the
+     *     head, and only with a rate floor set).
      * @param response_bytes The response body bytes written (for a
      *     stream, the payload of every chunk).
      * @param ns Head received to response written.

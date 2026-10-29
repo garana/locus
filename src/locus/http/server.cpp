@@ -738,11 +738,11 @@ void Server::serve_connection(int fd, const std::string& peer_ip,
                         return;
                     }
                     if (reject) {
+                        Sent sent;
                         write_buffered_response(fd, hres, head_req.is_head,
-                                                false);
-                        record(head_req.path, hres.status, 0,
-                               head_req.is_head ? 0 : hres.body.size(),
-                               body_start);
+                                                false, &sent);
+                        record(head_req.path, sent.status, 0,
+                               sent.body_bytes, body_start);
                         return;  // reject on the head: no 100, close (#10/#1)
                     }
                 }
@@ -881,7 +881,8 @@ void Server::serve_connection(int fd, const std::string& peer_ip,
 }
 
 bool Server::write_buffered_response(int fd, const ServerResponse& res,
-                                     bool head_request, bool keep) {
+                                     bool head_request, bool keep,
+                                     Sent* sent) {
     Response r;
     r.status = res.status;
     r.headers = res.headers;
@@ -890,7 +891,13 @@ bool Server::write_buffered_response(int fd, const ServerResponse& res,
     if (!write_response(r, head_request, keep, out, werr)) {
         // A framing/unsafe header from the handler: answer 500 and close.
         write_status_response(fd, head_request, 500, false);
+        if (sent != nullptr) {
+            *sent = {500, status_body_bytes(500, head_request)};
+        }
         return false;
+    }
+    if (sent != nullptr) {
+        *sent = {res.status, head_request ? 0 : res.body.size()};
     }
     return write_all_deadline(fd, out, wake_r_, cfg_.write_deadline_ms,
                               stopping_);
@@ -966,9 +973,9 @@ bool Server::handle_request(int fd, const Request& req,
         return !threw && sink.ok() && keep;
     }
 
-    const bool ok = write_buffered_response(fd, res, req.is_head, keep);
-    record(req.path, res.status, req_bytes,
-           req.is_head ? 0 : res.body.size(), start);
+    Sent sent;
+    const bool ok = write_buffered_response(fd, res, req.is_head, keep, &sent);
+    record(req.path, sent.status, req_bytes, sent.body_bytes, start);
     return ok && keep;
 }
 

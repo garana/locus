@@ -307,10 +307,16 @@ class Server {
                 std::chrono::steady_clock::time_point start);
     /** Serializes a buffered ServerResponse (status + headers + body) and
      * writes it; a HEAD omits the body. On a framing/unsafe header it
-     * sends a 500 and returns false. @returns true iff the write
-     * succeeded. */
+     * sends a 500 and returns false. When `sent` is not null it gets the
+     * status and body size actually sent (the 500's on that path), for
+     * the metrics. @returns true iff the write succeeded. */
+    struct Sent {
+        int status = 0;
+        std::uint64_t body_bytes = 0;
+    };
     bool write_buffered_response(int fd, const ServerResponse& res,
-                                 bool head_request, bool keep);
+                                 bool head_request, bool keep,
+                                 Sent* sent = nullptr);
     /** Writes a minimal status-only response (the reason as a text body).
      * @returns true iff the write succeeded. */
     bool write_status_response(int fd, bool head_request, int status,
