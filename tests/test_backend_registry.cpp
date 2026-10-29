@@ -569,10 +569,11 @@ TEST_CASE("cuda matvec matches scalar", "[backend]") {
     check_matvec_variant_matches_scalar(&matvec_cuda);
 }
 
-// The Q4_K / Q6_K kernels run 4 rows (a warp each) per block: cover
-// one partial block, exact blocks, and a partial last block, with
-// several super-blocks per row.
-TEST_CASE("cuda q4_k / q6_k matvec matches scalar across row blocks",
+// The Q4_K / Q5_K / Q6_K kernels run 4 rows (a warp each) per block:
+// cover one partial block, exact blocks, and a partial last block,
+// with several super-blocks per row.
+TEST_CASE("cuda q4_k / q5_k / q6_k matvec matches scalar across row "
+          "blocks",
           "[backend]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
@@ -588,7 +589,8 @@ TEST_CASE("cuda q4_k / q6_k matvec matches scalar across row blocks",
         std::size_t d_off;
         int dmin_off;
     };
-    for (const Q& q : {Q{TT::kQ4_K, 144, 0, 2}, Q{TT::kQ6_K, 210, 208, -1}}) {
+    for (const Q& q : {Q{TT::kQ4_K, 144, 0, 2}, Q{TT::kQ5_K, 176, 0, 2},
+                       Q{TT::kQ6_K, 210, 208, -1}}) {
         for (std::uint32_t rows : {1u, 127u, 128u, 129u, 300u}) {
             for (std::uint32_t cols : {256u, 1280u}) {
                 const std::size_t nblk =
