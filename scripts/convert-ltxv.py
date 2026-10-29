@@ -69,6 +69,9 @@ def write_dit(path, cfg, sch, steps, tensors):
     t = cfg
     if t.get("positional_embedding_type") != "rope":
         sys.exit("expected rope positions")
+    # The pipeline's coordinates assume no causal first-frame shift.
+    if t.get("causal_temporal_positioning", False):
+        sys.exit("causal_temporal_positioning is not supported")
     if t.get("qk_norm") != "rms_norm" or \
             t.get("standardization_norm") != "rms_norm":
         sys.exit("expected rms_norm q/k and block norms")

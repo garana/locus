@@ -112,9 +112,11 @@ def synth(ltx_src, out):
 
 
 def pipeline_coords(frames, rows, cols, fps=25.0):
-    """@returns [3, n] coordinates as the pipeline makes them: latent
-    (f, h, w) times the VAE scale (8, 32, 32), time shifted for the
-    causal first frame and divided by the frame rate."""
+    """@returns [3, n] test coordinates: latent (f, h, w) times the VAE
+    scale (8, 32, 32), the time shifted as latent_to_pixel_coords does
+    with causal_fix and divided by the frame rate. The 2B checkpoint's
+    pipeline does not shift (it has no causal_temporal_positioning);
+    the DiT takes any coordinates, so the goldens keep these."""
     import torch
     f_i, h_i, w_i = torch.meshgrid(torch.arange(frames),
                                    torch.arange(rows),
