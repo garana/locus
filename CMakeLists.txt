@@ -50,6 +50,7 @@ add_library(locus
     src/locus/image/t5_encoder.cpp
     src/locus/image/ltxv_dit.cpp
     src/locus/image/ltxv_vae.cpp
+    src/locus/image/ltxv_pipeline.cpp
     src/locus/image/janus_chat.cpp
     src/locus/image/png.cpp
     src/locus/image/inflate.cpp
