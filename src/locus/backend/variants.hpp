@@ -111,11 +111,13 @@ struct Ops;
 const Ops& vulkan_image_ops();
 
 /**
- * @returns true when the Vulkan device imports host memory in place
- * (VK_EXT_external_memory_host, unified memory as on Apple): mmapped
- * weights then cost it no device memory. Without it the image models'
- * weights (T5-XXL alone is 9.5 GB) would be copied into the weight
- * pool next to a language model's.
+ * @returns true when the Vulkan device can import host memory in
+ * place (VK_EXT_external_memory_host, unified memory as on Apple):
+ * mmapped F16, F32 and K-quant weights then cost it no device memory.
+ * Q8_0 weights are still copied (repacked for the GPU), so a Q8_0 T5
+ * would take about 5 GB of the pool. Without import the image models'
+ * F16 / F32 weights (T5-XXL alone is 9.5 GB) would be copied into the
+ * weight pool next to a language model's.
  */
 bool vulkan_imports_host_memory();
 
