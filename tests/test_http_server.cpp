@@ -5,10 +5,12 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/http/server.hpp"
@@ -816,4 +818,80 @@ TEST_CASE("http server: a throwing head stage answers 500 and the server "
     REQUIRE(r.find("HTTP/1.1 500") != std::string::npos);
     REQUIRE(one_request(f.port, "GET /ok HTTP/1.1\r\nHost: h\r\n\r\n")
                 .find("GET /ok") != std::string::npos);
+}
+
+// i#285: every answered request is counted by route and status, with
+// its body sizes and time: a buffered response, a stream (payload bytes,
+// no chunk framing), a handler's own error status, a head-stage reject,
+// a prefix route, an unknown path and a parse error (both "other").
+TEST_CASE("http server: metrics count each request by route and status",
+          "[http_server][metrics]") {
+    ServerConfig cfg;
+    cfg.metrics = std::make_shared<locus::http::HttpMetrics>(
+        std::vector<std::string>{"/ok", "/stream", "/denied", "/missing",
+                                 "/v/"});
+    const auto m = cfg.metrics;
+    Fixture f(
+        [](const Request& req, ServerResponse& res, const RequestContext&) {
+            if (req.path == "/stream") {
+                res.set_chunked_content_provider(
+                    "text/event-stream", [](locus::http::Sink& sink) {
+                        sink.write("ab");
+                        sink.write("cde");
+                        sink.done();
+                    });
+                return;
+            }
+            if (req.path == "/missing") {
+                res.status = 404;
+                res.set_content("nf", "text/plain");
+                return;
+            }
+            res.set_content("hello", "text/plain");
+        },
+        [](const Request& head, ServerResponse& res, RequestContext&) {
+            if (head.path != "/denied") return false;
+            res.status = 401;
+            res.set_content("no", "text/plain");
+            return true;
+        },
+        cfg);
+    one_request(f.port, "POST /ok HTTP/1.1\r\nContent-Length: 4\r\n\r\nabcd");
+    one_request(f.port, "GET /ok HTTP/1.1\r\nHost: h\r\n\r\n");
+    one_request(f.port, "GET /stream HTTP/1.1\r\nHost: h\r\n\r\n");
+    one_request(f.port, "GET /missing HTTP/1.1\r\nHost: h\r\n\r\n");
+    one_request(f.port, "GET /denied HTTP/1.1\r\nHost: h\r\n\r\n");
+    one_request(f.port, "GET /v/abc HTTP/1.1\r\nHost: h\r\n\r\n");
+    one_request(f.port, "GET /nowhere HTTP/1.1\r\nHost: h\r\n\r\n");
+    one_request(f.port, "GET / HTTP/2.0\r\nHost: h\r\n\r\n");  // 505
+
+    const auto code = [&](std::size_t route, int status) {
+        return m->at(route).codes[static_cast<std::size_t>(
+                                      status - locus::http::HttpMetrics::
+                                                   kMinCode)]
+            .load();
+    };
+    const std::size_t ok = m->route("/ok"), st = m->route("/stream"),
+                      miss = m->route("/missing"), den = m->route("/denied"),
+                      pre = m->route("/v/abc"), other = m->other();
+    REQUIRE(pre == 4);
+    REQUIRE(m->route("/v/") == other);  // a prefix needs a longer path
+    REQUIRE(code(ok, 200) == 2);
+    REQUIRE(code(st, 200) == 1);
+    REQUIRE(code(miss, 404) == 1);
+    REQUIRE(code(den, 401) == 1);
+    REQUIRE(code(pre, 200) == 1);
+    REQUIRE(code(other, 200) == 1);  // /nowhere: the handler answered
+    REQUIRE(code(other, 505) == 1);  // the parse error
+    const auto ok_req = m->at(ok).request_bytes.snapshot();
+    REQUIRE(ok_req.count == 2);
+    REQUIRE(ok_req.sum == 4.0);
+    REQUIRE(m->at(ok).response_bytes.snapshot().sum == 10.0);  // 2 x hello
+    REQUIRE(m->at(st).response_bytes.snapshot().sum == 5.0);   // ab + cde
+    REQUIRE(m->at(miss).response_bytes.snapshot().sum == 2.0);
+    REQUIRE(m->at(den).response_bytes.snapshot().sum == 2.0);
+    REQUIRE(m->at(den).request_bytes.snapshot().sum == 0.0);
+    REQUIRE(m->at(ok).seconds.snapshot().count == 2);
+    REQUIRE(m->at(other).seconds.snapshot().count == 2);
+    REQUIRE(m->in_flight.load() == 0);
 }

@@ -205,6 +205,8 @@ class OpenAiServer {
     http::Handler route_handler_;    /**< dispatch (built in ctor). */
     http::HeadHandler auth_head_;    /**< auth head stage (built in ctor). */
     std::unique_ptr<http::Server> http_;
+    /** Per-route request metrics (i#285), shared with http_. */
+    std::shared_ptr<http::HttpMetrics> http_metrics_;
     std::uint32_t n_vocab_ = 0;
 
     // Cumulative counters exposed at GET /metrics (Prometheus text).

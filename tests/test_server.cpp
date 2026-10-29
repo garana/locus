@@ -1199,6 +1199,26 @@ TEST_CASE("metrics carry labels and timings in well-formed histograms",
         REQUIRE(metric_value(b, std::string(h) + "_count") == 2);
         REQUIRE(b.find(std::string("\n") + h + "_sum{") != std::string::npos);
     }
+
+    // The HTTP layer's per-route series (i#285): both completions as
+    // 200s with their body sizes, and this /metrics request in flight.
+    const auto series = [&](const std::string& name,
+                            const std::string& extra) {
+        const std::string key = "\n" + name + "{" + labels + "," + extra + "} ";
+        const std::size_t p = b.find(key);
+        INFO(key);
+        REQUIRE(p != std::string::npos);
+        return std::atof(b.c_str() + p + key.size());
+    };
+    const std::string route = "route=\"/v1/completions\"";
+    REQUIRE(series("locus_http_requests_total", route + ",code=\"200\"") == 2);
+    REQUIRE(series("locus_http_request_bytes_count", route) == 2);
+    REQUIRE(series("locus_http_request_bytes_sum", route) > 0);
+    REQUIRE(series("locus_http_response_bytes_sum", route) > 0);
+    REQUIRE(series("locus_http_request_seconds_count", route) == 2);
+    REQUIRE(series("locus_http_request_seconds_count",
+                   "route=\"/v1/embeddings\"") == 0);
+    REQUIRE(metric_value(b, "locus_http_requests_in_flight") == 1);
 }
 
 // Follow-up to i#81 (cancel on disconnect) / i#85 + i#88 (fast-path

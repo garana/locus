@@ -19,7 +19,7 @@ TEST_CASE("histogram buckets are cumulative with le bounds",
     REQUIRE(s.bounds == std::vector<double>{0.001, 0.01, 0.1});
     REQUIRE(s.cumulative == std::vector<std::uint64_t>{2, 3, 3, 4});
     REQUIRE(s.count == 4);
-    REQUIRE(s.sum_seconds == Catch::Approx(2.0065));
+    REQUIRE(s.sum == Catch::Approx(2.0065));
 }
 
 TEST_CASE("histogram rejects too many bounds", "[metrics]") {
@@ -52,4 +52,28 @@ TEST_CASE("metrics text renders labels and histogram series",
             "# HELP i I.\n# TYPE i gauge\n"
             "i{" + lb + ",arch=\"llama\"} 1\n");
     REQUIRE(MetricsText::escape("a\nb") == "a\\nb");
+}
+
+// i#285: one family header, then labelled series after the fixed labels.
+TEST_CASE("metrics text renders labelled families", "[metrics]") {
+    using locus::server::MetricsText;
+    const double bounds[] = {1024};
+    Histogram bytes(bounds, 1.0);  // observations in bytes, rendered as is
+    bytes.observe(100);
+    bytes.observe(5000);
+    MetricsText mt({{"model", "m"}});
+    mt.family("r_total", "R.", "counter");
+    mt.value("r_total", MetricsText::label("route", "/a\"b"),
+             std::uint64_t{2});
+    mt.family("b_bytes", "B.", "histogram");
+    mt.histogram_series("b_bytes", MetricsText::label("route", "/x"),
+                        bytes.snapshot());
+    REQUIRE(mt.text() ==
+            "# HELP r_total R.\n# TYPE r_total counter\n"
+            "r_total{model=\"m\",route=\"/a\\\"b\"} 2\n"
+            "# HELP b_bytes B.\n# TYPE b_bytes histogram\n"
+            "b_bytes_bucket{model=\"m\",route=\"/x\",le=\"1024\"} 1\n"
+            "b_bytes_bucket{model=\"m\",route=\"/x\",le=\"+Inf\"} 2\n"
+            "b_bytes_sum{model=\"m\",route=\"/x\"} 5100\n"
+            "b_bytes_count{model=\"m\",route=\"/x\"} 2\n");
 }

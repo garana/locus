@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "locus/http/http.hpp"
+#include "locus/http/metrics.hpp"
 #include "locus/pipeline/net.hpp"
 
 namespace locus::http {
@@ -217,6 +218,10 @@ struct ServerConfig {
      * one slow client cannot block the acceptor is tracked in i#88. */
     std::function<bool(std::string_view method, std::string_view target)>
         fast_path;
+    /** Per-route request metrics, recorded for every answered request
+     * (handler responses, head-stage rejects, parse and deadline
+     * errors); null records nothing. */
+    std::shared_ptr<HttpMetrics> metrics;
 };
 
 /**
@@ -289,11 +294,17 @@ class Server {
      * worker or acceptor thread (and so the process). */
     void serve_connection_guarded(int fd, const std::string& peer_ip,
                                   bool single_request);
-    /** Runs the handler and writes its response (buffered or streamed).
+    /** Runs the handler and writes its response (buffered or streamed),
+     * then records it in cfg_.metrics (when set) from `start`, the time
+     * the head was complete.
      * @returns true iff the connection may be kept alive for the next
      * request (write succeeded AND `keep`). */
     bool handle_request(int fd, const Request& req, const RequestContext& ctx,
-                        bool keep);
+                        bool keep, std::chrono::steady_clock::time_point start);
+    /** Records one answered request in cfg_.metrics (when set). */
+    void record(std::string_view path, int status, std::uint64_t req_bytes,
+                std::uint64_t resp_bytes,
+                std::chrono::steady_clock::time_point start);
     /** Serializes a buffered ServerResponse (status + headers + body) and
      * writes it; a HEAD omits the body. On a framing/unsafe header it
      * sends a 500 and returns false. @returns true iff the write
