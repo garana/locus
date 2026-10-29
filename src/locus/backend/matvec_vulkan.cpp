@@ -2869,9 +2869,14 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                           std::span<const tok::TokenId> tokens,
                           kv::PagedKvCache& cache,
                           kv::PagedKvCache::Seq& seq,
-                          std::span<float> logits, bool all_logits) {
+                          std::span<float> logits, bool all_logits,
+                          std::span<const float* const> embd) {
     using C = State::Chunk;
     const auto& hp = m.hparams();
+    if (!embd.empty() && embd.size() != tokens.size()) {
+        throw std::invalid_argument(
+            "vulkan_forward_batch: one embedding entry per token");
+    }
     std::lock_guard lk(state_mu());
     State& s = state();
     const auto n = static_cast<std::uint32_t>(tokens.size());
@@ -2954,11 +2959,18 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const auto blogits = s.chunk_buf(C::kCLogits, n_logits);
     s.grow(s.table, s.table_n, cache.total_blocks());
 
-    // CPU side: the chunk's embedding rows and the block table.
+    // CPU side: the chunk's embedding rows (a given input embedding in
+    // place of the token's row, as forward_layers does) and the block
+    // table.
     std::vector<float> x_host(std::size_t{n} * E);
     for (std::uint32_t t = 0; t < n; ++t) {
-        dequant_row(m.embedding(), static_cast<std::uint32_t>(tokens[t]),
-                    {x_host.data() + std::size_t{t} * E, E});
+        float* row = x_host.data() + std::size_t{t} * E;
+        if (!embd.empty() && embd[t] != nullptr) {
+            std::copy(embd[t], embd[t] + E, row);
+        } else {
+            dequant_row(m.embedding(), static_cast<std::uint32_t>(tokens[t]),
+                        {row, E});
+        }
     }
     s.ctx.write_buffer(bx,
                        std::as_bytes(std::span<const float>(x_host)));
