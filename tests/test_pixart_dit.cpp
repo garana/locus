@@ -104,22 +104,32 @@ TEST_CASE("pixart dit matches torch on a synthetic model",
     const std::size_t lat = 4 * 8 * 8, cap = 6 * 32, out = 8 * 8 * 8;
     REQUIRE(in.size() == 2 * (lat + cap));
     REQUIRE(ref.size() == 2 * out);
-    const auto& op = locus::backend::best_backend().ops;
-    for (std::size_t b = 0; b < 2; ++b) {
-        INFO("batch row " << b);
-        const auto mask = j["masks"][b].get<std::vector<int>>();
-        std::uint32_t valid = 0;
-        while (valid < mask.size() && mask[valid] == 1) ++valid;
-        const std::span<const float> x(&in[b * lat], lat);
-        const std::span<const float> y(&in[2 * lat + b * cap], valid * 32);
-        const auto got = dit.forward(x, j["timesteps"][b].get<float>(), y,
-                                     valid, op);
-        REQUIRE(rel_error(got, std::span<const float>(&ref[b * out], out)) <=
-                1e-5);
+    // The CPU backend, and the GPU image ops when a Vulkan device is
+    // usable, so every device runs matvec_batch_vulkan.
+    std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
+        {"cpu", &locus::backend::best_backend().ops}};
+    if (locus::backend::vulkan_backend_usable()) {
+        legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
     }
-    REQUIRE_THROWS_AS(dit.forward(std::span<const float>(in.data(), lat), 1.0f,
-                                  {}, 0, op),
-                      std::invalid_argument);
+    for (const auto& [name, op] : legs) {
+        for (std::size_t b = 0; b < 2; ++b) {
+            INFO(name << " batch row " << b);
+            const auto mask = j["masks"][b].get<std::vector<int>>();
+            std::uint32_t valid = 0;
+            while (valid < mask.size() && mask[valid] == 1) ++valid;
+            const std::span<const float> x(&in[b * lat], lat);
+            const std::span<const float> y(&in[2 * lat + b * cap],
+                                           valid * 32);
+            const auto got = dit.forward(x, j["timesteps"][b].get<float>(),
+                                         y, valid, *op);
+            REQUIRE(rel_error(got, std::span<const float>(&ref[b * out],
+                                                          out)) <= 1e-5);
+        }
+    }
+    REQUIRE_THROWS_AS(
+        dit.forward(std::span<const float>(in.data(), lat), 1.0f, {}, 0,
+                    locus::backend::best_backend().ops),
+        std::invalid_argument);
 }
 
 // PixArt-XL-2-512x512 at step 0 (t = 999) against the diffusers

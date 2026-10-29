@@ -1520,6 +1520,8 @@ const Ops& vulkan_image_ops() {
                          .dequant_row = &dequant_row,
                          .matvec_batch = &matvec_batch_vulkan,
                          .self_parallel = true,
+                         .alloc_kv = nullptr,
+                         .prefetch = nullptr,
                          .mt_safe = false};
     return ops;
 }
