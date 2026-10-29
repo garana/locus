@@ -85,6 +85,8 @@ def write_dit(path, cfg, sch, steps, tensors):
         sys.exit("expected cross_attention_dim == inner dim")
     if sch.get("_class_name") != "RectifiedFlowScheduler":
         sys.exit("expected a RectifiedFlowScheduler")
+    if sch.get("shifting"):
+        sys.exit("timestep shifting is not supported")
     # The keys below that are not in the config: check them against the
     # tensor shapes (torch [out, in]).
     shapes = {name: a.shape for name, a in tensors}

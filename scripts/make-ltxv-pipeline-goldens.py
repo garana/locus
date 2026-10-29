@@ -3,9 +3,11 @@
 
 Runs the reference LTXVideoPipeline (Lightricks/LTX-Video at a pinned
 commit) the way the 0.9.6 distilled config runs it: the base pipeline,
-8 steps from the checkpoint's scheduler, guidance 1, deterministic
-sampling, all in float32 on the CPU. The 0.9.8 2B distilled checkpoint
-(--ckpt) and the T5 from a PixArt diffusers directory (--t5-dir, with
+8 steps from the checkpoint's scheduler, guidance 1, stochastic
+sampling, all in float32 on the CPU; then once more with deterministic
+sampling (the 0.9.8 multi-scale config's choice). The 0.9.8 2B
+distilled checkpoint (--ckpt) and the T5 from a PixArt diffusers
+directory (--t5-dir, with
 text_encoder/ in fp16 and tokenizer/; the same T5-XXL encoder weights
 as PixArt-XL-2-1024-MS) are loaded like inference.py's
 create_ltx_video_pipeline does, without its bf16 casts. The prompt is
@@ -18,10 +20,14 @@ into --out (tests/golden/ltxv):
 - pipeline.json: the prompt, its T5 token ids, sizes, seed, timesteps;
 - pipeline_noise.f32: the start noise as [128, 3, 5, 8] (the
   reference draws it token-major, as [120, 128]);
-- pipeline_latent.f32: the latent after the 8 steps, [128, 3, 5, 8];
+- pipeline_latent.f32: the latent after the 8 stochastic steps,
+  [128, 3, 5, 8];
+- pipeline_step_noise.f32: the noise those 8 steps drew, [8, 128, 3, 5,
+  8] (recorded from torch.randn_like during the run);
+- pipeline_latent_det.f32: the latent after 8 deterministic steps;
 - pipeline_decode_noise.f32: the decode noise, [128, 3, 5, 8];
-- pipeline_frames.u8: frames 0, 8 and 16 of the decoded clip, each
-  160 x 256 x 3 row-major RGB bytes.
+- pipeline_frames.u8: frames 0, 8 and 16 of the decoded stochastic
+  clip, each 160 x 256 x 3 row-major RGB bytes.
 
     python3 -I scripts/make-ltxv-pipeline-goldens.py \\
         --ltx-src LTX-Video --ckpt ltxv-2b-0.9.8-distilled.safetensors \\
@@ -104,29 +110,59 @@ def main():
                          generator=torch.Generator().manual_seed(SEED),
                          device=torch.device("cpu"), dtype=torch.float32)
     noise = rearrange(noise, "b (f h w) c -> b c f h w", f=f, h=h, w=w)
-    with torch.no_grad():
-        latent = pipe(
-            prompt=None, prompt_embeds=embeds, prompt_attention_mask=mask,
-            # encode_prompt always encodes a negative prompt, which needs
-            # T5; at guidance 1 the steps never read it (they take the
-            # positive half), so zeros, as the pipeline itself fills in.
-            negative_prompt=None,
-            negative_prompt_embeds=torch.zeros_like(embeds),
-            negative_prompt_attention_mask=torch.zeros_like(mask),
-            height=HEIGHT, width=WIDTH,
-            num_frames=FRAMES, frame_rate=FPS, num_inference_steps=8,
-            guidance_scale=1, stg_scale=0, rescaling_scale=1,
-            generator=torch.Generator().manual_seed(SEED),
-            output_type="latent", is_video=True,
-            vae_per_channel_normalize=True, enhance_prompt=False,
-            stochastic_sampling=False, decode_timestep=DECODE_T,
-            decode_noise_scale=DECODE_S, mixed_precision=False,
-            offload_to_cpu=False, conditioning_items=None,
-            media_items=None).images
-    if latent.ndim == 3:  # token-major
-        latent = rearrange(latent, "b (f h w) c -> b c f h w",
-                           f=f, h=h, w=w)
-    assert latent.shape == (1, 128, f, h, w), latent.shape
+    tokens_to_cfhw = "b (f h w) c -> b c f h w"
+
+    def run(stochastic):
+        """@returns the latent after the 8 steps and, when stochastic,
+        the 8 step noises the scheduler drew (rf.py's step calls
+        torch.randn_like(sample) on the token-major sample)."""
+        drawn = []
+        orig = torch.randn_like
+
+        def record(x, *args, **kwargs):
+            z = orig(x, *args, **kwargs)
+            drawn.append(z.clone())
+            return z
+
+        torch.manual_seed(SEED + 2)
+        torch.randn_like = record
+        try:
+            with torch.no_grad():
+                out = pipe(
+                    prompt=None, prompt_embeds=embeds,
+                    prompt_attention_mask=mask,
+                    # encode_prompt always encodes a negative prompt,
+                    # which needs T5; at guidance 1 the steps never read
+                    # it (they take the positive half), so zeros, as the
+                    # pipeline itself fills in.
+                    negative_prompt=None,
+                    negative_prompt_embeds=torch.zeros_like(embeds),
+                    negative_prompt_attention_mask=torch.zeros_like(mask),
+                    height=HEIGHT, width=WIDTH, num_frames=FRAMES,
+                    frame_rate=FPS, num_inference_steps=8,
+                    guidance_scale=1, stg_scale=0, rescaling_scale=1,
+                    generator=torch.Generator().manual_seed(SEED),
+                    output_type="latent", is_video=True,
+                    vae_per_channel_normalize=True, enhance_prompt=False,
+                    stochastic_sampling=stochastic,
+                    decode_timestep=DECODE_T, decode_noise_scale=DECODE_S,
+                    mixed_precision=False, offload_to_cpu=False,
+                    conditioning_items=None, media_items=None).images
+        finally:
+            torch.randn_like = orig
+        if out.ndim == 3:  # token-major
+            out = rearrange(out, tokens_to_cfhw, f=f, h=h, w=w)
+        assert out.shape == (1, 128, f, h, w), out.shape
+        if not stochastic:
+            assert not drawn, len(drawn)
+            return out, None
+        assert len(drawn) == 8, len(drawn)
+        steps = torch.cat([rearrange(z, tokens_to_cfhw, f=f, h=h, w=w)
+                           for z in drawn])
+        return out, steps
+
+    latent, step_noise = run(True)  # the 0.9.6 single-pass config
+    latent_det, _ = run(False)
 
     # The decode, as the pipeline's non-latent branch does it.
     dnoise = torch.randn(latent.shape,
@@ -144,6 +180,10 @@ def main():
         os.path.join(a.out, "pipeline_noise.f32"))
     latent[0].numpy().astype("<f4").tofile(
         os.path.join(a.out, "pipeline_latent.f32"))
+    step_noise.numpy().astype("<f4").tofile(
+        os.path.join(a.out, "pipeline_step_noise.f32"))
+    latent_det[0].numpy().astype("<f4").tofile(
+        os.path.join(a.out, "pipeline_latent_det.f32"))
     dnoise[0].numpy().astype("<f4").tofile(
         os.path.join(a.out, "pipeline_decode_noise.f32"))
     with open(os.path.join(a.out, "pipeline_frames.u8"), "wb") as out:

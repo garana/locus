@@ -125,8 +125,9 @@ TEST_CASE("ltxv requests are checked", "[ltxv][image]") {
 // The whole pipeline on the real models against the reference
 // LTXVideoPipeline (scripts/make-ltxv-pipeline-goldens.py): the T5 ids
 // of the prompt, then the 8 steps from the reference's start noise to
-// its latent (the exit check: latent-close parity). With
-// LOCUS_HEAVY_TESTS=1 also the decode, against frames 0, 8 and 16.
+// its latent (the exit check: latent-close parity), stochastic with the
+// reference's step noise and deterministic. With LOCUS_HEAVY_TESTS=1
+// also the decode of the stochastic latent, against frames 0, 8, 16.
 TEST_CASE("ltxv pipeline matches the reference clip",
           "[ltxv][image][e2e]") {
     const fs::path models = kDir + "models";
@@ -157,15 +158,33 @@ TEST_CASE("ltxv pipeline matches the reference clip",
     }
     const auto noise = read_f32(kDir + "golden/ltxv/pipeline_noise.f32");
     const auto ref = read_f32(kDir + "golden/ltxv/pipeline_latent.f32");
+    const auto steps_z =
+        read_f32(kDir + "golden/ltxv/pipeline_step_noise.f32");
+    const auto ref_det =
+        read_f32(kDir + "golden/ltxv/pipeline_latent_det.f32");
+    REQUIRE(steps_z.size() == 8 * noise.size());
     // The server's choice: the GPU when the Vulkan device imports host
     // memory, else the CPU.
     const bool gpu = locus::backend::vulkan_imports_host_memory();
     const auto& op = gpu ? locus::backend::vulkan_image_ops()
                          : locus::backend::best_backend().ops;
-    const auto x = pipe->denoise(noise, req, op, {});
+    // The default (stochastic) steps with the reference's step noise.
+    REQUIRE(req.stochastic);
+    const auto x = pipe->denoise(noise, steps_z, req, op, {});
     const double err = rel_error(x, ref);
     CAPTURE(gpu, err);
     REQUIRE(err <= 1e-2);
+    // The deterministic steps.
+    auto det = req;
+    det.stochastic = false;
+    const auto xd = pipe->denoise(noise, {}, det, op, {});
+    const double err_det = rel_error(xd, ref_det);
+    CAPTURE(err_det);
+    REQUIRE(err_det <= 1e-2);
+    REQUIRE_THROWS_AS(pipe->denoise(noise, std::span<const float>(
+                                               steps_z.data(), noise.size()),
+                                    req, op, {}),
+                      std::invalid_argument);
     fs::remove_all(d);
 
     if (std::getenv("LOCUS_HEAVY_TESTS") == nullptr) return;

@@ -22,7 +22,7 @@ namespace locus::image {
  * rectified-flow loop and the VAE decoder, as the reference
  * LTXVideoPipeline runs the 2B distilled checkpoint in one pass (the
  * 0.9.6 distilled config's form: the base pipeline, 8 steps from the
- * checkpoint's LinearQuadratic schedule, guidance 1, deterministic
+ * checkpoint's LinearQuadratic schedule, guidance 1, stochastic
  * sampling, no upscaler).
  *
  * - The prompt is stripped of ASCII whitespace at both ends (the
@@ -33,12 +33,16 @@ namespace locus::image {
  *   (8, 32, 32), the time divided by the frame rate (no causal
  *   first-frame shift: the 2B checkpoint does not set
  *   causal_temporal_positioning).
- * - Each step: x -= (t - t_next) v, with t_next = 0 after the last.
+ * - Each step (rf.py's step) with t_next = 0 after the last: stochastic
+ *   (the default, as that config sets it), x0 = x - t v, then
+ *   x = (1 - t_next) x0 + t_next z with fresh noise z; or
+ *   deterministic (the 0.9.8 multi-scale config's choice),
+ *   x -= (t - t_next) v.
  * - Before the decode: x = x (1 - 0.025) + noise 0.025, then the
  *   decoder at timestep 0.05 (decode_noise_scale, decode_timestep).
  *
- * Differences from the reference, by design: the start and decode noise
- * come from locus's seeded normal sampler (PixArtPipeline::
+ * Differences from the reference, by design: the start, step and decode
+ * noise come from locus's seeded normal sampler (PixArtPipeline::
  * normal_latent), not torch's, so a seed gives a different (but
  * repeatable) clip.
  */
@@ -52,6 +56,7 @@ class LtxvPipeline {
         std::uint32_t frames = 49;   ///< 8 k + 1
         float frame_rate = 30.0f;
         std::uint64_t seed = 0;
+        bool stochastic = true;  ///< the step kind (see the class doc)
     };
 
     /** Where the time went, in milliseconds (denoise includes T5). */
@@ -104,10 +109,14 @@ class LtxvPipeline {
      *
      * @param noise [128][f][h][w] with f = (frames - 1) / 8 + 1,
      *     h = height / 32, w = width / 32.
+     * @param step_noise For a stochastic request, the 8 steps' noise,
+     *     each shaped like noise (for tests: the reference's); empty
+     *     draws it from req.seed. Ignored for a deterministic request.
      * @returns The latent after the last step, same shape, or empty when
      *     cancelled.
      */
     std::vector<float> denoise(std::span<const float> noise,
+                               std::span<const float> step_noise,
                                const Request& req, const backend::Ops& op,
                                const std::function<bool()>& alive) const;
 

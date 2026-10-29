@@ -190,14 +190,29 @@ std::unique_ptr<LtxvPipeline> LtxvPipeline::load_dir(const std::string& dir) {
 }
 
 std::vector<float> LtxvPipeline::denoise(
-    std::span<const float> noise, const Request& req, const backend::Ops& op,
+    std::span<const float> noise, std::span<const float> step_noise,
+    const Request& req, const backend::Ops& op,
     const std::function<bool()>& alive) const {
     check(req);
     const std::uint32_t f = (req.frames - 1) / 8 + 1, h = req.height / 32,
                         w = req.width / 32;
     const std::uint32_t n = f * h * w;
-    if (noise.size() != std::size_t{dit_->channels()} * n) {
+    const std::size_t size = std::size_t{dit_->channels()} * n;
+    if (noise.size() != size) {
         throw std::invalid_argument("ltxv: noise is not 128 x f x h x w");
+    }
+    std::vector<float> drawn;
+    if (req.stochastic && step_noise.empty()) {
+        drawn.reserve(kSteps * size);
+        for (std::uint32_t i = 0; i < kSteps; ++i) {
+            const auto z =
+                PixArtPipeline::normal_latent(req.seed + 2 + i, size);
+            drawn.insert(drawn.end(), z.begin(), z.end());
+        }
+        step_noise = drawn;
+    }
+    if (req.stochastic && step_noise.size() != kSteps * size) {
+        throw std::invalid_argument("ltxv: step_noise is not 8 x the noise");
     }
     const auto ids = prompt_ids(*tok_, req.prompt);
     const auto text = t5_->encode(ids, op);
@@ -210,8 +225,21 @@ std::vector<float> LtxvPipeline::denoise(
         const auto v = dit_->forward(x, n, pos, t, text,
                                      static_cast<std::uint32_t>(ids.size()),
                                      op);
+        // rf.py's step in float32: dt = t - t_next, then either
+        // x - dt v, or x0 = x - t v and add_noise(x0, z, t - dt).
         const float dt = t - t_next;
-        for (std::size_t j = 0; j < x.size(); ++j) x[j] = x[j] - dt * v[j];
+        if (!req.stochastic) {
+            for (std::size_t j = 0; j < x.size(); ++j) {
+                x[j] = x[j] - dt * v[j];
+            }
+            continue;
+        }
+        const float next = t - dt, keep = 1.0f - next;
+        const float* z = &step_noise[i * size];
+        for (std::size_t j = 0; j < x.size(); ++j) {
+            const float x0 = x[j] - t * v[j];
+            x[j] = keep * x0 + next * z[j];
+        }
     }
     return x;
 }
@@ -243,7 +271,7 @@ std::vector<std::vector<std::uint8_t>> LtxvPipeline::generate(
     const std::size_t n = std::size_t{dit_->channels()} * f * h * w;
     const auto t0 = Clock::now();
     const auto noise = PixArtPipeline::normal_latent(req.seed, n);
-    const auto x = denoise(noise, req, op, alive);
+    const auto x = denoise(noise, {}, req, op, alive);
     if (x.empty()) return {};
     const auto t1 = Clock::now();
     if (alive && !alive()) return {};
