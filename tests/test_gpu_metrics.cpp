@@ -29,8 +29,9 @@ TEST_CASE("gpu metrics names and byte gauges", "[metrics]") {
 }
 
 // A Vulkan buffer counts toward its kind until destroyed, and a batch
-// adds one submit, its kernels, its host times and (with timestamps)
-// device time.
+// adds one submit, its kernels and its host times. Device time comes
+// from about 1 batch in 16 (the pick is seeded, so this is
+// deterministic per context).
 TEST_CASE("vulkan buffers and batches feed the gpu metrics",
           "[metrics][vulkan]") {
     if (!VulkanContext::available()) {
@@ -58,9 +59,19 @@ TEST_CASE("vulkan buffers and batches feed the gpu metrics",
     REQUIRE(gm.submits.load() == submits0 + 1);
     REQUIRE(gm.dispatches.load() >= dispatches0 + 1);
     REQUIRE(gm.wait_ns.load() > wait0);
-    if (ctx.timestamps()) {
-        REQUIRE(gm.device_ns.load() > device0);
-    }
     // matvec_f32's buffers are scratch and freed on return.
     REQUIRE(gm.held(MemKind::kScratch) == scratch0);
+    if (ctx.timestamps()) {
+        int n = 1;
+        while (gm.device_ns.load() == device0 && n < 256) {
+            ctx.matvec_f32(w, rows, cols, x, out);
+            ++n;
+        }
+        INFO(n << " batches");
+        REQUIRE(gm.device_ns.load() > device0);
+        // Sampled, not every batch: under LOCUS_VK_PROFILE every one.
+        if (!VulkanContext::profiling()) {
+            REQUIRE(n > 1);
+        }
+    }
 }
