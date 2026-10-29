@@ -6,6 +6,7 @@
 // IQ1_S/IQ2_XXS/IQ3_XXS/IQ4_XS families on-device (the pool stores the
 // source quantized bytes); other types delegate to scalar.
 
+#include "locus/backend/fallbacks.hpp"
 #include "locus/backend/gpu_metrics.hpp"
 #include "locus/backend/variants.hpp"
 
@@ -3686,7 +3687,20 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
         }
         if (tables_ok) {
             done = run_matvec(w, x, out, bytes, kind_for(w.type), t);
+            if (!done) {
+                static Fallback& f = fallback(
+                    "cuda", "cpu", "device error or out of memory");
+                f.add();
+            }
+        } else {
+            static Fallback& f =
+                fallback("cuda", "cpu", "device table upload failed");
+            f.add();
         }
+    } else {
+        static Fallback& f =
+            fallback("cuda", "cpu", "no matvec kernel for the weight type");
+        f.add();
     }
     if (!done) {
         matvec(w, x, out);  // fallback / other types: scalar
@@ -3708,13 +3722,25 @@ void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
     // types (incl F32/Q8_0) fall back to n matvec_cuda() calls
     // scattered to row-major -- the same-backend fallback rule, so
     // batched stays byte-identical to per-token.
-    if (n <= kMaxBatch && (w.type == gguf::TensorType::kQ4_K ||
-                           w.type == gguf::TensorType::kQ6_K)) {
+    const bool batch_type = w.type == gguf::TensorType::kQ4_K ||
+                            w.type == gguf::TensorType::kQ6_K;
+    if (n <= kMaxBatch && batch_type) {
         const std::size_t bytes = device_weight_bytes(w);
         if (run_batch(w, x_batch, out_batch, bytes, n,
                       w.type == gguf::TensorType::kQ6_K)) {
             return;
         }
+        static Fallback& f = fallback("cuda", "per_token",
+                                      "device error or out of memory");
+        f.add();
+    } else if (!batch_type) {
+        static Fallback& f = fallback("cuda", "per_token",
+                                      "no batch kernel for the weight type");
+        f.add();
+    } else {
+        static Fallback& f =
+            fallback("cuda", "per_token", "batch wider than the kernel");
+        f.add();
     }
     std::vector<float> col(w.rows);
     const std::size_t xc = w.cols;
@@ -3778,6 +3804,9 @@ void conv1d_cuda(std::span<const float> in, std::uint32_t in_ch,
     ensure_device();
     if (!run_conv1d_dev(false, in, in_ch, in_len, weight, out_ch, k, bias,
                         stride, dilation, pad, groups, out)) {
+        static Fallback& f = fallback(
+            "cuda", "cpu", "conv1d device error or unsupported shape");
+        f.add();
         conv1d(in, in_ch, in_len, weight, out_ch, k, bias, stride, dilation,
                pad, groups, out);
     }
@@ -3794,6 +3823,10 @@ void conv1d_transpose_cuda(std::span<const float> in,
     ensure_device();
     if (!run_conv1d_dev(true, in, in_ch, in_len, weight, out_ch, k, bias,
                         stride, dilation, pad, groups, out)) {
+        static Fallback& f = fallback(
+            "cuda", "cpu",
+            "conv1d_transpose device error or unsupported shape");
+        f.add();
         conv1d_transpose(in, in_ch, in_len, weight, out_ch, k, bias, stride,
                          dilation, pad, groups, out);
     }
@@ -3804,6 +3837,9 @@ void snake1d_cuda(std::span<float> x, std::uint32_t ch,
                   float eps) {
     ensure_device();
     if (!run_snake1d_dev(x, ch, len, alpha, eps)) {
+        static Fallback& f = fallback(
+            "cuda", "cpu", "snake1d device error or unsupported shape");
+        f.add();
         snake1d(x, ch, len, alpha, eps);
     }
 }
@@ -3822,6 +3858,9 @@ void conv2d_cuda(std::span<const float> in, std::uint32_t in_ch,
     ensure_device();
     if (!run_conv2d_dev(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias,
                         stride, pad, groups, out)) {
+        static Fallback& f = fallback(
+            "cuda", "cpu", "conv2d device error or unsupported shape");
+        f.add();
         conv2d(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias, stride,
                pad, groups, out);
     }

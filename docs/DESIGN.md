@@ -496,6 +496,14 @@ guarding the default path.
   `mapped` is weights the device reads in place from the file map).
   Sampling matters on MoltenVK, where a timestamp splits the
   compute encoder: on every batch it cost about 0.5% of decode speed.
+  `locus_fallbacks_total{from,to,reason}` counts work a GPU path
+  handed to a slower one: `to="per_op"` (Vulkan's whole-model forward
+  declined, so the host steps each layer), `per_token` (batched
+  prefill declined), `host_route` (MoE router on the host, per MoE
+  layer and token) and `cpu` (a kernel missing, a device error or an
+  unsupported shape). Only fallbacks that happened have a series.
+  The multi-sequence Vulkan decode declining is not counted: its
+  sequences still run on the GPU, one forward each.
 - KV-cache quantization: Q8 or Q4 blocks of 32 (f16 scale) in a
   separate byte pool, for the llama-family attention. Each layer's
   past rows are dequantized into scratch, so the attention math is the

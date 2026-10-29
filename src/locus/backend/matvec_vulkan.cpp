@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "iq_grids.h"
+#include "locus/backend/fallbacks.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
@@ -1491,6 +1492,9 @@ void vulkan_reset_state() {
 void matvec_vulkan(const Mat& w, std::span<const float> x,
                    std::span<float> out) {
     if (matvec_kernel(w) == Kernel::kCount_) {
+        static Fallback& f =
+            fallback("vulkan", "cpu", "no matvec shader for the weight type");
+        f.add();
         matvec(w, x, out);  // no shader for this weight type
         return;
     }
@@ -1704,12 +1708,13 @@ namespace {
  */
 /**
  * Logs, once per reason, that vulkan_forward_batch declined: the
- * caller then prefills one token at a time (i#321). Called under
- * state_mu.
+ * caller then prefills one token at a time (i#321). Each decline also
+ * counts in the fallback metrics. Called under state_mu.
  * @param why A string literal naming the reason.
  * @returns false, for `return batch_declined(...)`.
  */
 bool batch_declined(const char* why) {
+    fallback("vulkan", "per_token", why).add();
     static std::set<const char*> seen;
     if (seen.insert(why).second) {
         std::fprintf(stderr,
@@ -1853,10 +1858,18 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     auto pool_it = s.kv_pools.find(
         quant ? static_cast<const void*>(cache.qpool_data())
               : static_cast<const void*>(cache.pool_data()));
+    // Each decline below hands the token to the host's per-op loop
+    // (forward_layers, one matvec_vulkan per weight).
     if (pool_it == s.kv_pools.end()) {
-        return false;  // cache pool is not GPU-mapped
+        static Fallback& f =
+            fallback("vulkan", "per_op", "KV pool not GPU-mapped");
+        f.add();
+        return false;
     }
     if (!vulkan_forward_supported(m)) {
+        static Fallback& f = fallback(
+            "vulkan", "per_op", "model shape or weight type unsupported");
+        f.add();
         return false;
     }
     const bool mla = hp.arch == model::Arch::kDeepseek2;
@@ -1864,6 +1877,9 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         cache.geometry().kv_type != kv::KvType::kF16) {
         // MLA caches a single latent row (no separate K/V); its Q8/Q4
         // read is a #45 follow-up. Fall back to CPU.
+        static Fallback& f =
+            fallback("vulkan", "per_op", "MLA with a Q8 or Q4 KV cache");
+        f.add();
         return false;
     }
 
@@ -1909,6 +1925,9 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         // The Q8/Q4 KV store path norms and ropes K inside the store:
         // interleaved pairs only, no per-head norm. Those models keep
         // that combination on the CPU.
+        static Fallback& f = fallback(
+            "vulkan", "per_op", "Q8 or Q4 KV cache with neox rope or qk norm");
+        f.add();
         return false;
     }
 
@@ -2600,6 +2619,9 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
         } else {
             // Router runs on the CPU: sync the batch, read the
             // normed activations, gate, then keep recording.
+            static Fallback& f = fallback(
+                "vulkan", "host_route", "MoE experts not GPU-routed");
+            f.add();  // once per MoE layer per token
             s.end_batch();
             s.ctx.read_buffer(
                 s.xb,
