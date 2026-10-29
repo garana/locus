@@ -797,15 +797,18 @@ TEST_CASE("vulkan memory_available drops as buffers are allocated",
         SKIP("no usable Vulkan device / kernels not built");
     }
     VulkanContext ctx;
-    const std::uint64_t before = ctx.memory_available();
-    REQUIRE(before > 0);
+    REQUIRE(ctx.memory_available() > 0);
+    // memory_used, not memory_available: on a UMA device the budget
+    // follows system free memory, so another process freeing memory
+    // between two reads can raise memory_available (i#362).
+    const std::uint64_t before = ctx.memory_used();
     const std::size_t bytes = std::size_t{256} << 20;
     auto b = ctx.create_buffer(bytes);
-    const std::uint64_t during = ctx.memory_available();
+    const std::uint64_t during = ctx.memory_used();
     ctx.destroy_buffer(b);
     // Budget-backed drivers may report usage coarsely; require at
     // least half the allocation to show up.
-    REQUIRE(during + bytes / 2 <= before);
+    REQUIRE(during >= before + bytes / 2);
 }
 
 TEST_CASE("LOCUS_VK_BARRIERS keeps dispatch barriers", "[vulkan]") {

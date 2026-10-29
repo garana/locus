@@ -231,6 +231,17 @@ class VulkanContext {
     std::uint64_t memory_available() const;
 
     /**
+     * Device memory this process holds on that heap: the budget
+     * extension's heapUsage when the device has it, else this
+     * context's allocations. Unlike memory_available(), other
+     * processes do not move it (a UMA budget follows system free
+     * memory).
+     *
+     * @returns Bytes in use.
+     */
+    std::uint64_t memory_used() const;
+
+    /**
      * Whether dispatch() skips the barrier between dispatches
      * because the driver already serializes them (MoltenVK; unless
      * LOCUS_VK_BARRIERS is set).
