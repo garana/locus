@@ -1030,8 +1030,12 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
             "forward_batch: seq capacity not ensured");
     }
     if (backend_->name == "vulkan" && any_embd) {
-        // vulkan_forward_batch takes token ids only (#247), so a chunk
-        // with input embeddings runs one GPU forward per position.
+        // The GPU batch with the embeddings in place of those tokens'
+        // rows (i#257); where it declines, one GPU forward per position.
+        if (vulkan_forward_batch(*this, toks, cache, seq, logits, all_logits,
+                                 embd)) {
+            return;
+        }
         const std::uint32_t V = hp_.n_vocab;
         std::vector<float> scratch(V);
         std::vector<float> normed(hp_.n_embd);

@@ -92,17 +92,22 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
  *     positions must already be ensured on seq.
  * @param logits n_vocab floats for the last token, or n * n_vocab
  *     (one row per token) when all_logits.
+ * @param embd Optional, one entry per token: a non-null entry is that
+ *     position's input embedding (n_embd floats), used in place of the
+ *     token's embedding row (Janus image slots, i#257); empty means
+ *     every position is a token.
  * @returns true when it ran (seq advanced, logits filled); false
  *     when unsupported -- what vulkan_forward rejects, a quantized
  *     KV cache, or MoE experts that cannot route on the GPU -- so
  *     the caller runs the tokens one at a time instead.
- * @throws std::invalid_argument on a wrong logits size or missing
- *     capacity.
+ * @throws std::invalid_argument on a wrong logits size, missing
+ *     capacity, or an embd span of the wrong length.
  */
 bool vulkan_forward_batch(const model::TransformerModel& m,
                           std::span<const tok::TokenId> tokens,
                           kv::PagedKvCache& cache,
                           kv::PagedKvCache::Seq& seq,
-                          std::span<float> logits, bool all_logits);
+                          std::span<float> logits, bool all_logits,
+                          std::span<const float* const> embd = {});
 
 }  // namespace locus::backend

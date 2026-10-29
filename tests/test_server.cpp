@@ -1966,7 +1966,7 @@ TEST_CASE("chat with an image answers like the reference",
 TEST_CASE("chat with an image answers like the reference on vulkan",
           "[server][image][vision][e2e][vulkan]") {
     // The prompt prefills through forward_batch with input embeddings
-    // (i#257), which on vulkan runs each position on the GPU. Before
+    // (i#257), which on vulkan runs each chunk as one GPU batch. Before
     // that, image chat on vulkan answered garbage.
     if (!std::filesystem::exists(janus_path())) {
         SKIP("janus-pro-1b-bf16.gguf absent");
