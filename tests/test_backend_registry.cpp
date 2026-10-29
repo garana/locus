@@ -696,7 +696,10 @@ TEST_CASE("cuda iq matvec matches scalar across row blocks",
     for (const C& c : {C{TT::kIQ4_XS, 256, 136, {256, 1280}},
                        C{TT::kIQ4_NL, 32, 18, {64, 1312}},
                        C{TT::kIQ3_XXS, 256, 98, {256, 1280}},
-                       C{TT::kIQ3_S, 256, 110, {256, 1280}}}) {
+                       C{TT::kIQ3_S, 256, 110, {256, 1280}},
+                       C{TT::kIQ2_XXS, 256, 66, {256, 1280}},
+                       C{TT::kIQ2_XS, 256, 74, {256, 1280}},
+                       C{TT::kIQ2_S, 256, 82, {256, 1280}}}) {
         for (std::uint32_t rows : {1u, 5u, 9u, 130u}) {
             for (std::uint32_t cols : c.cols) {
                 const std::size_t nblk =
