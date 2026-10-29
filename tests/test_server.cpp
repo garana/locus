@@ -1356,6 +1356,7 @@ TEST_CASE("audio speech 503 when no decoder configured",
                            "application/json");
     REQUIRE(res);
     REQUIRE(res->status == 503);
+    REQUIRE(json::parse(res->body)["error"]["type"] == "server_error");
 }
 
 namespace {
@@ -1683,6 +1684,8 @@ TEST_CASE("images 503 unless a decoder and a Janus model are loaded",
                                "application/json");
         REQUIRE(res);
         REQUIRE(res->status == 503);
+        // The server's state, not the client's request: server_error.
+        REQUIRE(json::parse(res->body)["error"]["type"] == "server_error");
     }
     if (!std::filesystem::exists(vq16_path())) {
         SKIP("janus-vq16-decoder.gguf absent");

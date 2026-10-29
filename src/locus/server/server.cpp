@@ -64,6 +64,24 @@ void set_error(http::ServerResponse& res, const std::exception& e) {
 }
 
 /**
+ * Fills res with a 503: the feature is off, or busy. The type is
+ * server_error, so a client that branches on it does not take the
+ * server's state for its own bad request; a busy server also sends
+ * Retry-After (in seconds).
+ */
+void set_unavailable(http::ServerResponse& res, const std::string& message,
+                     int retry_after_s = 0) {
+    res.status = 503;
+    if (retry_after_s > 0) {
+        res.set_header("Retry-After", std::to_string(retry_after_s));
+    }
+    res.set_content(json{{"error", {{"message", message},
+                                    {"type", "server_error"}}}}
+                        .dump(-1, ' ', false, kLossy),
+                    "application/json");
+}
+
+/**
  * The text of an OpenAI message's content: a string, or an array of
  * parts (the multimodal shape, which some clients send for plain text
  * too) whose "text" parts are joined with newlines, as the vision path
@@ -1856,13 +1874,9 @@ void OpenAiServer::install_routes() {
                                const http::RequestContext& ctx) {
             auth_event("create", "audio.speech", ctx.identity);
             if (!snac_ || audio_band_base_ < 0) {
-                res.status = 503;
-                res.set_content(
-                    make_error("audio speech is not configured (needs "
-                               "--audio-decoder and an Orpheus-TTS "
-                               "model)")
-                        .dump(-1, ' ', false, kLossy),
-                    "application/json");
+                set_unavailable(res,
+                                "audio speech is not configured (needs "
+                                "--audio-decoder and an Orpheus-TTS model)");
                 return;
             }
             try {
@@ -2254,13 +2268,10 @@ void OpenAiServer::install_routes() {
                     std::unique_lock<std::mutex> lk(image_mu_,
                                                     std::try_to_lock);
                     if (!lk.owns_lock()) {
-                        res.status = 503;
-                        res.set_header("Retry-After", "60");
-                        res.set_content(
-                            make_error("an image is already being "
-                                       "generated; retry later")
-                                .dump(-1, ' ', false, kLossy),
-                            "application/json");
+                        set_unavailable(res,
+                                        "an image is already being "
+                                        "generated; retry later",
+                                        60);
                         return;
                     }
                     rgb = pixart_->generate(p, op, ctx.client_alive, &took);
@@ -2320,13 +2331,10 @@ void OpenAiServer::install_routes() {
                 }
             }
             if (!vq16_ || !janus_) {
-                res.status = 503;
-                res.set_content(
-                    make_error("image generation is not configured (needs "
-                               "--image-decoder and a Janus-Pro model, or "
-                               "--image-model)")
-                        .dump(-1, ' ', false, kLossy),
-                    "application/json");
+                set_unavailable(res,
+                                "image generation is not configured (needs "
+                                "--image-decoder and a Janus-Pro model, or "
+                                "--image-model)");
                 return;
             }
             try {
@@ -2396,7 +2404,18 @@ void OpenAiServer::install_routes() {
                 std::vector<float> chw;
                 Clock::time_point t0, t1, t2;
                 {
-                    std::lock_guard<std::mutex> lk(image_mu_);
+                    // As the PixArt path: a request that finds an image
+                    // in progress gets a 503, not a wait on a server
+                    // thread.
+                    std::unique_lock<std::mutex> lk(image_mu_,
+                                                    std::try_to_lock);
+                    if (!lk.owns_lock()) {
+                        set_unavailable(res,
+                                        "an image is already being "
+                                        "generated; retry later",
+                                        30);
+                        return;
+                    }
                     t0 = Clock::now();
                     codes = janus_->generate(model_, ids, p,
                                              ctx.client_alive);
