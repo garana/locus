@@ -4,6 +4,7 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "locus/backend/variants.hpp"
 #include "locus/image/dense.hpp"
 
 namespace locus::image {
@@ -148,11 +149,15 @@ std::vector<float> SdVaeDecoder::decode(std::span<const float> latent,
                     std::uint32_t out_ch, std::uint32_t k) {
         Act o{std::vector<float>(std::size_t{out_ch} * in.plane()), out_ch,
               in.h, in.w};
-        backend::conv2d_mt(in.data, in.ch, in.h, in.w,
-                           t(name + ".weight",
-                             std::size_t{out_ch} * in.ch * k * k),
-                           out_ch, k, k, t(name + ".bias", out_ch), 1, k / 2,
-                           1, o.data);
+        const auto wt = t(name + ".weight", std::size_t{out_ch} * in.ch * k * k);
+        const auto bs = t(name + ".bias", out_ch);
+        if (&op == &backend::vulkan_image_ops()) {
+            backend::conv2d_vulkan(in.data, in.ch, in.h, in.w, wt, out_ch, k,
+                                   k, bs, 1, k / 2, 1, o.data);
+        } else {
+            backend::conv2d_mt(in.data, in.ch, in.h, in.w, wt, out_ch, k, k,
+                               bs, 1, k / 2, 1, o.data);
+        }
         return o;
     };
     auto norm = [&](Act& x, const std::string& name) {
