@@ -256,6 +256,10 @@ if(Vulkan_FOUND)
         locus_vk_limit(kAttnPartMax LOCUS_ATTN_PART_MAX)
         locus_vk_limit(kAttnDecodeQMax LOCUS_ATTN_DECODE_Q_MAX)
         locus_vk_limit(kAttnGrpDvMax LOCUS_ATTN_GRP_DV_MAX)
+        locus_vk_limit(kQ4kLanes LOCUS_Q4K_LANES)
+        locus_vk_limit(kQ4kRows LOCUS_Q4K_ROWS)
+        message(STATUS "locus Vulkan kernels: Q4_K matvec "
+                       "${LOCUS_Q4K_LANES} lanes x ${LOCUS_Q4K_ROWS} rows")
         message(STATUS "locus Vulkan kernels: ATTN_PART_MAX "
                        "${LOCUS_ATTN_PART_MAX}, ATTN_DECODE_Q_MAX "
                        "${LOCUS_ATTN_DECODE_Q_MAX}, ATTN_GRP_DV_MAX "
@@ -264,7 +268,9 @@ if(Vulkan_FOUND)
         foreach(entry ${LOCUS_SHADERS})
             set(DEFS -DATTN_PART_MAX=${LOCUS_ATTN_PART_MAX}
                      -DATTN_DECODE_Q_MAX=${LOCUS_ATTN_DECODE_Q_MAX}
-                     -DATTN_GRP_DV_MAX=${LOCUS_ATTN_GRP_DV_MAX})
+                     -DATTN_GRP_DV_MAX=${LOCUS_ATTN_GRP_DV_MAX}
+                     -DQ4K_LANES=${LOCUS_Q4K_LANES}
+                     -DQ4K_ROWS=${LOCUS_Q4K_ROWS})
             if(entry MATCHES "^([a-z0-9_]+)=([a-z0-9_]+):([A-Z0-9_,]+)$")
                 set(shader ${CMAKE_MATCH_1})
                 set(source ${CMAKE_MATCH_2})

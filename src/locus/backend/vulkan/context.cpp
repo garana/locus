@@ -1,5 +1,6 @@
 #include "locus/backend/vulkan/context.hpp"
 
+#include "locus/backend/vulkan/limits.hpp"
 #include "locus/backend/vulkan/mem_fit.hpp"
 
 #include <algorithm>
@@ -50,10 +51,11 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ5_0:
         case Kernel::kMatvecQ5_0B:
             return (rows + 3) / 4;
-        case Kernel::kMatvecQ4_K:  // 8 rows of 16 lanes
+        case Kernel::kMatvecQ4_K:  // kQ4kRows rows of kQ4kLanes lanes
         case Kernel::kMatvecQ4_KB:
         case Kernel::kMatvecQ4_KGluB:
         case Kernel::kMatvecQ4_KSeg:
+            return (rows + kQ4kRows - 1) / kQ4kRows;
         case Kernel::kMatvecQ6_K:
         case Kernel::kMatvecQ6_KB:
             return (rows + 7) / 8;

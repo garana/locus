@@ -16,6 +16,14 @@ namespace locus::backend::vk {
  */
 inline constexpr std::uint32_t kAttnPartMax = 512;
 
+/**
+ * matvec_q4_k workgroup shape (EXPERIMENT, i#173): LANES lanes per row
+ * by ROWS rows. 16 x 8 suits the M4 Max; edit these two to time other
+ * shapes (LANES a power of two, LANES * ROWS <= 1024).
+ */
+inline constexpr std::uint32_t kQ4kLanes = 16;
+inline constexpr std::uint32_t kQ4kRows = 8;
+
 static_assert(kAttnPartMax >= 128,
               "attention kernels need room for their 128-thread "
               "workgroup's slices");

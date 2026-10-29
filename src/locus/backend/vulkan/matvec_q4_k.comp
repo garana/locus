@@ -33,10 +33,11 @@
 // (W2) to O2 at off2. The q, k and v projections in one dispatch,
 // without a concatenated copy of the weights; w_off must be 0.
 
-#define LANES 16u
-#define ROWS 8u
+// Workgroup shape from vk::kQ4kLanes / kQ4kRows (limits.hpp).
+#define LANES uint(Q4K_LANES)
+#define ROWS uint(Q4K_ROWS)
 
-layout(local_size_x = 128) in;
+layout(local_size_x = Q4K_LANES * Q4K_ROWS) in;
 
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 // The same weights as 16-byte quads, read when the slot's byte offset
