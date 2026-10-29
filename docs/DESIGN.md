@@ -489,8 +489,9 @@ guarding the default path.
   `locus_gpu_record_seconds_total` (Vulkan batch begin to submit),
   `locus_gpu_wait_seconds_total` (submit until the device is done),
   `locus_gpu_device_seconds_total` (GPU timestamps on a random 1 in 16
-  Vulkan batches, scaled by 16; every batch under `LOCUS_VK_PROFILE`)
-  and `locus_gpu_memory_bytes{kind}` (weights, mapped, kv, scratch,
+  Vulkan batches, scaled by 16; every batch under `LOCUS_VK_PROFILE`;
+  an estimate that needs many batches, so a short request may miss its
+  prefill), `locus_gpu_device_samples_total` (the batches timed) and `locus_gpu_memory_bytes{kind}` (weights, mapped, kv, scratch,
   table; `mapped` is weights the device reads in place from the file
   map). Sampling matters on MoltenVK, where a timestamp splits the
   compute encoder: on every batch it cost about 0.5% of decode speed.

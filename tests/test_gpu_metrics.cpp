@@ -50,6 +50,7 @@ TEST_CASE("vulkan buffers and batches feed the gpu metrics",
     const std::uint64_t dispatches0 = gm.dispatches.load();
     const std::uint64_t wait0 = gm.wait_ns.load();
     const std::uint64_t device0 = gm.device_ns.load();
+    const std::uint64_t samples0 = gm.device_samples.load();
     const std::int64_t scratch0 = gm.held(MemKind::kScratch);
     const std::uint32_t rows = 256, cols = 1024;
     std::vector<float> w(static_cast<std::size_t>(rows) * cols, 0.5f);
@@ -69,6 +70,7 @@ TEST_CASE("vulkan buffers and batches feed the gpu metrics",
         }
         INFO(n << " batches");
         REQUIRE(gm.device_ns.load() > device0);
+        REQUIRE(gm.device_samples.load() == samples0 + 1);
         // Sampled, not every batch: under LOCUS_VK_PROFILE every one.
         if (!VulkanContext::profiling()) {
             REQUIRE(n > 1);

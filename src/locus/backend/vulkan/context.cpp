@@ -1007,8 +1007,9 @@ struct VulkanContext::Impl {
 
         new_dpool();
 
-        // Two timestamps per batch, always (the device time metric);
-        // LOCUS_VK_PROFILE=2 adds one per dispatch.
+        // Two timestamps on a sampled batch (the device time metric;
+        // every batch under LOCUS_VK_PROFILE); LOCUS_VK_PROFILE=2 adds
+        // one per dispatch.
         VkPhysicalDeviceProperties pp;
         vkGetPhysicalDeviceProperties(phys, &pp);
         if (VulkanContext::profiling() ||
@@ -1494,7 +1495,8 @@ void VulkanContext::dispatch(Kernel k,
     ++im.prof.dispatches;
     ++im.batch_dispatches;
     // Slot 0 is the batch start; keep the last slot for its end.
-    if (im.per_kernel && im.ts_kernel.size() + 2 < Impl::kMaxTs) {
+    if (im.per_kernel && im.batch_timed &&
+        im.ts_kernel.size() + 2 < Impl::kMaxTs) {
         im.ts_kernel.push_back(static_cast<int>(k));
         vkCmdWriteTimestamp(
             im.batch_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -1591,6 +1593,7 @@ void VulkanContext::end_batch() {
                 static_cast<std::uint64_t>(ticks(ts[0], ts[last_ts]) *
                                            scale),
                 std::memory_order_relaxed);
+            gm.device_samples.fetch_add(1, std::memory_order_relaxed);
             im.prof.gpu_ms += to_ms(ts[0], ts[last_ts]);
             for (std::size_t i = 0; i < im.ts_kernel.size(); ++i) {
                 im.prof.kernel_ms[im.ts_kernel[i]] +=
