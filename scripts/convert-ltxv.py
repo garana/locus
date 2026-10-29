@@ -140,6 +140,9 @@ def write_vae(path, cfg, tensors):
         sys.exit("expected a 3D, non-causal decoder")
     if v.get("norm_layer") != "pixel_norm":
         sys.exit("expected pixel_norm")
+    # The reference's default; the C++ conv3d pads space with zeros only.
+    if v.get("spatial_padding_mode", "zeros") != "zeros":
+        sys.exit("expected spatial_padding_mode zeros")
     if not v.get("timestep_conditioning"):
         sys.exit("expected a timestep-conditioned decoder")
     kinds, params = [], []
