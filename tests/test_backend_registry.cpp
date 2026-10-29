@@ -699,7 +699,9 @@ TEST_CASE("cuda iq matvec matches scalar across row blocks",
                        C{TT::kIQ3_S, 256, 110, {256, 1280}},
                        C{TT::kIQ2_XXS, 256, 66, {256, 1280}},
                        C{TT::kIQ2_XS, 256, 74, {256, 1280}},
-                       C{TT::kIQ2_S, 256, 82, {256, 1280}}}) {
+                       C{TT::kIQ2_S, 256, 82, {256, 1280}},
+                       C{TT::kIQ1_S, 256, 50, {256, 1280}},
+                       C{TT::kIQ1_M, 256, 56, {256, 1280}}}) {
         for (std::uint32_t rows : {1u, 5u, 9u, 130u}) {
             for (std::uint32_t cols : c.cols) {
                 const std::size_t nblk =
@@ -710,7 +712,20 @@ TEST_CASE("cuda iq matvec matches scalar across row blocks",
                 }
                 for (std::size_t bl = 0; bl < nblk; ++bl) {
                     const std::uint16_t d = f32_to_f16(scale_d(rng));
-                    std::memcpy(w.data() + bl * c.bytes, &d, 2);
+                    std::byte* blk = w.data() + bl * c.bytes;
+                    if (c.type != TT::kIQ1_M) {
+                        std::memcpy(blk, &d, 2);
+                        continue;
+                    }
+                    // IQ1_M has no d field: its f16 scale is the top
+                    // nibbles of the four scale words at byte 48.
+                    for (int k = 0; k < 4; ++k) {
+                        std::uint16_t s;
+                        std::memcpy(&s, blk + 48 + 2 * k, 2);
+                        s = static_cast<std::uint16_t>(
+                            (s & 0x0fff) | (((d >> (4 * k)) & 0xf) << 12));
+                        std::memcpy(blk + 48 + 2 * k, &s, 2);
+                    }
                 }
                 std::vector<float> x(cols);
                 for (auto& v : x) {
