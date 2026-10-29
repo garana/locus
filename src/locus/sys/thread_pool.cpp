@@ -38,7 +38,8 @@ ThreadPool& ThreadPool::instance() {
 
 ThreadPool::ThreadPool(std::size_t n_workers)
     : n_workers_(n_workers) {
-    // One spinner per performance core besides the caller's; every
+    // Up to one spinner per performance core besides the caller
+    // (a count, not a placement: the OS places the threads); every
     // worker where the platform reports no tiers.
     const unsigned pcores = performance_cores();
     spin_workers_ =
@@ -151,7 +152,8 @@ void ThreadPool::parallel_for(
     if (n == 0) {
         return;
     }
-    if (n == 1 || n_workers_ == 0) {
+    // The claim word holds a 32-bit index, kLocked reserved.
+    if (n == 1 || n_workers_ == 0 || n >= kLocked) {
         for (std::size_t i = 0; i < n; ++i) {
             fn(i);
         }
@@ -170,7 +172,7 @@ void ThreadPool::parallel_for(
     word_.store(gen << 32);  // publish
     // Spinning workers pick it up on their own. Wake sleepers only for
     // the items beyond them (the caller drains one share itself), so a
-    // 10-slice matvec stays on the performance cores' spinners.
+    // 10-slice matvec runs on the spinners, not on extra threads.
     const std::size_t want = std::min(n - 1, n_workers_);
     const std::size_t spin = spinning_.load();
     if (want > spin) {

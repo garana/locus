@@ -21,10 +21,10 @@ namespace locus::sys {
  * (#206). After a loop, up to one worker per performance core spins
  * for the next one for a short budget before sleeping on a condition
  * variable, and indices are claimed with one atomic, so a loop starts
- * in well under a microsecond instead of the ~18 us of a condition-
- * variable wake. Only performance-core workers spin: a 10-slice
- * matvec then runs on the 10 performance cores, not on an efficiency
- * core that would finish last.
+ * in a few microseconds instead of the ~18 us of a condition-variable
+ * wake. The spinner count matches the performance cores so a 10-slice
+ * matvec has 10 runnable threads; nothing pins them, the OS places
+ * them (and keeps busy threads on the performance cores).
  */
 class ThreadPool {
   public:
@@ -40,7 +40,9 @@ class ThreadPool {
     /**
      * Invokes fn(i) for every i in [0, n) across the workers and
      * the calling thread; returns when all calls completed. The
-     * first exception thrown by fn is rethrown on the caller.
+     * first exception thrown by fn is rethrown on the caller. Jobs
+     * of 2^32 - 1 items or more (past the claim word's index field)
+     * run on the caller alone.
      */
     void parallel_for(std::size_t n,
                       const std::function<void(std::size_t)>& fn);
