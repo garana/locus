@@ -103,39 +103,6 @@ __global__ void matvec_f32_kernel(const float* w, const float* x,
     out[r] = acc;
 }
 
-/** IQ4_NL: 18-byte / 32-element block (d f16 + qs[16]). Low nibble ->
- *  first 16 lanes, high nibble -> next 16, mapped through the
- *  kvalues_iq4nl codebook. Same per-block accumulation as dot_iq4_nl. */
-__global__ void matvec_iq4_nl_kernel(const std::uint8_t* w,
-                                     const std::int8_t* kvalues,
-                                     const float* x, float* out,
-                                     std::uint32_t rows,
-                                     std::uint32_t cols) {
-    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) {
-        return;
-    }
-    const std::uint32_t nblk = cols / 32;
-    const std::size_t row_bytes =
-        static_cast<std::size_t>(nblk) * 18;
-    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
-                                      row_bytes;
-    float acc = 0.0f;
-    for (std::uint32_t b = 0; b < nblk; ++b) {
-        const std::uint8_t* blk = row + b * 18;
-        const float d = ld_f16(blk);
-        const std::uint8_t* q = blk + 2;
-        const float* xb = x + static_cast<std::size_t>(b) * 32;
-        float s = 0.0f;
-        for (int i = 0; i < 16; ++i) {
-            s += static_cast<float>(kvalues[q[i] & 0x0f]) * xb[i] +
-                 static_cast<float>(kvalues[q[i] >> 4]) * xb[i + 16];
-        }
-        acc += d * s;
-    }
-    out[r] = acc;
-}
-
 /** Unpacks the 6-bit scale/min of K-quant sub-block j from the
  *  packed 12-byte scales array (ggml get_scale_min_k4). */
 __device__ void scale_min_k4(int j, const std::uint8_t* q,
@@ -1437,6 +1404,136 @@ __global__ void matvec_q8_0_warp_kernel(const std::uint8_t* w,
     }
 }
 
+/** Copies the 16-entry IQ4 codebook (device `kvalues`) into shared
+ *  memory for the block and syncs; every thread must call it. */
+__device__ void load_iq4_codebook(const std::int8_t* kvalues,
+                                  std::int8_t* skv) {
+    if (threadIdx.x < 16) {
+        skv[threadIdx.x] = kvalues[threadIdx.x];
+    }
+    __syncthreads();
+}
+
+/**
+ * One IQ4_NL block is 18 bytes (d f16 + qs[16]), 32 weights: element i
+ * is the low nibble of qs[i] and element 16 + i the high nibble, each
+ * through the kvalues codebook. One warp per row, laid out as
+ * matvec_q8_0_warp_kernel: lane L takes blocks L, L + 32, ...; each
+ * pass the warp copies its 32 consecutive blocks (576 bytes, as 16-bit
+ * words: blocks are only 2-byte aligned) into shared memory with
+ * coalesced reads. Each lane sums its block as the scalar does
+ * (d times the sum over i of kv[lo] * x[i] + kv[hi] * x[i + 16]), and
+ * the warp sums the lanes, so the result matches the CPU only to
+ * rounding. Launch with 32 * kWarpRows threads per block.
+ */
+__global__ void matvec_iq4_nl_warp_kernel(const std::uint8_t* w,
+                                          const std::int8_t* kvalues,
+                                          const float* x, float* out,
+                                          std::uint32_t rows,
+                                          std::uint32_t cols) {
+    __shared__ std::int8_t skv[16];
+    __shared__ std::uint16_t sw[kWarpRows][32 * 9];
+    load_iq4_codebook(kvalues, skv);  // before any warp returns
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t r = blockIdx.x * kWarpRows + threadIdx.x / 32;
+    if (r >= rows) {
+        return;  // a whole warp leaves together: no partial shuffles
+    }
+    std::uint16_t* mine = sw[threadIdx.x / 32];
+    const std::uint32_t nblk = cols / 32;
+    const auto* row16 = reinterpret_cast<const std::uint16_t*>(
+        w + static_cast<std::size_t>(r) * nblk * 18);
+    float acc = 0.0f;
+    for (std::uint32_t b0 = 0; b0 < nblk; b0 += 32) {
+        const std::uint32_t nb = min(32u, nblk - b0);
+        for (std::uint32_t i = lane; i < nb * 9; i += 32) {
+            mine[i] = __ldg(row16 + static_cast<std::size_t>(b0) * 9 + i);
+        }
+        __syncwarp();
+        if (lane < nb) {
+            const std::uint32_t b = b0 + lane;
+            const std::uint16_t* blk16 = mine + lane * 9;
+            const float d = __half2float(__ushort_as_half(blk16[0]));
+            const float* xb = x + static_cast<std::size_t>(b) * 32;
+            float s = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                const std::uint32_t q =
+                    (blk16[1 + i / 2] >> (8 * (i % 2))) & 0xff;
+                s += static_cast<float>(skv[q & 0x0f]) * __ldg(xb + i) +
+                     static_cast<float>(skv[q >> 4]) * __ldg(xb + i + 16);
+            }
+            acc += d * s;
+        }
+        __syncwarp();  // the next pass overwrites this warp's slice
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        out[r] = acc;
+    }
+}
+
+/**
+ * One IQ4_XS super-block is 136 bytes: d (f16) + scales_h (u16) +
+ * scales_l[4] + qs[128], 256 weights in 8 sub-blocks of 32. In
+ * sub-block ib, element j is the low nibble of qs[16 ib + j] and
+ * element 16 + j the high nibble, each through the kvalues codebook,
+ * times dl = d * (ls - 32) with ls the sub-block's 6-bit scale. One
+ * warp per row: lane L reads the 4 qs bytes at 4L (one coalesced
+ * 128-byte read per warp; 136-byte blocks keep 8-byte alignment), so
+ * ib = L / 4 and j = 4 (L % 4) .. +3. Each lane accumulates its 8
+ * products over the row, then the warp sums the lanes, so the result
+ * matches the CPU only to rounding. Launch with 32 * kWarpRows threads
+ * per block.
+ */
+__global__ void matvec_iq4_xs_warp_kernel(const std::uint8_t* w,
+                                          const std::int8_t* kvalues,
+                                          const float* x, float* out,
+                                          std::uint32_t rows,
+                                          std::uint32_t cols) {
+    __shared__ std::int8_t skv[16];
+    load_iq4_codebook(kvalues, skv);  // before any warp returns
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t r = blockIdx.x * kWarpRows + threadIdx.x / 32;
+    if (r >= rows) {
+        return;  // a whole warp leaves together: no partial shuffles
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * nsb * 136;
+    const std::uint32_t ib = lane / 4;
+    const std::uint32_t c = 4 * (lane % 4);
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 136;
+        const float d = ld_f16(blk);
+        const std::uint32_t scales_h =
+            static_cast<std::uint32_t>(blk[2]) |
+            (static_cast<std::uint32_t>(blk[3]) << 8);
+        const int ls =
+            static_cast<int>(((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0x0f) |
+                             (((scales_h >> (2 * ib)) & 3) << 4));
+        const float dl = d * (ls - 32);
+        const std::uint32_t q4 =
+            __ldg(reinterpret_cast<const std::uint32_t*>(blk + 8) + lane);
+        const float* xb =
+            x + static_cast<std::size_t>(b) * 256 + 32 * ib + c;
+        const float4 xlo = __ldg(reinterpret_cast<const float4*>(xb));
+        const float4 xhi =
+            __ldg(reinterpret_cast<const float4*>(xb + 16));
+        const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
+        const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
+        for (int k = 0; k < 4; ++k) {
+            const std::uint32_t q = (q4 >> (8 * k)) & 0xff;
+            acc += dl * skv[q & 0x0f] * xl[k];
+            acc += dl * skv[q >> 4] * xh[k];
+        }
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        out[r] = acc;
+    }
+}
+
 /** One IQ1_S super-block is 50 bytes: d (f16) + qs[32] + qh[8]u16,
  *  256 weights. Each of 8 sub-blocks picks 4 grid entries (8 int8
  *  each) scaled by dl with a +/-0.125 delta. Dequant + accumulate in
@@ -1920,55 +2017,6 @@ __global__ void matvec_iq3_xxs_kernel(const std::uint8_t* w,
                 y += 8;
             }
             qs += 8;
-        }
-        for (int i = 0; i < 256; ++i) {
-            acc += tmp[i] * xb[i];
-        }
-    }
-    out[r] = acc;
-}
-
-/** One IQ4_XS super-block is 136 bytes: d (f16) + scales_h (u16) +
- *  scales_l[4] + qs[128], 256 weights. Grid-free: each nibble indexes
- *  the 16-entry kvalues_iq4nl codebook (device `kvalues`). Scalar fill
- *  interleaves y[j]/y[j+16], so materialize then dot i=0..255. */
-__global__ void matvec_iq4_xs_kernel(const std::uint8_t* w,
-                                     const std::int8_t* kvalues,
-                                     const float* x, float* out,
-                                     std::uint32_t rows,
-                                     std::uint32_t cols) {
-    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) {
-        return;
-    }
-    const std::uint32_t nsb = cols / 256;
-    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 136;
-    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
-                                      row_bytes;
-    float acc = 0.0f;
-    for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
-                                            136;
-        const float d = ld_f16(blk);
-        const std::uint16_t scales_h =
-            static_cast<std::uint16_t>(blk[2]) |
-            (static_cast<std::uint16_t>(blk[3]) << 8);
-        const std::uint8_t* scales_l = blk + 4;
-        const std::uint8_t* qs = blk + 8;
-        const float* xb = x + static_cast<std::size_t>(b) * 256;
-        float tmp[256];
-        float* y = tmp;
-        for (int ib = 0; ib < 8; ++ib) {
-            const int ls =
-                ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0f) |
-                (((scales_h >> (2 * ib)) & 3) << 4);
-            const float dl = d * (ls - 32);
-            for (int j = 0; j < 16; ++j) {
-                y[j] = dl * kvalues[qs[j] & 0x0f];
-                y[j + 16] = dl * kvalues[qs[j] >> 4];
-            }
-            y += 32;
-            qs += 16;
         }
         for (int i = 0; i < 256; ++i) {
             acc += tmp[i] * xb[i];
@@ -2763,11 +2811,13 @@ void launch_kernel(Kind kind, const void* dw,
                 dwb, t.g32, t.ksigns, dxf, doutf, rows, cols);
             break;
         case Kind::kIQ4_XS:
-            matvec_iq4_xs_kernel<<<blocks, threads>>>(
+            matvec_iq4_xs_warp_kernel<<<
+                (rows + kWarpRows - 1) / kWarpRows, 32 * kWarpRows>>>(
                 dwb, t.kvalues, dxf, doutf, rows, cols);
             break;
         case Kind::kIQ4_NL:
-            matvec_iq4_nl_kernel<<<blocks, threads>>>(
+            matvec_iq4_nl_warp_kernel<<<
+                (rows + kWarpRows - 1) / kWarpRows, 32 * kWarpRows>>>(
                 dwb, t.kvalues, dxf, doutf, rows, cols);
             break;
         case Kind::kTQ1_0:
