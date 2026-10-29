@@ -1581,43 +1581,57 @@ void vulkan_attention(std::span<const float> q, std::uint32_t nq,
                       std::uint32_t nk, std::uint32_t heads, std::uint32_t hd,
                       std::span<float> out) {
     const std::uint32_t w = heads * hd;
-    const std::size_t qn = std::size_t{nq} * w, kn = std::size_t{heads} * nk * hd,
-                      sn = std::size_t{heads} * nq * nk;
+    const std::size_t qn = std::size_t{nq} * w,
+                      kn = std::size_t{heads} * nk * hd,
+                      row = std::size_t{heads} * nk;
+    // Every buffer must fit one storage binding (maxStorageBufferRange
+    // is about 4 GB): at most 2^30 floats each. The scores run in query
+    // sub-blocks within the attention scratch cap (1 GiB unless a test
+    // lowers it), as attn_block does for the language models.
+    constexpr std::size_t kMaxFloats = std::size_t{1} << 30;
     if (nq == 0 || nk == 0 || q.size() < qn || kh.size() < kn ||
-        vt.size() < kn || out.size() < qn || sn > 0xffffffffu) {
+        vt.size() < kn || out.size() < qn || qn > kMaxFloats ||
+        kn > kMaxFloats || row > kMaxFloats) {
         throw std::invalid_argument("vulkan_attention: bad sizes");
     }
+    const std::uint32_t mb = static_cast<std::uint32_t>(std::clamp<std::size_t>(
+        attn_scratch_floats.load() / row, 1, nq));
     std::lock_guard lk(state_mu());
     State& s = state();
     s.grow(s.img_q, s.img_q_n, qn);
     s.grow(s.img_k, s.img_k_n, kn);
     s.grow(s.img_v, s.img_v_n, kn);
-    s.grow(s.img_s, s.img_s_n, sn);
+    s.grow(s.img_s, s.img_s_n, row * mb);
     s.grow(s.img_o, s.img_o_n, qn);
     s.ctx.write_buffer(s.img_q, std::as_bytes(q.first(qn)));
     s.ctx.write_buffer(s.img_k, std::as_bytes(kh.first(kn)));
     s.ctx.write_buffer(s.img_v, std::as_bytes(vt.first(kn)));
     s.ctx.begin_batch();
     State::BatchScope batch_scope{s};
-    // S_h[t][j] = K_h[j] . Q[t][h]: K_h ([nk][hd], head h's slice of
-    // img_k) as the weight, Q's head-h columns as the token rows.
-    for (std::uint32_t h = 0; h < heads; ++h) {
-        const Mat km{gguf::TensorType::kF32, nullptr, nk, hd};
-        rec_matmul(s, km, s.img_k, s.img_q, s.img_s,
-                   MatmulRows{nq, h * hd, w, h * nq * nk, nk}, false,
-                   std::uint64_t{h} * nk * hd * 4);
-    }
-    // Softmax of every row over all nk keys (no mask): the causal
-    // shader with heads = rows and base = nk - 1 makes each row's
-    // valid span exactly nk.
-    rec_softmax(s, s.img_s, heads * nq, nk, heads * nq, nk - 1,
-                1.0f / std::sqrt(static_cast<float>(hd)));
-    // O[t][h] = V_h^T P_h[t]: V_h^T ([hd][nk]) as the weight.
-    for (std::uint32_t h = 0; h < heads; ++h) {
-        const Mat vm{gguf::TensorType::kF32, nullptr, hd, nk};
-        rec_matmul(s, vm, s.img_v, s.img_s, s.img_o,
-                   MatmulRows{nq, h * nq * nk, nk, h * hd, w}, false,
-                   std::uint64_t{h} * hd * nk * 4);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    for (std::uint32_t t0 = 0; t0 < nq; t0 += mb) {
+        // Queries t0 .. t0 + m - 1; their scores fill img_s as
+        // [heads][m][nk].
+        const std::uint32_t m = std::min(mb, nq - t0);
+        // S_h[t][j] = K_h[j] . Q[t][h]: K_h ([nk][hd], head h's slice
+        // of img_k) as the weight, Q's head-h columns as the token rows.
+        for (std::uint32_t h = 0; h < heads; ++h) {
+            const Mat km{gguf::TensorType::kF32, nullptr, nk, hd};
+            rec_matmul(s, km, s.img_k, s.img_q, s.img_s,
+                       MatmulRows{m, t0 * w + h * hd, w, h * m * nk, nk},
+                       false, std::uint64_t{h} * nk * hd * 4);
+        }
+        // Softmax of every row over all nk keys (no mask): the causal
+        // shader with heads = rows and base = nk - 1 makes each row's
+        // valid span exactly nk.
+        rec_softmax(s, s.img_s, heads * m, nk, heads * m, nk - 1, scale);
+        // O[t][h] = V_h^T P_h[t]: V_h^T ([hd][nk]) as the weight.
+        for (std::uint32_t h = 0; h < heads; ++h) {
+            const Mat vm{gguf::TensorType::kF32, nullptr, hd, nk};
+            rec_matmul(s, vm, s.img_v, s.img_s, s.img_o,
+                       MatmulRows{m, h * m * nk, nk, t0 * w + h * hd, w},
+                       false, std::uint64_t{h} * hd * nk * 4);
+        }
     }
     s.end_batch();
     s.ctx.read_buffer(s.img_o, std::as_writable_bytes(out.first(qn)));
