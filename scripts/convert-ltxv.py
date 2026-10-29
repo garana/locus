@@ -79,6 +79,15 @@ def write_dit(path, cfg, sch, steps, tensors):
         sys.exit("expected cross_attention_dim == inner dim")
     if sch.get("_class_name") != "RectifiedFlowScheduler":
         sys.exit("expected a RectifiedFlowScheduler")
+    # The keys below that are not in the config: check them against the
+    # tensor shapes (torch [out, in]).
+    shapes = {name: a.shape for name, a in tensors}
+    if shapes.get("transformer_blocks.0.ff.net.0.proj.weight") != \
+            (4 * inner, inner):
+        sys.exit("expected a feed-forward width of 4 x inner")
+    if shapes.get("adaln_single.emb.timestep_embedder.linear_1.weight") != \
+            (inner, 256):
+        sys.exit("expected 256 timestep channels")
 
     w = gguf.GGUFWriter(path, "ltxv")
     w.add_name("ltxv")
@@ -166,8 +175,14 @@ def write_vae(path, cfg, tensors):
             a = a.reshape(a.shape[0], a.shape[1], 27)
         w.add_tensor(name, to_f32(a))
         n += 1
-    if n == 0:
-        sys.exit("no decoder tensors")
+    # conv_in 2, conv_out 2, the last table 1, last_time_embedder 4,
+    # timestep_scale_multiplier 1, per_channel_statistics 5; a res_x
+    # group has 5 per layer (conv1 2, conv2 2, table 1) plus its
+    # time_embedder 4; a compress_all block has its conv 2.
+    want = 15 + sum(5 * p + 4 if kind == "res_x" else 2
+                    for kind, p in zip(kinds, params))
+    if n != want:
+        sys.exit("ltxv_vae: wrote %d tensors, expected %d" % (n, want))
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
