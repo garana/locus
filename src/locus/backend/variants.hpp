@@ -91,6 +91,36 @@ void matvec_avx2(const Mat& w, std::span<const float> x,
 void matvec_vulkan(const Mat& w, std::span<const float> x,
                    std::span<float> out);
 
+/**
+ * matvec_batch on the GPU: w applied to n token-major inputs in one
+ * batched matmul dispatch (rec_matmul), output row-major
+ * (out[r * n + t]) as the Ops contract says. Weights are cached by
+ * host pointer like matvec_vulkan's, so pass only stable (mmapped)
+ * weights, never temporary host buffers.
+ */
+void matvec_batch_vulkan(const Mat& w, std::span<const float> x,
+                         std::span<float> out, std::uint32_t n);
+
+/**
+ * Ops for the image models (T5, PixArt DiT, VAE) on Vulkan: matvec and
+ * matvec_batch on the GPU, self_parallel, so dense::linear hands over
+ * whole matrices and all tokens at once. Kept apart from the vulkan
+ * backend entry, whose language-model paths do their own batching.
+ */
+struct Ops;
+const Ops& vulkan_image_ops();
+
+/**
+ * @returns true when the Vulkan device can import host memory in
+ * place (VK_EXT_external_memory_host, unified memory as on Apple):
+ * mmapped F16, F32 and K-quant weights then cost it no device memory.
+ * Q8_0 weights are still copied (repacked for the GPU), so a Q8_0 T5
+ * would take about 5 GB of the pool. Without import the image models'
+ * F16 / F32 weights (T5-XXL alone is 9.5 GB) would be copied into the
+ * weight pool next to a language model's.
+ */
+bool vulkan_imports_host_memory();
+
 /** @returns true when a usable Vulkan device + kernels exist. */
 bool vulkan_backend_usable();
 

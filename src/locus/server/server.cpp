@@ -19,6 +19,7 @@
 #include "locus/auth/helper_spawn.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/http/base64.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/image/image_input.hpp"
 #include "locus/image/janus.hpp"
 #include "locus/image/janus_chat.hpp"
@@ -2257,9 +2258,16 @@ void OpenAiServer::install_routes() {
                     p.seed = static_cast<std::uint64_t>(
                         body["seed"].get<std::int64_t>());
                 }
-                // The image models run on a CPU backend (the CPU entries
-                // come first), whatever --backend picked for the LLM.
-                const auto& op = backend::best_backend().ops;
+                // The image models' linears run on the GPU when the
+                // Vulkan device imports host memory (unified memory:
+                // their mmapped weights cost it nothing), else on the
+                // CPU backend, whatever --backend picked for the LLM.
+                // A discrete GPU would copy 12 GB of weights into the
+                // pool, evicting the LLM's. Attention and convolutions
+                // stay on the CPU.
+                const auto& op = backend::vulkan_imports_host_memory()
+                                     ? backend::vulkan_image_ops()
+                                     : backend::best_backend().ops;
                 image::PixArtPipeline::Timing took;
                 std::vector<std::uint8_t> rgb;
                 {

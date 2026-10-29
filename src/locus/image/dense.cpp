@@ -56,14 +56,19 @@ void linear(const backend::Ops& op, const backend::Mat& w,
             ? std::max(1u, std::min(rows / 16, 2 * threads))
             : 1;
     const std::uint32_t per = (rows + slices - 1) / slices;
+    // A self-parallel backend (a GPU) takes every token in one call;
+    // a CPU one goes in blocks that keep the inputs in cache.
+    const std::uint32_t block =
+        op.self_parallel && op.matvec_batch != nullptr ? std::max(n, 1u)
+                                                       : kTokenBlock;
     parallel(slices, [&](std::size_t s) {
         const std::uint32_t r0 = static_cast<std::uint32_t>(s) * per;
         if (r0 >= rows) return;
         const std::uint32_t nr = std::min(per, rows - r0);
         const backend::Mat ws = backend::mat_rows(w, r0, nr);
-        std::vector<float> tmp(std::size_t{nr} * kTokenBlock);
-        for (std::uint32_t t0 = 0; t0 < n; t0 += kTokenBlock) {
-            const std::uint32_t nt = std::min(kTokenBlock, n - t0);
+        std::vector<float> tmp(std::size_t{nr} * block);
+        for (std::uint32_t t0 = 0; t0 < n; t0 += block) {
+            const std::uint32_t nt = std::min(block, n - t0);
             mat_batch(op, ws, x.subspan(std::size_t{t0} * cols), nt, tmp);
             for (std::uint32_t t = 0; t < nt; ++t) {
                 float* o = &out[std::size_t{t0 + t} * rows + r0];
@@ -76,10 +81,17 @@ void linear(const backend::Ops& op, const backend::Mat& w,
     });
 }
 
-void attention(const backend::Ops& op, std::span<const float> q,
+void attention(const backend::Ops& given, std::span<const float> q,
                std::uint32_t nq, std::span<const float> k,
                std::span<const float> v, std::uint32_t nk,
                std::uint32_t heads, std::uint32_t hd, std::span<float> out) {
+    // The per-head K and V copies below are temporary host buffers. A
+    // GPU backend caches weights by host pointer, so it must never see
+    // them: such a backend (self-parallel, or not re-entrant across
+    // the threads below) is replaced by the CPU backend.
+    const backend::Ops& op = given.self_parallel || !given.mt_safe
+                                 ? backend::best_backend().ops
+                                 : given;
     const std::uint32_t w = heads * hd;
     std::vector<float> kh(std::size_t{heads} * nk * hd),
         vt(std::size_t{heads} * hd * nk);

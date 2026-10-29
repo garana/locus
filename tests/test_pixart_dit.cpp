@@ -9,6 +9,7 @@
 #include "catch_amalgamated.hpp"
 #include "json.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/image/pixart_dit.hpp"
 
@@ -103,22 +104,32 @@ TEST_CASE("pixart dit matches torch on a synthetic model",
     const std::size_t lat = 4 * 8 * 8, cap = 6 * 32, out = 8 * 8 * 8;
     REQUIRE(in.size() == 2 * (lat + cap));
     REQUIRE(ref.size() == 2 * out);
-    const auto& op = locus::backend::best_backend().ops;
-    for (std::size_t b = 0; b < 2; ++b) {
-        INFO("batch row " << b);
-        const auto mask = j["masks"][b].get<std::vector<int>>();
-        std::uint32_t valid = 0;
-        while (valid < mask.size() && mask[valid] == 1) ++valid;
-        const std::span<const float> x(&in[b * lat], lat);
-        const std::span<const float> y(&in[2 * lat + b * cap], valid * 32);
-        const auto got = dit.forward(x, j["timesteps"][b].get<float>(), y,
-                                     valid, op);
-        REQUIRE(rel_error(got, std::span<const float>(&ref[b * out], out)) <=
-                1e-5);
+    // The CPU backend, and the GPU image ops when a Vulkan device is
+    // usable, so every device runs matvec_batch_vulkan.
+    std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
+        {"cpu", &locus::backend::best_backend().ops}};
+    if (locus::backend::vulkan_backend_usable()) {
+        legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
     }
-    REQUIRE_THROWS_AS(dit.forward(std::span<const float>(in.data(), lat), 1.0f,
-                                  {}, 0, op),
-                      std::invalid_argument);
+    for (const auto& [name, op] : legs) {
+        for (std::size_t b = 0; b < 2; ++b) {
+            INFO(name << " batch row " << b);
+            const auto mask = j["masks"][b].get<std::vector<int>>();
+            std::uint32_t valid = 0;
+            while (valid < mask.size() && mask[valid] == 1) ++valid;
+            const std::span<const float> x(&in[b * lat], lat);
+            const std::span<const float> y(&in[2 * lat + b * cap],
+                                           valid * 32);
+            const auto got = dit.forward(x, j["timesteps"][b].get<float>(),
+                                         y, valid, *op);
+            REQUIRE(rel_error(got, std::span<const float>(&ref[b * out],
+                                                          out)) <= 1e-5);
+        }
+    }
+    REQUIRE_THROWS_AS(
+        dit.forward(std::span<const float>(in.data(), lat), 1.0f, {}, 0,
+                    locus::backend::best_backend().ops),
+        std::invalid_argument);
 }
 
 // PixArt-XL-2-512x512 at step 0 (t = 999) against the diffusers
@@ -141,22 +152,30 @@ TEST_CASE("pixart dit matches the reference on the first step",
     const float t = j["timestep"].get<float>();
     const std::size_t out = std::size_t{8} * 64 * 64;
     REQUIRE(ref.size() == 2 * out);
-    const auto& op = locus::backend::best_backend().ops;
-    std::size_t at = 0;
-    for (std::size_t b = 0; b < 2; ++b) {
-        INFO("batch row " << b);
-        const std::span<const float> y(&text[at], rows[b] * 4096);
-        const auto t0 = std::chrono::steady_clock::now();
-        const auto got = dit.forward(x, t, y, rows[b], op);
-        const double secs = std::chrono::duration<double>(
-                                std::chrono::steady_clock::now() - t0)
-                                .count();
-        const double err =
-            rel_error(got, std::span<const float>(&ref[b * out], out));
-        // Measured on macOS arm64: 3.9e-6 (row 0), 4.3e-5 (row 1).
-        WARN("pixart dit row " << b << ": max diff / rms " << err << ", "
-                               << secs << " s");
-        CHECK(err <= 5e-4);
-        at += std::size_t{rows[b]} * 4096;
+    // The CPU backend, and the GPU when a Vulkan device is usable.
+    std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
+        {"cpu", &locus::backend::best_backend().ops}};
+    if (locus::backend::vulkan_backend_usable()) {
+        legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    for (const auto& [name, op] : legs) {
+        std::size_t at = 0;
+        for (std::size_t b = 0; b < 2; ++b) {
+            INFO(name << " batch row " << b);
+            const std::span<const float> y(&text[at], rows[b] * 4096);
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto got = dit.forward(x, t, y, rows[b], *op);
+            const double secs = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - t0)
+                                    .count();
+            const double err =
+                rel_error(got, std::span<const float>(&ref[b * out], out));
+            // Measured on macOS arm64 (CPU): 3.9e-6 (row 0), 4.3e-5
+            // (row 1).
+            WARN("pixart dit " << name << " row " << b << ": max diff / rms "
+                               << err << ", " << secs << " s");
+            CHECK(err <= 5e-4);
+            at += std::size_t{rows[b]} * 4096;
+        }
     }
 }
