@@ -452,7 +452,10 @@ guarding the default path.
 - API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
   (a log-softmax over the raw logits) and usage accounting.
 - Metrics: every `/metrics` series carries `model` and `backend`
-  labels, and `locus_info` adds `arch`, `chat_template` and `kv_type`.
+  labels, and `locus_info` adds `arch`, `chat_template`, `kv_type`
+  and the hardware (`cpu`, `gpu`); `locus_device_info{kind,name}`
+  lists the CPU and each GPU in use. Join on these with `group_left`
+  instead of a hardware label on every series.
   Request counters and KV gauges sit beside per-request histograms
   (`locus_queue_seconds`, `locus_prefill_seconds`,
   `locus_time_to_first_token_seconds`, `locus_decode_token_seconds`,
@@ -470,7 +473,16 @@ guarding the default path.
   `locus_http_response_bytes`, stream payload included), the time from
   head received to response written (`locus_http_request_seconds`)
   and `locus_http_requests_in_flight`. A request costs a route lookup
-  and a few relaxed adds, about 27 ns on the M2 Pro.
+  and a few relaxed adds, about 27 ns on the M2 Pro. The forward pass
+  charges its host time to `locus_stage_seconds_total{stage}` (embed,
+  norm, attention, ffn, moe, layer, prefetch, head, sample) and, for
+  the per-layer stages, `locus_layer_seconds_total{layer,stage}`;
+  `layer` is an architecture's own whole-layer forward that is not
+  split further. One clock read per stage boundary on every step, so
+  it is always on; decode speed on llama-3.2-1b Q8_0 is unchanged
+  within noise. These are host times. Vulkan runs the whole model as
+  one submit, so its time goes to `stage="device"`; CUDA works per op,
+  so a stage's time includes its wait for the device.
 - KV-cache quantization: Q8 or Q4 blocks of 32 (f16 scale) in a
   separate byte pool, for the llama-family attention. Each layer's
   past rows are dequantized into scratch, so the attention math is the

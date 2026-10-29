@@ -21,6 +21,7 @@ add_executable(locus_tests
     test_deepseek.cpp
     test_engine.cpp
     test_engine_metrics.cpp
+    test_stage_metrics.cpp
     test_gguf.cpp
     test_paged_cache.cpp
     test_kv_quant.cpp

@@ -211,6 +211,10 @@ class OpenAiServer {
 
     // Cumulative counters exposed at GET /metrics (Prometheus text).
     std::atomic<std::uint64_t> requests_total_{0};
+    /** The CPU's model name and the GPUs this server uses (kind, name),
+     * for /metrics' hardware labels; set once in the constructor. */
+    std::string cpu_name_;
+    std::vector<std::pair<std::string, std::string>> devices_;
     std::atomic<std::uint64_t> prompt_tokens_total_{0};
     std::atomic<std::uint64_t> completion_tokens_total_{0};
 

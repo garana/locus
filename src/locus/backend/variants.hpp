@@ -1,6 +1,7 @@
 #pragma once
 
 #include <span>
+#include <string>
 
 #include "locus/backend/cpu_ops.hpp"
 
@@ -165,6 +166,13 @@ bool vulkan_imports_host_memory();
 bool vulkan_backend_usable();
 
 /**
+ * @returns The Vulkan device's name, or "" when no device is usable.
+ *     Opens the device on first use and takes the GPU lock, so call it
+ *     once at startup, not on a hot path.
+ */
+std::string vulkan_device_name();
+
+/**
  * Opt-in (--prefill-f16): the Vulkan prefill matmuls stage both
  * operands as f16 in shared memory (~+18% prefill on an M4 Max). Off
  * (the default) keeps prefill f32-exact.
@@ -238,6 +246,12 @@ void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
 
 /** @returns true when a usable CUDA device is present. */
 bool cuda_backend_usable();
+
+/**
+ * @returns The current CUDA device's name (cudaDeviceProp::name), or ""
+ *     with no usable device or on a non-CUDA build.
+ */
+std::string cuda_device_name();
 
 /**
  * Binds this process to CUDA device `ordinal` for all subsequent CUDA

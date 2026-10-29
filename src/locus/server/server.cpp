@@ -34,6 +34,7 @@
 #include "locus/server/metrics_text.hpp"
 #include "locus/server/responses.hpp"
 #include "locus/server/tools.hpp"
+#include "locus/sys/features.hpp"
 #include "locus/sys/perf_counters.hpp"
 
 namespace locus::server {
@@ -279,6 +280,45 @@ void render_http_metrics(MetricsText& mt, const http::HttpMetrics& hm) {
     mt.gauge("locus_http_requests_in_flight",
              "Requests between head received and response written.",
              f > 0 ? static_cast<std::uint64_t>(f) : 0);
+}
+
+/**
+ * The forward's wall time per stage and per (layer, stage) (i#285).
+ * The per-layer series list each per-layer stage that has any time, for
+ * every layer; embed, head and sample belong to no layer.
+ */
+void render_stage_metrics(MetricsText& mt, const model::StageMetrics& sm) {
+    using model::Stage;
+    constexpr auto kStages = static_cast<int>(Stage::kCount);
+    const auto secs = [](std::uint64_t ns) {
+        return static_cast<double>(ns) / 1e9;
+    };
+    mt.family("locus_stage_seconds_total",
+              "Forward wall time per stage (CPU-side; all layers).",
+              "counter");
+    for (int i = 0; i < kStages; ++i) {
+        const auto s = static_cast<Stage>(i);
+        mt.value("locus_stage_seconds_total",
+                 MetricsText::label("stage", model::stage_name(s)),
+                 secs(sm.stage_ns(s)));
+    }
+    mt.family("locus_layer_seconds_total",
+              "Forward wall time per layer and stage (CPU-side).",
+              "counter");
+    for (const Stage s : {Stage::kNorm, Stage::kAttention, Stage::kFfn,
+                          Stage::kMoe, Stage::kLayer, Stage::kPrefetch}) {
+        std::uint64_t any = 0;
+        for (std::uint32_t l = 0; l < sm.layers(); ++l) any += sm.ns(l, s);
+        if (any == 0) continue;  // e.g. moe on a dense model
+        const std::string stage = MetricsText::label("stage",
+                                                     model::stage_name(s));
+        for (std::uint32_t l = 0; l < sm.layers(); ++l) {
+            mt.value("locus_layer_seconds_total",
+                     MetricsText::label("layer", std::to_string(l)) + "," +
+                         stage,
+                     secs(sm.ns(l, s)));
+        }
+    }
 }
 
 /** @returns The --kv-type name of `t`, for the locus_info series. */
@@ -609,6 +649,20 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
                 image::JanusVision::load(*vg, m.hparams().n_embd));
             vision_gguf_ = std::move(vg);
         }
+    }
+    // Hardware names for /metrics (i#285), read once here: the GPU
+    // names take the GPU lock, which a scrape must never wait on. Only
+    // devices this server uses: the language model's GPU backend, and
+    // Vulkan when the PixArt models run there (see handle_pixart).
+    cpu_name_ = sys::cpu_name();
+    const std::string_view be = m.active_backend().name;
+    if (be == "vulkan") {
+        devices_.push_back({"vulkan", backend::vulkan_device_name()});
+    } else if (be == "cuda") {
+        devices_.push_back({"cuda", backend::cuda_device_name()});
+    }
+    if (pixart_ && be != "vulkan" && backend::vulkan_imports_host_memory()) {
+        devices_.push_back({"vulkan", backend::vulkan_device_name()});
     }
     install_routes();
 }
@@ -1078,7 +1132,24 @@ void OpenAiServer::install_routes() {
                     {{"arch", opt_.model_arch},
                      {"chat_template",
                       std::string(opt_.chat_template.name())},
-                     {"kv_type", kv_type_name(loop_.kv_type())}});
+                     {"kv_type", kv_type_name(loop_.kv_type())},
+                     {"cpu", cpu_name_},
+                     {"gpu", devices_.empty() ? std::string()
+                                              : devices_.front().second}});
+            // Each device this server uses, with its role in the name's
+            // kind (i#285); a CPU-only server lists just the CPU.
+            mt.family("locus_device_info",
+                      "The devices this server computes on.", "gauge");
+            mt.value("locus_device_info",
+                     MetricsText::label("kind", "cpu") + "," +
+                         MetricsText::label("name", cpu_name_),
+                     std::uint64_t{1});
+            for (const auto& [kind, name] : devices_) {
+                mt.value("locus_device_info",
+                         MetricsText::label("kind", kind) + "," +
+                             MetricsText::label("name", name),
+                         std::uint64_t{1});
+            }
             counter("locus_requests_total",
                     "Completion requests accepted.",
                     requests_total_.load());
@@ -1181,6 +1252,9 @@ void OpenAiServer::install_routes() {
                 }
             }
             if (http_metrics_) render_http_metrics(mt, *http_metrics_);
+            if (const model::StageMetrics* sm = model_.stage_metrics()) {
+                render_stage_metrics(mt, *sm);
+            }
             res.set_content(mt.text(), "text/plain; version=0.0.4");
     };
 

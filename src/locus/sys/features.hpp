@@ -42,6 +42,19 @@ Features detect();
 unsigned performance_cores();
 
 /**
+ * The CPU's model name, for the metrics' hardware labels: macOS's
+ * machdep.cpu.brand_string ("Apple M2 Pro"), Linux's first "model name"
+ * in /proc/cpuinfo (x86), else the board in /proc/device-tree/model
+ * (ARM boards such as "Raspberry Pi 5 Model B Rev 1.0"), else the first
+ * core's ARM implementer and part codes ("arm 0x41:0xd0c" on an ACPI
+ * server such as Graviton2).
+ *
+ * @returns The name with surrounding spaces trimmed, or "" when none of
+ *     these is available.
+ */
+std::string cpu_name();
+
+/**
  * @param f A capability set from detect().
  * @returns Human-readable one-line summary, e.g. for server logs.
  */

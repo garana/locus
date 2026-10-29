@@ -486,6 +486,7 @@ TransformerModel TransformerModel::load(const GgufFile& g,
                      " (%zu MB failed)\n",
                      locked >> 20, failed >> 20);
     }
+    m.stage_metrics_ = std::make_shared<StageMetrics>(m.hp_.n_layers);
     return m;
 }
 
@@ -642,10 +643,12 @@ void TransformerModel::forward_embedding(
     if (rows.begin >= rows.end || rows.end > hp_.n_vocab) {
         throw std::invalid_argument("forward_embedding: bad logit row range");
     }
+    StageLap lap(stage_metrics_.get());
     if (backend_->name == "vulkan" &&
         backend::vulkan_forward(*this, embd_in.empty() ? token : 0, cache,
                                 seq, logits, rows.begin, rows.end, embd_in,
                                 normed_out)) {
+        lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
         return;
     }
     forward_layers(token, embd_in, 0, hp_.n_layers, cache, seq, ws, logits,
@@ -691,9 +694,11 @@ void TransformerModel::forward_embeddings(std::span<const EmbedStep> steps,
             }
         }
     }
+    StageLap lap(stage_metrics_.get());
     if (steps.size() > 1 && backend_->name == "vulkan" &&
         backend::vulkan_forward_multi(*this, steps, cache, rows.begin,
                                       rows.end)) {
+        lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
         return;
     }
     for (const EmbedStep& st : steps) {
@@ -718,9 +723,12 @@ void TransformerModel::forward(tok::TokenId token,
     if (rows.begin >= rows.end || rows.end > hp_.n_vocab) {
         throw std::invalid_argument("forward: bad logit row range");
     }
-    if (!(backend_->name == "vulkan" &&
-          vulkan_forward(*this, token, cache, seq, logits, rows.begin,
-                         rows.end))) {
+    StageLap lap(stage_metrics_.get());
+    if (backend_->name == "vulkan" &&
+        vulkan_forward(*this, token, cache, seq, logits, rows.begin,
+                       rows.end)) {
+        lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
+    } else {
         // The whole stack is the [0, n_layers) slice. forward_layers
         // holds the one shared implementation; pipeline stages run
         // sub-ranges.
@@ -784,6 +792,9 @@ void TransformerModel::forward_layers(tok::TokenId token,
     if (seq.n_tokens >= cache.capacity(seq)) {
         throw std::invalid_argument("seq capacity not ensured");
     }
+    // Wall time per part, one clock read each (i#285).
+    StageLap lap(stage_metrics_.get());
+    constexpr std::uint32_t kNoLayer = StageMetrics::kNoLayer;
     if (spec_->forward != nullptr) {
         // The arch's own whole-token forward (residual state spans
         // layers): full model, one stage.
@@ -792,6 +803,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
                 "forward_layers: this arch runs the whole model only");
         }
         spec_->forward(*this, token, cache, seq, ws, out);
+        lap.lap(kNoLayer, Stage::kLayer);
         seq.n_tokens += 1;
         return;
     }
@@ -810,6 +822,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
     } else {
         std::copy_n(hidden_in.data(), hp_.n_embd, ws.x.data());
     }
+    lap.lap(kNoLayer, Stage::kEmbed);
 
     // R8 layer readahead: while layer l computes, ask the kernel
     // to page in layer l+1's static weights (and the output head
@@ -846,20 +859,25 @@ void TransformerModel::forward_layers(tok::TokenId token,
                     op.prefetch(out_w_);
                 }
             }
+            lap.lap(l, Stage::kPrefetch);
         }
 
         if (spec_->layer != nullptr) {
             spec_->layer(*this, lay, cache, seq, ws, l, pos);
+            lap.lap(l, Stage::kLayer);
             continue;
         }
         apply_norm(ws.x, lay.attn_norm, hp_.rms_eps, ws.xb);
+        lap.lap(l, Stage::kNorm);
         spec_->attention(*this, lay, cache, seq, ws, l, pos);
         matvec_mt(op, lay.wo, ws.out, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
             ws.x[i] += ws.xb2[i];
         }
+        lap.lap(l, Stage::kAttention);
 
         apply_norm(ws.x, lay.ffn_norm, hp_.rms_eps, ws.xb);
+        lap.lap(l, Stage::kNorm);
         if (!lay.is_moe()) {
             const MatvecJob gu[] = {{lay.w_gate, ws.xb, ws.gate},
                                     {lay.w_up, ws.xb, ws.up}};
@@ -872,11 +890,13 @@ void TransformerModel::forward_layers(tok::TokenId token,
             for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
                 ws.x[i] += ws.xb2[i];
             }
+            lap.lap(l, Stage::kFfn);
         } else {
             moe_ffn(lay, ws, l);
             for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
                 ws.x[i] += ws.moe_acc[i];
             }
+            lap.lap(l, Stage::kMoe);
         }
     }
 
@@ -886,6 +906,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
         // normed hidden state after return: Janus's image head reads it
         // (image/janus.cpp), so keep it there.
         apply_norm(ws.x, out_norm_, hp_.rms_eps, ws.xb);
+        lap.lap(kNoLayer, Stage::kNorm);
         if (rows.end == 0 || (rows.begin == 0 && rows.end == hp_.n_vocab)) {
             matvec_mt(op, out_w_, ws.xb, out);
         } else {
@@ -894,6 +915,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
                       ws.xb, out.subspan(rows.begin, rows.end - rows.begin));
         }
         scale_logits(out);
+        lap.lap(kNoLayer, Stage::kHead);
         seq.n_tokens = pos + 1;
     } else {
         // Hand the residual stream to the next stage; the token is not
@@ -1029,11 +1051,13 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
         throw std::invalid_argument(
             "forward_batch: seq capacity not ensured");
     }
+    StageLap lap(stage_metrics_.get());
     if (backend_->name == "vulkan" && any_embd) {
         // The GPU batch with the embeddings in place of those tokens'
         // rows (i#257); where it declines, one GPU forward per position.
         if (vulkan_forward_batch(*this, toks, cache, seq, logits, all_logits,
                                  embd)) {
+            lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
             return;
         }
         const std::uint32_t V = hp_.n_vocab;
@@ -1058,6 +1082,7 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     if (backend_->name == "vulkan") {
         if (vulkan_forward_batch(*this, toks, cache, seq, logits,
                                  all_logits)) {
+            lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
             return;
         }
         // Unsupported on the GPU batch path: one forward() per
@@ -1084,6 +1109,8 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     std::vector<float> gate(static_cast<std::size_t>(n) * ff);
     std::vector<float> up(static_cast<std::size_t>(n) * ff);
 
+    lap.restart();  // wall time per part (i#285)
+    constexpr std::uint32_t kNoLayer = StageMetrics::kNoLayer;
     for (std::uint32_t t = 0; t < n; ++t) {
         float* row = x.data() + static_cast<std::size_t>(t) * E;
         if (!embd.empty() && embd[t] != nullptr) {
@@ -1093,6 +1120,7 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                            {row, E});
         }
     }
+    lap.lap(kNoLayer, Stage::kEmbed);
 
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
@@ -1104,12 +1132,14 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
             const std::size_t o = static_cast<std::size_t>(t) * E;
             apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
                     ws.xb);
+            lap.lap(l, Stage::kNorm);
             spec_->attention(*this, lay, cache, seq, ws, l,
                              base + t);
             matvec_mt(op, lay.wo, ws.out, ws.xb2);
             for (std::uint32_t i = 0; i < E; ++i) {
                 x[o + i] += ws.xb2[i];
             }
+            lap.lap(l, Stage::kAttention);
         }
         if (!lay.is_moe()) {
             // Dense FFN: weight-stationary batched matvecs.
@@ -1119,6 +1149,7 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                 apply_norm({x.data() + o, E}, lay.ffn_norm,
                         hp_.rms_eps, {xbf.data() + o, E});
             }
+            lap.lap(l, Stage::kNorm);
             matvec_batch(op, lay.w_gate, xbf, gate, n);
             matvec_batch(op, lay.w_up, xbf, up, n);
             for (std::uint32_t t = 0; t < n; ++t) {
@@ -1132,6 +1163,7 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                  i < static_cast<std::size_t>(n) * E; ++i) {
                 x[i] += xb2[i];
             }
+            lap.lap(l, Stage::kFfn);
         } else {
             // MoE: ffn-norm all tokens, then apply the routed
             // experts weight-stationary (each read once across the
@@ -1142,7 +1174,9 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                 apply_norm({x.data() + o, E}, lay.ffn_norm,
                         hp_.rms_eps, {xbf.data() + o, E});
             }
+            lap.lap(l, Stage::kNorm);
             moe_ffn_batch(lay, l, xbf, x, n, ws);
+            lap.lap(l, Stage::kMoe);
         }
     }
 
@@ -1157,6 +1191,7 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
         apply_norm({x.data() + last, E}, out_norm_, hp_.rms_eps, ws.xb);
         matvec_mt(op, out_w_, ws.xb, logits);
     }
+    lap.lap(kNoLayer, Stage::kHead);
     seq.n_tokens = base + n;
 }
 
@@ -1202,11 +1237,14 @@ void TransformerModel::forward_batch_decode(
     std::vector<float> gate(static_cast<std::size_t>(n) * ff);
     std::vector<float> up(static_cast<std::size_t>(n) * ff);
 
+    StageLap lap(stage_metrics_.get());  // wall time per part (i#285)
+    constexpr std::uint32_t kNoLayer = StageMetrics::kNoLayer;
     for (std::uint32_t t = 0; t < n; ++t) {
         op.dequant_row(embd_, static_cast<std::uint32_t>(toks[t]),
                        {x.data() + static_cast<std::size_t>(t) * E,
                         E});
     }
+    lap.lap(kNoLayer, Stage::kEmbed);
 
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
@@ -1215,18 +1253,21 @@ void TransformerModel::forward_batch_decode(
             const std::size_t o = static_cast<std::size_t>(t) * E;
             apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
                     ws.xb);
+            lap.lap(l, Stage::kNorm);
             spec_->attention(*this, lay, cache, *seqs[t], ws, l,
                              pos[t]);
             matvec_mt(op, lay.wo, ws.out, ws.xb2);
             for (std::uint32_t i = 0; i < E; ++i) {
                 x[o + i] += ws.xb2[i];
             }
+            lap.lap(l, Stage::kAttention);
         }
         for (std::uint32_t t = 0; t < n; ++t) {
             const std::size_t o = static_cast<std::size_t>(t) * E;
             apply_norm({x.data() + o, E}, lay.ffn_norm, hp_.rms_eps,
                     {xbf.data() + o, E});
         }
+        lap.lap(l, Stage::kNorm);
         if (!lay.is_moe()) {
             matvec_batch(op, lay.w_gate, xbf, gate, n);
             matvec_batch(op, lay.w_up, xbf, up, n);
@@ -1241,14 +1282,17 @@ void TransformerModel::forward_batch_decode(
                  i < static_cast<std::size_t>(n) * E; ++i) {
                 x[i] += xb2[i];
             }
+            lap.lap(l, Stage::kFfn);
         } else {
             moe_ffn_batch(lay, l, xbf, x, n, ws);
+            lap.lap(l, Stage::kMoe);
         }
     }
 
     // Every decode token needs logits; amortize the head over the batch
     // (i#52).
     project_head_batch(op, x, xbf, logits, n);
+    lap.lap(kNoLayer, Stage::kHead);
     for (std::uint32_t t = 0; t < n; ++t) {
         seqs[t]->n_tokens = pos[t] + 1;
     }
@@ -1316,6 +1360,8 @@ void TransformerModel::forward_batch_layers(
 
     // First stage embeds each token; a later stage loads the residual
     // stream handed over per sequence.
+    StageLap lap(stage_metrics_.get());  // wall time per part (i#285)
+    constexpr std::uint32_t kNoLayer = StageMetrics::kNoLayer;
     if (first) {
         for (std::uint32_t t = 0; t < n; ++t) {
             if (toks[t] < 0 ||
@@ -1330,6 +1376,7 @@ void TransformerModel::forward_batch_layers(
         std::copy_n(hidden_in.data(),
                     static_cast<std::size_t>(n) * E, x.data());
     }
+    lap.lap(kNoLayer, Stage::kEmbed);
 
     // Identical per-layer body to forward_batch_decode (which is
     // byte-identical to per-sequence forward), just over [layer_begin,
@@ -1340,17 +1387,20 @@ void TransformerModel::forward_batch_layers(
             const std::size_t o = static_cast<std::size_t>(t) * E;
             apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
                        ws.xb);
+            lap.lap(l, Stage::kNorm);
             spec_->attention(*this, lay, cache, *seqs[t], ws, l, pos[t]);
             matvec_mt(op, lay.wo, ws.out, ws.xb2);
             for (std::uint32_t i = 0; i < E; ++i) {
                 x[o + i] += ws.xb2[i];
             }
+            lap.lap(l, Stage::kAttention);
         }
         for (std::uint32_t t = 0; t < n; ++t) {
             const std::size_t o = static_cast<std::size_t>(t) * E;
             apply_norm({x.data() + o, E}, lay.ffn_norm, hp_.rms_eps,
                        {xbf.data() + o, E});
         }
+        lap.lap(l, Stage::kNorm);
         if (!lay.is_moe()) {
             matvec_batch(op, lay.w_gate, xbf, gate, n);
             matvec_batch(op, lay.w_up, xbf, up, n);
@@ -1364,8 +1414,10 @@ void TransformerModel::forward_batch_layers(
                  i < static_cast<std::size_t>(n) * E; ++i) {
                 x[i] += xb2[i];
             }
+            lap.lap(l, Stage::kFfn);
         } else {
             moe_ffn_batch(lay, l, xbf, x, n, ws);
+            lap.lap(l, Stage::kMoe);
         }
     }
 
@@ -1373,6 +1425,7 @@ void TransformerModel::forward_batch_layers(
         // Final stage: project to logits (amortized head, i#52), consume
         // the token.
         project_head_batch(op, x, xbf, out, n);
+        lap.lap(kNoLayer, Stage::kHead);
         for (std::uint32_t t = 0; t < n; ++t) {
             seqs[t]->n_tokens = pos[t] + 1;
         }

@@ -3678,6 +3678,17 @@ bool cuda_backend_usable() {
     return cuda_ok(cudaGetDeviceCount(&n)) && n > 0;
 }
 
+std::string cuda_device_name() {
+    if (!cuda_backend_usable()) return "";
+    int dev = 0;
+    cudaDeviceProp p{};
+    if (!cuda_ok(cudaGetDevice(&dev)) ||
+        !cuda_ok(cudaGetDeviceProperties(&p, dev))) {
+        return "";
+    }
+    return p.name;
+}
+
 void cuda_set_device(int ordinal) {
     if (ordinal < 0) {
         throw std::out_of_range(

@@ -583,6 +583,9 @@ const Request* Engine::get(std::uint64_t id) const {
 }
 
 void Engine::sample_from(Request& r, std::span<float> logits) {
+    // Picking the token (with the logprobs snapshot and any grammar
+    // constraint) is the sample stage (i#285).
+    model::StageLap lap(model_.stage_metrics());
     // sample() mutates logits (penalties/temperature); snapshot the
     // raw logits first so logprobs reflect the natural distribution.
     std::vector<float> raw;
@@ -594,6 +597,7 @@ void Engine::sample_from(Request& r, std::span<float> logits) {
     if (r.constraint) {
         r.constraint->commit(next);
     }
+    lap.lap(model::StageMetrics::kNoLayer, model::Stage::kSample);
     r.generated.push_back(next);
     if (r.generated.size() == 1) {
         r.t_first = std::chrono::steady_clock::now();

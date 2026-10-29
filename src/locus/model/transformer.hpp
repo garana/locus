@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -8,6 +9,7 @@
 #include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
+#include "locus/model/stage_metrics.hpp"
 #include "locus/tok/tokenizer.hpp"
 
 namespace locus::model {
@@ -210,6 +212,13 @@ class TransformerModel {
     const backend::Backend& active_backend() const {
         return *backend_;
     }
+
+    /**
+     * @returns The wall time per (layer, stage) of this model's CPU-side
+     *     forward steps (i#285), shared by copies of the model; null for
+     *     a model not built by load().
+     */
+    StageMetrics* stage_metrics() const { return stage_metrics_.get(); }
 
     /**
      * The ggml-parity mode (DESIGN.md R16): QK_K weight matmuls
@@ -686,6 +695,7 @@ class TransformerModel {
     Hparams hp_;
     const struct ArchSpec* spec_ = nullptr;
     const backend::Backend* backend_ = nullptr;
+    std::shared_ptr<StageMetrics> stage_metrics_;
     /** use_q8k_activations' choice: -1 none (the default rule), 0 off,
      * 1 on. */
     int q8k_override_ = -1;

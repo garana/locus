@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 
 namespace locus::backend::vk {
 
@@ -258,6 +259,9 @@ class VulkanContext {
      * @returns true when the f16 kernels can be dispatched.
      */
     bool has_f16() const;
+
+    /** @returns The device's name (VkPhysicalDeviceProperties). */
+    const std::string& device_name() const;
 
     /** @returns Whether kernel k needs has_f16(). */
     static bool kernel_needs_f16(Kernel k);
