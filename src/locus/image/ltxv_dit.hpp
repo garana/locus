@@ -58,7 +58,9 @@ class LtxvDit {
      * @param coords [3][n]: each token's (time, y, x) coordinate as the
      *     reference's indices_grid (pixel units, time in seconds), before
      *     the division by the max positions.
-     * @param sigma The noise level in [0, 1].
+     * @param sigma The noise level in [0, 1], one for all tokens (the
+     *     reference's per-token timestep, for image or video
+     *     conditioning, is not supported).
      * @param text n_text rows of caption_channels floats: the T5 rows
      *     whose mask is 1. A masked row gets weight exactly 0 in the
      *     reference (a -10000 score bias), so leaving it out gives the
