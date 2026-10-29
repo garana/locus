@@ -234,6 +234,11 @@ struct State {
         };
         drop(x, x_n);
         drop(xb, xb_n);
+        drop(img_q, img_q_n);
+        drop(img_k, img_k_n);
+        drop(img_v, img_v_n);
+        drop(img_s, img_s_n);
+        drop(img_o, img_o_n);
         drop(q, q_n);
         drop(gate, gate_n);
         drop(up, up_n);
@@ -267,6 +272,13 @@ struct State {
         drop_tbl(iq2xxs_tbl, iq2xxs_tbl_ready);
         drop_tbl(iq3xxs_tbl, iq3xxs_tbl_ready);
     }
+
+    /** Image-model attention (vulkan_attention): Q, per-head K, per-head
+     *  V^T, scores and output. Scratch rewritten every call, never in
+     *  the weight pool. */
+    VulkanContext::Buffer img_q{}, img_k{}, img_v{}, img_s{}, img_o{};
+    std::size_t img_q_n = 0, img_k_n = 0, img_v_n = 0, img_s_n = 0,
+                img_o_n = 0;
 
     /** Activation buffers, sized on first use per model dims. */
     VulkanContext::Buffer x{}, xb{}, q{}, gate{}, up{}, attout{},
@@ -1507,22 +1519,9 @@ void matvec_batch_vulkan(const Mat& w, std::span<const float> x,
         matvec_batch_scalar(w, x, out, n);  // no shader for this type
         return;
     }
-    const std::size_t rows = w.rows, cols = w.cols;
+    const std::size_t rows = w.rows;
     std::vector<float> tok(rows * n);
-    {
-        std::lock_guard lk(state_mu());
-        State& s = state();
-        auto wb = s.upload_w(w);
-        s.grow(s.x, s.x_n, cols * n);
-        s.grow(s.xb, s.xb_n, rows * n);
-        s.ctx.write_buffer(s.x, std::as_bytes(x.first(cols * n)));
-        s.ctx.begin_batch();
-        State::BatchScope batch_scope{s};
-        rec_matmul(s, w, wb, s.x, s.xb,
-                   MatmulRows{n, 0, w.cols, 0, w.rows}, false);
-        s.end_batch();
-        s.ctx.read_buffer(s.xb, std::as_writable_bytes(std::span(tok)));
-    }
+    vulkan_linear_tokens(w, x, n, tok);
     // The GPU writes token-major; the matvec_batch contract is
     // row-major (out[r * n + t]).
     for (std::size_t t = 0; t < n; ++t) {
@@ -1530,6 +1529,36 @@ void matvec_batch_vulkan(const Mat& w, std::span<const float> x,
             out[r * n + t] = tok[t * rows + r];
         }
     }
+}
+
+void vulkan_linear_tokens(const Mat& w, std::span<const float> x,
+                          std::uint32_t n, std::span<float> out) {
+    if (n == 0) {
+        return;
+    }
+    const std::size_t rows = w.rows, cols = w.cols;
+    if (x.size() < cols * n || out.size() < rows * n) {
+        throw std::invalid_argument("vulkan_linear_tokens: short spans");
+    }
+    if (matmul_kernel(w) == Kernel::kCount_ &&
+        matvec_kernel(w) == Kernel::kCount_) {
+        for (std::size_t t = 0; t < n; ++t) {  // no shader for this type
+            matvec(w, x.subspan(t * cols, cols), out.subspan(t * rows, rows));
+        }
+        return;
+    }
+    std::lock_guard lk(state_mu());
+    State& s = state();
+    auto wb = s.upload_w(w);
+    s.grow(s.x, s.x_n, cols * n);
+    s.grow(s.xb, s.xb_n, rows * n);
+    s.ctx.write_buffer(s.x, std::as_bytes(x.first(cols * n)));
+    s.ctx.begin_batch();
+    State::BatchScope batch_scope{s};
+    rec_matmul(s, w, wb, s.x, s.xb, MatmulRows{n, 0, w.cols, 0, w.rows},
+               false);
+    s.end_batch();
+    s.ctx.read_buffer(s.xb, std::as_writable_bytes(out.first(rows * n)));
 }
 
 const Ops& vulkan_image_ops() {
@@ -1545,6 +1574,67 @@ const Ops& vulkan_image_ops() {
                          .prefetch = nullptr,
                          .mt_safe = false};
     return ops;
+}
+
+void vulkan_attention(std::span<const float> q, std::uint32_t nq,
+                      std::span<const float> kh, std::span<const float> vt,
+                      std::uint32_t nk, std::uint32_t heads, std::uint32_t hd,
+                      std::span<float> out) {
+    const std::uint32_t w = heads * hd;
+    const std::size_t qn = std::size_t{nq} * w,
+                      kn = std::size_t{heads} * nk * hd,
+                      row = std::size_t{heads} * nk;
+    // Every buffer must fit one storage binding (maxStorageBufferRange
+    // is about 4 GB): at most 2^30 floats each. The scores run in query
+    // sub-blocks within the attention scratch cap (1 GiB unless a test
+    // lowers it), as attn_block does for the language models.
+    constexpr std::size_t kMaxFloats = std::size_t{1} << 30;
+    if (nq == 0 || nk == 0 || q.size() < qn || kh.size() < kn ||
+        vt.size() < kn || out.size() < qn || qn > kMaxFloats ||
+        kn > kMaxFloats || row > kMaxFloats) {
+        throw std::invalid_argument("vulkan_attention: bad sizes");
+    }
+    const std::uint32_t mb = static_cast<std::uint32_t>(std::clamp<std::size_t>(
+        attn_scratch_floats.load() / row, 1, nq));
+    std::lock_guard lk(state_mu());
+    State& s = state();
+    s.grow(s.img_q, s.img_q_n, qn);
+    s.grow(s.img_k, s.img_k_n, kn);
+    s.grow(s.img_v, s.img_v_n, kn);
+    s.grow(s.img_s, s.img_s_n, row * mb);
+    s.grow(s.img_o, s.img_o_n, qn);
+    s.ctx.write_buffer(s.img_q, std::as_bytes(q.first(qn)));
+    s.ctx.write_buffer(s.img_k, std::as_bytes(kh.first(kn)));
+    s.ctx.write_buffer(s.img_v, std::as_bytes(vt.first(kn)));
+    s.ctx.begin_batch();
+    State::BatchScope batch_scope{s};
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    for (std::uint32_t t0 = 0; t0 < nq; t0 += mb) {
+        // Queries t0 .. t0 + m - 1; their scores fill img_s as
+        // [heads][m][nk].
+        const std::uint32_t m = std::min(mb, nq - t0);
+        // S_h[t][j] = K_h[j] . Q[t][h]: K_h ([nk][hd], head h's slice
+        // of img_k) as the weight, Q's head-h columns as the token rows.
+        for (std::uint32_t h = 0; h < heads; ++h) {
+            const Mat km{gguf::TensorType::kF32, nullptr, nk, hd};
+            rec_matmul(s, km, s.img_k, s.img_q, s.img_s,
+                       MatmulRows{m, t0 * w + h * hd, w, h * m * nk, nk},
+                       false, std::uint64_t{h} * nk * hd * 4);
+        }
+        // Softmax of every row over all nk keys (no mask): the causal
+        // shader with heads = rows and base = nk - 1 makes each row's
+        // valid span exactly nk.
+        rec_softmax(s, s.img_s, heads * m, nk, heads * m, nk - 1, scale);
+        // O[t][h] = V_h^T P_h[t]: V_h^T ([hd][nk]) as the weight.
+        for (std::uint32_t h = 0; h < heads; ++h) {
+            const Mat vm{gguf::TensorType::kF32, nullptr, hd, nk};
+            rec_matmul(s, vm, s.img_v, s.img_s, s.img_o,
+                       MatmulRows{m, h * m * nk, nk, t0 * w + h * hd, w},
+                       false, std::uint64_t{h} * hd * nk * 4);
+        }
+    }
+    s.end_batch();
+    s.ctx.read_buffer(s.img_o, std::as_writable_bytes(out.first(qn)));
 }
 
 bool vulkan_imports_host_memory() {

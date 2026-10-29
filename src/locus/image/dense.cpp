@@ -7,6 +7,7 @@
 #include <thread>
 #include <vector>
 
+#include "locus/backend/variants.hpp"
 #include "locus/sys/thread_pool.hpp"
 
 namespace locus::image::dense {
@@ -49,6 +50,17 @@ void linear(const backend::Ops& op, const backend::Mat& w,
             std::span<const float> b, std::span<const float> x,
             std::uint32_t n, std::span<float> out) {
     const std::uint32_t rows = w.rows, cols = w.cols;
+    if (&op == &backend::vulkan_image_ops()) {
+        // Token-major straight from the GPU, then the bias.
+        backend::vulkan_linear_tokens(w, x, n, out);
+        if (!b.empty()) {
+            parallel(n, [&](std::size_t t) {
+                float* o = &out[t * rows];
+                for (std::uint32_t r = 0; r < rows; ++r) o[r] += b[r];
+            });
+        }
+        return;
+    }
     const std::uint32_t threads =
         std::max(1u, std::thread::hardware_concurrency());
     const std::uint32_t slices =
@@ -85,13 +97,6 @@ void attention(const backend::Ops& given, std::span<const float> q,
                std::uint32_t nq, std::span<const float> k,
                std::span<const float> v, std::uint32_t nk,
                std::uint32_t heads, std::uint32_t hd, std::span<float> out) {
-    // The per-head K and V copies below are temporary host buffers. A
-    // GPU backend caches weights by host pointer, so it must never see
-    // them: such a backend (self-parallel, or not re-entrant across
-    // the threads below) is replaced by the CPU backend.
-    const backend::Ops& op = given.self_parallel || !given.mt_safe
-                                 ? backend::best_backend().ops
-                                 : given;
     const std::uint32_t w = heads * hd;
     std::vector<float> kh(std::size_t{heads} * nk * hd),
         vt(std::size_t{heads} * hd * nk);
@@ -107,6 +112,19 @@ void attention(const backend::Ops& given, std::span<const float> q,
             }
         }
     });
+    // The Vulkan image ops run the whole attention on the GPU, from
+    // scratch buffers (vulkan_attention).
+    if (&given == &backend::vulkan_image_ops()) {
+        backend::vulkan_attention(q, nq, kh, vt, nk, heads, hd, out);
+        return;
+    }
+    // kh and vt are temporary host buffers. Any other GPU backend
+    // caches weights by host pointer, so it must never see them: such
+    // a backend (self-parallel, or not re-entrant across the threads
+    // below) is replaced by the CPU backend.
+    const backend::Ops& op = given.self_parallel || !given.mt_safe
+                                 ? backend::best_backend().ops
+                                 : given;
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
     const std::uint32_t qblocks = (nq + kTokenBlock - 1) / kTokenBlock;
     parallel(std::size_t{heads} * qblocks, [&](std::size_t item) {

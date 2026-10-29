@@ -105,13 +105,24 @@ TEST_CASE("pixart dit matches torch on a synthetic model",
     REQUIRE(in.size() == 2 * (lat + cap));
     REQUIRE(ref.size() == 2 * out);
     // The CPU backend, and the GPU image ops when a Vulkan device is
-    // usable, so every device runs matvec_batch_vulkan.
+    // usable, so every device runs the GPU linears and attention.
     std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
         {"cpu", &locus::backend::best_backend().ops}};
     if (locus::backend::vulkan_backend_usable()) {
         legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+        // The same with a tiny attention scratch cap, so the GPU
+        // attention runs its queries in several sub-blocks (5, 5, 5, 1
+        // for 16 queries over 2 heads x 16 keys).
+        legs.push_back({"vulkan blocks", &locus::backend::vulkan_image_ops()});
     }
+    struct CapReset {
+        ~CapReset() { locus::backend::vulkan_set_attn_scratch_floats(0); }
+    } cap_reset;
     for (const auto& [name, op] : legs) {
+        if (locus::backend::vulkan_backend_usable()) {
+            locus::backend::vulkan_set_attn_scratch_floats(
+                std::string_view(name) == "vulkan blocks" ? 2 * 16 * 5 : 0);
+        }
         for (std::size_t b = 0; b < 2; ++b) {
             INFO(name << " batch row " << b);
             const auto mask = j["masks"][b].get<std::vector<int>>();
