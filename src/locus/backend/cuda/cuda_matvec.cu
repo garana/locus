@@ -2219,7 +2219,9 @@ struct DevBuf {
 /**
  * One set of reusable device buffers for a matvec call's activations
  * and outputs, on one device. Each slot only grows, so after the first
- * calls a matvec needs no cudaMalloc / cudaFree.
+ * calls a matvec needs no cudaMalloc / cudaFree. The slots are not
+ * counted against the weight pool's budget; they come out of the VRAM
+ * the budget leaves free.
  */
 struct ScratchSet {
     static constexpr int kSlots = 4;
