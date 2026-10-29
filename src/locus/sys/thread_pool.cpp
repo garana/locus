@@ -38,13 +38,15 @@ ThreadPool& ThreadPool::instance() {
 
 ThreadPool::ThreadPool(std::size_t n_workers)
     : n_workers_(n_workers) {
-    // Up to one spinner per performance core besides the caller
-    // (a count, not a placement: the OS places the threads); every
-    // worker where the platform reports no tiers.
+    // Up to one spinner per performance core besides the caller (a
+    // count, not a placement: the OS places the threads). None where
+    // the platform reports no tiers: on a 4-core x86 with no SMT the
+    // spinners made decode 5-10% slower (i#206 review), as idle
+    // spinning cores cost the busy thread its turbo headroom; there the
+    // workers sleep as before and keep only the lock-free claims.
     const unsigned pcores = performance_cores();
     spin_workers_ =
-        pcores > 1 ? std::min<std::size_t>(n_workers_, pcores - 1)
-                   : n_workers_;
+        pcores > 1 ? std::min<std::size_t>(n_workers_, pcores - 1) : 0;
     workers_.reserve(n_workers_);
     for (std::size_t i = 0; i < n_workers_; ++i) {
         workers_.emplace_back([this, i] { worker(i); });

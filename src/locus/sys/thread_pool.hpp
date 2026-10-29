@@ -24,7 +24,9 @@ namespace locus::sys {
  * in a few microseconds instead of the ~18 us of a condition-variable
  * wake. The spinner count matches the performance cores so a 10-slice
  * matvec has 10 runnable threads; nothing pins them, the OS places
- * them (and keeps busy threads on the performance cores).
+ * them (and keeps busy threads on the performance cores). Only where
+ * the platform reports core tiers (Apple silicon): elsewhere workers
+ * sleep between loops as before.
  */
 class ThreadPool {
   public:
