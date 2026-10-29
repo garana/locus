@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include "gguf_builder.hpp"
 #include "json.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/image/t5_encoder.hpp"
 
@@ -209,32 +211,45 @@ TEST_CASE("t5 xxl encoder matches the reference", "[t5][image][e2e]") {
     REQUIRE(jf.good());
     const auto index = nlohmann::json::parse(jf);
     const auto ref = read_f32(kDir + "golden/t5_encoder.f32");
-    const auto& op = locus::backend::best_backend().ops;
     const bool heavy = std::getenv("LOCUS_HEAVY_TESTS") != nullptr;
-    std::size_t at = 0;
-    for (const auto& c : index["cases"]) {
-        const auto name = c["name"].get<std::string>();
-        const auto ids = c["ids"].get<std::vector<TokenId>>();
-        const auto rows = c["rows"].get<std::vector<std::uint32_t>>();
-        const std::size_t next = at + rows.size() * 4096;
-        REQUIRE(next <= ref.size());
-        if (name == "long" && !heavy) {
+    // The CPU backend, and the GPU when a Vulkan device is usable.
+    std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
+        {"cpu", &locus::backend::best_backend().ops}};
+    if (locus::backend::vulkan_backend_usable()) {
+        legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    for (const auto& [leg, op] : legs) {
+        std::size_t at = 0;
+        for (const auto& c : index["cases"]) {
+            const auto name = c["name"].get<std::string>();
+            const auto ids = c["ids"].get<std::vector<TokenId>>();
+            const auto rows = c["rows"].get<std::vector<std::uint32_t>>();
+            const std::size_t next = at + rows.size() * 4096;
+            REQUIRE(next <= ref.size());
+            if (name == "long" && !heavy) {
+                at = next;
+                continue;
+            }
+            INFO(leg << " case " << name);
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto got = enc.encode(ids, *op);
+            const double secs =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count();
+            double worst = 0.0;
+            for (std::size_t r = 0; r < rows.size(); ++r) {
+                worst = std::max(
+                    worst, row_error(&got[std::size_t{rows[r]} * 4096],
+                                     &ref[at + r * 4096], 4096));
+            }
+            // Measured on macOS arm64 (CPU): 4.3e-4 prompt, 2.5e-4
+            // empty, 7.7e-4 long (sum order over 24 blocks; a wrong
+            // bucket or norm is near 1).
+            WARN("t5 " << leg << " " << name << ": max diff / row rms "
+                       << worst << ", " << secs << " s");
+            CHECK(worst <= 2e-3);
             at = next;
-            continue;
         }
-        INFO("case " << name);
-        const auto got = enc.encode(ids, op);
-        double worst = 0.0;
-        for (std::size_t r = 0; r < rows.size(); ++r) {
-            worst = std::max(worst,
-                             row_error(&got[std::size_t{rows[r]} * 4096],
-                                       &ref[at + r * 4096], 4096));
-        }
-        // Measured on macOS arm64: 4.3e-4 prompt, 2.5e-4 empty, 7.7e-4
-        // long (sum order over 24 blocks; a wrong bucket or norm is
-        // near 1).
-        WARN("t5 " << name << ": max diff / row rms " << worst);
-        CHECK(worst <= 2e-3);
-        at = next;
     }
 }

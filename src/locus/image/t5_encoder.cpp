@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 
+#include "locus/image/dense.hpp"
 #include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
@@ -37,6 +38,11 @@ void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
 void linear(const backend::Ops& op, const backend::Mat& w,
             std::span<const float> x, std::uint32_t n,
             std::span<float> out) {
+    if (op.self_parallel && op.matvec_batch != nullptr) {
+        // A GPU: the whole matrix over every token in one call.
+        dense::linear(op, w, {}, x, n, out);
+        return;
+    }
     const std::uint32_t rows = w.rows, cols = w.cols;
     const std::uint32_t threads =
         std::max(1u, std::thread::hardware_concurrency());

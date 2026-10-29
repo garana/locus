@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "iq_grids.h"
+#include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
 #include "locus/backend/vulkan/limits.hpp"
@@ -1473,6 +1474,53 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
                    VulkanContext::matvec_groups(k, w.rows));
     s.end_batch();
     s.ctx.read_buffer(s.xb, std::as_writable_bytes(out));
+}
+
+void matvec_batch_vulkan(const Mat& w, std::span<const float> x,
+                         std::span<float> out, std::uint32_t n) {
+    if (n == 0) {
+        return;
+    }
+    if (matmul_kernel(w) == Kernel::kCount_ &&
+        matvec_kernel(w) == Kernel::kCount_) {
+        matvec_batch_scalar(w, x, out, n);  // no shader for this type
+        return;
+    }
+    const std::size_t rows = w.rows, cols = w.cols;
+    std::vector<float> tok(rows * n);
+    {
+        std::lock_guard lk(state_mu());
+        State& s = state();
+        auto wb = s.upload_w(w);
+        s.grow(s.x, s.x_n, cols * n);
+        s.grow(s.xb, s.xb_n, rows * n);
+        s.ctx.write_buffer(s.x, std::as_bytes(x.first(cols * n)));
+        s.ctx.begin_batch();
+        State::BatchScope batch_scope{s};
+        rec_matmul(s, w, wb, s.x, s.xb,
+                   MatmulRows{n, 0, w.cols, 0, w.rows}, false);
+        s.end_batch();
+        s.ctx.read_buffer(s.xb, std::as_writable_bytes(std::span(tok)));
+    }
+    // The GPU writes token-major; the matvec_batch contract is
+    // row-major (out[r * n + t]).
+    for (std::size_t t = 0; t < n; ++t) {
+        for (std::size_t r = 0; r < rows; ++r) {
+            out[r * n + t] = tok[t * rows + r];
+        }
+    }
+}
+
+const Ops& vulkan_image_ops() {
+    // Not the vulkan backend entry's Ops: that one leaves matvec_batch
+    // null so the language-model paths keep their own batching.
+    static const Ops ops{.matvec = &matvec_vulkan,
+                         .matvec_q8k = &matvec_q8k,
+                         .dequant_row = &dequant_row,
+                         .matvec_batch = &matvec_batch_vulkan,
+                         .self_parallel = true,
+                         .mt_safe = false};
+    return ops;
 }
 
 namespace {

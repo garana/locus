@@ -9,6 +9,7 @@
 #include "catch_amalgamated.hpp"
 #include "json.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/image/pixart_pipeline.hpp"
 #include "locus/image/png.hpp"
@@ -137,7 +138,11 @@ TEST_CASE("pixart pipeline draws the reference image",
     req.prompt = "A small red apple on a wooden table, soft morning light.";
     req.steps = 8;
     const auto x = read_f32(kDir + "golden/pixart/dit_in.f32");
-    const auto& op = locus::backend::best_backend().ops;
+    // The server's choice: the GPU when a Vulkan device is usable (the
+    // per-stage tests cover the CPU too).
+    const bool gpu = locus::backend::vulkan_backend_usable();
+    const auto& op = gpu ? locus::backend::vulkan_image_ops()
+                         : locus::backend::best_backend().ops;
     PixArtPipeline::Timing tm;
     const auto img = pipe->generate_from(x, req, op, {}, &tm);
     REQUIRE(img.size() == std::size_t{3} * 512 * 512);
@@ -163,7 +168,8 @@ TEST_CASE("pixart pipeline draws the reference image",
     }
     const double mse = se / (128.0 * 128 * 3);
     const double psnr = 10.0 * std::log10(255.0 * 255.0 / mse);
-    WARN("pixart pipeline: PSNR " << psnr << " dB vs the reference; T5 "
+    WARN("pixart pipeline (" << (gpu ? "vulkan" : "cpu") << "): PSNR "
+                             << psnr << " dB vs the reference; T5 "
                                   << tm.encode << " ms, denoise "
                                   << tm.denoise << " ms, VAE " << tm.decode
                                   << " ms; image at " << out.string());

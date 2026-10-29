@@ -91,6 +91,25 @@ void matvec_avx2(const Mat& w, std::span<const float> x,
 void matvec_vulkan(const Mat& w, std::span<const float> x,
                    std::span<float> out);
 
+/**
+ * matvec_batch on the GPU: w applied to n token-major inputs in one
+ * batched matmul dispatch (rec_matmul), output row-major
+ * (out[r * n + t]) as the Ops contract says. Weights are cached by
+ * host pointer like matvec_vulkan's, so pass only stable (mmapped)
+ * weights, never temporary host buffers.
+ */
+void matvec_batch_vulkan(const Mat& w, std::span<const float> x,
+                         std::span<float> out, std::uint32_t n);
+
+/**
+ * Ops for the image models (T5, PixArt DiT, VAE) on Vulkan: matvec and
+ * matvec_batch on the GPU, self_parallel, so dense::linear hands over
+ * whole matrices and all tokens at once. Kept apart from the vulkan
+ * backend entry, whose language-model paths do their own batching.
+ */
+struct Ops;
+const Ops& vulkan_image_ops();
+
 /** @returns true when a usable Vulkan device + kernels exist. */
 bool vulkan_backend_usable();
 
