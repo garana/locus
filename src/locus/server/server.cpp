@@ -19,6 +19,7 @@
 #include "locus/auth/helper_spawn.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/http/base64.hpp"
+#include "locus/backend/fallbacks.hpp"
 #include "locus/backend/gpu_metrics.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/image/image_input.hpp"
@@ -399,6 +400,24 @@ void render_gpu_metrics(MetricsText& mt) {
                      static_cast<double>(gm.held(kind)));
         }
     }
+}
+
+/**
+ * Writes locus_fallbacks_total{from,to,reason} (i#285): how often a
+ * faster path handed its work to a slower one. Only fallbacks that
+ * happened at least once have a series.
+ */
+void render_fallbacks(MetricsText& mt) {
+    mt.family("locus_fallbacks_total",
+              "Work a GPU path handed to a slower path, per reason.",
+              "counter");
+    backend::for_each_fallback([&](const backend::Fallback& f) {
+        mt.value("locus_fallbacks_total",
+                 MetricsText::label("from", f.from) + "," +
+                     MetricsText::label("to", f.to) + "," +
+                     MetricsText::label("reason", f.reason),
+                 static_cast<double>(f.n.load(std::memory_order_relaxed)));
+    });
 }
 
 /** @returns The --kv-type name of `t`, for the locus_info series. */
@@ -1336,6 +1355,7 @@ void OpenAiServer::install_routes() {
                 render_stage_metrics(mt, *sm);
             }
             render_gpu_metrics(mt);
+            render_fallbacks(mt);
             res.set_content(mt.text(), "text/plain; version=0.0.4");
     };
 
