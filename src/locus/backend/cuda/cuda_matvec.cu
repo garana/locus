@@ -1885,144 +1885,162 @@ __global__ void matvec_iq2_s_kernel(const std::uint8_t* w,
     out[r] = acc;
 }
 
-/** One IQ3_S super-block is 110 bytes: d | qs[64] | qh[8] | signs[32]
- *  | scales[4]. Two 32-groups per outer step; each element's 9-bit
- *  iq3s_grid index is a qs byte + one high bit from qh; grid entry is
- *  4 u8; signs raw. `grid` = device iq3s_grid (u32). Matches
- *  dequant_block_iq3_s. */
-__global__ void matvec_iq3_s_kernel(const std::uint8_t* w,
-                                    const std::uint32_t* grid,
-                                    const float* x, float* out,
-                                    std::uint32_t rows,
-                                    std::uint32_t cols) {
-    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) {
-        return;
+
+/**
+ * Copies `n16` 16-bit words of one super-block from global `src` into
+ * the warp's shared slice `dst`, consecutive lanes reading consecutive
+ * words (coalesced), then syncs the warp. The grid-quant super-blocks
+ * are only 2-byte aligned, so they are read as 16-bit words and then
+ * as bytes from shared memory at any offset.
+ */
+__device__ inline void warp_stage_u16(const std::uint16_t* src,
+                                      std::uint32_t n16,
+                                      std::uint16_t* dst,
+                                      std::uint32_t lane) {
+    for (std::uint32_t i = lane; i < n16; i += 32) {
+        dst[i] = __ldg(src + i);
     }
-    const std::uint32_t nsb = cols / 256;
-    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 110;
-    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
-                                      row_bytes;
-    float acc = 0.0f;
-    for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
-                                            110;
-        const float d = ld_f16(blk);
-        const std::uint8_t* qs = blk + 2;
-        const std::uint8_t* qh = blk + 66;
-        const std::uint8_t* signs = blk + 74;
-        const std::uint8_t* scales = blk + 106;
-        const float* xb = x + static_cast<std::size_t>(b) * 256;
-        float tmp[256];
-        float* y = tmp;
-        for (int ib32 = 0; ib32 < 8; ib32 += 2) {
-            const float db1 = d * (1 + 2 * (scales[ib32 / 2] & 0xf));
-            const float db2 = d * (1 + 2 * (scales[ib32 / 2] >> 4));
-            for (int l = 0; l < 4; ++l) {
-                const std::uint8_t* g1 =
-                    reinterpret_cast<const std::uint8_t*>(
-                        grid + (qs[2 * l] |
-                                ((qh[0] << (8 - 2 * l)) & 256)));
-                const std::uint8_t* g2 =
-                    reinterpret_cast<const std::uint8_t*>(
-                        grid + (qs[2 * l + 1] |
-                                ((qh[0] << (7 - 2 * l)) & 256)));
-                for (int j = 0; j < 4; ++j) {
-                    y[j] = db1 * g1[j] *
-                           ((signs[l] & (1 << j)) ? -1.0f : 1.0f);
-                    y[j + 4] =
-                        db1 * g2[j] *
-                        ((signs[l] & (1 << (j + 4))) ? -1.0f : 1.0f);
-                }
-                y += 8;
-            }
-            qs += 8;
-            signs += 4;
-            for (int l = 0; l < 4; ++l) {
-                const std::uint8_t* g1 =
-                    reinterpret_cast<const std::uint8_t*>(
-                        grid + (qs[2 * l] |
-                                ((qh[1] << (8 - 2 * l)) & 256)));
-                const std::uint8_t* g2 =
-                    reinterpret_cast<const std::uint8_t*>(
-                        grid + (qs[2 * l + 1] |
-                                ((qh[1] << (7 - 2 * l)) & 256)));
-                for (int j = 0; j < 4; ++j) {
-                    y[j] = db2 * g1[j] *
-                           ((signs[l] & (1 << j)) ? -1.0f : 1.0f);
-                    y[j + 4] =
-                        db2 * g2[j] *
-                        ((signs[l] & (1 << (j + 4))) ? -1.0f : 1.0f);
-                }
-                y += 8;
-            }
-            qh += 2;
-            qs += 8;
-            signs += 4;
-        }
-        for (int i = 0; i < 256; ++i) {
-            acc += tmp[i] * xb[i];
-        }
-    }
-    out[r] = acc;
+    __syncwarp();
 }
 
-/** One IQ3_XXS super-block is 98 bytes: d (f16) + qs[64] +
- *  scales_and_signs[32], 256 weights. Each 32-group picks 8 grid
- *  entries (4 u8 each) via qs and a sign byte; `grid` = device
- *  iq3xxs_grid (u32), `ksigns` = device ksigns_iq2xs. */
-__global__ void matvec_iq3_xxs_kernel(const std::uint8_t* w,
-                                      const std::uint32_t* grid,
-                                      const std::uint8_t* ksigns,
-                                      const float* x, float* out,
-                                      std::uint32_t rows,
-                                      std::uint32_t cols) {
-    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+/** Loads the 8 activations a grid-quant lane owns (two float4). */
+__device__ inline void lane_x8(const float* xb, float xs[8]) {
+    const float4 a = __ldg(reinterpret_cast<const float4*>(xb));
+    const float4 c = __ldg(reinterpret_cast<const float4*>(xb + 4));
+    xs[0] = a.x;
+    xs[1] = a.y;
+    xs[2] = a.z;
+    xs[3] = a.w;
+    xs[4] = c.x;
+    xs[5] = c.y;
+    xs[6] = c.z;
+    xs[7] = c.w;
+}
+
+/**
+ * One IQ3_XXS super-block is 98 bytes: d (f16) + qs[64] +
+ * scales_and_signs[32], 256 weights in 8 groups of 32, each group 4
+ * units of 8 (two 4-byte grid entries through qs, signs through
+ * ksigns). One warp per row: lane L owns group g = L / 4, unit
+ * l = L % 4, so the 32 lanes cover the 32 units of a super-block; each
+ * super-block is staged in shared memory first (warp_stage_u16).
+ * Each lane dequantizes its 8 weights as dequant_block_iq3_xxs does
+ * and accumulates them over the row, then the warp sums the lanes,
+ * so the result matches the CPU only to rounding. `grid` = device
+ * iq3xxs_grid (u32), `ksigns` = device ksigns_iq2xs. Launch with
+ * 32 * kWarpRows threads per block.
+ */
+__global__ void matvec_iq3_xxs_warp_kernel(const std::uint8_t* w,
+                                           const std::uint32_t* grid,
+                                           const std::uint8_t* ksigns,
+                                           const float* x, float* out,
+                                           std::uint32_t rows,
+                                           std::uint32_t cols) {
+    __shared__ std::uint16_t sw[kWarpRows][49];  // 98 bytes
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t r = blockIdx.x * kWarpRows + threadIdx.x / 32;
     if (r >= rows) {
-        return;
+        return;  // a whole warp leaves together: no partial shuffles
     }
+    std::uint16_t* mine = sw[threadIdx.x / 32];
+    const auto* sb = reinterpret_cast<const std::uint8_t*>(mine);
     const std::uint32_t nsb = cols / 256;
-    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 98;
-    const std::uint8_t* row = w + static_cast<std::size_t>(r) *
-                                      row_bytes;
+    const auto* row16 = reinterpret_cast<const std::uint16_t*>(
+        w + static_cast<std::size_t>(r) * nsb * 98);
+    const std::uint32_t g = lane / 4;
+    const std::uint32_t l = lane % 4;
     float acc = 0.0f;
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) *
-                                            98;
-        const float d = ld_f16(blk);
-        const std::uint8_t* qs = blk + 2;
-        const std::uint8_t* sas = blk + 2 + 64;
-        const float* xb = x + static_cast<std::size_t>(b) * 256;
-        float tmp[256];
-        float* y = tmp;
-        for (int ib32 = 0; ib32 < 8; ++ib32) {
-            const std::uint32_t aux = ld_u32(sas + 4 * ib32);
-            const float db = d * (0.5f + (aux >> 28)) * 0.5f;
-            for (int l = 0; l < 4; ++l) {
-                const std::uint8_t signs =
-                    ksigns[(aux >> (7 * l)) & 127];
-                const std::uint8_t* g1 =
-                    reinterpret_cast<const std::uint8_t*>(
-                        grid + qs[2 * l]);
-                const std::uint8_t* g2 =
-                    reinterpret_cast<const std::uint8_t*>(
-                        grid + qs[2 * l + 1]);
-                for (int j = 0; j < 4; ++j) {
-                    y[j] = db * g1[j] *
-                           ((signs & (1 << j)) ? -1.0f : 1.0f);
-                    y[j + 4] = db * g2[j] *
-                               ((signs & (1 << (j + 4))) ? -1.0f
-                                                         : 1.0f);
-                }
-                y += 8;
-            }
-            qs += 8;
+        warp_stage_u16(row16 + static_cast<std::size_t>(b) * 49, 49, mine,
+                       lane);
+        const float d = __half2float(__ushort_as_half(mine[0]));
+        const std::uint8_t* qs = sb + 2 + 8 * g;
+        // scales_and_signs word of group g (bytes 66 + 4g): words 33 + 2g.
+        const std::uint32_t aux =
+            static_cast<std::uint32_t>(mine[33 + 2 * g]) |
+            (static_cast<std::uint32_t>(mine[34 + 2 * g]) << 16);
+        const float db = d * (0.5f + (aux >> 28)) * 0.5f;
+        const std::uint32_t signs = __ldg(ksigns + ((aux >> (7 * l)) & 127));
+        const std::uint32_t g1 = __ldg(grid + qs[2 * l]);
+        const std::uint32_t g2 = __ldg(grid + qs[2 * l + 1]);
+        float xs[8];
+        lane_x8(x + static_cast<std::size_t>(b) * 256 + 32 * g + 8 * l, xs);
+        for (int j = 0; j < 4; ++j) {
+            const float y1 = db * static_cast<float>((g1 >> (8 * j)) & 0xff) *
+                             ((signs & (1u << j)) ? -1.0f : 1.0f);
+            const float y2 = db * static_cast<float>((g2 >> (8 * j)) & 0xff) *
+                             ((signs & (1u << (j + 4))) ? -1.0f : 1.0f);
+            acc += y1 * xs[j];
+            acc += y2 * xs[j + 4];
         }
-        for (int i = 0; i < 256; ++i) {
-            acc += tmp[i] * xb[i];
-        }
+        __syncwarp();  // the next stage overwrites this warp's slice
     }
-    out[r] = acc;
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        out[r] = acc;
+    }
+}
+
+/**
+ * One IQ3_S super-block is 110 bytes: d | qs[64] | qh[8] | signs[32] |
+ * scales[4], 256 weights in 8 groups of 32, each 4 units of 8. Unit
+ * l of group g takes grid entries qs[8g + 2l] and qs[8g + 2l + 1],
+ * each with a ninth index bit from qh[g] (bits 2l and 2l + 1), the
+ * sign byte signs[4g + l], and the scale nibble scales[g / 2] (low
+ * for even g). One warp per row, laid out as
+ * matvec_iq3_xxs_warp_kernel (lane L owns g = L / 4, l = L % 4; each
+ * super-block staged in shared memory). The result matches the CPU
+ * only to rounding. `grid` = device iq3s_grid (u32). Launch with
+ * 32 * kWarpRows threads per block.
+ */
+__global__ void matvec_iq3_s_warp_kernel(const std::uint8_t* w,
+                                         const std::uint32_t* grid,
+                                         const float* x, float* out,
+                                         std::uint32_t rows,
+                                         std::uint32_t cols) {
+    __shared__ std::uint16_t sw[kWarpRows][55];  // 110 bytes
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t r = blockIdx.x * kWarpRows + threadIdx.x / 32;
+    if (r >= rows) {
+        return;  // a whole warp leaves together: no partial shuffles
+    }
+    std::uint16_t* mine = sw[threadIdx.x / 32];
+    const auto* sb = reinterpret_cast<const std::uint8_t*>(mine);
+    const std::uint32_t nsb = cols / 256;
+    const auto* row16 = reinterpret_cast<const std::uint16_t*>(
+        w + static_cast<std::size_t>(r) * nsb * 110);
+    const std::uint32_t g = lane / 4;
+    const std::uint32_t l = lane % 4;
+    float acc = 0.0f;
+    for (std::uint32_t b = 0; b < nsb; ++b) {
+        warp_stage_u16(row16 + static_cast<std::size_t>(b) * 55, 55, mine,
+                       lane);
+        const float d = __half2float(__ushort_as_half(mine[0]));
+        const std::uint8_t* qs = sb + 2 + 8 * g;
+        const std::uint32_t qh = sb[66 + g];
+        const std::uint32_t signs = sb[74 + 4 * g + l];
+        const std::uint32_t sc = (sb[106 + g / 2] >> (4 * (g % 2))) & 0xf;
+        const float db = d * (1 + 2 * sc);
+        const std::uint32_t g1 =
+            __ldg(grid + (qs[2 * l] | ((qh << (8 - 2 * l)) & 256)));
+        const std::uint32_t g2 =
+            __ldg(grid + (qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)));
+        float xs[8];
+        lane_x8(x + static_cast<std::size_t>(b) * 256 + 32 * g + 8 * l, xs);
+        for (int j = 0; j < 4; ++j) {
+            const float y1 = db * static_cast<float>((g1 >> (8 * j)) & 0xff) *
+                             ((signs & (1u << j)) ? -1.0f : 1.0f);
+            const float y2 = db * static_cast<float>((g2 >> (8 * j)) & 0xff) *
+                             ((signs & (1u << (j + 4))) ? -1.0f : 1.0f);
+            acc += y1 * xs[j];
+            acc += y2 * xs[j + 4];
+        }
+        __syncwarp();  // the next stage overwrites this warp's slice
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) {
+        out[r] = acc;
+    }
 }
 
 /** TQ1_0 (54B): qs[48] | qh[4] | d. Ternary base-3 packing (5 digits
@@ -2803,11 +2821,13 @@ void launch_kernel(Kind kind, const void* dw,
                 dwb, t.g64, dxf, doutf, rows, cols);
             break;
         case Kind::kIQ3_S:
-            matvec_iq3_s_kernel<<<blocks, threads>>>(
+            matvec_iq3_s_warp_kernel<<<
+                (rows + kWarpRows - 1) / kWarpRows, 32 * kWarpRows>>>(
                 dwb, t.g32, dxf, doutf, rows, cols);
             break;
         case Kind::kIQ3_XXS:
-            matvec_iq3_xxs_kernel<<<blocks, threads>>>(
+            matvec_iq3_xxs_warp_kernel<<<
+                (rows + kWarpRows - 1) / kWarpRows, 32 * kWarpRows>>>(
                 dwb, t.g32, t.ksigns, dxf, doutf, rows, cols);
             break;
         case Kind::kIQ4_XS:
