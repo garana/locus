@@ -19,6 +19,7 @@
 #include "locus/auth/helper_spawn.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/http/base64.hpp"
+#include "locus/backend/gpu_metrics.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/image/image_input.hpp"
 #include "locus/image/janus.hpp"
@@ -317,6 +318,79 @@ void render_stage_metrics(MetricsText& mt, const model::StageMetrics& sm) {
                      MetricsText::label("layer", std::to_string(l)) + "," +
                          stage,
                      secs(sm.ns(l, s)));
+        }
+    }
+}
+
+/**
+ * Writes the GPU counters (i#285) of each API this process used: its
+ * submits, kernels, host recording and wait time, device time and the
+ * memory it holds per kind. An API with no submits and no memory is
+ * left out.
+ */
+void render_gpu_metrics(MetricsText& mt) {
+    using backend::GpuApi;
+    using backend::MemKind;
+    constexpr auto kRelaxed = std::memory_order_relaxed;
+    const auto secs = [](std::uint64_t ns) {
+        return static_cast<double>(ns) / 1e9;
+    };
+    std::vector<GpuApi> used;
+    for (int a = 0; a < static_cast<int>(GpuApi::kCount); ++a) {
+        const backend::GpuMetrics& gm =
+            backend::gpu_metrics(static_cast<GpuApi>(a));
+        bool any = gm.submits.load(kRelaxed) != 0;
+        for (int k = 0; k < static_cast<int>(MemKind::kCount); ++k) {
+            any = any || gm.held(static_cast<MemKind>(k)) != 0;
+        }
+        if (any) used.push_back(static_cast<GpuApi>(a));
+    }
+    if (used.empty()) return;
+    const auto api = [](GpuApi a) {
+        return MetricsText::label("api", backend::gpu_api_name(a));
+    };
+    const auto counter = [&](const char* name, const char* help,
+                             auto get) {
+        mt.family(name, help, "counter");
+        for (const GpuApi a : used) {
+            mt.value(name, api(a), get(backend::gpu_metrics(a)));
+        }
+    };
+    counter("locus_gpu_submits_total",
+            "Command batches (vulkan) or synchronizing calls (cuda).",
+            [&](const backend::GpuMetrics& gm) {
+                return static_cast<double>(gm.submits.load(kRelaxed));
+            });
+    counter("locus_gpu_dispatches_total", "Kernels recorded (vulkan).",
+            [&](const backend::GpuMetrics& gm) {
+                return static_cast<double>(gm.dispatches.load(kRelaxed));
+            });
+    counter("locus_gpu_record_seconds_total",
+            "Host time recording batches, begin to submit (vulkan).",
+            [&](const backend::GpuMetrics& gm) {
+                return secs(gm.record_ns.load(kRelaxed));
+            });
+    counter("locus_gpu_wait_seconds_total",
+            "Host time from submit until the device is done.",
+            [&](const backend::GpuMetrics& gm) {
+                return secs(gm.wait_ns.load(kRelaxed));
+            });
+    counter("locus_gpu_device_seconds_total",
+            "Device time by GPU timestamps, first to last command (vulkan).",
+            [&](const backend::GpuMetrics& gm) {
+                return secs(gm.device_ns.load(kRelaxed));
+            });
+    mt.family("locus_gpu_memory_bytes",
+              "Device memory this process holds, per kind.", "gauge");
+    for (const GpuApi a : used) {
+        const backend::GpuMetrics& gm = backend::gpu_metrics(a);
+        for (int k = 0; k < static_cast<int>(MemKind::kCount); ++k) {
+            const auto kind = static_cast<MemKind>(k);
+            mt.value("locus_gpu_memory_bytes",
+                     api(a) + "," +
+                         MetricsText::label("kind",
+                                            backend::mem_kind_name(kind)),
+                     static_cast<double>(gm.held(kind)));
         }
     }
 }
@@ -1255,6 +1329,7 @@ void OpenAiServer::install_routes() {
             if (const model::StageMetrics* sm = model_.stage_metrics()) {
                 render_stage_metrics(mt, *sm);
             }
+            render_gpu_metrics(mt);
             res.set_content(mt.text(), "text/plain; version=0.0.4");
     };
 

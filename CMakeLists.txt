@@ -17,6 +17,7 @@ add_library(locus
     src/locus/backend/matvec_sse4.cpp
     src/locus/backend/matvec_vulkan.cpp
     src/locus/backend/cuda_stub.cpp
+    src/locus/backend/gpu_metrics.cpp
     src/locus/backend/registry.cpp
     src/locus/backend/vulkan/context.cpp
     src/locus/chat/template.cpp

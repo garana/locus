@@ -170,7 +170,7 @@ struct State {
 
     State() {
         pool.create = [this](std::size_t n) {
-            return ctx.create_buffer(n);
+            return ctx.create_buffer(n, MemKind::kWeights);
         };
         pool.destroy = [this](VulkanContext::Buffer b) {
             ctx.destroy_buffer(b);
@@ -578,7 +578,7 @@ struct State {
         if (!ready) {
             const std::size_t gsz = sizeof(grid);
             const std::size_t ssz = sizeof(::ksigns_iq2xs);
-            buf = ctx.create_buffer(gsz + ssz);
+            buf = ctx.create_buffer(gsz + ssz, MemKind::kTable);
             auto* p = static_cast<std::byte*>(ctx.mapped(buf));
             std::memcpy(p, &grid[0], gsz);
             std::memcpy(p + gsz, ::ksigns_iq2xs, ssz);
@@ -610,7 +610,7 @@ struct State {
             if (ones_n != 0) {
                 ctx.destroy_buffer(ones);
             }
-            ones = ctx.create_buffer(half_dim * 4);
+            ones = ctx.create_buffer(half_dim * 4, MemKind::kTable);
             auto* p = static_cast<float*>(ctx.mapped(ones));
             for (std::uint32_t i = 0; i < half_dim; ++i) {
                 p[i] = 1.0f;
@@ -1476,7 +1476,7 @@ bool vulkan_backend_usable() {
 float* vulkan_alloc_kv(std::size_t n_floats) {
     std::lock_guard lk(state_mu());
     State& s = state();
-    auto buf = s.ctx.create_buffer(n_floats * 4);
+    auto buf = s.ctx.create_buffer(n_floats * 4, MemKind::kKv);
     void* map = s.ctx.mapped(buf);
     std::memset(map, 0, n_floats * 4);
     s.kv_pools.emplace(map, buf);

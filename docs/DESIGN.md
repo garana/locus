@@ -482,7 +482,16 @@ guarding the default path.
   it is always on; decode speed on llama-3.2-1b Q8_0 is unchanged
   within noise. These are host times. Vulkan runs the whole model as
   one submit, so its time goes to `stage="device"`; CUDA works per op,
-  so a stage's time includes its wait for the device.
+  so a stage's time includes its wait for the device. Each GPU API
+  the process used adds, with an `api` label: `locus_gpu_submits_total`
+  (Vulkan batches, or CUDA synchronizing calls),
+  `locus_gpu_dispatches_total` (Vulkan kernels),
+  `locus_gpu_record_seconds_total` (Vulkan batch begin to submit),
+  `locus_gpu_wait_seconds_total` (submit until the device is done),
+  `locus_gpu_device_seconds_total` (two GPU timestamps per Vulkan
+  batch) and `locus_gpu_memory_bytes{kind}` (weights, mapped, kv,
+  scratch, table; `mapped` is weights the device reads in place from
+  the file map). The timestamps cost nothing measurable on decode.
 - KV-cache quantization: Q8 or Q4 blocks of 32 (f16 scale) in a
   separate byte pool, for the llama-family attention. Each layer's
   past rows are dequantized into scratch, so the attention math is the
