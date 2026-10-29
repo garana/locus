@@ -37,13 +37,17 @@ yet (each is a 400).
 `/v1/images/generations` returns one PNG as `b64_json`, from either
 model the server loaded:
 
-| Model           | Server flag                    | Image   | Extra fields (defaults)                                                    |
-|-----------------|--------------------------------|---------|----------------------------------------------------------------------------|
-| Janus-Pro-1B    | `--image-decoder <vq16.gguf>`  | 384x384 | `cfg` (5), `temperature` (1; 0 = argmax), `seed` (random)                  |
-| PixArt-alpha    | `--image-model <dir>`          | 512x512 | `steps` (20, up to 100), `guidance_scale` (4.5), `seed`, `negative_prompt` |
+| Model           | Server flag                    | Image   | Extra fields (defaults)                                                             |
+|-----------------|--------------------------------|---------|-------------------------------------------------------------------------------------|
+| Janus-Pro-1B    | `--image-decoder <vq16.gguf>`  | 384x384 | `cfg` (5), `temperature` (1; 0 = argmax), `seed` (random)                           |
+| PixArt-alpha    | `--image-model <dir>`          | 512x512 | `steps` (20, up to 100), `guidance_scale` (4.5), `seed` (random), `negative_prompt` |
 
 A request whose `model` starts with `pixart` goes to PixArt, and so
-does every request when no Janus model is loaded. `n` must be 1,
+does every request unless both a Janus-Pro model and its
+`--image-decoder` are loaded. The seed used comes back in the
+`X-Image-Seed` response header; send it again to repeat an image (with
+the OpenAI SDK, `client.images.with_raw_response.generate(...)` gives
+the headers). `n` must be 1,
 `size` must be the model's, and `response_format` must be `b64_json`
 (others are a 400). The PixArt directory holds the three GGUFs from
 `scripts/convert-t5-encoder.py`, `convert-pixart.py` and
