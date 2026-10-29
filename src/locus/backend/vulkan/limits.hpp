@@ -60,6 +60,27 @@ constexpr bool attn_grp_dv_fits(std::uint32_t dv) {
 }
 
 /**
+ * Whether kv_scatter_f16 can write rows of `width` floats with these
+ * destination terms: it packs pairs of floats into one pool word at
+ * (dst + i) >> 1, so width must be even (an odd one reads one float
+ * past the row and writes it into the pair's high half), and so must
+ * every term of dst (block_stride, row_w, dst_off, dst_plane), or the
+ * write lands half a word off and interleaves K and V halves (i#131).
+ * Every real shape is even: kv_dim = n_kv_heads * an even head_dim,
+ * the MLA row rank + rope_d with both even, and layer_stride / 2 =
+ * kv_dim.
+ *
+ * @returns Whether all five are even.
+ */
+constexpr bool kv_scatter_f16_fits(std::uint32_t width,
+                                   std::uint32_t block_stride,
+                                   std::uint32_t row_w,
+                                   std::uint32_t dst_off,
+                                   std::uint32_t dst_plane) {
+    return (width | block_stride | row_w | dst_off | dst_plane) % 2 == 0;
+}
+
+/**
  * Whether a row segment of matvec_q8_0_seg can be roped in its
  * epilogue: the segment is whole heads (n_rows % hs == 0) of hs rows
  * whose rd rows from ro on rotate, with hs, ro and rd even and the

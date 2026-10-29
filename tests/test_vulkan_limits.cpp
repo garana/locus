@@ -7,6 +7,7 @@ using locus::backend::vk::gpu_alloc_bytes;
 using locus::backend::vk::attn_grp_dv_fits;
 using locus::backend::vk::kAttnGrpDvMax;
 using locus::backend::vk::kAttnPartMax;
+using locus::backend::vk::kv_scatter_f16_fits;
 using locus::backend::vk::seg_rope_fits;
 
 TEST_CASE("attention head widths are bounded by the shared stage",
@@ -58,4 +59,18 @@ TEST_CASE("segmented matvec rope specs keep the epilogue's pairing",
     REQUIRE_FALSE(seg_rope_fits(4096, 128, 0, 63));   // odd width
     REQUIRE_FALSE(seg_rope_fits(4096, 128, 96, 64));  // past the head
     REQUIRE_FALSE(seg_rope_fits(4095, 65, 0, 64));    // odd head rows
+}
+
+TEST_CASE("kv_scatter_f16 needs every packed term even", "[vulkan]") {
+    // GQA K/V rows (kv_dim 512, a layer's V plane kv_dim on) and the
+    // MLA latent row (rank 512 + rope 64): the real shapes.
+    REQUIRE(kv_scatter_f16_fits(512, 16 * 2 * 512 * 48, 512, 3 * 16384,
+                                512));
+    REQUIRE(kv_scatter_f16_fits(576, 16 * 576 * 27, 576, 0, 0));
+    // Any one odd term shifts the pair packing.
+    REQUIRE_FALSE(kv_scatter_f16_fits(513, 1024, 512, 0, 0));
+    REQUIRE_FALSE(kv_scatter_f16_fits(512, 1023, 512, 0, 0));
+    REQUIRE_FALSE(kv_scatter_f16_fits(512, 1024, 511, 0, 0));
+    REQUIRE_FALSE(kv_scatter_f16_fits(512, 1024, 512, 1, 0));
+    REQUIRE_FALSE(kv_scatter_f16_fits(512, 1024, 512, 0, 513));
 }

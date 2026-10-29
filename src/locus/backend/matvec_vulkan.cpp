@@ -1050,6 +1050,27 @@ void rec_bias(State& s, std::span<const float> bias,
 }
 
 /**
+ * Dispatches kv_scatter (or kv_scatter_f16) with push p in the
+ * shader's layout (width, pos0, block_tokens, block_stride, row_w,
+ * dst_off, src_off, src_stride, src_plane, dst_plane) over a
+ * (1, rows, planes) grid. The f16 build first checks its even-pair
+ * invariant (vk::kv_scatter_f16_fits).
+ * @throws std::logic_error when an f16 scatter's terms are not even.
+ */
+void rec_kv_scatter(State& s, bool f16,
+                    std::span<const VulkanContext::Buffer> bufs,
+                    std::span<const std::uint32_t, 10> p,
+                    std::uint32_t rows, std::uint32_t planes) {
+    if (f16 && !vk::kv_scatter_f16_fits(p[0], p[3], p[4], p[5], p[9])) {
+        throw std::logic_error(
+            "kv_scatter_f16: width, block_stride, row_w, dst_off and "
+            "dst_plane must be even");
+    }
+    s.ctx.dispatch(f16 ? Kernel::kKvScatterF16 : Kernel::kKvScatter, bufs,
+                   p, 1, rows, planes);
+}
+
+/**
  * @returns The most MOE_ID matmul token tiles n_tok tokens' n_tok * k
  * pairs can fill across n_expert experts: every expert's last tile
  * may be partial, so ceil(pairs / tile) + n_expert, and never more
@@ -1993,8 +2014,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                         block_stride, kv_dim,  l * layer_stride,
                         0,      kv_dim,        kv_dim,
                         layer_stride / 2};
-                    s.ctx.dispatch(Kernel::kKvScatterF16, bufs, push, 1,
-                                   1, 2);
+                    rec_kv_scatter(s, true, bufs, push, 1, 2);
                 }
                 rec_attn_gqa(s, pp, s.q, s.att, s.attout, 1, pos,
                              hp.n_heads, group, hp.head_dim,
@@ -2137,7 +2157,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     block_stride,  kv_dim,   l * layer_stride,
                     0,             0,        0,
                     0};
-                s.ctx.dispatch(Kernel::kKvScatterF16, bufs, push, 1);
+                rec_kv_scatter(s, true, bufs, push, 1, 1);
             }
             // Per-head weight absorption, all heads per dispatch
             // where a batched kernel exists (head h = slot h).
@@ -2815,8 +2835,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                                       kv_dim,       dst_off,
                                       0,            width,
                                       0,            0};
-        s.ctx.dispatch(f16 ? Kernel::kKvScatterF16 : Kernel::kKvScatter,
-                       bufs, push, 1, n);
+        rec_kv_scatter(s, f16, bufs, push, n, 1);
     };
     auto silu_rows = [&](std::size_t count) {
         const VulkanContext::Buffer bufs[] = {bgate, bup, bgate};
