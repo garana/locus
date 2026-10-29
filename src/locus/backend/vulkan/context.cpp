@@ -1559,6 +1559,19 @@ std::uint64_t VulkanContext::memory_available() const {
                                  im.allocated);
 }
 
+std::uint64_t VulkanContext::memory_used() const {
+    const Impl& im = *impl_;
+    if (!im.has_budget) return im.allocated;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 props{};
+    props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    props.pNext = &budget;
+    vkGetPhysicalDeviceMemoryProperties2(im.phys, &props);
+    return budget.heapUsage[im.host_heap()];
+}
+
 void VulkanContext::note_token() { ++impl_->prof.tokens; }
 
 const VulkanContext::Profile& VulkanContext::profile() const {
@@ -1686,6 +1699,7 @@ void VulkanContext::dispatch(Kernel, std::span<const Buffer>,
 void VulkanContext::end_batch() { no_kernels(); }
 void VulkanContext::note_token() { no_kernels(); }
 std::uint64_t VulkanContext::memory_available() const { no_kernels(); }
+std::uint64_t VulkanContext::memory_used() const { no_kernels(); }
 bool VulkanContext::serial_dispatch() const { no_kernels(); }
 bool VulkanContext::has_f16() const { no_kernels(); }
 const VulkanContext::Profile& VulkanContext::profile() const {
