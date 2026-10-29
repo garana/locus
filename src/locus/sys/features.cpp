@@ -1,6 +1,9 @@
 #include "locus/sys/features.hpp"
 
 #include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iterator>
 
 #if defined(LOCUS_HAS_VULKAN)
 #include <vulkan/vulkan.h>
@@ -39,6 +42,49 @@ unsigned performance_cores() {
     }
 #endif
     return 0;
+}
+
+namespace {
+
+/** @returns s without leading and trailing spaces, tabs and NULs. */
+std::string trim(std::string s) {
+    const auto keep = [](char c) {
+        return c != ' ' && c != '\t' && c != '\n' && c != '\0';
+    };
+    std::size_t b = 0, e = s.size();
+    while (b < e && !keep(s[b])) ++b;
+    while (e > b && !keep(s[e - 1])) --e;
+    return s.substr(b, e - b);
+}
+
+}  // namespace
+
+std::string cpu_name() {
+#if defined(__APPLE__)
+    char buf[256] = {};
+    std::size_t len = sizeof(buf);
+    if (sysctlbyname("machdep.cpu.brand_string", buf, &len, nullptr, 0) ==
+            0 &&
+        len > 0) {
+        return trim(std::string(buf, std::strlen(buf)));
+    }
+    return "";
+#else
+    std::ifstream cpuinfo("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(cpuinfo, line)) {
+        if (line.rfind("model name", 0) == 0) {
+            const std::size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                return trim(line.substr(colon + 1));
+            }
+        }
+    }
+    std::ifstream board("/proc/device-tree/model");
+    std::string model((std::istreambuf_iterator<char>(board)),
+                      std::istreambuf_iterator<char>());
+    return trim(model);
+#endif
 }
 
 std::string to_string(const Features& f) {

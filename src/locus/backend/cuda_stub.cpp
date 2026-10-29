@@ -31,6 +31,8 @@ void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
 
 bool cuda_backend_usable() { return false; }
 
+std::string cuda_device_name() { return ""; }
+
 void cuda_set_device(int ordinal) {
     // Fail loud: a GPU executor was requested on a build with no CUDA
     // toolkit. Never silently fall back to the CPU (i#24 inc 4).

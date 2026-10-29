@@ -18,7 +18,7 @@ own docs.
 | POST /v1/messages             | Anthropic | Messages API, SSE stream, tools, images     |
 | POST /v1/responses            | OpenAI    | Responses API, stateless, SSE stream, tools |
 | GET  /health                  |           | liveness                                    |
-| GET  /metrics                 |           | Prometheus text; per-route HTTP series      |
+| GET  /metrics                 |           | Prometheus text; HTTP, stage, layer, device |
 
 The chat endpoints and `/v1/responses` accept a `tools` list and
 return structured tool calls (OpenAI `tool_calls`, Anthropic

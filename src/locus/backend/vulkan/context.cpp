@@ -690,6 +690,7 @@ struct VulkanContext::Impl {
 
     /** Device maxComputeSharedMemorySize (bytes), read at init. */
     std::uint32_t max_shared_mem = 0;
+    std::string device_name;  ///< VkPhysicalDeviceProperties::deviceName
     /** Whether the matmul smaller-tile step-down has been logged. */
     bool matmul_stepdown_logged = false;
     std::chrono::steady_clock::time_point batch_t0;
@@ -958,6 +959,7 @@ struct VulkanContext::Impl {
             VkPhysicalDeviceProperties pp;
             vkGetPhysicalDeviceProperties(phys, &pp);
             max_shared_mem = pp.limits.maxComputeSharedMemorySize;
+            device_name = pp.deviceName;
         }
         if (!has_f16) {
             static bool told = false;
@@ -1539,6 +1541,10 @@ bool VulkanContext::serial_dispatch() const {
 
 bool VulkanContext::has_f16() const { return impl_->has_f16; }
 
+const std::string& VulkanContext::device_name() const {
+    return impl_->device_name;
+}
+
 std::uint64_t VulkanContext::memory_available() const {
     const Impl& im = *impl_;
     const std::uint32_t heap = im.host_heap();
@@ -1702,6 +1708,7 @@ std::uint64_t VulkanContext::memory_available() const { no_kernels(); }
 std::uint64_t VulkanContext::memory_used() const { no_kernels(); }
 bool VulkanContext::serial_dispatch() const { no_kernels(); }
 bool VulkanContext::has_f16() const { no_kernels(); }
+const std::string& VulkanContext::device_name() const { no_kernels(); }
 const VulkanContext::Profile& VulkanContext::profile() const {
     no_kernels();
 }

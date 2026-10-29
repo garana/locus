@@ -1219,6 +1219,21 @@ TEST_CASE("metrics carry labels and timings in well-formed histograms",
     REQUIRE(series("locus_http_request_seconds_count",
                    "route=\"/v1/embeddings\"") == 0);
     REQUIRE(metric_value(b, "locus_http_requests_in_flight") == 1);
+
+    // The forward's time per stage and per (layer, stage), and the
+    // hardware (i#285). stories260K is a dense llama: no moe series.
+    REQUIRE(series("locus_stage_seconds_total", "stage=\"attention\"") > 0);
+    REQUIRE(series("locus_stage_seconds_total", "stage=\"ffn\"") > 0);
+    REQUIRE(series("locus_stage_seconds_total", "stage=\"head\"") > 0);
+    REQUIRE(series("locus_stage_seconds_total", "stage=\"sample\"") > 0);
+    REQUIRE(series("locus_stage_seconds_total", "stage=\"moe\"") == 0);
+    REQUIRE(series("locus_layer_seconds_total",
+                   "layer=\"0\",stage=\"attention\"") > 0);
+    REQUIRE(b.find("locus_layer_seconds_total{" + labels +
+                   ",layer=\"0\",stage=\"moe\"}") == std::string::npos);
+    REQUIRE(b.find(",cpu=\"") != std::string::npos);
+    REQUIRE(b.find("locus_device_info{" + labels + ",kind=\"cpu\",name=\"") !=
+            std::string::npos);
 }
 
 // Follow-up to i#81 (cancel on disconnect) / i#85 + i#88 (fast-path

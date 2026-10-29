@@ -61,6 +61,7 @@ add_library(locus
     src/locus/model/grammar.cpp
     src/locus/model/transformer.cpp
     src/locus/model/moe_stats.cpp
+    src/locus/model/stage_metrics.cpp
     src/locus/model/sampling.cpp
     src/locus/model/speculative.cpp
     src/locus/pipeline/driver.cpp

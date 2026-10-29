@@ -1682,6 +1682,14 @@ bool vulkan_imports_host_memory() {
     return state().ctx.host_import();
 }
 
+std::string vulkan_device_name() {
+    if (!vulkan_backend_usable()) {
+        return "";
+    }
+    std::lock_guard lk(state_mu());
+    return state().ctx.device_name();
+}
+
 namespace {
 
 /**
