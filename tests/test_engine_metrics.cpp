@@ -61,7 +61,9 @@ TEST_CASE("metrics text renders labelled families", "[metrics]") {
     Histogram bytes(bounds, 1.0);  // observations in bytes, rendered as is
     bytes.observe(100);
     bytes.observe(5000);
-    MetricsText mt({{"model", "m"}});
+    // One label: spelled as a vector, since GCC finds {{"k", "v"}}
+    // ambiguous with MetricsText's copy and move constructors.
+    MetricsText mt(std::vector<MetricsText::Label>{{"model", "m"}});
     mt.family("r_total", "R.", "counter");
     mt.value("r_total", MetricsText::label("route", "/a\"b"),
              std::uint64_t{2});
