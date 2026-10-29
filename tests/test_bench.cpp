@@ -168,3 +168,55 @@ TEST_CASE("bench: out_w_ n x matvec_cuda vs matvec_batch_cuda",
     }
     SUCCEED();
 }
+
+// Per-type CUDA matvec time for the IQ quants on a 4096 x 4096 weight
+// (fully resident). The wall time includes the per-call copies and
+// sync; run it under nsys for kernel-only times. Random bytes with a
+// small f16 at offset 0: values are meaningless, only the time counts.
+TEST_CASE("bench: cuda iq matvec", "[.][bench][cuda]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no CUDA device or non-CUDA build");
+    }
+    using TT = locus::gguf::TensorType;
+    struct Q {
+        TT type;
+        const char* name;
+        std::uint32_t block;  // weights per block
+        std::size_t bytes;    // bytes per block
+    };
+    const std::uint32_t rows = 4096, cols = 4096;
+    std::mt19937 rng(13);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> x(cols), out(rows);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    const int iters = 50;
+    for (const Q& q : {Q{TT::kIQ4_XS, "IQ4_XS", 256, 136},
+                       Q{TT::kIQ4_NL, "IQ4_NL", 32, 18},
+                       Q{TT::kIQ3_XXS, "IQ3_XXS", 256, 98},
+                       Q{TT::kIQ3_S, "IQ3_S", 256, 110},
+                       Q{TT::kIQ2_XXS, "IQ2_XXS", 256, 66},
+                       Q{TT::kIQ2_XS, "IQ2_XS", 256, 74},
+                       Q{TT::kIQ2_S, "IQ2_S", 256, 82},
+                       Q{TT::kIQ1_S, "IQ1_S", 256, 50},
+                       Q{TT::kIQ1_M, "IQ1_M", 256, 56}}) {
+        const std::size_t nblk =
+            static_cast<std::size_t>(rows) * (cols / q.block);
+        std::vector<std::byte> w(nblk * q.bytes);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < nblk; ++bl) {
+            const std::uint16_t d = f32_to_f16(0.01f);
+            std::memcpy(w.data() + bl * q.bytes, &d, 2);
+        }
+        Mat m{q.type, w.data(), rows, cols};
+        cuda_pool_reset();
+        const double ns = time_matvec(&matvec_cuda, m, x, out, iters);
+        WARN("cuda " << q.name << " 4096x4096: " << ns / 1000.0
+                     << " us per matvec");
+    }
+    SUCCEED();
+}
