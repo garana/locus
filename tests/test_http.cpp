@@ -298,6 +298,17 @@ TEST_CASE("write_response round-trips and sets framing", "[http]") {
     REQUIRE(out.find("Content-Length: 11\r\n") != std::string::npos);
     REQUIRE(out.find("Connection: keep-alive\r\n") != std::string::npos);
     REQUIRE(out.find("\r\n\r\n{\"ok\":true}") != std::string::npos);
+    // Every status a handler sets has a reason phrase; one without is
+    // refused (the server then answers 500).
+    for (const int s : {400, 401, 404, 409, 413, 499, 501, 503}) {
+        INFO(s);
+        res.status = s;
+        out.clear();
+        REQUIRE(write_response(res, false, true, out, err));
+    }
+    res.status = 418;
+    out.clear();
+    REQUIRE_FALSE(write_response(res, false, true, out, err));
 }
 
 TEST_CASE("write_response: HEAD omits the body but keeps Content-Length",

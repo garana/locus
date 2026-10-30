@@ -1,9 +1,13 @@
 #include "locus/server/server.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <fstream>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -28,6 +32,7 @@
 #include "locus/image/janus_chat.hpp"
 #include "locus/image/janus_vision.hpp"
 #include "locus/image/flux_pipeline.hpp"
+#include "locus/image/ltxv_pipeline.hpp"
 #include "locus/image/pixart_pipeline.hpp"
 #include "locus/image/png.hpp"
 #include "locus/image/vq16.hpp"
@@ -40,6 +45,7 @@
 #include "locus/server/tools.hpp"
 #include "locus/sys/features.hpp"
 #include "locus/sys/perf_counters.hpp"
+#include "locus/video/jobs.hpp"
 
 namespace locus::server {
 
@@ -765,6 +771,25 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             }
         }
     }
+    // Video (--video-model): a broken directory stops the server; a
+    // missing ffmpeg only turns the video routes into 501s.
+    if (!opt_.video_model_dir.empty()) {
+        ltxv_ = image::LtxvPipeline::load_dir(opt_.video_model_dir);
+        ffmpeg_ = video::probe_ffmpeg(opt_.ffmpeg_path);
+        if (!ffmpeg_) {
+            std::fprintf(stderr,
+                         "warning: no usable ffmpeg at \"%s\" (--ffmpeg); "
+                         "/v1/videos will answer 501\n",
+                         opt_.ffmpeg_path.c_str());
+        }
+        // At most 4 clips queued or running; a finished one is kept an
+        // hour.
+        video_jobs_ = std::make_unique<video::VideoJobs>(
+            (std::filesystem::temp_directory_path() /
+             ("locus-videos-" + std::to_string(::getpid())))
+                .string(),
+            4, 3600);
+    }
     // Image input (i#241): on when the model's GGUF carries the Janus
     // vision tower. A tower that is present but broken stops the
     // server here, like the image heads above.
@@ -1111,6 +1136,20 @@ OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
             path.size() > kModelsPrefix.size()) {
             return Route::kModelById;
         }
+        // /v1/videos/{id} and /v1/videos/{id}/content; an id has no '/'.
+        static const std::string kVideosPrefix = "/v1/videos/";
+        static const std::string kContent = "/content";
+        if (path.rfind(kVideosPrefix, 0) == 0) {
+            std::string_view rest(path);
+            rest.remove_prefix(kVideosPrefix.size());
+            const bool content =
+                rest.size() > kContent.size() &&
+                rest.substr(rest.size() - kContent.size()) == kContent;
+            if (content) rest.remove_suffix(kContent.size());
+            if (!rest.empty() && rest.find('/') == std::string_view::npos) {
+                return content ? Route::kVideoContent : Route::kVideoById;
+            }
+        }
         return Route::kUnknown;
     }
     if (method == "POST") {
@@ -1137,6 +1176,9 @@ OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
         }
         if (path == "/v1/images/edits") {
             return Route::kImageEdits;
+        }
+        if (path == "/v1/videos") {
+            return Route::kVideos;
         }
         return Route::kUnknown;
     }
@@ -3121,12 +3163,300 @@ void OpenAiServer::install_routes() {
         handle_flux(req, res, ctx, true);
     };
 
+    // /v1/videos (i#384), as OpenAI's Videos API shapes it: POST starts
+    // an LTX-Video job, GET /v1/videos/{id} reports it, and GET
+    // /v1/videos/{id}/content returns the MP4, which ffmpeg encodes. 503
+    // without --video-model; 501 without a usable ffmpeg.
+    const auto video_json = [](const video::VideoJob& j) {
+        return json{
+            {"id", j.id},
+            {"object", "video"},
+            {"model", j.model},
+            {"status", j.status},
+            {"progress", j.progress},
+            {"created_at", j.created_at},
+            {"completed_at", j.completed_at ? json(j.completed_at) : json()},
+            {"expires_at", j.expires_at ? json(j.expires_at) : json()},
+            {"size", j.size},
+            {"seconds", j.seconds},
+            {"prompt", j.prompt},
+            {"remixed_from_video_id", nullptr},
+            {"error", j.error.empty()
+                          ? json()
+                          : json{{"code", "video_generation_failed"},
+                                 {"message", j.error}}}};
+    };
+    const auto not_implemented = [](http::ServerResponse& res,
+                                    const std::string& message) {
+        res.status = 501;
+        res.set_content(json{{"error", {{"message", message},
+                                        {"type", "server_error"}}}}
+                            .dump(-1, ' ', false, kLossy),
+                        "application/json");
+    };
+    const auto videos_on = [this, not_implemented](
+                               http::ServerResponse& res) {
+        if (!video_jobs_) {
+            set_unavailable(res, "video generation is not configured "
+                                 "(needs --video-model)");
+            return false;
+        }
+        if (!ffmpeg_) {
+            not_implemented(res, "video needs ffmpeg to encode the MP4: "
+                                 "install it, or point --ffmpeg at it");
+            return false;
+        }
+        return true;
+    };
+    const auto video_not_found = [](http::ServerResponse& res,
+                                    const std::string& id) {
+        res.status = 404;
+        res.set_content(make_error("no video " + id).dump(-1, ' ', false,
+                                                          kLossy),
+                        "application/json");
+    };
+    // The {id} of /v1/videos/{id}[/content] (route_of checked the shape).
+    const auto video_id = [](const std::string& path) {
+        std::string id = path.substr(std::string("/v1/videos/").size());
+        const std::size_t slash = id.find('/');
+        if (slash != std::string::npos) id.resize(slash);
+        return id;
+    };
+
+    // POST /v1/videos: prompt, size ("WxH", multiples of 32 up to 1280;
+    // default 512x320), seconds (a string, as OpenAI sends it, or a
+    // number; default 2), input_reference.image_url (a data: URL: the
+    // first frame), and locus's fps (default 30), sampling ("stochastic",
+    // the default, or "deterministic") and seed. The clip has 8 k + 1
+    // frames, k = round(seconds * fps / 8), at most 257.
+    auto handle_videos = [this, video_json, videos_on, not_implemented](
+                             const http::Request& req,
+                             http::ServerResponse& res,
+                             const http::RequestContext& ctx) {
+        auth_event("create", "videos", ctx.identity);
+        if (!videos_on(res)) return;
+        try {
+            const json body = json::parse(req.body);
+            if (!body.is_object()) {
+                throw std::invalid_argument("the body must be a JSON object");
+            }
+            image::LtxvPipeline::Request p;
+            if (!body.contains("prompt") || !body["prompt"].is_string() ||
+                body["prompt"].get<std::string>().empty()) {
+                throw std::invalid_argument(
+                    "prompt must be a non-empty string");
+            }
+            p.prompt = body["prompt"].get<std::string>();
+            std::string size = "512x320";
+            if (body.contains("size")) {
+                if (!body["size"].is_string()) {
+                    throw std::invalid_argument("size must be a string");
+                }
+                size = body["size"].get<std::string>();
+            }
+            const auto x = size.find('x');
+            const auto digits = [](std::string_view d) {
+                return !d.empty() && d.size() <= 4 &&
+                       std::all_of(d.begin(), d.end(), [](char c) {
+                           return c >= '0' && c <= '9';
+                       });
+            };
+            if (x == std::string::npos ||
+                !digits(std::string_view(size).substr(0, x)) ||
+                !digits(std::string_view(size).substr(x + 1))) {
+                throw std::invalid_argument("size must be WIDTHxHEIGHT");
+            }
+            p.width = static_cast<std::uint32_t>(std::stoul(size.substr(0, x)));
+            p.height =
+                static_cast<std::uint32_t>(std::stoul(size.substr(x + 1)));
+            double seconds = 2.0;
+            if (body.contains("seconds")) {
+                const json& s = body["seconds"];
+                if (s.is_number()) {
+                    seconds = s.get<double>();
+                } else if (s.is_string()) {
+                    const std::string t = s.get<std::string>();
+                    std::size_t used = 0;
+                    try {
+                        seconds = std::stod(t, &used);
+                    } catch (const std::exception&) {
+                        used = 0;
+                    }
+                    if (used == 0 || used != t.size()) {
+                        throw std::invalid_argument(
+                            "seconds must be a number");
+                    }
+                } else {
+                    throw std::invalid_argument("seconds must be a number");
+                }
+            }
+            if (!std::isfinite(seconds) || seconds <= 0.0) {
+                throw std::invalid_argument("seconds must be positive");
+            }
+            if (body.contains("fps")) {
+                if (!body["fps"].is_number() ||
+                    !(body["fps"].get<double>() > 0.0 &&
+                      body["fps"].get<double>() <= 60.0)) {
+                    throw std::invalid_argument(
+                        "fps must be a number in (0, 60]");
+                }
+                p.frame_rate = body["fps"].get<float>();
+            }
+            const double k = std::round(seconds * p.frame_rate / 8.0);
+            constexpr std::uint32_t kMaxK =
+                (image::LtxvPipeline::kMaxFrames - 1) / 8;  // 32
+            if (k > static_cast<double>(kMaxK)) {
+                throw std::invalid_argument(
+                    "seconds * fps must be at most 256 frames");
+            }
+            p.frames = 8 * static_cast<std::uint32_t>(k) + 1;
+            if (body.contains("sampling")) {
+                const json& s = body["sampling"];
+                if (s == "stochastic") {
+                    p.stochastic = true;
+                } else if (s == "deterministic") {
+                    p.stochastic = false;
+                } else {
+                    throw std::invalid_argument(
+                        "sampling must be \"stochastic\" or "
+                        "\"deterministic\"");
+                }
+            }
+            p.seed = std::random_device{}();
+            if (body.contains("seed")) {
+                if (!body["seed"].is_number_integer()) {
+                    throw std::invalid_argument("seed must be an integer");
+                }
+                p.seed = static_cast<std::uint64_t>(
+                    body["seed"].get<std::int64_t>());
+            }
+            if (body.contains("input_reference")) {
+                const json& ref = body["input_reference"];
+                if (!ref.is_object() || ref.contains("file_id") ||
+                    !ref.contains("image_url")) {
+                    throw std::invalid_argument(
+                        "input_reference must be {\"image_url\": a data: "
+                        "URL} (file ids are not supported)");
+                }
+                if (!ltxv_->can_condition()) {
+                    not_implemented(res,
+                                    "image to video needs the LTX VAE with "
+                                    "its encoder (reconvert it with "
+                                    "convert-ltxv.py)");
+                    return;
+                }
+                image::DecodeLimits lim;
+                lim.max_bytes = opt_.max_body_bytes;
+                p.image = image::decode_image(
+                    data_url_bytes(ref["image_url"], opt_.max_body_bytes),
+                    lim);
+            }
+            image::LtxvPipeline::check(p);
+
+            video::VideoJob meta;
+            meta.model = "ltx-video";
+            meta.prompt = p.prompt;
+            meta.size = size;
+            char secs[32];
+            std::snprintf(secs, sizeof secs, "%g",
+                          (p.frames - 1) / static_cast<double>(p.frame_rate));
+            meta.seconds = secs;
+            // The job: denoise and decode under image_mu_ (so a clip and
+            // an image never run together), then ffmpeg. alive() is
+            // polled before each of the 8 DiT steps and the decode, which
+            // gives the progress.
+            const auto job = video_jobs_->submit(
+                meta,
+                [this, p](const std::string& out,
+                          const std::function<void(int)>& progress,
+                          const std::function<bool()>& alive) {
+                    std::vector<std::vector<std::uint8_t>> frames;
+                    {
+                        std::lock_guard<std::mutex> lk(image_mu_);
+                        int polls = 0;
+                        const auto& op =
+                            backend::vulkan_imports_host_memory()
+                                ? backend::vulkan_image_ops()
+                                : backend::best_backend().ops;
+                        // The decode takes about three times the 8 DiT
+                        // steps (M2 Pro, 512x320x65: 170 s vs 60 s), so
+                        // the steps span 0 to 30 and the decode 30 to 90.
+                        frames = ltxv_->generate(p, op, [&] {
+                            progress(30 * polls++ / 8);
+                            return alive();
+                        });
+                    }
+                    if (frames.empty()) {
+                        throw std::runtime_error("cancelled");
+                    }
+                    progress(90);
+                    video::encode_mp4(*ffmpeg_, frames, p.width, p.height,
+                                      p.frame_rate, out);
+                });
+            if (!job) {
+                set_unavailable(res, "too many video jobs; retry later", 60);
+                return;
+            }
+            res.set_header("X-Video-Seed", std::to_string(p.seed));
+            res.set_content(video_json(*job).dump(-1, ' ', false, kLossy),
+                            "application/json");
+        } catch (const std::exception& e) {
+            set_error(res, e);
+        }
+    };
+
+    auto handle_video_by_id = [this, video_json, videos_on, video_not_found,
+                               video_id](const http::Request& req,
+                                         http::ServerResponse& res) {
+        if (!videos_on(res)) return;
+        const std::string id = video_id(req.path);
+        const auto job = video_jobs_->get(id);
+        if (!job) {
+            video_not_found(res, id);
+            return;
+        }
+        res.set_content(video_json(*job).dump(-1, ' ', false, kLossy),
+                        "application/json");
+    };
+
+    // The MP4 of a completed job; 409 while it is queued or running, or
+    // when it failed.
+    auto handle_video_content = [this, videos_on, video_not_found,
+                                 video_id](const http::Request& req,
+                                           http::ServerResponse& res) {
+        if (!videos_on(res)) return;
+        const std::string id = video_id(req.path);
+        const auto job = video_jobs_->get(id);
+        if (!job) {
+            video_not_found(res, id);
+            return;
+        }
+        if (job->status != "completed") {
+            res.status = 409;
+            res.set_content(make_error("video " + id + " is " + job->status +
+                                       ", not completed")
+                                .dump(-1, ' ', false, kLossy),
+                            "application/json");
+            return;
+        }
+        std::ifstream f(job->file, std::ios::binary);
+        std::string mp4((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+        if (!f.good() && !f.eof()) {
+            set_error(res, std::runtime_error("cannot read the video file"));
+            return;
+        }
+        res.set_content(std::move(mp4), "video/mp4");
+    };
+
     // One dispatch handler over all routes (route_of is the single home
     // for routing, shared with the auth head stage below).
     route_handler_ = [this, handle_health, handle_models,
                       handle_model_by_id, handle_metrics, handle,
                       handle_messages, handle_responses, handle_embeddings,
-                      handle_audio, handle_images, handle_edits](
+                      handle_audio, handle_images, handle_edits,
+                      handle_videos, handle_video_by_id,
+                      handle_video_content](
                          const http::Request& req, http::ServerResponse& res,
                          const http::RequestContext& ctx) {
         switch (route_of(req.method, req.path)) {
@@ -3142,6 +3472,11 @@ void OpenAiServer::install_routes() {
             case Route::kAudioSpeech: handle_audio(req, res, ctx); break;
             case Route::kImages:      handle_images(req, res, ctx); break;
             case Route::kImageEdits:  handle_edits(req, res, ctx); break;
+            case Route::kVideos:      handle_videos(req, res, ctx); break;
+            case Route::kVideoById:   handle_video_by_id(req, res); break;
+            case Route::kVideoContent:
+                handle_video_content(req, res);
+                break;
             case Route::kUnknown:
                 res.status = 404;  // httplib's default: 404, empty body
                 break;
