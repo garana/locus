@@ -41,10 +41,11 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   (T5-XXL encoder, DiT, DPM-Solver++, SD VAE; one 512 x 512 PNG), or
   with FLUX.1 dev, schnell or Kontext dev as text to image (CLIP-L and
   T5-XXL, the MMDiT, flow-matching Euler, the FLUX VAE; any size up to
-  1024 x 1024; minutes per image). On a Vulkan GPU with unified memory,
-  whatever backend the language model uses, the linears, the DiT's
-  attention and the VAE's convolutions run on the GPU; T5's attention
-  stays on the CPU. Request fields: docs/CLIENTS.md.
+  1024 x 1024; on the CPU, minutes per image). For PixArt on a Vulkan
+  GPU with unified memory, whatever backend the language model uses,
+  the linears, the DiT's attention and the VAE's convolutions run on
+  the GPU; T5's attention stays on the CPU. Request fields:
+  docs/CLIENTS.md.
 - **Image input:** PNG and JPEG in chat requests (OpenAI `image_url`
   data URLs, Anthropic image blocks) with Janus-Pro-1B.
 - **Tools:** `locus-server`; `locus-run` (one prompt); `locus-gguf`

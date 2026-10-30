@@ -44,9 +44,8 @@ model the server loaded:
 | FLUX.1       | `--image-model <dir>`         | WxH, 16 to 1024 (*) | `steps` (28, 4 for schnell; up to 100), `guidance_scale` (3.5), `max_sequence_length` (512), `seed`     |
 
 (*) `size` is any "WxH" with both sides multiples of 16, up to 1024;
-the default is 1024x1024. An image takes minutes at 1024: FLUX's
-linears and attention run per op (on a unified-memory Vulkan GPU as
-for PixArt, else on the CPU); a resident GPU forward is i#372 step 9.
+the default is 1024x1024. FLUX runs on the CPU, so an image takes
+minutes even at 256; a GPU forward is i#372 step 9.
 
 A request whose `model` starts with `pixart` (or `flux`) goes to the
 pipeline in `--image-model`, and so does every request unless both a

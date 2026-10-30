@@ -2669,11 +2669,10 @@ void OpenAiServer::install_routes() {
                     p.seed = static_cast<std::uint64_t>(
                         body["seed"].get<std::int64_t>());
                 }
-                // As for PixArt: the GPU when the Vulkan device imports
-                // host memory, else the CPU backend.
-                const auto& op = backend::vulkan_imports_host_memory()
-                                     ? backend::vulkan_image_ops()
-                                     : backend::best_backend().ops;
+                // The CPU backend: per op on Vulkan, the 12B BF16 DiT
+                // fails ("vulkan: wait idle" on MoltenVK); the resident
+                // GPU forward is i#372 step 9.
+                const auto& op = backend::best_backend().ops;
                 image::FluxPipeline::Timing took;
                 std::vector<std::uint8_t> rgb;
                 {
