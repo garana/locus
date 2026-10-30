@@ -37,12 +37,15 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Speech:** `/v1/audio/speech` with Orpheus-TTS and the SNAC codec;
   24 kHz WAV or PCM, whole or streamed.
 - **Image output:** `/v1/images/generations` with Janus-Pro-1B and
-  the VQ-16 decoder (one 384 x 384 PNG), or with PixArt-alpha 512
-  (T5-XXL encoder, DiT, DPM-Solver++, SD VAE; one 512 x 512 PNG). On
-  a Vulkan GPU with unified memory, whatever backend the language
-  model uses, the linears, the DiT's attention and the VAE's
-  convolutions run on the GPU; T5's attention stays on the CPU.
-  Request fields: docs/CLIENTS.md.
+  the VQ-16 decoder (one 384 x 384 PNG), with PixArt-alpha 512
+  (T5-XXL encoder, DiT, DPM-Solver++, SD VAE; one 512 x 512 PNG), or
+  with FLUX.1 dev, schnell or Kontext dev as text to image (CLIP-L and
+  T5-XXL, the MMDiT, flow-matching Euler, the FLUX VAE; any size up to
+  1024 x 1024; on the CPU, minutes per image). For PixArt on a Vulkan
+  GPU with unified memory, whatever backend the language model uses,
+  the linears, the DiT's attention and the VAE's convolutions run on
+  the GPU; T5's attention stays on the CPU. Request fields:
+  docs/CLIENTS.md.
 - **Image input:** PNG and JPEG in chat requests (OpenAI `image_url`
   data URLs, Anthropic image blocks) with Janus-Pro-1B.
 - **Tools:** `locus-server`; `locus-run` (one prompt); `locus-gguf`
@@ -131,7 +134,8 @@ and tokenizers of the build. Speech needs `--audio-decoder
 <snac.gguf>`, image generation `--image-decoder <vq16.gguf>` (Janus)
 or `--image-model <dir>` (PixArt: a directory with the GGUFs from
 `scripts/convert-t5-encoder.py`, `convert-pixart.py` and
-`convert-sd-vae.py`).
+`convert-sd-vae.py`; FLUX.1: the GGUFs from `scripts/convert-flux.py`
+and `convert-t5-encoder.py`).
 
 ## Backends
 

@@ -37,21 +37,30 @@ yet (each is a 400).
 `/v1/images/generations` returns one PNG as `b64_json`, from either
 model the server loaded:
 
-| Model           | Server flag                    | Image   | Extra fields (defaults)                                                             |
-|-----------------|--------------------------------|---------|-------------------------------------------------------------------------------------|
-| Janus-Pro-1B    | `--image-decoder <vq16.gguf>`  | 384x384 | `cfg` (5), `temperature` (1; 0 = argmax), `seed` (random)                           |
-| PixArt-alpha    | `--image-model <dir>`          | 512x512 | `steps` (20, up to 100), `guidance_scale` (4.5), `seed` (random), `negative_prompt` |
+| Model        | Server flag                   | Image               | Extra fields (defaults)                                                                                 |
+|--------------|-------------------------------|---------------------|---------------------------------------------------------------------------------------------------------|
+| Janus-Pro-1B | `--image-decoder <vq16.gguf>` | 384x384             | `cfg` (5), `temperature` (1; 0 = argmax), `seed` (random)                                               |
+| PixArt-alpha | `--image-model <dir>`         | 512x512             | `steps` (20, up to 100), `guidance_scale` (4.5), `seed` (random), `negative_prompt`                     |
+| FLUX.1       | `--image-model <dir>`         | WxH, 16 to 1024 (*) | `steps` (28, 4 for schnell; up to 100), `guidance_scale` (3.5), `max_sequence_length` (512), `seed`     |
 
-A request whose `model` starts with `pixart` goes to PixArt, and so
-does every request unless both a Janus-Pro model and its
-`--image-decoder` are loaded. The seed used comes back in the
-`X-Image-Seed` response header; send it again to repeat an image (with
+(*) `size` is any "WxH" with both sides multiples of 16, up to 1024;
+the default is 1024x1024. FLUX runs on the CPU, so an image takes
+minutes even at 256; a GPU forward is i#372 step 9.
+
+A request whose `model` starts with `pixart` (or `flux`) goes to the
+pipeline in `--image-model`, and so does every request unless both a
+Janus-Pro model and its `--image-decoder` are loaded. The seed used
+comes back in the `X-Image-Seed` response header; send it again to
+repeat an image (with
 the OpenAI SDK, `client.images.with_raw_response.generate(...)` gives
 the headers). `n` must be 1,
-`size` must be the model's, and `response_format` must be `b64_json`
-(others are a 400). The PixArt directory holds the three GGUFs from
-`scripts/convert-t5-encoder.py`, `convert-pixart.py` and
-`convert-sd-vae.py`. One image runs at a time; a second request while
+`size` must be the model's (FLUX: see above), and `response_format`
+must be `b64_json` (others are a 400). The PixArt directory holds the
+three GGUFs from `scripts/convert-t5-encoder.py`, `convert-pixart.py`
+and `convert-sd-vae.py`; the FLUX directory holds the four from
+`scripts/convert-flux.py` (`--dit-out`, `--clip-out`, `--vae-out`) and
+`convert-t5-encoder.py` on the pipeline's `text_encoder_2`. One image
+runs at a time; a second request while
 one runs gets a 503 with `Retry-After`.
 
 With the OpenAI SDK, pass the extra fields in `extra_body`:
