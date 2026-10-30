@@ -223,6 +223,15 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matmul_q5_0_small_spv.h"
 #include "matmul_q5_0_id_small_spv.h"
 #include "matvec_q5_0_b_spv.h"
+#include "matmul_f16_spv.h"
+#include "matmul_f16_small_spv.h"
+#include "matmul_bf16_spv.h"
+#include "matmul_bf16_small_spv.h"
+#include "ln_mod_spv.h"
+#include "head_norm_rope_spv.h"
+#include "head_split_spv.h"
+#include "gated_add_spv.h"
+#include "gelu_tanh_spv.h"
 #include "rope_neox_spv.h"
 #include "rope_neox_b_spv.h"
 #include "matvec_q4_k_b_spv.h"
@@ -531,7 +540,7 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kMatvecQ4_KSeg, "matvec_q4_k_seg", locus_matvec_q4_k_seg_spv,
      sizeof(locus_matvec_q4_k_seg_spv), 6, 44},
     {Kernel::kBiasRows, "bias_rows", locus_bias_rows_spv,
-     sizeof(locus_bias_rows_spv), 2, 16},
+     sizeof(locus_bias_rows_spv), 2, 20},
     {Kernel::kMatmulQ5_0, "matmul_q5_0", locus_matmul_q5_0_spv,
      sizeof(locus_matmul_q5_0_spv), 3, 96, locus_matmul_q5_0_small_spv,
      sizeof(locus_matmul_q5_0_small_spv),
@@ -544,6 +553,26 @@ constexpr KernelDesc kDescs[] = {
      matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
     {Kernel::kMatvecQ5_0B, "matvec_q5_0_b", locus_matvec_q5_0_b_spv,
      sizeof(locus_matvec_q5_0_b_spv), 4, 52},
+    {Kernel::kMatmulF16, "matmul_f16", locus_matmul_f16_spv,
+     sizeof(locus_matmul_f16_spv), 3, 96, locus_matmul_f16_small_spv,
+     sizeof(locus_matmul_f16_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kMatmulBF16, "matmul_bf16", locus_matmul_bf16_spv,
+     sizeof(locus_matmul_bf16_spv), 3, 96, locus_matmul_bf16_small_spv,
+     sizeof(locus_matmul_bf16_small_spv),
+     matmul_shared_bytes(VulkanContext::kMatmulBK),
+     matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
+    {Kernel::kLnMod, "ln_mod", locus_ln_mod_spv, sizeof(locus_ln_mod_spv), 3,
+     36},
+    {Kernel::kHeadNormRope, "head_norm_rope", locus_head_norm_rope_spv,
+     sizeof(locus_head_norm_rope_spv), 4, 32},
+    {Kernel::kHeadSplit, "head_split", locus_head_split_spv,
+     sizeof(locus_head_split_spv), 2, 24},
+    {Kernel::kGatedAdd, "gated_add", locus_gated_add_spv,
+     sizeof(locus_gated_add_spv), 3, 28},
+    {Kernel::kGeluTanh, "gelu_tanh", locus_gelu_tanh_spv,
+     sizeof(locus_gelu_tanh_spv), 3, 28},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

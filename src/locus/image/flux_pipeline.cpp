@@ -6,11 +6,26 @@
 #include <filesystem>
 #include <stdexcept>
 
+#include "locus/backend/variants.hpp"
 #include "locus/image/pixart_pipeline.hpp"
 
 namespace locus::image {
 
 namespace {
+
+/** @returns The span from g's first tensor byte to its last. */
+std::span<const std::byte> tensor_bytes(const gguf::GgufFile& g) {
+    const std::byte *lo = nullptr, *hi = nullptr;
+    for (const gguf::TensorInfo& ti : g.tensors()) {
+        const auto d = g.tensor_data(ti);
+        if (lo == nullptr || d.data() < lo) lo = d.data();
+        const std::byte* end = d.data() + d.size();
+        if (hi == nullptr || end > hi) hi = end;
+    }
+    return lo == nullptr ? std::span<const std::byte>{}
+                         : std::span<const std::byte>(
+                               lo, static_cast<std::size_t>(hi - lo));
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -89,6 +104,8 @@ std::unique_ptr<FluxPipeline> FluxPipeline::load_dir(const std::string& dir) {
         tok::UgmTokenizer::from_gguf(*t5));
     p->clip_tok_ = std::make_unique<tok::ClipTokenizer>(
         tok::ClipTokenizer::from_gguf(*clip));
+    p->t5_bytes_ = tensor_bytes(*t5);
+    p->dit_bytes_ = tensor_bytes(*dit);
     p->t5_ = std::make_unique<T5Encoder>(T5Encoder::load(*t5));
     p->clip_ = std::make_unique<ClipTextEncoder>(ClipTextEncoder::load(*clip));
     p->dit_ = std::make_unique<FluxDit>(FluxDit::load(*dit));
@@ -180,6 +197,15 @@ std::vector<float> FluxPipeline::generate_from(
     if (alive && !alive()) return {};
     const auto ids = t5_ids(req.prompt, req.max_sequence_length);
     const auto text = t5_->encode(ids, op);
+    // T5-XXL (9.5 GB) and the 12B DiT (23.8 GB in BF16) together pass
+    // what a 36 GB Apple GPU can hold (its submits then fail), so on
+    // Vulkan each leaves the GPU before the other runs. Their BF16
+    // tensors are imported in place from the mappings, so taking them
+    // back costs no copy.
+    const bool vk = &op == &backend::vulkan_image_ops();
+    if (vk) {
+        backend::vulkan_release_weights(t5_bytes_.data(), t5_bytes_.size());
+    }
     const auto n_txt = static_cast<std::uint32_t>(ids.size());
     const std::vector<float> txt_ids(std::size_t{n_txt} * 3, 0.0f);
 
@@ -223,14 +249,29 @@ std::vector<float> FluxPipeline::generate_from(
     std::vector<float> in(x.size() + ref_tok.size());
     std::copy(ref_tok.begin(), ref_tok.end(),
               in.begin() + static_cast<std::ptrdiff_t>(x.size()));
-    for (std::uint32_t i = 0; i < steps; ++i) {
-        if (alive && !alive()) return {};
-        std::copy(x.begin(), x.end(), in.begin());
-        auto v = dit_->forward(in, img_ids, n_img + n_ref, text, txt_ids,
-                               n_txt, pooled, FluxSampler::model_sigma(sig[i]),
-                               req.guidance, op);
-        v.resize(x.size());
-        FluxSampler::step(x, v, sig[i], sig[i + 1]);
+    {
+        // The DiT leaves the GPU however the loop ends (done, the
+        // client gone, or a throw), so the next request's T5 has room.
+        struct ReleaseDit {
+            bool on;
+            std::span<const std::byte> b;
+            ~ReleaseDit() {
+                try {
+                    if (on) backend::vulkan_release_weights(b.data(), b.size());
+                } catch (...) {
+                }
+            }
+        } release_dit{vk, dit_bytes_};
+        for (std::uint32_t i = 0; i < steps; ++i) {
+            if (alive && !alive()) return {};
+            std::copy(x.begin(), x.end(), in.begin());
+            auto v = dit_->forward(in, img_ids, n_img + n_ref, text, txt_ids,
+                                   n_txt, pooled,
+                                   FluxSampler::model_sigma(sig[i]),
+                                   req.guidance, op);
+            v.resize(x.size());
+            FluxSampler::step(x, v, sig[i], sig[i + 1]);
+        }
     }
     const auto t2 = Clock::now();
     const auto lat = FluxSampler::unpack(x, kLatentCh, h, w);

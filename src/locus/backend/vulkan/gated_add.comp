@@ -1,0 +1,40 @@
+#version 450
+
+// FLUX's gated residual (i#372) over n rows of width dim:
+// x[x_off + t * x_stride + i] += g[g_off + i] * y[y_off + t * y_stride
+// + i]. With GELU_TANH it is instead torch's tanh-approximate GELU in
+// place on x's rows (y and g unused). Grid-stride over n * dim.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Y { float y[]; };
+layout(std430, binding = 1) readonly buffer G { float g[]; };
+layout(std430, binding = 2) buffer X { float x[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint dim;
+    uint x_off;
+    uint x_stride;
+    uint y_off;
+    uint y_stride;
+    uint g_off;
+} pc;
+
+void main() {
+    uint step = gl_NumWorkGroups.x * 256u;
+    for (uint e = gl_GlobalInvocationID.x; e < pc.n * pc.dim; e += step) {
+        uint t = e / pc.dim;
+        uint i = e % pc.dim;
+        uint at = pc.x_off + t * pc.x_stride + i;
+#ifdef GELU_TANH
+        float v = x[at];
+        const float kC = 0.79788456080286535588;  // sqrt(2 / pi)
+        // Clamped: a large argument can overflow a fast tanh.
+        float a = clamp(kC * (v + 0.044715 * v * v * v), -15.0, 15.0);
+        x[at] = 0.5 * v * (1.0 + tanh(a));
+#else
+        x[at] += g[pc.g_off + i] * y[pc.y_off + t * pc.y_stride + i];
+#endif
+    }
+}

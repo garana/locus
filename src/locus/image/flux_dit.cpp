@@ -1,11 +1,14 @@
 #include "locus/image/flux_dit.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
 #include <string>
 
+#include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
 #include "locus/image/pixart_dit.hpp"
 #include "locus/sys/thread_pool.hpp"
@@ -218,11 +221,13 @@ FluxDit FluxDit::load(const gguf::GgufFile& g) {
         std::memcpy(out.data(), g.tensor_data(*ti).data(), n * sizeof(float));
         return out;
     };
-    // A Linear [rows, cols], BF16 or F32.
+    // A Linear [rows, cols], BF16, Q8_0 (convert-flux.py --dit-type
+    // q8_0) or F32.
     const auto lin = [&](const std::string& name, std::uint32_t rows,
                          std::uint32_t cols) {
         const gguf::TensorInfo* ti = info(name + ".weight");
         if ((ti->type != gguf::TensorType::kBF16 &&
+             ti->type != gguf::TensorType::kQ8_0 &&
              ti->type != gguf::TensorType::kF32) ||
             ti->n_dims != 2 || ti->ne[0] != cols || ti->ne[1] != rows) {
             throw gguf::Error("flux: " + name + ".weight is not " +
@@ -338,6 +343,14 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
               ids.begin() + static_cast<std::ptrdiff_t>(n_txt) * 3);
     std::vector<float> cosv, sinv;
     rope(ids, n, cosv, sinv);
+    if (&op == &backend::vulkan_image_ops() &&
+        backend::VulkanSeq::available()) {
+        const char* env = std::getenv("LOCUS_FLUX_GPU");
+        if (env == nullptr || std::string(env) != "0") {
+            return forward_vulkan(x, n_img, text, n_txt, st, cosv, sinv,
+                                  trace);
+        }
+    }
 
     std::vector<float> img(std::size_t{n_img} * w), txt(std::size_t{n_txt} * w);
     linear(op, x_embed_.w, x_embed_.b, x, n_img, img);

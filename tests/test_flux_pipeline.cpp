@@ -11,6 +11,7 @@
 #include "catch_amalgamated.hpp"
 #include "json.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/image/flux_pipeline.hpp"
 
@@ -126,19 +127,28 @@ TEST_CASE("flux pipeline matches diffusers", "[flux][image][e2e]") {
     const std::vector<locus::tok::TokenId> t5_ids = j["t5_ids"];
     REQUIRE(p->t5_ids(req.prompt, req.max_sequence_length) == t5_ids);
     const auto latent = read_f32(kDir + "golden/flux/pipeline_in.f32");
-    const auto img = p->generate_from(
-        latent, req, locus::backend::best_backend().ops, nullptr);
     const auto ref = read_f32(kDir + "golden/flux/pipeline_out.f32");
-    REQUIRE(img.size() == ref.size());
-    double worst = 0.0, ss = 0.0;
-    for (std::size_t i = 0; i < img.size(); ++i) {
-        const double d = double{img[i]} - ref[i];
-        worst = std::max(worst, std::fabs(d));
-        ss += d * d;
+    std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
+        {"cpu", &locus::backend::best_backend().ops}};
+    if (locus::backend::vulkan_imports_host_memory()) {
+        // As the server runs it: the DiT steps on the GPU, the rest per op.
+        legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
     }
-    INFO("max " << worst << " rms " << std::sqrt(ss / img.size()));
-    // The image is in about [-1, 1]; 2 / 255 is one 8-bit level.
-    REQUIRE(worst < 2.0 / 255.0);
+    for (const auto& [name, op] : legs) {
+        DYNAMIC_SECTION(name) {
+            const auto img = p->generate_from(latent, req, *op, nullptr);
+            REQUIRE(img.size() == ref.size());
+            double worst = 0.0, ss = 0.0;
+            for (std::size_t i = 0; i < img.size(); ++i) {
+                const double d = double{img[i]} - ref[i];
+                worst = std::max(worst, std::fabs(d));
+                ss += d * d;
+            }
+            INFO("max " << worst << " rms " << std::sqrt(ss / img.size()));
+            // The image is in about [-1, 1]; 2 / 255 is one 8-bit level.
+            REQUIRE(worst < 2.0 / 255.0);
+        }
+    }
 }
 
 // FLUX.1 Kontext dev editing a 128 x 128 reference (auto_resize off, so

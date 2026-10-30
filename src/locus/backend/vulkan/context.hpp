@@ -131,6 +131,18 @@ enum class Kernel {
     kMatmulQ5_0Id,
     /** Batched (MoE slot) matvec over Q5_0 weights. */
     kMatvecQ5_0B,
+    /** Prefill matmuls over F16 / BF16 weights (matmul.comp TYPE_F16,
+     *  TYPE_BF16). */
+    kMatmulF16,
+    kMatmulBF16,
+    /** FLUX ops (i#372): modulated LayerNorm, per-head RMS norm plus
+     *  table RoPE, per-head planes for attention, gated residual and
+     *  tanh GELU. */
+    kLnMod,
+    kHeadNormRope,
+    kHeadSplit,
+    kGatedAdd,
+    kGeluTanh,
     kCount_,
 };
 

@@ -1,0 +1,68 @@
+#version 450
+
+// LayerNorm without affine over each of n rows of width d, then the
+// AdaLN modulation (FLUX, i#372): o = ln(x) * (1 + scale) + shift,
+// with scale and shift read from the modulation buffer M. Mean, then
+// variance about it, as the CPU reference does. One workgroup per row.
+
+#define WG 256u
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer M { float m[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint d;
+    uint n;
+    uint x_off;
+    uint x_stride;
+    uint o_off;
+    uint o_stride;
+    uint shift_off;
+    uint scale_off;
+    float eps;
+} pc;
+
+shared float red[WG];
+
+float reduce_sum(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (tid < step) {
+            red[tid] += red[tid + step];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.n) {
+        return;  // uniform per workgroup
+    }
+    uint xa = pc.x_off + row * pc.x_stride;
+    uint oa = pc.o_off + row * pc.o_stride;
+    float s = 0.0;
+    for (uint i = tid; i < pc.d; i += WG) {
+        s += x[xa + i];
+    }
+    float mean = reduce_sum(s) / float(pc.d);
+    float v = 0.0;
+    for (uint i = tid; i < pc.d; i += WG) {
+        float c = x[xa + i] - mean;
+        v += c * c;
+    }
+    float inv = inversesqrt(reduce_sum(v) / float(pc.d) + pc.eps);
+    for (uint i = tid; i < pc.d; i += WG) {
+        o[oa + i] = (x[xa + i] - mean) * inv * (1.0 + m[pc.scale_off + i]) +
+                    m[pc.shift_off + i];
+    }
+}

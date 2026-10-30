@@ -85,7 +85,10 @@ class FluxDit {
      * @param sigma The noise level in [0, 1] (the pipeline's t / 1000).
      * @param guidance The guidance scale; ignored without a guidance
      *     embedding.
-     * @param op The backend ops the matrices run on.
+     * @param op The backend ops the matrices run on. With
+     *     backend::vulkan_image_ops() the whole call runs on the GPU
+     *     (resident activations, one upload and one readback), unless
+     *     LOCUS_FLUX_GPU=0 keeps it per op.
      * @param trace When not null, receives the intermediate states.
      * @returns n_img x channels() floats, token-major: the velocity.
      * @throws std::invalid_argument on wrong sizes.
@@ -115,6 +118,18 @@ class FluxDit {
               std::vector<float>& sin_out) const;
 
   private:
+    /** forward() with every block on the GPU (flux_dit_vulkan.cpp):
+     *  st is silu of the conditioning vector, cosv / sinv the RoPE
+     *  tables of the joined sequence. */
+    std::vector<float> forward_vulkan(std::span<const float> x,
+                                      std::uint32_t n_img,
+                                      std::span<const float> text,
+                                      std::uint32_t n_txt,
+                                      const std::vector<float>& st,
+                                      const std::vector<float>& cosv,
+                                      const std::vector<float>& sinv,
+                                      Trace* trace) const;
+
     struct Linear {
         backend::Mat w;
         std::vector<float> b;

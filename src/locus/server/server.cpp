@@ -2713,10 +2713,13 @@ void OpenAiServer::install_routes() {
                     p.seed = static_cast<std::uint64_t>(
                         body["seed"].get<std::int64_t>());
                 }
-                // The CPU backend: per op on Vulkan, the 12B BF16 DiT
-                // fails ("vulkan: wait idle" on MoltenVK); the resident
-                // GPU forward is i#372 step 9.
-                const auto& op = backend::best_backend().ops;
+                // With host-memory import (as for PixArt) the DiT runs
+                // each step on the GPU, activations resident
+                // (FluxDit::forward_vulkan); CLIP, T5 and the VAE run
+                // per op. Without it, the CPU backend.
+                const auto& op = backend::vulkan_imports_host_memory()
+                                     ? backend::vulkan_image_ops()
+                                     : backend::best_backend().ops;
                 if (edit) {
                     // FluxKontextPipeline's size rule: the aspect at
                     // max_area pixels, 1024 x 1024 by default; a given

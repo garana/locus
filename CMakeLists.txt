@@ -52,6 +52,7 @@ add_library(locus
     src/locus/image/t5_encoder.cpp
     src/locus/image/clip_text.cpp
     src/locus/image/flux_dit.cpp
+    src/locus/image/flux_dit_vulkan.cpp
     src/locus/image/flux_sampler.cpp
     src/locus/image/flux_pipeline.cpp
     src/locus/image/ltxv_dit.cpp
@@ -181,6 +182,7 @@ if(Vulkan_FOUND)
             kv_scatter moe_group moe_combine attn_softmax sum_splits
             matvec_t_q8 attn_decode attn_combine attn_decode_grp matvec_q8_0_n
             copy qk_norm_rope bias_rows
+            ln_mod head_norm_rope head_split gated_add
             # Variants: <kernel>=<source>:<define>[,<define>...], the
             # source compiled again with -D<define> for each.
             matvec_b=matvec:BATCHED
@@ -204,6 +206,11 @@ if(Vulkan_FOUND)
             # default tile; create_pipe picks per the device limit.
             matmul_q8_0_small=matmul:TYPE_Q8,BK16
             matmul_f32_small=matmul:TYPE_F32,BK16
+            matmul_f16=matmul:TYPE_F16
+            matmul_f16_small=matmul:TYPE_F16,BK16
+            matmul_bf16=matmul:TYPE_BF16
+            matmul_bf16_small=matmul:TYPE_BF16,BK16
+            gelu_tanh=gated_add:GELU_TANH
             matmul_q8_0_id_small=matmul:TYPE_Q8,MOE_ID,BK16
             matmul_paged_f32_small=matmul:TYPE_F32,PAGED,BK16
             matmul_paged_t_f32_small=matmul:TYPE_F32,PAGED_T,BK16

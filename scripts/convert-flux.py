@@ -5,7 +5,9 @@ to GGUFs (i#372):
 
 - a "flux" GGUF with the transformer (FluxTransformer2DModel): the
   checkpoint names, 2D weights kept BF16 (the matvec kernels read
-  BF16), every other tensor F32; the model keys from
+  BF16) or, with --dit-type q8_0, quantized to Q8_0 (12.7 GB instead
+  of 23.8 GB, for GPUs that cannot hold the BF16 model), every other
+  tensor F32; the model keys from
   transformer/config.json and the sampler keys from
   scheduler/scheduler_config.json;
 - a "clip_text" GGUF with the CLIP-L text encoder (CLIPTextModel), all
@@ -88,7 +90,7 @@ def finish(w):
     w.close()
 
 
-def write_dit(path, mdir):
+def write_dit(path, mdir, q8):
     t = config(mdir / "transformer")
     s = json.loads((mdir / "scheduler" /
                     "scheduler_config.json").read_text())
@@ -160,7 +162,11 @@ def write_dit(path, mdir):
 
     n = 0
     for name, a in tensors:
-        if a.ndim == 2 and a.dtype == np.uint16:
+        if a.ndim == 2 and a.dtype == np.uint16 and q8 and \
+                a.shape[1] % 32 == 0:
+            q = gguf.quants.quantize(to_f32(a), gguf.GGMLQuantizationType.Q8_0)
+            w.add_tensor(name, q, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+        elif a.ndim == 2 and a.dtype == np.uint16:
             w.add_tensor(name, np.ascontiguousarray(a),
                          raw_dtype=gguf.GGMLQuantizationType.BF16)
         else:
@@ -287,6 +293,8 @@ def main():
     ap.add_argument("--model", required=True,
                     help="the diffusers pipeline directory")
     ap.add_argument("--dit-out", help="the transformer GGUF")
+    ap.add_argument("--dit-type", choices=("bf16", "q8_0"), default="bf16",
+                    help="the transformer's 2D weight type (default bf16)")
     ap.add_argument("--clip-out", help="the CLIP-L text encoder GGUF")
     ap.add_argument("--vae-out", help="the VAE GGUF")
     a = ap.parse_args()
@@ -298,7 +306,7 @@ def main():
     if idx.get("_class_name") not in ("FluxPipeline", "FluxKontextPipeline"):
         sys.exit("expected a FluxPipeline or FluxKontextPipeline directory")
     if a.dit_out:
-        write_dit(pathlib.Path(a.dit_out), mdir)
+        write_dit(pathlib.Path(a.dit_out), mdir, a.dit_type == "q8_0")
     if a.clip_out:
         write_clip(pathlib.Path(a.clip_out), mdir)
     if a.vae_out:

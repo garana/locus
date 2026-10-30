@@ -170,6 +170,11 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
         // 22-byte blocks: rows and halves start off word alignment.
         {"q5_0", locus::gguf::TensorType::kQ5_0, Kernel::kMatmulQ5_0, 96,
          1e-3f},
+        // Odd cols: rows start on either half of a 32-bit word.
+        {"f16", locus::gguf::TensorType::kF16, Kernel::kMatmulF16, 81,
+         1e-4f},
+        {"bf16", locus::gguf::TensorType::kBF16, Kernel::kMatmulBF16, 81,
+         1e-4f},
     };
     const std::uint32_t rows = 100, n_tok = 70, n_batch = 3;
     const std::uint32_t x_stride = 300, out_stride = 333;
@@ -184,8 +189,22 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
             const bool kq = c.type == locus::gguf::TensorType::kQ4_K ||
                             c.type == locus::gguf::TensorType::kQ6_K ||
                             c.type == locus::gguf::TensorType::kQ5_0;
+            const bool half = c.type == locus::gguf::TensorType::kF16 ||
+                              c.type == locus::gguf::TensorType::kBF16;
             std::vector<std::byte> w;
-            if (q8) {
+            if (half) {
+                auto f = random_f32(std::size_t{rows} * c.cols * n_batch,
+                                    rng);
+                w.resize(f.size() * 2);
+                for (std::size_t i = 0; i < f.size(); ++i) {
+                    const std::uint16_t h =
+                        c.type == locus::gguf::TensorType::kF16
+                            ? locus::backend::f32_to_f16(f[i])
+                            : static_cast<std::uint16_t>(
+                                  std::bit_cast<std::uint32_t>(f[i]) >> 16);
+                    std::memcpy(&w[i * 2], &h, 2);
+                }
+            } else if (q8) {
                 w = random_q8(rows * n_batch, c.cols, rng);
             } else if (kq) {
                 w = random_kq(c.type, rows * n_batch, c.cols, rng);
@@ -214,7 +233,8 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
                 auto ob = upload(ctx, init);
                 const std::uint32_t tiles = (n_tok + 63) / 64;
                 const std::uint32_t w_bstride = static_cast<std::uint32_t>(
-                    q8 || kq ? mat_bytes : mat_bytes / 4);
+                    q8 || kq ? mat_bytes
+                             : mat_bytes / (half ? 2 : 4));
                 ctx.begin_batch();
                 const VulkanContext::Buffer bufs[] = {wb, xb, ob};
                 const std::uint32_t push[] = {

@@ -146,6 +146,9 @@ class FluxPipeline {
 
   private:
     std::vector<std::unique_ptr<gguf::GgufFile>> files_;
+    /** The tensor bytes of the T5 and DiT GGUFs, for
+     *  backend::vulkan_release_weights. */
+    std::span<const std::byte> t5_bytes_, dit_bytes_;
     std::unique_ptr<tok::UgmTokenizer> t5_tok_;
     std::unique_ptr<tok::ClipTokenizer> clip_tok_;
     std::unique_ptr<T5Encoder> t5_;

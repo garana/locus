@@ -1,0 +1,61 @@
+#version 450
+
+// Per-head RMS norm, then rotary embedding from tables, in place on n
+// token rows of heads x hd (FLUX's q and k, i#372). Head row r = t *
+// heads + h: x / sqrt(mean(x^2) + eps) * w, then each pair (2 i,
+// 2 i + 1) rotates by token t's angle: (x0, x1) -> (x0 cos - x1 sin,
+// x1 cos + x0 sin). COS and SIN hold hd floats per token of the whole
+// sequence; this call's token t reads table row rope_row0 + t. One
+// workgroup per head row.
+
+#define WG 64u
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) readonly buffer C { float cs[]; };
+layout(std430, binding = 3) readonly buffer S { float sn[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint heads;
+    uint hd;
+    uint x_off;
+    uint x_stride;
+    uint w_off;
+    uint rope_row0;
+    float eps;
+} pc;
+
+shared float red[WG];
+
+void main() {
+    uint row = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= pc.n * pc.heads) {
+        return;  // uniform per workgroup
+    }
+    uint t = row / pc.heads;
+    uint at = pc.x_off + t * pc.x_stride + (row % pc.heads) * pc.hd;
+    float ss = 0.0;
+    for (uint i = tid; i < pc.hd; i += WG) {
+        ss += x[at + i] * x[at + i];
+    }
+    red[tid] = ss;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (tid < step) {
+            red[tid] += red[tid + step];
+        }
+        barrier();
+    }
+    float inv = inversesqrt(red[0] / float(pc.hd) + pc.eps);
+    uint tab = (pc.rope_row0 + t) * pc.hd;
+    for (uint i = 2u * tid; i + 1u < pc.hd; i += 2u * WG) {
+        float x0 = x[at + i] * inv * w[pc.w_off + i];
+        float x1 = x[at + i + 1u] * inv * w[pc.w_off + i + 1u];
+        x[at + i] = x0 * cs[tab + i] - x1 * sn[tab + i];
+        x[at + i + 1u] = x1 * cs[tab + i + 1u] + x0 * sn[tab + i + 1u];
+    }
+}

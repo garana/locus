@@ -14,7 +14,8 @@
 // Weight type by define: TYPE_Q8 (Q8_0 rows in the split GPU layout
 // of q8_layout.hpp, byte offsets, cols % 32 == 0), TYPE_Q4K / TYPE_Q6K
 // (ggml K-quant rows as on disk, byte offsets, cols % 256 == 0),
-// TYPE_Q5_0 (ggml Q5_0 rows as on disk, byte offsets, cols % 32 == 0)
+// TYPE_Q5_0 (ggml Q5_0 rows as on disk, byte offsets, cols % 32 == 0),
+// TYPE_F16 / TYPE_BF16 (16-bit rows as on disk, offsets in elements)
 // or TYPE_F32 (element offsets).
 //
 // TYPE_F32 can instead read W from the paged KV pool (attention as
@@ -84,7 +85,10 @@ layout(local_size_x = 256) in;
     defined(TYPE_Q5_0)
 #define W_BYTES
 #endif
-#if defined(W_BYTES) || defined(KV_F16)
+#if defined(TYPE_F16) || defined(TYPE_BF16)
+#define W_HALF
+#endif
+#if defined(W_BYTES) || defined(KV_F16) || defined(W_HALF)
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
 #else
 layout(std430, binding = 0) readonly buffer W { float w[]; };
@@ -147,10 +151,16 @@ uint pos_row(uint p) {
 #endif
 
 #ifndef W_BYTES
-#ifdef KV_F16
+#if defined(KV_F16) || defined(TYPE_F16)
 /** Pool element i (a half). */
 float w_el(uint i) {
     return unpackHalf2x16(w[i >> 1] >> ((i & 1u) * 16u)).x;
+}
+#elif defined(TYPE_BF16)
+/** Element i (a bfloat16: the high half of an f32). */
+float w_el(uint i) {
+    uint v = w[i >> 1];
+    return uintBitsToFloat((i & 1u) == 0u ? v << 16 : v & 0xffff0000u);
 }
 #else
 #define w_el(i) w[i]
@@ -163,7 +173,7 @@ float w_at(uint wbase, uint r, uint c) {
 #elif defined(PAGED_T)
     return w_el(pos_row(c) + wbase + r);
 #else
-    return w[wbase + r * pc.cols + c];
+    return w_el(wbase + r * pc.cols + c);
 #endif
 }
 #endif
