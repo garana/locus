@@ -91,12 +91,11 @@ Speech (text to audio) is `/v1/audio/speech`. How these run together:
 4. Text and image to video are jobs: up to 4 wait or run, and one runs
    at a time. It holds the image lock while it denoises and decodes
    (not during the ffmpeg encode), so image requests get 503s
-   meanwhile, and a waiting clip starts after an image in progress.
+   meanwhile, and a waiting clip starts after an image in progress. A
+   fifth clip gets a 503 with `Retry-After` 60 s.
 5. Image and video generation never run two at once. The weights are
-   shared, but each generation has its own working memory (in the
-   video VAE decode, one full-resolution tensor of a 512x320, 65-frame
-   clip is 5.4 GB), and one generation already keeps the GPU or the
-   CPU cores busy.
+   shared, but each generation has its own working memory, and one
+   generation already keeps the GPU or the CPU cores busy.
 6. Speech runs one request at a time; the next one waits.
 
 Greedy decoding is the default; sampling and the other decoding
