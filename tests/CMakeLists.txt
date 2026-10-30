@@ -85,6 +85,7 @@ add_executable(locus_tests
     test_ltxv_dit.cpp
     test_ltxv_vae.cpp
     test_ltxv_pipeline.cpp
+    test_video.cpp
     test_model_e2e.cpp
     test_moe.cpp
     test_dsa.cpp
