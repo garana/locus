@@ -24,6 +24,13 @@ real: the 2B checkpoint's decoder (--ckpt) in float32 on a seeded
 - vae_in.f32: the latent [128, 2, 2, 2];
 - vae_out.f32: the video [3, 9, 64, 64].
 
+encode: the 2B checkpoint's encoder (--ckpt) in float32: the latent
+mean, normalized per channel, of a seeded 9-frame 64 x 64 video and of
+its first frame alone. Writes, into --out (tests/golden/ltxv):
+vae_enc.json (the shapes), vae_enc_in.f32 (the video [3, 9, 64, 64],
+then the image [3, 1, 64, 64]) and vae_enc_out.f32 (the latents
+[128, 2, 2, 2], then [128, 1, 2, 2]).
+
 The reference is the official package at a pinned commit, given as a
 source checkout (--ltx-src, the directory holding ltx_video/):
 
@@ -135,9 +142,47 @@ def real(ltx_src, ckpt, out):
         f.write("\n")
 
 
+def encode(ltx_src, ckpt, out):
+    """The real encoder (i#372): the latent distribution's mean of a
+    seeded smooth video [3, 9, 64, 64] and of its first frame as a still
+    image [3, 1, 64, 64], normalized per channel as vae_encode does
+    (vae_encode samples the distribution; locus takes its mean)."""
+    sys.path.insert(0, str(pathlib.Path(ltx_src).resolve()))
+    import torch
+    from ltx_video.models.autoencoders.causal_video_autoencoder import (
+        CausalVideoAutoencoder)
+
+    vae = CausalVideoAutoencoder.from_pretrained(ckpt).float().eval()
+    g = torch.Generator().manual_seed(3725)
+    t, yy, xx = torch.meshgrid(torch.arange(9.0), torch.arange(64.0),
+                               torch.arange(64.0), indexing="ij")
+    chans = []
+    for c in range(3):
+        f = 0.05 + 0.15 * torch.rand(3, generator=g)
+        ph = 6.28 * torch.rand(3, generator=g)
+        chans.append((torch.sin(f[0] * xx + 0.3 * t + ph[0]) +
+                      torch.sin(f[1] * yy - 0.2 * t + ph[1]) +
+                      torch.sin(f[2] * (xx + yy) + ph[2])) / 3)
+    video = torch.stack(chans)[None]
+    cases = {}
+    with open(os.path.join(out, "vae_enc_in.f32"), "wb") as fi, \
+            open(os.path.join(out, "vae_enc_out.f32"), "wb") as fo:
+        for name, x in (("video", video), ("image", video[:, :, :1])):
+            with torch.no_grad():
+                m = vae.encoder(x)[:, :128]
+            z = (m - vae.mean_of_means.view(1, -1, 1, 1, 1)) / \
+                vae.std_of_means.view(1, -1, 1, 1, 1)
+            fi.write(x[0].numpy().astype("<f4").tobytes())
+            fo.write(z[0].numpy().astype("<f4").tobytes())
+            cases[name] = {"in": list(x.shape[1:]), "out": list(z.shape[1:])}
+    with open(os.path.join(out, "vae_enc.json"), "w") as f:
+        json.dump(cases, f, indent=1)
+        f.write("\n")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["synth", "real"])
+    ap.add_argument("mode", choices=["synth", "real", "encode"])
     ap.add_argument("--ltx-src", required=True,
                     help="a Lightricks/LTX-Video checkout")
     ap.add_argument("--ckpt", help="real: the 2B single-file checkpoint")
@@ -148,8 +193,8 @@ def main():
         synth(a.ltx_src, a.out)
     else:
         if not a.ckpt:
-            sys.exit("real needs --ckpt")
-        real(a.ltx_src, a.ckpt, a.out)
+            sys.exit(a.mode + " needs --ckpt")
+        (real if a.mode == "real" else encode)(a.ltx_src, a.ckpt, a.out)
 
 
 if __name__ == "__main__":

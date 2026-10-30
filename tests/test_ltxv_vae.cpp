@@ -133,3 +133,45 @@ TEST_CASE("ltxv vae matches the reference on the 2B decoder",
     CAPTURE(err);
     REQUIRE(err <= 1e-4);  // measured 1.0e-5
 }
+
+// The 2B encoder against the reference in float32
+// (scripts/make-ltxv-vae-goldens.py encode): the normalized latent mean
+// of a seeded smooth 9 x 64 x 64 video, and of its first frame alone
+// (the image-to-video condition).
+TEST_CASE("ltxv vae encoder matches the reference on the 2B model",
+          "[ltxv][image][e2e]") {
+    if (!std::filesystem::exists(kModel)) {
+        SKIP("ltxv-2b-vae.gguf absent; see scripts/convert-ltxv.py");
+    }
+    auto g = locus::gguf::GgufFile::open(kModel);
+    const auto vae = LtxvVae::load(g);
+    if (!vae.has_encoder()) {
+        SKIP("ltxv-2b-vae.gguf has no encoder; reconvert it");
+    }
+    const auto j = read_json(kDir + "golden/ltxv/vae_enc.json");
+    const auto in = read_f32(kDir + "golden/ltxv/vae_enc_in.f32");
+    const auto ref = read_f32(kDir + "golden/ltxv/vae_enc_out.f32");
+    std::size_t at_in = 0, at_out = 0;
+    for (const char* name : {"video", "image"}) {
+        INFO(name);
+        const auto s = j[name]["in"].get<std::vector<std::uint32_t>>();
+        const auto o = j[name]["out"].get<std::vector<std::size_t>>();
+        REQUIRE(s.size() == 4);  // [3, f, h, w]
+        REQUIRE(o.size() == 4);  // [128, f', h', w']
+        const std::uint32_t f = s[1], h = s[2], w = s[3];
+        const std::size_t n_in = std::size_t{3} * f * h * w;
+        const std::size_t n_out = o[0] * o[1] * o[2] * o[3];
+        REQUIRE(at_in + n_in <= in.size());
+        REQUIRE(at_out + n_out <= ref.size());
+        const auto got = vae.encode(
+            std::span<const float>(in).subspan(at_in, n_in), f, h, w);
+        const double err = rel_error(
+            got, std::span<const float>(ref).subspan(at_out, n_out));
+        CAPTURE(err);
+        REQUIRE(err <= 1e-4);
+        at_in += n_in;
+        at_out += n_out;
+    }
+    REQUIRE(at_in == in.size());
+    REQUIRE(at_out == ref.size());
+}

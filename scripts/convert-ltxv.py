@@ -7,9 +7,10 @@ to two GGUFs (i#357):
   without that prefix; 2D weights stay BF16 (the matvec kernels read
   BF16), every other tensor becomes F32; the model and sampler keys
   come from the checkpoint's "config" metadata;
-- an "ltxv_vae" GGUF with the VAE decoder: vae.decoder.* and
+- an "ltxv_vae" GGUF with the VAE: vae.decoder.*, vae.encoder.* and
   vae.per_channel_statistics.* without the "vae." prefix, all F32 (the
-  conv kernels read F32); the encoder is left out.
+  conv kernels read F32); the encoder is for image-to-video
+  conditioning (i#372).
 
 Either output may be left out (the synthetic goldens have only a DiT
 or only a decoder).
@@ -34,7 +35,9 @@ import gguf
 import numpy as np
 
 DIT_PREFIX = "model.diffusion_model."
-VAE_KEEP = ("vae.decoder.", "vae.per_channel_statistics.")
+VAE_KEEP = ("vae.decoder.", "vae.encoder.", "vae.per_channel_statistics.")
+ENCODER_KINDS = ("res_x", "compress_space_res", "compress_time_res",
+                 "compress_all_res")
 
 
 def read_header(path):
@@ -164,6 +167,24 @@ def write_vae(path, cfg, tensors):
             params.append(int(p.get("multiplier", 1)))
         else:
             sys.exit("unsupported decoder block %s" % kind)
+    # The encoder, when the checkpoint has it (the synthetic golden's has
+    # only a decoder): causal, pixel-norm res_x groups and space-to-depth
+    # compress_*_res blocks, with a "uniform" log variance (one channel).
+    has_encoder = any(name.startswith("encoder.") for name, _ in tensors)
+    enc_kinds, enc_params = [], []
+    if has_encoder:
+        if v.get("latent_log_var") != "uniform":
+            sys.exit("expected latent_log_var uniform")
+        if v.get("use_quant_conv"):
+            sys.exit("expected no quant_conv")
+        for kind, p in v["encoder_blocks"]:
+            if isinstance(p, int):
+                p = {"num_layers": p}
+            if kind not in ENCODER_KINDS:
+                sys.exit("unsupported encoder block %s" % kind)
+            enc_kinds.append(kind)
+            enc_params.append(int(p["num_layers"] if kind == "res_x"
+                                  else p.get("multiplier", 2)))
 
     w = gguf.GGUFWriter(path, "ltxv_vae")
     w.add_name("ltxv-vae")
@@ -177,15 +198,22 @@ def write_vae(path, cfg, tensors):
     # GGUF tensors have at most 4 dims, so a conv3d weight
     # [out, in, 3, 3, 3] is stored as [out, in, 27] (kt, kh, kw order).
     w.add_uint32(k + "decoder.kernel_size", 3)
+    if has_encoder:
+        w.add_uint32(k + "in_channels", v["in_channels"])
+        w.add_array(k + "encoder.block_kinds", enc_kinds)
+        w.add_array(k + "encoder.block_params", enc_params)
 
-    n = 0
+    n = n_enc = 0
     for name, a in tensors:
         if a.ndim == 5:
             if a.shape[2:] != (3, 3, 3):
                 sys.exit("%s: expected a 3x3x3 kernel" % name)
             a = a.reshape(a.shape[0], a.shape[1], 27)
         w.add_tensor(name, to_f32(a))
-        n += 1
+        if name.startswith("encoder."):
+            n_enc += 1
+        else:
+            n += 1
     # conv_in 2, conv_out 2, the last table 1, last_time_embedder 4,
     # timestep_scale_multiplier 1, per_channel_statistics 5; a res_x
     # group has 5 per layer (conv1 2, conv2 2, table 1) plus its
@@ -194,6 +222,14 @@ def write_vae(path, cfg, tensors):
                     for kind, p in zip(kinds, params))
     if n != want:
         sys.exit("ltxv_vae: wrote %d tensors, expected %d" % (n, want))
+    # The encoder: conv_in 2, conv_out 2; a res_x group 4 per layer
+    # (conv1 2, conv2 2); a compress_*_res block its conv 2.
+    want = 4 + sum(4 * p if kind == "res_x" else 2
+                   for kind, p in zip(enc_kinds, enc_params)) \
+        if has_encoder else 0
+    if n_enc != want:
+        sys.exit("ltxv_vae: wrote %d encoder tensors, expected %d" %
+                 (n_enc, want))
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
