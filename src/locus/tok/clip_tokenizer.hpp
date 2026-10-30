@@ -25,13 +25,22 @@ namespace locus::tok {
  * Each piece maps its UTF-8 bytes to the GPT-2 byte alphabet, gets
  * "</w>" on its last symbol, and is merged by merge rank.
  *
- * Differences from the reference, all for non-ASCII text: ftfy's
- * mojibake repair and its NFC normalization are not done (valid,
- * composed text is unchanged by both), and the Unicode classes are
- * approximate: lowercasing covers Latin-1, Latin Extended-A, Greek and
- * Cyrillic, and a non-ASCII codepoint is a letter unless it is a
- * space, a number, a combining mark or in a punctuation or symbol
- * block.
+ * The special tokens are split out of the text first, wherever they
+ * are, and each piece between them is cleaned and split on its own.
+ *
+ * Differences from the reference, all for unusual text:
+ * - ftfy's mojibake repair and its NFC normalization are not done
+ *   (valid, composed text is unchanged by both);
+ * - of the halfwidth and fullwidth forms, only U+3000, the ASCII block
+ *   (U+FF01 to U+FF5E) and the signs U+FFE0 to U+FFE6 are mapped; the
+ *   halfwidth CJK punctuation, Katakana and Hangul are not;
+ * - HTML entities are &amp; &lt; &gt; &quot; &apos; &nbsp; and numeric
+ *   references, without html.unescape's cp1252 remapping of
+ *   &#128; to &#159; or its U+FFFD replacement of invalid ones;
+ * - the Unicode classes are approximate: lowercasing covers Latin-1,
+ *   Latin Extended-A, Greek (with the word-final sigma) and Cyrillic,
+ *   and a codepoint above Latin-1 is a letter unless it is a space, a
+ *   number, a combining mark or in a punctuation or symbol block.
  */
 class ClipTokenizer {
   public:
@@ -63,6 +72,9 @@ class ClipTokenizer {
 
   private:
     void bpe(const std::string& word, std::vector<TokenId>& out) const;
+    /** Cleans, splits and BPE-encodes text with no special token. */
+    void tokenize_piece(std::string_view text,
+                        std::vector<TokenId>& out) const;
 
     std::unordered_map<std::string, TokenId> vocab_;
     /** "left right" -> merge rank. */

@@ -195,8 +195,12 @@ std::vector<std::uint32_t> ftfy_subset(std::string_view text) {
         // halfwidth Katakana and Hangul are left as they are).
         if (cp == 0x3000) cp = ' ';
         else if (cp >= 0xff01 && cp <= 0xff5e) cp -= 0xfee0;
-        else if (cp >= 0xffe0 && cp <= 0xffe6) {
-            static constexpr std::uint32_t kSigns[] = {0xa2, 0xa3, 0xac, 0xaf,
+        else if (cp == 0xffe3) {
+            // NFKC of the fullwidth macron: a space and a combining one.
+            out.push_back(' ');
+            cp = 0x304;
+        } else if (cp >= 0xffe0 && cp <= 0xffe6) {
+            static constexpr std::uint32_t kSigns[] = {0xa2, 0xa3, 0xac, 0,
                                                        0xa6, 0xa5, 0x20a9};
             cp = kSigns[cp - 0xffe0];
         }
@@ -229,16 +233,6 @@ std::vector<std::uint32_t> ftfy_subset(std::string_view text) {
         if (!control) clean.push_back(c);
     }
     return clean;
-}
-
-/** @returns Whether cps from i spell s (ASCII). */
-bool starts_with(const std::vector<std::uint32_t>& cps, std::size_t i,
-                 std::string_view s) {
-    if (i + s.size() > cps.size()) return false;
-    for (std::size_t k = 0; k < s.size(); ++k) {
-        if (cps[i + k] != static_cast<unsigned char>(s[k])) return false;
-    }
-    return true;
 }
 
 }  // namespace
@@ -336,10 +330,36 @@ void ClipTokenizer::bpe(const std::string& word,
 }
 
 std::vector<TokenId> ClipTokenizer::tokenize(std::string_view text) const {
+    // The special tokens split the text first, wherever they are, as the
+    // reference's added-token split does; each piece is cleaned alone.
+    std::vector<TokenId> out;
+    while (!text.empty()) {
+        std::size_t at = std::string_view::npos;
+        std::string_view special;
+        for (const std::string_view s : {kStart, kEnd}) {
+            const std::size_t p = text.find(s);
+            if (p < at) {
+                at = p;
+                special = s;
+            }
+        }
+        tokenize_piece(text.substr(0, at), out);
+        if (at == std::string_view::npos) break;
+        const auto it = vocab_.find(std::string(special));
+        out.push_back(it != vocab_.end() ? it->second : unk_);
+        text.remove_prefix(at + special.size());
+    }
+    return out;
+}
+
+void ClipTokenizer::tokenize_piece(std::string_view text,
+                                   std::vector<TokenId>& out) const {
     // Clean: whitespace runs to one space, ends trimmed; then lower.
+    const std::vector<std::uint32_t> fixed = ftfy_subset(text);
     std::vector<std::uint32_t> cps;
     bool pending_space = false;
-    for (const std::uint32_t cp : ftfy_subset(text)) {
+    for (std::size_t i = 0; i < fixed.size(); ++i) {
+        const std::uint32_t cp = fixed[i];
         if (is_space(cp)) {
             pending_space = !cps.empty();
             continue;
@@ -348,12 +368,19 @@ std::vector<TokenId> ClipTokenizer::tokenize(std::string_view text) const {
             cps.push_back(' ');
             pending_space = false;
         }
+        // Python lowers a capital sigma that ends a word to the final
+        // form: after a letter and not before one.
+        if (cp == 0x3a3) {
+            const bool after = i > 0 && is_letter(fixed[i - 1]);
+            const bool before = i + 1 < fixed.size() && is_letter(fixed[i + 1]);
+            cps.push_back(after && !before ? 0x3c2 : 0x3c3);
+            continue;
+        }
         std::uint32_t second = 0;
         cps.push_back(lower(cp, second));
         if (second != 0) cps.push_back(second);
     }
 
-    std::vector<TokenId> out;
     const auto& alpha = byte_cps();
     const auto emit = [&](std::size_t b, std::size_t e) {
         std::string utf8, mapped;
@@ -367,16 +394,8 @@ std::vector<TokenId> ClipTokenizer::tokenize(std::string_view text) const {
             ++i;
             continue;
         }
-        // The regex's alternatives, in its order.
-        std::string_view special;
-        if (starts_with(cps, i, kStart)) special = kStart;
-        if (starts_with(cps, i, kEnd)) special = kEnd;
-        if (!special.empty()) {
-            const auto it = vocab_.find(std::string(special));
-            out.push_back(it != vocab_.end() ? it->second : unk_);
-            i += special.size();
-            continue;
-        }
+        // The regex's alternatives, in its order (the special tokens are
+        // already split out).
         if (cps[i] == '\'' && i + 1 < n) {
             const std::uint32_t c1 = cps[i + 1];
             const std::uint32_t c2 = i + 2 < n ? cps[i + 2] : 0;
@@ -405,7 +424,6 @@ std::vector<TokenId> ClipTokenizer::tokenize(std::string_view text) const {
         emit(i, e);
         i = e;
     }
-    return out;
 }
 
 std::vector<TokenId> ClipTokenizer::encode(std::string_view text,

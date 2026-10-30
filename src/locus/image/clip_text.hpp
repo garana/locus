@@ -21,7 +21,7 @@ namespace locus::image {
  * v * sigmoid(1.702 v); a final layer norm. The pooled output is the
  * final row at the end token: with the legacy config eos_token_id 2
  * that is the first position of the largest id (transformers'
- * argmax), else the first position of the end token.
+ * argmax), else the first position of the end token (0 without one).
  *
  * Weights come from a "clip_text" GGUF (scripts/convert-flux.py), all
  * F32. Matrices stay in the GGUF mapping, so the GgufFile must outlive

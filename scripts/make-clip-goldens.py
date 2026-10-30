@@ -52,6 +52,8 @@ PROMPTS = [
     "Tom &amp; Jerry &#38; &#x41;BC &quot;cartoon&quot;",
     "it’s ‘single’ and ʼmodifier quotes",
     "bell\x07 and \x1b[31mred\x1b[0m escapes",
+    "ΟΔΟΣ ΣΟΦΟΣ and ΣΑ",
+    "wow!<|endoftext|>after and a￣macron",
     ("a very long prompt " * 20).strip(),
 ]
 

@@ -207,9 +207,9 @@ ClipTextEncoder::Output ClipTextEncoder::encode(
         at = static_cast<std::size_t>(
             std::max_element(ids.begin(), ids.end()) - ids.begin());
     } else {
+        // (ids == eos).argmax(): the first end token, or 0 without one.
         const auto it = std::find(ids.begin(), ids.end(), eos_);
-        at = it != ids.end() ? static_cast<std::size_t>(it - ids.begin())
-                             : n - 1;
+        at = it != ids.end() ? static_cast<std::size_t>(it - ids.begin()) : 0;
     }
     out.pooled.assign(out.hidden.begin() + static_cast<std::ptrdiff_t>(at * w),
                       out.hidden.begin() +
