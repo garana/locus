@@ -221,11 +221,13 @@ FluxDit FluxDit::load(const gguf::GgufFile& g) {
         std::memcpy(out.data(), g.tensor_data(*ti).data(), n * sizeof(float));
         return out;
     };
-    // A Linear [rows, cols], BF16 or F32.
+    // A Linear [rows, cols], BF16, Q8_0 (convert-flux.py --dit-type
+    // q8_0) or F32.
     const auto lin = [&](const std::string& name, std::uint32_t rows,
                          std::uint32_t cols) {
         const gguf::TensorInfo* ti = info(name + ".weight");
         if ((ti->type != gguf::TensorType::kBF16 &&
+             ti->type != gguf::TensorType::kQ8_0 &&
              ti->type != gguf::TensorType::kF32) ||
             ti->n_dims != 2 || ti->ne[0] != cols || ti->ne[1] != rows) {
             throw gguf::Error("flux: " + name + ".weight is not " +
