@@ -126,9 +126,9 @@ std::string find_executable(const std::string& name) {
         std::string dir = path.substr(start, colon == std::string::npos
                                                  ? std::string::npos
                                                  : colon - start);
-        if (dir.empty()) dir = ".";  // an empty entry is the current dir
-        // Built in steps: dir + "/" + name trips GCC 12's -Wrestrict
-        // false positive.
+        // An empty entry is the current dir. assign(1, '.') rather than
+        // = ".", which trips GCC 12's -Wrestrict false positive.
+        if (dir.empty()) dir.assign(1, '.');
         std::string p = dir;
         p += '/';
         p += name;
