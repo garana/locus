@@ -2595,7 +2595,7 @@ void OpenAiServer::install_routes() {
                                                     std::try_to_lock);
                     if (!lk.owns_lock()) {
                         set_unavailable(res,
-                                        "an image is already being "
+                                        "an image or video is already being "
                                         "generated; retry later",
                                         60);
                         return;
@@ -2784,7 +2784,7 @@ void OpenAiServer::install_routes() {
                                                     std::try_to_lock);
                     if (!lk.owns_lock()) {
                         set_unavailable(res,
-                                        "an image is already being "
+                                        "an image or video is already being "
                                         "generated; retry later",
                                         60);
                         return;
@@ -2941,7 +2941,7 @@ void OpenAiServer::install_routes() {
                                                     std::try_to_lock);
                     if (!lk.owns_lock()) {
                         set_unavailable(res,
-                                        "an image is already being "
+                                        "an image or video is already being "
                                         "generated; retry later",
                                         30);
                         return;
@@ -3391,7 +3391,7 @@ void OpenAiServer::install_routes() {
                     }
                     progress(90);
                     video::encode_mp4(*ffmpeg_, frames, p.width, p.height,
-                                      p.frame_rate, out);
+                                      p.frame_rate, out, alive);
                 });
             if (!job) {
                 set_unavailable(res, "too many video jobs; retry later", 60);
@@ -3439,7 +3439,12 @@ void OpenAiServer::install_routes() {
                             "application/json");
             return;
         }
+        // The file can expire between get() and the open: then a 404.
         std::ifstream f(job->file, std::ios::binary);
+        if (!f.is_open()) {
+            video_not_found(res, id);
+            return;
+        }
         std::string mp4((std::istreambuf_iterator<char>(f)),
                         std::istreambuf_iterator<char>());
         if (!f.good() && !f.eof()) {

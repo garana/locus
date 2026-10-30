@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -96,6 +97,56 @@ TEST_CASE("run_process feeds stdin and reads both outputs", "[video]") {
     // A child that stops reading early: the write fails, locus lives.
     const auto early = locus::video::run_process({"/usr/bin/true"}, parts);
     REQUIRE(early.exit_code == 0);
+}
+
+// The child keeps only 0, 1 and 2: an fd locus has open (as its
+// sockets are, without close-on-exec) is closed before the exec.
+TEST_CASE("run_process closes the parent's other fds in the child",
+          "[video]") {
+    const int fd = ::open("/dev/null", O_RDONLY);
+    REQUIRE(fd >= 0);
+    REQUIRE(::dup2(fd, 77) == 77);  // dup2 leaves 77 inheritable
+    ::close(fd);
+    // A redirect to fd 77 fails when it is closed (macOS's /dev/fd
+    // lists only 0 to 2, so it cannot tell).
+    const auto r = locus::video::run_process(
+        {"/bin/sh", "-c",
+         "if { : >&77; } 2>/dev/null; then echo leaked; else echo closed; "
+         "fi"},
+        {});
+    ::close(77);
+    REQUIRE(r.exit_code == 0);
+    REQUIRE(r.out == "closed\n");
+}
+
+TEST_CASE("run_process stops a child at its deadline or on request",
+          "[video]") {
+    using Clock = std::chrono::steady_clock;
+    auto t0 = Clock::now();
+    auto r = locus::video::run_process({"/bin/sh", "-c", "sleep 30"}, {}, 1);
+    REQUIRE(r.killed);
+    REQUIRE(r.exit_code == -1);
+    REQUIRE(Clock::now() - t0 < std::chrono::seconds(10));
+    t0 = Clock::now();
+    r = locus::video::run_process({"/bin/sh", "-c", "sleep 30"}, {}, 0,
+                                  [] { return false; });
+    REQUIRE(r.killed);
+    REQUIRE(Clock::now() - t0 < std::chrono::seconds(10));
+    // A quick child within its deadline is not touched.
+    r = locus::video::run_process({"/bin/sh", "-c", "echo ok"}, {}, 30,
+                                  [] { return true; });
+    REQUIRE_FALSE(r.killed);
+    REQUIRE(r.out == "ok\n");
+}
+
+TEST_CASE("find_executable searches PATH as a shell does", "[video]") {
+    const auto sh = locus::video::find_executable("sh");
+    REQUIRE(sh.size() > 3);
+    REQUIRE(sh.substr(sh.size() - 3) == "/sh");
+    REQUIRE(locus::video::find_executable("/bin/sh") == "/bin/sh");
+    REQUIRE(locus::video::find_executable("locus-no-such-cmd").empty());
+    REQUIRE(locus::video::find_executable("/nonexistent/sh").empty());
+    REQUIRE(locus::video::find_executable("/tmp").empty());  // a directory
 }
 
 TEST_CASE("an mp4 goes through the ffmpeg helper", "[video]") {
