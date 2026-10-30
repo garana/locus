@@ -210,6 +210,16 @@ float* vulkan_alloc_kv(std::size_t n_floats);
 void vulkan_reset_state();
 
 /**
+ * Drops the Vulkan weight-pool buffers (copies and in-place imports)
+ * over host memory [p, p + n), as an unmap does: an image pipeline
+ * whose parts do not all fit the GPU at once releases one part before
+ * the next (FLUX: T5-XXL before the DiT). The next use uploads or
+ * imports them again. No-op without Vulkan.
+ * @throws std::logic_error inside an open batch.
+ */
+void vulkan_release_weights(const void* p, std::size_t n);
+
+/**
  * CUDA matvec: F32, Q8_0, Q2_K, Q4_K, Q5_K, Q6_K and the
  * IQ1_S/IQ2_XXS/IQ3_XXS/IQ4_XS families run on an NVIDIA GPU
  * (pooled/paged); other types delegate to scalar.

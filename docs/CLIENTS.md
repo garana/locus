@@ -45,9 +45,11 @@ model the server loaded:
 | FLUX.1       | `--image-model <dir>`         | WxH (*)             | `steps` (28, 4 for schnell; up to 100), `guidance_scale` (3.5), `max_sequence_length` (512), `seed`     |
 
 (*) `size` is any "WxH" with both sides multiples of 16, up to 2048 a
-side and 1024 x 1024 pixels in all; the default is 1024x1024. FLUX
-runs on the CPU, so an image takes minutes even at 256; a GPU forward
-is i#372 step 9.
+side and 1024 x 1024 pixels in all; the default is 1024x1024. On a
+Vulkan GPU with unified memory the DiT runs each step on the GPU: on
+an M4 Max, a 256x256 image with 16 steps takes about 35 s, and one
+step at 1024x1024 about 17 s. Elsewhere FLUX runs on the CPU, minutes
+per image even at 256.
 
 A request whose `model` starts with `pixart` (or `flux`) goes to the
 pipeline in `--image-model`, and so does every request unless both a

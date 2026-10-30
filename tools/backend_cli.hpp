@@ -234,6 +234,8 @@ inline constexpr const char* kCommonHelp =
     "  LOCUS_VK_CPU_ROUTE=1    Vulkan: route MoE experts on the\n"
     "                          host (default routes on the GPU\n"
     "                          when all experts fit unbudgeted)\n"
+    "  LOCUS_FLUX_GPU=0        FLUX on Vulkan: run the DiT per\n"
+    "                          op instead of a resident GPU step\n"
     "  LOCUS_BATCH_DEQUANT=1   in batched forward, dequant each\n"
     "                          weight row once then dot all N\n"
     "                          tokens (token-exact, not byte-\n"

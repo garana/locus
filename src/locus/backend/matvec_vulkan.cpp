@@ -1496,6 +1496,18 @@ void vulkan_reset_state() {
     state().free_buffers();
 }
 
+void vulkan_release_weights(const void* p, std::size_t n) {
+    if (!vulkan_backend_usable()) {
+        return;
+    }
+    std::lock_guard lk(state_mu());
+    State& s = state();
+    if (s.ctx.batch_open()) {
+        throw std::logic_error("vulkan_release_weights: batch open");
+    }
+    s.pool.release_range(p, n);
+}
+
 void matvec_vulkan(const Mat& w, std::span<const float> x,
                    std::span<float> out) {
     if (matvec_kernel(w) == Kernel::kCount_) {

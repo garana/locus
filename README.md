@@ -41,13 +41,15 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   (T5-XXL encoder, DiT, DPM-Solver++, SD VAE; one 512 x 512 PNG), or
   with FLUX.1 dev, schnell or Kontext dev as text to image (CLIP-L and
   T5-XXL, the MMDiT, flow-matching Euler, the FLUX VAE; up to 1024 x
-  1024 pixels; on the CPU, minutes per image). `/v1/images/edits` runs
-  FLUX.1 Kontext dev on a reference image (its VAE-encoded tokens join
-  the image tokens), for the same character or scene in a new picture.
-  For PixArt on a Vulkan GPU with unified memory, whatever backend the
-  language model uses, the linears, the DiT's attention and the VAE's
-  convolutions run on the GPU; T5's attention stays on the CPU. Request
-  fields:
+  1024 pixels). `/v1/images/edits` runs FLUX.1 Kontext dev on a
+  reference image (its VAE-encoded tokens join the image tokens), for
+  the same character or scene in a new picture. On a Vulkan GPU with
+  unified memory, whatever backend the language model uses, PixArt's
+  linears, DiT attention and VAE convolutions run on the GPU (T5's
+  attention stays on the CPU), and the FLUX DiT runs each whole step
+  on the GPU with its activations resident (about 35 s for a 256 x 256
+  image on an M4 Max); elsewhere FLUX runs on the CPU, minutes per
+  image. Request fields:
   docs/CLIENTS.md.
 - **Image input:** PNG and JPEG in chat requests (OpenAI `image_url`
   data URLs, Anthropic image blocks) with Janus-Pro-1B.
