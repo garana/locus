@@ -1398,6 +1398,26 @@ void OpenAiServer::install_routes() {
             gauge("locus_requests_waiting",
                   "Requests waiting for admission after the last step.",
                   em.waiting.load(kRelaxed));
+            gauge("locus_batch_tokens",
+                  "Tokens the model computed in the last step (prefill, "
+                  "decode and speculative verify).",
+                  em.batch_tokens.load(kRelaxed));
+            // Each block in use counted once; with locus_kv_blocks_free
+            // the three sum to locus_kv_blocks_total.
+            mt.family("locus_kv_blocks_used",
+                      "KV blocks in use after the last step, by what holds "
+                      "them: a prefilling sequence, else a decoding one, "
+                      "else only the prefix cache.",
+                      "gauge");
+            for (const auto& [state, v] :
+                 {std::pair<const char*, std::uint32_t>{
+                      "prefilling", em.kv_blocks_prefilling.load(kRelaxed)},
+                  {"decoding", em.kv_blocks_decoding.load(kRelaxed)},
+                  {"cached", em.kv_blocks_cached.load(kRelaxed)}}) {
+                mt.value("locus_kv_blocks_used",
+                         MetricsText::label("state", state),
+                         std::uint64_t{v});
+            }
             // CPU cache counters for the inference compute threads
             // (Linux perf). Absent -- not zero -- when unavailable
             // (non-Linux, or perf_event_paranoid denies it), so a

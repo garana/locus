@@ -1224,6 +1224,32 @@ TEST_CASE("metrics carry labels and timings in well-formed histograms",
     REQUIRE(metric_value(b, "locus_decode_tokens_total") >= 6);  // 2 x 3
     REQUIRE(metric_value(b, "locus_prefill_tokens_total") > 0);
     REQUIRE(metric_value(b, "locus_requests_waiting") == 0);
+    REQUIRE(metric_value(b, "locus_batch_tokens") >= 0);  // present
+    // KV blocks in use by state: with the free blocks, the pool.
+    const auto kv_used = [&](const std::string& state) {
+        const std::string key = "state=\"" + state + "\"} ";
+        for (std::size_t at = 0; at < b.size();) {
+            const std::size_t eol = b.find('\n', at);
+            const std::string line =
+                b.substr(at, eol == std::string::npos ? eol : eol - at);
+            at = eol == std::string::npos ? b.size() : eol + 1;
+            const std::size_t k = line.find(key);
+            if (line.rfind("locus_kv_blocks_used{", 0) == 0 &&
+                k != std::string::npos) {
+                return std::atol(line.c_str() + k + key.size());
+            }
+        }
+        return -1L;
+    };
+    const long prefilling = kv_used("prefilling");
+    const long decoding = kv_used("decoding");
+    const long cached = kv_used("cached");
+    REQUIRE(prefilling >= 0);
+    REQUIRE(decoding >= 0);
+    REQUIRE(cached >= 0);
+    REQUIRE(prefilling + decoding + cached +
+                metric_value(b, "locus_kv_blocks_free") ==
+            metric_value(b, "locus_kv_blocks_total"));
 
     // Histogram: buckets cumulative, +Inf equals _count, which counts
     // both requests.

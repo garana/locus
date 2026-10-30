@@ -94,6 +94,7 @@ bool Engine::has_runnable_work() const {
 
 bool Engine::step() {
     const auto t0 = std::chrono::steady_clock::now();
+    step_tokens_ = 0;
     const bool more = step_once();
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - t0);
@@ -104,7 +105,36 @@ bool Engine::step() {
                            std::memory_order_relaxed);
     metrics_.waiting.store(static_cast<std::uint32_t>(waiting_.size()),
                            std::memory_order_relaxed);
+    metrics_.batch_tokens.store(step_tokens_, std::memory_order_relaxed);
+    count_block_states();
     return more;
+}
+
+void Engine::count_block_states() {
+    // 0: not held by a running sequence; 1: decoding; 2: prefilling. A
+    // block shared by both kinds counts once, as prefilling.
+    block_state_.assign(cache_.total_blocks(), 0);
+    for (const std::uint64_t id : running_) {
+        const Request& r = *requests_.at(id);
+        const std::uint8_t s = r.n_fed < r.prompt.size() ? 2 : 1;
+        for (const kv::BlockId b : r.seq.blocks) {
+            if (b < block_state_.size()) {
+                block_state_[b] = std::max(block_state_[b], s);
+            }
+        }
+    }
+    std::uint32_t prefilling = 0, decoding = 0;
+    for (const std::uint8_t s : block_state_) {
+        prefilling += s == 2;
+        decoding += s == 1;
+    }
+    // The rest of the blocks in use belong only to the prefix cache.
+    const std::uint32_t used = cache_.total_blocks() - cache_.free_blocks();
+    const std::uint32_t held = prefilling + decoding;
+    constexpr auto kRelaxed = std::memory_order_relaxed;
+    metrics_.kv_blocks_prefilling.store(prefilling, kRelaxed);
+    metrics_.kv_blocks_decoding.store(decoding, kRelaxed);
+    metrics_.kv_blocks_cached.store(used > held ? used - held : 0, kRelaxed);
 }
 
 bool Engine::step_once() {
@@ -202,6 +232,7 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
                         r.prompt.data() + r.n_fed, nb),
                     cache_, r.seq, ws_, logits_);
                 r.n_fed += nb;
+                step_tokens_ += nb;
                 budget -= nb;
                 continue;
             }
@@ -234,6 +265,7 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
                 : r.generated[r.n_fed - n_prompt];
         model_.forward(input, cache_, r.seq, ws_, logits_);
         ++r.n_fed;
+        ++step_tokens_;
         if (prefilling) {
             --budget;
         }
@@ -515,6 +547,7 @@ bool Engine::spec_decode_step(Request& r) {
                          {batched_logits_.data(), need},
                          /*all_logits=*/true);
     ++spec_steps_;
+    step_tokens_ += static_cast<std::uint32_t>(batch.size());
 
     // Verify greedily: logits at position base+i-1 predict token
     // base+i; the pending token (batch[0]) is already committed.
@@ -643,6 +676,7 @@ bool Engine::prefill_only(Request& r, std::uint32_t& budget) {
                         r.prompt.data() + r.n_fed, nb),
                     cache_, r.seq, ws_, r.logits);
                 r.n_fed += nb;
+                step_tokens_ += nb;
                 budget -= nb;
                 continue;
             }
@@ -667,6 +701,7 @@ bool Engine::prefill_only(Request& r, std::uint32_t& budget) {
         model_.forward(r.prompt[r.n_fed], cache_, r.seq, ws_,
                        r.logits);
         ++r.n_fed;
+        ++step_tokens_;
         --budget;
     }
     return true;
@@ -774,6 +809,7 @@ bool Engine::step_batched() {
             toks, cache_,
             std::span<kv::PagedKvCache::Seq* const>(seqs), ws_,
             std::span<float>(batched_logits_.data(), need));
+        step_tokens_ += static_cast<std::uint32_t>(toks.size());
         for (std::size_t j = 0; j < ids.size(); ++j) {
             Request& r = *requests_.at(ids[j]);
             if (r.logits.size() != V) {

@@ -320,6 +320,9 @@ class Engine {
      * correction/bonus. @returns false if it could not run (capacity
      * / overflow) so the caller uses the per-token path. */
     bool spec_decode_step(Request& r);
+    /** Counts the KV blocks in use by state into metrics_ (each block
+     * once: prefilling, else decoding, else cached). */
+    void count_block_states();
 
     const model::TransformerModel& model_;
     tok::TokenId eos_;
@@ -348,6 +351,10 @@ class Engine {
     std::uint64_t prefix_reused_tokens_ = 0;
     std::uint64_t spec_accepted_ = 0;
     std::uint64_t spec_steps_ = 0;
+    /** Tokens the model computed in the current step. */
+    std::uint32_t step_tokens_ = 0;
+    /** One state per pool block, reused by count_block_states. */
+    std::vector<std::uint8_t> block_state_;
     EngineMetrics metrics_;
 };
 

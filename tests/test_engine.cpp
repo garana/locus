@@ -220,6 +220,66 @@ TEST_CASE("prefix cache reuses KV and stays byte-exact",
     REQUIRE(engine.free_blocks() < engine.total_blocks());  // pinned
 }
 
+// i#285: the last step's token count, and the KV blocks in use by what
+// holds them; with the free blocks they always sum to the pool.
+TEST_CASE("engine reports step tokens and kv blocks by state",
+          "[engine][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const auto prompt = tok.encode(
+        "Once upon a time, there was a little girl named Lily who "
+        "loved to explore the forest near her home every day.",
+        true);
+    REQUIRE(prompt.size() > 16);  // at least one full, cacheable block
+
+    Engine::Config cfg;
+    cfg.prefix_cache = true;
+    cfg.prefill_budget = 4;  // a few steps of prefill
+    Engine engine(model, tok.eos_id(), cfg);
+    const auto& m = engine.metrics();
+    const auto sums = [&] {
+        REQUIRE(m.kv_blocks_prefilling + m.kv_blocks_decoding +
+                    m.kv_blocks_cached + engine.free_blocks() ==
+                engine.total_blocks());
+    };
+    const auto id = engine.submit(prompt, 6);
+    int prefill_steps = 0, decode_steps = 0;
+    while (engine.step()) {
+        sums();
+        if (m.kv_blocks_prefilling > 0) {
+            // Mid-prompt: the budget's 4 tokens, no decoding blocks.
+            ++prefill_steps;
+            REQUIRE(m.batch_tokens == 4);
+            REQUIRE(m.kv_blocks_decoding == 0);
+        } else if (m.kv_blocks_decoding > 0) {
+            // The step that ends the prompt feeds its last chunk (and
+            // may decode one token); every later step decodes one.
+            ++decode_steps;
+            if (decode_steps == 1) {
+                REQUIRE(m.batch_tokens >= 1);
+                REQUIRE(m.batch_tokens <= 5);
+            } else {
+                REQUIRE(m.batch_tokens == 1);
+            }
+        }
+    }
+    sums();
+    REQUIRE(prefill_steps >= 4);  // over 16 prompt tokens, 4 a step
+    REQUIRE(decode_steps >= 2);
+    REQUIRE(engine.get(id)->status == Status::kDone);
+    // Done: no sequence holds blocks; the prefix cache keeps the
+    // prompt's full blocks.
+    REQUIRE(m.kv_blocks_prefilling == 0);
+    REQUIRE(m.kv_blocks_decoding == 0);
+    REQUIRE(m.kv_blocks_cached >= 1);
+    REQUIRE(m.kv_blocks_cached ==
+            engine.total_blocks() - engine.free_blocks());
+}
+
 TEST_CASE("speculative decoding matches greedy output",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
