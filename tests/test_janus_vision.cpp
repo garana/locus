@@ -13,11 +13,13 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "gguf_builder.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
@@ -303,4 +305,158 @@ TEST_CASE("bench: janus vision tower", "[.][bench][janus]") {
             REQUIRE(std::isfinite(ali[0]));
         }
     }
+}
+
+namespace {
+
+/** One tensor of the synthetic tower: GGUF dims (ne0 first) and data. */
+struct SynthTensor {
+    std::string name;
+    std::vector<std::uint64_t> dims;
+    std::uint32_t type;  // 0 F32, 30 BF16
+    std::vector<std::byte> data;
+};
+
+/**
+ * A seeded Janus vision GGUF image: a 64 x 64 image in 8 x 8 patches
+ * (64 tokens), width 64 in 4 heads, FFN 128, 2 blocks, an aligner to
+ * n_embd 48. Matrices are BF16, everything else F32.
+ */
+std::vector<std::byte> synth_tower_gguf(std::uint32_t n_embd) {
+    constexpr std::uint32_t kImage = 64, kPatch = 8, kW = 64, kHeads = 4,
+                            kFfn = 128, kBlocks = 2;
+    constexpr std::uint32_t kTokens = (kImage / kPatch) * (kImage / kPatch);
+    std::mt19937 rng(386);
+    std::vector<SynthTensor> ts;
+    const auto f32 = [&](std::string name, std::vector<std::uint64_t> dims,
+                         float lo, float hi) {
+        std::uniform_real_distribution<float> d(lo, hi);
+        std::size_t n = 1;
+        for (auto x : dims) n *= x;
+        std::vector<std::byte> b(n * 4);
+        for (std::size_t i = 0; i < n; ++i) {
+            const float v = d(rng);
+            std::memcpy(&b[i * 4], &v, 4);
+        }
+        ts.push_back({std::move(name), std::move(dims), 0, std::move(b)});
+    };
+    const auto bf16 = [&](std::string name, std::uint64_t rows,
+                          std::uint64_t cols) {
+        // About unit-variance outputs for unit-variance inputs.
+        const float a = 1.0f / std::sqrt(static_cast<float>(cols));
+        std::uniform_real_distribution<float> d(-a, a);
+        std::vector<std::byte> b(rows * cols * 2);
+        for (std::size_t i = 0; i < rows * cols; ++i) {
+            std::uint32_t u;
+            const float v = d(rng);
+            std::memcpy(&u, &v, 4);
+            const auto h = static_cast<std::uint16_t>(u >> 16);
+            std::memcpy(&b[i * 2], &h, 2);
+        }
+        ts.push_back({std::move(name), {cols, rows}, 30, std::move(b)});
+    };
+    f32("vit.patch_embd.weight", {kPatch, kPatch, 3, kW}, -0.05f, 0.05f);
+    f32("vit.patch_embd.bias", {kW}, -0.1f, 0.1f);
+    f32("vit.pos_embd", {kW, kTokens}, -0.5f, 0.5f);
+    for (std::uint32_t i = 0; i < kBlocks; ++i) {
+        const std::string b = "vit.blk." + std::to_string(i) + ".";
+        f32(b + "ln1.weight", {kW}, 0.8f, 1.2f);
+        f32(b + "ln1.bias", {kW}, -0.1f, 0.1f);
+        bf16(b + "attn_qkv.weight", 3 * kW, kW);
+        f32(b + "attn_qkv.bias", {3 * kW}, -0.1f, 0.1f);
+        bf16(b + "attn_out.weight", kW, kW);
+        f32(b + "attn_out.bias", {kW}, -0.1f, 0.1f);
+        f32(b + "ln2.weight", {kW}, 0.8f, 1.2f);
+        f32(b + "ln2.bias", {kW}, -0.1f, 0.1f);
+        bf16(b + "ffn_up.weight", kFfn, kW);
+        f32(b + "ffn_up.bias", {kFfn}, -0.1f, 0.1f);
+        bf16(b + "ffn_down.weight", kW, kFfn);
+        f32(b + "ffn_down.bias", {kW}, -0.1f, 0.1f);
+    }
+    f32("vit.post_ln.weight", {kW}, 0.8f, 1.2f);
+    f32("vit.post_ln.bias", {kW}, -0.1f, 0.1f);
+    bf16("vit.aligner.0.weight", n_embd, kW);
+    f32("vit.aligner.0.bias", {n_embd}, -0.1f, 0.1f);
+    bf16("vit.aligner.2.weight", n_embd, n_embd);
+    f32("vit.aligner.2.bias", {n_embd}, -0.1f, 0.1f);
+
+    GgufBuilder g;
+    g.header(ts.size(), 12)
+        .kv_string("general.architecture", "llama")
+        .kv_u32("janus.vision.image_size", kImage)
+        .kv_u32("janus.vision.patch_size", kPatch)
+        .kv_u32("janus.vision.embedding_length", kW)
+        .kv_u32("janus.vision.head_count", kHeads)
+        .kv_u32("janus.vision.feed_forward_length", kFfn)
+        .kv_u32("janus.vision.block_count", kBlocks)
+        .kv_u32("janus.vision.image_placeholder", 100)
+        .kv_u32("janus.vision.end_of_image", 101)
+        .kv_u32("janus.begin_of_image", 102)
+        .kv_f32("janus.vision.layer_norm_eps", 1e-6f)
+        .kv_u32("general.alignment", 32);
+    std::uint64_t off = 0;
+    for (const auto& t : ts) {
+        g.tensor(t.name, t.dims, t.type, off);
+        off += (t.data.size() + 31) / 32 * 32;
+    }
+    g.pad();
+    for (const auto& t : ts) {
+        g.raw_bytes(t.data);
+        g.pad();
+    }
+    const auto b = g.bytes();
+    return {b.begin(), b.end()};
+}
+
+}  // namespace
+
+// The tower on the GPU (one resident VulkanSeq) against the CPU on a
+// seeded 2-block model, so its ops (the patch matmul, affine
+// LayerNorm, attention, erf GELU, residual adds) run in CI without the
+// 4 GB Janus GGUF.
+TEST_CASE("janus vision tower on vulkan matches the cpu on a tiny model",
+          "[janus][image][vision][vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device");
+    }
+    constexpr std::uint32_t kEmbd = 48;
+    const auto buf = synth_tower_gguf(kEmbd);
+    // The weights are uploaded keyed by their host addresses; drop them
+    // before buf goes, so a later test at the same address cannot hit
+    // them.
+    struct Release {
+        const std::vector<std::byte>& b;
+        ~Release() {
+            locus::backend::vulkan_release_weights(b.data(), b.size());
+        }
+    } release{buf};
+    const auto g = locus::gguf::GgufFile::parse(buf);
+    const auto v = locus::image::JanusVision::load(g, kEmbd);
+    REQUIRE(v.tokens() == 64);
+    std::mt19937 rng(7);
+    std::uniform_int_distribution<int> px(0, 255);
+    std::vector<std::uint8_t> rgb(std::size_t{64} * 64 * 3);
+    for (auto& c : rgb) c = static_cast<std::uint8_t>(px(rng));
+    const auto chw = v.to_pixels(rgb);
+    const auto& cpu = locus::backend::best_backend().ops;
+    const auto& gpu = locus::backend::vulkan_image_ops();
+    const auto f_cpu = v.features(chw, cpu);
+    const auto f_gpu = v.features(chw, gpu);
+    const auto a_cpu = v.align(f_cpu, cpu);
+    const auto a_gpu = v.align(f_gpu, gpu);
+    const auto rel = [](const std::vector<float>& got,
+                        const std::vector<float>& ref) {
+        double dd = 0.0, ss = 0.0;
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            dd += (double{got[i]} - ref[i]) * (double{got[i]} - ref[i]);
+            ss += double{ref[i]} * ref[i];
+        }
+        return std::sqrt(dd / ss);
+    };
+    REQUIRE(f_gpu.size() == f_cpu.size());
+    REQUIRE(a_gpu.size() == a_cpu.size());
+    WARN("features " << rel(f_gpu, f_cpu) << ", aligned "
+                     << rel(a_gpu, a_cpu));
+    REQUIRE(rel(f_gpu, f_cpu) < 1e-5);
+    REQUIRE(rel(a_gpu, a_cpu) < 1e-5);
 }
