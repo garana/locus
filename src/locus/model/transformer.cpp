@@ -13,6 +13,7 @@
 #include "locus/model/arch.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/model/gguf_load.hpp"
+#include "locus/model/gqa_attend.hpp"
 #include "locus/sys/features.hpp"
 #include "locus/sys/meminfo.hpp"
 #include "locus/sys/thread_pool.hpp"
@@ -1108,6 +1109,17 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     std::vector<float> xb2(static_cast<std::size_t>(n) * E);
     std::vector<float> gate(static_cast<std::size_t>(n) * ff);
     std::vector<float> up(static_cast<std::size_t>(n) * ff);
+    // Batched attention projections (plain llama attention, F32 cache).
+    const bool plain = spec_->plain_attention && !cache.quantized();
+    const std::uint32_t hd = hp_.head_dim;
+    const std::size_t kv_dim = std::size_t{hp_.n_kv_heads} * hd;
+    const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
+    std::vector<float> qb, kb, vb;
+    if (plain) {
+        qb.resize(static_cast<std::size_t>(n) * E);
+        kb.resize(static_cast<std::size_t>(n) * kv_dim);
+        vb.resize(kb.size());
+    }
 
     lap.restart();  // wall time per part (i#285)
     constexpr std::uint32_t kNoLayer = StageMetrics::kNoLayer;
@@ -1124,22 +1136,65 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
 
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
-        // Attention per token via the shared arch implementation
-        // (reusing it keeps every arch byte-identical to the
-        // sequential path). The attention projections are the only
-        // weights not yet batched here.
-        for (std::uint32_t t = 0; t < n; ++t) {
-            const std::size_t o = static_cast<std::size_t>(t) * E;
-            apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
-                    ws.xb);
+        if (plain) {
+            // Plain llama attention: q / k / v and wo as batched
+            // matvecs over the chunk (each weight read once), RoPE, the
+            // cache rows and the attention per token, as
+            // llama_attention does them. Byte-identical to it.
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const std::size_t o = static_cast<std::size_t>(t) * E;
+                apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
+                           {xbf.data() + o, E});
+            }
             lap.lap(l, Stage::kNorm);
-            spec_->attention(*this, lay, cache, seq, ws, l,
-                             base + t);
-            matvec_mt(op, lay.wo, ws.out, ws.xb2);
-            for (std::uint32_t i = 0; i < E; ++i) {
-                x[o + i] += ws.xb2[i];
+            matvec_batch(op, lay.wq, xbf, qb, n);
+            matvec_batch(op, lay.wk, xbf, kb, n);
+            matvec_batch(op, lay.wv, xbf, vb, n);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const std::uint32_t pos = base + t;
+                const std::span<float> q(qb.data() + std::size_t{t} * E, E);
+                float* krow = cache.k(seq, l, pos);
+                float* vrow = cache.v(seq, l, pos);
+                std::copy_n(kb.data() + std::size_t{t} * kv_dim, kv_dim,
+                            krow);
+                std::copy_n(vb.data() + std::size_t{t} * kv_dim, kv_dim,
+                            vrow);
+                backend::rope_norm(q, hp_.n_heads, hd, pos,
+                                   hp_.rope_freq_base, rope_factors());
+                backend::rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd, pos,
+                                   hp_.rope_freq_base, rope_factors());
+                gqa_attend(
+                    q.data(), xb2.data() + std::size_t{t} * E, hp_.n_heads,
+                    hd, group, pos, hp_.kq_scale,
+                    [&](std::uint32_t p) -> const float* {
+                        return cache.k(seq, l, p);
+                    },
+                    [&](std::uint32_t p) -> const float* {
+                        return cache.v(seq, l, p);
+                    });
+            }
+            matvec_batch(op, lay.wo, xb2, qb, n);
+            for (std::size_t i = 0; i < static_cast<std::size_t>(n) * E;
+                 ++i) {
+                x[i] += qb[i];
             }
             lap.lap(l, Stage::kAttention);
+        } else {
+            // Attention per token via the shared arch implementation
+            // (reusing it keeps every arch byte-identical to the
+            // sequential path).
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const std::size_t o = static_cast<std::size_t>(t) * E;
+                apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
+                           ws.xb);
+                lap.lap(l, Stage::kNorm);
+                spec_->attention(*this, lay, cache, seq, ws, l, base + t);
+                matvec_mt(op, lay.wo, ws.out, ws.xb2);
+                for (std::uint32_t i = 0; i < E; ++i) {
+                    x[o + i] += ws.xb2[i];
+                }
+                lap.lap(l, Stage::kAttention);
+            }
         }
         if (!lay.is_moe()) {
             // Dense FFN: weight-stationary batched matvecs.
