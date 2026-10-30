@@ -4,8 +4,9 @@ SentencePiece tokenizer to a "t5encoder" GGUF (i#308), with llama.cpp's
 names and keys, so llama.cpp's T5 encoder GGUFs load the same way.
 
 - Tensors keep the checkpoint dtype (F16 for PixArt's text_encoder, BF16
-  for FLUX's text_encoder_2), except that 1D BF16 tensors (the norms)
-  become F32, since the encoder reads its vectors as F32 or F16:
+  for FLUX's text_encoder_2), except that the BF16 tensors the encoder
+  reads as vectors (the norms, and the 2D relative attention bias)
+  become F32:
   shared.weight -> token_embd.weight; per block N
   layer.0.SelfAttention.{q,k,v,o} -> enc.blk.N.attn_{q,k,v,o},
   layer.0.SelfAttention.relative_attention_bias (block 0 only) ->
@@ -176,7 +177,9 @@ def main():
                 gname = tensor_name(name)
                 if gname is None:
                     continue
-                if t.dtype == np.uint16 and t.ndim == 2:
+                # attn_rel_b is 2D but the encoder reads it as a vector.
+                if t.dtype == np.uint16 and t.ndim == 2 and \
+                        not gname.endswith("attn_rel_b.weight"):
                     w.add_tensor(gname, np.ascontiguousarray(t),
                                  raw_dtype=gguf.GGMLQuantizationType.BF16)
                     bf16 = True

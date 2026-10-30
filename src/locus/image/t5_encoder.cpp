@@ -158,8 +158,15 @@ T5Encoder T5Encoder::load(const gguf::GgufFile& g) {
                 std::memcpy(&h, bytes.data() + 2 * i, 2);
                 out[i] = backend::f16_to_f32(h);
             }
+        } else if (ti->type == gguf::TensorType::kBF16) {
+            for (std::size_t i = 0; i < n; ++i) {
+                std::uint16_t h;
+                std::memcpy(&h, bytes.data() + 2 * i, 2);
+                const std::uint32_t u = std::uint32_t{h} << 16;
+                std::memcpy(&out[i], &u, sizeof(float));
+            }
         } else {
-            throw gguf::Error("t5: " + name + " must be F32 or F16");
+            throw gguf::Error("t5: " + name + " must be F32, F16 or BF16");
         }
         return out;
     };
