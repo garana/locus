@@ -44,6 +44,7 @@ add_library(locus
     src/locus/image/vq16.cpp
     src/locus/image/janus.cpp
     src/locus/image/janus_vision.cpp
+    src/locus/image/janus_vision_vulkan.cpp
     src/locus/image/pixart_dit.cpp
     src/locus/image/pixart_sampler.cpp
     src/locus/image/dense.cpp
@@ -211,6 +212,8 @@ if(Vulkan_FOUND)
             matmul_bf16=matmul:TYPE_BF16
             matmul_bf16_small=matmul:TYPE_BF16,BK16
             gelu_tanh=gated_add:GELU_TANH
+            gelu_erf=gated_add:GELU_ERF
+            layer_norm=ln_mod:AFFINE
             matmul_q8_0_id_small=matmul:TYPE_Q8,MOE_ID,BK16
             matmul_paged_f32_small=matmul:TYPE_F32,PAGED,BK16
             matmul_paged_t_f32_small=matmul:TYPE_F32,PAGED_T,BK16
