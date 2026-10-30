@@ -107,12 +107,11 @@ TEST_CASE("run_process closes the parent's other fds in the child",
     REQUIRE(fd >= 0);
     REQUIRE(::dup2(fd, 77) == 77);  // dup2 leaves 77 inheritable
     ::close(fd);
-    // A redirect to fd 77 fails when it is closed (macOS's /dev/fd
-    // lists only 0 to 2, so it cannot tell).
+    // /dev/fd/77 exists in the shell only while fd 77 is open (macOS
+    // and Linux; dash cannot redirect fds above 9, so no ">&77").
     const auto r = locus::video::run_process(
         {"/bin/sh", "-c",
-         "if { : >&77; } 2>/dev/null; then echo leaked; else echo closed; "
-         "fi"},
+         "if [ -e /dev/fd/77 ]; then echo leaked; else echo closed; fi"},
         {});
     ::close(77);
     REQUIRE(r.exit_code == 0);
@@ -122,10 +121,14 @@ TEST_CASE("run_process closes the parent's other fds in the child",
 TEST_CASE("run_process stops a child at its deadline or on request",
           "[video]") {
     using Clock = std::chrono::steady_clock;
+    // Two commands, so every shell forks sleep as a grandchild that
+    // holds the pipes: the kill must reach it too.
     auto t0 = Clock::now();
-    auto r = locus::video::run_process({"/bin/sh", "-c", "sleep 30"}, {}, 1);
+    auto r = locus::video::run_process(
+        {"/bin/sh", "-c", "sleep 30; echo done"}, {}, 1);
     REQUIRE(r.killed);
     REQUIRE(r.exit_code == -1);
+    REQUIRE(r.out.empty());
     REQUIRE(Clock::now() - t0 < std::chrono::seconds(10));
     t0 = Clock::now();
     r = locus::video::run_process({"/bin/sh", "-c", "sleep 30"}, {}, 0,

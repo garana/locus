@@ -127,7 +127,11 @@ std::string find_executable(const std::string& name) {
                                                  ? std::string::npos
                                                  : colon - start);
         if (dir.empty()) dir = ".";  // an empty entry is the current dir
-        const std::string p = dir + "/" + name;
+        // Built in steps: dir + "/" + name trips GCC 12's -Wrestrict
+        // false positive.
+        std::string p = dir;
+        p += '/';
+        p += name;
         if (executable_file(p)) return p;
         if (colon == std::string::npos) return {};
         start = colon + 1;
@@ -175,6 +179,9 @@ ProcessResult run_process(
         throw std::runtime_error("video: fork failed");
     }
     if (pid == 0) {
+        // Its own process group, so a kill reaches anything it starts
+        // (dash, for one, forks the last command of -c, not execs it).
+        ::setpgid(0, 0);
         ::dup2(in[0], 0);
         ::dup2(out[1], 1);
         ::dup2(err[1], 2);
@@ -182,6 +189,9 @@ ProcessResult run_process(
         ::execv(exe.c_str(), args.data());
         ::_exit(127);
     }
+    // Also from this side, so the group exists before any kill (an
+    // error after the child's exec is harmless).
+    ::setpgid(pid, pid);
     close_fd(in[0]);
     close_fd(out[1]);
     close_fd(err[1]);
@@ -202,13 +212,14 @@ ProcessResult run_process(
     skip_empty();
     if (chunk == input.size()) close_fd(in[1]);
     while (in[1] >= 0 || out[0] >= 0 || err[0] >= 0) {
-        if (watch && !r.killed &&
-            ((timeout_s > 0 && Clock::now() >= deadline) ||
-             (alive && !alive()))) {
-            // Kill it, then keep draining: its pipes close as it dies.
+        if (watch && ((timeout_s > 0 && Clock::now() >= deadline) ||
+                      (alive && !alive()))) {
+            // Kill its whole group, and stop reading: a process that
+            // left the group could still hold the pipes open.
+            ::kill(-pid, SIGKILL);
             ::kill(pid, SIGKILL);
             r.killed = true;
-            close_fd(in[1]);
+            break;
         }
         pollfd p[3];
         nfds_t n = 0;
