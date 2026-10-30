@@ -68,6 +68,36 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   pipeline, experimental); `locus-auth-helper` (a reference auth
   helper, see docs/CLIENTS.md).
 
+### Media: from what to what
+
+| From \ To | Text                                   | Image                                               | Video                                    |
+|-----------|----------------------------------------|-----------------------------------------------------|------------------------------------------|
+| Text      | completions, chat, messages, responses | `/v1/images/generations`: Janus-Pro, PixArt, FLUX.1 | `/v1/videos`: LTX-Video                  |
+| Image     | chat with an image: Janus-Pro-1B       | `/v1/images/edits`: FLUX.1 Kontext                  | `/v1/videos` with `input_reference`: LTX |
+| Video     | no                                     | no                                                  | no                                       |
+
+Speech (text to audio) is `/v1/audio/speech`. How these run together:
+
+1. Text to text has no lock: requests share continuous batching. Every
+   other kind runs alongside it and slows it, since they share the CPU
+   cores and the GPU; a FLUX step on the GPU holds the Vulkan lock, so
+   text on the same GPU waits for each step.
+2. Image to text runs one request at a time (the next one waits), on
+   its own KV cache, outside the batch (#257).
+3. Text to image and image to image share one lock with video
+   generation: one image at a time, and no queue. A request that finds
+   the lock taken gets a 503 at once, with `Retry-After` (60 s for
+   PixArt and FLUX, 30 s for Janus).
+4. Text and image to video are jobs: up to 4 wait or run, and one runs
+   at a time. It holds the image lock while it denoises and decodes
+   (not during the ffmpeg encode), so image requests get 503s
+   meanwhile, and a waiting clip starts after an image in progress. A
+   fifth clip gets a 503 with `Retry-After` 60 s.
+5. Image and video generation never run two at once. The weights are
+   shared, but each generation has its own working memory, and one
+   generation already keeps the GPU or the CPU cores busy.
+6. Speech runs one request at a time; the next one waits.
+
 Greedy decoding is the default; sampling and the other decoding
 features are opt-in per request. A request whose client disconnects
 is cancelled. On the CPU, quantized weights use 8-bit activations
