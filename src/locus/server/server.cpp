@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -26,6 +27,7 @@
 #include "locus/image/janus.hpp"
 #include "locus/image/janus_chat.hpp"
 #include "locus/image/janus_vision.hpp"
+#include "locus/image/flux_pipeline.hpp"
 #include "locus/image/pixart_pipeline.hpp"
 #include "locus/image/png.hpp"
 #include "locus/image/vq16.hpp"
@@ -733,9 +735,24 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             }
         }
     }
-    // A broken PixArt directory stops the server here too.
+    // A broken image pipeline directory stops the server here too. A
+    // flux GGUF in it makes it a FLUX.1 pipeline, else PixArt.
     if (!opt_.image_model_dir.empty()) {
-        pixart_ = image::PixArtPipeline::load_dir(opt_.image_model_dir);
+        bool flux = false;
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(
+                 opt_.image_model_dir, ec)) {
+            if (e.is_regular_file() && e.path().extension() == ".gguf" &&
+                gguf::GgufFile::open(e.path().string())
+                        .get_string("general.architecture") == "flux") {
+                flux = true;
+            }
+        }
+        if (flux) {
+            flux_ = image::FluxPipeline::load_dir(opt_.image_model_dir);
+        } else {
+            pixart_ = image::PixArtPipeline::load_dir(opt_.image_model_dir);
+        }
     }
     // Image input (i#241): on when the model's GGUF carries the Janus
     // vision tower. A tower that is present but broken stops the
@@ -760,7 +777,8 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
     } else if (be == "cuda") {
         devices_.push_back({"cuda", backend::cuda_device_name()});
     }
-    if (pixart_ && be != "vulkan" && backend::vulkan_imports_host_memory()) {
+    if ((pixart_ || flux_) && be != "vulkan" &&
+        backend::vulkan_imports_host_memory()) {
         devices_.push_back({"vulkan", backend::vulkan_device_name()});
     }
     install_routes();
@@ -2555,6 +2573,148 @@ void OpenAiServer::install_routes() {
             }
     };
 
+    // POST /v1/images/generations with the FLUX.1 pipeline
+    // (--image-model with a flux GGUF): prompt -> CLIP-L pooled and T5
+    // states -> the flow-matching loop -> VAE -> PNG, as b64_json.
+    // Extensions to the OpenAI shape: steps (default 28, or 4 for
+    // schnell), guidance_scale (default 3.5; schnell ignores it),
+    // max_sequence_length (T5 tokens, default 512) and seed. size is
+    // "WxH", multiples of 16 up to 1024 (default 1024x1024). One image
+    // at a time, under image_mu_.
+    auto handle_flux = [this](const http::Request& req,
+                              http::ServerResponse& res,
+                              const http::RequestContext& ctx) {
+            try {
+                const json body = json::parse(req.body);
+                auto str = [&](const char* k) -> std::string {
+                    if (!body.contains(k)) return {};
+                    if (!body[k].is_string()) {
+                        throw std::invalid_argument(std::string(k) +
+                                                    " must be a string");
+                    }
+                    return body[k].get<std::string>();
+                };
+                auto integer = [&](const char* k, std::int64_t lo,
+                                   std::int64_t hi) {
+                    if (!body[k].is_number_integer() ||
+                        body[k].get<std::int64_t>() < lo ||
+                        body[k].get<std::int64_t>() > hi) {
+                        throw std::invalid_argument(
+                            std::string(k) + " must be an integer from " +
+                            std::to_string(lo) + " to " + std::to_string(hi));
+                    }
+                    return body[k].get<std::int64_t>();
+                };
+                image::FluxPipeline::Request p;
+                p.prompt = str("prompt");
+                if (p.prompt.empty()) {
+                    throw std::invalid_argument(
+                        "prompt must be a non-empty string");
+                }
+                if (body.contains("n") && integer("n", 1, 1) != 1) {
+                    throw std::invalid_argument("n must be 1");
+                }
+                if (body.contains("size")) {
+                    // "WxH": two decimal sides, no signs or spaces.
+                    const std::string s = str("size");
+                    const auto x = s.find('x');
+                    const auto digits = [](std::string_view d) {
+                        return !d.empty() && d.size() <= 4 &&
+                               std::all_of(d.begin(), d.end(), [](char c) {
+                                   return c >= '0' && c <= '9';
+                               });
+                    };
+                    if (x == std::string::npos ||
+                        !digits(std::string_view(s).substr(0, x)) ||
+                        !digits(std::string_view(s).substr(x + 1))) {
+                        throw std::invalid_argument(
+                            "size must be WIDTHxHEIGHT");
+                    }
+                    p.width = static_cast<std::uint32_t>(
+                        std::stoul(s.substr(0, x)));
+                    p.height = static_cast<std::uint32_t>(
+                        std::stoul(s.substr(x + 1)));
+                }
+                if (body.contains("response_format") &&
+                    str("response_format") != "b64_json") {
+                    throw std::invalid_argument(
+                        "response_format must be b64_json");
+                }
+                if (body.contains("steps")) {
+                    p.steps =
+                        static_cast<std::uint32_t>(integer("steps", 1, 100));
+                }
+                if (body.contains("max_sequence_length")) {
+                    p.max_sequence_length = static_cast<std::uint32_t>(
+                        integer("max_sequence_length", 1, 512));
+                }
+                if (body.contains("guidance_scale")) {
+                    if (!body["guidance_scale"].is_number()) {
+                        throw std::invalid_argument(
+                            "guidance_scale must be a number");
+                    }
+                    const double g = body["guidance_scale"].get<double>();
+                    if (!std::isfinite(g) || g < 0.0 || g > 100.0) {
+                        throw std::invalid_argument(
+                            "guidance_scale must be from 0 to 100");
+                    }
+                    p.guidance = static_cast<float>(g);
+                }
+                p.seed = std::random_device{}();
+                if (body.contains("seed")) {
+                    if (!body["seed"].is_number_integer()) {
+                        throw std::invalid_argument(
+                            "seed must be an integer");
+                    }
+                    p.seed = static_cast<std::uint64_t>(
+                        body["seed"].get<std::int64_t>());
+                }
+                // As for PixArt: the GPU when the Vulkan device imports
+                // host memory, else the CPU backend.
+                const auto& op = backend::vulkan_imports_host_memory()
+                                     ? backend::vulkan_image_ops()
+                                     : backend::best_backend().ops;
+                image::FluxPipeline::Timing took;
+                std::vector<std::uint8_t> rgb;
+                {
+                    std::unique_lock<std::mutex> lk(image_mu_,
+                                                    std::try_to_lock);
+                    if (!lk.owns_lock()) {
+                        set_unavailable(res,
+                                        "an image is already being "
+                                        "generated; retry later",
+                                        60);
+                        return;
+                    }
+                    rgb = flux_->generate(p, op, ctx.client_alive, &took);
+                }
+                if (rgb.empty()) {
+                    res.status = 499;  // the client went away
+                    return;
+                }
+                const auto png = image::encode_png(rgb, p.width, p.height);
+                res.set_header("X-Image-Seed", std::to_string(p.seed));
+                res.set_header(
+                    "Server-Timing",
+                    "encode;dur=" + std::to_string(took.encode) +
+                        ", denoise;dur=" + std::to_string(took.denoise) +
+                        ", decode;dur=" + std::to_string(took.decode));
+                const auto created =
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+                res.set_content(
+                    json{{"created", created},
+                         {"data", json::array({json{
+                                      {"b64_json",
+                                       http::base64_encode(png)}}})}}
+                        .dump(-1, ' ', false, kLossy),
+                    "application/json");
+            } catch (const std::exception& e) {
+                set_error(res, e);
+            }
+    };
+
     // POST /v1/images/generations (OpenAI shape): prompt -> Janus-Pro
     // image codes (CFG) -> VQ-16 pixels -> PNG, returned as b64_json.
     // 503 unless --image-decoder loaded a decoder AND the model is a
@@ -2562,11 +2722,26 @@ void OpenAiServer::install_routes() {
     // request whose model starts with "pixart", or every request when
     // Janus is not loaded, goes to handle_pixart). One image at a time,
     // under image_mu_.
-    auto handle_images = [this, handle_pixart](
+    auto handle_images = [this, handle_pixart, handle_flux](
                              const http::Request& req,
                              http::ServerResponse& res,
                              const http::RequestContext& ctx) {
             auth_event("create", "images.generations", ctx.identity);
+            if (flux_) {
+                bool named = false;
+                try {
+                    const json b = json::parse(req.body);
+                    named = b.contains("model") && b["model"].is_string() &&
+                            b["model"].get<std::string>().rfind("flux", 0) ==
+                                0;
+                } catch (const std::exception&) {
+                    // handle_flux reports the parse error
+                }
+                if (named || !vq16_ || !janus_) {
+                    handle_flux(req, res, ctx);
+                    return;
+                }
+            }
             if (pixart_) {
                 bool named = false;
                 try {

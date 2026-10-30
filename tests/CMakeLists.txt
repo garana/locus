@@ -77,6 +77,7 @@ add_executable(locus_tests
     test_clip_text.cpp
     test_flux_dit.cpp
     test_flux_sampler.cpp
+    test_flux_pipeline.cpp
     test_pixart_dit.cpp
     test_pixart_sampler.cpp
     test_pixart_vae.cpp
