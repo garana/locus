@@ -131,8 +131,13 @@ std::pair<std::uint32_t, std::uint32_t> FluxPipeline::kontext_size(
 
 std::pair<std::uint32_t, std::uint32_t> FluxPipeline::reference_size(
     std::uint32_t width, std::uint32_t height, bool auto_resize) {
+    // get_default_height_width floors both sides to 16 before the
+    // aspect is taken.
+    width = width / 16 * 16;
+    height = height / 16 * 16;
     if (width == 0 || height == 0) {
-        throw std::invalid_argument("flux: zero reference size");
+        throw std::invalid_argument(
+            "flux: the reference must be at least 16 x 16");
     }
     if (auto_resize) {
         // PREFERRED_KONTEXT_RESOLUTIONS, (width, height); min() over

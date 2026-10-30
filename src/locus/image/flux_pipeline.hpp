@@ -64,9 +64,11 @@ class FluxPipeline {
         std::uint32_t width, std::uint32_t height, std::uint32_t max_area);
 
     /**
-     * The reference image's size before encoding: with auto_resize, the
-     * Kontext training resolution nearest in aspect (ties to the smaller
-     * width), else its own; either floored to a multiple of 16.
+     * The reference image's size before encoding: its sides floored to
+     * multiples of 16, then with auto_resize the Kontext training
+     * resolution nearest to that aspect (ties to the smaller width).
+     *
+     * @throws std::invalid_argument for a side under 16.
      */
     static std::pair<std::uint32_t, std::uint32_t> reference_size(
         std::uint32_t width, std::uint32_t height, bool auto_resize);

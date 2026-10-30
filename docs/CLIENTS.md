@@ -75,7 +75,8 @@ FluxKontextPipeline does); with it, `size`'s aspect at `size`'s area
 (at most 1024 x 1024), so "256x256" gives a faster 256 x 256 edit.
 `auto_resize` (default true) resizes the reference to the nearest of
 Kontext's training resolutions (about 1M pixels); false keeps its own
-size (floored to 16), which is faster for a small image.
+size (floored to 16), which is faster for a small image, and then the
+image may have at most 1024 x 1024 pixels and 2048 a side.
 
 With the OpenAI SDK, pass the extra fields in `extra_body`:
 

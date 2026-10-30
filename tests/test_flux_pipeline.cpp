@@ -92,6 +92,11 @@ TEST_CASE("flux kontext sizes follow the pipeline", "[flux][image]") {
     REQUIRE(P::reference_size(1080, 1920, true) == Size{752, 1392});
     REQUIRE(P::reference_size(4000, 100, true) == Size{1568, 672});
     REQUIRE(P::reference_size(500, 700, false) == Size{496, 688});
+    // The aspect after the floor to 16: 1104 / 1008 = 1.095, past the
+    // 1.085 midpoint, where the raw 1104 / 1023 = 1.079 is not.
+    REQUIRE(P::reference_size(1104, 1023, true) == Size{1104, 944});
+    REQUIRE_THROWS_AS(P::reference_size(15, 100, true),
+                      std::invalid_argument);
     REQUIRE(P::kontext_size(1392, 752, 1024 * 1024) == Size{1392, 752});
     REQUIRE(P::kontext_size(512, 512, 1024 * 1024) == Size{1024, 1024});
     REQUIRE(P::kontext_size(1920, 1080, 1024 * 1024) == Size{1360, 768});
