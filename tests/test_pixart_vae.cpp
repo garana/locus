@@ -75,8 +75,11 @@ TEST_CASE("vae decoder matches torch on a synthetic model",
         REQUIRE(rel_error(gpu, ref) <= 1e-5);
     }
     REQUIRE_THROWS_AS(vae.decode(z, 4, 8, op), std::invalid_argument);
-    const std::vector<float> big(std::size_t{4} * 129 * 1);
-    REQUIRE_THROWS_AS(vae.decode(big, 129, 1, op), std::invalid_argument);
+    // latent_fits: at most 256 a side and 128^2 positions.
+    const std::vector<float> wide(std::size_t{4} * 257 * 1);
+    REQUIRE_THROWS_AS(vae.decode(wide, 257, 1, op), std::invalid_argument);
+    const std::vector<float> big(std::size_t{4} * 129 * 129);
+    REQUIRE_THROWS_AS(vae.decode(big, 129, 129, op), std::invalid_argument);
 }
 
 // The PixArt VAE on the golden final latent, against the pipeline's
