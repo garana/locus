@@ -74,6 +74,7 @@ add_executable(locus_tests
     test_tokenizer.cpp
     test_t5_tokenizer.cpp
     test_t5_encoder.cpp
+    test_clip_text.cpp
     test_pixart_dit.cpp
     test_pixart_sampler.cpp
     test_pixart_vae.cpp
