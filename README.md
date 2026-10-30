@@ -51,6 +51,12 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   image on an M4 Max); elsewhere FLUX runs on the CPU, minutes per
   image. Request fields:
   docs/CLIENTS.md.
+- **Video output:** `/v1/videos` with LTX-Video 2B distilled (T5-XXL,
+  the 3D DiT, rectified flow, the causal 3D VAE), text to video or
+  image to video from a first frame. A clip is a job, in the shape of
+  OpenAI's Videos API: POST starts it, GET reports it, and `/content`
+  returns the MP4. locus does not encode video itself: ffmpeg runs as
+  a helper process (`--ffmpeg`). Request fields: docs/CLIENTS.md.
 - **Image input:** PNG and JPEG in chat requests (OpenAI `image_url`
   data URLs, Anthropic image blocks) with Janus-Pro-1B. On a Vulkan GPU
   with unified memory the vision tower runs on the GPU with its
@@ -144,7 +150,9 @@ and tokenizers of the build. Speech needs `--audio-decoder
 or `--image-model <dir>` (PixArt: a directory with the GGUFs from
 `scripts/convert-t5-encoder.py`, `convert-pixart.py` and
 `convert-sd-vae.py`; FLUX.1: the GGUFs from `scripts/convert-flux.py`
-and `convert-t5-encoder.py`).
+and `convert-t5-encoder.py`). Video needs `--video-model <dir>` (the
+GGUFs from `scripts/convert-ltxv.py` and `convert-t5-encoder.py`) and
+an ffmpeg on PATH or at `--ffmpeg <path>`.
 
 ## Backends
 

@@ -26,6 +26,7 @@
 #include "locus/pipeline/net.hpp"
 #include "locus/server/server.hpp"
 #include "locus/tok/tokenizer.hpp"
+#include "locus/video/ffmpeg.hpp"
 #include "httplib.h"
 #include "json.hpp"
 #include "png_parse.hpp"
@@ -2094,4 +2095,116 @@ TEST_CASE("chat with an image answers like the reference on vulkan",
     REQUIRE(a["choices"][0]["message"]["content"] ==
             "There is an apple on the table.");
     REQUIRE(a["usage"]["prompt_tokens"] == 630);
+}
+
+// Without --video-model the video routes are a 503; a path that is not
+// /v1/videos/{id}[/content] is not one of them.
+TEST_CASE("video routes are off without a video model", "[server]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    TestServer s(model, tok);
+    httplib::Client c("127.0.0.1", s.port);
+    auto r = c.Post("/v1/videos", R"({"prompt":"a fox"})", "application/json");
+    REQUIRE(r);
+    REQUIRE(r->status == 503);
+    REQUIRE(json::parse(r->body)["error"]["message"].get<std::string>().find(
+                "--video-model") != std::string::npos);
+    REQUIRE(c.Get("/v1/videos/video_1")->status == 503);
+    REQUIRE(c.Get("/v1/videos/video_1/content")->status == 503);
+    REQUIRE(c.Get("/v1/videos/a/b")->status == 404);
+    REQUIRE(c.Get("/v1/videos/")->status == 404);
+}
+
+// The video routes on the real LTX-Video models with the real ffmpeg:
+// a 64 x 64 clip of 9 frames from a job to an MP4, the request checks,
+// and the 501 without ffmpeg.
+TEST_CASE("video jobs make an mp4", "[server][e2e]") {
+    namespace fs = std::filesystem;
+    const fs::path models = std::string(LOCUS_SOURCE_DIR) + "/tests/models";
+    const char* parts[] = {"t5-xxl-enc-f16.gguf", "ltxv-2b-dit.gguf",
+                           "ltxv-2b-vae.gguf"};
+    for (const char* p : parts) {
+        if (!fs::exists(models / p)) SKIP(std::string(p) + " absent");
+    }
+    if (!fs::exists(model_path())) SKIP("stories260K absent");
+    if (!locus::video::probe_ffmpeg("ffmpeg")) SKIP("no ffmpeg on PATH");
+    const fs::path dir = fs::temp_directory_path() /
+                         ("locus-video-models-" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    for (const char* p : parts) {
+        fs::create_symlink(fs::absolute(models / p), dir / p);
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::string ct = "application/json";
+    {
+        locus::server::OpenAiServer::Options opt;
+        opt.video_model_dir = dir.string();
+        opt.ffmpeg_path = "/nonexistent/ffmpeg";
+        TestServer s(model, tok, opt);
+        httplib::Client c("127.0.0.1", s.port);
+        const auto r = c.Post("/v1/videos", R"({"prompt":"a fox"})", ct);
+        REQUIRE(r->status == 501);
+        REQUIRE(json::parse(r->body)["error"]["message"]
+                    .get<std::string>()
+                    .find("ffmpeg") != std::string::npos);
+    }
+    locus::server::OpenAiServer::Options opt;
+    opt.video_model_dir = dir.string();
+    TestServer s(model, tok, opt);
+    httplib::Client c("127.0.0.1", s.port);
+    c.set_read_timeout(60, 0);
+    for (const char* bad :
+         {R"({"prompt":""})", R"({"prompt":"a","size":"65x64"})",
+          R"({"prompt":"a","size":"64"})", R"({"prompt":"a","seconds":"x"})",
+          R"({"prompt":"a","seconds":"30"})",
+          R"({"prompt":"a","sampling":"fast"})",
+          R"({"prompt":"a","input_reference":{"file_id":"f"}})"}) {
+        INFO(bad);
+        const auto r = c.Post("/v1/videos", bad, ct);
+        REQUIRE(r->status == 400);
+    }
+    REQUIRE(c.Get("/v1/videos/video_nope")->status == 404);
+
+    // 0.27 s at 30 fps rounds to k = 1: 9 frames.
+    const auto r = c.Post(
+        "/v1/videos",
+        R"({"prompt":"a red fox in snow","size":"64x64","seconds":"0.27",)"
+        R"("seed":7,"sampling":"deterministic"})",
+        ct);
+    REQUIRE(r->status == 200);
+    const json job = json::parse(r->body);
+    REQUIRE(job["object"] == "video");
+    REQUIRE(job["status"] == "queued");
+    REQUIRE(job["size"] == "64x64");
+    REQUIRE(job["seconds"] == "0.266667");
+    REQUIRE(job["completed_at"].is_null());
+    REQUIRE(r->get_header_value("X-Video-Seed") == "7");
+    const std::string id = job["id"];
+    json now;
+    for (int i = 0; i < 1200; ++i) {
+        now = json::parse(c.Get("/v1/videos/" + id)->body);
+        if (now["status"] == "completed" || now["status"] == "failed") break;
+        const auto early = c.Get("/v1/videos/" + id + "/content");
+        CAPTURE(early->body);
+        REQUIRE(early->status == 409);
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    CAPTURE(now.dump());
+    REQUIRE(now["status"] == "completed");
+    REQUIRE(now["progress"] == 100);
+    REQUIRE(now["expires_at"].get<std::int64_t>() ==
+            now["completed_at"].get<std::int64_t>() + 3600);
+    const auto mp4 = c.Get("/v1/videos/" + id + "/content");
+    REQUIRE(mp4->status == 200);
+    REQUIRE(mp4->get_header_value("Content-Type") == "video/mp4");
+    REQUIRE(mp4->body.size() > 100);
+    REQUIRE(mp4->body.substr(4, 4) == "ftyp");
+    fs::remove_all(dir);
 }

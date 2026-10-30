@@ -3,6 +3,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,7 @@
 #include "locus/model/transformer.hpp"
 #include "locus/server/engine_loop.hpp"
 #include "locus/tok/tokenizer.hpp"
+#include "locus/video/ffmpeg.hpp"
 
 namespace locus::audio {
 class SnacDecoder;
@@ -22,7 +24,11 @@ class JanusImageGen;
 class JanusVision;
 class PixArtPipeline;
 class FluxPipeline;
+class LtxvPipeline;
 class Vq16Decoder;
+}
+namespace locus::video {
+class VideoJobs;
 }
 namespace locus::server {
 struct VisionChat;
@@ -102,6 +108,15 @@ class OpenAiServer {
          * for requests whose model starts with "pixart" or "flux" (or
          * every request when no Janus model is loaded). Empty = off. */
         std::string image_model_dir;
+        /** Directory of the LTX-Video pipeline (--video-model: the
+         * t5encoder, ltxv and ltxv_vae GGUFs; image to video needs the
+         * VAE with its encoder). It enables POST /v1/videos and GET
+         * /v1/videos/{id}[/content]. Empty = off. */
+        std::string video_model_dir;
+        /** The ffmpeg that encodes the MP4 (--ffmpeg; a bare name is
+         * looked up on PATH). Without a usable one the video routes
+         * answer 501. */
+        std::string ffmpeg_path = "ffmpeg";
         /** Path of the loaded model's GGUF; the image endpoint reads
          * the janus.* tensors from it. */
         std::string model_path;
@@ -157,7 +172,8 @@ class OpenAiServer {
         kHealth, kModels, kModelById, kMetrics,
         kCompletions, kChat, kMessages, kResponses, kEmbeddings,
         kAudioSpeech,
-        kImages, kImageEdits, kUnknown
+        kImages, kImageEdits,
+        kVideos, kVideoById, kVideoContent, kUnknown
     };
     /** Classifies a request. GET and HEAD both match the GET routes;
      * /v1/models/{id} matches by prefix (the regex route retired). */
@@ -260,6 +276,15 @@ class OpenAiServer {
     std::unique_ptr<image::PixArtPipeline> pixart_;
     std::unique_ptr<image::FluxPipeline> flux_;
     std::mutex image_mu_;
+
+    // /v1/videos (--video-model): the LTX-Video pipeline, the ffmpeg
+    // that encodes its MP4s (empty when none runs), and the jobs. A job
+    // holds image_mu_ while it runs, so a clip and an image never run
+    // together. video_jobs_ is declared last of the three, so it is
+    // destroyed (and its worker stopped) first.
+    std::unique_ptr<image::LtxvPipeline> ltxv_;
+    std::optional<video::Ffmpeg> ffmpeg_;
+    std::unique_ptr<video::VideoJobs> video_jobs_;
 
     // Image input (i#241): the Janus vision encoder, loaded when the
     // model's GGUF has vit.* tensors (null otherwise: a request with an

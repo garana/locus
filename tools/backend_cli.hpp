@@ -199,6 +199,11 @@ inline constexpr const char* kCommonHelp =
     "                   (flux, t5encoder, clip_text and autoencoder_kl\n"
     "                   GGUFs) or PixArt-alpha (pixart, t5encoder and\n"
     "                   autoencoder_kl)\n"
+    "  --video-model D  locus-server: enable /v1/videos with the\n"
+    "                   LTX-Video pipeline in directory D (t5encoder,\n"
+    "                   ltxv and ltxv_vae GGUFs)\n"
+    "  --ffmpeg P       locus-server: the ffmpeg that encodes the\n"
+    "                   videos' MP4 (default: ffmpeg on PATH)\n"
     "  --prefill-f16    Vulkan: stage prefill matmul operands in\n"
     "                   f16 (faster prompt ingestion; opt-in, the\n"
     "                   f32 default is exact)\n"
@@ -281,6 +286,12 @@ struct BackendArgs {
      * GGUFs, enabling locus-server's /v1/images/generations for it;
      * empty = off. */
     std::string image_model;
+    /** From --video-model D: directory of the LTX-Video pipeline's
+     * GGUFs, enabling locus-server's /v1/videos; empty = off. */
+    std::string video_model;
+    /** From --ffmpeg P: the ffmpeg that encodes videos (default: the
+     * one on PATH). */
+    std::string ffmpeg = "ffmpeg";
     /** From --concurrent N: submit the prompt N times and report
      * aggregate throughput (bench mode; default 1 = normal run). */
     std::uint32_t concurrent = 1;
@@ -404,6 +415,14 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.image_model = argv[++i];
         } else if (a.rfind("--image-model=", 0) == 0) {
             out.image_model = std::string(a.substr(14));
+        } else if (a == "--video-model" && i + 1 < argc) {
+            out.video_model = argv[++i];
+        } else if (a.rfind("--video-model=", 0) == 0) {
+            out.video_model = std::string(a.substr(14));
+        } else if (a == "--ffmpeg" && i + 1 < argc) {
+            out.ffmpeg = argv[++i];
+        } else if (a.rfind("--ffmpeg=", 0) == 0) {
+            out.ffmpeg = std::string(a.substr(9));
         } else if (a == "--concurrent" && i + 1 < argc) {
             number("--concurrent", argv[++i], out.concurrent);
         } else if (a.rfind("--concurrent=", 0) == 0) {

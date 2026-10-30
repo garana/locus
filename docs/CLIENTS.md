@@ -16,6 +16,9 @@ own docs.
 | POST /v1/audio/speech         | OpenAI    | Orpheus-TTS; needs `--audio-decoder`        |
 | POST /v1/images/generations   | OpenAI    | Janus-Pro, PixArt-alpha or FLUX.1           |
 | POST /v1/images/edits         | OpenAI    | FLUX.1 Kontext; JSON body; see Image output |
+| POST /v1/videos               | OpenAI    | LTX-Video job; see Video output             |
+| GET  /v1/videos/{id}          | OpenAI    | the job: status, progress, error            |
+| GET  /v1/videos/{id}/content  | OpenAI    | the MP4 of a completed job                  |
 | POST /v1/messages             | Anthropic | Messages API, SSE stream, tools, images     |
 | POST /v1/responses            | OpenAI    | Responses API, stateless, SSE stream, tools |
 | GET  /health                  |           | liveness                                    |
@@ -88,6 +91,52 @@ With the OpenAI SDK, pass the extra fields in `extra_body`:
 img = client.images.generate(
     model="pixart", prompt="a red fox in fresh snow", size="512x512",
     response_format="b64_json", extra_body={"steps": 20, "seed": 1})
+```
+
+### Video output
+
+`--video-model <dir>` loads LTX-Video 2B distilled (the GGUFs from
+`scripts/convert-ltxv.py` and `convert-t5-encoder.py`). A clip takes
+minutes (the default 512x320, 65 frames: about 4 minutes on an M2 Pro
+with MoltenVK, most of it the VAE decode), so it is a job, in the
+shape of OpenAI's Videos API:
+`POST /v1/videos` answers at once with a `video` object whose `status`
+is `queued`; `GET /v1/videos/{id}` reports `queued`, `in_progress`
+(with `progress`, 0 to 100), `completed` or `failed` (with `error`);
+`GET /v1/videos/{id}/content` returns the MP4 once completed (409
+before). One clip is made at a time, and never while an image is (the
+image endpoints answer 503 meanwhile); at most 4 jobs wait or run, and
+a fifth gets a 503 with `Retry-After`. A finished job and its file are
+kept for an hour (`expires_at`); the server keeps them in memory and
+in a temp directory, so a restart drops them.
+
+| Field             | Default    | Meaning                                                   |
+|-------------------|------------|-----------------------------------------------------------|
+| `prompt`          | (required) | the clip                                                  |
+| `size`            | 512x320    | "WxH", multiples of 32, at most 1280 a side               |
+| `seconds`         | "2"        | a string (as OpenAI sends it) or a number                 |
+| `input_reference` | none       | `{"image_url": "data:..."}`: the first frame              |
+| `fps`             | 30         | frames per second, at most 60                             |
+| `sampling`        | stochastic | or `deterministic`                                        |
+| `seed`            | random     | also returned in the `X-Video-Seed` header                |
+
+The clip has $8k + 1$ frames with $k$ the rounded seconds times fps
+over 8, at most 257 frames; the job's `seconds` says what that came
+to. Image to video crops the first frame to the clip's aspect and
+resizes it; it needs the VAE GGUF with its encoder (a 501 otherwise).
+
+locus does not encode video: it runs ffmpeg (on PATH, or
+`--ffmpeg <path>`) as a helper process, with the raw frames on its
+stdin, H.264 (libx264, or ffmpeg's own mpeg4 encoder without it) and
+at most two encoder threads. Without a usable ffmpeg the video routes
+answer 501.
+
+```sh
+curl -s localhost:8080/v1/videos -H 'Content-Type: application/json' \
+    -d '{"prompt": "a red fox walks through fresh snow", "seed": 7}'
+# {"id": "video_...", "status": "queued", ...}
+curl -s localhost:8080/v1/videos/video_...
+curl -s -o fox.mp4 localhost:8080/v1/videos/video_.../content
 ```
 
 ## Clients

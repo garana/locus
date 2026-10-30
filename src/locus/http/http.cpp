@@ -589,6 +589,7 @@ std::string status_reason(int status) {
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 408: return "Request Timeout";
+        case 409: return "Conflict";
         case 413: return "Content Too Large";
         case 429: return "Too Many Requests";
         case 499: return "Client Closed Request";
