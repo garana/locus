@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -191,8 +192,44 @@ TEST_CASE("flux kontext dit matches diffusers", "[flux][image][e2e]") {
                     1e-3);
             REQUIRE(out.size() == ref.size());
             // On the M2 Pro CPU: 3.4e-5, 4.4e-5 and 1.5e-4 above, 8.5e-5
-            // here.
+            // here; on the M4 Max GPU: 5.9e-5, 4.6e-5, 1.4e-4 and 1.4e-4.
             REQUIRE(rel_error(out.data(), ref.data(), ref.size()) < 1e-3);
+        }
+    }
+}
+
+// One denoiser call at real sizes: 512 text tokens and a 512 or 1024
+// px image (1024 or 4096 image tokens), random inputs.
+TEST_CASE("bench: flux dit step", "[.][bench][flux]") {
+    if (!std::filesystem::exists(kModel) ||
+        !locus::backend::vk::VulkanContext::available()) {
+        SKIP("needs " << kModel << " and a Vulkan device");
+    }
+    const auto g = locus::gguf::GgufFile::open(kModel);
+    const auto dit = FluxDit::load(g);
+    const std::uint32_t n_txt = 512;
+    for (const std::uint32_t side : {32u, 64u}) {  // latent patches
+        const std::uint32_t n_img = side * side;
+        std::vector<float> x(std::size_t{n_img} * dit.channels(), 0.1f);
+        std::vector<float> t(std::size_t{n_txt} * dit.text_width(), 0.05f);
+        std::vector<float> p(dit.pooled_width(), 0.2f);
+        std::vector<float> img_ids, txt_ids(std::size_t{n_txt} * 3, 0.0f);
+        for (std::uint32_t r = 0; r < side; ++r) {
+            for (std::uint32_t c = 0; c < side; ++c) {
+                img_ids.insert(img_ids.end(), {0.0f, float(r), float(c)});
+            }
+        }
+        for (int rep = 0; rep < 2; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto out = dit.forward(x, img_ids, n_img, t, txt_ids,
+                                         n_txt, p, 0.5f, 2.5f,
+                                         locus::backend::vulkan_image_ops());
+            const double s = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+            WARN(side * 16 << " px, " << n_img + n_txt << " tokens: " << s
+                           << " s (rep " << rep << ")");
+            REQUIRE(std::isfinite(out[0]));
         }
     }
 }
