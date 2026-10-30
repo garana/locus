@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -10,6 +11,7 @@
 
 #include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
+#include "locus/image/image_input.hpp"
 #include "locus/image/ltxv_dit.hpp"
 #include "locus/image/ltxv_vae.hpp"
 #include "locus/image/t5_encoder.hpp"
@@ -40,11 +42,20 @@ namespace locus::image {
  *   x -= (t - t_next) v.
  * - Before the decode: x = x (1 - 0.025) + noise 0.025, then the
  *   decoder at timestep 0.05 (decode_noise_scale, decode_timestep).
+ * - Image to video (Request::image), as inference.py conditions on a
+ *   first frame at strength 1: the image is center-cropped to the
+ *   clip's aspect, resized (bicubic) and blurred (3 x 3, sigma 1); the
+ *   VAE encodes it to frame 0's latent, which replaces frame 0 of the
+ *   start noise. Each step sets frame 0 to that latent plus
+ *   image_noise * z * t^2 (fresh z), runs the DiT with frame 0's tokens
+ *   at sigma 0, and steps only the other frames.
  *
  * Differences from the reference, by design: the start, step and decode
  * noise come from locus's seeded normal sampler (PixArtPipeline::
  * normal_latent), not torch's, so a seed gives a different (but
- * repeatable) clip.
+ * repeatable) clip. For image to video, the image skips the reference's
+ * CRF step (an H.264 encode and decode, which needs a video codec), and
+ * the encode takes the latent mean where the reference samples it.
  */
 class LtxvPipeline {
   public:
@@ -57,6 +68,11 @@ class LtxvPipeline {
         float frame_rate = 30.0f;
         std::uint64_t seed = 0;
         bool stochastic = true;  ///< the step kind (see the class doc)
+        /** Image to video: the first frame (any size; see the class doc). */
+        std::optional<Rgb8> image;
+        /** The noise on frame 0 each step, times t^2 (the reference's
+         *  image_cond_noise_scale). */
+        float image_noise = 0.15f;
     };
 
     /** Where the time went, in milliseconds (denoise includes T5). */
@@ -81,11 +97,38 @@ class LtxvPipeline {
     /**
      * Checks a request's sizes: width and height multiples of 32 in
      * [32, kMaxSide], frames 8 k + 1 in [1, kMaxFrames], a frame rate
-     * in (0, 1000].
+     * in (0, 1000], and for image to video a non-empty image and an
+     * image_noise in [0, 1].
      *
      * @throws std::invalid_argument naming the bad field.
      */
     static void check(const Request& req);
+
+    /** @returns Whether the VAE has its encoder (image to video). */
+    bool can_condition() const { return vae_->has_encoder(); }
+
+    /**
+     * The first frame as load_image_to_tensor_with_resize_and_crop makes
+     * it, without the CRF step: the center crop to width / height's
+     * aspect, Pillow's bicubic resize, torchvision's gaussian_blur
+     * (kernel 3, sigma 1, reflect padding), then [0, 255] to [-1, 1].
+     *
+     * @returns [3][height][width].
+     * @throws std::invalid_argument on an empty image or size.
+     */
+    static std::vector<float> condition_image(const Rgb8& image,
+                                              std::uint32_t width,
+                                              std::uint32_t height);
+
+    /**
+     * Frame 0's latent from condition_image's output: the VAE encoder's
+     * normalized mean.
+     *
+     * @returns [128][height / 32][width / 32].
+     * @throws std::invalid_argument without an encoder or on a bad size.
+     */
+    std::vector<float> encode_image(std::span<const float> image,
+                                    const Request& req) const;
 
     /** @returns The T5 tokenizer (for prompt_ids). */
     const tok::Tokenizer& tokenizer() const { return *tok_; }
@@ -112,13 +155,20 @@ class LtxvPipeline {
      * @param step_noise For a stochastic request, the 8 steps' noise,
      *     each shaped like noise (for tests: the reference's); empty
      *     draws it from req.seed. Ignored for a deterministic request.
+     * @param first Image to video: frame 0's latent, [128][h][w]
+     *     (encode_image's); empty for text to video.
+     * @param first_noise With first: the 8 steps' frame-0 noise, each
+     *     [128][h][w] (for tests: the reference's); empty draws it from
+     *     req.seed.
      * @returns The latent after the last step, same shape, or empty when
      *     cancelled.
      */
     std::vector<float> denoise(std::span<const float> noise,
                                std::span<const float> step_noise,
                                const Request& req, const backend::Ops& op,
-                               const std::function<bool()>& alive) const;
+                               const std::function<bool()>& alive,
+                               std::span<const float> first = {},
+                               std::span<const float> first_noise = {}) const;
 
     /**
      * The decode of a denoised latent with a given decode noise.

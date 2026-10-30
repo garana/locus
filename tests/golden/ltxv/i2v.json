@@ -1,0 +1,23 @@
+{
+ "prompt": "A red fox walks through fresh snow in a quiet pine forest.",
+ "width": 256,
+ "height": 160,
+ "frames": 17,
+ "fps": 30,
+ "seed": 357,
+ "source": [
+  200,
+  300,
+  3
+ ],
+ "strength": 1.0,
+ "image_cond_noise_scale": 0.15,
+ "latent": [
+  128,
+  3,
+  5,
+  8
+ ],
+ "encode_std_mean": 0.0013022938510403037,
+ "encode_std_max": 0.0016202061669901013
+}
