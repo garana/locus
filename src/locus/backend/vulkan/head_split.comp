@@ -1,0 +1,36 @@
+#version 450
+
+// Copies n token rows of heads x hd (row t at x_off + t * x_stride)
+// into per-head planes for attention as matmuls: [heads][n][hd] (K),
+// or with transpose set [heads][hd][n] (V^T). Grid-stride over the
+// input in order, so the reads are contiguous.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint heads;
+    uint hd;
+    uint x_off;
+    uint x_stride;
+    uint transpose;
+} pc;
+
+void main() {
+    uint w = pc.heads * pc.hd;
+    uint step = gl_NumWorkGroups.x * 256u;
+    for (uint e = gl_GlobalInvocationID.x; e < pc.n * w; e += step) {
+        uint t = e / w;
+        uint h = (e % w) / pc.hd;
+        uint d = e % pc.hd;
+        float v = x[pc.x_off + t * pc.x_stride + h * pc.hd + d];
+        if (pc.transpose != 0u) {
+            o[(h * pc.hd + d) * pc.n + t] = v;
+        } else {
+            o[(h * pc.n + t) * pc.hd + d] = v;
+        }
+    }
+}

@@ -8,6 +8,8 @@
 #include "catch_amalgamated.hpp"
 #include "json.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan/context.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/image/flux_dit.hpp"
 
@@ -56,6 +58,20 @@ double rel_error(const float* got, const float* ref, std::size_t count) {
     return worst / std::sqrt(ss / static_cast<double>(count));
 }
 
+struct Leg {
+    const char* name;
+    const locus::backend::Ops* op;
+};
+
+/** The CPU, plus the whole-step Vulkan forward when there is a device. */
+std::vector<Leg> legs() {
+    std::vector<Leg> v = {{"cpu", &locus::backend::best_backend().ops}};
+    if (locus::backend::vk::VulkanContext::available()) {
+        v.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    return v;
+}
+
 }  // namespace
 
 // The rotation angles of FluxPosEmbed for the 4 / 6 / 6 axes: axis a
@@ -98,14 +114,23 @@ TEST_CASE("flux dit matches diffusers on a tiny model", "[flux][image]") {
     const std::size_t nt = std::size_t{n_txt} * dit.text_width();
     REQUIRE(in.size() == nx + nt + dit.pooled_width());
     const std::span<const float> all(in);
-    const auto out = dit.forward(
-        all.subspan(0, nx), ids_of(j, "img_ids"), n_img,
-        all.subspan(nx, nt), ids_of(j, "txt_ids"), n_txt,
-        all.subspan(nx + nt), j["sigma"].get<float>(),
-        j["guidance"].get<float>(), locus::backend::best_backend().ops);
     const auto ref = read_f32(kDir + "golden/flux_synth_out.f32");
-    REQUIRE(out.size() == ref.size());
-    REQUIRE(rel_error(out.data(), ref.data(), ref.size()) < 1e-4);
+    for (const Leg& leg : legs()) {
+        DYNAMIC_SECTION(leg.name) {
+            FluxDit::Trace trace;
+            const auto out = dit.forward(
+                all.subspan(0, nx), ids_of(j, "img_ids"), n_img,
+                all.subspan(nx, nt), ids_of(j, "txt_ids"), n_txt,
+                all.subspan(nx + nt), j["sigma"].get<float>(),
+                j["guidance"].get<float>(), *leg.op, &trace);
+            REQUIRE(out.size() == ref.size());
+            REQUIRE(rel_error(out.data(), ref.data(), ref.size()) < 1e-4);
+            const std::size_t w = dit.width();
+            REQUIRE(trace.double0_img.size() == n_img * w);
+            REQUIRE(trace.double0_txt.size() == n_txt * w);
+            REQUIRE(trace.single0.size() == (n_img + n_txt) * w);
+        }
+    }
 }
 
 TEST_CASE("flux dit rejects wrong sizes", "[flux][image]") {
@@ -145,22 +170,29 @@ TEST_CASE("flux kontext dit matches diffusers", "[flux][image][e2e]") {
     const std::size_t nt = std::size_t{n_txt} * dit.text_width();
     REQUIRE(in.size() == nx + nt + dit.pooled_width());
     const std::span<const float> all(in);
-    FluxDit::Trace trace;
-    const auto out = dit.forward(
-        all.subspan(0, nx), ids_of(j, "img_ids"), n_img,
-        all.subspan(nx, nt), ids_of(j, "txt_ids"), n_txt,
-        all.subspan(nx + nt), j["sigma"].get<float>(),
-        j["guidance"].get<float>(), locus::backend::best_backend().ops,
-        &trace);
     const auto tr = read_f32(d + "dit_trace.f32");
-    const std::size_t w = dit.width();
-    const std::size_t a = n_img * w, b = n_txt * w, c = (n_img + n_txt) * w;
-    REQUIRE(tr.size() == a + b + c);
-    REQUIRE(rel_error(trace.double0_img.data(), tr.data(), a) < 1e-3);
-    REQUIRE(rel_error(trace.double0_txt.data(), tr.data() + a, b) < 1e-3);
-    REQUIRE(rel_error(trace.single0.data(), tr.data() + a + b, c) < 1e-3);
     const auto ref = read_f32(d + "dit_out.f32");
-    REQUIRE(out.size() == ref.size());
-    // On the M2 Pro: 3.4e-5, 4.4e-5 and 1.5e-4 above, 8.5e-5 here.
-    REQUIRE(rel_error(out.data(), ref.data(), ref.size()) < 1e-3);
+    for (const Leg& leg : legs()) {
+        DYNAMIC_SECTION(leg.name) {
+            FluxDit::Trace trace;
+            const auto out = dit.forward(
+                all.subspan(0, nx), ids_of(j, "img_ids"), n_img,
+                all.subspan(nx, nt), ids_of(j, "txt_ids"), n_txt,
+                all.subspan(nx + nt), j["sigma"].get<float>(),
+                j["guidance"].get<float>(), *leg.op, &trace);
+            const std::size_t w = dit.width();
+            const std::size_t a = n_img * w, b = n_txt * w,
+                              c = (n_img + n_txt) * w;
+            REQUIRE(tr.size() == a + b + c);
+            REQUIRE(rel_error(trace.double0_img.data(), tr.data(), a) < 1e-3);
+            REQUIRE(rel_error(trace.double0_txt.data(), tr.data() + a, b) <
+                    1e-3);
+            REQUIRE(rel_error(trace.single0.data(), tr.data() + a + b, c) <
+                    1e-3);
+            REQUIRE(out.size() == ref.size());
+            // On the M2 Pro CPU: 3.4e-5, 4.4e-5 and 1.5e-4 above, 8.5e-5
+            // here.
+            REQUIRE(rel_error(out.data(), ref.data(), ref.size()) < 1e-3);
+        }
+    }
 }

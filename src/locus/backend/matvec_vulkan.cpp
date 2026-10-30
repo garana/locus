@@ -25,6 +25,7 @@
 #include "locus/backend/vulkan/q8_layout.hpp"
 #include "locus/backend/vulkan/weight_pool.hpp"
 #include "locus/backend/vulkan_forward.hpp"
+#include "locus/backend/vulkan_seq.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/sys/mmap_file.hpp"
 
@@ -282,6 +283,10 @@ struct State {
     VulkanContext::Buffer img_q{}, img_k{}, img_v{}, img_s{}, img_o{};
     std::size_t img_q_n = 0, img_k_n = 0, img_v_n = 0, img_s_n = 0,
                 img_o_n = 0;
+    /** VulkanSeq's activation slots, and its per-batch copies of
+     *  biases and norm weights (scratch). */
+    VulkanContext::Buffer seq[VulkanSeq::kSlots]{}, seq_consts{};
+    std::size_t seq_n[VulkanSeq::kSlots]{}, seq_consts_n = 0;
     /** conv2d_vulkan's input and output (scratch). */
     VulkanContext::Buffer conv_in{}, conv_out{};
     std::size_t conv_in_n = 0, conv_out_n = 0;
@@ -898,6 +903,8 @@ Kernel matmul_kernel(const Mat& w) {
         case gguf::TensorType::kQ6_K: return Kernel::kMatmulQ6_K;
         case gguf::TensorType::kQ5_0: return Kernel::kMatmulQ5_0;
         case gguf::TensorType::kF32: return Kernel::kMatmulF32;
+        case gguf::TensorType::kF16: return Kernel::kMatmulF16;
+        case gguf::TensorType::kBF16: return Kernel::kMatmulBF16;
         default: return Kernel::kCount_;
     }
 }
@@ -964,7 +971,7 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
     // A short batch (a speculative verify, a tiny chunk, the CFG pair of
     // vulkan_forward_multi): one weight read for all its tokens
     // (matvec_*_n, bandwidth-bound) instead of a mostly-padding matmul
-    // tile, or, for F16 / BF16 (no matmul kernel), one matvec per token.
+    // tile.
     const Kernel small = small_batch_kernel(w, r.n_tok);
     if (small != Kernel::kCount_ && r.n_tok <= kSmallBatch && r.div == 1 &&
         r.w_bdiv == 1) {
@@ -3112,7 +3119,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         }
         const VulkanContext::Buffer bufs[] = {
             s.upload(b.data(), b.size() * 4), o};
-        const std::uint32_t push[] = {dim, n, 0, dim};
+        const std::uint32_t push[] = {dim, n, 0, dim, 0};
         s.ctx.dispatch(Kernel::kBiasRows, bufs, push,
                        std::min<std::uint32_t>((n * dim + 255) / 256,
                                                65535));
@@ -3384,6 +3391,219 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     }
     seq.n_tokens = base + n;
     return true;
+}
+
+bool VulkanSeq::available() { return vulkan_backend_usable(); }
+
+struct VulkanSeq::Impl {
+    std::unique_lock<std::recursive_mutex> lk;
+    State& s;
+    /** Floats of seq_consts used by the open batch. */
+    std::size_t consts_used = 0;
+    explicit Impl(std::recursive_mutex& mu) : lk(mu), s(state()) {}
+
+    VulkanContext::Buffer slot(Slot i) const {
+        if (i >= kSlots || s.seq_n[i] == 0) {
+            throw std::invalid_argument("VulkanSeq: slot not reserved");
+        }
+        return s.seq[i];
+    }
+
+    /** Copies v into this batch's constants; @returns its buffer and
+     *  float offset. A full buffer is retired (the ops already recorded
+     *  still read it) for a bigger one. */
+    std::pair<VulkanContext::Buffer, std::uint32_t> put(
+        std::span<const float> v) {
+        if (consts_used + v.size() > s.seq_consts_n) {
+            s.grow(s.seq_consts, s.seq_consts_n,
+                   std::max(v.size(), 2 * s.seq_consts_n + (1u << 20)));
+            consts_used = 0;
+        }
+        const auto at = static_cast<std::uint32_t>(consts_used);
+        std::memcpy(static_cast<float*>(s.ctx.mapped(s.seq_consts)) + at,
+                    v.data(), v.size_bytes());
+        consts_used += (v.size() + 63) & ~std::size_t{63};
+        return {s.seq_consts, at};
+    }
+};
+
+VulkanSeq::VulkanSeq() {
+    if (!vulkan_backend_usable()) {
+        throw std::runtime_error("VulkanSeq: Vulkan is not usable");
+    }
+    im_ = std::make_unique<Impl>(state_mu());
+    im_->s.ctx.begin_batch();
+}
+
+VulkanSeq::~VulkanSeq() {
+    if (im_->s.ctx.batch_open()) {
+        im_->s.abandon_batch();
+    }
+}
+
+void VulkanSeq::reserve(Slot i, std::size_t n) {
+    if (i >= kSlots || n == 0) {
+        throw std::invalid_argument("VulkanSeq: bad slot or size");
+    }
+    im_->s.grow(im_->s.seq[i], im_->s.seq_n[i], n);
+}
+
+void VulkanSeq::write(Slot i, std::size_t off, std::span<const float> v) {
+    const auto b = im_->slot(i);
+    if (off + v.size() > im_->s.seq_n[i]) {
+        throw std::invalid_argument("VulkanSeq: write past the slot");
+    }
+    flush();
+    std::memcpy(static_cast<float*>(im_->s.ctx.mapped(b)) + off, v.data(),
+                v.size_bytes());
+}
+
+void VulkanSeq::read(Slot i, std::size_t off, std::span<float> out) {
+    const auto b = im_->slot(i);
+    if (off + out.size() > im_->s.seq_n[i]) {
+        throw std::invalid_argument("VulkanSeq: read past the slot");
+    }
+    flush();
+    std::memcpy(out.data(), static_cast<const float*>(im_->s.ctx.mapped(b)) +
+                                off,
+                out.size_bytes());
+}
+
+void VulkanSeq::flush() {
+    im_->s.end_batch();
+    im_->consts_used = 0;
+    im_->s.ctx.begin_batch();
+}
+
+void VulkanSeq::linear(const Mat& w, std::span<const float> b, Rows x,
+                       Rows out, std::uint32_t n) {
+    if (!b.empty() && b.size() != w.rows) {
+        throw std::invalid_argument("VulkanSeq::linear: bias size");
+    }
+    State& s = im_->s;
+    const auto ob = im_->slot(out.slot);
+    rec_matmul(s, w, s.upload_w(w), im_->slot(x.slot), ob,
+               MatmulRows{n, x.off, x.stride, out.off, out.stride}, false);
+    if (!b.empty()) {
+        const auto [cb, at] = im_->put(b);
+        const VulkanContext::Buffer bufs[] = {cb, ob};
+        const std::uint32_t push[] = {w.rows, n, out.off, out.stride, at};
+        s.ctx.dispatch(Kernel::kBiasRows, bufs, push,
+                       std::min<std::uint32_t>((w.rows * n + 255) / 256,
+                                               4096));
+    }
+}
+
+namespace {
+
+/** Grid (x, y) for one workgroup per row. */
+std::pair<std::uint32_t, std::uint32_t> row_grid(std::uint32_t rows) {
+    const std::uint32_t gx = std::clamp<std::uint32_t>(rows, 1, 65535);
+    return {gx, (rows + gx - 1) / gx};
+}
+
+}  // namespace
+
+void VulkanSeq::ln_mod(Rows x, Rows out, std::uint32_t n, std::uint32_t d,
+                       Slot mod, std::uint32_t shift_off,
+                       std::uint32_t scale_off, float eps) {
+    const VulkanContext::Buffer bufs[] = {im_->slot(x.slot), im_->slot(mod),
+                                          im_->slot(out.slot)};
+    const std::uint32_t push[] = {d,         n,          x.off,
+                                  x.stride,  out.off,    out.stride,
+                                  shift_off, scale_off,  fbits(eps)};
+    const auto [gx, gy] = row_grid(n);
+    im_->s.ctx.dispatch(Kernel::kLnMod, bufs, push, gx, gy);
+}
+
+void VulkanSeq::head_norm_rope(Rows x, std::uint32_t n, std::uint32_t heads,
+                               std::uint32_t hd, std::span<const float> norm,
+                               Slot cos_s, Slot sin_s,
+                               std::uint32_t rope_row0, float eps) {
+    if (norm.size() != hd) {
+        throw std::invalid_argument("VulkanSeq::head_norm_rope: norm size");
+    }
+    const auto [cb, at] = im_->put(norm);
+    const VulkanContext::Buffer bufs[] = {im_->slot(x.slot), cb,
+                                          im_->slot(cos_s), im_->slot(sin_s)};
+    const std::uint32_t push[] = {n,  heads,     hd,       x.off,
+                                  x.stride, at, rope_row0, fbits(eps)};
+    const auto [gx, gy] = row_grid(n * heads);
+    im_->s.ctx.dispatch(Kernel::kHeadNormRope, bufs, push, gx, gy);
+}
+
+void VulkanSeq::attention(Rows q, Rows k, Rows v, Rows out, std::uint32_t n,
+                          std::uint32_t heads, std::uint32_t hd, Slot kh,
+                          Slot vt, Slot scores) {
+    State& s = im_->s;
+    const std::size_t plane = std::size_t{heads} * n * hd;
+    const std::size_t row = std::size_t{heads} * n;
+    constexpr std::size_t kMaxFloats = std::size_t{1} << 30;
+    if (n == 0 || plane > kMaxFloats || row > kMaxFloats) {
+        throw std::invalid_argument("VulkanSeq::attention: bad sizes");
+    }
+    const std::uint32_t mb = static_cast<std::uint32_t>(
+        std::clamp<std::size_t>(attn_scratch_floats.load() / row, 1, n));
+    reserve(kh, plane);
+    reserve(vt, plane);
+    reserve(scores, row * mb);
+    const auto khb = im_->slot(kh), vtb = im_->slot(vt);
+    const auto sb = im_->slot(scores);
+    const std::uint32_t groups = std::min<std::uint32_t>(
+        static_cast<std::uint32_t>((plane + 255) / 256), 4096);
+    for (const bool t : {false, true}) {
+        const Rows src = t ? v : k;
+        const VulkanContext::Buffer bufs[] = {im_->slot(src.slot),
+                                              t ? vtb : khb};
+        const std::uint32_t push[] = {n,       heads,      hd,
+                                      src.off, src.stride, t ? 1u : 0u};
+        s.ctx.dispatch(Kernel::kHeadSplit, bufs, push, groups);
+    }
+    const auto qb = im_->slot(q.slot), ob = im_->slot(out.slot);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+    for (std::uint32_t t0 = 0; t0 < n; t0 += mb) {
+        // Queries t0 .. t0 + m - 1, all heads at once (batch h): their
+        // scores fill the block as [heads][m][n].
+        const std::uint32_t m = std::min(mb, n - t0);
+        // S_h[t][j] = K_h[j] . Q[t][h]: K_h ([n][hd]) as the weight.
+        const Mat km{gguf::TensorType::kF32, nullptr, n, hd};
+        MatmulRows sr{m, q.off + t0 * q.stride, q.stride, 0, n};
+        sr.n_batch = heads;
+        sr.w_bstride_bytes = std::uint64_t{n} * hd * 4;
+        sr.x_bstride = hd;
+        sr.out_bstride = m * n;
+        rec_matmul(s, km, khb, qb, sb, sr, false);
+        // Unmasked: the causal shader with base n - 1 sees all n keys.
+        rec_softmax(s, sb, heads * m, n, heads * m, n - 1, scale);
+        // O[t][h] = V_h^T P_h[t]: V_h^T ([hd][n]) as the weight.
+        const Mat vm{gguf::TensorType::kF32, nullptr, hd, n};
+        MatmulRows orr{m, 0, n, out.off + t0 * out.stride, out.stride};
+        orr.n_batch = heads;
+        orr.w_bstride_bytes = std::uint64_t{hd} * n * 4;
+        orr.x_bstride = m * n;
+        orr.out_bstride = hd;
+        rec_matmul(s, vm, vtb, sb, ob, orr, false);
+    }
+}
+
+void VulkanSeq::gelu_tanh(Rows x, std::uint32_t n, std::uint32_t d) {
+    const auto xb = im_->slot(x.slot);
+    const VulkanContext::Buffer bufs[] = {xb, xb, xb};
+    const std::uint32_t push[] = {n, d, x.off, x.stride, 0, 0, 0};
+    im_->s.ctx.dispatch(
+        Kernel::kGeluTanh, bufs, push,
+        std::min<std::uint32_t>((n * d + 255) / 256, 4096));
+}
+
+void VulkanSeq::gated_add(Rows x, Rows y, std::uint32_t n, std::uint32_t d,
+                          Slot gate_s, std::uint32_t gate_off) {
+    const VulkanContext::Buffer bufs[] = {im_->slot(y.slot), im_->slot(gate_s),
+                                          im_->slot(x.slot)};
+    const std::uint32_t push[] = {n,     d,        x.off,   x.stride,
+                                  y.off, y.stride, gate_off};
+    im_->s.ctx.dispatch(
+        Kernel::kGatedAdd, bufs, push,
+        std::min<std::uint32_t>((n * d + 255) / 256, 4096));
 }
 
 }  // namespace locus::backend
