@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <stdexcept>
 
@@ -258,7 +259,13 @@ std::vector<float> FluxPipeline::generate_from(
             ~ReleaseDit() {
                 try {
                     if (on) backend::vulkan_release_weights(b.data(), b.size());
+                } catch (const std::exception& e) {
+                    // The DiT stays on the GPU, so the next request's
+                    // T5 may not fit: say why.
+                    std::fprintf(stderr, "flux: releasing the DiT: %s\n",
+                                 e.what());
                 } catch (...) {
+                    std::fprintf(stderr, "flux: releasing the DiT failed\n");
                 }
             }
         } release_dit{vk, dit_bytes_};

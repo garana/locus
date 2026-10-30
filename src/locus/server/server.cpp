@@ -2716,7 +2716,9 @@ void OpenAiServer::install_routes() {
                 // With host-memory import (as for PixArt) the DiT runs
                 // each step on the GPU, activations resident
                 // (FluxDit::forward_vulkan); CLIP, T5 and the VAE run
-                // per op. Without it, the CPU backend.
+                // per op. Without it, the CPU backend. A GPU step holds
+                // the Vulkan lock for its whole length, so text
+                // generation on the same GPU waits for it.
                 const auto& op = backend::vulkan_imports_host_memory()
                                      ? backend::vulkan_image_ops()
                                      : backend::best_backend().ops;
