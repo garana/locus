@@ -105,7 +105,10 @@ bool Engine::step() {
                            std::memory_order_relaxed);
     metrics_.waiting.store(static_cast<std::uint32_t>(waiting_.size()),
                            std::memory_order_relaxed);
-    metrics_.batch_tokens.store(step_tokens_, std::memory_order_relaxed);
+    // 0 once the engine has no work left, so an idle server does not
+    // keep showing its last step as if it were busy.
+    metrics_.batch_tokens.store(more ? step_tokens_ : 0,
+                                std::memory_order_relaxed);
     count_block_states();
     return more;
 }

@@ -1399,8 +1399,9 @@ void OpenAiServer::install_routes() {
                   "Requests waiting for admission after the last step.",
                   em.waiting.load(kRelaxed));
             gauge("locus_batch_tokens",
-                  "Tokens the model computed in the last step (prefill, "
-                  "decode and speculative verify).",
+                  "Tokens the model computed in the last engine step "
+                  "(prefill, decode and speculative verify); 0 when "
+                  "idle.",
                   em.batch_tokens.load(kRelaxed));
             // Each block in use counted once; with locus_kv_blocks_free
             // the three sum to locus_kv_blocks_total.

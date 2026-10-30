@@ -465,7 +465,7 @@ guarding the default path.
   `locus_engine_steps_total`) and the running and waiting counts.
   After each step the engine also sets `locus_batch_tokens` (the
   tokens the model computed in it: prefill, decode and speculative
-  verify) and `locus_kv_blocks_used{state}`: each block in use counted
+  verify; 0 once the engine is idle) and `locus_kv_blocks_used{state}`: each block in use counted
   once, as held by a sequence still prefilling, else by one decoding,
   else only by the prefix cache, so the three and
   `locus_kv_blocks_free` sum to `locus_kv_blocks_total`. The engine

@@ -46,8 +46,9 @@ struct EngineMetrics {
     /** After the last step: sequences running and requests waiting. */
     std::atomic<std::uint32_t> running{0};
     std::atomic<std::uint32_t> waiting{0};
-    /** Tokens the model computed in the last step: prefill chunks,
-     * decode tokens and speculative verify positions. */
+    /** Tokens the model computed in the last engine step: prefill
+     * chunks, decode tokens and speculative verify positions; 0 once
+     * the engine is idle. */
     std::atomic<std::uint32_t> batch_tokens{0};
     /** KV blocks in use after the last step, each counted once: held
      * by a sequence still prefilling, else by one decoding, else only

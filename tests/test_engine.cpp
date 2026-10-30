@@ -271,8 +271,9 @@ TEST_CASE("engine reports step tokens and kv blocks by state",
     REQUIRE(prefill_steps >= 4);  // over 16 prompt tokens, 4 a step
     REQUIRE(decode_steps >= 2);
     REQUIRE(engine.get(id)->status == Status::kDone);
-    // Done: no sequence holds blocks; the prefix cache keeps the
-    // prompt's full blocks.
+    // Done: idle, so no step tokens; no sequence holds blocks; the
+    // prefix cache keeps the prompt's full blocks.
+    REQUIRE(m.batch_tokens == 0);
     REQUIRE(m.kv_blocks_prefilling == 0);
     REQUIRE(m.kv_blocks_decoding == 0);
     REQUIRE(m.kv_blocks_cached >= 1);
