@@ -129,6 +129,12 @@ class GgufBuilder {
         return *this;
     }
 
+    /** Appends raw tensor payload bytes. */
+    GgufBuilder& raw_bytes(std::span<const std::byte> b) {
+        out_.insert(out_.end(), b.begin(), b.end());
+        return *this;
+    }
+
     std::span<const std::byte> bytes() const { return out_; }
 
   private:
