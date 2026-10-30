@@ -64,9 +64,11 @@ class LtxvVae {
 
     /**
      * A 3 x 3 x 3 conv, stride 1, as the reference's CausalConv3d with
-     * causal=False and zero spatial padding: in [ci][f][h][w] to out
-     * [co][f][h][w]; frame -1 reads frame 0 and frame f reads frame
-     * f - 1. Runs across the thread pool, one item per (co, frame, row).
+     * zero spatial padding: in [ci][f][h][w] to out [co][f][h][w]. With
+     * causal false, frame -1 reads frame 0 and frame f reads frame f - 1;
+     * with causal true (the encoder), frames -2 and -1 read frame 0 and
+     * nothing reads past the last. Runs across the thread pool, one item
+     * per (co, frame, row).
      *
      * @param weight [co][ci][27], each kernel in (kt, ky, kx) order.
      * @param bias co floats.
@@ -75,7 +77,30 @@ class LtxvVae {
                           std::uint32_t f, std::uint32_t h, std::uint32_t w,
                           std::span<const float> weight,
                           std::span<const float> bias, std::uint32_t co,
-                          std::span<float> out);
+                          std::span<float> out, bool causal = false);
+
+    /** @returns Whether the GGUF holds the encoder too. */
+    bool has_encoder() const { return !enc_blocks_.empty(); }
+
+    /**
+     * The encoder (the reference's causal Encoder), as vae_encode with
+     * vae_per_channel_normalize runs it, but taking the latent
+     * distribution's mean where vae_encode samples it: patchify 4 x 4,
+     * causal conv_in, the encoder blocks (res_x: pixel norm, SiLU, causal
+     * conv, twice, plus the input; compress_*_res: a causal conv and a
+     * space-to-depth by the block's stride, plus the input
+     * space-to-depthed and averaged over channel groups; the time stride
+     * first repeats frame 0), pixel norm, SiLU, causal conv_out, then
+     * (mean - mean_of_means) / std_of_means.
+     *
+     * @param video [3][f][h][w] in [-1, 1]; f = 1 + time_scale() k, h
+     *     and w multiples of space_scale().
+     * @returns [latent_channels][(f - 1) / time_scale() + 1]
+     *     [h / space_scale()][w / space_scale()].
+     * @throws std::invalid_argument without an encoder or on bad sizes.
+     */
+    std::vector<float> encode(std::span<const float> video, std::uint32_t f,
+                              std::uint32_t h, std::uint32_t w) const;
 
   private:
     struct Conv {
@@ -107,6 +132,20 @@ class LtxvVae {
     std::vector<Block> blocks_;
     TimeMlp last_time_;
     std::span<const float> last_table_;  ///< [2][ch]
+
+    /** One encoder block: a res_x group, or a compress_*_res block with
+     *  its (time, space) stride. */
+    struct EncBlock {
+        bool res = false;
+        std::uint32_t ch = 0;   ///< input channels
+        std::uint32_t out = 0;  ///< output channels
+        std::uint32_t st = 1, ss = 1;  ///< time and space stride
+        std::vector<Res> layers;  ///< res_x (their tables are empty)
+        Conv conv;                ///< compress_*_res
+    };
+    std::uint32_t in_ch_ = 3;
+    Conv enc_in_, enc_out_;
+    std::vector<EncBlock> enc_blocks_;
 };
 
 }  // namespace locus::image

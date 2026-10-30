@@ -119,6 +119,13 @@ TEST_CASE("ltxv requests are checked", "[ltxv][image]") {
     bad = r;
     bad.frame_rate = 0.0f;
     REQUIRE_THROWS_AS(LtxvPipeline::check(bad), std::invalid_argument);
+    bad = r;
+    bad.image = locus::image::Rgb8{};
+    REQUIRE_THROWS_AS(LtxvPipeline::check(bad), std::invalid_argument);
+    bad.image = locus::image::Rgb8{1, 1, {0, 0, 0}};
+    REQUIRE_NOTHROW(LtxvPipeline::check(bad));
+    bad.image_noise = 1.5f;
+    REQUIRE_THROWS_AS(LtxvPipeline::check(bad), std::invalid_argument);
     REQUIRE(LtxvPipeline::preprocess("  A Red Fox.\n") == "A Red Fox.");
 }
 
@@ -205,4 +212,82 @@ TEST_CASE("ltxv pipeline matches the reference clip",
         CAPTURE(db);
         REQUIRE(db >= 40.0);
     }
+}
+
+// The first frame as load_image_to_tensor_with_resize_and_crop makes it
+// without the CRF step (scripts/make-ltxv-pipeline-goldens.py --i2v):
+// a 300 x 200 image cropped to 256 x 160's aspect, resized and blurred.
+TEST_CASE("ltxv first frame is prepared as the reference does",
+          "[ltxv][image]") {
+    const auto j = read_json(kDir + "golden/ltxv/i2v.json");
+    const auto src = read_u8(kDir + "golden/ltxv/i2v_src.rgb");
+    const auto ref = read_f32(kDir + "golden/ltxv/i2v_image.f32");
+    const auto shape = j["source"].get<std::vector<std::uint32_t>>();
+    REQUIRE(shape.size() == 3);  // [h, w, 3]
+    const locus::image::Rgb8 img{shape[1], shape[0], src};
+    const auto w = j["width"].get<std::uint32_t>();
+    const auto h = j["height"].get<std::uint32_t>();
+    const auto got = LtxvPipeline::condition_image(img, w, h);
+    REQUIRE(got.size() == ref.size());
+    double worst = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        worst = std::max(worst, std::fabs(double{got[i]} - ref[i]));
+    }
+    CAPTURE(worst);
+    REQUIRE(worst <= 1e-5);  // the resize is exact; the blur's sum order
+    REQUIRE_THROWS_AS(LtxvPipeline::condition_image({}, w, h),
+                      std::invalid_argument);
+}
+
+// Image to video on the real models against the reference
+// LTXVideoPipeline with a frame-0 ConditioningItem (--i2v goldens): the
+// prepared frame encoded to frame 0's latent, then 8 deterministic steps
+// with the reference's start and frame-0 noise.
+TEST_CASE("ltxv image to video matches the reference",
+          "[ltxv][image][e2e]") {
+    const fs::path models = kDir + "models";
+    const char* parts[] = {"t5-xxl-enc-f16.gguf", "ltxv-2b-dit.gguf",
+                           "ltxv-2b-vae.gguf"};
+    for (const char* p : parts) {
+        if (!fs::exists(models / p)) {
+            SKIP(std::string(p) + " absent");
+        }
+    }
+    const auto d = temp_dir("locus_ltxv_i2v_models");
+    for (const char* p : parts) {
+        fs::create_symlink(fs::absolute(models / p), d / p);
+    }
+    const auto pipe = LtxvPipeline::load_dir(d.string());
+    fs::remove_all(d);
+    if (!pipe->can_condition()) {
+        SKIP("ltxv-2b-vae.gguf has no encoder; reconvert it");
+    }
+    const auto j = read_json(kDir + "golden/ltxv/i2v.json");
+    LtxvPipeline::Request req;
+    req.prompt = j["prompt"].get<std::string>();
+    req.width = j["width"].get<std::uint32_t>();
+    req.height = j["height"].get<std::uint32_t>();
+    req.frames = j["frames"].get<std::uint32_t>();
+    req.frame_rate = j["fps"].get<float>();
+    req.stochastic = false;
+    req.image_noise = j["image_cond_noise_scale"].get<float>();
+    const auto image = read_f32(kDir + "golden/ltxv/i2v_image.f32");
+    const auto noise = read_f32(kDir + "golden/ltxv/i2v_noise.f32");
+    const auto cond = read_f32(kDir + "golden/ltxv/i2v_cond_noise.f32");
+    const auto ref = read_f32(kDir + "golden/ltxv/i2v_latent.f32");
+    const bool gpu = locus::backend::vulkan_imports_host_memory();
+    const auto& op = gpu ? locus::backend::vulkan_image_ops()
+                         : locus::backend::best_backend().ops;
+    const auto first = pipe->encode_image(image, req);
+    const std::size_t hw = std::size_t{req.height / 32} * (req.width / 32);
+    REQUIRE(first.size() == 128 * hw);
+    REQUIRE(cond.size() == 8 * first.size());
+    const auto x = pipe->denoise(noise, {}, req, op, {}, first, cond);
+    const double err = rel_error(x, ref);
+    CAPTURE(gpu, err);
+    REQUIRE(err <= 1e-2);
+    REQUIRE_THROWS_AS(
+        pipe->denoise(noise, {}, req, op, {}, first,
+                      std::span<const float>(cond.data(), first.size())),
+        std::invalid_argument);
 }

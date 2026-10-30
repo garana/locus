@@ -112,6 +112,90 @@ void LtxvPipeline::check(const Request& req) {
     if (!(req.frame_rate > 0.0f && req.frame_rate <= 1000.0f)) {
         throw std::invalid_argument("frame_rate must be in (0, 1000]");
     }
+    if (req.image) {
+        if (req.image->w == 0 || req.image->h == 0 ||
+            req.image->rgb.size() != std::size_t{req.image->w} *
+                                         req.image->h * 3) {
+            throw std::invalid_argument("image is empty or malformed");
+        }
+        if (!(req.image_noise >= 0.0f && req.image_noise <= 1.0f)) {
+            throw std::invalid_argument("image_noise must be in [0, 1]");
+        }
+    }
+}
+
+std::vector<float> LtxvPipeline::condition_image(const Rgb8& image,
+                                                 std::uint32_t width,
+                                                 std::uint32_t height) {
+    if (image.w == 0 || image.h == 0 || width == 0 || height == 0 ||
+        image.rgb.size() != std::size_t{image.w} * image.h * 3) {
+        throw std::invalid_argument("ltxv: empty image or size");
+    }
+    // The center crop to the target aspect, with Python's int()
+    // truncation on double products.
+    const double target = static_cast<double>(width) / height;
+    const double frame = static_cast<double>(image.w) / image.h;
+    std::uint32_t cw = image.w, ch = image.h, x0 = 0, y0 = 0;
+    if (frame > target) {
+        cw = static_cast<std::uint32_t>(image.h * target);
+        x0 = (image.w - cw) / 2;
+    } else {
+        ch = static_cast<std::uint32_t>(image.w / target);
+        y0 = (image.h - ch) / 2;
+    }
+    if (cw == 0 || ch == 0) throw std::invalid_argument("ltxv: image too thin");
+    Rgb8 crop{cw, ch, std::vector<std::uint8_t>(std::size_t{cw} * ch * 3)};
+    for (std::uint32_t y = 0; y < ch; ++y) {
+        std::copy_n(&image.rgb[(std::size_t{y0 + y} * image.w + x0) * 3],
+                    std::size_t{cw} * 3, &crop.rgb[std::size_t{y} * cw * 3]);
+    }
+    const Rgb8 r = resize_bicubic(crop, width, height);
+
+    // torchvision's gaussian_blur: the normalized 1D kernel
+    // exp(-x^2 / 2) at x = -1, 0, 1, its outer product, reflect padding.
+    const float e = std::exp(-0.5f);
+    const float sum = e + 1.0f + e;
+    const float k1[3] = {e / sum, 1.0f / sum, e / sum};
+    const auto reflect = [](std::int64_t i, std::int64_t n) {
+        if (i < 0) return -i;
+        if (i >= n) return 2 * n - 2 - i;
+        return i;
+    };
+    const std::size_t plane = std::size_t{width} * height;
+    std::vector<float> out(3 * plane);
+    for (std::uint32_t c = 0; c < 3; ++c) {
+        for (std::uint32_t y = 0; y < height; ++y) {
+            for (std::uint32_t x = 0; x < width; ++x) {
+                float acc = 0.0f;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    const auto yy = reflect(std::int64_t{y} + dy, height);
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const auto xx = reflect(std::int64_t{x} + dx, width);
+                        const float v =
+                            r.rgb[(static_cast<std::size_t>(yy) * width +
+                                   static_cast<std::size_t>(xx)) *
+                                      3 +
+                                  c] /
+                            255.0f;
+                        acc += (k1[dy + 1] * k1[dx + 1]) * v;
+                    }
+                }
+                out[c * plane + std::size_t{y} * width + x] =
+                    acc * 255.0f / 127.5f - 1.0f;
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<float> LtxvPipeline::encode_image(std::span<const float> image,
+                                              const Request& req) const {
+    check(req);
+    if (!vae_->has_encoder()) {
+        throw std::invalid_argument(
+            "ltxv: the VAE GGUF has no encoder (reconvert it)");
+    }
+    return vae_->encode(image, 1, req.height, req.width);
 }
 
 std::unique_ptr<LtxvPipeline> LtxvPipeline::load_dir(const std::string& dir) {
@@ -192,15 +276,36 @@ std::unique_ptr<LtxvPipeline> LtxvPipeline::load_dir(const std::string& dir) {
 std::vector<float> LtxvPipeline::denoise(
     std::span<const float> noise, std::span<const float> step_noise,
     const Request& req, const backend::Ops& op,
-    const std::function<bool()>& alive) const {
+    const std::function<bool()>& alive, std::span<const float> first,
+    std::span<const float> first_noise) const {
     check(req);
     const std::uint32_t f = (req.frames - 1) / 8 + 1, h = req.height / 32,
                         w = req.width / 32;
-    const std::uint32_t n = f * h * w;
-    const std::size_t size = std::size_t{dit_->channels()} * n;
+    const std::uint32_t n = f * h * w, hw = h * w;
+    const std::uint32_t ch = dit_->channels();
+    const std::size_t size = std::size_t{ch} * n;
     if (noise.size() != size) {
         throw std::invalid_argument("ltxv: noise is not 128 x f x h x w");
     }
+    // Image to video: frame 0's hw tokens hold the encoded image.
+    const std::size_t first_size = std::size_t{ch} * hw;
+    if (!first.empty() && first.size() != first_size) {
+        throw std::invalid_argument("ltxv: first is not 128 x h x w");
+    }
+    std::vector<float> first_drawn;
+    if (!first.empty() && first_noise.empty()) {
+        first_drawn.reserve(kSteps * first_size);
+        for (std::uint32_t i = 0; i < kSteps; ++i) {
+            const auto z =
+                PixArtPipeline::normal_latent(req.seed + 10 + i, first_size);
+            first_drawn.insert(first_drawn.end(), z.begin(), z.end());
+        }
+        first_noise = first_drawn;
+    }
+    if (!first.empty() && first_noise.size() != kSteps * first_size) {
+        throw std::invalid_argument("ltxv: first_noise is not 8 x 128 x h x w");
+    }
+    const std::uint32_t t0 = first.empty() ? 0 : hw;  // first stepped token
     std::vector<float> drawn;
     if (req.stochastic && step_noise.empty()) {
         drawn.reserve(kSteps * size);
@@ -218,27 +323,44 @@ std::vector<float> LtxvPipeline::denoise(
     const auto text = t5_->encode(ids, op);
     const auto pos = coords(f, h, w, req.frame_rate);
     std::vector<float> x(noise.begin(), noise.end());
+    // Frame 0's tokens run at sigma min(t, 1 - 1) = 0, the rest at t.
+    std::vector<float> sig(first.empty() ? 1 : n, 0.0f);
     for (std::uint32_t i = 0; i < kSteps; ++i) {
         if (alive && !alive()) return {};
         const float t = steps_[i];
         const float t_next = i + 1 < kSteps ? steps_[i + 1] : 0.0f;
-        const auto v = dit_->forward(x, n, pos, t, text,
+        if (!first.empty()) {
+            // add_noise_to_image_conditioning_latents:
+            // init + noise_scale * z * t^2 on the hard-conditioned tokens.
+            const float* z = &first_noise[i * first_size];
+            for (std::uint32_t c = 0; c < ch; ++c) {
+                for (std::uint32_t k = 0; k < hw; ++k) {
+                    const std::size_t a = std::size_t{c} * hw + k;
+                    x[std::size_t{c} * n + k] =
+                        first[a] + req.image_noise * z[a] * (t * t);
+                }
+            }
+        }
+        std::fill(sig.begin() + t0, sig.end(), t);
+        const auto v = dit_->forward(x, n, pos, sig, text,
                                      static_cast<std::uint32_t>(ids.size()),
                                      op);
         // rf.py's step in float32: dt = t - t_next, then either
-        // x - dt v, or x0 = x - t v and add_noise(x0, z, t - dt).
+        // x - dt v, or x0 = x - t v and add_noise(x0, z, t - dt); only on
+        // the tokens past frame 0 when it is the condition.
         const float dt = t - t_next;
-        if (!req.stochastic) {
-            for (std::size_t j = 0; j < x.size(); ++j) {
-                x[j] = x[j] - dt * v[j];
-            }
-            continue;
-        }
         const float next = t - dt, keep = 1.0f - next;
-        const float* z = &step_noise[i * size];
-        for (std::size_t j = 0; j < x.size(); ++j) {
-            const float x0 = x[j] - t * v[j];
-            x[j] = keep * x0 + next * z[j];
+        const float* z = req.stochastic ? &step_noise[i * size] : nullptr;
+        for (std::uint32_t c = 0; c < ch; ++c) {
+            for (std::uint32_t k = t0; k < n; ++k) {
+                const std::size_t j = std::size_t{c} * n + k;
+                if (z == nullptr) {
+                    x[j] = x[j] - dt * v[j];
+                } else {
+                    const float x0 = x[j] - t * v[j];
+                    x[j] = keep * x0 + next * z[j];
+                }
+            }
         }
     }
     return x;
@@ -270,8 +392,13 @@ std::vector<std::vector<std::uint8_t>> LtxvPipeline::generate(
                         w = req.width / 32;
     const std::size_t n = std::size_t{dit_->channels()} * f * h * w;
     const auto t0 = Clock::now();
+    std::vector<float> first;
+    if (req.image) {
+        first = encode_image(
+            condition_image(*req.image, req.width, req.height), req);
+    }
     const auto noise = PixArtPipeline::normal_latent(req.seed, n);
-    const auto x = denoise(noise, {}, req, op, alive);
+    const auto x = denoise(noise, {}, req, op, alive, first);
     if (x.empty()) return {};
     const auto t1 = Clock::now();
     if (alive && !alive()) return {};

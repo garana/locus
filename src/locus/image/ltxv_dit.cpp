@@ -59,14 +59,18 @@ void rms_norm(std::span<float> x, std::uint32_t n, std::uint32_t d,
 
 /**
  * RMSNorm (no affine) over each of n rows of width d, then
- * out = norm(x) * (1 + scale) + shift.
+ * out = norm(x) * (1 + scale) + shift. Row t takes its shift and scale
+ * at offset gid[t] * stride: one set per distinct noise level.
  */
 void rms_modulate(std::span<const float> x, std::uint32_t n,
-                  std::uint32_t d, float eps, const float* shift,
-                  const float* scale, std::span<float> out) {
+                  std::uint32_t d, float eps, const float* shift0,
+                  const float* scale0, std::span<const std::uint32_t> gid,
+                  std::size_t stride, std::span<float> out) {
     parallel(n, [&](std::size_t t) {
         const float* xi = &x[t * d];
         float* o = &out[t * d];
+        const float* shift = shift0 + gid[t] * stride;
+        const float* scale = scale0 + gid[t] * stride;
         float ss = 0.0f;
         for (std::uint32_t i = 0; i < d; ++i) ss += xi[i] * xi[i];
         const float inv =
@@ -79,14 +83,18 @@ void rms_modulate(std::span<const float> x, std::uint32_t n,
 
 /**
  * LayerNorm without affine over each of n rows of width d, then
- * out = ln(x) * (1 + scale) + shift.
+ * out = ln(x) * (1 + scale) + shift, with shift and scale per row as
+ * for rms_modulate.
  */
 void ln_modulate(std::span<const float> x, std::uint32_t n, std::uint32_t d,
-                 float eps, const float* shift, const float* scale,
+                 float eps, const float* shift0, const float* scale0,
+                 std::span<const std::uint32_t> gid, std::size_t stride,
                  std::span<float> out) {
     parallel(n, [&](std::size_t t) {
         const float* xi = &x[t * d];
         float* o = &out[t * d];
+        const float* shift = shift0 + gid[t] * stride;
+        const float* scale = scale0 + gid[t] * stride;
         float mean = 0.0f;
         for (std::uint32_t i = 0; i < d; ++i) mean += xi[i];
         mean /= static_cast<float>(d);
@@ -313,9 +321,23 @@ std::vector<float> LtxvDit::forward(std::span<const float> latent,
                                     std::span<const float> text,
                                     std::uint32_t n_text,
                                     const backend::Ops& op) const {
+    return forward(latent, n, coords, std::span<const float>(&sigma, 1), text,
+                   n_text, op);
+}
+
+std::vector<float> LtxvDit::forward(std::span<const float> latent,
+                                    std::uint32_t n,
+                                    std::span<const float> coords,
+                                    std::span<const float> sigmas,
+                                    std::span<const float> text,
+                                    std::uint32_t n_text,
+                                    const backend::Ops& op) const {
     const std::uint32_t w = width_;
     if (n == 0 || latent.size() != std::size_t{in_ch_} * n) {
         throw std::invalid_argument("ltxv: latent is not C x n");
+    }
+    if (sigmas.size() != 1 && sigmas.size() != n) {
+        throw std::invalid_argument("ltxv: need 1 or n sigmas");
     }
     if (coords.size() != std::size_t{3} * n) {
         throw std::invalid_argument("ltxv: coords is not 3 x n");
@@ -336,14 +358,30 @@ std::vector<float> LtxvDit::forward(std::span<const float> latent,
     std::vector<float> cosv(std::size_t{n} * w), sinv(cosv.size());
     rope(coords, n, w, theta_, max_pos_, cosv, sinv);
 
-    // adaLN-single on sigma * the timestep scale.
-    const auto tf = PixArtDit::timestep_features(sigma * t_scale_, t_ch_);
-    std::vector<float> e1(w), c(w), sc(w), m(std::size_t{6} * w);
-    linear1(op, t1_.w, t1_.b, tf, e1);
-    for (float& v : e1) v = silu(v);
-    linear1(op, t2_.w, t2_.b, e1, c);
-    for (std::uint32_t i = 0; i < w; ++i) sc[i] = silu(c[i]);
-    linear1(op, ada_.w, ada_.b, sc, m);
+    // adaLN-single on sigma * the timestep scale, once per distinct
+    // sigma (frame-0 conditioning gives two); gid[t] is token t's.
+    std::vector<float> levels;
+    std::vector<std::uint32_t> gid(n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        const float s = sigmas[sigmas.size() == 1 ? 0 : t];
+        std::size_t g = 0;
+        while (g < levels.size() && levels[g] != s) ++g;
+        if (g == levels.size()) levels.push_back(s);
+        gid[t] = static_cast<std::uint32_t>(g);
+    }
+    const std::size_t n_lv = levels.size(), w6 = std::size_t{6} * w;
+    std::vector<float> c(n_lv * w), m(n_lv * w6);
+    std::vector<float> e1(w), sc(w);
+    for (std::size_t g = 0; g < n_lv; ++g) {
+        const auto tf =
+            PixArtDit::timestep_features(levels[g] * t_scale_, t_ch_);
+        const std::span<float> cg(&c[g * w], w);
+        linear1(op, t1_.w, t1_.b, tf, e1);
+        for (float& v : e1) v = silu(v);
+        linear1(op, t2_.w, t2_.b, e1, cg);
+        for (std::uint32_t i = 0; i < w; ++i) sc[i] = silu(cg[i]);
+        linear1(op, ada_.w, ada_.b, sc, std::span<float>(&m[g * w6], w6));
+    }
 
     // Caption projection over the valid T5 rows.
     std::vector<float> u1(std::size_t{n_text} * w), u(u1.size());
@@ -353,12 +391,16 @@ std::vector<float> LtxvDit::forward(std::span<const float> latent,
 
     std::vector<float> a(std::size_t{n} * w), q(a.size()), k(a.size()),
         v(a.size()), att(a.size()), o(a.size()), up(std::size_t{n} * ffn_),
-        kc(std::size_t{n_text} * w), vc(kc.size()), mod(std::size_t{6} * w);
+        kc(std::size_t{n_text} * w), vc(kc.size()), mod(n_lv * w6);
     constexpr float kQkEps = 1e-5f;  // the reference's q / k RMSNorm eps
     for (const Block& b : blocks_) {
-        // Rows: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
-        // gate_mlp, each the block's table plus the shared m.
-        for (std::size_t i = 0; i < mod.size(); ++i) mod[i] = b.table[i] + m[i];
+        // Rows per level: shift_msa, scale_msa, gate_msa, shift_mlp,
+        // scale_mlp, gate_mlp, each the block's table plus that level's m.
+        for (std::size_t g = 0; g < n_lv; ++g) {
+            for (std::size_t i = 0; i < w6; ++i) {
+                mod[g * w6 + i] = b.table[i] + m[g * w6 + i];
+            }
+        }
         const float* shift1 = &mod[0];
         const float* scale1 = &mod[w];
         const float* gate1 = &mod[2 * w];
@@ -366,17 +408,19 @@ std::vector<float> LtxvDit::forward(std::span<const float> latent,
         const float* scale2 = &mod[4 * w];
         const float* gate2 = &mod[5 * w];
 
-        const auto add_gated = [&](const float* gate) {
+        const auto add_gated = [&](const float* gate0) {
             parallel(n, [&](std::size_t t) {
                 float* hr = &h[t * w];
                 const float* orow = &o[t * w];
+                const float* gate =
+                    gate0 != nullptr ? gate0 + gid[t] * w6 : nullptr;
                 for (std::uint32_t i = 0; i < w; ++i) {
                     hr[i] += gate != nullptr ? gate[i] * orow[i] : orow[i];
                 }
             });
         };
 
-        rms_modulate(h, n, w, eps_, shift1, scale1, a);
+        rms_modulate(h, n, w, eps_, shift1, scale1, gid, w6, a);
         linear(op, b.q1.w, b.q1.b, a, n, q);
         linear(op, b.k1.w, b.k1.b, a, n, k);
         linear(op, b.v1.w, b.v1.b, a, n, v);
@@ -397,7 +441,7 @@ std::vector<float> LtxvDit::forward(std::span<const float> latent,
         linear(op, b.o2.w, b.o2.b, att, n, o);
         add_gated(nullptr);
 
-        rms_modulate(h, n, w, eps_, shift2, scale2, a);
+        rms_modulate(h, n, w, eps_, shift2, scale2, gid, w6, a);
         linear(op, b.up.w, b.up.b, a, n, up);
         parallel(n, [&](std::size_t t) {
             float* ur = &up[t * ffn_];
@@ -407,13 +451,16 @@ std::vector<float> LtxvDit::forward(std::span<const float> latent,
         add_gated(gate2);
     }
 
-    // Final layer: LayerNorm, shift and scale from the table plus c.
-    std::vector<float> shift(w), scale(w);
-    for (std::uint32_t i = 0; i < w; ++i) {
-        shift[i] = table_[i] + c[i];
-        scale[i] = table_[w + i] + c[i];
+    // Final layer: LayerNorm, shift and scale from the table plus each
+    // level's c.
+    std::vector<float> shift(n_lv * w), scale(n_lv * w);
+    for (std::size_t g = 0; g < n_lv; ++g) {
+        for (std::uint32_t i = 0; i < w; ++i) {
+            shift[g * w + i] = table_[i] + c[g * w + i];
+            scale[g * w + i] = table_[w + i] + c[g * w + i];
+        }
     }
-    ln_modulate(h, n, w, 1e-6f, shift.data(), scale.data(), a);
+    ln_modulate(h, n, w, 1e-6f, shift.data(), scale.data(), gid, w, a);
     std::vector<float> y(std::size_t{n} * out_ch_);
     linear(op, proj_out_.w, proj_out_.b, a, n, y);
 

@@ -58,9 +58,7 @@ class LtxvDit {
      * @param coords [3][n]: each token's (time, y, x) coordinate as the
      *     reference's indices_grid (pixel units, time in seconds), before
      *     the division by the max positions.
-     * @param sigma The noise level in [0, 1], one for all tokens (the
-     *     reference's per-token timestep, for image or video
-     *     conditioning, is not supported).
+     * @param sigma The noise level in [0, 1], one for all tokens.
      * @param text n_text rows of caption_channels floats: the T5 rows
      *     whose mask is 1. A masked row gets weight exactly 0 in the
      *     reference (a -10000 score bias), so leaving it out gives the
@@ -73,6 +71,23 @@ class LtxvDit {
     std::vector<float> forward(std::span<const float> latent,
                                std::uint32_t n,
                                std::span<const float> coords, float sigma,
+                               std::span<const float> text,
+                               std::uint32_t n_text,
+                               const backend::Ops& op) const;
+
+    /**
+     * forward() with one noise level per token, as the reference's
+     * per-token timestep for image or video conditioning: a
+     * conditioning token runs at a lower sigma (0 for a hard condition).
+     * The adaLN modulation is computed once per distinct sigma.
+     *
+     * @param sigmas 1 or n noise levels in [0, 1].
+     * @throws std::invalid_argument on wrong sizes.
+     */
+    std::vector<float> forward(std::span<const float> latent,
+                               std::uint32_t n,
+                               std::span<const float> coords,
+                               std::span<const float> sigmas,
                                std::span<const float> text,
                                std::uint32_t n_text,
                                const backend::Ops& op) const;

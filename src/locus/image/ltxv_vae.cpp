@@ -123,7 +123,7 @@ void LtxvVae::conv3d_k3(std::span<const float> in, std::uint32_t ci,
                         std::uint32_t f, std::uint32_t h, std::uint32_t w,
                         std::span<const float> weight,
                         std::span<const float> bias, std::uint32_t co,
-                        std::span<float> out) {
+                        std::span<float> out, bool causal) {
     const std::size_t plane = std::size_t{h} * w, vol = plane * f;
     if (f == 0 || h == 0 || w == 0 || in.size() != ci * vol ||
         weight.size() != std::size_t{co} * ci * 27 || bias.size() != co ||
@@ -141,9 +141,11 @@ void LtxvVae::conv3d_k3(std::span<const float> in, std::uint32_t ci,
         for (std::uint32_t c = 0; c < ci; ++c) {
             const float* wk = &weight[(std::size_t{oc} * ci + c) * 27];
             for (std::uint32_t kt = 0; kt < 3; ++kt) {
-                // The edge frame repeats in time (causal=False padding).
+                // The edge frame repeats in time: on both ends
+                // (causal=False), or twice before frame 0 (causal=True).
                 const std::int64_t d = std::clamp<std::int64_t>(
-                    static_cast<std::int64_t>(od) + kt - 1, 0, f - 1);
+                    static_cast<std::int64_t>(od) + kt - (causal ? 2 : 1), 0,
+                    f - 1);
                 const float* ip = &in[c * vol + d * plane];
                 for (std::uint32_t ky = 0; ky < 3; ++ky) {
                     const std::int64_t iy = oy + ky - 1;
@@ -302,7 +304,230 @@ LtxvVae LtxvVae::load(const gguf::GgufFile& g) {
         throw gguf::Error("ltxv_vae: conv_out is not out x patch^2");
     }
     v.space_scale_ *= v.patch_;
+
+    // The encoder, when the GGUF has it.
+    const gguf::Value* ek = g.find("ltxv_vae.encoder.block_kinds");
+    const gguf::Value* ep = g.find("ltxv_vae.encoder.block_params");
+    if (ek == nullptr) return v;
+    if (ep == nullptr || ek->type != gguf::ValueType::kArray ||
+        ep->type != gguf::ValueType::kArray || ek->arr.empty() ||
+        ek->arr.size() != ep->arr.size() || ek->arr.size() > 64) {
+        throw gguf::Error("ltxv_vae: bad encoder block lists");
+    }
+    v.in_ch_ = u("ltxv_vae.in_channels");
+    const std::string e = "encoder.";
+    v.enc_in_ = conv(e + "conv_in.conv", v.in_ch_ * v.patch_ * v.patch_);
+    ch = v.enc_in_.co;
+    std::uint32_t ts = 1, ss = 1;
+    for (std::size_t i = 0; i < ek->arr.size(); ++i) {
+        const gguf::Value& kv = ek->arr[i];
+        const gguf::Value& pv = ep->arr[i];
+        const std::int64_t p = pv.type == gguf::ValueType::kInt32 ||
+                                       pv.type == gguf::ValueType::kInt64
+                                   ? pv.i
+                                   : static_cast<std::int64_t>(pv.u);
+        if (kv.type != gguf::ValueType::kString || p <= 0 || p > 64) {
+            throw gguf::Error("ltxv_vae: bad encoder block entry");
+        }
+        const std::string b = e + "down_blocks." + std::to_string(i) + ".";
+        EncBlock blk;
+        blk.ch = ch;
+        if (kv.s == "res_x") {
+            blk.res = true;
+            blk.out = ch;
+            for (std::int64_t j = 0; j < p; ++j) {
+                const std::string r =
+                    b + "res_blocks." + std::to_string(j) + ".";
+                Res res;
+                res.conv1 = conv(r + "conv1.conv", ch);
+                res.conv2 = conv(r + "conv2.conv", ch);
+                if (res.conv1.co != ch || res.conv2.co != ch) {
+                    throw gguf::Error("ltxv_vae: " + r + " changes channels");
+                }
+                blk.layers.push_back(res);
+            }
+        } else if (kv.s == "compress_space_res" ||
+                   kv.s == "compress_time_res" || kv.s == "compress_all_res") {
+            blk.st = kv.s == "compress_space_res" ? 1 : 2;
+            blk.ss = kv.s == "compress_time_res" ? 1 : 2;
+            const std::uint32_t prod = blk.st * blk.ss * blk.ss;
+            blk.out = ch * static_cast<std::uint32_t>(p);
+            blk.conv = conv(b + "conv.conv", ch);
+            // The skip averages groups of in * prod / out channels.
+            if (blk.out % prod != 0 || blk.conv.co != blk.out / prod ||
+                (std::uint64_t{ch} * prod) % blk.out != 0) {
+                throw gguf::Error("ltxv_vae: bad " + kv.s + " at " + b);
+            }
+            ts *= blk.st;
+            ss *= blk.ss;
+        } else {
+            throw gguf::Error("ltxv_vae: unsupported encoder block " + kv.s);
+        }
+        ch = blk.out;
+        v.enc_blocks_.push_back(std::move(blk));
+    }
+    v.enc_out_ = conv(e + "conv_out.conv", ch);
+    // "uniform" log variance: the means, then one shared channel.
+    if (v.enc_out_.co != v.latent_ch_ + 1 || ts != v.time_scale_ ||
+        ss * v.patch_ != v.space_scale_) {
+        throw gguf::Error("ltxv_vae: the encoder does not mirror the decoder");
+    }
     return v;
+}
+
+namespace {
+
+/**
+ * einops "b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w" on x
+ * [ch][f][h][w]: channel c * st ss ss + p1 ss ss + p2 ss + p3.
+ */
+std::vector<float> space_to_depth(std::span<const float> x, std::uint32_t ch,
+                                  std::uint32_t f, std::uint32_t h,
+                                  std::uint32_t w, std::uint32_t st,
+                                  std::uint32_t ss) {
+    const std::uint32_t of = f / st, oh = h / ss, ow = w / ss;
+    const std::uint32_t prod = st * ss * ss;
+    std::vector<float> out(std::size_t{ch} * prod * of * oh * ow);
+    const std::size_t in_vol = std::size_t{f} * h * w;
+    const std::size_t out_vol = std::size_t{of} * oh * ow;
+    parallel(std::size_t{ch} * prod, [&](std::size_t oc) {
+        const auto c = static_cast<std::uint32_t>(oc / prod);
+        const auto k = static_cast<std::uint32_t>(oc % prod);
+        const std::uint32_t p1 = k / (ss * ss), p2 = (k / ss) % ss, p3 = k % ss;
+        float* o = &out[oc * out_vol];
+        const float* src = &x[std::size_t{c} * in_vol];
+        for (std::uint32_t d = 0; d < of; ++d) {
+            for (std::uint32_t y = 0; y < oh; ++y) {
+                const float* row =
+                    &src[((std::size_t{d} * st + p1) * h + y * ss + p2) * w];
+                for (std::uint32_t xx = 0; xx < ow; ++xx) {
+                    *o++ = row[xx * ss + p3];
+                }
+            }
+        }
+    });
+    return out;
+}
+
+void silu_inplace(std::span<float> x) {
+    constexpr std::size_t kChunk = 1 << 16;
+    parallel((x.size() + kChunk - 1) / kChunk, [&](std::size_t item) {
+        const std::size_t e = std::min(x.size(), (item + 1) * kChunk);
+        for (std::size_t i = item * kChunk; i < e; ++i) x[i] = silu(x[i]);
+    });
+}
+
+}  // namespace
+
+std::vector<float> LtxvVae::encode(std::span<const float> video,
+                                   std::uint32_t f, std::uint32_t h,
+                                   std::uint32_t w) const {
+    if (!has_encoder()) throw std::invalid_argument("ltxv_vae: no encoder");
+    if (f == 0 || (f - 1) % time_scale_ != 0 || h == 0 || w == 0 ||
+        h % space_scale_ != 0 || w % space_scale_ != 0 ||
+        video.size() != std::size_t{in_ch_} * f * h * w) {
+        throw std::invalid_argument(
+            "ltxv_vae: video is not 3 x (1 + 8k) x h x w, sides multiples "
+            "of space_scale()");
+    }
+    // patchify: "b c (f p) (h q) (w r) -> b (c p r q) f h w", p = 1:
+    // channel c * patch^2 + r * patch + q (the width offset first).
+    const std::uint32_t p = patch_;
+    std::uint32_t ch = in_ch_ * p * p, ch_h = h / p, ch_w = w / p, fr = f;
+    std::vector<float> x(std::size_t{ch} * fr * ch_h * ch_w);
+    {
+        const std::size_t ivol = std::size_t{f} * h * w;
+        const std::size_t ovol = std::size_t{fr} * ch_h * ch_w;
+        parallel(ch, [&](std::size_t oc) {
+            const auto c = static_cast<std::uint32_t>(oc / (p * p));
+            const auto r = static_cast<std::uint32_t>(oc % (p * p)) / p;
+            const auto q = static_cast<std::uint32_t>(oc % p);
+            float* o = &x[oc * ovol];
+            for (std::uint32_t d = 0; d < fr; ++d) {
+                for (std::uint32_t y = 0; y < ch_h; ++y) {
+                    const float* row =
+                        &video[c * ivol + (std::size_t{d} * h + y * p + q) * w];
+                    for (std::uint32_t xx = 0; xx < ch_w; ++xx) {
+                        *o++ = row[xx * p + r];
+                    }
+                }
+            }
+        });
+    }
+    const auto run = [&](const Conv& cv, const std::vector<float>& in) {
+        std::vector<float> out(std::size_t{cv.co} * fr * ch_h * ch_w);
+        conv3d_k3(in, cv.ci, fr, ch_h, ch_w, cv.w, cv.b, cv.co, out, true);
+        return out;
+    };
+    x = run(enc_in_, x);
+    ch = enc_in_.co;
+    for (const EncBlock& blk : enc_blocks_) {
+        const std::size_t plane = std::size_t{fr} * ch_h * ch_w;
+        if (blk.res) {
+            for (const Res& r : blk.layers) {
+                std::vector<float> t = x;
+                pixel_norm(t, ch, plane);
+                silu_inplace(t);
+                t = run(r.conv1, t);
+                pixel_norm(t, ch, plane);
+                silu_inplace(t);
+                t = run(r.conv2, t);
+                for (std::size_t i = 0; i < x.size(); ++i) x[i] += t[i];
+            }
+            continue;
+        }
+        // SpaceToDepthDownsample: frame 0 repeated first for a time
+        // stride, then a causal conv and a space-to-depth, plus the
+        // input space-to-depthed and averaged over channel groups.
+        if (blk.st == 2) {
+            std::vector<float> padded(std::size_t{ch} * (fr + 1) * ch_h * ch_w);
+            const std::size_t fp = std::size_t{ch_h} * ch_w;
+            for (std::uint32_t c = 0; c < ch; ++c) {
+                const float* src = &x[std::size_t{c} * fr * fp];
+                float* dst = &padded[std::size_t{c} * (fr + 1) * fp];
+                std::copy_n(src, fp, dst);
+                std::copy_n(src, std::size_t{fr} * fp, dst + fp);
+            }
+            x = std::move(padded);
+            ++fr;
+        }
+        const std::uint32_t prod = blk.st * blk.ss * blk.ss;
+        const auto skip = space_to_depth(x, ch, fr, ch_h, ch_w, blk.st, blk.ss);
+        const auto y0 = run(blk.conv, x);
+        auto y = space_to_depth(y0, blk.conv.co, fr, ch_h, ch_w, blk.st, blk.ss);
+        fr /= blk.st;
+        ch_h /= blk.ss;
+        ch_w /= blk.ss;
+        const std::size_t vol = std::size_t{fr} * ch_h * ch_w;
+        const std::uint32_t group = ch * prod / blk.out;
+        parallel(blk.out, [&](std::size_t oc) {
+            float* o = &y[oc * vol];
+            for (std::size_t i = 0; i < vol; ++i) {
+                float s = 0.0f;
+                for (std::uint32_t gi = 0; gi < group; ++gi) {
+                    s += skip[(oc * group + gi) * vol + i];
+                }
+                o[i] += s / static_cast<float>(group);
+            }
+        });
+        x = std::move(y);
+        ch = blk.out;
+    }
+    const std::size_t plane = std::size_t{fr} * ch_h * ch_w;
+    pixel_norm(x, ch, plane);
+    silu_inplace(x);
+    x = run(enc_out_, x);
+    // The mean (the first latent channels), normalized per channel.
+    std::vector<float> out(x.begin(),
+                           x.begin() + static_cast<std::ptrdiff_t>(
+                                           std::size_t{latent_ch_} * plane));
+    for (std::uint32_t c = 0; c < latent_ch_; ++c) {
+        for (std::size_t i = 0; i < plane; ++i) {
+            float& z = out[std::size_t{c} * plane + i];
+            z = (z - mean_[c]) / std_[c];
+        }
+    }
+    return out;
 }
 
 std::vector<float> LtxvVae::decode(std::span<const float> latent,
