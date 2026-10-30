@@ -52,7 +52,11 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   image. Request fields:
   docs/CLIENTS.md.
 - **Image input:** PNG and JPEG in chat requests (OpenAI `image_url`
-  data URLs, Anthropic image blocks) with Janus-Pro-1B.
+  data URLs, Anthropic image blocks) with Janus-Pro-1B. On a Vulkan GPU
+  with unified memory the vision tower runs on the GPU with its
+  activations resident, whatever backend the language model uses (on
+  an M4 Max, about 0.1 s per image; an image question about 0.9 s with
+  the language model on Vulkan).
 - **Tools:** `locus-server`; `locus-run` (one prompt); `locus-gguf`
   (inspect a GGUF); `locus-stage` and `locus-driver` (multi-server
   pipeline, experimental); `locus-auth-helper` (a reference auth

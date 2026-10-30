@@ -13,7 +13,8 @@ namespace locus::backend {
  * A sequence of GPU ops on resident activations, for the image
  * transformers whose whole step runs on the GPU (FLUX, i#372). The
  * activations live in numbered scratch slots between calls, so a step
- * uploads its inputs once and reads back only its output; weights go
+ * uploads its inputs once and reads back only its output (also the
+ * Janus vision tower); weights go
  * through the Vulkan weight pool (imported in place from the GGUF
  * mapping where the device can).
  *
@@ -100,6 +101,21 @@ class VulkanSeq {
 
     /** torch's tanh GELU in place on n rows of width d. */
     void gelu_tanh(Rows x, std::uint32_t n, std::uint32_t d);
+
+    /** The exact (erf) GELU in place on n rows of width d. */
+    void gelu_erf(Rows x, std::uint32_t n, std::uint32_t d);
+
+    /**
+     * LayerNorm with weight and bias (d floats each) over n rows of
+     * width d into out.
+     * @throws std::invalid_argument when w or b is not d long.
+     */
+    void layer_norm(Rows x, Rows out, std::uint32_t n, std::uint32_t d,
+                    std::span<const float> w, std::span<const float> b,
+                    float eps);
+
+    /** x[t][i] += y[t][i] on n rows of width d. */
+    void add(Rows x, Rows y, std::uint32_t n, std::uint32_t d);
 
     /** x[t][i] += gate[i] * y[t][i] on n rows of width d; gate at
      *  gate_off in slot gate_s. */

@@ -50,7 +50,9 @@ class JanusVision {
      *
      * @param chw [3][image_size][image_size] pixels in [-1, 1]
      *     (to_pixels).
-     * @param op The backend ops the matrices run on.
+     * @param op The backend ops the matrices run on. With
+     *     backend::vulkan_image_ops() the whole tower runs on the GPU
+     *     with its activations resident.
      * @returns tokens() x 1024 floats, token-major.
      */
     std::vector<float> features(std::span<const float> chw,
@@ -76,6 +78,11 @@ class JanusVision {
     std::vector<float> to_pixels(std::span<const std::uint8_t> rgb) const;
 
   private:
+    /** features() on the GPU (janus_vision_vulkan.cpp): the patch
+     *  embedding as one matmul over the image's patches, then the
+     *  blocks and the post LayerNorm, activations resident. */
+    std::vector<float> features_vulkan(std::span<const float> chw) const;
+
     struct Block {
         std::span<const float> ln1_w, ln1_b, qkv_b, out_b, ln2_w, ln2_b,
             up_b, down_b;

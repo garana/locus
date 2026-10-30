@@ -894,12 +894,16 @@ void OpenAiServer::vision_chat(bool anthropic, const VisionChat& chat,
     }
     const auto alive = [&] { return !ctx.client_alive || ctx.client_alive(); };
     try {
-        // The image tower runs one matvec per token per linear. A GPU
-        // backend would make each one a separate device call (on vulkan
-        // the tower took twice as long as on the CPU), so it runs on the
-        // best CPU backend unless the active one is a CPU backend.
+        // With host-memory import (unified memory, as for PixArt and
+        // FLUX) the image tower runs on the GPU with its activations
+        // resident (JanusVision::features_vulkan), whatever backend the
+        // language model uses. Otherwise per op it would make each
+        // linear a separate device call, so it runs on the active
+        // backend when that is a CPU one, else on the best CPU backend.
         const auto& active = model_.active_backend().ops;
-        const auto& op = backend::splits_rows(active)
+        const auto& op = backend::vulkan_imports_host_memory()
+                             ? backend::vulkan_image_ops()
+                         : backend::splits_rows(active)
                              ? active
                              : backend::best_backend().ops;
         const auto& hp = model_.hparams();

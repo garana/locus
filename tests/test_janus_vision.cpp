@@ -6,6 +6,7 @@
 #include "locus/tok/tokenizer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -18,6 +19,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
@@ -186,16 +188,25 @@ TEST_CASE("janus vision encoder matches the reference features",
     }
     const Golden ref = read_golden();
     auto g = locus::gguf::GgufFile::open(kModel);
-    const auto& op = locus::backend::best_backend().ops;
     const auto v = locus::image::JanusVision::load(
         g, static_cast<std::uint32_t>(*g.get_uint("llama.embedding_length")));
     REQUIRE(v.tokens() == 576);
-    const auto feat = v.features(golden_pixels(v), op);
-    check_rows(feat, ref.vis, 1024, 1e-4);
-    REQUIRE(rms(feat) == Catch::Approx(ref.vis_rms).epsilon(1e-4));
-    const auto ali = v.align(feat, op);
-    check_rows(ali, ref.ali, 2048, 1e-4);
-    REQUIRE(rms(ali) == Catch::Approx(ref.ali_rms).epsilon(1e-4));
+    std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
+        {"cpu", &locus::backend::best_backend().ops}};
+    if (locus::backend::vulkan_backend_usable()) {
+        // The whole tower on the GPU, activations resident.
+        legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    for (const auto& [name, op] : legs) {
+        DYNAMIC_SECTION(name) {
+            const auto feat = v.features(golden_pixels(v), *op);
+            check_rows(feat, ref.vis, 1024, 1e-4);
+            REQUIRE(rms(feat) == Catch::Approx(ref.vis_rms).epsilon(1e-4));
+            const auto ali = v.align(feat, *op);
+            check_rows(ali, ref.ali, 2048, 1e-4);
+            REQUIRE(rms(ali) == Catch::Approx(ref.ali_rms).epsilon(1e-4));
+        }
+    }
 }
 
 // i#241: the reference's answer to "What is on the table?" about the
@@ -261,4 +272,35 @@ TEST_CASE("janus answers a question about the reference image",
     INFO(exact << " of " << ref.answer.size() << " answer tokens are argmax");
     CHECK(exact == ref.answer.size());
     cache.release(seq);
+}
+
+// The tower on the reference image: the best CPU backend against the
+// Vulkan image ops.
+TEST_CASE("bench: janus vision tower", "[.][bench][janus]") {
+    if (!have_model()) SKIP("janus-pro-1b-bf16.gguf with vit.* absent");
+    auto g = locus::gguf::GgufFile::open(kModel);
+    const auto v = locus::image::JanusVision::load(
+        g, static_cast<std::uint32_t>(*g.get_uint("llama.embedding_length")));
+    const auto px = golden_pixels(v);
+    std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
+        {"cpu", &locus::backend::best_backend().ops}};
+    if (locus::backend::vulkan_backend_usable()) {
+        legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    for (const auto& [name, op] : legs) {
+        for (int rep = 0; rep < 3; ++rep) {
+            using clk = std::chrono::steady_clock;
+            const auto t0 = clk::now();
+            const auto feat = v.features(px, *op);
+            const auto t1 = clk::now();
+            const auto ali = v.align(feat, *op);
+            const auto t2 = clk::now();
+            const auto sec = [](clk::duration d) {
+                return std::chrono::duration<double>(d).count();
+            };
+            WARN(name << ": " << sec(t2 - t0) << " s (features "
+                      << sec(t1 - t0) << ", align " << sec(t2 - t1) << ")");
+            REQUIRE(std::isfinite(ali[0]));
+        }
+    }
 }

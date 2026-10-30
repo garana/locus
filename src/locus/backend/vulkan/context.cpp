@@ -232,6 +232,8 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "head_split_spv.h"
 #include "gated_add_spv.h"
 #include "gelu_tanh_spv.h"
+#include "gelu_erf_spv.h"
+#include "layer_norm_spv.h"
 #include "rope_neox_spv.h"
 #include "rope_neox_b_spv.h"
 #include "matvec_q4_k_b_spv.h"
@@ -573,6 +575,10 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_gated_add_spv), 3, 28},
     {Kernel::kGeluTanh, "gelu_tanh", locus_gelu_tanh_spv,
      sizeof(locus_gelu_tanh_spv), 3, 28},
+    {Kernel::kGeluErf, "gelu_erf", locus_gelu_erf_spv,
+     sizeof(locus_gelu_erf_spv), 3, 28},
+    {Kernel::kLayerNorm, "layer_norm", locus_layer_norm_spv,
+     sizeof(locus_layer_norm_spv), 3, 36},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

@@ -7,6 +7,8 @@
 #include <string>
 #include <thread>
 
+#include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan_seq.hpp"
 #include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
@@ -195,6 +197,10 @@ std::vector<float> JanusVision::features(std::span<const float> chw,
     const std::uint32_t n = tokens(), w = width_, hd = w / heads_;
     if (chw.size() != std::size_t{3} * image_ * image_) {
         throw std::invalid_argument("janus vision: need 3 x size x size");
+    }
+    if (&op == &backend::vulkan_image_ops() &&
+        backend::VulkanSeq::available()) {
+        return features_vulkan(chw);
     }
     // Patch embed: [w][grid][grid] -> token-major [n][w], plus positions.
     std::vector<float> conv(std::size_t{w} * n);

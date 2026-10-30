@@ -3,7 +3,9 @@
 // FLUX's gated residual (i#372) over n rows of width dim:
 // x[x_off + t * x_stride + i] += g[g_off + i] * y[y_off + t * y_stride
 // + i]. With GELU_TANH it is instead torch's tanh-approximate GELU in
-// place on x's rows (y and g unused). Grid-stride over n * dim.
+// place on x's rows (y and g unused), with GELU_ERF the exact GELU,
+// 0.5 v (1 + erf(v / sqrt(2))), erf to 1.5e-7 (Abramowitz and Stegun
+// 7.1.26). Grid-stride over n * dim.
 
 layout(local_size_x = 256) in;
 
@@ -27,7 +29,17 @@ void main() {
         uint t = e / pc.dim;
         uint i = e % pc.dim;
         uint at = pc.x_off + t * pc.x_stride + i;
-#ifdef GELU_TANH
+#if defined(GELU_ERF)
+        float v = x[at];
+        float z = abs(v) * 0.70710678118654752440;
+        float r = 1.0 / (1.0 + 0.3275911 * z);
+        float poly = r * (0.254829592 +
+                          r * (-0.284496736 +
+                               r * (1.421413741 +
+                                    r * (-1.453152027 + r * 1.061405429))));
+        float ef = 1.0 - poly * exp(-z * z);
+        x[at] = 0.5 * v * (1.0 + (v < 0.0 ? -ef : ef));
+#elif defined(GELU_TANH)
         float v = x[at];
         const float kC = 0.79788456080286535588;  // sqrt(2 / pi)
         // Clamped: a large argument can overflow a fast tanh.

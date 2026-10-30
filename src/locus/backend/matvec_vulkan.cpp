@@ -3607,6 +3607,46 @@ void VulkanSeq::gelu_tanh(Rows x, std::uint32_t n, std::uint32_t d) {
         std::min<std::uint32_t>((n * d + 255) / 256, 4096));
 }
 
+void VulkanSeq::gelu_erf(Rows x, std::uint32_t n, std::uint32_t d) {
+    const auto xb = im_->slot(x.slot);
+    const VulkanContext::Buffer bufs[] = {xb, xb, xb};
+    const std::uint32_t push[] = {n, d, x.off, x.stride, 0, 0, 0};
+    im_->s.ctx.dispatch(
+        Kernel::kGeluErf, bufs, push,
+        std::min<std::uint32_t>((n * d + 255) / 256, 4096));
+}
+
+void VulkanSeq::layer_norm(Rows x, Rows out, std::uint32_t n,
+                           std::uint32_t d, std::span<const float> w,
+                           std::span<const float> b, float eps) {
+    if (w.size() != d || b.size() != d) {
+        throw std::invalid_argument("VulkanSeq::layer_norm: w / b size");
+    }
+    // One put, so the weight and the bias share a buffer binding.
+    std::vector<float> wb(std::size_t{2} * d);
+    std::copy(w.begin(), w.end(), wb.begin());
+    std::copy(b.begin(), b.end(), wb.begin() + d);
+    const auto [cb, at] = im_->put(wb);
+    const VulkanContext::Buffer bufs[] = {im_->slot(x.slot), cb,
+                                          im_->slot(out.slot)};
+    const std::uint32_t push[] = {d,        n,       x.off,  x.stride,
+                                  out.off,  out.stride, at + d, at,
+                                  fbits(eps)};
+    const auto [gx, gy] = row_grid(n);
+    im_->s.ctx.dispatch(Kernel::kLayerNorm, bufs, push, gx, gy);
+}
+
+void VulkanSeq::add(Rows x, Rows y, std::uint32_t n, std::uint32_t d) {
+    const std::vector<float> ones(d, 1.0f);
+    const auto [cb, at] = im_->put(ones);
+    const VulkanContext::Buffer bufs[] = {im_->slot(y.slot), cb,
+                                          im_->slot(x.slot)};
+    const std::uint32_t push[] = {n, d, x.off, x.stride, y.off, y.stride, at};
+    im_->s.ctx.dispatch(
+        Kernel::kGatedAdd, bufs, push,
+        std::min<std::uint32_t>((n * d + 255) / 256, 4096));
+}
+
 void VulkanSeq::gated_add(Rows x, Rows y, std::uint32_t n, std::uint32_t d,
                           Slot gate_s, std::uint32_t gate_off) {
     const VulkanContext::Buffer bufs[] = {im_->slot(y.slot), im_->slot(gate_s),

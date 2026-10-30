@@ -143,6 +143,9 @@ enum class Kernel {
     kHeadSplit,
     kGatedAdd,
     kGeluTanh,
+    /** The Janus tower's exact GELU and affine LayerNorm. */
+    kGeluErf,
+    kLayerNorm,
     kCount_,
 };
 
