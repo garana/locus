@@ -58,6 +58,27 @@ class SdVaeDecoder {
     std::vector<float> decode(std::span<const float> latent, std::uint32_t h,
                               std::uint32_t w, const backend::Ops& op) const;
 
+    /** @returns Whether the GGUF holds the encoder half too. */
+    bool has_encoder() const { return has_encoder_; }
+
+    /**
+     * The encoder half (diffusers' Encoder): conv_in, down blocks of
+     * layers_per_block resnets, each but the last followed by a 3x3
+     * stride-2 conv after one zero row and column at the bottom and
+     * right, the mid block, GroupNorm, SiLU and conv_out to the
+     * latent's mean and log-variance (then quant_conv, when the VAE has
+     * one). Returns the mode (the mean) as the pipelines' denoisers take
+     * it: (mean - shift) * scale.
+     *
+     * @param image [in_channels][h][w] in [-1, 1]; h and w multiples of
+     *     upscale(), at most kMaxLatent * upscale().
+     * @param op The backend ops for the attention's matrices.
+     * @returns [latent_channels][h / upscale()][w / upscale()].
+     * @throws std::invalid_argument without an encoder or on a bad size.
+     */
+    std::vector<float> encode(std::span<const float> image, std::uint32_t h,
+                              std::uint32_t w, const backend::Ops& op) const;
+
     /**
      * The pipeline's postprocess: round(clamp(y / 2 + 0.5, 0, 1) * 255),
      * half to even, from [3][h][w] to row-major RGB bytes.
@@ -74,6 +95,10 @@ class SdVaeDecoder {
     std::uint32_t latent_ = 0, out_ch_ = 0, layers_ = 0, groups_ = 0;
     float eps_ = 0.0f, scaling_ = 0.0f, shift_ = 0.0f;
     bool post_quant_ = true;
+    bool has_encoder_ = false, quant_ = true;
+    std::uint32_t in_ch_ = 3;
+
+    struct Run;  ///< the conv / norm / resnet / attention steps
     std::vector<std::uint32_t> chans_;  ///< block_out_channels
 };
 

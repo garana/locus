@@ -125,3 +125,37 @@ TEST_CASE("flux vae decoder matches diffusers", "[flux][image]") {
     }
     REQUIRE(worst < 1e-3);
 }
+
+// FLUX.1's VAE encoder, as FluxKontextPipeline encodes its reference
+// image: the mode of the latent distribution, then (mean - shift) *
+// scale.
+TEST_CASE("flux vae encoder matches diffusers", "[flux][image]") {
+    if (!std::filesystem::exists(kVae)) {
+        SKIP("no " << kVae << " (scripts/convert-flux.py --vae-out)");
+    }
+    const auto g = locus::gguf::GgufFile::open(kVae);
+    const auto vae = locus::image::SdVaeDecoder::load(g);
+    REQUIRE(vae.has_encoder());
+    const auto img = read_f32(kDir + "golden/flux/vae_enc_in.f32");
+    const auto ref = read_f32(kDir + "golden/flux/vae_enc_out.f32");
+    const auto& op = locus::backend::best_backend().ops;
+    const auto lat = vae.encode(img, 128, 128, op);
+    REQUIRE(lat.size() == ref.size());
+    double ss = 0.0, worst = 0.0, es = 0.0;
+    for (std::size_t i = 0; i < lat.size(); ++i) {
+        const double d = double{lat[i]} - ref[i];
+        ss += double{ref[i]} * ref[i];
+        es += d * d;
+        worst = std::max(worst, std::fabs(d));
+    }
+    const double rms = std::sqrt(ss / ref.size());
+    INFO("max " << worst / rms << " rms " << std::sqrt(es / ref.size()) / rms
+                << " of the latent's RMS");
+    // The encoder is ill-conditioned in F32 at a few positions: on this
+    // image diffusers' own F32 output differs from its F64 one by up to
+    // 2.9e-3 (RMS 1.0e-4); locus is within 2.1e-3 (RMS 7.9e-5) of F32.
+    REQUIRE(worst / rms < 5e-3);
+    REQUIRE(std::sqrt(es / ref.size()) / rms < 5e-4);
+    std::vector<float> odd(3 * 124 * 128);
+    REQUIRE_THROWS_AS(vae.encode(odd, 124, 128, op), std::invalid_argument);
+}

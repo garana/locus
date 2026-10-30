@@ -138,45 +138,107 @@ SdVaeDecoder SdVaeDecoder::load(const gguf::GgufFile& g) {
     d.t("decoder.conv_norm_out.bias", last);
     d.t("decoder.conv_out.weight", std::size_t{d.out_ch_} * last * 9);
     d.t("decoder.conv_out.bias", d.out_ch_);
+
+    // The encoder, when the GGUF has it (convert-flux.py keeps it;
+    // convert-sd-vae.py leaves it out).
+    d.has_encoder_ = g.find_tensor("encoder.conv_in.weight") != nullptr;
+    if (!d.has_encoder_) return d;
+    if (const auto ic = g.get_uint("autoencoder_kl.in_channels")) {
+        if (*ic == 0 || *ic > 16) throw gguf::Error("vae: bad in_channels");
+        d.in_ch_ = static_cast<std::uint32_t>(*ic);
+    }
+    d.quant_ = g.get_bool("autoencoder_kl.use_quant_conv").value_or(true);
+    d.t("encoder.conv_in.weight", std::size_t{last} * d.in_ch_ * 9);
+    d.t("encoder.conv_in.bias", last);
+    prev = last;
+    for (std::size_t b = 0; b < nb; ++b) {
+        const std::uint32_t out = d.chans_[b];
+        const std::string p = "encoder.down_blocks." + std::to_string(b);
+        for (std::uint32_t r = 0; r < d.layers_; ++r) {
+            res(p + ".resnets." + std::to_string(r), r == 0 ? prev : out, out);
+        }
+        if (b + 1 < nb) {
+            d.t(p + ".downsamplers.0.conv.weight", std::size_t{out} * out * 9);
+            d.t(p + ".downsamplers.0.conv.bias", out);
+        }
+        prev = out;
+    }
+    res("encoder.mid_block.resnets.0", top, top);
+    res("encoder.mid_block.resnets.1", top, top);
+    const std::string ea = "encoder.mid_block.attentions.0.";
+    d.t(ea + "group_norm.weight", top);
+    d.t(ea + "group_norm.bias", top);
+    for (const char* m : {"to_q", "to_k", "to_v", "to_out.0"}) {
+        d.t(ea + m + ".weight", std::size_t{top} * top);
+        d.t(ea + m + ".bias", top);
+    }
+    d.t("encoder.conv_norm_out.weight", top);
+    d.t("encoder.conv_norm_out.bias", top);
+    d.t("encoder.conv_out.weight", std::size_t{2} * d.latent_ * top * 9);
+    d.t("encoder.conv_out.bias", std::size_t{2} * d.latent_);
+    if (d.quant_) {
+        d.t("quant_conv.weight", std::size_t{4} * d.latent_ * d.latent_);
+        d.t("quant_conv.bias", std::size_t{2} * d.latent_);
+    }
     return d;
 }
 
-std::vector<float> SdVaeDecoder::decode(std::span<const float> latent,
-                                        std::uint32_t h, std::uint32_t w,
-                                        const backend::Ops& op) const {
-    // 128 is a 1024 px image; larger latents make the mid attention
-    // (one head over h * w tokens) and the activations unreasonable.
-    if (h == 0 || w == 0 || h > kMaxLatent || w > kMaxLatent ||
-        latent.size() != std::size_t{latent_} * h * w) {
-        throw std::invalid_argument("vae: latent is not C x h x w");
-    }
-    const std::uint32_t groups = groups_;
-    const float eps = eps_;
+/** The building blocks both halves share, on one backend. */
+struct SdVaeDecoder::Run {
+    const SdVaeDecoder& d;
+    const backend::Ops& op;
 
-    // A conv with bias; k is 1 or 3 (padding k / 2), stride 1.
-    auto conv = [&](const Act& in, const std::string& name,
-                    std::uint32_t out_ch, std::uint32_t k) {
-        Act o{std::vector<float>(std::size_t{out_ch} * in.plane()), out_ch,
-              in.h, in.w};
-        const auto wt = t(name + ".weight", std::size_t{out_ch} * in.ch * k * k);
-        const auto bs = t(name + ".bias", out_ch);
+    /**
+     * A conv with bias. Stride 1: k is 1 or 3 and the padding k / 2.
+     * Stride 2 (the encoder's Downsample2D, padding 0): a 3x3 conv
+     * after one zero row and column at the bottom and right.
+     */
+    Act conv(const Act& in, const std::string& name, std::uint32_t out_ch,
+             std::uint32_t k, std::uint32_t stride = 1) const {
+        const auto wt =
+            d.t(name + ".weight", std::size_t{out_ch} * in.ch * k * k);
+        const auto bs = d.t(name + ".bias", out_ch);
+        Act src;
+        const Act* x = &in;
+        std::uint32_t pad = k / 2;
+        if (stride == 2) {
+            src = {std::vector<float>(std::size_t{in.ch} * (in.h + 1) *
+                                      (in.w + 1)),
+                   in.ch, in.h + 1, in.w + 1};
+            for (std::uint32_t c = 0; c < in.ch; ++c) {
+                for (std::uint32_t y = 0; y < in.h; ++y) {
+                    std::copy_n(&in.data[(std::size_t{c} * in.h + y) * in.w],
+                                in.w,
+                                &src.data[(std::size_t{c} * src.h + y) *
+                                          src.w]);
+                }
+            }
+            x = &src;
+            pad = 0;
+        }
+        const std::uint32_t oh = (x->h + 2 * pad - k) / stride + 1;
+        const std::uint32_t ow = (x->w + 2 * pad - k) / stride + 1;
+        Act o{std::vector<float>(std::size_t{out_ch} * oh * ow), out_ch, oh,
+              ow};
         if (&op == &backend::vulkan_image_ops()) {
-            backend::conv2d_vulkan(in.data, in.ch, in.h, in.w, wt, out_ch, k,
-                                   k, bs, 1, k / 2, 1, o.data);
+            backend::conv2d_vulkan(x->data, x->ch, x->h, x->w, wt, out_ch, k,
+                                   k, bs, stride, pad, 1, o.data);
         } else {
-            backend::conv2d_mt(in.data, in.ch, in.h, in.w, wt, out_ch, k, k,
-                               bs, 1, k / 2, 1, o.data);
+            backend::conv2d_mt(x->data, x->ch, x->h, x->w, wt, out_ch, k, k,
+                               bs, stride, pad, 1, o.data);
         }
         return o;
-    };
-    auto norm = [&](Act& x, const std::string& name) {
+    }
+
+    void norm(Act& x, const std::string& name) const {
         backend::group_norm(x.data, x.ch, static_cast<std::uint32_t>(x.plane()),
-                            groups, t(name + ".weight", x.ch),
-                            t(name + ".bias", x.ch), eps);
-    };
-    // ResnetBlock2D: two GN / SiLU / conv3 steps, plus x (through a 1x1
-    // conv_shortcut when the width changes).
-    auto res = [&](const Act& x, const std::string& p, std::uint32_t out) {
+                            d.groups_, d.t(name + ".weight", x.ch),
+                            d.t(name + ".bias", x.ch), d.eps_);
+    }
+
+    /** ResnetBlock2D: two GN / SiLU / conv3 steps, plus x (through a 1x1
+     *  conv_shortcut when the width changes). */
+    Act res(const Act& x, const std::string& p, std::uint32_t out) const {
         Act hh = x;
         norm(hh, p + ".norm1");
         backend::silu(hh.data);
@@ -195,11 +257,12 @@ std::vector<float> SdVaeDecoder::decode(std::span<const float> latent,
             }
         }
         return hh;
-    };
-    // Mid attention: GroupNorm, then one head over the h * w positions
-    // (token-major), out projection, plus the input from before the
-    // norm.
-    auto attention = [&](Act& x, const std::string& p) {
+    }
+
+    /** Mid attention: GroupNorm, then one head over the h * w positions
+     *  (token-major), out projection, plus the input from before the
+     *  norm. */
+    void attention(Act& x, const std::string& p) const {
         const std::uint32_t c = x.ch;
         const std::uint32_t n = static_cast<std::uint32_t>(x.plane());
         Act hn = x;
@@ -211,12 +274,14 @@ std::vector<float> SdVaeDecoder::decode(std::span<const float> latent,
             }
         }
         const auto mat = [&](const char* m) {
-            const auto wt = t(p + m + ".weight", std::size_t{c} * c);
+            const auto wt = d.t(p + m + ".weight", std::size_t{c} * c);
             return backend::Mat{gguf::TensorType::kF32,
                                 reinterpret_cast<const std::byte*>(wt.data()),
                                 c, c};
         };
-        const auto bias = [&](const char* m) { return t(p + m + ".bias", c); };
+        const auto bias = [&](const char* m) {
+            return d.t(p + m + ".bias", c);
+        };
         std::vector<float> q(tok.size()), k(tok.size()), v(tok.size()),
             o(tok.size());
         dense::linear(op, mat("to_q"), bias("to_q"), tok, n, q);
@@ -229,6 +294,66 @@ std::vector<float> SdVaeDecoder::decode(std::span<const float> latent,
                 x.data[std::size_t{ch} * n + i] += q[std::size_t{i} * c + ch];
             }
         }
+    }
+};
+
+std::vector<float> SdVaeDecoder::encode(std::span<const float> image,
+                                        std::uint32_t h, std::uint32_t w,
+                                        const backend::Ops& op) const {
+    if (!has_encoder_) throw std::invalid_argument("vae: no encoder");
+    const std::uint32_t f = upscale();
+    if (h == 0 || w == 0 || h % f != 0 || w % f != 0 || h / f > kMaxLatent ||
+        w / f > kMaxLatent || image.size() != std::size_t{in_ch_} * h * w) {
+        throw std::invalid_argument(
+            "vae: image is not C x h x w with sides multiples of upscale()");
+    }
+    const Run r{*this, op};
+    Act s{std::vector<float>(image.begin(), image.end()), in_ch_, h, w};
+    s = r.conv(s, "encoder.conv_in", chans_.front(), 3);
+    const std::size_t nb = chans_.size();
+    for (std::size_t b = 0; b < nb; ++b) {
+        const std::uint32_t out = chans_[b];
+        const std::string p = "encoder.down_blocks." + std::to_string(b);
+        for (std::uint32_t i = 0; i < layers_; ++i) {
+            s = r.res(s, p + ".resnets." + std::to_string(i), out);
+        }
+        if (b + 1 < nb) s = r.conv(s, p + ".downsamplers.0.conv", out, 3, 2);
+    }
+    const std::uint32_t top = chans_.back();
+    s = r.res(s, "encoder.mid_block.resnets.0", top);
+    r.attention(s, "encoder.mid_block.attentions.0.");
+    s = r.res(s, "encoder.mid_block.resnets.1", top);
+    r.norm(s, "encoder.conv_norm_out");
+    backend::silu(s.data);
+    s = r.conv(s, "encoder.conv_out", 2 * latent_, 3);
+    if (quant_) s = r.conv(s, "quant_conv", 2 * latent_, 1);
+    // The distribution's mode (its mean, the first half), scaled for the
+    // denoiser: (mean - shift) * scale.
+    const auto half = static_cast<std::ptrdiff_t>(latent_ * s.plane());
+    std::vector<float> out(s.data.begin(), s.data.begin() + half);
+    for (float& x : out) x = (x - shift_) * scaling_;
+    return out;
+}
+
+std::vector<float> SdVaeDecoder::decode(std::span<const float> latent,
+                                        std::uint32_t h, std::uint32_t w,
+                                        const backend::Ops& op) const {
+    // 128 is a 1024 px image; larger latents make the mid attention
+    // (one head over h * w tokens) and the activations unreasonable.
+    if (h == 0 || w == 0 || h > kMaxLatent || w > kMaxLatent ||
+        latent.size() != std::size_t{latent_} * h * w) {
+        throw std::invalid_argument("vae: latent is not C x h x w");
+    }
+    const Run r{*this, op};
+    const auto conv = [&](const Act& in, const std::string& name,
+                          std::uint32_t out_ch, std::uint32_t k) {
+        return r.conv(in, name, out_ch, k);
+    };
+    const auto norm = [&](Act& x, const std::string& name) { r.norm(x, name); };
+    const auto res = [&](const Act& x, const std::string& p,
+                         std::uint32_t out) { return r.res(x, p, out); };
+    const auto attention = [&](Act& x, const std::string& p) {
+        r.attention(x, p);
     };
 
     Act z{std::vector<float>(latent.begin(), latent.end()), latent_, h, w};
