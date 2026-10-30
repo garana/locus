@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "gguf_builder.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
@@ -688,6 +689,53 @@ TEST_CASE("embeddings endpoint returns normalized vectors",
         REQUIRE(data.size() == 2);
         REQUIRE(data[0]["embedding"] == data[1]["embedding"]);
     }
+}
+
+// --image-model picks FLUX.1 when a FLUX-only part (flux, clip_text) is
+// there, so a FLUX set missing its DiT names the FLUX parts; otherwise
+// PixArt, whose error names both sets.
+TEST_CASE("image model errors name the missing parts", "[server]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("locus-image-dir-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto put = [&](const char* name, const char* arch) {
+        GgufBuilder b;
+        b.header(0, 1).kv_string("general.architecture", arch);
+        std::ofstream(dir / name, std::ios::binary)
+            .write(reinterpret_cast<const char*>(b.bytes().data()),
+                   static_cast<std::streamsize>(b.bytes().size()));
+    };
+    const auto error_of = [&]() -> std::string {
+        locus::server::OpenAiServer::Options opt;
+        opt.image_model_dir = dir.string();
+        try {
+            locus::server::OpenAiServer server(model, tok, opt);
+        } catch (const locus::gguf::Error& e) {
+            return e.what();
+        }
+        return "";
+    };
+    put("clip-l.gguf", "clip_text");
+    REQUIRE(locus::gguf::GgufFile::open((dir / "clip-l.gguf").string())
+                .get_string("general.architecture") == "clip_text");
+    auto msg = error_of();
+    CAPTURE(msg);
+    REQUIRE(msg.find("a clip_text, a flux") != std::string::npos);
+    REQUIRE(msg.find("pixart") == std::string::npos);
+    std::filesystem::remove(dir / "clip-l.gguf");
+    put("other.gguf", "llama");
+    msg = error_of();
+    CAPTURE(msg);
+    REQUIRE(msg.find("a pixart") != std::string::npos);
+    REQUIRE(msg.find("for FLUX.1") != std::string::npos);
+    std::filesystem::remove_all(dir);
 }
 
 TEST_CASE("auth gates protected routes via a helper", "[server][e2e]") {

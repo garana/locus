@@ -24,12 +24,13 @@ constexpr std::uint32_t kLatentCh = 16;
 }  // namespace
 
 void FluxPipeline::validate(const Request& req) {
-    // The VAE decodes latents up to kMaxLatent (128) a side: 1024 px.
-    constexpr std::uint32_t kMax = SdVaeDecoder::kMaxLatent * 8;
-    if (req.width < 16 || req.height < 16 || req.width > kMax ||
-        req.height > kMax || req.width % 16 != 0 || req.height % 16 != 0) {
+    // The VAE takes latents up to 128^2 positions, 256 a side: 1024^2
+    // pixels, 2048 a side.
+    if (req.width % 16 != 0 || req.height % 16 != 0 ||
+        !SdVaeDecoder::latent_fits(req.height / 8, req.width / 8)) {
         throw std::invalid_argument(
-            "width and height must be multiples of 16 from 16 to 1024");
+            "width and height must be multiples of 16, at most 2048, with "
+            "at most 1024 x 1024 pixels");
     }
     if (req.steps > 1000) throw std::invalid_argument("steps must be <= 1000");
     if (req.max_sequence_length == 0 || req.max_sequence_length > 512) {
@@ -114,6 +115,55 @@ std::vector<tok::TokenId> FluxPipeline::t5_ids(
     return ids;
 }
 
+std::pair<std::uint32_t, std::uint32_t> FluxPipeline::kontext_size(
+    std::uint32_t width, std::uint32_t height, std::uint32_t max_area) {
+    if (width == 0 || height == 0 || max_area == 0) {
+        throw std::invalid_argument("flux: zero size or max_area");
+    }
+    // round() is Python's (half to even), as nearbyint by default.
+    const double aspect = static_cast<double>(width) / height;
+    const auto w = static_cast<std::uint32_t>(std::nearbyint(
+        std::sqrt(static_cast<double>(max_area) * aspect)));
+    const auto h = static_cast<std::uint32_t>(std::nearbyint(
+        std::sqrt(static_cast<double>(max_area) / aspect)));
+    return {w / 16 * 16, h / 16 * 16};
+}
+
+std::pair<std::uint32_t, std::uint32_t> FluxPipeline::reference_size(
+    std::uint32_t width, std::uint32_t height, bool auto_resize) {
+    // get_default_height_width floors both sides to 16 before the
+    // aspect is taken.
+    width = width / 16 * 16;
+    height = height / 16 * 16;
+    if (width == 0 || height == 0) {
+        throw std::invalid_argument(
+            "flux: the reference must be at least 16 x 16");
+    }
+    if (auto_resize) {
+        // PREFERRED_KONTEXT_RESOLUTIONS, (width, height); min() over
+        // (|aspect - w / h|, w, h) breaks ties by the smaller width.
+        static constexpr std::pair<std::uint32_t, std::uint32_t> kRes[] = {
+            {672, 1568},  {688, 1504},  {720, 1456}, {752, 1392},
+            {800, 1328},  {832, 1248},  {880, 1184}, {944, 1104},
+            {1024, 1024}, {1104, 944},  {1184, 880}, {1248, 832},
+            {1328, 800},  {1392, 752},  {1456, 720}, {1504, 688},
+            {1568, 672}};
+        const double aspect = static_cast<double>(width) / height;
+        double best = 0.0;
+        bool first = true;
+        for (const auto& [w, h] : kRes) {
+            const double d = std::fabs(aspect - static_cast<double>(w) / h);
+            if (first || d < best) {
+                best = d;
+                width = w;
+                height = h;
+                first = false;
+            }
+        }
+    }
+    return {width / 16 * 16, height / 16 * 16};
+}
+
 std::vector<float> FluxPipeline::generate_from(
     std::span<const float> latent, const Request& req, const backend::Ops& op,
     const std::function<bool()>& alive, Timing* timing) const {
@@ -132,17 +182,54 @@ std::vector<float> FluxPipeline::generate_from(
     const auto text = t5_->encode(ids, op);
     const auto n_txt = static_cast<std::uint32_t>(ids.size());
     const std::vector<float> txt_ids(std::size_t{n_txt} * 3, 0.0f);
+
+    // Kontext: the reference's packed latent follows the image tokens,
+    // with first id 1, on every step; its predictions are dropped.
+    std::vector<float> ref_tok, ref_ids;
+    std::uint32_t n_ref = 0;
+    if (req.reference) {
+        const Rgb8& src = *req.reference;
+        const auto [rw, rh] =
+            reference_size(src.w, src.h, req.auto_resize);
+        if (rw == 0 || rh == 0 || !SdVaeDecoder::latent_fits(rh / 8, rw / 8)) {
+            throw std::invalid_argument("flux: reference image too large");
+        }
+        if (!vae_->has_encoder()) {
+            throw std::invalid_argument("flux: the VAE GGUF has no encoder");
+        }
+        const Rgb8 r = resize_lanczos(src, rw, rh);
+        // VaeImageProcessor: bytes / 255, then 2 x - 1, channel-major.
+        const std::size_t plane = std::size_t{rw} * rh;
+        std::vector<float> img(plane * 3);
+        for (std::size_t i = 0; i < plane; ++i) {
+            for (std::size_t c = 0; c < 3; ++c) {
+                img[c * plane + i] =
+                    static_cast<float>(r.rgb[i * 3 + c]) / 255.0f * 2.0f - 1.0f;
+            }
+        }
+        const auto lat = vae_->encode(img, rh, rw, op);
+        ref_tok = FluxSampler::pack(lat, kLatentCh, rh / 8, rw / 8);
+        ref_ids = FluxSampler::image_ids(rh / 16, rw / 16, 1.0f);
+        n_ref = (rh / 16) * (rw / 16);
+    }
     const auto t1 = Clock::now();
 
     auto x = FluxSampler::pack(latent, kLatentCh, h, w);
     const std::uint32_t n_img = (h / 2) * (w / 2);
-    const auto img_ids = FluxSampler::image_ids(h / 2, w / 2, 0.0f);
+    auto img_ids = FluxSampler::image_ids(h / 2, w / 2, 0.0f);
+    img_ids.insert(img_ids.end(), ref_ids.begin(), ref_ids.end());
+    // The shift follows the image tokens only, as in the pipeline.
     const auto sig = sampler_->sigmas(steps, n_img);
+    std::vector<float> in(x.size() + ref_tok.size());
+    std::copy(ref_tok.begin(), ref_tok.end(),
+              in.begin() + static_cast<std::ptrdiff_t>(x.size()));
     for (std::uint32_t i = 0; i < steps; ++i) {
         if (alive && !alive()) return {};
-        const auto v = dit_->forward(x, img_ids, n_img, text, txt_ids, n_txt,
-                                     pooled, FluxSampler::model_sigma(sig[i]),
-                                     req.guidance, op);
+        std::copy(x.begin(), x.end(), in.begin());
+        auto v = dit_->forward(in, img_ids, n_img + n_ref, text, txt_ids,
+                               n_txt, pooled, FluxSampler::model_sigma(sig[i]),
+                               req.guidance, op);
+        v.resize(x.size());
         FluxSampler::step(x, v, sig[i], sig[i + 1]);
     }
     const auto t2 = Clock::now();

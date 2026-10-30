@@ -3,8 +3,10 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "locus/backend/registry.hpp"
@@ -12,6 +14,7 @@
 #include "locus/image/clip_text.hpp"
 #include "locus/image/flux_dit.hpp"
 #include "locus/image/flux_sampler.hpp"
+#include "locus/image/image_input.hpp"
 #include "locus/image/sd_vae.hpp"
 #include "locus/image/t5_encoder.hpp"
 #include "locus/tok/clip_tokenizer.hpp"
@@ -41,7 +44,34 @@ class FluxPipeline {
         float guidance = 3.5f;     ///< ignored without a guidance embedding
         std::uint32_t max_sequence_length = 512;  ///< T5 tokens
         std::uint64_t seed = 0;
+        /**
+         * Kontext: the image to edit or keep consistent with. It is
+         * resized (auto_resize: to the nearest of Kontext's 17 training
+         * resolutions by aspect; else its own size floored to 16) with
+         * Pillow's Lanczos. FluxKontextPipeline also fits the output
+         * size to 1024^2 pixels: callers do that with kontext_size.
+         */
+        std::optional<Rgb8> reference;
+        bool auto_resize = true;
     };
+
+    /**
+     * FluxKontextPipeline's output size for a requested one: the same
+     * aspect at max_area pixels (its default 1024^2), each side floored
+     * to a multiple of 16.
+     */
+    static std::pair<std::uint32_t, std::uint32_t> kontext_size(
+        std::uint32_t width, std::uint32_t height, std::uint32_t max_area);
+
+    /**
+     * The reference image's size before encoding: its sides floored to
+     * multiples of 16, then with auto_resize the Kontext training
+     * resolution nearest to that aspect (ties to the smaller width).
+     *
+     * @throws std::invalid_argument for a side under 16.
+     */
+    static std::pair<std::uint32_t, std::uint32_t> reference_size(
+        std::uint32_t width, std::uint32_t height, bool auto_resize);
 
     /** Where the time went, in milliseconds. */
     struct Timing {

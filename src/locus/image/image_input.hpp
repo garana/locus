@@ -46,6 +46,15 @@ Rgb8 decode_image(std::span<const std::byte> data,
 Rgb8 resize_bicubic(const Rgb8& in, std::uint32_t w, std::uint32_t h);
 
 /**
+ * Pillow's Image.resize((w, h), LANCZOS), the same way as
+ * resize_bicubic with the lanczos kernel (sinc(x) sinc(x / 3), support
+ * 3): VaeImageProcessor's default resample.
+ *
+ * @throws std::invalid_argument on a zero size.
+ */
+Rgb8 resize_lanczos(const Rgb8& in, std::uint32_t w, std::uint32_t h);
+
+/**
  * The Janus reference preprocessing up to the normalization
  * (VLMImageProcessor.resize): resize so the longer side is `side`,
  * each side max(int(side_px / max_side * side), min_size), with

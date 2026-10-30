@@ -736,22 +736,33 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         }
     }
     // A broken image pipeline directory stops the server here too. A
-    // flux GGUF in it makes it a FLUX.1 pipeline, else PixArt.
+    // flux or clip_text GGUF (parts only FLUX.1 has) makes it a FLUX.1
+    // pipeline, so a FLUX set missing a part names the FLUX parts; else
+    // PixArt, whose error names both sets.
     if (!opt_.image_model_dir.empty()) {
         bool flux = false;
         std::error_code ec;
         for (const auto& e : std::filesystem::directory_iterator(
                  opt_.image_model_dir, ec)) {
-            if (e.is_regular_file() && e.path().extension() == ".gguf" &&
-                gguf::GgufFile::open(e.path().string())
-                        .get_string("general.architecture") == "flux") {
-                flux = true;
+            if (!e.is_regular_file() || e.path().extension() != ".gguf") {
+                continue;
             }
+            // arch views into g, so g must outlive the comparison.
+            const auto g = gguf::GgufFile::open(e.path().string());
+            const auto arch = g.get_string("general.architecture");
+            if (arch == "flux" || arch == "clip_text") flux = true;
         }
         if (flux) {
             flux_ = image::FluxPipeline::load_dir(opt_.image_model_dir);
         } else {
-            pixart_ = image::PixArtPipeline::load_dir(opt_.image_model_dir);
+            try {
+                pixart_ =
+                    image::PixArtPipeline::load_dir(opt_.image_model_dir);
+            } catch (const gguf::Error& e) {
+                throw gguf::Error(std::string(e.what()) +
+                                  " (or, for FLUX.1, a flux, a clip_text, a "
+                                  "t5encoder and an autoencoder_kl GGUF)");
+            }
         }
     }
     // Image input (i#241): on when the model's GGUF carries the Janus
@@ -1124,6 +1135,9 @@ OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
         if (path == "/v1/images/generations") {
             return Route::kImages;
         }
+        if (path == "/v1/images/edits") {
+            return Route::kImageEdits;
+        }
         return Route::kUnknown;
     }
     return Route::kUnknown;
@@ -1151,7 +1165,7 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
             opt_.metrics_path, "/health", "/v1/models", "/v1/models/",
             "/v1/completions", "/v1/chat/completions", "/v1/messages",
             "/v1/responses", "/v1/embeddings", "/v1/audio/speech",
-            "/v1/images/generations"});
+            "/v1/images/generations", "/v1/images/edits"});
     cfg.metrics = http_metrics_;
     http_ = std::make_unique<http::Server>(std::move(cfg), route_handler_,
                                            auth_head_);
@@ -2581,9 +2595,15 @@ void OpenAiServer::install_routes() {
     // max_sequence_length (T5 tokens, default 512) and seed. size is
     // "WxH", multiples of 16 up to 1024 (default 1024x1024). One image
     // at a time, under image_mu_.
+    // With edit (POST /v1/images/edits, FLUX.1 Kontext): image, a
+    // base64 PNG or JPEG or a data: URL of one, is the reference; the
+    // output keeps the aspect of size (default: the image's) at the area
+    // of size, or 1024 x 1024 pixels without one (and at most that);
+    // auto_resize (default true) resizes the reference to Kontext's
+    // nearest training resolution.
     auto handle_flux = [this](const http::Request& req,
                               http::ServerResponse& res,
-                              const http::RequestContext& ctx) {
+                              const http::RequestContext& ctx, bool edit) {
             try {
                 const json body = json::parse(req.body);
                 auto str = [&](const char* k) -> std::string {
@@ -2613,6 +2633,30 @@ void OpenAiServer::install_routes() {
                 }
                 if (body.contains("n") && integer("n", 1, 1) != 1) {
                     throw std::invalid_argument("n must be 1");
+                }
+                if (edit) {
+                    if (!body.contains("image") || !body["image"].is_string()) {
+                        throw std::invalid_argument(
+                            "image must be a base64 PNG or JPEG, or a data: "
+                            "URL of one");
+                    }
+                    const std::string im = body["image"].get<std::string>();
+                    const auto bytes =
+                        im.rfind("data:", 0) == 0
+                            ? data_url_bytes(body["image"], opt_.max_body_bytes)
+                            : http::base64_decode(im, opt_.max_body_bytes);
+                    image::DecodeLimits lim;
+                    lim.max_bytes = opt_.max_body_bytes;
+                    p.reference = image::decode_image(bytes, lim);
+                    p.width = p.reference->w;
+                    p.height = p.reference->h;
+                    if (body.contains("auto_resize")) {
+                        if (!body["auto_resize"].is_boolean()) {
+                            throw std::invalid_argument(
+                                "auto_resize must be a boolean");
+                        }
+                        p.auto_resize = body["auto_resize"].get<bool>();
+                    }
                 }
                 if (body.contains("size")) {
                     // "WxH": two decimal sides, no signs or spaces.
@@ -2673,6 +2717,19 @@ void OpenAiServer::install_routes() {
                 // fails ("vulkan: wait idle" on MoltenVK); the resident
                 // GPU forward is i#372 step 9.
                 const auto& op = backend::best_backend().ops;
+                if (edit) {
+                    // FluxKontextPipeline's size rule: the aspect at
+                    // max_area pixels, 1024 x 1024 by default; a given
+                    // size sets max_area (at most that), so a client can
+                    // ask for a smaller, faster image.
+                    constexpr std::uint32_t kArea = 1024 * 1024;
+                    const std::uint32_t area =
+                        body.contains("size")
+                            ? std::min(p.width * p.height, kArea)
+                            : kArea;
+                    std::tie(p.width, p.height) = image::FluxPipeline::
+                        kontext_size(p.width, p.height, area);
+                }
                 image::FluxPipeline::Timing took;
                 std::vector<std::uint8_t> rgb;
                 {
@@ -2737,7 +2794,7 @@ void OpenAiServer::install_routes() {
                     // handle_flux reports the parse error
                 }
                 if (named || !vq16_ || !janus_) {
-                    handle_flux(req, res, ctx);
+                    handle_flux(req, res, ctx, false);
                     return;
                 }
             }
@@ -3042,12 +3099,29 @@ void OpenAiServer::install_routes() {
             });
     };
 
+    // POST /v1/images/edits (FLUX.1 Kontext): the image and the prompt
+    // -> the edited image, as b64_json; see handle_flux. A JSON body
+    // with the image as base64 or a data: URL (OpenAI's multipart form
+    // is not parsed). 503 unless --image-model loaded FLUX.1.
+    auto handle_edits = [this, handle_flux](const http::Request& req,
+                                            http::ServerResponse& res,
+                                            const http::RequestContext& ctx) {
+        auth_event("create", "images.edits", ctx.identity);
+        if (!flux_) {
+            set_unavailable(res,
+                            "image edits are not configured (needs "
+                            "--image-model with a FLUX.1 Kontext pipeline)");
+            return;
+        }
+        handle_flux(req, res, ctx, true);
+    };
+
     // One dispatch handler over all routes (route_of is the single home
     // for routing, shared with the auth head stage below).
     route_handler_ = [this, handle_health, handle_models,
                       handle_model_by_id, handle_metrics, handle,
                       handle_messages, handle_responses, handle_embeddings,
-                      handle_audio, handle_images](
+                      handle_audio, handle_images, handle_edits](
                          const http::Request& req, http::ServerResponse& res,
                          const http::RequestContext& ctx) {
         switch (route_of(req.method, req.path)) {
@@ -3062,6 +3136,7 @@ void OpenAiServer::install_routes() {
             case Route::kEmbeddings:  handle_embeddings(req, res, ctx); break;
             case Route::kAudioSpeech: handle_audio(req, res, ctx); break;
             case Route::kImages:      handle_images(req, res, ctx); break;
+            case Route::kImageEdits:  handle_edits(req, res, ctx); break;
             case Route::kUnknown:
                 res.status = 404;  // httplib's default: 404, empty body
                 break;

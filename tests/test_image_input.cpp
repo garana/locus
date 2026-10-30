@@ -173,6 +173,21 @@ TEST_CASE("resize_bicubic is bit-exact with Pillow", "[image][decode]") {
     require_same(resize_bicubic(src, kW, kH).rgb, src.rgb);
 }
 
+TEST_CASE("resize_lanczos is bit-exact with Pillow", "[image][decode]") {
+    const Rgb8 src = source();
+    for (const auto& [w, h] : {std::pair<std::uint32_t, std::uint32_t>{23, 17},
+                               {97, 59},
+                               {61, 20}}) {
+        INFO(w << " x " << h);
+        const auto r = locus::image::resize_lanczos(src, w, h);
+        REQUIRE(r.w == w);
+        REQUIRE(r.h == h);
+        require_same(r.rgb, read_rgb("lanczos_" + std::to_string(w) + "x" +
+                                         std::to_string(h) + ".rgb",
+                                     std::size_t{w} * h * 3));
+    }
+}
+
 TEST_CASE("fit_square matches the Janus reference preprocessing",
           "[image][decode]") {
     const Rgb8 src = source();

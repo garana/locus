@@ -21,6 +21,25 @@ double bicubic(double x) {
     return 0.0;
 }
 
+/** Pillow's lanczos kernel: sinc(x) sinc(x / 3), support 3. */
+double lanczos(double x) {
+    const auto sinc = [](double v) {
+        if (v == 0.0) return 1.0;
+        v *= 3.14159265358979323846;
+        return std::sin(v) / v;
+    };
+    if (-3.0 <= x && x < 3.0) return sinc(x) * sinc(x / 3.0);
+    return 0.0;
+}
+
+/** A resampling kernel and its support at scale 1. */
+struct Filter {
+    double (*fn)(double);
+    double support;
+};
+constexpr Filter kBicubic{&bicubic, 2.0};
+constexpr Filter kLanczos{&lanczos, 3.0};
+
 /** Pillow's 8-bit fixed point: 32 - 8 - 2 fraction bits. */
 constexpr int kPrecisionBits = 32 - 8 - 2;
 
@@ -35,13 +54,13 @@ struct Taps {
  * Pillow's precompute_coeffs + normalize_coeffs_8bpc for in_size ->
  * out_size over the box [0, in_size).
  */
-Taps taps(int in_size, int out_size) {
+Taps taps(int in_size, int out_size, const Filter& f) {
     Taps t;
     // (double)(in1 - in0) / outSize, with in0 / in1 as floats.
     const double scale =
         static_cast<double>(static_cast<float>(in_size) - 0.0f) / out_size;
     const double filterscale = scale < 1.0 ? 1.0 : scale;
-    const double support = 2.0 * filterscale;
+    const double support = f.support * filterscale;
     t.ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
     t.start.resize(out_size);
     t.count.resize(out_size);
@@ -57,7 +76,7 @@ Taps taps(int in_size, int out_size) {
         xmax -= xmin;
         double ww = 0.0;
         for (int x = 0; x < xmax; ++x) {
-            w[x] = bicubic((x + xmin - center + 0.5) * inv);
+            w[x] = f.fn((x + xmin - center + 0.5) * inv);
             ww += w[x];
         }
         for (int x = 0; x < xmax; ++x) {
@@ -82,8 +101,9 @@ std::uint8_t clip8(std::int32_t ss) {
  * Horizontal pass over input rows [y0, y0 + rows): each output pixel is
  * the taps' weighted sum of the row, per channel.
  */
-Rgb8 horizontal(const Rgb8& in, std::uint32_t out_w, int y0, int rows) {
-    const Taps t = taps(static_cast<int>(in.w), static_cast<int>(out_w));
+Rgb8 horizontal(const Rgb8& in, std::uint32_t out_w, int y0, int rows,
+                const Filter& f) {
+    const Taps t = taps(static_cast<int>(in.w), static_cast<int>(out_w), f);
     Rgb8 o{out_w, static_cast<std::uint32_t>(rows), {}};
     o.rgb.resize(std::size_t{out_w} * rows * 3);
     for (int yy = 0; yy < rows; ++yy) {
@@ -129,6 +149,32 @@ Rgb8 vertical(const Rgb8& in, const Taps& t, std::uint32_t out_h) {
     return o;
 }
 
+/** Pillow's ImagingResampleInner with filter f. */
+Rgb8 resample(const Rgb8& in, std::uint32_t w, std::uint32_t h,
+              const Filter& f) {
+    if (w == 0 || h == 0 || in.w == 0 || in.h == 0) {
+        throw std::invalid_argument("resize: zero size");
+    }
+    if (in.rgb.size() != std::size_t{in.w} * in.h * 3) {
+        throw std::invalid_argument("resize: need w * h * 3 bytes");
+    }
+    if (w == in.w && h == in.h) return in;  // Image.resize returns a copy
+    // The vertical taps first, to know which input rows the horizontal
+    // pass must produce.
+    Taps vt = taps(static_cast<int>(in.h), static_cast<int>(h), f);
+    const int y_first = vt.start[0];
+    const int y_last = vt.start[h - 1] + vt.count[h - 1];
+    Rgb8 cur = in;
+    if (w != in.w) {
+        for (auto& s : vt.start) s -= y_first;
+        cur = horizontal(in, w, y_first, y_last - y_first, f);
+    }
+    if (h != in.h) {
+        cur = vertical(cur, vt, h);
+    }
+    return cur;
+}
+
 }  // namespace
 
 Rgb8 decode_image(std::span<const std::byte> data, const DecodeLimits& lim) {
@@ -146,27 +192,11 @@ Rgb8 decode_image(std::span<const std::byte> data, const DecodeLimits& lim) {
 }
 
 Rgb8 resize_bicubic(const Rgb8& in, std::uint32_t w, std::uint32_t h) {
-    if (w == 0 || h == 0 || in.w == 0 || in.h == 0) {
-        throw std::invalid_argument("resize: zero size");
-    }
-    if (in.rgb.size() != std::size_t{in.w} * in.h * 3) {
-        throw std::invalid_argument("resize: need w * h * 3 bytes");
-    }
-    if (w == in.w && h == in.h) return in;  // Image.resize returns a copy
-    // ImagingResampleInner: the vertical taps first, to know which
-    // input rows the horizontal pass must produce.
-    Taps vt = taps(static_cast<int>(in.h), static_cast<int>(h));
-    const int y_first = vt.start[0];
-    const int y_last = vt.start[h - 1] + vt.count[h - 1];
-    Rgb8 cur = in;
-    if (w != in.w) {
-        for (auto& s : vt.start) s -= y_first;
-        cur = horizontal(in, w, y_first, y_last - y_first);
-    }
-    if (h != in.h) {
-        cur = vertical(cur, vt, h);
-    }
-    return cur;
+    return resample(in, w, h, kBicubic);
+}
+
+Rgb8 resize_lanczos(const Rgb8& in, std::uint32_t w, std::uint32_t h) {
+    return resample(in, w, h, kLanczos);
 }
 
 Rgb8 fit_square(const Rgb8& in, std::uint32_t side, std::uint32_t min_size,
