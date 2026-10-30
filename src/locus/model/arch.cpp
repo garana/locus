@@ -1147,7 +1147,7 @@ const ArchSpec kArchs[] = {
     {"llama",
      "Llama family (dense or Mixtral-style MoE, GQA)",
      &llama_hparams, &llama_attention_tensors, &llama_attention,
-     &llama_kv_dim},
+     &llama_kv_dim, nullptr, nullptr, nullptr, true},
     {"deepseek2",
      "DeepSeek-V2 family (MLA latent attention, DeepSeek MoE)",
      &deepseek2_hparams, &deepseek2_attention_tensors,

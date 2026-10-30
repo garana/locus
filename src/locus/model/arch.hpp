@@ -78,6 +78,14 @@ struct ArchSpec {
     /** Optional paged-cache layer count (0 / nullptr = n_layers):
      * archs that keep extra per-position rows (deepseek41). */
     std::uint32_t (*cache_layers)(const Hparams& hp) = nullptr;
+
+    /**
+     * Whether `attention` is the plain llama computation (q / k / v
+     * projections without bias, rope_norm on q and k, GQA attention,
+     * output wo): forward_batch then runs the projections as batched
+     * matvecs over the chunk, byte-identical to the per-token path.
+     */
+    bool plain_attention = false;
 };
 
 /** @returns All implemented architectures. */
