@@ -60,6 +60,13 @@ SdVaeDecoder SdVaeDecoder::load(const gguf::GgufFile& g) {
     d.groups_ = u("autoencoder_kl.norm_groups");
     d.eps_ = f("autoencoder_kl.norm_epsilon");
     d.scaling_ = f("autoencoder_kl.scaling_factor");
+    // FLUX's VAE: a shift as well as a scale, and no post-quant conv.
+    // The SD VAE GGUFs predate both keys.
+    if (g.find("autoencoder_kl.shift_factor") != nullptr) {
+        d.shift_ = f("autoencoder_kl.shift_factor");
+    }
+    d.post_quant_ =
+        g.get_bool("autoencoder_kl.use_post_quant_conv").value_or(true);
     if (g.get_bool("autoencoder_kl.mid_block_attention").value_or(false) !=
         true) {
         throw gguf::Error("vae: the decoder must have the mid attention");
@@ -97,8 +104,10 @@ SdVaeDecoder SdVaeDecoder::load(const gguf::GgufFile& g) {
             d.t(p + ".conv_shortcut.bias", out);
         }
     };
-    d.t("post_quant_conv.weight", std::size_t{d.latent_} * d.latent_);
-    d.t("post_quant_conv.bias", d.latent_);
+    if (d.post_quant_) {
+        d.t("post_quant_conv.weight", std::size_t{d.latent_} * d.latent_);
+        d.t("post_quant_conv.bias", d.latent_);
+    }
     d.t("decoder.conv_in.weight", std::size_t{top} * d.latent_ * 9);
     d.t("decoder.conv_in.bias", top);
     res("decoder.mid_block.resnets.0", top, top);
@@ -223,8 +232,8 @@ std::vector<float> SdVaeDecoder::decode(std::span<const float> latent,
     };
 
     Act z{std::vector<float>(latent.begin(), latent.end()), latent_, h, w};
-    for (float& x : z.data) x /= scaling_;
-    z = conv(z, "post_quant_conv", latent_, 1);
+    for (float& x : z.data) x = x / scaling_ + shift_;
+    if (post_quant_) z = conv(z, "post_quant_conv", latent_, 1);
     const std::uint32_t top = chans_.back();
     Act s = conv(z, "decoder.conv_in", top, 3);
     s = res(s, "decoder.mid_block.resnets.0", top);

@@ -17,8 +17,10 @@ namespace locus::image {
  * section 6). It turns a [4][h][w] latent into a [3][8h][8w] image in
  * [-1, 1] (for the four-level SD VAE).
  *
- * The latent is first divided by the scaling factor (0.18215), as the
- * pipeline does; then a 1x1 post-quant conv, a 3x3 conv_in, a mid
+ * The latent is first divided by the scaling factor (0.18215) and, for
+ * FLUX's 16-channel VAE, shifted by the shift factor (0.1159), as the
+ * pipelines do; then a 1x1 post-quant conv (not in FLUX's VAE), a 3x3
+ * conv_in, a mid
  * block (resnet, single-head attention, resnet), up blocks of
  * layers_per_block + 1 resnets each followed (but the last) by a
  * nearest 2x upsample and a 3x3 conv, and GroupNorm, SiLU, a 3x3
@@ -40,7 +42,7 @@ class SdVaeDecoder {
      */
     static SdVaeDecoder load(const gguf::GgufFile& g);
 
-    /** @returns The latent channels (4). */
+    /** @returns The latent channels (4; 16 for FLUX). */
     std::uint32_t latent_channels() const { return latent_; }
     /** @returns The image side over the latent side (8). */
     std::uint32_t upscale() const { return 1u << (chans_.size() - 1); }
@@ -70,7 +72,8 @@ class SdVaeDecoder {
 
     const gguf::GgufFile* g_ = nullptr;
     std::uint32_t latent_ = 0, out_ch_ = 0, layers_ = 0, groups_ = 0;
-    float eps_ = 0.0f, scaling_ = 0.0f;
+    float eps_ = 0.0f, scaling_ = 0.0f, shift_ = 0.0f;
+    bool post_quant_ = true;
     std::vector<std::uint32_t> chans_;  ///< block_out_channels
 };
 

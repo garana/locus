@@ -151,9 +151,10 @@ def write_dit(path, mdir):
     w.add_uint32(p + "num_train_timesteps", s["num_train_timesteps"])
     w.add_bool(p + "use_dynamic_shifting",
                bool(s.get("use_dynamic_shifting", False)))
-    w.add_float32(p + "shift", float(s.get("shift", 1.0)))
-    w.add_float32(p + "base_shift", float(s.get("base_shift", 0.5)))
-    w.add_float32(p + "max_shift", float(s.get("max_shift", 1.15)))
+    # Float64: the pipeline computes the shift in double from these.
+    w.add_float64(p + "shift", float(s.get("shift", 1.0)))
+    w.add_float64(p + "base_shift", float(s.get("base_shift", 0.5)))
+    w.add_float64(p + "max_shift", float(s.get("max_shift", 1.15)))
     w.add_uint32(p + "base_image_seq_len", s.get("base_image_seq_len", 256))
     w.add_uint32(p + "max_image_seq_len", s.get("max_image_seq_len", 4096))
 
