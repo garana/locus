@@ -12,7 +12,9 @@ caption masks, on a 2 x 3 x 4 latent (24 tokens). Writes, into --out:
 - ltxv_synth.json: sigmas, masks, coordinates and shapes;
 - ltxv_synth_in.f32: the latent [2, 8, 2, 3, 4], then the caption
   states [2, 6, 32];
-- ltxv_synth_out.f32: the output, as [2, 8, 24] (channel-major).
+- ltxv_synth_out.f32: the output, as [2, 8, 24] (channel-major);
+- ltxv_synth_tok_out.f32: batch row 0 again with a per-token timestep
+  (token_sigmas: frame 0 at 0, the rest at 0.725), as [8, 24].
 
 real: the 2B checkpoint (--ckpt, ltxv-2b-0.9.8-distilled.safetensors)
 upcast to float32, one call at sigma 0.9094 on a 2 x 4 x 6 latent (48
@@ -83,6 +85,14 @@ def synth(ltx_src, out):
         o = model(tokens, grid, encoder_hidden_states=y,
                   encoder_attention_mask=mask, timestep=sigma,
                   return_dict=False)[0]  # [2, n, 8]
+    # Batch row 0 with a per-token timestep, as image-to-video sets it:
+    # frame 0 a hard condition (0), the rest at 0.725.
+    tok_sigma = torch.full((1, n), 0.725)
+    tok_sigma[0, :rows * cols] = 0.0
+    with torch.no_grad():
+        o_tok = model(tokens[:1], grid[:1], encoder_hidden_states=y[:1],
+                      encoder_attention_mask=mask[:1], timestep=tok_sigma,
+                      return_dict=False)[0]  # [1, n, 8]
 
     cfg = {"transformer": dict(model.config),
            "scheduler": {"_class_name": "RectifiedFlowScheduler",
@@ -103,8 +113,11 @@ def synth(ltx_src, out):
         f.write(y.numpy().astype("<f4").tobytes())
     o.transpose(1, 2).contiguous().numpy().astype("<f4").tofile(
         os.path.join(out, "ltxv_synth_out.f32"))
+    o_tok.transpose(1, 2).contiguous().numpy().astype("<f4").tofile(
+        os.path.join(out, "ltxv_synth_tok_out.f32"))
     with open(os.path.join(out, "ltxv_synth.json"), "w") as f:
         json.dump({"sigmas": sigma.tolist(), "masks": mask.tolist(),
+                   "token_sigmas": tok_sigma[0].tolist(),
                    "coords": coords.tolist(),
                    "latent": list(x.shape), "caption": list(y.shape),
                    "out": [2, 8, n]}, f, indent=1)

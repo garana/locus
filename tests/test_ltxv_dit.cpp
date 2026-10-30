@@ -136,6 +136,30 @@ TEST_CASE("ltxv dit matches torch on a synthetic model", "[ltxv][image]") {
                       std::invalid_argument);
     REQUIRE_THROWS_AS(dit.forward(x, n - 1, coords, 1.0f, y, 1, cpu),
                       std::invalid_argument);
+
+    // Batch row 0 with a per-token timestep (frame 0 at 0, the rest at
+    // 0.725), as image-to-video conditioning runs it.
+    const auto tok = j["token_sigmas"].get<std::vector<float>>();
+    REQUIRE(tok.size() == n);
+    const auto ref_tok = read_f32(kDir + "golden/ltxv_synth_tok_out.f32");
+    REQUIRE(ref_tok.size() == lat);
+    const std::span<const float> y0(&in[2 * lat], 2 * 32);  // mask 1 1 0..
+    for (const auto& [name, op] : legs) {
+        INFO(name << " per-token sigma");
+        const auto got = dit.forward(x, n, coords,
+                                     std::span<const float>(tok), y0, 2, *op);
+        REQUIRE(rel_error(got, ref_tok) <= 1e-5);
+    }
+    // One sigma per token, all equal, is the scalar call.
+    const std::vector<float> same(n, 0.725f);
+    REQUIRE(dit.forward(x, n, coords, std::span<const float>(same), y0, 2,
+                        cpu) ==
+            dit.forward(x, n, coords, 0.725f, y0, 2, cpu));
+    const std::vector<float> short_sigmas(n - 1, 0.5f);
+    REQUIRE_THROWS_AS(dit.forward(x, n, coords,
+                                  std::span<const float>(short_sigmas), y0, 2,
+                                  cpu),
+                      std::invalid_argument);
 }
 
 // The real 2B DiT (BF16 weights) against the reference upcast to
