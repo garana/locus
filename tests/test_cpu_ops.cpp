@@ -794,9 +794,10 @@ TEST_CASE("matvec_cuda matches the scalar reference for K-/IQ-quants",
     }
 }
 
-// R11 CUDA: the one-launch batched kernel must be BIT-identical to n
-// per-token matvec_cuda() calls (row-major out[r*n + t]). Not
-// arch-guarded -- gated at runtime on a usable CUDA device.
+// R11 CUDA: the batched kernel must be BIT-identical to n per-token
+// matvec_cuda() calls (row-major out[r*n + t]), also past 32 tokens,
+// where it runs in 32-token slices. Not arch-guarded: gated at
+// runtime on a usable CUDA device.
 TEST_CASE("matvec_batch_cuda Q4_K/Q6_K byte-identical to per-token "
           "matvec_cuda (R11)",
           "[ops][batch][cuda]") {
@@ -805,37 +806,40 @@ TEST_CASE("matvec_batch_cuda Q4_K/Q6_K byte-identical to per-token "
     }
     cuda_pool_reset();  // drop any stale pages from prior test cases
     // 9 rows: two full 4-row (one warp per row) blocks and a partial one.
-    constexpr std::uint32_t rows = 9, nblk = 2, cols = nblk * 256,
-                            n = 5;
-    std::mt19937 rng(41);
-    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
-    std::vector<float> xb(static_cast<std::size_t>(n) * cols);
-    for (auto& v : xb) {
-        v = xd(rng);
-    }
-    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K}) {
-        std::vector<std::byte> w;
-        for (std::uint32_t r = 0; r < rows; ++r) {
-            auto row = k_quant_row(
-                t, nblk,
-                300u + r + 9u * static_cast<std::uint32_t>(t));
-            w.insert(w.end(), row.begin(), row.end());
+    constexpr std::uint32_t rows = 9, nblk = 2, cols = nblk * 256;
+    // One slice; one slice plus one token; two full slices; and two
+    // full slices plus one token.
+    for (std::uint32_t n : {5u, 33u, 64u, 65u}) {
+        std::mt19937 rng(41 + n);
+        std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+        std::vector<float> xb(static_cast<std::size_t>(n) * cols);
+        for (auto& v : xb) {
+            v = xd(rng);
         }
-        Mat m{t, w.data(), rows, cols};
-        std::vector<float> got(static_cast<std::size_t>(rows) * n);
-        matvec_batch_cuda(m, xb, got, n);
-        for (std::uint32_t r = 0; r < rows; ++r) {
-            for (std::uint32_t tk = 0; tk < n; ++tk) {
-                float ref = 0.0f;
-                matvec_cuda(mat_rows(m, r, 1),
-                            {xb.data() +
-                                 static_cast<std::size_t>(tk) * cols,
-                             cols},
-                            {&ref, 1});
-                INFO("type " << static_cast<int>(t) << " row " << r
-                             << " tok " << tk);
-                REQUIRE(got[static_cast<std::size_t>(r) * n + tk] ==
-                        ref);  // exact
+        for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+            std::vector<std::byte> w;
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                auto row = k_quant_row(
+                    t, nblk,
+                    300u + r + 9u * static_cast<std::uint32_t>(t));
+                w.insert(w.end(), row.begin(), row.end());
+            }
+            Mat m{t, w.data(), rows, cols};
+            std::vector<float> got(static_cast<std::size_t>(rows) * n);
+            matvec_batch_cuda(m, xb, got, n);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                for (std::uint32_t tk = 0; tk < n; ++tk) {
+                    float ref = 0.0f;
+                    matvec_cuda(mat_rows(m, r, 1),
+                                {xb.data() +
+                                     static_cast<std::size_t>(tk) * cols,
+                                 cols},
+                                {&ref, 1});
+                    INFO("type " << static_cast<int>(t) << " n " << n
+                                 << " row " << r << " tok " << tk);
+                    REQUIRE(got[static_cast<std::size_t>(r) * n + tk] ==
+                            ref);  // exact
+                }
             }
         }
     }

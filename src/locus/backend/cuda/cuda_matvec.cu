@@ -3107,6 +3107,40 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
     return ok;
 }
 
+/**
+ * run_batch for any n: slices of at most kMaxBatch tokens, each slice's
+ * row-major result copied into its columns of out_batch. Every slice
+ * runs the same kernel, so the result stays byte-identical to n
+ * per-token calls.
+ * @param out_batch rows * n floats, row-major (out[r * n + t]).
+ * @returns false on the first slice that fails (out_batch then holds a
+ *          partial result).
+ */
+bool run_batch_sliced(const Mat& w, std::span<const float> x_batch,
+                      std::span<float> out_batch, std::size_t w_bytes,
+                      std::uint32_t n, bool q6) {
+    if (n <= kMaxBatch) {
+        return run_batch(w, x_batch, out_batch, w_bytes, n, q6);
+    }
+    const std::size_t cols = w.cols;
+    std::vector<float> part(static_cast<std::size_t>(w.rows) * kMaxBatch);
+    for (std::uint32_t t0 = 0; t0 < n; t0 += kMaxBatch) {
+        const std::uint32_t m = std::min(kMaxBatch, n - t0);
+        const std::span<float> ps(part.data(),
+                                  static_cast<std::size_t>(w.rows) * m);
+        if (!run_batch(w, x_batch.subspan(t0 * cols, m * cols), ps, w_bytes,
+                       m, q6)) {
+            return false;
+        }
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            std::copy_n(part.data() + static_cast<std::size_t>(r) * m, m,
+                        out_batch.data() + static_cast<std::size_t>(r) * n +
+                            t0);
+        }
+    }
+    return true;
+}
+
 /** @returns true if a Q8_K-activation CUDA kernel exists for `type`. */
 bool cuda_has_q8k_kernel(gguf::TensorType type) {
     switch (type) {
@@ -3718,28 +3752,24 @@ void cuda_prefetch(const Mat& w) {
 void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n) {
     ensure_device();
-    // Q4_K/Q6_K get the one-launch register-blocked kernel; other
-    // types (incl F32/Q8_0) fall back to n matvec_cuda() calls
-    // scattered to row-major -- the same-backend fallback rule, so
-    // batched stays byte-identical to per-token.
+    // Q4_K/Q6_K get the register-blocked kernel, one launch per
+    // kMaxBatch tokens; other types (incl F32/Q8_0) fall back to n
+    // matvec_cuda() calls scattered to row-major: the same-backend
+    // fallback rule, so batched stays byte-identical to per-token.
     const bool batch_type = w.type == gguf::TensorType::kQ4_K ||
                             w.type == gguf::TensorType::kQ6_K;
-    if (n <= kMaxBatch && batch_type) {
+    if (batch_type) {
         const std::size_t bytes = device_weight_bytes(w);
-        if (run_batch(w, x_batch, out_batch, bytes, n,
-                      w.type == gguf::TensorType::kQ6_K)) {
+        if (run_batch_sliced(w, x_batch, out_batch, bytes, n,
+                             w.type == gguf::TensorType::kQ6_K)) {
             return;
         }
         static Fallback& f = fallback("cuda", "per_token",
                                       "device error or out of memory");
         f.add();
-    } else if (!batch_type) {
+    } else {
         static Fallback& f = fallback("cuda", "per_token",
                                       "no batch kernel for the weight type");
-        f.add();
-    } else {
-        static Fallback& f =
-            fallback("cuda", "per_token", "batch wider than the kernel");
         f.add();
     }
     std::vector<float> col(w.rows);
