@@ -14,7 +14,8 @@ own docs.
 | POST /v1/embeddings           | OpenAI    | string or array input; CPU and CUDA only    |
 | GET  /v1/models (and /{id})   | OpenAI    | model discovery                             |
 | POST /v1/audio/speech         | OpenAI    | Orpheus-TTS; needs `--audio-decoder`        |
-| POST /v1/images/generations   | OpenAI    | Janus-Pro or PixArt-alpha; see Image output |
+| POST /v1/images/generations   | OpenAI    | Janus-Pro, PixArt-alpha or FLUX.1           |
+| POST /v1/images/edits         | OpenAI    | FLUX.1 Kontext; JSON body; see Image output |
 | POST /v1/messages             | Anthropic | Messages API, SSE stream, tools, images     |
 | POST /v1/responses            | OpenAI    | Responses API, stateless, SSE stream, tools |
 | GET  /health                  |           | liveness                                    |
@@ -41,11 +42,12 @@ model the server loaded:
 |--------------|-------------------------------|---------------------|---------------------------------------------------------------------------------------------------------|
 | Janus-Pro-1B | `--image-decoder <vq16.gguf>` | 384x384             | `cfg` (5), `temperature` (1; 0 = argmax), `seed` (random)                                               |
 | PixArt-alpha | `--image-model <dir>`         | 512x512             | `steps` (20, up to 100), `guidance_scale` (4.5), `seed` (random), `negative_prompt`                     |
-| FLUX.1       | `--image-model <dir>`         | WxH, 16 to 1024 (*) | `steps` (28, 4 for schnell; up to 100), `guidance_scale` (3.5), `max_sequence_length` (512), `seed`     |
+| FLUX.1       | `--image-model <dir>`         | WxH (*)             | `steps` (28, 4 for schnell; up to 100), `guidance_scale` (3.5), `max_sequence_length` (512), `seed`     |
 
-(*) `size` is any "WxH" with both sides multiples of 16, up to 1024;
-the default is 1024x1024. FLUX runs on the CPU, so an image takes
-minutes even at 256; a GPU forward is i#372 step 9.
+(*) `size` is any "WxH" with both sides multiples of 16, up to 2048 a
+side and 1024 x 1024 pixels in all; the default is 1024x1024. FLUX
+runs on the CPU, so an image takes minutes even at 256; a GPU forward
+is i#372 step 9.
 
 A request whose `model` starts with `pixart` (or `flux`) goes to the
 pipeline in `--image-model`, and so does every request unless both a
@@ -60,8 +62,20 @@ three GGUFs from `scripts/convert-t5-encoder.py`, `convert-pixart.py`
 and `convert-sd-vae.py`; the FLUX directory holds the four from
 `scripts/convert-flux.py` (`--dit-out`, `--clip-out`, `--vae-out`) and
 `convert-t5-encoder.py` on the pipeline's `text_encoder_2`. One image
-runs at a time; a second request while
-one runs gets a 503 with `Retry-After`.
+runs at a time; a second request while one runs gets a 503 with
+`Retry-After`.
+
+`/v1/images/edits` runs FLUX.1 Kontext dev on a reference image: the
+same character, object or scene, changed as the prompt says. It takes
+a JSON body, not OpenAI's multipart form: `image` is a base64 PNG or
+JPEG, or a `data:` URL of one; `prompt`, `steps`, `guidance_scale`,
+`max_sequence_length` and `seed` are as above. Without `size` the
+output keeps the image's aspect at 1024 x 1024 pixels (as
+FluxKontextPipeline does); with it, `size`'s aspect at `size`'s area
+(at most 1024 x 1024), so "256x256" gives a faster 256 x 256 edit.
+`auto_resize` (default true) resizes the reference to the nearest of
+Kontext's training resolutions (about 1M pixels); false keeps its own
+size (floored to 16), which is faster for a small image.
 
 With the OpenAI SDK, pass the extra fields in `extra_body`:
 

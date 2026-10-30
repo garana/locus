@@ -33,8 +33,20 @@ namespace locus::image {
  */
 class SdVaeDecoder {
   public:
-    /** The largest latent side decode accepts (128: a 1024 px image). */
+    /**
+     * The largest latent decode and encode accept: kMaxLatent^2
+     * positions (the mid attention runs over all of them: a 1024^2
+     * pixel image), and kMaxLatentSide on either side (2048 px).
+     */
     static constexpr std::uint32_t kMaxLatent = 128;
+    static constexpr std::uint32_t kMaxLatentSide = 256;
+
+    /** @returns Whether an h x w latent is within those limits. */
+    static bool latent_fits(std::uint32_t h, std::uint32_t w) {
+        return h != 0 && w != 0 && h <= kMaxLatentSide &&
+               w <= kMaxLatentSide &&
+               std::uint64_t{h} * w <= std::uint64_t{kMaxLatent} * kMaxLatent;
+    }
 
     /**
      * @param g A GGUF whose general.architecture is "autoencoder_kl".
@@ -52,8 +64,8 @@ class SdVaeDecoder {
      *     (not yet divided by the scaling factor).
      * @param op The backend ops for the attention's matrices.
      * @returns [3][h * upscale][w * upscale], about [-1, 1], unclamped.
-     * @throws std::invalid_argument on a wrong size or a side over
-     *     kMaxLatent.
+     * @throws std::invalid_argument on a wrong size or a latent past
+     *     latent_fits.
      */
     std::vector<float> decode(std::span<const float> latent, std::uint32_t h,
                               std::uint32_t w, const backend::Ops& op) const;
@@ -71,7 +83,7 @@ class SdVaeDecoder {
      * it: (mean - shift) * scale.
      *
      * @param image [in_channels][h][w] in [-1, 1]; h and w multiples of
-     *     upscale(), at most kMaxLatent * upscale().
+     *     upscale(), whose latent passes latent_fits.
      * @param op The backend ops for the attention's matrices.
      * @returns [latent_channels][h / upscale()][w / upscale()].
      * @throws std::invalid_argument without an encoder or on a bad size.

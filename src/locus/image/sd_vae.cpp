@@ -302,8 +302,8 @@ std::vector<float> SdVaeDecoder::encode(std::span<const float> image,
                                         const backend::Ops& op) const {
     if (!has_encoder_) throw std::invalid_argument("vae: no encoder");
     const std::uint32_t f = upscale();
-    if (h == 0 || w == 0 || h % f != 0 || w % f != 0 || h / f > kMaxLatent ||
-        w / f > kMaxLatent || image.size() != std::size_t{in_ch_} * h * w) {
+    if (h % f != 0 || w % f != 0 || !latent_fits(h / f, w / f) ||
+        image.size() != std::size_t{in_ch_} * h * w) {
         throw std::invalid_argument(
             "vae: image is not C x h x w with sides multiples of upscale()");
     }
@@ -338,10 +338,10 @@ std::vector<float> SdVaeDecoder::encode(std::span<const float> image,
 std::vector<float> SdVaeDecoder::decode(std::span<const float> latent,
                                         std::uint32_t h, std::uint32_t w,
                                         const backend::Ops& op) const {
-    // 128 is a 1024 px image; larger latents make the mid attention
-    // (one head over h * w tokens) and the activations unreasonable.
-    if (h == 0 || w == 0 || h > kMaxLatent || w > kMaxLatent ||
-        latent.size() != std::size_t{latent_} * h * w) {
+    // 128^2 positions is a 1024^2 px image; larger latents make the mid
+    // attention (one head over h * w tokens) and the activations
+    // unreasonable.
+    if (!latent_fits(h, w) || latent.size() != std::size_t{latent_} * h * w) {
         throw std::invalid_argument("vae: latent is not C x h x w");
     }
     const Run r{*this, op};

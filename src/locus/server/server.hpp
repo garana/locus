@@ -157,7 +157,7 @@ class OpenAiServer {
         kHealth, kModels, kModelById, kMetrics,
         kCompletions, kChat, kMessages, kResponses, kEmbeddings,
         kAudioSpeech,
-        kImages, kUnknown
+        kImages, kImageEdits, kUnknown
     };
     /** Classifies a request. GET and HEAD both match the GET routes;
      * /v1/models/{id} matches by prefix (the regex route retired). */
