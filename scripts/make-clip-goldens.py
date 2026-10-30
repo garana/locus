@@ -54,6 +54,7 @@ PROMPTS = [
     "bell\x07 and \x1b[31mred\x1b[0m escapes",
     "ΟΔΟΣ ΣΟΦΟΣ and ΣΑ",
     "wow!<|endoftext|>after and a￣macron",
+    "x <|EndOfText|> y",
     ("a very long prompt " * 20).strip(),
 ]
 

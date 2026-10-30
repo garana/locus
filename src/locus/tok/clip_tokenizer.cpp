@@ -235,6 +235,16 @@ std::vector<std::uint32_t> ftfy_subset(std::string_view text) {
     return clean;
 }
 
+/** @returns Whether cps from i spell s (ASCII). */
+bool starts_with(const std::vector<std::uint32_t>& cps, std::size_t i,
+                 std::string_view s) {
+    if (i + s.size() > cps.size()) return false;
+    for (std::size_t k = 0; k < s.size(); ++k) {
+        if (cps[i + k] != static_cast<unsigned char>(s[k])) return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 ClipTokenizer ClipTokenizer::from_gguf(const gguf::GgufFile& g) {
@@ -394,8 +404,19 @@ void ClipTokenizer::tokenize_piece(std::string_view text,
             ++i;
             continue;
         }
-        // The regex's alternatives, in its order (the special tokens are
-        // already split out).
+        // The regex's alternatives, in its order. Its special-token
+        // alternative still matters after the split: the split is
+        // case-sensitive, so "<|EndOfText|>" stays in the text, lowers
+        // to "<|endoftext|>" and matches here, as in the reference.
+        std::string_view special;
+        if (starts_with(cps, i, kStart)) special = kStart;
+        if (starts_with(cps, i, kEnd)) special = kEnd;
+        if (!special.empty()) {
+            const auto it = vocab_.find(std::string(special));
+            out.push_back(it != vocab_.end() ? it->second : unk_);
+            i += special.size();
+            continue;
+        }
         if (cps[i] == '\'' && i + 1 < n) {
             const std::uint32_t c1 = cps[i + 1];
             const std::uint32_t c2 = i + 2 < n ? cps[i + 2] : 0;
