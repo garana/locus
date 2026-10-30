@@ -59,6 +59,14 @@ class FluxPipeline {
      */
     static std::unique_ptr<FluxPipeline> load_dir(const std::string& dir);
 
+    /**
+     * Checks a request's size and fields; generate runs it before it
+     * draws the noise, so a bad size allocates nothing.
+     *
+     * @throws std::invalid_argument naming the bad field.
+     */
+    static void validate(const Request& req);
+
     /** @returns The default step count: 4 without a guidance embedding
      *  (schnell), else 28. */
     std::uint32_t default_steps() const {

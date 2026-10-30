@@ -23,6 +23,23 @@ constexpr std::uint32_t kLatentCh = 16;
 
 }  // namespace
 
+void FluxPipeline::validate(const Request& req) {
+    // The VAE decodes latents up to kMaxLatent (128) a side: 1024 px.
+    constexpr std::uint32_t kMax = SdVaeDecoder::kMaxLatent * 8;
+    if (req.width < 16 || req.height < 16 || req.width > kMax ||
+        req.height > kMax || req.width % 16 != 0 || req.height % 16 != 0) {
+        throw std::invalid_argument(
+            "width and height must be multiples of 16 from 16 to 1024");
+    }
+    if (req.steps > 1000) throw std::invalid_argument("steps must be <= 1000");
+    if (req.max_sequence_length == 0 || req.max_sequence_length > 512) {
+        throw std::invalid_argument("max_sequence_length must be 1 to 512");
+    }
+    if (!std::isfinite(req.guidance) || req.guidance < 0.0f) {
+        throw std::invalid_argument("guidance must be finite and >= 0");
+    }
+}
+
 std::unique_ptr<FluxPipeline> FluxPipeline::load_dir(const std::string& dir) {
     namespace fs = std::filesystem;
     std::vector<fs::path> paths;
@@ -100,20 +117,7 @@ std::vector<tok::TokenId> FluxPipeline::t5_ids(
 std::vector<float> FluxPipeline::generate_from(
     std::span<const float> latent, const Request& req, const backend::Ops& op,
     const std::function<bool()>& alive, Timing* timing) const {
-    // The VAE decodes latents up to kMaxLatent (128) a side: 1024 px.
-    constexpr std::uint32_t kMax = SdVaeDecoder::kMaxLatent * 8;
-    if (req.width < 16 || req.height < 16 || req.width > kMax ||
-        req.height > kMax || req.width % 16 != 0 || req.height % 16 != 0) {
-        throw std::invalid_argument(
-            "width and height must be multiples of 16 from 16 to 1024");
-    }
-    if (req.steps > 1000) throw std::invalid_argument("steps must be <= 1000");
-    if (req.max_sequence_length == 0 || req.max_sequence_length > 512) {
-        throw std::invalid_argument("max_sequence_length must be 1 to 512");
-    }
-    if (!std::isfinite(req.guidance) || req.guidance < 0.0f) {
-        throw std::invalid_argument("guidance must be finite and >= 0");
-    }
+    validate(req);
     const std::uint32_t h = req.height / 8, w = req.width / 8;
     if (latent.size() != std::size_t{kLatentCh} * h * w) {
         throw std::invalid_argument("flux: latent is not 16 x h/8 x w/8");
@@ -152,6 +156,7 @@ std::vector<float> FluxPipeline::generate_from(
 std::vector<std::uint8_t> FluxPipeline::generate(
     const Request& req, const backend::Ops& op,
     const std::function<bool()>& alive, Timing* timing) const {
+    validate(req);  // before the noise: a bad size costs nothing
     const std::size_t n =
         std::size_t{kLatentCh} * (req.height / 8) * (req.width / 8);
     const auto latent = PixArtPipeline::normal_latent(req.seed, n);

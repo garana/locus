@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -50,6 +51,31 @@ TEST_CASE("flux pipeline needs all four parts", "[flux][image]") {
     REQUIRE_THROWS_AS(FluxPipeline::load_dir(tmp.string()),
                       locus::gguf::Error);
     std::filesystem::remove_all(tmp);
+}
+
+TEST_CASE("flux pipeline validates a request", "[flux][image]") {
+    FluxPipeline::Request r;
+    r.width = r.height = 256;
+    REQUIRE_NOTHROW(FluxPipeline::validate(r));
+    for (const auto& [w, h] : {std::pair<std::uint32_t, std::uint32_t>{
+                                   9999, 9999},
+                               {0, 16},
+                               {17, 16},
+                               {2048, 1024},
+                               {1024, 1040}}) {
+        INFO(w << " x " << h);
+        r.width = w;
+        r.height = h;
+        REQUIRE_THROWS_AS(FluxPipeline::validate(r), std::invalid_argument);
+    }
+    r.width = r.height = 256;
+    r.max_sequence_length = 513;
+    REQUIRE_THROWS_AS(FluxPipeline::validate(r), std::invalid_argument);
+    r.max_sequence_length = 512;
+    r.guidance = -1.0f;
+    REQUIRE_THROWS_AS(FluxPipeline::validate(r), std::invalid_argument);
+    r.guidance = std::nanf("");
+    REQUIRE_THROWS_AS(FluxPipeline::validate(r), std::invalid_argument);
 }
 
 // FLUX.1 Kontext dev as plain text to image, 128 x 128 in 2 steps from
