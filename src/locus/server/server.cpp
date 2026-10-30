@@ -736,22 +736,33 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         }
     }
     // A broken image pipeline directory stops the server here too. A
-    // flux GGUF in it makes it a FLUX.1 pipeline, else PixArt.
+    // flux or clip_text GGUF (parts only FLUX.1 has) makes it a FLUX.1
+    // pipeline, so a FLUX set missing a part names the FLUX parts; else
+    // PixArt, whose error names both sets.
     if (!opt_.image_model_dir.empty()) {
         bool flux = false;
         std::error_code ec;
         for (const auto& e : std::filesystem::directory_iterator(
                  opt_.image_model_dir, ec)) {
-            if (e.is_regular_file() && e.path().extension() == ".gguf" &&
-                gguf::GgufFile::open(e.path().string())
-                        .get_string("general.architecture") == "flux") {
-                flux = true;
+            if (!e.is_regular_file() || e.path().extension() != ".gguf") {
+                continue;
             }
+            // arch views into g, so g must outlive the comparison.
+            const auto g = gguf::GgufFile::open(e.path().string());
+            const auto arch = g.get_string("general.architecture");
+            if (arch == "flux" || arch == "clip_text") flux = true;
         }
         if (flux) {
             flux_ = image::FluxPipeline::load_dir(opt_.image_model_dir);
         } else {
-            pixart_ = image::PixArtPipeline::load_dir(opt_.image_model_dir);
+            try {
+                pixart_ =
+                    image::PixArtPipeline::load_dir(opt_.image_model_dir);
+            } catch (const gguf::Error& e) {
+                throw gguf::Error(std::string(e.what()) +
+                                  " (or, for FLUX.1, a flux, a clip_text, a "
+                                  "t5encoder and an autoencoder_kl GGUF)");
+            }
         }
     }
     // Image input (i#241): on when the model's GGUF carries the Janus
