@@ -50,6 +50,7 @@ add_library(locus
     src/locus/image/sd_vae.cpp
     src/locus/image/pixart_pipeline.cpp
     src/locus/image/t5_encoder.cpp
+    src/locus/image/clip_text.cpp
     src/locus/image/ltxv_dit.cpp
     src/locus/image/ltxv_vae.cpp
     src/locus/image/ltxv_pipeline.cpp
@@ -89,8 +90,10 @@ add_library(locus
     src/locus/sys/perf_counters.cpp
     src/locus/sys/histogram.cpp
     src/locus/tok/bpe_tokenizer.cpp
+    src/locus/tok/clip_tokenizer.cpp
     src/locus/tok/tokenizer.cpp
     src/locus/tok/ugm_tokenizer.cpp
+    src/locus/tok/unicode.cpp
 )
 target_include_directories(locus SYSTEM PRIVATE
     third_party/ggml
