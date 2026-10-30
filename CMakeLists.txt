@@ -52,6 +52,7 @@ add_library(locus
     src/locus/image/t5_encoder.cpp
     src/locus/image/clip_text.cpp
     src/locus/image/flux_dit.cpp
+    src/locus/image/flux_sampler.cpp
     src/locus/image/ltxv_dit.cpp
     src/locus/image/ltxv_vae.cpp
     src/locus/image/ltxv_pipeline.cpp

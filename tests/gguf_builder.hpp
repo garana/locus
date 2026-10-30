@@ -57,6 +57,12 @@ class GgufBuilder {
         return f32(val);
     }
 
+    GgufBuilder& kv_f64(std::string_view key, double val) {
+        str(key);
+        u32(12);  // ValueType::kFloat64
+        return raw(&val, 8);
+    }
+
     /** Array-of-f32 metadata entry. */
     GgufBuilder& kv_f32_array(std::string_view key,
                               std::span<const float> vals) {
