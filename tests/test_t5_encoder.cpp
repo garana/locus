@@ -60,9 +60,12 @@ std::vector<Tensor> synth_tensors() {
  *
  * @param heads, head_dim The values written to the keys (the tensors
  *     keep the script's shapes).
+ * @param bf16 Every tensor as BF16 (rounded to nearest even), like
+ *     FLUX's T5 converted, instead of F32.
  */
 std::vector<std::byte> synth_t5(std::uint32_t heads = kHeads,
-                                std::uint32_t head_dim = kHeadDim) {
+                                std::uint32_t head_dim = kHeadDim,
+                                bool bf16 = false) {
     const auto tensors = synth_tensors();
     std::vector<std::vector<float>> data;
     std::uint32_t lcg = 146;
@@ -88,15 +91,27 @@ std::vector<std::byte> synth_t5(std::uint32_t heads = kHeads,
     g.kv_u32("t5encoder.attention.relative_max_distance", kMaxDist);
     g.kv_f32("t5encoder.attention.layer_norm_rms_epsilon", 1e-6f);
     std::uint64_t offset = 0;
+    const std::size_t elem = bf16 ? 2 : 4;
     for (std::size_t i = 0; i < tensors.size(); ++i) {
         const auto& s = tensors[i].shape;
         const std::vector<std::uint64_t> dims(s.rbegin(), s.rend());
-        g.tensor(tensors[i].name, dims, 0 /* F32 */, offset);
-        offset = (offset + data[i].size() * 4 + 31) & ~31ull;
+        g.tensor(tensors[i].name, dims, bf16 ? 30 /* BF16 */ : 0 /* F32 */,
+                 offset);
+        offset = (offset + data[i].size() * elem + 31) & ~31ull;
     }
     g.pad();
     for (const auto& v : data) {
-        for (float x : v) g.f32(x);
+        for (float x : v) {
+            if (!bf16) {
+                g.f32(x);
+                continue;
+            }
+            std::uint32_t u;
+            std::memcpy(&u, &x, 4);
+            u += 0x7fffu + ((u >> 16) & 1u);  // round to nearest even
+            g.u8(static_cast<std::uint8_t>((u >> 16) & 0xff));
+            g.u8(static_cast<std::uint8_t>(u >> 24));
+        }
         while (g.bytes().size() % 32 != 0) g.zeros(1);
     }
     auto span = g.bytes();
@@ -183,6 +198,29 @@ TEST_CASE("t5 encoder matches torch on a synthetic model", "[t5][image]") {
     const std::vector<TokenId> bad{static_cast<TokenId>(kVocab)};
     REQUIRE_THROWS_AS(enc.encode(bad, op), std::invalid_argument);
     REQUIRE_THROWS_AS(enc.encode({}, op), std::invalid_argument);
+}
+
+// FLUX's T5 converts to BF16 (the norms and the relative bias as F32 in
+// the converter, here all BF16 to cover the loader's widening too): the
+// same model with BF16-rounded weights stays within the rounding of the
+// F32 golden.
+TEST_CASE("t5 encoder reads BF16 weights", "[t5][image]") {
+    const auto img = synth_t5(kHeads, kHeadDim, true);
+    auto g = locus::gguf::GgufFile::parse(img);
+    const auto enc = T5Encoder::load(g);
+    std::vector<TokenId> ids;
+    for (std::uint32_t i = 0; i + 1 < kTokens; ++i) {
+        ids.push_back(static_cast<TokenId>((i * 7 + 3) % kVocab));
+    }
+    ids.push_back(1);
+    const auto got = enc.encode(ids, locus::backend::best_backend().ops);
+    const auto ref = read_f32(kDir + "golden/t5_synth.f32");
+    REQUIRE(got.size() == ref.size());
+    for (std::uint32_t t = 0; t < kTokens; ++t) {
+        INFO("token " << t);
+        REQUIRE(row_error(&got[std::size_t{t} * kWidth],
+                          &ref[std::size_t{t} * kWidth], kWidth) <= 5e-2);
+    }
 }
 
 // heads x head_dim = 2^32 wraps to 0 in 32 bits; the loader must refuse

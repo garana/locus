@@ -3,7 +3,10 @@
 SentencePiece tokenizer to a "t5encoder" GGUF (i#308), with llama.cpp's
 names and keys, so llama.cpp's T5 encoder GGUFs load the same way.
 
-- Tensors keep the checkpoint dtype (F16 for PixArt's text_encoder):
+- Tensors keep the checkpoint dtype (F16 for PixArt's text_encoder, BF16
+  for FLUX's text_encoder_2), except that the BF16 tensors the encoder
+  reads as vectors (the norms, and the 2D relative attention bias)
+  become F32:
   shared.weight -> token_embd.weight; per block N
   layer.0.SelfAttention.{q,k,v,o} -> enc.blk.N.attn_{q,k,v,o},
   layer.0.SelfAttention.relative_attention_bias (block 0 only) ->
@@ -21,26 +24,51 @@ names and keys, so llama.cpp's T5 encoder GGUFs load the same way.
 1 MB), for tokenizer tests.
 
 Tested with Python 3.12, gguf 0.19.0, sentencepiece 0.2.0, protobuf
-and safetensors, on PixArt-alpha/PixArt-XL-2-512x512 at 50f7021:
+and numpy, on PixArt-alpha/PixArt-XL-2-512x512 at 50f7021 and
+black-forest-labs/FLUX.1-Kontext-dev at 24e9ded:
 
     python3 -I scripts/convert-t5-encoder.py --model DIR/text_encoder \\
         --tokenizer DIR/tokenizer --variant fp16 --out t5-xxl-enc.gguf
+    python3 -I scripts/convert-t5-encoder.py \\
+        --model DIR/text_encoder_2 --tokenizer DIR/tokenizer_2 \\
+        --out t5-xxl-enc-bf16.gguf
 """
 
 import argparse
 import json
 import pathlib
+import struct
 import sys
 
 import gguf
 import numpy as np
-from safetensors.numpy import load_file
 from sentencepiece import sentencepiece_model_pb2 as spb
 
 # SentencePiece piece types -> GGUF token types.
 SP_TYPES = {1: gguf.TokenType.NORMAL, 2: gguf.TokenType.UNKNOWN,
             3: gguf.TokenType.CONTROL, 4: gguf.TokenType.USER_DEFINED,
             5: gguf.TokenType.UNUSED, 6: gguf.TokenType.BYTE}
+
+
+def load_shard(path):
+    """@returns [(name, array)] of a safetensors file: BF16 as uint16
+    bits, F16 and F32 as floats. safetensors.numpy cannot load BF16, so
+    this reads the header and tensor bytes itself."""
+    with open(path, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        hdr = json.loads(f.read(n))
+    hdr.pop("__metadata__", None)
+    mm = np.memmap(path, dtype=np.uint8, mode="r")
+    out = []
+    for name, t in hdr.items():
+        b0, b1 = t["data_offsets"]
+        dt = {"BF16": np.uint16, "F16": np.float16,
+              "F32": np.float32}.get(t["dtype"])
+        if dt is None:
+            sys.exit("%s: unsupported dtype %s" % (name, t["dtype"]))
+        raw = mm[8 + n + b0:8 + n + b1]
+        out.append((name, raw.view(dt).reshape(t["shape"] or [1])))
+    return out
 
 
 def tensor_name(name):
@@ -100,7 +128,6 @@ def main():
     w.add_value_length(cfg["d_kv"])
     w.add_layer_norm_rms_eps(cfg["layer_norm_epsilon"])
     w.add_relative_attn_buckets_count(cfg["relative_attention_num_buckets"])
-    w.add_file_type(gguf.LlamaFileType.MOSTLY_F16)
 
     tdir = pathlib.Path(a.tokenizer)
     sp = spb.ModelProto()
@@ -138,6 +165,7 @@ def main():
     w.add_add_bos_token(False)
     w.add_add_eos_token(True)
 
+    bf16 = False
     if not a.vocab_only:
         suffix = ("." + a.variant) if a.variant else ""
         shards = sorted(mdir.glob("model%s*.safetensors" % suffix))
@@ -145,15 +173,27 @@ def main():
             sys.exit("no model%s*.safetensors in %s" % (suffix, mdir))
         seen = 0
         for shard in shards:
-            for name, t in load_file(str(shard)).items():
+            for name, t in load_shard(shard):
                 gname = tensor_name(name)
                 if gname is None:
                     continue
-                w.add_tensor(gname, t)
+                # attn_rel_b is 2D but the encoder reads it as a vector.
+                if t.dtype == np.uint16 and t.ndim == 2 and \
+                        not gname.endswith("attn_rel_b.weight"):
+                    w.add_tensor(gname, np.ascontiguousarray(t),
+                                 raw_dtype=gguf.GGMLQuantizationType.BF16)
+                    bf16 = True
+                elif t.dtype == np.uint16:
+                    w.add_tensor(gname, (t.astype(np.uint32) << 16)
+                                 .view(np.float32))
+                else:
+                    w.add_tensor(gname, np.ascontiguousarray(t))
                 seen += 1
         want = 2 + 9 * cfg["num_layers"] + 1
         if seen != want:
             sys.exit("wrote %d tensors, expected %d" % (seen, want))
+    w.add_file_type(gguf.LlamaFileType.MOSTLY_BF16 if bf16
+                    else gguf.LlamaFileType.MOSTLY_F16)
 
     w.write_header_to_file()
     w.write_kv_data_to_file()
