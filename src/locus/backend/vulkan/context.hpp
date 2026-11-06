@@ -268,6 +268,9 @@ class VulkanContext {
      */
     bool serial_dispatch() const;
 
+    /** @returns true when the driver is MoltenVK (Vulkan on Metal). */
+    bool moltenvk() const;
+
     /**
      * Whether the device does f16 shader arithmetic (shaderFloat16,
      * enabled at device creation): the kernels that need it

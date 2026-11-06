@@ -785,6 +785,8 @@ struct VulkanContext::Impl {
      * compute-to-compute barrier.
      */
     bool serial_dispatch = false;
+    /** The driver is MoltenVK (VK_DRIVER_ID_MOLTENVK). */
+    bool moltenvk = false;
     /** shaderFloat16 supported and enabled (f16 kernels built). */
     bool has_f16 = false;
     /** Bytes currently allocated through make_buffer. */
@@ -999,9 +1001,9 @@ struct VulkanContext::Impl {
                 // before the next starts. A pipeline barrier there
                 // only splits the encoder (~19 us each on an M4 Max),
                 // so skip them; LOCUS_VK_BARRIERS=1 keeps them.
+                moltenvk = dp.driverID == VK_DRIVER_ID_MOLTENVK;
                 serial_dispatch =
-                    dp.driverID == VK_DRIVER_ID_MOLTENVK &&
-                    std::getenv("LOCUS_VK_BARRIERS") == nullptr;
+                    moltenvk && std::getenv("LOCUS_VK_BARRIERS") == nullptr;
             }
         }
         dci.enabledExtensionCount =
@@ -1657,6 +1659,8 @@ void VulkanContext::abandon_batch() {
     }
 }
 
+bool VulkanContext::moltenvk() const { return impl_->moltenvk; }
+
 bool VulkanContext::serial_dispatch() const {
     return impl_->serial_dispatch;
 }
@@ -1806,6 +1810,7 @@ VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
     no_kernels();
 }
 bool VulkanContext::host_import() const { no_kernels(); }
+bool VulkanContext::moltenvk() const { no_kernels(); }
 bool VulkanContext::timestamps() const { no_kernels(); }
 void VulkanContext::destroy_buffer(Buffer) { no_kernels(); }
 void VulkanContext::write_buffer(Buffer,

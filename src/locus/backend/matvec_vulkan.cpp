@@ -26,6 +26,7 @@
 #include "locus/backend/vulkan/weight_pool.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/backend/vulkan_seq.hpp"
+#include "locus/model/expert_metrics.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/sys/mmap_file.hpp"
 
@@ -1713,6 +1714,15 @@ std::string vulkan_device_name() {
     return state().ctx.device_name();
 }
 
+const char* vulkan_api_name() {
+    static const char* const name = [] {
+        if (!vulkan_backend_usable()) return "vulkan";
+        std::lock_guard lk(state_mu());
+        return state().ctx.moltenvk() ? "moltenvk" : "vulkan";
+    }();
+    return name;
+}
+
 namespace {
 
 /**
@@ -2655,6 +2665,10 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     model::MoeStats::record(l, e, hp.n_layers,
                                             hp.n_expert);
                 }
+            }
+            for (const auto& [e, wgt] : picked) {
+                model::ExpertCalls::record(l, e, hp.n_layers, hp.n_expert,
+                                           true, vulkan_api_name());
             }
             s.ctx.begin_batch();
             // Upload only the ROUTED experts, each to its own
