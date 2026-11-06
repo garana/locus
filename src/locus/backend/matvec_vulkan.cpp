@@ -1691,8 +1691,16 @@ void conv2d_vulkan(std::span<const float> in, std::uint32_t in_ch,
     const std::uint32_t push[] = {in_ch, in_h,   in_w,   out_ch,
                                   oh,    ow,     kh,     kw,
                                   stride, pad,   groups, bias.empty() ? 0u : 1u};
-    // x tiles one output plane in 64s; y is the output channel.
-    s.ctx.dispatch(Kernel::kConv2d, bufs, push, (oh * ow + 63) / 64, out_ch);
+    if (groups == 1) {
+        // Implicit GEMM: x tiles the output plane in 64 pixels, y the
+        // output channels in 128.
+        s.ctx.dispatch(Kernel::kConv2dGemm, bufs, push, (oh * ow + 63) / 64,
+                       (out_ch + 127) / 128);
+    } else {
+        // x tiles one output plane in 64s; y is the output channel.
+        s.ctx.dispatch(Kernel::kConv2d, bufs, push, (oh * ow + 63) / 64,
+                       out_ch);
+    }
     s.end_batch();
     s.ctx.read_buffer(s.conv_out, std::as_writable_bytes(out));
 }

@@ -146,6 +146,8 @@ enum class Kernel {
     /** The Janus tower's exact GELU and affine LayerNorm. */
     kGeluErf,
     kLayerNorm,
+    /** conv2d as a tiled implicit GEMM (groups == 1). */
+    kConv2dGemm,
     kCount_,
 };
 

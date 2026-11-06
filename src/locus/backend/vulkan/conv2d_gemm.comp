@@ -1,0 +1,138 @@
+#version 450
+
+// 2D convolution (F32, groups == 1) as an implicit GEMM: out[oc][p] =
+// bias[oc] + sum_k W[oc][k] * X[k][p], where k runs over (ci, ky, kx)
+// in the weight's row order and X[k][p] is the input sample that tap k
+// sees at output pixel p (zero outside the padded input). X is never
+// built: each K step gathers its BK x BN tile straight from the input
+// planes. Same tiling as matmul.comp: one workgroup computes a BM x BN
+// tile (output channels x output pixels); each thread accumulates a
+// TM x TN register block from shared-memory stages.
+//
+// The sum runs in K order within BK steps, not conv2d.comp's tap order
+// with its skipped padding taps, so results differ from it (and from
+// cpu_ops conv2d) by f32 rounding.
+//
+// Grid: x tiles the output plane in BN pixels, y the output channels
+// in BM.
+
+#define TM 8u
+#define TN 4u
+// BK 16 keeps the stage at 12 KiB, under every device's guaranteed
+// 16 KiB of shared memory.
+#define BK 16u
+#define BM (16u * TM)
+#define BN (16u * TN)
+// Weight values each thread stages per K step.
+#define VPT (BM * BK / 256u)
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer I { float inp[]; };
+layout(std430, binding = 1) readonly buffer W { float wt[]; };
+layout(std430, binding = 2) readonly buffer B { float bias[]; };
+layout(std430, binding = 3) writeonly buffer O { float outp[]; };
+
+layout(push_constant) uniform PC {
+    uint in_ch;
+    uint in_h;
+    uint in_w;
+    uint out_ch;
+    uint out_h;
+    uint out_w;
+    uint kh;
+    uint kw;
+    uint stride;
+    uint pad;
+    uint groups;  // 1 (grouped convs use conv2d.comp)
+    uint has_bias;
+} pc;
+
+shared vec4 ws[BK][BM / 4u];
+shared vec4 xs[BK][BN / 4u];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint plane_out = pc.out_h * pc.out_w;
+    uint plane_in = pc.in_h * pc.in_w;
+    uint taps = pc.kh * pc.kw;
+    uint cols = pc.in_ch * taps;
+    uint p0 = gl_WorkGroupID.x * BN;
+    uint r0 = gl_WorkGroupID.y * BM;
+
+    // Compute layout: thread (tx, ty) owns channels ty * TM .. + TM and
+    // pixels tx * TN .. + TN of the tile.
+    uint tx = tid % 16u;
+    uint ty = tid / 16u;
+    vec4 acc[TM][TN / 4u];
+    for (uint i = 0u; i < TM; ++i) {
+        for (uint j = 0u; j < TN / 4u; ++j) {
+            acc[i][j] = vec4(0.0);
+        }
+    }
+
+    // Weight loader: BK / VPT threads per row, VPT values each.
+    uint lr = tid / (BK / VPT);
+    uint sub = tid % (BK / VPT);
+    uint r = r0 + lr;
+    // Input loader: thread tid stages pixel tid % BN of the tile for
+    // columns tid / BN, + 256 / BN, ...; the pixel's origin is fixed.
+    uint lp = tid % BN;
+    uint p = p0 + lp;
+    bool p_in = p < plane_out;
+    int by = int(p_in ? p / pc.out_w : 0u) * int(pc.stride) - int(pc.pad);
+    int bx = int(p_in ? p % pc.out_w : 0u) * int(pc.stride) - int(pc.pad);
+    for (uint k0 = 0u; k0 < cols; k0 += BK) {
+        for (uint c = sub * VPT; c < sub * VPT + VPT; ++c) {
+            uint kc = k0 + c;
+            ws[c][lr / 4u][lr % 4u] =
+                (r < pc.out_ch && kc < cols) ? wt[r * cols + kc] : 0.0;
+        }
+        for (uint c = tid / BN; c < BK; c += 256u / BN) {
+            uint kc = k0 + c;
+            float v = 0.0;
+            if (p_in && kc < cols) {
+                uint ci = kc / taps;
+                uint t = kc % taps;
+                int iy = by + int(t / pc.kw);
+                int ix = bx + int(t % pc.kw);
+                if (iy >= 0 && iy < int(pc.in_h) && ix >= 0 &&
+                    ix < int(pc.in_w)) {
+                    v = inp[ci * plane_in + uint(iy) * pc.in_w + uint(ix)];
+                }
+            }
+            xs[c][lp / 4u][lp % 4u] = v;
+        }
+        barrier();
+        for (uint k = 0u; k < BK; ++k) {
+            vec4 a[TM / 4u];
+            vec4 bv[TN / 4u];
+            for (uint i = 0u; i < TM / 4u; ++i) {
+                a[i] = ws[k][ty * (TM / 4u) + i];
+            }
+            for (uint j = 0u; j < TN / 4u; ++j) {
+                bv[j] = xs[k][tx * (TN / 4u) + j];
+            }
+            for (uint i = 0u; i < TM; ++i) {
+                for (uint j = 0u; j < TN / 4u; ++j) {
+                    acc[i][j] += a[i / 4u][i % 4u] * bv[j];
+                }
+            }
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < TM; ++i) {
+        uint oc = r0 + ty * TM + i;
+        if (oc >= pc.out_ch) {
+            continue;
+        }
+        float b = pc.has_bias != 0u ? bias[oc] : 0.0;
+        for (uint j = 0u; j < TN; ++j) {
+            uint q = p0 + tx * TN + j;
+            if (q < plane_out) {
+                outp[oc * plane_out + q] = acc[i][j / 4u][j % 4u] + b;
+            }
+        }
+    }
+}
