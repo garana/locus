@@ -99,6 +99,14 @@ class VulkanSeq {
                    std::uint32_t heads, std::uint32_t hd, Slot kh, Slot vt,
                    Slot scores);
 
+    /**
+     * attention() with n_q queries over n_kv keys and values (for
+     * example image rows onto text rows); out has n_q rows.
+     */
+    void cross_attention(Rows q, std::uint32_t n_q, Rows k, Rows v,
+                         std::uint32_t n_kv, Rows out, std::uint32_t heads,
+                         std::uint32_t hd, Slot kh, Slot vt, Slot scores);
+
     /** torch's tanh GELU in place on n rows of width d. */
     void gelu_tanh(Rows x, std::uint32_t n, std::uint32_t d);
 
