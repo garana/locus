@@ -1,6 +1,6 @@
-// The Vulkan conv1d / conv1d_transpose / snake1d / conv2d shaders
-// against the CPU scalar reference (cpu_ops), the oracle for every
-// backend.
+// The Vulkan conv1d / conv1d_transpose / snake1d / conv2d (direct and
+// implicit GEMM) shaders against the CPU scalar reference (cpu_ops),
+// the oracle for every backend.
 
 #include <bit>
 #include <cstdint>
@@ -235,6 +235,68 @@ TEST_CASE("vulkan conv2d matches the CPU reference", "[vulkan][conv2d]") {
             // x tiles one output plane in 64s; y is the out channel.
             ctx.dispatch(Kernel::kConv2d, bufs, push, (oh * ow + 63) / 64,
                          c.out_ch);
+            ctx.end_batch();
+            auto got = download(ctx, ob, want.size());
+            for (std::size_t i = 0; i < want.size(); ++i) {
+                INFO("element " << i);
+                REQUIRE(got[i] == Catch::Approx(want[i]).margin(1e-4));
+            }
+            for (auto b : {ib, wb, bb, ob}) ctx.destroy_buffer(b);
+        }
+    }
+}
+
+// conv2d_gemm.comp (the groups == 1 path) against the scalar
+// reference: a K that is not a multiple of the 16-column step, more
+// than one 128-channel tile, partial pixel tiles, stride 2, no bias.
+TEST_CASE("vulkan conv2d_gemm matches the CPU reference",
+          "[vulkan][conv2d]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(94);
+
+    struct Case {
+        const char* name;
+        std::uint32_t in_ch, in_h, in_w, out_ch, k, stride, pad, has_bias;
+    };
+    const Case cases[] = {
+        {"3x3 same", 5, 17, 23, 12, 3, 1, 1, 1},
+        {"1x1", 70, 9, 11, 5, 1, 1, 0, 1},
+        {"two channel tiles", 16, 10, 14, 200, 3, 1, 1, 1},
+        {"stride 2 no bias", 4, 11, 13, 6, 3, 2, 1, 0},
+        {"one in channel", 1, 40, 40, 3, 3, 1, 1, 1},
+    };
+    for (const auto& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            const std::uint32_t oh = locus::backend::conv1d_out_len(
+                c.in_h, c.k, c.stride, 1, c.pad);
+            const std::uint32_t ow = locus::backend::conv1d_out_len(
+                c.in_w, c.k, c.stride, 1, c.pad);
+            auto in = randvec(std::size_t{c.in_ch} * c.in_h * c.in_w, rng);
+            auto w = randvec(std::size_t{c.out_ch} * c.in_ch * c.k * c.k,
+                             rng);
+            auto bias = randvec(c.out_ch, rng);
+            std::vector<float> want(std::size_t{c.out_ch} * oh * ow);
+            locus::backend::conv2d(
+                in, c.in_ch, c.in_h, c.in_w, w, c.out_ch, c.k, c.k,
+                c.has_bias ? std::span<const float>(bias)
+                           : std::span<const float>{},
+                c.stride, c.pad, 1, want);
+            auto ib = upload(ctx, in), wb = upload(ctx, w),
+                 bb = upload(ctx, bias);
+            auto ob = upload(ctx, std::vector<float>(want.size(), 0.0f));
+            ctx.begin_batch();
+            const VulkanContext::Buffer bufs[] = {ib, wb, bb, ob};
+            const std::uint32_t push[] = {c.in_ch,  c.in_h, c.in_w,
+                                          c.out_ch, oh,     ow,
+                                          c.k,      c.k,    c.stride,
+                                          c.pad,    1,      c.has_bias};
+            // x tiles the output plane in 64 pixels, y the output
+            // channels in 128.
+            ctx.dispatch(Kernel::kConv2dGemm, bufs, push,
+                         (oh * ow + 63) / 64, (c.out_ch + 127) / 128);
             ctx.end_batch();
             auto got = download(ctx, ob, want.size());
             for (std::size_t i = 0; i < want.size(); ++i) {
