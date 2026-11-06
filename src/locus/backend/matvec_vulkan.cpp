@@ -1602,6 +1602,8 @@ const Ops& vulkan_image_ops() {
                          .self_parallel = true,
                          .alloc_kv = nullptr,
                          .prefetch = nullptr,
+                         .evict = nullptr,
+                         .pool_budget = nullptr,
                          .mt_safe = false};
     return ops;
 }

@@ -24,6 +24,10 @@ void matvec_cuda_q8k(const Mat& w, std::span<const float> x,
 
 void cuda_prefetch(const Mat&) {}
 
+void cuda_evict(const Mat&) {}
+
+std::size_t cuda_pool_budget() { return 0; }
+
 void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n) {
     matvec_batch_scalar(w, x_batch, out_batch, n);
