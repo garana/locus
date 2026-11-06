@@ -498,11 +498,20 @@ guarding the default path.
   `locus_gpu_device_seconds_total` (GPU timestamps on a random 1 in 16
   Vulkan batches, scaled by 16; every batch under `LOCUS_VK_PROFILE`;
   an estimate that needs many batches, so a short request may miss its
-  prefill), `locus_gpu_device_samples_total` (the batches timed) and
+  prefill), `locus_gpu_device_samples_total` (the batches timed),
+  `locus_gpu_device_stage_seconds_total{stage}` (Vulkan device time
+  per forward stage, the same stages as the host series, from a
+  timestamp at each stage's end on 1 timed batch in 4, scaled by 64;
+  `other` is device work outside a stage, such as the image and video
+  models; it tracks the device total over many batches),
+  `locus_gpu_device_stage_samples_total` and
   `locus_gpu_memory_bytes{kind}` (weights, mapped, kv, scratch, table;
   `mapped` is weights the device reads in place from the file map).
   Sampling matters on MoltenVK, where a timestamp splits the
-  compute encoder: on every batch it cost about 0.5% of decode speed.
+  compute encoder: on every batch it cost about 0.5% of decode speed,
+  and stage marks on every timed batch about 1.3%. A stage timestamp
+  there needs a barrier before it, or it does not wait for the
+  kernels before it and the time lands in the wrong stage.
   `locus_fallbacks_total{from,to,reason}` counts work a GPU path
   handed to a slower one: `to="per_op"` (Vulkan's whole-model forward
   declined, so the host steps each layer), `per_token` (batched

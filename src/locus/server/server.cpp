@@ -390,10 +390,40 @@ void render_gpu_metrics(MetricsText& mt) {
             [&](const backend::GpuMetrics& gm) {
                 return secs(gm.device_ns.load(kRelaxed));
             });
+    // Device time by forward stage (vulkan); "other" is the time outside
+    // a marked stage. Only stages with time are listed.
+    mt.family("locus_gpu_device_stage_seconds_total",
+              "Device time by forward stage, estimated from sampled "
+              "batches, fewer than the device time's (vulkan).",
+              "counter");
+    for (const GpuApi a : used) {
+        const backend::GpuMetrics& gm = backend::gpu_metrics(a);
+        for (int i = 0; i < static_cast<int>(model::Stage::kCount); ++i) {
+            const std::uint64_t ns = gm.stage_ns[i].load(kRelaxed);
+            if (ns == 0) continue;
+            mt.value("locus_gpu_device_stage_seconds_total",
+                     api(a) + "," +
+                         MetricsText::label(
+                             "stage",
+                             model::stage_name(static_cast<model::Stage>(i))),
+                     secs(ns));
+        }
+        const std::uint64_t rest = gm.unmarked_ns.load(kRelaxed);
+        if (rest != 0) {
+            mt.value("locus_gpu_device_stage_seconds_total",
+                     api(a) + "," + MetricsText::label("stage", "other"),
+                     secs(rest));
+        }
+    }
     counter("locus_gpu_device_samples_total",
             "Batches timed for the device time estimate (vulkan).",
             [&](const backend::GpuMetrics& gm) {
                 return static_cast<double>(gm.device_samples.load(kRelaxed));
+            });
+    counter("locus_gpu_device_stage_samples_total",
+            "Batches timed by stage for the device stage estimate (vulkan).",
+            [&](const backend::GpuMetrics& gm) {
+                return static_cast<double>(gm.stage_samples.load(kRelaxed));
             });
     mt.family("locus_gpu_memory_bytes",
               "Device memory this process holds, per kind.", "gauge");
