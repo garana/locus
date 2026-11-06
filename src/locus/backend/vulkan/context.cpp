@@ -713,12 +713,14 @@ struct VulkanContext::Impl {
     bool batch_is_open = false;
 
     /**
-     * LOCUS_VK_PROFILE state: a timestamp at batch begin, one after
-     * each dispatch (its kernel in ts_kernel), one at batch end.
+     * Timestamps of a timed batch: slot 0 at its begin, one per stage
+     * mark (mark_stage) and, under LOCUS_VK_PROFILE=2, one after each
+     * dispatch, then one at its end. ts_tag[i] names slot i + 1: a
+     * kernel (>= 0) or a stage mark (-1 - stage).
      */
     static constexpr std::uint32_t kMaxTs = 4096;
     Profile prof;
-    std::vector<int> ts_kernel;
+    std::vector<int> ts_tag;
     bool per_kernel = false;  // LOCUS_VK_PROFILE=2
     VkQueryPool qpool = VK_NULL_HANDLE;
     double ts_period_ns = 0.0;
@@ -742,13 +744,30 @@ struct VulkanContext::Impl {
     static constexpr std::uint32_t kTimeEvery = 16;
     std::uint32_t sample_rng = 0x9e3779b9u;
     bool batch_timed = false;  ///< the open batch carries timestamps
+    /** The timed batch also times its stages (mark_stage): 1 timed
+     *  batch in VulkanContext::kStageEvery, every one under
+     *  LOCUS_VK_PROFILE. */
+    bool batch_staged = false;
 
-    /** @returns true for about 1 call in kTimeEvery. */
-    bool sample_batch() {
+    /** Records a barrier: the next dispatch sees the writes of the
+     *  ones before it. */
+    void barrier() {
+        VkMemoryBarrier mb{};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(batch_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb,
+                             0, nullptr, 0, nullptr);
+    }
+
+    /** @returns true for about 1 call in `every`. */
+    bool sample_batch(std::uint32_t every = kTimeEvery) {
         sample_rng ^= sample_rng << 13;
         sample_rng ^= sample_rng >> 17;
         sample_rng ^= sample_rng << 5;
-        return sample_rng % kTimeEvery == 0;
+        return sample_rng % every == 0;
     }
     /** Dispatches recorded in the open batch (added to the metrics at
      *  end_batch, one atomic add per batch). */
@@ -1042,9 +1061,9 @@ struct VulkanContext::Impl {
 
         new_dpool();
 
-        // Two timestamps on a sampled batch (the device time metric;
-        // every batch under LOCUS_VK_PROFILE); LOCUS_VK_PROFILE=2 adds
-        // one per dispatch.
+        // Timestamps on a sampled batch (the device time metric; every
+        // batch under LOCUS_VK_PROFILE): its two ends and each stage
+        // mark; LOCUS_VK_PROFILE=2 adds one per dispatch.
         VkPhysicalDeviceProperties pp;
         vkGetPhysicalDeviceProperties(phys, &pp);
         if (VulkanContext::profiling() ||
@@ -1453,14 +1472,19 @@ void VulkanContext::begin_batch() {
     cbb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(im.batch_cmd, &cbb), "begin cmd");
     im.batch_t0 = std::chrono::steady_clock::now();
-    im.ts_kernel.clear();
+    im.ts_tag.clear();
     im.batch_timed =
         im.qpool != VK_NULL_HANDLE &&
         (VulkanContext::profiling() || im.sample_batch());
+    im.batch_staged =
+        im.batch_timed && (VulkanContext::profiling() ||
+                           im.sample_batch(VulkanContext::kStageEvery));
     if (im.batch_timed) {
-        // Only the per-kernel profile uses more than the two ends.
-        vkCmdResetQueryPool(im.batch_cmd, im.qpool, 0,
-                            im.per_kernel ? Impl::kMaxTs : 2);
+        // Only stage marks and the per-kernel profile use more than
+        // the two ends.
+        vkCmdResetQueryPool(
+            im.batch_cmd, im.qpool, 0,
+            im.per_kernel || im.batch_staged ? Impl::kMaxTs : 2);
         vkCmdWriteTimestamp(im.batch_cmd,
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                             im.qpool, 0);
@@ -1531,28 +1555,39 @@ void VulkanContext::dispatch(Kernel k,
     ++im.batch_dispatches;
     // Slot 0 is the batch start; keep the last slot for its end.
     if (im.per_kernel && im.batch_timed &&
-        im.ts_kernel.size() + 2 < Impl::kMaxTs) {
-        im.ts_kernel.push_back(static_cast<int>(k));
+        im.ts_tag.size() + 2 < Impl::kMaxTs) {
+        if (im.serial_dispatch) {
+            im.barrier();  // as in mark_stage
+        }
+        im.ts_tag.push_back(static_cast<int>(k));
         vkCmdWriteTimestamp(
             im.batch_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
             im.qpool,
-            static_cast<std::uint32_t>(im.ts_kernel.size()));
+            static_cast<std::uint32_t>(im.ts_tag.size()));
     }
 
     // Serialize consecutive dispatches (writes feed reads), unless
     // the driver already does (serial_dispatch).
-    if (im.serial_dispatch) {
+    if (!im.serial_dispatch) {
+        im.barrier();
+    }
+}
+
+void VulkanContext::mark_stage(std::uint32_t stage) {
+    Impl& im = *impl_;
+    if (!im.batch_staged || stage >= GpuMetrics::kStageSlots ||
+        im.ts_tag.size() + 2 >= Impl::kMaxTs) {
         return;
     }
-    VkMemoryBarrier mb{};
-    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask =
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(im.batch_cmd,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                         1, &mb, 0, nullptr, 0, nullptr);
+    // Without a barrier, MoltenVK's timestamp does not wait for the
+    // dispatches before it: a stage of 4 large kernels read 0.09 ms
+    // instead of about 140 ms. Other drivers already have one.
+    if (im.serial_dispatch) {
+        im.barrier();
+    }
+    im.ts_tag.push_back(-1 - static_cast<int>(stage));
+    vkCmdWriteTimestamp(im.batch_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        im.qpool, static_cast<std::uint32_t>(im.ts_tag.size()));
 }
 
 void VulkanContext::end_batch() {
@@ -1565,7 +1600,7 @@ void VulkanContext::end_batch() {
     using clock = std::chrono::steady_clock;
     const bool prof = im.batch_timed;
     const auto last_ts =
-        static_cast<std::uint32_t>(im.ts_kernel.size() + 1);
+        static_cast<std::uint32_t>(im.ts_tag.size() + 1);
     if (prof) {
         vkCmdWriteTimestamp(im.batch_cmd,
                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -1630,10 +1665,34 @@ void VulkanContext::end_batch() {
                 std::memory_order_relaxed);
             gm.device_samples.fetch_add(1, std::memory_order_relaxed);
             im.prof.gpu_ms += to_ms(ts[0], ts[last_ts]);
-            for (std::size_t i = 0; i < im.ts_kernel.size(); ++i) {
-                im.prof.kernel_ms[im.ts_kernel[i]] +=
-                    to_ms(ts[i], ts[i + 1]);
-                ++im.prof.kernel_n[im.ts_kernel[i]];
+            // A kernel slot times the span since the slot before it; a
+            // stage mark, the span since the previous mark. A staged
+            // batch stands for the kStageEvery timed ones.
+            const double stage_scale =
+                VulkanContext::profiling()
+                    ? 1.0
+                    : scale * VulkanContext::kStageEvery;
+            std::uint32_t mark = 0;
+            for (std::size_t i = 0; i < im.ts_tag.size(); ++i) {
+                const int tag = im.ts_tag[i];
+                if (tag >= 0) {
+                    im.prof.kernel_ms[tag] += to_ms(ts[i], ts[i + 1]);
+                    ++im.prof.kernel_n[tag];
+                    continue;
+                }
+                const auto slot = static_cast<std::uint32_t>(i + 1);
+                gm.stage_ns[-1 - tag].fetch_add(
+                    static_cast<std::uint64_t>(ticks(ts[mark], ts[slot]) *
+                                               stage_scale),
+                    std::memory_order_relaxed);
+                mark = slot;
+            }
+            if (im.batch_staged) {
+                gm.unmarked_ns.fetch_add(
+                    static_cast<std::uint64_t>(
+                        ticks(ts[mark], ts[last_ts]) * stage_scale),
+                    std::memory_order_relaxed);
+                gm.stage_samples.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -1825,6 +1884,7 @@ void VulkanContext::dispatch(Kernel, std::span<const Buffer>,
                              std::uint32_t) {
     no_kernels();
 }
+void VulkanContext::mark_stage(std::uint32_t) { no_kernels(); }
 void VulkanContext::end_batch() { no_kernels(); }
 void VulkanContext::note_token() { no_kernels(); }
 std::uint64_t VulkanContext::memory_available() const { no_kernels(); }

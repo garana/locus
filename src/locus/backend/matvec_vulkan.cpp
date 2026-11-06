@@ -27,6 +27,7 @@
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/model/moe_stats.hpp"
+#include "locus/model/stage_metrics.hpp"
 #include "locus/sys/mmap_file.hpp"
 
 namespace locus::backend {
@@ -1715,6 +1716,14 @@ std::string vulkan_device_name() {
 
 namespace {
 
+static_assert(static_cast<std::size_t>(model::Stage::kCount) <=
+              GpuMetrics::kStageSlots);
+
+/** Ends stage st of the open batch (its device time, i#391). */
+void mark(State& s, model::Stage st) {
+    s.ctx.mark_stage(static_cast<std::uint32_t>(st));
+}
+
 /**
  * Whether a MoE layer can route on the GPU (moe_route + batched
  * expert matvecs, no host sync). Needs every expert resident, so
@@ -2117,6 +2126,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                                       in_block * kv_dim;
 
         norm(lay.attn_norm, s.x, s.xb, hp.n_embd, 0);
+        mark(s, model::Stage::kNorm);
         if (!mla) {
             const VulkanContext::Buffer divisors =
                 s.rope_divisors(m.rope_factors(),
@@ -2470,11 +2480,14 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             }
         }
         rec_matvec(s, lay.wo, s.attout, s.x, 0, true);
+        mark(s, model::Stage::kAttention);
 
         norm(lay.ffn_norm, s.x, s.xb, hp.n_embd, 0);
+        mark(s, model::Stage::kNorm);
         if (!lay.is_moe()) {
             swiglu(lay.w_gate, lay.w_up, lay.w_down, hp.n_ff,
                    1.0f, 0, 0, 0, nullptr, nullptr, nullptr);
+            mark(s, model::Stage::kFfn);
         } else if (gpu_route_ok(s, m, lay)) {
             // Router, top-k and the routed experts all on the GPU
             // in the open batch: moe_route writes the picked ids
@@ -2635,6 +2648,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                        lay.gate_inp_shexp.rows > 0 ? &lay.gate_inp_shexp
                                                    : nullptr);
             }
+            mark(s, model::Stage::kMoe);
         } else {
             // Router runs on the CPU: sync the batch, read the
             // normed activations, gate, then keep recording.
@@ -2689,9 +2703,11 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                        lay.gate_inp_shexp.rows > 0 ? &lay.gate_inp_shexp
                                                    : nullptr);
             }
+            mark(s, model::Stage::kMoe);
         }
     }
     norm(m.output_norm(), s.x, s.xb, hp.n_embd, 0);
+    mark(s, model::Stage::kNorm);
     const Mat& out_w = m.output_weight();
     if (row_end == 0 || (row_begin == 0 && row_end == out_w.rows)) {
         rec_matvec(s, out_w, s.xb, s.logits, 0, false);
@@ -2706,6 +2722,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                    std::uint64_t{row_begin} * mat_row_bytes(out_w), 0, 1.0f,
                    &whole);
     }
+    mark(s, model::Stage::kHead);
     s.end_batch();
 
     s.ctx.read_buffer(s.logits, std::as_writable_bytes(logits));
@@ -2838,6 +2855,7 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
     for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
         const auto& lay = m.layers()[l];
         norm_rows(lay.attn_norm, bx, bxb);
+        mark(s, model::Stage::kNorm);
         proj(lay.wq, bxb, E, bq, 0, q_dim, false);
         proj(lay.wk, bxb, E, bkv, 0, kv_dim, false);
         proj(lay.wv, bxb, E, bkv, n * kv_dim, kv_dim, false);
@@ -2877,8 +2895,10 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
             copy(s.attout, 0, batt, i * q_dim, q_dim);
         }
         proj(lay.wo, batt, q_dim, bx, 0, E, true);
+        mark(s, model::Stage::kAttention);
 
         norm_rows(lay.ffn_norm, bx, bxb);
+        mark(s, model::Stage::kNorm);
         proj(lay.w_gate, bxb, E, bgate, 0, ff, false);
         proj(lay.w_up, bxb, E, bup, 0, ff, false);
         {
@@ -2888,6 +2908,7 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
                            (n * ff + 63) / 64);
         }
         proj(lay.w_down, bgate, ff, bx, 0, E, true);
+        mark(s, model::Stage::kFfn);
     }
     norm_rows(m.output_norm(), bx, bxb);
     // Head rows [row_begin, row_end) of every sequence: a row view of
@@ -2896,6 +2917,7 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
     rec_matmul(s, mat_rows(out_w, row_begin, n_rows), s.upload_w(out_w),
                bxb, blog, MatmulRows{n, 0, E, 0, n_rows}, false,
                std::uint64_t{row_begin} * mat_row_bytes(out_w));
+    mark(s, model::Stage::kHead);
     s.end_batch();
 
     std::vector<float> logits_host(std::size_t{n} * n_rows);
@@ -3144,6 +3166,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         const std::uint32_t layer_off = l * layer_stride;
 
         norm_rows(lay.attn_norm, bx, bxb, E, 0, E, E, n);
+        mark(s, model::Stage::kNorm);
         if (!mla) {
             const std::uint32_t hd = hp.head_dim;
             const auto divisors =
@@ -3267,10 +3290,13 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         }
         rec_matmul(s, lay.wo, s.upload_w(lay.wo),
                    batt_out, bx, MatmulRows{n, 0, att_dim, 0, E}, true);
+        mark(s, model::Stage::kAttention);
 
         norm_rows(lay.ffn_norm, bx, bxb, E, 0, E, E, n);
+        mark(s, model::Stage::kNorm);
         if (!lay.is_moe()) {
             swiglu_rows(lay.w_gate, lay.w_up, lay.w_down, hp.n_ff);
+            mark(s, model::Stage::kFfn);
             continue;
         }
         // MoE: route every token on the GPU, group the (token, slot)
@@ -3382,6 +3408,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                         lay.gate_inp_shexp.rows > 0 ? &lay.gate_inp_shexp
                                                     : nullptr);
         }
+        mark(s, model::Stage::kMoe);
     }
 
     // Prefill needs only the last row's logits; speculative verify
@@ -3395,6 +3422,7 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         norm_rows(m.output_norm(), bx, bxb, E, (n - 1) * E, 0, 0, 1);
         rec_matvec(s, out_w, bxb, blogits, 0, false);
     }
+    mark(s, model::Stage::kHead);
     s.end_batch();
 
     s.ctx.read_buffer(blogits, std::as_writable_bytes(logits));

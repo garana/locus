@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 namespace locus::backend {
@@ -39,15 +40,28 @@ const char* gpu_api_name(GpuApi a);
  *   estimate: about 1 batch in 16 is timed and counts 16 times.
  * - device_samples: the batches timed for device_ns. Few samples mean
  *   a rough estimate (a short request may sample none of its prefill).
+ * - stage_ns: device time by forward stage (index: model::Stage), from
+ *   the timestamps the forward writes at each stage's end (Vulkan);
+ *   unmarked_ns: the time outside a marked stage (a single matvec, the
+ *   image and video models). Estimated from fewer batches than
+ *   device_ns (1 timed batch in 4, counted 4 times more), so their sum
+ *   tracks device_ns over many batches, not exactly.
+ * - stage_samples: the batches timed for stage_ns.
  * - bytes: device memory this process holds, per MemKind.
  */
 struct GpuMetrics {
+    /** Slots in stage_ns, at least model::Stage::kCount. */
+    static constexpr std::size_t kStageSlots = 16;
+
     std::atomic<std::uint64_t> submits{0};
     std::atomic<std::uint64_t> dispatches{0};
     std::atomic<std::uint64_t> record_ns{0};
     std::atomic<std::uint64_t> wait_ns{0};
     std::atomic<std::uint64_t> device_ns{0};
     std::atomic<std::uint64_t> device_samples{0};
+    std::atomic<std::uint64_t> stage_ns[kStageSlots] = {};
+    std::atomic<std::uint64_t> unmarked_ns{0};
+    std::atomic<std::uint64_t> stage_samples{0};
     std::atomic<std::int64_t> bytes[static_cast<int>(MemKind::kCount)] = {};
 
     /** Adds `n` (negative to free) to the bytes held for kind k. */

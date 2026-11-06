@@ -377,6 +377,26 @@ class VulkanContext {
                   std::uint32_t groups_x, std::uint32_t groups_y = 1,
                   std::uint32_t groups_z = 1);
 
+    /**
+     * Timed batches (timestamps()) that also time their stages: 1 in
+     * kStageEvery, every one under LOCUS_VK_PROFILE. Each stage mark
+     * costs a barrier and a timestamp, which split the compute encoder
+     * on MoltenVK; on every timed batch they cost about 1.3% of decode
+     * speed on an M2 Pro.
+     */
+    static constexpr std::uint32_t kStageEvery = 4;
+
+    /**
+     * Ends a stage of the open batch: on a staged batch, writes a GPU
+     * timestamp, and end_batch adds the device time since the previous
+     * mark (or the batch start) to GpuMetrics::stage_ns[stage]. Time
+     * after the last mark goes to unmarked_ns. A no-op on any other
+     * batch.
+     *
+     * @param stage The stage's index, below GpuMetrics::kStageSlots.
+     */
+    void mark_stage(std::uint32_t stage);
+
     /** Submits the batch and waits for completion. */
     void end_batch();
 
