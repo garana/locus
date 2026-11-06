@@ -2933,6 +2933,7 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
         mark(s, model::Stage::kFfn);
     }
     norm_rows(m.output_norm(), bx, bxb);
+    mark(s, model::Stage::kNorm);
     // Head rows [row_begin, row_end) of every sequence: a row view of
     // the uploaded head, as vulkan_forward's partial head.
     const Mat& out_w = m.output_weight();
@@ -3438,10 +3439,12 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     const Mat& out_w = m.output_weight();
     if (all_logits) {
         norm_rows(m.output_norm(), bx, bxb, E, 0, E, E, n);
+        mark(s, model::Stage::kNorm);
         rec_matmul(s, out_w, s.upload_w(out_w), bxb,
                    blogits, MatmulRows{n, 0, E, 0, hp.n_vocab}, false);
     } else {
         norm_rows(m.output_norm(), bx, bxb, E, (n - 1) * E, 0, 0, 1);
+        mark(s, model::Stage::kNorm);
         rec_matvec(s, out_w, bxb, blogits, 0, false);
     }
     mark(s, model::Stage::kHead);
