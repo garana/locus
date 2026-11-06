@@ -674,7 +674,7 @@ TEST_CASE("batched forward matches sequential (llama MoE)",
     REQUIRE(kv_bat == kv_seq);
 }
 
-TEST_CASE("cuda MoE hybrid decode matches the all-GPU decode",
+TEST_CASE("cuda MoE hybrid prefill and decode match the all-GPU run",
           "[moe][cuda]") {
     using locus::model::ExpertCalls;
     if (!locus::backend::cuda_backend_usable()) {
@@ -693,13 +693,41 @@ TEST_CASE("cuda MoE hybrid decode matches the all-GPU decode",
     auto img = moe.build(4, 2);
     const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 3, 7, 1, 9, 2};
 
+    // Prefill the first half in one forward_batch, then decode.
+    auto run_both = [&] {
+        auto g = locus::gguf::GgufFile::parse(img);
+        auto model = TransformerModel::load(g);
+        model.use_backend(*locus::backend::find_backend("cuda"));
+        REQUIRE(model.supports_batch());
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        const std::vector<locus::tok::TokenId> head(toks.begin(),
+                                                    toks.begin() + 4);
+        REQUIRE(cache.ensure_capacity(seq, head.size()));
+        model.forward_batch(head, cache, seq, ws, logits);
+        std::vector<float> out = logits;
+        for (std::size_t i = head.size(); i < toks.size(); ++i) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(toks[i], cache, seq, ws, logits);
+        }
+        out.insert(out.end(), logits.begin(), logits.end());
+        cache.release(seq);
+        return out;
+    };
     const auto ref = run(img, toks, "cuda");
+    const auto ref_both = run_both();
     setenv("LOCUS_MOE_HYBRID", "1", 1);
     setenv("LOCUS_MOE_STEP", "1", 1);
     // 0: every pick on the CPU; 2: half the experts hot; 4: all.
     for (const char* slots : {"0", "2", "4"}) {
         CAPTURE(slots);
         setenv("LOCUS_MOE_HYBRID_SLOTS", slots, 1);
+        const auto got_both = run_both();
+        for (std::size_t i = 0; i < ref_both.size(); ++i) {
+            REQUIRE(got_both[i] == Catch::Approx(ref_both[i]).margin(1e-4));
+        }
         ExpertCalls::reset();
         const auto got = run(img, toks, "cuda");
         for (std::size_t i = 0; i < ref.size(); ++i) {
