@@ -11,6 +11,7 @@
 
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/arch.hpp"
+#include "locus/model/expert_metrics.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/model/gguf_load.hpp"
 #include "locus/model/gqa_attend.hpp"
@@ -1739,6 +1740,14 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
                              hp_.n_expert);
         }
     }
+    {
+        bool gpu = false;
+        const std::string_view api = expert_api(backend_->name, gpu);
+        for (const auto& [e, wgt] : picked) {
+            ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, gpu,
+                                api);
+        }
+    }
     // R8 expert readahead: overlap the SSD reads of every routed
     // expert before the sequential per-expert matmuls fault them
     // in one by one.
@@ -1829,6 +1838,8 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
     // Phase 1: route each token (byte-identical to moe_ffn).
     std::vector<std::vector<std::pair<std::uint32_t, float>>>
         picked(n);
+    bool gpu = false;
+    const std::string_view api = expert_api(backend_->name, gpu);
     for (std::uint32_t t = 0; t < n; ++t) {
         op.matvec(
             lay.gate_inp,
@@ -1840,6 +1851,10 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
                 MoeStats::record(layer, e, hp_.n_layers,
                                  hp_.n_expert);
             }
+        }
+        for (const auto& [e, wgt] : picked[t]) {
+            ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, gpu,
+                                api);
         }
     }
 

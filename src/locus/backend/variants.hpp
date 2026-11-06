@@ -173,6 +173,13 @@ bool vulkan_backend_usable();
 std::string vulkan_device_name();
 
 /**
+ * @returns "moltenvk" when the Vulkan driver is MoltenVK, else
+ *     "vulkan" (also when no device is usable). Asks the device once
+ *     and caches the answer, so it is cheap on a hot path.
+ */
+const char* vulkan_api_name();
+
+/**
  * Opt-in (--prefill-f16): the Vulkan prefill matmuls stage both
  * operands as f16 in shared memory (~+18% prefill on an M4 Max). Off
  * (the default) keeps prefill f32-exact.

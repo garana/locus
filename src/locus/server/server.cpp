@@ -37,6 +37,7 @@
 #include "locus/image/png.hpp"
 #include "locus/image/vq16.hpp"
 #include "locus/model/codec.hpp"
+#include "locus/model/expert_metrics.hpp"
 #include "locus/model/grammar.hpp"
 #include "locus/model/sampling.hpp"
 #include "locus/server/errors.hpp"
@@ -456,6 +457,27 @@ void render_fallbacks(MetricsText& mt) {
                      MetricsText::label("reason", f.reason),
                  static_cast<double>(f.n.load(std::memory_order_relaxed)));
     });
+}
+
+/**
+ * Writes locus_moe_expert_calls_total{layer,expert,device,api} (i#252):
+ * how often each routed expert ran, and where. Only experts that ran at
+ * least once have a series.
+ */
+void render_expert_calls(MetricsText& mt) {
+    const auto calls = model::ExpertCalls::snapshot();
+    if (calls.empty()) return;
+    mt.family("locus_moe_expert_calls_total",
+              "Routed MoE expert calls, per layer, expert and device.",
+              "counter");
+    for (const auto& c : calls) {
+        mt.value("locus_moe_expert_calls_total",
+                 MetricsText::label("layer", std::to_string(c.layer)) + "," +
+                     MetricsText::label("expert", std::to_string(c.expert)) +
+                     "," + MetricsText::label("device", c.device) + "," +
+                     MetricsText::label("api", c.api),
+                 c.calls);
+    }
 }
 
 /** @returns The --kv-type name of `t`, for the locus_info series. */
@@ -1485,6 +1507,7 @@ void OpenAiServer::install_routes() {
             }
             render_gpu_metrics(mt);
             render_fallbacks(mt);
+            render_expert_calls(mt);
             res.set_content(mt.text(), "text/plain; version=0.0.4");
     };
 

@@ -228,7 +228,11 @@ Routing spreads fast. On Moonlight, 11 forwards touch 43.8% of the
 layer-expert slots; on GLM-5.2 (256 experts), 16 forwards touch 27.4%.
 So prefetch pays within a token (overlap the reads of the routed
 experts), not across tokens (an expert cache). `LOCUS_MOE_STATS=1`
-prints this telemetry.
+prints this telemetry. `LOCUS_MOE_TRACE=<file>` writes every pick as
+`layer expert`; `scripts/moe-trace-sim.py` replays a trace against
+cache policies (LRU, LFU, Belady, step WLRU, static top) for a given
+GPU budget. On Vulkan both variables route MoE layers on the host, so
+the picks reach the CPU.
 
 On a cold spinning disk, GLM-5.2 runs faster end to end than a
 CPU-only llama.cpp (50.7 versus 92 minutes for 16 tokens), because
@@ -520,6 +524,11 @@ guarding the default path.
   unsupported shape). Only fallbacks that happened have a series.
   The multi-sequence Vulkan decode declining is not counted: its
   sequences still run on the GPU, one forward each.
+  `locus_moe_expert_calls_total{layer,expert,device,api}` counts each
+  routed expert run: `device` is `gpu` or `cpu`, `api` is `cuda`,
+  `vulkan`, `moltenvk` or the CPU kernel set (`neon`, `avx2`, `sse4`,
+  `scalar`). Vulkan's GPU-routed MoE layers keep the picks on the
+  device and are not counted.
 - KV-cache quantization: Q8 or Q4 blocks of 32 (f16 scale) in a
   separate byte pool, for the llama-family attention. Each layer's
   past rows are dequantized into scratch, so the attention math is the
