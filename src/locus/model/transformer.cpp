@@ -54,8 +54,9 @@ std::uint64_t env_u64(const char* name, std::uint64_t def) {
 }  // namespace
 
 /**
- * LOCUS_MOE_HYBRID=1 (i#252): in decode, the routed experts in the
- * step WLRU hot zone (ExpertCache) run on the GPU backend while the
+ * LOCUS_MOE_HYBRID=1 (i#252): in decode and batched prefill, the
+ * routed experts in the step WLRU hot zone (ExpertCache) run on the
+ * GPU backend while the
  * other picks run on the best CPU backend at the same time. Only a
  * promotion uploads an expert; a demotion frees it (Ops.evict).
  *
@@ -63,7 +64,7 @@ std::uint64_t env_u64(const char* name, std::uint64_t def) {
  * what fits in 90% of the GPU weight pool after the non-expert
  * weights. LOCUS_MOE_STEP (default 16) is the ranks a pick moves up.
  * Needs a backend with a weight pool (prefetch, evict, pool_budget):
- * CUDA. Batched prefill keeps the on-demand pool.
+ * CUDA.
  */
 struct MoeHybrid {
     std::once_flag once;
@@ -1848,6 +1849,32 @@ MoeHybrid* TransformerModel::moe_hybrid() const {
     return h->cache != nullptr && h->gpu == backend_ ? h : nullptr;
 }
 
+bool TransformerModel::moe_hybrid_touch(MoeHybrid& hy,
+                                        const backend::Ops& op,
+                                        const Layer& lay, std::uint32_t layer,
+                                        std::uint32_t e,
+                                        std::string_view gpu_api) const {
+    const ExpertCache::Touch t = hy.cache->touch(layer, e);
+    if (t.evicted) {
+        const Layer& el = layers_[t.evicted_layer];
+        const std::uint32_t ee = t.evicted_expert;
+        op.evict(el.gate_exps.expert(ee));
+        op.evict(el.up_exps.expert(ee));
+        op.evict(el.down_exps.expert(ee));
+        hy.evicted.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (t.promoted) {
+        op.prefetch(lay.gate_exps.expert(e));
+        op.prefetch(lay.up_exps.expert(e));
+        op.prefetch(lay.down_exps.expert(e));
+        hy.promoted.fetch_add(1, std::memory_order_relaxed);
+    }
+    (t.hot ? hy.hot : hy.cold).fetch_add(1, std::memory_order_relaxed);
+    ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, t.hot,
+                        t.hot ? gpu_api : hy.cpu->name);
+    return t.hot;
+}
+
 void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
                          std::uint32_t layer) const {
     using namespace locus::backend;
@@ -1871,26 +1898,8 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
     if (hy != nullptr) {
         std::vector<std::pair<std::uint32_t, float>> hot;
         for (const auto& [e, wgt] : picked) {
-            const ExpertCache::Touch t = hy->cache->touch(layer, e);
-            if (t.evicted) {
-                const Layer& el = layers_[t.evicted_layer];
-                const std::uint32_t ee = t.evicted_expert;
-                op.evict(el.gate_exps.expert(ee));
-                op.evict(el.up_exps.expert(ee));
-                op.evict(el.down_exps.expert(ee));
-                hy->evicted.fetch_add(1, std::memory_order_relaxed);
-            }
-            if (t.promoted) {
-                op.prefetch(lay.gate_exps.expert(e));
-                op.prefetch(lay.up_exps.expert(e));
-                op.prefetch(lay.down_exps.expert(e));
-                hy->promoted.fetch_add(1, std::memory_order_relaxed);
-            }
-            (t.hot ? hot : cold).emplace_back(e, wgt);
-            (t.hot ? hy->hot : hy->cold)
-                .fetch_add(1, std::memory_order_relaxed);
-            ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, t.hot,
-                                t.hot ? api : hy->cpu->name);
+            (moe_hybrid_touch(*hy, op, lay, layer, e, api) ? hot : cold)
+                .emplace_back(e, wgt);
         }
         picked = std::move(hot);
     } else {
@@ -2040,28 +2049,46 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
                                  hp_.n_expert);
             }
         }
-        for (const auto& [e, wgt] : picked[t]) {
-            ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, gpu,
-                                api);
+    }
+
+    // Hybrid: each pick, in token order, moves the hot zone as in
+    // decode; a pick outside it runs on the CPU backend.
+    MoeHybrid* const hy = moe_hybrid();
+    std::vector<std::uint8_t> on_cpu(static_cast<std::size_t>(n) * k, 0);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        for (std::uint32_t s = 0;
+             s < static_cast<std::uint32_t>(picked[t].size()); ++s) {
+            const std::uint32_t e = picked[t][s].first;
+            if (hy != nullptr) {
+                on_cpu[static_cast<std::size_t>(t) * k + s] =
+                    !moe_hybrid_touch(*hy, op, lay, layer, e, api);
+            } else {
+                ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert,
+                                    gpu, api);
+            }
         }
     }
 
     // Group (token, slot) by expert so each expert's weights are
-    // read once across the tokens that picked it.
+    // read once across the tokens that picked it; the CPU uses apart.
     struct Use {
         std::uint32_t e, t, s;
     };
-    std::vector<Use> uses;
+    std::vector<Use> uses, cold;
     uses.reserve(static_cast<std::size_t>(n) * k);
     for (std::uint32_t t = 0; t < n; ++t) {
         for (std::uint32_t s = 0;
              s < static_cast<std::uint32_t>(picked[t].size());
              ++s) {
-            uses.push_back({picked[t][s].first, t, s});
+            (on_cpu[static_cast<std::size_t>(t) * k + s] ? cold : uses)
+                .push_back({picked[t][s].first, t, s});
         }
     }
-    std::sort(uses.begin(), uses.end(),
-              [](const Use& a, const Use& b) { return a.e < b.e; });
+    const auto by_expert = [](const Use& a, const Use& b) {
+        return a.e < b.e;
+    };
+    std::sort(uses.begin(), uses.end(), by_expert);
+    std::sort(cold.begin(), cold.end(), by_expert);
 
     // Readahead the union once (first appearance of each expert).
     if (readahead_enabled()) {
@@ -2089,6 +2116,32 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
 
     // Phase 3: weight-stationary swiglu -> res[(t*k + s)*E].
     std::vector<float> res(static_cast<std::size_t>(n) * k * E);
+    // The CPU uses run on the CPU backend while the GPU runs the rest;
+    // each writes only its own res slots.
+    std::future<void> cold_done;
+    if (!cold.empty()) {
+        cold_done = std::async(std::launch::async, [&] {
+            const Ops cop =
+                effective_ops(hy->cpu, q8k_activations_for(hy->cpu));
+            std::vector<float> g(ff), u(ff), d(E);
+            for (const auto& c : cold) {
+                const float* xin =
+                    xbf.data() + static_cast<std::size_t>(c.t) * E;
+                const MatvecJob gu[] = {
+                    {lay.gate_exps.expert(c.e), {xin, E}, g},
+                    {lay.up_exps.expert(c.e), {xin, E}, u}};
+                matvec_mt_group(cop, gu);
+                silu_mul(g, u, g);
+                matvec_mt(cop, lay.down_exps.expert(c.e), g, d);
+                const float wgt = picked[c.t][c.s].second;
+                float* r = res.data() +
+                           (static_cast<std::size_t>(c.t) * k + c.s) * E;
+                for (std::uint32_t i = 0; i < E; ++i) {
+                    r[i] = wgt * d[i];
+                }
+            }
+        });
+    }
     std::vector<float> down(E);
     auto swiglu = [&](const Mat& wg, const Mat& wu, const Mat& wd,
                       std::uint32_t ffw, const float* xin,
@@ -2117,6 +2170,12 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
         for (std::uint32_t i = 0; i < E; ++i) {
             r[i] = wgt * down[i];
         }
+    }
+
+    if (cold_done.valid()) {
+        cold_done.get();
+        uses.insert(uses.end(), cold.begin(), cold.end());
+        std::sort(uses.begin(), uses.end(), by_expert);
     }
 
     // Weight window on the union (opt-in), after routed use.

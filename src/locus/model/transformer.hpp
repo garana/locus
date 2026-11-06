@@ -681,6 +681,15 @@ class TransformerModel {
     /** @returns The MoE hybrid state, or nullptr when the mode is off
      *  (see MoeHybrid in transformer.cpp). */
     struct MoeHybrid* moe_hybrid() const;
+    /**
+     * Records one pick of expert `e` in the hybrid hot zone: frees the
+     * expert it pushes out, starts the upload of a promoted one, and
+     * counts the call.
+     * @returns Whether `e` runs on the GPU (it was hot before the pick).
+     */
+    bool moe_hybrid_touch(MoeHybrid& hy, const backend::Ops& op,
+                          const Layer& lay, std::uint32_t layer,
+                          std::uint32_t e, std::string_view gpu_api) const;
     /** q8k_activations() as if `b` were the model's backend. */
     bool q8k_activations_for(const backend::Backend* b) const;
 
