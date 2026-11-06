@@ -35,6 +35,7 @@ const std::vector<Backend>& list() {
                       .matvec_q8k = &matvec_neon_q8k,
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_neon,
+                      .matvec_q8k_batch = &matvec_batch_neon_q8k,
                       .prefers_q8k = true}});
 #endif
 #if defined(__x86_64__)

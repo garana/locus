@@ -1164,16 +1164,18 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                                    hp_.rope_freq_base, rope_factors());
                 backend::rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd, pos,
                                    hp_.rope_freq_base, rope_factors());
-                gqa_attend(
-                    q.data(), xb2.data() + std::size_t{t} * E, hp_.n_heads,
-                    hd, group, pos, hp_.kq_scale,
-                    [&](std::uint32_t p) -> const float* {
-                        return cache.k(seq, l, p);
-                    },
-                    [&](std::uint32_t p) -> const float* {
-                        return cache.v(seq, l, p);
-                    });
             }
+            // Every row is stored, so all (token, head) pairs attend in
+            // one dispatch.
+            gqa_attend_batch(
+                qb.data(), xb2.data(), E, n, base, hp_.n_heads, hd, group,
+                hp_.kq_scale,
+                [&](std::uint32_t p) -> const float* {
+                    return cache.k(seq, l, p);
+                },
+                [&](std::uint32_t p) -> const float* {
+                    return cache.v(seq, l, p);
+                });
             matvec_batch(op, lay.wo, xb2, qb, n);
             for (std::size_t i = 0; i < static_cast<std::size_t>(n) * E;
                  ++i) {
@@ -1556,18 +1558,36 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
                   std::span<const float> x_batch,
                   std::span<float> out_batch, std::uint32_t n) {
     // R16 ggml parity: QK_K types (Q8_K) and block-32 types (Q8_0) run
-    // the quantized-activation dot per token via matvec_mt (which
-    // routes to op.matvec_q8k, row-sliced).
-    // The batched contract is "byte-identical to n per-token matvecs",
-    // so this holds by construction -- and it keeps prefill==decode,
-    // both going through the same Q8_K path. (The register-blocked f32
-    // batch kernel and the dequant-once batch path are bypassed for
-    // these types; a weight-stationary Q8_K batch kernel is future
-    // work.)
+    // the quantized-activation dot, so prefill == decode: the backend's
+    // matvec_q8k_batch (row-sliced; each row dotted against all n
+    // tokens while cached, byte-identical to n matvec_q8k calls), else
+    // matvec_q8k per token via matvec_mt. The register-blocked f32
+    // batch kernel and the dequant-once path are bypassed for these
+    // types.
     const std::uint32_t xc = w.cols;
     const std::uint32_t oc = w.rows;
     if (op.matvec_q8k != nullptr &&
         backend::uses_quantized_activation(w.type)) {
+        if (op.matvec_q8k_batch != nullptr && !op.self_parallel) {
+            // Each slice transposes its own rows into the token-major
+            // output, so no thread waits on a serial transpose.
+            for_row_slices(
+                op, oc, [&](std::uint32_t r0, std::uint32_t r1) {
+                    const Mat sub = backend::mat_rows(w, r0, r1 - r0);
+                    thread_local std::vector<float> rt;
+                    rt.resize(static_cast<std::size_t>(r1 - r0) * n);
+                    op.matvec_q8k_batch(sub, x_batch, rt, n);
+                    for (std::uint32_t t = 0; t < n; ++t) {
+                        float* o =
+                            out_batch.data() +
+                            static_cast<std::size_t>(t) * oc + r0;
+                        for (std::uint32_t r = 0; r < r1 - r0; ++r) {
+                            o[r] = rt[static_cast<std::size_t>(r) * n + t];
+                        }
+                    }
+                });
+            return;
+        }
         for (std::uint32_t t = 0; t < n; ++t) {
             matvec_mt(op, w,
                       x_batch.subspan(static_cast<std::size_t>(t) * xc,

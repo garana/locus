@@ -644,8 +644,9 @@ locus ports those dots (`backend::matvec_q8k`):
 | sse4    | the five K-quants; the rest through scalar                    |
 | cuda    | all 15 QK_K types                                             |
 
-The vectorized and CUDA dots replay the scalar accumulation order, so
-they are bit-identical to it.
+The vectorized and CUDA per-token dots replay the scalar accumulation
+order, so they are bit-identical to it (the batched prefill kernels
+below are the exception).
 
 "Bit-exact with llama.cpp" is unreachable in principle: ggml is not
 bit-exact across its own backends, because the final f32 sum runs in
@@ -661,8 +662,16 @@ avx2, cuda and the Vulkan per-op fallback keep the f32 dot.
 exactness checks. On the M4 Max CPU, Orpheus 3B Q4_K_M decodes at 63
 tok/s with 8-bit activations against 29.4 with f32.
 
-Prefill and decode take the same gate (`uses_quantized_activation`),
-so they agree. F32, F16 and BF16 weights always take the f32 dot.
+Prefill and decode take the same gate (`uses_quantized_activation`).
+For prefill, `Ops::matvec_q8k_batch` (neon) quantizes each token once
+and dots each weight row against four tokens at a time while it is
+in cache. Its block-32 kernel replays the per-token order, so it is
+bit-identical to decode; its Q4_K and Q6_K kernels unpack each block
+once and use sdot with one float step per block, so they are
+deterministic, and a token's value does not depend on its place in
+the batch, but they differ from the scalar order by f32 rounding. On
+the M4 Max this takes Orpheus 3B Q4_K_M prefill from 97 to 185 tok/s.
+F32, F16 and BF16 weights always take the f32 dot.
 
 Goldens: Qwen1.5-MoE and DeepSeek-V2-Lite are pinned to f32, because
 8-bit activations tip their greedy text at a near-tie. Muse Spark's
