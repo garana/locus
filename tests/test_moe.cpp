@@ -12,6 +12,7 @@
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/gguf/gguf.hpp"
+#include "locus/model/expert_metrics.hpp"
 #include "locus/model/transformer.hpp"
 #include "gguf_builder.hpp"
 
@@ -671,6 +672,52 @@ TEST_CASE("batched forward matches sequential (llama MoE)",
     auto [log_bat, kv_bat] = seq_run(true);
     REQUIRE(log_bat == log_seq);
     REQUIRE(kv_bat == kv_seq);
+}
+
+TEST_CASE("cuda MoE hybrid decode matches the all-GPU decode",
+          "[moe][cuda]") {
+    using locus::model::ExpertCalls;
+    if (!locus::backend::cuda_backend_usable()) {
+        SKIP("no usable CUDA device");
+    }
+    locus::backend::cuda_pool_reset();
+    ModelBuilder moe;
+    moe.common();
+    moe.tensor("blk.0.ffn_gate_inp.weight", {kE, 4}, weights(kE * 4, 80));
+    moe.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 81));
+    moe.tensor("blk.0.ffn_up_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 82));
+    moe.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
+               weights(kF * kE * 4, 83));
+    auto img = moe.build(4, 2);
+    const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 3, 7, 1, 9, 2};
+
+    const auto ref = run(img, toks, "cuda");
+    setenv("LOCUS_MOE_HYBRID", "1", 1);
+    setenv("LOCUS_MOE_STEP", "1", 1);
+    // 0: every pick on the CPU; 2: half the experts hot; 4: all.
+    for (const char* slots : {"0", "2", "4"}) {
+        CAPTURE(slots);
+        setenv("LOCUS_MOE_HYBRID_SLOTS", slots, 1);
+        ExpertCalls::reset();
+        const auto got = run(img, toks, "cuda");
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            REQUIRE(got[i] == Catch::Approx(ref[i]).margin(1e-4));
+        }
+        bool on_cpu = false, on_gpu = false;
+        for (const auto& c : ExpertCalls::snapshot()) {
+            (c.device == "cpu" ? on_cpu : on_gpu) = true;
+        }
+        // Each expert's first pick runs on the CPU (its upload starts
+        // then); with room for all four, later picks are hot.
+        REQUIRE(on_cpu);
+        REQUIRE(on_gpu == (std::string_view(slots) != "0"));
+    }
+    unsetenv("LOCUS_MOE_HYBRID_SLOTS");
+    unsetenv("LOCUS_MOE_STEP");
+    unsetenv("LOCUS_MOE_HYBRID");
+    ExpertCalls::reset();
 }
 
 TEST_CASE("distinct experts diverge from the dense model",

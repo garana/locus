@@ -2527,6 +2527,32 @@ class WeightPool {
         }
     }
 
+    /** Frees `host`'s page now (Ops.evict). A pinned page stays; LRU
+     *  frees it later. */
+    void drop(const void* host) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = table_.find(host);
+        if (it == table_.end() || it->second.pins != 0) {
+            return;
+        }
+        wait_ready(it->second);  // don't free mid-copy
+        cudaFree(it->second.dptr);
+        used_ -= it->second.bytes;
+        note_used();
+        drops_++;
+        table_.erase(it);
+    }
+
+    /** @returns The byte budget (Ops.pool_budget). */
+    std::size_t budget() {
+        std::lock_guard<std::mutex> lk(mu_);
+        bind_check_locked();
+        if (budget_ == 0) {
+            init_budget();
+        }
+        return budget_;
+    }
+
     /** Frees every resident page and empties the table. For tests:
      *  the pool keys weights by host pointer (valid only while that
      *  buffer is live), so transient test weights whose addresses get
@@ -2555,7 +2581,7 @@ class WeightPool {
             stderr,
             "[cuda-pool] budget=%zuMB resident=%zuMB hits=%llu "
             "misses=%llu hit_rate=%.1f%% prefetches=%llu "
-            "evictions=%llu uploaded=%lluMB\n",
+            "evictions=%llu drops=%llu uploaded=%lluMB\n",
             budget_ >> 20, used_ >> 20,
             static_cast<unsigned long long>(hits_),
             static_cast<unsigned long long>(misses_),
@@ -2564,6 +2590,7 @@ class WeightPool {
                 : 0.0,
             static_cast<unsigned long long>(prefetches_),
             static_cast<unsigned long long>(evictions_),
+            static_cast<unsigned long long>(drops_),
             static_cast<unsigned long long>(upload_bytes_ >> 20));
         // Process exit frees the device; skip cudaFree to avoid
         // ordering issues with CUDA context teardown.
@@ -2701,7 +2728,7 @@ class WeightPool {
     std::size_t budget_ = 0;
     std::size_t used_ = 0;
     std::uint64_t clock_ = 0;
-    std::uint64_t hits_ = 0, misses_ = 0, evictions_ = 0;
+    std::uint64_t hits_ = 0, misses_ = 0, evictions_ = 0, drops_ = 0;
     std::uint64_t prefetches_ = 0;
     std::uint64_t upload_bytes_ = 0;
     std::mutex mu_;
@@ -3747,6 +3774,16 @@ void cuda_prefetch(const Mat& w) {
     if (bytes > 0) {
         pool().prefetch(w.data, bytes);
     }
+}
+
+void cuda_evict(const Mat& w) {
+    ensure_device();
+    pool().drop(w.data);
+}
+
+std::size_t cuda_pool_budget() {
+    ensure_device();
+    return pool().budget();
 }
 
 void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
