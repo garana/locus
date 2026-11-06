@@ -4,6 +4,7 @@
 
 #include <arm_neon.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -613,6 +614,187 @@ float row_block32_q8_0_neon(gguf::TensorType type, const std::byte* row,
     return sum;
 }
 
+
+/**
+ * row_block32_q8_0_neon for T tokens: each weight block is unpacked
+ * once and dotted against every token, each token with its own lanes
+ * and float steps in the same order, so out[t] is bit-identical to
+ * row_block32_q8_0_neon on token t (scales at yd + t * nb, quants at
+ * yq + t * qs).
+ */
+template <int T>
+void rows_block32_q8_0_xt(gguf::TensorType type, const std::byte* row,
+                          std::size_t bb, std::size_t nb, const float* yd,
+                          const std::int8_t* yq, std::size_t qs, float* out) {
+    float32x4_t s0[T], s1[T];
+    for (int t = 0; t < T; ++t) {
+        s0[t] = vdupq_n_f32(0.0f);
+        s1[t] = vdupq_n_f32(0.0f);
+    }
+    std::size_t b = 0;
+    int8x16_t lo0, hi0, lo1, hi1;
+    for (; b + 1 < nb; b += 2) {
+        const float w0 = unpack_block32_neon(type, row + b * bb, lo0, hi0);
+        const float w1 =
+            unpack_block32_neon(type, row + (b + 1) * bb, lo1, hi1);
+        for (int t = 0; t < T; ++t) {
+            const float* d = yd + t * nb;
+            const std::int8_t* q = yq + t * qs;
+            const float d0 = w0 * d[b];
+            const int32x4_t p0 = lanes32(lo0, hi0, q + b * 32);
+            const float d1 = w1 * d[b + 1];
+            const int32x4_t p1 = lanes32(lo1, hi1, q + (b + 1) * 32);
+            s0[t] = vaddq_f32(s0[t], vmulq_n_f32(vcvtq_f32_s32(p0), d0));
+            s1[t] = vaddq_f32(s1[t], vmulq_n_f32(vcvtq_f32_s32(p1), d1));
+        }
+    }
+    for (int t = 0; t < T; ++t) {
+        out[t] = vaddvq_f32(s0[t]) + vaddvq_f32(s1[t]);
+    }
+    for (; b < nb; ++b) {
+        const float w0 = unpack_block32_neon(type, row + b * bb, lo0, hi0);
+        for (int t = 0; t < T; ++t) {
+            const float d = w0 * yd[t * nb + b];
+            const int p = vaddvq_s32(lanes32(lo0, hi0, yq + t * qs + b * 32));
+            out[t] += static_cast<float>(p) * d;
+        }
+    }
+}
+
+/** One sdot of 16 int8 pairs into four int32 lanes (widening
+ *  multiplies without dotprod; the same exact integers). */
+inline int32x4_t dot16(int8x16_t a, int8x16_t b) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    return vdotq_s32(vdupq_n_s32(0), a, b);
+#else
+    const int16x8_t p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+    const int16x8_t p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
+    return vpaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1));
+#endif
+}
+
+/**
+ * One Q4_K row x T Q8_K tokens (batched prefill): each block's nibbles
+ * are unpacked once and dotted against every token. Per token and
+ * block, the integer sum over the 8 scaled sub-blocks is exact; the
+ * float steps are one multiply-add per block, so the sum is
+ * deterministic but not ggml's scalar order (row_q4_k_q8k_neon).
+ * Token t's quants are at yq + t * qs, its scales at yd + t * ds and
+ * its 16-sums at ys + t * ss.
+ */
+template <int T>
+void rows_q4_k_q8k_xt(const std::byte* row, std::size_t nb, const float* yd,
+                      std::size_t ds, const std::int8_t* yq, std::size_t qs,
+                      const std::int16_t* ys, std::size_t ss, float* out) {
+    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
+                            kmask3 = 0x03030303;
+    const uint8x16_t m4b = vdupq_n_u8(0x0f);
+    float sumf[T] = {};
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 144;
+        const float bd = half_to_float(load_u16(blk));
+        const float bdmin = half_to_float(load_u16(blk + 2));
+        std::uint32_t utmp[4];
+        std::memcpy(utmp, blk + 4, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) |
+                  (((utmp[1] >> 6) & kmask3) << 4);
+        const std::uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+        const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
+        const auto* mins = scales + 8;
+        const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 16);
+        // Sub-block 2j: low nibbles of bytes 32j..32j+31; 2j+1: high.
+        int8x16_t w[16];
+        for (int j = 0; j < 4; ++j) {
+            const uint8x16_t b0 = vld1q_u8(q4 + 32 * j);
+            const uint8x16_t b1 = vld1q_u8(q4 + 32 * j + 16);
+            w[4 * j] = vreinterpretq_s8_u8(vandq_u8(b0, m4b));
+            w[4 * j + 1] = vreinterpretq_s8_u8(vandq_u8(b1, m4b));
+            w[4 * j + 2] = vreinterpretq_s8_u8(vshrq_n_u8(b0, 4));
+            w[4 * j + 3] = vreinterpretq_s8_u8(vshrq_n_u8(b1, 4));
+        }
+        for (int t = 0; t < T; ++t) {
+            const std::int8_t* q8 = yq + t * qs + i * 256;
+            const std::int16_t* bs = ys + t * ss + i * 16;
+            // Sub-block s's activation sum is bs[2s] + bs[2s + 1].
+            const int16x8_t bsum = vpaddq_s16(vld1q_s16(bs), vld1q_s16(bs + 8));
+            const int16x8_t mv = vreinterpretq_s16_u16(
+                vmovl_u8(vld1_u8(mins)));
+            const int minsum =
+                vaddvq_s32(vaddq_s32(vmull_s16(vget_low_s16(bsum),
+                                               vget_low_s16(mv)),
+                                     vmull_high_s16(bsum, mv)));
+            int32x4_t acc = vdupq_n_s32(0);
+            for (int s = 0; s < 8; ++s) {
+                const int32x4_t p =
+                    vaddq_s32(dot16(w[2 * s], vld1q_s8(q8 + 32 * s)),
+                              dot16(w[2 * s + 1], vld1q_s8(q8 + 32 * s + 16)));
+                acc = vmlaq_n_s32(acc, p, scales[s]);
+            }
+            const float dy = yd[t * ds + i];
+            sumf[t] += bd * dy * static_cast<float>(vaddvq_s32(acc)) -
+                       bdmin * dy * static_cast<float>(minsum);
+        }
+    }
+    for (int t = 0; t < T; ++t) {
+        out[t] = sumf[t];
+    }
+}
+
+/**
+ * One Q6_K row x T Q8_K tokens, as rows_q4_k_q8k_xt: the 6-bit codes
+ * are unpacked once per block, each token's 16 scaled group dots sum
+ * exactly, one float multiply-add per block.
+ */
+template <int T>
+void rows_q6_k_q8k_xt(const std::byte* row, std::size_t nb, const float* yd,
+                      std::size_t ds, const std::int8_t* yq, std::size_t qs,
+                      float* out) {
+    const uint8x16_t m4b = vdupq_n_u8(0x0f);
+    float sumf[T] = {};
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 210;
+        const auto* ql = reinterpret_cast<const std::uint8_t*>(blk);
+        const auto* qh = reinterpret_cast<const std::uint8_t*>(blk + 128);
+        const auto* sc = reinterpret_cast<const std::int8_t*>(blk + 192);
+        const float bd = half_to_float(load_u16(blk + 208));
+        // Groups 0..15 in q8 order: half n holds groups 8n..8n+7.
+        int8x16_t c[16];
+        for (int n = 0; n < 2; ++n) {
+            const uint8x16_t h0 = vld1q_u8(qh + 32 * n);
+            const uint8x16_t h1 = vld1q_u8(qh + 32 * n + 16);
+            const uint8x16_t l0 = vld1q_u8(ql + 64 * n);
+            const uint8x16_t l1 = vld1q_u8(ql + 64 * n + 16);
+            const uint8x16_t l2 = vld1q_u8(ql + 64 * n + 32);
+            const uint8x16_t l3 = vld1q_u8(ql + 64 * n + 48);
+            int8x16_t* g = c + 8 * n;
+            g[0] = q6_codes(vandq_u8(l0, m4b), q6_high<0>(h0));
+            g[1] = q6_codes(vandq_u8(l1, m4b), q6_high<0>(h1));
+            g[2] = q6_codes(vandq_u8(l2, m4b), q6_high<2>(h0));
+            g[3] = q6_codes(vandq_u8(l3, m4b), q6_high<2>(h1));
+            g[4] = q6_codes(vshrq_n_u8(l0, 4), q6_high<4>(h0));
+            g[5] = q6_codes(vshrq_n_u8(l1, 4), q6_high<4>(h1));
+            g[6] = q6_codes(vshrq_n_u8(l2, 4), q6_high<6>(h0));
+            g[7] = q6_codes(vshrq_n_u8(l3, 4), q6_high<6>(h1));
+        }
+        for (int t = 0; t < T; ++t) {
+            const std::int8_t* q8 = yq + t * qs + i * 256;
+            int32x4_t acc = vdupq_n_s32(0);
+            for (int g = 0; g < 16; ++g) {
+                acc = vmlaq_n_s32(acc, dot16(c[g], vld1q_s8(q8 + 16 * g)),
+                                  sc[g]);
+            }
+            sumf[t] += bd * yd[t * ds + i] *
+                       static_cast<float>(vaddvq_s32(acc));
+        }
+    }
+    for (int t = 0; t < T; ++t) {
+        out[t] = sumf[t];
+    }
+}
+
 }  // namespace
 
 void matvec_neon(const Mat& w, std::span<const float> x,
@@ -736,6 +918,122 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
         out[r] = q4k ? row_q4_k_q8k_neon(row, nb, yd.data(), yq.data(),
                                          ys.data())
                      : row_q6_k_q8k_neon(row, nb, yd.data(), yq.data());
+    }
+}
+
+/**
+ * Tokens per tile of matvec_batch_neon_q8k: as many quantized
+ * activation rows (cols bytes each) as fit about 64 KiB, so a tile
+ * stays in L1 while every weight row of the slice streams past it.
+ */
+static std::uint32_t q8_token_tile(std::size_t cols) {
+    return static_cast<std::uint32_t>(
+        std::clamp<std::size_t>((std::size_t{64} << 10) / cols, 4, 64));
+}
+
+void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
+                           std::span<float> out_batch, std::uint32_t n) {
+    const std::size_t cols = w.cols;
+    const bool block32 = uses_quantized_activation(w.type) &&
+                         !is_q8k_type(w.type) && cols % 32 == 0;
+    const bool q4k = w.type == gguf::TensorType::kQ4_K;
+    const bool q6k = w.type == gguf::TensorType::kQ6_K;
+    if (!block32 && ((!q4k && !q6k) || cols % 256 != 0)) {
+        // Other types: n per-token calls, scattered row-major.
+        thread_local std::vector<float> tmp;
+        tmp.resize(w.rows);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            matvec_neon_q8k(w, x_batch.subspan(t * cols, cols), tmp);
+            for (std::uint32_t r = 0; r < w.rows; ++r) {
+                out_batch[std::size_t{r} * n + t] = tmp[r];
+            }
+        }
+        return;
+    }
+    if (block32) {
+        // Block-32 weights x Q8_0 activations, as matvec_neon_q8k.
+        const std::size_t nb = cols / 32;
+        thread_local std::vector<float> d8;
+        thread_local std::vector<std::int8_t> q8;
+        d8.resize(nb * n);
+        q8.resize(cols * n);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            quantize_activation_q8_0(x_batch.subspan(t * cols, cols),
+                                     d8.data() + t * nb,
+                                     q8.data() + t * cols);
+        }
+        const std::size_t bb = w.type == gguf::TensorType::kQ8_0 ? 34 : 18;
+        const std::uint32_t tile = q8_token_tile(cols);
+        for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
+            const std::uint32_t t1 = std::min(n, t0 + tile);
+            for (std::uint32_t r = 0; r < w.rows; ++r) {
+                const std::byte* row = w.data + r * nb * bb;
+                float* o = out_batch.data() + std::size_t{r} * n;
+                std::uint32_t t = t0;
+                for (; t + 4 <= t1; t += 4) {
+                    rows_block32_q8_0_xt<4>(w.type, row, bb, nb,
+                                            d8.data() + t * nb,
+                                            q8.data() + t * cols, cols,
+                                            o + t);
+                }
+                for (; t < t1; ++t) {
+                    o[t] = row_block32_q8_0_neon(w.type, row, bb, nb,
+                                                 d8.data() + t * nb,
+                                                 q8.data() + t * cols);
+                }
+            }
+        }
+        return;
+    }
+    const std::size_t nb = cols / 256;
+    thread_local std::vector<float> yd;
+    thread_local std::vector<std::int8_t> yq;
+    thread_local std::vector<std::int16_t> ys;
+    yd.resize(nb * n);
+    yq.resize(cols * n);
+    ys.resize(nb * 16 * n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        quantize_activation_q8k(x_batch.subspan(t * cols, cols),
+                                yd.data() + t * nb, yq.data() + t * cols,
+                                ys.data() + t * nb * 16);
+    }
+    const std::size_t bb = q4k ? 144 : 210;
+    const std::uint32_t tile = q8_token_tile(cols);
+    // Four tokens per row pass (the kernels' T), then the tail one by
+    // one through the same kernels (so the result for a token does not
+    // depend on where it falls in the batch).
+    constexpr int kT = 4;
+    float o4[kT];
+    for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
+        const std::uint32_t t1 = std::min(n, t0 + tile);
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            const std::byte* row = w.data + r * nb * bb;
+            float* o = out_batch.data() + std::size_t{r} * n;
+            std::uint32_t t = t0;
+            for (; t + kT <= t1; t += kT) {
+                const float* d = yd.data() + t * nb;
+                const std::int8_t* q = yq.data() + t * cols;
+                if (q4k) {
+                    rows_q4_k_q8k_xt<kT>(row, nb, d, nb, q, cols,
+                                         ys.data() + t * nb * 16, nb * 16,
+                                         o4);
+                } else {
+                    rows_q6_k_q8k_xt<kT>(row, nb, d, nb, q, cols, o4);
+                }
+                std::copy(o4, o4 + kT, o + t);
+            }
+            for (; t < t1; ++t) {
+                const float* d = yd.data() + t * nb;
+                const std::int8_t* q = yq.data() + t * cols;
+                if (q4k) {
+                    rows_q4_k_q8k_xt<1>(row, nb, d, nb, q, cols,
+                                        ys.data() + t * nb * 16, nb * 16,
+                                        o + t);
+                } else {
+                    rows_q6_k_q8k_xt<1>(row, nb, d, nb, q, cols, o + t);
+                }
+            }
+        }
     }
 }
 

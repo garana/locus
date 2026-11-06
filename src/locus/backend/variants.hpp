@@ -39,6 +39,16 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
 void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch,
                        std::uint32_t n);
+
+/**
+ * matvec_neon_q8k on n tokens (Ops::matvec_q8k_batch): token-major
+ * x_batch, row-major out_batch (out[r*n + t]). Each token is quantized
+ * once, then each weight row is dotted against all n tokens while it
+ * is in cache, so weight DRAM traffic drops ~n-fold. Byte-identical to
+ * n matvec_neon_q8k() calls (the same row dot on the same quants).
+ */
+void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
+                           std::span<float> out_batch, std::uint32_t n);
 #endif
 
 #if defined(__x86_64__)
