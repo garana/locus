@@ -3547,15 +3547,22 @@ void VulkanSeq::head_norm_rope(Rows x, std::uint32_t n, std::uint32_t heads,
 void VulkanSeq::attention(Rows q, Rows k, Rows v, Rows out, std::uint32_t n,
                           std::uint32_t heads, std::uint32_t hd, Slot kh,
                           Slot vt, Slot scores) {
+    cross_attention(q, n, k, v, n, out, heads, hd, kh, vt, scores);
+}
+
+void VulkanSeq::cross_attention(Rows q, std::uint32_t n_q, Rows k, Rows v,
+                                std::uint32_t n_kv, Rows out,
+                                std::uint32_t heads, std::uint32_t hd,
+                                Slot kh, Slot vt, Slot scores) {
     State& s = im_->s;
-    const std::size_t plane = std::size_t{heads} * n * hd;
-    const std::size_t row = std::size_t{heads} * n;
+    const std::size_t plane = std::size_t{heads} * n_kv * hd;
+    const std::size_t row = std::size_t{heads} * n_kv;
     constexpr std::size_t kMaxFloats = std::size_t{1} << 30;
-    if (n == 0 || plane > kMaxFloats || row > kMaxFloats) {
+    if (n_q == 0 || n_kv == 0 || plane > kMaxFloats || row > kMaxFloats) {
         throw std::invalid_argument("VulkanSeq::attention: bad sizes");
     }
     const std::uint32_t mb = static_cast<std::uint32_t>(
-        std::clamp<std::size_t>(attn_scratch_floats.load() / row, 1, n));
+        std::clamp<std::size_t>(attn_scratch_floats.load() / row, 1, n_q));
     reserve(kh, plane);
     reserve(vt, plane);
     reserve(scores, row * mb);
@@ -3567,32 +3574,32 @@ void VulkanSeq::attention(Rows q, Rows k, Rows v, Rows out, std::uint32_t n,
         const Rows src = t ? v : k;
         const VulkanContext::Buffer bufs[] = {im_->slot(src.slot),
                                               t ? vtb : khb};
-        const std::uint32_t push[] = {n,       heads,      hd,
+        const std::uint32_t push[] = {n_kv,    heads,      hd,
                                       src.off, src.stride, t ? 1u : 0u};
         s.ctx.dispatch(Kernel::kHeadSplit, bufs, push, groups);
     }
     const auto qb = im_->slot(q.slot), ob = im_->slot(out.slot);
     const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-    for (std::uint32_t t0 = 0; t0 < n; t0 += mb) {
+    for (std::uint32_t t0 = 0; t0 < n_q; t0 += mb) {
         // Queries t0 .. t0 + m - 1, all heads at once (batch h): their
-        // scores fill the block as [heads][m][n].
-        const std::uint32_t m = std::min(mb, n - t0);
-        // S_h[t][j] = K_h[j] . Q[t][h]: K_h ([n][hd]) as the weight.
-        const Mat km{gguf::TensorType::kF32, nullptr, n, hd};
-        MatmulRows sr{m, q.off + t0 * q.stride, q.stride, 0, n};
+        // scores fill the block as [heads][m][n_kv].
+        const std::uint32_t m = std::min(mb, n_q - t0);
+        // S_h[t][j] = K_h[j] . Q[t][h]: K_h ([n_kv][hd]) as the weight.
+        const Mat km{gguf::TensorType::kF32, nullptr, n_kv, hd};
+        MatmulRows sr{m, q.off + t0 * q.stride, q.stride, 0, n_kv};
         sr.n_batch = heads;
-        sr.w_bstride_bytes = std::uint64_t{n} * hd * 4;
+        sr.w_bstride_bytes = std::uint64_t{n_kv} * hd * 4;
         sr.x_bstride = hd;
-        sr.out_bstride = m * n;
+        sr.out_bstride = m * n_kv;
         rec_matmul(s, km, khb, qb, sb, sr, false);
-        // Unmasked: the causal shader with base n - 1 sees all n keys.
-        rec_softmax(s, sb, heads * m, n, heads * m, n - 1, scale);
-        // O[t][h] = V_h^T P_h[t]: V_h^T ([hd][n]) as the weight.
-        const Mat vm{gguf::TensorType::kF32, nullptr, hd, n};
-        MatmulRows orr{m, 0, n, out.off + t0 * out.stride, out.stride};
+        // Unmasked: the causal shader with base n_kv - 1 sees all keys.
+        rec_softmax(s, sb, heads * m, n_kv, heads * m, n_kv - 1, scale);
+        // O[t][h] = V_h^T P_h[t]: V_h^T ([hd][n_kv]) as the weight.
+        const Mat vm{gguf::TensorType::kF32, nullptr, hd, n_kv};
+        MatmulRows orr{m, 0, n_kv, out.off + t0 * out.stride, out.stride};
         orr.n_batch = heads;
-        orr.w_bstride_bytes = std::uint64_t{hd} * n * 4;
-        orr.x_bstride = m * n;
+        orr.w_bstride_bytes = std::uint64_t{hd} * n_kv * 4;
+        orr.x_bstride = m * n_kv;
         orr.out_bstride = hd;
         rec_matmul(s, vm, vtb, sb, ob, orr, false);
     }

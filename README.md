@@ -44,12 +44,12 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   1024 pixels). `/v1/images/edits` runs FLUX.1 Kontext dev on a
   reference image (its VAE-encoded tokens join the image tokens), for
   the same character or scene in a new picture. On a Vulkan GPU with
-  unified memory, whatever backend the language model uses, PixArt's
-  linears, DiT attention and VAE convolutions run on the GPU (T5's
-  attention stays on the CPU), and the FLUX DiT runs each whole step
-  on the GPU with its activations resident (about 35 s for a 256 x 256
-  image on an M4 Max); elsewhere FLUX runs on the CPU, minutes per
-  image. Request fields:
+  unified memory, whatever backend the language model uses, the
+  PixArt and FLUX DiTs run each whole step on the GPU with their
+  activations resident, and the VAE convolutions run on the GPU
+  (T5's attention stays on the CPU). On an M4 Max a
+  256 x 256 FLUX image takes about 35 s; elsewhere FLUX runs on the
+  CPU, minutes per image. Request fields:
   docs/CLIENTS.md.
 - **Video output:** `/v1/videos` with LTX-Video 2B distilled (T5-XXL,
   the 3D DiT, rectified flow, the causal 3D VAE), text to video or

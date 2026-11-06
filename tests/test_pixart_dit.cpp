@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -105,7 +106,8 @@ TEST_CASE("pixart dit matches torch on a synthetic model",
     REQUIRE(in.size() == 2 * (lat + cap));
     REQUIRE(ref.size() == 2 * out);
     // The CPU backend, and the GPU image ops when a Vulkan device is
-    // usable, so every device runs the GPU linears and attention.
+    // usable: the resident step, with its attention in sub-blocks, and
+    // per op.
     std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
         {"cpu", &locus::backend::best_backend().ops}};
     if (locus::backend::vulkan_backend_usable()) {
@@ -114,14 +116,23 @@ TEST_CASE("pixart dit matches torch on a synthetic model",
         // attention runs its queries in several sub-blocks (5, 5, 5, 1
         // for 16 queries over 2 heads x 16 keys).
         legs.push_back({"vulkan blocks", &locus::backend::vulkan_image_ops()});
+        // LOCUS_PIXART_GPU=0: the GPU per op instead of one resident
+        // step.
+        legs.push_back({"vulkan per op", &locus::backend::vulkan_image_ops()});
     }
-    struct CapReset {
-        ~CapReset() { locus::backend::vulkan_set_attn_scratch_floats(0); }
-    } cap_reset;
+    struct Reset {
+        ~Reset() {
+            locus::backend::vulkan_set_attn_scratch_floats(0);
+            ::unsetenv("LOCUS_PIXART_GPU");
+        }
+    } reset;
     for (const auto& [name, op] : legs) {
         if (locus::backend::vulkan_backend_usable()) {
             locus::backend::vulkan_set_attn_scratch_floats(
                 std::string_view(name) == "vulkan blocks" ? 2 * 16 * 5 : 0);
+        }
+        if (std::string_view(name) == "vulkan per op") {
+            ::setenv("LOCUS_PIXART_GPU", "0", 1);
         }
         for (std::size_t b = 0; b < 2; ++b) {
             INFO(name << " batch row " << b);
