@@ -231,7 +231,8 @@ experts), not across tokens (an expert cache). `LOCUS_MOE_STATS=1`
 prints this telemetry. `LOCUS_MOE_TRACE=<file>` writes every pick as
 `layer expert`; `scripts/moe-trace-sim.py` replays a trace against
 cache policies (LRU, LFU, Belady, step WLRU, static top) for a given
-GPU budget.
+GPU budget. On Vulkan both variables route MoE layers on the host, so
+the picks reach the CPU.
 
 On a cold spinning disk, GLM-5.2 runs faster end to end than a
 CPU-only llama.cpp (50.7 versus 92 minutes for 16 tokens), because
