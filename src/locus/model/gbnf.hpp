@@ -84,7 +84,9 @@ class Gbnf {
  * Where a Gbnf parse stands after some UTF-8 bytes: the set of
  * pushdown stacks (each a list of element positions, the top one a
  * character to match next) that the input so far allows. Copyable,
- * so a caller can try bytes on a copy.
+ * so a caller can try bytes on a copy; step() writes the next state
+ * into a matcher the caller reuses, which allocates nothing once its
+ * buffers have grown (the per-token mask walk depends on that).
  */
 class GbnfMatcher {
   public:
@@ -97,22 +99,55 @@ class GbnfMatcher {
      */
     bool feed(std::uint8_t b);
 
+    /**
+     * The state after byte `b`, written into `out` (a matcher of the
+     * same grammar, whose buffers are reused).
+     * @returns false if no string of the grammar continues this way;
+     *     `out` is then unspecified.
+     */
+    bool step(std::uint8_t b, GbnfMatcher& out) const;
+
     /** @returns Whether the input so far is a complete string. */
     bool accepted() const;
 
     /** @returns Whether some character may still follow. */
     bool can_continue() const;
 
+    /**
+     * @returns The state as bytes: two matchers of one grammar with
+     *     equal keys accept the same continuations.
+     */
+    std::string key() const;
+
   private:
-    using Stack = std::vector<std::uint32_t>;
-    void expand(Stack s, std::vector<Stack>& out, int depth) const;
+    /** Stack i is data[i ? ends[i - 1] : 0, ends[i]). */
+    struct Stacks {
+        std::vector<std::uint32_t> data;
+        std::vector<std::uint32_t> ends;
+        std::size_t size() const { return ends.size(); }
+        std::uint32_t begin(std::size_t i) const { return i ? ends[i - 1] : 0; }
+        void clear() {
+            data.clear();
+            ends.clear();
+        }
+        void push(const std::vector<std::uint32_t>& s);
+    };
+    void expand(std::vector<std::uint32_t>& cur, Stacks& out, int depth) const;
     bool viable(char32_t lo, char32_t hi) const;
+    void dedup(Stacks& s) const;
 
     std::shared_ptr<const Gbnf> g_;
-    std::vector<Stack> stacks_;
-    // A UTF-8 character in progress: its bits so far and bytes left.
+    Stacks stacks_;
+    // Scratch for step(): the stack being expanded, the dedup order
+    // and copy.
+    mutable std::vector<std::uint32_t> cur_;
+    mutable std::vector<std::uint32_t> order_;
+    mutable Stacks tmp_;
+    // A UTF-8 character in progress: its bits so far, the continuation
+    // bytes left, and its continuation bytes in all.
     char32_t cp_ = 0;
     int need_ = 0;
+    int len_ = 0;
 };
 
 /**

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -28,10 +29,13 @@ class TokenTrie {
 
     const std::vector<Node>& nodes() const { return nodes_; }
     const std::vector<std::string>& pieces() const { return *pieces_; }
+    /** @returns The longest token, in bytes (the trie's depth). */
+    std::size_t max_len() const { return max_len_; }
 
   private:
     std::shared_ptr<const std::vector<std::string>> pieces_;
     std::vector<Node> nodes_;  // nodes_[0] is the root
+    std::size_t max_len_ = 0;
 };
 
 /**
@@ -54,13 +58,19 @@ class GrammarConstraint : public TokenConstraint {
     bool accepted() const { return m_.accepted(); }
 
   private:
-    void walk(std::uint32_t node, const GbnfMatcher& m) const;
+    void walk(std::uint32_t node, const GbnfMatcher& m,
+              std::size_t depth) const;
 
     GbnfMatcher m_;
     std::shared_ptr<const TokenTrie> trie_;
     tok::TokenId eos_;
     mutable std::vector<std::uint8_t> mask_;
     mutable bool fresh_ = false;
+    /** One matcher per trie depth, reused by every walk. */
+    mutable std::vector<GbnfMatcher> scratch_;
+    /** Masks by matcher state: inside a string or a repetition the
+     *  state after each token often repeats. */
+    mutable std::unordered_map<std::string, std::vector<std::uint8_t>> cache_;
 };
 
 }  // namespace locus::model

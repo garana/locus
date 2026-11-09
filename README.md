@@ -30,7 +30,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   `/v1/responses` (stateless), `/v1/embeddings`, `/v1/models`,
   `/metrics`, `/health`.
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
-  penalties, seed), JSON mode, prompt caching, logprobs, prompt-lookup
+  penalties, seed), structured output (JSON mode, a JSON Schema, a
+  regex or a GBNF grammar), prompt caching, logprobs, prompt-lookup
   speculative decoding.
 - **Large models:** weights stream from disk with readahead, so a
   model can be larger than RAM.

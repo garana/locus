@@ -459,8 +459,17 @@ guarding the default path.
   presence penalties, per-request seed. Temperature 0 is argmax. The
   filter order matches llama.cpp (penalties, constraint, top-k,
   temperature and softmax, top-p, min-p, draw).
-- JSON mode: an incremental JSON-grammar validator masks tokens whose
-  bytes would break the grammar (`response_format: json_object`).
+- Structured output: every format (JSON mode, a JSON Schema, a regex)
+  becomes a GBNF grammar. A matcher keeps the set of pushdown stacks
+  the output so far allows, over UTF-8 code points; a rule reference
+  at the end of a sequence drops the caller's frame, so repetition
+  does not grow the stacks, and left recursion is rejected at parse
+  time. Each step's allowed tokens come from one walk of a trie of the
+  vocabulary's bytes, cached by matcher state (inside a string the
+  state repeats). EOS is allowed only on a complete match and is the
+  only choice once nothing more can follow. With a 128k vocabulary on
+  an M2 Pro (Llama 3.2 1B, CPU) a JSON Schema costs about 3.5 ms per
+  token over free decoding.
 - Prompt caching: exact token-prefix keys, ref-counted block pins, LRU
   eviction; the longest shared prefix is adopted, leaving at least one
   token to recompute the last logits. Lookup is indexed by a 64-bit

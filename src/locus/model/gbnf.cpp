@@ -515,47 +515,97 @@ bool Gbnf::may_match(std::uint32_t p, char32_t lo, char32_t hi) const {
     return e.negate;
 }
 
-GbnfMatcher::GbnfMatcher(std::shared_ptr<const Gbnf> g) : g_(std::move(g)) {
-    expand(Stack{g_->start()}, stacks_, 0);
-    std::sort(stacks_.begin(), stacks_.end());
-    stacks_.erase(std::unique(stacks_.begin(), stacks_.end()), stacks_.end());
+void GbnfMatcher::Stacks::push(const std::vector<std::uint32_t>& s) {
+    data.insert(data.end(), s.begin(), s.end());
+    ends.push_back(static_cast<std::uint32_t>(data.size()));
 }
 
-void GbnfMatcher::expand(Stack s, std::vector<Stack>& out, int depth) const {
+GbnfMatcher::GbnfMatcher(std::shared_ptr<const Gbnf> g) : g_(std::move(g)) {
+    cur_.assign(1, g_->start());
+    expand(cur_, stacks_, 0);
+    dedup(stacks_);
+}
+
+void GbnfMatcher::expand(std::vector<std::uint32_t>& cur, Stacks& out,
+                         int depth) const {
     if (depth > 10000) return;  // unreachable after the left-rec check
-    if (s.empty()) {
-        out.push_back(std::move(s));
+    if (cur.empty()) {
+        out.push(cur);
         return;
     }
     const auto& el = g_->elems();
-    const std::uint32_t p = s.back();
+    const std::uint32_t p = cur.back();
     if (el[p].kind == Gbnf::Elem::kChar) {
-        out.push_back(std::move(s));
+        out.push(cur);
         return;
     }
     // A rule reference: continue after it, then enter each alternative.
     // When the reference ends its sequence the caller's frame is
-    // dropped first, so a repetition does not grow the stack.
-    s.pop_back();
-    if (el[p + 1].kind != Gbnf::Elem::kEnd) s.push_back(p + 1);
-    const auto& alts = g_->alts(el[p].ref);
-    for (std::size_t i = 0; i < alts.size(); ++i) {
-        Stack t = i + 1 == alts.size() ? std::move(s) : s;
-        if (el[alts[i]].kind != Gbnf::Elem::kEnd) t.push_back(alts[i]);
-        expand(std::move(t), out, depth + 1);
+    // dropped first, so a repetition does not grow the stack. `cur` is
+    // edited in place and restored before returning.
+    cur.pop_back();
+    const bool cont = el[p + 1].kind != Gbnf::Elem::kEnd;
+    if (cont) cur.push_back(p + 1);
+    for (const std::uint32_t a : g_->alts(el[p].ref)) {
+        if (el[a].kind != Gbnf::Elem::kEnd) {
+            cur.push_back(a);
+            expand(cur, out, depth + 1);
+            cur.pop_back();
+        } else {
+            expand(cur, out, depth + 1);
+        }
     }
+    if (cont) cur.pop_back();
+    cur.push_back(p);
+}
+
+void GbnfMatcher::dedup(Stacks& s) const {
+    const std::size_t n = s.size();
+    if (n < 2) return;
+    const auto lo = [&](std::uint32_t i) { return s.data.begin() + s.begin(i); };
+    const auto hi = [&](std::uint32_t i) { return s.data.begin() + s.ends[i]; };
+    order_.resize(n);
+    for (std::uint32_t i = 0; i < n; ++i) order_[i] = i;
+    std::sort(order_.begin(), order_.end(),
+              [&](std::uint32_t a, std::uint32_t b) {
+                  return std::lexicographical_compare(lo(a), hi(a), lo(b),
+                                                      hi(b));
+              });
+    tmp_.clear();
+    for (std::size_t k = 0; k < n && tmp_.size() < kMaxStacks; ++k) {
+        const std::uint32_t i = order_[k];
+        if (k > 0 && std::equal(lo(order_[k - 1]), hi(order_[k - 1]), lo(i),
+                                hi(i))) {
+            continue;
+        }
+        tmp_.data.insert(tmp_.data.end(), lo(i), hi(i));
+        tmp_.ends.push_back(static_cast<std::uint32_t>(tmp_.data.size()));
+    }
+    std::swap(s.data, tmp_.data);
+    std::swap(s.ends, tmp_.ends);
 }
 
 bool GbnfMatcher::viable(char32_t lo, char32_t hi) const {
-    for (const Stack& s : stacks_) {
-        if (!s.empty() && g_->may_match(s.back(), lo, hi)) return true;
+    for (std::size_t i = 0; i < stacks_.size(); ++i) {
+        const std::uint32_t e = stacks_.ends[i];
+        if (e != stacks_.begin(i) && g_->may_match(stacks_.data[e - 1], lo, hi)) {
+            return true;
+        }
     }
     return false;
 }
 
 bool GbnfMatcher::feed(std::uint8_t b) {
+    GbnfMatcher next = *this;
+    if (!step(b, next)) return false;
+    *this = std::move(next);
+    return true;
+}
+
+bool GbnfMatcher::step(std::uint8_t b, GbnfMatcher& out) const {
     char32_t cp = 0;
     int need = 0;
+    int len = len_;  // continuation bytes of the whole character
     if (need_ == 0) {
         if (b < 0x80) {
             cp = b;
@@ -571,52 +621,79 @@ bool GbnfMatcher::feed(std::uint8_t b) {
         } else {
             return false;
         }
+        len = need;
     } else {
         if ((b & 0xC0) != 0x80) return false;
         cp = (cp_ << 6) | (b & 0x3F);
         need = need_ - 1;
     }
+    // The shortest form only: a 2-byte character is at least U+0080,
+    // a 3-byte one U+0800, a 4-byte one U+10000.
+    const char32_t min_cp = len == 1 ? 0x80 : len == 2 ? 0x800 : 0x10000;
     if (need > 0) {
         // A character in progress: some stack must accept one of the
         // code points that start with these bits.
         const int shift = 6 * need;
-        const char32_t lo = cp << shift;
-        const char32_t hi = lo | ((char32_t{1} << shift) - 1);
-        if (!viable(lo, hi)) return false;
-        cp_ = cp;
-        need_ = need;
+        const char32_t lo = std::max<char32_t>(cp << shift, min_cp);
+        const char32_t hi = std::min<char32_t>(
+            (cp << shift) | ((char32_t{1} << shift) - 1), 0x10FFFF);
+        if (lo > hi || !viable(lo, hi)) return false;
+        out.stacks_.data = stacks_.data;  // reuses out's capacity
+        out.stacks_.ends = stacks_.ends;
+        out.cp_ = cp;
+        out.need_ = need;
+        out.len_ = len;
         return true;
     }
-    const auto& el = g_->elems();
-    std::vector<Stack> next;
-    for (const Stack& s : stacks_) {
-        if (s.empty() || !g_->matches(s.back(), cp)) continue;
-        Stack t = s;
-        const std::uint32_t p = t.back() + 1;
-        t.pop_back();
-        if (el[p].kind != Gbnf::Elem::kEnd) t.push_back(p);
-        expand(std::move(t), next, 0);
+    if (len > 0 &&
+        (cp < min_cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))) {
+        return false;  // overlong, out of range or a surrogate
     }
-    if (next.empty()) return false;
-    std::sort(next.begin(), next.end());
-    next.erase(std::unique(next.begin(), next.end()), next.end());
-    if (next.size() > kMaxStacks) next.resize(kMaxStacks);
-    stacks_ = std::move(next);
-    cp_ = 0;
-    need_ = 0;
+    const auto& el = g_->elems();
+    out.stacks_.clear();
+    for (std::size_t i = 0; i < stacks_.size(); ++i) {
+        const std::uint32_t s = stacks_.begin(i), e = stacks_.ends[i];
+        if (s == e || !g_->matches(stacks_.data[e - 1], cp)) continue;
+        cur_.assign(stacks_.data.begin() + s, stacks_.data.begin() + e - 1);
+        const std::uint32_t p = stacks_.data[e - 1] + 1;
+        if (el[p].kind != Gbnf::Elem::kEnd) cur_.push_back(p);
+        expand(cur_, out.stacks_, 0);
+    }
+    if (out.stacks_.size() == 0) return false;
+    dedup(out.stacks_);
+    out.cp_ = 0;
+    out.need_ = 0;
+    out.len_ = 0;
     return true;
 }
 
 bool GbnfMatcher::accepted() const {
     if (need_ != 0) return false;
-    return std::any_of(stacks_.begin(), stacks_.end(),
-                       [](const Stack& s) { return s.empty(); });
+    for (std::size_t i = 0; i < stacks_.size(); ++i) {
+        if (stacks_.ends[i] == stacks_.begin(i)) return true;
+    }
+    return false;
+}
+
+std::string GbnfMatcher::key() const {
+    std::string k;
+    const auto put = [&k](std::uint32_t v) {
+        k.append(reinterpret_cast<const char*>(&v), sizeof v);
+    };
+    put(static_cast<std::uint32_t>(cp_));
+    put(static_cast<std::uint32_t>(need_ << 8 | len_));
+    for (const std::uint32_t e : stacks_.ends) put(e);
+    put(~0u);
+    for (const std::uint32_t d : stacks_.data) put(d);
+    return k;
 }
 
 bool GbnfMatcher::can_continue() const {
     if (need_ != 0) return true;
-    return std::any_of(stacks_.begin(), stacks_.end(),
-                       [](const Stack& s) { return !s.empty(); });
+    for (std::size_t i = 0; i < stacks_.size(); ++i) {
+        if (stacks_.ends[i] != stacks_.begin(i)) return true;
+    }
+    return false;
 }
 
 namespace {

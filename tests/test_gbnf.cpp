@@ -81,6 +81,17 @@ TEST_CASE("gbnf matches UTF-8 code points, also split across feeds",
     GbnfMatcher m2(g);
     for (const char c : std::string("caf")) m2.feed(static_cast<std::uint8_t>(c));
     CHECK_FALSE(m2.feed(0xC2));  // U+0080..U+00BF: below the range
+
+    // A lead byte promises a code point of its length's range only: a
+    // 3- or 4-byte character can never be "{" (an overlong form).
+    GbnfMatcher brace(Gbnf::parse(R"(root ::= "{")"));
+    CHECK_FALSE(brace.feed(0xE0));
+    CHECK_FALSE(brace.feed(0xF0));
+    CHECK(brace.feed('{'));
+    GbnfMatcher any(Gbnf::parse("root ::= ."));
+    CHECK(any.feed(0xE0));
+    CHECK_FALSE(any.feed(0x80));  // E0 80 .. would be overlong
+    CHECK_FALSE(full("root ::= .", "\xED\xA0\x80"));  // a surrogate
 }
 
 TEST_CASE("gbnf rejects bad grammars", "[gbnf]") {
