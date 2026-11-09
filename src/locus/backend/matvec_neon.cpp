@@ -375,103 +375,6 @@ float dot_iq1_s_block_neon(const std::byte* blk, const float* x) {
     return vaddvq_f32(acc);
 }
 
-/**
- * Per-lane int16 products of 16 weight codes and 16 q8 values: lane l
- * of the result sums the products of elements l and l + 8 -- the
- * scalar dots' aux16[l] for two consecutive 8-element chunks.
- */
-inline int16x8_t prod16(int8x16_t a, const std::int8_t* q8) {
-    const int8x16_t b = vld1q_s8(q8);
-    return vaddq_s16(vmull_s8(vget_low_s8(a), vget_low_s8(b)),
-                     vmull_s8(vget_high_s8(a), vget_high_s8(b)));
-}
-
-/** aux32[0..7] += scale * p, lane for lane (exact integers). */
-inline void mla8(int32x4_t& lo, int32x4_t& hi, int16x8_t p,
-                 std::int16_t scale) {
-    lo = vmlal_n_s16(lo, vget_low_s16(p), scale);
-    hi = vmlal_high_n_s16(hi, p, scale);
-}
-
-/**
- * The scalar dots' per-block float step, sums[l] += d * aux32[l],
- * written as the same C++ expression as the scalar dot, so whatever
- * the compiler does with it (contract to an FMA or not), it does the
- * same in both.
- */
-inline void add8(float sums[8], int32x4_t a_lo, int32x4_t a_hi, float d) {
-    std::int32_t aux32[8];
-    vst1q_s32(aux32, a_lo);
-    vst1q_s32(aux32 + 4, a_hi);
-    for (int l = 0; l < 8; ++l) {
-        sums[l] += d * static_cast<float>(aux32[l]);
-    }
-}
-
-/**
- * One Q4_K row x Q8_K activation, bit-identical to the scalar
- * vec_dot_q4_k_q8_k (ggml's generic order): the per-lane aux32
- * integers come from NEON widening products (exact, so the order of
- * integer adds is free), and the float steps are the scalar's.
- */
-float row_q4_k_q8k_neon(const std::byte* row, std::size_t nb,
-                        const float* yd, const std::int8_t* yq,
-                        const std::int16_t* ys) {
-    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
-                            kmask3 = 0x03030303;
-    const uint8x16_t m4b = vdupq_n_u8(0x0f);
-    float sums[8] = {0};
-    float sumf = 0.0f;
-    for (std::size_t i = 0; i < nb; ++i) {
-        const std::byte* blk = row + i * 144;
-        const float bd = half_to_float(load_u16(blk));
-        const float bdmin = half_to_float(load_u16(blk + 2));
-        std::uint32_t utmp[4];
-        std::memcpy(utmp, blk + 4, 12);
-        utmp[3] = ((utmp[2] >> 4) & kmask2) |
-                  (((utmp[1] >> 6) & kmask3) << 4);
-        const std::uint32_t uaux = utmp[1] & kmask1;
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= kmask1;
-        const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
-        const auto* mins = scales + 8;
-        const std::int16_t* bs = ys + i * 16;
-        int sumi = 0;
-        for (int j = 0; j < 16; ++j) {
-            sumi += bs[j] * mins[j / 2];
-        }
-        const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 16);
-        const std::int8_t* q8 = yq + i * 256;
-        int32x4_t a_lo = vdupq_n_s32(0), a_hi = vdupq_n_s32(0);
-        for (int j = 0; j < 4; ++j, q4 += 32, q8 += 64) {
-            const uint8x16_t b0 = vld1q_u8(q4);
-            const uint8x16_t b1 = vld1q_u8(q4 + 16);
-            // Sub-block 2j: low nibbles; 2j + 1: high nibbles. Each
-            // product <= 15 * 127, so four per lane fit an int16.
-            mla8(a_lo, a_hi,
-                 vaddq_s16(prod16(vreinterpretq_s8_u8(vandq_u8(b0, m4b)),
-                                  q8),
-                           prod16(vreinterpretq_s8_u8(vandq_u8(b1, m4b)),
-                                  q8 + 16)),
-                 scales[2 * j]);
-            mla8(a_lo, a_hi,
-                 vaddq_s16(prod16(vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)),
-                                  q8 + 32),
-                           prod16(vreinterpretq_s8_u8(vshrq_n_u8(b1, 4)),
-                                  q8 + 48)),
-                 scales[2 * j + 1]);
-        }
-        const float d = bd * yd[i];
-        add8(sums, a_lo, a_hi, d);
-        sumf -= bdmin * yd[i] * static_cast<float>(sumi);
-    }
-    for (int l = 0; l < 8; ++l) {
-        sumf += sums[l];
-    }
-    return sumf;
-}
-
 /** The 2-bit qh field at SH, moved to bits 4..5 of each byte. */
 template <int SH>
 uint8x16_t q6_high(uint8x16_t h) {
@@ -487,56 +390,6 @@ uint8x16_t q6_high(uint8x16_t h) {
 inline int8x16_t q6_codes(uint8x16_t low, uint8x16_t high) {
     return vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(low, high)),
                     vdupq_n_s8(32));
-}
-
-/**
- * One Q6_K row x Q8_K activation, bit-identical to the scalar
- * vec_dot_q6_k_q8_k: 16 groups of 16 codes per block, in the scalar's
- * aux8 order, each group's per-lane products scaled by its int8
- * scale.
- */
-float row_q6_k_q8k_neon(const std::byte* row, std::size_t nb,
-                        const float* yd, const std::int8_t* yq) {
-    const uint8x16_t m4b = vdupq_n_u8(0x0f);
-    float sums[8] = {0};
-    for (std::size_t i = 0; i < nb; ++i) {
-        const std::byte* blk = row + i * 210;
-        const auto* ql = reinterpret_cast<const std::uint8_t*>(blk);
-        const auto* qh = reinterpret_cast<const std::uint8_t*>(blk + 128);
-        const auto* sc = reinterpret_cast<const std::int8_t*>(blk + 192);
-        const float bd = half_to_float(load_u16(blk + 208));
-        const std::int8_t* q8 = yq + i * 256;
-        int32x4_t a_lo = vdupq_n_s32(0), a_hi = vdupq_n_s32(0);
-        for (int n = 0; n < 2; ++n, ql += 64, qh += 32, q8 += 128,
-                 sc += 8) {
-            const uint8x16_t h0 = vld1q_u8(qh);
-            const uint8x16_t h1 = vld1q_u8(qh + 16);
-            const uint8x16_t l0 = vld1q_u8(ql);
-            const uint8x16_t l1 = vld1q_u8(ql + 16);
-            const uint8x16_t l2 = vld1q_u8(ql + 32);
-            const uint8x16_t l3 = vld1q_u8(ql + 48);
-            // |code * q8| <= 32 * 127, so two per lane fit an int16.
-            const int8x16_t c[8] = {
-                q6_codes(vandq_u8(l0, m4b), q6_high<0>(h0)),
-                q6_codes(vandq_u8(l1, m4b), q6_high<0>(h1)),
-                q6_codes(vandq_u8(l2, m4b), q6_high<2>(h0)),
-                q6_codes(vandq_u8(l3, m4b), q6_high<2>(h1)),
-                q6_codes(vshrq_n_u8(l0, 4), q6_high<4>(h0)),
-                q6_codes(vshrq_n_u8(l1, 4), q6_high<4>(h1)),
-                q6_codes(vshrq_n_u8(l2, 4), q6_high<6>(h0)),
-                q6_codes(vshrq_n_u8(l3, 4), q6_high<6>(h1))};
-            for (int g = 0; g < 8; ++g) {
-                mla8(a_lo, a_hi, prod16(c[g], q8 + 16 * g), sc[g]);
-            }
-        }
-        const float d = bd * yd[i];
-        add8(sums, a_lo, a_hi, d);
-    }
-    float sumf = 0.0f;
-    for (int l = 0; l < 8; ++l) {
-        sumf += sums[l];
-    }
-    return sumf;
 }
 
 /** One block-32 weight block as 2 x 16 int8 values (low, high
@@ -678,7 +531,7 @@ inline int32x4_t dot16(int8x16_t a, int8x16_t b) {
  * are unpacked once and dotted against every token. Per token and
  * block, the integer sum over the 8 scaled sub-blocks is exact; the
  * float steps are one multiply-add per block, so the sum is
- * deterministic but not ggml's scalar order (row_q4_k_q8k_neon).
+ * deterministic but not ggml's scalar order (scalar matvec_q8k).
  * Token t's quants are at yq + t * qs, its scales at yd + t * ds and
  * its 16-sums at ys + t * ss.
  */
@@ -915,9 +768,13 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
     const std::size_t bb = q4k ? 144 : 210;
     for (std::uint32_t r = 0; r < w.rows; ++r) {
         const std::byte* row = w.data + r * nb * bb;
-        out[r] = q4k ? row_q4_k_q8k_neon(row, nb, yd.data(), yq.data(),
-                                         ys.data())
-                     : row_q6_k_q8k_neon(row, nb, yd.data(), yq.data());
+        if (q4k) {
+            rows_q4_k_q8k_xt<1>(row, nb, yd.data(), nb, yq.data(), x.size(),
+                                ys.data(), nb * 16, &out[r]);
+        } else {
+            rows_q6_k_q8k_xt<1>(row, nb, yd.data(), nb, yq.data(), x.size(),
+                                &out[r]);
+        }
     }
 }
 
