@@ -1,9 +1,11 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -22,6 +24,7 @@
 #include "locus/pipeline/stage.hpp"
 #include "locus/pipeline/stage_server.hpp"
 #include "locus/tok/tokenizer.hpp"
+#include "gguf_builder.hpp"
 
 using locus::pipeline::Message;
 using locus::pipeline::MsgType;
@@ -1085,4 +1088,140 @@ TEST_CASE("TransformerModel::kv_pool_bytes scales with the block count",
     const std::size_t b200 = model.kv_pool_bytes(200);
     REQUIRE(b100 > 0);
     REQUIRE(b200 == 2 * b100);  // linear in n_blocks
+}
+
+namespace {
+
+/**
+ * A 3-layer llama GGUF image with small pseudo-random f32 weights.
+ * @param tied Leave out output.weight, so the head is the embedding.
+ */
+std::vector<std::byte> tiny_llama(bool tied) {
+    constexpr std::uint64_t E = 8, F = 16, V = 16;
+    constexpr std::uint32_t L = 3;
+    struct T {
+        std::string name;
+        std::vector<std::uint64_t> dims;
+        std::vector<float> data;
+    };
+    std::vector<T> ts;
+    std::uint32_t seed = 1;
+    auto add = [&](std::string name, std::vector<std::uint64_t> dims,
+                   bool ones = false) {
+        std::size_t n = 1;
+        for (const auto d : dims) n *= d;
+        std::vector<float> v(n, 1.0f);
+        std::uint32_t s = seed++ * 2654435761u + 12345u;
+        for (auto& f : v) {
+            if (ones) break;
+            s = s * 1664525u + 1013904223u;
+            f = (static_cast<float>(s >> 8) /
+                     static_cast<float>(1u << 24) -
+                 0.5f) *
+                0.2f;
+        }
+        ts.push_back({std::move(name), std::move(dims), std::move(v)});
+    };
+    add("token_embd.weight", {E, V});
+    add("output_norm.weight", {E}, true);
+    if (!tied) add("output.weight", {E, V});
+    for (std::uint32_t l = 0; l < L; ++l) {
+        const std::string bp = "blk." + std::to_string(l) + ".";
+        add(bp + "attn_norm.weight", {E}, true);
+        add(bp + "ffn_norm.weight", {E}, true);
+        for (const char* w : {"attn_q", "attn_k", "attn_v", "attn_output"}) {
+            add(bp + w + ".weight", {E, E});
+        }
+        add(bp + "ffn_gate.weight", {E, F});
+        add(bp + "ffn_up.weight", {E, F});
+        add(bp + "ffn_down.weight", {F, E});
+    }
+
+    GgufBuilder b;
+    b.header(ts.size(), 8)
+        .kv_string("general.architecture", "llama")
+        .kv_u32("llama.embedding_length", E)
+        .kv_u32("llama.block_count", L)
+        .kv_u32("llama.attention.head_count", 2)
+        .kv_u32("llama.attention.head_count_kv", 2)
+        .kv_u32("llama.feed_forward_length", F)
+        .kv_u32("llama.context_length", 32)
+        .kv_f32("llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    std::uint64_t offset = 0;
+    for (const auto& t : ts) {
+        b.tensor(t.name, t.dims, 0 /* F32 */, offset);
+        offset = (offset + t.data.size() * 4 + 31) & ~31ull;
+    }
+    b.pad();
+    for (const auto& t : ts) {
+        b.raw_bytes(std::as_bytes(std::span(t.data)));
+        b.pad();
+    }
+    const auto out = b.bytes();
+    return {out.begin(), out.end()};
+}
+
+}  // namespace
+
+// i#29: a stage maps the embedding only when it is first (or last with
+// a tied head) and the output norm and head only when it is last; a
+// chain of such stages still gives the full model's logits.
+TEST_CASE("a stage loads only the model-level weights it runs",
+          "[pipeline]") {
+    using locus::model::TransformerModel;
+    for (const bool tied : {false, true}) {
+        CAPTURE(tied);
+        const auto img = tiny_llama(tied);
+        auto g = locus::gguf::GgufFile::parse(img);
+        const auto full = TransformerModel::load(g);
+        const auto first = TransformerModel::load(g, 0, 1);
+        const auto mid = TransformerModel::load(g, 1, 2);
+        const auto last = TransformerModel::load(g, 2, 3);
+        const std::uint32_t E = full.hparams().n_embd;
+        const std::uint32_t V = full.hparams().n_vocab;
+
+        REQUIRE(full.embedding().data != nullptr);
+        REQUIRE(full.output_weight().data != nullptr);
+        REQUIRE(full.output_norm().size() == E);
+
+        REQUIRE(first.embedding().data != nullptr);
+        REQUIRE(first.output_weight().data == nullptr);
+        REQUIRE(first.output_norm().empty());
+
+        REQUIRE(mid.embedding().data == nullptr);
+        REQUIRE(mid.output_weight().data == nullptr);
+        REQUIRE(mid.output_norm().empty());
+
+        REQUIRE((last.embedding().data != nullptr) == tied);
+        REQUIRE(last.output_weight().data != nullptr);
+        REQUIRE(last.output_norm().size() == E);
+        if (tied) {
+            REQUIRE(last.output_weight().data == last.embedding().data);
+        }
+
+        auto run = [](const TransformerModel& m) {
+            return std::pair{m.make_cache(), m.make_workspace()};
+        };
+        auto [fc, fw] = run(full);
+        auto [c0, w0] = run(first);
+        auto [c1, w1] = run(mid);
+        auto [c2, w2] = run(last);
+        locus::kv::PagedKvCache::Seq fs, s0, s1, s2;
+        for (const locus::tok::TokenId t : {1, 5, 9, 3, 14}) {
+            REQUIRE(fc.ensure_capacity(fs, 1));
+            REQUIRE(c0.ensure_capacity(s0, 1));
+            REQUIRE(c1.ensure_capacity(s1, 1));
+            REQUIRE(c2.ensure_capacity(s2, 1));
+            std::vector<float> ref(V), h1(E), h2(E), logits(V);
+            full.forward_layers(t, {}, 0, 3, fc, fs, fw, ref);
+            first.forward_layers(t, {}, 0, 1, c0, s0, w0, h1);
+            mid.forward_layers(0, h1, 1, 2, c1, s1, w1, h2);
+            last.forward_layers(0, h2, 2, 3, c2, s2, w2, logits);
+            // Only the last stage consumes the token; a middle stage
+            // advances its own sequence, as PipelineStage does.
+            ++s0.n_tokens;
+            ++s1.n_tokens;
+            REQUIRE(logits == ref);
+        }
+    }
 }

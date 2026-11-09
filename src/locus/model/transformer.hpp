@@ -640,6 +640,9 @@ class TransformerModel {
     /** One past the last absolute layer index this model loaded
      * (n_layers for a full load). */
     std::uint32_t layer_end() const { return layer_end_; }
+    /** Empty (no data, 0 rows) on a stage that is not first, unless
+     * it is last and the head is tied to the embedding. The output
+     * norm and weight are empty on a stage that is not last. */
     const backend::Mat& embedding() const { return embd_; }
     const backend::Mat& output_weight() const { return out_w_; }
     std::span<const float> output_norm() const {
