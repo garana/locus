@@ -393,8 +393,6 @@ TransformerModel TransformerModel::load(const GgufFile& g,
         throw Error("missing tensor: token_embd.weight");
     }
     hp.n_vocab = static_cast<std::uint32_t>(embd->ne[1]);
-    m.embd_ = need_mat(g, "token_embd.weight", hp.n_embd,
-                       hp.n_vocab);
 
     // Slice-only loading (multi-server, DESIGN.md R15+): a stage loads
     // only its owned layer range [layer_begin, layer_end); layer_end 0
@@ -410,6 +408,16 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     }
     m.layer_begin_ = layer_begin;
     m.layer_end_ = layer_end;
+    // A stage maps only the model-level weights it runs (i#29): the
+    // embedding on the first stage, the output norm and head on the
+    // last. A tied head is the embedding, so a last stage keeps it.
+    const bool first = layer_begin == 0;
+    const bool last = layer_end == hp.n_layers;
+    const bool tied = g.find_tensor("output.weight") == nullptr;
+    if (first || (last && tied)) {
+        m.embd_ = need_mat(g, "token_embd.weight", hp.n_embd,
+                           hp.n_vocab);
+    }
 
     m.layers_.resize(hp.n_layers);
     for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
@@ -492,12 +500,13 @@ TransformerModel TransformerModel::load(const GgufFile& g,
         m.rope_factors_ =
             need_vec(g, "rope_freqs.weight", hp.head_dim / 2);
     }
-    m.out_norm_ = need_vec(g, "output_norm.weight", hp.n_embd);
-    // Tied embeddings when output.weight is absent.
-    m.out_w_ = g.find_tensor("output.weight") != nullptr
-                   ? need_mat(g, "output.weight", hp.n_embd,
-                              hp.n_vocab)
-                   : m.embd_;
+    if (last) {
+        m.out_norm_ = need_vec(g, "output_norm.weight", hp.n_embd);
+        // Tied embeddings when output.weight is absent.
+        m.out_w_ = tied ? m.embd_
+                        : need_mat(g, "output.weight", hp.n_embd,
+                                   hp.n_vocab);
+    }
 
     // R9 static pinning (opt-in): wire every non-expert weight
     // into RAM so per-token streaming is only the routed
