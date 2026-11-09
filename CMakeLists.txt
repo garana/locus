@@ -69,6 +69,9 @@ add_library(locus
     src/locus/image/image_input.cpp
     src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp
+    src/locus/model/gbnf.cpp
+    src/locus/model/grammar_constraint.cpp
+    src/locus/model/json_schema_gbnf.cpp
     src/locus/model/transformer.cpp
     src/locus/model/expert_cache.cpp
     src/locus/model/expert_metrics.cpp
