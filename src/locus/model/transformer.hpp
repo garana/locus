@@ -678,6 +678,12 @@ class TransformerModel {
     void moe_ffn(const Layer& lay, Workspace& ws,
                  std::uint32_t layer) const;
 
+    /** @returns The MoE hybrid state, or nullptr when the mode is off
+     *  (see MoeHybrid in transformer.cpp). */
+    struct MoeHybrid* moe_hybrid() const;
+    /** q8k_activations() as if `b` were the model's backend. */
+    bool q8k_activations_for(const backend::Backend* b) const;
+
     /**
      * Batched MoE (R10 step 3b): routes n tokens (ffn-normed
      * inputs in xbf, n*n_embd), then applies the routed experts
@@ -696,6 +702,10 @@ class TransformerModel {
     const struct ArchSpec* spec_ = nullptr;
     const backend::Backend* backend_ = nullptr;
     std::shared_ptr<StageMetrics> stage_metrics_;
+    /** LOCUS_MOE_HYBRID state, set up on the first MoE layer. */
+    std::shared_ptr<struct MoeHybrid> moe_hybrid_;
+    /** Sum of every tensor's bytes (sizes the hybrid hot zone). */
+    std::uint64_t weight_bytes_ = 0;
     /** use_q8k_activations' choice: -1 none (the default rule), 0 off,
      * 1 on. */
     int q8k_override_ = -1;

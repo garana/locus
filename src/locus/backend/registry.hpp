@@ -88,6 +88,15 @@ struct Ops {
      */
     void (*prefetch)(const Mat& w);
     /**
+     * Optional: frees w's copy in the backend's weight pool now
+     * (nullptr on backends without one). The MoE hybrid mode calls it
+     * when an expert leaves the GPU hot set, so the pool's room goes
+     * to the expert that replaced it. Never blocks on compute.
+     */
+    void (*evict)(const Mat& w);
+    /** Optional: @returns the weight pool's byte budget. */
+    std::size_t (*pool_budget)();
+    /**
      * True when matvec() may be called concurrently from several
      * threads (the R9 row-split, matvec_mt). The CPU kernels and
      * the CUDA pager are re-entrant; the Vulkan backend drives a

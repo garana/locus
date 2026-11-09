@@ -91,7 +91,9 @@ const std::vector<Backend>& list() {
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_cuda,
                       .self_parallel = true,
-                      .prefetch = &cuda_prefetch}});
+                      .prefetch = &cuda_prefetch,
+                      .evict = &cuda_evict,
+                      .pool_budget = &cuda_pool_budget}});
 #pragma GCC diagnostic pop
         return b;
     }();

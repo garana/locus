@@ -70,6 +70,7 @@ add_library(locus
     src/locus/audio/wav.cpp
     src/locus/model/grammar.cpp
     src/locus/model/transformer.cpp
+    src/locus/model/expert_cache.cpp
     src/locus/model/expert_metrics.cpp
     src/locus/model/moe_stats.cpp
     src/locus/model/stage_metrics.cpp
