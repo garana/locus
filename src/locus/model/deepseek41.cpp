@@ -840,7 +840,9 @@ void forward(const TransformerModel& m, tok::TokenId token,
     s.cand.clear();
 
     // Embedding: every stream starts as the token embedding; the id is
-    // kept for later positions' Engram hashes.
+    // kept for later positions' Engram hashes. forward_layers calls
+    // this only over the whole model, so the embedding and head are
+    // loaded (a stage slice maps them only where it uses them).
     s.h.resize(E);
     op.dequant_row(m.embedding(), static_cast<std::uint32_t>(token), s.h);
     s.X.resize(std::size_t{d.hc} * E);

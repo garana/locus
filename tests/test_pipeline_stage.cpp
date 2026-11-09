@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/vulkan_forward.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/pipeline/message.hpp"
@@ -1198,6 +1199,12 @@ TEST_CASE("a stage loads only the model-level weights it runs",
         if (tied) {
             REQUIRE(last.output_weight().data == last.embedding().data);
         }
+        // The full GPU forward declines a slice: it has neither every
+        // layer nor, on a middle stage, the embedding or head.
+        REQUIRE(locus::backend::vulkan_forward_supported(full));
+        REQUIRE_FALSE(locus::backend::vulkan_forward_supported(first));
+        REQUIRE_FALSE(locus::backend::vulkan_forward_supported(mid));
+        REQUIRE_FALSE(locus::backend::vulkan_forward_supported(last));
 
         auto run = [](const TransformerModel& m) {
             return std::pair{m.make_cache(), m.make_workspace()};
