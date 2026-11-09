@@ -268,18 +268,19 @@ device memory still runs.
   on a second stream. The model calls it at the same sites as the
   `madvise` hints, with the same `Mat` (same host pointer, the page
   table key) that the later matvec uses.
-- MoE hybrid decode (CUDA, opt-in `LOCUS_MOE_HYBRID=1`): only the
-  routed experts in a hot zone run on the GPU; the other picks run on
-  the best CPU backend at the same time, on a second thread. The hot
+- MoE hybrid (CUDA, opt-in `LOCUS_MOE_HYBRID=1`): only the routed
+  experts in a hot zone run on the GPU; the other picks run on the
+  best CPU backend at the same time, on a second thread. The hot
   zone is a step WLRU over every (layer, expert) of the model: one
   ranked list, each pick moves its expert `LOCUS_MOE_STEP` ranks up
   (default 16), and the first N ranks are resident. An expert that
   enters the zone starts an async upload (it runs on the CPU until
   then); the one it pushes out is freed at once (`Ops::evict`). N is
   `LOCUS_MOE_HYBRID_SLOTS`, else what fits in 90% of the pool after
-  the non-expert weights. Batched prefill keeps the on-demand pool.
-  On a GTX 750 Ti (2 GB) with an i5-2400 (sse4), 64 decode tokens,
-  Q4_K_M:
+  the non-expert weights. Batched prefill moves the zone the same way,
+  pick by pick in token order. On a GTX 750 Ti (2 GB) with an i5-2400
+  (sse4), a 12 to 13 token prompt and 64 decode tokens, Q4_K_M, model
+  file in the page cache:
 
   | model            | sse4 | cuda | hybrid s=1 | hybrid s=16 | hot zone |
   |------------------|------|------|------------|-------------|----------|
@@ -287,8 +288,13 @@ device memory still runs.
   | Moonlight-16B    | 0.8  | 1.0  | 2.0        | 2.2         | 4.3%     |
   | Qwen1.5-MoE-A2.7 | 0.7  | 1.7  | 4.1        | 4.2         | 3.0%     |
 
-  (tok/s). The gain comes from not uploading a missed expert: GPU
-  hits are 4 to 13% of picks with zones that small.
+  (decode tok/s). Prefill with s=16 against cuda: 5.0 s against 11.0
+  s, 5.2 against 11.0, 3.0 against 6.5. The gain comes from not
+  uploading a missed expert: GPU hits are 4 to 13% of picks with
+  zones that small. The CPU reads the cold experts from the model
+  file, so a model that does not stay in the page cache streams them
+  from disk: a cold first run of DeepSeek-V2-Lite took 172 s to
+  prefill.
 - Vulkan has no prefetch. On the Pi's V3D, upload (a memcpy into
   host-coherent unified memory) is 0.28% of compute with an unbounded
   pool and 4.5% even under heavy paging, so prefetch could gain at
