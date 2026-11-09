@@ -532,7 +532,9 @@ guarding the default path.
   prefill), `locus_gpu_device_samples_total` (the batches timed),
   `locus_gpu_device_stage_seconds_total{stage}` (Vulkan device time
   per forward stage, the same stages as the host series, from a
-  timestamp at each stage's end on 1 timed batch in 4, scaled by 64;
+  timestamp at each stage's end on 1 timed batch in 4, scaled by 64
+  (a MoE layer routed on the host splits a forward into several
+  batches, each sampled on its own);
   `other` is device work outside a stage, such as the image and video
   models; it tracks the device total over many batches),
   `locus_gpu_device_stage_samples_total` and
