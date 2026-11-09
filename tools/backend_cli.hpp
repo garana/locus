@@ -241,6 +241,8 @@ inline constexpr const char* kCommonHelp =
     "                          when all experts fit unbudgeted)\n"
     "  LOCUS_FLUX_GPU=0        FLUX on Vulkan: run the DiT per\n"
     "                          op instead of a resident GPU step\n"
+    "  LOCUS_PIXART_GPU=0      PixArt on Vulkan: the same for its\n"
+    "                          DiT\n"
     "  LOCUS_BATCH_DEQUANT=1   in batched forward, dequant each\n"
     "                          weight row once then dot all N\n"
     "                          tokens (token-exact, not byte-\n"

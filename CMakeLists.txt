@@ -50,6 +50,7 @@ add_library(locus
     src/locus/image/dense.cpp
     src/locus/image/sd_vae.cpp
     src/locus/image/pixart_pipeline.cpp
+    src/locus/image/pixart_dit_vulkan.cpp
     src/locus/image/t5_encoder.cpp
     src/locus/image/clip_text.cpp
     src/locus/image/flux_dit.cpp

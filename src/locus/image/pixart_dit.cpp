@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
 #include <string>
 
+#include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
 #include "locus/sys/thread_pool.hpp"
 
@@ -250,7 +253,7 @@ std::vector<float> PixArtDit::forward(std::span<const float> latent, float t,
     // Patch embed (conv as a Linear over each patch's c, p, q values)
     // plus the position table.
     const std::uint32_t pv = in_ch_ * p * p;
-    std::vector<float> patches(std::size_t{n} * pv), h(std::size_t{n} * w);
+    std::vector<float> patches(std::size_t{n} * pv);
     for (std::uint32_t i = 0; i < g; ++i) {
         for (std::uint32_t j = 0; j < g; ++j) {
             float* o = &patches[(std::size_t{i} * g + j) * pv];
@@ -264,8 +267,6 @@ std::vector<float> PixArtDit::forward(std::span<const float> latent, float t,
             }
         }
     }
-    linear(op, patch_embd_.w, patch_embd_.b, patches, n, h);
-    for (std::size_t i = 0; i < h.size(); ++i) h[i] += pos_[i];
 
     // adaLN-single: c = embedded timestep, m = the shared [6][w] vector.
     const auto tf = timestep_features(t, t_ch_);
@@ -275,6 +276,51 @@ std::vector<float> PixArtDit::forward(std::span<const float> latent, float t,
     linear1(op, t2_.w, t2_.b, e1, c);
     for (std::uint32_t i = 0; i < w; ++i) sc[i] = silu(c[i]);
     linear1(op, ada_.w, ada_.b, sc, m);
+    // Final layer: shift and scale from the table plus c itself.
+    std::vector<float> shift(w), scale(w);
+    for (std::uint32_t i = 0; i < w; ++i) {
+        shift[i] = table_[i] + c[i];
+        scale[i] = table_[w + i] + c[i];
+    }
+
+    std::vector<float> y;
+    if (&op == &backend::vulkan_image_ops() &&
+        backend::VulkanSeq::available()) {
+        const char* env = std::getenv("LOCUS_PIXART_GPU");
+        if (env == nullptr || std::string(env) != "0") {
+            // Each block's table plus m, then the final shift and scale.
+            const std::size_t bw = std::size_t{6} * w;
+            std::vector<float> mods(blocks_.size() * bw + 2 * w);
+            for (std::size_t bi = 0; bi < blocks_.size(); ++bi) {
+                for (std::size_t i = 0; i < bw; ++i) {
+                    mods[bi * bw + i] = blocks_[bi].table[i] + m[i];
+                }
+            }
+            std::copy(shift.begin(), shift.end(),
+                      mods.end() - 2 * std::ptrdiff_t{w});
+            std::copy(scale.begin(), scale.end(),
+                      mods.end() - std::ptrdiff_t{w});
+            y = forward_vulkan(patches, text, n_text, mods);
+        }
+    }
+    if (y.empty()) {
+        y = forward_cpu(patches, text, n_text, m, shift, scale, op);
+    }
+    return unpatchify(y);
+}
+
+std::vector<float> PixArtDit::forward_cpu(std::span<const float> patches,
+                                          std::span<const float> text,
+                                          std::uint32_t n_text,
+                                          std::span<const float> m,
+                                          std::span<const float> shift,
+                                          std::span<const float> scale,
+                                          const backend::Ops& op) const {
+    const std::uint32_t w = width_, p = patch_;
+    const std::uint32_t n = grid_ * grid_;
+    std::vector<float> h(std::size_t{n} * w);
+    linear(op, patch_embd_.w, patch_embd_.b, patches, n, h);
+    for (std::size_t i = 0; i < h.size(); ++i) h[i] += pos_[i];
 
     // Caption projection over the valid T5 rows.
     std::vector<float> u1(std::size_t{n_text} * w), u(u1.size());
@@ -332,16 +378,16 @@ std::vector<float> PixArtDit::forward(std::span<const float> latent, float t,
         add_gated(gate2);
     }
 
-    // Final layer: shift and scale from the table plus c itself.
-    std::vector<float> shift(w), scale(w);
-    for (std::uint32_t i = 0; i < w; ++i) {
-        shift[i] = table_[i] + c[i];
-        scale[i] = table_[w + i] + c[i];
-    }
     ln_modulate(h, n, w, 1e-6f, shift.data(), scale.data(), a);
     const std::uint32_t py = p * p * out_ch_;
     std::vector<float> y(std::size_t{n} * py);
     linear(op, proj_out_.w, proj_out_.b, a, n, y);
+    return y;
+}
+
+std::vector<float> PixArtDit::unpatchify(std::span<const float> y) const {
+    const std::uint32_t g = grid_, p = patch_, s = sample_;
+    const std::uint32_t py = p * p * out_ch_;
 
     // Unpatchify: out[k][p i + a][p j + b] = y[g i + j][(p a + b) C + k].
     std::vector<float> out(std::size_t{out_ch_} * s * s);

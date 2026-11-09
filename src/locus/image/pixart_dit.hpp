@@ -59,7 +59,10 @@ class PixArtDit {
      *     whose mask is 1. A masked row gets weight exactly 0 in the
      *     reference, so leaving it out gives the same output.
      * @param n_text Rows in text, at least 1.
-     * @param op The backend ops the matrices run on.
+     * @param op The backend ops the matrices run on. With
+     *     backend::vulkan_image_ops() the blocks and final layer run as
+     *     one GPU step (resident activations, one upload and one
+     *     readback), unless LOCUS_PIXART_GPU=0 keeps them per op.
      * @returns [out_channels][latent_size][latent_size].
      * @throws std::invalid_argument on wrong sizes.
      */
@@ -97,6 +100,26 @@ class PixArtDit {
         std::vector<float> table;  ///< [6][width] scale_shift_table
         Linear q1, k1, v1, o1, q2, k2, v2, o2, up, down;
     };
+
+    /** The blocks and final layer on op, one step at a time: patches
+     *  [n][in_ch p p], m the shared [6][width] vector, shift and scale
+     *  the final layer's. @returns [n][p p out_ch]. */
+    std::vector<float> forward_cpu(std::span<const float> patches,
+                                   std::span<const float> text,
+                                   std::uint32_t n_text,
+                                   std::span<const float> m,
+                                   std::span<const float> shift,
+                                   std::span<const float> scale,
+                                   const backend::Ops& op) const;
+    /** forward_cpu() as one resident GPU step (pixart_dit_vulkan.cpp):
+     *  mods holds each block's [6][width] modulation, then the final
+     *  shift and scale. */
+    std::vector<float> forward_vulkan(std::span<const float> patches,
+                                      std::span<const float> text,
+                                      std::uint32_t n_text,
+                                      const std::vector<float>& mods) const;
+    /** [n][p p out_ch] token rows to [out_ch][S][S]. */
+    std::vector<float> unpatchify(std::span<const float> y) const;
 
     std::uint32_t width_ = 0, heads_ = 0, head_dim_ = 0, ffn_ = 0,
                   in_ch_ = 0, out_ch_ = 0, patch_ = 0, sample_ = 0,
