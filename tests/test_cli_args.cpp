@@ -292,6 +292,25 @@ TEST_CASE("--speculative parses as a flag", "[cli]") {
         static_cast<int>(argv2.size()),
         const_cast<char**>(argv2.data()));
     REQUIRE_FALSE(b.speculative);  // off by default
+    REQUIRE(b.spec_draft == 0);    // the engine default
+    REQUIRE_FALSE(b.spec_fixed);
+}
+
+TEST_CASE("--spec-draft and --spec-fixed parse", "[cli]") {
+    std::array<const char*, 5> argv1 = {"prog", "--spec-draft", "6",
+                                        "--spec-fixed", "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()),
+        const_cast<char**>(argv1.data()));
+    REQUIRE(a.spec_draft == 6);
+    REQUIRE(a.spec_fixed);
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+
+    std::array<const char*, 2> argv2 = {"prog", "--spec-draft=-1"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()),
+        const_cast<char**>(argv2.data()));
+    REQUIRE(b.bad_number_flag == "--spec-draft");
 }
 
 // i#198: the positional numbers went through atoi, so "-1" tokens wrapped

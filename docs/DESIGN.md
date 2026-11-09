@@ -485,7 +485,26 @@ guarding the default path.
 - Speculative decoding: prompt lookup (no draft model). An n-gram
   match against the context proposes drafts, verified in one batched
   forward; the longest correct prefix is accepted. Greedy only, so
-  byte-exact to plain greedy.
+  byte-exact to plain greedy. Each draft's length (0 to
+  `--spec-draft`, default 8) is the one with the most expected tokens
+  per second: the request's decayed accept rate a gives
+  $1 + a + \dots + a^d$ tokens for d drafts, priced by the engine's
+  measured forward time for d drafts. On the M2 Pro CPU a verify row
+  costs 0.55 to 0.75 of a decode step; on MoltenVK a verify of 9 rows
+  costs about 10 decode steps against 4 for 5 rows, so fixed 8 drafts
+  are slower than none. A plain decode step also checks a one-token
+  draft against the decoded token, so the accept rate follows the
+  text while no draft is verified. Llama 3.2 1B Q8_0 on an M2 Pro,
+  160 tokens, tok/s over 3 runs (CPU runs vary by about 10%):
+
+  | prompt      | backend | off      | fixed 4    | fixed 8  | adaptive   |
+  |-------------|---------|----------|------------|----------|------------|
+  | code rename | CPU     | 52 to 60 | 71 to 83   | 88 to 98 | 82 to 90   |
+  | code rename | Vulkan  | 90       | 116 to 118 | 76       | 115 to 120 |
+  | summary     | CPU     | 52 to 68 | 61 to 63   | 48 to 55 | 63 to 66   |
+  | summary     | Vulkan  | 92       | 87         | 59       | 87 to 90   |
+  | free text   | CPU     | 72 to 78 | 70 to 73   | 70 to 74 | 66 to 70   |
+  | free text   | Vulkan  | 91 to 92 | 88 to 89   | 81       | 92         |
 - Embeddings: `/v1/embeddings` returns the last token's final-normed
   hidden state, L2-normalized, on a dedicated cache. CPU and CUDA
   backends only (`TransformerModel::embed` refuses vulkan).

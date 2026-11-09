@@ -114,6 +114,10 @@ OpenAI + Anthropic compatible inference server (default port 8080):
             opt.engine.n_blocks = (args.ctx + 15) / 16;
         }
         opt.engine.speculative = args.speculative;
+        if (args.spec_draft > 0) {
+            opt.engine.spec_draft = args.spec_draft;
+        }
+        opt.engine.spec_adaptive = !args.spec_fixed;
         opt.engine.kv_type = args.kv_type;
         opt.chat_template =
             locus::chat::ChatTemplate::from_gguf(g);
