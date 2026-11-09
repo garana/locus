@@ -175,6 +175,12 @@ class OpenAiServer {
                  const tok::Tokenizer& tok, Options opt);
     ~OpenAiServer();
 
+    /**
+     * The host that binds every interface, IPv6 and IPv4 on one socket
+     * (pipeline::listen_on). "0.0.0.0" binds IPv4 only (i#139).
+     */
+    static constexpr const char* kAnyHost = "";
+
     /** Serves forever on host:port. @returns false on bind error. */
     bool listen(const std::string& host, int port);
 
