@@ -51,7 +51,7 @@ add_executable(locus_tests
     test_resolver.cpp
     test_stage_config.cpp
     test_pipeline_driver.cpp
-    test_grammar.cpp
+    test_gbnf.cpp
     test_http.cpp
     test_http_server.cpp
     test_sampling.cpp
