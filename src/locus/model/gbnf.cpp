@@ -932,7 +932,7 @@ class RegexToGbnf {
                     }
                     // Split [a, b] around the characters JSON escapes.
                     char32_t s = a;
-                    for (const auto [x, y] :
+                    for (const auto& [x, y] :
                          {std::pair<char32_t, char32_t>{0, 0x1F},
                           {'"', '"'},
                           {'\\', '\\'}}) {
