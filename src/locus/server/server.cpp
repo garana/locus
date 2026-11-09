@@ -1453,6 +1453,23 @@ void OpenAiServer::install_routes() {
             counter("locus_spec_steps_total",
                     "Speculative verify forwards run.",
                     s.spec_steps);
+            counter("locus_spec_drafted_tokens_total",
+                    "Speculative draft tokens verified, accepted or not.",
+                    s.spec_drafted_tokens);
+            if (!s.spec_draft_counts.empty()) {
+                mt.family("locus_spec_verifies_total",
+                          "Speculative verify forwards by draft length.",
+                          "counter");
+                for (std::size_t d = 0; d < s.spec_draft_counts.size();
+                     ++d) {
+                    if (s.spec_draft_counts[d] > 0) {
+                        mt.value("locus_spec_verifies_total",
+                                 MetricsText::label("draft_tokens",
+                                                    std::to_string(d)),
+                                 s.spec_draft_counts[d]);
+                    }
+                }
+            }
             gauge("locus_kv_blocks_total", "KV cache pool size.",
                   s.total_blocks);
             gauge("locus_kv_blocks_free", "Free KV cache blocks.",

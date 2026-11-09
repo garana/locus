@@ -266,7 +266,18 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
             r.n_fed < n_prompt
                 ? r.prompt[r.n_fed]
                 : r.generated[r.n_fed - n_prompt];
-        model_.forward(input, cache_, r.seq, ws_, logits_);
+        if (cfg_.speculative && !prefilling) {
+            // A plain decode step's time prices drafts against it
+            // (model::choose_draft).
+            const auto t_dec = std::chrono::steady_clock::now();
+            model_.forward(input, cache_, r.seq, ws_, logits_);
+            spec_cost_.observe(
+                0, std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - t_dec)
+                       .count());
+        } else {
+            model_.forward(input, cache_, r.seq, ws_, logits_);
+        }
         ++r.n_fed;
         ++step_tokens_;
         if (prefilling) {
@@ -518,8 +529,27 @@ bool Engine::spec_decode_step(Request& r) {
                    static_cast<std::ptrdiff_t>(gen_upto));
     const tok::TokenId pending = r.generated[base - n_prompt];
 
+    // The last plain decode's one-token draft, checked against the
+    // token it decoded, keeps the accept rate current while no draft
+    // is verified.
+    if (r.spec.has_guess) {
+        model::observe_guess(r.spec, r.spec.guess == pending);
+        r.spec.has_guess = false;
+    }
+    const std::uint32_t max_draft =
+        cfg_.spec_adaptive
+            ? model::choose_draft(r.spec, spec_cost_, cfg_.spec_draft)
+            : cfg_.spec_draft;
+    if (max_draft == 0) {
+        const auto g = model::ngram_draft(ctx, cfg_.spec_ngram, 1);
+        if (!g.empty()) {
+            r.spec.has_guess = true;
+            r.spec.guess = g.front();
+        }
+        return false;  // a verify would cost more than it saves
+    }
     const auto drafts = model::ngram_draft(ctx, cfg_.spec_ngram,
-                                           cfg_.spec_draft);
+                                           max_draft);
     if (drafts.empty()) {
         // Nothing to verify: the per-token forward is the same step
         // without a one-token batched forward's overhead.
@@ -546,9 +576,14 @@ bool Engine::spec_decode_step(Request& r) {
     if (batched_logits_.size() < need) {
         batched_logits_.assign(need, 0.0f);
     }
+    const auto t_verify = std::chrono::steady_clock::now();
     model_.forward_batch(batch, cache_, r.seq, ws_,
                          {batched_logits_.data(), need},
                          /*all_logits=*/true);
+    spec_cost_.observe(kb - 1,
+                       std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - t_verify)
+                           .count());
     ++spec_steps_;
     step_tokens_ += static_cast<std::uint32_t>(batch.size());
 
@@ -591,6 +626,18 @@ bool Engine::spec_decode_step(Request& r) {
         }
         terminal = bonus == eos_ ||
                    r.generated.size() >= r.max_new_tokens;
+    }
+
+    // A draft cut short by EOS or the token cap says nothing about
+    // how well drafts match, so only a finished verify counts.
+    const std::uint32_t drafted = kb - 1;
+    spec_drafted_ += drafted;
+    if (drafted >= spec_drafts_.size()) {
+        spec_drafts_.resize(drafted + 1, 0);
+    }
+    ++spec_drafts_[drafted];
+    if (!terminal && drafted > 0) {
+        model::observe_draft(r.spec, drafted, acc);
     }
 
     // Commit pending + accepted drafts; roll back rejected KV.

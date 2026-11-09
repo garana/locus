@@ -142,6 +142,8 @@ EngineLoop::Stats EngineLoop::stats() {
     s.prefix_reused_tokens = engine_.prefix_reused_tokens();
     s.spec_accepted_tokens = engine_.spec_accepted_tokens();
     s.spec_steps = engine_.spec_steps();
+    s.spec_drafted_tokens = engine_.spec_drafted_tokens();
+    s.spec_draft_counts = engine_.spec_draft_counts();
     return s;
 }
 

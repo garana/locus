@@ -117,6 +117,10 @@ int main(int argc, char** argv) {
         cfg.kv_type = args.kv_type;
         cfg.batched_decode = args.batch_decode;
         cfg.speculative = args.speculative;
+        if (args.spec_draft > 0) {
+            cfg.spec_draft = args.spec_draft;
+        }
+        cfg.spec_adaptive = !args.spec_fixed;
         cfg.batched_prefill = !args.no_batch_prefill;
         locus::engine::Engine engine(model, tok.eos_id(), cfg);
 
@@ -163,12 +167,24 @@ int main(int argc, char** argv) {
                     dec, dec > 0 ? 1000.0 * (n_out - 1) / dec : 0.0);
                 if (cfg.speculative) {
                     std::fprintf(stderr,
-                                 "speculative: %llu verify steps, %llu "
-                                 "drafts accepted\n",
+                                 "speculative: %llu verify steps, %llu of "
+                                 "%llu drafts accepted\n",
                                  static_cast<unsigned long long>(
                                      engine.spec_steps()),
                                  static_cast<unsigned long long>(
-                                     engine.spec_accepted_tokens()));
+                                     engine.spec_accepted_tokens()),
+                                 static_cast<unsigned long long>(
+                                     engine.spec_drafted_tokens()));
+                    const auto& by_len = engine.spec_draft_counts();
+                    std::fprintf(stderr, "verifies by draft length:");
+                    for (std::size_t d = 0; d < by_len.size(); ++d) {
+                        if (by_len[d] > 0) {
+                            std::fprintf(stderr, " %zu:%llu", d,
+                                         static_cast<unsigned long long>(
+                                             by_len[d]));
+                        }
+                    }
+                    std::fprintf(stderr, "\n");
                 }
             }
         } else {

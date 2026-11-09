@@ -211,6 +211,9 @@ inline constexpr const char* kCommonHelp =
     "                   tokens from n-grams already in the context,\n"
     "                   verified in one batched forward (greedy,\n"
     "                   same output; wins when output repeats input)\n"
+    "  --spec-draft N   most draft tokens per verify (default 8); the\n"
+    "                   length adapts to how many drafts pass\n"
+    "  --spec-fixed     always draft --spec-draft tokens\n"
     "  --kv-type T      KV cache precision: f32 (default, exact),\n"
     "                   f16 (half the cache and attention reads;\n"
     "                   GPU-accelerated for GQA models), q8, q4\n"
@@ -301,6 +304,11 @@ struct BackendArgs {
     bool prefill_f16 = false;
     /** --speculative: prompt-lookup speculative decoding. */
     bool speculative = false;
+    /** From --spec-draft N: most draft tokens per verify (0 = the
+     * engine default). */
+    std::uint32_t spec_draft = 0;
+    /** --spec-fixed: draft spec_draft tokens every time. */
+    bool spec_fixed = false;
     /** From --kv-type T: KV cache precision (kv_type_ok false when
      * T names no type; kv_type_name keeps it for the error). */
     locus::kv::KvType kv_type = locus::kv::KvType::kF32;
@@ -434,6 +442,13 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.prefill_f16 = true;
         } else if (a == "--speculative") {
             out.speculative = true;
+        } else if (a == "--spec-draft" && i + 1 < argc) {
+            number("--spec-draft", argv[++i], out.spec_draft);
+        } else if (a.rfind("--spec-draft=", 0) == 0) {
+            number("--spec-draft", std::string(a.substr(13)),
+                   out.spec_draft);
+        } else if (a == "--spec-fixed") {
+            out.spec_fixed = true;
         } else if ((a == "--kv-type" && i + 1 < argc) ||
                    a.rfind("--kv-type=", 0) == 0) {
             out.kv_type_name =

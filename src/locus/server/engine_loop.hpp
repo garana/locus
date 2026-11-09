@@ -99,6 +99,9 @@ class EngineLoop {
         std::uint64_t prefix_reused_tokens = 0;
         std::uint64_t spec_accepted_tokens = 0;
         std::uint64_t spec_steps = 0;
+        std::uint64_t spec_drafted_tokens = 0;
+        /** Verifies by draft length (Engine::spec_draft_counts). */
+        std::vector<std::uint64_t> spec_draft_counts;
     };
     Stats stats();
     /** The engine's timing metrics; read without the lock, so
