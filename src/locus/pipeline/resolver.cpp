@@ -1,13 +1,16 @@
 #include "locus/pipeline/resolver.hpp"
 
 #include <arpa/inet.h>
+#include <arpa/nameser.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <resolv.h>
 #include <sys/socket.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <optional>
 
 namespace locus::pipeline {
 
@@ -57,13 +60,58 @@ std::vector<std::string> getaddrinfo_lookup(const std::string& host) {
     return out;
 }
 
+// Default record-TTL query: a plain DNS query for host's A and AAAA
+// records (res_nquery, with its own resolver state, so concurrent calls
+// do not share one), the smallest TTL among the answer records, CNAMEs
+// included (the chain is only valid as long as its shortest link).
+// nullopt when DNS has no answer: a name only in /etc/hosts, no server,
+// or a failed query.
+std::optional<int> dns_record_ttl(const std::string& host) {
+    struct __res_state st;
+    std::memset(&st, 0, sizeof(st));
+    if (::res_ninit(&st) != 0) {
+        return std::nullopt;
+    }
+    std::optional<int> best;
+    for (const int type : {ns_t_a, ns_t_aaaa}) {
+        unsigned char buf[4096];
+        const int n = ::res_nquery(&st, host.c_str(), ns_c_in, type, buf,
+                                   sizeof(buf));
+        if (n <= 0) {
+            continue;
+        }
+        ns_msg msg;
+        if (::ns_initparse(buf, n, &msg) != 0) {
+            continue;
+        }
+        const int count = ns_msg_count(msg, ns_s_an);
+        for (int i = 0; i < count; ++i) {
+            ns_rr rr;
+            if (::ns_parserr(&msg, ns_s_an, i, &rr) != 0) {
+                continue;
+            }
+            const int ttl = static_cast<int>(ns_rr_ttl(rr));
+            best = best ? std::min(*best, ttl) : ttl;
+        }
+    }
+    ::res_nclose(&st);
+    return best;
+}
+
 }  // namespace
 
 Resolver::Resolver(Options opt, LookupFn lookup, ClockFn clock,
-                   bool start_thread)
+                   bool start_thread, TtlFn ttl)
     : opt_(opt),
-      lookup_(lookup ? std::move(lookup) : &getaddrinfo_lookup),
       clock_(std::move(clock)) {
+    // The DNS TTL query goes with the real lookup only: a test that
+    // injects its lookup must not reach the network for a TTL.
+    if (ttl) {
+        ttl_ = std::move(ttl);
+    } else if (!lookup) {
+        ttl_ = &dns_record_ttl;
+    }
+    lookup_ = lookup ? std::move(lookup) : &getaddrinfo_lookup;
     if (opt_.default_ttl_s < 1) {
         opt_.default_ttl_s = 1;
     }
@@ -101,18 +149,21 @@ std::int64_t Resolver::now_ms() {
         .count();
 }
 
-std::int64_t Resolver::ttl_ms() const {
-    const int ttl = std::min(opt_.default_ttl_s, opt_.max_ttl_s);
+std::int64_t Resolver::ttl_ms(std::optional<int> record_s) const {
+    const int ttl = record_s
+                        ? std::clamp(*record_s, 1, opt_.max_ttl_s)
+                        : std::min(opt_.default_ttl_s, opt_.max_ttl_s);
     return static_cast<std::int64_t>(ttl) * 1000;
 }
 
-std::int64_t Resolver::refresh_delay_ms(bool failed) const {
+std::int64_t Resolver::refresh_delay_ms(bool failed,
+                                        std::optional<int> record_s) const {
     if (failed) {
         // Short negative TTL: retry a bad name soon, but not every call.
-        return std::min<std::int64_t>(ttl_ms(), 5000);
+        return std::min<std::int64_t>(ttl_ms(std::nullopt), 5000);
     }
-    return static_cast<std::int64_t>(static_cast<double>(ttl_ms()) *
-                                     opt_.refresh_frac);
+    return static_cast<std::int64_t>(
+        static_cast<double>(ttl_ms(record_s)) * opt_.refresh_frac);
 }
 
 std::string Resolver::resolve(const std::string& host) {
@@ -137,11 +188,13 @@ std::string Resolver::resolve(const std::string& host) {
     // lookup does not stall other resolve() callers.
     lk.unlock();
     std::vector<std::string> ips = lookup_(host);
+    const std::optional<int> record =
+        ttl_ && !ips.empty() ? ttl_(host) : std::nullopt;
     lk.lock();
     Entry& e = cache_[host];
     e.ips = std::move(ips);  // empty == a cached negative entry
     e.cursor = 0;
-    e.refresh_due_ms = now_ms() + refresh_delay_ms(e.ips.empty());
+    e.refresh_due_ms = now_ms() + refresh_delay_ms(e.ips.empty(), record);
     return e.ips.empty() ? std::string{}
                          : e.ips[e.cursor++ % e.ips.size()];
 }
@@ -177,13 +230,18 @@ void Resolver::refresh_now() {
     // Re-resolve each, with the lock released during the blocking lookup.
     for (const std::string& host : due) {
         std::vector<std::string> ips = lookup_(host);
+        const std::optional<int> record =
+            ttl_ && !ips.empty() ? ttl_(host) : std::nullopt;
         std::lock_guard<std::mutex> lk(mu_);
         auto it = cache_.find(host);
         if (it == cache_.end()) {
             continue;  // evicted meanwhile
         }
         Entry& e = it->second;
-        if (!ips.empty()) {
+        // Read before the move below: a moved-from vector is empty, which
+        // scheduled every successful refresh at the 5 s negative TTL.
+        const bool failed = ips.empty();
+        if (!failed) {
             e.ips = std::move(ips);  // refresh (or a negative entry
             e.cursor = 0;            // recovering) -> now positive
         }
@@ -191,7 +249,7 @@ void Resolver::refresh_now() {
         // an empty negative entry) and reschedule; refresh_delay_ms
         // gives the short negative TTL so a failing name is retried soon
         // without being dropped. Same policy for both failure paths.
-        e.refresh_due_ms = now_ms() + refresh_delay_ms(ips.empty());
+        e.refresh_due_ms = now_ms() + refresh_delay_ms(failed, record);
     }
 }
 

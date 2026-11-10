@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -238,4 +239,71 @@ TEST_CASE("Resolver runs and tears down cleanly with the thread on",
     REQUIRE(calls.load() >= 2);
     // Resolver destructs here (stop + notify + join) under no further
     // load; a hang would fail the test by timing out, not by assertion.
+}
+
+// i#40 part b: a record TTL from DNS (here an injected TtlFn) sets the
+// refresh time instead of default_ttl_s, capped by max_ttl_s; with no
+// record TTL the configured one applies; a failed lookup asks no TTL.
+TEST_CASE("Resolver refreshes at the record TTL when DNS gives one",
+          "[resolver]") {
+    FakeClock clk;
+    int calls = 0, ttl_calls = 0;
+    std::vector<std::string> answer{"10.0.0.1"};
+    std::optional<int> record = 20;
+    Resolver::LookupFn lk = [&](const std::string&) {
+        ++calls;
+        return answer;
+    };
+    Resolver::TtlFn tf = [&](const std::string&) {
+        ++ttl_calls;
+        return record;
+    };
+    Resolver::Options opt;
+    opt.default_ttl_s = 100;
+    opt.max_ttl_s = 300;
+    opt.refresh_frac = 0.75;
+    Resolver r(opt, lk, clk.fn(), false, tf);
+
+    // Record TTL 20 s: due at 15 s, not at 75 s.
+    REQUIRE(r.resolve("s") == "10.0.0.1");
+    REQUIRE(ttl_calls == 1);
+    clk.now_ms = 14'000;
+    r.refresh_now();
+    REQUIRE(calls == 1);
+    clk.now_ms = 16'000;
+    r.refresh_now();
+    REQUIRE(calls == 2);
+
+    // Record TTL 1000 s, capped by max_ttl_s 300: due 225 s later.
+    record = 1000;
+    clk.now_ms = 16'000 + 15'000;  // the refresh above set 20 s again
+    r.refresh_now();
+    REQUIRE(calls == 3);           // and asked the new TTL: 1000
+    clk.now_ms = 31'000 + 224'000;
+    r.refresh_now();
+    REQUIRE(calls == 3);
+    clk.now_ms = 31'000 + 226'000;
+    r.refresh_now();
+    REQUIRE(calls == 4);
+
+    // No record TTL: default_ttl_s 100 -> due 75 s later.
+    record = std::nullopt;
+    const std::int64_t t0 = clk.now_ms;
+    clk.now_ms = t0 + 225'000 + 1;
+    r.refresh_now();
+    REQUIRE(calls == 5);
+    clk.now_ms += 74'000;
+    r.refresh_now();
+    REQUIRE(calls == 5);
+    clk.now_ms += 2'000;
+    r.refresh_now();
+    REQUIRE(calls == 6);
+
+    // A failed lookup asks for no TTL.
+    const int asked = ttl_calls;
+    answer.clear();
+    clk.now_ms += 80'000;
+    r.refresh_now();
+    REQUIRE(calls == 7);
+    REQUIRE(ttl_calls == asked);
 }

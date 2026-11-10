@@ -121,6 +121,8 @@ target_include_directories(locus SYSTEM PRIVATE
 )
 find_package(Threads REQUIRED)
 target_link_libraries(locus PUBLIC Threads::Threads)
+# res_nquery / ns_parserr for the resolver's record TTL (i#40).
+target_link_libraries(locus PUBLIC resolv)
 
 add_executable(locus-run tools/run_main.cpp)
 target_link_libraries(locus-run PRIVATE locus)

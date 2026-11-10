@@ -51,8 +51,8 @@ struct StageOptions {
                                            *   live peers and their TCP
                                            *   RTT every N s (0 = off) */
     int resolve_ttl = 30;                 /**< --resolve-ttl s (name
-                                           *   cache; fallback TTL until
-                                           *   record TTL is used) */
+                                           *   cache TTL when DNS gives
+                                           *   no record TTL) */
     int resolve_max_ttl = 300;            /**< --resolve-max-ttl s cap */
     int resolve_refresh_percent = 75;     /**< --resolve-refresh-percent
                                            *   of the TTL */
@@ -119,8 +119,8 @@ inline Spec<StageOptions> stage_spec() {
                    "print the live peers and their kernel TCP RTT to "
                    "stderr every N s (0 = off)"),
         D::integer("resolve-ttl", &O::resolve_ttl,
-                   "downstream-name cache TTL s (fallback until the "
-                   "record TTL is used)"),
+                   "downstream-name cache TTL s when DNS gives no "
+                   "record TTL (else the record's, capped)"),
         D::integer("resolve-max-ttl", &O::resolve_max_ttl,
                    "cap on the downstream-name cache TTL s"),
         D::integer("resolve-refresh-percent", &O::resolve_refresh_percent,

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -19,11 +20,12 @@ namespace locus::pipeline {
  * the cache tracks DNS changes and the serve loop never blocks on a
  * lookup after the first.
  *
- * TTL note: the real record TTL is not available through getaddrinfo, so
- * this component uses a CONFIGURED TTL (Options.default_ttl_s, capped by
- * max_ttl_s) and applies refresh_frac to it. A later change can feed the
- * actual record TTL in without changing this API (the refresh math is
- * the same). Until then default_ttl_s IS the effective TTL.
+ * TTL: getaddrinfo does not report a record's TTL, so a second, plain
+ * DNS query (res_nquery, A and AAAA) reads it: the smallest TTL in the
+ * answers, CNAMEs included, capped by max_ttl_s (at least 1 s). When
+ * DNS gives none (a name from /etc/hosts, no DNS server, a failed
+ * query), Options.default_ttl_s is the TTL. The refresh runs at
+ * refresh_frac of whichever TTL applies.
  *
  * Thread-safety: resolve() and the background refresh run concurrently;
  * a mutex guards the cache and blocking lookups run outside it. The
@@ -34,7 +36,7 @@ namespace locus::pipeline {
 class Resolver {
   public:
     struct Options {
-        int default_ttl_s = 30;      /**< TTL when no record TTL known. */
+        int default_ttl_s = 30;      /**< TTL when no record TTL is known. */
         int max_ttl_s = 300;         /**< Cap on any TTL. */
         double refresh_frac = 0.75;  /**< Refresh at this fraction of TTL. */
     };
@@ -46,6 +48,10 @@ class Resolver {
     /** Monotonic clock in milliseconds. Default: steady_clock.
      * Injectable so tests drive TTL/refresh timing deterministically. */
     using ClockFn = std::function<std::int64_t()>;
+    /** A name's record TTL in seconds, or nullopt when unknown. Default:
+     * the DNS query in the class comment, but only with the default
+     * lookup; an injected lookup without a TtlFn uses default_ttl_s. */
+    using TtlFn = std::function<std::optional<int>(const std::string&)>;
 
     /**
      * @param opt TTL / refresh policy.
@@ -53,9 +59,10 @@ class Resolver {
      * @param clock Monotonic-ms clock (default steady_clock).
      * @param start_thread Start the background refresh thread (default
      *     true). Tests pass false and drive refresh_now() by hand.
+     * @param ttl Record-TTL function (default: see TtlFn).
      */
     explicit Resolver(Options opt, LookupFn lookup = {}, ClockFn clock = {},
-                      bool start_thread = true);
+                      bool start_thread = true, TtlFn ttl = {});
     ~Resolver();
     Resolver(const Resolver&) = delete;
     Resolver& operator=(const Resolver&) = delete;
@@ -103,18 +110,22 @@ class Resolver {
     };
 
     std::int64_t now_ms();
-    std::int64_t ttl_ms() const;  // clamped configured TTL
+    /** @returns the TTL to use, in ms: the record TTL clamped to [1 s,
+     * max_ttl_s] when known, else default_ttl_s (also capped). */
+    std::int64_t ttl_ms(std::optional<int> record_s) const;
     /** Delay until the next refresh of an entry just (re)resolved.
      * Success: refresh_frac of the TTL. Failure: a short negative TTL
      * (min(TTL, 5 s)) so a bad name is retried soon without re-asking
      * every call -- the same policy for a failed initial resolve and a
      * failed refresh. */
-    std::int64_t refresh_delay_ms(bool failed) const;
+    std::int64_t refresh_delay_ms(bool failed,
+                                  std::optional<int> record_s) const;
     void run();                   // background thread body
 
     Options opt_;
     LookupFn lookup_;
     ClockFn clock_;
+    TtlFn ttl_;
 
     std::mutex mu_;
     std::unordered_map<std::string, Entry> cache_;
