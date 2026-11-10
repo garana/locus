@@ -79,6 +79,7 @@ const std::vector<Backend>& list() {
                       .matvec_q8k = &matvec_q8k,  // scalar (pi: Vulkan)
                       .dequant_row = &dequant_row,
                       .alloc_kv = &vulkan_alloc_kv,
+                      .free_kv = &vulkan_free_kv,
                       .mt_safe = false}});
         const bool cu = cuda_backend_usable();
         b.push_back({"cuda",
