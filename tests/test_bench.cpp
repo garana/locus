@@ -127,54 +127,58 @@ TEST_CASE("bench: out_w_ n x matvec_cuda vs matvec_batch_cuda",
         TT type;
         std::size_t bytes, d_off;
     };
-    for (const Head h : {Head{TT::kQ6_K, 210, 208}, Head{TT::kQ8_0, 272, 0}}) {
-    auto w = make_kquant(rows, cols, h.bytes, h.d_off, /*dmin_off=*/-1, 7);
-    Mat m{h.type, w.data(), rows, cols};
-    std::mt19937 rng(5);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    const int iters = 50;
-    for (std::uint32_t n : {1u, 4u, 8u, 16u}) {
-        std::vector<float> xb(static_cast<std::size_t>(n) * cols);
-        for (auto& v : xb) {
-            v = dist(rng);
-        }
-        std::vector<float> col(rows);
-        std::vector<float> outb(static_cast<std::size_t>(rows) * n);
-        cuda_pool_reset();
-        auto per_token = [&] {
-            for (std::uint32_t t = 0; t < n; ++t) {
-                matvec_cuda(m,
-                            {xb.data() + static_cast<std::size_t>(t) *
-                                             cols,
-                             cols},
-                            col);
+    for (const Head h :
+         {Head{TT::kQ6_K, 210, 208}, Head{TT::kQ8_0, 272, 0}}) {
+        auto w = make_kquant(rows, cols, h.bytes, h.d_off,
+                             /*dmin_off=*/-1, 7);
+        Mat m{h.type, w.data(), rows, cols};
+        std::mt19937 rng(5);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        const int iters = 50;
+        for (std::uint32_t n : {1u, 4u, 8u, 16u}) {
+            std::vector<float> xb(static_cast<std::size_t>(n) * cols);
+            for (auto& v : xb) {
+                v = dist(rng);
             }
-        };
-        auto batched = [&] { matvec_batch_cuda(m, xb, outb, n); };
-        for (int i = 0; i < 3; ++i) {  // warm (upload + JIT)
-            per_token();
-            batched();
+            std::vector<float> col(rows);
+            std::vector<float> outb(static_cast<std::size_t>(rows) * n);
+            cuda_pool_reset();
+            auto per_token = [&] {
+                for (std::uint32_t t = 0; t < n; ++t) {
+                    matvec_cuda(m,
+                                {xb.data() +
+                                     static_cast<std::size_t>(t) * cols,
+                                 cols},
+                                col);
+                }
+            };
+            auto batched = [&] { matvec_batch_cuda(m, xb, outb, n); };
+            for (int i = 0; i < 3; ++i) {  // warm (upload + JIT)
+                per_token();
+                batched();
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; ++i) {
+                per_token();
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; ++i) {
+                batched();
+            }
+            const auto t2 = std::chrono::steady_clock::now();
+            const double per_ns =
+                std::chrono::duration<double, std::nano>(t1 - t0)
+                    .count() /
+                iters;
+            const double bat_ns =
+                std::chrono::duration<double, std::nano>(t2 - t1)
+                    .count() /
+                iters;
+            WARN("cuda out_w_ "
+                 << (h.type == TT::kQ8_0 ? "Q8_0" : "Q6_K") << " n=" << n
+                 << ": per-token=" << per_ns << "ns batched=" << bat_ns
+                 << "ns speedup=" << per_ns / bat_ns << "x");
         }
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < iters; ++i) {
-            per_token();
-        }
-        const auto t1 = std::chrono::steady_clock::now();
-        for (int i = 0; i < iters; ++i) {
-            batched();
-        }
-        const auto t2 = std::chrono::steady_clock::now();
-        const double per_ns =
-            std::chrono::duration<double, std::nano>(t1 - t0).count() /
-            iters;
-        const double bat_ns =
-            std::chrono::duration<double, std::nano>(t2 - t1).count() /
-            iters;
-        WARN("cuda out_w_ " << (h.type == TT::kQ8_0 ? "Q8_0" : "Q6_K")
-                            << " n=" << n << ": per-token=" << per_ns
-                            << "ns batched=" << bat_ns
-                            << "ns speedup=" << per_ns / bat_ns << "x");
-    }
     }
     SUCCEED();
 }
