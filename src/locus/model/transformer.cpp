@@ -793,8 +793,8 @@ void TransformerModel::forward_embeddings(std::span<const EmbedStep> steps,
     StageLap lap(stage_metrics_.get());
     // Batch-invariant mode: one sequence takes the multi-sequence
     // kernels too (#432).
-    if ((steps.size() > 1 || backend::vulkan_batch_invariant()) &&
-        backend_->name == "vulkan" &&
+    if (backend_->name == "vulkan" &&
+        (steps.size() > 1 || backend::vulkan_batch_invariant()) &&
         backend::vulkan_forward_multi(*this, steps, cache, rows.begin,
                                       rows.end)) {
         lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
