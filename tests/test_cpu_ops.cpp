@@ -5,10 +5,12 @@
 #include <random>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/sys/features.hpp"
 
@@ -1833,5 +1835,63 @@ TEST_CASE("scalar activation quantizers map NaN to 0", "[ops][q8k]") {
     for (const int j : {3, 40, 200}) {
         INFO("q8_0 j " << j);
         CHECK(q[j] == 0);
+    }
+}
+
+TEST_CASE("a matvec gives the same bits for any row split",
+          "[ops][threads]") {
+    // The model splits a matvec's rows across threads (matvec_mt), so a
+    // row's result must not depend on which slice it lands in, or the
+    // output would change with the thread count (i#479). Every CPU
+    // backend, f32 and Q8 activations, the types DBRX's IQ2_XXS file
+    // uses plus the other K-quants; 7 rows of 6144 columns.
+    constexpr std::uint32_t rows = 7, nblk = 24, cols = nblk * 256;
+    std::mt19937 rng(479);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = xd(rng);
+    }
+    for (const Backend& b : backends()) {
+        if (!b.available || !b.selectable ||
+            std::string_view(b.name) == "vulkan" ||
+            std::string_view(b.name) == "cuda") {
+            continue;
+        }
+        for (TensorType t : {TensorType::kQ2_K, TensorType::kQ4_K,
+                             TensorType::kQ5_K, TensorType::kQ6_K,
+                             TensorType::kIQ2_XXS}) {
+            std::vector<std::byte> w;
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                const auto row = k_quant_row(
+                    t, nblk,
+                    900u + r + 11u * static_cast<std::uint32_t>(t));
+                w.insert(w.end(), row.begin(), row.end());
+            }
+            const Mat m{t, w.data(), rows, cols};
+            for (const bool q8 : {false, true}) {
+                const auto mv = q8 ? b.ops.matvec_q8k : b.ops.matvec;
+                if (mv == nullptr) {
+                    continue;
+                }
+                std::vector<float> whole(rows);
+                mv(m, x, whole);
+                for (std::uint32_t s = 2; s <= 4; ++s) {
+                    INFO(b.name << " type " << static_cast<int>(t)
+                                << (q8 ? " q8" : " f32") << " split " << s);
+                    std::vector<float> got(rows);
+                    for (std::uint32_t i = 0; i < s; ++i) {
+                        const std::uint32_t r0 = rows * i / s;
+                        const std::uint32_t r1 = rows * (i + 1) / s;
+                        mv(mat_rows(m, r0, r1 - r0), x,
+                           std::span<float>(got).subspan(r0, r1 - r0));
+                    }
+                    for (std::uint32_t r = 0; r < rows; ++r) {
+                        REQUIRE(std::bit_cast<std::uint32_t>(got[r]) ==
+                                std::bit_cast<std::uint32_t>(whole[r]));
+                    }
+                }
+            }
+        }
     }
 }
