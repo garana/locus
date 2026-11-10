@@ -687,7 +687,21 @@ kv::PagedKvCache TransformerModel::make_cache(
             }
         }
     }
-    return kv::PagedKvCache(geom);
+    kv::PagedKvCache cache(geom);
+    // A device mirror of the host pool when the backend keeps one
+    // (CUDA, i#466); none when it does not fit on the device. Plain
+    // attention only: it writes just the (layer, pos) rows the forwards
+    // sync after each attention.
+    if (kv_type == kv::KvType::kF32 && spec_->plain_attention &&
+        backend_->ops.kv_mirror_alloc != nullptr) {
+        void* dev = backend_->ops.kv_mirror_alloc(
+            kv::PagedKvCache::pool_floats(geom));
+        if (dev != nullptr) {
+            cache.attach_mirror({dev, backend_->ops.kv_mirror_store,
+                                 backend_->ops.kv_mirror_free});
+        }
+    }
+    return cache;
 }
 
 void TransformerModel::scale_logits(std::span<float> logits) const {
@@ -966,6 +980,7 @@ void TransformerModel::forward_layers(tok::TokenId token,
         apply_norm(ws.x, lay.attn_norm, hp_.rms_eps, ws.xb);
         lap.lap(l, Stage::kNorm);
         spec_->attention(*this, lay, cache, seq, ws, l, pos);
+        cache.sync_rows(seq, l, pos, 1);
         matvec_mt(op, lay.wo, ws.out, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
             ws.x[i] += ws.xb2[i];
@@ -1275,6 +1290,7 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                 backend::rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd, pos,
                                    hp_.rope_freq_base, rope_factors());
             }
+            cache.sync_rows(seq, l, base, n);
             // Every row is stored, so all (token, head) pairs attend in
             // one dispatch.
             gqa_attend_batch(
@@ -1302,6 +1318,7 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                            ws.xb);
                 lap.lap(l, Stage::kNorm);
                 spec_->attention(*this, lay, cache, seq, ws, l, base + t);
+                cache.sync_rows(seq, l, base + t, 1);
                 matvec_mt(op, lay.wo, ws.out, ws.xb2);
                 for (std::uint32_t i = 0; i < E; ++i) {
                     x[o + i] += ws.xb2[i];
@@ -1455,6 +1472,7 @@ void TransformerModel::forward_batch_decode(
             lap.lap(l, Stage::kNorm);
             spec_->attention(*this, lay, cache, *seqs[t], ws, l,
                              pos[t]);
+            cache.sync_rows(*seqs[t], l, pos[t], 1);
             matvec_mt(op, lay.wo, ws.out, ws.xb2);
             for (std::uint32_t i = 0; i < E; ++i) {
                 x[o + i] += ws.xb2[i];
@@ -1588,6 +1606,7 @@ void TransformerModel::forward_batch_layers(
                        ws.xb);
             lap.lap(l, Stage::kNorm);
             spec_->attention(*this, lay, cache, *seqs[t], ws, l, pos[t]);
+            cache.sync_rows(*seqs[t], l, pos[t], 1);
             matvec_mt(op, lay.wo, ws.out, ws.xb2);
             for (std::uint32_t i = 0; i < E; ++i) {
                 x[o + i] += ws.xb2[i];
