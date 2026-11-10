@@ -145,6 +145,16 @@ void advise_layer_statics(const TransformerModel::Layer& lay) {
         lay, [](const backend::Mat& m) { advise_mat(m); });
 }
 
+/** Hints routed expert e's gate, up and down weights for readahead. */
+void advise_expert(const TransformerModel::Layer& lay, std::uint32_t e) {
+    sys::advise_willneed(lay.gate_exps.expert(e).data,
+                         lay.gate_exps.expert_bytes);
+    sys::advise_willneed(lay.up_exps.expert(e).data,
+                         lay.up_exps.expert_bytes);
+    sys::advise_willneed(lay.down_exps.expert(e).data,
+                         lay.down_exps.expert_bytes);
+}
+
 /**
  * How many row-slices to split a `rows`-row matvec across: the
  * fan-out (mt_fanout), capped by keeping at least kMinRowsPerSlice
@@ -1938,24 +1948,23 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
         }
     }
     // The cold experts run on the CPU backend while the GPU runs the
-    // hot ones; ws.xb is read-only until both are done.
+    // hot ones; ws.xb is read-only until both are done. The CPU reads
+    // them from the model file whatever its size, so ask for them all
+    // before it starts: on a cold page cache the reads then overlap.
     std::vector<float> cold_acc;
     std::future<void> cold_done;
     if (!cold.empty()) {
+        if (readahead_enabled()) {
+            for (const auto& [e, wgt] : cold) {
+                advise_expert(lay, e);
+            }
+        }
         cold_acc.assign(hp_.n_embd, 0.0f);
         cold_done = std::async(std::launch::async, [&] {
             const Ops cop =
                 effective_ops(hy->cpu, q8k_activations_for(hy->cpu));
             std::vector<float> g(n_ff), u(n_ff), d(hp_.n_embd);
             for (const auto& [e, wgt] : cold) {
-                if (advise_weights_) {
-                    sys::advise_willneed(lay.gate_exps.expert(e).data,
-                                         lay.gate_exps.expert_bytes);
-                    sys::advise_willneed(lay.up_exps.expert(e).data,
-                                         lay.up_exps.expert_bytes);
-                    sys::advise_willneed(lay.down_exps.expert(e).data,
-                                         lay.down_exps.expert_bytes);
-                }
                 const MatvecJob gu[] = {
                     {lay.gate_exps.expert(e), ws.xb, g},
                     {lay.up_exps.expert(e), ws.xb, u}};
@@ -2139,6 +2148,15 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
                 op.prefetch(g);
                 op.prefetch(up);
                 op.prefetch(d);
+            }
+        }
+        // The CPU side reads its experts from the model file whatever
+        // its size (no prefetch: they stay on the host).
+        prev = UINT32_MAX;
+        for (const auto& c : cold) {
+            if (c.e != prev) {
+                prev = c.e;
+                advise_expert(lay, c.e);
             }
         }
     }

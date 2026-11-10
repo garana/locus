@@ -293,8 +293,11 @@ device memory still runs.
   uploading a missed expert: GPU hits are 4 to 13% of picks with
   zones that small. The CPU reads the cold experts from the model
   file, so a model that does not stay in the page cache streams them
-  from disk: a cold first run of DeepSeek-V2-Lite took 172 s to
-  prefill.
+  from disk. Each layer asks for its cold experts with
+  `advise_willneed` before the GPU work starts, so the reads overlap
+  it: with a cold cache on spinning disks, DeepSeek-V2-Lite decodes
+  15 tokens in 21.8 s against 28.3 s without; its 17-token prefill
+  (78 s) stays disk bound, since it touches nearly all 10 GB.
 - Vulkan has no prefetch. On the Pi's V3D, upload (a memcpy into
   host-coherent unified memory) is 0.28% of compute with an unbounded
   pool and 4.5% even under heavy paging, so prefetch could gain at
