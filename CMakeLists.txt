@@ -93,6 +93,7 @@ add_library(locus
     src/locus/server/responses.cpp
     src/locus/server/tools.cpp
     src/locus/http/base64.cpp
+    src/locus/http/client.cpp
     src/locus/http/http.cpp
     src/locus/http/server.cpp
     src/locus/http/metrics.cpp
