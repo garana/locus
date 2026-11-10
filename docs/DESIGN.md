@@ -807,7 +807,7 @@ Goldens: Qwen1.5-MoE and DeepSeek-V2-Lite are pinned to f32, because
 8-bit activations tip their greedy text at a near-tie. Muse Spark's
 second prompt, DeepSeek-V4.1 and the Orpheus codec frame are checked
 teacher-forced: each reference token must be within 0.25 of the top
-logit.
+logit (0.75 at DeepSeek-V4.1's one known near-tie, #467).
 
 ## 16. Testing strategy
 
