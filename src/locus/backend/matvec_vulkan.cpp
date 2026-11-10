@@ -2878,7 +2878,13 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
     // weights, when all three are Q8_0: each row is the same dot the
     // separate projections compute.
     const auto& lay0 = m.layers()[0];
-    const bool qkv_cat = n <= kSmallBatch &&
+    // EXPERIMENT (i#471): LOCUS_VK_X_NO_QKV / _NO_GLU / _NO_SEQ0 turn
+    // off one change of PR#457 each.
+    static const bool x_no_qkv = std::getenv("LOCUS_VK_X_NO_QKV") != nullptr;
+    static const bool x_no_glu = std::getenv("LOCUS_VK_X_NO_GLU") != nullptr;
+    static const bool x_no_seq0 =
+        std::getenv("LOCUS_VK_X_NO_SEQ0") != nullptr;
+    const bool qkv_cat = !x_no_qkv && n <= kSmallBatch &&
                          lay0.wq.type == gguf::TensorType::kQ8_0 &&
                          lay0.wk.type == gguf::TensorType::kQ8_0 &&
                          lay0.wv.type == gguf::TensorType::kQ8_0;
@@ -3004,7 +3010,7 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
             // only, so the math is the same either way).
             const PagedPool pp{pool, s.mtable[i], geom.block_tokens,
                                block_stride, kv_dim, false};
-            if (i == 0) {
+            if (i == 0 && !x_no_seq0) {
                 rec_attn_gqa(s, pp, bq, s.att, batt, 1, pos, H, group, hd,
                              q_dim, l * layer_stride, layer_stride / 2);
             } else {
@@ -3019,7 +3025,7 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
 
         norm_rows(lay.ffn_norm, bx, bxb);
         mark(s, model::Stage::kNorm);
-        if (lay.w_gate.type == gguf::TensorType::kQ8_0 &&
+        if (!x_no_glu && lay.w_gate.type == gguf::TensorType::kQ8_0 &&
             lay.w_up.type == gguf::TensorType::kQ8_0 && n <= kSmallBatch) {
             // Gate, up and silu_mul in one short-batch dispatch (both
             // dots as matvec_q8_0_n computes one).
