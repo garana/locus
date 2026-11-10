@@ -150,6 +150,9 @@ enum class Kernel {
     kConv2dGemm,
     /** matvec_q8_0_n with SwiGLU: gate, up and silu_mul in one. */
     kMatvecQ8_0NGlu,
+    /** The two above without the dead-plane guards (i#471). */
+    kMatvecQ8_0NNg,
+    kMatvecQ8_0NGluNg,
     kCount_,
 };
 

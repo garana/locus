@@ -955,6 +955,34 @@ Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
     }
 }
 
+/**
+ * @returns k, or its guard-free build (matvec_q8_0_n.comp's NOGUARD)
+ * where that one is faster: Apple M1 / M2 GPUs (i#471: +3% on an M2
+ * Pro, -4% on an M4 Max). LOCUS_VK_Q8N_GUARDS=0 / 1 overrides. The
+ * choice is per device, never per batch size, so a sequence's bits do
+ * not depend on its batch.
+ */
+Kernel q8n_variant(const VulkanContext& ctx, Kernel k) {
+    static const bool guards = [&] {
+        if (const char* e = std::getenv("LOCUS_VK_Q8N_GUARDS")) {
+            return std::string(e) != "0";
+        }
+        const std::string& n = ctx.device_name();
+        return n.find("Apple M1") == std::string::npos &&
+               n.find("Apple M2") == std::string::npos;
+    }();
+    if (guards) {
+        return k;
+    }
+    if (k == Kernel::kMatvecQ8_0N) {
+        return Kernel::kMatvecQ8_0NNg;
+    }
+    if (k == Kernel::kMatvecQ8_0NGlu) {
+        return Kernel::kMatvecQ8_0NGluNg;
+    }
+    return k;
+}
+
 /** Token-row layout of one prefill matmul operand set. */
 struct MatmulRows {
     std::uint32_t n_tok;
@@ -990,7 +1018,7 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
     // vulkan_forward_multi): one weight read for all its tokens
     // (matvec_*_n, bandwidth-bound) instead of a mostly-padding matmul
     // tile.
-    const Kernel small = small_batch_kernel(w, r.n_tok);
+    const Kernel small = q8n_variant(s.ctx, small_batch_kernel(w, r.n_tok));
     if (small != Kernel::kCount_ && r.n_tok <= kSmallBatch && r.div == 1 &&
         r.w_bdiv == 1) {
         const VulkanContext::Buffer bufs[] = {wb, x, out};
@@ -2960,9 +2988,9 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
                                                   bq};
             const std::uint32_t push[] = {R, E, 0, 0, 0, 0, fbits(1.0f), n,
                                           E, R, 0, 0, 0};
-            s.ctx.dispatch(Kernel::kMatvecQ8_0N, bufs, push,
-                           VulkanContext::matvec_groups(
-                               Kernel::kMatvecQ8_0N, R));
+            const Kernel k = q8n_variant(s.ctx, Kernel::kMatvecQ8_0N);
+            s.ctx.dispatch(k, bufs, push,
+                           VulkanContext::matvec_groups(k, R));
         } else {
             proj(lay.wq, bxb, E, bq, 0, q_dim, false);
             proj(lay.wk, bxb, E, bkv, 0, kv_dim, false);
@@ -3031,9 +3059,9 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
                 s.upload_w(lay.w_gate), bxb, bgate, s.upload_w(lay.w_up)};
             const std::uint32_t push[] = {ff, E, 0, 0, 0, 0, fbits(1.0f), n,
                                           E,  ff, 0, 0, 0};
-            s.ctx.dispatch(Kernel::kMatvecQ8_0NGlu, bufs, push,
-                           VulkanContext::matvec_groups(
-                               Kernel::kMatvecQ8_0NGlu, ff));
+            const Kernel k = q8n_variant(s.ctx, Kernel::kMatvecQ8_0NGlu);
+            s.ctx.dispatch(k, bufs, push,
+                           VulkanContext::matvec_groups(k, ff));
         } else {
             proj(lay.w_gate, bxb, E, bgate, 0, ff, false);
             proj(lay.w_up, bxb, E, bup, 0, ff, false);

@@ -305,49 +305,55 @@ TEST_CASE("vulkan short-batch SwiGLU matches the CPU and keeps a "
     auto ub = upload_q8(ctx, wu, rows, cols);
     const auto x = random_floats(std::size_t{8} * cols, rng);
     auto xb = upload(ctx, x);
-    // Token 0's outputs of each kernel at every batch size.
-    std::vector<float> first_glu, first_plain;
-    for (const std::uint32_t n_tok : {1u, 2u, 5u, 8u}) {
-        INFO("n_tok " << n_tok);
-        auto og = upload(ctx, std::vector<float>(8 * rows, 0.0f));
-        auto op = upload(ctx, std::vector<float>(8 * rows, 0.0f));
-        ctx.begin_batch();
-        const std::uint32_t push[] = {rows,  cols, 0, 0, 0, 0, fbits(1.0f),
-                                      n_tok, cols, rows, 0, 0, 0};
-        const VulkanContext::Buffer gbufs[] = {gb, xb, og, ub};
-        ctx.dispatch(Kernel::kMatvecQ8_0NGlu, gbufs, push,
-                     VulkanContext::matvec_groups(Kernel::kMatvecQ8_0NGlu,
-                                                  rows));
-        const VulkanContext::Buffer pbufs[] = {gb, xb, op};
-        ctx.dispatch(Kernel::kMatvecQ8_0N, pbufs, push,
-                     VulkanContext::matvec_groups(Kernel::kMatvecQ8_0N, rows));
-        ctx.end_batch();
-        const auto got = download(ctx, og, 8 * rows);
-        const auto plain = download(ctx, op, 8 * rows);
-        for (std::uint32_t t = 0; t < n_tok; ++t) {
-            const auto xs = std::span<const float>(x).subspan(
-                std::size_t{t} * cols, cols);
-            const auto g = cpu_mv(TensorType::kQ8_0, wg.data(), 0, rows,
-                                  cols, xs);
-            const auto u = cpu_mv(TensorType::kQ8_0, wu.data(), 0, rows,
-                                  cols, xs);
-            for (std::uint32_t r = 0; r < rows; ++r) {
-                const float want = g[r] / (1.0f + std::exp(-g[r])) * u[r];
-                REQUIRE(got[t * rows + r] ==
-                        Catch::Approx(want).epsilon(1e-4).margin(1e-5));
+    // The guarded builds and the guard-free ones (i#471), each pair on
+    // its own: token 0's outputs at every batch size.
+    for (const bool ng : {false, true}) {
+        const Kernel kglu =
+            ng ? Kernel::kMatvecQ8_0NGluNg : Kernel::kMatvecQ8_0NGlu;
+        const Kernel kplain =
+            ng ? Kernel::kMatvecQ8_0NNg : Kernel::kMatvecQ8_0N;
+        std::vector<float> first_glu, first_plain;
+        for (const std::uint32_t n_tok : {1u, 2u, 5u, 8u}) {
+            INFO((ng ? "guard-free" : "guarded") << " n_tok " << n_tok);
+            auto og = upload(ctx, std::vector<float>(8 * rows, 0.0f));
+            auto op = upload(ctx, std::vector<float>(8 * rows, 0.0f));
+            ctx.begin_batch();
+            const std::uint32_t push[] = {rows,  cols, 0, 0, 0, 0, fbits(1.0f),
+                                          n_tok, cols, rows, 0, 0, 0};
+            const VulkanContext::Buffer gbufs[] = {gb, xb, og, ub};
+            ctx.dispatch(kglu, gbufs, push,
+                         VulkanContext::matvec_groups(kglu, rows));
+            const VulkanContext::Buffer pbufs[] = {gb, xb, op};
+            ctx.dispatch(kplain, pbufs, push,
+                         VulkanContext::matvec_groups(kplain, rows));
+            ctx.end_batch();
+            const auto got = download(ctx, og, 8 * rows);
+            const auto plain = download(ctx, op, 8 * rows);
+            for (std::uint32_t t = 0; t < n_tok; ++t) {
+                const auto xs = std::span<const float>(x).subspan(
+                    std::size_t{t} * cols, cols);
+                const auto g = cpu_mv(TensorType::kQ8_0, wg.data(), 0, rows,
+                                      cols, xs);
+                const auto u = cpu_mv(TensorType::kQ8_0, wu.data(), 0, rows,
+                                      cols, xs);
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    const float want = g[r] / (1.0f + std::exp(-g[r])) * u[r];
+                    REQUIRE(got[t * rows + r] ==
+                            Catch::Approx(want).epsilon(1e-4).margin(1e-5));
+                }
             }
+            const std::vector<float> g0(got.begin(), got.begin() + rows);
+            const std::vector<float> p0(plain.begin(), plain.begin() + rows);
+            if (first_glu.empty()) {
+                first_glu = g0;
+                first_plain = p0;
+            } else {
+                REQUIRE(g0 == first_glu);
+                REQUIRE(p0 == first_plain);
+            }
+            ctx.destroy_buffer(og);
+            ctx.destroy_buffer(op);
         }
-        const std::vector<float> g0(got.begin(), got.begin() + rows);
-        const std::vector<float> p0(plain.begin(), plain.begin() + rows);
-        if (first_glu.empty()) {
-            first_glu = g0;
-            first_plain = p0;
-        } else {
-            REQUIRE(g0 == first_glu);
-            REQUIRE(p0 == first_plain);
-        }
-        ctx.destroy_buffer(og);
-        ctx.destroy_buffer(op);
     }
     for (auto b : {gb, ub, xb}) ctx.destroy_buffer(b);
 }
