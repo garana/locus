@@ -50,6 +50,7 @@ add_library(locus
     src/locus/image/dense.cpp
     src/locus/image/sd_vae.cpp
     src/locus/image/pixart_pipeline.cpp
+    src/locus/image/pixart_dit_vulkan.cpp
     src/locus/image/t5_encoder.cpp
     src/locus/image/clip_text.cpp
     src/locus/image/flux_dit.cpp
@@ -68,8 +69,11 @@ add_library(locus
     src/locus/image/jpeg_decode.cpp
     src/locus/image/image_input.cpp
     src/locus/audio/wav.cpp
-    src/locus/model/grammar.cpp
+    src/locus/model/gbnf.cpp
+    src/locus/model/grammar_constraint.cpp
+    src/locus/model/json_schema_gbnf.cpp
     src/locus/model/transformer.cpp
+    src/locus/model/expert_cache.cpp
     src/locus/model/expert_metrics.cpp
     src/locus/model/moe_stats.cpp
     src/locus/model/stage_metrics.cpp

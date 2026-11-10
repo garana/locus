@@ -27,14 +27,34 @@ own docs.
 The chat endpoints and `/v1/responses` accept a `tools` list and
 return structured tool calls (OpenAI `tool_calls`, Anthropic
 `tool_use`, Responses `function_call` items), streamed or not.
-The OpenAI paths also support `logprobs`, `response_format:
-json_object` (constrained decoding) and `usage` accounting.
+The OpenAI paths also support `logprobs` and `usage` accounting.
+
+Structured output forces the reply to match a format, by masking the
+tokens that would break it:
+
+| Field                        | Endpoints                      |
+|------------------------------|--------------------------------|
+| `response_format`            | chat completions, completions  |
+| `text.format`                | /v1/responses                  |
+| `output_config.format`       | /v1/messages                   |
+| `output_format` (older beta) | /v1/messages                   |
+
+The format's `type` is `json_object` (any JSON value), `json_schema`
+(Chat Completions puts the schema in `json_schema.schema`, the others
+in `schema`), or, as locus extensions, `grammar` (a GBNF grammar in
+`grammar`, start rule `root`) or `regex` (in `regex`, matched whole).
+A schema's properties come out in its order. Supported keywords:
+type, const, enum, anyOf, oneOf, $ref with $defs, properties,
+required, additionalProperties, items, prefixItems, min/max items and
+length, pattern and the formats date, time, date-time and uuid;
+numeric bounds are not enforced. A bad schema, grammar or regex is a
+400.
 
 Images in chat requests (an OpenAI `image_url` part with a base64
 `data:` URL, or an Anthropic base64 image block) need a Janus-Pro
 model whose GGUF holds the vision tower. locus never fetches a URL.
-Requests with images do not support streaming, tools or JSON mode
-yet (each is a 400).
+Requests with images do not support streaming, tools or structured
+output yet (each is a 400).
 
 ### Image output
 

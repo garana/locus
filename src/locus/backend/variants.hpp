@@ -315,6 +315,20 @@ void cuda_pool_reset();
 void cuda_prefetch(const Mat& w);
 
 /**
+ * Frees w's page in the CUDA weight pool now (Ops.evict), unless a
+ * matvec holds it. No-op when w is not resident, and on non-CUDA
+ * builds.
+ */
+void cuda_evict(const Mat& w);
+
+/**
+ * @returns The CUDA weight pool's byte budget (Ops.pool_budget):
+ *     LOCUS_GPU_POOL_MB, else about 80% of free VRAM; 0 on non-CUDA
+ *     builds.
+ */
+std::size_t cuda_pool_budget();
+
+/**
  * CUDA 1D convolution (F32), the device half of the conv1d scalar
  * reference (generative-media codec decoders). Same contract and
  * channels-major layout as backend::conv1d: `out_len` comes from

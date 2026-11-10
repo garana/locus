@@ -1,16 +1,21 @@
 #include "locus/model/transformer.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/arch.hpp"
+#include "locus/model/expert_cache.hpp"
 #include "locus/model/expert_metrics.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/model/gguf_load.hpp"
@@ -40,7 +45,55 @@ bool readahead_enabled() {
     return std::getenv("LOCUS_NO_READAHEAD") == nullptr;
 }
 
+/** @returns env `name` as a number, or `def` when unset or empty. */
+std::uint64_t env_u64(const char* name, std::uint64_t def) {
+    const char* v = std::getenv(name);
+    return v != nullptr && *v != '\0' ? std::strtoull(v, nullptr, 10) : def;
+}
+
 }  // namespace
+
+/**
+ * LOCUS_MOE_HYBRID=1 (i#252): in decode and batched prefill, the
+ * routed experts in the step WLRU hot zone (ExpertCache) run on the
+ * GPU backend while the
+ * other picks run on the best CPU backend at the same time. Only a
+ * promotion uploads an expert; a demotion frees it (Ops.evict).
+ *
+ * The hot zone holds LOCUS_MOE_HYBRID_SLOTS experts when set, else
+ * what fits in 90% of the GPU weight pool after the non-expert
+ * weights. LOCUS_MOE_STEP (default 16) is the ranks a pick moves up.
+ * Needs a backend with a weight pool (prefetch, evict, pool_budget):
+ * CUDA.
+ */
+struct MoeHybrid {
+    std::once_flag once;
+    /** Null when the mode is off. */
+    std::unique_ptr<ExpertCache> cache;
+    /** The backend the cache was sized for. */
+    const backend::Backend* gpu = nullptr;
+    /** Runs the cold experts. */
+    const backend::Backend* cpu = nullptr;
+    std::atomic<std::uint64_t> hot{0}, cold{0}, promoted{0}, evicted{0};
+
+    ~MoeHybrid() {
+        if (cache == nullptr || std::getenv("LOCUS_MOE_STATS") == nullptr) {
+            return;
+        }
+        const std::uint64_t h = hot.load(), c = cold.load();
+        std::fprintf(stderr,
+                     "[moe-hybrid] slots=%u step=%u gpu=%llu cpu=%llu "
+                     "hit_rate=%.1f%% promoted=%llu evicted=%llu\n",
+                     cache->capacity(), cache->step(),
+                     static_cast<unsigned long long>(h),
+                     static_cast<unsigned long long>(c),
+                     h + c ? 100.0 * static_cast<double>(h) /
+                                 static_cast<double>(h + c)
+                           : 0.0,
+                     static_cast<unsigned long long>(promoted.load()),
+                     static_cast<unsigned long long>(evicted.load()));
+    }
+};
 
 bool weights_stream(std::uint64_t weight_bytes, std::uint64_t ram_bytes) {
     return ram_bytes == 0 || weight_bytes > ram_bytes / 2;
@@ -141,6 +194,10 @@ backend::Ops effective_ops(const backend::Backend* b, bool q8k) {
 }
 
 bool TransformerModel::q8k_activations() const {
+    return q8k_activations_for(backend_);
+}
+
+bool TransformerModel::q8k_activations_for(const backend::Backend* b) const {
     if (q8k_override_ >= 0) {
         return q8k_override_ == 1;
     }
@@ -148,8 +205,7 @@ bool TransformerModel::q8k_activations() const {
         e != nullptr && *e != '\0' && std::string_view(e) != "0") {
         return false;
     }
-    return hp_.q8k_default ||
-           (backend_ != nullptr && backend_->ops.prefers_q8k);
+    return hp_.q8k_default || (b != nullptr && b->ops.prefers_q8k);
 }
 
 backend::Ops TransformerModel::ops() const {
@@ -300,6 +356,7 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     for (const TensorInfo& t : g.tensors()) {
         weight_bytes += t.nbytes;
     }
+    m.weight_bytes_ = weight_bytes;
     m.advise_weights_ = readahead_enabled() &&
                         weights_stream(weight_bytes, sys::total_ram_bytes());
     Hparams& hp = m.hp_;
@@ -336,8 +393,6 @@ TransformerModel TransformerModel::load(const GgufFile& g,
         throw Error("missing tensor: token_embd.weight");
     }
     hp.n_vocab = static_cast<std::uint32_t>(embd->ne[1]);
-    m.embd_ = need_mat(g, "token_embd.weight", hp.n_embd,
-                       hp.n_vocab);
 
     // Slice-only loading (multi-server, DESIGN.md R15+): a stage loads
     // only its owned layer range [layer_begin, layer_end); layer_end 0
@@ -353,6 +408,16 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     }
     m.layer_begin_ = layer_begin;
     m.layer_end_ = layer_end;
+    // A stage maps only the model-level weights it runs (i#29): the
+    // embedding on the first stage, the output norm and head on the
+    // last. A tied head is the embedding, so a last stage keeps it.
+    const bool first = layer_begin == 0;
+    const bool last = layer_end == hp.n_layers;
+    const bool tied = g.find_tensor("output.weight") == nullptr;
+    if (first || (last && tied)) {
+        m.embd_ = need_mat(g, "token_embd.weight", hp.n_embd,
+                           hp.n_vocab);
+    }
 
     m.layers_.resize(hp.n_layers);
     for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
@@ -430,16 +495,18 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     }
 
     m.backend_ = &backend::best_backend();
+    m.moe_hybrid_ = std::make_shared<MoeHybrid>();
     if (g.find_tensor("rope_freqs.weight") != nullptr) {
         m.rope_factors_ =
             need_vec(g, "rope_freqs.weight", hp.head_dim / 2);
     }
-    m.out_norm_ = need_vec(g, "output_norm.weight", hp.n_embd);
-    // Tied embeddings when output.weight is absent.
-    m.out_w_ = g.find_tensor("output.weight") != nullptr
-                   ? need_mat(g, "output.weight", hp.n_embd,
-                              hp.n_vocab)
-                   : m.embd_;
+    if (last) {
+        m.out_norm_ = need_vec(g, "output_norm.weight", hp.n_embd);
+        // Tied embeddings when output.weight is absent.
+        m.out_w_ = tied ? m.embd_
+                        : need_mat(g, "output.weight", hp.n_embd,
+                                   hp.n_vocab);
+    }
 
     // R9 static pinning (opt-in): wire every non-expert weight
     // into RAM so per-token streaming is only the routed
@@ -1746,6 +1813,97 @@ void TransformerModel::apply_norm(std::span<const float> x,
     }
 }
 
+MoeHybrid* TransformerModel::moe_hybrid() const {
+    MoeHybrid* h = moe_hybrid_.get();
+    if (h == nullptr) {
+        return nullptr;
+    }
+    std::call_once(h->once, [&] {
+        const char* on = std::getenv("LOCUS_MOE_HYBRID");
+        const backend::Ops& op = backend_->ops;
+        if (on == nullptr || *on == '\0' || std::string_view(on) == "0" ||
+            op.prefetch == nullptr || op.evict == nullptr ||
+            op.pool_budget == nullptr) {
+            return;
+        }
+        std::uint32_t n_moe = 0;
+        std::uint64_t expert_bytes = 0, routed_bytes = 0;
+        for (std::uint32_t l = layer_begin_; l < layer_end_; ++l) {
+            const Layer& lay = layers_[l];
+            if (!lay.is_moe()) {
+                continue;
+            }
+            const std::uint64_t one = lay.gate_exps.expert_bytes +
+                                      lay.up_exps.expert_bytes +
+                                      lay.down_exps.expert_bytes;
+            expert_bytes = std::max(expert_bytes, one);
+            routed_bytes += one * hp_.n_expert;
+            ++n_moe;
+        }
+        if (n_moe == 0 || expert_bytes == 0) {
+            return;
+        }
+        const std::uint64_t slots_max =
+            static_cast<std::uint64_t>(n_moe) * hp_.n_expert;
+        std::uint64_t slots = env_u64("LOCUS_MOE_HYBRID_SLOTS", UINT64_MAX);
+        if (slots == UINT64_MAX) {
+            // Non-expert weights first (the embedding too: an
+            // overestimate when it stays on the host).
+            const std::uint64_t room = op.pool_budget() / 10 * 9;
+            const std::uint64_t dense = weight_bytes_ - routed_bytes;
+            slots = room > dense ? (room - dense) / expert_bytes : 0;
+        }
+        slots = std::min(slots, slots_max);
+        const auto step =
+            static_cast<std::uint32_t>(env_u64("LOCUS_MOE_STEP", 16));
+        h->gpu = backend_;
+        h->cpu = &backend::best_backend();
+        if (h->cpu->ops.self_parallel || !h->cpu->ops.mt_safe) {
+            h->cpu = backend::find_backend("scalar");
+        }
+        h->cache = std::make_unique<ExpertCache>(
+            hp_.n_layers, hp_.n_expert, static_cast<std::uint32_t>(slots),
+            step);
+        std::fprintf(stderr,
+                     "[moe-hybrid] hot zone %llu of %llu experts (%.1f%%), "
+                     "step %u, cold experts on %.*s\n",
+                     static_cast<unsigned long long>(slots),
+                     static_cast<unsigned long long>(slots_max),
+                     100.0 * static_cast<double>(slots) /
+                         static_cast<double>(slots_max),
+                     h->cache->step(),
+                     static_cast<int>(h->cpu->name.size()),
+                     h->cpu->name.data());
+    });
+    return h->cache != nullptr && h->gpu == backend_ ? h : nullptr;
+}
+
+bool TransformerModel::moe_hybrid_touch(MoeHybrid& hy,
+                                        const backend::Ops& op,
+                                        const Layer& lay, std::uint32_t layer,
+                                        std::uint32_t e,
+                                        std::string_view gpu_api) const {
+    const ExpertCache::Touch t = hy.cache->touch(layer, e);
+    if (t.evicted) {
+        const Layer& el = layers_[t.evicted_layer];
+        const std::uint32_t ee = t.evicted_expert;
+        op.evict(el.gate_exps.expert(ee));
+        op.evict(el.up_exps.expert(ee));
+        op.evict(el.down_exps.expert(ee));
+        hy.evicted.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (t.promoted) {
+        op.prefetch(lay.gate_exps.expert(e));
+        op.prefetch(lay.up_exps.expert(e));
+        op.prefetch(lay.down_exps.expert(e));
+        hy.promoted.fetch_add(1, std::memory_order_relaxed);
+    }
+    (t.hot ? hy.hot : hy.cold).fetch_add(1, std::memory_order_relaxed);
+    ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, t.hot,
+                        t.hot ? gpu_api : hy.cpu->name);
+    return t.hot;
+}
+
 void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
                          std::uint32_t layer) const {
     using namespace locus::backend;
@@ -1753,20 +1911,62 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
     const std::uint32_t n_ff = hp_.n_ff_exp;
 
     op.matvec(lay.gate_inp, ws.xb, ws.router);
-    const auto picked = moe_select(hp_, lay, ws.router);
+    auto picked = moe_select(hp_, lay, ws.router);
     if (MoeStats::enabled()) {
         for (const auto& [e, wgt] : picked) {
             MoeStats::record(layer, e, hp_.n_layers,
                              hp_.n_expert);
         }
     }
-    {
-        bool gpu = false;
-        const std::string_view api = expert_api(backend_->name, gpu);
+    MoeHybrid* const hy = moe_hybrid();
+    // Hybrid: picks outside the hot zone move to cold and run on the
+    // CPU backend; promotions upload, evictions free.
+    std::vector<std::pair<std::uint32_t, float>> cold;
+    bool gpu = false;
+    const std::string_view api = expert_api(backend_->name, gpu);
+    if (hy != nullptr) {
+        std::vector<std::pair<std::uint32_t, float>> hot;
+        for (const auto& [e, wgt] : picked) {
+            (moe_hybrid_touch(*hy, op, lay, layer, e, api) ? hot : cold)
+                .emplace_back(e, wgt);
+        }
+        picked = std::move(hot);
+    } else {
         for (const auto& [e, wgt] : picked) {
             ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, gpu,
                                 api);
         }
+    }
+    // The cold experts run on the CPU backend while the GPU runs the
+    // hot ones; ws.xb is read-only until both are done.
+    std::vector<float> cold_acc;
+    std::future<void> cold_done;
+    if (!cold.empty()) {
+        cold_acc.assign(hp_.n_embd, 0.0f);
+        cold_done = std::async(std::launch::async, [&] {
+            const Ops cop =
+                effective_ops(hy->cpu, q8k_activations_for(hy->cpu));
+            std::vector<float> g(n_ff), u(n_ff), d(hp_.n_embd);
+            for (const auto& [e, wgt] : cold) {
+                if (advise_weights_) {
+                    sys::advise_willneed(lay.gate_exps.expert(e).data,
+                                         lay.gate_exps.expert_bytes);
+                    sys::advise_willneed(lay.up_exps.expert(e).data,
+                                         lay.up_exps.expert_bytes);
+                    sys::advise_willneed(lay.down_exps.expert(e).data,
+                                         lay.down_exps.expert_bytes);
+                }
+                const MatvecJob gu[] = {
+                    {lay.gate_exps.expert(e), ws.xb, g},
+                    {lay.up_exps.expert(e), ws.xb, u}};
+                matvec_mt_group(cop, gu);
+                silu_mul(g, u, g);
+                matvec_mt(cop, lay.down_exps.expert(e), g, d);
+                for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
+                    cold_acc[i] += wgt * d[i];
+                }
+            }
+        });
     }
     // R8 expert readahead: overlap the SSD reads of every routed
     // expert before the sequential per-expert matmuls fault them
@@ -1842,6 +2042,12 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
         swiglu_into_acc(lay.gate_shexp, lay.up_shexp,
                         lay.down_shexp, shexp_ff, g);
     }
+    if (cold_done.valid()) {
+        cold_done.get();
+        for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
+            ws.moe_acc[i] += cold_acc[i];
+        }
+    }
 }
 
 void TransformerModel::moe_ffn_batch(const Layer& lay,
@@ -1872,28 +2078,46 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
                                  hp_.n_expert);
             }
         }
-        for (const auto& [e, wgt] : picked[t]) {
-            ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, gpu,
-                                api);
+    }
+
+    // Hybrid: each pick, in token order, moves the hot zone as in
+    // decode; a pick outside it runs on the CPU backend.
+    MoeHybrid* const hy = moe_hybrid();
+    std::vector<std::uint8_t> on_cpu(static_cast<std::size_t>(n) * k, 0);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        for (std::uint32_t s = 0;
+             s < static_cast<std::uint32_t>(picked[t].size()); ++s) {
+            const std::uint32_t e = picked[t][s].first;
+            if (hy != nullptr) {
+                on_cpu[static_cast<std::size_t>(t) * k + s] =
+                    !moe_hybrid_touch(*hy, op, lay, layer, e, api);
+            } else {
+                ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert,
+                                    gpu, api);
+            }
         }
     }
 
     // Group (token, slot) by expert so each expert's weights are
-    // read once across the tokens that picked it.
+    // read once across the tokens that picked it; the CPU uses apart.
     struct Use {
         std::uint32_t e, t, s;
     };
-    std::vector<Use> uses;
+    std::vector<Use> uses, cold;
     uses.reserve(static_cast<std::size_t>(n) * k);
     for (std::uint32_t t = 0; t < n; ++t) {
         for (std::uint32_t s = 0;
              s < static_cast<std::uint32_t>(picked[t].size());
              ++s) {
-            uses.push_back({picked[t][s].first, t, s});
+            (on_cpu[static_cast<std::size_t>(t) * k + s] ? cold : uses)
+                .push_back({picked[t][s].first, t, s});
         }
     }
-    std::sort(uses.begin(), uses.end(),
-              [](const Use& a, const Use& b) { return a.e < b.e; });
+    const auto by_expert = [](const Use& a, const Use& b) {
+        return a.e < b.e;
+    };
+    std::sort(uses.begin(), uses.end(), by_expert);
+    std::sort(cold.begin(), cold.end(), by_expert);
 
     // Readahead the union once (first appearance of each expert).
     if (readahead_enabled()) {
@@ -1921,6 +2145,32 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
 
     // Phase 3: weight-stationary swiglu -> res[(t*k + s)*E].
     std::vector<float> res(static_cast<std::size_t>(n) * k * E);
+    // The CPU uses run on the CPU backend while the GPU runs the rest;
+    // each writes only its own res slots.
+    std::future<void> cold_done;
+    if (!cold.empty()) {
+        cold_done = std::async(std::launch::async, [&] {
+            const Ops cop =
+                effective_ops(hy->cpu, q8k_activations_for(hy->cpu));
+            std::vector<float> g(ff), u(ff), d(E);
+            for (const auto& c : cold) {
+                const float* xin =
+                    xbf.data() + static_cast<std::size_t>(c.t) * E;
+                const MatvecJob gu[] = {
+                    {lay.gate_exps.expert(c.e), {xin, E}, g},
+                    {lay.up_exps.expert(c.e), {xin, E}, u}};
+                matvec_mt_group(cop, gu);
+                silu_mul(g, u, g);
+                matvec_mt(cop, lay.down_exps.expert(c.e), g, d);
+                const float wgt = picked[c.t][c.s].second;
+                float* r = res.data() +
+                           (static_cast<std::size_t>(c.t) * k + c.s) * E;
+                for (std::uint32_t i = 0; i < E; ++i) {
+                    r[i] = wgt * d[i];
+                }
+            }
+        });
+    }
     std::vector<float> down(E);
     auto swiglu = [&](const Mat& wg, const Mat& wu, const Mat& wd,
                       std::uint32_t ffw, const float* xin,
@@ -1949,6 +2199,12 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
         for (std::uint32_t i = 0; i < E; ++i) {
             r[i] = wgt * down[i];
         }
+    }
+
+    if (cold_done.valid()) {
+        cold_done.get();
+        uses.insert(uses.end(), cold.begin(), cold.end());
+        std::sort(uses.begin(), uses.end(), by_expert);
     }
 
     // Weight window on the union (opt-in), after routed use.

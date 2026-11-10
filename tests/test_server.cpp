@@ -21,7 +21,8 @@
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/http/base64.hpp"
-#include "locus/model/grammar.hpp"
+#include "locus/model/gbnf.hpp"
+#include "locus/model/json_schema_gbnf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/server/server.hpp"
@@ -358,10 +359,116 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
             res->body)["choices"][0]["message"]["content"];
         REQUIRE(!content.empty());
         // Every byte must keep the output a valid JSON prefix.
-        locus::model::JsonGrammar g;
+        locus::model::GbnfMatcher m(
+            locus::model::Gbnf::parse(locus::model::json_value_gbnf()));
         for (unsigned char c : content) {
             INFO("content: " << content);
-            REQUIRE(g.feed(c));
+            REQUIRE(m.feed(c));
+        }
+    }
+
+    SECTION("response_format json_schema forces a complete match") {
+        // An enum ends within a few tokens, so the match completes and
+        // the request stops on EOS ("stop"), not on max_tokens.
+        json req{
+            {"messages",
+             json::array({{{"role", "user"}, {"content", "Pick one"}}})},
+            {"max_tokens", 32},
+            {"response_format",
+             {{"type", "json_schema"},
+              {"json_schema",
+               {{"name", "pick"},
+                {"strict", true},
+                {"schema",
+                 {{"type", "object"},
+                  {"properties",
+                   {{"color", {{"enum", {"red", "green"}}}}}},
+                  {"required", {"color"}},
+                  {"additionalProperties", false}}}}}}}};
+        auto res = client.Post("/v1/chat/completions", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const json choice = json::parse(res->body)["choices"][0];
+        const std::string content = choice["message"]["content"];
+        INFO("content: " << content);
+        const json v = json::parse(content);
+        REQUIRE(v.size() == 1);
+        const std::string color = v["color"];
+        REQUIRE((color == "red" || color == "green"));
+        REQUIRE(choice["finish_reason"] == "stop");
+    }
+
+    SECTION("a regex, a grammar and the other APIs' format fields") {
+        json req{{"prompt", "Answer:"},
+                 {"max_tokens", 16},
+                 {"response_format", {{"type", "regex"}, {"regex", "(yes|no)!"}}}};
+        auto res = client.Post("/v1/completions", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const std::string text = json::parse(res->body)["choices"][0]["text"];
+        REQUIRE((text == "yes!" || text == "no!"));
+
+        req["response_format"] = {{"type", "grammar"},
+                                  {"grammar", "root ::= [0-9]{3}"}};
+        res = client.Post("/v1/completions", req.dump(), "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const std::string digits =
+            json::parse(res->body)["choices"][0]["text"];
+        REQUIRE(digits.size() == 3);
+        REQUIRE(std::all_of(digits.begin(), digits.end(),
+                            [](char c) { return c >= '0' && c <= '9'; }));
+
+        // Anthropic: output_config.format; Responses: text.format.
+        const json schema{{"type", "string"}, {"enum", {"up", "down"}}};
+        json msg{{"messages",
+                  json::array({{{"role", "user"}, {"content", "Which?"}}})},
+                 {"max_tokens", 16},
+                 {"output_config",
+                  {{"format", {{"type", "json_schema"}, {"schema", schema}}}}}};
+        res = client.Post("/v1/messages", msg.dump(), "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        // A value may end with one space or newline, as the grammar's
+        // `space` allows, so compare the parsed JSON.
+        INFO("messages: " << res->body);
+        const json a =
+            json::parse(json::parse(res->body)["content"][0]["text"]
+                            .get<std::string>());
+        REQUIRE((a == "up" || a == "down"));
+
+        json resp{{"input", "Which?"},
+                  {"max_output_tokens", 16},
+                  {"text",
+                   {{"format",
+                     {{"type", "json_schema"},
+                      {"name", "dir"},
+                      {"schema", schema}}}}}};
+        res = client.Post("/v1/responses", resp.dump(), "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const json out = json::parse(res->body);
+        INFO("responses: " << res->body);
+        const json r = json::parse(
+            out["output"][0]["content"][0]["text"].get<std::string>());
+        REQUIRE((r == "up" || r == "down"));
+    }
+
+    SECTION("a bad output format is a 400") {
+        for (const json& f :
+             {json{{"type", "json_schema"}, {"json_schema", {{"name", "x"}}}},
+              json{{"type", "grammar"}, {"grammar", "root ::= undefined"}},
+              json{{"type", "regex"}, {"regex", "(a)\\1"}},
+              json{{"type", "xml"}}}) {
+            json req{{"prompt", "x"}, {"max_tokens", 4},
+                     {"response_format", f}};
+            auto res = client.Post("/v1/completions", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            INFO(f.dump() << " -> " << res->body);
+            REQUIRE(res->status == 400);
         }
     }
 

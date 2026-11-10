@@ -38,7 +38,8 @@
 #include "locus/image/vq16.hpp"
 #include "locus/model/codec.hpp"
 #include "locus/model/expert_metrics.hpp"
-#include "locus/model/grammar.hpp"
+#include "locus/model/gbnf.hpp"
+#include "locus/model/json_schema_gbnf.hpp"
 #include "locus/model/sampling.hpp"
 #include "locus/server/errors.hpp"
 #include "locus/server/metrics_text.hpp"
@@ -491,54 +492,99 @@ std::string kv_type_name(kv::KvType t) {
     return "f32";
 }
 
-/** True when the caller asked for JSON output (OpenAI
- * response_format:{type:"json_object"} or Anthropic-style). */
-bool wants_json(const json& body) {
-    if (body.contains("response_format") &&
-        body["response_format"].is_object()) {
-        return body["response_format"].value("type", "") ==
-               "json_object";
+/**
+ * The grammar of one output-format object. `nested` is the Chat
+ * Completions form (the schema under json_schema.schema); the
+ * Responses and Anthropic forms carry it as `schema`. `ptr` is the
+ * object's JSON pointer in the body, where the schema is read again
+ * with its key order kept.
+ */
+std::shared_ptr<const model::Gbnf> format_grammar(const json& f,
+                                                  std::string_view raw,
+                                                  const std::string& ptr,
+                                                  bool nested) {
+    if (!f.is_object()) {
+        throw std::invalid_argument("the output format must be an object");
     }
-    return false;
+    const std::string type = f.value("type", "");
+    if (type == "text") {
+        return nullptr;
+    }
+    if (type == "json_object") {
+        return model::Gbnf::parse(model::json_value_gbnf());
+    }
+    if (type == "json_schema") {
+        const json* s = nested && f.contains("json_schema") &&
+                                f["json_schema"].is_object() &&
+                                f["json_schema"].contains("schema")
+                            ? &f["json_schema"]["schema"]
+                        : !nested && f.contains("schema") ? &f["schema"]
+                                                          : nullptr;
+        if (s == nullptr || !(s->is_object() || s->is_boolean())) {
+            throw std::invalid_argument(
+                nested ? "json_schema.schema must be a JSON Schema object"
+                       : "schema must be a JSON Schema object");
+        }
+        const auto ordered = nlohmann::ordered_json::parse(raw);
+        const std::string at = ptr + (nested ? "/json_schema/schema" : "/schema");
+        return model::Gbnf::parse(model::json_schema_to_gbnf(
+            ordered.at(nlohmann::ordered_json::json_pointer(at)).dump()));
+    }
+    // locus extensions: a GBNF grammar (rule "root") or a regex.
+    if (type == "grammar") {
+        if (!f.contains("grammar") || !f["grammar"].is_string()) {
+            throw std::invalid_argument("grammar must be a GBNF string");
+        }
+        return model::Gbnf::parse(f["grammar"].get<std::string>());
+    }
+    if (type == "regex") {
+        if (!f.contains("regex") || !f["regex"].is_string()) {
+            throw std::invalid_argument("regex must be a string");
+        }
+        return model::Gbnf::parse(
+            "root ::= " +
+            model::regex_to_gbnf(f["regex"].get<std::string>()));
+    }
+    throw std::invalid_argument(
+        "unsupported output format type '" + type +
+        "' (text, json_object, json_schema, grammar or regex)");
 }
 
 /**
- * Constrained-decoding filter that forces valid JSON output. Holds
- * the shared token->bytes table plus a live JsonGrammar; a candidate
- * token is allowed iff feeding its bytes keeps the JSON valid.
+ * The grammar a request asks its output to follow (i#402), or nullptr
+ * for free text. Read from `response_format` (Chat Completions and
+ * Completions), `text.format` (Responses), and `output_config.format`
+ * or the older `output_format` (Anthropic Messages).
+ * @param body The parsed body.
+ * @param raw The body text, parsed again only for a schema, so its
+ *     properties keep their order.
+ * @throws std::invalid_argument on a malformed or unsupported format,
+ *     a bad schema, grammar or regex.
  */
-class JsonTokenConstraint : public model::TokenConstraint {
-  public:
-    explicit JsonTokenConstraint(
-        std::shared_ptr<const std::vector<std::string>> pieces)
-        : pieces_(std::move(pieces)) {}
-
-    bool allows(tok::TokenId t) const override {
-        if (static_cast<std::size_t>(t) >= pieces_->size()) {
-            return true;  // special/oob token (e.g. eos): allow
-        }
-        model::JsonGrammar g = grammar_;
-        for (unsigned char c : (*pieces_)[t]) {
-            if (!g.feed(c)) {
-                return false;
-            }
-        }
-        return true;
+std::shared_ptr<const model::Gbnf> output_grammar(const json& body,
+                                                  std::string_view raw) {
+    if (body.contains("response_format") &&
+        body["response_format"].is_object()) {
+        return format_grammar(body["response_format"], raw,
+                              "/response_format", true);
     }
-
-    void commit(tok::TokenId t) override {
-        if (static_cast<std::size_t>(t) >= pieces_->size()) {
-            return;
-        }
-        for (unsigned char c : (*pieces_)[t]) {
-            grammar_.feed(c);
-        }
+    if (body.contains("output_config") &&
+        body["output_config"].is_object() &&
+        body["output_config"].contains("format")) {
+        return format_grammar(body["output_config"]["format"], raw,
+                              "/output_config/format", false);
     }
-
-  private:
-    std::shared_ptr<const std::vector<std::string>> pieces_;
-    model::JsonGrammar grammar_;
-};
+    if (body.contains("output_format")) {
+        return format_grammar(body["output_format"], raw, "/output_format",
+                              false);
+    }
+    if (body.contains("text") && body["text"].is_object() &&
+        body["text"].contains("format")) {
+        return format_grammar(body["text"]["format"], raw, "/text/format",
+                              false);
+    }
+    return nullptr;
+}
 
 }  // namespace
 
@@ -700,9 +746,10 @@ std::optional<VisionChat> parse_vision_chat(const json& body,
         throw std::invalid_argument(
             "stream is not supported with image input yet");
     }
-    if (body.contains("tools") || wants_json(body)) {
+    if (body.contains("tools") || output_grammar(body, body.dump())) {
         throw std::invalid_argument(
-            "tools and JSON mode are not supported with image input yet");
+            "tools and output formats are not supported with image input "
+            "yet");
     }
     if (body.contains("max_tokens")) {
         const auto& v = body["max_tokens"];
@@ -1153,18 +1200,27 @@ void OpenAiServer::vision_chat(bool anthropic, const VisionChat& chat,
     }
 }
 
-std::shared_ptr<const std::vector<std::string>>
-OpenAiServer::json_pieces() {
-    std::call_once(pieces_once_, [this] {
+std::shared_ptr<const model::TokenTrie> OpenAiServer::token_trie() {
+    std::call_once(trie_once_, [this] {
         auto pieces = std::make_shared<std::vector<std::string>>();
         pieces->reserve(n_vocab_);
         for (std::uint32_t t = 0; t < n_vocab_; ++t) {
             const tok::TokenId id = static_cast<tok::TokenId>(t);
             pieces->push_back(tok_.decode({&id, 1}));
         }
-        pieces_ = std::move(pieces);
+        trie_ = std::make_shared<const model::TokenTrie>(std::move(pieces));
     });
-    return pieces_;
+    return trie_;
+}
+
+std::unique_ptr<model::TokenConstraint> OpenAiServer::output_constraint(
+    std::shared_ptr<const model::Gbnf> g) {
+    if (g == nullptr) {
+        return nullptr;
+    }
+    return std::make_unique<model::GrammarConstraint>(std::move(g),
+                                                      token_trie(),
+                                                      tok_.eos_id());
 }
 
 OpenAiServer::~OpenAiServer() {
@@ -1524,6 +1580,7 @@ void OpenAiServer::install_routes() {
         bool stream = false;
         std::vector<ToolSpec> tools;
         std::optional<VisionChat> vision;  // a chat with images (i#241)
+        std::shared_ptr<const model::Gbnf> grammar;  // an output format
         try {
             body = json::parse(req.body);
             if (chat) {
@@ -1566,6 +1623,9 @@ void OpenAiServer::install_routes() {
                         opt_.max_tokens_cap));
             }
             stream = body.value("stream", false);
+            if (!vision) {
+                grammar = output_grammar(body, req.body);
+            }
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(make_error(e.what()).dump(-1, ' ', false, kLossy),
@@ -1578,11 +1638,8 @@ void OpenAiServer::install_routes() {
         }
 
         auto [sampling, seed] = parse_sampling(body);
-        std::unique_ptr<model::TokenConstraint> constraint;
-        if (wants_json(body)) {
-            constraint = std::make_unique<JsonTokenConstraint>(
-                json_pieces());
-        }
+        std::unique_ptr<model::TokenConstraint> constraint =
+            output_constraint(std::move(grammar));
         // logprobs: /v1/completions takes an integer count; /v1/chat/
         // completions takes a bool `logprobs` + integer `top_logprobs`.
         engine::LogprobsOpt lp;
@@ -1892,10 +1949,8 @@ void OpenAiServer::install_routes() {
             vision = parse_vision_chat(body, true, opt_.max_tokens_cap,
                                        opt_.max_body_bytes);
             if (!vision) {
-                if (wants_json(body)) {
-                    constraint = std::make_unique<JsonTokenConstraint>(
-                        json_pieces());
-                }
+                constraint =
+                    output_constraint(output_grammar(body, req.body));
                 auto msgs = parse_anthropic_messages(body);
                 tools = parse_tools(body, /*anthropic=*/true);
                 if (!tools.empty()) {
@@ -3082,9 +3137,11 @@ void OpenAiServer::install_routes() {
         auth_event("create", "responses", ctx.identity);
         json body;
         ResponsesRequest rq;
+        std::shared_ptr<const model::Gbnf> grammar;  // text.format
         try {
             body = json::parse(req.body);
             rq = parse_responses_request(body);
+            grammar = output_grammar(body, req.body);
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(make_error(e.what()).dump(-1, ' ', false, kLossy),
@@ -3110,9 +3167,9 @@ void OpenAiServer::install_routes() {
         }
         requests_total_.fetch_add(1, std::memory_order_relaxed);
         prompt_tokens_total_.fetch_add(n_prompt, std::memory_order_relaxed);
-        const std::uint64_t id = loop_.submit(std::move(prompt_ids),
-                                              max_tokens, sampling, seed,
-                                              nullptr, {});
+        const std::uint64_t id = loop_.submit(
+            std::move(prompt_ids), max_tokens, sampling, seed,
+            output_constraint(std::move(grammar)), {});
         auto r = std::make_shared<ResponsesResult>();
         r->id = "resp_" + std::to_string(id);
         r->model = opt_.model_name;

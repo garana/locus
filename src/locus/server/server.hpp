@@ -11,6 +11,7 @@
 #include "locus/chat/template.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/http/server.hpp"
+#include "locus/model/grammar_constraint.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/server/engine_loop.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -185,9 +186,15 @@ class OpenAiServer {
     /** Constructs http_ bound to host:port and starts it; @returns the
      * bound port (>0) or -1. */
     int build_and_start(const std::string& host, int port);
-    /** Lazily builds (once) and returns the token -> decoded-bytes
-     * table used by constrained decoding. */
-    std::shared_ptr<const std::vector<std::string>> json_pieces();
+    /** Lazily builds (once) and returns the trie of every token's
+     * decoded bytes, used by constrained decoding. */
+    std::shared_ptr<const model::TokenTrie> token_trie();
+    /**
+     * @returns A constraint that keeps the output a string of grammar
+     *     `g` (i#402), or nullptr when `g` is null.
+     */
+    std::unique_ptr<model::TokenConstraint> output_constraint(
+        std::shared_ptr<const model::Gbnf> g);
     /** L2-normalized last-token embedding of `text` (serialized). */
     std::vector<float> embed_text(const std::string& text);
     /**
@@ -240,8 +247,8 @@ class OpenAiServer {
     auth::WallClock auth_clock_;
     std::unique_ptr<auth::AuthClient> auth_;
 
-    std::once_flag pieces_once_;
-    std::shared_ptr<const std::vector<std::string>> pieces_;
+    std::once_flag trie_once_;
+    std::shared_ptr<const model::TokenTrie> trie_;
 
     // Embeddings run on a dedicated cache/workspace, serialized.
     std::mutex embed_mu_;
