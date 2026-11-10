@@ -4,6 +4,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -97,11 +98,22 @@ tok::TokenId sample(std::span<float> logits, const SamplingParams& p,
                          : argmax(logits);
     }
 
-    // Candidate (logit, index) pairs, highest logit first.
+    // Candidate (logit, index) pairs, highest logit first. A -inf
+    // logit (a row the head did not compute, as for speech's audio
+    // band) has weight exactly 0: it would sort last and add nothing
+    // to any sum, so it is left out (unless every logit is -inf).
     std::vector<std::pair<float, std::uint32_t>> cand;
     cand.reserve(logits.size());
+    constexpr float kNegInf = -std::numeric_limits<float>::infinity();
     for (std::uint32_t i = 0; i < logits.size(); ++i) {
-        cand.emplace_back(logits[i], i);
+        if (logits[i] != kNegInf) {
+            cand.emplace_back(logits[i], i);
+        }
+    }
+    if (cand.empty()) {
+        for (std::uint32_t i = 0; i < logits.size(); ++i) {
+            cand.emplace_back(logits[i], i);
+        }
     }
     if (constraint != nullptr) {
         std::vector<std::pair<float, std::uint32_t>> allowed;
