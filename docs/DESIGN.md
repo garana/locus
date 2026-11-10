@@ -113,9 +113,8 @@ pass. Every variant must
 match the scalar reference in tests, and the golden end-to-end tests
 run on every selectable backend.
 
-SIMD kernels follow the scheme of the sibling `pbw` project: each
-variant (neon, sse4, avx2) is its own source file, compiled with only
-that variant's flags and gated at configure time;
+Each SIMD kernel variant (neon, sse4, avx2) is its own source file,
+compiled with only that variant's flags and gated at configure time;
 `locus::sys::detect()` probes the running machine. One binary stays
 portable across CPU generations. When the compiler's default arm64
 target lacks the 8-bit dot product (GCC on the Pi 5), the neon kernels

@@ -139,11 +139,10 @@ inline bool splits_rows(const Ops& op) {
 }
 
 /**
- * One selectable math implementation. All variants are always
- * compiled in (pbw pattern); `available` reflects what the running
+ * One selectable math implementation. All variants the compiler
+ * supports are compiled in; `available` reflects what the running
  * machine supports, `selectable` whether the backend can serve
- * inference today (the Vulkan entry is listed but not selectable
- * until M5 completes).
+ * inference (today every available backend can).
  */
 struct Backend {
     std::string_view name;

@@ -156,7 +156,8 @@ enum class Kernel {
 /**
  * Synchronous Vulkan compute context: one device, one compute
  * queue, one pipeline per Kernel, SPIR-V embedded at compile time
- * (glslangValidator --vn, per the ../pbw pattern).
+ * (a header per shader: glslangValidator --vn, or glslc -mfmt=c
+ * wrapped by cmake/wrap_spv.cmake).
  *
  * Work is recorded in batches: begin_batch(), any number of
  * dispatch() calls (a memory barrier separates consecutive
