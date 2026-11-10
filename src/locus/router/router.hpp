@@ -105,10 +105,13 @@ struct Instance {
     std::vector<std::string> models;
     /** The /v1/models data entries, for the router's own listing. */
     std::string models_json;
-    /** The SRV name that listed it ("" for an address given as is). */
-    std::string srv;
-    /** Listed by `srv` before but not in its last answer: never picked
-     *  again unless the name lists it once more. */
+    /** Found by SRV (not given as host:port). One entry per host:port,
+     *  whichever names list it. */
+    bool from_srv = false;
+    /** The SRV names whose last answer lists it, sorted. */
+    std::vector<std::string> srv;
+    /** Found by SRV, and no name lists it any more: never picked again
+     *  unless a name lists it once more. */
     bool gone = false;
 };
 

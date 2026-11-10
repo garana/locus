@@ -547,6 +547,59 @@ TEST_CASE("router: an SRV name lists instances and follows changes",
     CHECK_THROWS_AS(Router(bad), std::invalid_argument);
 }
 
+// i#492: a target two SRV names list is one entry, gone only when
+// neither lists it; a static host:port is never doubled by a name.
+TEST_CASE("router: a target two SRV names share is one instance",
+          "[router]") {
+    using locus::pipeline::SrvTarget;
+    FakeInstance a("A", {"text"}, "m"), b("B", {"text"}, "m"),
+        s("S", {"text"}, "m");
+    std::mutex mu;
+    std::map<std::string, std::vector<SrvTarget>> answers = {
+        {"_x._tcp.test",
+         {{"127.0.0.1", a.port, 0, 0}, {"127.0.0.1", b.port, 0, 0}}},
+        {"_y._tcp.test",
+         {{"127.0.0.1", a.port, 0, 0}, {"127.0.0.1", s.port, 0, 0}}}};
+    RouterConfig cfg;
+    cfg.srv_lookup = [&](const std::string& name) {
+        std::lock_guard lk(mu);
+        return answers[name];
+    };
+    RouterFixture rf({"srv:_x._tcp.test", "srv:_y._tcp.test", s.addr()},
+                     cfg);
+    const auto entries = [&](int port) {
+        int n = 0;
+        for (const auto& in : rf.router->instances()) n += in.port == port;
+        return n;
+    };
+    const auto gone = [&](int port) {
+        for (const auto& in : rf.router->instances()) {
+            if (in.port == port) return in.gone;
+        }
+        return true;
+    };
+    CHECK(entries(a.port) == 1);  // listed by both names
+    CHECK(entries(s.port) == 1);  // static, and listed by _y
+    CHECK(rf.router->instances().size() == 3);
+
+    // _x drops A; _y still lists it, so it stays.
+    {
+        std::lock_guard lk(mu);
+        answers["_x._tcp.test"] = {{"127.0.0.1", b.port, 0, 0}};
+    }
+    rf.router->refresh();
+    CHECK_FALSE(gone(a.port));
+    // _y drops A too: now it is gone. S, static, never is.
+    {
+        std::lock_guard lk(mu);
+        answers["_y._tcp.test"] = {{"127.0.0.1", b.port, 0, 0}};
+    }
+    rf.router->refresh();
+    CHECK(gone(a.port));
+    CHECK_FALSE(gone(s.port));
+    CHECK(entries(b.port) == 1);
+}
+
 TEST_CASE("router: video ids name their instance", "[router]") {
     using locus::router::router_video_id;
     using locus::router::split_video_id;
