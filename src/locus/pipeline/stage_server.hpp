@@ -2,6 +2,7 @@
 
 #include <csignal>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,18 @@ class Resolver;  // cached hostname resolver (resolver.hpp)
 struct HostPort {
     std::string host;
     int port = 0;
+};
+
+/** One live connection of a stage to a neighbour (i#21). */
+struct PeerInfo {
+    enum class Role { kUpstream, kDownstream };
+    Role role = Role::kUpstream;
+    /** The peer's "ip:port"; empty while a downstream dial is pending. */
+    std::string address;
+    /** A downstream dial in progress (no RTT yet). */
+    bool connecting = false;
+    /** The kernel's RTT estimate; nullopt where the platform has none. */
+    std::optional<TcpRtt> rtt;
 };
 
 /** Timeouts / reconnect / keepalive policy for serve_stage. */
@@ -55,6 +68,15 @@ struct StageConn {
      * the caller (stage_main) owns it and outlives serve_stage*.
      */
     Resolver* resolver = nullptr;
+    /**
+     * i#21: serve_stage_mux calls on_peers on its loop thread, at most
+     * every peer_report_ms (0 = never), with the stage's live peers:
+     * each session's upstream and its downstream (idle pooled
+     * downstreams are not listed). The call must not block: the loop
+     * serves every session.
+     */
+    std::function<void(const std::vector<PeerInfo>&)> on_peers;
+    int peer_report_ms = 0;
 };
 
 /**

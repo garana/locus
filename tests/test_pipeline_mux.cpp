@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -9,6 +10,7 @@
 #include <csignal>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
 #include <span>
 #include <string>
 #include <thread>
@@ -1432,4 +1434,116 @@ TEST_CASE("serve_stage_mux: SESSION_END with an emptied pool drops, no "
     ::close(wfds[0]);
     ::close(wfds[1]);
     REQUIRE(sres.load() == 0);  // ended unclean: nothing left to dial
+}
+
+// i#21: tcp_rtt reads the kernel's RTT of a connected TCP socket and
+// peer_address names its peer; neither has an answer for a pipe.
+TEST_CASE("tcp_rtt and peer_address on a loopback connection",
+          "[pipeline][net]") {
+    int port = 0;
+    const int lfd = locus::pipeline::listen_on("127.0.0.1", 0, &port);
+    REQUIRE(lfd >= 0);
+    const int c = locus::pipeline::connect_to("127.0.0.1", port);
+    REQUIRE(c >= 0);
+    const int a = locus::pipeline::accept_one(lfd, nullptr);
+    REQUIRE(a >= 0);
+    REQUIRE(locus::pipeline::peer_address(c) ==
+            "127.0.0.1:" + std::to_string(port));
+    REQUIRE(locus::pipeline::peer_address(a).rfind("127.0.0.1:", 0) == 0);
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+    // One exchange gives the kernel a sample; loopback RTT is small.
+    REQUIRE(::write(c, "x", 1) == 1);
+    char b = 0;
+    REQUIRE(::read(a, &b, 1) == 1);
+    const auto rtt = locus::pipeline::tcp_rtt(c);
+    REQUIRE(rtt.has_value());
+    REQUIRE(rtt->rtt_us < 1'000'000u);
+#endif
+    int p[2];
+    REQUIRE(::pipe(p) == 0);
+    REQUIRE_FALSE(locus::pipeline::tcp_rtt(p[0]).has_value());
+    REQUIRE(locus::pipeline::peer_address(p[0]).empty());
+    ::close(p[0]);
+    ::close(p[1]);
+    ::close(a);
+    ::close(c);
+    ::close(lfd);
+}
+
+// i#21: with on_peers set, serve_stage_mux reports each live session's
+// upstream and downstream, with the addresses the other ends see.
+TEST_CASE("serve_stage_mux reports its live peers", "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    using locus::pipeline::PeerInfo;
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    std::mutex mu;
+    std::vector<PeerInfo> seen;  // the last report with a live session
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+    conn.peer_report_ms = 20;
+    conn.on_peers = [&](const std::vector<PeerInfo>& peers) {
+        if (peers.size() == 2 && !peers[1].connecting) {
+            std::lock_guard lk(mu);
+            seen = peers;
+        }
+    };
+    std::thread server([&] {
+        locus::pipeline::serve_stage_mux(stage, ls, allow,
+                                         {{"127.0.0.1", pc}}, conn);
+    });
+
+    Client a;
+    a.request_id = 7;
+    a.to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(a.to_stage >= 0);
+    a.from_stage = locus::pipeline::accept_one(lc, nullptr);
+    REQUIRE(a.from_stage >= 0);
+    ::close(lc);
+    // A few round trips keep the session live across several reports.
+    for (const auto t : tok.encode("Once upon a time", true)) {
+        a.round_trip(t);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    REQUIRE(a.ok);
+    std::vector<PeerInfo> got;
+    {
+        std::lock_guard lk(mu);
+        got = seen;
+    }
+    const std::string client_addr = [&] {  // the client's own end
+        sockaddr_storage ss{};
+        socklen_t len = sizeof(ss);
+        ::getsockname(a.to_stage, reinterpret_cast<sockaddr*>(&ss), &len);
+        const auto* in = reinterpret_cast<const sockaddr_in*>(&ss);
+        return "127.0.0.1:" + std::to_string(ntohs(in->sin_port));
+    }();
+    ::close(a.to_stage);  // EOF ends the session, and serve_sessions = 1
+    server.join();
+    ::close(a.from_stage);
+
+    REQUIRE(got.size() == 2);
+    REQUIRE(got[0].role == PeerInfo::Role::kUpstream);
+    REQUIRE(got[0].address == client_addr);
+    REQUIRE(got[1].role == PeerInfo::Role::kDownstream);
+    REQUIRE(got[1].address == "127.0.0.1:" + std::to_string(pc));
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+    REQUIRE(got[0].rtt.has_value());
+    REQUIRE(got[1].rtt.has_value());
+#endif
 }

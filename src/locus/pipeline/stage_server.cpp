@@ -865,6 +865,32 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         pump(s);      // process any already-buffered next-sequence frames
     };
 
+    // i#21: the live peers, read on this thread when a report is due.
+    const auto report_peers = [&] {
+        std::vector<PeerInfo> peers;
+        for (const auto& [ifd, sp] : sessions) {
+            const MuxSession& s = *sp;
+            if (s.cancelled) {
+                continue;
+            }
+            peers.push_back({PeerInfo::Role::kUpstream, peer_address(ifd),
+                             false, tcp_rtt(ifd)});
+            if (s.connecting) {
+                peers.push_back(
+                    {PeerInfo::Role::kDownstream, "", true, std::nullopt});
+            } else if (s.out_fd >= 0) {
+                peers.push_back({PeerInfo::Role::kDownstream,
+                                 peer_address(s.out_fd), false,
+                                 tcp_rtt(s.out_fd)});
+            }
+        }
+        conn_live.on_peers(peers);
+    };
+    Clock::time_point next_report = Clock::time_point::max();
+    if (conn_live.on_peers && conn_live.peer_report_ms > 0) {
+        next_report = Clock::now();
+    }
+
     bool result = true;
     std::vector<sys::Poller::Event> events;
     std::vector<StageExecutor::Completion> comps;
@@ -872,8 +898,8 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         // Wait only until the nearest pending dial timer fires (a connect
         // timeout for an in-progress dial, or a between-sweeps retry), so
         // those bound without a blocking sleep; -1 (forever) when none are
-        // pending. Issue 39.
-        Clock::time_point earliest = Clock::time_point::max();
+        // pending. Issue 39. A due peer report (i#21) bounds it too.
+        Clock::time_point earliest = next_report;
         for (const auto& [efd, esp] : sessions) {
             (void)efd;
             const MuxSession& s = *esp;
@@ -907,6 +933,12 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         if (pr < 0) {
             result = false;
             break;  // poll error
+        }
+        if (next_report != Clock::time_point::max() &&
+            Clock::now() >= next_report) {
+            report_peers();
+            next_report = Clock::now() + std::chrono::milliseconds(
+                                             conn_live.peer_report_ms);
         }
 
         bool listen_ready = false;

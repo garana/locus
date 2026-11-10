@@ -498,4 +498,48 @@ void set_keepalive(int fd, int idle_s, int intvl_s, int count) {
 #endif
 }
 
+std::optional<TcpRtt> tcp_rtt(int fd) {
+#if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+    tcp_connection_info ti{};
+    socklen_t len = sizeof(ti);
+    if (::getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &ti, &len) != 0) {
+        return std::nullopt;
+    }
+    return TcpRtt{ti.tcpi_srtt * 1000u, ti.tcpi_rttvar * 1000u};
+#elif defined(TCP_INFO)
+    tcp_info ti{};
+    socklen_t len = sizeof(ti);
+    if (::getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &len) != 0) {
+        return std::nullopt;
+    }
+    return TcpRtt{ti.tcpi_rtt, ti.tcpi_rttvar};
+#else
+    (void)fd;
+    return std::nullopt;
+#endif
+}
+
+std::string peer_address(int fd) {
+    sockaddr_storage ss{};
+    socklen_t len = sizeof(ss);
+    if (::getpeername(fd, reinterpret_cast<sockaddr*>(&ss), &len) != 0) {
+        return "";
+    }
+    char ip[INET6_ADDRSTRLEN] = {};
+    int port = 0;
+    if (ss.ss_family == AF_INET) {
+        const auto* a = reinterpret_cast<const sockaddr_in*>(&ss);
+        ::inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip));
+        port = ntohs(a->sin_port);
+        return std::string(ip) + ":" + std::to_string(port);
+    }
+    if (ss.ss_family == AF_INET6) {
+        const auto* a = reinterpret_cast<const sockaddr_in6*>(&ss);
+        ::inet_ntop(AF_INET6, &a->sin6_addr, ip, sizeof(ip));
+        port = ntohs(a->sin6_port);
+        return "[" + std::string(ip) + "]:" + std::to_string(port);
+    }
+    return "";
+}
+
 }  // namespace locus::pipeline

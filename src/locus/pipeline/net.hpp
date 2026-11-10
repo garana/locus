@@ -148,4 +148,25 @@ void set_recv_timeout(int fd, int ms);
  */
 void set_keepalive(int fd, int idle_s, int intvl_s, int count);
 
+/** The kernel's round-trip estimate for one TCP connection (i#21). */
+struct TcpRtt {
+    std::uint32_t rtt_us = 0;     /**< Smoothed round-trip time. */
+    std::uint32_t rttvar_us = 0;  /**< Its mean deviation. */
+};
+
+/**
+ * Reads the kernel's smoothed RTT of a connected TCP socket, with no
+ * probe of our own: Linux and FreeBSD TCP_INFO (microseconds), macOS
+ * TCP_CONNECTION_INFO (milliseconds, scaled here).
+ * @returns nullopt when fd is not a TCP socket, the call fails, or the
+ *     platform has no such option.
+ */
+std::optional<TcpRtt> tcp_rtt(int fd);
+
+/**
+ * @returns The numeric "ip:port" of fd's peer ("[ip]:port" for IPv6),
+ *     or "" when fd is not a connected socket.
+ */
+std::string peer_address(int fd);
+
 }  // namespace locus::pipeline

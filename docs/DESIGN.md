@@ -699,6 +699,11 @@ can use it underneath.
 across a stage chain. Activations travel as length-prefixed frames
 over TCP, tagged by request and position. A connect proves only that
 the downstream listener is up; liveness needs an app-level probe.
+The serve loop can report its live peers (each session's upstream
+and downstream) with the kernel's smoothed TCP round-trip time, read
+from `TCP_INFO` (Linux, FreeBSD) or `TCP_CONNECTION_INFO` (macOS)
+with no probe of its own (#21); `locus-stage --peer-log N` prints
+them every N seconds.
 
 A node separates I/O from compute (#24):
 
