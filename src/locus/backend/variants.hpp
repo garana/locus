@@ -244,7 +244,8 @@ std::size_t vulkan_kv_pool_count();
 
 /**
  * Frees the process-lifetime Vulkan backend state: the weight pool
- * buffers, the GPU-mapped KV pools, and activation scratch. TEST
+ * buffers and activation scratch; the GPU-mapped KV pools stay with
+ * their caches, which free them (i#428). TEST
  * USE ONLY -- the singleton's pool is the intended resident working
  * set in production (one model per process); this exists so a test
  * process running many models across many cases does not accumulate
