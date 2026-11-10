@@ -130,10 +130,35 @@ TEST_CASE("gbnf flags a state that drops stacks past the cap", "[gbnf]") {
     }
     CHECK(capped.truncated());
     CHECK_FALSE(wide.truncated());  // far below the default cap
-    CHECK(locus::model::gbnf_stack_overflows() > before);
-    // The flag stays once set.
+    // One path, counted once, however many fed states were over.
+    CHECK(locus::model::gbnf_stack_overflows() == before + 1);
+    // The flag stays once set, and a copy stepped further keeps the cap.
     REQUIRE(capped.feed('b'));
     CHECK(capped.truncated());
+    GbnfMatcher out(g);
+    REQUIRE(capped.step('b', out));
+    CHECK(out.truncated());
+    // Tries with step(), as the token mask does, are not counted.
+    GbnfMatcher fresh(g, 8), probe(g, 8);
+    const std::uint64_t mid = locus::model::gbnf_stack_overflows();
+    for (int i = 0; i < 20; ++i) {
+        REQUIRE(fresh.step('a', probe));
+        fresh = probe;
+    }
+    CHECK(fresh.truncated());
+    CHECK(locus::model::gbnf_stack_overflows() == mid);
+}
+
+TEST_CASE("gbnf step carries the stack cap into its output", "[gbnf]") {
+    const auto g = Gbnf::parse(R"(root ::= "a" root "b" | "a" root | )");
+    GbnfMatcher capped(g, 8);
+    GbnfMatcher out(g);  // the default cap until a step writes into it
+    GbnfMatcher cur = capped;
+    for (int i = 0; i < 20; ++i) {
+        REQUIRE(cur.step('a', out));
+        cur = out;
+    }
+    CHECK(cur.truncated());  // capped at 8 all along, not at 4096
 }
 
 TEST_CASE("json schema grammars stay under the stack cap", "[gbnf]") {
@@ -330,7 +355,7 @@ TEST_CASE("grammar constraint ends a match that only whitespace follows",
     };
     SECTION("a JSON object stops at its closing brace") {
         GrammarConstraint c(Gbnf::parse(json_value_gbnf(), "object"), trie,
-                            0);
+                            0, /*stop_at_space=*/true);
         c.commit(1);
         // No EOS yet; a tab may only follow a newline.
         CHECK(allowed(c) == std::vector<int>{2, 3, 4});
@@ -340,9 +365,22 @@ TEST_CASE("grammar constraint ends a match that only whitespace follows",
     }
     SECTION("a match that can still grow keeps its continuations") {
         // "7" is complete, but more digits may follow.
-        GrammarConstraint c(Gbnf::parse(R"(root ::= [0-9]+ " "?)"), trie, 0);
+        GrammarConstraint c(Gbnf::parse(R"(root ::= [0-9]+ " "?)"), trie, 0,
+                            /*stop_at_space=*/true);
         c.commit(6);
         CHECK(allowed(c) == std::vector<int>{0, 3, 6});
+    }
+    SECTION("a grammar that goes on after a space is not cut") {
+        // "7" then " 7"... in a vocabulary with no " 7" token: after a
+        // complete "7" the mask holds only the space, which leads to
+        // more digits. Only the JSON formats stop at whitespace.
+        const auto g = Gbnf::parse(R"(root ::= [0-9] (" " [0-9])*)");
+        GrammarConstraint c(g, trie, 0);
+        c.commit(6);
+        CHECK(allowed(c) == std::vector<int>{0, 3});
+        GrammarConstraint json_like(g, trie, 0, /*stop_at_space=*/true);
+        json_like.commit(6);
+        CHECK(allowed(json_like) == std::vector<int>{0});  // would cut
     }
 }
 

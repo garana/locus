@@ -154,6 +154,8 @@ class GbnfMatcher {
     /** Sorts and dedups s, keeping max_stacks_. @returns whether any
      * distinct stack was dropped. */
     bool dedup(Stacks& s) const;
+    /** Counts a newly truncated path in gbnf_stack_overflows(). */
+    void count_overflow() const;
 
     std::shared_ptr<const Gbnf> g_;
     std::size_t max_stacks_ = kMaxStacks;
@@ -172,10 +174,12 @@ class GbnfMatcher {
 };
 
 /**
- * @returns How many times, in this process, a grammar state had more
- *     parse stacks than its matcher's cap and dropped the rest (each
- *     can hide a continuation the grammar allows). The first one is
- *     also logged to stderr.
+ * @returns How many matcher paths in this process became truncated:
+ *     a state built or fed (GbnfMatcher's constructor or feed(), the
+ *     path the output takes) had more parse stacks than the cap and
+ *     dropped the rest, which can hide a continuation the grammar
+ *     allows. Each path counts once; the states a token mask only
+ *     tries (step()) do not count. The first is also logged to stderr.
  */
 std::uint64_t gbnf_stack_overflows();
 

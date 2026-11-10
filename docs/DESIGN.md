@@ -507,9 +507,11 @@ guarding the default path.
   at the end of a sequence drops the caller's frame, so repetition
   does not grow the stacks, and left recursion is rejected at parse
   time. A state keeps at most 4096 stacks; one that has more drops
-  the rest, logs it once and counts it in
+  the rest, logs it once and counts the reply once in
   `locus_grammar_stack_overflows_total`, since a dropped stack can
-  reject output the grammar allows. Each step's allowed tokens come
+  reject output the grammar allows. Only the JSON formats stop a
+  complete reply at its last brace when nothing but whitespace could
+  follow; a grammar or a regex may go on after whitespace. Each step's allowed tokens come
   from one walk of a trie of the vocabulary's bytes, cached by matcher
   state (inside a string the state repeats). EOS is allowed only on a
   complete match and is the only choice once nothing but whitespace

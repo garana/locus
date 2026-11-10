@@ -42,15 +42,21 @@ class TokenTrie {
  * Constrains decoding to the strings of a GBNF grammar (i#402). A
  * token is allowed when its bytes continue a string of the grammar;
  * EOS is allowed only when the output so far is a complete string, and
- * is the only choice once nothing but whitespace can follow, so the
- * request ends with a full match and no trailing padding. The allowed
- * set is computed once per step by a
- * walk of the vocabulary trie.
+ * is the only choice once nothing more can follow. The allowed set is
+ * computed once per step by a walk of the vocabulary trie.
  */
 class GrammarConstraint : public TokenConstraint {
   public:
+    /**
+     * @param stop_at_space Also end a complete match when every allowed
+     *     token is only whitespace. For the JSON grammars, whose every
+     *     value ends with optional space, so a reply ends at its
+     *     closing brace instead of padding. Off for other grammars,
+     *     where whitespace may lead to more content.
+     */
     GrammarConstraint(std::shared_ptr<const Gbnf> g,
-                      std::shared_ptr<const TokenTrie> trie, tok::TokenId eos);
+                      std::shared_ptr<const TokenTrie> trie, tok::TokenId eos,
+                      bool stop_at_space = false);
 
     bool allows(tok::TokenId t) const override;
     void commit(tok::TokenId t) override;
@@ -68,6 +74,7 @@ class GrammarConstraint : public TokenConstraint {
     GbnfMatcher m_;
     std::shared_ptr<const TokenTrie> trie_;
     tok::TokenId eos_;
+    bool stop_at_space_;
     mutable std::vector<std::uint8_t> mask_;
     mutable bool fresh_ = false;
     /** One matcher per trie depth, reused by every walk. */

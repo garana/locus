@@ -527,6 +527,7 @@ GbnfMatcher::GbnfMatcher(std::shared_ptr<const Gbnf> g,
     cur_.assign(1, g_->start());
     expand(cur_, stacks_, 0);
     truncated_ = dedup(stacks_);
+    if (truncated_) count_overflow();
 }
 
 std::uint64_t gbnf_stack_overflows() {
@@ -595,15 +596,17 @@ bool GbnfMatcher::dedup(Stacks& s) const {
     }
     std::swap(s.data, tmp_.data);
     std::swap(s.ends, tmp_.ends);
-    if (dropped &&
-        stack_overflows.fetch_add(1, std::memory_order_relaxed) == 0) {
+    return dropped;
+}
+
+void GbnfMatcher::count_overflow() const {
+    if (stack_overflows.fetch_add(1, std::memory_order_relaxed) == 0) {
         std::fprintf(stderr,
                      "locus: a grammar state has more than %zu parse "
                      "stacks; the rest are dropped, so the constraint may "
                      "reject output the grammar allows\n",
                      max_stacks_);
     }
-    return dropped;
 }
 
 bool GbnfMatcher::viable(char32_t lo, char32_t hi) const {
@@ -619,11 +622,15 @@ bool GbnfMatcher::viable(char32_t lo, char32_t hi) const {
 bool GbnfMatcher::feed(std::uint8_t b) {
     GbnfMatcher next = *this;
     if (!step(b, next)) return false;
+    // Counted on the path the output takes, not on the states a token
+    // mask only tries (those use step()), so the count is per path.
+    if (next.truncated_ && !truncated_) count_overflow();
     *this = std::move(next);
     return true;
 }
 
 bool GbnfMatcher::step(std::uint8_t b, GbnfMatcher& out) const {
+    out.max_stacks_ = max_stacks_;  // the next state keeps this cap
     char32_t cp = 0;
     int need = 0;
     int len = len_;  // continuation bytes of the whole character
