@@ -53,7 +53,8 @@ OpenAI + Anthropic compatible inference server (default port 8080):
   POST /v1/completions
   POST /v1/chat/completions
   POST /v1/messages            (Anthropic)
-  POST /v1/embeddings          (CPU and CUDA backends)
+  POST /v1/embeddings          (CPU and CUDA backends, or
+                               --embedding-model on the CPU)
   GET  /v1/models
   GET  /v1/models/{id}
   POST /v1/audio/speech        (needs --audio-decoder)
@@ -163,6 +164,7 @@ OpenAI + Anthropic compatible inference server (default port 8080):
             opt.metrics_path = args.metrics_path;
         }
         opt.audio_decoder_path = args.audio_decoder;
+        opt.embedding_model_path = args.embedding_model;
         if (args.max_tokens > 0) {
             opt.max_tokens_cap = args.max_tokens;
         }

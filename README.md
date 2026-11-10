@@ -30,6 +30,9 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **API:** `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
   `/v1/responses` (stateless), `/v1/embeddings`, `/v1/models`,
   `/metrics`, `/health`.
+- **Embedding models:** BERT GGUFs (arch `bert`, WordPiece; tested
+  with bge-small-en-v1.5) with `--embedding-model`, beside the chat
+  model, on the CPU.
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
   penalties, seed), structured output (JSON mode, a JSON Schema, a
   regex or a GBNF grammar), prompt caching, logprobs, prompt-lookup
@@ -164,6 +167,8 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
+- RAG: more embedding models, nomic-bert and XLM-R / E5 (#502); a
+  reranker endpoint, `/v1/rerank` (#503).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
 - Low priority: a quantized KV cache for MLA and DSA models (#63);
@@ -176,7 +181,8 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
     ./build/tests/locus_tests
 
 Tests that need model files skip when the file is absent;
-`scripts/fetch-test-model.sh` gets the small ones. Tests tagged as
+`scripts/fetch-test-model.sh` gets the small ones (`bge` as its
+argument gets the embedding model). Tests tagged as
 heavy also need `LOCUS_HEAVY_TESTS=1`.
 
 ## Run
@@ -194,7 +200,9 @@ or `--image-model <dir>` (PixArt: a directory with the GGUFs from
 and `convert-t5-encoder.py`, plus `--lora-dir <dir>` for LoRAs from
 `scripts/convert-lora.py`). Video needs `--video-model <dir>` (the
 GGUFs from `scripts/convert-ltxv.py` and `convert-t5-encoder.py`) and
-an ffmpeg on PATH or at `--ffmpeg <path>`.
+an ffmpeg on PATH or at `--ffmpeg <path>`. A dedicated embedding model
+for `/v1/embeddings` needs `--embedding-model <bert.gguf>`; task
+prefixes such as "query: " are the client's job.
 
 ## Backends
 

@@ -151,6 +151,9 @@ inline void print_tokenizers() {
     std::printf(
         "  bpe       byte-level BPE (model=gpt2); "
         "pretokenizers: gpt2, llama3, qwen2\n");
+    std::printf(
+        "  ugm       T5 unigram (model=t5)\n"
+        "  wpm       BERT WordPiece (model=bert)\n");
 }
 
 /** Prints the full capability matrix: archs, backends, quants,
@@ -184,6 +187,9 @@ inline constexpr const char* kCommonHelp =
     "                   path P (default /metrics)\n"
     "  --audio-decoder P locus-server: enable /v1/audio/speech with\n"
     "                   the neural-codec decoder GGUF at path P\n"
+    "  --embedding-model P locus-server: serve /v1/embeddings with the\n"
+    "                   BERT embedding GGUF at path P (CPU), listed in\n"
+    "                   /v1/models by its file name\n"
     "  --max-tokens N   locus-server: cap one request's output at N\n"
     "                   tokens (default 1024); also the length of a\n"
     "                   /v1/responses reply that sets no\n"
@@ -293,6 +299,9 @@ struct BackendArgs {
      * (arch "snac") enabling locus-server's /v1/audio/speech; empty =
      * the endpoint is disabled (503). */
     std::string audio_decoder;
+    /** From --embedding-model P: path to a BERT embedding GGUF for
+     * locus-server's /v1/embeddings; empty = the chat model embeds. */
+    std::string embedding_model;
     /** From --max-tokens N: per-request output-token cap (0 = the
      * server default). */
     std::uint32_t max_tokens = 0;
@@ -429,6 +438,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.audio_decoder = argv[++i];
         } else if (a.rfind("--audio-decoder=", 0) == 0) {
             out.audio_decoder = std::string(a.substr(16));
+        } else if (a == "--embedding-model" && i + 1 < argc) {
+            out.embedding_model = argv[++i];
+        } else if (a.rfind("--embedding-model=", 0) == 0) {
+            out.embedding_model = std::string(a.substr(18));
         } else if (a == "--max-tokens" && i + 1 < argc) {
             number("--max-tokens", argv[++i], out.max_tokens);
         } else if (a.rfind("--max-tokens=", 0) == 0) {

@@ -65,6 +65,22 @@ TEST_CASE("the lora-dir flag takes the FLUX LoRA directory", "[cli]") {
     REQUIRE(b.lora_dir == "l2");
 }
 
+TEST_CASE("the embedding-model flag takes the embedding GGUF path",
+          "[cli]") {
+    std::array<const char*, 4> argv1 = {"prog", "--embedding-model",
+                                        "bge.gguf", "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()), const_cast<char**>(argv1.data()));
+    REQUIRE(a.embedding_model == "bge.gguf");
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+
+    std::array<const char*, 3> argv2 = {"prog", "--embedding-model=e.gguf",
+                                        "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()), const_cast<char**>(argv2.data()));
+    REQUIRE(b.embedding_model == "e.gguf");
+}
+
 TEST_CASE("the audio-max-tokens flag sets the speech token cap", "[cli]") {
     std::array<const char*, 4> argv1 = {"prog", "--audio-max-tokens",
                                         "350", "m.gguf"};

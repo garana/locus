@@ -9,6 +9,7 @@
 
 #include "locus/auth/auth_client.hpp"
 #include "locus/chat/template.hpp"
+#include "locus/embed/embedding_model.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/http/server.hpp"
 #include "locus/model/grammar_constraint.hpp"
@@ -93,6 +94,11 @@ class OpenAiServer {
          * each runs a serialized model forward, so an unbounded array
          * is a CPU-exhaustion vector. Over this gets 400. */
         std::size_t max_embeddings_inputs = 256;
+        /** Path to a dedicated embedding model GGUF (arch "bert",
+         * --embedding-model). /v1/models lists it by its file name,
+         * and /v1/embeddings uses it unless the
+         * request's model names the chat model. Empty = off. */
+        std::string embedding_model_path;
         /** Path the Prometheus metrics endpoint is served at
          * (--metrics-path); default /metrics. */
         std::string metrics_path = "/metrics";
@@ -272,6 +278,10 @@ class OpenAiServer {
     std::once_flag embed_once_;
     std::unique_ptr<kv::PagedKvCache> embed_cache_;
     model::TransformerModel::Workspace embed_ws_;
+    // The dedicated embedding model (--embedding-model; null when not
+    // given), one request at a time under bert_mu_.
+    std::unique_ptr<embed::EmbeddingModel> bert_;
+    std::mutex bert_mu_;
 
     // /v1/audio/speech: the SNAC decoder (null when --audio-decoder was
     // not given) and the Orpheus audio band base resolved from the
