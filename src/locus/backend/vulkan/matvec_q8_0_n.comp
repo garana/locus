@@ -70,6 +70,16 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared float red[NT * LANES * ROWS];
+// The store and reduce loops skip the dead token planes (GUARD), or
+// with -DNOGUARD (the *_ng builds) run all NT: the same sums on every
+// live plane either way, but which is faster depends on the GPU's
+// compiler (i#471: +4% guarded on an M4 Max, +3% unguarded on an M2
+// Pro), so the host picks one build per device.
+#ifdef NOGUARD
+#define GUARD(t) true
+#else
+#define GUARD(t) ((t) < nt)
+#endif
 #ifdef SWIGLU
 shared float red_u[NT * LANES * ROWS];
 #endif
@@ -250,7 +260,7 @@ void main() {
     // batch (one sequence, in the multi-sequence decode) skips the
     // others, and each live plane's sums are the same either way.
     for (uint t = 0u; t < NT; ++t) {
-        if (t < nt) {
+        if (GUARD(t)) {
             red[t * LANES * ROWS + tid] = acc[t];
 #ifdef SWIGLU
             red_u[t * LANES * ROWS + tid] = acc_u[t];
@@ -261,7 +271,7 @@ void main() {
     for (uint step = LANES / 2u; step > 0u; step >>= 1) {
         if (lane < step) {
             for (uint t = 0u; t < NT; ++t) {
-                if (t < nt) {
+                if (GUARD(t)) {
                     uint i = t * LANES * ROWS + tid;
                     red[i] += red[i + step];
 #ifdef SWIGLU

@@ -41,6 +41,8 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ8_0GluShB:
         case Kernel::kMatvecQ8_0N:
         case Kernel::kMatvecQ8_0NGlu:
+        case Kernel::kMatvecQ8_0NNg:
+        case Kernel::kMatvecQ8_0NGluNg:
         case Kernel::kMatvecQ8_0P:
         case Kernel::kMatvecQ8_0GluP:
         case Kernel::kMatvecF32N:
@@ -237,6 +239,8 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "layer_norm_spv.h"
 #include "conv2d_gemm_spv.h"
 #include "matvec_q8_0_n_glu_spv.h"
+#include "matvec_q8_0_n_ng_spv.h"
+#include "matvec_q8_0_n_glu_ng_spv.h"
 #include "rope_neox_spv.h"
 #include "rope_neox_b_spv.h"
 #include "matvec_q4_k_b_spv.h"
@@ -587,6 +591,11 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kMatvecQ8_0NGlu, "matvec_q8_0_n_glu",
      locus_matvec_q8_0_n_glu_spv, sizeof(locus_matvec_q8_0_n_glu_spv), 4,
      52},
+    {Kernel::kMatvecQ8_0NNg, "matvec_q8_0_n_ng", locus_matvec_q8_0_n_ng_spv,
+     sizeof(locus_matvec_q8_0_n_ng_spv), 3, 52},
+    {Kernel::kMatvecQ8_0NGluNg, "matvec_q8_0_n_glu_ng",
+     locus_matvec_q8_0_n_glu_ng_spv, sizeof(locus_matvec_q8_0_n_glu_ng_spv),
+     4, 52},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */
