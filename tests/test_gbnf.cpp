@@ -275,3 +275,50 @@ TEST_CASE("grammar constraint allows the tokens that continue a match",
     CHECK(c.accepted());
     CHECK(allowed() == std::vector<int>{0});  // only EOS is left
 }
+
+TEST_CASE("grammar constraint ends a match that only whitespace follows",
+          "[gbnf]") {
+    // 0 is EOS; 3, 4 and 5 are whitespace, 6 is a digit.
+    auto pieces = std::make_shared<std::vector<std::string>>(
+        std::vector<std::string>{"", "{", "}", " ", "\n", "\t ", "7"});
+    const auto trie = std::make_shared<const TokenTrie>(pieces);
+    const auto allowed = [&](GrammarConstraint& c) {
+        std::vector<int> out;
+        for (int t = 0; t < 7; ++t) {
+            if (c.allows(t)) out.push_back(t);
+        }
+        return out;
+    };
+    SECTION("a JSON object stops at its closing brace") {
+        GrammarConstraint c(Gbnf::parse(json_value_gbnf(), "object"), trie,
+                            0);
+        c.commit(1);
+        // No EOS yet; a tab may only follow a newline.
+        CHECK(allowed(c) == std::vector<int>{2, 3, 4});
+        c.commit(2);
+        CHECK(c.accepted());
+        CHECK(allowed(c) == std::vector<int>{0});  // not the trailing space
+    }
+    SECTION("a match that can still grow keeps its continuations") {
+        // "7" is complete, but more digits may follow.
+        GrammarConstraint c(Gbnf::parse(R"(root ::= [0-9]+ " "?)"), trie, 0);
+        c.commit(6);
+        CHECK(allowed(c) == std::vector<int>{0, 3, 6});
+    }
+}
+
+TEST_CASE("the json value grammar parses with an object root", "[gbnf]") {
+    const auto g = Gbnf::parse(json_value_gbnf(), "object");
+    const auto full = [&](std::string_view s) {
+        GbnfMatcher m(g);
+        for (const unsigned char c : s) {
+            if (!m.feed(c)) return false;
+        }
+        return m.accepted();
+    };
+    CHECK(full(R"({"a": [1, 2]})"));
+    CHECK(full("{}"));
+    CHECK_FALSE(full("1.1"));
+    CHECK_FALSE(full(R"("text")"));
+    CHECK_FALSE(full("[1]"));
+}

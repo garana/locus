@@ -42,8 +42,9 @@ class TokenTrie {
  * Constrains decoding to the strings of a GBNF grammar (i#402). A
  * token is allowed when its bytes continue a string of the grammar;
  * EOS is allowed only when the output so far is a complete string, and
- * is the only choice once nothing more can follow, so the request ends
- * with a full match. The allowed set is computed once per step by a
+ * is the only choice once nothing but whitespace can follow, so the
+ * request ends with a full match and no trailing padding. The allowed
+ * set is computed once per step by a
  * walk of the vocabulary trie.
  */
 class GrammarConstraint : public TokenConstraint {
@@ -60,6 +61,9 @@ class GrammarConstraint : public TokenConstraint {
   private:
     void walk(std::uint32_t node, const GbnfMatcher& m,
               std::size_t depth) const;
+    /** @returns whether mask_ allows a token with a byte other than
+     * space, tab, CR or LF. */
+    bool more_than_space() const;
 
     GbnfMatcher m_;
     std::shared_ptr<const TokenTrie> trie_;

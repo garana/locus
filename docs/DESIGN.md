@@ -473,7 +473,8 @@ guarding the default path.
   time. Each step's allowed tokens come from one walk of a trie of the
   vocabulary's bytes, cached by matcher state (inside a string the
   state repeats). EOS is allowed only on a complete match and is the
-  only choice once nothing more can follow. With a 128k vocabulary on
+  only choice once nothing but whitespace can follow, so a reply ends
+  at its closing brace. With a 128k vocabulary on
   an M2 Pro (Llama 3.2 1B, CPU) a JSON Schema costs about 3.5 ms per
   token over free decoding.
 - Prompt caching: exact token-prefix keys, ref-counted block pins, LRU

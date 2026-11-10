@@ -39,7 +39,7 @@ tokens that would break it:
 | `output_config.format`       | /v1/messages                   |
 | `output_format` (older beta) | /v1/messages                   |
 
-The format's `type` is `json_object` (any JSON value), `json_schema`
+The format's `type` is `json_object` (a JSON object), `json_schema`
 (Chat Completions puts the schema in `json_schema.schema`, the others
 in `schema`), or, as locus extensions, `grammar` (a GBNF grammar in
 `grammar`, start rule `root`) or `regex` (in `regex`, matched whole).

@@ -511,7 +511,8 @@ std::shared_ptr<const model::Gbnf> format_grammar(const json& f,
         return nullptr;
     }
     if (type == "json_object") {
-        return model::Gbnf::parse(model::json_value_gbnf());
+        // OpenAI's JSON mode promises an object, not any value.
+        return model::Gbnf::parse(model::json_value_gbnf(), "object");
     }
     if (type == "json_schema") {
         const json* s = nested && f.contains("json_schema") &&
