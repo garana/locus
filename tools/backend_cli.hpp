@@ -203,6 +203,14 @@ inline constexpr const char* kCommonHelp =
     "                   from scripts/convert-lora.py) for the image\n"
     "                   requests' lora field, each named by its file\n"
     "                   name; needs a FLUX.1 --image-model\n"
+    "  --register URL   locus-server: register with the locus-router\n"
+    "                   at URL (http://HOST:PORT) once listening, and\n"
+    "                   again every 10 s; needs --register-as and\n"
+    "                   --register-key-file\n"
+    "  --register-as A  locus-server: the HOST:PORT the router reaches\n"
+    "                   this server at\n"
+    "  --register-key-file F locus-server: a file holding the router's\n"
+    "                   registration key\n"
     "  --video-model D  locus-server: enable /v1/videos with the\n"
     "                   LTX-Video pipeline in directory D (t5encoder,\n"
     "                   ltxv and ltxv_vae GGUFs)\n"
@@ -302,6 +310,9 @@ struct BackendArgs {
     /** From --lora-dir D: directory of FLUX.1 LoRA GGUFs for the image
      * requests' lora field; empty = no LoRAs. */
     std::string lora_dir;
+    /** From --register URL, --register-as A, --register-key-file F:
+     * register with a locus-router (empty: do not). */
+    std::string register_url, register_as, register_key_file;
     /** From --video-model D: directory of the LTX-Video pipeline's
      * GGUFs, enabling locus-server's /v1/videos; empty = off. */
     std::string video_model;
@@ -440,6 +451,12 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.lora_dir = argv[++i];
         } else if (a.rfind("--lora-dir=", 0) == 0) {
             out.lora_dir = std::string(a.substr(11));
+        } else if (a == "--register" && i + 1 < argc) {
+            out.register_url = argv[++i];
+        } else if (a == "--register-as" && i + 1 < argc) {
+            out.register_as = argv[++i];
+        } else if (a == "--register-key-file" && i + 1 < argc) {
+            out.register_key_file = argv[++i];
         } else if (a == "--video-model" && i + 1 < argc) {
             out.video_model = argv[++i];
         } else if (a.rfind("--video-model=", 0) == 0) {

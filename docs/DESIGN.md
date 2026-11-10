@@ -156,7 +156,13 @@ path and, for chat, the body. The instances are given as host:port or
 as `srv:NAME`, whose DNS SRV targets (the lowest priority's) are
 looked up again on every refresh, so instances join and leave with the
 record; one that leaves is never picked again, and an empty answer
-keeps the last list. An instance lists its kinds in
+keeps the last list. With `--register-keys`, an instance can also add
+itself (`locus-server --register`): it POSTs its host:port to
+`/locus/register` with one of the keys, again every third of its TTL
+(30 s), and the router drops it when that runs out or on
+`/locus/deregister`; without keys the route is a 404, since anyone who
+could register could take the router's traffic. An instance lists its
+kinds in
 `/v1/models` (`locus_kinds`), which the router reads at start and
 every `--refresh-ms`; a request that names a listed model goes to that
 instance. Buffered replies are forwarded whole; a chunked one (SSE)

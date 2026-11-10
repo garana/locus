@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -110,8 +111,13 @@ struct Instance {
     bool from_srv = false;
     /** The SRV names whose last answer lists it, sorted. */
     std::vector<std::string> srv;
-    /** Found by SRV, and no name lists it any more: never picked again
-     *  unless a name lists it once more. */
+    /** Registered itself (POST /locus/register). */
+    bool from_reg = false;
+    /** When its last registration runs out. */
+    std::chrono::steady_clock::time_point reg_until{};
+    /** Found by SRV or by registration, and neither lists it now (no
+     *  name lists it, and its registration ran out or was dropped):
+     *  never picked again unless it is listed once more. */
     bool gone = false;
 };
 
@@ -131,6 +137,11 @@ struct RouterConfig {
     /** The SRV lookup (tests set a fake); null: dns_srv_lookup. */
     std::function<std::vector<pipeline::SrvTarget>(const std::string&)>
         srv_lookup;
+    /** Keys an instance may register itself with (POST /locus/register
+     * and /locus/deregister, Authorization: Bearer KEY). Empty: registration
+     * is off (404), since anyone who could register could take the
+     * router's traffic. */
+    std::vector<std::string> register_keys;
     /** How often /v1/models is fetched from each instance. */
     int refresh_ms = 10000;
     /** Load bound: an instance with more requests in flight than this
@@ -243,6 +254,11 @@ class Router {
     /** Adds the targets of every SRV name to inst_ and marks the ones
      *  a name no longer lists as gone (run first by refresh). */
     void expand_srv();
+    /** POST /locus/register and /locus/deregister
+     *  (RouterConfig::register_keys). */
+    void registration(const http::Request& req, http::ServerResponse& res);
+    /** Polls one instance's /v1/models into `in` (no lock held). */
+    void poll(Instance& in) const;
 
     mutable std::mutex mu_;
     /** Only grows (under mu_), so an index stays the same instance. */
@@ -257,6 +273,67 @@ class Router {
     std::mutex stop_mu_;
     std::condition_variable stop_cv_;
     bool stopping_ = false;
+};
+
+/**
+ * Parses a --register-keys file: one key per line, surrounding spaces
+ * trimmed; blank lines and lines starting with '#' are skipped.
+ */
+std::vector<std::string> parse_register_keys(std::string_view text);
+
+/**
+ * Parses a router URL for --register: "http://HOST:PORT", with an
+ * optional trailing "/". @returns false for anything else (https is
+ * not supported).
+ */
+bool parse_router_url(std::string_view url, std::string& host, int& port);
+
+/**
+ * Keeps one instance registered with a router (locus-server
+ * --register): registers it once start() is called, again every
+ * ttl_s / 3, and deregisters it on stop(). A failed call is retried on
+ * the next tick; an instance that dies without stop() drops out of
+ * the router when its last registration runs out.
+ */
+class Registrar {
+  public:
+    struct Config {
+        std::string router_host;
+        int router_port = 0;
+        std::string address;  ///< HOST:PORT the router reaches this at
+        std::string key;      ///< one of the router's register_keys
+        int ttl_s = 30;
+        /** Before the first registration, so the server is listening
+         *  when the router polls it. */
+        int first_delay_ms = 1000;
+    };
+
+    explicit Registrar(Config cfg);
+    ~Registrar();
+    Registrar(const Registrar&) = delete;
+    Registrar& operator=(const Registrar&) = delete;
+
+    /** Starts the heartbeat thread. */
+    void start();
+    /** Stops it and deregisters (idempotent). */
+    void stop();
+
+    /** One registration. @returns whether the router took it. */
+    bool register_once();
+    /** One deregistration. @returns whether the router took it. */
+    bool deregister();
+
+  private:
+    /** POSTs this instance to `path` (/locus/register or
+     *  /locus/deregister). @returns whether the router took it. */
+    bool call(const std::string& path);
+
+    Config cfg_;
+    std::thread thread_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool stopping_ = false;
+    bool started_ = false;
 };
 
 }  // namespace locus::router

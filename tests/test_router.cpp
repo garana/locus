@@ -600,6 +600,116 @@ TEST_CASE("router: a target two SRV names share is one instance",
     CHECK(entries(b.port) == 1);
 }
 
+// i#388 step 5: an instance registers itself with a key, is reached
+// while its registration lasts, drops out when it runs out or on
+// deregistration, and comes back with the next registration.
+TEST_CASE("router: instances register themselves", "[router]") {
+    using locus::router::Registrar;
+    FakeInstance a("A", {"text"}, "m"), b("B", {"text"}, "m");
+    RouterConfig cfg;
+    cfg.register_keys = {"k1", "k2"};
+    RouterFixture rf({b.addr()}, cfg);  // B is static
+    const auto reached = [&] {
+        std::set<std::string> seen;
+        for (int i = 0; i < 20; ++i) {
+            const auto r = rf.post(
+                "/v1/completions",
+                json{{"prompt", "p" + std::to_string(i)}, {"max_tokens", 1}});
+            REQUIRE(r.ok);
+            REQUIRE(r.head.status == 200);
+            seen.insert(r.head.get_header_value("X-Instance"));
+        }
+        return seen;
+    };
+    CHECK(reached() == std::set<std::string>{"B"});
+
+    Registrar::Config rc;
+    rc.router_host = "127.0.0.1";
+    rc.router_port = rf.port;
+    rc.address = a.addr();
+    rc.key = "k2";
+    rc.ttl_s = 1;
+    Registrar reg(rc);
+    REQUIRE(reg.register_once());
+    CHECK(reached() == std::set<std::string>{"A", "B"});  // polled at once
+
+    // Its one-second registration runs out: never picked after that.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1300));
+    CHECK(reached() == std::set<std::string>{"B"});
+    REQUIRE(reg.register_once());
+    CHECK(reached() == std::set<std::string>{"A", "B"});
+    REQUIRE(reg.deregister());
+    CHECK(reached() == std::set<std::string>{"B"});
+
+    // A static instance registering stays one entry.
+    Registrar::Config rb = rc;
+    rb.address = b.addr();
+    REQUIRE(Registrar(rb).register_once());
+    CHECK(rf.router->instances().size() == 2);
+
+    // The heartbeat thread registers, and stop() deregisters.
+    rc.ttl_s = 3;
+    rc.first_delay_ms = 0;
+    {
+        Registrar beat(rc);
+        beat.start();
+        bool listed = false;
+        for (int i = 0; i < 50 && !listed; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            for (const auto& in : rf.router->instances()) {
+                listed |= in.port == a.port && !in.gone && in.healthy;
+            }
+        }
+        CHECK(listed);
+        beat.stop();
+    }
+    CHECK(reached() == std::set<std::string>{"B"});
+
+    // Keys: none, or a wrong one, is a 401.
+    Client c("127.0.0.1", rf.port);
+    const std::string body = json{{"address", a.addr()}}.dump();
+    auto r = c.send(ClientRequest{"POST", "/locus/register", {}, body});
+    CHECK(r.head.status == 401);
+    r = c.send(ClientRequest{"POST", "/locus/register",
+                             {{"Authorization", "Bearer k3"}}, body});
+    CHECK(r.head.status == 401);
+    r = c.send(ClientRequest{"POST", "/locus/register",
+                             {{"Authorization", "Bearer k1"}},
+                             json{{"address", "nope"}}.dump()});
+    CHECK(r.head.status == 400);
+    r = c.send(ClientRequest{"POST", "/locus/register",
+                             {{"Authorization", "Bearer k1"}},
+                             json{{"address", a.addr()}, {"ttl_s", 0}}.dump()});
+    CHECK(r.head.status == 400);
+}
+
+TEST_CASE("router: registration is off without keys", "[router]") {
+    FakeInstance b("B", {"text"}, "m");
+    RouterFixture rf({b.addr()});
+    Client c("127.0.0.1", rf.port);
+    const auto r = c.send(ClientRequest{"POST", "/locus/register",
+                                        {{"Authorization", "Bearer k1"}},
+                                        json{{"address", b.addr()}}.dump()});
+    CHECK(r.head.status == 404);
+}
+
+TEST_CASE("router: register keys and router URLs parse", "[router]") {
+    using locus::router::parse_register_keys;
+    using locus::router::parse_router_url;
+    CHECK(parse_register_keys("# keys\n k1 \n\nk2\r\n") ==
+          std::vector<std::string>{"k1", "k2"});
+    CHECK(parse_register_keys("").empty());
+    std::string h;
+    int p = 0;
+    REQUIRE(parse_router_url("http://10.0.0.2:8080", h, p));
+    CHECK(h == "10.0.0.2");
+    CHECK(p == 8080);
+    CHECK(parse_router_url("http://r.lan:80/", h, p));
+    CHECK_FALSE(parse_router_url("https://r.lan:80", h, p));
+    CHECK_FALSE(parse_router_url("http://r.lan:80/v1", h, p));
+    CHECK_FALSE(parse_router_url("r.lan:80", h, p));
+}
+
 TEST_CASE("router: video ids name their instance", "[router]") {
     using locus::router::router_video_id;
     using locus::router::split_video_id;

@@ -1,5 +1,8 @@
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <memory>
+#include <sstream>
 #include <string>
 
 #include "backend_cli.hpp"
@@ -96,6 +99,35 @@ OpenAI + Anthropic compatible inference server (default port 8080):
                      argv[0], args.positional[1].c_str());
         return 2;
     }
+    // --register (i#388): checked before the model loads, so a typo
+    // does not cost the load.
+    locus::router::Registrar::Config reg;
+    if (!args.register_url.empty() || !args.register_as.empty() ||
+        !args.register_key_file.empty()) {
+        std::string host;
+        int rport = 0;
+        if (!locus::router::parse_router_url(args.register_url, reg.router_host,
+                                             reg.router_port) ||
+            !locus::pipeline::parse_hostport(args.register_as, host, rport) ||
+            host.empty() || rport <= 0 || args.register_key_file.empty()) {
+            std::fprintf(stderr,
+                         "%s: --register http://HOST:PORT needs --register-as "
+                         "HOST:PORT and --register-key-file F\n",
+                         argv[0]);
+            return 2;
+        }
+        std::ifstream f(args.register_key_file);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        const auto keys = locus::router::parse_register_keys(ss.str());
+        if (!f || keys.empty()) {
+            std::fprintf(stderr, "%s: no key in --register-key-file %s\n",
+                         argv[0], args.register_key_file.c_str());
+            return 2;
+        }
+        reg.address = args.register_as;
+        reg.key = keys.front();
+    }
 
     try {
         auto g = locus::gguf::GgufFile::open(model_path);
@@ -154,6 +186,17 @@ OpenAI + Anthropic compatible inference server (default port 8080):
             std::fprintf(stderr, "%s\n", gpu_warn.c_str());
         }
         std::fprintf(stderr, "locus-server listening on :%d\n", port);
+        // Registers a moment after this, once listen has bound, and
+        // deregisters when the server stops (a kill leaves it to run
+        // out at the router).
+        std::unique_ptr<locus::router::Registrar> registrar;
+        if (!reg.router_host.empty()) {
+            registrar = std::make_unique<locus::router::Registrar>(reg);
+            registrar->start();
+            std::fprintf(stderr, "registering as %s with %s:%d\n",
+                         reg.address.c_str(), reg.router_host.c_str(),
+                         reg.router_port);
+        }
         if (!server.listen("0.0.0.0", port)) {
             std::fprintf(stderr, "error: cannot bind port %d\n",
                          port);
