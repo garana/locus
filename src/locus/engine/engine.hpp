@@ -15,6 +15,7 @@
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/model/sampling.hpp"
+#include "locus/model/speculative.hpp"
 #include "locus/tok/tokenizer.hpp"
 
 namespace locus::engine {
@@ -85,6 +86,8 @@ struct Request {
      * cache_read / cache_creation fields. */
     std::uint32_t reused_prefix_tokens = 0;
     std::uint32_t cached_prefix_tokens = 0;
+    /** Speculative decoding: how well this request's drafts pass. */
+    model::DraftState spec;
     /** Logits of the last token fed (batched-decode path only,
      * where several sequences' forwards interleave in one step). */
     std::vector<float> logits;
@@ -149,7 +152,11 @@ class Engine {
         /** Trailing n-gram length matched for drafts. */
         std::uint32_t spec_ngram = 3;
         /** Max draft tokens proposed per step. */
-        std::uint32_t spec_draft = 4;
+        std::uint32_t spec_draft = 8;
+        /** Pick each draft's length from the request's accept rate
+         * and the measured verify times (model::choose_draft); off
+         * drafts spec_draft every time. */
+        bool spec_adaptive = true;
         /** Backstop cap on retained TERMINAL request records. The
          * server release()s each record once the client consumes its
          * result; this bounds the leak from ABANDONED requests (an
@@ -269,6 +276,13 @@ class Engine {
     }
     /** Speculative verify forwards run, cumulative. */
     std::uint64_t spec_steps() const { return spec_steps_; }
+    /** Draft tokens verified, accepted or not, cumulative. */
+    std::uint64_t spec_drafted_tokens() const { return spec_drafted_; }
+    /** Verify forwards by draft length: entry n counts the verifies
+     * of n draft tokens, cumulative. */
+    const std::vector<std::uint64_t>& spec_draft_counts() const {
+        return spec_drafts_;
+    }
     /** Timing and scheduler metrics; safe to read from any thread
      * without the lock that serializes step(). */
     const EngineMetrics& metrics() const { return metrics_; }
@@ -351,6 +365,10 @@ class Engine {
     std::uint64_t prefix_reused_tokens_ = 0;
     std::uint64_t spec_accepted_ = 0;
     std::uint64_t spec_steps_ = 0;
+    std::uint64_t spec_drafted_ = 0;
+    std::vector<std::uint64_t> spec_drafts_;
+    /** Forward times by draft length (model::choose_draft). */
+    model::DraftCost spec_cost_;
     /** Tokens the model computed in the current step. */
     std::uint32_t step_tokens_ = 0;
     /** One state per pool block, reused by count_block_states. */

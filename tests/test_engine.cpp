@@ -303,16 +303,28 @@ TEST_CASE("speculative decoding matches greedy output",
     baseline.run_to_completion();
     const auto want = baseline.get(id)->generated;
 
-    Engine::Config cfg;
-    cfg.speculative = true;
-    cfg.spec_ngram = 2;
-    Engine engine(model, tok.eos_id(), cfg);
-    const auto a = engine.submit(prompt, 48);
-    engine.run_to_completion();
-    // Greedy spec decode is byte-exact to plain greedy.
-    REQUIRE(engine.get(a)->generated == want);
-    REQUIRE(engine.spec_steps() > 0);            // verify ran
-    REQUIRE(engine.spec_accepted_tokens() > 0);  // and accepted
+    // Adaptive (the default) and fixed draft lengths.
+    for (const bool adaptive : {true, false}) {
+        CAPTURE(adaptive);
+        Engine::Config cfg;
+        cfg.speculative = true;
+        cfg.spec_ngram = 2;
+        cfg.spec_adaptive = adaptive;
+        Engine engine(model, tok.eos_id(), cfg);
+        const auto a = engine.submit(prompt, 48);
+        engine.run_to_completion();
+        // Greedy spec decode is byte-exact to plain greedy.
+        REQUIRE(engine.get(a)->generated == want);
+        REQUIRE(engine.spec_steps() > 0);            // verify ran
+        REQUIRE(engine.spec_accepted_tokens() > 0);  // and accepted
+        REQUIRE(engine.spec_drafted_tokens() >=
+                engine.spec_accepted_tokens());
+        std::uint64_t verifies = 0;
+        for (const auto n : engine.spec_draft_counts()) {
+            verifies += n;
+        }
+        REQUIRE(verifies == engine.spec_steps());
+    }
 }
 
 TEST_CASE("speculative decoding on the vulkan backend matches greedy",
