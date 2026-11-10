@@ -484,18 +484,27 @@ void Router::expand_srv() {
             });
         };
         std::lock_guard lk(mu_);
+        // One entry per host:port: this name's answer adds or drops
+        // itself from each entry's names, and an entry no name lists
+        // any more is gone (i#492).
         for (auto& in : inst_) {
-            if (in.srv != name) continue;
-            in.gone = !listed(in.host, in.port);
+            if (!in.from_srv) continue;
+            auto it = std::lower_bound(in.srv.begin(), in.srv.end(), name);
+            const bool had = it != in.srv.end() && *it == name;
+            if (listed(in.host, in.port)) {
+                if (!had) in.srv.insert(it, name);
+            } else if (had) {
+                in.srv.erase(it);
+            }
+            in.gone = in.srv.empty();
             if (in.gone) in.healthy = false;
         }
         for (const auto& t : picks) {
             const bool known = std::any_of(
                 inst_.begin(), inst_.end(), [&](const Instance& in) {
-                    return in.host == t.host && in.port == t.port &&
-                           (in.srv == name || in.srv.empty());
+                    return in.host == t.host && in.port == t.port;
                 });
-            if (known) continue;
+            if (known) continue;  // a static entry, or one listed above
             if (inst_.size() == kMaxInstances) {
                 std::fprintf(stderr,
                              "locus-router: %s lists more than %zu "
@@ -507,7 +516,8 @@ void Router::expand_srv() {
             Instance in;
             in.host = t.host;
             in.port = t.port;
-            in.srv = name;
+            in.from_srv = true;
+            in.srv = {name};
             inst_.push_back(std::move(in));
         }
     }
