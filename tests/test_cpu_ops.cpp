@@ -842,6 +842,11 @@ TEST_CASE("matvec_batch_cuda Q4_K/Q5_K/Q6_K/Q8_0 byte-identical to "
                 w.insert(w.end(), row.begin(), row.end());
             }
             Mat m{t, w.data(), rows, cols};
+            // Reset per weight: w's address is recycled across
+            // iterations, and the per-row reference pages (keyed by
+            // w + r * row bytes, one row's size) of an earlier weight of
+            // the same type and size would match this one's.
+            cuda_pool_reset();
             std::vector<float> got(static_cast<std::size_t>(rows) * n);
             matvec_batch_cuda(m, xb, got, n);
             for (std::uint32_t r = 0; r < rows; ++r) {
