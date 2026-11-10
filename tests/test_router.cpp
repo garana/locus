@@ -487,6 +487,17 @@ TEST_CASE("router: video ids name their instance", "[router]") {
     CHECK_FALSE(split_video_id("video_0123abcd", inst, id));
     CHECK_FALSE(split_video_id("video_zz_1", inst, id));
     CHECK_FALSE(split_video_id("clip_1", inst, id));
+    CHECK_FALSE(split_video_id("video_3a__", inst, id));  // no id
+    // Any id comes back unchanged, prefixed or not (i#452).
+    for (const char* own : {"video_1", "job42", "video_", "video__x",
+                            "vid_eo"}) {
+        CAPTURE(own);
+        REQUIRE(split_video_id(router_video_id("h:1", own), inst, id));
+        CHECK(inst == "h:1");
+        CHECK(id == own);
+    }
+    // The short form for locus's own ids is unchanged.
+    CHECK(router_video_id("h:1", "video_ab") == "video_683a31_ab");
 
     FakeInstance v1("V1", {"video"}, "ltx"), v2("V2", {"video"}, "ltx");
     RouterFixture rf({v1.addr(), v2.addr()});

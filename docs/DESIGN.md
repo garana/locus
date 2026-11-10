@@ -165,7 +165,8 @@ with no shared state, and a leaving instance moves only its own keys.
 An instance over 1.25 times the candidates' average in-flight count
 goes last, and a connect failure or a busy 503 moves on to the next.
 A video job id from the router names the instance that made it
-(`video_`, its host:port in hex, `_`, the instance's own id), so a
+(`video_`, its host:port in hex, `_`, the instance's own id without
+its `video_` prefix, or after a second `_` whole when it has none), so a
 `GET /v1/videos/{id}` reaches that instance with no table, also after
 a router restart. The router's own `/metrics` counts, per instance,
 requests, upstream errors, streams a client left, wall seconds and

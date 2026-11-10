@@ -161,7 +161,15 @@ std::string router_video_id(std::string_view instance, std::string_view id) {
         out += kHex[u & 15];
     }
     out += '_';
-    out += id.substr(id.rfind("video_", 0) == 0 ? 6 : 0);
+    // "video_X" (X not starting with '_') keeps the short form, X;
+    // any other id goes whole after a second '_', so split_video_id
+    // gives every id back unchanged.
+    if (id.rfind("video_", 0) == 0 && id.size() > 6 && id[6] != '_') {
+        out += id.substr(6);
+    } else {
+        out += '_';
+        out += id;
+    }
     return out;
 }
 
@@ -185,8 +193,14 @@ bool split_video_id(std::string_view rid, std::string& instance,
         if (hi < 0 || lo < 0) return false;
         inst += static_cast<char>(hi * 16 + lo);
     }
+    const std::string_view rest = rid.substr(sep + 1);
+    if (rest[0] == '_') {
+        if (rest.size() == 1) return false;  // no id after "__"
+        id = std::string(rest.substr(1));  // the instance's id, whole
+    } else {
+        id = "video_" + std::string(rest);
+    }
     instance = std::move(inst);
-    id = "video_" + std::string(rid.substr(sep + 1));
     return true;
 }
 

@@ -62,9 +62,12 @@ std::string session_key(std::string_view header, std::string_view body);
  * The id the router gives a video job, so a later GET /v1/videos/{id}
  * reaches the instance that made it with no table: "video_", the
  * instance's host:port in hex, "_", then the instance's own id without
- * its "video_" prefix. It stays an id of word characters.
+ * its "video_" prefix; an id without that prefix goes whole after a
+ * second "_", so split_video_id gives back any id. It stays an id of
+ * word characters when the instance's id is one.
  * @param instance The instance's host:port.
- * @param id The instance's job id ("video_" and hex digits).
+ * @param id The instance's job id (locus makes "video_" and hex
+ *     digits).
  */
 std::string router_video_id(std::string_view instance, std::string_view id);
 
