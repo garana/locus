@@ -110,6 +110,20 @@ TEST_CASE("choose_draft prices drafts against a plain decode",
         }
         REQUIRE(choose_draft(good, c, 8) == 8);
     }
+    SECTION("a measured row prices the lengths not tried yet") {
+        // Only a decode and a 1-draft verify measured, a row at 0.65
+        // of a decode (the Pi 5 CPU). Unmeasured lengths cost 0.65 a
+        // row, not a quarter step, so the pick stops short of the max
+        // instead of trying it.
+        DraftCost c;
+        measure(c, 0, 1.0);
+        measure(c, 1, 1.65);
+        const auto d = choose_draft(good, c, 8);
+        REQUIRE(d >= 3);
+        REQUIRE(d <= 6);
+        // Drafts that mostly fail: plain decode, not another trial.
+        REQUIRE(choose_draft(passing(0.3), c, 8) == 0);
+    }
     SECTION("a cost jump is not crossed") {
         // Flat up to 4 drafts, then 4 decodes' worth: stay at 4.
         DraftCost c;

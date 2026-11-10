@@ -81,13 +81,16 @@ std::uint32_t choose_draft(const DraftState& s, const DraftCost& cost,
     double tokens = 1.0;  // 1 + a + ... + a^d
     double term = 1.0;
     // The cost of one more row for a length not measured yet: the
-    // cheapest measured step between consecutive measured lengths, at
-    // most a quarter of a decode step.
+    // cheapest measured step between consecutive measured lengths, or
+    // a quarter of a decode step before any is measured.
     double row = t0 / 4;
+    bool measured = false;
     for (std::uint32_t d = 1, prev = 0; d <= max_draft; ++d) {
         if (const double td = cost.seconds(d); td > 0.0) {
-            row = std::min(row, std::max(0.0, (td - cost.seconds(prev)) /
-                                                  (d - prev)));
+            const double s =
+                std::max(0.0, (td - cost.seconds(prev)) / (d - prev));
+            row = measured ? std::min(row, s) : s;
+            measured = true;
             prev = d;
         }
     }
