@@ -156,7 +156,12 @@ path and, for chat, the body. The instances are given as host:port or
 as `srv:NAME`, whose DNS SRV targets (the lowest priority's) are
 looked up again on every refresh, so instances join and leave with the
 record; one that leaves is never picked again, and an empty answer
-keeps the last list. With `--register-keys`, an instance can also add
+keeps the last list. `scan:A.B.C.D/N:PORT` (IPv4, at most 1024
+addresses) probes every address of the range for a `/v1/models` at
+start and every sixth refresh, 64 at a time with a 300 ms connect
+timeout; the ones that answer are its instances, and a scan that no
+longer finds one drops it (an empty scan is an answer, unlike an empty
+SRV lookup). With `--register-keys`, an instance can also add
 itself (`locus-server --register`): it POSTs its host:port to
 `/locus/register` with one of the keys, again every third of its TTL
 (30 s), and the router drops it when that runs out or on
