@@ -33,7 +33,8 @@ struct DriverResult {
  * where the last stage sends its kLogits back. For each prompt token,
  * then each sampled token, it writes one kToken frame and reads one
  * kLogits frame, samples the next token, and loops until the EOS token
- * or max_tokens.
+ * or max_tokens. A kLogits frame with another request_id or position
+ * ends the run like a transport failure.
  *
  * The stages own their KV caches and advance the position per stage, so
  * the driver keeps no cache and loads no model weights; it only needs
@@ -54,5 +55,21 @@ DriverResult drive_generation(int head_fd, int logits_fd,
                               std::span<const tok::TokenId> prompt,
                               tok::TokenId eos_id,
                               const DriverParams& params);
+
+/**
+ * drive_generation after its first round trip: the caller already sent
+ * prompt[0] at position 0 and read the kLogits frame that answered it.
+ * Lets several sessions on one chain be paired with their logits
+ * connections by the request_id of that first frame (the last stage
+ * may dial them in any order), then decode independently.
+ *
+ * @param first_logits The position-0 kLogits payload of this request.
+ * @returns As drive_generation.
+ */
+DriverResult drive_generation_continue(int head_fd, int logits_fd,
+                                       std::span<const tok::TokenId> prompt,
+                                       std::vector<float> first_logits,
+                                       tok::TokenId eos_id,
+                                       const DriverParams& params);
 
 }  // namespace locus::pipeline

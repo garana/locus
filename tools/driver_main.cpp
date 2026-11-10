@@ -1,15 +1,18 @@
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cli_spec.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/pipeline/driver.hpp"
+#include "locus/pipeline/message.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/tok/tokenizer.hpp"
 
@@ -37,7 +40,12 @@ const char* kUsage =
     "  --connect-timeout N  --head connect timeout ms (default 5000)\n"
     "  --logits-timeout N   how long to wait for the last stage to\n"
     "                    connect back before giving up, ms (default\n"
-    "                    10000; 0 = wait forever)\n";
+    "                    10000; 0 = wait forever)\n"
+    "  --concurrent N    run the prompt as N sessions at once (default\n"
+    "                    1), each with its own request id; a logits\n"
+    "                    connection is paired with its session by the\n"
+    "                    id of its first frame. Prints each text and\n"
+    "                    the aggregate tok/s\n";
 
 }  // namespace
 
@@ -46,6 +54,7 @@ int main(int argc, char** argv) {
     bool have_prompt = false;
     std::vector<std::string> allow_str;
     int max_tokens = 64, connect_timeout = 5000, logits_timeout = 10000;
+    int concurrent = 1;
     double temp = 0.0;
     unsigned long long seed = 0;
 
@@ -92,6 +101,12 @@ int main(int argc, char** argv) {
         } else if (a == "--logits-timeout") {
             logits_timeout =
                 as_int(next("--logits-timeout"), "--logits-timeout");
+        } else if (a == "--concurrent") {
+            concurrent = as_int(next("--concurrent"), "--concurrent");
+            if (concurrent < 1) {
+                std::fprintf(stderr, "--concurrent must be at least 1\n");
+                return 2;
+            }
         } else if (a == "-h" || a == "--help") {
             std::printf("%s", kUsage);
             return 0;
@@ -136,54 +151,119 @@ int main(int argc, char** argv) {
         const auto ids = tok.encode(prompt, true);
 
         // Listen for the tail's logits first, then connect to the head
-        // (which triggers the chain to wire up), then accept the tail.
+        // (which triggers the chain to wire up). Session i (request_id
+        // i + 1) sends its first prompt token; the last stage may dial
+        // the logits connections in any order (a stage that reuses a
+        // pooled downstream dials late), so each accepted connection is
+        // paired with its session by the request_id of its first frame.
         const int le = locus::pipeline::listen_on(lh, lp, nullptr);
         if (le < 0) {
             std::fprintf(stderr, "listen on %s failed\n",
                          logits_listen.c_str());
             return 1;
         }
-        const int head_fd =
-            locus::pipeline::connect_to(hh, hp, connect_timeout);
-        if (head_fd < 0) {
-            std::fprintf(stderr, "connect to head %s failed\n",
-                         head.c_str());
-            return 1;
+        if (ids.empty()) {
+            std::fprintf(stderr, "the prompt encodes to no tokens\n");
+            return 2;
         }
-        std::string peer;
-        const int logits_fd =
-            locus::pipeline::accept_one(le, &peer, logits_timeout);
-        if (logits_fd < 0) {
-            std::fprintf(stderr,
-                         "no logits connection within %d ms: the last "
-                         "stage never connected back (its --downstream "
-                         "should point at %s). Check the stage chain.\n",
-                         logits_timeout, logits_listen.c_str());
-            return 1;
+        struct Session {
+            int head_fd = -1;
+            int logits_fd = -1;
+            std::vector<float> first_logits;
+            locus::pipeline::DriverResult res;
+        };
+        std::vector<Session> sessions(static_cast<std::size_t>(concurrent));
+        for (std::size_t i = 0; i < sessions.size(); ++i) {
+            auto& s = sessions[i];
+            s.head_fd = locus::pipeline::connect_to(hh, hp, connect_timeout);
+            if (s.head_fd < 0 ||
+                !locus::pipeline::write_message(
+                    s.head_fd, locus::pipeline::make_token(i + 1, 0, ids[0]))) {
+                std::fprintf(stderr, "connect to head %s failed\n",
+                             head.c_str());
+                return 1;
+            }
+        }
+        for (std::size_t k = 0; k < sessions.size(); ++k) {
+            std::string peer;
+            const int fd =
+                locus::pipeline::accept_one(le, &peer, logits_timeout);
+            if (fd < 0) {
+                std::fprintf(stderr,
+                             "no logits connection within %d ms: the last "
+                             "stage never connected back (its --downstream "
+                             "should point at %s). Check the stage chain.\n",
+                             logits_timeout, logits_listen.c_str());
+                return 1;
+            }
+            if (!locus::pipeline::ip_allowed(peer, allow)) {
+                std::fprintf(stderr,
+                             "logits connection from %s refused (not in "
+                             "--allow)\n",
+                             peer.c_str());
+                return 1;
+            }
+            locus::pipeline::Message first;
+            if (locus::pipeline::read_message(fd, first) !=
+                    locus::pipeline::ReadResult::kOk ||
+                first.type != locus::pipeline::MsgType::kLogits ||
+                first.position != 0 || first.request_id < 1 ||
+                first.request_id > sessions.size() ||
+                sessions[first.request_id - 1].logits_fd >= 0) {
+                std::fprintf(stderr,
+                             "a logits connection's first frame names no "
+                             "waiting session\n");
+                return 1;
+            }
+            auto& s = sessions[first.request_id - 1];
+            s.logits_fd = fd;
+            s.first_logits = std::move(first.data);
         }
         ::close(le);
-        if (!locus::pipeline::ip_allowed(peer, allow)) {
-            std::fprintf(stderr,
-                         "logits connection from %s refused (not in "
-                         "--allow)\n",
-                         peer.c_str());
-            return 1;
-        }
 
-        locus::pipeline::DriverParams params;
-        params.sampling.temperature = static_cast<float>(temp);
-        params.max_tokens = static_cast<std::uint32_t>(max_tokens);
-        params.seed = seed;
-        auto res = locus::pipeline::drive_generation(
-            head_fd, logits_fd, ids, tok.eos_id(), params);
-
-        auto gen = std::move(res.tokens);
-        if (!gen.empty() && gen.back() == tok.eos_id()) {
-            gen.pop_back();  // do not print the stop token
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<std::thread> threads;
+        for (std::size_t i = 0; i < sessions.size(); ++i) {
+            threads.emplace_back([&, i] {
+                locus::pipeline::DriverParams params;
+                params.sampling.temperature = static_cast<float>(temp);
+                params.max_tokens = static_cast<std::uint32_t>(max_tokens);
+                params.seed = seed;
+                params.request_id = i + 1;
+                sessions[i].res = locus::pipeline::drive_generation_continue(
+                    sessions[i].head_fd, sessions[i].logits_fd, ids,
+                    std::move(sessions[i].first_logits), tok.eos_id(),
+                    params);
+            });
         }
-        std::printf("%s%s\n", tok.decode(ids).c_str(),
-                    tok.decode(gen).c_str());
-        if (!res.complete) {
+        for (auto& t : threads) {
+            t.join();
+        }
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          t0)
+                .count();
+
+        bool all_complete = true;
+        std::size_t n_tokens = 0;
+        for (auto& s : sessions) {
+            auto gen = std::move(s.res.tokens);
+            n_tokens += gen.size();
+            if (!gen.empty() && gen.back() == tok.eos_id()) {
+                gen.pop_back();  // do not print the stop token
+            }
+            std::printf("%s%s\n", tok.decode(ids).c_str(),
+                        tok.decode(gen).c_str());
+            all_complete = all_complete && s.res.complete;
+            ::close(s.head_fd);
+            ::close(s.logits_fd);
+        }
+        std::fprintf(stderr,
+                     "locus-driver: %d session(s), %zu tokens in %.2f s "
+                     "(%.2f tok/s in all, prompt included in the time)\n",
+                     concurrent, n_tokens, secs,
+                     static_cast<double>(n_tokens) / secs);
+        if (!all_complete) {
             std::fprintf(stderr,
                          "locus-driver: generation truncated by a "
                          "transport failure (the stage chain dropped "
