@@ -274,18 +274,28 @@ TEST_CASE("serve_stage_mux reuses a connection after SESSION_END, "
 
     // Runs a full sequence (prompt + greedy gen) over the shared
     // connection; each sequence's downstream is the stage's dial, so it is
-    // a fresh accept on the collector. @returns the generated tokens.
+    // a fresh accept on the collector. A reset connection dials its next
+    // downstream on the next sequence's first frame (i#459), so the first
+    // token goes out before the accept. @returns the generated tokens.
     auto run_seq = [&](std::uint64_t rid,
                        const std::vector<locus::tok::TokenId>& prompt,
                        int& from_out) {
         Client c;
         c.to_stage = to_stage;  // the shared, reused inbound connection
         c.request_id = rid;
-        c.from_stage = locus::pipeline::accept_one(lc, nullptr);
+        REQUIRE(locus::pipeline::write_message(
+            to_stage, locus::pipeline::make_token(rid, 0, prompt[0])));
+        c.from_stage = locus::pipeline::accept_one(lc, nullptr, 5000);
         REQUIRE(c.from_stage >= 0);
         from_out = c.from_stage;
-        for (const auto t : prompt) {
-            c.round_trip(t);
+        Message first;
+        REQUIRE(locus::pipeline::read_message(c.from_stage, first) ==
+                ReadResult::kOk);
+        REQUIRE(first.type == MsgType::kLogits);
+        c.logits = std::move(first.data);
+        c.pos = 1;
+        for (std::size_t i = 1; i < prompt.size(); ++i) {
+            c.round_trip(prompt[i]);
         }
         std::vector<locus::tok::TokenId> gen;
         for (int i = 0; i < kGen && c.ok; ++i) {
@@ -305,9 +315,13 @@ TEST_CASE("serve_stage_mux reuses a connection after SESSION_END, "
     REQUIRE(gen_a == ref_a);
 
     // End sequence A but keep the connection: the stage releases A's KV,
-    // closes A's downstream, and re-dials a fresh one for the next.
+    // closes A's downstream, and dials a fresh one for the next.
     REQUIRE(locus::pipeline::write_message(
         to_stage, locus::pipeline::make_session_end(101)));
+    // i#459: not before B sends anything. An eager redial here reached
+    // whatever listened at that moment: across hosts, a driver that had
+    // just exited, or the next driver before any of its sessions.
+    REQUIRE(locus::pipeline::accept_one(lc, nullptr, 300) < 0);
 
     // Sequence B on the SAME connection, a new request_id.
     const auto gen_b = run_seq(202, pb, b_from);

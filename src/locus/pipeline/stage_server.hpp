@@ -184,7 +184,11 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
  *
  * Each accepted connection becomes an independent session: it dials its
  * own downstream from `downstreams` (round-robin, same pool semantics as
- * serve_stage), gets its own KV sequence in the stage's shared cache
+ * serve_stage) when accepted, and, after a SESSION_END keeps the
+ * connection for another sequence, again when that sequence sends its
+ * first frame (so a client of a reused connection sends before it
+ * accepts the downstream, i#459); it gets its own KV sequence in the
+ * stage's shared cache
  * (PipelineStage::step(seq, in)), and buffers its own partial input and
  * unsent output frames. Both sockets are non-blocking: input is drained
  * with recv() and reassembled with the codec's decode() (a frame split
