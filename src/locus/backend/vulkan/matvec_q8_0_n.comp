@@ -250,24 +250,20 @@ void main() {
     // batch (one sequence, in the multi-sequence decode) skips the
     // others, and each live plane's sums are the same either way.
     for (uint t = 0u; t < NT; ++t) {
-        if (t < nt) {
-            red[t * LANES * ROWS + tid] = acc[t];
+        red[t * LANES * ROWS + tid] = acc[t];
 #ifdef SWIGLU
-            red_u[t * LANES * ROWS + tid] = acc_u[t];
+        red_u[t * LANES * ROWS + tid] = acc_u[t];
 #endif
-        }
     }
     barrier();
     for (uint step = LANES / 2u; step > 0u; step >>= 1) {
         if (lane < step) {
             for (uint t = 0u; t < NT; ++t) {
-                if (t < nt) {
-                    uint i = t * LANES * ROWS + tid;
-                    red[i] += red[i + step];
+                uint i = t * LANES * ROWS + tid;
+                red[i] += red[i + step];
 #ifdef SWIGLU
-                    red_u[i] += red_u[i + step];
+                red_u[i] += red_u[i + step];
 #endif
-                }
             }
         }
         barrier();
