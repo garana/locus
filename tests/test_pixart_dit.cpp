@@ -112,9 +112,10 @@ TEST_CASE("pixart dit matches torch on a synthetic model",
         {"cpu", &locus::backend::best_backend().ops}};
     if (locus::backend::vulkan_backend_usable()) {
         legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
-        // The same with a tiny attention scratch cap, so the GPU
-        // attention runs its queries in several sub-blocks (5, 5, 5, 1
-        // for 16 queries over 2 heads x 16 keys).
+        // The same with a tiny attention scratch cap (40 floats), so
+        // both attentions run their queries in sub-blocks: one query
+        // at a time over 2 heads x 16 image keys, and
+        // 40 / (2 n_text) at a time over the caption keys.
         legs.push_back({"vulkan blocks", &locus::backend::vulkan_image_ops()});
         // LOCUS_PIXART_GPU=0: the GPU per op instead of one resident
         // step.
@@ -129,7 +130,7 @@ TEST_CASE("pixart dit matches torch on a synthetic model",
     for (const auto& [name, op] : legs) {
         if (locus::backend::vulkan_backend_usable()) {
             locus::backend::vulkan_set_attn_scratch_floats(
-                std::string_view(name) == "vulkan blocks" ? 2 * 16 * 5 : 0);
+                std::string_view(name) == "vulkan blocks" ? 40 : 0);
         }
         if (std::string_view(name) == "vulkan per op") {
             ::setenv("LOCUS_PIXART_GPU", "0", 1);

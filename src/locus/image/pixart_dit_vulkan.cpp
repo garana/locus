@@ -18,7 +18,7 @@ enum : Seq::Slot {
     kQ,    ///< [n][w]
     kK,    ///< [n][w]
     kV,    ///< [n][w]
-    kAtt,  ///< caption hidden, then attention output [n][w]
+    kAtt,  ///< caption hidden [n_text][w], then attention output [n][w]
     kO,    ///< projection output [n][max(w, p p out_ch)]
     kFf,   ///< T5 rows, then the FFN hidden [n][ffn]
     kMod,  ///< every block's modulation [layers][6 w], then the final
@@ -43,7 +43,10 @@ std::vector<float> PixArtDit::forward_vulkan(
     const std::uint32_t py = patch_ * patch_ * out_ch_;
     Seq q;
     const std::size_t nw = std::size_t{n} * w;
-    for (Seq::Slot s : {kH, kNrm, kQ, kK, kV, kAtt}) q.reserve(s, nw);
+    for (Seq::Slot s : {kH, kNrm, kQ, kK, kV}) q.reserve(s, nw);
+    // kAtt first holds the caption rows, kFf the T5 rows: either may
+    // outnumber the image rows (a small latent, a long prompt).
+    q.reserve(kAtt, std::size_t{std::max(n, n_text)} * w);
     q.reserve(kO, std::size_t{n} * std::max(w, py));
     q.reserve(kFf, std::max(std::size_t{n} * f, text.size()));
     q.reserve(kMod, mods.size());
