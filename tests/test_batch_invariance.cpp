@@ -7,11 +7,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
@@ -42,8 +44,13 @@ std::pair<std::vector<TokenId>, std::vector<float>> run(
     locus::model::SamplingParams sp;
     sp.temperature = 0.8f;
     sp.top_p = 0.95f;
-    // No EOS, so every request runs n_gen tokens.
-    locus::engine::Engine engine(model, static_cast<TokenId>(-1), {});
+    // No EOS, so every request runs n_gen tokens. 96 blocks of 16
+    // positions hold the largest batch (the 600-token prompt plus 7
+    // short ones and their tokens); the default, one full context
+    // window per Engine, does not fit a small GPU's memory.
+    locus::engine::Engine::Config cfg;
+    cfg.n_blocks = 96;
+    locus::engine::Engine engine(model, static_cast<TokenId>(-1), cfg);
     std::vector<std::uint64_t> ids;
     for (std::uint32_t i = 0; i < n_req; ++i) {
         ids.push_back(engine.submit(prompt(i, len, model.hparams().n_vocab),
@@ -62,6 +69,18 @@ std::pair<std::vector<TokenId>, std::vector<float>> run(
     return {r->generated, lp};
 }
 
+/** run(), then free the Vulkan state its Engine leaves behind (a KV
+ *  pool per cache stays allocated until a reset). */
+std::pair<std::vector<TokenId>, std::vector<float>> run_and_reset(
+    TransformerModel& model, std::uint32_t n_req, std::uint32_t len,
+    std::uint32_t n_gen, bool vulkan) {
+    auto out = run(model, n_req, len, n_gen);
+    if (vulkan) {
+        locus::backend::vulkan_reset_state();
+    }
+    return out;
+}
+
 void check_model(const std::string& path, std::uint32_t n_gen) {
     if (!std::filesystem::exists(path)) {
         WARN(path + " absent: skipped");
@@ -75,14 +94,15 @@ void check_model(const std::string& path, std::uint32_t n_gen) {
         }
         DYNAMIC_SECTION("backend " << b.name) {
             model.use_backend(b);
+            const bool vulkan = std::string_view(b.name) == "vulkan";
             // A short target, and one longer than a step's prefill
             // budget, so its chunks depend on the other requests.
             for (const std::uint32_t len : {7u, 600u}) {
-                const auto alone = run(model, 1, len, n_gen);
+                const auto alone = run_and_reset(model, 1, len, n_gen, vulkan);
                 REQUIRE(alone.first.size() == n_gen);
                 for (const std::uint32_t n : {2u, 3u, 8u}) {
                     INFO("prompt " << len << " tokens, batch of " << n);
-                    const auto got = run(model, n, len, n_gen);
+                    const auto got = run_and_reset(model, n, len, n_gen, vulkan);
                     CHECK(got.first == alone.first);
                     CHECK(got.second == alone.second);
                 }
