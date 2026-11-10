@@ -39,8 +39,11 @@ TokenTrie::TokenTrie(std::shared_ptr<const std::vector<std::string>> pieces)
 
 GrammarConstraint::GrammarConstraint(std::shared_ptr<const Gbnf> g,
                                      std::shared_ptr<const TokenTrie> trie,
-                                     tok::TokenId eos)
-    : m_(std::move(g)), trie_(std::move(trie)), eos_(eos) {}
+                                     tok::TokenId eos, bool stop_at_space)
+    : m_(std::move(g)),
+      trie_(std::move(trie)),
+      eos_(eos),
+      stop_at_space_(stop_at_space) {}
 
 void GrammarConstraint::walk(std::uint32_t node, const GbnfMatcher& m,
                              std::size_t depth) const {
@@ -80,7 +83,7 @@ bool GrammarConstraint::allows(tok::TokenId t) const {
             }
             mask_.assign(trie_->pieces().size(), 0);
             walk(0, m_, 0);
-            if (m_.accepted() && !more_than_space()) {
+            if (stop_at_space_ && m_.accepted() && !more_than_space()) {
                 // Complete, and only whitespace may follow (the JSON
                 // grammars end every value with optional space): stop
                 // here instead of letting the model pad the reply.

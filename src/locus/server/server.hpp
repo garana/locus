@@ -37,6 +37,15 @@ struct VisionChat;
 
 namespace locus::server {
 
+/** A request's output format as a grammar (i#402): none for free text. */
+struct OutputGrammar {
+    std::shared_ptr<const model::Gbnf> g;
+    /** From json_object or json_schema: the reply stops at its last
+     * brace instead of the optional trailing whitespace. */
+    bool json = false;
+    explicit operator bool() const { return g != nullptr; }
+};
+
 /**
  * OpenAI- and Anthropic-compatible HTTP front end (DESIGN.md 4.5):
  *
@@ -190,11 +199,12 @@ class OpenAiServer {
      * decoded bytes, used by constrained decoding. */
     std::shared_ptr<const model::TokenTrie> token_trie();
     /**
-     * @returns A constraint that keeps the output a string of grammar
-     *     `g` (i#402), or nullptr when `g` is null.
+     * @returns A constraint that keeps the output a string of the
+     *     grammar `g` holds (i#402), or nullptr when it holds none. A
+     *     JSON format's reply also ends at its last brace.
      */
     std::unique_ptr<model::TokenConstraint> output_constraint(
-        std::shared_ptr<const model::Gbnf> g);
+        OutputGrammar g);
     /** L2-normalized last-token embedding of `text` (serialized). */
     std::vector<float> embed_text(const std::string& text);
     /**

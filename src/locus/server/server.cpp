@@ -499,20 +499,18 @@ std::string kv_type_name(kv::KvType t) {
  * object's JSON pointer in the body, where the schema is read again
  * with its key order kept.
  */
-std::shared_ptr<const model::Gbnf> format_grammar(const json& f,
-                                                  std::string_view raw,
-                                                  const std::string& ptr,
-                                                  bool nested) {
+OutputGrammar format_grammar(const json& f, std::string_view raw,
+                             const std::string& ptr, bool nested) {
     if (!f.is_object()) {
         throw std::invalid_argument("the output format must be an object");
     }
     const std::string type = f.value("type", "");
     if (type == "text") {
-        return nullptr;
+        return {};
     }
     if (type == "json_object") {
         // OpenAI's JSON mode promises an object, not any value.
-        return model::Gbnf::parse(model::json_value_gbnf(), "object");
+        return {model::Gbnf::parse(model::json_value_gbnf(), "object"), true};
     }
     if (type == "json_schema") {
         const json* s = nested && f.contains("json_schema") &&
@@ -528,23 +526,26 @@ std::shared_ptr<const model::Gbnf> format_grammar(const json& f,
         }
         const auto ordered = nlohmann::ordered_json::parse(raw);
         const std::string at = ptr + (nested ? "/json_schema/schema" : "/schema");
-        return model::Gbnf::parse(model::json_schema_to_gbnf(
-            ordered.at(nlohmann::ordered_json::json_pointer(at)).dump()));
+        return {model::Gbnf::parse(model::json_schema_to_gbnf(
+                    ordered.at(nlohmann::ordered_json::json_pointer(at))
+                        .dump())),
+                true};
     }
     // locus extensions: a GBNF grammar (rule "root") or a regex.
     if (type == "grammar") {
         if (!f.contains("grammar") || !f["grammar"].is_string()) {
             throw std::invalid_argument("grammar must be a GBNF string");
         }
-        return model::Gbnf::parse(f["grammar"].get<std::string>());
+        return {model::Gbnf::parse(f["grammar"].get<std::string>()), false};
     }
     if (type == "regex") {
         if (!f.contains("regex") || !f["regex"].is_string()) {
             throw std::invalid_argument("regex must be a string");
         }
-        return model::Gbnf::parse(
-            "root ::= " +
-            model::regex_to_gbnf(f["regex"].get<std::string>()));
+        return {model::Gbnf::parse(
+                    "root ::= " +
+                    model::regex_to_gbnf(f["regex"].get<std::string>())),
+                false};
     }
     throw std::invalid_argument(
         "unsupported output format type '" + type +
@@ -562,8 +563,7 @@ std::shared_ptr<const model::Gbnf> format_grammar(const json& f,
  * @throws std::invalid_argument on a malformed or unsupported format,
  *     a bad schema, grammar or regex.
  */
-std::shared_ptr<const model::Gbnf> output_grammar(const json& body,
-                                                  std::string_view raw) {
+OutputGrammar output_grammar(const json& body, std::string_view raw) {
     if (body.contains("response_format") &&
         body["response_format"].is_object()) {
         return format_grammar(body["response_format"], raw,
@@ -584,7 +584,7 @@ std::shared_ptr<const model::Gbnf> output_grammar(const json& body,
         return format_grammar(body["text"]["format"], raw, "/text/format",
                               false);
     }
-    return nullptr;
+    return {};
 }
 
 }  // namespace
@@ -1215,13 +1215,12 @@ std::shared_ptr<const model::TokenTrie> OpenAiServer::token_trie() {
 }
 
 std::unique_ptr<model::TokenConstraint> OpenAiServer::output_constraint(
-    std::shared_ptr<const model::Gbnf> g) {
-    if (g == nullptr) {
+    OutputGrammar g) {
+    if (g.g == nullptr) {
         return nullptr;
     }
-    return std::make_unique<model::GrammarConstraint>(std::move(g),
-                                                      token_trie(),
-                                                      tok_.eos_id());
+    return std::make_unique<model::GrammarConstraint>(
+        std::move(g.g), token_trie(), tok_.eos_id(), g.json);
 }
 
 OpenAiServer::~OpenAiServer() {
@@ -1454,8 +1453,8 @@ void OpenAiServer::install_routes() {
                     "Tokens generated.",
                     completion_tokens_total_.load());
             counter("locus_grammar_stack_overflows_total",
-                    "Grammar states (structured output) that had more "
-                    "parse stacks than the cap and dropped the rest.",
+                    "Structured-output replies whose grammar state had "
+                    "more parse stacks than the cap and dropped the rest.",
                     model::gbnf_stack_overflows());
             counter("locus_prefix_reused_tokens_total",
                     "Prompt tokens served from the prefix cache.",
@@ -1610,7 +1609,7 @@ void OpenAiServer::install_routes() {
         bool stream = false;
         std::vector<ToolSpec> tools;
         std::optional<VisionChat> vision;  // a chat with images (i#241)
-        std::shared_ptr<const model::Gbnf> grammar;  // an output format
+        OutputGrammar grammar;  // an output format
         try {
             body = json::parse(req.body);
             if (chat) {
@@ -3188,7 +3187,7 @@ void OpenAiServer::install_routes() {
         auth_event("create", "responses", ctx.identity);
         json body;
         ResponsesRequest rq;
-        std::shared_ptr<const model::Gbnf> grammar;  // text.format
+        OutputGrammar grammar;  // text.format
         try {
             body = json::parse(req.body);
             rq = parse_responses_request(body);
