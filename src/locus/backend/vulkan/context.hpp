@@ -153,6 +153,9 @@ enum class Kernel {
     /** The two above without the dead-plane guards (i#471). */
     kMatvecQ8_0NNg,
     kMatvecQ8_0NGluNg,
+    /** The NT 2 builds of matvec_q8_0_n / _glu (#432), for n <= 2. */
+    kMatvecQ8_0N2,
+    kMatvecQ8_0N2Glu,
     kCount_,
 };
 

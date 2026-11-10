@@ -463,11 +463,13 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   faster single-sequence forward, so Vulkan logits differ in the last
   bits alone and batched, unless batch-invariant mode
   (`LOCUS_VK_BATCH_INVARIANT=1`, `vulkan_set_batch_invariant`) sends it
-  through the multi-sequence kernels too: their token loop is a
-  runtime count in one shader, so a sequence's bits do not depend on
-  the batch (#432). Llama 3.2 1B Q8_0 on an M4 Max: 2, 4 and 8
-  sequences make 256, 344 and 400 tok/s in all, against 209 alone
-  (172 alone in batch-invariant mode).
+  through the multi-sequence kernels too. Q8_0 batches of 1 or 2 take
+  the NT 2 build of the short-batch kernel and larger ones the NT 8
+  build; the builds run the same per-token arithmetic, so a
+  sequence's bits do not depend on the batch (#432; a test checks the
+  builds agree bit for bit on the device). Llama 3.2 1B Q8_0 on an M4
+  Max: 2, 4 and 8 sequences make 317, 349 and 411 tok/s in all,
+  against 211 alone (203 alone in batch-invariant mode).
 - Prompt ingestion is batched by default (`--no-batch-prefill` turns
   it off). Vulkan has its own chunked prefill, `vulkan_forward_batch`
   (chunks of up to 512 tokens, 2048 for MoE; token-exact, not
