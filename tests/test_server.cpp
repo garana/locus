@@ -702,6 +702,42 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(text.find(", there was") != std::string::npos);
     }
 
+    // i#415: the last chunk before [DONE] carries the finish reason,
+    // as in the non-streamed reply.
+    SECTION("streams end with a finish_reason chunk") {
+        const auto last_chunk = [](const std::string& sse) {
+            const std::size_t done = sse.find("data: [DONE]\n\n");
+            REQUIRE(done != std::string::npos);
+            const std::size_t at = sse.rfind("data: ", done - 1);
+            REQUIRE(at != std::string::npos);
+            return json::parse(sse.substr(at + 6, done - at - 8));
+        };
+        for (const bool chat : {false, true}) {
+            CAPTURE(chat);
+            json req{{"max_tokens", 4}, {"stream", true}};
+            if (chat) {
+                req["messages"] = json::array(
+                    {{{"role", "user"}, {"content", "Tell a story"}}});
+            } else {
+                req["prompt"] = "Once upon a time";
+            }
+            auto res = client.Post(chat ? "/v1/chat/completions"
+                                        : "/v1/completions",
+                                   req.dump(), "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            const json last = last_chunk(res->body);
+            const json& c = last["choices"][0];
+            // 4 tokens cannot finish the story: cut by max_tokens.
+            REQUIRE(c["finish_reason"] == "length");
+            if (chat) {
+                REQUIRE(c["delta"] == json::object());
+            } else {
+                REQUIRE(c["text"] == "");
+            }
+        }
+    }
+
     SECTION("bad requests get 400") {
         auto res = client.Post("/v1/completions", "{not json",
                                "application/json");
