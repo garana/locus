@@ -56,9 +56,9 @@ void DraftCost::observe(std::uint32_t drafted, double seconds) {
         sec_.resize(drafted + 1, 0.0);
         seen_.resize(drafted + 1, 0);
     }
-    // The first forward of a shape pays one-time costs (on Vulkan, the
-    // first use of a batch size), so it is not counted.
-    if (seen_[drafted]++ == 0) {
+    // On Vulkan the first forward of a shape pays the first use of
+    // that batch size, so it is not counted there.
+    if (seen_[drafted]++ == 0 && drop_first_) {
         return;
     }
     double& v = sec_[drafted];

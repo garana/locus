@@ -56,13 +56,25 @@ DraftState passing(double rate) {
 
 }  // namespace
 
-TEST_CASE("DraftCost drops the first sample of each length", "[spec]") {
-    DraftCost c;
+TEST_CASE("DraftCost drops the first sample of each length on Vulkan",
+          "[spec]") {
+    DraftCost c(/*drop_first=*/true);
     c.observe(3, 9.0);  // a first use, with one-time costs
     REQUIRE(c.seconds(3) == 0.0);
     c.observe(3, 1.0);
     REQUIRE(c.seconds(3) == 1.0);
     REQUIRE(c.seconds(7) == 0.0);  // never seen
+}
+
+TEST_CASE("DraftCost counts the first sample elsewhere", "[spec]") {
+    // The CPU and CUDA have no one-time cost per batch size, so one try
+    // prices a length, and a short request stops walking the lengths.
+    DraftCost c;
+    c.observe(3, 2.0);
+    REQUIRE(c.seconds(3) == 2.0);
+    c.observe(3, 1.0);  // then a moving average
+    REQUIRE(c.seconds(3) > 1.0);
+    REQUIRE(c.seconds(3) < 2.0);
 }
 
 TEST_CASE("choose_draft prices drafts against a plain decode",
