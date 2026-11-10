@@ -324,6 +324,7 @@ void Client::close() {
         fd_ = -1;
     }
     buf_.clear();
+    active_ = false;
 }
 
 bool Client::connect(std::string& err) {
@@ -379,20 +380,44 @@ long Client::read_some(std::string& err) {
 }
 
 ClientResponse Client::send(const ClientRequest& req) {
-    return run(req, nullptr, nullptr);
+    ClientResponse res = begin(req);
+    if (!res.ok) return res;
+    const std::size_t cap = opt_.limits.max_body_bytes;
+    bool over = false;
+    res.ok = read_body(
+        [&](std::string_view d) {
+            if (res.body.size() + d.size() > cap) {
+                over = true;
+                return false;
+            }
+            res.body.append(d);
+            return true;
+        },
+        res.error);
+    if (over) res.error = "response body over the limit";
+    return res;
 }
 
 ClientResponse Client::stream(
     const ClientRequest& req,
     const std::function<bool(const ResponseHead&)>& on_head,
     const std::function<bool(std::string_view)>& on_body) {
-    return run(req, on_head, on_body);
+    ClientResponse res = begin(req);
+    if (!res.ok) return res;
+    if (on_head && !on_head(res.head)) {
+        close();
+        res.ok = false;
+        res.error = "stopped by the caller";
+        return res;
+    }
+    res.ok = read_body(on_body ? on_body
+                               : [](std::string_view) { return true; },
+                       res.error);
+    return res;
 }
 
-ClientResponse Client::run(
-    const ClientRequest& req,
-    const std::function<bool(const ResponseHead&)>& on_head,
-    const std::function<bool(std::string_view)>& on_body) {
+ClientResponse Client::begin(const ClientRequest& req) {
+    if (active_) close();  // the last body was not read: drop it
     ClientResponse res;
     // The request bytes; header names and values must not carry CR, LF
     // or NUL (the same injection guard as the response writer).
@@ -470,100 +495,90 @@ ClientResponse Client::run(
         }
         if (fd_ < 0) continue;  // the stale-connection retry
         res.head = head;
-        if (on_head && !on_head(res.head)) {
-            close();
-            res.error = "stopped by the caller";
-            return res;
-        }
-        bool stopped = false;
-        const auto deliver = [&](std::string_view d) {
-            if (stopped || d.empty()) return;
-            if (on_body) {
-                if (!on_body(d)) stopped = true;
-            } else if (res.body.size() + d.size() >
-                       opt_.limits.max_body_bytes) {
-                stopped = true;
-                res.error = "response body over the limit";
-            } else {
-                res.body.append(d);
-            }
-        };
-        switch (res.head.framing) {
-            case BodyFraming::kNone:
-                break;
-            case BodyFraming::kLength: {
-                std::size_t left = res.head.content_length;
-                for (;;) {
-                    const std::size_t take = std::min(left, buf_.size());
-                    deliver(std::string_view(buf_).substr(0, take));
-                    buf_.erase(0, take);
-                    left -= take;
-                    if (left == 0 || stopped) break;
-                    const long n = read_some(err);
-                    if (n <= 0) {
-                        close();
-                        res.error = n == 0 ? "connection closed mid-body"
-                                           : err;
-                        return res;
-                    }
-                }
-                break;
-            }
-            case BodyFraming::kChunked: {
-                ChunkDecoder dec(opt_.limits.max_body_bytes);
-                std::string pending = std::move(buf_);
-                buf_.clear();
-                for (;;) {
-                    std::string rest;
-                    const auto st = dec.feed(pending, deliver, rest);
-                    if (st == ChunkDecoder::State::kError) {
-                        close();
-                        res.error = "bad chunked body: " + dec.error();
-                        return res;
-                    }
-                    if (st == ChunkDecoder::State::kDone) {
-                        buf_ = std::move(rest);
-                        break;
-                    }
-                    if (stopped) break;
-                    buf_.clear();
-                    const long n = read_some(err);
-                    if (n <= 0) {
-                        close();
-                        res.error = n == 0 ? "connection closed mid-body"
-                                           : err;
-                        return res;
-                    }
-                    pending = std::move(buf_);
-                    buf_.clear();
-                }
-                break;
-            }
-            case BodyFraming::kClose: {
-                for (;;) {
-                    deliver(buf_);
-                    buf_.clear();
-                    if (stopped) break;
-                    const long n = read_some(err);
-                    if (n == 0) break;  // the end of the body
-                    if (n < 0) {
-                        close();
-                        res.error = err;
-                        return res;
-                    }
-                }
-                break;
-            }
-        }
-        if (stopped) {
-            close();
-            if (res.error.empty()) res.error = "stopped by the caller";
-            return res;
-        }
-        if (!res.head.keep_alive) close();
+        pending_ = head;
+        active_ = true;
         res.ok = true;
         return res;
     }
+}
+
+bool Client::read_body(const std::function<bool(std::string_view)>& on_body,
+                       std::string& err) {
+    if (!active_) {
+        err = "no response in progress";
+        return false;
+    }
+    active_ = false;
+    bool stopped = false;
+    const auto deliver = [&](std::string_view d) {
+        if (stopped || d.empty()) return;
+        if (!on_body(d)) stopped = true;
+    };
+    const auto fail = [&](long n, std::string why) {
+        close();
+        err = n == 0 ? std::move(why) : err;
+        return false;
+    };
+    switch (pending_.framing) {
+        case BodyFraming::kNone:
+            break;
+        case BodyFraming::kLength: {
+            std::size_t left = pending_.content_length;
+            for (;;) {
+                const std::size_t take = std::min(left, buf_.size());
+                deliver(std::string_view(buf_).substr(0, take));
+                buf_.erase(0, take);
+                left -= take;
+                if (left == 0 || stopped) break;
+                const long n = read_some(err);
+                if (n <= 0) return fail(n, "connection closed mid-body");
+            }
+            break;
+        }
+        case BodyFraming::kChunked: {
+            ChunkDecoder dec(opt_.limits.max_body_bytes);
+            std::string pending = std::move(buf_);
+            buf_.clear();
+            for (;;) {
+                std::string rest;
+                const auto st = dec.feed(pending, deliver, rest);
+                if (st == ChunkDecoder::State::kError) {
+                    close();
+                    err = "bad chunked body: " + dec.error();
+                    return false;
+                }
+                if (st == ChunkDecoder::State::kDone) {
+                    buf_ = std::move(rest);
+                    break;
+                }
+                if (stopped) break;
+                buf_.clear();
+                const long n = read_some(err);
+                if (n <= 0) return fail(n, "connection closed mid-body");
+                pending = std::move(buf_);
+                buf_.clear();
+            }
+            break;
+        }
+        case BodyFraming::kClose: {
+            for (;;) {
+                deliver(buf_);
+                buf_.clear();
+                if (stopped) break;
+                const long n = read_some(err);
+                if (n == 0) break;  // the end of the body
+                if (n < 0) return fail(n, "");
+            }
+            break;
+        }
+    }
+    if (stopped) {
+        close();
+        if (err.empty()) err = "stopped by the caller";
+        return false;
+    }
+    if (!pending_.keep_alive) close();
+    return true;
 }
 
 }  // namespace locus::http
