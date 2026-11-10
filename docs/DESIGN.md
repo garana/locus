@@ -153,9 +153,15 @@ path and, for chat, the body. An instance lists its kinds in
 every `--refresh-ms`; a request that names a listed model goes to that
 instance. Buffered replies are forwarded whole; a chunked one (SSE)
 streams through, and a client that leaves closes the upstream
-connection, so the instance stops the work. Session affinity, several
-instances per kind with a load bound, video id rewriting and auth at
-the router are the next steps of #388.
+connection, so the instance stops the work. With several instances of
+a kind, a session key (the client's own, or a hash of the system
+prompt and first user turn) orders them by rendezvous hashing, so a
+conversation keeps its instance's prefix cache, every router agrees
+with no shared state, and a leaving instance moves only its own keys.
+An instance over 1.25 times the candidates' average in-flight count
+goes last, and a connect failure or a busy 503 moves on to the next.
+Video id rewriting, auth at the router and router metrics are the
+next steps of #388.
 
 ## 5. Milestones
 

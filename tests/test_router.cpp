@@ -4,7 +4,12 @@
 
 #include <csignal>
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
+#include <future>
+#include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -42,6 +47,10 @@ struct FakeInstance {
     std::string name;
     std::mutex mu;
     std::vector<std::pair<std::string, std::string>> last_headers;
+    /** Each proxied request waits this long before answering. */
+    std::atomic<int> delay_ms{0};
+    /** Answer 503 with Retry-After, as a busy media instance does. */
+    std::atomic<bool> busy{false};
     std::unique_ptr<locus::http::Server> server;
     int port = 0;
 
@@ -69,6 +78,16 @@ struct FakeInstance {
                 {
                     std::lock_guard lk(mu);
                     last_headers = req.headers;
+                }
+                if (busy) {
+                    res.status = 503;
+                    res.set_header("Retry-After", "7");
+                    res.set_content(name + " busy", "text/plain");
+                    return;
+                }
+                if (delay_ms > 0) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(delay_ms.load()));
                 }
                 if (req.path == "/v1/chat/completions" &&
                     req.body.find("\"stream\":true") != std::string::npos) {
@@ -264,6 +283,154 @@ TEST_CASE("router: a dead instance is skipped", "[router]") {
         const auto r = rf.post("/v1/completions", {{"prompt", "x"}});
         REQUIRE(r.ok);
         CHECK(r.body.rfind("live", 0) == 0);
+    }
+}
+
+TEST_CASE("router: session keys", "[router]") {
+    using locus::router::session_key;
+    CHECK(session_key("abc", "{}") == "h:abc");
+    CHECK(session_key("", R"({"prompt_cache_key":"pk","messages":[]})") ==
+          "k:pk");
+    CHECK(session_key("", R"({"metadata":{"user_id":"u7"}})") == "u:u7");
+    // A conversation keeps its key as it grows: the system prompt and
+    // the first user turn decide it.
+    const std::string turn1 = R"({"messages":[
+        {"role":"system","content":"Be brief."},
+        {"role":"user","content":"Hello"}]})";
+    const std::string turn2 = R"({"messages":[
+        {"role":"system","content":"Be brief."},
+        {"role":"user","content":"Hello"},
+        {"role":"assistant","content":"Hi"},
+        {"role":"user","content":"And?"}]})";
+    const std::string other = R"({"messages":[
+        {"role":"system","content":"Be brief."},
+        {"role":"user","content":"Goodbye"}]})";
+    const std::string k1 = session_key("", turn1);
+    CHECK(k1.rfind("p:", 0) == 0);
+    CHECK(session_key("", turn2) == k1);
+    CHECK(session_key("", other) != k1);
+    // Anthropic system field, Responses input, completions prompt.
+    CHECK(session_key("", R"({"system":"S","messages":[{"role":"user",
+              "content":[{"type":"text","text":"Q"}]}]})") ==
+          session_key("", R"({"system":"S","messages":[{"role":"user",
+              "content":"Q"}]})"));
+    CHECK(!session_key("", R"({"input":"hi"})").empty());
+    CHECK(!session_key("", R"({"prompt":"Once"})").empty());
+    CHECK(session_key("", "").empty());
+    CHECK(session_key("", "not json").empty());
+}
+
+TEST_CASE("router: rendezvous order moves only a leaving instance's keys",
+          "[router]") {
+    using locus::router::rendezvous_score;
+    const auto winner = [](const std::string& key,
+                           const std::vector<std::string>& insts) {
+        std::string best;
+        std::uint64_t top = 0;
+        for (const auto& i : insts) {
+            const auto s = rendezvous_score(key, i);
+            if (best.empty() || s > top) {
+                top = s;
+                best = i;
+            }
+        }
+        return best;
+    };
+    const std::vector<std::string> three{"a:1", "b:1", "c:1"};
+    const std::vector<std::string> two{"a:1", "b:1"};
+    std::map<std::string, int> share;
+    int moved = 0;
+    for (int k = 0; k < 3000; ++k) {
+        const std::string key = "session-" + std::to_string(k);
+        const std::string w3 = winner(key, three);
+        ++share[w3];
+        if (w3 != "c:1") {
+            // Only keys that c:1 held may move when it leaves.
+            CHECK(winner(key, two) == w3);
+        } else {
+            ++moved;
+        }
+    }
+    // Each instance holds about a third of the keys.
+    for (const auto& [inst, n] : share) {
+        INFO(inst);
+        CHECK(n > 800);
+        CHECK(n < 1200);
+    }
+    CHECK(moved == share["c:1"]);
+    // The same in every router: a pure function of its inputs.
+    CHECK(rendezvous_score("k", "a:1") == rendezvous_score("k", "a:1"));
+}
+
+TEST_CASE("router: a session stays on one instance", "[router]") {
+    FakeInstance a("A", {"text"}, "m"), b("B", {"text"}, "m"),
+        c("C", {"text"}, "m");
+    RouterFixture r1({a.addr(), b.addr(), c.addr()});
+    RouterFixture r2({a.addr(), b.addr(), c.addr()});
+    const auto where = [](RouterFixture& rf, const std::string& session) {
+        const auto r = rf.post("/v1/completions", {{"prompt", "x"}},
+                               {{"X-Session-Id", session}});
+        REQUIRE(r.ok);
+        return r.body.substr(0, 1);
+    };
+    const std::string home = where(r1, "s-1");
+    for (int i = 0; i < 10; ++i) {
+        CHECK(where(r1, "s-1") == home);
+        CHECK(where(r2, "s-1") == home);  // the other router agrees
+    }
+    std::set<std::string> seen;
+    for (int s = 0; s < 30; ++s) {
+        seen.insert(where(r1, "spread-" + std::to_string(s)));
+    }
+    for (const auto& in : r1.router->instances()) {
+        CHECK(in.healthy);
+    }
+    CHECK(seen.size() == 3);
+}
+
+TEST_CASE("router: a loaded or busy instance passes requests on",
+          "[router]") {
+    FakeInstance a("A", {"text"}, "m"), b("B", {"text"}, "m"),
+        c("C", {"text"}, "m");
+    FakeInstance* by_addr[] = {&a, &b, &c};
+    RouterFixture rf({a.addr(), b.addr(), c.addr()});
+    locus::router::Route route;
+    route.session = "h:hot";
+    const auto order = rf.router->candidates(route);
+    REQUIRE(order.size() == 3);
+    FakeInstance& first = *by_addr[order[0]];
+
+    SECTION("over the load bound, the key's next instance answers") {
+        first.delay_ms = 600;
+        std::vector<std::future<std::string>> f;
+        for (int i = 0; i < 3; ++i) {
+            f.push_back(std::async(std::launch::async, [&] {
+                const auto r = rf.post("/v1/completions", {{"prompt", "x"}},
+                                       {{"X-Session-Id", "hot"}});
+                return r.ok ? r.body.substr(0, 1) : std::string("!");
+            }));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::multiset<std::string> got;
+        for (auto& x : f) got.insert(x.get());
+        CHECK(got.count(first.name) >= 1);
+        CHECK(got.count(first.name) < 3);  // the rest went elsewhere
+        CHECK(got.count("!") == 0);
+    }
+    SECTION("a 503 with Retry-After moves to the next instance") {
+        first.busy = true;
+        const auto r = rf.post("/v1/completions", {{"prompt", "x"}},
+                               {{"X-Session-Id", "hot"}});
+        REQUIRE(r.ok);
+        CHECK(r.head.status == 200);
+        CHECK(r.body.substr(0, 1) == by_addr[order[1]]->name);
+    }
+    SECTION("all busy: the last 503 comes back with its Retry-After") {
+        a.busy = b.busy = c.busy = true;
+        const auto r = rf.post("/v1/completions", {{"prompt", "x"}});
+        REQUIRE(r.ok);
+        CHECK(r.head.status == 503);
+        CHECK(r.head.get_header_value("Retry-After") == "7");
     }
 }
 

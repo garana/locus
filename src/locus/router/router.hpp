@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,7 +39,26 @@ struct Route {
     Kind kind = Kind::kText;
     /** The body's `model`, when it names one ("" otherwise). */
     std::string model;
+    /** The session key (session_key()); "" when there is none. */
+    std::string session;
 };
+
+/**
+ * The key that sends one conversation to one instance, so its prefix
+ * cache and hot experts are reused: the client's own key when it sends
+ * one (the `X-Session-Id` header, OpenAI's `prompt_cache_key`,
+ * Anthropic's `metadata.user_id`), else a hash of the prompt's start
+ * (the system prompt and the first user turn, which every later turn
+ * resends).
+ * @param header The X-Session-Id header ("" when absent).
+ * @param body The request body (JSON; anything else gives "").
+ */
+std::string session_key(std::string_view header, std::string_view body);
+
+/** @returns the rendezvous score of `instance` (host:port) for `key`:
+ * a 64-bit FNV-1a hash of both, the same in every router. */
+std::uint64_t rendezvous_score(std::string_view key,
+                               std::string_view instance);
 
 /**
  * Sorts a request by its path, and for chat, messages and responses by
@@ -67,6 +88,12 @@ struct RouterConfig {
     std::vector<std::string> instances;
     /** How often /v1/models is fetched from each instance. */
     int refresh_ms = 10000;
+    /** Load bound: an instance with more requests in flight than this
+     * times the average over its kind's candidates passes the request
+     * to the key's next instance. */
+    double load_factor = 1.25;
+    /** Idle kept-alive connections kept per instance. */
+    int pool_size = 8;
     /** Toward the instances. Media requests can take minutes, so the
      * read deadline is per gap between reads, not per request. */
     http::ClientOptions upstream;
@@ -100,15 +127,35 @@ class Router {
     /** @returns a copy of the instances as last polled. */
     std::vector<Instance> instances() const;
 
+    /**
+     * @returns the instance indexes that serve `route`, best first: the
+     * ones that list its model (when any does), each group in
+     * rendezvous order for the session key (or round robin without
+     * one), with instances over the load bound moved after the rest.
+     */
+    std::vector<int> candidates(const Route& route) const;
+
   private:
+    /** Per instance, kept across refreshes: requests in flight and
+     * idle connections. */
+    struct Slot {
+        std::atomic<int> inflight{0};
+        std::mutex mu;
+        std::vector<std::shared_ptr<http::Client>> idle;
+    };
+
     void handle(const http::Request& req, http::ServerResponse& res);
-    /** @returns the index of an instance for `route`, or -1. */
-    int pick(const Route& route) const;
     void models(http::ServerResponse& res) const;
+    /** An idle connection to instance i, or a new client. */
+    std::shared_ptr<http::Client> take(std::size_t i);
+    /** Returns a client to instance i's pool (up to pool_size). */
+    void give(std::size_t i, std::shared_ptr<http::Client> c);
 
     RouterConfig cfg_;
     mutable std::mutex mu_;
     std::vector<Instance> inst_;
+    std::vector<std::unique_ptr<Slot>> slots_;  ///< one per instance
+    mutable std::atomic<std::uint64_t> rr_{0};
     std::unique_ptr<http::Server> server_;
     std::thread refresher_;
     std::mutex stop_mu_;

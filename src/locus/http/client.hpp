@@ -128,6 +128,9 @@ struct ClientResponse {
      * read or parse failure (see error), with status 0. */
     bool ok = false;
     std::string error;
+    /** A connection to the server was made (false: the connect itself
+     * failed, so the server is down or unreachable). */
+    bool connected = false;
     ResponseHead head;
     std::string body;  ///< empty when streamed to a sink
 };

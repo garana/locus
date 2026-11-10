@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <set>
 #include <stdexcept>
 
@@ -68,6 +70,103 @@ std::string error_body(const std::string& msg, const char* type) {
 
 }  // namespace
 
+namespace {
+
+constexpr std::uint64_t kFnvBasis = 14695981039346656037ull;
+constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+
+std::uint64_t fnv1a(std::string_view s, std::uint64_t h = kFnvBasis) {
+    for (const char c : s) {
+        h ^= static_cast<unsigned char>(c);
+        h *= kFnvPrime;
+    }
+    return h;
+}
+
+/** The text of a message's content: a string, or the text parts. */
+std::string content_text(const json& c) {
+    if (c.is_string()) return c.get<std::string>();
+    std::string out;
+    if (c.is_array()) {
+        for (const auto& p : c) {
+            if (p.is_object() && p.contains("text") && p["text"].is_string()) {
+                out += p["text"].get<std::string>();
+            }
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+std::string session_key(std::string_view header, std::string_view body) {
+    if (!header.empty()) return "h:" + std::string(header);
+    const json j = json::parse(body, nullptr, /*allow_exceptions=*/false);
+    if (!j.is_object()) return "";
+    if (const auto k = j.find("prompt_cache_key");
+        k != j.end() && k->is_string() && !k->get<std::string>().empty()) {
+        return "k:" + k->get<std::string>();
+    }
+    if (const auto m = j.find("metadata"); m != j.end() && m->is_object()) {
+        if (const auto u = m->find("user_id");
+            u != m->end() && u->is_string() && !u->get<std::string>().empty()) {
+            return "u:" + u->get<std::string>();
+        }
+    }
+    // The prompt's start: what every later turn of the conversation
+    // sends again. Capped, so a long first turn costs little to hash.
+    constexpr std::size_t kMaxStart = 4096;
+    std::string start;
+    for (const char* key : {"system", "instructions"}) {
+        if (const auto s = j.find(key); s != j.end()) {
+            start += content_text(*s) + '\n';
+        }
+    }
+    const auto first_user = [&](const json& list) {
+        if (!list.is_array()) return;
+        for (const auto& m : list) {
+            if (!m.is_object()) continue;
+            const std::string role = m.value("role", "");
+            if (role == "system" || role == "developer") {
+                start += content_text(m.value("content", json())) + '\n';
+            } else if (role == "user") {
+                start += content_text(m.value("content", json()));
+                return;
+            }
+        }
+    };
+    if (const auto ms = j.find("messages"); ms != j.end()) first_user(*ms);
+    if (const auto in = j.find("input"); in != j.end()) {
+        if (in->is_string()) start += in->get<std::string>();
+        else first_user(*in);
+    }
+    if (const auto p = j.find("prompt"); p != j.end() && p->is_string()) {
+        start += p->get<std::string>();
+    }
+    if (start.empty()) return "";
+    if (start.size() > kMaxStart) start.resize(kMaxStart);
+    char hex[17];
+    std::snprintf(hex, sizeof(hex), "%016llx",
+                  static_cast<unsigned long long>(fnv1a(start)));
+    return std::string("p:") + hex;
+}
+
+std::uint64_t rendezvous_score(std::string_view key,
+                               std::string_view instance) {
+    std::uint64_t h = fnv1a(key);
+    h ^= 0xff;  // a separator byte, so "ab"+"c" differs from "a"+"bc"
+    h *= kFnvPrime;
+    h = fnv1a(instance, h);
+    // Mix the bits (splitmix64 finalizer): FNV's high bits move little
+    // for keys that differ only at the end.
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ull;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebull;
+    h ^= h >> 31;
+    return h;
+}
+
 std::string_view kind_name(Kind k) {
     return kKindNames[static_cast<int>(k)];
 }
@@ -127,6 +226,37 @@ Router::Router(RouterConfig cfg) : cfg_(std::move(cfg)) {
             throw std::invalid_argument("bad instance address: " + s);
         }
         inst_.push_back(std::move(in));
+        slots_.push_back(std::make_unique<Slot>());
+    }
+}
+
+std::shared_ptr<http::Client> Router::take(std::size_t i) {
+    Slot& s = *slots_[i];
+    {
+        std::lock_guard lk(s.mu);
+        if (!s.idle.empty()) {
+            auto c = std::move(s.idle.back());
+            s.idle.pop_back();
+            return c;
+        }
+    }
+    std::string host;
+    int port = 0;
+    {
+        std::lock_guard lk(mu_);
+        host = inst_[i].host;
+        port = inst_[i].port;
+    }
+    return std::make_shared<http::Client>(host, port, cfg_.upstream);
+}
+
+void Router::give(std::size_t i, std::shared_ptr<http::Client> c) {
+    // A client whose server closed the connection reconnects on its
+    // next request, so it is kept either way.
+    Slot& s = *slots_[i];
+    std::lock_guard lk(s.mu);
+    if (static_cast<int>(s.idle.size()) < cfg_.pool_size) {
+        s.idle.push_back(std::move(c));
     }
 }
 
@@ -225,26 +355,63 @@ std::vector<Instance> Router::instances() const {
     return inst_;
 }
 
-int Router::pick(const Route& route) const {
-    std::lock_guard lk(mu_);
-    int any = -1;
-    for (std::size_t i = 0; i < inst_.size(); ++i) {
-        const Instance& in = inst_[i];
-        if (!in.healthy ||
-            std::find(in.kinds.begin(), in.kinds.end(), route.kind) ==
-                in.kinds.end()) {
-            continue;
+std::vector<int> Router::candidates(const Route& route) const {
+    std::vector<int> of_kind, of_model;
+    {
+        std::lock_guard lk(mu_);
+        for (std::size_t i = 0; i < inst_.size(); ++i) {
+            const Instance& in = inst_[i];
+            if (!in.healthy ||
+                std::find(in.kinds.begin(), in.kinds.end(), route.kind) ==
+                    in.kinds.end()) {
+                continue;
+            }
+            of_kind.push_back(static_cast<int>(i));
+            if (!route.model.empty() &&
+                std::find(in.models.begin(), in.models.end(), route.model) !=
+                    in.models.end()) {
+                of_model.push_back(static_cast<int>(i));
+            }
         }
-        if (route.model.empty() ||
-            std::find(in.models.begin(), in.models.end(), route.model) !=
-                in.models.end()) {
-            return static_cast<int>(i);
-        }
-        if (any < 0) any = static_cast<int>(i);
     }
     // A model no instance lists (clients often send their own name for
     // it) goes to any instance of the kind.
-    return any;
+    std::vector<int> c = of_model.empty() ? of_kind : of_model;
+    if (c.empty()) return c;
+    if (!route.session.empty()) {
+        // Rendezvous hashing: every router orders the same instances
+        // the same way for a key, with no table to share.
+        std::vector<std::pair<std::uint64_t, int>> scored;
+        {
+            std::lock_guard lk(mu_);
+            for (const int i : c) {
+                const Instance& in = inst_[static_cast<std::size_t>(i)];
+                scored.emplace_back(
+                    rendezvous_score(route.session,
+                                     in.host + ":" + std::to_string(in.port)),
+                    i);
+            }
+        }
+        std::sort(scored.begin(), scored.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (std::size_t k = 0; k < c.size(); ++k) c[k] = scored[k].second;
+    } else {
+        const std::size_t r = rr_.fetch_add(1) % c.size();
+        std::rotate(c.begin(), c.begin() + static_cast<std::ptrdiff_t>(r),
+                    c.end());
+    }
+    // Bounded load: an instance at or over load_factor times the
+    // average in-flight count (counting this request) goes last.
+    int total = 0;
+    for (const int i : c) {
+        total += slots_[static_cast<std::size_t>(i)]->inflight.load();
+    }
+    const int cap = static_cast<int>(std::ceil(
+        cfg_.load_factor * (total + 1) / static_cast<double>(c.size())));
+    std::stable_partition(c.begin(), c.end(), [&](int i) {
+        return slots_[static_cast<std::size_t>(i)]->inflight.load() < cap;
+    });
+    return c;
 }
 
 void Router::models(http::ServerResponse& res) const {
@@ -290,21 +457,18 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
                         "application/json");
         return;
     }
-    const int idx = pick(*route);
-    if (idx < 0) {
+    Route rt = *route;
+    rt.session = session_key(req.get_header_value("X-Session-Id"), req.body);
+    const std::vector<int> cands = candidates(rt);
+    if (cands.empty()) {
         res.status = 503;
         res.set_header("Retry-After", "5");
         res.set_content(
             error_body("no healthy instance serves " +
-                           std::string(kind_name(route->kind)) + " requests",
+                           std::string(kind_name(rt.kind)) + " requests",
                        "server_error"),
             "application/json");
         return;
-    }
-    Instance in;
-    {
-        std::lock_guard lk(mu_);
-        in = inst_[static_cast<std::size_t>(idx)];
     }
 
     http::ClientRequest up;
@@ -314,60 +478,106 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
     for (const auto& [k, v] : req.headers) {
         if (!hop_by_hop(k)) up.headers.emplace_back(k, v);
     }
-    auto client = std::make_shared<http::Client>(in.host, in.port,
-                                                 cfg_.upstream);
-    const auto head = client->begin(up);
-    if (!head.ok) {
-        // A connect failure marks the instance down until the next poll.
-        {
-            std::lock_guard lk(mu_);
-            for (auto& i : inst_) {
-                if (i.host == in.host && i.port == in.port) i.healthy = false;
+    const auto copy_head = [&](const http::ResponseHead& h) {
+        res.status = h.status;
+        for (const auto& [k, v] : h.headers) {
+            if (!hop_by_hop(k) && !iequals(k, "Content-Type")) {
+                res.set_header(k, v);
             }
         }
-        res.status = 502;
-        res.set_content(error_body("upstream " + in.host + ":" +
-                                       std::to_string(in.port) + ": " +
-                                       head.error,
-                                   "server_error"),
-                        "application/json");
-        return;
-    }
-    res.status = head.head.status;
-    std::string content_type = head.head.get_header_value("Content-Type");
-    for (const auto& [k, v] : head.head.headers) {
-        if (!hop_by_hop(k) && !iequals(k, "Content-Type")) {
-            res.set_header(k, v);
+        return h.get_header_value("Content-Type");
+    };
+    // Try the candidates in order: a connect failure, or a 503 that
+    // says when to retry (the instance is busy), moves to the next.
+    std::string last_error;
+    bool busy = false;
+    std::string busy_type, busy_body;
+    http::ResponseHead busy_head;
+    for (const int ci : cands) {
+        const auto i = static_cast<std::size_t>(ci);
+        Slot& slot = *slots_[i];
+        ++slot.inflight;
+        // Released when the request is done here, or when the stream
+        // provider that holds it is gone.
+        std::shared_ptr<void> guard(nullptr,
+                                    [&slot](void*) { --slot.inflight; });
+        std::shared_ptr<http::Client> client = take(i);
+        const auto head = client->begin(up);
+        if (!head.ok) {
+            // A refused or timed-out connect means the instance is down
+            // until the next poll answers; any other failure (a reply
+            // cut short, a bad head) only moves on to the next one.
+            std::lock_guard lk(mu_);
+            if (!head.connected) inst_[i].healthy = false;
+            last_error = inst_[i].host + ":" + std::to_string(inst_[i].port) +
+                         ": " + head.error;
+            continue;
         }
-    }
-    const auto framing = head.head.framing;
-    if (framing == http::BodyFraming::kChunked ||
-        framing == http::BodyFraming::kClose) {
-        // A stream: pass each piece on as it arrives. A client that goes
-        // away fails sink.write, which stops read_body and closes the
-        // upstream connection, so the instance stops the work.
-        res.set_chunked_content_provider(
-            content_type, [client](http::Sink& sink) {
-                std::string err;
-                client->read_body(
-                    [&](std::string_view d) { return sink.write(d); }, err);
-            });
+        const auto framing = head.head.framing;
+        const bool stream = framing == http::BodyFraming::kChunked ||
+                            framing == http::BodyFraming::kClose;
+        if (head.head.status == 503 &&
+            !head.head.get_header_value("Retry-After").empty() && !stream) {
+            std::string b, err;
+            if (client->read_body(
+                    [&](std::string_view d) {
+                        b.append(d);
+                        return true;
+                    },
+                    err)) {
+                give(i, std::move(client));
+            }
+            busy = true;
+            busy_head = head.head;
+            busy_type = head.head.get_header_value("Content-Type");
+            busy_body = std::move(b);
+            continue;
+        }
+        const std::string content_type = copy_head(head.head);
+        if (stream) {
+            // A stream: pass each piece on as it arrives. A client that
+            // goes away fails sink.write, which stops read_body and
+            // closes the upstream connection, so the instance stops the
+            // work.
+            res.set_chunked_content_provider(
+                content_type,
+                [this, i, client, guard](http::Sink& sink) mutable {
+                    std::string err;
+                    if (client->read_body(
+                            [&](std::string_view d) { return sink.write(d); },
+                            err)) {
+                        give(i, std::move(client));
+                    }
+                });
+            return;
+        }
+        std::string body, err;
+        if (!client->read_body(
+                [&](std::string_view d) {
+                    body.append(d);
+                    return true;
+                },
+                err)) {
+            res.status = 502;
+            res.headers.clear();
+            res.set_content(error_body("upstream body: " + err, "server_error"),
+                            "application/json");
+            return;
+        }
+        give(i, std::move(client));
+        res.set_content(std::move(body), content_type);
         return;
     }
-    std::string body;
-    std::string err;
-    if (!client->read_body(
-            [&](std::string_view d) {
-                body.append(d);
-                return true;
-            },
-            err)) {
-        res.status = 502;
-        res.set_content(error_body("upstream body: " + err, "server_error"),
-                        "application/json");
+    if (busy) {
+        // Every candidate was busy: pass the last 503 on, Retry-After
+        // and all.
+        copy_head(busy_head);
+        res.set_content(std::move(busy_body), busy_type);
         return;
     }
-    res.set_content(std::move(body), content_type);
+    res.status = 502;
+    res.set_content(error_body("upstream " + last_error, "server_error"),
+                    "application/json");
 }
 
 }  // namespace locus::router
