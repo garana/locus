@@ -248,6 +248,8 @@ if(Vulkan_FOUND)
             matvec_q8_0_p=matvec_q8_0:BATCHED,PAIRS
             matvec_f32_n=matvec_q8_0_n:TYPE_F32
             matvec_q8_0_n_glu=matvec_q8_0_n:SWIGLU
+            matvec_q8_0_n2=matvec_q8_0_n:NT2
+            matvec_q8_0_n2_glu=matvec_q8_0_n:SWIGLU,NT2
             matvec_q8_0_n_ng=matvec_q8_0_n:NOGUARD
             matvec_q8_0_n_glu_ng=matvec_q8_0_n:SWIGLU,NOGUARD
             matvec_q8_0_glu_p=matvec_q8_0:BATCHED,SWIGLU,PAIRS
