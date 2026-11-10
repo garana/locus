@@ -117,7 +117,12 @@ SIMD kernels follow the scheme of the sibling `pbw` project: each
 variant (neon, sse4, avx2) is its own source file, compiled with only
 that variant's flags and gated at configure time;
 `locus::sys::detect()` probes the running machine. One binary stays
-portable across CPU generations. Vulkan shaders are compiled to
+portable across CPU generations. When the compiler's default arm64
+target lacks the 8-bit dot product (GCC on the Pi 5), the neon kernels
+are also built with it (`matvec_neon_dotprod.cpp`), and the neon
+backend uses that build on a CPU that reports dotprod; the integer
+sums are exact either way, so the results are the same. Vulkan
+shaders are compiled to
 SPIR-V and embedded at build time.
 
 ### 4.4 GGUF loader

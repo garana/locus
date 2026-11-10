@@ -1009,6 +1009,75 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
         }
     }
 }
+
+#if defined(LOCUS_HAS_NEON_DOTPROD_VARIANT)
+TEST_CASE("neon dotprod variant is bit-identical to the baseline neon",
+          "[ops][batch][neon]") {
+    if (!locus::sys::detect().dotprod) {
+        SKIP("CPU has no dotprod");
+    }
+    // The four entry points of matvec_neon_dotprod.cpp against the
+    // baseline build, on the types whose kernels use 8-bit dots (and
+    // F32 for the f32 paths), one token and a batch of 7.
+    constexpr std::uint32_t rows = 5, n = 7;
+    std::mt19937 rng(103);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    const std::uint32_t cols = 2 * 256;
+    std::vector<float> xb(std::size_t{n} * cols);
+    for (auto& v : xb) {
+        v = xd(rng);
+    }
+    std::vector<std::vector<std::byte>> store;
+    std::vector<Mat> mats;
+    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+        std::vector<std::byte> w;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto row = k_quant_row(t, 2, 300 + r);
+            w.insert(w.end(), row.begin(), row.end());
+        }
+        store.push_back(std::move(w));
+        mats.push_back(Mat{t, store.back().data(), rows, cols});
+    }
+    {
+        std::uniform_int_distribution<int> byte_d(0, 255);
+        std::vector<std::byte> w(std::size_t{rows} * (cols / 32) * 34);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / 34; ++bl) {
+            const std::uint16_t d = f32_to_f16(0.01f);
+            std::memcpy(w.data() + bl * 34, &d, 2);
+        }
+        store.push_back(std::move(w));
+        mats.push_back(Mat{TensorType::kQ8_0, store.back().data(), rows, cols});
+        std::vector<std::byte> f(std::size_t{rows} * cols * 4);
+        for (std::size_t i = 0; i < std::size_t{rows} * cols; ++i) {
+            const float v = xd(rng);
+            std::memcpy(f.data() + i * 4, &v, 4);
+        }
+        store.push_back(std::move(f));
+        mats.push_back(Mat{TensorType::kF32, store.back().data(), rows, cols});
+    }
+    const std::span<const float> x1(xb.data(), cols);
+    for (const Mat& m : mats) {
+        INFO("type " << static_cast<int>(m.type));
+        std::vector<float> a(rows), b(rows);
+        matvec_neon(m, x1, a);
+        neon_dotprod::matvec_neon(m, x1, b);
+        REQUIRE(a == b);
+        matvec_neon_q8k(m, x1, a);
+        neon_dotprod::matvec_neon_q8k(m, x1, b);
+        REQUIRE(a == b);
+        std::vector<float> ab(std::size_t{rows} * n), bb(ab.size());
+        matvec_batch_neon(m, xb, ab, n);
+        neon_dotprod::matvec_batch_neon(m, xb, bb, n);
+        REQUIRE(ab == bb);
+        matvec_batch_neon_q8k(m, xb, ab, n);
+        neon_dotprod::matvec_batch_neon_q8k(m, xb, bb, n);
+        REQUIRE(ab == bb);
+    }
+}
+#endif
 #endif
 
 TEST_CASE("conv1d dense matches a hand-computed same-padded case",

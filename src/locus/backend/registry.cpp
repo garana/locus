@@ -37,6 +37,17 @@ const std::vector<Backend>& list() {
                       .matvec_batch = &matvec_batch_neon,
                       .matvec_q8k_batch = &matvec_batch_neon_q8k,
                       .prefers_q8k = true}});
+#if defined(LOCUS_HAS_NEON_DOTPROD_VARIANT)
+        // The same kernels built with sdot, on a CPU that has it
+        // (bit-identical results, faster 8-bit dots).
+        if (f.dotprod) {
+            Ops& o = b.back().ops;
+            o.matvec = &neon_dotprod::matvec_neon;
+            o.matvec_q8k = &neon_dotprod::matvec_neon_q8k;
+            o.matvec_batch = &neon_dotprod::matvec_batch_neon;
+            o.matvec_q8k_batch = &neon_dotprod::matvec_batch_neon_q8k;
+        }
+#endif
 #endif
 #if defined(__x86_64__)
         b.push_back({"avx2",
