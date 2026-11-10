@@ -470,11 +470,15 @@ guarding the default path.
   the output so far allows, over UTF-8 code points; a rule reference
   at the end of a sequence drops the caller's frame, so repetition
   does not grow the stacks, and left recursion is rejected at parse
-  time. Each step's allowed tokens come from one walk of a trie of the
-  vocabulary's bytes, cached by matcher state (inside a string the
-  state repeats). EOS is allowed only on a complete match and is the
-  only choice once nothing but whitespace can follow, so a reply ends
-  at its closing brace. With a 128k vocabulary on
+  time. A state keeps at most 4096 stacks; one that has more drops
+  the rest, logs it once and counts it in
+  `locus_grammar_stack_overflows_total`, since a dropped stack can
+  reject output the grammar allows. Each step's allowed tokens come
+  from one walk of a trie of the vocabulary's bytes, cached by matcher
+  state (inside a string the state repeats). EOS is allowed only on a
+  complete match and is the only choice once nothing but whitespace
+  can follow, so a reply ends at its closing brace. With a 128k
+  vocabulary on
   an M2 Pro (Llama 3.2 1B, CPU) a JSON Schema costs about 3.5 ms per
   token over free decoding.
 - Prompt caching: exact token-prefix keys, ref-counted block pins, LRU

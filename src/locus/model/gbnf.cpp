@@ -1,6 +1,7 @@
 #include "locus/model/gbnf.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <functional>
 #include <limits>
@@ -15,8 +16,8 @@ namespace {
 constexpr std::uint32_t kMaxRepeat = 4096;
 /** No unbounded upper limit in {m,n}. */
 constexpr std::uint32_t kInf = std::numeric_limits<std::uint32_t>::max();
-/** Ambiguous grammars can multiply stacks; keep at most this many. */
-constexpr std::size_t kMaxStacks = 4096;
+/** States that dropped stacks past the cap (gbnf_stack_overflows). */
+std::atomic<std::uint64_t> stack_overflows{0};
 
 /** One element before flattening: a character class or a rule. */
 struct Item {
@@ -520,10 +521,16 @@ void GbnfMatcher::Stacks::push(const std::vector<std::uint32_t>& s) {
     ends.push_back(static_cast<std::uint32_t>(data.size()));
 }
 
-GbnfMatcher::GbnfMatcher(std::shared_ptr<const Gbnf> g) : g_(std::move(g)) {
+GbnfMatcher::GbnfMatcher(std::shared_ptr<const Gbnf> g,
+                         std::size_t max_stacks)
+    : g_(std::move(g)), max_stacks_(std::max<std::size_t>(max_stacks, 1)) {
     cur_.assign(1, g_->start());
     expand(cur_, stacks_, 0);
-    dedup(stacks_);
+    truncated_ = dedup(stacks_);
+}
+
+std::uint64_t gbnf_stack_overflows() {
+    return stack_overflows.load(std::memory_order_relaxed);
 }
 
 void GbnfMatcher::expand(std::vector<std::uint32_t>& cur, Stacks& out,
@@ -559,9 +566,9 @@ void GbnfMatcher::expand(std::vector<std::uint32_t>& cur, Stacks& out,
     cur.push_back(p);
 }
 
-void GbnfMatcher::dedup(Stacks& s) const {
+bool GbnfMatcher::dedup(Stacks& s) const {
     const std::size_t n = s.size();
-    if (n < 2) return;
+    if (n < 2) return false;
     const auto lo = [&](std::uint32_t i) { return s.data.begin() + s.begin(i); };
     const auto hi = [&](std::uint32_t i) { return s.data.begin() + s.ends[i]; };
     order_.resize(n);
@@ -572,17 +579,31 @@ void GbnfMatcher::dedup(Stacks& s) const {
                                                       hi(b));
               });
     tmp_.clear();
-    for (std::size_t k = 0; k < n && tmp_.size() < kMaxStacks; ++k) {
+    bool dropped = false;
+    for (std::size_t k = 0; k < n; ++k) {
         const std::uint32_t i = order_[k];
         if (k > 0 && std::equal(lo(order_[k - 1]), hi(order_[k - 1]), lo(i),
                                 hi(i))) {
             continue;
+        }
+        if (tmp_.size() >= max_stacks_) {
+            dropped = true;  // a distinct stack past the cap
+            break;
         }
         tmp_.data.insert(tmp_.data.end(), lo(i), hi(i));
         tmp_.ends.push_back(static_cast<std::uint32_t>(tmp_.data.size()));
     }
     std::swap(s.data, tmp_.data);
     std::swap(s.ends, tmp_.ends);
+    if (dropped &&
+        stack_overflows.fetch_add(1, std::memory_order_relaxed) == 0) {
+        std::fprintf(stderr,
+                     "locus: a grammar state has more than %zu parse "
+                     "stacks; the rest are dropped, so the constraint may "
+                     "reject output the grammar allows\n",
+                     max_stacks_);
+    }
+    return dropped;
 }
 
 bool GbnfMatcher::viable(char32_t lo, char32_t hi) const {
@@ -640,6 +661,7 @@ bool GbnfMatcher::step(std::uint8_t b, GbnfMatcher& out) const {
         if (lo > hi || !viable(lo, hi)) return false;
         out.stacks_.data = stacks_.data;  // reuses out's capacity
         out.stacks_.ends = stacks_.ends;
+        out.truncated_ = truncated_;
         out.cp_ = cp;
         out.need_ = need;
         out.len_ = len;
@@ -660,7 +682,7 @@ bool GbnfMatcher::step(std::uint8_t b, GbnfMatcher& out) const {
         expand(cur_, out.stacks_, 0);
     }
     if (out.stacks_.size() == 0) return false;
-    dedup(out.stacks_);
+    out.truncated_ = dedup(out.stacks_) || truncated_;
     out.cp_ = 0;
     out.need_ = 0;
     out.len_ = 0;

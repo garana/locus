@@ -1445,6 +1445,10 @@ void OpenAiServer::install_routes() {
             counter("locus_completion_tokens_total",
                     "Tokens generated.",
                     completion_tokens_total_.load());
+            counter("locus_grammar_stack_overflows_total",
+                    "Grammar states (structured output) that had more "
+                    "parse stacks than the cap and dropped the rest.",
+                    model::gbnf_stack_overflows());
             counter("locus_prefix_reused_tokens_total",
                     "Prompt tokens served from the prefix cache.",
                     s.prefix_reused_tokens);
