@@ -53,6 +53,7 @@ add_library(locus
     src/locus/image/pixart_dit.cpp
     src/locus/image/pixart_sampler.cpp
     src/locus/image/dense.cpp
+    src/locus/image/lora.cpp
     src/locus/image/sd_vae.cpp
     src/locus/image/pixart_pipeline.cpp
     src/locus/image/pixart_dit_vulkan.cpp

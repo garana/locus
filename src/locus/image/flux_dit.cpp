@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -39,6 +40,22 @@ void linear1(const backend::Ops& op, const backend::Mat& w,
              std::span<float> out) {
     op.matvec(w, x, out);
     for (std::uint32_t r = 0; r < w.rows; ++r) out[r] += b[r];
+}
+
+/** One layer on one vector, with its LoRA parts: out = w x + b + LoRA. */
+template <class L>
+void run1(const backend::Ops& op, const L& l, std::span<const float> x,
+          std::span<float> out) {
+    linear1(op, l.w, l.b, x, out);
+    if (!l.lora.empty()) apply_lora(op, l.lora, x, 1, out);
+}
+
+/** One layer on n token-major rows, with its LoRA parts. */
+template <class L>
+void run(const backend::Ops& op, const L& l, std::span<const float> x,
+         std::uint32_t n, std::span<float> out) {
+    linear(op, l.w, l.b, x, n, out);
+    if (!l.lora.empty()) apply_lora(op, l.lora, x, n, out);
 }
 
 /**
@@ -237,6 +254,7 @@ FluxDit FluxDit::load(const gguf::GgufFile& g) {
         Linear l;
         l.w = backend::Mat{ti->type, g.tensor_data(*ti).data(), rows, cols};
         l.b = vec(name + ".bias", rows);
+        l.name = name;
         return l;
     };
     const auto mlp = [&](const std::string& p, std::uint32_t in) {
@@ -296,6 +314,56 @@ FluxDit FluxDit::load(const gguf::GgufFile& g) {
     return d;
 }
 
+template <class F>
+void FluxDit::each_linear(F&& fn) {
+    for (Linear* l : {&x_embed_, &ctx_embed_, &norm_out_, &proj_out_,
+                      &time_.l1, &time_.l2, &text_.l1, &text_.l2}) {
+        fn(*l);
+    }
+    if (guidance_) {
+        fn(guide_.l1);
+        fn(guide_.l2);
+    }
+    for (DoubleBlock& b : doubles_) {
+        for (Stream* s : {&b.img, &b.txt}) {
+            for (Linear* l : {&s->mod, &s->q, &s->k, &s->v, &s->out,
+                              &s->ff1, &s->ff2}) {
+                fn(*l);
+            }
+        }
+    }
+    for (SingleBlock& b : singles_) {
+        for (Linear* l : {&b.mod, &b.q, &b.k, &b.v, &b.mlp, &b.out}) {
+            fn(*l);
+        }
+    }
+}
+
+void FluxDit::set_lora(const LoraSet* set) {
+    each_linear([](Linear& l) { l.lora.clear(); });
+    has_lora_ = false;
+    if (set == nullptr || set->empty()) return;
+    std::map<std::string, Linear*, std::less<>> by_name;
+    each_linear([&](Linear& l) { by_name[l.name] = &l; });
+    for (const std::string& layer : set->layers()) {
+        const auto it = by_name.find(layer);
+        const auto fail = [&](const std::string& why) {
+            set_lora(nullptr);
+            throw std::invalid_argument("flux lora: " + layer + " " + why);
+        };
+        if (it == by_name.end()) fail("is not a linear layer of this model");
+        Linear& l = *it->second;
+        for (const LoraPart& p : set->parts(layer)) {
+            if (p.a.cols != l.w.cols || p.b.rows != l.w.rows) {
+                fail("does not fit the " + std::to_string(l.w.rows) + " x " +
+                     std::to_string(l.w.cols) + " weight");
+            }
+            l.lora.push_back(p);
+        }
+    }
+    has_lora_ = true;
+}
+
 std::vector<float> FluxDit::forward(std::span<const float> x,
                                     std::span<const float> img_ids,
                                     std::uint32_t n_img,
@@ -321,9 +389,9 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
     const auto embed = [&](const Mlp& m, std::span<const float> in,
                            std::vector<float>& acc) {
         std::vector<float> h(w), o(w);
-        linear1(op, m.l1.w, m.l1.b, in, h);
+        run1(op, m.l1, in, h);
         for (float& v : h) v = silu(v);
-        linear1(op, m.l2.w, m.l2.b, h, o);
+        run1(op, m.l2, h, o);
         for (std::uint32_t i = 0; i < w; ++i) acc[i] += o[i];
     };
     std::vector<float> temb(w, 0.0f);
@@ -343,7 +411,9 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
               ids.begin() + static_cast<std::ptrdiff_t>(n_txt) * 3);
     std::vector<float> cosv, sinv;
     rope(ids, n, cosv, sinv);
-    if (&op == &backend::vulkan_image_ops() &&
+    // The whole-step GPU forward has no LoRA side product yet (i#372
+    // step 3), so a model with LoRAs runs per op instead.
+    if (!has_lora_ && &op == &backend::vulkan_image_ops() &&
         backend::VulkanSeq::available()) {
         const char* env = std::getenv("LOCUS_FLUX_GPU");
         if (env == nullptr || std::string(env) != "0") {
@@ -353,8 +423,8 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
     }
 
     std::vector<float> img(std::size_t{n_img} * w), txt(std::size_t{n_txt} * w);
-    linear(op, x_embed_.w, x_embed_.b, x, n_img, img);
-    linear(op, ctx_embed_.w, ctx_embed_.b, text, n_txt, txt);
+    run(op, x_embed_, x, n_img, img);
+    run(op, ctx_embed_, text, n_txt, txt);
 
     const std::size_t nw = std::size_t{n} * w;
     std::vector<float> q(nw), k(nw), v(nw), att(nw), nrm(nw), o(nw);
@@ -369,9 +439,9 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
         const auto sub = [&](std::vector<float>& b) {
             return std::span<float>(b).subspan(at, len);
         };
-        linear(op, s.q.w, s.q.b, in, rows, sub(q));
-        linear(op, s.k.w, s.k.b, in, rows, sub(k));
-        linear(op, s.v.w, s.v.b, in, rows, sub(v));
+        run(op, s.q, in, rows, sub(q));
+        run(op, s.k, in, rows, sub(k));
+        run(op, s.v, in, rows, sub(v));
         head_rms_norm(sub(q), rows, nh, hd, eps_, s.q_norm);
         head_rms_norm(sub(k), rows, nh, hd, eps_, s.k_norm);
     };
@@ -385,21 +455,21 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
         const auto a = std::span<const float>(att).subspan(
             std::size_t{row0} * w, len);
         auto ob = std::span<float>(o).subspan(0, len);
-        linear(op, s.out.w, s.out.b, a, rows, ob);
+        run(op, s.out, a, rows, ob);
         gated_add(h, ob, &mod[2 * w], rows, w);
         auto nb = std::span<float>(nrm).subspan(0, len);
         ln_modulate(h, rows, w, eps_, &mod[3 * w], &mod[4 * w], nb);
         auto fb = std::span<float>(ff).subspan(0, std::size_t{rows} * ffn_);
-        linear(op, s.ff1.w, s.ff1.b, nb, rows, fb);
+        run(op, s.ff1, nb, rows, fb);
         for (float& z : fb) z = gelu_tanh(z);
-        linear(op, s.ff2.w, s.ff2.b, fb, rows, ob);
+        run(op, s.ff2, fb, rows, ob);
         gated_add(h, ob, &mod[5 * w], rows, w);
     };
 
     for (std::size_t bi = 0; bi < doubles_.size(); ++bi) {
         const DoubleBlock& b = doubles_[bi];
-        linear1(op, b.img.mod.w, b.img.mod.b, st, mod_i);
-        linear1(op, b.txt.mod.w, b.txt.mod.b, st, mod_t);
+        run1(op, b.img.mod, st, mod_i);
+        run1(op, b.txt.mod, st, mod_t);
         auto ni = std::span<float>(nrm).subspan(0, std::size_t{n_img} * w);
         ln_modulate(img, n_img, w, eps_, &mod_i[0], &mod_i[w], ni);
         qkv(b.img, ni, n_img, n_txt);
@@ -426,12 +496,12 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
     std::vector<float> cat(std::size_t{n} * (w + ffn_));
     for (std::size_t bi = 0; bi < singles_.size(); ++bi) {
         const SingleBlock& b = singles_[bi];
-        linear1(op, b.mod.w, b.mod.b, st, mod);
+        run1(op, b.mod, st, mod);
         ln_modulate(h, n, w, eps_, &mod[0], &mod[w], nrm);
-        linear(op, b.mlp.w, b.mlp.b, nrm, n, ff);
-        linear(op, b.q.w, b.q.b, nrm, n, q);
-        linear(op, b.k.w, b.k.b, nrm, n, k);
-        linear(op, b.v.w, b.v.b, nrm, n, v);
+        run(op, b.mlp, nrm, n, ff);
+        run(op, b.q, nrm, n, q);
+        run(op, b.k, nrm, n, k);
+        run(op, b.v, nrm, n, v);
         head_rms_norm(q, n, nh, hd, eps_, b.q_norm);
         head_rms_norm(k, n, nh, hd, eps_, b.k_norm);
         apply_rope(q, n, nh, hd, cosv, sinv);
@@ -445,7 +515,7 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
                 c[w + i] = gelu_tanh(ff[t * ffn_ + i]);
             }
         });
-        linear(op, b.out.w, b.out.b, cat, n, o);
+        run(op, b.out, cat, n, o);
         gated_add(h, o, &mod[2 * w], n, w);
         if (trace != nullptr && bi == 0) trace->single0 = h;
     }
@@ -453,13 +523,13 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
     // norm_out (AdaLayerNormContinuous: scale, then shift) on the image
     // rows, then proj_out.
     std::vector<float> ss(std::size_t{2} * w);
-    linear1(op, norm_out_.w, norm_out_.b, st, ss);
+    run1(op, norm_out_, st, ss);
     const auto hi = std::span<const float>(h).subspan(
         std::size_t{n_txt} * w, std::size_t{n_img} * w);
     auto ni = std::span<float>(nrm).subspan(0, std::size_t{n_img} * w);
     ln_modulate(hi, n_img, w, eps_, &ss[w], &ss[0], ni);
     std::vector<float> out(std::size_t{n_img} * in_ch_);
-    linear(op, proj_out_.w, proj_out_.b, ni, n_img, out);
+    run(op, proj_out_, ni, n_img, out);
     return out;
 }
 

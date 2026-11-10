@@ -2,11 +2,13 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
+#include "locus/image/lora.hpp"
 
 namespace locus::image {
 
@@ -104,6 +106,22 @@ class FluxDit {
                                Trace* trace = nullptr) const;
 
     /**
+     * Attaches LoRAs (i#372): each linear layer some LoRA in set changes
+     * adds strength * B (A x) to its output, on the same backend ops.
+     * A model with LoRAs runs the per-op path, not the whole-step GPU
+     * forward. nullptr, or an empty set, detaches them.
+     *
+     * @param set The LoRAs; it and its GGUFs must outlive the attachment.
+     * @throws std::invalid_argument when a LoRA layer is not a linear
+     *     layer of this model, or its A or B does not fit the weight;
+     *     the model is left without LoRAs.
+     */
+    void set_lora(const LoraSet* set);
+
+    /** @returns Whether LoRAs are attached. */
+    bool has_lora() const { return has_lora_; }
+
+    /**
      * The RoPE angles' cosines and sines for each token, as diffusers'
      * FluxPosEmbed: per axis i of width d_i, frequency j of the axis is
      * theta^(-2 j / d_i), computed in double; each angle is repeated
@@ -130,10 +148,21 @@ class FluxDit {
                                       const std::vector<float>& sinv,
                                       Trace* trace) const;
 
+  public:
+    /** One linear layer, with the LoRA parts set_lora attached. */
     struct Linear {
         backend::Mat w;
         std::vector<float> b;
+        std::string name;  ///< the GGUF weight's name without ".weight"
+        std::vector<LoraPart> lora;
     };
+
+  private:
+    /** Calls fn on every linear layer. */
+    template <class F>
+    void each_linear(F&& fn);
+
+    bool has_lora_ = false;
     struct Stream {
         Linear mod;  ///< norm1: 6 x width (shift, scale, gate, then MLP)
         Linear q, k, v, out;

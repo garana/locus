@@ -1,0 +1,24 @@
+{
+ "kohya": [
+  [
+   "kohya",
+   1.0
+  ]
+ ],
+ "diffusers_half": [
+  [
+   "diffusers",
+   0.5
+  ]
+ ],
+ "kohya_ranks": [
+  [
+   "kohya",
+   1.0
+  ],
+  [
+   "ranks",
+   0.75
+  ]
+ ]
+}

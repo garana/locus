@@ -84,6 +84,7 @@ add_executable(locus_tests
     test_flux_sampler.cpp
     test_flux_pipeline.cpp
     test_lora_convert.cpp
+    test_flux_lora.cpp
     test_pixart_dit.cpp
     test_pixart_sampler.cpp
     test_pixart_vae.cpp
