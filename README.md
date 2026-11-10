@@ -21,7 +21,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Weight formats:** GGUF with F32, F16, BF16, the legacy quants,
   K-quants, IQ quants, TQ1_0 and TQ2_0.
 - **Tokenizers:** SentencePiece, byte-level BPE (gpt2, llama3 and
-  qwen2 pretokenizers) and the T5 unigram model, with chat templates.
+  qwen2 pretokenizers), the T5 unigram model and BERT's WordPiece,
+  with chat templates.
 - **Backends:** neon, avx2, sse4 and scalar on the CPU; vulkan (the
   whole forward pass on the GPU); cuda (matvec on the GPU).
 - **Serving:** continuous batching; a paged KV cache with

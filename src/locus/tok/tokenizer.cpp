@@ -7,6 +7,7 @@
 
 #include "locus/tok/bpe_tokenizer.hpp"
 #include "locus/tok/ugm_tokenizer.hpp"
+#include "locus/tok/wpm_tokenizer.hpp"
 
 namespace locus::tok {
 
@@ -24,6 +25,10 @@ std::unique_ptr<Tokenizer> tokenizer_from_gguf(
     if (model == "t5") {
         return std::make_unique<UgmTokenizer>(
             UgmTokenizer::from_gguf(g));
+    }
+    if (model == "bert") {
+        return std::make_unique<WpmTokenizer>(
+            WpmTokenizer::from_gguf(g));
     }
     throw gguf::Error("unsupported tokenizer.ggml.model");
 }

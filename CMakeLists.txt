@@ -115,11 +115,15 @@ add_library(locus
     src/locus/tok/tokenizer.cpp
     src/locus/tok/ugm_tokenizer.cpp
     src/locus/tok/unicode.cpp
+    src/locus/tok/unicode_flags.cpp
+    src/locus/tok/wpm_tokenizer.cpp
+    third_party/llama/unicode-data.cpp
 )
 target_include_directories(locus SYSTEM PRIVATE
     third_party/ggml
     third_party/httplib
     third_party/json
+    third_party/llama
 )
 find_package(Threads REQUIRED)
 target_link_libraries(locus PUBLIC Threads::Threads)
