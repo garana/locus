@@ -13,9 +13,11 @@
 namespace locus::embed {
 
 /**
- * A dedicated embedding model (locus-server --embedding-model): a BERT
- * GGUF with its tokenizer, owning the mapping its encoder points into.
- * Task prefixes ("query: ", "search_query: ") are the client's job.
+ * An encoder model: a BERT or XLM-R GGUF with its tokenizer, owning the
+ * mapping its encoder points into. With pooling rank it is a reranker
+ * (locus-server --rerank-model, rank()), else an embedding model
+ * (--embedding-model, embed()). Task prefixes ("query: ",
+ * "search_query: ") are the client's job.
  */
 class EmbeddingModel {
   public:
@@ -50,21 +52,50 @@ class EmbeddingModel {
      * @param tokens Set to the total token count, when not null.
      * @returns One width()-float vector per input.
      * @throws std::invalid_argument when an input has more than
-     *     context() tokens; the message names the input's index.
+     *     context() tokens (the message names the input's index), or
+     *     the model is a reranker.
      */
     std::vector<std::vector<float>> embed(
         const std::vector<std::string>& inputs, const backend::Ops& op,
         std::size_t* tokens = nullptr) const;
 
+    /** @returns Whether the model is a reranker (pooling rank). */
+    bool reranker() const { return enc_.pooling() == Pooling::kRank; }
+
+    /**
+     * Scores each document against the query, as llama-server's
+     * /v1/rerank does: each pair is [BOS] query [EOS] [SEP] document
+     * [EOS], each special token when the GGUF's add_bos / add_eos /
+     * add_sep says so (XLM-R: <s> q </s></s> d </s>), encoded in
+     * passes of up to kPassTokens tokens; the score is the classifier's
+     * first raw logit. A pair longer than context() keeps the start of
+     * its document.
+     *
+     * @param tokens Set to the total token count, when not null.
+     * @returns One score per document, in their order.
+     * @throws std::invalid_argument when the model is not a reranker,
+     *     or the query alone leaves no room for a document.
+     */
+    std::vector<float> rank(const std::string& query,
+                            const std::vector<std::string>& documents,
+                            const backend::Ops& op,
+                            std::size_t* tokens = nullptr) const;
+
   private:
+    /** The special tokens of a pair; -1 = none. */
+    struct PairFormat {
+        tok::TokenId bos = -1, eos = -1, sep = -1;
+    };
+
     EmbeddingModel(std::unique_ptr<gguf::GgufFile> g,
                    std::unique_ptr<tok::Tokenizer> tok, BertEncoder enc,
-                   std::string name);
+                   std::string name, PairFormat pair);
 
     std::unique_ptr<gguf::GgufFile> gguf_;  ///< enc_ points into it
     std::unique_ptr<tok::Tokenizer> tok_;
     BertEncoder enc_;
     std::string name_;
+    PairFormat pair_;
 };
 
 }  // namespace locus::embed

@@ -28,12 +28,13 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Serving:** continuous batching; a paged KV cache with
   copy-on-write prefix sharing; f32, f16, q8 or q4 KV.
 - **API:** `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
-  `/v1/responses` (stateless), `/v1/embeddings`, `/v1/models`,
-  `/metrics`, `/health`.
+  `/v1/responses` (stateless), `/v1/embeddings`, `/v1/rerank`,
+  `/v1/models`, `/metrics`, `/health`.
 - **Embedding models:** GGUFs of arch `bert`, BERT (WordPiece) or
   XLM-R (SentencePiece), with `--embedding-model`, beside the chat
   model, on the CPU; tested with bge-small-en-v1.5, e5-small-v2 and
-  bge-m3.
+  bge-m3. A reranker (an XLM-R cross-encoder such as
+  bge-reranker-v2-m3) serves `/v1/rerank` with `--rerank-model`.
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
   penalties, seed), structured output (JSON mode, a JSON Schema, a
   regex or a GBNF grammar), prompt caching, logprobs, prompt-lookup
@@ -168,8 +169,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
-- RAG: more embedding models, nomic-bert (#502); a
-  reranker endpoint, `/v1/rerank` (#503).
+- RAG: more embedding models, nomic-bert (#502).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
 - Low priority: a quantized KV cache for MLA and DSA models (#63);
@@ -203,7 +203,9 @@ and `convert-t5-encoder.py`, plus `--lora-dir <dir>` for LoRAs from
 GGUFs from `scripts/convert-ltxv.py` and `convert-t5-encoder.py`) and
 an ffmpeg on PATH or at `--ffmpeg <path>`. A dedicated embedding model
 for `/v1/embeddings` needs `--embedding-model <bert.gguf>`; task
-prefixes such as "query: " are the client's job.
+prefixes such as "query: " are the client's job. `/v1/rerank` needs
+`--rerank-model <reranker.gguf>`, made from a transformers XLM-R
+reranker by `scripts/convert-xlmr-reranker.py`.
 
 ## Backends
 

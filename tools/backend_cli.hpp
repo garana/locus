@@ -190,6 +190,9 @@ inline constexpr const char* kCommonHelp =
     "  --embedding-model P locus-server: serve /v1/embeddings with the\n"
     "                   BERT embedding GGUF at path P (CPU), listed in\n"
     "                   /v1/models by its file name\n"
+    "  --rerank-model P locus-server: serve /v1/rerank with the\n"
+    "                   reranker GGUF at path P (CPU; from\n"
+    "                   scripts/convert-xlmr-reranker.py)\n"
     "  --max-tokens N   locus-server: cap one request's output at N\n"
     "                   tokens (default 1024); also the length of a\n"
     "                   /v1/responses reply that sets no\n"
@@ -302,6 +305,9 @@ struct BackendArgs {
     /** From --embedding-model P: path to a BERT embedding GGUF for
      * locus-server's /v1/embeddings; empty = the chat model embeds. */
     std::string embedding_model;
+    /** From --rerank-model P: path to a reranker GGUF for
+     * locus-server's /v1/rerank; empty = the endpoint answers 503. */
+    std::string rerank_model;
     /** From --max-tokens N: per-request output-token cap (0 = the
      * server default). */
     std::uint32_t max_tokens = 0;
@@ -442,6 +448,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.embedding_model = argv[++i];
         } else if (a.rfind("--embedding-model=", 0) == 0) {
             out.embedding_model = std::string(a.substr(18));
+        } else if (a == "--rerank-model" && i + 1 < argc) {
+            out.rerank_model = argv[++i];
+        } else if (a.rfind("--rerank-model=", 0) == 0) {
+            out.rerank_model = std::string(a.substr(15));
         } else if (a == "--max-tokens" && i + 1 < argc) {
             number("--max-tokens", argv[++i], out.max_tokens);
         } else if (a.rfind("--max-tokens=", 0) == 0) {

@@ -918,6 +918,102 @@ TEST_CASE("embedding model serves embeddings beside the chat model",
     }
 }
 
+TEST_CASE("rerank endpoint orders documents by relevance",
+          "[server][e2e]") {
+    const std::string rr = std::string(LOCUS_SOURCE_DIR) +
+                           "/tests/models/bge-reranker-v2-m3-q8_0.gguf";
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    SECTION("without --rerank-model the endpoint is a 503") {
+        TestServer ts(model, tok);
+        httplib::Client client("127.0.0.1", ts.port);
+        json req{{"query", "q"}, {"documents", json::array({"d"})}};
+        auto res = client.Post("/v1/rerank", req.dump(), "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+    }
+    if (!std::filesystem::exists(rr)) {
+        SKIP("bge-reranker-v2-m3-q8_0.gguf absent; see "
+             "scripts/convert-xlmr-reranker.py");
+    }
+    locus::server::OpenAiServer::Options opt;
+    opt.rerank_model_path = rr;
+    TestServer ts(model, tok, opt);
+    httplib::Client client("127.0.0.1", ts.port);
+    const json docs = json::array(
+        {"hi", "The giant panda is a bear species endemic to China.",
+         json{{"text", "Paris is the capital of France."}}});
+
+    SECTION("best first, top_n and return_documents") {
+        json req{{"model", "bge-reranker-v2-m3-q8_0.gguf"},
+                 {"query", "what is panda?"},
+                 {"documents", docs},
+                 {"top_n", 2},
+                 {"return_documents", true}};
+        for (const char* path : {"/v1/rerank", "/rerank"}) {
+            auto res = client.Post(path, req.dump(), "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            const auto body = json::parse(res->body);
+            REQUIRE(body["model"] == "bge-reranker-v2-m3-q8_0.gguf");
+            const auto r = body["results"];
+            REQUIRE(r.size() == 2);
+            REQUIRE(r[0]["index"] == 1);
+            REQUIRE(r[0]["relevance_score"].get<double>() > 0.0);
+            REQUIRE(r[1]["relevance_score"].get<double>() <
+                    r[0]["relevance_score"].get<double>());
+            REQUIRE(r[0]["document"]["text"] ==
+                    "The giant panda is a bear species endemic to China.");
+            REQUIRE(body["usage"]["prompt_tokens"].get<int>() > 0);
+        }
+        auto models = client.Get("/v1/models");
+        REQUIRE(models);
+        const auto m = json::parse(models->body);
+        REQUIRE(m["data"].size() == 2);
+        REQUIRE(m["data"][1]["id"] == "bge-reranker-v2-m3-q8_0.gguf");
+        REQUIRE(m["locus_kinds"].back() == "rerank");
+    }
+
+    SECTION("all documents without top_n, no text without asking") {
+        json req{{"query", "what is panda?"}, {"documents", docs}};
+        auto res = client.Post("/v1/rerank", req.dump(), "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto r = json::parse(res->body)["results"];
+        REQUIRE(r.size() == 3);
+        REQUIRE(!r[0].contains("document"));
+    }
+
+    SECTION("bad requests are a 400") {
+        const std::vector<json> bad = {
+            json{{"documents", docs}},
+            json{{"query", "q"}},
+            json{{"query", "q"}, {"documents", json::array()}},
+            json{{"query", "q"}, {"documents", json::array({1})}},
+            json{{"query", "q"}, {"documents", docs}, {"top_n", 0}},
+            json{{"query", 3}, {"documents", docs}},
+        };
+        for (const auto& req : bad) {
+            INFO(req.dump());
+            auto res =
+                client.Post("/v1/rerank", req.dump(), "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 400);
+        }
+        json many{{"query", "q"},
+                  {"documents", json(std::vector<std::string>(1001, "d"))}};
+        auto res = client.Post("/v1/rerank", many.dump(), "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 400);
+        REQUIRE(res->body.find("1000-document limit") != std::string::npos);
+    }
+}
+
 // --image-model picks FLUX.1 when a FLUX-only part (flux, clip_text) is
 // there, so a FLUX set missing its DiT names the FLUX parts; otherwise
 // PixArt, whose error names both sets.

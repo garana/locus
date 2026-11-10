@@ -803,6 +803,22 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             throw gguf::Error("--embedding-model " + bert_->name() +
                               " has the chat model's name");
         }
+        if (bert_->reranker()) {
+            throw gguf::Error("--embedding-model " + bert_->name() +
+                              " is a reranker; pass it as --rerank-model");
+        }
+    }
+    if (!opt_.rerank_model_path.empty()) {
+        rerank_ = embed::EmbeddingModel::load(opt_.rerank_model_path);
+        if (!rerank_->reranker()) {
+            throw gguf::Error("--rerank-model " + rerank_->name() +
+                              " is not a reranker (pooling_type rank)");
+        }
+        if (rerank_->name() == opt_.model_name ||
+            (bert_ && rerank_->name() == bert_->name())) {
+            throw gguf::Error("--rerank-model " + rerank_->name() +
+                              " has another model's name");
+        }
     }
     if (!opt_.audio_decoder_path.empty()) {
         auto g = gguf::GgufFile::open(opt_.audio_decoder_path);
@@ -1304,6 +1320,9 @@ OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
         if (path == "/v1/embeddings") {
             return Route::kEmbeddings;
         }
+        if (path == "/v1/rerank" || path == "/rerank") {
+            return Route::kRerank;
+        }
         if (path == "/v1/audio/speech") {
             return Route::kAudioSpeech;
         }
@@ -1342,7 +1361,8 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
         std::vector<std::string>{
             opt_.metrics_path, "/health", "/v1/models", "/v1/models/",
             "/v1/completions", "/v1/chat/completions", "/v1/messages",
-            "/v1/responses", "/v1/embeddings", "/v1/audio/speech",
+            "/v1/responses", "/v1/embeddings", "/v1/rerank", "/rerank",
+            "/v1/audio/speech",
             "/v1/images/generations", "/v1/images/edits"});
     cfg.metrics = http_metrics_;
     http_ = std::make_unique<http::Server>(std::move(cfg), route_handler_,
@@ -1394,8 +1414,9 @@ void OpenAiServer::install_routes() {
                                           {"object", "model"},
                                           {"created", 0},
                                           {"owned_by", "locus"}}});
-            if (bert_) {
-                data.push_back({{"id", bert_->name()},
+            for (const auto* m : {bert_.get(), rerank_.get()}) {
+                if (m == nullptr) continue;
+                data.push_back({{"id", m->name()},
                                 {"object", "model"},
                                 {"created", 0},
                                 {"owned_by", "locus"}});
@@ -1405,6 +1426,7 @@ void OpenAiServer::install_routes() {
             if (janus_ || pixart_ || flux_) kinds.push_back("image");
             if (ltxv_) kinds.push_back("video");
             if (snac_) kinds.push_back("speech");
+            if (rerank_) kinds.push_back("rerank");
             res.set_content(
                 json{{"object", "list"},
                      {"data", data},
@@ -1420,7 +1442,8 @@ void OpenAiServer::install_routes() {
             const std::string model_id =
                 req.path.substr(std::string("/v1/models/").size());
             if (model_id != opt_.model_name &&
-                !(bert_ && model_id == bert_->name())) {
+                !(bert_ && model_id == bert_->name()) &&
+                !(rerank_ && model_id == rerank_->name())) {
                 res.status = 404;
                 res.set_content(
                     make_error("model not found").dump(-1, ' ', false, kLossy),
@@ -2428,6 +2451,103 @@ void OpenAiServer::install_routes() {
                 res.set_content(
                     make_error(e.what()).dump(-1, ' ', false, kLossy),
                     "application/json");
+            }
+    };
+
+    // POST /v1/rerank (and /rerank), the shape Jina, Cohere and
+    // llama-server share: {query, documents, top_n?, return_documents?}
+    // -> {results: [{index, relevance_score[, document]}]}, best first,
+    // top_n of them (all by default). The score is the reranker's raw
+    // logit, as llama-server gives it. 503 without --rerank-model.
+    auto handle_rerank = [this](const http::Request& req,
+                                http::ServerResponse& res,
+                                const http::RequestContext& ctx) {
+            auth_event("create", "rerank", ctx.identity);
+            const auto fail = [&](int status, const std::string& msg) {
+                res.status = status;
+                res.set_content(make_error(msg).dump(-1, ' ', false, kLossy),
+                                "application/json");
+            };
+            if (!rerank_) {
+                fail(503, "no reranker loaded (start with --rerank-model)");
+                return;
+            }
+            try {
+                const json body = json::parse(req.body);
+                if (!body.contains("query") || !body["query"].is_string()) {
+                    throw std::invalid_argument("query must be a string");
+                }
+                if (!body.contains("documents") ||
+                    !body["documents"].is_array() ||
+                    body["documents"].empty()) {
+                    throw std::invalid_argument(
+                        "documents must be a non-empty array");
+                }
+                if (body["documents"].size() > opt_.max_rerank_documents) {
+                    throw std::invalid_argument(
+                        "documents exceeds the " +
+                        std::to_string(opt_.max_rerank_documents) +
+                        "-document limit");
+                }
+                // A document is a string or, as Jina sends it, {text}.
+                std::vector<std::string> docs;
+                for (const auto& d : body["documents"]) {
+                    if (d.is_string()) {
+                        docs.push_back(d.get<std::string>());
+                    } else if (d.is_object() && d.contains("text") &&
+                               d["text"].is_string()) {
+                        docs.push_back(d["text"].get<std::string>());
+                    } else {
+                        throw std::invalid_argument(
+                            "a document must be a string or {\"text\": "
+                            "string}");
+                    }
+                }
+                std::size_t top_n = docs.size();
+                if (body.contains("top_n") && !body["top_n"].is_null()) {
+                    if (!body["top_n"].is_number_integer() ||
+                        body["top_n"].get<std::int64_t>() < 1) {
+                        throw std::invalid_argument(
+                            "top_n must be a positive integer");
+                    }
+                    top_n = std::min(
+                        top_n, static_cast<std::size_t>(
+                                   body["top_n"].get<std::int64_t>()));
+                }
+                const bool with_docs =
+                    body.value("return_documents", false) == true;
+                std::size_t tokens = 0;
+                std::vector<float> scores;
+                {
+                    std::lock_guard<std::mutex> lk(rerank_mu_);
+                    scores = rerank_->rank(body["query"].get<std::string>(),
+                                           docs, backend::best_backend().ops,
+                                           &tokens);
+                }
+                std::vector<std::size_t> order(docs.size());
+                for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+                std::stable_sort(order.begin(), order.end(),
+                                 [&](std::size_t a, std::size_t b) {
+                                     return scores[a] > scores[b];
+                                 });
+                json results = json::array();
+                for (std::size_t k = 0; k < top_n; ++k) {
+                    const std::size_t i = order[k];
+                    json r{{"index", i}, {"relevance_score", scores[i]}};
+                    if (with_docs) r["document"] = {{"text", docs[i]}};
+                    results.push_back(std::move(r));
+                }
+                res.set_content(
+                    json{{"object", "list"},
+                         {"model", rerank_->name()},
+                         {"results", results},
+                         {"usage",
+                          {{"prompt_tokens", tokens},
+                           {"total_tokens", tokens}}}}
+                        .dump(-1, ' ', false, kLossy),
+                    "application/json");
+            } catch (const std::exception& e) {
+                fail(400, e.what());
             }
     };
 
@@ -3721,7 +3841,7 @@ void OpenAiServer::install_routes() {
     route_handler_ = [this, handle_health, handle_models,
                       handle_model_by_id, handle_metrics, handle,
                       handle_messages, handle_responses, handle_embeddings,
-                      handle_audio, handle_images, handle_edits,
+                      handle_rerank, handle_audio, handle_images, handle_edits,
                       handle_videos, handle_video_by_id,
                       handle_video_content](
                          const http::Request& req, http::ServerResponse& res,
@@ -3736,6 +3856,7 @@ void OpenAiServer::install_routes() {
             case Route::kMessages:    handle_messages(req, res, ctx); break;
             case Route::kResponses:   handle_responses(req, res, ctx); break;
             case Route::kEmbeddings:  handle_embeddings(req, res, ctx); break;
+            case Route::kRerank:      handle_rerank(req, res, ctx); break;
             case Route::kAudioSpeech: handle_audio(req, res, ctx); break;
             case Route::kImages:      handle_images(req, res, ctx); break;
             case Route::kImageEdits:  handle_edits(req, res, ctx); break;

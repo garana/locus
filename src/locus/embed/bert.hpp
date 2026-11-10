@@ -42,7 +42,8 @@ class BertEncoder {
     /**
      * @param g A GGUF whose general.architecture is "bert".
      * @throws gguf::Error on a missing key, a missing or wrong-sized
-     *     tensor, or a pooling type other than mean, CLS or last.
+     *     tensor, or a pooling type other than mean, CLS, last or rank
+     *     (rank needs cls.output, and takes cls when present).
      */
     static BertEncoder load(const gguf::GgufFile& g);
 
@@ -68,6 +69,23 @@ class BertEncoder {
     std::vector<std::vector<float>> encode(
         std::span<const std::vector<tok::TokenId>> batch,
         const backend::Ops& op) const;
+
+    /**
+     * A reranker's scores (pooling() kRank): encode(), then the
+     * classifier on each sequence's first (CLS) state: tanh(cls x)
+     * when the model has cls, then cls.output.
+     *
+     * @returns labels() raw logits per sequence (bge-reranker-v2-m3
+     *     has one: the relevance score).
+     * @throws std::invalid_argument when the model is not a reranker,
+     *     or as encode() does.
+     */
+    std::vector<std::vector<float>> rank(
+        std::span<const std::vector<tok::TokenId>> batch,
+        const backend::Ops& op) const;
+
+    /** @returns The classifier's output count (0 unless kRank). */
+    std::uint32_t labels() const { return labels_; }
 
     /**
      * encode(), then pooling() per sequence and an L2 normalization.
@@ -113,6 +131,9 @@ class BertEncoder {
     std::vector<float> type0_;
     Norm embd_norm_;
     std::vector<Layer> layers_;
+    /** The reranker's classifier; cls_ may be absent (data null). */
+    Linear cls_, cls_out_;
+    std::uint32_t labels_ = 0;
 };
 
 }  // namespace locus::embed
