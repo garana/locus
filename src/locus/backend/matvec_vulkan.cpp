@@ -1583,7 +1583,15 @@ bool vulkan_batch_invariant() {
     int v = g_batch_invariant.load();
     if (v < 0) {
         const char* e = std::getenv("LOCUS_VK_BATCH_INVARIANT");
-        v = e != nullptr && *e != '\0' && std::string(e) != "0" ? 1 : 0;
+        if (e != nullptr && *e != '\0') {
+            v = std::string(e) == "0" ? 0 : 1;
+        } else {
+            // On by default where a lone sequence was measured to cost
+            // little in this mode: Apple GPUs (M2 Pro level, M4 Max
+            // -5%); off elsewhere (V3D -33%, others not measured).
+            v = vulkan_device_name().find("Apple") != std::string::npos ? 1
+                                                                       : 0;
+        }
         int expected = -1;
         g_batch_invariant.compare_exchange_strong(expected, v);
         v = g_batch_invariant.load();
