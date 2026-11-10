@@ -9,6 +9,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Warning flags are C++-only: nvcc does not understand -Wpedantic on
 # CUDA sources (host-side warnings go through -Xcompiler instead).
 add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>")
+# No implicit fused multiply-add (i#458): GCC and clang fuse a * b + c
+# by default wherever the target has FMA (always on arm64, never on
+# x86-64 without -mfma), so plain C++ would round differently per host.
+# Explicit FMA intrinsics in the SIMD kernels are not affected.
+add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>")
 
 add_library(locus
     src/locus/backend/cpu_ops.cpp

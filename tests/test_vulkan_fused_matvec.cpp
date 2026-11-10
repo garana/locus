@@ -363,7 +363,11 @@ TEST_CASE("vulkan MoE matvecs fold the shared experts into the routed "
                                                              n_sh * ff));
     for (std::uint32_t r = 0; r < cols; ++r) {
         want[r] += ds[r];
-        REQUIRE(out[r] == Catch::Approx(want[r]).margin(1e-4));
+        // Relative too: the shader may fuse its multiply-adds and the
+        // CPU reference (-ffp-contract=off) does not, so on a value near
+        // 6 the two part by 1.07e-4 (V3D), a relative 1.7e-5.
+        REQUIRE(out[r] ==
+                Catch::Approx(want[r]).epsilon(1e-4).margin(1e-4));
     }
     for (auto b : {gb, ub, db, sgb, sub, sdb, xb, rb, hb, ob}) {
         ctx.destroy_buffer(b);
