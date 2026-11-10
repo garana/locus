@@ -26,6 +26,13 @@ struct KvAttend {
     std::uint32_t n_heads = 0, n_kv_heads = 0, head_dim = 0;
     float kq_scale = 1.0f;
     std::uint32_t n_q = 0, base = 0;
+    /**
+     * Several sequences (batch decode): when set, query i is at position
+     * q_pos[i] of the sequence whose block table starts at
+     * blocks[q_table[i]], and base is ignored. Both hold n_q entries.
+     */
+    const std::uint32_t* q_pos = nullptr;
+    const std::uint32_t* q_table = nullptr;
     /** n_q rows of n_heads * head_dim floats, q_stride floats apart. */
     const float* q = nullptr;
     /** Out: as q. */

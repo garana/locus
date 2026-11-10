@@ -108,6 +108,36 @@ TEST_CASE("cuda attention over the KV mirror matches the host",
         }
     }
 
+    // Two sequences in one launch (batch decode): each query gets the
+    // bits of its own single-sequence launch.
+    Seq seq2;
+    REQUIRE(cache.ensure_capacity(seq2, 40));
+    for (std::uint32_t t = 0; t < 40; ++t) {
+        for (std::uint32_t i = 0; i < g.kv_dim; ++i) {
+            cache.k(seq2, layer, t)[i] = ud(rng);
+            cache.v(seq2, layer, t)[i] = ud(rng);
+        }
+    }
+    cache.sync_rows(seq2, layer, 0, 40);
+    {
+        Seq* both[] = {&seq, &seq2};
+        const std::uint32_t pos[] = {n_pos - 1, 39};
+        std::vector<float> got(2 * width);
+        REQUIRE(locus::model::device_gqa_attend_seqs(
+            cuda.ops, cache, both, layer, hp, pos, q.data(), got.data(),
+            width));
+        for (std::uint32_t t = 0; t < 2; ++t) {
+            INFO("sequence " << t);
+            std::vector<float> one(width);
+            REQUIRE(locus::model::device_gqa_attend(
+                cuda.ops, cache, *both[t], layer, hp, pos[t], 1,
+                q.data() + t * width, one.data(), width));
+            for (std::size_t j = 0; j < width; ++j) {
+                REQUIRE(same_bits(one[j], got[t * width + j]));
+            }
+        }
+    }
+
     // Without a mirror the caller attends on the host.
     PagedKvCache plain(g);
     Seq ps;

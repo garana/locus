@@ -1455,6 +1455,18 @@ void TransformerModel::forward_batch_decode(
     std::vector<float> xb2(static_cast<std::size_t>(n) * E);
     std::vector<float> gate(static_cast<std::size_t>(n) * ff);
     std::vector<float> up(static_cast<std::size_t>(n) * ff);
+    // Plain llama attention, F32 cache: the projections as batched
+    // matvecs over the sequences, as forward_batch does for one.
+    const bool plain = spec_->plain_attention && !cache.quantized();
+    const std::uint32_t hd = hp_.head_dim;
+    const std::size_t kv_dim = std::size_t{hp_.n_kv_heads} * hd;
+    const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
+    std::vector<float> qb, kb, vb;
+    if (plain) {
+        qb.resize(static_cast<std::size_t>(n) * E);
+        kb.resize(static_cast<std::size_t>(n) * kv_dim);
+        vb.resize(kb.size());
+    }
 
     StageLap lap(stage_metrics_.get());  // wall time per part (i#285)
     constexpr std::uint32_t kNoLayer = StageMetrics::kNoLayer;
@@ -1467,19 +1479,73 @@ void TransformerModel::forward_batch_decode(
 
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
-        // Attention: each token against ITS OWN sequence's cache.
-        for (std::uint32_t t = 0; t < n; ++t) {
-            const std::size_t o = static_cast<std::size_t>(t) * E;
-            apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
-                    ws.xb);
+        if (plain) {
+            // q / k / v and wo batched over the sequences (each weight
+            // read once); RoPE, the cache rows and the attention per
+            // sequence, as llama_attention does them. Byte-identical to
+            // it, and the GPU attends all the sequences in one launch.
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const std::size_t o = static_cast<std::size_t>(t) * E;
+                apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
+                           {xbf.data() + o, E});
+            }
             lap.lap(l, Stage::kNorm);
-            spec_->attention(*this, lay, cache, *seqs[t], ws, l,
-                             pos[t]);
-            matvec_mt(op, lay.wo, ws.out, ws.xb2);
-            for (std::uint32_t i = 0; i < E; ++i) {
-                x[o + i] += ws.xb2[i];
+            matvec_batch(op, lay.wq, xbf, qb, n);
+            matvec_batch(op, lay.wk, xbf, kb, n);
+            matvec_batch(op, lay.wv, xbf, vb, n);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const kv::PagedKvCache::Seq& s = *seqs[t];
+                const std::span<float> q(qb.data() + std::size_t{t} * E, E);
+                float* krow = cache.k(s, l, pos[t]);
+                float* vrow = cache.v(s, l, pos[t]);
+                std::copy_n(kb.data() + std::size_t{t} * kv_dim, kv_dim,
+                            krow);
+                std::copy_n(vb.data() + std::size_t{t} * kv_dim, kv_dim,
+                            vrow);
+                backend::rope_norm(q, hp_.n_heads, hd, pos[t],
+                                   hp_.rope_freq_base, rope_factors());
+                backend::rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd,
+                                   pos[t], hp_.rope_freq_base,
+                                   rope_factors());
+                cache.sync_rows(s, l, pos[t], 1);
+            }
+            if (!device_gqa_attend_seqs(op, cache, seqs, l, hp_, pos,
+                                        qb.data(), xb2.data(), E)) {
+                for (std::uint32_t t = 0; t < n; ++t) {
+                    const kv::PagedKvCache::Seq& s = *seqs[t];
+                    gqa_attend(
+                        qb.data() + std::size_t{t} * E,
+                        xb2.data() + std::size_t{t} * E, hp_.n_heads, hd,
+                        group, pos[t], hp_.kq_scale,
+                        [&](std::uint32_t p) -> const float* {
+                            return cache.k(s, l, p);
+                        },
+                        [&](std::uint32_t p) -> const float* {
+                            return cache.v(s, l, p);
+                        });
+                }
+            }
+            matvec_batch(op, lay.wo, xb2, qb, n);
+            for (std::size_t i = 0; i < static_cast<std::size_t>(n) * E;
+                 ++i) {
+                x[i] += qb[i];
             }
             lap.lap(l, Stage::kAttention);
+        } else {
+            // Attention: each token against ITS OWN sequence's cache.
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const std::size_t o = static_cast<std::size_t>(t) * E;
+                apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
+                           ws.xb);
+                lap.lap(l, Stage::kNorm);
+                spec_->attention(*this, lay, cache, *seqs[t], ws, l,
+                                 pos[t]);
+                matvec_mt(op, lay.wo, ws.out, ws.xb2);
+                for (std::uint32_t i = 0; i < E; ++i) {
+                    x[o + i] += ws.xb2[i];
+                }
+                lap.lap(l, Stage::kAttention);
+            }
         }
         for (std::uint32_t t = 0; t < n; ++t) {
             const std::size_t o = static_cast<std::size_t>(t) * E;

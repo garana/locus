@@ -164,4 +164,50 @@ inline bool device_gqa_attend(const backend::Ops& op,
     return op.kv_attend(a);
 }
 
+/**
+ * device_gqa_attend for n queries of n DIFFERENT sequences (batch
+ * decode): query t is at position pos[t] of *seqs[t], with its q row at
+ * q + t * q_stride and its output at out + t * q_stride. Gives each query
+ * the same bits as a device_gqa_attend call of its own.
+ *
+ * @returns false as device_gqa_attend does; the caller then attends on
+ *     the host.
+ */
+inline bool device_gqa_attend_seqs(
+    const backend::Ops& op, const kv::PagedKvCache& cache,
+    std::span<kv::PagedKvCache::Seq* const> seqs, std::uint32_t layer,
+    const Hparams& hp, std::span<const std::uint32_t> pos, const float* q,
+    float* out, std::size_t q_stride) {
+    if (op.kv_attend == nullptr || cache.mirror_data() == nullptr) {
+        return false;
+    }
+    const auto n = static_cast<std::uint32_t>(seqs.size());
+    // The sequences' block tables, one after another.
+    std::vector<std::uint32_t> blocks, table(n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        table[t] = static_cast<std::uint32_t>(blocks.size());
+        blocks.insert(blocks.end(), seqs[t]->blocks.begin(),
+                      seqs[t]->blocks.end());
+    }
+    backend::KvAttend a;
+    a.mirror = cache.mirror_data();
+    a.blocks = blocks.data();
+    a.n_blocks = static_cast<std::uint32_t>(blocks.size());
+    a.block_stride = cache.block_floats();
+    a.layer_off = cache.layer_offset(layer);
+    a.v_off = cache.layer_floats() / 2;
+    a.block_tokens = cache.geometry().block_tokens;
+    a.n_heads = hp.n_heads;
+    a.n_kv_heads = hp.n_kv_heads;
+    a.head_dim = hp.head_dim;
+    a.kq_scale = hp.kq_scale;
+    a.n_q = n;
+    a.q_pos = pos.data();
+    a.q_table = table.data();
+    a.q = q;
+    a.out = out;
+    a.q_stride = q_stride;
+    return op.kv_attend(a);
+}
+
 }  // namespace locus::model
