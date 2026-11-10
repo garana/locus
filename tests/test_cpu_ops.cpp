@@ -798,7 +798,7 @@ TEST_CASE("matvec_cuda matches the scalar reference for K-/IQ-quants",
 // matvec_cuda() calls (row-major out[r*n + t]), also past 32 tokens,
 // where it runs in 32-token slices. Not arch-guarded: gated at
 // runtime on a usable CUDA device.
-TEST_CASE("matvec_batch_cuda Q4_K/Q6_K/Q8_0 byte-identical to "
+TEST_CASE("matvec_batch_cuda Q4_K/Q5_K/Q6_K/Q8_0 byte-identical to "
           "per-token matvec_cuda (R11)",
           "[ops][batch][cuda]") {
     if (!cuda_backend_usable()) {
@@ -818,8 +818,8 @@ TEST_CASE("matvec_batch_cuda Q4_K/Q6_K/Q8_0 byte-identical to "
         for (auto& v : xb) {
             v = xd(rng);
         }
-        for (TensorType t :
-             {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0}) {
+        for (TensorType t : {TensorType::kQ4_K, TensorType::kQ5_K,
+                             TensorType::kQ6_K, TensorType::kQ8_0}) {
             std::vector<std::byte> w;
             std::uniform_int_distribution<int> qd(-127, 127);
             std::uniform_real_distribution<float> dd(0.01f, 0.2f);

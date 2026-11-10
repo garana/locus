@@ -120,15 +120,17 @@ TEST_CASE("bench: out_w_ n x matvec_cuda vs matvec_batch_cuda",
     using TT = locus::gguf::TensorType;
     const std::uint32_t rows = 32000;  // vocab
     const std::uint32_t cols = 2048;   // embd
-    // Q6_K, and Q8_0 (a tied head): 256 columns are 8 Q8_0 blocks,
-    // 272 bytes; the scales are random f16 past the first, which does
-    // not change the time.
+    // Q6_K, Q5_K, and Q8_0 (a tied head): 256 columns are 8 Q8_0
+    // blocks, 272 bytes; scales past the first are random f16, which
+    // does not change the time.
     struct Head {
         TT type;
         std::size_t bytes, d_off;
+        const char* name;
     };
-    for (const Head h :
-         {Head{TT::kQ6_K, 210, 208}, Head{TT::kQ8_0, 272, 0}}) {
+    for (const Head h : {Head{TT::kQ6_K, 210, 208, "Q6_K"},
+                         Head{TT::kQ5_K, 176, 0, "Q5_K"},
+                         Head{TT::kQ8_0, 272, 0, "Q8_0"}}) {
         auto w = make_kquant(rows, cols, h.bytes, h.d_off,
                              /*dmin_off=*/-1, 7);
         Mat m{h.type, w.data(), rows, cols};
@@ -175,7 +177,7 @@ TEST_CASE("bench: out_w_ n x matvec_cuda vs matvec_batch_cuda",
                     .count() /
                 iters;
             WARN("cuda out_w_ "
-                 << (h.type == TT::kQ8_0 ? "Q8_0" : "Q6_K") << " n=" << n
+                 << h.name << " n=" << n
                  << ": per-token=" << per_ns << "ns batched=" << bat_ns
                  << "ns speedup=" << per_ns / bat_ns << "x");
         }
