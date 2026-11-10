@@ -107,7 +107,8 @@ void check_model(const std::string& path, std::uint32_t n_gen,
                 REQUIRE(alone.first.size() == n_gen);
                 for (const std::uint32_t n : {2u, 3u, 8u}) {
                     INFO("prompt " << len << " tokens, batch of " << n);
-                    const auto got = run_and_reset(model, n, len, n_gen, vulkan);
+                    const auto got =
+                        run_and_reset(model, n, len, n_gen, vulkan);
                     CHECK(got.first == alone.first);
                     CHECK(got.second == alone.second);
                 }
@@ -128,10 +129,15 @@ TEST_CASE("a request decodes the same alone or batched",
 TEST_CASE("a request decodes the same alone or batched: Q8_0 and Q4_K_M",
           "[batch][invariance][e2e]") {
     // The scalar backend takes hours on these; stories260K covers it.
-    // On Vulkan a Q8_0 model decodes through the multi-sequence kernels
-    // alone and batched (batch-invariant mode, the default, #432).
+    // On Vulkan a Q8_0 model is batch-invariant in batch-invariant mode
+    // (#432; the default on Apple GPUs only), which this leg turns on.
     DYNAMIC_SECTION("llama-3.2-1b-q8_0.gguf") {
-        REQUIRE(locus::backend::vulkan_batch_invariant());
+        const bool was = locus::backend::vulkan_batch_invariant();
+        locus::backend::vulkan_set_batch_invariant(true);
+        struct Restore {
+            bool was;
+            ~Restore() { locus::backend::vulkan_set_batch_invariant(was); }
+        } restore{was};
         check_model(kModels + "llama-3.2-1b-q8_0.gguf", 16, false);
     }
     DYNAMIC_SECTION("llama-3.2-1b-q4_k_m.gguf") {

@@ -264,12 +264,13 @@ std::size_t vulkan_kv_pool_count();
 void vulkan_reset_state();
 
 /**
- * Batch-invariant Vulkan decode (#432): when on (the default), a lone
- * sequence also decodes through vulkan_forward_multi's kernels, so a
- * request's logits are bit-identical alone or batched; off, it takes
- * vulkan_forward's single-sequence kernels (about 5% faster alone on
- * an M4 Max, level on an M2 Pro). LOCUS_VK_BATCH_INVARIANT=0 turns it
- * off.
+ * Batch-invariant Vulkan decode (#432): when on, a lone sequence also
+ * decodes through vulkan_forward_multi's kernels, so a request's
+ * logits are bit-identical alone or batched; off, it takes
+ * vulkan_forward's single-sequence kernels. The default is per device:
+ * on for Apple GPUs, where a lone sequence costs little (level on an
+ * M2 Pro, -5% on an M4 Max), off elsewhere (-33% on V3D; others not
+ * measured). LOCUS_VK_BATCH_INVARIANT=1 / 0 overrides it.
  */
 void vulkan_set_batch_invariant(bool on);
 /** @returns Whether batch-invariant Vulkan decode is on. */

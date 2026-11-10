@@ -464,11 +464,13 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   On Vulkan it runs `vulkan_forward_multi` on groups of up to 8
   sequences (dense models with Q8_0, F32, F16 or BF16 weights; others
   run one forward per sequence; Q8_0 runs gate, up and silu_mul in one
-  dispatch and q, k and v in another). A lone sequence takes the
-  multi-sequence kernels too (batch-invariant mode, the default), so a
-  request's logits are bit-identical alone and batched;
-  `LOCUS_VK_BATCH_INVARIANT=0` (or `vulkan_set_batch_invariant`) gives
-  it the single-sequence forward instead. Q8_0 batches of 1 or 2 take
+  dispatch and q, k and v in another). In batch-invariant mode a lone
+  sequence takes the multi-sequence kernels too, so a request's
+  logits are bit-identical alone and batched. It is the default on
+  Apple GPUs, where a lone sequence costs little; elsewhere (V3D: a
+  third slower alone) a lone sequence keeps the single-sequence
+  forward. `LOCUS_VK_BATCH_INVARIANT=1` / `0` (or
+  `vulkan_set_batch_invariant`) overrides. Q8_0 batches of 1 or 2 take
   the NT 2 build of the short-batch kernel and larger ones the NT 8
   build; the builds run the same per-token arithmetic, so a
   sequence's bits do not depend on the batch (#432; a test checks the
