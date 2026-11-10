@@ -113,8 +113,8 @@ file name without `.gguf`. `lora` is one name or an array of up to 8;
 or an array of one per name; several LoRAs add up. An unknown name is
 a 400 that lists the server's LoRAs. Every LoRA is checked against the
 DiT when the server starts, so one made for another model stops it
-there. With a LoRA the DiT runs per op rather than as one GPU step, so
-the image is slower.
+there. On the GPU a LoRA adds two small matmuls per layer it changes
+to the DiT's step.
 
 With the OpenAI SDK, pass the extra fields in `extra_body`:
 

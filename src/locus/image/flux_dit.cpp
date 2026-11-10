@@ -411,9 +411,7 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
               ids.begin() + static_cast<std::ptrdiff_t>(n_txt) * 3);
     std::vector<float> cosv, sinv;
     rope(ids, n, cosv, sinv);
-    // The whole-step GPU forward has no LoRA side product yet (i#372
-    // step 3), so a model with LoRAs runs per op instead.
-    if (!has_lora_ && &op == &backend::vulkan_image_ops() &&
+    if (&op == &backend::vulkan_image_ops() &&
         backend::VulkanSeq::available()) {
         const char* env = std::getenv("LOCUS_FLUX_GPU");
         if (env == nullptr || std::string(env) != "0") {

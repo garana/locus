@@ -28,6 +28,7 @@ enum : Seq::Slot {
     kIn,     ///< packed latent, then T5 rows
     kKh,     ///< per-head K, V^T and score blocks (attention)
     kVt,
+    kLora,   ///< a LoRA's A x rows [n][rank]
 };
 constexpr Seq::Slot kScores = kIn;  // reused once the inputs are embedded
 
@@ -60,9 +61,16 @@ std::vector<float> FluxDit::forward_vulkan(std::span<const float> x,
     q.write(kIn, 0, x);
     q.write(kIn, x.size(), text);
 
+    // A layer, plus each LoRA part on it (i#372): out += strength *
+    // (s B)(A x), as the CPU path's apply_lora.
     const auto lin = [&](const Linear& l, Rows in, Rows out,
                          std::uint32_t rows) {
         q.linear(l.w, l.b, in, out, rows);
+        for (const LoraPart& p : l.lora) {
+            q.reserve(kLora, std::size_t{rows} * p.a.rows);
+            q.linear(p.a, {}, in, {kLora, 0, p.a.rows}, rows);
+            q.linear_add(p.b, {kLora, 0, p.a.rows}, out, rows, p.strength);
+        }
     };
     const auto mod = [&](const Linear& l, std::uint32_t off) {
         lin(l, {kSt, 0, 0}, {kMod, off, 0}, 1);
