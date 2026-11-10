@@ -1026,6 +1026,59 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
     }
 }
 
+TEST_CASE("neon activation quantizers are bit-identical to the scalar",
+          "[ops][neon][q8k]") {
+    // Random rows (several scales, zeros), plus rows built so that
+    // x * iscale lands exactly on k + 0.5: the round-half-to-even ties
+    // where a different rounding would show.
+    std::mt19937 rng(107);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    std::vector<std::vector<float>> rows;
+    for (const float s : {1.0f, 1e-3f, 37.5f}) {
+        std::vector<float> r(512);
+        for (auto& v : r) {
+            v = ud(rng) * s;
+        }
+        rows.push_back(r);
+    }
+    rows.emplace_back(512, 0.0f);  // an all-zero block takes the d = 0 path
+    {
+        // Q8_K: max = -127 gives iscale = 1, so x = k + 0.5 is a tie.
+        // Block 2 puts its maximum in the middle (first occurrence).
+        std::vector<float> r(512);
+        for (int j = 0; j < 256; ++j) {
+            r[j] = j == 0 ? -127.0f : static_cast<float>(j % 120) - 60.5f;
+        }
+        for (int j = 256; j < 512; ++j) {
+            r[j] = j == 400 ? 99.0f : (j == 450 ? -99.0f : 0.25f * (j % 7));
+        }
+        rows.push_back(r);
+        // Q8_0: amax 127 gives d = 1, id = 1, so x = k + 0.5 is a tie.
+        std::vector<float> t(512);
+        for (int j = 0; j < 512; ++j) {
+            t[j] = j % 32 == 0 ? 127.0f : static_cast<float>(j % 50) - 24.5f;
+        }
+        rows.push_back(t);
+    }
+    for (std::size_t ri = 0; ri < rows.size(); ++ri) {
+        INFO("row " << ri);
+        const std::span<const float> x(rows[ri]);
+        std::vector<float> da(2), db(2);
+        std::vector<std::int8_t> qa(512), qb(512);
+        std::vector<std::int16_t> sa(32), sb(32);
+        quantize_activation_q8k(x, da.data(), qa.data(), sa.data());
+        quantize_activation_q8k_neon(x, db.data(), qb.data(), sb.data());
+        REQUIRE(da == db);
+        REQUIRE(qa == qb);
+        REQUIRE(sa == sb);
+        std::vector<float> ea(16), eb(16);
+        quantize_activation_q8_0(x, ea.data(), qa.data());
+        quantize_activation_q8_0_neon(x, eb.data(), qb.data());
+        REQUIRE(ea == eb);
+        REQUIRE(qa == qb);
+    }
+}
+
 #if defined(LOCUS_HAS_NEON_DOTPROD_VARIANT)
 TEST_CASE("neon dotprod variant is bit-identical to the baseline neon",
           "[ops][batch][neon]") {
