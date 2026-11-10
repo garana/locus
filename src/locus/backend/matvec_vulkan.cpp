@@ -1836,6 +1836,11 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
  * (fused wkv_b goes through the F32-dequant path). */
 bool gpu_weights_ok(const model::TransformerModel& m) {
     const auto& hp = m.hparams();
+    // The full forward needs every layer, the embedding and the head;
+    // a pipeline stage's slice has only some of them (i#29).
+    if (m.layer_begin() != 0 || m.layer_end() != hp.n_layers) {
+        return false;
+    }
     const bool mla = hp.arch == model::Arch::kDeepseek2;
     for (const auto& l : m.layers()) {
         // The full GPU forward implements the llama / deepseek2
