@@ -64,12 +64,14 @@ class FluxPipeline {
 
     /**
      * Checks that a LoRA set fits this model's DiT, without keeping it
-     * attached: for a server to refuse a bad --lora-dir at startup.
+     * attached: for a server to refuse a bad --lora-dir at startup. It
+     * attaches the set and detaches it, so it must not run while
+     * generate does (that would detach the request's LoRAs).
      *
      * @throws std::invalid_argument when a LoRA layer is not a linear
      *     layer of the DiT, or its matrices do not fit the weight.
      */
-    void check_lora(const LoraSet& set) const {
+    void check_lora(const LoraSet& set) {
         dit_->set_lora(&set);
         dit_->set_lora(nullptr);
     }
