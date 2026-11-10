@@ -4022,11 +4022,13 @@ __global__ void gqa_attend_partial(
     const float* __restrict__ kv, const std::uint32_t* __restrict__ blocks,
     std::size_t block_stride, std::size_t layer_off, std::size_t v_off,
     std::uint32_t bt, std::uint32_t kv_dim, std::uint32_t hd, float scale,
-    std::uint32_t base, const float* __restrict__ q, std::size_t q_stride,
-    float* __restrict__ part) {
+    const std::uint32_t* __restrict__ qpos,
+    const std::uint32_t* __restrict__ qtab, const float* __restrict__ q,
+    std::size_t q_stride, float* __restrict__ part) {
     extern __shared__ float sh[];
     const std::uint32_t kvh = blockIdx.x, qi = blockIdx.y, c = blockIdx.z;
-    const std::uint32_t npos = base + qi + 1;
+    const std::uint32_t npos = qpos[qi] + 1;
+    blocks += qtab[qi];  // this query's sequence
     const std::uint32_t t0 = c * kAttendChunk;
     if (t0 >= npos) {
         return;  // the whole block leaves: no barrier is skipped
@@ -4149,11 +4151,12 @@ __global__ void gqa_attend_partial(
  */
 __global__ void gqa_attend_combine(const float* __restrict__ part,
                                    std::uint32_t hd, std::uint32_t group,
-                                   std::uint32_t base, std::uint32_t chunks,
+                                   const std::uint32_t* __restrict__ qpos,
+                                   std::uint32_t chunks,
                                    float* __restrict__ out,
                                    std::size_t q_stride) {
     const std::uint32_t kvh = blockIdx.x, qi = blockIdx.y;
-    const std::uint32_t npos = base + qi + 1;
+    const std::uint32_t npos = qpos[qi] + 1;
     const std::uint32_t used = (npos + kAttendChunk - 1) / kAttendChunk;
     const std::size_t head0 = std::size_t{kvh} * group * hd;
     const float* pq =
@@ -4183,8 +4186,9 @@ struct AttendScratch {
     void* out = nullptr;
     void* blocks = nullptr;
     void* part = nullptr;
+    void* meta = nullptr;  // n_q positions, then n_q table offsets
     std::size_t q_bytes = 0, out_bytes = 0, blocks_bytes = 0,
-                part_bytes = 0;
+                part_bytes = 0, meta_bytes = 0;
 
     static bool grow(void*& p, std::size_t& have, std::size_t want) {
         if (want <= have) {
@@ -4216,10 +4220,20 @@ bool cuda_kv_attend(const KvAttend& a) {
         return false;
     }
     const std::uint32_t group = a.n_heads / a.n_kv_heads;
-    const std::uint32_t max_pos = a.base + a.n_q;
-    if (std::size_t{max_pos} >
-        std::size_t{a.n_blocks} * a.block_tokens) {
-        return false;  // a position past the block table
+    // Each query's position and the start of its sequence's block table:
+    // one sequence (base + i, 0) or several (q_pos, q_table). The same
+    // numbers give the same bits whichever way they came.
+    std::vector<std::uint32_t> meta(std::size_t{a.n_q} * 2);
+    std::uint32_t max_pos = 0;
+    for (std::uint32_t i = 0; i < a.n_q; ++i) {
+        const std::uint32_t pos = a.q_pos ? a.q_pos[i] : a.base + i;
+        const std::uint32_t tab = a.q_table ? a.q_table[i] : 0;
+        if (std::size_t{tab} + pos / a.block_tokens >= a.n_blocks) {
+            return false;  // a position past the block table
+        }
+        meta[i] = pos;
+        meta[a.n_q + i] = tab;
+        max_pos = std::max(max_pos, pos + 1);
     }
     if ((group != 1 && group != 2 && group != 4 && group != 8) ||
         a.head_dim > kAttendThreads ||
@@ -4246,23 +4260,31 @@ bool cuda_kv_attend(const KvAttend& a) {
                              a.n_blocks * sizeof(std::uint32_t)) ||
         !AttendScratch::grow(s.part, s.part_bytes,
                              std::size_t{a.n_q} * a.n_heads * chunks *
-                                 (a.head_dim + 2) * sizeof(float))) {
+                                 (a.head_dim + 2) * sizeof(float)) ||
+        !AttendScratch::grow(s.meta, s.meta_bytes,
+                             meta.size() * sizeof(std::uint32_t))) {
         return false;
     }
     if (!cuda_ok(cudaMemcpy(s.q, a.q, q_bytes, cudaMemcpyHostToDevice)) ||
         !cuda_ok(cudaMemcpy(s.blocks, a.blocks,
                             a.n_blocks * sizeof(std::uint32_t),
+                            cudaMemcpyHostToDevice)) ||
+        !cuda_ok(cudaMemcpy(s.meta, meta.data(),
+                            meta.size() * sizeof(std::uint32_t),
                             cudaMemcpyHostToDevice))) {
         return false;
     }
+    const auto* qpos = static_cast<const std::uint32_t*>(s.meta);
+    const auto* qtab = qpos + a.n_q;
     const auto partial = [&](auto kernel) {
         kernel<<<dim3(a.n_kv_heads, a.n_q, chunks), kAttendThreads,
                  shared>>>(
             static_cast<const float*>(a.mirror),
             static_cast<const std::uint32_t*>(s.blocks), a.block_stride,
             a.layer_off, a.v_off, a.block_tokens, a.n_kv_heads * a.head_dim,
-            a.head_dim, a.kq_scale, a.base, static_cast<const float*>(s.q),
-            a.q_stride, static_cast<float*>(s.part));
+            a.head_dim, a.kq_scale, qpos, qtab,
+            static_cast<const float*>(s.q), a.q_stride,
+            static_cast<float*>(s.part));
     };
     switch (group) {
         case 1: partial(gqa_attend_partial<1>); break;
@@ -4272,7 +4294,7 @@ bool cuda_kv_attend(const KvAttend& a) {
         default: return false;  // checked above; other sizes: host
     }
     gqa_attend_combine<<<dim3(a.n_kv_heads, a.n_q), kAttendThreads>>>(
-        static_cast<const float*>(s.part), a.head_dim, group, a.base, chunks,
+        static_cast<const float*>(s.part), a.head_dim, group, qpos, chunks,
         static_cast<float*>(s.out), a.q_stride);
     if (!cuda_ok(cudaGetLastError())) {
         return false;
