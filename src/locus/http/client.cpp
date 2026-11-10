@@ -457,6 +457,7 @@ ClientResponse Client::begin(const ClientRequest& req) {
             buf_.clear();
             if (!connect(res.error)) return res;
         }
+        res.connected = true;
         std::string err;
         if (!write_all(out, err)) {
             close();
