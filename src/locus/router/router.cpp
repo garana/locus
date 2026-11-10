@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "json.hpp"
+#include "locus/auth/helper_spawn.hpp"
 #include "locus/pipeline/net.hpp"
 
 namespace locus::router {
@@ -266,6 +267,95 @@ Router::Router(RouterConfig cfg) : cfg_(std::move(cfg)) {
         inst_.push_back(std::move(in));
         slots_.push_back(std::make_unique<Slot>());
     }
+    if (!cfg_.auth_helper_argv.empty()) {
+        std::vector<std::unique_ptr<auth::HelperConnection>> conns;
+        for (std::size_t i = 0; i < std::max<std::size_t>(1, cfg_.auth_helpers);
+             ++i) {
+            std::string err;
+            auto c = auth::spawn_helper(cfg_.auth_helper_argv, &err);
+            if (!c) {
+                throw std::runtime_error("auth helper spawn: " + err);
+            }
+            conns.push_back(std::move(c));
+        }
+        auth_ = std::make_unique<auth::AuthClient>(std::move(conns), clock_,
+                                                   cfg_.auth_cache);
+    }
+}
+
+std::map<std::string, std::string> parse_instance_keys(std::string_view text) {
+    std::map<std::string, std::string> keys;
+    std::size_t line_no = 0;
+    while (!text.empty()) {
+        const std::size_t nl = text.find('\n');
+        std::string_view line = text.substr(0, nl);
+        text.remove_prefix(nl == std::string_view::npos ? text.size() : nl + 1);
+        ++line_no;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' ||
+                                 line.back() == '\t')) {
+            line.remove_suffix(1);
+        }
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
+            line.remove_prefix(1);
+        }
+        if (line.empty() || line.front() == '#') continue;
+        const std::size_t sp = line.find_first_of(" \t");
+        std::string_view key =
+            sp == std::string_view::npos ? std::string_view{} : line.substr(sp);
+        while (!key.empty() && (key.front() == ' ' || key.front() == '\t')) {
+            key.remove_prefix(1);
+        }
+        if (sp == std::string_view::npos || key.empty() ||
+            key.find_first_of(" \t") != std::string_view::npos) {
+            throw std::invalid_argument("instance keys, line " +
+                                        std::to_string(line_no) +
+                                        ": want \"host:port key\"");
+        }
+        keys[std::string(line.substr(0, sp))] = std::string(key);
+    }
+    return keys;
+}
+
+bool Router::reject(const http::Request& head, http::ServerResponse& res) {
+    if (!auth_ || head.path == "/health") return false;
+    // "Authorization: Bearer <key>" or "x-api-key: <key>", as
+    // locus-server takes them.
+    std::string cred;
+    if (head.has_header("Authorization")) {
+        const std::string h = head.get_header_value("Authorization");
+        cred = h.rfind("Bearer ", 0) == 0 ? h.substr(7) : h;
+    } else if (head.has_header("x-api-key")) {
+        cred = head.get_header_value("x-api-key");
+    }
+    if (!cred.empty() && auth_->resolve(cred).ok) return false;
+    res.status = 401;
+    res.set_content(error_body("invalid or missing credential",
+                               "authentication_error"),
+                    "application/json");
+    return true;
+}
+
+std::vector<std::pair<std::string, std::string>> Router::upstream_headers(
+    const http::Request& req, const std::string& inst) const {
+    using UA = RouterConfig::UpstreamAuth;
+    std::vector<std::pair<std::string, std::string>> h;
+    for (const auto& [k, v] : req.headers) {
+        if (hop_by_hop(k)) continue;
+        // The client's credential goes on only in the kClient mode.
+        if (cfg_.upstream_auth != UA::kClient &&
+            (iequals(k, "Authorization") || iequals(k, "x-api-key"))) {
+            continue;
+        }
+        h.emplace_back(k, v);
+    }
+    if (cfg_.upstream_auth == UA::kKey) {
+        auto it = cfg_.instance_keys.find(inst);
+        if (it == cfg_.instance_keys.end()) it = cfg_.instance_keys.find("*");
+        if (it != cfg_.instance_keys.end()) {
+            h.emplace_back("Authorization", "Bearer " + it->second);
+        }
+    }
+    return h;
 }
 
 std::shared_ptr<http::Client> Router::take(std::size_t i) {
@@ -307,8 +397,12 @@ int Router::start() {
     sc.port = cfg_.port;
     sc.worker_threads = cfg_.worker_threads;
     server_ = std::make_unique<http::Server>(
-        sc, [this](const http::Request& req, http::ServerResponse& res,
-                   const http::RequestContext&) { handle(req, res); });
+        sc,
+        [this](const http::Request& req, http::ServerResponse& res,
+               const http::RequestContext&) { handle(req, res); },
+        // The key check on the head, before the body is read.
+        [this](const http::Request& head, http::ServerResponse& res,
+               http::RequestContext&) { return reject(head, res); });
     const int port = server_->start();
     if (port < 0) {
         server_.reset();
@@ -355,7 +449,16 @@ void Router::refresh() {
         o.connect_timeout_ms = 2000;
         o.read_timeout_ms = 5000;
         http::Client c(in.host, in.port, o);
-        const auto r = c.send(http::ClientRequest{"GET", "/v1/models", {}, ""});
+        // An instance that checks keys needs one for its /v1/models too:
+        // the instance's key from instance_keys, in any upstream mode.
+        http::ClientRequest poll{"GET", "/v1/models", {}, ""};
+        auto key = cfg_.instance_keys.find(in.host + ":" +
+                                           std::to_string(in.port));
+        if (key == cfg_.instance_keys.end()) key = cfg_.instance_keys.find("*");
+        if (key != cfg_.instance_keys.end()) {
+            poll.headers.emplace_back("Authorization", "Bearer " + key->second);
+        }
+        const auto r = c.send(poll);
         const json j = r.ok && r.head.status == 200
                            ? json::parse(r.body, nullptr, false)
                            : json();
@@ -602,9 +705,6 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
     up.method = req.method;
     up.target = target;
     up.body = req.body;
-    for (const auto& [k, v] : req.headers) {
-        if (!hop_by_hop(k)) up.headers.emplace_back(k, v);
-    }
     const auto copy_head = [&](const http::ResponseHead& h) {
         res.status = h.status;
         for (const auto& [k, v] : h.headers) {
@@ -635,6 +735,11 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
                     .count());
         });
         std::shared_ptr<http::Client> client = take(i);
+        {
+            std::lock_guard lk(mu_);
+            up.headers = upstream_headers(
+                req, inst_[i].host + ":" + std::to_string(inst_[i].port));
+        }
         const auto head = client->begin(up);
         if (!head.ok) {
             // A refused or timed-out connect means the instance is down

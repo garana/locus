@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -26,6 +28,17 @@ inline constexpr const char* kRouterUsage =
     "  --listen HOST:PORT  address to serve on (default 0.0.0.0:8080)\n"
     "  --refresh-ms N      how often each instance's /v1/models is\n"
     "                      read again (default 10000)\n"
+    "  --auth-helper PATH  check client keys with this auth helper\n"
+    "                      (locus-auth-helper is a reference one): every\n"
+    "                      request but /health needs a key it allows\n"
+    "  --auth-helper-arg A an argument for the helper (repeatable)\n"
+    "  --upstream-auth M   the credential sent to the instances: client\n"
+    "                      (the client's own, default), none, or key\n"
+    "  --instance-keys F   a file of \"HOST:PORT KEY\" lines (\"* KEY\"\n"
+    "                      for any other instance), so keys stay off\n"
+    "                      the command line: the key each instance\n"
+    "                      gets with --upstream-auth key, and with its\n"
+    "                      /v1/models poll in any mode\n"
     "  -h, --help          show this help and exit\n";
 
 /**
@@ -35,6 +48,8 @@ inline constexpr const char* kRouterUsage =
 inline std::string parse_router_args(int argc, char** argv, int first,
                                      locus::router::RouterConfig& cfg,
                                      bool& help) {
+    std::string helper;
+    std::vector<std::string> helper_args;
     for (int i = first; i < argc; ++i) {
         const std::string_view a = argv[i];
         if (a == "-h" || a == "--help") {
@@ -51,6 +66,35 @@ inline std::string parse_router_args(int argc, char** argv, int first,
                 return std::string("bad --refresh-ms: ") + argv[i];
             }
             cfg.refresh_ms = n;
+        } else if (a == "--auth-helper" && i + 1 < argc) {
+            helper = argv[++i];
+        } else if (a == "--auth-helper-arg" && i + 1 < argc) {
+            helper_args.emplace_back(argv[++i]);
+        } else if (a == "--upstream-auth" && i + 1 < argc) {
+            const std::string_view m = argv[++i];
+            using UA = locus::router::RouterConfig::UpstreamAuth;
+            if (m == "client") {
+                cfg.upstream_auth = UA::kClient;
+            } else if (m == "none") {
+                cfg.upstream_auth = UA::kNone;
+            } else if (m == "key") {
+                cfg.upstream_auth = UA::kKey;
+            } else {
+                return "bad --upstream-auth: " + std::string(m) +
+                       " (client, none or key)";
+            }
+        } else if (a == "--instance-keys" && i + 1 < argc) {
+            std::ifstream f(argv[++i]);
+            if (!f) {
+                return std::string("cannot read --instance-keys ") + argv[i];
+            }
+            std::stringstream ss;
+            ss << f.rdbuf();
+            try {
+                cfg.instance_keys = locus::router::parse_instance_keys(ss.str());
+            } catch (const std::exception& e) {
+                return e.what();
+            }
         } else if (!a.empty() && a.front() == '-') {
             return "unknown option: " + std::string(a);
         } else {
@@ -59,6 +103,19 @@ inline std::string parse_router_args(int argc, char** argv, int first,
     }
     if (!help && cfg.instances.empty()) {
         return "no instances given";
+    }
+    if (helper.empty() && !helper_args.empty()) {
+        return "--auth-helper-arg given without --auth-helper";
+    }
+    if (!helper.empty()) {
+        cfg.auth_helper_argv = {helper};
+        cfg.auth_helper_argv.insert(cfg.auth_helper_argv.end(),
+                                    helper_args.begin(), helper_args.end());
+    }
+    if (cfg.upstream_auth ==
+            locus::router::RouterConfig::UpstreamAuth::kKey &&
+        cfg.instance_keys.empty()) {
+        return "--upstream-auth key needs --instance-keys";
     }
     return "";
 }
