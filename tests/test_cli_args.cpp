@@ -8,7 +8,7 @@
 #include "catch_amalgamated.hpp"
 #include "backend_cli.hpp"
 
-TEST_CASE("--ctx caps the KV pool from the command line",
+TEST_CASE("the ctx flag caps the KV pool from the command line",
           "[cli]") {
     std::array<const char*, 4> argv1 = {"prog", "--ctx", "1024",
                                         "m.gguf"};
@@ -33,7 +33,7 @@ TEST_CASE("--ctx caps the KV pool from the command line",
     REQUIRE(c.ctx == 0);  // default: model-derived pool
 }
 
-TEST_CASE("--image-decoder takes the VQ-16 decoder path", "[cli]") {
+TEST_CASE("the image-decoder flag takes the VQ-16 decoder path", "[cli]") {
     std::array<const char*, 4> argv1 = {"prog", "--image-decoder",
                                         "vq.gguf", "m.gguf"};
     auto a = locus_tools::parse_backend_args(
@@ -65,7 +65,7 @@ TEST_CASE("the lora-dir flag takes the FLUX LoRA directory", "[cli]") {
     REQUIRE(b.lora_dir == "l2");
 }
 
-TEST_CASE("--audio-max-tokens sets the speech token cap", "[cli]") {
+TEST_CASE("the audio-max-tokens flag sets the speech token cap", "[cli]") {
     std::array<const char*, 4> argv1 = {"prog", "--audio-max-tokens",
                                         "350", "m.gguf"};
     auto a = locus_tools::parse_backend_args(
@@ -88,7 +88,7 @@ TEST_CASE("--audio-max-tokens sets the speech token cap", "[cli]") {
     REQUIRE(c.audio_max_tokens == 0);  // default: the server's 1024
 }
 
-TEST_CASE("--max-tokens sets the output token cap", "[cli]") {
+TEST_CASE("the max-tokens flag sets the output token cap", "[cli]") {
     std::array<const char*, 5> argv1 = {"prog", "--max-tokens", "8192",
                                         "--audio-max-tokens=70", "m.gguf"};
     auto a = locus_tools::parse_backend_args(
@@ -151,7 +151,7 @@ TEST_CASE("numeric flags reject negative, huge and junk values",
     REQUIRE(c.positional == std::vector<std::string>{"m.gguf"});
 }
 
-TEST_CASE("--kv-type picks the KV cache precision", "[cli]") {
+TEST_CASE("the kv-type flag picks the KV cache precision", "[cli]") {
     using locus::kv::KvType;
     auto parse = [](std::vector<const char*> argv) {
         return locus_tools::parse_backend_args(
@@ -228,7 +228,7 @@ TEST_CASE("public_model_id exposes the basename, not the path",
     REQUIRE(locus_tools::public_model_id("/tmp/dir/") == "locus");
 }
 
-TEST_CASE("--timing and --warmup parse as flags", "[cli]") {
+TEST_CASE("the timing and warmup flags parse", "[cli]") {
     std::array<const char*, 5> argv1 = {"prog", "--timing", "m.gguf",
                                         "--warmup", "hi"};
     auto a = locus_tools::parse_backend_args(
@@ -246,7 +246,7 @@ TEST_CASE("--timing and --warmup parse as flags", "[cli]") {
     REQUIRE_FALSE(b.warmup);
 }
 
-TEST_CASE("--prefill-f16 parses as a flag", "[cli]") {
+TEST_CASE("the prefill-f16 flag parses", "[cli]") {
     std::array<const char*, 3> argv1 = {"prog", "--prefill-f16",
                                         "m.gguf"};
     auto a = locus_tools::parse_backend_args(
@@ -292,7 +292,7 @@ TEST_CASE("locus-run exits 2 on a negative numeric flag", "[cli]") {
     REQUIRE(WEXITSTATUS(rc) == 2);
 }
 
-TEST_CASE("--speculative parses as a flag", "[cli]") {
+TEST_CASE("the speculative flag parses", "[cli]") {
     std::array<const char*, 3> argv1 = {"prog", "--speculative",
                                         "m.gguf"};
     auto a = locus_tools::parse_backend_args(
@@ -310,7 +310,7 @@ TEST_CASE("--speculative parses as a flag", "[cli]") {
     REQUIRE_FALSE(b.spec_fixed);
 }
 
-TEST_CASE("--spec-draft and --spec-fixed parse", "[cli]") {
+TEST_CASE("the spec-draft and spec-fixed flags parse", "[cli]") {
     std::array<const char*, 5> argv1 = {"prog", "--spec-draft", "6",
                                         "--spec-fixed", "m.gguf"};
     auto a = locus_tools::parse_backend_args(
