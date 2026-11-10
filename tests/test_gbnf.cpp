@@ -116,6 +116,45 @@ TEST_CASE("gbnf repetition does not grow the parse stacks", "[gbnf]") {
     CHECK_FALSE(full(nest, "((x)"));
 }
 
+TEST_CASE("gbnf flags a state that drops stacks past the cap", "[gbnf]") {
+    // After n "a"s, any number of them may still wait for a "b", so the
+    // distinct stacks grow with n.
+    const auto g = Gbnf::parse(R"(root ::= "a" root "b" | "a" root | )");
+    GbnfMatcher wide(g);
+    GbnfMatcher capped(g, 8);
+    CHECK_FALSE(capped.truncated());
+    const std::uint64_t before = locus::model::gbnf_stack_overflows();
+    for (int i = 0; i < 20; ++i) {
+        REQUIRE(wide.feed('a'));
+        REQUIRE(capped.feed('a'));
+    }
+    CHECK(capped.truncated());
+    CHECK_FALSE(wide.truncated());  // far below the default cap
+    CHECK(locus::model::gbnf_stack_overflows() > before);
+    // The flag stays once set.
+    REQUIRE(capped.feed('b'));
+    CHECK(capped.truncated());
+}
+
+TEST_CASE("json schema grammars stay under the stack cap", "[gbnf]") {
+    const std::string s = R"({
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "n": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+      },
+      "required": ["name"]
+    })";
+    GbnfMatcher m(Gbnf::parse(json_schema_to_gbnf(s)));
+    for (const unsigned char c :
+         std::string(R"({"name": "x", "tags": ["a", "b"], "n": 12})")) {
+        REQUIRE(m.feed(c));
+    }
+    CHECK(m.accepted());
+    CHECK_FALSE(m.truncated());
+}
+
 TEST_CASE("regex to gbnf", "[gbnf]") {
     CHECK(re_full(R"(^\d{3}-\d{4}$)", "555-1234"));
     CHECK_FALSE(re_full(R"(^\d{3}-\d{4}$)", "55-1234"));
