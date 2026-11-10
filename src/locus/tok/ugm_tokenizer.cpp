@@ -100,6 +100,10 @@ UgmTokenizer::UgmTokenizer(Config config) : cfg_(std::move(config)) {
             throw std::invalid_argument("special token id out of range");
         }
     }
+    if (cfg_.add_bos &&
+        (cfg_.bos < 0 || static_cast<std::size_t>(cfg_.bos) >= n)) {
+        throw std::invalid_argument("bos token id out of range");
+    }
 
     // Charsmap: a uint32 LE byte size of the darts-clone trie, the
     // trie units, then the NUL-terminated replacement strings.
@@ -194,6 +198,8 @@ UgmTokenizer UgmTokenizer::from_gguf(const gguf::GgufFile& g) {
         g.get_bool("tokenizer.ggml.remove_extra_whitespaces")
             .value_or(true);
     cfg.add_eos = g.get_bool("tokenizer.ggml.add_eos_token").value_or(true);
+    cfg.add_bos = g.get_bool("tokenizer.ggml.add_bos_token").value_or(false);
+    if (cfg.add_bos) cfg.bos = id_of("tokenizer.ggml.bos_token_id", 0);
     try {
         return UgmTokenizer(std::move(cfg));
     } catch (const std::invalid_argument& e) {
@@ -353,6 +359,7 @@ void UgmTokenizer::encode_chunk(std::string_view text,
 std::vector<TokenId> UgmTokenizer::encode(std::string_view text,
                                           bool add_special) const {
     std::vector<TokenId> out;
+    if (add_special && cfg_.add_bos) out.push_back(cfg_.bos);
     // Split at user-defined tokens; strip whitespace on both sides of
     // each, as HF's lstrip/rstrip added tokens do. Only ASCII
     // whitespace: Python's strip also takes Unicode spaces (U+00A0,

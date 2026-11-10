@@ -20,8 +20,11 @@ std::unique_ptr<EmbeddingModel> EmbeddingModel::load(const std::string& path,
     if (g->get_string("general.architecture") != "bert") {
         throw gguf::Error(path + ": not an embedding model (arch bert)");
     }
-    if (g->get_string("tokenizer.ggml.model") != "bert") {
-        throw gguf::Error(path + ": tokenizer is not WordPiece (\"bert\")");
+    // WordPiece (BERT) or SentencePiece unigram (XLM-R).
+    const auto tm = g->get_string("tokenizer.ggml.model");
+    if (tm != "bert" && tm != "t5") {
+        throw gguf::Error(path + ": tokenizer is not WordPiece (\"bert\") "
+                                 "or unigram (\"t5\")");
     }
     auto tok = tok::tokenizer_from_gguf(*g);
     auto enc = BertEncoder::load(*g);

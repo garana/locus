@@ -1,3 +1,4 @@
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -76,6 +77,46 @@ TEST_CASE("t5 tokenizer rejects a bad charsmap", "[tok][t5]") {
     cfg.charsmap = {0xff, 0xff, 0, 0, 1, 2, 3, 4};
     REQUIRE_THROWS_AS(UgmTokenizer(cfg), std::invalid_argument);
     cfg.charsmap = {3, 0, 0, 0, 1, 2, 3, 4};
+    REQUIRE_THROWS_AS(UgmTokenizer(cfg), std::invalid_argument);
+}
+
+TEST_CASE("xlm-r tokenizer matches llama.cpp's unigram tokenizer",
+          "[tok][t5][e2e]") {
+    // bge-m3's vocab (XLM-R: <s> first, </s> last, the nmt_nfkc
+    // charsmap); the ids come from scripts/make-xlmr-tok-golden.py.
+    const std::string model =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/models/bge-m3-q8_0.gguf";
+    if (!std::filesystem::exists(model)) {
+        SKIP("bge-m3-q8_0.gguf absent; see scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model);
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    REQUIRE(tok->vocab_size() == 250002);
+    REQUIRE(tok->bos_id() == 0);
+    REQUIRE(tok->eos_id() == 2);
+    std::ifstream f(golden("xlmr_tokenizer.jsonl"));
+    REQUIRE(f.good());
+    int cases = 0;
+    for (std::string line; std::getline(f, line);) {
+        const auto j = nlohmann::json::parse(line);
+        const auto text = j["text"].get<std::string>();
+        const auto want = j["ids"].get<std::vector<TokenId>>();
+        INFO("text " << j["text"].dump());
+        REQUIRE(tok->encode(text, true) == want);
+        ++cases;
+    }
+    REQUIRE(cases == 22);
+}
+
+TEST_CASE("t5 tokenizer adds a bos only when asked", "[tok][t5]") {
+    auto cfg = tiny_vocab();
+    cfg.bos = 8;
+    cfg.add_bos = true;
+    const UgmTokenizer tok(cfg);
+    REQUIRE(tok.encode("ab", true) == std::vector<TokenId>{8, 7, 1});
+    REQUIRE(tok.encode("ab", false) == std::vector<TokenId>{7});
+    REQUIRE(tok.bos_id() == 8);
+    cfg.bos = 99;
     REQUIRE_THROWS_AS(UgmTokenizer(cfg), std::invalid_argument);
 }
 

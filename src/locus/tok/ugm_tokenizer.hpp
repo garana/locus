@@ -33,7 +33,8 @@ namespace locus::tok {
  *    Recent sentencepiece also rebases the running score once it
  *    passes 1e5 in magnitude; this class does not, so float rounding
  *    could pick a different near-tie only after thousands of pieces.
- * 4. With add_special, EOS is appended (T5 has no BOS).
+ * 4. With add_special, BOS is prepended when the model asks for it
+ *    (XLM-R's <s>; T5 has no BOS) and EOS appended.
  */
 class UgmTokenizer final : public Tokenizer {
   public:
@@ -50,6 +51,9 @@ class UgmTokenizer final : public Tokenizer {
         bool add_space_prefix = true;
         bool remove_extra_whitespaces = true;
         bool add_eos = true;
+        /** XLM-R's <s> (bos 0, add_bos): T5 has none (-1, false). */
+        TokenId bos = -1;
+        bool add_bos = false;
     };
 
     /** @throws std::invalid_argument on an inconsistent config or a
@@ -62,8 +66,8 @@ class UgmTokenizer final : public Tokenizer {
 
     /**
      * @param text UTF-8 input.
-     * @param add_special Append EOS (when the model asks for it). T5
-     *     has no BOS, so the flag means "add the special tokens".
+     * @param add_special Add BOS and EOS, each when the model asks for
+     *     it.
      */
     std::vector<TokenId> encode(std::string_view text,
                                 bool add_special) const override;
@@ -75,8 +79,8 @@ class UgmTokenizer final : public Tokenizer {
 
     std::string_view piece(TokenId id) const override;
     std::size_t vocab_size() const override { return cfg_.tokens.size(); }
-    /** T5 has no BOS: -1. */
-    TokenId bos_id() const override { return -1; }
+    /** -1 when the model has no BOS (T5). */
+    TokenId bos_id() const override { return cfg_.bos; }
     TokenId eos_id() const override { return cfg_.eos; }
     TokenId pad_id() const { return cfg_.pad; }
 

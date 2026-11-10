@@ -287,52 +287,100 @@ TEST_CASE("bert pooling averages or picks a token then normalizes",
                       std::invalid_argument);
 }
 
-TEST_CASE("bge-small embeddings match llama.cpp and transformers",
-          "[bert][e2e]") {
-    if (!std::filesystem::exists(kModel)) {
-        SKIP("bge-small-en-v1.5-q8_0.gguf absent; see "
-             "scripts/make-bert-embd-golden.py");
+namespace {
+
+/**
+ * Embeds the golden texts with a model, all in one batch and each
+ * alone, and checks them against three references:
+ *
+ * - q8ref (scripts/make-bert-q8-ref.py): the GGUF's own weights in
+ *   float64 arithmetic; locus must match it to a cosine of 0.99999.
+ * - llama: llama.cpp's vectors, at least 0.9995. llama.cpp rounds the
+ *   activations to 8 bits before each Q8_0 product, locus keeps them
+ *   in f32, so llama.cpp is the one off the q8ref: 0.99984 to 0.99993
+ *   on the 12-layer models, 0.99965 to 0.99973 on bge-m3's 24.
+ * - hf, when given: the f32 original in transformers, at least 0.9998
+ *   and at least as near as llama.cpp.
+ */
+void check_golden(const std::string& file, const char* llama,
+                  const char* q8ref, const char* hf, std::uint32_t width,
+                  Pooling pooling) {
+    const std::string path = kDir + "models/" + file;
+    if (!std::filesystem::exists(path)) {
+        SKIP(file << " absent; see scripts/fetch-test-model.sh");
     }
-    auto g = locus::gguf::GgufFile::open(kModel);
+    auto g = locus::gguf::GgufFile::open(path);
     const auto tok = locus::tok::tokenizer_from_gguf(g);
     const auto enc = BertEncoder::load(g);
-    REQUIRE(enc.width() == 384);
-    REQUIRE(enc.pooling() == Pooling::kCls);
-    std::ifstream f(kDir + "golden/bge_small_embd.json");
+    REQUIRE(enc.width() == width);
+    REQUIRE(enc.pooling() == pooling);
+    std::ifstream f(kDir + "golden/" + llama);
     REQUIRE(f.good());
     const auto j = nlohmann::json::parse(f);
     const auto texts = j["texts"].get<std::vector<std::string>>();
     const auto want = j["embeddings"].get<std::vector<std::vector<float>>>();
     REQUIRE(texts.size() == 7);
-    std::ifstream fh(kDir + "golden/bge_small_embd_hf.json");
-    REQUIRE(fh.good());
-    const auto hf = nlohmann::json::parse(fh)["embeddings"]
-                        .get<std::vector<std::vector<float>>>();
+    const auto read = [](const char* name) {
+        std::ifstream fr(kDir + "golden/" + name);
+        REQUIRE(fr.good());
+        return nlohmann::json::parse(fr)["embeddings"]
+            .get<std::vector<std::vector<float>>>();
+    };
+    const auto exact = read(q8ref);
+    REQUIRE(exact.size() == texts.size());
+    std::vector<std::vector<float>> ref;
+    if (hf != nullptr) ref = read(hf);
     std::vector<std::vector<TokenId>> batch;
     for (const auto& t : texts) batch.push_back(tok->encode(t, true));
     const auto& op = locus::backend::best_backend().ops;
-    // All in one batch, and each alone: both match.
     const auto got = enc.embed(batch, op);
     for (std::size_t i = 0; i < texts.size(); ++i) {
         INFO("text " << texts[i]);
         const auto one = enc.embed(
             std::span<const std::vector<TokenId>>(&batch[i], 1), op);
-        // llama.cpp rounds the activations to 8 bits before each Q8_0
-        // product, locus keeps them in f32: against the original
-        // weights in f32 (transformers), locus is the nearer of the
-        // two (0.99989 to 0.99995, llama.cpp 0.99971 to 0.99989).
+        const double e = cosine(got[i], exact[i]);
         const double c = cosine(got[i], want[i]);
-        const double ch = cosine(got[i], hf[i]);
-        const double lh = cosine(want[i], hf[i]);
-        UNSCOPED_INFO("cosine llama " << c << " hf " << ch << " llama-hf "
-                                      << lh);
-        REQUIRE(c >= 0.9998);
-        REQUIRE(ch >= 0.9998);
-        REQUIRE(ch >= lh);
+        UNSCOPED_INFO("cosine q8ref " << e << " llama " << c);
+        REQUIRE(e >= 0.99999);
+        REQUIRE(c >= 0.9995);
+        if (hf != nullptr) {
+            const double ch = cosine(got[i], ref[i]);
+            const double lh = cosine(want[i], ref[i]);
+            UNSCOPED_INFO("cosine hf " << ch << " llama-hf " << lh);
+            REQUIRE(ch >= 0.9998);
+            REQUIRE(ch >= lh);
+        }
         REQUIRE(cosine(one[0], got[i]) >= 0.99999);
     }
     // The question is nearer its answer than an unrelated sentence.
     REQUIRE(cosine(got[2], got[3]) > cosine(got[2], got[4]));
+}
+
+}  // namespace
+
+TEST_CASE("bge-small embeddings match llama.cpp and transformers",
+          "[bert][e2e]") {
+    // CLS pooling, WordPiece.
+    check_golden("bge-small-en-v1.5-q8_0.gguf", "bge_small_embd.json",
+                 "bge_small_embd_q8ref.json", "bge_small_embd_hf.json", 384,
+                 Pooling::kCls);
+}
+
+TEST_CASE("e5-small-v2 embeddings match llama.cpp and transformers",
+          "[bert][e2e]") {
+    // Mean pooling, WordPiece.
+    check_golden("e5-small-v2-q8_0.gguf", "e5_small_embd.json",
+                 "e5_small_embd_q8ref.json", "e5_small_embd_hf.json", 384,
+                 Pooling::kMean);
+}
+
+TEST_CASE("bge-m3 embeddings match exact arithmetic and llama.cpp",
+          "[bert][e2e]") {
+    // XLM-R: SentencePiece unigram, one token type, 24 layers of 1024.
+    // Its original weights are a pickle on BAAI's main branch, so it
+    // has no transformers reference.
+    check_golden("bge-m3-q8_0.gguf", "bge_m3_embd.json",
+                 "bge_m3_embd_q8ref.json", nullptr, 1024, Pooling::kCls);
 }
 
 TEST_CASE("embedding model groups inputs into passes", "[bert][e2e]") {

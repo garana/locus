@@ -3,34 +3,60 @@
 # [e2e] integration tests. The file is gitignored; tests SKIP
 # cleanly when it is absent, so running this is optional.
 #
-# With the argument "bge" it downloads bge-small-en-v1.5 Q8_0 (36 MB)
-# instead, for the embedding tests ([bert]), pinned to a commit and
-# checked by sha256. It lands under a temporary name first, so a test
-# never sees a partial file at the final path.
+# With an argument it downloads an embedding model instead, for the
+# [bert] tests, pinned to a commit and checked by sha256:
+#   bge     bge-small-en-v1.5 Q8_0 (36 MB)
+#   e5      e5-small-v2 Q8_0 (37 MB)
+#   bge-m3  bge-m3 Q8_0 (635 MB)
+# A file lands under a temporary name first, so a test never sees a
+# partial file at the final path.
 set -eu
 
 dir="$(cd "$(dirname "$0")/.." && pwd)/tests/models"
 mkdir -p "$dir"
 
-if [ "${1:-}" = "bge" ]; then
-    url="https://huggingface.co/ggml-org/bge-small-en-v1.5-Q8_0-GGUF"
-    url="$url/resolve/f2068edd9b54f2a369549ccc71f70ed273a2a801"
-    url="$url/bge-small-en-v1.5-q8_0.gguf"
-    sum="f046db1dc724cf4f6f0a0c5917e922823b73eb1d27b8f9a9c2797f7866974804"
-    out="$dir/bge-small-en-v1.5-q8_0.gguf"
-    curl -fSL -o "$out.part" "$url"
+# fetch REPO COMMIT FILE SHA256
+fetch() {
+    out="$dir/$3"
+    curl -fSL -o "$out.part" \
+        "https://huggingface.co/ggml-org/$1/resolve/$2/$3"
     got="$(shasum -a 256 "$out.part" | cut -d' ' -f1)"
-    if [ "$got" != "$sum" ]; then
+    if [ "$got" != "$4" ]; then
         echo "sha256 mismatch: $got" >&2
         rm -f "$out.part"
         exit 1
     fi
     mv "$out.part" "$out"
-    echo "$sum  $out"
-    exit 0
-fi
+    echo "$4  $out"
+}
 
-url="https://huggingface.co/ggml-org/models/resolve/main"
-url="$url/tinyllamas/stories260K.gguf"
-curl -fSL -o "$dir/stories260K.gguf" "$url"
-shasum -a 256 "$dir/stories260K.gguf"
+case "${1:-}" in
+bge)
+    fetch bge-small-en-v1.5-Q8_0-GGUF \
+        f2068edd9b54f2a369549ccc71f70ed273a2a801 \
+        bge-small-en-v1.5-q8_0.gguf \
+        f046db1dc724cf4f6f0a0c5917e922823b73eb1d27b8f9a9c2797f7866974804
+    ;;
+e5)
+    fetch e5-small-v2-Q8_0-GGUF \
+        14aa7ca88ca627e2ea0051929636561158e289ab \
+        e5-small-v2-q8_0.gguf \
+        afdfb5c342d2efc2a051c426dd1d00913495d5f2bbceaea100d2f3892aa31cbc
+    ;;
+bge-m3)
+    fetch bge-m3-Q8_0-GGUF \
+        9eba04c5d75ba5a1595e45de734d36bef4e5cb98 \
+        bge-m3-q8_0.gguf \
+        aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a173
+    ;;
+"")
+    url="https://huggingface.co/ggml-org/models/resolve/main"
+    url="$url/tinyllamas/stories260K.gguf"
+    curl -fSL -o "$dir/stories260K.gguf" "$url"
+    shasum -a 256 "$dir/stories260K.gguf"
+    ;;
+*)
+    echo "usage: $0 [bge|e5|bge-m3]" >&2
+    exit 2
+    ;;
+esac
