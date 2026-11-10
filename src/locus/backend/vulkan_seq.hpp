@@ -31,7 +31,7 @@ class VulkanSeq {
   public:
     /** A scratch buffer index, below kSlots. */
     using Slot = std::uint32_t;
-    static constexpr Slot kSlots = 16;
+    static constexpr Slot kSlots = 20;
 
     /** @returns Whether the Vulkan backend is usable. */
     static bool available();
@@ -67,6 +67,11 @@ class VulkanSeq {
      */
     void linear(const Mat& w, std::span<const float> b, Rows x, Rows out,
                 std::uint32_t n);
+
+    /** out[t] += scale * w x[t] for n token rows (a LoRA's B side,
+     *  added onto the base layer's output). */
+    void linear_add(const Mat& w, Rows x, Rows out, std::uint32_t n,
+                    float scale);
 
     /**
      * LayerNorm without affine over n rows of width d, then

@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -83,14 +85,26 @@ struct Leg {
     const locus::backend::Ops* op;
 };
 
-/** The CPU, plus the Vulkan image ops (per op with LoRAs) on a GPU. */
+/** The CPU, plus on a GPU the Vulkan image ops: the whole-step forward
+ *  and, with LOCUS_FLUX_GPU=0, the per-op one. */
 std::vector<Leg> legs() {
     std::vector<Leg> v = {{"cpu", &locus::backend::best_backend().ops}};
     if (locus::backend::vk::VulkanContext::available()) {
         v.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+        v.push_back({"vulkan per op", &locus::backend::vulkan_image_ops()});
     }
     return v;
 }
+
+/** Sets LOCUS_FLUX_GPU=0 for the "vulkan per op" leg, and clears it. */
+struct PerOp {
+    explicit PerOp(const Leg& leg) {
+        if (std::string_view(leg.name) == "vulkan per op") {
+            ::setenv("LOCUS_FLUX_GPU", "0", 1);
+        }
+    }
+    ~PerOp() { ::unsetenv("LOCUS_FLUX_GPU"); }
+};
 
 }  // namespace
 
@@ -104,6 +118,7 @@ TEST_CASE("flux dit with LoRAs matches diffusers with them merged",
     const auto plain_ref = read_f32(kDir + "flux_synth_out.f32");
     const auto cases = read_json(kDir + "lora/dit_cases.json");
     for (const Leg& leg : legs()) {
+        const PerOp per_op(leg);
         for (const auto& [name, loras] : cases.items()) {
             DYNAMIC_SECTION(leg.name << " " << name) {
                 std::vector<locus::gguf::GgufFile> files;

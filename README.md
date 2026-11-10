@@ -156,8 +156,8 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 
 - Multimedia (#143): diffusion image speed (#146), video (#148), real-time
   speech (#173), faster image input (#257), FLUX.1 LoRAs (#372:
-  `--lora-dir` and the `lora` field apply converted ones; the
-  whole-step GPU forward does not take them yet, so they run per op).
+  `--lora-dir` and the `lora` field apply converted ones, on the CPU
+  and in the whole-step GPU forward).
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
 - Multi-server inference, pipeline and expert parallel (#3, #24).

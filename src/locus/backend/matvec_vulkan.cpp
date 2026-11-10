@@ -3681,6 +3681,14 @@ void VulkanSeq::flush() {
     im_->s.ctx.begin_batch();
 }
 
+void VulkanSeq::linear_add(const Mat& w, Rows x, Rows out, std::uint32_t n,
+                           float scale) {
+    State& s = im_->s;
+    rec_matmul(s, w, s.upload_w(w), im_->slot(x.slot), im_->slot(out.slot),
+               MatmulRows{n, x.off, x.stride, out.off, out.stride}, true, 0,
+               scale);
+}
+
 void VulkanSeq::linear(const Mat& w, std::span<const float> b, Rows x,
                        Rows out, std::uint32_t n) {
     if (!b.empty() && b.size() != w.rows) {
