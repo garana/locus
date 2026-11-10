@@ -206,13 +206,15 @@ struct State {
     }
 
     /**
-     * Destroys every GPU buffer this owns (weight pool, KV pools,
-     * activation and chunk scratch, buffers retired mid-batch, and the
-     * IQ grid tables), leaving ctx untouched. Called both to reset
-     * between models in a multi-model process and from ~State to tear
-     * the buffers down before ctx destroys the VkDevice.
+     * Destroys every GPU buffer this owns (weight pool, activation and
+     * chunk scratch, buffers retired mid-batch, the IQ grid tables,
+     * and with kv the KV pools), leaving ctx untouched. A reset between
+     * models keeps the KV pools: each belongs to a live cache, which
+     * frees it (i#428), so a cache that outlives the reset still owns a
+     * valid pool and cannot free a newer one at the same address
+     * (i#445). ~State frees them too, before ctx destroys the VkDevice.
      */
-    void free_buffers() {
+    void free_buffers(bool kv = true) {
         // Weight pool: every model's weights are uploaded once and kept
         // resident (unbounded by default) -- the unbounded accumulator
         // across a multi-model test process. Free them all.
@@ -226,11 +228,13 @@ struct State {
         pool.transient_.clear();
         pool.used_ = 0;
         // GPU-mapped KV pools still live (vulkan_free_kv frees one when
-        // its cache goes).
-        for (auto& [map, buf] : kv_pools) {
-            ctx.destroy_buffer(buf);
+        // its cache goes): only at teardown.
+        if (kv) {
+            for (auto& [map, buf] : kv_pools) {
+                ctx.destroy_buffer(buf);
+            }
+            kv_pools.clear();
         }
-        kv_pools.clear();
         moe_gpu_fits.clear();
         // Buffers retired by grow() mid-batch; end_batch frees these,
         // but free them here too in case a batch never closed.
@@ -1528,7 +1532,7 @@ void vulkan_free_kv(float* pool) {
 
 void vulkan_reset_state() {
     std::lock_guard lk(state_mu());
-    state().free_buffers();
+    state().free_buffers(false);
 }
 
 void vulkan_release_weights(const void* p, std::size_t n) {

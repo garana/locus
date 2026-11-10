@@ -13,8 +13,9 @@ namespace {
 
 // #56: the Vulkan backend keeps a process-lifetime State singleton
 // whose weight pool is unbounded (never evicts); its GPU-mapped KV
-// pools now go with their caches (i#428), but the weights stay. A test process that runs many models
-// across many cases therefore accumulates device allocations until
+// pools go with their caches (i#428), but the weights stay. A test
+// process that runs many models across many cases therefore
+// accumulates device allocations until
 // V3DV (or any Vulkan device) runs out -- surfacing as
 // "vulkan: allocate memory" in a later case (deterministic on the
 // 4GB Pi, a rare 1-assertion-short flake on 32GB MoltenVK). Free
@@ -57,6 +58,15 @@ TEST_CASE("vulkan KV pools are freed with their cache", "[vulkan]") {
         auto a = model.make_cache(8);
         REQUIRE(locus::backend::vulkan_kv_pool_count() == base + 1);
         auto b = std::move(a);  // ownership moves; still one pool
+        REQUIRE(locus::backend::vulkan_kv_pool_count() == base + 1);
+    }
+    REQUIRE(locus::backend::vulkan_kv_pool_count() == base);
+
+    // i#445: a reset keeps a live cache's pool, and the cache still
+    // frees it afterwards.
+    {
+        auto c = model.make_cache(8);
+        locus::backend::vulkan_reset_state();
         REQUIRE(locus::backend::vulkan_kv_pool_count() == base + 1);
     }
     REQUIRE(locus::backend::vulkan_kv_pool_count() == base);
