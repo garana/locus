@@ -194,3 +194,31 @@ TEST_CASE("logprobs_from reports a normalized distribution",
     REQUIRE(one[0].token == 2);
     REQUIRE(lp2 < chosen_lp);  // token 0 less likely than token 2
 }
+
+TEST_CASE("sample skips -inf rows exactly", "[sampling]") {
+    // Speech computes only the audio band of the head and fills the
+    // rest with -inf. Sampling the masked vector must draw the same
+    // token as sampling the band alone, for every seed, and never a
+    // masked row.
+    constexpr std::uint32_t kV = 2000, kLo = 700, kHi = 1300;
+    std::mt19937 g(5);
+    std::normal_distribution<float> nd(0.0f, 2.0f);
+    std::vector<float> band(kHi - kLo);
+    for (auto& v : band) v = nd(g);
+    const float ninf = -std::numeric_limits<float>::infinity();
+    for (const float top_p : {1.0f, 0.8f}) {
+        SamplingParams p;
+        p.temperature = 0.6f;
+        p.top_p = top_p;
+        for (std::uint64_t seed = 1; seed <= 200; ++seed) {
+            std::vector<float> full(kV, ninf);
+            std::copy(band.begin(), band.end(), full.begin() + kLo);
+            std::vector<float> part = band;
+            std::mt19937_64 r1(seed), r2(seed);
+            const auto a = sample(full, p, {}, r1);
+            const auto b = sample(part, p, {}, r2);
+            INFO("top_p " << top_p << " seed " << seed);
+            REQUIRE(a == static_cast<TokenId>(b + kLo));
+        }
+    }
+}
