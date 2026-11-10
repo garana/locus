@@ -68,13 +68,12 @@ class DraftCost {
  * With accept rate a, a verify of d drafts yields 1 + a + ... + a^d
  * tokens (the accepted drafts plus the model's own next token). A
  * length never measured costs the longest shorter measured one plus
- * the cheapest measured cost of one more row, at most a quarter of a
- * decode step per row. That guess is low on
- * purpose, so a promising length is tried and then priced by what it
- * really costs; the times are shared by the engine's requests. On a
- * CPU each verify row costs most of a decode step and
- * short drafts win; on a GPU extra rows are nearly free and long ones
- * do.
+ * the cheapest measured cost of one more row (a quarter of a decode
+ * step until one is measured), so a promising length is tried and
+ * then priced by what it really costs, and where rows cost most of a
+ * decode step the engine stops drafting; the times are shared by the
+ * engine's requests. A verify's time covers its forward and its logit
+ * scans.
  * @param s The request's accept counts.
  * @param cost The engine's forward times.
  * @param max_draft The most draft tokens allowed.

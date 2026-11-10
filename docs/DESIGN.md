@@ -489,7 +489,9 @@ guarding the default path.
   `--spec-draft`, default 8) is the one with the most expected tokens
   per second: the request's decayed accept rate a gives
   $1 + a + \dots + a^d$ tokens for d drafts, priced by the engine's
-  measured forward time for d drafts. On the M2 Pro CPU a verify row
+  measured time for a verify of d drafts (the forward and the logit
+  scans); a length not measured yet costs the measured cost of a row
+  per extra row. On the M2 Pro CPU a verify row
   costs 0.55 to 0.75 of a decode step; on MoltenVK a verify of 9 rows
   costs about 10 decode steps against 4 for 5 rows, so fixed 8 drafts
   are slower than none. A plain decode step also checks a one-token

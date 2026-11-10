@@ -576,10 +576,25 @@ bool Engine::spec_decode_step(Request& r) {
     if (batched_logits_.size() < need) {
         batched_logits_.assign(need, 0.0f);
     }
+    // The verify's cost covers the forward and the logit scans, the
+    // work a draft adds over a plain decode step.
     const auto t_verify = std::chrono::steady_clock::now();
     model_.forward_batch(batch, cache_, r.seq, ws_,
                          {batched_logits_.data(), need},
                          /*all_logits=*/true);
+    // pred[i] is the model's token after batch[i]: it equals the
+    // draft batch[i + 1] while drafts pass, then corrects the first
+    // one that fails, or is the bonus token after the last draft.
+    std::vector<tok::TokenId> pred;
+    pred.reserve(kb);
+    for (std::uint32_t i = 0; i < kb; ++i) {
+        pred.push_back(model::argmax(
+            {batched_logits_.data() + static_cast<std::size_t>(i) * V,
+             V}));
+        if (i + 1 < kb && pred.back() != batch[i + 1]) {
+            break;  // corrected: discard the remaining drafts
+        }
+    }
     spec_cost_.observe(kb - 1,
                        std::chrono::duration<double>(
                            std::chrono::steady_clock::now() - t_verify)
@@ -587,22 +602,16 @@ bool Engine::spec_decode_step(Request& r) {
     ++spec_steps_;
     step_tokens_ += static_cast<std::uint32_t>(batch.size());
 
-    // Verify greedily: logits at position base+i-1 predict token
-    // base+i; the pending token (batch[0]) is already committed.
+    // The pending token (batch[0]) is already committed.
     std::uint32_t acc = 0;
     bool terminal = false;
-    for (std::uint32_t i = 1; i < kb; ++i) {
-        const tok::TokenId predicted = model::argmax(
-            {batched_logits_.data() +
-                 static_cast<std::size_t>(i - 1) * V,
-             V});
-        const bool accepted = predicted == batch[i];
-        const tok::TokenId t = accepted ? batch[i] : predicted;
+    for (std::size_t i = 0; i < pred.size(); ++i) {
+        const tok::TokenId t = pred[i];
         r.generated.push_back(t);
         if (on_token) {
             on_token(r, t);
         }
-        if (accepted) {
+        if (i + 1 < kb && t == batch[i + 1]) {
             ++acc;
             ++spec_accepted_;
         }
@@ -610,22 +619,6 @@ bool Engine::spec_decode_step(Request& r) {
             terminal = true;
             break;
         }
-        if (!accepted) {
-            break;  // corrected -> discard the remaining drafts
-        }
-    }
-    if (!terminal && acc == kb - 1) {
-        // Every draft matched (or there were none): the bonus token.
-        const tok::TokenId bonus = model::argmax(
-            {batched_logits_.data() +
-                 static_cast<std::size_t>(kb - 1) * V,
-             V});
-        r.generated.push_back(bonus);
-        if (on_token) {
-            on_token(r, bonus);
-        }
-        terminal = bonus == eos_ ||
-                   r.generated.size() >= r.max_new_tokens;
     }
 
     // A draft cut short by EOS or the token cap says nothing about
