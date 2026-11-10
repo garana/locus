@@ -834,8 +834,9 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         // sequence instead of closing it. release_downstream stops
         // watching it, erases out_index, sends SESSION_END and either
         // pools or closes it, and sets out_fd = -1. (begin_reset already
-        // cleared out_watched; the next dial below may check this very fd
-        // back out of the pool -- same-connection reuse.)
+        // cleared out_watched; pump dials for the next sequence on its
+        // first bytes, and that dial may check this very fd back out of
+        // the pool: same-connection reuse.)
         release_downstream(s);
         s.outbuf.clear();
         s.seq = kv::PagedKvCache::Seq{};  // old blocks freed by the release
