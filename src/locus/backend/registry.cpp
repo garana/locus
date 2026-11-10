@@ -104,6 +104,9 @@ const std::vector<Backend>& list() {
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_cuda,
                       .self_parallel = true,
+                      .kv_mirror_alloc = &cuda_kv_mirror_alloc,
+                      .kv_mirror_store = &cuda_kv_mirror_store,
+                      .kv_mirror_free = &cuda_kv_mirror_free,
                       .prefetch = &cuda_prefetch,
                       .evict = &cuda_evict,
                       .pool_budget = &cuda_pool_budget}});

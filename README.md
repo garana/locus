@@ -205,7 +205,7 @@ one with `--backend NAME` or `LOCUS_BACKEND=NAME`.
 | sse4    | x86-64; vectorized matvec and int8 dots, the rest scalar                                 |
 | scalar  | portable reference, every weight type                                                    |
 | vulkan  | the whole forward pass on the GPU: matmuls, norms, RoPE, paged attention, MoE routing    |
-| cuda    | matvec on an NVIDIA GPU through a paged weight pool; the rest on the CPU                 |
+| cuda    | matvec through a paged GPU weight pool, a GPU copy of the KV cache; the rest on the CPU  |
 
 Every selectable backend must reproduce the golden outputs. A GPU does
 not always beat the CPU: on a tile GPU streaming a model larger than

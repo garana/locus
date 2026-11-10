@@ -92,6 +92,18 @@ struct Ops {
      */
     void (*free_kv)(float* pool) = nullptr;
     /**
+     * Optional device mirror of a host F32 KV pool (i#466; nullptr:
+     * none). Allocates `n_floats` device floats, or returns nullptr when
+     * the device cannot hold them (the cache then has no mirror).
+     */
+    void* (*kv_mirror_alloc)(std::size_t n_floats) = nullptr;
+    /** Copies n host floats to mirror `dev` at float offset `off`;
+     *  @returns false on a device error. */
+    bool (*kv_mirror_store)(void* dev, std::size_t off, const float* src,
+                            std::size_t n) = nullptr;
+    /** Frees a kv_mirror_alloc allocation. */
+    void (*kv_mirror_free)(void* dev) = nullptr;
+    /**
      * Optional one-step-ahead weight-prefetch hint (nullptr on
      * backends without a pager). The model may call this at the R8
      * readahead points -- next layer's static tensors, and each

@@ -3941,6 +3941,40 @@ std::size_t cuda_pool_budget() {
     return pool().budget();
 }
 
+void* cuda_kv_mirror_alloc(std::size_t n_floats) {
+    ensure_device();
+    void* p = nullptr;
+    if (n_floats == 0 ||
+        !cuda_ok(cudaMalloc(&p, n_floats * sizeof(float)))) {
+        return nullptr;
+    }
+    // Zeroed, so a row read before its first store is 0, not garbage.
+    if (!cuda_ok(cudaMemset(p, 0, n_floats * sizeof(float)))) {
+        cudaFree(p);
+        return nullptr;
+    }
+    return p;
+}
+
+bool cuda_kv_mirror_store(void* dev, std::size_t off, const float* src,
+                          std::size_t n) {
+    ensure_device();
+    return cuda_ok(cudaMemcpy(static_cast<float*>(dev) + off, src,
+                              n * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+bool cuda_kv_mirror_load(const void* dev, std::size_t off, float* dst,
+                         std::size_t n) {
+    ensure_device();
+    return cuda_ok(cudaMemcpy(dst, static_cast<const float*>(dev) + off,
+                              n * sizeof(float), cudaMemcpyDeviceToHost));
+}
+
+void cuda_kv_mirror_free(void* dev) {
+    ensure_device();
+    cudaFree(dev);
+}
+
 void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n) {
     ensure_device();

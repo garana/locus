@@ -373,6 +373,32 @@ void cuda_evict(const Mat& w);
 std::size_t cuda_pool_budget();
 
 /**
+ * Device mirror of a host F32 KV pool (Ops.kv_mirror_*, i#466).
+ * cuda_kv_mirror_alloc returns `n_floats` zeroed device floats, outside
+ * the weight pool's budget, or nullptr when they do not fit (and always
+ * on non-CUDA builds).
+ */
+void* cuda_kv_mirror_alloc(std::size_t n_floats);
+
+/**
+ * Copies n floats from host `src` to mirror `dev` at float offset
+ * `off`; `src` may be reused on return.
+ * @returns false on a CUDA error.
+ */
+bool cuda_kv_mirror_store(void* dev, std::size_t off, const float* src,
+                          std::size_t n);
+
+/**
+ * Reads n floats of mirror `dev` at float offset `off` into `dst` (a
+ * test seam). @returns false on a CUDA error.
+ */
+bool cuda_kv_mirror_load(const void* dev, std::size_t off, float* dst,
+                         std::size_t n);
+
+/** Frees a cuda_kv_mirror_alloc allocation. */
+void cuda_kv_mirror_free(void* dev);
+
+/**
  * CUDA 1D convolution (F32), the device half of the conv1d scalar
  * reference (generative-media codec decoders). Same contract and
  * channels-major layout as backend::conv1d: `out_len` comes from

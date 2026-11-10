@@ -1,5 +1,6 @@
 #include "locus/kv/paged_cache.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <stdexcept>
@@ -143,9 +144,61 @@ bool PagedKvCache::fork(const Seq& parent, Seq& child) {
     }
     if (copy_id != kInvalidBlock) {
         child.blocks.push_back(copy_id);
+        // The host copied the tail rows; the mirror's copy of that
+        // block still holds whatever the block held before.
+        for (std::uint32_t rel = 0; rel < geom_.n_layers; ++rel) {
+            push_rows(copy_id, rel, 0, tail);
+        }
     }
     child.n_tokens = parent.n_tokens;
     return true;
+}
+
+void PagedKvCache::attach_mirror(const Mirror& m) {
+    if (quantized()) {
+        throw std::invalid_argument("a KV mirror needs an F32 cache");
+    }
+    if (m.dev == nullptr || m.store == nullptr || m.release == nullptr) {
+        throw std::invalid_argument("incomplete KV mirror");
+    }
+    mirror_ = {m.dev, m.release};
+    mirror_store_ = m.store;
+}
+
+void PagedKvCache::sync_rows(const Seq& seq, std::uint32_t layer,
+                             std::uint32_t pos, std::uint32_t n) {
+    if (!mirror_) {
+        return;
+    }
+    assert(layer >= geom_.layer_base &&
+           layer - geom_.layer_base < geom_.n_layers);
+    assert(pos + n <= capacity(seq));
+    const std::uint32_t rel = layer - geom_.layer_base;
+    const std::uint32_t bt = geom_.block_tokens;
+    // One K and one V copy per block the range touches.
+    while (n > 0 && mirror_) {
+        const std::uint32_t in_block = pos % bt;
+        const std::uint32_t take = std::min(n, bt - in_block);
+        push_rows(seq.blocks[pos / bt], rel, in_block, take);
+        pos += take;
+        n -= take;
+    }
+}
+
+void PagedKvCache::push_rows(BlockId b, std::uint32_t rel,
+                             std::uint32_t in_block, std::uint32_t n) {
+    if (!mirror_ || n == 0) {
+        return;
+    }
+    const std::size_t k_off = b * block_stride_ + rel * layer_stride_ +
+                              std::size_t{in_block} * geom_.kv_dim;
+    const std::size_t v_off = k_off + layer_stride_ / 2;
+    const std::size_t len = std::size_t{n} * geom_.kv_dim;
+    if (!mirror_store_(mirror_.get(), k_off, pool_ptr_ + k_off, len) ||
+        !mirror_store_(mirror_.get(), v_off, pool_ptr_ + v_off, len)) {
+        mirror_.reset();  // stale from here on: readers use the host
+        mirror_store_ = nullptr;
+    }
 }
 
 float* PagedKvCache::k(const Seq& seq, std::uint32_t layer,

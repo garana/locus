@@ -189,6 +189,48 @@ class PagedKvCache {
                   std::uint32_t pos, bool value,
                   std::span<float> dst) const;
 
+    /**
+     * A device copy of the F32 pool (i#466), with the same layout, so a
+     * row's float offset is the same on both sides. The host pool stays
+     * the source of truth; the device copy is only as fresh as the
+     * sync_rows calls made after each write.
+     */
+    struct Mirror {
+        /** Device allocation of pool_floats(geom) floats. */
+        void* dev = nullptr;
+        /**
+         * Copies `n` floats from host `src` to `dev` at float offset
+         * `off`. @returns false on a device error.
+         */
+        bool (*store)(void* dev, std::size_t off, const float* src,
+                      std::size_t n) = nullptr;
+        /** Frees `dev`; called when the cache drops the mirror. */
+        void (*release)(void* dev) = nullptr;
+    };
+
+    /**
+     * Adopts `m` as this cache's device mirror (F32 only). The cache
+     * owns it from here and releases it when destroyed. fork() keeps
+     * the copied tail block in step on its own; every other row write
+     * needs a sync_rows call.
+     * @throws std::invalid_argument on a quantized cache or an
+     *     incomplete Mirror.
+     */
+    void attach_mirror(const Mirror& m);
+
+    /** @returns The mirror's device pointer, or nullptr without one. */
+    const void* mirror_data() const { return mirror_.get(); }
+
+    /**
+     * Pushes the K and V rows of positions [pos, pos + n) of `layer`
+     * from the host pool to the mirror. No-op without a mirror. A
+     * device error drops the mirror (mirror_data() turns nullptr), so a
+     * device reader falls back to the host pool instead of reading
+     * stale rows.
+     */
+    void sync_rows(const Seq& seq, std::uint32_t layer,
+                   std::uint32_t pos, std::uint32_t n);
+
     const Geometry& geometry() const { return geom_; }
     std::uint32_t free_blocks() const { return alloc_.free_blocks(); }
     std::uint32_t total_blocks() const {
@@ -207,6 +249,10 @@ class PagedKvCache {
     /** Byte address of a K/V row in the quantized pool. */
     std::uint8_t* qrow(const Seq& seq, std::uint32_t layer,
                        std::uint32_t pos, bool value) const;
+    /** Pushes rows [in_block, in_block + n) of one (block, slice
+     *  layer) to the mirror, K then V; drops the mirror on error. */
+    void push_rows(BlockId b, std::uint32_t rel, std::uint32_t in_block,
+                   std::uint32_t n);
 
     Geometry geom_;
     BlockAllocator alloc_;
@@ -231,6 +277,11 @@ class PagedKvCache {
     /** External storage the cache releases when destroyed (null when
      *  owned here or when the caller keeps it). */
     std::unique_ptr<float, void (*)(float*)> external_{nullptr, nullptr};
+    /** Device mirror (null when none), released with the cache. */
+    std::unique_ptr<void, void (*)(void*)> mirror_{nullptr, nullptr};
+    /** Mirror::store of the attached mirror. */
+    bool (*mirror_store_)(void*, std::size_t, const float*,
+                          std::size_t) = nullptr;
 };
 
 }  // namespace locus::kv

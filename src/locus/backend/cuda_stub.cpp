@@ -28,6 +28,18 @@ void cuda_evict(const Mat&) {}
 
 std::size_t cuda_pool_budget() { return 0; }
 
+void* cuda_kv_mirror_alloc(std::size_t) { return nullptr; }
+
+bool cuda_kv_mirror_store(void*, std::size_t, const float*, std::size_t) {
+    return false;
+}
+
+bool cuda_kv_mirror_load(const void*, std::size_t, float*, std::size_t) {
+    return false;
+}
+
+void cuda_kv_mirror_free(void*) {}
+
 void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n) {
     matvec_batch_scalar(w, x_batch, out_batch, n);
