@@ -139,7 +139,11 @@ deepseek-coder) and
 rendered by a hardcoded formatter; an unknown template falls back
 to plain concatenation. Endpoints that run the model on their own
 thread (images, vision chat, audio) share the GPU backend through one
-process-wide lock (#268).
+process-wide lock (#268). `http::Client` is the first-party client
+for locus's own upstream calls (the router of #388): a pure response
+parser with the request parser's hardening, a streaming chunk
+decoder, and connect and read deadlines with one kept-alive
+connection, resent once when the server closed it while idle.
 
 ## 5. Milestones
 
