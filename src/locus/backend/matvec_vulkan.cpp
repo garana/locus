@@ -1530,6 +1530,26 @@ void vulkan_free_kv(float* pool) {
     }
 }
 
+namespace {
+std::atomic<int> g_batch_invariant{-1};  // -1: not read from the env yet
+}  // namespace
+
+void vulkan_set_batch_invariant(bool on) {
+    g_batch_invariant.store(on ? 1 : 0);
+}
+
+bool vulkan_batch_invariant() {
+    int v = g_batch_invariant.load();
+    if (v < 0) {
+        const char* e = std::getenv("LOCUS_VK_BATCH_INVARIANT");
+        v = e != nullptr && *e != '\0' && std::string(e) != "0" ? 1 : 0;
+        int expected = -1;
+        g_batch_invariant.compare_exchange_strong(expected, v);
+        v = g_batch_invariant.load();
+    }
+    return v == 1;
+}
+
 void vulkan_reset_state() {
     std::lock_guard lk(state_mu());
     state().free_buffers(false);
@@ -2857,7 +2877,18 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
     using C = State::Chunk;
     const auto bx = s.chunk_buf(C::kCX, std::size_t{n} * E);
     const auto bxb = s.chunk_buf(C::kCXb, std::size_t{n} * E);
-    const auto bq = s.chunk_buf(C::kCQ, std::size_t{n} * q_dim);
+    // q, k and v of every layer stacked per token ([q | k | v], R
+    // floats a token) by one short-batch dispatch over the concatenated
+    // weights, when all three are Q8_0: each row is the same dot the
+    // separate projections compute.
+    const auto& lay0 = m.layers()[0];
+    const bool qkv_cat = n <= kSmallBatch &&
+                         lay0.wq.type == gguf::TensorType::kQ8_0 &&
+                         lay0.wk.type == gguf::TensorType::kQ8_0 &&
+                         lay0.wv.type == gguf::TensorType::kQ8_0;
+    const std::uint32_t R = q_dim + 2 * kv_dim;
+    const auto bq =
+        s.chunk_buf(C::kCQ, std::size_t{n} * (qkv_cat ? R : q_dim));
     const auto bkv = s.chunk_buf(C::kCK, std::size_t{2} * n * kv_dim);
     const auto bgate = s.chunk_buf(C::kCGate, std::size_t{n} * ff);
     const auto bup = s.chunk_buf(C::kCUp, std::size_t{n} * ff);
@@ -2923,52 +2954,89 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
         const auto& lay = m.layers()[l];
         norm_rows(lay.attn_norm, bx, bxb);
         mark(s, model::Stage::kNorm);
-        proj(lay.wq, bxb, E, bq, 0, q_dim, false);
-        proj(lay.wk, bxb, E, bkv, 0, kv_dim, false);
-        proj(lay.wv, bxb, E, bkv, n * kv_dim, kv_dim, false);
+        if (qkv_cat) {
+            const Mat* qkv[] = {&lay.wq, &lay.wk, &lay.wv};
+            const VulkanContext::Buffer bufs[] = {s.upload_cat(qkv), bxb,
+                                                  bq};
+            const std::uint32_t push[] = {R, E, 0, 0, 0, 0, fbits(1.0f), n,
+                                          E, R, 0, 0, 0};
+            s.ctx.dispatch(Kernel::kMatvecQ8_0N, bufs, push,
+                           VulkanContext::matvec_groups(
+                               Kernel::kMatvecQ8_0N, R));
+        } else {
+            proj(lay.wq, bxb, E, bq, 0, q_dim, false);
+            proj(lay.wk, bxb, E, bkv, 0, kv_dim, false);
+            proj(lay.wv, bxb, E, bkv, n * kv_dim, kv_dim, false);
+        }
+        // Where sequence i's q and k rows start, and its V row's
+        // distance from its K row.
+        const VulkanContext::Buffer bk = qkv_cat ? bq : bkv;
         for (std::uint32_t i = 0; i < n; ++i) {
             const std::uint32_t pos = steps[i].seq->n_tokens;
+            const std::uint32_t q_at = qkv_cat ? i * R : i * q_dim;
+            const std::uint32_t k_at = qkv_cat ? i * R + q_dim : i * kv_dim;
+            const std::uint32_t v_from_k = qkv_cat ? kv_dim : n * kv_dim;
             {
                 const VulkanContext::Buffer bufs[] = {bq, divisors};
                 const std::uint32_t push[] = {
-                    H,         hd, pos, i * q_dim, hd, base_bits,
+                    H,         hd, pos, q_at, hd, base_bits,
                     fbits(1.0f), 0, 0};
                 s.ctx.dispatch(rope_k, bufs, push, H);
             }
             {
-                const VulkanContext::Buffer bufs[] = {bkv, divisors};
+                const VulkanContext::Buffer bufs[] = {bk, divisors};
                 const std::uint32_t push[] = {
-                    hp.n_kv_heads, hd, pos, i * kv_dim, hd, base_bits,
+                    hp.n_kv_heads, hd, pos, k_at, hd, base_bits,
                     fbits(1.0f),   0,  0};
                 s.ctx.dispatch(rope_k, bufs, push, hp.n_kv_heads);
             }
             {
-                // This sequence's K and V rows (planes n * kv_dim apart)
-                // into its own block, through its own table.
-                const VulkanContext::Buffer bufs[] = {bkv, pool,
+                // This sequence's K and V rows into its own block,
+                // through its own table.
+                const VulkanContext::Buffer bufs[] = {bk, pool,
                                                       s.mtable[i]};
                 const std::uint32_t push[] = {
                     kv_dim,       pos,        geom.block_tokens,
                     block_stride, kv_dim,     l * layer_stride,
-                    i * kv_dim,   kv_dim,     n * kv_dim,
+                    k_at,         kv_dim,     v_from_k,
                     layer_stride / 2};
                 s.ctx.dispatch(Kernel::kKvScatter, bufs, push, 1, 1, 2);
             }
-            copy(bq, i * q_dim, s.q, 0, q_dim);
+            // Sequence 0's q and output rows sit at offset 0 of the
+            // batch planes, so its attention reads and writes them in
+            // place; the others go through the scratch rows (copies
+            // only, so the math is the same either way).
             const PagedPool pp{pool, s.mtable[i], geom.block_tokens,
                                block_stride, kv_dim, false};
-            rec_attn_gqa(s, pp, s.q, s.att, s.attout, 1, pos, H, group, hd,
-                         q_dim, l * layer_stride, layer_stride / 2);
-            copy(s.attout, 0, batt, i * q_dim, q_dim);
+            if (i == 0) {
+                rec_attn_gqa(s, pp, bq, s.att, batt, 1, pos, H, group, hd,
+                             q_dim, l * layer_stride, layer_stride / 2);
+            } else {
+                copy(bq, q_at, s.q, 0, q_dim);
+                rec_attn_gqa(s, pp, s.q, s.att, s.attout, 1, pos, H, group,
+                             hd, q_dim, l * layer_stride, layer_stride / 2);
+                copy(s.attout, 0, batt, i * q_dim, q_dim);
+            }
         }
         proj(lay.wo, batt, q_dim, bx, 0, E, true);
         mark(s, model::Stage::kAttention);
 
         norm_rows(lay.ffn_norm, bx, bxb);
         mark(s, model::Stage::kNorm);
-        proj(lay.w_gate, bxb, E, bgate, 0, ff, false);
-        proj(lay.w_up, bxb, E, bup, 0, ff, false);
-        {
+        if (lay.w_gate.type == gguf::TensorType::kQ8_0 &&
+            lay.w_up.type == gguf::TensorType::kQ8_0 && n <= kSmallBatch) {
+            // Gate, up and silu_mul in one short-batch dispatch (both
+            // dots as matvec_q8_0_n computes one).
+            const VulkanContext::Buffer bufs[] = {
+                s.upload_w(lay.w_gate), bxb, bgate, s.upload_w(lay.w_up)};
+            const std::uint32_t push[] = {ff, E, 0, 0, 0, 0, fbits(1.0f), n,
+                                          E,  ff, 0, 0, 0};
+            s.ctx.dispatch(Kernel::kMatvecQ8_0NGlu, bufs, push,
+                           VulkanContext::matvec_groups(
+                               Kernel::kMatvecQ8_0NGlu, ff));
+        } else {
+            proj(lay.w_gate, bxb, E, bgate, 0, ff, false);
+            proj(lay.w_up, bxb, E, bup, 0, ff, false);
             const VulkanContext::Buffer bufs[] = {bgate, bup, bgate};
             const std::uint32_t push[] = {n * ff};
             s.ctx.dispatch(Kernel::kSiluMul, bufs, push,

@@ -254,6 +254,17 @@ std::size_t vulkan_kv_pool_count();
 void vulkan_reset_state();
 
 /**
+ * Batch-invariant Vulkan decode (#432): when on, a lone sequence also
+ * decodes through vulkan_forward_multi's kernels, so a request's
+ * logits are bit-identical alone or batched; off (the default), it
+ * takes vulkan_forward's faster single-sequence kernels. The default
+ * comes from LOCUS_VK_BATCH_INVARIANT (any value but "0" or empty).
+ */
+void vulkan_set_batch_invariant(bool on);
+/** @returns Whether batch-invariant Vulkan decode is on. */
+bool vulkan_batch_invariant();
+
+/**
  * Drops the Vulkan weight-pool buffers (copies and in-place imports)
  * over host memory [p, p + n), as an unmap does: an image pipeline
  * whose parts do not all fit the GPU at once releases one part before

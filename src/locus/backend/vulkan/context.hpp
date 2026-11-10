@@ -148,6 +148,8 @@ enum class Kernel {
     kLayerNorm,
     /** conv2d as a tiled implicit GEMM (groups == 1). */
     kConv2dGemm,
+    /** matvec_q8_0_n with SwiGLU: gate, up and silu_mul in one. */
+    kMatvecQ8_0NGlu,
     kCount_,
 };
 

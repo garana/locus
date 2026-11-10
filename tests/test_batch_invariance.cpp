@@ -129,10 +129,15 @@ TEST_CASE("a request decodes the same alone or batched: Q8_0 and Q4_K_M",
           "[batch][invariance][e2e]") {
     // The scalar backend takes hours on these; stories260K covers it.
     // On Vulkan a Q8_0 model decodes batches through the multi-sequence
-    // kernels and a lone sequence through the single-sequence ones, so
-    // it is not batch-invariant there yet (#432).
+    // kernels and, by default, a lone sequence through the faster
+    // single-sequence ones, so it is batch-invariant there only in
+    // batch-invariant mode (#432), which this leg turns on.
     DYNAMIC_SECTION("llama-3.2-1b-q8_0.gguf") {
-        check_model(kModels + "llama-3.2-1b-q8_0.gguf", 16, false, false);
+        struct Mode {
+            Mode() { locus::backend::vulkan_set_batch_invariant(true); }
+            ~Mode() { locus::backend::vulkan_set_batch_invariant(false); }
+        } mode;
+        check_model(kModels + "llama-3.2-1b-q8_0.gguf", 16, false);
     }
     DYNAMIC_SECTION("llama-3.2-1b-q4_k_m.gguf") {
         check_model(kModels + "llama-3.2-1b-q4_k_m.gguf", 16, false);

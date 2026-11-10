@@ -20,6 +20,12 @@
 // weights) per load where rows are word-aligned (w_off and w_bstride
 // in halves); i#267, both CFG sequences of Janus-Pro (BF16).
 //
+// -DSWIGLU (matvec_q8_0_n_glu, Q8_0 only): W is the gate matrix and WU
+// (binding 3) the up matrix of the same shape; each output gets both
+// dots, computed as the plain kernel computes one, and is
+// silu(gate) * up (silu_mul.comp's formula): the gate, up and silu_mul
+// dispatches of a SwiGLU block in one.
+//
 // -DNT2 (the *_n2 builds) caps the tokens at 2: the 8-wide token loop
 // and its 8-plane reduction cost as much as the weight read, so two
 // tokens through the NT 8 build took as long as two matvecs; the NT 2
@@ -43,6 +49,9 @@ layout(std430, binding = 0) readonly buffer W { uint w[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 1) readonly buffer X4 { vec4 x4[]; };
 layout(std430, binding = 2) buffer O { float o[]; };
+#ifdef SWIGLU
+layout(std430, binding = 3) readonly buffer WU { uint wu[]; };
+#endif
 
 layout(push_constant) uniform PC {
     uint rows;
@@ -61,6 +70,9 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared float red[NT * LANES * ROWS];
+#ifdef SWIGLU
+shared float red_u[NT * LANES * ROWS];
+#endif
 
 #ifdef TYPE_F16
 #ifdef BF16
@@ -89,6 +101,13 @@ uint word_at(uint b) {
     uint sh = (b & 3u) * 8u;
     return sh == 0u ? w[i] : (w[i] >> sh) | (w[i + 1u] << (32u - sh));
 }
+#ifdef SWIGLU
+uint word_at_u(uint b) {
+    uint i = b >> 2;
+    uint sh = (b & 3u) * 8u;
+    return sh == 0u ? wu[i] : (wu[i] >> sh) | (wu[i + 1u] << (32u - sh));
+}
+#endif
 #endif
 
 void main() {
@@ -106,6 +125,12 @@ void main() {
     for (uint t = 0u; t < NT; ++t) {
         acc[t] = 0.0;
     }
+#ifdef SWIGLU
+    float acc_u[NT];
+    for (uint t = 0u; t < NT; ++t) {
+        acc_u[t] = 0.0;
+    }
+#endif
     bool xal = ((x_off | pc.x_stride) & 3u) == 0u;
 #ifdef TYPE_F32
     if (r < pc.rows) {
@@ -172,6 +197,20 @@ void main() {
             wq[6] = float(bitfieldExtract(q1, 16, 8));
             wq[7] = float(bitfieldExtract(q1, 24, 8));
             uint xc = x_off + b * 32u + sub * 8u;
+#ifdef SWIGLU
+            float du = unpackHalf2x16(wu[sa >> 2] >> ((sa & 2u) * 8u)).x;
+            int u0 = int(al ? wu[qa >> 2] : word_at_u(qa));
+            int u1 = int(al ? wu[(qa >> 2) + 1u] : word_at_u(qa + 4u));
+            float wv[8];
+            wv[0] = float(bitfieldExtract(u0, 0, 8));
+            wv[1] = float(bitfieldExtract(u0, 8, 8));
+            wv[2] = float(bitfieldExtract(u0, 16, 8));
+            wv[3] = float(bitfieldExtract(u0, 24, 8));
+            wv[4] = float(bitfieldExtract(u1, 0, 8));
+            wv[5] = float(bitfieldExtract(u1, 8, 8));
+            wv[6] = float(bitfieldExtract(u1, 16, 8));
+            wv[7] = float(bitfieldExtract(u1, 24, 8));
+#endif
             // Constant trip count (guard inside) keeps acc in
             // registers. Same per-token arithmetic order as
             // matvec_q8_0.comp; vec4 x loads when rows are 4-aligned.
@@ -179,6 +218,9 @@ void main() {
                 if (t < nt) {
                     uint xi = xc + t * pc.x_stride;
                     float s = 0.0;
+#ifdef SWIGLU
+                    float su = 0.0;
+#endif
                     for (uint k = 0u; k < 2u; ++k) {
                         uint xk = xi + k * 4u;
                         vec4 xv = xal ? x4[xk >> 2]
@@ -188,22 +230,44 @@ void main() {
                              wq[k * 4u + 1u] * xv.y +
                              wq[k * 4u + 2u] * xv.z +
                              wq[k * 4u + 3u] * xv.w;
+#ifdef SWIGLU
+                        su += wv[k * 4u] * xv.x +
+                              wv[k * 4u + 1u] * xv.y +
+                              wv[k * 4u + 2u] * xv.z +
+                              wv[k * 4u + 3u] * xv.w;
+#endif
                     }
                     acc[t] += d * s;
+#ifdef SWIGLU
+                    acc_u[t] += du * su;
+#endif
                 }
             }
         }
     }
 #endif
+    // Only the nt live token planes are stored and reduced: a short
+    // batch (one sequence, in the multi-sequence decode) skips the
+    // others, and each live plane's sums are the same either way.
     for (uint t = 0u; t < NT; ++t) {
-        red[t * LANES * ROWS + tid] = acc[t];
+        if (t < nt) {
+            red[t * LANES * ROWS + tid] = acc[t];
+#ifdef SWIGLU
+            red_u[t * LANES * ROWS + tid] = acc_u[t];
+#endif
+        }
     }
     barrier();
     for (uint step = LANES / 2u; step > 0u; step >>= 1) {
         if (lane < step) {
             for (uint t = 0u; t < NT; ++t) {
-                uint i = t * LANES * ROWS + tid;
-                red[i] += red[i + step];
+                if (t < nt) {
+                    uint i = t * LANES * ROWS + tid;
+                    red[i] += red[i + step];
+#ifdef SWIGLU
+                    red_u[i] += red_u[i + step];
+#endif
+                }
             }
         }
         barrier();
@@ -213,6 +277,12 @@ void main() {
         float v = red[lane * LANES * ROWS + slot * LANES] * pc.scale;
         uint oi = pc.out_offset + bt * pc.out_bstride +
                   lane * pc.out_stride + r;
+#ifdef SWIGLU
+        // silu_mul.comp's formula on the gate and up outputs.
+        float u = red_u[lane * LANES * ROWS + slot * LANES] * pc.scale;
+        o[oi] = v / (1.0 + exp(-v)) * u;
+#else
         o[oi] = pc.accumulate != 0u ? o[oi] + v : v;
+#endif
     }
 }
