@@ -1,3 +1,4 @@
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <cstring>
@@ -1079,6 +1080,12 @@ TEST_CASE("neon activation quantizers are bit-identical to the scalar",
             all[j] = rows[1][j];
         }
         rows.push_back(all);
+        // A NaN with payload bits (i#473): nearest_int's bit trick would
+        // turn them into a nonzero quant; both paths give 0.
+        std::vector<float> pay = rows[0];
+        pay[17] = std::bit_cast<float>(0x7fc12345u);
+        pay[300] = std::bit_cast<float>(0xffc0abcdu);
+        rows.push_back(pay);
     }
     for (std::size_t ri = 0; ri < rows.size(); ++ri) {
         INFO("row " << ri);
@@ -1091,11 +1098,23 @@ TEST_CASE("neon activation quantizers are bit-identical to the scalar",
         REQUIRE(da == db);
         REQUIRE(qa == qb);
         REQUIRE(sa == sb);
+        for (std::size_t j = 0; j < x.size(); ++j) {
+            if (std::isnan(x[j])) {
+                INFO("q8k nan at " << j);
+                REQUIRE(qa[j] == 0);
+            }
+        }
         std::vector<float> ea(16), eb(16);
         quantize_activation_q8_0(x, ea.data(), qa.data());
         quantize_activation_q8_0_neon(x, eb.data(), qb.data());
         REQUIRE(ea == eb);
         REQUIRE(qa == qb);
+        for (std::size_t j = 0; j < x.size(); ++j) {
+            if (std::isnan(x[j])) {
+                INFO("q8_0 nan at " << j);
+                REQUIRE(qa[j] == 0);
+            }
+        }
     }
 }
 
@@ -1786,5 +1805,33 @@ TEST_CASE("matvec_q8k dots block-32 weights against a Q8_0 activation",
                 REQUIRE(q8[r] == Approx(f32[r]).epsilon(0.01).margin(0.05));
             }
         }
+    }
+}
+
+TEST_CASE("scalar activation quantizers map NaN to 0", "[ops][q8k]") {
+    // i#473: converting a NaN to an integer is undefined (x86 gives
+    // INT_MIN), and nearest_int's bit trick turns a NaN's payload into
+    // a quant; on every host both quantizers give 0 there.
+    std::vector<float> x(256);
+    for (int j = 0; j < 256; ++j) {
+        x[j] = 0.01f * static_cast<float>(j - 128);
+    }
+    x[3] = std::numeric_limits<float>::quiet_NaN();
+    x[40] = std::bit_cast<float>(0x7fc12345u);
+    x[200] = std::bit_cast<float>(0xffc0abcdu);
+    float d8k = 0.0f;
+    std::vector<std::int8_t> q(256);
+    std::vector<std::int16_t> s(16);
+    quantize_activation_q8k(x, &d8k, q.data(), s.data());
+    CHECK(std::isfinite(d8k));
+    for (const int j : {3, 40, 200}) {
+        INFO("q8k j " << j);
+        CHECK(q[j] == 0);
+    }
+    std::vector<float> d(8);
+    quantize_activation_q8_0(x, d.data(), q.data());
+    for (const int j : {3, 40, 200}) {
+        INFO("q8_0 j " << j);
+        CHECK(q[j] == 0);
     }
 }
