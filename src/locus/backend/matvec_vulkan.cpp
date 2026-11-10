@@ -1583,7 +1583,7 @@ bool vulkan_batch_invariant() {
     int v = g_batch_invariant.load();
     if (v < 0) {
         const char* e = std::getenv("LOCUS_VK_BATCH_INVARIANT");
-        v = e != nullptr && *e != '\0' && std::string(e) != "0" ? 1 : 0;
+        v = e != nullptr && std::string(e) == "0" ? 0 : 1;
         int expected = -1;
         g_batch_invariant.compare_exchange_strong(expected, v);
         v = g_batch_invariant.load();
