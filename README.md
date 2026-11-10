@@ -30,10 +30,10 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **API:** `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
   `/v1/responses` (stateless), `/v1/embeddings`, `/v1/rerank`,
   `/v1/models`, `/metrics`, `/health`.
-- **Embedding models:** GGUFs of arch `bert`, BERT (WordPiece) or
-  XLM-R (SentencePiece), with `--embedding-model`, beside the chat
-  model, on the CPU; tested with bge-small-en-v1.5, e5-small-v2 and
-  bge-m3. A reranker (an XLM-R cross-encoder such as
+- **Embedding models:** GGUFs of arch `bert` (BERT with WordPiece, or
+  XLM-R with SentencePiece) or `nomic-bert`, with `--embedding-model`,
+  beside the chat model, on the CPU; tested with bge-small-en-v1.5,
+  e5-small-v2, bge-m3 and nomic-embed-text v1.5. A reranker (an XLM-R cross-encoder such as
   bge-reranker-v2-m3) serves `/v1/rerank` with `--rerank-model`.
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
   penalties, seed), structured output (JSON mode, a JSON Schema, a
@@ -169,7 +169,6 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
-- RAG: more embedding models, nomic-bert (#502).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
 - Low priority: a quantized KV cache for MLA and DSA models (#63);
@@ -182,9 +181,9 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
     ./build/tests/locus_tests
 
 Tests that need model files skip when the file is absent;
-`scripts/fetch-test-model.sh` gets the small ones (`bge`, `e5` or
-`bge-m3` as its argument gets that embedding model). Tests tagged as
-heavy also need `LOCUS_HEAVY_TESTS=1`.
+`scripts/fetch-test-model.sh` gets the small ones (`bge`, `e5`,
+`bge-m3` or `nomic` as its argument gets that embedding model). Tests
+tagged as heavy also need `LOCUS_HEAVY_TESTS=1`.
 
 ## Run
 
