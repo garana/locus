@@ -1166,13 +1166,24 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
         return;
     }
     if (backend_->name == "vulkan") {
-        if (vulkan_forward_batch(*this, toks, cache, seq, logits,
+        // A short chunk gives each routed expert about one token, and
+        // the GPU expert matmul's token tiles then run nearly empty: on
+        // Qwen3-Coder-30B-A3B (128 experts, 8 per token) its three
+        // matmuls per layer cost ~265 ms whatever the chunk, so under
+        // ~30 tokens one decode step per token is faster (i#436). Below
+        // 2 tokens per expert on average, this chunk goes per token.
+        const bool few_per_expert =
+            hp_.n_expert > 0 &&
+            std::uint64_t{n} * hp_.n_expert_used <
+                std::uint64_t{2} * hp_.n_expert;
+        if (!few_per_expert &&
+            vulkan_forward_batch(*this, toks, cache, seq, logits,
                                  all_logits)) {
             lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
             return;
         }
-        // Unsupported on the GPU batch path: one forward() per
-        // token, which itself picks the GPU or the CPU.
+        // Unsupported on the GPU batch path, or too short for it: one
+        // forward() per token, which itself picks the GPU or the CPU.
         const std::uint32_t V = hp_.n_vocab;
         std::vector<float> scratch(V);
         for (std::uint32_t t = 0; t < n; ++t) {
