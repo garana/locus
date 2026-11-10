@@ -107,6 +107,7 @@ const std::vector<Backend>& list() {
                       .kv_mirror_alloc = &cuda_kv_mirror_alloc,
                       .kv_mirror_store = &cuda_kv_mirror_store,
                       .kv_mirror_free = &cuda_kv_mirror_free,
+                      .kv_attend = &cuda_kv_attend,
                       .prefetch = &cuda_prefetch,
                       .evict = &cuda_evict,
                       .pool_budget = &cuda_pool_budget}});

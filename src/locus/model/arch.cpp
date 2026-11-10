@@ -107,6 +107,13 @@ void llama_attention(const TransformerModel& m,
                   m.rope_factors());
         rope_norm({krow, kv_dim}, hp.n_kv_heads, hd, pos,
                   hp.rope_freq_base, m.rope_factors());
+        // With a device KV mirror (CUDA, i#466) the attention runs on
+        // the GPU over it; the host pool stays the source of truth.
+        cache.sync_rows(seq, l, pos, 1);
+        if (device_gqa_attend(op, cache, seq, l, hp, pos, 1, ws.q.data(),
+                              ws.out.data(), ws.q.size())) {
+            return;
+        }
     }
     // In F32 mode rows live in the cache with a fixed per-position
     // stride; a lambda hides the two layouts from the head loops.

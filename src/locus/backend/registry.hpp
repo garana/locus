@@ -8,6 +8,31 @@
 
 namespace locus::backend {
 
+/**
+ * GQA attention over a device KV mirror (Ops.kv_attend, i#466): n_q
+ * queries of one sequence at positions base .. base + n_q - 1, query i
+ * seeing positions 0 .. base + i. Offsets are in floats into the mirror,
+ * which has the host paged pool's layout.
+ */
+struct KvAttend {
+    const void* mirror = nullptr;
+    /** The sequence's block table: position t is in blocks[t / bt]. */
+    const std::uint32_t* blocks = nullptr;
+    std::uint32_t n_blocks = 0;
+    /** Floats per block, the layer's offset in a block, and V's offset
+     *  past K inside the layer. */
+    std::size_t block_stride = 0, layer_off = 0, v_off = 0;
+    std::uint32_t block_tokens = 0;
+    std::uint32_t n_heads = 0, n_kv_heads = 0, head_dim = 0;
+    float kq_scale = 1.0f;
+    std::uint32_t n_q = 0, base = 0;
+    /** n_q rows of n_heads * head_dim floats, q_stride floats apart. */
+    const float* q = nullptr;
+    /** Out: as q. */
+    float* out = nullptr;
+    std::size_t q_stride = 0;
+};
+
 /** Op table a backend provides to the model runtime. Ops not in
  * the table (rmsnorm, rope, ...) are negligible on CPU backends;
  * the vulkan backend replaces the whole forward pass instead. */
@@ -103,6 +128,14 @@ struct Ops {
                             std::size_t n) = nullptr;
     /** Frees a kv_mirror_alloc allocation. */
     void (*kv_mirror_free)(void* dev) = nullptr;
+    /**
+     * Optional attention over a kv_mirror_alloc mirror (nullptr: the
+     * host attends). Each (query, KV head) pair is computed the same way
+     * whatever n_q is, so prefill and decode give the same bits.
+     * @returns false on a device error (the caller then attends on the
+     *     host).
+     */
+    bool (*kv_attend)(const KvAttend& a) = nullptr;
     /**
      * Optional one-step-ahead weight-prefetch hint (nullptr on
      * backends without a pager). The model may call this at the R8
