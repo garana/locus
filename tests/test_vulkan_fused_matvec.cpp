@@ -365,9 +365,9 @@ TEST_CASE("vulkan MoE matvecs fold the shared experts into the routed "
         want[r] += ds[r];
         // Relative too: the shader may fuse its multiply-adds and the
         // CPU reference (-ffp-contract=off) does not, so on a value near
-        // 6 the two can part by 1.1e-4 (V3D).
+        // 6 the two part by 1.07e-4 (V3D), a relative 1.7e-5.
         REQUIRE(out[r] ==
-                Catch::Approx(want[r]).epsilon(1e-5).margin(1e-4));
+                Catch::Approx(want[r]).epsilon(1e-4).margin(1e-4));
     }
     for (auto b : {gb, ub, db, sgb, sub, sdb, xb, rb, hb, ob}) {
         ctx.destroy_buffer(b);
