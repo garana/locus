@@ -120,7 +120,8 @@ inline Spec<StageOptions> stage_spec() {
                    "stderr every N s (0 = off)"),
         D::integer("resolve-ttl", &O::resolve_ttl,
                    "downstream-name cache TTL s when DNS gives no "
-                   "record TTL (else the record's, capped)"),
+                   "record TTL (else the record's, capped); a name "
+                   "is refreshed no more often than every 5 s"),
         D::integer("resolve-max-ttl", &O::resolve_max_ttl,
                    "cap on the downstream-name cache TTL s"),
         D::integer("resolve-refresh-percent", &O::resolve_refresh_percent,
