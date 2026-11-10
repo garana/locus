@@ -15,7 +15,8 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
       cfg_(cfg),
       cache_(m.make_cache(cfg.n_blocks, cfg.kv_type)),
       ws_(m.make_workspace()),
-      logits_(m.hparams().n_vocab) {
+      logits_(m.hparams().n_vocab),
+      spec_cost_(m.active_backend().name == "vulkan") {
     if (cfg_.prefill_budget == 0) {
         cfg_.prefill_budget = m.prefill_chunk();
     }

@@ -51,14 +51,22 @@ void observe_guess(DraftState& s, bool hit);
  */
 class DraftCost {
   public:
-    /** Records one forward of `drafted` drafts that took `seconds`;
-     * the first one of each length is dropped (one-time costs). */
+    /**
+     * @param drop_first Drop the first forward of each length: on
+     *     Vulkan it pays the one-time cost of a new batch size. On the
+     *     CPU and CUDA there is none, so every forward counts and a
+     *     short request stops trying lengths sooner.
+     */
+    explicit DraftCost(bool drop_first = false) : drop_first_(drop_first) {}
+
+    /** Records one forward of `drafted` drafts that took `seconds`. */
     void observe(std::uint32_t drafted, double seconds);
     /** @returns the moving average for `drafted`, or 0 if not
      * measured yet. */
     double seconds(std::uint32_t drafted) const;
 
   private:
+    bool drop_first_;
     std::vector<double> sec_;
     std::vector<std::uint32_t> seen_;
 };
