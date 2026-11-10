@@ -926,6 +926,89 @@ TEST_CASE("matvec_batch_neon BF16 tiles are byte-identical to per-token "
         }
     }
 }
+
+TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
+          "[ops][batch][neon]") {
+    // n = 7: one 4-token pass and a 3-token tail. Q4_K / Q6_K take the
+    // multi-token sdot kernels (their own float order): within f32
+    // rounding of the scalar Q8_K dot, and a token's value does not
+    // depend on its place in the batch. Q5_K falls back per token and
+    // block-32 types take the bit-identical 4-token kernel: both equal
+    // matvec_neon_q8k exactly.
+    constexpr std::uint32_t rows = 5, n = 7;
+    std::mt19937 rng(101);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    const auto tokens = [&](std::uint32_t cols) {
+        std::vector<float> xb(std::size_t{n} * cols);
+        for (auto& v : xb) {
+            v = xd(rng);
+        }
+        return xb;
+    };
+    const std::uint32_t kcols = 2 * 256;
+    const auto xk = tokens(kcols);
+    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K,
+                         TensorType::kQ5_K}) {
+        std::vector<std::byte> w;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto row = k_quant_row(t, 2, 200 + r);
+            w.insert(w.end(), row.begin(), row.end());
+        }
+        const Mat m{t, w.data(), rows, kcols};
+        std::vector<float> got(std::size_t{rows} * n);
+        matvec_batch_neon_q8k(m, xk, got, n);
+        for (std::uint32_t tk = 0; tk < n; ++tk) {
+            const std::span<const float> x(xk.data() + std::size_t{tk} * kcols,
+                                           kcols);
+            std::vector<float> ref(rows), one(rows);
+            matvec_q8k(m, x, ref);
+            matvec_batch_neon_q8k(m, x, one, 1);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                INFO("type " << static_cast<int>(t) << " r=" << r
+                             << " t=" << tk);
+                const float g = got[std::size_t{r} * n + tk];
+                REQUIRE(g == one[r]);
+                if (t == TensorType::kQ5_K) {
+                    float neon = 0.0f;
+                    matvec_neon_q8k(mat_rows(m, r, 1), x, {&neon, 1});
+                    REQUIRE(g == neon);
+                } else {
+                    REQUIRE(g == Approx(ref[r]).epsilon(1e-5).margin(1e-4));
+                }
+            }
+        }
+    }
+    // 25 blocks per row: the odd-block tail runs too.
+    const std::uint32_t bcols = 800;
+    const auto xq = tokens(bcols);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
+    for (const auto& [t, bytes] : {std::pair{TensorType::kQ8_0, 34u},
+                                   std::pair{TensorType::kQ4_0, 18u},
+                                   std::pair{TensorType::kIQ4_NL, 18u}}) {
+        std::vector<std::byte> w(std::size_t{rows} * (bcols / 32) * bytes);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / bytes; ++bl) {
+            const std::uint16_t d = f32_to_f16(scale_d(rng));
+            std::memcpy(w.data() + bl * bytes, &d, 2);
+        }
+        const Mat m{t, w.data(), rows, bcols};
+        std::vector<float> got(std::size_t{rows} * n);
+        matvec_batch_neon_q8k(m, xq, got, n);
+        for (std::uint32_t tk = 0; tk < n; ++tk) {
+            std::vector<float> ref(rows);
+            matvec_neon_q8k(
+                m, {xq.data() + std::size_t{tk} * bcols, bcols}, ref);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                INFO("type " << static_cast<int>(t) << " r=" << r
+                             << " t=" << tk);
+                REQUIRE(got[std::size_t{r} * n + tk] == ref[r]);
+            }
+        }
+    }
+}
 #endif
 
 TEST_CASE("conv1d dense matches a hand-computed same-padded case",

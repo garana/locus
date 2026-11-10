@@ -181,9 +181,10 @@ TEST_CASE("neon matvec matches scalar", "[backend]") {
     }
 }
 
-// R16 on NEON: the int8 Q4_K / Q6_K dots are bit-identical to scalar
-// matvec_q8k (ggml's generic order, which the llama.cpp-golden models
-// were validated on); other types delegate to it.
+// R16 on NEON: the int8 Q4_K / Q6_K dots sum each block's integers
+// exactly and take one float step per block (batch-invariant, see
+// matvec_batch_neon_q8k), so they match scalar matvec_q8k within f32
+// rounding; Q5_K delegates to it exactly.
 TEST_CASE("neon q8k matvec matches scalar q8k", "[backend]") {
     using TT = locus::gguf::TensorType;
     struct Q {
@@ -224,7 +225,12 @@ TEST_CASE("neon q8k matvec matches scalar q8k", "[backend]") {
         matvec_neon_q8k(m, x, b);
         for (std::uint32_t r = 0; r < rows; ++r) {
             INFO("type " << static_cast<int>(q.type) << " row " << r);
-            REQUIRE(b[r] == a[r]);
+            if (q.type == TT::kQ5_K) {
+                REQUIRE(b[r] == a[r]);
+            } else {
+                REQUIRE(b[r] ==
+                        Catch::Approx(a[r]).epsilon(1e-5).margin(1e-4));
+            }
         }
     }
 }

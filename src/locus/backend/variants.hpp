@@ -16,11 +16,13 @@ void matvec_neon(const Mat& w, std::span<const float> x,
                  std::span<float> out);
 
 /**
- * NEON Q8_K-activation matvec (R16): quantizes x to Q8_K once and
- * integer-dots it with Q4_K / Q6_K rows -- per-lane widening products
- * (vmull_s8) for the scalar dot's exact aux32 integers, then its float
- * steps verbatim -- so the result is bit-identical to scalar
- * matvec_q8k (ggml's generic order). Other types delegate to it.
+ * NEON 8-bit activation matvec (R16): quantizes x once (Q8_K for Q4_K
+ * / Q6_K rows, Q8_0 for block-32 rows) and integer-dots it with the
+ * weights. Q4_K / Q6_K use matvec_batch_neon_q8k's kernels with one
+ * token (exact integers per block, one float step per block), so a
+ * token's value is the same alone or in a batch, and within f32
+ * rounding of scalar matvec_q8k. Block-32 rows are bit-identical to
+ * the scalar dot. Other types delegate to scalar matvec_q8k.
  */
 void matvec_neon_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out);
@@ -39,6 +41,16 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
 void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch,
                        std::uint32_t n);
+
+/**
+ * matvec_neon_q8k on n tokens (Ops::matvec_q8k_batch): token-major
+ * x_batch, row-major out_batch (out[r*n + t]). Each token is quantized
+ * once, then each weight row is dotted against four tokens at a time
+ * while it is in cache. Byte-identical to n matvec_neon_q8k() calls
+ * (the same row dot on the same quants).
+ */
+void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
+                           std::span<float> out_batch, std::uint32_t n);
 #endif
 
 #if defined(__x86_64__)

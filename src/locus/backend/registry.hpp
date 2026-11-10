@@ -59,6 +59,15 @@ struct Ops {
     void (*matvec_batch)(const Mat&, std::span<const float>,
                          std::span<float>, std::uint32_t n) = nullptr;
     /**
+     * Optional batched matvec_q8k, in matvec_batch's layouts: each
+     * token is quantized once and each weight row is dotted against
+     * all n tokens while it is in cache. Must be byte-identical to n
+     * matvec_q8k() calls (the same per-row, per-token dot). nullptr:
+     * the model loops matvec_q8k per token.
+     */
+    void (*matvec_q8k_batch)(const Mat&, std::span<const float>,
+                             std::span<float>, std::uint32_t n) = nullptr;
+    /**
      * True when the backend parallelizes the weight rows itself and
      * wants the WHOLE matrix in each matvec, matvec_q8k and
      * matvec_batch call (a GPU backend: its kernel grids over all
