@@ -239,6 +239,67 @@ TEST_CASE("bert encoder matches a plain reference on a tiny model",
     }
 }
 
+TEST_CASE("bert reranker head scores the CLS state", "[bert][rerank]") {
+    // The synthetic model plus a RoBERTa head with two labels:
+    // logits = cls.output * tanh(cls * x0 + b) + b.
+    auto tensors = synth_tensors();
+    std::vector<Tensor> head = {{"cls.weight", {kWidth, kWidth}, {}},
+                                {"cls.bias", {kWidth}, {}},
+                                {"cls.output.weight", {2, kWidth}, {}},
+                                {"cls.output.bias", {2}, {}}};
+    std::uint32_t lcg = 503;
+    for (auto& t : head) {
+        std::size_t n = 1;
+        for (auto d : t.shape) n *= d;
+        t.data.resize(n);
+        for (auto& v : t.data) {
+            lcg = lcg * 1664525u + 1013904223u;
+            v = static_cast<float>(lcg >> 8) / 16777216.0f - 0.5f;
+        }
+        tensors.push_back(t);
+    }
+    const auto img = synth_bert(tensors, 4);
+    const auto g = locus::gguf::GgufFile::parse(img);
+    const auto enc = BertEncoder::load(g);
+    REQUIRE(enc.pooling() == Pooling::kRank);
+    REQUIRE(enc.labels() == 2);
+    const std::vector<std::vector<TokenId>> batch = {{1, 7, 12, 2},
+                                                     {1, 3, 9, 9, 4, 2}};
+    const auto& op = locus::backend::best_backend().ops;
+    const auto got = enc.rank(batch, op);
+    REQUIRE(got.size() == 2);
+    for (std::size_t s = 0; s < batch.size(); ++s) {
+        const auto x = reference(tensors, batch[s]);
+        std::vector<double> h(kWidth);
+        for (std::uint32_t r = 0; r < kWidth; ++r) {
+            double z = head[1].data[r];
+            for (std::uint32_t c = 0; c < kWidth; ++c) {
+                z += head[0].data[r * kWidth + c] * x[c];
+            }
+            h[r] = std::tanh(z);
+        }
+        REQUIRE(got[s].size() == 2);
+        for (std::uint32_t l = 0; l < 2; ++l) {
+            double z = head[3].data[l];
+            for (std::uint32_t c = 0; c < kWidth; ++c) {
+                z += head[2].data[l * kWidth + c] * h[c];
+            }
+            INFO("sequence " << s << " label " << l);
+            REQUIRE(std::fabs(got[s][l] - z) < 1e-4);
+        }
+    }
+    // A reranker does not embed, and an embedding model does not rank.
+    REQUIRE_THROWS_AS(enc.embed(batch, op), std::invalid_argument);
+    const auto img2 = synth_bert(synth_tensors(), 2);
+    const auto g2 = locus::gguf::GgufFile::parse(img2);
+    REQUIRE_THROWS_AS(BertEncoder::load(g2).rank(batch, op),
+                      std::invalid_argument);
+    // Rank pooling without cls.output is refused.
+    const auto img3 = synth_bert(synth_tensors(), 4);
+    const auto g3 = locus::gguf::GgufFile::parse(img3);
+    REQUIRE_THROWS_AS(BertEncoder::load(g3), locus::gguf::Error);
+}
+
 TEST_CASE("bert encoder rejects bad input and bad models", "[bert]") {
     const auto tensors = synth_tensors();
     const auto& op = locus::backend::best_backend().ops;

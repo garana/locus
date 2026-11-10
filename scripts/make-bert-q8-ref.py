@@ -10,6 +10,10 @@ come from llama-tokenize (special tokens added, special-token text not
 parsed), which tests/test_wpm_tokenizer.cpp and test_t5_tokenizer.cpp
 check locus's tokenizers against.
 
+For a reranker (pooling_type 4, i#503) --texts is a rerank golden
+(scripts/make-rerank-golden.py) and the output holds its queries with
+the float64 scores.
+
 Needs gguf 0.19.0 and torch 2.5.1 (the golden venv) and llama.cpp's
 llama-tokenize (build 12110, commit cd959bae9):
 
@@ -90,8 +94,31 @@ def forward(hp, w, ids):
         f = 0.5 * f * (1.0 + torch.erf(f / 2.0 ** 0.5))
         x = norm(x + lin(f, p + "ffn_down"), p + "layer_output_norm")
     pooling = int(hp["bert.pooling_type"])
+    if pooling == 4:
+        # Rank: the CLS state through tanh(cls) and cls.output.
+        h = x[0]
+        if "cls.weight" in w:
+            h = torch.tanh(lin(h, "cls"))
+        return lin(h, "cls.output")
     v = {1: x.mean(dim=0), 2: x[0], 3: x[-1]}[pooling]
     return torch.nn.functional.normalize(v, dim=0)
+
+
+def rerank(a, hp, w):
+    """Scores the pairs of a rerank golden: <s> q </s></s> d </s>, the
+    XLM-R layout llama-server builds, from llama-tokenize's ids of q and
+    d (whose own <s> and </s> are dropped)."""
+    with open(a.texts, encoding="utf-8") as f:
+        data = json.load(f)
+    for q in data["queries"]:
+        qi = ids_of(a.llama_tokenize, a.model, q["query"])[1:-1]
+        scores = []
+        for d in q["documents"]:
+            di = ids_of(a.llama_tokenize, a.model, d)[1:-1]
+            ids = [0] + qi + [2, 2] + di + [2]
+            scores.append(float(forward(hp, w, ids)[0]))
+        q["scores"] = scores
+    return data
 
 
 def main():
@@ -99,12 +126,19 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--llama-tokenize", required=True)
     ap.add_argument("--texts", required=True,
-                    help="a golden JSON whose texts to embed")
+                    help="a golden JSON whose texts (or queries) to use")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
+    hp, w = load(a.model)
+    if int(hp["bert.pooling_type"]) == 4:
+        with torch.no_grad():
+            data = rerank(a, hp, w)
+        with open(a.out, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+            f.write("\n")
+        return
     with open(a.texts, encoding="utf-8") as f:
         texts = json.load(f)["texts"]
-    hp, w = load(a.model)
     vectors = []
     with torch.no_grad():
         for t in texts:

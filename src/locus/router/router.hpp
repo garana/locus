@@ -33,9 +33,10 @@ namespace locus::router {
 
 /** What a request asks for; an instance lists the kinds it serves in
  * its /v1/models (`locus_kinds`). */
-enum class Kind { kText, kImageToText, kImage, kVideo, kSpeech };
+enum class Kind { kText, kImageToText, kImage, kVideo, kSpeech, kRerank };
 
-/** @returns the wire name: text, image-to-text, image, video, speech. */
+/** @returns the wire name: text, image-to-text, image, video, speech,
+ *  rerank. */
 std::string_view kind_name(Kind k);
 /** @returns the kind for a wire name, or nullopt. */
 std::optional<Kind> parse_kind(std::string_view name);

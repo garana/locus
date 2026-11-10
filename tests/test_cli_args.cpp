@@ -79,6 +79,18 @@ TEST_CASE("the embedding-model flag takes the embedding GGUF path",
     auto b = locus_tools::parse_backend_args(
         static_cast<int>(argv2.size()), const_cast<char**>(argv2.data()));
     REQUIRE(b.embedding_model == "e.gguf");
+
+    std::array<const char*, 4> argv3 = {"prog", "--rerank-model", "rr.gguf",
+                                        "m.gguf"};
+    auto c = locus_tools::parse_backend_args(
+        static_cast<int>(argv3.size()), const_cast<char**>(argv3.data()));
+    REQUIRE(c.rerank_model == "rr.gguf");
+    REQUIRE(c.positional == std::vector<std::string>{"m.gguf"});
+    std::array<const char*, 3> argv4 = {"prog", "--rerank-model=r2.gguf",
+                                        "m.gguf"};
+    auto d = locus_tools::parse_backend_args(
+        static_cast<int>(argv4.size()), const_cast<char**>(argv4.data()));
+    REQUIRE(d.rerank_model == "r2.gguf");
 }
 
 TEST_CASE("the audio-max-tokens flag sets the speech token cap", "[cli]") {

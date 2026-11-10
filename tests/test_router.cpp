@@ -216,6 +216,10 @@ TEST_CASE("router: request kinds by path and body", "[router]") {
     CHECK(kind("/v1/videos") == Kind::kVideo);
     CHECK(kind("/v1/videos/video_1/content") == Kind::kVideo);
     CHECK(kind("/v1/audio/speech") == Kind::kSpeech);
+    CHECK(kind("/v1/rerank") == Kind::kRerank);
+    CHECK(kind("/rerank") == Kind::kRerank);
+    CHECK(locus::router::kind_name(Kind::kRerank) == "rerank");
+    CHECK(locus::router::parse_kind("rerank") == Kind::kRerank);
     CHECK_FALSE(classify("/v1/files", ""));
     CHECK(classify("/v1/completions", R"({"model":"m1"})")->model == "m1");
     // A body that is not JSON still gets a kind; the instance answers.

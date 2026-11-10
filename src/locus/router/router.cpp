@@ -18,8 +18,8 @@ using nlohmann::json;
 
 namespace {
 
-constexpr std::string_view kKindNames[] = {"text", "image-to-text", "image",
-                                           "video", "speech"};
+constexpr std::string_view kKindNames[] = {"text",  "image-to-text", "image",
+                                           "video", "speech",        "rerank"};
 
 char lower(char c) {
     return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
@@ -226,7 +226,7 @@ std::string_view kind_name(Kind k) {
 }
 
 std::optional<Kind> parse_kind(std::string_view name) {
-    for (int i = 0; i < 5; ++i) {
+    for (std::size_t i = 0; i < std::size(kKindNames); ++i) {
         if (kKindNames[i] == name) return static_cast<Kind>(i);
     }
     return std::nullopt;
@@ -266,6 +266,8 @@ std::optional<Route> classify(std::string_view path, std::string_view body) {
         r.kind = Kind::kVideo;
     } else if (path == "/v1/audio/speech") {
         r.kind = Kind::kSpeech;
+    } else if (path == "/v1/rerank" || path == "/rerank") {
+        r.kind = Kind::kRerank;
     } else {
         return std::nullopt;
     }

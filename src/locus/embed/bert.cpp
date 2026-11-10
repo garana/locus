@@ -82,9 +82,9 @@ BertEncoder BertEncoder::load(const gguf::GgufFile& g) {
     if (!pool) throw gguf::Error("bert: bert.pooling_type missing");
     e.pooling_ = static_cast<Pooling>(*pool);
     if (e.pooling_ != Pooling::kMean && e.pooling_ != Pooling::kCls &&
-        e.pooling_ != Pooling::kLast) {
+        e.pooling_ != Pooling::kLast && e.pooling_ != Pooling::kRank) {
         throw gguf::Error("bert: pooling_type " + std::to_string(*pool) +
-                          " is not mean (1), cls (2) or last (3)");
+                          " is not mean (1), cls (2), last (3) or rank (4)");
     }
 
     const auto info = [&](const std::string& name) {
@@ -167,7 +167,47 @@ BertEncoder BertEncoder::load(const gguf::GgufFile& g) {
         l.out_norm = norm(p + "layer_output_norm");
         e.layers_.push_back(std::move(l));
     }
+    if (e.pooling_ == Pooling::kRank) {
+        // The classifier, as llama.cpp's rank pooling: the CLS state
+        // through cls and tanh (when the model has it, as RoBERTa's
+        // head does), then cls.output, one logit per label.
+        if (g.find_tensor("cls.weight") != nullptr) {
+            e.cls_ = lin("cls", w, w);
+        }
+        const gguf::TensorInfo* out = info("cls.output.weight");
+        if (out->n_dims != 2 || out->ne[0] != w || out->ne[1] == 0 ||
+            out->ne[1] > 1024) {
+            throw gguf::Error("bert: cls.output.weight has the wrong shape");
+        }
+        e.labels_ = static_cast<std::uint32_t>(out->ne[1]);
+        e.cls_out_ = lin("cls.output", e.labels_, w);
+    }
     return e;
+}
+
+std::vector<std::vector<float>> BertEncoder::rank(
+    std::span<const std::vector<tok::TokenId>> batch,
+    const backend::Ops& op) const {
+    if (pooling_ != Pooling::kRank) {
+        throw std::invalid_argument("bert: not a reranker (pooling rank)");
+    }
+    const auto states = encode(batch, op);
+    const std::uint32_t w = width_;
+    std::vector<std::vector<float>> out;
+    out.reserve(states.size());
+    std::vector<float> h(w);
+    for (const auto& s : states) {
+        std::span<const float> x(s.data(), w);  // the CLS row
+        if (cls_.w.data != nullptr) {
+            image::dense::linear(op, cls_.w, cls_.b, x, 1, h);
+            for (float& z : h) z = std::tanh(z);
+            x = h;
+        }
+        std::vector<float> logits(labels_);
+        image::dense::linear(op, cls_out_.w, cls_out_.b, x, 1, logits);
+        out.push_back(std::move(logits));
+    }
+    return out;
 }
 
 std::vector<std::vector<float>> BertEncoder::encode(

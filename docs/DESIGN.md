@@ -151,7 +151,7 @@ connection, resent once when the server closed it while idle.
 
 `locus-router` (`router::Router`) proxies each request to one of
 several instances by kind: text, image-to-text (a chat, messages or
-responses body with an image part), image, video or speech, from the
+responses body with an image part), image, video, speech or rerank, from the
 path and, for chat, the body. The instances are given as host:port or
 as `srv:NAME`, whose DNS SRV targets (the lowest priority's) are
 looked up again on every refresh, so instances join and leave with the
@@ -611,10 +611,23 @@ guarding the default path.
   matches float64 arithmetic on the same Q8_0 weights to a cosine of
   0.99999, and on bge-small it is nearer the f32 original (0.99989 to
   0.99995) than llama.cpp, which rounds them to 8 bits (0.99971 to
-  0.99989; 0.99965 from exact on bge-m3's 24 layers). Otherwise `/v1/embeddings` returns the chat model's last
-  token's final-normed hidden state, L2-normalized, on a dedicated
-  cache; CPU and CUDA backends only (`TransformerModel::embed` refuses
-  vulkan).
+  0.99989; 0.99965 from exact on bge-m3's 24 layers). Otherwise
+  `/v1/embeddings` returns the chat model's last token's final-normed
+  hidden state, L2-normalized, on a dedicated cache; CPU and CUDA
+  backends only (`TransformerModel::embed` refuses vulkan).
+- Rerank: with `--rerank-model`, a GGUF of arch `bert` with
+  pooling_type 4 (rank) serves `/v1/rerank` (also `/rerank`): each
+  document is paired with the query as llama-server does (`<s> q
+  </s></s> d </s>` for XLM-R, a document cut to fit the context), the
+  pairs run as one batch, and the score is the raw logit of the
+  classifier on the CLS state (`cls`, tanh, `cls.output`). Results come
+  best first, `top_n` of them. On bge-reranker-v2-m3 Q8_0 the scores
+  match float64 arithmetic on the same weights to 1e-5 and the f32
+  original to 0.09, and rank the documents as the original does;
+  llama.cpp drifts up to 0.3. The router gives `/v1/rerank` its own
+  kind, `rerank`. ggml-org has no GGUF of the model, so
+  `scripts/convert-xlmr-reranker.py` makes one from BAAI's safetensors,
+  with the vocab of bge-m3's GGUF (the same SentencePiece model).
 - API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
   (a log-softmax over the raw logits) and usage accounting.
 - Metrics: every `/metrics` series carries `model` and `backend`

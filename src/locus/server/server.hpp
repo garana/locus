@@ -99,6 +99,13 @@ class OpenAiServer {
          * and /v1/embeddings uses it unless the
          * request's model names the chat model. Empty = off. */
         std::string embedding_model_path;
+        /** Path to a reranker GGUF (arch "bert", pooling rank,
+         * --rerank-model) that enables POST /v1/rerank; /v1/models lists
+         * it by its file name. Empty = the endpoint answers 503. */
+        std::string rerank_model_path;
+        /** Max documents one /v1/rerank call may score; over this gets
+         * 400. */
+        std::size_t max_rerank_documents = 1000;
         /** Path the Prometheus metrics endpoint is served at
          * (--metrics-path); default /metrics. */
         std::string metrics_path = "/metrics";
@@ -194,7 +201,7 @@ class OpenAiServer {
     enum class Route {
         kHealth, kModels, kModelById, kMetrics,
         kCompletions, kChat, kMessages, kResponses, kEmbeddings,
-        kAudioSpeech,
+        kRerank, kAudioSpeech,
         kImages, kImageEdits,
         kVideos, kVideoById, kVideoContent, kUnknown
     };
@@ -282,6 +289,10 @@ class OpenAiServer {
     // given), one request at a time under bert_mu_.
     std::unique_ptr<embed::EmbeddingModel> bert_;
     std::mutex bert_mu_;
+    // The reranker (--rerank-model; null when not given), one request
+    // at a time under rerank_mu_.
+    std::unique_ptr<embed::EmbeddingModel> rerank_;
+    std::mutex rerank_mu_;
 
     // /v1/audio/speech: the SNAC decoder (null when --audio-decoder was
     // not given) and the Orpheus audio band base resolved from the
