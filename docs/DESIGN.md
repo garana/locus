@@ -170,8 +170,12 @@ A video job id from the router names the instance that made it
 `GET /v1/videos/{id}` reaches that instance with no table, also after
 a router restart. The router's own `/metrics` counts, per instance,
 requests, upstream errors, streams a client left, wall seconds and
-the requests in flight, and whether the last poll answered. Auth at
-the router is the next step of #388.
+the requests in flight, and whether the last poll answered. With
+`--auth-helper` the router checks client keys on the request head
+through the same helper protocol as the server (`AuthClient`);
+`/health` stays open. Toward the instances it sends the client's own
+credential, none, or a key per instance from an `--instance-keys`
+file, which also authenticates its `/v1/models` polls.
 
 ## 5. Milestones
 

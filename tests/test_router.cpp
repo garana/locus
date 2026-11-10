@@ -160,8 +160,8 @@ struct FakeInstance {
 struct RouterFixture {
     std::unique_ptr<Router> router;
     int port = 0;
-    explicit RouterFixture(std::vector<std::string> instances) {
-        RouterConfig cfg;
+    explicit RouterFixture(std::vector<std::string> instances,
+                           RouterConfig cfg = {}) {
         cfg.host = "127.0.0.1";
         cfg.port = 0;
         cfg.instances = std::move(instances);
@@ -492,7 +492,9 @@ TEST_CASE("router: video ids name their instance", "[router]") {
     RouterFixture rf({v1.addr(), v2.addr()});
     Client c("127.0.0.1", rf.port);
     std::set<std::string> owners;
-    for (int k = 0; k < 6; ++k) {
+    // 20 jobs, so all of them landing on one of the two instances (a
+    // 2 x 2^-20 chance) cannot flake the spread check below.
+    for (int k = 0; k < 20; ++k) {
         // Different prompts spread the jobs (a prompt is the session
         // key); each id still finds its maker.
         const auto made = rf.post(
@@ -563,6 +565,106 @@ TEST_CASE("router: metrics per instance", "[router]") {
           std::string::npos);
     CHECK(text.find("# TYPE locus_router_request_seconds_total counter") !=
           std::string::npos);
+}
+
+TEST_CASE("router: instance keys file", "[router]") {
+    const auto k = locus::router::parse_instance_keys(
+        "# keys\n10.0.0.1:8001 sk-a\n\n  10.0.0.2:8001\tsk-b  \r\n* sk-any\n");
+    REQUIRE(k.size() == 3);
+    CHECK(k.at("10.0.0.1:8001") == "sk-a");
+    CHECK(k.at("10.0.0.2:8001") == "sk-b");
+    CHECK(k.at("*") == "sk-any");
+    CHECK_THROWS(locus::router::parse_instance_keys("10.0.0.1:8001\n"));
+    CHECK_THROWS(locus::router::parse_instance_keys("h:1 two words\n"));
+}
+
+TEST_CASE("router: client keys checked by the auth helper", "[router]") {
+    FakeInstance a("A", {"text"}, "m");
+    RouterConfig cfg;
+    cfg.auth_helper_argv = {LOCUS_AUTH_HELPER_BIN, "sk-ok"};
+    RouterFixture rf({a.addr()}, cfg);
+    const auto with = [&](std::vector<std::pair<std::string, std::string>> h) {
+        return rf.post("/v1/completions", {{"prompt", "x"}}, std::move(h));
+    };
+    CHECK(with({}).head.status == 401);
+    CHECK(with({{"Authorization", "Bearer sk-bad"}}).head.status == 401);
+    const auto ok = with({{"Authorization", "Bearer sk-ok"}});
+    CHECK(ok.head.status == 200);
+    CHECK(ok.body.rfind("A ", 0) == 0);
+    CHECK(with({{"x-api-key", "sk-ok"}}).head.status == 200);
+    const auto denied = with({});
+    CHECK(json::parse(denied.body)["error"]["type"] ==
+          "authentication_error");
+    // /health stays open; /v1/models needs a key.
+    Client c("127.0.0.1", rf.port);
+    CHECK(c.send(ClientRequest{"GET", "/health", {}, ""}).head.status == 200);
+    CHECK(c.send(ClientRequest{"GET", "/v1/models", {}, ""}).head.status ==
+          401);
+}
+
+TEST_CASE("router: the credential sent to the instances", "[router]") {
+    FakeInstance a("A", {"text"}, "m"), b("B", {"text"}, "n");
+    using UA = RouterConfig::UpstreamAuth;
+    const std::vector<std::pair<std::string, std::string>> client_key{
+        {"Authorization", "Bearer client-key"}, {"x-api-key", "client-x"}};
+    SECTION("none: the client's key does not go on") {
+        RouterConfig cfg;
+        cfg.upstream_auth = UA::kNone;
+        RouterFixture rf({a.addr()}, cfg);
+        REQUIRE(rf.post("/v1/completions", {{"prompt", "x"}}, client_key).ok);
+        CHECK(a.header("Authorization").empty());
+        CHECK(a.header("x-api-key").empty());
+    }
+    SECTION("key: each instance gets its own, else the * key") {
+        RouterConfig cfg;
+        cfg.upstream_auth = UA::kKey;
+        cfg.instance_keys = {{a.addr(), "sk-for-a"}, {"*", "sk-other"}};
+        RouterFixture rf({a.addr(), b.addr()}, cfg);
+        REQUIRE(rf.post("/v1/completions", {{"model", "m"}, {"prompt", "x"}},
+                        client_key)
+                    .ok);
+        CHECK(a.header("Authorization") == "Bearer sk-for-a");
+        CHECK(a.header("x-api-key").empty());
+        REQUIRE(rf.post("/v1/completions", {{"model", "n"}, {"prompt", "x"}},
+                        client_key)
+                    .ok);
+        CHECK(b.header("Authorization") == "Bearer sk-other");
+    }
+}
+
+TEST_CASE("router: polls an instance that checks keys with its key",
+          "[router]") {
+    // A real locus-server-style check would 401 a keyless /v1/models;
+    // this fake answers /v1/models only with the right key.
+    locus::http::ServerConfig sc;
+    sc.host = "127.0.0.1";
+    sc.port = 0;
+    sc.worker_threads = 2;
+    locus::http::Server inst(
+        sc, [](const locus::http::Request& req,
+               locus::http::ServerResponse& res,
+               const locus::http::RequestContext&) {
+            if (req.get_header_value("Authorization") != "Bearer sk-inst") {
+                res.status = 401;
+                res.set_content("{}", "application/json");
+                return;
+            }
+            res.set_content(
+                R"({"object":"list","data":[{"id":"m"}],"locus_kinds":["text"]})",
+                "application/json");
+        });
+    const int port = inst.start();
+    REQUIRE(port > 0);
+    const std::string addr = "127.0.0.1:" + std::to_string(port);
+    {
+        RouterFixture keyless({addr});
+        CHECK_FALSE(keyless.router->instances()[0].healthy);
+    }
+    RouterConfig cfg;
+    cfg.instance_keys = {{addr, "sk-inst"}};
+    RouterFixture keyed({addr}, cfg);
+    CHECK(keyed.router->instances()[0].healthy);
+    inst.stop();
 }
 
 TEST_CASE("router: a bad instance address is refused", "[router]") {

@@ -232,7 +232,10 @@ calling. Reliable agent use therefore needs a capable instruct model.
   a network is unauthenticated; run it on localhost or behind a
   trusted proxy. The server has an external-helper auth mechanism
   (`locus-auth-helper` is a reference helper with an allow-list), but
-  the `locus-server` binary does not expose it yet.
+  the `locus-server` binary does not expose it yet. `locus-router`
+  does: `--auth-helper PATH` checks every request but `/health`, so a
+  router in front of instances on a private network is the way to
+  require keys today.
 - Tool execution: locus only expresses tool calls; it never runs them.
   Running them is the client's job (locus is a model runner, not an
   MCP host).

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -11,6 +12,8 @@
 #include <thread>
 #include <vector>
 
+#include "locus/auth/auth_client.hpp"
+#include "locus/auth/token_cache.hpp"
 #include "locus/http/client.hpp"
 #include "locus/http/server.hpp"
 
@@ -117,7 +120,31 @@ struct RouterConfig {
      * read deadline is per gap between reads, not per request. */
     http::ClientOptions upstream;
     int worker_threads = 16;
+
+    /** Client keys: when set, every request but /health needs a key
+     * this auth helper allows (Authorization: Bearer, or x-api-key),
+     * else a 401. The argv of the helper, as locus-server takes it. */
+    std::vector<std::string> auth_helper_argv;
+    std::size_t auth_helpers = 1;
+    auth::AuthConfig auth_cache;
+
+    /** What the router sends the instances as a credential. */
+    enum class UpstreamAuth {
+        kClient,  ///< the client's own Authorization / x-api-key
+        kNone,    ///< nothing: instances trust the router
+        kKey,     ///< the key set for the instance (instance_keys)
+    };
+    UpstreamAuth upstream_auth = UpstreamAuth::kClient;
+    /** For kKey: host:port to key; "*" is the key of any other. */
+    std::map<std::string, std::string> instance_keys;
 };
+
+/**
+ * Parses an instance-keys file: one "host:port key" (or "* key") per
+ * line; blank lines and lines starting with '#' are skipped.
+ * @throws std::invalid_argument on a malformed line.
+ */
+std::map<std::string, std::string> parse_instance_keys(std::string_view text);
 
 /**
  * The router: an http::Server whose handler proxies each request to an
@@ -178,7 +205,18 @@ class Router {
     /** Returns a client to instance i's pool (up to pool_size). */
     void give(std::size_t i, std::shared_ptr<http::Client> c);
 
+    /** The head stage: the client key check (cfg_.auth_helper_argv).
+     * @returns true to reject (res holds the 401). */
+    bool reject(const http::Request& head, http::ServerResponse& res);
+    /** The request's headers for instance `inst` (host:port): the
+     * client's, minus hop-by-hop ones, with the credential the
+     * upstream_auth mode sends. */
+    std::vector<std::pair<std::string, std::string>> upstream_headers(
+        const http::Request& req, const std::string& inst) const;
+
     RouterConfig cfg_;
+    auth::WallClock clock_;
+    std::unique_ptr<auth::AuthClient> auth_;  ///< null: no key check
     mutable std::mutex mu_;
     std::vector<Instance> inst_;
     std::vector<std::unique_ptr<Slot>> slots_;  ///< one per instance
