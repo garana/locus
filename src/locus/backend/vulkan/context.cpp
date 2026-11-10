@@ -40,6 +40,7 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ8_0ShB:
         case Kernel::kMatvecQ8_0GluShB:
         case Kernel::kMatvecQ8_0N:
+        case Kernel::kMatvecQ8_0NGlu:
         case Kernel::kMatvecQ8_0P:
         case Kernel::kMatvecQ8_0GluP:
         case Kernel::kMatvecF32N:
@@ -235,6 +236,7 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "gelu_erf_spv.h"
 #include "layer_norm_spv.h"
 #include "conv2d_gemm_spv.h"
+#include "matvec_q8_0_n_glu_spv.h"
 #include "rope_neox_spv.h"
 #include "rope_neox_b_spv.h"
 #include "matvec_q4_k_b_spv.h"
@@ -582,6 +584,9 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_layer_norm_spv), 3, 36},
     {Kernel::kConv2dGemm, "conv2d_gemm", locus_conv2d_gemm_spv,
      sizeof(locus_conv2d_gemm_spv), 4, 48},
+    {Kernel::kMatvecQ8_0NGlu, "matvec_q8_0_n_glu",
+     locus_matvec_q8_0_n_glu_spv, sizeof(locus_matvec_q8_0_n_glu_spv), 4,
+     52},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

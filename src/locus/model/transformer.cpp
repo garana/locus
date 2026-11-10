@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 
+#include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/arch.hpp"
 #include "locus/model/expert_cache.hpp"
@@ -776,7 +777,10 @@ void TransformerModel::forward_embeddings(std::span<const EmbedStep> steps,
         }
     }
     StageLap lap(stage_metrics_.get());
-    if (steps.size() > 1 && backend_->name == "vulkan" &&
+    // Batch-invariant mode: one sequence takes the multi-sequence
+    // kernels too (#432).
+    if ((steps.size() > 1 || backend::vulkan_batch_invariant()) &&
+        backend_->name == "vulkan" &&
         backend::vulkan_forward_multi(*this, steps, cache, rows.begin,
                                       rows.end)) {
         lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
@@ -805,7 +809,18 @@ void TransformerModel::forward(tok::TokenId token,
         throw std::invalid_argument("forward: bad logit row range");
     }
     StageLap lap(stage_metrics_.get());
-    if (backend_->name == "vulkan" &&
+    // Batch-invariant mode: a lone sequence takes the multi-sequence
+    // kernels too, so its bits match a batched decode's (#432).
+    const bool multi_one =
+        backend_->name == "vulkan" && backend::vulkan_batch_invariant();
+    std::vector<float> normed1(multi_one ? hp_.n_embd : 0);
+    const EmbedStep one{token, {}, &seq, logits, normed1};
+    if (multi_one &&
+        backend::vulkan_forward_multi(
+            *this, std::span<const EmbedStep>(&one, 1), cache, rows.begin,
+            rows.end)) {
+        lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
+    } else if (backend_->name == "vulkan" &&
         vulkan_forward(*this, token, cache, seq, logits, rows.begin,
                        rows.end)) {
         lap.lap(StageMetrics::kNoLayer, Stage::kDevice);

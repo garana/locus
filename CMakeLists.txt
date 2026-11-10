@@ -242,6 +242,7 @@ if(Vulkan_FOUND)
             matvec_q8_0_glu_sh_b=matvec_q8_0:BATCHED,SWIGLU,SHARED
             matvec_q8_0_p=matvec_q8_0:BATCHED,PAIRS
             matvec_f32_n=matvec_q8_0_n:TYPE_F32
+            matvec_q8_0_n_glu=matvec_q8_0_n:SWIGLU
             matvec_q8_0_glu_p=matvec_q8_0:BATCHED,SWIGLU,PAIRS
             matmul_q8_0=matmul:TYPE_Q8
             matmul_f32=matmul:TYPE_F32
