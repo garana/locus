@@ -120,52 +120,65 @@ TEST_CASE("bench: out_w_ n x matvec_cuda vs matvec_batch_cuda",
     using TT = locus::gguf::TensorType;
     const std::uint32_t rows = 32000;  // vocab
     const std::uint32_t cols = 2048;   // embd
-    auto w = make_kquant(rows, cols, /*bytes=*/210, /*d_off=*/208,
-                         /*dmin_off=*/-1, 7);
-    Mat m{TT::kQ6_K, w.data(), rows, cols};
-    std::mt19937 rng(5);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    const int iters = 50;
-    for (std::uint32_t n : {1u, 4u, 8u, 16u}) {
-        std::vector<float> xb(static_cast<std::size_t>(n) * cols);
-        for (auto& v : xb) {
-            v = dist(rng);
-        }
-        std::vector<float> col(rows);
-        std::vector<float> outb(static_cast<std::size_t>(rows) * n);
-        cuda_pool_reset();
-        auto per_token = [&] {
-            for (std::uint32_t t = 0; t < n; ++t) {
-                matvec_cuda(m,
-                            {xb.data() + static_cast<std::size_t>(t) *
-                                             cols,
-                             cols},
-                            col);
+    // Q6_K, and Q8_0 (a tied head): 256 columns are 8 Q8_0 blocks,
+    // 272 bytes; the scales are random f16 past the first, which does
+    // not change the time.
+    struct Head {
+        TT type;
+        std::size_t bytes, d_off;
+    };
+    for (const Head h :
+         {Head{TT::kQ6_K, 210, 208}, Head{TT::kQ8_0, 272, 0}}) {
+        auto w = make_kquant(rows, cols, h.bytes, h.d_off,
+                             /*dmin_off=*/-1, 7);
+        Mat m{h.type, w.data(), rows, cols};
+        std::mt19937 rng(5);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        const int iters = 50;
+        for (std::uint32_t n : {1u, 4u, 8u, 16u}) {
+            std::vector<float> xb(static_cast<std::size_t>(n) * cols);
+            for (auto& v : xb) {
+                v = dist(rng);
             }
-        };
-        auto batched = [&] { matvec_batch_cuda(m, xb, outb, n); };
-        for (int i = 0; i < 3; ++i) {  // warm (upload + JIT)
-            per_token();
-            batched();
+            std::vector<float> col(rows);
+            std::vector<float> outb(static_cast<std::size_t>(rows) * n);
+            cuda_pool_reset();
+            auto per_token = [&] {
+                for (std::uint32_t t = 0; t < n; ++t) {
+                    matvec_cuda(m,
+                                {xb.data() +
+                                     static_cast<std::size_t>(t) * cols,
+                                 cols},
+                                col);
+                }
+            };
+            auto batched = [&] { matvec_batch_cuda(m, xb, outb, n); };
+            for (int i = 0; i < 3; ++i) {  // warm (upload + JIT)
+                per_token();
+                batched();
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; ++i) {
+                per_token();
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; ++i) {
+                batched();
+            }
+            const auto t2 = std::chrono::steady_clock::now();
+            const double per_ns =
+                std::chrono::duration<double, std::nano>(t1 - t0)
+                    .count() /
+                iters;
+            const double bat_ns =
+                std::chrono::duration<double, std::nano>(t2 - t1)
+                    .count() /
+                iters;
+            WARN("cuda out_w_ "
+                 << (h.type == TT::kQ8_0 ? "Q8_0" : "Q6_K") << " n=" << n
+                 << ": per-token=" << per_ns << "ns batched=" << bat_ns
+                 << "ns speedup=" << per_ns / bat_ns << "x");
         }
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < iters; ++i) {
-            per_token();
-        }
-        const auto t1 = std::chrono::steady_clock::now();
-        for (int i = 0; i < iters; ++i) {
-            batched();
-        }
-        const auto t2 = std::chrono::steady_clock::now();
-        const double per_ns =
-            std::chrono::duration<double, std::nano>(t1 - t0).count() /
-            iters;
-        const double bat_ns =
-            std::chrono::duration<double, std::nano>(t2 - t1).count() /
-            iters;
-        WARN("cuda out_w_ n=" << n << ": per-token=" << per_ns
-                              << "ns batched=" << bat_ns
-                              << "ns speedup=" << per_ns / bat_ns << "x");
     }
     SUCCEED();
 }

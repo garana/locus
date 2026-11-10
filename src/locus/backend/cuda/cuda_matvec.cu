@@ -2275,6 +2275,75 @@ __global__ void matvec_batch_q6_k_kernel(const std::uint8_t* w,
     }
 }
 
+/** Batched matvec_q8_0_warp_kernel: the same shared-memory staging of
+ *  32 blocks per pass, read once for all n tokens; per token, each
+ *  lane sums its block in the per-token kernel's order and the warp
+ *  sums the lanes the same way, so the result is byte-identical to n
+ *  per-token calls. A Q8_0 block is cheap to dequantize, so sharing it
+ *  saves less than for the K-quants: the per-token activation reads
+ *  and products remain (on a GTX 750 Ti, 1.08x at 8 tokens). Launch
+ *  with 32 * kWarpRows threads per block. */
+__global__ void matvec_batch_q8_0_kernel(const std::uint8_t* w,
+                                         const float* x, float* out,
+                                         std::uint32_t rows,
+                                         std::uint32_t cols,
+                                         std::uint32_t n) {
+    const std::uint32_t lane = threadIdx.x % 32;
+    const std::uint32_t r = blockIdx.x * kWarpRows + threadIdx.x / 32;
+    if (r >= rows) {
+        return;  // a whole warp leaves together: no partial shuffles
+    }
+    __shared__ std::uint16_t sw[kWarpRows][32 * 17];
+    std::uint16_t* mine = sw[threadIdx.x / 32];
+    const std::uint32_t nblk = cols / 32;
+    const auto* row16 = reinterpret_cast<const std::uint16_t*>(
+        w + static_cast<std::size_t>(r) * nblk * 34);
+    float acc[kMaxBatch];
+    for (std::uint32_t t = 0; t < n; ++t) {
+        acc[t] = 0.0f;
+    }
+    for (std::uint32_t b0 = 0; b0 < nblk; b0 += 32) {
+        const std::uint32_t nb = min(32u, nblk - b0);
+        for (std::uint32_t i = lane; i < nb * 17; i += 32) {
+            mine[i] = __ldg(row16 + static_cast<std::size_t>(b0) * 17 + i);
+        }
+        __syncwarp();
+        if (lane < nb) {
+            const std::uint32_t b = b0 + lane;
+            const std::uint16_t* blk16 = mine + lane * 17;
+            const float d = __half2float(__ushort_as_half(blk16[0]));
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const auto* x4 = reinterpret_cast<const float4*>(
+                    x + static_cast<std::size_t>(t) * cols +
+                    static_cast<std::size_t>(b) * 32);
+                float bacc = 0.0f;
+                for (int k = 0; k < 8; ++k) {
+                    const float4 xv = __ldg(x4 + k);
+                    const std::uint16_t lo = blk16[1 + 2 * k];
+                    const std::uint16_t hi = blk16[2 + 2 * k];
+                    const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
+                    const std::int8_t q[4] = {
+                        static_cast<std::int8_t>(lo & 0xff),
+                        static_cast<std::int8_t>(lo >> 8),
+                        static_cast<std::int8_t>(hi & 0xff),
+                        static_cast<std::int8_t>(hi >> 8)};
+                    for (int g = 0; g < 4; ++g) {
+                        bacc += static_cast<float>(q[g]) * xs[g];
+                    }
+                }
+                acc[t] += d * bacc;
+            }
+        }
+        __syncwarp();  // the next pass overwrites this warp's slice
+    }
+    for (std::uint32_t t = 0; t < n; ++t) {
+        const float s = warp_sum(acc[t]);
+        if (lane == 0) {
+            out[static_cast<std::size_t>(r) * n + t] = s;
+        }
+    }
+}
+
 /**
  * cudaDeviceSynchronize after a launch, charging the wait to the CUDA
  * metrics (i#285): one submit and the host time until the device is
@@ -3084,11 +3153,12 @@ Kind kind_for(gguf::TensorType t) {
     }
 }
 
-/** One-launch batched Q4_K/Q6_K matvec: weight pulled from the pool
- *  (shared across the n tokens), x_batch + out_batch staged once. */
+/** One-launch batched Q4_K/Q6_K/Q8_0 matvec: weight pulled from the
+ *  pool (shared across the n tokens), x_batch + out_batch staged once.
+ *  w.type must be one of those three. */
 bool run_batch(const Mat& w, std::span<const float> x_batch,
                std::span<float> out_batch, std::size_t w_bytes,
-               std::uint32_t n, bool q6) {
+               std::uint32_t n) {
     const void* dw = pool().acquire(w.data, w_bytes);
     const bool pooled = dw != nullptr;
     DevBuf dw_demand;
@@ -3115,8 +3185,11 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
             const auto* dwb = static_cast<const std::uint8_t*>(dw);
             const auto* dxf = static_cast<const float*>(dx);
             auto* doutf = static_cast<float*>(dout);
-            if (q6) {
+            if (w.type == gguf::TensorType::kQ6_K) {
                 matvec_batch_q6_k_kernel<<<blocks, 32 * kWarpRows>>>(
+                    dwb, dxf, doutf, w.rows, w.cols, n);
+            } else if (w.type == gguf::TensorType::kQ8_0) {
+                matvec_batch_q8_0_kernel<<<blocks, 32 * kWarpRows>>>(
                     dwb, dxf, doutf, w.rows, w.cols, n);
             } else {
                 matvec_batch_q4_k_kernel<<<blocks, 32 * kWarpRows>>>(
@@ -3145,9 +3218,9 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
  */
 bool run_batch_sliced(const Mat& w, std::span<const float> x_batch,
                       std::span<float> out_batch, std::size_t w_bytes,
-                      std::uint32_t n, bool q6) {
+                      std::uint32_t n) {
     if (n <= kMaxBatch) {
-        return run_batch(w, x_batch, out_batch, w_bytes, n, q6);
+        return run_batch(w, x_batch, out_batch, w_bytes, n);
     }
     const std::size_t cols = w.cols;
     std::vector<float> part(static_cast<std::size_t>(w.rows) * kMaxBatch);
@@ -3156,7 +3229,7 @@ bool run_batch_sliced(const Mat& w, std::span<const float> x_batch,
         const std::span<float> ps(part.data(),
                                   static_cast<std::size_t>(w.rows) * m);
         if (!run_batch(w, x_batch.subspan(t0 * cols, m * cols), ps, w_bytes,
-                       m, q6)) {
+                       m)) {
             return false;
         }
         for (std::uint32_t r = 0; r < w.rows; ++r) {
@@ -3789,16 +3862,22 @@ std::size_t cuda_pool_budget() {
 void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n) {
     ensure_device();
-    // Q4_K/Q6_K get the register-blocked kernel, one launch per
-    // kMaxBatch tokens; other types (incl F32/Q8_0) fall back to n
+    // Q4_K/Q6_K/Q8_0 get the register-blocked kernel, one launch per
+    // kMaxBatch tokens; other types (incl F32) fall back to n
     // matvec_cuda() calls scattered to row-major: the same-backend
     // fallback rule, so batched stays byte-identical to per-token.
     const bool batch_type = w.type == gguf::TensorType::kQ4_K ||
-                            w.type == gguf::TensorType::kQ6_K;
+                            w.type == gguf::TensorType::kQ6_K ||
+                            w.type == gguf::TensorType::kQ8_0;
+    if (n == 1) {
+        // One token: the per-token kernel is the same result and has no
+        // per-token accumulator array to keep in registers.
+        matvec_cuda(w, x_batch, out_batch);
+        return;
+    }
     if (batch_type) {
         const std::size_t bytes = device_weight_bytes(w);
-        if (run_batch_sliced(w, x_batch, out_batch, bytes, n,
-                             w.type == gguf::TensorType::kQ6_K)) {
+        if (run_batch_sliced(w, x_batch, out_batch, bytes, n)) {
             return;
         }
         static Fallback& f = fallback("cuda", "per_token",
