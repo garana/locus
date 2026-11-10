@@ -45,7 +45,8 @@ const char* kUsage =
     "                    1), each with its own request id; a logits\n"
     "                    connection is paired with its session by the\n"
     "                    id of its first frame. Prints each text and\n"
-    "                    the aggregate tok/s\n";
+    "                    the aggregate tok/s. All sessions use --seed,\n"
+    "                    so with --temp > 0 they draw the same text\n";
 
 }  // namespace
 
@@ -203,8 +204,13 @@ int main(int argc, char** argv) {
                              peer.c_str());
                 return 1;
             }
+            // A peer that connects and never sends must not hang us: the
+            // first frame gets the same deadline as the accept.
+            locus::pipeline::set_recv_timeout(fd, logits_timeout);
             locus::pipeline::Message first;
-            if (locus::pipeline::read_message(fd, first) !=
+            const auto got = locus::pipeline::read_message(fd, first);
+            locus::pipeline::set_recv_timeout(fd, 0);
+            if (got !=
                     locus::pipeline::ReadResult::kOk ||
                 first.type != locus::pipeline::MsgType::kLogits ||
                 first.position != 0 || first.request_id < 1 ||
@@ -212,7 +218,12 @@ int main(int argc, char** argv) {
                 sessions[first.request_id - 1].logits_fd >= 0) {
                 std::fprintf(stderr,
                              "a logits connection's first frame names no "
-                             "waiting session\n");
+                             "waiting session (type %d, request %llu, "
+                             "position %u)\n",
+                             static_cast<int>(first.type),
+                             static_cast<unsigned long long>(
+                                 first.request_id),
+                             first.position);
                 return 1;
             }
             auto& s = sessions[first.request_id - 1];
@@ -230,10 +241,19 @@ int main(int argc, char** argv) {
                 params.max_tokens = static_cast<std::uint32_t>(max_tokens);
                 params.seed = seed;
                 params.request_id = i + 1;
-                sessions[i].res = locus::pipeline::drive_generation_continue(
-                    sessions[i].head_fd, sessions[i].logits_fd, ids,
-                    std::move(sessions[i].first_logits), tok.eos_id(),
-                    params);
+                // An exception must not escape the thread (that calls
+                // std::terminate): the session just ends incomplete.
+                try {
+                    sessions[i].res =
+                        locus::pipeline::drive_generation_continue(
+                            sessions[i].head_fd, sessions[i].logits_fd, ids,
+                            std::move(sessions[i].first_logits),
+                            tok.eos_id(), params);
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "locus-driver: session %zu: %s\n",
+                                 i + 1, e.what());
+                    sessions[i].res.complete = false;
+                }
             });
         }
         for (auto& t : threads) {
@@ -248,10 +268,10 @@ int main(int argc, char** argv) {
         std::size_t n_tokens = 0;
         for (auto& s : sessions) {
             auto gen = std::move(s.res.tokens);
-            n_tokens += gen.size();
             if (!gen.empty() && gen.back() == tok.eos_id()) {
-                gen.pop_back();  // do not print the stop token
+                gen.pop_back();  // do not print or count the stop token
             }
+            n_tokens += gen.size();
             std::printf("%s%s\n", tok.decode(ids).c_str(),
                         tok.decode(gen).c_str());
             all_complete = all_complete && s.res.complete;
@@ -260,7 +280,8 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr,
                      "locus-driver: %d session(s), %zu tokens in %.2f s "
-                     "(%.2f tok/s in all, prompt included in the time)\n",
+                     "(%.2f tok/s in all; the time counts the prompt "
+                     "after each session's first token)\n",
                      concurrent, n_tokens, secs,
                      static_cast<double>(n_tokens) / secs);
         if (!all_complete) {
