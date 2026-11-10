@@ -733,7 +733,9 @@ float dot_iq4_nl(const std::byte* row, std::span<const float> x) {
 // on quantized matvec (and enables integer-dot speed). ----
 
 /** ggml's round-to-nearest (the 2^23 magic-add trick); matches the
- *  quantizer bit-for-bit, unlike std::lround (half-away-from-zero). */
+ *  quantizer bit-for-bit, unlike std::lround (half-away-from-zero).
+ *  Defined on the bits for every input, but a NaN gives whatever its
+ *  payload bits say, so callers map NaN to 0 first. */
 int nearest_int(float fval) {
     float val = fval + 12582912.0f;
     std::int32_t i;
@@ -771,7 +773,9 @@ void quantize_row_q8_k(const float* x, BlockQ8K* y, std::size_t n) {
         }
         const float iscale = -127.0f / max;
         for (int j = 0; j < 256; ++j) {
-            const int v = nearest_int(iscale * x[j]);
+            // A NaN quantizes to 0 (i#473), as the NEON path.
+            const float p = iscale * x[j];
+            const int v = std::isnan(p) ? 0 : nearest_int(p);
             y[i].qs[j] = static_cast<std::int8_t>(std::min(127, v));
         }
         for (int j = 0; j < 16; ++j) {
@@ -2007,7 +2011,12 @@ void quantize_row_q8_0_act(const float* x, BlockQ8_0Act* y, std::size_t n) {
         const float id = d != 0.0f ? 1.0f / d : 0.0f;
         y[b].d = f16_to_f32(f32_to_f16(d));
         for (int j = 0; j < 32; ++j) {
-            y[b].qs[j] = static_cast<std::int8_t>(std::nearbyint(xb[j] * id));
+            // A NaN quantizes to 0 (converting it to an integer is
+            // undefined; arm64 gives 0, x86 INT_MIN), as the NEON path.
+            const float v = xb[j] * id;
+            y[b].qs[j] = std::isnan(v)
+                             ? 0
+                             : static_cast<std::int8_t>(std::nearbyint(v));
         }
     }
 }

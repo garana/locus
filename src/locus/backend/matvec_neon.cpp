@@ -701,8 +701,12 @@ void quantize_activation_q8k_neon(std::span<const float> x, float* d,
                     vmulq_f32(is, vld1q_f32(xb + g * 16 + k * 4));
                 const int32x4_t bits =
                     vreinterpretq_s32_f32(vaddq_f32(p, magic));
-                v[k] = vminq_s32(
-                    vsubq_s32(vandq_s32(bits, mant), bias), q127);
+                // A NaN lane (p != p) quantizes to 0, as the scalar.
+                const int32x4_t keep =
+                    vreinterpretq_s32_u32(vceqq_f32(p, p));
+                v[k] = vandq_s32(
+                    vminq_s32(vsubq_s32(vandq_s32(bits, mant), bias), q127),
+                    keep);
             }
             lo = vcombine_s16(vmovn_s32(v[0]), vmovn_s32(v[1]));
             hi = vcombine_s16(vmovn_s32(v[2]), vmovn_s32(v[3]));
@@ -731,7 +735,8 @@ void quantize_activation_q8_0_neon(std::span<const float> x, float* d,
         const float dd = amax / 127.0f;
         const float id = dd != 0.0f ? 1.0f / dd : 0.0f;
         d[b] = f16_to_f32(f32_to_f16(dd));
-        // nearbyint under the default rounding mode: half to even.
+        // nearbyint under the default rounding mode: half to even; a NaN
+        // converts to 0 (FCVTNS), as the scalar maps it (i#473).
         int16x8_t h[4];
         for (int k = 0; k < 4; ++k) {
             const int32x4_t a = vcvtnq_s32_f32(vmulq_n_f32(v[2 * k], id));
