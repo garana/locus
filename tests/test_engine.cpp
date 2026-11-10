@@ -315,8 +315,15 @@ TEST_CASE("speculative decoding matches greedy output",
         engine.run_to_completion();
         // Greedy spec decode is byte-exact to plain greedy.
         REQUIRE(engine.get(a)->generated == want);
-        REQUIRE(engine.spec_steps() > 0);            // verify ran
-        REQUIRE(engine.spec_accepted_tokens() > 0);  // and accepted
+        REQUIRE(engine.spec_steps() > 0);  // verify ran
+        // With fixed lengths the drafts, and so the accepts, depend
+        // only on the model's greedy output. Adaptive lengths depend on
+        // the measured forward times too: where a verify row costs
+        // about a decode step (a slow CPU, this tiny model), one
+        // rejected first verify is enough to stop drafting (i#482).
+        if (!adaptive) {
+            REQUIRE(engine.spec_accepted_tokens() > 0);  // and accepted
+        }
         REQUIRE(engine.spec_drafted_tokens() >=
                 engine.spec_accepted_tokens());
         std::uint64_t verifies = 0;
