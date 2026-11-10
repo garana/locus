@@ -43,6 +43,7 @@ add_executable(locus_tests
     test_forward_batch_layers.cpp
     test_logit_rows.cpp
     test_outw_batch.cpp
+    test_batch_invariance.cpp
     test_batch_embd.cpp
     test_pipeline_mux.cpp
     test_stage_executor.cpp
