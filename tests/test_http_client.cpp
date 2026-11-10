@@ -85,9 +85,12 @@ struct RawServer {
                                                       3000);
             if (c < 0) return;
             char buf[4096];
-            (void)::read(c, buf, sizeof(buf));  // the request
+            // The request; its size does not matter here. GCC ignores a
+            // (void) cast on warn_unused_result, so keep the results.
+            [[maybe_unused]] const ssize_t got = ::read(c, buf, sizeof(buf));
             if (!reply.empty()) {
-                (void)::write(c, reply.data(), reply.size());
+                [[maybe_unused]] const ssize_t put =
+                    ::write(c, reply.data(), reply.size());
             }
             if (hold_ms > 0) {
                 std::this_thread::sleep_for(
