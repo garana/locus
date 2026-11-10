@@ -354,6 +354,50 @@ TEST_CASE("http client: a POST after an idle close runs once", "[http_client]") 
     CHECK(posts == 2);
 }
 
+TEST_CASE("http client: a write that times out is not sent again",
+          "[http_client]") {
+    // The server answers one request on a kept-alive connection, then
+    // stops reading. The next, large request times out writing; the
+    // client must not open a second connection to send it again.
+    int port = 0;
+    const int lfd = locus::pipeline::listen_on("127.0.0.1", 0, &port);
+    REQUIRE(lfd >= 0);
+    std::atomic<int> accepts{0};
+    std::atomic<bool> done{false};
+    std::thread srv([&] {
+        int first = -1;
+        while (!done) {
+            const int c = locus::pipeline::accept_one(lfd, nullptr, 100);
+            if (c < 0) continue;
+            if (++accepts > 1) {
+                ::close(c);
+                continue;
+            }
+            first = c;
+            char buf[4096];
+            [[maybe_unused]] const ssize_t got = ::read(c, buf, sizeof(buf));
+            const std::string ok =
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+            [[maybe_unused]] const ssize_t put =
+                ::write(c, ok.data(), ok.size());
+            // ...and read nothing more.
+        }
+        if (first >= 0) ::close(first);
+    });
+    locus::http::ClientOptions o;
+    o.write_timeout_ms = 200;
+    Client c("127.0.0.1", port, o);
+    REQUIRE(c.send(ClientRequest{"GET", "/", {}, ""}).ok);
+    const auto r =
+        c.send(ClientRequest{"POST", "/", {}, std::string(64 << 20, 'x')});
+    CHECK_FALSE(r.ok);
+    CHECK(r.error.find("write timed out") != std::string::npos);
+    CHECK(accepts == 1);
+    done = true;
+    srv.join();
+    ::close(lfd);
+}
+
 TEST_CASE("http client: IPv6 Host, write deadline, interim cap",
           "[http_client]") {
     SECTION("an IPv6 literal goes in brackets in Host") {

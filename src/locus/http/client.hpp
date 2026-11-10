@@ -141,7 +141,9 @@ struct ClientOptions {
     /** Longest gap between two reads (not the whole response, which
      * for a video can take minutes). */
     int read_timeout_ms = 60000;
-    /** Longest wait for the server to take more request bytes. */
+    /** Longest wait for the server to take more request bytes: a bound
+     * on each stall, not on the whole write (a server that takes a
+     * byte now and then keeps a large body going). */
     int write_timeout_ms = 60000;
     ResponseLimits limits;
 };
