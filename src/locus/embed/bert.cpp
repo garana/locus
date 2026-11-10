@@ -143,9 +143,11 @@ BertEncoder BertEncoder::load(const gguf::GgufFile& g) {
     e.vocab_ = static_cast<std::uint32_t>(tok->ne[1]);
     e.tok_embd_ = mat("token_embd.weight", e.vocab_, e.width_);
     e.pos_embd_ = mat("position_embd.weight", e.context_, e.width_);
-    // Token types are all 0 ("sentence A"), as in llama.cpp: row 0.
+    // Token types are all 0 ("sentence A"), as in llama.cpp: row 0. A
+    // model with one type (XLM-R) stores it as one row of 1 dimension.
     const gguf::TensorInfo* types = info("token_types.weight");
-    if (types->n_dims != 2 || types->ne[0] != e.width_ || types->ne[1] == 0) {
+    if (types->n_dims < 1 || types->n_dims > 2 || types->ne[0] != e.width_ ||
+        (types->n_dims == 2 && types->ne[1] == 0)) {
         throw gguf::Error("bert: token_types.weight has the wrong shape");
     }
     e.type0_ = vec("token_types.weight", types->nelements());

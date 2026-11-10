@@ -22,7 +22,9 @@ enum class Pooling : std::uint32_t {
 
 /**
  * The BERT encoder of embedding models (i#502), GGUF arch "bert", as
- * llama.cpp runs it (bge-small / bge-base / bge-large, MiniLM):
+ * llama.cpp runs it: BERT (bge-small, e5-small-v2) and XLM-R (bge-m3),
+ * whose converter already drops the position rows XLM-R skips, so
+ * row t is position t for both:
  *
  * x = LayerNorm(token + position + token_type[0]); then per layer,
  * post-norm: x = LayerNorm(x + O * attention(x)), then
@@ -56,7 +58,7 @@ class BertEncoder {
      * each sequence.
      *
      * @param batch Token ids per sequence, as the tokenizer gives them
-     *     (CLS first, SEP last).
+     *     (CLS or <s> first, SEP or </s> last).
      * @param op The backend ops the matrices run on.
      * @returns Per sequence, the token states: size() x width() floats,
      *     token-major.

@@ -26,7 +26,8 @@ class EmbeddingModel {
     static constexpr std::size_t kPassTokens = 4096;
 
     /**
-     * @param path A GGUF of arch "bert" with a WordPiece tokenizer.
+     * @param path A GGUF of arch "bert" with a WordPiece tokenizer
+     *     (BERT) or a SentencePiece unigram one (XLM-R).
      * @param name The model id requests use; empty = the file name,
      *     as locus-server names the chat model.
      * @throws gguf::Error when the file is not such a model.
@@ -40,7 +41,8 @@ class EmbeddingModel {
     std::uint32_t context() const { return enc_.context(); }
 
     /**
-     * Embeds each input: tokenized with CLS and SEP, encoded in passes
+     * Embeds each input: tokenized with the model's special tokens
+     * (CLS and SEP, or <s> and </s>), encoded in passes
      * of up to kPassTokens tokens, pooled and L2-normalized.
      *
      * @param inputs UTF-8 texts.
