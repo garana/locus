@@ -1,0 +1,27 @@
+[
+ [
+  "norm_out.linear",
+  64,
+  32
+ ],
+ [
+  "single_transformer_blocks.0.attn.to_q",
+  32,
+  32
+ ],
+ [
+  "single_transformer_blocks.1.proj_mlp",
+  128,
+  32
+ ],
+ [
+  "transformer_blocks.1.attn.to_out.0",
+  32,
+  32
+ ],
+ [
+  "x_embedder",
+  32,
+  16
+ ]
+]
