@@ -161,7 +161,13 @@ addresses) probes every address of the range for a `/v1/models` at
 start and every sixth refresh, 64 at a time with a 300 ms connect
 timeout; the ones that answer are its instances, and a scan that no
 longer finds one drops it (an empty scan is an answer, unlike an empty
-SRV lookup). With `--register-keys`, an instance can also add
+SRV lookup). A scan admits any server in the range that answers with
+a `data` list, not only locus, and with `--upstream-auth client` it
+gets the clients' prompts and keys, so scan only a range where
+everyone who can listen is trusted. A host that accepts the connect
+and then sends nothing holds a probe for the 2 s read timeout, so a
+range full of them makes a scan last about 1024 / 64 x 2.3 s = 37 s.
+With `--register-keys`, an instance can also add
 itself (`locus-server --register`): it POSTs its host:port to
 `/locus/register` with one of the keys, again every third of its TTL
 (30 s), and the router drops it when that runs out or on
