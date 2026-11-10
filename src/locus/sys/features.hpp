@@ -7,9 +7,9 @@ namespace locus::sys {
 /**
  * CPU/GPU capabilities visible to this process, combining what the
  * build enabled with what the running machine supports. Backends
- * use this to pick the best kernel variant at runtime (same scheme
- * as ../pbw: every variant is always compiled when the compiler
- * supports it; selection happens here, not at build time).
+ * use this to pick the best kernel variant at runtime: every variant
+ * is compiled when the compiler supports it, and selection happens
+ * here, not at build time.
  */
 struct Features {
     /** ARM NEON (baseline on all arm64 targets). */

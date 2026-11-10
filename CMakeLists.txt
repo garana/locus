@@ -147,10 +147,10 @@ target_link_libraries(locus-router PRIVATE locus)
 target_include_directories(locus PUBLIC src)
 
 # ----------------------------------------------------------------
-# Vectorized CPU support (same scheme as ../pbw): probe which SIMD
-# flags the compiler accepts; kernel variants (M2) are added as
-# per-source files with these flags, and locus::sys::detect()
-# picks the best variant at runtime.
+# Vectorized CPU support: probe which SIMD flags the compiler
+# accepts; each kernel variant is its own source file built with
+# only its flags, and locus::sys::detect() picks the best variant
+# at runtime.
 # ----------------------------------------------------------------
 include(CheckCXXCompilerFlag)
 
@@ -208,9 +208,10 @@ endif()
 message(STATUS "locus SIMD variants: ${LOCUS_SIMD_VARIANTS}")
 
 # ----------------------------------------------------------------
-# Vulkan (optional): detection + loader link now; compute kernels
-# land in M5. Shader-to-SPIR-V embedding will follow ../pbw's
-# glslc/glslangValidator custom-command pattern.
+# Vulkan (optional): find the loader and a shader compiler; each
+# compute shader is compiled to SPIR-V and embedded as a uint32_t
+# array header (glslangValidator --vn, or glslc -mfmt=c wrapped by
+# cmake/wrap_spv.cmake).
 # ----------------------------------------------------------------
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
