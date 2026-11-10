@@ -358,9 +358,9 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         const std::string content = json::parse(
             res->body)["choices"][0]["message"]["content"];
         REQUIRE(!content.empty());
-        // Every byte must keep the output a valid JSON prefix.
-        locus::model::GbnfMatcher m(
-            locus::model::Gbnf::parse(locus::model::json_value_gbnf()));
+        // Every byte must keep the output a valid prefix of an object.
+        locus::model::GbnfMatcher m(locus::model::Gbnf::parse(
+            locus::model::json_value_gbnf(), "object"));
         for (unsigned char c : content) {
             INFO("content: " << content);
             REQUIRE(m.feed(c));

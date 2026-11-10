@@ -54,6 +54,19 @@ void GrammarConstraint::walk(std::uint32_t node, const GbnfMatcher& m,
     }
 }
 
+bool GrammarConstraint::more_than_space() const {
+    const auto& pieces = trie_->pieces();
+    for (std::size_t t = 0; t < mask_.size(); ++t) {
+        if (mask_[t] == 0) continue;
+        for (const char ch : pieces[t]) {
+            if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool GrammarConstraint::allows(tok::TokenId t) const {
     if (!fresh_) {
         std::string k = m_.key();
@@ -67,6 +80,12 @@ bool GrammarConstraint::allows(tok::TokenId t) const {
             }
             mask_.assign(trie_->pieces().size(), 0);
             walk(0, m_, 0);
+            if (m_.accepted() && !more_than_space()) {
+                // Complete, and only whitespace may follow (the JSON
+                // grammars end every value with optional space): stop
+                // here instead of letting the model pad the reply.
+                std::fill(mask_.begin(), mask_.end(), 0);
+            }
             if (static_cast<std::size_t>(eos_) < mask_.size()) {
                 mask_[eos_] = m_.accepted() ? 1 : 0;
             }
