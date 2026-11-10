@@ -52,6 +52,14 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
 void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
 
+/** quantize_activation_q8k with NEON: bit-identical to it (the same
+ *  operations, the same rounding, no contraction). */
+void quantize_activation_q8k_neon(std::span<const float> x, float* d,
+                                  std::int8_t* qs, std::int16_t* bsums);
+/** quantize_activation_q8_0 with NEON, bit-identical to it. */
+void quantize_activation_q8_0_neon(std::span<const float> x, float* d,
+                                   std::int8_t* qs);
+
 #if defined(LOCUS_HAS_NEON_DOTPROD_VARIANT)
 /**
  * The four NEON entry points above, compiled again with the 8-bit

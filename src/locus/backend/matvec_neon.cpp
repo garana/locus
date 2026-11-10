@@ -5,6 +5,7 @@
 #include <arm_neon.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -658,6 +659,92 @@ void rows_q6_k_q8k_xt(const std::byte* row, std::size_t nb, const float* yd,
 
 }  // namespace
 
+void quantize_activation_q8k_neon(std::span<const float> x, float* d,
+                                  std::int8_t* qs, std::int16_t* bsums) {
+    const std::size_t nb = x.size() / 256;
+    // ggml's nearest_int: adding 1.5 * 2^23 rounds to an integer in
+    // the low mantissa bits (half to even), as the scalar does.
+    const float32x4_t magic = vdupq_n_f32(12582912.0f);
+    const int32x4_t mant = vdupq_n_s32(0x007fffff);
+    const int32x4_t bias = vdupq_n_s32(0x00400000);
+    const int32x4_t q127 = vdupq_n_s32(127);
+    for (std::size_t i = 0; i < nb; ++i) {
+        const float* xb = x.data() + i * 256;
+        // maxnm skips a NaN as the scalar's `ax > amax` does (an
+        // all-NaN block gives 0, as there).
+        float32x4_t m = vdupq_n_f32(0.0f);
+        for (int j = 0; j < 256; j += 4) {
+            m = vmaxnmq_f32(m, vabsq_f32(vld1q_f32(xb + j)));
+        }
+        const float amax = vmaxnmvq_f32(m);
+        std::int8_t* q = qs + i * 256;
+        std::int16_t* bs = bsums + i * 16;
+        if (amax == 0.0f) {
+            d[i] = 0.0f;
+            std::memset(q, 0, 256);
+            std::memset(bs, 0, 16 * sizeof(std::int16_t));
+            continue;
+        }
+        // The first element of that magnitude, as the scalar's strict
+        // > scan picks it.
+        int first = 0;
+        while (first < 255 && std::fabs(xb[first]) != amax) {
+            ++first;
+        }
+        const float iscale = -127.0f / xb[first];
+        const float32x4_t is = vdupq_n_f32(iscale);
+        for (int g = 0; g < 16; ++g) {
+            int16x8_t lo, hi;
+            int32x4_t v[4];
+            for (int k = 0; k < 4; ++k) {
+                const float32x4_t p =
+                    vmulq_f32(is, vld1q_f32(xb + g * 16 + k * 4));
+                const int32x4_t bits =
+                    vreinterpretq_s32_f32(vaddq_f32(p, magic));
+                v[k] = vminq_s32(
+                    vsubq_s32(vandq_s32(bits, mant), bias), q127);
+            }
+            lo = vcombine_s16(vmovn_s32(v[0]), vmovn_s32(v[1]));
+            hi = vcombine_s16(vmovn_s32(v[2]), vmovn_s32(v[3]));
+            const int8x16_t q16 = vcombine_s8(vmovn_s16(lo), vmovn_s16(hi));
+            vst1q_s8(q + g * 16, q16);
+            // The sum of the stored quants, as the scalar sums them.
+            bs[g] = static_cast<std::int16_t>(vaddlvq_s8(q16));
+        }
+        d[i] = 1.0f / iscale;
+    }
+}
+
+void quantize_activation_q8_0_neon(std::span<const float> x, float* d,
+                                   std::int8_t* qs) {
+    const std::size_t nb = x.size() / 32;
+    for (std::size_t b = 0; b < nb; ++b) {
+        const float* xb = x.data() + b * 32;
+        float32x4_t v[8];
+        float32x4_t m = vdupq_n_f32(0.0f);
+        for (int k = 0; k < 8; ++k) {
+            v[k] = vld1q_f32(xb + k * 4);
+            // NaN skipped, as std::max does.
+            m = vmaxnmq_f32(m, vabsq_f32(v[k]));
+        }
+        const float amax = vmaxnmvq_f32(m);
+        const float dd = amax / 127.0f;
+        const float id = dd != 0.0f ? 1.0f / dd : 0.0f;
+        d[b] = f16_to_f32(f32_to_f16(dd));
+        // nearbyint under the default rounding mode: half to even.
+        int16x8_t h[4];
+        for (int k = 0; k < 4; ++k) {
+            const int32x4_t a = vcvtnq_s32_f32(vmulq_n_f32(v[2 * k], id));
+            const int32x4_t c =
+                vcvtnq_s32_f32(vmulq_n_f32(v[2 * k + 1], id));
+            h[k] = vcombine_s16(vmovn_s32(a), vmovn_s32(c));
+        }
+        vst1q_s8(qs + b * 32, vcombine_s8(vmovn_s16(h[0]), vmovn_s16(h[1])));
+        vst1q_s8(qs + b * 32 + 16,
+                 vcombine_s8(vmovn_s16(h[2]), vmovn_s16(h[3])));
+    }
+}
+
 void matvec_neon(const Mat& w, std::span<const float> x,
                  std::span<float> out) {
     if (w.type == gguf::TensorType::kF32) {
@@ -751,7 +838,7 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
         thread_local std::vector<std::int8_t> q8;
         d8.resize(nb);
         q8.resize(x.size());
-        quantize_activation_q8_0(x, d8.data(), q8.data());
+        quantize_activation_q8_0_neon(x, d8.data(), q8.data());
         const std::size_t bb = w.type == gguf::TensorType::kQ8_0 ? 34 : 18;
         for (std::uint32_t r = 0; r < w.rows; ++r) {
             out[r] = row_block32_q8_0_neon(w.type, w.data + r * nb * bb, bb,
@@ -772,7 +859,7 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
     yd.resize(nb);
     yq.resize(x.size());
     ys.resize(nb * 16);
-    quantize_activation_q8k(x, yd.data(), yq.data(), ys.data());
+    quantize_activation_q8k_neon(x, yd.data(), yq.data(), ys.data());
     const std::size_t bb = q4k ? 144 : 210;
     for (std::uint32_t r = 0; r < w.rows; ++r) {
         const std::byte* row = w.data + r * nb * bb;
@@ -823,7 +910,7 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
         d8.resize(nb * n);
         q8.resize(cols * n);
         for (std::uint32_t t = 0; t < n; ++t) {
-            quantize_activation_q8_0(x_batch.subspan(t * cols, cols),
+            quantize_activation_q8_0_neon(x_batch.subspan(t * cols, cols),
                                      d8.data() + t * nb,
                                      q8.data() + t * cols);
         }
@@ -858,7 +945,7 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
     yq.resize(cols * n);
     ys.resize(nb * 16 * n);
     for (std::uint32_t t = 0; t < n; ++t) {
-        quantize_activation_q8k(x_batch.subspan(t * cols, cols),
+        quantize_activation_q8k_neon(x_batch.subspan(t * cols, cols),
                                 yd.data() + t * nb, yq.data() + t * cols,
                                 ys.data() + t * nb * 16);
     }
