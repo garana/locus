@@ -161,8 +161,16 @@ itself (`locus-server --register`): it POSTs its host:port to
 `/locus/register` with one of the keys, again every third of its TTL
 (30 s), and the router drops it when that runs out or on
 `/locus/deregister`; without keys the route is a 404, since anyone who
-could register could take the router's traffic. An instance lists its
-kinds in
+could register could take the router's traffic. A registration key is
+worth as much as a client key: the router sends the requests it routes
+to a registered address, with the client's own key in the default
+`--upstream-auth client`. An instance found by SRV or registration
+gets an `--instance-keys` key only from a line that names its
+host:port, never the `*` one, so the router sends its own keys only to
+addresses its operator named. Every proxied request carries
+`X-Locus-Router: 1`, and a router refuses (508) a request with it, so
+a registration at a router's own address cannot loop. An instance
+lists its kinds in
 `/v1/models` (`locus_kinds`), which the router reads at start and
 every `--refresh-ms`; a request that names a listed model goes to that
 instance. Buffered replies are forwarded whole; a chunked one (SSE)

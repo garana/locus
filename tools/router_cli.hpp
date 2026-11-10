@@ -38,14 +38,19 @@ inline constexpr const char* kRouterUsage =
     "  --upstream-auth M   the credential sent to the instances: client\n"
     "                      (the client's own, default), none, or key\n"
     "  --instance-keys F   a file of \"HOST:PORT KEY\" lines (\"* KEY\"\n"
-    "                      for any other instance), so keys stay off\n"
-    "                      the command line: the key each instance\n"
-    "                      gets with --upstream-auth key, and with its\n"
+    "                      for any other instance given as HOST:PORT;\n"
+    "                      one found by SRV or registration needs its\n"
+    "                      own line), so keys stay off the command\n"
+    "                      line: the key each instance gets with\n"
+    "                      --upstream-auth key, and with its\n"
     "                      /v1/models poll in any mode\n"
     "  --register-keys F   let instances register themselves (POST\n"
     "                      /locus/register, from locus-server\n"
     "                      --register) with a key from file F, one per\n"
-    "                      line; without it registration is off\n"
+    "                      line; without it registration is off. Guard\n"
+    "                      these keys like client keys: requests (and\n"
+    "                      with --upstream-auth client, the clients'\n"
+    "                      keys) go to the address a holder registers\n"
     "  -h, --help          show this help and exit\n";
 
 /**

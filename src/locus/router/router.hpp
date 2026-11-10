@@ -242,11 +242,17 @@ class Router {
     /** The head stage: the client key check (cfg_.auth_helper_argv).
      * @returns true to reject (res holds the 401). */
     bool reject(const http::Request& head, http::ServerResponse& res);
-    /** The request's headers for instance `inst` (host:port): the
-     * client's, minus hop-by-hop ones, with the credential the
-     * upstream_auth mode sends. */
+    /** The request's headers for instance `in`: the client's, minus
+     * hop-by-hop ones, with the credential the upstream_auth mode
+     * sends, and the router's loop mark (X-Locus-Router). */
     std::vector<std::pair<std::string, std::string>> upstream_headers(
-        const http::Request& req, const std::string& inst) const;
+        const http::Request& req, const Instance& in) const;
+    /** The instance key for `in`: its own "HOST:PORT KEY" line, else
+     * the "*" line, but "*" only for an instance given as host:port:
+     * one found by SRV or registration gets a key only from a line
+     * that names it, so a key goes only to an address the operator
+     * named. @returns nullptr when there is none. */
+    const std::string* instance_key(const Instance& in) const;
 
     RouterConfig cfg_;
     auth::WallClock clock_;

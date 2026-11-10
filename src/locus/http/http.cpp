@@ -597,6 +597,7 @@ std::string status_reason(int status) {
         case 501: return "Not Implemented";
         case 503: return "Service Unavailable";
         case 505: return "HTTP Version Not Supported";
+        case 508: return "Loop Detected";
         default:  return {};
     }
 }

@@ -683,6 +683,73 @@ TEST_CASE("router: instances register themselves", "[router]") {
     CHECK(r.head.status == 400);
 }
 
+// A register key must not be a way to collect the router's keys: an
+// instance found by registration (or SRV) gets an instance key only
+// from a line that names its address, never the "*" one (review of
+// #496). And a router refuses a request another router sent, so a
+// registration at a router's own address cannot loop.
+TEST_CASE("router: a registered instance never gets the wildcard key",
+          "[router]") {
+    using locus::router::Registrar;
+    using UA = RouterConfig::UpstreamAuth;
+    FakeInstance a("A", {"text"}, "m"), b("B", {"text"}, "m");
+    RouterConfig cfg;
+    cfg.register_keys = {"rk"};
+    cfg.upstream_auth = UA::kKey;
+    cfg.instance_keys = {{"*", "sk-wild"}};
+    RouterFixture rf({b.addr()}, cfg);  // B is static
+    Registrar::Config rc;
+    rc.router_host = "127.0.0.1";
+    rc.router_port = rf.port;
+    rc.address = a.addr();
+    rc.key = "rk";
+    REQUIRE(Registrar(rc).register_once());
+    std::set<std::string> seen;
+    for (int i = 0; i < 20; ++i) {
+        const auto r = rf.post(
+            "/v1/completions",
+            json{{"prompt", "p" + std::to_string(i)}, {"max_tokens", 1}});
+        REQUIRE(r.ok);
+        REQUIRE(r.head.status == 200);
+        seen.insert(r.head.get_header_value("X-Instance"));
+    }
+    REQUIRE(seen == std::set<std::string>{"A", "B"});
+    CHECK(b.header("Authorization") == "Bearer sk-wild");
+    CHECK(a.header("Authorization").empty());
+    // Every proxied request carries the router's loop mark.
+    CHECK(a.header("X-Locus-Router") == "1");
+
+    // A request with that mark is refused, not proxied.
+    Client c("127.0.0.1", rf.port);
+    const auto r = c.send(ClientRequest{
+        "POST", "/v1/completions",
+        {{"Content-Type", "application/json"}, {"X-Locus-Router", "1"}},
+        json{{"prompt", "x"}, {"max_tokens", 1}}.dump()});
+    CHECK(r.head.status == 508);
+}
+
+TEST_CASE("router: a registered instance gets the key that names it",
+          "[router]") {
+    using locus::router::Registrar;
+    FakeInstance a("A", {"text"}, "m");
+    RouterConfig cfg;
+    cfg.register_keys = {"rk"};
+    cfg.upstream_auth = RouterConfig::UpstreamAuth::kKey;
+    cfg.instance_keys = {{a.addr(), "sk-a"}, {"*", "sk-wild"}};
+    RouterFixture rf({}, cfg);
+    Registrar::Config rc;
+    rc.router_host = "127.0.0.1";
+    rc.router_port = rf.port;
+    rc.address = a.addr();
+    rc.key = "rk";
+    REQUIRE(Registrar(rc).register_once());
+    const auto r = rf.post("/v1/completions",
+                           json{{"prompt", "x"}, {"max_tokens", 1}});
+    REQUIRE(r.ok);
+    REQUIRE(r.head.status == 200);
+    CHECK(a.header("Authorization") == "Bearer sk-a");
+}
+
 TEST_CASE("router: registration is off without keys", "[router]") {
     FakeInstance b("B", {"text"}, "m");
     RouterFixture rf({b.addr()});

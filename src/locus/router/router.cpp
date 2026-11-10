@@ -366,8 +366,16 @@ bool Router::reject(const http::Request& head, http::ServerResponse& res) {
     return true;
 }
 
+const std::string* Router::instance_key(const Instance& in) const {
+    auto it = cfg_.instance_keys.find(in.host + ":" + std::to_string(in.port));
+    if (it == cfg_.instance_keys.end() && !in.from_srv && !in.from_reg) {
+        it = cfg_.instance_keys.find("*");
+    }
+    return it == cfg_.instance_keys.end() ? nullptr : &it->second;
+}
+
 std::vector<std::pair<std::string, std::string>> Router::upstream_headers(
-    const http::Request& req, const std::string& inst) const {
+    const http::Request& req, const Instance& in) const {
     using UA = RouterConfig::UpstreamAuth;
     std::vector<std::pair<std::string, std::string>> h;
     for (const auto& [k, v] : req.headers) {
@@ -380,12 +388,14 @@ std::vector<std::pair<std::string, std::string>> Router::upstream_headers(
         h.emplace_back(k, v);
     }
     if (cfg_.upstream_auth == UA::kKey) {
-        auto it = cfg_.instance_keys.find(inst);
-        if (it == cfg_.instance_keys.end()) it = cfg_.instance_keys.find("*");
-        if (it != cfg_.instance_keys.end()) {
-            h.emplace_back("Authorization", "Bearer " + it->second);
+        if (const std::string* key = instance_key(in)) {
+            h.emplace_back("Authorization", "Bearer " + *key);
         }
     }
+    // A router that receives this refuses the request (handle): an
+    // instance registered at a router's own address, or a router
+    // behind another, would otherwise send it round until a timeout.
+    h.emplace_back("X-Locus-Router", "1");
     return h;
 }
 
@@ -555,10 +565,8 @@ void Router::poll(Instance& in) const {
     // An instance that checks keys needs one for its /v1/models too:
     // the instance's key from instance_keys, in any upstream mode.
     http::ClientRequest poll{"GET", "/v1/models", {}, ""};
-    auto key = cfg_.instance_keys.find(in.host + ":" + std::to_string(in.port));
-    if (key == cfg_.instance_keys.end()) key = cfg_.instance_keys.find("*");
-    if (key != cfg_.instance_keys.end()) {
-        poll.headers.emplace_back("Authorization", "Bearer " + key->second);
+    if (const std::string* key = instance_key(in)) {
+        poll.headers.emplace_back("Authorization", "Bearer " + *key);
     }
     const auto r = c.send(poll);
     const json j = r.ok && r.head.status == 200
@@ -904,6 +912,18 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
         res.set_content(R"({"status":"ok"})", "application/json");
         return;
     }
+    // A request a router sent: this router is one of its instances (a
+    // registration at a router's address, or routers chained), so
+    // proxying it would loop until a timeout.
+    if (req.has_header("X-Locus-Router")) {
+        res.status = 508;
+        res.set_content(error_body("loop: this request came from a "
+                                   "locus-router, and a router does not "
+                                   "proxy to a router",
+                                   "invalid_request_error"),
+                        "application/json");
+        return;
+    }
     if (req.path == "/locus/register" || req.path == "/locus/deregister") {
         registration(req, res);
         return;
@@ -1004,8 +1024,7 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
         std::shared_ptr<http::Client> client = take(i);
         {
             std::lock_guard lk(mu_);
-            up.headers = upstream_headers(
-                req, inst_[i].host + ":" + std::to_string(inst_[i].port));
+            up.headers = upstream_headers(req, inst_[i]);
         }
         const auto head = client->begin(up);
         if (!head.ok) {
