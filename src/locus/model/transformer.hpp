@@ -458,6 +458,11 @@ class TransformerModel {
      * (every CPU/CUDA backend + arch; Vulkan opts out). */
     bool supports_batch() const;
 
+    /** @returns true when forward_batch_decode runs: every
+     * supports_batch() backend, plus Vulkan, which runs the step
+     * through its multi-sequence forward (forward_embeddings). */
+    bool supports_batch_decode() const;
+
     /** @returns true when forward_batch can ingest a prompt chunk:
      * every supports_batch() backend, plus Vulkan, which runs the
      * chunk through its GPU batched forward (one token at a time
