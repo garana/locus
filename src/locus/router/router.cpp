@@ -151,6 +151,44 @@ std::string session_key(std::string_view header, std::string_view body) {
     return std::string("p:") + hex;
 }
 
+std::string router_video_id(std::string_view instance, std::string_view id) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out = "video_";
+    for (const char c : instance) {
+        const auto u = static_cast<unsigned char>(c);
+        out += kHex[u >> 4];
+        out += kHex[u & 15];
+    }
+    out += '_';
+    out += id.substr(id.rfind("video_", 0) == 0 ? 6 : 0);
+    return out;
+}
+
+bool split_video_id(std::string_view rid, std::string& instance,
+                    std::string& id) {
+    if (rid.rfind("video_", 0) != 0) return false;
+    rid.remove_prefix(6);
+    const std::size_t sep = rid.find('_');
+    if (sep == std::string_view::npos || sep == 0 || sep % 2 != 0 ||
+        sep + 1 == rid.size()) {
+        return false;
+    }
+    const auto nib = [](char c) {
+        return c >= '0' && c <= '9'   ? c - '0'
+               : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                                      : -1;
+    };
+    std::string inst;
+    for (std::size_t k = 0; k < sep; k += 2) {
+        const int hi = nib(rid[k]), lo = nib(rid[k + 1]);
+        if (hi < 0 || lo < 0) return false;
+        inst += static_cast<char>(hi * 16 + lo);
+    }
+    instance = std::move(inst);
+    id = "video_" + std::string(rid.substr(sep + 1));
+    return true;
+}
+
 std::uint64_t rendezvous_score(std::string_view key,
                                std::string_view instance) {
     std::uint64_t h = fnv1a(key);
@@ -440,6 +478,61 @@ void Router::models(http::ServerResponse& res) const {
         "application/json");
 }
 
+void Router::metrics(http::ServerResponse& res) const {
+    // Prometheus text: one series per instance for each family.
+    std::vector<std::pair<std::string, bool>> inst;
+    {
+        std::lock_guard lk(mu_);
+        for (const auto& in : inst_) {
+            inst.emplace_back(in.host + ":" + std::to_string(in.port),
+                              in.healthy);
+        }
+    }
+    std::string out;
+    const auto family = [&](const char* name, const char* help,
+                            const char* type, const auto& value) {
+        out += std::string("# HELP ") + name + " " + help + "\n";
+        out += std::string("# TYPE ") + name + " " + type + "\n";
+        for (std::size_t i = 0; i < inst.size(); ++i) {
+            out += std::string(name) + "{instance=\"" + inst[i].first +
+                   "\"} " + value(i) + "\n";
+        }
+    };
+    const auto u = [](std::uint64_t v) { return std::to_string(v); };
+    family("locus_router_instance_up",
+           "1 when the instance answered its last /v1/models poll.", "gauge",
+           [&](std::size_t i) { return u(inst[i].second ? 1 : 0); });
+    family("locus_router_requests_total",
+           "Requests the instance answered through the router.", "counter",
+           [&](std::size_t i) { return u(slots_[i]->requests.load()); });
+    family("locus_router_upstream_errors_total",
+           "Requests that failed toward the instance (connect, a reply cut "
+           "short).",
+           "counter",
+           [&](std::size_t i) { return u(slots_[i]->errors.load()); });
+    family("locus_router_client_left_total",
+           "Streams the client left before the end; the upstream "
+           "connection was closed, so the instance stopped the work.",
+           "counter",
+           [&](std::size_t i) { return u(slots_[i]->client_left.load()); });
+    family("locus_router_request_seconds_total",
+           "Wall time of the requests sent to the instance.", "counter",
+           [&](std::size_t i) {
+               char buf[32];
+               std::snprintf(buf, sizeof buf, "%.6f",
+                             static_cast<double>(slots_[i]->busy_ns.load()) /
+                                 1e9);
+               return std::string(buf);
+           });
+    family("locus_router_inflight",
+           "Requests in flight to the instance now.", "gauge",
+           [&](std::size_t i) {
+               return u(static_cast<std::uint64_t>(
+                   std::max(0, slots_[i]->inflight.load())));
+           });
+    res.set_content(std::move(out), "text/plain; version=0.0.4");
+}
+
 void Router::handle(const http::Request& req, http::ServerResponse& res) {
     if (req.path == "/health") {
         res.set_content(R"({"status":"ok"})", "application/json");
@@ -447,6 +540,10 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
     }
     if (req.path == "/v1/models") {
         models(res);
+        return;
+    }
+    if (req.path == "/metrics") {
+        metrics(res);
         return;
     }
     const auto route = classify(req.path, req.body);
@@ -459,7 +556,37 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
     }
     Route rt = *route;
     rt.session = session_key(req.get_header_value("X-Session-Id"), req.body);
-    const std::vector<int> cands = candidates(rt);
+    std::string target = req.target;
+    std::vector<int> cands;
+    // GET /v1/videos/{id}[/content]: the id names the instance that made
+    // the job (router_video_id), so only that one can answer.
+    constexpr std::string_view kVideos = "/v1/videos/";
+    if (rt.kind == Kind::kVideo && req.path.rfind(kVideos, 0) == 0) {
+        std::string_view rest(req.path);
+        rest.remove_prefix(kVideos.size());
+        const std::string rid(rest.substr(0, rest.find('/')));
+        std::string inst, id;
+        if (split_video_id(rid, inst, id)) {
+            {
+                std::lock_guard lk(mu_);
+                for (std::size_t i = 0; i < inst_.size(); ++i) {
+                    if (inst_[i].host + ":" + std::to_string(inst_[i].port) ==
+                        inst) {
+                        cands.push_back(static_cast<int>(i));
+                    }
+                }
+            }
+            if (cands.empty()) {
+                res.status = 404;
+                res.set_content(error_body("no video " + rid,
+                                           "invalid_request_error"),
+                                "application/json");
+                return;
+            }
+            target.replace(kVideos.size(), rid.size(), id);
+        }
+    }
+    if (cands.empty()) cands = candidates(rt);
     if (cands.empty()) {
         res.status = 503;
         res.set_header("Retry-After", "5");
@@ -473,7 +600,7 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
 
     http::ClientRequest up;
     up.method = req.method;
-    up.target = req.target;
+    up.target = target;
     up.body = req.body;
     for (const auto& [k, v] : req.headers) {
         if (!hop_by_hop(k)) up.headers.emplace_back(k, v);
@@ -498,21 +625,29 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
         Slot& slot = *slots_[i];
         ++slot.inflight;
         // Released when the request is done here, or when the stream
-        // provider that holds it is gone.
-        std::shared_ptr<void> guard(nullptr,
-                                    [&slot](void*) { --slot.inflight; });
+        // provider that holds it is gone; it also adds the wall time.
+        const auto t0 = std::chrono::steady_clock::now();
+        std::shared_ptr<void> guard(nullptr, [&slot, t0](void*) {
+            --slot.inflight;
+            slot.busy_ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count());
+        });
         std::shared_ptr<http::Client> client = take(i);
         const auto head = client->begin(up);
         if (!head.ok) {
             // A refused or timed-out connect means the instance is down
             // until the next poll answers; any other failure (a reply
             // cut short, a bad head) only moves on to the next one.
+            ++slot.errors;
             std::lock_guard lk(mu_);
             if (!head.connected) inst_[i].healthy = false;
             last_error = inst_[i].host + ":" + std::to_string(inst_[i].port) +
                          ": " + head.error;
             continue;
         }
+        ++slot.requests;
         const auto framing = head.head.framing;
         const bool stream = framing == http::BodyFraming::kChunked ||
                             framing == http::BodyFraming::kClose;
@@ -543,10 +678,18 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
                 content_type,
                 [this, i, client, guard](http::Sink& sink) mutable {
                     std::string err;
+                    bool left = false;
                     if (client->read_body(
-                            [&](std::string_view d) { return sink.write(d); },
+                            [&](std::string_view d) {
+                                if (!sink.write(d)) left = true;
+                                return !left;
+                            },
                             err)) {
                         give(i, std::move(client));
+                    } else if (left) {
+                        ++slots_[i]->client_left;
+                    } else {
+                        ++slots_[i]->errors;
                     }
                 });
             return;
@@ -558,6 +701,7 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
                     return true;
                 },
                 err)) {
+            ++slot.errors;
             res.status = 502;
             res.headers.clear();
             res.set_content(error_body("upstream body: " + err, "server_error"),
@@ -565,6 +709,18 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
             return;
         }
         give(i, std::move(client));
+        if (rt.kind == Kind::kVideo &&
+            content_type.find("json") != std::string::npos) {
+            // A job: give it the router's id, which names this instance.
+            json j = json::parse(body, nullptr, /*allow_exceptions=*/false);
+            if (j.is_object() && j.contains("id") && j["id"].is_string()) {
+                std::lock_guard lk(mu_);
+                j["id"] = router_video_id(
+                    inst_[i].host + ":" + std::to_string(inst_[i].port),
+                    j["id"].get<std::string>());
+                body = j.dump();
+            }
+        }
         res.set_content(std::move(body), content_type);
         return;
     }

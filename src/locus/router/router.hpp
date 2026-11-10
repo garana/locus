@@ -55,6 +55,25 @@ struct Route {
  */
 std::string session_key(std::string_view header, std::string_view body);
 
+/**
+ * The id the router gives a video job, so a later GET /v1/videos/{id}
+ * reaches the instance that made it with no table: "video_", the
+ * instance's host:port in hex, "_", then the instance's own id without
+ * its "video_" prefix. It stays an id of word characters.
+ * @param instance The instance's host:port.
+ * @param id The instance's job id ("video_" and hex digits).
+ */
+std::string router_video_id(std::string_view instance, std::string_view id);
+
+/**
+ * Splits an id from router_video_id().
+ * @param[out] instance The instance's host:port.
+ * @param[out] id The instance's own id.
+ * @returns false for an id the router did not make.
+ */
+bool split_video_id(std::string_view rid, std::string& instance,
+                    std::string& id);
+
 /** @returns the rendezvous score of `instance` (host:port) for `key`:
  * a 64-bit FNV-1a hash of both, the same in every router. */
 std::uint64_t rendezvous_score(std::string_view key,
@@ -142,10 +161,18 @@ class Router {
         std::atomic<int> inflight{0};
         std::mutex mu;
         std::vector<std::shared_ptr<http::Client>> idle;
+        // For /metrics: requests answered from this instance, the ones
+        // that failed upstream, streams a client left, wall seconds.
+        std::atomic<std::uint64_t> requests{0};
+        std::atomic<std::uint64_t> errors{0};
+        std::atomic<std::uint64_t> client_left{0};
+        std::atomic<std::uint64_t> busy_ns{0};
     };
 
     void handle(const http::Request& req, http::ServerResponse& res);
     void models(http::ServerResponse& res) const;
+    /** The router's own Prometheus metrics, per instance. */
+    void metrics(http::ServerResponse& res) const;
     /** An idle connection to instance i, or a new client. */
     std::shared_ptr<http::Client> take(std::size_t i);
     /** Returns a client to instance i's pool (up to pool_size). */

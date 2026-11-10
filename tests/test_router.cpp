@@ -91,14 +91,52 @@ struct FakeInstance {
                 }
                 if (req.path == "/v1/chat/completions" &&
                     req.body.find("\"stream\":true") != std::string::npos) {
+                    // `chunks` pieces, `gap_ms` apart.
+                    const int chunks =
+                        req.body.find("\"long\":true") != std::string::npos
+                            ? 50
+                            : 3;
                     res.set_chunked_content_provider(
-                        "text/event-stream", [this](locus::http::Sink& s) {
-                            for (int i = 0; i < 3; ++i) {
-                                s.write("data: " + name + std::to_string(i) +
-                                        "\n\n");
+                        "text/event-stream",
+                        [this, chunks](locus::http::Sink& s) {
+                            for (int i = 0; i < chunks; ++i) {
+                                if (!s.write("data: " + name +
+                                             std::to_string(i) + "\n\n")) {
+                                    return;
+                                }
+                                if (chunks > 3) {
+                                    std::this_thread::sleep_for(
+                                        std::chrono::milliseconds(20));
+                                }
                             }
                             s.write("data: [DONE]\n\n");
                         });
+                    return;
+                }
+                // Video jobs: POST makes one this instance knows by its
+                // own id; GET finds only its own.
+                const std::string own = "video_" + name + "1";
+                if (req.path == "/v1/videos" && req.method == "POST") {
+                    res.set_content(json{{"id", own}, {"object", "video"},
+                                         {"status", "queued"}}
+                                        .dump(),
+                                    "application/json");
+                    return;
+                }
+                if (req.path.rfind("/v1/videos/", 0) == 0) {
+                    const std::string rest = req.path.substr(11);
+                    const std::string id = rest.substr(0, rest.find('/'));
+                    if (id != own) {
+                        res.status = 404;
+                        res.set_content("no video " + id, "text/plain");
+                    } else if (rest.find("/content") != std::string::npos) {
+                        res.set_content("MP4 of " + name, "video/mp4");
+                    } else {
+                        res.set_content(json{{"id", own}, {"owner", name},
+                                             {"status", "completed"}}
+                                            .dump(),
+                                        "application/json");
+                    }
                     return;
                 }
                 res.status = req.path == "/v1/audio/speech" ? 201 : 200;
@@ -432,6 +470,99 @@ TEST_CASE("router: a loaded or busy instance passes requests on",
         CHECK(r.head.status == 503);
         CHECK(r.head.get_header_value("Retry-After") == "7");
     }
+}
+
+TEST_CASE("router: video ids name their instance", "[router]") {
+    using locus::router::router_video_id;
+    using locus::router::split_video_id;
+    const std::string rid =
+        router_video_id("127.0.0.1:8311", "video_0123abcd");
+    CHECK(rid.rfind("video_", 0) == 0);
+    CHECK(rid.find('/') == std::string::npos);
+    std::string inst, id;
+    REQUIRE(split_video_id(rid, inst, id));
+    CHECK(inst == "127.0.0.1:8311");
+    CHECK(id == "video_0123abcd");
+    // An instance's own id, or garbage, is not a router id.
+    CHECK_FALSE(split_video_id("video_0123abcd", inst, id));
+    CHECK_FALSE(split_video_id("video_zz_1", inst, id));
+    CHECK_FALSE(split_video_id("clip_1", inst, id));
+
+    FakeInstance v1("V1", {"video"}, "ltx"), v2("V2", {"video"}, "ltx");
+    RouterFixture rf({v1.addr(), v2.addr()});
+    Client c("127.0.0.1", rf.port);
+    std::set<std::string> owners;
+    for (int k = 0; k < 6; ++k) {
+        // Different prompts spread the jobs (a prompt is the session
+        // key); each id still finds its maker.
+        const auto made = rf.post(
+            "/v1/videos", {{"prompt", "a fox, take " + std::to_string(k)}});
+        REQUIRE(made.ok);
+        const std::string vid = json::parse(made.body)["id"];
+        REQUIRE(split_video_id(vid, inst, id));
+        const auto got =
+            c.send(ClientRequest{"GET", "/v1/videos/" + vid, {}, ""});
+        REQUIRE(got.ok);
+        REQUIRE(got.head.status == 200);
+        const json j = json::parse(got.body);
+        CHECK(j["id"] == vid);  // the router's id comes back
+        owners.insert(j["owner"].get<std::string>());
+        const auto mp4 = c.send(
+            ClientRequest{"GET", "/v1/videos/" + vid + "/content", {}, ""});
+        REQUIRE(mp4.ok);
+        CHECK(mp4.body == "MP4 of " + j["owner"].get<std::string>());
+    }
+    CHECK(owners.size() == 2);
+    // A router id for an instance the router does not have: 404.
+    const auto none = c.send(ClientRequest{
+        "GET", "/v1/videos/" + router_video_id("10.9.9.9:1", "video_1"),
+        {}, ""});
+    REQUIRE(none.ok);
+    CHECK(none.head.status == 404);
+}
+
+TEST_CASE("router: metrics per instance", "[router]") {
+    FakeInstance a("A", {"text"}, "m");
+    RouterFixture rf({a.addr()});
+    for (int k = 0; k < 3; ++k) {
+        REQUIRE(rf.post("/v1/completions", {{"prompt", "x"}}).ok);
+    }
+    // A client that leaves a long stream after the first piece.
+    {
+        Client c("127.0.0.1", rf.port);
+        int got = 0;
+        c.stream(ClientRequest{"POST", "/v1/chat/completions",
+                               {{"Content-Type", "application/json"}},
+                               json{{"stream", true}, {"long", true},
+                                    {"messages", json::array()}}
+                                   .dump()},
+                 nullptr, [&](std::string_view) { return ++got < 1; });
+    }
+    const std::string series =
+        "{instance=\"" + a.addr() + "\"} ";
+    std::string text;
+    // The router notices the leave on its next write to the client.
+    for (int tries = 0; tries < 50; ++tries) {
+        Client c("127.0.0.1", rf.port);
+        text = c.send(ClientRequest{"GET", "/metrics", {}, ""}).body;
+        if (text.find("locus_router_client_left_total" + series + "1") !=
+            std::string::npos) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CHECK(text.find("locus_router_instance_up" + series + "1") !=
+          std::string::npos);
+    CHECK(text.find("locus_router_requests_total" + series + "4") !=
+          std::string::npos);
+    CHECK(text.find("locus_router_client_left_total" + series + "1") !=
+          std::string::npos);
+    CHECK(text.find("locus_router_upstream_errors_total" + series + "0") !=
+          std::string::npos);
+    CHECK(text.find("locus_router_inflight" + series + "0") !=
+          std::string::npos);
+    CHECK(text.find("# TYPE locus_router_request_seconds_total counter") !=
+          std::string::npos);
 }
 
 TEST_CASE("router: a bad instance address is refused", "[router]") {

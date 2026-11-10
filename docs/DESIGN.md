@@ -165,8 +165,13 @@ conversation keeps its instance's prefix cache, every router agrees
 with no shared state, and a leaving instance moves only its own keys.
 An instance over 1.25 times the candidates' average in-flight count
 goes last, and a connect failure or a busy 503 moves on to the next.
-Video id rewriting, auth at the router and router metrics are the
-next steps of #388.
+A video job id from the router names the instance that made it
+(`video_`, its host:port in hex, `_`, the instance's own id), so a
+`GET /v1/videos/{id}` reaches that instance with no table, also after
+a router restart. The router's own `/metrics` counts, per instance,
+requests, upstream errors, streams a client left, wall seconds and
+the requests in flight, and whether the last poll answered. Auth at
+the router is the next step of #388.
 
 ## 5. Milestones
 
