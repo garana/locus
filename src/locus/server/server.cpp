@@ -1361,16 +1361,24 @@ void OpenAiServer::install_routes() {
     };
 
     // OpenAI model listing: locus serves exactly one model. Auth (when
-    // on) is enforced by the head stage before this runs.
+    // on) is enforced by the head stage before this runs. `locus_kinds`
+    // (an extension OpenAI clients ignore) lists the request kinds this
+    // instance serves, for locus-router (#388).
     auto handle_models = [this](const http::Request&,
                                 http::ServerResponse& res) {
             json entry{{"id", opt_.model_name},
                        {"object", "model"},
                        {"created", 0},
                        {"owned_by", "locus"}};
+            json kinds = json::array({"text"});
+            if (vision_) kinds.push_back("image-to-text");
+            if (janus_ || pixart_ || flux_) kinds.push_back("image");
+            if (ltxv_) kinds.push_back("video");
+            if (snac_) kinds.push_back("speech");
             res.set_content(
                 json{{"object", "list"},
-                     {"data", json::array({entry})}}
+                     {"data", json::array({entry})},
+                     {"locus_kinds", kinds}}
                     .dump(-1, ' ', false, kLossy),
                 "application/json");
     };

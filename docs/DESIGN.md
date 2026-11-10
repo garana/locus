@@ -145,6 +145,18 @@ parser with the request parser's hardening, a streaming chunk
 decoder, and connect and read deadlines with one kept-alive
 connection, resent once when the server closed it while idle.
 
+`locus-router` (`router::Router`) proxies each request to one of
+several instances by kind: text, image-to-text (a chat, messages or
+responses body with an image part), image, video or speech, from the
+path and, for chat, the body. An instance lists its kinds in
+`/v1/models` (`locus_kinds`), which the router reads at start and
+every `--refresh-ms`; a request that names a listed model goes to that
+instance. Buffered replies are forwarded whole; a chunked one (SSE)
+streams through, and a client that leaves closes the upstream
+connection, so the instance stops the work. Session affinity, several
+instances per kind with a load bound, video id rewriting and auth at
+the router are the next steps of #388.
+
 ## 5. Milestones
 
 The MVP milestones, each with its exit test:

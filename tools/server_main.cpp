@@ -9,13 +9,19 @@
 #include "locus/server/server.hpp"
 #include "locus/sys/features.hpp"
 #include "locus/tok/tokenizer.hpp"
+#include "router_cli.hpp"
 
 /**
  * OpenAI-compatible inference server (M4):
  *   locus-server [--backend NAME] <model.gguf> [port]
  *   locus-server --backends
+ *   locus-server --router [--listen HOST:PORT] INSTANCE...
  */
 int main(int argc, char** argv) {
+    // locus-server --router ...: run locus-router instead (no model).
+    if (argc > 1 && std::string(argv[1]) == "--router") {
+        return locus_tools::run_router(argc, argv, 2);
+    }
     auto args = locus_tools::parse_backend_args(argc, argv);
     if (args.list) {
         locus_tools::print_backends();

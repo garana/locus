@@ -171,13 +171,29 @@ class Client {
         const std::function<bool(const ResponseHead&)>& on_head,
         const std::function<bool(std::string_view)>& on_body);
 
+    /**
+     * The first half of a request: sends `req` and reads the response
+     * head, so a proxy can answer with the upstream status before the
+     * body arrives. Follow it with read_body() (or close()) before the
+     * next request.
+     * @returns ok and the head, with an empty body.
+     */
+    ClientResponse begin(const ClientRequest& req);
+
+    /**
+     * The second half: reads the body of the response begin() started,
+     * passing each piece to `on_body`, which may return false to stop
+     * (the connection is then closed).
+     * @param[out] err Set on failure.
+     * @returns true when the whole body was read.
+     */
+    bool read_body(const std::function<bool(std::string_view)>& on_body,
+                   std::string& err);
+
     /** Closes the kept-alive connection, if any. */
     void close();
 
   private:
-    ClientResponse run(const ClientRequest& req,
-                       const std::function<bool(const ResponseHead&)>& on_head,
-                       const std::function<bool(std::string_view)>& on_body);
     bool connect(std::string& err);
     bool write_all(std::string_view data, std::string& err);
     /** Reads into buf_; @returns bytes read, 0 at EOF, -1 on error or
@@ -189,6 +205,10 @@ class Client {
     ClientOptions opt_;
     int fd_ = -1;
     std::string buf_;  ///< read but not yet parsed bytes
+    /** The head of the response begin() started; framing kNone once
+     * its body is read. */
+    ResponseHead pending_;
+    bool active_ = false;
 };
 
 }  // namespace locus::http
