@@ -798,27 +798,43 @@ TEST_CASE("matvec_cuda matches the scalar reference for K-/IQ-quants",
 // matvec_cuda() calls (row-major out[r*n + t]), also past 32 tokens,
 // where it runs in 32-token slices. Not arch-guarded: gated at
 // runtime on a usable CUDA device.
-TEST_CASE("matvec_batch_cuda Q4_K/Q6_K byte-identical to per-token "
-          "matvec_cuda (R11)",
+TEST_CASE("matvec_batch_cuda Q4_K/Q6_K/Q8_0 byte-identical to "
+          "per-token matvec_cuda (R11)",
           "[ops][batch][cuda]") {
     if (!cuda_backend_usable()) {
         SKIP("no CUDA device or non-CUDA build");
     }
     cuda_pool_reset();  // drop any stale pages from prior test cases
     // 9 rows: two full 4-row (one warp per row) blocks and a partial one.
-    constexpr std::uint32_t rows = 9, nblk = 2, cols = nblk * 256;
-    // One slice; one slice plus one token; two full slices; and two
-    // full slices plus one token.
-    for (std::uint32_t n : {5u, 33u, 64u, 65u}) {
+    // 1280 columns: Q8_0's 40 blocks are one full 32-block pass and a
+    // partial one.
+    constexpr std::uint32_t rows = 9, nblk = 5, cols = nblk * 256;
+    // One token (the per-token kernel); one slice; one slice plus one
+    // token; two full slices; and two full slices plus one token.
+    for (std::uint32_t n : {1u, 5u, 33u, 64u, 65u}) {
         std::mt19937 rng(41 + n);
         std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
         std::vector<float> xb(static_cast<std::size_t>(n) * cols);
         for (auto& v : xb) {
             v = xd(rng);
         }
-        for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+        for (TensorType t :
+             {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0}) {
             std::vector<std::byte> w;
+            std::uniform_int_distribution<int> qd(-127, 127);
+            std::uniform_real_distribution<float> dd(0.01f, 0.2f);
             for (std::uint32_t r = 0; r < rows; ++r) {
+                if (t == TensorType::kQ8_0) {
+                    for (std::uint32_t b = 0; b < cols / 32; ++b) {
+                        std::vector<int> q(32);
+                        for (auto& v : q) {
+                            v = qd(rng);
+                        }
+                        auto blk = q8_0_row(dd(rng), q);
+                        w.insert(w.end(), blk.begin(), blk.end());
+                    }
+                    continue;
+                }
                 auto row = k_quant_row(
                     t, nblk,
                     300u + r + 9u * static_cast<std::uint32_t>(t));
