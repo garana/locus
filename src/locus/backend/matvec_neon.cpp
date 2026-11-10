@@ -429,7 +429,7 @@ inline float unpack_block32_neon(gguf::TensorType type, const std::byte* blk,
  *  same exact integers through widening multiplies without it). */
 inline int32x4_t lanes32(int8x16_t qlo, int8x16_t qhi, const std::int8_t* x) {
     const int8x16_t xlo = vld1q_s8(x), xhi = vld1q_s8(x + 16);
-#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(__ARM_FEATURE_DOTPROD) || defined(LOCUS_NEON_DOTPROD_VARIANT)
     return vdotq_s32(vdotq_s32(vdupq_n_s32(0), qlo, xlo), qhi, xhi);
 #else
     auto d4 = [](int8x16_t a, int8x16_t b) {
@@ -525,7 +525,7 @@ void rows_block32_q8_0_xt(gguf::TensorType type, const std::byte* row,
 /** One sdot of 16 int8 pairs into four int32 lanes (widening
  *  multiplies without dotprod; the same exact integers). */
 inline int32x4_t dot16(int8x16_t a, int8x16_t b) {
-#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(__ARM_FEATURE_DOTPROD) || defined(LOCUS_NEON_DOTPROD_VARIANT)
     return vdotq_s32(vdupq_n_s32(0), a, b);
 #else
     const int16x8_t p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
