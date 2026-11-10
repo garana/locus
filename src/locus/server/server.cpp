@@ -797,6 +797,13 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         auth_ = std::make_unique<auth::AuthClient>(
             std::move(conns), auth_clock_, opt_.auth_cache);
     }
+    if (!opt_.embedding_model_path.empty()) {
+        bert_ = embed::EmbeddingModel::load(opt_.embedding_model_path);
+        if (bert_->name() == opt_.model_name) {
+            throw gguf::Error("--embedding-model " + bert_->name() +
+                              " has the chat model's name");
+        }
+    }
     if (!opt_.audio_decoder_path.empty()) {
         auto g = gguf::GgufFile::open(opt_.audio_decoder_path);
         snac_ = std::make_unique<audio::SnacDecoder>(
@@ -1376,16 +1383,23 @@ void OpenAiServer::install_routes() {
                         "application/json");
     };
 
-    // OpenAI model listing: locus serves exactly one model. Auth (when
-    // on) is enforced by the head stage before this runs. `locus_kinds`
-    // (an extension OpenAI clients ignore) lists the request kinds this
-    // instance serves, for locus-router (#388).
+    // OpenAI model listing: the chat model, then the embedding model
+    // when one is loaded. Auth (when on) is enforced by the head stage
+    // before this runs. `locus_kinds` (an extension OpenAI clients
+    // ignore) lists the request kinds this instance serves, for
+    // locus-router (#388), which routes by these ids.
     auto handle_models = [this](const http::Request&,
                                 http::ServerResponse& res) {
-            json entry{{"id", opt_.model_name},
-                       {"object", "model"},
-                       {"created", 0},
-                       {"owned_by", "locus"}};
+            json data = json::array({json{{"id", opt_.model_name},
+                                          {"object", "model"},
+                                          {"created", 0},
+                                          {"owned_by", "locus"}}});
+            if (bert_) {
+                data.push_back({{"id", bert_->name()},
+                                {"object", "model"},
+                                {"created", 0},
+                                {"owned_by", "locus"}});
+            }
             json kinds = json::array({"text"});
             if (vision_) kinds.push_back("image-to-text");
             if (janus_ || pixart_ || flux_) kinds.push_back("image");
@@ -1393,7 +1407,7 @@ void OpenAiServer::install_routes() {
             if (snac_) kinds.push_back("speech");
             res.set_content(
                 json{{"object", "list"},
-                     {"data", json::array({entry})},
+                     {"data", data},
                      {"locus_kinds", kinds}}
                     .dump(-1, ' ', false, kLossy),
                 "application/json");
@@ -1405,14 +1419,15 @@ void OpenAiServer::install_routes() {
                                      http::ServerResponse& res) {
             const std::string model_id =
                 req.path.substr(std::string("/v1/models/").size());
-            if (model_id != opt_.model_name) {
+            if (model_id != opt_.model_name &&
+                !(bert_ && model_id == bert_->name())) {
                 res.status = 404;
                 res.set_content(
                     make_error("model not found").dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
             }
-            res.set_content(json{{"id", opt_.model_name},
+            res.set_content(json{{"id", model_id},
                                  {"object", "model"},
                                  {"created", 0},
                                  {"owned_by", "locus"}}
@@ -2330,8 +2345,12 @@ void OpenAiServer::install_routes() {
             });
     };
 
-    // OpenAI embeddings: pooled hidden state, L2-normalized. `input`
-    // is a string or an array of strings. Auth runs in the head stage.
+    // OpenAI embeddings, L2-normalized. `input` is a string or an array
+    // of strings. With --embedding-model, the embedding model serves
+    // every request whose model is not the chat model's name (clients
+    // often send an OpenAI model name), in one batch; else the chat
+    // model's last-token hidden state, one input at a time. Auth runs
+    // in the head stage.
     auto handle_embeddings = [this](const http::Request& req,
                                     http::ServerResponse& res,
                                     const http::RequestContext& ctx) {
@@ -2362,17 +2381,46 @@ void OpenAiServer::install_routes() {
                         "input must be a string or array of "
                         "strings");
                 }
+                const bool chat = !bert_ ||
+                                  (body.contains("model") &&
+                                   body["model"].is_string() &&
+                                   body["model"].get<std::string>() ==
+                                       opt_.model_name);
                 json data = json::array();
-                for (std::size_t i = 0; i < inputs.size(); ++i) {
-                    data.push_back(
-                        {{"object", "embedding"},
-                         {"index", i},
-                         {"embedding", embed_text(inputs[i])}});
+                if (chat) {
+                    for (std::size_t i = 0; i < inputs.size(); ++i) {
+                        data.push_back(
+                            {{"object", "embedding"},
+                             {"index", i},
+                             {"embedding", embed_text(inputs[i])}});
+                    }
+                    res.set_content(
+                        json{{"object", "list"},
+                             {"data", data},
+                             {"model", opt_.model_name}}
+                            .dump(-1, ' ', false, kLossy),
+                        "application/json");
+                    return;
+                }
+                std::size_t tokens = 0;
+                std::vector<std::vector<float>> vectors;
+                {
+                    std::lock_guard<std::mutex> lk(bert_mu_);
+                    vectors = bert_->embed(
+                        inputs, backend::best_backend().ops, &tokens);
+                }
+                for (std::size_t i = 0; i < vectors.size(); ++i) {
+                    data.push_back({{"object", "embedding"},
+                                    {"index", i},
+                                    {"embedding", std::move(vectors[i])}});
                 }
                 res.set_content(
                     json{{"object", "list"},
                          {"data", data},
-                         {"model", opt_.model_name}}
+                         {"model", bert_->name()},
+                         {"usage",
+                          {{"prompt_tokens", tokens},
+                           {"total_tokens", tokens}}}}
                         .dump(-1, ' ', false, kLossy),
                     "application/json");
             } catch (const std::exception& e) {

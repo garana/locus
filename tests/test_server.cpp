@@ -835,6 +835,89 @@ TEST_CASE("embeddings endpoint returns normalized vectors",
     }
 }
 
+TEST_CASE("embedding model serves embeddings beside the chat model",
+          "[server][e2e]") {
+    const std::string bge = std::string(LOCUS_SOURCE_DIR) +
+                            "/tests/models/bge-small-en-v1.5-q8_0.gguf";
+    if (!std::filesystem::exists(model_path()) ||
+        !std::filesystem::exists(bge)) {
+        SKIP("stories260K or bge-small-en-v1.5-q8_0.gguf absent");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("scalar"));
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::server::OpenAiServer::Options opt;
+    opt.embedding_model_path = bge;
+    TestServer ts(model, tok, opt);
+    httplib::Client client("127.0.0.1", ts.port);
+    const std::string id = "bge-small-en-v1.5-q8_0.gguf";
+
+    SECTION("models lists both") {
+        auto res = client.Get("/v1/models");
+        REQUIRE(res);
+        const auto data = json::parse(res->body)["data"];
+        REQUIRE(data.size() == 2);
+        REQUIRE(data[0]["id"] == "locus");
+        REQUIRE(data[1]["id"] == id);
+        auto one = client.Get("/v1/models/" + id);
+        REQUIRE(one);
+        REQUIRE(one->status == 200);
+        REQUIRE(json::parse(one->body)["id"] == id);
+    }
+
+    SECTION("the embedding model serves any other model name") {
+        for (const json& req :
+             {json{{"input", json::array({"a cat", "a dog", "a cat"})},
+                   {"model", id}},
+              json{{"input", json::array({"a cat", "a dog", "a cat"})},
+                   {"model", "text-embedding-3-small"}},
+              json{{"input", json::array({"a cat", "a dog", "a cat"})}}}) {
+            auto res = client.Post("/v1/embeddings", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            const auto body = json::parse(res->body);
+            REQUIRE(body["model"] == id);
+            REQUIRE(body["usage"]["prompt_tokens"] == 12);
+            const auto data = body["data"];
+            REQUIRE(data.size() == 3);
+            REQUIRE(data[0]["embedding"].size() == 384);
+            REQUIRE(data[2]["index"] == 2);
+            // A batch keeps each input's own vector.
+            const auto a = data[0]["embedding"].get<std::vector<float>>();
+            const auto c = data[2]["embedding"].get<std::vector<float>>();
+            double dot = 0.0;
+            for (std::size_t i = 0; i < a.size(); ++i) dot += a[i] * c[i];
+            REQUIRE(dot == Catch::Approx(1.0).margin(1e-5));
+        }
+    }
+
+    SECTION("the chat model's name picks the chat model") {
+        json req{{"input", "hello"}, {"model", "locus"}};
+        auto res = client.Post("/v1/embeddings", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = json::parse(res->body);
+        REQUIRE(body["model"] == "locus");
+        REQUIRE(body["data"][0]["embedding"].size() ==
+                model.hparams().n_embd);
+    }
+
+    SECTION("an input past the context is a 400 naming it") {
+        std::string big;
+        for (int i = 0; i < 600; ++i) big += "word ";
+        json req{{"input", json::array({"short", big})}};
+        auto res = client.Post("/v1/embeddings", req.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 400);
+        REQUIRE(res->body.find("input 1 has 602 tokens") !=
+                std::string::npos);
+    }
+}
+
 // --image-model picks FLUX.1 when a FLUX-only part (flux, clip_text) is
 // there, so a FLUX set missing its DiT names the FLUX parts; otherwise
 // PixArt, whose error names both sets.

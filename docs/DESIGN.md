@@ -598,9 +598,18 @@ guarding the default path.
   | summary     | Vulkan  | 92       | 87         | 59       | 87 to 90   |
   | free text   | CPU     | 72 to 78 | 70 to 73   | 70 to 74 | 66 to 70   |
   | free text   | Vulkan  | 91 to 92 | 88 to 89   | 81       | 92         |
-- Embeddings: `/v1/embeddings` returns the last token's final-normed
-  hidden state, L2-normalized, on a dedicated cache. CPU and CUDA
-  backends only (`TransformerModel::embed` refuses vulkan).
+- Embeddings: with `--embedding-model`, a BERT GGUF (`embed::
+  BertEncoder`, CPU) serves `/v1/embeddings` for every request whose
+  model is not the chat model: the inputs run as one batch (passes of
+  up to 4096 tokens, attention within each input), pooled as the
+  GGUF's `pooling_type` says (mean, CLS or last), L2-normalized; an
+  input past the model's context is a 400. Its activations stay f32,
+  so on bge-small Q8_0 it is nearer the f32 original (cosine 0.99989
+  to 0.99995) than llama.cpp, which rounds them to 8 bits (0.99971 to
+  0.99989). Otherwise `/v1/embeddings` returns the chat model's last
+  token's final-normed hidden state, L2-normalized, on a dedicated
+  cache; CPU and CUDA backends only (`TransformerModel::embed` refuses
+  vulkan).
 - API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
   (a log-softmax over the raw logits) and usage accounting.
 - Metrics: every `/metrics` series carries `model` and `backend`
