@@ -53,7 +53,26 @@ class FluxPipeline {
          */
         std::optional<Rgb8> reference;
         bool auto_resize = true;
+        /**
+         * LoRAs for this request (i#372), or null. They are attached to
+         * the DiT for the call and detached after it; the set and its
+         * GGUFs must outlive the call. With LoRAs the DiT runs per op,
+         * not the whole-step GPU forward.
+         */
+        const LoraSet* lora = nullptr;
     };
+
+    /**
+     * Checks that a LoRA set fits this model's DiT, without keeping it
+     * attached: for a server to refuse a bad --lora-dir at startup.
+     *
+     * @throws std::invalid_argument when a LoRA layer is not a linear
+     *     layer of the DiT, or its matrices do not fit the weight.
+     */
+    void check_lora(const LoraSet& set) const {
+        dit_->set_lora(&set);
+        dit_->set_lora(nullptr);
+    }
 
     /**
      * FluxKontextPipeline's output size for a requested one: the same

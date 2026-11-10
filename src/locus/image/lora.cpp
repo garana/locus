@@ -1,5 +1,7 @@
 #include "locus/image/lora.hpp"
 
+#include <filesystem>
+#include <stdexcept>
 #include <string>
 
 #include "locus/image/dense.hpp"
@@ -66,6 +68,51 @@ std::vector<std::string> LoraSet::layers() const {
     std::vector<std::string> out;
     for (const auto& [layer, p] : by_layer_) out.push_back(layer);
     return out;
+}
+
+std::unique_ptr<LoraLibrary> LoraLibrary::load_dir(const std::string& dir) {
+    auto lib = std::make_unique<LoraLibrary>();
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        if (!e.is_regular_file() || e.path().extension() != ".gguf") {
+            continue;
+        }
+        auto g = std::make_unique<gguf::GgufFile>(
+            gguf::GgufFile::open(e.path().string()));
+        LoraSet check;  // refuses a file that is not a usable flux_lora
+        try {
+            check.add(*g, 1.0f);
+        } catch (const gguf::Error& err) {
+            throw gguf::Error(e.path().string() + ": " + err.what());
+        }
+        lib->files_[e.path().stem().string()] = std::move(g);
+    }
+    if (lib->files_.empty()) {
+        throw gguf::Error("lora: no *.gguf in " + dir);
+    }
+    return lib;
+}
+
+std::vector<std::string> LoraLibrary::names() const {
+    std::vector<std::string> out;
+    for (const auto& [name, g] : files_) out.push_back(name);
+    return out;
+}
+
+LoraSet LoraLibrary::select(std::span<const LoraPick> picks) const {
+    LoraSet set;
+    for (const LoraPick& p : picks) {
+        const auto it = files_.find(p.name);
+        if (it == files_.end()) {
+            std::string known;
+            for (const auto& [name, g] : files_) {
+                known += (known.empty() ? "" : ", ") + name;
+            }
+            throw std::invalid_argument("unknown lora \"" + p.name +
+                                        "\"; this server has: " + known);
+        }
+        set.add(*it->second, p.strength);
+    }
+    return set;
 }
 
 void apply_lora(const backend::Ops& op, std::span<const LoraPart> parts,

@@ -25,6 +25,7 @@ class JanusImageGen;
 class JanusVision;
 class PixArtPipeline;
 class FluxPipeline;
+class LoraLibrary;
 class LtxvPipeline;
 class Vq16Decoder;
 }
@@ -118,6 +119,12 @@ class OpenAiServer {
          * for requests whose model starts with "pixart" or "flux" (or
          * every request when no Janus model is loaded). Empty = off. */
         std::string image_model_dir;
+        /** Directory of FLUX.1 LoRAs (--lora-dir): flux_lora GGUFs from
+         * scripts/convert-lora.py, each named by its file name without
+         * ".gguf", for the "lora" field of the FLUX image requests.
+         * Needs a FLUX.1 image_model_dir; every LoRA is checked against
+         * its DiT at startup. Empty = no LoRAs. */
+        std::string lora_dir;
         /** Directory of the LTX-Video pipeline (--video-model: the
          * t5encoder, ltxv and ltxv_vae GGUFs; image to video needs the
          * VAE with its encoder). It enables POST /v1/videos and GET
@@ -292,6 +299,8 @@ class OpenAiServer {
     // its GGUF mappings and shares image_mu_ with Janus.
     std::unique_ptr<image::PixArtPipeline> pixart_;
     std::unique_ptr<image::FluxPipeline> flux_;
+    // The FLUX LoRAs (--lora-dir; null when not given).
+    std::unique_ptr<image::LoraLibrary> loras_;
     std::mutex image_mu_;
 
     // /v1/videos (--video-model): the LTX-Video pipeline, the ffmpeg

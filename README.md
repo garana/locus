@@ -155,8 +155,8 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 
 - Multimedia (#143): diffusion image speed (#146), video (#148), real-time
   speech (#173), faster image input (#257), FLUX.1 LoRAs (#372:
-  `scripts/convert-lora.py` converts one to GGUF and the DiT applies it
-  per op; the whole-step GPU forward and the API do not take one yet).
+  `--lora-dir` and the `lora` field apply converted ones; the
+  whole-step GPU forward does not take them yet, so they run per op).
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
@@ -187,7 +187,8 @@ and tokenizers of the build. Speech needs `--audio-decoder
 or `--image-model <dir>` (PixArt: a directory with the GGUFs from
 `scripts/convert-t5-encoder.py`, `convert-pixart.py` and
 `convert-sd-vae.py`; FLUX.1: the GGUFs from `scripts/convert-flux.py`
-and `convert-t5-encoder.py`). Video needs `--video-model <dir>` (the
+and `convert-t5-encoder.py`, plus `--lora-dir <dir>` for LoRAs from
+`scripts/convert-lora.py`). Video needs `--video-model <dir>` (the
 GGUFs from `scripts/convert-ltxv.py` and `convert-t5-encoder.py`) and
 an ffmpeg on PATH or at `--ffmpeg <path>`.
 

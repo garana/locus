@@ -882,6 +882,26 @@ TEST_CASE("image model errors name the missing parts", "[server]") {
     std::filesystem::remove_all(dir);
 }
 
+// i#372: LoRAs are checked against a FLUX.1 DiT at startup, so
+// --lora-dir without one stops the server.
+TEST_CASE("a LoRA directory needs a FLUX image model", "[server][lora]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::server::OpenAiServer::Options opt;
+    opt.lora_dir = std::string(LOCUS_SOURCE_DIR) + "/tests/golden/lora";
+    try {
+        locus::server::OpenAiServer server(model, tok, opt);
+        FAIL("the server must refuse --lora-dir without FLUX.1");
+    } catch (const locus::gguf::Error& e) {
+        CHECK(std::string(e.what()).find("--lora-dir needs --image-model") !=
+              std::string::npos);
+    }
+}
+
 TEST_CASE("auth gates protected routes via a helper", "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
         SKIP("model not present; run scripts/fetch-test-model.sh");

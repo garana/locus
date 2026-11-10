@@ -190,6 +190,19 @@ std::vector<float> FluxPipeline::generate_from(
     if (latent.size() != std::size_t{kLatentCh} * h * w) {
         throw std::invalid_argument("flux: latent is not 16 x h/8 x w/8");
     }
+    // The request's LoRAs, for this call only: detached on every exit
+    // (the end, a cancel, an exception), so the next request starts
+    // from the plain model.
+    struct Detach {
+        FluxDit* dit = nullptr;
+        ~Detach() {
+            if (dit != nullptr) dit->set_lora(nullptr);
+        }
+    } detach;
+    if (req.lora != nullptr && !req.lora->empty()) {
+        dit_->set_lora(req.lora);
+        detach.dit = dit_.get();
+    }
     const std::uint32_t steps = req.steps != 0 ? req.steps : default_steps();
 
     const auto t0 = Clock::now();

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -54,6 +55,43 @@ class LoraSet {
 
   private:
     std::map<std::string, std::vector<LoraPart>, std::less<>> by_layer_;
+};
+
+/** One LoRA a request asks for, by name, at a strength. */
+struct LoraPick {
+    std::string name;
+    float strength = 1.0f;
+};
+
+/**
+ * The LoRAs a server offers (--lora-dir): every "*.gguf" in one
+ * directory, each a "flux_lora" GGUF named by its file name without
+ * ".gguf". The files stay mapped for the library's life.
+ */
+class LoraLibrary {
+  public:
+    /**
+     * @throws gguf::Error when the directory holds no "*.gguf", or one
+     *     of them is not a usable flux_lora (wrong architecture, an
+     *     unpaired tensor, mismatched ranks).
+     * @throws std::filesystem::filesystem_error when it cannot be read.
+     */
+    static std::unique_ptr<LoraLibrary> load_dir(const std::string& dir);
+
+    /** @returns The LoRA names, sorted. */
+    std::vector<std::string> names() const;
+
+    /**
+     * @returns A set of the picked LoRAs at their strengths; it points
+     *     into this library, which must outlive it.
+     * @throws std::invalid_argument naming an unknown LoRA and listing
+     *     the known ones.
+     */
+    LoraSet select(std::span<const LoraPick> picks) const;
+
+  private:
+    std::map<std::string, std::unique_ptr<gguf::GgufFile>, std::less<>>
+        files_;
 };
 
 /**
