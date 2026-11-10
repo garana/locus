@@ -90,7 +90,17 @@ class Gbnf {
  */
 class GbnfMatcher {
   public:
-    explicit GbnfMatcher(std::shared_ptr<const Gbnf> g);
+    /** Parse stacks kept per state by default. */
+    static constexpr std::size_t kMaxStacks = 4096;
+
+    /**
+     * @param g The grammar.
+     * @param max_stacks The most parse stacks a state keeps; past it the
+     *     rest are dropped, truncated() turns true and
+     *     gbnf_stack_overflows() counts it.
+     */
+    explicit GbnfMatcher(std::shared_ptr<const Gbnf> g,
+                         std::size_t max_stacks = kMaxStacks);
 
     /**
      * Advances on one byte.
@@ -119,6 +129,13 @@ class GbnfMatcher {
      */
     std::string key() const;
 
+    /**
+     * @returns Whether some state on the way here had more parse stacks
+     *     than the cap, so continuations the grammar allows may be
+     *     missing.
+     */
+    bool truncated() const { return truncated_; }
+
   private:
     /** Stack i is data[i ? ends[i - 1] : 0, ends[i]). */
     struct Stacks {
@@ -134,9 +151,13 @@ class GbnfMatcher {
     };
     void expand(std::vector<std::uint32_t>& cur, Stacks& out, int depth) const;
     bool viable(char32_t lo, char32_t hi) const;
-    void dedup(Stacks& s) const;
+    /** Sorts and dedups s, keeping max_stacks_. @returns whether any
+     * distinct stack was dropped. */
+    bool dedup(Stacks& s) const;
 
     std::shared_ptr<const Gbnf> g_;
+    std::size_t max_stacks_ = kMaxStacks;
+    bool truncated_ = false;
     Stacks stacks_;
     // Scratch for step(): the stack being expanded, the dedup order
     // and copy.
@@ -149,6 +170,14 @@ class GbnfMatcher {
     int need_ = 0;
     int len_ = 0;
 };
+
+/**
+ * @returns How many times, in this process, a grammar state had more
+ *     parse stacks than its matcher's cap and dropped the rest (each
+ *     can hide a continuation the grammar allows). The first one is
+ *     also logged to stderr.
+ */
+std::uint64_t gbnf_stack_overflows();
 
 /**
  * The GBNF body of a regex (no rule name), for a rule or an element in

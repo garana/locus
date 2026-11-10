@@ -394,6 +394,50 @@ TEST_CASE("engine on the vulkan backend matches CPU output",
     REQUIRE(engine.free_blocks() == engine.total_blocks());
 }
 
+// i#431: concurrent requests on Vulkan decode together through the
+// multi-sequence forward. Greedy tokens must match each request alone
+// (the logits may differ in the last bits, #432, so greedy is the
+// check).
+TEST_CASE("vulkan batched decode matches each request alone",
+          "[engine][e2e][vulkan]") {
+    const std::string path =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/models/llama-3.2-1b-q8_0.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("llama-3.2-1b-q8_0.gguf absent");
+    }
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+    const std::vector<std::vector<locus::tok::TokenId>> prompts{
+        {128000, 791, 3925, 315, 279, 3363, 315, 22463, 12302},
+        {128000, 40, 1093, 311, 4321, 922},
+        {128000, 32, 4062, 14198, 39935, 35308, 927, 279},
+        {128000, 791, 1888, 961, 315, 264, 1695, 6237, 374, 279}};
+    constexpr std::uint32_t kGen = 24;
+    std::vector<std::vector<locus::tok::TokenId>> alone;
+    for (const auto& p : prompts) {
+        Engine e(model, static_cast<locus::tok::TokenId>(-1), {});
+        const auto id = e.submit(p, kGen);
+        e.run_to_completion();
+        alone.push_back(e.get(id)->generated);
+    }
+    Engine e(model, static_cast<locus::tok::TokenId>(-1), {});
+    std::vector<std::uint64_t> ids;
+    for (const auto& p : prompts) {
+        ids.push_back(e.submit(p, kGen));
+    }
+    e.run_to_completion();
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+        INFO("request " << i);
+        REQUIRE(e.get(ids[i])->generated.size() == kGen);
+        CHECK(e.get(ids[i])->generated == alone[i]);
+    }
+    locus::backend::vulkan_reset_state();
+}
+
 TEST_CASE("oversized request fails instead of wedging",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {

@@ -87,6 +87,11 @@ struct Ops {
      */
     float* (*alloc_kv)(std::size_t n_floats);
     /**
+     * Releases a pool alloc_kv returned (nullptr: nothing to free).
+     * The cache built on it calls this when it is destroyed.
+     */
+    void (*free_kv)(float* pool) = nullptr;
+    /**
      * Optional one-step-ahead weight-prefetch hint (nullptr on
      * backends without a pager). The model may call this at the R8
      * readahead points -- next layer's static tensors, and each

@@ -141,15 +141,15 @@ void Engine::count_block_states() {
 }
 
 bool Engine::step_once() {
-    // Batched decode needs a model/backend that supports the
-    // batched forward (Vulkan drives its own full forward and opts
-    // out); fall back to the per-token scheduler otherwise so
-    // default-on batched_decode is safe on every backend.
+    // Batched decode needs a model/backend that supports a batched
+    // decode step (Vulkan through its multi-sequence forward); fall
+    // back to the per-token scheduler otherwise so default-on
+    // batched_decode is safe on every backend.
     // Speculative decoding runs on the per-token scheduler (it does
     // its own multi-token batched forward), so it takes priority over
     // the batched-decode path.
     if (cfg_.batched_decode && !cfg_.speculative &&
-        model_.supports_batch()) {
+        model_.supports_batch_decode()) {
         return step_batched();
     }
     // Admission: FCFS while the pool can cover prompt + headroom.
@@ -197,8 +197,7 @@ void Engine::advance(Request& r, std::uint32_t& budget) {
         // (greedy, unconstrained), verify n-gram drafts in one
         // batched forward instead of a single per-token forward.
         // Verify needs only forward_batch with every position's
-        // logits, which the Vulkan backend has too (it opts out of
-        // cross-sequence batched decode, supports_batch()).
+        // logits, which the Vulkan backend has too.
         if (cfg_.speculative && !prefilling && r.n_fed < n_total &&
             r.n_fed >= n_prompt && model::is_greedy(r.sampling) &&
             !r.constraint && model_.supports_batch_prefill() &&

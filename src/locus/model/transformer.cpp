@@ -657,7 +657,8 @@ kv::PagedKvCache TransformerModel::make_cache(
             float* storage = backend_->ops.alloc_kv(
                 kv::PagedKvCache::pool_floats(geom));
             if (storage != nullptr) {
-                return kv::PagedKvCache(geom, storage);
+                return kv::PagedKvCache(geom, storage,
+                                        backend_->ops.free_kv);
             }
         } else {
             // R14 #45: quantized GPU-mapped KV pool. Size the float
@@ -670,7 +671,8 @@ kv::PagedKvCache TransformerModel::make_cache(
                 backend_->ops.alloc_kv((bytes + 3) / 4);
             if (storage != nullptr) {
                 return kv::PagedKvCache(
-                    geom, reinterpret_cast<std::uint8_t*>(storage));
+                    geom, reinterpret_cast<std::uint8_t*>(storage),
+                    backend_->ops.free_kv);
             }
         }
     }
@@ -1030,6 +1032,11 @@ bool TransformerModel::supports_batch() const {
     return backend_->name != "vulkan" && !hp_.custom_layer;
 }
 
+bool TransformerModel::supports_batch_decode() const {
+    return supports_batch() ||
+           (backend_->name == "vulkan" && !hp_.custom_layer);
+}
+
 bool TransformerModel::supports_batch_prefill() const {
     return supports_batch() || backend_->name == "vulkan";
 }
@@ -1344,9 +1351,40 @@ void TransformerModel::forward_batch_decode(
         throw std::invalid_argument(
             "forward_batch_decode: seqs/tokens size mismatch");
     }
-    if (!supports_batch()) {
+    if (!supports_batch_decode()) {
         throw std::invalid_argument(
             "forward_batch_decode: unsupported backend");
+    }
+    if (backend_->name == "vulkan") {
+        // The Vulkan backend has its own multi-sequence forward
+        // (vulkan_forward_multi, through forward_embeddings): one
+        // command batch, each weight read once for up to 8 sequences,
+        // so a larger step runs in even groups (9 as 5 + 4). A model it
+        // does not take, or a lone sequence, runs one forward per
+        // sequence with the faster single-sequence kernels. So Vulkan
+        // is not batch-invariant: a sequence's logits differ in the
+        // last bits alone and in a batch (#432).
+        constexpr std::uint32_t kMaxGroup = 8;
+        const std::uint32_t n_groups = (n + kMaxGroup - 1) / kMaxGroup;
+        const std::uint32_t kGroup = (n + n_groups - 1) / n_groups;
+        const std::uint32_t V = hp_.n_vocab;
+        std::vector<float> normed(static_cast<std::size_t>(n) * hp_.n_embd);
+        std::vector<EmbedStep> steps(n);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            steps[t].token = toks[t];
+            steps[t].seq = seqs[t];
+            steps[t].logits = logits.subspan(std::size_t{t} * V, V);
+            steps[t].normed_out =
+                std::span<float>(normed).subspan(std::size_t{t} * hp_.n_embd,
+                                                 hp_.n_embd);
+        }
+        for (std::uint32_t g = 0; g < n; g += kGroup) {
+            forward_embeddings(
+                std::span<const EmbedStep>(steps).subspan(
+                    g, std::min(kGroup, n - g)),
+                cache, ws, {});
+        }
+        return;
     }
     const Ops op = effective_ops(backend_, q8k_activations());
     const std::uint32_t E = hp_.n_embd;

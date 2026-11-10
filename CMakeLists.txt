@@ -83,6 +83,7 @@ add_library(locus
     src/locus/pipeline/message.cpp
     src/locus/pipeline/net.cpp
     src/locus/pipeline/resolver.cpp
+    src/locus/router/router.cpp
     src/locus/pipeline/stage.cpp
     src/locus/pipeline/stage_executor.cpp
     src/locus/pipeline/stage_server.cpp
@@ -93,6 +94,7 @@ add_library(locus
     src/locus/server/responses.cpp
     src/locus/server/tools.cpp
     src/locus/http/base64.cpp
+    src/locus/http/client.cpp
     src/locus/http/http.cpp
     src/locus/http/server.cpp
     src/locus/http/metrics.cpp
@@ -132,6 +134,9 @@ target_link_libraries(locus-stage PRIVATE locus)
 
 add_executable(locus-driver tools/driver_main.cpp)
 target_link_libraries(locus-driver PRIVATE locus)
+
+add_executable(locus-router tools/router_main.cpp)
+target_link_libraries(locus-router PRIVATE locus)
 target_include_directories(locus PUBLIC src)
 
 # ----------------------------------------------------------------

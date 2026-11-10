@@ -217,6 +217,11 @@ void vulkan_set_attn_scratch_floats(std::size_t floats);
 
 /** KV-pool allocator returning a GPU-mapped pointer (Ops hook). */
 float* vulkan_alloc_kv(std::size_t n_floats);
+/** Frees a pool from vulkan_alloc_kv (no-op for an unknown pointer, or
+ *  once the Vulkan state is torn down at exit). */
+void vulkan_free_kv(float* pool);
+/** @returns The GPU-mapped KV pools alive now (for tests). */
+std::size_t vulkan_kv_pool_count();
 
 /**
  * Frees the process-lifetime Vulkan backend state: the weight pool

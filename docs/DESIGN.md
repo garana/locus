@@ -139,7 +139,29 @@ deepseek-coder) and
 rendered by a hardcoded formatter; an unknown template falls back
 to plain concatenation. Endpoints that run the model on their own
 thread (images, vision chat, audio) share the GPU backend through one
-process-wide lock (#268).
+process-wide lock (#268). `http::Client` is the first-party client
+for locus's own upstream calls (the router of #388): a pure response
+parser with the request parser's hardening, a streaming chunk
+decoder, and connect and read deadlines with one kept-alive
+connection, resent once when the server closed it while idle.
+
+`locus-router` (`router::Router`) proxies each request to one of
+several instances by kind: text, image-to-text (a chat, messages or
+responses body with an image part), image, video or speech, from the
+path and, for chat, the body. An instance lists its kinds in
+`/v1/models` (`locus_kinds`), which the router reads at start and
+every `--refresh-ms`; a request that names a listed model goes to that
+instance. Buffered replies are forwarded whole; a chunked one (SSE)
+streams through, and a client that leaves closes the upstream
+connection, so the instance stops the work. With several instances of
+a kind, a session key (the client's own, or a hash of the system
+prompt and first user turn) orders them by rendezvous hashing, so a
+conversation keeps its instance's prefix cache, every router agrees
+with no shared state, and a leaving instance moves only its own keys.
+An instance over 1.25 times the candidates' average in-flight count
+goes last, and a connect failure or a busy 503 moves on to the next.
+Video id rewriting, auth at the router and router metrics are the
+next steps of #388.
 
 ## 5. Milestones
 
@@ -418,6 +440,12 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
 - `forward_batch_decode` decodes one token from each of N sequences in
   one pass. The engine uses it by default (`Engine::Config::
   batched_decode`); `locus-run` enables it with `--batch-decode`.
+  On Vulkan it runs `vulkan_forward_multi` on groups of up to 8
+  sequences (dense models with Q8_0, F32, F16 or BF16 weights; others
+  run one forward per sequence), and a lone sequence keeps the faster
+  single-sequence forward, so Vulkan logits differ in the last bits
+  alone and batched (#432). Llama 3.2 1B Q8_0 on an M2 Pro: 8 or 16
+  sequences make 154 tok/s in all, against 89 one at a time.
 - Prompt ingestion is batched by default (`--no-batch-prefill` turns
   it off). Vulkan has its own chunked prefill, `vulkan_forward_batch`
   (chunks of up to 512 tokens, 2048 for MoE; token-exact, not
@@ -470,11 +498,15 @@ guarding the default path.
   the output so far allows, over UTF-8 code points; a rule reference
   at the end of a sequence drops the caller's frame, so repetition
   does not grow the stacks, and left recursion is rejected at parse
-  time. Each step's allowed tokens come from one walk of a trie of the
-  vocabulary's bytes, cached by matcher state (inside a string the
-  state repeats). EOS is allowed only on a complete match and is the
-  only choice once nothing but whitespace can follow, so a reply ends
-  at its closing brace. With a 128k vocabulary on
+  time. A state keeps at most 4096 stacks; one that has more drops
+  the rest, logs it once and counts it in
+  `locus_grammar_stack_overflows_total`, since a dropped stack can
+  reject output the grammar allows. Each step's allowed tokens come
+  from one walk of a trie of the vocabulary's bytes, cached by matcher
+  state (inside a string the state repeats). EOS is allowed only on a
+  complete match and is the only choice once nothing but whitespace
+  can follow, so a reply ends at its closing brace. With a 128k
+  vocabulary on
   an M2 Pro (Llama 3.2 1B, CPU) a JSON Schema costs about 3.5 ms per
   token over free decoding.
 - Prompt caching: exact token-prefix keys, ref-counted block pins, LRU
