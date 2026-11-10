@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <string>
@@ -46,6 +47,9 @@ struct StageOptions {
                                            *   idle downstream conns pooled
                                            *   per resolved ip:port for
                                            *   reuse (0 = no pooling) */
+    int peer_log = 0;                     /**< --peer-log s: print the
+                                           *   live peers and their TCP
+                                           *   RTT every N s (0 = off) */
     int resolve_ttl = 30;                 /**< --resolve-ttl s (name
                                            *   cache; fallback TTL until
                                            *   record TTL is used) */
@@ -111,6 +115,9 @@ inline Spec<StageOptions> stage_spec() {
         D::integer("downstream-idle-max", &O::downstream_idle_max,
                    "idle downstream connections pooled per resolved "
                    "ip:port for reuse (0 = dial per session)"),
+        D::integer("peer-log", &O::peer_log,
+                   "print the live peers and their kernel TCP RTT to "
+                   "stderr every N s (0 = off)"),
         D::integer("resolve-ttl", &O::resolve_ttl,
                    "downstream-name cache TTL s (fallback until the "
                    "record TTL is used)"),
@@ -302,6 +309,36 @@ struct StageRuntime {
 };
 
 /**
+ * Prints a stage's live peers (--peer-log), one line per report:
+ * "peers: up 10.0.0.2:51544 rtt 0.24 ms (var 0.05) | down ...".
+ * @param peers The list serve_stage_mux reports.
+ */
+inline void log_peers(const std::vector<locus::pipeline::PeerInfo>& peers) {
+    using Role = locus::pipeline::PeerInfo::Role;
+    std::string line = "peers:";
+    if (peers.empty()) {
+        line += " none";
+    }
+    for (std::size_t i = 0; i < peers.size(); ++i) {
+        const auto& p = peers[i];
+        line += i == 0 ? " " : " | ";
+        line += p.role == Role::kUpstream ? "up " : "down ";
+        if (p.connecting) {
+            line += "(connecting)";
+            continue;
+        }
+        line += p.address.empty() ? "?" : p.address;
+        if (p.rtt) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, " rtt %.2f ms (var %.2f)",
+                          p.rtt->rtt_us / 1000.0, p.rtt->rttvar_us / 1000.0);
+            line += buf;
+        }
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
+/**
  * Validates and converts `opt` into runtime values. @returns an empty
  * string on success (out filled), else a human-readable error; the
  * caller decides whether that is fatal (startup) or logged and skipped
@@ -342,6 +379,10 @@ inline std::string build_runtime(const StageOptions& opt,
     out.conn.keepalive_count = opt.keepalive_count;
     out.conn.serve_sessions = opt.sessions;
     out.conn.downstream_idle_max = opt.downstream_idle_max;
+    if (opt.peer_log > 0) {
+        out.conn.peer_report_ms = opt.peer_log * 1000;
+        out.conn.on_peers = log_peers;
+    }
     return "";
 }
 
