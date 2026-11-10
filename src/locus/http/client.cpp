@@ -22,6 +22,9 @@ constexpr int kSendFlags = MSG_NOSIGNAL;
 constexpr int kSendFlags = 0;  // SO_NOSIGPIPE is set by connect_to
 #endif
 
+/** write_all's error when the server stopped taking bytes. */
+constexpr const char* kWriteTimedOut = "write timed out";
+
 char lower(char c) {
     return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
 }
@@ -373,7 +376,7 @@ bool Client::write_all(std::string_view data, std::string& err) {
             const int r = ::poll(&p, 1, timeout);
             if (r < 0 && errno == EINTR) continue;
             if (r == 0) {
-                err = "write timed out";
+                err = kWriteTimedOut;
                 return false;
             }
             if (r < 0) {
@@ -471,8 +474,8 @@ ClientResponse Client::begin(const ClientRequest& req) {
     }
     std::string out = req.method + " " + req.target + " HTTP/1.1\r\n";
     // An IPv6 literal goes in brackets (RFC 9110 section 7.2).
-    const bool v6 = host_.find(':') != std::string::npos &&
-                    (host_.empty() || host_.front() != '[');
+    const bool v6 =
+        host_.find(':') != std::string::npos && host_.front() != '[';
     out += "Host: " + (v6 ? "[" + host_ + "]" : host_) + ":" +
            std::to_string(port_) + "\r\n";
     for (const auto& [k, v] : req.headers) {
@@ -514,7 +517,11 @@ ClientResponse Client::begin(const ClientRequest& req) {
         std::string err;
         if (!write_all(out, err)) {
             close();
-            if (reused && attempt == 0) continue;
+            // A closed connection never had the whole request, so it is
+            // sent again on a new one. A timeout means the server is
+            // slow, not gone: sending again would give it the request
+            // twice and make the caller wait two timeouts.
+            if (reused && attempt == 0 && err != kWriteTimedOut) continue;
             res.error = err;
             return res;
         }
