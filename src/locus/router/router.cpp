@@ -1,6 +1,7 @@
 #include "locus/router/router.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -343,7 +344,11 @@ std::map<std::string, std::string> parse_instance_keys(std::string_view text) {
 }
 
 bool Router::reject(const http::Request& head, http::ServerResponse& res) {
-    if (!auth_ || head.path == "/health") return false;
+    // Registration checks its own keys (register_keys).
+    if (!auth_ || head.path == "/health" || head.path == "/locus/register" ||
+        head.path == "/locus/deregister") {
+        return false;
+    }
     // "Authorization: Bearer <key>" or "x-api-key: <key>", as
     // locus-server takes them.
     std::string cred;
@@ -361,8 +366,16 @@ bool Router::reject(const http::Request& head, http::ServerResponse& res) {
     return true;
 }
 
+const std::string* Router::instance_key(const Instance& in) const {
+    auto it = cfg_.instance_keys.find(in.host + ":" + std::to_string(in.port));
+    if (it == cfg_.instance_keys.end() && !in.from_srv && !in.from_reg) {
+        it = cfg_.instance_keys.find("*");
+    }
+    return it == cfg_.instance_keys.end() ? nullptr : &it->second;
+}
+
 std::vector<std::pair<std::string, std::string>> Router::upstream_headers(
-    const http::Request& req, const std::string& inst) const {
+    const http::Request& req, const Instance& in) const {
     using UA = RouterConfig::UpstreamAuth;
     std::vector<std::pair<std::string, std::string>> h;
     for (const auto& [k, v] : req.headers) {
@@ -375,12 +388,14 @@ std::vector<std::pair<std::string, std::string>> Router::upstream_headers(
         h.emplace_back(k, v);
     }
     if (cfg_.upstream_auth == UA::kKey) {
-        auto it = cfg_.instance_keys.find(inst);
-        if (it == cfg_.instance_keys.end()) it = cfg_.instance_keys.find("*");
-        if (it != cfg_.instance_keys.end()) {
-            h.emplace_back("Authorization", "Bearer " + it->second);
+        if (const std::string* key = instance_key(in)) {
+            h.emplace_back("Authorization", "Bearer " + *key);
         }
     }
+    // A router that receives this refuses the request (handle): an
+    // instance registered at a router's own address, or a router
+    // behind another, would otherwise send it round until a timeout.
+    h.emplace_back("X-Locus-Router", "1");
     return h;
 }
 
@@ -464,6 +479,22 @@ void Router::wait() {
     if (server_) server_->wait();
 }
 
+namespace {
+
+/** @returns Whether a found (not static) instance is listed now: by an
+ *  SRV name, or by a registration that has not run out. */
+bool listed_now(const Instance& in, std::chrono::steady_clock::time_point now) {
+    return !in.srv.empty() || (in.from_reg && in.reg_until > now);
+}
+
+/** @returns Whether `in` was found (by SRV or registration) and is not
+ *  listed any more, so it must not be picked. */
+bool lapsed(const Instance& in, std::chrono::steady_clock::time_point now) {
+    return (in.from_srv || in.from_reg) && !listed_now(in, now);
+}
+
+}  // namespace
+
 void Router::expand_srv() {
     for (const auto& name : srv_names_) {
         auto all = cfg_.srv_lookup ? cfg_.srv_lookup(name)
@@ -484,19 +515,22 @@ void Router::expand_srv() {
             });
         };
         std::lock_guard lk(mu_);
+        const auto now = std::chrono::steady_clock::now();
         // One entry per host:port: this name's answer adds or drops
-        // itself from each entry's names, and an entry no name lists
-        // any more is gone (i#492).
+        // itself from each entry's names (an entry that registered
+        // itself counts as found too), and an entry neither a name nor
+        // a registration lists any more is gone (i#492).
         for (auto& in : inst_) {
-            if (!in.from_srv) continue;
+            if (!in.from_srv && !in.from_reg) continue;  // static
             auto it = std::lower_bound(in.srv.begin(), in.srv.end(), name);
             const bool had = it != in.srv.end() && *it == name;
             if (listed(in.host, in.port)) {
                 if (!had) in.srv.insert(it, name);
+                in.from_srv = true;
             } else if (had) {
                 in.srv.erase(it);
             }
-            in.gone = in.srv.empty();
+            in.gone = lapsed(in, now);
             if (in.gone) in.healthy = false;
         }
         for (const auto& t : picks) {
@@ -523,63 +557,71 @@ void Router::expand_srv() {
     }
 }
 
+void Router::poll(Instance& in) const {
+    http::ClientOptions o;
+    o.connect_timeout_ms = 2000;
+    o.read_timeout_ms = 5000;
+    http::Client c(in.host, in.port, o);
+    // An instance that checks keys needs one for its /v1/models too:
+    // the instance's key from instance_keys, in any upstream mode.
+    http::ClientRequest poll{"GET", "/v1/models", {}, ""};
+    if (const std::string* key = instance_key(in)) {
+        poll.headers.emplace_back("Authorization", "Bearer " + *key);
+    }
+    const auto r = c.send(poll);
+    const json j = r.ok && r.head.status == 200
+                       ? json::parse(r.body, nullptr, false)
+                       : json();
+    in.healthy = j.is_object() && j.contains("data");
+    in.kinds.clear();
+    in.models.clear();
+    in.models_json.clear();
+    if (!in.healthy) return;
+    if (const auto k = j.find("locus_kinds"); k != j.end() && k->is_array()) {
+        for (const auto& v : *k) {
+            if (v.is_string()) {
+                if (const auto kind = parse_kind(v.get<std::string>())) {
+                    in.kinds.push_back(*kind);
+                }
+            }
+        }
+    } else {
+        in.kinds.push_back(Kind::kText);  // a server without kinds
+    }
+    if (j["data"].is_array()) {
+        for (const auto& m : j["data"]) {
+            if (m.is_object() && m.contains("id") && m["id"].is_string()) {
+                in.models.push_back(m["id"].get<std::string>());
+            }
+        }
+        in.models_json = j["data"].dump();
+    }
+}
+
 void Router::refresh() {
     expand_srv();
     std::vector<Instance> seen;
     {
         std::lock_guard lk(mu_);
+        // A registration that ran out since the last refresh.
+        const auto now = std::chrono::steady_clock::now();
+        for (auto& in : inst_) {
+            if (lapsed(in, now)) {
+                in.gone = true;
+                in.healthy = false;
+            }
+        }
         seen = inst_;
     }
     for (auto& in : seen) {
-        if (in.gone) continue;
-        http::ClientOptions o;
-        o.connect_timeout_ms = 2000;
-        o.read_timeout_ms = 5000;
-        http::Client c(in.host, in.port, o);
-        // An instance that checks keys needs one for its /v1/models too:
-        // the instance's key from instance_keys, in any upstream mode.
-        http::ClientRequest poll{"GET", "/v1/models", {}, ""};
-        auto key = cfg_.instance_keys.find(in.host + ":" +
-                                           std::to_string(in.port));
-        if (key == cfg_.instance_keys.end()) key = cfg_.instance_keys.find("*");
-        if (key != cfg_.instance_keys.end()) {
-            poll.headers.emplace_back("Authorization", "Bearer " + key->second);
-        }
-        const auto r = c.send(poll);
-        const json j = r.ok && r.head.status == 200
-                           ? json::parse(r.body, nullptr, false)
-                           : json();
-        in.healthy = j.is_object() && j.contains("data");
-        in.kinds.clear();
-        in.models.clear();
-        in.models_json.clear();
-        if (!in.healthy) continue;
-        if (const auto k = j.find("locus_kinds"); k != j.end() && k->is_array()) {
-            for (const auto& v : *k) {
-                if (v.is_string()) {
-                    if (const auto kind = parse_kind(v.get<std::string>())) {
-                        in.kinds.push_back(*kind);
-                    }
-                }
-            }
-        } else {
-            in.kinds.push_back(Kind::kText);  // a server without kinds
-        }
-        if (j["data"].is_array()) {
-            for (const auto& m : j["data"]) {
-                if (m.is_object() && m.contains("id") && m["id"].is_string()) {
-                    in.models.push_back(m["id"].get<std::string>());
-                }
-            }
-            in.models_json = j["data"].dump();
-        }
+        if (!in.gone) poll(in);
     }
     // Field by field and by index: inst_ may have grown meanwhile (it
     // only grows), and a name may have dropped one of these since.
     std::lock_guard lk(mu_);
     for (std::size_t i = 0; i < seen.size(); ++i) {
         Instance& in = inst_[i];
-        if (in.gone) continue;
+        if (in.gone || seen[i].gone) continue;
         in.healthy = seen[i].healthy;
         in.kinds = std::move(seen[i].kinds);
         in.models = std::move(seen[i].models);
@@ -596,9 +638,12 @@ std::vector<int> Router::candidates(const Route& route) const {
     std::vector<int> of_kind, of_model;
     {
         std::lock_guard lk(mu_);
+        // A registration can run out between refreshes: checked here
+        // too, so a lapsed instance gets no request meanwhile.
+        const auto now = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < inst_.size(); ++i) {
             const Instance& in = inst_[i];
-            if (in.gone || !in.healthy ||
+            if (in.gone || lapsed(in, now) || !in.healthy ||
                 std::find(in.kinds.begin(), in.kinds.end(), route.kind) ==
                     in.kinds.end()) {
                 continue;
@@ -732,9 +777,155 @@ void Router::metrics(http::ServerResponse& res) const {
     res.set_content(std::move(out), "text/plain; version=0.0.4");
 }
 
+namespace {
+
+/** @returns a == b, in a time that does not depend on where they
+ *  differ (a registration key check). */
+bool same_key(std::string_view a, std::string_view b) {
+    unsigned char d = a.size() == b.size() ? 0 : 1;
+    const std::size_t n = std::max(a.size(), b.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        const unsigned char x = i < a.size() ? a[i] : 0;
+        const unsigned char y = i < b.size() ? b[i] : 0;
+        d |= x ^ y;
+    }
+    return d == 0;
+}
+
+}  // namespace
+
+void Router::registration(const http::Request& req,
+                          http::ServerResponse& res) {
+    const auto fail = [&](int status, const std::string& msg,
+                          const char* type) {
+        res.status = status;
+        res.set_content(error_body(msg, type), "application/json");
+    };
+    if (cfg_.register_keys.empty()) {
+        fail(404, "registration is off (no --register-keys)",
+             "invalid_request_error");
+        return;
+    }
+    const std::string h = req.get_header_value("Authorization");
+    const std::string cred = h.rfind("Bearer ", 0) == 0 ? h.substr(7) : "";
+    bool ok = false;
+    for (const auto& k : cfg_.register_keys) {
+        ok |= !cred.empty() && same_key(cred, k);
+    }
+    if (!ok) {
+        fail(401, "invalid or missing registration key",
+             "authentication_error");
+        return;
+    }
+    if (req.method != "POST") {
+        fail(405, "use POST", "invalid_request_error");
+        return;
+    }
+    const bool remove = req.path == "/locus/deregister";
+    const json body = json::parse(req.body, nullptr, false);
+    Instance want;
+    if (!body.is_object() || !body.contains("address") ||
+        !body["address"].is_string() ||
+        !pipeline::parse_hostport(body["address"].get<std::string>(),
+                                  want.host, want.port) ||
+        want.host.empty() || want.port <= 0) {
+        fail(400, "address must be HOST:PORT", "invalid_request_error");
+        return;
+    }
+    int ttl = 30;
+    if (body.contains("ttl_s")) {
+        const json& t = body["ttl_s"];
+        if (!t.is_number_integer() || t.get<int>() < 1 || t.get<int>() > 300) {
+            fail(400, "ttl_s must be an integer from 1 to 300",
+                 "invalid_request_error");
+            return;
+        }
+        ttl = body["ttl_s"].get<int>();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    std::size_t idx = 0;
+    bool probe = false;  // a new or returning instance: poll it now
+    std::string status = "registered";
+    {
+        std::lock_guard lk(mu_);
+        auto it = std::find_if(inst_.begin(), inst_.end(), [&](const auto& in) {
+            return in.host == want.host && in.port == want.port;
+        });
+        if (remove) {
+            if (it != inst_.end() && it->from_reg) {
+                // Expire the registration; from_reg stays, so the
+                // entry is still a found one (gone unless a name lists
+                // it), not a static one.
+                it->reg_until = {};
+                it->gone = lapsed(*it, now);
+                if (it->gone) it->healthy = false;
+            }
+            status = "removed";
+        } else if (it != inst_.end() && !it->from_srv && !it->from_reg) {
+            status = "static";  // given as host:port: always listed
+        } else if (it != inst_.end()) {
+            probe = it->gone || !it->healthy;
+            it->from_reg = true;
+            it->reg_until = now + std::chrono::seconds(ttl);
+            it->gone = false;
+            idx = static_cast<std::size_t>(it - inst_.begin());
+        } else if (inst_.size() == kMaxInstances) {
+            fail(503, "the router keeps at most " +
+                          std::to_string(kMaxInstances) + " instances",
+                 "server_error");
+            return;
+        } else {
+            want.from_reg = true;
+            want.reg_until = now + std::chrono::seconds(ttl);
+            inst_.push_back(want);
+            idx = inst_.size() - 1;
+            probe = true;
+        }
+    }
+    // A new or returning instance takes requests once it answers its
+    // /v1/models, so poll it now rather than at the next refresh; a
+    // heartbeat of a healthy one does not poll.
+    if (probe) {
+        Instance seen;
+        {
+            std::lock_guard lk(mu_);
+            seen = inst_[idx];
+        }
+        poll(seen);
+        std::lock_guard lk(mu_);
+        Instance& in = inst_[idx];
+        if (!in.gone) {
+            in.healthy = seen.healthy;
+            in.kinds = std::move(seen.kinds);
+            in.models = std::move(seen.models);
+            in.models_json = std::move(seen.models_json);
+        }
+    }
+    const std::string addr = want.host + ":" + std::to_string(want.port);
+    res.set_content(
+        json{{"address", addr}, {"status", status}, {"ttl_s", ttl}}.dump(),
+        "application/json");
+}
+
 void Router::handle(const http::Request& req, http::ServerResponse& res) {
     if (req.path == "/health") {
         res.set_content(R"({"status":"ok"})", "application/json");
+        return;
+    }
+    // A request a router sent: this router is one of its instances (a
+    // registration at a router's address, or routers chained), so
+    // proxying it would loop until a timeout.
+    if (req.has_header("X-Locus-Router")) {
+        res.status = 508;
+        res.set_content(error_body("loop: this request came from a "
+                                   "locus-router, and a router does not "
+                                   "proxy to a router",
+                                   "invalid_request_error"),
+                        "application/json");
+        return;
+    }
+    if (req.path == "/locus/register" || req.path == "/locus/deregister") {
+        registration(req, res);
         return;
     }
     if (req.path == "/v1/models") {
@@ -833,8 +1024,7 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
         std::shared_ptr<http::Client> client = take(i);
         {
             std::lock_guard lk(mu_);
-            up.headers = upstream_headers(
-                req, inst_[i].host + ":" + std::to_string(inst_[i].port));
+            up.headers = upstream_headers(req, inst_[i]);
         }
         const auto head = client->begin(up);
         if (!head.ok) {
@@ -935,6 +1125,95 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
     res.status = 502;
     res.set_content(error_body("upstream " + last_error, "server_error"),
                     "application/json");
+}
+
+std::vector<std::string> parse_register_keys(std::string_view text) {
+    std::vector<std::string> keys;
+    while (!text.empty()) {
+        const std::size_t nl = text.find('\n');
+        std::string_view line = text.substr(0, nl);
+        text = nl == std::string_view::npos ? std::string_view{}
+                                            : text.substr(nl + 1);
+        while (!line.empty() && std::isspace(static_cast<unsigned char>(
+                                    line.front()))) {
+            line.remove_prefix(1);
+        }
+        while (!line.empty() && std::isspace(static_cast<unsigned char>(
+                                    line.back()))) {
+            line.remove_suffix(1);
+        }
+        if (line.empty() || line.front() == '#') continue;
+        keys.emplace_back(line);
+    }
+    return keys;
+}
+
+bool parse_router_url(std::string_view url, std::string& host, int& port) {
+    constexpr std::string_view kScheme = "http://";
+    if (url.rfind(kScheme, 0) != 0) return false;
+    url.remove_prefix(kScheme.size());
+    if (!url.empty() && url.back() == '/') url.remove_suffix(1);
+    if (url.find('/') != std::string_view::npos) return false;
+    return pipeline::parse_hostport(std::string(url), host, port) &&
+           !host.empty() && port > 0;
+}
+
+Registrar::Registrar(Config cfg) : cfg_(std::move(cfg)) {}
+
+Registrar::~Registrar() { stop(); }
+
+bool Registrar::call(const std::string& path) {
+    http::ClientOptions o;
+    o.connect_timeout_ms = 2000;
+    o.read_timeout_ms = 5000;
+    http::Client c(cfg_.router_host, cfg_.router_port, o);
+    json body{{"address", cfg_.address}};
+    if (path == "/locus/register") body["ttl_s"] = cfg_.ttl_s;
+    const auto r = c.send(http::ClientRequest{
+        "POST",
+        path,
+        {{"Content-Type", "application/json"},
+         {"Authorization", "Bearer " + cfg_.key}},
+        body.dump()});
+    return r.ok && r.head.status == 200;
+}
+
+bool Registrar::register_once() { return call("/locus/register"); }
+
+bool Registrar::deregister() { return call("/locus/deregister"); }
+
+void Registrar::start() {
+    std::lock_guard lk(mu_);
+    if (started_) return;
+    started_ = true;
+    thread_ = std::thread([this] {
+        std::unique_lock lk(mu_);
+        auto wait = std::chrono::milliseconds(cfg_.first_delay_ms);
+        const auto every =
+            std::chrono::milliseconds(std::max(1, cfg_.ttl_s) * 1000 / 3);
+        while (!cv_.wait_for(lk, wait, [this] { return stopping_; })) {
+            lk.unlock();
+            if (!register_once()) {
+                std::fprintf(stderr,
+                             "locus: registration with %s:%d failed; "
+                             "retrying\n",
+                             cfg_.router_host.c_str(), cfg_.router_port);
+            }
+            lk.lock();
+            wait = every;
+        }
+    });
+}
+
+void Registrar::stop() {
+    {
+        std::lock_guard lk(mu_);
+        if (!started_ || stopping_) return;
+        stopping_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) thread_.join();
+    deregister();
 }
 
 }  // namespace locus::router
