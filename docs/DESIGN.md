@@ -743,7 +743,10 @@ locus ports those dots (`backend::matvec_q8k`):
 
 The sse4 and CUDA dots, and the neon block-32 dots, replay the scalar
 accumulation order, so they are bit-identical to it. The neon Q4_K
-and Q6_K dots do not (below).
+and Q6_K dots do not (below). The build turns off implicit fused
+multiply-add (`-ffp-contract=off`), so the scalar path rounds the same
+on x86-64 and arm64, and a stage chain that mixes the two is exact
+(#458).
 
 "Bit-exact with llama.cpp" is unreachable in principle: ggml is not
 bit-exact across its own backends, because the final f32 sum runs in
