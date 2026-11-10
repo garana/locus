@@ -51,6 +51,20 @@ TEST_CASE("--image-decoder takes the VQ-16 decoder path", "[cli]") {
     REQUIRE(b.positional == std::vector<std::string>{"m.gguf"});
 }
 
+TEST_CASE("the lora-dir flag takes the FLUX LoRA directory", "[cli]") {
+    std::array<const char*, 4> argv1 = {"prog", "--lora-dir", "loras",
+                                        "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()), const_cast<char**>(argv1.data()));
+    REQUIRE(a.lora_dir == "loras");
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+
+    std::array<const char*, 3> argv2 = {"prog", "--lora-dir=l2", "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()), const_cast<char**>(argv2.data()));
+    REQUIRE(b.lora_dir == "l2");
+}
+
 TEST_CASE("--audio-max-tokens sets the speech token cap", "[cli]") {
     std::array<const char*, 4> argv1 = {"prog", "--audio-max-tokens",
                                         "350", "m.gguf"};

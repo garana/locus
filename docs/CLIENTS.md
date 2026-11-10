@@ -61,11 +61,11 @@ output yet (each is a 400).
 `/v1/images/generations` returns one PNG as `b64_json`, from either
 model the server loaded:
 
-| Model        | Server flag                   | Image               | Extra fields (defaults)                                                                                 |
-|--------------|-------------------------------|---------------------|---------------------------------------------------------------------------------------------------------|
-| Janus-Pro-1B | `--image-decoder <vq16.gguf>` | 384x384             | `cfg` (5), `temperature` (1; 0 = argmax), `seed` (random)                                               |
-| PixArt-alpha | `--image-model <dir>`         | 512x512             | `steps` (20, up to 100), `guidance_scale` (4.5), `seed` (random), `negative_prompt`                     |
-| FLUX.1       | `--image-model <dir>`         | WxH (*)             | `steps` (28, 4 for schnell; up to 100), `guidance_scale` (3.5), `max_sequence_length` (512), `seed`     |
+| Model        | Server flag                   | Image               | Extra fields (defaults)                                                                                                   |
+|--------------|-------------------------------|---------------------|---------------------------------------------------------------------------------------------------------------------------|
+| Janus-Pro-1B | `--image-decoder <vq16.gguf>` | 384x384             | `cfg` (5), `temperature` (1; 0 = argmax), `seed` (random)                                                                 |
+| PixArt-alpha | `--image-model <dir>`         | 512x512             | `steps` (20, up to 100), `guidance_scale` (4.5), `seed` (random), `negative_prompt`                                       |
+| FLUX.1       | `--image-model <dir>`         | WxH (*)             | `steps` (28, 4 for schnell; up to 100), `guidance_scale` (3.5), `max_sequence_length` (512), `seed`, `lora`, `lora_scale` |
 
 (*) `size` is any "WxH" with both sides multiples of 16, up to 2048 a
 side and 1024 x 1024 pixels in all; the default is 1024x1024. On a
@@ -104,6 +104,17 @@ FluxKontextPipeline does); with it, `size`'s aspect at `size`'s area
 Kontext's training resolutions (about 1M pixels); false keeps its own
 size (floored to 16), which is faster for a small image, and then the
 image may have at most 1024 x 1024 pixels and 2048 a side.
+
+FLUX requests (generations and edits) can apply LoRAs from the
+server's `--lora-dir`, a directory of GGUFs from
+`scripts/convert-lora.py` (kohya or diffusers LoRAs), each named by its
+file name without `.gguf`. `lora` is one name or an array of up to 8;
+`lora_scale` (default 1, from -4 to 4) is one number for all of them
+or an array of one per name; several LoRAs add up. An unknown name is
+a 400 that lists the server's LoRAs. Every LoRA is checked against the
+DiT when the server starts, so one made for another model stops it
+there. With a LoRA the DiT runs per op rather than as one GPU step, so
+the image is slower.
 
 With the OpenAI SDK, pass the extra fields in `extra_body`:
 

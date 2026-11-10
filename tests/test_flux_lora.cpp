@@ -137,6 +137,37 @@ TEST_CASE("LoraSet rejects a GGUF that is not a flux_lora",
     REQUIRE(set.empty());
 }
 
+TEST_CASE("LoraLibrary loads a directory and selects by name",
+          "[image][flux][lora]") {
+    const auto lib = locus::image::LoraLibrary::load_dir(kDir + "lora");
+    REQUIRE(lib->names() ==
+            std::vector<std::string>{"diffusers", "kohya", "ranks"});
+    const std::vector<locus::image::LoraPick> picks = {{"kohya", 1.0f},
+                                                       {"ranks", 0.5f}};
+    const LoraSet set = lib->select(picks);
+    REQUIRE(set.parts("transformer_blocks.0.attn.to_q").size() == 2);
+    // The set is the library's files at the picked strengths.
+    Synth s;
+    s.dit.set_lora(&set);
+    REQUIRE(s.dit.has_lora());
+    s.dit.set_lora(nullptr);
+
+    const std::vector<locus::image::LoraPick> bad = {{"nope", 1.0f}};
+    try {
+        (void)lib->select(bad);
+        FAIL("an unknown name must throw");
+    } catch (const std::invalid_argument& e) {
+        const std::string msg = e.what();
+        CHECK(msg.find("nope") != std::string::npos);
+        CHECK(msg.find("diffusers, kohya, ranks") != std::string::npos);
+    }
+    // A directory with no LoRA GGUF in it is refused.
+    REQUIRE_THROWS_AS(
+        locus::image::LoraLibrary::load_dir(std::string(LOCUS_SOURCE_DIR) +
+                                            "/tests/golden/flux"),
+        locus::gguf::Error);
+}
+
 TEST_CASE("LoraSet adds up LoRAs on the same layer",
           "[image][flux][lora]") {
     const auto k = locus::gguf::GgufFile::open(kDir + "lora/kohya.gguf");

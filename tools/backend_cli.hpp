@@ -199,6 +199,10 @@ inline constexpr const char* kCommonHelp =
     "                   (flux, t5encoder, clip_text and autoencoder_kl\n"
     "                   GGUFs) or PixArt-alpha (pixart, t5encoder and\n"
     "                   autoencoder_kl)\n"
+    "  --lora-dir D     locus-server: FLUX.1 LoRAs (flux_lora GGUFs\n"
+    "                   from scripts/convert-lora.py) for the image\n"
+    "                   requests' lora field, each named by its file\n"
+    "                   name; needs a FLUX.1 --image-model\n"
     "  --video-model D  locus-server: enable /v1/videos with the\n"
     "                   LTX-Video pipeline in directory D (t5encoder,\n"
     "                   ltxv and ltxv_vae GGUFs)\n"
@@ -295,6 +299,9 @@ struct BackendArgs {
      * GGUFs, enabling locus-server's /v1/images/generations for it;
      * empty = off. */
     std::string image_model;
+    /** From --lora-dir D: directory of FLUX.1 LoRA GGUFs for the image
+     * requests' lora field; empty = no LoRAs. */
+    std::string lora_dir;
     /** From --video-model D: directory of the LTX-Video pipeline's
      * GGUFs, enabling locus-server's /v1/videos; empty = off. */
     std::string video_model;
@@ -429,6 +436,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.image_model = argv[++i];
         } else if (a.rfind("--image-model=", 0) == 0) {
             out.image_model = std::string(a.substr(14));
+        } else if (a == "--lora-dir" && i + 1 < argc) {
+            out.lora_dir = argv[++i];
+        } else if (a.rfind("--lora-dir=", 0) == 0) {
+            out.lora_dir = std::string(a.substr(11));
         } else if (a == "--video-model" && i + 1 < argc) {
             out.video_model = argv[++i];
         } else if (a.rfind("--video-model=", 0) == 0) {

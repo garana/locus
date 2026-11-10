@@ -44,6 +44,7 @@
 #include "locus/server/errors.hpp"
 #include "locus/server/metrics_text.hpp"
 #include "locus/server/responses.hpp"
+#include "locus/server/image_lora.hpp"
 #include "locus/server/tools.hpp"
 #include "locus/sys/features.hpp"
 #include "locus/sys/perf_counters.hpp"
@@ -868,6 +869,22 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
                 throw gguf::Error(std::string(e.what()) +
                                   " (or, for FLUX.1, a flux, a clip_text, a "
                                   "t5encoder and an autoencoder_kl GGUF)");
+            }
+        }
+    }
+    // FLUX.1 LoRAs (--lora-dir): every one is checked against the DiT
+    // now, so a LoRA for another model stops the server, not a request.
+    if (!opt_.lora_dir.empty()) {
+        if (!flux_) {
+            throw gguf::Error("--lora-dir needs --image-model with FLUX.1");
+        }
+        loras_ = image::LoraLibrary::load_dir(opt_.lora_dir);
+        for (const std::string& name : loras_->names()) {
+            const image::LoraPick pick{name, 1.0f};
+            try {
+                flux_->check_lora(loras_->select({&pick, 1}));
+            } catch (const std::invalid_argument& e) {
+                throw gguf::Error("lora " + name + ": " + e.what());
             }
         }
     }
@@ -2928,6 +2945,18 @@ void OpenAiServer::install_routes() {
                             "guidance_scale must be from 0 to 100");
                     }
                     p.guidance = static_cast<float>(g);
+                }
+                // LoRAs (--lora-dir): the set lives until generate returns.
+                image::LoraSet lora_set;
+                const auto picks = parse_lora_fields(body);
+                if (!picks.empty()) {
+                    if (!loras_) {
+                        throw std::invalid_argument(
+                            "lora: this server has no LoRAs (start it with "
+                            "--lora-dir)");
+                    }
+                    lora_set = loras_->select(picks);
+                    p.lora = &lora_set;
                 }
                 p.seed = std::random_device{}();
                 if (body.contains("seed")) {

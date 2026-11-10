@@ -139,6 +139,7 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         }
         opt.image_decoder_path = args.image_decoder;
         opt.image_model_dir = args.image_model;
+        opt.lora_dir = args.lora_dir;
         opt.video_model_dir = args.video_model;
         opt.ffmpeg_path = args.ffmpeg;
         opt.model_path = model_path;
