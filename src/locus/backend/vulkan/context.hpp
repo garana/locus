@@ -156,6 +156,15 @@ enum class Kernel {
     /** The NT 2 builds of matvec_q8_0_n / _glu (#432), for n <= 2. */
     kMatvecQ8_0N2,
     kMatvecQ8_0N2Glu,
+    /** matvec_q8_0_n over Q4_K / Q6_K rows (matvec_k_n.comp, #436);
+     * the N2 builds for n <= 2. */
+    kMatvecQ4_KN,
+    kMatvecQ4_KN2,
+    kMatvecQ6_KN,
+    kMatvecQ6_KN2,
+    /** matvec_q4_k_n with SwiGLU, NT 8 and NT 2. */
+    kMatvecQ4_KNGlu,
+    kMatvecQ4_KN2Glu,
     kCount_,
 };
 

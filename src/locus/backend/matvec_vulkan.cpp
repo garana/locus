@@ -940,8 +940,9 @@ Kernel matmul_id_kernel(const Mat& w) {
 }
 
 /** @returns The short-batch (matvec_q8_0_n family) kernel for w over
- * n_tok <= kSmallBatch tokens, or kCount_. 16-bit weights take the
- * NT 2 build for up to 2 tokens (matvec_q8_0_n.comp). */
+ * n_tok <= kSmallBatch tokens, or kCount_. 16-bit and K-quant weights
+ * take the NT 2 build for up to 2 tokens (matvec_q8_0_n.comp,
+ * matvec_k_n.comp). */
 Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
     const bool two = n_tok <= 2;
     switch (w.type) {
@@ -951,6 +952,10 @@ Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
             return two ? Kernel::kMatvecF16N2 : Kernel::kMatvecF16N;
         case gguf::TensorType::kBF16:
             return two ? Kernel::kMatvecBF16N2 : Kernel::kMatvecBF16N;
+        case gguf::TensorType::kQ4_K:
+            return two ? Kernel::kMatvecQ4_KN2 : Kernel::kMatvecQ4_KN;
+        case gguf::TensorType::kQ6_K:
+            return two ? Kernel::kMatvecQ6_KN2 : Kernel::kMatvecQ6_KN;
         default: return Kernel::kCount_;
     }
 }
@@ -3072,15 +3077,21 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
 
         norm_rows(lay.ffn_norm, bx, bxb);
         mark(s, model::Stage::kNorm);
-        if (lay.w_gate.type == gguf::TensorType::kQ8_0 &&
-            lay.w_up.type == gguf::TensorType::kQ8_0 && n <= kSmallBatch) {
+        const auto gt = lay.w_gate.type;
+        if ((gt == gguf::TensorType::kQ8_0 ||
+             gt == gguf::TensorType::kQ4_K) &&
+            lay.w_up.type == gt && n <= kSmallBatch) {
             // Gate, up and silu_mul in one short-batch dispatch (both
-            // dots as matvec_q8_0_n computes one).
+            // dots as matvec_q8_0_n / matvec_q4_k_n computes one).
             const VulkanContext::Buffer bufs[] = {
                 s.upload_w(lay.w_gate), bxb, bgate, s.upload_w(lay.w_up)};
             const std::uint32_t push[] = {ff, E, 0, 0, 0, 0, fbits(1.0f), n,
                                           E,  ff, 0, 0, 0};
-            const Kernel k = q8n_variant(s.ctx, Kernel::kMatvecQ8_0NGlu, n);
+            const Kernel k =
+                gt == gguf::TensorType::kQ4_K
+                    ? (n <= 2 ? Kernel::kMatvecQ4_KN2Glu
+                              : Kernel::kMatvecQ4_KNGlu)
+                    : q8n_variant(s.ctx, Kernel::kMatvecQ8_0NGlu, n);
             s.ctx.dispatch(k, bufs, push,
                            VulkanContext::matvec_groups(k, ff));
         } else {
