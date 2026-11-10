@@ -670,11 +670,13 @@ void quantize_activation_q8k_neon(std::span<const float> x, float* d,
     const int32x4_t q127 = vdupq_n_s32(127);
     for (std::size_t i = 0; i < nb; ++i) {
         const float* xb = x.data() + i * 256;
+        // maxnm skips a NaN as the scalar's `ax > amax` does (an
+        // all-NaN block gives 0, as there).
         float32x4_t m = vdupq_n_f32(0.0f);
         for (int j = 0; j < 256; j += 4) {
-            m = vmaxq_f32(m, vabsq_f32(vld1q_f32(xb + j)));
+            m = vmaxnmq_f32(m, vabsq_f32(vld1q_f32(xb + j)));
         }
-        const float amax = vmaxvq_f32(m);
+        const float amax = vmaxnmvq_f32(m);
         std::int8_t* q = qs + i * 256;
         std::int16_t* bs = bsums + i * 16;
         if (amax == 0.0f) {
@@ -686,7 +688,7 @@ void quantize_activation_q8k_neon(std::span<const float> x, float* d,
         // The first element of that magnitude, as the scalar's strict
         // > scan picks it.
         int first = 0;
-        while (std::fabs(xb[first]) != amax) {
+        while (first < 255 && std::fabs(xb[first]) != amax) {
             ++first;
         }
         const float iscale = -127.0f / xb[first];
@@ -704,8 +706,10 @@ void quantize_activation_q8k_neon(std::span<const float> x, float* d,
             }
             lo = vcombine_s16(vmovn_s32(v[0]), vmovn_s32(v[1]));
             hi = vcombine_s16(vmovn_s32(v[2]), vmovn_s32(v[3]));
-            vst1q_s8(q + g * 16, vcombine_s8(vmovn_s16(lo), vmovn_s16(hi)));
-            bs[g] = static_cast<std::int16_t>(vaddvq_s16(vaddq_s16(lo, hi)));
+            const int8x16_t q16 = vcombine_s8(vmovn_s16(lo), vmovn_s16(hi));
+            vst1q_s8(q + g * 16, q16);
+            // The sum of the stored quants, as the scalar sums them.
+            bs[g] = static_cast<std::int16_t>(vaddlvq_s8(q16));
         }
         d[i] = 1.0f / iscale;
     }
@@ -720,9 +724,10 @@ void quantize_activation_q8_0_neon(std::span<const float> x, float* d,
         float32x4_t m = vdupq_n_f32(0.0f);
         for (int k = 0; k < 8; ++k) {
             v[k] = vld1q_f32(xb + k * 4);
-            m = vmaxq_f32(m, vabsq_f32(v[k]));
+            // NaN skipped, as std::max does.
+            m = vmaxnmq_f32(m, vabsq_f32(v[k]));
         }
-        const float amax = vmaxvq_f32(m);
+        const float amax = vmaxnmvq_f32(m);
         const float dd = amax / 127.0f;
         const float id = dd != 0.0f ? 1.0f / dd : 0.0f;
         d[b] = f16_to_f32(f32_to_f16(dd));

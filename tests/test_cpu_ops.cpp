@@ -1,4 +1,5 @@
 #include <cmath>
+#include <limits>
 #include <cstring>
 #include <random>
 #include <span>
@@ -1059,6 +1060,20 @@ TEST_CASE("neon activation quantizers are bit-identical to the scalar",
             t[j] = j % 32 == 0 ? 127.0f : static_cast<float>(j % 50) - 24.5f;
         }
         rows.push_back(t);
+    }
+    {
+        // NaN: one in a block, one at index 0, and a whole NaN block;
+        // the scalar max scans skip them.
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> r = rows[0];
+        r[5] = nan;
+        r[256] = nan;
+        rows.push_back(r);
+        std::vector<float> all(512, nan);
+        for (int j = 256; j < 512; ++j) {
+            all[j] = rows[1][j];
+        }
+        rows.push_back(all);
     }
     for (std::size_t ri = 0; ri < rows.size(); ++ri) {
         INFO("row " << ri);
