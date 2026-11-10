@@ -472,6 +472,81 @@ TEST_CASE("router: a loaded or busy instance passes requests on",
     }
 }
 
+// i#388: "srv:NAME" lists the lowest priority's SRV targets, looked up
+// again on every refresh; a target the answer drops is never picked,
+// an empty answer keeps the last list, and a target that comes back is
+// picked again.
+TEST_CASE("router: an SRV name lists instances and follows changes",
+          "[router]") {
+    using locus::pipeline::SrvTarget;
+    FakeInstance a("A", {"text"}, "m"), b("B", {"text"}, "m"),
+        c("C", {"text"}, "m");
+    std::mutex mu;
+    std::vector<SrvTarget> answer = {{"127.0.0.1", a.port, 10, 0},
+                                     {"127.0.0.1", b.port, 10, 0},
+                                     {"127.0.0.1", c.port, 20, 0}};
+    RouterConfig cfg;
+    cfg.srv_lookup = [&](const std::string& name) {
+        CHECK(name == "_locus._tcp.test");
+        std::lock_guard lk(mu);
+        return answer;
+    };
+    RouterFixture rf({"srv:_locus._tcp.test"}, cfg);
+    // The instances 20 completions reach (each its own prompt, so the
+    // session keys differ and every instance gets some).
+    const auto reached = [&] {
+        std::set<std::string> seen;
+        for (int i = 0; i < 20; ++i) {
+            const auto r = rf.post(
+                "/v1/completions",
+                json{{"prompt", "p" + std::to_string(i)}, {"max_tokens", 1}});
+            REQUIRE(r.ok);
+            REQUIRE(r.head.status == 200);
+            seen.insert(r.head.get_header_value("X-Instance"));
+        }
+        return seen;
+    };
+    const auto set = [&](std::vector<SrvTarget> v) {
+        {
+            std::lock_guard lk(mu);
+            answer = std::move(v);
+        }
+        rf.router->refresh();
+    };
+    const auto gone = [&](int port) {
+        for (const auto& in : rf.router->instances()) {
+            if (in.port == port) return in.gone;
+        }
+        FAIL("no instance on port " << port);
+        return false;
+    };
+
+    // Priority 10 is used; C (priority 20) is a fallback, not listed.
+    CHECK(reached() == std::set<std::string>{"A", "B"});
+    CHECK(rf.router->instances().size() == 2);
+
+    // B leaves the record and C joins it at priority 10.
+    set({{"127.0.0.1", a.port, 10, 0}, {"127.0.0.1", c.port, 10, 0}});
+    CHECK(reached() == std::set<std::string>{"A", "C"});
+    CHECK(gone(b.port));
+    CHECK_FALSE(gone(c.port));
+
+    // An empty answer (a DNS failure) keeps the last list.
+    set({});
+    CHECK(reached() == std::set<std::string>{"A", "C"});
+
+    // B comes back; C leaves.
+    set({{"127.0.0.1", a.port, 10, 0}, {"127.0.0.1", b.port, 10, 0}});
+    CHECK(reached() == std::set<std::string>{"A", "B"});
+    CHECK_FALSE(gone(b.port));
+    CHECK(gone(c.port));
+    CHECK(rf.router->instances().size() == 3);  // the list only grows
+
+    RouterConfig bad;
+    bad.instances = {"srv:"};
+    CHECK_THROWS_AS(Router(bad), std::invalid_argument);
+}
+
 TEST_CASE("router: video ids name their instance", "[router]") {
     using locus::router::router_video_id;
     using locus::router::split_video_id;

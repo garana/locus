@@ -68,9 +68,10 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Tools:** `locus-server`; `locus-run` (one prompt); `locus-gguf`
   (inspect a GGUF); `locus-stage` and `locus-driver` (multi-server
   pipeline, experimental); `locus-router` (or `locus-server
-  --router`: one URL in front of several locus-server instances, each
-  request sent to an instance that serves its kind and model;
-  experimental, #388); `locus-auth-helper` (a reference auth helper,
+  --router`: one URL in front of several locus-server instances, given
+  as host:port or found by DNS SRV, each request sent to an instance
+  that serves its kind and model; experimental, #388);
+  `locus-auth-helper` (a reference auth helper,
   see docs/CLIENTS.md).
 
 ### Media: from what to what

@@ -278,4 +278,44 @@ void Resolver::run() {
     }
 }
 
+std::vector<SrvTarget> dns_srv_lookup(const std::string& name) {
+    std::vector<SrvTarget> out;
+    struct __res_state st;
+    std::memset(&st, 0, sizeof(st));
+    if (::res_ninit(&st) != 0) {
+        return out;
+    }
+    unsigned char buf[8192];
+    const int n = ::res_nquery(&st, name.c_str(), ns_c_in, ns_t_srv, buf,
+                               sizeof(buf));
+    ns_msg msg;
+    if (n > 0 && ::ns_initparse(buf, n, &msg) == 0) {
+        const int count = ns_msg_count(msg, ns_s_an);
+        for (int i = 0; i < count; ++i) {
+            ns_rr rr;
+            if (::ns_parserr(&msg, ns_s_an, i, &rr) != 0 ||
+                ns_rr_type(rr) != ns_t_srv || ns_rr_rdlen(rr) < 7) {
+                continue;  // a CNAME in the chain, or a short record
+            }
+            // RDATA: priority, weight, port (16 bits each, big-endian),
+            // then the target name, maybe compressed.
+            const unsigned char* r = ns_rr_rdata(rr);
+            char target[NS_MAXDNAME];
+            if (::dn_expand(ns_msg_base(msg), ns_msg_end(msg), r + 6, target,
+                            sizeof(target)) < 0 ||
+                target[0] == '\0') {
+                continue;  // bad, or "." (no service at this name)
+            }
+            SrvTarget t;
+            t.priority = (r[0] << 8) | r[1];
+            t.weight = (r[2] << 8) | r[3];
+            t.port = (r[4] << 8) | r[5];
+            t.host = target;
+            out.push_back(std::move(t));
+        }
+    }
+    ::res_nclose(&st);
+    return out;
+}
+
 }  // namespace locus::pipeline

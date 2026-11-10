@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,7 @@
 #include "locus/auth/token_cache.hpp"
 #include "locus/http/client.hpp"
 #include "locus/http/server.hpp"
+#include "locus/pipeline/resolver.hpp"
 
 namespace locus::router {
 
@@ -103,14 +105,29 @@ struct Instance {
     std::vector<std::string> models;
     /** The /v1/models data entries, for the router's own listing. */
     std::string models_json;
+    /** The SRV name that listed it ("" for an address given as is). */
+    std::string srv;
+    /** Listed by `srv` before but not in its last answer: never picked
+     *  again unless the name lists it once more. */
+    bool gone = false;
 };
+
+/** The most instances a router keeps, SRV targets included. */
+inline constexpr std::size_t kMaxInstances = 1024;
 
 /** Router settings. */
 struct RouterConfig {
     std::string host = "0.0.0.0";
     int port = 8080;
-    /** Instances as host:port; a name is resolved on each connect. */
+    /** Instances as host:port (a name is resolved on each connect), or
+     * "srv:NAME": the targets of NAME's DNS SRV records (the lowest
+     * priority's), looked up again on every refresh, so instances
+     * join and leave with the record. An empty or failed answer keeps
+     * the targets the name listed last. */
     std::vector<std::string> instances;
+    /** The SRV lookup (tests set a fake); null: dns_srv_lookup. */
+    std::function<std::vector<pipeline::SrvTarget>(const std::string&)>
+        srv_lookup;
     /** How often /v1/models is fetched from each instance. */
     int refresh_ms = 10000;
     /** Load bound: an instance with more requests in flight than this
@@ -220,9 +237,17 @@ class Router {
     RouterConfig cfg_;
     auth::WallClock clock_;
     std::unique_ptr<auth::AuthClient> auth_;  ///< null: no key check
+    /** Adds the targets of every SRV name to inst_ and marks the ones
+     *  a name no longer lists as gone (run first by refresh). */
+    void expand_srv();
+
     mutable std::mutex mu_;
+    /** Only grows (under mu_), so an index stays the same instance. */
     std::vector<Instance> inst_;
-    std::vector<std::unique_ptr<Slot>> slots_;  ///< one per instance
+    /** One per instance, kMaxInstances allocated up front: adding an
+     *  instance never moves a Slot a request is using. */
+    std::unique_ptr<Slot[]> slots_;
+    std::vector<std::string> srv_names_;
     mutable std::atomic<std::uint64_t> rr_{0};
     std::unique_ptr<http::Server> server_;
     std::thread refresher_;
