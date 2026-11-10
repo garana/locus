@@ -763,6 +763,15 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         if (s.connecting || s.in_flight || s.cancelled) {
             return;
         }
+        // i#459: a reset connection dials its next downstream only once
+        // the next sequence sends something (reset_session no longer
+        // dials), so the dial meets the peer that sequence talks to.
+        if (s.out_fd < 0) {
+            if (!s.inbuf.empty()) {
+                try_dial(s);
+            }
+            return;
+        }
         Message in;
         std::string err;
         const Decode d = decode(s.inbuf, in, err);
@@ -857,12 +866,16 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         }
         s.dial_cursor = cursor;  // round-robin seed, as at accept
         cursor = (cursor + 1) % pool_live.size();
-        try_dial(s);  // start the next downstream dial (out_fd was closed)
+        // i#459: no dial here. pump dials once the next sequence sends
+        // its first bytes; dialing now would reach whatever listens at
+        // that moment (for a last stage, a driver that has just exited
+        // or the next one, before any of its sessions exists), and on a
+        // pooled fd it would reuse a peer that may already be gone.
         // decode() already consumed the SESSION_END frame (message.cpp
         // erases it on kComplete), so this pump sees only the NEXT
         // sequence's buffered bytes -- not SESSION_END again, which would
         // cycle release/reset forever.
-        pump(s);      // process any already-buffered next-sequence frames
+        pump(s);      // dial for any already-buffered next-sequence bytes
     };
 
     // i#21: the live peers, read on this thread when a report is due.

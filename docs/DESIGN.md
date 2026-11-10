@@ -704,6 +704,12 @@ and downstream) with the kernel's smoothed TCP round-trip time, read
 from `TCP_INFO` (Linux, FreeBSD) or `TCP_CONNECTION_INFO` (macOS)
 with no probe of its own (#21); `locus-stage --peer-log N` prints
 them every N seconds.
+A connection kept open across sequences (SESSION_END) dials its next
+downstream when the next sequence sends its first frame, not at the
+reset: a last stage's downstream is a driver, and a reset-time dial
+reached the driver that had just exited, or the next one before any of
+its sessions (#459). So a client sends its first token before it
+accepts the logits connection.
 
 A node separates I/O from compute (#24):
 
