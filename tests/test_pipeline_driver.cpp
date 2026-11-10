@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -14,6 +15,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/pipeline/driver.hpp"
+#include "locus/pipeline/message.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/tok/tokenizer.hpp"
 
@@ -258,4 +260,56 @@ TEST_CASE("locus-driver drives a multi-process stage chain",
     CHECK(r1 == 0);               // stage 1 process exited cleanly
     CHECK(res.complete);          // generation was not truncated
     REQUIRE(res.tokens == ref);   // byte-exact vs single-process greedy
+}
+
+// With several sessions on one chain (locus-driver --concurrent), a
+// crossed logits connection must end the run, not mix two streams:
+// drive_generation takes a kLogits frame only for its own request_id
+// and position. A fake last stage answers each token over a socketpair.
+TEST_CASE("drive_generation takes only its own request's logits",
+          "[pipeline]") {
+    using locus::pipeline::Message;
+    // rid_delta / pos_delta shift what the fake stage stamps on its
+    // replies; 0 / 0 is a correct chain.
+    auto run = [](std::uint64_t rid_delta, std::uint32_t pos_delta) {
+        int head[2], logits[2];
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, head) == 0);
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, logits) == 0);
+        std::thread stage([&] {
+            Message in;
+            while (locus::pipeline::read_message(head[1], in) ==
+                   locus::pipeline::ReadResult::kOk) {
+                std::vector<float> lg(4, 0.0f);
+                lg[2] = 1.0f;  // greedy picks token 2 every step
+                if (!locus::pipeline::write_message(
+                        logits[1],
+                        locus::pipeline::make_logits(
+                            in.request_id + rid_delta,
+                            in.position + pos_delta, std::move(lg)))) {
+                    break;
+                }
+            }
+            ::close(logits[1]);
+        });
+        locus::pipeline::DriverParams params;
+        params.request_id = 7;
+        params.max_tokens = 3;
+        const std::vector<locus::tok::TokenId> prompt{1, 3};
+        auto res = locus::pipeline::drive_generation(
+            head[0], logits[0], prompt, /*eos_id=*/0, params);
+        ::close(head[0]);  // EOF ends the fake stage's loop
+        stage.join();
+        ::close(head[1]);
+        ::close(logits[0]);
+        return res;
+    };
+    const auto ok = run(0, 0);
+    CHECK(ok.complete);
+    CHECK(ok.tokens == std::vector<locus::tok::TokenId>{2, 2, 2});
+    const auto other_request = run(1, 0);
+    CHECK_FALSE(other_request.complete);
+    CHECK(other_request.tokens.empty());
+    const auto other_position = run(0, 1);
+    CHECK_FALSE(other_position.complete);
+    CHECK(other_position.tokens.empty());
 }
