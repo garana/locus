@@ -687,7 +687,9 @@ class TransformerModel {
                  std::uint32_t layer) const;
 
     /** @returns The MoE hybrid state, or nullptr when the mode is off
-     *  (see MoeHybrid in transformer.cpp). */
+     *  (see MoeHybrid in transformer.cpp). The hot zone is sized once,
+     *  for the backend of the first call; after use_backend() moves to
+     *  another backend the mode stays off. */
     struct MoeHybrid* moe_hybrid() const;
     /**
      * Records one pick of expert `e` in the hybrid hot zone: frees the
