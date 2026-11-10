@@ -141,12 +141,18 @@ struct ClientOptions {
     /** Longest gap between two reads (not the whole response, which
      * for a video can take minutes). */
     int read_timeout_ms = 60000;
+    /** Longest wait for the server to take more request bytes. */
+    int write_timeout_ms = 60000;
     ResponseLimits limits;
 };
 
 /**
  * A blocking HTTP/1.1 client for one host:port, reusing one kept-alive
- * connection across requests. Not thread-safe: one per thread (the
+ * connection across requests. Before a request goes on a reused
+ * connection, a close by the server while it sat idle is noticed and a
+ * new connection is opened; a request is sent again after that only
+ * when it is idempotent (not a POST), so a reply cut short is never a
+ * second run on the server. Not thread-safe: one per thread (the
  * router keeps a pool of them).
  */
 class Client {
@@ -198,6 +204,11 @@ class Client {
 
   private:
     bool connect(std::string& err);
+    /** @returns whether the kept-alive connection is closed (or has
+     * stray bytes) on the server's side, without blocking. */
+    bool stale() const;
+    /** Sends all of `data`, waiting at most write_timeout_ms each time
+     * the server takes no more. */
     bool write_all(std::string_view data, std::string& err);
     /** Reads into buf_; @returns bytes read, 0 at EOF, -1 on error or
      * timeout (err set). */

@@ -77,17 +77,30 @@ struct RawServer {
     int listen_fd = -1;
     int port = 0;
     std::thread th;
-    RawServer(std::string reply, int hold_ms = 0) {
-        listen_fd = locus::pipeline::listen_on("127.0.0.1", 0, &port);
-        REQUIRE(listen_fd >= 0);
-        th = std::thread([this, reply = std::move(reply), hold_ms] {
+    /** The first read of the request (when `read_request`). */
+    std::string request;
+    /**
+     * @param host The address to listen on ("::1" for IPv6).
+     * @param read_request False: never read, so a large request body
+     *     fills the socket buffers and the client's write blocks.
+     */
+    RawServer(std::string reply, int hold_ms = 0,
+              const std::string& host = "127.0.0.1",
+              bool read_request = true) {
+        listen_fd = locus::pipeline::listen_on(host, 0, &port);
+        if (listen_fd < 0) return;  // the caller checks ok()
+        th = std::thread([this, reply = std::move(reply), hold_ms,
+                          read_request] {
             const int c = locus::pipeline::accept_one(listen_fd, nullptr,
                                                       3000);
             if (c < 0) return;
             char buf[4096];
-            // The request; its size does not matter here. GCC ignores a
-            // (void) cast on warn_unused_result, so keep the results.
-            [[maybe_unused]] const ssize_t got = ::read(c, buf, sizeof(buf));
+            // GCC ignores a (void) cast on warn_unused_result, so the
+            // results are kept.
+            if (read_request) {
+                const ssize_t got = ::read(c, buf, sizeof(buf));
+                if (got > 0) request.assign(buf, static_cast<std::size_t>(got));
+            }
             if (!reply.empty()) {
                 [[maybe_unused]] const ssize_t put =
                     ::write(c, reply.data(), reply.size());
@@ -100,9 +113,10 @@ struct RawServer {
         });
     }
     ~RawServer() {
-        th.join();
-        ::close(listen_fd);
+        if (th.joinable()) th.join();
+        if (listen_fd >= 0) ::close(listen_fd);
     }
+    bool ok() const { return listen_fd >= 0; }
 };
 
 }  // namespace
@@ -314,6 +328,72 @@ TEST_CASE("http client: a server restart between requests is retried once",
     const auto r = c.send(ClientRequest{"GET", "/2", {}, ""});
     REQUIRE(r.ok);
     CHECK(r.body == "ok /2");
+}
+
+TEST_CASE("http client: a POST after an idle close runs once", "[http_client]") {
+    // The server closes the kept-alive connection while it is idle; the
+    // client sees that before sending, so the POST goes once on a new
+    // connection (a POST is never sent twice).
+    std::atomic<int> posts{0};
+    locus::http::ServerConfig cfg = ServerFixture::config();
+    cfg.idle_timeout_ms = 100;
+    locus::http::Server s(cfg, [&](const locus::http::Request& req,
+                                   locus::http::ServerResponse& res,
+                                   const locus::http::RequestContext&) {
+        if (req.method == "POST") ++posts;
+        res.set_content("ok " + req.method, "text/plain");
+    });
+    const int port = s.start();
+    REQUIRE(port > 0);
+    Client c("127.0.0.1", port);
+    REQUIRE(c.send(ClientRequest{"POST", "/a", {}, "x"}).ok);
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    const auto r = c.send(ClientRequest{"POST", "/b", {}, "y"});
+    REQUIRE(r.ok);
+    CHECK(r.body == "ok POST");
+    CHECK(posts == 2);
+}
+
+TEST_CASE("http client: IPv6 Host, write deadline, interim cap",
+          "[http_client]") {
+    SECTION("an IPv6 literal goes in brackets in Host") {
+        RawServer raw("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+                      0, "::1");
+        if (!raw.ok()) SKIP("no IPv6 loopback");
+        Client c("::1", raw.port);
+        const auto r = c.send(ClientRequest{});
+        REQUIRE(r.ok);
+        CHECK(r.head.status == 204);
+        CHECK(raw.request.find("Host: [::1]:" + std::to_string(raw.port) +
+                               "\r\n") != std::string::npos);
+    }
+    SECTION("a server that stops reading trips the write deadline") {
+        RawServer raw("", 1500, "127.0.0.1", /*read_request=*/false);
+        REQUIRE(raw.ok());
+        locus::http::ClientOptions o;
+        o.write_timeout_ms = 200;
+        Client c("127.0.0.1", raw.port, o);
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto r = c.send(
+            ClientRequest{"POST", "/", {}, std::string(64 << 20, 'x')});
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        CHECK_FALSE(r.ok);
+        CHECK(r.error.find("write timed out") != std::string::npos);
+        CHECK(ms < 1200);
+    }
+    SECTION("endless interim responses are an error") {
+        std::string reply;
+        for (int i = 0; i < 20; ++i) reply += "HTTP/1.1 100 Continue\r\n\r\n";
+        reply += "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        RawServer raw(reply);
+        REQUIRE(raw.ok());
+        Client c("127.0.0.1", raw.port);
+        const auto r = c.send(ClientRequest{});
+        CHECK_FALSE(r.ok);
+        CHECK(r.error.find("interim") != std::string::npos);
+    }
 }
 
 TEST_CASE("http client: close-delimited bodies, refusals and timeouts",
