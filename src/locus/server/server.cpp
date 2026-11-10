@@ -1915,6 +1915,27 @@ void OpenAiServer::install_routes() {
                         payload += "data: " +
                                    chunk.dump(-1, ' ', false, kLossy) +
                                    "\n\n";
+                    } else {
+                        // The OpenAI stream ends with an empty delta
+                        // that carries the finish reason, as the
+                        // non-streamed reply does.
+                        const bool hit_eos =
+                            !v.generated.empty() &&
+                            v.generated.back() == tok_.eos_id();
+                        json last{{"index", 0},
+                                  {"finish_reason",
+                                   hit_eos ? "stop" : "length"}};
+                        if (chat) {
+                            last["delta"] = json::object();
+                        } else {
+                            last["text"] = "";
+                        }
+                        json chunk{{"id", rid},
+                                   {"object", sse_object},
+                                   {"choices", json::array({last})}};
+                        payload += "data: " +
+                                   chunk.dump(-1, ' ', false, kLossy) +
+                                   "\n\n";
                     }
                     payload += "data: [DONE]\n\n";
                     // Stream fully built from the snapshot v; drop the
