@@ -162,6 +162,15 @@ void on_unmap(const void* p, std::size_t n);
  * Single-threaded by contract: ops are called only from the
  * engine/model thread.
  */
+/** Whether the State singleton exists: set by its constructor, cleared
+ *  by its destructor, so a cache destroyed after the State at exit
+ *  does not touch it. */
+std::atomic<bool> g_state_alive{false};
+
+/** @returns Whether the State singleton is constructed and not torn
+ *  down. */
+bool state_alive() { return g_state_alive.load(); }
+
 struct State {
     VulkanContext ctx;
     WeightPool pool;
@@ -181,8 +190,10 @@ struct State {
         };
         // A model file unmapped drops the buffers over its pages.
         sys::set_unmap_hook(&on_unmap);
+        g_state_alive.store(true);
     }
     ~State() {
+        g_state_alive.store(false);
         sys::set_unmap_hook(nullptr);
         pool.report();
         ctx.report_profile();
@@ -214,7 +225,8 @@ struct State {
         }
         pool.transient_.clear();
         pool.used_ = 0;
-        // GPU-mapped KV pools: one per cache, never freed otherwise.
+        // GPU-mapped KV pools still live (vulkan_free_kv frees one when
+        // its cache goes).
         for (auto& [map, buf] : kv_pools) {
             ctx.destroy_buffer(buf);
         }
@@ -1493,6 +1505,27 @@ float* vulkan_alloc_kv(std::size_t n_floats) {
     return static_cast<float*>(map);
 }
 
+std::size_t vulkan_kv_pool_count() {
+    if (!state_alive()) {
+        return 0;
+    }
+    std::lock_guard lk(state_mu());
+    return state().kv_pools.size();
+}
+
+void vulkan_free_kv(float* pool) {
+    if (pool == nullptr || !state_alive()) {
+        return;
+    }
+    std::lock_guard lk(state_mu());
+    State& s = state();
+    const auto it = s.kv_pools.find(pool);
+    if (it != s.kv_pools.end()) {
+        s.ctx.destroy_buffer(it->second);
+        s.kv_pools.erase(it);
+    }
+}
+
 void vulkan_reset_state() {
     std::lock_guard lk(state_mu());
     state().free_buffers();
@@ -1601,6 +1634,7 @@ const Ops& vulkan_image_ops() {
                          .matvec_batch = &matvec_batch_vulkan,
                          .self_parallel = true,
                          .alloc_kv = nullptr,
+                         .free_kv = nullptr,
                          .prefetch = nullptr,
                          .evict = nullptr,
                          .pool_budget = nullptr,

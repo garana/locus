@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -64,9 +65,14 @@ class PagedKvCache {
     /**
      * Uses caller-provided storage (e.g. a GPU-mapped buffer on
      * unified memory) instead of allocating. `storage` must hold
-     * pool_floats(geom) floats and outlive the cache. F32 only.
+     * pool_floats(geom) floats. F32 only.
+     *
+     * @param release When not null, called with `storage` when the
+     *     cache is destroyed (the cache then owns the storage);
+     *     otherwise the storage must outlive the cache.
      */
-    PagedKvCache(const Geometry& geom, float* storage);
+    PagedKvCache(const Geometry& geom, float* storage,
+                 void (*release)(float*) = nullptr);
 
     /**
      * Quantized counterpart: wraps caller-provided GPU-mapped byte
@@ -75,8 +81,12 @@ class PagedKvCache {
      * hold pool_bytes(geom) bytes and outlive the cache. Requires a
      * quantized kv_type. The CPU codec (store_row/load_row) still
      * works against it, so it is unit-testable without a GPU.
+     *
+     * @param release As for the float overload; called with `storage`
+     *     reinterpreted as the float* an allocator handed out.
      */
-    PagedKvCache(const Geometry& geom, std::uint8_t* storage);
+    PagedKvCache(const Geometry& geom, std::uint8_t* storage,
+                 void (*release)(float*) = nullptr);
 
     /** @returns Floats an F32 pool for this geometry occupies. */
     static std::size_t pool_floats(const Geometry& geom) {
@@ -218,6 +228,9 @@ class PagedKvCache {
     std::vector<std::uint8_t> qpool_;
     /** Points at qpool_.data() or the external byte storage. */
     std::uint8_t* qpool_ptr_ = nullptr;
+    /** External storage the cache releases when destroyed (null when
+     *  owned here or when the caller keeps it). */
+    std::unique_ptr<float, void (*)(float*)> external_{nullptr, nullptr};
 };
 
 }  // namespace locus::kv

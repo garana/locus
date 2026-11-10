@@ -36,8 +36,12 @@ PagedKvCache::PagedKvCache(const Geometry& geom)
     }
 }
 
-PagedKvCache::PagedKvCache(const Geometry& geom, float* storage)
+PagedKvCache::PagedKvCache(const Geometry& geom, float* storage,
+                           void (*release)(float*))
     : PagedKvCache(geom) {
+    if (release != nullptr) {
+        external_ = {storage, release};
+    }
     if (quantized()) {
         throw std::invalid_argument(
             "float external storage requires an F32 KV cache");
@@ -48,8 +52,12 @@ PagedKvCache::PagedKvCache(const Geometry& geom, float* storage)
 }
 
 PagedKvCache::PagedKvCache(const Geometry& geom,
-                           std::uint8_t* storage)
+                           std::uint8_t* storage,
+                           void (*release)(float*))
     : PagedKvCache(geom) {
+    if (release != nullptr) {
+        external_ = {reinterpret_cast<float*>(storage), release};
+    }
     if (!quantized()) {
         throw std::invalid_argument(
             "byte external storage requires a quantized KV cache");

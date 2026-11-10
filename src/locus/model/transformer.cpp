@@ -657,7 +657,8 @@ kv::PagedKvCache TransformerModel::make_cache(
             float* storage = backend_->ops.alloc_kv(
                 kv::PagedKvCache::pool_floats(geom));
             if (storage != nullptr) {
-                return kv::PagedKvCache(geom, storage);
+                return kv::PagedKvCache(geom, storage,
+                                        backend_->ops.free_kv);
             }
         } else {
             // R14 #45: quantized GPU-mapped KV pool. Size the float
@@ -670,7 +671,8 @@ kv::PagedKvCache TransformerModel::make_cache(
                 backend_->ops.alloc_kv((bytes + 3) / 4);
             if (storage != nullptr) {
                 return kv::PagedKvCache(
-                    geom, reinterpret_cast<std::uint8_t*>(storage));
+                    geom, reinterpret_cast<std::uint8_t*>(storage),
+                    backend_->ops.free_kv);
             }
         }
     }
