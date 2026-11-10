@@ -111,6 +111,9 @@ def merged_deltas(path):
 
     @returns [(layer, merged minus base weight)], sorted by layer.
     """
+    # Seeded: merged minus base rounds by the base's values, so an
+    # unseeded base changes the reference's last bits on every run.
+    torch.manual_seed(372)
     model = FluxTransformer2DModel(**CFG).eval()
     # A dict, not the path: the loader then takes no Hub code path.
     sd, alphas = FluxPipeline.lora_state_dict(load_file(path),

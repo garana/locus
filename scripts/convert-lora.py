@@ -13,7 +13,8 @@ flux.py writes it):
 
 Two key layouts are read, the ones diffusers 0.31 loads for FLUX:
 
-- diffusers / PEFT: "[transformer.]<layer>.lora_A.weight" and
+- diffusers / PEFT: "[transformer. | base_model.model.]<layer>
+  .lora_A.weight" and
   ".lora_B.weight", an optional "<layer>.alpha" (none means s = 1),
   for any 2D weight of the DiT;
 - kohya (sd-scripts): "lora_unet_<bfl_layer>.lora_down.weight",
@@ -61,11 +62,22 @@ def read_safetensors(path):
         hdr = json.loads(f.read(n))
     hdr.pop("__metadata__", None)
     mm = np.memmap(path, dtype=np.uint8, mode="r")
+    sizes = {"BF16": 2, "F16": 2, "F32": 4}
     out = {}
     for name, t in hdr.items():
         b0, b1 = t["data_offsets"]
-        raw = mm[8 + n + b0:8 + n + b1]
         shape = t["shape"] or [1]
+        if t["dtype"] not in sizes:
+            sys.exit("%s: unsupported dtype %s" % (name, t["dtype"]))
+        # A truncated or malformed file names its tensor here, rather
+        # than failing later in a reshape.
+        want = int(np.prod(shape)) * sizes[t["dtype"]]
+        if not 0 <= b0 <= b1 <= mm.size - 8 - n or b1 - b0 != want:
+            sys.exit("%s: data_offsets %d..%d do not hold %s %s (%d bytes) "
+                     "in a %d-byte data section" % (
+                         name, b0, b1, t["dtype"], shape, want,
+                         mm.size - 8 - n))
+        raw = mm[8 + n + b0:8 + n + b1]
         if t["dtype"] == "BF16":
             a = (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
         elif t["dtype"] in ("F16", "F32"):
@@ -178,8 +190,13 @@ def convert(sd, shapes):
             # kohya files always carry alpha; a missing one means s = 1.
             scale = alpha / rank if alpha is not None else 1.0
         else:
-            layer = module[len("transformer."):] \
-                if module.startswith("transformer.") else module
+            # diffusers saves "transformer.", a bare PEFT save
+            # "base_model.model.".
+            layer = module
+            for prefix in ("transformer.", "base_model.model."):
+                if layer.startswith(prefix):
+                    layer = layer[len(prefix):]
+                    break
             layers = [layer]
             scale = alpha / rank if alpha is not None else 1.0
         for layer in layers:
