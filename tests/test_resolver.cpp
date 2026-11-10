@@ -307,3 +307,33 @@ TEST_CASE("Resolver refreshes at the record TTL when DNS gives one",
     REQUIRE(calls == 7);
     REQUIRE(ttl_calls == asked);
 }
+
+// i#465: behind a caching forwarder the record TTL is the time left on
+// its entry and shrinks toward 0; the refresh waits at least
+// min_refresh_s, not 0.75 of a 2 s TTL.
+TEST_CASE("Resolver refreshes no sooner than min_refresh_s",
+          "[resolver]") {
+    FakeClock clk;
+    int calls = 0;
+    Resolver::LookupFn lk = [&](const std::string&) {
+        ++calls;
+        return std::vector<std::string>{"10.0.0.1"};
+    };
+    Resolver::TtlFn tf = [](const std::string&) {
+        return std::optional<int>(2);
+    };
+    Resolver::Options opt;
+    opt.min_refresh_s = 5;
+    Resolver r(opt, lk, clk.fn(), false, tf);
+
+    REQUIRE(r.resolve("s") == "10.0.0.1");
+    clk.now_ms = 1'600;  // past 0.75 x 2 s
+    r.refresh_now();
+    REQUIRE(calls == 1);  // held back by the floor
+    clk.now_ms = 4'900;
+    r.refresh_now();
+    REQUIRE(calls == 1);
+    clk.now_ms = 5'100;
+    r.refresh_now();
+    REQUIRE(calls == 2);
+}

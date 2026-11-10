@@ -121,6 +121,9 @@ Resolver::Resolver(Options opt, LookupFn lookup, ClockFn clock,
     if (opt_.refresh_frac <= 0.0 || opt_.refresh_frac > 1.0) {
         opt_.refresh_frac = 0.75;
     }
+    if (opt_.min_refresh_s < 0) {
+        opt_.min_refresh_s = 0;
+    }
     if (start_thread) {
         threaded_ = true;
         thread_ = std::thread(&Resolver::run, this);
@@ -162,8 +165,10 @@ std::int64_t Resolver::refresh_delay_ms(bool failed,
         // Short negative TTL: retry a bad name soon, but not every call.
         return std::min<std::int64_t>(ttl_ms(std::nullopt), 5000);
     }
-    return static_cast<std::int64_t>(
+    const auto delay = static_cast<std::int64_t>(
         static_cast<double>(ttl_ms(record_s)) * opt_.refresh_frac);
+    return std::max<std::int64_t>(
+        delay, static_cast<std::int64_t>(opt_.min_refresh_s) * 1000);
 }
 
 std::string Resolver::resolve(const std::string& host) {

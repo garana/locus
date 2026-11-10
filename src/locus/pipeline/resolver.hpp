@@ -39,6 +39,11 @@ class Resolver {
         int default_ttl_s = 30;      /**< TTL when no record TTL is known. */
         int max_ttl_s = 300;         /**< Cap on any TTL. */
         double refresh_frac = 0.75;  /**< Refresh at this fraction of TTL. */
+        /** Shortest wait between successful refreshes, s: a caching
+         * forwarder reports the time left on its entry, which shrinks to
+         * 0, so refresh_frac of it alone would refresh ever more often
+         * near each expiry (i#465). */
+        int min_refresh_s = 5;
     };
 
     /** Resolves a hostname to zero or more numeric IP strings. Empty on
