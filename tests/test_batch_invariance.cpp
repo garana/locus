@@ -129,18 +129,19 @@ TEST_CASE("a request decodes the same alone or batched",
 TEST_CASE("a request decodes the same alone or batched: Q8_0 and Q4_K_M",
           "[batch][invariance][e2e]") {
     // The scalar backend takes hours on these; stories260K covers it.
-    // On Vulkan a Q8_0 model is batch-invariant in batch-invariant mode
-    // (#432; the default on Apple GPUs only), which this leg turns on.
+    // On Vulkan a model is batch-invariant in batch-invariant mode
+    // (#432; the default on Apple GPUs only, and there not for a lone
+    // K-quant sequence), which these legs set.
+    struct Mode {
+        Mode() { locus::backend::vulkan_set_batch_invariant(true); }
+        ~Mode() { locus::backend::vulkan_reset_batch_invariant(); }
+    };
     DYNAMIC_SECTION("llama-3.2-1b-q8_0.gguf") {
-        const bool was = locus::backend::vulkan_batch_invariant();
-        locus::backend::vulkan_set_batch_invariant(true);
-        struct Restore {
-            bool was;
-            ~Restore() { locus::backend::vulkan_set_batch_invariant(was); }
-        } restore{was};
+        const Mode mode;
         check_model(kModels + "llama-3.2-1b-q8_0.gguf", 16, false);
     }
     DYNAMIC_SECTION("llama-3.2-1b-q4_k_m.gguf") {
+        const Mode mode;
         check_model(kModels + "llama-3.2-1b-q4_k_m.gguf", 16, false);
     }
 }

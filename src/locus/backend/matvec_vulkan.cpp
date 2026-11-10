@@ -1577,14 +1577,11 @@ void vulkan_free_kv(float* pool) {
 }
 
 namespace {
-std::atomic<int> g_batch_invariant{-1};  // -1: not read from the env yet
-}  // namespace
+// -1: not read from the env yet; 0 off; 1 on, set (env or
+// vulkan_set_batch_invariant); 2 on by the device default.
+std::atomic<int> g_batch_invariant{-1};
 
-void vulkan_set_batch_invariant(bool on) {
-    g_batch_invariant.store(on ? 1 : 0);
-}
-
-bool vulkan_batch_invariant() {
+int batch_invariant_state() {
     int v = g_batch_invariant.load();
     if (v < 0) {
         const char* e = std::getenv("LOCUS_VK_BATCH_INVARIANT");
@@ -1594,15 +1591,24 @@ bool vulkan_batch_invariant() {
             // On by default where a lone sequence was measured to cost
             // little in this mode: Apple GPUs (M2 Pro level, M4 Max
             // -5%); off elsewhere (V3D -33%, others not measured).
-            v = vulkan_device_name().find("Apple") != std::string::npos ? 1
+            v = vulkan_device_name().find("Apple") != std::string::npos ? 2
                                                                        : 0;
         }
         int expected = -1;
         g_batch_invariant.compare_exchange_strong(expected, v);
         v = g_batch_invariant.load();
     }
-    return v == 1;
+    return v;
 }
+}  // namespace
+
+void vulkan_set_batch_invariant(bool on) {
+    g_batch_invariant.store(on ? 1 : 0);
+}
+
+void vulkan_reset_batch_invariant() { g_batch_invariant.store(-1); }
+
+bool vulkan_batch_invariant() { return batch_invariant_state() >= 1; }
 
 void vulkan_reset_state() {
     std::lock_guard lk(state_mu());
@@ -2888,6 +2894,22 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
     const auto short_ok = [n](const Mat& w) {
         return small_batch_kernel(w, n) != Kernel::kCount_;
     };
+    // A lone sequence under the device default (not a set mode) keeps
+    // vulkan_forward on K-quant weights: their short-batch kernels cost
+    // it 9 to 11% on an M2 Pro (#436), against level for Q8_0.
+    const auto kquant = [](const Mat& w) {
+        return w.type == gguf::TensorType::kQ4_K ||
+               w.type == gguf::TensorType::kQ6_K;
+    };
+    if (n == 1 && batch_invariant_state() == 2 &&
+        (kquant(m.output_weight()) ||
+         std::ranges::any_of(m.layers(), [&](const auto& l) {
+             return kquant(l.wq) || kquant(l.wk) || kquant(l.wv) ||
+                    kquant(l.wo) || kquant(l.w_gate) || kquant(l.w_up) ||
+                    kquant(l.w_down);
+         }))) {
+        return false;
+    }
     if (n == 0 || n > State::kMultiMax || n > kSmallBatch ||
         cache.quantized() || hp.arch == model::Arch::kDeepseek2 ||
         hp.n_expert > 0 || !vulkan_forward_supported(m) ||
