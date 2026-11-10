@@ -44,12 +44,14 @@ std::pair<std::vector<TokenId>, std::vector<float>> run(
     locus::model::SamplingParams sp;
     sp.temperature = 0.8f;
     sp.top_p = 0.95f;
-    // No EOS, so every request runs n_gen tokens. 96 blocks of 16
-    // positions hold the largest batch (the 600-token prompt plus 7
-    // short ones and their tokens); the default, one full context
-    // window per Engine, does not fit a small GPU's memory.
+    // No EOS, so every request runs n_gen tokens. A 32-token prefill
+    // budget per step makes the 80-token prompt's chunks depend on the
+    // other requests. 32 blocks of 16 positions hold the largest batch;
+    // the default, one full context window per Engine, does not fit a
+    // small GPU's memory.
     locus::engine::Engine::Config cfg;
-    cfg.n_blocks = 96;
+    cfg.n_blocks = 32;
+    cfg.prefill_budget = 32;
     locus::engine::Engine engine(model, static_cast<TokenId>(-1), cfg);
     std::vector<std::uint64_t> ids;
     for (std::uint32_t i = 0; i < n_req; ++i) {
@@ -81,7 +83,8 @@ std::pair<std::vector<TokenId>, std::vector<float>> run_and_reset(
     return out;
 }
 
-void check_model(const std::string& path, std::uint32_t n_gen) {
+void check_model(const std::string& path, std::uint32_t n_gen,
+                 bool scalar = true) {
     if (!std::filesystem::exists(path)) {
         WARN(path + " absent: skipped");
         return;
@@ -89,7 +92,8 @@ void check_model(const std::string& path, std::uint32_t n_gen) {
     auto g = locus::gguf::GgufFile::open(path);
     auto model = TransformerModel::load(g);
     for (const auto& b : locus::backend::backends()) {
-        if (!b.available || !b.selectable) {
+        if (!b.available || !b.selectable ||
+            (!scalar && std::string_view(b.name) == "scalar")) {
             continue;
         }
         DYNAMIC_SECTION("backend " << b.name) {
@@ -97,7 +101,7 @@ void check_model(const std::string& path, std::uint32_t n_gen) {
             const bool vulkan = std::string_view(b.name) == "vulkan";
             // A short target, and one longer than a step's prefill
             // budget, so its chunks depend on the other requests.
-            for (const std::uint32_t len : {7u, 600u}) {
+            for (const std::uint32_t len : {7u, 80u}) {
                 const auto alone = run_and_reset(model, 1, len, n_gen, vulkan);
                 REQUIRE(alone.first.size() == n_gen);
                 for (const std::uint32_t n : {2u, 3u, 8u}) {
@@ -124,6 +128,7 @@ TEST_CASE("a request decodes the same alone or batched: Q8_0 and Q4_K_M",
           "[batch][invariance][e2e]") {
     for (const char* f :
          {"llama-3.2-1b-q8_0.gguf", "llama-3.2-1b-q4_k_m.gguf"}) {
-        DYNAMIC_SECTION(f) { check_model(kModels + f, 16); }
+        // The scalar backend takes hours on these; stories260K covers it.
+        DYNAMIC_SECTION(f) { check_model(kModels + f, 16, false); }
     }
 }
