@@ -750,6 +750,57 @@ TEST_CASE("router: a registered instance gets the key that names it",
     CHECK(a.header("Authorization") == "Bearer sk-a");
 }
 
+// i#388 step 6: "scan:CIDR:PORT" probes the range's addresses for a
+// locus /v1/models; the ones that answer are its instances (found, so
+// no "*" key), and a scan that no longer finds one drops it.
+TEST_CASE("router: a scan finds the instances on a range", "[router]") {
+    using UA = RouterConfig::UpstreamAuth;
+    auto a = std::make_unique<FakeInstance>(
+        "A", std::vector<std::string>{"text"}, "m");
+    FakeInstance b("B", {"text"}, "m");
+    RouterConfig cfg;
+    cfg.scan_every = 1;  // every refresh, for the test
+    cfg.upstream_auth = UA::kKey;
+    cfg.instance_keys = {{"*", "sk-wild"}};
+    const int a_port = a->port;
+    RouterFixture rf({"scan:127.0.0.1/32:" + std::to_string(a_port), b.addr()},
+                     cfg);
+    std::set<std::string> seen;
+    for (int i = 0; i < 20; ++i) {
+        const auto r = rf.post(
+            "/v1/completions",
+            json{{"prompt", "p" + std::to_string(i)}, {"max_tokens", 1}});
+        REQUIRE(r.ok);
+        REQUIRE(r.head.status == 200);
+        seen.insert(r.head.get_header_value("X-Instance"));
+    }
+    CHECK(seen == std::set<std::string>{"A", "B"});
+    CHECK(a->header("Authorization").empty());  // found: no "*" key
+    CHECK(b.header("Authorization") == "Bearer sk-wild");
+
+    // A stops answering: the next scan no longer lists it.
+    a.reset();
+    rf.router->refresh();
+    bool gone = false;
+    for (const auto& in : rf.router->instances()) {
+        if (in.port == a_port) gone = in.gone;
+    }
+    CHECK(gone);
+    const auto r = rf.post("/v1/completions",
+                           json{{"prompt", "x"}, {"max_tokens", 1}});
+    REQUIRE(r.ok);
+    CHECK(r.head.get_header_value("X-Instance") == "B");
+
+    for (const char* bad : {"scan:10.0.0.0/16:80", "scan:::1/128:80",
+                            "scan:10.0.0.0/24:0", "scan:10.0.0.0/24:x",
+                            "scan:10.0.0.0/24"}) {
+        CAPTURE(bad);
+        RouterConfig c;
+        c.instances = {bad};
+        CHECK_THROWS_AS(Router(c), std::invalid_argument);
+    }
+}
+
 TEST_CASE("router: registration is off without keys", "[router]") {
     FakeInstance b("B", {"text"}, "m");
     RouterFixture rf({b.addr()});

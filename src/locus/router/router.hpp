@@ -106,10 +106,11 @@ struct Instance {
     std::vector<std::string> models;
     /** The /v1/models data entries, for the router's own listing. */
     std::string models_json;
-    /** Found by SRV (not given as host:port). One entry per host:port,
-     *  whichever names list it. */
+    /** Found by a name: an SRV name or a scan entry (not given as
+     *  host:port). One entry per host:port, whichever names list it. */
     bool from_srv = false;
-    /** The SRV names whose last answer lists it, sorted. */
+    /** The SRV names and scan entries ("scan:CIDR:PORT") whose last
+     *  answer lists it, sorted. */
     std::vector<std::string> srv;
     /** Registered itself (POST /locus/register). */
     bool from_reg = false;
@@ -137,6 +138,12 @@ struct RouterConfig {
     /** The SRV lookup (tests set a fake); null: dns_srv_lookup. */
     std::function<std::vector<pipeline::SrvTarget>(const std::string&)>
         srv_lookup;
+    /** An instance may also be "scan:CIDR:PORT" (IPv4, at most 1024
+     * addresses, so /22 or longer): every address of the range is
+     * probed on PORT for a locus /v1/models, once at start and then
+     * every scan_every refreshes; the ones that answer are the
+     * instances of that entry until a scan no longer finds them. */
+    int scan_every = 6;
     /** Keys an instance may register itself with (POST /locus/register
      * and /locus/deregister, Authorization: Bearer KEY). Empty: registration
      * is off (404), since anyone who could register could take the
@@ -260,6 +267,25 @@ class Router {
     /** Adds the targets of every SRV name to inst_ and marks the ones
      *  a name no longer lists as gone (run first by refresh). */
     void expand_srv();
+    /** Probes every scan entry's addresses and merges the ones that
+     *  answer (run by refresh every scan_every refreshes). */
+    void scan();
+    /** Merges one source's current targets (an SRV name's answer, or
+     *  a scan's hits) into inst_: adds new host:ports, adds or drops
+     *  `name` from each found entry's names, and marks an entry gone
+     *  when no source lists it. Takes mu_. */
+    void merge_listing(const std::string& name,
+                       const std::vector<std::pair<std::string, int>>& targets);
+
+    /** One "scan:CIDR:PORT" entry. */
+    struct ScanSpec {
+        std::string name;      ///< the entry as given, as its source name
+        std::uint32_t first;   ///< the first address probed, host order
+        std::uint32_t count;   ///< addresses probed
+        int port;
+    };
+    std::vector<ScanSpec> scans_;
+    std::atomic<std::uint64_t> refreshes_{0};  ///< for scan_every
     /** POST /locus/register and /locus/deregister
      *  (RouterConfig::register_keys). */
     void registration(const http::Request& req, http::ServerResponse& res);

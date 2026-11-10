@@ -282,6 +282,37 @@ Router::Router(RouterConfig cfg)
             srv_names_.push_back(s.substr(4));
             continue;
         }
+        if (s.rfind("scan:", 0) == 0) {
+            // scan:CIDR:PORT, IPv4, at most 1024 addresses.
+            const std::size_t colon = s.rfind(':');
+            const auto cidr = colon > 5 ? pipeline::Cidr::parse(
+                                              s.substr(5, colon - 5))
+                                        : std::nullopt;
+            int port = 0;
+            const std::string p = s.substr(colon + 1);
+            const bool digits =
+                !p.empty() && p.size() <= 5 &&
+                std::all_of(p.begin(), p.end(), [](char c) {
+                    return c >= '0' && c <= '9';
+                });
+            if (digits) port = std::stoi(p);
+            if (!cidr || cidr->family != pipeline::AddrFamily::kV4 ||
+                cidr->bits < 22 || port <= 0 || port > 65535) {
+                throw std::invalid_argument(
+                    "bad scan entry " + s +
+                    ": scan:A.B.C.D/N:PORT, IPv4, N from 22 to 32");
+            }
+            const std::uint32_t net = (std::uint32_t{cidr->net[0]} << 24) |
+                                      (std::uint32_t{cidr->net[1]} << 16) |
+                                      (std::uint32_t{cidr->net[2]} << 8) |
+                                      cidr->net[3];
+            const std::uint32_t size = 1u << (32 - cidr->bits);
+            // A /31 or /32 has no network and broadcast addresses to skip.
+            const bool ends = cidr->bits < 31;
+            scans_.push_back({s, net + (ends ? 1u : 0u),
+                              size - (ends ? 2u : 0u), port});
+            continue;
+        }
         Instance in;
         if (!pipeline::parse_hostport(s, in.host, in.port) ||
             in.host.empty() || in.port <= 0) {
@@ -505,55 +536,112 @@ void Router::expand_srv() {
         // spreading (rendezvous and the load bound).
         int lo = all.front().priority;
         for (const auto& t : all) lo = std::min(lo, t.priority);
-        std::vector<pipeline::SrvTarget> picks;
-        for (auto& t : all) {
-            if (t.priority == lo) picks.push_back(std::move(t));
+        std::vector<std::pair<std::string, int>> picks;
+        for (const auto& t : all) {
+            if (t.priority == lo) picks.emplace_back(t.host, t.port);
         }
-        const auto listed = [&](const std::string& host, int port) {
-            return std::any_of(picks.begin(), picks.end(), [&](const auto& t) {
-                return t.host == host && t.port == port;
-            });
-        };
-        std::lock_guard lk(mu_);
-        const auto now = std::chrono::steady_clock::now();
-        // One entry per host:port: this name's answer adds or drops
-        // itself from each entry's names (an entry that registered
-        // itself counts as found too), and an entry neither a name nor
-        // a registration lists any more is gone (i#492).
-        for (auto& in : inst_) {
-            if (!in.from_srv && !in.from_reg) continue;  // static
-            auto it = std::lower_bound(in.srv.begin(), in.srv.end(), name);
-            const bool had = it != in.srv.end() && *it == name;
-            if (listed(in.host, in.port)) {
-                if (!had) in.srv.insert(it, name);
-                in.from_srv = true;
-            } else if (had) {
-                in.srv.erase(it);
-            }
-            in.gone = lapsed(in, now);
-            if (in.gone) in.healthy = false;
-        }
-        for (const auto& t : picks) {
-            const bool known = std::any_of(
-                inst_.begin(), inst_.end(), [&](const Instance& in) {
-                    return in.host == t.host && in.port == t.port;
-                });
-            if (known) continue;  // a static entry, or one listed above
-            if (inst_.size() == kMaxInstances) {
-                std::fprintf(stderr,
-                             "locus-router: %s lists more than %zu "
-                             "instances; %s:%d left out\n",
-                             name.c_str(), kMaxInstances, t.host.c_str(),
-                             t.port);
-                continue;
-            }
-            Instance in;
-            in.host = t.host;
-            in.port = t.port;
+        merge_listing(name, picks);
+    }
+}
+
+void Router::merge_listing(
+    const std::string& name,
+    const std::vector<std::pair<std::string, int>>& targets) {
+    const auto listed = [&](const std::string& host, int port) {
+        return std::any_of(targets.begin(), targets.end(), [&](const auto& t) {
+            return t.first == host && t.second == port;
+        });
+    };
+    std::lock_guard lk(mu_);
+    const auto now = std::chrono::steady_clock::now();
+    // One entry per host:port: this source's targets add or drop it
+    // from each entry's names (an entry that registered itself counts
+    // as found too), and an entry neither a name nor a registration
+    // lists any more is gone (i#492).
+    for (auto& in : inst_) {
+        if (!in.from_srv && !in.from_reg) continue;  // static
+        auto it = std::lower_bound(in.srv.begin(), in.srv.end(), name);
+        const bool had = it != in.srv.end() && *it == name;
+        if (listed(in.host, in.port)) {
+            if (!had) in.srv.insert(it, name);
             in.from_srv = true;
-            in.srv = {name};
-            inst_.push_back(std::move(in));
+        } else if (had) {
+            in.srv.erase(it);
         }
+        in.gone = lapsed(in, now);
+        if (in.gone) in.healthy = false;
+    }
+    for (const auto& [host, port] : targets) {
+        const bool known = std::any_of(
+            inst_.begin(), inst_.end(), [&](const Instance& in) {
+                return in.host == host && in.port == port;
+            });
+        if (known) continue;  // a static entry, or one listed above
+        if (inst_.size() == kMaxInstances) {
+            std::fprintf(stderr,
+                         "locus-router: %s lists more than %zu "
+                         "instances; %s:%d left out\n",
+                         name.c_str(), kMaxInstances, host.c_str(), port);
+            continue;
+        }
+        Instance in;
+        in.host = host;
+        in.port = port;
+        in.from_srv = true;
+        in.srv = {name};
+        inst_.push_back(std::move(in));
+    }
+}
+
+void Router::scan() {
+    for (const auto& sc : scans_) {
+        // Probe every address with a short connect timeout, 64 at a
+        // time: most addresses of a range answer nothing, and a scan
+        // must not hold up the refresh for minutes.
+        std::vector<char> hit(sc.count, 0);
+        std::atomic<std::uint32_t> next{0};
+        const auto worker = [&] {
+            for (std::uint32_t i; (i = next.fetch_add(1)) < sc.count;) {
+                const std::uint32_t a = sc.first + i;
+                Instance probe;
+                probe.host = std::to_string(a >> 24) + "." +
+                             std::to_string((a >> 16) & 255) + "." +
+                             std::to_string((a >> 8) & 255) + "." +
+                             std::to_string(a & 255);
+                probe.port = sc.port;
+                probe.from_srv = true;  // found: no "*" key (instance_key)
+                http::ClientOptions o;
+                o.connect_timeout_ms = 300;
+                o.read_timeout_ms = 2000;
+                http::Client c(probe.host, probe.port, o);
+                http::ClientRequest req{"GET", "/v1/models", {}, ""};
+                if (const std::string* key = instance_key(probe)) {
+                    req.headers.emplace_back("Authorization", "Bearer " + *key);
+                }
+                const auto r = c.send(req);
+                if (r.ok && r.head.status == 200) {
+                    const json j = json::parse(r.body, nullptr, false);
+                    hit[i] = j.is_object() && j.contains("data");
+                }
+            }
+        };
+        std::vector<std::thread> pool;
+        const std::uint32_t threads = std::min<std::uint32_t>(64, sc.count);
+        for (std::uint32_t t = 0; t < threads; ++t) pool.emplace_back(worker);
+        for (auto& t : pool) t.join();
+        std::vector<std::pair<std::string, int>> found;
+        for (std::uint32_t i = 0; i < sc.count; ++i) {
+            if (!hit[i]) continue;
+            const std::uint32_t a = sc.first + i;
+            found.emplace_back(std::to_string(a >> 24) + "." +
+                                   std::to_string((a >> 16) & 255) + "." +
+                                   std::to_string((a >> 8) & 255) + "." +
+                                   std::to_string(a & 255),
+                               sc.port);
+        }
+        // An empty scan is an answer (nothing listens there now), not
+        // a lookup failure, so it drops the entry's instances.
+        merge_listing(sc.name, found);
     }
 }
 
@@ -600,6 +688,10 @@ void Router::poll(Instance& in) const {
 
 void Router::refresh() {
     expand_srv();
+    if (!scans_.empty() &&
+        refreshes_.fetch_add(1) % std::max(1, cfg_.scan_every) == 0) {
+        scan();
+    }
     std::vector<Instance> seen;
     {
         std::lock_guard lk(mu_);
