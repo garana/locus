@@ -156,15 +156,26 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
         #error no dotprod
         #endif
         int main() { return 0; }" LOCUS_CC_DEFAULT_DOTPROD)
+    # Only the dot product on top of the baseline: the variant's TU
+    # also compiles header inline functions (the linker keeps one copy),
+    # so it must not enable anything else a v8.0 core lacks (v8.1 LSE
+    # atomics, v8.2 fp16). armv8.2-a+dotprod only where a compiler
+    # refuses the narrower form.
+    check_cxx_compiler_flag("-march=armv8-a+dotprod" LOCUS_CC_DOTPROD_V8)
     check_cxx_compiler_flag("-march=armv8.2-a+dotprod" LOCUS_CC_DOTPROD)
-    if(LOCUS_CC_DOTPROD AND
+    if(LOCUS_CC_DOTPROD_V8)
+        set(LOCUS_DOTPROD_FLAG "-march=armv8-a+dotprod")
+    else()
+        set(LOCUS_DOTPROD_FLAG "-march=armv8.2-a+dotprod")
+    endif()
+    if((LOCUS_CC_DOTPROD_V8 OR LOCUS_CC_DOTPROD) AND
        (NOT LOCUS_CC_DEFAULT_DOTPROD OR LOCUS_NEON_DOTPROD_VARIANT))
         list(APPEND LOCUS_SIMD_VARIANTS "neon_dotprod")
         target_sources(locus PRIVATE
             src/locus/backend/matvec_neon_dotprod.cpp)
         set_source_files_properties(
             src/locus/backend/matvec_neon_dotprod.cpp
-            PROPERTIES COMPILE_FLAGS "-march=armv8.2-a+dotprod")
+            PROPERTIES COMPILE_FLAGS "${LOCUS_DOTPROD_FLAG}")
         target_compile_definitions(locus PUBLIC
             LOCUS_HAS_NEON_DOTPROD_VARIANT=1)
     endif()
