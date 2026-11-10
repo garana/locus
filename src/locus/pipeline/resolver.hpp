@@ -141,4 +141,21 @@ class Resolver {
     std::thread thread_;
 };
 
+/** One target of a DNS SRV record (RFC 2782). */
+struct SrvTarget {
+    std::string host;  ///< the target name, without the trailing dot
+    int port = 0;
+    int priority = 0;  ///< lower is preferred
+    int weight = 0;
+};
+
+/**
+ * Looks up the SRV records of `name` (for example
+ * "_locus._tcp.example.com") with a plain DNS query (res_nquery, its
+ * own resolver state). A target of "." (no service there) is left out.
+ * @returns The targets in answer order; empty when DNS has no answer
+ *     or the query fails.
+ */
+std::vector<SrvTarget> dns_srv_lookup(const std::string& name);
+
 }  // namespace locus::pipeline

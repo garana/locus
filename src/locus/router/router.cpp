@@ -257,15 +257,27 @@ std::optional<Route> classify(std::string_view path, std::string_view body) {
     return r;
 }
 
-Router::Router(RouterConfig cfg) : cfg_(std::move(cfg)) {
+Router::Router(RouterConfig cfg)
+    : cfg_(std::move(cfg)), slots_(std::make_unique<Slot[]>(kMaxInstances)) {
     for (const auto& s : cfg_.instances) {
+        if (s.rfind("srv:", 0) == 0) {
+            if (s.size() == 4) {
+                throw std::invalid_argument("srv: needs a DNS name");
+            }
+            srv_names_.push_back(s.substr(4));
+            continue;
+        }
         Instance in;
         if (!pipeline::parse_hostport(s, in.host, in.port) ||
             in.host.empty() || in.port <= 0) {
             throw std::invalid_argument("bad instance address: " + s);
         }
+        if (inst_.size() == kMaxInstances) {
+            throw std::invalid_argument("more than " +
+                                        std::to_string(kMaxInstances) +
+                                        " instances");
+        }
         inst_.push_back(std::move(in));
-        slots_.push_back(std::make_unique<Slot>());
     }
     if (!cfg_.auth_helper_argv.empty()) {
         std::vector<std::unique_ptr<auth::HelperConnection>> conns;
@@ -359,7 +371,7 @@ std::vector<std::pair<std::string, std::string>> Router::upstream_headers(
 }
 
 std::shared_ptr<http::Client> Router::take(std::size_t i) {
-    Slot& s = *slots_[i];
+    Slot& s = slots_[i];
     {
         std::lock_guard lk(s.mu);
         if (!s.idle.empty()) {
@@ -381,7 +393,7 @@ std::shared_ptr<http::Client> Router::take(std::size_t i) {
 void Router::give(std::size_t i, std::shared_ptr<http::Client> c) {
     // A client whose server closed the connection reconnects on its
     // next request, so it is kept either way.
-    Slot& s = *slots_[i];
+    Slot& s = slots_[i];
     std::lock_guard lk(s.mu);
     if (static_cast<int>(s.idle.size()) < cfg_.pool_size) {
         s.idle.push_back(std::move(c));
@@ -438,13 +450,64 @@ void Router::wait() {
     if (server_) server_->wait();
 }
 
+void Router::expand_srv() {
+    for (const auto& name : srv_names_) {
+        auto all = cfg_.srv_lookup ? cfg_.srv_lookup(name)
+                                   : pipeline::dns_srv_lookup(name);
+        if (all.empty()) continue;  // keep what the name listed last
+        // RFC 2782: the lowest priority is used while it answers; the
+        // others are fallbacks. Weights are left to the router's own
+        // spreading (rendezvous and the load bound).
+        int lo = all.front().priority;
+        for (const auto& t : all) lo = std::min(lo, t.priority);
+        std::vector<pipeline::SrvTarget> picks;
+        for (auto& t : all) {
+            if (t.priority == lo) picks.push_back(std::move(t));
+        }
+        const auto listed = [&](const std::string& host, int port) {
+            return std::any_of(picks.begin(), picks.end(), [&](const auto& t) {
+                return t.host == host && t.port == port;
+            });
+        };
+        std::lock_guard lk(mu_);
+        for (auto& in : inst_) {
+            if (in.srv != name) continue;
+            in.gone = !listed(in.host, in.port);
+            if (in.gone) in.healthy = false;
+        }
+        for (const auto& t : picks) {
+            const bool known = std::any_of(
+                inst_.begin(), inst_.end(), [&](const Instance& in) {
+                    return in.host == t.host && in.port == t.port &&
+                           (in.srv == name || in.srv.empty());
+                });
+            if (known) continue;
+            if (inst_.size() == kMaxInstances) {
+                std::fprintf(stderr,
+                             "locus-router: %s lists more than %zu "
+                             "instances; %s:%d left out\n",
+                             name.c_str(), kMaxInstances, t.host.c_str(),
+                             t.port);
+                continue;
+            }
+            Instance in;
+            in.host = t.host;
+            in.port = t.port;
+            in.srv = name;
+            inst_.push_back(std::move(in));
+        }
+    }
+}
+
 void Router::refresh() {
+    expand_srv();
     std::vector<Instance> seen;
     {
         std::lock_guard lk(mu_);
         seen = inst_;
     }
     for (auto& in : seen) {
+        if (in.gone) continue;
         http::ClientOptions o;
         o.connect_timeout_ms = 2000;
         o.read_timeout_ms = 5000;
@@ -487,8 +550,17 @@ void Router::refresh() {
             in.models_json = j["data"].dump();
         }
     }
+    // Field by field and by index: inst_ may have grown meanwhile (it
+    // only grows), and a name may have dropped one of these since.
     std::lock_guard lk(mu_);
-    inst_ = std::move(seen);
+    for (std::size_t i = 0; i < seen.size(); ++i) {
+        Instance& in = inst_[i];
+        if (in.gone) continue;
+        in.healthy = seen[i].healthy;
+        in.kinds = std::move(seen[i].kinds);
+        in.models = std::move(seen[i].models);
+        in.models_json = std::move(seen[i].models_json);
+    }
 }
 
 std::vector<Instance> Router::instances() const {
@@ -502,7 +574,7 @@ std::vector<int> Router::candidates(const Route& route) const {
         std::lock_guard lk(mu_);
         for (std::size_t i = 0; i < inst_.size(); ++i) {
             const Instance& in = inst_[i];
-            if (!in.healthy ||
+            if (in.gone || !in.healthy ||
                 std::find(in.kinds.begin(), in.kinds.end(), route.kind) ==
                     in.kinds.end()) {
                 continue;
@@ -545,12 +617,12 @@ std::vector<int> Router::candidates(const Route& route) const {
     // average in-flight count (counting this request) goes last.
     int total = 0;
     for (const int i : c) {
-        total += slots_[static_cast<std::size_t>(i)]->inflight.load();
+        total += slots_[static_cast<std::size_t>(i)].inflight.load();
     }
     const int cap = static_cast<int>(std::ceil(
         cfg_.load_factor * (total + 1) / static_cast<double>(c.size())));
     std::stable_partition(c.begin(), c.end(), [&](int i) {
-        return slots_[static_cast<std::size_t>(i)]->inflight.load() < cap;
+        return slots_[static_cast<std::size_t>(i)].inflight.load() < cap;
     });
     return c;
 }
@@ -607,23 +679,23 @@ void Router::metrics(http::ServerResponse& res) const {
            [&](std::size_t i) { return u(inst[i].second ? 1 : 0); });
     family("locus_router_requests_total",
            "Requests the instance answered through the router.", "counter",
-           [&](std::size_t i) { return u(slots_[i]->requests.load()); });
+           [&](std::size_t i) { return u(slots_[i].requests.load()); });
     family("locus_router_upstream_errors_total",
            "Requests that failed toward the instance (connect, a reply cut "
            "short).",
            "counter",
-           [&](std::size_t i) { return u(slots_[i]->errors.load()); });
+           [&](std::size_t i) { return u(slots_[i].errors.load()); });
     family("locus_router_client_left_total",
            "Streams the client left before the end; the upstream "
            "connection was closed, so the instance stopped the work.",
            "counter",
-           [&](std::size_t i) { return u(slots_[i]->client_left.load()); });
+           [&](std::size_t i) { return u(slots_[i].client_left.load()); });
     family("locus_router_request_seconds_total",
            "Wall time of the requests sent to the instance.", "counter",
            [&](std::size_t i) {
                char buf[32];
                std::snprintf(buf, sizeof buf, "%.6f",
-                             static_cast<double>(slots_[i]->busy_ns.load()) /
+                             static_cast<double>(slots_[i].busy_ns.load()) /
                                  1e9);
                return std::string(buf);
            });
@@ -631,7 +703,7 @@ void Router::metrics(http::ServerResponse& res) const {
            "Requests in flight to the instance now.", "gauge",
            [&](std::size_t i) {
                return u(static_cast<std::uint64_t>(
-                   std::max(0, slots_[i]->inflight.load())));
+                   std::max(0, slots_[i].inflight.load())));
            });
     res.set_content(std::move(out), "text/plain; version=0.0.4");
 }
@@ -722,7 +794,7 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
     http::ResponseHead busy_head;
     for (const int ci : cands) {
         const auto i = static_cast<std::size_t>(ci);
-        Slot& slot = *slots_[i];
+        Slot& slot = slots_[i];
         ++slot.inflight;
         // Released when the request is done here, or when the stream
         // provider that holds it is gone; it also adds the wall time.
@@ -792,9 +864,9 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
                             err)) {
                         give(i, std::move(client));
                     } else if (left) {
-                        ++slots_[i]->client_left;
+                        ++slots_[i].client_left;
                     } else {
-                        ++slots_[i]->errors;
+                        ++slots_[i].errors;
                     }
                 });
             return;

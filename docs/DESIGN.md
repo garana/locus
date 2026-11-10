@@ -152,7 +152,11 @@ connection, resent once when the server closed it while idle.
 `locus-router` (`router::Router`) proxies each request to one of
 several instances by kind: text, image-to-text (a chat, messages or
 responses body with an image part), image, video or speech, from the
-path and, for chat, the body. An instance lists its kinds in
+path and, for chat, the body. The instances are given as host:port or
+as `srv:NAME`, whose DNS SRV targets (the lowest priority's) are
+looked up again on every refresh, so instances join and leave with the
+record; one that leaves is never picked again, and an empty answer
+keeps the last list. An instance lists its kinds in
 `/v1/models` (`locus_kinds`), which the router reads at start and
 every `--refresh-ms`; a request that names a listed model goes to that
 instance. Buffered replies are forwarded whole; a chunked one (SSE)
