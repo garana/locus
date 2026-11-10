@@ -980,7 +980,6 @@ void TransformerModel::forward_layers(tok::TokenId token,
         apply_norm(ws.x, lay.attn_norm, hp_.rms_eps, ws.xb);
         lap.lap(l, Stage::kNorm);
         spec_->attention(*this, lay, cache, seq, ws, l, pos);
-        cache.sync_rows(seq, l, pos, 1);
         matvec_mt(op, lay.wo, ws.out, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
             ws.x[i] += ws.xb2[i];
@@ -1292,16 +1291,21 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
             }
             cache.sync_rows(seq, l, base, n);
             // Every row is stored, so all (token, head) pairs attend in
-            // one dispatch.
-            gqa_attend_batch(
-                qb.data(), xb2.data(), E, n, base, hp_.n_heads, hd, group,
-                hp_.kq_scale,
-                [&](std::uint32_t p) -> const float* {
-                    return cache.k(seq, l, p);
-                },
-                [&](std::uint32_t p) -> const float* {
-                    return cache.v(seq, l, p);
-                });
+            // one dispatch: on the GPU over the device KV mirror when
+            // there is one (the same bits per token as the decode path),
+            // else on the host.
+            if (!device_gqa_attend(op, cache, seq, l, hp_, base, n,
+                                   qb.data(), xb2.data(), E)) {
+                gqa_attend_batch(
+                    qb.data(), xb2.data(), E, n, base, hp_.n_heads, hd,
+                    group, hp_.kq_scale,
+                    [&](std::uint32_t p) -> const float* {
+                        return cache.k(seq, l, p);
+                    },
+                    [&](std::uint32_t p) -> const float* {
+                        return cache.v(seq, l, p);
+                    });
+            }
             matvec_batch(op, lay.wo, xb2, qb, n);
             for (std::size_t i = 0; i < static_cast<std::size_t>(n) * E;
                  ++i) {
@@ -1318,7 +1322,6 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                            ws.xb);
                 lap.lap(l, Stage::kNorm);
                 spec_->attention(*this, lay, cache, seq, ws, l, base + t);
-                cache.sync_rows(seq, l, base + t, 1);
                 matvec_mt(op, lay.wo, ws.out, ws.xb2);
                 for (std::uint32_t i = 0; i < E; ++i) {
                     x[o + i] += ws.xb2[i];
@@ -1472,7 +1475,6 @@ void TransformerModel::forward_batch_decode(
             lap.lap(l, Stage::kNorm);
             spec_->attention(*this, lay, cache, *seqs[t], ws, l,
                              pos[t]);
-            cache.sync_rows(*seqs[t], l, pos[t], 1);
             matvec_mt(op, lay.wo, ws.out, ws.xb2);
             for (std::uint32_t i = 0; i < E; ++i) {
                 x[o + i] += ws.xb2[i];
@@ -1606,7 +1608,6 @@ void TransformerModel::forward_batch_layers(
                        ws.xb);
             lap.lap(l, Stage::kNorm);
             spec_->attention(*this, lay, cache, *seqs[t], ws, l, pos[t]);
-            cache.sync_rows(*seqs[t], l, pos[t], 1);
             matvec_mt(op, lay.wo, ws.out, ws.xb2);
             for (std::uint32_t i = 0; i < E; ++i) {
                 x[o + i] += ws.xb2[i];

@@ -7,6 +7,8 @@
 
 namespace locus::backend {
 
+struct KvAttend;  // registry.hpp
+
 #if defined(__aarch64__)
 /**
  * NEON-vectorized matvec: F32 and Q8_0 rows use NEON inner loops;
@@ -397,6 +399,16 @@ bool cuda_kv_mirror_load(const void* dev, std::size_t off, float* dst,
 
 /** Frees a cuda_kv_mirror_alloc allocation. */
 void cuda_kv_mirror_free(void* dev);
+
+/**
+ * GQA attention on the GPU over a cuda_kv_mirror_alloc mirror
+ * (Ops.kv_attend): one block per (KV head, query), so a query's output
+ * does not depend on how many queries share the launch. Sums in another
+ * order than the host's gqa_head, so it matches it to rounding, not bits.
+ * @returns false on a CUDA error or an unsupported shape (always on
+ *     non-CUDA builds).
+ */
+bool cuda_kv_attend(const KvAttend& a);
 
 /**
  * CUDA 1D convolution (F32), the device half of the conv1d scalar

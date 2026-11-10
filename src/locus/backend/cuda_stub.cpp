@@ -3,6 +3,7 @@
 // Keeps registry.cpp linking on non-CUDA hosts: matvec delegates to
 // the scalar reference and the backend reports itself unusable.
 
+#include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 
 #ifndef LOCUS_HAS_CUDA
@@ -39,6 +40,8 @@ bool cuda_kv_mirror_load(const void*, std::size_t, float*, std::size_t) {
 }
 
 void cuda_kv_mirror_free(void*) {}
+
+bool cuda_kv_attend(const KvAttend&) { return false; }
 
 void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n) {

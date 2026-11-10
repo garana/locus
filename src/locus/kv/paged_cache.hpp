@@ -221,6 +221,17 @@ class PagedKvCache {
     /** @returns The mirror's device pointer, or nullptr without one. */
     const void* mirror_data() const { return mirror_.get(); }
 
+    /** F32 pool layout, for a device reader of the mirror: floats per
+     *  block, and per (block, layer) with K rows in the first half and
+     *  V rows in the second. */
+    std::size_t block_floats() const { return block_stride_; }
+    std::size_t layer_floats() const { return layer_stride_; }
+
+    /** @returns Float offset of absolute `layer` inside a block. */
+    std::size_t layer_offset(std::uint32_t layer) const {
+        return std::size_t{layer - geom_.layer_base} * layer_stride_;
+    }
+
     /**
      * Pushes the K and V rows of positions [pos, pos + n) of `layer`
      * from the host pool to the mirror. No-op without a mirror. A

@@ -7,6 +7,8 @@
 #include <vector>
 
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/registry.hpp"
+#include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/sys/thread_pool.hpp"
 
@@ -122,6 +124,44 @@ void gqa_attend_batch(const float* q, float* out, std::size_t q_stride,
             item(i);
         }
     });
+}
+
+/**
+ * GQA attention on the backend's device KV mirror (i#466) for n queries
+ * of seq at positions base .. base + n - 1, laid out as gqa_attend_batch
+ * lays them out. Their K and V rows must be synced to the mirror first.
+ *
+ * @returns false when the cache has no mirror, the backend no kv_attend,
+ *     or the device call fails; the caller then attends on the host.
+ */
+inline bool device_gqa_attend(const backend::Ops& op,
+                              const kv::PagedKvCache& cache,
+                              const kv::PagedKvCache::Seq& seq,
+                              std::uint32_t layer, const Hparams& hp,
+                              std::uint32_t base, std::uint32_t n,
+                              const float* q, float* out,
+                              std::size_t q_stride) {
+    if (op.kv_attend == nullptr || cache.mirror_data() == nullptr) {
+        return false;
+    }
+    backend::KvAttend a;
+    a.mirror = cache.mirror_data();
+    a.blocks = seq.blocks.data();
+    a.n_blocks = static_cast<std::uint32_t>(seq.blocks.size());
+    a.block_stride = cache.block_floats();
+    a.layer_off = cache.layer_offset(layer);
+    a.v_off = cache.layer_floats() / 2;
+    a.block_tokens = cache.geometry().block_tokens;
+    a.n_heads = hp.n_heads;
+    a.n_kv_heads = hp.n_kv_heads;
+    a.head_dim = hp.head_dim;
+    a.kq_scale = hp.kq_scale;
+    a.n_q = n;
+    a.base = base;
+    a.q = q;
+    a.out = out;
+    a.q_stride = q_stride;
+    return op.kv_attend(a);
 }
 
 }  // namespace locus::model
