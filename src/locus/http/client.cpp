@@ -1,5 +1,6 @@
 #include "locus/http/client.hpp"
 
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -337,12 +338,50 @@ bool Client::connect(std::string& err) {
     return true;
 }
 
+bool Client::stale() const {
+    pollfd p{fd_, POLLIN, 0};
+    if (::poll(&p, 1, 0) <= 0) return false;  // nothing pending: alive
+    // Readable while idle: the server closed (0) or sent bytes no
+    // request asked for; either way the connection is not reusable.
+    char c;
+    const ssize_t n = ::recv(fd_, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+    return n >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK);
+}
+
 bool Client::write_all(std::string_view data, std::string& err) {
+    // Non-blocking sends with a poll between them, so a server that
+    // stops reading a large body trips the write deadline. The socket
+    // is non-blocking only for the write (MSG_DONTWAIT is not honoured
+    // on a blocking socket everywhere).
+    const int flags = ::fcntl(fd_, F_GETFL, 0);
+    if (flags >= 0) ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+    struct Restore {
+        int fd, flags;
+        ~Restore() {
+            if (flags >= 0) ::fcntl(fd, F_SETFL, flags);
+        }
+    } restore{fd_, flags};
     std::size_t off = 0;
     while (off < data.size()) {
         const ssize_t n =
             ::send(fd_, data.data() + off, data.size() - off, kSendFlags);
         if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            pollfd p{fd_, POLLOUT, 0};
+            const int timeout =
+                opt_.write_timeout_ms > 0 ? opt_.write_timeout_ms : -1;
+            const int r = ::poll(&p, 1, timeout);
+            if (r < 0 && errno == EINTR) continue;
+            if (r == 0) {
+                err = "write timed out";
+                return false;
+            }
+            if (r < 0) {
+                err = std::string("poll failed: ") + std::strerror(errno);
+                return false;
+            }
+            continue;
+        }
         if (n <= 0) {
             err = std::string("write failed: ") + std::strerror(errno);
             return false;
@@ -431,7 +470,11 @@ ClientResponse Client::begin(const ClientRequest& req) {
         return res;
     }
     std::string out = req.method + " " + req.target + " HTTP/1.1\r\n";
-    out += "Host: " + host_ + ":" + std::to_string(port_) + "\r\n";
+    // An IPv6 literal goes in brackets (RFC 9110 section 7.2).
+    const bool v6 = host_.find(':') != std::string::npos &&
+                    (host_.empty() || host_.front() != '[');
+    out += "Host: " + (v6 ? "[" + host_ + "]" : host_) + ":" +
+           std::to_string(port_) + "\r\n";
     for (const auto& [k, v] : req.headers) {
         if (k.empty() || unsafe(k) || unsafe(v) || iequals(k, "Host") ||
             iequals(k, "Content-Length") ||
@@ -447,10 +490,20 @@ ClientResponse Client::begin(const ClientRequest& req) {
     out += "\r\n";
     out += req.body;
     const bool head_req = req.method == "HEAD";
+    // Safe to send twice: the server's state does not change (RFC 9110
+    // section 9.2.2).
+    const bool idempotent = req.method == "GET" || req.method == "HEAD" ||
+                            req.method == "PUT" || req.method == "DELETE" ||
+                            req.method == "OPTIONS";
+    // Interim 1xx responses before the real head, at most.
+    constexpr int kMaxInterim = 8;
 
-    // A kept-alive connection may have been closed by the server while
-    // idle; then the write or the first read fails with nothing read,
-    // and the request is sent once more on a new connection.
+    // A kept-alive connection the server closed while it sat idle is
+    // dropped before the request goes on it. If the close still races
+    // the send (the write fails, or the read sees the end with nothing
+    // read), the request is sent once more on a new connection, unless
+    // it is not idempotent and the write went through.
+    if (fd_ >= 0 && stale()) close();
     for (int attempt = 0;; ++attempt) {
         const bool reused = fd_ >= 0;
         if (!reused) {
@@ -468,6 +521,7 @@ ClientResponse Client::begin(const ClientRequest& req) {
         // The head, skipping interim 1xx responses (but not 101).
         ResponseHead head;
         bool got_any = !buf_.empty();
+        int interim = 0;
         for (;;) {
             const ParseResult pr =
                 parse_response_head(buf_, head_req, opt_.limits, head);
@@ -480,6 +534,11 @@ ClientResponse Client::begin(const ClientRequest& req) {
                 buf_.erase(0, pr.consumed);
                 if (head.status >= 100 && head.status < 200 &&
                     head.status != 101) {
+                    if (++interim > kMaxInterim) {
+                        close();
+                        res.error = "too many interim responses";
+                        return res;
+                    }
                     continue;  // interim; the real head follows
                 }
                 break;
@@ -487,7 +546,7 @@ ClientResponse Client::begin(const ClientRequest& req) {
             const long n = read_some(err);
             if (n <= 0) {
                 close();
-                if (reused && attempt == 0 && !got_any) break;
+                if (reused && attempt == 0 && !got_any && idempotent) break;
                 res.error = n == 0 ? "connection closed before a response"
                                    : err;
                 return res;
