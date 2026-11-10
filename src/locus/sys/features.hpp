@@ -14,6 +14,8 @@ namespace locus::sys {
 struct Features {
     /** ARM NEON (baseline on all arm64 targets). */
     bool neon = false;
+    /** ARM 8-bit dot product (sdot / udot, FEAT_DotProd). */
+    bool dotprod = false;
     /** x86-64 SSE4.1 detected on the running CPU. */
     bool sse4 = false;
     /** x86-64 AVX2 detected on the running CPU. */

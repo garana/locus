@@ -14,6 +14,14 @@
 #include "locus/backend/cpu_ops.hpp"
 
 namespace locus::backend {
+// matvec_neon_dotprod.cpp compiles this file again with the dot-product
+// extension enabled, into neon_dotprod:: (variants.hpp).
+#if defined(LOCUS_NEON_DOTPROD_VARIANT)
+namespace neon_dotprod {
+namespace self = ::locus::backend::neon_dotprod;
+#else
+namespace self = ::locus::backend;
+#endif
 
 namespace {
 /** f16 bits -> f32 through the hardware convert: exact for every
@@ -421,7 +429,7 @@ inline float unpack_block32_neon(gguf::TensorType type, const std::byte* blk,
  *  same exact integers through widening multiplies without it). */
 inline int32x4_t lanes32(int8x16_t qlo, int8x16_t qhi, const std::int8_t* x) {
     const int8x16_t xlo = vld1q_s8(x), xhi = vld1q_s8(x + 16);
-#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(__ARM_FEATURE_DOTPROD) || defined(LOCUS_NEON_DOTPROD_VARIANT)
     return vdotq_s32(vdotq_s32(vdupq_n_s32(0), qlo, xlo), qhi, xhi);
 #else
     auto d4 = [](int8x16_t a, int8x16_t b) {
@@ -517,7 +525,7 @@ void rows_block32_q8_0_xt(gguf::TensorType type, const std::byte* row,
 /** One sdot of 16 int8 pairs into four int32 lanes (widening
  *  multiplies without dotprod; the same exact integers). */
 inline int32x4_t dot16(int8x16_t a, int8x16_t b) {
-#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(__ARM_FEATURE_DOTPROD) || defined(LOCUS_NEON_DOTPROD_VARIANT)
     return vdotq_s32(vdupq_n_s32(0), a, b);
 #else
     const int16x8_t p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
@@ -800,7 +808,7 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
         thread_local std::vector<float> tmp;
         tmp.resize(w.rows);
         for (std::uint32_t t = 0; t < n; ++t) {
-            matvec_neon_q8k(w, x_batch.subspan(t * cols, cols), tmp);
+            self::matvec_neon_q8k(w, x_batch.subspan(t * cols, cols), tmp);
             for (std::uint32_t r = 0; r < w.rows; ++r) {
                 out_batch[std::size_t{r} * n + t] = tmp[r];
             }
@@ -1088,7 +1096,7 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
     thread_local std::vector<float> col;
     col.resize(w.rows);
     for (std::uint32_t t = 0; t < n; ++t) {
-        matvec_neon(
+        self::matvec_neon(
             w, x_batch.subspan(static_cast<std::size_t>(t) * cols,
                                cols),
             col);
@@ -1098,6 +1106,9 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
     }
 }
 
+#if defined(LOCUS_NEON_DOTPROD_VARIANT)
+}  // namespace neon_dotprod
+#endif
 }  // namespace locus::backend
 
 #endif  // __aarch64__

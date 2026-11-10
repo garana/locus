@@ -11,6 +11,10 @@
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
+#if defined(__linux__) && defined(__aarch64__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
 
 namespace locus::sys {
 
@@ -18,6 +22,15 @@ Features detect() {
     Features f;
 #if defined(__aarch64__)
     f.neon = true;
+#if defined(__APPLE__)
+    int dp = 0;
+    std::size_t dp_len = sizeof(dp);
+    f.dotprod = sysctlbyname("hw.optional.arm.FEAT_DotProd", &dp, &dp_len,
+                             nullptr, 0) == 0 &&
+                dp != 0;
+#elif defined(__linux__)
+    f.dotprod = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#endif
 #elif defined(__x86_64__)
     f.sse4 = __builtin_cpu_supports("sse4.1") != 0;
     f.avx2 = __builtin_cpu_supports("avx2") != 0;
@@ -98,7 +111,8 @@ std::string cpu_name() {
 
 std::string to_string(const Features& f) {
     auto mark = [](bool on) { return on ? "+" : "-"; };
-    return std::string("cpu[") + mark(f.neon) + "neon " + mark(f.sse4) +
+    return std::string("cpu[") + mark(f.neon) + "neon " + mark(f.dotprod) +
+           "dotprod " + mark(f.sse4) +
            "sse4 " + mark(f.avx2) + "avx2 " + mark(f.avx512f) +
            "avx512f] gpu[" + mark(f.vulkan) + "vulkan]";
 }

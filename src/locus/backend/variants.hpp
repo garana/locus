@@ -51,6 +51,25 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
  */
 void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
+
+#if defined(LOCUS_HAS_NEON_DOTPROD_VARIANT)
+/**
+ * The four NEON entry points above, compiled again with the 8-bit
+ * dot-product extension (matvec_neon_dotprod.cpp) for a build whose
+ * default target lacks it. Bit-identical to the baseline ones; the
+ * registry uses them when sys::detect() reports dotprod.
+ */
+namespace neon_dotprod {
+void matvec_neon(const Mat& w, std::span<const float> x,
+                 std::span<float> out);
+void matvec_neon_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out);
+void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
+                       std::span<float> out_batch, std::uint32_t n);
+void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
+                           std::span<float> out_batch, std::uint32_t n);
+}  // namespace neon_dotprod
+#endif
 #endif
 
 #if defined(__x86_64__)

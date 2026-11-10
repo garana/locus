@@ -147,9 +147,38 @@ target_include_directories(locus PUBLIC src)
 # ----------------------------------------------------------------
 include(CheckCXXCompilerFlag)
 
+option(LOCUS_NEON_DOTPROD_VARIANT
+       "Build the NEON dot-product variant even when the default target has dotprod"
+       OFF)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-    # NEON is baseline on arm64; nothing to probe.
+    # NEON is baseline on arm64. The 8-bit dot product (sdot) is not:
+    # when the default target lacks it (GCC on the Pi 5), build the
+    # NEON kernels again with it, picked at runtime on asimddp.
     set(LOCUS_SIMD_VARIANTS "neon")
+    include(CheckCXXSourceCompiles)
+    check_cxx_source_compiles("
+        #if !defined(__ARM_FEATURE_DOTPROD)
+        #error no dotprod
+        #endif
+        int main() { return 0; }" LOCUS_CC_DEFAULT_DOTPROD)
+    # The variant keeps the baseline flags and gives only its own
+    # functions the dot-product target (a pragma, see the file); the
+    # check compiles a vdotq_s32 call in a function with that target.
+    check_cxx_source_compiles("
+        #include <arm_neon.h>
+        __attribute__((target(\"arch=armv8.2-a+dotprod\")))
+        int32x4_t f(int32x4_t a, int8x16_t b, int8x16_t c) {
+            return vdotq_s32(a, b, c);
+        }
+        int main() { return 0; }" LOCUS_CC_DOTPROD_TARGET)
+    if(LOCUS_CC_DOTPROD_TARGET AND
+       (NOT LOCUS_CC_DEFAULT_DOTPROD OR LOCUS_NEON_DOTPROD_VARIANT))
+        list(APPEND LOCUS_SIMD_VARIANTS "neon_dotprod")
+        target_sources(locus PRIVATE
+            src/locus/backend/matvec_neon_dotprod.cpp)
+        target_compile_definitions(locus PUBLIC
+            LOCUS_HAS_NEON_DOTPROD_VARIANT=1)
+    endif()
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
