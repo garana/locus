@@ -21,18 +21,15 @@
 namespace locus::http {
 
 /**
- * First-party HTTP/1.1 connection server (issue 23, increment 2),
- * replacing the vendored httplib transport. It owns sockets; the parser
- * (increment 1) owns bytes. Model (A): one thread per connection, so a
- * handler may block (the engine does) without starving others. No routes
- * and no handler changes live here -- increment 3 ports the API routes
- * onto this, increment 4 makes httplib a tests-only dependency.
+ * First-party HTTP/1.1 connection server (issue 23). It owns sockets;
+ * the parser (http.hpp) owns bytes. Model (A): one thread per
+ * connection, so a handler may block (the engine does) without
+ * starving others. No routes live here: OpenAiServer installs them.
  *
- * Bounds, all explicit (httplib supplied these as defaults nobody on
- * this project chose; removing it removes them, so they are re-chosen):
+ * Bounds, all explicit and chosen for this server:
  * a fixed worker pool whose size IS the concurrency cap (excess
  * connections wait unread in the kernel's accept backlog, so they hold
- * no userspace buffer -- httplib's shape), a per-connection request cap,
+ * no userspace buffer), a per-connection request cap,
  * a head-receipt deadline, an idle-keep-alive timeout, and a per-write
  * deadline. There is deliberately NO whole-connection timeout: a long
  * streaming response is legitimate as long as each write makes progress
@@ -48,10 +45,9 @@ namespace locus::http {
  * rates (ingest and per-write) holds its worker for as long as it keeps
  * progressing, so the real bound on concurrent slow clients is
  * worker_threads itself -- worker_threads slow-but-legal connections can
- * occupy every worker and make others wait in the backlog. httplib had
- * the same exposure with the same pool shape; it is inherent to model
- * (A) and not removable with per-request bounds (an event loop would
- * change it).
+ * occupy every worker and make others wait in the backlog. That is
+ * inherent to model (A) and not removable with per-request bounds (an
+ * event loop would change it).
  */
 
 /**

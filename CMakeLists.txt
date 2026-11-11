@@ -123,7 +123,6 @@ add_library(locus
 )
 target_include_directories(locus SYSTEM PRIVATE
     third_party/ggml
-    third_party/httplib
     third_party/json
     third_party/llama
 )

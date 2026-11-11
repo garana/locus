@@ -133,14 +133,14 @@ tests; mmap read-only.
 
 ### 4.5 HTTP server
 
-Vendored cpp-httplib for HTTP and nlohmann/json for untrusted request
-bodies: hand-rolled JSON parsing is where API vulnerabilities come
-from. A worker thread drives `Engine::step()`; handler threads submit
-and wait (`EngineLoop`). Chat messages are formatted by
-`chat::ChatTemplate`: the GGUF's Jinja source is fingerprinted to a
-known family (llama3, chatml, llama2, zephyr, deepseek, deepseek2,
-deepseek-coder) and
-rendered by a hardcoded formatter; an unknown template falls back
+A first-party HTTP/1.1 server (`src/locus/http`) and vendored
+nlohmann/json for untrusted request bodies: hand-rolled JSON parsing
+is where API vulnerabilities come from. A worker thread drives
+`Engine::step()`; handler threads submit and wait (`EngineLoop`).
+Chat messages are formatted by `chat::ChatTemplate`: the GGUF's
+Jinja source is fingerprinted to a known family (llama3, chatml,
+llama2, zephyr, deepseek, deepseek2, deepseek-coder) and rendered by
+a hardcoded formatter; an unknown template falls back
 to plain concatenation. Endpoints that run the model on their own
 thread (images, vision chat, audio) share the GPU backend through one
 process-wide lock (#268). `http::Client` is the first-party client
@@ -245,7 +245,8 @@ The areas built after the MVP:
   default.
 - Vendored in-tree, pinned, sha256 recorded in the importing commit,
   license files alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
-  cpp-httplib v0.18.3 (MIT), nlohmann/json v3.11.3 (MIT), ggml's
+  cpp-httplib v0.18.3 (MIT, tests only: their HTTP client),
+  nlohmann/json v3.11.3 (MIT), ggml's
   IQ lookup tables (`third_party/ggml/iq_grids.h`, MIT) and llama.cpp's
   Unicode tables (`third_party/llama/unicode-data.{h,cpp}`, MIT, commit
   cd959bae9).

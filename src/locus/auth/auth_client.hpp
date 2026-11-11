@@ -39,7 +39,7 @@ struct AuthConfig {
  * and single-flight coalescing (concurrent resolves of the SAME
  * credential issue one helper request and share the answer). Also
  * pushes locus's request-lifecycle events to the helper over the same
- * sockets. Thread-safe: many httplib request threads share one
+ * sockets. Thread-safe: many http::Server worker threads share one
  * client. Fails CLOSED -- a timeout/broken helper resolves to deny
  * and is not cached (so a transient hiccup is not remembered).
  */
@@ -60,8 +60,8 @@ class AuthClient {
     AuthClient& operator=(const AuthClient&) = delete;
 
     /** Resolves `credential`. Cache hit is immediate; a miss issues
-     * (or joins) one helper request. Blocking (safe on an httplib
-     * request thread). */
+     * (or joins) one helper request. Blocking (safe on an http::Server
+     * worker thread). */
     Result resolve(const std::string& credential);
 
     /** Fire-and-forget push of a request-lifecycle event (create /
