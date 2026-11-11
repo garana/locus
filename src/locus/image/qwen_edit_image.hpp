@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <utility>
 #include <vector>
 
 #include "locus/image/image_input.hpp"
+#include "locus/image/qwen_vae.hpp"
 
 namespace locus::image {
 
@@ -55,5 +57,45 @@ struct EditReference {
  * @throws std::invalid_argument on an empty image.
  */
 EditReference qwen_edit_reference(const Rgb8& img);
+
+/**
+ * diffusers' QwenImageEditPipeline._pack_latents: 2 x 2 patches of
+ * [c][h][w] latents into one token each, tokens row-major over the
+ * (h / 2) x (w / 2) grid, a token's c * 4 values as [c][dy][dx].
+ *
+ * @throws std::invalid_argument on a size that does not match or an odd
+ *     side.
+ */
+std::vector<float> qwen_pack_latents(std::span<const float> z,
+                                     std::uint32_t c, std::uint32_t h,
+                                     std::uint32_t w);
+
+/** _unpack_latents: the inverse of qwen_pack_latents, back to
+ *  [c][h][w]. @throws std::invalid_argument on a bad size. */
+std::vector<float> qwen_unpack_latents(std::span<const float> tokens,
+                                       std::uint32_t c, std::uint32_t h,
+                                       std::uint32_t w);
+
+/** The reference image as the MMDiT's second segment (i#614). */
+struct EditLatents {
+    /** rows x cols tokens of z_dim * 4 values (qwen_pack_latents). */
+    std::vector<float> tokens;
+    /** The token grid: the latents' sides / 2. */
+    std::uint32_t rows = 0, cols = 0;
+};
+
+/**
+ * _encode_vae_image then _pack_latents: the VAE encoder's mean (the
+ * posterior's mode), normalized with the VAE's latents mean and std,
+ * packed into tokens.
+ *
+ * @param chw [3][h][w] in [-1, 1] (EditReference::vae_input).
+ * @param h, w Sides; multiples of 2 * vae.scale().
+ * @throws std::invalid_argument on a bad size or a VAE without its
+ *     encoder.
+ */
+EditLatents qwen_edit_reference_latents(const QwenVae& vae,
+                                        std::span<const float> chw,
+                                        std::uint32_t h, std::uint32_t w);
 
 }  // namespace locus::image
