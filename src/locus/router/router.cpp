@@ -284,6 +284,12 @@ Router::Router(RouterConfig cfg)
             srv_names_.push_back(s.substr(4));
             continue;
         }
+        if (s.rfind("mdns:", 0) == 0) {
+            // Validates the service name now (mdns_query throws).
+            pipeline::mdns_query(s.substr(5));
+            mdns_services_.push_back(s.substr(5));
+            continue;
+        }
         if (s.rfind("scan:", 0) == 0) {
             // scan:CIDR:PORT, IPv4, at most 1024 addresses.
             const std::size_t colon = s.rfind(':');
@@ -546,6 +552,17 @@ void Router::expand_srv() {
     }
 }
 
+void Router::expand_mdns() {
+    for (const auto& service : mdns_services_) {
+        auto all = cfg_.mdns_lookup ? cfg_.mdns_lookup(service)
+                                    : pipeline::mdns_browse(service, cfg_.mdns);
+        if (all.empty()) continue;  // keep what it listed last
+        std::vector<std::pair<std::string, int>> picks;
+        for (const auto& t : all) picks.emplace_back(t.host, t.port);
+        merge_listing("mdns:" + service, picks);
+    }
+}
+
 void Router::merge_listing(
     const std::string& name,
     const std::vector<std::pair<std::string, int>>& targets) {
@@ -690,6 +707,7 @@ void Router::poll(Instance& in) const {
 
 void Router::refresh() {
     expand_srv();
+    expand_mdns();
     if (!scans_.empty() &&
         refreshes_.fetch_add(1) % std::max(1, cfg_.scan_every) == 0) {
         scan();

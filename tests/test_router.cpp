@@ -757,6 +757,58 @@ TEST_CASE("router: a registered instance gets the key that names it",
 // i#388 step 6: "scan:CIDR:PORT" probes the range's addresses for a
 // locus /v1/models; the ones that answer are its instances (found, so
 // no "*" key), and a scan that no longer finds one drops it.
+// i#524: "mdns:SERVICE" lists the instances a DNS-SD browse finds, on
+// every refresh; an empty browse keeps them (lost packets), one the
+// browse stops listing drops out, and a found instance gets no "*" key.
+TEST_CASE("router: an mdns service lists the instances that answer",
+          "[router]") {
+    using locus::pipeline::SrvTarget;
+    using UA = RouterConfig::UpstreamAuth;
+    FakeInstance a("A", {"text"}, "m"), b("B", {"text"}, "m");
+    std::mutex mu;
+    std::vector<SrvTarget> answer = {{"127.0.0.1", a.port, 0, 0},
+                                     {"127.0.0.1", b.port, 0, 0}};
+    RouterConfig cfg;
+    cfg.upstream_auth = UA::kKey;
+    cfg.instance_keys = {{"*", "sk-wild"}};
+    cfg.mdns_lookup = [&](const std::string& service) {
+        CHECK(service == "_locus._tcp");
+        std::lock_guard lk(mu);
+        return answer;
+    };
+    RouterFixture rf({"mdns:_locus._tcp"}, cfg);
+    const auto reached = [&] {
+        std::set<std::string> seen;
+        for (int i = 0; i < 20; ++i) {
+            const auto r = rf.post(
+                "/v1/completions",
+                json{{"prompt", "p" + std::to_string(i)}, {"max_tokens", 1}});
+            REQUIRE(r.ok);
+            REQUIRE(r.head.status == 200);
+            seen.insert(r.head.get_header_value("X-Instance"));
+        }
+        return seen;
+    };
+    CHECK(reached() == std::set<std::string>{"A", "B"});
+    CHECK(a.header("Authorization").empty());  // found: no "*" key
+    const auto set = [&](std::vector<SrvTarget> v) {
+        {
+            std::lock_guard lk(mu);
+            answer = std::move(v);
+        }
+        rf.router->refresh();
+    };
+    set({});  // no answer this time: keep both
+    CHECK(reached() == std::set<std::string>{"A", "B"});
+    set({{"127.0.0.1", b.port, 0, 0}});  // A stopped answering
+    CHECK(reached() == std::set<std::string>{"B"});
+    for (const char* bad : {"mdns:", "mdns:a..b"}) {
+        RouterConfig c;
+        c.instances = {bad};
+        CHECK_THROWS(Router(c));
+    }
+}
+
 TEST_CASE("router: a scan finds the instances on a range", "[router]") {
     using UA = RouterConfig::UpstreamAuth;
     auto a = std::make_unique<FakeInstance>(

@@ -18,6 +18,7 @@
 #include "locus/auth/token_cache.hpp"
 #include "locus/http/client.hpp"
 #include "locus/http/server.hpp"
+#include "locus/pipeline/mdns.hpp"
 #include "locus/pipeline/resolver.hpp"
 
 namespace locus::router {
@@ -145,6 +146,15 @@ struct RouterConfig {
      * every scan_every refreshes; the ones that answer are the
      * instances of that entry until a scan no longer finds them. */
     int scan_every = 6;
+    /** An instance may also be "mdns:SERVICE" (for example
+     * "mdns:_locus._tcp"): the instances that answer a DNS-SD browse
+     * for SERVICE.local on the LAN, browsed again on every refresh.
+     * An empty answer keeps the instances it listed last (mDNS
+     * packets get lost); one it stops listing drops out. */
+    pipeline::MdnsBrowse mdns;
+    /** The browse (tests set a fake); null: pipeline::mdns_browse. */
+    std::function<std::vector<pipeline::SrvTarget>(const std::string&)>
+        mdns_lookup;
     /** Keys an instance may register itself with (POST /locus/register
      * and /locus/deregister, Authorization: Bearer KEY). Empty: registration
      * is off (404), since anyone who could register could take the
@@ -268,6 +278,9 @@ class Router {
     /** Adds the targets of every SRV name to inst_ and marks the ones
      *  a name no longer lists as gone (run first by refresh). */
     void expand_srv();
+    /** Browses every mdns: service and merges its answer (run by
+     *  refresh after expand_srv). */
+    void expand_mdns();
     /** Probes every scan entry's addresses and merges the ones that
      *  answer (run by refresh every scan_every refreshes). */
     void scan();
@@ -300,6 +313,8 @@ class Router {
      *  instance never moves a Slot a request is using. */
     std::unique_ptr<Slot[]> slots_;
     std::vector<std::string> srv_names_;
+    /** The services of the "mdns:SERVICE" entries. */
+    std::vector<std::string> mdns_services_;
     mutable std::atomic<std::uint64_t> rr_{0};
     std::unique_ptr<http::Server> server_;
     std::thread refresher_;
