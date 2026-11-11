@@ -223,7 +223,9 @@ a ResNet-50 or Inception-v3 from `scripts/convert-cnn.py`.
 
 Every backend is compiled into the one binary, and the best one the
 machine supports is picked at startup (on x86, avx2 before sse4). Pick
-one with `--backend NAME` or `LOCUS_BACKEND=NAME`.
+one with `--backend NAME` or `LOCUS_BACKEND=NAME`, and with `--backend
+vulkan` or `cuda` the GPU with `--device N` (`--backends` lists the
+Vulkan devices; the first is the default).
 
 | Backend | Runs                                                                                     |
 |---------|------------------------------------------------------------------------------------------|

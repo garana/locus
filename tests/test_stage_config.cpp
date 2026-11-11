@@ -413,6 +413,13 @@ TEST_CASE("resolve_device_binding: --device requires --backend cuda",
     b.device = {"0"};
     REQUIRE(resolve_device_binding(b, 1, db).find("--backend cuda") !=
             std::string::npos);
+    // Vulkan takes a device too (i#572).
+    StageOptions c;
+    c.backend = "vulkan";
+    c.device = {"1"};
+    REQUIRE(resolve_device_binding(c, 1, db).empty());
+    REQUIRE(db.device == 1);
+    REQUIRE(db.backend == "vulkan");
 }
 
 TEST_CASE("resolve_device_binding: a non-integer / negative device fails",

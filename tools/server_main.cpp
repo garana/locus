@@ -213,6 +213,11 @@ OpenAI + Anthropic compatible inference server (default port 8080):
 
     SignalStopper stopper;  // before any other thread starts
     try {
+        if (const std::string err = locus_tools::apply_device(args);
+            !err.empty()) {
+            std::fprintf(stderr, "%s: %s\n", argv[0], err.c_str());
+            return 2;
+        }
         auto g = locus::gguf::GgufFile::open(model_path);
         auto model = locus::model::TransformerModel::load(g);
         const auto& backend =

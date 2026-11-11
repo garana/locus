@@ -167,12 +167,15 @@ void on_unmap(const void* p, std::size_t n);
  *  does not touch it. */
 std::atomic<bool> g_state_alive{false};
 
+/** The device the State opens (vulkan_set_device; -1: the first). */
+std::atomic<int> g_vk_device{-1};
+
 /** @returns Whether the State singleton is constructed and not torn
  *  down. */
 bool state_alive() { return g_state_alive.load(); }
 
 struct State {
-    VulkanContext ctx;
+    VulkanContext ctx{g_vk_device.load()};
     WeightPool pool;
     std::unordered_map<const void*, VulkanContext::Buffer>
         kv_pools;
@@ -1562,7 +1565,23 @@ void vulkan_set_attn_scratch_floats(std::size_t floats) {
 }
 
 bool vulkan_backend_usable() {
-    static const bool ok = VulkanContext::available();
+    // Probes the device the State will open (vulkan_set_device, i#572),
+    // once per device: a working device 1 must not be refused because
+    // device 0 fails, nor a failing chosen device pass on device 0.
+    static std::mutex mu;
+    static int probed = -2;
+    static bool ok = false;
+    std::lock_guard lk(mu);
+    const int want = g_vk_device.load();
+    if (probed != want) {
+        try {
+            VulkanContext ctx(want);
+            ok = true;
+        } catch (const std::exception&) {
+            ok = false;
+        }
+        probed = want;
+    }
     return ok;
 }
 
@@ -1862,6 +1881,37 @@ std::string vulkan_device_name() {
     }
     std::lock_guard lk(state_mu());
     return state().ctx.device_name();
+}
+
+std::vector<VulkanDeviceInfo> vulkan_devices() {
+    std::vector<VulkanDeviceInfo> out;
+    for (const auto& d : VulkanContext::devices()) {
+        out.push_back({d.name, d.type});
+    }
+    return out;
+}
+
+void vulkan_set_device(int index) {
+    const std::size_t n = VulkanContext::devices().size();
+    if (n == 0) {
+        throw std::runtime_error(
+            "vulkan: no Vulkan device (or a build without Vulkan)");
+    }
+    if (index < 0 || static_cast<std::size_t>(index) >= n) {
+        throw std::out_of_range(
+            "vulkan: no device " + std::to_string(index) + " (" +
+            std::to_string(n) + " with a compute queue)");
+    }
+    std::lock_guard lk(state_mu());
+    // The State opens its device once: a later change would leave the
+    // weights, KV pools and kernels on the first one.
+    const int was = g_vk_device.load();
+    if (state_alive() && was != index && !(was < 0 && index == 0)) {
+        throw std::runtime_error(
+            "vulkan_set_device: the backend already runs on another "
+            "device; set it before the first Vulkan use");
+    }
+    g_vk_device.store(index);
 }
 
 const char* vulkan_api_name() {

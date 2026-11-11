@@ -921,7 +921,58 @@ struct VulkanContext::Impl {
         create(instance, &ci, nullptr, &messenger);
     }
 
-    void init() {
+    /** A physical device with a compute queue: its first such family. */
+    struct Candidate {
+        VkPhysicalDevice phys = VK_NULL_HANDLE;
+        std::uint32_t family = 0;
+        std::uint32_t ts_bits = 0;
+    };
+
+    static std::vector<Candidate> candidates(VkInstance inst) {
+        std::uint32_t n = 0;
+        vkEnumeratePhysicalDevices(inst, &n, nullptr);
+        std::vector<VkPhysicalDevice> devs(n);
+        vkEnumeratePhysicalDevices(inst, &n, devs.data());
+        std::vector<Candidate> out;
+        for (auto d : devs) {
+            std::uint32_t qn = 0;
+            vkGetPhysicalDeviceQueueFamilyProperties(d, &qn, nullptr);
+            std::vector<VkQueueFamilyProperties> qs(qn);
+            vkGetPhysicalDeviceQueueFamilyProperties(d, &qn, qs.data());
+            for (std::uint32_t i = 0; i < qn; ++i) {
+                if (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+                    out.push_back({d, i, qs[i].timestampValidBits});
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+    /** A bare instance (no layers), enough to list the devices. */
+    static VkInstance bare_instance() {
+        VkApplicationInfo app{};
+        app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        app.pApplicationName = "locus";
+        app.apiVersion = VK_API_VERSION_1_1;
+        VkInstanceCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        ici.pApplicationInfo = &app;
+#if defined(__APPLE__)
+        const char* ext = "VK_KHR_portability_enumeration";
+        ici.enabledExtensionCount = 1;
+        ici.ppEnabledExtensionNames = &ext;
+        ici.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#endif
+        VkInstance inst = VK_NULL_HANDLE;
+        if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) {
+            return VK_NULL_HANDLE;
+        }
+        return inst;
+    }
+
+    /** @param want The device index (devices()), or -1 for the first. */
+    void init(int want) {
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app.pApplicationName = "locus";
@@ -973,31 +1024,21 @@ struct VulkanContext::Impl {
         if (n == 0) {
             throw std::runtime_error("vulkan: no devices");
         }
-        std::vector<VkPhysicalDevice> devs(n);
-        vkEnumeratePhysicalDevices(instance, &n, devs.data());
-
-        for (auto d : devs) {
-            std::uint32_t qn = 0;
-            vkGetPhysicalDeviceQueueFamilyProperties(d, &qn,
-                                                     nullptr);
-            std::vector<VkQueueFamilyProperties> qs(qn);
-            vkGetPhysicalDeviceQueueFamilyProperties(d, &qn,
-                                                     qs.data());
-            for (std::uint32_t i = 0; i < qn; ++i) {
-                if (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-                    phys = d;
-                    queue_family = i;
-                    ts_valid_bits = qs[i].timestampValidBits;
-                    break;
-                }
-            }
-            if (phys != VK_NULL_HANDLE) {
-                break;
-            }
-        }
-        if (phys == VK_NULL_HANDLE) {
+        // The devices with a compute queue, in enumeration order; the
+        // index a caller picks (i#572) counts these only.
+        const std::vector<Candidate> cands = candidates(instance);
+        if (cands.empty()) {
             throw std::runtime_error("vulkan: no compute queue");
         }
+        const std::size_t pick = want < 0 ? 0 : static_cast<std::size_t>(want);
+        if (pick >= cands.size()) {
+            throw std::out_of_range(
+                "vulkan: no device " + std::to_string(want) + " (" +
+                std::to_string(cands.size()) + " with a compute queue)");
+        }
+        phys = cands[pick].phys;
+        queue_family = cands[pick].family;
+        ts_valid_bits = cands[pick].ts_bits;
 
         const float prio = 1.0f;
         VkDeviceQueueCreateInfo qci{};
@@ -1477,7 +1518,34 @@ std::uint32_t VulkanContext::validation_errors() {
     return g_validation_errors.load(std::memory_order_relaxed);
 }
 
-VulkanContext::VulkanContext() : impl_(new Impl) { impl_->init(); }
+VulkanContext::VulkanContext(int device) : impl_(new Impl) {
+    impl_->init(device);
+}
+
+std::vector<VulkanContext::DeviceInfo> VulkanContext::devices() {
+    std::vector<DeviceInfo> out;
+    VkInstance inst = Impl::bare_instance();
+    if (inst == VK_NULL_HANDLE) {
+        return out;
+    }
+    for (const auto& c : Impl::candidates(inst)) {
+        VkPhysicalDeviceProperties p{};
+        vkGetPhysicalDeviceProperties(c.phys, &p);
+        const char* type = "other";
+        switch (p.deviceType) {
+            case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: type = "discrete"; break;
+            case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+                type = "integrated";
+                break;
+            case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: type = "virtual"; break;
+            case VK_PHYSICAL_DEVICE_TYPE_CPU: type = "cpu"; break;
+            default: break;
+        }
+        out.push_back({p.deviceName, type});
+    }
+    vkDestroyInstance(inst, nullptr);
+    return out;
+}
 
 VulkanContext::~VulkanContext() = default;
 
@@ -1916,9 +1984,13 @@ bool VulkanContext::available() { return false; }
 
 std::uint32_t VulkanContext::validation_errors() { return 0; }
 
-VulkanContext::VulkanContext() {
+VulkanContext::VulkanContext(int) {
     throw std::runtime_error(
         "locus built without Vulkan kernels");
+}
+
+std::vector<VulkanContext::DeviceInfo> VulkanContext::devices() {
+    return {};
 }
 
 VulkanContext::~VulkanContext() = default;

@@ -90,6 +90,11 @@ int main(int argc, char** argv) {
     }
 
     try {
+        if (const std::string err = locus_tools::apply_device(args);
+            !err.empty()) {
+            std::fprintf(stderr, "%s: %s\n", argv[0], err.c_str());
+            return 2;
+        }
         auto g = locus::gguf::GgufFile::open(model_path);
         auto model = locus::model::TransformerModel::load(g);
         const auto& backend =
@@ -99,15 +104,18 @@ int main(int argc, char** argv) {
         auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
         auto& tok = *tok_ptr;
         const auto& hp = model.hparams();
+        const std::string be(model.active_backend().name);
+        // Which GPU, when there is a choice of them (i#572).
+        const std::string device =
+            be == "vulkan" ? " (" + locus::backend::vulkan_device_name() + ")"
+                           : "";
         std::fprintf(stderr,
-                     "%s | backend=%s | layers=%u embd=%u "
+                     "%s | backend=%s%s | layers=%u embd=%u "
                      "heads=%u/%u vocab=%u\n",
                      locus::sys::to_string(locus::sys::detect())
                          .c_str(),
-                     std::string(model.active_backend().name)
-                         .c_str(),
-                     hp.n_layers, hp.n_embd, hp.n_heads,
-                     hp.n_kv_heads, hp.n_vocab);
+                     be.c_str(), device.c_str(), hp.n_layers, hp.n_embd,
+                     hp.n_heads, hp.n_kv_heads, hp.n_vocab);
         const std::string gpu_warn = locus::backend::gpu_idle_warning(
             locus::backend::backend_defaulted(args.choice), backend);
         if (!gpu_warn.empty()) {

@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
     const int n_exec = opt.executors < 1 ? 1 : opt.executors;
 
     // Device-select seam (i#24 inc 4): validate --backend/--device
-    // before touching CUDA. A bad arity / non-cuda --device is a config
+    // before touching the GPU. A bad arity / CPU-backend --device is a config
     // error reported here; the actual device/backend binding (which can
     // throw if the device or backend is unavailable) happens inside the
     // try below so it shares the one error path.
@@ -208,7 +208,9 @@ int main(int argc, char** argv) {
         // upload, so the weight pool allocates on the chosen device and
         // not the default. cuda_set_device throws loudly for an out-of-
         // range ordinal or a non-CUDA build -- never a silent fallback.
-        if (dev.device >= 0) {
+        if (dev.device >= 0 && dev.backend == "vulkan") {
+            locus::backend::vulkan_set_device(dev.device);  // i#572
+        } else if (dev.device >= 0) {
             locus::backend::cuda_set_device(dev.device);
         }
         auto g = locus::gguf::GgufFile::open(opt.model);
@@ -268,9 +270,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::fprintf(stderr,
-                     "locus-stage: layers [%u,%u) on %s -> %s\n",
+                     "locus-stage: layers [%u,%u) on %s -> %s "
+                     "(backend %s)\n",
                      rt.layer_begin, rt.layer_end, opt.listen.c_str(),
-                     pool_desc.c_str());
+                     pool_desc.c_str(),
+                     std::string(model.active_backend().name).c_str());
 
         // Cached hostname resolution for downstream names (i#40): the
         // Resolver turns a name into a cached IP so a dial avoids a

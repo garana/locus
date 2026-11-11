@@ -213,6 +213,29 @@ bool vulkan_backend_usable();
  */
 std::string vulkan_device_name();
 
+/** A Vulkan device with a compute queue (i#572). */
+struct VulkanDeviceInfo {
+    std::string name;
+    /** "discrete", "integrated", "virtual", "cpu" or "other". */
+    std::string type;
+};
+
+/** @returns The Vulkan devices with a compute queue, in the order
+ *  vulkan_set_device counts them; empty without Vulkan. Opens no
+ *  device. */
+std::vector<VulkanDeviceInfo> vulkan_devices();
+
+/**
+ * Runs the Vulkan backend on device `index` of vulkan_devices() instead
+ * of the first, for the whole process (as cuda_set_device). Call it
+ * before the first Vulkan use (before the model loads); a call after
+ * that names the same device or throws.
+ * @throws std::out_of_range for an index past vulkan_devices();
+ *     std::runtime_error when the backend already runs on another
+ *     device, or in a build without Vulkan.
+ */
+void vulkan_set_device(int index);
+
 /**
  * @returns "moltenvk" when the Vulkan driver is MoltenVK, else
  *     "vulkan" (also when no device is usable). Asks the device once
