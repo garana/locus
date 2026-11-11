@@ -1,6 +1,8 @@
 #include "locus/server/engine_loop.hpp"
 
 #include <chrono>
+#include <cstdio>
+#include <exception>
 #include <thread>
 
 #include "locus/sys/perf_counters.hpp"
@@ -59,7 +61,18 @@ void EngineLoop::run() {
     locus::sys::perf::ThreadCounters perf_counters;
     std::unique_lock<std::mutex> lk(mu_);
     while (!stop_) {
-        engine_.step();
+        try {
+            engine_.step();
+        } catch (const std::exception& e) {
+            // A forward that throws (a lost GPU device, i#589) fails the
+            // requests it was stepping, with the reason; the server
+            // stays up for the others and for /health.
+            const std::size_t n = engine_.fail_running(e.what());
+            std::fprintf(stderr,
+                         "locus-server: a step failed (%s); %zu request(s) "
+                         "failed\n",
+                         e.what(), n);
+        }
         // Park unless there is work step() can make progress on now.
         // Gating on has_runnable_work (not just idle) keeps the
         // worker from busy-spinning while HOLDING mu_ on a backlog it

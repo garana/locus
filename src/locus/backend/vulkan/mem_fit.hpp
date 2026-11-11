@@ -37,4 +37,21 @@ constexpr bool moe_experts_fit(std::uint64_t expert_bytes,
     return expert_bytes <= available / 5 * 4;
 }
 
+/**
+ * On Apple (MoltenVK) experts imported from the model file in place
+ * still count toward the GPU's working set (i#589), though the budget
+ * does not show them used. With them, all experts must fit in 90% of
+ * the available memory; the copied ones alone keep the 80% rule.
+ *
+ * @param copied Expert bytes the device holds copies of.
+ * @param imported Expert bytes imported in place (0 off Apple).
+ * @param available From memory_available_from().
+ * @returns true when the experts fit.
+ */
+constexpr bool moe_experts_fit(std::uint64_t copied, std::uint64_t imported,
+                               std::uint64_t available) {
+    return moe_experts_fit(copied, available) &&
+           copied + imported <= available - available / 10;
+}
+
 }  // namespace locus::backend::vk

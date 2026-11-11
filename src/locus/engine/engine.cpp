@@ -609,6 +609,18 @@ void Engine::cancel(std::uint64_t id) {
     finish(r, Status::kCancelled, "cancelled");
 }
 
+std::size_t Engine::fail_running(const std::string& why) {
+    const std::vector<std::uint64_t> ids = std::move(running_);
+    running_.clear();
+    for (const std::uint64_t id : ids) {
+        auto it = requests_.find(id);
+        if (it != requests_.end() && !is_terminal(it->second->status)) {
+            finish(*it->second, Status::kFailed, why);
+        }
+    }
+    return ids.size();
+}
+
 void Engine::try_adopt(Request& r) {
     if (!prefix_cache_ || r.n_fed != 0 || !r.generated.empty() ||
         !r.seq.blocks.empty()) {
