@@ -45,7 +45,9 @@ inline constexpr const char* kRouterUsage =
     "                      read again (default 10000)\n"
     "  --media-timeout S   longest silence from an instance on an image,\n"
     "                      speech or video request, in seconds (default\n"
-    "                      1800; 0 = none); other requests: 60\n"
+    "                      1800; 0 = none)\n"
+    "  --text-timeout S    the same for every other request (default\n"
+    "                      1800; 0 = none)\n"
     "  --auth-helper PATH  check client keys with this auth helper\n"
     "                      (locus-auth-helper is a reference one): every\n"
     "                      request but /health needs a key it allows\n"
@@ -98,6 +100,12 @@ inline std::string parse_router_args(int argc, char** argv, int first,
                 return std::string("bad --media-timeout: ") + argv[i];
             }
             cfg.media_read_timeout_ms = n * 1000;
+        } else if (a == "--text-timeout" && i + 1 < argc) {
+            int n = 0;
+            if (!parse_nonneg_int(argv[++i], n) || n > 86400) {
+                return std::string("bad --text-timeout: ") + argv[i];
+            }
+            cfg.text_read_timeout_ms = n * 1000;
         } else if (a == "--auth-helper" && i + 1 < argc) {
             helper = argv[++i];
         } else if (a == "--auth-helper-arg" && i + 1 < argc) {

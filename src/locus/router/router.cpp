@@ -1162,7 +1162,7 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
                            rt.kind == Kind::kSpeech ||
                            rt.kind == Kind::kVideo;
         client->set_read_timeout_ms(media ? cfg_.media_read_timeout_ms
-                                          : cfg_.upstream.read_timeout_ms);
+                                          : cfg_.text_read_timeout_ms);
         {
             std::lock_guard lk(mu_);
             up.headers = upstream_headers(req, inst_[i]);

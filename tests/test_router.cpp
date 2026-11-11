@@ -352,7 +352,7 @@ TEST_CASE("router: media requests get their own read timeout", "[router]") {
     FakeInstance slow("slow", {"text", "image", "speech"}, "m");
     slow.delay_ms = 400;
     RouterConfig cfg;
-    cfg.upstream.read_timeout_ms = 150;
+    cfg.text_read_timeout_ms = 150;
     cfg.media_read_timeout_ms = 3000;
     RouterFixture rf({slow.addr()}, cfg);
 
@@ -367,6 +367,28 @@ TEST_CASE("router: media requests get their own read timeout", "[router]") {
     r = rf.post("/v1/completions", {{"prompt", "x"}});
     REQUIRE(r.ok);
     CHECK(r.head.status != 200);
+}
+
+// i#610: a text reply can be as slow as an image (a buffered chat on a
+// CPU, a long prefill), so text has its own read timeout, long by
+// default; upstream's (the polls' base options) no longer applies.
+TEST_CASE("router: slow text replies get the text read timeout",
+          "[router]") {
+    FakeInstance slow("slow", {"text"}, "m");
+    slow.delay_ms = 400;
+    RouterConfig cfg;
+    cfg.upstream.read_timeout_ms = 150;
+    REQUIRE(cfg.text_read_timeout_ms == 30 * 60 * 1000);
+    RouterFixture rf({slow.addr()}, cfg);
+    auto r = rf.post("/v1/chat/completions",
+                     {{"messages", json::array({{{"role", "user"},
+                                                 {"content", "hi"}}})}});
+    REQUIRE(r.ok);
+    CHECK(r.head.status == 200);
+    CHECK(r.body.rfind("slow /v1/chat/completions", 0) == 0);
+    r = rf.post("/v1/completions", {{"prompt", "x"}});
+    REQUIRE(r.ok);
+    CHECK(r.head.status == 200);
 }
 
 TEST_CASE("router: a dead instance is skipped", "[router]") {
