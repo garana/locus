@@ -22,6 +22,31 @@ Use the `build` and `test` skills (.claude/skills/). Quick form:
     cmake -B build -DCMAKE_BUILD_TYPE=Release
     cmake --build build -j && ./build/tests/locus_tests
 
+## Review gate
+
+A PR merges after two CLEAR votes from agents other than its author,
+and an x86 host tests every code PR.
+
+- Base each PR on main; stack one only when it needs another PR's code.
+- Any agent may review a PR by reading its diff. Tests run on the hosts
+  whose hardware the change touches: the x86 host for every code PR
+  (and CUDA), a Raspberry Pi host for V3D and the GCC 12 warning check,
+  an Apple host for MoltenVK.
+- Test by tier, from what the PR touches:
+  1. docs or scripts only: a build check;
+  2. one component (the router, request parsing, one image or audio
+     model): a warning-clean build on each compiler, plus that
+     component's test tags;
+  3. shared numeric code (kernels, the transformer forward, the engine
+     scheduler, backend state): the full suite, plus every golden whose
+     model uses the touched code, on each arch.
+- Batch runs: PRs that passed review by reading merge, at their frozen
+  heads and in their merge order, into one integration branch; one
+  full-suite run there covers them all. A vote names the integration
+  SHA and the PR heads it held. A red run is bisected by halves; the
+  PR that breaks it leaves the batch. PRs that conflict go in separate
+  batches, and a PR's head does not change once it is in a batch.
+
 ## Conventions
 
 - C++20, -Wall -Wextra -Wpedantic, warning-clean.
