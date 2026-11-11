@@ -564,6 +564,25 @@ void qwen2moe_hparams(const gguf::GgufFile& g, const std::string&,
         1.0f / std::sqrt(static_cast<float>(hp.head_dim));
 }
 
+// ---- qwen2 (Qwen2 / Qwen2.5 dense, the LM of Qwen2.5-VL): the llama
+// dense forward with qwen2moe's attention (q/k/v bias, NEOX rope). ----
+
+void qwen2_hparams(const gguf::GgufFile&, const std::string&,
+                   Hparams& hp) {
+    hp.arch = Arch::kLlama;
+    if (hp.n_heads == 0 || hp.n_embd % hp.n_heads != 0) {
+        throw gguf::Error("invalid head configuration");
+    }
+    hp.head_dim = hp.n_embd / hp.n_heads;
+    if (hp.n_kv_heads == 0 || hp.n_heads % hp.n_kv_heads != 0) {
+        throw gguf::Error("invalid kv head configuration");
+    }
+    hp.n_ff_exp = hp.n_ff;
+    hp.rope_neox = true;  // read by GPU backends
+    hp.kq_scale =
+        1.0f / std::sqrt(static_cast<float>(hp.head_dim));
+}
+
 void qwen2moe_attention_tensors(const gguf::GgufFile& g,
                                 const std::string& bp,
                                 const Hparams& hp,
@@ -1164,6 +1183,10 @@ const ArchSpec kArchs[] = {
      "indexer beyond top_k tokens)",
      &glm_dsa_hparams, &glm_dsa_attention_tensors,
      &glm_dsa_attention, &glm_dsa_kv_dim},
+    {"qwen2",
+     "Qwen2 / Qwen2.5 dense (GQA + q/k/v bias, NEOX rope)",
+     &qwen2_hparams, &qwen2moe_attention_tensors, &qwen2moe_attention,
+     &llama_kv_dim},
     {"qwen2moe",
      "Qwen1.5/2 MoE (GQA + q/k/v bias, routed + gated shared "
      "expert)",

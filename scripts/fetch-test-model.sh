@@ -9,6 +9,7 @@
 #   e5      e5-small-v2 Q8_0 (37 MB)
 #   bge-m3  bge-m3 Q8_0 (635 MB)
 #   nomic   nomic-embed-text v1.5 Q8_0 (146 MB)
+#   qwen2   Qwen2.5 0.5B Instruct Q8_0 (676 MB), the qwen2 golden
 # A file lands under a temporary name first, so a test never sees a
 # partial file at the final path.
 set -eu
@@ -57,6 +58,12 @@ nomic)
         nomic-embed-text-v1.5.Q8_0.gguf \
         3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7
     ;;
+qwen2)
+    fetch Qwen/Qwen2.5-0.5B-Instruct-GGUF \
+        9217f5db79a29953eb74d5343926648285ec7e67 \
+        qwen2.5-0.5b-instruct-q8_0.gguf \
+        ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e
+    ;;
 "")
     url="https://huggingface.co/ggml-org/models/resolve/main"
     url="$url/tinyllamas/stories260K.gguf"
@@ -64,7 +71,7 @@ nomic)
     shasum -a 256 "$dir/stories260K.gguf"
     ;;
 *)
-    echo "usage: $0 [bge|e5|bge-m3|nomic]" >&2
+    echo "usage: $0 [bge|e5|bge-m3|nomic|qwen2]" >&2
     exit 2
     ;;
 esac

@@ -17,7 +17,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 ### What works
 
 - **Architectures:** llama (dense and Mixtral-style MoE), deepseek2
-  (MLA), glm-dsa, qwen2moe, qwen3moe, dbrx, muse-spark, deepseek41.
+  (MLA), glm-dsa, qwen2, qwen2moe, qwen3moe, dbrx, muse-spark,
+  deepseek41.
 - **Weight formats:** GGUF with F32, F16, BF16, the legacy quants,
   K-quants, IQ quants, TQ1_0 and TQ2_0.
 - **Tokenizers:** SentencePiece, byte-level BPE (gpt2, llama3 and
@@ -182,8 +183,9 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 
 Tests that need model files skip when the file is absent;
 `scripts/fetch-test-model.sh` gets the small ones (`bge`, `e5`,
-`bge-m3` or `nomic` as its argument gets that embedding model). Tests
-tagged as heavy also need `LOCUS_HEAVY_TESTS=1`.
+`bge-m3` or `nomic` as its argument gets that embedding model, `qwen2`
+the qwen2 golden's model). Tests tagged as heavy also need
+`LOCUS_HEAVY_TESTS=1`.
 
 ## Run
 

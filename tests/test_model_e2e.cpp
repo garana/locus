@@ -367,6 +367,69 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
     }
 }
 
+// qwen2 dense (Qwen2.5 0.5B Instruct, Qwen's own Q8_0 GGUF at 9217f5d,
+// 676 MB). Golden ids: the GGUF's weights dequantized and run in float64
+// (scripts/make-qwen2-q8-ref.py, the decoder as llama.cpp's graph; f32
+// activations pinned here). llama.cpp's own greedy output agrees for
+// the first 19 tokens, then takes " about" where exact arithmetic takes
+// " and": the two are a near-tie (-0.7212 against -0.7268), and
+// llama.cpp's 8-bit activations tip it.
+TEST_CASE("qwen2 greedy decode matches exact arithmetic",
+          "[e2e][qwen]") {
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/qwen2.5-0.5b-instruct-q8_0.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("qwen2.5-0.5b-instruct-q8_0.gguf absent; see "
+             "scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    REQUIRE(g.get_string("general.architecture") == "qwen2");
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_q8k_activations(false);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+    const std::vector<locus::tok::TokenId> want = {
+        11,   1052,  572,   264,   3908,  883,  6941,  3757,
+        879,  12163, 304,   264,   2613,  14126, 13,   3757,
+        572,  1602,  22208, 323,   10245, 311,  13186, 279,
+        1879, 2163,  1435,  13,    3776,  1899, 11,   3757};
+    const std::string llama_prefix =
+        "Once upon a time, there was a young man named John who lived in "
+        "a small village. John was very curious";
+    std::vector<const char*> backends = {"neon"};
+    if (locus::backend::find_backend("neon") == nullptr) {
+        backends = {"scalar"};
+    }
+    if (locus::backend::vulkan_backend_usable()) {
+        backends.push_back("vulkan");
+    }
+    for (const char* be : backends) {
+        INFO(be);
+        model.use_backend(*locus::backend::find_backend(be));
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        auto ids = tok->encode("Once upon a time", true);
+        REQUIRE(ids == std::vector<locus::tok::TokenId>{12522, 5193, 264,
+                                                         882});
+        for (auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
+        }
+        std::vector<locus::tok::TokenId> got;
+        for (int i = 0; i < 32; ++i) {
+            const auto next = locus::model::argmax(logits);
+            got.push_back(next);
+            ids.push_back(next);
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(next, cache, seq, ws, logits);
+        }
+        cache.release(seq);
+        CHECK(got == want);
+        CHECK(tok->decode(ids).starts_with(llama_prefix));
+    }
+}
+
 // qwen3moe (Qwen3-Coder-30B-A3B-Instruct, unsloth Q4_K_M GGUF, 18.6GB:
 // huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF). Golden
 // prompt token counts and greedy continuations are llama.cpp's (via
