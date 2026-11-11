@@ -1,6 +1,7 @@
 #include <pthread.h>
 #include <signal.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -256,6 +257,9 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         if (!args.metrics_path.empty()) {
             opt.metrics_path = args.metrics_path;
         }
+        // Capped at a day, so the milliseconds fit in 32 bits.
+        opt.sse_keepalive_ms =
+            std::min<std::uint32_t>(args.sse_keepalive, 86400) * 1000;
         opt.audio_decoder_path = args.audio_decoder;
         opt.embedding_model_path = args.embedding_model;
         opt.rerank_model_path = args.rerank_model;

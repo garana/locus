@@ -63,6 +63,30 @@ using nlohmann::json;
  * U+FFFD instead of throwing type_error.316 out of a handler (i#243). */
 constexpr auto kLossy = json::error_handler_t::replace;
 
+/**
+ * An SSE stream's keepalive (i#619): a stream that has written nothing
+ * for `every` gets an SSE comment, which clients ignore, so a long
+ * prefill or a buffered tool reply does not look like a dead
+ * connection.
+ */
+struct SseKeepalive {
+    std::chrono::milliseconds every;
+    std::chrono::steady_clock::time_point last =
+        std::chrono::steady_clock::now();
+
+    /** Fills an empty payload with ": keepalive" when one is due, and
+     *  notes the time of any payload about to be written. */
+    void pad(std::string& payload) {
+        const auto now = std::chrono::steady_clock::now();
+        if (payload.empty() && every.count() > 0 && now - last >= every) {
+            payload = ": keepalive\n\n";
+        }
+        if (!payload.empty()) {
+            last = now;
+        }
+    }
+};
+
 /** The GPU ops for the embedding and rerank models' large passes
  *  (EmbeddingModel::kGpuMacs): the Vulkan image ops where the GPU
  *  imports host memory, as for PixArt (the weights stay in the GGUF
@@ -2072,8 +2096,10 @@ void OpenAiServer::install_routes() {
              buffer_tools](http::Sink& sink) {
               // The server calls a provider ONCE; loop until terminal,
               // one chunk per progress step.
+              SseKeepalive ka{
+                  std::chrono::milliseconds(opt_.sse_keepalive_ms)};
               for (;;) {
-                auto v = loop_.wait_progress(id, *state);
+                auto v = loop_.wait_progress(id, *state, ka.every);
                 std::string payload;
                 if (!buffer_tools) {
                     for (std::size_t i = *state;
@@ -2176,6 +2202,7 @@ void OpenAiServer::install_routes() {
                     // engine record (the provider won't run again).
                     loop_.release(id);
                 }
+                ka.pad(payload);
                 if (!payload.empty() &&
                     !sink.write(std::string_view(payload.data(),
                                                  payload.size()))) {
@@ -2369,6 +2396,8 @@ void OpenAiServer::install_routes() {
             [this, id, rid, input_tokens, st, tools_sp, buffer_tools](
                 http::Sink& sink) {
               // Call-once provider: loop until terminal (see completions).
+              SseKeepalive ka{
+                  std::chrono::milliseconds(opt_.sse_keepalive_ms)};
               for (;;) {
                 std::string payload;
                 if (!st->started) {
@@ -2400,7 +2429,7 @@ void OpenAiServer::install_routes() {
                     }
                     st->started = true;
                 }
-                auto v = loop_.wait_progress(id, st->emitted);
+                auto v = loop_.wait_progress(id, st->emitted, ka.every);
                 if (!buffer_tools) {
                     for (std::size_t i = st->emitted;
                          i < v.generated.size(); ++i) {
@@ -2521,6 +2550,7 @@ void OpenAiServer::install_routes() {
                     // Stream fully built from v; drop the record.
                     loop_.release(id);
                 }
+                ka.pad(payload);
                 if (!payload.empty() &&
                     !sink.write(std::string_view(payload.data(),
                                                  payload.size()))) {
@@ -3756,8 +3786,10 @@ void OpenAiServer::install_routes() {
                 bool opened = false;
                 const bool live = rq_sp->tools.empty();
                 std::string payload = sse.start(*r);
+                SseKeepalive ka{
+                    std::chrono::milliseconds(opt_.sse_keepalive_ms)};
                 for (;;) {
-                    auto v = loop_.wait_progress(id, seen);
+                    auto v = loop_.wait_progress(id, seen, ka.every);
                     if (live) {
                         for (std::size_t i = seen; i < v.generated.size();
                              ++i) {
@@ -3791,6 +3823,7 @@ void OpenAiServer::install_routes() {
                         }
                         loop_.release(id);
                     }
+                    ka.pad(payload);
                     if (!payload.empty() &&
                         !sink.write(std::string_view(payload.data(),
                                                      payload.size()))) {

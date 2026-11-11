@@ -192,6 +192,8 @@ inline constexpr const char* kCommonHelp =
     "                   report aggregate tok/s (bench mode)\n"
     "  --metrics-path P locus-server: serve Prometheus metrics at\n"
     "                   path P (default /metrics)\n"
+    "  --sse-keepalive S locus-server: a stream silent for S seconds\n"
+    "                   sends an SSE comment (default 15; 0 = off)\n"
     "  --audio-decoder P locus-server: enable /v1/audio/speech with\n"
     "                   the neural-codec decoder GGUF at path P\n"
     "  --embedding-model P locus-server: serve /v1/embeddings with the\n"
@@ -319,6 +321,9 @@ struct BackendArgs {
     /** From --metrics-path P: locus-server metrics route (empty =
      * default /metrics). */
     std::string metrics_path;
+    /** From --sse-keepalive S: seconds of silence before a stream
+     *  sends an SSE comment (0 = off). */
+    std::uint32_t sse_keepalive = 15;
     /** From --audio-decoder P: path to the neural-codec decoder GGUF
      * (arch "snac") enabling locus-server's /v1/audio/speech; empty =
      * the endpoint is disabled (503). */
@@ -473,6 +478,11 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.metrics_path = argv[++i];
         } else if (a.rfind("--metrics-path=", 0) == 0) {
             out.metrics_path = std::string(a.substr(15));
+        } else if (a == "--sse-keepalive" && i + 1 < argc) {
+            number("--sse-keepalive", argv[++i], out.sse_keepalive);
+        } else if (a.rfind("--sse-keepalive=", 0) == 0) {
+            number("--sse-keepalive", std::string(a.substr(16)),
+                   out.sse_keepalive);
         } else if (a == "--audio-decoder" && i + 1 < argc) {
             out.audio_decoder = argv[++i];
         } else if (a.rfind("--audio-decoder=", 0) == 0) {

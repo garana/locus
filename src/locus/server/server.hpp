@@ -114,6 +114,11 @@ class OpenAiServer {
         /** Path the Prometheus metrics endpoint is served at
          * (--metrics-path); default /metrics. */
         std::string metrics_path = "/metrics";
+        /** A streamed reply that has sent nothing for this long sends
+         * an SSE comment (": keepalive"), so clients and proxies see a
+         * live stream through a long prefill or a buffered tool reply
+         * (i#619; --sse-keepalive). 0 = off. */
+        std::uint32_t sse_keepalive_ms = 15000;
         /** Path to the neural-codec decoder GGUF (arch "snac") that
          * enables POST /v1/audio/speech (--audio-decoder). Empty =
          * the endpoint is off and returns 503. Loaded at construction;
