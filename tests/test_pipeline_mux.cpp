@@ -1450,6 +1450,27 @@ TEST_CASE("serve_stage_mux: SESSION_END with an emptied pool drops, no "
     REQUIRE(sres.load() == 0);  // ended unclean: nothing left to dial
 }
 
+// i#557: on the any-host socket (IPv6 that also takes IPv4) an IPv4
+// peer is a.b.c.d:port, as accept_one names it, not ::ffff:a.b.c.d.
+TEST_CASE("peer_address unmaps an IPv4 peer of a dual-stack socket",
+          "[pipeline][net]") {
+    int port = 0;
+    const int lfd = locus::pipeline::listen_on("", 0, &port);
+    REQUIRE(lfd >= 0);
+    const int c = locus::pipeline::connect_to("127.0.0.1", port);
+    REQUIRE(c >= 0);
+    std::string ip;
+    const int a = locus::pipeline::accept_one(lfd, &ip);
+    REQUIRE(a >= 0);
+    const std::string peer = locus::pipeline::peer_address(a);
+    CHECK(peer.rfind("127.0.0.1:", 0) == 0);
+    CHECK(peer.find("ffff") == std::string::npos);
+    CHECK(peer.rfind(ip + ":", 0) == 0);  // agrees with accept_one
+    ::close(a);
+    ::close(c);
+    ::close(lfd);
+}
+
 // i#21: tcp_rtt reads the kernel's RTT of a connected TCP socket and
 // peer_address names its peer; neither has an answer for a pipe.
 TEST_CASE("tcp_rtt and peer_address on a loopback connection",
