@@ -157,8 +157,9 @@ on a thread that already runs a loop, such as a stage's `/metrics`
 
 `locus-router` (`router::Router`) proxies each request to one of
 several instances by kind: text, image-to-text (a chat, messages or
-responses body with an image part), image, video, speech or rerank, from the
-path and, for chat, the body. The instances are given as host:port or
+responses body with an image part), image, video, speech, rerank or
+classify, from the path and, for chat, the body; `/v1/embeddings` under
+a classify instance's model goes to that instance. The instances are given as host:port or
 as `srv:NAME`, whose DNS SRV targets (the lowest priority's) are
 looked up again on every refresh, so instances join and leave with the
 record; one that leaves is never picked again, and an empty answer

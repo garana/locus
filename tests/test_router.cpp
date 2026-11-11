@@ -220,6 +220,13 @@ TEST_CASE("router: request kinds by path and body", "[router]") {
     CHECK(kind("/rerank") == Kind::kRerank);
     CHECK(locus::router::kind_name(Kind::kRerank) == "rerank");
     CHECK(locus::router::parse_kind("rerank") == Kind::kRerank);
+    CHECK(kind("/v1/classify") == Kind::kClassify);
+    CHECK(locus::router::kind_name(Kind::kClassify) == "classify");
+    CHECK(locus::router::parse_kind("classify") == Kind::kClassify);
+    // Embeddings stay text; the flag lets a classify instance take them.
+    CHECK(kind("/v1/embeddings") == Kind::kText);
+    CHECK(classify("/v1/embeddings", "")->embeddings);
+    CHECK_FALSE(classify("/v1/completions", "")->embeddings);
     CHECK_FALSE(classify("/v1/files", ""));
     CHECK(classify("/v1/completions", R"({"model":"m1"})")->model == "m1");
     // A body that is not JSON still gets a kind; the instance answers.
@@ -306,6 +313,35 @@ TEST_CASE("router: proxies each kind to its instance", "[router]") {
         CHECK(j["locus_kinds"] ==
               json::array({"text", "image", "speech"}));
     }
+}
+
+// i#583: a CNN classifier instance (locus-server --image-classifier)
+// takes /v1/classify, and /v1/embeddings under its model's name.
+TEST_CASE("router: classify and image embeddings go to a classify instance",
+          "[router]") {
+    FakeInstance text("text", {"text"}, "llama");
+    FakeInstance cnn("cnn", {"classify"}, "resnet50.tv_in1k");
+    RouterFixture rf({text.addr(), cnn.addr()});
+
+    auto r = rf.post("/v1/classify", {{"image", "AA"}});
+    REQUIRE(r.ok);
+    CHECK(r.body.rfind("cnn /v1/classify", 0) == 0);
+    r = rf.post("/v1/embeddings",
+                {{"model", "resnet50.tv_in1k"}, {"input", "AA"}});
+    REQUIRE(r.ok);
+    CHECK(r.body.rfind("cnn /v1/embeddings", 0) == 0);
+    // Text embeddings, by another model or none, stay on text.
+    r = rf.post("/v1/embeddings", {{"model", "llama"}, {"input", "hi"}});
+    REQUIRE(r.ok);
+    CHECK(r.body.rfind("text", 0) == 0);
+    r = rf.post("/v1/embeddings", {{"input", "hi"}});
+    REQUIRE(r.ok);
+    CHECK(r.body.rfind("text", 0) == 0);
+    // A completion that names the classifier's model is not its kind.
+    r = rf.post("/v1/completions",
+                {{"model", "resnet50.tv_in1k"}, {"prompt", "x"}});
+    REQUIRE(r.ok);
+    CHECK(r.body.rfind("text", 0) == 0);
 }
 
 TEST_CASE("router: a dead instance is skipped", "[router]") {

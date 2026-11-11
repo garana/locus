@@ -34,10 +34,18 @@ namespace locus::router {
 
 /** What a request asks for; an instance lists the kinds it serves in
  * its /v1/models (`locus_kinds`). */
-enum class Kind { kText, kImageToText, kImage, kVideo, kSpeech, kRerank };
+enum class Kind {
+    kText,
+    kImageToText,
+    kImage,
+    kVideo,
+    kSpeech,
+    kRerank,
+    kClassify
+};
 
 /** @returns the wire name: text, image-to-text, image, video, speech,
- *  rerank. */
+ *  rerank, classify. */
 std::string_view kind_name(Kind k);
 /** @returns the kind for a wire name, or nullopt. */
 std::optional<Kind> parse_kind(std::string_view name);
@@ -49,6 +57,9 @@ struct Route {
     std::string model;
     /** The session key (session_key()); "" when there is none. */
     std::string session;
+    /** /v1/embeddings: also served by a classify instance that lists
+     *  the body's model (its image embeddings). */
+    bool embeddings = false;
 };
 
 /**

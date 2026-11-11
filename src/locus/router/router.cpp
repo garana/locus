@@ -18,8 +18,8 @@ using nlohmann::json;
 
 namespace {
 
-constexpr std::string_view kKindNames[] = {"text",  "image-to-text", "image",
-                                           "video", "speech",        "rerank"};
+constexpr std::string_view kKindNames[] = {
+    "text", "image-to-text", "image", "video", "speech", "rerank", "classify"};
 
 char lower(char c) {
     return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
@@ -259,6 +259,9 @@ std::optional<Route> classify(std::string_view path, std::string_view body) {
     }
     if (path == "/v1/completions" || path == "/v1/embeddings") {
         r.kind = Kind::kText;
+        r.embeddings = path == "/v1/embeddings";
+    } else if (path == "/v1/classify") {
+        r.kind = Kind::kClassify;
     } else if (path == "/v1/chat/completions" || path == "/v1/messages" ||
                path == "/v1/responses") {
         // Only the conversation can hold image parts.
@@ -768,17 +771,25 @@ std::vector<int> Router::candidates(const Route& route) const {
         const auto now = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < inst_.size(); ++i) {
             const Instance& in = inst_[i];
-            if (in.gone || lapsed(in, now) || !in.healthy ||
-                std::find(in.kinds.begin(), in.kinds.end(), route.kind) ==
-                    in.kinds.end()) {
+            if (in.gone || lapsed(in, now) || !in.healthy) {
                 continue;
             }
-            of_kind.push_back(static_cast<int>(i));
-            if (!route.model.empty() &&
+            const auto has = [&](Kind k) {
+                return std::find(in.kinds.begin(), in.kinds.end(), k) !=
+                       in.kinds.end();
+            };
+            const bool listed =
+                !route.model.empty() &&
                 std::find(in.models.begin(), in.models.end(), route.model) !=
-                    in.models.end()) {
-                of_model.push_back(static_cast<int>(i));
+                    in.models.end();
+            // Image embeddings: a classify instance serves
+            // /v1/embeddings under its model's name.
+            const bool of = has(route.kind);
+            if (!of && !(route.embeddings && listed && has(Kind::kClassify))) {
+                continue;
             }
+            if (of) of_kind.push_back(static_cast<int>(i));
+            if (listed) of_model.push_back(static_cast<int>(i));
         }
     }
     // A model no instance lists (clients often send their own name for
