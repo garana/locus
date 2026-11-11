@@ -397,6 +397,68 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         CHECK(e->status == 400);
     }
 
+    // i#590: Anthropic's tool history (Claude Code's loop): a tool_use
+    // block in the assistant turn, a tool_result block (text and an
+    // image) in the next user turn; the same prompt as plain turns.
+    SECTION("messages tool history renders as plain turns") {
+        using namespace locus::server;
+        const json tools = json::array(
+            {{{"name", "word_count"},
+              {"description", "count words"},
+              {"input_schema", {{"type", "object"}}}}});
+        const json agent{
+            {"max_tokens", 6},
+            {"tools", tools},
+            {"messages",
+             json::array(
+                 {{{"role", "user"}, {"content", "Once upon a time"}},
+                  {{"role", "assistant"},
+                   {"content",
+                    json::array({{{"type", "text"}, {"text", "Let me count."}},
+                                 {{"type", "tool_use"},
+                                  {"id", "toolu_1"},
+                                  {"name", "word_count"},
+                                  {"input", {{"path", "a.txt"}}}}})}},
+                  {{"role", "user"},
+                   {"content",
+                    json::array(
+                        {{{"type", "tool_result"},
+                          {"tool_use_id", "toolu_1"},
+                          {"content",
+                           json::array({{{"type", "text"}, {"text", "9"}},
+                                        {{"type", "image"},
+                                         {"source",
+                                          {{"type", "base64"},
+                                           {"data", "AA"}}}}})}}})}}})}};
+        const std::string sys =
+            render_tools_system(parse_tools(json{{"tools", tools}}, true)) +
+            kToolResultNote;
+        const json plain{
+            {"max_tokens", 6},
+            {"system", sys},
+            {"messages",
+             json::array(
+                 {{{"role", "user"}, {"content", "Once upon a time"}},
+                  {{"role", "assistant"}, {"content", "Let me count."}},
+                  {{"role", "assistant"},
+                   {"content",
+                    render_tool_call("word_count",
+                                     json{{"path", "a.txt"}})}},
+                  {{"role", "user"},
+                   {"content",
+                    render_tool_result("word_count",
+                                       "9\n[image omitted]")}}})}};
+        auto a = client.Post("/v1/messages", agent.dump(), "application/json");
+        auto b = client.Post("/v1/messages", plain.dump(), "application/json");
+        REQUIRE(a);
+        REQUIRE(b);
+        REQUIRE(a->status == 200);
+        REQUIRE(b->status == 200);
+        const json ja = json::parse(a->body), jb = json::parse(b->body);
+        CHECK(ja["usage"]["input_tokens"] == jb["usage"]["input_tokens"]);
+        CHECK(ja["content"] == jb["content"]);
+    }
+
     SECTION("chat tools + stream buffers and emits a final chunk") {
         // With tools, the stream must BUFFER (a tool call can only be
         // recognized from the whole completion) and emit one terminal

@@ -202,8 +202,9 @@ std::vector<chat::Message> parse_messages(const json& messages,
 /**
  * Anthropic content is either a plain string or an array of content
  * blocks; we take the text of every {"type":"text"} block and
- * ignore the rest (images, tool_use/tool_result -- no tool support
- * yet). @returns the text blocks joined with newlines, as the vision
+ * ignore the rest (parse_anthropic_messages renders tool_use and
+ * tool_result blocks). @returns the text blocks joined with newlines,
+ * as the vision
  * path joins them (Claude Code sends its system prompt as several
  * blocks; with no separator their words would run together).
  */
@@ -234,33 +235,104 @@ std::string anthropic_text(const json& content) {
  * blocks) followed by every system-role entry of messages[], joined
  * with newlines: Claude Code sends one after the first user turn,
  * and chat templates expect a single system message first.
+ *
+ * Tool history renders as on the OpenAI paths (i#590), in block
+ * order: a tool_use block is an assistant turn (render_tool_call of
+ * its name and input), a tool_result block a user turn
+ * (render_tool_result, named after its tool_use_id's call; an image in
+ * it becomes "[image omitted]"); the text blocks around them are turns
+ * of the message's role.
+ *
+ * @param has_tool_history Set when the history holds a tool block.
  */
 std::vector<chat::Message> parse_anthropic_messages(
-    const json& body) {
+    const json& body, bool* has_tool_history = nullptr) {
     std::vector<chat::Message> out;
     std::string system;
     if (body.contains("system") && !body["system"].is_null()) {
         system = anthropic_text(body["system"]);
     }
+    std::map<std::string, std::string> call_names;  // tool_use id -> name
+    // A tool_result's content: a string, or blocks (text, images).
+    const auto result_text = [](const json& c) {
+        if (c.is_string()) return c.get<std::string>();
+        std::string t;
+        if (!c.is_array()) return t;
+        for (const auto& b : c) {
+            const std::string type = b.is_object() ? b.value("type", "") : "";
+            std::string piece;
+            if (type == "text" && b.contains("text") && b["text"].is_string()) {
+                piece = b["text"].get<std::string>();
+            } else if (type == "image") {
+                piece = "[image omitted]";
+            } else {
+                continue;
+            }
+            if (!t.empty()) t += "\n";
+            t += piece;
+        }
+        return t;
+    };
     for (const auto& m : body.at("messages")) {
-        chat::Message msg;
-        msg.role = m.value("role", "user");
-        if (msg.role != "user" && msg.role != "assistant" &&
-            msg.role != "system") {
-            throw std::invalid_argument(
-                "unsupported message role: " + msg.role);
+        const std::string role = m.value("role", "user");
+        if (role != "user" && role != "assistant" && role != "system") {
+            throw std::invalid_argument("unsupported message role: " + role);
         }
         if (!m.contains("content")) {
             throw std::invalid_argument(
                 "message must have content");
         }
-        msg.content = anthropic_text(m["content"]);
-        if (msg.role == "system") {
-            if (!system.empty() && !msg.content.empty()) system += "\n";
-            system += msg.content;
+        const json& content = m["content"];
+        if (role == "system") {
+            const std::string text = anthropic_text(content);
+            if (!system.empty() && !text.empty()) system += "\n";
+            system += text;
             continue;
         }
-        out.push_back(std::move(msg));
+        const auto is_tool = [](const json& b) {
+            const std::string t = b.is_object() ? b.value("type", "") : "";
+            return t == "tool_use" || t == "tool_result";
+        };
+        const bool tools =
+            content.is_array() &&
+            std::any_of(content.begin(), content.end(), is_tool);
+        if (!tools) {
+            out.push_back({role, anthropic_text(content)});
+            continue;
+        }
+        if (has_tool_history != nullptr) *has_tool_history = true;
+        std::string text;  // text blocks since the last tool block
+        const auto flush = [&] {
+            if (!text.empty()) out.push_back({role, std::move(text)});
+            text.clear();
+        };
+        for (const auto& b : content) {
+            const std::string type = b.is_object() ? b.value("type", "") : "";
+            if (type == "text" && b.contains("text") && b["text"].is_string()) {
+                if (!text.empty()) text += "\n";
+                text += b["text"].get<std::string>();
+            } else if (type == "tool_use") {
+                flush();
+                const std::string name = b.value("name", "");
+                if (b.contains("id") && b["id"].is_string()) {
+                    call_names[b["id"].get<std::string>()] = name;
+                }
+                out.push_back(
+                    {"assistant",
+                     render_tool_call(name, b.value("input", json()))});
+            } else if (type == "tool_result") {
+                flush();
+                const auto it = call_names.find(b.value("tool_use_id", ""));
+                std::string output =
+                    b.contains("content") ? result_text(b["content"]) : "";
+                if (b.value("is_error", false)) output = "Error: " + output;
+                out.push_back(
+                    {"user",
+                     render_tool_result(
+                         it != call_names.end() ? it->second : "", output)});
+            }
+        }
+        flush();
     }
     if (!system.empty()) {
         out.insert(out.begin(), chat::Message{"system", system});
@@ -2152,11 +2224,14 @@ void OpenAiServer::install_routes() {
             if (!vision) {
                 constraint =
                     output_constraint(output_grammar(body, req.body));
-                auto msgs = parse_anthropic_messages(body);
+                bool tool_history = false;
+                auto msgs = parse_anthropic_messages(body, &tool_history);
                 tools = parse_tools(body, /*anthropic=*/true);
                 if (!tools.empty()) {
                     msgs.insert(msgs.begin(),
-                                {"system", render_tools_system(tools)});
+                                {"system",
+                                 render_tools_system(tools) +
+                                     (tool_history ? kToolResultNote : "")});
                 }
                 prompt = opt_.chat_template.apply(msgs);
                 if (body.contains("max_tokens")) {
