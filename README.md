@@ -34,9 +34,11 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   `/v1/models`, `/metrics`, `/health`.
 - **Embedding models:** GGUFs of arch `bert` (BERT with WordPiece, or
   XLM-R with SentencePiece) or `nomic-bert`, with `--embedding-model`,
-  beside the chat model, on the CPU; tested with bge-small-en-v1.5,
-  e5-small-v2, bge-m3 and nomic-embed-text v1.5. A reranker (an XLM-R cross-encoder such as
-  bge-reranker-v2-m3) serves `/v1/rerank` with `--rerank-model`.
+  beside the chat model; tested with bge-small-en-v1.5, e5-small-v2,
+  bge-m3 and nomic-embed-text v1.5. A reranker (an XLM-R cross-encoder
+  such as bge-reranker-v2-m3) serves `/v1/rerank` with
+  `--rerank-model`. Both run on the CPU, and a large request's passes
+  on Vulkan where the GPU shares host memory (Apple).
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
   penalties, seed), structured output (JSON mode, a JSON Schema, a
   regex or a GBNF grammar), prompt caching (in RAM, and on disk with

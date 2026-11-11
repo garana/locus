@@ -60,6 +60,9 @@ class BertEncoder {
     /** @returns The most tokens one sequence may have (512). */
     std::uint32_t context() const { return context_; }
     Pooling pooling() const { return pooling_; }
+    /** @returns The multiply-adds of one token through the layer and
+     *  head matrices (the token embedding is a lookup, not counted). */
+    std::uint64_t token_macs() const { return token_macs_; }
 
     /**
      * Runs the encoder over several sequences in one pass: the
@@ -148,6 +151,7 @@ class BertEncoder {
     /** The reranker's classifier; cls_ may be absent (data null). */
     Linear cls_, cls_out_;
     std::uint32_t labels_ = 0;
+    std::uint64_t token_macs_ = 0;
 };
 
 }  // namespace locus::embed

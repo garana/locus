@@ -8,6 +8,7 @@
 #include "gguf_builder.hpp"
 #include "json.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/embed/bert.hpp"
 #include "locus/embed/embedding_model.hpp"
 #include "locus/gguf/gguf.hpp"
@@ -665,4 +666,48 @@ TEST_CASE("embedding model groups inputs into passes", "[bert][e2e]") {
     REQUIRE_THROWS_AS(locus::embed::EmbeddingModel::load(
                           kDir + "golden/bert-vocab.gguf"),
                       locus::gguf::Error);
+}
+
+TEST_CASE("encoder models on the Vulkan image ops match the CPU",
+          "[bert][vulkan][e2e]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no Vulkan device");
+    }
+    const auto& cpu = locus::backend::best_backend().ops;
+    const auto& gpu = locus::backend::vulkan_image_ops();
+    const std::vector<std::string> texts = {
+        "what is the capital of china?",
+        "Beijing is the capital of the People's Republic of China.",
+        "A small red apple on a wooden table, soft morning light."};
+    // Eight inputs of about 120 tokens: past kGpuMinTokens and kGpuMacs
+    // for every model, so the gpu argument runs the passes on Vulkan.
+    std::string para;
+    for (int i = 0; i < 12; ++i) para += texts[i % 3] + " ";
+    const std::vector<std::string> big(8, para);
+    for (const char* file :
+         {"bge-small-en-v1.5-q8_0.gguf", "bge-m3-q8_0.gguf",
+          "nomic-embed-text-v1.5.Q8_0.gguf"}) {
+        const std::string path = kDir + "models/" + file;
+        if (!std::filesystem::exists(path)) continue;
+        const auto m = locus::embed::EmbeddingModel::load(path);
+        for (const auto* in : {&texts, &big}) {
+            const auto c = m->embed(*in, cpu);
+            const auto g = m->embed(*in, gpu);  // every pass on Vulkan
+            const auto p = m->embed(*in, cpu, nullptr, &gpu);  // by size
+            for (std::size_t i = 0; i < in->size(); ++i) {
+                INFO(file << " input " << i);
+                REQUIRE(cosine(c[i], g[i]) >= 0.99999);
+                REQUIRE(cosine(c[i], p[i]) >= 0.99999);
+            }
+        }
+    }
+    const std::string rr = kDir + "models/bge-reranker-v2-m3-q8_0.gguf";
+    if (std::filesystem::exists(rr)) {
+        const auto m = locus::embed::EmbeddingModel::load(rr);
+        const auto c = m->rank(texts[0], big, cpu);
+        const auto g = m->rank(texts[0], big, cpu, nullptr, &gpu);
+        for (std::size_t i = 0; i < big.size(); ++i) {
+            REQUIRE(std::fabs(c[i] - g[i]) < 2e-3);
+        }
+    }
 }

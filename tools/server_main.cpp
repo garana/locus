@@ -128,7 +128,7 @@ OpenAI + Anthropic compatible inference server (default port 8080):
   POST /v1/chat/completions
   POST /v1/messages            (Anthropic)
   POST /v1/embeddings          (CPU and CUDA backends, or
-                               --embedding-model on the CPU)
+                               --embedding-model)
   POST /v1/rerank              (needs --rerank-model)
   GET  /v1/models
   GET  /v1/models/{id}

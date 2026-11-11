@@ -29,6 +29,20 @@ void passes(const std::vector<std::vector<tok::TokenId>>& ids,
     }
 }
 
+/** @returns gpu for a pass of at least EmbeddingModel::kGpuMinTokens
+ *  tokens and kGpuMacs of work when there is one, else op. */
+const backend::Ops& pick(std::span<const std::vector<tok::TokenId>> run,
+                         const backend::Ops& op, const backend::Ops* gpu,
+                         std::uint64_t token_macs) {
+    if (gpu == nullptr) return op;
+    std::uint64_t n = 0;
+    for (const auto& ids : run) n += ids.size();
+    return n >= EmbeddingModel::kGpuMinTokens &&
+                   n * token_macs >= EmbeddingModel::kGpuMacs
+               ? *gpu
+               : op;
+}
+
 }  // namespace
 
 EmbeddingModel::EmbeddingModel(std::unique_ptr<gguf::GgufFile> g,
@@ -96,7 +110,7 @@ std::unique_ptr<EmbeddingModel> EmbeddingModel::load(const std::string& path,
 
 std::vector<std::vector<float>> EmbeddingModel::embed(
     const std::vector<std::string>& inputs, const backend::Ops& op,
-    std::size_t* tokens) const {
+    std::size_t* tokens, const backend::Ops* gpu) const {
     if (reranker()) {
         throw std::invalid_argument(name_ + " is a reranker, not an "
                                             "embedding model");
@@ -119,14 +133,18 @@ std::vector<std::vector<float>> EmbeddingModel::embed(
     std::vector<std::vector<float>> out;
     out.reserve(inputs.size());
     passes(ids, [&](std::span<const std::vector<tok::TokenId>> run) {
-        for (auto& v : enc_.embed(run, op)) out.push_back(std::move(v));
+        for (auto& v :
+             enc_.embed(run, pick(run, op, gpu, enc_.token_macs()))) {
+            out.push_back(std::move(v));
+        }
     });
     return out;
 }
 
 std::vector<float> EmbeddingModel::rank(
     const std::string& query, const std::vector<std::string>& documents,
-    const backend::Ops& op, std::size_t* tokens) const {
+    const backend::Ops& op, std::size_t* tokens,
+    const backend::Ops* gpu) const {
     if (!reranker()) {
         throw std::invalid_argument(name_ + " is not a reranker");
     }
@@ -160,7 +178,8 @@ std::vector<float> EmbeddingModel::rank(
     std::vector<float> out;
     out.reserve(documents.size());
     passes(ids, [&](std::span<const std::vector<tok::TokenId>> run) {
-        for (const auto& logits : enc_.rank(run, op)) {
+        for (const auto& logits :
+             enc_.rank(run, pick(run, op, gpu, enc_.token_macs()))) {
             out.push_back(logits[0]);
         }
     });

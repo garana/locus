@@ -27,6 +27,16 @@ class EmbeddingModel {
      *  bge-small, 180 MB for bge-large). */
     static constexpr std::size_t kPassTokens = 4096;
 
+    /** A pass runs on the GPU ops, when embed() / rank() get them, from
+     *  kGpuMinTokens tokens and kGpuMacs of work (tokens x
+     *  BertEncoder::token_macs()); below either the GPU's fixed cost
+     *  per call wins. On an M2 Pro (MoltenVK), CPU against Vulkan:
+     *  bge-m3 45 tokens 190 / 206 ms, 120 tokens 588 / 339; nomic-embed
+     *  v1.5 120 tokens 217 / 108; bge-small 240 tokens 112 / 135, 480
+     *  tokens 216 / 205. */
+    static constexpr std::size_t kGpuMinTokens = 100;
+    static constexpr std::uint64_t kGpuMacs = 10'000'000'000ull;
+
     /**
      * @param path A GGUF of arch "bert" with a WordPiece tokenizer
      *     (BERT) or a SentencePiece unigram one (XLM-R).
@@ -50,6 +60,9 @@ class EmbeddingModel {
      * @param inputs UTF-8 texts.
      * @param op The backend ops the matrices run on.
      * @param tokens Set to the total token count, when not null.
+     * @param gpu GPU ops (backend::vulkan_image_ops()) for the passes of
+     *     at least kGpuMinTokens and kGpuMacs, or null for op
+     *     everywhere.
      * @returns One width()-float vector per input.
      * @throws std::invalid_argument when an input has more than
      *     context() tokens (the message names the input's index), or
@@ -57,7 +70,8 @@ class EmbeddingModel {
      */
     std::vector<std::vector<float>> embed(
         const std::vector<std::string>& inputs, const backend::Ops& op,
-        std::size_t* tokens = nullptr) const;
+        std::size_t* tokens = nullptr,
+        const backend::Ops* gpu = nullptr) const;
 
     /** @returns Whether the model is a reranker (pooling rank). */
     bool reranker() const { return enc_.pooling() == Pooling::kRank; }
@@ -72,6 +86,7 @@ class EmbeddingModel {
      * its document.
      *
      * @param tokens Set to the total token count, when not null.
+     * @param gpu As for embed().
      * @returns One score per document, in their order.
      * @throws std::invalid_argument when the model is not a reranker,
      *     or the query alone leaves no room for a document.
@@ -79,7 +94,8 @@ class EmbeddingModel {
     std::vector<float> rank(const std::string& query,
                             const std::vector<std::string>& documents,
                             const backend::Ops& op,
-                            std::size_t* tokens = nullptr) const;
+                            std::size_t* tokens = nullptr,
+                            const backend::Ops* gpu = nullptr) const;
 
   private:
     /** The special tokens of a pair; -1 = none. */

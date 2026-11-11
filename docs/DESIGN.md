@@ -641,7 +641,7 @@ guarding the default path.
 - Embeddings: with `--embedding-model`, a GGUF of arch `bert` (BERT
   with WordPiece, or XLM-R with SentencePiece) or `nomic-bert` (NEOX
   rope instead of a position table, fused qkv, SwiGLU, no biases;
-  `embed::BertEncoder`, CPU) serves `/v1/embeddings` for every request
+  `embed::BertEncoder`) serves `/v1/embeddings` for every request
   whose model is not the chat model: the inputs run as one batch
   (passes of up to 4096 tokens, attention within each input), pooled
   as the GGUF's `pooling_type` says (mean, CLS or last),
@@ -652,8 +652,16 @@ guarding the default path.
   them to 8 bits (0.99971 to 0.99989; 0.99965 from exact on bge-m3's
   24 layers). nomic-embed v1.5 loses more to Q8_0 itself: its Q8_0
   weights are 0.99887 to 0.99935 from its F16 ones (llama.cpp 0.99789
-  to 0.99869). Otherwise
-  `/v1/embeddings` returns the chat model's last token's final-normed
+  to 0.99869). The encoder runs on the best CPU backend; where the
+  GPU imports host memory (Apple, MoltenVK), a pass of at least 100
+  tokens and 1e10 multiply-adds runs on the Vulkan image ops instead
+  (the dense ops PixArt uses: one batched matvec per matrix, the
+  attention on the GPU), since below that the GPU's fixed cost per
+  call wins. On an M2 Pro that makes 32 bge-m3 inputs of 120 tokens
+  3.4x faster (18.2 s to 5.4 s) and a 50-document rerank 3.1x (12.8 s
+  to 4.1 s); bge-small barely gains (1.6 to 1.4 s), a per-token cost
+  in that path to find (#518). CUDA and other Vulkan GPUs: #519.
+  Otherwise `/v1/embeddings` returns the chat model's last token's final-normed
   hidden state, L2-normalized, on a dedicated cache; CPU and CUDA
   backends only (`TransformerModel::embed` refuses vulkan).
 - Rerank: with `--rerank-model`, a GGUF of arch `bert` with
