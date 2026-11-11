@@ -55,6 +55,7 @@ add_library(locus
     src/locus/image/janus_vision_vulkan.cpp
     src/locus/image/qwen_vae.cpp
     src/locus/image/qwen_vision.cpp
+    src/locus/image/qwen_edit_text.cpp
     src/locus/image/classifier.cpp
     src/locus/image/cnn.cpp
     src/locus/image/inception.cpp

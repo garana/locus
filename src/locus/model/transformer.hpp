@@ -476,6 +476,10 @@ class TransformerModel {
      *     (mrope_positions()) for an arch with M-RoPE sections
      *     (qwen2vl); the cache slots stay seq's next n. CPU backends
      *     only.
+     * @param hidden_only Write every position's hidden state after the
+     *     final norm into logits (n * n_embd floats) and skip the head:
+     *     a text encoder's last hidden states (i#574). CPU backends
+     *     only; all_logits must be false.
      * @throws std::invalid_argument on misuse or unsupported arch.
      */
     void forward_batch(std::span<const tok::TokenId> tokens,
@@ -484,7 +488,8 @@ class TransformerModel {
                        std::span<float> logits,
                        bool all_logits = false,
                        std::span<const float* const> embd = {},
-                       std::span<const MropePos> mrope = {}) const;
+                       std::span<const MropePos> mrope = {},
+                       bool hidden_only = false) const;
 
     /** @returns true when the batched forwards support this model
      * (every CPU/CUDA backend + arch; Vulkan opts out). */

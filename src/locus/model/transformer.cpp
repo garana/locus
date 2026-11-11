@@ -1187,11 +1187,22 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                                std::span<float> logits,
                                bool all_logits,
                                std::span<const float* const> embd,
-                               std::span<const MropePos> mrope) const {
+                               std::span<const MropePos> mrope,
+                               bool hidden_only) const {
     using namespace locus::backend;
     const auto n = static_cast<std::uint32_t>(toks.size());
     if (n == 0) {
         throw std::invalid_argument("forward_batch: empty batch");
+    }
+    // The GPU paths below return before the output branch: refuse them
+    // rather than hand back logits as hidden states.
+    if (hidden_only &&
+        (all_logits || backend_->name == "vulkan" ||
+         backend_->name == "cuda" || spec_->forward != nullptr ||
+         logits.size() != std::size_t{n} * hp_.n_embd)) {
+        throw std::invalid_argument(
+            "forward_batch: hidden_only needs a CPU backend, the llama "
+            "forward and n * n_embd outputs");
     }
     if (!supports_batch_prefill()) {
         throw std::invalid_argument(
@@ -1454,8 +1465,15 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     }
 
     // Prefill needs only the last token's logits; speculative verify
-    // needs every position's (logits is then n * n_vocab).
-    if (all_logits) {
+    // needs every position's (logits is then n * n_vocab); a text
+    // encoder needs every position's normed hidden state (i#574).
+    if (hidden_only) {
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const std::size_t o = static_cast<std::size_t>(t) * E;
+            apply_norm({x.data() + o, E}, out_norm_, hp_.rms_eps,
+                       logits.subspan(o, E));
+        }
+    } else if (all_logits) {
         // Speculative verify needs every position's logits; amortize the
         // head over all n positions (i#52).
         project_head_batch(op, x, xbf, logits, n);

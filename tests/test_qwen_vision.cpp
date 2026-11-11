@@ -12,21 +12,19 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "gguf_builder.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "png_parse.hpp"
+#include "qwen_tiny.hpp"
 
 namespace {
 
-using Shape = std::vector<std::uint64_t>;
 using locus::image::QwenVision;
 
 const std::string kDir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
 
 // Keep in sync with scripts/make-qwen-vision-goldens.py.
-constexpr std::uint32_t kW = 32, kHeads = 2, kFfn = 40, kOut = 24,
-                        kDepth = 4, kWa = 2, kGh = 12, kGw = 16;
+constexpr std::uint32_t kOut = 24, kGh = 12, kGw = 16;
 constexpr std::uint32_t kPatches[] = {0, 101};
 constexpr std::uint32_t kRows = 16, kRowStep = 4, kCropH = 196,
                         kCropW = 252;
@@ -48,84 +46,13 @@ std::vector<float> read_f32(const std::string& path) {
     return v;
 }
 
-/** The script's LCG: n values, advancing state. */
-std::vector<float> lcg(std::uint32_t& state, std::size_t n) {
-    std::vector<float> v(n);
-    for (auto& x : v) {
-        state = state * 1664525u + 1013904223u;
-        x = (static_cast<float>(state >> 8) / 16777216.0f - 0.5f) * 0.5f;
-    }
-    return v;
-}
+using qwen_tiny::lcg;
 
-/**
- * The tiny tower of scripts/make-qwen-vision-goldens.py synth as an
- * mmproj GGUF image: the script's gguf_shapes, F32, filled from the
- * LCG in sorted name order (std::map). Keep the two in sync.
- */
+/** The tiny tower of scripts/make-qwen-vision-goldens.py synth
+ *  (qwen_tiny.hpp), merging to kOut. */
 std::vector<std::byte> synth_mmproj(const char* projector =
                                         "qwen2.5vl_merger") {
-    std::map<std::string, Shape> shapes;
-    const std::uint64_t w = kW, f = kFfn, m = 4 * kW;
-    shapes["v.patch_embd.weight"] = {w, 3, 14, 14};
-    shapes["v.patch_embd.weight.1"] = {w, 3, 14, 14};
-    shapes["v.post_ln.weight"] = {w};
-    shapes["mm.0.weight"] = {m, m};
-    shapes["mm.0.bias"] = {m};
-    shapes["mm.2.weight"] = {kOut, m};
-    shapes["mm.2.bias"] = {kOut};
-    for (std::uint32_t i = 0; i < kDepth; ++i) {
-        const std::string b = "v.blk." + std::to_string(i) + ".";
-        shapes[b + "ln1.weight"] = {w};
-        shapes[b + "ln2.weight"] = {w};
-        for (const char* t : {"attn_q", "attn_k", "attn_v", "attn_out"}) {
-            shapes[b + t + ".weight"] = {w, w};
-            shapes[b + t + ".bias"] = {w};
-        }
-        for (const char* t : {"ffn_gate", "ffn_up"}) {
-            shapes[b + t + ".weight"] = {f, w};
-            shapes[b + t + ".bias"] = {f};
-        }
-        shapes[b + "ffn_down.weight"] = {w, f};
-        shapes[b + "ffn_down.bias"] = {w};
-    }
-    std::uint32_t state = 12345;
-    std::map<std::string, std::vector<float>> data;
-    for (const auto& [name, shape] : shapes) {
-        std::uint64_t n = 1;
-        for (auto d : shape) n *= d;
-        data[name] = lcg(state, n);
-    }
-
-    GgufBuilder g;
-    g.header(data.size(), 12);
-    g.kv_string("general.architecture", "clip");
-    g.kv_string("clip.projector_type", projector);
-    g.kv_u32("clip.vision.patch_size", 14);
-    g.kv_u32("clip.vision.embedding_length", kW);
-    g.kv_u32("clip.vision.feed_forward_length", kFfn);
-    g.kv_u32("clip.vision.attention.head_count", kHeads);
-    g.kv_u32("clip.vision.projection_dim", kOut);
-    g.kv_u32("clip.vision.block_count", kDepth);
-    g.kv_u32("clip.vision.n_wa_pattern", kWa);
-    g.kv_f32("clip.vision.attention.layer_norm_epsilon", 1e-6f);
-    const float mean[] = {0.5f, 0.5f, 0.5f}, sd[] = {0.25f, 0.25f, 0.25f};
-    g.kv_f32_array("clip.vision.image_mean", mean);
-    g.kv_f32_array("clip.vision.image_std", sd);
-    std::uint64_t offset = 0;
-    for (const auto& [name, v] : data) {
-        const Shape& s = shapes[name];
-        const std::vector<std::uint64_t> dims(s.rbegin(), s.rend());
-        g.tensor(name, dims, 0 /* F32 */, offset);
-        offset = (offset + v.size() * 4 + 31) & ~31ull;
-    }
-    g.pad();
-    for (const auto& [name, v] : data) {
-        for (float x : v) g.f32(x);
-        while (g.bytes().size() % 32 != 0) g.zeros(1);
-    }
-    auto span = g.bytes();
-    return {span.begin(), span.end()};
+    return qwen_tiny::mmproj(kOut, projector);
 }
 
 /** @returns The RMS of x - ref, and REQUIREs it within rel of ref's. */

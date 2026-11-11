@@ -8,96 +8,28 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
-#include "gguf_builder.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
+#include "qwen_tiny.hpp"
 
 namespace {
 
 using locus::model::MropePos;
 using locus::model::TransformerModel;
-using Shape = std::vector<std::uint64_t>;
+using qwen_tiny::kE;
+using qwen_tiny::kImageId;
+using qwen_tiny::kStartId;
+using qwen_tiny::kVocab;
+using qwen_tiny::lcg;
 
 // Keep in sync with scripts/make-qwen-mrope-golden.py.
-constexpr std::uint32_t kE = 64, kHeads = 4, kKv = 2, kFf = 96,
-                        kLayers = 2, kVocab = 64;
-constexpr std::int32_t kSections[] = {2, 3, 3, 0};
-constexpr std::int32_t kImageId = 60, kStartId = 61;
 const std::vector<std::int32_t> kBefore = {3, 17, 42, 9, kStartId};
 constexpr std::uint32_t kGh = 2, kGw = 3;
 const std::vector<std::int32_t> kAfter = {5, 33, 21, 58};
 
-/** The script's LCG: n values, advancing state. */
-std::vector<float> lcg(std::uint32_t& state, std::size_t n) {
-    std::vector<float> v(n);
-    for (auto& x : v) {
-        state = state * 1664525u + 1013904223u;
-        x = (static_cast<float>(state >> 8) / 16777216.0f - 0.5f) * 0.5f;
-    }
-    return v;
-}
-
-/**
- * The script's tiny Qwen2.5-VL language model as a GGUF image under
- * `arch` (qwen2vl, or qwen2 without the rope sections): the script's
- * gguf_shapes, F32, filled from the LCG in sorted name order.
- */
+/** The script's tiny language model (qwen_tiny.hpp) under `arch`. */
 std::vector<std::byte> tiny_model(const std::string& arch = "qwen2vl") {
-    const std::uint64_t hd = kE / kHeads;
-    std::map<std::string, Shape> shapes;
-    shapes["token_embd.weight"] = {kVocab, kE};
-    shapes["output_norm.weight"] = {kE};
-    shapes["output.weight"] = {kVocab, kE};
-    for (std::uint32_t i = 0; i < kLayers; ++i) {
-        const std::string b = "blk." + std::to_string(i) + ".";
-        shapes[b + "attn_norm.weight"] = {kE};
-        shapes[b + "ffn_norm.weight"] = {kE};
-        shapes[b + "attn_q.weight"] = {kE, kE};
-        shapes[b + "attn_q.bias"] = {kE};
-        for (const char* t : {"attn_k", "attn_v"}) {
-            shapes[b + t + ".weight"] = {kKv * hd, kE};
-            shapes[b + t + ".bias"] = {kKv * hd};
-        }
-        shapes[b + "attn_output.weight"] = {kE, kE};
-        shapes[b + "ffn_gate.weight"] = {kFf, kE};
-        shapes[b + "ffn_up.weight"] = {kFf, kE};
-        shapes[b + "ffn_down.weight"] = {kE, kFf};
-    }
-    std::uint32_t state = 12345;
-    std::map<std::string, std::vector<float>> data;
-    for (const auto& [name, shape] : shapes) {
-        std::uint64_t n = 1;
-        for (auto d : shape) n *= d;
-        data[name] = lcg(state, n);
-    }
-
-    const bool vl = arch == "qwen2vl";
-    GgufBuilder g;
-    g.header(data.size(), vl ? 10 : 9);
-    g.kv_string("general.architecture", arch);
-    g.kv_u32(arch + ".embedding_length", kE);
-    g.kv_u32(arch + ".block_count", kLayers);
-    g.kv_u32(arch + ".attention.head_count", kHeads);
-    g.kv_u32(arch + ".attention.head_count_kv", kKv);
-    g.kv_u32(arch + ".feed_forward_length", kFf);
-    g.kv_u32(arch + ".context_length", 128);
-    g.kv_f32(arch + ".attention.layer_norm_rms_epsilon", 1e-6f);
-    g.kv_f32(arch + ".rope.freq_base", 10000.0f);
-    if (vl) g.kv_i32_array(arch + ".rope.dimension_sections", kSections);
-    std::uint64_t offset = 0;
-    for (const auto& [name, v] : data) {
-        const Shape& s = shapes[name];
-        const std::vector<std::uint64_t> dims(s.rbegin(), s.rend());
-        g.tensor(name, dims, 0 /* F32 */, offset);
-        offset = (offset + v.size() * 4 + 31) & ~31ull;
-    }
-    g.pad();
-    for (const auto& [name, v] : data) {
-        for (float x : v) g.f32(x);
-        while (g.bytes().size() % 32 != 0) g.zeros(1);
-    }
-    auto span = g.bytes();
-    return {span.begin(), span.end()};
+    return qwen_tiny::lm(arch);
 }
 
 /** The prompt's token ids: text, the image span, text. */
