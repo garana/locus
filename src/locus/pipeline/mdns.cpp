@@ -1,6 +1,7 @@
 #include "locus/pipeline/mdns.hpp"
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -230,9 +231,34 @@ std::vector<SrvTarget> mdns_parse(std::span<const std::uint8_t> msg,
     return out;
 }
 
+bool mdns_local_source(std::uint32_t a, std::span<const Ipv4Net> nets) {
+    if ((a >> 24) == 127) return true;
+    return std::any_of(nets.begin(), nets.end(), [&](const Ipv4Net& n) {
+        return n.mask != 0 && (a & n.mask) == (n.addr & n.mask);
+    });
+}
+
+std::vector<Ipv4Net> local_ipv4_nets() {
+    std::vector<Ipv4Net> nets;
+    ifaddrs* list = nullptr;
+    if (::getifaddrs(&list) != 0) return nets;
+    for (const ifaddrs* i = list; i != nullptr; i = i->ifa_next) {
+        if (i->ifa_addr == nullptr || i->ifa_netmask == nullptr ||
+            i->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        const auto* a = reinterpret_cast<const sockaddr_in*>(i->ifa_addr);
+        const auto* m = reinterpret_cast<const sockaddr_in*>(i->ifa_netmask);
+        nets.push_back({ntohl(a->sin_addr.s_addr), ntohl(m->sin_addr.s_addr)});
+    }
+    ::freeifaddrs(list);
+    return nets;
+}
+
 std::vector<SrvTarget> mdns_browse(const std::string& service,
                                    const MdnsBrowse& opt) {
     const auto query = mdns_query(service);
+    const auto nets = local_ipv4_nets();
     in_addr group{};
     if (inet_pton(AF_INET, opt.group.c_str(), &group) != 1) return {};
     const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
@@ -261,8 +287,19 @@ std::vector<SrvTarget> mdns_browse(const std::string& service,
             if (left <= 0) break;
             pollfd p{fd, POLLIN, 0};
             if (::poll(&p, 1, static_cast<int>(left)) <= 0) break;
-            const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+            sockaddr_in from{};
+            socklen_t fl = sizeof(from);
+            const ssize_t n =
+                ::recvfrom(fd, buf.data(), buf.size(), 0,
+                           reinterpret_cast<sockaddr*>(&from), &fl);
             if (n <= 0) continue;
+            // A reply from another port, or from off the local networks,
+            // is not a responder's answer: drop it.
+            if (from.sin_family != AF_INET ||
+                ntohs(from.sin_port) != opt.port ||
+                !mdns_local_source(ntohl(from.sin_addr.s_addr), nets)) {
+                continue;
+            }
             for (auto& t : mdns_parse(
                      std::span<const std::uint8_t>(buf.data(),
                                                    static_cast<std::size_t>(n)),

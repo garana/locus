@@ -181,6 +181,27 @@ TEST_CASE("mdns parse survives malformed and hostile packets", "[mdns]") {
     }
 }
 
+// i#537: a reply is read only from loopback or an interface's network;
+// an interface with a zero mask makes nothing local.
+TEST_CASE("mdns local source is loopback or an interface network",
+          "[mdns]") {
+    using locus::pipeline::Ipv4Net;
+    using locus::pipeline::mdns_local_source;
+    const auto ip = [](unsigned a, unsigned b, unsigned c, unsigned d) {
+        return std::uint32_t{a << 24 | b << 16 | c << 8 | d};
+    };
+    const std::vector<Ipv4Net> nets = {
+        {ip(192, 168, 1, 20), ip(255, 255, 255, 0)}, {ip(10, 0, 0, 5), 0}};
+    CHECK(mdns_local_source(ip(127, 0, 0, 1), nets));
+    CHECK(mdns_local_source(ip(127, 9, 9, 9), {}));
+    CHECK(mdns_local_source(ip(192, 168, 1, 77), nets));
+    CHECK_FALSE(mdns_local_source(ip(192, 168, 2, 77), nets));
+    CHECK_FALSE(mdns_local_source(ip(10, 0, 0, 6), nets));  // zero mask
+    CHECK_FALSE(mdns_local_source(ip(8, 8, 8, 8), nets));
+    // This host has at least one IPv4 interface (loopback).
+    CHECK_FALSE(locus::pipeline::local_ipv4_nets().empty());
+}
+
 TEST_CASE("mdns browse collects answers from a loopback responder",
           "[mdns]") {
     // A responder on 127.0.0.1 and a test port, never the real group:
@@ -194,6 +215,15 @@ TEST_CASE("mdns browse collects answers from a loopback responder",
     socklen_t len = sizeof(a);
     REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len) == 0);
     const int port = ntohs(a.sin_port);
+    // A second loopback socket that forges an answer from another port:
+    // the browse must drop it (i#537).
+    const int forger = ::socket(AF_INET, SOCK_DGRAM, 0);
+    REQUIRE(forger >= 0);
+    sockaddr_in fa{};
+    fa.sin_family = AF_INET;
+    fa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::bind(forger, reinterpret_cast<sockaddr*>(&fa), sizeof(fa)) ==
+            0);
     std::atomic<int> queries{0};
     std::thread responder([&] {
         Bytes buf(1500);
@@ -206,6 +236,9 @@ TEST_CASE("mdns browse collects answers from a loopback responder",
         if (n <= 0) return;
         buf.resize(static_cast<std::size_t>(n));
         if (buf == mdns_query("_locus._tcp")) ++queries;
+        const auto forged = answer("c", "127.0.0.1", 18303);
+        ::sendto(forger, forged.data(), forged.size(), 0,
+                 reinterpret_cast<sockaddr*>(&from), fl);
         // Two responders' answers, and one repeated.
         for (const auto& r : {answer("a", "127.0.0.1", 18301),
                               answer("b", "127.0.0.1", 18302),
@@ -221,8 +254,9 @@ TEST_CASE("mdns browse collects answers from a loopback responder",
     const auto t = mdns_browse("_locus._tcp", opt);
     responder.join();
     ::close(fd);
+    ::close(forger);
     CHECK(queries == 1);
-    REQUIRE(t.size() == 2);
+    REQUIRE(t.size() == 2);  // not the forged "c" from another port
     CHECK(t[0].port + t[1].port == 18301 + 18302);
     // No responder: empty, within the timeout.
     opt.port = 9;  // discard; nothing answers on loopback

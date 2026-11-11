@@ -42,11 +42,31 @@ std::vector<std::uint8_t> mdns_query(const std::string& service);
 std::vector<SrvTarget> mdns_parse(std::span<const std::uint8_t> msg,
                                   const std::string& service);
 
+/** One IPv4 interface network, host byte order. */
+struct Ipv4Net {
+    std::uint32_t addr = 0, mask = 0;
+};
+
+/**
+ * @param a An IPv4 address, host byte order.
+ * @param nets The host's interface networks (local_ipv4_nets()); one
+ *     with a zero mask is ignored, so it cannot make every address local.
+ * @returns Whether a is loopback (127/8) or on one of nets.
+ */
+bool mdns_local_source(std::uint32_t a, std::span<const Ipv4Net> nets);
+
+/** @returns This host's IPv4 interface networks (getifaddrs). */
+std::vector<Ipv4Net> local_ipv4_nets();
+
 /**
  * Browses for SERVICE: sends mdns_query to opt.group:opt.port from an
  * ephemeral UDP port (so responders answer by unicast, RFC 6762 6.7;
  * the router joins no group), collects the answers for opt.timeout_ms
  * and parses each with mdns_parse.
+ *
+ * Only replies from opt.port (responders answer one-shot queries from
+ * 5353, RFC 6762 6.7) and from a local source (mdns_local_source) are
+ * read, so a host off the local networks cannot plant instances.
  *
  * @returns The targets found, one per host:port; empty on no answer or
  *     a socket error.
