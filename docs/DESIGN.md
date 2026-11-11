@@ -561,7 +561,8 @@ bitwise unchanged (a single end-of-row reduction would differ: float
 addition is not associative).
 
 `Ops::matvec_batch` is the hook. Kernels exist for Q4_K and Q6_K on
-sse4 and neon, and on CUDA (one launch for all N tokens). A backend
+sse4 and neon, and on CUDA (one launch for up to 32 tokens) for Q4_K,
+Q5_K, Q6_K, Q8_0, IQ4_NL and IQ4_XS. A backend
 kernel that covers only some types falls back to N calls of the same
 backend's matvec, never the scalar reference, so its batched and
 per-token paths agree.
