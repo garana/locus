@@ -1158,6 +1158,11 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
                     .count());
         });
         std::shared_ptr<http::Client> client = take(i);
+        const bool media = rt.kind == Kind::kImage ||
+                           rt.kind == Kind::kSpeech ||
+                           rt.kind == Kind::kVideo;
+        client->set_read_timeout_ms(media ? cfg_.media_read_timeout_ms
+                                          : cfg_.upstream.read_timeout_ms);
         {
             std::lock_guard lk(mu_);
             up.headers = upstream_headers(req, inst_[i]);

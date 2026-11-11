@@ -169,6 +169,11 @@ class Client {
      */
     ClientResponse send(const ClientRequest& req);
 
+    /** Sets the read timeout (ClientOptions::read_timeout_ms) for the
+     *  next requests: a pooled connection serves requests of different
+     *  lengths. */
+    void set_read_timeout_ms(int ms) { opt_.read_timeout_ms = ms; }
+
     /**
      * Sends `req` and passes the body to `on_body` as it arrives (each
      * chunk of a chunked body, or each read of a Content-Length or

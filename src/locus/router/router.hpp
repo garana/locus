@@ -184,6 +184,10 @@ struct RouterConfig {
     /** Toward the instances. Media requests can take minutes, so the
      * read deadline is per gap between reads, not per request. */
     http::ClientOptions upstream;
+    /** The read timeout of image, speech and video requests (ms; 0 = no
+     *  limit): a buffered image sends nothing until it is done, which on
+     *  the CPU takes minutes (i#605). The other kinds use upstream's. */
+    int media_read_timeout_ms = 30 * 60 * 1000;
     int worker_threads = 16;
 
     /** Client keys: when set, every request but /health needs a key
