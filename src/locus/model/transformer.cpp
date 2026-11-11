@@ -1080,6 +1080,13 @@ bool TransformerModel::supports_batch() const {
     return backend_->name != "vulkan" && !hp_.custom_layer;
 }
 
+bool TransformerModel::supports_batch_layers() const {
+    // Vulkan batches a stage's sequences through its own multi-sequence
+    // forward (i#566), without the CPU-driver path supports_batch covers.
+    return supports_batch() ||
+           (backend_->name == "vulkan" && !hp_.custom_layer);
+}
+
 bool TransformerModel::supports_batch_decode() const {
     return supports_batch() ||
            (backend_->name == "vulkan" && !hp_.custom_layer);
@@ -1643,7 +1650,7 @@ void TransformerModel::forward_batch_layers(
     if (n == 0) {
         throw std::invalid_argument("forward_batch_layers: empty");
     }
-    if (!supports_batch()) {
+    if (!supports_batch_layers()) {
         throw std::invalid_argument(
             "forward_batch_layers: unsupported backend");
     }
@@ -1683,6 +1690,71 @@ void TransformerModel::forward_batch_layers(
             throw std::invalid_argument(
                 "forward_batch_layers: seq capacity not ensured");
         }
+    }
+
+    if (backend_->name == "vulkan") {
+        // A Vulkan stage (i#566): the sequences in multi-sequence passes
+        // of at most 8 when the model fits them, else one GPU forward
+        // per sequence. A lone sequence keeps the single kernels unless
+        // the batch-invariant mode is on, as forward() does.
+        if (first) {
+            for (const tok::TokenId t : toks) {
+                if (t < 0 || static_cast<std::uint32_t>(t) >= V) {
+                    throw std::invalid_argument("token id out of vocab");
+                }
+            }
+        }
+        constexpr std::uint32_t kMultiMax = 8;  // vulkan_forward_multi's
+        const std::size_t ow = last ? V : E;
+        std::vector<float> normed(last ? std::size_t{n} * E : 0);
+        std::vector<EmbedStep> steps(n);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            steps[t].token = first ? toks[t] : 0;
+            if (!first) {
+                steps[t].embd_in = hidden_in.subspan(std::size_t{t} * E, E);
+            }
+            steps[t].seq = seqs[t];
+            steps[t].logits = out.subspan(t * ow, ow);
+            if (last) {
+                steps[t].normed_out =
+                    std::span(normed).subspan(std::size_t{t} * E, E);
+            }
+        }
+        StageLap lap(stage_metrics_.get());
+        // All or nothing, as the CPU path: a failure restores every
+        // seq's position (a rerun rewrites the same KV rows).
+        std::vector<std::uint32_t> before(n);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            before[t] = seqs[t]->n_tokens;
+        }
+        try {
+            for (std::uint32_t c = 0; c < n; c += kMultiMax) {
+                const std::uint32_t cn = std::min(kMultiMax, n - c);
+                const auto chunk = std::span(steps).subspan(c, cn);
+                if ((cn > 1 || backend::vulkan_batch_invariant()) &&
+                    vulkan_forward_multi_layers(*this, chunk, layer_begin,
+                                                layer_end, cache, 0, V)) {
+                    continue;
+                }
+                for (std::uint32_t t = c; t < c + cn; ++t) {
+                    if (first && last) {
+                        forward(toks[t], cache, *seqs[t], ws,
+                                steps[t].logits);
+                    } else {
+                        forward_layers(steps[t].token, steps[t].embd_in,
+                                       layer_begin, layer_end, cache,
+                                       *seqs[t], ws, steps[t].logits);
+                    }
+                }
+            }
+        } catch (...) {
+            for (std::uint32_t t = 0; t < n; ++t) {
+                seqs[t]->n_tokens = before[t];
+            }
+            throw;
+        }
+        lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
+        return;
     }
 
     const Ops op = effective_ops(backend_, q8k_activations());

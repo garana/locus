@@ -168,3 +168,183 @@ TEST_CASE("a vulkan stage refuses a range outside its cache",
     REQUIRE_THROWS_AS(locus::backend::vulkan_forward(b, 0, whole, sw, logits),
                       std::invalid_argument);
 }
+
+// i#566: a Vulkan stage batches its sequences in one multi-sequence
+// pass. Against the full model's multi-sequence pass over the same
+// sequences (the multi kernels may differ from the single ones in the
+// last bits, so like is compared with like), bit for bit.
+TEST_CASE("two batched vulkan stages give the full multi pass's logits",
+          "[vulkan][pipeline]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const auto& vk = *locus::backend::find_backend("vulkan");
+    auto full = TransformerModel::load(g);
+    full.use_backend(vk);
+    const std::uint32_t L = full.hparams().n_layers;
+    const std::uint32_t E = full.hparams().n_embd;
+    const std::uint32_t V = full.hparams().n_vocab;
+    const std::uint32_t k = L / 2;
+    auto a = TransformerModel::load(g, 0, k);
+    auto b = TransformerModel::load(g, k, L);
+    a.use_backend(vk);
+    b.use_backend(vk);
+    REQUIRE(a.supports_batch_layers());  // the StageExecutor batches
+    REQUIRE_FALSE(a.supports_batch());   // engine prefill unchanged
+
+    constexpr std::uint32_t n = 3;
+    const char* texts[n] = {
+        "Once upon a time, there was a little girl named Lily who loved "
+        "to play outside.",
+        "The cat sat on the mat and looked at the bird in the sky above "
+        "the old tree.",
+        "A dog ran in the park with a big red ball and a happy boy who "
+        "laughed."};
+    std::vector<std::vector<locus::tok::TokenId>> prompts;
+    std::size_t T = 1000;
+    for (const char* t : texts) {
+        prompts.push_back(tok.encode(t, true));
+        T = std::min(T, prompts.back().size());
+    }
+    REQUIRE(T > 16);
+
+    PagedKvCache fc = full.make_cache();
+    PagedKvCache ca = a.make_cache();
+    PagedKvCache cb = b.make_cache();
+    auto wa = a.make_workspace();
+    std::vector<PagedKvCache::Seq> fs(n), sa(n), sb(n);
+    std::vector<PagedKvCache::Seq*> pa, pb;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        pa.push_back(&sa[i]);
+        pb.push_back(&sb[i]);
+    }
+    std::vector<float> want(std::size_t{n} * V), got(std::size_t{n} * V);
+    std::vector<float> normed(std::size_t{n} * E), normed_b(normed.size());
+    std::vector<float> hidden(std::size_t{n} * E);
+    std::vector<locus::tok::TokenId> toks(n);
+    for (std::size_t p = 0; p < T; ++p) {
+        CAPTURE(p);
+        std::vector<locus::model::EmbedStep> fsteps(n), bsteps(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            REQUIRE(fc.ensure_capacity(fs[i], 1));
+            REQUIRE(ca.ensure_capacity(sa[i], 1));
+            REQUIRE(cb.ensure_capacity(sb[i], 1));
+            toks[i] = prompts[i][p];
+            fsteps[i] = {toks[i], {}, &fs[i],
+                         std::span(want).subspan(std::size_t{i} * V, V),
+                         std::span(normed).subspan(std::size_t{i} * E, E)};
+            bsteps[i] = {0, std::span(hidden).subspan(std::size_t{i} * E, E),
+                         &sb[i], std::span(got).subspan(std::size_t{i} * V, V),
+                         std::span(normed_b).subspan(std::size_t{i} * E, E)};
+        }
+        REQUIRE(locus::backend::vulkan_forward_multi(full, fsteps, fc, 0, V));
+        a.forward_batch_layers(toks, {}, 0, k, ca, pa, wa, hidden);
+        for (auto& s : sa) {
+            REQUIRE(s.n_tokens == p);  // a non-final stage does not advance
+            s.n_tokens += 1;
+        }
+        // The last stage through the GPU entry, so a decline fails here.
+        REQUIRE(locus::backend::vulkan_forward_multi_layers(b, bsteps, k, L,
+                                                            cb, 0, V));
+        REQUIRE(got == want);
+        const auto pos = static_cast<std::uint32_t>(p);
+        std::vector<float> rs(cb.geometry().kv_dim), rf(rs.size());
+        for (std::uint32_t i = 0; i < n; ++i) {
+            REQUIRE(sb[i].n_tokens == p + 1);
+            for (std::uint32_t l = k; l < L; ++l) {
+                for (const bool value : {false, true}) {
+                    cb.load_row(sb[i], l, pos, value, rs);
+                    fc.load_row(fs[i], l, pos, value, rf);
+                    REQUIRE(rs == rf);
+                }
+            }
+        }
+    }
+}
+
+// forward_batch_layers on both stages: 10 sequences run as multi passes
+// of 8 and 2 (the multi path's cap), and one sequence keeps the single
+// kernels (outside the batch-invariant mode), as forward() does.
+TEST_CASE("batched vulkan stages chunk by 8 and keep a lone sequence "
+          "single",
+          "[vulkan][pipeline]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    const std::uint32_t n = GENERATE(10u, 1u);
+    CAPTURE(n);
+    if (n == 1 && locus::backend::vulkan_batch_invariant()) {
+        SKIP("batch-invariant mode: a lone sequence takes the multi pass");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    const auto& vk = *locus::backend::find_backend("vulkan");
+    auto full = TransformerModel::load(g);
+    full.use_backend(vk);
+    const std::uint32_t L = full.hparams().n_layers;
+    const std::uint32_t E = full.hparams().n_embd;
+    const std::uint32_t V = full.hparams().n_vocab;
+    const std::uint32_t k = L / 2;
+    auto a = TransformerModel::load(g, 0, k);
+    auto b = TransformerModel::load(g, k, L);
+    a.use_backend(vk);
+    b.use_backend(vk);
+    PagedKvCache fc = full.make_cache();
+    PagedKvCache ca = a.make_cache();
+    PagedKvCache cb = b.make_cache();
+    auto wa = a.make_workspace();
+    auto wb = b.make_workspace();
+    std::vector<PagedKvCache::Seq> fs(n), sa(n), sb(n);
+    std::vector<PagedKvCache::Seq*> pa, pb;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        pa.push_back(&sa[i]);
+        pb.push_back(&sb[i]);
+    }
+    std::vector<float> want(std::size_t{n} * V), got(want.size());
+    std::vector<float> normed(std::size_t{n} * E);
+    std::vector<float> hidden(std::size_t{n} * E);
+    std::vector<locus::tok::TokenId> toks(n);
+    for (std::uint32_t p = 0; p < 20; ++p) {
+        CAPTURE(p);
+        std::vector<locus::model::EmbedStep> fsteps(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            REQUIRE(fc.ensure_capacity(fs[i], 1));
+            REQUIRE(ca.ensure_capacity(sa[i], 1));
+            REQUIRE(cb.ensure_capacity(sb[i], 1));
+            // A different token per sequence and position.
+            toks[i] = static_cast<locus::tok::TokenId>(1 + (p * 7 + i * 13) %
+                                                           (V - 1));
+            fsteps[i] = {toks[i], {}, &fs[i],
+                         std::span(want).subspan(std::size_t{i} * V, V),
+                         std::span(normed).subspan(std::size_t{i} * E, E)};
+        }
+        // The reference in the same chunks: multi passes of 8 and 2, or
+        // the single kernels for a lone sequence.
+        if (n == 1) {
+            REQUIRE(locus::backend::vulkan_forward(full, toks[0], fc, fs[0],
+                                                   want));
+        } else {
+            for (std::uint32_t c = 0; c < n; c += 8) {
+                const std::uint32_t cn = std::min(8u, n - c);
+                REQUIRE(locus::backend::vulkan_forward_multi(
+                    full, std::span(fsteps).subspan(c, cn), fc, 0, V));
+            }
+        }
+        a.forward_batch_layers(toks, {}, 0, k, ca, pa, wa, hidden);
+        for (auto& s : sa) {
+            s.n_tokens += 1;
+        }
+        b.forward_batch_layers({}, hidden, k, L, cb, pb, wb, got);
+        for (const auto& s : sb) {
+            REQUIRE(s.n_tokens == p + 1);
+        }
+        REQUIRE(got == want);
+    }
+}

@@ -2924,12 +2924,28 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                                  normed_out);
 }
 
-bool vulkan_forward_multi(const model::TransformerModel& m,
-                          std::span<const model::EmbedStep> steps,
-                          kv::PagedKvCache& cache, std::uint32_t row_begin,
-                          std::uint32_t row_end) {
+bool vulkan_forward_multi_layers(const model::TransformerModel& m,
+                                 std::span<const model::EmbedStep> steps,
+                                 std::uint32_t layer_begin,
+                                 std::uint32_t layer_end,
+                                 kv::PagedKvCache& cache,
+                                 std::uint32_t row_begin,
+                                 std::uint32_t row_end) {
     const auto& hp = m.hparams();
     const auto n = static_cast<std::uint32_t>(steps.size());
+    const bool last = layer_end == hp.n_layers;
+    if (layer_begin > layer_end || layer_end > hp.n_layers ||
+        layer_begin < m.layer_begin() || layer_end > m.layer_end()) {
+        throw std::invalid_argument(
+            "vulkan_forward_multi_layers: layer range outside the "
+            "loaded slice");
+    }
+    // The layers this call runs (a stage's slice loads only these).
+    const auto run =
+        std::span(m.layers()).subspan(layer_begin, layer_end - layer_begin);
+    if (run.empty()) {
+        return false;  // nothing to run (and no first layer to read)
+    }
     // Every weight needs a short-batch kernel: otherwise its projection
     // is a mostly-padding matmul tile or one matvec per row, and two
     // vulkan_forward calls (with their fused kernels) are faster.
@@ -2944,8 +2960,8 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
                w.type == gguf::TensorType::kQ6_K;
     };
     if (n == 1 && batch_invariant_state() == 2 &&
-        (kquant(m.output_weight()) ||
-         std::ranges::any_of(m.layers(), [&](const auto& l) {
+        ((last && kquant(m.output_weight())) ||
+         std::ranges::any_of(run, [&](const auto& l) {
              return kquant(l.wq) || kquant(l.wk) || kquant(l.wv) ||
                     kquant(l.wo) || kquant(l.w_gate) || kquant(l.w_up) ||
                     kquant(l.w_down);
@@ -2955,8 +2971,8 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
     if (n == 0 || n > State::kMultiMax || n > kSmallBatch ||
         cache.quantized() || hp.arch == model::Arch::kDeepseek2 ||
         hp.n_expert > 0 || !vulkan_forward_supported(m) ||
-        !short_ok(m.output_weight()) ||
-        std::ranges::any_of(m.layers(), [&](const auto& l) {
+        (last && !short_ok(m.output_weight())) ||
+        std::ranges::any_of(run, [&](const auto& l) {
             return l.is_moe() || l.has_qk_norm() || l.has_qkv_bias() ||
                    !short_ok(l.wq) || !short_ok(l.wk) || !short_ok(l.wv) ||
                    !short_ok(l.wo) || !short_ok(l.w_gate) ||
@@ -2978,9 +2994,22 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
         }
     }
     const auto& geom = cache.geometry();
-    if (geom.layer_base != 0 || geom.n_layers != hp.n_layers ||
-        m.layer_begin() != 0 || m.layer_end() != hp.n_layers) {
-        return false;  // a stage's slice: whole models only here
+    // A stage's cache holds only its slice: the loop runs absolute
+    // layer l and indexes the cache at l - layer_base (i#566).
+    if (layer_begin < geom.layer_base ||
+        layer_end > geom.layer_base + geom.n_layers) {
+        throw std::invalid_argument(
+            "vulkan_forward_multi_layers: layer range outside the cache");
+    }
+    // After layer 0, embd_in carries the previous stage's residual
+    // stream; before the last layer, logits receives this stage's.
+    for (const auto& st : steps) {
+        if ((layer_begin > 0 && st.embd_in.size() != hp.n_embd) ||
+            (!last && st.logits.size() < hp.n_embd)) {
+            throw std::invalid_argument(
+                "vulkan_forward_multi_layers: hidden in / out must be "
+                "n_embd");
+        }
     }
     const std::uint32_t E = hp.n_embd, hd = hp.head_dim, H = hp.n_heads;
     const std::uint32_t ff = hp.n_ff;
@@ -3001,7 +3030,9 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
     // floats a token) by one short-batch dispatch over the concatenated
     // weights, when all three are Q8_0: each row is the same dot the
     // separate projections compute.
-    const auto& lay0 = m.layers()[0];
+    // The first layer this call runs (layer 0 is empty on a later
+    // stage's slice).
+    const auto& lay0 = m.layers()[layer_begin];
     const bool qkv_cat = n <= kSmallBatch &&
                          lay0.wq.type == gguf::TensorType::kQ8_0 &&
                          lay0.wk.type == gguf::TensorType::kQ8_0 &&
@@ -3070,8 +3101,9 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
 
     s.ctx.begin_batch();
     State::BatchScope batch_scope{s};
-    for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
+    for (std::uint32_t l = layer_begin; l < layer_end; ++l) {
         const auto& lay = m.layers()[l];
+        const std::uint32_t rel = l - geom.layer_base;  // cache's index
         norm_rows(lay.attn_norm, bx, bxb);
         mark(s, model::Stage::kNorm);
         if (qkv_cat) {
@@ -3117,7 +3149,7 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
                                                       s.mtable[i]};
                 const std::uint32_t push[] = {
                     kv_dim,       pos,        geom.block_tokens,
-                    block_stride, kv_dim,     l * layer_stride,
+                    block_stride, kv_dim,     rel * layer_stride,
                     k_at,         kv_dim,     v_from_k,
                     layer_stride / 2};
                 s.ctx.dispatch(Kernel::kKvScatter, bufs, push, 1, 1, 2);
@@ -3130,11 +3162,11 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
                                block_stride, kv_dim, false};
             if (i == 0) {
                 rec_attn_gqa(s, pp, bq, s.att, batt, 1, pos, H, group, hd,
-                             q_dim, l * layer_stride, layer_stride / 2);
+                             q_dim, rel * layer_stride, layer_stride / 2);
             } else {
                 copy(bq, q_at, s.q, 0, q_dim);
                 rec_attn_gqa(s, pp, s.q, s.att, s.attout, 1, pos, H, group,
-                             hd, q_dim, l * layer_stride, layer_stride / 2);
+                             hd, q_dim, rel * layer_stride, layer_stride / 2);
                 copy(s.attout, 0, batt, i * q_dim, q_dim);
             }
         }
@@ -3171,6 +3203,19 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
         proj(lay.w_down, bgate, ff, bx, 0, E, true);
         mark(s, model::Stage::kFfn);
     }
+    if (!last) {
+        // A stage before the last hands each residual stream on: no
+        // final norm or head, and the seqs do not advance here.
+        s.end_batch();
+        std::vector<float> hidden_host(std::size_t{n} * E);
+        s.ctx.read_buffer(bx, std::as_writable_bytes(std::span(hidden_host)));
+        for (std::uint32_t i = 0; i < n; ++i) {
+            std::copy_n(hidden_host.begin() + std::size_t{i} * E, E,
+                        steps[i].logits.begin());
+            s.ctx.note_token();
+        }
+        return true;
+    }
     norm_rows(m.output_norm(), bx, bxb);
     mark(s, model::Stage::kNorm);
     // Head rows [row_begin, row_end) of every sequence: a row view of
@@ -3196,6 +3241,14 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
         s.ctx.note_token();
     }
     return true;
+}
+
+bool vulkan_forward_multi(const model::TransformerModel& m,
+                          std::span<const model::EmbedStep> steps,
+                          kv::PagedKvCache& cache, std::uint32_t row_begin,
+                          std::uint32_t row_end) {
+    return vulkan_forward_multi_layers(m, steps, 0, m.hparams().n_layers,
+                                       cache, row_begin, row_end);
 }
 
 bool vulkan_forward_batch(const model::TransformerModel& m,

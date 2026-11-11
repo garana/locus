@@ -104,7 +104,7 @@ class PipelineStage {
      * one malformed frame does not disturb the others.
      *
      * Requires supports_batch(); the backend floor is the model's
-     * (Vulkan cannot batch). At most one entry per sequence per call --
+     * forward_batch_layers. At most one entry per sequence per call --
      * the caller must not pass two frames for the same session in one
      * batch (the executor inherits this from "one step in flight per
      * session").
@@ -119,7 +119,7 @@ class PipelineStage {
 
     /** @returns Whether the backend can run a batched forward (and thus
      * step_batch); false means the caller must step one at a time. */
-    bool supports_batch() const { return model_.supports_batch(); }
+    bool supports_batch() const { return model_.supports_batch_layers(); }
 
     /**
      * Runs the read -> step -> write loop over the fds until in_fd

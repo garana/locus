@@ -495,6 +495,11 @@ class TransformerModel {
      * through its multi-sequence forward (forward_embeddings). */
     bool supports_batch_decode() const;
 
+    /** @returns true when forward_batch_layers runs: every
+     * supports_batch() backend, plus Vulkan, which runs a stage's
+     * sequences through its multi-sequence forward (i#566). */
+    bool supports_batch_layers() const;
+
     /** @returns true when forward_batch can ingest a prompt chunk:
      * every supports_batch() backend, plus Vulkan, which runs the
      * chunk through its GPU batched forward (one token at a time

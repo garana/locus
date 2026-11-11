@@ -106,6 +106,29 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
                           std::uint32_t row_end);
 
 /**
+ * vulkan_forward_multi over layers [layer_begin, layer_end) only
+ * (i#566), for a pipeline stage that batches its sequences; the cache
+ * may hold only a slice, as in vulkan_forward_layers.
+ *
+ * Per step, after layer 0 embd_in carries the previous stage's n_embd
+ * residual stream (required). Before the last layer, logits receives
+ * this stage's residual stream (n_embd floats, before the final norm)
+ * and the seqs do not advance; at the last layer it is as
+ * vulkan_forward_multi (logits rows, normed_out, seqs advance).
+ *
+ * @throws std::invalid_argument when the range is outside the cache's
+ *     or the model's loaded slice, or a hidden stream is not n_embd.
+ * @returns false when unsupported, before any state changes.
+ */
+bool vulkan_forward_multi_layers(const model::TransformerModel& m,
+                                 std::span<const model::EmbedStep> steps,
+                                 std::uint32_t layer_begin,
+                                 std::uint32_t layer_end,
+                                 kv::PagedKvCache& cache,
+                                 std::uint32_t row_begin,
+                                 std::uint32_t row_end);
+
+/**
  * Runs N tokens of one sequence (a prefill chunk) through the GPU
  * in one command batch: every projection is a tiled matmul over
  * the chunk's token rows, so each weight is read once per chunk
