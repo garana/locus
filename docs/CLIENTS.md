@@ -12,6 +12,7 @@ own docs.
 | POST /v1/completions          | OpenAI    | text completion, SSE stream                 |
 | POST /v1/chat/completions     | OpenAI    | chat, SSE stream, tools, image input        |
 | POST /v1/embeddings           | OpenAI    | string or array input; CPU and CUDA only    |
+| POST /v1/classify             | HF-style  | image labels; needs `--image-classifier`    |
 | GET  /v1/models (and /{id})   | OpenAI    | model discovery                             |
 | POST /v1/audio/speech         | OpenAI    | Orpheus-TTS; needs `--audio-decoder`        |
 | POST /v1/images/generations   | OpenAI    | Janus-Pro, PixArt-alpha or FLUX.1           |
@@ -181,6 +182,31 @@ curl -s localhost:8080/v1/videos -H 'Content-Type: application/json' \
 # {"id": "video_...", "status": "queued", ...}
 curl -s localhost:8080/v1/videos/video_...
 curl -s -o fox.mp4 localhost:8080/v1/videos/video_.../content
+```
+
+### Image classification
+
+`--image-classifier <cnn.gguf>` loads a CNN made by
+`scripts/convert-cnn.py` from a timm checkpoint (ResNet-50 or
+Inception-v3, ImageNet's 1000 classes). It runs on the CPU, one image
+at a time, with the checkpoint's own eval preprocessing (resize,
+center crop, mean and std).
+
+`POST /v1/classify` takes `{"image": ..., "top_k": 5}` and returns
+Hugging Face's image-classification shape: a list of `{label, score}`,
+the highest softmax probability first. The image is base64 or a
+`data:` URL (locus does not fetch URLs); `top_k` is 1 to the class
+count, 5 by default, and `model`, if given, must be the classifier's
+name. `/v1/embeddings` with that name as `model` takes images as its
+`input` strings and returns each one's pooled feature (2048 floats,
+the layer before the classifier), for image search and retrieval.
+`/v1/models` lists the classifier, and `locus_kinds` has `classify`.
+
+```sh
+img=$(base64 < apple.png)
+curl -s localhost:8080/v1/classify -H 'Content-Type: application/json' \
+    -d "{\"image\": \"$img\", \"top_k\": 2}"
+# [{"label":"Granny Smith","score":0.27},{"label":"butternut squash",...}]
 ```
 
 ## Clients

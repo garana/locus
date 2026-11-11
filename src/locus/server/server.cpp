@@ -27,6 +27,7 @@
 #include "locus/backend/fallbacks.hpp"
 #include "locus/backend/gpu_metrics.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/image/classifier.hpp"
 #include "locus/image/image_input.hpp"
 #include "locus/image/janus.hpp"
 #include "locus/image/janus_chat.hpp"
@@ -638,6 +639,19 @@ std::vector<std::byte> data_url_bytes(const json& image_url,
                                max_bytes);
 }
 
+/** @returns The bytes of an image given as a data: URL or as bare
+ *  base64 (/v1/classify, image inputs to /v1/embeddings). */
+std::vector<std::byte> image_input_bytes(const json& v,
+                                         std::size_t max_bytes) {
+    if (!v.is_string()) {
+        throw std::invalid_argument(
+            "an image must be a base64 string or a data: URL");
+    }
+    const std::string s = v.get<std::string>();
+    if (s.rfind("data:", 0) == 0) return data_url_bytes(v, max_bytes);
+    return http::base64_decode(s, max_bytes);
+}
+
 /** @returns Whether a message's content holds an image part. */
 bool has_image_part(const json& content, bool anthropic) {
     if (!content.is_array()) return false;
@@ -830,6 +844,15 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         if (rerank_->name() == opt_.model_name ||
             (bert_ && rerank_->name() == bert_->name())) {
             throw gguf::Error("--rerank-model " + rerank_->name() +
+                              " has another model's name");
+        }
+    }
+    if (!opt_.image_classifier_path.empty()) {
+        classifier_ = image::ImageClassifier::open(opt_.image_classifier_path);
+        const std::string& n = classifier_->name();
+        if (n == opt_.model_name || (bert_ && n == bert_->name()) ||
+            (rerank_ && n == rerank_->name())) {
+            throw gguf::Error("--image-classifier " + n +
                               " has another model's name");
         }
     }
@@ -1336,6 +1359,9 @@ OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
         if (path == "/v1/rerank" || path == "/rerank") {
             return Route::kRerank;
         }
+        if (path == "/v1/classify") {
+            return Route::kClassify;
+        }
         if (path == "/v1/audio/speech") {
             return Route::kAudioSpeech;
         }
@@ -1374,7 +1400,7 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
             opt_.metrics_path, "/health", "/v1/models", "/v1/models/",
             "/v1/completions", "/v1/chat/completions", "/v1/messages",
             "/v1/responses", "/v1/embeddings", "/v1/rerank", "/rerank",
-            "/v1/audio/speech",
+            "/v1/classify", "/v1/audio/speech",
             "/v1/images/generations", "/v1/images/edits"});
     cfg.metrics = http_metrics_;
     http_ = std::make_unique<http::Server>(std::move(cfg), route_handler_,
@@ -1433,12 +1459,19 @@ void OpenAiServer::install_routes() {
                                 {"created", 0},
                                 {"owned_by", "locus"}});
             }
+            if (classifier_) {
+                data.push_back({{"id", classifier_->name()},
+                                {"object", "model"},
+                                {"created", 0},
+                                {"owned_by", "locus"}});
+            }
             json kinds = json::array({"text"});
             if (vision_) kinds.push_back("image-to-text");
             if (janus_ || pixart_ || flux_) kinds.push_back("image");
             if (ltxv_) kinds.push_back("video");
             if (snac_) kinds.push_back("speech");
             if (rerank_) kinds.push_back("rerank");
+            if (classifier_) kinds.push_back("classify");
             res.set_content(
                 json{{"object", "list"},
                      {"data", data},
@@ -1455,7 +1488,8 @@ void OpenAiServer::install_routes() {
                 req.path.substr(std::string("/v1/models/").size());
             if (model_id != opt_.model_name &&
                 !(bert_ && model_id == bert_->name()) &&
-                !(rerank_ && model_id == rerank_->name())) {
+                !(rerank_ && model_id == rerank_->name()) &&
+                !(classifier_ && model_id == classifier_->name())) {
                 res.status = 404;
                 res.set_content(
                     make_error("model not found").dump(-1, ' ', false, kLossy),
@@ -2417,6 +2451,39 @@ void OpenAiServer::install_routes() {
                         "input must be a string or array of "
                         "strings");
                 }
+                // The image classifier's name: each input is an image
+                // (base64 or a data: URL), its pooled CNN feature out.
+                if (classifier_ && body.contains("model") &&
+                    body["model"].is_string() &&
+                    body["model"].get<std::string>() ==
+                        classifier_->name()) {
+                    image::DecodeLimits lim;
+                    lim.max_bytes = opt_.max_body_bytes;
+                    json data = json::array();
+                    for (std::size_t i = 0; i < inputs.size(); ++i) {
+                        const auto img = image::decode_image(
+                            image_input_bytes(json(inputs[i]),
+                                              opt_.max_body_bytes),
+                            lim);
+                        std::vector<float> e;
+                        {
+                            std::lock_guard<std::mutex> lk(classifier_mu_);
+                            e = classifier_->run(img).embedding;
+                        }
+                        data.push_back({{"object", "embedding"},
+                                        {"index", i},
+                                        {"embedding", std::move(e)}});
+                    }
+                    res.set_content(
+                        json{{"object", "list"},
+                             {"data", data},
+                             {"model", classifier_->name()},
+                             {"usage",
+                              {{"prompt_tokens", 0}, {"total_tokens", 0}}}}
+                            .dump(-1, ' ', false, kLossy),
+                        "application/json");
+                    return;
+                }
                 const bool chat = !bert_ ||
                                   (body.contains("model") &&
                                    body["model"].is_string() &&
@@ -2465,6 +2532,73 @@ void OpenAiServer::install_routes() {
                 res.set_content(
                     make_error(e.what()).dump(-1, ' ', false, kLossy),
                     "application/json");
+            }
+    };
+
+    // POST /v1/classify, Hugging Face's image-classification shape:
+    // {image, top_k?} -> [{label, score}], the highest softmax
+    // probabilities first, top_k of them (5 by default). The image is
+    // base64 or a data: URL; locus never fetches one. 503 without
+    // --image-classifier.
+    auto handle_classify = [this](const http::Request& req,
+                                  http::ServerResponse& res,
+                                  const http::RequestContext& ctx) {
+            auth_event("create", "classify", ctx.identity);
+            const auto fail = [&](int status, const std::string& msg) {
+                res.status = status;
+                res.set_content(make_error(msg).dump(-1, ' ', false, kLossy),
+                                "application/json");
+            };
+            if (!classifier_) {
+                fail(503, "no image classifier loaded (start locus-server "
+                          "with --image-classifier)");
+                return;
+            }
+            try {
+                const json body = json::parse(req.body);
+                if (!body.contains("image")) {
+                    throw std::invalid_argument("image is required");
+                }
+                if (body.contains("model") &&
+                    (!body["model"].is_string() ||
+                     body["model"].get<std::string>() !=
+                         classifier_->name())) {
+                    throw std::invalid_argument(
+                        "model must be " + classifier_->name());
+                }
+                std::int64_t k = 5;
+                if (body.contains("top_k")) {
+                    if (!body["top_k"].is_number_integer()) {
+                        throw std::invalid_argument(
+                            "top_k must be an integer");
+                    }
+                    k = body["top_k"].get<std::int64_t>();
+                }
+                if (k < 1 || k > classifier_->num_classes()) {
+                    throw std::invalid_argument(
+                        "top_k must be 1 to " +
+                        std::to_string(classifier_->num_classes()));
+                }
+                image::DecodeLimits lim;
+                lim.max_bytes = opt_.max_body_bytes;
+                const auto img = image::decode_image(
+                    image_input_bytes(body["image"], opt_.max_body_bytes),
+                    lim);
+                std::vector<float> logits;
+                {
+                    std::lock_guard<std::mutex> lk(classifier_mu_);
+                    logits = classifier_->run(img).logits;
+                }
+                json out = json::array();
+                for (const auto& [c, p] : image::cnn::top_k(
+                         logits, static_cast<std::uint32_t>(k))) {
+                    out.push_back(
+                        {{"label", classifier_->label(c)}, {"score", p}});
+                }
+                res.set_content(out.dump(-1, ' ', false, kLossy),
+                                "application/json");
+            } catch (const std::exception& e) {
+                fail(400, e.what());
             }
     };
 
@@ -3856,9 +3990,9 @@ void OpenAiServer::install_routes() {
     route_handler_ = [this, handle_health, handle_models,
                       handle_model_by_id, handle_metrics, handle,
                       handle_messages, handle_responses, handle_embeddings,
-                      handle_rerank, handle_audio, handle_images, handle_edits,
-                      handle_videos, handle_video_by_id,
-                      handle_video_content](
+                      handle_rerank, handle_classify, handle_audio,
+                      handle_images, handle_edits, handle_videos,
+                      handle_video_by_id, handle_video_content](
                          const http::Request& req, http::ServerResponse& res,
                          const http::RequestContext& ctx) {
         switch (route_of(req.method, req.path)) {
@@ -3872,6 +4006,7 @@ void OpenAiServer::install_routes() {
             case Route::kResponses:   handle_responses(req, res, ctx); break;
             case Route::kEmbeddings:  handle_embeddings(req, res, ctx); break;
             case Route::kRerank:      handle_rerank(req, res, ctx); break;
+            case Route::kClassify:    handle_classify(req, res, ctx); break;
             case Route::kAudioSpeech: handle_audio(req, res, ctx); break;
             case Route::kImages:      handle_images(req, res, ctx); break;
             case Route::kImageEdits:  handle_edits(req, res, ctx); break;

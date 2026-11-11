@@ -22,6 +22,7 @@ namespace locus::audio {
 class SnacDecoder;
 }
 namespace locus::image {
+class ImageClassifier;
 class JanusImageGen;
 class JanusVision;
 class PixArtPipeline;
@@ -103,6 +104,10 @@ class OpenAiServer {
          * --rerank-model) that enables POST /v1/rerank; /v1/models lists
          * it by its file name. Empty = the endpoint answers 503. */
         std::string rerank_model_path;
+        /** Path to a CNN image classifier GGUF (scripts/convert-cnn.py,
+         * --image-classifier) that enables POST /v1/classify and image
+         * inputs to /v1/embeddings under its name. Empty = 503. */
+        std::string image_classifier_path;
         /** Max documents one /v1/rerank call may score; over this gets
          * 400. */
         std::size_t max_rerank_documents = 1000;
@@ -207,7 +212,7 @@ class OpenAiServer {
     enum class Route {
         kHealth, kModels, kModelById, kMetrics,
         kCompletions, kChat, kMessages, kResponses, kEmbeddings,
-        kRerank, kAudioSpeech,
+        kRerank, kClassify, kAudioSpeech,
         kImages, kImageEdits,
         kVideos, kVideoById, kVideoContent, kUnknown
     };
@@ -299,6 +304,10 @@ class OpenAiServer {
     // at a time under rerank_mu_.
     std::unique_ptr<embed::EmbeddingModel> rerank_;
     std::mutex rerank_mu_;
+    // The CNN image classifier (--image-classifier; null when not
+    // given), one image at a time under classifier_mu_.
+    std::unique_ptr<image::ImageClassifier> classifier_;
+    std::mutex classifier_mu_;
 
     // /v1/audio/speech: the SNAC decoder (null when --audio-decoder was
     // not given) and the Orpheus audio band base resolved from the
