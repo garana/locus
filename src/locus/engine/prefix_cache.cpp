@@ -144,6 +144,9 @@ void PrefixCache::evict_lru() {
         return;
     }
     const EntryIt last = std::prev(entries_.end());
+    if (on_evict) {
+        on_evict(last->key, last->blocks);  // blocks still pinned here
+    }
     for (kv::BlockId b : last->blocks) {
         cache_.release_block(b);
     }

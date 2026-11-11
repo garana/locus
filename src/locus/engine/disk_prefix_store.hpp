@@ -84,7 +84,7 @@ class DiskPrefixStore {
      * @returns the blocks of the longest prefix of `prompt` with a
      *     file on disk (0 if none). The file is only checked by read().
      */
-    std::uint32_t find(std::span<const tok::TokenId> prompt) const;
+    virtual std::uint32_t find(std::span<const tok::TokenId> prompt) const;
 
     /**
      * Reads the stored blocks of `prompt`'s first `n_blocks` blocks,
@@ -95,7 +95,8 @@ class DiskPrefixStore {
      * @returns true when every block was read and verified; on false
      *     the contents of dst are unspecified.
      */
-    bool read(std::span<const tok::TokenId> prompt, std::uint32_t n_blocks,
+    virtual bool read(std::span<const tok::TokenId> prompt,
+                      std::uint32_t n_blocks,
               std::span<std::uint8_t* const> dst);
 
     /**
@@ -106,7 +107,8 @@ class DiskPrefixStore {
      * @returns false when the file alone exceeds the cap or on an I/O
      *     error (nothing is left behind).
      */
-    bool write(std::span<const tok::TokenId> prompt, std::uint32_t n_blocks,
+    virtual bool write(std::span<const tok::TokenId> prompt,
+                       std::uint32_t n_blocks,
                std::span<const std::uint8_t* const> src);
 
     /** @returns the file that holds `prompt`'s first `n_blocks`
@@ -117,6 +119,12 @@ class DiskPrefixStore {
 
     /** @returns bytes of the indexed files in the directory. */
     std::uint64_t used_bytes() const;
+
+    const DiskKey& key() const { return key_; }
+    std::size_t block_bytes() const { return block_bytes_; }
+
+    /** Virtual so a test can wrap the I/O (a slow or failing read). */
+    virtual ~DiskPrefixStore() = default;
 
   private:
     struct File {
@@ -143,13 +151,15 @@ class DiskPrefixStore {
                                      std::uint32_t n_blocks) const;
     std::uint64_t file_bytes(std::size_t header_bytes,
                              std::uint32_t n_blocks) const;
-    /** Unlinks a file and drops it from the index, when its gen is
-     *  `gen` (0: any). A file that cannot be unlinked stays indexed. */
-    void drop(std::uint64_t digest, std::uint64_t gen);
+    /** Drops a file from the index when its gen is `gen` (0: any).
+     *  @returns its path, for the caller to unlink after releasing the
+     *  lock, or an empty path when nothing was dropped. */
+    std::filesystem::path forget(std::uint64_t digest, std::uint64_t gen);
     /** @returns true when `digest` is indexed and its file exists;
      *  forgets an indexed file that no longer exists. */
     bool stored(std::uint64_t digest);
-    /** Marks a file most recently used (index and mtime). */
+    /** Marks a file most recently used in the index (the caller sets
+     *  its mtime after releasing the lock). */
     void touch(std::uint64_t digest);
 
     std::filesystem::path dir_;

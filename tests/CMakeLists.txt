@@ -38,6 +38,7 @@ add_executable(locus_tests
     test_helper_spawn.cpp
     test_prefix_cache.cpp
     test_disk_prefix_store.cpp
+    test_engine_disk_prefix.cpp
     test_poller.cpp
     test_meminfo.cpp
     test_mmap_file.cpp

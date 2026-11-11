@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <optional>
 #include <span>
@@ -57,6 +58,13 @@ class PrefixCache {
     /** Evicts LRU entries until the pool has `need` free blocks or
      * the cache is empty. @returns blocks freed. */
     std::uint32_t evict_until_free(std::uint32_t need);
+
+    /** When set, called with an entry's key and blocks as it is
+     *  evicted, before its blocks are released (the disk tier's
+     *  write-back, i#416). */
+    std::function<void(std::span<const tok::TokenId>,
+                       const std::vector<kv::BlockId>&)>
+        on_evict;
 
   private:
     struct Entry {

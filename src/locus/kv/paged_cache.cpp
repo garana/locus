@@ -201,6 +201,17 @@ void PagedKvCache::push_rows(BlockId b, std::uint32_t rel,
     }
 }
 
+void PagedKvCache::sync_block(BlockId id) {
+    if (!mirror_) {
+        return;
+    }
+    const std::size_t off = std::size_t{id} * block_stride_;
+    if (!mirror_store_(mirror_.get(), off, pool_ptr_ + off, block_stride_)) {
+        mirror_.reset();  // stale from here on: readers use the host
+        mirror_store_ = nullptr;
+    }
+}
+
 float* PagedKvCache::k(const Seq& seq, std::uint32_t layer,
                        std::uint32_t pos) {
     return row(seq, layer, pos, false);
