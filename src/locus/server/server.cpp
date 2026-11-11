@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -138,22 +139,62 @@ std::string openai_text(const json& content) {
     return out;
 }
 
-/** Parses and validates the OpenAI messages array. */
-std::vector<chat::Message> parse_messages(const json& messages) {
+/**
+ * Parses and validates the OpenAI messages array. Tool history renders
+ * as /v1/responses renders it: an assistant entry's tool_calls become
+ * one assistant turn each (render_tool_call; its content, if any,
+ * comes first), and a "tool" entry becomes a user turn
+ * (render_tool_result) named after its tool_call_id's call.
+ *
+ * @param has_tool_history Set when the history holds a tool call or
+ *     result.
+ */
+std::vector<chat::Message> parse_messages(const json& messages,
+                                          bool* has_tool_history = nullptr) {
     std::vector<chat::Message> out;
+    std::map<std::string, std::string> call_names;  // tool_call_id -> name
+    const auto text_of = [](const json& m) {
+        return m.contains("content") && !m["content"].is_null()
+                   ? openai_text(m["content"])
+                   : std::string();
+    };
     for (const auto& m : messages) {
-        if (!m.contains("content")) {
+        if (!m.is_object()) {
+            throw std::invalid_argument("messages must be objects");
+        }
+        const std::string role = m.value("role", "user");
+        const bool calls = role == "assistant" && m.contains("tool_calls") &&
+                           m["tool_calls"].is_array() &&
+                           !m["tool_calls"].empty();
+        if (role == "tool") {
+            const auto it = call_names.find(m.value("tool_call_id", ""));
+            const std::string name =
+                it != call_names.end() ? it->second : m.value("name", "");
+            out.push_back({"user", render_tool_result(name, text_of(m))});
+            if (has_tool_history != nullptr) *has_tool_history = true;
+            continue;
+        }
+        if (role != "system" && role != "user" && role != "assistant") {
+            throw std::invalid_argument("unsupported message role: " + role);
+        }
+        if (!calls && !m.contains("content")) {
             throw std::invalid_argument("message content is missing");
         }
-        chat::Message msg;
-        msg.role = m.value("role", "user");
-        if (msg.role != "system" && msg.role != "user" &&
-            msg.role != "assistant") {
-            throw std::invalid_argument(
-                "unsupported message role: " + msg.role);
+        const std::string text = text_of(m);
+        if (!calls || !text.empty()) out.push_back({role, text});
+        if (!calls) continue;
+        for (const auto& c : m["tool_calls"]) {
+            const json f = c.is_object() ? c.value("function", json::object())
+                                         : json::object();
+            const std::string name = f.value("name", "");
+            if (c.is_object() && c.contains("id") && c["id"].is_string()) {
+                call_names[c["id"].get<std::string>()] = name;
+            }
+            out.push_back(
+                {"assistant",
+                 render_tool_call(name, f.value("arguments", json()))});
         }
-        msg.content = openai_text(m["content"]);
-        out.push_back(std::move(msg));
+        if (has_tool_history != nullptr) *has_tool_history = true;
     }
     return out;
 }
@@ -719,6 +760,30 @@ std::string vision_turn_text(const json& content, bool anthropic,
 }
 
 /**
+ * The output limit of a completions or chat body: max_completion_tokens
+ * (OpenAI's current name, sent by the Antigravity SDK) or else
+ * max_tokens; a null value counts as absent.
+ *
+ * @param cap The server's --max-tokens; a larger request is clamped.
+ * @param dflt The limit when the body sets none.
+ * @throws std::invalid_argument when the value is not a positive integer.
+ */
+std::uint32_t read_max_tokens(const json& body, std::uint32_t cap,
+                              std::uint32_t dflt) {
+    for (const char* key : {"max_completion_tokens", "max_tokens"}) {
+        if (!body.contains(key) || body[key].is_null()) continue;
+        const auto& v = body[key];
+        if (!v.is_number_unsigned() || v.get<std::uint64_t>() == 0) {
+            throw std::invalid_argument(std::string(key) +
+                                        " must be a positive integer");
+        }
+        return static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(v.get<std::uint64_t>(), cap));
+    }
+    return dflt;
+}
+
+/**
  * Parses a chat (OpenAI messages[]) or messages (Anthropic, with a
  * top-level system) body that carries images.
  *
@@ -780,15 +845,7 @@ std::optional<VisionChat> parse_vision_chat(const json& body,
             "tools and output formats are not supported with image input "
             "yet");
     }
-    if (body.contains("max_tokens")) {
-        const auto& v = body["max_tokens"];
-        if (!v.is_number_unsigned() || v.get<std::uint64_t>() == 0) {
-            throw std::invalid_argument(
-                "max_tokens must be a positive integer");
-        }
-        vc.max_tokens = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(v.get<std::uint64_t>(), max_tokens_cap));
-    }
+    vc.max_tokens = read_max_tokens(body, max_tokens_cap, vc.max_tokens);
     std::tie(vc.sampling, vc.seed) = parse_sampling(body);
     return vc;
 }
@@ -1724,12 +1781,14 @@ void OpenAiServer::install_routes() {
                                            opt_.max_body_bytes);
             }
             if (chat && !vision) {
-                auto msgs = parse_messages(body["messages"]);
+                bool tool_history = false;
+                auto msgs = parse_messages(body["messages"], &tool_history);
                 tools = parse_tools(body, /*anthropic=*/false);
                 if (!tools.empty()) {
                     msgs.insert(msgs.begin(),
                                 {"system",
-                                 render_tools_system(tools)});
+                                 render_tools_system(tools) +
+                                     (tool_history ? kToolResultNote : "")});
                 }
                 prompt = opt_.chat_template.apply(msgs);
             } else if (!chat) {
@@ -1740,18 +1799,8 @@ void OpenAiServer::install_routes() {
                 }
                 prompt = body["prompt"].get<std::string>();
             }
-            if (body.contains("max_tokens")) {
-                const auto v = body["max_tokens"];
-                if (!v.is_number_unsigned() ||
-                    v.get<std::uint64_t>() == 0) {
-                    throw std::invalid_argument(
-                        "max_tokens must be a positive integer");
-                }
-                max_tokens = static_cast<std::uint32_t>(
-                    std::min<std::uint64_t>(
-                        v.get<std::uint64_t>(),
-                        opt_.max_tokens_cap));
-            }
+            max_tokens =
+                read_max_tokens(body, opt_.max_tokens_cap, max_tokens);
             stream = body.value("stream", false);
             if (!vision) {
                 grammar = output_grammar(body, req.body);

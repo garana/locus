@@ -12,11 +12,6 @@ constexpr auto kLossy = json::error_handler_t::replace;
 
 std::string dump(const json& j) { return j.dump(-1, ' ', false, kLossy); }
 
-/** Tells the model how tool results come back (see the item parser). */
-constexpr const char* kToolResultNote =
-    "\nA tool's output comes back as a user message that starts with "
-    "\"Tool result\".";
-
 /**
  * The text of a message item's content: a string, or parts whose
  * input_text / output_text / text entries are joined with newlines.
@@ -174,30 +169,21 @@ ResponsesRequest parse_responses_request(const json& body) {
             } else if (type == "function_call") {
                 const std::string name = flat_name(item);
                 call_names[item.value("call_id", "")] = name;
-                json args = json::object();
-                if (item.contains("arguments") &&
-                    item["arguments"].is_string()) {
-                    try {
-                        args = json::parse(
-                            item["arguments"].get<std::string>());
-                    } catch (const std::exception&) {
-                        args = item["arguments"];  // keep it as sent
-                    }
-                }
+                const json& a = item.contains("arguments") &&
+                                        item["arguments"].is_string()
+                                    ? item["arguments"]
+                                    : json();
                 out.messages.push_back(
-                    {"assistant",
-                     dump(json{{"name", name}, {"arguments", args}})});
+                    {"assistant", render_tool_call(name, a)});
             } else if (type == "function_call_output") {
                 const auto it = call_names.find(item.value("call_id", ""));
-                std::string text = "Tool result";
-                if (it != call_names.end()) {
-                    text += " (" + it->second + ")";
-                }
-                text += ":\n";
-                if (item.contains("output")) {
-                    text += item_text(item["output"], true);
-                }
-                out.messages.push_back({"user", std::move(text)});
+                out.messages.push_back(
+                    {"user",
+                     render_tool_result(
+                         it != call_names.end() ? it->second : "",
+                         item.contains("output")
+                             ? item_text(item["output"], true)
+                             : "")});
             }
             // Other item types (reasoning, web_search_call, ...) are
             // history from other servers; nothing of them goes in.
