@@ -2561,6 +2561,16 @@ class ScratchLease {
  * non-blocking stream so the copy overlaps the default-stream compute
  * of the current layer/expert; acquire() then waits on that copy's
  * event before handing the pointer to the kernel.
+ *
+ * Lifetime: a page is keyed by (host address, size) and never compared
+ * with the host bytes again, so it trusts that an address keeps its
+ * bytes. Production weights are GGUF mappings (and cuda_dev_const
+ * buffers the model owns) that live as long as the model. Code that
+ * frees host weights and may get new ones at the same address in the
+ * same process (a model unload and reload) must first drop the old
+ * pages, with cuda_evict() per weight or cuda_pool_reset(), as the
+ * Vulkan path does with vulkan_release_weights(); else a matvec reads
+ * the old model's device copy.
  */
 class WeightPool {
  public:

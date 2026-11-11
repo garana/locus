@@ -400,7 +400,9 @@ void cuda_set_device(int ordinal);
  * pool keys weights by host pointer, valid only while that buffer is
  * live; tests reset it between cases so transient weight buffers whose
  * addresses get recycled do not alias a stale device page. No-op on
- * non-CUDA builds; never needed in inference (weight pointers stable).
+ * non-CUDA builds. Inference does not need it while weights stay
+ * mapped for the model's life; a model unload and reload must call it
+ * (or cuda_evict per weight) before the new weights run.
  */
 void cuda_pool_reset();
 
@@ -415,7 +417,8 @@ void cuda_prefetch(const Mat& w);
 /**
  * Frees w's page in the CUDA weight pool now (Ops.evict), unless a
  * matvec holds it. No-op when w is not resident, and on non-CUDA
- * builds.
+ * builds. Call it before freeing w's host bytes when that address may
+ * hold another weight later: the pool keys pages by host address.
  */
 void cuda_evict(const Mat& w);
 
