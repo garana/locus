@@ -122,6 +122,7 @@ class DiskPrefixStore {
 
     const DiskKey& key() const { return key_; }
     std::size_t block_bytes() const { return block_bytes_; }
+    std::uint64_t cap_bytes() const { return cap_bytes_; }
 
     /** Virtual so a test can wrap the I/O (a slow or failing read). */
     virtual ~DiskPrefixStore() = default;

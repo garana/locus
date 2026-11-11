@@ -7,6 +7,7 @@
 
 #include "backend_cli.hpp"
 #include "cli_spec.hpp"
+#include "locus/engine/disk_prefix_key.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
@@ -60,6 +61,11 @@ int main(int argc, char** argv) {
                      "%s: %s needs a non-negative integer, got '%s'\n",
                      argv[0], args.bad_number_flag.c_str(),
                      args.bad_number_value.c_str());
+        return 2;
+    }
+    if (!args.prefix_cache_dir.empty() && args.prefix_cache_disk_mib == 0) {
+        std::fprintf(stderr, "%s: --prefix-cache-disk-mib must be > 0\n",
+                     argv[0]);
         return 2;
     }
     if (args.positional.size() < 2) {
@@ -122,6 +128,12 @@ int main(int argc, char** argv) {
         }
         cfg.spec_adaptive = !args.spec_fixed;
         cfg.batched_prefill = !args.no_batch_prefill;
+        if (!args.prefix_cache_dir.empty()) {
+            cfg.disk_prefix = locus::engine::open_disk_prefix(
+                args.prefix_cache_dir,
+                std::uint64_t{args.prefix_cache_disk_mib} << 20, g,
+                model_path, model, args.kv_type);
+        }
         locus::engine::Engine engine(model, tok.eos_id(), cfg);
 
         using clock = std::chrono::steady_clock;

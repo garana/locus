@@ -198,6 +198,10 @@ class Engine {
     /** Same, with default Config. */
     Engine(const model::TransformerModel& m, tok::TokenId eos);
 
+    /** With a disk tier, writes the RAM prefix cache's entries to it
+     *  (blocking, up to its cap) so a restart can read them back. */
+    ~Engine();
+
     /**
      * Enqueues a prompt for generation.
      *

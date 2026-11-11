@@ -170,6 +170,29 @@ class GgufFile {
     /** @returns Tensor descriptors in file order. */
     const std::vector<TensorInfo>& tensors() const { return tensors_; }
 
+    /** Calls `fn(file)` for this file, then each sibling shard. */
+    template <typename F>
+    void for_each_file(F&& fn) const {
+        fn(*this);
+        for (const auto& s : shards_) {
+            fn(*s);
+        }
+    }
+
+    /** @returns This file's size in bytes. */
+    std::size_t file_bytes() const { return buf_.size(); }
+
+    /** @returns This file's bytes before its data section: the header,
+     *  the metadata and the tensor table (the disk prefix cache hashes
+     *  them to name the model, i#416). */
+    std::span<const std::byte> header_bytes() const {
+        if (data_.data() == nullptr) {
+            return buf_;
+        }
+        return buf_.first(
+            static_cast<std::size_t>(data_.data() - buf_.data()));
+    }
+
     /** @returns The tensor named `name` (any shard), or nullptr. */
     const TensorInfo* find_tensor(std::string_view name) const;
 

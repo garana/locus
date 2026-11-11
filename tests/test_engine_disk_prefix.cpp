@@ -101,6 +101,7 @@ struct Fixture {
     locus::tok::SpmTokenizer tok;
     std::vector<TokenId> p;  // the prompt that goes to disk
     std::vector<TokenId> q;  // another one, to evict p from RAM
+    std::vector<TokenId> r;  // never cached: always computed
     std::vector<TokenId> want;
 
     Fixture()
@@ -116,6 +117,7 @@ struct Fixture {
             "The cat sat on the mat and looked at the bird in the sky. "
             "The bird sang a happy song.",
             true);
+        r = tok.encode("A dog ran.", true);
         Engine baseline(model, tok.eos_id(), Engine::Config{});
         const auto id = baseline.submit(p, 20);
         baseline.run_to_completion();
@@ -224,7 +226,10 @@ TEST_CASE("engine keeps decoding while a request loads from disk",
     auto store = std::make_shared<SlowStore>(t.dir, key, bb, gate.f);
     Engine e(f.model, f.tok.eos_id(), f.config(store));
     OpenOnExit opener{gate};
-    const auto busy = e.submit(f.q, 40);
+    // r: shorter than a block, so it never loads from disk (the fill
+    // engine wrote q too, at shutdown).
+    REQUIRE(f.r.size() < 16);
+    const auto busy = e.submit(f.r, 40);
     e.step();
     e.step();
     const auto id = e.submit(f.p, 20);

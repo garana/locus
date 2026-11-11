@@ -37,9 +37,10 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   bge-reranker-v2-m3) serves `/v1/rerank` with `--rerank-model`.
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
   penalties, seed), structured output (JSON mode, a JSON Schema, a
-  regex or a GBNF grammar), prompt caching, logprobs, prompt-lookup
-  speculative decoding with a draft length that adapts to the accept
-  rate and the measured verify cost.
+  regex or a GBNF grammar), prompt caching (in RAM, and on disk with
+  `--prefix-cache-dir DIR`, read back also after a restart), logprobs,
+  prompt-lookup speculative decoding with a draft length that adapts
+  to the accept rate and the measured verify cost.
 - **Large models:** weights stream from disk with readahead, so a
   model can be larger than RAM.
 - **Speech:** `/v1/audio/speech` with Orpheus-TTS and the SNAC codec;

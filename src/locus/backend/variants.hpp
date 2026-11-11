@@ -228,6 +228,10 @@ const char* vulkan_api_name();
  */
 void vulkan_set_prefill_f16(bool on);
 
+/** @returns Whether prefill stages operands in f16 (the effective
+ *  vulkan_set_prefill_f16 setting; false without a usable device). */
+bool vulkan_prefill_f16();
+
 /**
  * @returns The query tokens per attention sub-block of the batched
  * Vulkan prefill for n queries of `heads` heads over n_pos positions:

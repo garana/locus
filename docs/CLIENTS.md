@@ -28,6 +28,11 @@ The chat endpoints and `/v1/responses` accept a `tools` list and
 return structured tool calls (OpenAI `tool_calls`, Anthropic
 `tool_use`, Responses `function_call` items), streamed or not.
 The OpenAI paths also support `logprobs` and `usage` accounting.
+Prompt tokens served from the prefix cache, in RAM or (with
+`--prefix-cache-dir DIR`, capped by `--prefix-cache-disk-mib`) on
+disk, count as `usage.prompt_tokens_details.cached_tokens` (Anthropic:
+`cache_read_input_tokens`). The disk cache keeps each prefix's prompt
+tokens, so DIR must not be readable by other users (files are 0600).
 
 Structured output forces the reply to match a format, by masking the
 tokens that would break it:
