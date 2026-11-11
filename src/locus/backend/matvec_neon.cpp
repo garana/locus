@@ -55,47 +55,75 @@ float dot_f32_neon(const float* w, const float* x,
     return s;
 }
 
+/** Widens BF16 exactly: a bf16 is the top half of an f32, so a 16-bit
+ *  left shift is the conversion. */
+struct WidenBf16 {
+    static float32x4_t lo(uint16x8_t v) {
+        return vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v), 16));
+    }
+    static float32x4_t hi(uint16x8_t v) {
+        return vreinterpretq_f32_u32(vshll_high_n_u16(v, 16));
+    }
+    static float one(std::uint16_t h) {
+        const std::uint32_t u = static_cast<std::uint32_t>(h) << 16;
+        float f;
+        std::memcpy(&f, &u, sizeof f);
+        return f;
+    }
+};
+
+/** Widens F16 exactly through FCVTL (base AArch64 SIMD, no +fp16). */
+struct WidenF16 {
+    static float32x4_t lo(uint16x8_t v) {
+        return vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(v)));
+    }
+    static float32x4_t hi(uint16x8_t v) {
+        return vcvt_high_f32_f16(vreinterpretq_f16_u16(v));
+    }
+    static float one(std::uint16_t h) { return half_to_float(h); }
+};
+
 /**
- * BF16 row . f32 x. A bf16 is the top half of an f32, so a 16-bit left
- * shift widens it exactly; the products go into two 4-lane FMA chains
- * (8 weights per step), summed at the end, so the order differs from
- * the scalar dot's single chain (agrees to float rounding).
+ * 16-bit float row . f32 x (W: WidenBf16 or WidenF16). The products go
+ * into two 4-lane FMA chains (8 weights per step), summed at the end,
+ * so the order differs from the scalar dot's single chain (agrees to
+ * float rounding).
  */
-float dot_bf16_neon(const std::uint16_t* w, const float* x,
-                    std::size_t n) {
+template <class W>
+float dot_h16_neon(const std::uint16_t* w, const float* x, std::size_t n) {
     float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
     std::size_t i = 0;
     for (; i + 8 <= n; i += 8) {
         const uint16x8_t v = vld1q_u16(w + i);
-        a0 = vfmaq_f32(a0,
-                       vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v), 16)),
-                       vld1q_f32(x + i));
-        a1 = vfmaq_f32(a1, vreinterpretq_f32_u32(vshll_high_n_u16(v, 16)),
-                       vld1q_f32(x + i + 4));
+        a0 = vfmaq_f32(a0, W::lo(v), vld1q_f32(x + i));
+        a1 = vfmaq_f32(a1, W::hi(v), vld1q_f32(x + i + 4));
     }
     float s = vaddvq_f32(vaddq_f32(a0, a1));
     for (; i < n; ++i) {
-        const std::uint32_t u = static_cast<std::uint32_t>(w[i]) << 16;
-        float f;
-        std::memcpy(&f, &u, sizeof f);
-        s += f * x[i];
+        s += W::one(w[i]) * x[i];
     }
     return s;
 }
 
+float dot_bf16_neon(const std::uint16_t* w, const float* x,
+                    std::size_t n) {
+    return dot_h16_neon<WidenBf16>(w, x, n);
+}
+
 /**
- * R BF16 rows . T tokens, each dot in dot_bf16_neon's exact order (two
- * 4-lane chains, summed at the end, then the scalar tail), so each
- * result is byte-identical to it. Each 8-weight step is widened once
- * and used for all T tokens; each x load is used for all R rows.
+ * R 16-bit float rows . T tokens, each dot in dot_h16_neon's exact
+ * order (two 4-lane chains, summed at the end, then the scalar tail),
+ * so each result is byte-identical to it. Each 8-weight step is
+ * widened once and used for all T tokens; each x load is used for all
+ * R rows.
  *
  * @param w The first row; row k starts at w + k * cols.
  * @param x The first token; token j starts at x + j * cols.
  * @param out out[k * stride + j] receives row k . token j.
  */
-template <int R, int T>
-void bf16_tile_neon(const std::uint16_t* w, const float* x,
-                    std::size_t cols, float* out, std::size_t stride) {
+template <class W, int R, int T>
+void h16_tile_neon(const std::uint16_t* w, const float* x,
+                   std::size_t cols, float* out, std::size_t stride) {
     float32x4_t a0[R][T], a1[R][T];
     for (int k = 0; k < R; ++k) {
         for (int j = 0; j < T; ++j) {
@@ -108,8 +136,8 @@ void bf16_tile_neon(const std::uint16_t* w, const float* x,
         float32x4_t lo[R], hi[R];
         for (int k = 0; k < R; ++k) {
             const uint16x8_t v = vld1q_u16(w + k * cols + i);
-            lo[k] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v), 16));
-            hi[k] = vreinterpretq_f32_u32(vshll_high_n_u16(v, 16));
+            lo[k] = W::lo(v);
+            hi[k] = W::hi(v);
         }
         for (int j = 0; j < T; ++j) {
             const float32x4_t x0 = vld1q_f32(x + j * cols + i);
@@ -124,11 +152,7 @@ void bf16_tile_neon(const std::uint16_t* w, const float* x,
         for (int j = 0; j < T; ++j) {
             float s = vaddvq_f32(vaddq_f32(a0[k][j], a1[k][j]));
             for (std::size_t e = i; e < cols; ++e) {
-                const std::uint32_t u =
-                    static_cast<std::uint32_t>(w[k * cols + e]) << 16;
-                float f;
-                std::memcpy(&f, &u, sizeof f);
-                s += f * x[j * cols + e];
+                s += W::one(w[k * cols + e]) * x[j * cols + e];
             }
             out[k * stride + j] = s;
         }
@@ -762,12 +786,15 @@ void matvec_neon(const Mat& w, std::span<const float> x,
         }
         return;
     }
-    if (w.type == gguf::TensorType::kBF16) {
+    if (w.type == gguf::TensorType::kBF16 ||
+        w.type == gguf::TensorType::kF16) {
         const auto* rows = reinterpret_cast<const std::uint16_t*>(w.data);
+        const bool bf = w.type == gguf::TensorType::kBF16;
         for (std::uint32_t r = 0; r < w.rows; ++r) {
-            out[r] = dot_bf16_neon(
-                rows + static_cast<std::size_t>(r) * w.cols, x.data(),
-                w.cols);
+            const std::uint16_t* row =
+                rows + static_cast<std::size_t>(r) * w.cols;
+            out[r] = bf ? dot_bf16_neon(row, x.data(), w.cols)
+                        : dot_h16_neon<WidenF16>(row, x.data(), w.cols);
         }
         return;
     }
@@ -1154,11 +1181,11 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
         }
         return;
     }
-    // Register-blocked BF16: 2-row x 4-token tiles (bf16_tile_neon),
-    // byte-identical to dot_bf16_neon per token. Token blocks are the
-    // outer loop, so a block's 4 x rows stay in L1 while the weight
-    // rows stream past them.
-    if (w.type == gguf::TensorType::kBF16) {
+    // Register-blocked BF16 and F16: 2-row x 4-token tiles
+    // (h16_tile_neon), byte-identical to dot_h16_neon per token. Token
+    // blocks are the outer loop, so a block's 4 x rows stay in L1 while
+    // the weight rows stream past them.
+    const auto h16 = [&]<class W>(W) {
         const auto* rows = reinterpret_cast<const std::uint16_t*>(w.data);
         float* out = out_batch.data();
         std::uint32_t t = 0;
@@ -1166,21 +1193,28 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
             const float* xt = x_batch.data() + t * cols;
             std::uint32_t r = 0;
             for (; r + 2 <= w.rows; r += 2) {
-                bf16_tile_neon<2, 4>(rows + r * cols, xt, cols,
-                                     out + std::size_t{r} * n + t, n);
+                h16_tile_neon<W, 2, 4>(rows + r * cols, xt, cols,
+                                       out + std::size_t{r} * n + t, n);
             }
             if (r < w.rows) {
-                bf16_tile_neon<1, 4>(rows + r * cols, xt, cols,
-                                     out + std::size_t{r} * n + t, n);
+                h16_tile_neon<W, 1, 4>(rows + r * cols, xt, cols,
+                                       out + std::size_t{r} * n + t, n);
             }
         }
         for (; t < n; ++t) {
             const float* xt = x_batch.data() + t * cols;
             for (std::uint32_t r = 0; r < w.rows; ++r) {
                 out[std::size_t{r} * n + t] =
-                    dot_bf16_neon(rows + r * cols, xt, cols);
+                    dot_h16_neon<W>(rows + r * cols, xt, cols);
             }
         }
+    };
+    if (w.type == gguf::TensorType::kBF16) {
+        h16(WidenBf16{});
+        return;
+    }
+    if (w.type == gguf::TensorType::kF16) {
+        h16(WidenF16{});
         return;
     }
     // Other types: per-token NEON, scattered row-major. Byte-

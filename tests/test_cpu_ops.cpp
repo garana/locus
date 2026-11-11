@@ -913,25 +913,29 @@ TEST_CASE("matvec_batch_neon is byte-identical to per-token neon",
     }
 }
 
-TEST_CASE("matvec_batch_neon BF16 tiles are byte-identical to per-token "
-          "neon",
+TEST_CASE("matvec_batch_neon BF16 and F16 tiles are byte-identical to "
+          "per-token neon",
           "[ops][batch][neon]") {
     // 2-row x 4-token tiles, an odd last row, leftover tokens, and a
     // column count that is not a multiple of 8 (the scalar tail).
     constexpr std::uint32_t rows = 5;
     std::mt19937 rng(257);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    for (const TensorType type : {TensorType::kBF16, TensorType::kF16})
     for (std::uint32_t cols : {64u, 523u}) {
         std::vector<std::uint16_t> w(std::size_t{rows} * cols);
         for (auto& v : w) {
             const float f = xd(rng);
+            if (type == TensorType::kF16) {
+                v = f32_to_f16(f);
+                continue;
+            }
             std::uint32_t u;
             std::memcpy(&u, &f, sizeof u);
             v = static_cast<std::uint16_t>(u >> 16);
         }
-        const Mat m{TensorType::kBF16,
-                    reinterpret_cast<const std::byte*>(w.data()), rows,
-                    cols};
+        const Mat m{type, reinterpret_cast<const std::byte*>(w.data()),
+                    rows, cols};
         for (std::uint32_t n : {1u, 4u, 6u, 9u}) {
             std::vector<float> xb(std::size_t{n} * cols);
             for (auto& v : xb) v = xd(rng);
@@ -943,7 +947,8 @@ TEST_CASE("matvec_batch_neon BF16 tiles are byte-identical to per-token "
                     matvec_neon(mat_rows(m, r, 1),
                                 {xb.data() + std::size_t{tk} * cols, cols},
                                 {&ref, 1});
-                    INFO("cols " << cols << " n " << n << " r=" << r
+                    INFO("type " << static_cast<int>(type) << " cols "
+                                 << cols << " n " << n << " r=" << r
                                  << " t=" << tk);
                     REQUIRE(got[std::size_t{r} * n + tk] == ref);
                 }
