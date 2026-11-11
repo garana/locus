@@ -109,8 +109,10 @@ TEST_CASE("vulkan_device_beats_cpu follows the device in use",
         REQUIRE_FALSE(vulkan_device_beats_cpu());
         return;
     }
-    const auto& d = devs[static_cast<std::size_t>(vulkan_thread_device())];
-    REQUIRE(vulkan_device_beats_cpu() == vulkan_beats_cpu(d.type, d.name));
+    const auto i = static_cast<std::size_t>(vulkan_thread_device());
+    REQUIRE(i < devs.size());
+    REQUIRE(vulkan_device_beats_cpu() ==
+            vulkan_beats_cpu(devs[i].type, devs[i].name));
 }
 
 TEST_CASE("backend_defaulted needs no choice and no LOCUS_BACKEND",
