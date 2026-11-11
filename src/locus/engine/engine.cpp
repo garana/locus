@@ -274,12 +274,12 @@ bool Engine::step_once() {
         }
     }
 
-    // One iteration: each running sequence advances; prefill is
-    // capped by the shared budget, decode always costs 1 token.
-    std::uint32_t budget = cfg_.prefill_budget;
+    // One iteration: each running sequence advances; prefill takes its
+    // share of the budget, decode always costs 1 token.
+    share_prefill();
     for (std::size_t i = 0; i < running_.size();) {
         Request& r = *requests_.at(running_[i]);
-        advance(r, budget);
+        advance(r, r.step_share);
         if (r.status != Status::kRunning) {
             running_.erase(running_.begin() +
                            static_cast<std::ptrdiff_t>(i));
@@ -288,6 +288,49 @@ bool Engine::step_once() {
         }
     }
     return !idle();
+}
+
+void Engine::share_prefill() {
+    // (remaining prompt tokens, request) of the prompts still
+    // prefilling; any other running request is decoding.
+    std::vector<std::pair<std::uint32_t, Request*>> want;
+    bool decoding = false;
+    for (const std::uint64_t id : running_) {
+        Request& r = *requests_.at(id);
+        r.step_share = 0;
+        const auto n_prompt = static_cast<std::uint32_t>(r.prompt.size());
+        if (r.n_fed < n_prompt) {
+            want.emplace_back(n_prompt - r.n_fed, &r);
+        } else {
+            decoding = true;
+        }
+    }
+    // With decodes running, every other step feeds no prompt, so half
+    // the steps are decode-only.
+    if (decoding && cfg_.decode_share && !want.empty()) {
+        skip_prefill_ = !skip_prefill_;
+        if (skip_prefill_) return;
+    } else {
+        skip_prefill_ = false;
+    }
+    // Each prompt is fed in the chunks it gets alone: the whole budget
+    // or its whole remainder (batch invariance, i#403: a chunk's size
+    // changes the sums). The shortest remainder goes first, and a
+    // prompt whose chunk no longer fits waits for the next step.
+    // stable_sort keeps admission order among equal remainders.
+    std::stable_sort(want.begin(), want.end(),
+                     [](const auto& a, const auto& b) {
+                         return a.first < b.first;
+                     });
+    const std::uint32_t chunk = cfg_.prefill_budget;
+    std::uint32_t budget = chunk;
+    for (auto& [remaining, r] : want) {
+        const std::uint32_t need = std::min(remaining, chunk);
+        if (need <= budget) {
+            r->step_share = need;
+            budget -= need;
+        }
+    }
 }
 
 void Engine::advance(Request& r, std::uint32_t& budget) {
@@ -1001,13 +1044,14 @@ bool Engine::step_batched() {
         }
     }
 
-    // Phase 1: prefill each running request still on its prompt.
-    std::uint32_t budget = cfg_.prefill_budget;
+    // Phase 1: prefill each running request still on its prompt, by
+    // its share of the budget.
+    share_prefill();
     for (std::size_t i = 0; i < running_.size();) {
         Request& r = *requests_.at(running_[i]);
         if (r.n_fed <
             static_cast<std::uint32_t>(r.prompt.size())) {
-            if (!prefill_only(r, budget)) {
+            if (!prefill_only(r, r.step_share)) {
                 running_.erase(running_.begin() +
                                static_cast<std::ptrdiff_t>(i));
                 continue;

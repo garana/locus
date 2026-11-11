@@ -12,6 +12,7 @@
 #include "locus/tok/tokenizer.hpp"
 
 using locus::engine::Engine;
+using locus::engine::Request;
 using locus::engine::Status;
 
 namespace {
@@ -279,6 +280,71 @@ TEST_CASE("engine reports step tokens and kv blocks by state",
     REQUIRE(m.kv_blocks_cached >= 1);
     REQUIRE(m.kv_blocks_cached ==
             engine.total_blocks() - engine.free_blocks());
+}
+
+// i#617: a short prompt behind a long one goes first (the shortest
+// remainder does), so it reaches its first token in one or two steps,
+// not after the whole long prefill; while it decodes, the long prompt
+// is fed on at most every other step.
+TEST_CASE("a short prompt is not held back by a long prefill",
+          "[engine][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    std::vector<locus::tok::TokenId> long_prompt;
+    while (long_prompt.size() < 160) {
+        const auto t = tok.encode(
+            "Once upon a time, there was a little girl named Lily who "
+            "loved to explore the forest near her home every day. ",
+            long_prompt.empty());
+        long_prompt.insert(long_prompt.end(), t.begin(), t.end());
+    }
+    long_prompt.resize(160);
+    const auto short_prompt = tok.encode("Tom had a ball.", true);
+    REQUIRE(short_prompt.size() <= 8);
+
+    for (const bool batched : {true, false}) {
+        INFO("batched decode " << batched);
+        Engine::Config cfg;
+        cfg.prefill_budget = 16;
+        cfg.batched_decode = batched;
+        Engine engine(model, tok.eos_id(), cfg);
+        const auto big = engine.submit(long_prompt, 4);
+        const auto small = engine.submit(short_prompt, 8);
+        int steps = 0, first_token_step = 0;
+        std::uint32_t fed_before = 0;
+        bool fed_last = false;
+        while (engine.step()) {
+            ++steps;
+            const Request* b = engine.get(big);
+            const Request* s = engine.get(small);
+            if (first_token_step == 0 && !s->generated.empty()) {
+                first_token_step = steps;
+            }
+            // Each step feeds the long prompt a whole chunk or nothing.
+            // While the short request decodes and the long one is still
+            // on its prompt, no two steps in a row feed it.
+            const bool fed = b->n_fed != fed_before;
+            if (b->n_fed <= long_prompt.size() && fed) {
+                CHECK(b->n_fed - fed_before == 16);
+            }
+            const bool decoding =
+                s->status == Status::kRunning && !s->generated.empty();
+            if (decoding && b->n_fed < long_prompt.size()) {
+                CHECK_FALSE((fed && fed_last));
+            }
+            fed_last = fed;
+            fed_before = b->n_fed;
+        }
+        // Alone it would wait for 160 / 16 = 10 steps of the long one.
+        CHECK(first_token_step >= 1);
+        CHECK(first_token_step <= 2);
+        CHECK(engine.get(big)->status == Status::kDone);
+        CHECK(engine.get(small)->status == Status::kDone);
+    }
 }
 
 TEST_CASE("speculative decoding matches greedy output",
