@@ -4,6 +4,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "locus/pipeline/net.hpp"
@@ -77,6 +78,19 @@ struct StageConn {
      */
     std::function<void(const std::vector<PeerInfo>&)> on_peers;
     int peer_report_ms = 0;
+    /**
+     * i#22: a listening socket on which serve_stage_mux answers GET
+     * `metrics_path` with Prometheus text, on its loop thread: session,
+     * token, byte and dial counters, and the live peers with their RTT.
+     * -1 (the default) serves none. The stage allowlist does not apply
+     * (a scraper is not a stage peer); bind it to a trusted address.
+     * Not owned (the loop makes it non-blocking). Read once when the
+     * loop starts, so a reload does not change it.
+     */
+    int metrics_fd = -1;
+    std::string metrics_path = "/metrics";
+    /** Labels on every metrics series (e.g. the stage's layer range). */
+    std::vector<std::pair<std::string, std::string>> metrics_labels;
 };
 
 /**

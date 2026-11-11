@@ -1582,3 +1582,142 @@ TEST_CASE("serve_stage_mux reports its live peers", "[pipeline][mux][e2e]") {
     REQUIRE(got[1].rtt.has_value());
 #endif
 }
+
+namespace {
+
+/** @returns The whole response to one `GET path` on 127.0.0.1:port,
+ *  read until the server closes (the request asks it to). */
+std::string http_get(int port, const std::string& path) {
+    const int fd = locus::pipeline::connect_to("127.0.0.1", port);
+    if (fd < 0) {
+        return "";
+    }
+    const std::string req = "GET " + path +
+                            " HTTP/1.1\r\nHost: stage\r\n"
+                            "Connection: close\r\n\r\n";
+    if (::send(fd, req.data(), req.size(), MSG_NOSIGNAL) !=
+        static_cast<ssize_t>(req.size())) {
+        ::close(fd);
+        return "";
+    }
+    std::string out;
+    char buf[4096];
+    for (;;) {
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) {
+            break;
+        }
+        out.append(buf, static_cast<std::size_t>(n));
+    }
+    ::close(fd);
+    return out;
+}
+
+/** @returns The value of the first sample line that starts with
+ *  `series` (name and labels), or "" if there is none. */
+std::string sample_value(const std::string& text, const std::string& series) {
+    std::size_t at = 0;
+    while (at < text.size()) {
+        const std::size_t eol = text.find('\n', at);
+        const std::string line = text.substr(
+            at, eol == std::string::npos ? std::string::npos : eol - at);
+        if (line.rfind(series + " ", 0) == 0) {
+            return line.substr(series.size() + 1);
+        }
+        if (eol == std::string::npos) {
+            break;
+        }
+        at = eol + 1;
+    }
+    return "";
+}
+
+}  // namespace
+
+// i#22: with metrics_fd set, serve_stage_mux answers GET /metrics on its
+// own loop while a session runs: the counters, the live peers with
+// their RTT, and the fixed labels; another path is a 404.
+TEST_CASE("serve_stage_mux serves /metrics while a session runs",
+          "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+    int pm = 0;
+    const int lm = locus::pipeline::listen_on("127.0.0.1", 0, &pm);
+    REQUIRE(lm >= 0);
+
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+    conn.metrics_fd = lm;
+    conn.metrics_labels = {{"layers", "0:" + std::to_string(L)}};
+    std::jthread server([&] {
+        locus::pipeline::serve_stage_mux(stage, ls, allow,
+                                         {{"127.0.0.1", pc}}, conn);
+    });
+
+    // Before any session: the counters are zero.
+    const std::string lab = "{layers=\"0:" + std::to_string(L) + "\"";
+    const std::string idle = http_get(pm, "/metrics");
+    REQUIRE(idle.rfind("HTTP/1.1 200", 0) == 0);
+    REQUIRE(sample_value(idle, "locus_stage_sessions_accepted_total" + lab +
+                                   "}") == "0");
+
+    Client a;
+    a.request_id = 9;
+    a.to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(a.to_stage >= 0);
+    a.from_stage = locus::pipeline::accept_one(lc, nullptr);
+    REQUIRE(a.from_stage >= 0);
+    ::close(lc);
+    const auto toks = tok.encode("Once upon a time", true);
+    for (const auto t : toks) {
+        a.round_trip(t);
+    }
+    REQUIRE(a.ok);
+
+    const std::string live = http_get(pm, "/metrics");
+    REQUIRE(live.rfind("HTTP/1.1 200", 0) == 0);
+    REQUIRE(live.find("text/plain; version=0.0.4") != std::string::npos);
+    REQUIRE(sample_value(live, "locus_stage_sessions_accepted_total" + lab +
+                                   "}") == "1");
+    REQUIRE(sample_value(live, "locus_stage_sessions_active" + lab + "}") ==
+            "1");
+    REQUIRE(sample_value(live, "locus_stage_tokens_total" + lab + "}") ==
+            std::to_string(toks.size()));
+    REQUIRE(sample_value(live, "locus_stage_downstream_dials_total" + lab +
+                                   "}") == "1");
+    REQUIRE(sample_value(live, "locus_stage_sessions_dropped_total" + lab +
+                                   "}") == "0");
+    REQUIRE(std::stoull(sample_value(
+                live, "locus_stage_bytes_in_total" + lab + "}")) > 0);
+    REQUIRE(std::stoull(sample_value(
+                live, "locus_stage_bytes_out_total" + lab + "}")) > 0);
+    const std::string down = lab + ",role=\"downstream\",peer=\"127.0.0.1:" +
+                             std::to_string(pc) + "\"}";
+    REQUIRE(sample_value(live, "locus_stage_peer_connections" + down) ==
+            "1");
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+    REQUIRE_FALSE(
+        sample_value(live, "locus_stage_peer_rtt_seconds" + down).empty());
+#endif
+    REQUIRE(http_get(pm, "/other").rfind("HTTP/1.1 404", 0) == 0);
+
+    ::close(a.to_stage);  // EOF ends the session, and serve_sessions = 1
+    server.join();
+    ::close(a.from_stage);
+    ::close(lm);  // the caller's listener
+}

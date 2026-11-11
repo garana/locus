@@ -263,6 +263,27 @@ TEST_CASE("build_runtime validates and converts StageOptions",
     bad = opt;
     bad.downstream = {"missing-port"};
     REQUIRE_FALSE(locus_tools::build_runtime(bad, scratch).empty());
+
+    // i#22: the metrics endpoint is off by default, else a HOST:PORT
+    // with a nonzero port and an absolute path.
+    REQUIRE(rt.metrics_port == 0);
+    REQUIRE(rt.conn.metrics_path == "/metrics");
+    StageOptions m = opt;
+    m.metrics_listen = "127.0.0.1:9100";
+    m.metrics_path = "/m";
+    REQUIRE(locus_tools::build_runtime(m, scratch).empty());
+    REQUIRE(scratch.metrics_host == "127.0.0.1");
+    REQUIRE(scratch.metrics_port == 9100);
+    REQUIRE(scratch.conn.metrics_path == "/m");
+    bad = opt;
+    bad.metrics_listen = "noport";
+    REQUIRE_FALSE(locus_tools::build_runtime(bad, scratch).empty());
+    bad = opt;
+    bad.metrics_listen = "127.0.0.1:0";
+    REQUIRE_FALSE(locus_tools::build_runtime(bad, scratch).empty());
+    bad = opt;
+    bad.metrics_path = "metrics";
+    REQUIRE_FALSE(locus_tools::build_runtime(bad, scratch).empty());
 }
 
 // The shared guarded integer parse behind every CLI integer flag
