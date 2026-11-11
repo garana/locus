@@ -70,13 +70,15 @@ std::vector<std::byte> build(const std::map<std::string, Shape>& shapes,
 }
 
 /** The tiny language model under `arch` (qwen2vl, or qwen2 without the
- *  rope sections). */
-inline std::vector<std::byte> lm(const std::string& arch = "qwen2vl") {
+ *  rope sections), with `vocab` rows (the real tokenizer's 151936 for
+ *  the pipeline test). */
+inline std::vector<std::byte> lm(const std::string& arch = "qwen2vl",
+                                 std::uint64_t vocab = kVocab) {
     const std::uint64_t hd = kE / kHeads;
     std::map<std::string, Shape> shapes;
-    shapes["token_embd.weight"] = {kVocab, kE};
+    shapes["token_embd.weight"] = {vocab, kE};
     shapes["output_norm.weight"] = {kE};
-    shapes["output.weight"] = {kVocab, kE};
+    shapes["output.weight"] = {vocab, kE};
     for (std::uint32_t i = 0; i < kLayers; ++i) {
         const std::string b = "blk." + std::to_string(i) + ".";
         shapes[b + "attn_norm.weight"] = {kE};

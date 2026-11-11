@@ -16,7 +16,7 @@ own docs.
 | GET  /v1/models (and /{id})   | OpenAI    | model discovery                             |
 | POST /v1/audio/speech         | OpenAI    | Orpheus-TTS; needs `--audio-decoder`        |
 | POST /v1/images/generations   | OpenAI    | Janus-Pro, PixArt-alpha or FLUX.1           |
-| POST /v1/images/edits         | OpenAI    | FLUX.1 Kontext; JSON body; see Image output |
+| POST /v1/images/edits         | OpenAI    | Qwen-Image-Edit, FLUX.1 Kontext; JSON body  |
 | POST /v1/videos               | OpenAI    | LTX-Video job; see Video output             |
 | GET  /v1/videos/{id}          | OpenAI    | the job: status, progress, error            |
 | GET  /v1/videos/{id}/content  | OpenAI    | the MP4 of a completed job                  |
@@ -118,6 +118,24 @@ FluxKontextPipeline does); with it, `size`'s aspect at `size`'s area
 Kontext's training resolutions (about 1M pixels); false keeps its own
 size (floored to 16), which is faster for a small image, and then the
 image may have at most 1024 x 1024 pixels and 2048 a side.
+
+With a Qwen-Image-Edit directory, `/v1/images/edits` runs that model
+instead, as diffusers' QwenImageEditPipeline does: the prompt and the
+reference image go through Qwen2.5-VL with the edit template, the
+reference's VAE latents join the MMDiT's tokens, and the loop runs
+true CFG. The body is the same JSON (`image`, `prompt`, `seed`), plus
+`negative_prompt` (true CFG runs only with one; " " is the usual
+choice), `true_cfg_scale` (default 4, from 0 to 100) and `steps` (2 to
+100, default 50). Without `size` the output keeps the image's aspect
+at about 1024 x 1024 pixels; `size` "WxH" sets it (sides 16 to 2048,
+floored to multiples of 16). Each step runs the MMDiT twice with a
+negative prompt. The directory holds four GGUFs:
+`scripts/convert-qwen-image.py`'s transformer and VAE (`--dit-out`,
+`--vae-out`), and llama.cpp's Qwen2.5-VL-7B-Instruct language model
+(with its tokenizer) and mmproj. The language model runs on the CPU;
+the MMDiT and the VAE run on the GPU where it maps host memory. The
+start noise is locus's seeded sampler, not torch's, so a seed gives
+a different (but repeatable) image than diffusers.
 
 FLUX requests (generations and edits) can apply LoRAs from the
 server's `--lora-dir`, a directory of GGUFs from

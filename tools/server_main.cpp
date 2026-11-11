@@ -135,7 +135,8 @@ OpenAI + Anthropic compatible inference server (default port 8080):
   GET  /v1/models/{id}
   POST /v1/audio/speech        (needs --audio-decoder)
   POST /v1/images/generations  (needs --image-decoder or --image-model)
-  POST /v1/images/edits        (needs --image-model with FLUX.1 Kontext)
+  POST /v1/images/edits        (needs --image-model with Qwen-Image-Edit
+                                or FLUX.1 Kontext)
   POST /v1/videos              (needs --video-model and ffmpeg)
   GET  /v1/videos/{id}[/content]
   GET  /health

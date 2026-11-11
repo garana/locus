@@ -54,7 +54,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   (T5-XXL encoder, DiT, DPM-Solver++, SD VAE; one 512 x 512 PNG), or
   with FLUX.1 dev, schnell or Kontext dev as text to image (CLIP-L and
   T5-XXL, the MMDiT, flow-matching Euler, the FLUX VAE; up to 1024 x
-  1024 pixels). `/v1/images/edits` runs FLUX.1 Kontext dev on a
+  1024 pixels). `/v1/images/edits` runs Qwen-Image-Edit
+  (instruction-based edits with true CFG) or FLUX.1 Kontext dev on a
   reference image (its VAE-encoded tokens join the image tokens), for
   the same character or scene in a new picture. On a Vulkan GPU with
   unified memory, whatever backend the language model uses, the
@@ -94,7 +95,7 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 | From \ To | Text                                   | Image                                               | Video                                    |
 |-----------|----------------------------------------|-----------------------------------------------------|------------------------------------------|
 | Text      | completions, chat, messages, responses | `/v1/images/generations`: Janus-Pro, PixArt, FLUX.1 | `/v1/videos`: LTX-Video                  |
-| Image     | chat with an image: Janus-Pro-1B       | `/v1/images/edits`: FLUX.1 Kontext                  | `/v1/videos` with `input_reference`: LTX |
+| Image     | chat with an image: Janus-Pro-1B       | `/v1/images/edits`: Qwen-Image-Edit, FLUX.1 Kontext | `/v1/videos` with `input_reference`: LTX |
 | Video     | no                                     | no                                                  | no                                       |
 
 Speech (text to audio) is `/v1/audio/speech`. How these run together:
@@ -172,13 +173,11 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 - Multimedia (#143): diffusion image speed (#146), video (#148), real-time
   speech (#173), faster image input (#257), FLUX.1 LoRAs (#372:
   `--lora-dir` and the `lora` field apply converted ones, on the CPU
-  and in the whole-step GPU forward), Qwen-Image-Edit (#529: the
-  Qwen2.5-VL vision tower, from llama.cpp's mmproj GGUF, its language
-  model with M-RoPE (qwen2vl), the edit prompt's text conditioning on
-  the CPU, the VAE and the MMDiT on the CPU and on Vulkan, the sampler
-  and the denoising loop with true CFG;
-  `scripts/convert-qwen-image.py` writes the transformer and VAE GGUFs;
-  the endpoint is not in yet), CNN image classifiers
+  and in the whole-step GPU forward), Qwen-Image-Edit (#529: on
+  `/v1/images/edits`, matched end to end against diffusers on tiny
+  models; the language model runs on the CPU, the MMDiT and the VAE
+  also on Vulkan; a run with the real weights and its speed are
+  pending), CNN image classifiers
   (#274: ResNet-50 and Inception-v3 on `/v1/classify` and
   `/v1/embeddings`; the convs run on Vulkan when the GPU maps host
   memory).
