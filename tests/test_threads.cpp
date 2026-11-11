@@ -241,9 +241,9 @@ TEST_CASE("a ThreadPool::Scope reroutes the calling thread's loops",
             REQUIRE(h.load() == 1);
         }
         // The pool's own worker sees it as current too, so a nested
-        // loop stays here. Each index sleeps a little, so the loop lasts
-        // long enough for the woken worker to take part (a fail, not a
-        // hang, if it ever does not).
+        // loop stays here. Index 0 waits (up to 10 s) until the worker
+        // has taken an index, so the worker takes part however late it
+        // is scheduled (a fail, not a hang, if it never does).
         const std::thread::id caller = std::this_thread::get_id();
         std::vector<const ThreadPool*> where(64, nullptr);
         std::atomic<bool> other{false};
@@ -252,7 +252,12 @@ TEST_CASE("a ThreadPool::Scope reroutes the calling thread's loops",
             if (std::this_thread::get_id() != caller) {
                 other.store(true);
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            const auto until =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (i == 0 && !other.load() &&
+                   std::chrono::steady_clock::now() < until) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
         });
         REQUIRE(other.load());
         for (const ThreadPool* p : where) {
