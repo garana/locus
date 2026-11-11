@@ -219,7 +219,7 @@ TEST_CASE("Resolver runs and tears down cleanly with the thread on",
     Resolver r(opt, lk, {}, /*start_thread=*/true);
 
     std::atomic<bool> go{true};
-    std::vector<std::thread> workers;
+    std::vector<std::jthread> workers;
     for (int i = 0; i < 2; ++i) {
         workers.emplace_back([&] {
             while (go.load()) {

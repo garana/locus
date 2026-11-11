@@ -76,7 +76,7 @@ struct ServerFixture {
 struct RawServer {
     int listen_fd = -1;
     int port = 0;
-    std::thread th;
+    std::jthread th;
     /** The first read of the request (when `read_request`). */
     std::string request;
     /**
@@ -89,7 +89,7 @@ struct RawServer {
               bool read_request = true) {
         listen_fd = locus::pipeline::listen_on(host, 0, &port);
         if (listen_fd < 0) return;  // the caller checks ok()
-        th = std::thread([this, reply = std::move(reply), hold_ms,
+        th = std::jthread([this, reply = std::move(reply), hold_ms,
                           read_request] {
             const int c = locus::pipeline::accept_one(listen_fd, nullptr,
                                                       3000);
@@ -364,7 +364,7 @@ TEST_CASE("http client: a write that times out is not sent again",
     REQUIRE(lfd >= 0);
     std::atomic<int> accepts{0};
     std::atomic<bool> done{false};
-    std::thread srv([&] {
+    std::jthread srv([&] {
         int first = -1;
         while (!done) {
             const int c = locus::pipeline::accept_one(lfd, nullptr, 100);

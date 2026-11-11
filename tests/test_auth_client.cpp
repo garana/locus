@@ -101,7 +101,7 @@ class FakeHelper {
     int fd_;
     std::mutex mu_;
     std::map<std::string, int> counts_;
-    std::thread th_;
+    std::jthread th_;
 };
 
 /** Builds an AuthClient with one socketpair-backed helper. */
@@ -145,7 +145,7 @@ TEST_CASE("auth coalesces concurrent resolves of one credential",
           "[auth]") {
     Fixture f;
     f.helper->delay = 60ms;  // widen the in-flight window
-    std::vector<std::thread> ts;
+    std::vector<std::jthread> ts;
     std::atomic<int> ok{0};
     for (int i = 0; i < 8; ++i) {
         ts.emplace_back([&] {

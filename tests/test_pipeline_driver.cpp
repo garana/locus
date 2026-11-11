@@ -275,7 +275,7 @@ TEST_CASE("drive_generation takes only its own request's logits",
         int head[2], logits[2];
         REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, head) == 0);
         REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, logits) == 0);
-        std::thread stage([&] {
+        std::jthread stage([&] {
             Message in;
             while (locus::pipeline::read_message(head[1], in) ==
                    locus::pipeline::ReadResult::kOk) {

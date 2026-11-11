@@ -62,7 +62,7 @@ TEST_CASE("helper connection round-trips a request", "[auth]") {
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
     HelperConnection conn(fds[0], fds[0]);
 
-    std::thread helper([&] {
+    std::jthread helper([&] {
         std::string buf;
         HelperMessage req;
         if (read_one(fds[1], buf, req)) {
@@ -88,7 +88,7 @@ TEST_CASE("helper connection correlates out-of-order replies",
 
     // The helper reads BOTH requests, then answers the second one
     // first -- the client must still route each reply to its sender.
-    std::thread helper([&] {
+    std::jthread helper([&] {
         std::string buf;
         HelperMessage a, b;
         REQUIRE(read_one(fds[1], buf, a));
@@ -98,13 +98,13 @@ TEST_CASE("helper connection correlates out-of-order replies",
     });
 
     std::optional<HelperMessage> ra, rb;
-    std::thread ta([&] {
+    std::jthread ta([&] {
         HelperMessage q;
         q.type = "auth";
         q.set("credential", "AAA");
         ra = conn.request(std::move(q), 2000ms);
     });
-    std::thread tb([&] {
+    std::jthread tb([&] {
         HelperMessage q;
         q.type = "auth";
         q.set("credential", "BBB");
@@ -126,7 +126,7 @@ TEST_CASE("helper connection notify is fire-and-forget", "[auth]") {
     HelperConnection conn(fds[0], fds[0]);
 
     std::string got;
-    std::thread helper([&] {
+    std::jthread helper([&] {
         std::string buf;
         HelperMessage m;
         if (read_one(fds[1], buf, m)) {
@@ -148,7 +148,7 @@ TEST_CASE("helper connection times out with no reply", "[auth]") {
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
     HelperConnection conn(fds[0], fds[0]);
     // Drain the request but never reply.
-    std::thread helper([&] {
+    std::jthread helper([&] {
         std::string buf;
         HelperMessage m;
         read_one(fds[1], buf, m);
@@ -189,7 +189,7 @@ TEST_CASE("reader drains a burst of replies before honoring EOF",
     constexpr int kN = 8;
     const std::string pad(1024, 'x');  // fat replies -> > 4096 total
 
-    std::thread helper([&] {
+    std::jthread helper([&] {
         std::string buf;
         std::vector<HelperMessage> reqs;
         for (int i = 0; i < kN; ++i) {
@@ -205,7 +205,7 @@ TEST_CASE("reader drains a burst of replies before honoring EOF",
     });
 
     std::vector<std::optional<HelperMessage>> res(kN);
-    std::vector<std::thread> ts;
+    std::vector<std::jthread> ts;
     for (int i = 0; i < kN; ++i) {
         ts.emplace_back([&, i] {
             HelperMessage q;
