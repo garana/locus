@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -219,4 +221,54 @@ TEST_CASE("gqa_attend is bit-identical across thread counts",
         }
         REQUIRE(ref[i] == Catch::Approx(o).margin(1e-5));
     }
+}
+
+// i#45: a Scope makes a pool of its own the calling thread's current
+// one, so every loop that thread runs fans out there; it nests, and
+// other threads keep the process-wide pool.
+TEST_CASE("a ThreadPool::Scope reroutes the calling thread's loops",
+          "[threads]") {
+    ThreadPool& global = ThreadPool::instance();
+    ThreadPool own(1);  // one worker besides the caller
+    REQUIRE(own.parallelism() == 2);
+    {
+        const ThreadPool::Scope scope(own);
+        REQUIRE(&ThreadPool::instance() == &own);
+        std::vector<std::atomic<int>> hits(64);
+        ThreadPool::instance().parallel_for(
+            hits.size(), [&](std::size_t i) { hits[i].fetch_add(1); });
+        for (const auto& h : hits) {
+            REQUIRE(h.load() == 1);
+        }
+        // The pool's own worker sees it as current too, so a nested
+        // loop stays here. Each index sleeps a little, so the loop lasts
+        // long enough for the woken worker to take part (a fail, not a
+        // hang, if it ever does not).
+        const std::thread::id caller = std::this_thread::get_id();
+        std::vector<const ThreadPool*> where(64, nullptr);
+        std::atomic<bool> other{false};
+        ThreadPool::instance().parallel_for(where.size(), [&](std::size_t i) {
+            where[i] = &ThreadPool::instance();
+            if (std::this_thread::get_id() != caller) {
+                other.store(true);
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        });
+        REQUIRE(other.load());
+        for (const ThreadPool* p : where) {
+            REQUIRE(p == &own);
+        }
+        // Another thread is not affected.
+        const ThreadPool* seen = nullptr;
+        std::thread([&] { seen = &ThreadPool::instance(); }).join();
+        REQUIRE(seen == &global);
+        {
+            ThreadPool inner(0);
+            const ThreadPool::Scope nested(inner);
+            REQUIRE(&ThreadPool::instance() == &inner);
+            REQUIRE(ThreadPool::instance().parallelism() == 1);
+        }
+        REQUIRE(&ThreadPool::instance() == &own);
+    }
+    REQUIRE(&ThreadPool::instance() == &global);
 }

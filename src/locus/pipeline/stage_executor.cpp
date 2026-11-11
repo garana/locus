@@ -3,16 +3,20 @@
 #include <unistd.h>
 
 #include <exception>
+#include <optional>
 #include <unordered_set>
 #include <utility>
 
 namespace locus::pipeline {
 
 StageExecutor::StageExecutor(PipelineStage& stage, int wake_fd,
-                             std::size_t max_batch)
+                             std::size_t max_batch, std::size_t threads)
     : stage_(stage),
       wake_fd_(wake_fd),
       max_batch_(max_batch == 0 ? 1 : max_batch) {
+    if (threads > 0) {
+        pool_ = std::make_unique<sys::ThreadPool>(threads - 1);
+    }
     thread_ = std::thread(&StageExecutor::run, this);
 }
 
@@ -57,6 +61,12 @@ void StageExecutor::run() {
     // This thread runs every step of the stage: bind it first (e.g. to
     // the GPU the stage's KV cache lives on, i#573).
     stage_.run_thread_init();
+    // Every loop this thread's forwards run fans out to the executor's
+    // own pool, when it has one (i#45).
+    std::optional<sys::ThreadPool::Scope> scope;
+    if (pool_) {
+        scope.emplace(*pool_);
+    }
     // Fixed for the stage's backend; batching needs a backend that can
     // run a batched forward (forward_batch_layers).
     const bool batch_ok = stage_.supports_batch();

@@ -31,10 +31,33 @@ namespace locus::sys {
 class ThreadPool {
   public:
     /**
-     * @returns The process-wide pool, created on first use with
-     *     hardware_concurrency() - 1 workers.
+     * @returns The calling thread's current pool (a Scope's, i#45),
+     *     else the process-wide one, created on first use with
+     *     hardware_concurrency() - 1 workers. Every parallel_for caller
+     *     goes through this, so a Scope reroutes all of a thread's
+     *     loops.
      */
     static ThreadPool& instance();
+
+    /**
+     * A pool of its own (i#45): `n_workers` threads besides the
+     * caller, e.g. one per executor so several executors' loops do not
+     * serialize on one pool.
+     */
+    explicit ThreadPool(std::size_t n_workers);
+
+    /** Makes a pool the calling thread's current one (instance()) for
+     *  the Scope's life; nests, restoring the previous one. */
+    class Scope {
+      public:
+        explicit Scope(ThreadPool& pool);
+        ~Scope();
+        Scope(const Scope&) = delete;
+        Scope& operator=(const Scope&) = delete;
+
+      private:
+        ThreadPool* prev_;
+    };
 
     /** @returns Max useful fan-out (workers + calling thread). */
     std::size_t parallelism() const { return n_workers_ + 1; }
@@ -54,7 +77,6 @@ class ThreadPool {
     ThreadPool& operator=(const ThreadPool&) = delete;
 
   private:
-    explicit ThreadPool(std::size_t n_workers);
     void worker(std::size_t index);
     /** Claims and runs indices of job generation `gen` until its
      * index space is exhausted (or a newer job replaced it). */

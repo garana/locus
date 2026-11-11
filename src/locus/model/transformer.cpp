@@ -2302,7 +2302,12 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
             }
         }
         cold_acc.assign(hp_.n_embd, 0.0f);
+        // The caller's pool (an executor's own, i#45) follows the work
+        // to the helper thread, which would otherwise take the global
+        // one and oversubscribe the cores.
+        sys::ThreadPool& caller_pool = sys::ThreadPool::instance();
         cold_done = std::async(std::launch::async, [&] {
+            const sys::ThreadPool::Scope scope(caller_pool);
             const Ops cop =
                 effective_ops(hy->cpu, q8k_activations_for(hy->cpu));
             std::vector<float> g(n_ff), u(n_ff), d(hp_.n_embd);
@@ -2509,7 +2514,10 @@ void TransformerModel::moe_ffn_batch(const Layer& lay,
     // each writes only its own res slots.
     std::future<void> cold_done;
     if (!cold.empty()) {
+        // The caller's pool follows the work (i#45), as above.
+        sys::ThreadPool& caller_pool = sys::ThreadPool::instance();
         cold_done = std::async(std::launch::async, [&] {
+            const sys::ThreadPool::Scope scope(caller_pool);
             const Ops cop =
                 effective_ops(hy->cpu, q8k_activations_for(hy->cpu));
             std::vector<float> g(ff), u(ff), d(E);

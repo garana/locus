@@ -854,7 +854,11 @@ A node separates I/O from compute (#24):
 - An executor is one compute device running a continuous-batching
   loop: each iteration it gathers the ready sessions, runs one batched
   forward (`forward_batch_layers`), and returns the outputs. It owns
-  that device's paged KV pool.
+  that device's paged KV pool. With K > 1 CPU executors each has its
+  own thread pool of cores / K threads (#45; `sys::ThreadPool::Scope`
+  makes it current on the executor's thread and on its workers), so
+  their loops do not serialize on one pool and a lone request still
+  fans out.
 - One executor per device; a session is pinned to one executor, so its
   KV stays on that device.
 - The two sides talk through lock-protected queues and a self-pipe
