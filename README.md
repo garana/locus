@@ -31,7 +31,7 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   copy-on-write prefix sharing; f32, f16, q8 or q4 KV.
 - **API:** `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
   `/v1/responses` (stateless), `/v1/embeddings`, `/v1/rerank`,
-  `/v1/models`, `/metrics`, `/health`.
+  `/v1/classify`, `/v1/models`, `/metrics`, `/health`.
 - **Embedding models:** GGUFs of arch `bert` (BERT with WordPiece, or
   XLM-R with SentencePiece) or `nomic-bert`, with `--embedding-model`,
   beside the chat model; tested with bge-small-en-v1.5, e5-small-v2,
@@ -175,8 +175,8 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   Qwen2.5-VL vision tower, from llama.cpp's mmproj GGUF, its language
   model with M-RoPE (qwen2vl) and the VAE run on the CPU; the MMDiT
   and an endpoint are not in yet), CNN image classifiers (#274:
-  ResNet-50 and Inception-v3 classify and embed on the CPU, matching
-  timm; no endpoint yet).
+  ResNet-50 and Inception-v3 on `/v1/classify` and `/v1/embeddings`,
+  CPU only; Vulkan is #578).
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
@@ -215,7 +215,9 @@ an ffmpeg on PATH or at `--ffmpeg <path>`. A dedicated embedding model
 for `/v1/embeddings` needs `--embedding-model <bert.gguf>`; task
 prefixes such as "query: " are the client's job. `/v1/rerank` needs
 `--rerank-model <reranker.gguf>`, made from a transformers XLM-R
-reranker by `scripts/convert-xlmr-reranker.py`.
+reranker by `scripts/convert-xlmr-reranker.py`. `/v1/classify` and
+image inputs to `/v1/embeddings` need `--image-classifier <cnn.gguf>`,
+a ResNet-50 or Inception-v3 from `scripts/convert-cnn.py`.
 
 ## Backends
 

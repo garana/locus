@@ -190,6 +190,10 @@ inline constexpr const char* kCommonHelp =
     "  --embedding-model P locus-server: serve /v1/embeddings with the\n"
     "                   BERT embedding GGUF at path P, listed in\n"
     "                   /v1/models by its file name\n"
+    "  --image-classifier P locus-server: serve /v1/classify, and\n"
+    "                   image inputs to /v1/embeddings under its name,\n"
+    "                   with the CNN GGUF at path P (ResNet or\n"
+    "                   Inception, from scripts/convert-cnn.py; CPU)\n"
     "  --rerank-model P locus-server: serve /v1/rerank with the\n"
     "                   reranker GGUF at path P (from\n"
     "                   scripts/convert-xlmr-reranker.py); both run on\n"
@@ -316,6 +320,9 @@ struct BackendArgs {
     /** From --rerank-model P: path to a reranker GGUF for
      * locus-server's /v1/rerank; empty = the endpoint answers 503. */
     std::string rerank_model;
+    /** From --image-classifier P: path to a CNN GGUF for locus-server's
+     * /v1/classify; empty = the endpoint answers 503. */
+    std::string image_classifier;
     /** From --max-tokens N: per-request output-token cap (0 = the
      * server default). */
     std::uint32_t max_tokens = 0;
@@ -465,6 +472,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.rerank_model = argv[++i];
         } else if (a.rfind("--rerank-model=", 0) == 0) {
             out.rerank_model = std::string(a.substr(15));
+        } else if (a == "--image-classifier" && i + 1 < argc) {
+            out.image_classifier = argv[++i];
+        } else if (a.rfind("--image-classifier=", 0) == 0) {
+            out.image_classifier = std::string(a.substr(19));
         } else if (a == "--max-tokens" && i + 1 < argc) {
             number("--max-tokens", argv[++i], out.max_tokens);
         } else if (a.rfind("--max-tokens=", 0) == 0) {

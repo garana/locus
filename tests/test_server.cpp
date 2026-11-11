@@ -1016,6 +1016,103 @@ TEST_CASE("rerank endpoint orders documents by relevance",
     }
 }
 
+// i#577: POST /v1/classify (Hugging Face's image-classification shape)
+// and image inputs to /v1/embeddings with --image-classifier, here the
+// ResNet-50 of scripts/convert-cnn.py on janus_apple.png.
+TEST_CASE("classify endpoint labels an image and embeds it",
+          "[server][e2e]") {
+    const std::string dir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
+    const std::string cnn = dir + "models/resnet50-tv-f32.gguf";
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    std::ifstream f(dir + "golden/janus_apple.png", std::ios::binary);
+    const std::string png((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+    const std::string b64 = locus::http::base64_encode(
+        std::as_bytes(std::span(png.data(), png.size())));
+
+    SECTION("without --image-classifier the endpoint is a 503") {
+        TestServer ts(model, tok);
+        httplib::Client client("127.0.0.1", ts.port);
+        json req{{"image", b64}};
+        auto res = client.Post("/v1/classify", req.dump(), "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+    }
+    if (!std::filesystem::exists(cnn)) {
+        SKIP("resnet50-tv-f32.gguf absent; see scripts/convert-cnn.py");
+    }
+    locus::server::OpenAiServer::Options opt;
+    opt.image_classifier_path = cnn;
+    TestServer ts(model, tok, opt);
+    httplib::Client client("127.0.0.1", ts.port);
+
+    SECTION("the top k labels, highest first, base64 or a data: URL") {
+        for (const std::string& image :
+             {b64, "data:image/png;base64," + b64}) {
+            json req{{"image", image}, {"top_k", 3}};
+            auto res =
+                client.Post("/v1/classify", req.dump(), "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            const auto r = json::parse(res->body);
+            REQUIRE(r.is_array());
+            REQUIRE(r.size() == 3);
+            CHECK(r[0]["label"] == "Granny Smith");
+            REQUIRE(r[0]["score"].get<double>() >
+                    r[1]["score"].get<double>());
+        }
+        json req{{"image", b64}};  // top_k 5 by default
+        auto res = client.Post("/v1/classify", req.dump(), "application/json");
+        REQUIRE(res);
+        REQUIRE(json::parse(res->body).size() == 5);
+        auto models = client.Get("/v1/models");
+        REQUIRE(models);
+        const auto m = json::parse(models->body);
+        REQUIRE(m["data"].back()["id"] == "resnet50.tv_in1k");
+        REQUIRE(m["locus_kinds"].back() == "classify");
+    }
+
+    SECTION("/v1/embeddings embeds images under the classifier's name") {
+        json req{{"model", "resnet50.tv_in1k"},
+                 {"input", json::array({b64, "data:image/png;base64," + b64})}};
+        auto res =
+            client.Post("/v1/embeddings", req.dump(), "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = json::parse(res->body);
+        REQUIRE(body["model"] == "resnet50.tv_in1k");
+        REQUIRE(body["data"].size() == 2);
+        REQUIRE(body["data"][0]["embedding"].size() == 2048);
+        REQUIRE(body["data"][0]["embedding"] == body["data"][1]["embedding"]);
+    }
+
+    SECTION("bad requests are a 400") {
+        const std::vector<json> bad = {
+            json::object(),
+            json{{"image", "not base64!"}},
+            json{{"image", b64}, {"top_k", 0}},
+            json{{"image", b64}, {"top_k", 1001}},
+            json{{"image", b64}, {"top_k", "3"}},
+            json{{"image", b64}, {"model", "other"}},
+            json{{"image", locus::http::base64_encode(
+                     std::as_bytes(std::span("not an image", 12)))}},
+        };
+        for (const auto& req : bad) {
+            INFO(req.dump());
+            auto res =
+                client.Post("/v1/classify", req.dump(), "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 400);
+        }
+    }
+}
+
 // --image-model picks FLUX.1 when a FLUX-only part (flux, clip_text) is
 // there, so a FLUX set missing its DiT names the FLUX parts; otherwise
 // PixArt, whose error names both sets.
