@@ -162,20 +162,66 @@ void on_unmap(const void* p, std::size_t n);
  * Single-threaded by contract: ops are called only from the
  * engine/model thread.
  */
-/** Whether the State singleton exists: set by its constructor, cleared
- *  by its destructor, so a cache destroyed after the State at exit
- *  does not touch it. */
-std::atomic<bool> g_state_alive{false};
+/** One State per Vulkan device (i#573), up to this many devices. */
+constexpr int kMaxDevices = 8;
 
-/** The device the State opens (vulkan_set_device; -1: the first). */
+/** Whether device d's State exists: set by its constructor, cleared
+ *  by its destructor, so a cache destroyed after it at exit does not
+ *  touch it. */
+std::atomic<bool> g_state_alive[kMaxDevices] = {};
+
+/** Live States, so the one unmap hook is set while any lives. */
+std::atomic<int> g_states_live{0};
+
+/** The process's device (vulkan_set_device; -1: the first). */
 std::atomic<int> g_vk_device{-1};
 
-/** @returns Whether the State singleton is constructed and not torn
- *  down. */
-bool state_alive() { return g_state_alive.load(); }
+/** The calling thread's device (vulkan_bind_thread; -2: unbound, so
+ *  the process's device). */
+thread_local int t_vk_device = -2;
+
+/** @returns The device index whose State the calling thread uses. */
+int current_device() {
+    const int d = t_vk_device != -2 ? t_vk_device : g_vk_device.load();
+    return d < 0 ? 0 : d;
+}
+
+/** @returns Whether the calling thread's device's State is constructed
+ *  and not torn down. */
+bool state_alive() { return g_state_alive[current_device()].load(); }
+
+/** Which device each KV pool (by host pointer) was allocated on, under
+ *  its own lock: a cache may be freed, or used, from a thread bound to
+ *  another device, and must not take that device's state lock to ask. */
+// Leaked on purpose (as the fallback registry): a cache freed at exit,
+// after the States, must still find them alive.
+std::mutex& pool_owner_mu() {
+    static auto* mu = new std::mutex;
+    return *mu;
+}
+std::unordered_map<const void*, int>& pool_owner() {
+    static auto* m = new std::unordered_map<const void*, int>;
+    return *m;
+}
+
+/** @throws std::runtime_error when `p` is a KV pool of another device
+ *  than the calling thread's (a cache made on one GPU, used on another:
+ *  fail loudly, not as a silent CPU fallback). */
+void check_pool_device(const void* p) {
+    std::lock_guard lk(pool_owner_mu());
+    const auto it = pool_owner().find(p);
+    if (it != pool_owner().end() && it->second != current_device()) {
+        throw std::runtime_error(
+            "vulkan: this KV cache was made on device " +
+            std::to_string(it->second) + ", but the thread runs on " +
+            std::to_string(current_device()));
+    }
+}
 
 struct State {
-    VulkanContext ctx{g_vk_device.load()};
+    VulkanContext ctx;
+    /** The device index this State runs on. */
+    int device = 0;
     WeightPool pool;
     std::unordered_map<const void*, VulkanContext::Buffer>
         kv_pools;
@@ -184,7 +230,7 @@ struct State {
     /** Per-model GPU-routing verdict (memory fit), decided once. */
     std::unordered_map<const void*, bool> moe_gpu_fits;
 
-    State() {
+    explicit State(int d) : ctx(d), device(d) {
         pool.create = [this](std::size_t n) {
             return ctx.create_buffer(n, MemKind::kWeights);
         };
@@ -192,12 +238,16 @@ struct State {
             ctx.destroy_buffer(b);
         };
         // A model file unmapped drops the buffers over its pages.
-        sys::set_unmap_hook(&on_unmap);
-        g_state_alive.store(true);
+        if (g_states_live.fetch_add(1) == 0) {
+            sys::set_unmap_hook(&on_unmap);
+        }
+        g_state_alive[device].store(true);
     }
     ~State() {
-        g_state_alive.store(false);
-        sys::set_unmap_hook(nullptr);
+        g_state_alive[device].store(false);
+        if (g_states_live.fetch_sub(1) == 1) {
+            sys::set_unmap_hook(nullptr);
+        }
         pool.report();
         ctx.report_profile();
         // Free every GPU buffer while ctx (and its VkDevice) is still
@@ -233,8 +283,10 @@ struct State {
         // GPU-mapped KV pools still live (vulkan_free_kv frees one when
         // its cache goes): only at teardown.
         if (kv) {
+            std::lock_guard ok(pool_owner_mu());
             for (auto& [map, buf] : kv_pools) {
                 ctx.destroy_buffer(buf);
+                pool_owner().erase(map);  // gone with this device
             }
             kv_pools.clear();
         }
@@ -648,9 +700,31 @@ struct State {
     }
 };
 
-State& state() {
-    static State s;
+/** Device d's state lock (state_mu() is the calling thread's). */
+std::recursive_mutex& device_mu(int d);
+
+/** The States, by device index (null until first used there). */
+std::unique_ptr<State>* states() {
+    static std::unique_ptr<State> s[kMaxDevices];
     return s;
+}
+
+/** @returns The calling thread's device's State, made on first use
+ *  (its constructor may throw: a later call tries again). */
+State& state() {
+    const int d = current_device();
+    if (d >= kMaxDevices) {
+        throw std::out_of_range("vulkan: device index past " +
+                                std::to_string(kMaxDevices - 1));
+    }
+    // Under this device's own lock (callers hold it already; it is
+    // recursive), so building one device's State, seconds of kernel
+    // compiles, never stalls another device's work.
+    std::lock_guard lk(device_mu(d));
+    if (!states()[d]) {
+        states()[d] = std::make_unique<State>(d);
+    }
+    return *states()[d];
 }
 
 /**
@@ -667,23 +741,35 @@ std::recursive_mutex& state_mu();
  * sys unmap hook (set while State lives): a model file's mapping is
  * going away, so drop every pool buffer over its pages (#317).
  */
+std::recursive_mutex& device_mu(int d) {
+    static std::recursive_mutex mu[kMaxDevices];
+    return mu[d];
+}
+
 void on_unmap(const void* p, std::size_t n) {
-    std::lock_guard lk(state_mu());
-    State& s = state();
-    if (s.ctx.batch_open()) {
-        // A recorded batch still references these weights; freeing
-        // them under it is undefined. Runs from ~MappedFile: no throw.
-        std::fprintf(stderr,
-                     "[vulkan] model file unmapped while a batch still "
-                     "uses its weights\n");
-        std::abort();
+    // Every device that uploaded from the file drops its copy.
+    for (int d = 0; d < kMaxDevices; ++d) {
+        if (!g_state_alive[d].load()) {
+            continue;
+        }
+        std::lock_guard lk(device_mu(d));
+        State& s = *states()[d];
+        if (s.ctx.batch_open()) {
+            // A recorded batch still references these weights; freeing
+            // them under it is undefined. Runs from ~MappedFile: no
+            // throw.
+            std::fprintf(stderr,
+                         "[vulkan] model file unmapped while a batch still "
+                         "uses its weights\n");
+            std::abort();
+        }
+        s.pool.release_range(p, n);
     }
-    s.pool.release_range(p, n);
 }
 
 std::recursive_mutex& state_mu() {
-    static std::recursive_mutex mu;
-    return mu;
+    const int d = current_device();
+    return device_mu(d < kMaxDevices ? d : 0);
 }
 
 /** Records one matvec dispatch into the open batch. */
@@ -1568,21 +1654,23 @@ bool vulkan_backend_usable() {
     // Probes the device the State will open (vulkan_set_device, i#572),
     // once per device: a working device 1 must not be refused because
     // device 0 fails, nor a failing chosen device pass on device 0.
+    // The calling thread's device (i#573): each probed once.
     static std::mutex mu;
-    static int probed = -2;
-    static bool ok = false;
+    static int result[kMaxDevices] = {};  // 0 unknown, 1 ok, 2 not
+    const int want = current_device();
+    if (want >= kMaxDevices) {
+        return false;
+    }
     std::lock_guard lk(mu);
-    const int want = g_vk_device.load();
-    if (probed != want) {
+    if (result[want] == 0) {
         try {
             VulkanContext ctx(want);
-            ok = true;
+            result[want] = 1;
         } catch (const std::exception&) {
-            ok = false;
+            result[want] = 2;
         }
-        probed = want;
     }
-    return ok;
+    return result[want] == 1;
 }
 
 float* vulkan_alloc_kv(std::size_t n_floats) {
@@ -1592,6 +1680,10 @@ float* vulkan_alloc_kv(std::size_t n_floats) {
     void* map = s.ctx.mapped(buf);
     std::memset(map, 0, n_floats * 4);
     s.kv_pools.emplace(map, buf);
+    {
+        std::lock_guard ok(pool_owner_mu());
+        pool_owner()[map] = s.device;
+    }
     return static_cast<float*>(map);
 }
 
@@ -1604,17 +1696,48 @@ std::size_t vulkan_kv_pool_count() {
 }
 
 void vulkan_free_kv(float* pool) {
-    if (pool == nullptr || !state_alive()) {
+    if (pool == nullptr) {
         return;
     }
-    std::lock_guard lk(state_mu());
-    State& s = state();
+    // The cache may be dropped on a thread bound to another device:
+    // free the pool on the device that made it. That takes the owner's
+    // lock, possibly while this thread holds its own: no path holds two
+    // device locks the other way round today (on_unmap takes them one
+    // at a time), so keep it that way.
+    int d = -1;
+    {
+        std::lock_guard ok(pool_owner_mu());
+        const auto it = pool_owner().find(pool);
+        if (it == pool_owner().end()) {
+            return;
+        }
+        d = it->second;
+        pool_owner().erase(it);
+    }
+    if (!g_state_alive[d].load()) {
+        return;
+    }
+    std::lock_guard lk(device_mu(d));
+    State& s = *states()[d];
     const auto it = s.kv_pools.find(pool);
     if (it != s.kv_pools.end()) {
         s.ctx.destroy_buffer(it->second);
         s.kv_pools.erase(it);
     }
 }
+
+void vulkan_bind_thread(int index) {
+    const std::size_t n = VulkanContext::devices().size();
+    if (index < 0 || static_cast<std::size_t>(index) >= n ||
+        index >= kMaxDevices) {
+        throw std::out_of_range(
+            "vulkan: no device " + std::to_string(index) + " (" +
+            std::to_string(n) + " with a compute queue)");
+    }
+    t_vk_device = index;
+}
+
+int vulkan_thread_device() { return current_device(); }
 
 namespace {
 // -1: not read from the env yet; 0 off; 1 on, set (env or
@@ -1897,16 +2020,20 @@ void vulkan_set_device(int index) {
         throw std::runtime_error(
             "vulkan: no Vulkan device (or a build without Vulkan)");
     }
-    if (index < 0 || static_cast<std::size_t>(index) >= n) {
+    if (index < 0 || static_cast<std::size_t>(index) >= n ||
+        index >= kMaxDevices) {
         throw std::out_of_range(
             "vulkan: no device " + std::to_string(index) + " (" +
             std::to_string(n) + " with a compute queue)");
     }
-    std::lock_guard lk(state_mu());
-    // The State opens its device once: a later change would leave the
-    // weights, KV pools and kernels on the first one.
+    // The process device's own lock and State, whatever the calling
+    // thread is bound to: its State opens its device once, so a later
+    // change would leave its weights, KV pools and kernels behind.
     const int was = g_vk_device.load();
-    if (state_alive() && was != index && !(was < 0 && index == 0)) {
+    const int cur = was < 0 ? 0 : was;
+    std::lock_guard lk(device_mu(cur));
+    if (g_state_alive[cur].load() && was != index &&
+        !(was < 0 && index == 0)) {
         throw std::runtime_error(
             "vulkan_set_device: the backend already runs on another "
             "device; set it before the first Vulkan use");
@@ -1952,7 +2079,10 @@ void mark(State& s, model::Stage st) {
  */
 bool batch_declined(const char* why) {
     fallback("vulkan", "per_token", why).add();
+    // Its own lock: two devices' threads decline at once (i#573).
+    static std::mutex mu;
     static std::set<const char*> seen;
+    std::lock_guard lk(mu);
     if (seen.insert(why).second) {
         std::fprintf(stderr,
                      "[vulkan] batched prefill off (%s): prompts "
@@ -2105,6 +2235,8 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
     // Each decline below hands the token to the host's per-op loop
     // (forward_layers, one matvec_vulkan per weight).
     if (pool_it == s.kv_pools.end()) {
+        check_pool_device(quant ? static_cast<const void*>(cache.qpool_data())
+                                : static_cast<const void*>(cache.pool_data()));
         static Fallback& f =
             fallback("vulkan", "per_op", "KV pool not GPU-mapped");
         f.add();
@@ -3048,6 +3180,7 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
     auto pool_it =
         s.kv_pools.find(static_cast<const void*>(cache.pool_data()));
     if (pool_it == s.kv_pools.end()) {
+        check_pool_device(cache.pool_data());
         return false;  // cache pool is not GPU-mapped
     }
     for (const auto& st : steps) {
@@ -3343,6 +3476,8 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         f16 ? static_cast<const void*>(cache.qpool_data())
             : static_cast<const void*>(cache.pool_data()));
     if (pool_it == s.kv_pools.end()) {
+        check_pool_device(f16 ? static_cast<const void*>(cache.qpool_data())
+                              : static_cast<const void*>(cache.pool_data()));
         return batch_declined("KV pool not GPU-mapped");
     }
     const auto& geom = cache.geometry();

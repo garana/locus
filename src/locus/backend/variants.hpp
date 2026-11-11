@@ -237,6 +237,22 @@ std::vector<VulkanDeviceInfo> vulkan_devices();
 void vulkan_set_device(int index);
 
 /**
+ * Runs the calling thread's Vulkan work on device `index` (i#573): each
+ * device has its own backend state (context, kernels, weight uploads,
+ * KV pools), so two threads bound to two devices run independently.
+ * A thread never bound uses the process's device (vulkan_set_device).
+ * A KV cache belongs to the device of the thread that made it; using
+ * it from a thread bound to another throws. vulkan_set_prefill_f16,
+ * vulkan_reset_state and vulkan_release_weights act on the calling
+ * thread's device only.
+ * @throws std::out_of_range for an index past vulkan_devices().
+ */
+void vulkan_bind_thread(int index);
+
+/** @returns The device index the calling thread's Vulkan work uses. */
+int vulkan_thread_device();
+
+/**
  * @returns "moltenvk" when the Vulkan driver is MoltenVK, else
  *     "vulkan" (also when no device is usable). Asks the device once
  *     and caches the answer, so it is cheap on a hot path.

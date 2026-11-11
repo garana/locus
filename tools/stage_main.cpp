@@ -255,10 +255,22 @@ int main(int argc, char** argv) {
         stages.reserve(static_cast<std::size_t>(n_exec));
         stage_ptrs.reserve(static_cast<std::size_t>(n_exec));
         for (int i = 0; i < n_exec; ++i) {
+            // One Vulkan device per executor (i#573): its stage's KV
+            // cache is made on that device, and its thread runs there.
+            const int d = dev.devices.empty()
+                              ? -1
+                              : dev.devices[static_cast<std::size_t>(i)];
+            if (d >= 0) {
+                locus::backend::vulkan_bind_thread(d);
+            }
             stages.push_back(
                 std::make_unique<locus::pipeline::PipelineStage>(
                     model, rt.layer_begin, rt.layer_end,
                     static_cast<std::uint32_t>(opt.kv_blocks)));
+            if (d >= 0) {
+                stages.back()->set_thread_init(
+                    [d] { locus::backend::vulkan_bind_thread(d); });
+            }
             stage_ptrs.push_back(stages.back().get());
         }
         const int lfd = locus::pipeline::listen_on(rt.listen_host,

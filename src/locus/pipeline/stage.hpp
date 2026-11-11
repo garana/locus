@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -121,6 +122,19 @@ class PipelineStage {
      * step_batch); false means the caller must step one at a time. */
     bool supports_batch() const { return model_.supports_batch_layers(); }
 
+    /** Sets what the thread that steps this stage runs first (i#573):
+     *  binding it to the GPU the stage's KV cache was made on. */
+    void set_thread_init(std::function<void()> f) {
+        thread_init_ = std::move(f);
+    }
+
+    /** Runs the thread_init (if any) on the calling thread. */
+    void run_thread_init() const {
+        if (thread_init_) {
+            thread_init_();
+        }
+    }
+
     /**
      * Runs the read -> step -> write loop over the fds until in_fd
      * reaches EOF. Takes ownership of both fds and closes them before
@@ -147,6 +161,7 @@ class PipelineStage {
     bool is_last() const { return layer_end_ == n_layers_; }
 
   private:
+    std::function<void()> thread_init_;
     const model::TransformerModel& model_;
     std::uint32_t layer_begin_;
     std::uint32_t layer_end_;

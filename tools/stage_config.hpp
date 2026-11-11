@@ -154,6 +154,9 @@ inline Spec<StageOptions> stage_spec() {
 struct DeviceBinding {
     std::string backend;  /**< backend name to resolve ("" = auto) */
     int device = -1;      /**< CUDA device ordinal, or -1 for none */
+    /** Vulkan: one device per executor (i#573), when --device is given
+     *  once per executor; empty otherwise. */
+    std::vector<int> devices;
 };
 
 /**
@@ -194,8 +197,21 @@ inline std::string resolve_device_binding(const StageOptions& opt,
                    std::to_string(n_exec) + "), got " +
                    std::to_string(opt.device.size());
         }
-        return "per-executor device binding (multiple --device) is inc "
-               "4b and not yet supported; pass a single --device";
+        if (opt.backend != "vulkan") {
+            return "per-executor device binding (multiple --device) is inc "
+                   "4b and not yet supported on CUDA; pass a single "
+                   "--device";
+        }
+        // Vulkan: executor i runs on device i of the list (i#573).
+        for (const std::string& s : opt.device) {
+            int d = 0;
+            if (!parse_nonneg_int(s, d)) {
+                return "bad --device (want a non-negative integer): " + s;
+            }
+            out.devices.push_back(d);
+        }
+        out.device = out.devices.front();
+        return "";
     }
     // One guarded non-negative-int parse (parse_nonneg_int, cli_spec.hpp)
     // shared with Spec kInt and parse_layers -- it rejects junk, a
