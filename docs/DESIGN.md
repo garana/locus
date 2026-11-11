@@ -829,7 +829,12 @@ The serve loop can report its live peers (each session's upstream
 and downstream) with the kernel's smoothed TCP round-trip time, read
 from `TCP_INFO` (Linux, FreeBSD) or `TCP_CONNECTION_INFO` (macOS)
 with no probe of its own (#21); `locus-stage --peer-log N` prints
-them every N seconds.
+them every N seconds. `locus-stage --metrics-listen HOST:PORT` serves
+them as Prometheus text on GET `/metrics`, from the same loop through
+`http::LoopConnection`, with the session, token, byte and downstream
+dial counters (#22). Each stage serves its own page, so a scraper
+reads every stage directly; the driver does not gather them. The
+`--allow` list does not cover that port.
 A connection kept open across sequences (SESSION_END) dials its next
 downstream when the next sequence sends its first frame, not at the
 reset: a last stage's downstream is a driver, and a reset-time dial

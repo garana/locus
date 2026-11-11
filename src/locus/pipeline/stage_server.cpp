@@ -7,19 +7,25 @@
 
 #include <cassert>
 #include <cerrno>
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "locus/http/loop_connection.hpp"
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/resolver.hpp"
 #include "locus/pipeline/stage_executor.hpp"
+#include "locus/server/metrics_text.hpp"
 #include "locus/sys/poller.hpp"
 
 namespace locus::pipeline {
@@ -220,6 +226,110 @@ struct WakePipe {
         if (w >= 0) ::close(w);
     }
 };
+
+/** i#22: serve_stage_mux's counters since the loop started. */
+struct StageStats {
+    std::uint64_t sessions_accepted = 0;
+    std::uint64_t sessions_dropped = 0;   /**< ended on an error. */
+    std::uint64_t steps = 0;              /**< frames sent downstream. */
+    std::uint64_t bytes_in = 0;
+    std::uint64_t bytes_out = 0;
+    std::uint64_t downstream_dials = 0;   /**< connects started. */
+    std::uint64_t downstream_reused = 0;  /**< pooled fds checked out. */
+    std::uint64_t dial_failures = 0;      /**< one pool entry failed. */
+    std::uint64_t dial_retry_waits = 0;   /**< a whole sweep failed. */
+};
+
+/** The live state the /metrics page shows next to the counters. */
+struct StageGauges {
+    std::size_t sessions_active = 0;
+    std::size_t downstream_idle = 0;  /**< pooled for reuse. */
+    std::vector<PeerInfo> peers;
+};
+
+/**
+ * Renders the stage's Prometheus text. Peers are grouped by role and
+ * address, since several sessions may share one downstream: the gauge
+ * counts their connections and the RTT is the largest of them.
+ */
+std::string render_stage_metrics(
+    const StageStats& st, const StageGauges& g,
+    const std::vector<std::pair<std::string, std::string>>& labels) {
+    using server::MetricsText;
+    MetricsText m(labels);
+    m.counter("locus_stage_sessions_accepted_total",
+              "Upstream connections accepted.", st.sessions_accepted);
+    m.counter("locus_stage_sessions_dropped_total",
+              "Sessions ended by an error (peer, frame or downstream).",
+              st.sessions_dropped);
+    m.gauge("locus_stage_sessions_active", "Sessions being served.",
+            g.sessions_active);
+    m.counter("locus_stage_tokens_total",
+              "Frames run through the stage and sent downstream (one "
+              "token each).",
+              st.steps);
+    m.counter("locus_stage_bytes_in_total", "Bytes read from upstreams.",
+              st.bytes_in);
+    m.counter("locus_stage_bytes_out_total", "Bytes sent downstream.",
+              st.bytes_out);
+    m.counter("locus_stage_downstream_dials_total",
+              "Downstream connects started.", st.downstream_dials);
+    m.counter("locus_stage_downstream_reused_total",
+              "Pooled downstream connections reused.",
+              st.downstream_reused);
+    m.counter("locus_stage_downstream_connect_failures_total",
+              "Downstream connects that failed or timed out.",
+              st.dial_failures);
+    m.counter("locus_stage_downstream_retry_waits_total",
+              "Waits after every downstream in the pool failed.",
+              st.dial_retry_waits);
+    m.gauge("locus_stage_downstream_idle",
+            "Downstream connections pooled for reuse.", g.downstream_idle);
+
+    struct Peer {
+        std::uint64_t conns = 0;
+        std::optional<double> rtt_s;
+    };
+    std::map<std::pair<std::string, std::string>, Peer> by_peer;
+    std::uint64_t connecting = 0;
+    for (const PeerInfo& p : g.peers) {
+        if (p.connecting) {
+            ++connecting;
+            continue;
+        }
+        const char* role =
+            p.role == PeerInfo::Role::kUpstream ? "upstream" : "downstream";
+        Peer& e = by_peer[{role, p.address}];
+        ++e.conns;
+        if (p.rtt) {
+            const double s = p.rtt->rtt_us / 1e6;
+            e.rtt_s = e.rtt_s ? std::max(*e.rtt_s, s) : s;
+        }
+    }
+    m.gauge("locus_stage_downstream_connecting",
+            "Downstream connects in progress.", connecting);
+    m.family("locus_stage_peer_connections",
+             "Open connections per peer.", "gauge");
+    for (const auto& [key, e] : by_peer) {
+        m.value("locus_stage_peer_connections",
+                MetricsText::label("role", key.first) + "," +
+                    MetricsText::label("peer", key.second),
+                e.conns);
+    }
+    m.family("locus_stage_peer_rtt_seconds",
+             "The kernel's smoothed TCP RTT per peer (the largest over "
+             "its connections).",
+             "gauge");
+    for (const auto& [key, e] : by_peer) {
+        if (e.rtt_s) {
+            m.value("locus_stage_peer_rtt_seconds",
+                    MetricsText::label("role", key.first) + "," +
+                        MetricsText::label("peer", key.second),
+                    *e.rtt_s);
+        }
+    }
+    return m.text();
+}
 
 }  // namespace
 
@@ -453,6 +563,9 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // Live session count per executor, for least-loaded assignment.
     std::vector<std::size_t> exec_load(stages.size(), 0);
 
+    // i#22: counters for GET /metrics. Only this loop thread touches them.
+    StageStats stats;
+
     // Pushes as much of `s.outbuf` to the downstream as it will take
     // without blocking, keeping frame order. Starts watching out_fd for
     // write-readiness when bytes remain and stops once drained.
@@ -463,6 +576,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             const ssize_t n = ::send(s.out_fd, s.outbuf.data(),
                                      s.outbuf.size(), kSendFlags);
             if (n > 0) {
+                stats.bytes_out += static_cast<std::uint64_t>(n);
                 s.outbuf.erase(0, static_cast<std::size_t>(n));
                 continue;
             }
@@ -568,6 +682,9 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         }
         s.cancelled = true;
         s.clean_end = clean;
+        if (!clean) {
+            ++stats.sessions_dropped;
+        }
         poller.remove(s.in_fd);
         if (s.out_watched) {
             poller.remove(s.out_fd);
@@ -630,6 +747,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 }
                 // Wait reconnect_wait_ms before the next sweep WITHOUT a
                 // blocking sleep: the deadline is folded into poller.wait.
+                ++stats.dial_retry_waits;
                 s.dial_tried = 0;
                 s.out_fd = -1;
                 s.connecting = true;
@@ -702,6 +820,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                                               conn_live.connect_timeout_ms)
                                     : Clock::time_point::max();
                             s.retry_at = Clock::time_point::max();
+                            ++stats.downstream_reused;
                             return;
                         }
                         ::close(pfd);  // FIN / unexpected data / error
@@ -728,10 +847,12 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                                   conn_live.connect_timeout_ms)
                         : Clock::time_point::max();
                 s.retry_at = Clock::time_point::max();
+                ++stats.downstream_dials;
                 return;
             }
             // Synchronous failure (refused / unparseable / a hostname with
             // no resolver): advance to the next entry in this sweep.
+            ++stats.dial_failures;
         }
     };
 
@@ -741,6 +862,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // emits none). Close and deregister the in-progress fd, then continue
     // the sweep. One path for every failure shape (issue 39 Gap 2).
     auto fail_dial = [&](MuxSession& s) {
+        ++stats.dial_failures;
         if (s.out_fd >= 0) {
             if (s.out_watched) {
                 poller.remove(s.out_fd);
@@ -879,8 +1001,9 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         pump(s);      // dial for any already-buffered next-sequence bytes
     };
 
-    // i#21: the live peers, read on this thread when a report is due.
-    const auto report_peers = [&] {
+    // i#21: the live peers, read on this thread when a report (or a
+    // /metrics request, i#22) is due.
+    const auto collect_peers = [&] {
         std::vector<PeerInfo> peers;
         for (const auto& [ifd, sp] : sessions) {
             const MuxSession& s = *sp;
@@ -898,11 +1021,87 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                                  tcp_rtt(s.out_fd)});
             }
         }
-        conn_live.on_peers(peers);
+        return peers;
     };
+    const auto report_peers = [&] { conn_live.on_peers(collect_peers()); };
     Clock::time_point next_report = Clock::time_point::max();
     if (conn_live.on_peers && conn_live.peer_report_ms > 0) {
         next_report = Clock::now();
+    }
+
+    // i#22: GET /metrics on conn.metrics_fd. Each accepted scraper is a
+    // LoopConnection on this poller; the handler reads the loop's own
+    // state, so it needs no locks. Capped so a flood of scrapers cannot
+    // grow the map without bound (the excess is closed at accept).
+    constexpr std::size_t kMaxMetricsConns = 16;
+    const int metrics_fd = conn.metrics_fd;
+    const std::string metrics_path = conn.metrics_path;
+    const auto metrics_labels = conn.metrics_labels;
+    std::unordered_map<int, std::unique_ptr<http::LoopConnection>>
+        metrics_conns;
+    const http::LoopHandler metrics_handler = [&](const http::Request& req,
+                                                  http::Response& res) {
+        if (req.path != metrics_path) {
+            res.status = 404;
+            res.set_content("not found\n", "text/plain");
+            return;
+        }
+        if (req.method != "GET" && !req.is_head) {
+            res.status = 405;
+            res.set_header("Allow", "GET, HEAD");
+            res.set_content("method not allowed\n", "text/plain");
+            return;
+        }
+        StageGauges g;
+        for (const auto& [gfd, gsp] : sessions) {
+            (void)gfd;
+            g.sessions_active += gsp->cancelled ? 0 : 1;
+        }
+        for (const auto& [key, bucket] : pool_idle) {
+            (void)key;
+            g.downstream_idle += bucket.size();
+        }
+        g.peers = collect_peers();
+        res.set_content(render_stage_metrics(stats, g, metrics_labels),
+                        "text/plain; version=0.0.4");
+    };
+    // Applies a LoopConnection's Next to its fd's registration.
+    const auto metrics_next = [&](int fd, http::LoopConnection::Next n) {
+        switch (n) {
+            case http::LoopConnection::Next::kRead:
+                poller.modify(fd, sys::Poller::Dir::kRead);
+                break;
+            case http::LoopConnection::Next::kWrite:
+                poller.modify(fd, sys::Poller::Dir::kWrite);
+                break;
+            case http::LoopConnection::Next::kClose:
+                poller.remove(fd);
+                ::close(fd);
+                metrics_conns.erase(fd);
+                break;
+        }
+    };
+    // Accepts every pending scraper (the listener is non-blocking).
+    const auto metrics_accept = [&] {
+        for (;;) {
+            const int fd = ::accept(metrics_fd, nullptr, nullptr);
+            if (fd < 0) {
+                return;  // EAGAIN, or an aborted connect: try next wake
+            }
+            if (metrics_conns.size() >= kMaxMetricsConns ||
+                !set_nonblocking(fd)) {
+                ::close(fd);
+                continue;
+            }
+            metrics_conns.emplace(
+                fd, std::make_unique<http::LoopConnection>(
+                        fd, http::LoopConfig{}, metrics_handler));
+            poller.add(fd);
+        }
+    };
+    if (metrics_fd >= 0) {
+        set_nonblocking(metrics_fd);
+        poller.add(metrics_fd);
     }
 
     bool result = true;
@@ -925,6 +1124,10 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             if (d < earliest) {
                 earliest = d;
             }
+        }
+        for (const auto& [mfd, mc] : metrics_conns) {
+            (void)mfd;
+            earliest = std::min(earliest, mc->deadline());
         }
         int timeout = -1;
         if (earliest != Clock::time_point::max()) {
@@ -956,6 +1159,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         }
 
         bool listen_ready = false;
+        bool metrics_ready = false;
         for (const auto& ev : events) {
             if (reload.wake_fd >= 0 && ev.fd == reload.wake_fd) {
                 char buf[64];  // drain the (non-blocking) wake pipe
@@ -1023,6 +1227,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                     }
                     // Send the output downstream, then submit the next
                     // buffered frame (or finish if the peer already left).
+                    ++stats.steps;
                     encode(c.out, s.outbuf);
                     if (flush_out(s) < 0) {
                         std::fprintf(stderr,
@@ -1038,6 +1243,15 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             }
             if (ev.fd == listen_fd) {
                 listen_ready = true;  // accept after the session fds
+                continue;
+            }
+            if (metrics_fd >= 0 && ev.fd == metrics_fd) {
+                metrics_ready = true;  // after the batch, as listen_ready
+                continue;
+            }
+            if (const auto mit = metrics_conns.find(ev.fd);
+                mit != metrics_conns.end()) {
+                metrics_next(ev.fd, mit->second->on_event(ev));
                 continue;
             }
             // An event on a downstream (out) fd.
@@ -1101,6 +1315,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 char buf[4096];
                 const ssize_t n = ::recv(s.in_fd, buf, sizeof(buf), 0);
                 if (n > 0) {
+                    stats.bytes_in += static_cast<std::uint64_t>(n);
                     s.inbuf.append(buf, static_cast<std::size_t>(n));
                     continue;
                 }
@@ -1159,6 +1374,24 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             }
         }
 
+        // i#22: time out stalled scrapers (collected first: a close
+        // erases from the map), then accept new ones.
+        if (!metrics_conns.empty()) {
+            const Clock::time_point now = Clock::now();
+            std::vector<int> due;
+            for (const auto& [mfd, mc] : metrics_conns) {
+                if (mc->deadline() <= now) {
+                    due.push_back(mfd);
+                }
+            }
+            for (const int mfd : due) {
+                metrics_next(mfd, metrics_conns.at(mfd)->on_timeout());
+            }
+        }
+        if (metrics_ready) {
+            metrics_accept();
+        }
+
         // Stop once enough sessions have ended (freed, i.e. their KV
         // released). Checked after the whole batch so a drop reached from
         // any event -- input, downstream flush, or a completion -- counts.
@@ -1184,6 +1417,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 result = false;
                 break;  // listener broken
             }
+            ++stats.sessions_accepted;
             set_keepalive(in_fd, conn_live.keepalive_idle_s,
                           conn_live.keepalive_intvl_s,
                           conn_live.keepalive_count);
@@ -1218,6 +1452,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                              "downstream configured\n");
                 ::close(in_fd);
                 all_clean = false;
+                ++stats.sessions_dropped;
                 ++completed;
                 if (conn_live.serve_sessions > 0 &&
                     completed >= conn_live.serve_sessions) {
@@ -1248,6 +1483,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                                  "resolver is configured\n");
                     ::close(in_fd);
                     all_clean = false;
+                    ++stats.sessions_dropped;
                     // Count it like any ended session so serve_sessions
                     // still bounds the loop, and stop here if met (the
                     // normal check at the top of the loop would otherwise
@@ -1293,6 +1529,15 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             auto emplaced = sessions.emplace(in_fd, std::move(s));
             try_dial(*emplaced.first->second);  // registers out_fd (connecting)
         }
+    }
+
+    for (const auto& [mfd, mc] : metrics_conns) {
+        (void)mc;
+        ::close(mfd);  // the listener itself is the caller's
+    }
+    metrics_conns.clear();
+    if (metrics_fd >= 0) {
+        poller.remove(metrics_fd);
     }
 
     // Shutdown. The executor still owns every live seq, so route each

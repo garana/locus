@@ -290,6 +290,24 @@ int main(int argc, char** argv) {
                          opt.listen.c_str());
             return 1;
         }
+        // i#22: the metrics endpoint, served on the same loop.
+        int mfd = -1;
+        if (rt.metrics_port > 0) {
+            mfd = locus::pipeline::listen_on(rt.metrics_host,
+                                             rt.metrics_port, nullptr);
+            if (mfd < 0) {
+                std::fprintf(stderr, "metrics-listen on %s failed\n",
+                             opt.metrics_listen.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "locus-stage: metrics on %s%s\n",
+                         opt.metrics_listen.c_str(),
+                         opt.metrics_path.c_str());
+        }
+        rt.conn.metrics_fd = mfd;
+        rt.conn.metrics_labels = {
+            {"layers", std::to_string(rt.layer_begin) + ":" +
+                           std::to_string(rt.layer_end)}};
         std::fprintf(stderr,
                      "locus-stage: layers [%u,%u) on %s -> %s "
                      "(backend %s)\n",
@@ -369,6 +387,13 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr,
                                          "reload: listen cannot change "
                                          "on a running stage; ignoring\n");
+                        }
+                        if (fresh.metrics_listen != opt.metrics_listen ||
+                            fresh.metrics_path != opt.metrics_path) {
+                            std::fprintf(stderr,
+                                         "reload: metrics-listen and "
+                                         "metrics-path cannot change on a "
+                                         "running stage; ignoring\n");
                         }
                         if (fresh.sessions != opt.sessions) {
                             std::fprintf(stderr,

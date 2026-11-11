@@ -50,6 +50,10 @@ struct StageOptions {
     int peer_log = 0;                     /**< --peer-log s: print the
                                            *   live peers and their TCP
                                            *   RTT every N s (0 = off) */
+    std::string metrics_listen;           /**< --metrics-listen HOST:PORT
+                                           *   for GET /metrics (empty =
+                                           *   off) */
+    std::string metrics_path = "/metrics";  /**< --metrics-path */
     int resolve_ttl = 30;                 /**< --resolve-ttl s (name
                                            *   cache TTL when DNS gives
                                            *   no record TTL) */
@@ -118,6 +122,12 @@ inline Spec<StageOptions> stage_spec() {
         D::integer("peer-log", &O::peer_log,
                    "print the live peers and their kernel TCP RTT to "
                    "stderr every N s (0 = off)"),
+        D::string_("metrics-listen", &O::metrics_listen,
+                   "serve Prometheus metrics on HOST:PORT (empty = "
+                   "off); not covered by --allow, so bind a trusted "
+                   "address"),
+        D::string_("metrics-path", &O::metrics_path,
+                   "path of the metrics page (default /metrics)"),
         D::integer("resolve-ttl", &O::resolve_ttl,
                    "downstream-name cache TTL s when DNS gives no "
                    "record TTL (else the record's, capped); a name "
@@ -321,6 +331,8 @@ struct StageRuntime {
     std::uint32_t layer_end = 0;
     std::string listen_host;
     int listen_port = 0;
+    std::string metrics_host;  /**< valid when metrics_port > 0 */
+    int metrics_port = 0;      /**< 0 = no metrics endpoint */
     std::vector<locus::pipeline::Cidr> allow;
     std::vector<locus::pipeline::HostPort> pool;
     locus::pipeline::StageConn conn;
@@ -371,6 +383,19 @@ inline std::string build_runtime(const StageOptions& opt,
                                          out.listen_port)) {
         return "bad listen (want HOST:PORT): " + opt.listen;
     }
+    out.metrics_host.clear();
+    out.metrics_port = 0;
+    if (!opt.metrics_listen.empty() &&
+        (!locus::pipeline::parse_hostport(opt.metrics_listen,
+                                          out.metrics_host,
+                                          out.metrics_port) ||
+         out.metrics_port <= 0)) {
+        return "bad metrics-listen (want HOST:PORT): " + opt.metrics_listen;
+    }
+    if (opt.metrics_path.empty() || opt.metrics_path[0] != '/') {
+        return "bad metrics-path (want /PATH): " + opt.metrics_path;
+    }
+    out.conn.metrics_path = opt.metrics_path;
     out.pool.clear();
     for (const auto& ds : opt.downstream) {
         std::string h;

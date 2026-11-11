@@ -78,7 +78,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   the language model on Vulkan).
 - **Tools:** `locus-server`; `locus-run` (one prompt); `locus-gguf`
   (inspect a GGUF); `locus-stage` and `locus-driver` (multi-server
-  pipeline, experimental; a stage runs on the CPU, CUDA or Vulkan);
+  pipeline, experimental; a stage runs on the CPU, CUDA or Vulkan, and
+  can serve its own Prometheus `/metrics`);
   `locus-router` (or `locus-server
   --router`: one URL in front of several locus-server instances, given
   as host:port, found by DNS SRV, by mDNS / DNS-SD or by scanning an
