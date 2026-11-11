@@ -132,7 +132,7 @@ class Out:
         self.w.close()
 
 
-def write_dit(path, mdir, q8):
+def write_dit(path, mdir, q8, max_blocks=None):
     t = config(mdir / "transformer")
     s = json.loads((mdir / "scheduler" /
                     "scheduler_config.json").read_text())
@@ -157,8 +157,22 @@ def write_dit(path, mdir, q8):
             s.get("use_beta_sigmas"):
         sys.exit("unsupported scheduler option")
     inner = heads * hd
+    n_blocks = t["num_layers"]
+    if max_blocks is not None:
+        if not 0 < max_blocks <= n_blocks:
+            sys.exit("--blocks must be in 1 .. %d" % n_blocks)
+        n_blocks = max_blocks
 
     tensors = load_dir(mdir / "transformer", "diffusion_pytorch_model")
+    if max_blocks is not None:
+        # The first max_blocks blocks and the layers outside them; with
+        # only the shards holding those (a test's one block of the real
+        # model), the other blocks' shards may be absent.
+        def kept(name):
+            if not name.startswith("transformer_blocks."):
+                return True
+            return int(name.split(".")[1]) < max_blocks
+        tensors = [(n, a) for n, a in tensors if kept(n)]
     shapes = {name: tuple(a.shape) for name, a in tensors}
     # The widths the config does not hold, checked against the tensor
     # shapes (torch [out, in]).
@@ -184,7 +198,7 @@ def write_dit(path, mdir, q8):
     w = o.w
     w.add_name(mdir.name)
     k = "qwen_image."
-    w.add_uint32(k + "block_count", t["num_layers"])
+    w.add_uint32(k + "block_count", n_blocks)
     w.add_uint32(k + "embedding_length", inner)
     w.add_uint32(k + "feed_forward_length", ff)
     w.add_uint32(k + "attention.head_count", heads)
@@ -227,7 +241,7 @@ def write_dit(path, mdir, q8):
     # each; four q/k norms), img_mlp 4, txt_mlp 4, img_mod 2, txt_mod 2.
     # Outside: img_in 2, txt_in 2, txt_norm 1, the timestep embedder 4,
     # norm_out 2, proj_out 2.
-    want = 32 * t["num_layers"] + 13
+    want = 32 * n_blocks + 13
     if n != want:
         sys.exit("qwen_image: %d tensors, expected %d" % (n, want))
     o.finish()
@@ -279,6 +293,8 @@ def main():
     ap.add_argument("--dit-out", help="the transformer GGUF")
     ap.add_argument("--dit-type", choices=("bf16", "q8_0"), default="bf16",
                     help="the transformer's 2D weight type (default bf16)")
+    ap.add_argument("--blocks", type=int,
+                    help="keep only the first N transformer blocks (tests)")
     ap.add_argument("--vae-out", help="the VAE GGUF")
     a = ap.parse_args()
     if not (a.dit_out or a.vae_out):
@@ -290,7 +306,8 @@ def main():
                                       "QwenImagePipeline"):
         sys.exit("expected a QwenImageEditPipeline or QwenImagePipeline")
     if a.dit_out:
-        write_dit(pathlib.Path(a.dit_out), mdir, a.dit_type == "q8_0")
+        write_dit(pathlib.Path(a.dit_out), mdir, a.dit_type == "q8_0",
+                  a.blocks)
     if a.vae_out:
         write_vae(pathlib.Path(a.vae_out), mdir)
 
