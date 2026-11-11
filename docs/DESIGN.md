@@ -877,7 +877,8 @@ quants, so logits move by up to a few tenths against the scalar
 path. The block-32 kernels replay the per-token order. On the M4 Max
 this takes Orpheus 3B Q4_K_M prefill from 97 to 182 tok/s and decode
 from 80 to 85 tok/s. F32, F16 and BF16 weights always take the f32
-dot.
+dot; on neon F16 and BF16 widen to f32 in registers, 8 weights a step
+(the T5-XXL F16 prompt encode on an M2 Pro: 8.8 to 5.9 s).
 
 Goldens: Qwen1.5-MoE and DeepSeek-V2-Lite are pinned to f32, because
 8-bit activations tip their greedy text at a near-tie. Muse Spark's

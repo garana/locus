@@ -131,6 +131,33 @@ TEST_CASE("neon matvec matches scalar", "[backend]") {
         }
     }
 
+    SECTION("f16, with a non-multiple-of-8 tail") {
+        const std::uint32_t rows = 5, cols = 67;  // 8 steps + 3 tail
+        std::vector<std::uint16_t> w(static_cast<std::size_t>(rows) *
+                                     cols);
+        std::vector<float> x(cols);
+        for (auto& v : w) {
+            v = f32_to_f16(dist(rng));
+        }
+        // Edge halves: the smallest subnormal, a negative zero, and
+        // the largest finite (row 2), in the 8-wide steps and the tail.
+        w[3] = 0x0001;
+        w[66] = 0x0001;
+        w[70] = 0x8000;
+        w[140] = 0x7bff;
+        for (auto& v : x) {
+            v = dist(rng);
+        }
+        Mat m{locus::gguf::TensorType::kF16,
+              reinterpret_cast<const std::byte*>(w.data()), rows, cols};
+        std::vector<float> a(rows), b(rows);
+        matvec(m, x, a);
+        matvec_neon(m, x, b);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(b[r] == Catch::Approx(a[r]).epsilon(1e-5).margin(1e-4));
+        }
+    }
+
     SECTION("f32, with a non-multiple-of-4 tail") {
         const std::uint32_t rows = 5, cols = 67;
         std::vector<float> w(static_cast<std::size_t>(rows) *
