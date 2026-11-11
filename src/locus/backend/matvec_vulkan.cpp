@@ -963,7 +963,8 @@ Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
 /**
  * @returns The matvec_q8_0_n build for k over n tokens: the NT 2 build
  * for n <= 2 (#432: its 2 accumulators and planes, against 8, make a
- * lone sequence about 15% faster on an M4 Max), else k or its
+ * lone sequence about 15% faster on an M4 Max), the NT 4 build for 3
+ * or 4 (#516), else k or its
  * guard-free build (NOGUARD) where that one is faster: Apple M1 / M2
  * GPUs (i#471: +3% on an M2 Pro, -4% on an M4 Max;
  * LOCUS_VK_Q8N_GUARDS=0 / 1 overrides). The builds run the same
@@ -978,6 +979,13 @@ Kernel q8n_variant(const VulkanContext& ctx, Kernel k, std::uint32_t n) {
         }
         if (k == Kernel::kMatvecQ8_0NGlu) {
             return Kernel::kMatvecQ8_0N2Glu;
+        }
+    } else if (n <= 4) {
+        if (k == Kernel::kMatvecQ8_0N) {
+            return Kernel::kMatvecQ8_0N4;
+        }
+        if (k == Kernel::kMatvecQ8_0NGlu) {
+            return Kernel::kMatvecQ8_0N4Glu;
         }
     }
     static const bool guards = [&] {

@@ -165,6 +165,9 @@ enum class Kernel {
     /** matvec_q4_k_n with SwiGLU, NT 8 and NT 2. */
     kMatvecQ4_KNGlu,
     kMatvecQ4_KN2Glu,
+    /** The NT 4 builds of matvec_q8_0_n / _glu (#516), for n = 3, 4. */
+    kMatvecQ8_0N4,
+    kMatvecQ8_0N4Glu,
     kCount_,
 };
 
