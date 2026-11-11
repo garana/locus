@@ -171,8 +171,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 - Multi-server inference, pipeline and expert parallel (#3, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
-- Low priority: a quantized KV cache for MLA and DSA models (#63);
-  IPv6 listening (#139).
+- Low priority: a quantized KV cache for MLA and DSA models (#63).
 
 ## Build and test
 

@@ -201,7 +201,7 @@ OpenAI + Anthropic compatible inference server (default port 8080):
                          reg.address.c_str(), reg.router_host.c_str(),
                          reg.router_port);
         }
-        if (!server.listen("0.0.0.0", port)) {
+        if (!server.listen(locus::server::OpenAiServer::kAnyHost, port)) {
             std::fprintf(stderr, "error: cannot bind port %d\n",
                          port);
             return 1;

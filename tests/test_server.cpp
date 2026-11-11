@@ -1,4 +1,5 @@
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -1181,6 +1182,73 @@ TEST_CASE("metrics path is configurable", "[server][e2e]") {
 
     server.stop();
     th.join();
+}
+
+// i#139: locus-server bound "0.0.0.0", an IPv4-only socket, so no IPv6
+// client could reach it. kAnyHost (what the tool binds) must take
+// both families on one socket.
+TEST_CASE("the any-host bind serves IPv4 and IPv6 clients",
+          "[server][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    locus::server::OpenAiServer server(model, tok, {});
+    const int port =
+        server.bind_any_port(locus::server::OpenAiServer::kAnyHost);
+    REQUIRE(port > 0);
+    std::thread th([&] { server.listen_after_bind(); });
+    struct Stop {
+        locus::server::OpenAiServer& s;
+        std::thread& t;
+        ~Stop() {
+            s.stop();
+            t.join();
+        }
+    } stop{server, th};
+
+    // One GET /health on a raw socket: httplib's client is not what is
+    // under test, and a raw request keeps the address literal exact.
+    const auto health = [port](const std::string& host) {
+        const int fd = locus::pipeline::connect_to(host, port, 2000);
+        if (fd < 0) return std::string("connect failed");
+        // A server that kept the connection open fails the test after
+        // 5 s instead of hanging it.
+        const timeval tv{5, 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        const std::string req =
+            "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        std::string out;
+        if (::send(fd, req.data(), req.size(), MSG_NOSIGNAL) ==
+            static_cast<ssize_t>(req.size())) {
+            char buf[512];
+            ssize_t n = 0;
+            while ((n = ::recv(fd, buf, sizeof(buf), 0)) > 0) {
+                out.append(buf, static_cast<std::size_t>(n));
+            }
+        }
+        ::close(fd);
+        return out;
+    };
+    const std::string v4 = health("127.0.0.1");
+    INFO(v4);
+    REQUIRE(v4.rfind("HTTP/1.1 200", 0) == 0);
+    REQUIRE(v4.find("\"status\":\"ok\"") != std::string::npos);
+
+    // Skip the IPv6 leg on a host without an IPv6 loopback, as
+    // test_pipeline.cpp does.
+    const int probe = locus::pipeline::listen_on("::1", 0, nullptr);
+    if (probe < 0) {
+        SKIP("no IPv6 loopback on this host");
+    }
+    ::close(probe);
+    const std::string v6 = health("::1");
+    INFO(v6);
+    REQUIRE(v6.rfind("HTTP/1.1 200", 0) == 0);
+    REQUIRE(v6.find("\"status\":\"ok\"") != std::string::npos);
 }
 
 TEST_CASE("request-edge size limits reject before work",

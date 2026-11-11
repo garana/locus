@@ -164,7 +164,9 @@ using Handler = std::function<void(const Request& req, ServerResponse& res,
 
 /** Server configuration; every bound is explicit (see the class note). */
 struct ServerConfig {
-    std::string host = "0.0.0.0";   /**< "" / "0.0.0.0" == wildcard. */
+    /** "" == every interface, IPv6 and IPv4 on one socket; "0.0.0.0"
+     * binds IPv4 only. */
+    std::string host;
     int port = 8080;                /**< 0 == OS-assigned ephemeral. */
     /** Worker threads; this IS the concurrency cap. 0 == auto
      * (max(8, ncpu - 1), capped). Worst-case buffered request memory is
