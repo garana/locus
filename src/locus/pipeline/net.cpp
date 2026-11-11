@@ -535,8 +535,14 @@ std::string peer_address(int fd) {
     }
     if (ss.ss_family == AF_INET6) {
         const auto* a = reinterpret_cast<const sockaddr_in6*>(&ss);
-        ::inet_ntop(AF_INET6, &a->sin6_addr, ip, sizeof(ip));
         port = ntohs(a->sin6_port);
+        if (IN6_IS_ADDR_V4MAPPED(&a->sin6_addr)) {
+            // An IPv4 peer of a dual-stack socket, as accept_one shows
+            // it: a.b.c.d:port, not [::ffff:a.b.c.d]:port.
+            ::inet_ntop(AF_INET, &a->sin6_addr.s6_addr[12], ip, sizeof(ip));
+            return std::string(ip) + ":" + std::to_string(port);
+        }
+        ::inet_ntop(AF_INET6, &a->sin6_addr, ip, sizeof(ip));
         return "[" + std::string(ip) + "]:" + std::to_string(port);
     }
     return "";
