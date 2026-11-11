@@ -1,3 +1,4 @@
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -94,7 +95,7 @@ const std::vector<TokenId> kPrompt{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
 
 }  // namespace
 
-TEST_CASE("DiskPrefixStore reads back what it wrote, also after a reopen",
+TEST_CASE("DiskPrefixStore reads back what it wrote and after a reopen",
           "[disk_prefix]") {
     DirGuard g{temp_dir("locus-dps-roundtrip")};
     const auto in = blocks(3, 7);
@@ -300,6 +301,19 @@ TEST_CASE("DiskPrefixStore evicts the least recently used file to fit "
     }
 }
 
+TEST_CASE("DiskPrefixStore keeps its files and new directory owner only",
+          "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-dps-mode")};
+    const auto in = blocks(1, 1);
+    DiskPrefixStore s(g.dir / "cache", key(), kBlockBytes, 1 << 20);
+    REQUIRE(s.write(kPrompt, 1, srcs(in)));
+    struct stat st {};
+    REQUIRE(::stat(s.path_for(kPrompt, 1).c_str(), &st) == 0);
+    REQUIRE((st.st_mode & 077) == 0);
+    REQUIRE(::stat((g.dir / "cache").c_str(), &st) == 0);
+    REQUIRE((st.st_mode & 077) == 0);
+}
+
 TEST_CASE("DiskPrefixStore removes a crash's temporary files on open",
           "[disk_prefix]") {
     DirGuard g{temp_dir("locus-dps-tmp")};
@@ -357,7 +371,7 @@ TEST_CASE("DiskPrefixStore stores a prefix again after its file was "
     REQUIRE(out == in);
 }
 
-TEST_CASE("DiskPrefixStore: concurrent finds, reads and writes agree",
+TEST_CASE("DiskPrefixStore: concurrent finds and reads and writes agree",
           "[disk_prefix]") {
     DirGuard g{temp_dir("locus-dps-threads")};
     DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);

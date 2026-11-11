@@ -155,7 +155,11 @@ DiskPrefixStore::DiskPrefixStore(fs::path dir, DiskKey key,
     const std::vector<std::uint8_t> k = header({}, 0);
     key_seed_ = checksum(k.data(), k.size());
 
-    fs::create_directories(dir_);
+    // Files hold clients' prompt tokens: owner only. A directory the
+    // caller made keeps its mode; the files in it are 0600 anyway.
+    if (fs::create_directories(dir_)) {
+        fs::permissions(dir_, fs::perms::owner_all, fs::perm_options::replace);
+    }
     // (mtime, digest, bytes): the order across a restart is the
     // order of the files' last reads and writes.
     std::vector<std::tuple<fs::file_time_type, std::uint64_t,
@@ -408,7 +412,7 @@ bool DiskPrefixStore::write(std::span<const tok::TokenId> prompt,
     bool ok;
     {
         Fd f{::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
-                    0644)};
+                    0600)};
         ok = f.fd >= 0 && pwrite_full(f.fd, meta.data(), meta.size(), 0);
         off_t off = static_cast<off_t>(meta.size());
         for (std::uint32_t i = 0; ok && i < n_blocks; ++i) {
