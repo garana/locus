@@ -3406,36 +3406,39 @@ bool has_batch_kernel(gguf::TensorType type) {
  * @param kvalues The device IQ4 codebook; read by IQ4_NL and IQ4_XS.
  * @param x n <= kMaxBatch tokens, token-major (token t at t * cols).
  * @param out rows * n floats, row-major (out[r * n + t]).
+ * @returns false, launching nothing, for a type with no batched kernel.
  */
-void launch_batch(gguf::TensorType type, const std::uint8_t* w,
+bool launch_batch(gguf::TensorType type, const std::uint8_t* w,
                   const std::int8_t* kvalues, const float* x, float* out,
                   std::uint32_t rows, std::uint32_t cols, std::uint32_t n) {
     const std::uint32_t blocks = (rows + kWarpRows - 1) / kWarpRows;
     switch (type) {
+        case gguf::TensorType::kQ4_K:
+            matvec_batch_q4_k_kernel<<<blocks, 32 * kWarpRows>>>(
+                w, x, out, rows, cols, n);
+            return true;
         case gguf::TensorType::kQ6_K:
             matvec_batch_q6_k_kernel<<<blocks, 32 * kWarpRows>>>(
                 w, x, out, rows, cols, n);
-            break;
+            return true;
         case gguf::TensorType::kQ8_0:
             matvec_batch_q8_0_kernel<<<blocks, 32 * kWarpRows>>>(
                 w, x, out, rows, cols, n);
-            break;
+            return true;
         case gguf::TensorType::kQ5_K:
             matvec_batch_q5_k_kernel<<<blocks, 32 * kWarpRows>>>(
                 w, x, out, rows, cols, n);
-            break;
+            return true;
         case gguf::TensorType::kIQ4_NL:
             matvec_batch_iq4_nl_kernel<<<blocks, 32 * kWarpRows>>>(
                 w, kvalues, x, out, rows, cols, n);
-            break;
+            return true;
         case gguf::TensorType::kIQ4_XS:
             matvec_batch_iq4_xs_kernel<<<blocks, 32 * kWarpRows>>>(
                 w, kvalues, x, out, rows, cols, n);
-            break;
+            return true;
         default:
-            matvec_batch_q4_k_kernel<<<blocks, 32 * kWarpRows>>>(
-                w, x, out, rows, cols, n);
-            break;
+            return false;  // has_batch_kernel and this switch disagree
     }
 }
 
@@ -3484,10 +3487,11 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
         if (dx != nullptr && dout != nullptr &&
             cuda_ok(cudaMemcpy(dx, x_batch.data(), x_bytes,
                                cudaMemcpyHostToDevice))) {
-            launch_batch(w.type, static_cast<const std::uint8_t*>(dw), kv,
-                         static_cast<const float*>(dx),
-                         static_cast<float*>(dout), w.rows, w.cols, n);
-            ok = cuda_ok(cudaGetLastError()) &&
+            ok = launch_batch(w.type, static_cast<const std::uint8_t*>(dw),
+                              kv, static_cast<const float*>(dx),
+                              static_cast<float*>(dout), w.rows, w.cols,
+                              n) &&
+                 cuda_ok(cudaGetLastError()) &&
                  sync_counted() &&
                  cuda_ok(cudaMemcpy(out_batch.data(), dout, out_bytes,
                                     cudaMemcpyDeviceToHost));
@@ -4876,7 +4880,10 @@ bool cuda_dev_matvec_batch(const Mat& w, const float* dx, float* dout,
     for (std::uint32_t t0 = 0; t0 < n; t0 += kMaxBatch) {
         const std::uint32_t m = std::min(kMaxBatch, n - t0);
         const float* xs = dx + std::size_t{t0} * w.cols;
-        launch_batch(w.type, dwb, kv, xs, scratch, w.rows, w.cols, m);
+        if (!launch_batch(w.type, dwb, kv, xs, scratch, w.rows, w.cols,
+                          m)) {
+            return false;
+        }
         dev_transpose_kernel<<<blocks_for(std::size_t{w.rows} * m), 256>>>(
             scratch, dout + std::size_t{t0} * w.rows, w.rows, m);
     }
