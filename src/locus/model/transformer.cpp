@@ -1328,8 +1328,11 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     std::vector<float> xb2(static_cast<std::size_t>(n) * E);
     std::vector<float> gate(static_cast<std::size_t>(n) * ff);
     std::vector<float> up(static_cast<std::size_t>(n) * ff);
-    // Batched attention projections (plain llama attention, F32 cache).
-    const bool plain = spec_->plain_attention && !cache.quantized();
+    // Batched attention projections (plain llama attention, or Qwen2's
+    // with its biases and NEOX rope and no M-RoPE; F32 cache).
+    const bool qwen2 = spec_->qwen2_attention && mrope.empty();
+    const bool plain =
+        (spec_->plain_attention || qwen2) && !cache.quantized();
     const std::uint32_t hd = hp_.head_dim;
     const std::size_t kv_dim = std::size_t{hp_.n_kv_heads} * hd;
     const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
@@ -1359,7 +1362,8 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
             // Plain llama attention: q / k / v and wo as batched
             // matvecs over the chunk (each weight read once), RoPE, the
             // cache rows and the attention per token, as
-            // llama_attention does them. Byte-identical to it.
+            // llama_attention does them. Byte-identical to it. Qwen2's
+            // adds the biases and NEOX rope, as qwen2moe_attention does.
             for (std::uint32_t t = 0; t < n; ++t) {
                 const std::size_t o = static_cast<std::size_t>(t) * E;
                 apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
@@ -1378,6 +1382,23 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                             krow);
                 std::copy_n(vb.data() + std::size_t{t} * kv_dim, kv_dim,
                             vrow);
+                if (qwen2) {
+                    const auto bias = [](float* d, std::span<const float> b) {
+                        for (std::size_t i = 0; i < b.size(); ++i) {
+                            d[i] += b[i];
+                        }
+                    };
+                    bias(q.data(), lay.wq_bias);
+                    bias(krow, lay.wk_bias);
+                    bias(vrow, lay.wv_bias);
+                    backend::rope_neox_yarn(q, hp_.n_heads, hd, pos,
+                                            hp_.rope_freq_base,
+                                            backend::Yarn{});
+                    backend::rope_neox_yarn({krow, kv_dim}, hp_.n_kv_heads,
+                                            hd, pos, hp_.rope_freq_base,
+                                            backend::Yarn{});
+                    continue;
+                }
                 backend::rope_norm(q, hp_.n_heads, hd, pos,
                                    hp_.rope_freq_base, rope_factors());
                 backend::rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd, pos,

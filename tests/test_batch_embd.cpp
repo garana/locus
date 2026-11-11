@@ -12,6 +12,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
+#include "qwen_tiny.hpp"
 
 using locus::model::TransformerModel;
 using Seq = locus::kv::PagedKvCache::Seq;
@@ -21,6 +22,59 @@ std::string stories_path() {
     return std::string(LOCUS_SOURCE_DIR) + "/tests/models/stories260K.gguf";
 }
 }  // namespace
+
+// i#618: Qwen2's attention (q / k / v biases, NEOX rope) runs batched in
+// forward_batch, as plain llama attention does, and must equal one
+// forward per token bit for bit on every CPU backend: qwen2, and qwen2vl
+// without M-RoPE positions. Two chunks, so the second attends over the
+// first's cache rows.
+TEST_CASE("qwen2 forward_batch equals per-token forward",
+          "[model][batch]") {
+    for (const char* arch : {"qwen2", "qwen2vl"}) {
+        const auto img = qwen_tiny::lm(arch);
+        const auto g = locus::gguf::GgufFile::parse(img);
+        auto model = TransformerModel::load(g);
+        const std::uint32_t V = model.hparams().n_vocab;
+        const std::vector<locus::tok::TokenId> toks = {3,  17, 42, 9, 5,
+                                                       33, 21, 58, 12, 7,
+                                                       1,  44, 2};
+        const auto m = static_cast<std::uint32_t>(toks.size());
+        const std::uint32_t split = 6;
+        for (const auto& be : locus::backend::backends()) {
+            if (!be.available || !be.selectable || be.name == "vulkan") {
+                continue;
+            }
+            DYNAMIC_SECTION(arch << " backend " << be.name) {
+                model.use_backend(be);
+                auto cR = model.make_cache(32);
+                auto wR = model.make_workspace();
+                Seq sR;
+                std::vector<float> want(std::size_t{m} * V);
+                for (std::uint32_t i = 0; i < m; ++i) {
+                    REQUIRE(cR.ensure_capacity(sR, 1));
+                    model.forward(toks[i], cR, sR, wR,
+                                  {want.data() + std::size_t{i} * V, V});
+                }
+                auto cB = model.make_cache(32);
+                auto wB = model.make_workspace();
+                Seq sB;
+                std::vector<float> got(std::size_t{m} * V);
+                REQUIRE(cB.ensure_capacity(sB, split));
+                model.forward_batch({toks.data(), split}, cB, sB, wB,
+                                    {got.data(), std::size_t{split} * V},
+                                    /*all_logits=*/true);
+                REQUIRE(cB.ensure_capacity(sB, m - split));
+                model.forward_batch(
+                    {toks.data() + split, m - split}, cB, sB, wB,
+                    {got.data() + std::size_t{split} * V,
+                     std::size_t{m - split} * V},
+                    /*all_logits=*/true);
+                REQUIRE(sB.n_tokens == m);
+                CHECK(got == want);
+            }
+        }
+    }
+}
 
 // i#257: forward_batch takes input embeddings in place of some tokens
 // (Janus image slots), and must equal one forward_layers per position
