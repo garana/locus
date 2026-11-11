@@ -315,20 +315,29 @@ void Engine::share_prefill() {
     }
     // Each prompt is fed in the chunks it gets alone: the whole budget
     // or its whole remainder (batch invariance, i#403: a chunk's size
-    // changes the sums). The shortest remainder goes first, and a
-    // prompt whose chunk no longer fits waits for the next step.
-    // stable_sort keeps admission order among equal remainders.
-    std::stable_sort(want.begin(), want.end(),
-                     [](const auto& a, const auto& b) {
-                         return a.first < b.first;
-                     });
+    // changes the sums). A prompt that waited prefill_max_wait steps
+    // goes first, the longest waiter first; then the shortest
+    // remainder. A prompt whose chunk no longer fits waits for the next
+    // step. stable_sort keeps admission order among equals.
+    const std::uint32_t max_wait = cfg_.prefill_max_wait;
+    std::stable_sort(want.begin(), want.end(), [max_wait](const auto& a,
+                                                          const auto& b) {
+        const std::uint32_t wa = a.second->prefill_waits;
+        const std::uint32_t wb = b.second->prefill_waits;
+        if ((wa >= max_wait) != (wb >= max_wait)) return wa >= max_wait;
+        if (wa >= max_wait) return wa > wb;
+        return a.first < b.first;
+    });
     const std::uint32_t chunk = cfg_.prefill_budget;
     std::uint32_t budget = chunk;
     for (auto& [remaining, r] : want) {
         const std::uint32_t need = std::min(remaining, chunk);
         if (need <= budget) {
             r->step_share = need;
+            r->prefill_waits = 0;
             budget -= need;
+        } else {
+            ++r->prefill_waits;
         }
     }
 }

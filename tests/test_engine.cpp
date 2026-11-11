@@ -347,6 +347,52 @@ TEST_CASE("a short prompt is not held back by a long prefill",
     }
 }
 
+// A short prompt arriving every step would take the budget before a
+// long prompt whose chunk needs all of it; after prefill_max_wait (2)
+// steps unfed, the long one goes first. The skipped steps of
+// decode_share do not count, so its first chunk comes within about
+// twice (2 + 1) steps.
+TEST_CASE("a stream of short prompts does not starve a long one",
+          "[engine][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    std::vector<locus::tok::TokenId> long_prompt;
+    while (long_prompt.size() < 64) {
+        const auto t = tok.encode(
+            "Once upon a time, there was a little girl named Lily who "
+            "loved to explore the forest near her home every day. ",
+            long_prompt.empty());
+        long_prompt.insert(long_prompt.end(), t.begin(), t.end());
+    }
+    long_prompt.resize(64);
+    // 15 tokens: with a budget of 16, it leaves 1, too few for the long
+    // prompt's 16-token chunk.
+    const std::vector<locus::tok::TokenId> short_prompt(
+        long_prompt.begin(), long_prompt.begin() + 15);
+
+    Engine::Config cfg;
+    cfg.prefill_budget = 16;
+    Engine engine(model, tok.eos_id(), cfg);
+    const auto big = engine.submit(long_prompt, 2);
+    engine.submit(short_prompt, 2);
+    int steps = 0, first_chunk_step = 0;
+    for (int i = 0; i < 40 && engine.step(); ++i) {
+        ++steps;
+        if (first_chunk_step == 0 && engine.get(big)->n_fed > 0) {
+            first_chunk_step = steps;
+        }
+        engine.submit(short_prompt, 2);
+    }
+    CHECK(first_chunk_step >= 1);
+    CHECK(first_chunk_step <= 2 * (2 + 1) + 1);
+    engine.run_to_completion();
+    CHECK(engine.get(big)->status == Status::kDone);
+}
+
 TEST_CASE("speculative decoding matches greedy output",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {

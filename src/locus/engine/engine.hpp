@@ -86,6 +86,8 @@ struct Request {
     std::uint32_t n_fed = 0;
     /** This step's prompt tokens (Engine::share_prefill). */
     std::uint32_t step_share = 0;
+    /** Prefill steps in a row this prompt was not fed (aging). */
+    std::uint32_t prefill_waits = 0;
     /** Prompt-cache accounting (prefix_cache on). reused = prompt
      * tokens served from a cached KV prefix (skipped prefill), set at
      * adopt time; cached = prompt tokens NEWLY written to the cache at
@@ -134,6 +136,11 @@ class Engine {
          * remainder go first (i#617), so a short prompt behind a long
          * one is fed on the next step, not after the long prefill. */
         std::uint32_t prefill_budget = 0;
+        /** A prompt not fed on this many prefill steps in a row goes
+         * first on the next (oldest waiter first), so shorter prompts
+         * cannot starve a long one whose chunk needs the whole budget.
+         * Steps that skip prefill (decode_share) do not count. */
+        std::uint32_t prefill_max_wait = 2;
         /** While a request decodes, every other step feeds no prompt
          * (i#617), so decodes behind a long prompt get a decode-only
          * step at least every second step. The prefill loses the
@@ -356,7 +363,8 @@ class Engine {
     /** Feeds up to `budget` tokens of r; samples when caught up. */
     void advance(Request& r, std::uint32_t& budget);
     /** Sets every running request's step_share: the prompts still
-     * prefilling, shortest remainder first, each its whole-budget
+     * prefilling, the aged ones (prefill_max_wait) first, then the
+     * shortest remainder first, each its whole-budget
      * chunk or its whole remainder while the budget lasts (the chunks
      * it gets alone); 0 for the others, and for all of them on every
      * other step while a request decodes (decode_share). */
