@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -100,10 +101,13 @@ class QwenVae {
     };
 
     QwenVae() = default;
+    /** A copy owns new buffers; a moved-from VAE holds none. */
     QwenVae(const QwenVae&) = default;
-    QwenVae& operator=(const QwenVae&) = default;
     QwenVae(QwenVae&&) = default;
-    QwenVae& operator=(QwenVae&&) = default;
+    /** Deleted: assigning over a VAE that ran on the GPU would free its
+     *  conv buffers without dropping their GPU copies (see ~QwenVae). */
+    QwenVae& operator=(const QwenVae&) = delete;
+    QwenVae& operator=(QwenVae&&) = delete;
     /** Drops the GPU copies of the conv weights, when a call ran on
      *  backend::vulkan_image_ops(): they are cached by host pointer, and
      *  these are this object's own buffers (the 2D slices of the 3D
@@ -120,8 +124,17 @@ class QwenVae {
     template <class F>
     void each_conv(F&& fn) const;
 
-    /** Set by a call on the Vulkan image ops (see ~QwenVae). */
-    mutable bool gpu_used_ = false;
+    /** An atomic flag that copies its value (so the constructors stay
+     *  defaulted). */
+    struct Flag {
+        std::atomic<bool> v{false};
+        Flag() = default;
+        Flag(const Flag& o) : v(o.v.load()) {}
+        Flag(Flag&& o) noexcept : v(o.v.load()) {}
+    };
+    /** Set by a call on the Vulkan image ops (see ~QwenVae); atomic, as
+     *  encode / decode are const and may run on several threads. */
+    mutable Flag gpu_used_;
 
     std::uint32_t z_ = 0, downs_ = 0;
     std::vector<float> mean_, std_;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
@@ -332,15 +333,23 @@ QwenVae QwenVae::load(const gguf::GgufFile& g) {
 std::uint32_t QwenVae::scale() const { return 1u << downs_; }
 
 QwenVae::~QwenVae() {
-    if (!gpu_used_) return;
-    each_conv([](const Conv& k) {
-        for (const auto* v : {&k.w, &k.b}) {
-            if (!v->empty()) {
-                backend::vulkan_release_weights(v->data(),
-                                                v->size() * sizeof(float));
+    if (!gpu_used_.v.load()) return;
+    // vulkan_release_weights throws inside an open batch; a destructor
+    // must not throw (it may run while unwinding), so such a release is
+    // skipped and reported.
+    try {
+        each_conv([](const Conv& k) {
+            for (const auto* v : {&k.w, &k.b}) {
+                if (!v->empty()) {
+                    backend::vulkan_release_weights(
+                        v->data(), v->size() * sizeof(float));
+                }
             }
-        }
-    });
+        });
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "qwen vae: GPU weights not released: %s\n",
+                     e.what());
+    }
 }
 
 template <class F>
@@ -422,7 +431,7 @@ std::vector<float> QwenVae::encode(std::span<const float> chw,
         throw std::invalid_argument(
             "qwen vae: need [3][h][w], sides multiples of scale()");
     }
-    if (&op == &backend::vulkan_image_ops()) gpu_used_ = true;
+    if (&op == &backend::vulkan_image_ops()) gpu_used_.v.store(true);
     std::uint32_t c = enc_in_.out;
     auto x = run(enc_, conv2d(enc_in_, chw, h, w, 1, 1, op), c, h, w, op);
     x = conv2d(enc_out_, norm(x, enc_norm_, c, std::size_t{h} * w, true),
@@ -438,7 +447,7 @@ std::vector<float> QwenVae::decode(std::span<const float> z, std::uint32_t h,
     if (h == 0 || w == 0 || z.size() != std::size_t{z_} * h * w) {
         throw std::invalid_argument("qwen vae: need [z_dim][h][w]");
     }
-    if (&op == &backend::vulkan_image_ops()) gpu_used_ = true;
+    if (&op == &backend::vulkan_image_ops()) gpu_used_.v.store(true);
     auto x = conv2d(post_quant_, z, h, w, 1, 0, op);
     std::uint32_t c = dec_in_.out;
     x = run(dec_, conv2d(dec_in_, x, h, w, 1, 1, op), c, h, w, op);
