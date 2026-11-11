@@ -243,7 +243,9 @@ void gqa_attend_batch(const float* q, float* out, std::size_t q_stride,
     const std::uint32_t n_kv = n_heads / group;
     const std::uint64_t per_token = std::uint64_t{group} * (base + n);
     const std::uint64_t fan = std::max<std::size_t>(mt_fanout(), 1);
-    const std::uint64_t by_threads = (std::uint64_t{n} * n_kv + fan - 1) / fan;
+    // ceil(fan / n_kv) blocks per KV head give every thread a task.
+    const std::uint64_t by_threads =
+        std::uint64_t{n} / ((fan + n_kv - 1) / n_kv);
     const std::uint64_t by_memory =
         kMaxScores / std::max<std::uint64_t>(per_token, 1);
     const auto block = static_cast<std::uint32_t>(
