@@ -164,7 +164,11 @@ TEST_CASE("loop connection gives a partial head a 408 at its deadline",
     std::this_thread::sleep_until(c.deadline() +
                                   std::chrono::milliseconds(5));
     REQUIRE(c.on_timeout() == Next::kClose);  // 408 written, then close
-    CHECK(p.recv_all().rfind("HTTP/1.1 408", 0) == 0);
+    const std::string got = p.recv_all();
+    CHECK(got.rfind("HTTP/1.1 408", 0) == 0);
+    // The API's JSON error envelope, as http::Server writes it.
+    CHECK(got.find("Content-Type: application/json") != std::string::npos);
+    CHECK(got.ends_with(locus::http::status_error_body(408)));
 }
 
 TEST_CASE("loop connection closes an idle keep-alive connection",
@@ -202,6 +206,8 @@ TEST_CASE("loop connection turns a throwing handler into a 500",
     const std::string got = p.recv_all();
     CHECK(got.rfind("HTTP/1.1 500", 0) == 0);
     CHECK(got.find("boom") == std::string::npos);  // no internals leak
+    CHECK(got.find("Content-Type: application/json") != std::string::npos);
+    CHECK(got.ends_with(locus::http::status_error_body(500)));
 }
 
 TEST_CASE("loop connection honors Connection: close and the request cap",

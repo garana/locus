@@ -66,7 +66,7 @@ bool LoopConnection::fill() {
 void LoopConnection::queue_status(int status, bool head_request) {
     Response r;
     r.status = status;
-    r.set_content(status_reason(status) + "\n", "text/plain");
+    r.set_content(status_error_body(status), "application/json");
     std::string err;
     write_response(r, head_request, false, out_, err);
     close_after_ = true;
