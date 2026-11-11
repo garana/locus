@@ -1806,6 +1806,22 @@ void rope_norm(std::span<float> x, std::uint32_t n_heads,
     }
 }
 
+void rope_norm_table(std::uint32_t head_dim, std::uint32_t pos,
+                     float freq_base, std::span<const float> factors,
+                     std::span<float> cs) {
+    assert(cs.size() >= head_dim);
+    for (std::uint32_t i = 0; i + 1 < head_dim; i += 2) {
+        // rope_norm's theta, cos and sin, term for term.
+        const float theta =
+            static_cast<float>(pos) *
+            std::pow(freq_base,
+                     -static_cast<float>(i) / static_cast<float>(head_dim)) /
+            (factors.empty() ? 1.0f : factors[i / 2]);
+        cs[i] = std::cos(theta);
+        cs[i + 1] = std::sin(theta);
+    }
+}
+
 std::size_t mat_row_bytes(const Mat& w) { return row_bytes(w); }
 
 void matvec_t(const Mat& w, std::span<const float> x,

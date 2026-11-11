@@ -38,6 +38,15 @@ struct KvAttend {
     /** Out: as q. */
     float* out = nullptr;
     std::size_t q_stride = 0;
+    /** q and out are device pointers of a CUDA forward (i#517), not
+     *  host ones: nothing is copied and the call does not wait. */
+    bool device_io = false;
+    /** With device_io: device copies of blocks (n_blocks entries) and
+     *  of the query table (the n_q positions, then the n_q block-table
+     *  offsets), uploaded once per forward; null: uploaded per call.
+     *  The host blocks / q_pos / q_table stay set (bounds, chunk count). */
+    const void* dev_blocks = nullptr;
+    const void* dev_meta = nullptr;
 };
 
 /** Op table a backend provides to the model runtime. Ops not in

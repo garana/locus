@@ -700,6 +700,32 @@ class TransformerModel {
     }
 
   private:
+    /**
+     * CUDA forward of a plain llama model (i#517): n tokens, token t at
+     * position pos[t] of *seqs[t], with every layer's activations on the
+     * GPU (rmsnorm, q / k / v, RoPE, the K/V rows into the device mirror,
+     * the attention, wo, the FFN and the residual adds), one upload of
+     * the embeddings and one download of the logits and of the new K/V
+     * rows for the host pool. Each token gets the same bits however many
+     * share the call, so decode, batched decode and prefill agree.
+     *
+     * @param logits n * n_vocab floats when all_logits, else n_vocab (the
+     *     last token's).
+     * @param embd Empty, or one entry per token: nullptr to embed the
+     *     token, or n_embd floats used instead of its row (Janus image
+     *     slots, as forward_batch's embd); that token is then ignored.
+     * @returns false when it cannot run here (not CUDA, not plain llama,
+     *     no mirror, a weight the device cannot hold, a CUDA error, or
+     *     LOCUS_CUDA_FORWARD=0); the caller then takes the host path.
+     *     The sequences are not advanced either way.
+     */
+    bool cuda_forward(std::span<const tok::TokenId> toks,
+                      std::span<kv::PagedKvCache::Seq* const> seqs,
+                      std::span<const std::uint32_t> pos,
+                      kv::PagedKvCache& cache, Workspace& ws,
+                      std::span<float> logits, bool all_logits,
+                      std::span<const float* const> embd = {}) const;
+
     /** Applies the model's norm (RMS or LayerNorm per hp_.norm_type)
      * to x scaled by w, into out; uses hp_.rms_eps. */
     /** Applies hp_.logit_scale and the final logit softcap in place

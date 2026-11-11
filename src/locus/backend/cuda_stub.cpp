@@ -43,6 +43,37 @@ void cuda_kv_mirror_free(void*) {}
 
 bool cuda_kv_attend(const KvAttend&) { return false; }
 
+float* cuda_dev_alloc(std::size_t) { return nullptr; }
+void cuda_dev_free(float*) {}
+bool cuda_dev_upload(float*, const float*, std::size_t) { return false; }
+bool cuda_dev_download(float*, const float*, std::size_t) { return false; }
+const float* cuda_dev_const(const float*, std::size_t) { return nullptr; }
+bool cuda_dev_matvec(const Mat&, const float*, float*) { return false; }
+bool cuda_dev_matvec_batch(const Mat&, const float*, float*, std::uint32_t,
+                           float*) {
+    return false;
+}
+bool cuda_dev_rmsnorm(const float*, const float*, float, float*,
+                      std::uint32_t, std::uint32_t) {
+    return false;
+}
+bool cuda_dev_rope(float*, const float*, std::uint32_t, std::uint32_t,
+                   std::size_t, std::uint32_t) {
+    return false;
+}
+bool cuda_dev_silu_mul(float*, const float*, std::size_t) { return false; }
+bool cuda_dev_add(float*, const float*, std::size_t) { return false; }
+void* cuda_dev_alloc_bytes(std::size_t) { return nullptr; }
+void cuda_dev_free_bytes(void*) {}
+bool cuda_dev_upload_bytes(void*, const void*, std::size_t) { return false; }
+bool cuda_dev_kv_scatter(const float*, const float*, std::uint32_t,
+                         std::uint32_t, const std::uint64_t*, std::size_t,
+                         std::size_t, float*, float*, std::size_t,
+                         std::size_t) {
+    return false;
+}
+bool cuda_dev_finish() { return false; }
+
 void matvec_batch_cuda(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n) {
     matvec_batch_scalar(w, x_batch, out_batch, n);

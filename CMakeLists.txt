@@ -84,6 +84,7 @@ add_library(locus
     src/locus/model/grammar_constraint.cpp
     src/locus/model/json_schema_gbnf.cpp
     src/locus/model/transformer.cpp
+    src/locus/model/transformer_cuda.cpp
     src/locus/model/expert_cache.cpp
     src/locus/model/expert_metrics.cpp
     src/locus/model/moe_stats.cpp

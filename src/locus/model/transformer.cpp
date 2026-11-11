@@ -927,6 +927,19 @@ void TransformerModel::forward_layers(tok::TokenId token,
         return;
     }
     const std::uint32_t pos = seq.n_tokens;
+    if (first && last && backend_->name == "cuda" &&
+        (rows.end == 0 || (rows.begin == 0 && rows.end == hp_.n_vocab))) {
+        // Plain llama on CUDA, the whole model: the layers on the GPU
+        // (i#517), as every other CUDA forward of the full model.
+        kv::PagedKvCache::Seq* one = &seq;
+        const float* e = embed_in ? hidden_in.data() : nullptr;
+        if (cuda_forward({&token, 1}, {&one, 1}, {&pos, 1}, cache, ws, out,
+                         false, {&e, 1})) {
+            lap.lap(kNoLayer, Stage::kDevice);
+            seq.n_tokens = pos + 1;
+            return;
+        }
+    }
     const backend::Ops op =
         effective_ops(backend_, q8k_activations());
 
@@ -1221,6 +1234,22 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
             "forward_batch: seq capacity not ensured");
     }
     StageLap lap(stage_metrics_.get());
+    if (backend_->name == "cuda") {
+        // Plain llama on CUDA: the whole chunk on the GPU (i#517), input
+        // embeddings included, the same per-token bits as decode's
+        // cuda_forward.
+        std::vector<kv::PagedKvCache::Seq*> same(n, &seq);
+        std::vector<std::uint32_t> at(n);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            at[t] = base + t;
+        }
+        if (cuda_forward(toks, same, at, cache, ws, logits, all_logits,
+                         embd)) {
+            lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
+            seq.n_tokens = base + n;
+            return;
+        }
+    }
     if (backend_->name == "vulkan" && any_embd) {
         // The GPU batch with the embeddings in place of those tokens'
         // rows (i#257); where it declines, one GPU forward per position.
@@ -1505,6 +1534,18 @@ void TransformerModel::forward_batch_decode(
                 "forward_batch_decode: seq capacity not ensured");
         }
     }
+    if (backend_->name == "cuda") {
+        // Plain llama on CUDA: every sequence's step on the GPU in one
+        // pass (i#517), each with the bits of its own decode.
+        StageLap dlap(stage_metrics_.get());
+        if (cuda_forward(toks, seqs, pos, cache, ws, logits, true)) {
+            dlap.lap(StageMetrics::kNoLayer, Stage::kDevice);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                seqs[t]->n_tokens = pos[t] + 1;
+            }
+            return;
+        }
+    }
 
     std::vector<float> x(static_cast<std::size_t>(n) * E);
     std::vector<float> xbf(static_cast<std::size_t>(n) * E);
@@ -1689,6 +1730,18 @@ void TransformerModel::forward_batch_layers(
             pos[t] + 1 > cache.capacity(*seqs[t])) {
             throw std::invalid_argument(
                 "forward_batch_layers: seq capacity not ensured");
+        }
+    }
+    if (first && last && backend_->name == "cuda") {
+        // The whole model on CUDA: the same GPU forward as forward() and
+        // forward_batch_decode (i#517), so the bits agree with them.
+        StageLap dlap(stage_metrics_.get());
+        if (cuda_forward(toks, seqs, pos, cache, ws, out, true)) {
+            dlap.lap(StageMetrics::kNoLayer, Stage::kDevice);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                seqs[t]->n_tokens = pos[t] + 1;
+            }
+            return;
         }
     }
 
