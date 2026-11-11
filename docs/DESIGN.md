@@ -181,8 +181,9 @@ reads the PTR, SRV and A (or AAAA) records into host:ports
 (`pipeline::mdns_browse`, its own bounded parser). An empty browse
 keeps the last list, since mDNS packets get lost. Instances advertise
 with the OS (`dns-sd -R`, `avahi-publish-service`). Only replies from
-port 5353 and from loopback or an interface's own network are read,
-but anyone on the LAN can still answer, so the scan's trust rule holds
+port 5353 and from loopback or an interface's own network are read
+(a container bridge such as docker0 is one, so a container on the
+host can answer too), but anyone on the LAN can still answer, so the scan's trust rule holds
 for it too; with `--upstream-auth client`, an `mdns:` or `scan:`
 source makes the router warn at startup that client keys go to
 whatever answers.
