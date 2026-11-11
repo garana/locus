@@ -5,9 +5,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
-#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -26,6 +26,7 @@
 #include "locus/pipeline/resolver.hpp"
 #include "locus/pipeline/stage_executor.hpp"
 #include "locus/server/metrics_text.hpp"
+#include "locus/sys/features.hpp"
 #include "locus/sys/poller.hpp"
 
 namespace locus::pipeline {
@@ -556,9 +557,23 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // `sessions`, so the seqs it touches then are still alive).
     std::vector<std::unique_ptr<StageExecutor>> executors;
     executors.reserve(stages.size());
-    for (PipelineStage* st : stages) {
-        executors.push_back(
-            std::make_unique<StageExecutor>(*st, exec_wake.w, max_batch));
+    // K executors: each gets a share of the cores of its own (i#45), so
+    // their loops do not serialize on one pool and a lone request still
+    // fans out. The shares split the performance cores where the CPU
+    // has tiers (a matvec share on an efficiency core holds back the
+    // whole loop, as mt_fanout notes), else all cores; the first
+    // `cores % K` executors take one more. One executor keeps the
+    // process-wide pool.
+    const std::size_t k = stages.size();
+    const unsigned pcores = sys::performance_cores();
+    const std::size_t cores =
+        pcores > 0 ? pcores : std::max(1u, std::thread::hardware_concurrency());
+    for (std::size_t i = 0; i < k; ++i) {
+        const std::size_t threads =
+            k > 1 ? std::max<std::size_t>(1, cores / k + (i < cores % k))
+                  : 0;
+        executors.push_back(std::make_unique<StageExecutor>(
+            *stages[i], exec_wake.w, max_batch, threads));
     }
     // Live session count per executor, for least-loaded assignment.
     std::vector<std::size_t> exec_load(stages.size(), 0);

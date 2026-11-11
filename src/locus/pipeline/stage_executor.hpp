@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -12,6 +13,7 @@
 #include "locus/kv/paged_cache.hpp"
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/stage.hpp"
+#include "locus/sys/thread_pool.hpp"
 
 namespace locus::pipeline {
 
@@ -94,9 +96,13 @@ class StageExecutor {
      *     guard does not count), and the added latency the earliest-
      *     queued session waits for the rest of its batch. A modest
      *     default keeps both bounded under load; 0 is treated as 1.
+     * @param threads The threads this executor's forwards fan out to
+     *     (i#45): a pool of its own with threads - 1 workers, so K
+     *     executors' loops do not serialize on one pool. 0 (the
+     *     default) uses the process-wide pool.
      */
     StageExecutor(PipelineStage& stage, int wake_fd,
-                  std::size_t max_batch = 16);
+                  std::size_t max_batch = 16, std::size_t threads = 0);
     ~StageExecutor();
     StageExecutor(const StageExecutor&) = delete;
     StageExecutor& operator=(const StageExecutor&) = delete;
@@ -128,6 +134,8 @@ class StageExecutor {
     PipelineStage& stage_;
     int wake_fd_;
     std::size_t max_batch_;
+    /** This executor's own pool (null: the process-wide one). */
+    std::unique_ptr<sys::ThreadPool> pool_;
 
     std::mutex mu_;
     std::condition_variable cv_;

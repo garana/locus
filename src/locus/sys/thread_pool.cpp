@@ -30,11 +30,25 @@ void cpu_relax() {
 
 }  // namespace
 
+namespace {
+/** The calling thread's current pool (ThreadPool::Scope), or null. */
+thread_local ThreadPool* t_current = nullptr;
+}  // namespace
+
 ThreadPool& ThreadPool::instance() {
+    if (t_current != nullptr) {
+        return *t_current;
+    }
     static ThreadPool pool(
         std::max(1u, std::thread::hardware_concurrency()) - 1);
     return pool;
 }
+
+ThreadPool::Scope::Scope(ThreadPool& pool) : prev_(t_current) {
+    t_current = &pool;
+}
+
+ThreadPool::Scope::~Scope() { t_current = prev_; }
 
 ThreadPool::ThreadPool(std::size_t n_workers)
     : n_workers_(n_workers) {
@@ -108,11 +122,18 @@ void ThreadPool::drain(std::uint64_t gen) {
 }
 
 void ThreadPool::worker(std::size_t index) {
+    // A loop nested in one of this pool's tasks stays on this pool
+    // (i#45): an executor's workers must not reach the global one.
+    t_current = this;
     // Register this worker's cache counters for /metrics: the matvec
     // fan-out runs here, so this is where weight-read cache traffic
     // lives. No-op unless perf counters are available (Linux, permitted).
     perf::ThreadCounters perf_counters;
-    std::uint64_t seen = word_.load() >> 32;
+    // Nothing seen yet: a worker that starts after a job was published
+    // (thread start can take longer than a short first loop) still
+    // helps with it; a job already finished has no index left, so
+    // drain returns at once (i#45).
+    std::uint64_t seen = 0;
     for (;;) {
         bool got = false;
         if (index < spin_workers_) {
