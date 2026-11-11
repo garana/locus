@@ -64,7 +64,13 @@ void EngineLoop::run() {
         // Gating on has_runnable_work (not just idle) keeps the
         // worker from busy-spinning while HOLDING mu_ on a backlog it
         // cannot admit -- the failure that wedged the whole server.
-        if (!engine_.has_runnable_work()) {
+        if (!engine_.has_runnable_work() && engine_.loading()) {
+            // A disk-tier read is in flight and its end does not
+            // notify work_cv_: look again shortly instead of parking.
+            work_cv_.wait_for(lk, std::chrono::milliseconds(10), [this] {
+                return stop_ || engine_.has_runnable_work();
+            });
+        } else if (!engine_.has_runnable_work()) {
             work_cv_.wait(lk, [this] {
                 return stop_ || engine_.has_runnable_work();
             });

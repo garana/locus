@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <random>
+#include <stdexcept>
+#include <thread>
 
 #include "locus/model/speculative.hpp"
 
@@ -20,9 +23,37 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
     if (cfg_.prefill_budget == 0) {
         cfg_.prefill_budget = m.prefill_chunk();
     }
+    if (cfg_.disk_prefix) {
+        const auto& hp = m.hparams();
+        if (hp.idx_heads > 0 || !hp.ds41.ratio.empty()) {
+            throw std::invalid_argument(
+                "disk prefix cache: this model keeps per-sequence state "
+                "outside the KV pool");
+        }
+        const DiskKey& k = cfg_.disk_prefix->key();
+        const kv::PagedKvCache::Geometry& g = cache_.geometry();
+        if (k.kv_type != g.kv_type || k.block_tokens != g.block_tokens ||
+            k.kv_dim != g.kv_dim || k.n_layers != g.n_layers ||
+            k.layer_base != g.layer_base ||
+            cfg_.disk_prefix->block_bytes() != cache_.block_bytes()) {
+            throw std::invalid_argument(
+                "disk prefix cache: the store's key does not match the "
+                "KV cache geometry");
+        }
+        cfg_.prefix_cache = true;
+    }
     if (cfg_.prefix_cache) {
         prefix_cache_ = std::make_unique<PrefixCache>(
             cache_, cfg_.prefix_cache_slots);
+    }
+    if (cfg_.disk_prefix) {
+        disk_worker_ = std::make_unique<DiskPrefixWorker>(
+            cfg_.disk_prefix, cfg_.disk_write_backlog);
+        prefix_cache_->on_evict =
+            [this](std::span<const tok::TokenId> key,
+                   const std::vector<kv::BlockId>& blocks) {
+                write_back(key, blocks);
+            };
     }
 }
 
@@ -76,8 +107,12 @@ bool Engine::has_runnable_work() const {
     if (!running_.empty()) {
         return true;  // running work always advances a step
     }
-    if (waiting_.empty()) {
-        return false;
+    if (disk_worker_ && disk_worker_->has_done()) {
+        return true;  // a finished read moves its request to running
+    }
+    if (waiting_.empty() ||
+        running_.size() + loading_.size() >= cfg_.max_running) {
+        return false;  // nothing to admit, or admission is capped
     }
     // step() admits FCFS: it only looks at the queue front and breaks
     // if it does not fit, so runnability hinges on the front alone.
@@ -90,12 +125,24 @@ bool Engine::has_runnable_work() const {
         static_cast<std::uint32_t>(r.prompt.size()) +
         static_cast<std::uint32_t>(r.generated.size()) +
         cfg_.decode_headroom);
-    return want <= cache_.total_blocks();
+    // Blocks of loading requests come back only when their reads end.
+    std::uint32_t loading_blocks = 0;
+    for (const std::uint64_t id : loading_) {
+        loading_blocks += static_cast<std::uint32_t>(
+            requests_.at(id)->seq.blocks.size());
+    }
+    for (const auto& [id, seq] : orphans_) {
+        loading_blocks += static_cast<std::uint32_t>(seq.blocks.size());
+    }
+    return want + loading_blocks <= cache_.total_blocks();
 }
 
 bool Engine::step() {
     const auto t0 = std::chrono::steady_clock::now();
     step_tokens_ = 0;
+    if (disk_worker_) {
+        absorb_disk_loads();
+    }
     const bool more = step_once();
     const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - t0);
@@ -127,6 +174,21 @@ void Engine::count_block_states() {
             }
         }
     }
+    // Blocks a disk read is filling count as prefilling: they hold the
+    // prompt's KV, not the prefix cache's.
+    const auto filling = [&](const kv::PagedKvCache::Seq& seq) {
+        for (const kv::BlockId b : seq.blocks) {
+            if (b < block_state_.size()) {
+                block_state_[b] = 2;
+            }
+        }
+    };
+    for (const std::uint64_t id : loading_) {
+        filling(requests_.at(id)->seq);
+    }
+    for (const auto& [id, seq] : orphans_) {
+        filling(seq);
+    }
     std::uint32_t prefilling = 0, decoding = 0;
     for (const std::uint8_t s : block_state_) {
         prefilling += s == 2;
@@ -155,7 +217,7 @@ bool Engine::step_once() {
     }
     // Admission: FCFS while the pool can cover prompt + headroom.
     while (!waiting_.empty() &&
-           running_.size() < cfg_.max_running) {
+           running_.size() + loading_.size() < cfg_.max_running) {
         if (!try_admit_front()) {
             break;  // FCFS: do not admit later arrivals first
         }
@@ -174,7 +236,7 @@ bool Engine::step_once() {
             ++i;
         }
     }
-    return !waiting_.empty() || !running_.empty();
+    return !idle();
 }
 
 void Engine::advance(Request& r, std::uint32_t& budget) {
@@ -316,6 +378,9 @@ bool Engine::try_admit_front() {
         if (want > cache_.free_blocks()) {
             return false;
         }
+    }
+    if (disk_worker_ && try_disk_load(r)) {
+        return true;
     }
     r.status = Status::kRunning;
     if (r.t_admit == std::chrono::steady_clock::time_point{}) {
@@ -475,8 +540,15 @@ void Engine::cancel(std::uint64_t id) {
     // the loop holds mu_ across step() and only yields it between
     // steps, so cancel() never races a step in flight.
     auto rit = std::find(running_.begin(), running_.end(), id);
+    auto lit = std::find(loading_.begin(), loading_.end(), id);
     if (rit != running_.end()) {
         running_.erase(rit);
+    } else if (lit != loading_.end()) {
+        // The read still writes these blocks: hold them aside until it
+        // ends (absorb_disk_loads releases them), so the pool is
+        // unchanged once it does and no other request gets them early.
+        loading_.erase(lit);
+        orphans_.emplace(id, std::exchange(r.seq, {}));
     } else {
         auto wit = std::find(waiting_.begin(), waiting_.end(), id);
         if (wit != waiting_.end()) {
@@ -511,6 +583,110 @@ void Engine::try_adopt(Request& r) {
     r.n_fed = static_cast<std::uint32_t>(blocks.size()) * bt;
     r.reused_prefix_tokens = r.n_fed;  // served from cache (cache_read)
     prefix_reused_tokens_ += r.n_fed;
+}
+
+bool Engine::try_disk_load(Request& r) {
+    if (!r.generated.empty() || r.n_fed != r.reused_prefix_tokens) {
+        return false;  // readmitted victims recompute in full
+    }
+    const std::uint32_t n_prompt =
+        static_cast<std::uint32_t>(r.prompt.size());
+    const std::uint32_t bt = cache_.geometry().block_tokens;
+    const std::uint32_t on_disk = cfg_.disk_prefix->find(r.prompt);
+    // One prompt token is always fed again, so the disk gives at most
+    // n_prompt - 1 positions. Load only for at least one more block
+    // than RAM gave: a block-aligned prompt cached in RAM (which keeps
+    // its last block for the tail) stays a RAM hit.
+    if (n_prompt < 2 ||
+        std::min(on_disk * bt, n_prompt - 1) < r.n_fed + bt) {
+        return false;
+    }
+    // Drop the shorter RAM prefix: the read fills private blocks from
+    // position 0, so no shared block is ever written.
+    cache_.release(r.seq);
+    prefix_reused_tokens_ -= r.reused_prefix_tokens;
+    r.reused_prefix_tokens = 0;
+    r.n_fed = 0;
+    if (!cache_.ensure_capacity(r.seq, on_disk * bt)) {
+        prefix_cache_->evict_until_free(
+            cache_.blocks_needed(r.seq, on_disk * bt));
+        if (!cache_.ensure_capacity(r.seq, on_disk * bt)) {
+            try_adopt(r);  // what RAM still holds, if anything
+            return false;
+        }
+    }
+    std::vector<std::uint8_t*> dst;
+    for (const kv::BlockId b : r.seq.blocks) {
+        dst.push_back(cache_.block_data(b));
+    }
+    disk_worker_->read(
+        r.id,
+        std::vector<tok::TokenId>(r.prompt.begin(),
+                                  r.prompt.begin() + on_disk * bt),
+        on_disk, std::move(dst));
+    r.status = Status::kLoading;
+    if (r.t_admit == std::chrono::steady_clock::time_point{}) {
+        r.t_admit = std::chrono::steady_clock::now();
+    }
+    loading_.push_back(r.id);
+    waiting_.pop_front();
+    return true;
+}
+
+void Engine::absorb_disk_loads() {
+    const std::uint32_t bt = cache_.geometry().block_tokens;
+    for (const DiskPrefixWorker::Done& d : disk_worker_->take_done()) {
+        if (auto o = orphans_.find(d.id); o != orphans_.end()) {
+            cache_.release(o->second);  // cancelled while loading
+            orphans_.erase(o);
+            continue;
+        }
+        const auto it = std::find(loading_.begin(), loading_.end(), d.id);
+        if (it == loading_.end()) {
+            continue;
+        }
+        loading_.erase(it);
+        Request& r = *requests_.at(d.id);
+        if (d.ok) {
+            for (const kv::BlockId b : r.seq.blocks) {
+                cache_.sync_block(b);
+            }
+            // Keep one prompt token to feed, so the sampler gets the
+            // last position's logits; its KV row is written again with
+            // the same bytes, in a private block.
+            const std::uint32_t n = std::min(
+                static_cast<std::uint32_t>(r.seq.blocks.size()) * bt,
+                static_cast<std::uint32_t>(r.prompt.size()) - 1);
+            r.seq.n_tokens = n;
+            r.n_fed = n;
+            r.reused_prefix_tokens = n;
+            prefix_reused_tokens_ += n;
+            ++disk_hits_;
+            disk_loaded_tokens_ += n;
+        }
+        // A failed read leaves n_fed at 0: prefill computes the prompt
+        // over the blocks the read did not fill.
+        r.status = Status::kRunning;
+        running_.push_back(d.id);
+    }
+}
+
+void Engine::write_back(std::span<const tok::TokenId> key,
+                        const std::vector<kv::BlockId>& blocks) {
+    const auto n = static_cast<std::uint32_t>(blocks.size());
+    const std::size_t bb = cache_.block_bytes();
+    if (n == 0 || !disk_worker_->would_accept(std::size_t{n} * bb) ||
+        cfg_.disk_prefix->find(key) >= n) {
+        return;  // nothing to write, no room queued, or already on disk
+    }
+    // Copied now: the blocks are freed and reused right after this.
+    std::vector<std::uint8_t> bytes(std::size_t{n} * bb);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        std::memcpy(bytes.data() + i * bb, cache_.block_data(blocks[i]),
+                    bb);
+    }
+    disk_worker_->write(std::vector<tok::TokenId>(key.begin(), key.end()),
+                        n, std::move(bytes));
 }
 
 bool Engine::spec_decode_step(Request& r) {
@@ -648,7 +824,10 @@ void Engine::run_to_completion() {
     // for the pool: step() would otherwise report "more work" forever
     // and spin. Such a request is left waiting (callers should reject
     // it up front via admit_error).
-    while (!idle() && has_runnable_work()) {
+    while (!idle() && (has_runnable_work() || loading())) {
+        if (!has_runnable_work()) {
+            std::this_thread::yield();  // only a disk read in flight
+        }
         step();
     }
 }
@@ -753,7 +932,7 @@ bool Engine::prefill_only(Request& r, std::uint32_t& budget) {
 bool Engine::step_batched() {
     // Admission: same FCFS policy as step().
     while (!waiting_.empty() &&
-           running_.size() < cfg_.max_running) {
+           running_.size() + loading_.size() < cfg_.max_running) {
         if (!try_admit_front()) {
             break;
         }
@@ -867,7 +1046,7 @@ bool Engine::step_batched() {
         }
     }
 
-    return !waiting_.empty() || !running_.empty();
+    return !idle();
 }
 
 }  // namespace locus::engine

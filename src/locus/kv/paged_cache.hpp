@@ -242,6 +242,27 @@ class PagedKvCache {
     void sync_rows(const Seq& seq, std::uint32_t layer,
                    std::uint32_t pos, std::uint32_t n);
 
+    /** @returns Bytes of one block (all layers, K and V) in either
+     *  pool: a block is one contiguous range, so it can be read from
+     *  or written to a file as is. */
+    std::size_t block_bytes() const {
+        return quantized() ? q_block_stride_ : block_stride_ * sizeof(float);
+    }
+
+    /** @returns The first byte of block `id` in the pool. */
+    std::uint8_t* block_data(BlockId id) {
+        return quantized() ? qpool_ptr_ + id * q_block_stride_
+                           : reinterpret_cast<std::uint8_t*>(
+                                 pool_ptr_ + id * block_stride_);
+    }
+
+    /**
+     * Pushes a whole block from the host pool to the mirror, after
+     * the host bytes were replaced in bulk (a disk read). No-op without
+     * a mirror; a device error drops it, as in sync_rows.
+     */
+    void sync_block(BlockId id);
+
     const Geometry& geometry() const { return geom_; }
     std::uint32_t free_blocks() const { return alloc_.free_blocks(); }
     std::uint32_t total_blocks() const {

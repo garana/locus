@@ -10,6 +10,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "locus/engine/disk_prefix_store.hpp"
+#include "locus/engine/disk_prefix_worker.hpp"
 #include "locus/engine/metrics.hpp"
 #include "locus/engine/prefix_cache.hpp"
 #include "locus/kv/paged_cache.hpp"
@@ -23,6 +25,9 @@ namespace locus::engine {
 /** Lifecycle of a generation request. */
 enum class Status {
     kWaiting,
+    /** Admitted; its cached prefix is being read from the disk tier
+     * (i#416) into its blocks. Joins prefill when the read ends. */
+    kLoading,
     kRunning,
     kDone,
     kFailed,
@@ -144,6 +149,17 @@ class Engine {
         bool prefix_cache = false;
         /** Max cached prompt prefixes (LRU) when prefix_cache is on. */
         std::uint32_t prefix_cache_slots = 32;
+        /** Disk tier of the prefix cache (i#416; null = off). Implies
+         * prefix_cache. Prefixes evicted from RAM are written back to
+         * it, and a prompt whose prefix is longer on disk than in RAM
+         * loads it (kLoading) while the other requests step. Its key
+         * must match this engine's cache geometry and KV type.
+         * Models with per-sequence state outside the KV pool (a DSA
+         * indexer, deepseek41) are refused. */
+        std::shared_ptr<DiskPrefixStore> disk_prefix;
+        /** Cap on the bytes of queued write-backs; past it a
+         * write-back is dropped. */
+        std::uint64_t disk_write_backlog = 64ull << 20;
         /** Prompt-lookup speculative decoding: draft n-gram tokens
          * from the context and verify them in one batched forward
          * (greedy only). Byte-exact; off by default; uses the
@@ -228,9 +244,30 @@ class Engine {
      */
     void cancel(std::uint64_t id);
 
-    /** @returns true when nothing is waiting or running. */
+    /** @returns true when nothing is waiting, loading or running. */
     bool idle() const {
-        return waiting_.empty() && running_.empty();
+        return waiting_.empty() && running_.empty() && loading_.empty();
+    }
+
+    /** @returns true while a disk-tier read is in flight (for a
+     *  loading request, or one cancelled while loading whose blocks
+     *  wait for the read to end); the driver then polls instead of
+     *  parking, since a finished read does not wake it. */
+    bool loading() const { return !loading_.empty() || !orphans_.empty(); }
+
+    /** Waits until the disk tier's queued reads and writes have run
+     *  (tests; no-op without a disk tier). */
+    void disk_prefix_drain() {
+        if (disk_worker_) {
+            disk_worker_->drain();
+        }
+    }
+
+    /** Prompts whose prefix came from the disk tier, cumulative. */
+    std::uint64_t disk_prefix_hits() const { return disk_hits_; }
+    /** Prompt positions read from the disk tier, cumulative. */
+    std::uint64_t disk_prefix_loaded_tokens() const {
+        return disk_loaded_tokens_;
     }
 
     /** Invoked after each newly sampled token (streaming). */
@@ -337,6 +374,17 @@ class Engine {
     /** Counts the KV blocks in use by state into metrics_ (each block
      * once: prefilling, else decoding, else cached). */
     void count_block_states();
+    /** Starts reading r's prefix from the disk tier when it holds more
+     * blocks than the RAM cache gave r. @returns true when r is now
+     * kLoading (moved from the wait queue to loading_). */
+    bool try_disk_load(Request& r);
+    /** Moves finished disk reads' requests to running (or releases a
+     * cancelled one's blocks). */
+    void absorb_disk_loads();
+    /** PrefixCache::on_evict: queues the evicted prefix's blocks for
+     * the disk tier unless it is already there. */
+    void write_back(std::span<const tok::TokenId> key,
+                    const std::vector<kv::BlockId>& blocks);
 
     const model::TransformerModel& model_;
     tok::TokenId eos_;
@@ -374,6 +422,17 @@ class Engine {
     /** One state per pool block, reused by count_block_states. */
     std::vector<std::uint8_t> block_state_;
     EngineMetrics metrics_;
+
+    /** Requests in kLoading, in admission order. */
+    std::vector<std::uint64_t> loading_;
+    /** Blocks of requests cancelled while loading: the read still
+     * writes them, so they are released when it ends. */
+    std::unordered_map<std::uint64_t, kv::PagedKvCache::Seq> orphans_;
+    std::uint64_t disk_hits_ = 0;
+    std::uint64_t disk_loaded_tokens_ = 0;
+    // After cache_: destroyed first, so a read in flight finishes
+    // before the pool it writes goes away.
+    std::unique_ptr<DiskPrefixWorker> disk_worker_;
 };
 
 }  // namespace locus::engine

@@ -279,26 +279,38 @@ std::uint32_t DiskPrefixStore::find(
     return 0;
 }
 
-void DiskPrefixStore::drop(std::uint64_t digest, std::uint64_t gen) {
+fs::path DiskPrefixStore::forget(std::uint64_t digest, std::uint64_t gen) {
     const auto it = files_.find(digest);
     if (it == files_.end() || (gen != 0 && it->second.gen != gen)) {
-        return;  // already gone, or replaced by a newer write
-    }
-    std::error_code ec;
-    fs::remove(path_of(digest), ec);
-    if (ec) {
-        return;  // still on disk: keep counting it
+        return {};  // already gone, or replaced by a newer write
     }
     used_ -= it->second.bytes;
     files_.erase(it);
+    return path_of(digest);
 }
 
 void DiskPrefixStore::touch(std::uint64_t digest) {
     files_[digest].tick = ++clock_;
-    std::error_code ec;  // best effort: it only orders a later restart
-    fs::last_write_time(path_of(digest), fs::file_time_type::clock::now(),
-                        ec);
 }
+
+namespace {
+
+/** Unlinks `p` (when not empty), best effort: a file that stays is
+ *  only uncounted until the next open indexes it again. */
+void unlink_quietly(const fs::path& p) {
+    std::error_code ec;
+    if (!p.empty()) {
+        fs::remove(p, ec);
+    }
+}
+
+/** Sets `p`'s mtime to now, best effort: it only orders a restart. */
+void stamp(const fs::path& p) {
+    std::error_code ec;
+    fs::last_write_time(p, fs::file_time_type::clock::now(), ec);
+}
+
+}  // namespace
 
 bool DiskPrefixStore::read(std::span<const tok::TokenId> prompt,
                            std::uint32_t n_blocks,
@@ -324,14 +336,18 @@ bool DiskPrefixStore::read(std::span<const tok::TokenId> prompt,
         f.fd = ::open(path_of(digest).c_str(), O_RDONLY | O_CLOEXEC);
         if (f.fd < 0) {
             if (errno == ENOENT) {
-                drop(digest, gen);  // removed behind the store's back
+                forget(digest, gen);  // removed behind the store's back
             }
             return false;  // other errors may pass: keep the file
         }
     }
     const auto mismatch = [&] {
-        std::lock_guard lock(mu_);
-        drop(digest, gen);
+        fs::path p;
+        {
+            std::lock_guard lock(mu_);
+            p = forget(digest, gen);
+        }
+        unlink_quietly(p);
         return false;
     };
     struct stat st {};
@@ -368,11 +384,15 @@ bool DiskPrefixStore::read(std::span<const tok::TokenId> prompt,
         }
         off += static_cast<off_t>(block_bytes_);
     }
-    std::lock_guard lock(mu_);
-    const auto it = files_.find(digest);
-    if (it != files_.end() && it->second.gen == gen) {
+    {
+        std::lock_guard lock(mu_);
+        const auto it = files_.find(digest);
+        if (it == files_.end() || it->second.gen != gen) {
+            return true;  // replaced meanwhile: the bytes read were good
+        }
         touch(digest);
     }
+    stamp(path_of(digest));
     return true;
 }
 
@@ -400,9 +420,14 @@ bool DiskPrefixStore::write(std::span<const tok::TokenId> prompt,
         std::lock_guard lock(mu_);
         if (stored(digest)) {
             touch(digest);
-            return true;
+            seq = 0;
+        } else {
+            seq = ++tmp_seq_;
         }
-        seq = ++tmp_seq_;
+    }
+    if (seq == 0) {
+        stamp(path);
+        return true;
     }
 
     // Write a private temporary file without the lock, then take it to
@@ -429,38 +454,47 @@ bool DiskPrefixStore::write(std::span<const tok::TokenId> prompt,
         fs::remove(tmp, ec);
         return false;
     }
-    std::lock_guard lock(mu_);
-    if (stored(digest)) {  // another call stored it meanwhile
-        fs::remove(tmp, ec);
-        touch(digest);
-        return true;
-    }
-    // Evicting before the rename: if the rename fails the evicted
-    // files are gone anyway, which costs only cache hits.
-    while (used_ + bytes > cap_bytes_ && !files_.empty()) {
-        const auto lru = std::min_element(
-            files_.begin(), files_.end(), [](const auto& a, const auto& b) {
-                return a.second.tick < b.second.tick;
-            });
-        const std::size_t before = files_.size();
-        drop(lru->first, 0);
-        if (files_.size() == before) {
-            break;  // cannot unlink: give up rather than spin
+    // Victims leave the index under the lock and are unlinked after
+    // it: unlinking a large file can take a while, and find() on the
+    // engine thread takes this lock. The rename stays under it so the
+    // index never names a file that is not in place yet.
+    std::vector<fs::path> victims;
+    bool stored_now = false;
+    {
+        std::lock_guard lock(mu_);
+        if (stored(digest)) {  // another call stored it meanwhile
+            touch(digest);
+            stored_now = true;
+        } else {
+            // Evicting before the rename: if the rename fails the
+            // evicted files are gone anyway, which costs only hits.
+            while (used_ + bytes > cap_bytes_ && !files_.empty()) {
+                const auto lru = std::min_element(
+                    files_.begin(), files_.end(),
+                    [](const auto& a, const auto& b) {
+                        return a.second.tick < b.second.tick;
+                    });
+                victims.push_back(forget(lru->first, 0));
+            }
+            fs::rename(tmp, path, ec);
+            ok = !ec;
+            if (ok) {
+                ++clock_;
+                files_[digest] = File{bytes, clock_, clock_};
+                used_ += bytes;
+            }
         }
     }
-    if (used_ + bytes > cap_bytes_) {
-        fs::remove(tmp, ec);
-        return false;
+    for (const fs::path& v : victims) {
+        unlink_quietly(v);
     }
-    fs::rename(tmp, path, ec);
-    if (ec) {
-        fs::remove(tmp, ec);
-        return false;
+    if (stored_now || !ok) {
+        unlink_quietly(tmp);
+        if (stored_now) {
+            stamp(path);
+        }
     }
-    ++clock_;
-    files_[digest] = File{bytes, clock_, clock_};
-    used_ += bytes;
-    return true;
+    return stored_now || ok;
 }
 
 bool DiskPrefixStore::stored(std::uint64_t digest) {
