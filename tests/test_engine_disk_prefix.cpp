@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/engine/disk_prefix_store.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
@@ -104,10 +106,14 @@ struct Fixture {
     std::vector<TokenId> r;  // never cached: always computed
     std::vector<TokenId> want;
 
-    Fixture()
+    /** @param backend The backend to run on (nullptr: the default). */
+    explicit Fixture(const char* backend = nullptr)
         : g(locus::gguf::GgufFile::open(model_path())),
           model(locus::model::TransformerModel::load(g)),
           tok(locus::tok::SpmTokenizer::from_gguf(g)) {
+        if (backend != nullptr) {
+            model.use_backend(*locus::backend::find_backend(backend));
+        }
         p = tok.encode(
             "Once upon a time, there was a little girl named Lily who "
             "loved to explore the forest near her home every day. One "
@@ -175,6 +181,42 @@ TEST_CASE("engine reads an evicted prefix back from the disk tier",
     e.run_to_completion();
     REQUIRE(e.get(id)->generated == f.want);
     REQUIRE(e.disk_prefix_hits() == 1);
+}
+
+// i#561: the same on Vulkan, where the KV pool is the GPU-mapped
+// buffer itself: the write-back copies the GPU's K/V from it and a
+// read writes the GPU's next input into it. The tokens after a disk
+// load, also after a restart, equal a cold Vulkan run's.
+TEST_CASE("engine reads an evicted prefix back from the disk tier on "
+          "Vulkan",
+          "[engine][disk_prefix][vulkan]") {
+    if (!fs::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device");
+    }
+    Fixture f("vulkan");
+    REQUIRE(f.model.active_backend().name == "vulkan");
+    TempDir t("locus-edp-vk");
+    std::size_t bb;
+    const DiskKey key = key_for(f.model, bb);
+    {
+        auto store = std::make_shared<DiskPrefixStore>(t.dir, key, bb,
+                                                       64 << 20);
+        Engine e(f.model, f.tok.eos_id(), f.config(store));
+        f.fill(e, *store);
+        const auto id = e.submit(f.p, 20);
+        e.run_to_completion();
+        REQUIRE(e.disk_prefix_hits() == 1);
+        REQUIRE(e.get(id)->generated == f.want);
+    }
+    auto store = std::make_shared<DiskPrefixStore>(t.dir, key, bb, 64 << 20);
+    Engine e(f.model, f.tok.eos_id(), f.config(store));
+    const auto id = e.submit(f.p, 20);
+    e.run_to_completion();
+    REQUIRE(e.disk_prefix_hits() == 1);
+    REQUIRE(e.get(id)->generated == f.want);
 }
 
 TEST_CASE("engine falls back to prefill on a bad disk-tier file",
