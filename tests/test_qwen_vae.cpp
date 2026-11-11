@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -106,4 +107,39 @@ TEST_CASE("qwen vae rejects bad sizes", "[qwen-vae][image]") {
     REQUIRE_THROWS_AS(v.encode(img, 30, 32), std::invalid_argument);
     std::vector<float> z(3);
     REQUIRE_THROWS_AS(v.decode(z, 1, 1), std::invalid_argument);
+}
+
+// i#531 VALUES, with the real VAE: Qwen/Qwen-Image-Edit at ac7f931's
+// vae/, converted by scripts/convert-qwen-image.py --vae-out to
+// tests/models/qwen-image-vae.gguf, against diffusers' own encode and
+// decode of the same weights in float32
+// (scripts/make-qwen-image-vae-golden.py): the converter's layout and
+// values, and QwenVae at the real widths.
+TEST_CASE("qwen vae matches diffusers on the real Qwen-Image VAE",
+          "[qwen-vae][image][e2e]") {
+    const std::string path =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/models/qwen-image-vae.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("qwen-image-vae.gguf absent; make it with "
+             "scripts/convert-qwen-image.py --vae-out");
+    }
+    constexpr std::uint32_t z = 16, lat = 4;
+    const auto g = locus::gguf::GgufFile::open(path);
+    const auto v = QwenVae::load(g);
+    REQUIRE(v.z_dim() == z);
+    REQUIRE(v.scale() == kSize / lat);
+    REQUIRE(v.has_encoder());
+    const auto ref = read_f32(kGolden + "qwen_image_vae.f32");
+    const std::size_t nz = std::size_t{z} * lat * lat;
+    REQUIRE(ref.size() == nz + std::size_t{3} * kSize * kSize);
+
+    auto img = lcg(777, std::size_t{3} * kSize * kSize);
+    for (float& x : img) x *= 4.0f;
+    const auto mean = v.encode(img, kSize, kSize);
+    check_close(mean, std::span<const float>(ref).first(nz), 1e-5);
+
+    auto zv = lcg(999, nz);
+    for (float& x : zv) x *= 4.0f;
+    const auto out = v.decode(zv, lat, lat);
+    check_close(out, std::span<const float>(ref).subspan(nz), 1e-5);
 }
