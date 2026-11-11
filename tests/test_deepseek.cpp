@@ -1,5 +1,7 @@
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -94,5 +96,62 @@ TEST_CASE("deepseek-v2-lite matches llama.cpp token-exact",
         cache.release(seq);
         REQUIRE(tok->decode(ids) == want);
         REQUIRE(cache.free_blocks() == cache.total_blocks());
+    }
+}
+
+// i#63: a quantized KV cache on the real MLA model (CPU). It used to
+// crash (the latents read the byte pool as floats); now each position's
+// logits track the F32 cache's. Measured on an M2 Pro, worst position
+// of "The capital of France is Paris": cosine 0.9989 (F16), 0.9987
+// (Q8), 0.9951 (Q4). The greedy next token after " Paris" is a near tie
+// in F32 (24.468 for "," against 24.432 for "."), which the quantized
+// caches flip, so this compares logits, not text.
+TEST_CASE("deepseek-v2-lite runs with a quantized KV cache",
+          "[deepseek][e2e][kv]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present (deepseek-v2-lite-q4_k_m.gguf, ~10GB)");
+    }
+    if (std::getenv("LOCUS_HEAVY_TESTS") == nullptr) {
+        SKIP("deepseek e2e is heavy (~10GB); set LOCUS_HEAVY_TESTS=1");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("scalar"));
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+    const auto ids = tok->encode("The capital of France is Paris", true);
+    const auto run = [&](locus::kv::KvType kt) {
+        auto cache = model.make_cache(0, kt);
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        std::vector<std::vector<float>> out;
+        for (auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
+            out.push_back(logits);
+        }
+        cache.release(seq);
+        return out;
+    };
+    const auto cosine = [](const std::vector<float>& a,
+                           const std::vector<float>& b) {
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            dot += static_cast<double>(a[i]) * b[i];
+            na += static_cast<double>(a[i]) * a[i];
+            nb += static_cast<double>(b[i]) * b[i];
+        }
+        return dot / std::sqrt(na * nb);
+    };
+    using locus::kv::KvType;
+    const auto f32 = run(KvType::kF32);
+    for (const auto& [kt, bound] :
+         {std::pair{KvType::kF16, 0.998}, std::pair{KvType::kQ8, 0.998},
+          std::pair{KvType::kQ4, 0.99}}) {
+        const auto q = run(kt);
+        for (std::size_t i = 0; i < f32.size(); ++i) {
+            INFO("kv type " << static_cast<int>(kt) << " position " << i);
+            CHECK(cosine(f32[i], q[i]) > bound);
+        }
     }
 }

@@ -39,9 +39,13 @@ constexpr std::uint32_t kTopK = 4;
 /**
  * @param q8_wq_b Store attn_q_b as Q8_0 (q_lora_rank 32 so its rows
  *     are whole blocks): a quantized weight on MLA's matvec_mt path.
+ * @param rank kv_lora_rank: 4, or one that makes the cache row (rank +
+ *     2 rope dims, + 4 indexer dims for glm-dsa) a multiple of 32, as
+ *     a quantized KV cache needs.
  */
 std::vector<std::byte> build_image(const std::string& arch,
-                                   bool q8_wq_b = false) {
+                                   bool q8_wq_b = false,
+                                   std::uint32_t rank = 4) {
     struct T {
         std::string name;
         std::vector<std::uint64_t> dims;
@@ -93,11 +97,11 @@ std::vector<std::byte> build_image(const std::string& arch,
     } else {
         add("blk.0.attn_q_b.weight", {4, 8}, 3);
     }
-    add("blk.0.attn_kv_a_mqa.weight", {kE, 6}, 4);
+    add("blk.0.attn_kv_a_mqa.weight", {kE, rank + 2}, 4);
     ts.push_back({"blk.0.attn_kv_a_norm.weight",
-                  {4},
-                  std::vector<float>(4, 1.0f)});
-    add("blk.0.attn_kv_b.weight", {4, 8}, 5);
+                  {rank},
+                  std::vector<float>(rank, 1.0f)});
+    add("blk.0.attn_kv_b.weight", {rank, 8}, 5);
     add("blk.0.attn_output.weight", {4, kE}, 6);
     add("blk.0.ffn_gate.weight", {kE, kFf}, 7);
     add("blk.0.ffn_up.weight", {kE, kFf}, 8);
@@ -124,7 +128,7 @@ std::vector<std::byte> build_image(const std::string& arch,
         .kv_u32(p + "context_length", 32)
         .kv_f32(p + "attention.layer_norm_rms_epsilon", 1e-5f)
         .kv_u32(p + "attention.q_lora_rank", q_rank)
-        .kv_u32(p + "attention.kv_lora_rank", 4)
+        .kv_u32(p + "attention.kv_lora_rank", rank)
         .kv_u32(p + "rope.dimension_count", 2)
         .kv_u32(p + "attention.key_length", 4)
         .kv_u32(p + "attention.value_length", 2);
@@ -162,10 +166,11 @@ std::vector<std::byte> build_image(const std::string& arch,
 /** Per-position logits for `tokens` fed through the model. */
 std::vector<std::vector<float>> run(
     const std::vector<std::byte>& image,
-    const std::vector<locus::tok::TokenId>& tokens) {
+    const std::vector<locus::tok::TokenId>& tokens,
+    locus::kv::KvType kv_type = locus::kv::KvType::kF32) {
     auto g = locus::gguf::GgufFile::parse(image);
     auto model = TransformerModel::load(g);
-    auto cache = model.make_cache();
+    auto cache = model.make_cache(0, kv_type);
     auto ws = model.make_workspace();
     locus::kv::PagedKvCache::Seq seq;
     std::vector<std::vector<float>> out;
@@ -326,4 +331,57 @@ TEST_CASE("deepseek2's MLA honors use_q8k_activations", "[dsa]") {
     const auto off = last(*scalar, false);
     REQUIRE(off == last(no_q8k, true));  // flag off == no Q8 path at all
     REQUIRE(off != last(*scalar, true));  // and the flag does route wq_b
+}
+
+namespace {
+
+/** Cosine similarity of two equal-length vectors. */
+double cosine(const std::vector<float>& a, const std::vector<float>& b) {
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        dot += static_cast<double>(a[i]) * b[i];
+        na += static_cast<double>(a[i]) * a[i];
+        nb += static_cast<double>(b[i]) * b[i];
+    }
+    return dot / (std::sqrt(na) * std::sqrt(nb) + 1e-12);
+}
+
+}  // namespace
+
+// i#63: the MLA attention (deepseek2) and the DSA one (glm-dsa, its
+// indexer key in the same cache row) read a quantized KV cache through
+// its codec, as the dense path does: F16, Q8 and Q4 track the F32
+// forward, past the indexer's top_k so its selection runs on decoded
+// keys. Before, the MLA path read the byte pool as floats and crashed.
+TEST_CASE("mla and dsa attention read a quantized KV cache", "[dsa][kv]") {
+    using locus::kv::KvType;
+    // Cache rows of 32: rank + 2 rope (+ 4 indexer dims for glm-dsa).
+    for (const auto& [arch, rank] :
+         {std::pair<std::string, std::uint32_t>{"deepseek2", 30},
+          std::pair<std::string, std::uint32_t>{"glm-dsa", 26}}) {
+        INFO(arch);
+        const auto img = build_image(arch, false, rank);
+        const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 9, 2, 11,
+                                                       5, 0};
+        const auto f32 = run(img, toks, KvType::kF32);
+        const auto f16 = run(img, toks, KvType::kF16);
+        const auto q8 = run(img, toks, KvType::kQ8);
+        const auto q4 = run(img, toks, KvType::kQ4);
+        for (std::size_t i = 0; i < toks.size(); ++i) {
+            INFO("position " << i);
+            CHECK(cosine(f32[i], f16[i]) > 0.99999);
+            CHECK(cosine(f32[i], q8[i]) > 0.9999);
+            CHECK(cosine(f32[i], q4[i]) > 0.99);
+            CHECK(cosine(f32[i], f16[i]) >= cosine(f32[i], q8[i]) - 1e-9);
+        }
+        // The quantized cache is read, not bypassed: Q4's rounding
+        // shows in the logits.
+        bool moved = false;
+        for (std::size_t i = 0; i < toks.size(); ++i) {
+            for (std::size_t j = 0; j < f32[i].size(); ++j) {
+                moved = moved || f32[i][j] != q4[i][j];
+            }
+        }
+        CHECK(moved);
+    }
 }

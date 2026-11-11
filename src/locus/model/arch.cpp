@@ -255,13 +255,73 @@ void deepseek2_attention_tensors(const gguf::GgufFile& g,
  * positions, which is the dense case and bit-identical to the
  * pre-DSA implementation.
  */
-void mla_attention(const TransformerModel& m,
-                   const TransformerModel::Layer& lay,
-                   kv::PagedKvCache& cache,
-                   kv::PagedKvCache::Seq& seq,
-                   TransformerModel::Workspace& ws, std::uint32_t l,
-                   std::uint32_t pos, const std::uint32_t* sel,
-                   std::uint32_t n_att) {
+/**
+ * One layer's cache rows as the MLA attention reads them (i#63): the
+ * F32 rows in place, or, on a quantized cache, the current row built in
+ * `cur`, stored through the KV codec and every row decoded into `mat`,
+ * as the dense quantized path (llama_attention) reads them.
+ */
+struct MlaRows {
+    std::vector<float> cur;
+    std::vector<float> mat;
+    std::vector<const float*> ptr;  ///< row t for t in [0, pos]
+};
+
+/** @returns Where this position's cache row is written: the cache row
+ *  itself, or rows.cur on a quantized cache. */
+float* mla_row(kv::PagedKvCache& cache, const kv::PagedKvCache::Seq& seq,
+               std::uint32_t l, std::uint32_t pos, MlaRows& rows) {
+    if (!cache.quantized()) {
+        return cache.k(seq, l, pos);
+    }
+    rows.cur.assign(cache.geometry().kv_dim, 0.0f);
+    return rows.cur.data();
+}
+
+/** Stores a quantized current row and fills rows.ptr for [0, pos]. */
+void mla_commit(kv::PagedKvCache& cache, const kv::PagedKvCache::Seq& seq,
+                std::uint32_t l, std::uint32_t pos, MlaRows& rows) {
+    const std::size_t dim = cache.geometry().kv_dim;
+    rows.ptr.resize(pos + 1);
+    if (!cache.quantized()) {
+        for (std::uint32_t t = 0; t <= pos; ++t) {
+            rows.ptr[t] = cache.k(seq, l, t);
+        }
+        return;
+    }
+    cache.store_row(seq, l, pos, false, rows.cur);
+    rows.mat.resize((std::size_t{pos} + 1) * dim);
+    for (std::uint32_t t = 0; t <= pos; ++t) {
+        float* r = rows.mat.data() + t * dim;
+        cache.load_row(seq, l, t, false, {r, dim});
+        rows.ptr[t] = r;
+    }
+}
+
+/** The latent row: rms-normed c_kv followed by the roped shared k_pe. */
+void mla_latent(const TransformerModel& m,
+                const TransformerModel::Layer& lay,
+                TransformerModel::Workspace& ws, std::uint32_t pos,
+                float* row) {
+    using namespace locus::backend;
+    const Hparams& hp = m.hparams();
+    const std::uint32_t rank = hp.kv_lora_rank;
+    const std::uint32_t rope = hp.qk_rope_dim;
+    matvec_mt(m.ops(), lay.wkv_a, ws.xb, ws.kv_a);
+    rmsnorm({ws.kv_a.data(), rank}, lay.kv_a_norm, hp.rms_eps,
+            {row, rank});
+    std::copy(ws.kv_a.begin() + rank, ws.kv_a.end(), row + rank);
+    rope_norm_yarn({row + rank, rope}, 1, rope, pos,
+                   hp.rope_freq_base, hp.yarn);
+}
+
+/** The MLA attention over rows (mla_commit), all of [0, pos] or the
+ *  n_att positions of sel. */
+void mla_attend(const TransformerModel& m,
+                const TransformerModel::Layer& lay,
+                TransformerModel::Workspace& ws, std::uint32_t pos,
+                const MlaRows& rows, const std::uint32_t* sel,
+                std::uint32_t n_att) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
     const Ops op = m.ops();
@@ -279,14 +339,6 @@ void mla_attention(const TransformerModel& m,
     } else {
         matvec_mt(op, lay.wq, ws.xb, ws.q);
     }
-    // Latent row: rms-normed c_kv followed by roped shared k_pe.
-    matvec_mt(op, lay.wkv_a, ws.xb, ws.kv_a);
-    float* row = cache.k(seq, l, pos);
-    rmsnorm({ws.kv_a.data(), rank}, lay.kv_a_norm, hp.rms_eps,
-            {row, rank});
-    std::copy(ws.kv_a.begin() + rank, ws.kv_a.end(), row + rank);
-    rope_norm_yarn({row + rank, rope}, 1, rope, pos,
-                   hp.rope_freq_base, hp.yarn);
 
     for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
         float* qh =
@@ -309,7 +361,7 @@ void mla_attention(const TransformerModel& m,
         std::span<float> att(ws.att.data(), n_att);
         for (std::uint32_t j = 0; j < n_att; ++j) {
             const std::uint32_t t = sel != nullptr ? sel[j] : j;
-            const float* ckv = cache.k(seq, l, t);
+            const float* ckv = rows.ptr[t];
             float s = 0.0f;
             for (std::uint32_t i = 0; i < rank; ++i) {
                 s += ws.q_abs[i] * ckv[i];
@@ -325,7 +377,7 @@ void mla_attention(const TransformerModel& m,
         std::fill(ws.latent.begin(), ws.latent.end(), 0.0f);
         for (std::uint32_t j = 0; j < n_att; ++j) {
             const std::uint32_t t = sel != nullptr ? sel[j] : j;
-            const float* ckv = cache.k(seq, l, t);
+            const float* ckv = rows.ptr[t];
             const float a = att[j];
             for (std::uint32_t i = 0; i < rank; ++i) {
                 ws.latent[i] += a * ckv[i];
@@ -349,8 +401,10 @@ void deepseek2_attention(const TransformerModel& m,
                          kv::PagedKvCache::Seq& seq,
                          TransformerModel::Workspace& ws,
                          std::uint32_t l, std::uint32_t pos) {
-    mla_attention(m, lay, cache, seq, ws, l, pos, nullptr,
-                  pos + 1);
+    MlaRows rows;
+    mla_latent(m, lay, ws, pos, mla_row(cache, seq, l, pos, rows));
+    mla_commit(cache, seq, l, pos, rows);
+    mla_attend(m, lay, ws, pos, rows, nullptr, pos + 1);
 }
 
 std::uint32_t deepseek2_kv_dim(const Hparams& hp) {
@@ -476,18 +530,26 @@ void glm_dsa_attention(const TransformerModel& m,
     const std::uint32_t* sel = nullptr;
     std::uint32_t n_att = n_pos;
 
+    // This position's row holds the MLA latent and, after it, the
+    // indexer key; on a quantized cache it is built whole, then stored
+    // once (i#63), before anything reads the rows.
+    MlaRows rows;
+    float* row = mla_row(cache, seq, l, pos, rows);
+    const std::uint32_t off = hp.kv_lora_rank + hp.qk_rope_dim;
+    const std::uint32_t d = hp.idx_dim;
     if (hp.idx_heads > 0) {
-        const std::uint32_t off =
-            hp.kv_lora_rank + hp.qk_rope_dim;
-        const std::uint32_t d = hp.idx_dim;
-        // Compute and cache this position's indexer key:
-        // layernorm(W_k x), roped half-split on the rope dims.
-        float* krow = cache.k(seq, l, pos) + off;
+        // The indexer key: layernorm(W_k x), roped half-split on the
+        // rope dims.
+        float* krow = row + off;
         matvec_mt(op, lay.idx_k, ws.xb, {krow, d});
         layernorm_inplace({krow, d}, lay.idx_k_norm,
                           lay.idx_k_norm_b, hp.rms_eps);
         rope_half(krow, hp.qk_rope_dim, pos, hp.rope_freq_base);
+    }
+    mla_latent(m, lay, ws, pos, row);
+    mla_commit(cache, seq, l, pos, rows);
 
+    if (hp.idx_heads > 0) {
         if (n_pos > hp.idx_top_k) {
             // Indexer queries share the MLA q latent path.
             matvec_mt(op, lay.wq_a, ws.xb, ws.q_a);
@@ -502,8 +564,7 @@ void glm_dsa_attention(const TransformerModel& m,
             matvec_mt(op, lay.idx_proj, ws.xb, ws.idx_w);
             for (std::uint32_t t = 0; t < n_pos; ++t) {
                 ws.idx_scores[t] = dsa_index_score(
-                    ws.idx_q, ws.idx_w,
-                    {cache.k(seq, l, t) + off, d});
+                    ws.idx_q, ws.idx_w, {rows.ptr[t] + off, d});
             }
             ws.idx_sel.resize(n_pos);
             for (std::uint32_t t = 0; t < n_pos; ++t) {
@@ -522,7 +583,7 @@ void glm_dsa_attention(const TransformerModel& m,
             n_att = hp.idx_top_k;
         }
     }
-    mla_attention(m, lay, cache, seq, ws, l, pos, sel, n_att);
+    mla_attend(m, lay, ws, pos, rows, sel, n_att);
 }
 
 std::uint32_t glm_dsa_kv_dim(const Hparams& hp) {
