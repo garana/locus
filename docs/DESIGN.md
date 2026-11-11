@@ -89,7 +89,8 @@ Correctness first, then CPU throughput, then GPU.
 - Admission: a request is admitted when the allocator can cover its
   prompt blocks plus a decode headroom.
 - Preemption, when the pool runs dry: evict the newest sequence and
-  recompute it later (recompute, not swap to host).
+  recompute it later (recompute, not swap to host); with a disk tier,
+  its full blocks are written there and read back on readmission.
 - Fairness: admission is first come, first served, with a cap on
   prefill tokens per iteration (chunked prefill). Within it the prompt
   with the shortest remainder is fed first, so a short prompt behind a
@@ -630,7 +631,10 @@ guarding the default path.
   evicted from RAM are written back by a worker thread, and the rest
   at shutdown; a prompt whose prefix is at least one block longer on
   disk waits in a LOADING state while the worker reads it into its
-  blocks, and the engine keeps stepping the other requests.
+  blocks, and the engine keeps stepping the other requests. A
+  preempted sequence writes its full blocks (prompt and output so far,
+  keyed by those tokens) to the disk tier too; on readmission it loads
+  them the same way and recomputes only the tail (i#621).
 - Speculative decoding: prompt lookup (no draft model). An n-gram
   match against the context proposes drafts, verified in one batched
   forward; the longest correct prefix is accepted. Greedy only, so
