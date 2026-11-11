@@ -44,8 +44,10 @@ EmbeddingModel::EmbeddingModel(std::unique_ptr<gguf::GgufFile> g,
 std::unique_ptr<EmbeddingModel> EmbeddingModel::load(const std::string& path,
                                                      std::string name) {
     auto g = std::make_unique<gguf::GgufFile>(gguf::GgufFile::open(path));
-    if (g->get_string("general.architecture") != "bert") {
-        throw gguf::Error(path + ": not an encoder model (arch bert)");
+    const auto arch = g->get_string("general.architecture");
+    if (arch != "bert" && arch != "nomic-bert") {
+        throw gguf::Error(path + ": not an encoder model (arch bert or "
+                                 "nomic-bert)");
     }
     // WordPiece (BERT) or SentencePiece unigram (XLM-R).
     const auto tm = g->get_string("tokenizer.ggml.model");

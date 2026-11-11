@@ -34,13 +34,21 @@ enum class Pooling : std::uint32_t {
  * with; llama.cpp uses the tanh form, which moves bge-small's vectors
  * by a cosine of about 1e-6.
  *
+ * Arch "nomic-bert" (nomic-embed-text v1 and v1.5) is the same
+ * post-norm encoder with three differences, as llama.cpp runs it: no
+ * position table but NEOX rope on q and k (pairs i and i + head_dim/2,
+ * rope.freq_base); q, k and v as one matrix (attn_qkv); and the FFN
+ * down * (silu(gate * x) * (up * x)). Its matrices have no biases (a
+ * missing bias is zero, for either arch).
+ *
  * Matrices stay in the GGUF mapping, so the GgufFile must outlive the
  * encoder.
  */
 class BertEncoder {
   public:
     /**
-     * @param g A GGUF whose general.architecture is "bert".
+     * @param g A GGUF whose general.architecture is "bert" or
+     *     "nomic-bert".
      * @throws gguf::Error on a missing key, a missing or wrong-sized
      *     tensor, or a pooling type other than mean, CLS, last or rank
      *     (rank needs cls.output, and takes cls when present).
@@ -119,13 +127,19 @@ class BertEncoder {
         std::vector<float> w, b;
     };
     struct Layer {
-        Linear q, k, v, o, up, down;
+        /** qkv (3 x width rows) when fused, else q, k and v. */
+        Linear q, k, v, qkv, o, up, down;
+        /** The FFN gate (nomic-bert); absent (data null) for GELU. */
+        Linear gate;
         Norm attn_norm, out_norm;
     };
 
     std::uint32_t width_ = 0, heads_ = 0, ffn_ = 0, vocab_ = 0,
                   context_ = 0;
     float eps_ = 0.0f;
+    /** Rotary positions (nomic-bert) instead of pos_embd_. */
+    bool rope_ = false;
+    float freq_base_ = 10000.0f;
     Pooling pooling_ = Pooling::kCls;
     backend::Mat tok_embd_, pos_embd_;
     std::vector<float> type0_;

@@ -68,19 +68,24 @@ std::vector<Tensor> synth_tensors() {
     return t;
 }
 
-/** A bert GGUF image with the synthetic F32 weights. */
+/** A bert (or nomic-bert, with rope.freq_base 1000) GGUF image with
+ *  the synthetic F32 weights. */
 std::vector<std::byte> synth_bert(const std::vector<Tensor>& tensors,
-                                  std::uint32_t pooling) {
+                                  std::uint32_t pooling,
+                                  const std::string& arch = "bert") {
+    const bool nomic = arch == "nomic-bert";
+    const std::string p = arch + ".";
     GgufBuilder g;
-    g.header(tensors.size(), 8);
-    g.kv_string("general.architecture", "bert");
-    g.kv_u32("bert.embedding_length", kWidth);
-    g.kv_u32("bert.attention.head_count", kHeads);
-    g.kv_u32("bert.feed_forward_length", kFfn);
-    g.kv_u32("bert.context_length", kContext);
-    g.kv_u32("bert.block_count", kLayers);
-    g.kv_f32("bert.attention.layer_norm_epsilon", 1e-12f);
-    g.kv_u32("bert.pooling_type", pooling);
+    g.header(tensors.size(), nomic ? 9 : 8);
+    g.kv_string("general.architecture", arch);
+    g.kv_u32(p + "embedding_length", kWidth);
+    g.kv_u32(p + "attention.head_count", kHeads);
+    g.kv_u32(p + "feed_forward_length", kFfn);
+    g.kv_u32(p + "context_length", kContext);
+    g.kv_u32(p + "block_count", kLayers);
+    g.kv_f32(p + "attention.layer_norm_epsilon", 1e-12f);
+    g.kv_u32(p + "pooling_type", pooling);
+    if (nomic) g.kv_f32(p + "rope.freq_base", 1000.0f);
     std::uint64_t offset = 0;
     for (const auto& t : tensors) {
         const std::vector<std::uint64_t> dims(t.shape.rbegin(),
@@ -239,6 +244,176 @@ TEST_CASE("bert encoder matches a plain reference on a tiny model",
     }
 }
 
+TEST_CASE("nomic-bert encoder matches a plain reference on a tiny model",
+          "[bert]") {
+    // No position table and no biases; fused qkv, NEOX rope (base
+    // 1000), down * (silu(gate x) * (up x)).
+    const std::uint64_t w = kWidth, f = kFfn;
+    std::vector<Tensor> t = {{"token_embd.weight", {kVocab, w}, {}},
+                             {"token_types.weight", {2, w}, {}},
+                             {"token_embd_norm.weight", {w}, {}},
+                             {"token_embd_norm.bias", {w}, {}}};
+    for (std::uint32_t n = 0; n < kLayers; ++n) {
+        const std::string p = "blk." + std::to_string(n) + ".";
+        t.push_back({p + "attn_qkv.weight", {3 * w, w}, {}});
+        t.push_back({p + "attn_output.weight", {w, w}, {}});
+        t.push_back({p + "attn_output_norm.weight", {w}, {}});
+        t.push_back({p + "attn_output_norm.bias", {w}, {}});
+        t.push_back({p + "ffn_up.weight", {f, w}, {}});
+        t.push_back({p + "ffn_gate.weight", {f, w}, {}});
+        t.push_back({p + "ffn_down.weight", {w, f}, {}});
+        t.push_back({p + "layer_output_norm.weight", {w}, {}});
+        t.push_back({p + "layer_output_norm.bias", {w}, {}});
+    }
+    std::uint32_t lcg = 1502;
+    for (auto& x : t) {
+        std::size_t n = 1;
+        for (auto d : x.shape) n *= d;
+        x.data.resize(n);
+        const bool gain = x.name.find("norm.weight") != std::string::npos;
+        for (auto& v : x.data) {
+            lcg = lcg * 1664525u + 1013904223u;
+            const float r = static_cast<float>(lcg >> 8) / 16777216.0f - 0.5f;
+            v = gain ? 1.0f + 0.2f * r : r;
+        }
+    }
+    const auto get = [&](const std::string& name) -> const auto& {
+        for (const auto& x : t) {
+            if (x.name == name) return x.data;
+        }
+        FAIL("no tensor " << name);
+        return t[0].data;
+    };
+    const auto reference = [&](const std::vector<TokenId>& ids) {
+        const std::size_t n = ids.size(), hd = kWidth / kHeads;
+        const auto norm = [&](std::vector<double>& x, const std::string& p) {
+            const auto& g = get(p + ".weight");
+            const auto& b = get(p + ".bias");
+            for (std::size_t r = 0; r < n; ++r) {
+                double m = 0, v = 0;
+                for (std::size_t i = 0; i < w; ++i) m += x[r * w + i];
+                m /= w;
+                for (std::size_t i = 0; i < w; ++i) {
+                    v += (x[r * w + i] - m) * (x[r * w + i] - m);
+                }
+                v /= w;
+                for (std::size_t i = 0; i < w; ++i) {
+                    x[r * w + i] =
+                        (x[r * w + i] - m) / std::sqrt(v + 1e-12) * g[i] + b[i];
+                }
+            }
+        };
+        const auto lin = [&](const std::vector<double>& x, std::size_t in,
+                             const std::string& name, std::size_t out) {
+            const auto& W = get(name);
+            std::vector<double> y(n * out, 0.0);
+            for (std::size_t r = 0; r < n; ++r) {
+                for (std::size_t o = 0; o < out; ++o) {
+                    double s = 0;
+                    for (std::size_t c = 0; c < in; ++c) {
+                        s += W[o * in + c] * x[r * in + c];
+                    }
+                    y[r * out + o] = s;
+                }
+            }
+            return y;
+        };
+        // NEOX rope on one head's row at position pos.
+        const auto rope = [&](double* h, std::size_t pos) {
+            const std::size_t half = hd / 2;
+            for (std::size_t i = 0; i < half; ++i) {
+                const double a =
+                    pos * std::pow(1000.0, -2.0 * static_cast<double>(i) / hd);
+                const double x0 = h[i], x1 = h[i + half];
+                h[i] = x0 * std::cos(a) - x1 * std::sin(a);
+                h[i + half] = x0 * std::sin(a) + x1 * std::cos(a);
+            }
+        };
+        std::vector<double> x(n * w);
+        const auto& te = get("token_embd.weight");
+        const auto& ty = get("token_types.weight");
+        for (std::size_t r = 0; r < n; ++r) {
+            for (std::size_t i = 0; i < w; ++i) {
+                x[r * w + i] = te[static_cast<std::size_t>(ids[r]) * w + i] +
+                               ty[i];
+            }
+        }
+        norm(x, "token_embd_norm");
+        for (std::uint32_t l = 0; l < kLayers; ++l) {
+            const std::string p = "blk." + std::to_string(l) + ".";
+            const auto qkv = lin(x, w, p + "attn_qkv.weight", 3 * w);
+            std::vector<double> q(n * w), k(n * w), v(n * w);
+            for (std::size_t r = 0; r < n; ++r) {
+                for (std::size_t i = 0; i < w; ++i) {
+                    q[r * w + i] = qkv[r * 3 * w + i];
+                    k[r * w + i] = qkv[r * 3 * w + w + i];
+                    v[r * w + i] = qkv[r * 3 * w + 2 * w + i];
+                }
+                for (std::size_t h = 0; h < kHeads; ++h) {
+                    rope(&q[r * w + h * hd], r);
+                    rope(&k[r * w + h * hd], r);
+                }
+            }
+            std::vector<double> a(n * w, 0.0);
+            for (std::size_t h = 0; h < kHeads; ++h) {
+                for (std::size_t i = 0; i < n; ++i) {
+                    std::vector<double> s(n);
+                    double mx = -1e300, sum = 0;
+                    for (std::size_t j = 0; j < n; ++j) {
+                        double d = 0;
+                        for (std::size_t e = 0; e < hd; ++e) {
+                            d += q[i * w + h * hd + e] * k[j * w + h * hd + e];
+                        }
+                        s[j] = d / std::sqrt(static_cast<double>(hd));
+                        mx = std::max(mx, s[j]);
+                    }
+                    for (auto& z : s) sum += (z = std::exp(z - mx));
+                    for (std::size_t j = 0; j < n; ++j) {
+                        for (std::size_t e = 0; e < hd; ++e) {
+                            a[i * w + h * hd + e] +=
+                                s[j] / sum * v[j * w + h * hd + e];
+                        }
+                    }
+                }
+            }
+            const auto o = lin(a, w, p + "attn_output.weight", w);
+            for (std::size_t i = 0; i < x.size(); ++i) x[i] += o[i];
+            norm(x, p + "attn_output_norm");
+            const auto up = lin(x, w, p + "ffn_up.weight", f);
+            auto gt = lin(x, w, p + "ffn_gate.weight", f);
+            for (std::size_t i = 0; i < gt.size(); ++i) {
+                gt[i] = gt[i] / (1.0 + std::exp(-gt[i])) * up[i];
+            }
+            const auto d = lin(gt, f, p + "ffn_down.weight", w);
+            for (std::size_t i = 0; i < x.size(); ++i) x[i] += d[i];
+            norm(x, p + "layer_output_norm");
+        }
+        return x;
+    };
+    const auto img = synth_bert(t, 1, "nomic-bert");
+    const auto g = locus::gguf::GgufFile::parse(img);
+    const auto enc = BertEncoder::load(g);
+    REQUIRE(enc.pooling() == Pooling::kMean);
+    const std::vector<std::vector<TokenId>> batch = {
+        {1, 7, 12, 29, 2}, {1, 3, 2}, {1, 5, 5, 8, 9, 10, 11, 4, 0, 2}};
+    const auto out = enc.encode(batch, locus::backend::best_backend().ops);
+    for (std::size_t s = 0; s < batch.size(); ++s) {
+        const auto ref = reference(batch[s]);
+        REQUIRE(out[s].size() == ref.size());
+        double worst = 0;
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            worst = std::max(worst, std::fabs(out[s][i] - ref[i]));
+        }
+        INFO("sequence " << s);
+        REQUIRE(worst < 1e-4);
+    }
+    // A position-sensitive check: the same tokens in another order give
+    // other states (rope is on).
+    const std::vector<std::vector<TokenId>> swapped = {{1, 29, 12, 7, 2}};
+    const auto other = enc.encode(swapped, locus::backend::best_backend().ops);
+    REQUIRE(std::fabs(other[0][0] - out[0][0]) > 1e-6);
+}
+
 TEST_CASE("bert reranker head scores the CLS state", "[bert][rerank]") {
     // The synthetic model plus a RoBERTa head with two labels:
     // logits = cls.output * tanh(cls * x0 + b) + b.
@@ -360,12 +535,18 @@ namespace {
  *   activations to 8 bits before each Q8_0 product, locus keeps them
  *   in f32, so llama.cpp is the one off the q8ref: 0.99984 to 0.99993
  *   on the 12-layer models, 0.99965 to 0.99973 on bge-m3's 24.
- * - hf, when given: the f32 original in transformers, at least 0.9998
- *   and at least as near as llama.cpp.
+ * - hf, when given: the unquantized original (f32 in transformers, or
+ *   for nomic its own F16 GGUF in float64), at least hf_bar and at least
+ *   as near as llama.cpp.
+ *
+ * The bars are per model: nomic-embed v1.5 loses more to Q8_0 (its
+ * Q8_0 weights alone are 0.99887 to 0.99935 from its F16 ones), so its
+ * llama_bar and hf_bar are 0.9985.
  */
 void check_golden(const std::string& file, const char* llama,
                   const char* q8ref, const char* hf, std::uint32_t width,
-                  Pooling pooling) {
+                  Pooling pooling, double llama_bar = 0.9995,
+                  double hf_bar = 0.9998) {
     const std::string path = kDir + "models/" + file;
     if (!std::filesystem::exists(path)) {
         SKIP(file << " absent; see scripts/fetch-test-model.sh");
@@ -403,12 +584,12 @@ void check_golden(const std::string& file, const char* llama,
         const double c = cosine(got[i], want[i]);
         UNSCOPED_INFO("cosine q8ref " << e << " llama " << c);
         REQUIRE(e >= 0.99999);
-        REQUIRE(c >= 0.9995);
+        REQUIRE(c >= llama_bar);
         if (hf != nullptr) {
             const double ch = cosine(got[i], ref[i]);
             const double lh = cosine(want[i], ref[i]);
             UNSCOPED_INFO("cosine hf " << ch << " llama-hf " << lh);
-            REQUIRE(ch >= 0.9998);
+            REQUIRE(ch >= hf_bar);
             REQUIRE(ch >= lh);
         }
         REQUIRE(cosine(one[0], got[i]) >= 0.99999);
@@ -442,6 +623,17 @@ TEST_CASE("bge-m3 embeddings match exact arithmetic and llama.cpp",
     // has no transformers reference.
     check_golden("bge-m3-q8_0.gguf", "bge_m3_embd.json",
                  "bge_m3_embd_q8ref.json", nullptr, 1024, Pooling::kCls);
+}
+
+TEST_CASE("nomic-embed-text v1.5 embeddings match exact arithmetic",
+          "[bert][e2e]") {
+    // nomic-bert: NEOX rope, fused qkv, SwiGLU, no biases, mean pooling.
+    // The unquantized reference is nomic-ai's F16 GGUF in float64
+    // (scripts/make-bert-q8-ref.py), which llama.cpp's F16 run matches
+    // to 0.999999; its transformers model needs trust_remote_code.
+    check_golden("nomic-embed-text-v1.5.Q8_0.gguf", "nomic_embd.json",
+                 "nomic_embd_q8ref.json", "nomic_embd_f16ref.json", 768,
+                 Pooling::kMean, 0.9985, 0.9985);
 }
 
 TEST_CASE("embedding model groups inputs into passes", "[bert][e2e]") {

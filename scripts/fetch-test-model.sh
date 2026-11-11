@@ -8,6 +8,7 @@
 #   bge     bge-small-en-v1.5 Q8_0 (36 MB)
 #   e5      e5-small-v2 Q8_0 (37 MB)
 #   bge-m3  bge-m3 Q8_0 (635 MB)
+#   nomic   nomic-embed-text v1.5 Q8_0 (146 MB)
 # A file lands under a temporary name first, so a test never sees a
 # partial file at the final path.
 set -eu
@@ -15,11 +16,12 @@ set -eu
 dir="$(cd "$(dirname "$0")/.." && pwd)/tests/models"
 mkdir -p "$dir"
 
-# fetch REPO COMMIT FILE SHA256
+# fetch REPO COMMIT FILE SHA256 (REPO under ggml-org unless it has a /)
 fetch() {
     out="$dir/$3"
+    case "$1" in */*) repo="$1" ;; *) repo="ggml-org/$1" ;; esac
     curl -fSL -o "$out.part" \
-        "https://huggingface.co/ggml-org/$1/resolve/$2/$3"
+        "https://huggingface.co/$repo/resolve/$2/$3"
     got="$(shasum -a 256 "$out.part" | cut -d' ' -f1)"
     if [ "$got" != "$4" ]; then
         echo "sha256 mismatch: $got" >&2
@@ -49,6 +51,12 @@ bge-m3)
         bge-m3-q8_0.gguf \
         aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a173
     ;;
+nomic)
+    fetch nomic-ai/nomic-embed-text-v1.5-GGUF \
+        0188c9bf409793f810680a5a431e7b899c46104c \
+        nomic-embed-text-v1.5.Q8_0.gguf \
+        3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7
+    ;;
 "")
     url="https://huggingface.co/ggml-org/models/resolve/main"
     url="$url/tinyllamas/stories260K.gguf"
@@ -56,7 +64,7 @@ bge-m3)
     shasum -a 256 "$dir/stories260K.gguf"
     ;;
 *)
-    echo "usage: $0 [bge|e5|bge-m3]" >&2
+    echo "usage: $0 [bge|e5|bge-m3|nomic]" >&2
     exit 2
     ;;
 esac

@@ -1,5 +1,6 @@
 #include "locus/embed/bert.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -52,17 +53,21 @@ void gelu(std::span<float> x) {
 }  // namespace
 
 BertEncoder BertEncoder::load(const gguf::GgufFile& g) {
-    if (g.get_string("general.architecture") != "bert") {
-        throw gguf::Error("bert: general.architecture is not bert");
+    const auto arch = g.get_string("general.architecture");
+    if (arch != "bert" && arch != "nomic-bert") {
+        throw gguf::Error("bert: general.architecture is not bert or "
+                          "nomic-bert");
     }
+    const std::string ns = std::string(*arch) + ".";
     const auto u = [&](const std::string& key) {
-        const auto v = g.get_uint("bert." + key);
+        const auto v = g.get_uint(ns + key);
         if (!v || *v == 0 || *v > (1u << 20)) {
-            throw gguf::Error("bert: missing or bad bert." + key);
+            throw gguf::Error("bert: missing or bad " + ns + key);
         }
         return static_cast<std::uint32_t>(*v);
     };
     BertEncoder e;
+    e.rope_ = arch == "nomic-bert";
     e.width_ = u("embedding_length");
     e.heads_ = u("attention.head_count");
     e.ffn_ = u("feed_forward_length");
@@ -72,14 +77,25 @@ BertEncoder BertEncoder::load(const gguf::GgufFile& g) {
     if (e.width_ % e.heads_ != 0) {
         throw gguf::Error("bert: width is not a multiple of the heads");
     }
-    const gguf::Value* eps = g.find("bert.attention.layer_norm_epsilon");
+    const gguf::Value* eps = g.find(ns + "attention.layer_norm_epsilon");
     if (eps == nullptr || eps->type != gguf::ValueType::kFloat32 ||
         !(eps->f > 0.0f)) {
         throw gguf::Error("bert: missing or bad layer_norm_epsilon");
     }
     e.eps_ = static_cast<float>(eps->f);
-    const auto pool = g.get_uint("bert.pooling_type");
-    if (!pool) throw gguf::Error("bert: bert.pooling_type missing");
+    if (e.rope_) {
+        if (const gguf::Value* fb = g.find(ns + "rope.freq_base")) {
+            if (fb->type != gguf::ValueType::kFloat32 || !(fb->f > 0.0f)) {
+                throw gguf::Error("bert: bad rope.freq_base");
+            }
+            e.freq_base_ = static_cast<float>(fb->f);
+        }
+        if ((e.width_ / e.heads_) % 2 != 0) {
+            throw gguf::Error("bert: rope needs an even head size");
+        }
+    }
+    const auto pool = g.get_uint(ns + "pooling_type");
+    if (!pool) throw gguf::Error("bert: " + ns + "pooling_type missing");
     e.pooling_ = static_cast<Pooling>(*pool);
     if (e.pooling_ != Pooling::kMean && e.pooling_ != Pooling::kCls &&
         e.pooling_ != Pooling::kLast && e.pooling_ != Pooling::kRank) {
@@ -128,7 +144,10 @@ BertEncoder BertEncoder::load(const gguf::GgufFile& g) {
                          std::uint32_t cols) {
         Linear l;
         l.w = mat(p + ".weight", rows, cols);
-        l.b = vec(p + ".bias", rows);
+        // A missing bias is zero (nomic-bert has none).
+        if (g.find_tensor(p + ".bias") != nullptr) {
+            l.b = vec(p + ".bias", rows);
+        }
         return l;
     };
     const auto norm = [&](const std::string& p) {
@@ -142,7 +161,9 @@ BertEncoder BertEncoder::load(const gguf::GgufFile& g) {
     }
     e.vocab_ = static_cast<std::uint32_t>(tok->ne[1]);
     e.tok_embd_ = mat("token_embd.weight", e.vocab_, e.width_);
-    e.pos_embd_ = mat("position_embd.weight", e.context_, e.width_);
+    if (!e.rope_) {
+        e.pos_embd_ = mat("position_embd.weight", e.context_, e.width_);
+    }
     // Token types are all 0 ("sentence A"), as in llama.cpp: row 0. A
     // model with one type (XLM-R) stores it as one row of 1 dimension.
     const gguf::TensorInfo* types = info("token_types.weight");
@@ -157,11 +178,18 @@ BertEncoder BertEncoder::load(const gguf::GgufFile& g) {
     for (std::uint32_t i = 0; i < blocks; ++i) {
         const std::string p = "blk." + std::to_string(i) + ".";
         Layer l;
-        l.q = lin(p + "attn_q", w, w);
-        l.k = lin(p + "attn_k", w, w);
-        l.v = lin(p + "attn_v", w, w);
+        if (g.find_tensor(p + "attn_qkv.weight") != nullptr) {
+            l.qkv = lin(p + "attn_qkv", 3 * w, w);
+        } else {
+            l.q = lin(p + "attn_q", w, w);
+            l.k = lin(p + "attn_k", w, w);
+            l.v = lin(p + "attn_v", w, w);
+        }
         l.o = lin(p + "attn_output", w, w);
         l.attn_norm = norm(p + "attn_output_norm");
+        if (g.find_tensor(p + "ffn_gate.weight") != nullptr) {
+            l.gate = lin(p + "ffn_gate", e.ffn_, w);
+        }
         l.up = lin(p + "ffn_up", e.ffn_, w);
         l.down = lin(p + "ffn_down", w, e.ffn_);
         l.out_norm = norm(p + "layer_output_norm");
@@ -235,7 +263,8 @@ std::vector<std::vector<float>> BertEncoder::encode(
 
     const std::size_t nw = std::size_t{n} * w;
     std::vector<float> x(nw), h(nw), q(nw), k(nw), v(nw), a(nw), pe(w);
-    std::vector<float> f(std::size_t{n} * ffn_);
+    std::vector<float> f(std::size_t{n} * ffn_), gt;
+    std::vector<float> qkv;
     for (std::size_t s = 0; s < batch.size(); ++s) {
         for (std::uint32_t t = 0; t < batch[s].size(); ++t) {
             const std::span<float> row(x.data() +
@@ -243,15 +272,41 @@ std::vector<std::vector<float>> BertEncoder::encode(
                                        w);
             op.dequant_row(tok_embd_,
                            static_cast<std::uint32_t>(batch[s][t]), row);
-            op.dequant_row(pos_embd_, t, pe);
+            if (!rope_) op.dequant_row(pos_embd_, t, pe);
             for (std::uint32_t i = 0; i < w; ++i) row[i] += type0_[i] + pe[i];
         }
     }
     layer_norm(x, n, w, embd_norm_.w, embd_norm_.b, eps_, x);
+    const backend::Yarn plain;  // no scaling: plain NEOX rope
     for (const Layer& l : layers_) {
-        image::dense::linear(op, l.q.w, l.q.b, x, n, q);
-        image::dense::linear(op, l.k.w, l.k.b, x, n, k);
-        image::dense::linear(op, l.v.w, l.v.b, x, n, v);
+        if (l.qkv.w.data != nullptr) {
+            // One product for q, k and v; each token's row is q | k | v.
+            qkv.resize(std::size_t{n} * 3 * w);
+            image::dense::linear(op, l.qkv.w, l.qkv.b, x, n, qkv);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                const float* r = qkv.data() + std::size_t{t} * 3 * w;
+                std::copy(r, r + w, q.begin() + std::size_t{t} * w);
+                std::copy(r + w, r + 2 * w, k.begin() + std::size_t{t} * w);
+                std::copy(r + 2 * w, r + 3 * w,
+                          v.begin() + std::size_t{t} * w);
+            }
+        } else {
+            image::dense::linear(op, l.q.w, l.q.b, x, n, q);
+            image::dense::linear(op, l.k.w, l.k.b, x, n, k);
+            image::dense::linear(op, l.v.w, l.v.b, x, n, v);
+        }
+        if (rope_) {
+            // Position t within its own sequence.
+            for (std::size_t s = 0; s < batch.size(); ++s) {
+                for (std::uint32_t t = 0; t < batch[s].size(); ++t) {
+                    const std::size_t o = std::size_t{start[s] + t} * w;
+                    backend::rope_neox_yarn(std::span<float>(q).subspan(o, w),
+                                            heads_, hd, t, freq_base_, plain);
+                    backend::rope_neox_yarn(std::span<float>(k).subspan(o, w),
+                                            heads_, hd, t, freq_base_, plain);
+                }
+            }
+        }
         for (std::size_t s = 0; s < batch.size(); ++s) {
             const std::size_t o = std::size_t{start[s]} * w;
             const auto m = static_cast<std::uint32_t>(batch[s].size());
@@ -266,7 +321,15 @@ std::vector<std::vector<float>> BertEncoder::encode(
         for (std::size_t i = 0; i < nw; ++i) x[i] += h[i];
         layer_norm(x, n, w, l.attn_norm.w, l.attn_norm.b, eps_, x);
         image::dense::linear(op, l.up.w, l.up.b, x, n, f);
-        gelu(f);
+        if (l.gate.w.data != nullptr) {
+            // nomic-bert: silu(gate * x) * (up * x).
+            gt.resize(f.size());
+            image::dense::linear(op, l.gate.w, l.gate.b, x, n, gt);
+            backend::silu_mul(gt, f, gt);  // out may alias gate
+            f.swap(gt);
+        } else {
+            gelu(f);
+        }
         image::dense::linear(op, l.down.w, l.down.b, f, n, h);
         for (std::size_t i = 0; i < nw; ++i) x[i] += h[i];
         layer_norm(x, n, w, l.out_norm.w, l.out_norm.b, eps_, x);

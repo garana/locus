@@ -52,8 +52,11 @@ def load(path):
     """@returns (hparams, {name: float64 tensor}) with torch's [out, in]
     layout (GGUF's ne reversed)."""
     r = gguf.GGUFReader(path)
-    hp = {k: r.get_field(k).contents() for k in r.fields
-          if k.startswith("bert.")}
+    arch = r.get_field("general.architecture").contents()
+    # The arch's keys without their prefix ("bert." or "nomic-bert.").
+    hp = {k[len(arch) + 1:]: r.get_field(k).contents() for k in r.fields
+          if k.startswith(arch + ".")}
+    hp["arch"] = arch
     w = {}
     for t in r.tensors:
         a = gguf.quants.dequantize(t.data, t.tensor_type)
@@ -63,9 +66,22 @@ def load(path):
     return hp, w
 
 
+def rope_neox(x, base):
+    """NEOX rope over x [heads, n, hd]: within each head, the pairs
+    (i, i + hd/2) of position t rotate by t * base^(-2i/hd)."""
+    _, n, hd = x.shape
+    half = hd // 2
+    inv = base ** (-torch.arange(half, dtype=torch.float64) * 2.0 / hd)
+    ang = torch.arange(n, dtype=torch.float64)[:, None] * inv[None, :]
+    c, s = torch.cos(ang), torch.sin(ang)
+    a, b = x[..., :half], x[..., half:]
+    return torch.cat([a * c - b * s, a * s + b * c], dim=-1)
+
+
 def forward(hp, w, ids):
-    eps = float(hp["bert.attention.layer_norm_epsilon"])
-    heads = int(hp["bert.attention.head_count"])
+    eps = float(hp["attention.layer_norm_epsilon"])
+    heads = int(hp["attention.head_count"])
+    nomic = hp["arch"] == "nomic-bert"
     n = len(ids)
     ln = torch.nn.functional.layer_norm
 
@@ -73,27 +89,39 @@ def forward(hp, w, ids):
         return ln(x, x.shape[-1:], w[p + ".weight"], w[p + ".bias"], eps)
 
     def lin(x, p):
-        return x @ w[p + ".weight"].T + w[p + ".bias"]
+        # A missing bias is zero (nomic-bert has none).
+        y = x @ w[p + ".weight"].T
+        return y + w[p + ".bias"] if p + ".bias" in w else y
 
     types = w["token_types.weight"].reshape(-1, w["token_embd.weight"]
                                             .shape[1])
-    x = (w["token_embd.weight"][ids] + w["position_embd.weight"][:n] +
-         types[0])
+    x = w["token_embd.weight"][ids] + types[0]
+    if not nomic:
+        x = x + w["position_embd.weight"][:n]
     x = norm(x, "token_embd_norm")
     d = x.shape[1]
     hd = d // heads
-    for i in range(int(hp["bert.block_count"])):
+    for i in range(int(hp["block_count"])):
         p = f"blk.{i}."
-        q = lin(x, p + "attn_q").view(n, heads, hd).transpose(0, 1)
-        k = lin(x, p + "attn_k").view(n, heads, hd).transpose(0, 1)
-        v = lin(x, p + "attn_v").view(n, heads, hd).transpose(0, 1)
+        if p + "attn_qkv.weight" in w:
+            q, k, v = lin(x, p + "attn_qkv").split(d, dim=1)
+        else:
+            q, k, v = (lin(x, p + "attn_q"), lin(x, p + "attn_k"),
+                       lin(x, p + "attn_v"))
+        q, k, v = (t.view(n, heads, hd).transpose(0, 1) for t in (q, k, v))
+        if nomic:
+            base = float(hp.get("rope.freq_base", 10000.0))
+            q, k = rope_neox(q, base), rope_neox(k, base)
         s = torch.softmax(q @ k.transpose(1, 2) / hd ** 0.5, dim=-1)
         a = (s @ v).transpose(0, 1).reshape(n, d)
         x = norm(x + lin(a, p + "attn_output"), p + "attn_output_norm")
         f = lin(x, p + "ffn_up")
-        f = 0.5 * f * (1.0 + torch.erf(f / 2.0 ** 0.5))
+        if p + "ffn_gate.weight" in w:
+            f = torch.nn.functional.silu(lin(x, p + "ffn_gate")) * f
+        else:
+            f = 0.5 * f * (1.0 + torch.erf(f / 2.0 ** 0.5))
         x = norm(x + lin(f, p + "ffn_down"), p + "layer_output_norm")
-    pooling = int(hp["bert.pooling_type"])
+    pooling = int(hp["pooling_type"])
     if pooling == 4:
         # Rank: the CLS state through tanh(cls) and cls.output.
         h = x[0]
@@ -130,7 +158,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     hp, w = load(a.model)
-    if int(hp["bert.pooling_type"]) == 4:
+    if int(hp["pooling_type"]) == 4:
         with torch.no_grad():
             data = rerank(a, hp, w)
         with open(a.out, "w", encoding="utf-8") as f:
