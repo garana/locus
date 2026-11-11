@@ -940,8 +940,9 @@ Kernel matmul_id_kernel(const Mat& w) {
 }
 
 /** @returns The short-batch (matvec_q8_0_n family) kernel for w over
- * n_tok <= kSmallBatch tokens, or kCount_. 16-bit weights take the
- * NT 2 build for up to 2 tokens (matvec_q8_0_n.comp). */
+ * n_tok <= kSmallBatch tokens, or kCount_. 16-bit and K-quant weights
+ * take the NT 2 build for up to 2 tokens (matvec_q8_0_n.comp,
+ * matvec_k_n.comp). */
 Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
     const bool two = n_tok <= 2;
     switch (w.type) {
@@ -951,6 +952,10 @@ Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
             return two ? Kernel::kMatvecF16N2 : Kernel::kMatvecF16N;
         case gguf::TensorType::kBF16:
             return two ? Kernel::kMatvecBF16N2 : Kernel::kMatvecBF16N;
+        case gguf::TensorType::kQ4_K:
+            return two ? Kernel::kMatvecQ4_KN2 : Kernel::kMatvecQ4_KN;
+        case gguf::TensorType::kQ6_K:
+            return two ? Kernel::kMatvecQ6_KN2 : Kernel::kMatvecQ6_KN;
         default: return Kernel::kCount_;
     }
 }
@@ -1572,14 +1577,11 @@ void vulkan_free_kv(float* pool) {
 }
 
 namespace {
-std::atomic<int> g_batch_invariant{-1};  // -1: not read from the env yet
-}  // namespace
+// -1: not read from the env yet; 0 off; 1 on, set (env or
+// vulkan_set_batch_invariant); 2 on by the device default.
+std::atomic<int> g_batch_invariant{-1};
 
-void vulkan_set_batch_invariant(bool on) {
-    g_batch_invariant.store(on ? 1 : 0);
-}
-
-bool vulkan_batch_invariant() {
+int batch_invariant_state() {
     int v = g_batch_invariant.load();
     if (v < 0) {
         const char* e = std::getenv("LOCUS_VK_BATCH_INVARIANT");
@@ -1589,15 +1591,24 @@ bool vulkan_batch_invariant() {
             // On by default where a lone sequence was measured to cost
             // little in this mode: Apple GPUs (M2 Pro level, M4 Max
             // -5%); off elsewhere (V3D -33%, others not measured).
-            v = vulkan_device_name().find("Apple") != std::string::npos ? 1
+            v = vulkan_device_name().find("Apple") != std::string::npos ? 2
                                                                        : 0;
         }
         int expected = -1;
         g_batch_invariant.compare_exchange_strong(expected, v);
         v = g_batch_invariant.load();
     }
-    return v == 1;
+    return v;
 }
+}  // namespace
+
+void vulkan_set_batch_invariant(bool on) {
+    g_batch_invariant.store(on ? 1 : 0);
+}
+
+void vulkan_reset_batch_invariant() { g_batch_invariant.store(-1); }
+
+bool vulkan_batch_invariant() { return batch_invariant_state() >= 1; }
 
 void vulkan_reset_state() {
     std::lock_guard lk(state_mu());
@@ -2883,6 +2894,22 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
     const auto short_ok = [n](const Mat& w) {
         return small_batch_kernel(w, n) != Kernel::kCount_;
     };
+    // A lone sequence under the device default (not a set mode) keeps
+    // vulkan_forward on K-quant weights: their short-batch kernels cost
+    // it 9 to 11% on an M2 Pro (#436), against level for Q8_0.
+    const auto kquant = [](const Mat& w) {
+        return w.type == gguf::TensorType::kQ4_K ||
+               w.type == gguf::TensorType::kQ6_K;
+    };
+    if (n == 1 && batch_invariant_state() == 2 &&
+        (kquant(m.output_weight()) ||
+         std::ranges::any_of(m.layers(), [&](const auto& l) {
+             return kquant(l.wq) || kquant(l.wk) || kquant(l.wv) ||
+                    kquant(l.wo) || kquant(l.w_gate) || kquant(l.w_up) ||
+                    kquant(l.w_down);
+         }))) {
+        return false;
+    }
     if (n == 0 || n > State::kMultiMax || n > kSmallBatch ||
         cache.quantized() || hp.arch == model::Arch::kDeepseek2 ||
         hp.n_expert > 0 || !vulkan_forward_supported(m) ||
@@ -3072,15 +3099,21 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
 
         norm_rows(lay.ffn_norm, bx, bxb);
         mark(s, model::Stage::kNorm);
-        if (lay.w_gate.type == gguf::TensorType::kQ8_0 &&
-            lay.w_up.type == gguf::TensorType::kQ8_0 && n <= kSmallBatch) {
+        const auto gt = lay.w_gate.type;
+        if ((gt == gguf::TensorType::kQ8_0 ||
+             gt == gguf::TensorType::kQ4_K) &&
+            lay.w_up.type == gt && n <= kSmallBatch) {
             // Gate, up and silu_mul in one short-batch dispatch (both
-            // dots as matvec_q8_0_n computes one).
+            // dots as matvec_q8_0_n / matvec_q4_k_n computes one).
             const VulkanContext::Buffer bufs[] = {
                 s.upload_w(lay.w_gate), bxb, bgate, s.upload_w(lay.w_up)};
             const std::uint32_t push[] = {ff, E, 0, 0, 0, 0, fbits(1.0f), n,
                                           E,  ff, 0, 0, 0};
-            const Kernel k = q8n_variant(s.ctx, Kernel::kMatvecQ8_0NGlu, n);
+            const Kernel k =
+                gt == gguf::TensorType::kQ4_K
+                    ? (n <= 2 ? Kernel::kMatvecQ4_KN2Glu
+                              : Kernel::kMatvecQ4_KNGlu)
+                    : q8n_variant(s.ctx, Kernel::kMatvecQ8_0NGlu, n);
             s.ctx.dispatch(k, bufs, push,
                            VulkanContext::matvec_groups(k, ff));
         } else {

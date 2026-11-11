@@ -321,7 +321,13 @@ if(Vulkan_FOUND)
             matvec_f16_n=matvec_q8_0_n:TYPE_F16
             matvec_bf16_n=matvec_q8_0_n:TYPE_F16,BF16
             matvec_f16_n2=matvec_q8_0_n:TYPE_F16,NT2
-            matvec_bf16_n2=matvec_q8_0_n:TYPE_F16,BF16,NT2)
+            matvec_bf16_n2=matvec_q8_0_n:TYPE_F16,BF16,NT2
+            matvec_q4_k_n=matvec_k_n:Q4K
+            matvec_q4_k_n2=matvec_k_n:Q4K,NT2
+            matvec_q4_k_n_glu=matvec_k_n:Q4K,SWIGLU
+            matvec_q4_k_n2_glu=matvec_k_n:Q4K,SWIGLU,NT2
+            matvec_q6_k_n=matvec_k_n:Q6K
+            matvec_q6_k_n2=matvec_k_n:Q6K,NT2)
         # Limits shared with the host, read from their one definition.
         set(LOCUS_VK_LIMITS
             ${CMAKE_SOURCE_DIR}/src/locus/backend/vulkan/limits.hpp)

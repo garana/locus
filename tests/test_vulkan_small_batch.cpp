@@ -1,7 +1,7 @@
 // Short-batch kernels for the Vulkan batched forward (speculative
 // verify): matvec_q8_0_n / matvec_f32_n over <= 8 token rows, and the
 // routed-MoE (token, expert) pair matvecs matvec_q8_0_glu_p /
-// matvec_q8_0_p.
+// matvec_q8_0_p; matvec_q4_k_n / matvec_q6_k_n (#436).
 
 #include <algorithm>
 #include <bit>
@@ -70,9 +70,12 @@ VulkanContext::Buffer upload_q8(VulkanContext& ctx,
 std::vector<float> cpu_mv(locus::gguf::TensorType type, const void* w,
                           std::uint32_t r0, std::uint32_t rows,
                           std::uint32_t cols, std::span<const float> x) {
-    const std::size_t row_bytes = type == locus::gguf::TensorType::kQ8_0
-                                      ? (cols / 32) * 34
-                                      : std::size_t{cols} * 4;
+    using locus::gguf::TensorType;
+    const std::size_t row_bytes =
+        type == TensorType::kQ8_0   ? (cols / 32) * 34
+        : type == TensorType::kQ4_K ? (cols / 256) * 144
+        : type == TensorType::kQ6_K ? (cols / 256) * 210
+                                    : std::size_t{cols} * 4;
     locus::backend::Mat m{type,
                           static_cast<const std::byte*>(w) + r0 * row_bytes,
                           rows, cols};
@@ -404,6 +407,191 @@ TEST_CASE("vulkan short-batch builds give the same bits", "[vulkan]") {
             const auto a = run(k8, glu, n_tok);
             REQUIRE(run(kng, glu, n_tok) == a);
             REQUIRE(run(k2, glu, n_tok) == a);
+        }
+    }
+    for (auto b : {gb, ub, xb}) ctx.destroy_buffer(b);
+}
+
+namespace {
+
+/**
+ * Random K-quant bytes for rows x cols (as test_vulkan_prefill.cpp):
+ * random quants and scales, the f16 d (and Q4_K's dmin) pinned to a
+ * sane magnitude.
+ */
+std::vector<std::byte> random_kq(locus::gguf::TensorType type,
+                                 std::uint32_t rows, std::uint32_t cols,
+                                 std::mt19937& rng) {
+    const bool q4 = type == locus::gguf::TensorType::kQ4_K;
+    const std::size_t block = q4 ? 144 : 210;
+    const std::size_t d_off = q4 ? 0 : 208;
+    std::uniform_int_distribution<int> bd(0, 255);
+    std::vector<std::byte> w(std::size_t{rows} * (cols / 256) * block);
+    for (auto& b : w) {
+        b = static_cast<std::byte>(bd(rng));
+    }
+    for (std::size_t at = d_off; at < w.size(); at += block) {
+        const std::uint16_t d = locus::backend::f32_to_f16(0.01f);
+        std::memcpy(&w[at], &d, 2);
+        if (q4) {
+            const std::uint16_t dmin = locus::backend::f32_to_f16(0.005f);
+            std::memcpy(&w[at + 2], &dmin, 2);
+        }
+    }
+    return w;
+}
+
+}  // namespace
+
+// #436: matvec_q4_k_n / matvec_q6_k_n (and their NT 2 builds) against
+// the CPU per token, over two batches (w_bstride) with accumulate, and
+// a token's bits being the same whatever the batch size and build.
+TEST_CASE("vulkan K-quant short-batch matvecs match the CPU per token",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(97);
+    using locus::gguf::TensorType;
+    struct Case {
+        TensorType type;
+        Kernel k8, k2;
+        const char* name;
+        std::size_t block;
+    };
+    const std::uint32_t rows = 21, cols = 768, n_batch = 2;
+    for (const auto& c :
+         {Case{TensorType::kQ4_K, Kernel::kMatvecQ4_KN, Kernel::kMatvecQ4_KN2,
+               "q4_k", 144},
+          Case{TensorType::kQ6_K, Kernel::kMatvecQ6_KN, Kernel::kMatvecQ6_KN2,
+               "q6_k", 210}}) {
+        const std::size_t mat_bytes = std::size_t{rows} * (cols / 256) * c.block;
+        const auto w = random_kq(c.type, rows * n_batch, cols, rng);
+        auto wb = upload(ctx, w);
+        // Token rows x_stride apart, batches x_bstride apart; x_off 3
+        // takes the unaligned (scalar) x path.
+        const std::uint32_t x_stride = cols + 4;
+        const std::uint32_t out_stride = rows + 2, out_off = 1;
+        const auto run = [&](Kernel k, std::uint32_t n_tok,
+                             std::uint32_t x_off,
+                             const std::vector<float>& x) {
+            const std::uint32_t x_bstride = 8 * x_stride + 8;
+            const std::uint32_t out_bstride = 8 * out_stride;
+            auto xb = upload(ctx, x);
+            auto ob = upload(ctx, std::vector<float>(
+                                      out_off + n_batch * out_bstride, 0.5f));
+            ctx.begin_batch();
+            const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+            const std::uint32_t push[] = {
+                rows,       cols,
+                out_off,    1u,
+                0u,         x_off,
+                fbits(1.0f), n_tok,
+                x_stride,   out_stride,
+                static_cast<std::uint32_t>(mat_bytes), x_bstride,
+                out_bstride};
+            ctx.dispatch(k, bufs, push, VulkanContext::matvec_groups(k, rows),
+                         n_batch);
+            ctx.end_batch();
+            auto out = download(ctx, ob, out_off + n_batch * out_bstride);
+            ctx.destroy_buffer(xb);
+            ctx.destroy_buffer(ob);
+            return out;
+        };
+        for (const std::uint32_t x_off : {0u, 3u}) {
+            DYNAMIC_SECTION(c.name << " x_off " << x_off) {
+                const std::uint32_t x_bstride = 8 * x_stride + 8;
+                const auto x = random_floats(x_off + n_batch * x_bstride, rng);
+                const auto all8 = run(c.k8, 8, x_off, x);
+                for (std::uint32_t b = 0; b < n_batch; ++b) {
+                    for (std::uint32_t t = 0; t < 8; ++t) {
+                        const std::span<const float> xt(
+                            x.data() + x_off + b * x_bstride + t * x_stride,
+                            cols);
+                        const auto ref = cpu_mv(c.type, w.data(), b * rows,
+                                                rows, cols, xt);
+                        for (std::uint32_t r = 0; r < rows; ++r) {
+                            const float got =
+                                all8[out_off + b * 8 * out_stride +
+                                     t * out_stride + r];
+                            INFO("b " << b << " t " << t << " r " << r);
+                            CHECK(std::abs(got - (0.5f + ref[r])) <=
+                                  1e-3f * (1.0f + std::abs(ref[r])));
+                        }
+                    }
+                }
+                // Tokens 0 and 1 the same bits through NT 8 at n = 1,
+                // 2 and 8, and NT 2 at n = 1 and 2.
+                for (const auto& [k, n] :
+                     {std::pair{c.k8, 1u}, std::pair{c.k8, 2u},
+                      std::pair{c.k2, 1u}, std::pair{c.k2, 2u}}) {
+                    INFO("n_tok " << n << (k == c.k2 ? " nt2" : " nt8"));
+                    const auto got = run(k, n, x_off, x);
+                    for (std::uint32_t b = 0; b < n_batch; ++b) {
+                        for (std::uint32_t t = 0; t < n; ++t) {
+                            for (std::uint32_t r = 0; r < rows; ++r) {
+                                const std::size_t i = out_off +
+                                                      b * 8 * out_stride +
+                                                      t * out_stride + r;
+                                REQUIRE(got[i] == all8[i]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ctx.destroy_buffer(wb);
+    }
+}
+
+// #436: matvec_q4_k_n_glu (gate, up and silu_mul in one) against the
+// CPU, and its NT 8 and NT 2 builds giving a token the same bits.
+TEST_CASE("vulkan Q4_K short-batch SwiGLU matches the CPU", "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(101);
+    using locus::gguf::TensorType;
+    const std::uint32_t rows = 19, cols = 512, n_tok = 8;
+    const auto wg = random_kq(TensorType::kQ4_K, rows, cols, rng);
+    const auto wu = random_kq(TensorType::kQ4_K, rows, cols, rng);
+    const auto x = random_floats(std::size_t{n_tok} * cols, rng);
+    auto gb = upload(ctx, wg);
+    auto ub = upload(ctx, wu);
+    auto xb = upload(ctx, x);
+    const auto run = [&](Kernel k, std::uint32_t n) {
+        auto ob = upload(ctx, std::vector<float>(n_tok * rows, 0.0f));
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {gb, xb, ob, ub};
+        const std::uint32_t push[] = {rows, cols, 0, 0, 0, 0, fbits(1.0f),
+                                      n,    cols, rows, 0, 0, 0};
+        ctx.dispatch(k, bufs, push, VulkanContext::matvec_groups(k, rows));
+        ctx.end_batch();
+        auto out = download(ctx, ob, n_tok * rows);
+        ctx.destroy_buffer(ob);
+        return out;
+    };
+    const auto all8 = run(Kernel::kMatvecQ4_KNGlu, n_tok);
+    for (std::uint32_t t = 0; t < n_tok; ++t) {
+        const std::span<const float> xt(x.data() + t * cols, cols);
+        const auto g = cpu_mv(TensorType::kQ4_K, wg.data(), 0, rows, cols, xt);
+        const auto u = cpu_mv(TensorType::kQ4_K, wu.data(), 0, rows, cols, xt);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            const float want = g[r] / (1.0f + std::exp(-g[r])) * u[r];
+            INFO("t " << t << " r " << r);
+            CHECK(std::abs(all8[t * rows + r] - want) <=
+                  2e-3f * (1.0f + std::abs(want)));
+        }
+    }
+    for (const auto& [k, n] : {std::pair{Kernel::kMatvecQ4_KNGlu, 1u},
+                               std::pair{Kernel::kMatvecQ4_KN2Glu, 1u},
+                               std::pair{Kernel::kMatvecQ4_KN2Glu, 2u}}) {
+        INFO("n_tok " << n);
+        const auto got = run(k, n);
+        for (std::uint32_t i = 0; i < n * rows; ++i) {
+            REQUIRE(got[i] == all8[i]);
         }
     }
     for (auto b : {gb, ub, xb}) ctx.destroy_buffer(b);

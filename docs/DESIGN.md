@@ -487,24 +487,30 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
 
 - `forward_batch_decode` decodes one token from each of N sequences in
   one pass. The engine uses it by default (`Engine::Config::
-  batched_decode`); `locus-run` enables it with `--batch-decode`.
-  On Vulkan it runs `vulkan_forward_multi` on groups of up to 8
-  sequences (dense models with Q8_0, F32, F16 or BF16 weights; others
-  run one forward per sequence; Q8_0 runs gate, up and silu_mul in one
-  dispatch and q, k and v in another). In batch-invariant mode a lone
-  sequence takes the multi-sequence kernels too, so a request's
-  logits are bit-identical alone and batched. It is the default on
-  Apple GPUs, where a lone sequence costs little; elsewhere (V3D: a
-  third slower alone) a lone sequence keeps the single-sequence
-  forward. `LOCUS_VK_BATCH_INVARIANT=1` / `0` (or
-  `vulkan_set_batch_invariant`) overrides. Q8_0 batches of 1 or 2 take
-  the NT 2 build of the short-batch kernel and larger ones the NT 8
-  build; the builds run the same per-token arithmetic, so a
-  sequence's bits do not depend on the batch (#432; a test checks the
-  builds agree bit for bit on the device). Llama 3.2 1B Q8_0 on an M4
-  Max: 2, 4 and 8 sequences make 317, 349 and 411 tok/s in all,
-  against 198 alone (210 with the single-sequence forward); on an M2
-  Pro the two are level (93.9 and 93.0).
+  batched_decode`); `locus-run` enables it with `--batch-decode`. On
+  Vulkan it runs `vulkan_forward_multi` on groups of up to 8 sequences
+  (dense models with Q8_0, Q4_K, Q6_K, F32, F16 or BF16 weights; others
+  run one forward per sequence; Q8_0 and Q4_K run gate, up and silu_mul
+  in one dispatch, and Q8_0 q, k and v in another). In batch-invariant
+  mode a lone sequence takes the multi-sequence kernels too, so a
+  request's logits are bit-identical alone and batched. It is the
+  default on Apple GPUs, where a lone sequence costs little; elsewhere
+  (V3D: a third slower alone) a lone sequence keeps the single-sequence
+  forward. Under the default a lone sequence on a Q4_K or Q6_K model
+  keeps it too (the K-quant short-batch kernels cost it 9 to 11% on an
+  M2 Pro), so such a model is batch-invariant only with the mode set.
+  `LOCUS_VK_BATCH_INVARIANT=1` / `0` (or `vulkan_set_batch_invariant`)
+  overrides. Q8_0 batches of 1 or 2 take the NT 2 build of the
+  short-batch kernel and larger ones the NT 8 build (Q4_K and Q6_K too,
+  `matvec_k_n.comp`, #436); the builds run the same per-token
+  arithmetic, so a sequence's bits do not depend on the batch (#432; a
+  test checks the builds agree bit for bit on the device). Llama 3.2 1B
+  Q8_0 on an M4 Max: 2, 4 and 8 sequences make 317, 349 and 411 tok/s in
+  all, against 198 alone (210 with the single-sequence forward); on an
+  M2 Pro the two are level (93.9 and 93.0). Orpheus 3B Q4_K_M on the M4
+  Max: 2, 4 and 8 sequences make 140, 155 and 166 tok/s in all, against
+  102 one forward per sequence (M2 Pro: 46.5, 43.2 and 45.8 against
+  41.5).
 - Prompt ingestion is batched by default (`--no-batch-prefill` turns
   it off). Vulkan has its own chunked prefill, `vulkan_forward_batch`
   (chunks of up to 512 tokens, 2048 for MoE; token-exact, not

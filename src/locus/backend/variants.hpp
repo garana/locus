@@ -270,9 +270,16 @@ void vulkan_reset_state();
  * vulkan_forward's single-sequence kernels. The default is per device:
  * on for Apple GPUs, where a lone sequence costs little (level on an
  * M2 Pro, -5% on an M4 Max), off elsewhere (-33% on V3D; others not
- * measured). LOCUS_VK_BATCH_INVARIANT=1 / 0 overrides it.
+ * measured). Under the default, a lone sequence on a model with Q4_K
+ * or Q6_K weights still takes vulkan_forward (their short-batch
+ * kernels cost it 9 to 11% on an M2 Pro), so such a model is not
+ * batch-invariant unless the mode is set. LOCUS_VK_BATCH_INVARIANT=1 /
+ * 0 (or this call) sets it, for every weight type.
  */
 void vulkan_set_batch_invariant(bool on);
+/** Drops a vulkan_set_batch_invariant setting: back to the
+ * LOCUS_VK_BATCH_INVARIANT or per-device default. */
+void vulkan_reset_batch_invariant();
 /** @returns Whether batch-invariant Vulkan decode is on. */
 bool vulkan_batch_invariant();
 
