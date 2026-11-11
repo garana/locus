@@ -11,6 +11,8 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan/context.hpp"
 #include "locus/gguf/gguf.hpp"
 
 namespace {
@@ -66,6 +68,23 @@ void check_close(std::span<const float> got, std::span<const float> ref,
     REQUIRE(err <= rel * norm);
 }
 
+struct Leg {
+    const char* name;
+    const locus::backend::Ops* op;
+    double bound;  ///< relative error bound against diffusers
+};
+
+/** The CPU, plus the whole-step Vulkan forward when there is a device
+ *  (i#536; its sums run in another order, so FLUX's 1e-3 bound). */
+std::vector<Leg> legs(double cpu_bound) {
+    std::vector<Leg> v = {
+        {"cpu", &locus::backend::best_backend().ops, cpu_bound}};
+    if (locus::backend::vk::VulkanContext::available()) {
+        v.push_back({"vulkan", &locus::backend::vulkan_image_ops(), 1e-3});
+    }
+    return v;
+}
+
 }  // namespace
 
 // i#532 VALUES, on every box: a tiny QwenImageTransformer2DModel from
@@ -92,15 +111,19 @@ TEST_CASE("qwen image dit matches diffusers on a synthetic model",
 
     const auto x = lcg4(777, std::size_t{kImg} * kIn);
     const auto text = lcg4(999, std::size_t{kTxt} * kJoint);
-    QwenImageDit::Trace trace;
-    const auto v = d.forward(x, kSegs, text, kTxt, kSigma,
-                             locus::backend::best_backend().ops, &trace);
     const std::span<const float> r(ref);
-    // 1e-4 as for FLUX: float32 sums in another order, through two
-    // blocks of LCG weights (the errors here are about 1e-5).
-    check_close(trace.block0_img, r.first(ni), 1e-4);
-    check_close(trace.block0_txt, r.subspan(ni, nt), 1e-4);
-    check_close(v, r.subspan(ni + nt), 1e-4);
+    // 1e-4 on the CPU as for FLUX: float32 sums in another order,
+    // through two blocks of LCG weights (the errors are about 1e-5).
+    for (const Leg& leg : legs(1e-4)) {
+        DYNAMIC_SECTION(leg.name) {
+            QwenImageDit::Trace trace;
+            const auto v =
+                d.forward(x, kSegs, text, kTxt, kSigma, *leg.op, &trace);
+            check_close(trace.block0_img, r.first(ni), leg.bound);
+            check_close(trace.block0_txt, r.subspan(ni, nt), leg.bound);
+            check_close(v, r.subspan(ni + nt), leg.bound);
+        }
+    }
 }
 
 // QwenEmbedRope with scale_rope: rows and columns centred per segment,
@@ -177,11 +200,15 @@ TEST_CASE("qwen image dit matches diffusers on a real block",
     REQUIRE(ref.size() == ni + nt + nv);
     const auto x = lcg4(777, std::size_t{n_img} * d.channels());
     const auto text = lcg4(999, std::size_t{n_txt} * d.text_width());
-    QwenImageDit::Trace trace;
-    const auto v = d.forward(x, segs, text, n_txt, 0.5f,
-                             locus::backend::best_backend().ops, &trace);
     const std::span<const float> r(ref);
-    check_close(trace.block0_img, r.first(ni), 1e-4);
-    check_close(trace.block0_txt, r.subspan(ni, nt), 1e-4);
-    check_close(v, r.subspan(ni + nt), 1e-4);
+    for (const Leg& leg : legs(1e-4)) {
+        DYNAMIC_SECTION(leg.name) {
+            QwenImageDit::Trace trace;
+            const auto v =
+                d.forward(x, segs, text, n_txt, 0.5f, *leg.op, &trace);
+            check_close(trace.block0_img, r.first(ni), leg.bound);
+            check_close(trace.block0_txt, r.subspan(ni, nt), leg.bound);
+            check_close(v, r.subspan(ni + nt), leg.bound);
+        }
+    }
 }
