@@ -21,6 +21,7 @@
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/http/base64.hpp"
+#include "locus/http/http.hpp"
 #include "locus/model/gbnf.hpp"
 #include "locus/model/json_schema_gbnf.hpp"
 #include "locus/model/transformer.hpp"
@@ -1420,12 +1421,10 @@ TEST_CASE("server emits 499 + error envelope on a cancelled request",
         REQUIRE(status_of(resp) == 499);
         const auto b = json::parse(body_of(resp));
         REQUIRE(b.contains("error"));
-        // i#75 (error-body unification) tracks that this type is
-        // misdescriptive for a cancellation -- the request was well
-        // formed, the client left -- yet make_error hardcodes
-        // "invalid_request_error". Pinned as-is here; do NOT change the
-        // type in i#83 (client-visible; belongs to i#75's gate).
-        REQUIRE(b["error"]["type"] == "invalid_request_error");
+        // The request was well formed and the client left, so the type
+        // is api_error, as on /v1/messages, not invalid_request_error
+        // (i#75).
+        REQUIRE(b["error"]["type"] == "api_error");
         REQUIRE(b["error"]["message"].get<std::string>().find(
                     "cancelled") != std::string::npos);
     }
@@ -1436,7 +1435,7 @@ TEST_CASE("server emits 499 + error envelope on a cancelled request",
         REQUIRE(status_of(resp) == 499);
         const auto b = json::parse(body_of(resp));
         REQUIRE(b.contains("error"));
-        REQUIRE(b["error"]["type"] == "invalid_request_error");  // see i#75
+        REQUIRE(b["error"]["type"] == "api_error");  // as above (i#75)
     }
 
     SECTION("/v1/messages -> 499, Anthropic nested error envelope") {
@@ -2575,4 +2574,22 @@ TEST_CASE("video jobs make an mp4", "[server][e2e]") {
     REQUIRE(mp4->body.size() > 100);
     REQUIRE(mp4->body.substr(4, 4) == "ftyp");
     fs::remove_all(dir);
+}
+
+// i#75: a transport error (written by http::Server before any route)
+// carries the same flat envelope a route's make_error() writes, byte
+// for byte, so a client parses both the same way.
+TEST_CASE("transport error bodies are the API's flat error envelope",
+          "[server]") {
+    for (const int status : {400, 408, 413, 501, 505, 500}) {
+        INFO("status " << status);
+        const std::string body = locus::http::status_error_body(status);
+        const char* type = status < 500 ? "invalid_request_error"
+                                        : "server_error";
+        const json want{{"error",
+                         {{"message", locus::http::status_reason(status)},
+                          {"type", type}}}};
+        REQUIRE(json::parse(body) == want);
+        REQUIRE(body == want.dump());
+    }
 }

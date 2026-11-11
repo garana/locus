@@ -180,6 +180,12 @@ TEST_CASE("http server: a parse error answers the suggested status and "
     const std::string r = drain(c);
     REQUIRE(r.find("HTTP/1.1 505") != std::string::npos);
     REQUIRE(r.find("Connection: close") != std::string::npos);
+    // The API's flat JSON error envelope, as a route's errors (i#75).
+    REQUIRE(r.find("Content-Type: application/json") != std::string::npos);
+    const std::string want =
+        "{\"error\":{\"message\":\"HTTP Version Not Supported\","
+        "\"type\":\"server_error\"}}";
+    REQUIRE(r.substr(r.size() - want.size()) == want);
     ::close(c);
 }
 
@@ -195,6 +201,9 @@ TEST_CASE("http server: an oversized Content-Length is 413'd on the head, "
     const std::string r = drain(c);
     REQUIRE(r.find("HTTP/1.1 413") != std::string::npos);
     REQUIRE(r.find("Connection: close") != std::string::npos);
+    // A 4xx is the client's: invalid_request_error (i#75).
+    REQUIRE(r.find("\"type\":\"invalid_request_error\"}}") !=
+            std::string::npos);
     ::close(c);
 }
 
@@ -897,12 +906,12 @@ TEST_CASE("http server: metrics count each request by route and status",
     REQUIRE(m->at(den).request_bytes.snapshot().sum == 0.0);
     REQUIRE(m->at(ok).seconds.snapshot().count == 2);
     REQUIRE(m->at(other).seconds.snapshot().count == 2);
-    // What was sent, not what the handler set: a 500 and its text body.
+    // What was sent, not what the handler set: a 500 and its JSON body.
     const std::size_t bad = m->route("/bad");
     REQUIRE(code(bad, 500) == 1);
     REQUIRE(code(bad, 200) == 0);
     REQUIRE(m->at(bad).response_bytes.snapshot().sum ==
             static_cast<double>(
-                locus::http::status_reason(500).size() + 1));
+                locus::http::status_error_body(500).size()));
     REQUIRE(m->in_flight.load() == 0);
 }

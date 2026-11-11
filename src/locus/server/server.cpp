@@ -61,9 +61,12 @@ using nlohmann::json;
  * U+FFFD instead of throwing type_error.316 out of a handler (i#243). */
 constexpr auto kLossy = json::error_handler_t::replace;
 
-json make_error(const std::string& message) {
-    return json{{"error", {{"message", message},
-                           {"type", "invalid_request_error"}}}};
+/** @returns The OpenAI flat error envelope. @param type
+ *  invalid_request_error for a request the client got wrong; api_error
+ *  for a condition that is not the request's fault (a cancellation). */
+json make_error(const std::string& message,
+                const char* type = "invalid_request_error") {
+    return json{{"error", {{"message", message}, {"type", type}}}};
 }
 
 /** Fills res for an exception a handler caught: 400 with
@@ -1781,7 +1784,8 @@ void OpenAiServer::install_routes() {
                 res.status = 499;
                 res.set_content(
                     make_error("request cancelled: client closed the "
-                               "connection")
+                               "connection",
+                               "api_error")
                         .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;
@@ -3447,7 +3451,8 @@ void OpenAiServer::install_routes() {
                 res.status = 499;
                 res.set_content(
                     make_error("request cancelled: client closed the "
-                               "connection")
+                               "connection",
+                               "api_error")
                         .dump(-1, ' ', false, kLossy),
                     "application/json");
                 return;

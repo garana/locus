@@ -50,6 +50,14 @@ length, pattern and the formats date, time, date-time and uuid;
 numeric bounds are not enforced. A bad schema, grammar or regex is a
 400.
 
+Every error body is JSON. `/v1/messages` uses Anthropic's nested
+envelope; every other route, and an error the HTTP layer answers
+before any route (a malformed request, a 408, a 413, a 505), uses the
+OpenAI flat one, `{"error": {"message": ..., "type": ...}}`, with
+`invalid_request_error` for a request the client got wrong and
+`server_error` or `api_error` otherwise; a request cancelled because
+the client left (499) is `api_error` on every route.
+
 Images in chat requests (an OpenAI `image_url` part with a base64
 `data:` URL, or an Anthropic base64 image block) need a Janus-Pro
 model whose GGUF holds the vision tower. locus never fetches a URL.

@@ -217,7 +217,7 @@ class ServerSink : public Sink {
 
 /** @returns The body size write_status_response sends for `status`. */
 std::uint64_t status_body_bytes(int status, bool head_request) {
-    return head_request ? 0 : status_reason(status).size() + 1;
+    return head_request ? 0 : status_error_body(status).size();
 }
 
 /** Counts one request in HttpMetrics::in_flight while it is open. */
@@ -983,7 +983,7 @@ bool Server::write_status_response(int fd, bool head_request, int status,
                                    bool keep) {
     Response r;
     r.status = status;
-    r.set_content(status_reason(status) + "\n", "text/plain");
+    r.set_content(status_error_body(status), "application/json");
     std::string out, werr;
     if (!write_response(r, head_request, keep, out, werr)) {
         return false;
