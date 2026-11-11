@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <regex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -2933,5 +2934,88 @@ TEST_CASE("transport error bodies are the API's flat error envelope",
                           {"type", type}}}};
         REQUIRE(json::parse(body) == want);
         REQUIRE(body == want.dump());
+    }
+}
+
+// i#619: a streamed reply with tools is buffered until it is complete,
+// so with a keepalive it sends SSE comments while it waits, and the
+// events after them are the ones a stream without a keepalive sends.
+// 200 buffered tokens last far longer than the 1 ms keepalive.
+TEST_CASE("buffered SSE replies send keepalive comments", "[server][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const json fn{{"name", "get_weather"},
+                  {"description", "weather"},
+                  {"parameters", {{"type", "object"}}}};
+    const json msgs = json::array(
+        {{{"role", "user"}, {"content", "Once upon a time"}}});
+    struct Case {
+        const char* path;
+        json body;
+    };
+    const Case cases[] = {
+        {"/v1/chat/completions",
+         {{"messages", msgs},
+          {"max_tokens", 200},
+          {"stream", true},
+          {"tools",
+           json::array({{{"type", "function"}, {"function", fn}}})}}},
+        {"/v1/messages",
+         {{"messages", msgs},
+          {"max_tokens", 200},
+          {"stream", true},
+          {"tools", json::array({{{"name", "get_weather"},
+                                  {"description", "weather"},
+                                  {"input_schema", {{"type", "object"}}}}})}}},
+        {"/v1/responses",
+         {{"input", "Once upon a time"},
+          {"max_output_tokens", 200},
+          {"stream", true},
+          {"tools", json::array({{{"type", "function"},
+                                  {"name", "get_weather"},
+                                  {"description", "weather"},
+                                  {"parameters", {{"type", "object"}}}}})}}},
+    };
+    // One server per keepalive setting, each serving the three requests
+    // in the same order, so their request ids match.
+    const auto run = [&](std::uint32_t keepalive_ms) {
+        locus::server::OpenAiServer::Options opt;
+        opt.sse_keepalive_ms = keepalive_ms;
+        TestServer ts(model, tok, opt);
+        httplib::Client client("127.0.0.1", ts.port);
+        std::vector<std::string> out;
+        for (const Case& c : cases) {
+            auto res =
+                client.Post(c.path, c.body.dump(), "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            out.push_back(res->body);
+        }
+        return out;
+    };
+    const auto with = run(1);
+    const auto without = run(0);
+    const std::string ka = ": keepalive\n\n";
+    for (std::size_t i = 0; i < with.size(); ++i) {
+        INFO(cases[i].path);
+        CHECK(without[i].find(ka) == std::string::npos);
+        std::string events = with[i];
+        std::size_t n = 0;
+        for (std::size_t at; (at = events.find(ka)) != std::string::npos;) {
+            events.erase(at, ka.size());
+            ++n;
+        }
+        CHECK(n >= 1);
+        // The comments come before the real events: the stream is
+        // buffered, so nothing else is written until the reply is done.
+        CHECK(with[i].rfind(ka) < with[i].find("data: {", with[i].rfind(ka)));
+        // Timestamps differ between the two runs; nothing else may.
+        const std::regex created("\"created_at\":[0-9]+");
+        CHECK(std::regex_replace(events, created, "") ==
+              std::regex_replace(without[i], created, ""));
     }
 }

@@ -129,13 +129,14 @@ EngineLoop::View EngineLoop::view(std::uint64_t id) {
     return snapshot_locked(id);
 }
 
-EngineLoop::View EngineLoop::wait_progress(std::uint64_t id,
-                                           std::size_t n_seen) {
+EngineLoop::View EngineLoop::wait_progress(
+    std::uint64_t id, std::size_t n_seen, std::chrono::milliseconds max_wait) {
     // Poll under the read_waiters_ turnstile: announce intent, take
     // mu_ (the worker yields it between steps), snapshot, and either
     // return or back off. Polling (vs a condvar) keeps the re-acquire
     // fair -- a condvar wait would race the worker's relock and starve
     // the reader for the whole generation.
+    const auto until = std::chrono::steady_clock::now() + max_wait;
     for (;;) {
         read_waiters_.fetch_add(1);
         {
@@ -143,7 +144,9 @@ EngineLoop::View EngineLoop::wait_progress(std::uint64_t id,
             read_waiters_.fetch_sub(1);
             const View v = snapshot_locked(id);
             if (v.generated.size() > n_seen ||
-                engine::is_terminal(v.status)) {
+                engine::is_terminal(v.status) ||
+                (max_wait.count() > 0 &&
+                 std::chrono::steady_clock::now() >= until)) {
                 return v;
             }
         }

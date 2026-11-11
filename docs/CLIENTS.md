@@ -271,10 +271,11 @@ reply cut at the server's cap as an error, so raise the cap too
 (`--max-tokens 8192`). Codex logs that it cannot decode the
 `/v1/models` reply (it expects its own catalog format) and then uses
 default model metadata; that is harmless. A streamed request with
-tools sends nothing until the reply is complete, and Codex reconnects
-when the stream stays silent for a few minutes (it did at 4.5 minutes,
-while a 30B MoE prefilled those 22k tokens on an M2 Pro). On slow
-hardware add `stream_idle_timeout_ms = 1800000` to the provider.
+tools sends no events until the reply is complete; Codex reconnects
+when a stream stays silent for a few minutes (it did at 4.5 minutes,
+while a 30B MoE prefilled those 22k tokens on an M2 Pro), so locus
+sends an SSE comment (`: keepalive`) after every 15 s of silence
+(`--sse-keepalive S`, 0 = off).
 
 ### Google Antigravity SDK
 
@@ -319,7 +320,9 @@ Agent CLIs (Copilot CLI, Claude Code, Codex, Aider) drive a tool loop, so
 they need streaming and tool calling. locus recognizes a tool call
 only from the whole completion, so a streamed request with `tools` is
 buffered: the call (or the text) arrives in the final chunk, and the
-client never sees raw tool JSON as incremental content.
+client never sees raw tool JSON as incremental content. Until then the
+stream carries SSE comments (`: keepalive`, every 15 s of silence),
+which clients ignore.
 
 locus renders the tool list into a system instruction and parses the
 completion (best effort); it has no native structured function
