@@ -3855,6 +3855,45 @@ void matvec_cuda_q8k(const Mat& w, std::span<const float> x,
     matvec_q8k(w, x, out);  // other types / failure: scalar Q8_K
 }
 
+namespace {
+
+/** Fills t with the device tables w's kernel reads.
+ *  @returns false when an upload failed. */
+bool tables_for(gguf::TensorType type, CudaTables& t) {
+    switch (type) {
+        case gguf::TensorType::kIQ1_S:
+        case gguf::TensorType::kIQ1_M:
+            t.g64 = device_iq1s_grid();
+            return t.g64 != nullptr;
+        case gguf::TensorType::kIQ2_XXS:
+            t.g64 = device_iq2xxs_grid();
+            t.ksigns = device_ksigns();
+            return t.g64 != nullptr && t.ksigns != nullptr;
+        case gguf::TensorType::kIQ2_XS:
+            t.g64 = device_iq2xs_grid();
+            t.ksigns = device_ksigns();
+            return t.g64 != nullptr && t.ksigns != nullptr;
+        case gguf::TensorType::kIQ2_S:
+            t.g64 = device_iq2s_grid();
+            return t.g64 != nullptr;
+        case gguf::TensorType::kIQ3_S:
+            t.g32 = device_iq3s_grid();
+            return t.g32 != nullptr;
+        case gguf::TensorType::kIQ3_XXS:
+            t.g32 = device_iq3xxs_grid();
+            t.ksigns = device_ksigns();
+            return t.g32 != nullptr && t.ksigns != nullptr;
+        case gguf::TensorType::kIQ4_XS:
+        case gguf::TensorType::kIQ4_NL:
+            t.kvalues = device_kvalues_iq4nl();
+            return t.kvalues != nullptr;
+        default:
+            return true;  // F32/Q8_0/Q2_K/Q4_K/Q5_K/Q6_K need none
+    }
+}
+
+}  // namespace
+
 void matvec_cuda(const Mat& w, std::span<const float> x,
                  std::span<float> out) {
     ensure_device();
@@ -3864,45 +3903,7 @@ void matvec_cuda(const Mat& w, std::span<const float> x,
         // Grid/codebook kernels need their device tables uploaded;
         // if any upload failed we fall back to scalar for that call.
         CudaTables t;
-        bool tables_ok = true;
-        switch (w.type) {
-            case gguf::TensorType::kIQ1_S:
-            case gguf::TensorType::kIQ1_M:
-                t.g64 = device_iq1s_grid();
-                tables_ok = t.g64 != nullptr;
-                break;
-            case gguf::TensorType::kIQ2_XXS:
-                t.g64 = device_iq2xxs_grid();
-                t.ksigns = device_ksigns();
-                tables_ok = t.g64 != nullptr && t.ksigns != nullptr;
-                break;
-            case gguf::TensorType::kIQ2_XS:
-                t.g64 = device_iq2xs_grid();
-                t.ksigns = device_ksigns();
-                tables_ok = t.g64 != nullptr && t.ksigns != nullptr;
-                break;
-            case gguf::TensorType::kIQ2_S:
-                t.g64 = device_iq2s_grid();
-                tables_ok = t.g64 != nullptr;
-                break;
-            case gguf::TensorType::kIQ3_S:
-                t.g32 = device_iq3s_grid();
-                tables_ok = t.g32 != nullptr;
-                break;
-            case gguf::TensorType::kIQ3_XXS:
-                t.g32 = device_iq3xxs_grid();
-                t.ksigns = device_ksigns();
-                tables_ok = t.g32 != nullptr && t.ksigns != nullptr;
-                break;
-            case gguf::TensorType::kIQ4_XS:
-            case gguf::TensorType::kIQ4_NL:
-                t.kvalues = device_kvalues_iq4nl();
-                tables_ok = t.kvalues != nullptr;
-                break;
-            default:
-                break;  // F32/Q8_0/Q2_K/Q4_K/Q5_K/Q6_K need none
-        }
-        if (tables_ok) {
+        if (tables_for(w.type, t)) {
             done = run_matvec(w, x, out, bytes, kind_for(w.type), t);
             if (!done) {
                 static Fallback& f = fallback(
@@ -4265,25 +4266,37 @@ bool cuda_kv_attend(const KvAttend& a) {
                              meta.size() * sizeof(std::uint32_t))) {
         return false;
     }
-    if (!cuda_ok(cudaMemcpy(s.q, a.q, q_bytes, cudaMemcpyHostToDevice)) ||
-        !cuda_ok(cudaMemcpy(s.blocks, a.blocks,
-                            a.n_blocks * sizeof(std::uint32_t),
-                            cudaMemcpyHostToDevice)) ||
-        !cuda_ok(cudaMemcpy(s.meta, meta.data(),
-                            meta.size() * sizeof(std::uint32_t),
-                            cudaMemcpyHostToDevice))) {
+    // device_io: q and out are the caller's device buffers (a CUDA
+    // forward), so neither is copied.
+    const float* dq =
+        a.device_io ? a.q : static_cast<const float*>(s.q);
+    float* dout = a.device_io ? a.out : static_cast<float*>(s.out);
+    // Tables the caller already put on the device skip their upload (a
+    // pageable upload waits for the queued work).
+    const bool dev_tables = a.device_io && a.dev_blocks != nullptr &&
+                            a.dev_meta != nullptr;
+    if ((!a.device_io &&
+         !cuda_ok(cudaMemcpy(s.q, a.q, q_bytes, cudaMemcpyHostToDevice))) ||
+        (!dev_tables &&
+         (!cuda_ok(cudaMemcpy(s.blocks, a.blocks,
+                              a.n_blocks * sizeof(std::uint32_t),
+                              cudaMemcpyHostToDevice)) ||
+          !cuda_ok(cudaMemcpy(s.meta, meta.data(),
+                              meta.size() * sizeof(std::uint32_t),
+                              cudaMemcpyHostToDevice))))) {
         return false;
     }
-    const auto* qpos = static_cast<const std::uint32_t*>(s.meta);
+    const auto* dblocks = static_cast<const std::uint32_t*>(
+        dev_tables ? a.dev_blocks : s.blocks);
+    const auto* qpos = static_cast<const std::uint32_t*>(
+        dev_tables ? a.dev_meta : s.meta);
     const auto* qtab = qpos + a.n_q;
     const auto partial = [&](auto kernel) {
         kernel<<<dim3(a.n_kv_heads, a.n_q, chunks), kAttendThreads,
                  shared>>>(
-            static_cast<const float*>(a.mirror),
-            static_cast<const std::uint32_t*>(s.blocks), a.block_stride,
+            static_cast<const float*>(a.mirror), dblocks, a.block_stride,
             a.layer_off, a.v_off, a.block_tokens, a.n_kv_heads * a.head_dim,
-            a.head_dim, a.kq_scale, qpos, qtab,
-            static_cast<const float*>(s.q), a.q_stride,
+            a.head_dim, a.kq_scale, qpos, qtab, dq, a.q_stride,
             static_cast<float*>(s.part));
     };
     switch (group) {
@@ -4295,9 +4308,12 @@ bool cuda_kv_attend(const KvAttend& a) {
     }
     gqa_attend_combine<<<dim3(a.n_kv_heads, a.n_q), kAttendThreads>>>(
         static_cast<const float*>(s.part), a.head_dim, group, qpos, chunks,
-        static_cast<float*>(s.out), a.q_stride);
+        dout, a.q_stride);
     if (!cuda_ok(cudaGetLastError())) {
         return false;
+    }
+    if (a.device_io) {
+        return true;  // left on the device; the caller syncs
     }
     // Row by row: the gaps between q_stride rows stay the caller's.
     const std::size_t pitch = a.q_stride * sizeof(float);
@@ -4458,6 +4474,281 @@ void conv2d_cuda(std::span<const float> in, std::uint32_t in_ch,
         conv2d(in, in_ch, in_h, in_w, weight, out_ch, kh, kw, bias, stride,
                pad, groups, out);
     }
+}
+
+// ---- Device primitives for a CUDA forward (i#517). Every op reads and
+// writes device buffers and returns without waiting; cuda_dev_finish
+// waits once and unpins the weights the calls pinned. The norm, RoPE
+// and add kernels round each step as the host op does (no fused
+// multiply-add), so their results equal the host's bit for bit.
+
+namespace {
+
+/** Weights pinned by cuda_dev_matvec since the last cuda_dev_finish. */
+std::vector<const void*>& dev_pins() {
+    thread_local std::vector<const void*> pins;
+    return pins;
+}
+
+/** rmsnorm per token: one block per token, the sum of squares taken by
+ *  thread 0 in index order (the host's order), then scaled in parallel. */
+__global__ void dev_rmsnorm_kernel(const float* __restrict__ x,
+                                   const float* __restrict__ w, float eps,
+                                   float* __restrict__ out, std::uint32_t n) {
+    __shared__ float scale;
+    const float* xt = x + std::size_t{blockIdx.x} * n;
+    float* ot = out + std::size_t{blockIdx.x} * n;
+    if (threadIdx.x == 0) {
+        float ss = 0.0f;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            ss = __fadd_rn(ss, __fmul_rn(xt[i], xt[i]));
+        }
+        scale = __fdiv_rn(
+            1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, static_cast<float>(n)),
+                                       eps)));
+    }
+    __syncthreads();
+    for (std::uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        ot[i] = __fmul_rn(__fmul_rn(xt[i], scale), w[i]);
+    }
+}
+
+/** RoPE (rope_norm's pairs) per token from host-computed cos / sin:
+ *  cs holds, per token, head_dim / 2 (cos, sin) pairs. */
+__global__ void dev_rope_kernel(float* __restrict__ x,
+                                const float* __restrict__ cs,
+                                std::uint32_t n_heads, std::uint32_t hd,
+                                std::size_t stride) {
+    const std::uint32_t t = blockIdx.y;
+    const std::uint32_t pairs = hd / 2;
+    const std::uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_heads * pairs) {
+        return;
+    }
+    const std::uint32_t h = k / pairs, p = k % pairs;
+    float* v = x + t * stride + std::size_t{h} * hd + 2 * p;
+    const float c = cs[(std::size_t{t} * pairs + p) * 2];
+    const float s = cs[(std::size_t{t} * pairs + p) * 2 + 1];
+    const float x0 = v[0], x1 = v[1];
+    v[0] = __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s));
+    v[1] = __fadd_rn(__fmul_rn(x0, s), __fmul_rn(x1, c));
+}
+
+/** gate = gate / (1 + exp(-gate)) * up (silu_mul). */
+__global__ void dev_silu_mul_kernel(float* __restrict__ g,
+                                    const float* __restrict__ u,
+                                    std::size_t n) {
+    const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float gi = g[i];
+        g[i] = __fmul_rn(__fdiv_rn(gi, __fadd_rn(1.0f, expf(-gi))), u[i]);
+    }
+}
+
+/** x += y. */
+__global__ void dev_add_kernel(float* __restrict__ x,
+                               const float* __restrict__ y, std::size_t n) {
+    const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] = __fadd_rn(x[i], y[i]);
+    }
+}
+
+/** out[t * rows + r] = in[r * n + t]: a batch kernel's row-major result
+ *  to the token-major layout of the rest of the forward. */
+__global__ void dev_transpose_kernel(const float* __restrict__ in,
+                                     float* __restrict__ out,
+                                     std::uint32_t rows, std::uint32_t n) {
+    const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (i < std::size_t{rows} * n) {
+        const std::size_t r = i / n, t = i % n;
+        out[t * rows + r] = in[i];
+    }
+}
+
+unsigned blocks_for(std::size_t n, unsigned threads = 256) {
+    return static_cast<unsigned>((n + threads - 1) / threads);
+}
+
+/** Token t's K and V rows (kv_dim floats each) to the mirror at
+ *  rows[t] + layer_off (V v_off further) and to the host staging copy
+ *  at t * stage_stride + stage_off (V kv_dim further). */
+__global__ void dev_kv_scatter_kernel(
+    const float* __restrict__ k, const float* __restrict__ v,
+    std::uint32_t kv_dim, const std::uint64_t* __restrict__ rows,
+    std::size_t layer_off, std::size_t v_off, float* __restrict__ mirror,
+    float* __restrict__ stage, std::size_t stage_stride,
+    std::size_t stage_off) {
+    const std::uint32_t t = blockIdx.y;
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_dim) {
+        return;
+    }
+    const float kk = k[std::size_t{t} * kv_dim + i];
+    const float vv = v[std::size_t{t} * kv_dim + i];
+    float* m = mirror + rows[t] + layer_off + i;
+    m[0] = kk;
+    m[v_off] = vv;
+    float* s = stage + t * stage_stride + stage_off + i;
+    s[0] = kk;
+    s[kv_dim] = vv;
+}
+
+}  // namespace
+
+float* cuda_dev_alloc(std::size_t n) {
+    ensure_device();
+    void* p = nullptr;
+    return cuda_ok(cudaMalloc(&p, n * sizeof(float))) ? static_cast<float*>(p)
+                                                      : nullptr;
+}
+
+void cuda_dev_free(float* p) {
+    ensure_device();
+    cudaFree(p);
+}
+
+bool cuda_dev_upload(float* d, const float* h, std::size_t n) {
+    return cuda_ok(
+        cudaMemcpy(d, h, n * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+bool cuda_dev_download(float* h, const float* d, std::size_t n) {
+    return cuda_ok(
+        cudaMemcpy(h, d, n * sizeof(float), cudaMemcpyDeviceToHost));
+}
+
+const float* cuda_dev_const(const float* h, std::size_t n) {
+    ensure_device();
+    const void* p = pool().acquire(h, n * sizeof(float));
+    if (p != nullptr) {
+        dev_pins().push_back(h);
+    }
+    return static_cast<const float*>(p);
+}
+
+bool cuda_dev_matvec(const Mat& w, const float* dx, float* dout) {
+    ensure_device();
+    const std::size_t bytes = device_weight_bytes(w);
+    CudaTables t;
+    if (bytes == 0 || !tables_for(w.type, t)) {
+        return false;
+    }
+    const void* dw = pool().acquire(w.data, bytes);
+    if (dw == nullptr) {
+        return false;  // too big for the pool: the caller uses the host
+    }
+    dev_pins().push_back(w.data);
+    launch_kernel(kind_for(w.type), dw, t, dx, dout, w.rows, w.cols);
+    return cuda_ok(cudaGetLastError());
+}
+
+bool cuda_dev_matvec_batch(const Mat& w, const float* dx, float* dout,
+                           std::uint32_t n, float* scratch) {
+    const bool batch_type = w.type == gguf::TensorType::kQ4_K ||
+                            w.type == gguf::TensorType::kQ5_K ||
+                            w.type == gguf::TensorType::kQ6_K ||
+                            w.type == gguf::TensorType::kQ8_0;
+    if (n == 1 || !batch_type) {
+        // The per-token kernel, which the batch kernels equal bit for bit.
+        for (std::uint32_t t = 0; t < n; ++t) {
+            if (!cuda_dev_matvec(w, dx + std::size_t{t} * w.cols,
+                                 dout + std::size_t{t} * w.rows)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    ensure_device();
+    const std::size_t bytes = device_weight_bytes(w);
+    const void* dw = pool().acquire(w.data, bytes);
+    if (dw == nullptr) {
+        return false;
+    }
+    dev_pins().push_back(w.data);
+    const auto* dwb = static_cast<const std::uint8_t*>(dw);
+    const std::uint32_t blocks = (w.rows + kWarpRows - 1) / kWarpRows;
+    // At most kMaxBatch tokens per launch, as run_batch_sliced does.
+    for (std::uint32_t t0 = 0; t0 < n; t0 += kMaxBatch) {
+        const std::uint32_t m = std::min(kMaxBatch, n - t0);
+        const float* xs = dx + std::size_t{t0} * w.cols;
+        if (w.type == gguf::TensorType::kQ6_K) {
+            matvec_batch_q6_k_kernel<<<blocks, 32 * kWarpRows>>>(
+                dwb, xs, scratch, w.rows, w.cols, m);
+        } else if (w.type == gguf::TensorType::kQ8_0) {
+            matvec_batch_q8_0_kernel<<<blocks, 32 * kWarpRows>>>(
+                dwb, xs, scratch, w.rows, w.cols, m);
+        } else if (w.type == gguf::TensorType::kQ5_K) {
+            matvec_batch_q5_k_kernel<<<blocks, 32 * kWarpRows>>>(
+                dwb, xs, scratch, w.rows, w.cols, m);
+        } else {
+            matvec_batch_q4_k_kernel<<<blocks, 32 * kWarpRows>>>(
+                dwb, xs, scratch, w.rows, w.cols, m);
+        }
+        dev_transpose_kernel<<<blocks_for(std::size_t{w.rows} * m), 256>>>(
+            scratch, dout + std::size_t{t0} * w.rows, w.rows, m);
+    }
+    return cuda_ok(cudaGetLastError());
+}
+
+bool cuda_dev_rmsnorm(const float* dx, const float* dw, float eps,
+                      float* dout, std::uint32_t n, std::uint32_t tokens) {
+    dev_rmsnorm_kernel<<<tokens, 256>>>(dx, dw, eps, dout, n);
+    return cuda_ok(cudaGetLastError());
+}
+
+bool cuda_dev_rope(float* dx, const float* dcs, std::uint32_t n_heads,
+                   std::uint32_t hd, std::size_t stride,
+                   std::uint32_t tokens) {
+    const std::size_t work = std::size_t{n_heads} * (hd / 2);
+    dev_rope_kernel<<<dim3(blocks_for(work), tokens), 256>>>(dx, dcs, n_heads,
+                                                            hd, stride);
+    return cuda_ok(cudaGetLastError());
+}
+
+bool cuda_dev_silu_mul(float* dg, const float* du, std::size_t n) {
+    dev_silu_mul_kernel<<<blocks_for(n), 256>>>(dg, du, n);
+    return cuda_ok(cudaGetLastError());
+}
+
+bool cuda_dev_add(float* dx, const float* dy, std::size_t n) {
+    dev_add_kernel<<<blocks_for(n), 256>>>(dx, dy, n);
+    return cuda_ok(cudaGetLastError());
+}
+
+void* cuda_dev_alloc_bytes(std::size_t bytes) {
+    ensure_device();
+    void* p = nullptr;
+    return cuda_ok(cudaMalloc(&p, bytes)) ? p : nullptr;
+}
+
+void cuda_dev_free_bytes(void* p) {
+    ensure_device();
+    cudaFree(p);
+}
+
+bool cuda_dev_upload_bytes(void* d, const void* h, std::size_t bytes) {
+    return cuda_ok(cudaMemcpy(d, h, bytes, cudaMemcpyHostToDevice));
+}
+
+bool cuda_dev_kv_scatter(const float* dk, const float* dv,
+                         std::uint32_t n, std::uint32_t kv_dim,
+                         const std::uint64_t* drows, std::size_t layer_off,
+                         std::size_t v_off, float* mirror, float* stage,
+                         std::size_t stage_stride, std::size_t stage_off) {
+    dev_kv_scatter_kernel<<<dim3(blocks_for(kv_dim), n), 256>>>(
+        dk, dv, kv_dim, drows, layer_off, v_off, mirror, stage,
+        stage_stride, stage_off);
+    return cuda_ok(cudaGetLastError());
+}
+
+bool cuda_dev_finish() {
+    const bool ok = sync_counted();
+    for (const void* p : dev_pins()) {
+        pool().release(p);
+    }
+    dev_pins().clear();
+    return ok;
 }
 
 }  // namespace locus::backend

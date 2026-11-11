@@ -462,6 +462,71 @@ void cuda_kv_mirror_free(void* dev);
  */
 bool cuda_kv_attend(const KvAttend& a);
 
+// ---- Device primitives for a CUDA forward (i#517). Each takes and
+// returns device buffers and does not wait: the work is queued in order
+// and cuda_dev_finish waits for it and unpins every weight the calls
+// pinned. All return false on a CUDA error or a weight the device cannot
+// hold (and always on non-CUDA builds), and the caller then runs the
+// host path. rmsnorm, RoPE and add round each step as the host ops do,
+// so they equal them bit for bit; silu_mul uses the device expf.
+
+/** @returns n device floats, or nullptr. */
+float* cuda_dev_alloc(std::size_t n);
+/** Frees a cuda_dev_alloc buffer. */
+void cuda_dev_free(float* p);
+/** Copies n floats to / from the device (these two wait). */
+bool cuda_dev_upload(float* d, const float* h, std::size_t n);
+bool cuda_dev_download(float* h, const float* d, std::size_t n);
+/**
+ * @returns A device copy of host vector h (a norm weight), kept in the
+ *     weight pool by its host pointer and pinned until cuda_dev_finish;
+ *     nullptr when it does not fit.
+ */
+const float* cuda_dev_const(const float* h, std::size_t n);
+/** dout = w dx: matvec_cuda's kernel, so the same bits. */
+bool cuda_dev_matvec(const Mat& w, const float* dx, float* dout);
+/**
+ * n token-major rows of x (n x cols) to n token-major rows of out
+ * (n x rows): matvec_batch_cuda's kernels, so the same bits as n
+ * cuda_dev_matvec calls. scratch holds rows * min(n, 32) floats.
+ */
+bool cuda_dev_matvec_batch(const Mat& w, const float* dx, float* dout,
+                           std::uint32_t n, float* scratch);
+/** rmsnorm of `tokens` rows of n floats with weight dw. */
+bool cuda_dev_rmsnorm(const float* dx, const float* dw, float eps,
+                      float* dout, std::uint32_t n, std::uint32_t tokens);
+/**
+ * rope_norm on `tokens` rows of n_heads * hd floats, stride floats apart,
+ * from host-computed (cos, sin) pairs: hd / 2 per token in dcs.
+ */
+bool cuda_dev_rope(float* dx, const float* dcs, std::uint32_t n_heads,
+                   std::uint32_t hd, std::size_t stride,
+                   std::uint32_t tokens);
+/** dg = silu(dg) * du over n floats. */
+bool cuda_dev_silu_mul(float* dg, const float* du, std::size_t n);
+/** dx += dy over n floats. */
+bool cuda_dev_add(float* dx, const float* dy, std::size_t n);
+/** Raw device bytes, for the forward's integer tables. */
+void* cuda_dev_alloc_bytes(std::size_t bytes);
+void cuda_dev_free_bytes(void* p);
+/** Copies bytes to the device (waits). */
+bool cuda_dev_upload_bytes(void* d, const void* h, std::size_t bytes);
+/**
+ * Writes token t's K and V rows (dk / dv, n x kv_dim) into the KV mirror
+ * at float offset drows[t] + layer_off (V v_off further), and into the
+ * staging buffer at t * stage_stride + stage_off (V kv_dim further), for
+ * the host pool's copy. drows is a device array of n offsets, uploaded
+ * once per forward (it does not depend on the layer).
+ */
+bool cuda_dev_kv_scatter(const float* dk, const float* dv,
+                         std::uint32_t n, std::uint32_t kv_dim,
+                         const std::uint64_t* drows, std::size_t layer_off,
+                         std::size_t v_off, float* mirror, float* stage,
+                         std::size_t stage_stride, std::size_t stage_off);
+/** Waits for the queued work and unpins the weights. @returns false on
+ *  a CUDA error. */
+bool cuda_dev_finish();
+
 /**
  * CUDA 1D convolution (F32), the device half of the conv1d scalar
  * reference (generative-media codec decoders). Same contract and

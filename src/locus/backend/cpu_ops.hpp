@@ -84,6 +84,15 @@ void rope_norm(std::span<float> x, std::uint32_t n_heads,
                std::span<const float> factors = {});
 
 /**
+ * The (cos, sin) pairs rope_norm rotates by at pos, computed the same
+ * way: head_dim / 2 pairs into cs (head_dim floats), for a device RoPE
+ * that must give the host's bits (i#517).
+ */
+void rope_norm_table(std::uint32_t head_dim, std::uint32_t pos,
+                     float freq_base, std::span<const float> factors,
+                     std::span<float> cs);
+
+/**
  * A 2-D weight view into mapped model memory. Rows are output
  * channels; `cols` elements per row, stored row-major in `type`'s
  * on-disk encoding (ggml layout: ne[0] = cols, ne[1] = rows).
