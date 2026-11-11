@@ -1,8 +1,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
-#include <utility>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
