@@ -32,6 +32,13 @@ double lanczos(double x) {
     return 0.0;
 }
 
+/** Pillow's bilinear (triangle) kernel, support 1. */
+double bilinear(double x) {
+    if (x < 0.0) x = -x;
+    if (x < 1.0) return 1.0 - x;
+    return 0.0;
+}
+
 /** A resampling kernel and its support at scale 1. */
 struct Filter {
     double (*fn)(double);
@@ -39,6 +46,7 @@ struct Filter {
 };
 constexpr Filter kBicubic{&bicubic, 2.0};
 constexpr Filter kLanczos{&lanczos, 3.0};
+constexpr Filter kBilinear{&bilinear, 1.0};
 
 /** Pillow's 8-bit fixed point: 32 - 8 - 2 fraction bits. */
 constexpr int kPrecisionBits = 32 - 8 - 2;
@@ -197,6 +205,10 @@ Rgb8 resize_bicubic(const Rgb8& in, std::uint32_t w, std::uint32_t h) {
 
 Rgb8 resize_lanczos(const Rgb8& in, std::uint32_t w, std::uint32_t h) {
     return resample(in, w, h, kLanczos);
+}
+
+Rgb8 resize_bilinear(const Rgb8& in, std::uint32_t w, std::uint32_t h) {
+    return resample(in, w, h, kBilinear);
 }
 
 Rgb8 fit_square(const Rgb8& in, std::uint32_t side, std::uint32_t min_size,

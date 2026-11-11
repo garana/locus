@@ -55,6 +55,15 @@ Rgb8 resize_bicubic(const Rgb8& in, std::uint32_t w, std::uint32_t h);
 Rgb8 resize_lanczos(const Rgb8& in, std::uint32_t w, std::uint32_t h);
 
 /**
+ * Pillow's Image.resize((w, h), BILINEAR), the same way as
+ * resize_bicubic with the triangle kernel (support 1): torchvision's
+ * Resize on a PIL image, as timm's CNN eval transforms use it.
+ *
+ * @throws std::invalid_argument on a zero size.
+ */
+Rgb8 resize_bilinear(const Rgb8& in, std::uint32_t w, std::uint32_t h);
+
+/**
  * The Janus reference preprocessing up to the normalization
  * (VLMImageProcessor.resize): resize so the longer side is `side`,
  * each side max(int(side_px / max_side * side), min_size), with
