@@ -344,6 +344,31 @@ TEST_CASE("router: classify and image embeddings go to a classify instance",
     CHECK(r.body.rfind("text", 0) == 0);
 }
 
+// i#605: a buffered image sends nothing until it is done, so the media
+// kinds get their own read timeout. With the text one shorter than the
+// instance's answer and the media one longer, the text request times
+// out and the image request is served.
+TEST_CASE("router: media requests get their own read timeout", "[router]") {
+    FakeInstance slow("slow", {"text", "image", "speech"}, "m");
+    slow.delay_ms = 400;
+    RouterConfig cfg;
+    cfg.upstream.read_timeout_ms = 150;
+    cfg.media_read_timeout_ms = 3000;
+    RouterFixture rf({slow.addr()}, cfg);
+
+    auto r = rf.post("/v1/completions", {{"prompt", "x"}});
+    REQUIRE(r.ok);
+    CHECK(r.head.status != 200);
+    r = rf.post("/v1/images/generations", {{"prompt", "a cat"}});
+    REQUIRE(r.ok);
+    CHECK(r.head.status == 200);
+    CHECK(r.body.rfind("slow /v1/images/generations", 0) == 0);
+    // The pooled connection's timeout follows each request's kind.
+    r = rf.post("/v1/completions", {{"prompt", "x"}});
+    REQUIRE(r.ok);
+    CHECK(r.head.status != 200);
+}
+
 TEST_CASE("router: a dead instance is skipped", "[router]") {
     FakeInstance live("live", {"text"}, "m");
     std::string dead_addr;

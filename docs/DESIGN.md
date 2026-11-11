@@ -159,8 +159,8 @@ on a thread that already runs a loop, such as a stage's `/metrics`
 several instances by kind: text, image-to-text (a chat, messages or
 responses body with an image part), image, video, speech, rerank or
 classify, from the path and, for chat, the body; `/v1/embeddings` under
-a classify instance's model goes to that instance. The instances are given as host:port or
-as `srv:NAME`, whose DNS SRV targets (the lowest priority's) are
+a classify instance's model goes to that instance. The instances are
+given as host:port or as `srv:NAME`, whose DNS SRV targets (the lowest priority's) are
 looked up again on every refresh, so instances join and leave with the
 record; one that leaves is never picked again, and an empty answer
 keeps the last list. `scan:A.B.C.D/N:PORT` (IPv4, at most 1024
@@ -207,11 +207,15 @@ lists its kinds in
 every `--refresh-ms`; a request that names a listed model goes to that
 instance. Buffered replies are forwarded whole; a chunked one (SSE)
 streams through, and a client that leaves closes the upstream
-connection, so the instance stops the work. With several instances of
-a kind, a session key (the client's own, or a hash of the system
-prompt and first user turn) orders them by rendezvous hashing, so a
-conversation keeps its instance's prefix cache, every router agrees
-with no shared state, and a leaving instance moves only its own keys.
+connection, so the instance stops the work. An instance that stays
+silent longer than the read timeout fails the request: 60 s for text,
+and for image, speech and video `--media-timeout` (30 minutes by
+default), since a buffered image sends nothing until it is done.
+With several instances of a kind, a session key (the client's own, or
+a hash of the system prompt and first user turn) orders them by
+rendezvous hashing, so a conversation keeps its instance's prefix
+cache, every router agrees with no shared state, and a leaving
+instance moves only its own keys.
 An instance over 1.25 times the candidates' average in-flight count
 goes last, and a connect failure or a busy 503 moves on to the next.
 A video job id from the router names the instance that made it
