@@ -10,8 +10,8 @@ namespace {
 /** The conv with torchvision's padding (k / 2 on both sides). */
 std::vector<float> conv_same(const cnn::Conv& c, std::span<const float> x,
                              std::uint32_t& h, std::uint32_t& w,
-                             std::uint32_t stride, bool relu) {
-    return cnn::conv(c, x, h, w, stride, c.kh / 2, c.kw / 2, relu);
+                             std::uint32_t stride, bool relu, bool gpu) {
+    return cnn::conv(c, x, h, w, stride, c.kh / 2, c.kw / 2, relu, gpu);
 }
 
 }  // namespace
@@ -62,21 +62,21 @@ ResNet ResNet::load(const gguf::GgufFile& g) {
     return r;
 }
 
-ResNet::Output ResNet::run(std::span<const float> chw) const {
+ResNet::Output ResNet::run(std::span<const float> chw, bool gpu) const {
     if (chw.size() != std::size_t{3} * pre_.size * pre_.size) {
         throw std::invalid_argument("resnet: need [3][size][size]");
     }
     std::uint32_t h = pre_.size, w = pre_.size;
-    auto x = conv_same(stem_, chw, h, w, 2, true);
+    auto x = conv_same(stem_, chw, h, w, 2, true, gpu);
     x = cnn::max_pool3(x, stem_.out, h, w, 2, 1);
     for (const Block& b : blocks_) {
         std::uint32_t h1 = h, w1 = w;
-        const auto a = conv_same(b.c1, x, h1, w1, 1, true);
-        const auto m = conv_same(b.c2, a, h1, w1, b.stride, true);
-        auto o = conv_same(b.c3, m, h1, w1, 1, false);
+        const auto a = conv_same(b.c1, x, h1, w1, 1, true, gpu);
+        const auto m = conv_same(b.c2, a, h1, w1, b.stride, true, gpu);
+        auto o = conv_same(b.c3, m, h1, w1, 1, false, gpu);
         if (b.down.out != 0) {
             std::uint32_t h2 = h, w2 = w;
-            const auto s = conv_same(b.down, x, h2, w2, b.stride, false);
+            const auto s = conv_same(b.down, x, h2, w2, b.stride, false, gpu);
             for (std::size_t i = 0; i < o.size(); ++i) o[i] += s[i];
         } else {
             for (std::size_t i = 0; i < o.size(); ++i) o[i] += x[i];

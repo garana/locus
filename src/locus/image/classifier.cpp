@@ -34,12 +34,13 @@ const std::string& ImageClassifier::label(std::uint32_t i) const {
     return resnet_ ? resnet_->label(i) : inception_->label(i);
 }
 
-ImageClassifier::Output ImageClassifier::run(const Rgb8& img) const {
+ImageClassifier::Output ImageClassifier::run(const Rgb8& img,
+                                             bool gpu) const {
     if (resnet_) {
-        auto o = resnet_->run(resnet_->preprocess(img));
+        auto o = resnet_->run(resnet_->preprocess(img), gpu);
         return {std::move(o.logits), std::move(o.embedding)};
     }
-    auto o = inception_->run(inception_->preprocess(img));
+    auto o = inception_->run(inception_->preprocess(img), gpu);
     return {std::move(o.logits), std::move(o.embedding)};
 }
 

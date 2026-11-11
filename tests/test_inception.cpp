@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/image/cnn.hpp"
 #include "locus/image/image_input.hpp"
@@ -110,6 +111,36 @@ TEST_CASE("inception-v3 matches timm on an image", "[inception][image]") {
         CHECK(got5[k].first == want5[k].first);
         CHECK(got5[k].second == Catch::Approx(want5[k].second).epsilon(1e-4));
     }
+}
+
+// i#578: the convs on Vulkan (conv2d_vulkan, the 1 x 7 and 7 x 1 ones
+// on host-padded inputs) against the CPU path on the same image.
+TEST_CASE("inception-v3 on vulkan matches the cpu",
+          "[inception][image][vulkan]") {
+    if (!std::filesystem::exists(kModel)) {
+        SKIP("inception-v3-tv-f32.gguf absent; see scripts/convert-cnn.py");
+    }
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device");
+    }
+    auto g = locus::gguf::GgufFile::open(kModel);
+    const auto net = Inception::load(g);
+    const auto png = png_test::parse_stored_png(
+        read_bytes(kDir + "golden/janus_apple.png"));
+    const auto chw = net.preprocess({png.w, png.h, png.rgb});
+    const auto cpu = net.run(chw, false);
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto gpu = net.run(chw, true);
+    WARN("inception-v3 forward on vulkan: "
+         << std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0)
+                .count()
+         << " s");
+    check_close(gpu.logits, cpu.logits, 1e-5, "vulkan logits");
+    check_close(gpu.embedding, cpu.embedding, 1e-5, "vulkan embedding");
+    const auto a = locus::image::cnn::top_k(gpu.logits, 5);
+    const auto b = locus::image::cnn::top_k(cpu.logits, 5);
+    for (std::size_t k = 0; k < 5; ++k) CHECK(a[k].first == b[k].first);
 }
 
 TEST_CASE("inception rejects a wrong input size", "[inception][image]") {

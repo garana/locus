@@ -34,8 +34,9 @@ class ImageClassifier {
         std::vector<float> logits, embedding;
     };
 
-    /** The eval transform, then the network, on one image. */
-    Output run(const Rgb8& img) const;
+    /** The eval transform, then the network, on one image; with gpu
+     *  the convs run on Vulkan. */
+    Output run(const Rgb8& img, bool gpu = false) const;
 
   private:
     std::unique_ptr<gguf::GgufFile> g_;

@@ -188,9 +188,11 @@ curl -s -o fox.mp4 localhost:8080/v1/videos/video_.../content
 
 `--image-classifier <cnn.gguf>` loads a CNN made by
 `scripts/convert-cnn.py` from a timm checkpoint (ResNet-50 or
-Inception-v3, ImageNet's 1000 classes). It runs on the CPU, one image
-at a time, with the checkpoint's own eval preprocessing (resize,
-center crop, mean and std).
+Inception-v3, ImageNet's 1000 classes). It runs one image at a time,
+with the checkpoint's own eval preprocessing (resize, center crop,
+mean and std). The convs run on Vulkan when the GPU maps host memory
+(Apple: ResNet-50 in 0.15 s, against 1.5 s on the CPU of an M2 Pro);
+otherwise on the CPU.
 
 `POST /v1/classify` takes `{"image": ..., "top_k": 5}` and returns
 Hugging Face's image-classification shape: a list of `{label, score}`,

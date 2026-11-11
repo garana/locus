@@ -10,6 +10,10 @@ namespace {
  *  D 6, E 9 x 2. */
 constexpr std::size_t kConvs = 94;
 
+/** Whether this thread's run() puts its convs on Vulkan: set there
+ *  for the blocks' conv() calls, so they need not all pass it. */
+thread_local bool t_gpu = false;
+
 }  // namespace
 
 Inception Inception::load(const gguf::GgufFile& g) {
@@ -49,7 +53,7 @@ Inception::Map Inception::conv(const std::string& name, const Map& in,
     }
     Map out{{}, c.out, in.h, in.w};
     out.x = cnn::conv(c, in.x, out.h, out.w, stride, same ? c.kh / 2 : 0,
-                      same ? c.kw / 2 : 0, true);
+                      same ? c.kw / 2 : 0, true, t_gpu);
     return out;
 }
 
@@ -138,10 +142,16 @@ Inception::Map Inception::block_e(const std::string& p, const Map& x) const {
     return cat<Map>({&b1, &b3c, &dc, &bp});
 }
 
-Inception::Output Inception::run(std::span<const float> chw) const {
+Inception::Output Inception::run(std::span<const float> chw,
+                                 bool gpu) const {
     if (chw.size() != std::size_t{3} * pre_.size * pre_.size) {
         throw std::invalid_argument("inception: need [3][size][size]");
     }
+    struct Restore {
+        bool prev;
+        ~Restore() { t_gpu = prev; }
+    } restore{t_gpu};
+    t_gpu = gpu;
     Map x{{chw.begin(), chw.end()}, 3, pre_.size, pre_.size};
     x = conv("Conv2d_1a_3x3", x, 2, false);
     x = conv("Conv2d_2a_3x3", x, 1, false);

@@ -54,9 +54,10 @@ class Inception {
 
     /**
      * @param chw [3][input_size][input_size], as preprocess() gives it.
+     * @param gpu The convs on Vulkan (cnn::conv); the rest on the CPU.
      * @throws std::invalid_argument on a wrong size.
      */
-    Output run(std::span<const float> chw) const;
+    Output run(std::span<const float> chw, bool gpu = false) const;
 
   private:
     /** A feature map: [c][h][w]. */
