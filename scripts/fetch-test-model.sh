@@ -10,6 +10,8 @@
 #   bge-m3  bge-m3 Q8_0 (635 MB)
 #   nomic   nomic-embed-text v1.5 Q8_0 (146 MB)
 #   qwen2   Qwen2.5 0.5B Instruct Q8_0 (676 MB), the qwen2 golden
+# or the Qwen2.5-VL 7B vision tower, for the [qwen-vision] tests:
+#   qwen2.5-vl-mmproj  llama.cpp's mmproj, F16 (1.35 GB)
 # A file lands under a temporary name first, so a test never sees a
 # partial file at the final path.
 set -eu
@@ -64,6 +66,12 @@ qwen2)
         qwen2.5-0.5b-instruct-q8_0.gguf \
         ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e
     ;;
+qwen2.5-vl-mmproj)
+    fetch Qwen2.5-VL-7B-Instruct-GGUF \
+        508edd0afaa66bb9e9f40587acc2184f02daf1f6 \
+        mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf \
+        c24a7f5fcfc68286f0a217023b6738e73bea4f11787a43e8238d4bb1b8604cde
+    ;;
 "")
     url="https://huggingface.co/ggml-org/models/resolve/main"
     url="$url/tinyllamas/stories260K.gguf"
@@ -71,7 +79,7 @@ qwen2)
     shasum -a 256 "$dir/stories260K.gguf"
     ;;
 *)
-    echo "usage: $0 [bge|e5|bge-m3|nomic|qwen2]" >&2
+    echo "usage: $0 [bge|e5|bge-m3|nomic|qwen2|qwen2.5-vl-mmproj]" >&2
     exit 2
     ;;
 esac

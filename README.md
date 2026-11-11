@@ -170,7 +170,10 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 - Multimedia (#143): diffusion image speed (#146), video (#148), real-time
   speech (#173), faster image input (#257), FLUX.1 LoRAs (#372:
   `--lora-dir` and the `lora` field apply converted ones, on the CPU
-  and in the whole-step GPU forward).
+  and in the whole-step GPU forward), Qwen-Image-Edit (#529: the
+  Qwen2.5-VL vision tower, from llama.cpp's mmproj GGUF, its language
+  model with M-RoPE (qwen2vl) and the VAE run on the CPU; the MMDiT
+  and an endpoint are not in yet).
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
@@ -187,8 +190,8 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 Tests that need model files skip when the file is absent;
 `scripts/fetch-test-model.sh` gets the small ones (`bge`, `e5`,
 `bge-m3` or `nomic` as its argument gets that embedding model, `qwen2`
-the qwen2 golden's model). Tests tagged as heavy also need
-`LOCUS_HEAVY_TESTS=1`.
+the qwen2 golden's model, and `qwen2.5-vl-mmproj` the Qwen2.5-VL vision
+tower). Tests tagged as heavy also need `LOCUS_HEAVY_TESTS=1`.
 
 ## Run
 
