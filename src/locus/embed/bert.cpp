@@ -320,8 +320,13 @@ std::vector<std::vector<float>> BertEncoder::encode(
             const std::size_t o = std::size_t{start[s]} * w;
             const auto m = static_cast<std::uint32_t>(batch[s].size());
             const std::size_t len = std::size_t{m} * w;
+            // On the GPU ops a short input's attention runs on the CPU:
+            // each GPU call has a fixed cost (uploads and a sync) that a
+            // short sequence's small product does not pay back (#518).
+            const bool cpu_attn = op.self_parallel && m <= kCpuAttnTokens;
             image::dense::attention(
-                op, std::span<const float>(q).subspan(o, len), m,
+                cpu_attn ? backend::best_backend().ops : op,
+                std::span<const float>(q).subspan(o, len), m,
                 std::span<const float>(k).subspan(o, len),
                 std::span<const float>(v).subspan(o, len), m, heads_, hd,
                 std::span<float>(a).subspan(o, len));

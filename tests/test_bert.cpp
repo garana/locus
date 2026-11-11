@@ -680,10 +680,16 @@ TEST_CASE("encoder models on the Vulkan image ops match the CPU",
         "Beijing is the capital of the People's Republic of China.",
         "A small red apple on a wooden table, soft morning light."};
     // Eight inputs of about 120 tokens: past kGpuMinTokens and kGpuMacs
-    // for every model, so the gpu argument runs the passes on Vulkan.
+    // for every model, so the gpu argument runs the passes on Vulkan,
+    // with each input's attention on the CPU (kCpuAttnTokens); and one
+    // of about 360 tokens, whose attention runs on the GPU.
     std::string para;
     for (int i = 0; i < 12; ++i) para += texts[i % 3] + " ";
-    const std::vector<std::string> big(8, para);
+    const std::vector<std::string> big = [&] {
+        std::vector<std::string> v(8, para);
+        v.push_back(para + para + para);
+        return v;
+    }();
     for (const char* file :
          {"bge-small-en-v1.5-q8_0.gguf", "bge-m3-q8_0.gguf",
           "nomic-embed-text-v1.5.Q8_0.gguf"}) {

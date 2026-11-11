@@ -655,13 +655,14 @@ guarding the default path.
   to 0.99869). The encoder runs on the best CPU backend; where the
   GPU imports host memory (Apple, MoltenVK), a pass of at least 100
   tokens and 1e10 multiply-adds runs on the Vulkan image ops instead
-  (the dense ops PixArt uses: one batched matvec per matrix, the
-  attention on the GPU), since below that the GPU's fixed cost per
-  call wins. On an M2 Pro that makes 32 bge-m3 inputs of 120 tokens
-  3.4x faster (18.2 s to 5.4 s) and a 50-document rerank 3.1x (12.8 s
-  to 4.1 s); bge-small barely gains (1.6 to 1.4 s), a per-token cost
-  in that path to find (#518). CUDA and other Vulkan GPUs: #519.
-  Otherwise `/v1/embeddings` returns the chat model's last token's final-normed
+  (the dense ops PixArt uses: one batched matvec per matrix), since
+  below that the GPU's fixed cost per call wins. For the same reason
+  an input of at most 192 tokens has its attention on the CPU, a
+  longer one on the GPU. On an M2 Pro that makes 32 inputs of 120
+  tokens 3.9x faster with bge-m3 (18.2 s to 4.7 s), 3.7x with nomic
+  v1.5 and 1.5x with bge-small, and a 50-document rerank 3.1x (12.8 s
+  to 4.1 s). CUDA and other Vulkan GPUs: #519. Otherwise
+  `/v1/embeddings` returns the chat model's last token's final-normed
   hidden state, L2-normalized, on a dedicated cache; CPU and CUDA
   backends only (`TransformerModel::embed` refuses vulkan).
 - Rerank: with `--rerank-model`, a GGUF of arch `bert` with

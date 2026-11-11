@@ -46,6 +46,13 @@ enum class Pooling : std::uint32_t {
  */
 class BertEncoder {
   public:
+    /** On GPU ops (self_parallel), an input of at most this many tokens
+     *  has its attention on the best CPU backend: on an M2 Pro
+     *  (MoltenVK), eight inputs of bge-m3, GPU / CPU attention: 140
+     *  tokens 1.46 / 1.26 s, 278 tokens 2.44 / 2.60 s, 554 tokens 4.83 /
+     *  6.32 s; bge-small ties at 278. */
+    static constexpr std::uint32_t kCpuAttnTokens = 192;
+
     /**
      * @param g A GGUF whose general.architecture is "bert" or
      *     "nomic-bert".
