@@ -168,6 +168,10 @@ enum class Kernel {
     /** The NT 4 builds of matvec_q8_0_n / _glu (#516), for n = 3, 4. */
     kMatvecQ8_0N4,
     kMatvecQ8_0N4Glu,
+    /** The NT 4 builds of matvec_k_n (#541), for n = 3 or 4. */
+    kMatvecQ4_KN4,
+    kMatvecQ4_KN4Glu,
+    kMatvecQ6_KN4,
     kCount_,
 };
 

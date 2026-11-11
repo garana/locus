@@ -523,16 +523,17 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   `LOCUS_VK_BATCH_INVARIANT=1` / `0` (or `vulkan_set_batch_invariant`)
   overrides. Q8_0 batches of 1 or 2 take the NT 2 build of the
   short-batch kernel, 3 or 4 the NT 4 build (#516) and larger ones the
-  NT 8 build (Q4_K and Q6_K too, `matvec_k_n.comp`, #436); the builds
-  run the same per-token arithmetic, so a sequence's bits do not depend
-  on the batch (#432; a test checks the builds agree bit for bit on the
-  device). Llama 3.2 1B Q8_0 on an M4 Max: 2, 3, 4 and 8 sequences make
-  314, 361, 405 and 404 tok/s in all (312 and 347 at 3 and 4 with the
-  NT 8 build), against 198 alone (210 with the single-sequence
-  forward); on an M2 Pro the two are level (93.9 and 93.0). Orpheus 3B
-  Q4_K_M on the M4 Max: 2, 4 and 8 sequences make 140, 155 and 166
-  tok/s in all, against 102 one forward per sequence (M2 Pro: 46.5,
-  43.2 and 45.8 against 41.5).
+  NT 8 build (Q4_K and Q6_K too, `matvec_k_n.comp`, #436, with its NT 4
+  builds from #541); the builds run the same per-token arithmetic, so a
+  sequence's bits do not depend on the batch (#432; a test checks the
+  builds agree bit for bit on the device). Llama 3.2 1B Q8_0 on an M4
+  Max: 2, 3, 4 and 8 sequences make 314, 361, 405 and 404 tok/s in all
+  (312 and 347 at 3 and 4 with the NT 8 build), against 198 alone (210
+  with the single-sequence forward); on an M2 Pro the two are level
+  (93.9 and 93.0). Orpheus 3B Q4_K_M on the M4 Max: 2, 4 and 8 sequences
+  make 140, 155 and 166 tok/s in all, against 102 one forward per
+  sequence (M2 Pro: 46.5, 43.2 and 45.8 against 41.5), and 3 and 4
+  sequences 147 -> 154 and 156 -> 162 tok/s with the NT 4 builds.
 - Prompt ingestion is batched by default (`--no-batch-prefill` turns
   it off). Vulkan has its own chunked prefill, `vulkan_forward_batch`
   (chunks of up to 512 tokens, 2048 for MoE; token-exact, not
