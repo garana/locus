@@ -512,8 +512,13 @@ TEST_CASE("Poller.modify narrows kReadWrite to kRead and drops writable",
     // not have landed by the first wait, which would then report
     // writable-only. Spin (wait returns immediately while writable) until
     // readable also shows up, so the pre-narrow state is genuinely both.
+    // The spin is bounded by time, not by a count: while writable each
+    // wait returns at once, so 100 rounds could pass in microseconds,
+    // before a loaded box delivers the byte (i#255).
     bool both = false;
-    for (int i = 0; i < 100 && !both; ++i) {
+    const auto until =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!both && std::chrono::steady_clock::now() < until) {
         REQUIRE(p.wait(events, 1000) == 1);
         REQUIRE(events[0].fd == s.server);
         both = events[0].readable && events[0].writable;
