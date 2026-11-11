@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -79,6 +80,11 @@ struct Hparams {
     /** GQA rope pairs (x[i], x[i + head_dim/2]) (NEOX: Qwen2 /
      * Qwen3) instead of interleaved (x[2i], x[2i+1]). */
     bool rope_neox = false;
+    /** M-RoPE (qwen2vl): rope pairs per (t, h, w) position section,
+     * e.g. 16, 24, 24 of head_dim / 2 = 64; all 0 for plain rope. A
+     * token with a 3D position turns pair i by the position of its
+     * section; without one, every section takes the cache slot. */
+    std::uint32_t rope_sections[3] = {0, 0, 0};
     /** YARN rope correction (freq_scale 1 = off). */
     backend::Yarn yarn;
     /** The arch REQUIRES the quantized-activation (R16) mode on every
@@ -166,6 +172,24 @@ struct EmbedStep {
     std::span<float> logits;      ///< n_vocab floats
     std::span<float> normed_out;  ///< n_embd floats
 };
+
+/** One token's M-RoPE position: (t, h, w). */
+using MropePos = std::array<std::uint32_t, 3>;
+
+/**
+ * Qwen2-VL's rope positions for a prompt with one image (transformers'
+ * get_rope_index): n_before text tokens at t = h = w = 0 .. n_before -
+ * 1, then the image's grid_h x grid_w merged tokens (row-major) at (s,
+ * s + row, s + col) with s = n_before, then n_after text tokens from
+ * the image's largest position + 1.
+ *
+ * @param grid_h Merged-token rows (patch rows / 2).
+ * @param grid_w Merged-token columns.
+ */
+std::vector<MropePos> mrope_positions(std::uint32_t n_before,
+                                      std::uint32_t grid_h,
+                                      std::uint32_t grid_w,
+                                      std::uint32_t n_after);
 
 /**
  * Llama-family runtime over the scalar CPU backend, reading and
@@ -257,6 +281,9 @@ class TransformerModel {
          * over cached positions, selected positions. */
         std::vector<float> idx_q, idx_w, idx_scores;
         std::vector<std::uint32_t> idx_sel;
+        /** M-RoPE: the current token's (t, h, w) position, or nullptr
+         * to rope with its cache slot (Hparams::rope_sections). */
+        const std::uint32_t* mrope_pos = nullptr;
     };
 
     /** @returns A workspace sized for this model. */
@@ -445,6 +472,10 @@ class TransformerModel {
      *     slots, as forward_layers' input embedding; that token is
      *     ignored). With any embedding on the Vulkan backend the chunk
      *     runs one forward_embedding per position (on the GPU).
+     * @param mrope Empty, or one (t, h, w) rope position per token
+     *     (mrope_positions()) for an arch with M-RoPE sections
+     *     (qwen2vl); the cache slots stay seq's next n. CPU backends
+     *     only.
      * @throws std::invalid_argument on misuse or unsupported arch.
      */
     void forward_batch(std::span<const tok::TokenId> tokens,
@@ -452,7 +483,8 @@ class TransformerModel {
                        kv::PagedKvCache::Seq& seq, Workspace& ws,
                        std::span<float> logits,
                        bool all_logits = false,
-                       std::span<const float* const> embd = {}) const;
+                       std::span<const float* const> embd = {},
+                       std::span<const MropePos> mrope = {}) const;
 
     /** @returns true when the batched forwards support this model
      * (every CPU/CUDA backend + arch; Vulkan opts out). */

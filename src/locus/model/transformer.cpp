@@ -1127,13 +1127,38 @@ void TransformerModel::project_head_batch(
     matvec_batch(op, out_w_, xbf, logits, n);
 }
 
+std::vector<MropePos> mrope_positions(std::uint32_t n_before,
+                                      std::uint32_t grid_h,
+                                      std::uint32_t grid_w,
+                                      std::uint32_t n_after) {
+    std::vector<MropePos> p;
+    p.reserve(std::size_t{n_before} + std::size_t{grid_h} * grid_w +
+              n_after);
+    for (std::uint32_t i = 0; i < n_before; ++i) p.push_back({i, i, i});
+    for (std::uint32_t r = 0; r < grid_h; ++r) {
+        for (std::uint32_t c = 0; c < grid_w; ++c) {
+            p.push_back({n_before, n_before + r, n_before + c});
+        }
+    }
+    // Text resumes after the image's largest position.
+    const std::uint32_t next =
+        grid_h * grid_w == 0
+            ? n_before
+            : n_before + std::max(grid_h, grid_w);
+    for (std::uint32_t i = 0; i < n_after; ++i) {
+        p.push_back({next + i, next + i, next + i});
+    }
+    return p;
+}
+
 void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                                kv::PagedKvCache& cache,
                                kv::PagedKvCache::Seq& seq,
                                Workspace& ws,
                                std::span<float> logits,
                                bool all_logits,
-                               std::span<const float* const> embd) const {
+                               std::span<const float* const> embd,
+                               std::span<const MropePos> mrope) const {
     using namespace locus::backend;
     const auto n = static_cast<std::uint32_t>(toks.size());
     if (n == 0) {
@@ -1146,6 +1171,19 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     if (!embd.empty() && embd.size() != n) {
         throw std::invalid_argument(
             "forward_batch: embd needs one entry per token");
+    }
+    if (!mrope.empty()) {
+        // Only the CPU per-token attention ropes with M-RoPE so far.
+        if (mrope.size() != n || hp_.rope_sections[0] == 0) {
+            throw std::invalid_argument(
+                "forward_batch: mrope needs one position per token and "
+                "an M-RoPE arch");
+        }
+        if (backend_->name == "vulkan" || backend_->ops.self_parallel ||
+            spec_->plain_attention || spec_->forward != nullptr) {
+            throw std::invalid_argument(
+                "forward_batch: mrope runs on a CPU backend only");
+        }
     }
     const bool any_embd =
         std::any_of(embd.begin(), embd.end(),
@@ -1321,7 +1359,9 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                 apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
                            ws.xb);
                 lap.lap(l, Stage::kNorm);
+                ws.mrope_pos = mrope.empty() ? nullptr : mrope[t].data();
                 spec_->attention(*this, lay, cache, seq, ws, l, base + t);
+                ws.mrope_pos = nullptr;
                 matvec_mt(op, lay.wo, ws.out, ws.xb2);
                 for (std::uint32_t i = 0; i < E; ++i) {
                     x[o + i] += ws.xb2[i];

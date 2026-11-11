@@ -107,6 +107,7 @@ add_executable(locus_tests
     test_video.cpp
     test_model_e2e.cpp
     test_moe.cpp
+    test_qwen_mrope.cpp
     test_dsa.cpp
     test_muse_spark.cpp
     test_codec.cpp

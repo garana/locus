@@ -17,8 +17,9 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 ### What works
 
 - **Architectures:** llama (dense and Mixtral-style MoE), deepseek2
-  (MLA), glm-dsa, qwen2, qwen2moe, qwen3moe, dbrx, muse-spark,
-  deepseek41.
+  (MLA), glm-dsa, qwen2, qwen2vl (Qwen2.5-VL's language model, with
+  M-RoPE for image tokens on the CPU), qwen2moe, qwen3moe, dbrx,
+  muse-spark, deepseek41.
 - **Weight formats:** GGUF with F32, F16, BF16, the legacy quants,
   K-quants, IQ quants, TQ1_0 and TQ2_0.
 - **Tokenizers:** SentencePiece, byte-level BPE (gpt2, llama3 and

@@ -1911,6 +1911,36 @@ void rope_neox_yarn(std::span<float> x, std::uint32_t n_heads,
     }
 }
 
+void rope_mrope(std::span<float> x, std::uint32_t n_heads,
+                std::uint32_t head_dim, const std::uint32_t* pos,
+                const std::uint32_t* sections, float freq_base) {
+    assert(x.size() ==
+           static_cast<std::size_t>(n_heads) * head_dim);
+    const std::uint32_t half = head_dim / 2;
+    assert(sections[0] + sections[1] + sections[2] == half);
+    for (std::uint32_t h = 0; h < n_heads; ++h) {
+        float* v =
+            x.data() + static_cast<std::size_t>(h) * head_dim;
+        for (std::uint32_t i = 0; i < half; ++i) {
+            const std::uint32_t s = i < sections[0]                 ? 0
+                                    : i < sections[0] + sections[1] ? 1
+                                                                    : 2;
+            // The same float steps as yarn_theta without YARN, so equal
+            // positions give rope_neox_yarn's bits.
+            const float theta =
+                static_cast<float>(pos[s]) *
+                std::pow(freq_base, -2.0f * static_cast<float>(i) /
+                                        static_cast<float>(head_dim));
+            const float c = std::cos(theta);
+            const float sn = std::sin(theta);
+            const float x0 = v[i];
+            const float x1 = v[i + half];
+            v[i] = x0 * c - x1 * sn;
+            v[i + half] = x0 * sn + x1 * c;
+        }
+    }
+}
+
 void yarn_corr_range(std::uint32_t head_dim, float freq_base,
                      const Yarn& yarn, float& lo, float& hi) {
     yarn_corr_range_impl(head_dim, freq_base, yarn, lo, hi);

@@ -208,6 +208,20 @@ void rope_neox_yarn(std::span<float> x, std::uint32_t n_heads,
                     float freq_base, const Yarn& yarn);
 
 /**
+ * M-RoPE (Qwen2-VL), NEOX pairs: pair i turns by pos[s] *
+ * freq_base^(-2i / head_dim), where s is the section i falls in (the
+ * first sections[0] pairs take pos[0], the next sections[1] pos[1],
+ * the rest pos[2]). With pos[0] = pos[1] = pos[2] it equals
+ * rope_neox_yarn without YARN.
+ *
+ * @param pos The token's (t, h, w) position.
+ * @param sections Pairs per section; they sum to head_dim / 2.
+ */
+void rope_mrope(std::span<float> x, std::uint32_t n_heads,
+                std::uint32_t head_dim, const std::uint32_t* pos,
+                const std::uint32_t* sections, float freq_base);
+
+/**
  * Interleaved-pair RoPE with YARN corrections: pairs
  * (x[2i], x[2i+1]) rotate by the corrected angle. This is what
  * deepseek2 applies to its q_pe/k_pe (the HF implementation's
