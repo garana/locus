@@ -163,7 +163,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 | Llama-3.2-1B Q8_0 prefill, 2.5k tokens     | M4 Max (MoltenVK) | 1940 tok/s                 |
 | DeepSeek-Coder-V2-Lite Q8_0 decode, Vulkan | M4 Max (MoltenVK) | 88 tok/s                   |
 | Llama-3.2-1B Q8_0 decode, CPU              | M4 Max (neon)     | 89 tok/s                   |
-| Orpheus 3B Q4_K_M decode, CPU              | M4 Max (neon)     | 63 tok/s                   |
+| Orpheus 3B Q4_K_M decode, CPU              | M4 Max (neon)     | 92 tok/s                   |
 | Janus-Pro-1B, one image                    | M2 Pro (MoltenVK) | 22 s, decode included      |
 | Orpheus speech, 3.8 s clip                 | M2 Pro (MoltenVK) | 12 s; first audio at 1.7 s |
 
