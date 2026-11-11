@@ -583,6 +583,35 @@ void qwen2_hparams(const gguf::GgufFile&, const std::string&,
         1.0f / std::sqrt(static_cast<float>(hp.head_dim));
 }
 
+// ---- qwen2vl (Qwen2-VL / Qwen2.5-VL's LM, as llama.cpp writes it):
+// qwen2 plus M-RoPE's sections (rope.dimension_sections, e.g. 16, 24,
+// 24, 0). A text token's three positions are equal, so a text-only
+// prompt is plain qwen2. ----
+
+void qwen2vl_hparams(const gguf::GgufFile& g, const std::string& p,
+                     Hparams& hp) {
+    qwen2_hparams(g, p, hp);
+    const auto* sec = g.get_array(p + "rope.dimension_sections");
+    if (sec == nullptr || sec->size() < 3) {
+        throw gguf::Error("qwen2vl: missing rope.dimension_sections");
+    }
+    std::uint32_t sum = 0;
+    for (std::size_t i = 0; i < sec->size(); ++i) {
+        const gguf::Value& v = (*sec)[i];
+        const std::int64_t x = v.type == gguf::ValueType::kInt32
+                                   ? v.i
+                                   : static_cast<std::int64_t>(v.u);
+        if (x < 0 || (i >= 3 && x != 0)) {
+            throw gguf::Error("qwen2vl: unsupported rope sections");
+        }
+        if (i < 3) hp.rope_sections[i] = static_cast<std::uint32_t>(x);
+        sum += static_cast<std::uint32_t>(x);
+    }
+    if (sum != hp.head_dim / 2 || hp.rope_sections[0] == 0) {
+        throw gguf::Error("qwen2vl: rope sections do not cover head_dim");
+    }
+}
+
 void qwen2moe_attention_tensors(const gguf::GgufFile& g,
                                 const std::string& bp,
                                 const Hparams& hp,
@@ -623,12 +652,22 @@ void qwen2moe_attention(const TransformerModel& m,
             }
         }
     };
+    // Qwen2 uses NEOX rope, not interleaved; qwen2vl's M-RoPE when the
+    // token has a (t, h, w) position, the cache slot otherwise.
+    const bool mrope = ws.mrope_pos != nullptr && hp.rope_sections[0] != 0;
+    auto rope = [&](std::span<float> x, std::uint32_t heads) {
+        if (mrope) {
+            rope_mrope(x, heads, hd, ws.mrope_pos, hp.rope_sections,
+                       hp.rope_freq_base);
+        } else {
+            rope_neox_yarn(x, heads, hd, pos, hp.rope_freq_base, Yarn{});
+        }
+    };
 
     matvec_mt(op, lay.wq, ws.xb, ws.q);
     add_bias({ws.q.data(), static_cast<std::size_t>(hp.n_embd)},
              lay.wq_bias);
-    rope_neox_yarn(ws.q, hp.n_heads, hd, pos, hp.rope_freq_base,
-                   Yarn{});  // Qwen2 uses NEOX rope, not interleaved
+    rope(ws.q, hp.n_heads);
 
     std::vector<float> kmat, vmat;
     const float* kbase = nullptr;
@@ -640,8 +679,7 @@ void qwen2moe_attention(const TransformerModel& m,
         matvec_mt(op, lay.wv, ws.xb, vbuf);
         add_bias(kbuf, lay.wk_bias);
         add_bias(vbuf, lay.wv_bias);
-        rope_neox_yarn(kbuf, hp.n_kv_heads, hd, pos,
-                       hp.rope_freq_base, Yarn{});
+        rope(kbuf, hp.n_kv_heads);
         cache.store_row(seq, l, pos, false, kbuf);
         cache.store_row(seq, l, pos, true, vbuf);
         const std::size_t n = pos + 1;
@@ -662,8 +700,7 @@ void qwen2moe_attention(const TransformerModel& m,
         matvec_mt(op, lay.wv, ws.xb, {vrow, kv_dim});
         add_bias({krow, kv_dim}, lay.wk_bias);
         add_bias({vrow, kv_dim}, lay.wv_bias);
-        rope_neox_yarn({krow, kv_dim}, hp.n_kv_heads, hd, pos,
-                       hp.rope_freq_base, Yarn{});
+        rope({krow, kv_dim}, hp.n_kv_heads);
     }
     auto krow_at = [&](std::uint32_t t) -> const float* {
         return kbase ? kbase + static_cast<std::size_t>(t) * k_stride
@@ -1186,6 +1223,10 @@ const ArchSpec kArchs[] = {
     {"qwen2",
      "Qwen2 / Qwen2.5 dense (GQA + q/k/v bias, NEOX rope)",
      &qwen2_hparams, &qwen2moe_attention_tensors, &qwen2moe_attention,
+     &llama_kv_dim},
+    {"qwen2vl",
+     "Qwen2-VL / Qwen2.5-VL language model (qwen2 + M-RoPE)",
+     &qwen2vl_hparams, &qwen2moe_attention_tensors, &qwen2moe_attention,
      &llama_kv_dim},
     {"qwen2moe",
      "Qwen1.5/2 MoE (GQA + q/k/v bias, routed + gated shared "
