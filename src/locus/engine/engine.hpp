@@ -84,6 +84,10 @@ struct Request {
     kv::PagedKvCache::Seq seq;
     /** Prompt + generated tokens fed through the model so far. */
     std::uint32_t n_fed = 0;
+    /** This step's prompt tokens (Engine::share_prefill). */
+    std::uint32_t step_share = 0;
+    /** Prefill steps in a row this prompt was not fed (aging). */
+    std::uint32_t prefill_waits = 0;
     /** Prompt-cache accounting (prefix_cache on). reused = prompt
      * tokens served from a cached KV prefix (skipped prefill), set at
      * adopt time; cached = prompt tokens NEWLY written to the cache at
@@ -126,8 +130,22 @@ class Engine {
          * decodes them for GQA only, token by token). */
         kv::KvType kv_type = kv::KvType::kF32;
         /** Max prompt tokens prefetched per step across seqs;
-         * 0 = the model's preferred chunk (prefill_chunk()). */
+         * 0 = the model's preferred chunk (prefill_chunk()). Each
+         * prompt is fed in the chunks it gets alone (the whole budget,
+         * then its remainder), and the prompts with the shortest
+         * remainder go first (i#617), so a short prompt behind a long
+         * one is fed on the next step, not after the long prefill. */
         std::uint32_t prefill_budget = 0;
+        /** A prompt not fed on this many prefill steps in a row goes
+         * first on the next (oldest waiter first), so shorter prompts
+         * cannot starve a long one whose chunk needs the whole budget.
+         * Steps that skip prefill (decode_share) do not count. */
+        std::uint32_t prefill_max_wait = 2;
+        /** While a request decodes, every other step feeds no prompt
+         * (i#617), so decodes behind a long prompt get a decode-only
+         * step at least every second step. The prefill loses the
+         * decode-only steps' time, about one decode token's each. */
+        bool decode_share = true;
         /** Decode headroom required at admission, in tokens. */
         std::uint32_t decode_headroom = 16;
         /** Cap on simultaneously running sequences. */
@@ -344,6 +362,15 @@ class Engine {
     void observe_done(const Request& r);
     /** Feeds up to `budget` tokens of r; samples when caught up. */
     void advance(Request& r, std::uint32_t& budget);
+    /** Sets every running request's step_share: the prompts still
+     * prefilling, the aged ones (prefill_max_wait) first, then the
+     * shortest remainder first, each its whole-budget
+     * chunk or its whole remainder while the budget lasts (the chunks
+     * it gets alone); 0 for the others, and for all of them on every
+     * other step while a request decodes (decode_share). */
+    void share_prefill();
+    /** decode_share: whether this step skipped prefill. */
+    bool skip_prefill_ = false;
 
     /** One iteration with cross-sequence batched decode (R10 4b):
      * prefill -> sample -> one forward_batch_decode for every
