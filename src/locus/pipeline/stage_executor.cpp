@@ -54,8 +54,11 @@ void StageExecutor::drain(std::vector<Completion>& out) {
 }
 
 void StageExecutor::run() {
+    // This thread runs every step of the stage: bind it first (e.g. to
+    // the GPU the stage's KV cache lives on, i#573).
+    stage_.run_thread_init();
     // Fixed for the stage's backend; batching needs a backend that can
-    // run a batched forward (CPU/CUDA, not Vulkan).
+    // run a batched forward (forward_batch_layers).
     const bool batch_ok = stage_.supports_batch();
     for (;;) {
         std::vector<Job> steps;

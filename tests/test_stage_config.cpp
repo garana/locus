@@ -457,4 +457,14 @@ TEST_CASE("resolve_device_binding: multiple --device is inc 4b, gated now",
     // the flag surface is fixed before 4b fills it in.
     REQUIRE(resolve_device_binding(opt, 3, db).find("4b") !=
             std::string::npos);
+    // On Vulkan it binds one device per executor (i#573).
+    StageOptions vk;
+    vk.backend = "vulkan";
+    vk.device = {"1", "0"};
+    DeviceBinding vb;
+    REQUIRE(resolve_device_binding(vk, 2, vb).empty());
+    REQUIRE(vb.devices == std::vector<int>{1, 0});
+    vk.device = {"0", "x"};
+    REQUIRE(resolve_device_binding(vk, 2, vb).find("bad --device") !=
+            std::string::npos);
 }

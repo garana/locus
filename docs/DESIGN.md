@@ -818,7 +818,9 @@ across a stage chain. A stage runs on the CPU, on CUDA or on Vulkan
 (`--backend vulkan`, #48): on Vulkan its slice's KV cache holds only
 its layers, a lone session runs the single-sequence kernels and a
 batch of up to 8 the multi-sequence ones (dense llama-family models;
-others run one GPU forward per session). Activations travel as
+others run one GPU forward per session). With one `--device` per
+executor, each Vulkan executor runs on its own device, with its own
+backend state (#47). Activations travel as
 length-prefixed frames over TCP, tagged by request and position. A
 connect proves only that the downstream listener is up; liveness needs
 an app-level probe.
