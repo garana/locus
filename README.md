@@ -175,8 +175,8 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   Qwen2.5-VL vision tower, from llama.cpp's mmproj GGUF, its language
   model with M-RoPE (qwen2vl) and the VAE run on the CPU; the MMDiT
   and an endpoint are not in yet), CNN image classifiers (#274:
-  ResNet-50 classifies and embeds on the CPU, matching timm; no
-  endpoint yet).
+  ResNet-50 and Inception-v3 classify and embed on the CPU, matching
+  timm; no endpoint yet).
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
 - Multi-server inference, pipeline and expert parallel (#3, #24).

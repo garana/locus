@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "locus/gguf/gguf.hpp"
+#include "locus/image/cnn.hpp"
 #include "locus/image/image_input.hpp"
 
 namespace locus::image {
@@ -29,7 +30,7 @@ class ResNet {
     static ResNet load(const gguf::GgufFile& g);
 
     /** @returns The network's input side (224). */
-    std::uint32_t input_size() const { return size_; }
+    std::uint32_t input_size() const { return pre_.size; }
     /** @returns The embedding width (2048 for ResNet-50). */
     std::uint32_t embedding_size() const { return feat_; }
     /** @returns The number of classes (1000). */
@@ -39,16 +40,11 @@ class ResNet {
     /** @returns Class i's label ("Granny Smith"). */
     const std::string& label(std::uint32_t i) const { return labels_.at(i); }
 
-    /**
-     * The reference eval transform: the shorter side resized to resize
-     * (the GGUF's interpolation, Pillow's filter), a center crop of
-     * input_size() (offsets rounded half to even, as Python's round),
-     * then x / 255 and (x - mean) / std.
-     *
-     * @returns [3][input_size][input_size].
-     * @throws std::invalid_argument on an empty image.
-     */
-    std::vector<float> preprocess(const Rgb8& img) const;
+    /** The reference eval transform (cnn::preprocess).
+     *  @returns [3][input_size][input_size]. */
+    std::vector<float> preprocess(const Rgb8& img) const {
+        return cnn::preprocess(img, pre_);
+    }
 
     struct Output {
         std::vector<float> logits;     ///< num_classes()
@@ -61,28 +57,21 @@ class ResNet {
      */
     Output run(std::span<const float> chw) const;
 
-    /**
-     * @returns The k classes with the highest softmax probability, as
-     *     (class, probability), highest first.
-     */
+    /** @returns cnn::top_k(logits, k). */
     static std::vector<std::pair<std::uint32_t, float>> top_k(
-        std::span<const float> logits, std::uint32_t k);
+        std::span<const float> logits, std::uint32_t k) {
+        return cnn::top_k(logits, k);
+    }
 
-    /** A conv with its batch norm folded in: [out][in][k][k], bias. */
-    struct Conv {
-        std::span<const float> w, b;
-        std::uint32_t in = 0, out = 0, k = 0;
-    };
     struct Block {
-        Conv c1, c2, c3, down;  ///< down.out == 0: the identity
+        cnn::Conv c1, c2, c3, down;  ///< down.out == 0: the identity
         std::uint32_t stride = 1;
     };
 
   private:
-    std::uint32_t size_ = 0, resize_ = 0, feat_ = 0;
-    bool bicubic_ = false;
-    float mean_[3] = {}, std_[3] = {};
-    Conv stem_;
+    cnn::Preprocess pre_;
+    std::uint32_t feat_ = 0;
+    cnn::Conv stem_;
     std::vector<Block> blocks_;
     std::span<const float> fc_w_, fc_b_;
     std::vector<std::string> labels_;
