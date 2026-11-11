@@ -223,6 +223,15 @@ bool write_chunked_head(const Response& res, bool keep_alive,
  * or "" if the code is not one this server emits. */
 std::string status_reason(int status);
 
+/**
+ * @returns The body of a status-only error response (a parse error, a
+ * deadline, a cap): the API's flat error envelope,
+ * {"error":{"message":"<reason>","type":"<type>"}}, type
+ * invalid_request_error for a 4xx and server_error otherwise, so a
+ * client parses a transport error as it parses a route's (i#75).
+ */
+std::string status_error_body(int status);
+
 /** Encodes one chunked-transfer chunk -- `<hex size>CRLF<data>CRLF` --
  * for SSE streaming (http::Server's Sink). Empty `data` is NOT the
  * terminator; use last_chunk() for that. */

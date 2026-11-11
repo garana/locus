@@ -602,6 +602,17 @@ std::string status_reason(int status) {
     }
 }
 
+std::string status_error_body(int status) {
+    // The reasons are fixed ASCII without quotes or backslashes, so the
+    // JSON needs no escaping; the keys are in the order nlohmann::json
+    // writes them, so the bytes match a route's make_error().
+    const char* type =
+        status >= 400 && status < 500 ? "invalid_request_error"
+                                      : "server_error";
+    return "{\"error\":{\"message\":\"" + status_reason(status) +
+           "\",\"type\":\"" + type + "\"}}";
+}
+
 namespace {
 
 // A header name/value must not carry CR, LF, or NUL -- those would split
