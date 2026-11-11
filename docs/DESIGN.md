@@ -148,6 +148,12 @@ for locus's own upstream calls (the router of #388): a pure response
 parser with the request parser's hardening, a streaming chunk
 decoder, and connect and read deadlines with one kept-alive
 connection, resent once when the server closed it while idle.
+`http::LoopConnection` serves HTTP on a caller's own event loop
+(`sys::Poller`) instead of a thread per connection: the loop accepts
+and owns the fd, the connection reads, parses, calls a non-blocking
+handler and writes, and says what to watch next; for small endpoints
+on a thread that already runs a loop, such as a stage's `/metrics`
+(#22).
 
 `locus-router` (`router::Router`) proxies each request to one of
 several instances by kind: text, image-to-text (a chat, messages or
