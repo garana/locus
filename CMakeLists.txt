@@ -53,6 +53,7 @@ add_library(locus
     src/locus/image/janus.cpp
     src/locus/image/janus_vision.cpp
     src/locus/image/janus_vision_vulkan.cpp
+    src/locus/image/qwen_vae.cpp
     src/locus/image/pixart_dit.cpp
     src/locus/image/pixart_sampler.cpp
     src/locus/image/dense.cpp

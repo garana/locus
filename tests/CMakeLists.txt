@@ -115,6 +115,7 @@ add_executable(locus_tests
     test_vq16.cpp
     test_janus.cpp
     test_janus_vision.cpp
+    test_qwen_vae.cpp
     test_png.cpp
     test_image_input.cpp
     test_png_decode.cpp
