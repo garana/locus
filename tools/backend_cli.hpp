@@ -87,6 +87,13 @@ inline void print_backends() {
                     std::string(b.name).c_str(),
                     std::string(b.description).c_str(), note.c_str());
     }
+    // The Vulkan devices --device N picks from (i#572).
+    const auto vk = locus::backend::vulkan_devices();
+    for (std::size_t i = 0; i < vk.size(); ++i) {
+        std::printf("  vulkan device %zu: %s (%s)%s\n", i,
+                    vk[i].name.c_str(), vk[i].type.c_str(),
+                    i == 0 ? "  [default]" : "");
+    }
     // Variants compiled out for this architecture (e.g. the x86 SSE4/
     // AVX2 backends on an ARM build) are absent from the registry;
     // list them too so the operator sees the full matrix.
@@ -237,6 +244,8 @@ inline constexpr const char* kCommonHelp =
     "  --spec-draft N   most draft tokens per verify (default 8); the\n"
     "                   length adapts to how many drafts pass\n"
     "  --spec-fixed     always draft --spec-draft tokens\n"
+    "  --device N       the GPU to run on with --backend vulkan or\n"
+    "                   cuda (--backends lists the Vulkan devices)\n"
     "  --kv-type T      KV cache precision: f32 (default, exact),\n"
     "                   f16 (half the cache and attention reads;\n"
     "                   GPU-accelerated for GQA models), q8, q4\n"
@@ -364,6 +373,10 @@ struct BackendArgs {
     std::string prefix_cache_dir;
     /** From --prefix-cache-disk-mib N: its cap in MiB. */
     std::uint32_t prefix_cache_disk_mib = 4096;
+    /** From --device N: the GPU for --backend vulkan / cuda (i#572);
+     *  unset means the backend's first device. */
+    std::uint32_t device = 0;
+    bool device_set = false;
     /** --batch-decode: enable R10 cross-sequence batched decode. */
     bool batch_decode = false;
     /** --no-batch-prefill: force per-token prompt ingestion. */
@@ -532,6 +545,12 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         } else if (a.rfind("--prefix-cache-disk-mib=", 0) == 0) {
             number("--prefix-cache-disk-mib", std::string(a.substr(24)),
                    out.prefix_cache_disk_mib);
+        } else if (a == "--device" && i + 1 < argc) {
+            number("--device", argv[++i], out.device);
+            out.device_set = true;
+        } else if (a.rfind("--device=", 0) == 0) {
+            number("--device", std::string(a.substr(9)), out.device);
+            out.device_set = true;
         } else if (a == "--batch-decode") {
             out.batch_decode = true;
         } else if (a == "--no-batch-prefill") {
@@ -545,6 +564,36 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         }
     }
     return out;
+}
+
+/**
+ * Applies --device (i#572): binds the chosen GPU before the model loads,
+ * so its weights and KV pool land there.
+ * @returns "" (applied, or no --device), or an error for --device
+ *     without a GPU backend.
+ * @throws std::out_of_range / std::runtime_error from the backend for
+ *     a device it does not have.
+ */
+inline std::string apply_device(const BackendArgs& a) {
+    if (!a.device_set) {
+        return "";
+    }
+    // --backend, else LOCUS_BACKEND, as the registry picks.
+    std::string be = a.choice;
+    if (be.empty()) {
+        if (const char* env = std::getenv("LOCUS_BACKEND")) {
+            be = env;
+        }
+    }
+    if (be == "vulkan") {
+        locus::backend::vulkan_set_device(static_cast<int>(a.device));
+        return "";
+    }
+    if (be == "cuda") {
+        locus::backend::cuda_set_device(static_cast<int>(a.device));
+        return "";
+    }
+    return "--device requires --backend vulkan or --backend cuda";
 }
 
 }  // namespace locus_tools

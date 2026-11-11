@@ -75,6 +75,7 @@ add_executable(locus_tests
     test_vulkan_moe.cpp
     test_stage_vulkan.cpp
     test_vulkan_stage.cpp
+    test_vulkan_device.cpp
     test_vulkan_rope.cpp
     test_vulkan_conv1d.cpp
     test_vulkan_fused_matvec.cpp

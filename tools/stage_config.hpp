@@ -67,8 +67,8 @@ struct StageOptions {
     std::string backend;                  /**< --backend NAME: math
                                            *   backend for this stage
                                            *   (empty = auto default) */
-    std::vector<std::string> device;      /**< --device N: CUDA device
-                                           *   ordinal(s). One entry binds
+    std::vector<std::string> device;      /**< --device N: CUDA or Vulkan
+                                           *   device index(es). One entry binds
                                            *   the whole process; >1 is
                                            *   per-executor binding (inc
                                            *   4b, not yet supported) */
@@ -159,11 +159,12 @@ struct DeviceBinding {
 /**
  * Validates --backend/--device and resolves them to a DeviceBinding.
  * In inc 4a a single --device binds the WHOLE process to that CUDA
- * ordinal. Multiple --device entries (one per executor) are inc 4b and
+ * ordinal or Vulkan device index (i#572). Multiple --device entries
+ * (one per executor) are inc 4b and
  * rejected here, but the eventual rule (count is 1 or == --executors) is
  * enforced NOW so 4b fills the flag surface in rather than changing its
- * arity. A --device with a non-cuda backend, a non-integer ordinal, or a
- * negative ordinal is an error.
+ * arity. A --device without --backend cuda or vulkan, a non-integer
+ * ordinal, or a negative ordinal is an error.
  *
  * `out` is overwritten at entry (backend copied from opt, device reset
  * to -1), so on an error return it holds opt.backend and device -1, not
@@ -180,12 +181,12 @@ inline std::string resolve_device_binding(const StageOptions& opt,
     if (opt.device.empty()) {
         return "";  // no explicit device: the backend's default
     }
-    // --device only means anything for CUDA. Check this first so the
-    // diagnostic names the real problem regardless of how many entries
-    // were given (not a confusing arity/4b message for a non-cuda
+    // --device only means anything for a GPU backend. Check this first
+    // so the diagnostic names the real problem regardless of how many
+    // entries were given (not a confusing arity/4b message for a CPU
     // backend).
-    if (opt.backend != "cuda") {
-        return "--device requires --backend cuda";
+    if (opt.backend != "cuda" && opt.backend != "vulkan") {
+        return "--device requires --backend cuda or --backend vulkan";
     }
     if (opt.device.size() > 1) {
         if (static_cast<int>(opt.device.size()) != n_exec) {

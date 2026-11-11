@@ -4,6 +4,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "locus/backend/gpu_metrics.hpp"
 
@@ -315,8 +316,25 @@ class VulkanContext {
     /** Prints the per-token profile to stderr (when profiling). */
     void report_profile() const;
 
-    /** @throws std::runtime_error when no usable device. */
-    VulkanContext();
+    /** A physical device with a compute queue (i#572). */
+    struct DeviceInfo {
+        std::string name;
+        /** "discrete", "integrated", "virtual", "cpu" or "other". */
+        std::string type;
+    };
+
+    /** @returns The devices with a compute queue, in the order a
+     *  device index counts them; empty when none (or no Vulkan). Builds
+     *  no pipelines. */
+    static std::vector<DeviceInfo> devices();
+
+    /**
+     * @param device Index into devices(); -1 (the default) takes the
+     *     first.
+     * @throws std::out_of_range for an index past devices();
+     *     std::runtime_error when no usable device.
+     */
+    explicit VulkanContext(int device = -1);
     ~VulkanContext();
 
     VulkanContext(const VulkanContext&) = delete;
