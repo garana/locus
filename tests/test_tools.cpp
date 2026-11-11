@@ -4,6 +4,8 @@
 
 using locus::server::detect_tool_call;
 using locus::server::parse_tools;
+using locus::server::render_tool_call;
+using locus::server::render_tool_result;
 using locus::server::render_tools_system;
 using nlohmann::json;
 
@@ -52,6 +54,21 @@ TEST_CASE("render_tools_system", "[tools]") {
     const std::string s = render_tools_system(tools);
     REQUIRE(s.find("ping") != std::string::npos);
     REQUIRE(s.find("\"arguments\"") != std::string::npos);
+}
+
+TEST_CASE("render_tool_call and render_tool_result", "[tools]") {
+    // OpenAI sends arguments as a JSON string; it renders as an object.
+    REQUIRE(render_tool_call("f", "{\"a\":1}") ==
+            "{\"arguments\":{\"a\":1},\"name\":\"f\"}");
+    REQUIRE(render_tool_call("f", json{{"a", 1}}) ==
+            render_tool_call("f", "{\"a\":1}"));
+    // A string that is not JSON stays a string; none is {}.
+    REQUIRE(render_tool_call("f", "oops") ==
+            "{\"arguments\":\"oops\",\"name\":\"f\"}");
+    REQUIRE(render_tool_call("f", json()) ==
+            "{\"arguments\":{},\"name\":\"f\"}");
+    REQUIRE(render_tool_result("f", "9") == "Tool result (f):\n9");
+    REQUIRE(render_tool_result("", "9") == "Tool result:\n9");
 }
 
 TEST_CASE("detect_tool_call", "[tools]") {

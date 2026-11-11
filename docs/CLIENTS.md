@@ -224,7 +224,36 @@ model that calls tools well. Codex sets no output limit and treats a
 reply cut at the server's cap as an error, so raise the cap too
 (`--max-tokens 8192`). Codex logs that it cannot decode the
 `/v1/models` reply (it expects its own catalog format) and then uses
-default model metadata; that is harmless.
+default model metadata; that is harmless. A streamed request with
+tools sends nothing until the reply is complete, and Codex reconnects
+when the stream stays silent for a few minutes (it did at 4.5 minutes,
+while a 30B MoE prefilled those 22k tokens on an M2 Pro). On slow
+hardware add `stream_idle_timeout_ms = 1800000` to the provider.
+
+### Google Antigravity SDK
+
+The SDK (`pip install google-antigravity`) reaches locus through
+`LocalOpenAIAgentConfig`, which speaks streamed Chat Completions:
+
+    from google.antigravity import Agent, LocalOpenAIAgentConfig
+
+    config = LocalOpenAIAgentConfig(
+        base_url="http://host:port/v1",
+        model="<the model name locus reports>",
+        tools=[my_function],
+    )
+    async with Agent(config) as agent:
+        print(await (await agent.chat("...")).text())
+
+Its first request is about 13k tokens (a long system prompt and 19
+built-in tools), so start the server with `--ctx 24576` or more, and
+use a model that calls tools well (Qwen3-Coder-30B-A3B works; a 1B
+model answers without calling the tool). It sends
+`max_completion_tokens: 65535`, so the server's `--max-tokens` sets
+the real cap. The SDK runs a bundled harness binary, which has its own
+built-in tools for file reads, file writes and commands; they are on by
+default, so point `workspaces` at a folder it may change. The
+Antigravity IDE has no documented way to use a custom endpoint.
 
 ### GitHub Copilot CLI (offline)
 
@@ -263,9 +292,12 @@ calling. Reliable agent use therefore needs a capable instruct model.
 - Tool execution: locus only expresses tool calls; it never runs them.
   Running them is the client's job (locus is a model runner, not an
   MCP host).
-- Content blocks: `tool_use` and `tool_result` blocks in requests are
-  dropped; only text (and images, with a vision model) reaches the
-  model.
+- Tool history: on `/v1/chat/completions` and `/v1/responses`, earlier
+  tool calls and their outputs reach the model as plain turns (the call
+  as its JSON, the output as a user turn that starts with "Tool
+  result"). On `/v1/messages`, `tool_use` and `tool_result` blocks are
+  still dropped (#590); only text (and images, with a vision model)
+  reaches the model.
 - Content arrays: on `/v1/chat/completions`, content may be a string
   or an array of parts (the OpenAI multimodal shape); text parts are
   joined with newlines. A part other than text or an image is a 400.

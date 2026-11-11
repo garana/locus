@@ -50,6 +50,30 @@ std::vector<ToolSpec> parse_tools(const nlohmann::json& body,
  */
 std::string render_tools_system(const std::vector<ToolSpec>& tools);
 
+/** Appended to the tools instruction when the history may hold tool
+ *  results: tells the model how they come back (render_tool_result). */
+inline constexpr const char* kToolResultNote =
+    "\nA tool's output comes back as a user message that starts with "
+    "\"Tool result\".";
+
+/**
+ * An earlier tool call in the history, as the assistant text the tools
+ * instruction asks for: {"name": ..., "arguments": {...}}.
+ *
+ * @param arguments A JSON object, or a string holding one (OpenAI);
+ *     a string that does not parse is kept as a string.
+ */
+std::string render_tool_call(const std::string& name,
+                             const nlohmann::json& arguments);
+
+/**
+ * A tool's output in the history, as the text of a user turn:
+ * "Tool result (name):\n" then the output ("Tool result:" when the
+ * name is unknown).
+ */
+std::string render_tool_result(const std::string& name,
+                               const std::string& output);
+
 /**
  * Detects a tool call in generated `text`: extracts the first
  * balanced {...}, parses it, accepts {name,arguments} or

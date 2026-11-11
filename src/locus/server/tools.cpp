@@ -50,6 +50,29 @@ std::string render_tools_system(const std::vector<ToolSpec>& tools) {
            "Otherwise, answer the user normally in plain text.";
 }
 
+std::string render_tool_call(const std::string& name,
+                             const json& arguments) {
+    json args = json::object();
+    if (arguments.is_string()) {
+        try {
+            args = json::parse(arguments.get<std::string>());
+        } catch (const std::exception&) {
+            args = arguments;  // keep it as sent
+        }
+    } else if (!arguments.is_null()) {
+        args = arguments;
+    }
+    return json{{"name", name}, {"arguments", args}}.dump(
+        -1, ' ', false, json::error_handler_t::replace);
+}
+
+std::string render_tool_result(const std::string& name,
+                               const std::string& output) {
+    std::string text = "Tool result";
+    if (!name.empty()) text += " (" + name + ")";
+    return text + ":\n" + output;
+}
+
 std::optional<ToolCall> detect_tool_call(
     const std::string& text, const std::vector<ToolSpec>& tools) {
     if (tools.empty()) {

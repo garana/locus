@@ -28,6 +28,7 @@
 #include "locus/model/transformer.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/server/server.hpp"
+#include "locus/server/tools.hpp"
 #include "locus/tok/tokenizer.hpp"
 #include "locus/video/ffmpeg.hpp"
 #include "httplib.h"
@@ -211,6 +212,36 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(content[0]["top_logprobs"].size() == 2);
     }
 
+    // i#279: the Antigravity SDK sends only max_completion_tokens;
+    // without it the limit fell back to 16.
+    SECTION("chat max_completion_tokens sets the output limit") {
+        const json msgs = json::array(
+            {{{"role", "user"}, {"content", "Once upon a time"}}});
+        const auto n_out = [&](const json& req) {
+            auto res = client.Post("/v1/chat/completions", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            return json::parse(res->body)["usage"]["completion_tokens"]
+                .get<int>();
+        };
+        CHECK(n_out({{"messages", msgs}, {"max_completion_tokens", 3}}) ==
+              3);
+        // It wins over max_tokens; a null one is ignored.
+        CHECK(n_out({{"messages", msgs},
+                     {"max_completion_tokens", 3},
+                     {"max_tokens", 5}}) == 3);
+        CHECK(n_out({{"messages", msgs},
+                     {"max_completion_tokens", nullptr},
+                     {"max_tokens", 2}}) == 2);
+        const json bad{{"messages", msgs}, {"max_completion_tokens", 0}};
+        auto res = client.Post("/v1/chat/completions", bad.dump(),
+                               "application/json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("max_completion_tokens") != std::string::npos);
+    }
+
     SECTION("chat completions, non-streaming") {
         json req{{"messages",
                   json::array(
@@ -288,6 +319,82 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(res->status == 200);
         auto body = json::parse(res->body);
         REQUIRE(body["choices"][0].contains("message"));
+    }
+
+    // i#279: an agent's second turn (the Antigravity SDK, OpenAI SDKs)
+    // sends the call back as tool_calls without content, then a "tool"
+    // message with its output. That history renders to the same prompt
+    // as the plain-text turns render_tool_call / render_tool_result give.
+    SECTION("chat tool history renders as plain turns") {
+        using namespace locus::server;
+        const json tools = json::array(
+            {{{"type", "function"},
+              {"function",
+               {{"name", "word_count"},
+                {"description", "count words"},
+                {"parameters", {{"type", "object"}}}}}}});
+        const json agent{
+            {"messages",
+             json::array(
+                 {{{"role", "user"}, {"content", "Once upon a time"}},
+                  {{"role", "assistant"},
+                   {"tool_calls",
+                    json::array({{{"id", "call_0"},
+                                  {"type", "function"},
+                                  {"function",
+                                   {{"name", "word_count"},
+                                    {"arguments",
+                                     "{\"path\":\"a.txt\"}"}}}}})}},
+                  {{"role", "tool"},
+                   {"tool_call_id", "call_0"},
+                   {"content", "9"}}})},
+            {"tools", tools},
+            {"max_tokens", 6}};
+        const std::string sys =
+            render_tools_system(parse_tools(json{{"tools", tools}}, false)) +
+            kToolResultNote;
+        const json plain{
+            {"messages",
+             json::array(
+                 {{{"role", "system"}, {"content", sys}},
+                  {{"role", "user"}, {"content", "Once upon a time"}},
+                  {{"role", "assistant"},
+                   {"content",
+                    render_tool_call("word_count", "{\"path\":\"a.txt\"}")}},
+                  {{"role", "user"},
+                   {"content", render_tool_result("word_count", "9")}}})},
+            {"max_tokens", 6}};
+        auto a = client.Post("/v1/chat/completions", agent.dump(),
+                             "application/json");
+        auto b = client.Post("/v1/chat/completions", plain.dump(),
+                             "application/json");
+        REQUIRE(a);
+        REQUIRE(b);
+        REQUIRE(a->status == 200);
+        REQUIRE(b->status == 200);
+        const json ja = json::parse(a->body), jb = json::parse(b->body);
+        CHECK(ja["usage"]["prompt_tokens"] == jb["usage"]["prompt_tokens"]);
+        CHECK(ja["choices"][0]["message"].value("content", "") ==
+              jb["choices"][0]["message"].value("content", ""));
+        // A tool message whose call is unknown still renders; a
+        // missing content without tool_calls is still a 400.
+        const json orphan{
+            {"messages",
+             json::array({{{"role", "tool"},
+                           {"tool_call_id", "nope"},
+                           {"content", "x"}}})},
+            {"max_tokens", 2}};
+        auto o = client.Post("/v1/chat/completions", orphan.dump(),
+                             "application/json");
+        REQUIRE(o);
+        CHECK(o->status == 200);
+        const json bare{
+            {"messages", json::array({{{"role", "assistant"}}})},
+            {"max_tokens", 2}};
+        auto e = client.Post("/v1/chat/completions", bare.dump(),
+                             "application/json");
+        REQUIRE(e);
+        CHECK(e->status == 400);
     }
 
     SECTION("chat tools + stream buffers and emits a final chunk") {
