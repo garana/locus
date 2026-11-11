@@ -28,3 +28,4 @@ tests/models
 *.swo
 .clangd/
 cmake-build-*/
+__pycache__/

@@ -173,8 +173,9 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   `--lora-dir` and the `lora` field apply converted ones, on the CPU
   and in the whole-step GPU forward), Qwen-Image-Edit (#529: the
   Qwen2.5-VL vision tower, from llama.cpp's mmproj GGUF, its language
-  model with M-RoPE (qwen2vl) and the VAE run on the CPU; the MMDiT
-  and an endpoint are not in yet), CNN image classifiers (#274:
+  model with M-RoPE (qwen2vl), the edit prompt's text conditioning and
+  the VAE run on the CPU; the MMDiT and an endpoint are not in yet),
+  CNN image classifiers (#274:
   ResNet-50 and Inception-v3 on `/v1/classify` and `/v1/embeddings`;
   the convs run on Vulkan when the GPU maps host memory).
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
