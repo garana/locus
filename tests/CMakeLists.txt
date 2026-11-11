@@ -59,6 +59,7 @@ add_executable(locus_tests
     test_http_client.cpp
     test_router.cpp
     test_http_server.cpp
+    test_loop_connection.cpp
     test_sampling.cpp
     test_speculative.cpp
     test_responses.cpp
