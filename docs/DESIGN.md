@@ -581,7 +581,10 @@ guarding the default path.
   token to recompute the last logits. Lookup is indexed by a 64-bit
   digest of each block boundary, so it costs O(prompt); the token
   sequence stays the verified key, so a collision never returns a
-  wrong prefix.
+  wrong prefix. A disk tier (`DiskPrefixStore`, i#416, not yet wired
+  into the engine) keeps one file per prefix with the full key, the
+  tokens and a checksum per block, so a mismatch or a torn file reads
+  as a miss; a byte cap evicts the least recently used file.
 - Speculative decoding: prompt lookup (no draft model). An n-gram
   match against the context proposes drafts, verified in one batched
   forward; the longest correct prefix is accepted. Greedy only, so
