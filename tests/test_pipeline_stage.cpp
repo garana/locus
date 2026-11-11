@@ -1199,12 +1199,12 @@ TEST_CASE("a stage loads only the model-level weights it runs",
         if (tied) {
             REQUIRE(last.output_weight().data == last.embedding().data);
         }
-        // The full GPU forward declines a slice: it has neither every
-        // layer nor, on a middle stage, the embedding or head.
+        // The GPU forward runs a slice too (i#565): it checks only the
+        // slice's layers, and the head on the last stage.
         REQUIRE(locus::backend::vulkan_forward_supported(full));
-        REQUIRE_FALSE(locus::backend::vulkan_forward_supported(first));
-        REQUIRE_FALSE(locus::backend::vulkan_forward_supported(mid));
-        REQUIRE_FALSE(locus::backend::vulkan_forward_supported(last));
+        REQUIRE(locus::backend::vulkan_forward_supported(first));
+        REQUIRE(locus::backend::vulkan_forward_supported(mid));
+        REQUIRE(locus::backend::vulkan_forward_supported(last));
 
         auto run = [](const TransformerModel& m) {
             return std::pair{m.make_cache(), m.make_workspace()};

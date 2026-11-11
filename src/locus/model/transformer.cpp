@@ -917,6 +917,15 @@ void TransformerModel::forward_layers(tok::TokenId token,
         seq.n_tokens += 1;
         return;
     }
+    // A Vulkan stage's slice runs on the GPU (i#565); the whole model
+    // reaches here only after vulkan_forward declined, so skip it then.
+    if (backend_->name == "vulkan" && (!first || !last) &&
+        vulkan_forward_layers(*this, token, hidden_in, layer_begin,
+                              layer_end, cache, seq, out, rows.begin,
+                              rows.end)) {
+        lap.lap(kNoLayer, Stage::kDevice);  // one submit, as forward()
+        return;
+    }
     const std::uint32_t pos = seq.n_tokens;
     const backend::Ops op =
         effective_ops(backend_, q8k_activations());

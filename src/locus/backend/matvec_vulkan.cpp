@@ -1962,13 +1962,12 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
  * (fused wkv_b goes through the F32-dequant path). */
 bool gpu_weights_ok(const model::TransformerModel& m) {
     const auto& hp = m.hparams();
-    // The full forward needs every layer, the embedding and the head;
-    // a pipeline stage's slice has only some of them (i#29).
-    if (m.layer_begin() != 0 || m.layer_end() != hp.n_layers) {
-        return false;
-    }
+    // A pipeline stage's slice loads only its layers [layer_begin(),
+    // layer_end()) (i#29), and the head only on the last stage; the
+    // embedding is read on the host. Check what the slice will run.
     const bool mla = hp.arch == model::Arch::kDeepseek2;
-    for (const auto& l : m.layers()) {
+    for (std::uint32_t i = m.layer_begin(); i < m.layer_end(); ++i) {
+        const auto& l = m.layers()[i];
         // The full GPU forward implements the llama / deepseek2
         // attention plus per-head q/k norms (qwen3moe); q/k/v biases
         // (qwen2moe) and any other extra take the CPU path.
@@ -2000,7 +1999,8 @@ bool gpu_weights_ok(const model::TransformerModel& m) {
             return false;
         }
     }
-    return matvec_kernel(m.output_weight()) != Kernel::kCount_;
+    return m.layer_end() != hp.n_layers ||
+           matvec_kernel(m.output_weight()) != Kernel::kCount_;
 }
 
 }  // namespace
@@ -2024,12 +2024,14 @@ bool vulkan_forward_supported(const model::TransformerModel& m) {
     return vulkan_hparams_supported(m.hparams()) && gpu_weights_ok(m);
 }
 
-bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
-                    kv::PagedKvCache& cache,
-                    kv::PagedKvCache::Seq& seq,
-                    std::span<float> logits, std::uint32_t row_begin,
-                    std::uint32_t row_end, std::span<const float> embd_in,
-                    std::span<float> normed_out) {
+bool vulkan_forward_layers(const model::TransformerModel& m,
+                           tok::TokenId token,
+                           std::span<const float> hidden_in,
+                           std::uint32_t layer_begin, std::uint32_t layer_end,
+                           kv::PagedKvCache& cache,
+                           kv::PagedKvCache::Seq& seq, std::span<float> out,
+                           std::uint32_t row_begin, std::uint32_t row_end,
+                           std::span<float> normed_out) {
     const auto& hp = m.hparams();
     std::lock_guard lk(state_mu());
     State& s = state();
@@ -2074,12 +2076,19 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     // Derive the block stride from the CACHE's layer count, not the
     // model's: under slice-only loading (DESIGN.md R15+) they differ,
     // and this stride must match the pool the offsets below index into.
-    // This full-forward path assumes a base-0 full-height cache (the
-    // loop below runs absolute layer l as the row index), which holds
-    // because Vulkan only runs the whole model in one process; a sliced
-    // cache would need l - geom.layer_base here and in the loop.
-    assert(geom.layer_base == 0 &&
-           "vulkan_forward assumes a base-0 full-height KV cache");
+    // A stage's cache holds only its slice: the loop runs absolute
+    // layer l and indexes the cache at l - layer_base (i#565).
+    if (layer_begin > layer_end || layer_end > hp.n_layers ||
+        layer_begin < geom.layer_base ||
+        layer_end > geom.layer_base + geom.n_layers ||
+        layer_begin < m.layer_begin() || layer_end > m.layer_end()) {
+        throw std::invalid_argument(
+            "vulkan_forward_layers: layer range outside the cache or "
+            "the loaded slice");
+    }
+    if (out.size() != (layer_end == hp.n_layers ? hp.n_vocab : hp.n_embd)) {
+        throw std::invalid_argument("vulkan_forward_layers: wrong out size");
+    }
     const std::uint32_t block_stride =
         geom.n_layers * layer_stride;
     // Quantized byte strides (R14 #45); unused on the F32 path.
@@ -2166,12 +2175,14 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     // CPU side: embedding lookup (or the given input embedding) and
     // this token's block table.
     std::vector<float> x_host(hp.n_embd);
-    if (!embd_in.empty()) {
-        if (embd_in.size() != hp.n_embd) {
+    if (!hidden_in.empty() || layer_begin > 0) {
+        // A later stage's residual stream, or at layer 0 the input
+        // embedding used instead of the token's row.
+        if (hidden_in.size() != hp.n_embd) {
             throw std::invalid_argument(
-                "vulkan_forward: an input embedding must be n_embd");
+                "vulkan_forward_layers: hidden_in must be n_embd");
         }
-        std::copy(embd_in.begin(), embd_in.end(), x_host.begin());
+        std::copy(hidden_in.begin(), hidden_in.end(), x_host.begin());
     } else {
         dequant_row(m.embedding(), static_cast<std::uint32_t>(token),
                     x_host);
@@ -2270,10 +2281,12 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
 
     s.ctx.begin_batch();
     State::BatchScope batch_scope{s};
-    for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
+    for (std::uint32_t l = layer_begin; l < layer_end; ++l) {
         const auto& lay = m.layers()[l];
+        // The cache's own layer index: a stage holds only its slice.
+        const std::uint32_t rel = l - geom.layer_base;
         const std::uint32_t row_off = block * block_stride +
-                                      l * layer_stride +
+                                      rel * layer_stride +
                                       in_block * kv_dim;
 
         norm(lay.attn_norm, s.x, s.xb, hp.n_embd, 0);
@@ -2404,14 +2417,14 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                                                           s.table};
                     const std::uint32_t push[] = {
                         kv_dim, pos,           geom.block_tokens,
-                        block_stride, kv_dim,  l * layer_stride,
+                        block_stride, kv_dim,  rel * layer_stride,
                         0,      kv_dim,        kv_dim,
                         layer_stride / 2};
                     rec_kv_scatter(s, true, bufs, push, 1, 2);
                 }
                 rec_attn_gqa(s, pp, s.q, s.att, s.attout, 1, pos,
                              hp.n_heads, group, hp.head_dim,
-                             hp.n_heads * hp.head_dim, l * layer_stride,
+                             hp.n_heads * hp.head_dim, rel * layer_stride,
                              layer_stride / 2);
             } else {
                 // R14 #45: K/V into F32 scratch (reuse the FFN
@@ -2431,7 +2444,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                                    hp.n_kv_heads);
                 }
                 const std::uint32_t dst_k = block * q_block_b +
-                                            l * q_layer_b +
+                                            rel * q_layer_b +
                                             in_block * q_row_b;
                 const std::uint32_t dst_v =
                     dst_k + geom.block_tokens * q_row_b;
@@ -2458,7 +2471,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                         hp.n_heads,   group,
                         hp.head_dim,  kv_dim,
                         pos + 1,      geom.block_tokens,
-                        q_block_b,    l * q_layer_b,
+                        q_block_b,    rel * q_layer_b,
                         geom.block_tokens * q_row_b,
                         q_row_b,      kv_code};
                     s.ctx.dispatch(Kernel::kAttnPagedQ, bufs, push,
@@ -2547,7 +2560,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                                                       s.table};
                 const std::uint32_t push[] = {
                     rank + rope_d, pos,      geom.block_tokens,
-                    block_stride,  kv_dim,   l * layer_stride,
+                    block_stride,  kv_dim,   rel * layer_stride,
                     0,             0,        0,
                     0};
                 rec_kv_scatter(s, true, bufs, push, 1, 1);
@@ -2591,7 +2604,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                 }
             }
             rec_attn_mla(s, pp, s.q, s.q_abs, s.att, s.latent, 1, pos,
-                         hp.n_heads, rank, nope, rope_d, l * layer_stride,
+                         hp.n_heads, rank, nope, rope_d, rel * layer_stride,
                          hp.kq_scale);
             if (kv_q8) {
                 // W_uv: head h's vd rows start at row h * (nope + vd)
@@ -2861,6 +2874,16 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
             mark(s, model::Stage::kMoe);
         }
     }
+    if (layer_end < hp.n_layers) {
+        // A stage before the last hands the residual stream on: no
+        // final norm or head, and the token is not consumed here (the
+        // last stage advances seq, as forward_layers does).
+        s.end_batch();
+        s.ctx.read_buffer(s.x,
+                          std::as_writable_bytes(out.first(hp.n_embd)));
+        s.ctx.note_token();
+        return true;
+    }
     norm(m.output_norm(), s.x, s.xb, hp.n_embd, 0);
     mark(s, model::Stage::kNorm);
     const Mat& out_w = m.output_weight();
@@ -2880,7 +2903,7 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     mark(s, model::Stage::kHead);
     s.end_batch();
 
-    s.ctx.read_buffer(s.logits, std::as_writable_bytes(logits));
+    s.ctx.read_buffer(s.logits, std::as_writable_bytes(out));
     if (!normed_out.empty()) {
         s.ctx.read_buffer(
             s.xb, std::as_writable_bytes(normed_out.first(hp.n_embd)));
@@ -2888,6 +2911,17 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
     s.ctx.note_token();
     seq.n_tokens = pos + 1;
     return true;
+}
+
+bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
+                    kv::PagedKvCache& cache,
+                    kv::PagedKvCache::Seq& seq,
+                    std::span<float> logits, std::uint32_t row_begin,
+                    std::uint32_t row_end, std::span<const float> embd_in,
+                    std::span<float> normed_out) {
+    return vulkan_forward_layers(m, token, embd_in, 0, m.hparams().n_layers,
+                                 cache, seq, logits, row_begin, row_end,
+                                 normed_out);
 }
 
 bool vulkan_forward_multi(const model::TransformerModel& m,
@@ -2944,8 +2978,10 @@ bool vulkan_forward_multi(const model::TransformerModel& m,
         }
     }
     const auto& geom = cache.geometry();
-    assert(geom.layer_base == 0 &&
-           "vulkan_forward_multi assumes a base-0 full-height KV cache");
+    if (geom.layer_base != 0 || geom.n_layers != hp.n_layers ||
+        m.layer_begin() != 0 || m.layer_end() != hp.n_layers) {
+        return false;  // a stage's slice: whole models only here
+    }
     const std::uint32_t E = hp.n_embd, hd = hp.head_dim, H = hp.n_heads;
     const std::uint32_t ff = hp.n_ff;
     const std::uint32_t kv_dim = geom.kv_dim;
@@ -3222,8 +3258,10 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     if (base + n > hp.n_ctx || base + n > cache.capacity(seq)) {
         throw std::invalid_argument("seq capacity not ensured");
     }
-    assert(geom.layer_base == 0 &&
-           "vulkan_forward_batch assumes a base-0 full-height KV cache");
+    if (geom.layer_base != 0 || geom.n_layers != hp.n_layers ||
+        m.layer_begin() != 0 || m.layer_end() != hp.n_layers) {
+        return false;  // a stage's slice: whole models only here
+    }
 
     const std::uint32_t E = hp.n_embd;
     const std::uint32_t H = hp.n_heads;

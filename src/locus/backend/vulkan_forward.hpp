@@ -56,6 +56,32 @@ bool vulkan_forward(const model::TransformerModel& m, tok::TokenId token,
                     std::span<float> normed_out = {});
 
 /**
+ * vulkan_forward over layers [layer_begin, layer_end) only (i#565), the
+ * GPU counterpart of TransformerModel::forward_layers for a pipeline
+ * stage. Layer indices are absolute; the cache may hold only a slice
+ * starting at its geometry's layer_base.
+ *
+ * @param hidden_in At layer 0, an optional input embedding (as
+ *     vulkan_forward's embd_in); after it, the n_embd residual stream
+ *     from the previous stage.
+ * @param out The logits when layer_end is the model's last layer
+ *     (seq advances); otherwise the n_embd residual stream, before the
+ *     final norm, for the next stage (seq does not advance).
+ * @throws std::invalid_argument when the range is outside the cache's
+ *     slice or hidden_in has the wrong size.
+ * @returns false when unsupported, as vulkan_forward.
+ */
+bool vulkan_forward_layers(const model::TransformerModel& m,
+                           tok::TokenId token,
+                           std::span<const float> hidden_in,
+                           std::uint32_t layer_begin, std::uint32_t layer_end,
+                           kv::PagedKvCache& cache,
+                           kv::PagedKvCache::Seq& seq, std::span<float> out,
+                           std::uint32_t row_begin = 0,
+                           std::uint32_t row_end = 0,
+                           std::span<float> normed_out = {});
+
+/**
  * Runs one position for each of several sequences of one cache in a
  * single command batch (i#267: Janus's two CFG sequences). Every
  * projection reads its weights once for all the sequences (the
