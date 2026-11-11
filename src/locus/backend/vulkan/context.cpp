@@ -45,6 +45,8 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ8_0NGluNg:
         case Kernel::kMatvecQ8_0N2:
         case Kernel::kMatvecQ8_0N2Glu:
+        case Kernel::kMatvecQ8_0N4:
+        case Kernel::kMatvecQ8_0N4Glu:
         case Kernel::kMatvecQ8_0P:
         case Kernel::kMatvecQ8_0GluP:
         case Kernel::kMatvecF32N:
@@ -257,6 +259,8 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matvec_q8_0_n_glu_ng_spv.h"
 #include "matvec_q8_0_n2_spv.h"
 #include "matvec_q8_0_n2_glu_spv.h"
+#include "matvec_q8_0_n4_spv.h"
+#include "matvec_q8_0_n4_glu_spv.h"
 #include "rope_neox_spv.h"
 #include "rope_neox_b_spv.h"
 #include "matvec_q4_k_b_spv.h"
@@ -629,6 +633,11 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_matvec_q4_k_n_glu_spv), 4, 52},
     {Kernel::kMatvecQ4_KN2Glu, "matvec_q4_k_n2_glu",
      locus_matvec_q4_k_n2_glu_spv, sizeof(locus_matvec_q4_k_n2_glu_spv), 4,
+     52},
+    {Kernel::kMatvecQ8_0N4, "matvec_q8_0_n4", locus_matvec_q8_0_n4_spv,
+     sizeof(locus_matvec_q8_0_n4_spv), 3, 52},
+    {Kernel::kMatvecQ8_0N4Glu, "matvec_q8_0_n4_glu",
+     locus_matvec_q8_0_n4_glu_spv, sizeof(locus_matvec_q8_0_n4_glu_spv), 4,
      52},
 };
 

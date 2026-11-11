@@ -29,12 +29,15 @@
 // -DNT2 (the *_n2 builds) caps the tokens at 2: the 8-wide token loop
 // and its 8-plane reduction cost as much as the weight read, so two
 // tokens through the NT 8 build took as long as two matvecs; the NT 2
-// build takes as long as one (MoltenVK, 5632 x 2048 BF16).
+// build takes as long as one (MoltenVK, 5632 x 2048 BF16). -DNT4 (the
+// *_n4 builds) caps them at 4, for batches of 3 or 4 (#516).
 
 #define LANES 32u
 #define ROWS 4u
 #ifdef NT2
 #define NT 2u           // max tokens per dispatch (the *_n2 builds)
+#elif defined(NT4)
+#define NT 4u           // the *_n4 builds, for 3 or 4 tokens
 #else
 #define NT 8u           // max tokens per dispatch
 #endif

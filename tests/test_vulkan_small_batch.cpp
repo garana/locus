@@ -361,7 +361,7 @@ TEST_CASE("vulkan short-batch SwiGLU matches the CPU and keeps a "
     for (auto b : {gb, ub, xb}) ctx.destroy_buffer(b);
 }
 
-// #432: the NT 8, guard-free and NT 2 builds of matvec_q8_0_n (and
+// #432: the NT 8, guard-free, NT 2 and NT 4 builds of matvec_q8_0_n (and
 // _glu) run the same per-token arithmetic, so batch-invariant decode
 // may pick one by batch size; this checks a token's output is the same
 // bits from each build on this device.
@@ -376,10 +376,10 @@ TEST_CASE("vulkan short-batch builds give the same bits", "[vulkan]") {
     const auto wu = random_q8(rows, cols, rng);
     auto gb = upload_q8(ctx, wg, rows, cols);
     auto ub = upload_q8(ctx, wu, rows, cols);
-    const auto x = random_floats(std::size_t{2} * cols, rng);
+    const auto x = random_floats(std::size_t{4} * cols, rng);
     auto xb = upload(ctx, x);
     const auto run = [&](Kernel k, bool glu, std::uint32_t n_tok) {
-        auto ob = upload(ctx, std::vector<float>(2 * rows, 0.0f));
+        auto ob = upload(ctx, std::vector<float>(4 * rows, 0.0f));
         ctx.begin_batch();
         const std::uint32_t push[] = {rows,  cols, 0, 0, 0, 0, fbits(1.0f),
                                       n_tok, cols, rows, 0, 0, 0};
@@ -391,7 +391,7 @@ TEST_CASE("vulkan short-batch builds give the same bits", "[vulkan]") {
             ctx.dispatch(k, b3, push, VulkanContext::matvec_groups(k, rows));
         }
         ctx.end_batch();
-        auto out = download(ctx, ob, 2 * rows);
+        auto out = download(ctx, ob, 4 * rows);
         ctx.destroy_buffer(ob);
         return out;
     };
@@ -402,11 +402,16 @@ TEST_CASE("vulkan short-batch builds give the same bits", "[vulkan]") {
             glu ? Kernel::kMatvecQ8_0NGluNg : Kernel::kMatvecQ8_0NNg;
         const Kernel k2 =
             glu ? Kernel::kMatvecQ8_0N2Glu : Kernel::kMatvecQ8_0N2;
-        for (const std::uint32_t n_tok : {1u, 2u}) {
+        const Kernel k4 =
+            glu ? Kernel::kMatvecQ8_0N4Glu : Kernel::kMatvecQ8_0N4;
+        for (const std::uint32_t n_tok : {1u, 2u, 3u, 4u}) {
             INFO("n_tok " << n_tok);
             const auto a = run(k8, glu, n_tok);
             REQUIRE(run(kng, glu, n_tok) == a);
-            REQUIRE(run(k2, glu, n_tok) == a);
+            REQUIRE(run(k4, glu, n_tok) == a);
+            if (n_tok <= 2) {
+                REQUIRE(run(k2, glu, n_tok) == a);
+            }
         }
     }
     for (auto b : {gb, ub, xb}) ctx.destroy_buffer(b);
