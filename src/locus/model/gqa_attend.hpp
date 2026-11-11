@@ -234,16 +234,28 @@ void gqa_attend_batch(const float* q, float* out, std::size_t q_stride,
                       std::uint32_t n_heads, std::uint32_t hd,
                       std::uint32_t group, float kq_scale,
                       const KRow& krow_at, const VRow& vrow_at) {
-    constexpr std::uint32_t kBlock = 8;  // query tokens per task
+    // Query tokens per task: at most 8, few enough that every pool
+    // thread gets a task (a short chunk, a speculative verify), and few
+    // enough at long context that a task's scores (tokens x group x
+    // positions floats, thread_local) stay under about 4 MB. The block
+    // size changes no query's arithmetic.
+    constexpr std::uint64_t kMaxScores = std::uint64_t{1} << 20;
     const std::uint32_t n_kv = n_heads / group;
-    const std::uint32_t n_blocks = (n + kBlock - 1) / kBlock;
+    const std::uint64_t per_token = std::uint64_t{group} * (base + n);
+    const std::uint64_t fan = std::max<std::size_t>(mt_fanout(), 1);
+    const std::uint64_t by_threads = (std::uint64_t{n} * n_kv + fan - 1) / fan;
+    const std::uint64_t by_memory =
+        kMaxScores / std::max<std::uint64_t>(per_token, 1);
+    const auto block = static_cast<std::uint32_t>(
+        std::clamp<std::uint64_t>(std::min(by_threads, by_memory), 1, 8));
+    const std::uint32_t n_blocks = (n + block - 1) / block;
     const std::size_t items = std::size_t{n_kv} * n_blocks;
     const std::size_t t = std::min<std::size_t>(mt_fanout(), items);
     auto item = [&](std::size_t i) {
         const auto g = static_cast<std::uint32_t>(i % n_kv);
         const auto b = static_cast<std::uint32_t>(i / n_kv);
-        const std::uint32_t t0 = b * kBlock;
-        gqa_kv_block(q, out, q_stride, t0, std::min(n, t0 + kBlock), base,
+        const std::uint32_t t0 = b * block;
+        gqa_kv_block(q, out, q_stride, t0, std::min(n, t0 + block), base,
                      g, hd, group, kq_scale, krow_at, vrow_at);
     };
     if (t <= 1) {
