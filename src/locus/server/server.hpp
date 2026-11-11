@@ -86,7 +86,7 @@ class OpenAiServer {
         /** Hard cap applied to requested max_tokens. */
         std::uint32_t max_tokens_cap = 1024;
         /** Max HTTP request body accepted before the handler runs;
-         * httplib buffers the whole body into memory, so an
+         * the server buffers the whole body into memory, so an
          * unbounded Content-Length is an unauthenticated OOM. Bodies
          * over this get 413. Default 16 MiB. */
         std::size_t max_body_bytes = 16u * 1024 * 1024;

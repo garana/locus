@@ -61,7 +61,8 @@ class WallClock final : public Clock {
  * insert, so one insert never walks the whole list.
  *
  * Single-threaded: the caller serializes access (in locus, the auth
- * layer holds a mutex around it, since httplib is thread-per-request).
+ * layer holds a mutex around it, since http::Server runs a thread per
+ * connection).
  */
 class TokenCache {
   public:

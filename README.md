@@ -230,7 +230,7 @@ runs, but slower than neon.
 
 No runtime dependencies beyond the C and C++ libraries and the OS.
 Vendored, pinned and checksummed (see DESIGN.md section 6): Catch2
-(tests only), cpp-httplib, nlohmann/json, and ggml's IQ lookup
+and cpp-httplib (tests only), nlohmann/json, and ggml's IQ lookup
 tables. Image input (PNG, JPEG) uses locus's own decoders. Optional,
 found at configure time: the Vulkan loader and a shader compiler, the
 CUDA toolkit.

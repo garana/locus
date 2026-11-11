@@ -9,10 +9,10 @@
 namespace locus::http {
 
 /**
- * First-party HTTP/1.1 request parser + response writer (issue 23),
- * replacing the vendored httplib. This module is PURE: it never touches
+ * First-party HTTP/1.1 request parser + response writer (issue 23).
+ * This module is PURE: it never touches
  * a socket. The parser is fed bytes the caller has read and reports how
- * many it consumed, so the connection loop (increment 2) owns all I/O
+ * many it consumed, so the connection loop (http::Server) owns all I/O
  * and can parse the next request from the same buffer on a keep-alive
  * connection. Being socket-free is also what makes it fuzzable.
  *
@@ -35,9 +35,8 @@ struct Limits {
     std::size_t max_trailer_bytes = 4 * 1024;   /**< chunked trailers. */
 };
 
-/** A parsed HTTP/1.1 request. Plain data; the connection layer wraps it
- * in the handler-facing shim (increment 2). Header lookups are
- * case-insensitive per RFC 9110. */
+/** A parsed HTTP/1.1 request. Plain data; http::Server hands it to the
+ * route handlers. Header lookups are case-insensitive per RFC 9110. */
 struct Request {
     std::string method;        /**< e.g. "GET", "POST", "HEAD". */
     std::string target;        /**< raw request-target (path?query). */
@@ -225,7 +224,7 @@ bool write_chunked_head(const Response& res, bool keep_alive,
 std::string status_reason(int status);
 
 /** Encodes one chunked-transfer chunk -- `<hex size>CRLF<data>CRLF` --
- * for SSE streaming (increment 2's DataSink). Empty `data` is NOT the
+ * for SSE streaming (http::Server's Sink). Empty `data` is NOT the
  * terminator; use last_chunk() for that. */
 std::string encode_chunk(std::string_view data);
 

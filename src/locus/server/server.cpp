@@ -1344,9 +1344,8 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
     http::ServerConfig cfg;
     cfg.host = host;
     cfg.port = port;
-    // Preserve the oversize-body 413-on-head cap httplib gave us via
-    // set_payload_max_length: the parser rejects a too-large declared
-    // body on the head, before the body is read.
+    // The oversize-body cap: the parser answers 413 to a too-large
+    // declared body on the head, before the body is read.
     cfg.limits.max_body_bytes = opt_.max_body_bytes;
     // Serve the cheap monitoring routes on the acceptor's fast path so
     // they answer even when every worker is busy in a generation.
@@ -1902,8 +1901,8 @@ void OpenAiServer::install_routes() {
             "text/event-stream",
             [this, id, chat, rid, sse_object, state, tools_sp,
              buffer_tools](http::Sink& sink) {
-              // The shim calls a provider ONCE; loop until terminal,
-              // one chunk per progress step (httplib re-invoked instead).
+              // The server calls a provider ONCE; loop until terminal,
+              // one chunk per progress step.
               for (;;) {
                 auto v = loop_.wait_progress(id, *state);
                 std::string payload;
@@ -3866,7 +3865,7 @@ void OpenAiServer::install_routes() {
                 handle_video_content(req, res);
                 break;
             case Route::kUnknown:
-                res.status = 404;  // httplib's default: 404, empty body
+                res.status = 404;  // an unknown route: 404, empty body
                 break;
         }
     };
