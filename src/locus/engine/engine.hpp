@@ -277,6 +277,15 @@ class Engine {
     /** Invoked after each newly sampled token (streaming). */
     std::function<void(const Request&, tok::TokenId)> on_token;
 
+    /**
+     * Fails every running request with `why` (frees their blocks).
+     * For a step() that threw (a lost GPU, i#589): the requests it was
+     * stepping get an error instead of the process ending; waiting
+     * ones stay queued.
+     * @returns How many requests were failed.
+     */
+    std::size_t fail_running(const std::string& why);
+
     std::uint32_t free_blocks() const {
         return cache_.free_blocks();
     }

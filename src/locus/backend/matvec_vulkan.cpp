@@ -2121,25 +2121,33 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
     auto fit = s.moe_gpu_fits.find(&m);
     if (fit == s.moe_gpu_fits.end()) {
         // Experts imported in place (#317: every type but Q8_0's
-        // repacked rows) take no device memory of their own.
-        std::uint64_t experts = 0;
+        // repacked rows) take no device memory of their own, except on
+        // Apple: there an imported buffer counts toward the GPU's
+        // working set like any other (i#589: Qwen3-Coder's 16 GiB of
+        // experts plus a 7.5 GiB KV pool lost the device).
+        std::uint64_t copied = 0, imported = 0;
         for (const auto& l : m.layers()) {
             if (!l.is_moe()) {
                 continue;
             }
             for (const auto* em : {&l.gate_exps, &l.up_exps, &l.down_exps}) {
+                const std::uint64_t b = em->expert_bytes * hp.n_expert;
                 if (!s.ctx.host_import() ||
                     em->base.type == gguf::TensorType::kQ8_0) {
-                    experts += em->expert_bytes * hp.n_expert;
+                    copied += b;
+                } else if (s.ctx.moltenvk()) {
+                    imported += b;
                 }
             }
         }
+        const std::uint64_t experts = copied + imported;
         const std::uint64_t avail = s.ctx.memory_available();
-        fit = s.moe_gpu_fits.emplace(&m, vk::moe_experts_fit(experts, avail))
+        fit = s.moe_gpu_fits
+                  .emplace(&m, vk::moe_experts_fit(copied, imported, avail))
                   .first;
         if (!fit->second) {
             std::fprintf(stderr,
-                         "[vulkan] MoE experts (%llu MB) exceed 80%% of "
+                         "[vulkan] MoE experts (%llu MB) do not fit the "
                          "available device memory (%llu MB): routing "
                          "on the host (a smaller --ctx or --kv-type "
                          "f16 frees room)\n",

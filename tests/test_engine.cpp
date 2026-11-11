@@ -845,6 +845,41 @@ TEST_CASE("decode growth reclaims prefix-cache blocks before failing",
     REQUIRE(r->generated == want);        // reclaim is byte-neutral
 }
 
+// i#589: after a step() that throws (a lost GPU), fail_running() fails
+// the running requests with the reason and frees their blocks; a
+// waiting one stays queued and then runs normally.
+TEST_CASE("engine fail_running fails running requests and frees KV",
+          "[engine]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const auto prompt = tok.encode("Once upon a time", true);
+
+    Engine::Config cfg;
+    cfg.max_running = 1;  // the second request waits
+    Engine engine(model, tok.eos_id(), cfg);
+    const auto a = engine.submit(prompt, 64);
+    const auto b = engine.submit(prompt, 8);
+    for (int i = 0; i < 16 && engine.get(a)->generated.empty(); ++i) {
+        engine.step();
+    }
+    REQUIRE(engine.get(a)->status == Status::kRunning);
+    REQUIRE(engine.get(b)->status == Status::kWaiting);
+
+    REQUIRE(engine.fail_running("vulkan: wait idle") == 1);
+    REQUIRE(engine.get(a)->status == Status::kFailed);
+    REQUIRE(engine.get(a)->error == "vulkan: wait idle");
+    REQUIRE(engine.free_blocks() == engine.total_blocks());
+
+    engine.run_to_completion();
+    REQUIRE(engine.get(b)->status == Status::kDone);
+    REQUIRE(engine.get(b)->generated.size() == 8);
+    REQUIRE(engine.fail_running("x") == 0);  // nothing running
+}
+
 // i#81: cancel() stops a RUNNING request early, frees its KV blocks,
 // and marks it kCancelled -- the primitive the server uses when a
 // client disconnects so an abandoned request does not run to
