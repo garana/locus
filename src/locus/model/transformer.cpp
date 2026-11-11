@@ -1181,9 +1181,11 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     if (n == 0) {
         throw std::invalid_argument("forward_batch: empty batch");
     }
+    // The GPU paths below return before the output branch: refuse them
+    // rather than hand back logits as hidden states.
     if (hidden_only &&
         (all_logits || backend_->name == "vulkan" ||
-         spec_->forward != nullptr ||
+         backend_->name == "cuda" || spec_->forward != nullptr ||
          logits.size() != std::size_t{n} * hp_.n_embd)) {
         throw std::invalid_argument(
             "forward_batch: hidden_only needs a CPU backend, the llama "
