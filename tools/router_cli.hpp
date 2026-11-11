@@ -38,7 +38,9 @@ inline constexpr const char* kRouterUsage =
     "network whose hosts you trust.\n"
     "\n"
     "options:\n"
-    "  --listen HOST:PORT  address to serve on (default 0.0.0.0:8080)\n"
+    "  --listen HOST:PORT  address to serve on (default :8080: every\n"
+    "                      interface, IPv6 and IPv4; 0.0.0.0:PORT for\n"
+    "                      IPv4 only)\n"
     "  --refresh-ms N      how often each instance's /v1/models is\n"
     "                      read again (default 10000)\n"
     "  --auth-helper PATH  check client keys with this auth helper\n"
@@ -81,7 +83,6 @@ inline std::string parse_router_args(int argc, char** argv, int first,
                                                  cfg.port)) {
                 return std::string("bad --listen address: ") + argv[i];
             }
-            if (cfg.host.empty()) cfg.host = "0.0.0.0";
         } else if (a == "--refresh-ms" && i + 1 < argc) {
             int n = 0;
             if (!parse_nonneg_int(argv[++i], n) || n == 0) {

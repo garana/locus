@@ -129,7 +129,9 @@ inline constexpr std::size_t kMaxInstances = 1024;
 
 /** Router settings. */
 struct RouterConfig {
-    std::string host = "0.0.0.0";
+    /** "" (the default): every interface, IPv6 and IPv4 on one socket,
+     *  as locus-server; "0.0.0.0": IPv4 only. */
+    std::string host;
     int port = 8080;
     /** Instances as host:port (a name is resolved on each connect), or
      * "srv:NAME": the targets of NAME's DNS SRV records (the lowest
