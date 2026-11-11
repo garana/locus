@@ -461,17 +461,18 @@ TEST_CASE("vulkan K-quant short-batch matvecs match the CPU per token",
     using locus::gguf::TensorType;
     struct Case {
         TensorType type;
-        Kernel k8, k2;
+        Kernel k8, k2, k4;
         const char* name;
         std::size_t block;
     };
     const std::uint32_t rows = 21, cols = 768, n_batch = 2;
     for (const auto& c :
          {Case{TensorType::kQ4_K, Kernel::kMatvecQ4_KN, Kernel::kMatvecQ4_KN2,
-               "q4_k", 144},
+               Kernel::kMatvecQ4_KN4, "q4_k", 144},
           Case{TensorType::kQ6_K, Kernel::kMatvecQ6_KN, Kernel::kMatvecQ6_KN2,
-               "q6_k", 210}}) {
-        const std::size_t mat_bytes = std::size_t{rows} * (cols / 256) * c.block;
+               Kernel::kMatvecQ6_KN4, "q6_k", 210}}) {
+        const std::size_t mat_bytes =
+            std::size_t{rows} * (cols / 256) * c.block;
         const auto w = random_kq(c.type, rows * n_batch, cols, rng);
         auto wb = upload(ctx, w);
         // Token rows x_stride apart, batches x_bstride apart; x_off 3
@@ -526,12 +527,16 @@ TEST_CASE("vulkan K-quant short-batch matvecs match the CPU per token",
                         }
                     }
                 }
-                // Tokens 0 and 1 the same bits through NT 8 at n = 1,
-                // 2 and 8, and NT 2 at n = 1 and 2.
+                // A token's bits the same through NT 8 at n = 1, 2 and
+                // 8, NT 2 at n = 1 and 2, and NT 4 at n = 3 and 4.
                 for (const auto& [k, n] :
                      {std::pair{c.k8, 1u}, std::pair{c.k8, 2u},
-                      std::pair{c.k2, 1u}, std::pair{c.k2, 2u}}) {
-                    INFO("n_tok " << n << (k == c.k2 ? " nt2" : " nt8"));
+                      std::pair{c.k2, 1u}, std::pair{c.k2, 2u},
+                      std::pair{c.k4, 3u}, std::pair{c.k4, 4u}}) {
+                    INFO("n_tok " << n
+                                  << (k == c.k2   ? " nt2"
+                                      : k == c.k4 ? " nt4"
+                                                  : " nt8"));
                     const auto got = run(k, n, x_off, x);
                     for (std::uint32_t b = 0; b < n_batch; ++b) {
                         for (std::uint32_t t = 0; t < n; ++t) {
@@ -551,7 +556,7 @@ TEST_CASE("vulkan K-quant short-batch matvecs match the CPU per token",
 }
 
 // #436: matvec_q4_k_n_glu (gate, up and silu_mul in one) against the
-// CPU, and its NT 8 and NT 2 builds giving a token the same bits.
+// CPU, and its NT 8, NT 2 and NT 4 builds giving a token the same bits.
 TEST_CASE("vulkan Q4_K short-batch SwiGLU matches the CPU", "[vulkan]") {
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");
@@ -592,7 +597,9 @@ TEST_CASE("vulkan Q4_K short-batch SwiGLU matches the CPU", "[vulkan]") {
     }
     for (const auto& [k, n] : {std::pair{Kernel::kMatvecQ4_KNGlu, 1u},
                                std::pair{Kernel::kMatvecQ4_KN2Glu, 1u},
-                               std::pair{Kernel::kMatvecQ4_KN2Glu, 2u}}) {
+                               std::pair{Kernel::kMatvecQ4_KN2Glu, 2u},
+                               std::pair{Kernel::kMatvecQ4_KN4Glu, 3u},
+                               std::pair{Kernel::kMatvecQ4_KN4Glu, 4u}}) {
         INFO("n_tok " << n);
         const auto got = run(k, n);
         for (std::uint32_t i = 0; i < n * rows; ++i) {

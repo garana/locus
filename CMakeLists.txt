@@ -334,6 +334,9 @@ if(Vulkan_FOUND)
             matvec_q4_k_n2=matvec_k_n:Q4K,NT2
             matvec_q4_k_n_glu=matvec_k_n:Q4K,SWIGLU
             matvec_q4_k_n2_glu=matvec_k_n:Q4K,SWIGLU,NT2
+            matvec_q4_k_n4=matvec_k_n:Q4K,NT4
+            matvec_q4_k_n4_glu=matvec_k_n:Q4K,SWIGLU,NT4
+            matvec_q6_k_n4=matvec_k_n:Q6K,NT4
             matvec_q6_k_n=matvec_k_n:Q6K
             matvec_q6_k_n2=matvec_k_n:Q6K,NT2)
         # Limits shared with the host, read from their one definition.

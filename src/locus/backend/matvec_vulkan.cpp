@@ -945,6 +945,7 @@ Kernel matmul_id_kernel(const Mat& w) {
  * matvec_k_n.comp). */
 Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
     const bool two = n_tok <= 2;
+    const bool four = n_tok <= 4;  // K-quants' NT 4 builds (#541)
     switch (w.type) {
         case gguf::TensorType::kQ8_0: return Kernel::kMatvecQ8_0N;
         case gguf::TensorType::kF32: return Kernel::kMatvecF32N;
@@ -953,9 +954,13 @@ Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
         case gguf::TensorType::kBF16:
             return two ? Kernel::kMatvecBF16N2 : Kernel::kMatvecBF16N;
         case gguf::TensorType::kQ4_K:
-            return two ? Kernel::kMatvecQ4_KN2 : Kernel::kMatvecQ4_KN;
+            return two    ? Kernel::kMatvecQ4_KN2
+                   : four ? Kernel::kMatvecQ4_KN4
+                          : Kernel::kMatvecQ4_KN;
         case gguf::TensorType::kQ6_K:
-            return two ? Kernel::kMatvecQ6_KN2 : Kernel::kMatvecQ6_KN;
+            return two    ? Kernel::kMatvecQ6_KN2
+                   : four ? Kernel::kMatvecQ6_KN4
+                          : Kernel::kMatvecQ6_KN;
         default: return Kernel::kCount_;
     }
 }
@@ -3195,8 +3200,9 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
                                           E,  ff, 0, 0, 0};
             const Kernel k =
                 gt == gguf::TensorType::kQ4_K
-                    ? (n <= 2 ? Kernel::kMatvecQ4_KN2Glu
-                              : Kernel::kMatvecQ4_KNGlu)
+                    ? (n <= 2   ? Kernel::kMatvecQ4_KN2Glu
+                       : n <= 4 ? Kernel::kMatvecQ4_KN4Glu
+                                : Kernel::kMatvecQ4_KNGlu)
                     : q8n_variant(s.ctx, Kernel::kMatvecQ8_0NGlu, n);
             s.ctx.dispatch(k, bufs, push,
                            VulkanContext::matvec_groups(k, ff));

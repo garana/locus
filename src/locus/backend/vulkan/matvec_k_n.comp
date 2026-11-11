@@ -7,12 +7,13 @@
 // rows in the GGUF layout, as matvec_q4_k.comp / matvec_q6_k.comp.
 //
 // Eight rows per workgroup, 16 lanes per row, the lane split and the
-// per-token arithmetic of the single-token kernels, so a token's
-// result does not depend on how many tokens share the dispatch, nor
-// on the build (NT 8, or NT 2 with -DNT2). Push constants and grid as
-// matvec_q8_0_n.comp: X row t at x_off + t * x_stride, output row t
-// at out_offset + t * out_stride, workgroup y a batch b shifting W, X
-// and out by b * w_bstride (bytes), b * x_bstride and b * out_bstride.
+// per-token arithmetic of the single-token kernels, so a token's result
+// does not depend on how many tokens share the dispatch, nor on the
+// build (NT 8, NT 2 with -DNT2, or NT 4 with -DNT4, #541). Push
+// constants and grid as matvec_q8_0_n.comp: X row t at x_off + t *
+// x_stride, output row t at out_offset + t * out_stride, workgroup y a
+// batch b shifting W, X and out by b * w_bstride (bytes), b * x_bstride
+// and b * out_bstride.
 //
 // -DSWIGLU (matvec_q4_k_n_glu, Q4_K only): W is the gate matrix and WU
 // (binding 3) the up matrix of the same shape; each output gets both
@@ -23,6 +24,8 @@
 #define ROWS 8u
 #ifdef NT2
 #define NT 2u
+#elif defined(NT4)
+#define NT 4u
 #else
 #define NT 8u
 #endif
