@@ -61,6 +61,16 @@ using nlohmann::json;
  * U+FFFD instead of throwing type_error.316 out of a handler (i#243). */
 constexpr auto kLossy = json::error_handler_t::replace;
 
+/** The GPU ops for the embedding and rerank models' large passes
+ *  (EmbeddingModel::kGpuMacs): the Vulkan image ops where the GPU
+ *  imports host memory, as for PixArt (the weights stay in the GGUF
+ *  mapping); else null, the CPU everywhere (#512). */
+const backend::Ops* encoder_gpu_ops() {
+    return backend::vulkan_imports_host_memory()
+               ? &backend::vulkan_image_ops()
+               : nullptr;
+}
+
 /** @returns The OpenAI flat error envelope. @param type
  *  invalid_request_error for a request the client got wrong; api_error
  *  for a condition that is not the request's fault (a cancellation). */
@@ -2432,8 +2442,9 @@ void OpenAiServer::install_routes() {
                 std::vector<std::vector<float>> vectors;
                 {
                     std::lock_guard<std::mutex> lk(bert_mu_);
-                    vectors = bert_->embed(
-                        inputs, backend::best_backend().ops, &tokens);
+                    vectors = bert_->embed(inputs,
+                                           backend::best_backend().ops,
+                                           &tokens, encoder_gpu_ops());
                 }
                 for (std::size_t i = 0; i < vectors.size(); ++i) {
                     data.push_back({{"object", "embedding"},
@@ -2525,7 +2536,7 @@ void OpenAiServer::install_routes() {
                     std::lock_guard<std::mutex> lk(rerank_mu_);
                     scores = rerank_->rank(body["query"].get<std::string>(),
                                            docs, backend::best_backend().ops,
-                                           &tokens);
+                                           &tokens, encoder_gpu_ops());
                 }
                 std::vector<std::size_t> order(docs.size());
                 for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;

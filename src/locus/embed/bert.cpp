@@ -210,6 +210,15 @@ BertEncoder BertEncoder::load(const gguf::GgufFile& g) {
         e.labels_ = static_cast<std::uint32_t>(out->ne[1]);
         e.cls_out_ = lin("cls.output", e.labels_, w);
     }
+    const auto macs = [](const Linear& l) {
+        return std::uint64_t{l.w.rows} * l.w.cols;
+    };
+    for (const Layer& l : e.layers_) {
+        for (const Linear* x : {&l.q, &l.k, &l.v, &l.qkv, &l.o, &l.gate,
+                                &l.up, &l.down}) {
+            if (x->w.data != nullptr) e.token_macs_ += macs(*x);
+        }
+    }
     return e;
 }
 
