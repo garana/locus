@@ -370,10 +370,10 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
 // qwen2 dense (Qwen2.5 0.5B Instruct, Qwen's own Q8_0 GGUF at 9217f5d,
 // 676 MB). Golden ids: the GGUF's weights dequantized and run in float64
 // (scripts/make-qwen2-q8-ref.py, the decoder as llama.cpp's graph; f32
-// activations pinned here). llama.cpp's own greedy output agrees for the first 19
-// tokens, then takes " about" where exact arithmetic takes " and": the
-// two are a near-tie (-0.7212 against -0.7268), and llama.cpp's 8-bit
-// activations tip it.
+// activations pinned here). llama.cpp's own greedy output agrees for
+// the first 19 tokens, then takes " about" where exact arithmetic takes
+// " and": the two are a near-tie (-0.7212 against -0.7268), and
+// llama.cpp's 8-bit activations tip it.
 TEST_CASE("qwen2 greedy decode matches exact arithmetic",
           "[e2e][qwen]") {
     const std::string path = std::string(LOCUS_SOURCE_DIR) +
