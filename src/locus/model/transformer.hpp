@@ -277,6 +277,11 @@ class TransformerModel {
         /** MLA: kv_a projection, absorbed q, weighted latent,
          * compressed query. */
         std::vector<float> kv_a, q_abs, latent, q_a;
+        /** MLA's cache rows as its attention reads them (i#63): row t
+         *  of the layer for t in [0, pos]; on a quantized cache, the
+         *  current row built before its store, and the decoded rows. */
+        std::vector<const float*> mla_ptr;
+        std::vector<float> mla_cur, mla_mat;
         /** DSA indexer: per-head queries, head weights, scores
          * over cached positions, selected positions. */
         std::vector<float> idx_q, idx_w, idx_scores;
