@@ -2468,7 +2468,9 @@ void OpenAiServer::install_routes() {
                         std::vector<float> e;
                         {
                             std::lock_guard<std::mutex> lk(classifier_mu_);
-                            e = classifier_->run(img).embedding;
+                            e = classifier_->run(img, encoder_gpu_ops() !=
+                                                          nullptr)
+                                    .embedding;
                         }
                         data.push_back({{"object", "embedding"},
                                         {"index", i},
@@ -2587,7 +2589,11 @@ void OpenAiServer::install_routes() {
                 std::vector<float> logits;
                 {
                     std::lock_guard<std::mutex> lk(classifier_mu_);
-                    logits = classifier_->run(img).logits;
+                    // The convs on the GPU where it shares host memory
+                    // (Apple), as the embedding encoders (#512).
+                    logits =
+                        classifier_->run(img, encoder_gpu_ops() != nullptr)
+                            .logits;
                 }
                 json out = json::array();
                 for (const auto& [c, p] : image::cnn::top_k(

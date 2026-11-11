@@ -78,12 +78,14 @@ std::span<const float> read_f32(const gguf::GgufFile& g,
 
 /**
  * The conv, [in][h][w] to [out][h'][w'] (h and w updated), padding ph
- * rows and pw columns on each side, then ReLU when relu.
+ * rows and pw columns on each side, then ReLU when relu. With gpu, the
+ * conv runs on Vulkan (backend::conv2d_vulkan, the weights cached by
+ * their GGUF-mapped pointer); else on the CPU (conv2d_mt).
  */
 std::vector<float> conv(const Conv& c, std::span<const float> x,
                         std::uint32_t& h, std::uint32_t& w,
                         std::uint32_t stride, std::uint32_t ph,
-                        std::uint32_t pw, bool relu);
+                        std::uint32_t pw, bool relu, bool gpu = false);
 
 /** torch's max_pool2d(3, stride, padding pad) over c planes; the
  *  padding is never chosen. h and w are updated. */

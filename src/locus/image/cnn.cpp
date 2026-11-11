@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/sys/thread_pool.hpp"
 
 namespace locus::image::cnn {
@@ -58,7 +59,7 @@ Conv read_conv(const gguf::GgufFile& g, const std::string& name,
 std::vector<float> conv(const Conv& c, std::span<const float> x,
                         std::uint32_t& h, std::uint32_t& w,
                         std::uint32_t stride, std::uint32_t ph,
-                        std::uint32_t pw, bool relu) {
+                        std::uint32_t pw, bool relu, bool gpu) {
     // conv2d_mt pads both sides by one amount: pad the other side's
     // extra on the host first when they differ (1 x 7 / 7 x 1 kernels).
     std::vector<float> padded;
@@ -81,8 +82,13 @@ std::vector<float> conv(const Conv& c, std::span<const float> x,
     const std::uint32_t oh = (ih + 2 * pad - c.kh) / stride + 1,
                         ow = (iw + 2 * pad - c.kw) / stride + 1;
     std::vector<float> out(std::size_t{c.out} * oh * ow);
-    backend::conv2d_mt(in, c.in, ih, iw, c.w, c.out, c.kh, c.kw, c.b, stride,
-                       pad, 1, out);
+    if (gpu) {
+        backend::conv2d_vulkan(in, c.in, ih, iw, c.w, c.out, c.kh, c.kw, c.b,
+                               stride, pad, 1, out);
+    } else {
+        backend::conv2d_mt(in, c.in, ih, iw, c.w, c.out, c.kh, c.kw, c.b,
+                           stride, pad, 1, out);
+    }
     if (relu) {
         for (float& v : out) v = std::max(v, 0.0f);
     }
