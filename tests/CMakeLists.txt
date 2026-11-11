@@ -123,6 +123,7 @@ add_executable(locus_tests
     test_qwen_vae.cpp
     test_qwen_vision.cpp
     test_qwen_edit_text.cpp
+    test_qwen_edit_image.cpp
     test_resnet.cpp
     test_inception.cpp
     test_png.cpp
