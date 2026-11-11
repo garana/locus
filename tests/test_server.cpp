@@ -2471,6 +2471,14 @@ TEST_CASE("images 503 unless a decoder and a Janus model are loaded",
         REQUIRE(res->status == 503);
         // The server's state, not the client's request: server_error.
         REQUIRE(json::parse(res->body)["error"]["type"] == "server_error");
+        // Edits need --image-model with Qwen-Image-Edit or FLUX.1
+        // Kontext.
+        res = client.Post("/v1/images/edits", req.dump(), "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 503);
+        CHECK(json::parse(res->body)["error"]["message"]
+                  .get<std::string>()
+                  .find("Qwen-Image-Edit") != std::string::npos);
     }
     if (!std::filesystem::exists(vq16_path())) {
         SKIP("janus-vq16-decoder.gguf absent");

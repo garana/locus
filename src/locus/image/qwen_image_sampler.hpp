@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -84,7 +85,9 @@ struct QwenEditText {
  * @param ref The reference image's packed latents
  *     (qwen_edit_reference_latents), ref_seg's tokens.
  * @param op The backend ops for the MMDiT.
- * @returns The final packed latents, noise's size.
+ * @param alive When set, polled before each step; false cancels.
+ * @returns The final packed latents, noise's size, or empty when
+ *     cancelled.
  * @throws std::invalid_argument on wrong sizes or steps.
  */
 std::vector<float> qwen_edit_denoise(
@@ -93,7 +96,8 @@ std::vector<float> qwen_edit_denoise(
     std::span<const float> ref, QwenImageDit::Segment ref_seg,
     QwenEditText prompt, QwenEditText negative, float cfg_scale,
     std::uint32_t steps,
-    const backend::Ops& op = backend::best_backend().ops);
+    const backend::Ops& op = backend::best_backend().ops,
+    const std::function<bool()>& alive = {});
 
 /**
  * The pipeline's decode of the final latents (output_type "np"):
