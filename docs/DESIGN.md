@@ -167,6 +167,15 @@ gets the clients' prompts and keys, so scan only a range where
 everyone who can listen is trusted. A host that accepts the connect
 and then sends nothing holds a probe for the 2 s read timeout, so a
 range full of them makes a scan last about 1024 / 64 x 2.3 s = 37 s.
+`mdns:SERVICE` (for example `mdns:_locus._tcp`) sends one DNS-SD
+browse on every refresh: a PTR question for `SERVICE.local` to
+224.0.0.251:5353 from an ephemeral port, so responders answer by
+unicast (RFC 6762 6.7) and the router joins no group; for 500 ms it
+reads the PTR, SRV and A (or AAAA) records into host:ports
+(`pipeline::mdns_browse`, its own bounded parser). An empty browse
+keeps the last list, since mDNS packets get lost. Instances advertise
+with the OS (`dns-sd -R`, `avahi-publish-service`). Anyone on the LAN
+can answer, so the scan's trust rule holds for it too.
 With `--register-keys`, an instance can also add
 itself (`locus-server --register`): it POSTs its host:port to
 `/locus/register` with one of the keys, again every third of its TTL

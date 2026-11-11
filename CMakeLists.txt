@@ -87,6 +87,7 @@ add_library(locus
     src/locus/model/speculative.cpp
     src/locus/pipeline/driver.cpp
     src/locus/pipeline/message.cpp
+    src/locus/pipeline/mdns.cpp
     src/locus/pipeline/net.cpp
     src/locus/pipeline/resolver.cpp
     src/locus/router/router.cpp
