@@ -541,10 +541,12 @@ void Engine::preempt(std::uint64_t victim_id) {
     }
     cache_.release(v.seq);
     v.n_fed = 0;  // recompute (or a disk read) when readmitted
-    // Discard the adopted-prefix accounting. Readmission recomputes
-    // from scratch -- try_adopt no-ops once any output exists, and even
-    // a still-in-prefill victim re-adopts fresh -- so this request no
-    // longer holds the prefix it was credited for. Roll the credit out
+    // Discard the adopted-prefix accounting. Readmission starts from
+    // nothing (a recompute, or the disk tier's blocks, which
+    // absorb_disk_loads credits anew) -- try_adopt no-ops once any
+    // output exists, and even a still-in-prefill victim re-adopts fresh
+    // -- so this request no longer holds the prefix it was credited
+    // for. Roll the credit out
     // of the global reuse metric and clear the per-request cache_read
     // count; a later re-adopt re-adds it. Without this, a preempted
     // request over-reports cache_read_input_tokens (it reused nothing)
