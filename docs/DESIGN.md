@@ -93,7 +93,9 @@ Correctness first, then CPU throughput, then GPU.
 - Fairness: admission is first come, first served, with a cap on
   prefill tokens per iteration (chunked prefill). Within it the prompt
   with the shortest remainder is fed first, so a short prompt behind a
-  long one does not wait for the whole long prefill, and each prompt
+  long one does not wait for the whole long prefill (a prompt unfed for
+  two prefill iterations goes first, so short ones cannot starve a long
+  one), and each prompt
   is fed in the chunks it gets alone (the whole cap, then its
   remainder), which keeps its output independent of the batch. While
   a sequence decodes, every other iteration feeds no prompt, so long
