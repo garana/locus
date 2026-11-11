@@ -160,9 +160,9 @@ several instances by kind: text, image-to-text (a chat, messages or
 responses body with an image part), image, video, speech, rerank or
 classify, from the path and, for chat, the body; `/v1/embeddings` under
 a classify instance's model goes to that instance. The instances are
-given as host:port or as `srv:NAME`, whose DNS SRV targets (the lowest priority's) are
-looked up again on every refresh, so instances join and leave with the
-record; one that leaves is never picked again, and an empty answer
+given as host:port or as `srv:NAME`, whose DNS SRV targets (the
+lowest priority's) are looked up again on every refresh, so instances
+join and leave with the record; one that leaves is never picked again, and an empty answer
 keeps the last list. `scan:A.B.C.D/N:PORT` (IPv4, at most 1024
 addresses) probes every address of the range for a `/v1/models` at
 start and every sixth refresh, 64 at a time with a 300 ms connect
@@ -184,8 +184,8 @@ keeps the last list, since mDNS packets get lost. Instances advertise
 with the OS (`dns-sd -R`, `avahi-publish-service`). Only replies from
 port 5353 and from loopback or an interface's own network are read
 (a container bridge such as docker0 is one, so a container on the
-host can answer too), but anyone on the LAN can still answer, so the scan's trust rule holds
-for it too; with `--upstream-auth client`, an `mdns:` or `scan:`
+host can answer too), but anyone on the LAN can still answer, so the
+scan's trust rule holds for it too; with `--upstream-auth client`, an `mdns:` or `scan:`
 source makes the router warn at startup that client keys go to
 whatever answers.
 With `--register-keys`, an instance can also add
