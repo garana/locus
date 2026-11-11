@@ -225,6 +225,19 @@ std::string_view kind_name(Kind k) {
     return kKindNames[static_cast<int>(k)];
 }
 
+std::string discovery_auth_warning(const RouterConfig& cfg) {
+    if (cfg.upstream_auth != RouterConfig::UpstreamAuth::kClient) return "";
+    const bool found = std::any_of(
+        cfg.instances.begin(), cfg.instances.end(), [](const std::string& s) {
+            return s.starts_with("mdns:") || s.starts_with("scan:");
+        });
+    if (!found) return "";
+    return "warning: with --upstream-auth client, every client's key goes "
+           "to the instances that mdns: and scan: find, so any host that "
+           "answers on those networks receives the keys; prefer "
+           "--upstream-auth key with --instance-keys, or none";
+}
+
 std::optional<Kind> parse_kind(std::string_view name) {
     for (std::size_t i = 0; i < std::size(kKindNames); ++i) {
         if (kKindNames[i] == name) return static_cast<Kind>(i);

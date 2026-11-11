@@ -194,6 +194,13 @@ struct RouterConfig {
 };
 
 /**
+ * @returns The startup warning for an "mdns:" or "scan:" source under
+ *     UpstreamAuth::kClient (i#537): every client's key then goes to
+ *     whatever host answers on the network; "" otherwise.
+ */
+std::string discovery_auth_warning(const RouterConfig& cfg);
+
+/**
  * Parses an instance-keys file: one "host:port key" (or "* key") per
  * line; blank lines and lines starting with '#' are skipped.
  * @throws std::invalid_argument on a malformed line.

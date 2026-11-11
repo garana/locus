@@ -180,8 +180,12 @@ unicast (RFC 6762 6.7) and the router joins no group; for 500 ms it
 reads the PTR, SRV and A (or AAAA) records into host:ports
 (`pipeline::mdns_browse`, its own bounded parser). An empty browse
 keeps the last list, since mDNS packets get lost. Instances advertise
-with the OS (`dns-sd -R`, `avahi-publish-service`). Anyone on the LAN
-can answer, so the scan's trust rule holds for it too.
+with the OS (`dns-sd -R`, `avahi-publish-service`). Only replies from
+port 5353 and from loopback or an interface's own network are read,
+but anyone on the LAN can still answer, so the scan's trust rule holds
+for it too; with `--upstream-auth client`, an `mdns:` or `scan:`
+source makes the router warn at startup that client keys go to
+whatever answers.
 With `--register-keys`, an instance can also add
 itself (`locus-server --register`): it POSTs its host:port to
 `/locus/register` with one of the keys, again every third of its TTL

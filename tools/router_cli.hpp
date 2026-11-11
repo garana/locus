@@ -169,6 +169,10 @@ inline int run_router(int argc, char** argv, int first) {
                      kRouterUsage);
         return 2;
     }
+    if (const auto w = locus::router::discovery_auth_warning(cfg);
+        !w.empty()) {
+        std::fprintf(stderr, "locus-router: %s\n", w.c_str());
+    }
     try {
         locus::router::Router r(cfg);
         const int port = r.start();

@@ -757,6 +757,27 @@ TEST_CASE("router: a registered instance gets the key that names it",
 // i#524: "mdns:SERVICE" lists the instances a DNS-SD browse finds, on
 // every refresh; an empty browse keeps them (lost packets), one the
 // browse stops listing drops out, and a found instance gets no "*" key.
+// i#537: mdns: and scan: with the client's key forwarded print a
+// warning at startup; a fixed instance list or another upstream auth
+// does not.
+TEST_CASE("router: discovery with forwarded client keys warns",
+          "[router]") {
+    using UA = RouterConfig::UpstreamAuth;
+    RouterConfig cfg;
+    cfg.instances = {"127.0.0.1:8081"};
+    CHECK(locus::router::discovery_auth_warning(cfg).empty());
+    for (const char* src : {"mdns:_locus._tcp", "scan:10.0.0.0/30:8080"}) {
+        cfg.instances = {"127.0.0.1:8081", src};
+        cfg.upstream_auth = UA::kClient;
+        CHECK(locus::router::discovery_auth_warning(cfg).find(
+                  "--upstream-auth key") != std::string::npos);
+        cfg.upstream_auth = UA::kKey;
+        CHECK(locus::router::discovery_auth_warning(cfg).empty());
+        cfg.upstream_auth = UA::kNone;
+        CHECK(locus::router::discovery_auth_warning(cfg).empty());
+    }
+}
+
 TEST_CASE("router: an mdns service lists the instances that answer",
           "[router]") {
     using locus::pipeline::SrvTarget;
