@@ -12,7 +12,7 @@ namespace {
 #ifdef MSG_NOSIGNAL
 constexpr int kSendFlags = MSG_NOSIGNAL;
 #else
-constexpr int kSendFlags = 0;  // SO_NOSIGPIPE is set on the fd instead
+constexpr int kSendFlags = 0;  // SO_NOSIGPIPE, set on the fd, covers it
 #endif
 
 /** Bytes read per event: input is answered as it arrives, so a
@@ -31,7 +31,9 @@ std::size_t input_cap(const Limits& l) {
 
 LoopConnection::LoopConnection(int fd, LoopConfig cfg, LoopHandler handler)
     : fd_(fd), cfg_(std::move(cfg)), handler_(std::move(handler)) {
-#if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+#ifdef SO_NOSIGPIPE
+    // As http::Server does: set wherever it exists (macOS defines both
+    // it and MSG_NOSIGNAL), so a send without the flag is covered too.
     const int one = 1;
     ::setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
