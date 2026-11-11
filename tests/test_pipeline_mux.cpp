@@ -141,7 +141,7 @@ TEST_CASE("serve_stage_mux serves two concurrent sessions in isolation",
     conn.serve_sessions = 2;  // stop after both sessions end
 
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, allow, {{"127.0.0.1", pc}}, conn)
                    ? 1
@@ -261,7 +261,7 @@ TEST_CASE("serve_stage_mux reuses a connection after SESSION_END, "
     conn.downstream_idle_max = 0;
 
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, allow, {{"127.0.0.1", pc}}, conn)
                    ? 1
@@ -381,7 +381,7 @@ TEST_CASE("serve_stage_mux reuses a pooled downstream (issue 68)",
     conn.downstream_idle_max = 8;  // pooling ON (also the default)
 
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, allow, {{"127.0.0.1", pc}}, conn)
                    ? 1
@@ -496,7 +496,7 @@ TEST_CASE("serve_stage_mux replaces a dead pooled downstream (issue 68)",
     conn.downstream_idle_max = 8;  // pooling ON
 
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, allow, {{"127.0.0.1", pc}}, conn)
                    ? 1
@@ -596,7 +596,7 @@ TEST_CASE("serve_stage_mux closes pooled downstreams at teardown (i#68)",
     conn.downstream_idle_max = 8;  // pooling ON
 
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, allow, {{"127.0.0.1", pc}}, conn)
                    ? 1
@@ -686,7 +686,7 @@ TEST_CASE("serve_stage_mux spreads sessions across two executors",
     conn.serve_sessions = 2;
 
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stages, ls, allow, {{"127.0.0.1", pc}}, conn)
                    ? 1
@@ -778,7 +778,7 @@ TEST_CASE("serve_stage_mux reassembles a frame split across reads",
     locus::pipeline::StageConn conn;
     conn.serve_sessions = 1;
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, {}, {{"127.0.0.1", pc}}, conn)
                    ? 1
@@ -840,7 +840,7 @@ TEST_CASE("serve_stage_mux: EOF at a boundary is clean, mid-frame is not",
         locus::pipeline::StageConn conn;
         conn.serve_sessions = 1;
         std::atomic<int> sres{-1};
-        std::thread server([&] {
+        std::jthread server([&] {
             sres = locus::pipeline::serve_stage_mux(
                        stage, ls, {}, {{"127.0.0.1", pc}}, conn)
                        ? 1
@@ -909,7 +909,7 @@ TEST_CASE("serve_stage_mux drops an idle peer that resets the connection",
     locus::pipeline::StageConn conn;
     conn.serve_sessions = 1;
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, {}, {{"127.0.0.1", pc}}, conn)
                    ? 1
@@ -980,7 +980,7 @@ TEST_CASE("serve_stage_mux parks a backlog for a slow downstream",
     locus::pipeline::StageConn conn;
     conn.serve_sessions = 1;
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, {}, {{"127.0.0.1", pc}}, conn)
                    ? 1
@@ -1049,7 +1049,7 @@ TEST_CASE("serve_stage_mux answers a client that half-closes after a frame",
     locus::pipeline::StageConn conn;
     conn.serve_sessions = 1;
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, {}, {{"127.0.0.1", pc}}, conn)
                    ? 1
@@ -1167,7 +1167,7 @@ TEST_CASE("serve_stage_mux dials across the pool past a refused entry",
     conn.serve_sessions = 1;
 
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, allow,
                    {{"127.0.0.1", dead}, {"127.0.0.1", pc}}, conn)
@@ -1233,7 +1233,7 @@ TEST_CASE("serve_stage_mux drops a session with a dead downstream pool",
     conn.reconnect_wait_ms = 10;
 
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, allow, {{"127.0.0.1", dead}}, conn)
                    ? 1
@@ -1277,7 +1277,7 @@ TEST_CASE("serve_stage_mux drops a hostname downstream with no resolver",
     conn.reconnect_wait_ms = 1000;
 
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
                    stage, ls, allow, {{"needs-a-resolver.invalid", 9}},
                    conn)
@@ -1343,7 +1343,7 @@ TEST_CASE("serve_stage_mux drops a session when a reload empties the pool",
                       locus::pipeline::StageConn&) { p.clear(); };
 
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(stage, ls, {},
                                                 {{"127.0.0.1", pc}}, conn,
                                                 reload)
@@ -1408,7 +1408,7 @@ TEST_CASE("serve_stage_mux: SESSION_END with an emptied pool drops, no "
     };
 
     std::atomic<int> sres{-1};
-    std::thread server([&] {
+    std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(stage, ls, {},
                                                 {{"127.0.0.1", pc}}, conn,
                                                 reload)
@@ -1517,7 +1517,7 @@ TEST_CASE("serve_stage_mux reports its live peers", "[pipeline][mux][e2e]") {
             seen = peers;
         }
     };
-    std::thread server([&] {
+    std::jthread server([&] {
         locus::pipeline::serve_stage_mux(stage, ls, allow,
                                          {{"127.0.0.1", pc}}, conn);
     });

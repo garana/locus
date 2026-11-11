@@ -49,7 +49,7 @@ struct TestServer {
         : server(m, tok, std::move(opt)) {
         port = server.bind_any_port("127.0.0.1");
         REQUIRE(port > 0);
-        thread = std::thread([this] {
+        thread = std::jthread([this] {
             server.listen_after_bind();
         });
     }
@@ -60,7 +60,7 @@ struct TestServer {
 
     locus::server::OpenAiServer server;
     int port = -1;
-    std::thread thread;
+    std::jthread thread;
 };
 
 }  // namespace
@@ -781,7 +781,7 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
             }
         };
         std::string t1, t2, t3;
-        std::thread a(worker, &t1), b(worker, &t2),
+        std::jthread a(worker, &t1), b(worker, &t2),
             c(worker, &t3);
         a.join();
         b.join();
@@ -1094,7 +1094,7 @@ TEST_CASE("auth gates protected routes via a helper", "[server][e2e]") {
     locus::server::OpenAiServer server(model, tok, opt);
     const int port = server.bind_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread th([&] { server.listen_after_bind(); });
+    std::jthread th([&] { server.listen_after_bind(); });
     httplib::Client client("127.0.0.1", port);
 
     const json req{{"prompt", "Once upon a time"}, {"max_tokens", 4}};
@@ -1166,7 +1166,7 @@ TEST_CASE("metrics path is configurable", "[server][e2e]") {
     locus::server::OpenAiServer server(model, tok, opt);
     const int port = server.bind_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread th([&] { server.listen_after_bind(); });
+    std::jthread th([&] { server.listen_after_bind(); });
     httplib::Client client("127.0.0.1", port);
 
     auto m = client.Get("/internal/metrics");
@@ -1713,7 +1713,7 @@ TEST_CASE("server survives concurrent mid-stream SSE aborts",
     constexpr int kThreads = 24;
     constexpr int kRounds = 4;
     for (int round = 0; round < kRounds; ++round) {
-        std::vector<std::thread> aborters;
+        std::vector<std::jthread> aborters;
         aborters.reserve(kThreads);
         for (int i = 0; i < kThreads; ++i) {
             aborters.emplace_back([&] {
@@ -1838,7 +1838,7 @@ struct AudioServer {
           }()) {
         port = server.bind_any_port("127.0.0.1");
         REQUIRE(port > 0);
-        th = std::thread([this] { server.listen_after_bind(); });
+        th = std::jthread([this] { server.listen_after_bind(); });
     }
     ~AudioServer() {
         server.stop();
@@ -1855,7 +1855,7 @@ struct AudioServer {
     std::unique_ptr<locus::tok::Tokenizer> tok;
     locus::server::OpenAiServer server;
     int port = -1;
-    std::thread th;
+    std::jthread th;
 };
 
 /** REQUIRE that a request got a response; on failure, report why
@@ -2179,10 +2179,10 @@ TEST_CASE("images endpoint returns the reference image end to end",
     locus::server::OpenAiServer server(model, *tok, o);
     const int port = server.bind_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread th([&] { server.listen_after_bind(); });
+    std::jthread th([&] { server.listen_after_bind(); });
     struct Join {
         locus::server::OpenAiServer& s;
-        std::thread& t;
+        std::jthread& t;
         ~Join() {
             s.stop();
             t.join();
@@ -2346,10 +2346,10 @@ TEST_CASE("chat with an image answers like the reference",
     locus::server::OpenAiServer server(model, *tok, o);
     const int port = server.bind_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread th([&] { server.listen_after_bind(); });
+    std::jthread th([&] { server.listen_after_bind(); });
     struct Join {
         locus::server::OpenAiServer& s;
-        std::thread& t;
+        std::jthread& t;
         ~Join() {
             s.stop();
             t.join();
@@ -2441,10 +2441,10 @@ TEST_CASE("chat with an image answers like the reference on vulkan",
     locus::server::OpenAiServer server(model, *tok, o);
     const int port = server.bind_any_port("127.0.0.1");
     REQUIRE(port > 0);
-    std::thread th([&] { server.listen_after_bind(); });
+    std::jthread th([&] { server.listen_after_bind(); });
     struct Join {
         locus::server::OpenAiServer& s;
-        std::thread& t;
+        std::jthread& t;
         ~Join() {
             s.stop();
             t.join();

@@ -1108,7 +1108,7 @@ TEST_CASE("router: in front of a real locus-server", "[router][e2e]") {
     locus::server::OpenAiServer server(model, tok, {});
     const int sport = server.bind_any_port("127.0.0.1");
     REQUIRE(sport > 0);
-    std::thread th([&] { server.listen_after_bind(); });
+    std::jthread th([&] { server.listen_after_bind(); });
     {
         RouterFixture rf({"127.0.0.1:" + std::to_string(sport)});
         const auto inst = rf.router->instances();

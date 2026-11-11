@@ -850,7 +850,7 @@ TEST_CASE("matvec_vulkan is safe from several threads", "[vulkan]") {
             j.x, j.want);
     }
     std::atomic<int> bad{0};
-    std::vector<std::thread> threads;
+    std::vector<std::jthread> threads;
     for (auto& j : jobs) {
         threads.emplace_back([&j, &bad] {
             std::vector<float> got(rows);

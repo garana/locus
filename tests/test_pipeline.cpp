@@ -146,7 +146,7 @@ TEST_CASE("pipeline framed transport over a socketpair",
         activation(3, 2, 128)};
 
     std::atomic<bool> wok{true};
-    std::thread writer([&] {
+    std::jthread writer([&] {
         for (const auto& m : sent) {
             if (!locus::pipeline::write_message(fds[1], m)) {
                 wok = false;
@@ -226,7 +226,7 @@ TEST_CASE("pipeline transport over loopback TCP", "[pipeline]") {
                                      std::vector<float>(2048, 1.5f))};
 
     std::atomic<bool> wok{true};
-    std::thread client([&] {
+    std::jthread client([&] {
         const int c = locus::pipeline::connect_to("127.0.0.1", port);
         if (c < 0) {
             wok = false;
@@ -332,7 +332,7 @@ TEST_CASE("pipeline wildcard/::1 listen + allowlist", "[pipeline]") {
         REQUIRE(lfd >= 0);
         REQUIRE(port > 0);
         std::atomic<bool> ok{false};
-        std::thread client([&] {
+        std::jthread client([&] {
             const int c = locus::pipeline::connect_to("127.0.0.1", port);
             if (c >= 0) {
                 ok = locus::pipeline::write_message(
@@ -363,7 +363,7 @@ TEST_CASE("pipeline wildcard/::1 listen + allowlist", "[pipeline]") {
         }
         REQUIRE(port > 0);
         std::atomic<bool> ok{false};
-        std::thread client([&] {
+        std::jthread client([&] {
             const int c = locus::pipeline::connect_to("::1", port);
             if (c >= 0) {
                 ok = locus::pipeline::write_message(

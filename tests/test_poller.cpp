@@ -205,7 +205,7 @@ TEST_CASE("Poller.wait honors the deadline across EINTR retries",
     p.add(fds[0]);
 
     const pthread_t waiter = ::pthread_self();
-    std::thread burst([waiter] {
+    std::jthread burst([waiter] {
         for (int i = 0; i < 5; ++i) {  // fire at ~50..250 ms, then stop
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             ::pthread_kill(waiter, SIGALRM);

@@ -42,7 +42,7 @@ TEST_CASE("perf counters: register, read, unregister", "[perf]") {
         return;
     }
     Totals inside;
-    std::thread worker([&] {
+    std::jthread worker([&] {
         ThreadCounters guard;  // registers THIS thread's counters
         std::vector<std::uint64_t> buf(1u << 20, 1);  // 8 MiB
         volatile std::uint64_t sum = 0;

@@ -110,7 +110,7 @@ TEST_CASE("pipeline stages reproduce single-process generation",
         connect_pair(out_fd[N - 1], entry_r);
 
         std::vector<int> results(N, 0);
-        std::vector<std::thread> th;
+        std::vector<std::jthread> th;
         for (std::size_t i = 0; i < N; ++i) {
             th.emplace_back([&, i] {
                 results[i] =
@@ -283,13 +283,13 @@ TEST_CASE("pipeline serve_stage chain reproduces generation",
         conn.serve_sessions = 1;
 
         std::atomic<int> r0{-1}, r1{-1};
-        std::thread t0([&] {
+        std::jthread t0([&] {
             r0 = locus::pipeline::serve_stage(s0, l0, allow,
                                               "127.0.0.1", p1, conn)
                      ? 1
                      : 0;
         });
-        std::thread t1([&] {
+        std::jthread t1([&] {
             r1 = locus::pipeline::serve_stage(s1, l1, allow,
                                               "127.0.0.1", pe, conn)
                      ? 1
@@ -388,7 +388,7 @@ TEST_CASE("serve_stage reconnect gives up after N attempts",
 
     std::atomic<int> result{-1};
     const auto t0 = std::chrono::steady_clock::now();
-    std::thread th([&] {
+    std::jthread th([&] {
         result = locus::pipeline::serve_stage(stage, lin, {},
                                               "127.0.0.1", pdn, conn)
                      ? 1
@@ -464,7 +464,7 @@ TEST_CASE("serve_stage re-serves sessions with reset",
     conn.connect_timeout_ms = 1000;
     conn.reconnect_wait_ms = 50;
     std::atomic<int> result{-1};
-    std::thread th([&] {
+    std::jthread th([&] {
         result = locus::pipeline::serve_stage(stage, lin, {},
                                               "127.0.0.1", pe, conn)
                      ? 1
@@ -643,12 +643,12 @@ TEST_CASE("serve_stage distributes across a downstream pool",
         conn1.serve_sessions = 1;
 
         std::atomic<int> r0{-1}, r1{-1};
-        std::thread t0([&] {
+        std::jthread t0([&] {
             r0 = locus::pipeline::serve_stage(s0, l0, allow, pool, conn0)
                      ? 1
                      : 0;
         });
-        std::thread t1([&] {
+        std::jthread t1([&] {
             r1 = locus::pipeline::serve_stage(s1, l1, allow,
                                               "127.0.0.1", pe, conn1)
                      ? 1
@@ -696,18 +696,18 @@ TEST_CASE("serve_stage distributes across a downstream pool",
         conn1.serve_sessions = 1;  // each replica serves exactly one
 
         std::atomic<int> r0{-1}, ra{-1}, rb{-1};
-        std::thread t0([&] {
+        std::jthread t0([&] {
             r0 = locus::pipeline::serve_stage(s0, l0, allow, pool, conn0)
                      ? 1
                      : 0;
         });
-        std::thread ta([&] {
+        std::jthread ta([&] {
             ra = locus::pipeline::serve_stage(sa, la, allow,
                                               "127.0.0.1", pe, conn1)
                      ? 1
                      : 0;
         });
-        std::thread tb([&] {
+        std::jthread tb([&] {
             rb = locus::pipeline::serve_stage(sb, lb, allow,
                                               "127.0.0.1", pe, conn1)
                      ? 1
@@ -877,7 +877,7 @@ TEST_CASE("serve_stage applies a hot reload between sessions",
                        locus::pipeline::StageConn&) { ++reloads; };
 
     std::atomic<int> result{-1};
-    std::thread th([&] {
+    std::jthread th([&] {
         result = locus::pipeline::serve_stage(
                      stage, lin, {}, {{"127.0.0.1", pe}}, conn, reload)
                      ? 1
@@ -1011,13 +1011,13 @@ TEST_CASE("serve_stage dials a named downstream through the resolver",
     conn1.serve_sessions = 1;    // stage 1 -> entry collector, by IP
 
     std::atomic<int> r0{-1}, r1{-1};
-    std::thread t0([&] {
+    std::jthread t0([&] {
         r0 = locus::pipeline::serve_stage(
                  s0, l0, allow, {{"stage1.test", p1}}, conn0)
                  ? 1
                  : 0;
     });
-    std::thread t1([&] {
+    std::jthread t1([&] {
         r1 = locus::pipeline::serve_stage(
                  s1, l1, allow, {{"127.0.0.1", pe}}, conn1)
                  ? 1

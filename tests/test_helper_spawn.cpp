@@ -75,7 +75,7 @@ TEST_CASE("helper dtor never hangs on a SIGTERM-ignoring child",
 
     std::promise<void> done;
     auto fut = done.get_future();
-    std::thread t([conn = std::move(conn), &done]() mutable {
+    std::jthread t([conn = std::move(conn), &done]() mutable {
         conn.reset();  // runs ~HelperConnection: grace -> SIGKILL
         done.set_value();
     });

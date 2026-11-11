@@ -502,7 +502,7 @@ TEST_CASE("http server: a head reject on a POST never reads the body",
 TEST_CASE("http server: wait() blocks until stop()", "[http_server]") {
     Fixture f(echo_handler);
     std::atomic<bool> returned{false};
-    std::thread waiter([&] {
+    std::jthread waiter([&] {
         f.server.wait();
         returned.store(true);
     });
@@ -573,7 +573,7 @@ TEST_CASE("http server: fast-path route answers while the pool is busy",
     Fixture f(handler, cfg);
 
     // Occupy the worker with /slow on its own connection.
-    std::thread slow([&] {
+    std::jthread slow([&] {
         const int c = client_connect(f.port);
         send_all(c, "GET /slow HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
         drain(c, 3000);  // blocks in the handler until released
@@ -584,7 +584,7 @@ TEST_CASE("http server: fast-path route answers while the pool is busy",
     // would terminate the runner).
     struct Releaser {
         std::atomic<bool>& release;
-        std::thread& t;
+        std::jthread& t;
         ~Releaser() {
             release.store(true);
             if (t.joinable()) {
@@ -723,7 +723,7 @@ TEST_CASE("http server: fast path still matches when the request line "
 
     // Saturate the single worker, so a misclassified /fast (handed to
     // the pool) would NOT come back and the test fails loudly.
-    std::thread slow([&] {
+    std::jthread slow([&] {
         const int c = client_connect(f.port);
         send_all(c, "GET /slow HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
         drain(c, 3000);
@@ -731,7 +731,7 @@ TEST_CASE("http server: fast path still matches when the request line "
     });
     struct Releaser {
         std::atomic<bool>& release;
-        std::thread& t;
+        std::jthread& t;
         ~Releaser() {
             release.store(true);
             if (t.joinable()) {
