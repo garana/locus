@@ -48,8 +48,9 @@ def main():
     ap.add_argument("--vae", required=True,
                     help="the pipeline's vae/ directory")
     a = ap.parse_args()
+    # use_safetensors: never a pickle, even if a .bin sits next to it.
     vae = AutoencoderKLQwenImage.from_pretrained(
-        a.vae, torch_dtype=torch.float32).eval()
+        a.vae, torch_dtype=torch.float32, use_safetensors=True).eval()
     z_dim = vae.config.z_dim
     down = 2 ** (len(vae.config.dim_mult) - 1)
     zs = SIZE // down
