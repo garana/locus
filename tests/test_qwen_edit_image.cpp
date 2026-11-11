@@ -11,6 +11,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/gguf/gguf.hpp"
+#include "locus/image/flux_sampler.hpp"
 #include "locus/image/qwen_vae.hpp"
 #include "png_parse.hpp"
 #include "qwen_tiny.hpp"
@@ -160,8 +161,11 @@ TEST_CASE("qwen edit reference latents match the pipeline",
         std::invalid_argument);
 }
 
-// Packing is _pack_latents' permutation and unpacking undoes it.
+// Qwen-Image-Edit packs its latents with FluxSampler::pack (i#630):
+// QwenImageEditPipeline._pack_latents is FLUX's permutation, and the
+// unpack undoes it.
 TEST_CASE("qwen latents pack and unpack", "[qwen-edit][image]") {
+    using locus::image::FluxSampler;
     // [2][4][6]: value = channel * 100 + row * 10 + column.
     constexpr std::uint32_t c = 2, h = 4, w = 6;
     std::vector<float> z(std::size_t{c} * h * w);
@@ -173,14 +177,14 @@ TEST_CASE("qwen latents pack and unpack", "[qwen-edit][image]") {
             }
         }
     }
-    const auto t = locus::image::qwen_pack_latents(z, c, h, w);
+    const auto t = FluxSampler::pack(z, c, h, w);
     // Token (row 1, column 2) is token 1 * 3 + 2 = 5; its values are
     // channel 0's 2 x 2 patch at (2, 4), then channel 1's.
     const std::vector<float> want = {24, 25, 34, 35, 124, 125, 134, 135};
     for (std::size_t i = 0; i < want.size(); ++i) {
         CHECK(t[5 * 8 + i] == want[i]);
     }
-    CHECK(locus::image::qwen_unpack_latents(t, c, h, w) == z);
-    REQUIRE_THROWS_AS(locus::image::qwen_pack_latents(z, c, h + 1, w),
+    CHECK(FluxSampler::unpack(t, c, h, w) == z);
+    REQUIRE_THROWS_AS(FluxSampler::pack(z, c, h + 1, w),
                       std::invalid_argument);
 }
