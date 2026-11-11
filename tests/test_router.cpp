@@ -754,9 +754,6 @@ TEST_CASE("router: a registered instance gets the key that names it",
     CHECK(a.header("Authorization") == "Bearer sk-a");
 }
 
-// i#388 step 6: "scan:CIDR:PORT" probes the range's addresses for a
-// locus /v1/models; the ones that answer are its instances (found, so
-// no "*" key), and a scan that no longer finds one drops it.
 // i#524: "mdns:SERVICE" lists the instances a DNS-SD browse finds, on
 // every refresh; an empty browse keeps them (lost packets), one the
 // browse stops listing drops out, and a found instance gets no "*" key.
@@ -809,6 +806,36 @@ TEST_CASE("router: an mdns service lists the instances that answer",
     }
 }
 
+// i#443: the router's default host, "", serves IPv6 and IPv4 clients on
+// one socket, as locus-server does (i#139).
+TEST_CASE("router: the default host serves IPv4 and IPv6 clients",
+          "[router]") {
+    FakeInstance a("A", {"text"}, "m");
+    RouterConfig cfg;
+    REQUIRE(cfg.host.empty());  // the default
+    cfg.port = 0;
+    cfg.instances = {a.addr()};
+    cfg.refresh_ms = 60000;
+    Router router(cfg);
+    const int port = router.start();
+    REQUIRE(port > 0);
+    Client v4("127.0.0.1", port);
+    const auto r4 = v4.send(ClientRequest{"GET", "/health", {}, ""});
+    REQUIRE(r4.ok);
+    CHECK(r4.head.status == 200);
+    Client v6("::1", port);
+    const auto r6 = v6.send(ClientRequest{"GET", "/health", {}, ""});
+    if (!r6.connected) {
+        WARN("no IPv6 loopback here: the ::1 leg is skipped");
+    } else {
+        REQUIRE(r6.ok);
+        CHECK(r6.head.status == 200);
+    }
+}
+
+// i#388 step 6: "scan:CIDR:PORT" probes the range's addresses for a
+// locus /v1/models; the ones that answer are its instances (found, so
+// no "*" key), and a scan that no longer finds one drops it.
 TEST_CASE("router: a scan finds the instances on a range", "[router]") {
     using UA = RouterConfig::UpstreamAuth;
     auto a = std::make_unique<FakeInstance>(
