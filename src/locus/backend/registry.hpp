@@ -240,17 +240,37 @@ const Backend& resolve_backend(std::string_view choice);
 bool backend_defaulted(std::string_view choice);
 
 /**
+ * Whether a Vulkan device of this kind is measured faster than the CPU:
+ * a discrete GPU or an Apple integrated one. A CPU-type device
+ * (llvmpipe) and other integrated GPUs are not: on a Raspberry Pi 5,
+ * V3D decodes about 15 times slower than the CPU (i#607).
+ *
+ * @param type The device type, as VulkanDeviceInfo::type gives it.
+ * @param name The device name.
+ * @returns true when suggesting Vulkan over the CPU is right.
+ */
+bool vulkan_beats_cpu(std::string_view type, std::string_view name);
+
+/** @returns vulkan_beats_cpu() for the device the calling thread's
+ *  Vulkan backend runs on; false without a Vulkan device. Opens no
+ *  device. */
+bool vulkan_device_beats_cpu();
+
+/**
  * The startup warning for a default pick that leaves a GPU idle: the
  * picked backend runs on the CPU while a GPU backend (vulkan, cuda) in
- * `list` is available and selectable.
+ * `list` is available and selectable. Vulkan counts only when its
+ * device beats the CPU.
  *
  * @param defaulted Whether the backend was picked by default.
  * @param picked The backend in use.
  * @param list The backends to look for a usable GPU in.
+ * @param vulkan_beats Whether the Vulkan device beats the CPU.
  * @returns One line naming the GPU backend to pass, or empty when
  *     there is nothing to warn about.
  */
 std::string gpu_idle_warning(bool defaulted, const Backend& picked,
-                             std::span<const Backend> list = backends());
+                             std::span<const Backend> list = backends(),
+                             bool vulkan_beats = vulkan_device_beats_cpu());
 
 }  // namespace locus::backend

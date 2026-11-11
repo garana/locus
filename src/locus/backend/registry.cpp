@@ -169,8 +169,20 @@ bool backend_defaulted(std::string_view choice) {
     return choice.empty() && (env == nullptr || *env == '\0');
 }
 
+bool vulkan_beats_cpu(std::string_view type, std::string_view name) {
+    return type == "discrete" ||
+           (type == "integrated" && name.find("Apple") != name.npos);
+}
+
+bool vulkan_device_beats_cpu() {
+    const std::vector<VulkanDeviceInfo> devs = vulkan_devices();
+    const auto d = static_cast<std::size_t>(vulkan_thread_device());
+    return d < devs.size() && vulkan_beats_cpu(devs[d].type, devs[d].name);
+}
+
 std::string gpu_idle_warning(bool defaulted, const Backend& picked,
-                             std::span<const Backend> list) {
+                             std::span<const Backend> list,
+                             bool vulkan_beats) {
     auto is_gpu = [](std::string_view name) {
         return name == "vulkan" || name == "cuda";
     };
@@ -178,6 +190,9 @@ std::string gpu_idle_warning(bool defaulted, const Backend& picked,
         return {};
     }
     for (const Backend& b : list) {
+        if (b.name == "vulkan" && !vulkan_beats) {
+            continue;
+        }
         if (is_gpu(b.name) && b.available && b.selectable) {
             const std::string gpu(b.name);
             return "warning: running on the CPU (" +
