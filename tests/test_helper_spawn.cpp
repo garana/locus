@@ -1,4 +1,6 @@
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -57,6 +59,27 @@ TEST_CASE("spawn_helper rejects empty argv", "[auth]") {
     auto conn = spawn_helper({}, &err);
     REQUIRE_FALSE(conn);
     REQUIRE_FALSE(err.empty());
+}
+
+TEST_CASE("a helper gets SIGTERM though the server blocks it",
+          "[auth]") {
+    // locus-server blocks SIGINT / SIGTERM for its stopper thread, and
+    // a signal mask survives fork and exec. The child must unblock
+    // them: the dtor's SIGTERM ends this sleep at once when it can be
+    // received, and only the SIGKILL after the grace (about a second)
+    // does when it is blocked. Not a shell: dash clears the mask itself.
+    sigset_t term;
+    sigemptyset(&term);
+    sigaddset(&term, SIGTERM);
+    sigset_t old;
+    REQUIRE(pthread_sigmask(SIG_BLOCK, &term, &old) == 0);
+    std::string err;
+    auto conn = spawn_helper({"/bin/sleep", "5"}, &err);
+    REQUIRE(pthread_sigmask(SIG_SETMASK, &old, nullptr) == 0);
+    REQUIRE(conn);
+    const auto t0 = std::chrono::steady_clock::now();
+    conn.reset();
+    CHECK(std::chrono::steady_clock::now() - t0 < 500ms);
 }
 
 TEST_CASE("helper dtor never hangs on a SIGTERM-ignoring child",

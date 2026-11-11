@@ -40,6 +40,11 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
                 "disk prefix cache: the store's key does not match the "
                 "KV cache geometry");
         }
+        // Device attention over a KV mirror (CUDA) gives other K/V
+        // bits than the host's; only this cache knows if it has one.
+        cfg_.disk_prefix->set_device_attention(
+            cache_.mirror_data() != nullptr &&
+            m.active_backend().ops.kv_attend != nullptr);
         cfg_.prefix_cache = true;
     }
     if (cfg_.prefix_cache) {
@@ -59,6 +64,52 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
 
 Engine::Engine(const model::TransformerModel& m, tok::TokenId eos)
     : Engine(m, eos, Config{}) {}
+
+Engine::~Engine() {
+    if (!disk_worker_) {
+        return;
+    }
+    // Write-back covers only what RAM evicted; the entries still in RAM
+    // are written here, directly from the pool (no copy: nothing runs
+    // any more). Only the newest that fit the cap, written oldest first
+    // so the newest end most recently used: writing more would evict
+    // files just written.
+    try {
+        disk_worker_->drain();
+        struct Entry {
+            std::span<const tok::TokenId> key;
+            const std::vector<kv::BlockId>* blocks;
+        };
+        std::vector<Entry> entries;
+        prefix_cache_->for_each_oldest_first(
+            [&](std::span<const tok::TokenId> key,
+                const std::vector<kv::BlockId>& blocks) {
+                entries.push_back({key, &blocks});
+            });
+        const std::uint64_t bb = cache_.block_bytes();
+        std::uint64_t budget = cfg_.disk_prefix->cap_bytes();
+        std::size_t first = entries.size();
+        while (first > 0 &&
+               entries[first - 1].blocks->size() * bb <= budget) {
+            --first;
+            budget -= entries[first].blocks->size() * bb;
+        }
+        for (std::size_t i = first; i < entries.size(); ++i) {
+            const auto n =
+                static_cast<std::uint32_t>(entries[i].blocks->size());
+            if (n == 0 || cfg_.disk_prefix->find(entries[i].key) >= n) {
+                continue;
+            }
+            std::vector<const std::uint8_t*> src;
+            for (const kv::BlockId b : *entries[i].blocks) {
+                src.push_back(cache_.block_data(b));
+            }
+            cfg_.disk_prefix->write(entries[i].key, n, src);
+        }
+    } catch (...) {
+        // Out of memory at shutdown: the disk tier is only a cache.
+    }
+}
 
 std::uint64_t Engine::submit(
     std::vector<tok::TokenId> prompt, std::uint32_t max_new_tokens,

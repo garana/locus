@@ -186,6 +186,11 @@ ProcessResult run_process(
         ::dup2(out[1], 1);
         ::dup2(err[1], 2);
         close_from_3(limit);
+        // A signal mask survives exec: locus-server blocks SIGINT and
+        // SIGTERM for its stopper thread, and ffmpeg must get them.
+        sigset_t none;
+        sigemptyset(&none);
+        ::sigprocmask(SIG_SETMASK, &none, nullptr);
         ::execv(exe.c_str(), args.data());
         ::_exit(127);
     }

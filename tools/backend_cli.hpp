@@ -238,6 +238,10 @@ inline constexpr const char* kCommonHelp =
     "  --kv-type T      KV cache precision: f32 (default, exact),\n"
     "                   f16 (half the cache and attention reads;\n"
     "                   GPU-accelerated for GQA models), q8, q4\n"
+    "  --prefix-cache-dir DIR  keep evicted prompt-prefix KV in DIR and\n"
+    "                   read it back on a later match, also after a\n"
+    "                   restart (off unless set; use fast storage)\n"
+    "  --prefix-cache-disk-mib N  disk cap for DIR (default 4096)\n"
     "  --batch-decode   enable R10 cross-sequence batched decode\n"
     "  --no-batch-prefill  force per-token prompt ingestion\n"
     "  --timing         locus-run: print prefill and decode\n"
@@ -353,6 +357,11 @@ struct BackendArgs {
     locus::kv::KvType kv_type = locus::kv::KvType::kF32;
     bool kv_type_ok = true;
     std::string kv_type_name;
+    /** From --prefix-cache-dir DIR: the disk tier of the prefix cache
+     * (i#416; empty = off). */
+    std::string prefix_cache_dir;
+    /** From --prefix-cache-disk-mib N: its cap in MiB. */
+    std::uint32_t prefix_cache_disk_mib = 4096;
     /** --batch-decode: enable R10 cross-sequence batched decode. */
     bool batch_decode = false;
     /** --no-batch-prefill: force per-token prompt ingestion. */
@@ -511,6 +520,16 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.kv_type_name =
                 a == "--kv-type" ? argv[++i] : std::string(a.substr(10));
             out.kv_type_ok = parse_kv_type(out.kv_type_name, out.kv_type);
+        } else if (a == "--prefix-cache-dir" && i + 1 < argc) {
+            out.prefix_cache_dir = argv[++i];
+        } else if (a.rfind("--prefix-cache-dir=", 0) == 0) {
+            out.prefix_cache_dir = std::string(a.substr(19));
+        } else if (a == "--prefix-cache-disk-mib" && i + 1 < argc) {
+            number("--prefix-cache-disk-mib", argv[++i],
+                   out.prefix_cache_disk_mib);
+        } else if (a.rfind("--prefix-cache-disk-mib=", 0) == 0) {
+            number("--prefix-cache-disk-mib", std::string(a.substr(24)),
+                   out.prefix_cache_disk_mib);
         } else if (a == "--batch-decode") {
             out.batch_decode = true;
         } else if (a == "--no-batch-prefill") {

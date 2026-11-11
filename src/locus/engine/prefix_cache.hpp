@@ -59,6 +59,15 @@ class PrefixCache {
      * the cache is empty. @returns blocks freed. */
     std::uint32_t evict_until_free(std::uint32_t need);
 
+    /** Calls `fn(key, blocks)` for every entry, least recently used
+     *  first. */
+    template <typename F>
+    void for_each_oldest_first(F&& fn) const {
+        for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+            fn(std::span<const tok::TokenId>(it->key), it->blocks);
+        }
+    }
+
     /** When set, called with an entry's key and blocks as it is
      *  evicted, before its blocks are released (the disk tier's
      *  write-back, i#416). */

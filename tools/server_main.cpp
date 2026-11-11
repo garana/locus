@@ -1,12 +1,19 @@
+#include <pthread.h>
+#include <signal.h>
+
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "backend_cli.hpp"
 #include "cli_spec.hpp"
+#include "locus/engine/disk_prefix_key.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/server/server.hpp"
@@ -20,6 +27,73 @@
  *   locus-server --backends
  *   locus-server --router [--listen HOST:PORT] INSTANCE...
  */
+namespace {
+
+/**
+ * Turns SIGINT / SIGTERM into OpenAiServer::stop(), so main returns and
+ * the destructors run: the engine then writes its RAM prefix cache to
+ * --prefix-cache-dir (i#416). The signals are blocked in the
+ * constructor, which must run before any other thread starts (threads
+ * inherit the mask), and only this object's thread takes them, through
+ * sigwait. Before a server is attached (the model load) a signal exits
+ * at once, as the default action would.
+ */
+class SignalStopper {
+  public:
+    SignalStopper() {
+        sigemptyset(&set_);
+        sigaddset(&set_, SIGINT);
+        sigaddset(&set_, SIGTERM);
+        pthread_sigmask(SIG_BLOCK, &set_, nullptr);
+        thread_ = std::thread([this] { run(); });
+    }
+    ~SignalStopper() {
+        done_.store(true);
+        pthread_kill(thread_.native_handle(), SIGTERM);  // wake sigwait
+        thread_.join();
+    }
+    SignalStopper(const SignalStopper&) = delete;
+    SignalStopper& operator=(const SignalStopper&) = delete;
+
+    /** Sets the server a signal stops (nullptr: none any more). */
+    void attach(locus::server::OpenAiServer* s) {
+        std::lock_guard lk(mu_);
+        server_ = s;
+    }
+
+  private:
+    /** The first signal stops the server; a second one (or one before
+     *  a server is attached) exits at once. */
+    void run() {
+        bool stopping = false;
+        for (;;) {
+            int sig = 0;
+            sigwait(&set_, &sig);
+            if (done_.load()) {
+                return;
+            }
+            std::lock_guard lk(mu_);
+            if (server_ == nullptr || stopping) {
+                std::_Exit(128 + sig);
+            }
+            std::fprintf(stderr,
+                         "locus-server: signal %d, stopping (again to "
+                         "exit at once)\n",
+                         sig);
+            server_->stop();
+            stopping = true;
+        }
+    }
+
+    sigset_t set_;
+    std::mutex mu_;
+    locus::server::OpenAiServer* server_ = nullptr;
+    std::atomic<bool> done_{false};
+    std::thread thread_;
+};
+
+}  // namespace
+
 int main(int argc, char** argv) {
     // locus-server --router ...: run locus-router instead (no model).
     if (argc > 1 && std::string(argv[1]) == "--router") {
@@ -83,6 +157,11 @@ OpenAI + Anthropic compatible inference server (default port 8080):
                      args.bad_number_value.c_str());
         return 2;
     }
+    if (!args.prefix_cache_dir.empty() && args.prefix_cache_disk_mib == 0) {
+        std::fprintf(stderr, "%s: --prefix-cache-disk-mib must be > 0\n",
+                     argv[0]);
+        return 2;
+    }
     if (args.positional.empty()) {
         std::fprintf(stderr,
                      "usage: %s [--backend NAME] <model.gguf> "
@@ -131,6 +210,7 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         reg.key = keys.front();
     }
 
+    SignalStopper stopper;  // before any other thread starts
     try {
         auto g = locus::gguf::GgufFile::open(model_path);
         auto model = locus::model::TransformerModel::load(g);
@@ -159,6 +239,12 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         }
         opt.engine.spec_adaptive = !args.spec_fixed;
         opt.engine.kv_type = args.kv_type;
+        if (!args.prefix_cache_dir.empty()) {
+            opt.engine.disk_prefix = locus::engine::open_disk_prefix(
+                args.prefix_cache_dir,
+                std::uint64_t{args.prefix_cache_disk_mib} << 20, g,
+                model_path, model, args.kv_type);
+        }
         opt.chat_template =
             locus::chat::ChatTemplate::from_gguf(g);
         if (!args.metrics_path.empty()) {
@@ -201,7 +287,11 @@ OpenAI + Anthropic compatible inference server (default port 8080):
                          reg.address.c_str(), reg.router_host.c_str(),
                          reg.router_port);
         }
-        if (!server.listen(locus::server::OpenAiServer::kAnyHost, port)) {
+        stopper.attach(&server);
+        const bool bound =
+            server.listen(locus::server::OpenAiServer::kAnyHost, port);
+        stopper.attach(nullptr);
+        if (!bound) {
             std::fprintf(stderr, "error: cannot bind port %d\n",
                          port);
             return 1;

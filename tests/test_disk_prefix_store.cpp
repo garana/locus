@@ -165,6 +165,21 @@ TEST_CASE("DiskPrefixStore: every key field is part of the match",
     REQUIRE(wide.find(kPrompt) == 0);
 }
 
+TEST_CASE("DiskPrefixStore: device attention is part of the match",
+          "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-dps-devattn")};
+    const auto in = blocks(2, 6);
+    DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+    const fs::path host = s.path_for(kPrompt, 2);
+    s.set_device_attention(true);
+    REQUIRE(s.key().device_attention);
+    REQUIRE(s.path_for(kPrompt, 2) != host);
+    REQUIRE(s.write(kPrompt, 2, srcs(in)));
+    REQUIRE(s.find(kPrompt) == 2);
+    s.set_device_attention(false);
+    REQUIRE(s.find(kPrompt) == 0);  // the other path's file
+}
+
 TEST_CASE("DiskPrefixStore: a file under another file's name is a miss",
           "[disk_prefix]") {
     // A digest collision, or a file of another key under this key's

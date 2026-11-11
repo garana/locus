@@ -1531,6 +1531,14 @@ void vulkan_set_prefill_f16(bool on) {
     s.prefill_f16 = on;
 }
 
+bool vulkan_prefill_f16() {
+    if (!vulkan_backend_usable()) {
+        return false;
+    }
+    std::lock_guard lk(state_mu());
+    return state().prefill_f16;
+}
+
 std::uint32_t vulkan_attn_block(std::uint32_t n, std::uint32_t heads,
                                 std::uint32_t n_pos) {
     return attn_block(n, heads, n_pos);

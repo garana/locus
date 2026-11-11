@@ -35,6 +35,11 @@ struct DiskKey {
     /** A digest of any RoPE or context override that changes K
      *  (0 when none). */
     std::uint64_t overrides = 0;
+    /** Attention ran on the device over a KV mirror (CUDA, i#466): its
+     *  sums differ from the host's, so later layers' K/V do too. Only
+     *  the engine's own cache knows (the mirror attaches when it fits),
+     *  so the engine sets it (DiskPrefixStore::set_device_attention). */
+    bool device_attention = false;
 };
 
 /**
@@ -121,7 +126,12 @@ class DiskPrefixStore {
     std::uint64_t used_bytes() const;
 
     const DiskKey& key() const { return key_; }
+
+    /** Sets DiskKey::device_attention. The engine calls it once, at
+     *  construction, before any read or write. */
+    void set_device_attention(bool on);
     std::size_t block_bytes() const { return block_bytes_; }
+    std::uint64_t cap_bytes() const { return cap_bytes_; }
 
     /** Virtual so a test can wrap the I/O (a slow or failing read). */
     virtual ~DiskPrefixStore() = default;

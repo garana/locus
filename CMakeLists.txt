@@ -28,6 +28,7 @@ add_library(locus
     src/locus/backend/vulkan/context.cpp
     src/locus/chat/template.cpp
     src/locus/config/config_file.cpp
+    src/locus/engine/disk_prefix_key.cpp
     src/locus/engine/disk_prefix_store.cpp
     src/locus/engine/disk_prefix_worker.cpp
     src/locus/engine/engine.cpp
