@@ -14,7 +14,8 @@ TEST_CASE("arch registry lists and finds", "[arch]") {
     REQUIRE(archs().size() >= 2);
     REQUIRE(find_arch("llama") != nullptr);
     REQUIRE(find_arch("deepseek2") != nullptr);
-    REQUIRE(find_arch("qwen2") == nullptr);
+    REQUIRE(find_arch("qwen2") != nullptr);
+    REQUIRE(find_arch("gptneox") == nullptr);
     for (const ArchSpec& a : archs()) {
         REQUIRE(a.load_hparams != nullptr);
         REQUIRE(a.load_attention != nullptr);
@@ -26,14 +27,14 @@ TEST_CASE("arch registry lists and finds", "[arch]") {
 TEST_CASE("unsupported architectures fail with a useful error",
           "[arch]") {
     GgufBuilder b;
-    b.header(0, 1).kv_string("general.architecture", "qwen2");
+    b.header(0, 1).kv_string("general.architecture", "gptneox");
     auto g = locus::gguf::GgufFile::parse(b.bytes());
     try {
         TransformerModel::load(g);
         FAIL("expected gguf::Error");
     } catch (const locus::gguf::Error& e) {
         const std::string msg = e.what();
-        REQUIRE(msg.find("qwen2") != std::string::npos);
+        REQUIRE(msg.find("gptneox") != std::string::npos);
         REQUIRE(msg.find("llama") != std::string::npos);
         REQUIRE(msg.find("deepseek2") != std::string::npos);
     }
