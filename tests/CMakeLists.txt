@@ -72,6 +72,7 @@ add_executable(locus_tests
     test_vulkan_conv1d.cpp
     test_vulkan_fused_matvec.cpp
     test_vulkan_small_batch.cpp
+    test_vulkan_kv_f16.cpp
     test_vulkan_prefill.cpp
     test_vulkan_mem_fit.cpp
     test_vulkan_limits.cpp
