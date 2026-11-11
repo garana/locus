@@ -4,6 +4,7 @@
 #include <span>
 #include <vector>
 
+#include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
 
 namespace locus::image {
@@ -54,7 +55,9 @@ class QwenVae {
      * @throws std::invalid_argument on a bad size or no encoder.
      */
     std::vector<float> encode(std::span<const float> chw, std::uint32_t h,
-                              std::uint32_t w) const;
+                              std::uint32_t w,
+                              const backend::Ops& op =
+                                  backend::best_backend().ops) const;
 
     /**
      * The decoder, clamped to [-1, 1] as the reference.
@@ -64,7 +67,9 @@ class QwenVae {
      * @returns [3][h * scale()][w * scale()].
      */
     std::vector<float> decode(std::span<const float> z, std::uint32_t h,
-                              std::uint32_t w) const;
+                              std::uint32_t w,
+                              const backend::Ops& op =
+                                  backend::best_backend().ops) const;
 
     /** z = (z - latents_mean) / latents_std, per channel, in place. */
     void normalize(std::span<float> z) const;
@@ -94,10 +99,29 @@ class QwenVae {
         Conv conv;  ///< the resampler's conv
     };
 
+    QwenVae() = default;
+    QwenVae(const QwenVae&) = default;
+    QwenVae& operator=(const QwenVae&) = default;
+    QwenVae(QwenVae&&) = default;
+    QwenVae& operator=(QwenVae&&) = default;
+    /** Drops the GPU copies of the conv weights, when a call ran on
+     *  backend::vulkan_image_ops(): they are cached by host pointer, and
+     *  these are this object's own buffers (the 2D slices of the 3D
+     *  kernels), so a later allocation at the same address must not
+     *  find them. */
+    ~QwenVae();
+
   private:
     std::vector<float> run(const std::vector<Layer>& layers,
                            std::vector<float> x, std::uint32_t& c,
-                           std::uint32_t& h, std::uint32_t& w) const;
+                           std::uint32_t& h, std::uint32_t& w,
+                           const backend::Ops& op) const;
+    /** Calls fn on every conv. */
+    template <class F>
+    void each_conv(F&& fn) const;
+
+    /** Set by a call on the Vulkan image ops (see ~QwenVae). */
+    mutable bool gpu_used_ = false;
 
     std::uint32_t z_ = 0, downs_ = 0;
     std::vector<float> mean_, std_;

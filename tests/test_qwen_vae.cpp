@@ -10,6 +10,9 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan/context.hpp"
 #include "locus/gguf/gguf.hpp"
 
 namespace {
@@ -59,6 +62,23 @@ void check_close(std::span<const float> got, std::span<const float> ref,
     REQUIRE(err <= rel * norm);
 }
 
+struct Leg {
+    const char* name;
+    const locus::backend::Ops* op;
+    double bound;
+};
+
+/** The CPU, plus the Vulkan image ops when there is a device (i#587:
+ *  the convs on the GPU, the attention block's matmuls too, so a looser
+ *  bound for their other summation order). */
+std::vector<Leg> legs() {
+    std::vector<Leg> v = {{"cpu", &locus::backend::best_backend().ops, 1e-5}};
+    if (locus::backend::vk::VulkanContext::available()) {
+        v.push_back({"vulkan", &locus::backend::vulkan_image_ops(), 1e-4});
+    }
+    return v;
+}
+
 }  // namespace
 
 // i#533 VALUES, on every box: a tiny AutoencoderKLQwenImage from
@@ -79,13 +99,18 @@ TEST_CASE("qwen vae matches diffusers on a synthetic model",
 
     auto img = lcg(777, std::size_t{3} * kSize * kSize);
     for (float& x : img) x *= 4.0f;
-    const auto mean = v.encode(img, kSize, kSize);
-    check_close(mean, std::span<const float>(ref).first(nz), 1e-5);
-
     auto z = lcg(999, nz);
     for (float& x : z) x *= 4.0f;
-    const auto out = v.decode(z, kLat, kLat);
-    check_close(out, std::span<const float>(ref).subspan(nz), 1e-5);
+    for (const Leg& leg : legs()) {
+        DYNAMIC_SECTION(leg.name) {
+            const auto mean = v.encode(img, kSize, kSize, *leg.op);
+            check_close(mean, std::span<const float>(ref).first(nz),
+                        leg.bound);
+            const auto out = v.decode(z, kLat, kLat, *leg.op);
+            check_close(out, std::span<const float>(ref).subspan(nz),
+                        leg.bound);
+        }
+    }
 }
 
 TEST_CASE("qwen vae latents normalize and back", "[qwen-vae][image]") {
@@ -135,11 +160,16 @@ TEST_CASE("qwen vae matches diffusers on the real Qwen-Image VAE",
 
     auto img = lcg(777, std::size_t{3} * kSize * kSize);
     for (float& x : img) x *= 4.0f;
-    const auto mean = v.encode(img, kSize, kSize);
-    check_close(mean, std::span<const float>(ref).first(nz), 1e-5);
-
     auto zv = lcg(999, nz);
     for (float& x : zv) x *= 4.0f;
-    const auto out = v.decode(zv, lat, lat);
-    check_close(out, std::span<const float>(ref).subspan(nz), 1e-5);
+    for (const Leg& leg : legs()) {
+        DYNAMIC_SECTION(leg.name) {
+            const auto mean = v.encode(img, kSize, kSize, *leg.op);
+            check_close(mean, std::span<const float>(ref).first(nz),
+                        leg.bound);
+            const auto out = v.decode(zv, lat, lat, *leg.op);
+            check_close(out, std::span<const float>(ref).subspan(nz),
+                        leg.bound);
+        }
+    }
 }

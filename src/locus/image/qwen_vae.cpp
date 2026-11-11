@@ -9,6 +9,7 @@
 
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/image/dense.hpp"
 #include "locus/sys/thread_pool.hpp"
 
@@ -139,15 +140,22 @@ std::vector<float> floats(const gguf::GgufFile& g, const std::string& key,
     return v;
 }
 
-/** The 2D conv, [in][h][w] to [out][h'][w']. */
+/** The 2D conv, [in][h][w] to [out][h'][w']: conv2d_vulkan on the
+ *  Vulkan image ops (i#587), else the CPU's. */
 std::vector<float> conv2d(const Conv& c, std::span<const float> x,
                           std::uint32_t h, std::uint32_t w,
-                          std::uint32_t stride, std::uint32_t pad) {
+                          std::uint32_t stride, std::uint32_t pad,
+                          const backend::Ops& op) {
     const std::uint32_t oh = (h + 2 * pad - c.k) / stride + 1,
                         ow = (w + 2 * pad - c.k) / stride + 1;
     std::vector<float> out(std::size_t{c.out} * oh * ow);
-    backend::conv2d_mt(x, c.in, h, w, c.w, c.out, c.k, c.k, c.b, stride,
-                       pad, 1, out);
+    if (&op == &backend::vulkan_image_ops()) {
+        backend::conv2d_vulkan(x, c.in, h, w, c.w, c.out, c.k, c.k, c.b,
+                               stride, pad, 1, out);
+    } else {
+        backend::conv2d_mt(x, c.in, h, w, c.w, c.out, c.k, c.k, c.b, stride,
+                           pad, 1, out);
+    }
     return out;
 }
 
@@ -180,12 +188,15 @@ std::vector<float> norm(std::span<const float> x, std::span<const float> g,
 
 /** A residual block on [in][h][w]. */
 std::vector<float> res_block(const QwenVae::Res& r, std::span<const float> x,
-                             std::uint32_t h, std::uint32_t w) {
+                             std::uint32_t h, std::uint32_t w,
+                             const backend::Ops& op) {
     const std::size_t plane = std::size_t{h} * w;
-    auto a = conv2d(r.c1, norm(x, r.g1, r.c1.in, plane, true), h, w, 1, 1);
-    auto b = conv2d(r.c2, norm(a, r.g2, r.c2.in, plane, true), h, w, 1, 1);
+    auto a =
+        conv2d(r.c1, norm(x, r.g1, r.c1.in, plane, true), h, w, 1, 1, op);
+    auto b =
+        conv2d(r.c2, norm(a, r.g2, r.c2.in, plane, true), h, w, 1, 1, op);
     if (r.shortcut.out != 0) {
-        const auto s = conv2d(r.shortcut, x, h, w, 1, 0);
+        const auto s = conv2d(r.shortcut, x, h, w, 1, 0, op);
         for (std::size_t i = 0; i < b.size(); ++i) b[i] += s[i];
     } else {
         for (std::size_t i = 0; i < b.size(); ++i) b[i] += x[i];
@@ -196,10 +207,11 @@ std::vector<float> res_block(const QwenVae::Res& r, std::span<const float> x,
 /** The single-head attention block over the h * w pixels. */
 std::vector<float> attn_block(const QwenVae::Attn& a,
                               std::span<const float> x, std::uint32_t h,
-                              std::uint32_t w) {
+                              std::uint32_t w, const backend::Ops& op) {
     const std::uint32_t c = a.proj.in;
     const std::size_t plane = std::size_t{h} * w;
-    const auto qkv = conv2d(a.qkv, norm(x, a.g, c, plane, false), h, w, 1, 0);
+    const auto qkv =
+        conv2d(a.qkv, norm(x, a.g, c, plane, false), h, w, 1, 0, op);
     // [3c][plane] to token-major q, k and v, [plane][c] each.
     std::vector<float> q(plane * c), k(q.size()), v(q.size()),
         o(q.size());
@@ -211,12 +223,12 @@ std::vector<float> attn_block(const QwenVae::Attn& a,
         }
     });
     const auto n = static_cast<std::uint32_t>(plane);
-    dense::attention(backend::best_backend().ops, q, n, k, v, n, 1, c, o);
+    dense::attention(op, q, n, k, v, n, 1, c, o);
     std::vector<float> t(plane * c);
     parallel(c, [&](std::size_t i) {
         for (std::size_t p = 0; p < plane; ++p) t[i * plane + p] = o[p * c + i];
     });
-    auto out = conv2d(a.proj, t, h, w, 1, 0);
+    auto out = conv2d(a.proj, t, h, w, 1, 0, op);
     for (std::size_t i = 0; i < out.size(); ++i) out[i] += x[i];
     return out;
 }
@@ -319,17 +331,46 @@ QwenVae QwenVae::load(const gguf::GgufFile& g) {
 
 std::uint32_t QwenVae::scale() const { return 1u << downs_; }
 
+QwenVae::~QwenVae() {
+    if (!gpu_used_) return;
+    each_conv([](const Conv& k) {
+        for (const auto* v : {&k.w, &k.b}) {
+            if (!v->empty()) {
+                backend::vulkan_release_weights(v->data(),
+                                                v->size() * sizeof(float));
+            }
+        }
+    });
+}
+
+template <class F>
+void QwenVae::each_conv(F&& fn) const {
+    for (const Conv* k : {&enc_in_, &enc_out_, &quant_, &post_quant_,
+                          &dec_in_, &dec_out_}) {
+        fn(*k);
+    }
+    for (const auto* layers : {&enc_, &dec_}) {
+        for (const Layer& l : *layers) {
+            for (const Conv* k : {&l.res.c1, &l.res.c2, &l.res.shortcut,
+                                  &l.attn.qkv, &l.attn.proj, &l.conv}) {
+                fn(*k);
+            }
+        }
+    }
+}
+
 std::vector<float> QwenVae::run(const std::vector<Layer>& layers,
                                 std::vector<float> x, std::uint32_t& c,
-                                std::uint32_t& h, std::uint32_t& w) const {
+                                std::uint32_t& h, std::uint32_t& w,
+                                const backend::Ops& op) const {
     for (const Layer& l : layers) {
         switch (l.kind) {
             case Layer::Kind::kRes:
-                x = res_block(l.res, x, h, w);
+                x = res_block(l.res, x, h, w, op);
                 c = l.res.c2.out;
                 break;
             case Layer::Kind::kAttn:
-                x = attn_block(l.attn, x, h, w);
+                x = attn_block(l.attn, x, h, w, op);
                 break;
             case Layer::Kind::kDown: {
                 // ZeroPad2d((0, 1, 0, 1)), then 3 x 3 stride 2.
@@ -342,7 +383,7 @@ std::vector<float> QwenVae::run(const std::vector<Layer>& layers,
                                     w * sizeof(float));
                     }
                 }
-                x = conv2d(l.conv, p, h + 1, w + 1, 2, 0);
+                x = conv2d(l.conv, p, h + 1, w + 1, 2, 0, op);
                 h /= 2;
                 w /= 2;
                 break;
@@ -361,7 +402,7 @@ std::vector<float> QwenVae::run(const std::vector<Layer>& layers,
                 });
                 h = uh;
                 w = uw;
-                x = conv2d(l.conv, u, h, w, 1, 1);
+                x = conv2d(l.conv, u, h, w, 1, 1, op);
                 c = l.conv.out;
                 break;
             }
@@ -371,7 +412,8 @@ std::vector<float> QwenVae::run(const std::vector<Layer>& layers,
 }
 
 std::vector<float> QwenVae::encode(std::span<const float> chw,
-                                   std::uint32_t h, std::uint32_t w) const {
+                                   std::uint32_t h, std::uint32_t w,
+                                   const backend::Ops& op) const {
     if (!has_encoder()) {
         throw std::invalid_argument("qwen vae: this GGUF has no encoder");
     }
@@ -380,25 +422,28 @@ std::vector<float> QwenVae::encode(std::span<const float> chw,
         throw std::invalid_argument(
             "qwen vae: need [3][h][w], sides multiples of scale()");
     }
+    if (&op == &backend::vulkan_image_ops()) gpu_used_ = true;
     std::uint32_t c = enc_in_.out;
-    auto x = run(enc_, conv2d(enc_in_, chw, h, w, 1, 1), c, h, w);
+    auto x = run(enc_, conv2d(enc_in_, chw, h, w, 1, 1, op), c, h, w, op);
     x = conv2d(enc_out_, norm(x, enc_norm_, c, std::size_t{h} * w, true),
-               h, w, 1, 1);
-    x = conv2d(quant_, x, h, w, 1, 0);
+               h, w, 1, 1, op);
+    x = conv2d(quant_, x, h, w, 1, 0, op);
     x.resize(std::size_t{z_} * h * w);  // the mean: the first z channels
     return x;
 }
 
 std::vector<float> QwenVae::decode(std::span<const float> z, std::uint32_t h,
-                                   std::uint32_t w) const {
+                                   std::uint32_t w,
+                                   const backend::Ops& op) const {
     if (h == 0 || w == 0 || z.size() != std::size_t{z_} * h * w) {
         throw std::invalid_argument("qwen vae: need [z_dim][h][w]");
     }
-    auto x = conv2d(post_quant_, z, h, w, 1, 0);
+    if (&op == &backend::vulkan_image_ops()) gpu_used_ = true;
+    auto x = conv2d(post_quant_, z, h, w, 1, 0, op);
     std::uint32_t c = dec_in_.out;
-    x = run(dec_, conv2d(dec_in_, x, h, w, 1, 1), c, h, w);
+    x = run(dec_, conv2d(dec_in_, x, h, w, 1, 1, op), c, h, w, op);
     x = conv2d(dec_out_, norm(x, dec_norm_, c, std::size_t{h} * w, true),
-               h, w, 1, 1);
+               h, w, 1, 1, op);
     for (float& v : x) v = std::clamp(v, -1.0f, 1.0f);
     return x;
 }
