@@ -37,6 +37,7 @@
 #include "locus/image/ltxv_pipeline.hpp"
 #include "locus/image/pixart_pipeline.hpp"
 #include "locus/image/png.hpp"
+#include "locus/image/qwen_edit_pipeline.hpp"
 #include "locus/image/vq16.hpp"
 #include "locus/model/codec.hpp"
 #include "locus/model/expert_metrics.hpp"
@@ -765,6 +766,26 @@ std::vector<std::byte> image_input_bytes(const json& v,
     return http::base64_decode(s, max_bytes);
 }
 
+/**
+ * @param s "WxH": two decimal sides of 1 to 4 digits, no signs or spaces.
+ * @returns {width, height}.
+ * @throws std::invalid_argument otherwise.
+ */
+std::pair<std::uint32_t, std::uint32_t> parse_size_wxh(const std::string& s) {
+    const auto x = s.find('x');
+    const auto digits = [](std::string_view d) {
+        return !d.empty() && d.size() <= 4 &&
+               std::all_of(d.begin(), d.end(),
+                           [](char c) { return c >= '0' && c <= '9'; });
+    };
+    if (x == std::string::npos || !digits(std::string_view(s).substr(0, x)) ||
+        !digits(std::string_view(s).substr(x + 1))) {
+        throw std::invalid_argument("size must be WIDTHxHEIGHT");
+    }
+    return {static_cast<std::uint32_t>(std::stoul(s.substr(0, x))),
+            static_cast<std::uint32_t>(std::stoul(s.substr(x + 1)))};
+}
+
 /** @returns Whether a message's content holds an image part. */
 bool has_image_part(const json& content, bool anthropic) {
     if (!content.is_array()) return false;
@@ -1032,10 +1053,11 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
     }
     // A broken image pipeline directory stops the server here too. A
     // flux or clip_text GGUF (parts only FLUX.1 has) makes it a FLUX.1
-    // pipeline, so a FLUX set missing a part names the FLUX parts; else
-    // PixArt, whose error names both sets.
+    // pipeline, so a FLUX set missing a part names the FLUX parts; a
+    // qwen_image GGUF makes it Qwen-Image-Edit; else PixArt, whose
+    // error names both sets.
     if (!opt_.image_model_dir.empty()) {
-        bool flux = false;
+        bool flux = false, qwen = false;
         std::error_code ec;
         for (const auto& e : std::filesystem::directory_iterator(
                  opt_.image_model_dir, ec)) {
@@ -1046,8 +1068,12 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             const auto g = gguf::GgufFile::open(e.path().string());
             const auto arch = g.get_string("general.architecture");
             if (arch == "flux" || arch == "clip_text") flux = true;
+            if (arch == "qwen_image") qwen = true;
         }
-        if (flux) {
+        if (qwen) {
+            qwen_edit_ =
+                image::QwenEditPipeline::load_dir(opt_.image_model_dir);
+        } else if (flux) {
             flux_ = image::FluxPipeline::load_dir(opt_.image_model_dir);
         } else {
             try {
@@ -1118,7 +1144,7 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
     } else if (be == "cuda") {
         devices_.push_back({"cuda", backend::cuda_device_name()});
     }
-    if ((pixart_ || flux_) && be != "vulkan" &&
+    if ((pixart_ || flux_ || qwen_edit_) && be != "vulkan" &&
         backend::vulkan_imports_host_memory()) {
         devices_.push_back({"vulkan", backend::vulkan_device_name()});
     }
@@ -1596,7 +1622,9 @@ void OpenAiServer::install_routes() {
             }
             json kinds = json::array({"text"});
             if (vision_) kinds.push_back("image-to-text");
-            if (janus_ || pixart_ || flux_) kinds.push_back("image");
+            if (janus_ || pixart_ || flux_ || qwen_edit_) {
+                kinds.push_back("image");
+            }
             if (ltxv_) kinds.push_back("video");
             if (snac_) kinds.push_back("speech");
             if (rerank_) kinds.push_back("rerank");
@@ -3807,18 +3835,153 @@ void OpenAiServer::install_routes() {
             });
     };
 
-    // POST /v1/images/edits (FLUX.1 Kontext): the image and the prompt
-    // -> the edited image, as b64_json; see handle_flux. A JSON body
-    // with the image as base64 or a data: URL (OpenAI's multipart form
-    // is not parsed). 503 unless --image-model loaded FLUX.1.
-    auto handle_edits = [this, handle_flux](const http::Request& req,
-                                            http::ServerResponse& res,
-                                            const http::RequestContext& ctx) {
+    // POST /v1/images/edits with Qwen-Image-Edit (i#616): image (a
+    // base64 PNG or JPEG, or a data: URL of one) and prompt -> the edited
+    // image, as b64_json. Extensions to the OpenAI shape: negative_prompt
+    // (true CFG when true_cfg_scale is over 1; default none),
+    // true_cfg_scale (default 4), steps (2 to 100, default 50) and seed.
+    // size "WxH" sets the output (default: the reference's aspect at
+    // about 1024 x 1024 pixels), each side floored to a multiple of 16,
+    // up to 2048. One image at a time, under image_mu_.
+    auto handle_qwen_edit = [this](const http::Request& req,
+                                   http::ServerResponse& res,
+                                   const http::RequestContext& ctx) {
+        try {
+            const json body = json::parse(req.body);
+            auto str = [&](const char* k) -> std::string {
+                if (!body[k].is_string()) {
+                    throw std::invalid_argument(std::string(k) +
+                                                " must be a string");
+                }
+                return body[k].get<std::string>();
+            };
+            image::QwenEditPipeline::Request p;
+            if (body.contains("prompt")) p.prompt = str("prompt");
+            if (p.prompt.empty()) {
+                throw std::invalid_argument(
+                    "prompt must be a non-empty string");
+            }
+            if (body.contains("negative_prompt")) {
+                p.negative_prompt = str("negative_prompt");
+            }
+            if (body.contains("n") &&
+                (!body["n"].is_number_integer() ||
+                 body["n"].get<std::int64_t>() != 1)) {
+                throw std::invalid_argument("n must be 1");
+            }
+            if (body.contains("response_format") &&
+                str("response_format") != "b64_json") {
+                throw std::invalid_argument(
+                    "response_format must be b64_json");
+            }
+            if (!body.contains("image")) {
+                throw std::invalid_argument(
+                    "image must be a base64 PNG or JPEG, or a data: URL of "
+                    "one");
+            }
+            image::DecodeLimits lim;
+            lim.max_bytes = opt_.max_body_bytes;
+            p.reference = image::decode_image(
+                image_input_bytes(body["image"], opt_.max_body_bytes), lim);
+            if (body.contains("size")) {
+                std::tie(p.width, p.height) = parse_size_wxh(str("size"));
+                if (p.width < 16 || p.height < 16 || p.width > 2048 ||
+                    p.height > 2048) {
+                    throw std::invalid_argument(
+                        "size sides must be from 16 to 2048");
+                }
+            }
+            if (body.contains("steps")) {
+                const auto& s = body["steps"];
+                if (!s.is_number_integer() || s.get<std::int64_t>() < 2 ||
+                    s.get<std::int64_t>() > 100) {
+                    throw std::invalid_argument(
+                        "steps must be an integer from 2 to 100");
+                }
+                p.steps = static_cast<std::uint32_t>(s.get<std::int64_t>());
+            }
+            if (body.contains("true_cfg_scale")) {
+                const auto& g = body["true_cfg_scale"];
+                if (!g.is_number() || !std::isfinite(g.get<double>()) ||
+                    g.get<double>() < 0.0 || g.get<double>() > 100.0) {
+                    throw std::invalid_argument(
+                        "true_cfg_scale must be from 0 to 100");
+                }
+                p.true_cfg_scale = static_cast<float>(g.get<double>());
+            }
+            p.seed = std::random_device{}();
+            if (body.contains("seed")) {
+                if (!body["seed"].is_number_integer()) {
+                    throw std::invalid_argument("seed must be an integer");
+                }
+                p.seed = static_cast<std::uint64_t>(
+                    body["seed"].get<std::int64_t>());
+            }
+            // The MMDiT and the VAE run on the GPU where it maps host
+            // memory, else on the CPU; the language model always on the
+            // CPU.
+            const auto& op = backend::vulkan_imports_host_memory()
+                                 ? backend::vulkan_image_ops()
+                                 : backend::best_backend().ops;
+            image::QwenEditPipeline::Timing took;
+            std::vector<std::uint8_t> rgb;
+            std::uint32_t w = 0, h = 0;
+            {
+                std::unique_lock<std::mutex> lk(image_mu_, std::try_to_lock);
+                if (!lk.owns_lock()) {
+                    set_unavailable(res,
+                                    "an image or video is already being "
+                                    "generated; retry later",
+                                    60);
+                    return;
+                }
+                rgb = qwen_edit_->edit(p, op, ctx.client_alive, w, h, &took);
+            }
+            if (rgb.empty()) {
+                res.status = 499;  // the client went away
+                return;
+            }
+            const auto png = image::encode_png(rgb, w, h);
+            res.set_header("X-Image-Seed", std::to_string(p.seed));
+            res.set_header("Server-Timing",
+                           "encode;dur=" + std::to_string(took.encode) +
+                               ", denoise;dur=" +
+                               std::to_string(took.denoise) +
+                               ", decode;dur=" + std::to_string(took.decode));
+            const auto created =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+            res.set_content(
+                json{{"created", created},
+                     {"data", json::array({json{
+                                  {"b64_json", http::base64_encode(png)}}})}}
+                    .dump(-1, ' ', false, kLossy),
+                "application/json");
+        } catch (const std::exception& e) {
+            set_error(res, e);
+        }
+    };
+
+    // POST /v1/images/edits: Qwen-Image-Edit (handle_qwen_edit) or FLUX.1
+    // Kontext (handle_flux): the image and the prompt -> the edited
+    // image, as b64_json. A JSON body with the image as base64 or a
+    // data: URL (OpenAI's multipart form is not parsed). 503 unless
+    // --image-model loaded one of the two.
+    auto handle_edits = [this, handle_flux, handle_qwen_edit](
+                            const http::Request& req,
+                            http::ServerResponse& res,
+                            const http::RequestContext& ctx) {
         auth_event("create", "images.edits", ctx.identity);
+        if (qwen_edit_) {
+            handle_qwen_edit(req, res, ctx);
+            return;
+        }
         if (!flux_) {
             set_unavailable(res,
                             "image edits are not configured (needs "
-                            "--image-model with a FLUX.1 Kontext pipeline)");
+                            "--image-model with a Qwen-Image-Edit or "
+                            "FLUX.1 Kontext pipeline)");
             return;
         }
         handle_flux(req, res, ctx, true);

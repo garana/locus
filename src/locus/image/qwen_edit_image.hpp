@@ -23,10 +23,12 @@ namespace locus::image {
  * even, as Python's round) to a multiple of 32.
  *
  * @returns {width, height}.
- * @throws std::invalid_argument on a zero side.
+ * @param area The pixel count to aim at (the pipeline's 1024 x 1024;
+ *     smaller in tests).
+ * @throws std::invalid_argument on a zero side or area.
  */
-std::pair<std::uint32_t, std::uint32_t> qwen_edit_dimensions(std::uint32_t w,
-                                                             std::uint32_t h);
+std::pair<std::uint32_t, std::uint32_t> qwen_edit_dimensions(
+    std::uint32_t w, std::uint32_t h, std::uint64_t area = 1024 * 1024);
 
 /**
  * transformers' Qwen2-VL smart_resize: both sides multiples of factor,
@@ -54,9 +56,12 @@ struct EditReference {
 
 /**
  * @param img Any RGB image.
+ * @param area The VAE image's pixel count to aim at
+ *     (qwen_edit_dimensions).
  * @throws std::invalid_argument on an empty image.
  */
-EditReference qwen_edit_reference(const Rgb8& img);
+EditReference qwen_edit_reference(const Rgb8& img,
+                                  std::uint64_t area = 1024 * 1024);
 
 /**
  * diffusers' QwenImageEditPipeline._pack_latents: 2 x 2 patches of

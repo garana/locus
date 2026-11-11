@@ -115,7 +115,8 @@ std::vector<float> qwen_edit_denoise(
     std::span<const float> noise, QwenImageDit::Segment noise_seg,
     std::span<const float> ref, QwenImageDit::Segment ref_seg,
     QwenEditText prompt, QwenEditText negative, float cfg_scale,
-    std::uint32_t steps, const backend::Ops& op) {
+    std::uint32_t steps, const backend::Ops& op,
+    const std::function<bool()>& alive) {
     const std::size_t ch = dit.channels();
     const std::size_t n_noise =
         std::size_t{noise_seg.frames} * noise_seg.rows * noise_seg.cols;
@@ -136,6 +137,7 @@ std::vector<float> qwen_edit_denoise(
     x.insert(x.end(), ref.begin(), ref.end());
     const std::span<float> lat(x.data(), n_noise * ch);
     for (std::uint32_t i = 0; i < steps; ++i) {
+        if (alive && !alive()) return {};
         const float t = FluxSampler::model_sigma(sig[i]);
         auto v = dit.forward(x, seg_span, prompt.rows, prompt.n, t, op);
         v.resize(n_noise * ch);
