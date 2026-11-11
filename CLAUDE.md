@@ -40,12 +40,13 @@ and an x86 host tests every code PR.
   3. shared numeric code (kernels, the transformer forward, the engine
      scheduler, backend state): the full suite, plus every golden whose
      model uses the touched code, on each arch.
-- Batch runs: PRs that passed review by reading merge, at their frozen
-  heads and in their merge order, into one integration branch; one
+- Batch runs: PRs that passed review by reading are combined, at their
+  frozen heads and in their merge order, into one integration branch; one
   full-suite run there covers them all. A vote names the integration
   SHA and the PR heads it held. A red run is bisected by halves; the
   PR that breaks it leaves the batch. PRs that conflict go in separate
   batches, and a PR's head does not change once it is in a batch.
+- Votes and review notes go over the agent bus, not GitHub PR comments.
 
 ## Conventions
 
