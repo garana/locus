@@ -1,6 +1,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -134,6 +135,14 @@ TEST_CASE("the disk prefix key follows the model file and its settings",
         g, model_path(), model, locus::kv::KvType::kF32, bb2);
     REQUIRE(flipped.overrides != k.overrides);
     model.use_q8k_activations(q8k);
+
+    // So do the LOCUS_* switches that pick other kernels.
+    REQUIRE(std::getenv("LOCUS_BATCH_DEQUANT") == nullptr);
+    ::setenv("LOCUS_BATCH_DEQUANT", "1", 1);
+    const auto dequant = locus::engine::disk_key_for(
+        g, model_path(), model, locus::kv::KvType::kF32, bb2);
+    ::unsetenv("LOCUS_BATCH_DEQUANT");
+    REQUIRE(dequant.overrides != k.overrides);
 
     // A copy of the file with another mtime is another model.
     const fs::path copy = fs::temp_directory_path() /

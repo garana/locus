@@ -208,6 +208,7 @@ std::vector<std::uint8_t> DiskPrefixStore::header(
     put(h, key_.model_hash);
     put(h, key_.model_size);
     put(h, key_.overrides);
+    put(h, static_cast<std::uint32_t>(key_.device_attention));
     put(h, key_.block_tokens);
     put(h, key_.kv_dim);
     put(h, key_.n_layers);
@@ -511,6 +512,15 @@ bool DiskPrefixStore::stored(std::uint64_t digest) {
     used_ -= it->second.bytes;
     files_.erase(it);
     return false;
+}
+
+void DiskPrefixStore::set_device_attention(bool on) {
+    std::lock_guard lock(mu_);
+    key_.device_attention = on;
+    // The seed names the files: the other path's files become misses
+    // (and stay under the cap until LRU removes them).
+    const std::vector<std::uint8_t> k = header({}, 0);
+    key_seed_ = checksum(k.data(), k.size());
 }
 
 std::uint64_t DiskPrefixStore::used_bytes() const {

@@ -40,6 +40,11 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
                 "disk prefix cache: the store's key does not match the "
                 "KV cache geometry");
         }
+        // Device attention over a KV mirror (CUDA) gives other K/V
+        // bits than the host's; only this cache knows if it has one.
+        cfg_.disk_prefix->set_device_attention(
+            cache_.mirror_data() != nullptr &&
+            m.active_backend().ops.kv_attend != nullptr);
         cfg_.prefix_cache = true;
     }
     if (cfg_.prefix_cache) {

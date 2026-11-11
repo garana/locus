@@ -20,8 +20,9 @@ namespace locus::engine {
  * would take about a minute for a 10 GB model on a slow disk, and the
  * mtime makes a file replaced under the same name a miss. The override
  * part hashes what changes K or V bits besides the weights: context
- * length, RoPE and YaRN settings, Q8_K activations, the device name
- * and, on Vulkan, f16 prefill staging and the batch-invariant kernels.
+ * length, RoPE and YaRN settings, Q8_K activations, the device name,
+ * the LOCUS_* debug and offload switches that pick other kernels and,
+ * on Vulkan, f16 prefill staging and the batch-invariant kernels.
  * The backend is the one running `m`, so call this after use_backend
  * and the Vulkan mode setters.
  *
@@ -36,6 +37,8 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
 /**
  * Opens the disk prefix store under `dir` for `m` (disk_key_for), with
  * a cap of `cap_bytes`.
+ * @throws std::invalid_argument for an MoE model on a GPU backend: its
+ *     expert route also depends on the free device memory at startup.
  */
 std::shared_ptr<DiskPrefixStore> open_disk_prefix(
     const std::string& dir, std::uint64_t cap_bytes,

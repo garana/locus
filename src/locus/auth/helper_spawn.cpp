@@ -115,6 +115,11 @@ std::unique_ptr<HelperConnection> spawn_helper(
             cargv.push_back(const_cast<char*>(a.c_str()));
         }
         cargv.push_back(nullptr);
+        // A signal mask survives exec: locus-server blocks SIGINT and
+        // SIGTERM for its stopper thread, and the helper must get them.
+        sigset_t none;
+        sigemptyset(&none);
+        ::sigprocmask(SIG_SETMASK, &none, nullptr);
         ::execvp(cargv[0], cargv.data());
         _exit(127);  // exec failed
     }
