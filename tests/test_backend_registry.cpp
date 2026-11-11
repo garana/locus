@@ -62,26 +62,55 @@ TEST_CASE("gpu_idle_warning flags a default CPU pick with a GPU usable",
 
     SECTION("default CPU pick with a usable GPU warns") {
         const Backend list[] = {cpu, vk};
-        REQUIRE(gpu_idle_warning(true, cpu, list) ==
+        REQUIRE(gpu_idle_warning(true, cpu, list, true) ==
                 "warning: running on the CPU (neon) by default; a GPU "
                 "is usable: pass --backend vulkan (or set "
                 "LOCUS_BACKEND=vulkan)");
         const Backend list_cuda[] = {cpu, cuda};
-        REQUIRE(gpu_idle_warning(true, cpu, list_cuda).find(
+        REQUIRE(gpu_idle_warning(true, cpu, list_cuda, false).find(
                     "--backend cuda") != std::string::npos);
     }
     SECTION("an explicit choice does not warn") {
         const Backend list[] = {cpu, vk};
-        REQUIRE(gpu_idle_warning(false, cpu, list).empty());
+        REQUIRE(gpu_idle_warning(false, cpu, list, true).empty());
     }
     SECTION("a GPU pick does not warn") {
         const Backend list[] = {cpu, vk};
-        REQUIRE(gpu_idle_warning(true, vk, list).empty());
+        REQUIRE(gpu_idle_warning(true, vk, list, true).empty());
     }
     SECTION("no usable GPU does not warn") {
         const Backend list[] = {cpu, vk_off};
-        REQUIRE(gpu_idle_warning(true, cpu, list).empty());
+        REQUIRE(gpu_idle_warning(true, cpu, list, true).empty());
     }
+    SECTION("a Vulkan device slower than the CPU does not warn") {
+        const Backend list[] = {cpu, vk};
+        REQUIRE(gpu_idle_warning(true, cpu, list, false).empty());
+        const Backend list_both[] = {cpu, vk, cuda};
+        REQUIRE(gpu_idle_warning(true, cpu, list_both, false).find(
+                    "--backend cuda") != std::string::npos);
+    }
+}
+
+TEST_CASE("vulkan_beats_cpu: discrete and Apple GPUs only",
+          "[backend]") {
+    REQUIRE(vulkan_beats_cpu("discrete", "NVIDIA GeForce RTX 3060"));
+    REQUIRE(vulkan_beats_cpu("integrated", "Apple M2 Pro"));
+    REQUIRE_FALSE(vulkan_beats_cpu("integrated", "V3D 7.1.10.2"));
+    REQUIRE_FALSE(
+        vulkan_beats_cpu("cpu", "llvmpipe (LLVM 15.0.6, 128 bits)"));
+    REQUIRE_FALSE(vulkan_beats_cpu("virtual", "virtio-gpu"));
+    REQUIRE_FALSE(vulkan_beats_cpu("other", ""));
+}
+
+TEST_CASE("vulkan_device_beats_cpu follows the device in use",
+          "[backend]") {
+    const auto devs = vulkan_devices();
+    if (devs.empty()) {
+        REQUIRE_FALSE(vulkan_device_beats_cpu());
+        return;
+    }
+    const auto& d = devs[static_cast<std::size_t>(vulkan_thread_device())];
+    REQUIRE(vulkan_device_beats_cpu() == vulkan_beats_cpu(d.type, d.name));
 }
 
 TEST_CASE("backend_defaulted needs no choice and no LOCUS_BACKEND",
