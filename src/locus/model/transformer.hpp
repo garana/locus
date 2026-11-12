@@ -264,7 +264,9 @@ class TransformerModel {
      * Settles where the routed experts run (i#654) and returns it. On
      * Vulkan that depends on the free device memory when first asked,
      * and the backend keeps the answer for this model, so the disk
-     * prefix cache can key on it. Call it after the KV cache exists.
+     * prefix cache can key on it. Call it after the KV cache exists,
+     * on a thread bound to the device the forwards will run on (the
+     * decision is per device).
      * @returns true when some MoE layer routes its experts on Vulkan;
      *     false for a dense model or another backend.
      */
