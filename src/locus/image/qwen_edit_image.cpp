@@ -24,8 +24,14 @@ std::pair<std::uint32_t, std::uint32_t> qwen_edit_dimensions(
     const double ratio = static_cast<double>(w) / static_cast<double>(h);
     const double width = std::sqrt(static_cast<double>(area) * ratio);
     const double height = width / ratio;
-    return {static_cast<std::uint32_t>(py_round(width / 32) * 32),
-            static_cast<std::uint32_t>(py_round(height / 32) * 32)};
+    // At least 32 a side: a small area (auto_resize false at a small
+    // output) or a thin image would otherwise round a side to 0.
+    // diffusers' 1024 x 1024 never rounds below 32 for an aspect the
+    // vision tower takes.
+    return {static_cast<std::uint32_t>(
+                std::max(1.0, py_round(width / 32)) * 32),
+            static_cast<std::uint32_t>(
+                std::max(1.0, py_round(height / 32)) * 32)};
 }
 
 std::pair<std::uint32_t, std::uint32_t> qwen_smart_resize(

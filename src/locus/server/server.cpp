@@ -3901,7 +3901,9 @@ void OpenAiServer::install_routes() {
     // true_cfg_scale (default 4), steps (2 to 100, default 50) and seed.
     // size "WxH" sets the output (default: the reference's aspect at
     // about 1024 x 1024 pixels), each side floored to a multiple of 16,
-    // up to 2048. One image at a time, under image_mu_.
+    // up to 2048. auto_resize false (default true) encodes the reference
+    // at the output's area when below about 1024 x 1024 (i#670). One
+    // image at a time, under image_mu_.
     auto handle_qwen_edit = [this](const http::Request& req,
                                    http::ServerResponse& res,
                                    const http::RequestContext& ctx) {
@@ -3958,6 +3960,13 @@ void OpenAiServer::install_routes() {
                         "steps must be an integer from 2 to 100");
                 }
                 p.steps = static_cast<std::uint32_t>(s.get<std::int64_t>());
+            }
+            if (body.contains("auto_resize")) {
+                if (!body["auto_resize"].is_boolean()) {
+                    throw std::invalid_argument(
+                        "auto_resize must be a boolean");
+                }
+                p.auto_resize = body["auto_resize"].get<bool>();
             }
             if (body.contains("true_cfg_scale")) {
                 const auto& g = body["true_cfg_scale"];
