@@ -58,6 +58,34 @@ EditPrompt qwen_edit_prompt(const tok::Tokenizer& tok,
                             std::string_view instruction,
                             std::uint32_t n_image);
 
+/** The vision tower's merged rows for one reference image. */
+struct EditImageRows {
+    /** grid_h * grid_w rows of the language model's width. */
+    std::vector<float> rows;
+    /** Merged-token rows and columns (patch rows / merge_size()). */
+    std::uint32_t grid_h = 0, grid_w = 0;
+};
+
+/**
+ * Runs the vision tower over a reference image's patches, once for
+ * every prompt of an edit (the prompt and the negative prompt).
+ *
+ * @param lm The language model the rows feed; its width must be the
+ *     tower's out_dim().
+ * @param vision The vision tower.
+ * @param patches gh * gw patches, as QwenVision::patches() lays them out.
+ * @param gh Patch rows (a multiple of merge_size()).
+ * @param gw Patch columns (a multiple of merge_size()).
+ * @param op The backend ops the vision tower runs on.
+ * @returns The merged rows and their grid.
+ * @throws std::invalid_argument on a width or grid that does not match.
+ */
+EditImageRows qwen_edit_image_rows(const model::TransformerModel& lm,
+                                   const QwenVision& vision,
+                                   std::span<const float> patches,
+                                   std::uint32_t gh, std::uint32_t gw,
+                                   const backend::Ops& op);
+
 /**
  * The conditioning rows of one edit prompt.
  *
