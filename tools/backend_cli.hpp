@@ -192,6 +192,8 @@ inline constexpr const char* kCommonHelp =
     "                   report aggregate tok/s (bench mode)\n"
     "  --metrics-path P locus-server: serve Prometheus metrics at\n"
     "                   path P (default /metrics)\n"
+    "  --host H         locus-server: listen on address H only, for\n"
+    "                   example 127.0.0.1 (default: every interface)\n"
     "  --sse-keepalive S locus-server: a stream silent for S seconds\n"
     "                   sends an SSE comment (default 15; 0 = off)\n"
     "  --audio-decoder P locus-server: enable /v1/audio/speech with\n"
@@ -321,6 +323,9 @@ struct BackendArgs {
     /** From --metrics-path P: locus-server metrics route (empty =
      * default /metrics). */
     std::string metrics_path;
+    /** From --host H: locus-server's listen address (empty = every
+     *  interface, IPv6 and IPv4). */
+    std::string host;
     /** From --sse-keepalive S: seconds of silence before a stream
      *  sends an SSE comment (0 = off). */
     std::uint32_t sse_keepalive = 15;
@@ -478,6 +483,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.metrics_path = argv[++i];
         } else if (a.rfind("--metrics-path=", 0) == 0) {
             out.metrics_path = std::string(a.substr(15));
+        } else if (a == "--host" && i + 1 < argc) {
+            out.host = argv[++i];
+        } else if (a.rfind("--host=", 0) == 0) {
+            out.host = std::string(a.substr(7));
         } else if (a == "--sse-keepalive" && i + 1 < argc) {
             number("--sse-keepalive", argv[++i], out.sse_keepalive);
         } else if (a.rfind("--sse-keepalive=", 0) == 0) {

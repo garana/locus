@@ -205,7 +205,9 @@ tower). Tests tagged as heavy also need `LOCUS_HEAVY_TESTS=1`.
     locus-server model.gguf 8080
     locus-run model.gguf "Once upon a time" 32
 
-`locus-server --help` lists the options and environment variables;
+The server listens on every interface; `--host 127.0.0.1` keeps it
+on loopback. `locus-server --help` lists the options and environment
+variables;
 `--capabilities` lists the architectures, backends, weight formats
 and tokenizers of the build. Speech needs `--audio-decoder
 <snac.gguf>`, image generation `--image-decoder <vq16.gguf>` (Janus)

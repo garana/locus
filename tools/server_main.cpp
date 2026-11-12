@@ -287,7 +287,8 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         if (!gpu_warn.empty()) {
             std::fprintf(stderr, "%s\n", gpu_warn.c_str());
         }
-        std::fprintf(stderr, "locus-server listening on :%d\n", port);
+        std::fprintf(stderr, "locus-server listening on %s:%d\n",
+                     args.host.c_str(), port);
         // Registers a moment after this, once listen has bound, and
         // deregisters when the server stops (a kill leaves it to run
         // out at the router).
@@ -301,7 +302,10 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         }
         stopper.attach(&server);
         const bool bound =
-            server.listen(locus::server::OpenAiServer::kAnyHost, port);
+            server.listen(args.host.empty()
+                              ? locus::server::OpenAiServer::kAnyHost
+                              : args.host,
+                          port);
         stopper.attach(nullptr);
         if (!bound) {
             std::fprintf(stderr, "error: cannot bind port %d\n",
