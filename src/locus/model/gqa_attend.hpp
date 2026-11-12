@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <vector>
 
@@ -15,9 +16,42 @@
 namespace locus::model {
 
 /**
+ * @returns dot(a, b) over n floats in a fixed order: eight interleaved
+ * partial sums (lane j takes elements j, j + 8, ...), added as a fixed
+ * tree, then the tail. The lanes are explicit, so the compiler
+ * vectorizes the loop without reassociating anything (a plain
+ * reduction stays one serial add chain under strict FP, i#206), and
+ * the result is the same bits on every CPU and thread count.
+ */
+inline float dot_f32_8(const float* a, const float* b, std::uint32_t n) {
+    // Lanes 0..3 in lo, 4..7 in hi (GCC / Clang vector types: one
+    // 4-wide multiply and add per half; the plain 8-lane array loop
+    // vectorizes only 2 wide).
+    typedef float f4 __attribute__((vector_size(16)));
+    f4 lo = {0.0f, 0.0f, 0.0f, 0.0f};
+    f4 hi = lo;
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        f4 a0, a1, b0, b1;
+        std::memcpy(&a0, a + i, sizeof a0);
+        std::memcpy(&a1, a + i + 4, sizeof a1);
+        std::memcpy(&b0, b + i, sizeof b0);
+        std::memcpy(&b1, b + i + 4, sizeof b1);
+        lo += a0 * b0;
+        hi += a1 * b1;
+    }
+    float s = ((lo[0] + lo[1]) + (lo[2] + lo[3])) +
+              ((hi[0] + hi[1]) + (hi[2] + hi[3]));
+    for (; i < n; ++i) {
+        s += a[i] * b[i];
+    }
+    return s;
+}
+
+/**
  * One head of gqa_attend: head h of q scores positions 0..pos of KV
- * head h / group, softmaxes, and weights the value rows into head h of
- * out.
+ * head h / group (dot_f32_8), softmaxes, and weights the value rows
+ * into head h of out.
  */
 template <class KRow, class VRow>
 void gqa_head(const float* q, float* out, std::uint32_t h, std::uint32_t hd,
@@ -29,19 +63,30 @@ void gqa_head(const float* q, float* out, std::uint32_t h, std::uint32_t hd,
     const float* qh = q + static_cast<std::size_t>(h) * hd;
     const std::size_t kvh = static_cast<std::size_t>(h / group) * hd;
     for (std::uint32_t t = 0; t <= pos; ++t) {
-        const float* kt = krow_at(t) + kvh;
-        float s = 0.0f;
-        for (std::uint32_t i = 0; i < hd; ++i) {
-            s += qh[i] * kt[i];
-        }
-        att[t] = s * kq_scale;
+        att[t] = dot_f32_8(qh, krow_at(t) + kvh, hd) * kq_scale;
     }
     backend::softmax_inplace(att);
     float* oh = out + static_cast<std::size_t>(h) * hd;
     for (std::uint32_t i = 0; i < hd; ++i) {
         oh[i] = 0.0f;
     }
-    for (std::uint32_t t = 0; t <= pos; ++t) {
+    // Four positions per pass over oh, their terms still added one
+    // position at a time (the same bits as one pass per position), so
+    // oh is loaded and stored a quarter as often.
+    std::uint32_t t = 0;
+    for (; t + 4 <= pos + 1; t += 4) {
+        const float* v0 = vrow_at(t) + kvh;
+        const float* v1 = vrow_at(t + 1) + kvh;
+        const float* v2 = vrow_at(t + 2) + kvh;
+        const float* v3 = vrow_at(t + 3) + kvh;
+        const float a0 = att[t], a1 = att[t + 1];
+        const float a2 = att[t + 2], a3 = att[t + 3];
+        for (std::uint32_t i = 0; i < hd; ++i) {
+            oh[i] = (((oh[i] + a0 * v0[i]) + a1 * v1[i]) + a2 * v2[i]) +
+                    a3 * v3[i];
+        }
+    }
+    for (; t <= pos; ++t) {
         const float* vt = vrow_at(t) + kvh;
         const float a = att[t];
         for (std::uint32_t i = 0; i < hd; ++i) {

@@ -277,3 +277,26 @@ TEST_CASE("a ThreadPool::Scope reroutes the calling thread's loops",
     }
     REQUIRE(&ThreadPool::instance() == &global);
 }
+
+TEST_CASE("dot_f32_8 sums in its fixed lane order", "[threads]") {
+    // Lane j takes elements j, j + 8, ...; the lanes add as a fixed
+    // tree, then the tail (n = 19: two full rounds and a tail of 3).
+    constexpr std::uint32_t n = 19;
+    std::vector<float> a(n), b(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        a[i] = 1.0f / static_cast<float>(i + 3);
+        b[i] = static_cast<float>(i % 5) - 1.75f;
+    }
+    float acc[8] = {};
+    for (std::uint32_t i = 0; i < 16; ++i) {
+        acc[i % 8] += a[i] * b[i];
+    }
+    float want = ((acc[0] + acc[1]) + (acc[2] + acc[3])) +
+                 ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    for (std::uint32_t i = 16; i < n; ++i) {
+        want += a[i] * b[i];
+    }
+    REQUIRE(locus::model::dot_f32_8(a.data(), b.data(), n) == want);
+    REQUIRE(locus::model::dot_f32_8(a.data(), b.data(), 3) ==
+            (a[0] * b[0] + a[1] * b[1]) + a[2] * b[2]);
+}
