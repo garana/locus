@@ -794,8 +794,8 @@ guarding the default path.
   also runs on the GPU for GQA models. MLA already shrinks the KV
   cache, so its quantized path is low priority (#63).
 - More architectures and quant types: qwen2moe, qwen3moe, dbrx, glm-
-  dsa, muse-spark, deepseek41; ternary TQ1_0 / TQ2_0 and the IQ
-  family.
+  dsa, muse-spark, deepseek41, kolibri1; ternary TQ1_0 / TQ2_0 and
+  the IQ family.
 - Multi-GPU weight sharding (#62): shard the streamed weight window
   across the GPUs of one host. Needs multi-GPU hardware.
 
