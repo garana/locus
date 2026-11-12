@@ -1650,10 +1650,13 @@ void OpenAiServer::install_routes() {
             }
             json kinds = json::array({"text"});
             if (vision_) kinds.push_back("image-to-text");
-            // Generations and edits apart (i#633): FLUX.1 serves both,
+            // Generations and edits apart (i#633): FLUX.1 Kontext serves
+            // both, other FLUX.1 checkpoints generate (i#648),
             // Qwen-Image-Edit edits only, Janus and PixArt generate only.
             if (janus_ || pixart_ || flux_) kinds.push_back("image");
-            if (flux_ || qwen_edit_) kinds.push_back("image-edit");
+            if ((flux_ && flux_->may_edit()) || qwen_edit_) {
+                kinds.push_back("image-edit");
+            }
             if (ltxv_) kinds.push_back("video");
             if (snac_) kinds.push_back("speech");
             if (rerank_) kinds.push_back("rerank");
@@ -4019,7 +4022,9 @@ void OpenAiServer::install_routes() {
             handle_qwen_edit(req, res, ctx);
             return;
         }
-        if (!flux_) {
+        // A FLUX.1 dev or schnell checkpoint (flux.kontext false) does
+        // not edit (i#648).
+        if (!flux_ || !flux_->may_edit()) {
             set_unavailable(res,
                             "image edits are not configured (needs "
                             "--image-model with a Qwen-Image-Edit or "

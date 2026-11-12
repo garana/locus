@@ -3,10 +3,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "gguf_builder.hpp"
 #include "json.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
@@ -145,6 +147,29 @@ TEST_CASE("flux dit matches diffusers on a tiny model", "[flux][image]") {
             REQUIRE(trace.single0.size() == (n_img + n_txt) * w);
         }
     }
+}
+
+// i#648: only FLUX.1 Kontext edits. The converter writes flux.kontext
+// from the pipeline's class; a GGUF without it (converted before it
+// existed, as tests/golden/flux_synth.gguf) may be Kontext, so it edits.
+TEST_CASE("flux kontext key decides whether a checkpoint edits",
+          "[flux][image]") {
+    const auto gguf_with = [](std::optional<bool> kontext) {
+        GgufBuilder b;
+        b.header(0, kontext ? 2 : 1);
+        b.kv_string("general.architecture", "flux");
+        if (kontext) b.kv_bool("flux.kontext", *kontext);
+        b.pad();
+        const auto span = b.bytes();
+        return std::vector<std::byte>(span.begin(), span.end());
+    };
+    const auto yes = gguf_with(true), no = gguf_with(false),
+               absent = gguf_with(std::nullopt);
+    CHECK(FluxDit::may_edit_of(locus::gguf::GgufFile::parse(yes)));
+    CHECK_FALSE(FluxDit::may_edit_of(locus::gguf::GgufFile::parse(no)));
+    CHECK(FluxDit::may_edit_of(locus::gguf::GgufFile::parse(absent)));
+    const auto g = locus::gguf::GgufFile::open(kDir + "golden/flux_synth.gguf");
+    CHECK(FluxDit::load(g).may_edit());
 }
 
 TEST_CASE("flux dit rejects wrong sizes", "[flux][image]") {

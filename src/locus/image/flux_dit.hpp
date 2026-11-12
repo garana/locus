@@ -55,6 +55,14 @@ class FluxDit {
      */
     static FluxDit load(const gguf::GgufFile& g);
 
+    /**
+     * Whether a FLUX GGUF's checkpoint edits (i#648): its flux.kontext,
+     * which scripts/convert-flux.py writes from the pipeline's class
+     * (FLUX.1 Kontext and dev share their tensors). A GGUF without the
+     * key, converted before it existed, may be either: true.
+     */
+    static bool may_edit_of(const gguf::GgufFile& g);
+
     /** @returns The packed channels per image token (64). */
     std::uint32_t channels() const { return in_ch_; }
     /** @returns The T5 width context_embedder takes (4096). */
@@ -65,6 +73,10 @@ class FluxDit {
     std::uint32_t width() const { return width_; }
     /** @returns Whether the model takes a guidance scale (dev, Kontext). */
     bool guidance_embeds() const { return guidance_; }
+    /** @returns Whether the checkpoint edits a reference image: the
+     *  GGUF's flux.kontext (FLUX.1 Kontext), true when the key is
+     *  absent (converted before it existed; i#648). */
+    bool may_edit() const { return may_edit_; }
     /** @returns The double block count (19). */
     std::uint32_t double_blocks() const {
         return static_cast<std::uint32_t>(doubles_.size());
@@ -184,6 +196,7 @@ class FluxDit {
     std::uint32_t in_ch_ = 0, joint_ = 0, pooled_ = 0, width_ = 0,
                   heads_ = 0, head_dim_ = 0, ffn_ = 0, t_ch_ = 0;
     bool guidance_ = false;
+    bool may_edit_ = true;
     float eps_ = 0.0f, theta_ = 0.0f;
     std::vector<std::uint32_t> axes_;
     Linear x_embed_, ctx_embed_, norm_out_, proj_out_;
