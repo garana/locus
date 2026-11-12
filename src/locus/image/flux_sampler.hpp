@@ -49,9 +49,11 @@ class FluxSampler {
                      float sigma, float sigma_next);
 
     /**
-     * FluxPipeline._pack_latents: a [c][h][w] latent (h, w even) to
-     * (h / 2) (w / 2) tokens of c x 2 x 2 values, token-major (row-major
-     * patches; each token is channel, then row and column in the patch).
+     * FluxPipeline._pack_latents (QwenImageEditPipeline's is the same
+     * permutation, and Qwen-Image-Edit uses this one): a [c][h][w]
+     * latent (h, w even) to (h / 2) (w / 2) tokens of c x 2 x 2 values,
+     * token-major (row-major patches; each token is channel, then row and
+     * column in the patch).
      */
     static std::vector<float> pack(std::span<const float> latent,
                                    std::uint32_t c, std::uint32_t h,
