@@ -687,7 +687,12 @@ guarding the default path.
   longer one on the GPU. On an M2 Pro that makes 32 inputs of 120
   tokens 3.9x faster with bge-m3 (18.2 s to 4.7 s), 3.7x with nomic
   v1.5 and 1.5x with bge-small, and a 50-document rerank 3.1x (12.8 s
-  to 4.1 s). CUDA and other Vulkan GPUs: #519. Otherwise
+  to 4.1 s). Elsewhere, with a usable CUDA device, those passes run
+  on the CUDA ops: the matrices through the batched CUDA matvec, each
+  weight read once per 32 tokens, and the attention on the CPU, since
+  dense::attention keeps a GPU that caches weights by host pointer
+  off its temporary buffers. The image classifier's convs stay on
+  Vulkan only. Other Vulkan GPUs: #519. Otherwise
   `/v1/embeddings` returns the chat model's last token's final-normed
   hidden state, L2-normalized, on a dedicated cache; CPU and CUDA
   backends only (`TransformerModel::embed` refuses vulkan).
