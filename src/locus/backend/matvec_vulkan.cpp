@@ -219,6 +219,19 @@ void check_pool_device(const void* p) {
     }
 }
 
+/** KV pools freed from a thread that held another device's lock, by
+ *  device: their own device frees them when it next builds or looks
+ *  up its State (drain_kv_frees), so no thread waits on a second
+ *  device lock. Leaked as pool_owner(), for frees at exit. */
+std::mutex& kv_free_mu() {
+    static auto* mu = new std::mutex;
+    return *mu;
+}
+std::vector<const void*>* kv_frees() {
+    static auto* v = new std::vector<const void*>[kMaxDevices];
+    return v;
+}
+
 struct State {
     VulkanContext ctx;
     /** The device index this State runs on. */
@@ -290,6 +303,10 @@ struct State {
                 pool_owner().erase(map);  // gone with this device
             }
             kv_pools.clear();
+            // Queued frees named pools just destroyed: a later State
+            // here must not free a new pool at the same address.
+            std::lock_guard fk(kv_free_mu());
+            kv_frees()[device].clear();
         }
         moe_gpu_fits.clear();
         // Buffers retired by grow() mid-batch; end_batch frees these,
@@ -701,8 +718,61 @@ struct State {
     }
 };
 
+/**
+ * A device's state lock: recursive, and counting per thread which
+ * devices that thread holds, so the paths that reach another device's
+ * State (vulkan_free_kv, on_unmap) can see whether taking its lock
+ * could cross with a thread doing the same the other way round (i#620).
+ */
+class DeviceMutex {
+  public:
+    void lock() {
+        mu_.lock();
+        ++held()[index()];
+    }
+    void unlock() {
+        --held()[index()];
+        mu_.unlock();
+    }
+
+    /** @returns Whether the calling thread holds a device lock other
+     *  than device d's. */
+    static bool holds_other(int d) {
+        for (int e = 0; e < kMaxDevices; ++e) {
+            if (e != d && held()[e] > 0) return true;
+        }
+        return false;
+    }
+
+  private:
+    static int* held() {
+        thread_local int h[kMaxDevices] = {};
+        return h;
+    }
+    int index() const;
+    std::recursive_mutex mu_;
+};
+
 /** Device d's state lock (state_mu() is the calling thread's). */
-std::recursive_mutex& device_mu(int d);
+DeviceMutex& device_mu(int d);
+
+/** Frees device d's deferred KV pools; the caller holds d's lock and
+ *  no batch is open on it (a dropped cache's pool is in no batch, but
+ *  a batch is never changed under its feet). */
+void drain_kv_frees(State& s) {
+    std::vector<const void*> mine;
+    {
+        std::lock_guard fk(kv_free_mu());
+        mine.swap(kv_frees()[s.device]);
+    }
+    for (const void* p : mine) {
+        const auto it = s.kv_pools.find(p);
+        if (it != s.kv_pools.end()) {
+            s.ctx.destroy_buffer(it->second);
+            s.kv_pools.erase(it);
+        }
+    }
+}
 
 /** The States, by device index (null until first used there). */
 std::unique_ptr<State>* states() {
@@ -725,7 +795,11 @@ State& state() {
     if (!states()[d]) {
         states()[d] = std::make_unique<State>(d);
     }
-    return *states()[d];
+    State& s = *states()[d];
+    if (!s.ctx.batch_open()) {
+        drain_kv_frees(s);
+    }
+    return s;
 }
 
 /**
@@ -736,15 +810,19 @@ State& state() {
  * Recursive, so an entry point may reach another through the model's
  * ops while holding it.
  */
-std::recursive_mutex& state_mu();
+DeviceMutex& state_mu();
 
 /**
  * sys unmap hook (set while State lives): a model file's mapping is
  * going away, so drop every pool buffer over its pages (#317).
  */
-std::recursive_mutex& device_mu(int d) {
-    static std::recursive_mutex mu[kMaxDevices];
+DeviceMutex& device_mu(int d) {
+    static DeviceMutex mu[kMaxDevices];
     return mu[d];
+}
+
+int DeviceMutex::index() const {
+    return static_cast<int>(this - &device_mu(0));
 }
 
 void on_unmap(const void* p, std::size_t n) {
@@ -752,6 +830,16 @@ void on_unmap(const void* p, std::size_t n) {
     for (int d = 0; d < kMaxDevices; ++d) {
         if (!g_state_alive[d].load()) {
             continue;
+        }
+        if (DeviceMutex::holds_other(d)) {
+            // Taking d's lock here could cross with a thread that holds
+            // d's and waits on this one's (i#620). Unmapping a model
+            // from inside another device's backend call is a bug in
+            // the caller. Runs from ~MappedFile: no throw.
+            std::fprintf(stderr,
+                         "[vulkan] model file unmapped while holding "
+                         "another device's lock\n");
+            std::abort();
         }
         std::lock_guard lk(device_mu(d));
         State& s = *states()[d];
@@ -768,7 +856,7 @@ void on_unmap(const void* p, std::size_t n) {
     }
 }
 
-std::recursive_mutex& state_mu() {
+DeviceMutex& state_mu() {
     const int d = current_device();
     return device_mu(d < kMaxDevices ? d : 0);
 }
@@ -1701,10 +1789,10 @@ void vulkan_free_kv(float* pool) {
         return;
     }
     // The cache may be dropped on a thread bound to another device:
-    // free the pool on the device that made it. That takes the owner's
-    // lock, possibly while this thread holds its own: no path holds two
-    // device locks the other way round today (on_unmap takes them one
-    // at a time), so keep it that way.
+    // free the pool on the device that made it. When this thread holds
+    // another device's lock (inside a backend call there), taking the
+    // owner's could cross with a thread doing the same the other way
+    // round (i#620): queue the pool for its owner to free instead.
     int d = -1;
     {
         std::lock_guard ok(pool_owner_mu());
@@ -1718,8 +1806,21 @@ void vulkan_free_kv(float* pool) {
     if (!g_state_alive[d].load()) {
         return;
     }
+    if (DeviceMutex::holds_other(d)) {
+        std::lock_guard fk(kv_free_mu());
+        kv_frees()[d].push_back(pool);
+        return;
+    }
     std::lock_guard lk(device_mu(d));
     State& s = *states()[d];
+    if (s.ctx.batch_open()) {
+        // This thread's own open batch (a cache dropped mid-call):
+        // after it.
+        std::lock_guard fk(kv_free_mu());
+        kv_frees()[d].push_back(pool);
+        return;
+    }
+    drain_kv_frees(s);
     const auto it = s.kv_pools.find(pool);
     if (it != s.kv_pools.end()) {
         s.ctx.destroy_buffer(it->second);
@@ -3983,11 +4084,11 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
 bool VulkanSeq::available() { return vulkan_backend_usable(); }
 
 struct VulkanSeq::Impl {
-    std::unique_lock<std::recursive_mutex> lk;
+    std::unique_lock<DeviceMutex> lk;
     State& s;
     /** Floats of seq_consts used by the open batch. */
     std::size_t consts_used = 0;
-    explicit Impl(std::recursive_mutex& mu) : lk(mu), s(state()) {}
+    explicit Impl(DeviceMutex& mu) : lk(mu), s(state()) {}
 
     VulkanContext::Buffer slot(Slot i) const {
         if (i >= kSlots || s.seq_n[i] == 0) {
