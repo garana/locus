@@ -76,6 +76,10 @@ enum class Kernel {
     /** Short-batch routed MoE: (token, expert) pair matvecs. */
     kMatvecQ8_0P,
     kMatvecQ8_0GluP,
+    /** The same for Q4_K / Q6_K experts (i#623; Q6_K down only). */
+    kMatvecQ4_KP,
+    kMatvecQ4_KGluP,
+    kMatvecQ6_KP,
     /** F32 counterpart of kMatvecQ8_0N. */
     kMatvecF32N,
     /** F16 KV pool (opt-in, #105) readers / writer. */

@@ -60,6 +60,9 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ4_K:  // 8 rows of 16 lanes
         case Kernel::kMatvecQ4_KB:
         case Kernel::kMatvecQ4_KGluB:
+        case Kernel::kMatvecQ4_KP:
+        case Kernel::kMatvecQ4_KGluP:
+        case Kernel::kMatvecQ6_KP:
         case Kernel::kMatvecQ4_KSeg:
         case Kernel::kMatvecQ6_K:
         case Kernel::kMatvecQ6_KB:
@@ -214,6 +217,9 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matvec_q8_0_n_spv.h"
 #include "matvec_q8_0_p_spv.h"
 #include "matvec_q8_0_glu_p_spv.h"
+#include "matvec_q4_k_p_spv.h"
+#include "matvec_q4_k_glu_p_spv.h"
+#include "matvec_q6_k_p_spv.h"
 #include "matvec_f32_n_spv.h"
 #include "matmul_paged_f16_spv.h"
 #include "matmul_paged_t_f16_spv.h"
@@ -506,6 +512,12 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_matvec_q8_0_p_spv), 4, 60},
     {Kernel::kMatvecQ8_0GluP, "matvec_q8_0_glu_p", locus_matvec_q8_0_glu_p_spv,
      sizeof(locus_matvec_q8_0_glu_p_spv), 5, 60},
+    {Kernel::kMatvecQ4_KP, "matvec_q4_k_p", locus_matvec_q4_k_p_spv,
+     sizeof(locus_matvec_q4_k_p_spv), 4, 60},
+    {Kernel::kMatvecQ4_KGluP, "matvec_q4_k_glu_p", locus_matvec_q4_k_glu_p_spv,
+     sizeof(locus_matvec_q4_k_glu_p_spv), 5, 60},
+    {Kernel::kMatvecQ6_KP, "matvec_q6_k_p", locus_matvec_q6_k_p_spv,
+     sizeof(locus_matvec_q6_k_p_spv), 4, 60},
     {Kernel::kMatvecF32N, "matvec_f32_n", locus_matvec_f32_n_spv,
      sizeof(locus_matvec_f32_n_spv), 3, 52},
     // F16-KV pool readers stage in f32 like the F32 ones, so they
