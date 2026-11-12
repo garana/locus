@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -472,5 +473,66 @@ TEST_CASE("batched vulkan stages chunk by 8 and keep a lone sequence "
             REQUIRE(s.n_tokens == p + 1);
         }
         REQUIRE(got == want);
+    }
+}
+
+// i#116: past a cap of blocks, decode attention merges its per-block
+// partials in rounds (attn_combine_part), so the scratch stays bounded
+// at long context. With the cap forced to 1 and 2 blocks a round, a
+// 100-position decode (4 blocks of 32 grouped, or 2 of 64) takes the
+// round path from position 33 on; its logits track the one-round path
+// within float rounding (the merge order changes) with the same pick.
+TEST_CASE("vulkan decode attention merges its partials in rounds",
+          "[vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    const KvType kv = GENERATE(KvType::kF32, KvType::kF16);
+    CAPTURE(static_cast<int>(kv));
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+    const std::uint32_t V = model.hparams().n_vocab;
+    constexpr std::uint32_t n_pos = 100;
+    // The logits at every position, with the partials cap at `cap`
+    // blocks a round (0: the default, one round here).
+    auto run = [&](std::uint32_t cap) {
+        locus::backend::vulkan_set_attn_part_blocks(cap);
+        PagedKvCache c = model.make_cache(0, kv);
+        PagedKvCache::Seq s;
+        std::vector<float> all(std::size_t{n_pos} * V);
+        for (std::uint32_t p = 0; p < n_pos; ++p) {
+            REQUIRE(c.ensure_capacity(s, 1));
+            const auto t =
+                static_cast<locus::tok::TokenId>(1 + (p * 37) % (V - 1));
+            REQUIRE(locus::backend::vulkan_forward(
+                model, t, c, s,
+                std::span(all).subspan(std::size_t{p} * V, V)));
+        }
+        c.release(s);
+        locus::backend::vulkan_set_attn_part_blocks(0);
+        return all;
+    };
+    const auto want = run(0);
+    for (const std::uint32_t cap : {1u, 2u}) {
+        CAPTURE(cap);
+        const auto got = run(cap);
+        for (std::uint32_t p = 0; p < n_pos; ++p) {
+            CAPTURE(p);
+            const auto w = std::span(want).subspan(std::size_t{p} * V, V);
+            const auto o = std::span(got).subspan(std::size_t{p} * V, V);
+            double err = 0.0, norm = 0.0;
+            for (std::uint32_t v = 0; v < V; ++v) {
+                const double d = double{o[v]} - w[v];
+                err += d * d;
+                norm += double{w[v]} * w[v];
+            }
+            CHECK(std::sqrt(err) <= 1e-5 * std::sqrt(norm));
+            CHECK(std::max_element(o.begin(), o.end()) - o.begin() ==
+                  std::max_element(w.begin(), w.end()) - w.begin());
+        }
     }
 }

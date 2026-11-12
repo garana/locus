@@ -56,6 +56,8 @@ layout(push_constant) uniform PC {
     uint dv;
     float scale;
     uint out_stride;    // OUT floats between heads
+    uint c_base;        // first block of this dispatch (rounds, i#116)
+    uint n_total;       // blocks of the whole decode (1: write OUT)
 } pc;
 
 // ATTN_DECODE_Q_MAX is vk::kAttnDecodeQMax (limits.hpp), passed by
@@ -83,7 +85,8 @@ void main() {
     }
     barrier();
 
-    uint p0 = c * CH;
+    // c indexes this dispatch's partials; c + c_base the positions.
+    uint p0 = (c + pc.c_base) * CH;
     uint np = min(CH, pc.n_pos - p0);
     // Row bases once per block: the V loop below would otherwise pay
     // a table load and a division per position, per thread.
@@ -149,7 +152,7 @@ void main() {
                 acc += red[k * pc.dv + i];
             }
         }
-        if (n_blocks == 1u) {
+        if (pc.n_total == 1u) {
             o[h * pc.out_stride + i] = acc / l;
         } else {
             // Partials: [block][head][dv], then [block][head] (m, l)

@@ -287,6 +287,13 @@ std::uint32_t vulkan_attn_block(std::uint32_t n, std::uint32_t heads,
  */
 void vulkan_set_attn_scratch_floats(std::size_t floats);
 
+/**
+ * Sets decode attention's partials cap to `blocks` per round (0
+ * restores the default, 256). TEST USE ONLY: lets a short context take
+ * the multi-round merge (i#116).
+ */
+void vulkan_set_attn_part_blocks(std::uint32_t blocks);
+
 /** KV-pool allocator returning a GPU-mapped pointer (Ops hook). */
 float* vulkan_alloc_kv(std::size_t n_floats);
 /** Frees a pool from vulkan_alloc_kv (no-op for an unknown pointer, or

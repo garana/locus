@@ -313,6 +313,7 @@ if(Vulkan_FOUND)
             attn_decode_grp_f16=attn_decode_grp:KV_F16
             attn_decode_grp8=attn_decode_grp:HG8
             attn_decode_grp8_f16=attn_decode_grp:HG8,KV_F16
+            attn_combine_part=attn_combine:PARTIAL
             kv_scatter_f16=kv_scatter:KV_F16
             rmsnorm_b=rmsnorm:BATCHED
             rope_b=rope:BATCHED

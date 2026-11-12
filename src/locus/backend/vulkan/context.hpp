@@ -180,6 +180,9 @@ enum class Kernel {
     /** Unmasked multi-head attention in one pass (flash_attn.comp,
      *  i#640): the image transformers' joint attention. */
     kFlashAttn,
+    /** attn_combine's round merge: one partial per round of blocks
+     *  (attn_combine_part, i#116). */
+    kAttnCombinePart,
     kCount_,
 };
 

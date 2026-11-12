@@ -12,8 +12,9 @@
 // s[h][p] = Q1[h] . key[0, d1) + Q2[h] . key[d1, d1 + d2) with key at
 // pool[row + k_off + kvh * kv_stride], V the dv floats at row + v_off
 // + kvh * kv_stride (MLA: v_off = k_off, kv_stride 0, group = heads).
-// With one block it writes o / l to OUT; otherwise (o, m, l) partials
-// in attn_combine.comp's layout.
+// When the whole decode is one block (n_total) it writes o / l to OUT;
+// otherwise (o, m, l) partials in attn_combine.comp's layout, for this
+// dispatch's blocks from c_base on (a round, i#116).
 //
 // With KV_F16 (attn_decode_grp_f16) the pool holds IEEE halves in the
 // same layout: offsets and strides count halves.
@@ -88,6 +89,8 @@ layout(push_constant) uniform PC {
     uint dv;
     float scale;
     uint out_stride;    // OUT floats between heads
+    uint c_base;        // first block of this dispatch (rounds, i#116)
+    uint n_total;       // blocks of the whole decode (1: write OUT)
 } pc;
 
 shared float sc[HG * CH];
@@ -108,7 +111,8 @@ void main() {
     uint heads = (gl_NumWorkGroups.y / chunks) * pc.group;
     uint n_blocks = gl_NumWorkGroups.x;
     uint nh = min(HG, pc.group - g0);
-    uint p0 = c * CH;
+    // c indexes this dispatch's partials; c + c_base the positions.
+    uint p0 = (c + pc.c_base) * CH;
     uint np = min(CH, pc.n_pos - p0);
     if (t < np) {
         uint p = p0 + t;
@@ -270,7 +274,7 @@ void main() {
             continue;
         }
         uint h = h0 + hh;
-        if (n_blocks == 1u) {
+        if (pc.n_total == 1u) {
             vec4 r = acc[j] / lh[hh];
             uint ob = h * pc.out_stride + d4 * 4u;
             o[ob] = r.x;
