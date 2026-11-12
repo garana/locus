@@ -287,8 +287,19 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         if (!gpu_warn.empty()) {
             std::fprintf(stderr, "%s\n", gpu_warn.c_str());
         }
-        std::fprintf(stderr, "locus-server listening on %s:%d\n",
-                     args.host.c_str(), port);
+        // An IPv6 address in brackets, so "[::1]:8080" reads unambiguously.
+        const bool v6 = args.host.find(':') != std::string::npos;
+        std::fprintf(stderr, "locus-server listening on %s%s%s:%d\n",
+                     v6 ? "[" : "", args.host.c_str(), v6 ? "]" : "", port);
+        const bool loopback = args.host == "127.0.0.1" ||
+                              args.host == "::1" ||
+                              args.host == "localhost";
+        if (loopback && !reg.router_host.empty()) {
+            std::fprintf(stderr,
+                         "warning: --host %s is loopback only; a router on "
+                         "another machine cannot reach this server\n",
+                         args.host.c_str());
+        }
         // Registers a moment after this, once listen has bound, and
         // deregisters when the server stops (a kill leaves it to run
         // out at the router).
@@ -301,11 +312,8 @@ OpenAI + Anthropic compatible inference server (default port 8080):
                          reg.router_port);
         }
         stopper.attach(&server);
-        const bool bound =
-            server.listen(args.host.empty()
-                              ? locus::server::OpenAiServer::kAnyHost
-                              : args.host,
-                          port);
+        // An empty host is OpenAiServer::kAnyHost: every interface.
+        const bool bound = server.listen(args.host, port);
         stopper.attach(nullptr);
         if (!bound) {
             std::fprintf(stderr, "error: cannot bind port %d\n",
