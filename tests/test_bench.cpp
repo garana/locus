@@ -23,6 +23,7 @@
 #include "locus/http/metrics.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/codec.hpp"
+#include "locus/model/gqa_attend.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/tok/tokenizer.hpp"
 #include "locus/sys/features.hpp"
@@ -426,6 +427,45 @@ TEST_CASE("bench: cuda iq matvec", "[.][bench][cuda]") {
         const double ns = time_matvec(&matvec_cuda, m, x, out, iters);
         WARN("cuda " << q.name << " 4096x4096: " << ns / 1000.0
                      << " us per matvec");
+    }
+    SUCCEED();
+}
+
+// i#701: the CPU prefill attention proper (scores, softmax, value sums;
+// no projections) for one layer of Llama 3.2 1B (32 query heads, 8 KV
+// heads, head size 64) over a whole prompt, in the 64-token chunks the
+// CPU prefill feeds gqa_attend_batch. Multiply by the layer count for a
+// model's share.
+TEST_CASE("bench: cpu prefill attention per layer", "[.][bench]") {
+    constexpr std::uint32_t heads = 32, kv_heads = 8, hd = 64,
+                            group = heads / kv_heads, chunk = 64;
+    constexpr std::size_t kv_dim = std::size_t{kv_heads} * hd;
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    for (const std::uint32_t n_pos : {2177u, 8702u}) {
+        std::vector<float> k(std::size_t{n_pos} * kv_dim),
+            v(std::size_t{n_pos} * kv_dim),
+            q(std::size_t{chunk} * heads * hd),
+            out(std::size_t{chunk} * heads * hd);
+        for (auto* buf : {&k, &v, &q}) {
+            for (auto& x : *buf) {
+                x = d(rng);
+            }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::uint32_t base = 0; base < n_pos; base += chunk) {
+            const std::uint32_t n = std::min(chunk, n_pos - base);
+            locus::model::gqa_attend_batch(
+                q.data(), out.data(), std::size_t{heads} * hd, n, base,
+                heads, hd, group, 0.125f,
+                [&](std::uint32_t p) { return k.data() + p * kv_dim; },
+                [&](std::uint32_t p) { return v.data() + p * kv_dim; });
+        }
+        const double s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+        WARN("prefill attention, one layer, " << n_pos << " positions: "
+                                              << s << " s");
     }
     SUCCEED();
 }
