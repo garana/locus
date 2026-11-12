@@ -3,6 +3,8 @@
 #include "locus/backend/vulkan/mem_fit.hpp"
 
 #include <algorithm>
+#include <string_view>
+#include <thread>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -730,6 +732,16 @@ struct VulkanContext::Impl {
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t queue_family = 0;
     VkCommandPool pool = VK_NULL_HANDLE;
+    /** Signaled by each batch's submit when spin_wait: end_batch
+     *  polls it for up to kSpinBudget before blocking (i#697). */
+    VkFence batch_fence = VK_NULL_HANDLE;
+    /** Wait for a batch by polling its fence rather than
+     *  vkQueueWaitIdle: on MoltenVK by default (LOCUS_VK_SPIN_WAIT=0
+     *  or 1 overrides), where the blocking wait's wake-up cost about
+     *  0.4 ms a token (Llama 3.2 1B Q4_K_M decode 255 -> 279 tok/s on
+     *  an M4 Max). */
+    bool spin_wait = false;
+    static constexpr std::chrono::milliseconds kSpinBudget{20};
 
     /**
      * Descriptor sets cached by (kernel, buffers): a decode token
@@ -1185,6 +1197,10 @@ struct VulkanContext::Impl {
                     moltenvk && std::getenv("LOCUS_VK_BARRIERS") == nullptr;
             }
         }
+        {
+            const char* e = std::getenv("LOCUS_VK_SPIN_WAIT");
+            spin_wait = e != nullptr ? std::string_view(e) != "0" : moltenvk;
+        }
         dci.enabledExtensionCount =
             static_cast<std::uint32_t>(dexts.size());
         dci.ppEnabledExtensionNames = dexts.data();
@@ -1197,6 +1213,10 @@ struct VulkanContext::Impl {
         cpi.queueFamilyIndex = queue_family;
         check(vkCreateCommandPool(device, &cpi, nullptr, &pool),
               "create command pool");
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        check(vkCreateFence(device, &fci, nullptr, &batch_fence),
+              "create fence");
 
         {
             VkPhysicalDeviceProperties pp;
@@ -1535,6 +1555,7 @@ struct VulkanContext::Impl {
                 vkDestroyDescriptorSetLayout(device, p.dsl,
                                              nullptr);
             }
+            vkDestroyFence(device, batch_fence, nullptr);
             vkDestroyCommandPool(device, pool, nullptr);
             vkDestroyDevice(device, nullptr);
         }
@@ -1803,9 +1824,32 @@ void VulkanContext::end_batch() {
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &im.batch_cmd;
-    check(vkQueueSubmit(im.queue, 1, &si, VK_NULL_HANDLE),
-          "submit");
-    check(vkQueueWaitIdle(im.queue), "wait idle");
+    if (im.spin_wait) {
+        check(vkResetFences(im.device, 1, &im.batch_fence), "reset fence");
+        check(vkQueueSubmit(im.queue, 1, &si, im.batch_fence), "submit");
+        // Poll the fence, yielding between polls: a decode token's
+        // batch takes a few ms, and waking from a blocking wait costs
+        // MoltenVK about 0.4 ms a batch (i#697). Past the spin budget
+        // (a long batch: prefill, an image step) block instead.
+        const auto t_spin = clock::now();
+        VkResult st = vkGetFenceStatus(im.device, im.batch_fence);
+        while (st == VK_NOT_READY &&
+               clock::now() - t_spin < Impl::kSpinBudget) {
+            std::this_thread::yield();
+            st = vkGetFenceStatus(im.device, im.batch_fence);
+        }
+        if (st == VK_NOT_READY) {
+            check(vkWaitForFences(im.device, 1, &im.batch_fence, VK_TRUE,
+                                  UINT64_MAX),
+                  "wait fence");
+        } else {
+            check(st, "fence status");
+        }
+    } else {
+        check(vkQueueSubmit(im.queue, 1, &si, VK_NULL_HANDLE),
+              "submit");
+        check(vkQueueWaitIdle(im.queue), "wait idle");
+    }
     ++im.prof.batches;
     const clock::time_point t2 = clock::now();
     GpuMetrics& gm = gpu_metrics(GpuApi::kVulkan);
