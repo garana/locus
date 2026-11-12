@@ -264,4 +264,19 @@ TEST_CASE("cuda forward with a head row range keeps the GPU path and the "
             REQUIRE(part[i] == -std::numeric_limits<float>::infinity());
         }
     }
+
+    // A reversed range throws through the public forward_layers, on
+    // CUDA and on the host, instead of wrapping the row count.
+    for (const auto* b : {cuda, &locus::backend::best_backend()}) {
+        model.use_backend(*b);
+        INFO(b->name);
+        auto cache = model.make_cache(8);
+        Seq s;
+        REQUIRE(cache.ensure_capacity(s, 1));
+        std::vector<float> out(nv);
+        REQUIRE_THROWS_AS(
+            model.forward_layers(prompt[0], {}, 0, model.hparams().n_layers,
+                                 cache, s, ws, out, {10, 5}),
+            std::invalid_argument);
+    }
 }

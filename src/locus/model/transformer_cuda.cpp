@@ -104,12 +104,14 @@ bool TransformerModel::cuda_forward(
     const std::uint32_t nh = all_logits ? n : 1;  // tokens with logits
     const std::uint32_t bt = cache.geometry().block_tokens;
     // The head rows to compute, [lo, lo + R) (speech needs only its own
-    // tokens', i#689); the rest of each token's logits are -inf.
-    const std::uint32_t lo = rows_out.end == 0 ? 0 : rows_out.begin;
-    const std::uint32_t R = (rows_out.end == 0 ? V : rows_out.end) - lo;
-    if (lo + R > V || R == 0) {
+    // tokens', i#689); the rest of each token's logits are -inf. A bad
+    // range is checked before the subtraction, which would wrap.
+    if (rows_out.end != 0 &&
+        (rows_out.begin >= rows_out.end || rows_out.end > V)) {
         return false;  // the host path reports it
     }
+    const std::uint32_t lo = rows_out.end == 0 ? 0 : rows_out.begin;
+    const std::uint32_t R = (rows_out.end == 0 ? V : rows_out.end) - lo;
     const Mat head = R == V ? out_w_ : mat_rows(out_w_, lo, R);
 
     // Host tables: embeddings, RoPE (cos, sin) pairs, each token's row

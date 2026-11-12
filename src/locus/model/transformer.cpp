@@ -887,6 +887,12 @@ void TransformerModel::forward_layers(tok::TokenId token,
     }
     const bool first = layer_begin == 0;
     const bool last = layer_end == hp_.n_layers;
+    // forward()'s row check, here too: forward_layers is public, and
+    // the head's mat_rows would wrap on a reversed range.
+    if (last && rows.end != 0 &&
+        (rows.begin >= rows.end || rows.end > hp_.n_vocab)) {
+        throw std::invalid_argument("forward_layers: bad logit row range");
+    }
     // At layer 0 a non-empty hidden_in is the input embedding itself,
     // used instead of the token's row (Janus image tokens enter through
     // their own embedding and aligner).
