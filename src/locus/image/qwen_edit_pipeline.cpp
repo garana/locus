@@ -153,8 +153,12 @@ std::vector<float> QwenEditPipeline::edit_from(
         throw std::invalid_argument("qwen edit: noise size");
     }
     auto t0 = std::chrono::steady_clock::now();
+    // auto_resize false: the output's area, never more than the default
+    // (a larger output would only make the reference costlier).
     const auto r = qwen_edit_reference(
-        req.reference, req.auto_resize ? req.area : std::uint64_t{w} * h);
+        req.reference, req.auto_resize
+                           ? req.area
+                           : std::min(req.area, std::uint64_t{w} * h));
     const std::uint32_t ps = vision_->patch_size();
     const std::uint32_t th = r.text_image.h, tw = r.text_image.w;
     const auto patches = vision_->patches(r.text_image.rgb, th, tw);

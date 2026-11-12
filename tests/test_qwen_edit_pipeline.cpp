@@ -127,10 +127,11 @@ TEST_CASE("qwen edit pipeline matches diffusers on tiny parts",
     REQUIRE_THROWS_AS(p->edit(req, op, {}, ow, oh), std::invalid_argument);
 }
 
-// i#670: auto_resize false encodes the reference at the output's area.
-// At an output whose area is `area` it is the default, bit for bit; at
-// a smaller output the reference shrinks with it, so the edit changes
-// while the output size does not.
+// i#670: auto_resize false encodes the reference at the output's area
+// when that is smaller than `area`. At an output whose area is `area`
+// or more it is the default, bit for bit; at a smaller output the
+// reference shrinks with it, so the edit changes while the output size
+// does not.
 TEST_CASE("qwen edit auto_resize false encodes the reference at the "
           "output's area",
           "[qwen-edit][image]") {
@@ -168,8 +169,10 @@ TEST_CASE("qwen edit auto_resize false encodes the reference at the "
             state, std::size_t{h / s / 2} * (w / s / 2) * p->channels());
         return p->edit_from(noise, req, op, {});
     };
-    // 96 x 96 is kArea: the same reference either way.
+    // 96 x 96 is kArea: the same reference either way; a larger
+    // output keeps the default's reference.
     CHECK(run(96, false) == run(96, true));
+    CHECK(run(128, false) == run(128, true));
     // 48 x 48: a quarter of the reference pixels, a different edit.
     const auto small = run(48, false);
     CHECK(small.size() == std::size_t{48} * 48 * 3);

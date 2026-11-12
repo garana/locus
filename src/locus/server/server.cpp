@@ -3885,7 +3885,7 @@ void OpenAiServer::install_routes() {
     // size "WxH" sets the output (default: the reference's aspect at
     // about 1024 x 1024 pixels), each side floored to a multiple of 16,
     // up to 2048. auto_resize false (default true) encodes the reference
-    // at the output's area instead of about 1024 x 1024 (i#670). One
+    // at the output's area when below about 1024 x 1024 (i#670). One
     // image at a time, under image_mu_.
     auto handle_qwen_edit = [this](const http::Request& req,
                                    http::ServerResponse& res,

@@ -131,11 +131,12 @@ at about 1024 x 1024 pixels; `size` "WxH" sets it (sides 16 to 2048,
 floored to multiples of 16). Each step runs the MMDiT twice with a
 negative prompt. The reference is encoded at about 1024 x 1024 pixels
 whatever `size` is, as diffusers does; `auto_resize` false (default
-true) encodes it at the output's area instead, so a small edit runs
-fewer tokens per step and the model sees the reference at that
-resolution. A 512 x 512 edit of 20 steps on an M4 Max with the Q8_0
-MMDiT denoises in 344 s instead of 1104 s (7.9 s per MMDiT pass
-instead of 24.6 s). The directory holds four GGUFs:
+true) encodes it at the output's area when that is smaller (an output
+above 1024 x 1024 keeps the default), so a small edit runs fewer
+tokens per step and the model sees the reference at that resolution.
+A 512 x 512 edit of 20 steps on an M4 Max with the Q8_0 MMDiT
+denoises in 344 s instead of 1104 s (7.9 s per MMDiT pass instead of
+24.6 s). The directory holds four GGUFs:
 `scripts/convert-qwen-image.py`'s transformer and VAE (`--dit-out`,
 `--vae-out`), and llama.cpp's Qwen2.5-VL-7B-Instruct language model
 (with its tokenizer) and mmproj. The language model runs on the CPU;
