@@ -1220,7 +1220,8 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                 "an M-RoPE arch");
         }
         if (backend_->name == "vulkan" || backend_->ops.self_parallel ||
-            spec_->plain_attention || spec_->forward != nullptr) {
+            (spec_->plain_attention && !spec_->qwen2_attention) ||
+            spec_->forward != nullptr) {
             throw std::invalid_argument(
                 "forward_batch: mrope runs on a CPU backend only");
         }
@@ -1328,8 +1329,11 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     std::vector<float> xb2(static_cast<std::size_t>(n) * E);
     std::vector<float> gate(static_cast<std::size_t>(n) * ff);
     std::vector<float> up(static_cast<std::size_t>(n) * ff);
-    // Batched attention projections (plain llama attention, F32 cache).
-    const bool plain = spec_->plain_attention && !cache.quantized();
+    // Batched attention projections (plain llama attention, or qwen2's
+    // with its biases and NEOX / M-RoPE; F32 cache).
+    const bool qwen2 = spec_->qwen2_attention;
+    const bool plain =
+        (spec_->plain_attention || qwen2) && !cache.quantized();
     const std::uint32_t hd = hp_.head_dim;
     const std::size_t kv_dim = std::size_t{hp_.n_kv_heads} * hd;
     const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
@@ -1369,6 +1373,19 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
             matvec_batch(op, lay.wq, xbf, qb, n);
             matvec_batch(op, lay.wk, xbf, kb, n);
             matvec_batch(op, lay.wv, xbf, vb, n);
+            // qwen2: the biases after the projections, as
+            // qwen2moe_attention adds them.
+            auto add_bias = [n](std::vector<float>& d,
+                                std::span<const float> b) {
+                if (b.empty()) return;
+                for (std::uint32_t t = 0; t < n; ++t) {
+                    float* r = d.data() + std::size_t{t} * b.size();
+                    for (std::size_t i = 0; i < b.size(); ++i) r[i] += b[i];
+                }
+            };
+            add_bias(qb, lay.wq_bias);
+            add_bias(kb, lay.wk_bias);
+            add_bias(vb, lay.wv_bias);
             for (std::uint32_t t = 0; t < n; ++t) {
                 const std::uint32_t pos = base + t;
                 const std::span<float> q(qb.data() + std::size_t{t} * E, E);
@@ -1378,10 +1395,27 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                             krow);
                 std::copy_n(vb.data() + std::size_t{t} * kv_dim, kv_dim,
                             vrow);
-                backend::rope_norm(q, hp_.n_heads, hd, pos,
-                                   hp_.rope_freq_base, rope_factors());
-                backend::rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd, pos,
-                                   hp_.rope_freq_base, rope_factors());
+                const std::span<float> k(krow, kv_dim);
+                if (!qwen2) {
+                    backend::rope_norm(q, hp_.n_heads, hd, pos,
+                                       hp_.rope_freq_base, rope_factors());
+                    backend::rope_norm(k, hp_.n_kv_heads, hd, pos,
+                                       hp_.rope_freq_base, rope_factors());
+                } else if (!mrope.empty() && hp_.rope_sections[0] != 0) {
+                    backend::rope_mrope(q, hp_.n_heads, hd, mrope[t].data(),
+                                        hp_.rope_sections,
+                                        hp_.rope_freq_base);
+                    backend::rope_mrope(k, hp_.n_kv_heads, hd,
+                                        mrope[t].data(), hp_.rope_sections,
+                                        hp_.rope_freq_base);
+                } else {
+                    backend::rope_neox_yarn(q, hp_.n_heads, hd, pos,
+                                            hp_.rope_freq_base,
+                                            backend::Yarn{});
+                    backend::rope_neox_yarn(k, hp_.n_kv_heads, hd, pos,
+                                            hp_.rope_freq_base,
+                                            backend::Yarn{});
+                }
             }
             cache.sync_rows(seq, l, base, n);
             // Every row is stored, so all (token, head) pairs attend in

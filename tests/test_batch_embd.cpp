@@ -12,6 +12,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
+#include "qwen_tiny.hpp"
 
 using locus::model::TransformerModel;
 using Seq = locus::kv::PagedKvCache::Seq;
@@ -203,4 +204,77 @@ TEST_CASE("vulkan forward_batch with input embeddings tracks the CPU",
     cR.release(sR);
     cB.release(sB);
     cX.release(sX);
+}
+
+// i#671: qwen2-family attention (q / k / v biases, NEOX rope, M-RoPE)
+// batches its projections in forward_batch, as llama's does. Without
+// M-RoPE positions a chunk equals one forward() per position bit for bit
+// (forward() runs qwen2moe_attention per token); with them, a chunk
+// equals the same positions fed one token per forward_batch.
+TEST_CASE("qwen2 forward_batch equals per-position forward",
+          "[model][batch]") {
+    for (const char* arch : {"qwen2", "qwen2vl"}) {
+        DYNAMIC_SECTION(arch) {
+            const auto img = qwen_tiny::lm(arch);
+            const auto g = locus::gguf::GgufFile::parse(img);
+            auto model = TransformerModel::load(g);
+            const std::uint32_t V = model.hparams().n_vocab;
+            const std::vector<locus::tok::TokenId> toks = {3, 17, 9, 30, 1,
+                                                           22, 5};
+            const auto m = static_cast<std::uint32_t>(toks.size());
+
+            auto cR = model.make_cache(16);
+            auto wR = model.make_workspace();
+            Seq sR;
+            std::vector<std::vector<float>> want(m, std::vector<float>(V));
+            for (std::uint32_t i = 0; i < m; ++i) {
+                REQUIRE(cR.ensure_capacity(sR, 1));
+                model.forward(toks[i], cR, sR, wR, want[i]);
+            }
+            auto cB = model.make_cache(16);
+            auto wB = model.make_workspace();
+            Seq sB;
+            REQUIRE(cB.ensure_capacity(sB, m));
+            std::vector<float> got(std::size_t{m} * V);
+            model.forward_batch(toks, cB, sB, wB, got, true);
+            for (std::uint32_t i = 0; i < m; ++i) {
+                INFO("position " << i);
+                REQUIRE(std::vector<float>(got.begin() + i * V,
+                                           got.begin() + (i + 1) * V) ==
+                        want[i]);
+            }
+            cR.release(sR);
+            cB.release(sB);
+        }
+    }
+    SECTION("qwen2vl with M-RoPE positions") {
+        const auto img = qwen_tiny::lm("qwen2vl");
+        const auto g = locus::gguf::GgufFile::parse(img);
+        auto model = TransformerModel::load(g);
+        const std::uint32_t V = model.hparams().n_vocab;
+        // Two text tokens, a 2 x 2 image span, two text tokens.
+        const auto pos = locus::model::mrope_positions(2, 2, 2, 2);
+        const std::vector<locus::tok::TokenId> toks(pos.size(), 7);
+        const auto m = static_cast<std::uint32_t>(toks.size());
+        auto cB = model.make_cache(16);
+        auto wB = model.make_workspace();
+        Seq sB;
+        REQUIRE(cB.ensure_capacity(sB, m));
+        std::vector<float> got(std::size_t{m} * V);
+        model.forward_batch(toks, cB, sB, wB, got, true, {}, pos);
+        auto cO = model.make_cache(16);
+        auto wO = model.make_workspace();
+        Seq sO;
+        REQUIRE(cO.ensure_capacity(sO, m));
+        std::vector<float> one(V);
+        for (std::uint32_t i = 0; i < m; ++i) {
+            INFO("position " << i);
+            model.forward_batch(std::span(toks).subspan(i, 1), cO, sO, wO,
+                                one, true, {}, std::span(pos).subspan(i, 1));
+            REQUIRE(std::vector<float>(got.begin() + i * V,
+                                       got.begin() + (i + 1) * V) == one);
+        }
+        cB.release(sB);
+        cO.release(sO);
+    }
 }
