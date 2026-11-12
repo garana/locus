@@ -1746,6 +1746,20 @@ void OpenAiServer::install_routes() {
             counter("locus_prefix_reused_tokens_total",
                     "Prompt tokens served from the prefix cache.",
                     s.prefix_reused_tokens);
+            counter("locus_disk_prefix_hits_total",
+                    "Requests whose prefix was read from the disk tier.",
+                    s.disk_hits);
+            counter("locus_disk_prefix_loaded_tokens_total",
+                    "Positions read back from the disk tier.",
+                    s.disk_loaded_tokens);
+            counter("locus_disk_prefix_swapped_tokens_total",
+                    "Positions of preempted sequences written to the disk "
+                    "tier.",
+                    s.disk_swapped_tokens);
+            counter("locus_disk_prefix_refused_tokens_total",
+                    "Positions of preempted sequences the disk tier "
+                    "refused, recomputed on readmission.",
+                    s.disk_refused_tokens);
             counter("locus_spec_accepted_tokens_total",
                     "Speculative draft tokens accepted.",
                     s.spec_accepted_tokens);

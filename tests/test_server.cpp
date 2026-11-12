@@ -1899,6 +1899,14 @@ TEST_CASE("metrics carry labels and timings in well-formed histograms",
     REQUIRE(metric_value(b, "locus_engine_steps_total") > 0);
     REQUIRE(metric_value(b, "locus_decode_tokens_total") >= 6);  // 2 x 3
     REQUIRE(metric_value(b, "locus_prefill_tokens_total") > 0);
+    // The disk prefix tier's counters (i#642), 0 without a tier.
+    for (const char* m : {"locus_disk_prefix_hits_total",
+                          "locus_disk_prefix_loaded_tokens_total",
+                          "locus_disk_prefix_swapped_tokens_total",
+                          "locus_disk_prefix_refused_tokens_total"}) {
+        INFO(m);
+        REQUIRE(metric_value(b, m) == 0);
+    }
     REQUIRE(metric_value(b, "locus_requests_waiting") == 0);
     REQUIRE(metric_value(b, "locus_batch_tokens") >= 0);  // present
     // KV blocks in use by state: with the free blocks, the pool.

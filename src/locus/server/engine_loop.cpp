@@ -166,6 +166,10 @@ EngineLoop::Stats EngineLoop::stats() {
     s.spec_steps = engine_.spec_steps();
     s.spec_drafted_tokens = engine_.spec_drafted_tokens();
     s.spec_draft_counts = engine_.spec_draft_counts();
+    s.disk_hits = engine_.disk_prefix_hits();
+    s.disk_loaded_tokens = engine_.disk_prefix_loaded_tokens();
+    s.disk_swapped_tokens = engine_.disk_prefix_swapped_tokens();
+    s.disk_refused_tokens = engine_.disk_prefix_refused_tokens();
     return s;
 }
 

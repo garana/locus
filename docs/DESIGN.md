@@ -98,7 +98,11 @@ Correctness first, then CPU throughput, then GPU.
   two prefill iterations goes first, so short ones cannot starve a long
   one), and each prompt
   is fed in the chunks it gets alone (the whole cap, then its
-  remainder), which keeps its output independent of the batch. While
+  remainder), which keeps its output independent of the batch. A
+  prompt resumed from a cached prefix (the RAM cache, or the disk tier,
+  also after a preemption) is fed from the prefix's end, so its chunks
+  match an uncached run's only when the block size divides the cap and
+  the prefix ends on a chunk boundary. While
   a sequence decodes, every other iteration feeds no prompt, so long
   prompts do not starve decoding sequences.
 
@@ -638,7 +642,9 @@ guarding the default path.
   blocks, and the engine keeps stepping the other requests. A
   preempted sequence writes its full blocks (prompt and output so far,
   keyed by those tokens) to the disk tier too; on readmission it loads
-  them the same way and recomputes only the tail (i#621).
+  them the same way and recomputes only the tail (i#621). Blocks past
+  the write backlog are written at preemption from the pool, so the
+  step waits for the disk instead of a long recompute later (i#642).
 - Speculative decoding: prompt lookup (no draft model). An n-gram
   match against the context proposes drafts, verified in one batched
   forward; the longest correct prefix is accepted. Greedy only, so
