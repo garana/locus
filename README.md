@@ -178,7 +178,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   runs at 1.34x real time), Qwen-Image-Edit's 65 s CPU encode (#671,
   parked: the edit's working set does not fit a 36 GiB host with the
   language model on the GPU).
-- Performance: prefill on Apple GPUs at about half of Metal's (#10:
+- Performance: prefill on Apple GPUs at 42% of Metal's (#10:
   MoltenVK exposes no cooperative matrix), CPU prefill (#618: x86
   SSE4, long-context attention #701), batch-invariant decode at full
   speed on V3D (#511), the MoE hybrid on Vulkan (#679).
