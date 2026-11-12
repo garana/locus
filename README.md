@@ -181,7 +181,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 - Performance: prefill on Apple GPUs at about half of Metal's (#10:
   MoltenVK exposes no cooperative matrix), CPU prefill (#618: x86
   SSE4, long-context attention #701), batch-invariant decode at full
-  speed on V3D (#511).
+  speed on V3D (#511), the MoE hybrid on Vulkan (#679).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
