@@ -52,6 +52,12 @@ class QwenEditPipeline {
         /** The reference's pixel count for the VAE (the pipeline's
          *  1024 x 1024; smaller in tests). */
         std::uint64_t area = 1024 * 1024;
+        /** true (diffusers): the reference is encoded at about `area`
+         *  pixels whatever the output size. false (i#670): at the
+         *  output's area, so a small edit runs fewer reference tokens
+         *  through the MMDiT and the vision tower. As FLUX Kontext's
+         *  auto_resize. */
+        bool auto_resize = true;
     };
 
     /** Where the time went, in milliseconds. */

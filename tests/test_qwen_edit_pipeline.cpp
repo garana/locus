@@ -126,3 +126,52 @@ TEST_CASE("qwen edit pipeline matches diffusers on tiny parts",
     req.reference = {};
     REQUIRE_THROWS_AS(p->edit(req, op, {}, ow, oh), std::invalid_argument);
 }
+
+// i#670: auto_resize false encodes the reference at the output's area.
+// At an output whose area is `area` it is the default, bit for bit; at
+// a smaller output the reference shrinks with it, so the edit changes
+// while the output size does not.
+TEST_CASE("qwen edit auto_resize false encodes the reference at the "
+          "output's area",
+          "[qwen-edit][image]") {
+    if (!std::filesystem::exists(kTokModel)) {
+        SKIP("qwen2.5-0.5b-instruct-q8_0.gguf absent (its tokenizer)");
+    }
+    const auto tok_g = locus::gguf::GgufFile::open(kTokModel);
+    const auto lm_img = qwen_tiny::lm("qwen2vl", kVocab);
+    const auto lm_g = locus::gguf::GgufFile::parse(lm_img);
+    const auto v_img = qwen_tiny::mmproj(qwen_tiny::kE);
+    const auto v_g = locus::gguf::GgufFile::parse(v_img);
+    const auto dit_g =
+        locus::gguf::GgufFile::open(kDir + "golden/qwen_image_dit_synth.gguf");
+    const auto vae_g =
+        locus::gguf::GgufFile::open(kDir + "golden/qwen_vae_synth.gguf");
+    const auto p =
+        QwenEditPipeline::from_parts(lm_g, v_g, dit_g, vae_g, tok_g);
+    const auto& op = locus::backend::best_backend().ops;
+
+    auto run = [&](std::uint32_t side, bool auto_resize) {
+        QwenEditPipeline::Request req;
+        req.prompt = "Make the sky purple.";
+        req.reference = reference();
+        req.steps = kSteps;
+        req.true_cfg_scale = 1.0f;  // no CFG: one pass per step
+        req.area = kArea;
+        req.width = req.height = side;
+        req.auto_resize = auto_resize;
+        const auto [w, h] = p->output_size(req);
+        REQUIRE(w == side);
+        REQUIRE(h == side);
+        const std::uint32_t s = p->vae_scale();
+        std::uint32_t state = 31337;
+        auto noise = qwen_tiny::lcg(
+            state, std::size_t{h / s / 2} * (w / s / 2) * p->channels());
+        return p->edit_from(noise, req, op, {});
+    };
+    // 96 x 96 is kArea: the same reference either way.
+    CHECK(run(96, false) == run(96, true));
+    // 48 x 48: a quarter of the reference pixels, a different edit.
+    const auto small = run(48, false);
+    CHECK(small.size() == std::size_t{48} * 48 * 3);
+    CHECK(small != run(48, true));
+}
