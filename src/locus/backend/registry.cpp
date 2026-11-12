@@ -65,13 +65,13 @@ const std::vector<Backend>& list() {
                       .matvec_q8k = &matvec_sse4_q8k,
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_sse4,
+                      .matvec_q8k_batch = &matvec_batch_sse4_q8k,
                       .prefers_q8k = true}});
 #endif
-        // The scalar backend ships the R11 batched reference; neon
-        // ships its register-blocked kernel (Q4_K/Q6_K + per-token
-        // fallback). sse4/avx2 leave matvec_batch null for now and
-        // use the per-token fallback until their kernels land
-        // (owner: vx).
+        // The scalar backend ships the R11 batched reference; neon and
+        // sse4 ship register-blocked f32 kernels (Q4_K/Q6_K + per-token
+        // fallback) and batched quantized-activation dots
+        // (matvec_q8k_batch); avx2 uses the per-token fallback.
         b.push_back({"scalar", "portable reference (all types)",
                      true, true,
                      {.matvec = &matvec,
