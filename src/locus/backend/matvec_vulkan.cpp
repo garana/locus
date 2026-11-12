@@ -3293,18 +3293,39 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
     }
     if (n == 0 || n > State::kMultiMax || n > kSmallBatch ||
         cache.quantized() || hp.arch == model::Arch::kDeepseek2 ||
-        hp.n_expert > 0 || !vulkan_forward_supported(m) ||
+        !vulkan_forward_supported(m) ||
         (last && !short_ok(m.output_weight())) ||
         std::ranges::any_of(run, [&](const auto& l) {
-            return l.is_moe() || l.has_qk_norm() || !short_ok(l.wq) ||
-                   !short_ok(l.wk) || !short_ok(l.wv) ||
-                   !short_ok(l.wo) || !short_ok(l.w_gate) ||
-                   !short_ok(l.w_up) || !short_ok(l.w_down);
+            if (!short_ok(l.wq) || !short_ok(l.wk) || !short_ok(l.wv) ||
+                !short_ok(l.wo)) {
+                return true;
+            }
+            if (!l.is_moe()) {
+                return !short_ok(l.w_gate) || !short_ok(l.w_up) ||
+                       !short_ok(l.w_down);
+            }
+            // MoE (i#623): the routed experts through rec_moe_routed;
+            // a shared expert through the dense FFN below, ungated
+            // only (qwen2moe's sigmoid-gated one stays per sequence).
+            return hp.n_expert_shared > 0 &&
+                   (l.gate_inp_shexp.rows > 0 || !short_ok(l.gate_shexp) ||
+                    !short_ok(l.up_shexp) || !short_ok(l.down_shexp));
         })) {
         return false;
     }
     std::lock_guard lk(state_mu());
     State& s = state();
+    // The routed experts need GPU routing (all experts resident) and an
+    // id-matmul for their weight types, as vulkan_forward_batch's.
+    for (const auto& lay : run) {
+        if (lay.is_moe() &&
+            (!gpu_route_ok(s, m, lay) || hp.n_expert > 256 ||
+             matmul_id_kernel(lay.gate_exps.base) == Kernel::kCount_ ||
+             matmul_id_kernel(lay.up_exps.base) == Kernel::kCount_ ||
+             matmul_id_kernel(lay.down_exps.base) == Kernel::kCount_)) {
+            return false;
+        }
+    }
     auto pool_it =
         s.kv_pools.find(static_cast<const void*>(cache.pool_data()));
     if (pool_it == s.kv_pools.end()) {
@@ -3365,8 +3386,13 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
     const auto bq =
         s.chunk_buf(C::kCQ, std::size_t{n} * (qkv_cat ? R : q_dim));
     const auto bkv = s.chunk_buf(C::kCK, std::size_t{2} * n * kv_dim);
-    const auto bgate = s.chunk_buf(C::kCGate, std::size_t{n} * ff);
-    const auto bup = s.chunk_buf(C::kCUp, std::size_t{n} * ff);
+    // FFN rows: the dense width, a shared expert's, or every routed
+    // (token, expert) pair's.
+    const std::size_t ff_rows = std::max<std::size_t>(
+        {std::size_t{n} * ff, std::size_t{n} * shexp_ff(hp),
+         std::size_t{n} * hp.n_expert_used * hp.n_ff_exp});
+    const auto bgate = s.chunk_buf(C::kCGate, ff_rows);
+    const auto bup = s.chunk_buf(C::kCUp, ff_rows);
     const auto batt = s.chunk_buf(C::kCAttOut, std::size_t{n} * q_dim);
     const auto blog = s.chunk_buf(C::kCLogits, std::size_t{n} * n_rows);
     // The decode attention reads q and writes its output at offset 0:
@@ -3467,6 +3493,26 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
                  qkv_cat ? q_dim + kv_dim : n * kv_dim,
                  qkv_cat ? R : kv_dim);
         }
+        // Per-head q / k RMS norms (qwen3, qwen3moe) before rope: each
+        // head's hd floats, in place, one dispatch per sequence and
+        // matrix (the heads of a row are hd apart, the rows are not).
+        if (lay.has_qk_norm()) {
+            auto head_norms = [&](std::span<const float> w,
+                                  VulkanContext::Buffer o, std::uint32_t at,
+                                  std::uint32_t heads) {
+                const VulkanContext::Buffer bufs[] = {
+                    o, s.upload(w.data(), w.size() * 4), o};
+                const std::uint32_t push[] = {hd, eps_bits, at, at, hd, hd};
+                s.ctx.dispatch(Kernel::kRmsNormB, bufs, push, 1, heads);
+            };
+            for (std::uint32_t i = 0; i < n; ++i) {
+                head_norms(lay.attn_q_norm, bq, qkv_cat ? i * R : i * q_dim,
+                           H);
+                head_norms(lay.attn_k_norm, bk,
+                           qkv_cat ? i * R + q_dim : i * kv_dim,
+                           hp.n_kv_heads);
+            }
+        }
         for (std::uint32_t i = 0; i < n; ++i) {
             const std::uint32_t pos = steps[i].seq->n_tokens;
             const std::uint32_t q_at = qkv_cat ? i * R : i * q_dim;
@@ -3519,34 +3565,55 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
 
         norm_rows(lay.ffn_norm, bx, bxb);
         mark(s, model::Stage::kNorm);
-        const auto gt = lay.w_gate.type;
-        if ((gt == gguf::TensorType::kQ8_0 ||
-             gt == gguf::TensorType::kQ4_K) &&
-            lay.w_up.type == gt && n <= kSmallBatch) {
-            // Gate, up and silu_mul in one short-batch dispatch (both
-            // dots as matvec_q8_0_n / matvec_q4_k_n computes one).
-            const VulkanContext::Buffer bufs[] = {
-                s.upload_w(lay.w_gate), bxb, bgate, s.upload_w(lay.w_up)};
-            const std::uint32_t push[] = {ff, E, 0, 0, 0, 0, fbits(1.0f), n,
-                                          E,  ff, 0, 0, 0};
-            const Kernel k =
-                gt == gguf::TensorType::kQ4_K
-                    ? (n <= 2   ? Kernel::kMatvecQ4_KN2Glu
-                       : n <= 4 ? Kernel::kMatvecQ4_KN4Glu
-                                : Kernel::kMatvecQ4_KNGlu)
-                    : q8n_variant(s.ctx, Kernel::kMatvecQ8_0NGlu, n);
-            s.ctx.dispatch(k, bufs, push,
-                           VulkanContext::matvec_groups(k, ff));
-        } else {
-            proj(lay.w_gate, bxb, E, bgate, 0, ff, false);
-            proj(lay.w_up, bxb, E, bup, 0, ff, false);
-            const VulkanContext::Buffer bufs[] = {bgate, bup, bgate};
-            const std::uint32_t push[] = {n * ff};
-            s.ctx.dispatch(Kernel::kSiluMul, bufs, push,
-                           (n * ff + 63) / 64);
+        // SwiGLU of width f on the normed rows, added into bx: the dense
+        // FFN, or an MoE layer's shared expert.
+        auto dense_ffn = [&](const Mat& wg0, const Mat& wu0, const Mat& wd0,
+                             std::uint32_t f) {
+            Mat wg = wg0, wu = wu0, wd = wd0;
+            wg.rows = f;
+            wu.rows = f;
+            wd.cols = f;
+            const auto gt = wg.type;
+            if ((gt == gguf::TensorType::kQ8_0 ||
+                 gt == gguf::TensorType::kQ4_K) &&
+                wu.type == gt && n <= kSmallBatch) {
+                // Gate, up and silu_mul in one short-batch dispatch (both
+                // dots as matvec_q8_0_n / matvec_q4_k_n computes one).
+                const VulkanContext::Buffer bufs[] = {
+                    s.upload_w(wg), bxb, bgate, s.upload_w(wu)};
+                const std::uint32_t push[] = {f, E, 0, 0, 0, 0, fbits(1.0f),
+                                              n, E, f, 0, 0, 0};
+                const Kernel k =
+                    gt == gguf::TensorType::kQ4_K
+                        ? (n <= 2   ? Kernel::kMatvecQ4_KN2Glu
+                           : n <= 4 ? Kernel::kMatvecQ4_KN4Glu
+                                    : Kernel::kMatvecQ4_KNGlu)
+                        : q8n_variant(s.ctx, Kernel::kMatvecQ8_0NGlu, n);
+                s.ctx.dispatch(k, bufs, push,
+                               VulkanContext::matvec_groups(k, f));
+            } else {
+                proj(wg, bxb, E, bgate, 0, f, false);
+                proj(wu, bxb, E, bup, 0, f, false);
+                const VulkanContext::Buffer bufs[] = {bgate, bup, bgate};
+                const std::uint32_t push[] = {n * f};
+                s.ctx.dispatch(Kernel::kSiluMul, bufs, push,
+                               (n * f + 63) / 64);
+            }
+            proj(wd, bgate, f, bx, 0, E, true);
+        };
+        if (!lay.is_moe()) {
+            dense_ffn(lay.w_gate, lay.w_up, lay.w_down, ff);
+            mark(s, model::Stage::kFfn);
+            continue;
         }
-        proj(lay.w_down, bgate, ff, bx, 0, E, true);
-        mark(s, model::Stage::kFfn);
+        // MoE (i#623): every sequence's row through the routed experts,
+        // then the shared expert.
+        rec_moe_routed(s, hp, lay, n, bx, bxb, bgate, bup);
+        if (hp.n_expert_shared > 0) {
+            dense_ffn(lay.gate_shexp, lay.up_shexp, lay.down_shexp,
+                      shexp_ff(hp));
+        }
+        mark(s, model::Stage::kMoe);
     }
     if (!last) {
         // A stage before the last hands each residual stream on: no
