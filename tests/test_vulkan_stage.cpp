@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -263,6 +265,65 @@ TEST_CASE("two batched vulkan stages give the full multi pass's logits",
                     REQUIRE(rs == rf);
                 }
             }
+        }
+    }
+}
+
+// i#623: a model with q / k / v biases (qwen2) runs the multi pass, and
+// each sequence's logits there match its own single-sequence pass (other
+// kernels sum in another order, so within a bound, with the same
+// greedy pick).
+TEST_CASE("a qwen2 multi pass matches its sequences' single passes",
+          "[vulkan][pipeline]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/qwen2.5-0.5b-instruct-q8_0.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("qwen2.5-0.5b-instruct-q8_0.gguf absent");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+    REQUIRE(model.layers()[0].has_qkv_bias());
+    const std::uint32_t E = model.hparams().n_embd;
+    const std::uint32_t V = model.hparams().n_vocab;
+    constexpr std::uint32_t n = 3;
+    PagedKvCache cm = model.make_cache(1024);
+    PagedKvCache cs = model.make_cache(1024);
+    std::vector<PagedKvCache::Seq> sm(n), ss(n);
+    std::vector<float> got(std::size_t{n} * V), want(V);
+    std::vector<float> normed(std::size_t{n} * E);
+    for (std::uint32_t p = 0; p < 12; ++p) {
+        CAPTURE(p);
+        std::vector<locus::model::EmbedStep> steps(n);
+        std::vector<locus::tok::TokenId> toks(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            REQUIRE(cm.ensure_capacity(sm[i], 1));
+            toks[i] = static_cast<locus::tok::TokenId>(
+                100 + (p * 37 + i * 1009) % 30000);
+            steps[i] = {toks[i], {}, &sm[i],
+                        std::span(got).subspan(std::size_t{i} * V, V),
+                        std::span(normed).subspan(std::size_t{i} * E, E)};
+        }
+        // Declined before i#623 (q / k / v biases).
+        REQUIRE(locus::backend::vulkan_forward_multi(model, steps, cm, 0, V));
+        for (std::uint32_t i = 0; i < n; ++i) {
+            CAPTURE(i);
+            REQUIRE(cs.ensure_capacity(ss[i], 1));
+            REQUIRE(locus::backend::vulkan_forward(model, toks[i], cs, ss[i],
+                                                   want));
+            const auto row = std::span(got).subspan(std::size_t{i} * V, V);
+            double err = 0.0, norm = 0.0;
+            for (std::uint32_t v = 0; v < V; ++v) {
+                const double d = double{row[v]} - want[v];
+                err += d * d;
+                norm += double{want[v]} * want[v];
+            }
+            CHECK(std::sqrt(err) <= 1e-3 * std::sqrt(norm));
+            CHECK(std::max_element(row.begin(), row.end()) - row.begin() ==
+                  std::max_element(want.begin(), want.end()) - want.begin());
         }
     }
 }

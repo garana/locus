@@ -3177,8 +3177,8 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
         hp.n_expert > 0 || !vulkan_forward_supported(m) ||
         (last && !short_ok(m.output_weight())) ||
         std::ranges::any_of(run, [&](const auto& l) {
-            return l.is_moe() || l.has_qk_norm() || l.has_qkv_bias() ||
-                   !short_ok(l.wq) || !short_ok(l.wk) || !short_ok(l.wv) ||
+            return l.is_moe() || l.has_qk_norm() || !short_ok(l.wq) ||
+                   !short_ok(l.wk) || !short_ok(l.wv) ||
                    !short_ok(l.wo) || !short_ok(l.w_gate) ||
                    !short_ok(l.w_up) || !short_ok(l.w_down);
         })) {
@@ -3328,6 +3328,26 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
         // Where sequence i's q and k rows start, and its V row's
         // distance from its K row.
         const VulkanContext::Buffer bk = qkv_cat ? bq : bkv;
+        // q / k / v biases (qwen2), on every sequence's rows at once
+        // (i#623): stacked [q | k | v] rows R apart, or one plane each.
+        auto bias = [&](std::span<const float> b, VulkanContext::Buffer o,
+                        std::uint32_t dim, std::uint32_t off,
+                        std::uint32_t stride) {
+            const VulkanContext::Buffer bufs[] = {
+                s.upload(b.data(), b.size() * 4), o};
+            const std::uint32_t push[] = {dim, n, off, stride, 0};
+            s.ctx.dispatch(Kernel::kBiasRows, bufs, push,
+                           std::min<std::uint32_t>((n * dim + 255) / 256,
+                                                   65535));
+        };
+        if (lay.has_qkv_bias()) {
+            bias(lay.wq_bias, bq, q_dim, 0, qkv_cat ? R : q_dim);
+            bias(lay.wk_bias, bk, kv_dim, qkv_cat ? q_dim : 0,
+                 qkv_cat ? R : kv_dim);
+            bias(lay.wv_bias, bk, kv_dim,
+                 qkv_cat ? q_dim + kv_dim : n * kv_dim,
+                 qkv_cat ? R : kv_dim);
+        }
         for (std::uint32_t i = 0; i < n; ++i) {
             const std::uint32_t pos = steps[i].seq->n_tokens;
             const std::uint32_t q_at = qkv_cat ? i * R : i * q_dim;
