@@ -1,6 +1,7 @@
 #include "locus/image/flux_dit.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -204,6 +205,13 @@ FluxDit FluxDit::load(const gguf::GgufFile& g) {
     if (!gb) throw gguf::Error("flux: missing flux.guidance_embeds");
     d.guidance_ = *gb;
     d.may_edit_ = may_edit_of(g);
+    if (!g.get_bool("flux.kontext")) {
+        std::fprintf(stderr,
+                     "flux: no flux.kontext (converted before it existed); "
+                     "edits are on. Re-run scripts/convert-flux.py so a "
+                     "FLUX.1 dev or schnell checkpoint stops serving "
+                     "edits.\n");
+    }
     const gguf::Value* ax = g.find("flux.rope.axes");
     if (ax == nullptr || ax->type != gguf::ValueType::kArray ||
         ax->arr.empty() || ax->arr.size() > 8) {

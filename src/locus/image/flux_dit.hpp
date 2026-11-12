@@ -59,7 +59,8 @@ class FluxDit {
      * Whether a FLUX GGUF's checkpoint edits (i#648): its flux.kontext,
      * which scripts/convert-flux.py writes from the pipeline's class
      * (FLUX.1 Kontext and dev share their tensors). A GGUF without the
-     * key, converted before it existed, may be either: true.
+     * key, converted before it existed, may be either: true, and load()
+     * says so on stderr.
      */
     static bool may_edit_of(const gguf::GgufFile& g);
 
