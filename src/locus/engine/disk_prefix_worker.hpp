@@ -5,6 +5,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -55,8 +56,21 @@ class DiskPrefixWorker {
      *  (so a caller can skip copying the bytes). */
     bool would_accept(std::uint64_t bytes) const;
 
-    /** Queues a read of `n_blocks` blocks of `tokens` into `dst`, one
-     *  pointer per block; its Done carries `id`. */
+    /**
+     * @returns The most blocks of a prefix of `tokens` that a write
+     *     not yet on disk holds (queued, or running), else 0: with
+     *     DiskPrefixStore::find, what a read of `tokens` can get now
+     *     (i#675).
+     */
+    std::uint32_t queued_blocks(std::span<const tok::TokenId> tokens) const;
+
+    /**
+     * Queues a read of `n_blocks` blocks of `tokens` into `dst`, one
+     * pointer per block; its Done carries `id`. A queued write that
+     * holds those blocks serves the read from its bytes at once (reads
+     * run before writes, so the store would miss them); a running one
+     * finishes before the read runs.
+     */
     void read(std::uint64_t id, std::vector<tok::TokenId> tokens,
               std::uint32_t n_blocks, std::vector<std::uint8_t*> dst);
 
@@ -91,6 +105,8 @@ class DiskPrefixWorker {
     std::deque<Job> writes_;
     std::uint64_t backlog_ = 0;
     bool busy_ = false;
+    /** The write run() is doing, while it does it (else null). */
+    const Job* writing_ = nullptr;
     std::vector<Done> done_;
     // Last member: started after the rest is built, joined first.
     std::jthread thread_;

@@ -755,7 +755,10 @@ bool Engine::try_disk_load(Request& r) {
         r.prompt.size() + r.generated.size());
     const std::uint32_t bt = cache_.geometry().block_tokens;
     const std::vector<tok::TokenId> ctx = context_of(r, n_total);
-    const std::uint32_t on_disk = cfg_.disk_prefix->find(ctx);
+    // A victim readmitted before the worker wrote its blocks finds them
+    // in the worker's queue (i#675).
+    const std::uint32_t on_disk = std::max(cfg_.disk_prefix->find(ctx),
+                                           disk_worker_->queued_blocks(ctx));
     // One token is always fed again, so the disk gives at most
     // n_total - 1 positions. Load only for at least one more block
     // than RAM gave: a block-aligned prompt cached in RAM (which keeps
