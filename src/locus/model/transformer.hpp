@@ -665,6 +665,9 @@ class TransformerModel {
         backend::Mat ffn_latent_down, ffn_latent_up;
         std::span<const float> ffn_pre_exp_norm, ffn_post_exp_norm;
         std::span<const float> post_ffw_norm;
+        /** kolibri1: RMS norm weight on the attention output, before
+         *  the residual (its FFN one is post_ffw_norm). */
+        std::span<const float> post_attn_norm;
 
         /** deepseek41: attention sinks, grouped output LoRA, mHC
          * mixes (fn / base / scale per sublayer), the KV compressor
