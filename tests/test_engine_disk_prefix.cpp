@@ -390,12 +390,14 @@ TEST_CASE("a preempted sequence reads its blocks back from the disk tier",
     const auto want0 = baseline.get(b0)->generated;
     const auto want1 = baseline.get(b1)->generated;
 
+    std::uint64_t swapped = 0, loaded = 0, refused = 0;
     const auto run = [&](std::shared_ptr<DiskPrefixStore> store,
-                         std::uint64_t& swapped, std::uint64_t& loaded) {
+                         std::uint64_t backlog = 64ull << 20) {
         Engine::Config cfg;
         cfg.n_blocks = 7;
         cfg.decode_headroom = 1;
         cfg.disk_prefix = std::move(store);
+        cfg.disk_write_backlog = backlog;
         Engine e(f.model, f.tok.eos_id(), cfg);
         const auto id0 = e.submit(f.q, 40);
         const auto id1 = e.submit(f.p, 40);
@@ -406,18 +408,35 @@ TEST_CASE("a preempted sequence reads its blocks back from the disk tier",
         REQUIRE(e.get(id1)->generated == want1);
         swapped = e.disk_prefix_swapped_tokens();
         loaded = e.disk_prefix_loaded_tokens();
+        refused = e.disk_prefix_refused_tokens();
     };
-    std::uint64_t swapped = 0;
-    std::uint64_t loaded = 0;
-    run(nullptr, swapped, loaded);  // recompute
+    run(nullptr);  // recompute
     REQUIRE(swapped == 0);
     REQUIRE(loaded == 0);
 
     TempDir t("locus-edp-preempt");
     std::size_t bb;
     const DiskKey key = key_for(f.model, bb);
-    run(std::make_shared<DiskPrefixStore>(t.dir, key, bb, 64 << 20),
-        swapped, loaded);
-    REQUIRE(swapped >= 32);
-    REQUIRE(loaded >= 32);
+    SECTION("through the write worker") {
+        run(std::make_shared<DiskPrefixStore>(t.dir, key, bb, 64 << 20));
+        REQUIRE(swapped >= 32);
+        REQUIRE(loaded >= 32);
+        REQUIRE(refused == 0);
+    }
+    // i#642: a victim larger than the write backlog is written at
+    // preemption, from the pool, and still read back.
+    SECTION("past the write backlog") {
+        run(std::make_shared<DiskPrefixStore>(t.dir, key, bb, 64 << 20), 1);
+        REQUIRE(swapped >= 32);
+        REQUIRE(loaded >= 32);
+        REQUIRE(refused == 0);
+    }
+    // A disk cap smaller than one block refuses the swap: counted, and
+    // the victim recomputes.
+    SECTION("refused by the disk cap") {
+        run(std::make_shared<DiskPrefixStore>(t.dir, key, bb, bb / 2), 1);
+        REQUIRE(swapped == 0);
+        REQUIRE(loaded == 0);
+        REQUIRE(refused >= 32);
+    }
 }
