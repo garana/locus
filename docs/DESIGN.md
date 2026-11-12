@@ -645,7 +645,8 @@ guarding the default path.
   blocks, and the engine keeps stepping the other requests. A
   preempted sequence writes its full blocks (prompt and output so far,
   keyed by those tokens) to the disk tier too; on readmission it loads
-  them the same way and recomputes only the tail (i#621). Blocks past
+  them the same way and recomputes only the tail (i#621); blocks still
+  in the worker's write queue are copied from it (i#675). Blocks past
   the write backlog are written at preemption from the pool, so the
   step waits for the disk instead of a long recompute later (i#642).
 - Speculative decoding: prompt lookup (no draft model). An n-gram

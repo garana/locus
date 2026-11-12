@@ -6,15 +6,19 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/engine/disk_prefix_store.hpp"
+#include "locus/engine/disk_prefix_worker.hpp"
 
 using locus::engine::DiskKey;
 using locus::engine::DiskPrefixStore;
+using locus::engine::DiskPrefixWorker;
 using locus::tok::TokenId;
 namespace fs = std::filesystem;
 
@@ -444,4 +448,93 @@ TEST_CASE("DiskPrefixStore: concurrent finds and reads and writes agree",
     }
     REQUIRE(files == kThreads + 1);  // no temporary file left behind
     REQUIRE(s.used_bytes() == on_disk);
+}
+
+namespace {
+
+/** A store whose writes wait until `open`: the write the worker runs
+ *  stays running, and the writes after it stay queued. */
+struct GatedStore : DiskPrefixStore {
+    using DiskPrefixStore::DiskPrefixStore;
+    std::atomic<bool> open{false};
+    std::atomic<int> writes{0};
+    bool write(std::span<const TokenId> prompt, std::uint32_t n_blocks,
+               std::span<const std::uint8_t* const> src) override {
+        ++writes;
+        while (!open) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return DiskPrefixStore::write(prompt, n_blocks, src);
+    }
+};
+
+std::vector<std::uint8_t> flat(
+    const std::vector<std::vector<std::uint8_t>>& b) {
+    std::vector<std::uint8_t> f;
+    for (const auto& x : b) {
+        f.insert(f.end(), x.begin(), x.end());
+    }
+    return f;
+}
+
+}  // namespace
+
+// i#675: a preempted sequence readmitted before the worker wrote its
+// blocks. The worker runs reads before writes, so a read of a queued
+// write's blocks would miss on disk; the queue serves it instead, and
+// a running write finishes before the read runs.
+TEST_CASE("DiskPrefixWorker reads blocks of a write not yet on disk",
+          "[disk_prefix]") {
+    const DirGuard g{temp_dir("locus-dpw-queued")};
+    auto s = std::make_shared<GatedStore>(g.dir, key(), kBlockBytes,
+                                          1u << 20);
+    DiskPrefixWorker w(s, 1u << 20);
+    // Opens the gate before ~DiskPrefixWorker joins, even on a failure.
+    struct Opener {
+        GatedStore& s;
+        ~Opener() { s.open = true; }
+    } opener{*s};
+    const std::vector<TokenId> ta(kPrompt.begin(), kPrompt.begin() + 8);
+    const std::vector<TokenId> tb{21, 22, 23, 24, 25, 26,
+                                  27, 28, 29, 30, 31, 32};
+    const auto a = blocks(2, 7), b = blocks(3, 11);
+    REQUIRE(w.write(ta, 2, flat(a)));
+    while (s->writes == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(w.write(tb, 3, flat(b)));  // queued behind the running one
+
+    REQUIRE(s->find(tb) == 0);
+    REQUIRE(w.queued_blocks(tb) == 3);
+    std::vector<TokenId> longer = tb;
+    longer.push_back(99);
+    REQUIRE(w.queued_blocks(longer) == 3);
+    REQUIRE(w.queued_blocks(ta) == 2);  // the running write
+    const std::vector<TokenId> shorter(tb.begin(), tb.end() - 1);
+    REQUIRE(w.queued_blocks(shorter) == 0);
+
+    // The queued write serves the read at once, its first 2 blocks.
+    auto got = blocks(2, 0);
+    w.read(1, std::vector<TokenId>(tb.begin(), tb.begin() + 8), 2,
+           dsts(got));
+    auto done = w.take_done();
+    REQUIRE(done.size() == 1);
+    REQUIRE(done[0].id == 1);
+    REQUIRE(done[0].ok);
+    REQUIRE(got[0] == b[0]);
+    REQUIRE(got[1] == b[1]);
+
+    // The running write's blocks: read from disk once it finishes.
+    auto got_a = blocks(2, 0);
+    w.read(2, ta, 2, dsts(got_a));
+    REQUIRE_FALSE(w.has_done());
+    s->open = true;
+    w.drain();
+    done = w.take_done();
+    REQUIRE(done.size() == 1);
+    REQUIRE(done[0].id == 2);
+    REQUIRE(done[0].ok);
+    REQUIRE(got_a == a);
+    REQUIRE(s->find(tb) == 3);  // the served write still reached disk
+    REQUIRE(w.queued_blocks(tb) == 0);
 }

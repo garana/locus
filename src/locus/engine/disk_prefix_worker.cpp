@@ -1,5 +1,7 @@
 #include "locus/engine/disk_prefix_worker.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <utility>
 
 namespace locus::engine {
@@ -40,12 +42,44 @@ bool DiskPrefixWorker::would_accept(std::uint64_t bytes) const {
     return backlog_ + bytes <= backlog_cap_;
 }
 
+std::uint32_t DiskPrefixWorker::queued_blocks(
+    std::span<const tok::TokenId> tokens) const {
+    std::lock_guard lock(mu_);
+    std::uint32_t most = 0;
+    auto look = [&](const Job& w) {
+        if (w.tokens.size() <= tokens.size() &&
+            std::equal(w.tokens.begin(), w.tokens.end(), tokens.begin())) {
+            most = std::max(most, w.n_blocks);
+        }
+    };
+    for (const Job& w : writes_) {
+        look(w);
+    }
+    if (writing_ != nullptr) {
+        look(*writing_);
+    }
+    return most;
+}
+
 void DiskPrefixWorker::read(std::uint64_t id,
                             std::vector<tok::TokenId> tokens,
                             std::uint32_t n_blocks,
                             std::vector<std::uint8_t*> dst) {
     {
         std::lock_guard lock(mu_);
+        // A queued write of these blocks: copy them now. The worker
+        // runs reads first, so the store would not have them yet.
+        for (const Job& w : writes_) {
+            if (n_blocks <= w.n_blocks && tokens.size() <= w.tokens.size() &&
+                std::equal(tokens.begin(), tokens.end(), w.tokens.begin())) {
+                const std::size_t bb = w.bytes.size() / w.n_blocks;
+                for (std::uint32_t i = 0; i < n_blocks; ++i) {
+                    std::memcpy(dst[i], w.bytes.data() + i * bb, bb);
+                }
+                done_.push_back({id, true});
+                return;
+            }
+        }
         Job j;
         j.is_read = true;
         j.id = id;
@@ -88,6 +122,7 @@ void DiskPrefixWorker::run(std::stop_token stop) {
         Job j = std::move(q.front());
         q.pop_front();
         busy_ = true;
+        writing_ = j.is_read ? nullptr : &j;
         lock.unlock();
         bool ok;
         if (j.is_read) {
@@ -103,6 +138,7 @@ void DiskPrefixWorker::run(std::stop_token stop) {
         }
         lock.lock();
         busy_ = false;
+        writing_ = nullptr;
         if (j.is_read) {
             done_.push_back({j.id, ok});
         } else {
