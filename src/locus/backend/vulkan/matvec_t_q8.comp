@@ -26,6 +26,7 @@ layout(push_constant) uniform PC {
     uint w_off_y;    // bytes
     uint x_off_y;
     uint out_off_y;
+    uint q8_gguf;    // 1: rows in GGUF's own block layout (i#678)
 } pc;
 
 shared vec4 red[4][32];
@@ -44,9 +45,16 @@ void main() {
     vec4 acc = vec4(0.0);
     for (uint r = slice * per; r < r_end; ++r) {
         uint rb = wbase + r * row_bytes;
-        uint sa = rb + (c / 32u) * 2u;
+        uint sa = pc.q8_gguf != 0u ? rb + (c / 32u) * 34u
+                                   : rb + (c / 32u) * 2u;
         float d = unpackHalf2x16(w[sa >> 2] >> ((sa & 2u) * 8u)).x;
-        int q = int(w[(rb + 2u * nb + c) >> 2]);
+        // Split rows: the quant word is aligned. GGUF blocks (i#678):
+        // it starts 0 or 2 bytes into a word.
+        uint qa = pc.q8_gguf != 0u ? sa + 2u + c % 32u : rb + 2u * nb + c;
+        uint qs = (qa & 3u) * 8u;
+        int q = int(qs == 0u ? w[qa >> 2]
+                             : (w[qa >> 2] >> qs) |
+                                   (w[(qa >> 2) + 1u] << (32u - qs)));
         vec4 v = vec4(bitfieldExtract(q, 0, 8), bitfieldExtract(q, 8, 8),
                       bitfieldExtract(q, 16, 8),
                       bitfieldExtract(q, 24, 8));

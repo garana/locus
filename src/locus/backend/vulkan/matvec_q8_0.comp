@@ -125,6 +125,7 @@ layout(push_constant) uniform PC {
     uint r_stride;  // ROUTE words per token row
     uint kp;        // routed slots per token
 #endif
+    uint q8_gguf;   // 1: rows in GGUF's own block layout (i#678)
 } pc;
 
 shared float red[LANES * ROWS];
@@ -144,25 +145,45 @@ uint NAME(uint b) { \
 /**
  * This lane's share of dot(row r of the matrix at wbase, x), nb
  * blocks wide. Rows are in the split GPU layout (q8_layout.hpp): nb
- * f16 scales, then nb x 32 quants, 34 * nb bytes in all.
+ * f16 scales, then nb x 32 quants, 34 * nb bytes in all; or, with
+ * pc.q8_gguf (i#678), in GGUF's own 34-byte blocks (an f16 scale, then
+ * 32 quants), read in place. Only the loads differ: the same sums in
+ * the same order.
  */
 #define DEFINE_ROW_PART(NAME, WORD, BUF) \
 float NAME(uint wbase, uint xbase, uint r, uint lane, uint nb) { \
     uint rb = wbase + r * nb * 34u; \
     uint qb = rb + 2u * nb; \
     uint sub = lane & 3u; \
+    bool gg = pc.q8_gguf != 0u; \
     /* Whole-word quant loads unless the row start is misaligned \
        (odd nb, or an odd w_off); scales are 2-byte aligned. */ \
-    bool al = ((rb | qb) & 3u) == 0u; \
+    bool al = !gg && ((rb | qb) & 3u) == 0u; \
     float acc = 0.0; \
     for (uint b = lane >> 2; b < nb; b += LANES / 4u) { \
-        uint sa = rb + 2u * b; \
+        uint sa = gg ? rb + 34u * b : rb + 2u * b; \
         float d = unpackHalf2x16(BUF[sa >> 2] >> ((sa & 2u) * 8u)).x; \
-        uint qa = qb + b * 32u + sub * 8u; \
+        uint qa = gg ? sa + 2u + sub * 8u : qb + b * 32u + sub * 8u; \
+        uint wq[2]; \
+        if (al) { \
+            wq[0] = BUF[qa >> 2]; \
+            wq[1] = BUF[(qa >> 2) + 1u]; \
+        } else if (gg) { \
+            /* A GGUF block's quants start 0 or 2 bytes into a word: \
+               three aligned loads cover the lane's two words. */ \
+            uint qi = qa >> 2, qs = (qa & 3u) * 8u; \
+            uint a0 = BUF[qi], a1 = BUF[qi + 1u]; \
+            uint a2 = qs == 0u ? 0u : BUF[qi + 2u]; \
+            wq[0] = qs == 0u ? a0 : (a0 >> qs) | (a1 << (32u - qs)); \
+            wq[1] = qs == 0u ? a1 : (a1 >> qs) | (a2 << (32u - qs)); \
+        } else { \
+            wq[0] = WORD(qa); \
+            wq[1] = WORD(qa + 4u); \
+        } \
         uint xi = xbase + b * 32u + sub * 8u; \
         float s = 0.0; \
         for (uint k = 0u; k < 2u; ++k) { \
-            int q = int(al ? BUF[(qa >> 2) + k] : WORD(qa + k * 4u)); \
+            int q = int(wq[k]); \
             uint xk = xi + k * 4u; \
             s += float(bitfieldExtract(q, 0, 8)) * x[xk] + \
                  float(bitfieldExtract(q, 8, 8)) * x[xk + 1u] + \

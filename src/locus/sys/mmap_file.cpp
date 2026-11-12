@@ -46,6 +46,19 @@ bool in_file_mapping(const void* p, std::size_t n) {
     });
 }
 
+std::span<const std::byte> file_mapping_of(const void* p, std::size_t n) {
+    const auto b = reinterpret_cast<std::uintptr_t>(p);
+    Registry& r = registry();
+    std::lock_guard lk(r.mu);
+    for (const auto& m : r.live) {
+        if (b >= m.first && b <= m.second && n <= m.second - b) {
+            return {reinterpret_cast<const std::byte*>(m.first),
+                    static_cast<std::size_t>(m.second - m.first)};
+        }
+    }
+    return {};
+}
+
 UnmapHook set_unmap_hook(UnmapHook hook) {
     return unmap_hook.exchange(hook);
 }

@@ -70,6 +70,9 @@ layout(push_constant) uniform PC {
     uint w_bstride;
     uint x_bstride;
     uint out_bstride;
+#if !defined(TYPE_F32) && !defined(TYPE_F16)
+    uint q8_gguf;       // 1: rows in GGUF's own block layout (i#678)
+#endif
 } pc;
 
 shared float red[NT * LANES * ROWS];
@@ -193,13 +196,29 @@ void main() {
         uint rb = w_off + r * nb * 34u;
         uint qb = rb + 2u * nb;
         uint sub = lane & 3u;
-        bool al = ((rb | qb) & 3u) == 0u;
+        // Split rows, or with q8_gguf GGUF's 34-byte blocks read in
+        // place (i#678): only the loads differ.
+        bool gg = pc.q8_gguf != 0u;
+        bool al = !gg && ((rb | qb) & 3u) == 0u;
         for (uint b = lane >> 2; b < nb; b += LANES / 4u) {
-            uint sa = rb + 2u * b;
+            uint sa = gg ? rb + 34u * b : rb + 2u * b;
             float d = unpackHalf2x16(w[sa >> 2] >> ((sa & 2u) * 8u)).x;
-            uint qa = qb + b * 32u + sub * 8u;
-            int q0 = int(al ? w[qa >> 2] : word_at(qa));
-            int q1 = int(al ? w[(qa >> 2) + 1u] : word_at(qa + 4u));
+            uint qa = gg ? sa + 2u + sub * 8u : qb + b * 32u + sub * 8u;
+            // A GGUF block's quants start 0 or 2 bytes into a word:
+            // three aligned loads cover the lane's two words.
+            uint qi = qa >> 2, qs = (qa & 3u) * 8u;
+            int q0, q1;
+            if (al || (gg && qs == 0u)) {
+                q0 = int(w[qi]);
+                q1 = int(w[qi + 1u]);
+            } else if (gg) {
+                uint a0 = w[qi], a1 = w[qi + 1u], a2 = w[qi + 2u];
+                q0 = int((a0 >> qs) | (a1 << (32u - qs)));
+                q1 = int((a1 >> qs) | (a2 << (32u - qs)));
+            } else {
+                q0 = int(word_at(qa));
+                q1 = int(word_at(qa + 4u));
+            }
             float wq[8];
             wq[0] = float(bitfieldExtract(q0, 0, 8));
             wq[1] = float(bitfieldExtract(q0, 8, 8));
@@ -212,8 +231,18 @@ void main() {
             uint xc = x_off + b * 32u + sub * 8u;
 #ifdef SWIGLU
             float du = unpackHalf2x16(wu[sa >> 2] >> ((sa & 2u) * 8u)).x;
-            int u0 = int(al ? wu[qa >> 2] : word_at_u(qa));
-            int u1 = int(al ? wu[(qa >> 2) + 1u] : word_at_u(qa + 4u));
+            int u0, u1;
+            if (al || (gg && qs == 0u)) {
+                u0 = int(wu[qi]);
+                u1 = int(wu[qi + 1u]);
+            } else if (gg) {
+                uint b0 = wu[qi], b1 = wu[qi + 1u], b2 = wu[qi + 2u];
+                u0 = int((b0 >> qs) | (b1 << (32u - qs)));
+                u1 = int((b1 >> qs) | (b2 << (32u - qs)));
+            } else {
+                u0 = int(word_at_u(qa));
+                u1 = int(word_at_u(qa + 4u));
+            }
             float wv[8];
             wv[0] = float(bitfieldExtract(u0, 0, 8));
             wv[1] = float(bitfieldExtract(u0, 8, 8));

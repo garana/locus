@@ -385,6 +385,15 @@ class VulkanContext {
                          MemKind kind = MemKind::kScratch);
 
     /**
+     * Marks buffer b as holding Q8_0 rows in GGUF's own block layout
+     * (on) or the split GPU layout (off, the default). Dispatches of
+     * the Q8_0 kernels read it from their binding-0 buffer (i#678).
+     */
+    void set_q8_gguf(Buffer b, bool on);
+    /** @returns Whether b holds Q8_0 rows in GGUF's layout. */
+    bool q8_gguf(Buffer b) const;
+
+    /**
      * Wraps host memory [ptr, ptr + bytes) as a buffer without copying
      * (VK_EXT_external_memory_host: on unified memory the GPU reads the
      * mmap'd weights in place). Imports the whole pages from ptr's page

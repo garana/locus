@@ -142,6 +142,9 @@ layout(push_constant) uniform PC {
     uint split_stride;  // floats between partial planes
     uint x_inner;       // x_div > 1 (not MOE_ID): see above
     uint out_inner;
+#ifdef TYPE_Q8
+    uint q8_gguf;       // 1: rows in GGUF's own block layout (i#678)
+#endif
 } pc;
 
 #ifdef F16_STAGE
@@ -407,12 +410,16 @@ void main() {
 #ifdef TYPE_Q8
         if (r < pc.rows) {
             // Split GPU row layout (q8_layout.hpp): nb f16
-            // scales, then nb x 32 quants.
+            // scales, then nb x 32 quants; or, with q8_gguf (i#678),
+            // GGUF's 34-byte blocks (an f16 scale, then 32 quants).
             uint nb = pc.cols / 32u;
             uint rb = wbase + r * nb * 34u;
-            uint sa = rb + (k0 / 32u) * 2u;
+            uint kc = k0 + sub * VPT;
+            uint sa = pc.q8_gguf != 0u ? rb + (kc / 32u) * 34u
+                                       : rb + (k0 / 32u) * 2u;
             float d = unpackHalf2x16(w[sa >> 2] >> ((sa & 2u) * 8u)).x;
-            uint q0 = rb + 2u * nb + k0 + sub * VPT;
+            uint q0 = pc.q8_gguf != 0u ? sa + 2u + kc % 32u
+                                       : rb + 2u * nb + kc;
             for (uint h = 0u; h < VPT / 4u; ++h) {
                 int q = int(word_at(q0 + h * 4u));
                 uint c = sub * VPT + h * 4u;

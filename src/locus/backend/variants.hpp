@@ -306,6 +306,22 @@ std::size_t vulkan_kv_pool_count();
  */
 void vulkan_reset_state();
 
+/** How Vulkan holds Q8_0 weights (i#678). */
+enum class Q8Layout {
+    kAuto,   ///< per model file: GGUF in place on Apple when twice
+             ///< the file would not fit, else the split copy
+    kSplit,  ///< always the split GPU copy (q8_layout.hpp)
+    kGguf,   ///< always GGUF's own layout (in place where it imports)
+};
+
+/**
+ * Sets the Q8_0 layout policy for uploads from now on (the default:
+ * LOCUS_VK_Q8_LAYOUT=split or gguf, else kAuto). Weights already on
+ * the GPU keep theirs: call vulkan_reset_state() first to change a
+ * model's (tests and benches).
+ */
+void vulkan_set_q8_layout(Q8Layout layout);
+
 /**
  * Batch-invariant Vulkan decode (#432): when on, a lone sequence also
  * decodes through vulkan_forward_multi's kernels, so a request's

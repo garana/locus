@@ -706,6 +706,67 @@ const KernelDesc& kernel_desc(Kernel k) {
     return kDescs[static_cast<int>(k)];
 }
 
+/** @returns Whether k reads Q8_0 weights, so takes the layout word
+ *  (q8_gguf) after the host's push constants (i#678). */
+constexpr bool reads_q8(Kernel k) {
+    switch (k) {
+        case Kernel::kMatvecQ8_0:
+        case Kernel::kMatvecQ8_0B:
+        case Kernel::kMatvecQ8_0Glu:
+        case Kernel::kMatvecQ8_0GluB:
+        case Kernel::kMatvecQ8_0Seg:
+        case Kernel::kMatvecQ8_0ShB:
+        case Kernel::kMatvecQ8_0GluShB:
+        case Kernel::kMatvecQ8_0P:
+        case Kernel::kMatvecQ8_0GluP:
+        case Kernel::kMatvecQ8_0N:
+        case Kernel::kMatvecQ8_0NGlu:
+        case Kernel::kMatvecQ8_0NNg:
+        case Kernel::kMatvecQ8_0NGluNg:
+        case Kernel::kMatvecQ8_0N2:
+        case Kernel::kMatvecQ8_0N2Glu:
+        case Kernel::kMatvecQ8_0N4:
+        case Kernel::kMatvecQ8_0N4Glu:
+        case Kernel::kMatmulQ8_0:
+        case Kernel::kMatmulQ8_0Id:
+        case Kernel::kMatmulQ8_0H:
+        case Kernel::kMatmulQ8_0IdH:
+        case Kernel::kMatvecTQ8:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/** @returns Whether name starts with prefix. */
+constexpr bool starts_with(const char* name, const char* prefix) {
+    for (; *prefix != '\0'; ++name, ++prefix) {
+        if (*name != *prefix) return false;
+    }
+    return true;
+}
+
+/** Every kernel built from a Q8_0 weight reader's source (by its table
+ *  name) is in reads_q8, and no other: a new Q8_0 build that missed
+ *  the list would read its layout word from past the push range. */
+constexpr bool q8_kernels_listed() {
+    for (const KernelDesc& kd : kDescs) {
+        const bool q8_name = starts_with(kd.name, "matvec_q8_0") ||
+                             starts_with(kd.name, "matmul_q8_0") ||
+                             starts_with(kd.name, "matvec_t_q8");
+        if (q8_name != reads_q8(kd.kernel)) return false;
+    }
+    return true;
+}
+static_assert(q8_kernels_listed(),
+              "reads_q8 must list exactly the Q8_0 weight readers");
+
+/** @returns k's push range: the host's push constants, plus the Q8_0
+ *  layout word for a Q8_0 reader. */
+constexpr std::uint32_t push_range(const KernelDesc& kd) {
+    return kd.push_bytes + (reads_q8(kd.kernel) ? 4u : 0u);
+}
+
 }  // namespace
 
 const char* kernel_name(Kernel k) { return kernel_desc(k).name; }
@@ -894,6 +955,9 @@ struct VulkanContext::Impl {
          *  it (an import binds buf below the tensor, at the memory
          *  alignment, and starts here). */
         VkDeviceSize desc_off = 0;
+        /** Q8_0 rows in GGUF's own block layout, read in place, rather
+         *  than the split GPU layout (i#678). */
+        bool q8_gguf = false;
     };
 
     /** VK_EXT_external_memory_host enabled: import_host works. */
@@ -1266,7 +1330,7 @@ struct VulkanContext::Impl {
 
         VkPushConstantRange pcr{};
         pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pcr.size = kd.push_bytes;
+        pcr.size = push_range(kd);
         VkPipelineLayoutCreateInfo pli{};
         pli.sType =
             VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1738,9 +1802,25 @@ void VulkanContext::dispatch(Kernel k,
     vkCmdBindDescriptorSets(
         im.batch_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout,
         0, 1, &ds, 0, nullptr);
-    vkCmdPushConstants(im.batch_cmd, p.layout,
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                       kd.push_bytes, push.data());
+    if (reads_q8(k)) {
+        // The weights' layout (binding 0's buffer; one model's weights
+        // per dispatch) after the host's words (i#678).
+        std::uint32_t words[128 / 4 + 1];
+        if (push.size() >= std::size(words)) {
+            throw std::runtime_error("vulkan: push constants too long");
+        }
+        std::copy(push.begin(), push.end(), words);
+        words[push.size()] =
+            static_cast<Impl::HostBuffer*>(buffers[0].impl)->q8_gguf ? 1u
+                                                                    : 0u;
+        vkCmdPushConstants(im.batch_cmd, p.layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, push_range(kd),
+                           words);
+    } else {
+        vkCmdPushConstants(im.batch_cmd, p.layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, kd.push_bytes,
+                           push.data());
+    }
     vkCmdDispatch(im.batch_cmd, groups_x, groups_y, groups_z);
     ++im.prof.dispatches;
     ++im.batch_dispatches;
@@ -1914,6 +1994,14 @@ bool VulkanContext::serial_dispatch() const {
 }
 
 bool VulkanContext::has_f16() const { return impl_->has_f16; }
+
+void VulkanContext::set_q8_gguf(Buffer b, bool on) {
+    static_cast<Impl::HostBuffer*>(b.impl)->q8_gguf = on;
+}
+
+bool VulkanContext::q8_gguf(Buffer b) const {
+    return static_cast<Impl::HostBuffer*>(b.impl)->q8_gguf;
+}
 
 bool VulkanContext::small_variant(Kernel k) const {
     return impl_->pipes[static_cast<int>(k)].small;
@@ -2093,6 +2181,8 @@ std::uint64_t VulkanContext::memory_available() const { no_kernels(); }
 std::uint64_t VulkanContext::memory_used() const { no_kernels(); }
 bool VulkanContext::serial_dispatch() const { no_kernels(); }
 bool VulkanContext::has_f16() const { no_kernels(); }
+void VulkanContext::set_q8_gguf(Buffer, bool) { no_kernels(); }
+bool VulkanContext::q8_gguf(Buffer) const { no_kernels(); }
 bool VulkanContext::small_variant(Kernel) const { no_kernels(); }
 const std::string& VulkanContext::device_name() const { no_kernels(); }
 const VulkanContext::Profile& VulkanContext::profile() const {

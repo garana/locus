@@ -48,6 +48,13 @@ class MappedFile {
  */
 bool in_file_mapping(const void* p, std::size_t n);
 
+/**
+ * @returns The live MappedFile mapping that holds [p, p + n), or an
+ *     empty span when none does (i#678: a weight's file, for a
+ *     decision made once per model file).
+ */
+std::span<const std::byte> file_mapping_of(const void* p, std::size_t n);
+
 /** A function MappedFile calls with its range before unmapping it. */
 using UnmapHook = void (*)(const void* p, std::size_t n);
 

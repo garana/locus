@@ -171,6 +171,19 @@ constexpr int kMaxDevices = 8;
  *  touch it. */
 std::atomic<bool> g_state_alive[kMaxDevices] = {};
 
+/** The Q8_0 layout policy (vulkan_set_q8_layout; i#678), from
+ *  LOCUS_VK_Q8_LAYOUT at first use. */
+std::atomic<Q8Layout>& q8_layout_policy() {
+    static std::atomic<Q8Layout> p{[] {
+        const char* e = std::getenv("LOCUS_VK_Q8_LAYOUT");
+        const std::string_view v = e != nullptr ? e : "";
+        return v == "split"  ? Q8Layout::kSplit
+               : v == "gguf" ? Q8Layout::kGguf
+                             : Q8Layout::kAuto;
+    }()};
+    return p;
+}
+
 /** Live States, so the one unmap hook is set while any lives. */
 std::atomic<int> g_states_live{0};
 
@@ -243,6 +256,10 @@ struct State {
     bool prefill_f16 = false;
     /** Per-model GPU-routing verdict (memory fit), decided once. */
     std::unordered_map<const void*, bool> moe_gpu_fits;
+    /** Per model file (its mapping's start): Q8_0 rows in GGUF's own
+     *  layout, imported in place, rather than the split copy (i#678).
+     *  Decided on the file's first Q8_0 upload. */
+    std::unordered_map<const void*, bool> q8_gguf_files;
 
     explicit State(int d) : ctx(d), device(d) {
         pool.create = [this](std::size_t n) {
@@ -309,6 +326,7 @@ struct State {
             kv_frees()[device].clear();
         }
         moe_gpu_fits.clear();
+        q8_gguf_files.clear();
         // Buffers retired by grow() mid-batch; end_batch frees these,
         // but free them here too in case a batch never closed.
         for (auto b : retired) {
@@ -405,9 +423,43 @@ struct State {
     }
 
     /**
+     * Whether the Q8_0 rows at data (n bytes) take GGUF's own layout in
+     * place rather than the split copy (i#678). Decided once per model
+     * file, on its first Q8_0 upload (after a language model's KV pool,
+     * which its cache allocates before any forward), and cached, so a
+     * model never mixes layouts. LOCUS_VK_Q8_LAYOUT=split or gguf
+     * forces it. Otherwise only on Apple (host import on MoltenVK),
+     * where an imported buffer counts toward the GPU's working set:
+     * GGUF when the file held twice (its mapped pages and a copy) would
+     * not fit the MoE route's rule against the available memory. The
+     * GGUF reads cost about 3% of Q8_0 decode, so a file that fits
+     * twice keeps the split copy.
+     */
+    bool q8_gguf_for(const void* data, std::size_t n) {
+        const Q8Layout mode = q8_layout_policy().load();
+        if (mode == Q8Layout::kSplit) return false;
+        if (mode == Q8Layout::kGguf) return true;
+        const auto file = sys::file_mapping_of(data, n);
+        if (file.empty() || !ctx.host_import() || !ctx.moltenvk()) {
+            return false;
+        }
+        auto it = q8_gguf_files.find(file.data());
+        if (it == q8_gguf_files.end()) {
+            const std::uint64_t twice = std::uint64_t{2} * file.size();
+            it = q8_gguf_files
+                     .emplace(file.data(),
+                              !vk::moe_experts_fit(twice,
+                                                   ctx.memory_available()))
+                     .first;
+        }
+        return it->second;
+    }
+
+    /**
      * Uploads the first w.rows rows of weight matrix w, keyed by
      * w.data. Q8_0 rows go up in the split GPU layout
-     * (q8_layout.hpp), other types as stored.
+     * (q8_layout.hpp), or GGUF's own in place where q8_gguf_for says
+     * so; other types as stored.
      */
     VulkanContext::Buffer upload_w(const Mat& w) {
         return upload_rows(w.data, w, weight_bytes(w));
@@ -426,18 +478,26 @@ struct State {
         }
         const std::size_t n = static_cast<std::size_t>(total);
         const std::size_t alloc = vk::gpu_alloc_bytes(n);
-        return pool.acquire(
+        const bool gguf =
+            q8_gguf_for(ms[0]->data, weight_bytes(*ms[0]));
+        auto b = pool.acquire(
             static_cast<const std::byte*>(ms[0]->data) + 3, alloc,
             [&](VulkanContext::Buffer b) {
                 auto* dst = static_cast<std::byte*>(ctx.mapped(b));
                 for (const Mat* w : ms) {
-                    vk::q8_0_split_rows(
-                        static_cast<const std::byte*>(w->data), dst,
-                        w->rows, w->cols);
+                    if (gguf) {
+                        std::memcpy(dst, w->data, weight_bytes(*w));
+                    } else {
+                        vk::q8_0_split_rows(
+                            static_cast<const std::byte*>(w->data), dst,
+                            w->rows, w->cols);
+                    }
                     dst += weight_bytes(*w);
                 }
                 std::memset(dst, 0, alloc - n);
             });
+        ctx.set_q8_gguf(b, gguf);
+        return b;
     }
 
     /**
@@ -457,7 +517,9 @@ struct State {
         const std::size_t n = static_cast<std::size_t>(bytes);
         const std::size_t alloc = vk::gpu_alloc_bytes(n);
         constexpr std::size_t kImportMin = std::size_t{64} << 10;
-        if (w.type != gguf::TensorType::kQ8_0 && n >= kImportMin &&
+        const bool q8 = w.type == gguf::TensorType::kQ8_0;
+        const bool gguf = q8 && q8_gguf_for(w.data, n);
+        if ((!q8 || gguf) && n >= kImportMin &&
             alloc == n && ctx.host_import() &&
             sys::in_file_mapping(w.data, n)) {
             auto b = pool.acquire_external(
@@ -469,15 +531,16 @@ struct State {
                     return ib;
                 });
             if (b) {
+                if (q8) ctx.set_q8_gguf(*b, true);
                 return *b;
             }
         }
-        return pool.acquire(
+        auto b = pool.acquire(
             key, alloc,
             [&](VulkanContext::Buffer b) {
                 const auto* src = static_cast<const std::byte*>(w.data);
                 auto* dst = static_cast<std::byte*>(ctx.mapped(b));
-                if (w.type == gguf::TensorType::kQ8_0) {
+                if (q8 && !gguf) {
                     const std::size_t row_bytes = (w.cols / 32) * 34;
                     vk::q8_0_split_rows(src, dst, n / row_bytes, w.cols);
                 } else {
@@ -486,6 +549,8 @@ struct State {
                 std::memset(dst + n, 0, alloc - n);
             },
             w.data);
+        if (q8) ctx.set_q8_gguf(b, gguf);
+        return b;
     }
 
     VulkanContext::Buffer upload(const void* ptr,
@@ -1875,6 +1940,10 @@ void vulkan_reset_batch_invariant() { g_batch_invariant.store(-1); }
 
 bool vulkan_batch_invariant() { return batch_invariant_state() >= 1; }
 
+void vulkan_set_q8_layout(Q8Layout layout) {
+    q8_layout_policy().store(layout);
+}
+
 void vulkan_reset_state() {
     std::lock_guard lk(state_mu());
     state().free_buffers(false);
@@ -2234,8 +2303,12 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
             }
             for (const auto* em : {&l.gate_exps, &l.up_exps, &l.down_exps}) {
                 const std::uint64_t b = em->expert_bytes * hp.n_expert;
+                // Q8_0 is copied (split) unless its file takes GGUF's
+                // layout in place (i#678).
                 if (!s.ctx.host_import() ||
-                    em->base.type == gguf::TensorType::kQ8_0) {
+                    (em->base.type == gguf::TensorType::kQ8_0 &&
+                     !s.q8_gguf_for(em->base.data,
+                                    static_cast<std::size_t>(b)))) {
                     copied += b;
                 } else if (s.ctx.moltenvk()) {
                     imported += b;
