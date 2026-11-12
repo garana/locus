@@ -1646,9 +1646,10 @@ void OpenAiServer::install_routes() {
             }
             json kinds = json::array({"text"});
             if (vision_) kinds.push_back("image-to-text");
-            if (janus_ || pixart_ || flux_ || qwen_edit_) {
-                kinds.push_back("image");
-            }
+            // Generations and edits apart (i#633): FLUX.1 serves both,
+            // Qwen-Image-Edit edits only, Janus and PixArt generate only.
+            if (janus_ || pixart_ || flux_) kinds.push_back("image");
+            if (flux_ || qwen_edit_) kinds.push_back("image-edit");
             if (ltxv_) kinds.push_back("video");
             if (snac_) kinds.push_back("speech");
             if (rerank_) kinds.push_back("rerank");

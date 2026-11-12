@@ -213,7 +213,7 @@ TEST_CASE("router: request kinds by path and body", "[router]") {
                R"({"messages":[{"role":"user","content":"type image"}],
                   "tools":[{"type":"image"}]})") == Kind::kText);
     CHECK(kind("/v1/images/generations") == Kind::kImage);
-    CHECK(kind("/v1/images/edits") == Kind::kImage);
+    CHECK(kind("/v1/images/edits") == Kind::kImageEdit);
     CHECK(kind("/v1/videos") == Kind::kVideo);
     CHECK(kind("/v1/videos/video_1/content") == Kind::kVideo);
     CHECK(kind("/v1/audio/speech") == Kind::kSpeech);
@@ -224,6 +224,8 @@ TEST_CASE("router: request kinds by path and body", "[router]") {
     CHECK(kind("/v1/classify") == Kind::kClassify);
     CHECK(locus::router::kind_name(Kind::kClassify) == "classify");
     CHECK(locus::router::parse_kind("classify") == Kind::kClassify);
+    CHECK(locus::router::kind_name(Kind::kImageEdit) == "image-edit");
+    CHECK(locus::router::parse_kind("image-edit") == Kind::kImageEdit);
     // Embeddings stay text; the flag lets a classify instance take them.
     CHECK(kind("/v1/embeddings") == Kind::kText);
     CHECK(classify("/v1/embeddings", "")->embeddings);
@@ -313,6 +315,43 @@ TEST_CASE("router: proxies each kind to its instance", "[router]") {
         CHECK(ids == std::vector<std::string>{"llama", "qwen", "janus"});
         CHECK(j["locus_kinds"] ==
               json::array({"text", "image", "speech"}));
+    }
+}
+
+// i#633: an edit-only instance (Qwen-Image-Edit) lists image-edit, a
+// generation-only one (PixArt) image, and each route goes to its own;
+// a fleet of servers from before image-edit sends edits to "image".
+TEST_CASE("router: image edits and generations go apart", "[router]") {
+    SECTION("an edit-only and a generation-only instance") {
+        FakeInstance edit("edit", {"text", "image-edit"}, "qwen-edit");
+        FakeInstance gen("gen", {"text", "image"}, "pixart");
+        RouterFixture rf({edit.addr(), gen.addr()});
+        for (int k = 0; k < 4; ++k) {  // not one lucky pick
+            auto r = rf.post("/v1/images/edits", {{"prompt", "purple"}});
+            REQUIRE(r.ok);
+            CHECK(r.body.rfind("edit /v1/images/edits", 0) == 0);
+            r = rf.post("/v1/images/generations", {{"prompt", "a cat"}});
+            REQUIRE(r.ok);
+            CHECK(r.body.rfind("gen /v1/images/generations", 0) == 0);
+        }
+    }
+    SECTION("servers that list only image take edits too") {
+        FakeInstance old("old", {"text", "image"}, "flux");
+        RouterFixture rf({old.addr()});
+        auto r = rf.post("/v1/images/edits", {{"prompt", "purple"}});
+        REQUIRE(r.ok);
+        CHECK(r.head.status == 200);
+        CHECK(r.body.rfind("old /v1/images/edits", 0) == 0);
+    }
+    SECTION("once one lists image-edit, image-only ones get no edits") {
+        FakeInstance edit("edit", {"image-edit"}, "qwen-edit");
+        FakeInstance gen("gen", {"image"}, "pixart");
+        RouterFixture rf({gen.addr(), edit.addr()});
+        for (int k = 0; k < 4; ++k) {
+            const auto r = rf.post("/v1/images/edits", {{"prompt", "x"}});
+            REQUIRE(r.ok);
+            CHECK(r.body.rfind("edit /v1/images/edits", 0) == 0);
+        }
     }
 }
 
