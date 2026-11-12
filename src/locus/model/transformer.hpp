@@ -261,6 +261,14 @@ class TransformerModel {
     bool q8k_activations() const;
 
     /**
+     * @returns Whether the MoE hybrid (hot experts on the GPU, the rest
+     *     on the CPU) runs for this model: moe_hybrid_wanted() for an
+     *     MoE model on its backend, decided once (i#652). The disk
+     *     prefix key hashes it, since it changes the K/V bits.
+     */
+    bool moe_hybrid_on() const;
+
+    /**
      * @returns The active backend's ops as the forward uses them:
      *     Ops::matvec_q8k cleared unless Q8_K-activation mode is on.
      *     Arch hooks take these, never the backend's raw ops, so
@@ -847,6 +855,23 @@ std::vector<std::pair<std::uint32_t, float>> moe_select(
  * @param ram_bytes Physical RAM (sys::total_ram_bytes(); 0 = unknown).
  */
 bool weights_stream(std::uint64_t weight_bytes, std::uint64_t ram_bytes);
+
+/**
+ * The MoE hybrid's switch (i#252, i#652). On a GPU without the whole
+ * model in its pool, every missed expert is uploaded before its
+ * matvec, which on a 2 GB GTX 750 Ti ran at or below CPU speed, while
+ * the hybrid ran 2 to 2.5x faster than both (PR#397).
+ *
+ * @param env LOCUS_MOE_HYBRID's value, or null when unset: "0" turns
+ *     the hybrid off, any other non-empty value on.
+ * @param pooled Whether the backend has a weight pool with prefetch,
+ *     evict and a budget (CUDA); without one the hybrid is off.
+ * @param weights The model's tensor bytes.
+ * @param room The pool bytes the weights may use (90% of its budget).
+ * @returns With env unset: whether the weights exceed the room.
+ */
+bool moe_hybrid_wanted(const char* env, bool pooled, std::uint64_t weights,
+                       std::uint64_t room);
 
 /**
  * @returns How many pool threads model-level parallel loops may use:
