@@ -33,7 +33,13 @@
 // 4, W2 at binding 5), as if stacked: rows [0, seg1) of W go to O at
 // out_offset, the next seg2 - seg1 rows (W1) to O2 at off1, the rest
 // (W2) to O2 at off2. The q, k and v projections in one dispatch,
-// without a concatenated copy of the weights; w_off must be 0.
+// without a concatenated copy of the weights; w_off must be 0. The
+// first two segments can be roped in the epilogue, as
+// matvec_q8_0_seg does (i#688): segment k's rows are heads of hs_k
+// rows whose rd_k rows from ro_k on rotate at pos (rd_k 0 = none),
+// rope.comp's interleaved pairs; a pair is two rows of one workgroup
+// (rows start at multiples of 8; the host keeps seg1, hs, ro and rd
+// even).
 //
 // With -DPAIRS (BATCHED only; i#623) the slots are a short batch's
 // (token, expert) pairs, as in matvec_q8_0.comp: ROUTE holds one row per
@@ -72,6 +78,8 @@ layout(std430, binding = 4) readonly buffer W1 { uint w1[]; };
 layout(std430, binding = 4) readonly buffer W14 { uvec4 w14[]; };
 layout(std430, binding = 5) readonly buffer W2 { uint w2[]; };
 layout(std430, binding = 5) readonly buffer W24 { uvec4 w24[]; };
+// Per-pair rope frequency divisors (rope.comp's F).
+layout(std430, binding = 6) readonly buffer F { float f[]; };
 #endif
 
 layout(push_constant) uniform PC {
@@ -99,6 +107,13 @@ layout(push_constant) uniform PC {
     uint off1;
     uint seg2;  // first row of W2
     uint off2;
+    uint hs0, ro0, rd0;  // segment 0 rope: head rows, offset, width
+    uint hs1, ro1, rd1;  // segment 1 rope
+    uint pos;
+    float freq_base;
+    float freq_scale;    // YARN: 1/scaling_factor; 1.0 = off
+    float corr_lo;
+    float corr_hi;
 #endif
 } pc;
 
@@ -239,6 +254,30 @@ float row_part(uint wbase, uint xbase, uint r, uint lane, bool up) {
     return acc;
 }
 
+#ifdef SEGMENTS
+/**
+ * rope.comp's rotation of the pair (x0, x1) at pair offset i of an
+ * rd-wide rope span: the even element's result, or the odd one's (as
+ * matvec_q8_0.comp's).
+ */
+float rope_rot(float x0, float x1, uint i, uint rd, bool odd) {
+    float theta_extrap =
+        float(pc.pos) * pow(pc.freq_base, -float(i) / float(rd));
+    float theta = theta_extrap;
+    if (pc.freq_scale != 1.0) {
+        float y = (float(i / 2u) - pc.corr_lo) /
+                  max(0.001, pc.corr_hi - pc.corr_lo);
+        float ramp = 1.0 - min(1.0, max(0.0, y));
+        theta = pc.freq_scale * theta_extrap * (1.0 - ramp) +
+                theta_extrap * ramp;
+    }
+    theta /= f[i / 2u];
+    float c = cos(theta);
+    float s = sin(theta);
+    return odd ? x0 * s + x1 * c : x0 * c - x1 * s;
+}
+#endif
+
 void main() {
     uint lane = gl_LocalInvocationID.x % LANES;
     uint slot = gl_LocalInvocationID.x / LANES;
@@ -322,6 +361,20 @@ void main() {
         float u = red_u[gl_LocalInvocationID.x] * pc.scale;
         o[at] = v / (1.0 + exp(-v)) * u;
 #elif defined(SEGMENTS)
+        // Rope the finished dot (segments 0 and 1) with its pair's
+        // partner row, the lane-0 sum of the neighbouring slot.
+        bool s0 = g_seg == 0u;
+        uint j = s0 ? r : r - pc.seg1;  // row within segment 0 / 1
+        uint hs = s0 ? pc.hs0 : pc.hs1;
+        uint ro = s0 ? pc.ro0 : pc.ro1;
+        uint rd = s0 ? pc.rd0 : pc.rd1;
+        uint wi = rd != 0u && g_seg < 2u ? j % hs : 0u;
+        if (rd != 0u && g_seg < 2u && wi >= ro && wi < ro + rd) {
+            uint k = wi - ro;
+            bool odd = (k & 1u) != 0u;
+            float vp = red[(slot ^ 1u) * LANES] * pc.scale;
+            v = rope_rot(odd ? vp : v, odd ? v : vp, k & ~1u, rd, odd);
+        }
         if (g_seg == 0u) {
             o[at] = v;
         } else {
