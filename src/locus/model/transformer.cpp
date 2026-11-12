@@ -917,6 +917,12 @@ void TransformerModel::forward_layers(tok::TokenId token,
     }
     const bool first = layer_begin == 0;
     const bool last = layer_end == hp_.n_layers;
+    // forward()'s row check, here too: forward_layers is public, and
+    // the head's mat_rows would wrap on a reversed range.
+    if (last && rows.end != 0 &&
+        (rows.begin >= rows.end || rows.end > hp_.n_vocab)) {
+        throw std::invalid_argument("forward_layers: bad logit row range");
+    }
     // At layer 0 a non-empty hidden_in is the input embedding itself,
     // used instead of the token's row (Janus image tokens enter through
     // their own embedding and aligner).
@@ -969,14 +975,14 @@ void TransformerModel::forward_layers(tok::TokenId token,
         return;
     }
     const std::uint32_t pos = seq.n_tokens;
-    if (first && last && backend_->name == "cuda" &&
-        (rows.end == 0 || (rows.begin == 0 && rows.end == hp_.n_vocab))) {
+    if (first && last && backend_->name == "cuda") {
         // Plain llama on CUDA, the whole model: the layers on the GPU
-        // (i#517), as every other CUDA forward of the full model.
+        // (i#517), as every other CUDA forward of the full model, and
+        // only the requested head rows (speech's, i#689).
         kv::PagedKvCache::Seq* one = &seq;
         const float* e = embed_in ? hidden_in.data() : nullptr;
         if (cuda_forward({&token, 1}, {&one, 1}, {&pos, 1}, cache, ws, out,
-                         false, {&e, 1})) {
+                         false, {&e, 1}, rows)) {
             lap.lap(kNoLayer, Stage::kDevice);
             seq.n_tokens = pos + 1;
             return;
