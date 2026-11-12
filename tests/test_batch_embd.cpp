@@ -209,8 +209,8 @@ TEST_CASE("vulkan forward_batch with input embeddings tracks the CPU",
 // i#671: qwen2-family attention (q / k / v biases, NEOX rope, M-RoPE)
 // batches its projections in forward_batch, as llama's does. Without
 // M-RoPE positions a chunk equals one forward() per position bit for bit
-// (forward() runs qwen2moe_attention per token); with them, a chunk
-// equals the same positions fed one token per forward_batch.
+// (forward() runs qwen2moe_attention per token); with them too, each
+// position's (t, h, w) set in the workspace for its forward().
 TEST_CASE("qwen2 forward_batch equals per-position forward",
           "[model][batch]") {
     for (const char* arch : {"qwen2", "qwen2vl"}) {
@@ -262,19 +262,23 @@ TEST_CASE("qwen2 forward_batch equals per-position forward",
         REQUIRE(cB.ensure_capacity(sB, m));
         std::vector<float> got(std::size_t{m} * V);
         model.forward_batch(toks, cB, sB, wB, got, true, {}, pos);
-        auto cO = model.make_cache(16);
-        auto wO = model.make_workspace();
-        Seq sO;
-        REQUIRE(cO.ensure_capacity(sO, m));
-        std::vector<float> one(V);
+        // The per-token path (qwen2moe_attention through forward()), with
+        // each position's (t, h, w) in the workspace, as forward_batch's
+        // per-token branch sets it (i#676).
+        auto cR = model.make_cache(16);
+        auto wR = model.make_workspace();
+        Seq sR;
+        std::vector<float> want(V);
         for (std::uint32_t i = 0; i < m; ++i) {
             INFO("position " << i);
-            model.forward_batch(std::span(toks).subspan(i, 1), cO, sO, wO,
-                                one, true, {}, std::span(pos).subspan(i, 1));
+            REQUIRE(cR.ensure_capacity(sR, 1));
+            wR.mrope_pos = pos[i].data();
+            model.forward(toks[i], cR, sR, wR, want);
+            wR.mrope_pos = nullptr;
             REQUIRE(std::vector<float>(got.begin() + i * V,
-                                       got.begin() + (i + 1) * V) == one);
+                                       got.begin() + (i + 1) * V) == want);
         }
         cB.release(sB);
-        cO.release(sO);
+        cR.release(sR);
     }
 }
