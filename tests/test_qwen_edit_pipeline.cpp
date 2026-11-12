@@ -1,4 +1,5 @@
 #include "locus/image/qwen_edit_pipeline.hpp"
+#include "locus/image/qwen_edit_image.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -177,4 +178,25 @@ TEST_CASE("qwen edit auto_resize false encodes the reference at the "
     const auto small = run(48, false);
     CHECK(small.size() == std::size_t{48} * 48 * 3);
     CHECK(small != run(48, true));
+    // 16 x 16: the reference would round to 0 x 0; it clamps to 32 x 32.
+    CHECK(run(16, false).size() == std::size_t{16} * 16 * 3);
+}
+
+// A thin reference at a small area rounds its short side to 0 without
+// the clamp (2000 x 100 at 64 x 64: 14.3 rows -> 0).
+TEST_CASE("qwen edit reference sides are at least 32", "[qwen-edit][image]") {
+    using locus::image::qwen_edit_dimensions;
+    CHECK(qwen_edit_dimensions(16, 16, 16 * 16) ==
+          std::pair<std::uint32_t, std::uint32_t>{32, 32});
+    CHECK(qwen_edit_dimensions(2000, 100, 64 * 64) ==
+          std::pair<std::uint32_t, std::uint32_t>{288, 32});
+    // The pipeline's default area is unchanged.
+    CHECK(qwen_edit_dimensions(384, 384, 1024 * 1024) ==
+          std::pair<std::uint32_t, std::uint32_t>{1024, 1024});
+    const locus::image::Rgb8 thin{2000, 100,
+                                  std::vector<std::uint8_t>(2000 * 100 * 3,
+                                                            128)};
+    const auto r = locus::image::qwen_edit_reference(thin, 64 * 64);
+    CHECK(r.vae_image.w == 288);
+    CHECK(r.vae_image.h == 32);
 }

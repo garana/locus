@@ -21,7 +21,7 @@ namespace locus::image {
 /**
  * diffusers' calculate_dimensions(1024 * 1024, w / h): the side of the
  * same aspect with about 1024 x 1024 pixels, each side rounded (half to
- * even, as Python's round) to a multiple of 32.
+ * even, as Python's round) to a multiple of 32, and at least 32.
  *
  * @returns {width, height}.
  * @param area The pixel count to aim at (the pipeline's 1024 x 1024;
