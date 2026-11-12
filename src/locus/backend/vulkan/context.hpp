@@ -161,6 +161,9 @@ enum class Kernel {
     /** The NT 2 builds of matvec_q8_0_n / _glu (#432), for n <= 2. */
     kMatvecQ8_0N2,
     kMatvecQ8_0N2Glu,
+    /** The NT 1 builds (i#511): a lone sequence, matvec_q8_0's loop. */
+    kMatvecQ8_0N1,
+    kMatvecQ8_0N1Glu,
     /** matvec_q8_0_n over Q4_K / Q6_K rows (matvec_k_n.comp, #436);
      * the N2 builds for n <= 2. */
     kMatvecQ4_KN,

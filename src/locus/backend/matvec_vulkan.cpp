@@ -1172,6 +1172,24 @@ Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
  * checks that on each device).
  */
 Kernel q8n_variant(const VulkanContext& ctx, Kernel k, std::uint32_t n) {
+    // The NT 1 builds (i#511): matvec_q8_0's loop for a lone sequence,
+    // on V3D, where with the NT 2 loop a lone Q8_0 1B decode took 2080
+    // ms of GPU time per token against the single path's 1468
+    // (LOCUS_VK_Q8N1=0 / 1 overrides).
+    static const bool n1 = [&] {
+        if (const char* e = std::getenv("LOCUS_VK_Q8N1")) {
+            return std::string(e) != "0";
+        }
+        return ctx.device_name().find("V3D") != std::string::npos;
+    }();
+    if (n == 1 && n1) {
+        if (k == Kernel::kMatvecQ8_0N) {
+            return Kernel::kMatvecQ8_0N1;
+        }
+        if (k == Kernel::kMatvecQ8_0NGlu) {
+            return Kernel::kMatvecQ8_0N1Glu;
+        }
+    }
     if (n <= 2) {
         if (k == Kernel::kMatvecQ8_0N) {
             return Kernel::kMatvecQ8_0N2;
