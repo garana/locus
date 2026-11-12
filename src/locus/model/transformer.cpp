@@ -939,14 +939,14 @@ void TransformerModel::forward_layers(tok::TokenId token,
         return;
     }
     const std::uint32_t pos = seq.n_tokens;
-    if (first && last && backend_->name == "cuda" &&
-        (rows.end == 0 || (rows.begin == 0 && rows.end == hp_.n_vocab))) {
+    if (first && last && backend_->name == "cuda") {
         // Plain llama on CUDA, the whole model: the layers on the GPU
-        // (i#517), as every other CUDA forward of the full model.
+        // (i#517), as every other CUDA forward of the full model, and
+        // only the requested head rows (speech's, i#689).
         kv::PagedKvCache::Seq* one = &seq;
         const float* e = embed_in ? hidden_in.data() : nullptr;
         if (cuda_forward({&token, 1}, {&one, 1}, {&pos, 1}, cache, ws, out,
-                         false, {&e, 1})) {
+                         false, {&e, 1}, rows)) {
             lap.lap(kNoLayer, Stage::kDevice);
             seq.n_tokens = pos + 1;
             return;

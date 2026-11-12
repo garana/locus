@@ -748,6 +748,8 @@ class TransformerModel {
      * @param embd Empty, or one entry per token: nullptr to embed the
      *     token, or n_embd floats used instead of its row (Janus image
      *     slots, as forward_batch's embd); that token is then ignored.
+     * @param rows_out The head rows to compute (default: all); each
+     *     token's other logits are -inf (speech, i#689).
      * @returns false when it cannot run here (not CUDA, not plain llama,
      *     no mirror, a weight the device cannot hold, a CUDA error, or
      *     LOCUS_CUDA_FORWARD=0); the caller then takes the host path.
@@ -758,7 +760,8 @@ class TransformerModel {
                       std::span<const std::uint32_t> pos,
                       kv::PagedKvCache& cache, Workspace& ws,
                       std::span<float> logits, bool all_logits,
-                      std::span<const float* const> embd = {}) const;
+                      std::span<const float* const> embd = {},
+                      LogitRows rows_out = {}) const;
 
     /** Applies the model's norm (RMS or LayerNorm per hp_.norm_type)
      * to x scaled by w, into out; uses hp_.rms_eps. */

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -207,4 +208,60 @@ TEST_CASE("cuda attention: prefill and decode give the same logits",
         top = std::max(top, std::fabs(cpu[i]));
     }
     CHECK(worst <= 1e-3f * top);
+}
+
+TEST_CASE("cuda forward with a head row range keeps the GPU path and the "
+          "kept rows' bits",
+          "[cuda][attention][mirror]") {
+    // Speech computes only its own tokens' head rows (i#173); on CUDA
+    // that must still run the whole token on the GPU (i#689), with the
+    // same bits in the kept rows as the full head.
+    const auto* cuda = locus::backend::find_backend("cuda");
+    if (cuda == nullptr || !cuda->available) {
+        SKIP("no usable CUDA backend");
+    }
+    const std::string path =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/models/stories260K.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP(path + " absent");
+    }
+    using locus::model::Stage;
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*cuda);
+    const std::uint32_t nv = model.hparams().n_vocab;
+    const locus::model::LogitRows rows{nv / 3, nv - nv / 5};
+    const std::vector<locus::tok::TokenId> prompt{1, 403, 407, 261, 89, 17};
+    const auto n = static_cast<std::uint32_t>(prompt.size());
+    auto ws = model.make_workspace();
+    const auto run = [&](locus::model::LogitRows r) {
+        std::vector<float> out(std::size_t{n} * nv);
+        auto cache = model.make_cache(8);
+        REQUIRE(cache.mirror_data() != nullptr);
+        Seq s;
+        REQUIRE(cache.ensure_capacity(s, n));
+        for (std::uint32_t t = 0; t < n; ++t) {
+            model.forward(prompt[t], cache, s, ws,
+                          {out.data() + std::size_t{t} * nv, nv}, r);
+        }
+        return out;
+    };
+    const auto full = run({});
+    const auto* sm = model.stage_metrics();
+    REQUIRE(sm != nullptr);
+    const std::uint64_t head0 = sm->stage_ns(Stage::kHead);
+    const std::uint64_t dev0 = sm->stage_ns(Stage::kDevice);
+    const auto part = run(rows);
+    // The per-op path laps the head; the GPU path laps only the device.
+    CHECK(sm->stage_ns(Stage::kHead) == head0);
+    CHECK(sm->stage_ns(Stage::kDevice) > dev0);
+    for (std::size_t i = 0; i < part.size(); ++i) {
+        const std::uint32_t v = static_cast<std::uint32_t>(i % nv);
+        INFO("position " << i / nv << " logit " << v);
+        if (v >= rows.begin && v < rows.end) {
+            REQUIRE(same_bits(part[i], full[i]));
+        } else {
+            REQUIRE(part[i] == -std::numeric_limits<float>::infinity());
+        }
+    }
 }

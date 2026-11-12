@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <string_view>
 #include <vector>
@@ -57,7 +58,7 @@ bool TransformerModel::cuda_forward(
     std::span<kv::PagedKvCache::Seq* const> seqs,
     std::span<const std::uint32_t> pos, kv::PagedKvCache& cache,
     Workspace& ws, std::span<float> logits, bool all_logits,
-    std::span<const float* const> embd) const {
+    std::span<const float* const> embd, LogitRows rows_out) const {
     using namespace locus::backend;
     static const bool off = [] {
         const char* e = std::getenv("LOCUS_CUDA_FORWARD");
@@ -102,6 +103,14 @@ bool TransformerModel::cuda_forward(
     const std::size_t kvd = std::size_t{KV} * hd;
     const std::uint32_t nh = all_logits ? n : 1;  // tokens with logits
     const std::uint32_t bt = cache.geometry().block_tokens;
+    // The head rows to compute, [lo, lo + R) (speech needs only its own
+    // tokens', i#689); the rest of each token's logits are -inf.
+    const std::uint32_t lo = rows_out.end == 0 ? 0 : rows_out.begin;
+    const std::uint32_t R = (rows_out.end == 0 ? V : rows_out.end) - lo;
+    if (lo + R > V || R == 0) {
+        return false;  // the host path reports it
+    }
+    const Mat head = R == V ? out_w_ : mat_rows(out_w_, lo, R);
 
     // Host tables: embeddings, RoPE (cos, sin) pairs, each token's row
     // offset in the mirror, and the attention's block tables (one per
@@ -135,7 +144,7 @@ bool TransformerModel::cuda_forward(
     // The batch kernels' row-major slices go through scratch before the
     // transpose: rows * min(n, 32) floats for the widest weight.
     const std::size_t widest =
-        std::max<std::size_t>({qd, E, ff, all_logits ? V : 0});
+        std::max<std::size_t>({qd, E, ff, all_logits ? R : 0});
     const std::size_t stage_stride = std::size_t{L} * 2 * kvd;
     if (!b.floats(b.x, std::size_t{n} * E) ||
         !b.floats(b.xb, std::size_t{n} * E) ||
@@ -147,7 +156,7 @@ bool TransformerModel::cuda_forward(
         !b.floats(b.gate, std::size_t{n} * ff) ||
         !b.floats(b.up, std::size_t{n} * ff) ||
         !b.floats(b.scratch, widest * std::min<std::uint32_t>(n, 32)) ||
-        !b.floats(b.logits, std::size_t{nh} * V) ||
+        !b.floats(b.logits, std::size_t{nh} * R) ||
         !b.floats(b.cs, cs.size()) ||
         !b.floats(b.stage, std::size_t{n} * stage_stride) ||
         !b.bytes(b.rows, rows.size() * sizeof(std::uint64_t)) ||
@@ -225,15 +234,19 @@ bool TransformerModel::cuda_forward(
         const float* on = cuda_dev_const(out_norm_.data(), E);
         ok = on != nullptr && cuda_dev_rmsnorm(b.x, on, eps, b.xb, E, n) &&
              (all_logits
-                  ? cuda_dev_matvec_batch(out_w_, b.xb, b.logits, n,
+                  ? cuda_dev_matvec_batch(head, b.xb, b.logits, n,
                                           b.scratch)
-                  : cuda_dev_matvec(out_w_, b.xb + std::size_t{n - 1} * E,
+                  : cuda_dev_matvec(head, b.xb + std::size_t{n - 1} * E,
                                     b.logits));
     }
     ok = cuda_dev_finish() && ok;
     std::vector<float> stage(std::size_t{n} * stage_stride);
+    // The whole head lands in logits as is; a row range lands in a
+    // packed buffer, then at its rows.
+    std::vector<float> packed(R == V ? 0 : std::size_t{nh} * R);
     if (!ok ||
-        !cuda_dev_download(logits.data(), b.logits, std::size_t{nh} * V) ||
+        !cuda_dev_download(R == V ? logits.data() : packed.data(), b.logits,
+                           std::size_t{nh} * R) ||
         !cuda_dev_download(stage.data(), b.stage, stage.size()) ||
         !cuda_dev_download(ws.xb.data(), b.xb + std::size_t{n - 1} * E, E)) {
         return false;
@@ -249,8 +262,16 @@ bool TransformerModel::cuda_forward(
                         kvd * sizeof(float));
         }
     }
+    const float ninf = -std::numeric_limits<float>::infinity();
     for (std::uint32_t t = 0; t < nh; ++t) {
-        scale_logits(logits.subspan(std::size_t{t} * V, V));
+        const std::span<float> row = logits.subspan(std::size_t{t} * V, V);
+        if (R != V) {
+            std::fill(row.begin(), row.begin() + lo, ninf);
+            std::copy_n(packed.data() + std::size_t{t} * R, R,
+                        row.begin() + lo);
+            std::fill(row.begin() + lo + R, row.end(), ninf);
+        }
+        scale_logits(row.subspan(lo, R));
     }
     return true;
 }

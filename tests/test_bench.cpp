@@ -19,7 +19,12 @@
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/embed/embedding_model.hpp"
+#include "locus/gguf/gguf.hpp"
 #include "locus/http/metrics.hpp"
+#include "locus/kv/paged_cache.hpp"
+#include "locus/model/codec.hpp"
+#include "locus/model/transformer.hpp"
+#include "locus/tok/tokenizer.hpp"
 #include "locus/sys/features.hpp"
 
 using namespace locus::backend;
@@ -224,11 +229,12 @@ TEST_CASE("bench: encoder pass cpu vs cuda", "[.][bench][cuda]") {
         if (!std::filesystem::exists(path)) continue;
         const auto m = locus::embed::EmbeddingModel::load(path);
         cuda_pool_reset();
-        // About 12, 48, 120 and 480 tokens in one pass: eight inputs of
-        // the given repeats, or one long input for the last.
+        // About 15, 60, 120 and 470 tokens in one pass: up to eight
+        // inputs of one sentence, or one long input under the 512-token
+        // limit (13 tokens a sentence on bge-small).
         for (const auto& [inputs, reps] :
              {std::pair{1, 1}, std::pair{4, 1}, std::pair{8, 1},
-              std::pair{1, 40}}) {
+              std::pair{1, 36}}) {
             std::string text;
             for (int r = 0; r < reps; ++r) text += sentence;
             const std::vector<std::string> in(
@@ -241,6 +247,107 @@ TEST_CASE("bench: encoder pass cpu vs cuda", "[.][bench][cuda]") {
                       << " ms, cuda " << g << " ms (" << c / g << "x)");
         }
     }
+    SUCCEED();
+}
+
+// Orpheus speech decode on CUDA (i#689): ms per token with the speech
+// head rows and with the full head. Run it once as is, and once with
+// LOCUS_CUDA_FORWARD=0 for the per-op path (read once per process).
+TEST_CASE("bench: orpheus decode step on cuda with speech rows",
+          "[.][bench][cuda]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no usable CUDA device");
+    }
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/orpheus-3b-0.1-ft-Q4_K_M.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP(path + " absent");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*find_backend("cuda"));
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    // The server's speech rows: <custom_token_0> through the 7 bands.
+    const auto base =
+        static_cast<std::uint32_t>(locus::model::orpheus_band_base(*tok));
+    const std::uint32_t nv = model.hparams().n_vocab;
+    const locus::model::LogitRows speech{base - 10,
+                                         std::min(nv, base + 7u * 4096u)};
+    const auto prompt = tok->encode("tara: Hello there, how are you?", true);
+    constexpr std::uint32_t kSteps = 48;
+    auto ws = model.make_workspace();
+    std::vector<float> logits(nv);
+    const auto ms_per_token = [&](locus::model::LogitRows rows) {
+        auto cache = model.make_cache();
+        locus::kv::PagedKvCache::Seq seq;
+        for (const auto id : prompt) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits, rows);
+        }
+        // Fixed inputs (the band base) so both runs do the same work.
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::uint32_t i = 0; i < kSteps; ++i) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(static_cast<locus::tok::TokenId>(base), cache, seq,
+                          ws, logits, rows);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        cache.release(seq);
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() /
+               kSteps;
+    };
+    ms_per_token({});  // warm: weight pool, first touch
+    const double rows_ms = ms_per_token(speech);
+    const double full_ms = ms_per_token({});
+    WARN("orpheus on cuda, " << kSteps << " steps: speech rows ["
+                             << speech.begin << ", " << speech.end << ") "
+                             << rows_ms << " ms/token, full head " << full_ms
+                             << " ms/token");
+    SUCCEED();
+}
+
+// The same on a model that fits a 2 GB card whole (Orpheus 3B pages
+// through the weight pool there, which hides the path): Llama 3.2 1B
+// with a range as wide as Orpheus's speech rows (28,682).
+TEST_CASE("bench: llama 1b decode step on cuda with a head row range",
+          "[.][bench][cuda]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no usable CUDA device");
+    }
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/llama-3.2-1b-q4_k_m.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP(path + " absent");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*find_backend("cuda"));
+    const std::uint32_t nv = model.hparams().n_vocab;
+    const locus::model::LogitRows part{nv - 28682, nv};
+    constexpr std::uint32_t kSteps = 128;
+    auto ws = model.make_workspace();
+    std::vector<float> logits(nv);
+    const auto ms_per_token = [&](locus::model::LogitRows rows) {
+        auto cache = model.make_cache();
+        locus::kv::PagedKvCache::Seq seq;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::uint32_t i = 0; i < kSteps; ++i) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(static_cast<locus::tok::TokenId>(1000 + i), cache,
+                          seq, ws, logits, rows);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        cache.release(seq);
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() /
+               kSteps;
+    };
+    ms_per_token({});  // warm: weight pool, first touch
+    const double rows_ms = ms_per_token(part);
+    const double full_ms = ms_per_token({});
+    WARN("llama 1b on cuda, " << kSteps << " steps: rows [" << part.begin
+                              << ", " << part.end << ") " << rows_ms
+                              << " ms/token, full head " << full_ms
+                              << " ms/token");
     SUCCEED();
 }
 
