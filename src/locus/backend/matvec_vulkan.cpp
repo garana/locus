@@ -2327,6 +2327,21 @@ bool vulkan_forward_supported(const model::TransformerModel& m) {
     return vulkan_hparams_supported(m.hparams()) && gpu_weights_ok(m);
 }
 
+bool vulkan_moe_gpu_route(const model::TransformerModel& m) {
+    if (m.hparams().n_expert == 0 || !vulkan_backend_usable()) {
+        return false;
+    }
+    std::lock_guard lk(state_mu());
+    State& s = state();
+    bool any = false;
+    for (const auto& lay : m.layers()) {
+        if (lay.is_moe() && gpu_route_ok(s, m, lay)) {
+            any = true;
+        }
+    }
+    return any;
+}
+
 bool vulkan_forward_layers(const model::TransformerModel& m,
                            tok::TokenId token,
                            std::span<const float> hidden_in,

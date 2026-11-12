@@ -261,6 +261,19 @@ class TransformerModel {
     bool q8k_activations() const;
 
     /**
+     * Settles where the routed experts run (i#654) and returns it. On
+     * Vulkan that depends on the free device memory when first asked,
+     * and the backend keeps the answer for this model, so the disk
+     * prefix cache can key on it. Call it after the KV cache exists,
+     * on a thread bound to the device the forwards will run on (the
+     * decision is per device).
+     * @returns true when some MoE layer would route its experts on the
+     *     GPU (they fit; a model on the per-op path still says true);
+     *     false for a dense model or another backend.
+     */
+    bool experts_on_gpu() const;
+
+    /**
      * @returns Whether the MoE hybrid (hot experts on the GPU, the rest
      *     on the CPU) runs for this model: moe_hybrid_wanted() for an
      *     MoE model on its backend, decided once (i#652). The disk

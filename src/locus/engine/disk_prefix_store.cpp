@@ -209,6 +209,7 @@ std::vector<std::uint8_t> DiskPrefixStore::header(
     put(h, key_.model_size);
     put(h, key_.overrides);
     put(h, static_cast<std::uint32_t>(key_.device_attention));
+    put(h, static_cast<std::uint32_t>(key_.experts_on_gpu));
     put(h, key_.block_tokens);
     put(h, key_.kv_dim);
     put(h, key_.n_layers);
@@ -519,6 +520,13 @@ void DiskPrefixStore::set_device_attention(bool on) {
     key_.device_attention = on;
     // The seed names the files: the other path's files become misses
     // (and stay under the cap until LRU removes them).
+    const std::vector<std::uint8_t> k = header({}, 0);
+    key_seed_ = checksum(k.data(), k.size());
+}
+
+void DiskPrefixStore::set_experts_on_gpu(bool on) {
+    std::lock_guard lock(mu_);
+    key_.experts_on_gpu = on;
     const std::vector<std::uint8_t> k = header({}, 0);
     key_seed_ = checksum(k.data(), k.size());
 }
