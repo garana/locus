@@ -93,15 +93,15 @@ std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
  *     merged output, QwenVision::encode).
  * @param grid_h Merged-token rows (patch rows / merge_size()).
  * @param grid_w Merged-token columns.
+ * @param matmul_ops Null, or the ops lm's batched matmuls run on (a
+ *     GPU's image ops; TransformerModel::forward_batch).
  * @returns (ids.size() - drop) rows of lm's width, token-major.
  * @throws std::invalid_argument on a size that does not match.
  */
-std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
-                                         std::span<const float> image_rows,
-                                         std::span<const tok::TokenId> ids,
-                                         std::uint32_t image_at,
-                                         std::uint32_t grid_h,
-                                         std::uint32_t grid_w,
-                                         std::uint32_t drop);
+std::vector<float> qwen_edit_text_embeds(
+    const model::TransformerModel& lm, std::span<const float> image_rows,
+    std::span<const tok::TokenId> ids, std::uint32_t image_at,
+    std::uint32_t grid_h, std::uint32_t grid_w, std::uint32_t drop,
+    const backend::Ops* matmul_ops = nullptr);
 
 }  // namespace locus::image

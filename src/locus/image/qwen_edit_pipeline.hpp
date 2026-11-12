@@ -136,11 +136,15 @@ class QwenEditPipeline {
     std::vector<float> text_rows(const std::string& prompt,
                                  std::span<const float> image_rows,
                                  std::uint32_t grid_h, std::uint32_t grid_w,
+                                 const backend::Ops* matmul_ops,
                                  std::uint32_t& n) const;
 
     std::vector<std::unique_ptr<gguf::GgufFile>> files_;
     std::unique_ptr<tok::Tokenizer> tok_;
     std::unique_ptr<model::TransformerModel> lm_;
+    /** The language model's tensor bytes, released from the GPU after
+     *  the encode (i#671). */
+    std::span<const std::byte> lm_bytes_;
     std::unique_ptr<QwenVision> vision_;
     std::unique_ptr<QwenImageDit> dit_;
     std::unique_ptr<QwenImageSampler> sampler_;

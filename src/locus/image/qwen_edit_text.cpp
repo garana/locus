@@ -61,13 +61,11 @@ std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
                                  drop);
 }
 
-std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
-                                         std::span<const float> image_rows,
-                                         std::span<const tok::TokenId> ids,
-                                         std::uint32_t image_at,
-                                         std::uint32_t grid_h,
-                                         std::uint32_t grid_w,
-                                         std::uint32_t drop) {
+std::vector<float> qwen_edit_text_embeds(
+    const model::TransformerModel& lm, std::span<const float> image_rows,
+    std::span<const tok::TokenId> ids, std::uint32_t image_at,
+    std::uint32_t grid_h, std::uint32_t grid_w, std::uint32_t drop,
+    const backend::Ops* matmul_ops) {
     const std::uint32_t E = lm.hparams().n_embd;
     const std::uint32_t n_image = grid_h * grid_w;
     if (n_image == 0 || image_rows.size() != std::size_t{n_image} * E) {
@@ -93,7 +91,8 @@ std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
         throw std::invalid_argument("qwen edit: prompt exceeds the cache");
     }
     std::vector<float> hidden(std::size_t{n} * E);
-    lm.forward_batch(ids, cache, seq, ws, hidden, false, embd, pos, true);
+    lm.forward_batch(ids, cache, seq, ws, hidden, false, embd, pos, true,
+                     matmul_ops);
     cache.release(seq);
     hidden.erase(hidden.begin(),
                  hidden.begin() + static_cast<std::ptrdiff_t>(

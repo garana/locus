@@ -1880,6 +1880,7 @@ const Ops& vulkan_image_ops() {
     static const Ops ops{.matvec = &matvec_vulkan,
                          .dequant_row = &dequant_row,
                          .matvec_batch = &matvec_batch_vulkan,
+                         .linear_tokens = &vulkan_linear_tokens,
                          .self_parallel = true,
                          .alloc_kv = nullptr,
                          .free_kv = nullptr,

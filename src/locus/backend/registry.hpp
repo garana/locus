@@ -109,6 +109,15 @@ struct Ops {
     void (*matvec_q8k_batch)(const Mat&, std::span<const float>,
                              std::span<float>, std::uint32_t n) = nullptr;
     /**
+     * Optional batched matvec writing token-major output (out[t *
+     * w.rows + r], the layout the model wants): a GPU kernel that
+     * produces it natively skips matvec_batch's row-major round trip,
+     * two transposes of every output on the host (i#671). When set,
+     * the model's batched matmuls call it instead of matvec_batch.
+     */
+    void (*linear_tokens)(const Mat&, std::span<const float> x,
+                          std::uint32_t n, std::span<float> out) = nullptr;
+    /**
      * True when the backend parallelizes the weight rows itself and
      * wants the WHOLE matrix in each matvec, matvec_q8k and
      * matvec_batch call (a GPU backend: its kernel grids over all

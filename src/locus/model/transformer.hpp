@@ -485,6 +485,11 @@ class TransformerModel {
      *     final norm into logits (n * n_embd floats) and skip the head:
      *     a text encoder's last hidden states (i#574). CPU backends
      *     only; all_logits must be false.
+     * @param matmul_ops Null, or the ops the chunk's batched matmuls
+     *     (the plain / qwen2 attention projections and the dense FFN)
+     *     run on instead of the backend's: a GPU's image ops, so a text
+     *     encoder's prefill runs its weights on the GPU while the rest
+     *     stays on the CPU backend (i#671). CPU backends only.
      * @throws std::invalid_argument on misuse or unsupported arch.
      */
     void forward_batch(std::span<const tok::TokenId> tokens,
@@ -494,7 +499,8 @@ class TransformerModel {
                        bool all_logits = false,
                        std::span<const float* const> embd = {},
                        std::span<const MropePos> mrope = {},
-                       bool hidden_only = false) const;
+                       bool hidden_only = false,
+                       const backend::Ops* matmul_ops = nullptr) const;
 
     /** @returns true when the batched forwards support this model
      * (every CPU/CUDA backend + arch; Vulkan opts out). */

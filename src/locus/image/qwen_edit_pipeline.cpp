@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "locus/backend/variants.hpp"
 #include "locus/image/flux_sampler.hpp"
 #include "locus/image/pixart_pipeline.hpp"
 #include "locus/image/qwen_edit_image.hpp"
@@ -15,6 +16,21 @@
 namespace locus::image {
 
 namespace {
+
+/** @returns The span from g's first tensor byte to its last (as
+ *  flux_pipeline.cpp's). */
+std::span<const std::byte> tensor_bytes(const gguf::GgufFile& g) {
+    const std::byte *lo = nullptr, *hi = nullptr;
+    for (const gguf::TensorInfo& ti : g.tensors()) {
+        const auto d = g.tensor_data(ti);
+        if (lo == nullptr || d.data() < lo) lo = d.data();
+        const std::byte* end = d.data() + d.size();
+        if (hi == nullptr || end > hi) hi = end;
+    }
+    return lo == nullptr ? std::span<const std::byte>{}
+                         : std::span<const std::byte>(
+                               lo, static_cast<std::size_t>(hi - lo));
+}
 
 double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(
@@ -84,6 +100,7 @@ std::unique_ptr<QwenEditPipeline> QwenEditPipeline::from_parts(
     p->tok_ = tok::tokenizer_from_gguf(tok);
     p->lm_ = std::make_unique<model::TransformerModel>(
         model::TransformerModel::load(lm));
+    p->lm_bytes_ = tensor_bytes(lm);
     p->vision_ = std::make_unique<QwenVision>(QwenVision::load(vision));
     p->dit_ = std::make_unique<QwenImageDit>(QwenImageDit::load(dit));
     p->sampler_ =
@@ -123,14 +140,15 @@ std::pair<std::uint32_t, std::uint32_t> QwenEditPipeline::output_size(
 
 std::vector<float> QwenEditPipeline::text_rows(
     const std::string& prompt, std::span<const float> image_rows,
-    std::uint32_t grid_h, std::uint32_t grid_w, std::uint32_t& n) const {
+    std::uint32_t grid_h, std::uint32_t grid_w,
+    const backend::Ops* matmul_ops, std::uint32_t& n) const {
     const auto p = qwen_edit_prompt(*tok_, prompt, grid_h * grid_w);
     if (p.ids.size() <= kEditDropTokens) {
         throw std::invalid_argument("qwen edit: the prompt is too short");
     }
     n = static_cast<std::uint32_t>(p.ids.size() - kEditDropTokens);
     return qwen_edit_text_embeds(*lm_, image_rows, p.ids, p.image_at, grid_h,
-                                 grid_w, kEditDropTokens);
+                                 grid_w, kEditDropTokens, matmul_ops);
 }
 
 std::vector<float> QwenEditPipeline::edit_from(
@@ -166,13 +184,21 @@ std::vector<float> QwenEditPipeline::edit_from(
         throw std::invalid_argument("qwen edit: bad patch grid");
     }
     const auto image_rows = vision_->encode(patches, gh, gw, op);
+    // On the GPU's image ops, the language model's batched matmuls run
+    // there too (i#671), and its weights leave the GPU before the MMDiT
+    // runs, as FLUX's T5 does.
+    const bool gpu = &op == &backend::vulkan_image_ops();
+    const backend::Ops* lm_ops = gpu ? &op : nullptr;
     std::uint32_t n_pos = 0, n_neg = 0;
     const auto pos =
-        text_rows(req.prompt, image_rows, gh / mg, gw / mg, n_pos);
+        text_rows(req.prompt, image_rows, gh / mg, gw / mg, lm_ops, n_pos);
     std::vector<float> neg;
     if (req.negative_prompt && req.true_cfg_scale > 1.0f) {
         neg = text_rows(*req.negative_prompt, image_rows, gh / mg, gw / mg,
-                        n_neg);
+                        lm_ops, n_neg);
+    }
+    if (gpu) {
+        backend::vulkan_release_weights(lm_bytes_.data(), lm_bytes_.size());
     }
     const auto lat = qwen_edit_reference_latents(
         *vae_, r.vae_input, r.vae_image.h, r.vae_image.w, op);

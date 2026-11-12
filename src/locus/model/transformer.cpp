@@ -1188,7 +1188,8 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                                bool all_logits,
                                std::span<const float* const> embd,
                                std::span<const MropePos> mrope,
-                               bool hidden_only) const {
+                               bool hidden_only,
+                               const backend::Ops* matmul_ops) const {
     using namespace locus::backend;
     const auto n = static_cast<std::uint32_t>(toks.size());
     if (n == 0) {
@@ -1207,6 +1208,13 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     if (!supports_batch_prefill()) {
         throw std::invalid_argument(
             "forward_batch: unsupported backend");
+    }
+    if (matmul_ops != nullptr &&
+        (backend_->name == "vulkan" || backend_->name == "cuda" ||
+         spec_->forward != nullptr)) {
+        throw std::invalid_argument(
+            "forward_batch: matmul_ops needs a CPU backend and the shared "
+            "forward");
     }
     if (!embd.empty() && embd.size() != n) {
         throw std::invalid_argument(
@@ -1320,6 +1328,9 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
         return;
     }
     const Ops op = effective_ops(backend_, q8k_activations());
+    // The chunk's batched matmuls (projections, dense FFN) on
+    // matmul_ops when given (i#671); the rest stays on the backend.
+    const Ops& mm = matmul_ops != nullptr ? *matmul_ops : op;
     const std::uint32_t E = hp_.n_embd;
     const std::uint32_t ff = hp_.n_ff;
 
@@ -1370,9 +1381,9 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                            {xbf.data() + o, E});
             }
             lap.lap(l, Stage::kNorm);
-            matvec_batch(op, lay.wq, xbf, qb, n);
-            matvec_batch(op, lay.wk, xbf, kb, n);
-            matvec_batch(op, lay.wv, xbf, vb, n);
+            matvec_batch(mm, lay.wq, xbf, qb, n);
+            matvec_batch(mm, lay.wk, xbf, kb, n);
+            matvec_batch(mm, lay.wv, xbf, vb, n);
             // qwen2: the biases after the projections, as
             // qwen2moe_attention adds them.
             auto add_bias = [n](std::vector<float>& d,
@@ -1434,7 +1445,7 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                         return cache.v(seq, l, p);
                     });
             }
-            matvec_batch(op, lay.wo, xb2, qb, n);
+            matvec_batch(mm, lay.wo, xb2, qb, n);
             for (std::size_t i = 0; i < static_cast<std::size_t>(n) * E;
                  ++i) {
                 x[i] += qb[i];
@@ -1468,15 +1479,15 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                         hp_.rms_eps, {xbf.data() + o, E});
             }
             lap.lap(l, Stage::kNorm);
-            matvec_batch(op, lay.w_gate, xbf, gate, n);
-            matvec_batch(op, lay.w_up, xbf, up, n);
+            matvec_batch(mm, lay.w_gate, xbf, gate, n);
+            matvec_batch(mm, lay.w_up, xbf, up, n);
             for (std::uint32_t t = 0; t < n; ++t) {
                 const std::size_t o =
                     static_cast<std::size_t>(t) * ff;
                 silu_mul({gate.data() + o, ff}, {up.data() + o, ff},
                          {gate.data() + o, ff});
             }
-            matvec_batch(op, lay.w_down, gate, xb2, n);
+            matvec_batch(mm, lay.w_down, gate, xb2, n);
             for (std::uint32_t i = 0;
                  i < static_cast<std::size_t>(n) * E; ++i) {
                 x[i] += xb2[i];
@@ -2019,6 +2030,11 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
     // types.
     const std::uint32_t xc = w.cols;
     const std::uint32_t oc = w.rows;
+    if (op.linear_tokens != nullptr) {
+        // Token-major from the kernel itself (a GPU's image ops).
+        op.linear_tokens(w, x_batch, n, out_batch);
+        return;
+    }
     if (op.matvec_q8k != nullptr &&
         backend::uses_quantized_activation(w.type)) {
         if (op.matvec_q8k_batch != nullptr && !op.self_parallel) {

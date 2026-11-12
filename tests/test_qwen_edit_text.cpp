@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -148,4 +149,21 @@ TEST_CASE("qwen edit text embeds match transformers on a tiny model",
             lm, std::span<const float>(rows).first(rows.size() - 1), ids,
             71, kGh / mg, kGw / mg, kDrop),
         std::invalid_argument);
+
+    // i#671: the language model's batched matmuls on the GPU's image ops
+    // track the CPU (other summation order: a bound, not bits).
+    if (locus::backend::vulkan_backend_usable()) {
+        const auto gpu = locus::image::qwen_edit_text_embeds(
+            lm, rows, ids, 71, kGh / mg, kGw / mg, kDrop,
+            &locus::backend::vulkan_image_ops());
+        REQUIRE(gpu.size() == got.size());
+        double e2 = 0.0, n2 = 0.0;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            const double d = double{gpu[i]} - got[i];
+            e2 += d * d;
+            n2 += double{got[i]} * got[i];
+        }
+        CHECK(std::sqrt(e2) <= 1e-4 * std::sqrt(n2));
+        CHECK(gpu != got);  // it did run elsewhere
+    }
 }
