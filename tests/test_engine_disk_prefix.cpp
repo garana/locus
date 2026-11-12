@@ -371,3 +371,53 @@ TEST_CASE("engine refuses a disk tier whose key does not match",
         std::make_shared<DiskPrefixStore>(t.dir, key, bb + 4, 1 << 20);
     REQUIRE_THROWS_AS(Engine(model, tok.eos_id(), cfg), std::invalid_argument);
 }
+
+// i#621: a pool too small for two growing sequences preempts the newer
+// one. With a disk tier its full blocks (prompt and output so far) are
+// written there and read back on readmission instead of recomputed;
+// the tokens equal a run with room for both, and a recompute run's.
+TEST_CASE("a preempted sequence reads its blocks back from the disk tier",
+          "[engine][disk_prefix]") {
+    if (!fs::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    Fixture f;
+    Engine::Config roomy;
+    Engine baseline(f.model, f.tok.eos_id(), roomy);
+    const auto b0 = baseline.submit(f.q, 40);
+    const auto b1 = baseline.submit(f.p, 40);
+    baseline.run_to_completion();
+    const auto want0 = baseline.get(b0)->generated;
+    const auto want1 = baseline.get(b1)->generated;
+
+    const auto run = [&](std::shared_ptr<DiskPrefixStore> store,
+                         std::uint64_t& swapped, std::uint64_t& loaded) {
+        Engine::Config cfg;
+        cfg.n_blocks = 7;
+        cfg.decode_headroom = 1;
+        cfg.disk_prefix = std::move(store);
+        Engine e(f.model, f.tok.eos_id(), cfg);
+        const auto id0 = e.submit(f.q, 40);
+        const auto id1 = e.submit(f.p, 40);
+        e.run_to_completion();
+        REQUIRE(e.get(id0)->status == Status::kDone);
+        REQUIRE(e.get(id1)->status == Status::kDone);
+        REQUIRE(e.get(id0)->generated == want0);
+        REQUIRE(e.get(id1)->generated == want1);
+        swapped = e.disk_prefix_swapped_tokens();
+        loaded = e.disk_prefix_loaded_tokens();
+    };
+    std::uint64_t swapped = 0;
+    std::uint64_t loaded = 0;
+    run(nullptr, swapped, loaded);  // recompute
+    REQUIRE(swapped == 0);
+    REQUIRE(loaded == 0);
+
+    TempDir t("locus-edp-preempt");
+    std::size_t bb;
+    const DiskKey key = key_for(f.model, bb);
+    run(std::make_shared<DiskPrefixStore>(t.dir, key, bb, 64 << 20),
+        swapped, loaded);
+    REQUIRE(swapped >= 32);
+    REQUIRE(loaded >= 32);
+}
