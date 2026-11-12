@@ -25,6 +25,8 @@
 // products, exactly as the plain kernel computes them, and writes
 // silu(gate) * up -- the gate, up and silu_mul dispatches of an MoE
 // expert in one, reading the activations once (split slots only).
+// With -DSWIGLU alone (matvec_q4_k_glu; i#688) the same for one
+// token's dense FFN: binding 3 is unused.
 //
 // With -DSEGMENTS (matvec_q4_k_seg) the rows are those of up to three
 // same-width matrices read from their own buffers (W, W1 at binding
@@ -292,6 +294,9 @@ void main() {
            : (g_seg == 1u ? pc.off1 + lr : pc.out_offset + lr);
 #else
         acc = row_part(pc.w_off, pc.x_off, r, lane, false);
+#ifdef SWIGLU
+        acc_u = row_part(pc.w_off, pc.x_off, r, lane, true);
+#endif
 #endif
     }
     red[gl_LocalInvocationID.x] = acc;

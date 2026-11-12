@@ -628,3 +628,73 @@ TEST_CASE("vulkan fused SwiGLU q4_k experts match the CPU reference",
         }
     }
 }
+
+TEST_CASE("vulkan fused SwiGLU q4_k equals the unfused chain for one "
+          "token",
+          "[vulkan]") {
+    // matvec_q4_k_glu (i#688): one token's dense gate, up and silu_mul
+    // in one dispatch must give the bits of matvec_q4_k twice and
+    // silu_mul, which single-token decode ran before.
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(43);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    const std::uint32_t rows = 37, cols = 768;
+    const std::size_t mat_bytes = rows * (cols / 256) * 144;
+    auto quant = [&] {
+        std::vector<std::byte> w(mat_bytes);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t at = 0; at < w.size(); at += 144) {
+            const std::uint16_t d = locus::backend::f32_to_f16(0.01f);
+            const std::uint16_t dmin = locus::backend::f32_to_f16(0.005f);
+            std::memcpy(&w[at], &d, 2);
+            std::memcpy(&w[at + 2], &dmin, 2);
+        }
+        return w;
+    };
+    const auto wg = quant(), wu = quant();
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    for (const std::uint32_t x_off : {0u, 1u}) {
+        INFO("x_off " << x_off);
+        std::vector<float> xs(x_off, 0.0f);
+        xs.insert(xs.end(), x.begin(), x.end());
+        auto gb = upload(ctx, wg);
+        auto ub = upload(ctx, wu);
+        auto xb = upload(ctx, xs);
+        auto ob = upload(ctx, std::vector<float>(rows, 0.0f));
+        auto og = upload(ctx, std::vector<float>(rows, 0.0f));
+        auto ou = upload(ctx, std::vector<float>(rows, 0.0f));
+        const std::uint32_t push[] = {rows, cols, 0, 0, 0, x_off,
+                                      fbits(1.0f)};
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {gb, xb, ob, gb, ub};
+        ctx.dispatch(Kernel::kMatvecQ4_KGlu, bufs, push,
+                     VulkanContext::matvec_groups(Kernel::kMatvecQ4_KGlu,
+                                                  rows));
+        for (const auto& [w, o] : {std::pair{gb, og}, std::pair{ub, ou}}) {
+            const VulkanContext::Buffer mb[] = {w, xb, o};
+            ctx.dispatch(Kernel::kMatvecQ4_K, mb, push,
+                         VulkanContext::matvec_groups(Kernel::kMatvecQ4_K,
+                                                      rows));
+        }
+        const VulkanContext::Buffer sb[] = {og, ou, og};
+        const std::uint32_t spush[] = {rows};
+        ctx.dispatch(Kernel::kSiluMul, sb, spush, (rows + 63) / 64);
+        ctx.end_batch();
+        const auto got = download<float>(ctx, ob, rows);
+        const auto unfused = download<float>(ctx, og, rows);
+        REQUIRE(std::memcmp(got.data(), unfused.data(),
+                            got.size() * sizeof(float)) == 0);
+        for (auto b : {gb, ub, xb, ob, og, ou}) {
+            ctx.destroy_buffer(b);
+        }
+    }
+}

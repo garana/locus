@@ -180,6 +180,8 @@ enum class Kernel {
     /** Unmasked multi-head attention in one pass (flash_attn.comp,
      *  i#640): the image transformers' joint attention. */
     kFlashAttn,
+    /** One token's Q4_K gate, up and silu_mul in one dispatch (i#688). */
+    kMatvecQ4_KGlu,
     kCount_,
 };
 
