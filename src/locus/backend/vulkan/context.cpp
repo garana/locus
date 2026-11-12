@@ -883,9 +883,21 @@ struct VulkanContext::Impl {
     bool has_f16 = false;
     /** Bytes currently allocated through make_buffer. */
     VkDeviceSize allocated = 0;
+    /** The heap of the memory type make_buffer last allocated from;
+     *  ~0u before the first buffer (i#364). */
+    std::uint32_t buffer_heap = ~0u;
 
-    /** @returns The heap backing host-visible coherent memory. */
+    /**
+     * @returns The heap the buffers live in: the one make_buffer's
+     *     memory type uses, once a buffer exists (i#364: on a discrete
+     *     GPU with resizable BAR the first host-visible coherent type
+     *     in the table may not be one a storage buffer allows); before
+     *     that, the first host-visible coherent type's heap.
+     */
     std::uint32_t host_heap() const {
+        if (buffer_heap != ~0u) {
+            return buffer_heap;
+        }
         VkPhysicalDeviceMemoryProperties props;
         vkGetPhysicalDeviceMemoryProperties(phys, &props);
         const VkMemoryPropertyFlags want =
@@ -1325,6 +1337,7 @@ struct VulkanContext::Impl {
             throw std::runtime_error(
                 "vulkan: no host-visible memory");
         }
+        buffer_heap = props.memoryTypes[type].heapIndex;
         VkMemoryAllocateInfo mai{};
         mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         mai.allocationSize = req.size;
