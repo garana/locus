@@ -1008,6 +1008,40 @@ void dbrx_attention(const TransformerModel& m,
                hp.kq_scale, krow_at, vrow_at);
 }
 
+/**
+ * @returns The per-layer sliding-window flags of a
+ *     sliding_window_pattern array: bools, or integers (non-zero means
+ *     sliding), as converters write it (i#662).
+ * @throws gguf::Error on another element type.
+ */
+std::vector<bool> swa_pattern(const std::vector<gguf::Value>& pat,
+                              const char* arch) {
+    std::vector<bool> out;
+    out.reserve(pat.size());
+    for (const auto& v : pat) {
+        switch (v.type) {
+            case gguf::ValueType::kBool:
+                out.push_back(v.b);
+                break;
+            case gguf::ValueType::kUint8:
+            case gguf::ValueType::kUint16:
+            case gguf::ValueType::kUint32:
+            case gguf::ValueType::kUint64:
+            case gguf::ValueType::kInt8:
+            case gguf::ValueType::kInt16:
+            case gguf::ValueType::kInt32:
+            case gguf::ValueType::kInt64:
+                out.push_back(v.u != 0 || v.i != 0);
+                break;
+            default:
+                throw gguf::Error(std::string(arch) +
+                                  ": sliding_window_pattern is neither "
+                                  "bools nor integers");
+        }
+    }
+    return out;
+}
+
 // Muse Spark (Meta; muse-spark). GQA attention with a sigmoid output
 // gate and a weightless per-head norm on its output; RoPE only on the
 // sliding-window layers (the others are NoPE and global); norm-
@@ -1056,10 +1090,7 @@ void muse_spark_hparams(const gguf::GgufFile& g, const std::string& p,
         hp.swa_window == 0) {
         throw gguf::Error("muse-spark: missing sliding-window layout");
     }
-    hp.swa_layers.clear();
-    for (const auto& v : *pat) {
-        hp.swa_layers.push_back(v.b);
-    }
+    hp.swa_layers = swa_pattern(*pat, "muse-spark");
     hp.embd_norm = true;
     hp.custom_layer = true;
     hp.q8k_default = true;  // the goldens are llama.cpp's
@@ -1260,6 +1291,223 @@ void muse_spark_layer(const TransformerModel& m,
     }
 }
 
+// Kolibri-1 (Aleph Alpha; kolibri1). GQA with per-head RMS norm on q
+// and k; NEOX RoPE only on the sliding-window layers (the others are
+// NoPE and global); RMS norms on the attention and FFN outputs before
+// their residuals; every layer MoE: sigmoid routing whose selection
+// adds exp_probs_b to the router logits while the weights are the
+// sigmoid of the unbiased logits, plus one ungated shared expert.
+// Mirrors llama.cpp's llama_model_kolibri1 graph.
+void kolibri1_hparams(const gguf::GgufFile& g, const std::string& p,
+                      Hparams& hp) {
+    hp.arch = Arch::kLlama;
+    hp.head_dim = static_cast<std::uint32_t>(
+        g.get_uint(p + "attention.key_length").value_or(0));
+    if (hp.head_dim == 0 && hp.n_heads != 0) {
+        hp.head_dim = hp.n_embd / hp.n_heads;
+    }
+    const auto vlen = g.get_uint(p + "attention.value_length");
+    if (hp.head_dim == 0 || (vlen && *vlen != hp.head_dim)) {
+        throw gguf::Error("kolibri1: unsupported key/value lengths");
+    }
+    if (hp.n_kv_heads == 0 || hp.n_heads % hp.n_kv_heads != 0) {
+        throw gguf::Error("invalid kv head configuration");
+    }
+    hp.n_ff_exp = static_cast<std::uint32_t>(
+        g.get_uint(p + "expert_feed_forward_length").value_or(0));
+    hp.n_expert_shared = static_cast<std::uint32_t>(
+        g.get_uint(p + "expert_shared_count").value_or(0));
+    hp.n_ff_shexp = static_cast<std::uint32_t>(
+        g.get_uint(p + "expert_shared_feed_forward_length").value_or(0));
+    if (hp.n_expert == 0 || hp.n_ff_exp == 0) {
+        throw gguf::Error(
+            "kolibri1: missing expert_count or a scalar "
+            "expert_feed_forward_length");
+    }
+    if (hp.n_expert_shared != 1 || hp.n_ff_shexp == 0) {
+        throw gguf::Error("kolibri1: needs one shared expert");
+    }
+    hp.gating = static_cast<GatingFunc>(
+        g.get_uint(p + "expert_gating_func")
+            .value_or(static_cast<std::uint64_t>(GatingFunc::kSigmoid)));
+    if (hp.gating != GatingFunc::kSigmoid) {
+        throw gguf::Error("kolibri1: needs sigmoid expert gating");
+    }
+    hp.expert_weights_norm =
+        g.get_bool(p + "expert_weights_norm").value_or(false);
+    hp.expert_weights_scale =
+        get_float(g, p + "expert_weights_scale", 1.0f);
+    hp.swa_window = static_cast<std::uint32_t>(
+        g.get_uint(p + "attention.sliding_window").value_or(0));
+    const auto* pat = g.get_array(p + "attention.sliding_window_pattern");
+    if (pat == nullptr || pat->size() != hp.n_layers ||
+        hp.swa_window == 0) {
+        throw gguf::Error("kolibri1: missing sliding-window layout");
+    }
+    hp.swa_layers = swa_pattern(*pat, "kolibri1");
+    hp.rope_freq_base_swa = hp.rope_freq_base;
+    hp.rope_neox = true;
+    hp.custom_layer = true;
+    hp.kq_scale = 1.0f / std::sqrt(static_cast<float>(hp.head_dim));
+}
+
+void kolibri1_attention_tensors(const gguf::GgufFile& g,
+                                const std::string& bp, const Hparams& hp,
+                                TransformerModel::Layer& lay) {
+    qwen3moe_attention_tensors(g, bp, hp, lay);
+    lay.post_attn_norm =
+        need_vec(g, bp + "post_attention_norm.weight", hp.n_embd);
+    lay.post_ffw_norm = need_vec(g, bp + "post_ffw_norm.weight", hp.n_embd);
+    if (g.find_tensor(bp + "exp_probs_b.bias") == nullptr) {
+        throw gguf::Error("kolibri1: missing " + bp + "exp_probs_b.bias");
+    }
+}
+
+/** Unused: kolibri1 runs kolibri1_layer. */
+void kolibri1_attention(const TransformerModel&,
+                        const TransformerModel::Layer&, kv::PagedKvCache&,
+                        kv::PagedKvCache::Seq&, TransformerModel::Workspace&,
+                        std::uint32_t, std::uint32_t) {
+    throw std::logic_error("kolibri1: attention runs in its layer body");
+}
+
+void kolibri1_layer(const TransformerModel& m,
+                    const TransformerModel::Layer& lay,
+                    kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq,
+                    TransformerModel::Workspace& ws, std::uint32_t l,
+                    std::uint32_t pos) {
+    using namespace locus::backend;
+    const Hparams& hp = m.hparams();
+    const Ops op = m.ops();
+    const std::uint32_t E = hp.n_embd;
+    const std::uint32_t hd = hp.head_dim;
+    const std::size_t q_dim = std::size_t{hp.n_heads} * hd;
+    const std::size_t kv_dim = std::size_t{hp.n_kv_heads} * hd;
+    const std::uint32_t group = hp.n_heads / hp.n_kv_heads;
+    const bool swa = hp.swa_layers[l];
+    auto head_norm = [&](std::span<float> x, std::uint32_t heads,
+                         std::span<const float> w) {
+        for (std::uint32_t h = 0; h < heads; ++h) {
+            std::span<float> xh = x.subspan(std::size_t{h} * hd, hd);
+            rmsnorm(xh, w, hp.rms_eps, xh);
+        }
+    };
+    auto rope = [&](std::span<float> x, std::uint32_t heads) {
+        if (swa) {  // the global layers are NoPE
+            rope_neox_yarn(x, heads, hd, pos, hp.rope_freq_base_swa,
+                           Yarn{});
+        }
+    };
+
+    // Attention: q / k norms, then RoPE on the sliding layers.
+    rmsnorm(ws.x, lay.attn_norm, hp.rms_eps, ws.xb);
+    std::span<float> q(ws.q.data(), q_dim);
+    matvec_mt(op, lay.wq, ws.xb, q);
+    head_norm(q, hp.n_heads, lay.attn_q_norm);
+    rope(q, hp.n_heads);
+    thread_local std::vector<float> kbuf, vbuf;
+    kbuf.resize(kv_dim);
+    vbuf.resize(kv_dim);
+    matvec_mt(op, lay.wk, ws.xb, kbuf);
+    matvec_mt(op, lay.wv, ws.xb, vbuf);
+    head_norm(kbuf, hp.n_kv_heads, lay.attn_k_norm);
+    rope(kbuf, hp.n_kv_heads);
+    // llama.cpp's standard SWA mask: key t is seen while pos - t <
+    // window.
+    const std::uint32_t t0 =
+        swa && pos + 1 > hp.swa_window ? pos + 1 - hp.swa_window : 0;
+    const std::uint32_t n = pos + 1 - t0;
+    std::vector<float> kmat, vmat;
+    const float* kbase = nullptr;
+    const float* vbase = nullptr;
+    if (cache.quantized()) {
+        cache.store_row(seq, l, pos, false, kbuf);
+        cache.store_row(seq, l, pos, true, vbuf);
+        kmat.resize(n * kv_dim);
+        vmat.resize(n * kv_dim);
+        for (std::uint32_t t = t0; t <= pos; ++t) {
+            cache.load_row(seq, l, t, false,
+                           {kmat.data() + (t - t0) * kv_dim, kv_dim});
+            cache.load_row(seq, l, t, true,
+                           {vmat.data() + (t - t0) * kv_dim, kv_dim});
+        }
+        kbase = kmat.data();
+        vbase = vmat.data();
+    } else {
+        std::copy(kbuf.begin(), kbuf.end(), cache.k(seq, l, pos));
+        std::copy(vbuf.begin(), vbuf.end(), cache.v(seq, l, pos));
+    }
+    auto krow_at = [&](std::uint32_t t) -> const float* {
+        return kbase ? kbase + std::size_t{t - t0} * kv_dim
+                     : cache.k(seq, l, t);
+    };
+    auto vrow_at = [&](std::uint32_t t) -> const float* {
+        return vbase ? vbase + std::size_t{t - t0} * kv_dim
+                     : cache.v(seq, l, t);
+    };
+    // The shared GQA attention (heads across the thread pool) over the
+    // window's n positions, t0 .. pos (i#662).
+    gqa_attend(
+        q.data(), ws.out.data(), hp.n_heads, hd, group, n - 1, hp.kq_scale,
+        [&](std::uint32_t t) { return krow_at(t0 + t); },
+        [&](std::uint32_t t) { return vrow_at(t0 + t); });
+    matvec_mt(op, lay.wo, {ws.out.data(), q_dim}, ws.xb2);
+    rmsnorm(ws.xb2, lay.post_attn_norm, hp.rms_eps, ws.xb2);
+    for (std::uint32_t i = 0; i < E; ++i) {
+        ws.x[i] += ws.xb2[i];
+    }
+
+    // MoE: pick the top k of logits + bias; weigh each pick by the
+    // sigmoid of its unbiased logit (renormalized when the GGUF says
+    // so), then add the shared expert.
+    rmsnorm(ws.x, lay.ffn_norm, hp.rms_eps, ws.xb);
+    op.matvec(lay.gate_inp, ws.xb, ws.router);
+    thread_local std::vector<std::uint32_t> idx;
+    thread_local std::vector<float> wgt;
+    idx.resize(hp.n_expert);
+    for (std::uint32_t e = 0; e < hp.n_expert; ++e) idx[e] = e;
+    auto sel = [&](std::uint32_t e) {
+        return ws.router[e] + lay.exp_probs_b[e];
+    };
+    std::partial_sort(idx.begin(), idx.begin() + hp.n_expert_used,
+                      idx.end(), [&](std::uint32_t a, std::uint32_t b) {
+                          return sel(a) > sel(b) || (sel(a) == sel(b) && a < b);
+                      });
+    wgt.resize(hp.n_expert_used);
+    float wsum = 0.0f;
+    for (std::uint32_t k = 0; k < hp.n_expert_used; ++k) {
+        wgt[k] = 1.0f / (1.0f + std::exp(-ws.router[idx[k]]));
+        wsum += wgt[k];
+    }
+    for (float& w : wgt) {
+        if (hp.expert_weights_norm) w /= wsum;
+        w *= hp.expert_weights_scale;
+    }
+    std::span<float> acc(ws.moe_acc.data(), E);
+    std::fill(acc.begin(), acc.end(), 0.0f);
+    auto glu = [&](const Mat& g, const Mat& u, const Mat& d,
+                   std::uint32_t ff, float w) {
+        matvec_mt(op, g, ws.xb, {ws.gate.data(), ff});
+        matvec_mt(op, u, ws.xb, {ws.up.data(), ff});
+        silu_mul({ws.gate.data(), ff}, {ws.up.data(), ff},
+                 {ws.gate.data(), ff});
+        matvec_mt(op, d, {ws.gate.data(), ff}, ws.xb2);
+        for (std::uint32_t i = 0; i < E; ++i) {
+            acc[i] += w * ws.xb2[i];
+        }
+    };
+    for (std::uint32_t k = 0; k < hp.n_expert_used; ++k) {
+        const std::uint32_t e = idx[k];
+        glu(lay.gate_exps.expert(e), lay.up_exps.expert(e),
+            lay.down_exps.expert(e), hp.n_ff_exp, wgt[k]);
+    }
+    glu(lay.gate_shexp, lay.up_shexp, lay.down_shexp, hp.n_ff_shexp, 1.0f);
+    rmsnorm(acc, lay.post_ffw_norm, hp.rms_eps, acc);
+    for (std::uint32_t i = 0; i < E; ++i) {
+        ws.x[i] += acc[i];
+    }
+}
+
 const ArchSpec kArchs[] = {
     {"llama",
      "Llama family (dense or Mixtral-style MoE, GQA)",
@@ -1277,16 +1525,17 @@ const ArchSpec kArchs[] = {
     {"qwen2",
      "Qwen2 / Qwen2.5 dense (GQA + q/k/v bias, NEOX rope)",
      &qwen2_hparams, &qwen2moe_attention_tensors, &qwen2moe_attention,
-     &llama_kv_dim},
+     &llama_kv_dim, nullptr, nullptr, nullptr, false, true},
     {"qwen2vl",
      "Qwen2-VL / Qwen2.5-VL language model (qwen2 + M-RoPE)",
      &qwen2vl_hparams, &qwen2moe_attention_tensors, &qwen2moe_attention,
-     &llama_kv_dim},
+     &llama_kv_dim, nullptr, nullptr, nullptr, false, true},
     {"qwen2moe",
      "Qwen1.5/2 MoE (GQA + q/k/v bias, routed + gated shared "
      "expert)",
      &qwen2moe_hparams, &qwen2moe_attention_tensors,
-     &qwen2moe_attention, &llama_kv_dim},
+     &qwen2moe_attention, &llama_kv_dim, nullptr, nullptr, nullptr, false,
+     true},
     {"qwen3moe",
      "Qwen3 MoE / Qwen3-Coder (GQA + per-head q/k norm, routed "
      "experts)",
@@ -1302,6 +1551,11 @@ const ArchSpec kArchs[] = {
      "residuals, latent MoE)",
      &muse_spark_hparams, &muse_spark_attention_tensors,
      &muse_spark_attention, &llama_kv_dim, &muse_spark_layer},
+    {"kolibri1",
+     "Kolibri-1 (GQA + q/k norm, SWA / NoPE layers, post norms, "
+     "sigmoid MoE with logit-biased selection + shared expert)",
+     &kolibri1_hparams, &kolibri1_attention_tensors, &kolibri1_attention,
+     &llama_kv_dim, &kolibri1_layer},
     {"deepseek41",
      "DeepSeek-V4.1-Flash (hyper-connections, MQA with compressed / "
      "indexed history and sinks, Engram, sqrt-softplus MoE)",

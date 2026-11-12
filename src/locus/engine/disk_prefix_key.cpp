@@ -57,6 +57,10 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
     // and the batch-invariant kernels. The device too: two GPUs on one
     // backend do not round alike.
     o = fnv(o, m.q8k_activations());
+    // The MoE hybrid as decided, not only its variable: unset turns it
+    // on where the weights do not fit (i#652), and its cold experts
+    // round as the CPU does.
+    o = fnv(o, m.moe_hybrid_on());
     // Debug and offload switches read from the environment that pick
     // other kernels or another expert split: their raw values.
     for (const char* var : {"LOCUS_BATCH_DEQUANT", "LOCUS_MOE_HYBRID",
@@ -104,12 +108,13 @@ std::shared_ptr<DiskPrefixStore> open_disk_prefix(
     const gguf::GgufFile& g, const std::string& path,
     const model::TransformerModel& m, kv::KvType kv_type) {
     const std::string_view be = m.active_backend().name;
-    if (m.hparams().n_expert > 0 && (be == "vulkan" || be == "cuda")) {
-        // On a GPU the expert route (device or host) also depends on
-        // the free device memory at startup, which no key can follow.
+    if (m.hparams().n_expert > 0 && be == "cuda") {
+        // CUDA's expert split also follows the free device memory, and
+        // has no query the key could hold yet (Vulkan's: the engine
+        // sets DiskKey::experts_on_gpu).
         throw std::invalid_argument(
-            "--prefix-cache-dir: not supported for MoE models on a GPU "
-            "backend yet");
+            "--prefix-cache-dir: not supported for MoE models on CUDA "
+            "yet");
     }
     std::size_t bb = 0;
     DiskKey k = disk_key_for(g, path, m, kv_type, bb);

@@ -19,7 +19,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Architectures:** llama (dense and Mixtral-style MoE), deepseek2
   (MLA), glm-dsa, qwen2, qwen2vl (Qwen2.5-VL's language model, with
   M-RoPE for image tokens on the CPU), qwen2moe, qwen3moe, dbrx,
-  muse-spark, deepseek41.
+  muse-spark, deepseek41, kolibri1 (Kolibri-1, checked on a synthetic
+  model; the real weights need a 64 GB host, #659).
 - **Weight formats:** GGUF with F32, F16, BF16, the legacy quants,
   K-quants, IQ quants, TQ1_0 and TQ2_0.
 - **Tokenizers:** SentencePiece, byte-level BPE (gpt2, llama3 and
@@ -38,7 +39,7 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   bge-m3 and nomic-embed-text v1.5. A reranker (an XLM-R cross-encoder
   such as bge-reranker-v2-m3) serves `/v1/rerank` with
   `--rerank-model`. Both run on the CPU, and a large request's passes
-  on Vulkan where the GPU shares host memory (Apple).
+  on Vulkan where the GPU shares host memory (Apple), or on CUDA.
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
   penalties, seed), structured output (JSON mode, a JSON Schema, a
   regex or a GBNF grammar), prompt caching (in RAM, and on disk with
@@ -54,7 +55,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   (T5-XXL encoder, DiT, DPM-Solver++, SD VAE; one 512 x 512 PNG), or
   with FLUX.1 dev, schnell or Kontext dev as text to image (CLIP-L and
   T5-XXL, the MMDiT, flow-matching Euler, the FLUX VAE; up to 1024 x
-  1024 pixels). `/v1/images/edits` runs FLUX.1 Kontext dev on a
+  1024 pixels). `/v1/images/edits` runs Qwen-Image-Edit
+  (instruction-based edits with true CFG) or FLUX.1 Kontext dev on a
   reference image (its VAE-encoded tokens join the image tokens), for
   the same character or scene in a new picture. On a Vulkan GPU with
   unified memory, whatever backend the language model uses, the
@@ -94,7 +96,7 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 | From \ To | Text                                   | Image                                               | Video                                    |
 |-----------|----------------------------------------|-----------------------------------------------------|------------------------------------------|
 | Text      | completions, chat, messages, responses | `/v1/images/generations`: Janus-Pro, PixArt, FLUX.1 | `/v1/videos`: LTX-Video                  |
-| Image     | chat with an image: Janus-Pro-1B       | `/v1/images/edits`: FLUX.1 Kontext                  | `/v1/videos` with `input_reference`: LTX |
+| Image     | chat with an image: Janus-Pro-1B       | `/v1/images/edits`: Qwen-Image-Edit, FLUX.1 Kontext | `/v1/videos` with `input_reference`: LTX |
 | Video     | no                                     | no                                                  | no                                       |
 
 Speech (text to audio) is `/v1/audio/speech`. How these run together:
@@ -172,14 +174,14 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 - Multimedia (#143): diffusion image speed (#146), video (#148), real-time
   speech (#173), faster image input (#257), FLUX.1 LoRAs (#372:
   `--lora-dir` and the `lora` field apply converted ones, on the CPU
-  and in the whole-step GPU forward), Qwen-Image-Edit (#529: the
-  Qwen2.5-VL vision tower, from llama.cpp's mmproj GGUF, its language
-  model with M-RoPE (qwen2vl), the edit prompt's text conditioning, the
-  VAE and the MMDiT run on the CPU; `scripts/convert-qwen-image.py`
-  writes the transformer and VAE GGUFs; the pipeline and an endpoint
-  are not in yet), CNN image classifiers (#274: ResNet-50 and
-  Inception-v3 on `/v1/classify` and `/v1/embeddings`; the convs run
-  on Vulkan when the GPU maps host memory).
+  and in the whole-step GPU forward), Qwen-Image-Edit (#529: on
+  `/v1/images/edits`, matched end to end against diffusers on tiny
+  models; the language model runs on the CPU, the MMDiT and the VAE
+  also on Vulkan; a run with the real weights and its speed are
+  pending), CNN image classifiers
+  (#274: ResNet-50 and Inception-v3 on `/v1/classify` and
+  `/v1/embeddings`; the convs run on Vulkan when the GPU maps host
+  memory).
 - Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
   bandwidth (#179), hot MoE experts on the GPU (#252).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
@@ -204,7 +206,9 @@ tower). Tests tagged as heavy also need `LOCUS_HEAVY_TESTS=1`.
     locus-server model.gguf 8080
     locus-run model.gguf "Once upon a time" 32
 
-`locus-server --help` lists the options and environment variables;
+The server listens on every interface; `--host 127.0.0.1` keeps it
+on loopback. `locus-server --help` lists the options and environment
+variables;
 `--capabilities` lists the architectures, backends, weight formats
 and tokenizers of the build. Speech needs `--audio-decoder
 <snac.gguf>`, image generation `--image-decoder <vq16.gguf>` (Janus)

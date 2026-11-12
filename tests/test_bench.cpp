@@ -5,14 +5,20 @@
 // compared to the f32-dequant default -- Q8_K exists for integer-dot
 // throughput, and this is where that win is verified.
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <random>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/embed/embedding_model.hpp"
 #include "locus/http/metrics.hpp"
 #include "locus/sys/features.hpp"
 
@@ -180,6 +186,59 @@ TEST_CASE("bench: out_w_ n x matvec_cuda vs matvec_batch_cuda",
                  << h.name << " n=" << n
                  << ": per-token=" << per_ns << "ns batched=" << bat_ns
                  << "ns speedup=" << per_ns / bat_ns << "x");
+        }
+    }
+    SUCCEED();
+}
+
+// i#519: one embedding pass on the CPU against the CUDA ops, at the
+// sizes EmbeddingModel's GPU thresholds (kGpuMinTokens, kGpuMacs) were
+// set from on Apple. Each input is the same sentence repeated; the
+// best of three runs after a warm-up.
+TEST_CASE("bench: encoder pass cpu vs cuda", "[.][bench][cuda]") {
+    const auto* cuda = find_backend("cuda");
+    if (cuda == nullptr || !cuda->available) {
+        SKIP("no usable CUDA device");
+    }
+    const auto& cpu = best_backend().ops;
+    const std::string sentence =
+        "Beijing is the capital of the People's Republic of China. ";
+    const auto best_ms = [](const auto& fn) {
+        fn();  // warm (weight upload, first touch)
+        double best = 1e30;
+        for (int i = 0; i < 3; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            fn();
+            const auto t1 = std::chrono::steady_clock::now();
+            best = std::min(
+                best,
+                std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+        return best;
+    };
+    for (const char* file :
+         {"bge-small-en-v1.5-q8_0.gguf", "bge-m3-q8_0.gguf",
+          "nomic-embed-text-v1.5.Q8_0.gguf"}) {
+        const std::string path =
+            std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + file;
+        if (!std::filesystem::exists(path)) continue;
+        const auto m = locus::embed::EmbeddingModel::load(path);
+        cuda_pool_reset();
+        // About 12, 48, 120 and 480 tokens in one pass: eight inputs of
+        // the given repeats, or one long input for the last.
+        for (const auto& [inputs, reps] :
+             {std::pair{1, 1}, std::pair{4, 1}, std::pair{8, 1},
+              std::pair{1, 40}}) {
+            std::string text;
+            for (int r = 0; r < reps; ++r) text += sentence;
+            const std::vector<std::string> in(
+                static_cast<std::size_t>(inputs), text);
+            std::size_t tokens = 0;
+            m->embed(in, cpu, &tokens);
+            const double c = best_ms([&] { m->embed(in, cpu); });
+            const double g = best_ms([&] { m->embed(in, cuda->ops); });
+            WARN(file << " " << tokens << " tokens: cpu " << c
+                      << " ms, cuda " << g << " ms (" << c / g << "x)");
         }
     }
     SUCCEED();

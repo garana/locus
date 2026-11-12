@@ -82,7 +82,10 @@ class QwenImageDit {
      * @param text n_txt x text_width() floats: the text-encoder rows.
      * @param n_txt Text tokens, at least 1.
      * @param sigma The noise level in [0, 1] (the pipeline's t / 1000).
-     * @param op The backend ops the matrices run on.
+     * @param op The backend ops the matrices run on. With
+     *     backend::vulkan_image_ops() the whole call runs on the GPU
+     *     (resident activations, one upload and one readback), unless
+     *     LOCUS_QWEN_IMAGE_GPU=0 keeps it per op.
      * @param trace When not null, receives the intermediate states.
      * @returns One out_channels() row per image token, token-major (the
      *     pipeline keeps the first segment's).
@@ -110,6 +113,19 @@ class QwenImageDit {
               std::vector<float>& sin_out) const;
 
   private:
+    /** forward() with every block on the GPU (qwen_image_dit_vulkan.cpp):
+     *  text_normed is the text rows after txt_norm, st silu of the
+     *  conditioning vector, cosv / sinv the RoPE tables of the joined
+     *  sequence. */
+    std::vector<float> forward_vulkan(std::span<const float> x,
+                                      std::uint32_t n_img,
+                                      std::span<const float> text_normed,
+                                      std::uint32_t n_txt,
+                                      const std::vector<float>& st,
+                                      const std::vector<float>& cosv,
+                                      const std::vector<float>& sinv,
+                                      Trace* trace) const;
+
     struct Linear {
         backend::Mat w;
         std::vector<float> b;

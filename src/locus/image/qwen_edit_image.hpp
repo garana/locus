@@ -1,10 +1,13 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <utility>
 #include <vector>
 
+#include "locus/backend/registry.hpp"
 #include "locus/image/image_input.hpp"
+#include "locus/image/qwen_vae.hpp"
 
 namespace locus::image {
 
@@ -18,13 +21,15 @@ namespace locus::image {
 /**
  * diffusers' calculate_dimensions(1024 * 1024, w / h): the side of the
  * same aspect with about 1024 x 1024 pixels, each side rounded (half to
- * even, as Python's round) to a multiple of 32.
+ * even, as Python's round) to a multiple of 32, and at least 32.
  *
  * @returns {width, height}.
- * @throws std::invalid_argument on a zero side.
+ * @param area The pixel count to aim at (the pipeline's 1024 x 1024;
+ *     smaller in tests).
+ * @throws std::invalid_argument on a zero side or area.
  */
-std::pair<std::uint32_t, std::uint32_t> qwen_edit_dimensions(std::uint32_t w,
-                                                             std::uint32_t h);
+std::pair<std::uint32_t, std::uint32_t> qwen_edit_dimensions(
+    std::uint32_t w, std::uint32_t h, std::uint64_t area = 1024 * 1024);
 
 /**
  * transformers' Qwen2-VL smart_resize: both sides multiples of factor,
@@ -52,8 +57,36 @@ struct EditReference {
 
 /**
  * @param img Any RGB image.
+ * @param area The VAE image's pixel count to aim at
+ *     (qwen_edit_dimensions).
  * @throws std::invalid_argument on an empty image.
  */
-EditReference qwen_edit_reference(const Rgb8& img);
+EditReference qwen_edit_reference(const Rgb8& img,
+                                  std::uint64_t area = 1024 * 1024);
+
+/** The reference image as the MMDiT's second segment (i#614). */
+struct EditLatents {
+    /** rows x cols tokens of z_dim * 4 values (FluxSampler::pack, which
+     *  is QwenImageEditPipeline._pack_latents too). */
+    std::vector<float> tokens;
+    /** The token grid: the latents' sides / 2. */
+    std::uint32_t rows = 0, cols = 0;
+};
+
+/**
+ * _encode_vae_image then _pack_latents: the VAE encoder's mean (the
+ * posterior's mode), normalized with the VAE's latents mean and std,
+ * packed into tokens.
+ *
+ * @param chw [3][h][w] in [-1, 1] (EditReference::vae_input).
+ * @param h, w Sides; multiples of 2 * vae.scale().
+ * @param op The backend ops for the VAE encoder (the Vulkan image ops
+ *     run its convs on the GPU).
+ * @throws std::invalid_argument on a bad size or a VAE without its
+ *     encoder.
+ */
+EditLatents qwen_edit_reference_latents(
+    const QwenVae& vae, std::span<const float> chw, std::uint32_t h,
+    std::uint32_t w, const backend::Ops& op = backend::best_backend().ops);
 
 }  // namespace locus::image

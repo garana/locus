@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -61,9 +62,13 @@ class EngineLoop {
 
     /**
      * Blocks until the request has more than n_seen generated
-     * tokens or reaches a terminal state.
+     * tokens or reaches a terminal state, or, with a nonzero
+     * max_wait, until that much time has passed (i#619).
+     * @returns The latest snapshot; after a timeout it may hold no new
+     *     tokens.
      */
-    View wait_progress(std::uint64_t id, std::size_t n_seen);
+    View wait_progress(std::uint64_t id, std::size_t n_seen,
+                       std::chrono::milliseconds max_wait = {});
 
     /** Blocks until the request reaches a terminal state. */
     View wait_done(std::uint64_t id);
@@ -102,6 +107,9 @@ class EngineLoop {
         std::uint64_t spec_drafted_tokens = 0;
         /** Verifies by draft length (Engine::spec_draft_counts). */
         std::vector<std::uint64_t> spec_draft_counts;
+        /** The disk prefix tier's counters (Engine::disk_prefix_*). */
+        std::uint64_t disk_hits = 0, disk_loaded_tokens = 0,
+                      disk_swapped_tokens = 0, disk_refused_tokens = 0;
     };
     Stats stats();
     /** The engine's timing metrics; read without the lock, so

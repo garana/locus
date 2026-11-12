@@ -59,19 +59,31 @@ struct Dev {
     }
 };
 
-/** A random-but-sane Q4_K row (scales bounded), as test_cpu_ops does. */
-std::vector<std::byte> q4k_rows(std::uint32_t rows, std::uint32_t blocks,
-                                std::uint32_t seed) {
-    std::vector<std::byte> w(std::size_t{rows} * blocks * 144);
+/**
+ * Random-but-sane rows of a Q4_K, IQ4_NL or IQ4_XS weight (random
+ * bytes, bounded f16 scales), as test_cpu_ops does.
+ * @param cols A multiple of the type's block size (256, or 32 for
+ *     IQ4_NL).
+ */
+std::vector<std::byte> quant_rows(TensorType t, std::uint32_t rows,
+                                  std::uint32_t cols, std::uint32_t seed) {
+    const std::size_t bytes = t == TensorType::kQ4_K    ? 144
+                              : t == TensorType::kIQ4_XS ? 136
+                                                         : 18;
+    const std::uint32_t per = t == TensorType::kIQ4_NL ? 32 : 256;
+    const std::size_t blocks = std::size_t{rows} * (cols / per);
+    std::vector<std::byte> w(blocks * bytes);
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> byte_d(0, 255);
     for (auto& b : w) {
         b = static_cast<std::byte>(byte_d(rng));
     }
     const std::uint16_t d = f32_to_f16(0.01f), dmin = f32_to_f16(0.005f);
-    for (std::size_t b = 0; b < std::size_t{rows} * blocks; ++b) {
-        std::memcpy(w.data() + b * 144, &d, 2);
-        std::memcpy(w.data() + b * 144 + 2, &dmin, 2);
+    for (std::size_t b = 0; b < blocks; ++b) {
+        std::memcpy(w.data() + b * bytes, &d, 2);
+        if (t == TensorType::kQ4_K) {
+            std::memcpy(w.data() + b * bytes + 2, &dmin, 2);
+        }
     }
     return w;
 }
@@ -150,32 +162,38 @@ TEST_CASE("cuda device matvecs equal matvec_cuda", "[cuda][device]") {
     if (!cuda_backend_usable()) {
         SKIP("no usable CUDA device");
     }
-    cuda_pool_reset();
-    constexpr std::uint32_t rows = 37, blocks = 8, cols = blocks * 256;
-    const auto wb = q4k_rows(rows, blocks, 7);
-    const Mat m{TensorType::kQ4_K, wb.data(), rows, cols};
+    // 37 rows; 2048 columns (IQ4_NL: two full 32-block passes).
+    constexpr std::uint32_t rows = 37, cols = 8 * 256;
     // 40 tokens: one 32-token batch launch and a partial one.
     constexpr std::uint32_t n = 40;
     const auto x = random_floats(std::size_t{n} * cols, 8);
-    std::vector<float> ref(std::size_t{n} * rows);
-    for (std::uint32_t t = 0; t < n; ++t) {
-        matvec_cuda(m, {x.data() + std::size_t{t} * cols, cols},
-                    {ref.data() + std::size_t{t} * rows, rows});
-    }
-    {
-        Dev dx(x), dout(ref.size());
+    for (const TensorType type :
+         {TensorType::kQ4_K, TensorType::kIQ4_NL, TensorType::kIQ4_XS}) {
+        INFO("type " << static_cast<int>(type));
+        // w's address may repeat across types; the pool keys by address.
+        cuda_pool_reset();
+        const auto wb = quant_rows(type, rows, cols, 7);
+        const Mat m{type, wb.data(), rows, cols};
+        std::vector<float> ref(std::size_t{n} * rows);
         for (std::uint32_t t = 0; t < n; ++t) {
-            REQUIRE(cuda_dev_matvec(m, dx.p + std::size_t{t} * cols,
-                                    dout.p + std::size_t{t} * rows));
+            matvec_cuda(m, {x.data() + std::size_t{t} * cols, cols},
+                        {ref.data() + std::size_t{t} * rows, rows});
         }
-        REQUIRE(cuda_dev_finish());
-        REQUIRE(same_bits(dout.get(), ref));
-    }
-    {
-        Dev dx(x), dout(ref.size()), scratch(std::size_t{rows} * 32);
-        REQUIRE(cuda_dev_matvec_batch(m, dx.p, dout.p, n, scratch.p));
-        REQUIRE(cuda_dev_finish());
-        REQUIRE(same_bits(dout.get(), ref));
+        {
+            Dev dx(x), dout(ref.size());
+            for (std::uint32_t t = 0; t < n; ++t) {
+                REQUIRE(cuda_dev_matvec(m, dx.p + std::size_t{t} * cols,
+                                        dout.p + std::size_t{t} * rows));
+            }
+            REQUIRE(cuda_dev_finish());
+            REQUIRE(same_bits(dout.get(), ref));
+        }
+        {
+            Dev dx(x), dout(ref.size()), scratch(std::size_t{rows} * 32);
+            REQUIRE(cuda_dev_matvec_batch(m, dx.p, dout.p, n, scratch.p));
+            REQUIRE(cuda_dev_finish());
+            REQUIRE(same_bits(dout.get(), ref));
+        }
     }
     cuda_pool_reset();
 }

@@ -29,6 +29,18 @@ bool vulkan_hparams_supported(const model::Hparams& hp);
 bool vulkan_forward_supported(const model::TransformerModel& m);
 
 /**
+ * Settles where m's routed experts run on the calling thread's device
+ * and returns it (i#654). The decision depends on the free device
+ * memory when it is first made, and the device keeps it for m's life,
+ * so later forwards route the same way. Call it once the KV pool is
+ * allocated, as a forward would find the device.
+ * @returns true when at least one MoE layer would route its experts on
+ *     the GPU (they fit, even if the model takes the per-op path);
+ *     false for a dense model or without a usable device.
+ */
+bool vulkan_moe_gpu_route(const model::TransformerModel& m);
+
+/**
  * Runs one full token forward on the GPU: all matmuls (F32/Q8_0
  * shaders), rmsnorm, RoPE, SwiGLU, and paged attention reading
  * K/V straight from the GPU-mapped cache pool, recorded as one

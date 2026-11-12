@@ -116,6 +116,51 @@ TEST_CASE("the audio-max-tokens flag sets the speech token cap", "[cli]") {
     REQUIRE(c.audio_max_tokens == 0);  // default: the server's 1024
 }
 
+TEST_CASE("the host flag sets the server's listen address", "[cli]") {
+    std::array<const char*, 4> argv1 = {"prog", "--host", "127.0.0.1",
+                                        "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()),
+        const_cast<char**>(argv1.data()));
+    REQUIRE(a.host == "127.0.0.1");
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+
+    std::array<const char*, 3> argv2 = {"prog", "--host=::1", "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()),
+        const_cast<char**>(argv2.data()));
+    REQUIRE(b.host == "::1");
+
+    std::array<const char*, 2> argv3 = {"prog", "m.gguf"};
+    auto c = locus_tools::parse_backend_args(
+        static_cast<int>(argv3.size()),
+        const_cast<char**>(argv3.data()));
+    REQUIRE(c.host.empty());  // every interface
+}
+
+TEST_CASE("the sse-keepalive flag sets the stream keepalive", "[cli]") {
+    std::array<const char*, 4> argv1 = {"prog", "--sse-keepalive", "30",
+                                        "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()),
+        const_cast<char**>(argv1.data()));
+    REQUIRE(a.sse_keepalive == 30);
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+
+    std::array<const char*, 3> argv2 = {"prog", "--sse-keepalive=0",
+                                        "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()),
+        const_cast<char**>(argv2.data()));
+    REQUIRE(b.sse_keepalive == 0);  // off
+
+    std::array<const char*, 2> argv3 = {"prog", "m.gguf"};
+    auto c = locus_tools::parse_backend_args(
+        static_cast<int>(argv3.size()),
+        const_cast<char**>(argv3.data()));
+    REQUIRE(c.sse_keepalive == 15);
+}
+
 TEST_CASE("the max-tokens flag sets the output token cap", "[cli]") {
     std::array<const char*, 5> argv1 = {"prog", "--max-tokens", "8192",
                                         "--audio-max-tokens=70", "m.gguf"};

@@ -27,6 +27,7 @@ class JanusImageGen;
 class JanusVision;
 class PixArtPipeline;
 class FluxPipeline;
+class QwenEditPipeline;
 class LoraLibrary;
 class LtxvPipeline;
 class Vq16Decoder;
@@ -114,6 +115,11 @@ class OpenAiServer {
         /** Path the Prometheus metrics endpoint is served at
          * (--metrics-path); default /metrics. */
         std::string metrics_path = "/metrics";
+        /** A streamed reply that has sent nothing for this long sends
+         * an SSE comment (": keepalive"), so clients and proxies see a
+         * live stream through a long prefill or a buffered tool reply
+         * (i#619; --sse-keepalive). 0 = off. */
+        std::uint32_t sse_keepalive_ms = 15000;
         /** Path to the neural-codec decoder GGUF (arch "snac") that
          * enables POST /v1/audio/speech (--audio-decoder). Empty =
          * the endpoint is off and returns 503. Loaded at construction;
@@ -335,6 +341,9 @@ class OpenAiServer {
     // its GGUF mappings and shares image_mu_ with Janus.
     std::unique_ptr<image::PixArtPipeline> pixart_;
     std::unique_ptr<image::FluxPipeline> flux_;
+    // Qwen-Image-Edit (--image-model with a qwen_image GGUF), for
+    // /v1/images/edits.
+    std::unique_ptr<image::QwenEditPipeline> qwen_edit_;
     // The FLUX LoRAs (--lora-dir; null when not given).
     std::unique_ptr<image::LoraLibrary> loras_;
     std::mutex image_mu_;

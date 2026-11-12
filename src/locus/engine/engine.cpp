@@ -45,6 +45,9 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
         cfg_.disk_prefix->set_device_attention(
             cache_.mirror_data() != nullptr &&
             m.active_backend().ops.kv_attend != nullptr);
+        // Vulkan routes MoE experts on the GPU or the host by the free
+        // device memory; settled now, with the KV pool allocated.
+        cfg_.disk_prefix->set_experts_on_gpu(m.experts_on_gpu());
         cfg_.prefix_cache = true;
     }
     if (cfg_.prefix_cache) {
@@ -274,12 +277,12 @@ bool Engine::step_once() {
         }
     }
 
-    // One iteration: each running sequence advances; prefill is
-    // capped by the shared budget, decode always costs 1 token.
-    std::uint32_t budget = cfg_.prefill_budget;
+    // One iteration: each running sequence advances; prefill takes its
+    // share of the budget, decode always costs 1 token.
+    share_prefill();
     for (std::size_t i = 0; i < running_.size();) {
         Request& r = *requests_.at(running_[i]);
-        advance(r, budget);
+        advance(r, r.step_share);
         if (r.status != Status::kRunning) {
             running_.erase(running_.begin() +
                            static_cast<std::ptrdiff_t>(i));
@@ -288,6 +291,58 @@ bool Engine::step_once() {
         }
     }
     return !idle();
+}
+
+void Engine::share_prefill() {
+    // (remaining prompt tokens, request) of the prompts still
+    // prefilling; any other running request is decoding.
+    std::vector<std::pair<std::uint32_t, Request*>> want;
+    bool decoding = false;
+    for (const std::uint64_t id : running_) {
+        Request& r = *requests_.at(id);
+        r.step_share = 0;
+        const auto n_prompt = static_cast<std::uint32_t>(r.prompt.size());
+        if (r.n_fed < n_prompt) {
+            want.emplace_back(n_prompt - r.n_fed, &r);
+        } else {
+            decoding = true;
+        }
+    }
+    // With decodes running, every other step feeds no prompt, so half
+    // the steps are decode-only.
+    if (decoding && cfg_.decode_share && !want.empty()) {
+        skip_prefill_ = !skip_prefill_;
+        if (skip_prefill_) return;
+    } else {
+        skip_prefill_ = false;
+    }
+    // Each prompt is fed in the chunks it gets alone: the whole budget
+    // or its whole remainder (batch invariance, i#403: a chunk's size
+    // changes the sums). A prompt that waited prefill_max_wait steps
+    // goes first, the longest waiter first; then the shortest
+    // remainder. A prompt whose chunk no longer fits waits for the next
+    // step. stable_sort keeps admission order among equals.
+    const std::uint32_t max_wait = cfg_.prefill_max_wait;
+    std::stable_sort(want.begin(), want.end(), [max_wait](const auto& a,
+                                                          const auto& b) {
+        const std::uint32_t wa = a.second->prefill_waits;
+        const std::uint32_t wb = b.second->prefill_waits;
+        if ((wa >= max_wait) != (wb >= max_wait)) return wa >= max_wait;
+        if (wa >= max_wait) return wa > wb;
+        return a.first < b.first;
+    });
+    const std::uint32_t chunk = cfg_.prefill_budget;
+    std::uint32_t budget = chunk;
+    for (auto& [remaining, r] : want) {
+        const std::uint32_t need = std::min(remaining, chunk);
+        if (need <= budget) {
+            r->step_share = need;
+            r->prefill_waits = 0;
+            budget -= need;
+        } else {
+            ++r->prefill_waits;
+        }
+    }
 }
 
 void Engine::advance(Request& r, std::uint32_t& budget) {
@@ -471,12 +526,42 @@ bool Engine::reclaim_and_grow(Request& r, std::uint32_t n_more) {
 
 void Engine::preempt(std::uint64_t victim_id) {
     Request& v = *requests_.at(victim_id);
+    // With a disk tier, the victim's full blocks go to it first, keyed
+    // by the tokens they hold (prompt, then output), so readmission
+    // reads them back instead of recomputing (i#621). Blocks that fit
+    // the write backlog are copied and written by the worker; a longer
+    // victim, whose recompute costs most, is written here from the pool
+    // itself, before its blocks are freed: no copy, at the cost of this
+    // step waiting for the disk (i#642).
+    if (disk_worker_) {
+        const std::uint32_t bt = cache_.geometry().block_tokens;
+        const std::uint32_t n = std::min(
+            v.seq.n_tokens / bt,
+            static_cast<std::uint32_t>(v.seq.blocks.size()));
+        if (n > 0) {
+            const std::vector<kv::BlockId> blocks(
+                v.seq.blocks.begin(), v.seq.blocks.begin() + n);
+            const std::vector<tok::TokenId> key = context_of(v, n * bt);
+            bool swapped = write_back(key, blocks);
+            if (!swapped) {
+                std::vector<const std::uint8_t*> src;
+                for (const kv::BlockId b : blocks) {
+                    src.push_back(cache_.block_data(b));
+                }
+                swapped = cfg_.disk_prefix->write(key, n, src);
+            }
+            (swapped ? disk_swapped_tokens_ : disk_refused_tokens_) +=
+                n * bt;
+        }
+    }
     cache_.release(v.seq);
-    v.n_fed = 0;  // full recompute when readmitted
-    // Discard the adopted-prefix accounting. Readmission recomputes
-    // from scratch -- try_adopt no-ops once any output exists, and even
-    // a still-in-prefill victim re-adopts fresh -- so this request no
-    // longer holds the prefix it was credited for. Roll the credit out
+    v.n_fed = 0;  // recompute (or a disk read) when readmitted
+    // Discard the adopted-prefix accounting. Readmission starts from
+    // nothing (a recompute, or the disk tier's blocks, which
+    // absorb_disk_loads credits anew) -- try_adopt no-ops once any
+    // output exists, and even a still-in-prefill victim re-adopts fresh
+    // -- so this request no longer holds the prefix it was credited
+    // for. Roll the credit out
     // of the global reuse metric and clear the per-request cache_read
     // count; a later re-adopt re-adds it. Without this, a preempted
     // request over-reports cache_read_input_tokens (it reused nothing)
@@ -648,20 +733,35 @@ void Engine::try_adopt(Request& r) {
     prefix_reused_tokens_ += r.n_fed;
 }
 
-bool Engine::try_disk_load(Request& r) {
-    if (!r.generated.empty() || r.n_fed != r.reused_prefix_tokens) {
-        return false;  // readmitted victims recompute in full
+std::vector<tok::TokenId> Engine::context_of(const Request& r,
+                                             std::uint32_t n) const {
+    std::vector<tok::TokenId> out(
+        r.prompt.begin(),
+        r.prompt.begin() + std::min<std::size_t>(n, r.prompt.size()));
+    if (n > r.prompt.size()) {
+        out.insert(out.end(), r.generated.begin(),
+                   r.generated.begin() + (n - r.prompt.size()));
     }
-    const std::uint32_t n_prompt =
-        static_cast<std::uint32_t>(r.prompt.size());
+    return out;
+}
+
+bool Engine::try_disk_load(Request& r) {
+    if (r.n_fed != r.reused_prefix_tokens) {
+        return false;
+    }
+    // The tokens to cover: the prompt, and for a readmitted victim the
+    // output so far, whose blocks preempt() wrote.
+    const std::uint32_t n_total = static_cast<std::uint32_t>(
+        r.prompt.size() + r.generated.size());
     const std::uint32_t bt = cache_.geometry().block_tokens;
-    const std::uint32_t on_disk = cfg_.disk_prefix->find(r.prompt);
-    // One prompt token is always fed again, so the disk gives at most
-    // n_prompt - 1 positions. Load only for at least one more block
+    const std::vector<tok::TokenId> ctx = context_of(r, n_total);
+    const std::uint32_t on_disk = cfg_.disk_prefix->find(ctx);
+    // One token is always fed again, so the disk gives at most
+    // n_total - 1 positions. Load only for at least one more block
     // than RAM gave: a block-aligned prompt cached in RAM (which keeps
     // its last block for the tail) stays a RAM hit.
-    if (n_prompt < 2 ||
-        std::min(on_disk * bt, n_prompt - 1) < r.n_fed + bt) {
+    if (n_total < 2 ||
+        std::min(on_disk * bt, n_total - 1) < r.n_fed + bt) {
         return false;
     }
     // Drop the shorter RAM prefix: the read fills private blocks from
@@ -684,8 +784,7 @@ bool Engine::try_disk_load(Request& r) {
     }
     disk_worker_->read(
         r.id,
-        std::vector<tok::TokenId>(r.prompt.begin(),
-                                  r.prompt.begin() + on_disk * bt),
+        std::vector<tok::TokenId>(ctx.begin(), ctx.begin() + on_disk * bt),
         on_disk, std::move(dst));
     r.status = Status::kLoading;
     if (r.t_admit == std::chrono::steady_clock::time_point{}) {
@@ -714,16 +813,22 @@ void Engine::absorb_disk_loads() {
             for (const kv::BlockId b : r.seq.blocks) {
                 cache_.sync_block(b);
             }
-            // Keep one prompt token to feed, so the sampler gets the
-            // last position's logits; its KV row is written again with
-            // the same bytes, in a private block.
+            // Keep one token to feed, so the sampler gets the last
+            // position's logits; its KV row is written again with the
+            // same bytes, in a private block.
+            const auto n_prompt =
+                static_cast<std::uint32_t>(r.prompt.size());
             const std::uint32_t n = std::min(
                 static_cast<std::uint32_t>(r.seq.blocks.size()) * bt,
-                static_cast<std::uint32_t>(r.prompt.size()) - 1);
+                n_prompt +
+                    static_cast<std::uint32_t>(r.generated.size()) - 1);
             r.seq.n_tokens = n;
             r.n_fed = n;
-            r.reused_prefix_tokens = n;
-            prefix_reused_tokens_ += n;
+            // Only prompt positions count as reused input (cache_read);
+            // a victim's output positions are its own.
+            const std::uint32_t reused = std::min(n, n_prompt);
+            r.reused_prefix_tokens = reused;
+            prefix_reused_tokens_ += reused;
             ++disk_hits_;
             disk_loaded_tokens_ += n;
         }
@@ -734,13 +839,18 @@ void Engine::absorb_disk_loads() {
     }
 }
 
-void Engine::write_back(std::span<const tok::TokenId> key,
+bool Engine::write_back(std::span<const tok::TokenId> key,
                         const std::vector<kv::BlockId>& blocks) {
     const auto n = static_cast<std::uint32_t>(blocks.size());
     const std::size_t bb = cache_.block_bytes();
-    if (n == 0 || !disk_worker_->would_accept(std::size_t{n} * bb) ||
-        cfg_.disk_prefix->find(key) >= n) {
-        return;  // nothing to write, no room queued, or already on disk
+    if (n == 0) {
+        return false;
+    }
+    if (cfg_.disk_prefix->find(key) >= n) {
+        return true;  // already on disk
+    }
+    if (!disk_worker_->would_accept(std::size_t{n} * bb)) {
+        return false;  // no room queued: dropped
     }
     // Copied now: the blocks are freed and reused right after this.
     std::vector<std::uint8_t> bytes(std::size_t{n} * bb);
@@ -748,8 +858,9 @@ void Engine::write_back(std::span<const tok::TokenId> key,
         std::memcpy(bytes.data() + i * bb, cache_.block_data(blocks[i]),
                     bb);
     }
-    disk_worker_->write(std::vector<tok::TokenId>(key.begin(), key.end()),
-                        n, std::move(bytes));
+    return disk_worker_->write(
+        std::vector<tok::TokenId>(key.begin(), key.end()), n,
+        std::move(bytes));
 }
 
 bool Engine::spec_decode_step(Request& r) {
@@ -1001,13 +1112,14 @@ bool Engine::step_batched() {
         }
     }
 
-    // Phase 1: prefill each running request still on its prompt.
-    std::uint32_t budget = cfg_.prefill_budget;
+    // Phase 1: prefill each running request still on its prompt, by
+    // its share of the budget.
+    share_prefill();
     for (std::size_t i = 0; i < running_.size();) {
         Request& r = *requests_.at(running_[i]);
         if (r.n_fed <
             static_cast<std::uint32_t>(r.prompt.size())) {
-            if (!prefill_only(r, budget)) {
+            if (!prefill_only(r, r.step_share)) {
                 running_.erase(running_.begin() +
                                static_cast<std::ptrdiff_t>(i));
                 continue;

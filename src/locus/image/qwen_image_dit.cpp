@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
 #include <string>
 
+#include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
 #include "locus/sys/thread_pool.hpp"
 
@@ -355,10 +358,19 @@ std::vector<float> QwenImageDit::forward(std::span<const float> x,
     std::vector<float> cosv, sinv;
     rope(segs, n_txt, cosv, sinv);
 
-    std::vector<float> img(std::size_t{n_img} * w), txt(std::size_t{n_txt} * w);
-    linear(op, img_in_.w, img_in_.b, x, n_img, img);
     std::vector<float> tn(text.begin(), text.end());
     rms_norm(tn, n_txt, joint_, eps_, txt_norm_);
+    if (&op == &backend::vulkan_image_ops() &&
+        backend::VulkanSeq::available()) {
+        const char* env = std::getenv("LOCUS_QWEN_IMAGE_GPU");
+        if (env == nullptr || std::string(env) != "0") {
+            return forward_vulkan(x, n_img, tn, n_txt, st, cosv, sinv,
+                                  trace);
+        }
+    }
+
+    std::vector<float> img(std::size_t{n_img} * w), txt(std::size_t{n_txt} * w);
+    linear(op, img_in_.w, img_in_.b, x, n_img, img);
     linear(op, txt_in_.w, txt_in_.b, tn, n_txt, txt);
 
     const std::size_t nw = std::size_t{n} * w;

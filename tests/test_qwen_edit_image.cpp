@@ -1,5 +1,6 @@
 #include "locus/image/qwen_edit_image.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -9,7 +10,11 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/image/flux_sampler.hpp"
+#include "locus/image/qwen_vae.hpp"
 #include "png_parse.hpp"
+#include "qwen_tiny.hpp"
 
 namespace {
 
@@ -117,5 +122,69 @@ TEST_CASE("qwen edit reference matches the pipeline's preprocessing",
         }
     }
     REQUIRE_THROWS_AS(locus::image::qwen_edit_reference({}),
+                      std::invalid_argument);
+}
+
+// i#614: the reference image's latents, as the pipeline's
+// _encode_vae_image (the posterior's mode, normalized) and
+// _pack_latents (scripts/make-qwen-edit-latents-golden.py): the
+// synthetic VAE of tests/golden/qwen_vae_synth.gguf on a [3][32][24]
+// LCG image, so 8 x 6 latents and 4 x 3 tokens of 16 values.
+TEST_CASE("qwen edit reference latents match the pipeline",
+          "[qwen-edit][image]") {
+    constexpr std::uint32_t kH = 32, kW = 24;
+    const auto ref = read_as<float>(kDir + "golden/qwen_edit_latents.f32");
+    const auto g =
+        locus::gguf::GgufFile::open(kDir + "golden/qwen_vae_synth.gguf");
+    const auto vae = locus::image::QwenVae::load(g);
+    REQUIRE(vae.scale() == 4);
+    std::uint32_t state = 777;
+    auto img = qwen_tiny::lcg(state, std::size_t{3} * kH * kW);
+    for (float& x : img) x *= 4.0f;
+    const auto lat = locus::image::qwen_edit_reference_latents(vae, img, kH,
+                                                               kW);
+    CHECK(lat.rows == 4);
+    CHECK(lat.cols == 3);
+    REQUIRE(lat.tokens.size() == ref.size());
+    double err = 0.0, norm = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        const double d = double{lat.tokens[i]} - ref[i];
+        err += d * d;
+        norm += double{ref[i]} * ref[i];
+    }
+    WARN("error rms " << std::sqrt(err / ref.size()) << ", reference rms "
+                      << std::sqrt(norm / ref.size()));
+    REQUIRE(std::sqrt(err) <= 1e-5 * std::sqrt(norm));
+    // A side that is not a multiple of 2 x the VAE scale is refused.
+    REQUIRE_THROWS_AS(
+        locus::image::qwen_edit_reference_latents(vae, img, kH, kW - 4),
+        std::invalid_argument);
+}
+
+// Qwen-Image-Edit packs its latents with FluxSampler::pack (i#630):
+// QwenImageEditPipeline._pack_latents is FLUX's permutation, and the
+// unpack undoes it.
+TEST_CASE("qwen latents pack and unpack", "[qwen-edit][image]") {
+    using locus::image::FluxSampler;
+    // [2][4][6]: value = channel * 100 + row * 10 + column.
+    constexpr std::uint32_t c = 2, h = 4, w = 6;
+    std::vector<float> z(std::size_t{c} * h * w);
+    for (std::uint32_t ch = 0; ch < c; ++ch) {
+        for (std::uint32_t y = 0; y < h; ++y) {
+            for (std::uint32_t x = 0; x < w; ++x) {
+                z[(std::size_t{ch} * h + y) * w + x] =
+                    static_cast<float>(ch * 100 + y * 10 + x);
+            }
+        }
+    }
+    const auto t = FluxSampler::pack(z, c, h, w);
+    // Token (row 1, column 2) is token 1 * 3 + 2 = 5; its values are
+    // channel 0's 2 x 2 patch at (2, 4), then channel 1's.
+    const std::vector<float> want = {24, 25, 34, 35, 124, 125, 134, 135};
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        CHECK(t[5 * 8 + i] == want[i]);
+    }
+    CHECK(FluxSampler::unpack(t, c, h, w) == z);
+    REQUIRE_THROWS_AS(FluxSampler::pack(z, c, h + 1, w),
                       std::invalid_argument);
 }

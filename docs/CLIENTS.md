@@ -16,7 +16,7 @@ own docs.
 | GET  /v1/models (and /{id})   | OpenAI    | model discovery                             |
 | POST /v1/audio/speech         | OpenAI    | Orpheus-TTS; needs `--audio-decoder`        |
 | POST /v1/images/generations   | OpenAI    | Janus-Pro, PixArt-alpha or FLUX.1           |
-| POST /v1/images/edits         | OpenAI    | FLUX.1 Kontext; JSON body; see Image output |
+| POST /v1/images/edits         | OpenAI    | Qwen-Image-Edit, FLUX.1 Kontext; JSON body  |
 | POST /v1/videos               | OpenAI    | LTX-Video job; see Video output             |
 | GET  /v1/videos/{id}          | OpenAI    | the job: status, progress, error            |
 | GET  /v1/videos/{id}/content  | OpenAI    | the MP4 of a completed job                  |
@@ -107,7 +107,9 @@ runs at a time; a second request while one runs gets a 503 with
 `Retry-After`.
 
 `/v1/images/edits` runs FLUX.1 Kontext dev on a reference image: the
-same character, object or scene, changed as the prompt says. It takes
+same character, object or scene, changed as the prompt says. A FLUX.1
+dev or schnell checkpoint (its GGUF's `flux.kontext` false, written by
+`scripts/convert-flux.py`) does not edit: the route answers 503. It takes
 a JSON body, not OpenAI's multipart form: `image` is a base64 PNG or
 JPEG, or a `data:` URL of one; `prompt`, `steps`, `guidance_scale`,
 `max_sequence_length` and `seed` are as above. Without `size` the
@@ -118,6 +120,31 @@ FluxKontextPipeline does); with it, `size`'s aspect at `size`'s area
 Kontext's training resolutions (about 1M pixels); false keeps its own
 size (floored to 16), which is faster for a small image, and then the
 image may have at most 1024 x 1024 pixels and 2048 a side.
+
+With a Qwen-Image-Edit directory, `/v1/images/edits` runs that model
+instead, as diffusers' QwenImageEditPipeline does: the prompt and the
+reference image go through Qwen2.5-VL with the edit template, the
+reference's VAE latents join the MMDiT's tokens, and the loop runs
+true CFG. The body is the same JSON (`image`, `prompt`, `seed`), plus
+`negative_prompt` (true CFG runs only with one; " " is the usual
+choice), `true_cfg_scale` (default 4, from 0 to 100) and `steps` (2 to
+100, default 50). Without `size` the output keeps the image's aspect
+at about 1024 x 1024 pixels; `size` "WxH" sets it (sides 16 to 2048,
+floored to multiples of 16). Each step runs the MMDiT twice with a
+negative prompt. The reference is encoded at about 1024 x 1024 pixels
+whatever `size` is, as diffusers does; `auto_resize` false (default
+true) encodes it at the output's area when that is smaller (an output
+above 1024 x 1024 keeps the default), so a small edit runs fewer
+tokens per step and the model sees the reference at that resolution.
+A 512 x 512 edit of 20 steps on an M4 Max with the Q8_0 MMDiT
+denoises in 344 s instead of 1104 s (7.9 s per MMDiT pass instead of
+24.6 s). The directory holds four GGUFs:
+`scripts/convert-qwen-image.py`'s transformer and VAE (`--dit-out`,
+`--vae-out`), and llama.cpp's Qwen2.5-VL-7B-Instruct language model
+(with its tokenizer) and mmproj. The language model runs on the CPU;
+the MMDiT and the VAE run on the GPU where it maps host memory. The
+start noise is locus's seeded sampler, not torch's, so a seed gives
+a different (but repeatable) image than diffusers.
 
 FLUX requests (generations and edits) can apply LoRAs from the
 server's `--lora-dir`, a directory of GGUFs from
@@ -253,10 +280,11 @@ reply cut at the server's cap as an error, so raise the cap too
 (`--max-tokens 8192`). Codex logs that it cannot decode the
 `/v1/models` reply (it expects its own catalog format) and then uses
 default model metadata; that is harmless. A streamed request with
-tools sends nothing until the reply is complete, and Codex reconnects
-when the stream stays silent for a few minutes (it did at 4.5 minutes,
-while a 30B MoE prefilled those 22k tokens on an M2 Pro). On slow
-hardware add `stream_idle_timeout_ms = 1800000` to the provider.
+tools sends no events until the reply is complete; Codex reconnects
+when a stream stays silent for a few minutes (it did at 4.5 minutes,
+while a 30B MoE prefilled those 22k tokens on an M2 Pro), so locus
+sends an SSE comment (`: keepalive`) after every 15 s of silence
+(`--sse-keepalive S`, 0 = off).
 
 ### Google Antigravity SDK
 
@@ -301,7 +329,9 @@ Agent CLIs (Copilot CLI, Claude Code, Codex, Aider) drive a tool loop, so
 they need streaming and tool calling. locus recognizes a tool call
 only from the whole completion, so a streamed request with `tools` is
 buffered: the call (or the text) arrives in the final chunk, and the
-client never sees raw tool JSON as incremental content.
+client never sees raw tool JSON as incremental content. Until then the
+stream carries SSE comments (`: keepalive`, every 15 s of silence),
+which clients ignore.
 
 locus renders the tool list into a system instruction and parses the
 completion (best effort); it has no native structured function

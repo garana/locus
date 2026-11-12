@@ -89,10 +89,22 @@ Correctness first, then CPU throughput, then GPU.
 - Admission: a request is admitted when the allocator can cover its
   prompt blocks plus a decode headroom.
 - Preemption, when the pool runs dry: evict the newest sequence and
-  recompute it later (recompute, not swap to host).
-- Fairness: first come, first served, with a cap on prefill tokens per
-  iteration (chunked prefill), so long prompts do not starve decoding
-  sequences.
+  recompute it later (recompute, not swap to host); with a disk tier,
+  its full blocks are written there and read back on readmission.
+- Fairness: admission is first come, first served, with a cap on
+  prefill tokens per iteration (chunked prefill). Within it the prompt
+  with the shortest remainder is fed first, so a short prompt behind a
+  long one does not wait for the whole long prefill (a prompt unfed for
+  two prefill iterations goes first, so short ones cannot starve a long
+  one), and each prompt
+  is fed in the chunks it gets alone (the whole cap, then its
+  remainder), which keeps its output independent of the batch. A
+  prompt resumed from a cached prefix (the RAM cache, or the disk tier,
+  also after a preemption) is fed from the prefix's end, so its chunks
+  match an uncached run's only when the block size divides the cap and
+  the prefix ends on a chunk boundary. While
+  a sequence decodes, every other iteration feeds no prompt, so long
+  prompts do not starve decoding sequences.
 
 ### 4.3 Backend interface
 
@@ -206,12 +218,18 @@ a registration at a router's own address cannot loop. An instance
 lists its kinds in
 `/v1/models` (`locus_kinds`), which the router reads at start and
 every `--refresh-ms`; a request that names a listed model goes to that
-instance. Buffered replies are forwarded whole; a chunked one (SSE)
-streams through, and a client that leaves closes the upstream
-connection, so the instance stops the work. An instance that stays
-silent longer than the read timeout fails the request: 60 s for text,
-and for image, speech and video `--media-timeout` (30 minutes by
-default), since a buffered image sends nothing until it is done.
+instance. Image edits (`image-edit`: FLUX.1 Kontext, Qwen-Image-Edit)
+are a kind apart from generations (`image`), so an edit-only instance
+gets no generation; while no instance lists `image-edit` (older
+servers), edits go to `image` instances. Buffered replies are
+forwarded whole; a chunked one (SSE) streams through, and a client
+that leaves closes the upstream connection, so the instance stops the
+work. An instance that stays
+silent longer than the read timeout fails the request:
+`--media-timeout` for image, speech and video and `--text-timeout` for
+the rest, 30 minutes each by default, since a buffered image or chat
+sends nothing until it is done and a stream nothing during its
+prefill.
 With several instances of a kind, a session key (the client's own, or
 a hash of the system prompt and first user turn) orders them by
 rendezvous hashing, so a conversation keeps its instance's prefix
@@ -362,7 +380,8 @@ device memory still runs.
   on a second stream. The model calls it at the same sites as the
   `madvise` hints, with the same `Mat` (same host pointer, the page
   table key) that the later matvec uses.
-- MoE hybrid (CUDA, opt-in `LOCUS_MOE_HYBRID=1`): only the routed
+- MoE hybrid (CUDA; on by default when the model's weights exceed
+  90% of the pool, `LOCUS_MOE_HYBRID=0` off, `=1` on): only the routed
   experts in a hot zone run on the GPU; the other picks run on the
   best CPU backend at the same time, on a second thread. The hot
   zone is a step WLRU over every (layer, expert) of the model: one
@@ -561,7 +580,8 @@ bitwise unchanged (a single end-of-row reduction would differ: float
 addition is not associative).
 
 `Ops::matvec_batch` is the hook. Kernels exist for Q4_K and Q6_K on
-sse4 and neon, and on CUDA (one launch for all N tokens). A backend
+sse4 and neon, and on CUDA (one launch for up to 32 tokens) for Q4_K,
+Q5_K, Q6_K, Q8_0, IQ4_NL and IQ4_XS. A backend
 kernel that covers only some types falls back to N calls of the same
 backend's matvec, never the scalar reference, so its batched and
 per-token paths agree.
@@ -613,14 +633,21 @@ guarding the default path.
   wrong prefix. A disk tier (`--prefix-cache-dir`, i#416) keeps one
   file per prefix with the full key (the model's GGUF header, size and
   mtime, the backend and device, the KV geometry, RoPE settings and
-  the numeric modes that change KV bits; MoE models on a GPU, whose
-  expert route follows free device memory, are refused), the tokens
+  the numeric modes that change KV bits, and on Vulkan whether the MoE
+  experts run on the GPU, settled once the KV pool exists; MoE models
+  on CUDA, whose expert split follows free device memory, are
+  refused), the tokens
   and a checksum per block, so a mismatch or a torn file reads as a
   miss; a byte cap evicts the least recently used file. Entries
   evicted from RAM are written back by a worker thread, and the rest
   at shutdown; a prompt whose prefix is at least one block longer on
   disk waits in a LOADING state while the worker reads it into its
-  blocks, and the engine keeps stepping the other requests.
+  blocks, and the engine keeps stepping the other requests. A
+  preempted sequence writes its full blocks (prompt and output so far,
+  keyed by those tokens) to the disk tier too; on readmission it loads
+  them the same way and recomputes only the tail (i#621). Blocks past
+  the write backlog are written at preemption from the pool, so the
+  step waits for the disk instead of a long recompute later (i#642).
 - Speculative decoding: prompt lookup (no draft model). An n-gram
   match against the context proposes drafts, verified in one batched
   forward; the longest correct prefix is accepted. Greedy only, so
@@ -669,7 +696,12 @@ guarding the default path.
   longer one on the GPU. On an M2 Pro that makes 32 inputs of 120
   tokens 3.9x faster with bge-m3 (18.2 s to 4.7 s), 3.7x with nomic
   v1.5 and 1.5x with bge-small, and a 50-document rerank 3.1x (12.8 s
-  to 4.1 s). CUDA and other Vulkan GPUs: #519. Otherwise
+  to 4.1 s). Elsewhere, with a usable CUDA device, those passes run
+  on the CUDA ops: the matrices through the batched CUDA matvec, each
+  weight read once per 32 tokens, and the attention on the CPU, since
+  dense::attention keeps a GPU that caches weights by host pointer
+  off its temporary buffers. The image classifier's convs stay on
+  Vulkan only. Other Vulkan GPUs: #519. Otherwise
   `/v1/embeddings` returns the chat model's last token's final-normed
   hidden state, L2-normalized, on a dedicated cache; CPU and CUDA
   backends only (`TransformerModel::embed` refuses vulkan).
@@ -771,8 +803,8 @@ guarding the default path.
   also runs on the GPU for GQA models. MLA already shrinks the KV
   cache, so its quantized path is low priority (#63).
 - More architectures and quant types: qwen2moe, qwen3moe, dbrx, glm-
-  dsa, muse-spark, deepseek41; ternary TQ1_0 / TQ2_0 and the IQ
-  family.
+  dsa, muse-spark, deepseek41, kolibri1; ternary TQ1_0 / TQ2_0 and
+  the IQ family.
 - Multi-GPU weight sharding (#62): shard the streamed weight window
   across the GPUs of one host. Needs multi-GPU hardware.
 

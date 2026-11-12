@@ -55,11 +55,12 @@ std::uint64_t env_u64(const char* name, std::uint64_t def) {
 }  // namespace
 
 /**
- * LOCUS_MOE_HYBRID=1 (i#252): in decode and batched prefill, the
- * routed experts in the step WLRU hot zone (ExpertCache) run on the
- * GPU backend while the
- * other picks run on the best CPU backend at the same time. Only a
- * promotion uploads an expert; a demotion frees it (Ops.evict).
+ * The MoE hybrid (i#252): in decode and batched prefill, the routed
+ * experts in the step WLRU hot zone (ExpertCache) run on the GPU
+ * backend while the other picks run on the best CPU backend at the
+ * same time. Only a promotion uploads an expert; a demotion frees it
+ * (Ops.evict). On when moe_hybrid_on() says so: by default where the
+ * weights do not fit the pool (i#652), or forced by LOCUS_MOE_HYBRID.
  *
  * The hot zone holds LOCUS_MOE_HYBRID_SLOTS experts when set, else
  * what fits in 90% of the GPU weight pool after the non-expert
@@ -98,6 +99,39 @@ struct MoeHybrid {
 
 bool weights_stream(std::uint64_t weight_bytes, std::uint64_t ram_bytes) {
     return ram_bytes == 0 || weight_bytes > ram_bytes / 2;
+}
+
+std::uint64_t stage_weight_bytes(const gguf::GgufFile& g,
+                                 std::uint32_t layer_begin,
+                                 std::uint32_t layer_end,
+                                 std::uint32_t n_layers) {
+    const bool first = layer_begin == 0;
+    const bool last = layer_end >= n_layers;
+    const bool tied = g.find_tensor("output.weight") == nullptr;
+    std::uint64_t bytes = 0;
+    // Every shard of a split model, not only the first file's tensors.
+    g.for_each_file([&](const gguf::GgufFile& f) {
+        for (const gguf::TensorInfo& t : f.tensors()) {
+            bool mine;
+            std::uint32_t l = 0;
+            const char* s = t.name.c_str();
+            if (t.name.rfind("blk.", 0) == 0 &&
+                std::sscanf(s + 4, "%u", &l) == 1) {
+                // Past n_layers (a next-token head's blocks): the last
+                // stage.
+                mine = l < n_layers ? l >= layer_begin && l < layer_end
+                                    : last;
+            } else if (t.name == "token_embd.weight") {
+                mine = first || (last && tied);
+            } else {
+                mine = last;  // the output norm and head
+            }
+            if (mine) {
+                bytes += t.nbytes;
+            }
+        }
+    });
+    return bytes;
 }
 
 namespace {
@@ -206,6 +240,11 @@ backend::Ops effective_ops(const backend::Backend* b, bool q8k) {
 
 bool TransformerModel::q8k_activations() const {
     return q8k_activations_for(backend_);
+}
+
+bool TransformerModel::experts_on_gpu() const {
+    return hp_.n_expert > 0 && backend_->name == "vulkan" &&
+           backend::vulkan_moe_gpu_route(*this);
 }
 
 bool TransformerModel::q8k_activations_for(const backend::Backend* b) const {
@@ -364,10 +403,11 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     m.spec_ = spec;
     m.file_backed_ = g.file_backed();
     std::uint64_t weight_bytes = 0;
-    for (const TensorInfo& t : g.tensors()) {
-        weight_bytes += t.nbytes;
-    }
-    m.weight_bytes_ = weight_bytes;
+    g.for_each_file([&](const GgufFile& f) {  // every shard
+        for (const TensorInfo& t : f.tensors()) {
+            weight_bytes += t.nbytes;
+        }
+    });
     m.advise_weights_ = readahead_enabled() &&
                         weights_stream(weight_bytes, sys::total_ram_bytes());
     Hparams& hp = m.hp_;
@@ -419,6 +459,8 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     }
     m.layer_begin_ = layer_begin;
     m.layer_end_ = layer_end;
+    m.weight_bytes_ =
+        stage_weight_bytes(g, layer_begin, layer_end, hp.n_layers);
     // A stage maps only the model-level weights it runs (i#29): the
     // embedding on the first stage, the output norm and head on the
     // last. A tied head is the embedding, so a last stage keeps it.
@@ -1220,7 +1262,8 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                 "an M-RoPE arch");
         }
         if (backend_->name == "vulkan" || backend_->ops.self_parallel ||
-            spec_->plain_attention || spec_->forward != nullptr) {
+            (spec_->plain_attention && !spec_->qwen2_attention) ||
+            spec_->forward != nullptr) {
             throw std::invalid_argument(
                 "forward_batch: mrope runs on a CPU backend only");
         }
@@ -1328,8 +1371,11 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
     std::vector<float> xb2(static_cast<std::size_t>(n) * E);
     std::vector<float> gate(static_cast<std::size_t>(n) * ff);
     std::vector<float> up(static_cast<std::size_t>(n) * ff);
-    // Batched attention projections (plain llama attention, F32 cache).
-    const bool plain = spec_->plain_attention && !cache.quantized();
+    // Batched attention projections (plain llama attention, or qwen2's
+    // with its biases and NEOX / M-RoPE; F32 cache).
+    const bool qwen2 = spec_->qwen2_attention;
+    const bool plain =
+        (spec_->plain_attention || qwen2) && !cache.quantized();
     const std::uint32_t hd = hp_.head_dim;
     const std::size_t kv_dim = std::size_t{hp_.n_kv_heads} * hd;
     const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
@@ -1369,6 +1415,19 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
             matvec_batch(op, lay.wq, xbf, qb, n);
             matvec_batch(op, lay.wk, xbf, kb, n);
             matvec_batch(op, lay.wv, xbf, vb, n);
+            // qwen2: the biases after the projections, as
+            // qwen2moe_attention adds them.
+            auto add_bias = [n](std::vector<float>& d,
+                                std::span<const float> b) {
+                if (b.empty()) return;
+                for (std::uint32_t t = 0; t < n; ++t) {
+                    float* r = d.data() + std::size_t{t} * b.size();
+                    for (std::size_t i = 0; i < b.size(); ++i) r[i] += b[i];
+                }
+            };
+            add_bias(qb, lay.wq_bias);
+            add_bias(kb, lay.wk_bias);
+            add_bias(vb, lay.wv_bias);
             for (std::uint32_t t = 0; t < n; ++t) {
                 const std::uint32_t pos = base + t;
                 const std::span<float> q(qb.data() + std::size_t{t} * E, E);
@@ -1378,10 +1437,27 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                             krow);
                 std::copy_n(vb.data() + std::size_t{t} * kv_dim, kv_dim,
                             vrow);
-                backend::rope_norm(q, hp_.n_heads, hd, pos,
-                                   hp_.rope_freq_base, rope_factors());
-                backend::rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd, pos,
-                                   hp_.rope_freq_base, rope_factors());
+                const std::span<float> k(krow, kv_dim);
+                if (!qwen2) {
+                    backend::rope_norm(q, hp_.n_heads, hd, pos,
+                                       hp_.rope_freq_base, rope_factors());
+                    backend::rope_norm(k, hp_.n_kv_heads, hd, pos,
+                                       hp_.rope_freq_base, rope_factors());
+                } else if (!mrope.empty() && hp_.rope_sections[0] != 0) {
+                    backend::rope_mrope(q, hp_.n_heads, hd, mrope[t].data(),
+                                        hp_.rope_sections,
+                                        hp_.rope_freq_base);
+                    backend::rope_mrope(k, hp_.n_kv_heads, hd,
+                                        mrope[t].data(), hp_.rope_sections,
+                                        hp_.rope_freq_base);
+                } else {
+                    backend::rope_neox_yarn(q, hp_.n_heads, hd, pos,
+                                            hp_.rope_freq_base,
+                                            backend::Yarn{});
+                    backend::rope_neox_yarn(k, hp_.n_kv_heads, hd, pos,
+                                            hp_.rope_freq_base,
+                                            backend::Yarn{});
+                }
             }
             cache.sync_rows(seq, l, base, n);
             // Every row is stored, so all (token, head) pairs attend in
@@ -2165,17 +2241,35 @@ void TransformerModel::apply_norm(std::span<const float> x,
     }
 }
 
+bool moe_hybrid_wanted(const char* env, bool pooled, std::uint64_t weights,
+                       std::uint64_t room) {
+    if (!pooled) {
+        return false;
+    }
+    if (env != nullptr && *env != '\0') {
+        return std::string_view(env) != "0";
+    }
+    return weights > room;
+}
+
+bool TransformerModel::moe_hybrid_on() const {
+    return moe_hybrid() != nullptr;
+}
+
 MoeHybrid* TransformerModel::moe_hybrid() const {
     MoeHybrid* h = moe_hybrid_.get();
     if (h == nullptr) {
         return nullptr;
     }
     std::call_once(h->once, [&] {
-        const char* on = std::getenv("LOCUS_MOE_HYBRID");
+        // Decided once, with the hot zone: the pool budget follows the
+        // free VRAM, so a second look could disagree.
         const backend::Ops& op = backend_->ops;
-        if (on == nullptr || *on == '\0' || std::string_view(on) == "0" ||
-            op.prefetch == nullptr || op.evict == nullptr ||
-            op.pool_budget == nullptr) {
+        const bool pooled = op.prefetch != nullptr && op.evict != nullptr &&
+                            op.pool_budget != nullptr;
+        if (!moe_hybrid_wanted(std::getenv("LOCUS_MOE_HYBRID"), pooled,
+                               weight_bytes_,
+                               pooled ? op.pool_budget() / 10 * 9 : 0)) {
             return;
         }
         std::uint32_t n_moe = 0;

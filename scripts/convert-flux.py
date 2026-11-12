@@ -90,7 +90,9 @@ def finish(w):
     w.close()
 
 
-def write_dit(path, mdir, q8):
+def write_dit(path, mdir, q8, kontext):
+    """kontext: the pipeline is FluxKontextPipeline (trained to edit a
+    reference image); written as flux.kontext (i#648)."""
     t = config(mdir / "transformer")
     s = json.loads((mdir / "scheduler" /
                     "scheduler_config.json").read_text())
@@ -146,6 +148,9 @@ def write_dit(path, mdir, q8):
     w.add_uint32(k + "joint_attention_dim", t["joint_attention_dim"])
     w.add_uint32(k + "pooled_projection_dim", t["pooled_projection_dim"])
     w.add_bool(k + "guidance_embeds", guidance)
+    # Kontext and FLUX.1 dev share their tensors; only the pipeline's
+    # class tells them apart, and only Kontext edits.
+    w.add_bool(k + "kontext", kontext)
     w.add_uint32(k + "timestep.channels", 256)
     w.add_float32(k + "rope.theta", 10000.0)
     w.add_array(k + "rope.axes", axes)
@@ -306,7 +311,8 @@ def main():
     if idx.get("_class_name") not in ("FluxPipeline", "FluxKontextPipeline"):
         sys.exit("expected a FluxPipeline or FluxKontextPipeline directory")
     if a.dit_out:
-        write_dit(pathlib.Path(a.dit_out), mdir, a.dit_type == "q8_0")
+        write_dit(pathlib.Path(a.dit_out), mdir, a.dit_type == "q8_0",
+                  idx.get("_class_name") == "FluxKontextPipeline")
     if a.clip_out:
         write_clip(pathlib.Path(a.clip_out), mdir)
     if a.vae_out:

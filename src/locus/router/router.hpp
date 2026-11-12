@@ -41,11 +41,13 @@ enum class Kind {
     kVideo,
     kSpeech,
     kRerank,
-    kClassify
+    kClassify,
+    /** /v1/images/edits (i#633); kImage is /v1/images/generations. */
+    kImageEdit
 };
 
 /** @returns the wire name: text, image-to-text, image, video, speech,
- *  rerank, classify. */
+ *  rerank, classify, image-edit. */
 std::string_view kind_name(Kind k);
 /** @returns the kind for a wire name, or nullopt. */
 std::optional<Kind> parse_kind(std::string_view name);
@@ -186,8 +188,13 @@ struct RouterConfig {
     http::ClientOptions upstream;
     /** The read timeout of image, speech and video requests (ms; 0 = no
      *  limit): a buffered image sends nothing until it is done, which on
-     *  the CPU takes minutes (i#605). The other kinds use upstream's. */
+     *  the CPU takes minutes (i#605). */
     int media_read_timeout_ms = 30 * 60 * 1000;
+    /** The read timeout of every other request (ms; 0 = no limit): a
+     *  buffered chat sends nothing until its reply is done, and a
+     *  streamed one nothing during its prefill, both minutes on a CPU
+     *  (i#610). A dead instance is caught by the health polls. */
+    int text_read_timeout_ms = 30 * 60 * 1000;
     int worker_threads = 16;
 
     /** Client keys: when set, every request but /health needs a key

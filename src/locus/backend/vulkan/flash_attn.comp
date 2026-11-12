@@ -1,0 +1,219 @@
+#version 450
+
+// Unmasked multi-head attention in one pass (flash attention, i#640):
+// out[t][h] = softmax(q[t][h] . k[j][h] * scale over j) v[j][h], for
+// the image transformers' joint attention. One workgroup takes BR
+// queries of one head and streams the keys and values in tiles of BC:
+// the score tile goes through registers and shared memory only, with
+// the softmax kept online (running row max m and sum l, the output
+// rescaled when m grows), so neither the score matrix nor a softmax
+// pass touches memory.
+//
+// Q, K, V and out are token-major rows: element d of head h of token t
+// at *_off + t * *_stride + h * hd + d (floats). Offsets and strides
+// are multiples of 4 and hd is a multiple of 4 up to 128 (the host
+// checks), so rows load as vec4s.
+//
+// 16 x RT threads: thread (ty, tx) owns the score block of rows
+// ty * 4 .. + 3 by keys tx * 4 .. + 3, and the output block of the
+// same rows by columns tx * 8 .. + 7. SMALL halves the query block
+// and the stages so the shared memory fits 16 KiB (V3D).
+#ifdef SMALL
+#define RT 8u
+#define BK 16u
+#define VC 8u
+#else
+#define RT 16u
+#define BK 32u
+#define VC 16u
+#endif
+// Rows per thread. 8 (64 accumulators plus 32 scores) spills: 3.3x
+// slower on the M4 Max.
+#define TR 4u
+#define TR4 (TR / 4u)
+#define NT (16u * RT)  // threads
+// BR, HD_MAX and the shared block must match VulkanContext's
+// kFlashAttnRows / kFlashAttnRowsSmall / kFlashAttnHdMax and
+// flash_shared_bytes (context.hpp, context.cpp).
+#define BR (TR * RT)   // queries per workgroup
+#define BC 64u         // keys per tile
+#define HD_MAX 128u
+
+layout(local_size_x = NT) in;
+
+layout(std430, binding = 0) readonly buffer Q { vec4 q4[]; };
+layout(std430, binding = 1) readonly buffer K { vec4 k4[]; };
+layout(std430, binding = 2) readonly buffer V { vec4 v4[]; };
+layout(std430, binding = 3) writeonly buffer O { vec4 o4[]; };
+
+layout(push_constant) uniform PC {
+    uint n_q;
+    uint n_kv;
+    uint hd;
+    uint q_off;
+    uint q_stride;
+    uint k_off;
+    uint k_stride;
+    uint v_off;
+    uint v_stride;
+    uint o_off;
+    uint o_stride;
+    float scale;  // 1 / sqrt(hd) * log2(e): the softmax runs in exp2
+} pc;
+
+// Region A: the Q and K stages ([BK][BR] and [BK][BC], d-major), then
+// the probability tile P ([BC][BR], key-major). Region B: the row
+// reductions ([BR][16]), then the V stage ([VC][HD_MAX]).
+#define A_Q 0u
+#define A_K (BK * BR / 4u)
+#define A_VEC4 max(BK * (BR + BC), BC * BR) / 4u
+#define B_VEC4 max(BR * 16u, VC * HD_MAX) / 4u
+shared vec4 sa[A_VEC4];
+shared vec4 sb[B_VEC4];
+
+void red_put(uint row, uint tx, float v) {
+    uint at = row * 16u + tx;
+    sb[at / 4u][at % 4u] = v;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ty = tid / 16u, tx = tid % 16u;
+    uint h = gl_WorkGroupID.y;
+    uint t0 = gl_WorkGroupID.x * BR;
+    uint hd4 = pc.hd / 4u;
+    uint hoff = h * pc.hd;
+
+    vec4 acc[TR][2];
+    float m[TR], l[TR];
+    for (uint i = 0u; i < TR; ++i) {
+        acc[i][0] = vec4(0.0);
+        acc[i][1] = vec4(0.0);
+        m[i] = -1.0 / 0.0;
+        l[i] = 0.0;
+    }
+
+    for (uint j0 = 0u; j0 < pc.n_kv; j0 += BC) {
+        // S = Q K^T over d, BK columns per stage.
+        vec4 s[TR];
+        for (uint i = 0u; i < TR; ++i) s[i] = vec4(0.0);
+        for (uint d0 = 0u; d0 < pc.hd; d0 += BK) {
+            barrier();
+            // BR rows x BK / 4 vec4s of Q, then BC rows of K.
+            for (uint idx = tid; idx < (BR + BC) * (BK / 4u); idx += NT) {
+                // Rows fastest: consecutive threads store consecutive
+                // floats of a stage row (no shared-memory bank clash).
+                uint c4 = idx / (BR + BC);
+                uint r = idx % (BR + BC);
+                uint d4 = d0 / 4u + c4;
+                vec4 v = vec4(0.0);
+                uint base;
+                if (r < BR) {
+                    uint t = t0 + r;
+                    if (t < pc.n_q && d4 < hd4) {
+                        v = q4[(pc.q_off + t * pc.q_stride + hoff) / 4u +
+                               d4];
+                    }
+                    base = A_Q;
+                } else {
+                    r -= BR;
+                    uint j = j0 + r;
+                    if (j < pc.n_kv && d4 < hd4) {
+                        v = k4[(pc.k_off + j * pc.k_stride + hoff) / 4u +
+                               d4];
+                    }
+                    base = A_K;
+                }
+                uint w = (base == A_Q) ? BR / 4u : BC / 4u;
+                for (uint e = 0u; e < 4u; ++e) {
+                    sa[base + (c4 * 4u + e) * w + r / 4u][r % 4u] = v[e];
+                }
+            }
+            barrier();
+            for (uint k = 0u; k < BK; ++k) {
+                vec4 b = sa[A_K + k * (BC / 4u) + tx];
+                for (uint g = 0u; g < TR4; ++g) {
+                    vec4 a = sa[A_Q + k * (BR / 4u) + ty * TR4 + g];
+                    for (uint i = 0u; i < 4u; ++i) s[g * 4u + i] += a[i] * b;
+                }
+            }
+        }
+
+        // Scale into log2 units; keys past n_kv get no weight.
+        float mt[TR];
+        for (uint i = 0u; i < TR; ++i) {
+            s[i] *= pc.scale;
+            for (uint c = 0u; c < 4u; ++c) {
+                if (j0 + tx * 4u + c >= pc.n_kv) s[i][c] = -1.0 / 0.0;
+            }
+            mt[i] = max(max(s[i].x, s[i].y), max(s[i].z, s[i].w));
+        }
+        barrier();  // the stage reads are done: region A is P's now
+        for (uint i = 0u; i < TR; ++i) red_put(ty * TR + i, tx, mt[i]);
+        barrier();
+        vec4 p[TR];
+        for (uint i = 0u; i < TR; ++i) {
+            uint at = (ty * TR + i) * 4u;
+            vec4 r = max(max(sb[at], sb[at + 1u]),
+                         max(sb[at + 2u], sb[at + 3u]));
+            float mn = max(m[i], max(max(r.x, r.y), max(r.z, r.w)));
+            float alpha = exp2(m[i] - mn);
+            m[i] = mn;
+            p[i] = exp2(s[i] - mn);
+            l[i] = l[i] * alpha + (p[i].x + p[i].y + p[i].z + p[i].w);
+            acc[i][0] *= alpha;
+            acc[i][1] *= alpha;
+        }
+        for (uint c = 0u; c < 4u; ++c) {
+            for (uint g = 0u; g < TR4; ++g) {
+                sa[(tx * 4u + c) * (BR / 4u) + ty * TR4 + g] =
+                    vec4(p[g * 4u][c], p[g * 4u + 1u][c], p[g * 4u + 2u][c],
+                         p[g * 4u + 3u][c]);
+            }
+        }
+
+        // O += P V, VC keys of V per stage.
+        for (uint jj0 = 0u; jj0 < BC; jj0 += VC) {
+            barrier();  // P written, the reductions / last stage read
+            for (uint idx = tid; idx < VC * (HD_MAX / 4u); idx += NT) {
+                uint r = idx / (HD_MAX / 4u);
+                uint d4 = idx % (HD_MAX / 4u);
+                uint j = j0 + jj0 + r;
+                vec4 v = vec4(0.0);
+                if (j < pc.n_kv && d4 < hd4) {
+                    v = v4[(pc.v_off + j * pc.v_stride + hoff) / 4u + d4];
+                }
+                sb[idx] = v;
+            }
+            barrier();
+            for (uint jj = 0u; jj < VC; ++jj) {
+                vec4 v0 = sb[jj * (HD_MAX / 4u) + tx * 2u];
+                vec4 v1 = sb[jj * (HD_MAX / 4u) + tx * 2u + 1u];
+                for (uint g = 0u; g < TR4; ++g) {
+                    vec4 pv = sa[(jj0 + jj) * (BR / 4u) + ty * TR4 + g];
+                    for (uint i = 0u; i < 4u; ++i) {
+                        acc[g * 4u + i][0] += pv[i] * v0;
+                        acc[g * 4u + i][1] += pv[i] * v1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Each thread summed its own keys: add the 16 partial sums per row.
+    barrier();
+    for (uint i = 0u; i < TR; ++i) red_put(ty * TR + i, tx, l[i]);
+    barrier();
+    for (uint i = 0u; i < TR; ++i) {
+        uint t = t0 + ty * TR + i;
+        if (t >= pc.n_q) continue;
+        uint at = (ty * TR + i) * 4u;
+        vec4 r = sb[at] + sb[at + 1u] + sb[at + 2u] + sb[at + 3u];
+        float inv = 1.0 / (r.x + r.y + r.z + r.w);
+        uint ob = (pc.o_off + t * pc.o_stride + hoff) / 4u;
+        for (uint c = 0u; c < 2u; ++c) {
+            uint d4 = tx * 2u + c;
+            if (d4 < hd4) o4[ob + d4] = acc[i][c] * inv;
+        }
+    }
+}

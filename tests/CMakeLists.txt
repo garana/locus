@@ -115,6 +115,7 @@ add_executable(locus_tests
     test_qwen_mrope.cpp
     test_dsa.cpp
     test_muse_spark.cpp
+    test_kolibri1.cpp
     test_codec.cpp
     test_snac.cpp
     test_vq16.cpp
@@ -125,6 +126,8 @@ add_executable(locus_tests
     test_qwen_vision.cpp
     test_qwen_edit_text.cpp
     test_qwen_edit_image.cpp
+    test_qwen_edit_denoise.cpp
+    test_qwen_edit_pipeline.cpp
     test_resnet.cpp
     test_inception.cpp
     test_png.cpp

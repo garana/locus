@@ -25,6 +25,7 @@
 #include "locus/router/router.hpp"
 #include "locus/server/server.hpp"
 #include "locus/tok/tokenizer.hpp"
+#include "router_cli.hpp"
 
 using locus::http::Client;
 using locus::http::ClientRequest;
@@ -212,7 +213,7 @@ TEST_CASE("router: request kinds by path and body", "[router]") {
                R"({"messages":[{"role":"user","content":"type image"}],
                   "tools":[{"type":"image"}]})") == Kind::kText);
     CHECK(kind("/v1/images/generations") == Kind::kImage);
-    CHECK(kind("/v1/images/edits") == Kind::kImage);
+    CHECK(kind("/v1/images/edits") == Kind::kImageEdit);
     CHECK(kind("/v1/videos") == Kind::kVideo);
     CHECK(kind("/v1/videos/video_1/content") == Kind::kVideo);
     CHECK(kind("/v1/audio/speech") == Kind::kSpeech);
@@ -223,6 +224,8 @@ TEST_CASE("router: request kinds by path and body", "[router]") {
     CHECK(kind("/v1/classify") == Kind::kClassify);
     CHECK(locus::router::kind_name(Kind::kClassify) == "classify");
     CHECK(locus::router::parse_kind("classify") == Kind::kClassify);
+    CHECK(locus::router::kind_name(Kind::kImageEdit) == "image-edit");
+    CHECK(locus::router::parse_kind("image-edit") == Kind::kImageEdit);
     // Embeddings stay text; the flag lets a classify instance take them.
     CHECK(kind("/v1/embeddings") == Kind::kText);
     CHECK(classify("/v1/embeddings", "")->embeddings);
@@ -315,6 +318,43 @@ TEST_CASE("router: proxies each kind to its instance", "[router]") {
     }
 }
 
+// i#633: an edit-only instance (Qwen-Image-Edit) lists image-edit, a
+// generation-only one (PixArt) image, and each route goes to its own;
+// a fleet of servers from before image-edit sends edits to "image".
+TEST_CASE("router: image edits and generations go apart", "[router]") {
+    SECTION("an edit-only and a generation-only instance") {
+        FakeInstance edit("edit", {"text", "image-edit"}, "qwen-edit");
+        FakeInstance gen("gen", {"text", "image"}, "pixart");
+        RouterFixture rf({edit.addr(), gen.addr()});
+        for (int k = 0; k < 4; ++k) {  // not one lucky pick
+            auto r = rf.post("/v1/images/edits", {{"prompt", "purple"}});
+            REQUIRE(r.ok);
+            CHECK(r.body.rfind("edit /v1/images/edits", 0) == 0);
+            r = rf.post("/v1/images/generations", {{"prompt", "a cat"}});
+            REQUIRE(r.ok);
+            CHECK(r.body.rfind("gen /v1/images/generations", 0) == 0);
+        }
+    }
+    SECTION("servers that list only image take edits too") {
+        FakeInstance old("old", {"text", "image"}, "flux");
+        RouterFixture rf({old.addr()});
+        auto r = rf.post("/v1/images/edits", {{"prompt", "purple"}});
+        REQUIRE(r.ok);
+        CHECK(r.head.status == 200);
+        CHECK(r.body.rfind("old /v1/images/edits", 0) == 0);
+    }
+    SECTION("once one lists image-edit, image-only ones get no edits") {
+        FakeInstance edit("edit", {"image-edit"}, "qwen-edit");
+        FakeInstance gen("gen", {"image"}, "pixart");
+        RouterFixture rf({gen.addr(), edit.addr()});
+        for (int k = 0; k < 4; ++k) {
+            const auto r = rf.post("/v1/images/edits", {{"prompt", "x"}});
+            REQUIRE(r.ok);
+            CHECK(r.body.rfind("edit /v1/images/edits", 0) == 0);
+        }
+    }
+}
+
 // i#583: a CNN classifier instance (locus-server --image-classifier)
 // takes /v1/classify, and /v1/embeddings under its model's name.
 TEST_CASE("router: classify and image embeddings go to a classify instance",
@@ -352,7 +392,7 @@ TEST_CASE("router: media requests get their own read timeout", "[router]") {
     FakeInstance slow("slow", {"text", "image", "speech"}, "m");
     slow.delay_ms = 400;
     RouterConfig cfg;
-    cfg.upstream.read_timeout_ms = 150;
+    cfg.text_read_timeout_ms = 150;
     cfg.media_read_timeout_ms = 3000;
     RouterFixture rf({slow.addr()}, cfg);
 
@@ -367,6 +407,53 @@ TEST_CASE("router: media requests get their own read timeout", "[router]") {
     r = rf.post("/v1/completions", {{"prompt", "x"}});
     REQUIRE(r.ok);
     CHECK(r.head.status != 200);
+}
+
+// i#610: a text reply can be as slow as an image (a buffered chat on a
+// CPU, a long prefill), so text has its own read timeout, long by
+// default; upstream's (the polls' base options) no longer applies.
+TEST_CASE("router: slow text replies get the text read timeout",
+          "[router]") {
+    FakeInstance slow("slow", {"text"}, "m");
+    slow.delay_ms = 400;
+    RouterConfig cfg;
+    cfg.upstream.read_timeout_ms = 150;
+    REQUIRE(cfg.text_read_timeout_ms == 30 * 60 * 1000);
+    RouterFixture rf({slow.addr()}, cfg);
+    auto r = rf.post("/v1/chat/completions",
+                     {{"messages", json::array({{{"role", "user"},
+                                                 {"content", "hi"}}})}});
+    REQUIRE(r.ok);
+    CHECK(r.head.status == 200);
+    CHECK(r.body.rfind("slow /v1/chat/completions", 0) == 0);
+    r = rf.post("/v1/completions", {{"prompt", "x"}});
+    REQUIRE(r.ok);
+    CHECK(r.head.status == 200);
+}
+
+// The two read timeouts' flags: seconds, 0 to 86400.
+TEST_CASE("router: --text-timeout and --media-timeout parse", "[router]") {
+    const auto parse = [](std::vector<std::string> args,
+                          RouterConfig& cfg) {
+        args.push_back("127.0.0.1:9");  // an instance, required
+        std::vector<char*> argv;
+        for (auto& a : args) argv.push_back(a.data());
+        bool help = false;
+        return locus_tools::parse_router_args(static_cast<int>(argv.size()),
+                                              argv.data(), 0, cfg, help);
+    };
+    RouterConfig cfg;
+    CHECK(parse({"--text-timeout", "90", "--media-timeout", "0"}, cfg) ==
+          "");
+    CHECK(cfg.text_read_timeout_ms == 90 * 1000);
+    CHECK(cfg.media_read_timeout_ms == 0);
+    CHECK(parse({"--text-timeout", "86400"}, cfg) == "");
+    CHECK(cfg.text_read_timeout_ms == 86400 * 1000);
+    CHECK(parse({"--text-timeout", "86401"}, cfg) ==
+          "bad --text-timeout: 86401");
+    CHECK(parse({"--media-timeout", "-1"}, cfg) ==
+          "bad --media-timeout: -1");
+    CHECK(parse({"--text-timeout", "x"}, cfg) == "bad --text-timeout: x");
 }
 
 TEST_CASE("router: a dead instance is skipped", "[router]") {

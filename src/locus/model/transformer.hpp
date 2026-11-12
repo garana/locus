@@ -261,6 +261,28 @@ class TransformerModel {
     bool q8k_activations() const;
 
     /**
+     * Settles where the routed experts run (i#654) and returns it. On
+     * Vulkan that depends on the free device memory when first asked,
+     * and the backend keeps the answer for this model, so the disk
+     * prefix cache can key on it. Call it after the KV cache exists,
+     * on a thread bound to the device the forwards will run on (the
+     * decision is per device).
+     * @returns true when some MoE layer would route its experts on the
+     *     GPU (they fit; a model on the per-op path still says true);
+     *     false for a dense model or another backend.
+     */
+    bool experts_on_gpu() const;
+
+    /**
+     * @returns Whether the MoE hybrid (hot experts on the GPU, the rest
+     *     on the CPU) runs for this model: moe_hybrid() is set up
+     *     (moe_hybrid_wanted() on the first call's backend, i#652). The
+     *     disk prefix key hashes it, since it changes the K/V bits; a
+     *     first call from there sizes the hot zone as a forward would.
+     */
+    bool moe_hybrid_on() const;
+
+    /**
      * @returns The active backend's ops as the forward uses them:
      *     Ops::matvec_q8k cleared unless Q8_K-activation mode is on.
      *     Arch hooks take these, never the backend's raw ops, so
@@ -665,6 +687,9 @@ class TransformerModel {
         backend::Mat ffn_latent_down, ffn_latent_up;
         std::span<const float> ffn_pre_exp_norm, ffn_post_exp_norm;
         std::span<const float> post_ffw_norm;
+        /** kolibri1: RMS norm weight on the attention output, before
+         *  the residual (its FFN one is post_ffw_norm). */
+        std::span<const float> post_attn_norm;
 
         /** deepseek41: attention sinks, grouped output LoRA, mHC
          * mixes (fn / base / scale per sublayer), the KV compressor
@@ -796,7 +821,8 @@ class TransformerModel {
     std::shared_ptr<StageMetrics> stage_metrics_;
     /** LOCUS_MOE_HYBRID state, set up on the first MoE layer. */
     std::shared_ptr<struct MoeHybrid> moe_hybrid_;
-    /** Sum of every tensor's bytes (sizes the hybrid hot zone). */
+    /** The loaded range's tensor bytes (stage_weight_bytes): decides
+     *  the hybrid and sizes its hot zone. */
     std::uint64_t weight_bytes_ = 0;
     /** use_q8k_activations' choice: -1 none (the default rule), 0 off,
      * 1 on. */
@@ -844,6 +870,41 @@ std::vector<std::pair<std::uint32_t, float>> moe_select(
  * @param ram_bytes Physical RAM (sys::total_ram_bytes(); 0 = unknown).
  */
 bool weights_stream(std::uint64_t weight_bytes, std::uint64_t ram_bytes);
+
+/**
+ * The MoE hybrid's switch (i#252, i#652). On a GPU without the whole
+ * model in its pool, every missed expert is uploaded before its
+ * matvec, which on a 2 GB GTX 750 Ti ran at or below CPU speed, while
+ * the hybrid ran 2 to 2.5x faster than both (PR#397).
+ *
+ * @param env LOCUS_MOE_HYBRID's value, or null when unset: "0" turns
+ *     the hybrid off, any other non-empty value on.
+ * @param pooled Whether the backend has a weight pool with prefetch,
+ *     evict and a budget (CUDA); without one the hybrid is off.
+ * @param weights The model's tensor bytes.
+ * @param room The pool bytes the weights may use (90% of its budget).
+ * @returns With env unset: whether the weights exceed the room.
+ */
+bool moe_hybrid_wanted(const char* env, bool pooled, std::uint64_t weights,
+                       std::uint64_t room);
+
+/**
+ * The tensor bytes a pipeline stage loads, so a stage that owns part of
+ * a model sizes the hybrid by its own weights, not the whole file's.
+ * @param g The model.
+ * @param layer_begin The stage's first layer.
+ * @param layer_end One past its last layer (n_layers for the last
+ *     stage).
+ * @param n_layers The model's layer count.
+ * @returns The bytes of the stage's blk.N tensors, the embedding on the
+ *     first stage (or the last, when the head is tied to it), and the
+ *     other model-level tensors (output norm, head) on the last; for
+ *     the whole model, every tensor.
+ */
+std::uint64_t stage_weight_bytes(const gguf::GgufFile& g,
+                                 std::uint32_t layer_begin,
+                                 std::uint32_t layer_end,
+                                 std::uint32_t n_layers);
 
 /**
  * @returns How many pool threads model-level parallel loops may use:

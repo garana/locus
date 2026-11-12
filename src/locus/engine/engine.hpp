@@ -84,6 +84,10 @@ struct Request {
     kv::PagedKvCache::Seq seq;
     /** Prompt + generated tokens fed through the model so far. */
     std::uint32_t n_fed = 0;
+    /** This step's prompt tokens (Engine::share_prefill). */
+    std::uint32_t step_share = 0;
+    /** Prefill steps in a row this prompt was not fed (aging). */
+    std::uint32_t prefill_waits = 0;
     /** Prompt-cache accounting (prefix_cache on). reused = prompt
      * tokens served from a cached KV prefix (skipped prefill), set at
      * adopt time; cached = prompt tokens NEWLY written to the cache at
@@ -110,7 +114,8 @@ struct Request {
  * decode token per running sequence with a bounded budget of
  * prefill tokens (chunked prefill), admits waiting requests while
  * blocks allow (prompt + decode headroom), and preempts the newest
- * running sequence by full recompute when the pool runs dry.
+ * running sequence when the pool runs dry: it recomputes on
+ * readmission, or with a disk tier reads its blocks back.
  *
  * Single-threaded by design: callers drive step() from one thread
  * (the M4 server owns that loop).
@@ -126,8 +131,22 @@ class Engine {
          * decodes them for GQA only, token by token). */
         kv::KvType kv_type = kv::KvType::kF32;
         /** Max prompt tokens prefetched per step across seqs;
-         * 0 = the model's preferred chunk (prefill_chunk()). */
+         * 0 = the model's preferred chunk (prefill_chunk()). Each
+         * prompt is fed in the chunks it gets alone (the whole budget,
+         * then its remainder), and the prompts with the shortest
+         * remainder go first (i#617), so a short prompt behind a long
+         * one is fed on the next step, not after the long prefill. */
         std::uint32_t prefill_budget = 0;
+        /** A prompt not fed on this many prefill steps in a row goes
+         * first on the next (oldest waiter first), so shorter prompts
+         * cannot starve a long one whose chunk needs the whole budget.
+         * Steps that skip prefill (decode_share) do not count. */
+        std::uint32_t prefill_max_wait = 2;
+        /** While a request decodes, every other step feeds no prompt
+         * (i#617), so decodes behind a long prompt get a decode-only
+         * step at least every second step. The prefill loses the
+         * decode-only steps' time, about one decode token's each. */
+        bool decode_share = true;
         /** Decode headroom required at admission, in tokens. */
         std::uint32_t decode_headroom = 16;
         /** Cap on simultaneously running sequences. */
@@ -152,13 +171,16 @@ class Engine {
         /** Disk tier of the prefix cache (i#416; null = off). Implies
          * prefix_cache. Prefixes evicted from RAM are written back to
          * it, and a prompt whose prefix is longer on disk than in RAM
-         * loads it (kLoading) while the other requests step. Its key
+         * loads it (kLoading) while the other requests step. A
+         * preempted sequence's full blocks (prompt and output) are
+         * written to it too, and read back on readmission. Its key
          * must match this engine's cache geometry and KV type.
          * Models with per-sequence state outside the KV pool (a DSA
          * indexer, deepseek41) are refused. */
         std::shared_ptr<DiskPrefixStore> disk_prefix;
         /** Cap on the bytes of queued write-backs; past it a
-         * write-back is dropped. */
+         * write-back is dropped, and a preempted sequence's blocks are
+         * written at preemption instead (i#642). */
         std::uint64_t disk_write_backlog = 64ull << 20;
         /** Prompt-lookup speculative decoding: draft n-gram tokens
          * from the context and verify them in one batched forward
@@ -273,6 +295,17 @@ class Engine {
     std::uint64_t disk_prefix_loaded_tokens() const {
         return disk_loaded_tokens_;
     }
+    /** Positions of preempted sequences written to the disk tier
+     *  (queued, written at preemption, or already there), cumulative
+     *  (i#621, i#642). */
+    std::uint64_t disk_prefix_swapped_tokens() const {
+        return disk_swapped_tokens_;
+    }
+    /** Positions of preempted sequences the disk tier refused (its cap
+     *  or an I/O error), so they recompute; cumulative (i#642). */
+    std::uint64_t disk_prefix_refused_tokens() const {
+        return disk_refused_tokens_;
+    }
 
     /** Invoked after each newly sampled token (streaming). */
     std::function<void(const Request&, tok::TokenId)> on_token;
@@ -344,6 +377,15 @@ class Engine {
     void observe_done(const Request& r);
     /** Feeds up to `budget` tokens of r; samples when caught up. */
     void advance(Request& r, std::uint32_t& budget);
+    /** Sets every running request's step_share: the prompts still
+     * prefilling, the aged ones (prefill_max_wait) first, then the
+     * shortest remainder first, each its whole-budget
+     * chunk or its whole remainder while the budget lasts (the chunks
+     * it gets alone); 0 for the others, and for all of them on every
+     * other step while a request decodes (decode_share). */
+    void share_prefill();
+    /** decode_share: whether this step skipped prefill. */
+    bool skip_prefill_ = false;
 
     /** One iteration with cross-sequence batched decode (R10 4b):
      * prefill -> sample -> one forward_batch_decode for every
@@ -394,10 +436,16 @@ class Engine {
     /** Moves finished disk reads' requests to running (or releases a
      * cancelled one's blocks). */
     void absorb_disk_loads();
-    /** PrefixCache::on_evict: queues the evicted prefix's blocks for
-     * the disk tier unless it is already there. */
-    void write_back(std::span<const tok::TokenId> key,
+    /** PrefixCache::on_evict and preempt(): queues the prefix's blocks
+     * for the disk tier unless it is already there. @returns false
+     * when nothing was written or queued (no blocks, or the backlog
+     * cap). */
+    bool write_back(std::span<const tok::TokenId> key,
                     const std::vector<kv::BlockId>& blocks);
+    /** @returns The first n tokens of r's context: prompt, then the
+     *  output so far. */
+    std::vector<tok::TokenId> context_of(const Request& r,
+                                         std::uint32_t n) const;
 
     const model::TransformerModel& model_;
     tok::TokenId eos_;
@@ -443,6 +491,8 @@ class Engine {
     std::unordered_map<std::uint64_t, kv::PagedKvCache::Seq> orphans_;
     std::uint64_t disk_hits_ = 0;
     std::uint64_t disk_loaded_tokens_ = 0;
+    std::uint64_t disk_swapped_tokens_ = 0;
+    std::uint64_t disk_refused_tokens_ = 0;
     // After cache_: destroyed first, so a read in flight finishes
     // before the pool it writes goes away.
     std::unique_ptr<DiskPrefixWorker> disk_worker_;

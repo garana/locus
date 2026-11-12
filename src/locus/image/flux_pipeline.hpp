@@ -125,6 +125,9 @@ class FluxPipeline {
     }
     /** @returns Whether the model takes a guidance scale. */
     bool guidance_embeds() const { return dit_->guidance_embeds(); }
+    /** @returns Whether the checkpoint edits (FluxDit::may_edit): only
+     *  then does the server list image-edit and serve edits. */
+    bool may_edit() const { return dit_->may_edit(); }
 
     /**
      * Text to an RGB image.

@@ -90,10 +90,24 @@ layout(local_size_x = 256) in;
 #endif
 #if defined(W_BYTES) || defined(KV_F16) || defined(W_HALF)
 layout(std430, binding = 0) readonly buffer W { uint w[]; };
+#if defined(TYPE_BF16) && !defined(PAGED) && !defined(PAGED_T)
+// The same BF16 rows as 16-byte quads (8 weights), for whole-row stages.
+layout(std430, binding = 0) readonly buffer W4 { uvec4 w4[]; };
+#endif
 #else
 layout(std430, binding = 0) readonly buffer W { float w[]; };
+#if defined(TYPE_F32) && !defined(PAGED) && !defined(PAGED_T) && \
+    !defined(MOE_ID)
+// The same F32 rows as vec4s, for whole-row stages.
+layout(std430, binding = 0) readonly buffer W4F { vec4 w4f[]; };
+#endif
 #endif
 layout(std430, binding = 1) readonly buffer X { float x[]; };
+#if (defined(TYPE_BF16) || defined(TYPE_F32)) && !defined(PAGED) && \
+    !defined(PAGED_T) && !defined(MOE_ID) && !defined(KV_F16)
+// The same activations as vec4s, for whole, 16-byte-aligned stages.
+layout(std430, binding = 1) readonly buffer X4 { vec4 x4[]; };
+#endif
 layout(std430, binding = 2) buffer O { float o[]; };
 #ifdef MOE_ID
 layout(std430, binding = 3) readonly buffer IDS { uint ids[]; };
@@ -212,6 +226,73 @@ void scale_min(uint j, uint sc0, out float d, out float m) {
 }
 #endif
 
+#if (defined(TYPE_BF16) || defined(TYPE_F32)) && !defined(PAGED) && \
+    !defined(PAGED_T) && !defined(MOE_ID) && !defined(KV_F16)
+#define PREFETCH
+#define XPT (BN * BK / 256u)
+/**
+ * The BF16 stage at k0 into registers: this thread's VPT weights of row
+ * r (quad loads when whole and 16-byte aligned) and its XPT activations,
+ * as the plain loop stages them, so the global loads of the next stage
+ * can run while this one computes (i#592).
+ */
+void load_stage(uint k0, uint k_end, uint wbase, uint r, uint sub,
+                uint tid, uint n_here, inout float wv[VPT],
+                inout float xv[XPT]) {
+    uint e0 = wbase + r * pc.cols + k0 + sub * VPT;
+#ifdef TYPE_BF16
+    if (r < pc.rows && k0 + sub * VPT + VPT <= k_end && (e0 & 7u) == 0u) {
+        for (uint h = 0u; h < VPT / 8u; ++h) {
+            uvec4 q = w4[(e0 >> 3) + h];
+            for (uint i = 0u; i < 4u; ++i) {
+                wv[h * 8u + 2u * i] = uintBitsToFloat(q[i] << 16);
+                wv[h * 8u + 2u * i + 1u] =
+                    uintBitsToFloat(q[i] & 0xffff0000u);
+            }
+        }
+    } else {
+#else
+    if (r < pc.rows && k0 + sub * VPT + VPT <= k_end && (e0 & 3u) == 0u) {
+        for (uint h = 0u; h < VPT / 4u; ++h) {
+            vec4 q = w4f[(e0 >> 2) + h];
+            wv[h * 4u] = q.x;
+            wv[h * 4u + 1u] = q.y;
+            wv[h * 4u + 2u] = q.z;
+            wv[h * 4u + 3u] = q.w;
+        }
+    } else {
+#endif
+        for (uint c = 0u; c < VPT; ++c) {
+            uint kc = k0 + sub * VPT + c;
+            wv[c] = (r < pc.rows && kc < k_end) ? w_at(wbase, r, kc) : 0.0;
+        }
+    }
+    // Activations: thread tid takes columns 4 (tid % (BK / 4)) .. + 4 of
+    // token rows tid / (BK / 4) + j * (256 / (BK / 4)), one vec4 each
+    // when the 4 columns are whole and the row 16-byte aligned.
+    for (uint j = 0u; j < XPT / 4u; ++j) {
+        uint idx = tid + j * 256u;
+        uint tl = idx / (BK / 4u);
+        uint c4 = (idx % (BK / 4u)) * 4u;
+        uint kc = k0 + c4;
+        uint at = tl < n_here ? rows_x[tl] + kc : 0u;
+        if (tl < n_here && kc + 4u <= k_end && (at & 3u) == 0u) {
+            vec4 v = x4[at >> 2];
+            xv[4u * j] = v.x;
+            xv[4u * j + 1u] = v.y;
+            xv[4u * j + 2u] = v.z;
+            xv[4u * j + 3u] = v.w;
+        } else {
+            for (uint i = 0u; i < 4u; ++i) {
+                xv[4u * j + i] = (tl < n_here && kc + i < k_end)
+                                     ? x[rows_x[tl] + kc + i]
+                                     : 0.0;
+            }
+        }
+    }
+}
+#endif
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint ks = gl_WorkGroupID.y % pc.k_splits;
@@ -277,6 +358,49 @@ void main() {
     // Weight loader: BK / VPT threads per row, VPT values each.
     uint lr = tid / (BK / VPT);
     uint sub = tid % (BK / VPT);
+#ifdef PREFETCH
+    // Register-prefetched stages (i#592): stage k0 goes to shared memory
+    // while stage k0 + BK's global loads are issued before the compute.
+    float wv[VPT];
+    float xv[XPT];
+    uint rr = r0 + lr;
+    if (k_begin < k_end) {
+        load_stage(k_begin, k_end, wbase, rr, sub, tid, n_here, wv, xv);
+    }
+    for (uint k0 = k_begin; k0 < k_end; k0 += BK) {
+        for (uint c = 0u; c < VPT; ++c) {
+            ws[sub * VPT + c][lr / 4u][lr % 4u] = SVAL(wv[c]);
+        }
+        for (uint j = 0u; j < XPT / 4u; ++j) {
+            uint idx = tid + j * 256u;
+            uint tl = idx / (BK / 4u);
+            uint c4 = (idx % (BK / 4u)) * 4u;
+            for (uint i = 0u; i < 4u; ++i) {
+                xs[c4 + i][tl / 4u][tl % 4u] = SVAL(xv[4u * j + i]);
+            }
+        }
+        barrier();
+        if (k0 + BK < k_end) {
+            load_stage(k0 + BK, k_end, wbase, rr, sub, tid, n_here, wv, xv);
+        }
+        for (uint k = 0u; k < BK; ++k) {
+            vec4 a[TM / 4u];
+            vec4 bv[TN / 4u];
+            for (uint i = 0u; i < TM / 4u; ++i) {
+                a[i] = vec4(ws[k][ty * (TM / 4u) + i]);
+            }
+            for (uint j = 0u; j < TN / 4u; ++j) {
+                bv[j] = vec4(xs[k][tx * (TN / 4u) + j]);
+            }
+            for (uint i = 0u; i < TM; ++i) {
+                for (uint j = 0u; j < TN / 4u; ++j) {
+                    acc[i][j] += a[i / 4u][i % 4u] * bv[j];
+                }
+            }
+        }
+        barrier();
+    }
+#else
     for (uint k0 = k_begin; k0 < k_end; k0 += BK) {
         // Weights: row r0 + lr, columns k0 + sub*8 .. +8.
         uint r = r0 + lr;
@@ -390,6 +514,27 @@ void main() {
             }
         }
 #else
+#if defined(TYPE_BF16) && !defined(PAGED) && !defined(PAGED_T)
+        // A thread's VPT columns of one row as VPT / 8 quad loads, when
+        // they are inside the tile and the row's elements start at a
+        // multiple of 8 (16 bytes); else element by element. Same values
+        // either way.
+        uint e0 = wbase + r * pc.cols + k0 + sub * VPT;
+        if (r < pc.rows && k0 + sub * VPT + VPT <= k_end &&
+            (e0 & 7u) == 0u) {
+            for (uint h = 0u; h < VPT / 8u; ++h) {
+                uvec4 q = w4[(e0 >> 3) + h];
+                uint c = sub * VPT + h * 8u;
+                for (uint i = 0u; i < 4u; ++i) {
+                    uint v = q[i];
+                    ws[c + 2u * i][lr / 4u][lr % 4u] =
+                        SVAL(uintBitsToFloat(v << 16));
+                    ws[c + 2u * i + 1u][lr / 4u][lr % 4u] =
+                        SVAL(uintBitsToFloat(v & 0xffff0000u));
+                }
+            }
+        } else
+#endif
         for (uint c = sub * VPT; c < sub * VPT + VPT; ++c) {
             uint kc = k0 + c;
             ws[c][lr / 4u][lr % 4u] = SVAL((r < pc.rows && kc < k_end)
@@ -424,6 +569,7 @@ void main() {
         }
         barrier();
     }
+#endif
 
     for (uint j = 0u; j < TN; ++j) {
         uint tl = tx * TN + j;
