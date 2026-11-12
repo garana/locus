@@ -40,6 +40,11 @@ struct DiskKey {
      *  the engine's own cache knows (the mirror attaches when it fits),
      *  so the engine sets it (DiskPrefixStore::set_device_attention). */
     bool device_attention = false;
+    /** The routed experts ran on the GPU, not the host (Vulkan,
+     *  i#654): the two sum in other orders. The route depends on the
+     *  free device memory once the KV pool exists, so the engine sets
+     *  it (DiskPrefixStore::set_experts_on_gpu). */
+    bool experts_on_gpu = false;
 };
 
 /**
@@ -68,7 +73,7 @@ struct DiskKey {
  */
 class DiskPrefixStore {
   public:
-    static constexpr std::uint32_t kFormatVersion = 1;
+    static constexpr std::uint32_t kFormatVersion = 2;
 
     /**
      * Opens (creating it if needed) the cache directory `dir`, indexes
@@ -130,6 +135,8 @@ class DiskPrefixStore {
     /** Sets DiskKey::device_attention. The engine calls it once, at
      *  construction, before any read or write. */
     void set_device_attention(bool on);
+    /** Sets DiskKey::experts_on_gpu, as set_device_attention does. */
+    void set_experts_on_gpu(bool on);
     std::size_t block_bytes() const { return block_bytes_; }
     std::uint64_t cap_bytes() const { return cap_bytes_; }
 

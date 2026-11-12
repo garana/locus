@@ -261,6 +261,16 @@ class TransformerModel {
     bool q8k_activations() const;
 
     /**
+     * Settles where the routed experts run (i#654) and returns it. On
+     * Vulkan that depends on the free device memory when first asked,
+     * and the backend keeps the answer for this model, so the disk
+     * prefix cache can key on it. Call it after the KV cache exists.
+     * @returns true when some MoE layer routes its experts on Vulkan;
+     *     false for a dense model or another backend.
+     */
+    bool experts_on_gpu() const;
+
+    /**
      * @returns The active backend's ops as the forward uses them:
      *     Ops::matvec_q8k cleared unless Q8_K-activation mode is on.
      *     Arch hooks take these, never the backend's raw ops, so

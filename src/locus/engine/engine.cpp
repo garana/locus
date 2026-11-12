@@ -45,6 +45,9 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
         cfg_.disk_prefix->set_device_attention(
             cache_.mirror_data() != nullptr &&
             m.active_backend().ops.kv_attend != nullptr);
+        // Vulkan routes MoE experts on the GPU or the host by the free
+        // device memory; settled now, with the KV pool allocated.
+        cfg_.disk_prefix->set_experts_on_gpu(m.experts_on_gpu());
         cfg_.prefix_cache = true;
     }
     if (cfg_.prefix_cache) {

@@ -180,6 +180,21 @@ TEST_CASE("DiskPrefixStore: device attention is part of the match",
     REQUIRE(s.find(kPrompt) == 0);  // the other path's file
 }
 
+TEST_CASE("DiskPrefixStore: the expert route is part of the match",
+          "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-dps-experts")};
+    const auto in = blocks(2, 6);
+    DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+    const fs::path host = s.path_for(kPrompt, 2);
+    s.set_experts_on_gpu(true);
+    REQUIRE(s.key().experts_on_gpu);
+    REQUIRE(s.path_for(kPrompt, 2) != host);
+    REQUIRE(s.write(kPrompt, 2, srcs(in)));
+    REQUIRE(s.find(kPrompt) == 2);
+    s.set_experts_on_gpu(false);
+    REQUIRE(s.find(kPrompt) == 0);  // the other route's file
+}
+
 TEST_CASE("DiskPrefixStore: a file under another file's name is a miss",
           "[disk_prefix]") {
     // A digest collision, or a file of another key under this key's

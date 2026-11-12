@@ -1,3 +1,5 @@
+#include <unistd.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -11,8 +13,11 @@
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_forward.hpp"
+#include "locus/engine/disk_prefix_key.hpp"
+#include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/expert_metrics.hpp"
+#include "locus/model/moe_stats.hpp"
 #include "locus/model/transformer.hpp"
 #include "gguf_builder.hpp"
 
@@ -378,6 +383,67 @@ TEST_CASE("moe on the vulkan backend matches dense",
     for (std::size_t i = 0; i < a.size(); ++i) {
         REQUIRE(b[i] == Catch::Approx(a[i]).margin(1e-3));
     }
+}
+
+TEST_CASE("the engine keys the disk prefix store on the vulkan expert "
+          "route",
+          "[moe][vulkan][disk_prefix]") {
+    ModelBuilder mb;
+    mb.common();
+    mb.tensor("blk.0.ffn_gate_inp.weight", {kE, 4}, weights(kE * 4, 13));
+    mb.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, 4},
+              weights(kE * kF * 4, 14));
+    mb.tensor("blk.0.ffn_up_exps.weight", {kE, kF, 4},
+              weights(kE * kF * 4, 15));
+    mb.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
+              weights(kF * kE * 4, 16));
+    const auto img = mb.build(4, 2);
+    const auto base = std::filesystem::temp_directory_path() /
+                      ("locus-moe-dpk-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(base);
+    std::filesystem::create_directories(base);
+    const std::string path = (base / "moe.gguf").string();
+    {
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(img.data()),
+                static_cast<std::streamsize>(img.size()));
+    }
+    struct Cleanup {
+        std::filesystem::path dir;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    } cleanup{base};
+
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = TransformerModel::load(g);
+    REQUIRE_FALSE(model.experts_on_gpu());  // the CPU routes on the host
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+    // Open on Vulkan (refused for every GPU before i#654); the engine
+    // settles the route and puts it in the key.
+    auto store = locus::engine::open_disk_prefix(
+        (base / "kv").string(), 1 << 20, g, path, model,
+        locus::kv::KvType::kF32);
+    REQUIRE_FALSE(store->key().experts_on_gpu);
+    locus::engine::Engine::Config cfg;
+    cfg.disk_prefix = store;
+    locus::engine::Engine engine(model, static_cast<locus::tok::TokenId>(-1),
+                                 cfg);
+    REQUIRE(store->key().experts_on_gpu == model.experts_on_gpu());
+    // Experts this small fit any device, unless a switch sends them to
+    // the host.
+    if (std::getenv("LOCUS_VK_CPU_ROUTE") == nullptr &&
+        std::getenv("LOCUS_GPU_POOL_MB") == nullptr &&
+        !locus::model::MoeStats::enabled()) {
+        REQUIRE(store->key().experts_on_gpu);
+    }
+    const auto id = engine.submit({3, 7, 1}, 2);
+    engine.run_to_completion();
+    REQUIRE(engine.get(id)->generated.size() == 2);
 }
 
 TEST_CASE("readahead hints leave outputs bit-identical",
