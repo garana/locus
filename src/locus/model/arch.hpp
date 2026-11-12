@@ -86,6 +86,13 @@ struct ArchSpec {
      * matvecs over the chunk, byte-identical to the per-token path.
      */
     bool plain_attention = false;
+    /**
+     * Whether `attention` is qwen2moe_attention: the plain computation
+     * plus q / k / v biases and NEOX rope (M-RoPE where a token has a
+     * (t, h, w) position). forward_batch batches its projections as
+     * plain_attention's (i#671).
+     */
+    bool qwen2_attention = false;
 };
 
 /** @returns All implemented architectures. */
