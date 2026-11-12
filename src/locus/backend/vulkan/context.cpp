@@ -601,7 +601,7 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kQkNormRope, "qk_norm_rope", locus_qk_norm_rope_spv,
      sizeof(locus_qk_norm_rope_spv), 5, 32},
     {Kernel::kMatvecQ4_KSeg, "matvec_q4_k_seg", locus_matvec_q4_k_seg_spv,
-     sizeof(locus_matvec_q4_k_seg_spv), 6, 44},
+     sizeof(locus_matvec_q4_k_seg_spv), 7, 88},
     {Kernel::kBiasRows, "bias_rows", locus_bias_rows_spv,
      sizeof(locus_bias_rows_spv), 2, 20},
     {Kernel::kMatmulQ5_0, "matmul_q5_0", locus_matmul_q5_0_spv,
