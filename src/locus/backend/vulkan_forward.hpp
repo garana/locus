@@ -34,8 +34,9 @@ bool vulkan_forward_supported(const model::TransformerModel& m);
  * memory when it is first made, and the device keeps it for m's life,
  * so later forwards route the same way. Call it once the KV pool is
  * allocated, as a forward would find the device.
- * @returns true when at least one MoE layer routes its experts on the
- *     GPU; false for a dense model or without a usable device.
+ * @returns true when at least one MoE layer would route its experts on
+ *     the GPU (they fit, even if the model takes the per-op path);
+ *     false for a dense model or without a usable device.
  */
 bool vulkan_moe_gpu_route(const model::TransformerModel& m);
 
