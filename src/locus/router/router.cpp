@@ -19,7 +19,8 @@ using nlohmann::json;
 namespace {
 
 constexpr std::string_view kKindNames[] = {
-    "text", "image-to-text", "image", "video", "speech", "rerank", "classify"};
+    "text",   "image-to-text", "image",     "video",
+    "speech", "rerank",        "classify",  "image-edit"};
 
 char lower(char c) {
     return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
@@ -275,9 +276,10 @@ std::optional<Route> classify(std::string_view path, std::string_view body) {
             }
         }
         r.kind = image ? Kind::kImageToText : Kind::kText;
-    } else if (path == "/v1/images/generations" ||
-               path == "/v1/images/edits") {
+    } else if (path == "/v1/images/generations") {
         r.kind = Kind::kImage;
+    } else if (path == "/v1/images/edits") {
+        r.kind = Kind::kImageEdit;
     } else if (path == "/v1/videos" || path.rfind("/v1/videos/", 0) == 0) {
         r.kind = Kind::kVideo;
     } else if (path == "/v1/audio/speech") {
@@ -769,9 +771,21 @@ std::vector<int> Router::candidates(const Route& route) const {
         // A registration can run out between refreshes: checked here
         // too, so a lapsed instance gets no request meanwhile.
         const auto now = std::chrono::steady_clock::now();
+        const auto live = [&](const Instance& in) {
+            return !in.gone && !lapsed(in, now) && in.healthy;
+        };
+        // Servers from before the image-edit kind list edits under
+        // "image": with no live instance listing image-edit, edits go to
+        // the image instances, as they did (i#633).
+        const bool any_edit = std::any_of(
+            inst_.begin(), inst_.end(), [&](const Instance& in) {
+                return live(in) &&
+                       std::find(in.kinds.begin(), in.kinds.end(),
+                                 Kind::kImageEdit) != in.kinds.end();
+            });
         for (std::size_t i = 0; i < inst_.size(); ++i) {
             const Instance& in = inst_[i];
-            if (in.gone || lapsed(in, now) || !in.healthy) {
+            if (!live(in)) {
                 continue;
             }
             const auto has = [&](Kind k) {
@@ -784,7 +798,9 @@ std::vector<int> Router::candidates(const Route& route) const {
                     in.models.end();
             // Image embeddings: a classify instance serves
             // /v1/embeddings under its model's name.
-            const bool of = has(route.kind);
+            const bool of =
+                has(route.kind) || (route.kind == Kind::kImageEdit &&
+                                    !any_edit && has(Kind::kImage));
             if (!of && !(route.embeddings && listed && has(Kind::kClassify))) {
                 continue;
             }
@@ -1159,6 +1175,7 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
         });
         std::shared_ptr<http::Client> client = take(i);
         const bool media = rt.kind == Kind::kImage ||
+                           rt.kind == Kind::kImageEdit ||
                            rt.kind == Kind::kSpeech ||
                            rt.kind == Kind::kVideo;
         client->set_read_timeout_ms(media ? cfg_.media_read_timeout_ms

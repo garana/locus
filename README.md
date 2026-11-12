@@ -38,7 +38,7 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   bge-m3 and nomic-embed-text v1.5. A reranker (an XLM-R cross-encoder
   such as bge-reranker-v2-m3) serves `/v1/rerank` with
   `--rerank-model`. Both run on the CPU, and a large request's passes
-  on Vulkan where the GPU shares host memory (Apple).
+  on Vulkan where the GPU shares host memory (Apple), or on CUDA.
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
   penalties, seed), structured output (JSON mode, a JSON Schema, a
   regex or a GBNF grammar), prompt caching (in RAM, and on disk with
@@ -205,7 +205,9 @@ tower). Tests tagged as heavy also need `LOCUS_HEAVY_TESTS=1`.
     locus-server model.gguf 8080
     locus-run model.gguf "Once upon a time" 32
 
-`locus-server --help` lists the options and environment variables;
+The server listens on every interface; `--host 127.0.0.1` keeps it
+on loopback. `locus-server --help` lists the options and environment
+variables;
 `--capabilities` lists the architectures, backends, weight formats
 and tokenizers of the build. Speech needs `--audio-decoder
 <snac.gguf>`, image generation `--image-decoder <vq16.gguf>` (Janus)

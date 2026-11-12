@@ -89,7 +89,8 @@ Correctness first, then CPU throughput, then GPU.
 - Admission: a request is admitted when the allocator can cover its
   prompt blocks plus a decode headroom.
 - Preemption, when the pool runs dry: evict the newest sequence and
-  recompute it later (recompute, not swap to host).
+  recompute it later (recompute, not swap to host); with a disk tier,
+  its full blocks are written there and read back on readmission.
 - Fairness: admission is first come, first served, with a cap on
   prefill tokens per iteration (chunked prefill). Within it the prompt
   with the shortest remainder is fed first, so a short prompt behind a
@@ -213,9 +214,13 @@ a registration at a router's own address cannot loop. An instance
 lists its kinds in
 `/v1/models` (`locus_kinds`), which the router reads at start and
 every `--refresh-ms`; a request that names a listed model goes to that
-instance. Buffered replies are forwarded whole; a chunked one (SSE)
-streams through, and a client that leaves closes the upstream
-connection, so the instance stops the work. An instance that stays
+instance. Image edits (`image-edit`: FLUX.1 Kontext, Qwen-Image-Edit)
+are a kind apart from generations (`image`), so an edit-only instance
+gets no generation; while no instance lists `image-edit` (older
+servers), edits go to `image` instances. Buffered replies are
+forwarded whole; a chunked one (SSE) streams through, and a client
+that leaves closes the upstream connection, so the instance stops the
+work. An instance that stays
 silent longer than the read timeout fails the request:
 `--media-timeout` for image, speech and video and `--text-timeout` for
 the rest, 30 minutes each by default, since a buffered image or chat
@@ -630,7 +635,10 @@ guarding the default path.
   evicted from RAM are written back by a worker thread, and the rest
   at shutdown; a prompt whose prefix is at least one block longer on
   disk waits in a LOADING state while the worker reads it into its
-  blocks, and the engine keeps stepping the other requests.
+  blocks, and the engine keeps stepping the other requests. A
+  preempted sequence writes its full blocks (prompt and output so far,
+  keyed by those tokens) to the disk tier too; on readmission it loads
+  them the same way and recomputes only the tail (i#621).
 - Speculative decoding: prompt lookup (no draft model). An n-gram
   match against the context proposes drafts, verified in one batched
   forward; the longest correct prefix is accepted. Greedy only, so
@@ -679,7 +687,12 @@ guarding the default path.
   longer one on the GPU. On an M2 Pro that makes 32 inputs of 120
   tokens 3.9x faster with bge-m3 (18.2 s to 4.7 s), 3.7x with nomic
   v1.5 and 1.5x with bge-small, and a 50-document rerank 3.1x (12.8 s
-  to 4.1 s). CUDA and other Vulkan GPUs: #519. Otherwise
+  to 4.1 s). Elsewhere, with a usable CUDA device, those passes run
+  on the CUDA ops: the matrices through the batched CUDA matvec, each
+  weight read once per 32 tokens, and the attention on the CPU, since
+  dense::attention keeps a GPU that caches weights by host pointer
+  off its temporary buffers. The image classifier's convs stay on
+  Vulkan only. Other Vulkan GPUs: #519. Otherwise
   `/v1/embeddings` returns the chat model's last token's final-normed
   hidden state, L2-normalized, on a dedicated cache; CPU and CUDA
   backends only (`TransformerModel::embed` refuses vulkan).

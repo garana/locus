@@ -12,7 +12,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
-#include "locus/backend/vulkan/context.hpp"
+#include "locus/backend/vulkan_seq.hpp"
 #include "locus/gguf/gguf.hpp"
 
 namespace {
@@ -79,7 +79,7 @@ struct Leg {
 std::vector<Leg> legs(double cpu_bound) {
     std::vector<Leg> v = {
         {"cpu", &locus::backend::best_backend().ops, cpu_bound}};
-    if (locus::backend::vk::VulkanContext::available()) {
+    if (locus::backend::VulkanSeq::available()) {
         v.push_back({"vulkan", &locus::backend::vulkan_image_ops(), 1e-3});
     }
     return v;

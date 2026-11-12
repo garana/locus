@@ -114,7 +114,8 @@ struct Request {
  * decode token per running sequence with a bounded budget of
  * prefill tokens (chunked prefill), admits waiting requests while
  * blocks allow (prompt + decode headroom), and preempts the newest
- * running sequence by full recompute when the pool runs dry.
+ * running sequence when the pool runs dry: it recomputes on
+ * readmission, or with a disk tier reads its blocks back.
  *
  * Single-threaded by design: callers drive step() from one thread
  * (the M4 server owns that loop).
@@ -170,7 +171,9 @@ class Engine {
         /** Disk tier of the prefix cache (i#416; null = off). Implies
          * prefix_cache. Prefixes evicted from RAM are written back to
          * it, and a prompt whose prefix is longer on disk than in RAM
-         * loads it (kLoading) while the other requests step. Its key
+         * loads it (kLoading) while the other requests step. A
+         * preempted sequence's full blocks (prompt and output) are
+         * written to it too, and read back on readmission. Its key
          * must match this engine's cache geometry and KV type.
          * Models with per-sequence state outside the KV pool (a DSA
          * indexer, deepseek41) are refused. */
@@ -290,6 +293,11 @@ class Engine {
     /** Prompt positions read from the disk tier, cumulative. */
     std::uint64_t disk_prefix_loaded_tokens() const {
         return disk_loaded_tokens_;
+    }
+    /** Positions of preempted sequences written to the disk tier
+     *  (queued or already there), cumulative (i#621). */
+    std::uint64_t disk_prefix_swapped_tokens() const {
+        return disk_swapped_tokens_;
     }
 
     /** Invoked after each newly sampled token (streaming). */
@@ -421,10 +429,16 @@ class Engine {
     /** Moves finished disk reads' requests to running (or releases a
      * cancelled one's blocks). */
     void absorb_disk_loads();
-    /** PrefixCache::on_evict: queues the evicted prefix's blocks for
-     * the disk tier unless it is already there. */
-    void write_back(std::span<const tok::TokenId> key,
+    /** PrefixCache::on_evict and preempt(): queues the prefix's blocks
+     * for the disk tier unless it is already there. @returns false
+     * when nothing was written or queued (no blocks, or the backlog
+     * cap). */
+    bool write_back(std::span<const tok::TokenId> key,
                     const std::vector<kv::BlockId>& blocks);
+    /** @returns The first n tokens of r's context: prompt, then the
+     *  output so far. */
+    std::vector<tok::TokenId> context_of(const Request& r,
+                                         std::uint32_t n) const;
 
     const model::TransformerModel& model_;
     tok::TokenId eos_;
@@ -470,6 +484,7 @@ class Engine {
     std::unordered_map<std::uint64_t, kv::PagedKvCache::Seq> orphans_;
     std::uint64_t disk_hits_ = 0;
     std::uint64_t disk_loaded_tokens_ = 0;
+    std::uint64_t disk_swapped_tokens_ = 0;
     // After cache_: destroyed first, so a read in flight finishes
     // before the pool it writes goes away.
     std::unique_ptr<DiskPrefixWorker> disk_worker_;

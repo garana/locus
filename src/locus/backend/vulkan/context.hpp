@@ -177,6 +177,9 @@ enum class Kernel {
     kMatvecQ4_KN4,
     kMatvecQ4_KN4Glu,
     kMatvecQ6_KN4,
+    /** Unmasked multi-head attention in one pass (flash_attn.comp,
+     *  i#640): the image transformers' joint attention. */
+    kFlashAttn,
     kCount_,
 };
 
@@ -266,6 +269,15 @@ class VulkanContext {
     static constexpr std::uint32_t kMatmulBK = 32;
     static constexpr std::uint32_t kMatmulBKSmall = 16;
 
+    /**
+     * flash_attn.comp: queries per workgroup (its BR), for the default
+     * and the SMALL variant, and the widest head it takes (HD_MAX);
+     * keep them in sync with the shader's defines.
+     */
+    static constexpr std::uint32_t kFlashAttnRows = 64;
+    static constexpr std::uint32_t kFlashAttnRowsSmall = 32;
+    static constexpr std::uint32_t kFlashAttnHdMax = 128;
+
     /** Widest head qk_norm_rope.comp takes (its HD_MAX). */
     static constexpr std::uint32_t kQkNormRopeHdMax = 512;
 
@@ -302,6 +314,10 @@ class VulkanContext {
 
     /** @returns true when the driver is MoltenVK (Vulkan on Metal). */
     bool moltenvk() const;
+
+    /** @returns true when kernel k was built from its smaller-shared-
+     *  memory variant (the device's limit, or LOCUS_VK_MATMUL_SMALL). */
+    bool small_variant(Kernel k) const;
 
     /**
      * Whether the device does f16 shader arithmetic (shaderFloat16,

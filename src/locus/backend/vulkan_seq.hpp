@@ -95,10 +95,13 @@ class VulkanSeq {
 
     /**
      * Unmasked multi-head attention: n queries over n keys and values,
-     * all rows heads x hd, softmax(q k^T / sqrt(hd)) v into out. Slots
-     * kh and vt hold the per-head K and V^T planes it builds, scores
-     * the score blocks (queries run in blocks within the attention
-     * scratch cap).
+     * all rows heads x hd, softmax(q k^T / sqrt(hd)) v into out. With
+     * hd a multiple of 4 up to 128 and every offset and stride a
+     * multiple of 4, it runs in one pass (flash_attn.comp, i#640) and
+     * leaves kh, vt and scores alone. Otherwise, or with
+     * LOCUS_VK_FLASH=0, slots kh and vt hold the per-head K and V^T
+     * planes it builds and scores the score blocks (queries run in
+     * blocks within the attention scratch cap).
      */
     void attention(Rows q, Rows k, Rows v, Rows out, std::uint32_t n,
                    std::uint32_t heads, std::uint32_t hd, Slot kh, Slot vt,

@@ -91,11 +91,15 @@ struct SseKeepalive {
 /** The GPU ops for the embedding and rerank models' large passes
  *  (EmbeddingModel::kGpuMacs): the Vulkan image ops where the GPU
  *  imports host memory, as for PixArt (the weights stay in the GGUF
- *  mapping); else null, the CPU everywhere (#512). */
+ *  mapping, #512); else the CUDA ops when a CUDA device is usable, the
+ *  matrices through its batched matvec (i#519); else null, the CPU
+ *  everywhere. */
 const backend::Ops* encoder_gpu_ops() {
-    return backend::vulkan_imports_host_memory()
-               ? &backend::vulkan_image_ops()
-               : nullptr;
+    if (backend::vulkan_imports_host_memory()) {
+        return &backend::vulkan_image_ops();
+    }
+    const backend::Backend* cuda = backend::find_backend("cuda");
+    return cuda != nullptr && cuda->available ? &cuda->ops : nullptr;
 }
 
 /** @returns The OpenAI flat error envelope. @param type
@@ -1646,9 +1650,10 @@ void OpenAiServer::install_routes() {
             }
             json kinds = json::array({"text"});
             if (vision_) kinds.push_back("image-to-text");
-            if (janus_ || pixart_ || flux_ || qwen_edit_) {
-                kinds.push_back("image");
-            }
+            // Generations and edits apart (i#633): FLUX.1 serves both,
+            // Qwen-Image-Edit edits only, Janus and PixArt generate only.
+            if (janus_ || pixart_ || flux_) kinds.push_back("image");
+            if (flux_ || qwen_edit_) kinds.push_back("image-edit");
             if (ltxv_) kinds.push_back("video");
             if (snac_) kinds.push_back("speech");
             if (rerank_) kinds.push_back("rerank");
@@ -2650,8 +2655,10 @@ void OpenAiServer::install_routes() {
                         std::vector<float> e;
                         {
                             std::lock_guard<std::mutex> lk(classifier_mu_);
-                            e = classifier_->run(img, encoder_gpu_ops() !=
-                                                          nullptr)
+                            // Its convs run on Vulkan only (not CUDA).
+                            e = classifier_
+                                    ->run(img, backend::
+                                                   vulkan_imports_host_memory())
                                     .embedding;
                         }
                         data.push_back({{"object", "embedding"},
@@ -2772,10 +2779,12 @@ void OpenAiServer::install_routes() {
                 {
                     std::lock_guard<std::mutex> lk(classifier_mu_);
                     // The convs on the GPU where it shares host memory
-                    // (Apple), as the embedding encoders (#512).
-                    logits =
-                        classifier_->run(img, encoder_gpu_ops() != nullptr)
-                            .logits;
+                    // (Apple), as the embedding encoders (#512); they
+                    // run on Vulkan only, so not on CUDA.
+                    logits = classifier_
+                                 ->run(img,
+                                       backend::vulkan_imports_host_memory())
+                                 .logits;
                 }
                 json out = json::array();
                 for (const auto& [c, p] : image::cnn::top_k(
