@@ -196,15 +196,19 @@ TEST_CASE("bench: out_w_ n x matvec_cuda vs matvec_batch_cuda",
     SUCCEED();
 }
 
-// i#519: one embedding pass on the CPU against the CUDA ops, at the
-// sizes EmbeddingModel's GPU thresholds (kGpuMinTokens, kGpuMacs) were
-// set from on Apple. Each input is the same sentence repeated; the
-// best of three runs after a warm-up.
-TEST_CASE("bench: encoder pass cpu vs cuda", "[.][bench][cuda]") {
-    const auto* cuda = find_backend("cuda");
-    if (cuda == nullptr || !cuda->available) {
-        SKIP("no usable CUDA device");
-    }
+namespace {
+
+/**
+ * One embedding pass on the CPU against `gpu` for each encoder model
+ * present, at the sizes EmbeddingModel's GPU thresholds (kGpuMinTokens,
+ * kGpuMacs) were set from on Apple. Each input is the same sentence
+ * repeated; the best of three runs after a warm-up.
+ *
+ * @param name The GPU's name in the report.
+ * @param reset Frees the GPU's weight pool before each model.
+ */
+void bench_encoders(const char* name, const Ops& gpu,
+                    void (*reset)()) {
     const auto& cpu = best_backend().ops;
     const std::string sentence =
         "Beijing is the capital of the People's Republic of China. ";
@@ -228,7 +232,7 @@ TEST_CASE("bench: encoder pass cpu vs cuda", "[.][bench][cuda]") {
             std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + file;
         if (!std::filesystem::exists(path)) continue;
         const auto m = locus::embed::EmbeddingModel::load(path);
-        cuda_pool_reset();
+        reset();
         // About 15, 60, 120 and 470 tokens in one pass: up to eight
         // inputs of one sentence, or one long input under the 512-token
         // limit (13 tokens a sentence on bge-small).
@@ -242,11 +246,34 @@ TEST_CASE("bench: encoder pass cpu vs cuda", "[.][bench][cuda]") {
             std::size_t tokens = 0;
             m->embed(in, cpu, &tokens);
             const double c = best_ms([&] { m->embed(in, cpu); });
-            const double g = best_ms([&] { m->embed(in, cuda->ops); });
-            WARN(file << " " << tokens << " tokens: cpu " << c
-                      << " ms, cuda " << g << " ms (" << c / g << "x)");
+            const double g = best_ms([&] { m->embed(in, gpu); });
+            WARN(file << " " << tokens << " tokens: cpu " << c << " ms, "
+                      << name << " " << g << " ms (" << c / g << "x)");
         }
     }
+}
+
+}  // namespace
+
+// i#519: the encoder passes on the CUDA ops.
+TEST_CASE("bench: encoder pass cpu vs cuda", "[.][bench][cuda]") {
+    const auto* cuda = find_backend("cuda");
+    if (cuda == nullptr || !cuda->available) {
+        SKIP("no usable CUDA device");
+    }
+    bench_encoders("cuda", cuda->ops, &cuda_pool_reset);
+    SUCCEED();
+}
+
+// i#680: the encoder passes on the Vulkan image ops, which copy the
+// weights into the device pool where the GPU does not import host
+// memory. The server uses them only where Vulkan is measured faster
+// than the CPU (vulkan_device_beats_cpu); this times any device.
+TEST_CASE("bench: encoder pass cpu vs vulkan", "[.][bench][vulkan]") {
+    if (!vulkan_backend_usable()) {
+        SKIP("no Vulkan device");
+    }
+    bench_encoders("vulkan", vulkan_image_ops(), &vulkan_reset_state);
     SUCCEED();
 }
 

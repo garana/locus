@@ -27,6 +27,7 @@
 #include "locus/http/base64.hpp"
 #include "locus/backend/fallbacks.hpp"
 #include "locus/backend/gpu_metrics.hpp"
+#include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/image/classifier.hpp"
 #include "locus/image/image_input.hpp"
@@ -92,14 +93,24 @@ struct SseKeepalive {
  *  (EmbeddingModel::kGpuMacs): the Vulkan image ops where the GPU
  *  imports host memory, as for PixArt (the weights stay in the GGUF
  *  mapping, #512); else the CUDA ops when a CUDA device is usable, the
- *  matrices through its batched matvec (i#519); else null, the CPU
- *  everywhere. */
+ *  matrices through its batched matvec (i#519); else the Vulkan image
+ *  ops on a device measured faster than the CPU (a discrete GPU), which
+ *  copy the weights into the device pool: under 700 MB for these models
+ *  (i#680); else null, the CPU everywhere. Not on V3D or llvmpipe,
+ *  which run these passes slower than the CPU (i#612). */
 const backend::Ops* encoder_gpu_ops() {
     if (backend::vulkan_imports_host_memory()) {
         return &backend::vulkan_image_ops();
     }
     const backend::Backend* cuda = backend::find_backend("cuda");
-    return cuda != nullptr && cuda->available ? &cuda->ops : nullptr;
+    if (cuda != nullptr && cuda->available) {
+        return &cuda->ops;
+    }
+    if (backend::vulkan_backend_usable() &&
+        backend::vulkan_device_beats_cpu()) {
+        return &backend::vulkan_image_ops();
+    }
+    return nullptr;
 }
 
 /** @returns The OpenAI flat error envelope. @param type

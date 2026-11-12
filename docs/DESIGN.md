@@ -702,7 +702,9 @@ guarding the default path.
   weight read once per 32 tokens, and the attention on the CPU, since
   dense::attention keeps a GPU that caches weights by host pointer
   off its temporary buffers. The image classifier's convs stay on
-  Vulkan only. Other Vulkan GPUs: #519. Otherwise
+  Vulkan only. Without CUDA, a discrete Vulkan GPU runs them on the
+  Vulkan image ops, the weights copied into its pool (under 700 MB);
+  V3D and llvmpipe keep the CPU, which is faster there (i#680). Otherwise
   `/v1/embeddings` returns the chat model's last token's final-normed
   hidden state, L2-normalized, on a dedicated cache; CPU and CUDA
   backends only (`TransformerModel::embed` refuses vulkan).
