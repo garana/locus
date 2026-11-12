@@ -48,28 +48,43 @@ std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
                                          std::uint32_t gh, std::uint32_t gw,
                                          std::uint32_t drop,
                                          const backend::Ops& op) {
-    const std::uint32_t E = lm.hparams().n_embd;
-    const std::uint32_t mg = vision.merge_size();
-    if (vision.out_dim() != E) {
+    if (vision.out_dim() != lm.hparams().n_embd) {
         throw std::invalid_argument(
             "qwen edit: the vision tower's width is not the model's");
     }
+    const std::uint32_t mg = vision.merge_size();
     if (gh == 0 || gw == 0 || gh % mg != 0 || gw % mg != 0) {
         throw std::invalid_argument("qwen edit: bad patch grid");
     }
-    const std::uint32_t n_image = gh * gw / (mg * mg);
+    const auto img = vision.encode(patches, gh, gw, op);
+    return qwen_edit_text_embeds(lm, img, ids, image_at, gh / mg, gw / mg,
+                                 drop);
+}
+
+std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
+                                         std::span<const float> image_rows,
+                                         std::span<const tok::TokenId> ids,
+                                         std::uint32_t image_at,
+                                         std::uint32_t grid_h,
+                                         std::uint32_t grid_w,
+                                         std::uint32_t drop) {
+    const std::uint32_t E = lm.hparams().n_embd;
+    const std::uint32_t n_image = grid_h * grid_w;
+    if (n_image == 0 || image_rows.size() != std::size_t{n_image} * E) {
+        throw std::invalid_argument(
+            "qwen edit: the image rows do not match the grid and the "
+            "model's width");
+    }
     const auto n = static_cast<std::uint32_t>(ids.size());
     if (image_at == 0 || image_at + n_image > n || drop >= n) {
         throw std::invalid_argument(
             "qwen edit: the image span or the drop does not fit the ids");
     }
-    const auto img = vision.encode(patches, gh, gw, op);
-
     std::vector<const float*> embd(n, nullptr);
     for (std::uint32_t i = 0; i < n_image; ++i) {
-        embd[image_at + i] = img.data() + std::size_t{i} * E;
+        embd[image_at + i] = image_rows.data() + std::size_t{i} * E;
     }
-    const auto pos = model::mrope_positions(image_at, gh / mg, gw / mg,
+    const auto pos = model::mrope_positions(image_at, grid_h, grid_w,
                                             n - image_at - n_image);
     auto cache = lm.make_cache();
     auto ws = lm.make_workspace();

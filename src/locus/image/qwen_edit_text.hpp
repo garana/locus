@@ -84,4 +84,24 @@ std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
                                          std::uint32_t drop,
                                          const backend::Ops& op);
 
+/**
+ * qwen_edit_text_embeds with the vision tower's rows already computed,
+ * so one image serves several prompts (the prompt and the negative
+ * prompt, i#671).
+ *
+ * @param image_rows grid_h * grid_w rows of lm's width (the tower's
+ *     merged output, QwenVision::encode).
+ * @param grid_h Merged-token rows (patch rows / merge_size()).
+ * @param grid_w Merged-token columns.
+ * @returns (ids.size() - drop) rows of lm's width, token-major.
+ * @throws std::invalid_argument on a size that does not match.
+ */
+std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
+                                         std::span<const float> image_rows,
+                                         std::span<const tok::TokenId> ids,
+                                         std::uint32_t image_at,
+                                         std::uint32_t grid_h,
+                                         std::uint32_t grid_w,
+                                         std::uint32_t drop);
+
 }  // namespace locus::image

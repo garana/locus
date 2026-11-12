@@ -130,11 +130,12 @@ class QwenEditPipeline {
   private:
     QwenEditPipeline() = default;
 
-    /** The prompt's conditioning rows with the reference's patches. */
+    /** The prompt's conditioning rows with the reference's vision
+     *  tower rows (grid_h x grid_w merged tokens, encoded once for
+     *  every prompt of the edit). */
     std::vector<float> text_rows(const std::string& prompt,
-                                 std::span<const float> patches,
-                                 std::uint32_t gh, std::uint32_t gw,
-                                 const backend::Ops& op,
+                                 std::span<const float> image_rows,
+                                 std::uint32_t grid_h, std::uint32_t grid_w,
                                  std::uint32_t& n) const;
 
     std::vector<std::unique_ptr<gguf::GgufFile>> files_;
