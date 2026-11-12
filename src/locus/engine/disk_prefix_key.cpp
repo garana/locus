@@ -57,10 +57,8 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
     // and the batch-invariant kernels. The device too: two GPUs on one
     // backend do not round alike.
     o = fnv(o, m.q8k_activations());
-    // The MoE hybrid as decided, not only its variable: unset turns it
-    // on where the weights do not fit (i#652), and its cold experts
-    // round as the CPU does.
-    o = fnv(o, m.moe_hybrid_on());
+    // Not the MoE hybrid: the engine refuses a store while it is on
+    // (i#664), and asking here would settle it before the KV pool.
     // Debug and offload switches read from the environment that pick
     // other kernels or another expert split: their raw values.
     for (const char* var : {"LOCUS_BATCH_DEQUANT", "LOCUS_MOE_HYBRID",
@@ -107,15 +105,6 @@ std::shared_ptr<DiskPrefixStore> open_disk_prefix(
     const std::string& dir, std::uint64_t cap_bytes,
     const gguf::GgufFile& g, const std::string& path,
     const model::TransformerModel& m, kv::KvType kv_type) {
-    const std::string_view be = m.active_backend().name;
-    if (m.hparams().n_expert > 0 && be == "cuda") {
-        // CUDA's expert split also follows the free device memory, and
-        // has no query the key could hold yet (Vulkan's: the engine
-        // sets DiskKey::experts_on_gpu).
-        throw std::invalid_argument(
-            "--prefix-cache-dir: not supported for MoE models on CUDA "
-            "yet");
-    }
     std::size_t bb = 0;
     DiskKey k = disk_key_for(g, path, m, kv_type, bb);
     return std::make_shared<DiskPrefixStore>(dir, std::move(k), bb,

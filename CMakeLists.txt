@@ -327,6 +327,7 @@ if(Vulkan_FOUND)
             matvec_q4_k_glu_p=matvec_q4_k:BATCHED,SWIGLU,PAIRS
             matvec_q6_k_p=matvec_q6_k:BATCHED,PAIRS
             matvec_q4_k_seg=matvec_q4_k:SEGMENTS
+            matvec_q4_k_glu=matvec_q4_k:SWIGLU
             matmul_q4_k=matmul:TYPE_Q4K
             matmul_q6_k=matmul:TYPE_Q6K
             matmul_q4_k_id=matmul:TYPE_Q4K,MOE_ID

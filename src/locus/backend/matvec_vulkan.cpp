@@ -973,21 +973,38 @@ std::size_t q4k_seg_count(const Mat& q, const Mat& k, const Mat& v) {
  * Records the matvecs of 2 or 3 Q4_K matrices reading x
  * (q4k_seg_count) as one matvec_q4_k_seg dispatch, each read from its
  * own upload: ms[0]'s rows to out at out_off, ms[1]'s to out2 at off1,
- * ms[2]'s (if any) to out2 at off2.
+ * ms[2]'s (if any) to out2 at off2, roped per `rope` (default: none),
+ * as rec_matvec_seg.
  */
 void rec_matvec_q4k_seg(State& s, std::span<const Mat* const> ms,
                         VulkanContext::Buffer x, VulkanContext::Buffer out,
                         std::uint32_t out_off, VulkanContext::Buffer out2,
-                        std::uint32_t off1, std::uint32_t off2) {
+                        std::uint32_t off1, std::uint32_t off2,
+                        const SegRope& rope = {}) {
     const std::uint32_t seg1 = ms[0]->rows;
     const std::uint32_t seg2 = seg1 + ms[1]->rows;
+    // The epilogue's pairs are two rows of one 8-row workgroup: seg1
+    // and the rope spans even (rec_matvec_seg's invariants).
+    if ((rope.rd0 != 0 || rope.rd1 != 0) &&
+        (seg1 % 2 != 0 ||
+         !vk::seg_rope_fits(seg1, rope.hs0, rope.ro0, rope.rd0) ||
+         !vk::seg_rope_fits(ms[1]->rows, rope.hs1, rope.ro1, rope.rd1))) {
+        throw std::logic_error("matvec_q4_k_seg: rope spec breaks the "
+                               "epilogue's pairing invariants");
+    }
     const std::uint32_t rows = seg2 + (ms.size() > 2 ? ms[2]->rows : 0);
     const VulkanContext::Buffer w1 = s.upload_w(*ms[1]);
     const VulkanContext::Buffer bufs[] = {
         s.upload_w(*ms[0]), x, out, out2, w1,
-        ms.size() > 2 ? s.upload_w(*ms[2]) : w1};
-    const std::uint32_t push[] = {rows, ms[0]->cols, out_off, 0, 0, 0,
-                                  fbits(1.0f), seg1, off1, seg2, off2};
+        ms.size() > 2 ? s.upload_w(*ms[2]) : w1,
+        rope.divisors.impl != nullptr ? rope.divisors : x};
+    const std::uint32_t push[] = {
+        rows,         ms[0]->cols, out_off,     0,
+        0,            0,           fbits(1.0f), seg1,
+        off1,         seg2,        off2,        rope.hs0,
+        rope.ro0,     rope.rd0,    rope.hs1,    rope.ro1,
+        rope.rd1,     rope.pos,    rope.base_bits, rope.fs_bits,
+        rope.lo_bits, rope.hi_bits};
     s.ctx.dispatch(Kernel::kMatvecQ4_KSeg, bufs, push,
                    VulkanContext::matvec_groups(Kernel::kMatvecQ4_KSeg,
                                                 rows));
@@ -2621,6 +2638,21 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             s.ctx.dispatch(Kernel::kMatvecQ8_0Glu, bufs, push,
                            VulkanContext::matvec_groups(
                                Kernel::kMatvecQ8_0Glu, ff));
+        } else if (wg.type == gguf::TensorType::kQ4_K &&
+                   wu.type == gguf::TensorType::kQ4_K &&
+                   wg.cols == wu.cols && off_g == off_u) {
+            // The same for Q4_K (i#688): binding 3 is unused.
+            const VulkanContext::Buffer gw =
+                whole_g != nullptr ? *whole_g : s.upload_w(g2);
+            const VulkanContext::Buffer bufs[] = {
+                gw, s.xb, s.gate, gw,
+                whole_u != nullptr ? *whole_u : s.upload_w(u2)};
+            const std::uint32_t push[] = {
+                ff, wg.cols, 0, 0, w_off_units(wg, off_g), 0,
+                fbits(1.0f)};
+            s.ctx.dispatch(Kernel::kMatvecQ4_KGlu, bufs, push,
+                           VulkanContext::matvec_groups(
+                               Kernel::kMatvecQ4_KGlu, ff));
         } else {
             rec_matvec(s, g2, s.xb, s.gate, 0, false, off_g, 0, 1.0f,
                        whole_g);
@@ -2668,8 +2700,10 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             const bool qk_norm = lay.has_qk_norm();
             const bool bias = lay.has_qkv_bias();
             // Biases land before rope, so no epilogue rope with them.
-            const bool epi_rope =
-                fused && !hp.rope_neox && !qk_norm && !bias;
+            // The Q4_K stacked projection ropes in its epilogue too
+            // (i#688).
+            const bool epi_rope = (fused || n_q4k_seg > 0) &&
+                                  !hp.rope_neox && !qk_norm && !bias;
             const Kernel rope_k =
                 hp.rope_neox ? Kernel::kRopeNeox : Kernel::kRope;
             // q-k-norm models norm and rope q and K in one dispatch,
@@ -2698,22 +2732,22 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             const std::uint32_t k_at = f16 ? 0 : row_off;
             const std::uint32_t v_at =
                 f16 ? kv_dim : row_off + layer_stride / 2;
+            SegRope rope;  // rd 0: no epilogue rope
+            if (epi_rope) {
+                // q and k roped in the epilogue (whole heads).
+                rope.hs0 = rope.rd0 = hp.head_dim;
+                rope.hs1 = rope.rd1 = hp.head_dim;
+                rope.pos = pos;
+                rope.base_bits = base_bits;
+                rope.fs_bits = fbits(1.0f);
+                rope.divisors = divisors;
+            }
             if (fused) {
-                SegRope rope;  // rd 0: no epilogue rope
-                if (epi_rope) {
-                    // q and k roped in the epilogue (whole heads).
-                    rope.hs0 = rope.rd0 = hp.head_dim;
-                    rope.hs1 = rope.rd1 = hp.head_dim;
-                    rope.pos = pos;
-                    rope.base_bits = base_bits;
-                    rope.fs_bits = fbits(1.0f);
-                    rope.divisors = divisors;
-                }
                 rec_matvec_seg(s, qkv, s.xb, s.q, 0, kv_dst, k_at, v_at,
                                rope);
             } else if (n_q4k_seg > 0) {
                 rec_matvec_q4k_seg(s, {qkv, n_q4k_seg}, s.xb, s.q, 0,
-                                   kv_dst, k_at, v_at);
+                                   kv_dst, k_at, v_at, rope);
             } else {
                 rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
             }

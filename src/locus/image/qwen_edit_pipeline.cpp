@@ -161,23 +161,15 @@ std::vector<float> QwenEditPipeline::edit_from(
     const auto patches = vision_->patches(r.text_image.rgb, th, tw);
     // The vision tower once, for the prompt and the negative prompt
     // alike (i#671).
-    const std::uint32_t gh = th / ps, gw = tw / ps;
-    const std::uint32_t mg = vision_->merge_size();
-    if (vision_->out_dim() != lm_->hparams().n_embd) {
-        throw std::invalid_argument(
-            "qwen edit: the vision tower's width is not the model's");
-    }
-    if (gh == 0 || gw == 0 || gh % mg != 0 || gw % mg != 0) {
-        throw std::invalid_argument("qwen edit: bad patch grid");
-    }
-    const auto image_rows = vision_->encode(patches, gh, gw, op);
+    const auto ref =
+        qwen_edit_image_rows(*lm_, *vision_, patches, th / ps, tw / ps, op);
     std::uint32_t n_pos = 0, n_neg = 0;
     const auto pos =
-        text_rows(req.prompt, image_rows, gh / mg, gw / mg, n_pos);
+        text_rows(req.prompt, ref.rows, ref.grid_h, ref.grid_w, n_pos);
     std::vector<float> neg;
     if (req.negative_prompt && req.true_cfg_scale > 1.0f) {
-        neg = text_rows(*req.negative_prompt, image_rows, gh / mg, gw / mg,
-                        n_neg);
+        neg = text_rows(*req.negative_prompt, ref.rows, ref.grid_h,
+                        ref.grid_w, n_neg);
     }
     const auto lat = qwen_edit_reference_latents(
         *vae_, r.vae_input, r.vae_image.h, r.vae_image.w, op);

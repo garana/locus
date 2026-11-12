@@ -176,7 +176,8 @@ class Engine {
          * written to it too, and read back on readmission. Its key
          * must match this engine's cache geometry and KV type.
          * Models with per-sequence state outside the KV pool (a DSA
-         * indexer, deepseek41) are refused. */
+         * indexer, deepseek41) are refused, and so is a model with the
+         * MoE hybrid on (i#664). */
         std::shared_ptr<DiskPrefixStore> disk_prefix;
         /** Cap on the bytes of queued write-backs; past it a
          * write-back is dropped, and a preempted sequence's blocks are
