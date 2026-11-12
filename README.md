@@ -159,35 +159,32 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 
 ### Speed
 
-| Workload                                   | Hardware          | Speed                      |
-|--------------------------------------------|-------------------|----------------------------|
-| Llama-3.2-1B Q8_0 decode, Vulkan           | M4 Max (MoltenVK) | 204 tok/s                  |
-| Llama-3.2-1B Q8_0 prefill, 2.5k tokens     | M4 Max (MoltenVK) | 1940 tok/s                 |
-| DeepSeek-Coder-V2-Lite Q8_0 decode, Vulkan | M4 Max (MoltenVK) | 88 tok/s                   |
-| Llama-3.2-1B Q8_0 decode, CPU              | M4 Max (neon)     | 89 tok/s                   |
-| Orpheus 3B Q4_K_M decode, CPU              | M4 Max (neon)     | 92 tok/s                   |
-| Janus-Pro-1B, one image                    | M2 Pro (MoltenVK) | 22 s, decode included      |
-| Orpheus speech, 3.8 s clip                 | M2 Pro (MoltenVK) | 12 s; first audio at 1.7 s |
+| Workload                                   | Hardware          | Speed                                  |
+|--------------------------------------------|-------------------|----------------------------------------|
+| Llama-3.2-1B Q4_K_M decode, Vulkan         | M4 Max (MoltenVK) | 299 tok/s (llama.cpp Metal: 312)       |
+| Llama-3.2-1B Q8_0 decode, Vulkan           | M4 Max (MoltenVK) | 214 tok/s (llama.cpp Metal: 223)       |
+| Orpheus 3B Q4_K_M decode, Vulkan           | M4 Max (MoltenVK) | 131 tok/s (llama.cpp Metal: 135)       |
+| Llama-3.2-1B Q8_0 prefill, 2.5k tokens     | M4 Max (MoltenVK) | 1940 tok/s                             |
+| DeepSeek-Coder-V2-Lite Q8_0 decode, Vulkan | M4 Max (MoltenVK) | 88 tok/s                               |
+| Llama-3.2-1B Q8_0 decode, CPU              | M4 Max (neon)     | 89 tok/s                               |
+| Llama-3.2-1B Q8_0 prefill, 8k tokens, CPU  | M2 Pro (neon)     | 124 tok/s                              |
+| Janus-Pro-1B, one image                    | M2 Pro (MoltenVK) | 22 s, decode included                  |
+| Orpheus speech, 3.8 s clip                 | M2 Pro (MoltenVK) | 12 s; first audio at 1.7 s             |
+| Qwen-Image-Edit, 512 x 512, 20 steps       | M4 Max (MoltenVK) | 344 s denoise with `auto_resize` false |
 
 ### Pending
 
-- Multimedia (#143): diffusion image speed (#146), video (#148), real-time
-  speech (#173), faster image input (#257), FLUX.1 LoRAs (#372:
-  `--lora-dir` and the `lora` field apply converted ones, on the CPU
-  and in the whole-step GPU forward), Qwen-Image-Edit (#529: on
-  `/v1/images/edits`, matched end to end against diffusers on tiny
-  models; the language model runs on the CPU, the MMDiT and the VAE
-  also on Vulkan; a run with the real weights and its speed are
-  pending), CNN image classifiers
-  (#274: ResNet-50 and Inception-v3 on `/v1/classify` and
-  `/v1/embeddings`; the convs run on Vulkan when the GPU maps host
-  memory).
-- Performance: CPU decode against llama.cpp (#206), Vulkan K-quant
-  bandwidth (#179), hot MoE experts on the GPU (#252).
+- Multimedia (#143): real-time speech on the M2 Pro (#173; the M4 Max
+  runs at 1.34x real time), Qwen-Image-Edit's 65 s CPU encode (#671,
+  parked: the edit's working set does not fit a 36 GiB host with the
+  language model on the GPU).
+- Performance: prefill on Apple GPUs at about half of Metal's (#10:
+  MoltenVK exposes no cooperative matrix), CPU prefill (#618: x86
+  SSE4, long-context attention #701), batch-invariant decode at full
+  speed on V3D (#511).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
-- Low priority: a quantized KV cache for MLA and DSA models (#63).
 
 ## Build and test
 
