@@ -70,12 +70,6 @@ std::uint64_t env_u64(const char* name, std::uint64_t def) {
  */
 struct MoeHybrid {
     std::once_flag once;
-    /** moe_hybrid_on()'s answer, decided once per backend: the pool
-     *  budget it reads follows the free VRAM, so a second look could
-     *  disagree. */
-    std::mutex decide_mu;
-    const backend::Backend* decided_for = nullptr;
-    bool on = false;
     /** Null when the mode is off. */
     std::unique_ptr<ExpertCache> cache;
     /** The backend the cache was sized for. */
@@ -105,6 +99,39 @@ struct MoeHybrid {
 
 bool weights_stream(std::uint64_t weight_bytes, std::uint64_t ram_bytes) {
     return ram_bytes == 0 || weight_bytes > ram_bytes / 2;
+}
+
+std::uint64_t stage_weight_bytes(const gguf::GgufFile& g,
+                                 std::uint32_t layer_begin,
+                                 std::uint32_t layer_end,
+                                 std::uint32_t n_layers) {
+    const bool first = layer_begin == 0;
+    const bool last = layer_end >= n_layers;
+    const bool tied = g.find_tensor("output.weight") == nullptr;
+    std::uint64_t bytes = 0;
+    // Every shard of a split model, not only the first file's tensors.
+    g.for_each_file([&](const gguf::GgufFile& f) {
+        for (const gguf::TensorInfo& t : f.tensors()) {
+            bool mine;
+            std::uint32_t l = 0;
+            const char* s = t.name.c_str();
+            if (t.name.rfind("blk.", 0) == 0 &&
+                std::sscanf(s + 4, "%u", &l) == 1) {
+                // Past n_layers (a next-token head's blocks): the last
+                // stage.
+                mine = l < n_layers ? l >= layer_begin && l < layer_end
+                                    : last;
+            } else if (t.name == "token_embd.weight") {
+                mine = first || (last && tied);
+            } else {
+                mine = last;  // the output norm and head
+            }
+            if (mine) {
+                bytes += t.nbytes;
+            }
+        }
+    });
+    return bytes;
 }
 
 namespace {
@@ -376,10 +403,11 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     m.spec_ = spec;
     m.file_backed_ = g.file_backed();
     std::uint64_t weight_bytes = 0;
-    for (const TensorInfo& t : g.tensors()) {
-        weight_bytes += t.nbytes;
-    }
-    m.weight_bytes_ = weight_bytes;
+    g.for_each_file([&](const GgufFile& f) {  // every shard
+        for (const TensorInfo& t : f.tensors()) {
+            weight_bytes += t.nbytes;
+        }
+    });
     m.advise_weights_ = readahead_enabled() &&
                         weights_stream(weight_bytes, sys::total_ram_bytes());
     Hparams& hp = m.hp_;
@@ -431,6 +459,8 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     }
     m.layer_begin_ = layer_begin;
     m.layer_end_ = layer_end;
+    m.weight_bytes_ =
+        stage_weight_bytes(g, layer_begin, layer_end, hp.n_layers);
     // A stage maps only the model-level weights it runs (i#29): the
     // embedding on the first stage, the output norm and head on the
     // last. A tied head is the embedding, so a last stage keeps it.
@@ -887,6 +917,12 @@ void TransformerModel::forward_layers(tok::TokenId token,
     }
     const bool first = layer_begin == 0;
     const bool last = layer_end == hp_.n_layers;
+    // forward()'s row check, here too: forward_layers is public, and
+    // the head's mat_rows would wrap on a reversed range.
+    if (last && rows.end != 0 &&
+        (rows.begin >= rows.end || rows.end > hp_.n_vocab)) {
+        throw std::invalid_argument("forward_layers: bad logit row range");
+    }
     // At layer 0 a non-empty hidden_in is the input embedding itself,
     // used instead of the token's row (Janus image tokens enter through
     // their own embedding and aligner).
@@ -939,14 +975,14 @@ void TransformerModel::forward_layers(tok::TokenId token,
         return;
     }
     const std::uint32_t pos = seq.n_tokens;
-    if (first && last && backend_->name == "cuda" &&
-        (rows.end == 0 || (rows.begin == 0 && rows.end == hp_.n_vocab))) {
+    if (first && last && backend_->name == "cuda") {
         // Plain llama on CUDA, the whole model: the layers on the GPU
-        // (i#517), as every other CUDA forward of the full model.
+        // (i#517), as every other CUDA forward of the full model, and
+        // only the requested head rows (speech's, i#689).
         kv::PagedKvCache::Seq* one = &seq;
         const float* e = embed_in ? hidden_in.data() : nullptr;
         if (cuda_forward({&token, 1}, {&one, 1}, {&pos, 1}, cache, ws, out,
-                         false, {&e, 1})) {
+                         false, {&e, 1}, rows)) {
             lap.lap(kNoLayer, Stage::kDevice);
             seq.n_tokens = pos + 1;
             return;
@@ -2223,26 +2259,7 @@ bool moe_hybrid_wanted(const char* env, bool pooled, std::uint64_t weights,
 }
 
 bool TransformerModel::moe_hybrid_on() const {
-    MoeHybrid* h = moe_hybrid_.get();
-    if (h == nullptr) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lk(h->decide_mu);
-    if (h->decided_for != backend_) {
-        bool moe = false;
-        for (std::uint32_t l = layer_begin_; l < layer_end_; ++l) {
-            moe = moe || layers_[l].is_moe();
-        }
-        const backend::Ops& op = backend_->ops;
-        const bool pooled = op.prefetch != nullptr && op.evict != nullptr &&
-                            op.pool_budget != nullptr;
-        h->on = moe && moe_hybrid_wanted(
-                           std::getenv("LOCUS_MOE_HYBRID"), pooled,
-                           weight_bytes_,
-                           pooled ? op.pool_budget() / 10 * 9 : 0);
-        h->decided_for = backend_;
-    }
-    return h->on;
+    return moe_hybrid() != nullptr;
 }
 
 MoeHybrid* TransformerModel::moe_hybrid() const {
@@ -2251,10 +2268,16 @@ MoeHybrid* TransformerModel::moe_hybrid() const {
         return nullptr;
     }
     std::call_once(h->once, [&] {
-        if (!moe_hybrid_on()) {
+        // Decided once, with the hot zone: the pool budget follows the
+        // free VRAM, so a second look could disagree.
+        const backend::Ops& op = backend_->ops;
+        const bool pooled = op.prefetch != nullptr && op.evict != nullptr &&
+                            op.pool_budget != nullptr;
+        if (!moe_hybrid_wanted(std::getenv("LOCUS_MOE_HYBRID"), pooled,
+                               weight_bytes_,
+                               pooled ? op.pool_budget() / 10 * 9 : 0)) {
             return;
         }
-        const backend::Ops& op = backend_->ops;
         std::uint32_t n_moe = 0;
         std::uint64_t expert_bytes = 0, routed_bytes = 0;
         for (std::uint32_t l = layer_begin_; l < layer_end_; ++l) {

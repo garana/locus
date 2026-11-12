@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -264,6 +265,94 @@ TEST_CASE("moe_hybrid_wanted: on by default when the weights do not fit",
     // No pool (the CPU, Vulkan today): off, even when forced.
     REQUIRE_FALSE(moe_hybrid_wanted(nullptr, false, 9 * kGiB, 0));
     REQUIRE_FALSE(moe_hybrid_wanted("1", false, 9 * kGiB, 0));
+}
+
+TEST_CASE("stage_weight_bytes counts the tensors a stage loads",
+          "[moe]") {
+    using locus::model::stage_weight_bytes;
+    // f32 tensors of distinct sizes, so each sum names its tensors.
+    const auto image = [](bool tied) {
+        std::vector<std::pair<std::string, std::uint64_t>> ts = {
+            {"token_embd.weight", 64},  // 256 bytes
+            {"blk.0.attn_q.weight", 8},  // 32
+            {"blk.1.attn_q.weight", 16},  // 64
+            {"blk.2.attn_q.weight", 512},  // 2048, a next-token block
+            {"output_norm.weight", 32},  // 128
+        };
+        if (!tied) {
+            ts.push_back({"output.weight", 1024});  // 4096
+        }
+        GgufBuilder b;
+        b.header(ts.size(), 1).kv_string("general.architecture", "llama");
+        std::uint64_t offset = 0;
+        for (const auto& [name, n] : ts) {
+            const std::uint64_t dims[] = {n};
+            b.tensor(name, dims, 0, offset);
+            offset += n * 4;
+        }
+        b.pad();
+        b.zeros(offset);
+        auto span = b.bytes();
+        return std::vector<std::byte>(span.begin(), span.end());
+    };
+    const auto img = image(false);
+    const auto g = locus::gguf::GgufFile::parse(img);
+    // Two layers: [0, 1) and [1, 2); blk.2 is past n_layers.
+    REQUIRE(stage_weight_bytes(g, 0, 2, 2) == 256 + 32 + 64 + 2048 + 128 +
+                                                   4096);
+    REQUIRE(stage_weight_bytes(g, 0, 1, 2) == 256 + 32);
+    REQUIRE(stage_weight_bytes(g, 1, 2, 2) == 64 + 2048 + 128 + 4096);
+    // A tied head is the embedding: the last stage holds it too.
+    const auto tied_img = image(true);
+    const auto t = locus::gguf::GgufFile::parse(tied_img);
+    REQUIRE(stage_weight_bytes(t, 1, 2, 2) == 256 + 64 + 2048 + 128);
+
+    // A split model: the second shard's tensors count too.
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() /
+                         ("locus-stage-split-" +
+                          std::to_string(std::random_device{}()));
+    fs::create_directories(dir);
+    struct Cleanup {
+        fs::path dir;
+        ~Cleanup() {
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+        }
+    } cleanup{dir};
+    const auto shard = [&](const char* name, std::uint32_t no,
+                           std::vector<std::pair<std::string,
+                                                 std::uint64_t>> ts) {
+        GgufBuilder b;
+        b.header(ts.size(), no == 0 ? 3 : 1);
+        if (no == 0) {
+            b.kv_string("general.architecture", "llama")
+                .kv_u32("split.no", 0)
+                .kv_u32("split.count", 2);
+        } else {
+            b.kv_u32("split.no", no);
+        }
+        std::uint64_t offset = 0;
+        for (const auto& [tn, n] : ts) {
+            const std::uint64_t dims[] = {n};
+            b.tensor(tn, dims, 0, offset);
+            offset += n * 4;
+        }
+        b.pad();
+        b.zeros(offset);
+        std::ofstream f(dir / name, std::ios::binary);
+        const auto bytes = b.bytes();
+        f.write(reinterpret_cast<const char*>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size()));
+    };
+    shard("m-00001-of-00002.gguf", 0,
+          {{"token_embd.weight", 64}, {"blk.0.attn_q.weight", 8}});
+    shard("m-00002-of-00002.gguf", 1,
+          {{"blk.1.attn_q.weight", 16}, {"output_norm.weight", 32}});
+    const auto s =
+        locus::gguf::GgufFile::open((dir / "m-00001-of-00002.gguf").string());
+    REQUIRE(stage_weight_bytes(s, 0, 2, 2) == 256 + 32 + 64 + 128);
+    REQUIRE(stage_weight_bytes(s, 1, 2, 2) == 256 + 64 + 128);  // tied
 }
 
 TEST_CASE("identical experts reproduce the dense model exactly",
@@ -831,6 +920,54 @@ TEST_CASE("cuda MoE hybrid prefill and decode match the all-GPU run",
     unsetenv("LOCUS_MOE_HYBRID_SLOTS");
     unsetenv("LOCUS_MOE_STEP");
     unsetenv("LOCUS_MOE_HYBRID");
+    ExpertCalls::reset();
+}
+
+TEST_CASE("moe_hybrid_on is what the forward runs after a backend switch",
+          "[moe][cuda]") {
+    using locus::model::ExpertCalls;
+    if (!locus::backend::cuda_backend_usable()) {
+        SKIP("no usable CUDA device");
+    }
+    locus::backend::cuda_pool_reset();
+    ModelBuilder moe;
+    moe.common();
+    moe.tensor("blk.0.ffn_gate_inp.weight", {kE, 4}, weights(kE * 4, 80));
+    moe.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 81));
+    moe.tensor("blk.0.ffn_up_exps.weight", {kE, kF, 4},
+               weights(kE * kF * 4, 82));
+    moe.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
+               weights(kF * kE * 4, 83));
+    auto img = moe.build(4, 2);
+    auto g = locus::gguf::GgufFile::parse(img);
+    auto model = TransformerModel::load(g);
+    // Unset on any exit, so a failed check does not leak it.
+    struct Hybrid {
+        Hybrid() { setenv("LOCUS_MOE_HYBRID", "1", 1); }
+        ~Hybrid() { unsetenv("LOCUS_MOE_HYBRID"); }
+    } const hybrid;
+    // Asked first on the CPU (no weight pool), as disk_key_for may be:
+    // off, and it stays off once the model moves to CUDA.
+    model.use_backend(*locus::backend::find_backend("scalar"));
+    REQUIRE_FALSE(model.moe_hybrid_on());
+    model.use_backend(*locus::backend::find_backend("cuda"));
+    ExpertCalls::reset();
+    auto cache = model.make_cache();
+    auto ws = model.make_workspace();
+    locus::kv::PagedKvCache::Seq seq;
+    std::vector<float> logits(model.hparams().n_vocab);
+    for (const locus::tok::TokenId t : {3, 7, 1}) {
+        REQUIRE(cache.ensure_capacity(seq, 1));
+        model.forward(t, cache, seq, ws, logits);
+    }
+    cache.release(seq);
+    bool on_cpu = false;
+    for (const auto& c : ExpertCalls::snapshot()) {
+        on_cpu = on_cpu || c.device == "cpu";
+    }
+    REQUIRE_FALSE(on_cpu);
+    REQUIRE_FALSE(model.moe_hybrid_on());
     ExpertCalls::reset();
 }
 

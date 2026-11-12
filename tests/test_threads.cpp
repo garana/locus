@@ -223,6 +223,54 @@ TEST_CASE("gqa_attend is bit-identical across thread counts",
     }
 }
 
+// i#618: gqa_attend_batch runs a block of query tokens per KV head
+// (gqa_kv_block), sharing each key and value row read; every token must
+// equal its own gqa_attend call bit for bit, whatever the block size the
+// thread count and chunk give (a partial last block included).
+TEST_CASE("gqa_attend_batch equals gqa_attend per token", "[threads]") {
+    constexpr std::uint32_t heads = 8, group = 4, hd = 20;
+    constexpr std::uint32_t kv = heads / group * hd;
+    std::uint32_t s = 7;
+    auto rnd = [&s] {
+        s = s * 1664525u + 1013904223u;
+        return static_cast<float>(s >> 8) / (1u << 24) - 0.5f;
+    };
+    // {query tokens, positions cached before them}
+    const std::pair<std::uint32_t, std::uint32_t> shapes[] = {
+        {1, 0}, {1, 9}, {13, 5}, {20, 0}, {7, 31}};
+    for (const auto& [n, base] : shapes) {
+        const std::uint32_t total = base + n;
+        std::vector<float> q(std::size_t{n} * heads * hd),
+            k(std::size_t{total} * kv), v(std::size_t{total} * kv);
+        for (auto* vec : {&q, &k, &v}) {
+            for (auto& x : *vec) {
+                x = rnd();
+            }
+        }
+        auto krow = [&](std::uint32_t t) { return k.data() + t * kv; };
+        auto vrow = [&](std::uint32_t t) { return v.data() + t * kv; };
+        const std::size_t qs = std::size_t{heads} * hd;
+        std::vector<float> want(q.size(), -1.0f);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            locus::model::gqa_attend(q.data() + t * qs, want.data() + t * qs,
+                                     heads, hd, group, base + t, 0.25f, krow,
+                                     vrow);
+        }
+        for (const char* th : {"1", "2", "4", "16"}) {
+            DYNAMIC_SECTION("n " << n << " base " << base << " threads "
+                                 << th) {
+                setenv("LOCUS_THREADS", th, 1);
+                std::vector<float> got(q.size(), -1.0f);
+                locus::model::gqa_attend_batch(q.data(), got.data(), qs, n,
+                                               base, heads, hd, group, 0.25f,
+                                               krow, vrow);
+                unsetenv("LOCUS_THREADS");
+                REQUIRE(got == want);
+            }
+        }
+    }
+}
+
 // i#45: a Scope makes a pool of its own the calling thread's current
 // one, so every loop that thread runs fans out there; it nests, and
 // other threads keep the process-wide pool.
@@ -276,4 +324,27 @@ TEST_CASE("a ThreadPool::Scope reroutes the calling thread's loops",
         REQUIRE(&ThreadPool::instance() == &own);
     }
     REQUIRE(&ThreadPool::instance() == &global);
+}
+
+TEST_CASE("dot_f32_8 sums in its fixed lane order", "[threads]") {
+    // Lane j takes elements j, j + 8, ...; the lanes add as a fixed
+    // tree, then the tail (n = 19: two full rounds and a tail of 3).
+    constexpr std::uint32_t n = 19;
+    std::vector<float> a(n), b(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        a[i] = 1.0f / static_cast<float>(i + 3);
+        b[i] = static_cast<float>(i % 5) - 1.75f;
+    }
+    float acc[8] = {};
+    for (std::uint32_t i = 0; i < 16; ++i) {
+        acc[i % 8] += a[i] * b[i];
+    }
+    float want = ((acc[0] + acc[1]) + (acc[2] + acc[3])) +
+                 ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    for (std::uint32_t i = 16; i < n; ++i) {
+        want += a[i] * b[i];
+    }
+    REQUIRE(locus::model::dot_f32_8(a.data(), b.data(), n) == want);
+    REQUIRE(locus::model::dot_f32_8(a.data(), b.data(), 3) ==
+            (a[0] * b[0] + a[1] * b[1]) + a[2] * b[2]);
 }

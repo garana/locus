@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 #include <vector>
 
@@ -15,9 +16,42 @@
 namespace locus::model {
 
 /**
+ * @returns dot(a, b) over n floats in a fixed order: eight interleaved
+ * partial sums (lane j takes elements j, j + 8, ...), added as a fixed
+ * tree, then the tail. The lanes are explicit, so the compiler
+ * vectorizes the loop without reassociating anything (a plain
+ * reduction stays one serial add chain under strict FP, i#206), and
+ * the result is the same bits on every CPU and thread count.
+ */
+inline float dot_f32_8(const float* a, const float* b, std::uint32_t n) {
+    // Lanes 0..3 in lo, 4..7 in hi (GCC / Clang vector types: one
+    // 4-wide multiply and add per half; the plain 8-lane array loop
+    // vectorizes only 2 wide).
+    typedef float f4 __attribute__((vector_size(16)));
+    f4 lo = {0.0f, 0.0f, 0.0f, 0.0f};
+    f4 hi = lo;
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        f4 a0, a1, b0, b1;
+        std::memcpy(&a0, a + i, sizeof a0);
+        std::memcpy(&a1, a + i + 4, sizeof a1);
+        std::memcpy(&b0, b + i, sizeof b0);
+        std::memcpy(&b1, b + i + 4, sizeof b1);
+        lo += a0 * b0;
+        hi += a1 * b1;
+    }
+    float s = ((lo[0] + lo[1]) + (lo[2] + lo[3])) +
+              ((hi[0] + hi[1]) + (hi[2] + hi[3]));
+    for (; i < n; ++i) {
+        s += a[i] * b[i];
+    }
+    return s;
+}
+
+/**
  * One head of gqa_attend: head h of q scores positions 0..pos of KV
- * head h / group, softmaxes, and weights the value rows into head h of
- * out.
+ * head h / group (dot_f32_8), softmaxes, and weights the value rows
+ * into head h of out.
  */
 template <class KRow, class VRow>
 void gqa_head(const float* q, float* out, std::uint32_t h, std::uint32_t hd,
@@ -29,19 +63,30 @@ void gqa_head(const float* q, float* out, std::uint32_t h, std::uint32_t hd,
     const float* qh = q + static_cast<std::size_t>(h) * hd;
     const std::size_t kvh = static_cast<std::size_t>(h / group) * hd;
     for (std::uint32_t t = 0; t <= pos; ++t) {
-        const float* kt = krow_at(t) + kvh;
-        float s = 0.0f;
-        for (std::uint32_t i = 0; i < hd; ++i) {
-            s += qh[i] * kt[i];
-        }
-        att[t] = s * kq_scale;
+        att[t] = dot_f32_8(qh, krow_at(t) + kvh, hd) * kq_scale;
     }
     backend::softmax_inplace(att);
     float* oh = out + static_cast<std::size_t>(h) * hd;
     for (std::uint32_t i = 0; i < hd; ++i) {
         oh[i] = 0.0f;
     }
-    for (std::uint32_t t = 0; t <= pos; ++t) {
+    // Four positions per pass over oh, their terms still added one
+    // position at a time (the same bits as one pass per position), so
+    // oh is loaded and stored a quarter as often.
+    std::uint32_t t = 0;
+    for (; t + 4 <= pos + 1; t += 4) {
+        const float* v0 = vrow_at(t) + kvh;
+        const float* v1 = vrow_at(t + 1) + kvh;
+        const float* v2 = vrow_at(t + 2) + kvh;
+        const float* v3 = vrow_at(t + 3) + kvh;
+        const float a0 = att[t], a1 = att[t + 1];
+        const float a2 = att[t + 2], a3 = att[t + 3];
+        for (std::uint32_t i = 0; i < hd; ++i) {
+            oh[i] = (((oh[i] + a0 * v0[i]) + a1 * v1[i]) + a2 * v2[i]) +
+                    a3 * v3[i];
+        }
+    }
+    for (; t <= pos; ++t) {
         const float* vt = vrow_at(t) + kvh;
         const float a = att[t];
         for (std::uint32_t i = 0; i < hd; ++i) {
@@ -92,12 +137,96 @@ void gqa_attend(const float* q, float* out, std::uint32_t n_heads,
 }
 
 /**
+ * gqa_head for every head of KV head g and query tokens t0 .. t1 - 1
+ * (token t sees positions 0..base + t), sharing the key and value row
+ * reads: each key row is loaded once and scored against every query
+ * that sees it, and each group of four value rows is loaded once and
+ * added into every such query's output. Each query's arithmetic is
+ * gqa_head's, in its order (the same dot, softmax and four-position
+ * groups from 0, then the tail one position at a time), so the result
+ * is bit-identical.
+ */
+template <class KRow, class VRow>
+void gqa_kv_block(const float* q, float* out, std::size_t q_stride,
+                  std::uint32_t t0, std::uint32_t t1, std::uint32_t base,
+                  std::uint32_t g, std::uint32_t hd, std::uint32_t group,
+                  float kq_scale, const KRow& krow_at, const VRow& vrow_at) {
+    const std::uint32_t nq = (t1 - t0) * group;
+    const std::uint32_t last = base + t1 - 1;  // the furthest position
+    const std::size_t stride = std::size_t{last} + 1;
+    thread_local std::vector<float> att_buf;
+    att_buf.resize(nq * stride);
+    const std::size_t kvh = std::size_t{g} * hd;
+    // Query j: token t0 + j / group, head g * group + j % group.
+    const auto qrow = [&](std::uint32_t j) {
+        return std::size_t{t0 + j / group} * q_stride +
+               std::size_t{g * group + j % group} * hd;
+    };
+    const auto pos_of = [&](std::uint32_t j) {
+        return base + t0 + j / group;
+    };
+    for (std::uint32_t p = 0; p <= last; ++p) {
+        const float* k = krow_at(p) + kvh;
+        for (std::uint32_t j = 0; j < nq; ++j) {
+            if (p <= pos_of(j)) {
+                att_buf[j * stride + p] =
+                    dot_f32_8(q + qrow(j), k, hd) * kq_scale;
+            }
+        }
+    }
+    for (std::uint32_t j = 0; j < nq; ++j) {
+        backend::softmax_inplace(
+            {att_buf.data() + j * stride, std::size_t{pos_of(j)} + 1});
+        float* oh = out + qrow(j);
+        for (std::uint32_t i = 0; i < hd; ++i) {
+            oh[i] = 0.0f;
+        }
+    }
+    for (std::uint32_t t = 0; t <= last; t += 4) {
+        const float* v[4] = {};
+        for (std::uint32_t s = 0; s < 4 && t + s <= last; ++s) {
+            v[s] = vrow_at(t + s) + kvh;
+        }
+        for (std::uint32_t j = 0; j < nq; ++j) {
+            const std::uint32_t pos = pos_of(j);
+            if (t > pos) continue;
+            const float* att = att_buf.data() + j * stride;
+            float* oh = out + qrow(j);
+            if (t + 4 <= pos + 1) {
+                const float* v0 = v[0];
+                const float* v1 = v[1];
+                const float* v2 = v[2];
+                const float* v3 = v[3];
+                const float a0 = att[t], a1 = att[t + 1];
+                const float a2 = att[t + 2], a3 = att[t + 3];
+                for (std::uint32_t i = 0; i < hd; ++i) {
+                    oh[i] = (((oh[i] + a0 * v0[i]) + a1 * v1[i]) +
+                             a2 * v2[i]) +
+                            a3 * v3[i];
+                }
+                continue;
+            }
+            // The tail: positions t .. pos, one at a time.
+            for (std::uint32_t s = t; s <= pos; ++s) {
+                const float* vt = v[s - t];
+                const float a = att[s];
+                for (std::uint32_t i = 0; i < hd; ++i) {
+                    oh[i] += a * vt[i];
+                }
+            }
+        }
+    }
+}
+
+/**
  * gqa_attend for n query tokens at positions base .. base + n - 1 in
- * one pool dispatch over every (token, head) pair: token t's q row is
- * q + t * q_stride, its output row out + t * q_stride, and it sees
- * positions 0..base + t, whose key and value rows must all be stored.
- * Each pair's arithmetic is gqa_head's, so the result is bit-identical
- * to n gqa_attend calls. Same threading rule as gqa_attend.
+ * one pool dispatch: token t's q row is q + t * q_stride, its output
+ * row out + t * q_stride, and it sees positions 0..base + t, whose key
+ * and value rows must all be stored. Each task is one KV head and a
+ * block of tokens (gqa_kv_block), so a key or value row is read once
+ * for all the block's queries of that head, not once per query. The
+ * result is bit-identical to n gqa_attend calls. Same threading rule as
+ * gqa_attend.
  */
 template <class KRow, class VRow>
 void gqa_attend_batch(const float* q, float* out, std::size_t q_stride,
@@ -105,13 +234,31 @@ void gqa_attend_batch(const float* q, float* out, std::size_t q_stride,
                       std::uint32_t n_heads, std::uint32_t hd,
                       std::uint32_t group, float kq_scale,
                       const KRow& krow_at, const VRow& vrow_at) {
-    const std::size_t items = std::size_t{n} * n_heads;
+    // Query tokens per task: at most 8, few enough that every pool
+    // thread gets a task (a short chunk, a speculative verify), and few
+    // enough at long context that a task's scores (tokens x group x
+    // positions floats, thread_local) stay under about 4 MB. The block
+    // size changes no query's arithmetic.
+    constexpr std::uint64_t kMaxScores = std::uint64_t{1} << 20;
+    const std::uint32_t n_kv = n_heads / group;
+    const std::uint64_t per_token = std::uint64_t{group} * (base + n);
+    const std::uint64_t fan = std::max<std::size_t>(mt_fanout(), 1);
+    // ceil(fan / n_kv) blocks per KV head give every thread a task.
+    const std::uint64_t by_threads =
+        std::uint64_t{n} / ((fan + n_kv - 1) / n_kv);
+    const std::uint64_t by_memory =
+        kMaxScores / std::max<std::uint64_t>(per_token, 1);
+    const auto block = static_cast<std::uint32_t>(
+        std::clamp<std::uint64_t>(std::min(by_threads, by_memory), 1, 8));
+    const std::uint32_t n_blocks = (n + block - 1) / block;
+    const std::size_t items = std::size_t{n_kv} * n_blocks;
     const std::size_t t = std::min<std::size_t>(mt_fanout(), items);
     auto item = [&](std::size_t i) {
-        const auto tok = static_cast<std::uint32_t>(i / n_heads);
-        const auto h = static_cast<std::uint32_t>(i % n_heads);
-        gqa_head(q + tok * q_stride, out + tok * q_stride, h, hd, group,
-                 base + tok, kq_scale, krow_at, vrow_at);
+        const auto g = static_cast<std::uint32_t>(i % n_kv);
+        const auto b = static_cast<std::uint32_t>(i / n_kv);
+        const std::uint32_t t0 = b * block;
+        gqa_kv_block(q, out, q_stride, t0, std::min(n, t0 + block), base,
+                     g, hd, group, kq_scale, krow_at, vrow_at);
     };
     if (t <= 1) {
         for (std::size_t i = 0; i < items; ++i) {

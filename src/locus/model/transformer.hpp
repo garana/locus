@@ -275,9 +275,10 @@ class TransformerModel {
 
     /**
      * @returns Whether the MoE hybrid (hot experts on the GPU, the rest
-     *     on the CPU) runs for this model: moe_hybrid_wanted() for an
-     *     MoE model on its backend, decided once (i#652). The disk
-     *     prefix key hashes it, since it changes the K/V bits.
+     *     on the CPU) runs for this model: moe_hybrid() is set up
+     *     (moe_hybrid_wanted() on the first call's backend, i#652). The
+     *     disk prefix key hashes it, since it changes the K/V bits; a
+     *     first call from there sizes the hot zone as a forward would.
      */
     bool moe_hybrid_on() const;
 
@@ -748,6 +749,8 @@ class TransformerModel {
      * @param embd Empty, or one entry per token: nullptr to embed the
      *     token, or n_embd floats used instead of its row (Janus image
      *     slots, as forward_batch's embd); that token is then ignored.
+     * @param rows_out The head rows to compute (default: all); each
+     *     token's other logits are -inf (speech, i#689).
      * @returns false when it cannot run here (not CUDA, not plain llama,
      *     no mirror, a weight the device cannot hold, a CUDA error, or
      *     LOCUS_CUDA_FORWARD=0); the caller then takes the host path.
@@ -758,7 +761,8 @@ class TransformerModel {
                       std::span<const std::uint32_t> pos,
                       kv::PagedKvCache& cache, Workspace& ws,
                       std::span<float> logits, bool all_logits,
-                      std::span<const float* const> embd = {}) const;
+                      std::span<const float* const> embd = {},
+                      LogitRows rows_out = {}) const;
 
     /** Applies the model's norm (RMS or LayerNorm per hp_.norm_type)
      * to x scaled by w, into out; uses hp_.rms_eps. */
@@ -820,7 +824,8 @@ class TransformerModel {
     std::shared_ptr<StageMetrics> stage_metrics_;
     /** LOCUS_MOE_HYBRID state, set up on the first MoE layer. */
     std::shared_ptr<struct MoeHybrid> moe_hybrid_;
-    /** Sum of every tensor's bytes (sizes the hybrid hot zone). */
+    /** The loaded range's tensor bytes (stage_weight_bytes): decides
+     *  the hybrid and sizes its hot zone. */
     std::uint64_t weight_bytes_ = 0;
     /** use_q8k_activations' choice: -1 none (the default rule), 0 off,
      * 1 on. */
@@ -885,6 +890,24 @@ bool weights_stream(std::uint64_t weight_bytes, std::uint64_t ram_bytes);
  */
 bool moe_hybrid_wanted(const char* env, bool pooled, std::uint64_t weights,
                        std::uint64_t room);
+
+/**
+ * The tensor bytes a pipeline stage loads, so a stage that owns part of
+ * a model sizes the hybrid by its own weights, not the whole file's.
+ * @param g The model.
+ * @param layer_begin The stage's first layer.
+ * @param layer_end One past its last layer (n_layers for the last
+ *     stage).
+ * @param n_layers The model's layer count.
+ * @returns The bytes of the stage's blk.N tensors, the embedding on the
+ *     first stage (or the last, when the head is tied to it), and the
+ *     other model-level tensors (output norm, head) on the last; for
+ *     the whole model, every tensor.
+ */
+std::uint64_t stage_weight_bytes(const gguf::GgufFile& g,
+                                 std::uint32_t layer_begin,
+                                 std::uint32_t layer_end,
+                                 std::uint32_t n_layers);
 
 /**
  * @returns How many pool threads model-level parallel loops may use:
