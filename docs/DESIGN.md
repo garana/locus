@@ -98,7 +98,11 @@ Correctness first, then CPU throughput, then GPU.
   two prefill iterations goes first, so short ones cannot starve a long
   one), and each prompt
   is fed in the chunks it gets alone (the whole cap, then its
-  remainder), which keeps its output independent of the batch. While
+  remainder), which keeps its output independent of the batch. A
+  prompt resumed from a cached prefix (the RAM cache, or the disk tier,
+  also after a preemption) is fed from the prefix's end, so its chunks
+  match an uncached run's only when the block size divides the cap and
+  the prefix ends on a chunk boundary. While
   a sequence decodes, every other iteration feeds no prompt, so long
   prompts do not starve decoding sequences.
 
@@ -214,9 +218,13 @@ a registration at a router's own address cannot loop. An instance
 lists its kinds in
 `/v1/models` (`locus_kinds`), which the router reads at start and
 every `--refresh-ms`; a request that names a listed model goes to that
-instance. Buffered replies are forwarded whole; a chunked one (SSE)
-streams through, and a client that leaves closes the upstream
-connection, so the instance stops the work. An instance that stays
+instance. Image edits (`image-edit`: FLUX.1 Kontext, Qwen-Image-Edit)
+are a kind apart from generations (`image`), so an edit-only instance
+gets no generation; while no instance lists `image-edit` (older
+servers), edits go to `image` instances. Buffered replies are
+forwarded whole; a chunked one (SSE) streams through, and a client
+that leaves closes the upstream connection, so the instance stops the
+work. An instance that stays
 silent longer than the read timeout fails the request:
 `--media-timeout` for image, speech and video and `--text-timeout` for
 the rest, 30 minutes each by default, since a buffered image or chat
@@ -372,7 +380,8 @@ device memory still runs.
   on a second stream. The model calls it at the same sites as the
   `madvise` hints, with the same `Mat` (same host pointer, the page
   table key) that the later matvec uses.
-- MoE hybrid (CUDA, opt-in `LOCUS_MOE_HYBRID=1`): only the routed
+- MoE hybrid (CUDA; on by default when the model's weights exceed
+  90% of the pool, `LOCUS_MOE_HYBRID=0` off, `=1` on): only the routed
   experts in a hot zone run on the GPU; the other picks run on the
   best CPU backend at the same time, on a second thread. The hot
   zone is a step WLRU over every (layer, expert) of the model: one
@@ -636,7 +645,9 @@ guarding the default path.
   blocks, and the engine keeps stepping the other requests. A
   preempted sequence writes its full blocks (prompt and output so far,
   keyed by those tokens) to the disk tier too; on readmission it loads
-  them the same way and recomputes only the tail (i#621).
+  them the same way and recomputes only the tail (i#621). Blocks past
+  the write backlog are written at preemption from the pool, so the
+  step waits for the disk instead of a long recompute later (i#642).
 - Speculative decoding: prompt lookup (no draft model). An n-gram
   match against the context proposes drafts, verified in one batched
   forward; the longest correct prefix is accepted. Greedy only, so
@@ -685,7 +696,12 @@ guarding the default path.
   longer one on the GPU. On an M2 Pro that makes 32 inputs of 120
   tokens 3.9x faster with bge-m3 (18.2 s to 4.7 s), 3.7x with nomic
   v1.5 and 1.5x with bge-small, and a 50-document rerank 3.1x (12.8 s
-  to 4.1 s). CUDA and other Vulkan GPUs: #519. Otherwise
+  to 4.1 s). Elsewhere, with a usable CUDA device, those passes run
+  on the CUDA ops: the matrices through the batched CUDA matvec, each
+  weight read once per 32 tokens, and the attention on the CPU, since
+  dense::attention keeps a GPU that caches weights by host pointer
+  off its temporary buffers. The image classifier's convs stay on
+  Vulkan only. Other Vulkan GPUs: #519. Otherwise
   `/v1/embeddings` returns the chat model's last token's final-normed
   hidden state, L2-normalized, on a dedicated cache; CPU and CUDA
   backends only (`TransformerModel::embed` refuses vulkan).
@@ -787,8 +803,8 @@ guarding the default path.
   also runs on the GPU for GQA models. MLA already shrinks the KV
   cache, so its quantized path is low priority (#63).
 - More architectures and quant types: qwen2moe, qwen3moe, dbrx, glm-
-  dsa, muse-spark, deepseek41; ternary TQ1_0 / TQ2_0 and the IQ
-  family.
+  dsa, muse-spark, deepseek41, kolibri1; ternary TQ1_0 / TQ2_0 and
+  the IQ family.
 - Multi-GPU weight sharding (#62): shard the streamed weight window
   across the GPUs of one host. Needs multi-GPU hardware.
 

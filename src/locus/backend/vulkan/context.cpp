@@ -60,6 +60,9 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ4_K:  // 8 rows of 16 lanes
         case Kernel::kMatvecQ4_KB:
         case Kernel::kMatvecQ4_KGluB:
+        case Kernel::kMatvecQ4_KP:
+        case Kernel::kMatvecQ4_KGluP:
+        case Kernel::kMatvecQ6_KP:
         case Kernel::kMatvecQ4_KSeg:
         case Kernel::kMatvecQ6_K:
         case Kernel::kMatvecQ6_KB:
@@ -214,6 +217,9 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matvec_q8_0_n_spv.h"
 #include "matvec_q8_0_p_spv.h"
 #include "matvec_q8_0_glu_p_spv.h"
+#include "matvec_q4_k_p_spv.h"
+#include "matvec_q4_k_glu_p_spv.h"
+#include "matvec_q6_k_p_spv.h"
 #include "matvec_f32_n_spv.h"
 #include "matmul_paged_f16_spv.h"
 #include "matmul_paged_t_f16_spv.h"
@@ -255,6 +261,8 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "ln_mod_spv.h"
 #include "head_norm_rope_spv.h"
 #include "head_split_spv.h"
+#include "flash_attn_spv.h"
+#include "flash_attn_small_spv.h"
 #include "gated_add_spv.h"
 #include "gelu_tanh_spv.h"
 #include "gelu_erf_spv.h"
@@ -361,6 +369,20 @@ constexpr std::uint32_t matmul_shared_bytes(std::uint32_t bk) {
 }
 static_assert(matmul_shared_bytes(VulkanContext::kMatmulBK) == 25088);
 static_assert(matmul_shared_bytes(VulkanContext::kMatmulBKSmall) == 12800);
+
+/** flash_attn.comp's shared block: region A (the Q and K stages, then
+ *  P) and region B (row reductions, then the V stage), for BR queries,
+ *  BK stage columns and VC staged keys (BC = 64 keys per tile). */
+constexpr std::uint32_t flash_shared_bytes(std::uint32_t br, std::uint32_t bk,
+                                           std::uint32_t vc) {
+    constexpr std::uint32_t bc = 64, hd = VulkanContext::kFlashAttnHdMax;
+    return 4u * (std::max(bk * (br + bc), bc * br) +
+                 std::max(br * 16u, vc * hd));
+}
+static_assert(flash_shared_bytes(VulkanContext::kFlashAttnRows, 32, 16) ==
+              24576);
+static_assert(flash_shared_bytes(VulkanContext::kFlashAttnRowsSmall, 16,
+                                 8) == 12288);
 
 /**
  * Every kernel's interface, row i describing Kernel(i). One table
@@ -490,6 +512,12 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_matvec_q8_0_p_spv), 4, 60},
     {Kernel::kMatvecQ8_0GluP, "matvec_q8_0_glu_p", locus_matvec_q8_0_glu_p_spv,
      sizeof(locus_matvec_q8_0_glu_p_spv), 5, 60},
+    {Kernel::kMatvecQ4_KP, "matvec_q4_k_p", locus_matvec_q4_k_p_spv,
+     sizeof(locus_matvec_q4_k_p_spv), 4, 60},
+    {Kernel::kMatvecQ4_KGluP, "matvec_q4_k_glu_p", locus_matvec_q4_k_glu_p_spv,
+     sizeof(locus_matvec_q4_k_glu_p_spv), 5, 60},
+    {Kernel::kMatvecQ6_KP, "matvec_q6_k_p", locus_matvec_q6_k_p_spv,
+     sizeof(locus_matvec_q6_k_p_spv), 4, 60},
     {Kernel::kMatvecF32N, "matvec_f32_n", locus_matvec_f32_n_spv,
      sizeof(locus_matvec_f32_n_spv), 3, 52},
     // F16-KV pool readers stage in f32 like the F32 ones, so they
@@ -652,6 +680,11 @@ constexpr KernelDesc kDescs[] = {
      52},
     {Kernel::kMatvecQ6_KN4, "matvec_q6_k_n4", locus_matvec_q6_k_n4_spv,
      sizeof(locus_matvec_q6_k_n4_spv), 3, 52},
+    {Kernel::kFlashAttn, "flash_attn", locus_flash_attn_spv,
+     sizeof(locus_flash_attn_spv), 4, 48, locus_flash_attn_small_spv,
+     sizeof(locus_flash_attn_small_spv),
+     flash_shared_bytes(VulkanContext::kFlashAttnRows, 32, 16),
+     flash_shared_bytes(VulkanContext::kFlashAttnRowsSmall, 16, 8)},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */
@@ -778,6 +811,7 @@ struct VulkanContext::Impl {
         VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
+        bool small = false;  ///< built from the kernel's alt_spv
     };
     Pipe pipes[static_cast<int>(Kernel::kCount_)];
 
@@ -883,9 +917,21 @@ struct VulkanContext::Impl {
     bool has_f16 = false;
     /** Bytes currently allocated through make_buffer. */
     VkDeviceSize allocated = 0;
+    /** The heap of the memory type make_buffer last allocated from;
+     *  ~0u before the first buffer (i#364). */
+    std::uint32_t buffer_heap = ~0u;
 
-    /** @returns The heap backing host-visible coherent memory. */
+    /**
+     * @returns The heap the buffers live in: the one make_buffer's
+     *     memory type uses, once a buffer exists (i#364: on a discrete
+     *     GPU with resizable BAR the first host-visible coherent type
+     *     in the table may not be one a storage buffer allows); before
+     *     that, the first host-visible coherent type's heap.
+     */
     std::uint32_t host_heap() const {
+        if (buffer_heap != ~0u) {
+            return buffer_heap;
+        }
         VkPhysicalDeviceMemoryProperties props;
         vkGetPhysicalDeviceMemoryProperties(phys, &props);
         const VkMemoryPropertyFlags want =
@@ -1244,6 +1290,7 @@ struct VulkanContext::Impl {
             const bool forced =
                 std::getenv("LOCUS_VK_MATMUL_SMALL") != nullptr;
             if (over || forced) {
+                p.small = true;
                 spv = kd.alt_spv;
                 spv_bytes = kd.alt_spv_bytes;
                 if (!matmul_stepdown_logged) {
@@ -1325,6 +1372,7 @@ struct VulkanContext::Impl {
             throw std::runtime_error(
                 "vulkan: no host-visible memory");
         }
+        buffer_heap = props.memoryTypes[type].heapIndex;
         VkMemoryAllocateInfo mai{};
         mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         mai.allocationSize = req.size;
@@ -1867,6 +1915,10 @@ bool VulkanContext::serial_dispatch() const {
 
 bool VulkanContext::has_f16() const { return impl_->has_f16; }
 
+bool VulkanContext::small_variant(Kernel k) const {
+    return impl_->pipes[static_cast<int>(k)].small;
+}
+
 const std::string& VulkanContext::device_name() const {
     return impl_->device_name;
 }
@@ -2041,6 +2093,7 @@ std::uint64_t VulkanContext::memory_available() const { no_kernels(); }
 std::uint64_t VulkanContext::memory_used() const { no_kernels(); }
 bool VulkanContext::serial_dispatch() const { no_kernels(); }
 bool VulkanContext::has_f16() const { no_kernels(); }
+bool VulkanContext::small_variant(Kernel) const { no_kernels(); }
 const std::string& VulkanContext::device_name() const { no_kernels(); }
 const VulkanContext::Profile& VulkanContext::profile() const {
     no_kernels();

@@ -288,6 +288,138 @@ TEST_CASE("vulkan MoE pair matvecs match the CPU routed experts",
     }
 }
 
+// i#623: the K-quant pair kernels (Q4_K gate / up with silu_mul, then a
+// Q4_K or Q6_K weighted down sum per token) against the CPU routed
+// experts, as the Q8_0 case above.
+TEST_CASE("vulkan K-quant MoE pair matvecs match the CPU routed experts",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(97);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    using locus::gguf::TensorType;
+    // Random K-quant bytes with small super-block scales (f16 d / dmin
+    // at bytes 0..3 for Q4_K, d at bytes 208..209 for Q6_K).
+    auto random_k = [&](TensorType t, std::uint32_t rows,
+                        std::uint32_t cols) {
+        const std::size_t bb = t == TensorType::kQ4_K ? 144 : 210;
+        std::vector<std::byte> w(std::size_t{rows} * (cols / 256) * bb);
+        for (auto& b : w) b = static_cast<std::byte>(byte_d(rng));
+        for (std::size_t at = 0; at < w.size(); at += bb) {
+            if (t == TensorType::kQ4_K) {
+                const std::uint16_t dd[] = {
+                    locus::backend::f32_to_f16(0.01f),
+                    locus::backend::f32_to_f16(0.005f)};
+                std::memcpy(&w[at], dd, 4);
+            } else {
+                const std::uint16_t d = locus::backend::f32_to_f16(0.002f);
+                std::memcpy(&w[at + 208], &d, 2);
+            }
+        }
+        return w;
+    };
+    auto upload_bytes = [&](const std::vector<std::byte>& w) {
+        std::vector<std::byte> g((w.size() + 3) & ~std::size_t{3});
+        std::copy(w.begin(), w.end(), g.begin());
+        auto b = ctx.create_buffer(g.size());
+        ctx.write_buffer(b, g);
+        return b;
+    };
+    const std::uint32_t ff = 256, cols = 512, n_exp = 5, k = 2, n_tok = 3;
+    const std::uint32_t ids[n_tok][k] = {{4, 1}, {0, 4}, {2, 3}};
+    const float wts[n_tok][k] = {{0.6f, 0.4f}, {-0.3f, 1.2f},
+                                 {0.25f, 0.75f}};
+    std::vector<std::uint32_t> route;
+    for (std::uint32_t t = 0; t < n_tok; ++t) {
+        route.insert(route.end(), {ids[t][0], ids[t][1], fbits(wts[t][0]),
+                                   fbits(wts[t][1])});
+    }
+    for (const TensorType down_t : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+        DYNAMIC_SECTION("down " << (down_t == TensorType::kQ4_K ? "Q4_K"
+                                                                : "Q6_K")) {
+            const auto wg = random_k(TensorType::kQ4_K, ff * n_exp, cols);
+            const auto wu = random_k(TensorType::kQ4_K, ff * n_exp, cols);
+            const auto wd = random_k(down_t, cols * n_exp, ff);
+            const std::size_t up_bytes = std::size_t{ff} * (cols / 256) * 144;
+            const std::size_t down_bytes =
+                std::size_t{cols} * (ff / 256) *
+                (down_t == TensorType::kQ4_K ? 144 : 210);
+            const auto x = random_floats(n_tok * cols, rng);
+            const auto resid = random_floats(n_tok * cols, rng);
+            auto gb = upload_bytes(wg);
+            auto ub = upload_bytes(wu);
+            auto db = upload_bytes(wd);
+            auto xb = upload(ctx, x);
+            auto rb = upload(ctx, route);
+            auto hb = ctx.create_buffer(n_tok * k * ff * 4);
+            auto ob = upload(ctx, resid);
+            const Kernel down_k = down_t == TensorType::kQ4_K
+                                      ? Kernel::kMatvecQ4_KP
+                                      : Kernel::kMatvecQ6_KP;
+            ctx.begin_batch();
+            {
+                const VulkanContext::Buffer bufs[] = {gb, xb, hb, rb, ub};
+                const std::uint32_t push[] = {
+                    ff, cols, 0, 0, 0, 0, fbits(1.0f),
+                    static_cast<std::uint32_t>(up_bytes), cols, ff, 0, 0, 0,
+                    2 * k, k};
+                ctx.dispatch(Kernel::kMatvecQ4_KGluP, bufs, push,
+                             VulkanContext::matvec_groups(
+                                 Kernel::kMatvecQ4_KGluP, ff),
+                             n_tok * k);
+            }
+            {
+                const VulkanContext::Buffer bufs[] = {db, hb, ob, rb};
+                const std::uint32_t push[] = {
+                    cols, ff, 0, 1, 0, 0, fbits(1.0f),
+                    static_cast<std::uint32_t>(down_bytes), ff, cols, 0, 0, 0,
+                    2 * k, k};
+                ctx.dispatch(down_k, bufs, push,
+                             VulkanContext::matvec_groups(down_k, cols),
+                             n_tok);
+            }
+            ctx.end_batch();
+            const auto h = download(ctx, hb, n_tok * k * ff);
+            const auto out = download(ctx, ob, n_tok * cols);
+            for (std::uint32_t t = 0; t < n_tok; ++t) {
+                const auto xt =
+                    std::span<const float>(x).subspan(t * cols, cols);
+                std::vector<float> want = {resid.begin() + t * cols,
+                                           resid.begin() + (t + 1) * cols};
+                for (std::uint32_t j = 0; j < k; ++j) {
+                    const std::uint32_t p = t * k + j;
+                    const auto a = cpu_mv(TensorType::kQ4_K, wg.data(),
+                                          ids[t][j] * ff, ff, cols, xt);
+                    const auto b = cpu_mv(TensorType::kQ4_K, wu.data(),
+                                          ids[t][j] * ff, ff, cols, xt);
+                    for (std::uint32_t r = 0; r < ff; ++r) {
+                        const float sv =
+                            a[r] / (1.0f + std::exp(-a[r])) * b[r];
+                        REQUIRE(h[p * ff + r] ==
+                                Catch::Approx(sv).epsilon(1e-3).margin(1e-3));
+                    }
+                    // The down check reads the GPU's own intermediate.
+                    const auto d = cpu_mv(
+                        down_t, wd.data(), ids[t][j] * cols, cols, ff,
+                        std::span<const float>(h).subspan(p * ff, ff));
+                    for (std::uint32_t r = 0; r < cols; ++r) {
+                        want[r] += wts[t][j] * d[r];
+                    }
+                }
+                for (std::uint32_t r = 0; r < cols; ++r) {
+                    REQUIRE(out[t * cols + r] ==
+                            Catch::Approx(want[r]).epsilon(1e-3).margin(1e-3));
+                }
+            }
+            for (auto buf : {gb, ub, db, xb, rb, hb, ob}) {
+                ctx.destroy_buffer(buf);
+            }
+        }
+    }
+}
+
 // i#432: matvec_q8_0_n_glu (gate, up and silu_mul in one short-batch
 // dispatch) against the CPU, and a token's result from matvec_q8_0_n
 // and matvec_q8_0_n_glu being the same bits whatever the batch size

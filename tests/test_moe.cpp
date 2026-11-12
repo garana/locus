@@ -246,6 +246,26 @@ std::vector<std::byte> qwen_image(float gate_scale, bool zero_shared) {
 
 }  // namespace
 
+// i#652: the hybrid is on by default where the weights do not fit the
+// pool; LOCUS_MOE_HYBRID forces either way; a backend without a pool
+// never runs it.
+TEST_CASE("moe_hybrid_wanted: on by default when the weights do not fit",
+          "[moe]") {
+    using locus::model::moe_hybrid_wanted;
+    constexpr std::uint64_t kGiB = 1ull << 30;
+    // Unset (null or empty): by fit.
+    REQUIRE(moe_hybrid_wanted(nullptr, true, 9 * kGiB, 2 * kGiB));
+    REQUIRE_FALSE(moe_hybrid_wanted(nullptr, true, 1 * kGiB, 2 * kGiB));
+    REQUIRE_FALSE(moe_hybrid_wanted(nullptr, true, 2 * kGiB, 2 * kGiB));
+    REQUIRE(moe_hybrid_wanted("", true, 9 * kGiB, 2 * kGiB));
+    // Forced.
+    REQUIRE(moe_hybrid_wanted("1", true, 1 * kGiB, 2 * kGiB));
+    REQUIRE_FALSE(moe_hybrid_wanted("0", true, 9 * kGiB, 2 * kGiB));
+    // No pool (the CPU, Vulkan today): off, even when forced.
+    REQUIRE_FALSE(moe_hybrid_wanted(nullptr, false, 9 * kGiB, 0));
+    REQUIRE_FALSE(moe_hybrid_wanted("1", false, 9 * kGiB, 0));
+}
+
 TEST_CASE("identical experts reproduce the dense model exactly",
           "[moe]") {
     const auto wg = weights(kE * kF, 10);

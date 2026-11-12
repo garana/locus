@@ -165,8 +165,8 @@ std::vector<float> QwenEditPipeline::edit_from(
         neg = text_rows(*req.negative_prompt, patches, th / ps, tw / ps, op,
                         n_neg);
     }
-    const auto lat = qwen_edit_reference_latents(*vae_, r.vae_input,
-                                                 r.vae_image.h, r.vae_image.w);
+    const auto lat = qwen_edit_reference_latents(
+        *vae_, r.vae_input, r.vae_image.h, r.vae_image.w, op);
     if (timing != nullptr) timing->encode = ms_since(t0);
     t0 = std::chrono::steady_clock::now();
     const auto out = qwen_edit_denoise(

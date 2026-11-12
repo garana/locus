@@ -124,13 +124,14 @@ class QwenVae {
     template <class F>
     void each_conv(F&& fn) const;
 
-    /** An atomic flag that copies its value (so the constructors stay
-     *  defaulted). */
+    /** An atomic flag that keeps QwenVae's constructors defaulted: a
+     *  copy has its own host weights, none of them uploaded, so it starts
+     *  false; a move takes the source's uploads and clears its flag. */
     struct Flag {
         std::atomic<bool> v{false};
         Flag() = default;
-        Flag(const Flag& o) : v(o.v.load()) {}
-        Flag(Flag&& o) noexcept : v(o.v.load()) {}
+        Flag(const Flag&) {}
+        Flag(Flag&& o) noexcept : v(o.v.exchange(false)) {}
     };
     /** Set by a call on the Vulkan image ops (see ~QwenVae); atomic, as
      *  encode / decode are const and may run on several threads. */

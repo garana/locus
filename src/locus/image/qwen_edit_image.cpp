@@ -4,6 +4,8 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "locus/image/flux_sampler.hpp"
+
 namespace locus::image {
 
 namespace {
@@ -79,78 +81,22 @@ EditReference qwen_edit_reference(const Rgb8& img, std::uint64_t area) {
     return r;
 }
 
-namespace {
-
-void check_latents(std::size_t n, std::uint32_t c, std::uint32_t h,
-                   std::uint32_t w) {
-    if (c == 0 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0 ||
-        n != std::size_t{c} * h * w) {
-        throw std::invalid_argument(
-            "qwen edit: latents must be [c][h][w] with even sides");
-    }
-}
-
-}  // namespace
-
-std::vector<float> qwen_pack_latents(std::span<const float> z,
-                                     std::uint32_t c, std::uint32_t h,
-                                     std::uint32_t w) {
-    check_latents(z.size(), c, h, w);
-    const std::uint32_t rows = h / 2, cols = w / 2;
-    std::vector<float> out(z.size());
-    std::size_t o = 0;
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        for (std::uint32_t q = 0; q < cols; ++q) {
-            for (std::uint32_t ch = 0; ch < c; ++ch) {
-                for (std::uint32_t dy = 0; dy < 2; ++dy) {
-                    for (std::uint32_t dx = 0; dx < 2; ++dx) {
-                        out[o++] = z[(std::size_t{ch} * h + 2 * r + dy) * w +
-                                     2 * q + dx];
-                    }
-                }
-            }
-        }
-    }
-    return out;
-}
-
-std::vector<float> qwen_unpack_latents(std::span<const float> tokens,
-                                       std::uint32_t c, std::uint32_t h,
-                                       std::uint32_t w) {
-    check_latents(tokens.size(), c, h, w);
-    const std::uint32_t rows = h / 2, cols = w / 2;
-    std::vector<float> z(tokens.size());
-    std::size_t o = 0;
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        for (std::uint32_t q = 0; q < cols; ++q) {
-            for (std::uint32_t ch = 0; ch < c; ++ch) {
-                for (std::uint32_t dy = 0; dy < 2; ++dy) {
-                    for (std::uint32_t dx = 0; dx < 2; ++dx) {
-                        z[(std::size_t{ch} * h + 2 * r + dy) * w + 2 * q +
-                          dx] = tokens[o++];
-                    }
-                }
-            }
-        }
-    }
-    return z;
-}
-
 EditLatents qwen_edit_reference_latents(const QwenVae& vae,
                                         std::span<const float> chw,
-                                        std::uint32_t h, std::uint32_t w) {
+                                        std::uint32_t h, std::uint32_t w,
+                                        const backend::Ops& op) {
     const std::uint32_t s = vae.scale();
     if (h == 0 || w == 0 || h % (2 * s) != 0 || w % (2 * s) != 0) {
         throw std::invalid_argument(
             "qwen edit: the reference's sides must be multiples of 2 x "
             "the VAE scale");
     }
-    auto z = vae.encode(chw, h, w);
+    auto z = vae.encode(chw, h, w, op);
     vae.normalize(z);
     EditLatents out;
     out.rows = h / s / 2;
     out.cols = w / s / 2;
-    out.tokens = qwen_pack_latents(z, vae.z_dim(), h / s, w / s);
+    out.tokens = FluxSampler::pack(z, vae.z_dim(), h / s, w / s);
     return out;
 }
 

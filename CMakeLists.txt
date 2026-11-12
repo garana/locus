@@ -257,7 +257,7 @@ if(Vulkan_FOUND)
             kv_scatter moe_group moe_combine attn_softmax sum_splits
             matvec_t_q8 attn_decode attn_combine attn_decode_grp matvec_q8_0_n
             copy qk_norm_rope bias_rows
-            ln_mod head_norm_rope head_split gated_add
+            ln_mod head_norm_rope head_split gated_add flash_attn
             # Variants: <kernel>=<source>:<define>[,<define>...], the
             # source compiled again with -D<define> for each.
             matvec_b=matvec:BATCHED
@@ -292,6 +292,8 @@ if(Vulkan_FOUND)
             matmul_f16_small=matmul:TYPE_F16,BK16
             matmul_bf16=matmul:TYPE_BF16
             matmul_bf16_small=matmul:TYPE_BF16,BK16
+            # SMALL: half the query block, 12 KiB of shared memory.
+            flash_attn_small=flash_attn:SMALL
             gelu_tanh=gated_add:GELU_TANH
             gelu_erf=gated_add:GELU_ERF
             layer_norm=ln_mod:AFFINE
@@ -320,6 +322,9 @@ if(Vulkan_FOUND)
             matvec_q6_k_b=matvec_q6_k:BATCHED
             matvec_q5_0_b=matvec_q5_0:BATCHED
             matvec_q4_k_glu_b=matvec_q4_k:BATCHED,SWIGLU
+            matvec_q4_k_p=matvec_q4_k:BATCHED,PAIRS
+            matvec_q4_k_glu_p=matvec_q4_k:BATCHED,SWIGLU,PAIRS
+            matvec_q6_k_p=matvec_q6_k:BATCHED,PAIRS
             matvec_q4_k_seg=matvec_q4_k:SEGMENTS
             matmul_q4_k=matmul:TYPE_Q4K
             matmul_q6_k=matmul:TYPE_Q6K

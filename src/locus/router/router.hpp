@@ -41,11 +41,13 @@ enum class Kind {
     kVideo,
     kSpeech,
     kRerank,
-    kClassify
+    kClassify,
+    /** /v1/images/edits (i#633); kImage is /v1/images/generations. */
+    kImageEdit
 };
 
 /** @returns the wire name: text, image-to-text, image, video, speech,
- *  rerank, classify. */
+ *  rerank, classify, image-edit. */
 std::string_view kind_name(Kind k);
 /** @returns the kind for a wire name, or nullopt. */
 std::optional<Kind> parse_kind(std::string_view name);

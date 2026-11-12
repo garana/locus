@@ -55,11 +55,12 @@ std::uint64_t env_u64(const char* name, std::uint64_t def) {
 }  // namespace
 
 /**
- * LOCUS_MOE_HYBRID=1 (i#252): in decode and batched prefill, the
- * routed experts in the step WLRU hot zone (ExpertCache) run on the
- * GPU backend while the
- * other picks run on the best CPU backend at the same time. Only a
- * promotion uploads an expert; a demotion frees it (Ops.evict).
+ * The MoE hybrid (i#252): in decode and batched prefill, the routed
+ * experts in the step WLRU hot zone (ExpertCache) run on the GPU
+ * backend while the other picks run on the best CPU backend at the
+ * same time. Only a promotion uploads an expert; a demotion frees it
+ * (Ops.evict). On when moe_hybrid_on() says so: by default where the
+ * weights do not fit the pool (i#652), or forced by LOCUS_MOE_HYBRID.
  *
  * The hot zone holds LOCUS_MOE_HYBRID_SLOTS experts when set, else
  * what fits in 90% of the GPU weight pool after the non-expert
@@ -69,6 +70,12 @@ std::uint64_t env_u64(const char* name, std::uint64_t def) {
  */
 struct MoeHybrid {
     std::once_flag once;
+    /** moe_hybrid_on()'s answer, decided once per backend: the pool
+     *  budget it reads follows the free VRAM, so a second look could
+     *  disagree. */
+    std::mutex decide_mu;
+    const backend::Backend* decided_for = nullptr;
+    bool on = false;
     /** Null when the mode is off. */
     std::unique_ptr<ExpertCache> cache;
     /** The backend the cache was sized for. */
@@ -2170,19 +2177,50 @@ void TransformerModel::apply_norm(std::span<const float> x,
     }
 }
 
+bool moe_hybrid_wanted(const char* env, bool pooled, std::uint64_t weights,
+                       std::uint64_t room) {
+    if (!pooled) {
+        return false;
+    }
+    if (env != nullptr && *env != '\0') {
+        return std::string_view(env) != "0";
+    }
+    return weights > room;
+}
+
+bool TransformerModel::moe_hybrid_on() const {
+    MoeHybrid* h = moe_hybrid_.get();
+    if (h == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(h->decide_mu);
+    if (h->decided_for != backend_) {
+        bool moe = false;
+        for (std::uint32_t l = layer_begin_; l < layer_end_; ++l) {
+            moe = moe || layers_[l].is_moe();
+        }
+        const backend::Ops& op = backend_->ops;
+        const bool pooled = op.prefetch != nullptr && op.evict != nullptr &&
+                            op.pool_budget != nullptr;
+        h->on = moe && moe_hybrid_wanted(
+                           std::getenv("LOCUS_MOE_HYBRID"), pooled,
+                           weight_bytes_,
+                           pooled ? op.pool_budget() / 10 * 9 : 0);
+        h->decided_for = backend_;
+    }
+    return h->on;
+}
+
 MoeHybrid* TransformerModel::moe_hybrid() const {
     MoeHybrid* h = moe_hybrid_.get();
     if (h == nullptr) {
         return nullptr;
     }
     std::call_once(h->once, [&] {
-        const char* on = std::getenv("LOCUS_MOE_HYBRID");
-        const backend::Ops& op = backend_->ops;
-        if (on == nullptr || *on == '\0' || std::string_view(on) == "0" ||
-            op.prefetch == nullptr || op.evict == nullptr ||
-            op.pool_budget == nullptr) {
+        if (!moe_hybrid_on()) {
             return;
         }
+        const backend::Ops& op = backend_->ops;
         std::uint32_t n_moe = 0;
         std::uint64_t expert_bytes = 0, routed_bytes = 0;
         for (std::uint32_t l = layer_begin_; l < layer_end_; ++l) {

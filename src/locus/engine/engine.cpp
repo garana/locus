@@ -528,7 +528,11 @@ void Engine::preempt(std::uint64_t victim_id) {
     Request& v = *requests_.at(victim_id);
     // With a disk tier, the victim's full blocks go to it first, keyed
     // by the tokens they hold (prompt, then output), so readmission
-    // reads them back instead of recomputing (i#621).
+    // reads them back instead of recomputing (i#621). Blocks that fit
+    // the write backlog are copied and written by the worker; a longer
+    // victim, whose recompute costs most, is written here from the pool
+    // itself, before its blocks are freed: no copy, at the cost of this
+    // step waiting for the disk (i#642).
     if (disk_worker_) {
         const std::uint32_t bt = cache_.geometry().block_tokens;
         const std::uint32_t n = std::min(
@@ -537,9 +541,17 @@ void Engine::preempt(std::uint64_t victim_id) {
         if (n > 0) {
             const std::vector<kv::BlockId> blocks(
                 v.seq.blocks.begin(), v.seq.blocks.begin() + n);
-            if (write_back(context_of(v, n * bt), blocks)) {
-                disk_swapped_tokens_ += n * bt;
+            const std::vector<tok::TokenId> key = context_of(v, n * bt);
+            bool swapped = write_back(key, blocks);
+            if (!swapped) {
+                std::vector<const std::uint8_t*> src;
+                for (const kv::BlockId b : blocks) {
+                    src.push_back(cache_.block_data(b));
+                }
+                swapped = cfg_.disk_prefix->write(key, n, src);
             }
+            (swapped ? disk_swapped_tokens_ : disk_refused_tokens_) +=
+                n * bt;
         }
     }
     cache_.release(v.seq);

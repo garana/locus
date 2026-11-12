@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "locus/backend/registry.hpp"
 #include "locus/image/image_input.hpp"
 #include "locus/image/qwen_vae.hpp"
 
@@ -63,27 +64,10 @@ struct EditReference {
 EditReference qwen_edit_reference(const Rgb8& img,
                                   std::uint64_t area = 1024 * 1024);
 
-/**
- * diffusers' QwenImageEditPipeline._pack_latents: 2 x 2 patches of
- * [c][h][w] latents into one token each, tokens row-major over the
- * (h / 2) x (w / 2) grid, a token's c * 4 values as [c][dy][dx].
- *
- * @throws std::invalid_argument on a size that does not match or an odd
- *     side.
- */
-std::vector<float> qwen_pack_latents(std::span<const float> z,
-                                     std::uint32_t c, std::uint32_t h,
-                                     std::uint32_t w);
-
-/** _unpack_latents: the inverse of qwen_pack_latents, back to
- *  [c][h][w]. @throws std::invalid_argument on a bad size. */
-std::vector<float> qwen_unpack_latents(std::span<const float> tokens,
-                                       std::uint32_t c, std::uint32_t h,
-                                       std::uint32_t w);
-
 /** The reference image as the MMDiT's second segment (i#614). */
 struct EditLatents {
-    /** rows x cols tokens of z_dim * 4 values (qwen_pack_latents). */
+    /** rows x cols tokens of z_dim * 4 values (FluxSampler::pack, which
+     *  is QwenImageEditPipeline._pack_latents too). */
     std::vector<float> tokens;
     /** The token grid: the latents' sides / 2. */
     std::uint32_t rows = 0, cols = 0;
@@ -96,11 +80,13 @@ struct EditLatents {
  *
  * @param chw [3][h][w] in [-1, 1] (EditReference::vae_input).
  * @param h, w Sides; multiples of 2 * vae.scale().
+ * @param op The backend ops for the VAE encoder (the Vulkan image ops
+ *     run its convs on the GPU).
  * @throws std::invalid_argument on a bad size or a VAE without its
  *     encoder.
  */
-EditLatents qwen_edit_reference_latents(const QwenVae& vae,
-                                        std::span<const float> chw,
-                                        std::uint32_t h, std::uint32_t w);
+EditLatents qwen_edit_reference_latents(
+    const QwenVae& vae, std::span<const float> chw, std::uint32_t h,
+    std::uint32_t w, const backend::Ops& op = backend::best_backend().ops);
 
 }  // namespace locus::image

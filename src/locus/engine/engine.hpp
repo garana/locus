@@ -179,7 +179,8 @@ class Engine {
          * indexer, deepseek41) are refused. */
         std::shared_ptr<DiskPrefixStore> disk_prefix;
         /** Cap on the bytes of queued write-backs; past it a
-         * write-back is dropped. */
+         * write-back is dropped, and a preempted sequence's blocks are
+         * written at preemption instead (i#642). */
         std::uint64_t disk_write_backlog = 64ull << 20;
         /** Prompt-lookup speculative decoding: draft n-gram tokens
          * from the context and verify them in one batched forward
@@ -295,9 +296,15 @@ class Engine {
         return disk_loaded_tokens_;
     }
     /** Positions of preempted sequences written to the disk tier
-     *  (queued or already there), cumulative (i#621). */
+     *  (queued, written at preemption, or already there), cumulative
+     *  (i#621, i#642). */
     std::uint64_t disk_prefix_swapped_tokens() const {
         return disk_swapped_tokens_;
+    }
+    /** Positions of preempted sequences the disk tier refused (its cap
+     *  or an I/O error), so they recompute; cumulative (i#642). */
+    std::uint64_t disk_prefix_refused_tokens() const {
+        return disk_refused_tokens_;
     }
 
     /** Invoked after each newly sampled token (streaming). */
@@ -485,6 +492,7 @@ class Engine {
     std::uint64_t disk_hits_ = 0;
     std::uint64_t disk_loaded_tokens_ = 0;
     std::uint64_t disk_swapped_tokens_ = 0;
+    std::uint64_t disk_refused_tokens_ = 0;
     // After cache_: destroyed first, so a read in flight finishes
     // before the pool it writes goes away.
     std::unique_ptr<DiskPrefixWorker> disk_worker_;

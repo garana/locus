@@ -717,3 +717,58 @@ TEST_CASE("encoder models on the Vulkan image ops match the CPU",
         }
     }
 }
+
+// i#519: on the CUDA ops the matrices run through matvec_batch_cuda
+// (each weight read once per pass) and the attention stays on the CPU
+// (dense::attention never hands a self-parallel backend its host
+// buffers). The same inputs and bars as the Vulkan case above.
+TEST_CASE("encoder models on the CUDA ops match the CPU",
+          "[bert][cuda][e2e]") {
+    const auto* cuda = locus::backend::find_backend("cuda");
+    if (cuda == nullptr || !cuda->available) {
+        SKIP("no usable CUDA device");
+    }
+    locus::backend::cuda_pool_reset();
+    const auto& cpu = locus::backend::best_backend().ops;
+    const auto& gpu = cuda->ops;
+    const std::vector<std::string> texts = {
+        "what is the capital of china?",
+        "Beijing is the capital of the People's Republic of China.",
+        "A small red apple on a wooden table, soft morning light."};
+    std::string para;
+    for (int i = 0; i < 12; ++i) para += texts[i % 3] + " ";
+    const std::vector<std::string> big(8, para);
+    std::size_t ran = 0;
+    for (const char* file :
+         {"bge-small-en-v1.5-q8_0.gguf", "bge-m3-q8_0.gguf",
+          "nomic-embed-text-v1.5.Q8_0.gguf"}) {
+        const std::string path = kDir + "models/" + file;
+        if (!std::filesystem::exists(path)) continue;
+        ++ran;
+        const auto m = locus::embed::EmbeddingModel::load(path);
+        for (const auto* in : {&texts, &big}) {
+            const auto c = m->embed(*in, cpu);
+            const auto g = m->embed(*in, gpu);  // every pass on CUDA
+            const auto p = m->embed(*in, cpu, nullptr, &gpu);  // by size
+            for (std::size_t i = 0; i < in->size(); ++i) {
+                INFO(file << " input " << i);
+                REQUIRE(cosine(c[i], g[i]) >= 0.99999);
+                REQUIRE(cosine(c[i], p[i]) >= 0.99999);
+            }
+        }
+    }
+    const std::string rr = kDir + "models/bge-reranker-v2-m3-q8_0.gguf";
+    if (std::filesystem::exists(rr)) {
+        ++ran;
+        const auto m = locus::embed::EmbeddingModel::load(rr);
+        const auto c = m->rank(texts[0], big, cpu);
+        const auto g = m->rank(texts[0], big, cpu, nullptr, &gpu);
+        for (std::size_t i = 0; i < big.size(); ++i) {
+            REQUIRE(std::fabs(c[i] - g[i]) < 2e-3);
+        }
+    }
+    if (ran == 0) {
+        SKIP("no encoder model present");
+    }
+    locus::backend::cuda_pool_reset();
+}

@@ -57,6 +57,10 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
     // and the batch-invariant kernels. The device too: two GPUs on one
     // backend do not round alike.
     o = fnv(o, m.q8k_activations());
+    // The MoE hybrid as decided, not only its variable: unset turns it
+    // on where the weights do not fit (i#652), and its cold experts
+    // round as the CPU does.
+    o = fnv(o, m.moe_hybrid_on());
     // Debug and offload switches read from the environment that pick
     // other kernels or another expert split: their raw values.
     for (const char* var : {"LOCUS_BATCH_DEQUANT", "LOCUS_MOE_HYBRID",
