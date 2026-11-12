@@ -1008,6 +1008,40 @@ void dbrx_attention(const TransformerModel& m,
                hp.kq_scale, krow_at, vrow_at);
 }
 
+/**
+ * @returns The per-layer sliding-window flags of a
+ *     sliding_window_pattern array: bools, or integers (non-zero means
+ *     sliding), as converters write it (i#662).
+ * @throws gguf::Error on another element type.
+ */
+std::vector<bool> swa_pattern(const std::vector<gguf::Value>& pat,
+                              const char* arch) {
+    std::vector<bool> out;
+    out.reserve(pat.size());
+    for (const auto& v : pat) {
+        switch (v.type) {
+            case gguf::ValueType::kBool:
+                out.push_back(v.b);
+                break;
+            case gguf::ValueType::kUint8:
+            case gguf::ValueType::kUint16:
+            case gguf::ValueType::kUint32:
+            case gguf::ValueType::kUint64:
+            case gguf::ValueType::kInt8:
+            case gguf::ValueType::kInt16:
+            case gguf::ValueType::kInt32:
+            case gguf::ValueType::kInt64:
+                out.push_back(v.u != 0 || v.i != 0);
+                break;
+            default:
+                throw gguf::Error(std::string(arch) +
+                                  ": sliding_window_pattern is neither "
+                                  "bools nor integers");
+        }
+    }
+    return out;
+}
+
 // Muse Spark (Meta; muse-spark). GQA attention with a sigmoid output
 // gate and a weightless per-head norm on its output; RoPE only on the
 // sliding-window layers (the others are NoPE and global); norm-
@@ -1056,10 +1090,7 @@ void muse_spark_hparams(const gguf::GgufFile& g, const std::string& p,
         hp.swa_window == 0) {
         throw gguf::Error("muse-spark: missing sliding-window layout");
     }
-    hp.swa_layers.clear();
-    for (const auto& v : *pat) {
-        hp.swa_layers.push_back(v.b);
-    }
+    hp.swa_layers = swa_pattern(*pat, "muse-spark");
     hp.embd_norm = true;
     hp.custom_layer = true;
     hp.q8k_default = true;  // the goldens are llama.cpp's
@@ -1313,10 +1344,7 @@ void kolibri1_hparams(const gguf::GgufFile& g, const std::string& p,
         hp.swa_window == 0) {
         throw gguf::Error("kolibri1: missing sliding-window layout");
     }
-    hp.swa_layers.clear();
-    for (const auto& v : *pat) {
-        hp.swa_layers.push_back(v.b);
-    }
+    hp.swa_layers = swa_pattern(*pat, "kolibri1");
     hp.rope_freq_base_swa = hp.rope_freq_base;
     hp.rope_neox = true;
     hp.custom_layer = true;
@@ -1417,29 +1445,12 @@ void kolibri1_layer(const TransformerModel& m,
         return vbase ? vbase + std::size_t{t - t0} * kv_dim
                      : cache.v(seq, l, t);
     };
-    for (std::uint32_t h = 0; h < hp.n_heads; ++h) {
-        const float* qh = q.data() + std::size_t{h} * hd;
-        const std::size_t kvh = std::size_t{h / group} * hd;
-        std::span<float> att(ws.att.data(), n);
-        for (std::uint32_t t = t0; t <= pos; ++t) {
-            const float* kt = krow_at(t) + kvh;
-            float sc = 0.0f;
-            for (std::uint32_t i = 0; i < hd; ++i) {
-                sc += qh[i] * kt[i];
-            }
-            att[t - t0] = sc * hp.kq_scale;
-        }
-        softmax_inplace(att);
-        std::span<float> oh(ws.out.data() + std::size_t{h} * hd, hd);
-        std::fill(oh.begin(), oh.end(), 0.0f);
-        for (std::uint32_t t = t0; t <= pos; ++t) {
-            const float* vt = vrow_at(t) + kvh;
-            const float a = att[t - t0];
-            for (std::uint32_t i = 0; i < hd; ++i) {
-                oh[i] += a * vt[i];
-            }
-        }
-    }
+    // The shared GQA attention (heads across the thread pool) over the
+    // window's n positions, t0 .. pos (i#662).
+    gqa_attend(
+        q.data(), ws.out.data(), hp.n_heads, hd, group, n - 1, hp.kq_scale,
+        [&](std::uint32_t t) { return krow_at(t0 + t); },
+        [&](std::uint32_t t) { return vrow_at(t0 + t); });
     matvec_mt(op, lay.wo, {ws.out.data(), q_dim}, ws.xb2);
     rmsnorm(ws.xb2, lay.post_attn_norm, hp.rms_eps, ws.xb2);
     for (std::uint32_t i = 0; i < E; ++i) {
@@ -1451,7 +1462,9 @@ void kolibri1_layer(const TransformerModel& m,
     // so), then add the shared expert.
     rmsnorm(ws.x, lay.ffn_norm, hp.rms_eps, ws.xb);
     op.matvec(lay.gate_inp, ws.xb, ws.router);
-    std::vector<std::uint32_t> idx(hp.n_expert);
+    thread_local std::vector<std::uint32_t> idx;
+    thread_local std::vector<float> wgt;
+    idx.resize(hp.n_expert);
     for (std::uint32_t e = 0; e < hp.n_expert; ++e) idx[e] = e;
     auto sel = [&](std::uint32_t e) {
         return ws.router[e] + lay.exp_probs_b[e];
@@ -1460,7 +1473,7 @@ void kolibri1_layer(const TransformerModel& m,
                       idx.end(), [&](std::uint32_t a, std::uint32_t b) {
                           return sel(a) > sel(b) || (sel(a) == sel(b) && a < b);
                       });
-    std::vector<float> wgt(hp.n_expert_used);
+    wgt.resize(hp.n_expert_used);
     float wsum = 0.0f;
     for (std::uint32_t k = 0; k < hp.n_expert_used; ++k) {
         wgt[k] = 1.0f / (1.0f + std::exp(-ws.router[idx[k]]));
