@@ -122,18 +122,15 @@ std::pair<std::uint32_t, std::uint32_t> QwenEditPipeline::output_size(
 }
 
 std::vector<float> QwenEditPipeline::text_rows(
-    const std::string& prompt, std::span<const float> patches,
-    std::uint32_t gh, std::uint32_t gw, const backend::Ops& op,
-    std::uint32_t& n) const {
-    const std::uint32_t merge = vision_->merge_size();
-    const auto p =
-        qwen_edit_prompt(*tok_, prompt, gh / merge * (gw / merge));
+    const std::string& prompt, std::span<const float> image_rows,
+    std::uint32_t grid_h, std::uint32_t grid_w, std::uint32_t& n) const {
+    const auto p = qwen_edit_prompt(*tok_, prompt, grid_h * grid_w);
     if (p.ids.size() <= kEditDropTokens) {
         throw std::invalid_argument("qwen edit: the prompt is too short");
     }
     n = static_cast<std::uint32_t>(p.ids.size() - kEditDropTokens);
-    return qwen_edit_text_embeds(*lm_, *vision_, p.ids, p.image_at, patches,
-                                 gh, gw, kEditDropTokens, op);
+    return qwen_edit_text_embeds(*lm_, image_rows, p.ids, p.image_at, grid_h,
+                                 grid_w, kEditDropTokens);
 }
 
 std::vector<float> QwenEditPipeline::edit_from(
@@ -162,12 +159,24 @@ std::vector<float> QwenEditPipeline::edit_from(
     const std::uint32_t ps = vision_->patch_size();
     const std::uint32_t th = r.text_image.h, tw = r.text_image.w;
     const auto patches = vision_->patches(r.text_image.rgb, th, tw);
+    // The vision tower once, for the prompt and the negative prompt
+    // alike (i#671).
+    const std::uint32_t gh = th / ps, gw = tw / ps;
+    const std::uint32_t mg = vision_->merge_size();
+    if (vision_->out_dim() != lm_->hparams().n_embd) {
+        throw std::invalid_argument(
+            "qwen edit: the vision tower's width is not the model's");
+    }
+    if (gh == 0 || gw == 0 || gh % mg != 0 || gw % mg != 0) {
+        throw std::invalid_argument("qwen edit: bad patch grid");
+    }
+    const auto image_rows = vision_->encode(patches, gh, gw, op);
     std::uint32_t n_pos = 0, n_neg = 0;
-    const auto pos = text_rows(req.prompt, patches, th / ps, tw / ps, op,
-                               n_pos);
+    const auto pos =
+        text_rows(req.prompt, image_rows, gh / mg, gw / mg, n_pos);
     std::vector<float> neg;
     if (req.negative_prompt && req.true_cfg_scale > 1.0f) {
-        neg = text_rows(*req.negative_prompt, patches, th / ps, tw / ps, op,
+        neg = text_rows(*req.negative_prompt, image_rows, gh / mg, gw / mg,
                         n_neg);
     }
     const auto lat = qwen_edit_reference_latents(

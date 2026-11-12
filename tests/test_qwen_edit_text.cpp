@@ -136,4 +136,16 @@ TEST_CASE("qwen edit text embeds match transformers on a tiny model",
     REQUIRE_THROWS_AS(locus::image::qwen_edit_text_embeds(
                           lm, narrow, ids, 71, px, kGh, kGw, kDrop, op),
                       std::invalid_argument);
+
+    // i#671: the overload on the tower's rows, encoded once, gives the
+    // same bits; rows that do not match the grid are refused.
+    const std::uint32_t mg = v.merge_size();
+    const auto rows = v.encode(px, kGh, kGw, op);
+    CHECK(locus::image::qwen_edit_text_embeds(lm, rows, ids, 71, kGh / mg,
+                                              kGw / mg, kDrop) == got);
+    REQUIRE_THROWS_AS(
+        locus::image::qwen_edit_text_embeds(
+            lm, std::span<const float>(rows).first(rows.size() - 1), ids,
+            71, kGh / mg, kGw / mg, kDrop),
+        std::invalid_argument);
 }
