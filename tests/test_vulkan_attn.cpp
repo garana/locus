@@ -8,6 +8,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/vulkan/context.hpp"
+#include "locus/backend/vulkan_seq.hpp"
 
 using locus::backend::vk::Kernel;
 using locus::backend::vk::VulkanContext;
@@ -638,5 +639,98 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
                 }
             }
         }
+    }
+}
+
+// i#640: VulkanSeq's image attention (flash_attn.comp when the heads
+// fit, the score-matrix path when not) against a double-precision
+// reference: query and key counts off the 64-row block, cross
+// attention, PixArt's 72-wide heads, a fused q | k | v row (offsets and
+// a 3 w stride) and a head width the flash kernel declines (6).
+TEST_CASE("vulkan seq attention matches the reference", "[vulkan]") {
+    if (!locus::backend::VulkanSeq::available()) {
+        SKIP("no usable Vulkan device");
+    }
+    struct Case {
+        std::uint32_t n_q, n_kv, heads, hd;
+        bool fused;  // q, k, v side by side in one row (n_q == n_kv)
+    };
+    const Case cases[] = {{70, 70, 3, 128, false},
+                          {130, 45, 2, 72, false},
+                          {65, 65, 4, 64, true},
+                          {33, 33, 2, 6, false}};
+    std::mt19937 rng(640);
+    for (const Case& c : cases) {
+        CAPTURE(c.n_q, c.n_kv, c.heads, c.hd, c.fused);
+        const std::uint32_t w = c.heads * c.hd;
+        // Peaky scores (|q . k| up to 4 sqrt(hd)) so the online max
+        // moves across key tiles.
+        auto q = random_floats(std::size_t{c.n_q} * w, rng);
+        auto k = random_floats(std::size_t{c.n_kv} * w, rng);
+        auto v = random_floats(std::size_t{c.n_kv} * w, rng);
+        for (auto& f : q) f *= 2.0f;
+        for (auto& f : k) f *= 2.0f;
+
+        std::vector<float> out(std::size_t{c.n_q} * w);
+        {
+            using Seq = locus::backend::VulkanSeq;
+            Seq seq;
+            if (c.fused) {
+                std::vector<float> qkv(std::size_t{c.n_q} * 3 * w);
+                for (std::uint32_t t = 0; t < c.n_q; ++t) {
+                    for (std::uint32_t i = 0; i < w; ++i) {
+                        qkv[(t * 3 + 0) * w + i] = q[t * w + i];
+                        qkv[(t * 3 + 1) * w + i] = k[t * w + i];
+                        qkv[(t * 3 + 2) * w + i] = v[t * w + i];
+                    }
+                }
+                seq.reserve(0, qkv.size());
+                seq.write(0, 0, qkv);
+                seq.reserve(4, out.size());
+                seq.attention({0, 0, 3 * w}, {0, w, 3 * w}, {0, 2 * w, 3 * w},
+                              {4, 0, w}, c.n_q, c.heads, c.hd, 5, 6, 7);
+            } else {
+                seq.reserve(0, q.size());
+                seq.reserve(1, k.size());
+                seq.reserve(2, v.size());
+                seq.reserve(4, out.size());
+                seq.write(0, 0, q);
+                seq.write(1, 0, k);
+                seq.write(2, 0, v);
+                seq.cross_attention({0, 0, w}, c.n_q, {1, 0, w}, {2, 0, w},
+                                    c.n_kv, {4, 0, w}, c.heads, c.hd, 5, 6,
+                                    7);
+            }
+            seq.read(4, 0, out);
+        }
+
+        double worst = 0.0;
+        std::vector<double> p(c.n_kv);
+        for (std::uint32_t h = 0; h < c.heads; ++h) {
+            for (std::uint32_t t = 0; t < c.n_q; ++t) {
+                double mx = -1e300;
+                for (std::uint32_t j = 0; j < c.n_kv; ++j) {
+                    double d = 0.0;
+                    for (std::uint32_t e = 0; e < c.hd; ++e) {
+                        d += double(q[t * w + h * c.hd + e]) *
+                             k[j * w + h * c.hd + e];
+                    }
+                    p[j] = d / std::sqrt(double(c.hd));
+                    mx = std::max(mx, p[j]);
+                }
+                double sum = 0.0;
+                for (auto& x : p) sum += (x = std::exp(x - mx));
+                for (std::uint32_t e = 0; e < c.hd; ++e) {
+                    double o = 0.0;
+                    for (std::uint32_t j = 0; j < c.n_kv; ++j) {
+                        o += p[j] * v[j * w + h * c.hd + e];
+                    }
+                    o /= sum;
+                    worst = std::max(
+                        worst, std::abs(o - out[t * w + h * c.hd + e]));
+                }
+            }
+        }
+        CHECK(worst < 1e-5);
     }
 }

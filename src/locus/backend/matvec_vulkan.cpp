@@ -6,6 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string_view>
 #include <stdexcept>
 #include <bit>
 #include <cassert>
@@ -4106,6 +4107,30 @@ void VulkanSeq::head_norm_rope(Rows x, std::uint32_t n, std::uint32_t heads,
     im_->s.ctx.dispatch(Kernel::kHeadNormRope, bufs, push, gx, gy);
 }
 
+namespace {
+
+/** @returns Whether flash_attn.comp takes these operands: heads of at
+ *  most kFlashAttnHdMax floats, everything on vec4 boundaries. */
+bool flash_fits(VulkanSeq::Rows q, VulkanSeq::Rows k, VulkanSeq::Rows v,
+                VulkanSeq::Rows out, std::uint32_t hd) {
+    if (hd == 0 || hd % 4 != 0 || hd > VulkanContext::kFlashAttnHdMax) {
+        return false;
+    }
+    for (const auto& r : {q, k, v, out}) {
+        if (r.off % 4 != 0 || r.stride % 4 != 0) return false;
+    }
+    return true;
+}
+
+/** @returns false when LOCUS_VK_FLASH=0 keeps the score-matrix path
+ *  (matmul, softmax, matmul), for comparison. */
+bool flash_enabled() {
+    const char* e = std::getenv("LOCUS_VK_FLASH");
+    return e == nullptr || std::string_view(e) != "0";
+}
+
+}  // namespace
+
 void VulkanSeq::attention(Rows q, Rows k, Rows v, Rows out, std::uint32_t n,
                           std::uint32_t heads, std::uint32_t hd, Slot kh,
                           Slot vt, Slot scores) {
@@ -4122,6 +4147,26 @@ void VulkanSeq::cross_attention(Rows q, std::uint32_t n_q, Rows k, Rows v,
     constexpr std::size_t kMaxFloats = std::size_t{1} << 30;
     if (n_q == 0 || n_kv == 0 || plane > kMaxFloats || row > kMaxFloats) {
         throw std::invalid_argument("VulkanSeq::attention: bad sizes");
+    }
+    if (flash_fits(q, k, v, out, hd) && flash_enabled()) {
+        // One pass, no score matrix (i#640): a workgroup per block of
+        // queries of one head.
+        const std::uint32_t br =
+            s.ctx.small_variant(Kernel::kFlashAttn)
+                ? VulkanContext::kFlashAttnRowsSmall
+                : VulkanContext::kFlashAttnRows;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(hd)) *
+                            1.44269504088896340736f;  // log2(e)
+        const VulkanContext::Buffer bufs[] = {
+            im_->slot(q.slot), im_->slot(k.slot), im_->slot(v.slot),
+            im_->slot(out.slot)};
+        const std::uint32_t push[] = {
+            n_q,      n_kv,       hd,         q.off,  q.stride,
+            k.off,    k.stride,   v.off,      v.stride, out.off,
+            out.stride, fbits(scale)};
+        s.ctx.dispatch(Kernel::kFlashAttn, bufs, push, (n_q + br - 1) / br,
+                       heads);
+        return;
     }
     const std::uint32_t mb = static_cast<std::uint32_t>(
         std::clamp<std::size_t>(attn_scratch_floats.load() / row, 1, n_q));

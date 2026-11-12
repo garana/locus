@@ -255,6 +255,8 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "ln_mod_spv.h"
 #include "head_norm_rope_spv.h"
 #include "head_split_spv.h"
+#include "flash_attn_spv.h"
+#include "flash_attn_small_spv.h"
 #include "gated_add_spv.h"
 #include "gelu_tanh_spv.h"
 #include "gelu_erf_spv.h"
@@ -361,6 +363,20 @@ constexpr std::uint32_t matmul_shared_bytes(std::uint32_t bk) {
 }
 static_assert(matmul_shared_bytes(VulkanContext::kMatmulBK) == 25088);
 static_assert(matmul_shared_bytes(VulkanContext::kMatmulBKSmall) == 12800);
+
+/** flash_attn.comp's shared block: region A (the Q and K stages, then
+ *  P) and region B (row reductions, then the V stage), for BR queries,
+ *  BK stage columns and VC staged keys (BC = 64 keys per tile). */
+constexpr std::uint32_t flash_shared_bytes(std::uint32_t br, std::uint32_t bk,
+                                           std::uint32_t vc) {
+    constexpr std::uint32_t bc = 64, hd = VulkanContext::kFlashAttnHdMax;
+    return 4u * (std::max(bk * (br + bc), bc * br) +
+                 std::max(br * 16u, vc * hd));
+}
+static_assert(flash_shared_bytes(VulkanContext::kFlashAttnRows, 32, 16) ==
+              24576);
+static_assert(flash_shared_bytes(VulkanContext::kFlashAttnRowsSmall, 16,
+                                 8) == 12288);
 
 /**
  * Every kernel's interface, row i describing Kernel(i). One table
@@ -652,6 +668,11 @@ constexpr KernelDesc kDescs[] = {
      52},
     {Kernel::kMatvecQ6_KN4, "matvec_q6_k_n4", locus_matvec_q6_k_n4_spv,
      sizeof(locus_matvec_q6_k_n4_spv), 3, 52},
+    {Kernel::kFlashAttn, "flash_attn", locus_flash_attn_spv,
+     sizeof(locus_flash_attn_spv), 4, 48, locus_flash_attn_small_spv,
+     sizeof(locus_flash_attn_small_spv),
+     flash_shared_bytes(VulkanContext::kFlashAttnRows, 32, 16),
+     flash_shared_bytes(VulkanContext::kFlashAttnRowsSmall, 16, 8)},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */
@@ -778,6 +799,7 @@ struct VulkanContext::Impl {
         VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
+        bool small = false;  ///< built from the kernel's alt_spv
     };
     Pipe pipes[static_cast<int>(Kernel::kCount_)];
 
@@ -1244,6 +1266,7 @@ struct VulkanContext::Impl {
             const bool forced =
                 std::getenv("LOCUS_VK_MATMUL_SMALL") != nullptr;
             if (over || forced) {
+                p.small = true;
                 spv = kd.alt_spv;
                 spv_bytes = kd.alt_spv_bytes;
                 if (!matmul_stepdown_logged) {
@@ -1867,6 +1890,10 @@ bool VulkanContext::serial_dispatch() const {
 
 bool VulkanContext::has_f16() const { return impl_->has_f16; }
 
+bool VulkanContext::small_variant(Kernel k) const {
+    return impl_->pipes[static_cast<int>(k)].small;
+}
+
 const std::string& VulkanContext::device_name() const {
     return impl_->device_name;
 }
@@ -2041,6 +2068,7 @@ std::uint64_t VulkanContext::memory_available() const { no_kernels(); }
 std::uint64_t VulkanContext::memory_used() const { no_kernels(); }
 bool VulkanContext::serial_dispatch() const { no_kernels(); }
 bool VulkanContext::has_f16() const { no_kernels(); }
+bool VulkanContext::small_variant(Kernel) const { no_kernels(); }
 const std::string& VulkanContext::device_name() const { no_kernels(); }
 const VulkanContext::Profile& VulkanContext::profile() const {
     no_kernels();
