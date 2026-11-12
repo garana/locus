@@ -89,7 +89,10 @@ std::vector<Tensor> make_tensors() {
     return ts;
 }
 
-std::vector<std::byte> build_image(const std::vector<Tensor>& ts, bool norm) {
+/** @param pattern_type The sliding_window_pattern's GGUF element type:
+ *  7 bool (llama.cpp's), 5 int32, 6 float32 (refused). */
+std::vector<std::byte> build_image(const std::vector<Tensor>& ts, bool norm,
+                                   std::uint32_t pattern_type = 7) {
     const std::string p = "kolibri1.";
     GgufBuilder g;
     g.header(ts.size(), 19)
@@ -111,9 +114,20 @@ std::vector<std::byte> build_image(const std::vector<Tensor>& ts, bool norm) {
         .kv_u32(p + "expert_gating_func", 2)
         .kv_bool(p + "expert_weights_norm", norm)
         .kv_u32(p + "attention.sliding_window", kWin);
-    // sliding_window_pattern: a bool array (GGUF type 9 of 7).
-    g.str(p + "attention.sliding_window_pattern").u32(9).u32(7).u64(kL);
-    for (std::uint32_t l = 0; l < kL; ++l) g.u8(l == 0 ? 1 : 0);
+    // sliding_window_pattern: an array (GGUF type 9) of pattern_type.
+    g.str(p + "attention.sliding_window_pattern")
+        .u32(9)
+        .u32(pattern_type)
+        .u64(kL);
+    for (std::uint32_t l = 0; l < kL; ++l) {
+        if (pattern_type == 7) {
+            g.u8(l == 0 ? 1 : 0);
+        } else if (pattern_type == 5) {
+            g.u32(l == 0 ? 1 : 0);
+        } else {
+            g.f32(l == 0 ? 1.0f : 0.0f);
+        }
+    }
     std::uint64_t offset = 0;
     for (const auto& t : ts) {
         g.tensor(t.name, t.dims, 0 /* F32 */, offset);
@@ -376,4 +390,23 @@ TEST_CASE("kolibri1 matches the reference graph", "[model][kolibri1]") {
             }
         }
     }
+}
+
+// i#662: converters that write sliding_window_pattern as int32 (non-zero
+// is sliding) load the same model; another element type is refused.
+TEST_CASE("kolibri1 takes an int32 sliding_window_pattern",
+          "[model][kolibri1]") {
+    const auto ts = make_tensors();
+    auto img_b = build_image(ts, false, 7);
+    auto img_i = build_image(ts, false, 5);
+    auto gb = locus::gguf::GgufFile::parse(img_b);
+    auto gi = locus::gguf::GgufFile::parse(img_i);
+    auto mb = TransformerModel::load(gb);
+    auto mi = TransformerModel::load(gi);
+    REQUIRE(mi.hparams().swa_layers == std::vector<bool>{true, false});
+    const std::vector<int> toks = {3, 17, 9, 30, 1};
+    CHECK(run(mi, toks) == run(mb, toks));
+    auto img_f = build_image(ts, false, 6);
+    auto gf = locus::gguf::GgufFile::parse(img_f);
+    REQUIRE_THROWS_AS(TransformerModel::load(gf), locus::gguf::Error);
 }
