@@ -267,7 +267,8 @@ class TransformerModel {
      * prefix cache can key on it. Call it after the KV cache exists,
      * on a thread bound to the device the forwards will run on (the
      * decision is per device).
-     * @returns true when some MoE layer routes its experts on Vulkan;
+     * @returns true when some MoE layer would route its experts on the
+     *     GPU (they fit; a model on the per-op path still says true);
      *     false for a dense model or another backend.
      */
     bool experts_on_gpu() const;
