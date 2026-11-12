@@ -48,6 +48,16 @@ Engine::Engine(const model::TransformerModel& m, tok::TokenId eos,
         // Vulkan routes MoE experts on the GPU or the host by the free
         // device memory; settled now, with the KV pool allocated.
         cfg_.disk_prefix->set_experts_on_gpu(m.experts_on_gpu());
+        // The MoE hybrid's hot zone follows the requests served before,
+        // so where an expert ran (GPU or CPU), and so the K/V bits,
+        // depend on history no key can hold (i#664). Settled now, after
+        // the KV pool, since the CUDA pool budget is fixed at first use.
+        if (m.moe_hybrid_on()) {
+            throw std::invalid_argument(
+                "--prefix-cache-dir: not supported while the MoE hybrid "
+                "is on (its cold experts run on the CPU as the hot set "
+                "changes); set LOCUS_MOE_HYBRID=0 to use the disk tier");
+        }
         cfg_.prefix_cache = true;
     }
     if (cfg_.prefix_cache) {
