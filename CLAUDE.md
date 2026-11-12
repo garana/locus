@@ -46,6 +46,11 @@ and an x86 host tests every code PR.
   SHA and the PR heads it held. A red run is bisected by halves; the
   PR that breaks it leaves the batch. PRs that conflict go in separate
   batches, and a PR's head does not change once it is in a batch.
+- Review first: a PR enters a batch only after its two reading CLEARs;
+  a NOT CLEAR is fixed and read again before that.
+- One batch at a time: the next batch starts when the running one has
+  all its votes, and it takes every PR that passed review meanwhile.
+  Work on issues, PRs and reviews goes on while a batch runs.
 - Votes and review notes go over the agent bus, not GitHub PR comments.
 
 ## Conventions
