@@ -109,23 +109,28 @@ std::uint64_t stage_weight_bytes(const gguf::GgufFile& g,
     const bool last = layer_end >= n_layers;
     const bool tied = g.find_tensor("output.weight") == nullptr;
     std::uint64_t bytes = 0;
-    for (const gguf::TensorInfo& t : g.tensors()) {
-        bool mine;
-        std::uint32_t l = 0;
-        const char* s = t.name.c_str();
-        if (t.name.rfind("blk.", 0) == 0 &&
-            std::sscanf(s + 4, "%u", &l) == 1) {
-            // Past n_layers (a next-token head's blocks): the last stage.
-            mine = l < n_layers ? l >= layer_begin && l < layer_end : last;
-        } else if (t.name == "token_embd.weight") {
-            mine = first || (last && tied);
-        } else {
-            mine = last;  // the output norm and head
+    // Every shard of a split model, not only the first file's tensors.
+    g.for_each_file([&](const gguf::GgufFile& f) {
+        for (const gguf::TensorInfo& t : f.tensors()) {
+            bool mine;
+            std::uint32_t l = 0;
+            const char* s = t.name.c_str();
+            if (t.name.rfind("blk.", 0) == 0 &&
+                std::sscanf(s + 4, "%u", &l) == 1) {
+                // Past n_layers (a next-token head's blocks): the last
+                // stage.
+                mine = l < n_layers ? l >= layer_begin && l < layer_end
+                                    : last;
+            } else if (t.name == "token_embd.weight") {
+                mine = first || (last && tied);
+            } else {
+                mine = last;  // the output norm and head
+            }
+            if (mine) {
+                bytes += t.nbytes;
+            }
         }
-        if (mine) {
-            bytes += t.nbytes;
-        }
-    }
+    });
     return bytes;
 }
 
@@ -393,9 +398,11 @@ TransformerModel TransformerModel::load(const GgufFile& g,
     m.spec_ = spec;
     m.file_backed_ = g.file_backed();
     std::uint64_t weight_bytes = 0;
-    for (const TensorInfo& t : g.tensors()) {
-        weight_bytes += t.nbytes;
-    }
+    g.for_each_file([&](const GgufFile& f) {  // every shard
+        for (const TensorInfo& t : f.tensors()) {
+            weight_bytes += t.nbytes;
+        }
+    });
     m.advise_weights_ = readahead_enabled() &&
                         weights_stream(weight_bytes, sys::total_ram_bytes());
     Hparams& hp = m.hp_;
