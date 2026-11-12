@@ -32,6 +32,9 @@
 #define TR 4u
 #define TR4 (TR / 4u)
 #define NT (16u * RT)  // threads
+// BR, HD_MAX and the shared block must match VulkanContext's
+// kFlashAttnRows / kFlashAttnRowsSmall / kFlashAttnHdMax and
+// flash_shared_bytes (context.hpp, context.cpp).
 #define BR (TR * RT)   // queries per workgroup
 #define BC 64u         // keys per tile
 #define HD_MAX 128u

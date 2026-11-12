@@ -267,7 +267,8 @@ class VulkanContext {
 
     /**
      * flash_attn.comp: queries per workgroup (its BR), for the default
-     * and the SMALL variant, and the widest head it takes (HD_MAX).
+     * and the SMALL variant, and the widest head it takes (HD_MAX);
+     * keep them in sync with the shader's defines.
      */
     static constexpr std::uint32_t kFlashAttnRows = 64;
     static constexpr std::uint32_t kFlashAttnRowsSmall = 32;
