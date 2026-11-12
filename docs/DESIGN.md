@@ -214,9 +214,13 @@ a registration at a router's own address cannot loop. An instance
 lists its kinds in
 `/v1/models` (`locus_kinds`), which the router reads at start and
 every `--refresh-ms`; a request that names a listed model goes to that
-instance. Buffered replies are forwarded whole; a chunked one (SSE)
-streams through, and a client that leaves closes the upstream
-connection, so the instance stops the work. An instance that stays
+instance. Image edits (`image-edit`: FLUX.1 Kontext, Qwen-Image-Edit)
+are a kind apart from generations (`image`), so an edit-only instance
+gets no generation; while no instance lists `image-edit` (older
+servers), edits go to `image` instances. Buffered replies are
+forwarded whole; a chunked one (SSE) streams through, and a client
+that leaves closes the upstream connection, so the instance stops the
+work. An instance that stays
 silent longer than the read timeout fails the request:
 `--media-timeout` for image, speech and video and `--text-timeout` for
 the rest, 30 minutes each by default, since a buffered image or chat
