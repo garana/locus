@@ -1,6 +1,12 @@
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <latch>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -9,6 +15,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan_seq.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 
@@ -143,6 +150,80 @@ TEST_CASE("a vulkan KV cache cannot run on another device",
     REQUIRE(capacity);
     CAPTURE(err);
     REQUIRE(err.find("made on device 0") != std::string::npos);
+}
+
+// i#620: two threads, each inside a backend call on its own device
+// (a VulkanSeq holds that device's lock), drop the cache the other made.
+// Freeing a pool takes its owner's lock; taken here, the two would wait
+// on each other. The frees are queued for the owners instead, which
+// free them on their next use. A watchdog aborts a deadlock rather than
+// hang the suite.
+TEST_CASE("vulkan caches freed across two devices' backend calls",
+          "[vulkan][device]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    if (locus::backend::vulkan_devices().size() < 2) {
+        SKIP("needs two Vulkan devices (e.g. a GPU and llvmpipe)");
+    }
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+
+    std::optional<locus::kv::PagedKvCache> caches[2];
+    std::size_t before[2] = {0, 0}, made[2] = {0, 0}, after[2] = {0, 0};
+    std::string err[2];
+    std::latch built(2), holding(2);
+    std::mutex wmu;
+    std::condition_variable wcv;
+    bool done = false;
+    std::jthread watchdog([&] {
+        std::unique_lock lk(wmu);
+        if (!wcv.wait_for(lk, std::chrono::seconds(120),
+                          [&] { return done; })) {
+            std::fprintf(stderr, "deadlock: crossed vulkan_free_kv\n");
+            std::abort();
+        }
+    });
+    {
+        std::vector<std::jthread> threads;
+        for (int d = 0; d < 2; ++d) {
+            threads.emplace_back([&, d] {
+                try {
+                    locus::backend::vulkan_bind_thread(d);
+                    before[d] = locus::backend::vulkan_kv_pool_count();
+                    caches[d].emplace(model.make_cache());
+                    made[d] = locus::backend::vulkan_kv_pool_count();
+                    built.arrive_and_wait();
+                    locus::backend::VulkanSeq seq;  // d's lock, held
+                    holding.arrive_and_wait();
+                    caches[1 - d].reset();  // the other device's pool
+                } catch (const std::exception& e) {
+                    err[d] = e.what();
+                }
+            });
+        }
+    }
+    {
+        std::lock_guard lk(wmu);
+        done = true;
+    }
+    wcv.notify_all();
+    for (int d = 0; d < 2; ++d) {
+        std::jthread([&, d] {
+            locus::backend::vulkan_bind_thread(d);
+            after[d] = locus::backend::vulkan_kv_pool_count();
+        }).join();
+    }
+    for (int d = 0; d < 2; ++d) {
+        CAPTURE(d, err[d]);
+        REQUIRE(err[d].empty());
+        REQUIRE(made[d] == before[d] + 1);
+        REQUIRE(after[d] == before[d]);  // the queued free ran
+    }
 }
 
 TEST_CASE("vulkan_bind_thread refuses a device it does not have",
