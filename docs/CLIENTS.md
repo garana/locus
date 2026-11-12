@@ -107,7 +107,9 @@ runs at a time; a second request while one runs gets a 503 with
 `Retry-After`.
 
 `/v1/images/edits` runs FLUX.1 Kontext dev on a reference image: the
-same character, object or scene, changed as the prompt says. It takes
+same character, object or scene, changed as the prompt says. A FLUX.1
+dev or schnell checkpoint (its GGUF's `flux.kontext` false, written by
+`scripts/convert-flux.py`) does not edit: the route answers 503. It takes
 a JSON body, not OpenAI's multipart form: `image` is a base64 PNG or
 JPEG, or a `data:` URL of one; `prompt`, `steps`, `guidance_scale`,
 `max_sequence_length` and `seed` are as above. Without `size` the
