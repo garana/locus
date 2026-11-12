@@ -3173,8 +3173,19 @@ void rec_moe_routed(State& s, const model::Hparams& hp,
     g.rows = ff;
     u.rows = ff;
     d.cols = ff;
-    const auto q8 = gguf::TensorType::kQ8_0;
-    if (n <= kSmallBatch && g.type == q8 && u.type == q8 && d.type == q8 &&
+    // The pair kernels for these weight types: gate / up with silu_mul,
+    // and the weighted down sum (Q8_0; Q4_K; Q6_K down only, i#623).
+    using T = gguf::TensorType;
+    const Kernel glu_k = g.type != u.type ? Kernel::kCount_
+                         : g.type == T::kQ8_0 ? Kernel::kMatvecQ8_0GluP
+                         : g.type == T::kQ4_K ? Kernel::kMatvecQ4_KGluP
+                                              : Kernel::kCount_;
+    const Kernel down_k = d.type == T::kQ8_0   ? Kernel::kMatvecQ8_0P
+                          : d.type == T::kQ4_K ? Kernel::kMatvecQ4_KP
+                          : d.type == T::kQ6_K ? Kernel::kMatvecQ6_KP
+                                               : Kernel::kCount_;
+    if (n <= kSmallBatch && glu_k != Kernel::kCount_ &&
+        down_k != Kernel::kCount_ &&
         lay.gate_exps.expert_bytes == lay.up_exps.expert_bytes) {
         // A short batch (speculative verify, a multi-sequence decode):
         // matvecs per (token, expert) pair read each picked expert once,
@@ -3190,9 +3201,8 @@ void rec_moe_routed(State& s, const model::Hparams& hp,
                 ff, g.cols, 0, 0, 0, 0, fbits(1.0f),
                 w_off_units(g, lay.gate_exps.expert_bytes), E, ff,
                 0, 0, 0, r_stride, k_used};
-            s.ctx.dispatch(Kernel::kMatvecQ8_0GluP, bufs, push,
-                           VulkanContext::matvec_groups(
-                               Kernel::kMatvecQ8_0GluP, ff),
+            s.ctx.dispatch(glu_k, bufs, push,
+                           VulkanContext::matvec_groups(glu_k, ff),
                            n * k_used);
         }
         {
@@ -3202,10 +3212,8 @@ void rec_moe_routed(State& s, const model::Hparams& hp,
                 d.rows, ff, 0, 1, 0, 0, fbits(1.0f),
                 w_off_units(d, lay.down_exps.expert_bytes), ff, E,
                 0, 0, 0, r_stride, k_used};
-            s.ctx.dispatch(Kernel::kMatvecQ8_0P, bufs, push,
-                           VulkanContext::matvec_groups(
-                               Kernel::kMatvecQ8_0P, d.rows),
-                           n);
+            s.ctx.dispatch(down_k, bufs, push,
+                           VulkanContext::matvec_groups(down_k, d.rows), n);
         }
         return;
     }

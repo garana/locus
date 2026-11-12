@@ -17,7 +17,9 @@
 // tree reduces the row.
 //
 // Compiled again with -DBATCHED (matvec_q6_k_b): slots and modes as
-// matvec_q4_k.comp / matvec_q8_0.comp.
+// matvec_q4_k.comp / matvec_q8_0.comp. With -DPAIRS too
+// (matvec_q6_k_p; i#623) workgroup y = token t sums its kp experts
+// (x rows t * kp + j) weighted into output row t, as matvec_q4_k_p.
 
 #define LANES 16u
 #define ROWS 8u
@@ -51,6 +53,10 @@ layout(push_constant) uniform PC {
     uint n_slots;
     uint mode;      // 1 = ids from route[], 2 = weighted slot sum
     uint row_stride;  // unused: K-quant rows are never column-split
+#endif
+#ifdef PAIRS
+    uint r_stride;  // ROUTE words per token row
+    uint kp;        // routed slots per token
 #endif
 } pc;
 
@@ -145,7 +151,17 @@ void main() {
     uint at = pc.out_offset + r;
     float acc = 0.0;
     if (r < pc.rows) {
-#ifdef BATCHED
+#if defined(PAIRS)
+        uint y = gl_WorkGroupID.y;
+        uint rb = y * pc.r_stride;
+        for (uint k = 0u; k < pc.kp; ++k) {
+            acc += uintBitsToFloat(route[rb + pc.kp + k]) *
+                   row_part(pc.w_off + route[rb + k] * pc.w_stride,
+                            pc.x_off + (y * pc.kp + k) * pc.x_stride, r,
+                            lane);
+        }
+        at += y * pc.out_stride;
+#elif defined(BATCHED)
         uint y = gl_WorkGroupID.y;
         bool sum = (pc.mode & 2u) != 0u;
         uint k1 = sum ? pc.n_slots : y + 1u;
