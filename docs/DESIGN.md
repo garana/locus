@@ -372,7 +372,8 @@ device memory still runs.
   on a second stream. The model calls it at the same sites as the
   `madvise` hints, with the same `Mat` (same host pointer, the page
   table key) that the later matvec uses.
-- MoE hybrid (CUDA, opt-in `LOCUS_MOE_HYBRID=1`): only the routed
+- MoE hybrid (CUDA; on by default when the model's weights exceed
+  90% of the pool, `LOCUS_MOE_HYBRID=0` off, `=1` on): only the routed
   experts in a hot zone run on the GPU; the other picks run on the
   best CPU backend at the same time, on a second thread. The hot
   zone is a step WLRU over every (layer, expert) of the model: one
