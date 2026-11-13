@@ -11,6 +11,8 @@
 #include <cstring>
 #include <vector>
 
+#include "iq_grids.h"
+
 namespace locus::backend {
 // matvec_sse4_avx.cpp compiles this file again with AVX enabled, into
 // sse4_avx:: (variants.hpp).
@@ -1208,8 +1210,93 @@ void row_q6_k_q8k_sse4_xt(const std::byte* row, const Q8kAct* a,
     }
 }
 
+/**
+ * Byte mask of two 8-weight sign groups: byte j (0..7) is 0xff when bit
+ * j of s0 is set, byte 8 + j when bit j of s1 is.
+ */
+__m128i iq2_neg_mask(std::uint32_t s0, std::uint32_t s1) {
+    const __m128i bits =
+        _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64,
+                      -128);
+    const __m128i v = _mm_set_epi64x(
+        static_cast<long long>(std::uint64_t{s1} * 0x0101010101010101ull),
+        static_cast<long long>(std::uint64_t{s0} * 0x0101010101010101ull));
+    return _mm_cmpeq_epi8(_mm_and_si128(v, bits), bits);
+}
+
+/**
+ * Adds ls * (sum of the 16 signed products grid * q8) to the int32
+ * lanes of acc, exactly: g holds 16 unsigned grid bytes (<= 43), neg
+ * the bytes whose sign bit is set, q 16 activations. The signed sum is
+ * maddubs(g, q) - 2 maddubs(g & neg, q): the activation is never
+ * negated (Q8_K can hold -128), and each int16 lane's true value is at
+ * most 2 * 43 * 128 in size, so the wrapping subtract lands on it.
+ */
+void iq2_group16(__m128i g, __m128i neg, __m128i q, int ls, __m128i& acc) {
+    const __m128i all = _mm_maddubs_epi16(g, q);
+    const __m128i ng = _mm_maddubs_epi16(_mm_and_si128(g, neg), q);
+    const __m128i s = _mm_sub_epi16(all, _mm_add_epi16(ng, ng));
+    acc = _mm_add_epi32(
+        acc, _mm_madd_epi16(s, _mm_set1_epi16(static_cast<short>(ls))));
+}
+
+/**
+ * One IQ2_XXS (66 B) or IQ2_S (82 B) row against a Q8_K activation (plain
+ * order), in scalar vec_dot_iq2_xxs_q8_k / vec_dot_iq2_s_q8_k's float
+ * order: each block's integer sum (exact, so its add order is free),
+ * times f16(d) * d_x, added to sumf, then 0.125 * sumf.
+ */
+float row_iq2_q8k_sse4(bool xxs, const std::byte* row, const Q8kAct& a,
+                       std::size_t nb) {
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * (xxs ? 66 : 82);
+        const float d = f16_to_f32(load_u16(blk)) * a.d[i];
+        const std::int8_t* q8 = a.qs + i * 256;
+        const auto* u = reinterpret_cast<const std::uint8_t*>(blk);
+        __m128i acc = _mm_setzero_si128();
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const __m128i q0 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(q8 + ib32 * 32));
+            const __m128i q1 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(q8 + ib32 * 32 + 16));
+            std::uint64_t g[4];
+            std::uint32_t s[4];
+            int ls1, ls2;
+            if (xxs) {
+                const std::uint8_t* p = u + 2 + 8 * ib32;
+                std::uint32_t aux1;
+                std::memcpy(&aux1, p + 4, 4);
+                for (int l = 0; l < 4; ++l) {
+                    g[l] = iq2xxs_grid[p[l]];
+                    s[l] = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
+                }
+                ls1 = ls2 = static_cast<int>(2 * (aux1 >> 28) + 1);
+            } else {
+                const std::uint8_t* qs = u + 2 + 4 * ib32;
+                const std::uint8_t* signs = u + 34 + 4 * ib32;
+                const std::uint32_t qh = u[66 + ib32];
+                for (int l = 0; l < 4; ++l) {
+                    g[l] = iq2s_grid[qs[l] | ((qh << (8 - 2 * l)) & 0x300)];
+                    s[l] = signs[l];
+                }
+                ls1 = 1 + 2 * (u[74 + ib32] & 0xf);
+                ls2 = 1 + 2 * (u[74 + ib32] >> 4);
+            }
+            iq2_group16(_mm_set_epi64x(static_cast<long long>(g[1]),
+                                       static_cast<long long>(g[0])),
+                        iq2_neg_mask(s[0], s[1]), q0, ls1, acc);
+            iq2_group16(_mm_set_epi64x(static_cast<long long>(g[3]),
+                                       static_cast<long long>(g[2])),
+                        iq2_neg_mask(s[2], s[3]), q1, ls2, acc);
+        }
+        sumf += d * static_cast<float>(hsum_epi32_sse4(acc));
+    }
+    return 0.125f * sumf;
+}
+
 /** Which row kernel a weight takes under Q8_K / Q8_0 activations. */
-enum class Q8Path { kBlock32, kQ2K, kK, kOther };
+enum class Q8Path { kBlock32, kQ2K, kK, kIQ2, kOther };
 
 Q8Path q8_path(gguf::TensorType type, std::size_t cols) {
     using T = gguf::TensorType;
@@ -1226,7 +1313,23 @@ Q8Path q8_path(gguf::TensorType type, std::size_t cols) {
         type == T::kQ6_K) {
         return Q8Path::kK;
     }
+    if (type == T::kIQ2_XXS || type == T::kIQ2_S) {
+        return Q8Path::kIQ2;
+    }
     return Q8Path::kOther;
+}
+
+/** The per-token row kernel for a kQ2K, kK or kIQ2 weight. */
+float row_q8k_sse4(Q8Path path, gguf::TensorType type, const std::byte* row,
+                   const Q8kAct& a, std::size_t nb) {
+    if (path == Q8Path::kQ2K) {
+        return row_q2_k_q8k_sse4(row, a, nb);
+    }
+    if (path == Q8Path::kIQ2) {
+        return row_iq2_q8k_sse4(type == gguf::TensorType::kIQ2_XXS, row, a,
+                                nb);
+    }
+    return row_k_q8k_sse4(type, row, a, nb);
 }
 
 /**
@@ -1271,15 +1374,14 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
     std::vector<std::int8_t> hqs(cols);
     std::vector<std::int16_t> hbs(nb * 16);
     const bool q3k = w.type == gguf::TensorType::kQ3_K;
-    // Q2_K reads the plain order; Q4_K..Q6_K the lane_pairs_mask one.
+    // Q2_K, Q3_K and the IQ2 types read the plain order; Q4_K..Q6_K the
+    // lane_pairs_mask one.
     quantize_q8k_sse4(x, path == Q8Path::kK && !q3k, hd.data(),
                       hqs.data(), hbs.data());
     const Q8kAct a{hd.data(), hqs.data(), hbs.data()};
     const std::size_t row_bytes = mat_row_bytes(w);
     for (std::uint32_t r = 0; r < w.rows; ++r) {
-        const std::byte* row = w.data + r * row_bytes;
-        out[r] = path == Q8Path::kQ2K ? row_q2_k_q8k_sse4(row, a, nb)
-                                      : row_k_q8k_sse4(w.type, row, a, nb);
+        out[r] = row_q8k_sse4(path, w.type, w.data + r * row_bytes, a, nb);
     }
 }
 
@@ -1379,10 +1481,7 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
                 }
             }
             for (; t < t1; ++t) {
-                const Q8kAct a = act(t);
-                o[t] = path == Q8Path::kQ2K
-                           ? row_q2_k_q8k_sse4(row, a, nb)
-                           : row_k_q8k_sse4(w.type, row, a, nb);
+                o[t] = row_q8k_sse4(path, w.type, row, act(t), nb);
             }
         }
     }
