@@ -73,14 +73,14 @@ and an x86 host tests every code PR.
   build time; vendor pinned single-file deps with recorded sha256.
 - SIMD kernel variants: one source file per variant
   (`backend/matvec_sse4.cpp`, `matvec_sse4_avx.cpp`, `matvec_avx2.cpp`,
-  `matvec_neon.cpp`, `matvec_neon_dotprod.cpp`), and only that file gets the variant's
-  instruction flags (`set_source_files_properties` in CMakeLists.txt,
-  or a target pragma opened after the headers, as the dotprod file
-  does), so the rest of the binary stays baseline and runs on any CPU
-  of the arch. CMake builds every variant the compiler accepts
-  (`check_cxx_compiler_flag` / `check_cxx_source_compiles`); none is
-  chosen at build time. At startup `locus::sys::detect()` reads the
-  CPU's features, `backend/registry.cpp` marks each variant available
-  or not from them and uses the first available one (`--backend` or
-  `LOCUS_BACKEND` overrides). Each variant is tested against the
-  scalar kernels.
+  `matvec_neon.cpp`, `matvec_neon_dotprod.cpp`), and only that file
+  gets the variant's instruction flags (`set_source_files_properties`
+  in CMakeLists.txt, or a target pragma opened after the headers, as
+  the dotprod file does), so the rest of the binary stays baseline and
+  runs on any CPU of the arch. CMake builds every variant the compiler
+  accepts (`check_cxx_compiler_flag` / `check_cxx_source_compiles`);
+  none is chosen at build time. At startup `locus::sys::detect()` reads
+  the CPU's features, `backend/registry.cpp` marks each variant
+  available or not from them and uses the first available one
+  (`--backend` or `LOCUS_BACKEND` overrides). Each variant is tested
+  against the scalar kernels.
