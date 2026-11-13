@@ -655,9 +655,9 @@ guarding the default path.
   text records (`req_id=`, `type=`, `key=value` lines, a blank line)
   on its stdin and stdout. Each prefix is one blob, byte for byte the
   disk tier's file, named by its 16 hex digit digest. The bytes go
-  through a POSIX shm object (`/locus-pfx-<pid>-<n>`, 0600) that locus
-  creates per call and unlinks after the reply, never through the
-  pipe:
+  through a POSIX shm object (`/locus-pfx-<pid>-<seq>` in hex, 0600)
+  that locus creates per call and unlinks after the reply, never
+  through the pipe:
 
   | request                       | reply                   |
   |-------------------------------|-------------------------|

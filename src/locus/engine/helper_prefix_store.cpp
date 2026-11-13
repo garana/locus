@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -34,19 +35,27 @@ class Shm {
         }
     }
 
-    /** Creates `name` with `n` bytes reserved (posix_fallocate, so a
-     *  full /dev/shm fails here, not as a SIGBUS on a write).
+    /** Creates `name` with `n` bytes. On Linux they are reserved
+     *  (posix_fallocate, so a full /dev/shm fails here, not as a SIGBUS
+     *  on a write); macOS has no posix_fallocate and sizes the object
+     *  once with ftruncate.
      *  @returns false on any error. */
     bool create(const std::string& name, std::size_t n) {
-        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
-                         0600);
+        fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
         if (fd_ < 0) {
             return false;
         }
         name_ = name;
+        ::fcntl(fd_, F_SETFD, FD_CLOEXEC);  // not inherited by the helper
+#if defined(__APPLE__)
+        if (::ftruncate(fd_, static_cast<off_t>(n)) != 0) {
+            return false;
+        }
+#else
         if (::posix_fallocate(fd_, 0, static_cast<off_t>(n)) != 0) {
             return false;
         }
+#endif
         p_ = ::mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
         n_ = n;
         return p_ != MAP_FAILED;
@@ -65,6 +74,17 @@ class Shm {
 std::string hex(std::uint64_t v) {
     char s[17];
     std::snprintf(s, sizeof s, "%016llx", static_cast<unsigned long long>(v));
+    return s;
+}
+
+/** "/locus-pfx-<pid>-<seq>", both in hex and 32-bit: at most 28
+ *  characters, under macOS's 31 (PSHMNAMLEN). A seq that wraps names a
+ *  new object again, since each one is unlinked after its call. */
+std::string shm_name(std::uint64_t seq) {
+    char s[32];
+    std::snprintf(s, sizeof s, "/locus-pfx-%x-%x",
+                  static_cast<unsigned>(::getpid()),
+                  static_cast<unsigned>(seq));
     return s;
 }
 
@@ -135,7 +155,10 @@ HelperPrefixStore::HelperPrefixStore(std::vector<std::string> argv,
                 lk.unlock();
                 HelperMessage req;
                 req.type = "list";
-                const std::optional<HelperMessage> r = call(std::move(req));
+                // A short timeout, so a hung helper does not hold the
+                // destructor (which joins this thread) for long.
+                const std::optional<HelperMessage> r =
+                    call(std::move(req), std::min(timeout_, kListTimeout));
                 if (r) {
                     // Added, not replaced: a name the helper dropped is
                     // forgotten when its read misses.
@@ -190,7 +213,8 @@ bool HelperPrefixStore::start() {
     return r.has_value();
 }
 
-std::optional<HelperMessage> HelperPrefixStore::call(HelperMessage req) {
+std::optional<HelperMessage> HelperPrefixStore::call(
+    HelperMessage req, std::optional<std::chrono::milliseconds> timeout) {
     for (int attempt = 0; attempt < 2 && !off_.load(); ++attempt) {
         std::shared_ptr<auth::HelperConnection> c;
         {
@@ -198,7 +222,8 @@ std::optional<HelperMessage> HelperPrefixStore::call(HelperMessage req) {
             c = conn_;
         }
         if (c && !c->broken()) {
-            std::optional<HelperMessage> r = c->request(req, timeout_);
+            std::optional<HelperMessage> r =
+                c->request(req, timeout.value_or(timeout_));
             if (r || !c->broken()) {
                 return r;  // an answer, or a slow helper: a miss
             }
@@ -254,8 +279,7 @@ bool HelperPrefixStore::read(std::span<const tok::TokenId> prompt,
     const std::uint64_t bytes =
         file_bytes(header(prompt, n_blocks).size(), n_blocks);
     Shm shm;
-    const std::string name = "/locus-pfx-" + std::to_string(::getpid()) +
-                             "-" + std::to_string(++shm_seq_);
+    const std::string name = shm_name(++shm_seq_);
     if (!shm.create(name, bytes)) {
         return false;
     }
@@ -315,8 +339,7 @@ bool HelperPrefixStore::write(std::span<const tok::TokenId> prompt,
         return false;
     }
     Shm shm;
-    const std::string name = "/locus-pfx-" + std::to_string(::getpid()) +
-                             "-" + std::to_string(++shm_seq_);
+    const std::string name = shm_name(++shm_seq_);
     if (!shm.create(name, bytes)) {
         return false;
     }

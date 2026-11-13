@@ -79,9 +79,15 @@ class HelperPrefixStore : public DiskPrefixStore {
     std::size_t known() const;
 
   private:
+    /** The refresh thread's list timeout (at most the call timeout). */
+    static constexpr std::chrono::milliseconds kListTimeout{10000};
+
     /** Sends `req`, starting the helper again once when it died.
+     *  @param timeout Overrides the call timeout.
      *  @returns the reply, or nullopt (a miss). */
-    std::optional<auth::HelperMessage> call(auth::HelperMessage req);
+    std::optional<auth::HelperMessage> call(
+        auth::HelperMessage req,
+        std::optional<std::chrono::milliseconds> timeout = std::nullopt);
     /** Starts the helper and replaces names_ with its list.
      *  @returns false when it does not answer. Called under start_mu_. */
     bool start();
