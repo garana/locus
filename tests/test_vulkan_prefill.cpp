@@ -135,6 +135,40 @@ std::size_t argmax(const std::vector<float>& v) {
         std::max_element(v.begin(), v.end()) - v.begin());
 }
 
+/**
+ * Keeps the GPU busy for about ms milliseconds (an f32 matvec over a
+ * 64 MB matrix, repeated) before a bench times anything: a GPU idle
+ * before the bench runs its first case still clocking up, which made
+ * that case read several times slower than it is (i#688: q4_k
+ * 768 x 2048 17 us cold, 5 us warm on an M4 Max).
+ */
+void gpu_warm(VulkanContext& ctx, double ms = 500.0) {
+    constexpr std::uint32_t rows = 8192, cols = 2048;
+    std::mt19937 rng(1);
+    const auto w = random_f32(std::size_t{rows} * cols, rng);
+    const auto x = random_f32(cols, rng);
+    auto wb = upload(ctx, w);
+    auto xb = upload(ctx, x);
+    auto ob = ctx.create_buffer(std::size_t{rows} * 4);
+    const std::uint32_t push[] = {rows, cols, 0, 0, 0, 0, fbits(1.0f)};
+    const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+    const std::uint32_t groups =
+        VulkanContext::matvec_groups(Kernel::kMatvecF32, rows);
+    const auto t0 = std::chrono::steady_clock::now();
+    while (std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0)
+               .count() < ms) {
+        ctx.begin_batch();
+        for (int i = 0; i < 20; ++i) {
+            ctx.dispatch(Kernel::kMatvecF32, bufs, push, groups);
+        }
+        ctx.end_batch();
+    }
+    for (auto b : {wb, xb, ob}) {
+        ctx.destroy_buffer(b);
+    }
+}
+
 }  // namespace
 
 TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
@@ -713,6 +747,7 @@ TEST_CASE("bench: vulkan matmul throughput", "[.][bench][vulkan]") {
         SKIP("no usable Vulkan device / kernels not built");
     }
     VulkanContext ctx;
+    gpu_warm(ctx);
     std::mt19937 rng(53);
     const std::uint32_t n_tok = 512, reps = 20;
     struct Shape {
@@ -779,6 +814,7 @@ TEST_CASE("bench: vulkan matvec bandwidth", "[.][bench][vulkan]") {
         SKIP("no usable Vulkan device / kernels not built");
     }
     VulkanContext ctx;
+    gpu_warm(ctx);
     std::mt19937 rng(59);
     const std::uint32_t reps = 2000;
     struct Shape {
@@ -829,6 +865,7 @@ TEST_CASE("bench: vulkan k-quant matvec bandwidth", "[.][bench][vulkan]") {
         SKIP("no usable Vulkan device / kernels not built");
     }
     VulkanContext ctx;
+    gpu_warm(ctx);
     std::mt19937 rng(61);
     const std::uint32_t reps = 1000;
     struct Case {
@@ -884,6 +921,7 @@ TEST_CASE("bench: vulkan f32 matvec bandwidth", "[.][bench][vulkan]") {
         SKIP("no usable Vulkan device / kernels not built");
     }
     VulkanContext ctx;
+    gpu_warm(ctx);
     std::mt19937 rng(61);
     const std::uint32_t reps = 500;
     for (const auto& [rows, cols] :

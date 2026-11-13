@@ -349,6 +349,7 @@ struct State {
         drop(router, router_n);
         drop(route, route_n);
         drop(attn_part, attn_part_n);
+        drop(attn_round, attn_round_n);
         for (int c = 0; c < kChunkCount_; ++c) {
             drop(chunk[c], chunk_n[c]);
         }
@@ -385,12 +386,12 @@ struct State {
     /** Activation buffers, sized on first use per model dims. */
     VulkanContext::Buffer x{}, xb{}, q{}, gate{}, up{}, attout{},
         att{}, logits{}, table{}, ones{}, kv_a{}, q_abs{},
-        latent{}, q_a{}, router{}, route{}, attn_part{};
+        latent{}, q_a{}, router{}, route{}, attn_part{}, attn_round{};
     std::size_t x_n = 0, xb_n = 0, q_n = 0, gate_n = 0, up_n = 0,
                 attout_n = 0, att_n = 0, logits_n = 0,
                 table_n = 0, ones_n = 0, kv_a_n = 0, q_abs_n = 0,
                 latent_n = 0, q_a_n = 0, router_n = 0, route_n = 0,
-                attn_part_n = 0;
+                attn_part_n = 0, attn_round_n = 0;
 
     /**
      * Uploads a whole stacked expert tensor (every expert) as one
@@ -972,21 +973,38 @@ std::size_t q4k_seg_count(const Mat& q, const Mat& k, const Mat& v) {
  * Records the matvecs of 2 or 3 Q4_K matrices reading x
  * (q4k_seg_count) as one matvec_q4_k_seg dispatch, each read from its
  * own upload: ms[0]'s rows to out at out_off, ms[1]'s to out2 at off1,
- * ms[2]'s (if any) to out2 at off2.
+ * ms[2]'s (if any) to out2 at off2, roped per `rope` (default: none),
+ * as rec_matvec_seg.
  */
 void rec_matvec_q4k_seg(State& s, std::span<const Mat* const> ms,
                         VulkanContext::Buffer x, VulkanContext::Buffer out,
                         std::uint32_t out_off, VulkanContext::Buffer out2,
-                        std::uint32_t off1, std::uint32_t off2) {
+                        std::uint32_t off1, std::uint32_t off2,
+                        const SegRope& rope = {}) {
     const std::uint32_t seg1 = ms[0]->rows;
     const std::uint32_t seg2 = seg1 + ms[1]->rows;
+    // The epilogue's pairs are two rows of one 8-row workgroup: seg1
+    // and the rope spans even (rec_matvec_seg's invariants).
+    if ((rope.rd0 != 0 || rope.rd1 != 0) &&
+        (seg1 % 2 != 0 ||
+         !vk::seg_rope_fits(seg1, rope.hs0, rope.ro0, rope.rd0) ||
+         !vk::seg_rope_fits(ms[1]->rows, rope.hs1, rope.ro1, rope.rd1))) {
+        throw std::logic_error("matvec_q4_k_seg: rope spec breaks the "
+                               "epilogue's pairing invariants");
+    }
     const std::uint32_t rows = seg2 + (ms.size() > 2 ? ms[2]->rows : 0);
     const VulkanContext::Buffer w1 = s.upload_w(*ms[1]);
     const VulkanContext::Buffer bufs[] = {
         s.upload_w(*ms[0]), x, out, out2, w1,
-        ms.size() > 2 ? s.upload_w(*ms[2]) : w1};
-    const std::uint32_t push[] = {rows, ms[0]->cols, out_off, 0, 0, 0,
-                                  fbits(1.0f), seg1, off1, seg2, off2};
+        ms.size() > 2 ? s.upload_w(*ms[2]) : w1,
+        rope.divisors.impl != nullptr ? rope.divisors : x};
+    const std::uint32_t push[] = {
+        rows,         ms[0]->cols, out_off,     0,
+        0,            0,           fbits(1.0f), seg1,
+        off1,         seg2,        off2,        rope.hs0,
+        rope.ro0,     rope.rd0,    rope.hs1,    rope.ro1,
+        rope.rd1,     rope.pos,    rope.base_bits, rope.fs_bits,
+        rope.lo_bits, rope.hi_bits};
     s.ctx.dispatch(Kernel::kMatvecQ4_KSeg, bufs, push,
                    VulkanContext::matvec_groups(Kernel::kMatvecQ4_KSeg,
                                                 rows));
@@ -1491,6 +1509,19 @@ constexpr std::size_t kAttnScratchFloats = std::size_t{1} << 28;
 /** The cap in use (vulkan_set_attn_scratch_floats; tests only). */
 std::atomic<std::size_t> attn_scratch_floats{kAttnScratchFloats};
 
+/**
+ * Decode attention's partials cap, in blocks per round (i#116): past
+ * it the blocks merge in rounds of this many (attn_combine_part), so
+ * the partials scratch stays at cap * heads * (dv + 2) floats however
+ * long the context (DeepSeek-V2-Lite at 128k: about 8 MB, not 134).
+ * 256 grouped blocks are 8192 positions, so shorter contexts keep the
+ * one-round path and its bits.
+ */
+constexpr std::uint32_t kAttnPartBlocks = 256;
+
+/** The cap in use (vulkan_set_attn_part_blocks; tests only). */
+std::atomic<std::uint32_t> attn_part_blocks{kAttnPartBlocks};
+
 /** vulkan_attn_block at the cap in use. */
 std::uint32_t attn_block(std::uint32_t n, std::uint32_t heads,
                          std::uint32_t n_pos) {
@@ -1552,42 +1583,64 @@ void rec_attn_decode(State& s, const PagedPool& pp, std::uint32_t n_pos,
     // Positions per block: attn_decode_grp.comp / attn_decode.comp CH.
     const std::uint32_t block = grouped ? 32 : 64;
     const std::uint32_t blocks = (n_pos + block - 1) / block;
+    // Past attn_part_blocks the blocks run in rounds of that many, each
+    // merged into one partial (attn_combine_part), so the partials
+    // scratch stays bounded (i#116); up to it, one round as before.
+    const std::uint32_t cap = attn_part_blocks.load();
+    const std::uint32_t rounds = blocks > cap ? (blocks + cap - 1) / cap : 1;
+    const std::uint32_t per = rounds > 1 ? cap : blocks;
     VulkanContext::Buffer part = a.out;
     if (blocks > 1) {
         s.grow(s.attn_part, s.attn_part_n,
-               std::size_t{blocks} * heads * (a.dv + 2));
+               std::size_t{per} * heads * (a.dv + 2));
         part = s.attn_part;
+    }
+    if (rounds > 1) {
+        s.grow(s.attn_round, s.attn_round_n,
+               std::size_t{rounds} * heads * (a.dv + 2));
     }
     const VulkanContext::Buffer bufs[] = {pp.pool, pp.table, a.q1,
                                           a.q2,    a.out,    part};
-    const std::uint32_t push[] = {n_pos,       pp.block_tokens,
-                                  pp.block_stride, pp.row_w,
-                                  a.k_off,     a.v_off,
-                                  a.kv_stride, a.group,
-                                  a.d1,        a.d2,
-                                  a.q1_stride, a.q2_stride,
-                                  a.q2_off,    a.dv,
-                                  fbits(a.scale), a.out_stride};
+    Kernel k = pp.f16 ? Kernel::kAttnDecodeF16 : Kernel::kAttnDecode;
+    std::uint32_t groups_y = heads;
     if (grouped) {
         // Workgroup y: KV head x chunks of hg heads (attn_decode_grp
         // HG): 8 for a group that fits, so no duplicate-head lanes.
         const bool hg8 = a.group <= 8;
         const std::uint32_t hg = hg8 ? 8 : 16;
         const std::uint32_t chunks = (a.group + hg - 1) / hg;
-        const Kernel k =
-            hg8 ? (pp.f16 ? Kernel::kAttnDecodeGrp8F16
+        k = hg8 ? (pp.f16 ? Kernel::kAttnDecodeGrp8F16
                           : Kernel::kAttnDecodeGrp8)
                 : (pp.f16 ? Kernel::kAttnDecodeGrpF16
                           : Kernel::kAttnDecodeGrp);
-        s.ctx.dispatch(k, bufs, push, blocks, heads / a.group * chunks);
-    } else {
-        s.ctx.dispatch(
-            pp.f16 ? Kernel::kAttnDecodeF16 : Kernel::kAttnDecode, bufs,
-            push, blocks, heads);
+        groups_y = heads / a.group * chunks;
+    }
+    for (std::uint32_t r = 0; r < rounds; ++r) {
+        const std::uint32_t c_base = r * per;
+        const std::uint32_t nb = std::min(per, blocks - c_base);
+        const std::uint32_t push[] = {n_pos,       pp.block_tokens,
+                                      pp.block_stride, pp.row_w,
+                                      a.k_off,     a.v_off,
+                                      a.kv_stride, a.group,
+                                      a.d1,        a.d2,
+                                      a.q1_stride, a.q2_stride,
+                                      a.q2_off,    a.dv,
+                                      fbits(a.scale), a.out_stride,
+                                      c_base,      blocks};
+        s.ctx.dispatch(k, bufs, push, nb, groups_y);
+        if (rounds > 1) {
+            const VulkanContext::Buffer cbufs[] = {part, s.attn_round};
+            const std::uint32_t cpush[] = {nb, heads, a.dv, a.out_stride,
+                                           r,  rounds};
+            s.ctx.dispatch(Kernel::kAttnCombinePart, cbufs, cpush,
+                           (a.dv + 63) / 64, heads);
+        }
     }
     if (blocks > 1) {
-        const VulkanContext::Buffer cbufs[] = {part, a.out};
-        const std::uint32_t cpush[] = {blocks, heads, a.dv, a.out_stride};
+        const VulkanContext::Buffer cbufs[] = {
+            rounds > 1 ? s.attn_round : part, a.out};
+        const std::uint32_t cpush[] = {rounds > 1 ? rounds : blocks, heads,
+                                       a.dv, a.out_stride};
         s.ctx.dispatch(Kernel::kAttnCombine, cbufs, cpush,
                        (a.dv + 63) / 64, heads);
     }
@@ -1737,6 +1790,10 @@ std::uint32_t vulkan_attn_block(std::uint32_t n, std::uint32_t heads,
 
 void vulkan_set_attn_scratch_floats(std::size_t floats) {
     attn_scratch_floats.store(floats != 0 ? floats : kAttnScratchFloats);
+}
+
+void vulkan_set_attn_part_blocks(std::uint32_t blocks) {
+    attn_part_blocks.store(blocks != 0 ? blocks : kAttnPartBlocks);
 }
 
 bool vulkan_backend_usable() {
@@ -2581,6 +2638,21 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             s.ctx.dispatch(Kernel::kMatvecQ8_0Glu, bufs, push,
                            VulkanContext::matvec_groups(
                                Kernel::kMatvecQ8_0Glu, ff));
+        } else if (wg.type == gguf::TensorType::kQ4_K &&
+                   wu.type == gguf::TensorType::kQ4_K &&
+                   wg.cols == wu.cols && off_g == off_u) {
+            // The same for Q4_K (i#688): binding 3 is unused.
+            const VulkanContext::Buffer gw =
+                whole_g != nullptr ? *whole_g : s.upload_w(g2);
+            const VulkanContext::Buffer bufs[] = {
+                gw, s.xb, s.gate, gw,
+                whole_u != nullptr ? *whole_u : s.upload_w(u2)};
+            const std::uint32_t push[] = {
+                ff, wg.cols, 0, 0, w_off_units(wg, off_g), 0,
+                fbits(1.0f)};
+            s.ctx.dispatch(Kernel::kMatvecQ4_KGlu, bufs, push,
+                           VulkanContext::matvec_groups(
+                               Kernel::kMatvecQ4_KGlu, ff));
         } else {
             rec_matvec(s, g2, s.xb, s.gate, 0, false, off_g, 0, 1.0f,
                        whole_g);
@@ -2628,8 +2700,10 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             const bool qk_norm = lay.has_qk_norm();
             const bool bias = lay.has_qkv_bias();
             // Biases land before rope, so no epilogue rope with them.
-            const bool epi_rope =
-                fused && !hp.rope_neox && !qk_norm && !bias;
+            // The Q4_K stacked projection ropes in its epilogue too
+            // (i#688).
+            const bool epi_rope = (fused || n_q4k_seg > 0) &&
+                                  !hp.rope_neox && !qk_norm && !bias;
             const Kernel rope_k =
                 hp.rope_neox ? Kernel::kRopeNeox : Kernel::kRope;
             // q-k-norm models norm and rope q and K in one dispatch,
@@ -2658,22 +2732,22 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             const std::uint32_t k_at = f16 ? 0 : row_off;
             const std::uint32_t v_at =
                 f16 ? kv_dim : row_off + layer_stride / 2;
+            SegRope rope;  // rd 0: no epilogue rope
+            if (epi_rope) {
+                // q and k roped in the epilogue (whole heads).
+                rope.hs0 = rope.rd0 = hp.head_dim;
+                rope.hs1 = rope.rd1 = hp.head_dim;
+                rope.pos = pos;
+                rope.base_bits = base_bits;
+                rope.fs_bits = fbits(1.0f);
+                rope.divisors = divisors;
+            }
             if (fused) {
-                SegRope rope;  // rd 0: no epilogue rope
-                if (epi_rope) {
-                    // q and k roped in the epilogue (whole heads).
-                    rope.hs0 = rope.rd0 = hp.head_dim;
-                    rope.hs1 = rope.rd1 = hp.head_dim;
-                    rope.pos = pos;
-                    rope.base_bits = base_bits;
-                    rope.fs_bits = fbits(1.0f);
-                    rope.divisors = divisors;
-                }
                 rec_matvec_seg(s, qkv, s.xb, s.q, 0, kv_dst, k_at, v_at,
                                rope);
             } else if (n_q4k_seg > 0) {
                 rec_matvec_q4k_seg(s, {qkv, n_q4k_seg}, s.xb, s.q, 0,
-                                   kv_dst, k_at, v_at);
+                                   kv_dst, k_at, v_at, rope);
             } else {
                 rec_matvec(s, lay.wq, s.xb, s.q, 0, false);
             }

@@ -3,6 +3,8 @@
 #include "locus/backend/vulkan/mem_fit.hpp"
 
 #include <algorithm>
+#include <string_view>
+#include <thread>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -60,6 +62,7 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ4_K:  // 8 rows of 16 lanes
         case Kernel::kMatvecQ4_KB:
         case Kernel::kMatvecQ4_KGluB:
+        case Kernel::kMatvecQ4_KGlu:
         case Kernel::kMatvecQ4_KP:
         case Kernel::kMatvecQ4_KGluP:
         case Kernel::kMatvecQ6_KP:
@@ -205,6 +208,7 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matvec_q8_0_glu_b_spv.h"
 #include "attn_decode_spv.h"
 #include "attn_combine_spv.h"
+#include "attn_combine_part_spv.h"
 #include "matvec_q8_0_seg_spv.h"
 #include "matvec_q8_0_sh_b_spv.h"
 #include "matvec_q8_0_glu_sh_b_spv.h"
@@ -219,6 +223,7 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matvec_q8_0_glu_p_spv.h"
 #include "matvec_q4_k_p_spv.h"
 #include "matvec_q4_k_glu_p_spv.h"
+#include "matvec_q4_k_glu_spv.h"
 #include "matvec_q6_k_p_spv.h"
 #include "matvec_f32_n_spv.h"
 #include "matmul_paged_f16_spv.h"
@@ -483,7 +488,7 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kMatvecQ8_0GluB, "matvec_q8_0_glu_b", locus_matvec_q8_0_glu_b_spv,
      sizeof(locus_matvec_q8_0_glu_b_spv), 5, 52},
     {Kernel::kAttnDecode, "attn_decode", locus_attn_decode_spv,
-     sizeof(locus_attn_decode_spv), 6, 64},
+     sizeof(locus_attn_decode_spv), 6, 72},
     {Kernel::kAttnCombine, "attn_combine", locus_attn_combine_spv,
      sizeof(locus_attn_combine_spv), 2, 16},
     {Kernel::kMatvecQ8_0Seg, "matvec_q8_0_seg", locus_matvec_q8_0_seg_spv,
@@ -494,7 +499,7 @@ constexpr KernelDesc kDescs[] = {
      locus_matvec_q8_0_glu_sh_b_spv, sizeof(locus_matvec_q8_0_glu_sh_b_spv), 7,
      60},
     {Kernel::kAttnDecodeGrp, "attn_decode_grp", locus_attn_decode_grp_spv,
-     sizeof(locus_attn_decode_grp_spv), 6, 64},
+     sizeof(locus_attn_decode_grp_spv), 6, 72},
     {Kernel::kMatmulQ8_0H, "matmul_q8_0_h", locus_matmul_q8_0_h_spv,
      sizeof(locus_matmul_q8_0_h_spv), 3, 96},
     {Kernel::kMatmulF32H, "matmul_f32_h", locus_matmul_f32_h_spv,
@@ -534,12 +539,12 @@ constexpr KernelDesc kDescs[] = {
      matmul_shared_bytes(VulkanContext::kMatmulBK),
      matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
     {Kernel::kAttnDecodeF16, "attn_decode_f16", locus_attn_decode_f16_spv,
-     sizeof(locus_attn_decode_f16_spv), 6, 64},
+     sizeof(locus_attn_decode_f16_spv), 6, 72},
     {Kernel::kKvScatterF16, "kv_scatter_f16", locus_kv_scatter_f16_spv,
      sizeof(locus_kv_scatter_f16_spv), 3, 40},
     {Kernel::kAttnDecodeGrpF16, "attn_decode_grp_f16",
      locus_attn_decode_grp_f16_spv, sizeof(locus_attn_decode_grp_f16_spv), 6,
-     64},
+     72},
     {Kernel::kRopeNeox, "rope_neox", locus_rope_neox_spv,
      sizeof(locus_rope_neox_spv), 2, 36},
     {Kernel::kRopeNeoxB, "rope_neox_b", locus_rope_neox_b_spv,
@@ -581,10 +586,10 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kConv2d, "conv2d", locus_conv2d_spv, sizeof(locus_conv2d_spv),
      4, 48},
     {Kernel::kAttnDecodeGrp8, "attn_decode_grp8",
-     locus_attn_decode_grp8_spv, sizeof(locus_attn_decode_grp8_spv), 6, 64},
+     locus_attn_decode_grp8_spv, sizeof(locus_attn_decode_grp8_spv), 6, 72},
     {Kernel::kAttnDecodeGrp8F16, "attn_decode_grp8_f16",
      locus_attn_decode_grp8_f16_spv,
-     sizeof(locus_attn_decode_grp8_f16_spv), 6, 64},
+     sizeof(locus_attn_decode_grp8_f16_spv), 6, 72},
     {Kernel::kMatvecBF16, "matvec_bf16", locus_matvec_bf16_spv,
      sizeof(locus_matvec_bf16_spv), 3, 28},
     {Kernel::kMatvecBF16B, "matvec_bf16_b", locus_matvec_bf16_b_spv,
@@ -601,7 +606,7 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kQkNormRope, "qk_norm_rope", locus_qk_norm_rope_spv,
      sizeof(locus_qk_norm_rope_spv), 5, 32},
     {Kernel::kMatvecQ4_KSeg, "matvec_q4_k_seg", locus_matvec_q4_k_seg_spv,
-     sizeof(locus_matvec_q4_k_seg_spv), 6, 44},
+     sizeof(locus_matvec_q4_k_seg_spv), 7, 88},
     {Kernel::kBiasRows, "bias_rows", locus_bias_rows_spv,
      sizeof(locus_bias_rows_spv), 2, 20},
     {Kernel::kMatmulQ5_0, "matmul_q5_0", locus_matmul_q5_0_spv,
@@ -685,6 +690,11 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_flash_attn_small_spv),
      flash_shared_bytes(VulkanContext::kFlashAttnRows, 32, 16),
      flash_shared_bytes(VulkanContext::kFlashAttnRowsSmall, 16, 8)},
+    {Kernel::kMatvecQ4_KGlu, "matvec_q4_k_glu", locus_matvec_q4_k_glu_spv,
+     sizeof(locus_matvec_q4_k_glu_spv), 5, 28},
+    {Kernel::kAttnCombinePart, "attn_combine_part",
+     locus_attn_combine_part_spv, sizeof(locus_attn_combine_part_spv), 2,
+     24},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */
@@ -730,6 +740,16 @@ struct VulkanContext::Impl {
     VkQueue queue = VK_NULL_HANDLE;
     std::uint32_t queue_family = 0;
     VkCommandPool pool = VK_NULL_HANDLE;
+    /** Signaled by each batch's submit when spin_wait: end_batch
+     *  polls it for up to kSpinBudget before blocking (i#697). */
+    VkFence batch_fence = VK_NULL_HANDLE;
+    /** Wait for a batch by polling its fence rather than
+     *  vkQueueWaitIdle: on MoltenVK by default (LOCUS_VK_SPIN_WAIT=0
+     *  or 1 overrides), where the blocking wait's wake-up cost about
+     *  0.4 ms a token (Llama 3.2 1B Q4_K_M decode 255 -> 279 tok/s on
+     *  an M4 Max). */
+    bool spin_wait = false;
+    static constexpr std::chrono::milliseconds kSpinBudget{20};
 
     /**
      * Descriptor sets cached by (kernel, buffers): a decode token
@@ -1185,6 +1205,10 @@ struct VulkanContext::Impl {
                     moltenvk && std::getenv("LOCUS_VK_BARRIERS") == nullptr;
             }
         }
+        {
+            const char* e = std::getenv("LOCUS_VK_SPIN_WAIT");
+            spin_wait = e != nullptr ? std::string_view(e) != "0" : moltenvk;
+        }
         dci.enabledExtensionCount =
             static_cast<std::uint32_t>(dexts.size());
         dci.ppEnabledExtensionNames = dexts.data();
@@ -1197,6 +1221,10 @@ struct VulkanContext::Impl {
         cpi.queueFamilyIndex = queue_family;
         check(vkCreateCommandPool(device, &cpi, nullptr, &pool),
               "create command pool");
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        check(vkCreateFence(device, &fci, nullptr, &batch_fence),
+              "create fence");
 
         {
             VkPhysicalDeviceProperties pp;
@@ -1535,6 +1563,7 @@ struct VulkanContext::Impl {
                 vkDestroyDescriptorSetLayout(device, p.dsl,
                                              nullptr);
             }
+            vkDestroyFence(device, batch_fence, nullptr);
             vkDestroyCommandPool(device, pool, nullptr);
             vkDestroyDevice(device, nullptr);
         }
@@ -1803,9 +1832,32 @@ void VulkanContext::end_batch() {
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &im.batch_cmd;
-    check(vkQueueSubmit(im.queue, 1, &si, VK_NULL_HANDLE),
-          "submit");
-    check(vkQueueWaitIdle(im.queue), "wait idle");
+    if (im.spin_wait) {
+        check(vkResetFences(im.device, 1, &im.batch_fence), "reset fence");
+        check(vkQueueSubmit(im.queue, 1, &si, im.batch_fence), "submit");
+        // Poll the fence, yielding between polls: a decode token's
+        // batch takes a few ms, and waking from a blocking wait costs
+        // MoltenVK about 0.4 ms a batch (i#697). Past the spin budget
+        // (a long batch: prefill, an image step) block instead.
+        const auto t_spin = clock::now();
+        VkResult st = vkGetFenceStatus(im.device, im.batch_fence);
+        while (st == VK_NOT_READY &&
+               clock::now() - t_spin < Impl::kSpinBudget) {
+            std::this_thread::yield();
+            st = vkGetFenceStatus(im.device, im.batch_fence);
+        }
+        if (st == VK_NOT_READY) {
+            check(vkWaitForFences(im.device, 1, &im.batch_fence, VK_TRUE,
+                                  UINT64_MAX),
+                  "wait fence");
+        } else {
+            check(st, "fence status");
+        }
+    } else {
+        check(vkQueueSubmit(im.queue, 1, &si, VK_NULL_HANDLE),
+              "submit");
+        check(vkQueueWaitIdle(im.queue), "wait idle");
+    }
     ++im.prof.batches;
     const clock::time_point t2 = clock::now();
     GpuMetrics& gm = gpu_metrics(GpuApi::kVulkan);

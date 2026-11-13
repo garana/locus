@@ -555,6 +555,114 @@ TEST_CASE("the engine keys the disk prefix store on the vulkan expert "
     REQUIRE(engine.get(id)->generated.size() == 2);
 }
 
+TEST_CASE("the disk prefix tier takes a cuda MoE model with the hybrid "
+          "off, and refuses it on",
+          "[moe][cuda][disk_prefix]") {
+    if (!locus::backend::cuda_backend_usable()) {
+        SKIP("no usable CUDA device");
+    }
+    locus::backend::cuda_pool_reset();
+    ModelBuilder mb;
+    mb.common();
+    mb.tensor("blk.0.ffn_gate_inp.weight", {kE, 4}, weights(kE * 4, 13));
+    mb.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, 4},
+              weights(kE * kF * 4, 14));
+    mb.tensor("blk.0.ffn_up_exps.weight", {kE, kF, 4},
+              weights(kE * kF * 4, 15));
+    mb.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
+              weights(kF * kE * 4, 16));
+    const auto img = mb.build(4, 2);
+    const auto base = std::filesystem::temp_directory_path() /
+                      ("locus-moe-cuda-dpk-" +
+                       std::to_string(std::random_device{}()));
+    std::filesystem::remove_all(base);
+    std::filesystem::create_directories(base);
+    const std::string path = (base / "moe.gguf").string();
+    {
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(img.data()),
+                static_cast<std::streamsize>(img.size()));
+    }
+    struct Cleanup {
+        std::filesystem::path dir;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+            unsetenv("LOCUS_MOE_HYBRID");
+        }
+    } cleanup{base};
+    auto g = locus::gguf::GgufFile::open(path);
+    const auto eos = static_cast<locus::tok::TokenId>(-1);
+    // One model per decision: the hybrid is settled once per model.
+    const auto cuda_model = [&] {
+        auto m = TransformerModel::load(g);
+        m.use_backend(*locus::backend::find_backend("cuda"));
+        return m;
+    };
+    const auto open = [&](const TransformerModel& m) {
+        return locus::engine::open_disk_prefix(
+            (base / "kv").string(), 1 << 20, g, path, m,
+            locus::kv::KvType::kF32);
+    };
+
+    // On: the hot set follows the history, so the engine refuses the
+    // store (open_disk_prefix no longer refuses CUDA MoE itself).
+    setenv("LOCUS_MOE_HYBRID", "1", 1);
+    {
+        const auto m = cuda_model();
+        locus::engine::Engine::Config cfg;
+        cfg.disk_prefix = open(m);
+        REQUIRE_THROWS_AS(locus::engine::Engine(m, eos, cfg),
+                          std::invalid_argument);
+        REQUIRE(m.moe_hybrid_on());
+    }
+
+    // Off: every expert runs on the GPU. A prefix written by one engine
+    // is read back by a fresh one (a restart), with the same tokens as a
+    // run without the tier.
+    setenv("LOCUS_MOE_HYBRID", "0", 1);
+    const auto m = cuda_model();
+    const std::vector<locus::tok::TokenId> p = {
+        3, 7, 1, 9, 2, 5, 11, 4, 8, 6, 13, 10, 12, 3, 14, 7, 2, 9, 1, 5};
+    const std::vector<locus::tok::TokenId> q = {
+        6, 2, 8, 4, 10, 12, 1, 3, 5, 7, 9, 11, 13, 15, 2, 4, 6};
+    std::vector<locus::tok::TokenId> want;
+    {
+        locus::engine::Engine::Config cfg;
+        cfg.n_blocks = 8;
+        locus::engine::Engine plain(m, eos, cfg);
+        const auto id = plain.submit(p, 4);
+        plain.run_to_completion();
+        want = plain.get(id)->generated;
+    }
+    const auto with_store = [&](std::shared_ptr<
+                                locus::engine::DiskPrefixStore> s) {
+        locus::engine::Engine::Config cfg;
+        cfg.n_blocks = 8;  // past the 2 blocks a 32-token context sizes
+        cfg.prefix_cache_slots = 1;  // q's entry evicts p's
+        cfg.disk_prefix = std::move(s);
+        return cfg;
+    };
+    {
+        auto store = open(m);
+        locus::engine::Engine e(m, eos, with_store(store));
+        REQUIRE_FALSE(m.moe_hybrid_on());
+        e.submit(p, 4);
+        e.run_to_completion();
+        e.submit(q, 2);
+        e.run_to_completion();
+        e.disk_prefix_drain();
+        REQUIRE(store->find(p) >= 1);
+    }
+    auto store = open(m);
+    locus::engine::Engine e(m, eos, with_store(store));
+    const auto id = e.submit(p, 4);
+    e.run_to_completion();
+    REQUIRE(e.disk_prefix_hits() == 1);
+    REQUIRE(want.size() == 4);
+    REQUIRE(e.get(id)->generated == want);
+}
+
 TEST_CASE("readahead hints leave outputs bit-identical",
           "[moe]") {
     // R8: readahead (default on) is pure madvise hinting;

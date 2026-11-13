@@ -40,14 +40,11 @@ EditPrompt qwen_edit_prompt(const tok::Tokenizer& tok,
     return p;
 }
 
-std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
-                                         const QwenVision& vision,
-                                         std::span<const tok::TokenId> ids,
-                                         std::uint32_t image_at,
-                                         std::span<const float> patches,
-                                         std::uint32_t gh, std::uint32_t gw,
-                                         std::uint32_t drop,
-                                         const backend::Ops& op) {
+EditImageRows qwen_edit_image_rows(const model::TransformerModel& lm,
+                                   const QwenVision& vision,
+                                   std::span<const float> patches,
+                                   std::uint32_t gh, std::uint32_t gw,
+                                   const backend::Ops& op) {
     if (vision.out_dim() != lm.hparams().n_embd) {
         throw std::invalid_argument(
             "qwen edit: the vision tower's width is not the model's");
@@ -56,9 +53,20 @@ std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
     if (gh == 0 || gw == 0 || gh % mg != 0 || gw % mg != 0) {
         throw std::invalid_argument("qwen edit: bad patch grid");
     }
-    const auto img = vision.encode(patches, gh, gw, op);
-    return qwen_edit_text_embeds(lm, img, ids, image_at, gh / mg, gw / mg,
-                                 drop);
+    return {vision.encode(patches, gh, gw, op), gh / mg, gw / mg};
+}
+
+std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,
+                                         const QwenVision& vision,
+                                         std::span<const tok::TokenId> ids,
+                                         std::uint32_t image_at,
+                                         std::span<const float> patches,
+                                         std::uint32_t gh, std::uint32_t gw,
+                                         std::uint32_t drop,
+                                         const backend::Ops& op) {
+    const auto img = qwen_edit_image_rows(lm, vision, patches, gh, gw, op);
+    return qwen_edit_text_embeds(lm, img.rows, ids, image_at, img.grid_h,
+                                 img.grid_w, drop);
 }
 
 std::vector<float> qwen_edit_text_embeds(const model::TransformerModel& lm,

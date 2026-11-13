@@ -634,11 +634,11 @@ guarding the default path.
   file per prefix with the full key (the model's GGUF header, size and
   mtime, the backend and device, the KV geometry, RoPE settings and
   the numeric modes that change KV bits, and on Vulkan whether the MoE
-  experts run on the GPU, settled once the KV pool exists; MoE models
-  on CUDA, whose expert split follows free device memory, are
-  refused), the tokens
-  and a checksum per block, so a mismatch or a torn file reads as a
-  miss; a byte cap evicts the least recently used file. Entries
+  experts run on the GPU, settled once the KV pool exists; a model with
+  the MoE hybrid on is refused, since its hot set follows the requests
+  served before), the tokens and a checksum per block, so a mismatch
+  or a torn file reads as a miss; a byte cap evicts the least recently
+  used file. Entries
   evicted from RAM are written back by a worker thread, and the rest
   at shutdown; a prompt whose prefix is at least one block longer on
   disk waits in a LOADING state while the worker reads it into its
@@ -702,7 +702,9 @@ guarding the default path.
   weight read once per 32 tokens, and the attention on the CPU, since
   dense::attention keeps a GPU that caches weights by host pointer
   off its temporary buffers. The image classifier's convs stay on
-  Vulkan only. Other Vulkan GPUs: #519. Otherwise
+  Vulkan only. Without CUDA, a discrete Vulkan GPU runs them on the
+  Vulkan image ops, the weights copied into its pool (under 700 MB);
+  V3D and llvmpipe keep the CPU, which is faster there (i#680). Otherwise
   `/v1/embeddings` returns the chat model's last token's final-normed
   hidden state, L2-normalized, on a dedicated cache; CPU and CUDA
   backends only (`TransformerModel::embed` refuses vulkan).

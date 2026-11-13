@@ -588,10 +588,12 @@ TEST_CASE("vulkan q4_k seg matvec routes each matrix to its output",
             const std::uint32_t seg1 = rows[0], seg2 = seg1 + rows[1];
             const std::uint32_t total = n_seg == 3 ? seg2 + rows[2] : seg2;
             const VulkanContext::Buffer bufs[] = {
-                wb[0], xb, ob, o2b, wb[1], n_seg == 3 ? wb[2] : wb[1]};
+                wb[0], xb, ob, o2b, wb[1], n_seg == 3 ? wb[2] : wb[1], xb};
+            // No epilogue rope (rd 0): the rope words are unused.
             const std::uint32_t push[] = {
                 total, cols, out_off, 0, 0, 0,
-                std::bit_cast<std::uint32_t>(1.0f), seg1, off1, seg2, off2};
+                std::bit_cast<std::uint32_t>(1.0f), seg1, off1, seg2, off2,
+                1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0};
             ctx.begin_batch();
             ctx.dispatch(Kernel::kMatvecQ4_KSeg, bufs, push,
                          VulkanContext::matvec_groups(Kernel::kMatvecQ4_KSeg,
@@ -620,6 +622,70 @@ TEST_CASE("vulkan q4_k seg matvec routes each matrix to its output",
             }
             ctx.destroy_buffer(ob);
             ctx.destroy_buffer(o2b);
+        }
+    }
+
+    // i#688: the epilogue rope (q heads in segment 0, k heads in
+    // segment 1) against the unroped dispatch followed by rope.comp on
+    // each segment, the decode path it replaces. The same math, but the
+    // two shaders' sin / cos and contraction may round a value's last
+    // bit apart (as matvec_q8_0_seg's epilogue), so a tight bound.
+    SECTION("epilogue rope equals rope.comp after the matvec") {
+        const std::uint32_t hd = 8, nq = 3, nk = 1, pos = 37;
+        const std::uint32_t seg1 = nq * hd, seg2 = seg1 + nk * hd;
+        const auto wq = random_q4k(seg1), wk = random_q4k(nk * hd);
+        auto qb = ctx.create_buffer(wq.size());
+        auto kb = ctx.create_buffer(wk.size());
+        ctx.write_buffer(qb, wq);
+        ctx.write_buffer(kb, wk);
+        std::vector<float> f(hd / 2);
+        for (auto& v : f) {
+            v = 1.0f + 0.5f * std::fabs(dist(rng));
+        }
+        auto fb = ctx.create_buffer(f.size() * 4);
+        ctx.write_buffer(fb, std::as_bytes(std::span(f)));
+        const std::uint32_t base = std::bit_cast<std::uint32_t>(10000.0f);
+        const std::uint32_t one = std::bit_cast<std::uint32_t>(1.0f);
+        auto run = [&](bool epi) {
+            auto ob = ctx.create_buffer(seg1 * 4);
+            auto o2b = ctx.create_buffer(nk * hd * 4);
+            const VulkanContext::Buffer bufs[] = {qb, xb, ob, o2b,
+                                                  kb, kb, fb};
+            const std::uint32_t r = epi ? hd : 0;
+            const std::uint32_t push[] = {
+                seg2, cols, 0, 0, 0, 0, one, seg1, 0, seg2, 0,
+                hd,   0,    r, hd, 0, r, pos, base, one, 0, 0};
+            ctx.begin_batch();
+            ctx.dispatch(Kernel::kMatvecQ4_KSeg, bufs, push,
+                         VulkanContext::matvec_groups(Kernel::kMatvecQ4_KSeg,
+                                                      seg2));
+            if (!epi) {
+                for (const auto& [b, heads] :
+                     {std::pair{ob, nq}, std::pair{o2b, nk}}) {
+                    const VulkanContext::Buffer rb[] = {b, fb};
+                    const std::uint32_t rp[] = {heads, hd,   pos, 0, hd,
+                                                base,  one, 0,   0};
+                    ctx.dispatch(Kernel::kRope, rb, rp, heads);
+                }
+            }
+            ctx.end_batch();
+            std::vector<float> o(seg1 + nk * hd);
+            ctx.read_buffer(ob, std::as_writable_bytes(
+                                    std::span(o).first(seg1)));
+            ctx.read_buffer(o2b, std::as_writable_bytes(
+                                     std::span(o).subspan(seg1)));
+            ctx.destroy_buffer(ob);
+            ctx.destroy_buffer(o2b);
+            return o;
+        };
+        const auto fused = run(true);
+        const auto apart = run(false);
+        for (std::size_t i = 0; i < fused.size(); ++i) {
+            INFO("row " << i);
+            REQUIRE(fused[i] == Catch::Approx(apart[i]).epsilon(1e-6));
+        }
+        for (auto b : {qb, kb, fb}) {
+            ctx.destroy_buffer(b);
         }
     }
     ctx.destroy_buffer(xb);

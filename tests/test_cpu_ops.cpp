@@ -747,6 +747,71 @@ TEST_CASE("matvec_batch_sse4 Q4_K/Q6_K byte-identical to per-token "
         }
     }
 }
+
+// i#691: the SSE4 Q8_K / Q8_0-activation batch (prefill's matvec) and
+// the per-token SSE4 kernel are bit-identical to scalar matvec_q8k, for
+// every token of a batch, so batched prefill equals the per-token path.
+TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
+          "dots",
+          "[ops][batch][sse4]") {
+    if (!locus::sys::detect().sse4) {
+        SKIP("CPU lacks SSE4.1");
+    }
+    constexpr std::uint32_t rows = 3;
+    std::mt19937 rng(211);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    const auto check = [&](const Mat& m, std::uint32_t n) {
+        const std::uint32_t cols = m.cols;
+        std::vector<float> xb(std::size_t{n} * cols);
+        for (auto& v : xb) {
+            v = xd(rng);
+        }
+        std::vector<float> got(std::size_t{rows} * n);
+        matvec_batch_sse4_q8k(m, xb, got, n);
+        for (std::uint32_t tk = 0; tk < n; ++tk) {
+            const std::span<const float> x(xb.data() + std::size_t{tk} * cols,
+                                           cols);
+            std::vector<float> ref(rows), one(rows);
+            matvec_q8k(m, x, ref);
+            matvec_sse4_q8k(m, x, one);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                INFO("type " << static_cast<int>(m.type) << " cols " << cols
+                             << " r=" << r << " t=" << tk);
+                REQUIRE(one[r] == ref[r]);
+                REQUIRE(got[std::size_t{r} * n + tk] == ref[r]);
+            }
+        }
+    };
+    // 8 blocks (2048 columns): the token tile is 48, so n = 50 spans two
+    // tiles.
+    for (TensorType t : {TensorType::kQ2_K, TensorType::kQ3_K,
+                         TensorType::kQ4_K, TensorType::kQ5_K,
+                         TensorType::kQ6_K}) {
+        std::vector<std::byte> w;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto row = k_quant_row(t, 8, 900u + r);
+            w.insert(w.end(), row.begin(), row.end());
+        }
+        check(Mat{t, w.data(), rows, 8 * 256}, 50);
+    }
+    // Block-32 weights, 25 blocks a row (the odd tail block runs): Q8_0
+    // takes the SSE4 kernel, Q4_0 and IQ4_NL the scalar one per token.
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
+    for (const auto& [t, bytes] : {std::pair{TensorType::kQ8_0, 34u},
+                                   std::pair{TensorType::kQ4_0, 18u},
+                                   std::pair{TensorType::kIQ4_NL, 18u}}) {
+        std::vector<std::byte> w(std::size_t{rows} * 25 * bytes);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / bytes; ++bl) {
+            const std::uint16_t d = f32_to_f16(scale_d(rng));
+            std::memcpy(w.data() + bl * bytes, &d, 2);
+        }
+        check(Mat{t, w.data(), rows, 800}, 7);
+    }
+}
 #endif
 
 // Per-token CUDA device kernels vs the scalar reference, across every

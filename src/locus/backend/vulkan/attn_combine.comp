@@ -7,6 +7,12 @@
 // y = head h): the whole group reduces the max and the weighted l
 // over the blocks, then SL slices of 64 threads each sum every SL-th
 // block for their i, added up through shared memory.
+//
+// With -DPARTIAL (attn_combine_part; i#116) it writes round `round` of
+// n_rounds as one partial in its own input's layout instead: the
+// unnormalized sum_c e_c o_c[h][i], then (max_c m_c, sum_c e_c l_c),
+// so a long decode's blocks merge in rounds of a bounded size and the
+// plain build merges the rounds.
 
 #define WG 256u
 #define NI 64u              // outputs per workgroup
@@ -22,6 +28,10 @@ layout(push_constant) uniform PC {
     uint heads;
     uint dv;
     uint out_stride;    // OUT floats between heads
+#ifdef PARTIAL
+    uint round;
+    uint n_rounds;
+#endif
 } pc;
 
 shared float red[WG];
@@ -74,6 +84,18 @@ void main() {
         for (uint k = 1u; k < SL; ++k) {
             acc += red[k * NI + t];
         }
+#ifdef PARTIAL
+        o[(pc.round * pc.heads + h) * pc.dv + i] = acc;
+#else
         o[h * pc.out_stride + i] = acc / l;
+#endif
     }
+#ifdef PARTIAL
+    if (t == 0u && gl_WorkGroupID.x == 0u) {
+        uint st = pc.n_rounds * pc.heads * pc.dv +
+                  (pc.round * pc.heads + h) * 2u;
+        o[st] = mx;
+        o[st + 1u] = l;
+    }
+#endif
 }

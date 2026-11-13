@@ -36,9 +36,8 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
 
 /**
  * Opens the disk prefix store under `dir` for `m` (disk_key_for), with
- * a cap of `cap_bytes`.
- * @throws std::invalid_argument for an MoE model on CUDA: its expert
- *     split also depends on the free device memory at startup.
+ * a cap of `cap_bytes`. The Engine that takes the store refuses it
+ * while the MoE hybrid is on (i#664).
  */
 std::shared_ptr<DiskPrefixStore> open_disk_prefix(
     const std::string& dir, std::uint64_t cap_bytes,
