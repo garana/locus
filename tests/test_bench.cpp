@@ -383,6 +383,55 @@ TEST_CASE("bench: llama 1b decode step on cuda with a head row range",
 // i#719: the batched SSE4 K-quant rows (prefill's matvec) on a
 // feed-forward-sized weight (2048 x 8192) for a 64-token chunk, one
 // thread. Random bytes with a small f16 scale: only the time counts.
+// i#721: the per-token (decode) SSE4 q8k matvec on the same 2048 x 8192
+// weights, one thread, with the weight bytes read per second. Random
+// bytes with a small f16 scale: only the time counts.
+TEST_CASE("bench: sse4 q8k decode rows", "[.][bench]") {
+    if (!locus::sys::detect().sse4) {
+        SKIP("CPU lacks SSE4.1");
+    }
+    constexpr std::uint32_t rows = 2048, cols = 8192, reps = 50;
+    std::mt19937 rng(12);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    std::vector<float> x(cols);
+    for (auto& v : x) {
+        v = xd(rng);
+    }
+    struct Q {
+        const char* name;
+        locus::gguf::TensorType type;
+        std::size_t bytes, d_off;
+    };
+    for (const Q& q : {Q{"q4_k", locus::gguf::TensorType::kQ4_K, 144, 0},
+                       Q{"q6_k", locus::gguf::TensorType::kQ6_K, 210, 208}}) {
+        std::vector<std::byte> w(std::size_t{rows} * (cols / 256) * q.bytes);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / q.bytes; ++bl) {
+            const std::uint16_t d = f32_to_f16(0.01f);
+            std::memcpy(w.data() + bl * q.bytes + q.d_off, &d, 2);
+        }
+        const Mat m{q.type, w.data(), rows, cols};
+        std::vector<float> out(rows);
+        matvec_sse4_q8k(m, x, out);  // warm
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::uint32_t r = 0; r < reps; ++r) {
+            matvec_sse4_q8k(m, x, out);
+        }
+        const double s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count() /
+                         reps;
+        WARN(q.name << " " << rows << " x " << cols << ", 1 token: "
+                    << s * 1e3 << " ms per call, "
+                    << static_cast<double>(w.size()) / s / 1e9
+                    << " GB/s of weights");
+    }
+    SUCCEED();
+}
+
 TEST_CASE("bench: sse4 q8k batch rows", "[.][bench]") {
     if (!locus::sys::detect().sse4) {
         SKIP("CPU lacks SSE4.1");
