@@ -65,50 +65,54 @@ int8x16_t zip_hi(int8x16_t a, int8x16_t b) {
 }
 
 /**
- * Rows r0, r1 (weight blocks at w0, w1) against tokens t0, t1 (scales
- * d0, d1, quants q0, q1) over nb blocks. out = {r0 t0, r0 t1, r1 t0,
- * r1 t1}.
+ * Activations packed for smmla, once per call: token pair p (tokens
+ * 2p, 2p + 1; an odd last token paired with itself), block b holds the
+ * four interleaved vectors at qp[(p * nb + b) * 64] and the two scales
+ * at dp[(p * nb + b) * 2].
  */
-float32x4_t pair_dot(const std::byte* w0, const std::byte* w1,
-                     const float* d0, const float* d1,
-                     const std::int8_t* q0, const std::int8_t* q1,
-                     std::size_t nb) {
-    float32x4_t acc = vdupq_n_f32(0.0f);
-    for (std::size_t b = 0; b < nb; ++b) {
-        const std::byte* a = w0 + b * kBlk;
-        const std::byte* c = w1 + b * kBlk;
-        const auto* aq = reinterpret_cast<const std::int8_t*>(a + 2);
-        const auto* cq = reinterpret_cast<const std::int8_t*>(c + 2);
-        const int8x16_t a_l = vld1q_s8(aq), a_h = vld1q_s8(aq + 16);
-        const int8x16_t c_l = vld1q_s8(cq), c_h = vld1q_s8(cq + 16);
-        const int8x16_t x_l = vld1q_s8(q0 + b * 32);
-        const int8x16_t x_h = vld1q_s8(q0 + b * 32 + 16);
-        const int8x16_t y_l = vld1q_s8(q1 + b * 32);
-        const int8x16_t y_h = vld1q_s8(q1 + b * 32 + 16);
-        int32x4_t s = vdupq_n_s32(0);
-        s = vmmlaq_s32(s, zip_lo(a_l, c_l), zip_lo(x_l, y_l));
-        s = vmmlaq_s32(s, zip_hi(a_l, c_l), zip_hi(x_l, y_l));
-        s = vmmlaq_s32(s, zip_lo(a_h, c_h), zip_lo(x_h, y_h));
-        s = vmmlaq_s32(s, zip_hi(a_h, c_h), zip_hi(x_h, y_h));
-        const float sa = scale_of(a), sc = scale_of(c);
-        const float sc4[4] = {sa * d0[b], sa * d1[b], sc * d0[b],
-                              sc * d1[b]};
-        // A multiply, then an add (no fused multiply-add), per lane.
-        acc = vaddq_f32(acc, vmulq_f32(vcvtq_f32_s32(s), vld1q_f32(sc4)));
+struct Packed {
+    std::vector<std::int8_t> qp;
+    std::vector<float> dp;
+};
+
+void pack(const float* d, const std::int8_t* q, std::uint32_t n,
+          std::size_t nb, std::size_t cols, Packed& pk) {
+    const std::uint32_t pairs = (n + 1) / 2;
+    pk.qp.resize(std::size_t{pairs} * nb * 64);
+    pk.dp.resize(std::size_t{pairs} * nb * 2);
+    for (std::uint32_t p = 0; p < pairs; ++p) {
+        const std::uint32_t t0 = 2 * p, t1 = t0 + 1 < n ? t0 + 1 : t0;
+        const std::int8_t* x = q + t0 * cols;
+        const std::int8_t* y = q + t1 * cols;
+        for (std::size_t b = 0; b < nb; ++b) {
+            const int8x16_t x_l = vld1q_s8(x + b * 32);
+            const int8x16_t x_h = vld1q_s8(x + b * 32 + 16);
+            const int8x16_t y_l = vld1q_s8(y + b * 32);
+            const int8x16_t y_h = vld1q_s8(y + b * 32 + 16);
+            std::int8_t* o = pk.qp.data() + (p * nb + b) * 64;
+            vst1q_s8(o, zip_lo(x_l, y_l));
+            vst1q_s8(o + 16, zip_hi(x_l, y_l));
+            vst1q_s8(o + 32, zip_lo(x_h, y_h));
+            vst1q_s8(o + 48, zip_hi(x_h, y_h));
+            pk.dp[(p * nb + b) * 2] = d[t0 * nb + b];
+            pk.dp[(p * nb + b) * 2 + 1] = d[t1 * nb + b];
+        }
     }
-    return acc;
 }
 
 /**
- * pair_dot for rows r0, r1 against two token pairs at once (t0, t1)
- * and (t2, t3): each block's weights are loaded and interleaved once
- * for four tokens. Each output's sequence of steps is pair_dot's.
+ * Rows r0, r1 (weight blocks at w0, w1) against `np` (1 or 2) packed
+ * token pairs starting at pair p, over nb blocks: acc[i] = {r0 tA,
+ * r0 tB, r1 tA, r1 tB} for pair p + i. Each output takes the same
+ * steps (an exact int32 per block, times s_w * d_x, then added)
+ * whatever np is.
  */
-void pair_dot2(const std::byte* w0, const std::byte* w1,
-               const float* const d[4], const std::int8_t* const q[4],
-               std::size_t nb, float32x4_t& acc01, float32x4_t& acc23) {
-    acc01 = vdupq_n_f32(0.0f);
-    acc23 = vdupq_n_f32(0.0f);
+template <int NP>
+void rows_pairs(const std::byte* w0, const std::byte* w1, const Packed& pk,
+                std::size_t p, std::size_t nb, float32x4_t acc[NP]) {
+    for (int i = 0; i < NP; ++i) {
+        acc[i] = vdupq_n_f32(0.0f);
+    }
     for (std::size_t b = 0; b < nb; ++b) {
         const std::byte* a = w0 + b * kBlk;
         const std::byte* c = w1 + b * kBlk;
@@ -119,82 +123,68 @@ void pair_dot2(const std::byte* w0, const std::byte* w1,
         const int8x16_t w_0 = zip_lo(a_l, c_l), w_1 = zip_hi(a_l, c_l);
         const int8x16_t w_2 = zip_lo(a_h, c_h), w_3 = zip_hi(a_h, c_h);
         const float sa = scale_of(a), sc = scale_of(c);
-        int32x4_t s[2];
-        for (int p = 0; p < 2; ++p) {
-            const std::int8_t* x = q[2 * p] + b * 32;
-            const std::int8_t* y = q[2 * p + 1] + b * 32;
-            const int8x16_t x_l = vld1q_s8(x), x_h = vld1q_s8(x + 16);
-            const int8x16_t y_l = vld1q_s8(y), y_h = vld1q_s8(y + 16);
-            int32x4_t t = vdupq_n_s32(0);
-            t = vmmlaq_s32(t, w_0, zip_lo(x_l, y_l));
-            t = vmmlaq_s32(t, w_1, zip_hi(x_l, y_l));
-            t = vmmlaq_s32(t, w_2, zip_lo(x_h, y_h));
-            t = vmmlaq_s32(t, w_3, zip_hi(x_h, y_h));
-            s[p] = t;
+        for (int i = 0; i < NP; ++i) {
+            const std::size_t at = (p + i) * nb + b;
+            const std::int8_t* x = pk.qp.data() + at * 64;
+            int32x4_t s = vdupq_n_s32(0);
+            s = vmmlaq_s32(s, w_0, vld1q_s8(x));
+            s = vmmlaq_s32(s, w_1, vld1q_s8(x + 16));
+            s = vmmlaq_s32(s, w_2, vld1q_s8(x + 32));
+            s = vmmlaq_s32(s, w_3, vld1q_s8(x + 48));
+            const float dA = pk.dp[at * 2], dB = pk.dp[at * 2 + 1];
+            const float sc4[4] = {sa * dA, sa * dB, sc * dA, sc * dB};
+            // A multiply, then an add (no fused multiply-add), per lane.
+            acc[i] = vaddq_f32(acc[i],
+                               vmulq_f32(vcvtq_f32_s32(s), vld1q_f32(sc4)));
         }
-        const float sc01[4] = {sa * d[0][b], sa * d[1][b], sc * d[0][b],
-                               sc * d[1][b]};
-        const float sc23[4] = {sa * d[2][b], sa * d[3][b], sc * d[2][b],
-                               sc * d[3][b]};
-        acc01 = vaddq_f32(acc01,
-                          vmulq_f32(vcvtq_f32_s32(s[0]), vld1q_f32(sc01)));
-        acc23 = vaddq_f32(acc23,
-                          vmulq_f32(vcvtq_f32_s32(s[1]), vld1q_f32(sc23)));
     }
 }
 
 /**
  * out[r * ostride + t] for every row of w and n tokens (scales d at
- * t * nb, quants q at t * cols), four tokens per weight load. An odd
- * last row or token is paired with itself; its duplicate result is
+ * t * nb, quants q at t * cols), two token pairs per weight load. An
+ * odd last row or token is paired with itself; its duplicate result is
  * dropped.
  */
 void q8_0_rows(const Mat& w, const float* d, const std::int8_t* q,
                std::uint32_t n, float* out, std::size_t ostride) {
     const std::size_t nb = w.cols / 32;
+    thread_local Packed pk;
+    pack(d, q, n, nb, w.cols, pk);
+    const std::uint32_t pairs = (n + 1) / 2;
+    // Writes pair p's four lanes (r0 tA, r0 tB, r1 tA, r1 tB).
+    auto store = [&](std::uint32_t r, std::uint32_t r1, std::uint32_t p,
+                     float32x4_t v4) {
+        float v[4];
+        vst1q_f32(v, v4);
+        const std::uint32_t t = 2 * p;
+        const bool two = t + 1 < n;
+        out[std::size_t{r} * ostride + t] = v[0];
+        if (two) {
+            out[std::size_t{r} * ostride + t + 1] = v[1];
+        }
+        if (r1 != r) {
+            out[std::size_t{r1} * ostride + t] = v[2];
+            if (two) {
+                out[std::size_t{r1} * ostride + t + 1] = v[3];
+            }
+        }
+    };
     for (std::uint32_t r = 0; r < w.rows; r += 2) {
         const std::uint32_t r1 = r + 1 < w.rows ? r + 1 : r;
         const std::byte* w0 = w.data + std::size_t{r} * nb * kBlk;
         const std::byte* w1 = w.data + std::size_t{r1} * nb * kBlk;
-        std::uint32_t t = 0;
-        for (; t + 4 <= n; t += 4) {
-            const float* dd[4];
-            const std::int8_t* qq[4];
-            for (std::uint32_t k = 0; k < 4; ++k) {
-                dd[k] = d + std::size_t{t + k} * nb;
-                qq[k] = q + std::size_t{t + k} * w.cols;
-            }
-            float32x4_t a01, a23;
-            pair_dot2(w0, w1, dd, qq, nb, a01, a23);
-            float v[8];
-            vst1q_f32(v, a01);
-            vst1q_f32(v + 4, a23);
-            for (std::uint32_t k = 0; k < 4; ++k) {
-                // Lanes: (r0 tA, r0 tB, r1 tA, r1 tB) per pair.
-                const float* p = v + (k / 2) * 4;
-                out[std::size_t{r} * ostride + t + k] = p[k % 2];
-                if (r1 != r) {
-                    out[std::size_t{r1} * ostride + t + k] = p[2 + k % 2];
-                }
-            }
+        std::uint32_t p = 0;
+        for (; p + 2 <= pairs; p += 2) {
+            float32x4_t acc[2];
+            rows_pairs<2>(w0, w1, pk, p, nb, acc);
+            store(r, r1, p, acc[0]);
+            store(r, r1, p + 1, acc[1]);
         }
-        for (; t < n; t += 2) {
-            const std::uint32_t t1 = t + 1 < n ? t + 1 : t;
-            float v[4];
-            vst1q_f32(v, pair_dot(w0, w1, d + std::size_t{t} * nb,
-                                  d + std::size_t{t1} * nb,
-                                  q + std::size_t{t} * w.cols,
-                                  q + std::size_t{t1} * w.cols, nb));
-            out[std::size_t{r} * ostride + t] = v[0];
-            if (t1 != t) {
-                out[std::size_t{r} * ostride + t1] = v[1];
-            }
-            if (r1 != r) {
-                out[std::size_t{r1} * ostride + t] = v[2];
-                if (t1 != t) {
-                    out[std::size_t{r1} * ostride + t1] = v[3];
-                }
-            }
+        if (p < pairs) {
+            float32x4_t acc[1];
+            rows_pairs<1>(w0, w1, pk, p, nb, acc);
+            store(r, r1, p, acc[0]);
         }
     }
 }
