@@ -501,20 +501,29 @@ TEST_CASE("bench: cpu prefill attention per layer", "[.][bench]") {
                 x = d(rng);
             }
         }
-        const auto t0 = std::chrono::steady_clock::now();
-        for (std::uint32_t base = 0; base < n_pos; base += chunk) {
-            const std::uint32_t n = std::min(chunk, n_pos - base);
-            locus::model::gqa_attend_batch(
-                q.data(), out.data(), std::size_t{heads} * hd, n, base,
-                heads, hd, group, 0.125f,
-                [&](std::uint32_t p) { return k.data() + p * kv_dim; },
-                [&](std::uint32_t p) { return v.data() + p * kv_dim; });
+        // The 4-wide build, then (on an AVX CPU) the 8-wide one.
+        for (const bool off : {true, false}) {
+            locus::model::attend_avx_off() = off;
+            if (!off && !locus::model::attend_avx()) {
+                break;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            for (std::uint32_t base = 0; base < n_pos; base += chunk) {
+                const std::uint32_t n = std::min(chunk, n_pos - base);
+                locus::model::gqa_attend_batch(
+                    q.data(), out.data(), std::size_t{heads} * hd, n, base,
+                    heads, hd, group, 0.125f,
+                    [&](std::uint32_t p) { return k.data() + p * kv_dim; },
+                    [&](std::uint32_t p) { return v.data() + p * kv_dim; });
+            }
+            const double s = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+            WARN((off ? "4-wide" : "avx") << " prefill attention, one layer, "
+                                          << n_pos << " positions: " << s
+                                          << " s");
         }
-        const double s = std::chrono::duration<double>(
-                             std::chrono::steady_clock::now() - t0)
-                             .count();
-        WARN("prefill attention, one layer, " << n_pos << " positions: "
-                                              << s << " s");
+        locus::model::attend_avx_off() = false;
     }
     // The softmax's share: one row per (query head, position) as the
     // prefill runs it, timed on 1/64 of the 8,702-position rows on one
