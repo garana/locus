@@ -260,8 +260,12 @@ TEST_CASE("neon q8k matvec matches scalar q8k", "[backend]") {
     for (auto& v : x) {
         v = dist(rng);
     }
+    // Q5_K, Q3_K, IQ2_XXS and IQ2_S (i#733): NEON integer sums, the
+    // scalar float steps, so the same bits.
     for (const Q& q : {Q{TT::kQ4_K, 144, 0, 2}, Q{TT::kQ6_K, 210, 208, -1},
-                       Q{TT::kQ5_K, 176, 0, 2}}) {
+                       Q{TT::kQ5_K, 176, 0, 2}, Q{TT::kQ3_K, 110, 108, -1},
+                       Q{TT::kIQ2_XXS, 66, 0, -1},
+                       Q{TT::kIQ2_S, 82, 0, -1}}) {
         std::vector<std::byte> w(static_cast<std::size_t>(rows) *
                                  (cols / 256) * q.bytes);
         for (auto& by : w) {
@@ -283,7 +287,7 @@ TEST_CASE("neon q8k matvec matches scalar q8k", "[backend]") {
         matvec_neon_q8k(m, x, b);
         for (std::uint32_t r = 0; r < rows; ++r) {
             INFO("type " << static_cast<int>(q.type) << " row " << r);
-            if (q.type == TT::kQ5_K) {
+            if (q.type != TT::kQ4_K && q.type != TT::kQ6_K) {
                 REQUIRE(b[r] == a[r]);
             } else {
                 REQUIRE(b[r] ==
