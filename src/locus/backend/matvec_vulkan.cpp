@@ -1548,7 +1548,9 @@ void rec_softmax(State& s, VulkanContext::Buffer scores, std::uint32_t rows,
  * each K/V tile is read once for all of them. Q and out rows are
  * q_dim floats per token (head h at h * hd). Queries run in
  * sub-blocks of attn_block(n, heads, base + n) tokens, each over the
- * positions it can see; scores holds one sub-block's rows.
+ * positions it can see; scores holds one sub-block's rows. `first`
+ * starts a single decode token's attention at that position (a
+ * sliding window); it needs the decode kernels (n == 1).
  */
 /** One attention segment set for rec_attn_decode (see attn_decode.comp). */
 struct DecodeAttn {
@@ -1556,6 +1558,8 @@ struct DecodeAttn {
     std::uint32_t k_off, v_off, kv_stride, group, d1, d2, q1_stride,
         q2_stride, q2_off, dv, out_stride;
     float scale;
+    /** First position attended: a sliding window's start (0 = all). */
+    std::uint32_t first = 0;
 };
 
 /**
@@ -1569,9 +1573,9 @@ bool grp_ok(const PagedPool& pp, const DecodeAttn& a) {
 }
 
 /**
- * Records flash-decoding attention for one query token over n_pos
- * cache positions, plus attn_combine when there is more than one
- * block: attn_decode per (64-position block, head), or with
+ * Records flash-decoding attention for one query token over cache
+ * positions a.first .. n_pos - 1, plus attn_combine when there is more
+ * than one block: attn_decode per (64-position block, head), or with
  * `grouped` (grp_ok) attn_decode_grp per (32-position block, KV
  * head), reading each K/V row once for the KV head's query heads.
  */
@@ -1580,7 +1584,7 @@ void rec_attn_decode(State& s, const PagedPool& pp, std::uint32_t n_pos,
                      bool grouped) {
     // Positions per block: attn_decode_grp.comp / attn_decode.comp CH.
     const std::uint32_t block = grouped ? 32 : 64;
-    const std::uint32_t blocks = (n_pos + block - 1) / block;
+    const std::uint32_t blocks = (n_pos - a.first + block - 1) / block;
     // Past attn_part_blocks the blocks run in rounds of that many, each
     // merged into one partial (attn_combine_part), so the partials
     // scratch stays bounded (i#116); up to it, one round as before.
@@ -1624,7 +1628,8 @@ void rec_attn_decode(State& s, const PagedPool& pp, std::uint32_t n_pos,
                                       a.q1_stride, a.q2_stride,
                                       a.q2_off,    a.dv,
                                       fbits(a.scale), a.out_stride,
-                                      c_base,      blocks};
+                                      c_base,      blocks,
+                                      a.first};
         s.ctx.dispatch(k, bufs, push, nb, groups_y);
         if (rounds > 1) {
             const VulkanContext::Buffer cbufs[] = {part, s.attn_round};
@@ -1648,16 +1653,23 @@ void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
                   VulkanContext::Buffer scores, VulkanContext::Buffer out,
                   std::uint32_t n, std::uint32_t base, std::uint32_t heads,
                   std::uint32_t group, std::uint32_t hd, std::uint32_t q_dim,
-                  std::uint32_t layer_off, std::uint32_t v_offset) {
+                  std::uint32_t layer_off, std::uint32_t v_offset,
+                  std::uint32_t first = 0) {
     const std::uint32_t n_pos = base + n;
-    const DecodeAttn da{q,  q,     out, layer_off, layer_off + v_offset,
-                        hd, group, hd,  0,         hd,
-                        0,  0,     hd,  hd,
-                        1.0f / std::sqrt(static_cast<float>(hd))};
+    DecodeAttn da{q,  q,     out, layer_off, layer_off + v_offset,
+                  hd, group, hd,  0,         hd,
+                  0,  0,     hd,  hd,
+                  1.0f / std::sqrt(static_cast<float>(hd))};
+    da.first = first;
     const bool grouped = group > 1 && grp_ok(pp, da);
     if (n == 1 && (grouped || vk::attn_decode_fits(hd))) {
         rec_attn_decode(s, pp, n_pos, heads, da, grouped);
         return;
+    }
+    if (first != 0) {
+        // The matmul path below masks causally from position 0 only.
+        throw std::logic_error(
+            "rec_attn_gqa: a sliding window needs the decode kernels");
     }
     const std::uint32_t n_kv = heads / group;
     const std::uint32_t mb = attn_block(n, heads, n_pos);

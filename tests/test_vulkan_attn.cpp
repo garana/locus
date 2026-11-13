@@ -403,12 +403,16 @@ TEST_CASE("vulkan decode attention (flash) matches the CPU reference",
         const char* name;
         std::uint32_t heads, group, d1, d2, dv, n_pos;
         bool shared_kv;  // MLA: one latent row, V = its first dv
+        std::uint32_t first = 0;  // a sliding window's first position
     };
     const Case cases[] = {
         {"gqa one block", 4, 2, 64, 0, 64, 37, false},
         {"gqa three blocks + combine", 4, 2, 64, 0, 64, 150, false},
         {"mla two-segment key", 3, 3, 512, 64, 512, 61, true},
         {"mla blocks + combine", 3, 3, 512, 64, 512, 200, true},
+        // Windows starting mid-block, one block and three + combine.
+        {"gqa window, one block", 4, 2, 64, 0, 64, 150, false, 101},
+        {"gqa window, blocks + combine", 4, 2, 64, 0, 64, 300, false, 37},
     };
     for (const Case& c : cases) {
         DYNAMIC_SECTION(c.name) {
@@ -439,8 +443,8 @@ TEST_CASE("vulkan decode attention (flash) matches the CPU reference",
             std::vector<float> want(c.heads * c.dv);
             for (std::uint32_t h = 0; h < c.heads; ++h) {
                 const std::uint32_t kvh = h / c.group;
-                std::vector<double> s(c.n_pos);
-                for (std::uint32_t p = 0; p < c.n_pos; ++p) {
+                std::vector<double> s(c.n_pos - c.first);
+                for (std::uint32_t p = c.first; p < c.n_pos; ++p) {
                     const std::size_t kb = row(p) + k_off + kvh * kv_stride;
                     double d = 0.0;
                     for (std::uint32_t i = 0; i < c.d1; ++i) {
@@ -450,20 +454,20 @@ TEST_CASE("vulkan decode attention (flash) matches the CPU reference",
                         d += q2[h * q2_stride + q2_off + i] *
                              pool[kb + c.d1 + i];
                     }
-                    s[p] = d * scale;
+                    s[p - c.first] = d * scale;
                 }
                 softmax(s);
                 for (std::uint32_t i = 0; i < c.dv; ++i) {
                     double acc = 0.0;
-                    for (std::uint32_t p = 0; p < c.n_pos; ++p) {
-                        acc += s[p] *
+                    for (std::uint32_t p = c.first; p < c.n_pos; ++p) {
+                        acc += s[p - c.first] *
                                pool[row(p) + v_off + kvh * kv_stride + i];
                     }
                     want[h * c.dv + i] = static_cast<float>(acc);
                 }
             }
 
-            const std::uint32_t blocks = (c.n_pos + 63) / 64;
+            const std::uint32_t blocks = (c.n_pos - c.first + 63) / 64;
             auto pb = upload(ctx, pool);
             auto tb = upload(ctx, table);
             auto q1b = upload(ctx, q1);
@@ -479,7 +483,7 @@ TEST_CASE("vulkan decode attention (flash) matches the CPU reference",
                 k_off,     v_off,   kv_stride,    c.group,
                 c.d1,      c.d2,    q1_stride,    q2_stride,
                 q2_off,    c.dv,    fbits(scale), c.dv,
-                0,         blocks};
+                0,         blocks,  c.first};
             ctx.dispatch(Kernel::kAttnDecode, bufs, push, blocks, c.heads);
             if (blocks > 1) {
                 const VulkanContext::Buffer cb[] = {partb, ob};
@@ -515,6 +519,7 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
         const char* name;
         std::uint32_t heads, group, d1, d2, dv, n_pos;
         bool mla;
+        std::uint32_t first = 0;  // a sliding window's first position
     };
     const Case cases[] = {
         {"mla partial head chunk, one block", 3, 3, 512, 64, 512, 20, true},
@@ -524,6 +529,12 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
         {"mla narrow latent (8 head sets)", 16, 16, 128, 32, 128, 100, true},
         {"gqa group 4, position slices", 8, 4, 64, 0, 64, 150, false},
         {"gqa group 8, head dim 128", 16, 8, 128, 0, 128, 45, false},
+        // Kolibri-1's shape: 12 query heads a KV head, a window
+        // starting mid-block, one block and many + combine.
+        {"gqa group 12, window, one block", 24, 12, 128, 0, 128, 90, false,
+         70},
+        {"gqa group 12, window over blocks", 24, 12, 128, 0, 128, 700,
+         false, 187},
     };
     for (const Case& c : cases) {
         for (const unsigned v : {0u, 1u, 2u, 3u}) {
@@ -564,8 +575,8 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
                 std::vector<float> want(c.heads * c.dv);
                 for (std::uint32_t h = 0; h < c.heads; ++h) {
                     const std::uint32_t kvh = h / c.group;
-                    std::vector<double> sv(c.n_pos);
-                    for (std::uint32_t p = 0; p < c.n_pos; ++p) {
+                    std::vector<double> sv(c.n_pos - c.first);
+                    for (std::uint32_t p = c.first; p < c.n_pos; ++p) {
                         const std::size_t kb =
                             row(p) + k_off + kvh * kv_stride;
                         double d = 0.0;
@@ -576,13 +587,13 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
                             d += q2[h * q2_stride + q2_off + i] *
                                  pool[kb + c.d1 + i];
                         }
-                        sv[p] = d * scale;
+                        sv[p - c.first] = d * scale;
                     }
                     softmax(sv);
                     for (std::uint32_t i = 0; i < c.dv; ++i) {
                         double acc = 0.0;
-                        for (std::uint32_t p = 0; p < c.n_pos; ++p) {
-                            acc += sv[p] * pool[row(p) + v_off +
+                        for (std::uint32_t p = c.first; p < c.n_pos; ++p) {
+                            acc += sv[p - c.first] * pool[row(p) + v_off +
                                                 kvh * kv_stride + i];
                         }
                         want[h * c.dv + i] = static_cast<float>(acc);
@@ -599,7 +610,7 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
                 } else {
                     pb = upload(ctx, pool);
                 }
-                const std::uint32_t blocks = (c.n_pos + 31) / 32;
+                const std::uint32_t blocks = (c.n_pos - c.first + 31) / 32;
                 const std::uint32_t chunks = (c.group + hg - 1) / hg;
                 auto tb = upload(ctx, table);
                 auto q1b = upload(ctx, q1);
@@ -615,7 +626,7 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
                     k_off,     v_off,   kv_stride,    c.group,
                     c.d1,      c.d2,    q1_stride,    q2_stride,
                     q2_off,    c.dv,    fbits(scale), c.dv,
-                    0,         blocks};
+                    0,         blocks,  c.first};
                 const Kernel k =
                     hg == 8 ? (f16 ? Kernel::kAttnDecodeGrp8F16
                                    : Kernel::kAttnDecodeGrp8)
