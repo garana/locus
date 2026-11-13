@@ -535,10 +535,14 @@ __m128i lane_pairs_mask() {
 /** Adds scale * s (8 int16 per-lane sums) to the int32 lanes lo (0..3)
  *  and hi (4..7). */
 void add_scaled_lanes(__m128i s, int scale, __m128i& lo, __m128i& hi) {
+    // madd on s interleaved with zeros: each int32 is s_e * scale + 0 *
+    // (scale's high half), the product exactly, one fast instruction
+    // where mullo_epi32 is two slow ones (i#719). Signed scales (Q6_K's
+    // int8) work too: the zero cancels the sign-extended high half.
     const __m128i scv = _mm_set1_epi32(scale);
-    lo = _mm_add_epi32(lo, _mm_mullo_epi32(_mm_cvtepi16_epi32(s), scv));
-    hi = _mm_add_epi32(
-        hi, _mm_mullo_epi32(_mm_cvtepi16_epi32(_mm_srli_si128(s, 8)), scv));
+    const __m128i z = _mm_setzero_si128();
+    lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(s, z), scv));
+    hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(s, z), scv));
 }
 
 /** SSE4 Q4_K x Q8_K: fills aux32[8] and sumi (the bsums min term)

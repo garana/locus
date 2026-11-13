@@ -168,6 +168,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 | DeepSeek-Coder-V2-Lite Q8_0 decode, Vulkan | M4 Max (MoltenVK) | 88 tok/s                               |
 | Llama-3.2-1B Q8_0 decode, CPU              | M4 Max (neon)     | 89 tok/s                               |
 | Llama-3.2-1B Q8_0 prefill, 8k tokens, CPU  | M2 Pro (neon)     | 124 tok/s                              |
+| Llama-3.2-1B Q8_0 prefill, 2k tokens, CPU  | i5-2400 (sse4)    | 18 tok/s (llama.cpp: 26)               |
 | Janus-Pro-1B, one image                    | M2 Pro (MoltenVK) | 22 s, decode included                  |
 | Orpheus speech, 3.8 s clip                 | M2 Pro (MoltenVK) | 12 s; first audio at 1.7 s             |
 | Qwen-Image-Edit, 512 x 512, 20 steps       | M4 Max (MoltenVK) | 344 s denoise with `auto_resize` false |
@@ -179,8 +180,10 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   parked: the edit's working set does not fit a 36 GiB host with the
   language model on the GPU).
 - Performance: prefill on Apple GPUs at 44% of Metal's (#10:
-  MoltenVK exposes no cooperative matrix), CPU prefill (#618: x86
-  SSE4, long-context attention #701), batch-invariant decode at full
+  MoltenVK exposes no cooperative matrix), CPU prefill on x86 (#618:
+  a SIMD softmax and an AVX path, #705 and #706, run behind the opt-in
+  `LOCUS_CPU_FAST` flag, as they change the float order), batch-invariant
+  decode at full
   speed on V3D (#511), the MoE hybrid on Vulkan (#679).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
