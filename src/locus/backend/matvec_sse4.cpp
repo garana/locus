@@ -1598,6 +1598,105 @@ void row_iq1_q8k_sse4(bool m_type, const std::byte* row, const Q8kAct* a,
 }
 
 /**
+ * One TQ1_0 (54 B) or TQ2_0 (66 B) row against a Q8_K activation (plain
+ * order), in scalar vec_dot_tq1_0_q8_k / vec_dot_tq2_0_q8_k's float
+ * order. Each weight is a digit c in {0, 1, 2} (TQ2_0: up to 3) minus 1,
+ * and every activation of the block is used once, so the block's sum is
+ * sum(c * q8) - sum(q8): maddubs on the digits, minus the activation's
+ * block sums. Both are exact, so the float steps (the scalar's) give the
+ * same bits.
+ */
+float row_tq_q8k_sse4(bool tq1, const std::byte* row, const Q8kAct& a,
+                      std::size_t nb) {
+    const __m128i ones16 = _mm_set1_epi16(1);
+    // c (16 unsigned digits) dotted with 16 activations, into int32 lanes.
+    const auto dot = [&](__m128i c, const std::int8_t* q, __m128i& acc) {
+        acc = _mm_add_epi32(
+            acc, _mm_madd_epi16(
+                     _mm_maddubs_epi16(
+                         c, _mm_loadu_si128(
+                                reinterpret_cast<const __m128i*>(q))),
+                     ones16));
+    };
+    // TQ1_0's base-3 digit of 16 bytes b at per-lane multipliers
+    // (mlo for bytes 0-7, mhi for 8-15): ((b * m) mod 256 * 3) >> 8.
+    const auto digit = [](__m128i b, __m128i mlo, __m128i mhi) {
+        const __m128i lo8 = _mm_set1_epi16(0xff);
+        const auto one = [&](__m128i w, __m128i m) {
+            const __m128i q = _mm_and_si128(_mm_mullo_epi16(w, m), lo8);
+            return _mm_srli_epi16(_mm_mullo_epi16(q, _mm_set1_epi16(3)), 8);
+        };
+        return _mm_packus_epi16(one(_mm_cvtepu8_epi16(b), mlo),
+                                one(_mm_cvtepu8_epi16(_mm_srli_si128(b, 8)),
+                                    mhi));
+    };
+    static constexpr short kPow3[5] = {1, 3, 9, 27, 81};
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * (tq1 ? 54 : 66);
+        const auto* u = reinterpret_cast<const std::uint8_t*>(blk);
+        const std::int8_t* q8 = a.qs + i * 256;
+        __m128i acc = _mm_setzero_si128();
+        if (tq1) {
+            const __m128i b0 =
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(u));
+            const __m128i b1 =
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(u + 16));
+            const __m128i b2 =
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(u + 32));
+            for (int l = 0; l < 5; ++l) {
+                const __m128i m = _mm_set1_epi16(kPow3[l]);
+                dot(digit(b0, m, m), q8 + l * 32, acc);
+                dot(digit(b1, m, m), q8 + l * 32 + 16, acc);
+                dot(digit(b2, m, m), q8 + 160 + l * 16, acc);
+            }
+            // qh[0..3] for l = 0..3 lands at q8[240 + 4 l + j]: one
+            // vector of qh repeated four times, multiplier pow3[l].
+            std::uint32_t qh;
+            std::memcpy(&qh, u + 48, 4);
+            const __m128i h = _mm_set1_epi32(static_cast<int>(qh));
+            dot(digit(h, _mm_setr_epi16(1, 1, 1, 1, 3, 3, 3, 3),
+                      _mm_setr_epi16(9, 9, 9, 9, 27, 27, 27, 27)),
+                q8 + 240, acc);
+        } else {
+            const __m128i m3 = _mm_set1_epi8(3);
+            for (int h = 0; h < 2; ++h) {
+                const __m128i b0 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(u + 32 * h));
+                const __m128i b1 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(u + 32 * h + 16));
+                for (int l = 0; l < 4; ++l) {
+                    const __m128i s = _mm_cvtsi32_si128(2 * l);
+                    dot(_mm_and_si128(_mm_srl_epi16(b0, s), m3),
+                        q8 + 128 * h + 32 * l, acc);
+                    dot(_mm_and_si128(_mm_srl_epi16(b1, s), m3),
+                        q8 + 128 * h + 32 * l + 16, acc);
+                }
+            }
+        }
+        // sum(q8) over the block: its 16 block sums.
+        const std::int16_t* bs = a.bsums + i * 16;
+        const __m128i bsum = _mm_add_epi32(
+            _mm_madd_epi16(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bs)),
+                ones16),
+            _mm_madd_epi16(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bs + 8)),
+                ones16));
+        const std::int32_t sumi =
+            hsum_epi32_sse4(acc) - hsum_epi32_sse4(bsum);
+        if (tq1) {
+            const float bd = f16_to_f32(load_u16(blk + 52));
+            sumf += static_cast<float>(sumi) * (bd * a.d[i]);
+        } else {
+            const float bd = f16_to_f32(load_u16(blk + 64));
+            sumf += static_cast<float>(sumi) * (a.d[i] * bd);
+        }
+    }
+    return sumf;
+}
+
+/**
  * One IQ4_XS (136 B) row against a Q8_K activation (plain order), in
  * scalar vec_dot_iq4_xs_q8_k's float order: each 32-weight group's
  * integer sum (exact), times d4d8 * (ls - 32), added to sumf in group
@@ -1658,6 +1757,7 @@ enum class Q8Path {
     kIQ2,
     kIQ3,
     kIQ4XS,
+    kTQ,
     kOther
 };
 
@@ -1688,6 +1788,9 @@ Q8Path q8_path(gguf::TensorType type, std::size_t cols) {
     if (type == T::kIQ3_XXS || type == T::kIQ3_S) {
         return Q8Path::kIQ3;
     }
+    if (type == T::kTQ1_0 || type == T::kTQ2_0) {
+        return Q8Path::kTQ;
+    }
     if (type == T::kIQ1_S || type == T::kIQ1_M) {
         return Q8Path::kIQ1;
     }
@@ -1708,6 +1811,9 @@ float row_q8k_sse4(Q8Path path, gguf::TensorType type, const std::byte* row,
     }
     if (path == Q8Path::kIQ4XS) {
         return row_iq4_xs_q8k_sse4(row, a, nb);
+    }
+    if (path == Q8Path::kTQ) {
+        return row_tq_q8k_sse4(type == gguf::TensorType::kTQ1_0, row, a, nb);
     }
     if (path == Q8Path::kIQ1) {
         float o;
