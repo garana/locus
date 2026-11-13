@@ -363,6 +363,8 @@ struct State {
         drop(route, route_n);
         drop(attn_part, attn_part_n);
         drop(attn_round, attn_round_n);
+        drop(res, res_n);
+        drop(zeros, zeros_n);
         for (int c = 0; c < kChunkCount_; ++c) {
             drop(chunk[c], chunk_n[c]);
         }
