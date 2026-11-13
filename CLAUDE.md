@@ -49,8 +49,15 @@ and an x86 host tests every code PR.
 - Review first: a PR enters a batch only after its two reading CLEARs;
   a NOT CLEAR is fixed and read again before that.
 - One batch at a time: the next batch starts when the running one has
-  all its votes, and it takes every PR that passed review meanwhile.
-  Work on issues, PRs and reviews goes on while a batch runs.
+  all its votes and its PRs are merged, and it takes every PR that
+  has its two reading CLEARs at that moment (with 8 such PRs, all 8
+  go in). One agent assembles each batch; the others never start one
+  on their own.
+- Pipelining: while a batch runs, every agent keeps working. Code the
+  next issue, stack a PR on your own open PR when it needs that code,
+  and read others' PRs, so the next batch is full when the running
+  one ends. A box running its batch share works on the next issue in
+  parallel.
 - Votes and review notes go over the agent bus, not GitHub PR comments.
 
 ## Conventions
