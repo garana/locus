@@ -117,6 +117,111 @@ TEST_CASE("softmax normalizes and orders", "[ops]") {
     REQUIRE(x[1] == Approx(0.75f));
 }
 
+namespace {
+
+/** The default softmax's float order, written out: std::exp, serial sum. */
+void softmax_ref(std::span<float> x) {
+    float mx = x[0];
+    for (float v : x) {
+        mx = std::max(mx, v);
+    }
+    float sum = 0.0f;
+    for (float& v : x) {
+        v = std::exp(v - mx);
+        sum += v;
+    }
+    for (float& v : x) {
+        v /= sum;
+    }
+}
+
+/** Random attention-like rows: lengths 1..300, scores in [-30, 30]. */
+std::vector<std::vector<float>> softmax_rows() {
+    std::mt19937 rng(705);
+    std::uniform_real_distribution<float> u(-30.0f, 30.0f);
+    std::vector<std::vector<float>> rows;
+    for (std::size_t n = 1; n <= 300; n += (n < 20 ? 1 : 37)) {
+        std::vector<float> r(n);
+        for (float& v : r) {
+            v = u(rng);
+        }
+        rows.push_back(std::move(r));
+    }
+    return rows;
+}
+
+}  // namespace
+
+TEST_CASE("exp_fast is within 2 ulp of std::exp", "[ops][fast]") {
+    REQUIRE(exp_fast(0.0f) == 1.0f);
+    for (float x = -87.0f; x <= 88.0f; x += 0.01171875f) {
+        const float ref = std::exp(x);
+        REQUIRE(std::abs(exp_fast(x) - ref) <= 2.4e-7f * ref);
+    }
+    // Below the range the result clamps to e^-87.3, not 0 or a NaN.
+    const float lo = exp_fast(-std::numeric_limits<float>::infinity());
+    REQUIRE(lo > 0.0f);
+    REQUIRE(lo < 2e-38f);
+    REQUIRE(exp_fast(-1000.0f) == lo);
+}
+
+TEST_CASE("softmax_fast_inplace is close to the default softmax",
+          "[ops][fast]") {
+    for (const auto& row : softmax_rows()) {
+        std::vector<float> ref = row;
+        std::vector<float> fast = row;
+        softmax_ref(ref);
+        softmax_fast_inplace(fast);
+        float total = 0.0f;
+        for (std::size_t i = 0; i < row.size(); ++i) {
+            REQUIRE(fast[i] == Approx(ref[i]).epsilon(2e-6).margin(1e-30));
+            total += fast[i];
+        }
+        REQUIRE(total == Approx(1.0f).epsilon(1e-5));
+    }
+}
+
+TEST_CASE("softmax_fast_inplace is scalar exp_fast in 8 fixed lanes",
+          "[ops][fast]") {
+    for (const auto& row : softmax_rows()) {
+        std::vector<float> ref = row;
+        float m = ref[0];
+        for (float v : ref) {
+            m = v > m ? v : m;
+        }
+        float sum[8] = {};
+        const std::size_t whole = ref.size() / 8 * 8;
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            ref[i] = exp_fast(ref[i] - m);
+            sum[i < whole ? i % 8 : i - whole] += ref[i];
+        }
+        const float s = ((sum[0] + sum[4]) + (sum[1] + sum[5])) +
+                        ((sum[2] + sum[6]) + (sum[3] + sum[7]));
+        for (float& v : ref) {
+            v /= s;
+        }
+        std::vector<float> got = row;
+        softmax_fast_inplace(got);
+        REQUIRE(std::memcmp(got.data(), ref.data(),
+                            ref.size() * sizeof(float)) == 0);
+    }
+}
+
+TEST_CASE("softmax_inplace without LOCUS_CPU_FAST keeps the std::exp bits",
+          "[ops][fast]") {
+    if (cpu_fast()) {
+        SKIP("LOCUS_CPU_FAST is set");
+    }
+    for (const auto& row : softmax_rows()) {
+        std::vector<float> ref = row;
+        std::vector<float> got = row;
+        softmax_ref(ref);
+        softmax_inplace(got);
+        REQUIRE(std::memcmp(got.data(), ref.data(),
+                            ref.size() * sizeof(float)) == 0);
+    }
+}
+
 TEST_CASE("silu_mul limits", "[ops]") {
     const float gate[] = {0.0f, 100.0f, -100.0f};
     const float up[] = {5.0f, 2.0f, 3.0f};
@@ -751,6 +856,86 @@ TEST_CASE("matvec_batch_sse4 Q4_K/Q6_K byte-identical to per-token "
 // i#691: the SSE4 Q8_K / Q8_0-activation batch (prefill's matvec) and
 // the per-token SSE4 kernel are bit-identical to scalar matvec_q8k, for
 // every token of a batch, so batched prefill equals the per-token path.
+#if defined(LOCUS_HAS_SSE4_AVX_VARIANT)
+// i#706: the SSE4 kernels built with AVX give the SSE4 build's bits on
+// every entry point, per token and batched (the scalar comparisons
+// above then hold for them too).
+TEST_CASE("sse4_avx kernels give the sse4 bits", "[ops][batch][sse4]") {
+    if (!locus::sys::detect().avx) {
+        SKIP("CPU lacks AVX");
+    }
+    constexpr std::uint32_t rows = 3;
+    std::mt19937 rng(706);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    const auto check = [&](const Mat& m, std::uint32_t n) {
+        INFO("type " << static_cast<int>(m.type) << " n " << n);
+        const std::uint32_t cols = m.cols;
+        std::vector<float> xb(std::size_t{n} * cols);
+        for (auto& v : xb) {
+            v = xd(rng);
+        }
+        const std::span<const float> x0(xb.data(), cols);
+        std::vector<float> a(std::size_t{rows} * n), b(a.size());
+        const auto same = [&] {
+            REQUIRE(std::memcmp(a.data(), b.data(),
+                                a.size() * sizeof(float)) == 0);
+        };
+        a.resize(rows);
+        b.resize(rows);
+        matvec_sse4(m, x0, a);
+        sse4_avx::matvec_sse4(m, x0, b);
+        same();
+        matvec_sse4_q8k(m, x0, a);
+        sse4_avx::matvec_sse4_q8k(m, x0, b);
+        same();
+        a.resize(std::size_t{rows} * n);
+        b.resize(a.size());
+        matvec_batch_sse4(m, xb, a, n);
+        sse4_avx::matvec_batch_sse4(m, xb, b, n);
+        same();
+        matvec_batch_sse4_q8k(m, xb, a, n);
+        sse4_avx::matvec_batch_sse4_q8k(m, xb, b, n);
+        same();
+    };
+    for (TensorType t : {TensorType::kQ2_K, TensorType::kQ3_K,
+                         TensorType::kQ4_K, TensorType::kQ5_K,
+                         TensorType::kQ6_K}) {
+        std::vector<std::byte> w;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            auto row = k_quant_row(t, 8, 700u + r);
+            w.insert(w.end(), row.begin(), row.end());
+        }
+        for (std::uint32_t n : {1u, 4u, 50u}) {
+            check(Mat{t, w.data(), rows, 8 * 256}, n);
+        }
+    }
+    // 25 blocks a row, so the odd tail block runs.
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
+    for (const auto& [t, bytes] : {std::pair{TensorType::kQ8_0, 34u},
+                                   std::pair{TensorType::kQ4_0, 18u}}) {
+        std::vector<std::byte> w(std::size_t{rows} * 25 * bytes);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / bytes; ++bl) {
+            const std::uint16_t d = f32_to_f16(scale_d(rng));
+            std::memcpy(w.data() + bl * bytes, &d, 2);
+        }
+        for (std::uint32_t n : {1u, 4u, 7u}) {
+            check(Mat{t, w.data(), rows, 800}, n);
+        }
+    }
+    std::vector<float> wf(std::size_t{rows} * 70);
+    for (auto& v : wf) {
+        v = xd(rng);
+    }
+    check(Mat{TensorType::kF32, reinterpret_cast<const std::byte*>(wf.data()),
+              rows, 70},
+          5);
+}
+#endif
+
 TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
           "dots",
           "[ops][batch][sse4]") {

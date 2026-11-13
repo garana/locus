@@ -218,6 +218,24 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set_source_files_properties(
         src/locus/backend/matvec_sse4.cpp
         PROPERTIES COMPILE_FLAGS "-msse4.1")
+    # The SSE4 kernels again with AVX (no AVX2) for Sandy / Ivy Bridge:
+    # the file keeps -msse4.1 and gives only the kernels the AVX target
+    # (a pragma, see the file), picked at runtime when the CPU has AVX.
+    include(CheckCXXSourceCompiles)
+    check_cxx_source_compiles("
+        #include <immintrin.h>
+        __attribute__((target(\"avx\")))
+        __m256 f(__m256 a, __m256 b) { return _mm256_add_ps(a, b); }
+        int main() { return 0; }" LOCUS_CC_AVX_TARGET)
+    if(LOCUS_CC_AVX_TARGET)
+        list(APPEND LOCUS_SIMD_VARIANTS "sse4_avx")
+        target_sources(locus PRIVATE src/locus/backend/matvec_sse4_avx.cpp)
+        set_source_files_properties(
+            src/locus/backend/matvec_sse4_avx.cpp
+            PROPERTIES COMPILE_FLAGS "-msse4.1")
+        target_compile_definitions(locus PUBLIC
+            LOCUS_HAS_SSE4_AVX_VARIANT=1)
+    endif()
     check_cxx_compiler_flag("-mavx2" LOCUS_CC_AVX2)
     if(LOCUS_CC_AVX2)
         list(APPEND LOCUS_SIMD_VARIANTS "avx2")
@@ -272,6 +290,8 @@ if(Vulkan_FOUND)
             matvec_q8_0_p=matvec_q8_0:BATCHED,PAIRS
             matvec_f32_n=matvec_q8_0_n:TYPE_F32
             matvec_q8_0_n_glu=matvec_q8_0_n:SWIGLU
+            matvec_q8_0_n1=matvec_q8_0_n:NT1
+            matvec_q8_0_n1_glu=matvec_q8_0_n:SWIGLU,NT1
             matvec_q8_0_n2=matvec_q8_0_n:NT2
             matvec_q8_0_n2_glu=matvec_q8_0_n:SWIGLU,NT2
             matvec_q8_0_n4=matvec_q8_0_n:NT4
