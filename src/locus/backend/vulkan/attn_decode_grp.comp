@@ -91,6 +91,7 @@ layout(push_constant) uniform PC {
     uint out_stride;    // OUT floats between heads
     uint c_base;        // first block of this dispatch (rounds, i#116)
     uint n_total;       // blocks of the whole decode (1: write OUT)
+    uint first;         // first position attended (a sliding window)
 } pc;
 
 shared float sc[HG * CH];
@@ -111,8 +112,9 @@ void main() {
     uint heads = (gl_NumWorkGroups.y / chunks) * pc.group;
     uint n_blocks = gl_NumWorkGroups.x;
     uint nh = min(HG, pc.group - g0);
-    // c indexes this dispatch's partials; c + c_base the positions.
-    uint p0 = (c + pc.c_base) * CH;
+    // c indexes this dispatch's partials; c + c_base the positions,
+    // from `first` on (0 unless the layer attends a sliding window).
+    uint p0 = pc.first + (c + pc.c_base) * CH;
     uint np = min(CH, pc.n_pos - p0);
     if (t < np) {
         uint p = p0 + t;
