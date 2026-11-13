@@ -15,12 +15,7 @@ namespace locus::image {
 
 namespace {
 
-/** Exact GELU (torch.nn.GELU(), approximate="none"). */
-void gelu(std::span<float> x) {
-    for (float& v : x) {
-        v = 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752440f));
-    }
-}
+using dense::gelu;
 
 using dense::parallel;
 
