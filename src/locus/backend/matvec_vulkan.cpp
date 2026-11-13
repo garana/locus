@@ -709,11 +709,13 @@ struct State {
 
     /** The extra SSBO an IQ kernel binds (grid+signs), or null. */
     VulkanContext::Buffer grid_for(Kernel k) {
-        if (k == Kernel::kMatvecIQ2_XXS || k == Kernel::kMatvecIQ2_XXSB) {
+        if (k == Kernel::kMatvecIQ2_XXS || k == Kernel::kMatvecIQ2_XXSB ||
+            k == Kernel::kMatmulIQ2_XXS || k == Kernel::kMatmulIQ2_XXSId) {
             return grid_table(iq2xxs_tbl, iq2xxs_tbl_ready,
                               ::iq2xxs_grid);
         }
-        if (k == Kernel::kMatvecIQ2_S || k == Kernel::kMatvecIQ2_SB) {
+        if (k == Kernel::kMatvecIQ2_S || k == Kernel::kMatvecIQ2_SB ||
+            k == Kernel::kMatmulIQ2_S || k == Kernel::kMatmulIQ2_SId) {
             // The grid alone is read (signs are inline); grid_table
             // appends ksigns_iq2xs regardless.
             return grid_table(iq2s_tbl, iq2s_tbl_ready, ::iq2s_grid);
@@ -1145,6 +1147,10 @@ Kernel matmul_kernel(const Mat& w) {
         case gguf::TensorType::kQ4_K: return Kernel::kMatmulQ4_K;
         case gguf::TensorType::kQ6_K: return Kernel::kMatmulQ6_K;
         case gguf::TensorType::kQ5_0: return Kernel::kMatmulQ5_0;
+        case gguf::TensorType::kQ3_K: return Kernel::kMatmulQ3_K;
+        case gguf::TensorType::kQ5_K: return Kernel::kMatmulQ5_K;
+        case gguf::TensorType::kIQ2_S: return Kernel::kMatmulIQ2_S;
+        case gguf::TensorType::kIQ2_XXS: return Kernel::kMatmulIQ2_XXS;
         case gguf::TensorType::kF32: return Kernel::kMatmulF32;
         case gguf::TensorType::kF16: return Kernel::kMatmulF16;
         case gguf::TensorType::kBF16: return Kernel::kMatmulBF16;
@@ -1160,6 +1166,10 @@ Kernel matmul_id_kernel(const Mat& w) {
         case gguf::TensorType::kQ4_K: return Kernel::kMatmulQ4_KId;
         case gguf::TensorType::kQ5_0: return Kernel::kMatmulQ5_0Id;
         case gguf::TensorType::kQ6_K: return Kernel::kMatmulQ6_KId;
+        case gguf::TensorType::kQ3_K: return Kernel::kMatmulQ3_KId;
+        case gguf::TensorType::kQ5_K: return Kernel::kMatmulQ5_KId;
+        case gguf::TensorType::kIQ2_S: return Kernel::kMatmulIQ2_SId;
+        case gguf::TensorType::kIQ2_XXS: return Kernel::kMatmulIQ2_XXSId;
         default: return Kernel::kCount_;
     }
 }
@@ -1351,7 +1361,11 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
         k_splits > 1
             ? s.chunk_buf(State::kCSplit, std::size_t{k_splits} * plane)
             : out;
-    const VulkanContext::Buffer bufs[] = {wb, x, dst};
+    // IQ kernels bind their grid table at binding 3.
+    const VulkanContext::Buffer grid = s.grid_for(k);
+    const VulkanContext::Buffer bufs_all[] = {wb, x, dst, grid};
+    const std::span<const VulkanContext::Buffer> bufs(
+        bufs_all, grid.impl != nullptr ? 4u : 3u);
     const std::uint32_t push[] = {w.rows,
                                   w.cols,
                                   r.n_tok,
@@ -1449,7 +1463,12 @@ void rec_matmul_id(State& s, const Mat& w, VulkanContext::Buffer wb,
                    std::uint32_t k, std::uint32_t n_expert,
                    std::uint64_t expert_bytes, std::uint32_t x_stride,
                    std::uint32_t x_div, std::uint32_t out_stride) {
-    const VulkanContext::Buffer bufs[] = {wb, x, out, ids};
+    // IQ kernels bind their grid table after the ids (binding 4).
+    const Kernel kid = matmul_id_kernel(w);
+    const VulkanContext::Buffer grid = s.grid_for(kid);
+    const VulkanContext::Buffer bufs_all[] = {wb, x, out, ids, grid};
+    const std::span<const VulkanContext::Buffer> bufs(
+        bufs_all, grid.impl != nullptr ? 5u : 4u);
     const std::uint32_t push[] = {w.rows,
                                   w.cols,
                                   n_tok,
