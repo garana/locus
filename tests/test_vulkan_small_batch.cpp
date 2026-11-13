@@ -495,9 +495,8 @@ TEST_CASE("vulkan short-batch SwiGLU matches the CPU and keeps a "
 
 // #432: the NT 8, guard-free, NT 1 (i#511), NT 2 and NT 4 builds of
 // matvec_q8_0_n (and _glu) run the same per-token arithmetic, so
-// batch-invariant decode
-// may pick one by batch size; this checks a token's output is the same
-// bits from each build on this device.
+// batch-invariant decode may pick one by batch size; this checks a
+// token's output is the same bits from each build on this device.
 TEST_CASE("vulkan short-batch builds give the same bits", "[vulkan]") {
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");

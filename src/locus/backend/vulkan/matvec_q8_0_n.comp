@@ -197,6 +197,8 @@ void main() {
     // where it is used, scalar x loads), which V3D runs faster than the
     // loop below that keeps a block's 8 weights for every token (i#511).
     // The same sums in the same order, so the same bits as NT 2 and 4.
+    // Any other token count writes zeros: the host picks it for n == 1
+    // only (q8n_variant).
     if (r < pc.rows && nt == 1u) {
         uint nb = pc.cols / 32u;
         uint rb = w_off + r * nb * 34u;
