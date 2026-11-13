@@ -857,6 +857,26 @@ float row_q8_0_q8_0_sse4(const std::byte* row, const float* xd,
     constexpr std::size_t kBlk = 34;  // f16 scale + 32 int8
     __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
     std::size_t b = 0;
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+    // Block b in lanes 0-3 and b + 1 in 4-7 of one 256-bit sum: the same
+    // adds as s0 and s1 below.
+    __m256 s8 = _mm256_setzero_ps();
+    for (; b + 1 < nb; b += 2) {
+        const std::byte* b0 = row + b * kBlk;
+        const std::byte* b1 = b0 + kBlk;
+        const __m256 d = _mm256_set_m128(
+            _mm_set1_ps(f16_to_f32(load_u16(b1)) * xd[b + 1]),
+            _mm_set1_ps(f16_to_f32(load_u16(b0)) * xd[b]));
+        const __m256i p = _mm256_set_m128i(
+            block32_lanes_sse4(reinterpret_cast<const std::int8_t*>(b1 + 2),
+                               xq + (b + 1) * 32),
+            block32_lanes_sse4(reinterpret_cast<const std::int8_t*>(b0 + 2),
+                               xq + b * 32));
+        s8 = _mm256_add_ps(s8, _mm256_mul_ps(_mm256_cvtepi32_ps(p), d));
+    }
+    s0 = _mm256_castps256_ps128(s8);
+    s1 = _mm256_extractf128_ps(s8, 1);
+#else
     for (; b + 1 < nb; b += 2) {
         const std::byte* b0 = row + b * kBlk;
         const std::byte* b1 = b0 + kBlk;
@@ -869,6 +889,7 @@ float row_q8_0_q8_0_sse4(const std::byte* row, const float* xd,
         s0 = _mm_add_ps(s0, _mm_mul_ps(_mm_cvtepi32_ps(p0), _mm_set1_ps(d0)));
         s1 = _mm_add_ps(s1, _mm_mul_ps(_mm_cvtepi32_ps(p1), _mm_set1_ps(d1)));
     }
+#endif
     alignas(16) float l0[4], l1[4];
     _mm_store_ps(l0, s0);
     _mm_store_ps(l1, s1);
@@ -924,6 +945,22 @@ float row_nibble32_q8_0_sse4(bool iq4nl, const std::byte* row,
     };
     __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
     std::size_t b = 0;
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+    // As row_q8_0_q8_0_sse4: blocks b, b + 1 in one 256-bit sum.
+    __m256 s8 = _mm256_setzero_ps();
+    for (; b + 1 < nb; b += 2) {
+        const std::byte* b0 = row + b * kBlk;
+        const std::byte* b1 = b0 + kBlk;
+        const __m256 d = _mm256_set_m128(
+            _mm_set1_ps(f16_to_f32(load_u16(b1)) * xd[b + 1]),
+            _mm_set1_ps(f16_to_f32(load_u16(b0)) * xd[b]));
+        const __m256i p = _mm256_set_m128i(lanes(b1, xq + (b + 1) * 32),
+                                           lanes(b0, xq + b * 32));
+        s8 = _mm256_add_ps(s8, _mm256_mul_ps(_mm256_cvtepi32_ps(p), d));
+    }
+    s0 = _mm256_castps256_ps128(s8);
+    s1 = _mm256_extractf128_ps(s8, 1);
+#else
     for (; b + 1 < nb; b += 2) {
         const std::byte* b0 = row + b * kBlk;
         const std::byte* b1 = b0 + kBlk;
@@ -934,6 +971,7 @@ float row_nibble32_q8_0_sse4(bool iq4nl, const std::byte* row,
         s0 = _mm_add_ps(s0, _mm_mul_ps(_mm_cvtepi32_ps(p0), _mm_set1_ps(d0)));
         s1 = _mm_add_ps(s1, _mm_mul_ps(_mm_cvtepi32_ps(p1), _mm_set1_ps(d1)));
     }
+#endif
     alignas(16) float l0[4], l1[4];
     _mm_store_ps(l0, s0);
     _mm_store_ps(l1, s1);
