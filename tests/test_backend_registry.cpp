@@ -553,14 +553,15 @@ TEST_CASE("sse4 q8k matvec matches scalar q8k (all k-quants)",
     for (auto& v : x) {
         v = dist(rng);
     }
-    // The IQ2 types too (any bytes are valid grid indices and signs).
+    // The IQ types too (any bytes are valid grid indices and signs).
     for (const Q& q :
          {Q{TT::kQ2_K, 84, 80, 82}, Q{TT::kQ3_K, 110, 108, -1},
           Q{TT::kQ4_K, 144, 0, 2}, Q{TT::kQ5_K, 176, 0, 2},
           Q{TT::kQ6_K, 210, 208, -1}, Q{TT::kIQ2_XXS, 66, 0, -1},
           Q{TT::kIQ2_S, 82, 0, -1}, Q{TT::kIQ4_XS, 136, 0, -1},
           Q{TT::kIQ3_XXS, 98, 0, -1}, Q{TT::kIQ3_S, 110, 0, -1},
-          Q{TT::kIQ1_S, 50, 0, -1}, Q{TT::kIQ1_M, 56, 0, -1}}) {
+          Q{TT::kIQ1_S, 50, 0, -1}, Q{TT::kIQ1_M, 56, 0, -1},
+          Q{TT::kIQ2_XS, 74, 0, -1}}) {
         std::vector<std::byte> w(static_cast<std::size_t>(rows) *
                                  (cols / 256) * q.bytes);
         for (auto& by : w) {
