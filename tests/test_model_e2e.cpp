@@ -948,7 +948,7 @@ TEST_CASE("kolibri1 decode matches the llama.cpp golden",
     auto tok = locus::tok::tokenizer_from_gguf(g);
     struct Golden {
         std::string prompt;
-        std::size_t prompt_tokens;  // llama.cpp's count (no BOS)
+        std::size_t prompt_tokens;  // llama.cpp's (the model adds no BOS)
         std::string cont;           // the reference's 24 tokens
         std::size_t exact;          // greedy tokens pinned exactly
     };
@@ -987,6 +987,8 @@ TEST_CASE("kolibri1 decode matches the llama.cpp golden",
             REQUIRE(prompt.size() == gd.prompt_tokens);
             const auto ids = tok->encode(gd.prompt + gd.cont, true);
             REQUIRE(ids.size() == gd.prompt_tokens + 24);
+            // The reference's tokens follow the prompt's unchanged.
+            REQUIRE(std::equal(prompt.begin(), prompt.end(), ids.begin()));
             // Greedy from the prompt: the first `exact` tokens.
             {
                 auto cache = model.make_cache(8);
