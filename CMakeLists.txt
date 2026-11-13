@@ -251,7 +251,7 @@ if(Vulkan_FOUND)
             matvec matvec_f16 matvec_q8_0 matvec_q4_0 matvec_q5_0
             matvec_t matvec_q4_k matvec_q5_k matvec_q6_k matvec_q2_k
             matvec_iq2_xxs matvec_iq3_xxs matvec_iq4_xs
-            matvec_q3_k matvec_iq2_s
+            matvec_iq2_s
             rmsnorm rope silu_mul
             conv1d conv1d_transpose snake1d conv2d conv2d_gemm
             attn_paged_q kv_store_q moe_route
@@ -326,7 +326,10 @@ if(Vulkan_FOUND)
             matvec_q4_k_b=matvec_q4_k:BATCHED
             matvec_q6_k_b=matvec_q6_k:BATCHED
             matvec_q5_0_b=matvec_q5_0:BATCHED
-            matvec_q3_k_b=matvec_q3_k:BATCHED
+            matvec_q3_k=matvec_q4_k:TYPE_Q3K
+            matvec_q3_k_b=matvec_q4_k:TYPE_Q3K,BATCHED
+            matvec_q3_k_glu=matvec_q4_k:TYPE_Q3K,SWIGLU
+            matvec_q3_k_seg=matvec_q4_k:TYPE_Q3K,SEGMENTS
             matvec_iq2_s_b=matvec_iq2_s:BATCHED
             matvec_iq2_xxs_b=matvec_iq2_xxs:BATCHED
             matvec_q4_k_glu_b=matvec_q4_k:BATCHED,SWIGLU

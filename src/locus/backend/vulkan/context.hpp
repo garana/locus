@@ -198,6 +198,10 @@ enum class Kernel {
     /** RMS norm added to a residual (rmsnorm.comp RESID): kolibri1's
      *  post-attention and post-FFN norms (i#714). */
     kRmsNormRes,
+    /** One token's Q3_K gate, up and silu_mul, and the Q3_K q / k / v
+     *  in one dispatch (matvec_q4_k.comp TYPE_Q3K, i#173). */
+    kMatvecQ3_KGlu,
+    kMatvecQ3_KSeg,
     kCount_,
 };
 

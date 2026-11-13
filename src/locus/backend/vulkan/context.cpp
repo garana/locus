@@ -60,8 +60,6 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecBF16N2:
         case Kernel::kMatvecQ5_0:
         case Kernel::kMatvecQ5_0B:
-        case Kernel::kMatvecQ3_K:  // 4 rows of 32 lanes (i#718)
-        case Kernel::kMatvecQ3_KB:
         case Kernel::kMatvecIQ2_S:
         case Kernel::kMatvecIQ2_SB:
         case Kernel::kMatvecIQ2_XXS:
@@ -86,6 +84,10 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecQ4_KN4:
         case Kernel::kMatvecQ4_KN4Glu:
         case Kernel::kMatvecQ6_KN4:
+        case Kernel::kMatvecQ3_K:  // matvec_q4_k's 8 x 16 layout (i#173)
+        case Kernel::kMatvecQ3_KB:
+        case Kernel::kMatvecQ3_KGlu:
+        case Kernel::kMatvecQ3_KSeg:
             return (rows + 7) / 8;
         default:
             return (rows + 63) / 64;
@@ -198,6 +200,8 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matvec_q3_k_spv.h"
 #include "matvec_iq2_s_spv.h"
 #include "matvec_q3_k_b_spv.h"
+#include "matvec_q3_k_glu_spv.h"
+#include "matvec_q3_k_seg_spv.h"
 #include "matvec_iq2_s_b_spv.h"
 #include "matvec_iq2_xxs_b_spv.h"
 #include "rmsnorm_res_spv.h"
@@ -728,6 +732,10 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_matvec_iq2_xxs_b_spv), 5, 52},
     {Kernel::kRmsNormRes, "rmsnorm_res", locus_rmsnorm_res_spv,
      sizeof(locus_rmsnorm_res_spv), 4, 16},
+    {Kernel::kMatvecQ3_KGlu, "matvec_q3_k_glu", locus_matvec_q3_k_glu_spv,
+     sizeof(locus_matvec_q3_k_glu_spv), 5, 28},
+    {Kernel::kMatvecQ3_KSeg, "matvec_q3_k_seg", locus_matvec_q3_k_seg_spv,
+     sizeof(locus_matvec_q3_k_seg_spv), 7, 88},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */
