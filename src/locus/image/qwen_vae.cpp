@@ -12,7 +12,6 @@
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/image/dense.hpp"
-#include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
 
@@ -21,10 +20,7 @@ namespace {
 using Conv = QwenVae::Conv;
 using Layer = QwenVae::Layer;
 
-/** Runs fn(i) for i in [0, n) on the thread pool. */
-void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
-    sys::ThreadPool::instance().parallel_for(n, fn);
-}
+using dense::parallel;
 
 /** The reader of the qwen_image_vae GGUF's tensors. */
 struct Reader {
