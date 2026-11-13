@@ -146,6 +146,7 @@ target_link_libraries(locus_tests PRIVATE locus catch2)
 target_include_directories(locus_tests SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/httplib
     ${CMAKE_SOURCE_DIR}/third_party/json
+    ${CMAKE_SOURCE_DIR}/third_party/ggml
 )
 target_include_directories(locus_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/tools
