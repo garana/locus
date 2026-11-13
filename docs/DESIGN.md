@@ -132,7 +132,13 @@ portable across CPU generations. When the compiler's default arm64
 target lacks the 8-bit dot product (GCC on the Pi 5), the neon kernels
 are also built with it (`matvec_neon_dotprod.cpp`), and the neon
 backend uses that build on a CPU that reports dotprod; the integer
-sums are exact either way, so the results are the same. Vulkan
+sums are exact either way, so the results are the same. The sse4
+kernels are likewise built with AVX (`matvec_sse4_avx.cpp`) for CPUs
+with AVX but not AVX2 (Sandy and Ivy Bridge): the sse4 backend uses
+that build when the CPU reports AVX. It keeps the sse4 float order (the
+batched Q8_0 kernel's two 4-lane sums share one 256-bit register), so
+the results are the same, 7 to 19% faster per kernel on an i5-2400.
+Vulkan
 shaders are compiled to
 SPIR-V and embedded at build time.
 

@@ -72,8 +72,8 @@ and an x86 host tests every code PR.
 - Dependency policy (DESIGN.md 6): no FetchContent, no network at
   build time; vendor pinned single-file deps with recorded sha256.
 - SIMD kernel variants: one source file per variant
-  (`backend/matvec_sse4.cpp`, `matvec_avx2.cpp`, `matvec_neon.cpp`,
-  `matvec_neon_dotprod.cpp`), and only that file gets the variant's
+  (`backend/matvec_sse4.cpp`, `matvec_sse4_avx.cpp`, `matvec_avx2.cpp`,
+  `matvec_neon.cpp`, `matvec_neon_dotprod.cpp`), and only that file gets the variant's
   instruction flags (`set_source_files_properties` in CMakeLists.txt,
   or a target pragma opened after the headers, as the dotprod file
   does), so the rest of the binary stays baseline and runs on any CPU
