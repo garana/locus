@@ -218,11 +218,6 @@ vec4 xload(uint xk, bool xal) {
 }
 
 #ifdef TYPE_Q3K
-/** Byte i of the weights (W, or WU / W1 / W2 as wword picks). */
-uint wbyte(uint i, bool up) {
-    return (wword(i >> 2, up) >> ((i & 3u) * 8u)) & 0xffu;
-}
-
 /** Scale group g's 6-bit scale minus 32, from the 12 bytes s0 s1 s2. */
 float q3_scale(uint s0, uint s1, uint s2, uint g) {
     uint i = g & 3u;
@@ -232,6 +227,15 @@ float q3_scale(uint s0, uint s1, uint s2, uint g) {
     uint lo = grp < 2u ? (b & 0xfu) : (b >> 4);
     uint hi = (s2 >> (8u * i + 2u * grp)) & 3u;
     return float(int(lo | (hi << 4)) - 32);
+}
+
+/**
+ * The word at byte offset 4i + sh / 8 (sh 0 or 16) from the aligned
+ * words lo (i) and hi (i + 1): a 110-byte Q3_K block starts on a 2-byte
+ * boundary, so every other block's words straddle two aligned ones.
+ */
+uint q3_join(uint lo, uint hi, uint sh) {
+    return sh == 0u ? lo : (lo >> 16u) | (hi << 16u);
 }
 
 /**
@@ -258,19 +262,26 @@ float row_part(uint wbase, uint xbase, uint r, uint lane, bool up) {
         uint b = u >> 1;
         uint n = u & 1u;  // half: elements 128n .. 128n + 127
         uint at = rb + b * 110u;
+        // Aligned words from at & ~3, joined pairwise when at % 4 == 2.
+        // The last one read (word 27) is the one holding d, the word
+        // the byte-wise reads of d took before.
+        uint ib = at >> 2;
+        uint sh = (at & 2u) * 8u;
         uint qw[8], hw[8];
+        uint hlo = wword(ib, up), qlo = wword(ib + 8u + 8u * n, up);
         for (uint k = 0u; k < 8u; ++k) {
-            qw[k] = word_at(at + 32u + 32u * n + 4u * k, up);
-            hw[k] = word_at(at + 4u * k, up);
+            uint hhi = wword(ib + k + 1u, up);
+            uint qhi = wword(ib + 9u + 8u * n + k, up);
+            hw[k] = q3_join(hlo, hhi, sh);
+            qw[k] = q3_join(qlo, qhi, sh);
+            hlo = hhi;
+            qlo = qhi;
         }
-        // The block's tail (scale bytes 8..11, d) byte by byte: a word
-        // there could reach past the last block's end.
-        uint s0 = word_at(at + 96u, up), s1 = word_at(at + 100u, up);
-        uint s2 = wbyte(at + 104u, up) | (wbyte(at + 105u, up) << 8u) |
-                  (wbyte(at + 106u, up) << 16u) |
-                  (wbyte(at + 107u, up) << 24u);
-        float d = unpackHalf2x16(wbyte(at + 108u, up) |
-                                 (wbyte(at + 109u, up) << 8u)).x;
+        uint w24 = wword(ib + 24u, up), w25 = wword(ib + 25u, up);
+        uint w26 = wword(ib + 26u, up), w27 = wword(ib + 27u, up);
+        uint s0 = q3_join(w24, w25, sh), s1 = q3_join(w25, w26, sh);
+        uint s2 = q3_join(w26, w27, sh);
+        float d = unpackHalf2x16(sh == 0u ? w27 : w27 >> 16u).x;
         uint xi = xbase + b * 256u + n * 128u;
         float s = 0.0;
         for (uint j = 0u; j < 4u; ++j) {
