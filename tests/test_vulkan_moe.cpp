@@ -2,6 +2,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <numeric>
 #include <random>
 #include <vector>
 
@@ -68,6 +69,7 @@ TEST_CASE("vulkan moe_route matches model::moe_select", "[vulkan]") {
         locus::model::GatingFunc gating;
         bool bias, norm, ties;
         float scale;
+        bool bias_on_logit = false;
     };
     using locus::model::GatingFunc;
     const Case cases[] = {
@@ -79,6 +81,15 @@ TEST_CASE("vulkan moe_route matches model::moe_select", "[vulkan]") {
          GatingFunc::kSigmoid, true, true, false, 2.5f},
         {"ties pick the lowest index", 256, 5, 1, 1,
          GatingFunc::kSoftmax, false, false, true, 1.0f},
+        // Past 256: each thread owns experts t and t + 256.
+        {"kolibri1: 384, sigmoid, bias on the logit", 384, 6, 1, 1,
+         GatingFunc::kSigmoid, true, false, false, 1.0f, true},
+        {"384 ties pick the lowest index", 384, 6, 1, 1,
+         GatingFunc::kSoftmax, false, false, true, 1.0f},
+        {"512 softmax, normalized", 512, 8, 1, 1, GatingFunc::kSoftmax,
+         false, true, false, 1.5f},
+        {"512 sigmoid + bias + groups", 512, 8, 8, 4,
+         GatingFunc::kSigmoid, true, true, false, 2.5f},
     };
     for (const Case& c : cases) {
         DYNAMIC_SECTION(c.name) {
@@ -91,6 +102,7 @@ TEST_CASE("vulkan moe_route matches model::moe_select", "[vulkan]") {
                 hp.gating = c.gating;
                 hp.expert_weights_norm = c.norm;
                 hp.expert_weights_scale = c.scale;
+                hp.bias_on_logit = c.bias_on_logit;
                 std::vector<float> logits(c.n_expert), bias(c.n_expert);
                 for (auto& v : logits) {
                     v = c.ties ? static_cast<float>(
@@ -121,7 +133,7 @@ TEST_CASE("vulkan moe_route matches model::moe_select", "[vulkan]") {
                 const std::uint32_t push[] = {
                     c.n_expert,       c.k,
                     c.gating == GatingFunc::kSigmoid ? 1u : 0u,
-                    c.bias ? 1u : 0u, c.n_group,
+                    c.bias ? (c.bias_on_logit ? 2u : 1u) : 0u, c.n_group,
                     c.n_group_used,   c.norm ? 1u : 0u,
                     fbits(c.scale),   2u};
                 ctx.dispatch(Kernel::kMoeRoute, bufs, push, 1);
@@ -137,6 +149,78 @@ TEST_CASE("vulkan moe_route matches model::moe_select", "[vulkan]") {
                 for (auto b : {lb, bb, rb}) {
                     ctx.destroy_buffer(b);
                 }
+            }
+        }
+    }
+}
+
+TEST_CASE("vulkan moe_group lists pairs and tiles in expert order",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    std::mt19937 rng(37);
+    const std::uint32_t TT = VulkanContext::kMatmulTileToks;
+    // 8 experts (one per thread pair's low half), and past 256 (two
+    // per thread).
+    for (const std::uint32_t n_exp : {8u, 384u, 512u}) {
+        DYNAMIC_SECTION(n_exp << " experts") {
+            const std::uint32_t n_tok = 300, k = 6;
+            std::vector<std::uint32_t> route(std::size_t{n_tok} * 2 * k);
+            for (std::uint32_t t = 0; t < n_tok; ++t) {
+                std::vector<std::uint32_t> ids(n_exp);
+                std::iota(ids.begin(), ids.end(), 0u);
+                std::shuffle(ids.begin(), ids.end(), rng);
+                // Expert n_exp - 1 in every token: a list past one tile.
+                ids[0] = n_exp - 1;
+                for (std::uint32_t j = 1; j < k; ++j) {
+                    if (ids[j] == n_exp - 1) {
+                        ids[j] = ids[k];
+                    }
+                }
+                for (std::uint32_t j = 0; j < k; ++j) {
+                    route[t * 2 * k + j] = ids[j];
+                }
+            }
+            const std::uint32_t max_tiles = (n_tok * k + TT - 1) / TT + n_exp;
+            const std::size_t lb = n_exp + std::size_t{n_exp} * n_tok;
+            auto rb = upload(ctx, route);
+            auto idb = ctx.create_buffer((lb + 1 + max_tiles) * 4);
+            ctx.begin_batch();
+            const VulkanContext::Buffer bufs[] = {rb, idb};
+            const std::uint32_t push[] = {n_tok, k, n_exp, n_tok, TT};
+            ctx.dispatch(Kernel::kMoeGroup, bufs, push, 1);
+            ctx.end_batch();
+            const auto ids =
+                download<std::uint32_t>(ctx, idb, lb + 1 + max_tiles);
+            // Each expert's count and list are exactly its pairs.
+            std::vector<std::vector<std::uint32_t>> want(n_exp);
+            for (std::uint32_t p = 0; p < n_tok * k; ++p) {
+                want[route[(p / k) * 2 * k + p % k]].push_back(p);
+            }
+            std::uint32_t tiles = 0;
+            for (std::uint32_t e = 0; e < n_exp; ++e) {
+                INFO("expert " << e);
+                REQUIRE(ids[e] == want[e].size());
+                std::vector<std::uint32_t> got(
+                    ids.begin() + n_exp + std::size_t{e} * n_tok,
+                    ids.begin() + n_exp + std::size_t{e} * n_tok + ids[e]);
+                std::sort(got.begin(), got.end());
+                REQUIRE(got == want[e]);
+                tiles += (ids[e] + TT - 1) / TT;
+            }
+            REQUIRE(ids[n_exp - 1] == n_tok);
+            // The work list: each expert's tiles, in expert order.
+            REQUIRE(ids[lb] == tiles);
+            std::size_t at = lb + 1;
+            for (std::uint32_t e = 0; e < n_exp; ++e) {
+                for (std::uint32_t i = 0; i < (ids[e] + TT - 1) / TT; ++i) {
+                    REQUIRE(ids[at++] == ((e << 16) | i));
+                }
+            }
+            for (auto b : {rb, idb}) {
+                ctx.destroy_buffer(b);
             }
         }
     }

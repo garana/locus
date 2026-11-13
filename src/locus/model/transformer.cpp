@@ -2158,6 +2158,11 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
 std::vector<std::pair<std::uint32_t, float>> moe_select(
     const Hparams& hp, const TransformerModel::Layer& lay,
     std::span<float> router) {
+    // kolibri1 selects by the raw logit plus the bias.
+    std::vector<float> sel;
+    if (hp.bias_on_logit) {
+        sel.assign(router.begin(), router.end());
+    }
     if (hp.gating == GatingFunc::kSoftmax) {
         backend::softmax_inplace(router);
     } else {
@@ -2166,9 +2171,12 @@ std::vector<std::pair<std::uint32_t, float>> moe_select(
         }
     }
     // Selection scores add the V3/K2 correction bias (weights do
-    // not); group-limited routing masks all but the best groups,
-    // each scored by the sum of its top-2 selection scores.
-    std::vector<float> sel(router.begin(), router.end());
+    // not; with bias_on_logit it adds to the logit); group-limited
+    // routing masks all but the best groups, each scored by the sum
+    // of its top-2 selection scores.
+    if (!hp.bias_on_logit) {
+        sel.assign(router.begin(), router.end());
+    }
     if (!lay.exp_probs_b.empty()) {
         for (std::uint32_t e = 0; e < hp.n_expert; ++e) {
             sel[e] += lay.exp_probs_b[e];

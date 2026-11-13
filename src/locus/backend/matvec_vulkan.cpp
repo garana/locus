@@ -2264,8 +2264,18 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
         return false;
     }
     if (hp.n_expert_used > 16 || hp.n_expert_used == 0 ||
-        hp.n_group > 32 || hp.n_expert > 256 ||
+        hp.n_group > 32 || hp.n_expert > 512 ||
         (hp.n_group > 1 && hp.n_expert % hp.n_group != 0)) {
+        return false;
+    }
+    // moe_route's bias on the logit (has_bias 2) assumes sigmoid
+    // gating (softmax reuses its scores as scratch) and a bias tensor
+    // (without one the groups would rank by the gated score, the CPU
+    // by the logit): kolibri1's case. Anything else routes on the
+    // host.
+    if (hp.bias_on_logit &&
+        (hp.gating != model::GatingFunc::kSigmoid ||
+         lay.exp_probs_b.empty())) {
         return false;
     }
     for (const auto* em : {&lay.gate_exps, &lay.up_exps, &lay.down_exps}) {
@@ -3087,7 +3097,7 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                     hp.n_expert,
                     k_used,
                     hp.gating == model::GatingFunc::kSigmoid ? 1u : 0u,
-                    has_bias ? 1u : 0u,
+                    has_bias ? (hp.bias_on_logit ? 2u : 1u) : 0u,
                     hp.n_group,
                     hp.n_group_used,
                     hp.expert_weights_norm ? 1u : 0u,
@@ -3347,7 +3357,7 @@ void rec_moe_routed(State& s, const model::Hparams& hp,
             ne,
             k_used,
             hp.gating == model::GatingFunc::kSigmoid ? 1u : 0u,
-            has_bias ? 1u : 0u,
+            has_bias ? (hp.bias_on_logit ? 2u : 1u) : 0u,
             hp.n_group,
             hp.n_group_used,
             hp.expert_weights_norm ? 1u : 0u,
@@ -3516,7 +3526,7 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
     // id-matmul for their weight types, as vulkan_forward_batch's.
     for (const auto& lay : run) {
         if (lay.is_moe() &&
-            (!gpu_route_ok(s, m, lay) || hp.n_expert > 256 ||
+            (!gpu_route_ok(s, m, lay) ||
              matmul_id_kernel(lay.gate_exps.base) == Kernel::kCount_ ||
              matmul_id_kernel(lay.up_exps.base) == Kernel::kCount_ ||
              matmul_id_kernel(lay.down_exps.base) == Kernel::kCount_)) {
@@ -3904,12 +3914,13 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         return batch_declined("MLA cache row is not rank + rope");
     }
     // Routed experts need GPU routing (all experts resident) and an
-    // id-matmul; moe_group handles up to 256 experts.
+    // id-matmul; moe_group, like moe_route, takes up to 512 experts
+    // (gpu_route_ok).
     for (const auto& lay : m.layers()) {
         if (!lay.is_moe()) {
             continue;
         }
-        if (!gpu_route_ok(s, m, lay) || hp.n_expert > 256) {
+        if (!gpu_route_ok(s, m, lay)) {
             return batch_declined("MoE experts routed on the host");
         }
         if (matmul_id_kernel(lay.gate_exps.base) == Kernel::kCount_ ||

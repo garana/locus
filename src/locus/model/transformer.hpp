@@ -61,6 +61,10 @@ struct Hparams {
     /** MoE: renormalize the top-k weights. */
     bool expert_weights_norm = false;
     GatingFunc gating = GatingFunc::kSoftmax;
+    /** MoE: the selection bias (exp_probs_b) adds to the raw router
+     * logit rather than the gated score (kolibri1); the weights are
+     * still the gated scores. */
+    bool bias_on_logit = false;
     /** MoE: routing groups (V3/K2 group-limited routing). */
     std::uint32_t n_group = 1;
     std::uint32_t n_group_used = 1;
