@@ -2774,38 +2774,31 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             const std::uint32_t push[] = {ff, ff};
             s.ctx.dispatch(Kernel::kSiluMulSg, bufs, push,
                            (ff + 63) / 64);
-        } else if (wg.type == gguf::TensorType::kQ8_0 &&
-            wu.type == gguf::TensorType::kQ8_0 && wg.cols == wu.cols &&
-            off_g == off_u) {
-            // Gate, up and silu_mul in one fused dispatch.
-            const VulkanContext::Buffer bufs[] = {
-                whole_g != nullptr ? *whole_g : s.upload_w(g2), s.xb,
-                s.gate, whole_u != nullptr ? *whole_u : s.upload_w(u2)};
-            const std::uint32_t push[] = {
-                ff, wg.cols, 0, 0, w_off_units(wg, off_g), 0,
-                fbits(1.0f)};
-            s.ctx.dispatch(Kernel::kMatvecQ8_0Glu, bufs, push,
-                           VulkanContext::matvec_groups(
-                               Kernel::kMatvecQ8_0Glu, ff));
-        } else if ((wg.type == gguf::TensorType::kQ4_K ||
+        } else if (wg.type == wu.type &&
+                   (wg.type == gguf::TensorType::kQ8_0 ||
+                    wg.type == gguf::TensorType::kQ4_K ||
                     wg.type == gguf::TensorType::kQ3_K) &&
-                   wu.type == wg.type && wg.cols == wu.cols &&
-                   off_g == off_u) {
-            // The same for Q4_K (i#688) and Q3_K (i#173): binding 3 is
-            // unused.
-            const Kernel gk = wg.type == gguf::TensorType::kQ3_K
-                                  ? Kernel::kMatvecQ3_KGlu
-                                  : Kernel::kMatvecQ4_KGlu;
+                   wg.cols == wu.cols && off_g == off_u) {
+            // Gate, up and silu_mul in one fused dispatch. The up
+            // weights bind at 3 (matvec_q8_0_glu) or 4 (matvec_q4_k_glu,
+            // i#688, and its Q3_K build, i#173, whose binding 3 is
+            // unused: the gate fills it).
+            const bool q8 = wg.type == gguf::TensorType::kQ8_0;
+            const Kernel k = q8 ? Kernel::kMatvecQ8_0Glu
+                             : wg.type == gguf::TensorType::kQ3_K
+                                 ? Kernel::kMatvecQ3_KGlu
+                                 : Kernel::kMatvecQ4_KGlu;
             const VulkanContext::Buffer gw =
                 whole_g != nullptr ? *whole_g : s.upload_w(g2);
+            const VulkanContext::Buffer uw =
+                whole_u != nullptr ? *whole_u : s.upload_w(u2);
             const VulkanContext::Buffer bufs[] = {
-                gw, s.xb, s.gate, gw,
-                whole_u != nullptr ? *whole_u : s.upload_w(u2)};
+                gw, s.xb, s.gate, q8 ? uw : gw, uw};
             const std::uint32_t push[] = {
                 ff, wg.cols, 0, 0, w_off_units(wg, off_g), 0,
                 fbits(1.0f)};
-            s.ctx.dispatch(gk, bufs, push,
-                           VulkanContext::matvec_groups(gk, ff));
+            s.ctx.dispatch(k, {bufs, q8 ? 4u : 5u}, push,
+                           VulkanContext::matvec_groups(k, ff));
         } else {
             rec_matvec(s, g2, s.xb, s.gate, 0, false, off_g, 0, 1.0f,
                        whole_g);
