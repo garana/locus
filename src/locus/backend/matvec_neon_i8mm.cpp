@@ -199,6 +199,15 @@ void q8_0_rows(const Mat& w, const float* d, const std::int8_t* q,
     }
 }
 
+// Other types go to the sdot kernels: every i8mm CPU has dotprod, and
+// where the dot product is a variant of its own (GCC's default arm64
+// target), the baseline build would be the slower one.
+#if defined(LOCUS_HAS_NEON_DOTPROD_VARIANT)
+namespace base = ::locus::backend::neon_dotprod;
+#else
+namespace base = ::locus::backend;
+#endif
+
 bool takes(const Mat& w) {
     return w.type == gguf::TensorType::kQ8_0 && w.cols % 32 == 0 &&
            w.cols > 0;
@@ -209,7 +218,7 @@ bool takes(const Mat& w) {
 void matvec_neon_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
     if (!takes(w)) {
-        ::locus::backend::matvec_neon_q8k(w, x, out);
+        base::matvec_neon_q8k(w, x, out);
         return;
     }
     thread_local std::vector<float> d;
@@ -223,7 +232,7 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
 void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n) {
     if (!takes(w)) {
-        ::locus::backend::matvec_batch_neon_q8k(w, x_batch, out_batch, n);
+        base::matvec_batch_neon_q8k(w, x_batch, out_batch, n);
         return;
     }
     const std::size_t nb = w.cols / 32;
