@@ -383,15 +383,18 @@ TEST_CASE("bench: llama 1b decode step on cuda with a head row range",
 // i#719: the batched SSE4 K-quant rows (prefill's matvec) on a
 // feed-forward-sized weight (2048 x 8192) for a 64-token chunk, one
 // thread. Random bytes with a small f16 scale: only the time counts.
-TEST_CASE("bench: sse4 q8k batch rows", "[.][bench]") {
+// i#721: the per-token (decode) SSE4 q8k matvec on the same 2048 x 8192
+// weights, one thread, with the weight bytes read per second. Random
+// bytes with a small f16 scale: only the time counts.
+TEST_CASE("bench: sse4 q8k decode rows", "[.][bench]") {
     if (!locus::sys::detect().sse4) {
         SKIP("CPU lacks SSE4.1");
     }
-    constexpr std::uint32_t rows = 2048, cols = 8192, n = 64, reps = 5;
-    std::mt19937 rng(11);
+    constexpr std::uint32_t rows = 2048, cols = 8192, reps = 50;
+    std::mt19937 rng(12);
     std::uniform_int_distribution<int> byte_d(0, 255);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
-    std::vector<float> x(std::size_t{n} * cols);
+    std::vector<float> x(cols);
     for (auto& v : x) {
         v = xd(rng);
     }
@@ -411,18 +414,80 @@ TEST_CASE("bench: sse4 q8k batch rows", "[.][bench]") {
             std::memcpy(w.data() + bl * q.bytes + q.d_off, &d, 2);
         }
         const Mat m{q.type, w.data(), rows, cols};
-        std::vector<float> out(std::size_t{rows} * n);
-        matvec_batch_sse4_q8k(m, x, out, n);  // warm
+        std::vector<float> out(rows);
+        matvec_sse4_q8k(m, x, out);  // warm
         const auto t0 = std::chrono::steady_clock::now();
         for (std::uint32_t r = 0; r < reps; ++r) {
-            matvec_batch_sse4_q8k(m, x, out, n);
+            matvec_sse4_q8k(m, x, out);
         }
-        const double ms = std::chrono::duration<double, std::milli>(
-                              std::chrono::steady_clock::now() - t0)
-                              .count() /
-                          reps;
-        WARN(q.name << " " << rows << " x " << cols << ", " << n
-                    << " tokens: " << ms << " ms per call");
+        const double s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count() /
+                         reps;
+        WARN(q.name << " " << rows << " x " << cols << ", 1 token: "
+                    << s * 1e3 << " ms per call, "
+                    << static_cast<double>(w.size()) / s / 1e9
+                    << " GB/s of weights");
+    }
+    SUCCEED();
+}
+
+TEST_CASE("bench: sse4 q8k batch rows", "[.][bench]") {
+    if (!locus::sys::detect().sse4) {
+        SKIP("CPU lacks SSE4.1");
+    }
+    constexpr std::uint32_t rows = 2048, cols = 8192, n = 64, reps = 5;
+    std::mt19937 rng(11);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    std::vector<float> x(std::size_t{n} * cols);
+    for (auto& v : x) {
+        v = xd(rng);
+    }
+    // bytes and d_off are per scale block (32 columns for Q8_0, 256 for
+    // the K-quants).
+    struct Q {
+        const char* name;
+        locus::gguf::TensorType type;
+        std::size_t block, bytes, d_off;
+    };
+    using Fn = void (*)(const Mat&, std::span<const float>, std::span<float>,
+                        std::uint32_t);
+    std::vector<std::pair<const char*, Fn>> builds = {
+        {"sse4", &matvec_batch_sse4_q8k}};
+#if defined(LOCUS_HAS_SSE4_AVX_VARIANT)
+    if (locus::sys::detect().avx) {
+        builds.push_back({"sse4_avx", &sse4_avx::matvec_batch_sse4_q8k});
+    }
+#endif
+    for (const Q& q :
+         {Q{"q8_0", locus::gguf::TensorType::kQ8_0, 32, 34, 0},
+          Q{"q4_k", locus::gguf::TensorType::kQ4_K, 256, 144, 0},
+          Q{"q6_k", locus::gguf::TensorType::kQ6_K, 256, 210, 208}}) {
+        std::vector<std::byte> w(std::size_t{rows} * (cols / q.block) *
+                                 q.bytes);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / q.bytes; ++bl) {
+            const std::uint16_t d = f32_to_f16(0.01f);
+            std::memcpy(w.data() + bl * q.bytes + q.d_off, &d, 2);
+        }
+        const Mat m{q.type, w.data(), rows, cols};
+        std::vector<float> out(std::size_t{rows} * n);
+        for (const auto& [build, fn] : builds) {
+            fn(m, x, out, n);  // warm
+            const auto t0 = std::chrono::steady_clock::now();
+            for (std::uint32_t r = 0; r < reps; ++r) {
+                fn(m, x, out, n);
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0)
+                                  .count() /
+                              reps;
+            WARN(build << " " << q.name << " " << rows << " x " << cols
+                       << ", " << n << " tokens: " << ms << " ms per call");
+        }
     }
     SUCCEED();
 }
@@ -501,20 +566,29 @@ TEST_CASE("bench: cpu prefill attention per layer", "[.][bench]") {
                 x = d(rng);
             }
         }
-        const auto t0 = std::chrono::steady_clock::now();
-        for (std::uint32_t base = 0; base < n_pos; base += chunk) {
-            const std::uint32_t n = std::min(chunk, n_pos - base);
-            locus::model::gqa_attend_batch(
-                q.data(), out.data(), std::size_t{heads} * hd, n, base,
-                heads, hd, group, 0.125f,
-                [&](std::uint32_t p) { return k.data() + p * kv_dim; },
-                [&](std::uint32_t p) { return v.data() + p * kv_dim; });
+        // The 4-wide build, then (on an AVX CPU) the 8-wide one.
+        for (const bool off : {true, false}) {
+            locus::model::attend_avx_off() = off;
+            if (!off && !locus::model::attend_avx()) {
+                break;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            for (std::uint32_t base = 0; base < n_pos; base += chunk) {
+                const std::uint32_t n = std::min(chunk, n_pos - base);
+                locus::model::gqa_attend_batch(
+                    q.data(), out.data(), std::size_t{heads} * hd, n, base,
+                    heads, hd, group, 0.125f,
+                    [&](std::uint32_t p) { return k.data() + p * kv_dim; },
+                    [&](std::uint32_t p) { return v.data() + p * kv_dim; });
+            }
+            const double s = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+            WARN((off ? "4-wide" : "avx") << " prefill attention, one layer, "
+                                          << n_pos << " positions: " << s
+                                          << " s");
         }
-        const double s = std::chrono::duration<double>(
-                             std::chrono::steady_clock::now() - t0)
-                             .count();
-        WARN("prefill attention, one layer, " << n_pos << " positions: "
-                                              << s << " s");
+        locus::model::attend_avx_off() = false;
     }
     // The softmax's share: one row per (query head, position) as the
     // prefill runs it, timed on 1/64 of the 8,702-position rows on one

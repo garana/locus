@@ -115,9 +115,11 @@ void paged_matmul(VulkanContext& ctx, Kernel k, const Paged& pg,
 
 void causal_softmax(VulkanContext& ctx, VulkanContext::Buffer s,
                     std::uint32_t rows, std::uint32_t n_pos,
-                    std::uint32_t heads, std::uint32_t base, float scale) {
+                    std::uint32_t heads, std::uint32_t base, float scale,
+                    std::uint32_t window = 0) {
     const VulkanContext::Buffer bufs[] = {s};
-    const std::uint32_t push[] = {n_pos, heads, base, fbits(scale), rows};
+    const std::uint32_t push[] = {n_pos, heads, base, fbits(scale), rows,
+                                  window};
     ctx.dispatch(Kernel::kAttnSoftmax, bufs, push, rows);
 }
 
@@ -126,7 +128,9 @@ void causal_softmax(VulkanContext& ctx, VulkanContext::Buffer s,
 // Attention as matmuls over the paged pool (S = K Q^T, causal
 // softmax, O = V^T P), for n_q query tokens at the END of an n_pos
 // context: token t sits at position n_pos - n_q + t and attends to
-// positions 0 .. its own. n_q 1 is decode, n_q > 1 a prefill chunk.
+// positions 0 .. its own, or with a sliding window W (i#730) to the
+// last W of them (q - p < W). n_q 1 is decode, n_q > 1 a prefill
+// chunk.
 TEST_CASE("vulkan paged attention matches the CPU reference",
           "[vulkan]") {
     if (!VulkanContext::available()) {
@@ -143,11 +147,13 @@ TEST_CASE("vulkan paged attention matches the CPU reference",
     for (std::uint32_t head_dim : head_dims) {
         for (std::uint32_t n_pos : n_poss) {
             for (std::uint32_t n_q : n_qs) {
+              for (const std::uint32_t window : {0u, 20u}) {
                 if (n_q > n_pos) {
                     continue;
                 }
                 DYNAMIC_SECTION("head_dim " << head_dim << " n_pos "
-                                            << n_pos << " n_q " << n_q) {
+                                            << n_pos << " n_q " << n_q
+                                            << " window " << window) {
                     const std::uint32_t n_heads = 4, n_kv = 2;
                     const std::uint32_t group = n_heads / n_kv;
                     const std::uint32_t kv_dim = n_kv * head_dim;
@@ -175,23 +181,26 @@ TEST_CASE("vulkan paged attention matches the CPU reference",
                     std::vector<float> want(std::size_t{n_q} * q_dim);
                     for (std::uint32_t tq = 0; tq < n_q; ++tq) {
                         const std::uint32_t span = base + tq + 1;
+                        const std::uint32_t lo =
+                            window > 0 && span > window ? span - window : 0;
                         for (std::uint32_t h = 0; h < n_heads; ++h) {
                             const std::uint32_t kvh = (h / group) * head_dim;
                             const float* qh =
                                 q.data() + tq * q_dim + h * head_dim;
-                            std::vector<double> s(span);
-                            for (std::uint32_t t = 0; t < span; ++t) {
+                            std::vector<double> s(span - lo);
+                            for (std::uint32_t t = lo; t < span; ++t) {
                                 double d = 0.0;
                                 for (std::uint32_t i = 0; i < head_dim; ++i) {
                                     d += qh[i] * kv_at(t, false, kvh + i);
                                 }
-                                s[t] = d / std::sqrt(double(head_dim));
+                                s[t - lo] = d / std::sqrt(double(head_dim));
                             }
                             softmax(s);
                             for (std::uint32_t i = 0; i < head_dim; ++i) {
                                 double acc = 0.0;
-                                for (std::uint32_t t = 0; t < span; ++t) {
-                                    acc += s[t] * kv_at(t, true, kvh + i);
+                                for (std::uint32_t t = lo; t < span; ++t) {
+                                    acc += s[t - lo] *
+                                           kv_at(t, true, kvh + i);
                                 }
                                 want[tq * q_dim + h * head_dim + i] =
                                     static_cast<float>(acc);
@@ -221,7 +230,8 @@ TEST_CASE("vulkan paged attention matches the CPU reference",
                                  head_dim, n_pos);
                     causal_softmax(ctx, sb, n_q * n_heads, n_pos, n_heads,
                                    base,
-                                   1.0f / std::sqrt(float(head_dim)));
+                                   1.0f / std::sqrt(float(head_dim)),
+                                   window);
                     paged_matmul(ctx, Kernel::kMatmulPagedTF32, pg, head_dim,
                                  n_pos, n_q * group, false,
                                  layer * layer_stride + layer_stride / 2, sb,
@@ -242,6 +252,7 @@ TEST_CASE("vulkan paged attention matches the CPU reference",
                         ctx.destroy_buffer(b);
                     }
                 }
+              }
             }
         }
     }
