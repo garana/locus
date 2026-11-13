@@ -467,6 +467,31 @@ TEST_CASE("bench: cpu prefill attention per layer", "[.][bench]") {
         WARN("prefill attention, one layer, " << n_pos << " positions: "
                                               << s << " s");
     }
+    // The softmax's share: one row per (query head, position) as the
+    // prefill runs it, timed on 1/64 of the 8,702-position rows on one
+    // thread and scaled to the layer and the pool.
+    {
+        constexpr std::uint32_t n_pos = 8702, sample = 64;
+        std::vector<float> row(n_pos);
+        double total = 0.0;
+        for (std::uint32_t p = 0; p < n_pos; p += sample) {
+            for (std::uint32_t i = 0; i <= p; ++i) {
+                row[i] = d(rng);
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            for (std::uint32_t h = 0; h < heads; ++h) {
+                locus::backend::softmax_inplace({row.data(), p + 1});
+            }
+            total += std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count();
+        }
+        const double threads =
+            static_cast<double>(locus::model::mt_fanout());
+        WARN("softmax share, one layer, 8702 positions: about "
+             << total * sample / threads << " s on " << threads
+             << " threads");
+    }
     SUCCEED();
 }
 
