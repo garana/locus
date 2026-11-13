@@ -1176,7 +1176,7 @@ Kernel q8n_variant(const VulkanContext& ctx, Kernel k, std::uint32_t n) {
     // on V3D, where with the NT 2 loop a lone Q8_0 1B decode took 2080
     // ms of GPU time per token against the single path's 1468
     // (LOCUS_VK_Q8N1=0 / 1 overrides).
-    // Only for n == 1: the NT 1 build writes zeros for any other count.
+    // Only for n == 1: the NT 1 build computes token 0 only.
     static const bool n1 = [&] {
         const char* e = std::getenv("LOCUS_VK_Q8N1");
         if (e != nullptr && *e != '\0') {  // empty: unset
