@@ -744,11 +744,6 @@ void q6_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
 namespace {
 
 /**
- * The lane sums of one vec_dot_block32_q8_0 block: lane l is quants
- * 4l..4l+3 of both halves, q (weights) times x (activations). Integer
- * sums are exact, so the SIMD add order matches the scalar loop.
- */
-/**
  * The four lane sums of 16 weights a against 16 activations b: lane l
  * is a[4l..4l+3] . b[4l..4l+3]. maddubs takes |a| (unsigned) times b
  * with a's sign, two products per int16: at most 2 * 128 * 127 =
@@ -760,6 +755,11 @@ __m128i lanes16_sse4(__m128i abs_a, __m128i a, __m128i b) {
     return _mm_madd_epi16(p, _mm_set1_epi16(1));
 }
 
+/**
+ * The lane sums of one vec_dot_block32_q8_0 block: lane l is quants
+ * 4l..4l+3 of both halves, q (weights) times x (activations). Integer
+ * sums are exact, so the SIMD add order matches the scalar loop.
+ */
 __m128i block32_lanes_sse4(const std::int8_t* q, const std::int8_t* x) {
     const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q));
     const __m128i q1 =
@@ -813,8 +813,8 @@ float row_q8_0_q8_0_sse4(const std::byte* row, const float* xd,
 }
 
 /**
- * row_q8_0_q8_0_sse4 for kT tokens: each weight block is sign-extended
- * to int16 once and dotted with every token's quants; each token's
+ * row_q8_0_q8_0_sse4 for kT tokens: each weight block and its absolute
+ * values are loaded once and dotted with every token's quants; each token's
  * float lanes and reduction keep the one-token order, so out[t] is the
  * bits row_q8_0_q8_0_sse4 gives for token t.
  */
