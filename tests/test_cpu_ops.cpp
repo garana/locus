@@ -897,14 +897,29 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
                                    std::pair{TensorType::kIQ2_S, 82u},
                                    std::pair{TensorType::kIQ4_XS, 136u},
                                    std::pair{TensorType::kIQ3_XXS, 98u},
-                                   std::pair{TensorType::kIQ3_S, 110u}}) {
+                                   std::pair{TensorType::kIQ3_S, 110u},
+                                   std::pair{TensorType::kIQ1_S, 50u},
+                                   std::pair{TensorType::kIQ1_M, 56u}}) {
         std::vector<std::byte> w(std::size_t{rows} * 8 * bytes);
         for (auto& by : w) {
             by = static_cast<std::byte>(byte_d(rng));
         }
         for (std::size_t bl = 0; bl < w.size() / bytes; ++bl) {
             const std::uint16_t d = f32_to_f16(scale_d(rng));
-            std::memcpy(w.data() + bl * bytes, &d, 2);
+            std::byte* blk = w.data() + bl * bytes;
+            if (t != TensorType::kIQ1_M) {
+                std::memcpy(blk, &d, 2);
+                continue;
+            }
+            // IQ1_M's f16 scale is the top nibbles of the four 16-bit
+            // words at 48 (random ones could be inf / NaN).
+            std::uint16_t sc[4];
+            std::memcpy(sc, blk + 48, 8);
+            for (int k = 0; k < 4; ++k) {
+                sc[k] = static_cast<std::uint16_t>(
+                    (sc[k] & 0x0fff) | (((d >> (4 * k)) & 0xf) << 12));
+            }
+            std::memcpy(blk + 48, sc, 8);
         }
         check(Mat{t, w.data(), rows, 8 * 256}, 50);
     }
