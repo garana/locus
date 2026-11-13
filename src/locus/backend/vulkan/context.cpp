@@ -751,6 +751,13 @@ struct VulkanContext::Impl {
     bool spin_wait = false;
     static constexpr std::chrono::milliseconds kSpinBudget{20};
 
+    /** matmul.comp's register prefetch for the quantized weights
+     *  (its specialization constant 0): on by default (+7% prefill on
+     *  an M4 Max), off on V3D, where it lost 4-5%
+     *  (LOCUS_VK_MATMUL_PREFETCH=0 or 1 overrides). Either way the
+     *  same values and summation order. */
+    bool matmul_prefetch = true;
+
     /**
      * Descriptor sets cached by (kernel, buffers): a decode token
      * replays the same dispatch sequence, so after the first token
@@ -1231,6 +1238,10 @@ struct VulkanContext::Impl {
             vkGetPhysicalDeviceProperties(phys, &pp);
             max_shared_mem = pp.limits.maxComputeSharedMemorySize;
             device_name = pp.deviceName;
+            const char* e = std::getenv("LOCUS_VK_MATMUL_PREFETCH");
+            matmul_prefetch =
+                e != nullptr ? std::string_view(e) != "0"
+                             : device_name.find("V3D") == std::string::npos;
         }
         if (!has_f16) {
             static bool told = false;
@@ -1360,6 +1371,17 @@ struct VulkanContext::Impl {
         cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         cpci.stage.module = sm;
         cpci.stage.pName = "main";
+        // matmul.comp's constant 0 (other shaders declare none).
+        const VkBool32 prefetch = matmul_prefetch ? VK_TRUE : VK_FALSE;
+        const VkSpecializationMapEntry spec_entry{0, 0, sizeof(VkBool32)};
+        VkSpecializationInfo spec{};
+        if (std::string_view(kd.name).starts_with("matmul_")) {
+            spec.mapEntryCount = 1;
+            spec.pMapEntries = &spec_entry;
+            spec.dataSize = sizeof(prefetch);
+            spec.pData = &prefetch;
+            cpci.stage.pSpecializationInfo = &spec;
+        }
         cpci.layout = p.layout;
         check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1,
                                        &cpci, nullptr,
@@ -1975,6 +1997,10 @@ const std::string& VulkanContext::device_name() const {
     return impl_->device_name;
 }
 
+bool VulkanContext::matmul_prefetch() const {
+    return impl_->matmul_prefetch;
+}
+
 std::uint64_t VulkanContext::memory_available() const {
     const Impl& im = *impl_;
     const std::uint32_t heap = im.host_heap();
@@ -2147,6 +2173,7 @@ bool VulkanContext::serial_dispatch() const { no_kernels(); }
 bool VulkanContext::has_f16() const { no_kernels(); }
 bool VulkanContext::small_variant(Kernel) const { no_kernels(); }
 const std::string& VulkanContext::device_name() const { no_kernels(); }
+bool VulkanContext::matmul_prefetch() const { no_kernels(); }
 const VulkanContext::Profile& VulkanContext::profile() const {
     no_kernels();
 }
