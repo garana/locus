@@ -317,6 +317,7 @@ if(Vulkan_FOUND)
             attn_combine_part=attn_combine:PARTIAL
             kv_scatter_f16=kv_scatter:KV_F16
             rmsnorm_b=rmsnorm:BATCHED
+            rmsnorm_res=rmsnorm:RESID
             rope_b=rope:BATCHED
             rope_neox=rope:NEOX
             rope_neox_b=rope:BATCHED,NEOX

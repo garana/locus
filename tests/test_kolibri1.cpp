@@ -347,15 +347,20 @@ TEST_CASE("kolibri1 loads its hparams and tensors", "[model][kolibri1]") {
     REQUIRE_FALSE(hp.expert_weights_norm);
     REQUIRE(model.layers()[1].post_attn_norm.size() == kE);
     REQUIRE(model.layers()[1].exp_probs_b.size() == kNe);
-    // Its own layer body: no batch paths, no GPU full forward.
+    // Its own layer body: no batch paths; the Vulkan single-token
+    // forward runs it (i#714).
     REQUIRE_FALSE(model.supports_batch());
-    REQUIRE_FALSE(locus::backend::vulkan_forward_supported(model));
+    REQUIRE(model.hparams().custom_layer_gpu);
+    REQUIRE(locus::backend::vulkan_forward_supported(model));
 }
 
 // Ten positions: past the window of 3 on layer 0, every position's
 // logits against the reference, with and without renormalized expert
-// weights; on Vulkan too when there is a device (its matvecs sum in
-// another order).
+// weights; on Vulkan too when there is a device, through the
+// whole-token GPU forward with the experts routed on the GPU (its
+// matvecs sum in another order). Positions 3.. drop the oldest key on
+// layer 0 one at a time, so the window's first position is checked at
+// each boundary against the CPU's rule.
 TEST_CASE("kolibri1 matches the reference graph", "[model][kolibri1]") {
     const std::vector<int> toks = {3, 17, 9, 30, 1, 22, 5, 14, 27, 8};
     const auto ts = make_tensors();
@@ -374,6 +379,10 @@ TEST_CASE("kolibri1 matches the reference graph", "[model][kolibri1]") {
         for (const auto& [be, bound] : legs) {
             INFO(be->name);
             model.use_backend(*be);
+            if (be->name == "vulkan") {
+                REQUIRE(locus::backend::vulkan_forward_supported(model));
+                REQUIRE(locus::backend::vulkan_moe_gpu_route(model));
+            }
             const auto got = run(model, toks);
             for (std::size_t p = 0; p < toks.size(); ++p) {
                 INFO("position " << p);

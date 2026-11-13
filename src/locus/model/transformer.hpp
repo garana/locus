@@ -105,6 +105,10 @@ struct Hparams {
      * muse-spark). Only the CPU single-token forward implements it:
      * no batch paths, no GPU full forward. */
     bool custom_layer = false;
+    /** A custom_layer arch the Vulkan single-token forward runs too
+     * (kolibri1: sliding-window / NoPE layers, post norms, routing on
+     * the raw logit); its batch paths stay off. */
+    bool custom_layer_gpu = false;
     /** Weightless RMS norm of the token embedding (muse-spark). */
     bool embd_norm = false;
     /** Logits multiplier, then tanh softcap at +/- this (0 = off). */

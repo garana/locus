@@ -1338,6 +1338,7 @@ void kolibri1_hparams(const gguf::GgufFile& g, const std::string& p,
     hp.expert_weights_scale =
         get_float(g, p + "expert_weights_scale", 1.0f);
     hp.bias_on_logit = true;  // select by logit + exp_probs_b
+    hp.custom_layer_gpu = true;  // the Vulkan decode forward runs it
     hp.swa_window = static_cast<std::uint32_t>(
         g.get_uint(p + "attention.sliding_window").value_or(0));
     const auto* pat = g.get_array(p + "attention.sliding_window_pattern");
