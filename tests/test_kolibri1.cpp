@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/fallbacks.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_forward.hpp"
@@ -22,6 +23,20 @@
 using locus::model::TransformerModel;
 
 namespace {
+
+/** Vulkan's fallbacks off the whole-token forward so far (per-op
+ *  matvecs, host-routed experts), any reason. */
+std::uint64_t vulkan_fallbacks() {
+    std::uint64_t n = 0;
+    locus::backend::for_each_fallback(
+        [&](const locus::backend::Fallback& f) {
+            if (f.from == "vulkan" &&
+                (f.to == "per_op" || f.to == "host_route")) {
+                n += f.n.load();
+            }
+        });
+    return n;
+}
 
 /** Deterministic small pseudo-random values in [-0.5, 0.5]. */
 std::vector<float> weights(std::size_t n, std::uint32_t seed) {
@@ -383,7 +398,12 @@ TEST_CASE("kolibri1 matches the reference graph", "[model][kolibri1]") {
                 REQUIRE(locus::backend::vulkan_forward_supported(model));
                 REQUIRE(locus::backend::vulkan_moe_gpu_route(model));
             }
+            const std::uint64_t fb0 = vulkan_fallbacks();
             const auto got = run(model, toks);
+            if (be->name == "vulkan") {
+                // Every token took the whole-token forward.
+                REQUIRE(vulkan_fallbacks() == fb0);
+            }
             for (std::size_t p = 0; p < toks.size(); ++p) {
                 INFO("position " << p);
                 double err = 0.0, ref = 0.0;

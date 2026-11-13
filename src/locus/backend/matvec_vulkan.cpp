@@ -2598,8 +2598,11 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
            static_cast<std::size_t>(hp.n_heads) * hp.n_ctx);
     s.grow(s.logits, s.logits_n, hp.n_vocab);
     s.grow(s.table, s.table_n, cache.total_blocks());
-    if (!m.layers()[layer_begin].post_attn_norm.empty() ||
-        !m.layers()[layer_begin].post_ffw_norm.empty()) {
+    if (std::any_of(m.layers().begin() + layer_begin,
+                    m.layers().begin() + layer_end, [](const auto& l) {
+                        return !l.post_attn_norm.empty() ||
+                               !l.post_ffw_norm.empty();
+                    })) {
         s.grow(s.res, s.res_n, hp.n_embd);
         if (s.zeros_n < hp.n_embd) {
             s.grow(s.zeros, s.zeros_n, hp.n_embd);
