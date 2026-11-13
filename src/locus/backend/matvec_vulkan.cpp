@@ -916,16 +916,19 @@ struct SegRope {
 };
 
 /**
- * Records the matvecs of 2 or 3 matrices reading x (seg_ok) as one
- * dispatch over their stacked rows (State::upload_cat): ms[0]'s rows
- * to out at out_off, ms[1]'s to out2 at off1, ms[2]'s (if any) to
- * out2 at off2, roped per `rope` (default: none).
+ * The dispatch matvec_q8_0_seg and matvec_q4_k_seg share: checks the
+ * rope spec against the epilogue's pairing, builds their common push
+ * block (segment rows and offsets, then the rope words) and records
+ * kernel k with `bufs`, whose weight layout is the caller's.
+ *
+ * @param name The kernel's name, for the error.
+ * @throws std::logic_error when the rope spec breaks the pairing.
  */
-void rec_matvec_seg(State& s, std::span<const Mat* const> ms,
-                    VulkanContext::Buffer x, VulkanContext::Buffer out,
-                    std::uint32_t out_off, VulkanContext::Buffer out2,
-                    std::uint32_t off1, std::uint32_t off2,
-                    const SegRope& rope = {}) {
+void rec_seg_dispatch(State& s, Kernel k, const char* name,
+                      std::span<const Mat* const> ms,
+                      std::span<const VulkanContext::Buffer> bufs,
+                      std::uint32_t out_off, std::uint32_t off1,
+                      std::uint32_t off2, const SegRope& rope) {
     const std::uint32_t seg1 = ms[0]->rows;
     const std::uint32_t seg2 = seg1 + ms[1]->rows;
     // The epilogue's pairing assumptions (vk::seg_rope_fits, segment 1
@@ -936,14 +939,11 @@ void rec_matvec_seg(State& s, std::span<const Mat* const> ms,
         (seg1 % 2 != 0 ||
          !vk::seg_rope_fits(seg1, rope.hs0, rope.ro0, rope.rd0) ||
          !vk::seg_rope_fits(ms[1]->rows, rope.hs1, rope.ro1, rope.rd1))) {
-        throw std::logic_error("matvec_q8_0_seg: rope spec breaks the "
-                               "epilogue's pairing invariants");
+        throw std::logic_error(std::string(name) +
+                               ": rope spec breaks the epilogue's pairing "
+                               "invariants");
     }
-    const std::uint32_t rows =
-        seg2 + (ms.size() > 2 ? ms[2]->rows : 0);
-    const VulkanContext::Buffer bufs[] = {
-        s.upload_cat(ms), x, out, out2,
-        rope.divisors.impl != nullptr ? rope.divisors : x};
+    const std::uint32_t rows = seg2 + (ms.size() > 2 ? ms[2]->rows : 0);
     const std::uint32_t push[] = {
         rows,         ms[0]->cols, out_off,     0,
         0,            0,           fbits(1.0f), seg1,
@@ -951,9 +951,25 @@ void rec_matvec_seg(State& s, std::span<const Mat* const> ms,
         rope.ro0,     rope.rd0,    rope.hs1,    rope.ro1,
         rope.rd1,     rope.pos,    rope.base_bits, rope.fs_bits,
         rope.lo_bits, rope.hi_bits};
-    s.ctx.dispatch(Kernel::kMatvecQ8_0Seg, bufs, push,
-                   VulkanContext::matvec_groups(Kernel::kMatvecQ8_0Seg,
-                                                rows));
+    s.ctx.dispatch(k, bufs, push, VulkanContext::matvec_groups(k, rows));
+}
+
+/**
+ * Records the matvecs of 2 or 3 matrices reading x (seg_ok) as one
+ * dispatch over their stacked rows (State::upload_cat): ms[0]'s rows
+ * to out at out_off, ms[1]'s to out2 at off1, ms[2]'s (if any) to
+ * out2 at off2, roped per `rope` (default: none).
+ */
+void rec_matvec_seg(State& s, std::span<const Mat* const> ms,
+                    VulkanContext::Buffer x, VulkanContext::Buffer out,
+                    std::uint32_t out_off, VulkanContext::Buffer out2,
+                    std::uint32_t off1, std::uint32_t off2,
+                    const SegRope& rope = {}) {
+    const VulkanContext::Buffer bufs[] = {
+        s.upload_cat(ms), x, out, out2,
+        rope.divisors.impl != nullptr ? rope.divisors : x};
+    rec_seg_dispatch(s, Kernel::kMatvecQ8_0Seg, "matvec_q8_0_seg", ms, bufs,
+                     out_off, off1, off2, rope);
 }
 
 /**
@@ -981,33 +997,15 @@ void rec_matvec_q4k_seg(State& s, std::span<const Mat* const> ms,
                         std::uint32_t out_off, VulkanContext::Buffer out2,
                         std::uint32_t off1, std::uint32_t off2,
                         const SegRope& rope = {}) {
-    const std::uint32_t seg1 = ms[0]->rows;
-    const std::uint32_t seg2 = seg1 + ms[1]->rows;
-    // The epilogue's pairs are two rows of one 8-row workgroup: seg1
-    // and the rope spans even (rec_matvec_seg's invariants).
-    if ((rope.rd0 != 0 || rope.rd1 != 0) &&
-        (seg1 % 2 != 0 ||
-         !vk::seg_rope_fits(seg1, rope.hs0, rope.ro0, rope.rd0) ||
-         !vk::seg_rope_fits(ms[1]->rows, rope.hs1, rope.ro1, rope.rd1))) {
-        throw std::logic_error("matvec_q4_k_seg: rope spec breaks the "
-                               "epilogue's pairing invariants");
-    }
-    const std::uint32_t rows = seg2 + (ms.size() > 2 ? ms[2]->rows : 0);
+    // Each matrix from its own upload; the pairs are two rows of one
+    // 8-row workgroup, under rec_seg_dispatch's checks.
     const VulkanContext::Buffer w1 = s.upload_w(*ms[1]);
     const VulkanContext::Buffer bufs[] = {
         s.upload_w(*ms[0]), x, out, out2, w1,
         ms.size() > 2 ? s.upload_w(*ms[2]) : w1,
         rope.divisors.impl != nullptr ? rope.divisors : x};
-    const std::uint32_t push[] = {
-        rows,         ms[0]->cols, out_off,     0,
-        0,            0,           fbits(1.0f), seg1,
-        off1,         seg2,        off2,        rope.hs0,
-        rope.ro0,     rope.rd0,    rope.hs1,    rope.ro1,
-        rope.rd1,     rope.pos,    rope.base_bits, rope.fs_bits,
-        rope.lo_bits, rope.hi_bits};
-    s.ctx.dispatch(Kernel::kMatvecQ4_KSeg, bufs, push,
-                   VulkanContext::matvec_groups(Kernel::kMatvecQ4_KSeg,
-                                                rows));
+    rec_seg_dispatch(s, Kernel::kMatvecQ4_KSeg, "matvec_q4_k_seg", ms, bufs,
+                     out_off, off1, off2, rope);
 }
 
 /**
