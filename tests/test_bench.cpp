@@ -118,6 +118,43 @@ TEST_CASE("bench: k-quant matvec f32 vs Q8_K", "[.][bench]") {
     SUCCEED();
 }
 
+#if defined(__aarch64__)
+// i#744: the NEON Q8_K dots against the scalar ones they match bit for
+// bit. (IQ1_M's f16 scale is assembled from nibbles; random bytes may
+// make it inf or NaN, which does not change the timing.)
+TEST_CASE("bench: neon q8k IQ3, IQ1_M, IQ4_XS and Q2_K", "[.][bench]") {
+    using TT = locus::gguf::TensorType;
+    struct Q {
+        TT type;
+        const char* name;
+        std::size_t bytes;
+        std::size_t d_off;
+        int dmin_off;
+    };
+    const std::uint32_t rows = 2048, cols = 4096;
+    std::mt19937 rng(744);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> x(cols), out(rows);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+    const int iters = 20;
+    for (const Q& q : {Q{TT::kIQ3_XXS, "IQ3_XXS", 98, 0, -1},
+                       Q{TT::kIQ3_S, "IQ3_S", 110, 0, -1},
+                       Q{TT::kIQ1_M, "IQ1_M", 56, 0, -1},
+                       Q{TT::kIQ4_XS, "IQ4_XS", 136, 0, -1},
+                       Q{TT::kQ2_K, "Q2_K", 84, 80, 82}}) {
+        auto w = make_kquant(rows, cols, q.bytes, q.d_off, q.dmin_off, 7);
+        Mat m{q.type, w.data(), rows, cols};
+        const double s = time_matvec(&matvec_q8k, m, x, out, iters);
+        const double v = time_matvec(&matvec_neon_q8k, m, x, out, iters);
+        WARN(q.name << ": scalar q8k=" << s << "ns neon q8k=" << v
+                    << "ns speedup=" << s / v << "x");
+    }
+    SUCCEED();
+}
+#endif
+
 // i#52 measure-first: the last stage projects out_w_ (the LM head, the
 // biggest tensor) once PER token via matvec. Amortizing it into one
 // matvec_batch reads the weight once for the whole batch; this measures

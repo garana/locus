@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -329,6 +330,86 @@ TEST_CASE("neon q8k block-32 dots match scalar q8k", "[backend]") {
         for (std::uint32_t r = 0; r < rows; ++r) {
             INFO("type " << static_cast<int>(type) << " row " << r);
             REQUIRE(b[r] == a[r]);
+        }
+    }
+}
+
+TEST_CASE("neon q8k IQ3, IQ1_M, IQ4_XS and Q2_K dots are the scalar bits",
+          "[backend]") {
+    // i#744: exact integer sums and the scalar float steps, so equal
+    // bits per token, batched, and in the dotprod build.
+    using TT = locus::gguf::TensorType;
+    struct Q {
+        TT type;
+        std::size_t bytes;
+        int d_off;     // f16 scale, or -1
+        int dmin_off;  // second f16 scale, or -1
+    };
+    const std::uint32_t rows = 7, cols = 768, n = 5;  // 3 blocks / row
+    std::mt19937 rng(744);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
+    std::vector<float> xb(std::size_t{n} * cols);
+    for (auto& v : xb) {
+        v = dist(rng);
+    }
+    for (const Q& q : {Q{TT::kIQ3_XXS, 98, 0, -1}, Q{TT::kIQ3_S, 110, 0, -1},
+                       Q{TT::kIQ1_M, 56, -1, -1}, Q{TT::kIQ4_XS, 136, 0, -1},
+                       Q{TT::kQ2_K, 84, 80, 82}}) {
+        std::vector<std::byte> w(std::size_t{rows} * (cols / 256) * q.bytes);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / q.bytes; ++bl) {
+            std::byte* blk = w.data() + bl * q.bytes;
+            for (const int off : {q.d_off, q.dmin_off}) {
+                if (off >= 0) {
+                    const std::uint16_t d = f32_to_f16(scale_d(rng));
+                    std::memcpy(blk + off, &d, 2);
+                }
+            }
+            if (q.type == TT::kIQ1_M) {
+                // The f16 scale is the top nibble of each of the four
+                // u16 scale words at 48: keep it finite.
+                const std::uint16_t d = f32_to_f16(scale_d(rng));
+                for (int k = 0; k < 4; ++k) {
+                    std::uint16_t s;
+                    std::memcpy(&s, blk + 48 + 2 * k, 2);
+                    s = static_cast<std::uint16_t>(
+                        (s & 0x0fff) | (((d >> (4 * k)) & 0xf) << 12));
+                    std::memcpy(blk + 48 + 2 * k, &s, 2);
+                }
+            }
+        }
+        const Mat m{q.type, w.data(), rows, cols};
+        std::vector<float> batched(std::size_t{rows} * n);
+        matvec_batch_neon_q8k(m, xb, batched, n);
+#if defined(LOCUS_HAS_NEON_DOTPROD_VARIANT)
+        std::vector<float> batched_dp(std::size_t{rows} * n);
+        neon_dotprod::matvec_batch_neon_q8k(m, xb, batched_dp, n);
+#endif
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const std::span<const float> x(xb.data() + std::size_t{t} * cols,
+                                           cols);
+            std::vector<float> a(rows), b(rows);
+            matvec_q8k(m, x, a);
+            matvec_neon_q8k(m, x, b);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                INFO("type " << static_cast<int>(q.type) << " token " << t
+                             << " row " << r);
+                REQUIRE(std::isfinite(a[r]));
+                REQUIRE(b[r] == a[r]);
+                REQUIRE(batched[std::size_t{r} * n + t] == a[r]);
+#if defined(LOCUS_HAS_NEON_DOTPROD_VARIANT)
+                REQUIRE(batched_dp[std::size_t{r} * n + t] == a[r]);
+#endif
+            }
+#if defined(LOCUS_HAS_NEON_DOTPROD_VARIANT)
+            std::vector<float> c(rows);
+            neon_dotprod::matvec_neon_q8k(m, x, c);
+            REQUIRE(c == a);
+#endif
         }
     }
 }
