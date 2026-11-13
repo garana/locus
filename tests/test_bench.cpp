@@ -379,6 +379,55 @@ TEST_CASE("bench: llama 1b decode step on cuda with a head row range",
     SUCCEED();
 }
 
+#if defined(__x86_64__)
+// i#719: the batched SSE4 K-quant rows (prefill's matvec) on a
+// feed-forward-sized weight (2048 x 8192) for a 64-token chunk, one
+// thread. Random bytes with a small f16 scale: only the time counts.
+TEST_CASE("bench: sse4 q8k batch rows", "[.][bench]") {
+    if (!locus::sys::detect().sse4) {
+        SKIP("CPU lacks SSE4.1");
+    }
+    constexpr std::uint32_t rows = 2048, cols = 8192, n = 64, reps = 5;
+    std::mt19937 rng(11);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    std::vector<float> x(std::size_t{n} * cols);
+    for (auto& v : x) {
+        v = xd(rng);
+    }
+    struct Q {
+        const char* name;
+        locus::gguf::TensorType type;
+        std::size_t bytes, d_off;
+    };
+    for (const Q& q : {Q{"q4_k", locus::gguf::TensorType::kQ4_K, 144, 0},
+                       Q{"q6_k", locus::gguf::TensorType::kQ6_K, 210, 208}}) {
+        std::vector<std::byte> w(std::size_t{rows} * (cols / 256) * q.bytes);
+        for (auto& b : w) {
+            b = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / q.bytes; ++bl) {
+            const std::uint16_t d = f32_to_f16(0.01f);
+            std::memcpy(w.data() + bl * q.bytes + q.d_off, &d, 2);
+        }
+        const Mat m{q.type, w.data(), rows, cols};
+        std::vector<float> out(std::size_t{rows} * n);
+        matvec_batch_sse4_q8k(m, x, out, n);  // warm
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::uint32_t r = 0; r < reps; ++r) {
+            matvec_batch_sse4_q8k(m, x, out, n);
+        }
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count() /
+                          reps;
+        WARN(q.name << " " << rows << " x " << cols << ", " << n
+                    << " tokens: " << ms << " ms per call");
+    }
+    SUCCEED();
+}
+#endif
+
 // Per-type CUDA matvec time for the IQ quants on a 4096 x 4096 weight
 // (fully resident). The wall time includes the per-call copies and
 // sync; run it under nsys for kernel-only times. Random bytes with a
