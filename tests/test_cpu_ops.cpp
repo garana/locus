@@ -1004,7 +1004,8 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
                                    std::pair{TensorType::kIQ3_XXS, 98u},
                                    std::pair{TensorType::kIQ3_S, 110u},
                                    std::pair{TensorType::kIQ1_S, 50u},
-                                   std::pair{TensorType::kIQ1_M, 56u}}) {
+                                   std::pair{TensorType::kIQ1_M, 56u},
+                                   std::pair{TensorType::kIQ2_XS, 74u}}) {
         std::vector<std::byte> w(std::size_t{rows} * 8 * bytes);
         for (auto& by : w) {
             by = static_cast<std::byte>(byte_d(rng));
