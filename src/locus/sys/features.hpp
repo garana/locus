@@ -16,6 +16,8 @@ struct Features {
     bool neon = false;
     /** ARM 8-bit dot product (sdot / udot, FEAT_DotProd). */
     bool dotprod = false;
+    /** ARM 8-bit matrix multiply (smmla, FEAT_I8MM). */
+    bool i8mm = false;
     /** x86-64 SSE4.1 detected on the running CPU. */
     bool sse4 = false;
     /** x86-64 AVX2 detected on the running CPU. */

@@ -48,6 +48,15 @@ const std::vector<Backend>& list() {
             o.matvec_q8k_batch = &neon_dotprod::matvec_batch_neon_q8k;
         }
 #endif
+#if defined(LOCUS_HAS_NEON_I8MM_VARIANT)
+        // Q8_0 through smmla in llama.cpp's float order: opt-in only
+        // (LOCUS_CPU_FAST), since it moves the low bits.
+        if (f.i8mm && cpu_fast()) {
+            Ops& o = b.back().ops;
+            o.matvec_q8k = &neon_i8mm::matvec_neon_q8k;
+            o.matvec_q8k_batch = &neon_i8mm::matvec_batch_neon_q8k;
+        }
+#endif
 #endif
 #if defined(__x86_64__)
         b.push_back({"avx2",

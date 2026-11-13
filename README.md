@@ -127,8 +127,10 @@ where the backend's int8 dot is the fast path (neon, sse4, scalar),
 as llama.cpp does; `LOCUS_F32_ACTIVATIONS=1` selects f32 activations.
 `LOCUS_CPU_FAST=1` opts in to CPU kernels with a different float order
 (today every CPU softmax: attention, MoE routing and the image
-encoders, about 2x faster): close to the default results but not
-bit-identical, so the goldens are checked without it.
+encoders, about 2x faster; and on ARM CPUs with i8mm, such as the
+M2 and later, Q8_0 weights through `smmla`, about 18% faster prefill
+on an M2 Pro): close to the default results but not bit-identical, so
+the goldens are checked without it.
 
 ### Validated models
 
