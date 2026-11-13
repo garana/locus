@@ -172,6 +172,19 @@ void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
     sys::ThreadPool::instance().parallel_for(n, fn);
 }
 
+void gelu(std::span<float> x) {
+    for (float& v : x) {
+        v = 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752440f));
+    }
+}
+
+void rms_norm(std::span<const float> x, std::span<const float> w, float eps,
+              std::uint32_t n, std::uint32_t d, std::span<float> out) {
+    parallel(n, [&](std::size_t t) {
+        backend::rmsnorm(x.subspan(t * d, d), w, eps, out.subspan(t * d, d));
+    });
+}
+
 void linear1(const backend::Ops& op, const backend::Mat& w,
              std::span<const float> b, std::span<const float> x,
              std::span<float> out) {
