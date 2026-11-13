@@ -1162,6 +1162,12 @@ bool TransformerModel::supports_batch_prefill() const {
 
 std::uint32_t TransformerModel::prefill_chunk() const {
     if (backend_->name != "vulkan") {
+        // A batched custom layer over many experts (kolibri1: 384, 6 a
+        // token) groups each chunk's picks per expert: at 64 tokens an
+        // expert gets one or two, so it takes a bigger chunk (i#739).
+        if (spec_->layer_batch != nullptr && hp_.n_expert > 0) {
+            return 512;  // Kolibri-1, 560 tokens: 64 -> 512 is +8%
+        }
         return 64;
     }
     // MoE prefill groups each chunk's (token, expert) pairs per expert

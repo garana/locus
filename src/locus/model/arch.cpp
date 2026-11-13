@@ -1612,12 +1612,17 @@ void kolibri1_layer_batch(const TransformerModel& m,
     std::vector<std::uint32_t> ids(std::size_t{n} * K);
     std::vector<float> wts(std::size_t{n} * K);
     {
+        // The router logits for every token at once (the per-token
+        // layer's op.matvec, batched).
+        std::vector<float> logits(std::size_t{n} * hp.n_expert);
+        matvec_batch(op, lay.gate_inp, xb, logits, n);
         std::vector<std::uint32_t> idx;
         std::vector<float> wgt;
         for (std::uint32_t t = 0; t < n; ++t) {
-            op.matvec(lay.gate_inp, row(xb, t), ws.router);
-            kolibri1_route(hp, lay, {ws.router.data(), hp.n_expert}, idx,
-                           wgt);
+            kolibri1_route(hp, lay,
+                           {logits.data() + std::size_t{t} * hp.n_expert,
+                            hp.n_expert},
+                           idx, wgt);
             std::copy_n(idx.begin(), K, ids.begin() + std::size_t{t} * K);
             std::copy_n(wgt.begin(), K, wts.begin() + std::size_t{t} * K);
         }

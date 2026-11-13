@@ -1091,14 +1091,15 @@ TEST_CASE("matvec_batch_neon BF16 and F16 tiles are byte-identical to "
 
 TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
           "[ops][batch][neon]") {
-    // n = 7: one 4-token pass and a 3-token tail. Q4_K / Q6_K take the
-    // multi-token sdot kernels (their own float order): within f32
-    // rounding of the scalar Q8_K dot, and a token's value does not
-    // depend on its place in the batch. Q5_K, Q3_K, IQ2_XXS and IQ2_S
-    // take 4-token kernels whose every token gets the scalar dot's bits
-    // (i#733, i#739), and block-32 types the bit-identical 4-token
-    // kernel: all equal matvec_neon_q8k exactly.
-    constexpr std::uint32_t rows = 5, n = 7;
+    // n = 11. Q4_K / Q6_K run two 4-token passes and a 3-token tail
+    // through their multi-token sdot kernels (their own float order):
+    // within f32 rounding of the scalar Q8_K dot, and a token's value
+    // does not depend on its place in the batch. Q5_K, Q3_K, IQ2_XXS
+    // and IQ2_S run one 8-token pass and a 3-token tail through kernels
+    // whose every token gets the scalar dot's bits (i#733, i#739), and
+    // block-32 types take the bit-identical 4-token kernel: all equal
+    // matvec_neon_q8k exactly.
+    constexpr std::uint32_t rows = 5, n = 11;
     std::mt19937 rng(101);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
     const auto tokens = [&](std::uint32_t cols) {

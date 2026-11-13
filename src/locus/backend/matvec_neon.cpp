@@ -920,13 +920,16 @@ void rows_iq2_xxs_q8k_xt(const std::byte* row, std::size_t nb,
         for (int t = 0; t < T; ++t) {
             const float d = dw * yd[t * ds + i];
             const std::int8_t* q8 = yq + t * qs + i * 256;
-            std::int32_t bsum = 0;
+            // ls * sumi per sub-block into four lanes, one horizontal
+            // add per block: the same exact integer bsum.
+            int32x4_t acc = vdupq_n_s32(0);
             for (int ib32 = 0; ib32 < 8; ++ib32) {
                 const int32x4_t p = vaddq_s32(
                     dot16(w[2 * ib32], vld1q_s8(q8 + 32 * ib32)),
                     dot16(w[2 * ib32 + 1], vld1q_s8(q8 + 32 * ib32 + 16)));
-                bsum += vaddvq_s32(p) * ls[ib32];
+                acc = vmlaq_n_s32(acc, p, ls[ib32]);
             }
+            const std::int32_t bsum = vaddvq_s32(acc);
             sumf[t] += d * static_cast<float>(bsum);
         }
     }
@@ -966,16 +969,18 @@ void rows_iq2_s_q8k_xt(const std::byte* row, std::size_t nb,
         for (int t = 0; t < T; ++t) {
             const float d = dw * yd[t * ds + i];
             const std::int8_t* q8 = yq + t * qs + i * 256;
-            std::int32_t bsum = 0;
+            // ls1 * sumi1 + ls2 * sumi2 per sub-block into four lanes,
+            // one horizontal add per block: the same exact bsum.
+            int32x4_t acc = vdupq_n_s32(0);
             for (int ib32 = 0; ib32 < 8; ++ib32) {
-                const std::int32_t sumi1 = vaddvq_s32(
-                    dot16(w[2 * ib32], vld1q_s8(q8 + 32 * ib32)));
-                const std::int32_t sumi2 = vaddvq_s32(
-                    dot16(w[2 * ib32 + 1], vld1q_s8(q8 + 32 * ib32 + 16)));
-                const int ls1 = 1 + 2 * (sc[ib32] & 0xf);
-                const int ls2 = 1 + 2 * (sc[ib32] >> 4);
-                bsum += ls1 * sumi1 + ls2 * sumi2;
+                acc = vmlaq_n_s32(acc,
+                                  dot16(w[2 * ib32], vld1q_s8(q8 + 32 * ib32)),
+                                  1 + 2 * (sc[ib32] & 0xf));
+                acc = vmlaq_n_s32(
+                    acc, dot16(w[2 * ib32 + 1], vld1q_s8(q8 + 32 * ib32 + 16)),
+                    1 + 2 * (sc[ib32] >> 4));
             }
+            const std::int32_t bsum = vaddvq_s32(acc);
             sumf[t] += d * static_cast<float>(bsum);
         }
     }
@@ -992,12 +997,13 @@ void rows_iq2_s_q8k_xt(const std::byte* row, std::size_t nb,
 inline void lanes8_madd(int8x16_t a, const std::int8_t* q,
                         std::int16_t scale, int32x4_t acc[2]) {
     const int8x16_t qv = vld1q_s8(q);
-    const int16x8_t lo = vmull_s8(vget_low_s8(a), vget_low_s8(qv));
-    const int16x8_t hi = vmull_s8(vget_high_s8(a), vget_high_s8(qv));
-    acc[0] = vmlal_n_s16(acc[0], vget_low_s16(lo), scale);
-    acc[1] = vmlal_n_s16(acc[1], vget_high_s16(lo), scale);
-    acc[0] = vmlal_n_s16(acc[0], vget_low_s16(hi), scale);
-    acc[1] = vmlal_n_s16(acc[1], vget_high_s16(hi), scale);
+    // Elements e and e + 8 share lane e % 8: their two products added
+    // in int16 (|a q| <= 31 * 128, so the pair fits), then scaled.
+    const int16x8_t p =
+        vmlal_s8(vmull_s8(vget_low_s8(a), vget_low_s8(qv)), vget_high_s8(a),
+                 vget_high_s8(qv));
+    acc[0] = vmlal_n_s16(acc[0], vget_low_s16(p), scale);
+    acc[1] = vmlal_n_s16(acc[1], vget_high_s16(p), scale);
 }
 
 /**
@@ -1289,7 +1295,7 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
         }
         const std::size_t bb = i733_block(w.type);
         const std::uint32_t tile = q8_token_tile(cols);
-        constexpr int kT = 4;
+        constexpr int kT = 8;
         float o4[kT];
         for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
             const std::uint32_t t1 = std::min(n, t0 + tile);
