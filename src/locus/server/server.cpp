@@ -89,6 +89,33 @@ struct SseKeepalive {
     }
 };
 
+/**
+ * Writes one step of a generation's SSE stream: payload, or a keepalive
+ * when one is due. When the client has gone, cancels the generation and
+ * drops its record (both no-ops if the terminal path already released
+ * it).
+ *
+ * @param terminal Whether this is the stream's last step; the sink is
+ *     then closed.
+ * @returns false when the stream is over: the client went away, or
+ *     terminal.
+ */
+bool write_sse_step(http::Sink& sink, SseKeepalive& ka, std::string& payload,
+                    EngineLoop& loop, std::uint64_t id, bool terminal) {
+    ka.pad(payload);
+    if (!payload.empty() &&
+        !sink.write(std::string_view(payload.data(), payload.size()))) {
+        loop.cancel(id);
+        loop.release(id);
+        return false;
+    }
+    if (terminal) {
+        sink.done();
+        return false;
+    }
+    return true;
+}
+
 /** The GPU ops for the embedding and rerank models' large passes
  *  (EmbeddingModel::kGpuMacs): the Vulkan image ops where the GPU
  *  imports host memory, as for PixArt (the weights stay in the GGUF
@@ -2313,19 +2340,8 @@ void OpenAiServer::install_routes() {
                     // engine record (the provider won't run again).
                     loop_.release(id);
                 }
-                ka.pad(payload);
-                if (!payload.empty() &&
-                    !sink.write(std::string_view(payload.data(),
-                                                 payload.size()))) {
-                    // Client vanished mid-stream: stop the generation
-                    // and drop the record (both no-ops if the terminal
-                    // path above already released it).
-                    loop_.cancel(id);
-                    loop_.release(id);
-                    return;
-                }
-                if (terminal) {
-                    sink.done();
+                if (!write_sse_step(sink, ka, payload, loop_, id,
+                                    terminal)) {
                     return;
                 }
               }
@@ -2661,19 +2677,8 @@ void OpenAiServer::install_routes() {
                     // Stream fully built from v; drop the record.
                     loop_.release(id);
                 }
-                ka.pad(payload);
-                if (!payload.empty() &&
-                    !sink.write(std::string_view(payload.data(),
-                                                 payload.size()))) {
-                    // Client vanished mid-stream: stop the generation
-                    // and drop the record (both no-ops if the terminal
-                    // path above already released it).
-                    loop_.cancel(id);
-                    loop_.release(id);
-                    return;
-                }
-                if (terminal) {
-                    sink.done();
+                if (!write_sse_step(sink, ka, payload, loop_, id,
+                                    terminal)) {
                     return;
                 }
               }
@@ -3833,19 +3838,11 @@ void OpenAiServer::install_routes() {
                         }
                         loop_.release(id);
                     }
-                    ka.pad(payload);
-                    if (!payload.empty() &&
-                        !sink.write(std::string_view(payload.data(),
-                                                     payload.size()))) {
-                        loop_.cancel(id);
-                        loop_.release(id);
+                    if (!write_sse_step(sink, ka, payload, loop_, id,
+                                        terminal)) {
                         return;
                     }
                     payload.clear();
-                    if (terminal) {
-                        sink.done();
-                        return;
-                    }
                 }
             });
     };
