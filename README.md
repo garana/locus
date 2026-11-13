@@ -130,8 +130,10 @@ where the backend's int8 dot is the fast path (neon, sse4, scalar),
 as llama.cpp does; `LOCUS_F32_ACTIVATIONS=1` selects f32 activations.
 `LOCUS_CPU_FAST=1` opts in to CPU kernels with a different float order
 (today every CPU softmax: attention, MoE routing and the image
-encoders, about 2x faster): close to the default results but not
-bit-identical, so the goldens are checked without it.
+encoders, about 2x faster; and on ARM CPUs with i8mm, such as the
+M2 and later, Q8_0 weights through `smmla`, about 27% faster prefill
+on an M2 Pro): close to the default results but not bit-identical, so
+the goldens are checked without it.
 
 ### Validated models
 
@@ -189,9 +191,10 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   parked: the edit's working set does not fit a 36 GiB host with the
   language model on the GPU).
 - Performance: prefill on Apple GPUs at 44% of Metal's (#10:
-  MoltenVK exposes no cooperative matrix), CPU prefill on x86 (#618),
-  batch-invariant decode at full speed on V3D (#511), the MoE hybrid on
-  Vulkan (#679).
+  MoltenVK exposes no cooperative matrix), CPU prefill (#618: about
+  60% of llama.cpp's on an M2 Pro with `LOCUS_CPU_FAST`, which uses
+  Apple's Accelerate there), batch-invariant decode at full speed on
+  V3D (#511).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
