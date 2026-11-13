@@ -59,13 +59,8 @@ void linear(const backend::Ops& op, const backend::Mat& w,
     });
 }
 
-/** T5's rms norm (no mean, no bias) over each of n rows of width d. */
-void rms_norm(std::span<const float> x, std::span<const float> w, float eps,
-              std::uint32_t n, std::uint32_t d, std::span<float> out) {
-    parallel(n, [&](std::size_t t) {
-        backend::rmsnorm(x.subspan(t * d, d), w, eps, out.subspan(t * d, d));
-    });
-}
+/** T5's rms norm (no mean, no bias): dense::rms_norm. */
+using dense::rms_norm;
 
 }  // namespace
 

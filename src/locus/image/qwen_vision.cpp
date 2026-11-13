@@ -12,22 +12,11 @@ namespace locus::image {
 
 namespace {
 
-/** Exact GELU (torch.nn.GELU(), approximate="none"). */
-void gelu(std::span<float> x) {
-    for (float& v : x) {
-        v = 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752440f));
-    }
-}
+using dense::gelu;
 
 using dense::parallel;
 
-/** RMSNorm with weight w over each of n rows of width d. */
-void rms_norm(std::span<const float> x, std::span<const float> w, float eps,
-              std::uint32_t n, std::uint32_t d, std::span<float> out) {
-    parallel(n, [&](std::size_t t) {
-        backend::rmsnorm(x.subspan(t * d, d), w, eps, out.subspan(t * d, d));
-    });
-}
+using dense::rms_norm;
 
 }  // namespace
 
