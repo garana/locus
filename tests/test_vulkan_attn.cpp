@@ -478,7 +478,8 @@ TEST_CASE("vulkan decode attention (flash) matches the CPU reference",
                 c.n_pos,   bt,      block_stride, row_w,
                 k_off,     v_off,   kv_stride,    c.group,
                 c.d1,      c.d2,    q1_stride,    q2_stride,
-                q2_off,    c.dv,    fbits(scale), c.dv};
+                q2_off,    c.dv,    fbits(scale), c.dv,
+                0,         blocks};
             ctx.dispatch(Kernel::kAttnDecode, bufs, push, blocks, c.heads);
             if (blocks > 1) {
                 const VulkanContext::Buffer cb[] = {partb, ob};
@@ -613,7 +614,8 @@ TEST_CASE("vulkan grouped decode attention matches the CPU reference",
                     c.n_pos,   bt,      block_stride, row_w,
                     k_off,     v_off,   kv_stride,    c.group,
                     c.d1,      c.d2,    q1_stride,    q2_stride,
-                    q2_off,    c.dv,    fbits(scale), c.dv};
+                    q2_off,    c.dv,    fbits(scale), c.dv,
+                    0,         blocks};
                 const Kernel k =
                     hg == 8 ? (f16 ? Kernel::kAttnDecodeGrp8F16
                                    : Kernel::kAttnDecodeGrp8)

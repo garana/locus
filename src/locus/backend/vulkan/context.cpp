@@ -208,6 +208,7 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matvec_q8_0_glu_b_spv.h"
 #include "attn_decode_spv.h"
 #include "attn_combine_spv.h"
+#include "attn_combine_part_spv.h"
 #include "matvec_q8_0_seg_spv.h"
 #include "matvec_q8_0_sh_b_spv.h"
 #include "matvec_q8_0_glu_sh_b_spv.h"
@@ -487,7 +488,7 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kMatvecQ8_0GluB, "matvec_q8_0_glu_b", locus_matvec_q8_0_glu_b_spv,
      sizeof(locus_matvec_q8_0_glu_b_spv), 5, 52},
     {Kernel::kAttnDecode, "attn_decode", locus_attn_decode_spv,
-     sizeof(locus_attn_decode_spv), 6, 64},
+     sizeof(locus_attn_decode_spv), 6, 72},
     {Kernel::kAttnCombine, "attn_combine", locus_attn_combine_spv,
      sizeof(locus_attn_combine_spv), 2, 16},
     {Kernel::kMatvecQ8_0Seg, "matvec_q8_0_seg", locus_matvec_q8_0_seg_spv,
@@ -498,7 +499,7 @@ constexpr KernelDesc kDescs[] = {
      locus_matvec_q8_0_glu_sh_b_spv, sizeof(locus_matvec_q8_0_glu_sh_b_spv), 7,
      60},
     {Kernel::kAttnDecodeGrp, "attn_decode_grp", locus_attn_decode_grp_spv,
-     sizeof(locus_attn_decode_grp_spv), 6, 64},
+     sizeof(locus_attn_decode_grp_spv), 6, 72},
     {Kernel::kMatmulQ8_0H, "matmul_q8_0_h", locus_matmul_q8_0_h_spv,
      sizeof(locus_matmul_q8_0_h_spv), 3, 96},
     {Kernel::kMatmulF32H, "matmul_f32_h", locus_matmul_f32_h_spv,
@@ -538,12 +539,12 @@ constexpr KernelDesc kDescs[] = {
      matmul_shared_bytes(VulkanContext::kMatmulBK),
      matmul_shared_bytes(VulkanContext::kMatmulBKSmall)},
     {Kernel::kAttnDecodeF16, "attn_decode_f16", locus_attn_decode_f16_spv,
-     sizeof(locus_attn_decode_f16_spv), 6, 64},
+     sizeof(locus_attn_decode_f16_spv), 6, 72},
     {Kernel::kKvScatterF16, "kv_scatter_f16", locus_kv_scatter_f16_spv,
      sizeof(locus_kv_scatter_f16_spv), 3, 40},
     {Kernel::kAttnDecodeGrpF16, "attn_decode_grp_f16",
      locus_attn_decode_grp_f16_spv, sizeof(locus_attn_decode_grp_f16_spv), 6,
-     64},
+     72},
     {Kernel::kRopeNeox, "rope_neox", locus_rope_neox_spv,
      sizeof(locus_rope_neox_spv), 2, 36},
     {Kernel::kRopeNeoxB, "rope_neox_b", locus_rope_neox_b_spv,
@@ -585,10 +586,10 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kConv2d, "conv2d", locus_conv2d_spv, sizeof(locus_conv2d_spv),
      4, 48},
     {Kernel::kAttnDecodeGrp8, "attn_decode_grp8",
-     locus_attn_decode_grp8_spv, sizeof(locus_attn_decode_grp8_spv), 6, 64},
+     locus_attn_decode_grp8_spv, sizeof(locus_attn_decode_grp8_spv), 6, 72},
     {Kernel::kAttnDecodeGrp8F16, "attn_decode_grp8_f16",
      locus_attn_decode_grp8_f16_spv,
-     sizeof(locus_attn_decode_grp8_f16_spv), 6, 64},
+     sizeof(locus_attn_decode_grp8_f16_spv), 6, 72},
     {Kernel::kMatvecBF16, "matvec_bf16", locus_matvec_bf16_spv,
      sizeof(locus_matvec_bf16_spv), 3, 28},
     {Kernel::kMatvecBF16B, "matvec_bf16_b", locus_matvec_bf16_b_spv,
@@ -691,6 +692,9 @@ constexpr KernelDesc kDescs[] = {
      flash_shared_bytes(VulkanContext::kFlashAttnRowsSmall, 16, 8)},
     {Kernel::kMatvecQ4_KGlu, "matvec_q4_k_glu", locus_matvec_q4_k_glu_spv,
      sizeof(locus_matvec_q4_k_glu_spv), 5, 28},
+    {Kernel::kAttnCombinePart, "attn_combine_part",
+     locus_attn_combine_part_spv, sizeof(locus_attn_combine_part_spv), 2,
+     24},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

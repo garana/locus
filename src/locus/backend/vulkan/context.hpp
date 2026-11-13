@@ -182,6 +182,9 @@ enum class Kernel {
     kFlashAttn,
     /** One token's Q4_K gate, up and silu_mul in one dispatch (i#688). */
     kMatvecQ4_KGlu,
+    /** attn_combine's round merge: one partial per round of blocks
+     *  (attn_combine_part, i#116). */
+    kAttnCombinePart,
     kCount_,
 };
 
