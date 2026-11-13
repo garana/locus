@@ -58,8 +58,35 @@ void rmsnorm_unit(std::span<float> x, float eps);
 void layernorm(std::span<const float> x, std::span<const float> w,
                float eps, std::span<float> out);
 
-/** In-place numerically-stable softmax over x. */
+/**
+ * In-place numerically-stable softmax over x. Bit-identical to the
+ * std::exp form by default; under LOCUS_CPU_FAST it runs
+ * softmax_fast_inplace instead (cpu_fast).
+ */
 void softmax_inplace(std::span<float> x);
+
+/**
+ * @returns Whether LOCUS_CPU_FAST is set to a value other than "0"
+ * (read once). It opts in to CPU kernels whose float order differs
+ * from the scalar reference: faster, close to it but not
+ * bit-identical, so outputs can move against the goldens.
+ */
+bool cpu_fast();
+
+/**
+ * @returns e^x from a degree-6 polynomial on x - n ln 2 scaled by 2^n
+ * (the Cephes expf form), within 2 ulp of std::exp for x in
+ * [-87.3, 88.3]; x below that range clamps to -87.3 (about 1e-38).
+ * Plain float ops, so a vectorized loop gives the same bits.
+ */
+float exp_fast(float x);
+
+/**
+ * Softmax over x with exp_fast and the max and sum kept in 8 fixed
+ * lanes, so the loops vectorize. Within a few ulp of softmax_inplace's
+ * default; the same bits on every arch (no contraction, fixed order).
+ */
+void softmax_fast_inplace(std::span<float> x);
 
 /**
  * out = silu(gate) * up, elementwise (SwiGLU FFN activation).

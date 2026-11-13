@@ -4,6 +4,7 @@
 #include <bit>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -1758,7 +1759,122 @@ void layernorm(std::span<const float> x, std::span<const float> w,
     }
 }
 
+bool cpu_fast() {
+    static const bool on = [] {
+        const char* v = std::getenv("LOCUS_CPU_FAST");
+        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+namespace {
+
+// Four floats in one register on every arch (SSE2 or NEON); the GCC and
+// clang vector extension, so this file needs no variant flags.
+using V4f = float __attribute__((vector_size(16)));
+using V4i = std::int32_t __attribute__((vector_size(16)));
+
+/** @returns a > b ? a : b per lane (a when either is a NaN). */
+float max_lane(float a, float b) { return b > a ? b : a; }
+V4f max_lane(V4f a, V4f b) {
+    const V4i m = b > a;
+    return (V4f)((m & (V4i)b) | (~m & (V4i)a));
+}
+
+/** @returns a < b ? a : b per lane. */
+float min_lane(float a, float b) { return b < a ? b : a; }
+V4f min_lane(V4f a, V4f b) {
+    const V4i m = b < a;
+    return (V4f)((m & (V4i)b) | (~m & (V4i)a));
+}
+
+/** @returns 2^n for an integral n in [-126, 127]. */
+float pow2_int(float n) {
+    const std::int32_t e = static_cast<std::int32_t>(n) + 127;
+    return std::bit_cast<float>(static_cast<std::uint32_t>(e) << 23);
+}
+V4f pow2_int(V4f n) {
+    return (V4f)((__builtin_convertvector(n, V4i) + 127) << 23);
+}
+
+/** exp_fast's steps on a float or four lanes, the same ops in order. */
+template <class F>
+F exp_poly(F x) {
+    // The magic constant 1.5 * 2^23 rounds x log2(e) to the nearest
+    // integer n without a round instruction (exact below 2^22).
+    constexpr float kRound = 12582912.0f;
+    x = min_lane(max_lane(x, F{} - 87.3f), F{} + 88.3f);
+    const F n = (x * 1.44269504f + kRound) - kRound;
+    // r = x - n ln 2, with ln 2 split in two so n * hi is exact.
+    const F r = (x - n * 0.693359375f) - n * -2.12194440e-4f;
+    F p = F{} + 1.9875691500e-4f;
+    p = p * r + 1.3981999507e-3f;
+    p = p * r + 8.3334519073e-3f;
+    p = p * r + 4.1665795894e-2f;
+    p = p * r + 1.6666665459e-1f;
+    p = p * r + 5.0000001201e-1f;
+    p = p * (r * r) + r + 1.0f;
+    return p * pow2_int(n);
+}
+
+V4f load4(const float* p) {
+    V4f v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+void store4(float* p, V4f v) { std::memcpy(p, &v, sizeof(v)); }
+
+}  // namespace
+
+float exp_fast(float x) { return exp_poly(x); }
+
+void softmax_fast_inplace(std::span<float> x) {
+    // Eight lanes: element i goes to lane i % 8 (two V4f), the tail
+    // to lanes 0, 1, ...; the lanes then add in a fixed tree.
+    const std::size_t n = x.size();
+    float* v = x.data();
+    V4f mx0 = V4f{} + v[0], mx1 = mx0;
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        mx0 = max_lane(mx0, load4(v + i));
+        mx1 = max_lane(mx1, load4(v + i + 4));
+    }
+    float m = v[0];
+    for (std::size_t l = 0; l < 4; ++l) {
+        m = max_lane(m, max_lane(mx0[l], mx1[l]));
+    }
+    for (; i < n; ++i) {
+        m = max_lane(m, v[i]);
+    }
+    V4f s0 = {}, s1 = {};
+    for (i = 0; i + 8 <= n; i += 8) {
+        const V4f e0 = exp_poly(load4(v + i) - m);
+        const V4f e1 = exp_poly(load4(v + i + 4) - m);
+        store4(v + i, e0);
+        store4(v + i + 4, e1);
+        s0 += e0;
+        s1 += e1;
+    }
+    float sum[8];
+    store4(sum, s0);
+    store4(sum + 4, s1);
+    for (std::size_t l = 0; i < n; ++i, ++l) {
+        v[i] = exp_poly(v[i] - m);
+        sum[l] += v[i];
+    }
+    const float s = ((sum[0] + sum[4]) + (sum[1] + sum[5])) +
+                    ((sum[2] + sum[6]) + (sum[3] + sum[7]));
+    for (i = 0; i < n; ++i) {
+        v[i] /= s;
+    }
+}
+
 void softmax_inplace(std::span<float> x) {
+    if (cpu_fast()) {
+        softmax_fast_inplace(x);
+        return;
+    }
     float mx = x[0];
     for (float v : x) {
         mx = std::max(mx, v);

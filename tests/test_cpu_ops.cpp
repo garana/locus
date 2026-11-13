@@ -117,6 +117,111 @@ TEST_CASE("softmax normalizes and orders", "[ops]") {
     REQUIRE(x[1] == Approx(0.75f));
 }
 
+namespace {
+
+/** The default softmax's float order, written out: std::exp, serial sum. */
+void softmax_ref(std::span<float> x) {
+    float mx = x[0];
+    for (float v : x) {
+        mx = std::max(mx, v);
+    }
+    float sum = 0.0f;
+    for (float& v : x) {
+        v = std::exp(v - mx);
+        sum += v;
+    }
+    for (float& v : x) {
+        v /= sum;
+    }
+}
+
+/** Random attention-like rows: lengths 1..300, scores in [-30, 30]. */
+std::vector<std::vector<float>> softmax_rows() {
+    std::mt19937 rng(705);
+    std::uniform_real_distribution<float> u(-30.0f, 30.0f);
+    std::vector<std::vector<float>> rows;
+    for (std::size_t n = 1; n <= 300; n += (n < 20 ? 1 : 37)) {
+        std::vector<float> r(n);
+        for (float& v : r) {
+            v = u(rng);
+        }
+        rows.push_back(std::move(r));
+    }
+    return rows;
+}
+
+}  // namespace
+
+TEST_CASE("exp_fast is within 2 ulp of std::exp", "[ops][fast]") {
+    REQUIRE(exp_fast(0.0f) == 1.0f);
+    for (float x = -87.0f; x <= 88.0f; x += 0.01171875f) {
+        const float ref = std::exp(x);
+        REQUIRE(std::abs(exp_fast(x) - ref) <= 2.4e-7f * ref);
+    }
+    // Below the range the result clamps to e^-87.3, not 0 or a NaN.
+    const float lo = exp_fast(-std::numeric_limits<float>::infinity());
+    REQUIRE(lo > 0.0f);
+    REQUIRE(lo < 2e-38f);
+    REQUIRE(exp_fast(-1000.0f) == lo);
+}
+
+TEST_CASE("softmax_fast_inplace is close to the default softmax",
+          "[ops][fast]") {
+    for (const auto& row : softmax_rows()) {
+        std::vector<float> ref = row;
+        std::vector<float> fast = row;
+        softmax_ref(ref);
+        softmax_fast_inplace(fast);
+        float total = 0.0f;
+        for (std::size_t i = 0; i < row.size(); ++i) {
+            REQUIRE(fast[i] == Approx(ref[i]).epsilon(2e-6).margin(1e-30));
+            total += fast[i];
+        }
+        REQUIRE(total == Approx(1.0f).epsilon(1e-5));
+    }
+}
+
+TEST_CASE("softmax_fast_inplace is scalar exp_fast in 8 fixed lanes",
+          "[ops][fast]") {
+    for (const auto& row : softmax_rows()) {
+        std::vector<float> ref = row;
+        float m = ref[0];
+        for (float v : ref) {
+            m = v > m ? v : m;
+        }
+        float sum[8] = {};
+        const std::size_t whole = ref.size() / 8 * 8;
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            ref[i] = exp_fast(ref[i] - m);
+            sum[i < whole ? i % 8 : i - whole] += ref[i];
+        }
+        const float s = ((sum[0] + sum[4]) + (sum[1] + sum[5])) +
+                        ((sum[2] + sum[6]) + (sum[3] + sum[7]));
+        for (float& v : ref) {
+            v /= s;
+        }
+        std::vector<float> got = row;
+        softmax_fast_inplace(got);
+        REQUIRE(std::memcmp(got.data(), ref.data(),
+                            ref.size() * sizeof(float)) == 0);
+    }
+}
+
+TEST_CASE("softmax_inplace without LOCUS_CPU_FAST keeps the std::exp bits",
+          "[ops][fast]") {
+    if (cpu_fast()) {
+        SKIP("LOCUS_CPU_FAST is set");
+    }
+    for (const auto& row : softmax_rows()) {
+        std::vector<float> ref = row;
+        std::vector<float> got = row;
+        softmax_ref(ref);
+        softmax_inplace(got);
+        REQUIRE(std::memcmp(got.data(), ref.data(),
+                            ref.size() * sizeof(float)) == 0);
+    }
+}
+
 TEST_CASE("silu_mul limits", "[ops]") {
     const float gate[] = {0.0f, 100.0f, -100.0f};
     const float up[] = {5.0f, 2.0f, 3.0f};
