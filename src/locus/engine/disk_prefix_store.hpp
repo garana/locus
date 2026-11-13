@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -143,6 +144,49 @@ class DiskPrefixStore {
     /** Virtual so a test can wrap the I/O (a slow or failing read). */
     virtual ~DiskPrefixStore() = default;
 
+  protected:
+    /**
+     * For a store that keeps its bytes elsewhere (HelperPrefixStore,
+     * i#655): the key, digests and file format of this class, no
+     * directory. The derived class overrides find, read and write.
+     */
+    DiskPrefixStore(DiskKey key, std::size_t block_bytes,
+                    std::uint64_t cap_bytes, std::nullptr_t no_dir);
+
+    /** @returns the digest naming `prompt`'s first `n_blocks` blocks. */
+    std::uint64_t digest_of(std::span<const tok::TokenId> prompt,
+                            std::uint32_t n_blocks) const;
+    /** @returns the digest of every block count 1..prompt blocks
+     *  (index 0 unused). */
+    std::vector<std::uint64_t> digests(
+        std::span<const tok::TokenId> prompt) const;
+    /** The serialized header for `n_blocks` blocks of `prompt`,
+     *  without its trailing checksum. */
+    std::vector<std::uint8_t> header(std::span<const tok::TokenId> prompt,
+                                     std::uint32_t n_blocks) const;
+    /** @returns the bytes of a file whose header has `header_bytes`. */
+    std::uint64_t file_bytes(std::size_t header_bytes,
+                             std::uint32_t n_blocks) const;
+    /**
+     * @returns the start of a file for `prompt`'s first `n_blocks`
+     *     blocks (the header, the block checksums of src[i] and the
+     *     header checksum); the blocks follow it in the file.
+     */
+    std::vector<std::uint8_t> meta(std::span<const tok::TokenId> prompt,
+                                   std::uint32_t n_blocks,
+                                   std::span<const std::uint8_t* const> src)
+        const;
+    /**
+     * Checks `blob` (one file's bytes) against this key, `prompt`'s
+     * first `n_blocks` blocks and every checksum, as read() checks a
+     * file, and copies block i into dst[i].
+     *
+     * @returns true when it matches; on false dst is unspecified.
+     */
+    bool decode(std::span<const std::uint8_t> blob,
+                std::span<const tok::TokenId> prompt, std::uint32_t n_blocks,
+                std::span<std::uint8_t* const> dst) const;
+
   private:
     struct File {
         std::uint64_t bytes = 0;
@@ -154,20 +198,7 @@ class DiskPrefixStore {
         std::uint64_t gen = 0;
     };
 
-    /** @returns the digest naming the files of the first `n_blocks`
-     *  blocks, for every n_blocks in 1..prompt blocks (index 0
-     *  unused). */
-    std::vector<std::uint64_t> digests(
-        std::span<const tok::TokenId> prompt) const;
-    std::uint64_t digest_of(std::span<const tok::TokenId> prompt,
-                            std::uint32_t n_blocks) const;
     std::filesystem::path path_of(std::uint64_t digest) const;
-    /** The serialized header for `n_blocks` blocks of `prompt`,
-     *  without its trailing checksum. */
-    std::vector<std::uint8_t> header(std::span<const tok::TokenId> prompt,
-                                     std::uint32_t n_blocks) const;
-    std::uint64_t file_bytes(std::size_t header_bytes,
-                             std::uint32_t n_blocks) const;
     /** Drops a file from the index when its gen is `gen` (0: any).
      *  @returns its path, for the caller to unlink after releasing the
      *  lock, or an empty path when nothing was dropped. */

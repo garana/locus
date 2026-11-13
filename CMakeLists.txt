@@ -32,6 +32,7 @@ add_library(locus
     src/locus/engine/disk_prefix_store.cpp
     src/locus/engine/disk_prefix_worker.cpp
     src/locus/engine/engine.cpp
+    src/locus/engine/helper_prefix_store.cpp
     src/locus/engine/metrics.cpp
     src/locus/engine/prefix_cache.cpp
     src/locus/auth/token_cache.cpp
@@ -160,6 +161,9 @@ target_link_libraries(locus-gguf PRIVATE locus)
 
 add_executable(locus-auth-helper tools/auth_helper_main.cpp)
 target_link_libraries(locus-auth-helper PRIVATE locus)
+
+add_executable(locus-prefix-helper tools/prefix_helper_main.cpp)
+target_link_libraries(locus-prefix-helper PRIVATE locus)
 
 add_executable(locus-stage tools/stage_main.cpp)
 target_link_libraries(locus-stage PRIVATE locus)
