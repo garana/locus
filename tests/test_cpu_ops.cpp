@@ -875,7 +875,7 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
         check(Mat{t, w.data(), rows, 8 * 256}, 50);
     }
     // Block-32 weights, 25 blocks a row (the odd tail block runs): Q8_0
-    // takes the SSE4 kernel, Q4_0 and IQ4_NL the scalar one per token.
+    // takes the SSE4 kernel, Q4_0 and IQ4_NL the nibble-decoding one.
     std::uniform_int_distribution<int> byte_d(0, 255);
     std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
     for (const auto& [t, bytes] : {std::pair{TensorType::kQ8_0, 34u},
