@@ -857,6 +857,26 @@ float row_q8_0_q8_0_sse4(const std::byte* row, const float* xd,
     constexpr std::size_t kBlk = 34;  // f16 scale + 32 int8
     __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
     std::size_t b = 0;
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+    // Block b in lanes 0-3 and b + 1 in 4-7 of one 256-bit sum: the same
+    // adds as s0 and s1 below.
+    __m256 s8 = _mm256_setzero_ps();
+    for (; b + 1 < nb; b += 2) {
+        const std::byte* b0 = row + b * kBlk;
+        const std::byte* b1 = b0 + kBlk;
+        const __m256 d = _mm256_set_m128(
+            _mm_set1_ps(f16_to_f32(load_u16(b1)) * xd[b + 1]),
+            _mm_set1_ps(f16_to_f32(load_u16(b0)) * xd[b]));
+        const __m256i p = _mm256_set_m128i(
+            block32_lanes_sse4(reinterpret_cast<const std::int8_t*>(b1 + 2),
+                               xq + (b + 1) * 32),
+            block32_lanes_sse4(reinterpret_cast<const std::int8_t*>(b0 + 2),
+                               xq + b * 32));
+        s8 = _mm256_add_ps(s8, _mm256_mul_ps(_mm256_cvtepi32_ps(p), d));
+    }
+    s0 = _mm256_castps256_ps128(s8);
+    s1 = _mm256_extractf128_ps(s8, 1);
+#else
     for (; b + 1 < nb; b += 2) {
         const std::byte* b0 = row + b * kBlk;
         const std::byte* b1 = b0 + kBlk;
@@ -869,6 +889,7 @@ float row_q8_0_q8_0_sse4(const std::byte* row, const float* xd,
         s0 = _mm_add_ps(s0, _mm_mul_ps(_mm_cvtepi32_ps(p0), _mm_set1_ps(d0)));
         s1 = _mm_add_ps(s1, _mm_mul_ps(_mm_cvtepi32_ps(p1), _mm_set1_ps(d1)));
     }
+#endif
     alignas(16) float l0[4], l1[4];
     _mm_store_ps(l0, s0);
     _mm_store_ps(l1, s1);
@@ -882,6 +903,85 @@ float row_q8_0_q8_0_sse4(const std::byte* row, const float* xd,
             reinterpret_cast<__m128i*>(p),
             block32_lanes_sse4(reinterpret_cast<const std::int8_t*>(blk + 2),
                                xq + b * 32));
+        sum += static_cast<float>(p[0] + p[1] + p[2] + p[3]) * d;
+    }
+    return sum;
+}
+
+/**
+ * One Q4_0 or IQ4_NL (18 B blocks) weight row dotted with a Q8_0
+ * activation, in row_q8_0_q8_0_sse4's float order (scalar
+ * vec_dot_block32_q8_0, which these types share with Q8_0). Each block
+ * is decoded to 32 int8 weights in two vectors first: weights 0-15 from
+ * the low nibbles, 16-31 from the high ones, minus 8 (Q4_0) or through
+ * kvalues_iq4nl (IQ4_NL), as scalar unpack_block32. The lane sums are
+ * then block32_lanes_sse4's, so the result is bit-identical.
+ */
+float row_nibble32_q8_0_sse4(bool iq4nl, const std::byte* row,
+                             const float* xd, const std::int8_t* xq,
+                             std::size_t nb) {
+    constexpr std::size_t kBlk = 18;  // f16 scale + 16 nibble bytes
+    const __m128i lo4 = _mm_set1_epi8(0x0f);
+    const __m128i table = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m128i eight = _mm_set1_epi8(8);
+    const auto lanes = [&](const std::byte* blk, const std::int8_t* x) {
+        const __m128i b =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 2));
+        __m128i w0 = _mm_and_si128(b, lo4);
+        __m128i w1 = _mm_and_si128(_mm_srli_epi16(b, 4), lo4);
+        if (iq4nl) {
+            w0 = _mm_shuffle_epi8(table, w0);
+            w1 = _mm_shuffle_epi8(table, w1);
+        } else {
+            w0 = _mm_sub_epi8(w0, eight);
+            w1 = _mm_sub_epi8(w1, eight);
+        }
+        const __m128i x0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x));
+        const __m128i x1 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + 16));
+        return _mm_add_epi32(lanes16_sse4(_mm_abs_epi8(w0), w0, x0),
+                             lanes16_sse4(_mm_abs_epi8(w1), w1, x1));
+    };
+    __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
+    std::size_t b = 0;
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+    // As row_q8_0_q8_0_sse4: blocks b, b + 1 in one 256-bit sum.
+    __m256 s8 = _mm256_setzero_ps();
+    for (; b + 1 < nb; b += 2) {
+        const std::byte* b0 = row + b * kBlk;
+        const std::byte* b1 = b0 + kBlk;
+        const __m256 d = _mm256_set_m128(
+            _mm_set1_ps(f16_to_f32(load_u16(b1)) * xd[b + 1]),
+            _mm_set1_ps(f16_to_f32(load_u16(b0)) * xd[b]));
+        const __m256i p = _mm256_set_m128i(lanes(b1, xq + (b + 1) * 32),
+                                           lanes(b0, xq + b * 32));
+        s8 = _mm256_add_ps(s8, _mm256_mul_ps(_mm256_cvtepi32_ps(p), d));
+    }
+    s0 = _mm256_castps256_ps128(s8);
+    s1 = _mm256_extractf128_ps(s8, 1);
+#else
+    for (; b + 1 < nb; b += 2) {
+        const std::byte* b0 = row + b * kBlk;
+        const std::byte* b1 = b0 + kBlk;
+        const float d0 = f16_to_f32(load_u16(b0)) * xd[b];
+        const float d1 = f16_to_f32(load_u16(b1)) * xd[b + 1];
+        const __m128i p0 = lanes(b0, xq + b * 32);
+        const __m128i p1 = lanes(b1, xq + (b + 1) * 32);
+        s0 = _mm_add_ps(s0, _mm_mul_ps(_mm_cvtepi32_ps(p0), _mm_set1_ps(d0)));
+        s1 = _mm_add_ps(s1, _mm_mul_ps(_mm_cvtepi32_ps(p1), _mm_set1_ps(d1)));
+    }
+#endif
+    alignas(16) float l0[4], l1[4];
+    _mm_store_ps(l0, s0);
+    _mm_store_ps(l1, s1);
+    float sum = ((l0[0] + l0[1]) + (l0[2] + l0[3])) +
+                ((l1[0] + l1[1]) + (l1[2] + l1[3]));
+    for (; b < nb; ++b) {
+        const std::byte* blk = row + b * kBlk;
+        const float d = f16_to_f32(load_u16(blk)) * xd[b];
+        alignas(16) std::int32_t p[4];
+        _mm_store_si128(reinterpret_cast<__m128i*>(p), lanes(blk, xq + b * 32));
         sum += static_cast<float>(p[0] + p[1] + p[2] + p[3]) * d;
     }
     return sum;
@@ -1241,67 +1341,471 @@ void iq2_group16(__m128i g, __m128i neg, __m128i q, int ls, __m128i& acc) {
 }
 
 /**
- * One IQ2_XXS (66 B) or IQ2_S (82 B) row against a Q8_K activation (plain
- * order), in scalar vec_dot_iq2_xxs_q8_k / vec_dot_iq2_s_q8_k's float
- * order: each block's integer sum (exact, so its add order is free),
- * times f16(d) * d_x, added to sumf, then 0.125 * sumf.
+ * One decoded 32-weight group of an IQ2 or IQ3 block: per 16 weights h,
+ * the unsigned grid bytes, the byte mask of the negated ones, and the
+ * scale (iq2_group16's operands).
  */
-float row_iq2_q8k_sse4(bool xxs, const std::byte* row, const Q8kAct& a,
-                       std::size_t nb) {
+struct IqGroup32 {
+    __m128i g[2];
+    __m128i neg[2];
+    int ls[2];
+};
+
+/** Block bytes, and the factor scalar applies to sumf, per IQ type. */
+std::size_t iq23_block_bytes(gguf::TensorType type) {
+    using T = gguf::TensorType;
+    switch (type) {
+        case T::kIQ2_XXS: return 66;
+        case T::kIQ2_XS: return 74;
+        case T::kIQ2_S: return 82;
+        case T::kIQ3_XXS: return 98;
+        default: return 110;  // kIQ3_S
+    }
+}
+float iq23_factor(gguf::TensorType type) {
+    using T = gguf::TensorType;
+    return type == T::kIQ3_XXS ? 0.25f : (type == T::kIQ3_S ? 1.0f : 0.125f);
+}
+
+/**
+ * Decodes group ib32 of the IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S
+ * block at u, as scalar vec_dot_iq{2,3}_*_q8_k reads it: IQ2 has four
+ * 8-byte grid entries and one sign byte per 8 weights; IQ3 eight 4-byte
+ * entries and one sign byte per 8 weights.
+ */
+IqGroup32 iq23_decode(gguf::TensorType type, const std::uint8_t* u,
+                      int ib32) {
+    using T = gguf::TensorType;
+    IqGroup32 r;
+    std::uint32_t s[4];
+    if (type == T::kIQ3_XXS || type == T::kIQ3_S) {
+        std::uint32_t g[8];
+        if (type == T::kIQ3_XXS) {
+            const std::uint8_t* q3 = u + 2 + 8 * ib32;
+            std::uint32_t aux32;
+            std::memcpy(&aux32, u + 66 + 4 * ib32, 4);
+            for (int k = 0; k < 8; ++k) {
+                g[k] = iq3xxs_grid[q3[k]];
+            }
+            for (int l = 0; l < 4; ++l) {
+                s[l] = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+            }
+            r.ls[0] = r.ls[1] = static_cast<int>(2 * (aux32 >> 28) + 1);
+        } else {
+            const std::uint8_t* qs = u + 2 + 8 * ib32;
+            const std::uint32_t qh = u[66 + ib32];
+            for (int l = 0; l < 4; ++l) {
+                g[2 * l] = iq3s_grid[qs[2 * l] | ((qh << (8 - 2 * l)) & 256)];
+                g[2 * l + 1] =
+                    iq3s_grid[qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)];
+                s[l] = u[74 + 4 * ib32 + l];
+            }
+            const std::uint32_t sc = u[106 + ib32 / 2];
+            r.ls[0] = r.ls[1] = static_cast<int>(
+                2 * ((ib32 & 1) == 0 ? (sc & 0xf) : (sc >> 4)) + 1);
+        }
+        for (int h = 0; h < 2; ++h) {
+            r.g[h] = _mm_setr_epi32(
+                static_cast<int>(g[4 * h]), static_cast<int>(g[4 * h + 1]),
+                static_cast<int>(g[4 * h + 2]), static_cast<int>(g[4 * h + 3]));
+        }
+    } else {
+        std::uint64_t g[4];
+        if (type == T::kIQ2_XXS) {
+            const std::uint8_t* p = u + 2 + 8 * ib32;
+            std::uint32_t aux1;
+            std::memcpy(&aux1, p + 4, 4);
+            for (int l = 0; l < 4; ++l) {
+                g[l] = iq2xxs_grid[p[l]];
+                s[l] = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
+            }
+            r.ls[0] = r.ls[1] = static_cast<int>(2 * (aux1 >> 28) + 1);
+        } else if (type == T::kIQ2_XS) {
+            // Four 16-bit words: a 9-bit grid index and a 7-bit ksigns
+            // index; two 4-bit scales at 66 + ib32.
+            for (int l = 0; l < 4; ++l) {
+                std::uint16_t q;
+                std::memcpy(&q, u + 2 + 2 * (4 * ib32 + l), 2);
+                g[l] = iq2xs_grid[q & 511];
+                s[l] = ksigns_iq2xs[q >> 9];
+            }
+            r.ls[0] = 2 * (u[66 + ib32] & 0xf) + 1;
+            r.ls[1] = 2 * (u[66 + ib32] >> 4) + 1;
+        } else {
+            const std::uint8_t* qs = u + 2 + 4 * ib32;
+            const std::uint8_t* signs = u + 34 + 4 * ib32;
+            const std::uint32_t qh = u[66 + ib32];
+            for (int l = 0; l < 4; ++l) {
+                g[l] = iq2s_grid[qs[l] | ((qh << (8 - 2 * l)) & 0x300)];
+                s[l] = signs[l];
+            }
+            r.ls[0] = 1 + 2 * (u[74 + ib32] & 0xf);
+            r.ls[1] = 1 + 2 * (u[74 + ib32] >> 4);
+        }
+        for (int h = 0; h < 2; ++h) {
+            r.g[h] = _mm_set_epi64x(static_cast<long long>(g[2 * h + 1]),
+                                    static_cast<long long>(g[2 * h]));
+        }
+    }
+    r.neg[0] = iq2_neg_mask(s[0], s[1]);
+    r.neg[1] = iq2_neg_mask(s[2], s[3]);
+    return r;
+}
+
+/**
+ * kT tokens' IQ2 / IQ3 row dots against Q8_K activations (plain order),
+ * each in scalar vec_dot_iq{2,3}_*_q8_k's float order: each block's
+ * integer sum (exact, so its add order is free), times f16(d) * d_x,
+ * added to sumf, then times the type's factor. Each group is decoded
+ * once for all kT tokens; a token's integer ops are the same for any kT,
+ * so out[t] is the one-token bits.
+ */
+template <int kT>
+void row_iq23_q8k_sse4(gguf::TensorType type, const std::byte* row,
+                       const Q8kAct* a, std::size_t nb, float* out) {
+    const std::size_t bytes = iq23_block_bytes(type);
+    float sumf[kT];
+    for (int t = 0; t < kT; ++t) {
+        sumf[t] = 0.0f;
+    }
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * bytes;
+        const float wd = f16_to_f32(load_u16(blk));
+        const auto* u = reinterpret_cast<const std::uint8_t*>(blk);
+        __m128i acc[kT];
+        for (int t = 0; t < kT; ++t) {
+            acc[t] = _mm_setzero_si128();
+        }
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const IqGroup32 grp = iq23_decode(type, u, ib32);
+            for (int t = 0; t < kT; ++t) {
+                const std::int8_t* q8 = a[t].qs + i * 256 + ib32 * 32;
+                for (int h = 0; h < 2; ++h) {
+                    iq2_group16(grp.g[h], grp.neg[h],
+                                _mm_loadu_si128(reinterpret_cast<
+                                                const __m128i*>(q8 + 16 * h)),
+                                grp.ls[h], acc[t]);
+                }
+            }
+        }
+        for (int t = 0; t < kT; ++t) {
+            const float d = wd * a[t].d[i];
+            sumf[t] += d * static_cast<float>(hsum_epi32_sse4(acc[t]));
+        }
+    }
+    const float f = iq23_factor(type);
+    for (int t = 0; t < kT; ++t) {
+        out[t] = f * sumf[t];
+    }
+}
+
+/**
+ * kT tokens' IQ1_S (50 B) or IQ1_M (56 B) row dots against Q8_K
+ * activations (plain order), each in scalar vec_dot_iq1_s_q8_k /
+ * vec_dot_iq1_m_q8_k's float order; each group is decoded once for all
+ * kT tokens. The grid values are -1, 0 or 1, so sign(q, grid) is each
+ * product exactly (Q8_K activations are never -128); maddubs by ones
+ * then madd by the scale gives the scaled sums, and for IQ1_M the
+ * per-8 activation sums times delta * scale. Every integer is exact,
+ * so the float steps (the scalar kernels') give the same bits.
+ */
+template <int kT>
+void row_iq1_q8k_sse4(bool m_type, const std::byte* row, const Q8kAct* a,
+                      std::size_t nb, float* out) {
+    constexpr float kDelta = 0.125f;  // IQ1S_DELTA / IQ1M_DELTA
+    const __m128i ones8 = _mm_set1_epi8(1);
+    // One token's 16 activations against 16 signed grid bytes: pair sums
+    // of the products per int16 lane.
+    const auto pair_sums = [&](__m128i g, const std::int8_t* q) {
+        return _mm_maddubs_epi16(
+            ones8,
+            _mm_sign_epi8(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(q)), g));
+    };
+    // int16 multipliers: lo in lanes 0-3, hi in 4-7.
+    const auto dv = [](int lo, int hi) {
+        return _mm_setr_epi16(
+            static_cast<short>(lo), static_cast<short>(lo),
+            static_cast<short>(lo), static_cast<short>(lo),
+            static_cast<short>(hi), static_cast<short>(hi),
+            static_cast<short>(hi), static_cast<short>(hi));
+    };
+    float sumf[kT];
+    for (int t = 0; t < kT; ++t) {
+        sumf[t] = 0.0f;
+    }
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * (m_type ? 56 : 50);
+        const auto* u = reinterpret_cast<const std::uint8_t*>(blk);
+        __m128i acc1[kT], acc2[kT];
+        std::int32_t sumi1_s[kT];  // IQ1_S: the delta term, from bsums
+        for (int t = 0; t < kT; ++t) {
+            acc1[t] = _mm_setzero_si128();
+            acc2[t] = _mm_setzero_si128();
+            sumi1_s[t] = 0;
+        }
+        std::uint16_t sc[4] = {};
+        if (m_type) {
+            std::memcpy(sc, u + 48, 8);
+        }
+        for (int ib = 0; ib < 8; ++ib) {
+            // Decode the group once: grid halves, scales and, for IQ1_M,
+            // the delta multipliers.
+            std::uint64_t g[4];
+            int ls1, ls2, delta_s = 1;
+            __m128i dm0 = _mm_setzero_si128(), dm1 = _mm_setzero_si128();
+            if (!m_type) {
+                const std::uint8_t* qs = u + 2 + 4 * ib;
+                std::uint16_t qh;
+                std::memcpy(&qh, u + 34 + 2 * ib, 2);
+                for (int l = 0; l < 4; ++l) {
+                    g[l] = iq1s_grid[qs[l] | (((qh >> (3 * l)) & 7) << 8)];
+                }
+                ls1 = ls2 = 2 * ((qh >> 12) & 7) + 1;
+                delta_s = (qh & 0x8000) ? -1 : 1;
+            } else {
+                const std::uint8_t* qs = u + 4 * ib;
+                const std::uint8_t* qh = u + 32 + 2 * ib;
+                for (int l = 0; l < 4; ++l) {
+                    g[l] = iq1s_grid[qs[l] |
+                                     ((static_cast<std::uint32_t>(qh[l / 2])
+                                       << (8 - 4 * (l % 2))) &
+                                      0x700)];
+                }
+                ls1 = 2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1;
+                ls2 = 2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1;
+                const int d0 = (qh[0] & 0x08) ? -1 : 1;
+                const int d1 = (qh[0] & 0x80) ? -1 : 1;
+                const int d2 = (qh[1] & 0x08) ? -1 : 1;
+                const int d3 = (qh[1] & 0x80) ? -1 : 1;
+                // Activation pair sums (lanes 0-3: weights 0-7, 4-7:
+                // 8-15) times delta[l] * ls.
+                dm0 = dv(d0 * ls1, d1 * ls1);
+                dm1 = dv(d2 * ls2, d3 * ls2);
+            }
+            const __m128i g0 = _mm_set_epi64x(static_cast<long long>(g[1]),
+                                              static_cast<long long>(g[0]));
+            const __m128i g1 = _mm_set_epi64x(static_cast<long long>(g[3]),
+                                              static_cast<long long>(g[2]));
+            const __m128i ls1v = _mm_set1_epi16(static_cast<short>(ls1));
+            const __m128i ls2v = _mm_set1_epi16(static_cast<short>(ls2));
+            for (int t = 0; t < kT; ++t) {
+                const std::int8_t* q8 = a[t].qs + i * 256 + ib * 32;
+                acc1[t] = _mm_add_epi32(
+                    acc1[t], _mm_madd_epi16(pair_sums(g0, q8), ls1v));
+                acc1[t] = _mm_add_epi32(
+                    acc1[t], _mm_madd_epi16(pair_sums(g1, q8 + 16), ls2v));
+                if (!m_type) {
+                    sumi1_s[t] += ls1 * delta_s *
+                                  (a[t].bsums[i * 16 + 2 * ib] +
+                                   a[t].bsums[i * 16 + 2 * ib + 1]);
+                } else {
+                    const __m128i q0 = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(q8));
+                    const __m128i q1 = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(q8 + 16));
+                    acc2[t] = _mm_add_epi32(
+                        acc2[t],
+                        _mm_madd_epi16(_mm_maddubs_epi16(ones8, q0), dm0));
+                    acc2[t] = _mm_add_epi32(
+                        acc2[t],
+                        _mm_madd_epi16(_mm_maddubs_epi16(ones8, q1), dm1));
+                }
+            }
+        }
+        for (int t = 0; t < kT; ++t) {
+            const std::int32_t sumi1 = hsum_epi32_sse4(acc1[t]);
+            if (!m_type) {
+                const float d = f16_to_f32(load_u16(blk)) * a[t].d[i];
+                sumf[t] += d * (static_cast<float>(sumi1) +
+                                kDelta * static_cast<float>(sumi1_s[t]));
+            } else {
+                const std::uint16_t scale_u16 =
+                    (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                    ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+                const std::int32_t sumi2 = hsum_epi32_sse4(acc2[t]);
+                sumf[t] += f16_to_f32(scale_u16) * a[t].d[i] *
+                           (static_cast<float>(sumi1) +
+                            kDelta * static_cast<float>(sumi2));
+            }
+        }
+    }
+    for (int t = 0; t < kT; ++t) {
+        out[t] = sumf[t];
+    }
+}
+
+/**
+ * One TQ1_0 (54 B) or TQ2_0 (66 B) row against a Q8_K activation (plain
+ * order), in scalar vec_dot_tq1_0_q8_k / vec_dot_tq2_0_q8_k's float
+ * order. Each weight is a digit c in {0, 1, 2} (TQ2_0: up to 3) minus 1,
+ * and every activation of the block is used once, so the block's sum is
+ * sum(c * q8) - sum(q8): maddubs on the digits, minus the activation's
+ * block sums. Both are exact, so the float steps (the scalar's) give the
+ * same bits.
+ */
+float row_tq_q8k_sse4(bool tq1, const std::byte* row, const Q8kAct& a,
+                      std::size_t nb) {
+    const __m128i ones16 = _mm_set1_epi16(1);
+    // c (16 unsigned digits) dotted with 16 activations, into int32 lanes.
+    const auto dot = [&](__m128i c, const std::int8_t* q, __m128i& acc) {
+        acc = _mm_add_epi32(
+            acc, _mm_madd_epi16(
+                     _mm_maddubs_epi16(
+                         c, _mm_loadu_si128(
+                                reinterpret_cast<const __m128i*>(q))),
+                     ones16));
+    };
+    // TQ1_0's base-3 digit of 16 bytes b at per-lane multipliers
+    // (mlo for bytes 0-7, mhi for 8-15): ((b * m) mod 256 * 3) >> 8.
+    const auto digit = [](__m128i b, __m128i mlo, __m128i mhi) {
+        const __m128i lo8 = _mm_set1_epi16(0xff);
+        const auto one = [&](__m128i w, __m128i m) {
+            const __m128i q = _mm_and_si128(_mm_mullo_epi16(w, m), lo8);
+            return _mm_srli_epi16(_mm_mullo_epi16(q, _mm_set1_epi16(3)), 8);
+        };
+        return _mm_packus_epi16(one(_mm_cvtepu8_epi16(b), mlo),
+                                one(_mm_cvtepu8_epi16(_mm_srli_si128(b, 8)),
+                                    mhi));
+    };
+    static constexpr short kPow3[5] = {1, 3, 9, 27, 81};
     float sumf = 0.0f;
     for (std::size_t i = 0; i < nb; ++i) {
-        const std::byte* blk = row + i * (xxs ? 66 : 82);
-        const float d = f16_to_f32(load_u16(blk)) * a.d[i];
-        const std::int8_t* q8 = a.qs + i * 256;
+        const std::byte* blk = row + i * (tq1 ? 54 : 66);
         const auto* u = reinterpret_cast<const std::uint8_t*>(blk);
+        const std::int8_t* q8 = a.qs + i * 256;
         __m128i acc = _mm_setzero_si128();
-        for (int ib32 = 0; ib32 < 8; ++ib32) {
-            const __m128i q0 = _mm_loadu_si128(
-                reinterpret_cast<const __m128i*>(q8 + ib32 * 32));
-            const __m128i q1 = _mm_loadu_si128(
-                reinterpret_cast<const __m128i*>(q8 + ib32 * 32 + 16));
-            std::uint64_t g[4];
-            std::uint32_t s[4];
-            int ls1, ls2;
-            if (xxs) {
-                const std::uint8_t* p = u + 2 + 8 * ib32;
-                std::uint32_t aux1;
-                std::memcpy(&aux1, p + 4, 4);
-                for (int l = 0; l < 4; ++l) {
-                    g[l] = iq2xxs_grid[p[l]];
-                    s[l] = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
-                }
-                ls1 = ls2 = static_cast<int>(2 * (aux1 >> 28) + 1);
-            } else {
-                const std::uint8_t* qs = u + 2 + 4 * ib32;
-                const std::uint8_t* signs = u + 34 + 4 * ib32;
-                const std::uint32_t qh = u[66 + ib32];
-                for (int l = 0; l < 4; ++l) {
-                    g[l] = iq2s_grid[qs[l] | ((qh << (8 - 2 * l)) & 0x300)];
-                    s[l] = signs[l];
-                }
-                ls1 = 1 + 2 * (u[74 + ib32] & 0xf);
-                ls2 = 1 + 2 * (u[74 + ib32] >> 4);
+        if (tq1) {
+            const __m128i b0 =
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(u));
+            const __m128i b1 =
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(u + 16));
+            const __m128i b2 =
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(u + 32));
+            for (int l = 0; l < 5; ++l) {
+                const __m128i m = _mm_set1_epi16(kPow3[l]);
+                dot(digit(b0, m, m), q8 + l * 32, acc);
+                dot(digit(b1, m, m), q8 + l * 32 + 16, acc);
+                dot(digit(b2, m, m), q8 + 160 + l * 16, acc);
             }
-            iq2_group16(_mm_set_epi64x(static_cast<long long>(g[1]),
-                                       static_cast<long long>(g[0])),
-                        iq2_neg_mask(s[0], s[1]), q0, ls1, acc);
-            iq2_group16(_mm_set_epi64x(static_cast<long long>(g[3]),
-                                       static_cast<long long>(g[2])),
-                        iq2_neg_mask(s[2], s[3]), q1, ls2, acc);
+            // qh[0..3] for l = 0..3 lands at q8[240 + 4 l + j]: one
+            // vector of qh repeated four times, multiplier pow3[l].
+            std::uint32_t qh;
+            std::memcpy(&qh, u + 48, 4);
+            const __m128i h = _mm_set1_epi32(static_cast<int>(qh));
+            dot(digit(h, _mm_setr_epi16(1, 1, 1, 1, 3, 3, 3, 3),
+                      _mm_setr_epi16(9, 9, 9, 9, 27, 27, 27, 27)),
+                q8 + 240, acc);
+        } else {
+            const __m128i m3 = _mm_set1_epi8(3);
+            for (int h = 0; h < 2; ++h) {
+                const __m128i b0 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(u + 32 * h));
+                const __m128i b1 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(u + 32 * h + 16));
+                for (int l = 0; l < 4; ++l) {
+                    const __m128i s = _mm_cvtsi32_si128(2 * l);
+                    dot(_mm_and_si128(_mm_srl_epi16(b0, s), m3),
+                        q8 + 128 * h + 32 * l, acc);
+                    dot(_mm_and_si128(_mm_srl_epi16(b1, s), m3),
+                        q8 + 128 * h + 32 * l + 16, acc);
+                }
+            }
         }
-        sumf += d * static_cast<float>(hsum_epi32_sse4(acc));
+        // sum(q8) over the block: its 16 block sums.
+        const std::int16_t* bs = a.bsums + i * 16;
+        const __m128i bsum = _mm_add_epi32(
+            _mm_madd_epi16(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bs)),
+                ones16),
+            _mm_madd_epi16(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(bs + 8)),
+                ones16));
+        const std::int32_t sumi =
+            hsum_epi32_sse4(acc) - hsum_epi32_sse4(bsum);
+        if (tq1) {
+            const float bd = f16_to_f32(load_u16(blk + 52));
+            sumf += static_cast<float>(sumi) * (bd * a.d[i]);
+        } else {
+            const float bd = f16_to_f32(load_u16(blk + 64));
+            sumf += static_cast<float>(sumi) * (a.d[i] * bd);
+        }
     }
-    return 0.125f * sumf;
+    return sumf;
+}
+
+/**
+ * One IQ4_XS (136 B) row against a Q8_K activation (plain order), in
+ * scalar vec_dot_iq4_xs_q8_k's float order: each 32-weight group's
+ * integer sum (exact), times d4d8 * (ls - 32), added to sumf in group
+ * order. The 4-bit codes map through kvalues_iq4nl with one pshufb;
+ * the products go through maddubs(|v|, sign(q, v)), which is exact
+ * because Q8_K activations stay in [-127, 127] (never -128).
+ */
+float row_iq4_xs_q8k_sse4(const std::byte* row, const Q8kAct& a,
+                          std::size_t nb) {
+    const __m128i table = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m128i lo4 = _mm_set1_epi8(0x0f);
+    const __m128i ones = _mm_set1_epi16(1);
+    // The signed sum of 16 codes (as values) times 16 activations.
+    const auto dot16 = [&](__m128i codes, __m128i q) {
+        const __m128i v = _mm_shuffle_epi8(table, codes);
+        return _mm_madd_epi16(
+            _mm_maddubs_epi16(_mm_abs_epi8(v), _mm_sign_epi8(q, v)), ones);
+    };
+    float sumf = 0.0f;
+    for (std::size_t ibl = 0; ibl < nb; ++ibl) {
+        const std::byte* blk = row + ibl * 136;
+        const float d4d8 = f16_to_f32(load_u16(blk)) * a.d[ibl];
+        std::uint16_t h;
+        std::memcpy(&h, blk + 2, 2);
+        const auto* scales_l = reinterpret_cast<const std::uint8_t*>(blk + 4);
+        const auto* qs = reinterpret_cast<const std::uint8_t*>(blk + 8);
+        const std::int8_t* q8 = a.qs + ibl * 256;
+        for (int ib = 0; ib < 8; ++ib) {
+            // ls: the low nibble (even ib) or high nibble (odd ib) of
+            // scales_l[ib / 2], with 2 bits of h on top.
+            const int sl = (ib & 1) == 0 ? (scales_l[ib / 2] & 0xf)
+                                         : (scales_l[ib / 2] >> 4);
+            const int ls = sl | (((h >> (2 * ib)) & 3) << 4);
+            const __m128i b = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(qs + ib * 16));
+            const __m128i q0 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(q8 + ib * 32));
+            const __m128i q1 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(q8 + ib * 32 + 16));
+            const __m128i s = _mm_add_epi32(
+                dot16(_mm_and_si128(b, lo4), q0),
+                dot16(_mm_and_si128(_mm_srli_epi16(b, 4), lo4), q1));
+            sumf += d4d8 * static_cast<float>(ls - 32) *
+                    static_cast<float>(hsum_epi32_sse4(s));
+        }
+    }
+    return sumf;
 }
 
 /** Which row kernel a weight takes under Q8_K / Q8_0 activations. */
-enum class Q8Path { kBlock32, kQ2K, kK, kIQ2, kOther };
+enum class Q8Path {
+    kBlock32,      // Q8_0
+    kBlock32Nib,   // Q4_0, IQ4_NL: nibbles decoded, then Q8_0's lanes
+    kQ2K,
+    kK,
+    kIQ1,
+    kIQ2,
+    kIQ3,
+    kIQ4XS,
+    kTQ,
+    kOther
+};
 
 Q8Path q8_path(gguf::TensorType type, std::size_t cols) {
     using T = gguf::TensorType;
     if (type == T::kQ8_0 && cols % 32 == 0) {
         return Q8Path::kBlock32;
+    }
+    if ((type == T::kQ4_0 || type == T::kIQ4_NL) && cols % 32 == 0) {
+        return Q8Path::kBlock32Nib;
     }
     if (cols % 256 != 0) {
         return Q8Path::kOther;
@@ -1313,21 +1817,47 @@ Q8Path q8_path(gguf::TensorType type, std::size_t cols) {
         type == T::kQ6_K) {
         return Q8Path::kK;
     }
-    if (type == T::kIQ2_XXS || type == T::kIQ2_S) {
+    if (type == T::kIQ2_XXS || type == T::kIQ2_XS || type == T::kIQ2_S) {
         return Q8Path::kIQ2;
+    }
+    if (type == T::kIQ4_XS) {
+        return Q8Path::kIQ4XS;
+    }
+    if (type == T::kIQ3_XXS || type == T::kIQ3_S) {
+        return Q8Path::kIQ3;
+    }
+    if (type == T::kTQ1_0 || type == T::kTQ2_0) {
+        return Q8Path::kTQ;
+    }
+    if (type == T::kIQ1_S || type == T::kIQ1_M) {
+        return Q8Path::kIQ1;
     }
     return Q8Path::kOther;
 }
 
-/** The per-token row kernel for a kQ2K, kK or kIQ2 weight. */
+/** The per-token row kernel for a kQ2K, kK or IQ (kIQ2, kIQ3, kIQ4XS)
+ *  weight. */
 float row_q8k_sse4(Q8Path path, gguf::TensorType type, const std::byte* row,
                    const Q8kAct& a, std::size_t nb) {
     if (path == Q8Path::kQ2K) {
         return row_q2_k_q8k_sse4(row, a, nb);
     }
-    if (path == Q8Path::kIQ2) {
-        return row_iq2_q8k_sse4(type == gguf::TensorType::kIQ2_XXS, row, a,
-                                nb);
+    if (path == Q8Path::kIQ2 || path == Q8Path::kIQ3) {
+        float o;
+        row_iq23_q8k_sse4<1>(type, row, &a, nb, &o);
+        return o;
+    }
+    if (path == Q8Path::kIQ4XS) {
+        return row_iq4_xs_q8k_sse4(row, a, nb);
+    }
+    if (path == Q8Path::kTQ) {
+        return row_tq_q8k_sse4(type == gguf::TensorType::kTQ1_0, row, a, nb);
+    }
+    if (path == Q8Path::kIQ1) {
+        float o;
+        row_iq1_q8k_sse4<1>(type == gguf::TensorType::kIQ1_M, row, &a, nb,
+                            &o);
+        return o;
     }
     return row_k_q8k_sse4(type, row, a, nb);
 }
@@ -1358,14 +1888,19 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
         matvec_q8k(w, x, out);  // other types: scalar Q8_K / Q8_0
         return;
     }
-    if (path == Q8Path::kBlock32) {
+    if (path == Q8Path::kBlock32 || path == Q8Path::kBlock32Nib) {
         const std::size_t nb = cols / 32;
         std::vector<float> xd(nb);
         std::vector<std::int8_t> xq(cols);
         quantize_activation_q8_0(x, xd.data(), xq.data());
+        const bool iq4nl = w.type == gguf::TensorType::kIQ4_NL;
         for (std::uint32_t r = 0; r < w.rows; ++r) {
-            out[r] = row_q8_0_q8_0_sse4(w.data + r * nb * 34, xd.data(),
-                                        xq.data(), nb);
+            out[r] = path == Q8Path::kBlock32
+                         ? row_q8_0_q8_0_sse4(w.data + r * nb * 34,
+                                              xd.data(), xq.data(), nb)
+                         : row_nibble32_q8_0_sse4(iq4nl,
+                                                  w.data + r * nb * 18,
+                                                  xd.data(), xq.data(), nb);
         }
         return;
     }
@@ -1408,6 +1943,33 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
     const std::uint32_t tile = static_cast<std::uint32_t>(
         std::max<std::size_t>(1, (std::size_t{96} << 10) / cols));
     const std::size_t row_bytes = mat_row_bytes(w);
+    if (path == Q8Path::kBlock32Nib) {
+        // Q4_0 / IQ4_NL: each token quantized once, then the per-token
+        // row kernel over a tile of tokens while the row is in cache.
+        const std::size_t nb = cols / 32;
+        thread_local std::vector<float> xd;
+        thread_local std::vector<std::int8_t> xq;
+        xd.resize(nb * n);
+        xq.resize(cols * n);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            quantize_activation_q8_0(x_batch.subspan(t * cols, cols),
+                                     xd.data() + t * nb, xq.data() + t * cols);
+        }
+        const bool iq4nl = w.type == gguf::TensorType::kIQ4_NL;
+        for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
+            const std::uint32_t t1 = std::min(n, t0 + tile);
+            for (std::uint32_t r = 0; r < w.rows; ++r) {
+                const std::byte* row = w.data + r * row_bytes;
+                float* o = out_batch.data() + std::size_t{r} * n;
+                for (std::uint32_t t = t0; t < t1; ++t) {
+                    o[t] = row_nibble32_q8_0_sse4(iq4nl, row,
+                                                  xd.data() + t * nb,
+                                                  xq.data() + t * cols, nb);
+                }
+            }
+        }
+        return;
+    }
     if (path == Q8Path::kBlock32) {
         const std::size_t nb = cols / 32;
         thread_local std::vector<float> xd;
@@ -1477,6 +2039,22 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
                         row_q4_k_q8k_sse4_xt<kT>(row, a4, nb, o + t);
                     } else {
                         row_q6_k_q8k_sse4_xt<kT>(row, a4, nb, o + t);
+                    }
+                }
+            }
+            if (path == Q8Path::kIQ1 || path == Q8Path::kIQ2 ||
+                path == Q8Path::kIQ3) {
+                // Each group decoded once for four tokens.
+                constexpr int kT = 4;
+                for (; t + kT <= t1; t += kT) {
+                    const Q8kAct a4[kT] = {act(t), act(t + 1), act(t + 2),
+                                           act(t + 3)};
+                    if (path == Q8Path::kIQ1) {
+                        row_iq1_q8k_sse4<kT>(
+                            w.type == gguf::TensorType::kIQ1_M, row, a4, nb,
+                            o + t);
+                    } else {
+                        row_iq23_q8k_sse4<kT>(w.type, row, a4, nb, o + t);
                     }
                 }
             }
