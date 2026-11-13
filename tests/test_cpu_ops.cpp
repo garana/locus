@@ -980,7 +980,7 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
         check(Mat{t, w.data(), rows, 8 * 256}, 50);
     }
     // Block-32 weights, 25 blocks a row (the odd tail block runs): Q8_0
-    // takes the SSE4 kernel, Q4_0 and IQ4_NL the scalar one per token.
+    // takes the SSE4 kernel, Q4_0 and IQ4_NL the nibble-decoding one.
     std::uniform_int_distribution<int> byte_d(0, 255);
     std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
     for (const auto& [t, bytes] : {std::pair{TensorType::kQ8_0, 34u},
@@ -995,6 +995,46 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
             std::memcpy(w.data() + bl * bytes, &d, 2);
         }
         check(Mat{t, w.data(), rows, 800}, 7);
+    }
+    // The IQ types with an sse4 dot: random bytes are valid codes, signs
+    // and scales; 8 blocks a row, 50 tokens over two tiles.
+    for (const auto& [t, bytes] : {std::pair{TensorType::kIQ2_XXS, 66u},
+                                   std::pair{TensorType::kIQ2_S, 82u},
+                                   std::pair{TensorType::kIQ4_XS, 136u},
+                                   std::pair{TensorType::kIQ3_XXS, 98u},
+                                   std::pair{TensorType::kIQ3_S, 110u},
+                                   std::pair{TensorType::kIQ1_S, 50u},
+                                   std::pair{TensorType::kIQ1_M, 56u},
+                                   std::pair{TensorType::kIQ2_XS, 74u},
+                                   std::pair{TensorType::kTQ1_0, 54u},
+                                   std::pair{TensorType::kTQ2_0, 66u}}) {
+        std::vector<std::byte> w(std::size_t{rows} * 8 * bytes);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / bytes; ++bl) {
+            const std::uint16_t d = f32_to_f16(scale_d(rng));
+            std::byte* blk = w.data() + bl * bytes;
+            if (t == TensorType::kTQ1_0 || t == TensorType::kTQ2_0) {
+                // The ternary types keep their f16 scale last.
+                std::memcpy(blk + bytes - 2, &d, 2);
+                continue;
+            }
+            if (t != TensorType::kIQ1_M) {
+                std::memcpy(blk, &d, 2);
+                continue;
+            }
+            // IQ1_M's f16 scale is the top nibbles of the four 16-bit
+            // words at 48 (random ones could be inf / NaN).
+            std::uint16_t sc[4];
+            std::memcpy(sc, blk + 48, 8);
+            for (int k = 0; k < 4; ++k) {
+                sc[k] = static_cast<std::uint16_t>(
+                    (sc[k] & 0x0fff) | (((d >> (4 * k)) & 0xf) << 12));
+            }
+            std::memcpy(blk + 48, sc, 8);
+        }
+        check(Mat{t, w.data(), rows, 8 * 256}, 50);
     }
     // The maddubs edges (i#708): every weight -128 (|w| reads as 128
     // unsigned) against activations that quantize to +-127 in every

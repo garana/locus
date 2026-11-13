@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <numeric>
 #include <unordered_map>
@@ -24,14 +25,15 @@ using locus::model::TransformerModel;
 
 namespace {
 
-/** Vulkan's fallbacks off the whole-token forward so far (per-op
- *  matvecs, host-routed experts), any reason. */
+/** Vulkan's fallbacks off the GPU forwards so far (per-op matvecs,
+ *  host-routed experts, a declined batched prefill), any reason. */
 std::uint64_t vulkan_fallbacks() {
     std::uint64_t n = 0;
     locus::backend::for_each_fallback(
         [&](const locus::backend::Fallback& f) {
             if (f.from == "vulkan" &&
-                (f.to == "per_op" || f.to == "host_route")) {
+                (f.to == "per_op" || f.to == "host_route" ||
+                 f.to == "per_token")) {
                 n += f.n.load();
             }
         });
@@ -418,6 +420,61 @@ TEST_CASE("kolibri1 matches the reference graph", "[model][kolibri1]") {
                           want[p].begin());
             }
         }
+    }
+}
+
+// i#730: Vulkan's batched prefill against its per-token forward, every
+// position's logits, with the window of 3 on layer 0 met at chunk
+// boundaries. Chunks of 6 or more (2 of 6 experts a token: shorter
+// chunks average under 2 tokens an expert, and forward_batch runs those
+// token by token): 6 + 10 (the query at 6 sees 4 .. 6 across the
+// boundary; from 8 on the window has crossed it), 8 + 8, and one chunk
+// of 16 (every window inside it).
+TEST_CASE("kolibri1 batched Vulkan prefill tracks the per-token forward",
+          "[model][kolibri1][vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device");
+    }
+    const std::vector<int> toks = {3,  17, 9,  30, 1,  22, 5,  14,
+                                   27, 8,  11, 2,  19, 25, 6,  31};
+    const auto ts = make_tensors();
+    auto img = build_image(ts, false);
+    auto g = locus::gguf::GgufFile::parse(img);
+    auto model = TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+    const auto want = run(model, toks);
+    const std::uint32_t V = model.hparams().n_vocab;
+    const std::vector<std::vector<std::size_t>> plans = {
+        {6, 10}, {8, 8}, {16}};
+    for (const std::vector<std::size_t>& chunks : plans) {
+        INFO("first chunk " << chunks[0]);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        const std::uint64_t fb0 = vulkan_fallbacks();
+        std::size_t at = 0;
+        for (const std::size_t nb : chunks) {
+            std::vector<locus::tok::TokenId> ids(toks.begin() + at,
+                                                 toks.begin() + at + nb);
+            std::vector<float> logits(nb * V);
+            REQUIRE(cache.ensure_capacity(seq,
+                                          static_cast<std::uint32_t>(nb)));
+            model.forward_batch(ids, cache, seq, ws, logits, true);
+            for (std::size_t t = 0; t < nb; ++t) {
+                INFO("position " << at + t);
+                double err = 0.0, ref = 0.0;
+                for (std::uint32_t i = 0; i < V; ++i) {
+                    err = std::max(err, std::abs(double(logits[t * V + i]) -
+                                                 want[at + t][i]));
+                    ref = std::max(ref, std::abs(double(want[at + t][i])));
+                }
+                CHECK(err <= 1e-3 * ref);
+            }
+            at += nb;
+        }
+        // Every chunk took the batched GPU forward.
+        REQUIRE(vulkan_fallbacks() == fb0);
+        cache.release(seq);
     }
 }
 
