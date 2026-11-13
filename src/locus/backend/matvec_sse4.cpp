@@ -3,12 +3,23 @@
 #if defined(__x86_64__) && defined(__SSE4_1__)
 
 #include <smmintrin.h>  // SSE4.1
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+#include <immintrin.h>
+#endif
 
 #include <algorithm>
 #include <cstring>
 #include <vector>
 
 namespace locus::backend {
+// matvec_sse4_avx.cpp compiles this file again with AVX enabled, into
+// sse4_avx:: (variants.hpp).
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+namespace sse4_avx {
+namespace self = ::locus::backend::sse4_avx;
+#else
+namespace self = ::locus::backend;
+#endif
 
 namespace {
 
@@ -414,6 +425,8 @@ void matvec_sse4(const Mat& w, std::span<const float> x,
     matvec(w, x, out);  // other types: scalar reference
 }
 
+namespace {
+
 /** SSE4 Q3_K x Q8_K aux32[8]: 2-bit + hmask 3rd-bit unpack (-4 offset),
  *  6-bit scales unpacked from the packed 12 bytes, 16 groups x 2 with
  *  scale=(scales[j]-32); no min term. Bit-identical to scalar
@@ -745,8 +758,6 @@ void q6_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
 }
 
-namespace {
-
 /**
  * The four lane sums of 16 weights a against 16 activations b: lane l
  * is a[4l..4l+3] . b[4l..4l+3]. maddubs takes |a| (unsigned) times b
@@ -847,11 +858,38 @@ void row_q8_0_q8_0_sse4_xt(const std::byte* row, const float* const* xd,
                              lanes16_sse4(w.abs_q[1], w.q[1], xb));
     };
     __m128 s0[kT], s1[kT];
+    std::size_t b = 0;
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+    // One 256-bit sum per token: block b in lanes 0-3 and b + 1 in lanes
+    // 4-7, the same adds as s0 and s1 below, so the same bits.
+    __m256 s8[kT];
+    for (int t = 0; t < kT; ++t) {
+        s8[t] = _mm256_setzero_ps();
+    }
+    for (; b + 1 < nb; b += 2) {
+        const std::byte* b0 = row + b * kBlk;
+        const std::byte* b1 = b0 + kBlk;
+        const float w0 = f16_to_f32(load_u16(b0));
+        const float w1 = f16_to_f32(load_u16(b1));
+        const W16 v0 = widen(b0), v1 = widen(b1);
+        for (int t = 0; t < kT; ++t) {
+            const __m256 d = _mm256_set_m128(_mm_set1_ps(w1 * xd[t][b + 1]),
+                                             _mm_set1_ps(w0 * xd[t][b]));
+            const __m256i p = _mm256_set_m128i(
+                lanes(v1, xq[t] + (b + 1) * 32), lanes(v0, xq[t] + b * 32));
+            s8[t] = _mm256_add_ps(s8[t],
+                                  _mm256_mul_ps(_mm256_cvtepi32_ps(p), d));
+        }
+    }
+    for (int t = 0; t < kT; ++t) {
+        s0[t] = _mm256_castps256_ps128(s8[t]);
+        s1[t] = _mm256_extractf128_ps(s8[t], 1);
+    }
+#else
     for (int t = 0; t < kT; ++t) {
         s0[t] = _mm_setzero_ps();
         s1[t] = _mm_setzero_ps();
     }
-    std::size_t b = 0;
     for (; b + 1 < nb; b += 2) {
         const std::byte* b0 = row + b * kBlk;
         const std::byte* b1 = b0 + kBlk;
@@ -869,6 +907,7 @@ void row_q8_0_q8_0_sse4_xt(const std::byte* row, const float* const* xd,
                 s1[t], _mm_mul_ps(_mm_cvtepi32_ps(p1), _mm_set1_ps(d1)));
         }
     }
+#endif
     for (int t = 0; t < kT; ++t) {
         alignas(16) float l0[4], l1[4];
         _mm_store_ps(l0, s0[t]);
@@ -1199,7 +1238,7 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
         thread_local std::vector<float> tmp;
         tmp.resize(w.rows);
         for (std::uint32_t t = 0; t < n; ++t) {
-            matvec_sse4_q8k(w, x_batch.subspan(t * cols, cols), tmp);
+            self::matvec_sse4_q8k(w, x_batch.subspan(t * cols, cols), tmp);
             for (std::uint32_t r = 0; r < w.rows; ++r) {
                 out_batch[std::size_t{r} * n + t] = tmp[r];
             }
@@ -1313,7 +1352,7 @@ void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
     std::vector<float> col(w.rows);
     const std::size_t xc = w.cols;
     for (std::uint32_t t = 0; t < n; ++t) {
-        matvec_sse4(
+        self::matvec_sse4(
             w,
             x_batch.subspan(static_cast<std::size_t>(t) * xc, xc),
             col);
@@ -1323,6 +1362,9 @@ void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
     }
 }
 
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+}  // namespace sse4_avx
+#endif
 }  // namespace locus::backend
 
 #endif  // __x86_64__ && __SSE4_1__

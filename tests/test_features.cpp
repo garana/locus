@@ -11,6 +11,7 @@ TEST_CASE("feature detection runs and reports", "[sys]") {
     REQUIRE_FALSE(f.avx2);
 #elif defined(__x86_64__)
     REQUIRE_FALSE(f.neon);
+    REQUIRE((!f.avx2 || f.avx));  // AVX2 implies AVX
 #endif
 
     auto s = locus::sys::to_string(f);

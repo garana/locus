@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -268,6 +269,59 @@ TEST_CASE("gqa_attend_batch equals gqa_attend per token", "[threads]") {
                 REQUIRE(got == want);
             }
         }
+    }
+}
+
+// i#618: on an AVX CPU the attention kernels run their 8-wide build;
+// it must give the 4-wide build's bits, decode and batched, with head
+// sizes that leave a tail (hd % 8 != 0) and that do not.
+TEST_CASE("gqa attention AVX build gives the 4-wide bits", "[threads]") {
+    if (!locus::model::attend_avx()) {
+        SKIP("CPU lacks AVX (or not x86-64)");
+    }
+    constexpr std::uint32_t heads = 8, group = 4;
+    std::uint32_t s = 11;
+    auto rnd = [&s] {
+        s = s * 1664525u + 1013904223u;
+        return static_cast<float>(s >> 8) / (1u << 24) - 0.5f;
+    };
+    for (const std::uint32_t hd : {20u, 64u}) {
+        const std::uint32_t kv = heads / group * hd;
+        const std::uint32_t n = 13, base = 40, total = base + n;
+        std::vector<float> q(std::size_t{n} * heads * hd),
+            k(std::size_t{total} * kv), v(std::size_t{total} * kv);
+        for (auto* vec : {&q, &k, &v}) {
+            for (auto& x : *vec) {
+                x = rnd();
+            }
+        }
+        auto krow = [&](std::uint32_t t) { return k.data() + t * kv; };
+        auto vrow = [&](std::uint32_t t) { return v.data() + t * kv; };
+        const std::size_t qs = std::size_t{heads} * hd;
+        const auto run = [&](bool off, std::vector<float>& dec,
+                             std::vector<float>& bat) {
+            locus::model::attend_avx_off() = off;
+            dec.assign(q.size(), -1.0f);
+            bat.assign(q.size(), -1.0f);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                locus::model::gqa_attend(q.data() + t * qs,
+                                         dec.data() + t * qs, heads, hd,
+                                         group, base + t, 0.25f, krow, vrow);
+            }
+            locus::model::gqa_attend_batch(q.data(), bat.data(), qs, n, base,
+                                           heads, hd, group, 0.25f, krow,
+                                           vrow);
+            locus::model::attend_avx_off() = false;
+        };
+        std::vector<float> dec4, bat4, dec8, bat8;
+        run(true, dec4, bat4);
+        run(false, dec8, bat8);
+        INFO("hd " << hd);
+        REQUIRE(std::memcmp(dec8.data(), dec4.data(),
+                            dec4.size() * sizeof(float)) == 0);
+        REQUIRE(std::memcmp(bat8.data(), bat4.data(),
+                            bat4.size() * sizeof(float)) == 0);
+        REQUIRE(bat4 == dec4);
     }
 }
 
