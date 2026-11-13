@@ -49,6 +49,42 @@ inline float dot_f32_8(const float* a, const float* b, std::uint32_t n) {
 }
 
 /**
+ * dot_f32_8 of four vectors a[0..3] with one b: b is loaded once per
+ * step for all four, and each dot keeps dot_f32_8's lanes, tree and
+ * tail, so out[r] is the bits dot_f32_8(a[r], b, n) gives.
+ */
+inline void dot4_f32_8(const float* const a[4], const float* b,
+                       std::uint32_t n, float out[4]) {
+    typedef float f4 __attribute__((vector_size(16)));
+    f4 lo[4], hi[4];
+    for (int r = 0; r < 4; ++r) {
+        lo[r] = f4{0.0f, 0.0f, 0.0f, 0.0f};
+        hi[r] = lo[r];
+    }
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        f4 b0, b1;
+        std::memcpy(&b0, b + i, sizeof b0);
+        std::memcpy(&b1, b + i + 4, sizeof b1);
+        for (int r = 0; r < 4; ++r) {
+            f4 a0, a1;
+            std::memcpy(&a0, a[r] + i, sizeof a0);
+            std::memcpy(&a1, a[r] + i + 4, sizeof a1);
+            lo[r] += a0 * b0;
+            hi[r] += a1 * b1;
+        }
+    }
+    for (int r = 0; r < 4; ++r) {
+        float s = ((lo[r][0] + lo[r][1]) + (lo[r][2] + lo[r][3])) +
+                  ((hi[r][0] + hi[r][1]) + (hi[r][2] + hi[r][3]));
+        for (std::uint32_t k = i; k < n; ++k) {
+            s += a[r][k] * b[k];
+        }
+        out[r] = s;
+    }
+}
+
+/**
  * One head of gqa_attend: head h of q scores positions 0..pos of KV
  * head h / group (dot_f32_8), softmaxes, and weights the value rows
  * into head h of out.
@@ -167,11 +203,24 @@ void gqa_kv_block(const float* q, float* out, std::size_t q_stride,
     };
     for (std::uint32_t p = 0; p <= last; ++p) {
         const float* k = krow_at(p) + kvh;
-        for (std::uint32_t j = 0; j < nq; ++j) {
-            if (p <= pos_of(j)) {
-                att_buf[j * stride + p] =
-                    dot_f32_8(q + qrow(j), k, hd) * kq_scale;
+        // pos_of grows with j, so the queries that see p are a suffix:
+        // from the first one on, four at a time through dot4_f32_8 (the
+        // key row loaded once for four), then one at a time.
+        std::uint32_t j = 0;
+        while (j < nq && p > pos_of(j)) {
+            ++j;
+        }
+        for (; j + 4 <= nq; j += 4) {
+            const float* qs[4] = {q + qrow(j), q + qrow(j + 1),
+                                  q + qrow(j + 2), q + qrow(j + 3)};
+            float d[4];
+            dot4_f32_8(qs, k, hd, d);
+            for (std::uint32_t r = 0; r < 4; ++r) {
+                att_buf[(j + r) * stride + p] = d[r] * kq_scale;
             }
+        }
+        for (; j < nq; ++j) {
+            att_buf[j * stride + p] = dot_f32_8(q + qrow(j), k, hd) * kq_scale;
         }
     }
     for (std::uint32_t j = 0; j < nq; ++j) {
@@ -234,11 +283,14 @@ void gqa_attend_batch(const float* q, float* out, std::size_t q_stride,
                       std::uint32_t n_heads, std::uint32_t hd,
                       std::uint32_t group, float kq_scale,
                       const KRow& krow_at, const VRow& vrow_at) {
-    // Query tokens per task: at most 8, few enough that every pool
-    // thread gets a task (a short chunk, a speculative verify), and few
-    // enough at long context that a task's scores (tokens x group x
-    // positions floats, thread_local) stay under about 4 MB. The block
-    // size changes no query's arithmetic.
+    // Query tokens per task: at most kMaxBlock, few enough that every
+    // pool thread gets a task (a short chunk, a speculative verify), and
+    // few enough at long context that a task's scores (tokens x group x
+    // positions floats, thread_local) stay under about 4 MB. Each task
+    // reads its KV head's whole K and V history, so larger blocks read
+    // it fewer times (i#701: 8 to 32 tokens). The block size changes no
+    // query's arithmetic.
+    constexpr std::uint64_t kMaxBlock = 32;
     constexpr std::uint64_t kMaxScores = std::uint64_t{1} << 20;
     const std::uint32_t n_kv = n_heads / group;
     const std::uint64_t per_token = std::uint64_t{group} * (base + n);
@@ -249,7 +301,8 @@ void gqa_attend_batch(const float* q, float* out, std::size_t q_stride,
     const std::uint64_t by_memory =
         kMaxScores / std::max<std::uint64_t>(per_token, 1);
     const auto block = static_cast<std::uint32_t>(
-        std::clamp<std::uint64_t>(std::min(by_threads, by_memory), 1, 8));
+        std::clamp<std::uint64_t>(std::min(by_threads, by_memory), 1,
+                                  kMaxBlock));
     const std::uint32_t n_blocks = (n + block - 1) / block;
     const std::size_t items = std::size_t{n_kv} * n_blocks;
     const std::size_t t = std::min<std::size_t>(mt_fanout(), items);
