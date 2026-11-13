@@ -126,8 +126,9 @@ is cancelled. On the CPU, quantized weights use 8-bit activations
 where the backend's int8 dot is the fast path (neon, sse4, scalar),
 as llama.cpp does; `LOCUS_F32_ACTIVATIONS=1` selects f32 activations.
 `LOCUS_CPU_FAST=1` opts in to CPU kernels with a different float order
-(today the attention softmax, about 2x faster): close to the default
-results but not bit-identical, so the goldens hold only without it.
+(today every CPU softmax: attention, MoE routing and the image
+encoders, about 2x faster): close to the default results but not
+bit-identical, so the goldens are checked without it.
 
 ### Validated models
 

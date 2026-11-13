@@ -61,7 +61,8 @@ void layernorm(std::span<const float> x, std::span<const float> w,
 /**
  * In-place numerically-stable softmax over x. Bit-identical to the
  * std::exp form by default; under LOCUS_CPU_FAST it runs
- * softmax_fast_inplace instead (cpu_fast).
+ * softmax_fast_inplace instead (cpu_fast), for every caller: attention,
+ * MoE routing, the image encoders.
  */
 void softmax_inplace(std::span<float> x);
 
