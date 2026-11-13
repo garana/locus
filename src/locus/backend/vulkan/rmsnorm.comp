@@ -12,7 +12,8 @@
 //
 // Compiled again with -DRESID (rmsnorm_res): out[out_off + i] =
 // r[i] + x[i] * w[i] / sqrt(mean+eps), the normed branch added to the
-// residual R (kolibri1's post-attention and post-FFN norms). X or R
+// residual R (kolibri1's post-attention and post-FFN norms), R read
+// at the output's offsets (rmsnorm_res_b: BATCHED rows too). X or R
 // may be the same buffer as OUT: each thread reads element i before
 // it writes it.
 
@@ -66,7 +67,7 @@ void main() {
     float scale = inversesqrt(red[0] / float(pc.n) + pc.eps);
     for (uint i = tid; i < pc.n; i += WG) {
 #ifdef RESID
-        o[oi + i] = r[i] + x[xi + i] * scale * w[i];
+        o[oi + i] = r[oi + i] + x[xi + i] * scale * w[i];
 #else
         o[oi + i] = x[xi + i] * scale * w[i];
 #endif

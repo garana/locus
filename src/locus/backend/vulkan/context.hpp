@@ -205,6 +205,10 @@ enum class Kernel {
     kMatmulIQ2_SId,
     kMatmulIQ2_XXS,
     kMatmulIQ2_XXSId,
+    /** rmsnorm_res over a prefill chunk's rows (BATCHED, i#730). */
+    kRmsNormResB,
+    /** Expert-id prefill matmul over F32 experts (i#730). */
+    kMatmulF32Id,
     kCount_,
 };
 
