@@ -609,6 +609,7 @@ struct State {
         kCDown,    // MoE: routed down outputs, n*k x n_embd
         kCLogits,
         kCSplit,   // split-K partial planes (decode attention)
+        kCRes,     // kolibri1: the residual rows saved across a branch
         kChunkCount_
     };
     VulkanContext::Buffer chunk[kChunkCount_]{};
@@ -1174,6 +1175,7 @@ Kernel matmul_id_kernel(const Mat& w) {
         case gguf::TensorType::kQ5_K: return Kernel::kMatmulQ5_KId;
         case gguf::TensorType::kIQ2_S: return Kernel::kMatmulIQ2_SId;
         case gguf::TensorType::kIQ2_XXS: return Kernel::kMatmulIQ2_XXSId;
+        case gguf::TensorType::kF32: return Kernel::kMatmulF32Id;
         default: return Kernel::kCount_;
     }
 }
@@ -1483,7 +1485,9 @@ void rec_matmul_id(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   0,
                                   out_stride,
                                   fbits(1.0f),
-                                  static_cast<std::uint32_t>(expert_bytes),
+                                  // per expert, in w_off units (F32
+                                  // experts index floats, not bytes)
+                                  w_off_units(w, expert_bytes),
                                   0,
                                   0,
                                   n_expert,
@@ -1610,9 +1614,10 @@ std::uint32_t attn_block(std::uint32_t n, std::uint32_t heads,
 /** Records the causal softmax over `rows` score rows (attn_softmax). */
 void rec_softmax(State& s, VulkanContext::Buffer scores, std::uint32_t rows,
                  std::uint32_t n_pos, std::uint32_t heads, std::uint32_t base,
-                 float scale) {
+                 float scale, std::uint32_t window = 0) {
     const VulkanContext::Buffer bufs[] = {scores};
-    const std::uint32_t push[] = {n_pos, heads, base, fbits(scale), rows};
+    const std::uint32_t push[] = {n_pos, heads, base, fbits(scale), rows,
+                                  window};
     const std::uint32_t gx = std::min<std::uint32_t>(rows, 65535);
     s.ctx.dispatch(Kernel::kAttnSoftmax, bufs, push, gx,
                    (rows + gx - 1) / gx);
@@ -1626,9 +1631,11 @@ void rec_softmax(State& s, VulkanContext::Buffer scores, std::uint32_t rows,
  * each K/V tile is read once for all of them. Q and out rows are
  * q_dim floats per token (head h at h * hd). Queries run in
  * sub-blocks of attn_block(n, heads, base + n) tokens, each over the
- * positions it can see; scores holds one sub-block's rows. `first`
- * starts a single decode token's attention at that position (a
- * sliding window); it needs the decode kernels (n == 1).
+ * positions it can see; scores holds one sub-block's rows. With a
+ * sliding `window` W (0 = none) the query at position q sees only the
+ * positions p with q - p < W: the decode kernels start at q + 1 - W,
+ * the matmul path masks below it in attn_softmax (one rule for decode
+ * and prefill).
  */
 /** One attention segment set for rec_attn_decode (see attn_decode.comp). */
 struct DecodeAttn {
@@ -1736,8 +1743,11 @@ void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
                   std::uint32_t n, std::uint32_t base, std::uint32_t heads,
                   std::uint32_t group, std::uint32_t hd, std::uint32_t q_dim,
                   std::uint32_t layer_off, std::uint32_t v_offset,
-                  std::uint32_t first = 0) {
+                  std::uint32_t window = 0) {
     const std::uint32_t n_pos = base + n;
+    // The lone decode query sits at base: its window's first position.
+    const std::uint32_t first =
+        window > 0 && base + 1 > window ? base + 1 - window : 0;
     DecodeAttn da{q,  q,     out, layer_off, layer_off + v_offset,
                   hd, group, hd,  0,         hd,
                   0,  0,     hd,  hd,
@@ -1747,11 +1757,6 @@ void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
     if (n == 1 && (grouped || vk::attn_decode_fits(hd))) {
         rec_attn_decode(s, pp, n_pos, heads, da, grouped);
         return;
-    }
-    if (first != 0) {
-        // The matmul path below masks causally from position 0 only.
-        throw std::logic_error(
-            "rec_attn_gqa: a sliding window needs the decode kernels");
     }
     const std::uint32_t n_kv = heads / group;
     const std::uint32_t mb = attn_block(n, heads, n_pos);
@@ -1770,7 +1775,7 @@ void rec_attn_gqa(State& s, const PagedPool& pp, VulkanContext::Buffer q,
         rec_paged_matmul(s, Kernel::kMatmulPagedF32, pp, np, hd, layer_off,
                          q, scores, sr, false, m * heads * np);
         rec_softmax(s, scores, m * heads, np, heads, base + t0,
-                    1.0f / std::sqrt(static_cast<float>(hd)));
+                    1.0f / std::sqrt(static_cast<float>(hd)), window);
         MatmulRows orow{m * group, 0, heads * np, t0 * q_dim, q_dim};
         orow.n_batch = n_kv;
         orow.x_bstride = group * np;
@@ -2836,8 +2841,7 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
         const bool no_rope = hp.swa_window > 0 && !swa_l;
         const std::uint32_t base_bits =
             swa_l ? fbits(hp.rope_freq_base_swa) : base_bits_all;
-        const std::uint32_t first =
-            swa_l && pos + 1 > hp.swa_window ? pos + 1 - hp.swa_window : 0;
+        const std::uint32_t window = swa_l ? hp.swa_window : 0;
 
         norm(lay.attn_norm, s.x, s.xb, hp.n_embd, 0);
         mark(s, model::Stage::kNorm);
@@ -2984,7 +2988,7 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                 rec_attn_gqa(s, pp, s.q, s.att, s.attout, 1, pos,
                              hp.n_heads, group, hp.head_dim,
                              hp.n_heads * hp.head_dim, rel * layer_stride,
-                             layer_stride / 2, first);
+                             layer_stride / 2, window);
             } else {
                 // R14 #45: K/V into F32 scratch (reuse the FFN
                 // gate/up buffers -- free until this layer's FFN),
@@ -4057,10 +4061,8 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
         throw std::invalid_argument(
             "vulkan_forward_batch: one embedding entry per token");
     }
-    if (hp.custom_layer) {
-        // kolibri1's window, NoPE and post norms are in the single-token
-        // forward only: prefill runs it token by token.
-        return false;
+    if (hp.custom_layer && !hp.custom_layer_gpu) {
+        return false;  // muse-spark / deepseek41: their own CPU layer
     }
     std::lock_guard lk(state_mu());
     State& s = state();
@@ -4199,12 +4201,13 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                          VulkanContext::Buffer divisors,
                          std::uint32_t heads, std::uint32_t dim,
                          std::uint32_t offset, std::uint32_t stride,
-                         std::uint32_t row_stride, bool yarn) {
+                         std::uint32_t row_stride, bool yarn,
+                         std::uint32_t bb) {
         const VulkanContext::Buffer bufs[] = {buf, divisors};
         const std::uint32_t push[] = {
             heads,  dim,
             base,   offset,
-            stride, base_bits,
+            stride, bb,
             yarn ? fs_bits : fbits(1.0f),
             yarn ? lo_bits : 0u,
             yarn ? hi_bits : 0u,
@@ -4278,11 +4281,53 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                                                65535));
     };
 
+    // kolibri1's post norms: rows saved across a branch, zeros to clear
+    // the stream with, and x = resid + rmsnorm(in) * w over n rows.
+    const bool post_norms = std::any_of(
+        m.layers().begin(), m.layers().end(), [](const auto& l) {
+            return !l.post_attn_norm.empty() || !l.post_ffw_norm.empty();
+        });
+    VulkanContext::Buffer bres{}, bzeros{};
+    if (post_norms) {
+        bres = s.chunk_buf(C::kCRes, std::size_t{n} * E);
+        if (s.zeros_n < std::size_t{n} * E) {
+            s.grow(s.zeros, s.zeros_n, std::size_t{n} * E);
+            const std::vector<float> z(s.zeros_n, 0.0f);
+            s.ctx.write_buffer(s.zeros,
+                               std::as_bytes(std::span<const float>(z)));
+        }
+        bzeros = s.zeros;
+    }
+    auto norm_res_rows = [&](std::span<const float> w,
+                             VulkanContext::Buffer in,
+                             VulkanContext::Buffer resid) {
+        const VulkanContext::Buffer bufs[] = {
+            in, s.upload(w.data(), w.size() * 4), bx, resid};
+        const std::uint32_t push[] = {E, eps_bits, 0, 0, E, E};
+        s.ctx.dispatch(Kernel::kRmsNormResB, bufs, push, 1, n);
+    };
+    auto copy_rows = [&](VulkanContext::Buffer src,
+                         VulkanContext::Buffer dst) {
+        const std::uint32_t count = n * E;
+        const VulkanContext::Buffer bufs[] = {src, dst};
+        const std::uint32_t push[] = {count, 0, 0};
+        s.ctx.dispatch(Kernel::kCopy, bufs, push,
+                       std::min<std::uint32_t>((count + 255) / 256, 65535));
+    };
+
     s.ctx.begin_batch();
     State::BatchScope batch_scope{s};
     for (std::uint32_t l = 0; l < hp.n_layers; ++l) {
         const auto& lay = m.layers()[l];
         const std::uint32_t layer_off = l * layer_stride;
+        // Sliding-window archs (kolibri1), as the decode forward: a
+        // sliding layer ropes at rope_freq_base_swa over the last
+        // swa_window positions, a global one attends all with no rope.
+        const bool swa_l = hp.swa_window > 0 && hp.swa_layers[l];
+        const bool no_rope = hp.swa_window > 0 && !swa_l;
+        const std::uint32_t lbase =
+            swa_l ? fbits(hp.rope_freq_base_swa) : base_bits;
+        const std::uint32_t window = swa_l ? hp.swa_window : 0;
 
         norm_rows(lay.attn_norm, bx, bxb, E, 0, E, E, n);
         mark(s, model::Stage::kNorm);
@@ -4318,13 +4363,15 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                 norm_rows(lay.attn_k_norm, bk, bk, hd, 0, hd, hd,
                           n * hp.n_kv_heads);
             }
-            rope_rows(bq, divisors, H, hd, 0, hd, q_dim, false);
-            rope_rows(bk, divisors, hp.n_kv_heads, hd, 0, hd, kv_dim,
-                      false);
+            if (!no_rope) {
+                rope_rows(bq, divisors, H, hd, 0, hd, q_dim, false, lbase);
+                rope_rows(bk, divisors, hp.n_kv_heads, hd, 0, hd, kv_dim,
+                          false, lbase);
+            }
             scatter_rows(bk, kv_dim, layer_off);
             scatter_rows(bv, kv_dim, layer_off + layer_stride / 2);
             rec_attn_gqa(s, pp, bq, batt, batt_out, n, base, H, group, hd,
-                         q_dim, layer_off, layer_stride / 2);
+                         q_dim, layer_off, layer_stride / 2, window);
         } else {
             const bool split = lay.wk_b.rows > 0;
             const auto divisors = s.rope_divisors({}, rope_d / 2);
@@ -4360,9 +4407,11 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                        MatmulRows{n, 0, E, 0, kvw}, false,
                        cat ? weight_bytes(lay.wq) : 0);
             norm_rows(lay.kv_a_norm, bkva, bkva, rank, 0, kvw, kvw, n);
-            rope_rows(bkva, divisors, 1, rope_d, rank, 0, kvw, true);
+            rope_rows(bkva, divisors, 1, rope_d, rank, 0, kvw, true,
+                      base_bits);
             scatter_rows(bkva, kvw, layer_off);
-            rope_rows(bq, divisors, H, rope_d, nope, qk, q_dim, true);
+            rope_rows(bq, divisors, H, rope_d, nope, qk, q_dim, true,
+                      base_bits);
 
             // Per-head absorption q_abs = W_uk^T q_nope, all heads
             // and tokens in one matmul (head = batch).
@@ -4407,14 +4456,31 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                            blat, batt_out, uv_rows, false);
             }
         }
-        rec_matmul(s, lay.wo, s.upload_w(lay.wo),
-                   batt_out, bx, MatmulRows{n, 0, att_dim, 0, E}, true);
+        if (lay.post_attn_norm.empty()) {
+            rec_matmul(s, lay.wo, s.upload_w(lay.wo),
+                       batt_out, bx, MatmulRows{n, 0, att_dim, 0, E}, true);
+        } else {
+            // kolibri1: x += rmsnorm(wo . attn) * post_attention_norm.
+            rec_matmul(s, lay.wo, s.upload_w(lay.wo), batt_out, bres,
+                       MatmulRows{n, 0, att_dim, 0, E}, false);
+            norm_res_rows(lay.post_attn_norm, bres, bx);
+        }
         mark(s, model::Stage::kAttention);
 
         norm_rows(lay.ffn_norm, bx, bxb, E, 0, E, E, n);
         mark(s, model::Stage::kNorm);
+        // kolibri1's post-FFN norm, as decode: the branch accumulates
+        // into cleared rows, then x = saved + rmsnorm(branch) * w.
+        const bool post_ffw = !lay.post_ffw_norm.empty();
+        if (post_ffw) {
+            copy_rows(bx, bres);
+            copy_rows(bzeros, bx);
+        }
         if (!lay.is_moe()) {
             swiglu_rows(lay.w_gate, lay.w_up, lay.w_down, hp.n_ff);
+            if (post_ffw) {
+                norm_res_rows(lay.post_ffw_norm, bx, bres);
+            }
             mark(s, model::Stage::kFfn);
             continue;
         }
@@ -4426,6 +4492,9 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
                         shexp_ff(hp),
                         lay.gate_inp_shexp.rows > 0 ? &lay.gate_inp_shexp
                                                     : nullptr);
+        }
+        if (post_ffw) {
+            norm_res_rows(lay.post_ffw_norm, bx, bres);
         }
         mark(s, model::Stage::kMoe);
     }

@@ -338,6 +338,9 @@ if(Vulkan_FOUND)
             kv_scatter_f16=kv_scatter:KV_F16
             rmsnorm_b=rmsnorm:BATCHED
             rmsnorm_res=rmsnorm:RESID
+            rmsnorm_res_b=rmsnorm:BATCHED,RESID
+            matmul_f32_id=matmul:TYPE_F32,MOE_ID
+            matmul_f32_id_small=matmul:TYPE_F32,MOE_ID,BK16
             rope_b=rope:BATCHED
             rope_neox=rope:NEOX
             rope_neox_b=rope:BATCHED,NEOX

@@ -208,6 +208,10 @@ enum class Kernel {
     kMatmulIQ2_SId,
     kMatmulIQ2_XXS,
     kMatmulIQ2_XXSId,
+    /** rmsnorm_res over a prefill chunk's rows (BATCHED, i#730). */
+    kRmsNormResB,
+    /** Expert-id prefill matmul over F32 experts (i#730). */
+    kMatmulF32Id,
     /** One token's Q3_K gate, up and silu_mul, and the Q3_K q / k / v
      *  in one dispatch (matvec_q4_k.comp TYPE_Q3K, i#173). */
     kMatvecQ3_KGlu,
