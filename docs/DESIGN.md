@@ -951,7 +951,7 @@ locus ports those dots (`backend::matvec_q8k`):
 |---------|---------------------------------------------------------------|
 | scalar  | all 15 QK_K types and the block-32 types                      |
 | neon    | Q4_K, Q6_K and the block-32 types; the rest through scalar    |
-| sse4    | all QK_K types but TQ1_0 / TQ2_0, and the block-32 types      |
+| sse4    | all 15 QK_K types and the block-32 types                      |
 | cuda    | all 15 QK_K types                                             |
 
 The sse4 and CUDA dots, and the neon block-32 dots, replay the scalar
