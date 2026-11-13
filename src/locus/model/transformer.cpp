@@ -1154,7 +1154,10 @@ bool TransformerModel::supports_batch_decode() const {
 }
 
 bool TransformerModel::supports_batch_prefill() const {
-    return supports_batch() || backend_->name == "vulkan";
+    // A custom-layer arch with a batched body (layer_batch: kolibri1)
+    // prefills in chunks on the CPU backends too (i#739).
+    return supports_batch() || backend_->name == "vulkan" ||
+           (spec_->layer_batch != nullptr && backend_->name != "cuda");
 }
 
 std::uint32_t TransformerModel::prefill_chunk() const {
@@ -1407,6 +1410,12 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
 
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
+        if (spec_->layer_batch != nullptr) {
+            // The arch's own batched layer body (kolibri1, i#739).
+            spec_->layer_batch(*this, lay, cache, seq, ws, l, base, n, x);
+            lap.lap(l, Stage::kLayer);
+            continue;
+        }
         if (plain) {
             // Plain llama attention: q / k / v and wo as batched
             // matvecs over the chunk (each weight read once), RoPE, the

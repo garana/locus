@@ -1017,7 +1017,8 @@ TEST_CASE("matvec_batch_neon is byte-identical to per-token neon",
         v = xd(rng);
     }
     for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K,
-                         TensorType::kQ5_K}) {
+                         TensorType::kQ5_K, TensorType::kQ3_K,
+                         TensorType::kIQ2_XXS, TensorType::kIQ2_S}) {
         std::vector<std::byte> w;
         for (std::uint32_t r = 0; r < rows; ++r) {
             auto row = k_quant_row(t, blocks, 100 + r);
@@ -1093,9 +1094,10 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
     // n = 7: one 4-token pass and a 3-token tail. Q4_K / Q6_K take the
     // multi-token sdot kernels (their own float order): within f32
     // rounding of the scalar Q8_K dot, and a token's value does not
-    // depend on its place in the batch. Q5_K falls back per token and
-    // block-32 types take the bit-identical 4-token kernel: both equal
-    // matvec_neon_q8k exactly.
+    // depend on its place in the batch. Q5_K, Q3_K, IQ2_XXS and IQ2_S
+    // take 4-token kernels whose every token gets the scalar dot's bits
+    // (i#733, i#739), and block-32 types the bit-identical 4-token
+    // kernel: all equal matvec_neon_q8k exactly.
     constexpr std::uint32_t rows = 5, n = 7;
     std::mt19937 rng(101);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
@@ -1109,7 +1111,8 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
     const std::uint32_t kcols = 2 * 256;
     const auto xk = tokens(kcols);
     for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K,
-                         TensorType::kQ5_K}) {
+                         TensorType::kQ5_K, TensorType::kQ3_K,
+                         TensorType::kIQ2_XXS, TensorType::kIQ2_S}) {
         std::vector<std::byte> w;
         for (std::uint32_t r = 0; r < rows; ++r) {
             auto row = k_quant_row(t, 2, 200 + r);
@@ -1129,10 +1132,11 @@ TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
                              << " t=" << tk);
                 const float g = got[std::size_t{r} * n + tk];
                 REQUIRE(g == one[r]);
-                if (t == TensorType::kQ5_K) {
+                if (t != TensorType::kQ4_K && t != TensorType::kQ6_K) {
                     float neon = 0.0f;
                     matvec_neon_q8k(mat_rows(m, r, 1), x, {&neon, 1});
                     REQUIRE(g == neon);
+                    REQUIRE(g == ref[r]);  // the scalar bits
                 } else {
                     REQUIRE(g == Approx(ref[r]).epsilon(1e-5).margin(1e-4));
                 }

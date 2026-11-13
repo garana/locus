@@ -1373,17 +1373,22 @@ void kolibri1_attention(const TransformerModel&,
     throw std::logic_error("kolibri1: attention runs in its layer body");
 }
 
-void kolibri1_layer(const TransformerModel& m,
-                    const TransformerModel::Layer& lay,
-                    kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq,
-                    TransformerModel::Workspace& ws, std::uint32_t l,
-                    std::uint32_t pos) {
+/**
+ * kolibri1's attention for one token at pos once its projections are
+ * in: q / k RMS norms per head, RoPE on the sliding layers (the global
+ * layers are NoPE), k and v into the cache, then GQA attention over the
+ * window (or every position) into out (q_dim floats). Shared by the
+ * per-token and batched layers, so both compute the same.
+ */
+void kolibri1_attend(const TransformerModel& m,
+                     const TransformerModel::Layer& lay,
+                     kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq,
+                     std::uint32_t l, std::uint32_t pos, std::span<float> q,
+                     std::span<float> kbuf, std::span<float> vbuf,
+                     float* out) {
     using namespace locus::backend;
     const Hparams& hp = m.hparams();
-    const Ops op = m.ops();
-    const std::uint32_t E = hp.n_embd;
     const std::uint32_t hd = hp.head_dim;
-    const std::size_t q_dim = std::size_t{hp.n_heads} * hd;
     const std::size_t kv_dim = std::size_t{hp.n_kv_heads} * hd;
     const std::uint32_t group = hp.n_heads / hp.n_kv_heads;
     const bool swa = hp.swa_layers[l];
@@ -1400,18 +1405,8 @@ void kolibri1_layer(const TransformerModel& m,
                            Yarn{});
         }
     };
-
-    // Attention: q / k norms, then RoPE on the sliding layers.
-    rmsnorm(ws.x, lay.attn_norm, hp.rms_eps, ws.xb);
-    std::span<float> q(ws.q.data(), q_dim);
-    matvec_mt(op, lay.wq, ws.xb, q);
     head_norm(q, hp.n_heads, lay.attn_q_norm);
     rope(q, hp.n_heads);
-    thread_local std::vector<float> kbuf, vbuf;
-    kbuf.resize(kv_dim);
-    vbuf.resize(kv_dim);
-    matvec_mt(op, lay.wk, ws.xb, kbuf);
-    matvec_mt(op, lay.wv, ws.xb, vbuf);
     head_norm(kbuf, hp.n_kv_heads, lay.attn_k_norm);
     rope(kbuf, hp.n_kv_heads);
     // llama.cpp's standard SWA mask: key t is seen while pos - t <
@@ -1450,26 +1445,24 @@ void kolibri1_layer(const TransformerModel& m,
     // The shared GQA attention (heads across the thread pool) over the
     // window's n positions, t0 .. pos (i#662).
     gqa_attend(
-        q.data(), ws.out.data(), hp.n_heads, hd, group, n - 1, hp.kq_scale,
+        q.data(), out, hp.n_heads, hd, group, n - 1, hp.kq_scale,
         [&](std::uint32_t t) { return krow_at(t0 + t); },
         [&](std::uint32_t t) { return vrow_at(t0 + t); });
-    matvec_mt(op, lay.wo, {ws.out.data(), q_dim}, ws.xb2);
-    rmsnorm(ws.xb2, lay.post_attn_norm, hp.rms_eps, ws.xb2);
-    for (std::uint32_t i = 0; i < E; ++i) {
-        ws.x[i] += ws.xb2[i];
-    }
+}
 
-    // MoE: pick the top k of logits + bias; weigh each pick by the
-    // sigmoid of its unbiased logit (renormalized when the GGUF says
-    // so), then add the shared expert.
-    rmsnorm(ws.x, lay.ffn_norm, hp.rms_eps, ws.xb);
-    op.matvec(lay.gate_inp, ws.xb, ws.router);
-    thread_local std::vector<std::uint32_t> idx;
-    thread_local std::vector<float> wgt;
+/**
+ * kolibri1's routing: the top k of logit + bias (the lowest index on a
+ * tie), each weighed by the sigmoid of its unbiased logit (renormalized
+ * when the GGUF says so), scaled.
+ */
+void kolibri1_route(const Hparams& hp, const TransformerModel::Layer& lay,
+                    std::span<const float> router,
+                    std::vector<std::uint32_t>& idx,
+                    std::vector<float>& wgt) {
     idx.resize(hp.n_expert);
     for (std::uint32_t e = 0; e < hp.n_expert; ++e) idx[e] = e;
     auto sel = [&](std::uint32_t e) {
-        return ws.router[e] + lay.exp_probs_b[e];
+        return router[e] + lay.exp_probs_b[e];
     };
     std::partial_sort(idx.begin(), idx.begin() + hp.n_expert_used,
                       idx.end(), [&](std::uint32_t a, std::uint32_t b) {
@@ -1478,13 +1471,59 @@ void kolibri1_layer(const TransformerModel& m,
     wgt.resize(hp.n_expert_used);
     float wsum = 0.0f;
     for (std::uint32_t k = 0; k < hp.n_expert_used; ++k) {
-        wgt[k] = 1.0f / (1.0f + std::exp(-ws.router[idx[k]]));
+        wgt[k] = 1.0f / (1.0f + std::exp(-router[idx[k]]));
         wsum += wgt[k];
     }
     for (float& w : wgt) {
         if (hp.expert_weights_norm) w /= wsum;
         w *= hp.expert_weights_scale;
     }
+}
+
+/** acc += w * r over n floats: one out-of-line body, so the per-token
+ *  and batched layers round each mixture step the same way. */
+[[gnu::noinline]] void kolibri1_add(float* acc, float w, const float* r,
+                                    std::uint32_t n) {
+    for (std::uint32_t i = 0; i < n; ++i) {
+        acc[i] += w * r[i];
+    }
+}
+
+void kolibri1_layer(const TransformerModel& m,
+                    const TransformerModel::Layer& lay,
+                    kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq,
+                    TransformerModel::Workspace& ws, std::uint32_t l,
+                    std::uint32_t pos) {
+    using namespace locus::backend;
+    const Hparams& hp = m.hparams();
+    const Ops op = m.ops();
+    const std::uint32_t E = hp.n_embd;
+    const std::size_t q_dim = std::size_t{hp.n_heads} * hp.head_dim;
+    const std::size_t kv_dim = std::size_t{hp.n_kv_heads} * hp.head_dim;
+
+    // Attention: q / k norms, then RoPE on the sliding layers.
+    rmsnorm(ws.x, lay.attn_norm, hp.rms_eps, ws.xb);
+    std::span<float> q(ws.q.data(), q_dim);
+    matvec_mt(op, lay.wq, ws.xb, q);
+    thread_local std::vector<float> kbuf, vbuf;
+    kbuf.resize(kv_dim);
+    vbuf.resize(kv_dim);
+    matvec_mt(op, lay.wk, ws.xb, kbuf);
+    matvec_mt(op, lay.wv, ws.xb, vbuf);
+    kolibri1_attend(m, lay, cache, seq, l, pos, q, kbuf, vbuf,
+                    ws.out.data());
+    matvec_mt(op, lay.wo, {ws.out.data(), q_dim}, ws.xb2);
+    rmsnorm(ws.xb2, lay.post_attn_norm, hp.rms_eps, ws.xb2);
+    for (std::uint32_t i = 0; i < E; ++i) {
+        ws.x[i] += ws.xb2[i];
+    }
+
+    // MoE: the routed picks in order, then the shared expert.
+    rmsnorm(ws.x, lay.ffn_norm, hp.rms_eps, ws.xb);
+    op.matvec(lay.gate_inp, ws.xb, ws.router);
+    thread_local std::vector<std::uint32_t> idx;
+    thread_local std::vector<float> wgt;
+    kolibri1_route(hp, lay, {ws.router.data(), hp.n_expert}, idx, wgt);
     std::span<float> acc(ws.moe_acc.data(), E);
     std::fill(acc.begin(), acc.end(), 0.0f);
     auto glu = [&](const Mat& g, const Mat& u, const Mat& d,
@@ -1494,9 +1533,7 @@ void kolibri1_layer(const TransformerModel& m,
         silu_mul({ws.gate.data(), ff}, {ws.up.data(), ff},
                  {ws.gate.data(), ff});
         matvec_mt(op, d, {ws.gate.data(), ff}, ws.xb2);
-        for (std::uint32_t i = 0; i < E; ++i) {
-            acc[i] += w * ws.xb2[i];
-        }
+        kolibri1_add(acc.data(), w, ws.xb2.data(), E);
     };
     for (std::uint32_t k = 0; k < hp.n_expert_used; ++k) {
         const std::uint32_t e = idx[k];
@@ -1507,6 +1544,146 @@ void kolibri1_layer(const TransformerModel& m,
     rmsnorm(acc, lay.post_ffw_norm, hp.rms_eps, acc);
     for (std::uint32_t i = 0; i < E; ++i) {
         ws.x[i] += acc[i];
+    }
+}
+
+/**
+ * kolibri1_layer over n tokens at base .. base + n - 1 (x: their rows,
+ * token-major), for the CPU batched prefill (i#739): the projections,
+ * the routed experts (grouped by expert, so each is read once for the
+ * tokens that picked it) and the shared expert as batched matvecs; the
+ * norms, the attention (kolibri1_attend, token by token, each after
+ * its own cache rows land) and the per-token mixture as kolibri1_layer.
+ * Each token gets kolibri1_layer's result where the batched matvec
+ * equals the per-token one.
+ */
+void kolibri1_layer_batch(const TransformerModel& m,
+                          const TransformerModel::Layer& lay,
+                          kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq,
+                          TransformerModel::Workspace& ws, std::uint32_t l,
+                          std::uint32_t base, std::uint32_t n,
+                          std::span<float> x) {
+    using namespace locus::backend;
+    const Hparams& hp = m.hparams();
+    const Ops op = m.ops();
+    const std::uint32_t E = hp.n_embd;
+    const std::size_t q_dim = std::size_t{hp.n_heads} * hp.head_dim;
+    const std::size_t kv_dim = std::size_t{hp.n_kv_heads} * hp.head_dim;
+    const std::uint32_t K = hp.n_expert_used;
+    auto row = [E](std::vector<float>& v, std::uint32_t t) {
+        return std::span<float>(v.data() + std::size_t{t} * E, E);
+    };
+    auto xrow = [&](std::uint32_t t) {
+        return x.subspan(std::size_t{t} * E, E);
+    };
+
+    // Attention.
+    std::vector<float> xb(std::size_t{n} * E);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        rmsnorm(xrow(t), lay.attn_norm, hp.rms_eps, row(xb, t));
+    }
+    std::vector<float> q(n * q_dim), k(n * kv_dim), v(n * kv_dim),
+        att(n * q_dim), o(std::size_t{n} * E);
+    matvec_batch(op, lay.wq, xb, q, n);
+    matvec_batch(op, lay.wk, xb, k, n);
+    matvec_batch(op, lay.wv, xb, v, n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        kolibri1_attend(m, lay, cache, seq, l, base + t,
+                        {q.data() + t * q_dim, q_dim},
+                        {k.data() + t * kv_dim, kv_dim},
+                        {v.data() + t * kv_dim, kv_dim},
+                        att.data() + t * q_dim);
+    }
+    matvec_batch(op, lay.wo, att, o, n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        rmsnorm(row(o, t), lay.post_attn_norm, hp.rms_eps, row(o, t));
+        const std::span<float> xt = xrow(t);
+        const std::span<float> ot = row(o, t);
+        for (std::uint32_t i = 0; i < E; ++i) {
+            xt[i] += ot[i];
+        }
+    }
+
+    // MoE: route every token, then each picked expert once over the
+    // tokens that picked it.
+    for (std::uint32_t t = 0; t < n; ++t) {
+        rmsnorm(xrow(t), lay.ffn_norm, hp.rms_eps, row(xb, t));
+    }
+    std::vector<std::uint32_t> ids(std::size_t{n} * K);
+    std::vector<float> wts(std::size_t{n} * K);
+    {
+        std::vector<std::uint32_t> idx;
+        std::vector<float> wgt;
+        for (std::uint32_t t = 0; t < n; ++t) {
+            op.matvec(lay.gate_inp, row(xb, t), ws.router);
+            kolibri1_route(hp, lay, {ws.router.data(), hp.n_expert}, idx,
+                           wgt);
+            std::copy_n(idx.begin(), K, ids.begin() + std::size_t{t} * K);
+            std::copy_n(wgt.begin(), K, wts.begin() + std::size_t{t} * K);
+        }
+    }
+    struct Use {
+        std::uint32_t e, p;  // expert, pair t * K + slot
+    };
+    std::vector<Use> uses(std::size_t{n} * K);
+    for (std::uint32_t p = 0; p < n * K; ++p) {
+        uses[p] = {ids[p], p};
+    }
+    std::stable_sort(uses.begin(), uses.end(),
+                     [](const Use& a, const Use& b) { return a.e < b.e; });
+    const std::uint32_t ff = hp.n_ff_exp;
+    std::vector<float> dn(std::size_t{n} * K * E);
+    std::vector<float> xe, ge, ue, de;
+    for (std::size_t u0 = 0; u0 < uses.size();) {
+        std::size_t u1 = u0;
+        while (u1 < uses.size() && uses[u1].e == uses[u0].e) ++u1;
+        const auto ne = static_cast<std::uint32_t>(u1 - u0);
+        const std::uint32_t e = uses[u0].e;
+        xe.resize(std::size_t{ne} * E);
+        for (std::uint32_t j = 0; j < ne; ++j) {
+            const std::uint32_t t = uses[u0 + j].p / K;
+            std::copy_n(xb.data() + std::size_t{t} * E, E,
+                        xe.data() + std::size_t{j} * E);
+        }
+        ge.resize(std::size_t{ne} * ff);
+        ue.resize(ge.size());
+        de.resize(std::size_t{ne} * E);
+        matvec_batch(op, lay.gate_exps.expert(e), xe, ge, ne);
+        matvec_batch(op, lay.up_exps.expert(e), xe, ue, ne);
+        for (std::uint32_t j = 0; j < ne; ++j) {
+            const std::span<float> g(ge.data() + std::size_t{j} * ff, ff);
+            silu_mul(g, {ue.data() + std::size_t{j} * ff, ff}, g);
+        }
+        matvec_batch(op, lay.down_exps.expert(e), ge, de, ne);
+        for (std::uint32_t j = 0; j < ne; ++j) {
+            std::copy_n(de.data() + std::size_t{j} * E, E,
+                        dn.data() + std::size_t{uses[u0 + j].p} * E);
+        }
+        u0 = u1;
+    }
+    const std::uint32_t fs = hp.n_ff_shexp;
+    std::vector<float> gs(std::size_t{n} * fs), us(gs.size()),
+        sh(std::size_t{n} * E);
+    matvec_batch(op, lay.gate_shexp, xb, gs, n);
+    matvec_batch(op, lay.up_shexp, xb, us, n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        const std::span<float> g(gs.data() + std::size_t{t} * fs, fs);
+        silu_mul(g, {us.data() + std::size_t{t} * fs, fs}, g);
+    }
+    matvec_batch(op, lay.down_shexp, gs, sh, n);
+    std::span<float> acc(ws.moe_acc.data(), E);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        std::fill(acc.begin(), acc.end(), 0.0f);
+        for (std::uint32_t s = 0; s < K; ++s) {
+            const std::size_t p = std::size_t{t} * K + s;
+            kolibri1_add(acc.data(), wts[p], dn.data() + p * E, E);
+        }
+        kolibri1_add(acc.data(), 1.0f, sh.data() + std::size_t{t} * E, E);
+        rmsnorm(acc, lay.post_ffw_norm, hp.rms_eps, acc);
+        const std::span<float> xt = xrow(t);
+        for (std::uint32_t i = 0; i < E; ++i) {
+            xt[i] += acc[i];
+        }
     }
 }
 
@@ -1557,7 +1734,8 @@ const ArchSpec kArchs[] = {
      "Kolibri-1 (GQA + q/k norm, SWA / NoPE layers, post norms, "
      "sigmoid MoE with logit-biased selection + shared expert)",
      &kolibri1_hparams, &kolibri1_attention_tensors, &kolibri1_attention,
-     &llama_kv_dim, &kolibri1_layer},
+     &llama_kv_dim, &kolibri1_layer, nullptr, nullptr, false, false,
+     &kolibri1_layer_batch},
     {"deepseek41",
      "DeepSeek-V4.1-Flash (hyper-connections, MQA with compressed / "
      "indexed history and sinks, Engram, sqrt-softplus MoE)",
