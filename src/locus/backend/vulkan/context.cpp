@@ -58,6 +58,12 @@ std::uint32_t VulkanContext::matvec_groups(Kernel k,
         case Kernel::kMatvecBF16N2:
         case Kernel::kMatvecQ5_0:
         case Kernel::kMatvecQ5_0B:
+        case Kernel::kMatvecQ3_K:  // 4 rows of 32 lanes (i#718)
+        case Kernel::kMatvecQ3_KB:
+        case Kernel::kMatvecIQ2_S:
+        case Kernel::kMatvecIQ2_SB:
+        case Kernel::kMatvecIQ2_XXS:
+        case Kernel::kMatvecIQ2_XXSB:
             return (rows + 3) / 4;
         case Kernel::kMatvecQ4_K:  // 8 rows of 16 lanes
         case Kernel::kMatvecQ4_KB:
@@ -187,6 +193,11 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matvec_q6_k_spv.h"
 #include "matvec_q2_k_spv.h"
 #include "matvec_iq2_xxs_spv.h"
+#include "matvec_q3_k_spv.h"
+#include "matvec_iq2_s_spv.h"
+#include "matvec_q3_k_b_spv.h"
+#include "matvec_iq2_s_b_spv.h"
+#include "matvec_iq2_xxs_b_spv.h"
 #include "matvec_iq3_xxs_spv.h"
 #include "matvec_iq4_xs_spv.h"
 #include "matvec_q8_0_b_spv.h"
@@ -695,6 +706,16 @@ constexpr KernelDesc kDescs[] = {
     {Kernel::kAttnCombinePart, "attn_combine_part",
      locus_attn_combine_part_spv, sizeof(locus_attn_combine_part_spv), 2,
      24},
+    {Kernel::kMatvecQ3_K, "matvec_q3_k", locus_matvec_q3_k_spv,
+     sizeof(locus_matvec_q3_k_spv), 3, 28},
+    {Kernel::kMatvecIQ2_S, "matvec_iq2_s", locus_matvec_iq2_s_spv,
+     sizeof(locus_matvec_iq2_s_spv), 4, 28},
+    {Kernel::kMatvecQ3_KB, "matvec_q3_k_b", locus_matvec_q3_k_b_spv,
+     sizeof(locus_matvec_q3_k_b_spv), 4, 52},
+    {Kernel::kMatvecIQ2_SB, "matvec_iq2_s_b", locus_matvec_iq2_s_b_spv,
+     sizeof(locus_matvec_iq2_s_b_spv), 5, 52},
+    {Kernel::kMatvecIQ2_XXSB, "matvec_iq2_xxs_b", locus_matvec_iq2_xxs_b_spv,
+     sizeof(locus_matvec_iq2_xxs_b_spv), 5, 52},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */

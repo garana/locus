@@ -86,6 +86,14 @@ std::size_t weight_bytes(const Mat& w) {
             b = static_cast<std::size_t>(w.rows) *
                 (w.cols / 256) * 66;
             break;
+        case gguf::TensorType::kIQ2_S:
+            b = static_cast<std::size_t>(w.rows) *
+                (w.cols / 256) * 82;
+            break;
+        case gguf::TensorType::kQ3_K:
+            b = static_cast<std::size_t>(w.rows) *
+                (w.cols / 256) * 110;
+            break;
         case gguf::TensorType::kIQ3_XXS:
             b = static_cast<std::size_t>(w.rows) *
                 (w.cols / 256) * 98;
@@ -115,6 +123,8 @@ Kernel matvec_kernel(const Mat& w) {
         case gguf::TensorType::kQ2_K: return Kernel::kMatvecQ2_K;
         case gguf::TensorType::kIQ2_XXS:
             return Kernel::kMatvecIQ2_XXS;
+        case gguf::TensorType::kIQ2_S: return Kernel::kMatvecIQ2_S;
+        case gguf::TensorType::kQ3_K: return Kernel::kMatvecQ3_K;
         case gguf::TensorType::kIQ3_XXS:
             return Kernel::kMatvecIQ3_XXS;
         case gguf::TensorType::kIQ4_XS:
@@ -133,6 +143,9 @@ Kernel batched_kernel(const Mat& w) {
         case gguf::TensorType::kQ4_K: return Kernel::kMatvecQ4_KB;
         case gguf::TensorType::kQ6_K: return Kernel::kMatvecQ6_KB;
         case gguf::TensorType::kQ5_0: return Kernel::kMatvecQ5_0B;
+        case gguf::TensorType::kQ3_K: return Kernel::kMatvecQ3_KB;
+        case gguf::TensorType::kIQ2_S: return Kernel::kMatvecIQ2_SB;
+        case gguf::TensorType::kIQ2_XXS: return Kernel::kMatvecIQ2_XXSB;
         default: return Kernel::kCount_;
     }
 }
@@ -367,6 +380,7 @@ struct State {
         };
         drop_tbl(iq2xxs_tbl, iq2xxs_tbl_ready);
         drop_tbl(iq3xxs_tbl, iq3xxs_tbl_ready);
+        drop_tbl(iq2s_tbl, iq2s_tbl_ready);
     }
 
     /** Image-model attention (vulkan_attention): Q, per-head K, per-head
@@ -667,8 +681,9 @@ struct State {
     // IQ grid+signs tables (SSBO 3), uploaded once: the grid then
     // ksigns_iq2xs (128 B) at the grid's end. iq2xxs_grid is 2048 B
     // (256 u64), iq3xxs_grid is 1024 B (256 u32).
-    VulkanContext::Buffer iq2xxs_tbl{}, iq3xxs_tbl{};
-    bool iq2xxs_tbl_ready = false, iq3xxs_tbl_ready = false;
+    VulkanContext::Buffer iq2xxs_tbl{}, iq3xxs_tbl{}, iq2s_tbl{};
+    bool iq2xxs_tbl_ready = false, iq3xxs_tbl_ready = false,
+         iq2s_tbl_ready = false;
 
     template <typename Grid>
     VulkanContext::Buffer grid_table(VulkanContext::Buffer& buf,
@@ -687,9 +702,14 @@ struct State {
 
     /** The extra SSBO an IQ kernel binds (grid+signs), or null. */
     VulkanContext::Buffer grid_for(Kernel k) {
-        if (k == Kernel::kMatvecIQ2_XXS) {
+        if (k == Kernel::kMatvecIQ2_XXS || k == Kernel::kMatvecIQ2_XXSB) {
             return grid_table(iq2xxs_tbl, iq2xxs_tbl_ready,
                               ::iq2xxs_grid);
+        }
+        if (k == Kernel::kMatvecIQ2_S || k == Kernel::kMatvecIQ2_SB) {
+            // The grid alone is read (signs are inline); grid_table
+            // appends ksigns_iq2xs regardless.
+            return grid_table(iq2s_tbl, iq2s_tbl_ready, ::iq2s_grid);
         }
         if (k == Kernel::kMatvecIQ3_XXS) {
             return grid_table(iq3xxs_tbl, iq3xxs_tbl_ready,
@@ -1063,7 +1083,10 @@ void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
                   std::uint32_t mode, VulkanContext::Buffer route,
                   std::uint32_t row_stride = 0) {
     const Kernel k = batched_kernel(w);
-    const VulkanContext::Buffer bufs[] = {wb, x, out, route};
+    // IQ kernels bind their grid table after the route (binding 4).
+    const VulkanContext::Buffer grid = s.grid_for(k);
+    const VulkanContext::Buffer bufs[] = {wb, x, out, route, grid};
+    const std::size_t nbuf = grid.impl != nullptr ? 5u : 4u;
     const std::uint32_t push[] = {w.rows,
                                   w.cols,
                                   out_offset,
@@ -1077,7 +1100,8 @@ void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   slots,
                                   mode,
                                   row_stride};
-    s.ctx.dispatch(k, bufs, push, VulkanContext::matvec_groups(k, w.rows),
+    s.ctx.dispatch(k, {bufs, nbuf}, push,
+                   VulkanContext::matvec_groups(k, w.rows),
                    (mode & kSlotSum) != 0 ? 1u : slots);
 }
 

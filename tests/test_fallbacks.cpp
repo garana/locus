@@ -50,16 +50,16 @@ TEST_CASE("fallback counters register once and count", "[metrics]") {
     REQUIRE(count_of("test", "cpu", "temporary reason") == 1);
 }
 
-// Q3_K has no Vulkan matvec shader: matvec_vulkan computes it on the
+// IQ1_S has no Vulkan matvec shader: matvec_vulkan computes it on the
 // CPU and counts that.
 TEST_CASE("vulkan matvec without a shader counts a fallback",
           "[metrics][vulkan]") {
     if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device / kernels not built");
     }
-    constexpr std::size_t kQ3KBlock = 110;  // bytes per 256 weights
-    std::vector<std::byte> w(kQ3KBlock);  // all zero: d = 0
-    const locus::backend::Mat m{locus::gguf::TensorType::kQ3_K, w.data(),
+    constexpr std::size_t kIq1sBlock = 50;  // bytes per 256 weights
+    std::vector<std::byte> w(kIq1sBlock);  // all zero: d = 0
+    const locus::backend::Mat m{locus::gguf::TensorType::kIQ1_S, w.data(),
                                 1, 256};
     std::vector<float> x(256, 1.0f), out(1, -1.0f);
     const char* reason = "no matvec shader for the weight type";
