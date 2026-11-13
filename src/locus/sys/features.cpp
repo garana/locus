@@ -28,11 +28,20 @@ Features detect() {
     f.dotprod = sysctlbyname("hw.optional.arm.FEAT_DotProd", &dp, &dp_len,
                              nullptr, 0) == 0 &&
                 dp != 0;
+    int mm = 0;
+    std::size_t mm_len = sizeof(mm);
+    f.i8mm = sysctlbyname("hw.optional.arm.FEAT_I8MM", &mm, &mm_len,
+                          nullptr, 0) == 0 &&
+             mm != 0;
 #elif defined(__linux__)
     f.dotprod = (getauxval(AT_HWCAP) & HWCAP_ASIMDDP) != 0;
+#if defined(HWCAP2_I8MM)
+    f.i8mm = (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0;
+#endif
 #endif
 #elif defined(__x86_64__)
     f.sse4 = __builtin_cpu_supports("sse4.1") != 0;
+    f.avx = __builtin_cpu_supports("avx") != 0;
     f.avx2 = __builtin_cpu_supports("avx2") != 0;
     f.avx512f = __builtin_cpu_supports("avx512f") != 0;
 #endif
@@ -112,8 +121,9 @@ std::string cpu_name() {
 std::string to_string(const Features& f) {
     auto mark = [](bool on) { return on ? "+" : "-"; };
     return std::string("cpu[") + mark(f.neon) + "neon " + mark(f.dotprod) +
-           "dotprod " + mark(f.sse4) +
-           "sse4 " + mark(f.avx2) + "avx2 " + mark(f.avx512f) +
+           "dotprod " + mark(f.i8mm) + "i8mm " + mark(f.sse4) +
+           "sse4 " + mark(f.avx) + "avx " + mark(f.avx2) + "avx2 " +
+           mark(f.avx512f) +
            "avx512f] gpu[" + mark(f.vulkan) + "vulkan]";
 }
 

@@ -80,6 +80,23 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
 }  // namespace neon_dotprod
 #endif
+
+#if defined(LOCUS_HAS_NEON_I8MM_VARIANT)
+/**
+ * Q8_0 weights through the 8-bit matrix multiply (smmla,
+ * matvec_neon_i8mm.cpp), in llama.cpp's float order (one scaled
+ * integer dot per block): not bit-identical to the baseline kernels,
+ * so the registry uses them only under cpu_fast() on a CPU with i8mm.
+ * A token gets the same bits alone or batched. Other weight types go
+ * to the baseline matvec_neon_q8k / matvec_batch_neon_q8k.
+ */
+namespace neon_i8mm {
+void matvec_neon_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out);
+void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
+                           std::span<float> out_batch, std::uint32_t n);
+}  // namespace neon_i8mm
+#endif
 #endif
 
 #if defined(__x86_64__)
@@ -121,6 +138,25 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
  */
 void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n);
+
+/**
+ * The four SSE4 entry points above, compiled again with AVX
+ * (matvec_sse4_avx.cpp) for CPUs with AVX but not AVX2. Bit-identical
+ * to the SSE4 ones; the registry uses them when sys::detect() reports
+ * AVX.
+ */
+#if defined(LOCUS_HAS_SSE4_AVX_VARIANT)
+namespace sse4_avx {
+void matvec_sse4(const Mat& w, std::span<const float> x,
+                 std::span<float> out);
+void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out);
+void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
+                           std::span<float> out_batch, std::uint32_t n);
+void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
+                       std::span<float> out_batch, std::uint32_t n);
+}  // namespace sse4_avx
+#endif
 
 /**
  * AVX2-vectorized matvec: F32 and Q8_0 rows use AVX2 inner

@@ -211,6 +211,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
         target_compile_definitions(locus PUBLIC
             LOCUS_HAS_NEON_DOTPROD_VARIANT=1)
     endif()
+    # The 8-bit matrix multiply (smmla): Q8_0 in llama.cpp's float
+    # order, used only under LOCUS_CPU_FAST on a CPU with i8mm.
+    check_cxx_source_compiles("
+        #include <arm_neon.h>
+        __attribute__((target(\"arch=armv8.2-a+dotprod+i8mm\")))
+        int32x4_t f(int32x4_t a, int8x16_t b, int8x16_t c) {
+            return vmmlaq_s32(a, b, c);
+        }
+        int main() { return 0; }" LOCUS_CC_I8MM_TARGET)
+    if(LOCUS_CC_I8MM_TARGET)
+        list(APPEND LOCUS_SIMD_VARIANTS "neon_i8mm")
+        target_sources(locus PRIVATE src/locus/backend/matvec_neon_i8mm.cpp)
+        target_compile_definitions(locus PUBLIC
+            LOCUS_HAS_NEON_I8MM_VARIANT=1)
+    endif()
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
@@ -218,6 +233,24 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set_source_files_properties(
         src/locus/backend/matvec_sse4.cpp
         PROPERTIES COMPILE_FLAGS "-msse4.1")
+    # The SSE4 kernels again with AVX (no AVX2) for Sandy / Ivy Bridge:
+    # the file keeps -msse4.1 and gives only the kernels the AVX target
+    # (a pragma, see the file), picked at runtime when the CPU has AVX.
+    include(CheckCXXSourceCompiles)
+    check_cxx_source_compiles("
+        #include <immintrin.h>
+        __attribute__((target(\"avx\")))
+        __m256 f(__m256 a, __m256 b) { return _mm256_add_ps(a, b); }
+        int main() { return 0; }" LOCUS_CC_AVX_TARGET)
+    if(LOCUS_CC_AVX_TARGET)
+        list(APPEND LOCUS_SIMD_VARIANTS "sse4_avx")
+        target_sources(locus PRIVATE src/locus/backend/matvec_sse4_avx.cpp)
+        set_source_files_properties(
+            src/locus/backend/matvec_sse4_avx.cpp
+            PROPERTIES COMPILE_FLAGS "-msse4.1")
+        target_compile_definitions(locus PUBLIC
+            LOCUS_HAS_SSE4_AVX_VARIANT=1)
+    endif()
     check_cxx_compiler_flag("-mavx2" LOCUS_CC_AVX2)
     if(LOCUS_CC_AVX2)
         list(APPEND LOCUS_SIMD_VARIANTS "avx2")
