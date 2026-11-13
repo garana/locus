@@ -86,6 +86,14 @@ std::size_t weight_bytes(const Mat& w) {
             b = static_cast<std::size_t>(w.rows) *
                 (w.cols / 256) * 66;
             break;
+        case gguf::TensorType::kIQ2_S:
+            b = static_cast<std::size_t>(w.rows) *
+                (w.cols / 256) * 82;
+            break;
+        case gguf::TensorType::kQ3_K:
+            b = static_cast<std::size_t>(w.rows) *
+                (w.cols / 256) * 110;
+            break;
         case gguf::TensorType::kIQ3_XXS:
             b = static_cast<std::size_t>(w.rows) *
                 (w.cols / 256) * 98;
@@ -115,6 +123,8 @@ Kernel matvec_kernel(const Mat& w) {
         case gguf::TensorType::kQ2_K: return Kernel::kMatvecQ2_K;
         case gguf::TensorType::kIQ2_XXS:
             return Kernel::kMatvecIQ2_XXS;
+        case gguf::TensorType::kIQ2_S: return Kernel::kMatvecIQ2_S;
+        case gguf::TensorType::kQ3_K: return Kernel::kMatvecQ3_K;
         case gguf::TensorType::kIQ3_XXS:
             return Kernel::kMatvecIQ3_XXS;
         case gguf::TensorType::kIQ4_XS:
@@ -133,6 +143,9 @@ Kernel batched_kernel(const Mat& w) {
         case gguf::TensorType::kQ4_K: return Kernel::kMatvecQ4_KB;
         case gguf::TensorType::kQ6_K: return Kernel::kMatvecQ6_KB;
         case gguf::TensorType::kQ5_0: return Kernel::kMatvecQ5_0B;
+        case gguf::TensorType::kQ3_K: return Kernel::kMatvecQ3_KB;
+        case gguf::TensorType::kIQ2_S: return Kernel::kMatvecIQ2_SB;
+        case gguf::TensorType::kIQ2_XXS: return Kernel::kMatvecIQ2_XXSB;
         default: return Kernel::kCount_;
     }
 }
@@ -350,6 +363,8 @@ struct State {
         drop(route, route_n);
         drop(attn_part, attn_part_n);
         drop(attn_round, attn_round_n);
+        drop(res, res_n);
+        drop(zeros, zeros_n);
         for (int c = 0; c < kChunkCount_; ++c) {
             drop(chunk[c], chunk_n[c]);
         }
@@ -367,6 +382,7 @@ struct State {
         };
         drop_tbl(iq2xxs_tbl, iq2xxs_tbl_ready);
         drop_tbl(iq3xxs_tbl, iq3xxs_tbl_ready);
+        drop_tbl(iq2s_tbl, iq2s_tbl_ready);
     }
 
     /** Image-model attention (vulkan_attention): Q, per-head K, per-head
@@ -382,6 +398,11 @@ struct State {
     /** conv2d_vulkan's input and output (scratch). */
     VulkanContext::Buffer conv_in{}, conv_out{};
     std::size_t conv_in_n = 0, conv_out_n = 0;
+
+    /** kolibri1's post norms (i#714): the residual saved across a
+     *  normed branch, and zeros to clear the stream with. */
+    VulkanContext::Buffer res{}, zeros{};
+    std::size_t res_n = 0, zeros_n = 0;
 
     /** Activation buffers, sized on first use per model dims. */
     VulkanContext::Buffer x{}, xb{}, q{}, gate{}, up{}, attout{},
@@ -667,8 +688,9 @@ struct State {
     // IQ grid+signs tables (SSBO 3), uploaded once: the grid then
     // ksigns_iq2xs (128 B) at the grid's end. iq2xxs_grid is 2048 B
     // (256 u64), iq3xxs_grid is 1024 B (256 u32).
-    VulkanContext::Buffer iq2xxs_tbl{}, iq3xxs_tbl{};
-    bool iq2xxs_tbl_ready = false, iq3xxs_tbl_ready = false;
+    VulkanContext::Buffer iq2xxs_tbl{}, iq3xxs_tbl{}, iq2s_tbl{};
+    bool iq2xxs_tbl_ready = false, iq3xxs_tbl_ready = false,
+         iq2s_tbl_ready = false;
 
     template <typename Grid>
     VulkanContext::Buffer grid_table(VulkanContext::Buffer& buf,
@@ -687,9 +709,14 @@ struct State {
 
     /** The extra SSBO an IQ kernel binds (grid+signs), or null. */
     VulkanContext::Buffer grid_for(Kernel k) {
-        if (k == Kernel::kMatvecIQ2_XXS) {
+        if (k == Kernel::kMatvecIQ2_XXS || k == Kernel::kMatvecIQ2_XXSB) {
             return grid_table(iq2xxs_tbl, iq2xxs_tbl_ready,
                               ::iq2xxs_grid);
+        }
+        if (k == Kernel::kMatvecIQ2_S || k == Kernel::kMatvecIQ2_SB) {
+            // The grid alone is read (signs are inline); grid_table
+            // appends ksigns_iq2xs regardless.
+            return grid_table(iq2s_tbl, iq2s_tbl_ready, ::iq2s_grid);
         }
         if (k == Kernel::kMatvecIQ3_XXS) {
             return grid_table(iq3xxs_tbl, iq3xxs_tbl_ready,
@@ -1063,7 +1090,10 @@ void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
                   std::uint32_t mode, VulkanContext::Buffer route,
                   std::uint32_t row_stride = 0) {
     const Kernel k = batched_kernel(w);
-    const VulkanContext::Buffer bufs[] = {wb, x, out, route};
+    // IQ kernels bind their grid table after the route (binding 4).
+    const VulkanContext::Buffer grid = s.grid_for(k);
+    const VulkanContext::Buffer bufs[] = {wb, x, out, route, grid};
+    const std::size_t nbuf = grid.impl != nullptr ? 5u : 4u;
     const std::uint32_t push[] = {w.rows,
                                   w.cols,
                                   out_offset,
@@ -1077,7 +1107,8 @@ void rec_matvec_b(State& s, const Mat& w, VulkanContext::Buffer wb,
                                   slots,
                                   mode,
                                   row_stride};
-    s.ctx.dispatch(k, bufs, push, VulkanContext::matvec_groups(k, w.rows),
+    s.ctx.dispatch(k, {bufs, nbuf}, push,
+                   VulkanContext::matvec_groups(k, w.rows),
                    (mode & kSlotSum) != 0 ? 1u : slots);
 }
 
@@ -1582,6 +1613,10 @@ bool grp_ok(const PagedPool& pp, const DecodeAttn& a) {
 void rec_attn_decode(State& s, const PagedPool& pp, std::uint32_t n_pos,
                      std::uint32_t heads, const DecodeAttn& a,
                      bool grouped) {
+    if (a.first >= n_pos) {
+        throw std::logic_error(
+            "rec_attn_decode: window start past the last position");
+    }
     // Positions per block: attn_decode_grp.comp / attn_decode.comp CH.
     const std::uint32_t block = grouped ? 32 : 64;
     const std::uint32_t blocks = (n_pos - a.first + block - 1) / block;
@@ -2392,9 +2427,12 @@ bool vulkan_hparams_supported(const model::Hparams& hp) {
     // shared array (vk::kAttnPartMax floats): wider heads, or a
     // larger MLA latent rank, would overrun it.
     // Archs with their own layer body (muse-spark) run on the CPU
-    // single-token forward only.
+    // single-token forward only, unless the GPU forward implements it
+    // (custom_layer_gpu: kolibri1). Sliding layers rope at their own
+    // base; the window needs the decode kernels' first position.
     const bool mla = hp.arch == model::Arch::kDeepseek2;
-    return !hp.custom_layer &&
+    return (!hp.custom_layer || hp.custom_layer_gpu) &&
+           (hp.swa_window == 0 || hp.swa_layers.size() == hp.n_layers) &&
            hp.norm_type == model::NormType::kRmsNorm &&
            hp.idx_top_k == 0 && vk::attn_width_fits(hp.head_dim) &&
            (!mla || vk::attn_width_fits(hp.kv_lora_rank));
@@ -2451,6 +2489,14 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
         return false;
     }
     const bool mla = hp.arch == model::Arch::kDeepseek2;
+    if (quant && hp.swa_window > 0 &&
+        cache.geometry().kv_type != kv::KvType::kF16) {
+        // attn_paged_q reads from position 0: no window there.
+        static Fallback& f = fallback(
+            "vulkan", "per_op", "sliding window with a Q8 or Q4 KV cache");
+        f.add();
+        return false;
+    }
     if (quant && mla &&
         cache.geometry().kv_type != kv::KvType::kF16) {
         // MLA caches a single latent row (no separate K/V); its Q8/Q4
@@ -2554,6 +2600,19 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
            static_cast<std::size_t>(hp.n_heads) * hp.n_ctx);
     s.grow(s.logits, s.logits_n, hp.n_vocab);
     s.grow(s.table, s.table_n, cache.total_blocks());
+    if (std::any_of(m.layers().begin() + layer_begin,
+                    m.layers().begin() + layer_end, [](const auto& l) {
+                        return !l.post_attn_norm.empty() ||
+                               !l.post_ffw_norm.empty();
+                    })) {
+        s.grow(s.res, s.res_n, hp.n_embd);
+        if (s.zeros_n < hp.n_embd) {
+            s.grow(s.zeros, s.zeros_n, hp.n_embd);
+            const std::vector<float> z(s.zeros_n, 0.0f);
+            s.ctx.write_buffer(
+                s.zeros, std::as_bytes(std::span<const float>(z)));
+        }
+    }
     if (hp.n_expert > 0) {
         s.grow(s.router, s.router_n, std::size_t{hp.n_expert} * 2);
         s.grow(s.route, s.route_n,
@@ -2594,7 +2653,7 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
     const PagedPool pp{pool, s.table, geom.block_tokens, block_stride,
                        kv_dim, f16};
     const std::uint32_t eps_bits = fbits(hp.rms_eps);
-    const std::uint32_t base_bits = fbits(hp.rope_freq_base);
+    const std::uint32_t base_bits_all = fbits(hp.rope_freq_base);
     float corr_lo = 0.0f, corr_hi = 0.0f;
     if (mla) {
         yarn_corr_range(rope_d, hp.rope_freq_base, hp.yarn,
@@ -2618,6 +2677,22 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             in, s.upload(w.data(), w.size() * 4), out};
         const std::uint32_t push[] = {n, eps_bits, out_off, tail};
         s.ctx.dispatch(Kernel::kRmsNorm, bufs, push, 1);
+    };
+    // x = resid + rmsnorm(in) * w (rmsnorm_res), written into x; in or
+    // resid may be x itself.
+    auto norm_res = [&](std::span<const float> w,
+                        VulkanContext::Buffer in,
+                        VulkanContext::Buffer resid) {
+        const VulkanContext::Buffer bufs[] = {
+            in, s.upload(w.data(), w.size() * 4), s.x, resid};
+        const std::uint32_t push[] = {hp.n_embd, eps_bits, 0, 0};
+        s.ctx.dispatch(Kernel::kRmsNormRes, bufs, push, 1);
+    };
+    // n_embd floats from src to dst.
+    auto copy = [&](VulkanContext::Buffer src, VulkanContext::Buffer dst) {
+        const VulkanContext::Buffer bufs[] = {src, dst};
+        const std::uint32_t push[] = {hp.n_embd, 0, 0};
+        s.ctx.dispatch(Kernel::kCopy, bufs, push, (hp.n_embd + 255) / 256);
     };
     auto swiglu = [&](const Mat& wg, const Mat& wu, const Mat& wd,
                       std::uint32_t ff, float wgt,
@@ -2700,6 +2775,16 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
         const std::uint32_t row_off = block * block_stride +
                                       rel * layer_stride +
                                       in_block * kv_dim;
+        // Sliding-window archs (kolibri1; hp.swa_layers): a sliding
+        // layer ropes at rope_freq_base_swa and sees the window's last
+        // swa_window positions (key t while pos - t < window, as the
+        // CPU's), a global layer attends everything with no rope.
+        const bool swa_l = hp.swa_window > 0 && hp.swa_layers[l];
+        const bool no_rope = hp.swa_window > 0 && !swa_l;
+        const std::uint32_t base_bits =
+            swa_l ? fbits(hp.rope_freq_base_swa) : base_bits_all;
+        const std::uint32_t first =
+            swa_l && pos + 1 > hp.swa_window ? pos + 1 - hp.swa_window : 0;
 
         norm(lay.attn_norm, s.x, s.xb, hp.n_embd, 0);
         mark(s, model::Stage::kNorm);
@@ -2723,12 +2808,14 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             // The Q4_K stacked projection ropes in its epilogue too
             // (i#688).
             const bool epi_rope = (fused || n_q4k_seg > 0) &&
-                                  !hp.rope_neox && !qk_norm && !bias;
+                                  !hp.rope_neox && !qk_norm && !bias &&
+                                  !no_rope;
             const Kernel rope_k =
                 hp.rope_neox ? Kernel::kRopeNeox : Kernel::kRope;
             // q-k-norm models norm and rope q and K in one dispatch,
             // once K has landed (below).
             const bool qk_fused = !epi_rope && qk_norm && !qblk &&
+                                  !no_rope &&
                                   hp.head_dim <=
                                       VulkanContext::kQkNormRopeHdMax;
             // Per-head RMS norm in place: `heads` rows of head_dim
@@ -2778,12 +2865,14 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                 if (qk_norm) {
                     head_norm(s.q, 0, hp.n_heads, lay.attn_q_norm);
                 }
-                const VulkanContext::Buffer bufs[] = {s.q,
-                                                      divisors};
-                const std::uint32_t push[] = {
-                    hp.n_heads, hp.head_dim, pos, 0, hp.head_dim,
-                    base_bits,  fbits(1.0f), 0,   0};
-                s.ctx.dispatch(rope_k, bufs, push, hp.n_heads);
+                if (!no_rope) {
+                    const VulkanContext::Buffer bufs[] = {s.q,
+                                                          divisors};
+                    const std::uint32_t push[] = {
+                        hp.n_heads, hp.head_dim, pos, 0, hp.head_dim,
+                        base_bits,  fbits(1.0f), 0,   0};
+                    s.ctx.dispatch(rope_k, bufs, push, hp.n_heads);
+                }
             }
             if (!qblk) {
                 if (!fused && n_q4k_seg == 0) {
@@ -2817,13 +2906,16 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                         head_norm(kv_dst, k_at, hp.n_kv_heads,
                                   lay.attn_k_norm);
                     }
-                    const VulkanContext::Buffer bufs[] = {
-                        kv_dst, divisors};
-                    const std::uint32_t push[] = {
-                        hp.n_kv_heads, hp.head_dim, pos,
-                        k_at,          hp.head_dim, base_bits,
-                        fbits(1.0f),   0,           0};
-                    s.ctx.dispatch(rope_k, bufs, push, hp.n_kv_heads);
+                    if (!no_rope) {
+                        const VulkanContext::Buffer bufs[] = {
+                            kv_dst, divisors};
+                        const std::uint32_t push[] = {
+                            hp.n_kv_heads, hp.head_dim, pos,
+                            k_at,          hp.head_dim, base_bits,
+                            fbits(1.0f),   0,           0};
+                        s.ctx.dispatch(rope_k, bufs, push,
+                                       hp.n_kv_heads);
+                    }
                 }
                 if (f16) {
                     // K and V rows (planes kv_dim apart) in one go.
@@ -2839,7 +2931,7 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                 rec_attn_gqa(s, pp, s.q, s.att, s.attout, 1, pos,
                              hp.n_heads, group, hp.head_dim,
                              hp.n_heads * hp.head_dim, rel * layer_stride,
-                             layer_stride / 2);
+                             layer_stride / 2, first);
             } else {
                 // R14 #45: K/V into F32 scratch (reuse the FFN
                 // gate/up buffers -- free until this layer's FFN),
@@ -3057,11 +3149,25 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                 }
             }
         }
-        rec_matvec(s, lay.wo, s.attout, s.x, 0, true);
+        if (lay.post_attn_norm.empty()) {
+            rec_matvec(s, lay.wo, s.attout, s.x, 0, true);
+        } else {
+            // kolibri1: x += rmsnorm(wo . attn) * post_attention_norm.
+            rec_matvec(s, lay.wo, s.attout, s.res, 0, false);
+            norm_res(lay.post_attn_norm, s.res, s.x);
+        }
         mark(s, model::Stage::kAttention);
 
         norm(lay.ffn_norm, s.x, s.xb, hp.n_embd, 0);
         mark(s, model::Stage::kNorm);
+        // kolibri1's post-FFN norm: with the FFN input normed into xb,
+        // the branch accumulates into a cleared x, then x = saved +
+        // rmsnorm(branch) * post_ffw_norm.
+        const bool post_ffw = !lay.post_ffw_norm.empty();
+        if (post_ffw) {
+            copy(s.x, s.res);
+            copy(s.zeros, s.x);
+        }
         if (!lay.is_moe()) {
             swiglu(lay.w_gate, lay.w_up, lay.w_down, hp.n_ff,
                    1.0f, 0, 0, 0, nullptr, nullptr, nullptr);
@@ -3286,6 +3392,9 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                                                    : nullptr);
             }
             mark(s, model::Stage::kMoe);
+        }
+        if (post_ffw) {
+            norm_res(lay.post_ffw_norm, s.x, s.res);
         }
     }
     if (layer_end < hp.n_layers) {
@@ -3512,6 +3621,7 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
     }
     if (n == 0 || n > State::kMultiMax || n > kSmallBatch ||
         cache.quantized() || hp.arch == model::Arch::kDeepseek2 ||
+        hp.custom_layer ||  // kolibri1: single-token forward only
         !vulkan_forward_supported(m) ||
         (last && !short_ok(m.output_weight())) ||
         std::ranges::any_of(run, [&](const auto& l) {
@@ -3893,6 +4003,11 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     if (!embd.empty() && embd.size() != tokens.size()) {
         throw std::invalid_argument(
             "vulkan_forward_batch: one embedding entry per token");
+    }
+    if (hp.custom_layer) {
+        // kolibri1's window, NoPE and post norms are in the single-token
+        // forward only: prefill runs it token by token.
+        return false;
     }
     std::lock_guard lk(state_mu());
     State& s = state();

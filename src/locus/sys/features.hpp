@@ -20,6 +20,8 @@ struct Features {
     bool i8mm = false;
     /** x86-64 SSE4.1 detected on the running CPU. */
     bool sse4 = false;
+    /** x86-64 AVX (256-bit float, OS saves the YMM state). */
+    bool avx = false;
     /** x86-64 AVX2 detected on the running CPU. */
     bool avx2 = false;
     /** x86-64 AVX-512F detected on the running CPU. */

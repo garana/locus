@@ -7,7 +7,9 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "iq_grids.h"
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
 #include "locus/backend/vulkan/q8_layout.hpp"
 #include "locus/model/transformer.hpp"
@@ -779,6 +781,156 @@ TEST_CASE("vulkan fused SwiGLU q4_k equals the unfused chain for one "
                             got.size() * sizeof(float)) == 0);
         for (auto b : {gb, ub, xb, ob, og, ou}) {
             ctx.destroy_buffer(b);
+        }
+    }
+}
+
+// i#718: the Q3_K and IQ2_S matvecs and the batched Q3_K / IQ2_S /
+// IQ2_XXS ones (Kolibri-1's experts) against the CPU dequant: the
+// plain op path, then split, routed and weighted-sum slots.
+TEST_CASE("vulkan q3_k iq2_s and iq2_xxs matvecs match the CPU plain "
+          "and batched",
+          "[vulkan]") {
+    if (!VulkanContext::available() ||
+        !locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    using locus::gguf::TensorType;
+    struct Case {
+        const char* name;
+        TensorType type;
+        Kernel batched;
+        std::size_t block, d_off;  // block bytes, f16 d's offset
+        bool grid;                 // binds an IQ grid table
+    };
+    const Case cases[] = {
+        {"q3_k", TensorType::kQ3_K, Kernel::kMatvecQ3_KB, 110, 108, false},
+        {"iq2_s", TensorType::kIQ2_S, Kernel::kMatvecIQ2_SB, 82, 0, true},
+        {"iq2_xxs", TensorType::kIQ2_XXS, Kernel::kMatvecIQ2_XXSB, 66, 0,
+         true},
+    };
+    // 9 rows (not a multiple of the 4-row workgroup), 3 super-blocks.
+    const std::uint32_t rows = 9, cols = 768, n_mat = 5, slots = 3;
+    for (const Case& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            std::mt19937 rng(71);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            std::uniform_int_distribution<int> byte_d(0, 255);
+            const std::size_t mat_bytes =
+                std::size_t{rows} * (cols / 256) * c.block;
+            std::vector<std::byte> w(mat_bytes * n_mat);
+            for (auto& b : w) {
+                b = static_cast<std::byte>(byte_d(rng));
+            }
+            for (std::size_t at = c.d_off; at < w.size(); at += c.block) {
+                const std::uint16_t d = locus::backend::f32_to_f16(0.01f);
+                std::memcpy(&w[at], &d, 2);
+            }
+            std::vector<float> x(std::size_t{cols} * slots);
+            for (auto& v : x) {
+                v = dist(rng);
+            }
+            auto cpu_slot = [&](std::uint32_t id, std::uint32_t k) {
+                locus::backend::Mat m{c.type, w.data() + id * mat_bytes,
+                                      rows, cols};
+                std::vector<float> out(rows);
+                locus::backend::matvec(
+                    m, std::span<const float>(x).subspan(k * cols, cols),
+                    out);
+                return out;
+            };
+            // Plain: the op path (it binds the grid table).
+            {
+                locus::backend::Mat m{c.type, w.data() + 2 * mat_bytes,
+                                      rows, cols};
+                std::vector<float> gpu(rows);
+                locus::backend::matvec_vulkan(
+                    m, std::span<const float>(x).subspan(0, cols), gpu);
+                const auto want = cpu_slot(2, 0);
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    INFO("plain row " << r);
+                    REQUIRE(gpu[r] ==
+                            Catch::Approx(want[r]).margin(1e-3).epsilon(1e-4));
+                }
+            }
+            VulkanContext ctx;
+            const std::uint32_t ids[] = {4, 0, 2};
+            const float wts[] = {0.5f, -1.25f, 2.0f};
+            const std::vector<std::uint32_t> route = {
+                ids[0], ids[1], ids[2], fbits(wts[0]), fbits(wts[1]),
+                fbits(wts[2])};
+            auto wb = ctx.create_buffer((w.size() + 3) & ~std::size_t{3});
+            {
+                std::vector<std::byte> wp(w);
+                wp.resize((w.size() + 3) & ~std::size_t{3});
+                ctx.write_buffer(wb, wp);
+            }
+            std::vector<std::byte> tbl;
+            if (c.type == TensorType::kIQ2_S) {
+                tbl.resize(sizeof(iq2s_grid) + sizeof(ksigns_iq2xs));
+                std::memcpy(tbl.data(), iq2s_grid, sizeof(iq2s_grid));
+            } else if (c.type == TensorType::kIQ2_XXS) {
+                tbl.resize(sizeof(iq2xxs_grid) + sizeof(ksigns_iq2xs));
+                std::memcpy(tbl.data(), iq2xxs_grid, sizeof(iq2xxs_grid));
+                std::memcpy(tbl.data() + sizeof(iq2xxs_grid), ksigns_iq2xs,
+                            sizeof(ksigns_iq2xs));
+            }
+            auto gb = ctx.create_buffer(std::max<std::size_t>(tbl.size(), 4));
+            if (!tbl.empty()) {
+                ctx.write_buffer(gb, tbl);
+            }
+            auto xb = upload(ctx, x);
+            auto rb = upload(ctx, route);
+            auto run = [&](std::uint32_t mode, std::uint32_t out_stride,
+                           std::size_t out_n, std::vector<float> init) {
+                auto ob = upload(ctx, init);
+                ctx.begin_batch();
+                const VulkanContext::Buffer bufs[] = {wb, xb, ob, rb, gb};
+                const std::uint32_t push[] = {
+                    rows, cols, 0, mode & 2u ? 1u : 0u, 0, 0, fbits(1.0f),
+                    static_cast<std::uint32_t>(mat_bytes), cols, out_stride,
+                    slots, mode, 0u};
+                ctx.dispatch(c.batched, {bufs, c.grid ? 5u : 4u}, push,
+                             VulkanContext::matvec_groups(c.batched, rows),
+                             mode & 2u ? 1u : slots);
+                ctx.end_batch();
+                auto got = download<float>(ctx, ob, out_n);
+                ctx.destroy_buffer(ob);
+                return got;
+            };
+            for (const std::uint32_t mode : {0u, 1u}) {
+                auto got = run(mode, rows, rows * slots,
+                               std::vector<float>(rows * slots, 0.0f));
+                for (std::uint32_t k = 0; k < slots; ++k) {
+                    const auto want = cpu_slot(mode == 1 ? ids[k] : k, k);
+                    for (std::uint32_t r = 0; r < rows; ++r) {
+                        INFO("mode " << mode << " slot " << k << " row " << r);
+                        REQUIRE(got[k * rows + r] ==
+                                Catch::Approx(want[r])
+                                    .margin(1e-3)
+                                    .epsilon(1e-4));
+                    }
+                }
+            }
+            {
+                std::vector<float> init(rows);
+                for (auto& v : init) {
+                    v = dist(rng);
+                }
+                auto got = run(3, 0, rows, init);
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    float want = init[r];
+                    for (std::uint32_t k = 0; k < slots; ++k) {
+                        want += wts[k] * cpu_slot(ids[k], k)[r];
+                    }
+                    INFO("sum row " << r);
+                    REQUIRE(got[r] ==
+                            Catch::Approx(want).margin(1e-3).epsilon(1e-4));
+                }
+            }
+            for (auto b : {wb, gb, xb, rb}) {
+                ctx.destroy_buffer(b);
+            }
         }
     }
 }

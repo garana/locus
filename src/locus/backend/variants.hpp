@@ -140,6 +140,25 @@ void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n);
 
 /**
+ * The four SSE4 entry points above, compiled again with AVX
+ * (matvec_sse4_avx.cpp) for CPUs with AVX but not AVX2. Bit-identical
+ * to the SSE4 ones; the registry uses them when sys::detect() reports
+ * AVX.
+ */
+#if defined(LOCUS_HAS_SSE4_AVX_VARIANT)
+namespace sse4_avx {
+void matvec_sse4(const Mat& w, std::span<const float> x,
+                 std::span<float> out);
+void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out);
+void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
+                           std::span<float> out_batch, std::uint32_t n);
+void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
+                       std::span<float> out_batch, std::uint32_t n);
+}  // namespace sse4_avx
+#endif
+
+/**
  * AVX2-vectorized matvec: F32 and Q8_0 rows use AVX2 inner
  * loops; other weight types delegate to the scalar reference.
  * Compiled only on x86-64 hosts (per-source -mavx2).

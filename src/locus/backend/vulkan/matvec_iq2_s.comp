@@ -1,0 +1,139 @@
+#version 450
+
+// IQ2_S matvec: 82-byte blocks of 256 elements -- f16 d | qs[32] grid
+// index low bytes | signs[32] | qh[8] | scales[8]. Each 32-element
+// sub-block ib takes two 4-bit scales (d * (0.5 + s) * 0.25, one per
+// 16 elements) and 4 groups of 8: a 10-bit iq2s_grid index (qs plus 2
+// qh bits) picks 8 unsigned grid bytes, a sign byte flips them (mirrors
+// cpu_ops dequant_block_iq2_s). As matvec_q5_0: ROWS rows a
+// workgroup, LANES lanes a row, each lane taking 32-element sub-blocks.
+//
+// Compiled a second time with -DBATCHED (matvec_iq2_s_b) with matvec_q5_0's
+// slot semantics: slot y reads w_off + id * w_stride (bytes), x_off +
+// y * x_stride and writes out_offset + y * out_stride, id = route[y]
+// under mode bit 1; mode bit 2 sums all slots weighted by
+// route[n_slots + k] into one output row.
+//
+// G holds iq2s_grid (1024 uint64 = 8 KiB): binding 3, or 4 in the
+// BATCHED build (after the route).
+
+#define LANES 32u
+#define ROWS 4u
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer O { float o[]; };
+#ifdef BATCHED
+layout(std430, binding = 3) readonly buffer R { uint route[]; };
+#endif
+#ifdef BATCHED
+layout(std430, binding = 4) readonly buffer G { uint g[]; };
+#else
+layout(std430, binding = 3) readonly buffer G { uint g[]; };
+#endif
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint out_offset;
+    uint accumulate;
+    uint w_off;   // byte offset
+    uint x_off;
+    float scale;
+#ifdef BATCHED
+    uint w_stride;  // per slot, in bytes
+    uint x_stride;
+    uint out_stride;
+    uint n_slots;
+    uint mode;      // 1 = ids from route[], 2 = weighted slot sum
+    uint row_stride;  // unused (quantized rows are whole)
+#endif
+} pc;
+
+shared float red[LANES * ROWS];
+
+uint byte_at(uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+float f16_at(uint i) {
+    return unpackHalf2x16(byte_at(i) | (byte_at(i + 1u) << 8u)).x;
+}
+
+/** Unsigned byte j (0..7) of grid entry idx (a uint64 = two words). */
+uint grid_byte(uint idx, uint j) {
+    return (g[idx * 2u + (j >> 2u)] >> ((j & 3u) * 8u)) & 0xffu;
+}
+
+/** This lane's share of dot(row r of the matrix at wbase, x). */
+float row_part(uint wbase, uint xbase, uint r, uint lane) {
+    uint nb = pc.cols / 256u;
+    uint base = wbase + r * nb * 82u;
+    float acc = 0.0;
+    for (uint u = lane; u < nb * 8u; u += LANES) {
+        uint b = u >> 3;
+        uint ib = u & 7u;
+        uint at = base + b * 82u;
+        float d = f16_at(at);
+        uint sc = byte_at(at + 74u + ib);
+        uint qh = byte_at(at + 66u + ib);
+        uint xb = xbase + b * 256u + ib * 32u;
+        for (uint l = 0u; l < 4u; ++l) {
+            float dl = d * (0.5 + float(l < 2u ? (sc & 0xfu) : (sc >> 4))) *
+                       0.25;
+            uint idx = byte_at(at + 2u + ib * 4u + l) |
+                       ((qh << (8u - 2u * l)) & 0x300u);
+            uint signs = byte_at(at + 34u + ib * 4u + l);
+            float s = 0.0;
+            for (uint j = 0u; j < 8u; ++j) {
+                float gp = float(grid_byte(idx, j));
+                s += ((signs & (1u << j)) != 0u ? -gp : gp) *
+                     x[xb + l * 8u + j];
+            }
+            acc += dl * s;
+        }
+    }
+    return acc;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x % LANES;
+    uint slot = gl_LocalInvocationID.x / LANES;
+    uint r = gl_WorkGroupID.x * ROWS + slot;
+    uint at = pc.out_offset + r;
+    float acc = 0.0;
+    if (r < pc.rows) {
+#ifdef BATCHED
+        uint y = gl_WorkGroupID.y;
+        bool sum = (pc.mode & 2u) != 0u;
+        uint k1 = sum ? pc.n_slots : y + 1u;
+        for (uint k = sum ? 0u : y; k < k1; ++k) {
+            uint id = (pc.mode & 1u) != 0u ? route[k] : k;
+            float wk = sum ? uintBitsToFloat(route[pc.n_slots + k])
+                           : 1.0;
+            acc += wk * row_part(pc.w_off + id * pc.w_stride,
+                                 pc.x_off + k * pc.x_stride, r, lane);
+        }
+        if (!sum) {
+            at += y * pc.out_stride;
+        }
+#else
+        acc = row_part(pc.w_off, pc.x_off, r, lane);
+#endif
+    }
+    red[gl_LocalInvocationID.x] = acc;
+    barrier();
+    for (uint step = LANES / 2u; step > 0u; step >>= 1) {
+        if (lane < step) {
+            red[gl_LocalInvocationID.x] +=
+                red[gl_LocalInvocationID.x + step];
+        }
+        barrier();
+    }
+    if (lane == 0u && r < pc.rows) {
+        float v = red[gl_LocalInvocationID.x] * pc.scale;
+        o[at] = pc.accumulate != 0 ? o[at] + v : v;
+    }
+}

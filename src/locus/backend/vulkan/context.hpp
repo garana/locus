@@ -185,6 +185,16 @@ enum class Kernel {
     /** attn_combine's round merge: one partial per round of blocks
      *  (attn_combine_part, i#116). */
     kAttnCombinePart,
+    /** Q3_K and IQ2_S matvecs, and batched (MoE slot) Q3_K, IQ2_S and
+     *  IQ2_XXS (i#718). */
+    kMatvecQ3_K,
+    kMatvecIQ2_S,
+    kMatvecQ3_KB,
+    kMatvecIQ2_SB,
+    kMatvecIQ2_XXSB,
+    /** RMS norm added to a residual (rmsnorm.comp RESID): kolibri1's
+     *  post-attention and post-FFN norms (i#714). */
+    kRmsNormRes,
     kCount_,
 };
 

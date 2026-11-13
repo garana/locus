@@ -9,6 +9,12 @@
 // Compiled again with -DBATCHED (rmsnorm_b): workgroup y normalizes
 // row y, read at in_off + y * in_stride and written at out_off +
 // y * out_stride (a prefill chunk's rows in one dispatch).
+//
+// Compiled again with -DRESID (rmsnorm_res): out[out_off + i] =
+// r[i] + x[i] * w[i] / sqrt(mean+eps), the normed branch added to the
+// residual R (kolibri1's post-attention and post-FFN norms). X or R
+// may be the same buffer as OUT: each thread reads element i before
+// it writes it.
 
 #define WG 256u
 
@@ -17,6 +23,9 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer X { float x[]; };
 layout(std430, binding = 1) readonly buffer W { float w[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
+#ifdef RESID
+layout(std430, binding = 3) readonly buffer R { float r[]; };
+#endif
 
 layout(push_constant) uniform PC {
     uint n;
@@ -56,7 +65,11 @@ void main() {
     }
     float scale = inversesqrt(red[0] / float(pc.n) + pc.eps);
     for (uint i = tid; i < pc.n; i += WG) {
+#ifdef RESID
+        o[oi + i] = r[i] + x[xi + i] * scale * w[i];
+#else
         o[oi + i] = x[xi + i] * scale * w[i];
+#endif
     }
 #ifndef BATCHED
     for (uint i = pc.n + tid; i < pc.n + pc.tail; i += WG) {

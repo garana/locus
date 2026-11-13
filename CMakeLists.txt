@@ -233,6 +233,24 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set_source_files_properties(
         src/locus/backend/matvec_sse4.cpp
         PROPERTIES COMPILE_FLAGS "-msse4.1")
+    # The SSE4 kernels again with AVX (no AVX2) for Sandy / Ivy Bridge:
+    # the file keeps -msse4.1 and gives only the kernels the AVX target
+    # (a pragma, see the file), picked at runtime when the CPU has AVX.
+    include(CheckCXXSourceCompiles)
+    check_cxx_source_compiles("
+        #include <immintrin.h>
+        __attribute__((target(\"avx\")))
+        __m256 f(__m256 a, __m256 b) { return _mm256_add_ps(a, b); }
+        int main() { return 0; }" LOCUS_CC_AVX_TARGET)
+    if(LOCUS_CC_AVX_TARGET)
+        list(APPEND LOCUS_SIMD_VARIANTS "sse4_avx")
+        target_sources(locus PRIVATE src/locus/backend/matvec_sse4_avx.cpp)
+        set_source_files_properties(
+            src/locus/backend/matvec_sse4_avx.cpp
+            PROPERTIES COMPILE_FLAGS "-msse4.1")
+        target_compile_definitions(locus PUBLIC
+            LOCUS_HAS_SSE4_AVX_VARIANT=1)
+    endif()
     check_cxx_compiler_flag("-mavx2" LOCUS_CC_AVX2)
     if(LOCUS_CC_AVX2)
         list(APPEND LOCUS_SIMD_VARIANTS "avx2")
@@ -266,6 +284,7 @@ if(Vulkan_FOUND)
             matvec matvec_f16 matvec_q8_0 matvec_q4_0 matvec_q5_0
             matvec_t matvec_q4_k matvec_q5_k matvec_q6_k matvec_q2_k
             matvec_iq2_xxs matvec_iq3_xxs matvec_iq4_xs
+            matvec_q3_k matvec_iq2_s
             rmsnorm rope silu_mul
             conv1d conv1d_transpose snake1d conv2d conv2d_gemm
             attn_paged_q kv_store_q moe_route
@@ -331,12 +350,16 @@ if(Vulkan_FOUND)
             attn_combine_part=attn_combine:PARTIAL
             kv_scatter_f16=kv_scatter:KV_F16
             rmsnorm_b=rmsnorm:BATCHED
+            rmsnorm_res=rmsnorm:RESID
             rope_b=rope:BATCHED
             rope_neox=rope:NEOX
             rope_neox_b=rope:BATCHED,NEOX
             matvec_q4_k_b=matvec_q4_k:BATCHED
             matvec_q6_k_b=matvec_q6_k:BATCHED
             matvec_q5_0_b=matvec_q5_0:BATCHED
+            matvec_q3_k_b=matvec_q3_k:BATCHED
+            matvec_iq2_s_b=matvec_iq2_s:BATCHED
+            matvec_iq2_xxs_b=matvec_iq2_xxs:BATCHED
             matvec_q4_k_glu_b=matvec_q4_k:BATCHED,SWIGLU
             matvec_q4_k_p=matvec_q4_k:BATCHED,PAIRS
             matvec_q4_k_glu_p=matvec_q4_k:BATCHED,SWIGLU,PAIRS
