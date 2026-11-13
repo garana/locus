@@ -891,10 +891,11 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
         }
         check(Mat{t, w.data(), rows, 800}, 7);
     }
-    // IQ2_XXS and IQ2_S: random bytes are valid grid indices and signs;
-    // 8 blocks a row, 50 tokens over two tiles.
+    // IQ2_XXS, IQ2_S and IQ4_XS: random bytes are valid codes, signs and
+    // scales; 8 blocks a row, 50 tokens over two tiles.
     for (const auto& [t, bytes] : {std::pair{TensorType::kIQ2_XXS, 66u},
-                                   std::pair{TensorType::kIQ2_S, 82u}}) {
+                                   std::pair{TensorType::kIQ2_S, 82u},
+                                   std::pair{TensorType::kIQ4_XS, 136u}}) {
         std::vector<std::byte> w(std::size_t{rows} * 8 * bytes);
         for (auto& by : w) {
             by = static_cast<std::byte>(byte_d(rng));
