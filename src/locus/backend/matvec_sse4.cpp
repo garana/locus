@@ -1303,16 +1303,18 @@ void iq2_group16(__m128i g, __m128i neg, __m128i q, int ls, __m128i& acc) {
 }
 
 /**
- * One IQ2_XXS (66 B) or IQ2_S (82 B) row against a Q8_K activation (plain
- * order), in scalar vec_dot_iq2_xxs_q8_k / vec_dot_iq2_s_q8_k's float
- * order: each block's integer sum (exact, so its add order is free),
- * times f16(d) * d_x, added to sumf, then 0.125 * sumf.
+ * One IQ2_XXS (66 B), IQ2_XS (74 B) or IQ2_S (82 B) row against a Q8_K
+ * activation (plain order), in scalar vec_dot_iq2_{xxs,xs,s}_q8_k's
+ * float order: each block's integer sum (exact, so its add order is
+ * free), times f16(d) * d_x, added to sumf, then 0.125 * sumf.
  */
-float row_iq2_q8k_sse4(bool xxs, const std::byte* row, const Q8kAct& a,
-                       std::size_t nb) {
+float row_iq2_q8k_sse4(gguf::TensorType type, const std::byte* row,
+                       const Q8kAct& a, std::size_t nb) {
+    const bool xxs = type == gguf::TensorType::kIQ2_XXS;
+    const bool xs = type == gguf::TensorType::kIQ2_XS;
     float sumf = 0.0f;
     for (std::size_t i = 0; i < nb; ++i) {
-        const std::byte* blk = row + i * (xxs ? 66 : 82);
+        const std::byte* blk = row + i * (xxs ? 66 : (xs ? 74 : 82));
         const float d = f16_to_f32(load_u16(blk)) * a.d[i];
         const std::int8_t* q8 = a.qs + i * 256;
         const auto* u = reinterpret_cast<const std::uint8_t*>(blk);
@@ -1334,6 +1336,17 @@ float row_iq2_q8k_sse4(bool xxs, const std::byte* row, const Q8kAct& a,
                     s[l] = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
                 }
                 ls1 = ls2 = static_cast<int>(2 * (aux1 >> 28) + 1);
+            } else if (xs) {
+                // Four 16-bit words: a 9-bit grid index and a 7-bit
+                // ksigns index; two 4-bit scales at 66 + ib32.
+                for (int l = 0; l < 4; ++l) {
+                    std::uint16_t q;
+                    std::memcpy(&q, u + 2 + 2 * (4 * ib32 + l), 2);
+                    g[l] = iq2xs_grid[q & 511];
+                    s[l] = ksigns_iq2xs[q >> 9];
+                }
+                ls1 = 2 * (u[66 + ib32] & 0xf) + 1;
+                ls2 = 2 * (u[66 + ib32] >> 4) + 1;
             } else {
                 const std::uint8_t* qs = u + 2 + 4 * ib32;
                 const std::uint8_t* signs = u + 34 + 4 * ib32;
@@ -1616,7 +1629,7 @@ Q8Path q8_path(gguf::TensorType type, std::size_t cols) {
         type == T::kQ6_K) {
         return Q8Path::kK;
     }
-    if (type == T::kIQ2_XXS || type == T::kIQ2_S) {
+    if (type == T::kIQ2_XXS || type == T::kIQ2_XS || type == T::kIQ2_S) {
         return Q8Path::kIQ2;
     }
     if (type == T::kIQ4_XS) {
@@ -1639,8 +1652,7 @@ float row_q8k_sse4(Q8Path path, gguf::TensorType type, const std::byte* row,
         return row_q2_k_q8k_sse4(row, a, nb);
     }
     if (path == Q8Path::kIQ2) {
-        return row_iq2_q8k_sse4(type == gguf::TensorType::kIQ2_XXS, row, a,
-                                nb);
+        return row_iq2_q8k_sse4(type, row, a, nb);
     }
     if (path == Q8Path::kIQ4XS) {
         return row_iq4_xs_q8k_sse4(row, a, nb);
