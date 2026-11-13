@@ -811,6 +811,56 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
         }
         check(Mat{t, w.data(), rows, 800}, 7);
     }
+    // The maddubs edges (i#708): every weight -128 (|w| reads as 128
+    // unsigned) against activations that quantize to +-127 in every
+    // lane, the largest pair sums (2 x 128 x 127, under int16's max).
+    {
+        constexpr std::uint32_t cols = 64, n = 5;
+        std::vector<std::byte> w(std::size_t{rows} * (cols / 32) * 34);
+        for (std::size_t bl = 0; bl < w.size() / 34; ++bl) {
+            const std::uint16_t d = f32_to_f16(0.01f);
+            std::memcpy(w.data() + bl * 34, &d, 2);
+            std::memset(w.data() + bl * 34 + 2, 0x80, 32);  // -128
+        }
+        const Mat m{TensorType::kQ8_0, w.data(), rows, cols};
+        std::vector<float> xb(std::size_t{n} * cols);
+        for (std::size_t i = 0; i < xb.size(); ++i) {
+            xb[i] = (i / 7) % 2 ? -3.0f : 3.0f;  // equal |x|: q = +-127
+        }
+        std::vector<float> got(std::size_t{rows} * n);
+        matvec_batch_sse4_q8k(m, xb, got, n);
+        for (std::uint32_t tk = 0; tk < n; ++tk) {
+            const std::span<const float> x(xb.data() + std::size_t{tk} * cols,
+                                           cols);
+            std::vector<float> ref(rows), one(rows);
+            matvec_q8k(m, x, ref);
+            matvec_sse4_q8k(m, x, one);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                REQUIRE(one[r] == ref[r]);
+                REQUIRE(got[std::size_t{r} * n + tk] == ref[r]);
+            }
+        }
+    }
+    // The kernel moves the weights' sign onto the activations, so an
+    // activation quant must never be -128: the quantizer's |q| <= 127.
+    {
+        std::uniform_real_distribution<float> big(-1e6f, 1e6f);
+        std::vector<float> x(4096);
+        for (auto& v : x) {
+            v = big(rng);
+        }
+        x[0] = 0.0f;  // and a block whose max is reached exactly
+        for (std::size_t j = 0; j < 32; ++j) {
+            x[32 + j] = j % 2 ? -5.0f : 5.0f;
+        }
+        std::vector<float> d(x.size() / 32);
+        std::vector<std::int8_t> q(x.size());
+        quantize_activation_q8_0(x, d.data(), q.data());
+        for (const std::int8_t v : q) {
+            REQUIRE(v >= -127);
+            REQUIRE(v <= 127);
+        }
+    }
 }
 #endif
 
