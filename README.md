@@ -181,8 +181,9 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   language model on the GPU).
 - Performance: prefill on Apple GPUs at 42% of Metal's (#10:
   MoltenVK exposes no cooperative matrix), CPU prefill on x86 (#618:
-  a SIMD softmax and an AVX path, #705 and #706, wait on whether CPU
-  kernels may change their float order), batch-invariant decode at full
+  a SIMD softmax and an AVX path, #705 and #706, run behind the opt-in
+  `LOCUS_CPU_FAST` flag, as they change the float order), batch-invariant
+  decode at full
   speed on V3D (#511), the MoE hybrid on Vulkan (#679).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
