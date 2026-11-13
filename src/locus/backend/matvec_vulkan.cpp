@@ -1004,15 +1004,16 @@ void rec_matvec_seg(State& s, std::span<const Mat* const> ms,
 
 /**
  * @returns How many of q, k, v (in that order) can run as one
- * rec_matvec_q4k_seg dispatch: q and k Q4_K of one width (2), and v
- * too when it matches them (3); 0 otherwise.
+ * rec_matvec_q4k_seg dispatch: q and k of one width, both Q4_K or both
+ * Q3_K (2), and v too when it matches them (3); 0 otherwise.
  */
 std::size_t q4k_seg_count(const Mat& q, const Mat& k, const Mat& v) {
-    const auto q4 = gguf::TensorType::kQ4_K;
-    if (q.type != q4 || k.type != q4 || k.cols != q.cols) {
+    const auto t = q.type;
+    if ((t != gguf::TensorType::kQ4_K && t != gguf::TensorType::kQ3_K) ||
+        k.type != t || k.cols != q.cols) {
         return 0;
     }
-    return v.type == q4 && v.cols == q.cols ? 3 : 2;
+    return v.type == t && v.cols == q.cols ? 3 : 2;
 }
 
 /**
@@ -1034,7 +1035,10 @@ void rec_matvec_q4k_seg(State& s, std::span<const Mat* const> ms,
         s.upload_w(*ms[0]), x, out, out2, w1,
         ms.size() > 2 ? s.upload_w(*ms[2]) : w1,
         rope.divisors.impl != nullptr ? rope.divisors : x};
-    rec_seg_dispatch(s, Kernel::kMatvecQ4_KSeg, "matvec_q4_k_seg", ms, bufs,
+    // Q3_K q / k / v run matvec_q4_k.comp's TYPE_Q3K build (i#173).
+    const bool q3 = ms[0]->type == gguf::TensorType::kQ3_K;
+    rec_seg_dispatch(s, q3 ? Kernel::kMatvecQ3_KSeg : Kernel::kMatvecQ4_KSeg,
+                     q3 ? "matvec_q3_k_seg" : "matvec_q4_k_seg", ms, bufs,
                      out_off, off1, off2, rope);
 }
 
@@ -2783,10 +2787,15 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             s.ctx.dispatch(Kernel::kMatvecQ8_0Glu, bufs, push,
                            VulkanContext::matvec_groups(
                                Kernel::kMatvecQ8_0Glu, ff));
-        } else if (wg.type == gguf::TensorType::kQ4_K &&
-                   wu.type == gguf::TensorType::kQ4_K &&
-                   wg.cols == wu.cols && off_g == off_u) {
-            // The same for Q4_K (i#688): binding 3 is unused.
+        } else if ((wg.type == gguf::TensorType::kQ4_K ||
+                    wg.type == gguf::TensorType::kQ3_K) &&
+                   wu.type == wg.type && wg.cols == wu.cols &&
+                   off_g == off_u) {
+            // The same for Q4_K (i#688) and Q3_K (i#173): binding 3 is
+            // unused.
+            const Kernel gk = wg.type == gguf::TensorType::kQ3_K
+                                  ? Kernel::kMatvecQ3_KGlu
+                                  : Kernel::kMatvecQ4_KGlu;
             const VulkanContext::Buffer gw =
                 whole_g != nullptr ? *whole_g : s.upload_w(g2);
             const VulkanContext::Buffer bufs[] = {
@@ -2795,9 +2804,8 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
             const std::uint32_t push[] = {
                 ff, wg.cols, 0, 0, w_off_units(wg, off_g), 0,
                 fbits(1.0f)};
-            s.ctx.dispatch(Kernel::kMatvecQ4_KGlu, bufs, push,
-                           VulkanContext::matvec_groups(
-                               Kernel::kMatvecQ4_KGlu, ff));
+            s.ctx.dispatch(gk, bufs, push,
+                           VulkanContext::matvec_groups(gk, ff));
         } else {
             rec_matvec(s, g2, s.xb, s.gate, 0, false, off_g, 0, 1.0f,
                        whole_g);
