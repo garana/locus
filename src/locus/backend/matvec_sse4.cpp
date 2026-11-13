@@ -748,22 +748,27 @@ namespace {
  * 4l..4l+3 of both halves, q (weights) times x (activations). Integer
  * sums are exact, so the SIMD add order matches the scalar loop.
  */
+/**
+ * The four lane sums of 16 weights a against 16 activations b: lane l
+ * is a[4l..4l+3] . b[4l..4l+3]. maddubs takes |a| (unsigned) times b
+ * with a's sign, two products per int16: at most 2 * 128 * 127 =
+ * 32512, so no saturation, and b (Q8_0 activations) is never -128, so
+ * negating it cannot overflow. madd with ones adds the pairs.
+ */
+__m128i lanes16_sse4(__m128i abs_a, __m128i a, __m128i b) {
+    const __m128i p = _mm_maddubs_epi16(abs_a, _mm_sign_epi8(b, a));
+    return _mm_madd_epi16(p, _mm_set1_epi16(1));
+}
+
 __m128i block32_lanes_sse4(const std::int8_t* q, const std::int8_t* x) {
-    // madd: pairs of adjacent products; hadd: pairs of pairs, so lane l
-    // holds elements 4l..4l+3 of one 16-quant half.
-    auto half = [](const std::int8_t* a, const std::int8_t* b) {
-        const __m128i va =
-            _mm_loadu_si128(reinterpret_cast<const __m128i*>(a));
-        const __m128i vb =
-            _mm_loadu_si128(reinterpret_cast<const __m128i*>(b));
-        const __m128i lo = _mm_madd_epi16(_mm_cvtepi8_epi16(va),
-                                          _mm_cvtepi8_epi16(vb));
-        const __m128i hi =
-            _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(va, 8)),
-                           _mm_cvtepi8_epi16(_mm_srli_si128(vb, 8)));
-        return _mm_hadd_epi32(lo, hi);
-    };
-    return _mm_add_epi32(half(q, x), half(q + 16, x + 16));
+    const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q));
+    const __m128i q1 =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(q + 16));
+    const __m128i x0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x));
+    const __m128i x1 =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + 16));
+    return _mm_add_epi32(lanes16_sse4(_mm_abs_epi8(q0), q0, x0),
+                         lanes16_sse4(_mm_abs_epi8(q1), q1, x1));
 }
 
 /**
@@ -818,32 +823,24 @@ void row_q8_0_q8_0_sse4_xt(const std::byte* row, const float* const* xd,
                            const std::int8_t* const* xq, std::size_t nb,
                            float* out) {
     constexpr std::size_t kBlk = 34;
-    // A block's 32 weights as four int16 vectors.
+    // A block's 32 weights and their absolute values, taken once.
     struct W16 {
-        __m128i v[4];
+        __m128i q[2], abs_q[2];
     };
     const auto widen = [](const std::byte* blk) {
         const auto* q = reinterpret_cast<const __m128i*>(blk + 2);
         const __m128i a = _mm_loadu_si128(q);
         const __m128i b = _mm_loadu_si128(q + 1);
-        return W16{{_mm_cvtepi8_epi16(a),
-                    _mm_cvtepi8_epi16(_mm_srli_si128(a, 8)),
-                    _mm_cvtepi8_epi16(b),
-                    _mm_cvtepi8_epi16(_mm_srli_si128(b, 8))}};
+        return W16{{a, b}, {_mm_abs_epi8(a), _mm_abs_epi8(b)}};
     };
-    // The lane sums block32_lanes_sse4 gives, from the widened weights.
+    // The lane sums block32_lanes_sse4 gives, from the loaded weights.
     const auto lanes = [](const W16& w, const std::int8_t* x) {
         const __m128i xa =
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(x));
         const __m128i xb =
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + 16));
-        const __m128i h0 = _mm_hadd_epi32(
-            _mm_madd_epi16(w.v[0], _mm_cvtepi8_epi16(xa)),
-            _mm_madd_epi16(w.v[1], _mm_cvtepi8_epi16(_mm_srli_si128(xa, 8))));
-        const __m128i h1 = _mm_hadd_epi32(
-            _mm_madd_epi16(w.v[2], _mm_cvtepi8_epi16(xb)),
-            _mm_madd_epi16(w.v[3], _mm_cvtepi8_epi16(_mm_srli_si128(xb, 8))));
-        return _mm_add_epi32(h0, h1);
+        return _mm_add_epi32(lanes16_sse4(w.abs_q[0], w.q[0], xa),
+                             lanes16_sse4(w.abs_q[1], w.q[1], xb));
     };
     __m128 s0[kT], s1[kT];
     for (int t = 0; t < kT; ++t) {
