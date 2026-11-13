@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "locus/engine/disk_prefix_store.hpp"
 #include "locus/gguf/gguf.hpp"
@@ -41,6 +42,16 @@ DiskKey disk_key_for(const gguf::GgufFile& g, const std::string& path,
  */
 std::shared_ptr<DiskPrefixStore> open_disk_prefix(
     const std::string& dir, std::uint64_t cap_bytes,
+    const gguf::GgufFile& g, const std::string& path,
+    const model::TransformerModel& m, kv::KvType kv_type);
+
+/**
+ * As open_disk_prefix, with the prefixes kept by the helper process
+ * `argv` (HelperPrefixStore, i#655); a blob over `cap_bytes` is not
+ * sent.
+ */
+std::shared_ptr<DiskPrefixStore> open_helper_prefix(
+    const std::vector<std::string>& argv, std::uint64_t cap_bytes,
     const gguf::GgufFile& g, const std::string& path,
     const model::TransformerModel& m, kv::KvType kv_type);
 

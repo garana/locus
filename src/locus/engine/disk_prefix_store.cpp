@@ -137,13 +137,9 @@ bool parse_name(const std::string& name, std::uint64_t& digest) {
 
 }  // namespace
 
-DiskPrefixStore::DiskPrefixStore(fs::path dir, DiskKey key,
-                                 std::size_t block_bytes,
-                                 std::uint64_t cap_bytes)
-    : dir_(std::move(dir)),
-      key_(std::move(key)),
-      block_bytes_(block_bytes),
-      cap_bytes_(cap_bytes) {
+DiskPrefixStore::DiskPrefixStore(DiskKey key, std::size_t block_bytes,
+                                 std::uint64_t cap_bytes, std::nullptr_t)
+    : key_(std::move(key)), block_bytes_(block_bytes), cap_bytes_(cap_bytes) {
     if (key_.block_tokens == 0 || block_bytes_ == 0) {
         throw std::invalid_argument(
             "DiskPrefixStore: block_tokens and block_bytes must be > 0");
@@ -154,7 +150,13 @@ DiskPrefixStore::DiskPrefixStore(fs::path dir, DiskKey key,
     }
     const std::vector<std::uint8_t> k = header({}, 0);
     key_seed_ = checksum(k.data(), k.size());
+}
 
+DiskPrefixStore::DiskPrefixStore(fs::path dir, DiskKey key,
+                                 std::size_t block_bytes,
+                                 std::uint64_t cap_bytes)
+    : DiskPrefixStore(std::move(key), block_bytes, cap_bytes, nullptr) {
+    dir_ = std::move(dir);
     // Files hold clients' prompt tokens: owner only. A directory the
     // caller made keeps its mode; the files in it are 0600 anyway.
     if (fs::create_directories(dir_)) {
@@ -229,6 +231,48 @@ std::uint64_t DiskPrefixStore::file_bytes(std::size_t header_bytes,
     // header, one checksum per block, the header checksum, the blocks
     return header_bytes + 8ull * n_blocks + 8 +
            static_cast<std::uint64_t>(block_bytes_) * n_blocks;
+}
+
+std::vector<std::uint8_t> DiskPrefixStore::meta(
+    std::span<const tok::TokenId> prompt, std::uint32_t n_blocks,
+    std::span<const std::uint8_t* const> src) const {
+    std::vector<std::uint8_t> m = header(prompt, n_blocks);
+    for (std::uint32_t i = 0; i < n_blocks; ++i) {
+        put(m, checksum(src[i], block_bytes_));
+    }
+    put(m, checksum(m.data(), m.size()));
+    return m;
+}
+
+bool DiskPrefixStore::decode(std::span<const std::uint8_t> blob,
+                             std::span<const tok::TokenId> prompt,
+                             std::uint32_t n_blocks,
+                             std::span<std::uint8_t* const> dst) const {
+    if (n_blocks == 0 || dst.size() < n_blocks ||
+        prompt.size() < std::size_t{n_blocks} * key_.block_tokens) {
+        return false;
+    }
+    const std::vector<std::uint8_t> want = header(prompt, n_blocks);
+    if (blob.size() != file_bytes(want.size(), n_blocks)) {
+        return false;
+    }
+    const std::size_t meta = want.size() + 8ull * n_blocks + 8;
+    std::uint64_t hsum;
+    std::memcpy(&hsum, blob.data() + meta - 8, 8);
+    if (std::memcmp(blob.data(), want.data(), want.size()) != 0 ||
+        hsum != checksum(blob.data(), meta - 8)) {
+        return false;
+    }
+    for (std::uint32_t i = 0; i < n_blocks; ++i) {
+        std::uint64_t sum;
+        std::memcpy(&sum, blob.data() + want.size() + 8ull * i, 8);
+        const std::uint8_t* b = blob.data() + meta + block_bytes_ * i;
+        if (checksum(b, block_bytes_) != sum) {
+            return false;
+        }
+        std::memcpy(dst[i], b, block_bytes_);
+    }
+    return true;
 }
 
 std::vector<std::uint64_t> DiskPrefixStore::digests(
@@ -406,13 +450,10 @@ bool DiskPrefixStore::write(std::span<const tok::TokenId> prompt,
         return false;
     }
     const std::uint64_t digest = digest_of(prompt, n_blocks);
-    std::vector<std::uint8_t> meta = header(prompt, n_blocks);
-    const std::uint64_t bytes = file_bytes(meta.size(), n_blocks);
-    for (std::uint32_t i = 0; i < n_blocks; ++i) {
-        put(meta, checksum(src[i], block_bytes_));
-    }
-    put(meta, checksum(meta.data(), meta.size()));
-
+    const std::vector<std::uint8_t> meta =
+        this->meta(prompt, n_blocks, src);
+    const std::uint64_t bytes =
+        meta.size() + static_cast<std::uint64_t>(block_bytes_) * n_blocks;
     if (bytes > cap_bytes_) {
         return false;
     }
