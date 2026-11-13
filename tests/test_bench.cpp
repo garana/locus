@@ -395,14 +395,28 @@ TEST_CASE("bench: sse4 q8k batch rows", "[.][bench]") {
     for (auto& v : x) {
         v = xd(rng);
     }
+    // bytes and d_off are per scale block (32 columns for Q8_0, 256 for
+    // the K-quants).
     struct Q {
         const char* name;
         locus::gguf::TensorType type;
-        std::size_t bytes, d_off;
+        std::size_t block, bytes, d_off;
     };
-    for (const Q& q : {Q{"q4_k", locus::gguf::TensorType::kQ4_K, 144, 0},
-                       Q{"q6_k", locus::gguf::TensorType::kQ6_K, 210, 208}}) {
-        std::vector<std::byte> w(std::size_t{rows} * (cols / 256) * q.bytes);
+    using Fn = void (*)(const Mat&, std::span<const float>, std::span<float>,
+                        std::uint32_t);
+    std::vector<std::pair<const char*, Fn>> builds = {
+        {"sse4", &matvec_batch_sse4_q8k}};
+#if defined(LOCUS_HAS_SSE4_AVX_VARIANT)
+    if (locus::sys::detect().avx) {
+        builds.push_back({"sse4_avx", &sse4_avx::matvec_batch_sse4_q8k});
+    }
+#endif
+    for (const Q& q :
+         {Q{"q8_0", locus::gguf::TensorType::kQ8_0, 32, 34, 0},
+          Q{"q4_k", locus::gguf::TensorType::kQ4_K, 256, 144, 0},
+          Q{"q6_k", locus::gguf::TensorType::kQ6_K, 256, 210, 208}}) {
+        std::vector<std::byte> w(std::size_t{rows} * (cols / q.block) *
+                                 q.bytes);
         for (auto& b : w) {
             b = static_cast<std::byte>(byte_d(rng));
         }
@@ -412,17 +426,19 @@ TEST_CASE("bench: sse4 q8k batch rows", "[.][bench]") {
         }
         const Mat m{q.type, w.data(), rows, cols};
         std::vector<float> out(std::size_t{rows} * n);
-        matvec_batch_sse4_q8k(m, x, out, n);  // warm
-        const auto t0 = std::chrono::steady_clock::now();
-        for (std::uint32_t r = 0; r < reps; ++r) {
-            matvec_batch_sse4_q8k(m, x, out, n);
+        for (const auto& [build, fn] : builds) {
+            fn(m, x, out, n);  // warm
+            const auto t0 = std::chrono::steady_clock::now();
+            for (std::uint32_t r = 0; r < reps; ++r) {
+                fn(m, x, out, n);
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t0)
+                                  .count() /
+                              reps;
+            WARN(build << " " << q.name << " " << rows << " x " << cols
+                       << ", " << n << " tokens: " << ms << " ms per call");
         }
-        const double ms = std::chrono::duration<double, std::milli>(
-                              std::chrono::steady_clock::now() - t0)
-                              .count() /
-                          reps;
-        WARN(q.name << " " << rows << " x " << cols << ", " << n
-                    << " tokens: " << ms << " ms per call");
     }
     SUCCEED();
 }
