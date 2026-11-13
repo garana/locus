@@ -19,8 +19,7 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Architectures:** llama (dense and Mixtral-style MoE), deepseek2
   (MLA), glm-dsa, qwen2, qwen2vl (Qwen2.5-VL's language model, with
   M-RoPE for image tokens on the CPU), qwen2moe, qwen3moe, dbrx,
-  muse-spark, deepseek41, kolibri1 (Kolibri-1, checked on a synthetic
-  model; the real weights need a 64 GB host, #659).
+  muse-spark, deepseek41, kolibri1 (Kolibri-1).
 - **Weight formats:** GGUF with F32, F16, BF16, the legacy quants,
   K-quants, IQ quants, TQ1_0 and TQ2_0.
 - **Tokenizers:** SentencePiece, byte-level BPE (gpt2, llama3 and
@@ -135,20 +134,21 @@ models. "Teacher-forced"
 means each reference token must be within a small margin of the top
 logit, for prompts where greedy decoding tips at a near-tie.
 
-| Model                         | Arch       | Weights          | Check                                              |
-|-------------------------------|------------|------------------|----------------------------------------------------|
-| stories260K                   | llama      | F32              | token-exact, every backend                         |
-| Llama-3.2-1B                  | llama      | Q8_0, Q4_K_M     | token-exact; Q4_K_M on every backend               |
-| DeepSeek-V2-Lite              | deepseek2  | Q4_K_M           | token-exact, CPU and Vulkan                        |
-| DeepSeek-Coder-V2-Lite        | deepseek2  | Q8_0             | Vulkan batched prefill tracks per-token prefill    |
-| Qwen1.5-MoE-A2.7B             | qwen2moe   | Q4_K_M           | token-exact, CPU and Vulkan                        |
-| Qwen3-Coder-30B-A3B           | qwen3moe   | Q4_K_M           | token-exact, CPU and Vulkan                        |
-| DBRX-Instruct 16x12B          | dbrx       | IQ2_XXS, 32 GB   | token-exact                                        |
-| Muse Spark Open 816B-A42B     | muse-spark | UD-IQ1_S, 176 GB | one prompt token-exact, one teacher-forced         |
-| DeepSeek-V4.1-Flash-1017      | deepseek41 | UD-IQ1_S, 233 GB | teacher-forced, against llama.cpp#30817            |
-| Orpheus-TTS 3B                | llama      | Q4_K_M           | first audio frame teacher-forced; SNAC RMS < 1e-6  |
-| Janus-Pro-1B                  | llama      | BF16             | 576 image codes exact; vision tower RMS < 1e-4 rel |
-| PixArt-XL-2-512x512           | pixart     | F32, T5 F16      | each stage vs diffusers; 8-step latent RMS 9e-5    |
+| Model                     | Arch       | Weights            | Check                                                      |
+|---------------------------|------------|--------------------|------------------------------------------------------------|
+| stories260K               | llama      | F32                | token-exact, every backend                                 |
+| Llama-3.2-1B              | llama      | Q8_0, Q4_K_M       | token-exact; Q4_K_M on every backend                       |
+| DeepSeek-V2-Lite          | deepseek2  | Q4_K_M             | token-exact, CPU and Vulkan                                |
+| DeepSeek-Coder-V2-Lite    | deepseek2  | Q8_0               | Vulkan batched prefill tracks per-token prefill            |
+| Qwen1.5-MoE-A2.7B         | qwen2moe   | Q4_K_M             | token-exact, CPU and Vulkan                                |
+| Qwen3-Coder-30B-A3B       | qwen3moe   | Q4_K_M             | token-exact, CPU and Vulkan                                |
+| DBRX-Instruct 16x12B      | dbrx       | IQ2_XXS, 32 GB     | token-exact                                                |
+| Muse Spark Open 816B-A42B | muse-spark | UD-IQ1_S, 176 GB   | one prompt token-exact, one teacher-forced                 |
+| DeepSeek-V4.1-Flash-1017  | deepseek41 | UD-IQ1_S, 233 GB   | teacher-forced, against llama.cpp#30817                    |
+| Kolibri-1 384x2.8B        | kolibri1   | APEX I-Nano, 24 GB | English token-exact, German teacher-forced, CPU and Vulkan |
+| Orpheus-TTS 3B            | llama      | Q4_K_M             | first audio frame teacher-forced; SNAC RMS < 1e-6          |
+| Janus-Pro-1B              | llama      | BF16               | 576 image codes exact; vision tower RMS < 1e-4 rel         |
+| PixArt-XL-2-512x512       | pixart     | F32, T5 F16        | each stage vs diffusers; 8-step latent RMS 9e-5            |
 
 Two goldens run with f32 activations, because 8-bit activations tip
 their greedy text at a near-tie: Qwen1.5-MoE and DeepSeek-V2-Lite.
