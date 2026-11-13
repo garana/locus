@@ -541,15 +541,22 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   mode a lone sequence takes the multi-sequence kernels too, so a
   request's logits are bit-identical alone and batched. It is the
   default on Apple GPUs, where a lone sequence costs little; elsewhere
-  (V3D: a third slower alone) a lone sequence keeps the single-sequence
-  forward. Under the default a lone sequence on a Q4_K or Q6_K model
-  keeps it too (the K-quant short-batch kernels cost it 9 to 11% on an
-  M2 Pro), so such a model is batch-invariant only with the mode set.
+  a lone sequence keeps the single-sequence forward (on V3D the mode
+  costs a lone Q8_0 sequence 3% with the NT 1 build below, but stays
+  off by default until i#682 is understood). Under the default a lone
+  sequence on a Q4_K or Q6_K model keeps it too (the K-quant
+  short-batch kernels cost it 9 to 11% on an M2 Pro), so such a model
+  is batch-invariant only with the mode set.
   `LOCUS_VK_BATCH_INVARIANT=1` / `0` (or `vulkan_set_batch_invariant`)
   overrides. Q8_0 batches of 1 or 2 take the NT 2 build of the
-  short-batch kernel, 3 or 4 the NT 4 build (#516) and larger ones the
-  NT 8 build (Q4_K and Q6_K too, `matvec_k_n.comp`, #436, with its NT 4
-  builds from #541); the builds run the same per-token arithmetic, so a
+  short-batch kernel (on V3D a lone sequence the NT 1 build, with
+  matvec_q8_0's inner loop: V3D is register-bound and the NT 2 loop
+  cost it 39 to 50% per byte; V3D only, as its loop shape gives the
+  other builds' bits there but not under MoltenVK's fast math;
+  `LOCUS_VK_Q8N1=0` turns it off, i#511), 3 or 4 the NT 4 build (#516)
+  and larger ones the NT 8 build (Q4_K and Q6_K too,
+  `matvec_k_n.comp`, #436, with its NT 4 builds from #541); the builds
+  run the same per-token arithmetic, so a
   sequence's bits do not depend on the batch (#432; a test checks the
   builds agree bit for bit on the device). Llama 3.2 1B Q8_0 on an M4
   Max: 2, 3, 4 and 8 sequences make 314, 361, 405 and 404 tok/s in all

@@ -1203,6 +1203,30 @@ Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
  * checks that on each device).
  */
 Kernel q8n_variant(const VulkanContext& ctx, Kernel k, std::uint32_t n) {
+    // The NT 1 builds (i#511): matvec_q8_0's loop for a lone sequence,
+    // on V3D, where with the NT 2 loop a lone Q8_0 1B decode took 2080
+    // ms of GPU time per token against the single path's 1468
+    // (LOCUS_VK_Q8N1=0 turns it off). V3D only: its loop shape differs
+    // from the shared one, and Mesa's V3D compiler (no FMA, no
+    // reassociation) gives it the same bits, which the builds test
+    // checks; MoltenVK's fast math does not (i#511), so elsewhere the
+    // NT 2 build stays, whatever the variable says.
+    // Only for n == 1: the NT 1 build computes token 0 only.
+    static const bool n1 = [&] {
+        if (ctx.device_name().find("V3D") == std::string::npos) {
+            return false;
+        }
+        const char* e = std::getenv("LOCUS_VK_Q8N1");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    if (n == 1 && n1) {
+        if (k == Kernel::kMatvecQ8_0N) {
+            return Kernel::kMatvecQ8_0N1;
+        }
+        if (k == Kernel::kMatvecQ8_0NGlu) {
+            return Kernel::kMatvecQ8_0N1Glu;
+        }
+    }
     if (n <= 2) {
         if (k == Kernel::kMatvecQ8_0N) {
             return Kernel::kMatvecQ8_0N2;
@@ -1957,7 +1981,9 @@ int batch_invariant_state() {
         } else {
             // On by default where a lone sequence was measured to cost
             // little in this mode: Apple GPUs (M2 Pro level, M4 Max
-            // -5%); off elsewhere (V3D -33%, others not measured).
+            // -5%); off elsewhere. V3D costs 3% with the NT 1 build
+            // (i#511) but stays off until i#682 (a rare mismatch in
+            // this mode there) is understood.
             v = vulkan_device_name().find("Apple") != std::string::npos ? 2
                                                                        : 0;
         }
