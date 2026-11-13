@@ -9,23 +9,15 @@
 
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_seq.hpp"
-#include "locus/sys/thread_pool.hpp"
+#include "locus/image/dense.hpp"
 
 namespace locus::image {
 
 namespace {
 
-/** Exact GELU (torch.nn.GELU(), approximate="none"). */
-void gelu(std::span<float> x) {
-    for (float& v : x) {
-        v = 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752440f));
-    }
-}
+using dense::gelu;
 
-/** Runs fn(i) for i in [0, n) on the thread pool. */
-void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
-    sys::ThreadPool::instance().parallel_for(n, fn);
-}
+using dense::parallel;
 
 /**
  * out[t][r] = w[r] . x[t] + bias[r] for n tokens, token-major in and

@@ -9,7 +9,6 @@
 #include <thread>
 
 #include "locus/image/dense.hpp"
-#include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
 
@@ -23,10 +22,7 @@ void gelu_tanh(std::span<float> x) {
     }
 }
 
-/** Runs fn(i) for i in [0, n) on the thread pool. */
-void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
-    sys::ThreadPool::instance().parallel_for(n, fn);
-}
+using dense::parallel;
 
 /**
  * out[t][r] = w[r] . x[t] for n tokens, token-major in and out. The
@@ -63,13 +59,8 @@ void linear(const backend::Ops& op, const backend::Mat& w,
     });
 }
 
-/** T5's rms norm (no mean, no bias) over each of n rows of width d. */
-void rms_norm(std::span<const float> x, std::span<const float> w, float eps,
-              std::uint32_t n, std::uint32_t d, std::span<float> out) {
-    parallel(n, [&](std::size_t t) {
-        backend::rmsnorm(x.subspan(t * d, d), w, eps, out.subspan(t * d, d));
-    });
-}
+/** T5's rms norm (no mean, no bias): dense::rms_norm. */
+using dense::rms_norm;
 
 }  // namespace
 

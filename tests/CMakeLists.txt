@@ -39,6 +39,7 @@ add_executable(locus_tests
     test_helper_spawn.cpp
     test_prefix_cache.cpp
     test_disk_prefix_store.cpp
+    test_helper_prefix_store.cpp
     test_engine_disk_prefix.cpp
     test_server_disk_prefix.cpp
     test_poller.cpp
@@ -154,12 +155,13 @@ target_include_directories(locus_tests PRIVATE
 target_compile_definitions(locus_tests PRIVATE
     LOCUS_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
     LOCUS_AUTH_HELPER_BIN="$<TARGET_FILE:locus-auth-helper>"
+    LOCUS_PREFIX_HELPER_BIN="$<TARGET_FILE:locus-prefix-helper>"
     LOCUS_STAGE_BIN="$<TARGET_FILE:locus-stage>"
     LOCUS_RUN_BIN="$<TARGET_FILE:locus-run>"
     LOCUS_SERVER_BIN="$<TARGET_FILE:locus-server>"
 )
-add_dependencies(locus_tests locus-auth-helper locus-stage locus-run
-                 locus-server)
+add_dependencies(locus_tests locus-auth-helper locus-prefix-helper
+                 locus-stage locus-run locus-server)
 
 add_test(NAME unit COMMAND locus_tests)
 

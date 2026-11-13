@@ -7,31 +7,16 @@
 #include <string>
 
 #include "locus/image/dense.hpp"
-#include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
 
 namespace {
 
-/** Exact GELU (torch.nn.GELU(), approximate="none"). */
-void gelu(std::span<float> x) {
-    for (float& v : x) {
-        v = 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752440f));
-    }
-}
+using dense::gelu;
 
-/** Runs fn(i) for i in [0, n) on the thread pool. */
-void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
-    sys::ThreadPool::instance().parallel_for(n, fn);
-}
+using dense::parallel;
 
-/** RMSNorm with weight w over each of n rows of width d. */
-void rms_norm(std::span<const float> x, std::span<const float> w, float eps,
-              std::uint32_t n, std::uint32_t d, std::span<float> out) {
-    parallel(n, [&](std::size_t t) {
-        backend::rmsnorm(x.subspan(t * d, d), w, eps, out.subspan(t * d, d));
-    });
-}
+using dense::rms_norm;
 
 }  // namespace
 
