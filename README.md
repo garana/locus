@@ -125,6 +125,10 @@ features are opt-in per request. A request whose client disconnects
 is cancelled. On the CPU, quantized weights use 8-bit activations
 where the backend's int8 dot is the fast path (neon, sse4, scalar),
 as llama.cpp does; `LOCUS_F32_ACTIVATIONS=1` selects f32 activations.
+`LOCUS_CPU_FAST=1` opts in to CPU kernels with a different float order
+(today every CPU softmax: attention, MoE routing and the image
+encoders, about 2x faster): close to the default results but not
+bit-identical, so the goldens are checked without it.
 
 ### Validated models
 
@@ -182,9 +186,8 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   language model on the GPU).
 - Performance: prefill on Apple GPUs at 44% of Metal's (#10:
   MoltenVK exposes no cooperative matrix), CPU prefill on x86 (#618:
-  a SIMD softmax and an AVX path, #705 and #706, run behind the opt-in
-  `LOCUS_CPU_FAST` flag, as they change the float order), batch-invariant
-  decode at full
+  an AVX path, #706, behind the opt-in `LOCUS_CPU_FAST` flag, as it
+  changes the float order), batch-invariant decode at full
   speed on V3D (#511), the MoE hybrid on Vulkan (#679).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host

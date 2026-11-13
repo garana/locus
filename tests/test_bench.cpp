@@ -518,8 +518,9 @@ TEST_CASE("bench: cpu prefill attention per layer", "[.][bench]") {
     }
     // The softmax's share: one row per (query head, position) as the
     // prefill runs it, timed on 1/64 of the 8,702-position rows on one
-    // thread and scaled to the layer and the pool.
-    {
+    // thread and scaled to the layer and the pool; then the same for
+    // the LOCUS_CPU_FAST softmax (i#705).
+    for (const bool fast : {false, true}) {
         constexpr std::uint32_t n_pos = 8702, sample = 64;
         std::vector<float> row(n_pos);
         double total = 0.0;
@@ -529,7 +530,11 @@ TEST_CASE("bench: cpu prefill attention per layer", "[.][bench]") {
             }
             const auto t0 = std::chrono::steady_clock::now();
             for (std::uint32_t h = 0; h < heads; ++h) {
-                locus::backend::softmax_inplace({row.data(), p + 1});
+                if (fast) {
+                    locus::backend::softmax_fast_inplace({row.data(), p + 1});
+                } else {
+                    locus::backend::softmax_inplace({row.data(), p + 1});
+                }
             }
             total += std::chrono::duration<double>(
                          std::chrono::steady_clock::now() - t0)
@@ -537,9 +542,9 @@ TEST_CASE("bench: cpu prefill attention per layer", "[.][bench]") {
         }
         const double threads =
             static_cast<double>(locus::model::mt_fanout());
-        WARN("softmax share, one layer, 8702 positions: about "
-             << total * sample / threads << " s on " << threads
-             << " threads");
+        WARN((fast ? "fast " : "") << "softmax share, one layer, 8702 "
+             << "positions: about " << total * sample / threads << " s on "
+             << threads << " threads");
     }
     SUCCEED();
 }
