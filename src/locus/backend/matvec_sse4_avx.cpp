@@ -25,6 +25,8 @@
 #include <span>
 #include <vector>
 
+#include "iq_grids.h"
+
 #if defined(__clang__)
 #pragma clang attribute push(__attribute__((target("avx"))), \
                              apply_to = function)
