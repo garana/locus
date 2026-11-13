@@ -557,10 +557,16 @@ TEST_CASE("sse4 q8k matvec matches scalar q8k (all k-quants)",
     for (auto& v : x) {
         v = dist(rng);
     }
+    // The IQ and ternary types too (any bytes are valid codes and signs).
     for (const Q& q :
          {Q{TT::kQ2_K, 84, 80, 82}, Q{TT::kQ3_K, 110, 108, -1},
           Q{TT::kQ4_K, 144, 0, 2}, Q{TT::kQ5_K, 176, 0, 2},
-          Q{TT::kQ6_K, 210, 208, -1}}) {
+          Q{TT::kQ6_K, 210, 208, -1}, Q{TT::kIQ2_XXS, 66, 0, -1},
+          Q{TT::kIQ2_S, 82, 0, -1}, Q{TT::kIQ4_XS, 136, 0, -1},
+          Q{TT::kIQ3_XXS, 98, 0, -1}, Q{TT::kIQ3_S, 110, 0, -1},
+          Q{TT::kIQ1_S, 50, 0, -1}, Q{TT::kIQ1_M, 56, 0, -1},
+          Q{TT::kIQ2_XS, 74, 0, -1}, Q{TT::kTQ1_0, 54, 52, -1},
+          Q{TT::kTQ2_0, 66, 64, -1}}) {
         std::vector<std::byte> w(static_cast<std::size_t>(rows) *
                                  (cols / 256) * q.bytes);
         for (auto& by : w) {
@@ -573,6 +579,17 @@ TEST_CASE("sse4 q8k matvec matches scalar q8k (all k-quants)",
             std::memcpy(blk + q.d_off, &d, 2);
             if (q.dmin_off >= 0) {
                 std::memcpy(blk + q.dmin_off, &dmin, 2);
+            }
+            if (q.type == TT::kIQ1_M) {
+                // IQ1_M's f16 scale is the top nibbles of the four
+                // 16-bit words at 48 (random ones could be inf / NaN).
+                std::uint16_t sc[4];
+                std::memcpy(sc, blk + 48, 8);
+                for (int k = 0; k < 4; ++k) {
+                    sc[k] = static_cast<std::uint16_t>(
+                        (sc[k] & 0x0fff) | (((d >> (4 * k)) & 0xf) << 12));
+                }
+                std::memcpy(blk + 48, sc, 8);
             }
         }
         Mat m{q.type, w.data(), rows, cols};
