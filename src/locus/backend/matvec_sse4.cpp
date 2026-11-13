@@ -1295,8 +1295,59 @@ float row_iq2_q8k_sse4(bool xxs, const std::byte* row, const Q8kAct& a,
     return 0.125f * sumf;
 }
 
+/**
+ * One IQ4_XS (136 B) row against a Q8_K activation (plain order), in
+ * scalar vec_dot_iq4_xs_q8_k's float order: each 32-weight group's
+ * integer sum (exact), times d4d8 * (ls - 32), added to sumf in group
+ * order. The 4-bit codes map through kvalues_iq4nl with one pshufb;
+ * the products go through maddubs(|v|, sign(q, v)), which is exact
+ * because Q8_K activations stay in [-127, 127] (never -128).
+ */
+float row_iq4_xs_q8k_sse4(const std::byte* row, const Q8kAct& a,
+                          std::size_t nb) {
+    const __m128i table = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m128i lo4 = _mm_set1_epi8(0x0f);
+    const __m128i ones = _mm_set1_epi16(1);
+    // The signed sum of 16 codes (as values) times 16 activations.
+    const auto dot16 = [&](__m128i codes, __m128i q) {
+        const __m128i v = _mm_shuffle_epi8(table, codes);
+        return _mm_madd_epi16(
+            _mm_maddubs_epi16(_mm_abs_epi8(v), _mm_sign_epi8(q, v)), ones);
+    };
+    float sumf = 0.0f;
+    for (std::size_t ibl = 0; ibl < nb; ++ibl) {
+        const std::byte* blk = row + ibl * 136;
+        const float d4d8 = f16_to_f32(load_u16(blk)) * a.d[ibl];
+        std::uint16_t h;
+        std::memcpy(&h, blk + 2, 2);
+        const auto* scales_l = reinterpret_cast<const std::uint8_t*>(blk + 4);
+        const auto* qs = reinterpret_cast<const std::uint8_t*>(blk + 8);
+        const std::int8_t* q8 = a.qs + ibl * 256;
+        for (int ib = 0; ib < 8; ++ib) {
+            // ls: the low nibble (even ib) or high nibble (odd ib) of
+            // scales_l[ib / 2], with 2 bits of h on top.
+            const int sl = (ib & 1) == 0 ? (scales_l[ib / 2] & 0xf)
+                                         : (scales_l[ib / 2] >> 4);
+            const int ls = sl | (((h >> (2 * ib)) & 3) << 4);
+            const __m128i b = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(qs + ib * 16));
+            const __m128i q0 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(q8 + ib * 32));
+            const __m128i q1 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(q8 + ib * 32 + 16));
+            const __m128i s = _mm_add_epi32(
+                dot16(_mm_and_si128(b, lo4), q0),
+                dot16(_mm_and_si128(_mm_srli_epi16(b, 4), lo4), q1));
+            sumf += d4d8 * static_cast<float>(ls - 32) *
+                    static_cast<float>(hsum_epi32_sse4(s));
+        }
+    }
+    return sumf;
+}
+
 /** Which row kernel a weight takes under Q8_K / Q8_0 activations. */
-enum class Q8Path { kBlock32, kQ2K, kK, kIQ2, kOther };
+enum class Q8Path { kBlock32, kQ2K, kK, kIQ2, kIQ4XS, kOther };
 
 Q8Path q8_path(gguf::TensorType type, std::size_t cols) {
     using T = gguf::TensorType;
@@ -1316,10 +1367,13 @@ Q8Path q8_path(gguf::TensorType type, std::size_t cols) {
     if (type == T::kIQ2_XXS || type == T::kIQ2_S) {
         return Q8Path::kIQ2;
     }
+    if (type == T::kIQ4_XS) {
+        return Q8Path::kIQ4XS;
+    }
     return Q8Path::kOther;
 }
 
-/** The per-token row kernel for a kQ2K, kK or kIQ2 weight. */
+/** The per-token row kernel for a kQ2K, kK, kIQ2 or kIQ4XS weight. */
 float row_q8k_sse4(Q8Path path, gguf::TensorType type, const std::byte* row,
                    const Q8kAct& a, std::size_t nb) {
     if (path == Q8Path::kQ2K) {
@@ -1328,6 +1382,9 @@ float row_q8k_sse4(Q8Path path, gguf::TensorType type, const std::byte* row,
     if (path == Q8Path::kIQ2) {
         return row_iq2_q8k_sse4(type == gguf::TensorType::kIQ2_XXS, row, a,
                                 nb);
+    }
+    if (path == Q8Path::kIQ4XS) {
+        return row_iq4_xs_q8k_sse4(row, a, nb);
     }
     return row_k_q8k_sse4(type, row, a, nb);
 }
