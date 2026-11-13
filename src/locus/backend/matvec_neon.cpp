@@ -681,6 +681,264 @@ void rows_q6_k_q8k_xt(const std::byte* row, std::size_t nb, const float* yd,
     }
 }
 
+/*
+ * Q8_K dots for IQ3_XXS, IQ3_S, IQ1_M, IQ4_XS and Q2_K (i#744). Each
+ * one is the scalar vec_dot_*_q8_k of cpu_ops.cpp with the inner
+ * integer sums done by dot16: those sums are exact, so their order is
+ * free, and the float steps are the scalar ones in the same order. So
+ * a row's result is the scalar kernel's bits. yq is a token's plain
+ * Q8_K quants, yd its block scales and ys its 16-sums.
+ */
+
+/** 0xff in byte j (0..7) where bit j of s0 is set, and in byte 8 + j
+ *  where bit j of s1 is. */
+inline uint8x16_t sign_mask(std::uint8_t s0, std::uint8_t s1) {
+    static constexpr std::uint8_t kBits[16] = {1, 2, 4,  8,  16, 32, 64, 128,
+                                               1, 2, 4,  8,  16, 32, 64, 128};
+    return vtstq_u8(vcombine_u8(vdup_n_u8(s0), vdup_n_u8(s1)),
+                    vld1q_u8(kBits));
+}
+
+/** g (bytes <= 127) with the bytes under mask m negated: (g ^ m) - m. */
+inline int8x16_t signed_grid(uint8x16_t g, uint8x16_t m) {
+    return vreinterpretq_s8_u8(vsubq_u8(veorq_u8(g, m), m));
+}
+
+/** Four 4-byte grid entries as 16 bytes, in entry order. */
+inline uint8x16_t grid16(std::uint32_t a, std::uint32_t b, std::uint32_t c,
+                         std::uint32_t d) {
+    const std::uint32_t g[4] = {a, b, c, d};
+    return vld1q_u8(reinterpret_cast<const std::uint8_t*>(g));
+}
+
+/** As vec_dot_iq3_xxs_q8_k (98-byte blocks). */
+float row_iq3_xxs_q8k_neon(const std::byte* row, std::size_t nb,
+                           const float* yd, const std::int8_t* yq) {
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const auto* u = reinterpret_cast<const std::uint8_t*>(row + i * 98);
+        const float d = half_to_float(load_u16(row + i * 98)) * yd[i];
+        const std::int8_t* q8 = yq + i * 256;
+        std::int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const std::uint8_t* q3 = u + 2 + 8 * ib32;
+            std::uint32_t aux32;
+            std::memcpy(&aux32, u + 66 + 4 * ib32, 4);
+            int32x4_t acc = vdupq_n_s32(0);
+            for (int h = 0; h < 2; ++h) {
+                const std::uint8_t* q = q3 + 4 * h;
+                const uint8x16_t g =
+                    grid16(iq3xxs_grid[q[0]], iq3xxs_grid[q[1]],
+                           iq3xxs_grid[q[2]], iq3xxs_grid[q[3]]);
+                const uint8x16_t m = sign_mask(
+                    ksigns_iq2xs[(aux32 >> (14 * h)) & 127],
+                    ksigns_iq2xs[(aux32 >> (14 * h + 7)) & 127]);
+                acc = vaddq_s32(acc, dot16(signed_grid(g, m),
+                                           vld1q_s8(q8 + 32 * ib32 + 16 * h)));
+            }
+            bsum += vaddvq_s32(acc) *
+                    static_cast<std::int32_t>(2 * (aux32 >> 28) + 1);
+        }
+        sumf += d * static_cast<float>(bsum);
+    }
+    return 0.25f * sumf;
+}
+
+/** As vec_dot_iq3_s_q8_k (110-byte blocks). */
+float row_iq3_s_q8k_neon(const std::byte* row, std::size_t nb,
+                         const float* yd, const std::int8_t* yq) {
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const auto* u = reinterpret_cast<const std::uint8_t*>(row + i * 110);
+        const float d = half_to_float(load_u16(row + i * 110)) * yd[i];
+        const std::int8_t* q8 = yq + i * 256;
+        std::int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const std::uint8_t* qs = u + 2 + 8 * ib32;
+            const std::uint32_t qh = u[66 + ib32];
+            const std::uint8_t* signs = u + 74 + 4 * ib32;
+            // The 9th index bit: bit 2l of qh for entry 2l, 2l + 1
+            // for entry 2l + 1.
+            const auto at = [&](int k) {
+                const int l = k / 2;
+                const std::uint32_t hb =
+                    k % 2 == 0 ? (qh << (8 - 2 * l)) & 256
+                               : (qh << (7 - 2 * l)) & 256;
+                return iq3s_grid[qs[k] | hb];
+            };
+            int32x4_t acc = vdupq_n_s32(0);
+            for (int h = 0; h < 2; ++h) {
+                const uint8x16_t g = grid16(at(4 * h), at(4 * h + 1),
+                                            at(4 * h + 2), at(4 * h + 3));
+                const uint8x16_t m = sign_mask(signs[2 * h], signs[2 * h + 1]);
+                acc = vaddq_s32(acc, dot16(signed_grid(g, m),
+                                           vld1q_s8(q8 + 32 * ib32 + 16 * h)));
+            }
+            const std::uint32_t sc = u[106 + ib32 / 2];
+            const std::uint32_t ls =
+                2 * (ib32 % 2 == 0 ? sc & 0xf : sc >> 4) + 1;
+            bsum += vaddvq_s32(acc) * static_cast<std::int32_t>(ls);
+        }
+        sumf += d * static_cast<float>(bsum);
+    }
+    return sumf;
+}
+
+/** As vec_dot_iq1_m_q8_k (56-byte blocks). */
+float row_iq1_m_q8k_neon(const std::byte* row, std::size_t nb,
+                         const float* yd, const std::int8_t* yq) {
+    constexpr float kDelta = 0.125f;  // IQ1M_DELTA
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const auto* u = reinterpret_cast<const std::uint8_t*>(row + i * 56);
+        std::uint16_t sc[4];
+        std::memcpy(sc, u + 48, 8);
+        const std::uint16_t scale_u16 =
+            (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+            ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+        const std::int8_t* q8 = yq + i * 256;
+        std::int32_t sumi1 = 0, sumi2 = 0;
+        for (int ib = 0; ib < 8; ++ib) {
+            const std::uint8_t* qs = u + 4 * ib;
+            const std::uint8_t* qh = u + 32 + 2 * ib;
+            const int ls[2] = {
+                2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1,
+                2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1};
+            for (int h = 0; h < 2; ++h) {
+                // Entries 2h and 2h + 1 (16 weights), against 16 q8.
+                std::uint64_t g[2];
+                for (int e = 0; e < 2; ++e) {
+                    const int l = 2 * h + e;
+                    g[e] = iq1s_grid[qs[l] |
+                                     ((static_cast<std::uint32_t>(qh[h])
+                                       << (8 - 4 * (l % 2))) &
+                                      0x700)];
+                }
+                const int8x16_t q = vld1q_s8(q8 + 32 * ib + 16 * h);
+                const std::int32_t sum1 = vaddvq_s32(dot16(
+                    vld1q_s8(reinterpret_cast<const std::int8_t*>(g)), q));
+                // delta of entry 2h + e: bit 0x08 (e = 0) or 0x80 of qh[h].
+                const int d0 = (qh[h] & 0x08) ? -1 : 1;
+                const int d1 = (qh[h] & 0x80) ? -1 : 1;
+                const std::int32_t sum2 = vaddlv_s8(vget_low_s8(q)) * d0 +
+                                          vaddlv_s8(vget_high_s8(q)) * d1;
+                sumi1 += sum1 * ls[h];
+                sumi2 += sum2 * ls[h];
+            }
+        }
+        sumf += half_to_float(scale_u16) * yd[i] *
+                (static_cast<float>(sumi1) +
+                 kDelta * static_cast<float>(sumi2));
+    }
+    return sumf;
+}
+
+/** As vec_dot_iq4_xs_q8_k (136-byte blocks). */
+float row_iq4_xs_q8k_neon(const std::byte* row, std::size_t nb,
+                          const float* yd, const std::int8_t* yq) {
+    const int8x16_t table = vld1q_s8(kvalues_iq4nl);
+    const uint8x16_t m4b = vdupq_n_u8(0x0f);
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 136;
+        const float d4d8 = half_to_float(load_u16(blk)) * yd[i];
+        const std::uint32_t h = load_u16(blk + 2);
+        const auto* sl = reinterpret_cast<const std::uint8_t*>(blk + 4);
+        const auto* qs = reinterpret_cast<const std::uint8_t*>(blk + 8);
+        const std::int8_t* q8 = yq + i * 256;
+        for (int ib = 0; ib < 8; ++ib) {
+            const std::uint32_t ls =
+                (ib % 2 == 0 ? sl[ib / 2] & 0xf : sl[ib / 2] >> 4) |
+                (((h >> (2 * ib)) & 3) << 4);
+            const uint8x16_t b = vld1q_u8(qs + 16 * ib);
+            const int32x4_t s = vaddq_s32(
+                dot16(vqtbl1q_s8(table, vandq_u8(b, m4b)),
+                      vld1q_s8(q8 + 32 * ib)),
+                dot16(vqtbl1q_s8(table, vshrq_n_u8(b, 4)),
+                      vld1q_s8(q8 + 32 * ib + 16)));
+            const float d1 = d4d8 * static_cast<float>(
+                                        static_cast<int>(ls) - 32);
+            sumf += d1 * static_cast<float>(vaddvq_s32(s));
+        }
+    }
+    return sumf;
+}
+
+/** As vec_dot_q2_k_q8_k (84-byte blocks). */
+float row_q2_k_q8k_neon(const std::byte* row, std::size_t nb,
+                        const float* yd, const std::int8_t* yq,
+                        const std::int16_t* ys) {
+    const uint8x16_t m3 = vdupq_n_u8(3);
+    float sumf = 0.0f;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 84;
+        const auto* sc = reinterpret_cast<const std::uint8_t*>(blk);
+        const auto* q2 = reinterpret_cast<const std::uint8_t*>(blk + 16);
+        const float bd = half_to_float(load_u16(blk + 80));
+        const float bdmin = half_to_float(load_u16(blk + 82));
+        const std::int16_t* bs = ys + i * 16;
+        int summs = 0;
+        for (int j = 0; j < 16; ++j) {
+            summs += bs[j] * (sc[j] >> 4);
+        }
+        const float dall = yd[i] * bd;
+        const float dmin = yd[i] * bdmin;
+        const std::int8_t* q8 = yq + i * 256;
+        int isum = 0;
+        for (int k = 0; k < 2; ++k) {
+            const uint8x16_t a = vld1q_u8(q2 + 32 * k);
+            const uint8x16_t b = vld1q_u8(q2 + 32 * k + 16);
+            for (int j = 0; j < 4; ++j) {
+                const int8x16_t va = vreinterpretq_s8_u8(
+                    vandq_u8(vshlq_u8(a, vdupq_n_s8(-2 * j)), m3));
+                const int8x16_t vb = vreinterpretq_s8_u8(
+                    vandq_u8(vshlq_u8(b, vdupq_n_s8(-2 * j)), m3));
+                const int g = 8 * k + 2 * j;  // sub-block (scale index)
+                isum += (sc[g] & 0xf) *
+                        vaddvq_s32(dot16(va, vld1q_s8(q8 + 16 * g)));
+                isum += (sc[g + 1] & 0xf) *
+                        vaddvq_s32(dot16(vb, vld1q_s8(q8 + 16 * g + 16)));
+            }
+        }
+        sumf += dall * static_cast<float>(isum) -
+                dmin * static_cast<float>(summs);
+    }
+    return sumf;
+}
+
+/** The i#744 types' row kernel for one token, or nullptr. */
+using IqRow = float (*)(const std::byte*, std::size_t, const float*,
+                        const std::int8_t*, const std::int16_t*);
+IqRow iq_row_kernel(gguf::TensorType type) {
+    using T = gguf::TensorType;
+    switch (type) {
+        case T::kIQ3_XXS:
+            return [](const std::byte* r, std::size_t nb, const float* d,
+                      const std::int8_t* q, const std::int16_t*) {
+                return row_iq3_xxs_q8k_neon(r, nb, d, q);
+            };
+        case T::kIQ3_S:
+            return [](const std::byte* r, std::size_t nb, const float* d,
+                      const std::int8_t* q, const std::int16_t*) {
+                return row_iq3_s_q8k_neon(r, nb, d, q);
+            };
+        case T::kIQ1_M:
+            return [](const std::byte* r, std::size_t nb, const float* d,
+                      const std::int8_t* q, const std::int16_t*) {
+                return row_iq1_m_q8k_neon(r, nb, d, q);
+            };
+        case T::kIQ4_XS:
+            return [](const std::byte* r, std::size_t nb, const float* d,
+                      const std::int8_t* q, const std::int16_t*) {
+                return row_iq4_xs_q8k_neon(r, nb, d, q);
+            };
+        case T::kQ2_K:
+            return &row_q2_k_q8k_neon;
+        default:
+            return nullptr;
+    }
+}
+
 }  // namespace
 
 void quantize_activation_q8k_neon(std::span<const float> x, float* d,
@@ -880,7 +1138,8 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
     }
     const bool q4k = w.type == gguf::TensorType::kQ4_K;
     const bool q6k = w.type == gguf::TensorType::kQ6_K;
-    if ((!q4k && !q6k) || x.size() % 256 != 0) {
+    const IqRow iq = iq_row_kernel(w.type);
+    if ((!q4k && !q6k && iq == nullptr) || x.size() % 256 != 0) {
         matvec_q8k(w, x, out);  // other types: scalar Q8_K
         return;
     }
@@ -892,6 +1151,13 @@ void matvec_neon_q8k(const Mat& w, std::span<const float> x,
     yq.resize(x.size());
     ys.resize(nb * 16);
     quantize_activation_q8k_neon(x, yd.data(), yq.data(), ys.data());
+    if (iq != nullptr) {
+        const std::size_t rb = mat_row_bytes(w);
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            out[r] = iq(w.data + r * rb, nb, yd.data(), yq.data(), ys.data());
+        }
+        return;
+    }
     const std::size_t bb = q4k ? 144 : 210;
     for (std::uint32_t r = 0; r < w.rows; ++r) {
         const std::byte* row = w.data + r * nb * bb;
@@ -922,6 +1188,39 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                          !is_q8k_type(w.type) && cols % 32 == 0;
     const bool q4k = w.type == gguf::TensorType::kQ4_K;
     const bool q6k = w.type == gguf::TensorType::kQ6_K;
+    const IqRow iq = iq_row_kernel(w.type);
+    if (iq != nullptr && cols % 256 == 0) {
+        // The i#744 types: each token quantized once, then the
+        // per-token row kernel over a tile of tokens while the row is
+        // in cache (so a token's result does not depend on the batch).
+        const std::size_t nb = cols / 256;
+        thread_local std::vector<float> yd;
+        thread_local std::vector<std::int8_t> yq;
+        thread_local std::vector<std::int16_t> ys;
+        yd.resize(nb * n);
+        yq.resize(cols * n);
+        ys.resize(nb * 16 * n);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            quantize_activation_q8k_neon(x_batch.subspan(t * cols, cols),
+                                         yd.data() + t * nb,
+                                         yq.data() + t * cols,
+                                         ys.data() + t * nb * 16);
+        }
+        const std::size_t rb = mat_row_bytes(w);
+        const std::uint32_t tile = q8_token_tile(cols);
+        for (std::uint32_t t0 = 0; t0 < n; t0 += tile) {
+            const std::uint32_t t1 = std::min(n, t0 + tile);
+            for (std::uint32_t r = 0; r < w.rows; ++r) {
+                const std::byte* row = w.data + r * rb;
+                float* o = out_batch.data() + std::size_t{r} * n;
+                for (std::uint32_t t = t0; t < t1; ++t) {
+                    o[t] = iq(row, nb, yd.data() + t * nb,
+                              yq.data() + t * cols, ys.data() + t * nb * 16);
+                }
+            }
+        }
+        return;
+    }
     if (!block32 && ((!q4k && !q6k) || cols % 256 != 0)) {
         // Other types: n per-token calls, scattered row-major.
         thread_local std::vector<float> tmp;
