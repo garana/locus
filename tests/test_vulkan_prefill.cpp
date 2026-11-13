@@ -311,6 +311,69 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
     }
 }
 
+TEST_CASE("vulkan matmul prefetch and plain staging give the same bits",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    // LOCUS_VK_MATMUL_PREFETCH picks the quantized matmuls' staging when
+    // a context is made; restore whatever the run had.
+    const char* had = std::getenv("LOCUS_VK_MATMUL_PREFETCH");
+    const std::string saved = had != nullptr ? had : "";
+    struct Case {
+        locus::gguf::TensorType type;
+        Kernel kernel;
+        std::uint32_t cols;
+    };
+    const Case cases[] = {
+        {locus::gguf::TensorType::kQ8_0, Kernel::kMatmulQ8_0, 96},
+        {locus::gguf::TensorType::kQ4_K, Kernel::kMatmulQ4_K, 512},
+        {locus::gguf::TensorType::kQ6_K, Kernel::kMatmulQ6_K, 512},
+        {locus::gguf::TensorType::kQ5_0, Kernel::kMatmulQ5_0, 96},
+    };
+    // Ragged: rows and tokens are not tile multiples.
+    const std::uint32_t rows = 100, n_tok = 70;
+    for (const Case& c : cases) {
+        std::mt19937 rng(61);
+        const bool q8 = c.type == locus::gguf::TensorType::kQ8_0;
+        const auto w = q8 ? random_q8(rows, c.cols, rng)
+                          : random_kq(c.type, rows, c.cols, rng);
+        const auto x = random_f32(std::size_t{n_tok} * c.cols, rng);
+        std::vector<float> outs[2];
+        for (const bool on : {false, true}) {
+            ::setenv("LOCUS_VK_MATMUL_PREFETCH", on ? "1" : "0", 1);
+            VulkanContext ctx;
+            REQUIRE(ctx.matmul_prefetch() == on);
+            auto wb = upload(ctx, q8 ? gpu_q8(w, c.cols) : w);
+            auto xb = upload(ctx, x);
+            auto ob = ctx.create_buffer(std::size_t{n_tok} * rows * 4);
+            const std::uint32_t TR = VulkanContext::kMatmulTileRows;
+            const std::uint32_t TT = VulkanContext::kMatmulTileToks;
+            const std::uint32_t tiles = (n_tok + TT - 1) / TT;
+            const std::uint32_t push[] = {
+                rows, c.cols, n_tok, 0, 0, 0, c.cols, 0, rows, fbits(1.0f),
+                0,    0,      0,     tiles, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0};
+            const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+            ctx.begin_batch();
+            ctx.dispatch(c.kernel, bufs, push, (rows + TR - 1) / TR, tiles);
+            ctx.end_batch();
+            outs[on ? 1 : 0] =
+                download<float>(ctx, ob, std::size_t{n_tok} * rows);
+            for (auto b : {wb, xb, ob}) {
+                ctx.destroy_buffer(b);
+            }
+        }
+        INFO("kernel " << static_cast<int>(c.kernel));
+        REQUIRE(std::memcmp(outs[0].data(), outs[1].data(),
+                            outs[0].size() * sizeof(float)) == 0);
+    }
+    if (had != nullptr) {
+        ::setenv("LOCUS_VK_MATMUL_PREFETCH", saved.c_str(), 1);
+    } else {
+        ::unsetenv("LOCUS_VK_MATMUL_PREFETCH");
+    }
+}
+
 TEST_CASE("vulkan prefill MoE: route, group, expert matmul, combine",
           "[vulkan]") {
     if (!VulkanContext::available()) {

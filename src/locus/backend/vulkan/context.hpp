@@ -336,6 +336,13 @@ class VulkanContext {
     /** @returns The device's name (VkPhysicalDeviceProperties). */
     const std::string& device_name() const;
 
+    /**
+     * @returns Whether the quantized matmuls prefetch the next stage
+     * into registers: on except on V3D, LOCUS_VK_MATMUL_PREFETCH=0 or
+     * 1 overrides. Same bits either way.
+     */
+    bool matmul_prefetch() const;
+
     /** @returns Whether kernel k needs has_f16(). */
     static bool kernel_needs_f16(Kernel k);
 

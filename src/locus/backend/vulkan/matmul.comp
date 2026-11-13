@@ -318,6 +318,12 @@ void dequant_stage(uint k0, uint wbase, uint r, uint sub,
     !defined(PAGED) && !defined(PAGED_T) && !defined(MOE_ID) && \
     !defined(KV_F16)
 #define PREFETCH
+#ifdef W_BYTES
+// Specialization constant 0: false keeps the quantized weights on the
+// plain stage-then-compute loop (the context's default on V3D, where
+// the prefetch is slower). Same values and order either way.
+layout(constant_id = 0) const bool kPrefetch = true;
+#endif
 #define XPT (BN * BK / 256u)
 /**
  * The stage at k0 into registers: this thread's VPT weights of row r
@@ -453,6 +459,9 @@ void main() {
     uint lr = tid / (BK / VPT);
     uint sub = tid % (BK / VPT);
 #ifdef PREFETCH
+#ifdef W_BYTES
+    if (kPrefetch) {
+#endif
     // Register-prefetched stages (i#592): stage k0 goes to shared memory
     // while stage k0 + BK's global loads are issued before the compute.
     float wv[VPT];
@@ -494,7 +503,11 @@ void main() {
         }
         barrier();
     }
-#else
+#ifdef W_BYTES
+    } else {
+#endif
+#endif
+#if !defined(PREFETCH) || defined(W_BYTES)
     for (uint k0 = k_begin; k0 < k_end; k0 += BK) {
         // Weights: row r0 + lr, columns k0 + sub * VPT .. + VPT.
         uint r = r0 + lr;
@@ -559,6 +572,9 @@ void main() {
             }
         }
         barrier();
+    }
+#endif
+#if defined(PREFETCH) && defined(W_BYTES)
     }
 #endif
 
