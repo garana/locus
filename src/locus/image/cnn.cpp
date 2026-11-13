@@ -9,16 +9,13 @@
 
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/variants.hpp"
-#include "locus/sys/thread_pool.hpp"
+#include "locus/image/dense.hpp"
 
 namespace locus::image::cnn {
 
 namespace {
 
-/** Runs fn(i) for i in [0, n) on the thread pool. */
-void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
-    sys::ThreadPool::instance().parallel_for(n, fn);
-}
+using dense::parallel;
 
 }  // namespace
 
