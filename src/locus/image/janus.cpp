@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/image/dense.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/sampling.hpp"
 #include "locus/sys/thread_pool.hpp"
@@ -15,12 +16,7 @@ namespace locus::image {
 
 namespace {
 
-/** Exact GELU (torch.nn.GELU(), approximate="none"). */
-void gelu(std::span<float> x) {
-    for (float& v : x) {
-        v = 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752440f));
-    }
-}
+using dense::gelu;
 
 /** Python's str.isspace() set (what str.strip() removes). */
 bool py_space(char32_t c) {

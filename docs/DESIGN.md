@@ -662,6 +662,33 @@ guarding the default path.
   in the worker's write queue are copied from it (i#675). Blocks past
   the write backlog are written at preemption from the pool, so the
   step waits for the disk instead of a long recompute later (i#642).
+- Prefix cache helper (`--prefix-cache-helper PATH`, i#655): the same
+  tier kept by an external process, so the KV can live on remote or
+  shared storage. Locus starts the helper and speaks the auth helper's
+  text records (`req_id=`, `type=`, `key=value` lines, a blank line)
+  on its stdin and stdout. Each prefix is one blob, byte for byte the
+  disk tier's file, named by its 16 hex digit digest. The bytes go
+  through a POSIX shm object (`/locus-pfx-<pid>-<seq>` in hex, 0600)
+  that locus creates per call and unlinks after the reply, never
+  through the pipe:
+
+  | request                       | reply                   |
+  |-------------------------------|-------------------------|
+  | `list`                        | `names=<name> <name>..` |
+  | `read name= shm= bytes=`      | `ok=1` (blob in shm)    |
+  | `write name= shm= bytes=`     | `ok=1` (blob stored)    |
+  | `evict name=` (`req_id=0`)    | none                    |
+
+  Locus checks every blob it reads as it checks a file (key, tokens,
+  checksums), so a wrong or stale blob is a miss and is evicted; the
+  helper owns placement, eviction and the remote protocol. Lookups
+  use a local set of names: the helper's list, read at start and
+  again every 60 s (so another process's prefixes are found), plus
+  this process's writes, minus reads that missed. A call over 120 s
+  misses. A helper that dies is started again once; when that one
+  dies too, the tier turns off with a warning. `locus-prefix-helper
+  DIR [CAP_MIB]` is a reference helper that keeps the blobs as files
+  in DIR, which the disk tier can also open.
 - Speculative decoding: prompt lookup (no draft model). An n-gram
   match against the context proposes drafts, verified in one batched
   forward; the longest correct prefix is accepted. Greedy only, so
@@ -950,16 +977,16 @@ locus ports those dots (`backend::matvec_q8k`):
 | Backend | 8-bit activation dots                                         |
 |---------|---------------------------------------------------------------|
 | scalar  | all 15 QK_K types and the block-32 types                      |
-| neon    | Q4_K, Q6_K and the block-32 types; the rest through scalar    |
+| neon    | the K-quants, IQ1_M, IQ2_XXS/S, IQ3_XXS/S, IQ4_XS, block-32   |
 | sse4    | all 15 QK_K types and the block-32 types                      |
 | cuda    | all 15 QK_K types                                             |
 
-The sse4 and CUDA dots, and the neon block-32 dots, replay the scalar
-accumulation order, so they are bit-identical to it. The neon Q4_K
-and Q6_K dots do not (below). The build turns off implicit fused
-multiply-add (`-ffp-contract=off`), so the scalar path rounds the same
-on x86-64 and arm64, and a stage chain that mixes the two is exact
-(#458).
+The sse4 and CUDA dots, and the neon ones but Q4_K and Q6_K, replay
+the scalar accumulation order, so they are bit-identical to it. The
+neon Q4_K and Q6_K dots do not (below). The build turns off implicit
+fused multiply-add (`-ffp-contract=off`), so the scalar path rounds
+the same on x86-64 and arm64, and a stage chain that mixes the two is
+exact (#458).
 
 "Bit-exact with llama.cpp" is unreachable in principle: ggml is not
 bit-exact across its own backends, because the final f32 sum runs in

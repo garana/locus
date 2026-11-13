@@ -15,28 +15,11 @@ namespace locus::image {
 namespace {
 
 using dense::attention;
+using dense::gelu_tanh;
 using dense::linear;
-
-/** Runs fn(i) for i in [0, n) on the thread pool. */
-void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
-    sys::ThreadPool::instance().parallel_for(n, fn);
-}
-
-/** torch's F.gelu(approximate="tanh"). */
-float gelu_tanh(float v) {
-    constexpr float kC = 0.79788456080286535588f;  // sqrt(2 / pi)
-    return 0.5f * v * (1.0f + std::tanh(kC * (v + 0.044715f * v * v * v)));
-}
-
-float silu(float v) { return v / (1.0f + std::exp(-v)); }
-
-/** One vector: out = w x + b. */
-void linear1(const backend::Ops& op, const backend::Mat& w,
-             std::span<const float> b, std::span<const float> x,
-             std::span<float> out) {
-    op.matvec(w, x, out);
-    for (std::uint32_t r = 0; r < w.rows; ++r) out[r] += b[r];
-}
+using dense::linear1;
+using dense::parallel;
+using dense::silu;
 
 /**
  * diffusers' RMSNorm over each of n rows of width d, in place:

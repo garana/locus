@@ -80,6 +80,23 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
 }  // namespace neon_dotprod
 #endif
+
+#if defined(LOCUS_HAS_NEON_I8MM_VARIANT)
+/**
+ * Q8_0 weights through the 8-bit matrix multiply (smmla,
+ * matvec_neon_i8mm.cpp), in llama.cpp's float order (one scaled
+ * integer dot per block): not bit-identical to the baseline kernels,
+ * so the registry uses them only under cpu_fast() on a CPU with i8mm.
+ * A token gets the same bits alone or batched. Other weight types go
+ * to the baseline matvec_neon_q8k / matvec_batch_neon_q8k.
+ */
+namespace neon_i8mm {
+void matvec_neon_q8k(const Mat& w, std::span<const float> x,
+                     std::span<float> out);
+void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
+                           std::span<float> out_batch, std::uint32_t n);
+}  // namespace neon_i8mm
+#endif
 #endif
 
 #if defined(__x86_64__)

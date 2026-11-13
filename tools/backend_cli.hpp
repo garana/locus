@@ -261,6 +261,11 @@ inline constexpr const char* kCommonHelp =
     "                   read it back on a later match, also after a\n"
     "                   restart (off unless set; use fast storage)\n"
     "  --prefix-cache-disk-mib N  disk cap for DIR (default 4096)\n"
+    "  --prefix-cache-helper PATH  keep that KV through this helper\n"
+    "                   process instead of DIR (locus-prefix-helper\n"
+    "                   is a reference one); a prefix over the cap\n"
+    "                   is not sent\n"
+    "  --prefix-cache-helper-arg A  an argument for it (repeatable)\n"
     "  --batch-decode   enable R10 cross-sequence batched decode\n"
     "  --no-batch-prefill  force per-token prompt ingestion\n"
     "  --timing         locus-run: print prefill and decode\n"
@@ -313,7 +318,8 @@ inline constexpr const char* kCommonHelp =
     "                          identical to the fused matvec)\n"
     "  LOCUS_CPU_FAST=1        CPU: kernels with a new float order\n"
     "                          (every softmax: attention, MoE\n"
-    "                          routing, image encoders); faster,\n"
+    "                          routing, image encoders; Q8_0 on\n"
+    "                          ARM CPUs with i8mm); faster,\n"
     "                          close to but not bit-identical to\n"
     "                          the default\n"
     "  LOCUS_NO_READAHEAD=1    disable the default madvise\n"
@@ -406,6 +412,12 @@ struct BackendArgs {
     std::string prefix_cache_dir;
     /** From --prefix-cache-disk-mib N: its cap in MiB. */
     std::uint32_t prefix_cache_disk_mib = 4096;
+    /** From --prefix-cache-helper PATH and --prefix-cache-helper-arg:
+     *  the helper that keeps that tier instead of a directory (i#655;
+     *  empty = none). */
+    std::vector<std::string> prefix_cache_helper;
+    /** --prefix-cache-helper-arg values, before PATH is known. */
+    std::vector<std::string> prefix_cache_helper_args;
     /** From --device N: the GPU for --backend vulkan / cuda (i#572);
      *  unset means the backend's first device. */
     std::uint32_t device = 0;
@@ -585,6 +597,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.prefix_cache_dir = argv[++i];
         } else if (a.rfind("--prefix-cache-dir=", 0) == 0) {
             out.prefix_cache_dir = std::string(a.substr(19));
+        } else if (a == "--prefix-cache-helper" && i + 1 < argc) {
+            out.prefix_cache_helper = {argv[++i]};
+        } else if (a == "--prefix-cache-helper-arg" && i + 1 < argc) {
+            out.prefix_cache_helper_args.emplace_back(argv[++i]);
         } else if (a == "--prefix-cache-disk-mib" && i + 1 < argc) {
             number("--prefix-cache-disk-mib", argv[++i],
                    out.prefix_cache_disk_mib);
@@ -609,7 +625,30 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.positional.emplace_back(a);
         }
     }
+    if (!out.prefix_cache_helper.empty()) {
+        out.prefix_cache_helper.insert(out.prefix_cache_helper.end(),
+                                       out.prefix_cache_helper_args.begin(),
+                                       out.prefix_cache_helper_args.end());
+    }
     return out;
+}
+
+/** @returns what is wrong with the disk prefix tier flags, or an
+ *  empty string when nothing is. */
+inline std::string prefix_cache_error(const BackendArgs& a) {
+    const bool helper = !a.prefix_cache_helper.empty();
+    if (!a.prefix_cache_helper_args.empty() && !helper) {
+        return "--prefix-cache-helper-arg needs --prefix-cache-helper";
+    }
+    if (helper && !a.prefix_cache_dir.empty()) {
+        return "--prefix-cache-dir and --prefix-cache-helper exclude "
+               "each other";
+    }
+    if ((helper || !a.prefix_cache_dir.empty()) &&
+        a.prefix_cache_disk_mib == 0) {
+        return "--prefix-cache-disk-mib must be > 0";
+    }
+    return {};
 }
 
 /**

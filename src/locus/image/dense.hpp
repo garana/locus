@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
+#include <functional>
 #include <span>
 
 #include "locus/backend/cpu_ops.hpp"
@@ -32,5 +34,37 @@ void attention(const backend::Ops& op, std::span<const float> q,
                std::uint32_t nq, std::span<const float> k,
                std::span<const float> v, std::uint32_t nk,
                std::uint32_t heads, std::uint32_t hd, std::span<float> out);
+
+/** Runs fn(i) for i in [0, n) on the thread pool. */
+void parallel(std::size_t n, const std::function<void(std::size_t)>& fn);
+
+/** One vector: out = w x + b. */
+void linear1(const backend::Ops& op, const backend::Mat& w,
+             std::span<const float> b, std::span<const float> x,
+             std::span<float> out);
+
+/**
+ * LayerNorm without affine over each of n rows of width d, then
+ * out = ln(x) * (1 + scale) + shift (scale and shift: d floats).
+ */
+void ln_modulate(std::span<const float> x, std::uint32_t n, std::uint32_t d,
+                 float eps, const float* shift, const float* scale,
+                 std::span<float> out);
+
+/** Exact GELU (torch.nn.GELU(), approximate="none"), in place. */
+void gelu(std::span<float> x);
+
+/** RMSNorm with weight w over each of n rows of width d. */
+void rms_norm(std::span<const float> x, std::span<const float> w, float eps,
+              std::uint32_t n, std::uint32_t d, std::span<float> out);
+
+/** torch's F.gelu(approximate="tanh"). */
+inline float gelu_tanh(float v) {
+    constexpr float kC = 0.79788456080286535588f;  // sqrt(2 / pi)
+    return 0.5f * v * (1.0f + std::tanh(kC * (v + 0.044715f * v * v * v)));
+}
+
+/** v * sigmoid(v). */
+inline float silu(float v) { return v / (1.0f + std::exp(-v)); }
 
 }  // namespace locus::image::dense

@@ -6,17 +6,14 @@
 #include <stdexcept>
 #include <string>
 
+#include "locus/image/dense.hpp"
 #include "locus/image/pixart_dit.hpp"
-#include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
 
 namespace {
 
-/** Runs fn(i) for i in [0, n) on the thread pool. */
-void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
-    sys::ThreadPool::instance().parallel_for(n, fn);
-}
+using dense::parallel;
 
 float silu(float v) { return v / (1.0f + std::exp(-v)); }
 

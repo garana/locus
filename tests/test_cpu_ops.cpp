@@ -1554,6 +1554,84 @@ TEST_CASE("neon dotprod variant is bit-identical to the baseline neon",
     }
 }
 #endif
+
+#if defined(LOCUS_HAS_NEON_I8MM_VARIANT)
+TEST_CASE("neon i8mm Q8_0 follows llama.cpp's order alone and batched",
+          "[ops][neon][fast]") {
+    if (!locus::sys::detect().i8mm) {
+        SKIP("CPU has no i8mm");
+    }
+    // Odd rows and tokens, so the self-paired last row and token run.
+    const std::uint32_t rows = 37, cols = 256, n = 5;
+    const std::size_t nb = cols / 32;
+    std::mt19937 rng(131);
+    std::uniform_int_distribution<int> byte_d(0, 255);
+    std::uniform_real_distribution<float> scale_d(0.001f, 0.05f);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    std::vector<std::byte> w(std::size_t{rows} * nb * 34);
+    for (auto& by : w) {
+        by = static_cast<std::byte>(byte_d(rng));
+    }
+    for (std::size_t bl = 0; bl < w.size() / 34; ++bl) {
+        const std::uint16_t d = f32_to_f16(scale_d(rng));
+        std::memcpy(w.data() + bl * 34, &d, 2);
+    }
+    std::vector<float> x(std::size_t{n} * cols);
+    for (auto& v : x) {
+        v = ud(rng);
+    }
+    const Mat m{TensorType::kQ8_0, w.data(), rows, cols};
+    std::vector<float> got(std::size_t{rows} * n);
+    neon_i8mm::matvec_batch_neon_q8k(m, x, got, n);
+    for (std::uint32_t tk = 0; tk < n; ++tk) {
+        const std::span<const float> xt(x.data() + std::size_t{tk} * cols,
+                                        cols);
+        // The reference order: per block an exact integer dot, times
+        // d_w * d_x, added to the sum (a multiply, then an add).
+        std::vector<float> xd(nb);
+        std::vector<std::int8_t> xq(cols);
+        quantize_activation_q8_0(xt, xd.data(), xq.data());
+        std::vector<float> one(rows), base(rows);
+        neon_i8mm::matvec_neon_q8k(m, xt, one);
+        matvec_q8k(m, xt, base);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            float sum = 0.0f;
+            for (std::size_t b = 0; b < nb; ++b) {
+                const std::byte* blk = w.data() + (r * nb + b) * 34;
+                std::uint16_t h;
+                std::memcpy(&h, blk, 2);
+                const auto* q = reinterpret_cast<const std::int8_t*>(blk + 2);
+                int isum = 0;
+                for (int k = 0; k < 32; ++k) {
+                    isum += q[k] * xq[b * 32 + k];
+                }
+                const float sc = f16_to_f32(h) * xd[b];
+                const float p = static_cast<float>(isum) * sc;
+                sum = sum + p;
+            }
+            INFO("r=" << r << " t=" << tk);
+            const float g = got[std::size_t{r} * n + tk];
+            REQUIRE(g == sum);
+            REQUIRE(one[r] == g);
+            REQUIRE(g == Approx(base[r]).epsilon(1e-5).margin(1e-4));
+        }
+    }
+    // Other types go to the baseline kernels unchanged.
+    std::vector<std::byte> w4(std::size_t{rows} * nb * 18);
+    for (auto& by : w4) {
+        by = static_cast<std::byte>(byte_d(rng));
+    }
+    for (std::size_t bl = 0; bl < w4.size() / 18; ++bl) {
+        const std::uint16_t d = f32_to_f16(scale_d(rng));
+        std::memcpy(w4.data() + bl * 18, &d, 2);
+    }
+    const Mat m4{TensorType::kQ4_0, w4.data(), rows, cols};
+    std::vector<float> a(std::size_t{rows} * n), b(std::size_t{rows} * n);
+    neon_i8mm::matvec_batch_neon_q8k(m4, x, a, n);
+    matvec_batch_neon_q8k(m4, x, b, n);
+    REQUIRE(a == b);
+}
+#endif
 #endif
 
 TEST_CASE("conv1d dense matches a hand-computed same-padded case",

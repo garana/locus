@@ -32,6 +32,7 @@ add_library(locus
     src/locus/engine/disk_prefix_store.cpp
     src/locus/engine/disk_prefix_worker.cpp
     src/locus/engine/engine.cpp
+    src/locus/engine/helper_prefix_store.cpp
     src/locus/engine/metrics.cpp
     src/locus/engine/prefix_cache.cpp
     src/locus/auth/token_cache.cpp
@@ -161,6 +162,9 @@ target_link_libraries(locus-gguf PRIVATE locus)
 add_executable(locus-auth-helper tools/auth_helper_main.cpp)
 target_link_libraries(locus-auth-helper PRIVATE locus)
 
+add_executable(locus-prefix-helper tools/prefix_helper_main.cpp)
+target_link_libraries(locus-prefix-helper PRIVATE locus)
+
 add_executable(locus-stage tools/stage_main.cpp)
 target_link_libraries(locus-stage PRIVATE locus)
 
@@ -210,6 +214,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
             src/locus/backend/matvec_neon_dotprod.cpp)
         target_compile_definitions(locus PUBLIC
             LOCUS_HAS_NEON_DOTPROD_VARIANT=1)
+    endif()
+    # The 8-bit matrix multiply (smmla): Q8_0 in llama.cpp's float
+    # order, used only under LOCUS_CPU_FAST on a CPU with i8mm.
+    check_cxx_source_compiles("
+        #include <arm_neon.h>
+        __attribute__((target(\"arch=armv8.2-a+dotprod+i8mm\")))
+        int32x4_t f(int32x4_t a, int8x16_t b, int8x16_t c) {
+            return vmmlaq_s32(a, b, c);
+        }
+        int main() { return 0; }" LOCUS_CC_I8MM_TARGET)
+    if(LOCUS_CC_I8MM_TARGET)
+        list(APPEND LOCUS_SIMD_VARIANTS "neon_i8mm")
+        target_sources(locus PRIVATE src/locus/backend/matvec_neon_i8mm.cpp)
+        target_compile_definitions(locus PUBLIC
+            LOCUS_HAS_NEON_I8MM_VARIANT=1)
     endif()
 endif()
 
