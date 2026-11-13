@@ -160,9 +160,8 @@ OpenAI + Anthropic compatible inference server (default port 8080):
                      args.bad_number_value.c_str());
         return 2;
     }
-    if (!args.prefix_cache_dir.empty() && args.prefix_cache_disk_mib == 0) {
-        std::fprintf(stderr, "%s: --prefix-cache-disk-mib must be > 0\n",
-                     argv[0]);
+    if (const std::string e = prefix_cache_error(args); !e.empty()) {
+        std::fprintf(stderr, "%s: %s\n", argv[0], e.c_str());
         return 2;
     }
     if (args.positional.empty()) {
@@ -250,6 +249,11 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         if (!args.prefix_cache_dir.empty()) {
             opt.engine.disk_prefix = locus::engine::open_disk_prefix(
                 args.prefix_cache_dir,
+                std::uint64_t{args.prefix_cache_disk_mib} << 20, g,
+                model_path, model, args.kv_type);
+        } else if (!args.prefix_cache_helper.empty()) {
+            opt.engine.disk_prefix = locus::engine::open_helper_prefix(
+                args.prefix_cache_helper,
                 std::uint64_t{args.prefix_cache_disk_mib} << 20, g,
                 model_path, model, args.kv_type);
         }

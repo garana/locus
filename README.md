@@ -42,7 +42,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Decoding:** sampling (temperature, top-k, top-p, min-p,
   penalties, seed), structured output (JSON mode, a JSON Schema, a
   regex or a GBNF grammar), prompt caching (in RAM, and on disk with
-  `--prefix-cache-dir DIR`, read back also after a restart), logprobs,
+  `--prefix-cache-dir DIR`, read back also after a restart, or through
+  an external helper process, `--prefix-cache-helper`), logprobs,
   prompt-lookup speculative decoding with a draft length that adapts
   to the accept rate and the measured verify cost.
 - **Large models:** weights stream from disk with readahead, so a
@@ -88,7 +89,9 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   --register`), each request sent to an instance that serves its kind
   and model; experimental, #388);
   `locus-auth-helper` (a reference auth helper,
-  see docs/CLIENTS.md).
+  see docs/CLIENTS.md); `locus-prefix-helper` (a reference prefix
+  cache helper that keeps the blobs in a directory, see
+  docs/DESIGN.md).
 
 ### Media: from what to what
 
