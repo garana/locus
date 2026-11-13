@@ -4,7 +4,9 @@
 // heads + h holds query token t's scores against cache positions
 // 0 .. n_pos-1 (S = K Q^T from matmul.comp). Token t sits at
 // position base + t, so positions above it are masked: they get
-// probability 0, the rest exp(scale * s - max) / sum. One
+// probability 0, the rest exp(scale * s - max) / sum. With a sliding
+// window W (window > 0, kolibri1) the token at q also masks positions
+// below q + 1 - W: it sees p with q - p < W, decode's rule. One
 // workgroup per row; max and sum reduced in shared memory.
 
 #define WG 256u
@@ -19,6 +21,7 @@ layout(push_constant) uniform PC {
     uint base;    // position of the chunk's first token
     float scale;
     uint rows;    // rows in all (the grid may overshoot)
+    uint window;  // sliding window (0 = none)
 } pc;
 
 shared float red[WG];
@@ -60,14 +63,15 @@ void main() {
         return;  // uniform per workgroup
     }
     uint valid = pc.base + row / pc.heads + 1u;
+    uint lo = pc.window > 0u && valid > pc.window ? valid - pc.window : 0u;
     uint at = row * pc.n_pos;
     float mx = -3.4e38;
-    for (uint p = tid; p < valid; p += WG) {
+    for (uint p = lo + tid; p < valid; p += WG) {
         mx = max(mx, s[at + p] * pc.scale);
     }
     mx = reduce_max(mx);
     float sum = 0.0;
-    for (uint p = tid; p < valid; p += WG) {
+    for (uint p = lo + tid; p < valid; p += WG) {
         float e = exp(s[at + p] * pc.scale - mx);
         s[at + p] = e;
         sum += e;
@@ -75,6 +79,6 @@ void main() {
     sum = reduce_sum(sum);
     float inv = 1.0 / sum;
     for (uint p = tid; p < pc.n_pos; p += WG) {
-        s[at + p] = p < valid ? s[at + p] * inv : 0.0;
+        s[at + p] = p >= lo && p < valid ? s[at + p] * inv : 0.0;
     }
 }
