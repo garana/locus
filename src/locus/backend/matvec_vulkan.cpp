@@ -2268,6 +2268,16 @@ bool gpu_route_ok(State& s, const model::TransformerModel& m,
         (hp.n_group > 1 && hp.n_expert % hp.n_group != 0)) {
         return false;
     }
+    // moe_route's bias on the logit (has_bias 2) assumes sigmoid
+    // gating (softmax reuses its scores as scratch) and a bias tensor
+    // (without one the groups would rank by the gated score, the CPU
+    // by the logit): kolibri1's case. Anything else routes on the
+    // host.
+    if (hp.bias_on_logit &&
+        (hp.gating != model::GatingFunc::kSigmoid ||
+         lay.exp_probs_b.empty())) {
+        return false;
+    }
     for (const auto* em : {&lay.gate_exps, &lay.up_exps, &lay.down_exps}) {
         if (batched_kernel(em->base) == Kernel::kCount_ ||
             em->expert_bytes * hp.n_expert >
