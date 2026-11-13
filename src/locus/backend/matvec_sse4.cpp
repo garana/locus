@@ -3,12 +3,23 @@
 #if defined(__x86_64__) && defined(__SSE4_1__)
 
 #include <smmintrin.h>  // SSE4.1
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+#include <immintrin.h>
+#endif
 
 #include <algorithm>
 #include <cstring>
 #include <vector>
 
 namespace locus::backend {
+// matvec_sse4_avx.cpp compiles this file again with AVX enabled, into
+// sse4_avx:: (variants.hpp).
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+namespace sse4_avx {
+namespace self = ::locus::backend::sse4_avx;
+#else
+namespace self = ::locus::backend;
+#endif
 
 namespace {
 
@@ -414,6 +425,8 @@ void matvec_sse4(const Mat& w, std::span<const float> x,
     matvec(w, x, out);  // other types: scalar reference
 }
 
+namespace {
+
 /** SSE4 Q3_K x Q8_K aux32[8]: 2-bit + hmask 3rd-bit unpack (-4 offset),
  *  6-bit scales unpacked from the packed 12 bytes, 16 groups x 2 with
  *  scale=(scales[j]-32); no min term. Bit-identical to scalar
@@ -545,6 +558,33 @@ void add_scaled_lanes(__m128i s, int scale, __m128i& lo, __m128i& hi) {
     hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(s, z), scv));
 }
 
+/** Adds scale * (m0 + m1) to the int32 lanes lo (0..3) and hi (4..7),
+ *  m0 and m1 being two int16 pair sums per lane (maddubs results): the
+ *  two interleaved, one madd by the scale adds both, exactly. */
+void add_scaled_pairs(__m128i m0, __m128i m1, int scale, __m128i& lo,
+                      __m128i& hi) {
+    const __m128i scv = _mm_set1_epi16(static_cast<short>(scale));
+    lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(m0, m1), scv));
+    hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(m0, m1), scv));
+}
+
+/** The Q4_K / Q5_K min term: bsums[j] * mins[j / 2] over j = 0..15, the
+ *  mins being the bytes of utmp[2..3] after the scale unpack; one madd
+ *  per 8 bsums (|bsum| <= 32 * 127, mins < 64: exact in int32). */
+int k_min_term(const std::uint32_t utmp[4], const std::int16_t* bsums) {
+    const auto mins16 = [](std::uint32_t m) {
+        const __m128i v = _mm_cvtsi32_si128(static_cast<int>(m));
+        return _mm_cvtepu8_epi16(_mm_unpacklo_epi8(v, v));
+    };
+    return hsum_epi32_sse4(_mm_add_epi32(
+        _mm_madd_epi16(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(bsums)),
+            mins16(utmp[2])),
+        _mm_madd_epi16(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(bsums + 8)),
+            mins16(utmp[3]))));
+}
+
 /** SSE4 Q4_K x Q8_K: fills aux32[8] and sumi (the bsums min term)
  *  exactly as scalar vec_dot_q4_k_q8_k does, so the caller's f32 sums
  *  match bit-for-bit. q8il is the block's q8 in lane_pairs_mask order;
@@ -565,38 +605,37 @@ void q4_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
     utmp[2] = uaux;
     utmp[0] &= kmask1;
     const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
-    const auto* mins = reinterpret_cast<const std::uint8_t*>(utmp + 2);
-    sumi = 0;
-    for (int j = 0; j < 16; ++j) {
-        sumi += bsums[j] * mins[j / 2];
-    }
+    sumi = k_min_term(utmp, bsums);
     const __m128i lo4 = _mm_set1_epi8(0x0f);
     const __m128i il = lane_pairs_mask();
     __m128i acc_lo = _mm_setzero_si128(), acc_hi = _mm_setzero_si128();
-    for (int j = 0; j < 8; ++j) {
-        const std::uint8_t* q4b = q4 + (j / 2) * 32;
-        const std::int8_t* q8g = q8il + j * 32;
+    // Sub-blocks 2k (low nibbles) and 2k + 1 (high nibbles) share one
+    // 32-byte chunk: load and shuffle it once for both.
+    for (int k = 0; k < 4; ++k) {
+        const std::uint8_t* q4b = q4 + k * 32;
         const __m128i r0 = _mm_shuffle_epi8(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b)), il);
         const __m128i r1 = _mm_shuffle_epi8(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b + 16)),
             il);
-        __m128i n0, n1;
-        if ((j & 1) == 0) {  // low nibbles
-            n0 = _mm_and_si128(r0, lo4);
-            n1 = _mm_and_si128(r1, lo4);
-        } else {  // high nibbles
-            n0 = _mm_and_si128(_mm_srli_epi16(r0, 4), lo4);
-            n1 = _mm_and_si128(_mm_srli_epi16(r1, 4), lo4);
+        for (int h = 0; h < 2; ++h) {
+            const int j = 2 * k + h;
+            const std::int8_t* q8g = q8il + j * 32;
+            const __m128i n0 =
+                h == 0 ? _mm_and_si128(r0, lo4)
+                       : _mm_and_si128(_mm_srli_epi16(r0, 4), lo4);
+            const __m128i n1 =
+                h == 0 ? _mm_and_si128(r1, lo4)
+                       : _mm_and_si128(_mm_srli_epi16(r1, 4), lo4);
+            const __m128i a0 =
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
+            const __m128i a1 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(q8g + 16));
+            // |pair sum| <= 2*15*127 per maddubs lane
+            add_scaled_pairs(_mm_maddubs_epi16(n0, a0),
+                             _mm_maddubs_epi16(n1, a1), scales[j], acc_lo,
+                             acc_hi);
         }
-        const __m128i a0 =
-            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
-        const __m128i a1 = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(q8g + 16));
-        // 4 products per lane, |sum| <= 4*15*127: no int16 overflow
-        const __m128i s = _mm_add_epi16(_mm_maddubs_epi16(n0, a0),
-                                        _mm_maddubs_epi16(n1, a1));
-        add_scaled_lanes(s, scales[j], acc_lo, acc_hi);
     }
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
@@ -621,11 +660,7 @@ void q5_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
     utmp[2] = uaux;
     utmp[0] &= kmask1;
     const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
-    const auto* mins = reinterpret_cast<const std::uint8_t*>(utmp + 2);
-    sumi = 0;
-    for (int j = 0; j < 16; ++j) {
-        sumi += bsums[j] * mins[j / 2];
-    }
+    sumi = k_min_term(utmp, bsums);
     const __m128i lo4 = _mm_set1_epi8(0x0f);
     const __m128i s16 = _mm_set1_epi8(16);
     const __m128i il = lane_pairs_mask();
@@ -634,38 +669,40 @@ void q5_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
     const __m128i hm1 = _mm_shuffle_epi8(
         _mm_loadu_si128(reinterpret_cast<const __m128i*>(hm + 16)), il);
     __m128i acc_lo = _mm_setzero_si128(), acc_hi = _mm_setzero_si128();
-    for (int j = 0; j < 8; ++j) {
-        const std::uint8_t* q4b = q4 + (j / 2) * 32;
-        const std::int8_t* q8g = q8il + j * 32;
+    // As q4_k_q8k_aux32_sse4: one load and shuffle per nibble chunk for
+    // sub-blocks 2k and 2k + 1, one madd per sub-block.
+    for (int k = 0; k < 4; ++k) {
+        const std::uint8_t* q4b = q4 + k * 32;
         const __m128i r0 = _mm_shuffle_epi8(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b)), il);
         const __m128i r1 = _mm_shuffle_epi8(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b + 16)),
             il);
-        __m128i n0, n1;
-        if ((j & 1) == 0) {
-            n0 = _mm_and_si128(r0, lo4);
-            n1 = _mm_and_si128(r1, lo4);
-        } else {
-            n0 = _mm_and_si128(_mm_srli_epi16(r0, 4), lo4);
-            n1 = _mm_and_si128(_mm_srli_epi16(r1, 4), lo4);
+        for (int h = 0; h < 2; ++h) {
+            const int j = 2 * k + h;
+            const std::int8_t* q8g = q8il + j * 32;
+            __m128i n0 = h == 0
+                             ? _mm_and_si128(r0, lo4)
+                             : _mm_and_si128(_mm_srli_epi16(r0, 4), lo4);
+            __m128i n1 = h == 0
+                             ? _mm_and_si128(r1, lo4)
+                             : _mm_and_si128(_mm_srli_epi16(r1, 4), lo4);
+            // add 16 where the j-th hm bit is set (5th weight bit)
+            const __m128i bit = _mm_set1_epi8(static_cast<char>(1 << j));
+            n0 = _mm_add_epi8(
+                n0, _mm_and_si128(
+                        _mm_cmpeq_epi8(_mm_and_si128(hm0, bit), bit), s16));
+            n1 = _mm_add_epi8(
+                n1, _mm_and_si128(
+                        _mm_cmpeq_epi8(_mm_and_si128(hm1, bit), bit), s16));
+            const __m128i a0 =
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
+            const __m128i a1 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(q8g + 16));
+            add_scaled_pairs(_mm_maddubs_epi16(n0, a0),
+                             _mm_maddubs_epi16(n1, a1), scales[j], acc_lo,
+                             acc_hi);
         }
-        // add 16 where the j-th hm bit is set (5th weight bit)
-        const __m128i bit = _mm_set1_epi8(static_cast<char>(1 << j));
-        n0 = _mm_add_epi8(
-            n0, _mm_and_si128(
-                    _mm_cmpeq_epi8(_mm_and_si128(hm0, bit), bit), s16));
-        n1 = _mm_add_epi8(
-            n1, _mm_and_si128(
-                    _mm_cmpeq_epi8(_mm_and_si128(hm1, bit), bit), s16));
-        const __m128i a0 =
-            _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
-        const __m128i a1 = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(q8g + 16));
-        // 4 products per lane, |sum| <= 4*31*127: no int16 overflow
-        const __m128i s = _mm_add_epi16(_mm_maddubs_epi16(n0, a0),
-                                        _mm_maddubs_epi16(n1, a1));
-        add_scaled_lanes(s, scales[j], acc_lo, acc_hi);
     }
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
@@ -724,15 +761,20 @@ void q6_k_raw6_sse4(const std::byte* blk, std::uint8_t aux[256]) {
 void q6_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
                          std::int32_t aux32[8]) {
     const auto* sc = reinterpret_cast<const std::int8_t*>(blk + 192);
-    std::uint8_t aux[256];
-    q6_k_raw6_sse4(blk, aux);
+    const auto* ql = reinterpret_cast<const std::uint8_t*>(blk);
+    const auto* qh = reinterpret_cast<const std::uint8_t*>(blk + 128);
     const __m128i il = lane_pairs_mask();
     const __m128i u1 = _mm_set1_epi8(1);
+    const __m128i m3 = _mm_set1_epi8(3);
+    const __m128i lo4 = _mm_set1_epi8(0x0f);
     __m128i acc_lo = _mm_setzero_si128(), acc_hi = _mm_setzero_si128();
-    for (int j = 0; j < 16; ++j) {
-        const __m128i rv = _mm_shuffle_epi8(
-            _mm_loadu_si128(reinterpret_cast<const __m128i*>(aux + j * 16)),
-            il);
+    // Group j's 16 raw codes, as q6_k_raw6_sse4 lays them out, built in
+    // a register: in each 128-weight half n, ql[h..h+15] low nibbles
+    // with qh bits 0-1 are group 8n + h / 16, ql[32 + h..] low nibbles
+    // with bits 2-3 group + 2, the high nibbles of the same with bits
+    // 4-5 and 6-7 groups + 4 and + 6.
+    const auto group = [&](__m128i rv, int j) {
+        rv = _mm_shuffle_epi8(rv, il);
         const __m128i qv = _mm_loadu_si128(
             reinterpret_cast<const __m128i*>(q8il + j * 16));
         // per lane: |raw6*q8 pair| <= 2*63*127, 32*|q8 pair| <= 32*254
@@ -740,12 +782,39 @@ void q6_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
             _mm_maddubs_epi16(rv, qv),
             _mm_slli_epi16(_mm_maddubs_epi16(u1, qv), 5));
         add_scaled_lanes(s, sc[j], acc_lo, acc_hi);
+    };
+    for (int n = 0; n < 2; ++n) {
+        for (int h = 0; h < 32; h += 16) {
+            const __m128i qlA = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(ql + n * 64 + h));
+            const __m128i qlB = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(ql + n * 64 + 32 + h));
+            const __m128i qhv = _mm_loadu_si128(
+                reinterpret_cast<const __m128i*>(qh + n * 32 + h));
+            const int j = n * 8 + h / 16;
+            group(_mm_or_si128(_mm_and_si128(qlA, lo4),
+                               _mm_slli_epi16(_mm_and_si128(qhv, m3), 4)),
+                  j);
+            group(_mm_or_si128(
+                      _mm_and_si128(qlB, lo4),
+                      _mm_slli_epi16(
+                          _mm_and_si128(_mm_srli_epi16(qhv, 2), m3), 4)),
+                  j + 2);
+            group(_mm_or_si128(
+                      _mm_and_si128(_mm_srli_epi16(qlA, 4), lo4),
+                      _mm_slli_epi16(
+                          _mm_and_si128(_mm_srli_epi16(qhv, 4), m3), 4)),
+                  j + 4);
+            group(_mm_or_si128(
+                      _mm_and_si128(_mm_srli_epi16(qlB, 4), lo4),
+                      _mm_slli_epi16(
+                          _mm_and_si128(_mm_srli_epi16(qhv, 6), m3), 4)),
+                  j + 6);
+        }
     }
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
 }
-
-namespace {
 
 /**
  * The four lane sums of 16 weights a against 16 activations b: lane l
@@ -847,11 +916,38 @@ void row_q8_0_q8_0_sse4_xt(const std::byte* row, const float* const* xd,
                              lanes16_sse4(w.abs_q[1], w.q[1], xb));
     };
     __m128 s0[kT], s1[kT];
+    std::size_t b = 0;
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+    // One 256-bit sum per token: block b in lanes 0-3 and b + 1 in lanes
+    // 4-7, the same adds as s0 and s1 below, so the same bits.
+    __m256 s8[kT];
+    for (int t = 0; t < kT; ++t) {
+        s8[t] = _mm256_setzero_ps();
+    }
+    for (; b + 1 < nb; b += 2) {
+        const std::byte* b0 = row + b * kBlk;
+        const std::byte* b1 = b0 + kBlk;
+        const float w0 = f16_to_f32(load_u16(b0));
+        const float w1 = f16_to_f32(load_u16(b1));
+        const W16 v0 = widen(b0), v1 = widen(b1);
+        for (int t = 0; t < kT; ++t) {
+            const __m256 d = _mm256_set_m128(_mm_set1_ps(w1 * xd[t][b + 1]),
+                                             _mm_set1_ps(w0 * xd[t][b]));
+            const __m256i p = _mm256_set_m128i(
+                lanes(v1, xq[t] + (b + 1) * 32), lanes(v0, xq[t] + b * 32));
+            s8[t] = _mm256_add_ps(s8[t],
+                                  _mm256_mul_ps(_mm256_cvtepi32_ps(p), d));
+        }
+    }
+    for (int t = 0; t < kT; ++t) {
+        s0[t] = _mm256_castps256_ps128(s8[t]);
+        s1[t] = _mm256_extractf128_ps(s8[t], 1);
+    }
+#else
     for (int t = 0; t < kT; ++t) {
         s0[t] = _mm_setzero_ps();
         s1[t] = _mm_setzero_ps();
     }
-    std::size_t b = 0;
     for (; b + 1 < nb; b += 2) {
         const std::byte* b0 = row + b * kBlk;
         const std::byte* b1 = b0 + kBlk;
@@ -869,6 +965,7 @@ void row_q8_0_q8_0_sse4_xt(const std::byte* row, const float* const* xd,
                 s1[t], _mm_mul_ps(_mm_cvtepi32_ps(p1), _mm_set1_ps(d1)));
         }
     }
+#endif
     for (int t = 0; t < kT; ++t) {
         alignas(16) float l0[4], l1[4];
         _mm_store_ps(l0, s0[t]);
@@ -979,13 +1076,8 @@ void q4_k_q8k_aux32_sse4_xt(const std::byte* blk, const Q8kAct* a,
     utmp[2] = uaux;
     utmp[0] &= kmask1;
     const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
-    const auto* mins = reinterpret_cast<const std::uint8_t*>(utmp + 2);
     for (int t = 0; t < kT; ++t) {
-        const std::int16_t* bs = a[t].bsums + b * 16;
-        sumi[t] = 0;
-        for (int j = 0; j < 16; ++j) {
-            sumi[t] += bs[j] * mins[j / 2];
-        }
+        sumi[t] = k_min_term(utmp, a[t].bsums + b * 16);
     }
     const __m128i lo4 = _mm_set1_epi8(0x0f);
     const __m128i il = lane_pairs_mask();
@@ -994,30 +1086,31 @@ void q4_k_q8k_aux32_sse4_xt(const std::byte* blk, const Q8kAct* a,
         acc_lo[t] = _mm_setzero_si128();
         acc_hi[t] = _mm_setzero_si128();
     }
-    for (int j = 0; j < 8; ++j) {
-        const std::uint8_t* q4b = q4 + (j / 2) * 32;
+    for (int k = 0; k < 4; ++k) {
+        const std::uint8_t* q4b = q4 + k * 32;
         const __m128i r0 = _mm_shuffle_epi8(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b)), il);
         const __m128i r1 = _mm_shuffle_epi8(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b + 16)),
             il);
-        __m128i n0, n1;
-        if ((j & 1) == 0) {  // low nibbles
-            n0 = _mm_and_si128(r0, lo4);
-            n1 = _mm_and_si128(r1, lo4);
-        } else {  // high nibbles
-            n0 = _mm_and_si128(_mm_srli_epi16(r0, 4), lo4);
-            n1 = _mm_and_si128(_mm_srli_epi16(r1, 4), lo4);
-        }
-        for (int t = 0; t < kT; ++t) {
-            const std::int8_t* q8g = a[t].qs + b * 256 + j * 32;
-            const __m128i a0 =
-                _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
-            const __m128i a1 = _mm_loadu_si128(
-                reinterpret_cast<const __m128i*>(q8g + 16));
-            const __m128i s = _mm_add_epi16(_mm_maddubs_epi16(n0, a0),
-                                            _mm_maddubs_epi16(n1, a1));
-            add_scaled_lanes(s, scales[j], acc_lo[t], acc_hi[t]);
+        for (int h = 0; h < 2; ++h) {
+            const int j = 2 * k + h;
+            const __m128i n0 =
+                h == 0 ? _mm_and_si128(r0, lo4)
+                       : _mm_and_si128(_mm_srli_epi16(r0, 4), lo4);
+            const __m128i n1 =
+                h == 0 ? _mm_and_si128(r1, lo4)
+                       : _mm_and_si128(_mm_srli_epi16(r1, 4), lo4);
+            for (int t = 0; t < kT; ++t) {
+                const std::int8_t* q8g = a[t].qs + b * 256 + j * 32;
+                const __m128i a0 =
+                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
+                const __m128i a1 = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(q8g + 16));
+                add_scaled_pairs(_mm_maddubs_epi16(n0, a0),
+                                 _mm_maddubs_epi16(n1, a1), scales[j],
+                                 acc_lo[t], acc_hi[t]);
+            }
         }
     }
     for (int t = 0; t < kT; ++t) {
@@ -1199,7 +1292,7 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
         thread_local std::vector<float> tmp;
         tmp.resize(w.rows);
         for (std::uint32_t t = 0; t < n; ++t) {
-            matvec_sse4_q8k(w, x_batch.subspan(t * cols, cols), tmp);
+            self::matvec_sse4_q8k(w, x_batch.subspan(t * cols, cols), tmp);
             for (std::uint32_t r = 0; r < w.rows; ++r) {
                 out_batch[std::size_t{r} * n + t] = tmp[r];
             }
@@ -1313,7 +1406,7 @@ void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
     std::vector<float> col(w.rows);
     const std::size_t xc = w.cols;
     for (std::uint32_t t = 0; t < n; ++t) {
-        matvec_sse4(
+        self::matvec_sse4(
             w,
             x_batch.subspan(static_cast<std::size_t>(t) * xc, xc),
             col);
@@ -1323,6 +1416,9 @@ void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
     }
 }
 
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+}  // namespace sse4_avx
+#endif
 }  // namespace locus::backend
 
 #endif  // __x86_64__ && __SSE4_1__
