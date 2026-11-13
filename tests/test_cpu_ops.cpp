@@ -996,6 +996,20 @@ TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "
         }
         check(Mat{t, w.data(), rows, 800}, 7);
     }
+    // IQ2_XXS and IQ2_S: random bytes are valid grid indices and signs;
+    // 8 blocks a row, 50 tokens over two tiles.
+    for (const auto& [t, bytes] : {std::pair{TensorType::kIQ2_XXS, 66u},
+                                   std::pair{TensorType::kIQ2_S, 82u}}) {
+        std::vector<std::byte> w(std::size_t{rows} * 8 * bytes);
+        for (auto& by : w) {
+            by = static_cast<std::byte>(byte_d(rng));
+        }
+        for (std::size_t bl = 0; bl < w.size() / bytes; ++bl) {
+            const std::uint16_t d = f32_to_f16(scale_d(rng));
+            std::memcpy(w.data() + bl * bytes, &d, 2);
+        }
+        check(Mat{t, w.data(), rows, 8 * 256}, 50);
+    }
     // The maddubs edges (i#708): every weight -128 (|w| reads as 128
     // unsigned) against activations that quantize to +-127 in every
     // lane, the largest pair sums (2 x 128 x 127, under int16's max).
