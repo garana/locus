@@ -166,6 +166,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 | Orpheus 3B Q4_K_M decode, Vulkan           | M4 Max (MoltenVK) | 131 tok/s (llama.cpp Metal: 135)       |
 | Llama-3.2-1B Q8_0 prefill, 2.5k tokens     | M4 Max (MoltenVK) | 2048 tok/s                             |
 | DeepSeek-Coder-V2-Lite Q8_0 decode, Vulkan | M4 Max (MoltenVK) | 88 tok/s                               |
+| Kolibri-1 APEX I-Nano decode, Vulkan       | M4 Max (MoltenVK) | 37 tok/s (llama.cpp CPU: 24 to 31)     |
 | Llama-3.2-1B Q8_0 decode, CPU              | M4 Max (neon)     | 89 tok/s                               |
 | Llama-3.2-1B Q8_0 prefill, 8k tokens, CPU  | M2 Pro (neon)     | 124 tok/s                              |
 | Llama-3.2-1B Q8_0 prefill, 2k tokens, CPU  | i5-2400 (sse4)    | 18 tok/s (llama.cpp: 26)               |

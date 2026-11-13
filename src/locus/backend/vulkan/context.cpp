@@ -198,6 +198,7 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
 #include "matvec_q3_k_b_spv.h"
 #include "matvec_iq2_s_b_spv.h"
 #include "matvec_iq2_xxs_b_spv.h"
+#include "rmsnorm_res_spv.h"
 #include "matvec_iq3_xxs_spv.h"
 #include "matvec_iq4_xs_spv.h"
 #include "matvec_q8_0_b_spv.h"
@@ -716,6 +717,8 @@ constexpr KernelDesc kDescs[] = {
      sizeof(locus_matvec_iq2_s_b_spv), 5, 52},
     {Kernel::kMatvecIQ2_XXSB, "matvec_iq2_xxs_b", locus_matvec_iq2_xxs_b_spv,
      sizeof(locus_matvec_iq2_xxs_b_spv), 5, 52},
+    {Kernel::kRmsNormRes, "rmsnorm_res", locus_rmsnorm_res_spv,
+     sizeof(locus_rmsnorm_res_spv), 4, 16},
 };
 
 /** @returns Whether row i of kDescs is Kernel(i), for every kernel. */
