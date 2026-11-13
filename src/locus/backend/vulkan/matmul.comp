@@ -15,6 +15,9 @@
 // of q8_layout.hpp, byte offsets, cols % 32 == 0), TYPE_Q4K / TYPE_Q6K
 // (ggml K-quant rows as on disk, byte offsets, cols % 256 == 0),
 // TYPE_Q5_0 (ggml Q5_0 rows as on disk, byte offsets, cols % 32 == 0),
+// TYPE_Q3K / TYPE_Q5K / TYPE_IQ2S / TYPE_IQ2XXS (ggml rows as on disk,
+// byte offsets, cols % 256 == 0; the IQ grid table at binding 3, or 4
+// after MOE_ID's ids),
 // TYPE_F16 / TYPE_BF16 (16-bit rows as on disk, offsets in elements)
 // or TYPE_F32 (element offsets).
 //
@@ -82,8 +85,12 @@
 layout(local_size_x = 256) in;
 
 #if defined(TYPE_Q8) || defined(TYPE_Q4K) || defined(TYPE_Q6K) || \
-    defined(TYPE_Q5_0)
+    defined(TYPE_Q5_0) || defined(TYPE_Q3K) || defined(TYPE_Q5K) || \
+    defined(TYPE_IQ2S) || defined(TYPE_IQ2XXS)
 #define W_BYTES
+#endif
+#if defined(TYPE_IQ2S) || defined(TYPE_IQ2XXS)
+#define W_GRID
 #endif
 #if defined(TYPE_F16) || defined(TYPE_BF16)
 #define W_HALF
@@ -115,6 +122,18 @@ layout(std430, binding = 3) readonly buffer IDS { uint ids[]; };
 #endif
 #if defined(PAGED) || defined(PAGED_T)
 layout(std430, binding = 3) readonly buffer TABLE { uint table[]; };
+#endif
+#ifdef W_GRID
+// iq2s_grid or iq2xxs_grid + ksigns_iq2xs (matvec_iq2_*'s table).
+#ifdef MOE_ID
+layout(std430, binding = 4) readonly buffer G { uint g[]; };
+#else
+layout(std430, binding = 3) readonly buffer G { uint g[]; };
+#endif
+/** Unsigned byte j (0..7) of grid entry idx (a uint64 = two words). */
+uint grid_byte(uint idx, uint j) {
+    return (g[idx * 2u + (j >> 2u)] >> ((j & 3u) * 8u)) & 0xffu;
+}
 #endif
 
 layout(push_constant) uniform PC {
@@ -202,7 +221,8 @@ uint word_at(uint b) {
 }
 #endif
 
-#if defined(TYPE_Q4K) || defined(TYPE_Q6K) || defined(TYPE_Q5_0)
+#if defined(TYPE_Q4K) || defined(TYPE_Q6K) || defined(TYPE_Q5_0) || \
+    defined(TYPE_Q3K) || defined(TYPE_Q5K) || defined(W_GRID)
 uint byte_at(uint i) {
     return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
 }
@@ -212,7 +232,7 @@ float f16_at(uint i) {
 }
 #endif
 
-#ifdef TYPE_Q4K
+#if defined(TYPE_Q4K) || defined(TYPE_Q5K)
 // ggml get_scale_min_k4 over the packed scales at byte `sc0`.
 void scale_min(uint j, uint sc0, out float d, out float m) {
     if (j < 4u) {
@@ -296,6 +316,95 @@ void dequant_stage(uint k0, uint wbase, uint r, uint sub,
                     32;
             wv[h * 4u + i] = d1 * float(q);
         }
+    }
+#elif defined(TYPE_Q3K)
+    // VPT columns inside one 16-element scale group is: half n = is /
+    // 8, quant shift 2 * ((is % 8) / 2), the 16 bytes from (is % 2) *
+    // 16, high bit 4n + j of hmask (cpu_ops dequant_block_q3_k).
+    uint nb = pc.cols / 256u;
+    uint kc = k0 + sub * VPT;
+    uint e = kc % 256u;
+    uint at = wbase + (r * nb + kc / 256u) * 110u;
+    uint is = e / 16u;
+    uint n = is >> 3;
+    uint j = (is & 7u) >> 1;
+    uint half16 = (is & 1u) * 16u;
+    uint l0 = e % 16u;
+    uint i4 = is & 3u;
+    uint grp = is >> 2;
+    uint sb = byte_at(at + 96u + (grp & 1u) * 4u + i4);
+    uint lo = grp < 2u ? (sb & 0xfu) : (sb >> 4);
+    uint hi = (byte_at(at + 104u + i4) >> (2u * grp)) & 3u;
+    float dl = f16_at(at + 108u) * float(int(lo | (hi << 4)) - 32);
+    uint m = 1u << (n * 4u + j);
+    for (uint c = 0u; c < VPT; ++c) {
+        uint l = l0 + c;
+        int q = int((byte_at(at + 32u + n * 32u + half16 + l) >>
+                     (2u * j)) & 3u) -
+                ((byte_at(at + half16 + l) & m) != 0u ? 0 : 4);
+        wv[c] = dl * float(q);
+    }
+#elif defined(TYPE_Q5K)
+    // VPT columns inside 32-element sub-block sb: nibble (sb % 2) of
+    // qs[(sb / 2) * 32 + l], high bit sb of qh[l] (cpu_ops
+    // dequant_block_q5_k).
+    uint nb = pc.cols / 256u;
+    uint kc = k0 + sub * VPT;
+    uint e = kc % 256u;
+    uint at = wbase + (r * nb + kc / 256u) * 176u;
+    uint sb = e / 32u;
+    float sc, mn;
+    scale_min(sb, at + 4u, sc, mn);
+    float d1 = f16_at(at) * sc;
+    float m1 = f16_at(at + 2u) * mn;
+    uint l0 = e % 32u;
+    uint sh = (sb & 1u) * 4u;
+    for (uint c = 0u; c < VPT; ++c) {
+        uint l = l0 + c;
+        uint q = ((byte_at(at + 48u + (sb / 2u) * 32u + l) >> sh) & 0xfu) |
+                 (((byte_at(at + 16u + l) >> sb) & 1u) << 4u);
+        wv[c] = d1 * float(q) - m1;
+    }
+#elif defined(TYPE_IQ2S)
+    // 8-element groups l of sub-block ib (cpu_ops dequant_block_iq2_s).
+    uint nb = pc.cols / 256u;
+    uint kc = k0 + sub * VPT;
+    uint e = kc % 256u;
+    uint at = wbase + (r * nb + kc / 256u) * 82u;
+    uint ib = e / 32u;
+    float d = f16_at(at);
+    uint sc = byte_at(at + 74u + ib);
+    uint qh = byte_at(at + 66u + ib);
+    for (uint c = 0u; c < VPT; ++c) {
+        uint l = ((e % 32u) + c) / 8u;
+        uint jj = (e + c) % 8u;
+        float dl = d * (0.5 + float(l < 2u ? (sc & 0xfu) : (sc >> 4))) *
+                   0.25;
+        uint idx = byte_at(at + 2u + ib * 4u + l) |
+                   ((qh << (8u - 2u * l)) & 0x300u);
+        uint signs = byte_at(at + 34u + ib * 4u + l);
+        float gp = float(grid_byte(idx, jj));
+        wv[c] = dl * ((signs & (1u << jj)) != 0u ? -gp : gp);
+    }
+#elif defined(TYPE_IQ2XXS)
+    // 8-element groups l of sub-block ib (cpu_ops
+    // dequant_block_iq2_xxs); ksigns_iq2xs at byte 2048 of the table.
+    uint nb = pc.cols / 256u;
+    uint kc = k0 + sub * VPT;
+    uint e = kc % 256u;
+    uint at = wbase + (r * nb + kc / 256u) * 66u;
+    uint ib = e / 32u;
+    uint a0 = word_at(at + 2u + 8u * ib);
+    uint a1 = word_at(at + 6u + 8u * ib);
+    float db = f16_at(at) * (0.5 + float(a1 >> 28u)) * 0.25;
+    for (uint c = 0u; c < VPT; ++c) {
+        uint l = ((e % 32u) + c) / 8u;
+        uint jj = (e + c) % 8u;
+        uint idx = (a0 >> (8u * l)) & 0xffu;
+        uint so = 2048u + ((a1 >> (7u * l)) & 127u);
+        uint signs = (g[so >> 2u] >> ((so & 3u) * 8u)) & 0xffu;
+        float gp = float(grid_byte(idx, jj));
+        wv[c] = db * ((signs & (1u << jj)) != 0u ? -gp : gp);
     }
 #else  // TYPE_Q5_0
     uint nb = pc.cols / 32u;

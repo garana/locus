@@ -198,6 +198,20 @@ enum class Kernel {
     /** RMS norm added to a residual (rmsnorm.comp RESID): kolibri1's
      *  post-attention and post-FFN norms (i#714). */
     kRmsNormRes,
+    /** Prefill matmuls (dense and expert-id) over Q3_K, Q5_K, IQ2_S
+     *  and IQ2_XXS weights (matmul.comp, i#729). */
+    kMatmulQ3_K,
+    kMatmulQ3_KId,
+    kMatmulQ5_K,
+    kMatmulQ5_KId,
+    kMatmulIQ2_S,
+    kMatmulIQ2_SId,
+    kMatmulIQ2_XXS,
+    kMatmulIQ2_XXSId,
+    /** rmsnorm_res over a prefill chunk's rows (BATCHED, i#730). */
+    kRmsNormResB,
+    /** Expert-id prefill matmul over F32 experts (i#730). */
+    kMatmulF32Id,
     kCount_,
 };
 
