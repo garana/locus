@@ -32,6 +32,11 @@ std::string qwen_moe_path() {
            "/tests/models/Qwen1.5-MoE-A2.7B.Q4_K_M.gguf";
 }
 
+std::string kolibri1_path() {
+    return std::string(LOCUS_SOURCE_DIR) +
+           "/tests/models/kolibri-1-apex-i-nano.gguf";
+}
+
 std::string muse_spark_path() {
     return std::string(LOCUS_SOURCE_DIR) +
            "/tests/models/Muse-Spark-Open-816B-A42B-UD-IQ1_S-00001-of-"
@@ -924,5 +929,106 @@ TEST_CASE("deepseek41 decode matches the reference golden",
             }
         }
         cache.release(seq);
+    }
+}
+
+TEST_CASE("kolibri1 decode matches the llama.cpp golden",
+          "[e2e][kolibri1]") {
+    // mudler/Kolibri-1-APEX-GGUF at 0fd62efa, Kolibri-1-APEX-I-Nano.gguf
+    // (24.4 GB; sha256 e38f2b1ba9fe4f7d46e136cf6bebdc4d365c82e4d50c17571
+    // a2609c2e17c321a). The goldens are llama.cpp 0.9.0 (cd959bae9) on
+    // the CPU, greedy: llama-completion -ngl 0 -dev none --temp 0.
+    const std::string path = kolibri1_path();
+    if (!std::filesystem::exists(path)) {
+        SKIP("Kolibri-1 APEX I-Nano not present (24GB, gitignored)");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    REQUIRE(g.get_string("general.architecture") == "kolibri1");
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::tokenizer_from_gguf(g);
+    struct Golden {
+        std::string prompt;
+        std::size_t prompt_tokens;  // llama.cpp's count (no BOS)
+        std::string cont;           // the reference's 24 tokens
+        std::size_t exact;          // greedy tokens pinned exactly
+    };
+    // The German one has near-ties on this coarse quant (IQ2 experts):
+    // after "Sie ist" locus's top beats the reference's token by 0.23
+    // on Vulkan, after "Energiequelle fur" by 0.13 (neon) and 0.18
+    // (Vulkan); so 6 tokens are exact, the rest teacher-forced.
+    const Golden goldens[] = {
+        {"The water cycle describes how water moves between the oceans, "
+         "the air and the land. First,",
+         19,
+         " water evaporates from the oceans and the land. Then, water "
+         "vapor rises into the air. Then, water vapor condenses",
+         24},
+        {"Die Sonne ist ein Stern im Zentrum unseres Sonnensystems. Sie "
+         "besteht haupts\xc3\xa4" "chlich aus",
+         15,
+         " Wasserstoff und Helium. Sie ist die Energiequelle f\xc3\xbc"
+         "r das Leben auf der Erde. Sie ist die Energiequelle f\xc3\xbc"
+         "r das Leben auf der",
+         6},
+    };
+    std::vector<const char*> backends = {"neon"};
+    if (locus::backend::find_backend("neon") == nullptr) {
+        backends = {"scalar"};
+    }
+    if (locus::backend::vulkan_backend_usable()) {
+        backends.push_back("vulkan");
+    }
+    std::vector<float> logits(model.hparams().n_vocab);
+    for (const char* be : backends) {
+        model.use_backend(*locus::backend::find_backend(be));
+        for (const Golden& gd : goldens) {
+            INFO(be << ", " << gd.prompt_tokens << "-token prompt");
+            const auto prompt = tok->encode(gd.prompt, true);
+            REQUIRE(prompt.size() == gd.prompt_tokens);
+            const auto ids = tok->encode(gd.prompt + gd.cont, true);
+            REQUIRE(ids.size() == gd.prompt_tokens + 24);
+            // Greedy from the prompt: the first `exact` tokens.
+            {
+                auto cache = model.make_cache(8);
+                auto ws = model.make_workspace();
+                locus::kv::PagedKvCache::Seq seq;
+                for (auto id : prompt) {
+                    REQUIRE(cache.ensure_capacity(seq, 1));
+                    model.forward(id, cache, seq, ws, logits);
+                }
+                std::vector<locus::tok::TokenId> gen;
+                for (std::size_t i = 0; i < gd.exact; ++i) {
+                    const auto next = locus::model::argmax(logits);
+                    gen.push_back(next);
+                    REQUIRE(cache.ensure_capacity(seq, 1));
+                    model.forward(next, cache, seq, ws, logits);
+                }
+                cache.release(seq);
+                const std::vector<locus::tok::TokenId> want(
+                    ids.begin() + static_cast<std::ptrdiff_t>(prompt.size()),
+                    ids.begin() +
+                        static_cast<std::ptrdiff_t>(prompt.size() + gd.exact));
+                REQUIRE(tok->decode(gen) == tok->decode(want));
+            }
+            // Teacher-forced along the whole reference: each of its
+            // tokens within 0.25 of locus's top logit.
+            if (gd.exact < 24) {
+                auto cache = model.make_cache(8);
+                auto ws = model.make_workspace();
+                locus::kv::PagedKvCache::Seq seq;
+                for (std::size_t i = 0; i + 1 < ids.size(); ++i) {
+                    REQUIRE(cache.ensure_capacity(seq, 1));
+                    model.forward(ids[i], cache, seq, ws, logits);
+                    if (i + 1 >= prompt.size()) {
+                        const float top = *std::max_element(logits.begin(),
+                                                            logits.end());
+                        INFO("position " << i + 1);
+                        REQUIRE(logits[static_cast<std::size_t>(
+                                    ids[i + 1])] >= top - 0.25f);
+                    }
+                }
+                cache.release(seq);
+            }
+        }
     }
 }
