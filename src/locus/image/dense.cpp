@@ -17,11 +17,6 @@ namespace {
 /** Tokens per matvec_batch call: keeps the inputs in cache. */
 constexpr std::uint32_t kTokenBlock = 64;
 
-/** Runs fn(i) for i in [0, n) on the thread pool. */
-void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
-    sys::ThreadPool::instance().parallel_for(n, fn);
-}
-
 /**
  * out[r * n + t] = w[r] . x[t] for n token-major inputs: the backend's
  * matvec_batch layout (row-major output), or n matvec calls when the
@@ -169,6 +164,39 @@ void attention(const backend::Ops& given, std::span<const float> q,
             for (std::uint32_t e = 0; e < hd; ++e) {
                 o[e] = ob[std::size_t{e} * m + t];
             }
+        }
+    });
+}
+
+void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
+    sys::ThreadPool::instance().parallel_for(n, fn);
+}
+
+void linear1(const backend::Ops& op, const backend::Mat& w,
+             std::span<const float> b, std::span<const float> x,
+             std::span<float> out) {
+    op.matvec(w, x, out);
+    for (std::uint32_t r = 0; r < w.rows; ++r) out[r] += b[r];
+}
+
+void ln_modulate(std::span<const float> x, std::uint32_t n, std::uint32_t d,
+                 float eps, const float* shift, const float* scale,
+                 std::span<float> out) {
+    parallel(n, [&](std::size_t t) {
+        const float* xi = &x[t * d];
+        float* o = &out[t * d];
+        float mean = 0.0f;
+        for (std::uint32_t i = 0; i < d; ++i) mean += xi[i];
+        mean /= static_cast<float>(d);
+        float var = 0.0f;
+        for (std::uint32_t i = 0; i < d; ++i) {
+            const float c = xi[i] - mean;
+            var += c * c;
+        }
+        var /= static_cast<float>(d);
+        const float inv = 1.0f / std::sqrt(var + eps);
+        for (std::uint32_t i = 0; i < d; ++i) {
+            o[i] = (xi[i] - mean) * inv * (1.0f + scale[i]) + shift[i];
         }
     });
 }
