@@ -164,7 +164,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 | Llama-3.2-1B Q4_K_M decode, Vulkan         | M4 Max (MoltenVK) | 299 tok/s (llama.cpp Metal: 312)       |
 | Llama-3.2-1B Q8_0 decode, Vulkan           | M4 Max (MoltenVK) | 214 tok/s (llama.cpp Metal: 223)       |
 | Orpheus 3B Q4_K_M decode, Vulkan           | M4 Max (MoltenVK) | 131 tok/s (llama.cpp Metal: 135)       |
-| Llama-3.2-1B Q8_0 prefill, 2.5k tokens     | M4 Max (MoltenVK) | 1940 tok/s                             |
+| Llama-3.2-1B Q8_0 prefill, 2.5k tokens     | M4 Max (MoltenVK) | 2048 tok/s                             |
 | DeepSeek-Coder-V2-Lite Q8_0 decode, Vulkan | M4 Max (MoltenVK) | 88 tok/s                               |
 | Llama-3.2-1B Q8_0 decode, CPU              | M4 Max (neon)     | 89 tok/s                               |
 | Llama-3.2-1B Q8_0 prefill, 8k tokens, CPU  | M2 Pro (neon)     | 124 tok/s                              |
@@ -178,7 +178,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   runs at 1.34x real time), Qwen-Image-Edit's 65 s CPU encode (#671,
   parked: the edit's working set does not fit a 36 GiB host with the
   language model on the GPU).
-- Performance: prefill on Apple GPUs at 42% of Metal's (#10:
+- Performance: prefill on Apple GPUs at 45% of Metal's (#10:
   MoltenVK exposes no cooperative matrix), CPU prefill (#618: x86
   SSE4, long-context attention #701), batch-invariant decode at full
   speed on V3D (#511), the MoE hybrid on Vulkan (#679).
