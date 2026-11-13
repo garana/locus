@@ -23,25 +23,67 @@ namespace locus::model {
  * reduction stays one serial add chain under strict FP, i#206), and
  * the result is the same bits on every CPU and thread count.
  */
-inline float dot_f32_8(const float* a, const float* b, std::uint32_t n) {
-    // Lanes 0..3 in lo, 4..7 in hi (GCC / Clang vector types: one
-    // 4-wide multiply and add per half; the plain 8-lane array loop
-    // vectorizes only 2 wide).
+/**
+ * The eight lanes of dot_f32_8: as two 4-wide vectors (W = 4, any CPU)
+ * or one 8-wide vector (W = 8, for code built with AVX). Lane j is
+ * the same sum of products either way, so the results are the same
+ * bits; only the instructions differ.
+ */
+template <int W>
+struct Lanes8;
+
+template <>
+struct Lanes8<4> {
     typedef float f4 __attribute__((vector_size(16)));
     f4 lo = {0.0f, 0.0f, 0.0f, 0.0f};
-    f4 hi = lo;
-    std::uint32_t i = 0;
-    for (; i + 8 <= n; i += 8) {
+    f4 hi = {0.0f, 0.0f, 0.0f, 0.0f};
+    /** Lanes += a[0..7] * b[0..7]. */
+    [[gnu::always_inline]] void add_mul(const float* a, const float* b) {
         f4 a0, a1, b0, b1;
-        std::memcpy(&a0, a + i, sizeof a0);
-        std::memcpy(&a1, a + i + 4, sizeof a1);
-        std::memcpy(&b0, b + i, sizeof b0);
-        std::memcpy(&b1, b + i + 4, sizeof b1);
+        std::memcpy(&a0, a, sizeof a0);
+        std::memcpy(&a1, a + 4, sizeof a1);
+        std::memcpy(&b0, b, sizeof b0);
+        std::memcpy(&b1, b + 4, sizeof b1);
         lo += a0 * b0;
         hi += a1 * b1;
     }
-    float s = ((lo[0] + lo[1]) + (lo[2] + lo[3])) +
-              ((hi[0] + hi[1]) + (hi[2] + hi[3]));
+    [[gnu::always_inline]] float lane(int j) const {
+        return j < 4 ? lo[j] : hi[j - 4];
+    }
+};
+
+template <>
+struct Lanes8<8> {
+    typedef float f8 __attribute__((vector_size(32)));
+    f8 v = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    [[gnu::always_inline]] void add_mul(const float* a, const float* b) {
+        f8 a8, b8;
+        std::memcpy(&a8, a, sizeof a8);
+        std::memcpy(&b8, b, sizeof b8);
+        v += a8 * b8;
+    }
+    [[gnu::always_inline]] float lane(int j) const { return v[j]; }
+};
+
+/** The fixed tree over the eight lanes. */
+template <int W>
+[[gnu::always_inline]] inline float lanes8_sum(const Lanes8<W>& l) {
+    return ((l.lane(0) + l.lane(1)) + (l.lane(2) + l.lane(3))) +
+           ((l.lane(4) + l.lane(5)) + (l.lane(6) + l.lane(7)));
+}
+
+template <int W = 4>
+[[gnu::always_inline]] inline float dot_f32_8(const float* a, const float* b,
+                                              std::uint32_t n) {
+    // Lanes 0..3 in lo, 4..7 in hi (GCC / Clang vector types: one
+    // 4-wide multiply and add per half; the plain 8-lane array loop
+    // vectorizes only 2 wide), or all eight in one AVX vector.
+    Lanes8<W> l;
+    std::uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        l.add_mul(a + i, b + i);
+    }
+    float s = lanes8_sum(l);
     for (; i < n; ++i) {
         s += a[i] * b[i];
     }
@@ -53,30 +95,20 @@ inline float dot_f32_8(const float* a, const float* b, std::uint32_t n) {
  * step for all four, and each dot keeps dot_f32_8's lanes, tree and
  * tail, so out[r] is the bits dot_f32_8(a[r], b, n) gives.
  */
-inline void dot4_f32_8(const float* const a[4], const float* b,
-                       std::uint32_t n, float out[4]) {
-    typedef float f4 __attribute__((vector_size(16)));
-    f4 lo[4], hi[4];
-    for (int r = 0; r < 4; ++r) {
-        lo[r] = f4{0.0f, 0.0f, 0.0f, 0.0f};
-        hi[r] = lo[r];
-    }
+template <int W = 4>
+[[gnu::always_inline]] inline void dot4_f32_8(const float* const a[4],
+                                              const float* b,
+                                              std::uint32_t n,
+                                              float out[4]) {
+    Lanes8<W> l[4];
     std::uint32_t i = 0;
     for (; i + 8 <= n; i += 8) {
-        f4 b0, b1;
-        std::memcpy(&b0, b + i, sizeof b0);
-        std::memcpy(&b1, b + i + 4, sizeof b1);
         for (int r = 0; r < 4; ++r) {
-            f4 a0, a1;
-            std::memcpy(&a0, a[r] + i, sizeof a0);
-            std::memcpy(&a1, a[r] + i + 4, sizeof a1);
-            lo[r] += a0 * b0;
-            hi[r] += a1 * b1;
+            l[r].add_mul(a[r] + i, b + i);
         }
     }
     for (int r = 0; r < 4; ++r) {
-        float s = ((lo[r][0] + lo[r][1]) + (lo[r][2] + lo[r][3])) +
-                  ((hi[r][0] + hi[r][1]) + (hi[r][2] + hi[r][3]));
+        float s = lanes8_sum(l[r]);
         for (std::uint32_t k = i; k < n; ++k) {
             s += a[r][k] * b[k];
         }
@@ -89,17 +121,18 @@ inline void dot4_f32_8(const float* const a[4], const float* b,
  * head h / group (dot_f32_8), softmaxes, and weights the value rows
  * into head h of out.
  */
-template <class KRow, class VRow>
-void gqa_head(const float* q, float* out, std::uint32_t h, std::uint32_t hd,
-              std::uint32_t group, std::uint32_t pos, float kq_scale,
-              const KRow& krow_at, const VRow& vrow_at) {
+template <int W, class KRow, class VRow>
+[[gnu::always_inline]] inline void gqa_head(
+    const float* q, float* out, std::uint32_t h, std::uint32_t hd,
+    std::uint32_t group, std::uint32_t pos, float kq_scale,
+    const KRow& krow_at, const VRow& vrow_at) {
     thread_local std::vector<float> att_buf;
     att_buf.resize(pos + 1);
     std::span<float> att(att_buf.data(), pos + 1);
     const float* qh = q + static_cast<std::size_t>(h) * hd;
     const std::size_t kvh = static_cast<std::size_t>(h / group) * hd;
     for (std::uint32_t t = 0; t <= pos; ++t) {
-        att[t] = dot_f32_8(qh, krow_at(t) + kvh, hd) * kq_scale;
+        att[t] = dot_f32_8<W>(qh, krow_at(t) + kvh, hd) * kq_scale;
     }
     backend::softmax_inplace(att);
     float* oh = out + static_cast<std::size_t>(h) * hd;
@@ -131,6 +164,39 @@ void gqa_head(const float* q, float* out, std::uint32_t h, std::uint32_t hd,
     }
 }
 
+/** Tests set it to run the 4-wide build on an AVX CPU too. */
+inline bool& attend_avx_off() {
+    static bool off = false;
+    return off;
+}
+
+/**
+ * @returns Whether the attention kernels take their AVX build: an
+ * x86-64 CPU that has AVX (and an OS that saves its registers). The
+ * AVX build keeps every lane's sums, so the results are the same bits.
+ */
+inline bool attend_avx() {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    static const bool on = __builtin_cpu_supports("avx") != 0;
+    return on && !attend_avx_off();
+#else
+    return false;
+#endif
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+// The 8-wide builds, compiled for AVX: only these functions get the
+// target (the rest of the binary stays baseline), and the bodies they
+// inline run their eight lanes in one register.
+template <class KRow, class VRow>
+[[gnu::target("avx")]] void gqa_head_avx(
+    const float* q, float* out, std::uint32_t h, std::uint32_t hd,
+    std::uint32_t group, std::uint32_t pos, float kq_scale,
+    const KRow& krow_at, const VRow& vrow_at) {
+    gqa_head<8>(q, out, h, hd, group, pos, kq_scale, krow_at, vrow_at);
+}
+#endif
+
 /**
  * Decode attention for one query token over positions 0..pos, GQA:
  * head h of q (hd floats each) scores every position's key row of KV
@@ -153,8 +219,17 @@ void gqa_attend(const float* q, float* out, std::uint32_t n_heads,
                 std::uint32_t hd, std::uint32_t group, std::uint32_t pos,
                 float kq_scale, const KRow& krow_at, const VRow& vrow_at,
                 std::uint64_t min_work = std::uint64_t{1} << 16) {
+    const bool avx = attend_avx();
     auto head = [&](std::uint32_t h) {
-        gqa_head(q, out, h, hd, group, pos, kq_scale, krow_at, vrow_at);
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+        if (avx) {
+            gqa_head_avx(q, out, h, hd, group, pos, kq_scale, krow_at,
+                         vrow_at);
+            return;
+        }
+#endif
+        (void)avx;
+        gqa_head<4>(q, out, h, hd, group, pos, kq_scale, krow_at, vrow_at);
     };
     const std::size_t t = std::min<std::size_t>(mt_fanout(), n_heads);
     if (t <= 1 ||
@@ -182,11 +257,12 @@ void gqa_attend(const float* q, float* out, std::uint32_t n_heads,
  * groups from 0, then the tail one position at a time), so the result
  * is bit-identical.
  */
-template <class KRow, class VRow>
-void gqa_kv_block(const float* q, float* out, std::size_t q_stride,
-                  std::uint32_t t0, std::uint32_t t1, std::uint32_t base,
-                  std::uint32_t g, std::uint32_t hd, std::uint32_t group,
-                  float kq_scale, const KRow& krow_at, const VRow& vrow_at) {
+template <int W, class KRow, class VRow>
+[[gnu::always_inline]] inline void gqa_kv_block(
+    const float* q, float* out, std::size_t q_stride, std::uint32_t t0,
+    std::uint32_t t1, std::uint32_t base, std::uint32_t g, std::uint32_t hd,
+    std::uint32_t group, float kq_scale, const KRow& krow_at,
+    const VRow& vrow_at) {
     const std::uint32_t nq = (t1 - t0) * group;
     const std::uint32_t last = base + t1 - 1;  // the furthest position
     const std::size_t stride = std::size_t{last} + 1;
@@ -214,13 +290,14 @@ void gqa_kv_block(const float* q, float* out, std::size_t q_stride,
             const float* qs[4] = {q + qrow(j), q + qrow(j + 1),
                                   q + qrow(j + 2), q + qrow(j + 3)};
             float d[4];
-            dot4_f32_8(qs, k, hd, d);
+            dot4_f32_8<W>(qs, k, hd, d);
             for (std::uint32_t r = 0; r < 4; ++r) {
                 att_buf[(j + r) * stride + p] = d[r] * kq_scale;
             }
         }
         for (; j < nq; ++j) {
-            att_buf[j * stride + p] = dot_f32_8(q + qrow(j), k, hd) * kq_scale;
+            att_buf[j * stride + p] =
+                dot_f32_8<W>(q + qrow(j), k, hd) * kq_scale;
         }
     }
     for (std::uint32_t j = 0; j < nq; ++j) {
@@ -267,6 +344,19 @@ void gqa_kv_block(const float* q, float* out, std::size_t q_stride,
     }
 }
 
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+/** gqa_kv_block's 8-wide build, compiled for AVX (see gqa_head_avx). */
+template <class KRow, class VRow>
+[[gnu::target("avx")]] void gqa_kv_block_avx(
+    const float* q, float* out, std::size_t q_stride, std::uint32_t t0,
+    std::uint32_t t1, std::uint32_t base, std::uint32_t g, std::uint32_t hd,
+    std::uint32_t group, float kq_scale, const KRow& krow_at,
+    const VRow& vrow_at) {
+    gqa_kv_block<8>(q, out, q_stride, t0, t1, base, g, hd, group, kq_scale,
+                    krow_at, vrow_at);
+}
+#endif
+
 /**
  * gqa_attend for n query tokens at positions base .. base + n - 1 in
  * one pool dispatch: token t's q row is q + t * q_stride, its output
@@ -306,12 +396,21 @@ void gqa_attend_batch(const float* q, float* out, std::size_t q_stride,
     const std::uint32_t n_blocks = (n + block - 1) / block;
     const std::size_t items = std::size_t{n_kv} * n_blocks;
     const std::size_t t = std::min<std::size_t>(mt_fanout(), items);
+    const bool avx = attend_avx();
     auto item = [&](std::size_t i) {
         const auto g = static_cast<std::uint32_t>(i % n_kv);
         const auto b = static_cast<std::uint32_t>(i / n_kv);
         const std::uint32_t t0 = b * block;
-        gqa_kv_block(q, out, q_stride, t0, std::min(n, t0 + block), base,
-                     g, hd, group, kq_scale, krow_at, vrow_at);
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+        if (avx) {
+            gqa_kv_block_avx(q, out, q_stride, t0, std::min(n, t0 + block),
+                             base, g, hd, group, kq_scale, krow_at, vrow_at);
+            return;
+        }
+#endif
+        (void)avx;
+        gqa_kv_block<4>(q, out, q_stride, t0, std::min(n, t0 + block), base,
+                        g, hd, group, kq_scale, krow_at, vrow_at);
     };
     if (t <= 1) {
         for (std::size_t i = 0; i < items; ++i) {

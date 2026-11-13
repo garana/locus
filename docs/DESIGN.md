@@ -132,7 +132,13 @@ portable across CPU generations. When the compiler's default arm64
 target lacks the 8-bit dot product (GCC on the Pi 5), the neon kernels
 are also built with it (`matvec_neon_dotprod.cpp`), and the neon
 backend uses that build on a CPU that reports dotprod; the integer
-sums are exact either way, so the results are the same. Vulkan
+sums are exact either way, so the results are the same. The sse4
+kernels are likewise built with AVX (`matvec_sse4_avx.cpp`) for CPUs
+with AVX but not AVX2 (Sandy and Ivy Bridge): the sse4 backend uses
+that build when the CPU reports AVX. It keeps the sse4 float order (the
+batched Q8_0 kernel's two 4-lane sums share one 256-bit register), so
+the results are the same, 7 to 19% faster per kernel on an i5-2400.
+Vulkan
 shaders are compiled to
 SPIR-V and embedded at build time.
 
@@ -944,16 +950,16 @@ locus ports those dots (`backend::matvec_q8k`):
 | Backend | 8-bit activation dots                                         |
 |---------|---------------------------------------------------------------|
 | scalar  | all 15 QK_K types and the block-32 types                      |
-| neon    | Q2/4/6_K, IQ1_M, IQ3_XXS, IQ3_S, IQ4_XS and block-32 types    |
-| sse4    | the five K-quants; the rest through scalar                    |
+| neon    | the K-quants, IQ1_M, IQ2_XXS/S, IQ3_XXS/S, IQ4_XS, block-32   |
+| sse4    | all 15 QK_K types and the block-32 types                      |
 | cuda    | all 15 QK_K types                                             |
 
-The sse4 and CUDA dots, and the neon block-32, Q2_K and IQ dots,
-replay the scalar accumulation order, so they are bit-identical to it.
-The neon Q4_K and Q6_K dots do not (below). The build turns off
-implicit fused multiply-add (`-ffp-contract=off`), so the scalar path
-rounds the same on x86-64 and arm64, and a stage chain that mixes the
-two is exact (#458).
+The sse4 and CUDA dots, and the neon ones but Q4_K and Q6_K, replay
+the scalar accumulation order, so they are bit-identical to it. The
+neon Q4_K and Q6_K dots do not (below). The build turns off implicit
+fused multiply-add (`-ffp-contract=off`), so the scalar path rounds
+the same on x86-64 and arm64, and a stage chain that mixes the two is
+exact (#458).
 
 "Bit-exact with llama.cpp" is unreachable in principle: ggml is not
 bit-exact across its own backends, because the final f32 sum runs in
