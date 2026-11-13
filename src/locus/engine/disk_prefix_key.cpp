@@ -1,5 +1,7 @@
 #include "locus/engine/disk_prefix_key.hpp"
 
+#include "locus/engine/helper_prefix_store.hpp"
+
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -109,6 +111,16 @@ std::shared_ptr<DiskPrefixStore> open_disk_prefix(
     DiskKey k = disk_key_for(g, path, m, kv_type, bb);
     return std::make_shared<DiskPrefixStore>(dir, std::move(k), bb,
                                              cap_bytes);
+}
+
+std::shared_ptr<DiskPrefixStore> open_helper_prefix(
+    const std::vector<std::string>& argv, std::uint64_t cap_bytes,
+    const gguf::GgufFile& g, const std::string& path,
+    const model::TransformerModel& m, kv::KvType kv_type) {
+    std::size_t bb = 0;
+    DiskKey k = disk_key_for(g, path, m, kv_type, bb);
+    return std::make_shared<HelperPrefixStore>(argv, std::move(k), bb,
+                                               cap_bytes);
 }
 
 }  // namespace locus::engine
