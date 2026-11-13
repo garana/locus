@@ -14,6 +14,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
+#include "locus/backend/vulkan/context.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
@@ -143,5 +144,47 @@ TEST_CASE("a request decodes the same alone or batched: Q8_0 and Q4_K_M",
     DYNAMIC_SECTION("llama-3.2-1b-q4_k_m.gguf") {
         const Mode mode;
         check_model(kModels + "llama-3.2-1b-q4_k_m.gguf", 16, false);
+    }
+}
+
+// i#682: a driver may hand a new buffer back with a freed one's old
+// bytes, so a kernel that reads memory nothing wrote decodes the same in
+// a fresh process (zeroed pages) and differently after other work. New
+// buffers filled with NaN bytes, then with small finite ones, must give
+// the bits of unfilled ones, alone and batched, in batch-invariant mode.
+TEST_CASE("vulkan decode reads only memory it wrote",
+          "[vulkan][invariance][e2e]") {
+    const std::string path = kModels + "llama-3.2-1b-q8_0.gguf";
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no Vulkan device");
+    }
+    if (!std::filesystem::exists(path)) {
+        SKIP("llama-3.2-1b-q8_0.gguf absent");
+    }
+    using locus::backend::vk::VulkanContext;
+    struct Restore {
+        ~Restore() {
+            VulkanContext::set_poison(-1);
+            locus::backend::vulkan_reset_batch_invariant();
+        }
+    } const restore;
+    locus::backend::vulkan_set_batch_invariant(true);
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+    const auto decode = [&](int poison, std::uint32_t n_req) {
+        locus::backend::vulkan_reset_state();
+        VulkanContext::set_poison(poison);
+        return run_and_reset(model, n_req, 7, 8, true);
+    };
+    for (const std::uint32_t n : {1u, 2u}) {
+        INFO("batch of " << n);
+        const auto clean = decode(-1, n);
+        for (const int poison : {0xff, 0x3c}) {
+            INFO("poison " << poison);
+            const auto got = decode(poison, n);
+            CHECK(got.first == clean.first);
+            CHECK(got.second == clean.second);
+        }
     }
 }

@@ -1387,6 +1387,10 @@ struct VulkanContext::Impl {
               "bind memory");
         check(vkMapMemory(device, b.mem, 0, size, 0, &b.map),
               "map memory");
+        const int poison = VulkanContext::poison();
+        if (poison >= 0) {
+            std::memset(b.map, poison, size);
+        }
         return b;
     }
 
@@ -1601,6 +1605,29 @@ VulkanContext::Buffer VulkanContext::create_buffer(std::size_t bytes,
                                                    MemKind kind) {
     auto* hb = new Impl::HostBuffer(impl_->make_buffer(bytes, kind));
     return Buffer{hb};
+}
+
+namespace {
+// -2: not read from LOCUS_VK_POISON yet; -1 off; else the fill byte.
+std::atomic<int> g_poison{-2};
+}  // namespace
+
+int VulkanContext::poison() {
+    int v = g_poison.load();
+    if (v == -2) {
+        const char* e = std::getenv("LOCUS_VK_POISON");
+        v = e != nullptr && *e != '\0'
+                ? static_cast<int>(std::strtol(e, nullptr, 0) & 0xff)
+                : -1;
+        int expected = -2;
+        g_poison.compare_exchange_strong(expected, v);
+        v = g_poison.load();
+    }
+    return v;
+}
+
+void VulkanContext::set_poison(int byte) {
+    g_poison.store(byte < 0 ? -1 : byte & 0xff);
 }
 
 VulkanContext::Buffer VulkanContext::import_host(const void* ptr,
@@ -2061,6 +2088,8 @@ namespace {
 VulkanContext::Buffer VulkanContext::create_buffer(std::size_t, MemKind) {
     no_kernels();
 }
+int VulkanContext::poison() { return -1; }
+void VulkanContext::set_poison(int) {}
 VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
                                                  std::size_t) {
     no_kernels();

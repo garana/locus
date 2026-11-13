@@ -385,6 +385,19 @@ class VulkanContext {
                          MemKind kind = MemKind::kScratch);
 
     /**
+     * @returns The byte create_buffer fills new buffers with, or -1 for
+     *     none (the default). A driver may hand back a freed allocation
+     *     with its old bytes, so a kernel that reads memory nothing wrote
+     *     can differ between a fresh process and a long one (i#682); a
+     *     fill byte makes such a read show at once. LOCUS_VK_POISON sets
+     *     it at startup (e.g. 0xff, NaN in every float).
+     */
+    static int poison();
+
+    /** Sets poison(): @param byte 0 to 255, or -1 for none. */
+    static void set_poison(int byte);
+
+    /**
      * Wraps host memory [ptr, ptr + bytes) as a buffer without copying
      * (VK_EXT_external_memory_host: on unified memory the GPU reads the
      * mmap'd weights in place). Imports the whole pages from ptr's page
