@@ -493,15 +493,18 @@ TEST_CASE("vulkan short-batch SwiGLU matches the CPU and keeps a "
     for (auto b : {gb, ub, xb}) ctx.destroy_buffer(b);
 }
 
-// #432: the NT 8, guard-free, NT 2 and NT 4 builds of matvec_q8_0_n (and
-// _glu) run the same per-token arithmetic, so batch-invariant decode
-// may pick one by batch size; this checks a token's output is the same
-// bits from each build on this device.
+// #432: the NT 8, guard-free, NT 2 and NT 4 builds of matvec_q8_0_n
+// (and _glu) run the same per-token arithmetic, so batch-invariant
+// decode may pick one by batch size; this checks a token's output is
+// the same bits from each build on this device. The NT 1 build (i#511)
+// has its own loop shape and is picked on V3D only, so it is checked
+// there only: MoltenVK's fast math rounds it apart.
 TEST_CASE("vulkan short-batch builds give the same bits", "[vulkan]") {
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");
     }
     VulkanContext ctx;
+    const bool v3d = ctx.device_name().find("V3D") != std::string::npos;
     std::mt19937 rng(83);
     const std::uint32_t rows = 37, cols = 4096;
     const auto wg = random_q8(rows, cols, rng);
@@ -536,6 +539,8 @@ TEST_CASE("vulkan short-batch builds give the same bits", "[vulkan]") {
             glu ? Kernel::kMatvecQ8_0N2Glu : Kernel::kMatvecQ8_0N2;
         const Kernel k4 =
             glu ? Kernel::kMatvecQ8_0N4Glu : Kernel::kMatvecQ8_0N4;
+        const Kernel k1 =
+            glu ? Kernel::kMatvecQ8_0N1Glu : Kernel::kMatvecQ8_0N1;
         for (const std::uint32_t n_tok : {1u, 2u, 3u, 4u}) {
             INFO("n_tok " << n_tok);
             const auto a = run(k8, glu, n_tok);
@@ -543,6 +548,9 @@ TEST_CASE("vulkan short-batch builds give the same bits", "[vulkan]") {
             REQUIRE(run(k4, glu, n_tok) == a);
             if (n_tok <= 2) {
                 REQUIRE(run(k2, glu, n_tok) == a);
+            }
+            if (n_tok == 1 && v3d) {
+                REQUIRE(run(k1, glu, n_tok) == a);
             }
         }
     }

@@ -709,11 +709,13 @@ struct State {
 
     /** The extra SSBO an IQ kernel binds (grid+signs), or null. */
     VulkanContext::Buffer grid_for(Kernel k) {
-        if (k == Kernel::kMatvecIQ2_XXS || k == Kernel::kMatvecIQ2_XXSB) {
+        if (k == Kernel::kMatvecIQ2_XXS || k == Kernel::kMatvecIQ2_XXSB ||
+            k == Kernel::kMatmulIQ2_XXS || k == Kernel::kMatmulIQ2_XXSId) {
             return grid_table(iq2xxs_tbl, iq2xxs_tbl_ready,
                               ::iq2xxs_grid);
         }
-        if (k == Kernel::kMatvecIQ2_S || k == Kernel::kMatvecIQ2_SB) {
+        if (k == Kernel::kMatvecIQ2_S || k == Kernel::kMatvecIQ2_SB ||
+            k == Kernel::kMatmulIQ2_S || k == Kernel::kMatmulIQ2_SId) {
             // The grid alone is read (signs are inline); grid_table
             // appends ksigns_iq2xs regardless.
             return grid_table(iq2s_tbl, iq2s_tbl_ready, ::iq2s_grid);
@@ -1145,6 +1147,10 @@ Kernel matmul_kernel(const Mat& w) {
         case gguf::TensorType::kQ4_K: return Kernel::kMatmulQ4_K;
         case gguf::TensorType::kQ6_K: return Kernel::kMatmulQ6_K;
         case gguf::TensorType::kQ5_0: return Kernel::kMatmulQ5_0;
+        case gguf::TensorType::kQ3_K: return Kernel::kMatmulQ3_K;
+        case gguf::TensorType::kQ5_K: return Kernel::kMatmulQ5_K;
+        case gguf::TensorType::kIQ2_S: return Kernel::kMatmulIQ2_S;
+        case gguf::TensorType::kIQ2_XXS: return Kernel::kMatmulIQ2_XXS;
         case gguf::TensorType::kF32: return Kernel::kMatmulF32;
         case gguf::TensorType::kF16: return Kernel::kMatmulF16;
         case gguf::TensorType::kBF16: return Kernel::kMatmulBF16;
@@ -1160,6 +1166,10 @@ Kernel matmul_id_kernel(const Mat& w) {
         case gguf::TensorType::kQ4_K: return Kernel::kMatmulQ4_KId;
         case gguf::TensorType::kQ5_0: return Kernel::kMatmulQ5_0Id;
         case gguf::TensorType::kQ6_K: return Kernel::kMatmulQ6_KId;
+        case gguf::TensorType::kQ3_K: return Kernel::kMatmulQ3_KId;
+        case gguf::TensorType::kQ5_K: return Kernel::kMatmulQ5_KId;
+        case gguf::TensorType::kIQ2_S: return Kernel::kMatmulIQ2_SId;
+        case gguf::TensorType::kIQ2_XXS: return Kernel::kMatmulIQ2_XXSId;
         default: return Kernel::kCount_;
     }
 }
@@ -1203,6 +1213,30 @@ Kernel small_batch_kernel(const Mat& w, std::uint32_t n_tok) {
  * checks that on each device).
  */
 Kernel q8n_variant(const VulkanContext& ctx, Kernel k, std::uint32_t n) {
+    // The NT 1 builds (i#511): matvec_q8_0's loop for a lone sequence,
+    // on V3D, where with the NT 2 loop a lone Q8_0 1B decode took 2080
+    // ms of GPU time per token against the single path's 1468
+    // (LOCUS_VK_Q8N1=0 turns it off). V3D only: its loop shape differs
+    // from the shared one, and Mesa's V3D compiler (no FMA, no
+    // reassociation) gives it the same bits, which the builds test
+    // checks; MoltenVK's fast math does not (i#511), so elsewhere the
+    // NT 2 build stays, whatever the variable says.
+    // Only for n == 1: the NT 1 build computes token 0 only.
+    static const bool n1 = [&] {
+        if (ctx.device_name().find("V3D") == std::string::npos) {
+            return false;
+        }
+        const char* e = std::getenv("LOCUS_VK_Q8N1");
+        return e == nullptr || std::string(e) != "0";
+    }();
+    if (n == 1 && n1) {
+        if (k == Kernel::kMatvecQ8_0N) {
+            return Kernel::kMatvecQ8_0N1;
+        }
+        if (k == Kernel::kMatvecQ8_0NGlu) {
+            return Kernel::kMatvecQ8_0N1Glu;
+        }
+    }
     if (n <= 2) {
         if (k == Kernel::kMatvecQ8_0N) {
             return Kernel::kMatvecQ8_0N2;
@@ -1327,7 +1361,11 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
         k_splits > 1
             ? s.chunk_buf(State::kCSplit, std::size_t{k_splits} * plane)
             : out;
-    const VulkanContext::Buffer bufs[] = {wb, x, dst};
+    // IQ kernels bind their grid table at binding 3.
+    const VulkanContext::Buffer grid = s.grid_for(k);
+    const VulkanContext::Buffer bufs_all[] = {wb, x, dst, grid};
+    const std::span<const VulkanContext::Buffer> bufs(
+        bufs_all, grid.impl != nullptr ? 4u : 3u);
     const std::uint32_t push[] = {w.rows,
                                   w.cols,
                                   r.n_tok,
@@ -1425,7 +1463,12 @@ void rec_matmul_id(State& s, const Mat& w, VulkanContext::Buffer wb,
                    std::uint32_t k, std::uint32_t n_expert,
                    std::uint64_t expert_bytes, std::uint32_t x_stride,
                    std::uint32_t x_div, std::uint32_t out_stride) {
-    const VulkanContext::Buffer bufs[] = {wb, x, out, ids};
+    // IQ kernels bind their grid table after the ids (binding 4).
+    const Kernel kid = matmul_id_kernel(w);
+    const VulkanContext::Buffer grid = s.grid_for(kid);
+    const VulkanContext::Buffer bufs_all[] = {wb, x, out, ids, grid};
+    const std::span<const VulkanContext::Buffer> bufs(
+        bufs_all, grid.impl != nullptr ? 5u : 4u);
     const std::uint32_t push[] = {w.rows,
                                   w.cols,
                                   n_tok,
@@ -1957,7 +2000,9 @@ int batch_invariant_state() {
         } else {
             // On by default where a lone sequence was measured to cost
             // little in this mode: Apple GPUs (M2 Pro level, M4 Max
-            // -5%); off elsewhere (V3D -33%, others not measured).
+            // -5%); off elsewhere. V3D costs 3% with the NT 1 build
+            // (i#511) but stays off until i#682 (a rare mismatch in
+            // this mode there) is understood.
             v = vulkan_device_name().find("Apple") != std::string::npos ? 2
                                                                        : 0;
         }

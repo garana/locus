@@ -59,7 +59,8 @@ const std::vector<Backend>& list() {
         b.push_back({"sse4",
                      "x86-64 SSE4.1 vectorized matvec (F32/Q8_0/"
                      "Q4_K/Q6_K), 8-bit activation dots (K-quants), "
-                     "Q4_K/Q6_K register-blocked batch",
+                     "Q4_K/Q6_K register-blocked batch; built with AVX "
+                     "when the CPU has it",
                      f.sse4, true,
                      {.matvec = &matvec_sse4,
                       .matvec_q8k = &matvec_sse4_q8k,
@@ -67,6 +68,17 @@ const std::vector<Backend>& list() {
                       .matvec_batch = &matvec_batch_sse4,
                       .matvec_q8k_batch = &matvec_batch_sse4_q8k,
                       .prefers_q8k = true}});
+#if defined(LOCUS_HAS_SSE4_AVX_VARIANT)
+        // The same kernels built with AVX, on a CPU that has it
+        // (bit-identical results; VEX encoding and 256-bit float sums).
+        if (f.avx) {
+            Ops& o = b.back().ops;
+            o.matvec = &sse4_avx::matvec_sse4;
+            o.matvec_q8k = &sse4_avx::matvec_sse4_q8k;
+            o.matvec_batch = &sse4_avx::matvec_batch_sse4;
+            o.matvec_q8k_batch = &sse4_avx::matvec_batch_sse4_q8k;
+        }
+#endif
 #endif
         // The scalar backend ships the R11 batched reference; neon and
         // sse4 ship register-blocked f32 kernels (Q4_K/Q6_K + per-token

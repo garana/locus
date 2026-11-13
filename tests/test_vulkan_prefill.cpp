@@ -5,11 +5,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "iq_grids.h"
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
@@ -77,11 +79,21 @@ std::vector<std::byte> random_q8(std::uint32_t rows, std::uint32_t cols,
 std::vector<std::byte> random_kq(locus::gguf::TensorType type,
                                  std::uint32_t rows, std::uint32_t cols,
                                  std::mt19937& rng) {
-    // Q4_K / Q6_K super-blocks of 256, or Q5_0 blocks of 32 (d first).
-    const bool q4 = type == locus::gguf::TensorType::kQ4_K;
-    const bool q5 = type == locus::gguf::TensorType::kQ5_0;
-    const std::size_t block = q5 ? 22 : q4 ? 144 : 210;
-    const std::size_t d_off = q5 || q4 ? 0 : 208;
+    // K / IQ super-blocks of 256 (Q6_K's d last, Q3_K's at 108), or
+    // Q5_0 blocks of 32 (d first); Q4_K and Q5_K's dmin after d.
+    using T = locus::gguf::TensorType;
+    const bool q4 = type == T::kQ4_K || type == T::kQ5_K;
+    const bool q5 = type == T::kQ5_0;
+    const std::size_t block = q5                  ? 22
+                              : type == T::kQ4_K  ? 144
+                              : type == T::kQ5_K  ? 176
+                              : type == T::kQ3_K  ? 110
+                              : type == T::kIQ2_S ? 82
+                              : type == T::kIQ2_XXS ? 66
+                                                    : 210;
+    const std::size_t d_off = type == T::kQ6_K   ? 208
+                              : type == T::kQ3_K ? 108
+                                                 : 0;
     const std::uint32_t per = q5 ? 32 : 256;
     std::uniform_int_distribution<int> bd(0, 255);
     std::vector<std::byte> w(std::size_t{rows} * (cols / per) * block);
@@ -96,6 +108,29 @@ std::vector<std::byte> random_kq(locus::gguf::TensorType type,
             std::memcpy(&w[at + 2], &dmin, 2);
         }
     }
+    return w;
+}
+
+/**
+ * The grid table an IQ matmul binds (matvec_vulkan's grid_for layout:
+ * the grid, then ksigns_iq2xs), or one zero word for other types.
+ */
+std::vector<std::uint32_t> grid_table(locus::gguf::TensorType type) {
+    std::vector<std::byte> b;
+    auto put = [&](const void* p, std::size_t n) {
+        const auto* c = static_cast<const std::byte*>(p);
+        b.insert(b.end(), c, c + n);
+    };
+    if (type == locus::gguf::TensorType::kIQ2_S) {
+        put(iq2s_grid, sizeof(iq2s_grid));
+    } else if (type == locus::gguf::TensorType::kIQ2_XXS) {
+        put(iq2xxs_grid, sizeof(iq2xxs_grid));
+    } else {
+        return {0u};
+    }
+    put(ksigns_iq2xs, sizeof(ksigns_iq2xs));
+    std::vector<std::uint32_t> w((b.size() + 3) / 4);
+    std::memcpy(w.data(), b.data(), b.size());
     return w;
 }
 
@@ -201,6 +236,16 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
          1e-3f},
         {"q6_k", locus::gguf::TensorType::kQ6_K, Kernel::kMatmulQ6_K, 512,
          1e-3f},
+        // i#729: Kolibri-1's types (110-, 176-, 82- and 66-byte blocks,
+        // off word alignment; the IQ ones bind a grid table).
+        {"q3_k", locus::gguf::TensorType::kQ3_K, Kernel::kMatmulQ3_K, 512,
+         1e-3f},
+        {"q5_k", locus::gguf::TensorType::kQ5_K, Kernel::kMatmulQ5_K, 512,
+         1e-3f},
+        {"iq2_s", locus::gguf::TensorType::kIQ2_S, Kernel::kMatmulIQ2_S, 512,
+         1e-3f},
+        {"iq2_xxs", locus::gguf::TensorType::kIQ2_XXS,
+         Kernel::kMatmulIQ2_XXS, 512, 1e-3f},
         // 22-byte blocks: rows and halves start off word alignment.
         {"q5_0", locus::gguf::TensorType::kQ5_0, Kernel::kMatmulQ5_0, 96,
          1e-3f},
@@ -220,9 +265,10 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
         }
         DYNAMIC_SECTION(c.name) {
             const bool q8 = c.type == locus::gguf::TensorType::kQ8_0;
-            const bool kq = c.type == locus::gguf::TensorType::kQ4_K ||
-                            c.type == locus::gguf::TensorType::kQ6_K ||
-                            c.type == locus::gguf::TensorType::kQ5_0;
+            const bool kq = c.type != locus::gguf::TensorType::kQ8_0 &&
+                            c.type != locus::gguf::TensorType::kF32 &&
+                            c.type != locus::gguf::TensorType::kF16 &&
+                            c.type != locus::gguf::TensorType::kBF16;
             const bool half = c.type == locus::gguf::TensorType::kF16 ||
                               c.type == locus::gguf::TensorType::kBF16;
             std::vector<std::byte> w;
@@ -263,6 +309,9 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
 
             auto wb = upload(ctx, q8 ? gpu_q8(w, c.cols) : w);
             auto xb = upload(ctx, x);
+            const bool iq = c.type == locus::gguf::TensorType::kIQ2_S ||
+                            c.type == locus::gguf::TensorType::kIQ2_XXS;
+            const auto gridb = upload(ctx, grid_table(c.type));
             for (const bool acc : {false, true}) {
                 auto ob = upload(ctx, init);
                 const std::uint32_t tiles = (n_tok + 63) / 64;
@@ -270,7 +319,9 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
                     q8 || kq ? mat_bytes
                              : mat_bytes / (half ? 2 : 4));
                 ctx.begin_batch();
-                const VulkanContext::Buffer bufs[] = {wb, xb, ob};
+                const VulkanContext::Buffer bufs_all[] = {wb, xb, ob, gridb};
+                const std::span<const VulkanContext::Buffer> bufs(
+                    bufs_all, iq ? 4u : 3u);
                 const std::uint32_t push[] = {
                     rows,  c.cols, n_tok, acc ? 1u : 0u, 0,
                     0,     x_stride, 0,   out_stride,    fbits(scale),
@@ -307,6 +358,7 @@ TEST_CASE("vulkan matmul matches the CPU reference", "[vulkan]") {
             }
             ctx.destroy_buffer(wb);
             ctx.destroy_buffer(xb);
+            ctx.destroy_buffer(gridb);
         }
     }
 }
@@ -371,6 +423,98 @@ TEST_CASE("vulkan matmul prefetch and plain staging give the same bits",
         ::setenv("LOCUS_VK_MATMUL_PREFETCH", saved.c_str(), 1);
     } else {
         ::unsetenv("LOCUS_VK_MATMUL_PREFETCH");
+    }
+}
+
+// i#729: the expert-id matmuls over Kolibri-1's expert types, against
+// the CPU: moe_group lists 70 tokens' top-3 of 8 experts, and every
+// (token, slot) pair's output row is that expert's matvec.
+TEST_CASE("vulkan expert-id matmuls over q3_k q5_k iq2_s and iq2_xxs",
+          "[vulkan]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    using T = locus::gguf::TensorType;
+    struct Case {
+        const char* name;
+        T type;
+        Kernel kernel;
+    };
+    const Case cases[] = {
+        {"q3_k", T::kQ3_K, Kernel::kMatmulQ3_KId},
+        {"q5_k", T::kQ5_K, Kernel::kMatmulQ5_KId},
+        {"iq2_s", T::kIQ2_S, Kernel::kMatmulIQ2_SId},
+        {"iq2_xxs", T::kIQ2_XXS, Kernel::kMatmulIQ2_XXSId},
+    };
+    const std::uint32_t n_tok = 70, k = 3, n_exp = 8, rows = 37, cols = 512;
+    const std::uint32_t TT = VulkanContext::kMatmulTileToks;
+    const std::uint32_t TR = VulkanContext::kMatmulTileRows;
+    for (const Case& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            std::mt19937 rng(97);
+            const auto w = random_kq(c.type, rows * n_exp, cols, rng);
+            const std::size_t e_bytes = w.size() / n_exp;
+            const auto x = random_f32(std::size_t{n_tok} * cols, rng);
+            std::vector<std::uint32_t> route(std::size_t{n_tok} * 2 * k);
+            for (std::uint32_t t = 0; t < n_tok; ++t) {
+                std::vector<std::uint32_t> ids(n_exp);
+                std::iota(ids.begin(), ids.end(), 0u);
+                std::shuffle(ids.begin(), ids.end(), rng);
+                for (std::uint32_t j = 0; j < k; ++j) {
+                    route[t * 2 * k + j] = ids[j];
+                    route[t * 2 * k + k + j] = fbits(1.0f);
+                }
+            }
+            const std::uint32_t max_tiles = (n_tok * k + TT - 1) / TT + n_exp;
+            const std::size_t lb = n_exp + std::size_t{n_exp} * n_tok;
+            auto wb = upload(ctx, w);
+            auto xb = upload(ctx, x);
+            auto rb = upload(ctx, route);
+            auto gridb = upload(ctx, grid_table(c.type));
+            auto idb = ctx.create_buffer((lb + 1 + max_tiles) * 4);
+            auto ob = ctx.create_buffer(std::size_t{n_tok} * k * rows * 4);
+            const bool iq = c.type == T::kIQ2_S || c.type == T::kIQ2_XXS;
+            ctx.begin_batch();
+            {
+                const VulkanContext::Buffer bufs[] = {rb, idb};
+                const std::uint32_t push[] = {n_tok, k, n_exp, n_tok, TT};
+                ctx.dispatch(Kernel::kMoeGroup, bufs, push, 1);
+            }
+            {
+                const VulkanContext::Buffer bufs_all[] = {wb, xb, ob, idb,
+                                                          gridb};
+                const std::span<const VulkanContext::Buffer> bufs(
+                    bufs_all, iq ? 5u : 4u);
+                const std::uint32_t push[] = {
+                    rows, cols, n_tok, 0, 0, 0, cols, 0, rows, fbits(1.0f),
+                    static_cast<std::uint32_t>(e_bytes), 0, 0, n_exp, k,
+                    n_tok, 1, 0, 0, 0, 1, 0, 0, 0};
+                ctx.dispatch(c.kernel, bufs, push, (rows + TR - 1) / TR,
+                             max_tiles);
+            }
+            ctx.end_batch();
+            const auto got =
+                download<float>(ctx, ob, std::size_t{n_tok} * k * rows);
+            for (std::uint32_t t = 0; t < n_tok; ++t) {
+                for (std::uint32_t j = 0; j < k; ++j) {
+                    const std::uint32_t e = route[t * 2 * k + j];
+                    locus::backend::Mat m{c.type, w.data() + e * e_bytes,
+                                          rows, cols};
+                    const std::size_t p = std::size_t{t} * k + j;
+                    for (std::uint32_t r = 0; r < rows; ++r) {
+                        INFO("token " << t << " slot " << j << " row " << r);
+                        REQUIRE(got[p * rows + r] ==
+                                Catch::Approx(cpu_dot(m, r, x.data() +
+                                                                t * cols))
+                                    .margin(1e-3));
+                    }
+                }
+            }
+            for (auto b : {wb, xb, rb, gridb, idb, ob}) {
+                ctx.destroy_buffer(b);
+            }
+        }
     }
 }
 

@@ -46,11 +46,22 @@ and an x86 host tests every code PR.
   SHA and the PR heads it held. A red run is bisected by halves; the
   PR that breaks it leaves the batch. PRs that conflict go in separate
   batches, and a PR's head does not change once it is in a batch.
-- Review first: a PR enters a batch only after its two reading CLEARs;
-  a NOT CLEAR is fixed and read again before that.
-- One batch at a time: the next batch starts when the running one has
-  all its votes, and it takes every PR that passed review meanwhile.
-  Work on issues, PRs and reviews goes on while a batch runs.
+- Workflow, for every agent:
+  1. Take the next issue and set it In Progress on the project board.
+  2. When it has code, open a PR linked to the issue and ask the other
+     agents to review it.
+  3. The others read it and vote CLEAR or NOT CLEAR. On a NOT CLEAR,
+     all agents reach an agreement before the PR moves on; then it is
+     fixed and read again.
+  4. On two CLEARs, a PR that needs tests joins the test queue of each
+     host its tier and hardware call for (the x86 and Pi hosts, and
+     others when the change touches their hardware).
+  5. A host that has no test running takes every PR in its queue at
+     that moment (with 8 approved PRs, all 8) and tests them in one
+     batch run. It does not start a second run while one is going.
+- Keep working while tests run: code the next issue, stack a PR on
+  your own open PR when it needs that code, and read others' PRs, so
+  the next batch is full when a host frees up.
 - Votes and review notes go over the agent bus, not GitHub PR comments.
 
 ## Conventions
@@ -72,15 +83,15 @@ and an x86 host tests every code PR.
 - Dependency policy (DESIGN.md 6): no FetchContent, no network at
   build time; vendor pinned single-file deps with recorded sha256.
 - SIMD kernel variants: one source file per variant
-  (`backend/matvec_sse4.cpp`, `matvec_avx2.cpp`, `matvec_neon.cpp`,
-  `matvec_neon_dotprod.cpp`), and only that file gets the variant's
-  instruction flags (`set_source_files_properties` in CMakeLists.txt,
-  or a target pragma opened after the headers, as the dotprod file
-  does), so the rest of the binary stays baseline and runs on any CPU
-  of the arch. CMake builds every variant the compiler accepts
-  (`check_cxx_compiler_flag` / `check_cxx_source_compiles`); none is
-  chosen at build time. At startup `locus::sys::detect()` reads the
-  CPU's features, `backend/registry.cpp` marks each variant available
-  or not from them and uses the first available one (`--backend` or
-  `LOCUS_BACKEND` overrides). Each variant is tested against the
-  scalar kernels.
+  (`backend/matvec_sse4.cpp`, `matvec_sse4_avx.cpp`, `matvec_avx2.cpp`,
+  `matvec_neon.cpp`, `matvec_neon_dotprod.cpp`), and only that file
+  gets the variant's instruction flags (`set_source_files_properties`
+  in CMakeLists.txt, or a target pragma opened after the headers, as
+  the dotprod file does), so the rest of the binary stays baseline and
+  runs on any CPU of the arch. CMake builds every variant the compiler
+  accepts (`check_cxx_compiler_flag` / `check_cxx_source_compiles`);
+  none is chosen at build time. At startup `locus::sys::detect()` reads
+  the CPU's features, `backend/registry.cpp` marks each variant
+  available or not from them and uses the first available one
+  (`--backend` or `LOCUS_BACKEND` overrides). Each variant is tested
+  against the scalar kernels.

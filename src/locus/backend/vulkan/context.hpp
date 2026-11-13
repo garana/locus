@@ -161,6 +161,9 @@ enum class Kernel {
     /** The NT 2 builds of matvec_q8_0_n / _glu (#432), for n <= 2. */
     kMatvecQ8_0N2,
     kMatvecQ8_0N2Glu,
+    /** The NT 1 builds (i#511): a lone sequence, matvec_q8_0's loop. */
+    kMatvecQ8_0N1,
+    kMatvecQ8_0N1Glu,
     /** matvec_q8_0_n over Q4_K / Q6_K rows (matvec_k_n.comp, #436);
      * the N2 builds for n <= 2. */
     kMatvecQ4_KN,
@@ -195,6 +198,16 @@ enum class Kernel {
     /** RMS norm added to a residual (rmsnorm.comp RESID): kolibri1's
      *  post-attention and post-FFN norms (i#714). */
     kRmsNormRes,
+    /** Prefill matmuls (dense and expert-id) over Q3_K, Q5_K, IQ2_S
+     *  and IQ2_XXS weights (matmul.comp, i#729). */
+    kMatmulQ3_K,
+    kMatmulQ3_KId,
+    kMatmulQ5_K,
+    kMatmulQ5_KId,
+    kMatmulIQ2_S,
+    kMatmulIQ2_SId,
+    kMatmulIQ2_XXS,
+    kMatmulIQ2_XXSId,
     kCount_,
 };
 
