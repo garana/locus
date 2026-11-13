@@ -410,3 +410,48 @@ TEST_CASE("kolibri1 takes an int32 sliding_window_pattern",
     auto gf = locus::gguf::GgufFile::parse(img_f);
     REQUIRE_THROWS_AS(TransformerModel::load(gf), locus::gguf::Error);
 }
+
+TEST_CASE("moe_select with bias_on_logit picks as kolibri1 does",
+          "[model][kolibri1]") {
+    // kolibri1_layer's rule: top k of logit + bias (lowest index on a
+    // tie), each weighed by the sigmoid of its unbiased logit.
+    locus::model::Hparams hp;
+    hp.n_expert = 384;
+    hp.n_expert_used = 6;
+    hp.gating = locus::model::GatingFunc::kSigmoid;
+    hp.bias_on_logit = true;
+    TransformerModel::Layer lay{};
+    const auto logits = weights(hp.n_expert, 11);
+    const auto bias = weights(hp.n_expert, 12);
+    lay.exp_probs_b = bias;
+    for (const bool norm : {false, true}) {
+        hp.expert_weights_norm = norm;
+        hp.expert_weights_scale = norm ? 2.5f : 1.0f;
+        std::vector<std::uint32_t> idx(hp.n_expert);
+        std::iota(idx.begin(), idx.end(), 0u);
+        auto sel = [&](std::uint32_t e) {
+            return logits[e] + lay.exp_probs_b[e];
+        };
+        std::partial_sort(idx.begin(), idx.begin() + hp.n_expert_used,
+                          idx.end(), [&](std::uint32_t a, std::uint32_t b) {
+                              return sel(a) > sel(b) ||
+                                     (sel(a) == sel(b) && a < b);
+                          });
+        std::vector<float> w(hp.n_expert_used);
+        float wsum = 0.0f;
+        for (std::uint32_t k = 0; k < hp.n_expert_used; ++k) {
+            w[k] = 1.0f / (1.0f + std::exp(-logits[idx[k]]));
+            wsum += w[k];
+        }
+        std::vector<float> router = logits;
+        const auto got = locus::model::moe_select(hp, lay, router);
+        REQUIRE(got.size() == hp.n_expert_used);
+        for (std::uint32_t k = 0; k < hp.n_expert_used; ++k) {
+            INFO("norm " << norm << " slot " << k);
+            REQUIRE(got[k].first == idx[k]);
+            const float want = (norm ? w[k] / wsum : w[k]) *
+                               hp.expert_weights_scale;
+            REQUIRE(got[k].second == Catch::Approx(want).epsilon(1e-6));
+        }
+    }
+}

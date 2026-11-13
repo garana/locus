@@ -8,8 +8,11 @@
 // and scaling.
 //
 // One 256-thread workgroup, every score in shared memory (n_expert
-// <= 256). L holds n_splits planes of n_expert partial logits
-// (split-K router matvec), summed in plane order. Softmax sums its
+// <= 512: past 256 a thread owns experts t and t + 256). has_bias 2
+// adds the bias to the raw logit instead of the gated score
+// (kolibri1: select by logit + bias, weigh by the sigmoid). L holds
+// n_splits planes of n_expert partial logits (split-K router
+// matvec), summed in plane order. Softmax sums its
 // exps on thread 0 in expert order, as on the CPU; top-k is one
 // parallel pass: an expert's rank is the number of experts that beat
 // it (higher score, or equal and lower index; counted by up to 4
@@ -28,10 +31,10 @@ layout(std430, binding = 1) readonly buffer B { float bias[]; };
 layout(std430, binding = 2) writeonly buffer R { uint route[]; };
 
 layout(push_constant) uniform PC {
-    uint n_expert;      // <= 256
+    uint n_expert;      // <= NE
     uint k;             // <= 16
     uint sigmoid;       // 0 = softmax gating, 1 = sigmoid
-    uint has_bias;
+    uint has_bias;      // 0 none, 1 on the gated score, 2 on the logit
     uint n_group;       // <= 32; 0 or 1 = no group limit
     uint n_group_used;
     uint norm;          // normalize picked weights to sum 1
@@ -44,10 +47,11 @@ layout(push_constant) uniform PC {
 } pc;
 
 #define WG 256u
+#define NE 512u
 #define MAX_K 16u
 
-shared float prob[WG];
-shared float sel[WG];
+shared float prob[NE];
+shared float sel[NE];
 shared uint picked[MAX_K];
 shared uint rk[WG];
 
@@ -61,19 +65,26 @@ void main() {
     uint rb = 0u;
 #endif
     uint n = pc.n_expert;
-    if (t < n) {
+    for (uint e = t; e < n; e += WG) {
         float v = 0.0;
         for (uint sp = 0u; sp < pc.n_splits; ++sp) {
-            v += l[lb + sp * n + t];
+            v += l[lb + sp * n + e];
         }
-        prob[t] = pc.sigmoid != 0u ? 1.0 / (1.0 + exp(-v)) : v;
+        prob[e] = pc.sigmoid != 0u ? 1.0 / (1.0 + exp(-v)) : v;
+        if (pc.has_bias == 2u) {
+            sel[e] = v + bias[e];
+        }
     }
     barrier();
     if (pc.sigmoid == 0u) {
         // Softmax: max (a tree: order-free, so exact) and exps in
         // parallel; the sum stays serial in expert order (the CPU's),
         // broadcast through sel[0].
-        sel[t] = t < n ? prob[t] : prob[0];
+        float m0 = t < n ? prob[t] : prob[0];
+        for (uint e = t + WG; e < n; e += WG) {
+            m0 = max(m0, prob[e]);
+        }
+        sel[t] = m0;
         barrier();
         for (uint step = WG / 2u; step > 0u; step >>= 1) {
             if (t < step) {
@@ -83,10 +94,8 @@ void main() {
         }
         float mx = sel[0];
         barrier();
-        float ex = t < n ? exp(prob[t] - mx) : 0.0;
-        barrier();
-        if (t < n) {
-            prob[t] = ex;
+        for (uint e = t; e < n; e += WG) {
+            prob[e] = exp(prob[e] - mx);
         }
         barrier();
         if (t == 0u) {
@@ -99,13 +108,15 @@ void main() {
         barrier();
         float sum = sel[0];
         barrier();
-        if (t < n) {
-            prob[t] = ex / sum;
+        for (uint e = t; e < n; e += WG) {
+            prob[e] = prob[e] / sum;
         }
     }
     barrier();
-    if (t < n) {
-        sel[t] = prob[t] + (pc.has_bias != 0u ? bias[t] : 0.0);
+    if (pc.has_bias != 2u) {
+        for (uint e = t; e < n; e += WG) {
+            sel[e] = prob[e] + (pc.has_bias != 0u ? bias[e] : 0.0);
+        }
     }
     barrier();
     if (pc.n_group > 1u && t == 0u) {
@@ -143,7 +154,20 @@ void main() {
         }
     }
     barrier();
-    {
+    if (n > WG) {
+        // Each thread ranks its experts t and t + WG over all n.
+        for (uint e = t; e < n; e += WG) {
+            float sv = sel[e];
+            uint rank = 0u;
+            for (uint f = 0u; f < n; ++f) {
+                float sf = sel[f];
+                rank += (sf > sv || (sf == sv && f < e)) ? 1u : 0u;
+            }
+            if (rank < pc.k) {
+                picked[rank] = e;
+            }
+        }
+    } else {
         // tpe threads per expert e each count a stride of the experts
         // that beat it; their sum is e's rank.
         uint tpe = n <= WG / 4u ? 4u : (n <= WG / 2u ? 2u : 1u);

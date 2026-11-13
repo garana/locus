@@ -12,6 +12,9 @@
 // count, then one entry (expert << 16 | token tile) per tile of
 // `tile` pairs, so the matmul's grid covers the tiles that hold pairs
 // rather than n_expert times the worst case.
+//
+// Up to 512 experts: thread i owns experts 2i and 2i + 1, so the
+// prefix sum and the work list keep expert order.
 
 layout(local_size_x = 256) in;
 
@@ -21,17 +24,18 @@ layout(std430, binding = 1) writeonly buffer IDS { uint ids[]; };
 layout(push_constant) uniform PC {
     uint n_tok;
     uint k;
-    uint n_expert;  // <= 256
+    uint n_expert;  // <= 512
     uint cap;       // list capacity per expert (>= n_tok)
     uint tile;      // pairs per MOE_ID matmul token tile
 } pc;
 
-shared uint cnt[256];
+shared uint cnt[512];
 shared uint pre[256];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    cnt[tid] = 0u;
+    cnt[2u * tid] = 0u;
+    cnt[2u * tid + 1u] = 0u;
     barrier();
     for (uint p = tid; p < pc.n_tok * pc.k; p += 256u) {
         uint t = p / pc.k;
@@ -40,11 +44,17 @@ void main() {
         ids[pc.n_expert + e * pc.cap + at] = p;
     }
     barrier();
-    uint nt = 0u;
-    if (tid < pc.n_expert) {
-        ids[tid] = cnt[tid];
-        nt = (cnt[tid] + pc.tile - 1u) / pc.tile;
+    uint nt0 = 0u, nt1 = 0u;
+    uint e0 = 2u * tid, e1 = e0 + 1u;
+    if (e0 < pc.n_expert) {
+        ids[e0] = cnt[e0];
+        nt0 = (cnt[e0] + pc.tile - 1u) / pc.tile;
     }
+    if (e1 < pc.n_expert) {
+        ids[e1] = cnt[e1];
+        nt1 = (cnt[e1] + pc.tile - 1u) / pc.tile;
+    }
+    uint nt = nt0 + nt1;
     // Inclusive prefix sum of the tile counts (Hillis-Steele).
     pre[tid] = nt;
     barrier();
@@ -58,7 +68,11 @@ void main() {
     if (tid == 255u) {
         ids[lb] = pre[255];
     }
-    for (uint i = 0u; i < nt; ++i) {
-        ids[lb + 1u + pre[tid] - nt + i] = (tid << 16) | i;
+    uint at = lb + 1u + pre[tid] - nt;
+    for (uint i = 0u; i < nt0; ++i) {
+        ids[at + i] = (e0 << 16) | i;
+    }
+    for (uint i = 0u; i < nt1; ++i) {
+        ids[at + nt0 + i] = (e1 << 16) | i;
     }
 }
