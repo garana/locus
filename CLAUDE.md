@@ -46,18 +46,22 @@ and an x86 host tests every code PR.
   SHA and the PR heads it held. A red run is bisected by halves; the
   PR that breaks it leaves the batch. PRs that conflict go in separate
   batches, and a PR's head does not change once it is in a batch.
-- Review first: a PR enters a batch only after its two reading CLEARs;
-  a NOT CLEAR is fixed and read again before that.
-- One batch at a time: the next batch starts when the running one has
-  all its votes and its PRs are merged, and it takes every PR that
-  has its two reading CLEARs at that moment (with 8 such PRs, all 8
-  go in). One agent assembles each batch; the others never start one
-  on their own.
-- Pipelining: while a batch runs, every agent keeps working. Code the
-  next issue, stack a PR on your own open PR when it needs that code,
-  and read others' PRs, so the next batch is full when the running
-  one ends. A box running its batch share works on the next issue in
-  parallel.
+- Workflow, for every agent:
+  1. Take the next issue and set it In Progress on the project board.
+  2. When it has code, open a PR linked to the issue and ask the other
+     agents to review it.
+  3. The others read it and vote CLEAR or NOT CLEAR. On a NOT CLEAR,
+     all agents reach an agreement before the PR moves on; then it is
+     fixed and read again.
+  4. On two CLEARs, a PR that needs tests joins the test queue of each
+     host its tier and hardware call for (the x86 and Pi hosts, and
+     others when the change touches their hardware).
+  5. A host that has no test running takes every PR in its queue at
+     that moment (with 8 approved PRs, all 8) and tests them in one
+     batch run. It does not start a second run while one is going.
+- Keep working while tests run: code the next issue, stack a PR on
+  your own open PR when it needs that code, and read others' PRs, so
+  the next batch is full when a host frees up.
 - Votes and review notes go over the agent bus, not GitHub PR comments.
 
 ## Conventions
