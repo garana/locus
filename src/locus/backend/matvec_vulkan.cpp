@@ -1175,14 +1175,18 @@ Kernel q8n_variant(const VulkanContext& ctx, Kernel k, std::uint32_t n) {
     // The NT 1 builds (i#511): matvec_q8_0's loop for a lone sequence,
     // on V3D, where with the NT 2 loop a lone Q8_0 1B decode took 2080
     // ms of GPU time per token against the single path's 1468
-    // (LOCUS_VK_Q8N1=0 / 1 overrides).
+    // (LOCUS_VK_Q8N1=0 turns it off). V3D only: its loop shape differs
+    // from the shared one, and Mesa's V3D compiler (no FMA, no
+    // reassociation) gives it the same bits, which the builds test
+    // checks; MoltenVK's fast math does not (i#511), so elsewhere the
+    // NT 2 build stays, whatever the variable says.
     // Only for n == 1: the NT 1 build computes token 0 only.
     static const bool n1 = [&] {
-        const char* e = std::getenv("LOCUS_VK_Q8N1");
-        if (e != nullptr && *e != '\0') {  // empty: unset
-            return std::string(e) != "0";
+        if (ctx.device_name().find("V3D") == std::string::npos) {
+            return false;
         }
-        return ctx.device_name().find("V3D") != std::string::npos;
+        const char* e = std::getenv("LOCUS_VK_Q8N1");
+        return e == nullptr || std::string(e) != "0";
     }();
     if (n == 1 && n1) {
         if (k == Kernel::kMatvecQ8_0N) {

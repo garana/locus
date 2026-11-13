@@ -551,10 +551,12 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   overrides. Q8_0 batches of 1 or 2 take the NT 2 build of the
   short-batch kernel (on V3D a lone sequence the NT 1 build, with
   matvec_q8_0's inner loop: V3D is register-bound and the NT 2 loop
-  cost it 39 to 50% per byte; `LOCUS_VK_Q8N1=0` / `1` overrides,
-  i#511), 3 or 4 the NT 4 build (#516) and larger ones the
-  NT 8 build (Q4_K and Q6_K too, `matvec_k_n.comp`, #436, with its NT 4
-  builds from #541); the builds run the same per-token arithmetic, so a
+  cost it 39 to 50% per byte; V3D only, as its loop shape gives the
+  other builds' bits there but not under MoltenVK's fast math;
+  `LOCUS_VK_Q8N1=0` turns it off, i#511), 3 or 4 the NT 4 build (#516)
+  and larger ones the NT 8 build (Q4_K and Q6_K too,
+  `matvec_k_n.comp`, #436, with its NT 4 builds from #541); the builds
+  run the same per-token arithmetic, so a
   sequence's bits do not depend on the batch (#432; a test checks the
   builds agree bit for bit on the device). Llama 3.2 1B Q8_0 on an M4
   Max: 2, 3, 4 and 8 sequences make 314, 361, 405 and 404 tok/s in all

@@ -196,7 +196,9 @@ void main() {
     // One token: matvec_q8_0.comp's row loop (each weight extracted
     // where it is used, scalar x loads), which V3D runs faster than the
     // loop below that keeps a block's 8 weights for every token (i#511).
-    // The same sums in the same order, so the same bits as NT 2 and 4.
+    // The same sums in the same order; V3D's compiler gives them the
+    // bits of NT 2 and 4, MoltenVK's fast math does not, so the host
+    // picks this build on V3D only.
     // It computes token 0 only (nt is min(n_tok, 1)) and leaves other
     // tokens' rows untouched: the host picks it for n == 1 only
     // (q8n_variant).
