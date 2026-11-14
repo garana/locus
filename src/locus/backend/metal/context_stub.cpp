@@ -35,6 +35,16 @@ void Context::free(Buffer& b) { b = Buffer{}; }
 
 bool Context::has_kernel(std::string_view) const { return false; }
 
+void Context::begin_batch() {
+    throw std::runtime_error("metal: not built with Metal");
+}
+
+bool Context::batch_open() const { return false; }
+
+void Context::end_batch() {
+    throw std::runtime_error("metal: not built with Metal");
+}
+
 void Context::dispatch(std::string_view, std::span<const Arg>,
                        std::span<const std::byte>, std::uint32_t,
                        std::uint32_t) {
