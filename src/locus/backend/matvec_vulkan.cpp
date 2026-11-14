@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -2125,6 +2126,41 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
                    VulkanContext::matvec_groups(k, w.rows));
     s.end_batch();
     s.ctx.read_buffer(s.xb, std::as_writable_bytes(out));
+}
+
+double vulkan_matvec_repeat(const Mat& w, std::span<const float> x,
+                            std::span<float> out, std::uint32_t reps) {
+    if (matvec_kernel(w) == Kernel::kCount_) {
+        throw std::invalid_argument(
+            "vulkan_matvec_repeat: no matvec shader for the weight type");
+    }
+    if (reps == 0 || x.size() != w.cols || out.size() != w.rows) {
+        throw std::invalid_argument("vulkan_matvec_repeat: arguments");
+    }
+    std::lock_guard lk(state_mu());
+    State& s = state();
+    const Kernel k = matvec_kernel(w);
+    auto wb = s.upload_w(w);
+    s.grow(s.x, s.x_n, x.size());
+    s.grow(s.xb, s.xb_n, out.size());
+    s.ctx.write_buffer(s.x, std::as_bytes(x));
+    const VulkanContext::Buffer grid = s.grid_for(k);
+    s.ctx.begin_batch();
+    State::BatchScope batch_scope{s};
+    const VulkanContext::Buffer bufs[] = {wb, s.x, s.xb, grid};
+    const std::size_t nbuf = grid.impl != nullptr ? 4u : 3u;
+    const std::uint32_t push[] = {w.rows, w.cols, 0, 0, 0, 0,
+                                  fbits(1.0f)};
+    for (std::uint32_t i = 0; i < reps; ++i) {
+        s.ctx.dispatch(k, {bufs, nbuf}, push,
+                       VulkanContext::matvec_groups(k, w.rows));
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    s.end_batch();
+    const auto t1 = std::chrono::steady_clock::now();
+    s.ctx.read_buffer(s.xb, std::as_writable_bytes(out));
+    return std::chrono::duration<double, std::milli>(t1 - t0).count() /
+           reps;
 }
 
 void matvec_batch_vulkan(const Mat& w, std::span<const float> x,
