@@ -104,7 +104,8 @@ inline Spec<StageOptions> stage_spec() {
                        true),
         D::string_list("allow", &O::allow,
                        "allowed peer CIDR; repeatable; needed when "
-                       "--listen is not loopback (default: any). On "
+                       "--listen is not loopback (on loopback, the "
+                       "default is any). On "
                        "Linux a refused peer's connect times out (the "
                        "kernel drops it)"),
         D::string_("key-file", &O::key_file,
