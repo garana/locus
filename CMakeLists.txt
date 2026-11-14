@@ -103,6 +103,7 @@ add_library(locus
     src/locus/model/sampling.cpp
     src/locus/model/speculative.cpp
     src/locus/pipeline/driver.cpp
+    src/locus/pipeline/expert_server.cpp
     src/locus/pipeline/message.cpp
     src/locus/pipeline/mdns.cpp
     src/locus/pipeline/net.cpp
@@ -170,6 +171,9 @@ target_link_libraries(locus-stage PRIVATE locus)
 
 add_executable(locus-driver tools/driver_main.cpp)
 target_link_libraries(locus-driver PRIVATE locus)
+
+add_executable(locus-experts tools/experts_main.cpp)
+target_link_libraries(locus-experts PRIVATE locus)
 
 add_executable(locus-router tools/router_main.cpp)
 target_link_libraries(locus-router PRIVATE locus)

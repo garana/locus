@@ -894,8 +894,11 @@ can use it underneath. On the wire a token's owner sends `kExpertCall`
 (the layer, the expert id and the hidden state) and the expert's host
 replies with `kExpertOut` (that expert's output before the router
 weight), so the owner can combine the experts in its own pick order
-and keep one host's bits; the server and the `moe_ffn` side are #781's
-next steps.
+and keep one host's bits. `locus-experts` serves an expert range
+through `TransformerModel::expert_out`, the step `moe_ffn` takes per
+pick, one connection at a time, and accepts only loopback peers unless
+given `--allow` (the port has no authentication). The `moe_ffn` side
+that calls it is #781's next step.
 
 ### Stage serving
 
