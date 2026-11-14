@@ -1096,12 +1096,22 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 break;
         }
     };
-    // Accepts every pending scraper (the listener is non-blocking).
+    // Accepts every pending scraper (the listener is non-blocking). The
+    // page lists every peer's address, so --allow covers this port too.
     const auto metrics_accept = [&] {
         for (;;) {
-            const int fd = ::accept(metrics_fd, nullptr, nullptr);
+            std::string peer;
+            const int fd = accept_one(metrics_fd, &peer);
             if (fd < 0) {
                 return;  // EAGAIN, or an aborted connect: try next wake
+            }
+            if (!ip_allowed(peer, allow_live)) {
+                std::fprintf(stderr,
+                             "serve_stage: refused metrics connection from "
+                             "%s (not in --allow)\n",
+                             peer.c_str());
+                ::close(fd);
+                continue;
             }
             if (metrics_conns.size() >= kMaxMetricsConns ||
                 !set_nonblocking(fd)) {
