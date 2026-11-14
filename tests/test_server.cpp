@@ -213,6 +213,57 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(content[0]["top_logprobs"].size() == 2);
     }
 
+    // i#625 F6: a reply holds max_tokens x (top + 1) entries, so the
+    // counts are capped at OpenAI's limits and a negative one is a 400
+    // (top_logprobs -1 used to wrap to 2^32 - 1, the whole vocabulary).
+    SECTION("logprobs counts outside OpenAI's limits are a 400") {
+        const json msgs = json::array(
+            {{{"role", "user"}, {"content", "Once upon a time"}}});
+        for (const json& top : {json(-1), json(21), json(2.5), json("3")}) {
+            INFO(top.dump());
+            json req{{"messages", msgs},
+                     {"max_tokens", 2},
+                     {"logprobs", true},
+                     {"top_logprobs", top}};
+            auto res = client.Post("/v1/chat/completions", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 400);
+        }
+        for (const json& n : {json(-1), json(6), json(1000000)}) {
+            INFO(n.dump());
+            json req{{"prompt", "Once upon a time"},
+                     {"max_tokens", 2},
+                     {"logprobs", n}};
+            auto res = client.Post("/v1/completions", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 400);
+        }
+        // The limits themselves pass, and off stays off.
+        json top20{{"messages", msgs},
+                   {"max_tokens", 2},
+                   {"logprobs", true},
+                   {"top_logprobs", 20}};
+        auto ok = client.Post("/v1/chat/completions", top20.dump(),
+                              "application/json");
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+        json five{{"prompt", "Once upon a time"},
+                  {"max_tokens", 2},
+                  {"logprobs", 5}};
+        ok = client.Post("/v1/completions", five.dump(), "application/json");
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+        json off{{"prompt", "Once upon a time"},
+                 {"max_tokens", 2},
+                 {"logprobs", nullptr}};
+        ok = client.Post("/v1/completions", off.dump(), "application/json");
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+        REQUIRE(!json::parse(ok->body)["choices"][0].contains("logprobs"));
+    }
+
     // i#279: the Antigravity SDK sends only max_completion_tokens;
     // without it the limit fell back to 16.
     SECTION("chat max_completion_tokens sets the output limit") {
