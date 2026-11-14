@@ -205,6 +205,44 @@ TEST_CASE("gbnf step carries the stack cap into its output", "[gbnf]") {
     CHECK(cur.truncated());  // capped at 8 all along, not at 4096
 }
 
+TEST_CASE("gbnf flags an expansion past the word cap", "[gbnf]") {
+    // Each level keeps a "z" to match after it, so the stacks at the
+    // bottom are about 50 words deep, and four of them are far more
+    // than 64 words: the expansion stops there, under the stack cap and
+    // the visit budget.
+    std::string g = "root ::= r0\n";
+    for (int i = 0; i < 50; ++i) {
+        g += "r" + std::to_string(i) + " ::= r" + std::to_string(i + 1) +
+             " \"z\"\n";
+    }
+    g += "r50 ::= \"a\" | \"b\" | \"c\" | \"d\"\n";
+    const auto gr = Gbnf::parse(g);
+    const GbnfMatcher wide(gr);
+    const GbnfMatcher small(gr, GbnfMatcher::kMaxStacks, 64);
+    CHECK_FALSE(wide.truncated());
+    CHECK(small.truncated());
+    CHECK(full(gr, "d" + std::string(50, 'z')));
+}
+
+TEST_CASE("gbnf step shares the visit budget across stacks", "[gbnf]") {
+    // After "x", h's expansion visits about 2^20 stacks (each c is empty
+    // two ways), past the step's budget; the other alternative's stack
+    // still gets its share, whichever order the two are in.
+    std::string h = "h ::=";
+    for (int i = 0; i < 20; ++i) h += " c";
+    h += " \"z\"\nc ::= \"a\"? | \"b\"?\n";
+    for (const char* root : {"root ::= \"x\" h | \"x\" \"y\"\n",
+                             "root ::= \"x\" \"y\" | \"x\" h\n"}) {
+        CAPTURE(root);
+        GbnfMatcher m(Gbnf::parse(std::string(root) + h));
+        CHECK_FALSE(m.truncated());
+        REQUIRE(m.feed('x'));
+        CHECK(m.truncated());
+        REQUIRE(m.feed('y'));
+        CHECK(m.accepted());
+    }
+}
+
 TEST_CASE("json schema grammars stay under the stack cap", "[gbnf]") {
     const std::string s = R"({
       "type": "object",

@@ -554,11 +554,13 @@ void GbnfMatcher::Stacks::push(const std::vector<std::uint32_t>& s) {
 }
 
 GbnfMatcher::GbnfMatcher(std::shared_ptr<const Gbnf> g,
-                         std::size_t max_stacks)
-    : g_(std::move(g)), max_stacks_(std::max<std::size_t>(max_stacks, 1)) {
+                         std::size_t max_stacks, std::size_t max_words)
+    : g_(std::move(g)),
+      max_stacks_(std::max<std::size_t>(max_stacks, 1)),
+      max_words_(std::max<std::size_t>(max_words, 1)) {
     cur_.assign(1, g_->start());
     std::size_t budget = kMaxExpandVisits;
-    const bool cut = expand(cur_, stacks_, budget);
+    const bool cut = expand(cur_, stacks_, budget) != Expand::kDone;
     truncated_ = dedup(stacks_) || cut;
     if (truncated_) count_overflow();
 }
@@ -567,20 +569,23 @@ std::uint64_t gbnf_stack_overflows() {
     return stack_overflows.load(std::memory_order_relaxed);
 }
 
-bool GbnfMatcher::expand(const std::vector<std::uint32_t>& cur, Stacks& out,
-                         std::size_t& budget) const {
+GbnfMatcher::Expand GbnfMatcher::expand(
+    const std::vector<std::uint32_t>& cur, Stacks& out,
+    std::size_t& budget) const {
     // Each stack on the worklist either ends (empty: the input may stop
     // here) or tops on a character element, and goes to `out`, or tops
     // on a rule reference and is replaced by one stack per alternative.
     // The left-recursion check guarantees this ends; the order of `out`
-    // does not matter (dedup sorts it).
+    // does not matter (dedup sorts it). The visit budget bounds the
+    // time, max_words_ the memory of the worklist and of `out` (i#844):
+    // reaching either drops the stacks not yet reached.
     const auto& el = g_->elems();
     work_.clear();
     work_.push(cur);
     while (work_.size() > 0) {
         if (budget == 0) {
             work_.clear();
-            return true;
+            return Expand::kBudget;
         }
         --budget;
         const std::size_t last = work_.size() - 1;
@@ -589,6 +594,10 @@ bool GbnfMatcher::expand(const std::vector<std::uint32_t>& cur, Stacks& out,
         work_.data.resize(work_.begin(last));
         work_.ends.pop_back();
         if (top_.empty() || el[top_.back()].kind == Gbnf::Elem::kChar) {
+            if (out.data.size() + top_.size() > max_words_) {
+                work_.clear();
+                return Expand::kFull;
+            }
             out.push(top_);
             continue;
         }
@@ -599,7 +608,14 @@ bool GbnfMatcher::expand(const std::vector<std::uint32_t>& cur, Stacks& out,
         const std::uint32_t p = top_.back();
         top_.pop_back();
         if (el[p + 1].kind != Gbnf::Elem::kEnd) top_.push_back(p + 1);
-        for (const std::uint32_t a : g_->alts(el[p].ref)) {
+        const auto alts = g_->alts(el[p].ref);
+        // Each alternative adds a copy of top_ (and its own position).
+        if (work_.data.size() + alts.size() * (top_.size() + 1) >
+            max_words_) {
+            work_.clear();
+            return Expand::kFull;
+        }
+        for (const std::uint32_t a : alts) {
             if (el[a].kind != Gbnf::Elem::kEnd) {
                 top_.push_back(a);
                 work_.push(top_);
@@ -609,7 +625,7 @@ bool GbnfMatcher::expand(const std::vector<std::uint32_t>& cur, Stacks& out,
             }
         }
     }
-    return false;
+    return Expand::kDone;
 }
 
 bool GbnfMatcher::dedup(Stacks& s) const {
@@ -725,15 +741,31 @@ bool GbnfMatcher::step(std::uint8_t b, GbnfMatcher& out) const {
     }
     const auto& el = g_->elems();
     out.stacks_.clear();
-    std::size_t budget = kMaxExpandVisits;
+    out.max_words_ = max_words_;
+    // The visit budget is split fairly (i#844): each matching stack may
+    // spend an equal share of what is left, and what one leaves goes to
+    // the next, so one stack with a costly expansion cannot starve the
+    // ones after it. A full output ends the step.
+    std::size_t m = 0;
+    for (std::size_t i = 0; i < stacks_.size(); ++i) {
+        const std::uint32_t s = stacks_.begin(i), e = stacks_.ends[i];
+        if (s != e && g_->matches(stacks_.data[e - 1], cp)) ++m;
+    }
+    std::size_t pool = kMaxExpandVisits;
     bool cut = false;
-    for (std::size_t i = 0; i < stacks_.size() && !cut; ++i) {
+    for (std::size_t i = 0, j = 0; i < stacks_.size(); ++i) {
         const std::uint32_t s = stacks_.begin(i), e = stacks_.ends[i];
         if (s == e || !g_->matches(stacks_.data[e - 1], cp)) continue;
         cur_.assign(stacks_.data.begin() + s, stacks_.data.begin() + e - 1);
         const std::uint32_t p = stacks_.data[e - 1] + 1;
         if (el[p].kind != Gbnf::Elem::kEnd) cur_.push_back(p);
-        cut = expand(cur_, out.stacks_, budget);
+        const std::size_t share = pool / (m - j++);
+        std::size_t left = share;
+        const Expand r = expand(cur_, out.stacks_, left);
+        pool -= share - left;
+        if (r == Expand::kDone) continue;
+        cut = true;
+        if (r == Expand::kFull) break;
     }
     if (out.stacks_.size() == 0) return false;
     out.truncated_ = dedup(out.stacks_) || truncated_ || cut;
