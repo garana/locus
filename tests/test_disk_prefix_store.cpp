@@ -440,13 +440,28 @@ TEST_CASE("DiskPrefixStore with a key reads only files signed with it",
                 fs::file_size(plain.path_for(kPrompt, 2)) + 32);
     }
     {
-        // Another key names the same file but does not read it.
+        // Another key names its files apart: no hit, and the first
+        // key's file is left alone (two keyed stores do not evict each
+        // other's files as mismatches).
         DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
         s.set_mac_key(k2);
-        REQUIRE(s.find(kPrompt) == 2);
+        REQUIRE(s.find(kPrompt) == 0);
+        REQUIRE(s.path_for(kPrompt, 2) != keyed_path);
+        REQUIRE(fs::exists(keyed_path));
+    }
+    {
+        // A file at the keyed name with a forged tag (another key's
+        // bytes copied there) is a miss, and removed.
+        DiskPrefixStore other(g.dir, key(), kBlockBytes, 1 << 20);
+        other.set_mac_key(k2);
+        REQUIRE(other.write(kPrompt, 2, srcs(in)));
+        fs::copy_file(other.path_for(kPrompt, 2), keyed_path,
+                      fs::copy_options::overwrite_existing);
+        DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+        s.set_mac_key(k1);
         auto out = blocks(2, 0);
         REQUIRE_FALSE(s.read(kPrompt, 2, dsts(out)));
-        REQUIRE_FALSE(fs::exists(keyed_path));  // a mismatch is removed
+        REQUIRE_FALSE(fs::exists(keyed_path));
     }
     {
         // An unkeyed store names keyed files apart: none is a hit.

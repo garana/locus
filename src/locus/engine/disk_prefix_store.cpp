@@ -240,9 +240,10 @@ std::vector<std::uint8_t> DiskPrefixStore::header(
     put(h, key_.overrides);
     put(h, static_cast<std::uint32_t>(key_.device_attention));
     put(h, static_cast<std::uint32_t>(key_.experts_on_gpu));
-    // Keyed files end with a tag: a keyed store never reads an
-    // unkeyed file, nor the other way (the seed names them apart).
-    put(h, static_cast<std::uint32_t>(keyed() ? 1 : 0));
+    // Keyed files end with a tag, and the header names the key by a
+    // hash of it (0: unkeyed), so stores with no key or another key
+    // name their files apart instead of removing each other's.
+    put(h, key_id_);
     put(h, key_.block_tokens);
     put(h, key_.kv_dim);
     put(h, key_.n_layers);
@@ -277,6 +278,14 @@ void DiskPrefixStore::seal(std::uint8_t* blob, std::size_t bytes) const {
 void DiskPrefixStore::set_mac_key(std::string key) {
     std::lock_guard lock(mu_);
     mac_key_ = std::move(key);
+    key_id_ = 0;
+    if (!mac_key_.empty()) {
+        // A one-way name for the key (not the key): its HMAC of a label.
+        const sys::Sha256Digest d =
+            sys::hmac_sha256(mac_key_, "locus prefix cache key id");
+        std::memcpy(&key_id_, d.data(), sizeof key_id_);
+        key_id_ |= 1;  // never 0, which means unkeyed
+    }
     const std::vector<std::uint8_t> k = header({}, 0);
     key_seed_ = checksum(k.data(), k.size());
 }

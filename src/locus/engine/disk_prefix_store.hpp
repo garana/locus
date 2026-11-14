@@ -157,7 +157,9 @@ class DiskPrefixStore {
      * (i#830), so a file that someone without the key planted or
      * changed reads as a miss; the checksums alone catch damage, not
      * tampering. Files written without the key, or with another, are
-     * misses too. Call it once, before any read or write.
+     * named apart (the header carries a one-way hash of the key), so
+     * they are never read and stores with other keys do not remove
+     * each other's files. Call it once, before any read or write.
      *
      * @param key The shared key (--prefix-cache-key-file); empty: none.
      */
@@ -250,6 +252,9 @@ class DiskPrefixStore {
     std::uint64_t key_seed_ = 0;
     /** set_mac_key's key; empty: files carry no tag. */
     std::string mac_key_;
+    /** A one-way 64-bit name of mac_key_ (0: none), in the header, so
+     *  stores with other keys name their files apart. */
+    std::uint64_t key_id_ = 0;
 
     mutable std::mutex mu_;
     std::unordered_map<std::uint64_t, File> files_;
