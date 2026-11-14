@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "locus/backend/registry.hpp"
@@ -13,6 +14,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/kv_quant.hpp"
 #include "locus/model/arch.hpp"
+#include "locus/pipeline/net.hpp"
 #include "locus/sys/features.hpp"
 
 #include "cli_spec.hpp"
@@ -268,6 +270,12 @@ inline constexpr const char* kCommonHelp =
     "  --prefix-cache-helper-arg A  an argument for it (repeatable)\n"
     "  --batch-decode   enable R10 cross-sequence batched decode\n"
     "  --no-batch-prefill  force per-token prompt ingestion\n"
+    "  --remote-experts H:P=LO:HI  locus-run: MoE experts LO..HI-1 of\n"
+    "                   every layer run on the locus-experts at H:P\n"
+    "                   (expert parallelism; repeatable). The per-token\n"
+    "                   forward uses them; a batched prefill computes\n"
+    "                   every expert here (--no-batch-prefill sends the\n"
+    "                   prompt's too)\n"
     "  --timing         locus-run: print prefill and decode\n"
     "                   tok/s to stderr\n"
     "  --warmup         locus-run: run a throwaway 1-token\n"
@@ -430,6 +438,9 @@ struct BackendArgs {
     bool batch_decode = false;
     /** --no-batch-prefill: force per-token prompt ingestion. */
     bool no_batch_prefill = false;
+    /** --remote-experts H:P=LO:HI (repeatable): expert hosts, as given;
+     *  locus-run parses them (parse_remote_experts). */
+    std::vector<std::string> remote_experts;
     /** --timing: locus-run prints prefill/decode rates. */
     bool timing = false;
     /** --warmup: locus-run runs a throwaway request first. */
@@ -472,6 +483,46 @@ inline bool parse_kv_type(std::string_view name, locus::kv::KvType& out) {
     } else {
         return false;
     }
+    return true;
+}
+
+/** One --remote-experts value: the expert host and the experts it
+ *  serves, [lo, hi). */
+struct RemoteExpertsSpec {
+    std::string host;
+    int port = 0;
+    std::uint32_t lo = 0;
+    std::uint32_t hi = 0;
+};
+
+/**
+ * Parses a --remote-experts value, "HOST:PORT=LO:HI" (HOST may be a
+ * bracketed IPv6 literal, as parse_hostport takes it).
+ *
+ * @returns false when it is malformed, the port is 0, or LO >= HI.
+ */
+inline bool parse_remote_experts(const std::string& s,
+                                 RemoteExpertsSpec& out) {
+    const auto eq = s.rfind('=');
+    if (eq == std::string::npos) {
+        return false;
+    }
+    RemoteExpertsSpec r;
+    if (!locus::pipeline::parse_hostport(s.substr(0, eq), r.host, r.port) ||
+        r.host.empty() || r.port == 0) {
+        return false;
+    }
+    const std::string range = s.substr(eq + 1);
+    const auto colon = range.find(':');
+    int lo = 0, hi = 0;
+    if (colon == std::string::npos ||
+        !parse_nonneg_int(range.substr(0, colon), lo) ||
+        !parse_nonneg_int(range.substr(colon + 1), hi) || lo >= hi) {
+        return false;
+    }
+    r.lo = static_cast<std::uint32_t>(lo);
+    r.hi = static_cast<std::uint32_t>(hi);
+    out = std::move(r);
     return true;
 }
 
@@ -621,6 +672,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.batch_decode = true;
         } else if (a == "--no-batch-prefill") {
             out.no_batch_prefill = true;
+        } else if (a == "--remote-experts" && i + 1 < argc) {
+            out.remote_experts.emplace_back(argv[++i]);
         } else if (a == "--timing") {
             out.timing = true;
         } else if (a == "--warmup") {
