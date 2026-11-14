@@ -185,6 +185,32 @@ void rms_norm(std::span<const float> x, std::span<const float> w, float eps,
     });
 }
 
+void rope_pairs(std::span<float> x, std::uint32_t n, std::uint32_t heads,
+                std::uint32_t hd, std::span<const float> cosv,
+                std::span<const float> sinv) {
+    parallel(n, [&](std::size_t t) {
+        const float* c = &cosv[t * hd];
+        const float* s = &sinv[t * hd];
+        for (std::uint32_t h = 0; h < heads; ++h) {
+            float* xi = &x[(t * heads + h) * hd];
+            for (std::uint32_t i = 0; i + 1 < hd; i += 2) {
+                const float x0 = xi[i], x1 = xi[i + 1];
+                xi[i] = x0 * c[i] - x1 * s[i];
+                xi[i + 1] = x1 * c[i + 1] + x0 * s[i + 1];
+            }
+        }
+    });
+}
+
+void gated_add(std::span<float> x, std::span<const float> add,
+               const float* gate, std::uint32_t n, std::uint32_t d) {
+    for (std::size_t t = 0; t < n; ++t) {
+        for (std::uint32_t i = 0; i < d; ++i) {
+            x[t * d + i] += gate[i] * add[t * d + i];
+        }
+    }
+}
+
 void linear1(const backend::Ops& op, const backend::Mat& w,
              std::span<const float> b, std::span<const float> x,
              std::span<float> out) {
