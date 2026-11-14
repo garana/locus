@@ -921,7 +921,8 @@ skips the remote experts. Only the per-token CPU forward uses it; the
 batched and GPU forwards compute every expert locally, which gives the
 same output since each host maps the whole file. `locus-run
 --remote-experts HOST:PORT=LO:HI` (repeatable) connects to each
-`locus-experts` and installs the client.
+`locus-experts` and installs the client. A host lost mid-run ends the
+run: the client's error reaches the caller and nothing retries.
 
 ### Stage serving
 

@@ -91,6 +91,15 @@ int main(int argc, char** argv) {
                          argv[0], s.c_str());
             return 2;
         }
+        for (const auto& o : remote) {
+            if (r.lo < o.hi && o.lo < r.hi) {
+                std::fprintf(stderr,
+                             "%s: --remote-experts ranges %u:%u and %u:%u "
+                             "overlap\n",
+                             argv[0], o.lo, o.hi, r.lo, r.hi);
+                return 2;
+            }
+        }
         remote.push_back(std::move(r));
     }
     const std::string model_path = args.positional[0];

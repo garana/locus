@@ -1697,11 +1697,8 @@ TEST_CASE("a forward with remote experts is one process's bits",
     plain.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
                  weights(kF * kE * 4, 16));
     const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 5, 2};
-    // Window 1 makes start() read a host's reply before its next call
-    // (two picks on the same host); 0 is the default size.
-    for (const std::size_t window : {std::size_t{0}, std::size_t{1}}) {
-    for (const auto& img :
-         {plain.build(4, 2), qwen_image(+8.0f, /*zero_shared=*/false)}) {
+    const auto check = [&](const std::vector<std::byte>& img,
+                           std::size_t window) {
         INFO("window " << window);
         const auto want = run(img, toks);
 
@@ -1738,6 +1735,11 @@ TEST_CASE("a forward with remote experts is one process's bits",
         REQUIRE(got.size() == want.size());
         REQUIRE(std::memcmp(got.data(), want.data(),
                             got.size() * sizeof(float)) == 0);
-    }
+    };
+    // Window 1 makes start() read a host's reply before its next call
+    // (two picks on the same host); 0 is the default size.
+    for (const std::size_t window : {std::size_t{0}, std::size_t{1}}) {
+        check(plain.build(4, 2), window);
+        check(qwen_image(+8.0f, /*zero_shared=*/false), window);
     }
 }
