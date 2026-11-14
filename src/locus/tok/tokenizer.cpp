@@ -3,6 +3,7 @@
 #include <charconv>
 #include <cstdio>
 #include <limits>
+#include <queue>
 #include <stdexcept>
 
 #include "locus/tok/bpe_tokenizer.hpp"
@@ -144,10 +145,13 @@ std::vector<TokenId> SpmTokenizer::encode(std::string_view text,
         return out;
     }
 
-    // Split into UTF-8 codepoint symbols (offset, length pairs).
+    // Split into UTF-8 codepoint symbols (offset, length pairs), linked
+    // so a merge is O(1). A merged-away symbol keeps len 0.
     struct Sym {
         std::size_t off;
         std::size_t len;
+        std::ptrdiff_t prev;
+        std::ptrdiff_t next;
     };
     std::vector<Sym> syms;
     for (std::size_t i = 0; i < norm.size();) {
@@ -155,39 +159,75 @@ std::vector<TokenId> SpmTokenizer::encode(std::string_view text,
         if (len > norm.size() - i) {
             len = norm.size() - i;  // truncated trailing sequence
         }
-        syms.push_back({i, len});
+        const auto k = static_cast<std::ptrdiff_t>(syms.size());
+        syms.push_back({i, len, k - 1, k + 1});
         i += len;
     }
+    syms.back().next = -1;
 
     // Greedy SPM: repeatedly merge the adjacent pair whose joined
     // piece has the highest score (leftmost wins ties), as in
-    // llama.cpp. O(n^2) is fine at prompt sizes; optimize later if
-    // profiling says so.
-    auto lookup = [&](const Sym& a, const Sym& b) {
-        auto it = token_to_id_.find(std::string_view(
-            norm.data() + a.off, a.len + b.len));
-        return it == token_to_id_.end() ? -1 : it->second;
+    // llama.cpp. A heap of candidate pairs makes it O(n log n) (i#625
+    // F5: the rescan after every merge was O(n^2) on one long word). A
+    // pair is stale once either symbol changed; their lengths only
+    // grow, so a sum that no longer matches finds it.
+    struct Pair {
+        float score;
+        std::size_t off;  // the left symbol's: leftmost first on a tie
+        std::ptrdiff_t left;
+        std::size_t len;
     };
-    while (syms.size() > 1) {
-        float best_score = std::numeric_limits<float>::lowest();
-        std::size_t best = syms.size();
-        for (std::size_t i = 0; i + 1 < syms.size(); ++i) {
-            TokenId id = lookup(syms[i], syms[i + 1]);
-            if (id >= 0 &&
-                cfg_.scores[static_cast<std::size_t>(id)] > best_score) {
-                best_score = cfg_.scores[static_cast<std::size_t>(id)];
-                best = i;
-            }
+    const auto lower = [](const Pair& a, const Pair& b) {
+        return a.score < b.score || (a.score == b.score && a.off > b.off);
+    };
+    std::priority_queue<Pair, std::vector<Pair>, decltype(lower)> heap(
+        lower);
+    const auto push = [&](std::ptrdiff_t l) {
+        if (l < 0 || syms[static_cast<std::size_t>(l)].next < 0) {
+            return;
         }
-        if (best == syms.size()) {
-            break;
+        const Sym& a = syms[static_cast<std::size_t>(l)];
+        const Sym& b = syms[static_cast<std::size_t>(a.next)];
+        const auto it = token_to_id_.find(
+            std::string_view(norm.data() + a.off, a.len + b.len));
+        if (it == token_to_id_.end()) {
+            return;
         }
-        syms[best].len += syms[best + 1].len;
-        syms.erase(syms.begin() +
-                   static_cast<std::ptrdiff_t>(best + 1));
+        const float s = cfg_.scores[static_cast<std::size_t>(it->second)];
+        // The rescan this replaces never picked a score at or below
+        // lowest() (or a NaN): skip them, which also keeps the heap's
+        // order strict.
+        if (s > std::numeric_limits<float>::lowest()) {
+            heap.push({s, a.off, l, a.len + b.len});
+        }
+    };
+    for (std::size_t i = 0; i + 1 < syms.size(); ++i) {
+        push(static_cast<std::ptrdiff_t>(i));
+    }
+    while (!heap.empty()) {
+        const Pair p = heap.top();
+        heap.pop();
+        Sym& a = syms[static_cast<std::size_t>(p.left)];
+        if (a.len == 0 || a.next < 0) {
+            continue;
+        }
+        Sym& b = syms[static_cast<std::size_t>(a.next)];
+        if (a.len + b.len != p.len) {
+            continue;  // stale
+        }
+        a.len += b.len;
+        b.len = 0;
+        a.next = b.next;
+        if (b.next >= 0) {
+            syms[static_cast<std::size_t>(b.next)].prev = p.left;
+        }
+        push(a.prev);
+        push(p.left);
     }
 
-    for (const Sym& s : syms) {
+    for (std::ptrdiff_t k = 0; k >= 0;
+         k = syms[static_cast<std::size_t>(k)].next) {
+        const Sym& s = syms[static_cast<std::size_t>(k)];
         std::string_view piece(norm.data() + s.off, s.len);
         if (auto it = token_to_id_.find(piece);
             it != token_to_id_.end()) {
