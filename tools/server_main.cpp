@@ -302,12 +302,8 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         if (args.host.empty()) {
             std::fprintf(stderr,
                          "locus-server listening on every interface, port "
-                         "%d%s\n",
-                         port,
-                         opt.auth_helper_argv.empty()
-                             ? " (no --auth-helper: anyone who can reach "
-                               "it can use it)"
-                             : "");
+                         "%d\n",
+                         port);
         } else {
             std::fprintf(stderr, "locus-server listening on %s%s%s:%d\n",
                          v6 ? "[" : "", args.host.c_str(), v6 ? "]" : "",
@@ -316,6 +312,11 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         const bool loopback = args.host == "127.0.0.1" ||
                               args.host == "::1" ||
                               args.host == "localhost";
+        if (!loopback && opt.auth_helper_argv.empty()) {
+            std::fprintf(stderr,
+                         "warning: not loopback and no --auth-helper: "
+                         "anyone who can reach this server can use it\n");
+        }
         if (loopback && !reg.router_host.empty()) {
             std::fprintf(stderr,
                          "warning: listening on %s, loopback only (the "
