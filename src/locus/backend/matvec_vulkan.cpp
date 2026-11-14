@@ -1004,15 +1004,16 @@ void rec_matvec_seg(State& s, std::span<const Mat* const> ms,
 
 /**
  * @returns How many of q, k, v (in that order) can run as one
- * rec_matvec_q4k_seg dispatch: q and k Q4_K of one width (2), and v
- * too when it matches them (3); 0 otherwise.
+ * rec_matvec_q4k_seg dispatch: q and k of one width, both Q4_K or both
+ * Q3_K (2), and v too when it matches them (3); 0 otherwise.
  */
 std::size_t q4k_seg_count(const Mat& q, const Mat& k, const Mat& v) {
-    const auto q4 = gguf::TensorType::kQ4_K;
-    if (q.type != q4 || k.type != q4 || k.cols != q.cols) {
+    const auto t = q.type;
+    if ((t != gguf::TensorType::kQ4_K && t != gguf::TensorType::kQ3_K) ||
+        k.type != t || k.cols != q.cols) {
         return 0;
     }
-    return v.type == q4 && v.cols == q.cols ? 3 : 2;
+    return v.type == t && v.cols == q.cols ? 3 : 2;
 }
 
 /**
@@ -1034,7 +1035,10 @@ void rec_matvec_q4k_seg(State& s, std::span<const Mat* const> ms,
         s.upload_w(*ms[0]), x, out, out2, w1,
         ms.size() > 2 ? s.upload_w(*ms[2]) : w1,
         rope.divisors.impl != nullptr ? rope.divisors : x};
-    rec_seg_dispatch(s, Kernel::kMatvecQ4_KSeg, "matvec_q4_k_seg", ms, bufs,
+    // Q3_K q / k / v run matvec_q4_k.comp's TYPE_Q3K build (i#173).
+    const bool q3 = ms[0]->type == gguf::TensorType::kQ3_K;
+    rec_seg_dispatch(s, q3 ? Kernel::kMatvecQ3_KSeg : Kernel::kMatvecQ4_KSeg,
+                     q3 ? "matvec_q3_k_seg" : "matvec_q4_k_seg", ms, bufs,
                      out_off, off1, off2, rope);
 }
 
@@ -2772,14 +2776,18 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                            (ff + 63) / 64);
         } else if (wg.type == wu.type &&
                    (wg.type == gguf::TensorType::kQ8_0 ||
-                    wg.type == gguf::TensorType::kQ4_K) &&
+                    wg.type == gguf::TensorType::kQ4_K ||
+                    wg.type == gguf::TensorType::kQ3_K) &&
                    wg.cols == wu.cols && off_g == off_u) {
             // Gate, up and silu_mul in one fused dispatch. The up
             // weights bind at 3 (matvec_q8_0_glu) or 4 (matvec_q4_k_glu,
-            // i#688, whose binding 3 is unused: the gate fills it).
+            // i#688, and its Q3_K build, i#173, whose binding 3 is
+            // unused: the gate fills it).
             const bool q8 = wg.type == gguf::TensorType::kQ8_0;
-            const Kernel k =
-                q8 ? Kernel::kMatvecQ8_0Glu : Kernel::kMatvecQ4_KGlu;
+            const Kernel k = q8 ? Kernel::kMatvecQ8_0Glu
+                             : wg.type == gguf::TensorType::kQ3_K
+                                 ? Kernel::kMatvecQ3_KGlu
+                                 : Kernel::kMatvecQ4_KGlu;
             const VulkanContext::Buffer gw =
                 whole_g != nullptr ? *whole_g : s.upload_w(g2);
             const VulkanContext::Buffer uw =

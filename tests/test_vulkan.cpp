@@ -538,7 +538,8 @@ TEST_CASE("vulkan k-quant matvec matches the CPU reference",
     }
 }
 
-TEST_CASE("vulkan q4_k seg matvec routes each matrix to its output",
+TEST_CASE("vulkan q4_k and q3_k seg matvec routes each matrix to its "
+          "output",
           "[vulkan]") {
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");
@@ -548,15 +549,25 @@ TEST_CASE("vulkan q4_k seg matvec routes each matrix to its output",
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::uniform_int_distribution<int> byte_d(0, 255);
     const std::uint32_t cols = 768;
+    const bool q3 = GENERATE(false, true);
+    // matvec_q3_k_seg (i#173): the same routing and epilogue over Q3_K.
+    const std::size_t bb = q3 ? 110 : 144;
+    const Kernel seg = q3 ? Kernel::kMatvecQ3_KSeg : Kernel::kMatvecQ4_KSeg;
+    const auto type = q3 ? locus::gguf::TensorType::kQ3_K
+                         : locus::gguf::TensorType::kQ4_K;
     auto random_q4k = [&](std::uint32_t rows) {
-        std::vector<std::byte> w(rows * (cols / 256) * 144);
+        std::vector<std::byte> w(rows * (cols / 256) * bb);
         for (auto& b : w) {
             b = static_cast<std::byte>(byte_d(rng));
         }
-        for (std::size_t at = 0; at < w.size(); at += 144) {
+        for (std::size_t at = 0; at < w.size(); at += bb) {
             const std::uint16_t dd[] = {locus::backend::f32_to_f16(0.01f),
                                         locus::backend::f32_to_f16(0.005f)};
-            std::memcpy(&w[at], dd, 4);
+            if (q3) {
+                std::memcpy(&w[at + 108], dd, 2);
+            } else {
+                std::memcpy(&w[at], dd, 4);
+            }
         }
         return w;
     };
@@ -595,9 +606,8 @@ TEST_CASE("vulkan q4_k seg matvec routes each matrix to its output",
                 std::bit_cast<std::uint32_t>(1.0f), seg1, off1, seg2, off2,
                 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0};
             ctx.begin_batch();
-            ctx.dispatch(Kernel::kMatvecQ4_KSeg, bufs, push,
-                         VulkanContext::matvec_groups(Kernel::kMatvecQ4_KSeg,
-                                                      total));
+            ctx.dispatch(seg, bufs, push,
+                         VulkanContext::matvec_groups(seg, total));
             ctx.end_batch();
             std::vector<float> o(64), o2(64);
             ctx.read_buffer(ob, std::as_writable_bytes(std::span(o)));
@@ -606,8 +616,7 @@ TEST_CASE("vulkan q4_k seg matvec routes each matrix to its output",
             const std::uint32_t at[] = {out_off, off1, off2};
             for (std::uint32_t i = 0; i < n_seg; ++i) {
                 std::vector<float> cpu(rows[i]);
-                locus::backend::Mat m{locus::gguf::TensorType::kQ4_K,
-                                      ws[i].data(), rows[i], cols};
+                locus::backend::Mat m{type, ws[i].data(), rows[i], cols};
                 locus::backend::matvec(m, x, cpu);
                 auto& dst = i == 0 ? want_o : want_o2;
                 std::copy(cpu.begin(), cpu.end(), dst.begin() + at[i]);
@@ -656,9 +665,8 @@ TEST_CASE("vulkan q4_k seg matvec routes each matrix to its output",
                 seg2, cols, 0, 0, 0, 0, one, seg1, 0, seg2, 0,
                 hd,   0,    r, hd, 0, r, pos, base, one, 0, 0};
             ctx.begin_batch();
-            ctx.dispatch(Kernel::kMatvecQ4_KSeg, bufs, push,
-                         VulkanContext::matvec_groups(Kernel::kMatvecQ4_KSeg,
-                                                      seg2));
+            ctx.dispatch(seg, bufs, push,
+                         VulkanContext::matvec_groups(seg, seg2));
             if (!epi) {
                 for (const auto& [b, heads] :
                      {std::pair{ob, nq}, std::pair{o2b, nk}}) {
