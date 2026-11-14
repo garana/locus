@@ -95,8 +95,8 @@ class Context {
     /**
      * In the open batch, the next dispatch need not wait for the one
      * before it (it neither reads nor writes what that one writes), so
-     * the GPU may run them together. It still waits for every earlier
-     * one.
+     * the GPU may run them together. It still waits for every dispatch
+     * recorded before the last barrier.
      */
     void overlap_next();
 
