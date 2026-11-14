@@ -103,7 +103,10 @@ inline Spec<StageOptions> stage_spec() {
                        "downstream HOST:PORT; repeat for a replica pool",
                        true),
         D::string_list("allow", &O::allow,
-                       "allowed peer CIDR; repeatable (default: any)"),
+                       "allowed peer CIDR; repeatable; needed when "
+                       "--listen is not loopback (default: any). On "
+                       "Linux a refused peer's connect times out (the "
+                       "kernel drops it)"),
         D::string_("key-file", &O::key_file,
                    "shared key: peers must prove they hold it before "
                    "any frame (the same file on every stage and the "
