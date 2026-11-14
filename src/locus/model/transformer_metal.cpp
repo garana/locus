@@ -248,10 +248,15 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 const std::uint64_t krow = row_of(l, false);
                 const std::uint64_t vrow = row_of(l, true);
                 rmsnorm(lay.attn_norm);
+                // q, k and v read xb and write apart: they may overlap,
+                // and so may the two RoPEs.
                 mv(lay.wq, s.xb, s.q, 0, false);
+                ctx.overlap_next();
                 mv(lay.wk, s.xb, *pool, krow, false);
+                ctx.overlap_next();
                 mv(lay.wv, s.xb, *pool, vrow, false);
                 rope(s.q, 0, H);
+                ctx.overlap_next();
                 rope(*pool, krow, KV);
                 const AttnParams ap{cache.block_floats(),
                                     cache.layer_offset(l),
@@ -275,6 +280,7 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 mv(lay.wo, s.att, s.x, 0, true);
                 rmsnorm(lay.ffn_norm);
                 mv(lay.w_gate, s.xb, s.gate, 0, false);
+                ctx.overlap_next();  // gate and up, likewise
                 mv(lay.w_up, s.xb, s.up, 0, false);
                 const SiluParams sp{ff};
                 const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
