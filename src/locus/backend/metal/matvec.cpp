@@ -124,6 +124,11 @@ bool matvec_supported(gguf::TensorType t) {
     return kind_of(t).kernel != nullptr;
 }
 
+bool matvec_shape_ok(gguf::TensorType t, std::uint32_t cols) {
+    const Kind k = kind_of(t);
+    return k.kernel != nullptr && cols % k.block == 0;
+}
+
 void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t cols, const Context::Buffer& w,
                    std::uint64_t w_off, const Context::Buffer& x,

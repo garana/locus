@@ -105,35 +105,22 @@ constexpr std::uint32_t kNormGroup = 256;
 
 }  // namespace
 
-bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
-                                     kv::PagedKvCache::Seq& seq,
-                                     std::uint32_t pos,
-                                     kv::PagedKvCache& cache, Workspace& ws,
-                                     std::span<float> logits,
-                                     LogitRows rows_out) const {
+bool TransformerModel::metal_forward_supported() const {
     using namespace backend;
     static const bool off = [] {
         const char* e = std::getenv("LOCUS_METAL_FORWARD");
         return e != nullptr && std::string_view(e) == "0";
     }();
     if (off || backend_->name != "metal" || !spec_->plain_attention ||
-        cache.quantized() || layer_begin_ != 0 ||
+        layer_begin_ != 0 ||
         layer_end_ != hp_.n_layers || hp_.norm_type != NormType::kRmsNorm ||
         hp_.embd_norm || hp_.n_kv_heads == 0 || out_w_.rows != hp_.n_vocab ||
         hp_.head_dim % 4 != 0 || hp_.n_heads % hp_.n_kv_heads != 0 ||
         !Context::usable()) {
         return false;
     }
-    if (embd == nullptr &&
-        (token < 0 || static_cast<std::uint32_t>(token) >= hp_.n_vocab)) {
-        return false;  // the host path reports it
-    }
-    if (pos + 1 > hp_.n_ctx || pos >= cache.capacity(seq)) {
-        return false;
-    }
     const auto ok_w = [](const Mat& m) {
-        return metal::matvec_supported(m.type) &&
-               metal::matvec_weight_bytes(m.type, m.rows, m.cols) > 0;
+        return metal::matvec_shape_ok(m.type, m.cols);
     };
     for (const Layer& lay : layers_) {
         if (lay.is_moe() || !lay.has_separate_qkv(hp_) ||
@@ -144,6 +131,26 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         }
     }
     if (!ok_w(out_w_)) {
+        return false;
+    }
+    return true;
+}
+
+bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
+                                     kv::PagedKvCache::Seq& seq,
+                                     std::uint32_t pos,
+                                     kv::PagedKvCache& cache, Workspace& ws,
+                                     std::span<float> logits,
+                                     LogitRows rows_out) const {
+    using namespace backend;
+    if (!metal_forward_supported() || cache.quantized()) {
+        return false;
+    }
+    if (embd == nullptr &&
+        (token < 0 || static_cast<std::uint32_t>(token) >= hp_.n_vocab)) {
+        return false;  // the host path reports it
+    }
+    if (pos + 1 > hp_.n_ctx || pos >= cache.capacity(seq)) {
         return false;
     }
     const std::uint32_t E = hp_.n_embd, hd = hp_.head_dim,

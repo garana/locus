@@ -1329,6 +1329,25 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
             return;
         }
     }
+    if (mrope.empty() && !hidden_only && metal_forward_supported()) {
+        // Metal (i#866): one GPU forward a position, so a chunk gives
+        // the per-token forward's bits (embeddings in place of rows).
+        const std::uint32_t V = hp_.n_vocab;
+        std::vector<float> spare(all_logits ? 0 : V);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            std::span<float> out =
+                all_logits ? logits.subspan(std::size_t{t} * V, V)
+                           : (t + 1 == n ? logits.first(V)
+                                         : std::span<float>(spare));
+            const float* e = embd.empty() ? nullptr : embd[t];
+            forward_layers(e != nullptr ? 0 : toks[t],
+                           e != nullptr
+                               ? std::span<const float>(e, hp_.n_embd)
+                               : std::span<const float>{},
+                           0, hp_.n_layers, cache, seq, ws, out, {});
+        }
+        return;
+    }
     if (backend_->name == "vulkan" && any_embd) {
         // The GPU batch with the embeddings in place of those tokens'
         // rows (i#257); where it declines, one GPU forward per position.
@@ -1610,6 +1629,16 @@ void TransformerModel::forward_batch_decode(
         throw std::invalid_argument(
             "forward_batch_decode: unsupported backend");
     }
+    if (metal_forward_supported()) {
+        // Metal (i#866): one GPU forward a sequence, so a batched step
+        // gives each sequence the per-token forward's bits.
+        const std::uint32_t V = hp_.n_vocab;
+        for (std::uint32_t t = 0; t < n; ++t) {
+            forward_layers(toks[t], {}, 0, hp_.n_layers, cache, *seqs[t], ws,
+                           logits.subspan(std::size_t{t} * V, V), {});
+        }
+        return;
+    }
     if (backend_->name == "vulkan") {
         // The Vulkan backend has its own multi-sequence forward
         // (vulkan_forward_multi, through forward_embeddings): one
@@ -1856,6 +1885,15 @@ void TransformerModel::forward_batch_layers(
             throw std::invalid_argument(
                 "forward_batch_layers: seq capacity not ensured");
         }
+    }
+    if (first && last && metal_forward_supported()) {
+        // Metal (i#866): the whole model, one GPU forward a sequence,
+        // as forward_batch_decode.
+        for (std::uint32_t t = 0; t < n; ++t) {
+            forward_layers(toks[t], {}, 0, hp_.n_layers, cache, *seqs[t], ws,
+                           out.subspan(std::size_t{t} * V, V), {});
+        }
+        return;
     }
     if (first && last && backend_->name == "cuda") {
         // The whole model on CUDA: the same GPU forward as forward() and

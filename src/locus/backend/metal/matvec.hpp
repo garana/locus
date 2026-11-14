@@ -15,6 +15,10 @@ namespace locus::backend::metal {
  */
 bool matvec_supported(gguf::TensorType t);
 
+/** @returns Whether type t has a kernel and `cols` is a whole number of
+ *  its blocks. */
+bool matvec_shape_ok(gguf::TensorType t, std::uint32_t cols);
+
 /**
  * out = w x on the GPU (i#866): w's bytes are copied once into a
  * shared Metal buffer, cached by their host pointer, and x and out go
