@@ -1,11 +1,15 @@
 #include "locus/video/jobs.hpp"
 
+#include <unistd.h>  // mkdtemp on macOS (Linux declares it in stdlib.h)
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <random>
+#include <stdexcept>
 
 namespace locus::video {
 
@@ -17,16 +21,31 @@ std::int64_t wall_seconds() {
         .count();
 }
 
-/** "video_" and 24 random hex digits, as OpenAI's ids look. */
+/** "video_" and 24 random hex digits, as OpenAI's ids look. Each digit
+ *  comes from the OS's random source (std::random_device), not from a
+ *  seeded generator, so seeing ids does not predict the next one. */
 std::string new_id() {
     static std::mutex mu;
-    static std::mt19937_64 rng{std::random_device{}()};
+    static std::random_device rd;
     std::lock_guard<std::mutex> lk(mu);
     char buf[32];
-    std::snprintf(buf, sizeof buf, "video_%016llx%08llx",
-                  static_cast<unsigned long long>(rng()),
-                  static_cast<unsigned long long>(rng() & 0xffffffffULL));
+    std::snprintf(buf, sizeof buf, "video_%08x%08x%08x", rd(), rd(), rd());
     return buf;
+}
+
+/** @returns A new private directory (mode 0700) under the system temp
+ *  directory. @throws std::runtime_error when it cannot be made. */
+std::string make_private_dir() {
+    std::string path = (std::filesystem::temp_directory_path() /
+                        "locus-videos-XXXXXX")
+                           .string();
+    if (::mkdtemp(path.data()) == nullptr) {
+        throw std::runtime_error("cannot make a private video directory "
+                                 "under " +
+                                 std::filesystem::temp_directory_path()
+                                     .string());
+    }
+    return path;
 }
 
 void remove_file(const std::string& path) {
@@ -43,7 +62,12 @@ VideoJobs::VideoJobs(std::string dir, std::size_t max_pending,
       max_pending_(max_pending),
       ttl_(ttl),
       now_(now ? std::move(now) : wall_seconds) {
-    std::filesystem::create_directories(dir_);
+    if (dir_.empty()) {
+        dir_ = make_private_dir();
+        own_dir_ = true;
+    } else {
+        std::filesystem::create_directories(dir_);
+    }
     thread_ = std::thread([this] { worker(); });
 }
 
@@ -56,6 +80,10 @@ VideoJobs::~VideoJobs() {
     thread_.join();
     for (const auto& [id, job] : jobs_) remove_file(job.file);
     remove_file(dir_ + "/partial.mp4");
+    if (own_dir_) {
+        std::error_code ec;
+        std::filesystem::remove(dir_, ec);  // empty by now
+    }
 }
 
 std::optional<VideoJob> VideoJobs::submit(VideoJob job, Runner run) {
