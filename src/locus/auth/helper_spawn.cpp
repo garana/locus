@@ -99,6 +99,14 @@ std::unique_ptr<HelperConnection> spawn_helper(
         ::close(in_pipe[1]);
         return fail("pipe");
     }
+    // A server started with fd 0, 1 or 2 closed gets one of them here;
+    // the child's dup2 onto it would then keep close-on-exec.
+    if (!sys::lift_above_std(in_pipe[0]) || !sys::lift_above_std(in_pipe[1]) ||
+        !sys::lift_above_std(out_pipe[0]) ||
+        !sys::lift_above_std(out_pipe[1])) {
+        close_all(in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1]);
+        return fail("fcntl");
+    }
 
     // Everything the child needs is made here, before fork: the child of
     // a threaded process may only make async-signal-safe calls (another
@@ -111,6 +119,11 @@ std::unique_ptr<HelperConnection> spawn_helper(
     }
     cargv.push_back(nullptr);
     const int fd_limit = sys::child_fd_limit();
+    // The PATH search too: execvp's is not async-signal-safe. A name that
+    // resolves to nothing is still exec'd as given, so it fails in the
+    // child (exit 127) and the connection reads as broken, as before.
+    std::string exe = sys::find_executable(argv[0]);
+    if (exe.empty()) exe = argv[0];
 
     const pid_t pid = ::fork();
     if (pid < 0) {
@@ -130,7 +143,7 @@ std::unique_ptr<HelperConnection> spawn_helper(
         sigset_t none;
         sigemptyset(&none);
         ::sigprocmask(SIG_SETMASK, &none, nullptr);
-        ::execvp(cargv[0], cargv.data());
+        ::execv(exe.c_str(), cargv.data());
         _exit(127);  // exec failed
     }
     // Parent: keep in_pipe[1] (write to child) + out_pipe[0] (read).

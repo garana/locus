@@ -82,37 +82,10 @@ bool drain(int fd, std::string& s, std::size_t cap) {
     }
 }
 
-bool executable_file(const std::string& p) {
-    struct stat st{};
-    return ::stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
-           ::access(p.c_str(), X_OK) == 0;
-}
-
 }  // namespace
 
 std::string find_executable(const std::string& name) {
-    if (name.empty()) return {};
-    if (name.find('/') != std::string::npos) {
-        return executable_file(name) ? name : std::string();
-    }
-    const char* env = std::getenv("PATH");
-    const std::string path = env != nullptr ? env : "/usr/bin:/bin";
-    std::size_t start = 0;
-    for (;;) {
-        const std::size_t colon = path.find(':', start);
-        std::string dir = path.substr(start, colon == std::string::npos
-                                                 ? std::string::npos
-                                                 : colon - start);
-        // An empty entry is the current dir. assign(1, '.') rather than
-        // = ".", which trips GCC 12's -Wrestrict false positive.
-        if (dir.empty()) dir.assign(1, '.');
-        std::string p = dir;
-        p += '/';
-        p += name;
-        if (executable_file(p)) return p;
-        if (colon == std::string::npos) return {};
-        start = colon + 1;
-    }
+    return sys::find_executable(name);
 }
 
 ProcessResult run_process(
@@ -146,6 +119,13 @@ ProcessResult run_process(
         make_pipe(in);
         make_pipe(out);
         make_pipe(err);
+        // A server started with fd 0, 1 or 2 closed gets one of them
+        // here; the child's dup2 onto it would then keep close-on-exec.
+        for (int* p : {in, out, err}) {
+            if (!sys::lift_above_std(p[0]) || !sys::lift_above_std(p[1])) {
+                throw std::runtime_error("video: fcntl failed");
+            }
+        }
     } catch (...) {
         close_all();
         throw;
