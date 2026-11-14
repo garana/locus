@@ -494,3 +494,30 @@ TEST_CASE("the server host defaults to loopback and takes an auth helper",
     REQUIRE(WIFEXITED(rc));
     REQUIRE(WEXITSTATUS(rc) == 2);
 }
+
+TEST_CASE("remote-experts values parse as HOST:PORT=LO:HI", "[cli]") {
+    // i#805: locus-run --remote-experts, expert parallelism (#781).
+    locus_tools::RemoteExpertsSpec r;
+    REQUIRE(locus_tools::parse_remote_experts("rpi.local:9201=32:64", r));
+    CHECK(r.host == "rpi.local");
+    CHECK(r.port == 9201);
+    CHECK(r.lo == 32);
+    CHECK(r.hi == 64);
+    REQUIRE(locus_tools::parse_remote_experts("[::1]:9201=0:1", r));
+    CHECK(r.host == "::1");
+    for (const char* bad :
+         {"rpi.local:9201", "rpi.local=32:64", ":9201=32:64",
+          "rpi.local:0=32:64", "rpi.local:9201=64:32",
+          "rpi.local:9201=32:32", "rpi.local:9201=-1:4",
+          "rpi.local:9201=32", "rpi.local:9201=a:b"}) {
+        INFO(bad);
+        CHECK_FALSE(locus_tools::parse_remote_experts(bad, r));
+    }
+    // A bad value is a usage error before the model loads (exit 2).
+    const std::string cmd = std::string("'") + LOCUS_RUN_BIN +
+                            "' --remote-experts nope missing.gguf hi "
+                            ">/dev/null 2>&1";
+    const int rc = std::system(cmd.c_str());
+    REQUIRE(WIFEXITED(rc));
+    REQUIRE(WEXITSTATUS(rc) == 2);
+}

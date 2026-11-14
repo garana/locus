@@ -905,8 +905,16 @@ weight), so the owner can combine the experts in its own pick order
 and keep one host's bits. `locus-experts` serves an expert range
 through `TransformerModel::expert_out`, the step `moe_ffn` takes per
 pick, one connection at a time, and accepts only loopback peers unless
-given `--allow` (the port has no authentication). The `moe_ffn` side
-that calls it is #781's next step.
+given `--allow` (the port has no authentication). On the token's
+side, `TransformerModel::set_remote_experts` takes a
+`model::RemoteExperts` (`pipeline::ExpertClient` over those
+connections): `moe_ffn` starts the remote picks, computes the local
+ones meanwhile, then adds every pick in pick order, and its readahead
+skips the remote experts. Only the per-token CPU forward uses it; the
+batched and GPU forwards compute every expert locally, which gives the
+same output since each host maps the whole file. `locus-run
+--remote-experts HOST:PORT=LO:HI` (repeatable) connects to each
+`locus-experts` and installs the client.
 
 ### Stage serving
 

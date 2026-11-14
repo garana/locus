@@ -83,7 +83,7 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   pipeline, experimental; a stage runs on the CPU, CUDA or Vulkan, and
   can serve its own Prometheus `/metrics`); `locus-experts` (serves
   one host's share of an MoE model's experts, for expert parallelism,
-  #781; the forward side is not wired yet);
+  #781; `locus-run --remote-experts HOST:PORT=LO:HI` uses it);
   `locus-router` (or `locus-server
   --router`: one URL in front of several locus-server instances, given
   as host:port, found by DNS SRV, by mDNS / DNS-SD or by scanning an

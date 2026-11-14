@@ -1,5 +1,7 @@
 #include "locus/server/tools.hpp"
 
+#include "locus/http/json_body.hpp"
+
 namespace locus::server {
 
 using nlohmann::json;
@@ -55,7 +57,7 @@ std::string render_tool_call(const std::string& name,
     json args = json::object();
     if (arguments.is_string()) {
         try {
-            args = json::parse(arguments.get<std::string>());
+            args = http::parse_json(arguments.get<std::string>());
         } catch (const std::exception&) {
             args = arguments;  // keep it as sent
         }
@@ -86,7 +88,7 @@ std::optional<ToolCall> detect_tool_call(
     }
     json j;
     try {
-        j = json::parse(text.substr(b, e - b + 1));
+        j = http::parse_json(text.substr(b, e - b + 1));
     } catch (const std::exception&) {
         return std::nullopt;
     }
