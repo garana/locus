@@ -51,6 +51,7 @@ inline constexpr const char* kRouterUsage =
     "  --auth-helper PATH  check client keys with this auth helper\n"
     "                      (locus-auth-helper is a reference one): every\n"
     "                      request but /health needs a key it allows\n"
+    "                      (a binary or a script that starts with #!)\n"
     "  --auth-helper-arg A an argument for the helper (repeatable)\n"
     "  --upstream-auth M   the credential sent to the instances: client\n"
     "                      (the client's own, default), none, or key\n"
