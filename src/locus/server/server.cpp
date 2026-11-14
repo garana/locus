@@ -916,6 +916,20 @@ std::uint32_t read_max_tokens(const json& body, std::uint32_t cap,
 }
 
 /**
+ * The sampling seed of a generation body: its seed, or a random one when
+ * the body sets none.
+ *
+ * @throws std::invalid_argument when seed is not an integer.
+ */
+std::uint64_t read_seed(const json& body) {
+    if (!body.contains("seed")) return std::random_device{}();
+    if (!body["seed"].is_number_integer()) {
+        throw std::invalid_argument("seed must be an integer");
+    }
+    return static_cast<std::uint64_t>(body["seed"].get<std::int64_t>());
+}
+
+/**
  * Parses a chat (OpenAI messages[]) or messages (Anthropic, with a
  * top-level system) body that carries images.
  *
@@ -3019,15 +3033,7 @@ void OpenAiServer::install_routes() {
                     cap = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                         cap, body["max_tokens"].get<std::uint64_t>()));
                 }
-                std::uint64_t seed = std::random_device{}();
-                if (body.contains("seed")) {
-                    if (!body["seed"].is_number_integer()) {
-                        throw std::invalid_argument(
-                            "seed must be an integer");
-                    }
-                    seed = static_cast<std::uint64_t>(
-                        body["seed"].get<std::int64_t>());
-                }
+                const std::uint64_t seed = read_seed(body);
                 bool stream = false;
                 if (body.contains("stream")) {
                     if (!body["stream"].is_boolean()) {
@@ -3307,15 +3313,7 @@ void OpenAiServer::install_routes() {
                     }
                     p.guidance = static_cast<float>(g);
                 }
-                p.seed = std::random_device{}();
-                if (body.contains("seed")) {
-                    if (!body["seed"].is_number_integer()) {
-                        throw std::invalid_argument(
-                            "seed must be an integer");
-                    }
-                    p.seed = static_cast<std::uint64_t>(
-                        body["seed"].get<std::int64_t>());
-                }
+                p.seed = read_seed(body);
                 // The image models' linears run on the GPU when the
                 // Vulkan device imports host memory (unified memory:
                 // their mmapped weights cost it nothing), else on the
@@ -3499,15 +3497,7 @@ void OpenAiServer::install_routes() {
                     lora_set = loras_->select(picks);
                     p.lora = &lora_set;
                 }
-                p.seed = std::random_device{}();
-                if (body.contains("seed")) {
-                    if (!body["seed"].is_number_integer()) {
-                        throw std::invalid_argument(
-                            "seed must be an integer");
-                    }
-                    p.seed = static_cast<std::uint64_t>(
-                        body["seed"].get<std::int64_t>());
-                }
+                p.seed = read_seed(body);
                 // With host-memory import (as for PixArt) the DiT runs
                 // each step on the GPU, activations resident
                 // (FluxDit::forward_vulkan); CLIP, T5 and the VAE run
@@ -3671,15 +3661,7 @@ void OpenAiServer::install_routes() {
                     throw std::invalid_argument(
                         "need finite cfg >= 0 and temperature >= 0");
                 }
-                p.seed = std::random_device{}();
-                if (body.contains("seed")) {
-                    if (!body["seed"].is_number_integer()) {
-                        throw std::invalid_argument(
-                            "seed must be an integer");
-                    }
-                    p.seed = static_cast<std::uint64_t>(
-                        body["seed"].get<std::int64_t>());
-                }
+                p.seed = read_seed(body);
 
                 using Clock = std::chrono::steady_clock;
                 const auto ids = janus_->prompt_ids(tok_, prompt);
@@ -3988,14 +3970,7 @@ void OpenAiServer::install_routes() {
                 }
                 p.true_cfg_scale = static_cast<float>(g.get<double>());
             }
-            p.seed = std::random_device{}();
-            if (body.contains("seed")) {
-                if (!body["seed"].is_number_integer()) {
-                    throw std::invalid_argument("seed must be an integer");
-                }
-                p.seed = static_cast<std::uint64_t>(
-                    body["seed"].get<std::int64_t>());
-            }
+            p.seed = read_seed(body);
             // The MMDiT and the VAE run on the GPU where it maps host
             // memory, else on the CPU; the language model always on the
             // CPU.
@@ -4227,14 +4202,7 @@ void OpenAiServer::install_routes() {
                         "\"deterministic\"");
                 }
             }
-            p.seed = std::random_device{}();
-            if (body.contains("seed")) {
-                if (!body["seed"].is_number_integer()) {
-                    throw std::invalid_argument("seed must be an integer");
-                }
-                p.seed = static_cast<std::uint64_t>(
-                    body["seed"].get<std::int64_t>());
-            }
+            p.seed = read_seed(body);
             if (body.contains("input_reference")) {
                 const json& ref = body["input_reference"];
                 if (!ref.is_object() || ref.contains("file_id") ||
