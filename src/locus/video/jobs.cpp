@@ -81,8 +81,10 @@ VideoJobs::~VideoJobs() {
     for (const auto& [id, job] : jobs_) remove_file(job.file);
     remove_file(dir_ + "/partial.mp4");
     if (own_dir_) {
+        // Private to this process (made here, mode 0700), so remove it
+        // whole, even if a run left another file there.
         std::error_code ec;
-        std::filesystem::remove(dir_, ec);  // empty by now
+        std::filesystem::remove_all(dir_, ec);
     }
 }
 
