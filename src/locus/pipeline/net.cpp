@@ -9,6 +9,9 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <linux/filter.h>
+#endif
 
 #include <array>
 #include <cerrno>
@@ -172,6 +175,84 @@ bool ip_allowed(const std::string& ip, const std::vector<Cidr>& allow) {
         }
     }
     return false;
+}
+
+bool attach_allow_filter(int fd, const std::vector<Cidr>& allow) {
+#if defined(__linux__)
+    if (allow.empty()) {
+        // Allow all: drop any filter (ENOENT when there is none).
+        int unused = 0;
+        ::setsockopt(fd, SOL_SOCKET, SO_DETACH_FILTER, &unused,
+                     sizeof(unused));
+        return true;
+    }
+    // The program reads the IP header through SKF_NET_OFF (the filter
+    // of a TCP socket sees the packet from its TCP header on). Every
+    // range is a short block that ends in its own "accept", so no jump
+    // spans more than one block (jt / jf hold 8 bits); the two family
+    // sections are reached by `ja`, whose offset holds 32.
+    using Prog = std::vector<sock_filter>;
+    constexpr std::uint32_t kNet = static_cast<std::uint32_t>(SKF_NET_OFF);
+    constexpr std::uint32_t kAccept = 0xFFFFFFFFu;  // keep the whole packet
+    const auto word = [](const std::uint8_t* p) {
+        return (std::uint32_t{p[0]} << 24) | (std::uint32_t{p[1]} << 16) |
+               (std::uint32_t{p[2]} << 8) | std::uint32_t{p[3]};
+    };
+    // Appends the test of one range: the source address words at
+    // `src` (net offset) that the prefix covers, then "accept".
+    const auto range = [&](Prog& p, std::uint32_t src, const Cidr& c) {
+        const int words = (c.bits + 31) / 32;
+        for (int w = 0; w < words; ++w) {
+            const int left = c.bits - 32 * w;  // prefix bits in this word
+            const std::uint32_t mask =
+                left >= 32 ? 0xFFFFFFFFu : ~(0xFFFFFFFFu >> left);
+            // On a mismatch, skip the rest of this block and its accept.
+            const auto skip =
+                static_cast<std::uint8_t>(3 * (words - 1 - w) + 1);
+            const auto at = kNet + src + 4 * static_cast<std::uint32_t>(w);
+            p.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, at));
+            p.push_back(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, mask));
+            p.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                 word(c.net.data() + 4 * w) & mask, 0, skip));
+        }
+        p.push_back(BPF_STMT(BPF_RET | BPF_K, kAccept));  // /0: always
+    };
+    Prog v4, v6;
+    for (const Cidr& c : allow) {
+        if (c.family == AddrFamily::kV4) {
+            range(v4, 12, c);  // IPv4 source address at byte 12
+        } else {
+            range(v6, 8, c);  // IPv6 source address at byte 8
+        }
+    }
+    v4.push_back(BPF_STMT(BPF_RET | BPF_K, 0));  // no range: drop
+    v6.push_back(BPF_STMT(BPF_RET | BPF_K, 0));
+    Prog prog = {
+        BPF_STMT(BPF_LD | BPF_B | BPF_ABS, kNet),  // version / IHL
+        BPF_STMT(BPF_ALU | BPF_RSH | BPF_K, 4),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 4, 0, 1),
+        BPF_STMT(BPF_JMP | BPF_JA, 3),  // to the IPv4 section, at 7
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6, 0, 1),
+        // to the IPv6 section, at 7 + v4.size()
+        BPF_STMT(BPF_JMP | BPF_JA,
+                 static_cast<std::uint32_t>(v4.size() + 1)),
+        BPF_STMT(BPF_RET | BPF_K, 0),  // neither: drop
+    };
+    prog.insert(prog.end(), v4.begin(), v4.end());
+    prog.insert(prog.end(), v6.begin(), v6.end());
+    if (prog.size() > BPF_MAXINSNS) {
+        return false;
+    }
+    sock_fprog fp{};
+    fp.len = static_cast<unsigned short>(prog.size());
+    fp.filter = prog.data();
+    return ::setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &fp,
+                        sizeof(fp)) == 0;
+#else
+    (void)fd;
+    (void)allow;
+    return true;
+#endif
 }
 
 bool parse_hostport(const std::string& s, std::string& host, int& port) {
