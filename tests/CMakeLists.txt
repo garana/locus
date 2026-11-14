@@ -9,6 +9,7 @@ target_include_directories(catch2 SYSTEM PUBLIC
 
 add_executable(locus_tests
     test_sanity.cpp
+    test_third_party.cpp
     test_block_allocator.cpp
     test_features.cpp
     test_arch_registry.cpp
