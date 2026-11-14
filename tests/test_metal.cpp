@@ -357,7 +357,7 @@ TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
     }
 }
 
-TEST_CASE("metal Q4_K matmul matches the CPU matvec per token",
+TEST_CASE("metal Q4_K and Q6_K matmuls match the CPU matvec per token",
           "[metal]") {
     if (!Context::usable()) {
         SKIP("no Metal device");
@@ -367,56 +367,58 @@ TEST_CASE("metal Q4_K matmul matches the CPU matvec per token",
     std::mt19937 rng(17);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     // Rows and tokens off the 64 x 32 tile, strided token rows.
-    for (const auto& [rows, cols, n_tok] :
-         {std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>{
-              200, 512, 37},
-          {64, 256, 1}, {1027, 3072, 70}}) {
-        CAPTURE(rows, cols, n_tok);
-        const auto w = random_weights(TensorType::kQ4_K, rows, cols, rows);
-        const locus::backend::Mat m{TensorType::kQ4_K, w.data(), rows, cols};
-        const std::uint32_t xs = cols + 8, os = rows + 4;
-        std::vector<float> x(std::size_t{n_tok} * xs);
-        for (auto& v : x) {
-            v = dist(rng);
-        }
-        std::vector<float> init(std::size_t{n_tok} * os);
-        for (auto& v : init) {
-            v = dist(rng);
-        }
-        Context::Buffer wb = ctx.upload(w);
-        Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
-        for (const bool acc : {false, true}) {
-            CAPTURE(acc);
-            Context::Buffer ob = ctx.upload(std::as_bytes(std::span(init)));
-            {
-                std::lock_guard lk(mb::device_mutex());
-                REQUIRE(mb::record_matmul(ctx, TensorType::kQ4_K, rows, cols,
-                                          n_tok, wb, 0, xb, 0, xs, ob, 0, os,
-                                          acc));
+    for (const TensorType ty : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+        CAPTURE(static_cast<int>(ty));
+        for (const auto& [rows, cols, n_tok] :
+             {std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>{
+                  200, 512, 37},
+              {64, 256, 1}, {1027, 3072, 70}}) {
+            CAPTURE(rows, cols, n_tok);
+            const auto w = random_weights(ty, rows, cols, rows);
+            const locus::backend::Mat m{ty, w.data(), rows, cols};
+            const std::uint32_t xs = cols + 8, os = rows + 4;
+            std::vector<float> x(std::size_t{n_tok} * xs);
+            for (auto& v : x) {
+                v = dist(rng);
             }
-            const auto* got = static_cast<const float*>(ob.data);
-            std::vector<float> want(rows);
-            for (std::uint32_t t = 0; t < n_tok; ++t) {
-                locus::backend::matvec(
-                    m, {x.data() + std::size_t{t} * xs, cols}, want);
-                for (std::uint32_t r = 0; r < rows; ++r) {
-                    const float base =
-                        acc ? init[std::size_t{t} * os + r] : 0.0f;
-                    REQUIRE(got[std::size_t{t} * os + r] ==
-                            Catch::Approx(base + want[r])
-                                .margin(1e-3)
-                                .epsilon(1e-4));
-                }
-                // Past the rows, the stride's padding is untouched.
-                for (std::uint32_t r = rows; r < os; ++r) {
-                    REQUIRE(got[std::size_t{t} * os + r] ==
-                            init[std::size_t{t} * os + r]);
-                }
+            std::vector<float> init(std::size_t{n_tok} * os);
+            for (auto& v : init) {
+                v = dist(rng);
             }
-            ctx.free(ob);
+            Context::Buffer wb = ctx.upload(w);
+            Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
+            for (const bool acc : {false, true}) {
+                CAPTURE(acc);
+                Context::Buffer ob = ctx.upload(std::as_bytes(std::span(init)));
+                {
+                    std::lock_guard lk(mb::device_mutex());
+                    REQUIRE(mb::record_matmul(ctx, ty, rows, cols, n_tok, wb,
+                                              0, xb, 0, xs, ob, 0, os, acc));
+                }
+                const auto* got = static_cast<const float*>(ob.data);
+                std::vector<float> want(rows);
+                for (std::uint32_t t = 0; t < n_tok; ++t) {
+                    locus::backend::matvec(
+                        m, {x.data() + std::size_t{t} * xs, cols}, want);
+                    for (std::uint32_t r = 0; r < rows; ++r) {
+                        const float base =
+                            acc ? init[std::size_t{t} * os + r] : 0.0f;
+                        REQUIRE(got[std::size_t{t} * os + r] ==
+                                Catch::Approx(base + want[r])
+                                    .margin(1e-3)
+                                    .epsilon(1e-4));
+                    }
+                    // Past the rows, the stride's padding is untouched.
+                    for (std::uint32_t r = rows; r < os; ++r) {
+                        REQUIRE(got[std::size_t{t} * os + r] ==
+                                init[std::size_t{t} * os + r]);
+                    }
+                }
+                ctx.free(ob);
+            }
+            ctx.free(wb);
+            ctx.free(xb);
         }
-        ctx.free(wb);
-        ctx.free(xb);
     }
     // Types without a matmul kernel say so and record nothing.
     Context::Buffer none = ctx.alloc(64);
