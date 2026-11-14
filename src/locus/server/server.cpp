@@ -152,6 +152,42 @@ void set_unavailable(http::ServerResponse& res, const std::string& message,
 }
 
 /**
+ * Takes the image lock without waiting. An image takes minutes, so when
+ * another image or video holds it, a request gets a 503 instead of
+ * holding a server thread in a queue.
+ *
+ * @param retry_after_s The Retry-After of that 503, in seconds.
+ * @returns The lock; when it does not own mu, res holds the 503.
+ */
+std::unique_lock<std::mutex> try_image_lock(std::mutex& mu,
+                                            http::ServerResponse& res,
+                                            int retry_after_s) {
+    std::unique_lock<std::mutex> lk(mu, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        set_unavailable(res,
+                        "an image or video is already being generated; "
+                        "retry later",
+                        retry_after_s);
+    }
+    return lk;
+}
+
+/** Fills res with an OpenAI images reply: one PNG, base64-encoded. */
+void set_png_reply(http::ServerResponse& res,
+                   std::span<const std::byte> png) {
+    const auto created = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now()
+                                 .time_since_epoch())
+                             .count();
+    res.set_content(
+        json{{"created", created},
+             {"data",
+              json::array({json{{"b64_json", http::base64_encode(png)}}})}}
+            .dump(-1, ' ', false, kLossy),
+        "application/json");
+}
+
+/**
  * The text of an OpenAI message's content: a string, or an array of
  * parts (the multimodal shape, which some clients send for plain text
  * too) whose "text" parts are joined with newlines, as the vision path
@@ -3328,17 +3364,8 @@ void OpenAiServer::install_routes() {
                 image::PixArtPipeline::Timing took;
                 std::vector<std::uint8_t> rgb;
                 {
-                    // An image takes minutes: a second request gets a
-                    // 503 instead of holding a server thread in a queue.
-                    std::unique_lock<std::mutex> lk(image_mu_,
-                                                    std::try_to_lock);
-                    if (!lk.owns_lock()) {
-                        set_unavailable(res,
-                                        "an image or video is already being "
-                                        "generated; retry later",
-                                        60);
-                        return;
-                    }
+                    const auto lk = try_image_lock(image_mu_, res, 60);
+                    if (!lk.owns_lock()) return;
                     rgb = pixart_->generate(p, op, ctx.client_alive, &took);
                 }
                 if (rgb.empty()) {
@@ -3352,17 +3379,7 @@ void OpenAiServer::install_routes() {
                     "encode;dur=" + std::to_string(took.encode) +
                         ", denoise;dur=" + std::to_string(took.denoise) +
                         ", decode;dur=" + std::to_string(took.decode));
-                const auto created =
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-                res.set_content(
-                    json{{"created", created},
-                         {"data", json::array({json{
-                                      {"b64_json",
-                                       http::base64_encode(png)}}})}}
-                        .dump(-1, ' ', false, kLossy),
-                    "application/json");
+                set_png_reply(res, png);
             } catch (const std::exception& e) {
                 set_error(res, e);
             }
@@ -3523,15 +3540,8 @@ void OpenAiServer::install_routes() {
                 image::FluxPipeline::Timing took;
                 std::vector<std::uint8_t> rgb;
                 {
-                    std::unique_lock<std::mutex> lk(image_mu_,
-                                                    std::try_to_lock);
-                    if (!lk.owns_lock()) {
-                        set_unavailable(res,
-                                        "an image or video is already being "
-                                        "generated; retry later",
-                                        60);
-                        return;
-                    }
+                    const auto lk = try_image_lock(image_mu_, res, 60);
+                    if (!lk.owns_lock()) return;
                     rgb = flux_->generate(p, op, ctx.client_alive, &took);
                 }
                 if (rgb.empty()) {
@@ -3545,17 +3555,7 @@ void OpenAiServer::install_routes() {
                     "encode;dur=" + std::to_string(took.encode) +
                         ", denoise;dur=" + std::to_string(took.denoise) +
                         ", decode;dur=" + std::to_string(took.decode));
-                const auto created =
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-                res.set_content(
-                    json{{"created", created},
-                         {"data", json::array({json{
-                                      {"b64_json",
-                                       http::base64_encode(png)}}})}}
-                        .dump(-1, ' ', false, kLossy),
-                    "application/json");
+                set_png_reply(res, png);
             } catch (const std::exception& e) {
                 set_error(res, e);
             }
@@ -3669,18 +3669,8 @@ void OpenAiServer::install_routes() {
                 std::vector<float> chw;
                 Clock::time_point t0, t1, t2;
                 {
-                    // As the PixArt path: a request that finds an image
-                    // in progress gets a 503, not a wait on a server
-                    // thread.
-                    std::unique_lock<std::mutex> lk(image_mu_,
-                                                    std::try_to_lock);
-                    if (!lk.owns_lock()) {
-                        set_unavailable(res,
-                                        "an image or video is already being "
-                                        "generated; retry later",
-                                        30);
-                        return;
-                    }
+                    const auto lk = try_image_lock(image_mu_, res, 30);
+                    if (!lk.owns_lock()) return;
                     t0 = Clock::now();
                     codes = janus_->generate(model_, ids, p,
                                              ctx.client_alive);
@@ -3712,17 +3702,7 @@ void OpenAiServer::install_routes() {
                                                     ms(t0, t1) +
                                                     ", decode;dur=" +
                                                     ms(t1, t2));
-                const auto created =
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-                res.set_content(
-                    json{{"created", created},
-                         {"data", json::array({json{
-                                      {"b64_json",
-                                       http::base64_encode(png)}}})}}
-                        .dump(-1, ' ', false, kLossy),
-                    "application/json");
+                set_png_reply(res, png);
             } catch (const std::exception& e) {
                 set_error(res, e);
             }
@@ -3981,14 +3961,8 @@ void OpenAiServer::install_routes() {
             std::vector<std::uint8_t> rgb;
             std::uint32_t w = 0, h = 0;
             {
-                std::unique_lock<std::mutex> lk(image_mu_, std::try_to_lock);
-                if (!lk.owns_lock()) {
-                    set_unavailable(res,
-                                    "an image or video is already being "
-                                    "generated; retry later",
-                                    60);
-                    return;
-                }
+                const auto lk = try_image_lock(image_mu_, res, 60);
+                if (!lk.owns_lock()) return;
                 rgb = qwen_edit_->edit(p, op, ctx.client_alive, w, h, &took);
             }
             if (rgb.empty()) {
@@ -4002,16 +3976,7 @@ void OpenAiServer::install_routes() {
                                ", denoise;dur=" +
                                std::to_string(took.denoise) +
                                ", decode;dur=" + std::to_string(took.decode));
-            const auto created =
-                std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::system_clock::now().time_since_epoch())
-                    .count();
-            res.set_content(
-                json{{"created", created},
-                     {"data", json::array({json{
-                                  {"b64_json", http::base64_encode(png)}}})}}
-                    .dump(-1, ' ', false, kLossy),
-                "application/json");
+            set_png_reply(res, png);
         } catch (const std::exception& e) {
             set_error(res, e);
         }
