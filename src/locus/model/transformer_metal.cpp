@@ -102,6 +102,10 @@ struct SiluParams {
 };
 
 constexpr std::uint32_t kNormGroup = 256;
+// attn_fused (kernels.metal): its threadgroup, and the positions its
+// threadgroup memory holds.
+constexpr std::uint32_t kAttnGroup = 256;
+constexpr std::uint32_t kAttnMaxPos = 4096;
 
 }  // namespace
 
@@ -167,6 +171,13 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
     const std::uint32_t R = (rows_out.end == 0 ? V : rows_out.end) - lo;
     const std::uint32_t n_pos = pos + 1;
     const std::uint32_t bt = cache.geometry().block_tokens;
+    // Short contexts take the one-kernel attention: its scores fit in
+    // threadgroup memory and the group splits evenly over head_dim.
+    // LOCUS_METAL_ATTN_PASSES=3 keeps the three passes (tests).
+    const char* passes = std::getenv("LOCUS_METAL_ATTN_PASSES");
+    const bool fused_attn =
+        n_pos <= kAttnMaxPos && hd <= kAttnGroup && kAttnGroup % hd == 0 &&
+        (passes == nullptr || std::string_view(passes) != "3");
 
     std::lock_guard lk(metal::device_mutex());
     const Context::Buffer* pool = metal::kv_buffer(cache.pool_data());
@@ -267,16 +278,27 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                                     KV,
                                     hd,
                                     hp_.kq_scale};
-                const Context::Arg sa[] = {
-                    {&s.q, 0}, {pool, 0}, {&s.blocks, 0}, {&s.scores, 0}};
-                ctx.dispatch("attn_scores", sa, bytes_of(ap), H * n_pos, 64);
-                // One threadgroup a head (H groups of kNormGroup).
-                const Context::Arg sm[] = {{&s.scores, 0}};
-                ctx.dispatch("attn_softmax", sm, bytes_of(ap),
-                             H * kNormGroup, kNormGroup);
-                const Context::Arg va[] = {
-                    {&s.scores, 0}, {pool, 0}, {&s.blocks, 0}, {&s.att, 0}};
-                ctx.dispatch("attn_values", va, bytes_of(ap), H * hd, 64);
+                if (fused_attn) {
+                    // One kernel, one threadgroup a head.
+                    const Context::Arg fa[] = {
+                        {&s.q, 0}, {pool, 0}, {&s.blocks, 0}, {&s.att, 0}};
+                    ctx.dispatch("attn_fused", fa, bytes_of(ap),
+                                 H * kAttnGroup, kAttnGroup);
+                } else {
+                    const Context::Arg sa[] = {{&s.q, 0},
+                                               {pool, 0},
+                                               {&s.blocks, 0},
+                                               {&s.scores, 0}};
+                    ctx.dispatch("attn_scores", sa, bytes_of(ap), H * n_pos,
+                                 64);
+                    // One threadgroup a head (H groups of kNormGroup).
+                    const Context::Arg sm[] = {{&s.scores, 0}};
+                    ctx.dispatch("attn_softmax", sm, bytes_of(ap),
+                                 H * kNormGroup, kNormGroup);
+                    const Context::Arg va[] = {
+                        {&s.scores, 0}, {pool, 0}, {&s.blocks, 0}, {&s.att, 0}};
+                    ctx.dispatch("attn_values", va, bytes_of(ap), H * hd, 64);
+                }
                 mv(lay.wo, s.att, s.x, 0, true);
                 rmsnorm(lay.ffn_norm);
                 mv(lay.w_gate, s.xb, s.gate, 0, false);

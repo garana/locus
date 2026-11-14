@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -301,20 +302,30 @@ TEST_CASE("metal forward tracks the CPU on llama Q4_K_M and Q8_0",
         const auto cpu = run(locus::backend::backends().front().name);
         const std::uint64_t before =
             locus::model::TransformerModel::metal_forward_tokens();
-        const auto gpu = run("metal");
-        // Every token took the GPU path.
-        CHECK(locus::model::TransformerModel::metal_forward_tokens() -
-                  before ==
-              ids.size());
-        for (std::size_t t = 0; t < ids.size(); ++t) {
-            CAPTURE(t);
-            CHECK(locus::model::argmax(gpu[t]) == locus::model::argmax(cpu[t]));
-            float worst = 0.0f, scale = 0.0f;
-            for (std::uint32_t r = 0; r < nv; ++r) {
-                worst = std::max(worst, std::abs(gpu[t][r] - cpu[t][r]));
-                scale = std::max(scale, std::abs(cpu[t][r]));
+        // The one-kernel attention (the default at this length), then
+        // the three passes.
+        for (const bool three : {false, true}) {
+            CAPTURE(three);
+            if (three) {
+                setenv("LOCUS_METAL_ATTN_PASSES", "3", 1);
             }
-            CHECK(worst <= 0.01f * scale);
+            const auto gpu = run("metal");
+            unsetenv("LOCUS_METAL_ATTN_PASSES");
+            // Every token took the GPU path.
+            CHECK(locus::model::TransformerModel::metal_forward_tokens() -
+                      before ==
+                  ids.size() * (three ? 2 : 1));
+            for (std::size_t t = 0; t < ids.size(); ++t) {
+                CAPTURE(t);
+                CHECK(locus::model::argmax(gpu[t]) ==
+                      locus::model::argmax(cpu[t]));
+                float worst = 0.0f, scale = 0.0f;
+                for (std::uint32_t r = 0; r < nv; ++r) {
+                    worst = std::max(worst, std::abs(gpu[t][r] - cpu[t][r]));
+                    scale = std::max(scale, std::abs(cpu[t][r]));
+                }
+                CHECK(worst <= 0.01f * scale);
+            }
         }
     }
 }
