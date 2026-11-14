@@ -256,9 +256,13 @@ struct MuxSession {
     bool hs_answered = false;
     std::optional<HandshakeClient> hs_out;
     std::string hs_buf;
-    // i#854: when input bytes last arrived. With a partial frame in
-    // inbuf and nothing in flight, the frame timeout counts from here.
+    // i#854: when input bytes last arrived, and when the session last
+    // stopped waiting on a step or a dial. With a partial frame in inbuf
+    // and nothing in flight, the frame timeout counts from the later of
+    // the two, so a frame begun during a long step is not dropped as the
+    // step ends.
     Clock::time_point last_input = Clock::now();
+    Clock::time_point idle_since = Clock::now();
 };
 
 // A pipe whose ends close on destruction. The executor's completion
@@ -639,7 +643,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             s.inbuf.empty()) {
             return Clock::time_point::max();
         }
-        return s.last_input +
+        return std::max(s.last_input, s.idle_since) +
                std::chrono::milliseconds(conn_live.frame_timeout_ms);
     };
 
@@ -1038,6 +1042,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // buffered while the dial was in flight.
     auto dial_done = [&](MuxSession& s) {
         s.connecting = false;
+        s.idle_since = Clock::now();  // the frame clock starts
         s.dial_deadline = Clock::time_point::max();
         if (s.out_watched) {
             poller.remove(s.out_fd);  // nothing to flush yet
@@ -1349,6 +1354,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                     }
                     MuxSession& s = *cit->second;
                     s.in_flight = false;
+                    s.idle_since = Clock::now();  // the frame clock starts
                     if (s.cancelled) {
                         // Dropped mid-step: the step is done with the seq,
                         // so release it now and discard the output.
