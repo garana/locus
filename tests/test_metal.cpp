@@ -265,6 +265,7 @@ TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
     // llama-quantize --allow-requantize (i#907): Q4_0 (with a Q6_K
     // head) and Q5_K_M (Q5_K and Q6_K). Requantized, so only fit for
     // this GPU-against-CPU check, not for quality numbers.
+    int ran = 0;
     for (const char* name :
          {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf",
           "llama-3.2-1b-q4_0.gguf", "llama-3.2-1b-q5_k_m.gguf"}) {
@@ -275,6 +276,7 @@ TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
             continue;
         }
         CAPTURE(name);
+        ++ran;
         auto g = locus::gguf::GgufFile::open(path);
         auto model = locus::model::TransformerModel::load(g);
         // The CPU reference with f32 activations, as the GPU computes
@@ -347,5 +349,8 @@ TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
                 CHECK(worst <= 0.01f * scale);
             }
         }
+    }
+    if (ran == 0) {
+        SKIP("none of the llama test models is present");
     }
 }
