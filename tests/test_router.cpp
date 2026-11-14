@@ -3,6 +3,7 @@
 // (locus's own http::Server) and a real locus-server.
 
 #include <csignal>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -22,6 +23,7 @@
 #include "locus/http/client.hpp"
 #include "locus/http/server.hpp"
 #include "locus/model/transformer.hpp"
+#include "locus/pipeline/net.hpp"
 #include "locus/router/router.hpp"
 #include "locus/server/server.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -1358,4 +1360,72 @@ TEST_CASE("router: in front of a real locus-server", "[router][e2e]") {
     }
     server.stop();
     th.join();
+}
+
+TEST_CASE("router: polls instances in parallel", "[router]") {
+    // i#625 F13: two instances that take the connection and never
+    // answer each hold their poll for the read timeout (5 s). One after
+    // the other, a refresh took 10 s; in parallel it takes one timeout.
+    int p1 = 0;
+    int p2 = 0;
+    const int l1 = locus::pipeline::listen_on("127.0.0.1", 0, &p1);
+    const int l2 = locus::pipeline::listen_on("127.0.0.1", 0, &p2);
+    REQUIRE(l1 >= 0);
+    REQUIRE(l2 >= 0);
+    FakeInstance a("A", {"text"}, "m");
+    RouterFixture rf({"127.0.0.1:" + std::to_string(p1),
+                      "127.0.0.1:" + std::to_string(p2), a.addr()});
+    const auto t0 = std::chrono::steady_clock::now();
+    rf.router->refresh();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    ::close(l1);
+    ::close(l2);
+    CHECK(ms < 8000);
+    const auto inst = rf.router->instances();
+    REQUIRE(inst.size() == 3);
+    CHECK_FALSE(inst[0].healthy);
+    CHECK_FALSE(inst[1].healthy);
+    CHECK(inst[2].healthy);
+}
+
+TEST_CASE("router: a model list with invalid UTF-8 does not stop it",
+          "[router]") {
+    // The json parser refuses the reply's ill-formed UTF-8, so the
+    // instance is down; the refresh returns and the router stays up.
+    int port = 0;
+    const int lfd = locus::pipeline::listen_on("127.0.0.1", 0, &port);
+    REQUIRE(lfd >= 0);
+    std::atomic<bool> stop{false};
+    std::jthread th([&] {
+        const std::string body =
+            "{\"object\":\"list\",\"data\":[{\"id\":\"m\xff\","
+            "\"object\":\"model\"}]}";
+        const std::string reply =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Connection: close\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\n\r\n" + body;
+        while (!stop) {
+            const int c = locus::pipeline::accept_one(lfd, nullptr, 200);
+            if (c < 0) continue;
+            char buf[4096];
+            [[maybe_unused]] const ssize_t got = ::read(c, buf, sizeof(buf));
+            [[maybe_unused]] const ssize_t put =
+                ::write(c, reply.data(), reply.size());
+            ::close(c);
+        }
+    });
+    RouterFixture rf({"127.0.0.1:" + std::to_string(port)});
+    rf.router->refresh();
+    const auto inst = rf.router->instances();
+    stop = true;
+    th.join();
+    ::close(lfd);
+    REQUIRE(inst.size() == 1);
+    CHECK_FALSE(inst[0].healthy);
+    CHECK(inst[0].models_json.empty());
+    Client c("127.0.0.1", rf.port);
+    const auto h = c.send(ClientRequest{"GET", "/health", {}, ""});
+    REQUIRE(h.ok);
 }

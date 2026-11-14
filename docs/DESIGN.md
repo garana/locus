@@ -167,7 +167,9 @@ process-wide lock (#268). `http::Client` is the first-party client
 for locus's own upstream calls (the router of #388): a pure response
 parser with the request parser's hardening, a streaming chunk
 decoder, and connect and read deadlines with one kept-alive
-connection, resent once when the server closed it while idle.
+connection, resent once when the server closed it while idle. An
+optional total deadline per request bounds a server that sends a byte
+just under each read deadline.
 `http::LoopConnection` serves HTTP on a caller's own event loop
 (`sys::Poller`) instead of a thread per connection: the loop accepts
 and owns the fd, the connection reads, parses, calls a non-blocking
@@ -193,8 +195,11 @@ SRV lookup). A scan admits any server in the range that answers with
 a `data` list, not only locus, and with `--upstream-auth client` it
 gets the clients' prompts and keys, so scan only a range where
 everyone who can listen is trusted. A host that accepts the connect
-and then sends nothing holds a probe for the 2 s read timeout, so a
-range full of them makes a scan last about 1024 / 64 x 2.3 s = 37 s.
+and then sends nothing holds a probe for the 2 s read timeout (3 s in
+all for one that trickles bytes), so a range full of them makes a scan
+last about 1024 / 64 x 2.3 s = 37 s. Each refresh polls the instances'
+`/v1/models` in parallel, 64 at a time, each poll capped at 8 s in
+all, so a slow instance delays only its own poll.
 `mdns:SERVICE` (for example `mdns:_locus._tcp`) sends one DNS-SD
 browse on every refresh: a PTR question for `SERVICE.local` to
 224.0.0.251:5353 from an ephemeral port, so responders answer by

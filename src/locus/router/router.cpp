@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <set>
 #include <stdexcept>
+#include <system_error>
+#include <thread>
 
 #include "json.hpp"
 #include "locus/auth/helper_spawn.hpp"
@@ -651,6 +653,7 @@ void Router::scan() {
                 http::ClientOptions o;
                 o.connect_timeout_ms = 300;
                 o.read_timeout_ms = 2000;
+                o.total_timeout_ms = 3000;
                 http::Client c(probe.host, probe.port, o);
                 http::ClientRequest req{"GET", "/v1/models", {}, ""};
                 if (const std::string* key = instance_key(probe)) {
@@ -663,9 +666,17 @@ void Router::scan() {
                 }
             }
         };
-        std::vector<std::thread> pool;
+        std::vector<std::jthread> pool;  // joined if one fails to start
         const std::uint32_t threads = std::min<std::uint32_t>(64, sc.count);
-        for (std::uint32_t t = 0; t < threads; ++t) pool.emplace_back(worker);
+        // Fewer threads when one fails to start (a low ulimit -u): the
+        // ones running, and this one, still take every address.
+        try {
+            for (std::uint32_t t = 1; t < threads; ++t) {
+                pool.emplace_back(worker);
+            }
+        } catch (const std::system_error&) {
+        }
+        worker();  // this thread is one of them
         for (auto& t : pool) t.join();
         std::vector<std::pair<std::string, int>> found;
         for (std::uint32_t i = 0; i < sc.count; ++i) {
@@ -687,6 +698,9 @@ void Router::poll(Instance& in) const {
     http::ClientOptions o;
     o.connect_timeout_ms = 2000;
     o.read_timeout_ms = 5000;
+    // A whole poll, so an instance that sends a byte every few seconds
+    // cannot hold its refresh for long.
+    o.total_timeout_ms = 8000;
     http::Client c(in.host, in.port, o);
     // An instance that checks keys needs one for its /v1/models too:
     // the instance's key from instance_keys, in any upstream mode.
@@ -720,7 +734,10 @@ void Router::poll(Instance& in) const {
                 in.models.push_back(m["id"].get<std::string>());
             }
         }
-        in.models_json = j["data"].dump();
+        // Lossy, in case: the parse above already refuses ill-formed
+        // UTF-8, and a strict dump throws on it.
+        in.models_json =
+            j["data"].dump(-1, ' ', false, json::error_handler_t::replace);
     }
 }
 
@@ -744,8 +761,35 @@ void Router::refresh() {
         }
         seen = inst_;
     }
-    for (auto& in : seen) {
-        if (!in.gone) poll(in);
+    // In parallel, 64 at a time: a slow instance delays its own poll,
+    // not the others'. A reply that makes a poll throw marks only that
+    // instance unhealthy.
+    {
+        std::atomic<std::size_t> next{0};
+        const auto worker = [&] {
+            for (std::size_t i; (i = next.fetch_add(1)) < seen.size();) {
+                if (seen[i].gone) continue;
+                try {
+                    poll(seen[i]);
+                } catch (...) {
+                    seen[i].healthy = false;
+                    seen[i].kinds.clear();
+                    seen[i].models.clear();
+                    seen[i].models_json.clear();
+                }
+            }
+        };
+        // jthread: if one fails to start, the others are joined.
+        std::vector<std::jthread> pool;
+        const std::size_t threads = std::min<std::size_t>(64, seen.size());
+        try {  // fewer threads when one fails to start, as in scan()
+            for (std::size_t t = 1; t < threads; ++t) {
+                pool.emplace_back(worker);
+            }
+        } catch (const std::system_error&) {
+        }
+        worker();  // this thread is one of them
+        for (auto& t : pool) t.join();
     }
     // Field by field and by index: inst_ may have grown meanwhile (it
     // only grows), and a name may have dropped one of these since.

@@ -24,6 +24,7 @@ constexpr int kSendFlags = 0;  // SO_NOSIGPIPE is set by connect_to
 
 /** write_all's error when the server stopped taking bytes. */
 constexpr const char* kWriteTimedOut = "write timed out";
+constexpr const char* kTotalTimedOut = "request timed out";
 
 char lower(char c) {
     return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
@@ -331,8 +332,33 @@ void Client::close() {
     active_ = false;
 }
 
+bool Client::expired() const {
+    return opt_.total_timeout_ms > 0 &&
+           std::chrono::steady_clock::now() >= deadline_;
+}
+
+int Client::wait_ms(int ms) const {
+    if (opt_.total_timeout_ms <= 0) return ms > 0 ? ms : -1;
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline_ - std::chrono::steady_clock::now())
+                          .count();
+    if (left <= 0) return 0;
+    const int l = static_cast<int>(std::min<long long>(left, INT32_MAX));
+    return ms > 0 ? std::min(ms, l) : l;
+}
+
+bool Client::total_bound(int ms, int t) const {
+    return opt_.total_timeout_ms > 0 && (ms <= 0 || t < ms);
+}
+
 bool Client::connect(std::string& err) {
-    fd_ = pipeline::connect_to(host_, port_, opt_.connect_timeout_ms);
+    if (expired()) {
+        err = kTotalTimedOut;
+        return false;
+    }
+    // connect_to takes 0 for no limit.
+    const int t = wait_ms(opt_.connect_timeout_ms);
+    fd_ = pipeline::connect_to(host_, port_, t < 0 ? 0 : std::max(t, 1));
     if (fd_ < 0) {
         err = "connect to " + host_ + ":" + std::to_string(port_) +
               " failed";
@@ -371,12 +397,12 @@ bool Client::write_all(std::string_view data, std::string& err) {
         if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             pollfd p{fd_, POLLOUT, 0};
-            const int timeout =
-                opt_.write_timeout_ms > 0 ? opt_.write_timeout_ms : -1;
-            const int r = ::poll(&p, 1, timeout);
+            const int t = wait_ms(opt_.write_timeout_ms);
+            const int r = ::poll(&p, 1, t);
             if (r < 0 && errno == EINTR) continue;
             if (r == 0) {
-                err = kWriteTimedOut;
+                err = total_bound(opt_.write_timeout_ms, t) ? kTotalTimedOut
+                                                            : kWriteTimedOut;
                 return false;
             }
             if (r < 0) {
@@ -396,13 +422,21 @@ bool Client::write_all(std::string_view data, std::string& err) {
 
 long Client::read_some(std::string& err) {
     for (;;) {
+        // Checked before the poll too: a server that trickles bytes
+        // keeps the poll ready, and must still stop at the total.
+        if (expired()) {
+            err = kTotalTimedOut;
+            return -1;
+        }
         pollfd p{fd_, POLLIN, 0};
-        const int timeout =
-            opt_.read_timeout_ms > 0 ? opt_.read_timeout_ms : -1;
-        const int r = ::poll(&p, 1, timeout);
+        const int t = wait_ms(opt_.read_timeout_ms);
+        const int r = ::poll(&p, 1, t);
         if (r < 0 && errno == EINTR) continue;
         if (r == 0) {
-            err = "read timed out";
+            // By which limit: poll may wake a little early, so the
+            // clock alone cannot tell.
+            err = total_bound(opt_.read_timeout_ms, t) ? kTotalTimedOut
+                                                       : "read timed out";
             return -1;
         }
         if (r < 0) {
@@ -507,6 +541,10 @@ ClientResponse Client::begin(const ClientRequest& req) {
     // read), the request is sent once more on a new connection, unless
     // it is not idempotent and the write went through.
     if (fd_ >= 0 && stale()) close();
+    if (opt_.total_timeout_ms > 0) {
+        deadline_ = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(opt_.total_timeout_ms);
+    }
     for (int attempt = 0;; ++attempt) {
         const bool reused = fd_ >= 0;
         if (!reused) {
