@@ -351,7 +351,11 @@ calling. Reliable agent use therefore needs a capable instruct model.
   (`--auth-helper-arg`), which every local user can read in `ps`; it
   names each key's caller `user:N`, N the key's place among the
   distinct keys of that list, so add new keys at the end (removing or
-  reordering one renumbers the callers after it).
+  reordering one renumbers the callers after it). A helper (this one,
+  or `--prefix-cache-helper`'s) must be a binary or a script that
+  starts with `#!`: it is found on PATH (`/usr/bin:/bin` when PATH is
+  unset) and started with `execv`, which runs no shell for a script
+  without one.
 - Tool execution: locus only expresses tool calls; it never runs them.
   Running them is the client's job (locus is a model runner, not an
   MCP host).
