@@ -186,10 +186,11 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 
 ### Pending
 
-- Multimedia (#143): speech on the M2 Pro takes 1.9x the audio's
-  length, its generation 1.23x llama.cpp Metal's time on the same
-  weights (#784; the M4 Max generates faster than real time: 139
-  audio tokens/s, where real time needs about 82); a comparison
+- Multimedia (#143): on the M2 Pro a speech request takes 1.9x as
+  long as the audio it makes, and its token generation is 1.23x
+  slower than llama.cpp Metal's on the same weights (#784); the M4
+  Max generates faster than real time (139 audio tokens/s, where real
+  time needs about 82); a comparison
   with other speech, image and video tools (#245).
 - Performance: prefill on Apple GPUs at 44% of Metal's (#10:
   MoltenVK exposes no cooperative matrix, so a Metal matmul is being
