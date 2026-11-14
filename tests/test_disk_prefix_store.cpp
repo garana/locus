@@ -419,8 +419,13 @@ TEST_CASE("DiskPrefixStore resolves a symlinked directory once",
     // DIR given as a symlink: the store uses the real directory, so
     // repointing the link after startup does not move its files.
     DirGuard g{temp_dir("locus-dps-dirlink")};
-    fs::create_directories(g.dir / "real");
-    fs::create_directories(g.dir / "other");
+    // 0700, as a deployment would make them: the runner's umask (0002
+    // on Ubuntu) could leave them group-writable, which the store refuses.
+    for (const char* d : {"real", "other"}) {
+        fs::create_directories(g.dir / d);
+        fs::permissions(g.dir / d, fs::perms::owner_all,
+                        fs::perm_options::replace);
+    }
     const fs::path link = g.dir / "link";
     fs::create_symlink(g.dir / "real", link);
     DiskPrefixStore s(link, key(), kBlockBytes, 1 << 20);
@@ -437,6 +442,8 @@ TEST_CASE("DiskPrefixStore removes a crash's temporary files on open",
           "[disk_prefix]") {
     DirGuard g{temp_dir("locus-dps-tmp")};
     fs::create_directories(g.dir);
+    fs::permissions(g.dir, fs::perms::owner_all,
+                    fs::perm_options::replace);  // whatever the umask
     const fs::path tmp = g.dir / "0123456789abcdef.lkv.tmp";
     const fs::path other = g.dir / "notes.txt";
     std::ofstream(tmp) << "half a file";
