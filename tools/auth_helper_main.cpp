@@ -6,12 +6,14 @@
 // (type "request") are read and ignored. The allow-list is the
 // comma-separated LOCUS_AUTH_TOKENS env var, then any argv tokens
 // (which every local user can read in ps, so they draw a warning). A
-// token's identity is "user:N", N its 1-based place in that list, so
-// the identity locus logs and passes on never holds the secret.
+// token's identity is "user:N", N its 1-based place among the list's
+// distinct tokens, so the identity locus logs and passes on never holds
+// the secret.
 //
 // REFERENCE ONLY: operators replace this with real validation (an
 // API-key DB, JWT check, OIDC introspection, ...). It is deliberately
-// tiny and dependency-free beyond the shared codec.
+// tiny and dependency-free beyond the shared codec; its key lookup is a
+// map find, not a constant-time compare.
 #include <unistd.h>
 
 #include <chrono>

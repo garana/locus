@@ -349,7 +349,9 @@ calling. Reliable agent use therefore needs a capable instruct model.
   require keys today. Give the reference helper its keys in
   `LOCUS_AUTH_TOKENS` (comma-separated), not as arguments
   (`--auth-helper-arg`), which every local user can read in `ps`; it
-  names each key's caller `user:N`, N the key's place in that list.
+  names each key's caller `user:N`, N the key's place among the
+  distinct keys of that list, so add new keys at the end (removing or
+  reordering one renumbers the callers after it).
 - Tool execution: locus only expresses tool calls; it never runs them.
   Running them is the client's job (locus is a model runner, not an
   MCP host).
