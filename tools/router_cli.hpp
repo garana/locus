@@ -48,6 +48,9 @@ inline constexpr const char* kRouterUsage =
     "                      1800; 0 = none)\n"
     "  --text-timeout S    the same for every other request (default\n"
     "                      1800; 0 = none)\n"
+    "  --max-conns-per-ip N  open connections one client address may\n"
+    "                      hold; past it a new one is closed (default 0:\n"
+    "                      no cap)\n"
     "  --auth-helper PATH  check client keys with this auth helper\n"
     "                      (locus-auth-helper is a reference one): every\n"
     "                      request but /health needs a key it allows\n"
@@ -106,6 +109,12 @@ inline std::string parse_router_args(int argc, char** argv, int first,
                 return std::string("bad --text-timeout: ") + argv[i];
             }
             cfg.text_read_timeout_ms = n * 1000;
+        } else if (a == "--max-conns-per-ip" && i + 1 < argc) {
+            int n = 0;
+            if (!parse_nonneg_int(argv[++i], n)) {
+                return std::string("bad --max-conns-per-ip: ") + argv[i];
+            }
+            cfg.max_conns_per_ip = static_cast<std::size_t>(n);
         } else if (a == "--auth-helper" && i + 1 < argc) {
             helper = argv[++i];
         } else if (a == "--auth-helper-arg" && i + 1 < argc) {

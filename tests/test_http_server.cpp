@@ -798,6 +798,36 @@ TEST_CASE("http server: a fast-path head cut short does not stall the "
 // i#837: an inline fast-path response used only the per-wait write
 // deadline, so a client that never reads a large one held the acceptor
 // for that whole deadline (and longer, a few bytes at a time).
+// i#625 F21: with a per-address cap, one client address cannot hold
+// every worker; a connection past the cap is closed at accept, and a
+// closed one gives its slot back.
+TEST_CASE("http server: a per-address cap closes connections past it",
+          "[http_server]") {
+    ServerConfig cfg;
+    cfg.worker_threads = 4;
+    cfg.max_conns_per_ip = 2;
+    cfg.head_deadline_ms = 5000;
+    Fixture f(echo_handler, cfg);
+    const int a = client_connect(f.port);
+    const int b = client_connect(f.port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // The third, from the same address, is closed without a reply.
+    const int c = client_connect(f.port);
+    send_all(c, "GET /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    CHECK(drain(c, 2000).empty());
+    ::close(c);
+    // One of the two leaves: its slot comes back.
+    ::close(a);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const int d = client_connect(f.port);
+    send_all(d, "GET /y HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    const std::string r = drain(d, 2000);
+    ::close(d);
+    ::close(b);
+    REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
+    REQUIRE(r.find("GET /y") != std::string::npos);
+}
+
 TEST_CASE("http server: a slow reader of a fast-path reply does not hold "
           "the acceptor", "[http_server]") {
     ServerConfig cfg;

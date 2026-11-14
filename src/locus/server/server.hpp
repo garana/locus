@@ -173,6 +173,9 @@ class OpenAiServer {
          * the default). auth_helpers helper processes are spawned. */
         std::vector<std::string> auth_helper_argv;
         std::size_t auth_helpers = 1;
+        /** Open connections one client address may hold (i#625 F21;
+         *  http::ServerConfig::max_conns_per_ip). 0 = no cap. */
+        std::size_t max_conns_per_ip = 0;
         auth::AuthConfig auth_cache;
         /** Prompt caching (KV prefix reuse) -- on by default. A
          * request sharing a block-aligned prompt prefix with a recent
