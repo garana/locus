@@ -190,6 +190,10 @@ int main(int argc, char** argv) {
                          logits_listen.c_str());
             return 1;
         }
+        if (!locus::pipeline::attach_allow_filter(le, allow)) {
+            std::fprintf(stderr, "--allow applies at accept only (the "
+                                 "kernel refused the filter)\n");
+        }
         if (ids.empty()) {
             std::fprintf(stderr, "the prompt encodes to no tokens\n");
             return 2;

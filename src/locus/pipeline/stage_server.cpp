@@ -48,6 +48,16 @@ bool is_numeric_ip(const std::string& host) {
            ::inet_pton(AF_INET6, host.c_str(), &a6) == 1;
 }
 
+// i#851: puts `allow` in the kernel on a listening socket, at start and
+// on each reload; the check at accept stays. Logs when it cannot.
+void kernel_allow(int fd, const std::vector<Cidr>& allow) {
+    if (fd >= 0 && !attach_allow_filter(fd, allow)) {
+        std::fprintf(stderr,
+                     "serve_stage: --allow applies at accept only (the "
+                     "kernel refused the filter)\n");
+    }
+}
+
 // Accepts one allowed input connection on listen_fd, logging (and
 // dropping) peers outside `allow`, and, when `key` is not empty
 // (blocking mode only), peers that fail the handshake. @returns the
@@ -408,6 +418,7 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
         poller.add(reload.wake_fd);
     }
     std::vector<sys::Poller::Event> events;
+    kernel_allow(listen_fd, allow_live);
 
     for (;;) {
         // Wait for the next peer. A SIGHUP handler sets reload.flag and
@@ -423,6 +434,7 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
                 *reload.flag = 0;  // clear first: a signal during apply
                                    // re-fires and is caught next loop
                 reload.apply(allow_live, pool_live, conn_live);
+                kernel_allow(listen_fd, allow_live);
             }
             const int pr = poller.wait(events, -1);
             if (pr < 0) {
@@ -1221,6 +1233,8 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         set_nonblocking(metrics_fd);
         poller.add(metrics_fd);
     }
+    kernel_allow(listen_fd, allow_live);  // --allow covers metrics too
+    kernel_allow(metrics_fd, allow_live);
 
     bool result = true;
     std::vector<sys::Poller::Event> events;
@@ -1613,6 +1627,8 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             *reload.flag = 0;
             const std::string old_key = conn_live.key;
             reload.apply(allow_live, pool_live, conn_live);
+            kernel_allow(listen_fd, allow_live);
+            kernel_allow(metrics_fd, allow_live);
             if (conn_live.key != old_key) {
                 // The idle downstreams passed under the old key; new
                 // sessions would never take them (pool_tag), so close

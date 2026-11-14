@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <optional>
 #include <thread>
@@ -324,6 +325,13 @@ int Server::start() {
         return -1;
     }
     make_nonblocking(listen_fd_);
+    // i#851: refused peers' SYNs are dropped in the kernel; the check at
+    // accept stays as the second layer.
+    if (!locus::pipeline::attach_allow_filter(listen_fd_, cfg_.allow)) {
+        std::fprintf(stderr,
+                     "http server: --allow is not in the kernel (filter "
+                     "refused); it applies at accept\n");
+    }
     // Re-issue listen() to set our backlog (listen_on uses a small fixed
     // one): connections beyond the worker pool queue here, and beyond the
     // backlog the kernel refuses them -- no userspace buffer, no 503.

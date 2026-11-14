@@ -43,6 +43,21 @@ bool ip_allowed(const std::string& ip, const std::vector<Cidr>& allow);
 bool is_loopback_host(const std::string& host);
 
 /**
+ * Applies `allow` in the kernel too (i#851): on Linux, attaches a
+ * classic BPF socket filter to the listening socket `fd` that drops
+ * every packet whose source address no range in `allow` holds, so a
+ * refused peer's SYN never makes a connection. Accepted sockets inherit
+ * it. An IPv4 packet is matched against the IPv4 ranges and an IPv6 one
+ * against the IPv6 ranges, as ip_allowed matches accept_one's address.
+ * Calling it again replaces the filter (a reload); an empty `allow`
+ * removes it. Elsewhere it does nothing. The userspace check stays.
+ *
+ * @returns false when the filter was not attached (too many ranges,
+ *     or the kernel refused it); only the userspace check applies then.
+ */
+bool attach_allow_filter(int fd, const std::vector<Cidr>& allow);
+
+/**
  * Splits a "host:port" endpoint string (as a CLI takes) into its parts.
  * Accepts a bracketed IPv6 literal ("[::1]:8000", brackets stripped),
  * "host:port", and ":port" (empty host == wildcard, for a bind). A bare
