@@ -10,6 +10,7 @@
 
 #include "json.hpp"
 #include "locus/auth/helper_spawn.hpp"
+#include "locus/http/json_body.hpp"
 #include "locus/pipeline/net.hpp"
 
 namespace locus::router {
@@ -104,7 +105,7 @@ std::string content_text(const json& c) {
 
 std::string session_key(std::string_view header, std::string_view body) {
     if (!header.empty()) return "h:" + std::string(header);
-    const json j = json::parse(body, nullptr, /*allow_exceptions=*/false);
+    const json j = http::parse_json_or_discarded(body);
     if (!j.is_object()) return "";
     if (const auto k = j.find("prompt_cache_key");
         k != j.end() && k->is_string() && !k->get<std::string>().empty()) {
@@ -250,7 +251,7 @@ std::optional<Route> classify(std::string_view path, std::string_view body) {
     Route r;
     json j;
     if (!body.empty()) {
-        j = json::parse(body, nullptr, /*allow_exceptions=*/false);
+        j = http::parse_json_or_discarded(body);
         if (j.is_object()) {
             if (const auto m = j.find("model");
                 m != j.end() && m->is_string()) {
@@ -657,7 +658,7 @@ void Router::scan() {
                 }
                 const auto r = c.send(req);
                 if (r.ok && r.head.status == 200) {
-                    const json j = json::parse(r.body, nullptr, false);
+                    const json j = http::parse_json_or_discarded(r.body);
                     hit[i] = j.is_object() && j.contains("data");
                 }
             }
@@ -695,7 +696,7 @@ void Router::poll(Instance& in) const {
     }
     const auto r = c.send(poll);
     const json j = r.ok && r.head.status == 200
-                       ? json::parse(r.body, nullptr, false)
+                       ? http::parse_json_or_discarded(r.body)
                        : json();
     in.healthy = j.is_object() && j.contains("data");
     in.kinds.clear();
@@ -857,7 +858,7 @@ void Router::models(http::ServerResponse& res) const {
         for (const auto& in : inst_) {
             if (!in.healthy) continue;
             for (const Kind k : in.kinds) kinds.insert(static_cast<int>(k));
-            const json d = json::parse(in.models_json, nullptr, false);
+            const json d = http::parse_json_or_discarded(in.models_json);
             if (!d.is_array()) continue;
             for (const auto& m : d) {
                 if (m.is_object() && m.contains("id") && m["id"].is_string() &&
@@ -974,7 +975,7 @@ void Router::registration(const http::Request& req,
         return;
     }
     const bool remove = req.path == "/locus/deregister";
-    const json body = json::parse(req.body, nullptr, false);
+    const json body = http::parse_json_or_discarded(req.body);
     Instance want;
     if (!body.is_object() || !body.contains("address") ||
         !body["address"].is_string() ||
@@ -1261,7 +1262,7 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
         if (rt.kind == Kind::kVideo &&
             content_type.find("json") != std::string::npos) {
             // A job: give it the router's id, which names this instance.
-            json j = json::parse(body, nullptr, /*allow_exceptions=*/false);
+            json j = http::parse_json_or_discarded(body);
             if (j.is_object() && j.contains("id") && j["id"].is_string()) {
                 std::lock_guard lk(mu_);
                 j["id"] = router_video_id(
