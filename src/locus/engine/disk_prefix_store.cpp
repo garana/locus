@@ -10,7 +10,11 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <optional>
 #include <tuple>
+#include <utility>
+
+#include "locus/sys/sha256.hpp"
 
 namespace locus::engine {
 
@@ -236,6 +240,9 @@ std::vector<std::uint8_t> DiskPrefixStore::header(
     put(h, key_.overrides);
     put(h, static_cast<std::uint32_t>(key_.device_attention));
     put(h, static_cast<std::uint32_t>(key_.experts_on_gpu));
+    // Keyed files end with a tag: a keyed store never reads an
+    // unkeyed file, nor the other way (the seed names them apart).
+    put(h, static_cast<std::uint32_t>(keyed() ? 1 : 0));
     put(h, key_.block_tokens);
     put(h, key_.kv_dim);
     put(h, key_.n_layers);
@@ -252,9 +259,26 @@ std::vector<std::uint8_t> DiskPrefixStore::header(
 
 std::uint64_t DiskPrefixStore::file_bytes(std::size_t header_bytes,
                                           std::uint32_t n_blocks) const {
-    // header, one checksum per block, the header checksum, the blocks
+    // header, one checksum per block, the header checksum, the blocks,
+    // and the tag when keyed
     return header_bytes + 8ull * n_blocks + 8 +
-           static_cast<std::uint64_t>(block_bytes_) * n_blocks;
+           static_cast<std::uint64_t>(block_bytes_) * n_blocks +
+           (keyed() ? kTagBytes : 0);
+}
+
+void DiskPrefixStore::seal(std::uint8_t* blob, std::size_t bytes) const {
+    if (!keyed()) return;
+    sys::HmacSha256 mac(mac_key_);
+    mac.update(blob, bytes - kTagBytes);
+    const sys::Sha256Digest t = mac.finish();
+    std::memcpy(blob + bytes - kTagBytes, t.data(), kTagBytes);
+}
+
+void DiskPrefixStore::set_mac_key(std::string key) {
+    std::lock_guard lock(mu_);
+    mac_key_ = std::move(key);
+    const std::vector<std::uint8_t> k = header({}, 0);
+    key_seed_ = checksum(k.data(), k.size());
 }
 
 std::vector<std::uint8_t> DiskPrefixStore::meta(
@@ -279,6 +303,16 @@ bool DiskPrefixStore::decode(std::span<const std::uint8_t> blob,
     const std::vector<std::uint8_t> want = header(prompt, n_blocks);
     if (blob.size() != file_bytes(want.size(), n_blocks)) {
         return false;
+    }
+    if (keyed()) {  // the tag first: nothing unsigned is looked at
+        sys::HmacSha256 mac(mac_key_);
+        mac.update(blob.data(), blob.size() - kTagBytes);
+        sys::Sha256Digest got{};
+        std::memcpy(got.data(), blob.data() + blob.size() - kTagBytes,
+                    kTagBytes);
+        if (!sys::digest_equal(mac.finish(), got)) {
+            return false;
+        }
     }
     const std::size_t meta = want.size() + 8ull * n_blocks + 8;
     std::uint64_t hsum;
@@ -443,6 +477,13 @@ bool DiskPrefixStore::read(std::span<const tok::TokenId> prompt,
         hsum != checksum(got.data(), meta - 8)) {
         return mismatch();
     }
+    // Keyed: the tag covers every byte before it, fed as it is read; a
+    // file that fails it is a miss, and dst is then unspecified.
+    std::optional<sys::HmacSha256> mac;
+    if (keyed()) {
+        mac.emplace(mac_key_);
+        mac->update(got.data(), got.size());
+    }
     off_t off = static_cast<off_t>(meta);
     for (std::uint32_t i = 0; i < n_blocks; ++i) {
         std::uint64_t sum;
@@ -453,7 +494,17 @@ bool DiskPrefixStore::read(std::span<const tok::TokenId> prompt,
         if (checksum(dst[i], block_bytes_) != sum) {
             return mismatch();
         }
+        if (mac) mac->update(dst[i], block_bytes_);
         off += static_cast<off_t>(block_bytes_);
+    }
+    if (mac) {
+        sys::Sha256Digest tag{};
+        if (!pread_full(f.fd, tag.data(), kTagBytes, off)) {
+            return false;
+        }
+        if (!sys::digest_equal(mac->finish(), tag)) {
+            return mismatch();
+        }
     }
     {
         std::lock_guard lock(mu_);
@@ -478,7 +529,8 @@ bool DiskPrefixStore::write(std::span<const tok::TokenId> prompt,
     const std::vector<std::uint8_t> meta =
         this->meta(prompt, n_blocks, src);
     const std::uint64_t bytes =
-        meta.size() + static_cast<std::uint64_t>(block_bytes_) * n_blocks;
+        meta.size() + static_cast<std::uint64_t>(block_bytes_) * n_blocks +
+        (keyed() ? kTagBytes : 0);
     if (bytes > cap_bytes_) {
         return false;
     }
@@ -509,10 +561,20 @@ bool DiskPrefixStore::write(std::span<const tok::TokenId> prompt,
                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                     0600)};
         ok = f.fd >= 0 && pwrite_full(f.fd, meta.data(), meta.size(), 0);
+        std::optional<sys::HmacSha256> mac;
+        if (keyed()) {
+            mac.emplace(mac_key_);
+            mac->update(meta.data(), meta.size());
+        }
         off_t off = static_cast<off_t>(meta.size());
         for (std::uint32_t i = 0; ok && i < n_blocks; ++i) {
             ok = pwrite_full(f.fd, src[i], block_bytes_, off);
+            if (mac) mac->update(src[i], block_bytes_);
             off += static_cast<off_t>(block_bytes_);
+        }
+        if (ok && mac) {  // the tag of every byte before it, last
+            const sys::Sha256Digest tag = mac->finish();
+            ok = pwrite_full(f.fd, tag.data(), kTagBytes, off);
         }
         if (f.fd >= 0) {
             ok = ::close(f.fd) == 0 && ok;
