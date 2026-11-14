@@ -1721,3 +1721,70 @@ TEST_CASE("serve_stage_mux serves /metrics while a session runs",
     ::close(a.from_stage);
     ::close(lm);  // the caller's listener
 }
+
+// i#625 F15: the /metrics page lists every peer's address, so --allow
+// covers its port too. The metrics socket listens dual-stack with only
+// 127.0.0.0/8 allowed: a scrape from 127.0.0.1 gets the page, one from
+// ::1 is closed unanswered.
+TEST_CASE("serve_stage_mux applies --allow to the metrics port",
+          "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+    int pm = 0;
+    const int lm = locus::pipeline::listen_on("", 0, &pm);  // dual-stack
+    REQUIRE(lm >= 0);
+
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;
+    conn.serve_sessions = 1;
+    conn.metrics_fd = lm;
+    std::jthread server([&] {
+        locus::pipeline::serve_stage_mux(stage, ls, allow,
+                                         {{"127.0.0.1", pc}}, conn);
+    });
+
+    REQUIRE(http_get(pm, "/metrics").rfind("HTTP/1.1 200", 0) == 0);
+    const int v6 = locus::pipeline::connect_to("::1", pm);
+    if (v6 >= 0) {  // a host without IPv6 loopback skips this half
+        const std::string req =
+            "GET /metrics HTTP/1.1\r\nHost: stage\r\n"
+            "Connection: close\r\n\r\n";
+        ::send(v6, req.data(), req.size(), MSG_NOSIGNAL);
+        char buf[256];
+        REQUIRE(::recv(v6, buf, sizeof(buf), 0) <= 0);  // closed, no page
+        ::close(v6);
+    } else {
+        WARN("no IPv6 loopback: the refused half did not run");
+    }
+
+    // One session ends the server (serve_sessions = 1).
+    Client a;
+    a.request_id = 11;
+    a.to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(a.to_stage >= 0);
+    a.from_stage = locus::pipeline::accept_one(lc, nullptr);
+    REQUIRE(a.from_stage >= 0);
+    ::close(lc);
+    for (const auto t : tok.encode("Once", true)) {
+        a.round_trip(t);
+    }
+    REQUIRE(a.ok);
+    ::close(a.to_stage);
+    server.join();
+    ::close(a.from_stage);
+    ::close(lm);
+}
