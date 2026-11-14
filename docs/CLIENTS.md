@@ -346,7 +346,10 @@ calling. Reliable agent use therefore needs a capable instruct model.
   the `locus-server` binary does not expose it yet. `locus-router`
   does: `--auth-helper PATH` checks every request but `/health`, so a
   router in front of instances on a private network is the way to
-  require keys today.
+  require keys today. Give the reference helper its keys in
+  `LOCUS_AUTH_TOKENS` (comma-separated), not as arguments
+  (`--auth-helper-arg`), which every local user can read in `ps`; it
+  names each key's caller `user:N`, N the key's place in that list.
 - Tool execution: locus only expresses tool calls; it never runs them.
   Running them is the client's job (locus is a model runner, not an
   MCP host).

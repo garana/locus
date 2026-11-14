@@ -3,8 +3,11 @@
 // Speaks the framed text protocol on stdin/stdout: for each `auth`
 // request it answers ok=1 + identity + not_after when the credential
 // is in its allow-list, else ok=0. Request-lifecycle event pushes
-// (type "request") are read and ignored. The allow-list is the union
-// of argv tokens and the comma-separated LOCUS_AUTH_TOKENS env var.
+// (type "request") are read and ignored. The allow-list is the
+// comma-separated LOCUS_AUTH_TOKENS env var, then any argv tokens
+// (which every local user can read in ps, so they draw a warning). A
+// token's identity is "user:N", N its 1-based place in that list, so
+// the identity locus logs and passes on never holds the secret.
 //
 // REFERENCE ONLY: operators replace this with real validation (an
 // API-key DB, JWT check, OIDC introspection, ...). It is deliberately
@@ -12,9 +15,10 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <set>
+#include <map>
 #include <string>
 
 #include "locus/auth/helper_message.hpp"
@@ -47,25 +51,34 @@ void write_all(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::set<std::string> allowed;
-    for (int i = 1; i < argc; ++i) {
-        allowed.insert(argv[i]);
-    }
+    // Token -> its identity number, in first-seen order.
+    std::map<std::string, std::size_t> allowed;
+    const auto add = [&](const std::string& tok) {
+        if (!tok.empty() && allowed.count(tok) == 0) {
+            const std::size_t n = allowed.size() + 1;
+            allowed.emplace(tok, n);
+        }
+    };
     if (const char* env = std::getenv("LOCUS_AUTH_TOKENS")) {
-        std::string s(env), tok;
-        for (char c : s) {
-            if (c == ',') {
-                if (!tok.empty()) {
-                    allowed.insert(tok);
-                }
+        std::string tok;
+        for (const char* c = env; *c != '\0'; ++c) {
+            if (*c == ',') {
+                add(tok);
                 tok.clear();
             } else {
-                tok.push_back(c);
+                tok.push_back(*c);
             }
         }
-        if (!tok.empty()) {
-            allowed.insert(tok);
-        }
+        add(tok);
+    }
+    if (argc > 1) {
+        std::fprintf(stderr,
+                     "locus-auth-helper: tokens given as arguments are "
+                     "visible to every local user (ps); pass them in "
+                     "LOCUS_AUTH_TOKENS instead\n");
+    }
+    for (int i = 1; i < argc; ++i) {
+        add(argv[i]);
     }
 
     std::string buf;
@@ -86,9 +99,11 @@ int main(int argc, char** argv) {
                 HelperMessage r;
                 r.req_id = m.req_id;
                 r.type = "auth";
-                if (cred != nullptr && allowed.count(*cred) != 0) {
+                const auto it =
+                    cred != nullptr ? allowed.find(*cred) : allowed.end();
+                if (it != allowed.end()) {
                     r.set("ok", "1");
-                    r.set("identity", "user:" + *cred);
+                    r.set("identity", "user:" + std::to_string(it->second));
                     r.set("not_after",
                           std::to_string(now_ns() + 60'000'000'000));
                 } else {
