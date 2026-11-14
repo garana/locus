@@ -200,6 +200,30 @@ std::vector<MropePos> mrope_positions(std::uint32_t n_before,
                                       std::uint32_t n_after);
 
 /**
+ * MoE experts that other hosts compute (expert parallelism, #781).
+ * For each token, moe_ffn starts every remote pick before it computes
+ * the local ones, then takes the replies in start order and adds all
+ * picks in pick order, so the output is one host's bits when the
+ * remote d equals TransformerModel::expert_out's.
+ */
+class RemoteExperts {
+  public:
+    virtual ~RemoteExperts() = default;
+    /** @returns Whether expert `e` of `layer` runs on another host. */
+    virtual bool remote(std::uint32_t layer, std::uint32_t e) const = 0;
+    /** Starts expert `e` of `layer` on `xb` (n_embd floats). */
+    virtual void start(std::uint32_t layer, std::uint32_t e,
+                       std::span<const float> xb) = 0;
+    /**
+     * Waits for the oldest started call and writes its d (n_embd
+     * floats).
+     *
+     * @throws std::runtime_error when the reply cannot be had.
+     */
+    virtual void finish(std::span<float> d) = 0;
+};
+
+/**
  * Llama-family runtime over the scalar CPU backend, reading and
  * writing KV state through the paged cache so any number of
  * sequences can interleave (DESIGN.md M2/M3). Weights stay in the
@@ -339,6 +363,15 @@ class TransformerModel {
     void expert_out(std::uint32_t layer, std::uint32_t expert,
                     std::span<const float> xb, std::span<float> d,
                     Workspace& ws) const;
+
+    /**
+     * Sends the experts `r` names to other hosts in the per-token CPU
+     * forward (moe_ffn); null computes them all here. Not owned; it
+     * must outlive the forwards that use it. The batched forward and
+     * the GPU forwards still compute every expert here (each host maps
+     * the whole file, so the result is the same).
+     */
+    void set_remote_experts(RemoteExperts* r) { remote_experts_ = r; }
 
     /** @returns Paged-cache layers: the loaded slice, or the arch's
      * own count (ArchSpec::cache_layers). */
@@ -870,6 +903,8 @@ class TransformerModel {
      * range are default-constructed and never accessed. */
     std::uint32_t layer_begin_ = 0;
     std::uint32_t layer_end_ = 0;
+    /** set_remote_experts: experts other hosts compute, or null. */
+    RemoteExperts* remote_experts_ = nullptr;
 };
 
 /** @returns The index of the largest logit (greedy sampling). */

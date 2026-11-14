@@ -23,6 +23,7 @@
 #include "locus/model/expert_metrics.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/model/transformer.hpp"
+#include "locus/pipeline/expert_client.hpp"
 #include "locus/pipeline/expert_server.hpp"
 #include "locus/pipeline/message.hpp"
 #include "gguf_builder.hpp"
@@ -1676,4 +1677,59 @@ TEST_CASE("an expert server answers each call with expert_out's bits",
     server.join();
     ::close(sv[0]);
     REQUIRE(served == 3);
+}
+
+TEST_CASE("a forward with remote experts is one process's bits",
+          "[moe][pipeline]") {
+    // Experts 2 and 3 run on a loopback expert server over a second
+    // load of the same image; the owner combines all picks in pick
+    // order, so its logits equal a plain forward's bit for bit. This
+    // pins moe_ffn == the weighted sum of its picks' expert_out, with
+    // and without a shared expert.
+    ModelBuilder plain;
+    plain.common();
+    plain.tensor("blk.0.ffn_gate_inp.weight", {kE, 4},
+                 weights(kE * 4, 13));
+    plain.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, 4},
+                 weights(kE * kF * 4, 14));
+    plain.tensor("blk.0.ffn_up_exps.weight", {kE, kF, 4},
+                 weights(kE * kF * 4, 15));
+    plain.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
+                 weights(kF * kE * 4, 16));
+    const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 5, 2};
+    for (const auto& img :
+         {plain.build(4, 2), qwen_image(+8.0f, /*zero_shared=*/false)}) {
+        const auto want = run(img, toks);
+
+        auto g_srv = locus::gguf::GgufFile::parse(img);
+        auto server_model = TransformerModel::load(g_srv);
+        auto g = locus::gguf::GgufFile::parse(img);
+        auto model = TransformerModel::load(g);
+        int sv[2];
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        std::thread server([&] {
+            locus::pipeline::serve_expert_calls(server_model, sv[1], 2, 4);
+            ::close(sv[1]);
+        });
+        locus::pipeline::ExpertClient client({{2, 4, sv[0]}},
+                                             model.hparams().n_embd);
+        model.set_remote_experts(&client);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> got(model.hparams().n_vocab);
+        for (auto t : toks) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(t, cache, seq, ws, got);
+        }
+        cache.release(seq);
+        model.set_remote_experts(nullptr);
+        ::close(sv[0]);  // the server sees EOF and returns
+        server.join();
+        INFO("remote calls " << client.calls());
+        REQUIRE(client.calls() > 0);  // the remote path ran
+        REQUIRE(got.size() == want.size());
+        REQUIRE(std::memcmp(got.data(), want.data(),
+                            got.size() * sizeof(float)) == 0);
+    }
 }

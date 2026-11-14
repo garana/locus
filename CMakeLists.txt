@@ -103,6 +103,7 @@ add_library(locus
     src/locus/model/sampling.cpp
     src/locus/model/speculative.cpp
     src/locus/pipeline/driver.cpp
+    src/locus/pipeline/expert_client.cpp
     src/locus/pipeline/expert_server.cpp
     src/locus/pipeline/message.cpp
     src/locus/pipeline/mdns.cpp

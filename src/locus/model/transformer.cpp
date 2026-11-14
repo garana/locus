@@ -2488,11 +2488,31 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
             }
         });
     }
+    // Expert parallelism (#781): which picks another host computes.
+    RemoteExperts* const rx = remote_experts_;
+    std::vector<char> is_remote(picked.size(), 0);
+    bool any_remote = false;
+    if (rx != nullptr) {
+        for (std::size_t i = 0; i < picked.size(); ++i) {
+            is_remote[i] = rx->remote(layer, picked[i].first) ? 1 : 0;
+            any_remote = any_remote || is_remote[i] != 0;
+        }
+    }
+    // Start them first, so their hosts work while this one computes.
+    for (std::size_t i = 0; i < picked.size(); ++i) {
+        if (is_remote[i] != 0) {
+            rx->start(layer, picked[i].first, ws.xb);
+        }
+    }
     // R8 expert readahead: overlap the SSD reads of every routed
     // expert before the sequential per-expert matmuls fault them
-    // in one by one.
+    // in one by one (not the remote ones: this host never reads them).
     if (readahead_enabled()) {
-        for (const auto& [e, wgt] : picked) {
+        for (std::size_t i = 0; i < picked.size(); ++i) {
+            if (is_remote[i] != 0) {
+                continue;
+            }
+            const std::uint32_t e = picked[i].first;
             if (advise_weights_) {
                 sys::advise_willneed(lay.gate_exps.expert(e).data,
                                      lay.gate_exps.expert_bytes);
@@ -2519,10 +2539,37 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
             ws.moe_acc[i] += wgt * ws.xb2[i];
         }
     };
-    for (const auto& [e, wgt] : picked) {
-        swiglu_into_acc(lay.gate_exps.expert(e),
-                        lay.up_exps.expert(e),
-                        lay.down_exps.expert(e), n_ff, wgt);
+    if (!any_remote) {
+        for (const auto& [e, wgt] : picked) {
+            swiglu_into_acc(lay.gate_exps.expert(e),
+                            lay.up_exps.expert(e),
+                            lay.down_exps.expert(e), n_ff, wgt);
+        }
+    } else {
+        // Each pick's d, local ones computed while the remote ones run,
+        // then the remote replies in start order; then the weighted
+        // adds in pick order, the adds the loop above makes.
+        std::vector<std::vector<float>> d(picked.size(),
+                                          std::vector<float>(hp_.n_embd));
+        for (std::size_t p = 0; p < picked.size(); ++p) {
+            if (is_remote[p] == 0) {
+                const std::uint32_t e = picked[p].first;
+                swiglu_expert(op, lay.gate_exps.expert(e),
+                              lay.up_exps.expert(e), lay.down_exps.expert(e),
+                              n_ff, ws.xb, ws.gate, ws.up, d[p]);
+            }
+        }
+        for (std::size_t p = 0; p < picked.size(); ++p) {
+            if (is_remote[p] != 0) {
+                rx->finish(d[p]);
+            }
+        }
+        for (std::size_t p = 0; p < picked.size(); ++p) {
+            const float wgt = picked[p].second;
+            for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
+                ws.moe_acc[i] += wgt * d[p][i];
+            }
+        }
     }
     // Weight window (opt-in): drop this layer's routed experts
     // right after use. Routing rarely repeats an expert on the
