@@ -1,12 +1,17 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <utility>
 
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "catch_amalgamated.hpp"
 #include "backend_cli.hpp"
+#include "locus/backend/variants.hpp"
 
 TEST_CASE("the ctx flag caps the KV pool from the command line",
           "[cli]") {
@@ -353,6 +358,41 @@ TEST_CASE("locus-run starts without a Vulkan device", "[cli]") {
         INFO(cmd);
         REQUIRE(std::system(cmd.c_str()) == 0);
     }
+}
+
+TEST_CASE("LOCUS_VK_TRACE prints each Vulkan forward step", "[cli][vulkan]") {
+    // i#682: a step line names the path, batch size and kernels, and a
+    // sequence line hashes the output; a lone request takes the multi
+    // path in batch-invariant mode and the single path out of it.
+    const std::string model =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/models/stories260K.gguf";
+    if (!std::filesystem::exists(model)) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no Vulkan device");
+    }
+    const auto log = std::filesystem::temp_directory_path() /
+                     ("locus_vk_trace_" + std::to_string(::getpid()));
+    for (const auto& [mode, path] :
+         {std::pair{"1", "vk-trace: multi n=1 inv=1 "},
+          std::pair{"0", "vk-trace: single n=1 inv=0 "}}) {
+        const std::string cmd =
+            std::string("LOCUS_VK_TRACE=1 LOCUS_VK_BATCH_INVARIANT=") +
+            mode + " '" + LOCUS_RUN_BIN + "' --backend vulkan '" + model +
+            "' 'Once upon' 4 >/dev/null 2>'" + log.string() + "'";
+        INFO(cmd);
+        REQUIRE(std::system(cmd.c_str()) == 0);
+        std::ifstream in(log);
+        const std::string text((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        INFO(text);
+        CHECK(text.find("vk-trace: prefill n=") != std::string::npos);
+        CHECK(text.find(path) != std::string::npos);
+        CHECK(text.find("kernels=") != std::string::npos);
+        CHECK(text.find(" out=") != std::string::npos);
+    }
+    std::filesystem::remove(log);
 }
 
 TEST_CASE("locus-run exits 2 on a negative numeric flag", "[cli]") {
