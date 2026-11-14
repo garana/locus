@@ -193,7 +193,7 @@ TEST_CASE("metal matvec matches the CPU for each weight type",
         CHECK(mb::matvec_supported(t));
         // Rows not a multiple of the 8 a threadgroup takes; one shape
         // with fewer blocks per row than the 16 lanes.
-        for (const auto [rows, cols] :
+        for (const auto& [rows, cols] :
              {std::pair<std::uint32_t, std::uint32_t>{37, 512},
               {1027, 3072}, {5, 256}}) {
             CAPTURE(static_cast<int>(t), rows, cols);
