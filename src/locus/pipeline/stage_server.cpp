@@ -256,6 +256,9 @@ struct MuxSession {
     bool hs_answered = false;
     std::optional<HandshakeClient> hs_out;
     std::string hs_buf;
+    // i#854: when input bytes last arrived. With a partial frame in
+    // inbuf and nothing in flight, the frame timeout counts from here.
+    Clock::time_point last_input = Clock::now();
 };
 
 // A pipe whose ends close on destruction. The executor's completion
@@ -624,6 +627,21 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     }
     // Live session count per executor, for least-loaded assignment.
     std::vector<std::size_t> exec_load(stages.size(), 0);
+    // i#854: the most floats an input frame may carry (every executor
+    // runs the same layers of the same model).
+    const std::uint32_t in_floats = stages[0]->input_floats();
+    // i#854: when a session's partial frame times out, or max() when it
+    // has none: frames are pumped whenever no step is in flight and the
+    // dial is done, so bytes left in inbuf then are part of one frame.
+    const auto frame_deadline = [&](const MuxSession& s) {
+        if (conn_live.frame_timeout_ms <= 0 || s.cancelled ||
+            !s.in_authed || s.in_flight || s.connecting || s.resetting ||
+            s.inbuf.empty()) {
+            return Clock::time_point::max();
+        }
+        return s.last_input +
+               std::chrono::milliseconds(conn_live.frame_timeout_ms);
+    };
 
     // i#22: counters for GET /metrics. Only this loop thread touches them.
     StageStats stats;
@@ -964,7 +982,9 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         }
         Message in;
         std::string err;
-        const Decode d = decode(s.inbuf, in, err);
+        // i#854: a frame longer than one activation is refused from its
+        // length prefix, before the rest of it is buffered.
+        const Decode d = decode(s.inbuf, in, err, in_floats);
         if (d == Decode::kIncomplete) {
             return;
         }
@@ -1237,6 +1257,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             if (!s.in_authed && !s.cancelled) {
                 earliest = std::min(earliest, s.hs_deadline);
             }
+            earliest = std::min(earliest, frame_deadline(s));
             if (!s.connecting || s.cancelled) {
                 continue;
             }
@@ -1511,6 +1532,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 if (n > 0) {
                     stats.bytes_in += static_cast<std::uint64_t>(n);
                     s.inbuf.append(buf, static_cast<std::size_t>(n));
+                    s.last_input = Clock::now();
                     continue;
                 }
                 if (n == 0) {
@@ -1561,6 +1583,14 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                                  "serve_stage_mux: session dropped: no "
                                  "handshake answer within %d ms\n",
                                  conn_live.handshake_timeout_ms);
+                    begin_drop(s, false);
+                    continue;
+                }
+                if (now >= frame_deadline(s)) {
+                    std::fprintf(stderr,
+                                 "serve_stage_mux: session dropped: a "
+                                 "frame stalled for %d ms\n",
+                                 conn_live.frame_timeout_ms);
                     begin_drop(s, false);
                     continue;
                 }

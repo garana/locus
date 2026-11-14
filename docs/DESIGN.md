@@ -948,7 +948,11 @@ peer without the key is closed before any frame; a pooled downstream
 passed it when it was dialed. In the serve loop the handshake is one
 more per-session state with its own deadline, so a silent peer does
 not stall other sessions (#849). Frames are not signed: a peer on the
-network path is not stopped.
+network path is not stopped. A stage refuses an input frame longer than
+one activation (n_embd floats) from its length prefix, and the serve
+loop drops a session whose partial frame makes no progress for
+`--frame-timeout` (30 s); a connection idle between frames stays, as a
+pooled one must (#854).
 The serve loop can report its live peers (each session's upstream
 and downstream) with the kernel's smoothed TCP round-trip time, read
 from `TCP_INFO` (Linux, FreeBSD) or `TCP_CONNECTION_INFO` (macOS)

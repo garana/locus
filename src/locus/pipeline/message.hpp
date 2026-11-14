@@ -110,6 +110,14 @@ void encode(const Message& m, std::string& out);
  */
 Decode decode(std::string& buf, Message& out, std::string& err);
 
+/**
+ * As decode, but a frame whose length prefix leaves room for more than
+ * `max_floats` floats is kError as soon as the prefix is in, before its
+ * payload is buffered (i#854).
+ */
+Decode decode(std::string& buf, Message& out, std::string& err,
+              std::uint32_t max_floats);
+
 /** @returns The largest frame length accepted by decode/read_message;
  * guards against a desynced or hostile peer. */
 std::uint32_t max_frame_bytes();
