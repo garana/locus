@@ -2,14 +2,20 @@
 // implicit GEMM) shaders against the CPU scalar reference (cpu_ops),
 // the oracle for every backend.
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
+#include <iterator>
 #include <random>
 #include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
 
 using locus::backend::vk::Kernel;
@@ -306,4 +312,151 @@ TEST_CASE("vulkan conv2d_gemm matches the CPU reference",
             for (auto b : {ib, wb, bb, ob}) ctx.destroy_buffer(b);
         }
     }
+}
+
+namespace {
+
+/** Sets LOCUS_VK_SPLIT for the next VulkanContext; restores the old
+ *  value (or its absence) on destruction. */
+struct SplitEnv {
+    explicit SplitEnv(const char* v) {
+        if (const char* o = std::getenv("LOCUS_VK_SPLIT")) {
+            old = o;
+            had = true;
+        }
+        ::setenv("LOCUS_VK_SPLIT", v, 1);
+    }
+    ~SplitEnv() {
+        if (had) {
+            ::setenv("LOCUS_VK_SPLIT", old.c_str(), 1);
+        } else {
+            ::unsetenv("LOCUS_VK_SPLIT");
+        }
+    }
+    std::string old;
+    bool had = false;
+};
+
+}  // namespace
+
+// i#682: on V3D a large grid goes as several vkCmdDispatchBase pieces
+// (LOCUS_VK_SPLIT sets the budget). A split grid must give the whole
+// one's bits: here on any device, with the split forced, over a grid of
+// 2 x 2 output tiles; a budget of 2 splits x only, one of 1 splits y
+// too.
+TEST_CASE("vulkan split dispatches give the bits of a whole one",
+          "[vulkan][conv2d]") {
+    if (!VulkanContext::available()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    std::mt19937 rng(682);
+    const std::uint32_t in_ch = 8, hw = 12, out_ch = 200, k = 3;
+    const std::uint32_t o = hw - k + 1;  // stride 1, no padding
+    const auto in = randvec(std::size_t{in_ch} * hw * hw, rng);
+    const auto w = randvec(std::size_t{out_ch} * in_ch * k * k, rng);
+    const auto bias = randvec(out_ch, rng);
+    const auto run = [&](const char* split) {
+        const SplitEnv env(split);
+        VulkanContext ctx;
+        auto ib = upload(ctx, in), wb = upload(ctx, w),
+             bb = upload(ctx, bias);
+        auto ob = upload(ctx, std::vector<float>(out_ch * o * o, 0.0f));
+        ctx.begin_batch();
+        const VulkanContext::Buffer bufs[] = {ib, wb, bb, ob};
+        const std::uint32_t push[] = {in_ch, hw, hw, out_ch, o, o, k,
+                                      k,     1,  0,  1,      1};
+        // 100 output pixels in 64s and 200 channels in 128s: 2 x 2.
+        ctx.dispatch(Kernel::kConv2dGemm, bufs, push, (o * o + 63) / 64,
+                     (out_ch + 127) / 128);
+        ctx.end_batch();
+        auto got = download(ctx, ob, std::size_t{out_ch} * o * o);
+        for (auto b : {ib, wb, bb, ob}) ctx.destroy_buffer(b);
+        return got;
+    };
+    const auto whole = run("0");
+    for (const char* split : {"2", "1"}) {
+        INFO("LOCUS_VK_SPLIT=" << split);
+        const auto got = run(split);
+        REQUIRE(got.size() == whole.size());
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            REQUIRE(fbits(got[i]) == fbits(whole[i]));
+        }
+    }
+}
+
+// i#682: on V3D, unsplit, about 4% of these rounds came back wrong: the
+// kernel reset the GPU in the middle of the 338-workgroup 3 x 3 conv, and
+// its last workgroups never ran. Inception's shapes run in turn through
+// conv2d_vulkan (the path inception takes) on fixed inputs, and every run
+// must give the first one's bits; a wrong one prints how many outputs
+// moved and the channels and pixels they span. Hidden (minutes on V3D):
+// LOCUS_VK_STRESS_ITERS sets the rounds (default 30). A failure is worth
+// a look at the kernel log ("Resetting GPU for hang").
+TEST_CASE("vulkan conv2d repeats its bits", "[.][vulkan][stress]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device");
+    }
+    int iters = 30;
+    if (const char* e = std::getenv("LOCUS_VK_STRESS_ITERS")) {
+        iters = std::max(1, std::atoi(e));
+    }
+    struct Shape {
+        std::uint32_t in_ch, hw, out_ch, k, stride, pad;
+    };
+    // The stem's 3 x 3, a 1 x 1 at 35 x 35, the stride 2 reduction, a 1 x
+    // 1 at 17 x 17 and one at 8 x 8.
+    const Shape shapes[] = {{32, 149, 32, 3, 1, 0},
+                            {288, 35, 64, 1, 1, 0},
+                            {288, 35, 384, 3, 2, 0},
+                            {768, 17, 192, 1, 1, 0},
+                            {2048, 8, 320, 1, 1, 0}};
+    struct Data {
+        std::vector<float> in, w, b, first;
+        std::size_t plane;
+    };
+    std::mt19937 rng(682);
+    std::vector<Data> data;
+    for (const Shape& s : shapes) {
+        Data d;
+        d.in = randvec(std::size_t{s.in_ch} * s.hw * s.hw, rng);
+        d.w = randvec(std::size_t{s.out_ch} * s.in_ch * s.k * s.k, rng);
+        d.b = randvec(s.out_ch, rng);
+        const std::uint32_t o = (s.hw + 2 * s.pad - s.k) / s.stride + 1;
+        d.plane = std::size_t{o} * o;
+        d.first.resize(s.out_ch * d.plane);
+        locus::backend::conv2d_vulkan(d.in, s.in_ch, s.hw, s.hw, d.w,
+                                      s.out_ch, s.k, s.k, d.b, s.stride,
+                                      s.pad, 1, d.first);
+        data.push_back(std::move(d));
+    }
+    int bad_runs = 0;
+    for (int it = 1; it < iters; ++it) {
+        for (std::size_t si = 0; si < std::size(shapes); ++si) {
+            const Shape& s = shapes[si];
+            const Data& d = data[si];
+            std::vector<float> got(d.first.size());
+            locus::backend::conv2d_vulkan(d.in, s.in_ch, s.hw, s.hw, d.w,
+                                          s.out_ch, s.k, s.k, d.b, s.stride,
+                                          s.pad, 1, got);
+            std::size_t n = 0, lo = got.size(), hi = 0;
+            for (std::size_t i = 0; i < got.size(); ++i) {
+                if (fbits(got[i]) != fbits(d.first[i])) {
+                    ++n;
+                    lo = std::min(lo, i);
+                    hi = i;
+                }
+            }
+            if (n > 0) {
+                ++bad_runs;
+                WARN("conv " << s.in_ch << " -> " << s.out_ch << " k "
+                             << s.k << " at " << s.hw << ": round " << it
+                             << ": " << n << " of " << got.size()
+                             << " outputs differ, channels "
+                             << lo / d.plane << " .. " << hi / d.plane
+                             << ", pixels " << lo % d.plane << " .. "
+                             << hi % d.plane);
+            }
+        }
+    }
+    CHECK(bad_runs == 0);
 }
