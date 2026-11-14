@@ -26,7 +26,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   qwen2 pretokenizers), the T5 unigram model and BERT's WordPiece,
   with chat templates.
 - **Backends:** neon, avx2, sse4 and scalar on the CPU; vulkan (the
-  whole forward pass on the GPU); cuda (matvec on the GPU).
+  whole forward pass on the GPU); cuda (matvec on the GPU); metal
+  (Apple GPUs, being built: #10).
 - **Serving:** continuous batching; a paged KV cache with
   copy-on-write prefix sharing; f32, f16, q8 or q4 KV.
 - **API:** `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
@@ -195,9 +196,10 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   time needs about 82); a comparison
   with other speech, image and video tools (#245).
 - Performance: prefill on Apple GPUs at 44% of Metal's (#10:
-  MoltenVK exposes no cooperative matrix, so a Metal matmul is being
-  tried), CPU prefill on an M2 Pro at about 60% of llama.cpp's with
-  `LOCUS_CPU_FAST` (llama.cpp sends its prompt matmuls through
+  MoltenVK exposes no cooperative matrix, so a native Metal backend is
+  being built, #865 to #868), CPU prefill on an M2 Pro at about 60%
+  of llama.cpp's with `LOCUS_CPU_FAST` (llama.cpp sends its prompt
+  matmuls through
   Apple's Accelerate; whether locus should is #782), batch-invariant
   decode at full speed on V3D (#511).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
@@ -259,6 +261,7 @@ Vulkan devices; the first is the default).
 | scalar  | portable reference, every weight type                                                    |
 | vulkan  | the whole forward pass on the GPU: matmuls, norms, RoPE, paged attention, MoE routing    |
 | cuda    | matvec and attention on the GPU (paged weight pool, KV cache copy); the rest on the CPU  |
+| metal   | Apple GPUs (#10, stage 1): device, buffers, kernels; the math still runs on the CPU      |
 
 Every selectable backend must reproduce the golden outputs. A GPU does
 not always beat the CPU: on a tile GPU streaming a model larger than
