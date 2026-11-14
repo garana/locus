@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -199,6 +200,10 @@ struct ServerConfig {
                                      *   may exceed it legitimately). */
     Limits limits;                  /**< parser caps. */
     std::vector<locus::pipeline::Cidr> allow;  /**< empty == allow all. */
+    /** Open connections one peer address may hold at once; a new one
+     * past it is closed at accept (i#625 F21). 0 (default) = no cap: a
+     * router in front reaches an instance from one address. */
+    std::size_t max_conns_per_ip = 0;
     /** Routes served on the fast-path acceptor thread rather than the
      * inference worker pool, so cheap control endpoints (/health,
      * /metrics) are not starved when every worker is busy in a long
@@ -270,6 +275,12 @@ class Server {
      * no persistent registration to unwind and no stale-registration or
      * recycled-fd-number hazard. */
     void unwatch_unclassified(int fd);
+    /** Counts a new connection from `peer_ip` against
+     * cfg_.max_conns_per_ip. @returns false when that peer is at the
+     * cap (the caller closes the fd uncounted). */
+    bool take_ip_slot(const std::string& peer_ip);
+    /** Closes an accepted connection and gives its peer's slot back. */
+    void close_conn(int fd, const std::string& peer_ip);
     /** Pushes one accepted connection onto the worker handoff queue and
      * wakes a worker. @returns false when the queue is at its cap, in
      * which case the caller must close `fd` (shed, never accumulate). */
@@ -374,6 +385,9 @@ class Server {
     /** peek_classify's buffer (acceptor-only, like unclassified_). */
     std::vector<char> peek_buf_;
     std::atomic<bool> stopping_{false};
+    std::mutex per_ip_mu_;  /**< guards per_ip_ (acceptor and workers). */
+    /** Open connections per peer address, when max_conns_per_ip > 0. */
+    std::unordered_map<std::string, std::size_t> per_ip_;
     std::atomic<bool> started_{false};
     std::mutex wait_mu_;              /**< guards the wait() handoff. */
     std::condition_variable wait_cv_; /**< signalled by stop(). */
