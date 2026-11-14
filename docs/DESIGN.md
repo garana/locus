@@ -890,7 +890,12 @@ For MoE models, experts can live on different hosts, each processing
 the tokens routed to it. Routing adds traffic, but experts are
 independent, so this is a second axis that also suits a LAN. The
 multi-GPU pager (#62) shards weights within one host; a pipeline stage
-can use it underneath.
+can use it underneath. On the wire a token's owner sends `kExpertCall`
+(the layer, the expert id and the hidden state) and the expert's host
+replies with `kExpertOut` (that expert's output before the router
+weight), so the owner can combine the experts in its own pick order
+and keep one host's bits; the server and the `moe_ffn` side are #781's
+next steps.
 
 ### Stage serving
 
