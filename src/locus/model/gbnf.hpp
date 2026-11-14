@@ -149,7 +149,14 @@ class GbnfMatcher {
         }
         void push(const std::vector<std::uint32_t>& s);
     };
-    void expand(std::vector<std::uint32_t>& cur, Stacks& out, int depth) const;
+    /**
+     * Appends to `out` every stack `cur` reaches before consuming a
+     * character, over an explicit worklist (no recursion, i#625 F1).
+     * @param budget Stack visits left for this step; spent here.
+     * @returns Whether the budget ran out, so stacks were dropped.
+     */
+    bool expand(const std::vector<std::uint32_t>& cur, Stacks& out,
+                std::size_t& budget) const;
     bool viable(char32_t lo, char32_t hi) const;
     /** Sorts and dedups s, keeping max_stacks_. @returns whether any
      * distinct stack was dropped. */
@@ -166,6 +173,9 @@ class GbnfMatcher {
     mutable std::vector<std::uint32_t> cur_;
     mutable std::vector<std::uint32_t> order_;
     mutable Stacks tmp_;
+    // Scratch for expand(): its worklist and the stack it works on.
+    mutable Stacks work_;
+    mutable std::vector<std::uint32_t> top_;
     // A UTF-8 character in progress: its bits so far, the continuation
     // bytes left, and its continuation bytes in all.
     char32_t cp_ = 0;
