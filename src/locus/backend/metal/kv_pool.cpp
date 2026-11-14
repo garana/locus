@@ -9,9 +9,10 @@ namespace locus::backend::metal {
 
 namespace {
 
+// Leaked, as device_mutex(): a cache freed at exit still finds it.
 std::unordered_map<const float*, Context::Buffer>& pools() {
-    static std::unordered_map<const float*, Context::Buffer> p;
-    return p;
+    static auto* p = new std::unordered_map<const float*, Context::Buffer>;
+    return *p;
 }
 
 }  // namespace

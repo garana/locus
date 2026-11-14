@@ -1339,12 +1339,15 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
                 all_logits ? logits.subspan(std::size_t{t} * V, V)
                            : (t + 1 == n ? logits.first(V)
                                          : std::span<float>(spare));
+            // A token whose logits are dropped computes one head row.
+            const bool keep = all_logits || t + 1 == n;
+            const LogitRows rows = keep ? LogitRows{} : LogitRows{0, 1};
             const float* e = embd.empty() ? nullptr : embd[t];
             forward_layers(e != nullptr ? 0 : toks[t],
                            e != nullptr
                                ? std::span<const float>(e, hp_.n_embd)
                                : std::span<const float>{},
-                           0, hp_.n_layers, cache, seq, ws, out, {});
+                           0, hp_.n_layers, cache, seq, ws, out, rows);
         }
         return;
     }

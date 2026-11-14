@@ -27,8 +27,8 @@ kernel void add_f32(device const float* a [[buffer(0)]],
 // per row (two rows per simdgroup); lanes stride over the row's units
 // and the 16 partial sums are added with simd shuffles within each
 // half of the simdgroup. W starts w_off bytes into its buffer, a multiple
-// of 4 (Q4_K loads words; F32 a multiple of 16); x_off is a multiple of
-// 4 (float4 loads).
+// of 4 for Q4_K (word loads) and 16 for F32 (float4); Q8_0 and Q6_K
+// read bytes. x_off is a multiple of 4 (float4 loads).
 
 struct MvParams {
     ulong w_off;    // bytes into the weight buffer
