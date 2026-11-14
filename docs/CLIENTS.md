@@ -353,9 +353,10 @@ calling. Reliable agent use therefore needs a capable instruct model.
   distinct keys of that list, so add new keys at the end (removing or
   reordering one renumbers the callers after it). A helper (this one,
   or `--prefix-cache-helper`'s) must be a binary or a script that
-  starts with `#!`: it is found on PATH (`/usr/bin:/bin` when PATH is
-  unset) and started with `execv`, which runs no shell for a script
-  without one.
+  starts with `#!`. A bare name is found on PATH (`/usr/bin:/bin` when
+  PATH is unset), a name with a `/` is used as given, and either is
+  started with `execv`, which runs no shell for a script without
+  `#!`.
 - Tool execution: locus only expresses tool calls; it never runs them.
   Running them is the client's job (locus is a model runner, not an
   MCP host).
