@@ -146,8 +146,10 @@ SPIR-V and embedded at build time.
 
 Parsing untrusted model files is an attack surface (llama.cpp has had
 parser CVEs). Rules: bounds-check every offset against the file size;
-no allocation sized by an unvalidated field; a fuzz corpus in the
-tests; mmap read-only.
+no allocation sized by an unvalidated field; hand-written hostile
+files in the tests (`[gguf]`: truncations, oversized arrays, hostile
+tensor tables; a fuzz target is not in the tree yet, #625); mmap
+read-only.
 
 ### 4.5 HTTP server
 
@@ -293,8 +295,10 @@ The areas built after the MVP:
 
 - Runtime dependencies: libc, libc++, OS APIs. Nothing else by
   default.
-- Vendored in-tree, pinned, sha256 recorded in the importing commit,
-  license files alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
+- Vendored in-tree, pinned, every file's sha256 in
+  `third_party/SHA256SUMS` (the `[third_party]` test checks the files
+  against it and that each vendored file is listed), license files
+  alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
   cpp-httplib v0.18.3 (MIT, tests only: their HTTP client),
   nlohmann/json v3.11.3 (MIT), ggml's
   IQ lookup tables (`third_party/ggml/iq_grids.h`, MIT) and llama.cpp's
