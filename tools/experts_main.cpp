@@ -5,10 +5,12 @@
 
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "locus/backend/registry.hpp"
@@ -21,18 +23,22 @@ namespace {
 
 const char* kUsage =
     "usage: locus-experts --model <m.gguf> --listen HOST:PORT "
-    "--experts LO:HI [--allow CIDR]... [--backend NAME]\n"
+    "--experts LO:HI [--allow CIDR]... [--backend NAME] "
+    "[--idle-timeout MS]\n"
     "\n"
     "Serves MoE expert calls for expert parallelism: a peer sends a\n"
     "layer, an expert id in [LO, HI) and a hidden state, and gets that\n"
     "expert's output back, the bits its own forward would compute. One\n"
     "connection is served at a time.\n"
     "\n"
-    "  --allow CIDR  peers allowed to connect (repeatable); without it\n"
-    "                only loopback (127.0.0.0/8, ::1), since the port\n"
-    "                has no authentication and runs compute for any\n"
-    "                peer it accepts\n"
-    "  --backend B   math backend (default: the model's)\n";
+    "  --allow CIDR       peers allowed to connect (repeatable); without\n"
+    "                     it only loopback (127.0.0.0/8, ::1), since the\n"
+    "                     port has no authentication and runs compute\n"
+    "                     for any peer it accepts\n"
+    "  --backend B        math backend (default: the model's)\n"
+    "  --idle-timeout MS  close a connection that sends nothing for MS\n"
+    "                     milliseconds, so a silent peer does not hold\n"
+    "                     the one slot (default 60000; 0 = never)\n";
 
 /** Parses "LO:HI" with LO < HI. @returns false when malformed. */
 bool parse_range(const std::string& s, std::uint32_t& lo,
@@ -59,6 +65,7 @@ bool parse_range(const std::string& s, std::uint32_t& lo,
 
 int main(int argc, char** argv) {
     std::string model_path, listen, range, backend;
+    int idle_ms = 60000;
     std::vector<std::string> allow_str;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -80,6 +87,15 @@ int main(int argc, char** argv) {
             allow_str.push_back(next());
         } else if (a == "--backend") {
             backend = next();
+        } else if (a == "--idle-timeout") {
+            const std::string v = next();
+            char* end = nullptr;
+            const long ms = std::strtol(v.c_str(), &end, 10);
+            if (*end != '\0' || ms < 0 || ms > 86400000) {
+                std::fprintf(stderr, "bad --idle-timeout %s\n", v.c_str());
+                return 2;
+            }
+            idle_ms = static_cast<int>(ms);
         } else if (a == "--help" || a == "-h") {
             std::printf("%s", kUsage);
             return 0;
@@ -128,11 +144,26 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "locus-experts: experts [%u,%u) on :%d\n", lo,
                      hi, bound);
+        int failures = 0;
         for (;;) {
             std::string peer;
             const int fd = locus::pipeline::accept_one(lfd, &peer);
             if (fd < 0) {
+                // A lasting failure (out of fds, say) would spin: back
+                // off, and give up after 100 in a row.
+                if (++failures >= 100) {
+                    std::fprintf(stderr, "locus-experts: accept keeps "
+                                         "failing; exiting\n");
+                    return 1;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
+            }
+            failures = 0;
+            if (idle_ms > 0) {
+                // read_message then returns kTimeout, which ends the
+                // connection in serve_expert_calls.
+                locus::pipeline::set_recv_timeout(fd, idle_ms);
             }
             if (!locus::pipeline::ip_allowed(peer, allow)) {
                 std::fprintf(stderr, "locus-experts: refused %s\n",
