@@ -99,6 +99,14 @@ bool VulkanContext::profiling() {
     return on;
 }
 
+bool VulkanContext::tracing() {
+    static const bool on = [] {
+        const char* e = std::getenv("LOCUS_VK_TRACE");
+        return e != nullptr && *e != '\0' && std::string_view(e) != "0";
+    }();
+    return on;
+}
+
 /**
  * @returns Kernel k's profile label (its kernel table row; a
  * placeholder in builds without Vulkan kernels, which never profile).
@@ -1014,6 +1022,8 @@ struct VulkanContext::Impl {
     /** Dispatches recorded in the open batch (added to the metrics at
      *  end_batch, one atomic add per batch). */
     std::uint64_t batch_dispatches = 0;
+    /** Kernels dispatched since take_traced_kernels (tracing only). */
+    bool traced[static_cast<int>(Kernel::kCount_)]{};
 
     struct HostBuffer {
         VkBuffer buf = VK_NULL_HANDLE;
@@ -1903,6 +1913,9 @@ void VulkanContext::dispatch(Kernel k,
     vkCmdDispatch(im.batch_cmd, groups_x, groups_y, groups_z);
     ++im.prof.dispatches;
     ++im.batch_dispatches;
+    if (tracing()) {
+        im.traced[static_cast<int>(k)] = true;
+    }
     // Slot 0 is the batch start; keep the last slot for its end.
     if (im.per_kernel && im.batch_timed &&
         im.ts_tag.size() + 2 < Impl::kMaxTs) {
@@ -2144,6 +2157,20 @@ std::uint64_t VulkanContext::memory_used() const {
 
 void VulkanContext::note_token() { ++impl_->prof.tokens; }
 
+std::string VulkanContext::take_traced_kernels() {
+    std::string out;
+    for (int k = 0; k < static_cast<int>(Kernel::kCount_); ++k) {
+        if (impl_->traced[k]) {
+            if (!out.empty()) {
+                out += ',';
+            }
+            out += kernel_name(static_cast<Kernel>(k));
+            impl_->traced[k] = false;
+        }
+    }
+    return out;
+}
+
 const VulkanContext::Profile& VulkanContext::profile() const {
     return impl_->prof;
 }
@@ -2275,6 +2302,7 @@ void VulkanContext::dispatch(Kernel, std::span<const Buffer>,
 void VulkanContext::mark_stage(std::uint32_t) { no_kernels(); }
 void VulkanContext::end_batch() { no_kernels(); }
 void VulkanContext::note_token() { no_kernels(); }
+std::string VulkanContext::take_traced_kernels() { no_kernels(); }
 std::uint64_t VulkanContext::memory_available() const { no_kernels(); }
 std::uint64_t VulkanContext::memory_used() const { no_kernels(); }
 bool VulkanContext::serial_dispatch() const { no_kernels(); }
