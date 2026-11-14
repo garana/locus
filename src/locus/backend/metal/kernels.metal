@@ -27,7 +27,7 @@ kernel void add_f32(device const float* a [[buffer(0)]],
 // per row (two rows per simdgroup); lanes stride over the row's units
 // and the 16 partial sums are added with simd shuffles within each
 // half of the simdgroup. W starts w_off bytes into its buffer, a multiple
-// of 4 for Q4_K (word loads) and 16 for F32 (float4); Q8_0 and Q6_K
+// of 8 for Q4_K (8-byte loads) and 16 for F32 (float4); Q8_0 and Q6_K
 // read bytes. x_off is a multiple of 4 (float4 loads).
 
 struct MvParams {
@@ -136,51 +136,76 @@ inline void q4k_scale_min(uint j, device const uchar* q, thread float& sc,
     }
 }
 
+// The threadgroup is 2 simdgroups of 2 rows each (kQ4Rows a group).
+// Lane l works on blocks l / 8, + 4, ...: in each it takes 8 elements
+// from four sub-blocks, those at 8 (l % 4) of sub-blocks 2 jq, 2 jq + 1,
+// 2 jq + 4 and 2 jq + 5 (jq = l % 8 / 4): two 8-byte runs of nibbles.
+// The 32 activations and their four sums are loaded once and serve
+// both rows. (The layout of ggml's Metal Q4_K matvec.)
+constant constexpr uint kQ4Rows = 4;
+
+inline float dot8(float4 a, float4 b, uint2 q, uint sh) {
+    const float4 q0 = float4((as_type<uchar4>(q.x) >> sh) & uchar4(0xF));
+    const float4 q1 = float4((as_type<uchar4>(q.y) >> sh) & uchar4(0xF));
+    return dot(q0, a) + dot(q1, b);
+}
+
 kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
                     device const float* xb [[buffer(1)]],
                     device float* out [[buffer(2)]],
                     constant MvParams& p [[buffer(3)]],
                     uint tg [[threadgroup_position_in_grid]],
-                    uint tid [[thread_index_in_threadgroup]]) {
-    const uint lane = tid % kMvLanes;
-    const uint r = tg * kMvRows + tid / kMvLanes;
-    float acc = 0.0f;
-    if (r < p.rows) {
-        const uint nb = p.cols / 256;
-        device const uchar* row = w + p.w_off + (ulong)r * nb * 144;
-        device const float* x = xb + p.x_off;
-        for (uint u = lane; u < nb * 4; u += kMvLanes) {
-            const uint b = u >> 2;
-            const uint j = u & 3;
-            device const uchar* blk = row + b * 144;
-            const half2 dm = *(device const half2*)blk;
-            float sc0, mn0, sc1, mn1;
-            q4k_scale_min(2 * j, blk + 4, sc0, mn0);
-            q4k_scale_min(2 * j + 1, blk + 4, sc1, mn1);
-            device const uint* q = (device const uint*)(blk + 16 + j * 32);
-            device const float4* xl =
-                (device const float4*)(x + b * 256 + j * 64);
-            device const float4* xh = xl + 8;
-            float sq0 = 0.0f, sx0 = 0.0f, sq1 = 0.0f, sx1 = 0.0f;
-            for (uint k = 0; k < 8; ++k) {
-                const uint v = q[k];
-                const float4 lo(v & 0xF, (v >> 8) & 0xF, (v >> 16) & 0xF,
-                                (v >> 24) & 0xF);
-                const float4 hi((v >> 4) & 0xF, (v >> 12) & 0xF,
-                                (v >> 20) & 0xF, (v >> 28) & 0xF);
-                const float4 a = xl[k];
-                const float4 c = xh[k];
-                sq0 += dot(lo, a);
-                sx0 += hsum(a);
-                sq1 += dot(hi, c);
-                sx1 += hsum(c);
+                    uint sg [[simdgroup_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]]) {
+    const uint r0 = tg * kQ4Rows + sg * 2;
+    const uint nb = p.cols / 256;
+    const ulong row_bytes = ulong(nb) * 144;
+    const uint ix = lane / 8, jq = (lane % 8) / 4, ir = lane % 4;
+    device const uchar* w0 = w + p.w_off + ulong(r0) * row_bytes;
+    device const float* x = xb + p.x_off + 64 * jq + 8 * ir;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (uint b = ix; b < nb; b += 4) {
+        device const float4* y = (device const float4*)(x + b * 256);
+        // Elements of sub-blocks 2 jq, 2 jq + 1, 2 jq + 4, 2 jq + 5.
+        const float4 a0 = y[0], a1 = y[1], b0 = y[8], b1 = y[9];
+        const float4 c0 = y[32], c1 = y[33], e0 = y[40], e1 = y[41];
+        const float s0 = hsum(a0 + a1), s1 = hsum(b0 + b1);
+        const float s2 = hsum(c0 + c1), s3 = hsum(e0 + e1);
+        for (uint i = 0; i < 2; ++i) {
+            if (r0 + i >= p.rows) {
+                break;
             }
-            const float d = float(dm.x), dmin = float(dm.y);
-            acc += d * sc0 * sq0 - dmin * mn0 * sx0;
-            acc += d * sc1 * sq1 - dmin * mn1 * sx1;
+            device const uchar* blk = w0 + i * row_bytes + b * 144;
+            const half2 dm = *(device const half2*)blk;
+            float sc0, mn0, sc1, mn1, sc2, mn2, sc3, mn3;
+            q4k_scale_min(2 * jq, blk + 4, sc0, mn0);
+            q4k_scale_min(2 * jq + 1, blk + 4, sc1, mn1);
+            q4k_scale_min(2 * jq + 4, blk + 4, sc2, mn2);
+            q4k_scale_min(2 * jq + 5, blk + 4, sc3, mn3);
+            device const uchar* q = blk + 16 + 32 * jq + 8 * ir;
+            const uint2 lo = *(device const uint2*)q;
+            const uint2 hi = *(device const uint2*)(q + 64);
+            const float v = float(dm.x) * (sc0 * dot8(a0, a1, lo, 0) +
+                                           sc1 * dot8(b0, b1, lo, 4) +
+                                           sc2 * dot8(c0, c1, hi, 0) +
+                                           sc3 * dot8(e0, e1, hi, 4)) -
+                            float(dm.y) * (mn0 * s0 + mn1 * s1 + mn2 * s2 +
+                                           mn3 * s3);
+            if (i == 0) {
+                acc0 += v;
+            } else {
+                acc1 += v;
+            }
         }
     }
-    mv_store(out, p, r, lane, acc);
+    const float t0 = simd_sum(acc0), t1 = simd_sum(acc1);
+    if (lane == 0) {
+        for (uint i = 0; i < 2 && r0 + i < p.rows; ++i) {
+            device float* o = out + p.out_off + r0 + i;
+            const float v = p.scale * (i == 0 ? t0 : t1);
+            *o = p.accumulate != 0 ? *o + v : v;
+        }
+    }
 }
 
 // Q6_K: 210-byte super-blocks of 256 (128 ql, 64 qh, 16 int8 scales,

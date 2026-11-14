@@ -53,9 +53,9 @@ void drop_weights();
  * building block. The caller holds device_mutex().
  * @param t The weight type (matvec_supported).
  * @param w The buffer holding the matrix's bytes from w_off on. Q4_K
- *     loads words and F32 float4s, so w_off is a multiple of 4 for
- *     Q4_K and 16 for F32 (a whole number of rows is); Q8_0 and Q6_K
- *     read bytes, any offset.
+ *     loads 8 bytes at a time and F32 float4s, so w_off is a multiple
+ *     of 8 for Q4_K and 16 for F32 (a whole number of rows is);
+ *     Q8_0 and Q6_K read bytes, any offset.
  * @param x_off Floats into x, a multiple of 4.
  * @param out_off Floats into out.
  * @throws std::invalid_argument for a type without a kernel, columns
