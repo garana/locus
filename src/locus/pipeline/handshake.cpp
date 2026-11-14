@@ -78,7 +78,8 @@ bool read_exact(int fd, std::size_t n, std::string& out,
         const int r = ::poll(&p, 1, left_ms(deadline));
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) return false;
-        const ssize_t got = ::recv(fd, buf, std::min(sizeof buf, n - out.size()), 0);
+        const ssize_t got =
+            ::recv(fd, buf, std::min(sizeof buf, n - out.size()), 0);
         if (got < 0 && errno == EINTR) continue;
         if (got <= 0) return false;
         out.append(buf, static_cast<std::size_t>(got));
