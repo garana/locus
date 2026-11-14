@@ -1697,8 +1697,12 @@ TEST_CASE("a forward with remote experts is one process's bits",
     plain.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
                  weights(kF * kE * 4, 16));
     const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 5, 2};
+    // Window 1 makes start() read a host's reply before its next call
+    // (two picks on the same host); 0 is the default size.
+    for (const std::size_t window : {std::size_t{0}, std::size_t{1}})
     for (const auto& img :
          {plain.build(4, 2), qwen_image(+8.0f, /*zero_shared=*/false)}) {
+        INFO("window " << window);
         const auto want = run(img, toks);
 
         auto g_srv = locus::gguf::GgufFile::parse(img);
@@ -1712,7 +1716,10 @@ TEST_CASE("a forward with remote experts is one process's bits",
             ::close(sv[1]);
         });
         locus::pipeline::ExpertClient client({{2, 4, sv[0]}},
-                                             model.hparams().n_embd);
+                                             model.hparams().n_embd, window);
+        if (window != 0) {
+            REQUIRE(client.window() == window);
+        }
         model.set_remote_experts(&client);
         auto cache = model.make_cache();
         auto ws = model.make_workspace();

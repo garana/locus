@@ -365,11 +365,13 @@ class TransformerModel {
                     Workspace& ws) const;
 
     /**
-     * Sends the experts `r` names to other hosts in the per-token CPU
-     * forward (moe_ffn); null computes them all here. Not owned; it
-     * must outlive the forwards that use it. The batched forward and
-     * the GPU forwards still compute every expert here (each host maps
-     * the whole file, so the result is the same).
+     * Sends the experts `r` names to other hosts from the per-token
+     * moe_ffn, whatever its backend's ops; null computes them all here.
+     * Not owned; it must outlive the forwards that use it. The batched
+     * forward (moe_ffn_batch) and the whole-layer GPU forwards, which do
+     * not call moe_ffn, still compute every expert here, and under the
+     * MoE hybrid a cold pick runs on its CPU here even if `r` names it
+     * (each host maps the whole file, so the result is the same).
      */
     void set_remote_experts(RemoteExperts* r) { remote_experts_ = r; }
 

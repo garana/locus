@@ -2449,6 +2449,11 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
         picked = std::move(hot);
     } else {
         for (const auto& [e, wgt] : picked) {
+            // Another host's experts are its calls, not this host's.
+            if (remote_experts_ != nullptr &&
+                remote_experts_->remote(layer, e)) {
+                continue;
+            }
             ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, gpu,
                                 api);
         }
@@ -2489,18 +2494,24 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
         });
     }
     // Expert parallelism (#781): which picks another host computes.
+    // Filled only when a RemoteExperts is set, so the all-local path
+    // allocates nothing.
     RemoteExperts* const rx = remote_experts_;
-    std::vector<char> is_remote(picked.size(), 0);
+    std::vector<char> is_remote;
     bool any_remote = false;
     if (rx != nullptr) {
+        is_remote.assign(picked.size(), 0);
         for (std::size_t i = 0; i < picked.size(); ++i) {
             is_remote[i] = rx->remote(layer, picked[i].first) ? 1 : 0;
             any_remote = any_remote || is_remote[i] != 0;
         }
     }
+    const auto remote_pick = [&](std::size_t i) {
+        return !is_remote.empty() && is_remote[i] != 0;
+    };
     // Start them first, so their hosts work while this one computes.
     for (std::size_t i = 0; i < picked.size(); ++i) {
-        if (is_remote[i] != 0) {
+        if (remote_pick(i)) {
             rx->start(layer, picked[i].first, ws.xb);
         }
     }
@@ -2509,7 +2520,7 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
     // in one by one (not the remote ones: this host never reads them).
     if (readahead_enabled()) {
         for (std::size_t i = 0; i < picked.size(); ++i) {
-            if (is_remote[i] != 0) {
+            if (remote_pick(i)) {
                 continue;
             }
             const std::uint32_t e = picked[i].first;
