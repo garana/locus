@@ -120,7 +120,11 @@ bool write_all_deadline(int fd, std::string_view data, int wake_r,
                     *inline_write_until - std::chrono::steady_clock::now())
                     .count();
             if (left <= 0) return false;  // the inline total ran out
-            deadline_ms = std::min(deadline_ms, static_cast<int>(left));
+            // A negative deadline_ms is poll's "forever": the total
+            // still applies then.
+            deadline_ms = deadline_ms < 0
+                              ? static_cast<int>(left)
+                              : std::min(deadline_ms, static_cast<int>(left));
         }
         const ssize_t n =
             ::send(fd, data.data() + off, data.size() - off, kSendFlags);
