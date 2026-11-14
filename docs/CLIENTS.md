@@ -339,14 +339,12 @@ calling. Reliable agent use therefore needs a capable instruct model.
 
 ## Caveats
 
-- Auth: `locus-server` does not check API keys, so anything exposed on
-  a network is unauthenticated; run it on localhost or behind a
-  trusted proxy. The server has an external-helper auth mechanism
-  (`locus-auth-helper` is a reference helper with an allow-list), but
-  the `locus-server` binary does not expose it yet. `locus-router`
-  does: `--auth-helper PATH` checks every request but `/health`, so a
-  router in front of instances on a private network is the way to
-  require keys today.
+- Auth: `locus-server` listens on 127.0.0.1 unless `--host` says
+  otherwise, and checks no API keys unless `--auth-helper PATH` is
+  given (`locus-auth-helper` is a reference helper with an
+  allow-list); then every request but `/health` needs a key the helper
+  allows. `locus-router` takes the same flag. Without a helper, anything
+  exposed on a network is unauthenticated.
 - Tool execution: locus only expresses tool calls; it never runs them.
   Running them is the client's job (locus is a model runner, not an
   MCP host).

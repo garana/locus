@@ -164,6 +164,11 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         std::fprintf(stderr, "%s: %s\n", argv[0], e.c_str());
         return 2;
     }
+    if (args.auth_helper.empty() && !args.auth_helper_args.empty()) {
+        std::fprintf(stderr, "%s: --auth-helper-arg needs --auth-helper\n",
+                     argv[0]);
+        return 2;
+    }
     if (args.positional.empty()) {
         std::fprintf(stderr,
                      "usage: %s [--backend NAME] <model.gguf> "
@@ -262,6 +267,7 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         if (!args.metrics_path.empty()) {
             opt.metrics_path = args.metrics_path;
         }
+        opt.auth_helper_argv = args.auth_helper;
         // Capped at a day, so the milliseconds fit in 32 bits.
         opt.sse_keepalive_ms =
             std::min<std::uint32_t>(args.sse_keepalive, 86400) * 1000;
@@ -293,15 +299,29 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         }
         // An IPv6 address in brackets, so "[::1]:8080" reads unambiguously.
         const bool v6 = args.host.find(':') != std::string::npos;
-        std::fprintf(stderr, "locus-server listening on %s%s%s:%d\n",
-                     v6 ? "[" : "", args.host.c_str(), v6 ? "]" : "", port);
+        if (args.host.empty()) {
+            std::fprintf(stderr,
+                         "locus-server listening on every interface, port "
+                         "%d%s\n",
+                         port,
+                         opt.auth_helper_argv.empty()
+                             ? " (no --auth-helper: anyone who can reach "
+                               "it can use it)"
+                             : "");
+        } else {
+            std::fprintf(stderr, "locus-server listening on %s%s%s:%d\n",
+                         v6 ? "[" : "", args.host.c_str(), v6 ? "]" : "",
+                         port);
+        }
         const bool loopback = args.host == "127.0.0.1" ||
                               args.host == "::1" ||
                               args.host == "localhost";
         if (loopback && !reg.router_host.empty()) {
             std::fprintf(stderr,
-                         "warning: --host %s is loopback only; a router on "
-                         "another machine cannot reach this server\n",
+                         "warning: listening on %s, loopback only (the "
+                         "default); a router on another machine cannot "
+                         "reach this server: pass --host with its "
+                         "address, or --host '*'\n",
                          args.host.c_str());
         }
         // Registers a moment after this, once listen has bound, and
