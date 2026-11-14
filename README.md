@@ -193,8 +193,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 - Performance: prefill on Apple GPUs at 44% of Metal's (#10:
   MoltenVK exposes no cooperative matrix), CPU prefill (#618: about
   60% of llama.cpp's on an M2 Pro with `LOCUS_CPU_FAST`, which uses
-  Apple's Accelerate there), batch-invariant decode at full speed on
-  V3D (#511).
+  Apple's Accelerate there).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
