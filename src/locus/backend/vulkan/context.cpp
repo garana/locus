@@ -3,6 +3,7 @@
 #include "locus/backend/vulkan/mem_fit.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <string_view>
 #include <thread>
 #include <atomic>
@@ -11,6 +12,61 @@
 #include <stdexcept>
 
 namespace locus::backend::vk {
+
+namespace {
+
+/**
+ * Most workgroups one V3D job may run (i#682). The kernel's v3d driver
+ * reset the GPU for a "hang" about once in 30 runs of a 338-workgroup,
+ * 274 ms conv dispatch, and the rest of that job never ran; split into
+ * jobs of 32, 300 rounds showed no reset and no wrong result, at the
+ * same speed. Also the budget of any kernel v3d_split_budget does not
+ * know.
+ */
+constexpr std::uint32_t kV3dSplitGroups = 32;
+
+}  // namespace
+
+std::uint32_t VulkanContext::v3d_split_budget(std::string_view name) {
+    // The one-token matvec builds (decode, and NT 1): on V3D one 1B
+    // head workgroup runs about 10 us (32064 of them take 331 ms whole),
+    // so 1024 run about 11 ms; 32 cost a 1B decode 10%, 1024 nothing.
+    constexpr std::uint32_t kOneToken = 1024;
+    if (!name.starts_with("matvec_")) {
+        return kV3dSplitGroups;
+    }
+    // Each part after "matvec" must be a type's or a known build's; the
+    // multi-token builds scale the budget down by their work per
+    // workgroup, so a piece stays near a one-token one (an NT 8
+    // dispatch ran 76 ms on average whole on the 1B).
+    std::uint32_t budget = kOneToken;
+    std::size_t at = name.find('_');
+    while (at != std::string_view::npos) {
+        const std::size_t end = name.find('_', at + 1);
+        const std::string_view part = name.substr(
+            at + 1, end == std::string_view::npos ? end : end - at - 1);
+        constexpr std::string_view kTypeParts[] = {
+            "f32", "f16", "bf16", "q8", "q4", "q5", "q6", "q2", "q3",
+            "0",   "k",   "iq2",  "iq3", "iq4", "xxs", "xs", "s"};
+        constexpr std::string_view kOneTokenParts[] = {"glu", "seg", "n1",
+                                                        "ng"};
+        if (part == "n2") {
+            budget = std::min<std::uint32_t>(budget, 512);
+        } else if (part == "n4") {
+            budget = std::min<std::uint32_t>(budget, 256);
+        } else if (part == "n" || part == "b" || part == "p" ||
+                   part == "sh" || part == "t") {
+            budget = std::min<std::uint32_t>(budget, 128);
+        } else if (std::ranges::find(kTypeParts, part) ==
+                       std::end(kTypeParts) &&
+                   std::ranges::find(kOneTokenParts, part) ==
+                       std::end(kOneTokenParts)) {
+            return kV3dSplitGroups;  // a build this does not know
+        }
+        at = end;
+    }
+    return budget;
+}
 
 bool VulkanContext::kernel_needs_f16(Kernel k) {
     switch (k) {
@@ -833,15 +889,6 @@ const KernelDesc& kernel_desc(Kernel k) {
 }
 
 /**
- * Most workgroups one V3D job may run (i#682). The kernel's v3d driver
- * reset the GPU for a "hang" about once in 30 runs of a 338-workgroup,
- * 274 ms conv dispatch, and the rest of that job never ran; split into
- * jobs of 32, 300 rounds showed no reset and no wrong result, at the
- * same speed.
- */
-constexpr std::uint32_t kV3dSplitGroups = 32;
-
-/**
  * @returns Whether SPIR-V `spv` (`bytes` long) reads the NumWorkgroups
  * built-in (gl_NumWorkGroups): a grid-stride kernel, whose grid must
  * stay one dispatch.
@@ -867,14 +914,15 @@ bool spv_reads_num_workgroups(const std::uint32_t* spv, std::size_t bytes) {
 /**
  * Records a gx x gy x gz grid. With a budget `split` (V3D) it goes as
  * vkCmdDispatchBase pieces of at most `split` workgroups each, x first,
- * then y; a `whole` kernel (one that reads gl_NumWorkGroups) and a grid
- * within the budget go as one dispatch. Each piece sees the same
+ * then y; budget 0 (a kernel that reads gl_NumWorkGroups, or another
+ * device) and a grid within the budget go as one dispatch. z is never
+ * split: every kernel's grid has gz 1. Each piece sees the same
  * gl_WorkGroupID as in the whole grid, so the results are the same.
  */
-void record_grid(VkCommandBuffer cmd, std::uint32_t split, bool whole,
-                 std::uint32_t gx, std::uint32_t gy, std::uint32_t gz) {
+void record_grid(VkCommandBuffer cmd, std::uint32_t split, std::uint32_t gx,
+                 std::uint32_t gy, std::uint32_t gz) {
     const std::uint64_t column = std::uint64_t{gy} * gz;  // one x step
-    if (split == 0 || whole || column * gx <= split) {
+    if (split == 0 || column * gx <= split) {
         vkCmdDispatch(cmd, gx, gy, gz);
         return;
     }
@@ -939,8 +987,11 @@ struct VulkanContext::Impl {
      *  dispatches, each its own job (i#682): the kernel's v3d driver
      *  resets the GPU when it takes a long compute job for a hang, and
      *  that job's remaining workgroups are lost without an error. 0:
-     *  whole grids (other devices). LOCUS_VK_SPLIT=N overrides. */
+     *  whole grids (other devices). LOCUS_VK_SPLIT=N overrides, for
+     *  every kernel (`split_forced`); else each kernel takes
+     *  v3d_split_budget's. */
     std::uint32_t split_groups = 0;
+    bool split_forced = false;
 
     /**
      * Descriptor sets cached by (kernel, buffers): a decode token
@@ -1023,9 +1074,10 @@ struct VulkanContext::Impl {
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
         bool small = false;  ///< built from the kernel's alt_spv
-        /** The shader reads gl_NumWorkGroups (a grid-stride loop), so its
-         *  grid is never split (split_groups). */
-        bool whole = false;
+        /** This kernel's split budget (record_grid): 0 when its shader
+         *  reads gl_NumWorkGroups (a grid-stride loop) or the split is
+         *  off. */
+        std::uint32_t split = 0;
     };
     Pipe pipes[static_cast<int>(Kernel::kCount_)];
 
@@ -1432,6 +1484,7 @@ struct VulkanContext::Impl {
                 e != nullptr ? std::string_view(e) != "0"
                              : device_name.find("V3D") == std::string::npos;
             const char* sp = std::getenv("LOCUS_VK_SPLIT");
+            split_forced = sp != nullptr;
             split_groups =
                 sp != nullptr
                     ? static_cast<std::uint32_t>(std::strtoul(sp, nullptr, 10))
@@ -1582,7 +1635,10 @@ struct VulkanContext::Impl {
         if (split_groups > 0) {
             cpci.flags = VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
         }
-        p.whole = spv_reads_num_workgroups(spv, spv_bytes);
+        p.split = split_groups == 0 || spv_reads_num_workgroups(spv, spv_bytes)
+                      ? 0
+                  : split_forced ? split_groups
+                                 : v3d_split_budget(kd.name);
         check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1,
                                        &cpci, nullptr,
                                        &p.pipeline),
@@ -1992,8 +2048,8 @@ void VulkanContext::dispatch(Kernel k,
     vkCmdPushConstants(im.batch_cmd, p.layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        kd.push_bytes, push.data());
-    record_grid(im.batch_cmd, im.split_groups, p.whole, groups_x, groups_y,
-                groups_z);
+    record_grid(im.batch_cmd, p.split, groups_x, groups_y, groups_z);
+    // One per dispatch() call: a split grid's pieces count as one.
     ++im.prof.dispatches;
     ++im.batch_dispatches;
     if (tracing()) {
