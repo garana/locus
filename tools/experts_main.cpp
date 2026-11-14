@@ -142,6 +142,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "listen on %s failed\n", listen.c_str());
             return 1;
         }
+        if (!locus::pipeline::attach_allow_filter(lfd, allow)) {
+            std::fprintf(stderr, "locus-experts: --allow applies at accept "
+                                 "only (the kernel refused the filter)\n");
+        }
         std::fprintf(stderr, "locus-experts: experts [%u,%u) on :%d\n", lo,
                      hi, bound);
         int failures = 0;

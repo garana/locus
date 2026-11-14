@@ -946,6 +946,19 @@ passed it when it was dialed. In the serve loop the handshake is one
 more per-session state with its own deadline, so a silent peer does
 not stall other sessions (#849). Frames are not signed: a peer on the
 network path is not stopped.
+On Linux, every `--allow` (locus-stage and its metrics port,
+locus-experts, the driver's logits listen, and `http::Server`'s
+`allow`) is also a classic BPF socket filter on the listening socket:
+a SYN from outside the ranges is dropped in the kernel and never
+becomes a connection; the check at accept stays, and a reload
+replaces the filter (#851).
+macOS has no per-socket filter; pf can do the same with root, for
+example an anchor `locus` (listed in pf.conf) loaded with
+`sudo pfctl -a locus -f FILE`, where FILE holds
+
+    pass in quick proto tcp from 10.0.0.0/8 to any port 9000
+    block in quick proto tcp from any to any port 9000
+
 The serve loop can report its live peers (each session's upstream
 and downstream) with the kernel's smoothed TCP round-trip time, read
 from `TCP_INFO` (Linux, FreeBSD) or `TCP_CONNECTION_INFO` (macOS)
