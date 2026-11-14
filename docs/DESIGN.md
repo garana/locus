@@ -215,7 +215,8 @@ scan's trust rule holds for it too; with `--upstream-auth client`, an
 `mdns:` or `scan:` source makes the router warn at startup that client
 keys go to whatever answers.
 With `--register-keys`, an instance can also add
-itself (`locus-server --register`): it POSTs its host:port to
+itself (`locus-server --register`, with a `--host` the router can
+reach, since it listens on 127.0.0.1 by default): it POSTs its host:port to
 `/locus/register` with one of the keys, again every third of its TTL
 (30 s), and the router drops it when that runs out or on
 `/locus/deregister`; without keys the route is a 404, since anyone who

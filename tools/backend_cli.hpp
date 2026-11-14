@@ -194,8 +194,13 @@ inline constexpr const char* kCommonHelp =
     "                   report aggregate tok/s (bench mode)\n"
     "  --metrics-path P locus-server: serve Prometheus metrics at\n"
     "                   path P (default /metrics)\n"
-    "  --host H         locus-server: listen on address H only, for\n"
-    "                   example 127.0.0.1 (default: every interface)\n"
+    "  --host H         locus-server: listen on address H (default\n"
+    "                   127.0.0.1); '*' listens on every interface\n"
+    "  --auth-helper P  locus-server: check client keys with the auth\n"
+    "                   helper P (locus-auth-helper is a reference one):\n"
+    "                   every request but /health needs a key it allows\n"
+    "  --auth-helper-arg A locus-server: an argument for the helper\n"
+    "                   (repeatable)\n"
     "  --sse-keepalive S locus-server: a stream silent for S seconds\n"
     "                   sends an SSE comment (default 15; 0 = off)\n"
     "  --audio-decoder P locus-server: enable /v1/audio/speech with\n"
@@ -357,9 +362,14 @@ struct BackendArgs {
     /** From --metrics-path P: locus-server metrics route (empty =
      * default /metrics). */
     std::string metrics_path;
-    /** From --host H: locus-server's listen address (empty = every
-     *  interface, IPv6 and IPv4). */
-    std::string host;
+    /** From --host H: locus-server's listen address. Loopback unless
+     *  asked (i#625 F7); "--host '*'" gives empty: every interface,
+     *  IPv6 and IPv4. */
+    std::string host = "127.0.0.1";
+    /** From --auth-helper PATH and --auth-helper-arg A: locus-server
+     *  checks client keys with this helper (empty = no key check). */
+    std::vector<std::string> auth_helper;
+    std::vector<std::string> auth_helper_args;
     /** From --sse-keepalive S: seconds of silence before a stream
      *  sends an SSE comment (0 = off). */
     std::uint32_t sse_keepalive = 15;
@@ -568,8 +578,14 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.metrics_path = std::string(a.substr(15));
         } else if (a == "--host" && i + 1 < argc) {
             out.host = argv[++i];
+            if (out.host == "*") out.host.clear();
         } else if (a.rfind("--host=", 0) == 0) {
             out.host = std::string(a.substr(7));
+            if (out.host == "*") out.host.clear();
+        } else if (a == "--auth-helper" && i + 1 < argc) {
+            out.auth_helper = {argv[++i]};
+        } else if (a == "--auth-helper-arg" && i + 1 < argc) {
+            out.auth_helper_args.emplace_back(argv[++i]);
         } else if (a == "--sse-keepalive" && i + 1 < argc) {
             number("--sse-keepalive", argv[++i], out.sse_keepalive);
         } else if (a.rfind("--sse-keepalive=", 0) == 0) {
@@ -686,6 +702,11 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         out.prefix_cache_helper.insert(out.prefix_cache_helper.end(),
                                        out.prefix_cache_helper_args.begin(),
                                        out.prefix_cache_helper_args.end());
+    }
+    if (!out.auth_helper.empty()) {
+        out.auth_helper.insert(out.auth_helper.end(),
+                               out.auth_helper_args.begin(),
+                               out.auth_helper_args.end());
     }
     return out;
 }
