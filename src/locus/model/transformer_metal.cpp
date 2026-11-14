@@ -259,16 +259,27 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 const std::uint64_t krow = row_of(l, false);
                 const std::uint64_t vrow = row_of(l, true);
                 rmsnorm(lay.attn_norm);
-                // q, k and v read xb and write apart: they may overlap,
-                // and so may the two RoPEs.
-                mv(lay.wq, s.xb, s.q, 0, false);
+                // q, k and v read xb and write apart: they may overlap.
+                // The Q4_K matvec applies RoPE as it stores q and k;
+                // other types take the RoPE dispatches after them.
+                const bool q_roped = metal::record_matvec(
+                    ctx, lay.wq.type, lay.wq.rows, lay.wq.cols, wbuf(lay.wq),
+                    0, s.xb, 0, s.q, 0, false, &s.cs, hd);
                 ctx.overlap_next();
-                mv(lay.wk, s.xb, *pool, krow, false);
+                const bool k_roped = metal::record_matvec(
+                    ctx, lay.wk.type, lay.wk.rows, lay.wk.cols, wbuf(lay.wk),
+                    0, s.xb, 0, *pool, krow, false, &s.cs, hd);
                 ctx.overlap_next();
                 mv(lay.wv, s.xb, *pool, vrow, false);
-                rope(s.q, 0, H);
-                ctx.overlap_next();
-                rope(*pool, krow, KV);
+                if (!q_roped) {
+                    rope(s.q, 0, H);
+                }
+                if (!k_roped) {
+                    if (!q_roped) {
+                        ctx.overlap_next();  // the two RoPEs, likewise
+                    }
+                    rope(*pool, krow, KV);
+                }
                 const AttnParams ap{cache.block_floats(),
                                     cache.layer_offset(l),
                                     cache.layer_floats() / 2,
@@ -301,12 +312,19 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 }
                 mv(lay.wo, s.att, s.x, 0, true);
                 rmsnorm(lay.ffn_norm);
-                mv(lay.w_gate, s.xb, s.gate, 0, false);
-                ctx.overlap_next();  // gate and up, likewise
-                mv(lay.w_up, s.xb, s.up, 0, false);
-                const SiluParams sp{ff};
-                const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
-                ctx.dispatch("silu_mul", su, bytes_of(sp), ff, 256);
+                // Gate, up and SwiGLU in one Q4_K dispatch, or the two
+                // matvecs (they may overlap) and silu_mul.
+                if (lay.w_up.type != lay.w_gate.type ||
+                    !metal::record_glu(ctx, lay.w_gate.type, lay.w_gate.rows,
+                                       lay.w_gate.cols, wbuf(lay.w_gate),
+                                       wbuf(lay.w_up), s.xb, s.gate)) {
+                    mv(lay.w_gate, s.xb, s.gate, 0, false);
+                    ctx.overlap_next();
+                    mv(lay.w_up, s.xb, s.up, 0, false);
+                    const SiluParams sp{ff};
+                    const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
+                    ctx.dispatch("silu_mul", su, bytes_of(sp), ff, 256);
+                }
                 mv(lay.w_down, s.gate, s.x, 0, true);
             }
             rmsnorm(out_norm_);

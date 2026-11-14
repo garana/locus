@@ -58,14 +58,33 @@ void drop_weights();
  *     Q8_0 and Q6_K read bytes, any offset.
  * @param x_off Floats into x, a multiple of 4.
  * @param out_off Floats into out.
+ * @param rope_cs With rope_hd, RoPE's (cos, sin) table: the output rows
+ *     are rotated in pairs within heads of rope_hd rows as they are
+ *     stored (Q4_K only; other types leave it to the caller).
+ * @returns Whether the rows were rotated.
  * @throws std::invalid_argument for a type without a kernel, columns
  *     that are not whole blocks, or a bad x_off.
  */
-void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+bool record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t cols, const Context::Buffer& w,
                    std::uint64_t w_off, const Context::Buffer& x,
                    std::uint32_t x_off, const Context::Buffer& out,
-                   std::uint64_t out_off, bool accumulate);
+                   std::uint64_t out_off, bool accumulate,
+                   const Context::Buffer* rope_cs = nullptr,
+                   std::uint32_t rope_hd = 0);
+
+/**
+ * Records out[r] = silu(gate_r . x) * (up_r . x) for r < rows, the
+ * FFN's gate, up and SwiGLU in one dispatch, when both matrices are
+ * Q4_K (from offset 0 of their buffers). The caller holds
+ * device_mutex().
+ * @returns false, recording nothing, for another type: the caller runs
+ *     the two matvecs and silu_mul.
+ */
+bool record_glu(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                std::uint32_t cols, const Context::Buffer& w_gate,
+                const Context::Buffer& w_up, const Context::Buffer& x,
+                const Context::Buffer& out);
 
 /** @returns The bytes of a rows x cols matrix of type t (0 for a type
  *  without a kernel). */

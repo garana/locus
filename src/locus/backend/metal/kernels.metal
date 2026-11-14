@@ -38,6 +38,7 @@ struct MvParams {
     uint accumulate;
     uint x_off;
     float scale;
+    uint rope_hd;   // mv_q4_k: rotate row pairs (0: no)
 };
 
 constant constexpr uint kMvLanes = 16;
@@ -150,20 +151,14 @@ inline float dot8(float4 a, float4 b, uint2 q, uint sh) {
     return dot(q0, a) + dot(q1, b);
 }
 
-kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
-                    device const float* xb [[buffer(1)]],
-                    device float* out [[buffer(2)]],
-                    constant MvParams& p [[buffer(3)]],
-                    uint tg [[threadgroup_position_in_grid]],
-                    uint sg [[simdgroup_index_in_threadgroup]],
-                    uint lane [[thread_index_in_simdgroup]]) {
-    const uint r0 = tg * kQ4Rows + sg * 2;
-    const uint nb = p.cols / 256;
-    const ulong row_bytes = ulong(nb) * 144;
+// The lane's share of two Q4_K rows' dots with x: rows a and b (b only
+// when has_b), as above. Both lanes' sums still need a simd_sum.
+inline float2 q4k_two(device const uchar* ra, device const uchar* rb,
+                      bool has_b, uint nb, device const float* xb,
+                      uint lane) {
     const uint ix = lane / 8, jq = (lane % 8) / 4, ir = lane % 4;
-    device const uchar* w0 = w + p.w_off + ulong(r0) * row_bytes;
-    device const float* x = xb + p.x_off + 64 * jq + 8 * ir;
-    float acc0 = 0.0f, acc1 = 0.0f;
+    device const float* x = xb + 64 * jq + 8 * ir;
+    float2 acc = 0.0f;
     for (uint b = ix; b < nb; b += 4) {
         device const float4* y = (device const float4*)(x + b * 256);
         // Elements of sub-blocks 2 jq, 2 jq + 1, 2 jq + 4, 2 jq + 5.
@@ -172,10 +167,10 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
         const float s0 = hsum(a0 + a1), s1 = hsum(b0 + b1);
         const float s2 = hsum(c0 + c1), s3 = hsum(e0 + e1);
         for (uint i = 0; i < 2; ++i) {
-            if (r0 + i >= p.rows) {
+            if (i == 1 && !has_b) {
                 break;
             }
-            device const uchar* blk = w0 + i * row_bytes + b * 144;
+            device const uchar* blk = (i == 0 ? ra : rb) + b * 144;
             const half2 dm = *(device const half2*)blk;
             float sc0, mn0, sc1, mn1, sc2, mn2, sc3, mn3;
             q4k_scale_min(2 * jq, blk + 4, sc0, mn0);
@@ -185,26 +180,78 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
             device const uchar* q = blk + 16 + 32 * jq + 8 * ir;
             const uint2 lo = *(device const uint2*)q;
             const uint2 hi = *(device const uint2*)(q + 64);
-            const float v = float(dm.x) * (sc0 * dot8(a0, a1, lo, 0) +
-                                           sc1 * dot8(b0, b1, lo, 4) +
-                                           sc2 * dot8(c0, c1, hi, 0) +
-                                           sc3 * dot8(e0, e1, hi, 4)) -
-                            float(dm.y) * (mn0 * s0 + mn1 * s1 + mn2 * s2 +
-                                           mn3 * s3);
-            if (i == 0) {
-                acc0 += v;
-            } else {
-                acc1 += v;
-            }
+            acc[i] += float(dm.x) * (sc0 * dot8(a0, a1, lo, 0) +
+                                     sc1 * dot8(b0, b1, lo, 4) +
+                                     sc2 * dot8(c0, c1, hi, 0) +
+                                     sc3 * dot8(e0, e1, hi, 4)) -
+                      float(dm.y) *
+                          (mn0 * s0 + mn1 * s1 + mn2 * s2 + mn3 * s3);
         }
     }
-    const float t0 = simd_sum(acc0), t1 = simd_sum(acc1);
+    return acc;
+}
+
+// With rope_hd > 0 the two rows (r0 even, a pair within a head of
+// rope_hd rows) are rotated by cs[r0 % rope_hd] (cos) and the next
+// float (sin) as they are stored: rope_norm on q or k, fused. cs is
+// buffer 3 (any buffer when rope_hd is 0) and the params buffer 4.
+kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
+                    device const float* xb [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    device const float* cs [[buffer(3)]],
+                    constant MvParams& p [[buffer(4)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint sg [[simdgroup_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]]) {
+    const uint r0 = tg * kQ4Rows + sg * 2;
+    if (r0 >= p.rows) {
+        return;  // a whole simdgroup past the end
+    }
+    const uint nb = p.cols / 256;
+    const ulong row_bytes = ulong(nb) * 144;
+    device const uchar* ra = w + p.w_off + ulong(r0) * row_bytes;
+    const float2 acc =
+        q4k_two(ra, ra + row_bytes, r0 + 1 < p.rows, nb, xb + p.x_off, lane);
+    float t0 = p.scale * simd_sum(acc.x), t1 = p.scale * simd_sum(acc.y);
+    if (p.rope_hd > 0) {
+        const uint i = r0 % p.rope_hd;
+        const float c = cs[i], s = cs[i + 1];
+        const float a = t0;
+        t0 = a * c - t1 * s;
+        t1 = a * s + t1 * c;
+    }
     if (lane == 0) {
         for (uint i = 0; i < 2 && r0 + i < p.rows; ++i) {
             device float* o = out + p.out_off + r0 + i;
-            const float v = p.scale * (i == 0 ? t0 : t1);
+            const float v = i == 0 ? t0 : t1;
             *o = p.accumulate != 0 ? *o + v : v;
         }
+    }
+}
+
+// The FFN's gate and up projections and their SwiGLU in one:
+// out[out_off + r] = silu(gate_r . x) * (up_r . x), gate at buffer 0
+// and up at buffer 3 (the same shape and w_off; the params at 4). A simdgroup takes one
+// row of each, two simdgroups a threadgroup.
+kernel void mv_q4_k_glu(device const uchar* wg [[buffer(0)]],
+                        device const float* xb [[buffer(1)]],
+                        device float* out [[buffer(2)]],
+                        device const uchar* wu [[buffer(3)]],
+                        constant MvParams& p [[buffer(4)]],
+                        uint tg [[threadgroup_position_in_grid]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    const uint r = tg * 2 + sg;
+    if (r >= p.rows) {
+        return;
+    }
+    const uint nb = p.cols / 256;
+    const ulong at = p.w_off + ulong(r) * ulong(nb) * 144;
+    const float2 acc = q4k_two(wg + at, wu + at, true, nb, xb + p.x_off,
+                               lane);
+    const float g = simd_sum(acc.x), u = simd_sum(acc.y);
+    if (lane == 0) {
+        out[p.out_off + r] = g / (1.0f + exp(-g)) * u;
     }
 }
 

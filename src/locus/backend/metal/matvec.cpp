@@ -46,6 +46,7 @@ struct MvParams {
     std::uint64_t w_off, out_off;
     std::uint32_t rows, cols, accumulate, x_off;
     float scale;
+    std::uint32_t rope_hd;
 };
 
 
@@ -130,21 +131,50 @@ bool matvec_shape_ok(gguf::TensorType t, std::uint32_t cols) {
     return k.kernel != nullptr && cols % k.block == 0;
 }
 
-void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+bool record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t cols, const Context::Buffer& w,
                    std::uint64_t w_off, const Context::Buffer& x,
                    std::uint32_t x_off, const Context::Buffer& out,
-                   std::uint64_t out_off, bool accumulate) {
+                   std::uint64_t out_off, bool accumulate,
+                   const Context::Buffer* rope_cs, std::uint32_t rope_hd) {
     const Kind k = kind_of(t);
     if (k.kernel == nullptr || cols % k.block != 0 || x_off % 4 != 0) {
         throw std::invalid_argument("metal record_matvec: no kernel");
     }
-    const MvParams p{w_off, out_off, rows, cols, accumulate ? 1u : 0u,
-                     x_off, 1.0f};
-    const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
+    // Only the Q4_K kernel rotates (its simdgroup holds a row pair).
+    const bool rope = rope_cs != nullptr && rope_hd > 0 &&
+                      t == gguf::TensorType::kQ4_K && rope_hd % 2 == 0 &&
+                      rows % 2 == 0;
+    const MvParams p{w_off, out_off,  rows,  cols, accumulate ? 1u : 0u,
+                     x_off, 1.0f,     rope ? rope_hd : 0u};
     const std::uint32_t groups = (rows + k.rows - 1) / k.rows;
-    ctx.dispatch(k.kernel, args, std::as_bytes(std::span(&p, 1)),
-                 groups * k.group, k.group);
+    if (t == gguf::TensorType::kQ4_K) {
+        // The Q4_K kernel takes the RoPE table at 3 and its params at 4.
+        const Context::Arg args[] = {
+            {&w, 0}, {&x, 0}, {&out, 0}, {rope ? rope_cs : &x, 0}};
+        ctx.dispatch(k.kernel, args, std::as_bytes(std::span(&p, 1)),
+                     groups * k.group, k.group);
+    } else {
+        const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
+        ctx.dispatch(k.kernel, args, std::as_bytes(std::span(&p, 1)),
+                     groups * k.group, k.group);
+    }
+    return rope;
+}
+
+bool record_glu(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                std::uint32_t cols, const Context::Buffer& w_gate,
+                const Context::Buffer& w_up, const Context::Buffer& x,
+                const Context::Buffer& out) {
+    if (t != gguf::TensorType::kQ4_K || cols % 256 != 0) {
+        return false;
+    }
+    const MvParams p{0, 0, rows, cols, 0, 0, 1.0f, 0};
+    const Context::Arg args[] = {
+        {&w_gate, 0}, {&x, 0}, {&out, 0}, {&w_up, 0}};
+    ctx.dispatch("mv_q4_k_glu", args, std::as_bytes(std::span(&p, 1)),
+                 ((rows + 1) / 2) * 64, 64);
+    return true;
 }
 
 std::size_t matvec_weight_bytes(gguf::TensorType t, std::uint32_t rows,
