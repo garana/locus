@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 namespace locus::sys {
 
 /**
@@ -18,5 +20,25 @@ int child_fd_limit();
  * Async-signal-safe: call it in the child between fork and exec.
  */
 void close_fds_from_3(int limit);
+
+/**
+ * The executable a command name runs: a name with a '/' as it is, else
+ * the first match on PATH (/usr/bin:/bin when PATH is unset), as a
+ * shell finds it. Call it in the parent: a child after fork may only
+ * execv the result (execvp's PATH search is not async-signal-safe).
+ *
+ * @returns The path, or empty when nothing executable is found.
+ */
+std::string find_executable(const std::string& name);
+
+/**
+ * Moves `fd` above the std fds (0, 1, 2) when it is one of them, with
+ * close-on-exec set. A server started with fd 0, 1 or 2 closed can get
+ * one of those from pipe(); a child's dup2 onto the same number is then
+ * a no-op that keeps close-on-exec, and the std fd is gone after exec.
+ *
+ * @returns false, with `fd` unchanged, when the move fails.
+ */
+bool lift_above_std(int& fd);
 
 }  // namespace locus::sys
