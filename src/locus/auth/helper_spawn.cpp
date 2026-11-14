@@ -9,6 +9,8 @@
 #include <cstring>
 #include <exception>
 
+#include "locus/sys/child_fds.hpp"
+
 namespace locus::auth {
 
 namespace detail {
@@ -98,6 +100,18 @@ std::unique_ptr<HelperConnection> spawn_helper(
         return fail("pipe");
     }
 
+    // Everything the child needs is made here, before fork: the child of
+    // a threaded process may only make async-signal-safe calls (another
+    // thread may hold the allocator's lock at the fork), so it does not
+    // allocate.
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const std::string& a : argv) {
+        cargv.push_back(const_cast<char*>(a.c_str()));
+    }
+    cargv.push_back(nullptr);
+    const int fd_limit = sys::child_fd_limit();
+
     const pid_t pid = ::fork();
     if (pid < 0) {
         close_all(in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1]);
@@ -105,16 +119,12 @@ std::unique_ptr<HelperConnection> spawn_helper(
     }
     if (pid == 0) {
         // Child: stdin <- in_pipe read end, stdout -> out_pipe write
-        // end. dup2 clears CLOEXEC on the new std fds.
+        // end. dup2 clears CLOEXEC on the new std fds. Then every other
+        // fd goes, so the helper holds none of the server's sockets or
+        // files (not every fd locus opens is close-on-exec).
         ::dup2(in_pipe[0], STDIN_FILENO);
         ::dup2(out_pipe[1], STDOUT_FILENO);
-        close_all(in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1]);
-        std::vector<char*> cargv;
-        cargv.reserve(argv.size() + 1);
-        for (const std::string& a : argv) {
-            cargv.push_back(const_cast<char*>(a.c_str()));
-        }
-        cargv.push_back(nullptr);
+        sys::close_fds_from_3(fd_limit);
         // A signal mask survives exec: locus-server blocks SIGINT and
         // SIGTERM for its stopper thread, and the helper must get them.
         sigset_t none;

@@ -124,6 +124,7 @@ add_library(locus
     src/locus/http/loop_connection.cpp
     src/locus/http/server.cpp
     src/locus/http/metrics.cpp
+    src/locus/sys/child_fds.cpp
     src/locus/sys/mmap_file.cpp
     src/locus/sys/poller.cpp
     src/locus/sys/thread_pool.cpp
