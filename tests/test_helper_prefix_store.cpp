@@ -167,12 +167,12 @@ TEST_CASE("HelperPrefixStore with a key signs its blobs", "[disk_prefix]") {
     auto out = blocks(2, 0);
     REQUIRE(file_store.read(kPrompt, 2, dsts(out)));
     REQUIRE(out == b);
-    // Another key: the same name, but the tag does not check.
+    // Another key names its blobs apart: no hit, and nothing removed.
     HelperPrefixStore other(helper(g.dir), key(), kBlockBytes, kCap);
     other.set_mac_key(std::string(32, 'y'));
-    REQUIRE(other.find(kPrompt) == 2);
+    REQUIRE(other.find(kPrompt) == 0);
     auto out2 = blocks(2, 0);
-    REQUIRE_FALSE(other.read(kPrompt, 2, dsts(out2)));
+    REQUIRE(file_store.read(kPrompt, 2, dsts(out2)));
 }
 
 TEST_CASE("HelperPrefixStore: a blob that does not check is a miss",
