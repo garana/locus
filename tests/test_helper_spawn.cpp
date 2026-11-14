@@ -7,6 +7,8 @@
 
 #include <cerrno>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <string>
 #include <thread>
@@ -98,6 +100,30 @@ TEST_CASE("spawn_helper resolves the command on PATH in the parent",
     q.type = "auth";
     q.set("credential", "on-path");
     REQUIRE(conn->request(std::move(q), 2000ms).has_value());
+}
+
+// A bare name not on PATH must not run a file of that name in the
+// server's working directory (execvp never looked there).
+TEST_CASE("spawn_helper does not run a bare name from the cwd", "[auth]") {
+    namespace fs = std::filesystem;
+    const fs::path d = fs::temp_directory_path() /
+                       ("locus-cwd-" + std::to_string(::getpid()));
+    fs::create_directories(d);
+    const fs::path script = d / "locus-cwd-helper-xyz";
+    std::ofstream(script) << "#!/bin/sh\nexec cat\n";
+    fs::permissions(script, fs::perms::owner_all, fs::perm_options::replace);
+    const fs::path back = fs::current_path();
+    fs::current_path(d);
+    std::string err;
+    auto conn = spawn_helper({"locus-cwd-helper-xyz"}, &err);
+    fs::current_path(back);
+    REQUIRE(conn);
+    HelperMessage q;
+    q.type = "auth";
+    q.set("credential", "x");
+    CHECK_FALSE(conn->request(std::move(q), 1000ms).has_value());
+    conn.reset();
+    fs::remove_all(d);
 }
 
 TEST_CASE("spawn_helper on a bad command reports broken", "[auth]") {

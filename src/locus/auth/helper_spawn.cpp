@@ -120,10 +120,10 @@ std::unique_ptr<HelperConnection> spawn_helper(
     cargv.push_back(nullptr);
     const int fd_limit = sys::child_fd_limit();
     // The PATH search too: execvp's is not async-signal-safe. A name that
-    // resolves to nothing is still exec'd as given, so it fails in the
-    // child (exit 127) and the connection reads as broken, as before.
-    std::string exe = sys::find_executable(argv[0]);
-    if (exe.empty()) exe = argv[0];
+    // resolves to nothing is not exec'd at all (exec'ing a bare name
+    // would open it in the cwd, which execvp never did): the child exits
+    // 127 and the connection reads as broken, as before.
+    const std::string exe = sys::find_executable(argv[0]);
 
     const pid_t pid = ::fork();
     if (pid < 0) {
@@ -143,7 +143,7 @@ std::unique_ptr<HelperConnection> spawn_helper(
         sigset_t none;
         sigemptyset(&none);
         ::sigprocmask(SIG_SETMASK, &none, nullptr);
-        ::execv(exe.c_str(), cargv.data());
+        if (!exe.empty()) ::execv(exe.c_str(), cargv.data());
         _exit(127);  // exec failed
     }
     // Parent: keep in_pipe[1] (write to child) + out_pipe[0] (read).
