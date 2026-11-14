@@ -400,14 +400,14 @@ void Server::stop() {
     // No lock: the acceptor is the only writer and it has been joined
     // above, so nothing can touch unclassified_ now.
     for (const Unclassified& u : unclassified_) {
-        ::close(u.fd);
+        close_conn(u.fd, u.peer_ip);
     }
     unclassified_.clear();
     // Close any connections the acceptor queued but no worker served.
     {
         std::lock_guard<std::mutex> lk(handoff_mu_);
         while (!handoff_.empty()) {
-            ::close(handoff_.front().fd);
+            close_conn(handoff_.front().fd, handoff_.front().peer_ip);
             handoff_.pop_front();
         }
     }
@@ -445,7 +445,7 @@ void Server::worker_loop() {
             handoff_.pop_front();
         }
         serve_connection_guarded(c.fd, c.peer_ip, false);
-        ::close(c.fd);
+        close_conn(c.fd, c.peer_ip);
     }
 }
 
@@ -550,11 +550,17 @@ void Server::accept_one_conn() {
         ::close(fd);
         return;
     }
+    // i#625 F21: a peer at its cap is closed at once, so one address
+    // cannot hold every worker (and the backlog) by itself.
+    if (!take_ip_slot(peer_ip)) {
+        ::close(fd);
+        return;
+    }
     // Nothing to classify without a fast_path predicate: straight to the
     // pool, exactly as before the fast path existed.
     if (!cfg_.fast_path) {
         if (!enqueue_handoff(fd, peer_ip)) {
-            ::close(fd);
+            close_conn(fd, peer_ip);
         }
         return;
     }
@@ -568,7 +574,7 @@ void Server::accept_one_conn() {
             : 128;
     if (unclassified_.size() >= cap) {
         if (!enqueue_handoff(fd, peer_ip)) {
-            ::close(fd);
+            close_conn(fd, peer_ip);
         }
         return;
     }
@@ -621,11 +627,11 @@ void Server::classify_ready(int fd) {
             const InlineDeadline deadline;
             serve_connection_guarded(fd, peer_ip, /*single_request=*/true);
         }
-        ::close(fd);
+        close_conn(fd, peer_ip);
         return;
     }
     if (!enqueue_handoff(fd, peer_ip)) {
-        ::close(fd);
+        close_conn(fd, peer_ip);
     }
 }
 
@@ -644,8 +650,34 @@ void Server::expire_unclassified() {
     for (const Pending& p : due) {
         unwatch_unclassified(p.fd);
         if (!enqueue_handoff(p.fd, p.peer_ip)) {
-            ::close(p.fd);
+            close_conn(p.fd, p.peer_ip);
         }
+    }
+}
+
+bool Server::take_ip_slot(const std::string& peer_ip) {
+    if (cfg_.max_conns_per_ip == 0) {
+        return true;
+    }
+    std::lock_guard lk(per_ip_mu_);
+    std::size_t& n = per_ip_[peer_ip];
+    if (n >= cfg_.max_conns_per_ip) {
+        if (n == 0) per_ip_.erase(peer_ip);
+        return false;
+    }
+    ++n;
+    return true;
+}
+
+void Server::close_conn(int fd, const std::string& peer_ip) {
+    ::close(fd);
+    if (cfg_.max_conns_per_ip == 0) {
+        return;
+    }
+    std::lock_guard lk(per_ip_mu_);
+    const auto it = per_ip_.find(peer_ip);
+    if (it != per_ip_.end() && --it->second == 0) {
+        per_ip_.erase(it);
     }
 }
 
