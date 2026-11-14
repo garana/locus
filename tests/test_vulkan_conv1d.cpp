@@ -339,6 +339,44 @@ struct SplitEnv {
 
 }  // namespace
 
+// i#885: the V3D split budget follows each build's work per workgroup,
+// and a kernel the table does not know takes the safe 32. No device:
+// the budget is a function of the kernel's name.
+TEST_CASE("v3d split budgets follow the work per workgroup",
+          "[vulkan][conv2d]") {
+    const auto budget = [](const char* name) {
+        return VulkanContext::v3d_split_budget(name);
+    };
+    // One-token builds (decode, and the NT 1 build).
+    for (const char* n :
+         {"matvec_q8_0", "matvec_q4_k", "matvec_q6_k", "matvec_f32",
+          "matvec_bf16", "matvec_iq2_xxs", "matvec_iq4_xs", "matvec_q8_0_glu",
+          "matvec_q4_k_glu", "matvec_q8_0_seg", "matvec_q3_k_seg",
+          "matvec_q8_0_n1", "matvec_q8_0_n1_glu"}) {
+        INFO(n);
+        CHECK(budget(n) == 1024);
+    }
+    CHECK(budget("matvec_f16_n2") == 512);
+    CHECK(budget("matvec_q8_0_n2_glu") == 512);
+    CHECK(budget("matvec_q8_0_n4") == 256);
+    CHECK(budget("matvec_q4_k_n4_glu") == 256);
+    // NT 8, batched, pair, shared-expert and transposed builds.
+    for (const char* n :
+         {"matvec_q8_0_n", "matvec_q8_0_n_glu", "matvec_q8_0_n_ng",
+          "matvec_q4_k_n", "matvec_q8_0_b", "matvec_q4_k_glu_b",
+          "matvec_q8_0_p", "matvec_q8_0_glu_p", "matvec_q8_0_glu_sh_b",
+          "matvec_t", "matvec_t_q8"}) {
+        INFO(n);
+        CHECK(budget(n) == 128);
+    }
+    // Everything else, and a matvec build the table does not know.
+    for (const char* n : {"conv2d_gemm", "matmul_q4_k", "attn_decode",
+                          "matvec_q8_0_newbuild", "matvec"}) {
+        INFO(n);
+        CHECK(budget(n) == 32);
+    }
+}
+
 // i#682: on V3D a large grid goes as several vkCmdDispatchBase pieces
 // (LOCUS_VK_SPLIT sets the budget). A split grid must give the whole
 // one's bits: here on any device, with the split forced, over a grid of
