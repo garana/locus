@@ -92,15 +92,26 @@ class GbnfMatcher {
   public:
     /** Parse stacks kept per state by default. */
     static constexpr std::size_t kMaxStacks = 4096;
+    /**
+     * Words (rule positions) a step's expansion may hold at once, in
+     * its worklist and in its output each, by default (i#844): 2^20,
+     * 4 MiB a buffer. The visit budget bounds the time; this bounds the
+     * memory, which a wide, deep grammar could otherwise raise to tens
+     * of MB within that budget.
+     */
+    static constexpr std::size_t kMaxWords = std::size_t{1} << 20;
 
     /**
      * @param g The grammar.
      * @param max_stacks The most parse stacks a state keeps; past it the
      *     rest are dropped, truncated() turns true and
      *     gbnf_stack_overflows() counts it.
+     * @param max_words The most words a step's expansion holds in its
+     *     worklist or its output; past it the step is cut the same way.
      */
     explicit GbnfMatcher(std::shared_ptr<const Gbnf> g,
-                         std::size_t max_stacks = kMaxStacks);
+                         std::size_t max_stacks = kMaxStacks,
+                         std::size_t max_words = kMaxWords);
 
     /**
      * Advances on one byte.
@@ -130,9 +141,9 @@ class GbnfMatcher {
     std::string key() const;
 
     /**
-     * @returns Whether some state on the way here had more parse stacks
-     *     than the cap, so continuations the grammar allows may be
-     *     missing.
+     * @returns Whether some state on the way here was cut (more parse
+     *     stacks than the cap, or an expansion past its visit budget or
+     *     word cap), so continuations the grammar allows may be missing.
      */
     bool truncated() const { return truncated_; }
 
@@ -149,14 +160,19 @@ class GbnfMatcher {
         }
         void push(const std::vector<std::uint32_t>& s);
     };
+    /** How an expansion ended. */
+    enum class Expand {
+        kDone,    ///< every stack reached, all in `out`
+        kBudget,  ///< the visit budget ran out: some were dropped
+        kFull,    ///< `out` or the worklist reached max_words_
+    };
     /**
      * Appends to `out` every stack `cur` reaches before consuming a
      * character, over an explicit worklist (no recursion, i#625 F1).
-     * @param budget Stack visits left for this step; spent here.
-     * @returns Whether the budget ran out, so stacks were dropped.
+     * @param budget Stack visits left for this expansion; spent here.
      */
-    bool expand(const std::vector<std::uint32_t>& cur, Stacks& out,
-                std::size_t& budget) const;
+    Expand expand(const std::vector<std::uint32_t>& cur, Stacks& out,
+                  std::size_t& budget) const;
     bool viable(char32_t lo, char32_t hi) const;
     /** Sorts and dedups s, keeping max_stacks_. @returns whether any
      * distinct stack was dropped. */
@@ -166,6 +182,7 @@ class GbnfMatcher {
 
     std::shared_ptr<const Gbnf> g_;
     std::size_t max_stacks_ = kMaxStacks;
+    std::size_t max_words_ = kMaxWords;
     bool truncated_ = false;
     Stacks stacks_;
     // Scratch for step(): the stack being expanded, the dedup order
@@ -173,6 +190,8 @@ class GbnfMatcher {
     mutable std::vector<std::uint32_t> cur_;
     mutable std::vector<std::uint32_t> order_;
     mutable Stacks tmp_;
+    // Scratch for step(): the stacks still to expand in this pass.
+    mutable std::vector<std::uint32_t> pending_;
     // Scratch for expand(): its worklist and the stack it works on.
     mutable Stacks work_;
     mutable std::vector<std::uint32_t> top_;
@@ -186,10 +205,11 @@ class GbnfMatcher {
 /**
  * @returns How many matcher paths in this process became truncated:
  *     a state built or fed (GbnfMatcher's constructor or feed(), the
- *     path the output takes) had more parse stacks than the cap and
- *     dropped the rest, which can hide a continuation the grammar
- *     allows. Each path counts once; the states a token mask only
- *     tries (step()) do not count. The first is also logged to stderr.
+ *     path the output takes) was cut (more parse stacks than the cap,
+ *     or an expansion past its visit budget or word cap) and dropped
+ *     the rest, which can hide a continuation the grammar allows.
+ *     Each path counts once; the states a token mask only tries
+ *     (step()) do not count. The first is also logged to stderr.
  */
 std::uint64_t gbnf_stack_overflows();
 
