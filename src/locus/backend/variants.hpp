@@ -178,6 +178,19 @@ void matvec_vulkan(const Mat& w, std::span<const float> x,
                    std::span<float> out);
 
 /**
+ * A bench hook (i#784): records `reps` copies of w's decode matvec
+ * (the kernel matvec_vulkan runs) in one batch, each after a barrier
+ * as in a decode step, submits it and waits.
+ * @param x The input, w.cols floats.
+ * @param out The result of the last copy, w.rows floats.
+ * @returns The submit-to-done wall time per copy, in ms.
+ * @throws std::invalid_argument for a weight type without a matvec
+ *     shader, reps 0, or mismatched spans.
+ */
+double vulkan_matvec_repeat(const Mat& w, std::span<const float> x,
+                            std::span<float> out, std::uint32_t reps);
+
+/**
  * matvec_batch on the GPU: w applied to n token-major inputs in one
  * batched matmul dispatch (rec_matmul), output row-major
  * (out[r * n + t]) as the Ops contract says. Weights are cached by
