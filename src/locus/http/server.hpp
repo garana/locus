@@ -203,17 +203,13 @@ struct ServerConfig {
      * inference worker pool, so cheap control endpoints (/health,
      * /metrics) are not starved when every worker is busy in a long
      * generation. Matched on the request line, peeked without consuming;
-     * each fast-path connection is served exactly ONE request and closed,
-     * so a keep-alive connection can never carry a later (inference)
-     * request into the acceptor. Empty (default) = no fast path; every
-     * request goes to the pool. The predicate must be cheap and must not
-     * block.
-     *
-     * Scope: this removes starvation by a busy worker POOL. A fast route
-     * can still queue behind the acceptor's own per-connection peek -- a
-     * client that connects and sends nothing holds the single acceptor
-     * for up to the peek window. Making classification event-driven so
-     * one slow client cannot block the acceptor is tracked in i#88. */
+     * a match is served inline only once the whole request (at most 16
+     * KiB) is buffered, and one still arriving after 100 ms goes to the
+     * pool, so a slow client never holds the acceptor. Each fast-path
+     * connection is served exactly ONE request and closed, so a
+     * keep-alive connection can never carry a later (inference) request
+     * into the acceptor. Empty (default) = no fast path; every request
+     * goes to the pool. The predicate must be cheap and must not block. */
     std::function<bool(std::string_view method, std::string_view target)>
         fast_path;
     /** Per-route request metrics, recorded for every answered request
@@ -259,8 +255,9 @@ class Server {
      * the classification poll set. Never blocks on the new peer. */
     void accept_one_conn();
     /** Classifies an unclassified connection the poll set has reported
-     * readable: a matching fast_path route is served inline (one
-     * request, then closed); anything else goes to the pool. */
+     * readable (or a partial one due for its recheck): a whole buffered
+     * fast_path request is served inline (one request, then closed); one
+     * still arriving waits as partial; anything else goes to the pool. */
     void classify_ready(int fd);
     /** Hands every unclassified connection whose classification
      * deadline has passed to the pool, which is where a client that has
@@ -275,13 +272,23 @@ class Server {
      * wakes a worker. @returns false when the queue is at its cap, in
      * which case the caller must close `fd` (shed, never accumulate). */
     bool enqueue_handoff(int fd, const std::string& peer_ip);
-    /** Peeks (MSG_PEEK, never consumes) the request line on `fd` and
-     * extracts method + target. The caller must only call this for an
-     * fd already reported readable: there is no poll inside, because a
-     * blocking per-connection poll here serialized the sole acceptor
-     * (i#88). @returns true if a full request line was read; false
-     * (treat as non-fast) on a short/garbled head or a read error. */
-    bool peek_request_line(int fd, std::string& method, std::string& target);
+    /** What the acceptor does with a connection it peeked. */
+    enum class Classified {
+        kServe,  /**< a fast_path request, all of it buffered: inline. */
+        kPool,   /**< any other request, or an error: the pool. */
+        kWait,   /**< maybe fast, not all here yet: peek again later. */
+    };
+    /**
+     * Peeks (MSG_PEEK, never consumes) what `fd` has buffered and parses
+     * it as a whole request. Only a fast_path request whose head AND
+     * body are all buffered is served inline: serving one still in
+     * transit would block the sole acceptor on the client's next bytes
+     * (i#625 F4). No poll inside, as a blocking per-connection poll here
+     * serialized the acceptor (i#88).
+     * @returns kServe, kPool, or kWait (a request line not complete yet,
+     *     or a fast one still arriving).
+     */
+    Classified peek_classify(int fd);
     /** @param single_request when true, serve at most ONE request and
      * close (forces keep-alive off). The acceptor uses it for fast-path
      * connections so an adopted keep-alive connection can never carry a
@@ -352,6 +359,10 @@ class Server {
         int fd;
         std::string peer_ip;
         std::chrono::steady_clock::time_point deadline;
+        /** Peeked kWait: its buffered bytes keep it readable, so it is
+         *  left out of the poll set and peeked again at `recheck`. */
+        bool partial = false;
+        std::chrono::steady_clock::time_point recheck{};
     };
     /** Acceptor-thread only (no lock): the acceptor is the sole owner,
      * and stop() drains this only after joining it. The readiness set
