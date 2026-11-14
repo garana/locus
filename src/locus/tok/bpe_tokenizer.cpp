@@ -4,7 +4,7 @@
 
 #include <algorithm>
 #include <array>
-#include <limits>
+#include <queue>
 #include <stdexcept>
 
 namespace locus::tok {
@@ -481,37 +481,89 @@ BpeTokenizer BpeTokenizer::from_gguf(const gguf::GgufFile& g) {
 
 void BpeTokenizer::bpe_word(std::string_view word,
                             std::vector<TokenId>& out) const {
-    // Bytes -> alphabet codepoints, one symbol per byte.
-    std::vector<std::string> syms;
+    // Bytes -> alphabet codepoints, one symbol per byte: (offset,
+    // length) runs of `text`, linked so a merge is O(1). A merged-away
+    // symbol keeps len 0.
+    struct Sym {
+        std::size_t off;
+        std::size_t len;
+        std::ptrdiff_t prev;
+        std::ptrdiff_t next;
+    };
+    std::string text;
+    std::vector<Sym> syms;
     syms.reserve(word.size());
     for (char c : word) {
-        std::string s;
-        append_utf8(s, alphabet().to_cp[static_cast<std::size_t>(
-                           static_cast<unsigned char>(c))]);
-        syms.push_back(std::move(s));
+        const std::size_t off = text.size();
+        append_utf8(text, alphabet().to_cp[static_cast<std::size_t>(
+                              static_cast<unsigned char>(c))]);
+        const auto k = static_cast<std::ptrdiff_t>(syms.size());
+        syms.push_back({off, text.size() - off, k - 1, k + 1});
     }
-    // Lowest-rank-first pair merging.
-    while (syms.size() > 1) {
-        std::uint32_t best_rank =
-            std::numeric_limits<std::uint32_t>::max();
-        std::size_t best = syms.size();
-        for (std::size_t i = 0; i + 1 < syms.size(); ++i) {
-            auto it = merge_rank_.find(syms[i] + '\x01' +
-                                       syms[i + 1]);
-            if (it != merge_rank_.end() &&
-                it->second < best_rank) {
-                best_rank = it->second;
-                best = i;
-            }
-        }
-        if (best == syms.size()) {
-            break;
-        }
-        syms[best] += syms[best + 1];
-        syms.erase(syms.begin() +
-                   static_cast<std::ptrdiff_t>(best + 1));
+    if (syms.empty()) {
+        return;
     }
-    for (const std::string& s : syms) {
+    syms.back().next = -1;
+    const auto piece = [&](const Sym& s) {
+        return std::string_view(text).substr(s.off, s.len);
+    };
+    // Lowest-rank-first pair merging, leftmost first on a tie. A heap
+    // of candidate pairs makes it O(n log n) (i#625 F5: the rescan
+    // after every merge was O(n^2) on one long letter run). A pair is
+    // stale once either symbol changed; their lengths only grow, so a
+    // sum that no longer matches finds it.
+    struct Pair {
+        std::uint32_t rank;
+        std::size_t off;  // the left symbol's
+        std::ptrdiff_t left;
+        std::size_t len;
+    };
+    const auto later = [](const Pair& a, const Pair& b) {
+        return a.rank > b.rank || (a.rank == b.rank && a.off > b.off);
+    };
+    std::priority_queue<Pair, std::vector<Pair>, decltype(later)> heap(
+        later);
+    std::string key;
+    const auto push = [&](std::ptrdiff_t l) {
+        if (l < 0 || syms[static_cast<std::size_t>(l)].next < 0) {
+            return;
+        }
+        const Sym& a = syms[static_cast<std::size_t>(l)];
+        const Sym& b = syms[static_cast<std::size_t>(a.next)];
+        key.assign(piece(a));
+        key += '\x01';
+        key += piece(b);
+        const auto it = merge_rank_.find(key);
+        if (it != merge_rank_.end()) {
+            heap.push({it->second, a.off, l, a.len + b.len});
+        }
+    };
+    for (std::size_t i = 0; i + 1 < syms.size(); ++i) {
+        push(static_cast<std::ptrdiff_t>(i));
+    }
+    while (!heap.empty()) {
+        const Pair p = heap.top();
+        heap.pop();
+        Sym& a = syms[static_cast<std::size_t>(p.left)];
+        if (a.len == 0 || a.next < 0) {
+            continue;
+        }
+        Sym& b = syms[static_cast<std::size_t>(a.next)];
+        if (a.len + b.len != p.len) {
+            continue;  // stale
+        }
+        a.len += b.len;
+        b.len = 0;
+        a.next = b.next;
+        if (b.next >= 0) {
+            syms[static_cast<std::size_t>(b.next)].prev = p.left;
+        }
+        push(a.prev);
+        push(p.left);
+    }
+    for (std::ptrdiff_t k = 0; k >= 0;
+         k = syms[static_cast<std::size_t>(k)].next) {
+        const std::string s(piece(syms[static_cast<std::size_t>(k)]));
         auto it = token_to_id_.find(s);
         if (it != token_to_id_.end()) {
             out.push_back(it->second);
