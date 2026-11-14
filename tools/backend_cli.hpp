@@ -273,6 +273,13 @@ inline constexpr const char* kCommonHelp =
     "                   is a reference one); a prefix over the cap\n"
     "                   is not sent\n"
     "  --prefix-cache-helper-arg A  an argument for it (repeatable)\n"
+    "  --prefix-cache-key-file P  sign the disk tier's files with the\n"
+    "                   key in P (an HMAC-SHA-256 per file), so one\n"
+    "                   planted or changed without the key is a miss;\n"
+    "                   for a shared or remote store. It costs a hash\n"
+    "                   of each file's bytes per read and write (a few\n"
+    "                   hundred MB/s per core). Make a key file:\n"
+    "                     umask 077; head -c 32 /dev/urandom > cache.key\n"
     "  --batch-decode   enable R10 cross-sequence batched decode\n"
     "  --no-batch-prefill  force per-token prompt ingestion\n"
     "  --remote-experts H:P=LO:HI  locus-run: MoE experts LO..HI-1 of\n"
@@ -440,6 +447,9 @@ struct BackendArgs {
     std::vector<std::string> prefix_cache_helper;
     /** --prefix-cache-helper-arg values, before PATH is known. */
     std::vector<std::string> prefix_cache_helper_args;
+    /** From --prefix-cache-key-file PATH: sign the tier's files with
+     *  the key in PATH (i#830; empty = unsigned). */
+    std::string prefix_cache_key_file;
     /** From --device N: the GPU for --backend vulkan / cuda (i#572);
      *  unset means the backend's first device. */
     std::uint32_t device = 0;
@@ -672,6 +682,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.prefix_cache_helper = {argv[++i]};
         } else if (a == "--prefix-cache-helper-arg" && i + 1 < argc) {
             out.prefix_cache_helper_args.emplace_back(argv[++i]);
+        } else if (a == "--prefix-cache-key-file" && i + 1 < argc) {
+            out.prefix_cache_key_file = argv[++i];
         } else if (a == "--prefix-cache-disk-mib" && i + 1 < argc) {
             number("--prefix-cache-disk-mib", argv[++i],
                    out.prefix_cache_disk_mib);
@@ -725,6 +737,11 @@ inline std::string prefix_cache_error(const BackendArgs& a) {
     if ((helper || !a.prefix_cache_dir.empty()) &&
         a.prefix_cache_disk_mib == 0) {
         return "--prefix-cache-disk-mib must be > 0";
+    }
+    if (!a.prefix_cache_key_file.empty() && !helper &&
+        a.prefix_cache_dir.empty()) {
+        return "--prefix-cache-key-file needs --prefix-cache-dir or "
+               "--prefix-cache-helper";
     }
     return {};
 }

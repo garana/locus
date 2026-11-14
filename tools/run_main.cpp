@@ -10,6 +10,7 @@
 #include "backend_cli.hpp"
 #include "cli_spec.hpp"
 #include "locus/engine/disk_prefix_key.hpp"
+#include "locus/pipeline/handshake.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
@@ -190,6 +191,10 @@ int main(int argc, char** argv) {
                 args.prefix_cache_helper,
                 std::uint64_t{args.prefix_cache_disk_mib} << 20, g,
                 model_path, model, args.kv_type);
+        }
+        if (cfg.disk_prefix && !args.prefix_cache_key_file.empty()) {
+            cfg.disk_prefix->set_mac_key(
+                locus::pipeline::read_key_file(args.prefix_cache_key_file));
         }
         locus::engine::Engine engine(model, tok.eos_id(), cfg);
 
