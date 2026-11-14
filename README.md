@@ -264,7 +264,7 @@ Vulkan devices; the first is the default).
 | scalar  | portable reference, every weight type                                                    |
 | vulkan  | the whole forward pass on the GPU: matmuls, norms, RoPE, paged attention, MoE routing    |
 | cuda    | matvec and attention on the GPU (paged weight pool, KV cache copy); the rest on the CPU  |
-| metal   | Apple GPUs (#10): plain llama (F32, Q8_0, Q4_K, Q6_K) on the GPU, other models on CPU    |
+| metal   | Apple GPUs (#10): plain llama on the GPU (F32/F16, Q8_0, Q4_0, Q5_0, Q4/5/6_K), else CPU |
 
 Every selectable backend must reproduce the golden outputs. A GPU does
 not always beat the CPU: on a tile GPU streaming a model larger than
