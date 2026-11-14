@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "locus/auth/helper_message.hpp"
+#include "locus/engine/disk_prefix_store.hpp"
 
 namespace {
 
@@ -146,7 +147,8 @@ struct Store {
 
     bool read(const std::string& name, const std::string& shm,
               std::size_t bytes) const {
-        const int fd = ::open(path(name).c_str(), O_RDONLY | O_CLOEXEC);
+        const int fd =
+            ::open(path(name).c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (fd < 0) {
             return false;
         }
@@ -175,9 +177,15 @@ struct Store {
         if (m.p == MAP_FAILED) {
             return false;
         }
+        // A file or symlink left at the temp name is removed (remove
+        // never follows a symlink), and O_EXCL | O_NOFOLLOW makes one
+        // planted after that fail the write instead of redirecting it.
         const fs::path tmp = path(name).string() + ".tmp";
-        const int fd =
-            ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        std::error_code rm_ec;
+        fs::remove(tmp, rm_ec);
+        const int fd = ::open(
+            tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            0600);
         if (fd < 0) {
             return false;
         }
@@ -253,9 +261,11 @@ int main(int argc, char** argv) {
         store.cap = std::strtoull(pos[1].c_str(), nullptr, 10) << 20;
     }
     std::error_code ec;
-    if (fs::create_directories(store.dir, ec)) {
-        fs::permissions(store.dir, fs::perms::owner_all,
-                        fs::perm_options::replace, ec);
+    try {
+        locus::engine::ensure_private_dir(store.dir);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "locus-prefix-helper: %s\n", e.what());
+        return 2;
     }
 
     std::string buf;
