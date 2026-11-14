@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 
 #include "locus/gguf/gguf.hpp"
@@ -15,8 +16,28 @@ namespace locus::backend {
  * selected via locus::sys::detect().
  */
 
-/** @returns The float value of an IEEE binary16 bit pattern. */
-float f16_to_f32(std::uint16_t h);
+/** f16_to_f32 for any pattern: zeros, subnormals, inf and NaN too. */
+float f16_to_f32_rare(std::uint16_t h);
+
+/**
+ * @returns The float value of an IEEE binary16 bit pattern. Normal
+ * numbers (a weight block's scales) convert inline, since the kernels
+ * call this once per block and x86 before F16C has no instruction for
+ * it; the rest go to f16_to_f32_rare. The same bits either way.
+ */
+inline float f16_to_f32(std::uint16_t h) {
+    const std::uint32_t exp = (h >> 10) & 0x1fu;
+    if (exp == 0 || exp == 0x1fu) {
+        return f16_to_f32_rare(h);
+    }
+    const std::uint32_t bits =
+        (static_cast<std::uint32_t>(h & 0x8000u) << 16) |
+        ((exp - 15 + 127) << 23) |
+        (static_cast<std::uint32_t>(h & 0x3ffu) << 13);
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
 
 /**
  * @returns The binary16 bit pattern nearest to f, with an exact tie
