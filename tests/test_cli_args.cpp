@@ -5,6 +5,7 @@
 #include <iterator>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -140,7 +141,7 @@ TEST_CASE("the host flag sets the server's listen address", "[cli]") {
     auto c = locus_tools::parse_backend_args(
         static_cast<int>(argv3.size()),
         const_cast<char**>(argv3.data()));
-    REQUIRE(c.host.empty());  // every interface
+    REQUIRE(c.host == "127.0.0.1");  // loopback unless asked (i#625 F7)
 }
 
 TEST_CASE("the sse-keepalive flag sets the stream keepalive", "[cli]") {
@@ -465,6 +466,33 @@ TEST_CASE("bad positional numbers exit 2", "[cli]") {
                        std::string("missing.gguf '") + p + "'") == 2);
     }
     REQUIRE(status(LOCUS_SERVER_BIN, "missing.gguf 8080") == 1);
+}
+
+// i#625 F7: locus-server listens on loopback unless asked, and takes an
+// auth helper as the router does.
+TEST_CASE("the server host defaults to loopback and takes an auth helper",
+          "[cli]") {
+    const auto parse = [](std::vector<const char*> argv) {
+        argv.insert(argv.begin(), "prog");
+        return locus_tools::parse_backend_args(
+            static_cast<int>(argv.size()), const_cast<char**>(argv.data()));
+    };
+    REQUIRE(parse({"m.gguf"}).host == "127.0.0.1");
+    REQUIRE(parse({"--host", "*", "m.gguf"}).host.empty());  // every one
+    REQUIRE(parse({"--host=*", "m.gguf"}).host.empty());
+    REQUIRE(parse({"--host", "::1", "m.gguf"}).host == "::1");
+    REQUIRE(parse({"m.gguf"}).auth_helper.empty());
+    const auto a = parse({"--auth-helper", "/bin/h", "--auth-helper-arg",
+                          "x", "--auth-helper-arg", "y", "m.gguf"});
+    REQUIRE(a.auth_helper == std::vector<std::string>{"/bin/h", "x", "y"});
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+    // An argument without the helper is a usage error (exit 2).
+    const std::string cmd = std::string("'") + LOCUS_SERVER_BIN +
+                            "' --auth-helper-arg x missing.gguf "
+                            ">/dev/null 2>&1";
+    const int rc = std::system(cmd.c_str());
+    REQUIRE(WIFEXITED(rc));
+    REQUIRE(WEXITSTATUS(rc) == 2);
 }
 
 TEST_CASE("remote-experts values parse as HOST:PORT=LO:HI", "[cli]") {
