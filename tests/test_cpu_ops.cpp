@@ -30,6 +30,25 @@ TEST_CASE("f16 conversion round-trips", "[ops]") {
     REQUIRE(std::isinf(f16_to_f32(0x7c00)));
 }
 
+TEST_CASE("f16 inline conversion gives the full one's bits", "[ops]") {
+    // Every pattern: the inline normal path and f16_to_f32_rare agree
+    // bit for bit, and each non-NaN value converts back to itself.
+    int differ = 0, no_round_trip = 0;
+    for (std::uint32_t h = 0; h <= 0xffff; ++h) {
+        const auto p = static_cast<std::uint16_t>(h);
+        const float f = f16_to_f32(p);
+        if (std::bit_cast<std::uint32_t>(f) !=
+            std::bit_cast<std::uint32_t>(f16_to_f32_rare(p))) {
+            ++differ;
+        }
+        if (!std::isnan(f) && f32_to_f16(f) != p) {
+            ++no_round_trip;
+        }
+    }
+    CHECK(differ == 0);
+    CHECK(no_round_trip == 0);
+}
+
 TEST_CASE("f16 conversion rounds ties to even including subnormals",
           "[ops]") {
     // An exact tie must land on the neighbour with an even pattern,

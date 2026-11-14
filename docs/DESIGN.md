@@ -146,8 +146,10 @@ SPIR-V and embedded at build time.
 
 Parsing untrusted model files is an attack surface (llama.cpp has had
 parser CVEs). Rules: bounds-check every offset against the file size;
-no allocation sized by an unvalidated field; a fuzz corpus in the
-tests; mmap read-only.
+no allocation sized by an unvalidated field; hand-written hostile
+files in the tests (`[gguf]`: truncations, oversized arrays, hostile
+tensor tables; a fuzz target is not in the tree yet, #625); mmap
+read-only.
 
 ### 4.5 HTTP server
 
@@ -293,8 +295,10 @@ The areas built after the MVP:
 
 - Runtime dependencies: libc, libc++, OS APIs. Nothing else by
   default.
-- Vendored in-tree, pinned, sha256 recorded in the importing commit,
-  license files alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
+- Vendored in-tree, pinned, every file's sha256 in
+  `third_party/SHA256SUMS` (the `[third_party]` test checks the files
+  against it and that each vendored file is listed), license files
+  alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
   cpp-httplib v0.18.3 (MIT, tests only: their HTTP client),
   nlohmann/json v3.11.3 (MIT), ggml's
   IQ lookup tables (`third_party/ggml/iq_grids.h`, MIT) and llama.cpp's
@@ -651,7 +655,10 @@ guarding the default path.
   the MoE hybrid on is refused, since its hot set follows the requests
   served before), the tokens and a checksum per block, so a mismatch
   or a torn file reads as a miss; a byte cap evicts the least recently
-  used file. Entries
+  used file. The checksums catch damage, not tampering, so the
+  directory must be the server user's own and not group- or
+  world-writable (else startup fails), and symlinks in it are never
+  followed. Entries
   evicted from RAM are written back by a worker thread, and the rest
   at shutdown; a prompt whose prefix is at least one block longer on
   disk waits in a LOADING state while the worker reads it into its
@@ -890,7 +897,15 @@ For MoE models, experts can live on different hosts, each processing
 the tokens routed to it. Routing adds traffic, but experts are
 independent, so this is a second axis that also suits a LAN. The
 multi-GPU pager (#62) shards weights within one host; a pipeline stage
-can use it underneath.
+can use it underneath. On the wire a token's owner sends `kExpertCall`
+(the layer, the expert id and the hidden state) and the expert's host
+replies with `kExpertOut` (that expert's output before the router
+weight), so the owner can combine the experts in its own pick order
+and keep one host's bits. `locus-experts` serves an expert range
+through `TransformerModel::expert_out`, the step `moe_ffn` takes per
+pick, one connection at a time, and accepts only loopback peers unless
+given `--allow` (the port has no authentication). The `moe_ffn` side
+that calls it is #781's next step.
 
 ### Stage serving
 
@@ -914,7 +929,8 @@ them as Prometheus text on GET `/metrics`, from the same loop through
 `http::LoopConnection`, with the session, token, byte and downstream
 dial counters (#22). Each stage serves its own page, so a scraper
 reads every stage directly; the driver does not gather them. The
-`--allow` list does not cover that port.
+`--allow` list covers that port too, since the page lists every peer's
+address.
 A connection kept open across sequences (SESSION_END) dials its next
 downstream when the next sequence sends its first frame, not at the
 reset: a last stage's downstream is a driver, and a reset-time dial
@@ -977,7 +993,7 @@ locus ports those dots (`backend::matvec_q8k`):
 | Backend | 8-bit activation dots                                         |
 |---------|---------------------------------------------------------------|
 | scalar  | all 15 QK_K types and the block-32 types                      |
-| neon    | the K-quants, IQ1_M, IQ2_XXS/S, IQ3_XXS/S, IQ4_XS, block-32   |
+| neon    | all 15 QK_K types and the block-32 types                      |
 | sse4    | all 15 QK_K types and the block-32 types                      |
 | cuda    | all 15 QK_K types                                             |
 

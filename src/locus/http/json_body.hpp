@@ -10,7 +10,8 @@
 namespace locus::http {
 
 /**
- * The deepest nesting of objects and arrays a JSON text may have. Request
+ * How deep a JSON text may nest: every value or container sits at most
+ * this many levels in (so 65 nested empty containers still pass). Request
  * bodies and upstream replies reach code that recurses once per level
  * (dump, copy, the JSON-schema and tool converters), so the depth is
  * bounded when the text is parsed, far below any thread's stack.

@@ -33,6 +33,12 @@ enum class MsgType : std::uint16_t {
                        *   (releases its KV) but does NOT close the fd, so
                        *   the next request_id reuses the connection
                        *   (issue 76 / the downstream pool). No payload. */
+    kExpertCall = 5,  /**< Expert parallelism (#781): run one MoE expert
+                       *   on the hidden state. position = layer, token =
+                       *   expert id, data = xb (n_embd floats). */
+    kExpertOut = 6,   /**< The reply to a kExpertCall, with its tags:
+                       *   data = the expert's output d (n_embd floats),
+                       *   before the router weight. */
 };
 
 /**
@@ -64,6 +70,18 @@ Message make_logits(std::uint64_t request_id, std::uint32_t position,
 /** @returns A kSessionEnd message for `request_id` (no payload); the
  * receiver frees that session but keeps the connection open for reuse. */
 Message make_session_end(std::uint64_t request_id);
+/**
+ * @returns A kExpertCall: run expert `expert` of layer `layer` on `xb`
+ *     (n_embd floats) for `request_id`.
+ */
+Message make_expert_call(std::uint64_t request_id, std::uint32_t layer,
+                         std::uint32_t expert, std::vector<float> xb);
+/**
+ * @returns The kExpertOut reply to that call: `d` (n_embd floats), the
+ *     expert's output before the router weight.
+ */
+Message make_expert_out(std::uint64_t request_id, std::uint32_t layer,
+                        std::uint32_t expert, std::vector<float> d);
 
 /** Outcome of a buffer decode attempt (mirrors auth::HelperDecode). */
 enum class Decode {

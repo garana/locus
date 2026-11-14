@@ -261,6 +261,42 @@ TEST_CASE("video jobs run in order and expire", "[video]") {
     fs::remove_all(d);
 }
 
+// i#625 F9 and F20: with no directory given, the clips go to a fresh
+// private one (mode 0700, a new name each time, removed at the end), and
+// job ids are 24 hex digits from the OS's random source.
+TEST_CASE("video jobs make a private directory and unguessable ids",
+          "[video]") {
+    std::string kept;
+    {
+        VideoJobs a("", 1, 60);
+        VideoJobs b("", 1, 60);
+        REQUIRE(a.dir() != b.dir());
+        REQUIRE(fs::is_directory(a.dir()));
+        const auto perms = fs::status(a.dir()).permissions();
+        REQUIRE((perms & fs::perms::all) == fs::perms::owner_all);
+        const auto job = a.submit({}, [](const std::string& out,
+                                         const std::function<void(int)>&,
+                                         const std::function<bool()>&) {
+            std::ofstream(out) << "clip";
+        });
+        REQUIRE(job);
+        a.wait_idle();
+        REQUIRE(fs::exists(a.get(job->id)->file));
+        kept = a.dir();
+        // "video_" and 24 lowercase hex digits; two ids differ.
+        REQUIRE(job->id.size() == 6 + 24);
+        REQUIRE(job->id.find_first_not_of("0123456789abcdef", 6) ==
+                std::string::npos);
+        const auto other = b.submit({}, [](const std::string&,
+                                           const std::function<void(int)>&,
+                                           const std::function<bool()>&) {});
+        REQUIRE(other);
+        REQUIRE(other->id != job->id);
+        b.wait_idle();
+    }
+    REQUIRE_FALSE(fs::exists(kept));
+}
+
 TEST_CASE("video jobs cap the queue and stop a running job",
           "[video]") {
     const auto d = temp_dir("locus-video-cap");

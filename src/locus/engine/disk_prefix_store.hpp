@@ -49,6 +49,20 @@ struct DiskKey {
 };
 
 /**
+ * Creates `dir` (mode 0700) when it is missing, and checks that only
+ * this user can change what is in it: its files hold clients' prompt
+ * tokens, and a read trusts the KV in them.
+ *
+ * @param dir The cache directory.
+ * @returns `dir` with every symlink resolved: the caller opens files
+ *     through it, so repointing a symlink in `dir` later does not move
+ *     the cache.
+ * @throws std::runtime_error when `dir` is not a directory, another
+ *     user owns it, or its group or others can write to it.
+ */
+std::filesystem::path ensure_private_dir(const std::filesystem::path& dir);
+
+/**
  * Prefix-cache KV blocks on persistent storage (i#416), so a prompt
  * prefix seen before is read back instead of computed again, also
  * after a server restart.

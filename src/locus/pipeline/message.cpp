@@ -23,7 +23,9 @@ bool valid_type(std::uint16_t t) {
     return t == static_cast<std::uint16_t>(MsgType::kToken) ||
            t == static_cast<std::uint16_t>(MsgType::kActivation) ||
            t == static_cast<std::uint16_t>(MsgType::kLogits) ||
-           t == static_cast<std::uint16_t>(MsgType::kSessionEnd);
+           t == static_cast<std::uint16_t>(MsgType::kSessionEnd) ||
+           t == static_cast<std::uint16_t>(MsgType::kExpertCall) ||
+           t == static_cast<std::uint16_t>(MsgType::kExpertOut);
 }
 
 // Little-endian integer append helpers (portable regardless of host
@@ -155,6 +157,35 @@ Message make_session_end(std::uint64_t request_id) {
     m.type = MsgType::kSessionEnd;
     m.request_id = request_id;
     return m;  // no position/token/data
+}
+
+namespace {
+
+/** An expert message: layer in position, expert id in token. */
+Message expert_message(MsgType type, std::uint64_t request_id,
+                       std::uint32_t layer, std::uint32_t expert,
+                       std::vector<float> data) {
+    Message m;
+    m.type = type;
+    m.request_id = request_id;
+    m.position = layer;
+    m.token = static_cast<tok::TokenId>(expert);
+    m.data = std::move(data);
+    return m;
+}
+
+}  // namespace
+
+Message make_expert_call(std::uint64_t request_id, std::uint32_t layer,
+                         std::uint32_t expert, std::vector<float> xb) {
+    return expert_message(MsgType::kExpertCall, request_id, layer, expert,
+                          std::move(xb));
+}
+
+Message make_expert_out(std::uint64_t request_id, std::uint32_t layer,
+                        std::uint32_t expert, std::vector<float> d) {
+    return expert_message(MsgType::kExpertOut, request_id, layer, expert,
+                          std::move(d));
 }
 
 void encode(const Message& m, std::string& out) {

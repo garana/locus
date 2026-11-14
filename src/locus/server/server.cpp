@@ -899,6 +899,12 @@ bool has_image_part(const json& content, bool anthropic) {
     return false;
 }
 
+/** Most images one chat request may carry. Each is decoded (up to 4096 x
+ *  4096) and run through the vision tower before the prompt length is
+ *  known, so the count is capped up front; Janus-Pro spends 576 tokens on
+ *  each, so its context holds few more than this anyway. */
+constexpr std::size_t kMaxChatImages = 8;
+
 /**
  * One turn's text from its content: text parts as they are, each image
  * as the placeholder, joined by "\n" (the reference's
@@ -930,6 +936,11 @@ std::string vision_turn_text(const json& content, bool anthropic,
             if (!allow_images) {
                 throw std::invalid_argument(
                     "images are only accepted in user messages");
+            }
+            if (images.size() >= kMaxChatImages) {
+                throw std::invalid_argument(
+                    "at most " + std::to_string(kMaxChatImages) +
+                    " images per request");
             }
             if (anthropic) {
                 const json& src = p.at("source");
@@ -991,6 +1002,50 @@ std::uint64_t read_seed(const json& body) {
         throw std::invalid_argument("seed must be an integer");
     }
     return static_cast<std::uint64_t>(body["seed"].get<std::int64_t>());
+}
+
+/**
+ * The logprobs request of a completions or chat body, within OpenAI's
+ * limits: /v1/completions takes an integer `logprobs` from 0 to 5,
+ * /v1/chat/completions a bool `logprobs` and an integer `top_logprobs`
+ * from 0 to 20. A reply holds max_tokens x (top + 1) entries, so the cap
+ * keeps it small; null or false means off.
+ *
+ * @throws std::invalid_argument for any other value.
+ */
+engine::LogprobsOpt read_logprobs(const json& body, bool chat) {
+    engine::LogprobsOpt lp;
+    const auto count = [&](const char* key, std::int64_t max) {
+        const json& v = body[key];
+        if (!v.is_number_integer() || v.get<std::int64_t>() < 0 ||
+            v.get<std::int64_t>() > max) {
+            throw std::invalid_argument(std::string(key) +
+                                        " must be an integer from 0 to " +
+                                        std::to_string(max));
+        }
+        return static_cast<std::uint32_t>(v.get<std::int64_t>());
+    };
+    const bool set = body.contains("logprobs") && !body["logprobs"].is_null();
+    if (chat) {
+        if (!set) return lp;
+        if (!body["logprobs"].is_boolean()) {
+            throw std::invalid_argument("logprobs must be a boolean");
+        }
+        if (!body["logprobs"].get<bool>()) return lp;
+        lp.enabled = true;
+        if (body.contains("top_logprobs") &&
+            !body["top_logprobs"].is_null()) {
+            lp.top = count("top_logprobs", 20);
+        }
+        return lp;
+    }
+    if (!set || (body["logprobs"].is_boolean() &&
+                 !body["logprobs"].get<bool>())) {
+        return lp;
+    }
+    lp.enabled = true;
+    lp.top = count("logprobs", 5);
+    return lp;
 }
 
 /**
@@ -1231,12 +1286,9 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
                          opt_.ffmpeg_path.c_str());
         }
         // At most 4 clips queued or running; a finished one is kept an
-        // hour.
-        video_jobs_ = std::make_unique<video::VideoJobs>(
-            (std::filesystem::temp_directory_path() /
-             ("locus-videos-" + std::to_string(::getpid())))
-                .string(),
-            4, 3600);
+        // hour. The clips go to a private directory VideoJobs makes
+        // (mkdtemp, mode 0700), not a predictable name in a shared /tmp.
+        video_jobs_ = std::make_unique<video::VideoJobs>("", 4, 3600);
     }
     // Image input (i#241): on when the model's GGUF carries the Janus
     // vision tower. A tower that is present but broken stops the
@@ -2003,6 +2055,7 @@ void OpenAiServer::install_routes() {
         std::vector<ToolSpec> tools;
         std::optional<VisionChat> vision;  // a chat with images (i#241)
         OutputGrammar grammar;  // an output format
+        engine::LogprobsOpt lp;
         try {
             body = http::parse_json(req.body);
             if (chat) {
@@ -2040,6 +2093,7 @@ void OpenAiServer::install_routes() {
             if (!vision) {
                 grammar = output_grammar(body, req.body);
             }
+            lp = read_logprobs(body, chat);
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(make_error(e.what()).dump(-1, ' ', false, kLossy),
@@ -2054,19 +2108,6 @@ void OpenAiServer::install_routes() {
         auto [sampling, seed] = parse_sampling(body);
         std::unique_ptr<model::TokenConstraint> constraint =
             output_constraint(std::move(grammar));
-        // logprobs: /v1/completions takes an integer count; /v1/chat/
-        // completions takes a bool `logprobs` + integer `top_logprobs`.
-        engine::LogprobsOpt lp;
-        if (chat) {
-            if (body.value("logprobs", false)) {
-                lp.enabled = true;
-                lp.top = body.value("top_logprobs", 0);
-            }
-        } else if (body.contains("logprobs") &&
-                   body["logprobs"].is_number_unsigned()) {
-            lp.enabled = true;
-            lp.top = body["logprobs"].get<std::uint32_t>();
-        }
         auto prompt_ids = tok_.encode(prompt, true);
         const std::uint32_t n_prompt =
             static_cast<std::uint32_t>(prompt_ids.size());
