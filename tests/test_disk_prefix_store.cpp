@@ -414,6 +414,75 @@ TEST_CASE("DiskPrefixStore never follows a symlink in its directory",
     REQUIRE(s.used_bytes() == 0);
 }
 
+// i#830: with a key, each file ends with an HMAC of its bytes, so a file
+// written without the key (or with another) is a miss, however well its
+// checksums match.
+TEST_CASE("DiskPrefixStore with a key reads only files signed with it",
+          "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-dps-mac")};
+    const auto in = blocks(2, 9);
+    const std::string k1(32, 'a');
+    const std::string k2(32, 'b');
+    fs::path keyed_path;
+    {
+        DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+        s.set_mac_key(k1);
+        REQUIRE(s.write(kPrompt, 2, srcs(in)));
+        keyed_path = s.path_for(kPrompt, 2);
+        auto out = blocks(2, 0);
+        REQUIRE(s.read(kPrompt, 2, dsts(out)));
+        REQUIRE(out == in);
+        // The tag adds 32 bytes to the unkeyed file.
+        DirGuard gp{temp_dir("locus-dps-mac-plain")};
+        DiskPrefixStore plain(gp.dir, key(), kBlockBytes, 1 << 20);
+        REQUIRE(plain.write(kPrompt, 2, srcs(in)));
+        REQUIRE(fs::file_size(keyed_path) ==
+                fs::file_size(plain.path_for(kPrompt, 2)) + 32);
+    }
+    {
+        // Another key names its files apart: no hit, and the first
+        // key's file is left alone (two keyed stores do not evict each
+        // other's files as mismatches).
+        DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+        s.set_mac_key(k2);
+        REQUIRE(s.find(kPrompt) == 0);
+        REQUIRE(s.path_for(kPrompt, 2) != keyed_path);
+        REQUIRE(fs::exists(keyed_path));
+    }
+    {
+        // A file at the keyed name with a forged tag (another key's
+        // bytes copied there) is a miss, and removed.
+        DiskPrefixStore other(g.dir, key(), kBlockBytes, 1 << 20);
+        other.set_mac_key(k2);
+        REQUIRE(other.write(kPrompt, 2, srcs(in)));
+        fs::copy_file(other.path_for(kPrompt, 2), keyed_path,
+                      fs::copy_options::overwrite_existing);
+        DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+        s.set_mac_key(k1);
+        auto out = blocks(2, 0);
+        REQUIRE_FALSE(s.read(kPrompt, 2, dsts(out)));
+        REQUIRE_FALSE(fs::exists(keyed_path));
+    }
+    {
+        // An unkeyed store names keyed files apart: none is a hit.
+        DiskPrefixStore a(g.dir, key(), kBlockBytes, 1 << 20);
+        a.set_mac_key(k1);
+        REQUIRE(a.write(kPrompt, 2, srcs(in)));
+        DiskPrefixStore b(g.dir, key(), kBlockBytes, 1 << 20);
+        REQUIRE(b.find(kPrompt) == 0);
+    }
+    {
+        // One flipped byte of the tag is a miss.
+        DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+        s.set_mac_key(k1);
+        const fs::path p = s.path_for(kPrompt, 2);
+        REQUIRE(fs::exists(p));
+        flip(p, static_cast<std::streamoff>(fs::file_size(p) - 1));
+        auto out = blocks(2, 0);
+        REQUIRE_FALSE(s.read(kPrompt, 2, dsts(out)));
+    }
+}
+
 TEST_CASE("DiskPrefixStore resolves a symlinked directory once",
           "[disk_prefix]") {
     // DIR given as a symlink: the store uses the real directory, so
