@@ -3457,25 +3457,8 @@ void OpenAiServer::install_routes() {
                     }
                 }
                 if (body.contains("size")) {
-                    // "WxH": two decimal sides, no signs or spaces.
-                    const std::string s = str("size");
-                    const auto x = s.find('x');
-                    const auto digits = [](std::string_view d) {
-                        return !d.empty() && d.size() <= 4 &&
-                               std::all_of(d.begin(), d.end(), [](char c) {
-                                   return c >= '0' && c <= '9';
-                               });
-                    };
-                    if (x == std::string::npos ||
-                        !digits(std::string_view(s).substr(0, x)) ||
-                        !digits(std::string_view(s).substr(x + 1))) {
-                        throw std::invalid_argument(
-                            "size must be WIDTHxHEIGHT");
-                    }
-                    p.width = static_cast<std::uint32_t>(
-                        std::stoul(s.substr(0, x)));
-                    p.height = static_cast<std::uint32_t>(
-                        std::stoul(s.substr(x + 1)));
+                    std::tie(p.width, p.height) =
+                        parse_size_wxh(str("size"));
                 }
                 if (body.contains("response_format") &&
                     str("response_format") != "b64_json") {
@@ -4099,21 +4082,7 @@ void OpenAiServer::install_routes() {
                 }
                 size = body["size"].get<std::string>();
             }
-            const auto x = size.find('x');
-            const auto digits = [](std::string_view d) {
-                return !d.empty() && d.size() <= 4 &&
-                       std::all_of(d.begin(), d.end(), [](char c) {
-                           return c >= '0' && c <= '9';
-                       });
-            };
-            if (x == std::string::npos ||
-                !digits(std::string_view(size).substr(0, x)) ||
-                !digits(std::string_view(size).substr(x + 1))) {
-                throw std::invalid_argument("size must be WIDTHxHEIGHT");
-            }
-            p.width = static_cast<std::uint32_t>(std::stoul(size.substr(0, x)));
-            p.height =
-                static_cast<std::uint32_t>(std::stoul(size.substr(x + 1)));
+            std::tie(p.width, p.height) = parse_size_wxh(size);
             double seconds = 2.0;
             if (body.contains("seconds")) {
                 const json& s = body["seconds"];
