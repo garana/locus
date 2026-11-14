@@ -1679,6 +1679,31 @@ TEST_CASE("an expert server answers each call with expert_out's bits",
     REQUIRE(served == 3);
 }
 
+// i#850: a call frame holds n_embd floats; a longer one is refused from
+// its length prefix, before the server reads (or allocates) its payload.
+TEST_CASE("an expert server closes on a call longer than n_embd floats",
+          "[moe][pipeline]") {
+    auto g = locus::gguf::GgufFile::parse(qwen_image(+8.0f, false));
+    auto model = TransformerModel::load(g);
+    const std::uint32_t n_embd = model.hparams().n_embd;
+    int sv[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    std::uint64_t served = 1;
+    std::thread server([&] {
+        served = locus::pipeline::serve_expert_calls(model, sv[1], 0, 4);
+        ::close(sv[1]);
+    });
+    REQUIRE(locus::pipeline::write_message(
+        sv[0], locus::pipeline::make_expert_call(
+                   1, 0, 1, std::vector<float>(n_embd + 1, 0.5f))));
+    locus::pipeline::Message out;
+    CHECK(locus::pipeline::read_message(sv[0], out) !=
+          locus::pipeline::ReadResult::kOk);
+    server.join();
+    ::close(sv[0]);
+    REQUIRE(served == 0);
+}
+
 TEST_CASE("a forward with remote experts is one process's bits",
           "[moe][pipeline]") {
     // Experts 2 and 3 run on a loopback expert server over a second

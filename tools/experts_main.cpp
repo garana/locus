@@ -1,7 +1,7 @@
 // locus-experts: serves MoE expert calls for expert parallelism (#781).
 //
 //   locus-experts --model <m.gguf> --listen HOST:PORT --experts LO:HI
-//                 [--allow CIDR]... [--backend NAME]
+//                 [--allow CIDR]... [--key-file F] [--backend NAME]
 
 #include <unistd.h>
 
@@ -17,13 +17,14 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/pipeline/expert_server.hpp"
+#include "locus/pipeline/handshake.hpp"
 #include "locus/pipeline/net.hpp"
 
 namespace {
 
 const char* kUsage =
     "usage: locus-experts --model <m.gguf> --listen HOST:PORT "
-    "--experts LO:HI [--allow CIDR]... [--backend NAME] "
+    "--experts LO:HI [--allow CIDR]... [--key-file F] [--backend NAME] "
     "[--idle-timeout MS]\n"
     "\n"
     "Serves MoE expert calls for expert parallelism: a peer sends a\n"
@@ -35,6 +36,10 @@ const char* kUsage =
     "                     it only loopback (127.0.0.0/8, ::1), since the\n"
     "                     port has no authentication and runs compute\n"
     "                     for any peer it accepts\n"
+    "  --key-file F       shared key: a peer must prove it holds it\n"
+    "                     before any call (locus-run's\n"
+    "                     --remote-experts-key-file; make one with\n"
+    "                     `umask 077; head -c 32 /dev/urandom > ep.key`)\n"
     "  --backend B        math backend (default: the model's)\n"
     "  --idle-timeout MS  close a connection that sends nothing for MS\n"
     "                     milliseconds, so a silent peer does not hold\n"
@@ -64,7 +69,7 @@ bool parse_range(const std::string& s, std::uint32_t& lo,
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model_path, listen, range, backend;
+    std::string model_path, listen, range, backend, key_file;
     int idle_ms = 60000;
     std::vector<std::string> allow_str;
     for (int i = 1; i < argc; ++i) {
@@ -87,6 +92,8 @@ int main(int argc, char** argv) {
             allow_str.push_back(next());
         } else if (a == "--backend") {
             backend = next();
+        } else if (a == "--key-file") {
+            key_file = next();
         } else if (a == "--idle-timeout") {
             const std::string v = next();
             char* end = nullptr;
@@ -124,6 +131,15 @@ int main(int argc, char** argv) {
             return 2;
         }
         allow.push_back(*c);
+    }
+    std::string key;  // empty: no handshake
+    if (!key_file.empty()) {
+        try {
+            key = locus::pipeline::read_key_file(key_file);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "bad --key-file: %s\n", e.what());
+            return 2;
+        }
     }
     try {
         auto g = locus::gguf::GgufFile::open(model_path);
@@ -167,6 +183,16 @@ int main(int argc, char** argv) {
             }
             if (!locus::pipeline::ip_allowed(peer, allow)) {
                 std::fprintf(stderr, "locus-experts: refused %s\n",
+                             peer.c_str());
+                ::close(fd);
+                continue;
+            }
+            if (!key.empty() &&
+                !locus::pipeline::handshake_accept(
+                    fd, key, locus::pipeline::kHandshakeTimeoutMs)) {
+                std::fprintf(stderr,
+                             "locus-experts: refused %s (failed the key "
+                             "handshake)\n",
                              peer.c_str());
                 ::close(fd);
                 continue;

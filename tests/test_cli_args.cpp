@@ -517,7 +517,11 @@ TEST_CASE("remote-experts values parse as HOST:PORT=LO:HI", "[cli]") {
     // the model loads (exit 2).
     for (const char* flags :
          {"--remote-experts nope",
-          "--remote-experts a:1=0:8 --remote-experts b:1=4:12"}) {
+          "--remote-experts a:1=0:8 --remote-experts b:1=4:12",
+          // i#850: a key for no expert host, or one that cannot be read.
+          "--remote-experts-key-file missing.key",
+          "--remote-experts a:1=0:8 "
+          "--remote-experts-key-file missing.key"}) {
         INFO(flags);
         const std::string cmd = std::string("'") + LOCUS_RUN_BIN + "' " +
                                 flags + " missing.gguf hi >/dev/null 2>&1";

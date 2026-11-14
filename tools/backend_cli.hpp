@@ -291,6 +291,10 @@ inline constexpr const char* kCommonHelp =
     "                   1); locus-experts drops a connection idle past\n"
     "                   its --idle-timeout, so a long prefill here wants\n"
     "                   --idle-timeout 0 there\n"
+    "  --remote-experts-key-file P  locus-run: prove to each expert\n"
+    "                   host that this run holds the key in P (the\n"
+    "                   hosts' locus-experts --key-file). Make one:\n"
+    "                     umask 077; head -c 32 /dev/urandom > ep.key\n"
     "  --timing         locus-run: print prefill and decode\n"
     "                   tok/s to stderr\n"
     "  --warmup         locus-run: run a throwaway 1-token\n"
@@ -464,6 +468,9 @@ struct BackendArgs {
     /** --remote-experts H:P=LO:HI (repeatable): expert hosts, as given;
      *  locus-run parses them (parse_remote_experts). */
     std::vector<std::string> remote_experts;
+    /** --remote-experts-key-file P: the expert hosts' shared key (i#850;
+     *  empty = no handshake). */
+    std::string remote_experts_key_file;
     /** --timing: locus-run prints prefill/decode rates. */
     bool timing = false;
     /** --warmup: locus-run runs a throwaway request first. */
@@ -705,6 +712,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.no_batch_prefill = true;
         } else if (a == "--remote-experts" && i + 1 < argc) {
             out.remote_experts.emplace_back(argv[++i]);
+        } else if (a == "--remote-experts-key-file" && i + 1 < argc) {
+            out.remote_experts_key_file = argv[++i];
         } else if (a == "--timing") {
             out.timing = true;
         } else if (a == "--warmup") {

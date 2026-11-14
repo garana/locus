@@ -149,4 +149,15 @@ enum class ReadResult {
  */
 ReadResult read_message(int fd, Message& out);
 
+/**
+ * As read_message, but a frame whose length leaves room for more than
+ * `max_floats` floats is refused (kError) before its payload is read,
+ * so a peer cannot make the reader allocate more than one message of
+ * the model's size (i#850).
+ *
+ * @param max_floats The most floats one frame may carry (n_embd for an
+ *     expert call or its answer).
+ */
+ReadResult read_message(int fd, Message& out, std::uint32_t max_floats);
+
 }  // namespace locus::pipeline

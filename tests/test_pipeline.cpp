@@ -176,6 +176,24 @@ TEST_CASE("pipeline message codec round-trips", "[pipeline]") {
     }
 }
 
+// i#850: read_message with a float cap refuses a longer frame from its
+// length prefix, and takes one at the cap.
+TEST_CASE("pipeline read_message refuses a frame past its float cap",
+          "[pipeline]") {
+    int fds[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    REQUIRE(locus::pipeline::write_message(fds[1], activation(1, 0, 8)));
+    REQUIRE(locus::pipeline::write_message(fds[1], activation(2, 0, 9)));
+    Message out;
+    REQUIRE(locus::pipeline::read_message(fds[0], out, 8) ==
+            ReadResult::kOk);
+    REQUIRE(out.data.size() == 8);
+    REQUIRE(locus::pipeline::read_message(fds[0], out, 8) ==
+            ReadResult::kError);
+    ::close(fds[0]);
+    ::close(fds[1]);
+}
+
 TEST_CASE("pipeline framed transport over a socketpair",
           "[pipeline]") {
     int fds[2];
