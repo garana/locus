@@ -839,6 +839,11 @@ class TransformerModel {
      *     Metal one, or LOCUS_METAL_FORWARD=0); the caller then takes
      *     the host path. seq is not advanced either way.
      */
+    /** @returns Whether metal_forward takes this model on its backend
+     *  (any cache conditions aside): the batched paths then run it a
+     *  token at a time, so they match the per-token forward. */
+    bool metal_forward_supported() const;
+
     bool metal_forward(tok::TokenId token, const float* embd,
                        kv::PagedKvCache::Seq& seq, std::uint32_t pos,
                        kv::PagedKvCache& cache, Workspace& ws,
