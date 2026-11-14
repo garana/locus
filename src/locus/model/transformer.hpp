@@ -292,6 +292,10 @@ class TransformerModel {
     /** @returns Whether the Q8-activation mode is in effect. */
     bool q8k_activations() const;
 
+    /** @returns How many tokens the Metal forward (i#866) has run in
+     *  this process (tests: whether the GPU path was taken). */
+    static std::uint64_t metal_forward_tokens();
+
     /**
      * Settles where the routed experts run (i#654) and returns it. On
      * Vulkan that depends on the free device memory when first asked,
@@ -823,6 +827,11 @@ class TransformerModel {
                       std::span<const float* const> embd = {},
                       LogitRows rows_out = {}) const;
 
+    /** @returns Whether metal_forward takes this model on its backend
+     *  (any cache conditions aside): the batched paths then run it a
+     *  token at a time, so they match the per-token forward. */
+    bool metal_forward_supported() const;
+
     /**
      * Metal forward of a plain llama model (i#866): one token at
      * position pos of seq, every layer on the GPU in one command batch
@@ -839,22 +848,10 @@ class TransformerModel {
      *     Metal one, or LOCUS_METAL_FORWARD=0); the caller then takes
      *     the host path. seq is not advanced either way.
      */
-    /** @returns Whether metal_forward takes this model on its backend
-     *  (any cache conditions aside): the batched paths then run it a
-     *  token at a time, so they match the per-token forward. */
-    bool metal_forward_supported() const;
-
     bool metal_forward(tok::TokenId token, const float* embd,
                        kv::PagedKvCache::Seq& seq, std::uint32_t pos,
                        kv::PagedKvCache& cache, Workspace& ws,
                        std::span<float> logits, LogitRows rows_out) const;
-
-  public:
-    /** @returns How many tokens metal_forward has run in this process
-     *  (tests: whether the GPU path was taken). */
-    static std::uint64_t metal_forward_tokens();
-
-  private:
 
     /** Applies the model's norm (RMS or LayerNorm per hp_.norm_type)
      * to x scaled by w, into out; uses hp_.rms_eps. */
