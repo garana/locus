@@ -1955,10 +1955,25 @@ TEST_CASE("metrics carry labels and timings in well-formed histograms",
         REQUIRE(r);
         REQUIRE(r->status == 200);
     }
-    auto res = client.Get("/metrics");
-    REQUIRE(res);
-    REQUIRE(res->status == 200);
-    const std::string& b = res->body;
+    // i#891: the HTTP layer records a request after its response is
+    // written, so the client can have the second reply before it is
+    // counted; scrape until the HTTP series hold both requests (record()
+    // sets all of them at once), for at most 2 s.
+    std::string b;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        auto res = client.Get("/metrics");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        b = res->body;
+        if (b.find("route=\"/v1/completions\",code=\"200\"} 2\n") !=
+                std::string::npos ||
+            std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 
     // Every sample line carries the model (escaped) and backend.
     const std::string labels = std::string("model=\"m\\\"1\",backend=\"") +
