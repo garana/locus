@@ -602,10 +602,20 @@ void Server::classify_ready(int fd) {
         // The response's writes share one total deadline (i#837): the
         // request is all here, so the only wait left is the client's
         // reading, and a slow reader must not hold the acceptor.
-        inline_write_until = std::chrono::steady_clock::now() +
-                             std::chrono::milliseconds(kInlineWriteMs);
-        serve_connection_guarded(fd, peer_ip, /*single_request=*/true);
-        inline_write_until.reset();
+        // A guard, so nothing can leave a stale deadline behind for
+        // the next inline serve.
+        struct InlineDeadline {
+            InlineDeadline() {
+                inline_write_until =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(kInlineWriteMs);
+            }
+            ~InlineDeadline() { inline_write_until.reset(); }
+        };
+        {
+            const InlineDeadline deadline;
+            serve_connection_guarded(fd, peer_ip, /*single_request=*/true);
+        }
         ::close(fd);
         return;
     }
