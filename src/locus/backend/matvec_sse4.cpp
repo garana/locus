@@ -633,9 +633,11 @@ void q4_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
         const __m128i r1 = _mm_shuffle_epi8(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b + 16)),
             il);
+        // Sub-block 2k + h's 8 per-lane int16 sums: |pair sum| <= 2 * 15
+        // * 127 per maddubs lane, two of them <= 7620, exact.
+        __m128i s[2];
         for (int h = 0; h < 2; ++h) {
-            const int j = 2 * k + h;
-            const std::int8_t* q8g = q8il + j * 32;
+            const std::int8_t* q8g = q8il + (2 * k + h) * 32;
             const __m128i n0 =
                 h == 0 ? _mm_and_si128(r0, lo4)
                        : _mm_and_si128(_mm_srli_epi16(r0, 4), lo4);
@@ -646,11 +648,11 @@ void q4_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
             const __m128i a1 = _mm_loadu_si128(
                 reinterpret_cast<const __m128i*>(q8g + 16));
-            // |pair sum| <= 2*15*127 per maddubs lane
-            add_scaled_pairs(_mm_maddubs_epi16(n0, a0),
-                             _mm_maddubs_epi16(n1, a1), scales[j], acc_lo,
-                             acc_hi);
+            s[h] = _mm_add_epi16(_mm_maddubs_epi16(n0, a0),
+                                 _mm_maddubs_epi16(n1, a1));
         }
+        add_scaled_two(s[0], s[1], scales[2 * k], scales[2 * k + 1], acc_lo,
+                       acc_hi);
     }
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
@@ -685,7 +687,7 @@ void q5_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
         _mm_loadu_si128(reinterpret_cast<const __m128i*>(hm + 16)), il);
     __m128i acc_lo = _mm_setzero_si128(), acc_hi = _mm_setzero_si128();
     // As q4_k_q8k_aux32_sse4: one load and shuffle per nibble chunk for
-    // sub-blocks 2k and 2k + 1, one madd per sub-block.
+    // sub-blocks 2k and 2k + 1, one madd pair for both (add_scaled_two).
     for (int k = 0; k < 4; ++k) {
         const std::uint8_t* q4b = q4 + k * 32;
         const __m128i r0 = _mm_shuffle_epi8(
@@ -693,6 +695,9 @@ void q5_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
         const __m128i r1 = _mm_shuffle_epi8(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4b + 16)),
             il);
+        // Sub-block 2k + h's 8 per-lane int16 sums: |pair sum| <= 2 * 31
+        // * 127 per maddubs lane, two of them <= 15748, exact.
+        __m128i s[2];
         for (int h = 0; h < 2; ++h) {
             const int j = 2 * k + h;
             const std::int8_t* q8g = q8il + j * 32;
@@ -714,10 +719,11 @@ void q5_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8g));
             const __m128i a1 = _mm_loadu_si128(
                 reinterpret_cast<const __m128i*>(q8g + 16));
-            add_scaled_pairs(_mm_maddubs_epi16(n0, a0),
-                             _mm_maddubs_epi16(n1, a1), scales[j], acc_lo,
-                             acc_hi);
+            s[h] = _mm_add_epi16(_mm_maddubs_epi16(n0, a0),
+                                 _mm_maddubs_epi16(n1, a1));
         }
+        add_scaled_two(s[0], s[1], scales[2 * k], scales[2 * k + 1], acc_lo,
+                       acc_hi);
     }
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32), acc_lo);
     _mm_storeu_si128(reinterpret_cast<__m128i*>(aux32 + 4), acc_hi);
