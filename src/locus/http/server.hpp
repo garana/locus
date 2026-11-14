@@ -205,7 +205,9 @@ struct ServerConfig {
      * generation. Matched on the request line, peeked without consuming;
      * a match is served inline only once the whole request (at most 16
      * KiB) is buffered, and one still arriving after 100 ms goes to the
-     * pool, so a slow client never holds the acceptor. Each fast-path
+     * pool, so a slow client never holds the acceptor; the reply has 1 s
+     * in all to be written (a large one to a slow reader, such as
+     * /metrics across a WAN, is cut). Each fast-path
      * connection is served exactly ONE request and closed, so a
      * keep-alive connection can never carry a later (inference) request
      * into the acceptor. Empty (default) = no fast path; every request
@@ -369,6 +371,8 @@ class Server {
      * passed to poll() is rebuilt from this each iteration (listen fd,
      * wake fd, then these), so it holds no kernel-side registration. */
     std::vector<Unclassified> unclassified_;
+    /** peek_classify's buffer (acceptor-only, like unclassified_). */
+    std::vector<char> peek_buf_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> started_{false};
     std::mutex wait_mu_;              /**< guards the wait() handoff. */
