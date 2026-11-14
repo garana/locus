@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <string>
 #include <vector>
@@ -35,6 +36,9 @@ struct StageOptions {
     std::string listen;                   /**< --listen HOST:PORT (req) */
     std::vector<std::string> downstream;  /**< --downstream pool (req) */
     std::vector<std::string> allow;       /**< --allow CIDR (repeatable)*/
+    std::string key_file;                 /**< --key-file: the shared
+                                           *   handshake key (empty =
+                                           *   no handshake) */
     int connect_timeout = 5000;           /**< --connect-timeout ms */
     int reconnect_wait = 1000;            /**< --reconnect-wait ms */
     int reconnect_attempts = 0;           /**< --reconnect-attempts */
@@ -100,6 +104,11 @@ inline Spec<StageOptions> stage_spec() {
                        true),
         D::string_list("allow", &O::allow,
                        "allowed peer CIDR; repeatable (default: any)"),
+        D::string_("key-file", &O::key_file,
+                   "shared key: peers must prove they hold it before "
+                   "any frame (the same file on every stage and the "
+                   "driver; make one with `umask 077; head -c 32 "
+                   "/dev/urandom > stage.key`)"),
         D::integer("connect-timeout", &O::connect_timeout,
                    "downstream connect timeout ms (0 = OS default)"),
         D::integer("reconnect-wait", &O::reconnect_wait,
@@ -420,6 +429,16 @@ inline std::string build_runtime(const StageOptions& opt,
         return "listen " + opt.listen +
                " is not loopback: give --allow with the peers that may "
                "connect (for example --allow 10.0.0.0/8)";
+    }
+    // Read on every build, so a SIGHUP reload picks up a new key for the
+    // sessions after it.
+    out.conn.key.clear();
+    if (!opt.key_file.empty()) {
+        try {
+            out.conn.key = locus::pipeline::read_key_file(opt.key_file);
+        } catch (const std::exception& e) {
+            return std::string("bad key-file: ") + e.what();
+        }
     }
     out.conn.connect_timeout_ms = opt.connect_timeout;
     out.conn.reconnect_wait_ms = opt.reconnect_wait;
