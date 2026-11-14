@@ -11,57 +11,20 @@
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
-#include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
 
 namespace {
 
 using dense::attention;
+using dense::gated_add;
 using dense::gelu_tanh;
 using dense::linear;
 using dense::linear1;
 using dense::ln_modulate;
-using dense::parallel;
+using dense::rms_norm;
+using dense::rope_pairs;
 using dense::silu;
-
-/**
- * diffusers' RMSNorm on each of rows rows of width d, in place:
- * x / sqrt(mean(x^2) + eps) * weight (a head's rows for the q / k
- * norms, a whole row for txt_norm).
- */
-void rms_norm(std::span<float> x, std::size_t rows, std::uint32_t d,
-              float eps, const std::vector<float>& weight) {
-    parallel(rows, [&](std::size_t r) {
-        float* xi = &x[r * d];
-        float ss = 0.0f;
-        for (std::uint32_t i = 0; i < d; ++i) ss += xi[i] * xi[i];
-        const float inv = 1.0f / std::sqrt(ss / static_cast<float>(d) + eps);
-        for (std::uint32_t i = 0; i < d; ++i) xi[i] = xi[i] * inv * weight[i];
-    });
-}
-
-/**
- * apply_rotary_emb_qwen (complex) on n rows of heads x hd, in place:
- * each pair (2 i, 2 i + 1) of each head turns by the token's angle,
- * (x0, x1) -> (x0 cos - x1 sin, x1 cos + x0 sin).
- */
-void apply_rope(std::span<float> x, std::uint32_t n, std::uint32_t heads,
-                std::uint32_t hd, const std::vector<float>& cosv,
-                const std::vector<float>& sinv) {
-    parallel(n, [&](std::size_t t) {
-        const float* c = &cosv[t * hd];
-        const float* s = &sinv[t * hd];
-        for (std::uint32_t h = 0; h < heads; ++h) {
-            float* xi = &x[(t * heads + h) * hd];
-            for (std::uint32_t i = 0; i + 1 < hd; i += 2) {
-                const float x0 = xi[i], x1 = xi[i + 1];
-                xi[i] = x0 * c[i] - x1 * s[i];
-                xi[i + 1] = x1 * c[i + 1] + x0 * s[i + 1];
-            }
-        }
-    });
-}
 
 /**
  * QwenTimestepProjEmbeddings' Timesteps(channels, flip_sin_to_cos=True,
@@ -82,16 +45,6 @@ std::vector<float> timestep_features(float sigma, std::uint32_t channels) {
         tf[half + k] = std::sin(a);
     }
     return tf;
-}
-
-/** x[i] += gate[i % d] * add[i], over n rows of width d. */
-void gated_add(std::span<float> x, std::span<const float> add,
-               const float* gate, std::uint32_t n, std::uint32_t d) {
-    for (std::size_t t = 0; t < n; ++t) {
-        for (std::uint32_t i = 0; i < d; ++i) {
-            x[t * d + i] += gate[i] * add[t * d + i];
-        }
-    }
 }
 
 }  // namespace
@@ -317,7 +270,7 @@ std::vector<float> QwenImageDit::forward(std::span<const float> x,
     rope(segs, n_txt, cosv, sinv);
 
     std::vector<float> tn(text.begin(), text.end());
-    rms_norm(tn, n_txt, joint_, eps_, txt_norm_);
+    rms_norm(tn, txt_norm_, eps_, n_txt, joint_, tn);
     if (&op == &backend::vulkan_image_ops() &&
         backend::VulkanSeq::available()) {
         const char* env = std::getenv("LOCUS_QWEN_IMAGE_GPU");
@@ -347,8 +300,8 @@ std::vector<float> QwenImageDit::forward(std::span<const float> x,
         linear(op, s.q.w, s.q.b, in, rows, sub(q));
         linear(op, s.k.w, s.k.b, in, rows, sub(k));
         linear(op, s.v.w, s.v.b, in, rows, sub(v));
-        rms_norm(sub(q), std::size_t{rows} * nh, hd, eps_, s.q_norm);
-        rms_norm(sub(k), std::size_t{rows} * nh, hd, eps_, s.k_norm);
+        rms_norm(sub(q), s.q_norm, eps_, rows * nh, hd, sub(q));
+        rms_norm(sub(k), s.k_norm, eps_, rows * nh, hd, sub(k));
     };
     // Gated residual of one stream's attention output, then its gated
     // FFN on the modulated LayerNorm. mod: shift, scale, gate (attn),
@@ -381,8 +334,8 @@ std::vector<float> QwenImageDit::forward(std::span<const float> x,
         auto nt = std::span<float>(nrm).subspan(0, std::size_t{n_txt} * w);
         ln_modulate(txt, n_txt, w, eps_, &mod_t[0], &mod_t[w], nt);
         qkv(b.txt, nt, n_txt, 0);
-        apply_rope(q, n, nh, hd, cosv, sinv);
-        apply_rope(k, n, nh, hd, cosv, sinv);
+        rope_pairs(q, n, nh, hd, cosv, sinv);
+        rope_pairs(k, n, nh, hd, cosv, sinv);
         attention(op, q, n, k, v, n, nh, hd, att);
         finish(b.txt, txt, n_txt, 0, mod_t);
         finish(b.img, img, n_img, n_txt, mod_i);
