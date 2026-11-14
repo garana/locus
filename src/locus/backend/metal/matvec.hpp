@@ -16,10 +16,12 @@ bool matvec_supported(gguf::TensorType t);
 
 /**
  * out = w x on the GPU (i#866): w's bytes are copied once into a
- * shared Metal buffer, cached by their host pointer (so pass only
- * weights that stay put, such as mmapped tensors), and x and out go
- * through scratch buffers. Weight types without a kernel run the
- * scalar CPU matvec.
+ * shared Metal buffer, cached by their host pointer, and x and out go
+ * through scratch buffers. The cache checks only type and shape, so
+ * pass only weights that stay put for the process (mmapped tensors):
+ * another matrix of the same type and shape at a freed one's address
+ * would get the old bytes. Calls from several threads run one at a
+ * time. Weight types without a kernel run the scalar CPU matvec.
  * @throws std::invalid_argument when x or out has the wrong size.
  */
 void matvec(const Mat& w, std::span<const float> x, std::span<float> out);
