@@ -37,6 +37,25 @@ TEST_CASE("sha256 matches the FIPS 180-4 examples", "[handshake]") {
           "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
 }
 
+TEST_CASE("sha256 and hmac fed in pieces match one call", "[handshake]") {
+    // Pieces that cross block boundaries in every way.
+    std::string data;
+    for (int i = 0; i < 1000; ++i) data += static_cast<char>(i * 7 + 3);
+    for (const std::size_t step : {1u, 3u, 63u, 64u, 65u, 200u}) {
+        INFO(step);
+        locus::sys::Sha256 s;
+        locus::sys::HmacSha256 h("key");
+        for (std::size_t off = 0; off < data.size(); off += step) {
+            const std::string_view piece =
+                std::string_view(data).substr(off, step);
+            s.update(piece);
+            h.update(piece);
+        }
+        CHECK(s.finish() == sha256(data));
+        CHECK(h.finish() == hmac_sha256("key", data));
+    }
+}
+
 TEST_CASE("hmac_sha256 matches RFC 4231", "[handshake]") {
     // Test cases 1, 2 and 6 (a key longer than the block).
     CHECK(to_hex(hmac_sha256(std::string(20, '\x0b'), "Hi There")) ==

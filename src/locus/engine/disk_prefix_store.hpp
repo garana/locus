@@ -88,7 +88,7 @@ std::filesystem::path ensure_private_dir(const std::filesystem::path& dir);
  */
 class DiskPrefixStore {
   public:
-    static constexpr std::uint32_t kFormatVersion = 2;
+    static constexpr std::uint32_t kFormatVersion = 3;  // 3: keyed flag
 
     /**
      * Opens (creating it if needed) the cache directory `dir`, indexes
@@ -152,6 +152,18 @@ class DiskPrefixStore {
     void set_device_attention(bool on);
     /** Sets DiskKey::experts_on_gpu, as set_device_attention does. */
     void set_experts_on_gpu(bool on);
+    /**
+     * Ends every file with an HMAC-SHA-256 of its bytes under `key`
+     * (i#830), so a file that someone without the key planted or
+     * changed reads as a miss; the checksums alone catch damage, not
+     * tampering. Files written without the key, or with another, are
+     * named apart (the header carries a one-way hash of the key), so
+     * they are never read and stores with other keys do not remove
+     * each other's files. Call it once, before any read or write.
+     *
+     * @param key The shared key (--prefix-cache-key-file); empty: none.
+     */
+    void set_mac_key(std::string key);
     std::size_t block_bytes() const { return block_bytes_; }
     std::uint64_t cap_bytes() const { return cap_bytes_; }
 
@@ -200,6 +212,13 @@ class DiskPrefixStore {
     bool decode(std::span<const std::uint8_t> blob,
                 std::span<const tok::TokenId> prompt, std::uint32_t n_blocks,
                 std::span<std::uint8_t* const> dst) const;
+    /** @returns whether files end with a tag (set_mac_key). */
+    bool keyed() const { return !mac_key_.empty(); }
+    /** Bytes of the tag at a keyed file's end. */
+    static constexpr std::size_t kTagBytes = 32;
+    /** Writes the tag of blob[0, bytes - kTagBytes) into its last
+     *  kTagBytes; a no-op when not keyed. */
+    void seal(std::uint8_t* blob, std::size_t bytes) const;
 
   private:
     struct File {
@@ -231,6 +250,11 @@ class DiskPrefixStore {
     /** Digest seed: a hash of the serialized key, so the same tokens
      *  under another key name another file. */
     std::uint64_t key_seed_ = 0;
+    /** set_mac_key's key; empty: files carry no tag. */
+    std::string mac_key_;
+    /** A one-way 64-bit name of mac_key_ (0: none), in the header, so
+     *  stores with other keys name their files apart. */
+    std::uint64_t key_id_ = 0;
 
     mutable std::mutex mu_;
     std::unordered_map<std::uint64_t, File> files_;

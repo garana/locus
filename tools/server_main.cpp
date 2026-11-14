@@ -15,6 +15,7 @@
 #include "backend_cli.hpp"
 #include "cli_spec.hpp"
 #include "locus/engine/disk_prefix_key.hpp"
+#include "locus/pipeline/handshake.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/server/server.hpp"
@@ -261,6 +262,10 @@ OpenAI + Anthropic compatible inference server (default port 8080):
                 args.prefix_cache_helper,
                 std::uint64_t{args.prefix_cache_disk_mib} << 20, g,
                 model_path, model, args.kv_type);
+        }
+        if (opt.engine.disk_prefix && !args.prefix_cache_key_file.empty()) {
+            opt.engine.disk_prefix->set_mac_key(
+                locus::pipeline::read_key_file(args.prefix_cache_key_file));
         }
         opt.chat_template =
             locus::chat::ChatTemplate::from_gguf(g);
