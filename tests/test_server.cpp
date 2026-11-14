@@ -2723,6 +2723,19 @@ TEST_CASE("image input on a text-only model is a 400", "[server][image]") {
     REQUIRE(b);
     REQUIRE(b->status == 400);
     REQUIRE(json::parse(b->body)["type"] == "error");
+
+    // i#625 F14: past 8 images a request is refused while it is parsed,
+    // before any image is decoded or run through a vision tower.
+    json many = openai_image_chat(url, "What are these?");
+    json& parts = many["messages"][0]["content"];
+    while (parts.size() < 9 + 1) {
+        parts.insert(parts.begin(), parts[0]);
+    }
+    auto c = client.Post("/v1/chat/completions", many.dump(),
+                         "application/json");
+    REQUIRE(c);
+    REQUIRE(c->status == 400);
+    REQUIRE(c->body.find("at most 8 images") != std::string::npos);
 }
 
 // i#241 end to end on Janus-Pro: the reference image and the golden
