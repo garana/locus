@@ -165,6 +165,18 @@ static_assert(locus::backend::vk::kAttnGrpDvMax ==
               "kAttnGrpDvMax differs from the shaders' ATTN_GRP_DV_MAX");
 
 #include <vulkan/vulkan.h>
+#if defined(__APPLE__)
+// VK_EXT_metal_objects (i#806): in C++ its Metal handles are void*.
+#include <vulkan/vulkan_metal.h>
+#endif
+
+#include "locus/backend/vulkan/metal_matmul.hpp"
+
+namespace {
+/** VkPhysicalDeviceTimelineSemaphoreFeatures' sType (i#806). */
+constexpr VkStructureType kTimelineFeaturesType =
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+}  // namespace
 
 #include <array>
 #include <bit>
@@ -1029,7 +1041,33 @@ struct VulkanContext::Impl {
          *  it (an import binds buf below the tensor, at the memory
          *  alignment, and starts here). */
         VkDeviceSize desc_off = 0;
+        /** Where buf is bound in mem (an import's bind offset). */
+        VkDeviceSize mem_off = 0;
+        /** The MTLBuffer behind mem (i#806), exported on first use;
+         *  MoltenVK owns it for as long as mem lives. */
+        void* mtl = nullptr;
     };
+
+    /** VK_EXT_metal_objects enabled, for the Metal matmul (i#806):
+     *  memory is allocated exportable. */
+    bool metal_objects = false;
+    /** The Metal Q4_K matmul, when metal_matmul() is on. */
+    std::unique_ptr<vk::MetalMatmul> metal;
+    /** Command buffers of the open batch already submitted, before a
+     *  Metal matmul; freed once the batch completes. */
+    std::vector<VkCommandBuffer> split_cmds;
+    /** The timeline semaphore ordering Vulkan and Metal work, its
+     *  MTLSharedEvent, the last value handed out, and the value the
+     *  next Vulkan submit waits for (0: none). */
+    VkSemaphore metal_sem = VK_NULL_HANDLE;
+    void* metal_event = nullptr;
+    std::uint64_t metal_val = 0;
+    std::uint64_t metal_wait = 0;
+    /** Vulkan dispatches recorded in batch_cmd since it began (a Metal
+     *  matmul right after another needs no new submit or wait). */
+    std::uint64_t cmd_dispatches = 0;
+    /** A Metal matmul ran in the open batch. */
+    bool metal_in_batch = false;
 
     /** VK_EXT_external_memory_host enabled: import_host works. */
     bool has_host_import = false;
@@ -1232,6 +1270,8 @@ struct VulkanContext::Impl {
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
         std::vector<const char*> dexts;
+        bool has_metal_ext = false;
+        VkPhysicalDeviceTimelineSemaphoreFeatures timeline_f{};
         // Enabled through dci.pNext when the device has it.
         VkPhysicalDeviceShaderFloat16Int8Features f16f{};
         f16f.sType =
@@ -1282,6 +1322,9 @@ struct VulkanContext::Impl {
                     std::strcmp(e.extensionName,
                                 VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME) ==
                         0;
+                has_metal_ext =
+                    has_metal_ext ||
+                    std::strcmp(e.extensionName, "VK_EXT_metal_objects") == 0;
             }
             // LOCUS_VK_NO_F16=1 takes the no-shaderFloat16 path on any
             // device (to check the fallback).
@@ -1324,12 +1367,95 @@ struct VulkanContext::Impl {
             const char* e = std::getenv("LOCUS_VK_SPIN_WAIT");
             spin_wait = e != nullptr ? std::string_view(e) != "0" : moltenvk;
         }
+#if defined(__APPLE__) && defined(LOCUS_HAS_METAL)
+        {
+            // LOCUS_VK_METAL_MATMUL=1: Q4_K prefill matmuls on Metal's
+            // simdgroup_matrix through VK_EXT_metal_objects (i#806).
+            const char* e = std::getenv("LOCUS_VK_METAL_MATMUL");
+            metal_objects = moltenvk && has_metal_ext && e != nullptr &&
+                            std::string_view(e) != "0";
+            if (metal_objects) {
+                dexts.push_back("VK_EXT_metal_objects");
+                // The Vulkan / Metal handshake: a timeline semaphore
+                // exported as an MTLSharedEvent.
+                dexts.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timeline_f.sType = kTimelineFeaturesType;
+                timeline_f.timelineSemaphore = VK_TRUE;
+                timeline_f.pNext = const_cast<void*>(dci.pNext);
+                dci.pNext = &timeline_f;
+            }
+        }
+#else
+        (void)has_metal_ext;
+        (void)timeline_f;
+#endif
         dci.enabledExtensionCount =
             static_cast<std::uint32_t>(dexts.size());
         dci.ppEnabledExtensionNames = dexts.data();
         check(vkCreateDevice(phys, &dci, nullptr, &device),
               "create device");
         vkGetDeviceQueue(device, queue_family, 0, &queue);
+#if defined(__APPLE__) && defined(LOCUS_HAS_METAL)
+        if (metal_objects) {
+            // The MTLDevice and the queue's own MTLCommandQueue: Metal
+            // command buffers committed there run in order with the
+            // Vulkan submits (MoltenVK commits a submit's command buffer
+            // before vkQueueSubmit returns). Without them, or without
+            // the kernel, prefill keeps the Vulkan matmul.
+            VkExportMetalCommandQueueInfoEXT eq{};
+            eq.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT;
+            eq.queue = queue;
+            VkExportMetalDeviceInfoEXT ed{};
+            ed.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT;
+            ed.pNext = &eq;
+            VkExportMetalObjectsInfoEXT eo{};
+            eo.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT;
+            eo.pNext = &ed;
+            auto fn = reinterpret_cast<PFN_vkExportMetalObjectsEXT>(
+                vkGetDeviceProcAddr(device, "vkExportMetalObjectsEXT"));
+            if (fn != nullptr) {
+                fn(device, &eo);
+                metal = vk::MetalMatmul::create(ed.mtlDevice,
+                                                eq.mtlCommandQueue);
+            }
+            if (metal != nullptr) {
+                // The timeline semaphore the Vulkan submits and the Metal
+                // command buffers wait on and signal (see metal_matmul_q4k).
+                VkExportMetalObjectCreateInfoEXT emo{};
+                emo.sType =
+                    VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT;
+                emo.exportObjectType =
+                    VK_EXPORT_METAL_OBJECT_TYPE_METAL_SHARED_EVENT_BIT_EXT;
+                VkSemaphoreTypeCreateInfo stc{};
+                stc.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+                stc.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+                stc.pNext = &emo;
+                VkSemaphoreCreateInfo sci{};
+                sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+                sci.pNext = &stc;
+                if (vkCreateSemaphore(device, &sci, nullptr, &metal_sem) ==
+                    VK_SUCCESS) {
+                    VkExportMetalSharedEventInfoEXT ee{};
+                    ee.sType =
+                        VK_STRUCTURE_TYPE_EXPORT_METAL_SHARED_EVENT_INFO_EXT;
+                    ee.semaphore = metal_sem;
+                    VkExportMetalObjectsInfoEXT eoe{};
+                    eoe.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT;
+                    eoe.pNext = &ee;
+                    fn(device, &eoe);
+                    metal_event = ee.mtlSharedEvent;
+                }
+                if (metal_event == nullptr) {
+                    metal.reset();
+                }
+            }
+            if (metal == nullptr) {
+                std::fprintf(stderr,
+                             "locus: LOCUS_VK_METAL_MATMUL: Metal objects "
+                             "or kernel unavailable, Vulkan matmuls kept\n");
+            }
+        }
+#endif
 
         VkCommandPoolCreateInfo cpi{};
         cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1535,6 +1661,14 @@ struct VulkanContext::Impl {
         mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         mai.allocationSize = req.size;
         mai.memoryTypeIndex = type;
+#if defined(__APPLE__) && defined(LOCUS_HAS_METAL)
+        VkExportMetalObjectCreateInfoEXT emo{};
+        emo.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT;
+        emo.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_BUFFER_BIT_EXT;
+        if (metal_objects) {
+            mai.pNext = &emo;
+        }
+#endif
         check(vkAllocateMemory(device, &mai, nullptr, &b.mem),
               "allocate memory");
         b.bytes = req.size;
@@ -1641,6 +1775,15 @@ struct VulkanContext::Impl {
         mai.pNext = &imp;
         mai.allocationSize = end - base;
         mai.memoryTypeIndex = type;
+#if defined(__APPLE__) && defined(LOCUS_HAS_METAL)
+        VkExportMetalObjectCreateInfoEXT emo{};
+        emo.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT;
+        emo.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_BUFFER_BIT_EXT;
+        if (metal_objects) {
+            emo.pNext = &imp;
+            mai.pNext = &emo;
+        }
+#endif
         if (vkAllocateMemory(device, &mai, nullptr, &b.mem) != VK_SUCCESS ||
             vkBindBufferMemory(device, b.buf, b.mem, bind) != VK_SUCCESS) {
             if (b.mem != VK_NULL_HANDLE) {
@@ -1654,9 +1797,73 @@ struct VulkanContext::Impl {
         b.imported = true;
         b.kind = MemKind::kMapped;
         b.desc_off = rem;
+        b.mem_off = bind;
         gpu_metrics(GpuApi::kVulkan)
             .add_bytes(b.kind, static_cast<std::int64_t>(b.bytes));
         return b;
+    }
+
+    /** The timeline values a submit waits for and signals (kept here:
+     *  VkTimelineSemaphoreSubmitInfo points at them). */
+    std::uint64_t ts_wait_v = 0, ts_sig_v = 0;
+
+    /**
+     * Fills si (sType and the semaphore parts) for a queue submit: it
+     * waits for metal_wait, the last Metal matmul (then clears it), and
+     * signals `signal` on the timeline semaphore (0: no signal). With
+     * neither, si is a plain submit.
+     */
+    void timeline_submit(VkSubmitInfo& si, VkTimelineSemaphoreSubmitInfo& ts,
+                         VkPipelineStageFlags& stage, std::uint64_t signal) {
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        if (metal_sem == VK_NULL_HANDLE ||
+            (metal_wait == 0 && signal == 0)) {
+            return;
+        }
+        ts.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        if (metal_wait != 0) {
+            ts_wait_v = metal_wait;
+            metal_wait = 0;
+            ts.waitSemaphoreValueCount = 1;
+            ts.pWaitSemaphoreValues = &ts_wait_v;
+            si.waitSemaphoreCount = 1;
+            si.pWaitSemaphores = &metal_sem;
+            si.pWaitDstStageMask = &stage;
+        }
+        if (signal != 0) {
+            ts_sig_v = signal;
+            ts.signalSemaphoreValueCount = 1;
+            ts.pSignalSemaphoreValues = &ts_sig_v;
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores = &metal_sem;
+        }
+        si.pNext = &ts;
+    }
+
+    /**
+     * @returns The MTLBuffer behind b's memory, exported on first use
+     *     (needs metal_objects), or nullptr.
+     */
+    void* metal_buffer(HostBuffer& b) {
+#if defined(__APPLE__) && defined(LOCUS_HAS_METAL)
+        if (b.mtl == nullptr && metal_objects) {
+            // Per device (a process may hold several contexts); once
+            // per buffer, so not worth caching.
+            const auto fn = reinterpret_cast<PFN_vkExportMetalObjectsEXT>(
+                vkGetDeviceProcAddr(device, "vkExportMetalObjectsEXT"));
+            if (fn != nullptr) {
+                VkExportMetalBufferInfoEXT eb{};
+                eb.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_BUFFER_INFO_EXT;
+                eb.memory = b.mem;
+                VkExportMetalObjectsInfoEXT eo{};
+                eo.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT;
+                eo.pNext = &eb;
+                fn(device, &eo);
+                b.mtl = eb.mtlBuffer;
+            }
+        }
+#endif
+        return b.mtl;
     }
 
     void destroy_buffer(HostBuffer& b) {
@@ -1694,6 +1901,9 @@ struct VulkanContext::Impl {
                                              nullptr);
             }
             vkDestroyFence(device, batch_fence, nullptr);
+            if (metal_sem != VK_NULL_HANDLE) {
+                vkDestroySemaphore(device, metal_sem, nullptr);
+            }
             vkDestroyCommandPool(device, pool, nullptr);
             vkDestroyDevice(device, nullptr);
         }
@@ -1839,6 +2049,8 @@ void VulkanContext::begin_batch() {
                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                             im.qpool, 0);
     }
+    im.cmd_dispatches = 0;
+    im.metal_in_batch = false;
     // Open only once the command buffer exists and recording began: a
     // throw above leaves no batch (and no BatchScope) behind.
     im.batch_is_open = true;
@@ -1903,6 +2115,7 @@ void VulkanContext::dispatch(Kernel k,
     vkCmdDispatch(im.batch_cmd, groups_x, groups_y, groups_z);
     ++im.prof.dispatches;
     ++im.batch_dispatches;
+    ++im.cmd_dispatches;
     // Slot 0 is the batch start; keep the last slot for its end.
     if (im.per_kernel && im.batch_timed &&
         im.ts_tag.size() + 2 < Impl::kMaxTs) {
@@ -1959,7 +2172,10 @@ void VulkanContext::end_batch() {
     check(vkEndCommandBuffer(im.batch_cmd), "end cmd");
     const clock::time_point t1 = clock::now();
     VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    // After a Metal matmul, wait for it (i#806); else a plain submit.
+    VkTimelineSemaphoreSubmitInfo ts{};
+    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    im.timeline_submit(si, ts, stage, 0);
     si.commandBufferCount = 1;
     si.pCommandBuffers = &im.batch_cmd;
     if (im.spin_wait) {
@@ -2071,6 +2287,14 @@ void VulkanContext::end_batch() {
     }
     vkFreeCommandBuffers(im.device, im.pool, 1, &im.batch_cmd);
     im.batch_cmd = VK_NULL_HANDLE;
+    // The command buffers submitted before Metal matmuls ran ahead of
+    // the last one on the same queue, so they are done too.
+    if (!im.split_cmds.empty()) {
+        vkFreeCommandBuffers(im.device, im.pool,
+                             static_cast<std::uint32_t>(im.split_cmds.size()),
+                             im.split_cmds.data());
+        im.split_cmds.clear();
+    }
     // Bound the cache when keys keep changing (e.g. a paging
     // budget cycling per-expert buffers).
     if (im.sets_stale || im.sets_live > 65536) {
@@ -2087,9 +2311,111 @@ void VulkanContext::abandon_batch() {
         vkFreeCommandBuffers(im.device, im.pool, 1, &im.batch_cmd);
         im.batch_cmd = VK_NULL_HANDLE;
     }
+    if (!im.split_cmds.empty()) {
+        // Submitted before a Metal matmul: let them finish first.
+        vkQueueWaitIdle(im.queue);
+        vkFreeCommandBuffers(im.device, im.pool,
+                             static_cast<std::uint32_t>(im.split_cmds.size()),
+                             im.split_cmds.data());
+        im.split_cmds.clear();
+    }
 }
 
 bool VulkanContext::moltenvk() const { return impl_->moltenvk; }
+
+bool VulkanContext::metal_matmul() const { return impl_->metal != nullptr; }
+
+void VulkanContext::metal_matmul_q4k(
+    Buffer w, std::uint64_t w_off, Buffer x, std::uint32_t x_off,
+    std::uint32_t x_stride, Buffer out, std::uint32_t out_off,
+    std::uint32_t out_stride, std::uint32_t rows, std::uint32_t cols,
+    std::uint32_t n_tok, bool accumulate, float scale) {
+    Impl& im = *impl_;
+    if (im.metal == nullptr || !im.batch_is_open || cols % 256 != 0) {
+        throw std::logic_error(
+            "vulkan: metal_matmul_q4k needs metal_matmul(), an open batch "
+            "and whole Q4_K blocks");
+    }
+    auto* wb = static_cast<Impl::HostBuffer*>(w.impl);
+    auto* xb = static_cast<Impl::HostBuffer*>(x.impl);
+    auto* ob = static_cast<Impl::HostBuffer*>(out.impl);
+    vk::MetalQ4kArgs a;
+    a.w = im.metal_buffer(*wb);
+    a.x = im.metal_buffer(*xb);
+    a.out = im.metal_buffer(*ob);
+    if (a.w == nullptr || a.x == nullptr || a.out == nullptr) {
+        throw std::runtime_error("vulkan: no Metal buffer to export");
+    }
+    // Each buffer's data starts at its bind offset in the memory plus
+    // its descriptor offset in the buffer.
+    a.w_off = wb->mem_off + wb->desc_off + w_off;
+    a.x_off = (xb->mem_off + xb->desc_off) / 4 + x_off;
+    a.out_off = (ob->mem_off + ob->desc_off) / 4 + out_off;
+    a.x_stride = x_stride;
+    a.out_stride = out_stride;
+    a.rows = rows;
+    a.cols = cols;
+    a.n_tok = n_tok;
+    a.accumulate = accumulate;
+    a.scale = scale;
+    // Both directions are ordered with GPU-side events on the timeline
+    // semaphore. The Metal command buffer waits for the Vulkan work
+    // submitted before it (a vkQueueSubmit's Metal command buffer may be
+    // committed after it returns, so queue order alone does not put it
+    // first), and the next Vulkan submit waits for the Metal one: Metal's
+    // hazard tracking does not order MoltenVK's later command buffer
+    // after ours, even on tracked buffers (without the wait, i#806's
+    // test reads the output before the matmul writes it).
+    //
+    // A Metal matmul right after another (q / k / v, gate / up), with no
+    // Vulkan work recorded in between, needs no Vulkan submit: it waits
+    // for the previous matmul and signals its own value, which the next
+    // Vulkan submit waits for.
+    const bool chained = im.metal_in_batch && im.cmd_dispatches == 0;
+    std::uint64_t ready = 0;
+    if (chained) {
+        ready = im.metal_wait;
+        im.metal_wait = 0;
+    } else {
+        check(vkEndCommandBuffer(im.batch_cmd), "end cmd");
+        ready = ++im.metal_val;
+        VkSubmitInfo si{};
+        VkTimelineSemaphoreSubmitInfo ts{};
+        VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        im.timeline_submit(si, ts, stage, ready);
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &im.batch_cmd;
+        check(vkQueueSubmit(im.queue, 1, &si, VK_NULL_HANDLE), "submit");
+        im.split_cmds.push_back(im.batch_cmd);
+        im.batch_cmd = VK_NULL_HANDLE;
+    }
+    const std::uint64_t done = ++im.metal_val;
+    a.event = im.metal_event;
+    a.wait_value = ready;
+    a.signal_value = done;
+    im.metal->commit_q4k(a);
+    im.metal_wait = done;
+    im.metal_in_batch = true;
+    if (chained) {
+        ++im.prof.dispatches;
+        ++im.batch_dispatches;
+        return;
+    }
+    VkCommandBufferAllocateInfo cba{};
+    cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cba.commandPool = im.pool;
+    cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cba.commandBufferCount = 1;
+    check(vkAllocateCommandBuffers(im.device, &cba, &im.batch_cmd),
+          "allocate command buffer");
+    VkCommandBufferBeginInfo cbb{};
+    cbb.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(im.batch_cmd, &cbb), "begin cmd");
+    im.cmd_dispatches = 0;
+    ++im.prof.dispatches;
+    ++im.batch_dispatches;
+}
 
 bool VulkanContext::serial_dispatch() const {
     return impl_->serial_dispatch;
@@ -2253,6 +2579,14 @@ VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
 }
 bool VulkanContext::host_import() const { no_kernels(); }
 bool VulkanContext::moltenvk() const { no_kernels(); }
+bool VulkanContext::metal_matmul() const { no_kernels(); }
+void VulkanContext::metal_matmul_q4k(Buffer, std::uint64_t, Buffer,
+                                     std::uint32_t, std::uint32_t, Buffer,
+                                     std::uint32_t, std::uint32_t,
+                                     std::uint32_t, std::uint32_t,
+                                     std::uint32_t, bool, float) {
+    no_kernels();
+}
 bool VulkanContext::timestamps() const { no_kernels(); }
 void VulkanContext::destroy_buffer(Buffer) { no_kernels(); }
 void VulkanContext::write_buffer(Buffer,

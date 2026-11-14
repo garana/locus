@@ -193,8 +193,10 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   time needs about 82); a comparison
   with other speech, image and video tools (#245).
 - Performance: prefill on Apple GPUs at 44% of Metal's (#10:
-  MoltenVK exposes no cooperative matrix, so a Metal matmul is being
-  tried), CPU prefill on an M2 Pro at about 60% of llama.cpp's with
+  MoltenVK exposes no cooperative matrix; `LOCUS_VK_METAL_MATMUL=1`
+  runs Q4_K prefill matmuls on Metal's simdgroup_matrix from the
+  Vulkan backend, a 1B Q4_K_M prefill 19% faster, and the other types
+  are next, #799), CPU prefill on an M2 Pro at about 60% of llama.cpp's with
   `LOCUS_CPU_FAST` (llama.cpp sends its prompt matmuls through
   Apple's Accelerate; whether locus should is #782), batch-invariant
   decode at full speed on V3D (#511).

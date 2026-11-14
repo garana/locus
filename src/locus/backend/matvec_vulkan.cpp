@@ -1336,6 +1336,15 @@ void rec_matmul(State& s, const Mat& w, VulkanContext::Buffer wb,
                        r.n_batch);
         return;
     }
+    // LOCUS_VK_METAL_MATMUL (i#806): a plain Q4_K matmul runs on Metal's
+    // simdgroup_matrix between the batch's Vulkan work.
+    if (w.type == gguf::TensorType::kQ4_K && s.ctx.metal_matmul() &&
+        r.n_batch == 1 && r.div == 1 && r.w_bdiv == 1 && w.cols % 256 == 0) {
+        s.ctx.metal_matmul_q4k(wb, w_byte_off, x, r.x_off, r.x_stride, out,
+                               r.out_off, r.out_stride, w.rows, w.cols,
+                               r.n_tok, accumulate, scale);
+        return;
+    }
     const Kernel k = matmul_kernel(w);
     if (k == Kernel::kCount_) {
         for (std::uint32_t b = 0; b < r.n_batch; ++b) {

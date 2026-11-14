@@ -281,6 +281,20 @@ if(Vulkan_FOUND)
     target_link_libraries(locus PRIVATE Vulkan::Vulkan)
     message(STATUS "locus Vulkan: found (${Vulkan_LIBRARY})")
 
+    # Apple: the Metal Q4_K prefill matmul run from the Vulkan backend
+    # through MoltenVK's VK_EXT_metal_objects (LOCUS_VK_METAL_MATMUL,
+    # i#806). Metal and Foundation are system frameworks; the kernel is
+    # compiled at run time from its embedded source.
+    if(APPLE)
+        enable_language(OBJCXX)
+        target_sources(locus PRIVATE src/locus/backend/vulkan/metal_matmul.mm)
+        set_source_files_properties(src/locus/backend/vulkan/metal_matmul.mm
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_compile_definitions(locus PRIVATE LOCUS_HAS_METAL=1)
+        target_link_libraries(locus PRIVATE "-framework Metal"
+                                            "-framework Foundation")
+    endif()
+
     find_program(GLSLC glslc)
     find_program(GLSLANG_VALIDATOR glslangValidator)
     if(GLSLANG_VALIDATOR OR GLSLC)

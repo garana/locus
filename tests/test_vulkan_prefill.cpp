@@ -1211,3 +1211,98 @@ TEST_CASE("vulkan comes up without shaderFloat16, f16 kernels skipped",
         ctx.destroy_buffer(b);
     }
 }
+
+// i#806: LOCUS_VK_METAL_MATMUL runs a Q4_K matmul on Metal's
+// simdgroup_matrix between a batch's Vulkan work. One batch: a Vulkan
+// copy writes X, two Metal matmuls read it (the second accumulates on
+// the first), and a Vulkan copy reads the result back, so both
+// directions of the ordering are checked. The shape is off every tile
+// (100 rows, 45 tokens), with strides and offsets on both sides; the
+// sums are the CPU's in another order, so within a tolerance.
+TEST_CASE("vulkan metal q4_k matmul matches the CPU between vulkan work",
+          "[vulkan]") {
+    setenv("LOCUS_VK_METAL_MATMUL", "1", 1);
+    if (!VulkanContext::available()) {
+        unsetenv("LOCUS_VK_METAL_MATMUL");
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    VulkanContext ctx;
+    unsetenv("LOCUS_VK_METAL_MATMUL");
+    if (!ctx.metal_matmul()) {
+        SKIP("no Metal matmul (not MoltenVK, or no VK_EXT_metal_objects)");
+    }
+    constexpr std::uint32_t rows = 100, cols = 512, n = 45;
+    constexpr std::uint32_t x_stride = cols + 8, x_off = 5;
+    constexpr std::uint32_t out_stride = rows + 7, out_off = 3;
+    std::mt19937 rng(806);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::normal_distribution<float> nx(0.0f, 1.0f);
+    std::vector<std::byte> w(std::size_t{rows} * (cols / 256) * 144);
+    for (auto& b : w) {
+        b = static_cast<std::byte>(byte(rng));
+    }
+    for (std::size_t at = 0; at < w.size(); at += 144) {
+        const std::uint16_t dd[] = {locus::backend::f32_to_f16(0.01f),
+                                    locus::backend::f32_to_f16(0.005f)};
+        std::memcpy(&w[at], dd, 4);
+    }
+    const std::size_t x_len = std::size_t{x_off} + std::size_t{n} * x_stride;
+    std::vector<float> x(x_len);
+    for (float& v : x) {
+        v = nx(rng);
+    }
+    const std::size_t o_len =
+        std::size_t{out_off} + std::size_t{n} * out_stride;
+    std::vector<float> init(o_len);
+    for (float& v : init) {
+        v = nx(rng);
+    }
+    auto wb = ctx.create_buffer(w.size());
+    ctx.write_buffer(wb, w);
+    auto xsrc = ctx.create_buffer(x_len * 4);
+    ctx.write_buffer(xsrc, std::as_bytes(std::span(x)));
+    auto xb = ctx.create_buffer(x_len * 4);
+    auto ob = ctx.create_buffer(o_len * 4);
+    ctx.write_buffer(ob, std::as_bytes(std::span(init)));
+    auto back = ctx.create_buffer(o_len * 4);
+    ctx.begin_batch();
+    {
+        const VulkanContext::Buffer bufs[] = {xsrc, xb};
+        const std::uint32_t push[] = {static_cast<std::uint32_t>(x_len), 0, 0};
+        ctx.dispatch(Kernel::kCopy, bufs, push,
+                     static_cast<std::uint32_t>((x_len + 255) / 256));
+    }
+    // out = init + 0.5 W x, then += 0.25 W x: init + 0.75 W x.
+    ctx.metal_matmul_q4k(wb, 0, xb, x_off, x_stride, ob, out_off, out_stride,
+                         rows, cols, n, true, 0.5f);
+    ctx.metal_matmul_q4k(wb, 0, xb, x_off, x_stride, ob, out_off, out_stride,
+                         rows, cols, n, true, 0.25f);
+    {
+        const VulkanContext::Buffer bufs[] = {ob, back};
+        const std::uint32_t push[] = {static_cast<std::uint32_t>(o_len), 0, 0};
+        ctx.dispatch(Kernel::kCopy, bufs, push,
+                     static_cast<std::uint32_t>((o_len + 255) / 256));
+    }
+    ctx.end_batch();
+    std::vector<float> got(o_len);
+    ctx.read_buffer(back, std::as_writable_bytes(std::span(got)));
+    std::vector<float> want = init;
+    const locus::backend::Mat m{locus::gguf::TensorType::kQ4_K, w.data(),
+                                rows, cols};
+    std::vector<float> row(rows);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        locus::backend::matvec(
+            m, std::span(x).subspan(x_off + std::size_t{t} * x_stride, cols),
+            row);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            want[out_off + std::size_t{t} * out_stride + r] += 0.75f * row[r];
+        }
+    }
+    for (std::size_t i = 0; i < o_len; ++i) {
+        INFO("element " << i);
+        REQUIRE(got[i] == Catch::Approx(want[i]).margin(1e-3));
+    }
+    for (auto b : {wb, xsrc, xb, ob, back}) {
+        ctx.destroy_buffer(b);
+    }
+}

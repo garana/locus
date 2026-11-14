@@ -351,6 +351,13 @@ class VulkanContext {
     /** @returns true when the driver is MoltenVK (Vulkan on Metal). */
     bool moltenvk() const;
 
+    /**
+     * @returns true when Q4_K prefill matmuls run on Metal's
+     * simdgroup_matrix (i#806): LOCUS_VK_METAL_MATMUL=1 on MoltenVK with
+     * VK_EXT_metal_objects, and the kernel built.
+     */
+    bool metal_matmul() const;
+
     /** @returns true when kernel k was built from its smaller-shared-
      *  memory variant (the device's limit, or LOCUS_VK_MATMUL_SMALL). */
     bool small_variant(Kernel k) const;
@@ -426,6 +433,25 @@ class VulkanContext {
      */
     Buffer create_buffer(std::size_t bytes,
                          MemKind kind = MemKind::kScratch);
+
+    /**
+     * Records out[t * out_stride + out_off + r] = scale * (W[r] . x[t])
+     * (or += with accumulate), x[t] at t * x_stride + x_off, for the
+     * rows x cols Q4_K matrix W starting w_off bytes into w, as a Metal
+     * command buffer between the batch's Vulkan work: the work recorded
+     * so far is submitted (unwaited), the Metal matmul committed on the
+     * same queue, and recording continues in a new command buffer, so
+     * the GPU runs all three in order. Offsets other than w_off are in
+     * floats. Needs metal_matmul() and an open batch.
+     *
+     * @throws std::logic_error otherwise.
+     */
+    void metal_matmul_q4k(Buffer w, std::uint64_t w_off, Buffer x,
+                          std::uint32_t x_off, std::uint32_t x_stride,
+                          Buffer out, std::uint32_t out_off,
+                          std::uint32_t out_stride, std::uint32_t rows,
+                          std::uint32_t cols, std::uint32_t n_tok,
+                          bool accumulate, float scale);
 
     /**
      * Wraps host memory [ptr, ptr + bytes) as a buffer without copying
