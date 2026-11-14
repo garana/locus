@@ -645,3 +645,288 @@ kernel void attn_fused(device const float* q [[buffer(0)]],
         out[h * p.head_dim + d] = v * inv;
     }
 }
+
+// ---------------------------------------------------------------------
+// Prefill matmul (i#866, from #799): Y[t][r] = scale * (W X)[r][t] (+ Y)
+// for Q4_K W rows and f32 token rows of X and Y. A threadgroup of 128
+// (4 simdgroups) takes 64 weight rows x 32 tokens and walks k in stages
+// of 32 (one sub-block): the threads dequantize the weight tile and
+// stage the activations in threadgroup memory (float), then each
+// simdgroup runs a 32 x 16 piece as eight 8 x 8 simdgroup_matrix tiles.
+// Rows and tokens past the matrix load as zero and are not stored.
+
+
+struct MmBlockQ4K {
+    half d;
+    half dmin;
+    uchar scales[12];
+    uchar qs[128];
+};
+
+struct MmParams {
+    ulong w_off;     // bytes
+    ulong x_off;     // floats
+    ulong out_off;   // floats
+    uint rows, cols, n_tok;
+    uint x_stride, out_stride;
+    uint accumulate;
+    float scale;
+    uint row_tiles;  // threadgroup t is tile (t % row_tiles, t / row_tiles)
+};
+
+constant constexpr uint kMmTM = 64;
+constant constexpr uint kMmTN = 32;
+constant constexpr uint kMmTK = 32;
+constant constexpr uint kMmPA = kMmTK + 8;
+constant constexpr uint kMmPB = kMmTK + 8;
+constant constexpr uint kMmPO = kMmTM + 4;
+
+// Sub-block j's 6-bit scale and min (ggml's get_scale_min_k4).
+inline void mm_scale_min(uint j, device const uchar* q, thread uint& sc,
+                      thread uint& mn) {
+    if (j < 4) {
+        sc = q[j] & 63;
+        mn = q[j + 4] & 63;
+    } else {
+        sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        mn = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+kernel void mm_q4_k(device const uchar* wbase [[buffer(0)]],
+                   device const float* xbase [[buffer(1)]],
+                   device float* ybase [[buffer(2)]],
+                   constant MmParams& p [[buffer(3)]],
+                   uint tgi [[threadgroup_position_in_grid]],
+                   uint tid [[thread_index_in_threadgroup]],
+                   uint sg [[simdgroup_index_in_threadgroup]]) {
+    const uint2 tg = uint2(tgi % p.row_tiles, tgi / p.row_tiles);
+    threadgroup float sa[kMmTM * kMmPA];
+    threadgroup float sb[kMmTN * kMmPB];
+    threadgroup float so[kMmTN * kMmPO];
+    device const MmBlockQ4K* w = (device const MmBlockQ4K*)(wbase + p.w_off);
+    device const float* x = xbase + p.x_off;
+    device float* y = ybase + p.out_off;
+    const uint m0 = tg.x * kMmTM;
+    const uint n0 = tg.y * kMmTN;
+    const uint nb = p.cols / 256;
+    const uint rm = (sg & 1) * 32;
+    const uint rn = (sg >> 1) * 16;
+    simdgroup_float8x8 acc[4][2];
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 2; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
+
+    // Loaders: A, row tid / 2, 16 elements at (tid & 1) * 16; B, token
+    // tid / 4, 8 elements at (tid & 3) * 8.
+    const uint ar = tid >> 1;
+    const uint ah = (tid & 1) * 16;
+    const uint bt = tid >> 2;
+    const uint bk = (tid & 3) * 8;
+    const bool a_in = m0 + ar < p.rows;
+    const bool b_in = n0 + bt < p.n_tok;
+    device const MmBlockQ4K* wrow = w + (a_in ? (m0 + ar) * nb : 0);
+    device const float* xrow = x + (b_in ? (n0 + bt) * p.x_stride : 0);
+
+    for (uint k0 = 0; k0 < p.cols; k0 += kMmTK) {
+        threadgroup float* da = sa + ar * kMmPA + ah;
+        if (a_in) {
+            device const MmBlockQ4K& blk = wrow[k0 / 256];
+            const uint j = (k0 % 256) / 32;
+            uint sc, mn;
+            mm_scale_min(j, blk.scales, sc, mn);
+            const float d = float(blk.d) * float(sc);
+            const float mm = float(blk.dmin) * float(mn);
+            device const uchar* q = blk.qs + 32 * (j / 2) + ah;
+            const uint sh = (j & 1) * 4;
+            for (uint i = 0; i < 16; ++i) {
+                da[i] = d * float((q[i] >> sh) & 0xF) - mm;
+            }
+        } else {
+            for (uint i = 0; i < 16; ++i) da[i] = 0.0f;
+        }
+        threadgroup float* db = sb + bt * kMmPB + bk;
+        if (b_in) {
+            device const float* src = xrow + k0 + bk;
+            for (uint i = 0; i < 8; ++i) db[i] = src[i];
+        } else {
+            for (uint i = 0; i < 8; ++i) db[i] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0; kk < kMmTK; kk += 8) {
+            simdgroup_float8x8 a[4], bm[2];
+            for (uint i = 0; i < 4; ++i)
+                simdgroup_load(a[i], sa + (rm + 8 * i) * kMmPA + kk, kMmPA);
+            // B is k x tokens: the [token][k] tile, loaded transposed.
+            for (uint j = 0; j < 2; ++j)
+                simdgroup_load(bm[j], sb + (rn + 8 * j) * kMmPB + kk, kMmPB,
+                               ulong2(0, 0), true);
+            for (uint i = 0; i < 4; ++i)
+                for (uint j = 0; j < 2; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], bm[j],
+                                                  acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // The tile as [token][row] in threadgroup memory, then each thread
+    // stores its share inside the matrix.
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 2; ++j)
+            simdgroup_store(acc[i][j], so + (rn + 8 * j) * kMmPO + rm + 8 * i,
+                            kMmPO, ulong2(0, 0), true);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < kMmTM * kMmTN; e += 128) {
+        const uint t = e / kMmTM, r = e % kMmTM;
+        if (n0 + t < p.n_tok && m0 + r < p.rows) {
+            device float* o = y + (n0 + t) * p.out_stride + m0 + r;
+            const float v = p.scale * so[t * kMmPO + r];
+            *o = p.accumulate != 0 ? *o + v : v;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// The prefill forward's row kernels (i#866): n token rows at once.
+
+struct RowNormParams {
+    uint n;       // row width
+    uint stride;  // floats between rows (in and out)
+    float eps;
+};
+
+// rmsnorm_f32 on row t = threadgroup t: out[t] = x[t] / rms * w.
+kernel void rmsnorm_rows(device const float* x [[buffer(0)]],
+                         device const float* w [[buffer(1)]],
+                         device float* out [[buffer(2)]],
+                         constant RowNormParams& p [[buffer(3)]],
+                         uint t [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint nt [[threads_per_threadgroup]]) {
+    threadgroup float part[32];
+    device const float* xr = x + ulong(t) * p.stride;
+    device float* o = out + ulong(t) * p.stride;
+    float s = 0.0f;
+    for (uint i = tid; i < p.n; i += nt) {
+        s += xr[i] * xr[i];
+    }
+    s = group_sum(s, part, tid, nt);
+    const float inv = 1.0f / sqrt(s / float(p.n) + p.eps);
+    for (uint i = tid; i < p.n; i += nt) {
+        o[i] = xr[i] * inv * w[i];
+    }
+}
+
+struct RopeRowsParams {
+    ulong off;    // token 0's first float
+    uint n_tok;
+    uint n_heads;
+    uint head_dim;
+    uint stride;  // floats between token rows
+};
+
+// rope_norm on n token rows: token t's heads at off + t * stride, its
+// (cos, sin) table at cs + t * head_dim. One thread a pair.
+kernel void rope_rows(device float* v [[buffer(0)]],
+                      device const float* cs [[buffer(1)]],
+                      constant RopeRowsParams& p [[buffer(2)]],
+                      uint g [[thread_position_in_grid]]) {
+    const uint half_d = p.head_dim / 2, per = p.n_heads * half_d;
+    if (g >= p.n_tok * per) {
+        return;
+    }
+    const uint t = g / per, j = g % per;
+    const uint h = j / half_d, i = j % half_d;
+    device float* e =
+        v + p.off + ulong(t) * p.stride + h * p.head_dim + 2 * i;
+    device const float* c = cs + t * p.head_dim + 2 * i;
+    const float a = e[0], b = e[1];
+    e[0] = a * c[0] - b * c[1];
+    e[1] = a * c[1] + b * c[0];
+}
+
+struct ScatterParams {
+    ulong v_off;  // V's offset past K in a pool row
+    uint n_tok;
+    uint kv_dim;
+};
+
+// The chunk's K and V rows (n_tok rows of kv_dim) into the KV pool:
+// token t's K row at rows[t], its V row v_off past it.
+kernel void kv_scatter(device const float* k [[buffer(0)]],
+                       device const float* v [[buffer(1)]],
+                       device float* pool [[buffer(2)]],
+                       device const ulong* rows [[buffer(3)]],
+                       constant ScatterParams& p [[buffer(4)]],
+                       uint g [[thread_position_in_grid]]) {
+    if (g >= p.n_tok * p.kv_dim) {
+        return;
+    }
+    const uint t = g / p.kv_dim, i = g % p.kv_dim;
+    pool[rows[t] + i] = k[g];
+    pool[rows[t] + p.v_off + i] = v[g];
+}
+
+struct AttnRowsParams {
+    AttnParams a;    // n_pos unused: query t sees base + t + 1
+    uint base;       // the chunk's first position
+    uint q_stride;   // floats between the queries' (and outputs') rows
+};
+
+// Causal attention for a chunk: threadgroup g is query t = g / n_heads,
+// head h = g % n_heads, over positions [0, base + t]; as attn_fused,
+// up to kAttnMaxPos positions.
+kernel void attn_rows(device const float* q [[buffer(0)]],
+                      device const float* pool [[buffer(1)]],
+                      device const uint* blocks [[buffer(2)]],
+                      device float* out [[buffer(3)]],
+                      constant AttnRowsParams& pr [[buffer(4)]],
+                      uint g [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float s[kAttnMaxPos];
+    threadgroup float part[32];
+    threadgroup float red[kAttnGroup];
+    constant AttnParams& p = pr.a;
+    const uint t = g / p.n_heads, h = g % p.n_heads;
+    const uint n_pos = pr.base + t + 1;
+    const uint kvh = h / (p.n_heads / p.n_kv_heads);
+    device const float4* qh =
+        (device const float4*)(q + ulong(t) * pr.q_stride + h * p.head_dim);
+    float m = -INFINITY;
+    for (uint j = tid; j < n_pos; j += kAttnGroup) {
+        device const float4* k = (device const float4*)(
+            pool + kv_row(p, blocks, j) + kvh * p.head_dim);
+        float d = 0.0f;
+        for (uint i = 0; i < p.head_dim / 4; ++i) {
+            d += dot(qh[i], k[i]);
+        }
+        d *= p.kq_scale;
+        s[j] = d;
+        m = max(m, d);
+    }
+    m = group_max(m, part, tid, kAttnGroup);
+    float sum = 0.0f;
+    for (uint j = tid; j < n_pos; j += kAttnGroup) {
+        const float e = exp(s[j] - m);
+        s[j] = e;
+        sum += e;
+    }
+    sum = group_sum(sum, part, tid, kAttnGroup);
+    const float inv = 1.0f / sum;
+    const uint per = kAttnGroup / p.head_dim;
+    const uint d = tid % p.head_dim, slice = tid / p.head_dim;
+    float acc = 0.0f;
+    if (slice < per) {
+        for (uint j = slice; j < n_pos; j += per) {
+            acc += s[j] * pool[kv_row(p, blocks, j) + p.v_off +
+                               kvh * p.head_dim + d];
+        }
+    }
+    red[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (slice == 0) {
+        float v = 0.0f;
+        for (uint j = 0; j < per; ++j) {
+            v += red[j * p.head_dim + d];
+        }
+        out[ulong(t) * pr.q_stride + h * p.head_dim + d] = v * inv;
+    }
+}

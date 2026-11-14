@@ -155,6 +155,40 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                  groups * k.group, k.group);
 }
 
+namespace {
+
+/** MmParams in kernels.metal. */
+struct MmParams {
+    std::uint64_t w_off, x_off, out_off;
+    std::uint32_t rows, cols, n_tok, x_stride, out_stride, accumulate;
+    float scale;
+    std::uint32_t row_tiles;
+};
+
+}  // namespace
+
+bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                   std::uint32_t cols, std::uint32_t n_tok,
+                   const Context::Buffer& w, std::uint64_t w_off,
+                   const Context::Buffer& x, std::uint64_t x_off,
+                   std::uint32_t x_stride, const Context::Buffer& out,
+                   std::uint64_t out_off, std::uint32_t out_stride,
+                   bool accumulate) {
+    if (t != gguf::TensorType::kQ4_K || cols % 256 != 0 || n_tok == 0) {
+        return false;
+    }
+    const std::uint32_t row_tiles = (rows + 63) / 64;
+    const std::uint32_t tok_tiles = (n_tok + 31) / 32;
+    const MmParams p{w_off,    x_off,      out_off,
+                     rows,     cols,       n_tok,
+                     x_stride, out_stride, accumulate ? 1u : 0u,
+                     1.0f,     row_tiles};
+    const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
+    ctx.dispatch("mm_q4_k", args, std::as_bytes(std::span(&p, 1)),
+                 row_tiles * tok_tiles * 128, 128);
+    return true;
+}
+
 std::size_t matvec_weight_bytes(gguf::TensorType t, std::uint32_t rows,
                                 std::uint32_t cols) {
     const Kind k = kind_of(t);
