@@ -1759,8 +1759,24 @@ TEST_CASE("serve_stage_mux applies --allow to the metrics port",
     });
 
     REQUIRE(http_get(pm, "/metrics").rfind("HTTP/1.1 200", 0) == 0);
-    const int v6 = locus::pipeline::connect_to("::1", pm);
-    if (v6 >= 0) {  // a host without IPv6 loopback skips this half
+    // i#851: where the kernel takes the filter (Linux, when the host
+    // allows it on TCP), the refused peer's SYN is dropped and the
+    // connect never completes; else the stage accepts and closes it.
+    bool filtered = false;
+#if defined(__linux__)
+    {
+        int probe_port = 0;
+        const int probe = locus::pipeline::listen_on("127.0.0.1", 0,
+                                                     &probe_port);
+        REQUIRE(probe >= 0);
+        filtered = locus::pipeline::attach_allow_filter(probe, allow);
+        ::close(probe);
+    }
+#endif
+    if (filtered) {
+        CHECK(locus::pipeline::connect_to("::1", pm, 500) < 0);
+    } else if (const int v6 = locus::pipeline::connect_to("::1", pm);
+               v6 >= 0) {
         const std::string req =
             "GET /metrics HTTP/1.1\r\nHost: stage\r\n"
             "Connection: close\r\n\r\n";
@@ -1768,7 +1784,7 @@ TEST_CASE("serve_stage_mux applies --allow to the metrics port",
         char buf[256];
         REQUIRE(::recv(v6, buf, sizeof(buf), 0) <= 0);  // closed, no page
         ::close(v6);
-    } else {
+    } else {  // a host without IPv6 loopback skips this half
         WARN("no IPv6 loopback: the refused half did not run");
     }
 
