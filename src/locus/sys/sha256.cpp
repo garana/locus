@@ -41,10 +41,12 @@ void compress(std::array<std::uint32_t, 8>& h, const unsigned char* p) {
     }
     auto v = h;
     for (int i = 0; i < 64; ++i) {
-        const std::uint32_t s1 = rotr(v[4], 6) ^ rotr(v[4], 11) ^ rotr(v[4], 25);
+        const std::uint32_t s1 =
+            rotr(v[4], 6) ^ rotr(v[4], 11) ^ rotr(v[4], 25);
         const std::uint32_t ch = (v[4] & v[5]) ^ (~v[4] & v[6]);
         const std::uint32_t t1 = v[7] + s1 + ch + kK[i] + w[i];
-        const std::uint32_t s0 = rotr(v[0], 2) ^ rotr(v[0], 13) ^ rotr(v[0], 22);
+        const std::uint32_t s0 =
+            rotr(v[0], 2) ^ rotr(v[0], 13) ^ rotr(v[0], 22);
         const std::uint32_t maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
         v = {t1 + s0 + maj, v[0], v[1], v[2], v[3] + t1, v[4], v[5], v[6]};
     }
