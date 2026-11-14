@@ -16,6 +16,8 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/metal/context.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/embed/embedding_model.hpp"
@@ -706,4 +708,59 @@ TEST_CASE("bench: http metrics per request", "[.][bench]") {
     WARN("http metrics: " << ns << " ns per request (route + record)");
     REQUIRE(m.at(m.route("/v1/images/generations")).seconds.snapshot()
                 .count == static_cast<std::uint64_t>(kN));
+}
+
+// The Orpheus 3B Q4_K_M decode matvecs on the Metal backend's kernels
+// (i#866), one shape at a time, repeated in one batch, with their
+// effective bandwidth: the numbers to set against the Vulkan bench's
+// (i#784) on the same machine. Random weights.
+TEST_CASE("bench: metal decode matvecs at the orpheus shapes",
+          "[.][bench][metal]") {
+    namespace mb = locus::backend::metal;
+    if (!mb::Context::usable()) {
+        SKIP("no Metal device");
+    }
+    using TT = locus::gguf::TensorType;
+    struct Shape {
+        const char* name;
+        TT type;
+        std::uint32_t rows, cols;
+        std::size_t block_bytes, d_off;
+        int dmin_off;
+    };
+    const Shape shapes[] = {
+        {"q4_k attn_q/o   ", TT::kQ4_K, 3072, 3072, 144, 0, 2},
+        {"q4_k attn_k/v   ", TT::kQ4_K, 1024, 3072, 144, 0, 2},
+        {"q4_k ffn_gate/up", TT::kQ4_K, 8192, 3072, 144, 0, 2},
+        {"q4_k ffn_down   ", TT::kQ4_K, 3072, 8192, 144, 0, 2},
+        {"q6_k attn_v     ", TT::kQ6_K, 1024, 3072, 210, 208, -1},
+        {"q6_k ffn_down   ", TT::kQ6_K, 3072, 8192, 210, 208, -1},
+        {"q6_k head speech", TT::kQ6_K, 28682, 3072, 210, 208, -1},
+        {"q6_k head full  ", TT::kQ6_K, 156940, 3072, 210, 208, -1},
+    };
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const Shape& sh : shapes) {
+        auto w = make_kquant(sh.rows, sh.cols, sh.block_bytes, sh.d_off,
+                             sh.dmin_off, 9);
+        const Mat m{sh.type, w.data(), sh.rows, sh.cols};
+        std::vector<float> x(sh.cols), out(sh.rows);
+        for (auto& v : x) {
+            v = dist(rng);
+        }
+        // About 2 GB of weight reads a batch, at least 16 copies.
+        const auto reps = static_cast<std::uint32_t>(std::max<std::size_t>(
+            16, (std::size_t{2} << 30) / w.size()));
+        mb::matvec_repeat(m, x, out, reps);  // upload, warm
+        double best = 1e30;
+        for (int i = 0; i < 3; ++i) {
+            best = std::min(best, mb::matvec_repeat(m, x, out, reps));
+        }
+        WARN(sh.name << " " << sh.rows << " x " << sh.cols << ": "
+                     << best * 1e3 << " us, "
+                     << static_cast<double>(w.size()) / (best * 1e6)
+                     << " GB/s (" << reps << " copies)");
+    }
+    mb::drop_weights();
+    SUCCEED();
 }
