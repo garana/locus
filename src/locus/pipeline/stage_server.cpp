@@ -29,6 +29,7 @@
 #include "locus/server/metrics_text.hpp"
 #include "locus/sys/features.hpp"
 #include "locus/sys/poller.hpp"
+#include "locus/sys/sha256.hpp"
 
 namespace locus::pipeline {
 
@@ -243,6 +244,10 @@ struct MuxSession {
     // hs_buf, sends the answer (`hs_answered`) and reads the proof, all
     // within dial_deadline.
     std::string key;
+    // Appended to out_key for the idle pool: a downstream that passed the
+    // handshake under one key is reused only by sessions with that key
+    // (a reload may change it). Empty without a key.
+    std::string pool_tag;
     std::optional<HandshakeServer> hs_in;
     bool in_authed = true;
     Clock::time_point hs_deadline = Clock::time_point::max();
@@ -688,7 +693,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 s.out_watched = false;
             }
             out_index.erase(s.out_fd);
-            std::vector<int>& bucket = pool_idle[s.out_key];
+            std::vector<int>& bucket = pool_idle[s.out_key + s.pool_tag];
             if (fr == 0 && static_cast<int>(bucket.size()) <
                                conn_live.downstream_idle_max) {
                 bucket.push_back(s.out_fd);  // clean + frame-aligned
@@ -851,7 +856,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             // reused-but-dead fd would never resolve and the loop would
             // spin: pooling breaks silently. Keep the phase dispatch.
             if (!ip.empty() && conn_live.downstream_idle_max > 0) {
-                auto pit = pool_idle.find(key);
+                auto pit = pool_idle.find(key + s.pool_tag);
                 if (pit != pool_idle.end()) {
                     while (!pit->second.empty()) {
                         const int pfd = pit->second.back();
@@ -1492,7 +1497,17 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             // flags are hints and buffered bytes are processed first.
             for (;;) {
                 char buf[4096];
-                const ssize_t n = ::recv(s.in_fd, buf, sizeof(buf), 0);
+                // i#849: before the answer checks out, read no more than
+                // the answer (a peer without the key gets no buffer); a
+                // client sends nothing past it until it has the proof.
+                const std::size_t want =
+                    s.in_authed ? sizeof(buf)
+                                : std::min(sizeof(buf),
+                                           kAnswerBytes - s.inbuf.size());
+                if (want == 0) {
+                    break;  // the answer is in: check it first
+                }
+                const ssize_t n = ::recv(s.in_fd, buf, want, 0);
                 if (n > 0) {
                     stats.bytes_in += static_cast<std::uint64_t>(n);
                     s.inbuf.append(buf, static_cast<std::size_t>(n));
@@ -1596,7 +1611,20 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         // the fresh allowlist/pool/policy. Running sessions keep theirs.
         if (reload.flag != nullptr && *reload.flag != 0 && reload.apply) {
             *reload.flag = 0;
+            const std::string old_key = conn_live.key;
             reload.apply(allow_live, pool_live, conn_live);
+            if (conn_live.key != old_key) {
+                // The idle downstreams passed under the old key; new
+                // sessions would never take them (pool_tag), so close
+                // them now rather than hold them.
+                for (auto& [pkey, bucket] : pool_idle) {
+                    (void)pkey;
+                    for (const int pfd : bucket) {
+                        ::close(pfd);
+                    }
+                }
+                pool_idle.clear();
+            }
         }
 
         // Accept at most one new session per wakeup (level-triggered, so
@@ -1722,6 +1750,10 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             s->key = conn_live.key;
             bool greeted = true;
             if (!s->key.empty()) {
+                // A one-way tag of the key, never the key (a log may
+                // print the pool's names).
+                s->pool_tag =
+                    "|key:" + sys::to_hex(sys::sha256(s->key)).substr(0, 16);
                 s->hs_in.emplace(s->key);
                 s->in_authed = false;
                 s->hs_deadline = Clock::now() +
