@@ -222,6 +222,31 @@ TEST_CASE("spec.first_missing_required tracks what was seen",
 
 // ---- build_runtime: the shared startup/reload conversion ----
 
+// i#625 F8: a stage off loopback must name its peers, at startup and on
+// a reload alike (both go through build_runtime).
+TEST_CASE("build_runtime needs --allow off loopback", "[config]") {
+    StageOptions opt;
+    opt.layers = "0:2";
+    opt.downstream = {"a:1"};
+    locus_tools::StageRuntime rt;
+    for (const char* lo : {"127.0.0.1:8000", "127.1.2.3:8000",
+                           "[::1]:8000", "localhost:8000"}) {
+        INFO(lo);
+        opt.listen = lo;
+        REQUIRE(locus_tools::build_runtime(opt, rt).empty());
+    }
+    for (const char* open : {":8000", "0.0.0.0:8000", "[::]:8000",
+                             "192.168.1.7:8000"}) {
+        INFO(open);
+        opt.listen = open;
+        opt.allow.clear();
+        const std::string err = locus_tools::build_runtime(opt, rt);
+        REQUIRE(err.find("--allow") != std::string::npos);
+        opt.allow = {"10.0.0.0/8"};
+        REQUIRE(locus_tools::build_runtime(opt, rt).empty());
+    }
+}
+
 TEST_CASE("build_runtime validates and converts StageOptions",
           "[config]") {
     StageOptions opt;

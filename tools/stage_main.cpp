@@ -40,7 +40,7 @@ const char* kUsage =
     "filtered (blackholed) one listed before a live one costs up to\n"
     "--connect-timeout per session. --allow restricts which peer\n"
     "addresses may connect and is repeatable (e.g. --allow 10.0.0.0/8);\n"
-    "with no --allow, any peer may connect.\n"
+    "a --listen that is not loopback needs one.\n"
     "\n"
     "--config FILE reads a key=value file: every flag below has a key\n"
     "(the flag name without the dashes, e.g. connect-timeout). CLI flags\n"
