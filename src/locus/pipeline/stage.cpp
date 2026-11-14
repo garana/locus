@@ -190,7 +190,9 @@ bool PipelineStage::run(int in_fd, int out_fd) {
     bool ok = true;
     for (;;) {
         Message in;
-        const ReadResult r = read_message(in_fd, in);
+        // i#854: a frame longer than one activation is refused from its
+        // length prefix, before its payload is allocated.
+        const ReadResult r = read_message(in_fd, in, n_embd_);
         if (r == ReadResult::kEof) {
             break;  // clean shutdown
         }
