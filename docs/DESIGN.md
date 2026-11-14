@@ -546,13 +546,12 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   in one dispatch, and Q8_0 q, k and v in another). In batch-invariant
   mode a lone sequence takes the multi-sequence kernels too, so a
   request's logits are bit-identical alone and batched. It is the
-  default on Apple GPUs, where a lone sequence costs little; elsewhere
-  a lone sequence keeps the single-sequence forward (on V3D the mode
-  costs a lone Q8_0 sequence 3% with the NT 1 build below, but stays
-  off by default until i#682 is understood). Under the default a lone
-  sequence on a Q4_K or Q6_K model keeps it too (the K-quant
-  short-batch kernels cost it 9 to 11% on an M2 Pro), so such a model
-  is batch-invariant only with the mode set.
+  default on Apple GPUs and on V3D, where a lone sequence costs little
+  (on V3D 2.4% for a lone Q8_0 sequence with the NT 1 build below);
+  elsewhere a lone sequence keeps the single-sequence forward. Under
+  the default a lone sequence on a Q4_K or Q6_K model keeps it too
+  (the K-quant short-batch kernels cost it 9 to 11% on an M2 Pro), so
+  such a model is batch-invariant only with the mode set.
   `LOCUS_VK_BATCH_INVARIANT=1` / `0` (or `vulkan_set_batch_invariant`)
   overrides. Q8_0 batches of 1 or 2 take the NT 2 build of the
   short-batch kernel (on V3D a lone sequence the NT 1 build, with
