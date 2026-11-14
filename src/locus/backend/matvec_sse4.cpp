@@ -1187,8 +1187,11 @@ float row_k_q8k_sse4_t(const std::byte* row, const Q8kAct& a,
 
 #if defined(LOCUS_SSE4_AVX_VARIANT)
 // i#801, LOCUS_CPU_FAST only: one-token Q4_K and Q6_K rows in llama.cpp's
-// float order (its x86 __AVX__ ggml_vec_dot_q4_K_q8_K and _q6_K_q8_K at
-// e8e6c7a, ported line for line), against qs in their plain order. The
+// float order, against qs in their plain order. Ported from ggml
+// (ggml/src/ggml-cpu/arch/x86/quants.c at llama.cpp e8e6c7a: the __AVX__
+// ggml_vec_dot_q4_K_q8_K and ggml_vec_dot_q6_K_q8_K, and the helpers
+// below), MIT License, Copyright (c) 2023-2026 The ggml authors: see
+// third_party/ggml/LICENSE. The
 // int sums keep maddubs's lane pairing, one float multiply-add per block
 // per lane, the Q4_K min term in its own four lanes, then a horizontal
 // sum: not the scalar kernel's order, so behind the flag.
