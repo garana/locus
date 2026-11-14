@@ -953,6 +953,51 @@ TEST_CASE("sse4_avx kernels give the sse4 bits", "[ops][batch][sse4]") {
               rows, 70},
           5);
 }
+
+// i#801: under LOCUS_CPU_FAST the sse4_avx Q4_K / Q6_K one-token rows
+// take llama.cpp's __AVX__ float order. Not the scalar bits, but within
+// a float reordering's error of scalar matvec_q8k; other types are left
+// to the default path.
+TEST_CASE("llama-order Q4_K and Q6_K rows track the scalar dots",
+          "[ops][sse4][fast]") {
+    if (!locus::sys::detect().avx) {
+        SKIP("CPU lacks AVX");
+    }
+    constexpr std::uint32_t rows = 5;
+    std::mt19937 rng(801);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    for (TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+        for (std::uint32_t nblk : {1u, 3u, 8u}) {
+            std::vector<std::byte> w;
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                auto row = k_quant_row(t, nblk, 800u + r);
+                w.insert(w.end(), row.begin(), row.end());
+            }
+            const Mat m{t, w.data(), rows, nblk * 256};
+            std::vector<float> x(m.cols);
+            for (auto& v : x) {
+                v = xd(rng);
+            }
+            std::vector<float> ref(rows), got(rows), again(rows);
+            matvec_q8k(m, x, ref);
+            REQUIRE(sse4_avx::matvec_q8k_llama_avx(m, x, got));
+            REQUIRE(sse4_avx::matvec_q8k_llama_avx(m, x, again));
+            REQUIRE(got == again);  // the same steps every call
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                INFO("type " << static_cast<int>(t) << " blocks " << nblk
+                             << " row " << r);
+                CHECK(std::fabs(got[r] - ref[r]) <=
+                      1e-5f * (1.0f + std::fabs(ref[r])));
+            }
+        }
+    }
+    // Other types go to the default path.
+    auto row = k_quant_row(TensorType::kQ5_K, 1, 1);
+    const Mat q5{TensorType::kQ5_K, row.data(), 1, 256};
+    std::vector<float> x(256, 0.5f), out(1, -7.0f);
+    REQUIRE_FALSE(sse4_avx::matvec_q8k_llama_avx(q5, x, out));
+    REQUIRE(out[0] == -7.0f);
+}
 #endif
 
 TEST_CASE("matvec_batch_sse4_q8k matches the per-token and scalar q8k "

@@ -14,6 +14,7 @@
 #include "iq_grids.h"
 
 namespace locus::backend {
+bool cpu_fast();  // cpu_ops.cpp: LOCUS_CPU_FAST is set
 // matvec_sse4_avx.cpp compiles this file again with AVX enabled, into
 // sse4_avx:: (variants.hpp).
 #if defined(LOCUS_SSE4_AVX_VARIANT)
@@ -1184,6 +1185,241 @@ float row_k_q8k_sse4_t(const std::byte* row, const Q8kAct& a,
     return sumf;
 }
 
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+// i#801, LOCUS_CPU_FAST only: one-token Q4_K and Q6_K rows in llama.cpp's
+// float order (its x86 __AVX__ ggml_vec_dot_q4_K_q8_K and _q6_K_q8_K at
+// e8e6c7a, ported line for line), against qs in their plain order. The
+// int sums keep maddubs's lane pairing, one float multiply-add per block
+// per lane, the Q4_K min term in its own four lanes, then a horizontal
+// sum: not the scalar kernel's order, so behind the flag.
+
+/** llama.cpp's hsum_float_8. */
+float hsum8_llama(__m256 x) {
+    __m128 res = _mm256_extractf128_ps(x, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(x));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+    return _mm_cvtss_f32(res);
+}
+
+/** llama.cpp's MM256_SET_M128I(a, b): b in the low half, a in the high. */
+__m256i set_m128i_llama(__m128i a, __m128i b) {
+    return _mm256_insertf128_si256(_mm256_castsi128_si256(b), a, 1);
+}
+
+float row_q4_k_q8k_fast(const std::byte* row, const Q8kAct& a,
+                        std::size_t nb) {
+    const __m128i m4 = _mm_set1_epi8(0xF);
+    const __m128i m2 = _mm_set1_epi8(0x2);
+    __m256 acc = _mm256_setzero_ps();
+    __m128 acc_m = _mm_setzero_ps();
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 144;
+        const float d = a.d[i] * f16_to_f32(load_u16(blk));
+        const float dmin = -a.d[i] * f16_to_f32(load_u16(blk + 2));
+        const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 16);
+        const std::int8_t* q8 = a.qs + i * 256;
+        std::uint32_t utmp[4];
+        unpack_k_scales(blk, utmp);
+        const __m128i utmps = _mm_set_epi32(
+            static_cast<int>(utmp[3]), static_cast<int>(utmp[2]),
+            static_cast<int>(utmp[1]), static_cast<int>(utmp[0]));
+        const __m128i scales = _mm_cvtepu8_epi16(utmps);
+        const __m128i mins =
+            _mm_cvtepu8_epi16(_mm_unpackhi_epi64(utmps, utmps));
+        const std::int16_t* bsums = a.bsums + i * 16;
+        const __m128i q8sums_0 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(bsums));
+        const __m128i q8sums_1 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(bsums + 8));
+        const __m128i q8s = _mm_hadd_epi16(q8sums_0, q8sums_1);
+        const __m128i prod = _mm_madd_epi16(mins, q8s);
+        acc_m = _mm_add_ps(
+            _mm_mul_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod)), acc_m);
+        __m128i sumi_0 = _mm_setzero_si128();
+        __m128i sumi_1 = _mm_setzero_si128();
+        __m128i shuffle = _mm_set1_epi16(0x0100);
+        for (int j = 0; j < 4; ++j) {
+            const __m128i scale_l = _mm_shuffle_epi8(scales, shuffle);
+            shuffle = _mm_add_epi16(shuffle, m2);
+            const __m128i scale_h = _mm_shuffle_epi8(scales, shuffle);
+            shuffle = _mm_add_epi16(shuffle, m2);
+            __m128i q4bits =
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4));
+            q4 += 16;
+            const __m128i q4l_0 = _mm_and_si128(q4bits, m4);
+            const __m128i q4h_0 = _mm_and_si128(_mm_srli_epi16(q4bits, 4), m4);
+            q4bits = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q4));
+            q4 += 16;
+            const __m128i q4l_1 = _mm_and_si128(q4bits, m4);
+            const __m128i q4h_1 = _mm_and_si128(_mm_srli_epi16(q4bits, 4), m4);
+            const auto ld = [&q8] {
+                const __m128i v =
+                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8));
+                q8 += 16;
+                return v;
+            };
+            const __m128i q8l_0 = ld();
+            __m128i p16l = _mm_maddubs_epi16(q4l_0, q8l_0);
+            p16l = _mm_madd_epi16(scale_l, p16l);
+            sumi_0 = _mm_add_epi32(sumi_0, p16l);
+            const __m128i q8l_1 = ld();
+            p16l = _mm_maddubs_epi16(q4l_1, q8l_1);
+            p16l = _mm_madd_epi16(scale_l, p16l);
+            sumi_1 = _mm_add_epi32(sumi_1, p16l);
+            const __m128i q8h_0 = ld();
+            __m128i p16h = _mm_maddubs_epi16(q4h_0, q8h_0);
+            p16h = _mm_madd_epi16(scale_h, p16h);
+            sumi_0 = _mm_add_epi32(sumi_0, p16h);
+            const __m128i q8h_1 = ld();
+            p16h = _mm_maddubs_epi16(q4h_1, q8h_1);
+            p16h = _mm_madd_epi16(scale_h, p16h);
+            sumi_1 = _mm_add_epi32(sumi_1, p16h);
+        }
+        const __m256 vd = _mm256_set1_ps(d);
+        const __m256i sumi = set_m128i_llama(sumi_1, sumi_0);
+        acc = _mm256_add_ps(_mm256_mul_ps(vd, _mm256_cvtepi32_ps(sumi)), acc);
+    }
+    acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+    acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+    return hsum8_llama(acc) + _mm_cvtss_f32(acc_m);
+}
+
+/** llama.cpp's get_scale_shuffle(i). */
+__m128i scale_shuffle_llama(int i) {
+    alignas(16) static const std::uint8_t k[128] = {
+        0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,  1,  1,  1,  1,
+        2,  2,  2,  2,  2,  2,  2,  2,  3,  3,  3,  3,  3,  3,  3,  3,
+        4,  4,  4,  4,  4,  4,  4,  4,  5,  5,  5,  5,  5,  5,  5,  5,
+        6,  6,  6,  6,  6,  6,  6,  6,  7,  7,  7,  7,  7,  7,  7,  7,
+        8,  8,  8,  8,  8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9,  9,
+        10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+        12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
+        14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15};
+    return _mm_load_si128(reinterpret_cast<const __m128i*>(k) + i);
+}
+
+float row_q6_k_q8k_fast(const std::byte* row, const Q8kAct& a,
+                        std::size_t nb) {
+    const __m128i m3 = _mm_set1_epi8(3);
+    const __m128i m15 = _mm_set1_epi8(15);
+    __m256 acc = _mm256_setzero_ps();
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::byte* blk = row + i * 210;
+        const float d = a.d[i] * f16_to_f32(load_u16(blk + 208));
+        const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk);
+        const auto* qh = reinterpret_cast<const std::uint8_t*>(blk + 128);
+        const std::int8_t* q8 = a.qs + i * 256;
+        const std::int16_t* bsums = a.bsums + i * 16;
+        // The q6_k -32 offset through the bsums, as llama.cpp does.
+        const __m128i q8sums_0 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(bsums));
+        const __m128i q8sums_1 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(bsums) + 1);
+        const __m128i scales =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 192));
+        const __m128i scales_16_0 = _mm_cvtepi8_epi16(scales);
+        const __m128i scales_16_1 =
+            _mm_cvtepi8_epi16(_mm_bsrli_si128(scales, 8));
+        const __m128i q8sclsub_0 =
+            _mm_slli_epi32(_mm_madd_epi16(q8sums_0, scales_16_0), 5);
+        const __m128i q8sclsub_1 =
+            _mm_slli_epi32(_mm_madd_epi16(q8sums_1, scales_16_1), 5);
+        __m128i sumi_0 = _mm_setzero_si128();
+        __m128i sumi_1 = _mm_setzero_si128();
+        int is = 0;
+        const auto ld = [](const std::uint8_t*& p) {
+            const __m128i v =
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+            p += 16;
+            return v;
+        };
+        for (int j = 0; j < 2; ++j) {
+            const __m128i q4bitsH_0 = ld(qh);
+            const __m128i q4bitsH_1 = ld(qh);
+            const __m128i q4h_0 =
+                _mm_slli_epi16(_mm_and_si128(q4bitsH_0, m3), 4);
+            const __m128i q4h_1 =
+                _mm_slli_epi16(_mm_and_si128(q4bitsH_1, m3), 4);
+            const __m128i q4h_2 = _mm_slli_epi16(
+                _mm_and_si128(q4bitsH_0, _mm_set1_epi8(12)), 2);
+            const __m128i q4h_3 = _mm_slli_epi16(
+                _mm_and_si128(q4bitsH_1, _mm_set1_epi8(12)), 2);
+            const __m128i q4h_4 = _mm_and_si128(q4bitsH_0, _mm_set1_epi8(48));
+            const __m128i q4h_5 = _mm_and_si128(q4bitsH_1, _mm_set1_epi8(48));
+            const __m128i q4h_6 = _mm_srli_epi16(
+                _mm_and_si128(q4bitsH_0, _mm_set1_epi8(-64)), 2);
+            const __m128i q4h_7 = _mm_srli_epi16(
+                _mm_and_si128(q4bitsH_1, _mm_set1_epi8(-64)), 2);
+            const __m128i q4bits1_0 = ld(q4);
+            const __m128i q4bits1_1 = ld(q4);
+            const __m128i q4bits2_0 = ld(q4);
+            const __m128i q4bits2_1 = ld(q4);
+            const __m128i q4_0 =
+                _mm_or_si128(_mm_and_si128(q4bits1_0, m15), q4h_0);
+            const __m128i q4_1 =
+                _mm_or_si128(_mm_and_si128(q4bits1_1, m15), q4h_1);
+            const __m128i q4_2 =
+                _mm_or_si128(_mm_and_si128(q4bits2_0, m15), q4h_2);
+            const __m128i q4_3 =
+                _mm_or_si128(_mm_and_si128(q4bits2_1, m15), q4h_3);
+            const __m128i q4_4 = _mm_or_si128(
+                _mm_and_si128(_mm_srli_epi16(q4bits1_0, 4), m15), q4h_4);
+            const __m128i q4_5 = _mm_or_si128(
+                _mm_and_si128(_mm_srli_epi16(q4bits1_1, 4), m15), q4h_5);
+            const __m128i q4_6 = _mm_or_si128(
+                _mm_and_si128(_mm_srli_epi16(q4bits2_0, 4), m15), q4h_6);
+            const __m128i q4_7 = _mm_or_si128(
+                _mm_and_si128(_mm_srli_epi16(q4bits2_1, 4), m15), q4h_7);
+            __m128i q8v[8];
+            for (int k = 0; k < 8; ++k) {
+                q8v[k] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q8));
+                q8 += 16;
+            }
+            __m128i p16_0 = _mm_maddubs_epi16(q4_0, q8v[0]);
+            __m128i p16_1 = _mm_maddubs_epi16(q4_1, q8v[1]);
+            __m128i p16_2 = _mm_maddubs_epi16(q4_2, q8v[2]);
+            __m128i p16_3 = _mm_maddubs_epi16(q4_3, q8v[3]);
+            __m128i p16_4 = _mm_maddubs_epi16(q4_4, q8v[4]);
+            __m128i p16_5 = _mm_maddubs_epi16(q4_5, q8v[5]);
+            __m128i p16_6 = _mm_maddubs_epi16(q4_6, q8v[6]);
+            __m128i p16_7 = _mm_maddubs_epi16(q4_7, q8v[7]);
+            const __m128i scale_0 =
+                _mm_shuffle_epi8(scales, scale_shuffle_llama(is + 0));
+            const __m128i scale_1 =
+                _mm_shuffle_epi8(scales, scale_shuffle_llama(is + 1));
+            const __m128i scale_2 =
+                _mm_shuffle_epi8(scales, scale_shuffle_llama(is + 2));
+            const __m128i scale_3 =
+                _mm_shuffle_epi8(scales, scale_shuffle_llama(is + 3));
+            is += 4;
+            p16_0 = _mm_madd_epi16(_mm_cvtepi8_epi16(scale_0), p16_0);
+            p16_1 = _mm_madd_epi16(
+                _mm_cvtepi8_epi16(_mm_bsrli_si128(scale_0, 8)), p16_1);
+            p16_2 = _mm_madd_epi16(_mm_cvtepi8_epi16(scale_1), p16_2);
+            p16_3 = _mm_madd_epi16(
+                _mm_cvtepi8_epi16(_mm_bsrli_si128(scale_1, 8)), p16_3);
+            p16_4 = _mm_madd_epi16(_mm_cvtepi8_epi16(scale_2), p16_4);
+            p16_5 = _mm_madd_epi16(
+                _mm_cvtepi8_epi16(_mm_bsrli_si128(scale_2, 8)), p16_5);
+            p16_6 = _mm_madd_epi16(_mm_cvtepi8_epi16(scale_3), p16_6);
+            p16_7 = _mm_madd_epi16(
+                _mm_cvtepi8_epi16(_mm_bsrli_si128(scale_3, 8)), p16_7);
+            sumi_0 = _mm_add_epi32(sumi_0, _mm_add_epi32(p16_0, p16_2));
+            sumi_1 = _mm_add_epi32(sumi_1, _mm_add_epi32(p16_1, p16_3));
+            sumi_0 = _mm_add_epi32(sumi_0, _mm_add_epi32(p16_4, p16_6));
+            sumi_1 = _mm_add_epi32(sumi_1, _mm_add_epi32(p16_5, p16_7));
+        }
+        sumi_0 = _mm_sub_epi32(sumi_0, q8sclsub_0);
+        sumi_1 = _mm_sub_epi32(sumi_1, q8sclsub_1);
+        const __m256i sumi = set_m128i_llama(sumi_1, sumi_0);
+        acc = _mm256_add_ps(
+            _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi)), acc);
+    }
+    return hsum8_llama(acc);
+}
+#endif  // LOCUS_SSE4_AVX_VARIANT
+
 float row_k_q8k_sse4(gguf::TensorType type, const std::byte* row,
                      const Q8kAct& a, std::size_t nb) {
     using T = gguf::TensorType;
@@ -1914,6 +2150,30 @@ void quantize_q8k_sse4(std::span<const float> x, bool shuffle, float* d,
 
 }  // namespace
 
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+bool matvec_q8k_llama_avx(const Mat& w, std::span<const float> x,
+                          std::span<float> out) {
+    const bool q4 = w.type == gguf::TensorType::kQ4_K;
+    if ((!q4 && w.type != gguf::TensorType::kQ6_K) || x.size() % 256 != 0) {
+        return false;
+    }
+    const std::size_t nb = x.size() / 256;
+    std::vector<float> hd(nb);
+    std::vector<std::int8_t> hqs(x.size());
+    std::vector<std::int16_t> hbs(nb * 16);
+    // qs in the plain order, as llama.cpp's block_q8_K holds them.
+    quantize_q8k_sse4(x, false, hd.data(), hqs.data(), hbs.data());
+    const Q8kAct a{hd.data(), hqs.data(), hbs.data()};
+    const std::size_t rb = mat_row_bytes(w);
+    for (std::uint32_t r = 0; r < w.rows; ++r) {
+        const std::byte* row = w.data + r * rb;
+        out[r] = q4 ? row_q4_k_q8k_fast(row, a, nb)
+                    : row_q6_k_q8k_fast(row, a, nb);
+    }
+    return true;
+}
+#endif
+
 void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
                      std::span<float> out) {
     const std::size_t cols = x.size();
@@ -1942,6 +2202,13 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
     std::vector<float> hd(nb);
     std::vector<std::int8_t> hqs(cols);
     std::vector<std::int16_t> hbs(nb * 16);
+#if defined(LOCUS_SSE4_AVX_VARIANT)
+    // i#801: LOCUS_CPU_FAST takes llama.cpp's Q4_K / Q6_K rows (another
+    // float order).
+    if (cpu_fast() && self::matvec_q8k_llama_avx(w, x, out)) {
+        return;
+    }
+#endif
     const bool q3k = w.type == gguf::TensorType::kQ3_K;
     // Q2_K, Q3_K and the IQ2 types read the plain order; Q4_K..Q6_K the
     // lane_pairs_mask one.
