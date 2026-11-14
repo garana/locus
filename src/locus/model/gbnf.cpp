@@ -745,28 +745,43 @@ bool GbnfMatcher::step(std::uint8_t b, GbnfMatcher& out) const {
     // The visit budget is split fairly (i#844): each matching stack may
     // spend an equal share of what is left, and what one leaves goes to
     // the next, so one stack with a costly expansion cannot starve the
-    // ones after it. A full output ends the step.
-    std::size_t m = 0;
+    // ones after it. The stacks cut by their share then run again, on
+    // the pool the others left (their partial output dedups away), so
+    // the split loses no expansion the whole budget allows. A full
+    // output ends the step.
+    pending_.clear();
     for (std::size_t i = 0; i < stacks_.size(); ++i) {
         const std::uint32_t s = stacks_.begin(i), e = stacks_.ends[i];
-        if (s != e && g_->matches(stacks_.data[e - 1], cp)) ++m;
+        if (s != e && g_->matches(stacks_.data[e - 1], cp)) {
+            pending_.push_back(static_cast<std::uint32_t>(i));
+        }
     }
     std::size_t pool = kMaxExpandVisits;
-    bool cut = false;
-    for (std::size_t i = 0, j = 0; i < stacks_.size(); ++i) {
-        const std::uint32_t s = stacks_.begin(i), e = stacks_.ends[i];
-        if (s == e || !g_->matches(stacks_.data[e - 1], cp)) continue;
-        cur_.assign(stacks_.data.begin() + s, stacks_.data.begin() + e - 1);
-        const std::uint32_t p = stacks_.data[e - 1] + 1;
-        if (el[p].kind != Gbnf::Elem::kEnd) cur_.push_back(p);
-        const std::size_t share = pool / (m - j++);
-        std::size_t left = share;
-        const Expand r = expand(cur_, out.stacks_, left);
-        pool -= share - left;
-        if (r == Expand::kDone) continue;
-        cut = true;
-        if (r == Expand::kFull) break;
+    bool full = false;
+    for (int pass = 0; pass < 2 && !full && !pending_.empty() && pool > 0;
+         ++pass) {
+        const std::size_t n = pending_.size();
+        std::size_t kept = 0;  // the stacks cut, for the next pass
+        for (std::size_t j = 0; j < n; ++j) {
+            const std::uint32_t i = pending_[j];
+            const std::uint32_t s = stacks_.begin(i), e = stacks_.ends[i];
+            cur_.assign(stacks_.data.begin() + s,
+                        stacks_.data.begin() + e - 1);
+            const std::uint32_t p = stacks_.data[e - 1] + 1;
+            if (el[p].kind != Gbnf::Elem::kEnd) cur_.push_back(p);
+            const std::size_t share = pool / (n - j);
+            std::size_t left = share;
+            const Expand r = expand(cur_, out.stacks_, left);
+            pool -= share - left;
+            if (r == Expand::kBudget) pending_[kept++] = i;
+            if (r == Expand::kFull) {
+                full = true;
+                break;
+            }
+        }
+        pending_.resize(kept);
     }
+    const bool cut = full || !pending_.empty();
     if (out.stacks_.size() == 0) return false;
     out.truncated_ = dedup(out.stacks_) || truncated_ || cut;
     out.cp_ = 0;

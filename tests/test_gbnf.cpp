@@ -243,6 +243,33 @@ TEST_CASE("gbnf step shares the visit budget across stacks", "[gbnf]") {
     }
 }
 
+TEST_CASE("gbnf step's fair split loses no expansion the budget allows",
+          "[gbnf]") {
+    // After "x", 64 stacks match: h's expansion needs more than its
+    // first share (1/64 of the budget) but far less than the budget, so
+    // the second pass completes it, in either alternative order.
+    std::string h = "h ::=";
+    for (int i = 0; i < 12; ++i) h += " c";
+    h += " \"z\"\nc ::= \"a\"? | \"b\"?\n";
+    std::string light;
+    for (int i = 0; i < 63; ++i) {
+        light += " | \"x\" \"y" + std::to_string(i) + "\"";
+    }
+    for (const bool heavy_first : {true, false}) {
+        CAPTURE(heavy_first);
+        const std::string root =
+            heavy_first ? "root ::= \"x\" h" + light + "\n"
+                        : "root ::= " + light.substr(3) + " | \"x\" h\n";
+        GbnfMatcher m(Gbnf::parse(root + h));
+        REQUIRE(m.feed('x'));
+        CHECK_FALSE(m.truncated());
+        GbnfMatcher a = m;
+        for (int i = 0; i < 12; ++i) REQUIRE(a.feed('a'));
+        REQUIRE(a.feed('z'));
+        CHECK(a.accepted());
+    }
+}
+
 TEST_CASE("json schema grammars stay under the stack cap", "[gbnf]") {
     const std::string s = R"({
       "type": "object",

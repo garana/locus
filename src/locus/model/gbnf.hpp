@@ -190,6 +190,8 @@ class GbnfMatcher {
     mutable std::vector<std::uint32_t> cur_;
     mutable std::vector<std::uint32_t> order_;
     mutable Stacks tmp_;
+    // Scratch for step(): the stacks still to expand in this pass.
+    mutable std::vector<std::uint32_t> pending_;
     // Scratch for expand(): its worklist and the stack it works on.
     mutable Stacks work_;
     mutable std::vector<std::uint32_t> top_;
@@ -205,8 +207,9 @@ class GbnfMatcher {
  *     a state built or fed (GbnfMatcher's constructor or feed(), the
  *     path the output takes) was cut (more parse stacks than the cap,
  *     or an expansion past its visit budget or word cap) and dropped
- *     the rest, which can hide a continuation the grammar allows. Each path counts once; the states a token mask only
- *     tries (step()) do not count. The first is also logged to stderr.
+ *     the rest, which can hide a continuation the grammar allows.
+ *     Each path counts once; the states a token mask only tries
+ *     (step()) do not count. The first is also logged to stderr.
  */
 std::uint64_t gbnf_stack_overflows();
 
