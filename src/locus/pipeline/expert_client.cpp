@@ -47,7 +47,8 @@ bool ExpertClient::remote(std::uint32_t, std::uint32_t e) const {
 
 void ExpertClient::read_reply(Pending& p) {
     Message out;
-    if (read_message(p.fd, out) != ReadResult::kOk) {
+    // A reply holds n_embd floats: a longer frame is refused unread.
+    if (read_message(p.fd, out, n_embd_) != ReadResult::kOk) {
         throw std::runtime_error("ExpertClient: expert " +
                                  std::to_string(p.expert) +
                                  "'s host closed or timed out");
