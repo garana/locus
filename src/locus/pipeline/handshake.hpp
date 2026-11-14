@@ -17,8 +17,9 @@ namespace locus::pipeline {
  *   accepting side -> HMAC(key, "server" Nc Ns)           (32 bytes)
  *
  * Ns and Nc are 16 random bytes each. It authenticates the peer when
- * the connection opens; the frames after it are neither signed nor
- * encrypted.
+ * the connection opens, against an attacker who is not on the network
+ * path: the frames after it are neither signed nor encrypted, so one on
+ * the path (who can also relay a key holder's answer) is not stopped.
  */
 
 /** Bytes of the accepting side's greeting. */
