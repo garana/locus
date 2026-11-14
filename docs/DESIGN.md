@@ -957,7 +957,11 @@ peer without the key is closed before any frame; a pooled downstream
 passed it when it was dialed. In the serve loop the handshake is one
 more per-session state with its own deadline, so a silent peer does
 not stall other sessions (#849). Frames are not signed: a peer on the
-network path is not stopped.
+network path is not stopped. A stage refuses an input frame longer than
+one activation (n_embd floats) from its length prefix, and the serve
+loop drops a session whose partial frame makes no progress for
+`--frame-timeout` (30 s); a connection idle between frames stays, as a
+pooled one must (#854).
 On Linux, every `--allow` (locus-stage and its metrics port,
 locus-experts, the driver's logits listen, and `http::Server`'s
 `allow`) is also a classic BPF socket filter on the listening socket:
