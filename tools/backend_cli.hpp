@@ -205,6 +205,11 @@ inline constexpr const char* kCommonHelp =
     "                   P is a binary or a script that starts with #!\n"
     "  --auth-helper-arg A locus-server: an argument for the helper\n"
     "                   (repeatable)\n"
+    "  --max-conns-per-ip N locus-server: open connections one client\n"
+    "                   address (not network: an IPv6 /64 has many) may\n"
+    "                   hold; past it a new one is closed\n"
+    "                   (default 0: no cap; a router in front reaches\n"
+    "                   the server from one address)\n"
     "  --sse-keepalive S locus-server: a stream silent for S seconds\n"
     "                   sends an SSE comment (default 15; 0 = off)\n"
     "  --audio-decoder P locus-server: enable /v1/audio/speech with\n"
@@ -393,6 +398,9 @@ struct BackendArgs {
     /** From --sse-keepalive S: seconds of silence before a stream
      *  sends an SSE comment (0 = off). */
     std::uint32_t sse_keepalive = 15;
+    /** From --max-conns-per-ip N: open connections one client address
+     *  may hold on locus-server (i#625 F21); 0 = no cap. */
+    std::uint32_t max_conns_per_ip = 0;
     /** From --audio-decoder P: path to the neural-codec decoder GGUF
      * (arch "snac") enabling locus-server's /v1/audio/speech; empty =
      * the endpoint is disabled (503). */
@@ -609,6 +617,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.auth_helper = {argv[++i]};
         } else if (a == "--auth-helper-arg" && i + 1 < argc) {
             out.auth_helper_args.emplace_back(argv[++i]);
+        } else if (a == "--max-conns-per-ip" && i + 1 < argc) {
+            number("--max-conns-per-ip", argv[++i], out.max_conns_per_ip);
         } else if (a == "--sse-keepalive" && i + 1 < argc) {
             number("--sse-keepalive", argv[++i], out.sse_keepalive);
         } else if (a.rfind("--sse-keepalive=", 0) == 0) {
