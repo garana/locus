@@ -4,6 +4,7 @@
 
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <utility>
@@ -257,6 +258,14 @@ bool write_message(int fd, const Message& m) {
 }
 
 ReadResult read_message(int fd, Message& out) {
+    return read_message(fd, out,
+                        (kMaxFrameBytes - kHeaderBytes) / sizeof(float));
+}
+
+ReadResult read_message(int fd, Message& out, std::uint32_t max_floats) {
+    const std::uint64_t cap = std::min<std::uint64_t>(
+        kMaxFrameBytes,
+        kHeaderBytes + std::uint64_t{max_floats} * sizeof(float));
     char lenb[4];
     const ssize_t g = read_some(fd, lenb, 4);
     if (g == 0) {
@@ -276,7 +285,7 @@ ReadResult read_message(int fd, Message& out) {
         return ReadResult::kError;  // truncated length prefix
     }
     const std::uint32_t frame_len = get_u32(lenb);
-    if (frame_len < kHeaderBytes || frame_len > kMaxFrameBytes) {
+    if (frame_len < kHeaderBytes || frame_len > cap) {
         return ReadResult::kError;
     }
     std::string payload(frame_len, '\0');
