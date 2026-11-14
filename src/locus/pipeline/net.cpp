@@ -156,6 +156,12 @@ bool Cidr::contains(const std::string& ip) const {
     return prefix_match(net.data(), b.data(), bits);
 }
 
+bool is_loopback_host(const std::string& host) {
+    if (host == "localhost" || host == "::1") return true;
+    static const auto v4 = Cidr::parse("127.0.0.0/8");
+    return v4 && v4->contains(host);
+}
+
 bool ip_allowed(const std::string& ip, const std::vector<Cidr>& allow) {
     if (allow.empty()) {
         return true;  // empty allowlist = allow all
