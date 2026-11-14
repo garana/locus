@@ -216,4 +216,9 @@ void Context::dispatch(std::string_view name, std::span<const Arg> args,
     }
 }
 
+std::mutex& device_mutex() {
+    static std::mutex mu;
+    return mu;
+}
+
 }  // namespace locus::backend::metal

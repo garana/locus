@@ -4,6 +4,7 @@
 #include <span>
 
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/metal/context.hpp"
 
 namespace locus::backend::metal {
 
@@ -41,5 +42,28 @@ double matvec_repeat(const Mat& w, std::span<const float> x,
 /** Frees every cached weight buffer (tests; the next matvec uploads
  *  again). */
 void drop_weights();
+
+/**
+ * Records out[out_off + r] (+)= dot(row r of the matrix, x[x_off ..])
+ * for r < rows into ctx's open batch (or runs it alone): the forward's
+ * building block. The caller holds device_mutex().
+ * @param t The weight type (matvec_supported).
+ * @param w The buffer holding the matrix's bytes from w_off on: a
+ *     multiple of 4 bytes (16 for F32).
+ * @param x_off Floats into x, a multiple of 4.
+ * @param out_off Floats into out.
+ * @throws std::invalid_argument for a type without a kernel, columns
+ *     that are not whole blocks, or a bad x_off.
+ */
+void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                   std::uint32_t cols, const Context::Buffer& w,
+                   std::uint64_t w_off, const Context::Buffer& x,
+                   std::uint32_t x_off, const Context::Buffer& out,
+                   std::uint64_t out_off, bool accumulate);
+
+/** @returns The bytes of a rows x cols matrix of type t (0 for a type
+ *  without a kernel). */
+std::size_t matvec_weight_bytes(gguf::TensorType t, std::uint32_t rows,
+                                std::uint32_t cols);
 
 }  // namespace locus::backend::metal

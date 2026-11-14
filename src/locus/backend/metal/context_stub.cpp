@@ -51,4 +51,9 @@ void Context::dispatch(std::string_view, std::span<const Arg>,
     throw std::runtime_error("metal: not built with Metal");
 }
 
+std::mutex& device_mutex() {
+    static std::mutex mu;
+    return mu;
+}
+
 }  // namespace locus::backend::metal

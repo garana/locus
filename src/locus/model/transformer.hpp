@@ -823,6 +823,34 @@ class TransformerModel {
                       std::span<const float* const> embd = {},
                       LogitRows rows_out = {}) const;
 
+    /**
+     * Metal forward of a plain llama model (i#866): one token at
+     * position pos of seq, every layer on the GPU in one command batch
+     * (rmsnorm, q / k / v with k and v written straight into the KV
+     * pool, RoPE, the attention over the pool, wo, the FFN and the
+     * residual adds), then the head rows of rows_out. The KV pool must
+     * be a Metal one (Ops.alloc_kv); the weights are uploaded once, on
+     * the first call, into buffers the model owns.
+     *
+     * @param embd nullptr to embed the token, or n_embd floats used
+     *     instead of its row.
+     * @returns false when it cannot run here (not Metal, not plain
+     *     llama, a weight type without a kernel, a pool that is not a
+     *     Metal one, or LOCUS_METAL_FORWARD=0); the caller then takes
+     *     the host path. seq is not advanced either way.
+     */
+    bool metal_forward(tok::TokenId token, const float* embd,
+                       kv::PagedKvCache::Seq& seq, std::uint32_t pos,
+                       kv::PagedKvCache& cache, Workspace& ws,
+                       std::span<float> logits, LogitRows rows_out) const;
+
+  public:
+    /** @returns How many tokens metal_forward has run in this process
+     *  (tests: whether the GPU path was taken). */
+    static std::uint64_t metal_forward_tokens();
+
+  private:
+
     /** Applies the model's norm (RMS or LayerNorm per hp_.norm_type)
      * to x scaled by w, into out; uses hp_.rms_eps. */
     /** Applies hp_.logit_scale and the final logit softcap in place
@@ -883,6 +911,9 @@ class TransformerModel {
     std::shared_ptr<StageMetrics> stage_metrics_;
     /** LOCUS_MOE_HYBRID state, set up on the first MoE layer. */
     std::shared_ptr<struct MoeHybrid> moe_hybrid_;
+    /** The Metal forward's weight buffers (i#866), uploaded on its
+     *  first call and freed with the model. */
+    mutable std::shared_ptr<struct MetalWeights> metal_weights_;
     /** The loaded range's tensor bytes (stage_weight_bytes): decides
      *  the hybrid and sizes its hot zone. */
     std::uint64_t weight_bytes_ = 0;

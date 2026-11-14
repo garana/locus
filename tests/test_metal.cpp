@@ -3,7 +3,11 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <string>
+#include <string_view>
 #include <random>
 #include <utility>
 #include <span>
@@ -15,6 +19,10 @@
 #include "locus/backend/metal/context.hpp"
 #include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/kv/paged_cache.hpp"
+#include "locus/model/transformer.hpp"
+#include "locus/tok/tokenizer.hpp"
 
 using locus::backend::metal::Context;
 
@@ -231,4 +239,82 @@ TEST_CASE("metal matvec matches the CPU for each weight type",
     CHECK_THROWS_AS(mb::matvec(bad, shortx, out), std::invalid_argument);
     CHECK_THROWS_AS(mb::matvec_repeat(bad, x, out, 0), std::invalid_argument);
     mb::drop_weights();
+}
+
+TEST_CASE("metal forward tracks the CPU on llama Q4_K_M and Q8_0",
+          "[metal][e2e]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    for (const char* name :
+         {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf"}) {
+        const std::string path =
+            std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
+        if (!std::filesystem::exists(path)) {
+            SKIP(path + " absent");
+        }
+        CAPTURE(name);
+        auto g = locus::gguf::GgufFile::open(path);
+        auto model = locus::model::TransformerModel::load(g);
+        // The CPU reference with f32 activations, as the GPU computes
+        // (its Q8_K default rounds them, which moves the logits ~2%).
+        model.use_q8k_activations(false);
+        const auto tok = locus::tok::tokenizer_from_gguf(g);
+        const std::uint32_t nv = model.hparams().n_vocab;
+        // The same tokens through the best CPU backend and Metal: the
+        // prompt, then the CPU's greedy continuation.
+        std::vector<locus::tok::TokenId> ids =
+            tok->encode("The capital of France is", true);
+        const auto run = [&](std::string_view be) {
+            model.use_backend(*locus::backend::find_backend(be));
+            auto cache = model.make_cache();
+            auto ws = model.make_workspace();
+            locus::kv::PagedKvCache::Seq seq;
+            std::vector<float> logits(nv);
+            std::vector<std::vector<float>> all;
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(ids[i], cache, seq, ws, logits);
+                all.push_back(logits);
+            }
+            cache.release(seq);
+            return all;
+        };
+        {
+            // Extend ids with 12 greedy CPU tokens.
+            model.use_backend(locus::backend::backends().front());
+            auto cache = model.make_cache();
+            auto ws = model.make_workspace();
+            locus::kv::PagedKvCache::Seq seq;
+            std::vector<float> logits(nv);
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(ids[i], cache, seq, ws, logits);
+            }
+            for (int i = 0; i < 12; ++i) {
+                ids.push_back(locus::model::argmax(logits));
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(ids.back(), cache, seq, ws, logits);
+            }
+            cache.release(seq);
+        }
+        const auto cpu = run(locus::backend::backends().front().name);
+        const std::uint64_t before =
+            locus::model::TransformerModel::metal_forward_tokens();
+        const auto gpu = run("metal");
+        // Every token took the GPU path.
+        CHECK(locus::model::TransformerModel::metal_forward_tokens() -
+                  before ==
+              ids.size());
+        for (std::size_t t = 0; t < ids.size(); ++t) {
+            CAPTURE(t);
+            CHECK(locus::model::argmax(gpu[t]) == locus::model::argmax(cpu[t]));
+            float worst = 0.0f, scale = 0.0f;
+            for (std::uint32_t r = 0; r < nv; ++r) {
+                worst = std::max(worst, std::abs(gpu[t][r] - cpu[t][r]));
+                scale = std::max(scale, std::abs(cpu[t][r]));
+            }
+            CHECK(worst <= 0.01f * scale);
+        }
+    }
 }
