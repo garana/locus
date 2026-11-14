@@ -16,11 +16,14 @@ namespace {
 
 using gguf::TensorType;
 
-/** A matvec kernel and its weight block: elements and bytes. */
+/** A matvec kernel, its weight block (elements and bytes) and its
+ *  threadgroup (threads and the rows it takes). */
 struct Kind {
     const char* kernel = nullptr;
     std::uint32_t block = 0;
     std::uint32_t bytes = 0;
+    std::uint32_t group = 128;  // 4 simdgroups
+    std::uint32_t rows = 8;
 };
 
 Kind kind_of(TensorType t) {
@@ -30,7 +33,7 @@ Kind kind_of(TensorType t) {
         case TensorType::kQ8_0:
             return {"mv_q8_0", 32, 34};
         case TensorType::kQ4_K:
-            return {"mv_q4_k", 256, 144};
+            return {"mv_q4_k", 256, 144, 64, 4};
         case TensorType::kQ6_K:
             return {"mv_q6_k", 256, 210};
         default:
@@ -45,8 +48,6 @@ struct MvParams {
     float scale;
 };
 
-constexpr std::uint32_t kGroup = 128;  // 4 simdgroups
-constexpr std::uint32_t kRowsPerGroup = 8;
 
 /** A cached weight: its buffer and the matrix it was made from. */
 struct Cached {
@@ -141,9 +142,9 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
     const MvParams p{w_off, out_off, rows, cols, accumulate ? 1u : 0u,
                      x_off, 1.0f};
     const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
-    const std::uint32_t groups = (rows + kRowsPerGroup - 1) / kRowsPerGroup;
+    const std::uint32_t groups = (rows + k.rows - 1) / k.rows;
     ctx.dispatch(k.kernel, args, std::as_bytes(std::span(&p, 1)),
-                 groups * kGroup, kGroup);
+                 groups * k.group, k.group);
 }
 
 std::size_t matvec_weight_bytes(gguf::TensorType t, std::uint32_t rows,
