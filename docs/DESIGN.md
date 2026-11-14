@@ -918,7 +918,8 @@ them as Prometheus text on GET `/metrics`, from the same loop through
 `http::LoopConnection`, with the session, token, byte and downstream
 dial counters (#22). Each stage serves its own page, so a scraper
 reads every stage directly; the driver does not gather them. The
-`--allow` list does not cover that port.
+`--allow` list covers that port too, since the page lists every peer's
+address.
 A connection kept open across sequences (SESSION_END) dials its next
 downstream when the next sequence sends its first frame, not at the
 reset: a last stage's downstream is a driver, and a reset-time dial
