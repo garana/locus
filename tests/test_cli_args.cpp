@@ -485,11 +485,16 @@ TEST_CASE("remote-experts values parse as HOST:PORT=LO:HI", "[cli]") {
         INFO(bad);
         CHECK_FALSE(locus_tools::parse_remote_experts(bad, r));
     }
-    // A bad value is a usage error before the model loads (exit 2).
-    const std::string cmd = std::string("'") + LOCUS_RUN_BIN +
-                            "' --remote-experts nope missing.gguf hi "
-                            ">/dev/null 2>&1";
-    const int rc = std::system(cmd.c_str());
-    REQUIRE(WIFEXITED(rc));
-    REQUIRE(WEXITSTATUS(rc) == 2);
+    // A bad value, or two ranges that overlap, is a usage error before
+    // the model loads (exit 2).
+    for (const char* flags :
+         {"--remote-experts nope",
+          "--remote-experts a:1=0:8 --remote-experts b:1=4:12"}) {
+        INFO(flags);
+        const std::string cmd = std::string("'") + LOCUS_RUN_BIN + "' " +
+                                flags + " missing.gguf hi >/dev/null 2>&1";
+        const int rc = std::system(cmd.c_str());
+        REQUIRE(WIFEXITED(rc));
+        REQUIRE(WEXITSTATUS(rc) == 2);
+    }
 }
