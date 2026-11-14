@@ -334,10 +334,12 @@ TEST_CASE("neon q8k block-32 dots match scalar q8k", "[backend]") {
     }
 }
 
-TEST_CASE("neon q8k IQ3, IQ1_M, IQ4_XS and Q2_K dots are the scalar bits",
-          "[backend]") {
-    // i#744: exact integer sums and the scalar float steps, so equal
-    // bits per token, batched, and in the dotprod build.
+TEST_CASE("neon q8k IQ TQ and Q2_K dots are the scalar bits", "[backend]") {
+    // IQ3_XXS, IQ3_S, IQ1_M, IQ4_XS, Q2_K (i#744), IQ2_XS, IQ1_S, TQ1_0
+    // and TQ2_0: exact integer sums and the scalar float steps, so equal
+    // bits per token, batched (a group of 4 and a tail of 1), and in the
+    // dotprod build. (No commas in the name: Catch2 splits filters on
+    // them.)
     using TT = locus::gguf::TensorType;
     struct Q {
         TT type;
@@ -356,7 +358,9 @@ TEST_CASE("neon q8k IQ3, IQ1_M, IQ4_XS and Q2_K dots are the scalar bits",
     }
     for (const Q& q : {Q{TT::kIQ3_XXS, 98, 0, -1}, Q{TT::kIQ3_S, 110, 0, -1},
                        Q{TT::kIQ1_M, 56, -1, -1}, Q{TT::kIQ4_XS, 136, 0, -1},
-                       Q{TT::kQ2_K, 84, 80, 82}}) {
+                       Q{TT::kQ2_K, 84, 80, 82}, Q{TT::kIQ2_XS, 74, 0, -1},
+                       Q{TT::kIQ1_S, 50, 0, -1}, Q{TT::kTQ1_0, 54, 52, -1},
+                       Q{TT::kTQ2_0, 66, 64, -1}}) {
         std::vector<std::byte> w(std::size_t{rows} * (cols / 256) * q.bytes);
         for (auto& by : w) {
             by = static_cast<std::byte>(byte_d(rng));
