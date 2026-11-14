@@ -89,14 +89,6 @@ std::string_view trim_ows(std::string_view s) {
     return s.substr(b, e - b);
 }
 
-/**
- * Writes all of `data`, bouncing on EAGAIN via poll(POLLOUT). The
- * deadline bounds a single BLOCKED write (one poll wait), NOT the total
- * time: a write that keeps making progress is never cut off, which is
- * what lets a long SSE stream and a slow prefill through. A write that
- * cannot make progress for `deadline_ms`, a shutdown, or a dead peer all
- * return false. @returns true iff every byte was sent.
- */
 // Set by the acceptor while it serves a fast-path request inline
 // (i#837): a total deadline for every write of that response, so a
 // client that reads a few bytes at a time cannot hold the sole acceptor
@@ -105,6 +97,15 @@ std::string_view trim_ows(std::string_view s) {
 thread_local std::optional<std::chrono::steady_clock::time_point>
     inline_write_until;
 
+/**
+ * Writes all of `data`, bouncing on EAGAIN via poll(POLLOUT). The
+ * deadline bounds a single BLOCKED write (one poll wait), NOT the total
+ * time: a write that keeps making progress is never cut off, which is
+ * what lets a long SSE stream and a slow prefill through. A write that
+ * cannot make progress for `deadline_ms`, a shutdown, or a dead peer all
+ * return false; on the acceptor's inline serve, so does running past
+ * inline_write_until. @returns true iff every byte was sent.
+ */
 bool write_all_deadline(int fd, std::string_view data, int wake_r,
                         int deadline_ms,
                         const std::atomic<bool>& stopping) {

@@ -795,8 +795,6 @@ TEST_CASE("http server: a fast-path head cut short does not stall the "
     REQUIRE(ms < 1000.0);
 }
 
-// The other half of F4: a fast-path head that arrives in two parts still
-// takes the fast path (it waits as partial, then is served inline).
 // i#837: an inline fast-path response used only the per-wait write
 // deadline, so a client that never reads a large one held the acceptor
 // for that whole deadline (and longer, a few bytes at a time).
@@ -832,6 +830,8 @@ TEST_CASE("http server: a slow reader of a fast-path reply does not hold "
     REQUIRE(ms < 3000.0);
 }
 
+// The other half of F4: a fast-path head that arrives in two parts still
+// takes the fast path (it waits as partial, then is served inline).
 TEST_CASE("http server: a fast-path head in two parts is still fast",
           "[http_server]") {
     ServerConfig cfg;
