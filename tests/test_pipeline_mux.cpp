@@ -1917,3 +1917,110 @@ TEST_CASE("serve_stage_mux runs the key handshake on input and dial",
     ::close(lc);
     REQUIRE(sres.load() == 0);  // sessions 2 to 5 ended unclean
 }
+
+// i#854: the mux refuses an input frame longer than one activation from
+// its length prefix, and drops a session whose partial frame stalls past
+// frame_timeout_ms; a connection idle between frames is left alone.
+TEST_CASE("serve_stage_mux caps input frames and times out a stalled one",
+          "[pipeline][mux][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const std::uint32_t n_embd = model.hparams().n_embd;
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;
+    conn.frame_timeout_ms = 300;
+    conn.serve_sessions = 3;
+    std::atomic<int> sres{-1};
+    std::jthread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, allow, {{"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+    // Reads until EOF, for up to 3 s. @returns whether the stage closed
+    // `fd`.
+    const auto closed_by_stage = [](int fd) {
+        pollfd p{fd, POLLIN, 0};
+        char buf[64];
+        for (;;) {
+            if (::poll(&p, 1, 3000) <= 0) {
+                return false;
+            }
+            if (::recv(fd, buf, sizeof(buf), 0) <= 0) {
+                return true;
+            }
+        }
+    };
+
+    // 1. Idle between frames for longer than the frame timeout: kept.
+    Client a;
+    a.request_id = 1;
+    a.to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(a.to_stage >= 0);
+    a.from_stage = locus::pipeline::accept_one(lc, nullptr, 2000);
+    REQUIRE(a.from_stage >= 0);
+    const auto ids = tok.encode("Once upon", true);
+    a.round_trip(ids.at(0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    a.round_trip(ids.at(1));
+    REQUIRE(a.ok);
+    ::close(a.to_stage);
+    ::close(a.from_stage);
+
+    // 2. A frame header that claims n_embd + 1 floats: closed from the
+    // prefix (the payload is never sent).
+    {
+        const int b = locus::pipeline::connect_to("127.0.0.1", ps);
+        REQUIRE(b >= 0);
+        const int bd = locus::pipeline::accept_one(lc, nullptr, 2000);
+        Message m;
+        m.type = MsgType::kActivation;
+        m.data.assign(n_embd + 1, 0.0f);
+        std::string frame;
+        locus::pipeline::encode(m, frame);
+        REQUIRE(::send(b, frame.data(), 40, MSG_NOSIGNAL) == 40);
+        CHECK(closed_by_stage(b));
+        ::close(b);
+        if (bd >= 0) {
+            ::close(bd);
+        }
+    }
+
+    // 3. Ten bytes of a frame, then nothing: dropped after the timeout.
+    {
+        const int c = locus::pipeline::connect_to("127.0.0.1", ps);
+        REQUIRE(c >= 0);
+        const int cd = locus::pipeline::accept_one(lc, nullptr, 2000);
+        std::string frame;
+        locus::pipeline::encode(locus::pipeline::make_token(3, 0, 1), frame);
+        REQUIRE(::send(c, frame.data(), 10, MSG_NOSIGNAL) == 10);
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(closed_by_stage(c));
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        CHECK(ms >= 250);  // not before the timeout
+        ::close(c);
+        if (cd >= 0) {
+            ::close(cd);
+        }
+    }
+
+    server.join();
+    ::close(lc);
+    REQUIRE(sres.load() == 0);  // sessions 2 and 3 ended unclean
+}

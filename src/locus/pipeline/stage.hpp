@@ -159,6 +159,9 @@ class PipelineStage {
 
     bool is_first() const { return layer_begin_ == 0; }
     bool is_last() const { return layer_end_ == n_layers_; }
+    /** @returns The most floats an input frame may carry: n_embd (one
+     *  position's activation; a token frame carries none). */
+    std::uint32_t input_floats() const { return n_embd_; }
 
   private:
     std::function<void()> thread_init_;

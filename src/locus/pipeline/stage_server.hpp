@@ -81,6 +81,13 @@ struct StageConn {
     /** The longest one handshake may take, ms (> 0). */
     int handshake_timeout_ms = kHandshakeTimeoutMs;
     /**
+     * i#854: serve_stage_mux drops a session whose part of a frame has
+     * made no progress for this long (ms), so a peer that stops
+     * mid-frame frees its session and buffer. An idle connection between
+     * frames is never cut (a pooled one waits there). 0: never.
+     */
+    int frame_timeout_ms = 30000;
+    /**
      * i#21: serve_stage_mux calls on_peers on its loop thread, at most
      * every peer_report_ms (0 = never), with the stage's live peers:
      * each session's upstream and its downstream (idle pooled

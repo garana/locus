@@ -43,6 +43,9 @@ struct StageOptions {
     int reconnect_wait = 1000;            /**< --reconnect-wait ms */
     int reconnect_attempts = 0;           /**< --reconnect-attempts */
     int read_timeout = 0;                 /**< --read-timeout ms */
+    int frame_timeout = 30000;            /**< --frame-timeout ms: drop a
+                                           *   session whose partial
+                                           *   frame stalls this long */
     int keepalive_idle = 5;               /**< --keepalive-idle s */
     int keepalive_interval = 2;           /**< --keepalive-interval s */
     int keepalive_count = 3;              /**< --keepalive-count */
@@ -117,6 +120,10 @@ inline Spec<StageOptions> stage_spec() {
                    "give up after N attempts (0 = retry forever)"),
         D::integer("read-timeout", &O::read_timeout,
                    "input read timeout ms (0 = block)"),
+        D::integer("frame-timeout", &O::frame_timeout,
+                   "drop a session whose partial input frame makes no "
+                   "progress for this many ms (default 30000; 0 = "
+                   "never); an idle connection between frames stays"),
         D::integer("keepalive-idle", &O::keepalive_idle,
                    "idle s before first keepalive probe (0 = disable)"),
         D::integer("keepalive-interval", &O::keepalive_interval,
@@ -444,6 +451,7 @@ inline std::string build_runtime(const StageOptions& opt,
     out.conn.reconnect_wait_ms = opt.reconnect_wait;
     out.conn.reconnect_attempts = opt.reconnect_attempts;
     out.conn.recv_timeout_ms = opt.read_timeout;
+    out.conn.frame_timeout_ms = opt.frame_timeout;
     out.conn.keepalive_idle_s = opt.keepalive_idle;
     out.conn.keepalive_intvl_s = opt.keepalive_interval;
     out.conn.keepalive_count = opt.keepalive_count;
