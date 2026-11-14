@@ -508,6 +508,13 @@ TEST_CASE("router: session keys", "[router]") {
     CHECK(!session_key("", R"({"prompt":"Once"})").empty());
     CHECK(session_key("", "").empty());
     CHECK(session_key("", "not json").empty());
+    // i#625 F3: a first user turn nested 50000 arrays deep used to crash
+    // the router (the content's copy recursed once per level); the
+    // depth-bounded parse refuses it, so it has no session key.
+    const std::string deep = R"({"messages":[{"role":"user","content":)" +
+                             std::string(50000, '[') + "1" +
+                             std::string(50000, ']') + "}]}";
+    CHECK(session_key("", deep).empty());
 }
 
 TEST_CASE("router: rendezvous order moves only a leaving instance's keys",

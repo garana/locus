@@ -25,6 +25,7 @@
 #include "locus/auth/helper_spawn.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/http/base64.hpp"
+#include "locus/http/json_body.hpp"
 #include "locus/backend/fallbacks.hpp"
 #include "locus/backend/gpu_metrics.hpp"
 #include "locus/backend/registry.hpp"
@@ -755,7 +756,7 @@ OutputGrammar format_grammar(const json& f, std::string_view raw,
                 nested ? "json_schema.schema must be a JSON Schema object"
                        : "schema must be a JSON Schema object");
         }
-        const auto ordered = nlohmann::ordered_json::parse(raw);
+        const auto ordered = http::parse_json<nlohmann::ordered_json>(raw);
         const std::string at = ptr + (nested ? "/json_schema/schema" : "/schema");
         return {model::Gbnf::parse(model::json_schema_to_gbnf(
                     ordered.at(nlohmann::ordered_json::json_pointer(at))
@@ -2003,7 +2004,7 @@ void OpenAiServer::install_routes() {
         std::optional<VisionChat> vision;  // a chat with images (i#241)
         OutputGrammar grammar;  // an output format
         try {
-            body = json::parse(req.body);
+            body = http::parse_json(req.body);
             if (chat) {
                 if (!body.contains("messages") ||
                     !body["messages"].is_array() ||
@@ -2366,7 +2367,7 @@ void OpenAiServer::install_routes() {
         std::unique_ptr<model::TokenConstraint> constraint;
         std::optional<VisionChat> vision;  // a chat with images (i#241)
         try {
-            const json body = json::parse(req.body);
+            const json body = http::parse_json(req.body);
             if (!body.contains("messages") ||
                 !body["messages"].is_array() ||
                 body["messages"].empty()) {
@@ -2696,7 +2697,7 @@ void OpenAiServer::install_routes() {
                                     const http::RequestContext& ctx) {
             auth_event("create", "embeddings", ctx.identity);
             try {
-                const json body = json::parse(req.body);
+                const json body = http::parse_json(req.body);
                 std::vector<std::string> inputs;
                 if (body.contains("input") &&
                     body["input"].is_string()) {
@@ -2829,7 +2830,7 @@ void OpenAiServer::install_routes() {
                 return;
             }
             try {
-                const json body = json::parse(req.body);
+                const json body = http::parse_json(req.body);
                 if (!body.contains("image")) {
                     throw std::invalid_argument("image is required");
                 }
@@ -2901,7 +2902,7 @@ void OpenAiServer::install_routes() {
                 return;
             }
             try {
-                const json body = json::parse(req.body);
+                const json body = http::parse_json(req.body);
                 if (!body.contains("query") || !body["query"].is_string()) {
                     throw std::invalid_argument("query must be a string");
                 }
@@ -2994,7 +2995,7 @@ void OpenAiServer::install_routes() {
                 return;
             }
             try {
-                const json body = json::parse(req.body);
+                const json body = http::parse_json(req.body);
                 if (!body.contains("input") ||
                     !body["input"].is_string()) {
                     throw std::invalid_argument("input must be a string");
@@ -3297,7 +3298,7 @@ void OpenAiServer::install_routes() {
                                 http::ServerResponse& res,
                                 const http::RequestContext& ctx) {
             try {
-                const json body = json::parse(req.body);
+                const json body = http::parse_json(req.body);
                 auto str = [&](const char* k) -> std::string {
                     if (!body.contains(k)) return {};
                     if (!body[k].is_string()) {
@@ -3408,7 +3409,7 @@ void OpenAiServer::install_routes() {
                               http::ServerResponse& res,
                               const http::RequestContext& ctx, bool edit) {
             try {
-                const json body = json::parse(req.body);
+                const json body = http::parse_json(req.body);
                 auto str = [&](const char* k) -> std::string {
                     if (!body.contains(k)) return {};
                     if (!body[k].is_string()) {
@@ -3564,7 +3565,7 @@ void OpenAiServer::install_routes() {
             if (flux_) {
                 bool named = false;
                 try {
-                    const json b = json::parse(req.body);
+                    const json b = http::parse_json(req.body);
                     named = b.contains("model") && b["model"].is_string() &&
                             b["model"].get<std::string>().rfind("flux", 0) ==
                                 0;
@@ -3579,7 +3580,7 @@ void OpenAiServer::install_routes() {
             if (pixart_) {
                 bool named = false;
                 try {
-                    const json b = json::parse(req.body);
+                    const json b = http::parse_json(req.body);
                     named = b.contains("model") && b["model"].is_string() &&
                             b["model"].get<std::string>().rfind("pixart",
                                                                 0) == 0;
@@ -3599,7 +3600,7 @@ void OpenAiServer::install_routes() {
                 return;
             }
             try {
-                const json body = json::parse(req.body);
+                const json body = http::parse_json(req.body);
                 if (!body.contains("prompt") ||
                     !body["prompt"].is_string() ||
                     body["prompt"].get<std::string>().empty()) {
@@ -3709,7 +3710,7 @@ void OpenAiServer::install_routes() {
         ResponsesRequest rq;
         OutputGrammar grammar;  // text.format
         try {
-            body = json::parse(req.body);
+            body = http::parse_json(req.body);
             rq = parse_responses_request(body);
             grammar = output_grammar(body, req.body);
         } catch (const std::exception& e) {
@@ -3861,7 +3862,7 @@ void OpenAiServer::install_routes() {
                                    http::ServerResponse& res,
                                    const http::RequestContext& ctx) {
         try {
-            const json body = json::parse(req.body);
+            const json body = http::parse_json(req.body);
             auto str = [&](const char* k) -> std::string {
                 if (!body[k].is_string()) {
                     throw std::invalid_argument(std::string(k) +
@@ -4061,7 +4062,7 @@ void OpenAiServer::install_routes() {
         auth_event("create", "videos", ctx.identity);
         if (!videos_on(res)) return;
         try {
-            const json body = json::parse(req.body);
+            const json body = http::parse_json(req.body);
             if (!body.is_object()) {
                 throw std::invalid_argument("the body must be a JSON object");
             }

@@ -213,6 +213,40 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(content[0]["top_logprobs"].size() == 2);
     }
 
+    // i#625 F2: a JSON schema about 1000 levels deep, or tool parameters
+    // about 3000 deep, crashed the server (dump and copy recurse once per
+    // level). The bounded parse answers 400 before anything recurses, and
+    // the server keeps serving.
+    SECTION("deeply nested request JSON is a 400, not a crash") {
+        std::string deep;
+        for (int i = 0; i < 3000; ++i) deep += "{\"a\":";
+        deep += "1" + std::string(3000, '}');
+        const std::string msgs =
+            R"([{"role":"user","content":"Once upon a time"}])";
+        for (const std::string& body :
+             {R"({"messages":)" + msgs + R"(,"max_tokens":2,)" +
+                  R"("response_format":{"type":"json_schema",)" +
+                  R"("json_schema":{"name":"x","schema":)" + deep + "}}}",
+              R"({"messages":)" + msgs + R"(,"max_tokens":2,"tools":[)" +
+                  R"({"type":"function","function":{"name":"f",)" +
+                  R"("parameters":)" + deep + "}}]}",
+              R"({"messages":[{"role":"user","content":)" +
+                  std::string(50000, '[') + "1" +
+                  std::string(50000, ']') + "}]}"}) {
+            auto res = client.Post("/v1/chat/completions", body,
+                                   "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 400);
+            REQUIRE(res->body.find("nested deeper") != std::string::npos);
+        }
+        // Still serving.
+        json ok{{"prompt", "Once upon a time"}, {"max_tokens", 2}};
+        auto res = client.Post("/v1/completions", ok.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+    }
+
     // i#279: the Antigravity SDK sends only max_completion_tokens;
     // without it the limit fell back to 16.
     SECTION("chat max_completion_tokens sets the output limit") {
