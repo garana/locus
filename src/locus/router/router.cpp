@@ -650,6 +650,7 @@ void Router::scan() {
                 http::ClientOptions o;
                 o.connect_timeout_ms = 300;
                 o.read_timeout_ms = 2000;
+                o.total_timeout_ms = 3000;
                 http::Client c(probe.host, probe.port, o);
                 http::ClientRequest req{"GET", "/v1/models", {}, ""};
                 if (const std::string* key = instance_key(probe)) {
@@ -686,6 +687,9 @@ void Router::poll(Instance& in) const {
     http::ClientOptions o;
     o.connect_timeout_ms = 2000;
     o.read_timeout_ms = 5000;
+    // A whole poll, so an instance that sends a byte every few seconds
+    // cannot hold its refresh for long.
+    o.total_timeout_ms = 8000;
     http::Client c(in.host, in.port, o);
     // An instance that checks keys needs one for its /v1/models too:
     // the instance's key from instance_keys, in any upstream mode.
@@ -743,8 +747,20 @@ void Router::refresh() {
         }
         seen = inst_;
     }
-    for (auto& in : seen) {
-        if (!in.gone) poll(in);
+    // In parallel, 64 at a time: a slow instance delays its own poll,
+    // not the others'.
+    {
+        std::atomic<std::size_t> next{0};
+        const auto worker = [&] {
+            for (std::size_t i; (i = next.fetch_add(1)) < seen.size();) {
+                if (!seen[i].gone) poll(seen[i]);
+            }
+        };
+        std::vector<std::thread> pool;
+        const std::size_t threads = std::min<std::size_t>(64, seen.size());
+        for (std::size_t t = 1; t < threads; ++t) pool.emplace_back(worker);
+        worker();  // this thread is one of them
+        for (auto& t : pool) t.join();
     }
     // Field by field and by index: inst_ may have grown meanwhile (it
     // only grows), and a name may have dropped one of these since.

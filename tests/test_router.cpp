@@ -3,6 +3,7 @@
 // (locus's own http::Server) and a real locus-server.
 
 #include <csignal>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -22,6 +23,7 @@
 #include "locus/http/client.hpp"
 #include "locus/http/server.hpp"
 #include "locus/model/transformer.hpp"
+#include "locus/pipeline/net.hpp"
 #include "locus/router/router.hpp"
 #include "locus/server/server.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -1351,4 +1353,32 @@ TEST_CASE("router: in front of a real locus-server", "[router][e2e]") {
     }
     server.stop();
     th.join();
+}
+
+TEST_CASE("router: polls instances in parallel", "[router]") {
+    // i#625 F13: two instances that take the connection and never
+    // answer each hold their poll for the read timeout (5 s). One after
+    // the other, a refresh took 10 s; in parallel it takes one timeout.
+    int p1 = 0;
+    int p2 = 0;
+    const int l1 = locus::pipeline::listen_on("127.0.0.1", 0, &p1);
+    const int l2 = locus::pipeline::listen_on("127.0.0.1", 0, &p2);
+    REQUIRE(l1 >= 0);
+    REQUIRE(l2 >= 0);
+    FakeInstance a("A", {"text"}, "m");
+    RouterFixture rf({"127.0.0.1:" + std::to_string(p1),
+                      "127.0.0.1:" + std::to_string(p2), a.addr()});
+    const auto t0 = std::chrono::steady_clock::now();
+    rf.router->refresh();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    ::close(l1);
+    ::close(l2);
+    CHECK(ms < 8000);
+    const auto inst = rf.router->instances();
+    REQUIRE(inst.size() == 3);
+    CHECK_FALSE(inst[0].healthy);
+    CHECK_FALSE(inst[1].healthy);
+    CHECK(inst[2].healthy);
 }
