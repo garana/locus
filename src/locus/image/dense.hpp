@@ -51,6 +51,13 @@ void ln_modulate(std::span<const float> x, std::uint32_t n, std::uint32_t d,
                  float eps, const float* shift, const float* scale,
                  std::span<float> out);
 
+/** Exact GELU (torch.nn.GELU(), approximate="none"), in place. */
+void gelu(std::span<float> x);
+
+/** RMSNorm with weight w over each of n rows of width d. */
+void rms_norm(std::span<const float> x, std::span<const float> w, float eps,
+              std::uint32_t n, std::uint32_t d, std::span<float> out);
+
 /** torch's F.gelu(approximate="tanh"). */
 inline float gelu_tanh(float v) {
     constexpr float kC = 0.79788456080286535588f;  // sqrt(2 / pi)
