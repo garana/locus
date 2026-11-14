@@ -655,7 +655,10 @@ guarding the default path.
   the MoE hybrid on is refused, since its hot set follows the requests
   served before), the tokens and a checksum per block, so a mismatch
   or a torn file reads as a miss; a byte cap evicts the least recently
-  used file. Entries
+  used file. The checksums catch damage, not tampering, so the
+  directory must be the server user's own and not group- or
+  world-writable (else startup fails), and symlinks in it are never
+  followed. Entries
   evicted from RAM are written back by a worker thread, and the rest
   at shutdown; a prompt whose prefix is at least one block longer on
   disk waits in a LOADING state while the worker reads it into its
