@@ -73,7 +73,7 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
  * once for a tile of 32 tokens. Token t of x starts at x_off + t *
  * x_stride (floats). The caller holds device_mutex().
  * @returns false, recording nothing, for a type without a matmul
- *     kernel (Q4_K and Q6_K): the caller loops record_matvec.
+ *     kernel (Q4_K, Q6_K and Q8_0): the caller loops record_matvec.
  */
 bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t cols, std::uint32_t n_tok,

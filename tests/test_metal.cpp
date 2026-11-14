@@ -357,7 +357,7 @@ TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
     }
 }
 
-TEST_CASE("metal Q4_K and Q6_K matmuls match the CPU matvec per token",
+TEST_CASE("metal Q4_K, Q6_K and Q8_0 matmuls match the CPU matvec",
           "[metal]") {
     if (!Context::usable()) {
         SKIP("no Metal device");
@@ -367,7 +367,8 @@ TEST_CASE("metal Q4_K and Q6_K matmuls match the CPU matvec per token",
     std::mt19937 rng(17);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     // Rows and tokens off the 64 x 32 tile, strided token rows.
-    for (const TensorType ty : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+    for (const TensorType ty :
+         {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0}) {
         CAPTURE(static_cast<int>(ty));
         for (const auto& [rows, cols, n_tok] :
              {std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>{
@@ -423,8 +424,8 @@ TEST_CASE("metal Q4_K and Q6_K matmuls match the CPU matvec per token",
     // Types without a matmul kernel say so and record nothing.
     Context::Buffer none = ctx.alloc(64);
     std::lock_guard lk(mb::device_mutex());
-    CHECK_FALSE(mb::record_matmul(ctx, TensorType::kQ8_0, 4, 32, 2, none, 0,
-                                  none, 0, 32, none, 0, 4, false));
+    CHECK_FALSE(mb::record_matmul(ctx, TensorType::kQ5_K, 4, 256, 2, none, 0,
+                                  none, 0, 256, none, 0, 4, false));
     ctx.free(none);
 }
 

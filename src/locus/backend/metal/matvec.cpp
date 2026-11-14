@@ -176,8 +176,10 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    bool accumulate) {
     const char* kernel = t == gguf::TensorType::kQ4_K   ? "mm_q4_k"
                          : t == gguf::TensorType::kQ6_K ? "mm_q6_k"
+                         : t == gguf::TensorType::kQ8_0 ? "mm_q8_0"
                                                         : nullptr;
-    if (kernel == nullptr || cols % 256 != 0 || n_tok == 0) {
+    const std::uint32_t block = t == gguf::TensorType::kQ8_0 ? 32 : 256;
+    if (kernel == nullptr || cols % block != 0 || n_tok == 0) {
         return false;
     }
     const std::uint32_t row_tiles = (rows + 63) / 64;

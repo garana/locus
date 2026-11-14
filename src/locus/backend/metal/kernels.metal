@@ -1122,3 +1122,92 @@ kernel void attn_rows_tiled(device const float* q [[buffer(0)]],
         }
     }
 }
+
+// The Q8_0 matmul: mm_q4_k with a Q8_0 weight loader (34-byte
+// blocks of 32, a block a k stage).
+kernel void mm_q8_0(device const uchar* wbase [[buffer(0)]],
+                   device const float* xbase [[buffer(1)]],
+                   device float* ybase [[buffer(2)]],
+                   constant MmParams& p [[buffer(3)]],
+                   uint tgi [[threadgroup_position_in_grid]],
+                   uint tid [[thread_index_in_threadgroup]],
+                   uint sg [[simdgroup_index_in_threadgroup]]) {
+    const uint2 tg = uint2(tgi % p.row_tiles, tgi / p.row_tiles);
+    threadgroup float sa[kMmTM * kMmPA];
+    threadgroup float sb[kMmTN * kMmPB];
+    threadgroup float so[kMmTN * kMmPO];
+    device const uchar* w = wbase + p.w_off;
+    device const float* x = xbase + p.x_off;
+    device float* y = ybase + p.out_off;
+    const uint m0 = tg.x * kMmTM;
+    const uint n0 = tg.y * kMmTN;
+    const uint nb = p.cols / 32;
+    const uint rm = (sg & 1) * 32;
+    const uint rn = (sg >> 1) * 16;
+    simdgroup_float8x8 acc[4][2];
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 2; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
+
+    // Loaders: A, row tid / 2, 16 elements at (tid & 1) * 16; B, token
+    // tid / 4, 8 elements at (tid & 3) * 8.
+    const uint ar = tid >> 1;
+    const uint ah = (tid & 1) * 16;
+    const uint bt = tid >> 2;
+    const uint bk = (tid & 3) * 8;
+    const bool a_in = m0 + ar < p.rows;
+    const bool b_in = n0 + bt < p.n_tok;
+    device const uchar* wrow = w + (a_in ? ulong(m0 + ar) * nb * 34 : 0);
+    device const float* xrow = x + (b_in ? (n0 + bt) * p.x_stride : 0);
+
+    for (uint k0 = 0; k0 < p.cols; k0 += kMmTK) {
+        threadgroup float* da = sa + ar * kMmPA + ah;
+        if (a_in) {
+            // Stage k0 is block k0 / 32: d, then 32 int8; a lane takes 16.
+            device const uchar* blk = wrow + (k0 / 32) * 34;
+            const float d = f16_at(blk);
+            device const char* qv = (device const char*)(blk + 2) + ah;
+            for (uint i = 0; i < 16; ++i) {
+                da[i] = d * float(qv[i]);
+            }
+        } else {
+            for (uint i = 0; i < 16; ++i) da[i] = 0.0f;
+        }
+        threadgroup float* db = sb + bt * kMmPB + bk;
+        if (b_in) {
+            device const float* src = xrow + k0 + bk;
+            for (uint i = 0; i < 8; ++i) db[i] = src[i];
+        } else {
+            for (uint i = 0; i < 8; ++i) db[i] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0; kk < kMmTK; kk += 8) {
+            simdgroup_float8x8 a[4], bm[2];
+            for (uint i = 0; i < 4; ++i)
+                simdgroup_load(a[i], sa + (rm + 8 * i) * kMmPA + kk, kMmPA);
+            // B is k x tokens: the [token][k] tile, loaded transposed.
+            for (uint j = 0; j < 2; ++j)
+                simdgroup_load(bm[j], sb + (rn + 8 * j) * kMmPB + kk, kMmPB,
+                               ulong2(0, 0), true);
+            for (uint i = 0; i < 4; ++i)
+                for (uint j = 0; j < 2; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], bm[j],
+                                                  acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // The tile as [token][row] in threadgroup memory, then each thread
+    // stores its share inside the matrix.
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 2; ++j)
+            simdgroup_store(acc[i][j], so + (rn + 8 * j) * kMmPO + rm + 8 * i,
+                            kMmPO, ulong2(0, 0), true);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < kMmTM * kMmTN; e += 128) {
+        const uint t = e / kMmTM, r = e % kMmTM;
+        if (n0 + t < p.n_tok && m0 + r < p.rows) {
+            device float* o = y + (n0 + t) * p.out_stride + m0 + r;
+            const float v = p.scale * so[t * kMmPO + r];
+            *o = p.accumulate != 0 ? *o + v : v;
+        }
+    }
+}
