@@ -148,8 +148,26 @@ TEST_CASE("bench: neon q8k IQ3, IQ1_M, IQ4_XS and Q2_K", "[.][bench]") {
         Mat m{q.type, w.data(), rows, cols};
         const double s = time_matvec(&matvec_q8k, m, x, out, iters);
         const double v = time_matvec(&matvec_neon_q8k, m, x, out, iters);
+        // 16 tokens batched (each block decoded once per 4 tokens)
+        // against 16 one-token calls, ns per token.
+        constexpr std::uint32_t kN = 16;
+        std::vector<float> xb(std::size_t{kN} * cols);
+        std::vector<float> ob(std::size_t{kN} * rows);
+        for (std::uint32_t t = 0; t < kN; ++t) {
+            std::copy(x.begin(), x.end(), xb.begin() + std::size_t{t} * cols);
+        }
+        matvec_batch_neon_q8k(m, xb, ob, kN);  // warm
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters / 4; ++i) {
+            matvec_batch_neon_q8k(m, xb, ob, kN);
+        }
+        const double b = std::chrono::duration<double, std::nano>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count() /
+                         (iters / 4) / kN;
         WARN(q.name << ": scalar q8k=" << s << "ns neon q8k=" << v
-                    << "ns speedup=" << s / v << "x");
+                    << "ns speedup=" << s / v << "x; batched 16: " << b
+                    << "ns/token (" << v / b << "x one-token)");
     }
     SUCCEED();
 }
