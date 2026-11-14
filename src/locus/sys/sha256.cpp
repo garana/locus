@@ -1,5 +1,6 @@
 #include "locus/sys/sha256.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace locus::sys {
@@ -52,33 +53,77 @@ void compress(std::array<std::uint32_t, 8>& h, const unsigned char* p) {
 
 }  // namespace
 
-Sha256Digest sha256(std::string_view data) {
-    std::array<std::uint32_t, 8> h = {0x6a09e667, 0xbb67ae85, 0x3c6ef372,
-                                      0xa54ff53a, 0x510e527f, 0x9b05688c,
-                                      0x1f83d9ab, 0x5be0cd19};
-    const auto* p = reinterpret_cast<const unsigned char*>(data.data());
-    std::size_t n = data.size();
-    std::size_t off = 0;
-    for (; n - off >= 64; off += 64) compress(h, p + off);
-    // The tail, a 1 bit, zeros to 56 mod 64 bytes, the bit length.
-    unsigned char tail[128] = {};
-    const std::size_t rest = n - off;
-    for (std::size_t i = 0; i < rest; ++i) tail[i] = p[off + i];
-    tail[rest] = 0x80;
-    const std::size_t len = rest + 1 + 8 <= 64 ? 64 : 128;
-    const std::uint64_t bits = static_cast<std::uint64_t>(n) * 8;
-    for (int i = 0; i < 8; ++i) {
-        tail[len - 1 - i] = static_cast<unsigned char>(bits >> (8 * i));
+Sha256::Sha256()
+    : h_{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f,
+         0x9b05688c, 0x1f83d9ab, 0x5be0cd19} {}
+
+void Sha256::update(const void* data, std::size_t n) {
+    const auto* p = static_cast<const unsigned char*>(data);
+    total_ += n;
+    if (used_ > 0) {  // fill the pending block first
+        const std::size_t take = std::min(n, 64 - used_);
+        for (std::size_t i = 0; i < take; ++i) buf_[used_ + i] = p[i];
+        used_ += take;
+        p += take;
+        n -= take;
+        if (used_ < 64) return;
+        compress(h_, buf_.data());
+        used_ = 0;
     }
-    compress(h, tail);
-    if (len == 128) compress(h, tail + 64);
+    for (; n >= 64; p += 64, n -= 64) compress(h_, p);
+    for (std::size_t i = 0; i < n; ++i) buf_[i] = p[i];
+    used_ = n;
+}
+
+Sha256Digest Sha256::finish() {
+    // The tail, a 1 bit, zeros to 56 mod 64 bytes, the bit length.
+    const std::uint64_t bits = total_ * 8;
+    const unsigned char one = 0x80;
+    const unsigned char zero = 0;
+    update(&one, 1);
+    while (used_ != 56) update(&zero, 1);
+    unsigned char len[8];
+    for (int i = 0; i < 8; ++i) {
+        len[i] = static_cast<unsigned char>(bits >> (56 - 8 * i));
+    }
+    update(len, 8);  // completes the last block
     Sha256Digest out{};
     for (int i = 0; i < 8; ++i) {
         for (int j = 0; j < 4; ++j) {
-            out[4 * i + j] = static_cast<std::uint8_t>(h[i] >> (24 - 8 * j));
+            out[4 * i + j] = static_cast<std::uint8_t>(h_[i] >> (24 - 8 * j));
         }
     }
     return out;
+}
+
+Sha256Digest sha256(std::string_view data) {
+    Sha256 s;
+    s.update(data);
+    return s.finish();
+}
+
+HmacSha256::HmacSha256(std::string_view key) {
+    std::string k(key);
+    if (k.size() > 64) {
+        const Sha256Digest kd = sha256(k);
+        k.assign(kd.begin(), kd.end());
+    }
+    k.resize(64, '\0');
+    std::string inner(64, '\0');
+    outer_pad_.assign(64, '\0');
+    for (int i = 0; i < 64; ++i) {
+        inner[i] = static_cast<char>(k[i] ^ 0x36);
+        outer_pad_[i] = static_cast<char>(k[i] ^ 0x5c);
+    }
+    inner_.update(inner);
+}
+
+Sha256Digest HmacSha256::finish() {
+    const Sha256Digest ih = inner_.finish();
+    Sha256 outer;
+    outer.update(outer_pad_);
+    outer.update(ih.data(), ih.size());
+    return outer.finish();
 }
 
 std::string to_hex(const Sha256Digest& d) {
@@ -92,22 +137,9 @@ std::string to_hex(const Sha256Digest& d) {
 }
 
 Sha256Digest hmac_sha256(std::string_view key, std::string_view msg) {
-    std::string k(key);
-    if (k.size() > 64) {
-        const Sha256Digest kd = sha256(k);
-        k.assign(kd.begin(), kd.end());
-    }
-    k.resize(64, '\0');
-    std::string inner(64, '\0');
-    std::string outer(64, '\0');
-    for (int i = 0; i < 64; ++i) {
-        inner[i] = static_cast<char>(k[i] ^ 0x36);
-        outer[i] = static_cast<char>(k[i] ^ 0x5c);
-    }
-    inner.append(msg);
-    const Sha256Digest ih = sha256(inner);
-    outer.append(ih.begin(), ih.end());
-    return sha256(outer);
+    HmacSha256 h(key);
+    h.update(msg);
+    return h.finish();
 }
 
 bool digest_equal(const Sha256Digest& a, const Sha256Digest& b) {

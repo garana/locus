@@ -43,7 +43,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   penalties, seed), structured output (JSON mode, a JSON Schema, a
   regex or a GBNF grammar), prompt caching (in RAM, and on disk with
   `--prefix-cache-dir DIR`, read back also after a restart, or through
-  an external helper process, `--prefix-cache-helper`), logprobs,
+  an external helper process, `--prefix-cache-helper`; files signed
+  with `--prefix-cache-key-file`), logprobs,
   prompt-lookup speculative decoding with a draft length that adapts
   to the accept rate and the measured verify cost.
 - **Large models:** weights stream from disk with readahead, so a

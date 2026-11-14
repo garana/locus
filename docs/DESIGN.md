@@ -658,7 +658,9 @@ guarding the default path.
   used file. The checksums catch damage, not tampering, so the
   directory must be the server user's own and not group- or
   world-writable (else startup fails), and symlinks in it are never
-  followed. Entries
+  followed. With `--prefix-cache-key-file`, each file (or helper blob)
+  also ends with an HMAC-SHA-256 of its bytes, so one written without
+  the key is a miss: for a store others can write (#830). Entries
   evicted from RAM are written back by a worker thread, and the rest
   at shutdown; a prompt whose prefix is at least one block longer on
   disk waits in a LOADING state while the worker reads it into its
