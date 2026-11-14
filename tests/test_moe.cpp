@@ -1,3 +1,4 @@
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -7,7 +8,9 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -20,6 +23,9 @@
 #include "locus/model/expert_metrics.hpp"
 #include "locus/model/moe_stats.hpp"
 #include "locus/model/transformer.hpp"
+#include "locus/pipeline/expert_client.hpp"
+#include "locus/pipeline/expert_server.hpp"
+#include "locus/pipeline/message.hpp"
 #include "gguf_builder.hpp"
 
 using locus::model::TransformerModel;
@@ -1613,4 +1619,125 @@ TEST_CASE("the R16 default follows the backend and the switch",
     model.use_q8k_activations(false);
     model.use_backend(scalar);
     REQUIRE_FALSE(model.q8k_activations());
+}
+
+TEST_CASE("an expert server answers each call with expert_out's bits",
+          "[moe][pipeline]") {
+    auto g = locus::gguf::GgufFile::parse(qwen_image(+8.0f, false));
+    auto model = TransformerModel::load(g);
+    const std::uint32_t n_embd = model.hparams().n_embd;
+    REQUIRE(model.hparams().n_expert == 4);
+    // The references first: the server thread uses the shared pool.
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<std::vector<float>> xb(4, std::vector<float>(n_embd));
+    std::vector<std::vector<float>> want(4, std::vector<float>(n_embd));
+    auto ws = model.make_workspace();
+    for (std::uint32_t e = 0; e < 4; ++e) {
+        for (auto& v : xb[e]) {
+            v = dist(rng);
+        }
+        model.expert_out(0, e, xb[e], want[e], ws);
+    }
+    std::vector<float> d(n_embd);
+    REQUIRE_THROWS_AS(model.expert_out(1, 0, xb[0], d, ws),
+                      std::out_of_range);
+    REQUIRE_THROWS_AS(model.expert_out(0, 4, xb[0], d, ws),
+                      std::out_of_range);
+
+    int sv[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    std::uint64_t served = 0;
+    std::thread server([&] {
+        served = locus::pipeline::serve_expert_calls(model, sv[1], 1, 4);
+        ::close(sv[1]);
+    });
+    using locus::pipeline::Message;
+    using locus::pipeline::MsgType;
+    using locus::pipeline::ReadResult;
+    for (std::uint32_t e = 1; e < 4; ++e) {
+        REQUIRE(locus::pipeline::write_message(
+            sv[0], locus::pipeline::make_expert_call(90 + e, 0, e, xb[e])));
+        Message out;
+        REQUIRE(locus::pipeline::read_message(sv[0], out) ==
+                ReadResult::kOk);
+        REQUIRE(out.type == MsgType::kExpertOut);
+        REQUIRE(out.request_id == 90 + e);
+        REQUIRE(out.position == 0);
+        REQUIRE(out.token == static_cast<locus::tok::TokenId>(e));
+        REQUIRE(out.data.size() == n_embd);
+        REQUIRE(std::memcmp(out.data.data(), want[e].data(),
+                            n_embd * sizeof(float)) == 0);
+    }
+    // Expert 0 is outside the served range [1, 4): the server closes.
+    REQUIRE(locus::pipeline::write_message(
+        sv[0], locus::pipeline::make_expert_call(1, 0, 0, xb[0])));
+    Message out;
+    REQUIRE(locus::pipeline::read_message(sv[0], out) == ReadResult::kEof);
+    server.join();
+    ::close(sv[0]);
+    REQUIRE(served == 3);
+}
+
+TEST_CASE("a forward with remote experts is one process's bits",
+          "[moe][pipeline]") {
+    // Experts 2 and 3 run on a loopback expert server over a second
+    // load of the same image; the owner combines all picks in pick
+    // order, so its logits equal a plain forward's bit for bit. This
+    // pins moe_ffn == the weighted sum of its picks' expert_out, with
+    // and without a shared expert.
+    ModelBuilder plain;
+    plain.common();
+    plain.tensor("blk.0.ffn_gate_inp.weight", {kE, 4},
+                 weights(kE * 4, 13));
+    plain.tensor("blk.0.ffn_gate_exps.weight", {kE, kF, 4},
+                 weights(kE * kF * 4, 14));
+    plain.tensor("blk.0.ffn_up_exps.weight", {kE, kF, 4},
+                 weights(kE * kF * 4, 15));
+    plain.tensor("blk.0.ffn_down_exps.weight", {kF, kE, 4},
+                 weights(kF * kE * 4, 16));
+    const std::vector<locus::tok::TokenId> toks = {3, 7, 1, 5, 2};
+    // Window 1 makes start() read a host's reply before its next call
+    // (two picks on the same host); 0 is the default size.
+    for (const std::size_t window : {std::size_t{0}, std::size_t{1}}) {
+    for (const auto& img :
+         {plain.build(4, 2), qwen_image(+8.0f, /*zero_shared=*/false)}) {
+        INFO("window " << window);
+        const auto want = run(img, toks);
+
+        auto g_srv = locus::gguf::GgufFile::parse(img);
+        auto server_model = TransformerModel::load(g_srv);
+        auto g = locus::gguf::GgufFile::parse(img);
+        auto model = TransformerModel::load(g);
+        int sv[2];
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        std::thread server([&] {
+            locus::pipeline::serve_expert_calls(server_model, sv[1], 2, 4);
+            ::close(sv[1]);
+        });
+        locus::pipeline::ExpertClient client({{2, 4, sv[0]}},
+                                             model.hparams().n_embd, window);
+        if (window != 0) {
+            REQUIRE(client.window() == window);
+        }
+        model.set_remote_experts(&client);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> got(model.hparams().n_vocab);
+        for (auto t : toks) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(t, cache, seq, ws, got);
+        }
+        cache.release(seq);
+        model.set_remote_experts(nullptr);
+        ::close(sv[0]);  // the server sees EOF and returns
+        server.join();
+        INFO("remote calls " << client.calls());
+        REQUIRE(client.calls() > 0);  // the remote path ran
+        REQUIRE(got.size() == want.size());
+        REQUIRE(std::memcmp(got.data(), want.data(),
+                            got.size() * sizeof(float)) == 0);
+    }
+    }
 }

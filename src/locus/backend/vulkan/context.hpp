@@ -278,6 +278,12 @@ class VulkanContext {
     static bool profiling();
 
     /**
+     * @returns true when LOCUS_VK_TRACE is set and not "0": the
+     * forwards then print a vk-trace line per step to stderr (i#682).
+     */
+    static bool tracing();
+
+    /**
      * @returns The count of Vulkan validation errors seen so far in
      * this process. Nonzero only when LOCUS_VK_VALIDATION enabled the
      * Khronos validation layer (with GPU-assisted validation) at
@@ -379,6 +385,13 @@ class VulkanContext {
 
     /** Counts one forwarded token toward the profile. */
     void note_token();
+
+    /**
+     * @returns The kernels dispatched since the last call, each once,
+     * by name in kernel order, comma separated; clears that record.
+     * Kept only while tracing(); empty otherwise.
+     */
+    std::string take_traced_kernels();
 
     /** @returns The profile collected so far. */
     const Profile& profile() const;

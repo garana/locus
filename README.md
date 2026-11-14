@@ -81,7 +81,9 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Tools:** `locus-server`; `locus-run` (one prompt); `locus-gguf`
   (inspect a GGUF); `locus-stage` and `locus-driver` (multi-server
   pipeline, experimental; a stage runs on the CPU, CUDA or Vulkan, and
-  can serve its own Prometheus `/metrics`);
+  can serve its own Prometheus `/metrics`); `locus-experts` (serves
+  one host's share of an MoE model's experts, for expert parallelism,
+  #781; `locus-run --remote-experts HOST:PORT=LO:HI` uses it);
   `locus-router` (or `locus-server
   --router`: one URL in front of several locus-server instances, given
   as host:port, found by DNS SRV, by mDNS / DNS-SD or by scanning an

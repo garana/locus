@@ -1,12 +1,17 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <utility>
 
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "catch_amalgamated.hpp"
 #include "backend_cli.hpp"
+#include "locus/backend/variants.hpp"
 
 TEST_CASE("the ctx flag caps the KV pool from the command line",
           "[cli]") {
@@ -355,6 +360,41 @@ TEST_CASE("locus-run starts without a Vulkan device", "[cli]") {
     }
 }
 
+TEST_CASE("LOCUS_VK_TRACE prints each Vulkan forward step", "[cli][vulkan]") {
+    // i#682: a step line names the path, batch size and kernels, and a
+    // sequence line hashes the output; a lone request takes the multi
+    // path in batch-invariant mode and the single path out of it.
+    const std::string model =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/models/stories260K.gguf";
+    if (!std::filesystem::exists(model)) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no Vulkan device");
+    }
+    const auto log = std::filesystem::temp_directory_path() /
+                     ("locus_vk_trace_" + std::to_string(::getpid()));
+    for (const auto& [mode, path] :
+         {std::pair{"1", "vk-trace: multi n=1 inv=1 "},
+          std::pair{"0", "vk-trace: single n=1 inv=0 "}}) {
+        const std::string cmd =
+            std::string("LOCUS_VK_TRACE=1 LOCUS_VK_BATCH_INVARIANT=") +
+            mode + " '" + LOCUS_RUN_BIN + "' --backend vulkan '" + model +
+            "' 'Once upon' 4 >/dev/null 2>'" + log.string() + "'";
+        INFO(cmd);
+        REQUIRE(std::system(cmd.c_str()) == 0);
+        std::ifstream in(log);
+        const std::string text((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        INFO(text);
+        CHECK(text.find("vk-trace: prefill n=") != std::string::npos);
+        CHECK(text.find(path) != std::string::npos);
+        CHECK(text.find("kernels=") != std::string::npos);
+        CHECK(text.find(" out=") != std::string::npos);
+    }
+    std::filesystem::remove(log);
+}
+
 TEST_CASE("locus-run exits 2 on a negative numeric flag", "[cli]") {
     // The check runs before the model loads, so no model is needed.
     const std::string cmd = std::string("'") + LOCUS_RUN_BIN +
@@ -425,4 +465,31 @@ TEST_CASE("bad positional numbers exit 2", "[cli]") {
                        std::string("missing.gguf '") + p + "'") == 2);
     }
     REQUIRE(status(LOCUS_SERVER_BIN, "missing.gguf 8080") == 1);
+}
+
+TEST_CASE("remote-experts values parse as HOST:PORT=LO:HI", "[cli]") {
+    // i#805: locus-run --remote-experts, expert parallelism (#781).
+    locus_tools::RemoteExpertsSpec r;
+    REQUIRE(locus_tools::parse_remote_experts("rpi.local:9201=32:64", r));
+    CHECK(r.host == "rpi.local");
+    CHECK(r.port == 9201);
+    CHECK(r.lo == 32);
+    CHECK(r.hi == 64);
+    REQUIRE(locus_tools::parse_remote_experts("[::1]:9201=0:1", r));
+    CHECK(r.host == "::1");
+    for (const char* bad :
+         {"rpi.local:9201", "rpi.local=32:64", ":9201=32:64",
+          "rpi.local:0=32:64", "rpi.local:9201=64:32",
+          "rpi.local:9201=32:32", "rpi.local:9201=-1:4",
+          "rpi.local:9201=32", "rpi.local:9201=a:b"}) {
+        INFO(bad);
+        CHECK_FALSE(locus_tools::parse_remote_experts(bad, r));
+    }
+    // A bad value is a usage error before the model loads (exit 2).
+    const std::string cmd = std::string("'") + LOCUS_RUN_BIN +
+                            "' --remote-experts nope missing.gguf hi "
+                            ">/dev/null 2>&1";
+    const int rc = std::system(cmd.c_str());
+    REQUIRE(WIFEXITED(rc));
+    REQUIRE(WEXITSTATUS(rc) == 2);
 }

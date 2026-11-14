@@ -34,6 +34,8 @@ Prompt tokens served from the prefix cache, in RAM or (with
 disk, count as `usage.prompt_tokens_details.cached_tokens` (Anthropic:
 `cache_read_input_tokens`). The disk cache keeps each prefix's prompt
 tokens, so DIR must not be readable by other users (files are 0600).
+The server refuses a DIR that another user owns or that group or
+others can write.
 
 Structured output forces the reply to match a format, by masking the
 tokens that would break it:
@@ -346,7 +348,12 @@ calling. Reliable agent use therefore needs a capable instruct model.
   the `locus-server` binary does not expose it yet. `locus-router`
   does: `--auth-helper PATH` checks every request but `/health`, so a
   router in front of instances on a private network is the way to
-  require keys today.
+  require keys today. Give the reference helper its keys in
+  `LOCUS_AUTH_TOKENS` (comma-separated), not as arguments
+  (`--auth-helper-arg`), which every local user can read in `ps`; it
+  names each key's caller `user:N`, N the key's place among the
+  distinct keys of that list, so add new keys at the end (removing or
+  reordering one renumbers the callers after it).
 - Tool execution: locus only expresses tool calls; it never runs them.
   Running them is the client's job (locus is a model runner, not an
   MCP host).

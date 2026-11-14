@@ -2379,6 +2379,47 @@ bool TransformerModel::moe_hybrid_touch(MoeHybrid& hy,
     return t.hot;
 }
 
+namespace {
+
+/** One SwiGLU expert on xb into out: gate and up (one pool dispatch),
+ *  silu, down; gate and up hold its ff floats. The per-pick step of
+ *  moe_ffn and of expert_out. */
+void swiglu_expert(const backend::Ops& op, const backend::Mat& wg,
+                   const backend::Mat& wu, const backend::Mat& wd,
+                   std::uint32_t ff, std::span<const float> xb,
+                   std::span<float> gate, std::span<float> up,
+                   std::span<float> out) {
+    const MatvecJob gu[] = {{wg, xb, gate.first(ff)},
+                            {wu, xb, up.first(ff)}};
+    matvec_mt_group(op, gu);
+    backend::silu_mul(gate.first(ff), up.first(ff), gate.first(ff));
+    matvec_mt(op, wd, gate.first(ff), out);
+}
+
+}  // namespace
+
+void TransformerModel::expert_out(std::uint32_t layer, std::uint32_t expert,
+                                  std::span<const float> xb,
+                                  std::span<float> d, Workspace& ws) const {
+    if (layer < layer_begin_ || layer >= layer_end_ ||
+        layers_[layer].gate_exps.base.rows == 0) {
+        throw std::out_of_range("expert_out: no MoE layer " +
+                                std::to_string(layer));
+    }
+    if (expert >= hp_.n_expert) {
+        throw std::out_of_range("expert_out: no expert " +
+                                std::to_string(expert));
+    }
+    if (xb.size() != hp_.n_embd || d.size() != hp_.n_embd) {
+        throw std::invalid_argument("expert_out: xb and d take n_embd");
+    }
+    const Layer& lay = layers_[layer];
+    const backend::Ops op = effective_ops(backend_, q8k_activations());
+    swiglu_expert(op, lay.gate_exps.expert(expert),
+                  lay.up_exps.expert(expert), lay.down_exps.expert(expert),
+                  hp_.n_ff_exp, xb, ws.gate, ws.up, d);
+}
+
 void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
                          std::uint32_t layer) const {
     using namespace locus::backend;
@@ -2408,6 +2449,11 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
         picked = std::move(hot);
     } else {
         for (const auto& [e, wgt] : picked) {
+            // Another host's experts are its calls, not this host's.
+            if (remote_experts_ != nullptr &&
+                remote_experts_->remote(layer, e)) {
+                continue;
+            }
             ExpertCalls::record(layer, e, hp_.n_layers, hp_.n_expert, gpu,
                                 api);
         }
@@ -2447,11 +2493,37 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
             }
         });
     }
+    // Expert parallelism (#781): which picks another host computes.
+    // Filled only when a RemoteExperts is set, so the all-local path
+    // allocates nothing.
+    RemoteExperts* const rx = remote_experts_;
+    std::vector<char> is_remote;
+    bool any_remote = false;
+    if (rx != nullptr) {
+        is_remote.assign(picked.size(), 0);
+        for (std::size_t i = 0; i < picked.size(); ++i) {
+            is_remote[i] = rx->remote(layer, picked[i].first) ? 1 : 0;
+            any_remote = any_remote || is_remote[i] != 0;
+        }
+    }
+    const auto remote_pick = [&](std::size_t i) {
+        return !is_remote.empty() && is_remote[i] != 0;
+    };
+    // Start them first, so their hosts work while this one computes.
+    for (std::size_t i = 0; i < picked.size(); ++i) {
+        if (remote_pick(i)) {
+            rx->start(layer, picked[i].first, ws.xb);
+        }
+    }
     // R8 expert readahead: overlap the SSD reads of every routed
     // expert before the sequential per-expert matmuls fault them
-    // in one by one.
+    // in one by one (not the remote ones: this host never reads them).
     if (readahead_enabled()) {
-        for (const auto& [e, wgt] : picked) {
+        for (std::size_t i = 0; i < picked.size(); ++i) {
+            if (remote_pick(i)) {
+                continue;
+            }
+            const std::uint32_t e = picked[i].first;
             if (advise_weights_) {
                 sys::advise_willneed(lay.gate_exps.expert(e).data,
                                      lay.gate_exps.expert_bytes);
@@ -2473,20 +2545,42 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
     auto swiglu_into_acc = [&](const Mat& wg, const Mat& wu,
                                const Mat& wd, std::uint32_t ff,
                                float wgt) {
-        const MatvecJob gu[] = {{wg, ws.xb, {ws.gate.data(), ff}},
-                                {wu, ws.xb, {ws.up.data(), ff}}};
-        matvec_mt_group(op, gu);
-        silu_mul({ws.gate.data(), ff}, {ws.up.data(), ff},
-                 {ws.gate.data(), ff});
-        matvec_mt(op, wd, {ws.gate.data(), ff}, ws.xb2);
+        swiglu_expert(op, wg, wu, wd, ff, ws.xb, ws.gate, ws.up, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
             ws.moe_acc[i] += wgt * ws.xb2[i];
         }
     };
-    for (const auto& [e, wgt] : picked) {
-        swiglu_into_acc(lay.gate_exps.expert(e),
-                        lay.up_exps.expert(e),
-                        lay.down_exps.expert(e), n_ff, wgt);
+    if (!any_remote) {
+        for (const auto& [e, wgt] : picked) {
+            swiglu_into_acc(lay.gate_exps.expert(e),
+                            lay.up_exps.expert(e),
+                            lay.down_exps.expert(e), n_ff, wgt);
+        }
+    } else {
+        // Each pick's d, local ones computed while the remote ones run,
+        // then the remote replies in start order; then the weighted
+        // adds in pick order, the adds the loop above makes.
+        std::vector<std::vector<float>> d(picked.size(),
+                                          std::vector<float>(hp_.n_embd));
+        for (std::size_t p = 0; p < picked.size(); ++p) {
+            if (is_remote[p] == 0) {
+                const std::uint32_t e = picked[p].first;
+                swiglu_expert(op, lay.gate_exps.expert(e),
+                              lay.up_exps.expert(e), lay.down_exps.expert(e),
+                              n_ff, ws.xb, ws.gate, ws.up, d[p]);
+            }
+        }
+        for (std::size_t p = 0; p < picked.size(); ++p) {
+            if (is_remote[p] != 0) {
+                rx->finish(d[p]);
+            }
+        }
+        for (std::size_t p = 0; p < picked.size(); ++p) {
+            const float wgt = picked[p].second;
+            for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
+                ws.moe_acc[i] += wgt * d[p][i];
+            }
+        }
     }
     // Weight window (opt-in): drop this layer's routed experts
     // right after use. Routing rarely repeats an expert on the

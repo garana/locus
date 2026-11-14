@@ -107,6 +107,50 @@ TEST_CASE("gbnf rejects bad grammars", "[gbnf]") {
                     std::invalid_argument);
 }
 
+// i#625 F1: each of these killed the server with a stack overflow (the
+// parsers, the left-recursion check and the matcher's expansion
+// recursed once per level or per rule).
+TEST_CASE("gbnf survives deep and long grammars", "[gbnf]") {
+    // Nesting past 64 groups is refused, in a grammar and in a regex;
+    // 64 still parses.
+    const auto parens = [](int n) {
+        return std::string(static_cast<std::size_t>(n), '(') + "\"a\"" +
+               std::string(static_cast<std::size_t>(n), ')');
+    };
+    CHECK_THROWS_AS(Gbnf::parse("root ::= " + parens(1000)),
+                    std::invalid_argument);
+    CHECK(full("root ::= " + parens(64), "a"));
+    const std::string deep_re = std::string(1000, '(') + "a" +
+                                std::string(1000, ')');
+    CHECK_THROWS_AS(regex_to_gbnf(deep_re), std::invalid_argument);
+    CHECK(re_full(std::string(64, '(') + "a" + std::string(64, ')'), "a"));
+
+    // A chain of 5000 rules: r0 ::= r1, ..., r4999 ::= "a".
+    std::string chain = "root ::= r0\n";
+    for (int i = 0; i < 4999; ++i) {
+        chain += "r" + std::to_string(i) + " ::= r" + std::to_string(i + 1) +
+                 "\n";
+    }
+    chain += "r4999 ::= \"a\"\n";
+    CHECK(full(chain, "a"));
+    CHECK_FALSE(full(chain, "b"));
+
+    // The review's 143-byte body: a nullable unit repeated 4096 times.
+    CHECK(re_full("(a?){0,4096}", std::string(10, 'a')));
+    CHECK(re_full("(a?){0,4096}", ""));
+    // Nested nullable repeats: still a matcher, maybe truncated.
+    const auto g = Gbnf::parse("root ::= " +
+                               regex_to_gbnf("((a?){0,64}){0,64}"));
+    GbnfMatcher m(g);
+    for (int i = 0; i < 20; ++i) REQUIRE(m.feed('a'));
+    CHECK(m.accepted());
+
+    // So many copies that the grammar is refused, not built.
+    std::string big = "root ::=";
+    for (int i = 0; i < 300; ++i) big += " \"a\"{4096}";
+    CHECK_THROWS_AS(Gbnf::parse(big), std::invalid_argument);
+}
+
 TEST_CASE("gbnf repetition does not grow the parse stacks", "[gbnf]") {
     // Right recursion through a repeat reuses the caller's frame, so a
     // long run stays cheap; recursion through nesting still works.

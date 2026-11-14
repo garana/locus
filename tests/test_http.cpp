@@ -3,6 +3,7 @@
 
 #include "catch_amalgamated.hpp"
 #include "locus/http/http.hpp"
+#include "locus/http/json_body.hpp"
 
 using locus::http::Limits;
 using locus::http::parse_head;
@@ -653,4 +654,38 @@ TEST_CASE("parse_request: chunked resume over many small chunks is correct",
     REQUIRE(r.state == ParseState::kComplete);
     REQUIRE(r.consumed == req.size());
     REQUIRE(inc.body == expect);
+}
+
+// i#625 F2 / F3: request and upstream JSON is parsed with a depth bound,
+// since dump, copy and the schema and tool converters recurse once per
+// level. kMaxJsonDepth levels parse; one more is refused, by either
+// helper, before anything recurses on it.
+TEST_CASE("parse_json refuses nesting past kMaxJsonDepth", "[http]") {
+    using locus::http::kMaxJsonDepth;
+    using locus::http::parse_json;
+    using locus::http::parse_json_or_discarded;
+    const auto nest = [](int levels) {
+        return std::string(static_cast<std::size_t>(levels), '[') + "1" +
+               std::string(static_cast<std::size_t>(levels), ']');
+    };
+    const auto deep_object = [](int levels) {
+        std::string s;
+        for (int i = 0; i < levels; ++i) s += "{\"a\":";
+        s += "1";
+        s += std::string(static_cast<std::size_t>(levels), '}');
+        return s;
+    };
+    REQUIRE(parse_json(nest(kMaxJsonDepth)).is_array());
+    REQUIRE(parse_json(deep_object(kMaxJsonDepth)).is_object());
+    REQUIRE_THROWS_AS(parse_json(nest(kMaxJsonDepth + 1)),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(parse_json(deep_object(kMaxJsonDepth + 1)),
+                      std::invalid_argument);
+    // A text far deeper than any stack would hold is refused the same way.
+    REQUIRE_THROWS_AS(parse_json(nest(100000)), std::invalid_argument);
+    REQUIRE(parse_json_or_discarded(nest(100000)).is_discarded());
+    REQUIRE(parse_json_or_discarded("{not json").is_discarded());
+    REQUIRE(parse_json_or_discarded(R"({"a":[1,2]})")["a"].size() == 2);
+    // Malformed text still raises the library's own parse error.
+    REQUIRE_THROWS_AS(parse_json("{not json"), nlohmann::json::parse_error);
 }

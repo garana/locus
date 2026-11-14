@@ -9,6 +9,7 @@ target_include_directories(catch2 SYSTEM PUBLIC
 
 add_executable(locus_tests
     test_sanity.cpp
+    test_third_party.cpp
     test_block_allocator.cpp
     test_features.cpp
     test_arch_registry.cpp
@@ -91,6 +92,7 @@ add_executable(locus_tests
     test_q8_layout.cpp
     test_vulkan_reset.cpp
     test_tokenizer.cpp
+    test_tokenizer_merge.cpp
     test_t5_tokenizer.cpp
     test_wpm_tokenizer.cpp
     test_bert.cpp
