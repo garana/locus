@@ -120,6 +120,94 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
     mv_store(out, p, r, lane, acc);
 }
 
+// F16: units of 4 columns (8-byte loads: w_off a multiple of 8).
+kernel void mv_f16(device const uchar* w [[buffer(0)]],
+                   device const float* xb [[buffer(1)]],
+                   device float* out [[buffer(2)]],
+                   constant MvParams& p [[buffer(3)]],
+                   uint tg [[threadgroup_position_in_grid]],
+                   uint tid [[thread_index_in_threadgroup]]) {
+    const uint lane = tid % kMvLanes;
+    const uint r = tg * kMvRows + tid / kMvLanes;
+    float acc = 0.0f;
+    if (r < p.rows) {
+        device const half4* row =
+            (device const half4*)(w + p.w_off + (ulong)r * p.cols * 2);
+        device const float4* x = (device const float4*)(xb + p.x_off);
+        for (uint u = lane; u < p.cols / 4; u += kMvLanes) {
+            acc += dot(float4(row[u]), x[u]);
+        }
+    }
+    mv_store(out, p, r, lane, acc);
+}
+
+// Q4_0: 18-byte blocks of 32 (f16 d, 16 bytes): element j is the low
+// nibble of byte j minus 8, element j + 16 the high one.
+kernel void mv_q4_0(device const uchar* w [[buffer(0)]],
+                    device const float* xb [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    constant MvParams& p [[buffer(3)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+    const uint lane = tid % kMvLanes;
+    const uint r = tg * kMvRows + tid / kMvLanes;
+    float acc = 0.0f;
+    if (r < p.rows) {
+        const uint nb = p.cols / 32;
+        device const uchar* row = w + p.w_off + (ulong)r * nb * 18;
+        device const float* x = xb + p.x_off;
+        for (uint b = lane; b < nb; b += kMvLanes) {
+            device const uchar* blk = row + b * 18;
+            device const uchar* q = blk + 2;
+            device const float4* xv = (device const float4*)(x + b * 32);
+            float s = 0.0f;
+            for (uint k = 0; k < 4; ++k) {
+                const uchar4 v(q[4 * k], q[4 * k + 1], q[4 * k + 2],
+                               q[4 * k + 3]);
+                s += dot(float4(v & uchar4(0xF)) - 8.0f, xv[k]);
+                s += dot(float4(v >> 4) - 8.0f, xv[k + 4]);
+            }
+            acc += f16_at(blk) * s;
+        }
+    }
+    mv_store(out, p, r, lane, acc);
+}
+
+// Q5_0: 22-byte blocks of 32 (f16 d, 32-bit qh, 16 bytes): element j
+// is (low nibble of byte j | bit j of qh << 4) - 16, element j + 16
+// (high nibble | bit j + 16 << 4) - 16.
+kernel void mv_q5_0(device const uchar* w [[buffer(0)]],
+                    device const float* xb [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    constant MvParams& p [[buffer(3)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+    const uint lane = tid % kMvLanes;
+    const uint r = tg * kMvRows + tid / kMvLanes;
+    float acc = 0.0f;
+    if (r < p.rows) {
+        const uint nb = p.cols / 32;
+        device const uchar* row = w + p.w_off + (ulong)r * nb * 22;
+        device const float* x = xb + p.x_off;
+        for (uint b = lane; b < nb; b += kMvLanes) {
+            device const uchar* blk = row + b * 22;
+            const uint qh = uint(blk[2]) | (uint(blk[3]) << 8) |
+                            (uint(blk[4]) << 16) | (uint(blk[5]) << 24);
+            device const uchar* q = blk + 6;
+            device const float* xv = x + b * 32;
+            float s = 0.0f;
+            for (uint j = 0; j < 16; ++j) {
+                const int lo = int((q[j] & 0xF) | (((qh >> j) & 1) << 4));
+                const int hi =
+                    int((q[j] >> 4) | (((qh >> (j + 16)) & 1) << 4));
+                s += float(lo - 16) * xv[j] + float(hi - 16) * xv[j + 16];
+            }
+            acc += f16_at(blk) * s;
+        }
+    }
+    mv_store(out, p, r, lane, acc);
+}
+
 // Q4_K: 144-byte super-blocks of 256 (f16 d and dmin, 12 packed 6-bit
 // scale / min pairs, 128 nibble bytes). A unit is one pair of
 // sub-blocks 2j, 2j + 1, which share 32 nibble bytes (low, high).
@@ -206,6 +294,50 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
             *o = p.accumulate != 0 ? *o + v : v;
         }
     }
+}
+
+// Q5_K: 176-byte super-blocks of 256 (f16 d and dmin, 12 packed
+// scale / min bytes as Q4_K's, 32 qh bytes, 128 nibble bytes). Pair j
+// (sub-blocks 2 j and 2 j + 1) takes nibble bytes 32 j ..: element
+// 64 j + l is (low nibble of byte l | bit 2 j of qh[l] << 4), element
+// 64 j + 32 + l (high nibble | bit 2 j + 1 << 4). A unit is one pair.
+kernel void mv_q5_k(device const uchar* w [[buffer(0)]],
+                    device const float* xb [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    constant MvParams& p [[buffer(3)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+    const uint lane = tid % kMvLanes;
+    const uint r = tg * kMvRows + tid / kMvLanes;
+    float acc = 0.0f;
+    if (r < p.rows) {
+        const uint nb = p.cols / 256;
+        device const uchar* row = w + p.w_off + (ulong)r * nb * 176;
+        device const float* x = xb + p.x_off;
+        for (uint u = lane; u < nb * 4; u += kMvLanes) {
+            const uint b = u >> 2, j = u & 3;
+            device const uchar* blk = row + b * 176;
+            float sc0, mn0, sc1, mn1;
+            q4k_scale_min(2 * j, blk + 4, sc0, mn0);
+            q4k_scale_min(2 * j + 1, blk + 4, sc1, mn1);
+            device const uchar* qh = blk + 16;
+            device const uchar* q = blk + 48 + 32 * j;
+            device const float* xl = x + b * 256 + 64 * j;
+            float sq0 = 0.0f, sx0 = 0.0f, sq1 = 0.0f, sx1 = 0.0f;
+            for (uint l = 0; l < 32; ++l) {
+                const uint h = qh[l] >> (2 * j);
+                const float a = xl[l], c = xl[l + 32];
+                sq0 += float((q[l] & 0xF) | ((h & 1) << 4)) * a;
+                sq1 += float((q[l] >> 4) | ((h & 2) << 3)) * c;
+                sx0 += a;
+                sx1 += c;
+            }
+            const float d = f16_at(blk), dmin = f16_at(blk + 2);
+            acc += d * sc0 * sq0 - dmin * mn0 * sx0;
+            acc += d * sc1 * sq1 - dmin * mn1 * sx1;
+        }
+    }
+    mv_store(out, p, r, lane, acc);
 }
 
 // Q6_K: 210-byte super-blocks of 256 (128 ql, 64 qh, 16 int8 scales,
