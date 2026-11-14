@@ -524,6 +524,64 @@ TEST_CASE("serve_stage re-serves sessions with reset",
     REQUIRE(result.load() == 1);  // served 2 sessions, then returned
 }
 
+// i#849: the blocking serve_stage with a key refuses an input that holds
+// another key (and keeps accepting), then serves one that holds the
+// key, and proves itself to its downstream before the first frame.
+TEST_CASE("serve_stage runs the key handshake on accept and dial",
+          "[pipeline][e2e][handshake]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const std::string key = "0123456789abcdef0123456789abcdef";
+
+    PipelineStage stage(model, 0, L);
+    int pin = 0, pe = 0;
+    const int lin = locus::pipeline::listen_on("127.0.0.1", 0, &pin);
+    const int le = locus::pipeline::listen_on("127.0.0.1", 0, &pe);
+    REQUIRE(lin >= 0);
+    REQUIRE(le >= 0);
+
+    locus::pipeline::StageConn conn;
+    conn.key = key;
+    conn.serve_sessions = 1;
+    conn.connect_timeout_ms = 1000;
+    std::atomic<int> result{-1};
+    std::jthread th([&] {
+        result = locus::pipeline::serve_stage(stage, lin, {},
+                                              "127.0.0.1", pe, conn)
+                     ? 1
+                     : 0;
+    });
+
+    const int bad = locus::pipeline::connect_to("127.0.0.1", pin);
+    REQUIRE(bad >= 0);
+    REQUIRE_FALSE(locus::pipeline::handshake_connect(
+        bad, "fedcba9876543210fedcba9876543210", 2000));
+    ::close(bad);
+
+    const int w = locus::pipeline::connect_to("127.0.0.1", pin);
+    REQUIRE(w >= 0);
+    REQUIRE(locus::pipeline::handshake_connect(w, key, 2000));
+    const int r = locus::pipeline::accept_one(le, nullptr, 2000);
+    REQUIRE(r >= 0);
+    REQUIRE(locus::pipeline::handshake_accept(r, key, 2000));
+    const auto ids = tok.encode("Once", true);
+    REQUIRE(locus::pipeline::write_message(
+        w, locus::pipeline::make_token(1, 0, ids.at(0))));
+    Message lg;
+    REQUIRE(locus::pipeline::read_message(r, lg) == ReadResult::kOk);
+    REQUIRE(lg.type == MsgType::kLogits);
+    ::close(w);
+    th.join();
+    ::close(r);
+    ::close(le);
+    REQUIRE(result.load() == 1);
+}
+
 // #16: serve_stage takes a POOL of interchangeable downstream replicas
 // (no load balancer). Each connect sweeps the pool and uses the first
 // replica that accepts, so a dead one is skipped (an established

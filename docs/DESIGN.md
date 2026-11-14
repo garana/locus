@@ -936,7 +936,14 @@ length-prefixed frames over TCP, tagged by request and position. A
 connect proves only that the downstream listener is up; liveness needs
 an app-level probe. A stage writes whatever its peer sends into its KV
 cache, so a `locus-stage --listen` (or a driver's `--logits-listen`)
-that is not loopback needs `--allow` (#847).
+that is not loopback needs `--allow` (#847). With `--key-file` (the
+same file on every stage and the driver), each accepted connection and
+each new downstream dial first runs a shared-key HMAC handshake, and a
+peer without the key is closed before any frame; a pooled downstream
+passed it when it was dialed. In the serve loop the handshake is one
+more per-session state with its own deadline, so a silent peer does
+not stall other sessions (#849). Frames are not signed: a peer on the
+network path is not stopped.
 The serve loop can report its live peers (each session's upstream
 and downstream) with the kernel's smoothed TCP round-trip time, read
 from `TCP_INFO` (Linux, FreeBSD) or `TCP_CONNECTION_INFO` (macOS)

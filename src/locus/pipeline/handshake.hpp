@@ -30,6 +30,8 @@ inline constexpr std::size_t kAnswerBytes = 56;
 inline constexpr std::size_t kProofBytes = 32;
 /** The shortest key read_key_file takes. */
 inline constexpr std::size_t kMinKeyBytes = 16;
+/** The tools' bound on one handshake, ms. */
+inline constexpr int kHandshakeTimeoutMs = 5000;
 
 /**
  * Reads a key file: its whole content is the key.
