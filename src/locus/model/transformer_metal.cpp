@@ -398,6 +398,12 @@ bool TransformerModel::metal_forward_batch(
         }
     }
     const std::size_t qd = std::size_t{H} * hd, kvd = std::size_t{KV} * hd;
+    // The tiled attention takes head widths of 32 to 128 in steps of 32
+    // (LOCUS_METAL_ATTN_TILED=0: attn_rows, for tests).
+    const char* tiled_env = std::getenv("LOCUS_METAL_ATTN_TILED");
+    const bool tiled_attn =
+        hd % 32 == 0 && hd <= 128 &&
+        (tiled_env == nullptr || std::string_view(tiled_env) != "0");
     const std::uint32_t bt = cache.geometry().block_tokens;
 
     std::lock_guard lk(metal::device_mutex());
@@ -524,16 +530,23 @@ bool TransformerModel::metal_forward_batch(
                         {&s.rows, std::size_t{l} * m * 8}};
                     ctx.dispatch("kv_scatter", sa, bytes_of(sp),
                                  m * static_cast<std::uint32_t>(kvd), 256);
+                    // n_pos carries the sub-chunk's token count.
                     const AttnRowsParams ap{
                         {cache.block_floats(), cache.layer_offset(l),
-                         cache.layer_floats() / 2, 0, bt, H, KV, hd,
+                         cache.layer_floats() / 2, m, bt, H, KV, hd,
                          hp_.kq_scale},
                         base + c0,
                         static_cast<std::uint32_t>(qd)};
                     const Context::Arg aa[] = {
                         {&s.q, 0}, {pool, 0}, {&s.blocks, 0}, {&s.att, 0}};
-                    ctx.dispatch("attn_rows", aa, bytes_of(ap),
-                                 m * H * kAttnGroup, kAttnGroup);
+                    if (tiled_attn) {
+                        // 8 queries of a head a threadgroup, K / V staged.
+                        ctx.dispatch("attn_rows_tiled", aa, bytes_of(ap),
+                                     ((m + 7) / 8) * H * 256, 256);
+                    } else {
+                        ctx.dispatch("attn_rows", aa, bytes_of(ap),
+                                     m * H * kAttnGroup, kAttnGroup);
+                    }
                     mm(lay.wo, s.att, static_cast<std::uint32_t>(qd), s.x, E,
                        true, m);
                     norm_rows(lay.ffn_norm, m);

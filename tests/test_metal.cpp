@@ -486,21 +486,29 @@ TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
         };
         const auto cpu = prefill(locus::backend::backends().front().name,
                                  false);
-        const std::uint64_t before =
-            locus::model::TransformerModel::metal_forward_tokens();
-        const auto gpu = prefill("metal", false);
-        // The prompt and the next token all ran on the GPU.
-        CHECK(locus::model::TransformerModel::metal_forward_tokens() -
-                  before ==
-              ids.size() + 1);
-        close(gpu.first, cpu.first);
-        close(gpu.second, cpu.second);
-        // All logits: a row each, the last equal to the one-row run's.
-        const auto all = prefill("metal", true);
-        REQUIRE(all.first.size() == ids.size() * nv);
-        close(std::span<const float>(all.first).subspan(
-                  (ids.size() - 1) * nv, nv),
-              cpu.first);
+        // The tiled causal attention (the default), then attn_rows.
+        for (const bool tiled : {true, false}) {
+            CAPTURE(tiled);
+            if (!tiled) {
+                setenv("LOCUS_METAL_ATTN_TILED", "0", 1);
+            }
+            const std::uint64_t before =
+                locus::model::TransformerModel::metal_forward_tokens();
+            const auto gpu = prefill("metal", false);
+            // The prompt and the next token all ran on the GPU.
+            CHECK(locus::model::TransformerModel::metal_forward_tokens() -
+                      before ==
+                  ids.size() + 1);
+            close(gpu.first, cpu.first);
+            close(gpu.second, cpu.second);
+            // All logits: a row each, the last as the one-row run's.
+            const auto all = prefill("metal", true);
+            unsetenv("LOCUS_METAL_ATTN_TILED");
+            REQUIRE(all.first.size() == ids.size() * nv);
+            close(std::span<const float>(all.first).subspan(
+                      (ids.size() - 1) * nv, nv),
+                  cpu.first);
+        }
     }
     if (ran == 0) {
         SKIP("none of the llama test models is present");
