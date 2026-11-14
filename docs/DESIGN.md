@@ -912,7 +912,10 @@ weight), so the owner can combine the experts in its own pick order
 and keep one host's bits. `locus-experts` serves an expert range
 through `TransformerModel::expert_out`, the step `moe_ffn` takes per
 pick, one connection at a time, and accepts only loopback peers unless
-given `--allow` (the port has no authentication). On the token's
+given `--allow`; with `--key-file` (and locus-run's
+`--remote-experts-key-file`) a peer first passes the stage's key
+handshake, and each side refuses a frame longer than n_embd floats
+from its length prefix (#850). On the token's
 side, `TransformerModel::set_remote_experts` takes a
 `model::RemoteExperts` (`pipeline::ExpertClient` over those
 connections): `moe_ffn` starts the remote picks, computes the local

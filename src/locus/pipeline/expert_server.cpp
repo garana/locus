@@ -16,8 +16,10 @@ std::uint64_t serve_expert_calls(const model::TransformerModel& m, int fd,
     std::uint64_t served = 0;
     for (;;) {
         Message in;
-        if (read_message(fd, in) != ReadResult::kOk) {
-            return served;  // closed, or a broken frame
+        // A call holds n_embd floats: a longer frame is refused unread,
+        // so a peer cannot make this host allocate more (i#850).
+        if (read_message(fd, in, n_embd) != ReadResult::kOk) {
+            return served;  // closed, or a broken or oversized frame
         }
         const auto expert = static_cast<std::uint32_t>(in.token);
         if (in.type != MsgType::kExpertCall || expert < expert_lo ||

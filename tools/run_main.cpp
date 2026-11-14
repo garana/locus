@@ -102,6 +102,25 @@ int main(int argc, char** argv) {
         }
         remote.push_back(std::move(r));
     }
+    // i#850: the expert hosts' shared key, read before the model loads.
+    std::string expert_key;
+    if (!args.remote_experts_key_file.empty()) {
+        if (remote.empty()) {
+            std::fprintf(stderr,
+                         "%s: --remote-experts-key-file needs "
+                         "--remote-experts\n",
+                         argv[0]);
+            return 2;
+        }
+        try {
+            expert_key = locus::pipeline::read_key_file(
+                args.remote_experts_key_file);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "%s: bad --remote-experts-key-file: %s\n",
+                         argv[0], e.what());
+            return 2;
+        }
+    }
     const std::string model_path = args.positional[0];
     const std::string prompt = args.positional[1];
     // Guarded parse: atoi wrapped "-1" to 4294967295 tokens and read
@@ -162,6 +181,15 @@ int main(int argc, char** argv) {
             if (fd < 0) {
                 std::fprintf(stderr, "%s: cannot reach %s:%d\n", argv[0],
                              r.host.c_str(), r.port);
+                return 1;
+            }
+            if (!expert_key.empty() &&
+                !locus::pipeline::handshake_connect(
+                    fd, expert_key, locus::pipeline::kHandshakeTimeoutMs)) {
+                std::fprintf(stderr,
+                             "%s: %s:%d failed the key handshake (does it "
+                             "run with the same --key-file?)\n",
+                             argv[0], r.host.c_str(), r.port);
                 return 1;
             }
             hosts.push_back({r.lo, r.hi, fd});
