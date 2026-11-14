@@ -26,14 +26,15 @@ kernel void add_f32(device const float* a [[buffer(0)]],
 // A threadgroup of 128 threads (4 simdgroups) takes 8 rows, 16 lanes
 // per row (two rows per simdgroup); lanes stride over the row's units
 // and the 16 partial sums are added with simd shuffles within each
-// half of the simdgroup. W starts at the bound buffer's offset, 16-byte
-// aligned (so Q4_K's word loads are aligned); x_off is a multiple of 4
-// (float4 loads).
+// half of the simdgroup. W starts w_off bytes into its buffer, a multiple
+// of 4 (Q4_K loads words; F32 a multiple of 16); x_off is a multiple of
+// 4 (float4 loads).
 
 struct MvParams {
+    ulong w_off;    // bytes into the weight buffer
+    ulong out_off;  // floats into the output buffer
     uint rows;
     uint cols;
-    uint out_off;
     uint accumulate;
     uint x_off;
     float scale;
@@ -68,7 +69,7 @@ inline float f16_at(device const uchar* b) {
 }
 
 // F32: units of 4 columns.
-kernel void mv_f32(device const float* w [[buffer(0)]],
+kernel void mv_f32(device const uchar* w [[buffer(0)]],
                    device const float* xb [[buffer(1)]],
                    device float* out [[buffer(2)]],
                    constant MvParams& p [[buffer(3)]],
@@ -79,7 +80,7 @@ kernel void mv_f32(device const float* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         device const float4* row =
-            (device const float4*)(w + (ulong)r * p.cols);
+            (device const float4*)(w + p.w_off + (ulong)r * p.cols * 4);
         device const float4* x = (device const float4*)(xb + p.x_off);
         for (uint u = lane; u < p.cols / 4; u += kMvLanes) {
             acc += dot(row[u], x[u]);
@@ -101,7 +102,7 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 32;
-        device const uchar* row = w + (ulong)r * nb * 34;
+        device const uchar* row = w + p.w_off + (ulong)r * nb * 34;
         device const float* x = xb + p.x_off;
         for (uint b = lane; b < nb; b += kMvLanes) {
             device const uchar* blk = row + b * 34;
@@ -146,7 +147,7 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 256;
-        device const uchar* row = w + (ulong)r * nb * 144;
+        device const uchar* row = w + p.w_off + (ulong)r * nb * 144;
         device const float* x = xb + p.x_off;
         for (uint u = lane; u < nb * 4; u += kMvLanes) {
             const uint b = u >> 2;
@@ -199,7 +200,7 @@ kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 256;
-        device const uchar* row = w + (ulong)r * nb * 210;
+        device const uchar* row = w + p.w_off + (ulong)r * nb * 210;
         device const float* x = xb + p.x_off;
         for (uint u = lane; u < nb * 4; u += kMvLanes) {
             const uint b = u >> 2;
@@ -229,4 +230,197 @@ kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
         }
     }
     mv_store(out, p, r, lane, acc);
+}
+
+// ---------------------------------------------------------------------
+// The text forward's other steps (i#866). Offsets count floats.
+
+// The sum of v over a threadgroup of up to 1024 threads (32
+// simdgroups); every thread gets it. `part` holds 32 floats.
+inline float group_sum(float v, threadgroup float* part, uint tid,
+                       uint n_threads) {
+    v = simd_sum(v);
+    const uint sg = tid / 32, n_sg = (n_threads + 31) / 32;
+    if (tid % 32 == 0) {
+        part[sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s = 0.0f;
+    for (uint i = 0; i < n_sg; ++i) {
+        s += part[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return s;
+}
+
+inline float group_max(float v, threadgroup float* part, uint tid,
+                       uint n_threads) {
+    v = simd_max(v);
+    const uint sg = tid / 32, n_sg = (n_threads + 31) / 32;
+    if (tid % 32 == 0) {
+        part[sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = -INFINITY;
+    for (uint i = 0; i < n_sg; ++i) {
+        m = max(m, part[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return m;
+}
+
+struct NormParams {
+    uint n;
+    float eps;
+};
+
+// out = x / sqrt(mean(x^2) + eps) * w, one threadgroup.
+kernel void rmsnorm_f32(device const float* x [[buffer(0)]],
+                        device const float* w [[buffer(1)]],
+                        device float* out [[buffer(2)]],
+                        constant NormParams& p [[buffer(3)]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint nt [[threads_per_threadgroup]]) {
+    threadgroup float part[32];
+    float s = 0.0f;
+    for (uint i = tid; i < p.n; i += nt) {
+        s += x[i] * x[i];
+    }
+    s = group_sum(s, part, tid, nt);
+    const float inv = 1.0f / sqrt(s / float(p.n) + p.eps);
+    for (uint i = tid; i < p.n; i += nt) {
+        out[i] = x[i] * inv * w[i];
+    }
+}
+
+struct RopeParams {
+    ulong off;      // the first head's first float
+    uint n_heads;
+    uint head_dim;
+};
+
+// In place, pairs (2 i, 2 i + 1) of each head rotated by cs[2 i]
+// (cos) and cs[2 i + 1] (sin): one thread a pair.
+kernel void rope_norm(device float* v [[buffer(0)]],
+                      device const float* cs [[buffer(1)]],
+                      constant RopeParams& p [[buffer(2)]],
+                      uint g [[thread_position_in_grid]]) {
+    const uint half_d = p.head_dim / 2;
+    if (g >= p.n_heads * half_d) {
+        return;
+    }
+    const uint h = g / half_d, i = g % half_d;
+    device float* e = v + p.off + h * p.head_dim + 2 * i;
+    const float c = cs[2 * i], s = cs[2 * i + 1];
+    const float a = e[0], b = e[1];
+    e[0] = a * c - b * s;
+    e[1] = a * s + b * c;
+}
+
+// Paged attention for one query over positions [0, n_pos): position t
+// of the sequence is at blocks[t / bt] * block_floats + layer_off +
+// (t % bt) * kv_dim (K), and v_off past it (V); head h reads KV head
+// h / (n_heads / n_kv_heads).
+struct AttnParams {
+    ulong block_floats;
+    ulong layer_off;
+    ulong v_off;
+    uint n_pos;
+    uint block_tokens;
+    uint n_heads;
+    uint n_kv_heads;
+    uint head_dim;
+    float kq_scale;
+};
+
+inline ulong kv_row(constant AttnParams& p, device const uint* blocks,
+                    uint t) {
+    return ulong(blocks[t / p.block_tokens]) * p.block_floats +
+           p.layer_off + ulong(t % p.block_tokens) * p.n_kv_heads *
+                             p.head_dim;
+}
+
+// scores[h * n_pos + t] = kq_scale * dot(q_h, k_t): one thread each.
+kernel void attn_scores(device const float* q [[buffer(0)]],
+                        device const float* pool [[buffer(1)]],
+                        device const uint* blocks [[buffer(2)]],
+                        device float* scores [[buffer(3)]],
+                        constant AttnParams& p [[buffer(4)]],
+                        uint g [[thread_position_in_grid]]) {
+    if (g >= p.n_heads * p.n_pos) {
+        return;
+    }
+    const uint h = g / p.n_pos, t = g % p.n_pos;
+    const uint kvh = h / (p.n_heads / p.n_kv_heads);
+    device const float4* k = (device const float4*)(
+        pool + kv_row(p, blocks, t) + kvh * p.head_dim);
+    device const float4* qh = (device const float4*)(q + h * p.head_dim);
+    float s = 0.0f;
+    for (uint i = 0; i < p.head_dim / 4; ++i) {
+        s += dot(qh[i], k[i]);
+    }
+    scores[g] = s * p.kq_scale;
+}
+
+// Softmax of each head's n_pos scores in place: one threadgroup a head.
+kernel void attn_softmax(device float* scores [[buffer(0)]],
+                         constant AttnParams& p [[buffer(1)]],
+                         uint h [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint nt [[threads_per_threadgroup]]) {
+    threadgroup float part[32];
+    device float* s = scores + h * p.n_pos;
+    float m = -INFINITY;
+    for (uint t = tid; t < p.n_pos; t += nt) {
+        m = max(m, s[t]);
+    }
+    m = group_max(m, part, tid, nt);
+    float sum = 0.0f;
+    for (uint t = tid; t < p.n_pos; t += nt) {
+        const float e = exp(s[t] - m);
+        s[t] = e;
+        sum += e;
+    }
+    sum = group_sum(sum, part, tid, nt);
+    const float inv = 1.0f / sum;
+    for (uint t = tid; t < p.n_pos; t += nt) {
+        s[t] *= inv;
+    }
+}
+
+// out[h * head_dim + d] = sum_t p[h, t] * v_t[kvh * head_dim + d]: one
+// thread each.
+kernel void attn_values(device const float* scores [[buffer(0)]],
+                        device const float* pool [[buffer(1)]],
+                        device const uint* blocks [[buffer(2)]],
+                        device float* out [[buffer(3)]],
+                        constant AttnParams& p [[buffer(4)]],
+                        uint g [[thread_position_in_grid]]) {
+    if (g >= p.n_heads * p.head_dim) {
+        return;
+    }
+    const uint h = g / p.head_dim, d = g % p.head_dim;
+    const uint kvh = h / (p.n_heads / p.n_kv_heads);
+    device const float* s = scores + h * p.n_pos;
+    float acc = 0.0f;
+    for (uint t = 0; t < p.n_pos; ++t) {
+        acc += s[t] * pool[kv_row(p, blocks, t) + p.v_off +
+                           kvh * p.head_dim + d];
+    }
+    out[g] = acc;
+}
+
+struct SiluParams {
+    uint n;
+};
+
+// gate[i] = silu(gate[i]) * up[i].
+kernel void silu_mul(device float* gate [[buffer(0)]],
+                     device const float* up [[buffer(1)]],
+                     constant SiluParams& p [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i < p.n) {
+        const float g = gate[i];
+        gate[i] = g / (1.0f + exp(-g)) * up[i];
+    }
 }

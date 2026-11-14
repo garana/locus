@@ -988,6 +988,16 @@ void TransformerModel::forward_layers(tok::TokenId token,
             return;
         }
     }
+    if (first && last && backend_->name == "metal") {
+        // Plain llama on Metal, the whole model, one command batch
+        // (i#866).
+        const float* e = embed_in ? hidden_in.data() : nullptr;
+        if (metal_forward(token, e, seq, pos, cache, ws, out, rows)) {
+            lap.lap(kNoLayer, Stage::kDevice);
+            seq.n_tokens = pos + 1;
+            return;
+        }
+    }
     const backend::Ops op =
         effective_ops(backend_, q8k_activations());
 

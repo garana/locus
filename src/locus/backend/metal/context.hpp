@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -117,5 +118,12 @@ class Context {
     explicit Context(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };
+
+/**
+ * @returns The lock every user of the Metal context holds while it
+ *     records or submits (the context is not thread-safe): the matvec
+ *     entry points and the forward.
+ */
+std::mutex& device_mutex();
 
 }  // namespace locus::backend::metal

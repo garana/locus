@@ -3,9 +3,9 @@
 
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <mutex>
 #include <unordered_map>
 
 #include "locus/backend/metal/context.hpp"
@@ -40,7 +40,8 @@ Kind kind_of(TensorType t) {
 
 /** MvParams in kernels.metal. */
 struct MvParams {
-    std::uint32_t rows, cols, out_off, accumulate, x_off;
+    std::uint64_t w_off, out_off;
+    std::uint32_t rows, cols, accumulate, x_off;
     float scale;
 };
 
@@ -59,13 +60,6 @@ struct State {
     std::unordered_map<const std::byte*, Cached> weights;
     Context::Buffer x, out;
 };
-
-// Guards state() and the context: one matvec at a time, from any
-// thread (the forward will own its own buffers, i#866).
-std::mutex& state_mu() {
-    static std::mutex mu;
-    return mu;
-}
 
 State& state() {
     static State s;
@@ -120,12 +114,8 @@ Kind prepare(Context& ctx, const Mat& w, std::span<const float> x,
 
 void record(Context& ctx, const Mat& w, const Kind& k) {
     State& s = state();
-    const Context::Buffer& wb = weight(ctx, w, k);
-    const MvParams p{w.rows, w.cols, 0, 0, 0, 1.0f};
-    const Context::Arg args[] = {{&wb, 0}, {&s.x, 0}, {&s.out, 0}};
-    const std::uint32_t groups = (w.rows + kRowsPerGroup - 1) / kRowsPerGroup;
-    ctx.dispatch(k.kernel, args, std::as_bytes(std::span(&p, 1)),
-                 groups * kGroup, kGroup);
+    record_matvec(ctx, w.type, w.rows, w.cols, weight(ctx, w, k), 0, s.x,
+                  0, s.out, 0, false);
 }
 
 }  // namespace
@@ -134,13 +124,38 @@ bool matvec_supported(gguf::TensorType t) {
     return kind_of(t).kernel != nullptr;
 }
 
+void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                   std::uint32_t cols, const Context::Buffer& w,
+                   std::uint64_t w_off, const Context::Buffer& x,
+                   std::uint32_t x_off, const Context::Buffer& out,
+                   std::uint64_t out_off, bool accumulate) {
+    const Kind k = kind_of(t);
+    if (k.kernel == nullptr || cols % k.block != 0 || x_off % 4 != 0) {
+        throw std::invalid_argument("metal record_matvec: no kernel");
+    }
+    const MvParams p{w_off, out_off, rows, cols, accumulate ? 1u : 0u,
+                     x_off, 1.0f};
+    const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
+    const std::uint32_t groups = (rows + kRowsPerGroup - 1) / kRowsPerGroup;
+    ctx.dispatch(k.kernel, args, std::as_bytes(std::span(&p, 1)),
+                 groups * kGroup, kGroup);
+}
+
+std::size_t matvec_weight_bytes(gguf::TensorType t, std::uint32_t rows,
+                                std::uint32_t cols) {
+    const Kind k = kind_of(t);
+    return k.kernel == nullptr
+               ? 0
+               : std::size_t{rows} * (cols / k.block) * k.bytes;
+}
+
 void matvec(const Mat& w, std::span<const float> x, std::span<float> out) {
     const Kind kd = kind_of(w.type);
     if (kd.kernel == nullptr || w.cols % kd.block != 0) {
         backend::matvec(w, x, out);  // no kernel for this type
         return;
     }
-    std::lock_guard lk(state_mu());
+    std::lock_guard lk(device_mutex());
     Context& ctx = Context::get();
     const Kind k = prepare(ctx, w, x, out);
     record(ctx, w, k);
@@ -152,7 +167,7 @@ double matvec_repeat(const Mat& w, std::span<const float> x,
     if (reps == 0) {
         throw std::invalid_argument("metal matvec_repeat: reps 0");
     }
-    std::lock_guard lk(state_mu());
+    std::lock_guard lk(device_mutex());
     Context& ctx = Context::get();
     const Kind k = prepare(ctx, w, x, out);
     weight(ctx, w, k);  // uploaded before the clock starts
@@ -177,7 +192,7 @@ void drop_weights() {
     if (!Context::usable()) {
         return;
     }
-    std::lock_guard lk(state_mu());
+    std::lock_guard lk(device_mutex());
     Context& ctx = Context::get();
     for (auto& [ptr, c] : state().weights) {
         ctx.free(c.buf);
