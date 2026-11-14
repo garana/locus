@@ -919,7 +919,9 @@ executor, each Vulkan executor runs on its own device, with its own
 backend state (#47). Activations travel as
 length-prefixed frames over TCP, tagged by request and position. A
 connect proves only that the downstream listener is up; liveness needs
-an app-level probe.
+an app-level probe. A stage writes whatever its peer sends into its KV
+cache, so a `locus-stage --listen` (or a driver's `--logits-listen`)
+that is not loopback needs `--allow` (#847).
 The serve loop can report its live peers (each session's upstream
 and downstream) with the kernel's smoothed TCP round-trip time, read
 from `TCP_INFO` (Linux, FreeBSD) or `TCP_CONNECTION_INFO` (macOS)

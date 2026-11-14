@@ -104,6 +104,7 @@ add_library(locus
     src/locus/model/speculative.cpp
     src/locus/pipeline/driver.cpp
     src/locus/pipeline/expert_server.cpp
+    src/locus/pipeline/handshake.cpp
     src/locus/pipeline/message.cpp
     src/locus/pipeline/mdns.cpp
     src/locus/pipeline/net.cpp
@@ -128,6 +129,7 @@ add_library(locus
     src/locus/sys/child_fds.cpp
     src/locus/sys/mmap_file.cpp
     src/locus/sys/poller.cpp
+    src/locus/sys/sha256.cpp
     src/locus/sys/thread_pool.cpp
     src/locus/sys/perf_counters.cpp
     src/locus/sys/histogram.cpp

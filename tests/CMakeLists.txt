@@ -47,6 +47,7 @@ add_executable(locus_tests
     test_meminfo.cpp
     test_mmap_file.cpp
     test_pipeline.cpp
+    test_handshake.cpp
     test_pipeline_stage.cpp
     test_forward_batch_layers.cpp
     test_logit_rows.cpp

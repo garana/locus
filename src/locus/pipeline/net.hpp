@@ -36,6 +36,13 @@ struct Cidr {
 bool ip_allowed(const std::string& ip, const std::vector<Cidr>& allow);
 
 /**
+ * @returns Whether a listen host binds loopback only: "localhost", an
+ *     address in 127.0.0.0/8, or ::1. An empty host (every interface)
+ *     is not.
+ */
+bool is_loopback_host(const std::string& host);
+
+/**
  * Splits a "host:port" endpoint string (as a CLI takes) into its parts.
  * Accepts a bracketed IPv6 literal ("[::1]:8000", brackets stripped),
  * "host:port", and ":port" (empty host == wildcard, for a bind). A bare

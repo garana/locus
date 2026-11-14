@@ -33,7 +33,8 @@ const char* kUsage =
     "  --head H:P        first stage's input address to connect to\n"
     "  --logits-listen H:P  address to listen on for the last stage's\n"
     "                    logits (empty host == wildcard, \":PORT\")\n"
-    "  --allow CIDR      restrict who may connect back (repeatable)\n"
+    "  --allow CIDR      restrict who may connect back (repeatable);\n"
+    "                    needed when --logits-listen is not loopback\n"
     "  --max-tokens N    cap generated tokens (default 64)\n"
     "  --temp T          sampling temperature (default 0 = greedy)\n"
     "  --seed S          RNG seed for non-greedy sampling (default 0)\n"
@@ -143,6 +144,15 @@ int main(int argc, char** argv) {
             return 2;
         }
         allow.push_back(*c);
+    }
+    // i#625 F8: whoever connects to the logits listen feeds the output;
+    // off loopback the driver must name its peer (the last stage).
+    if (allow.empty() && !locus::pipeline::is_loopback_host(lh)) {
+        std::fprintf(stderr,
+                     "--logits-listen %s is not loopback: give --allow with "
+                     "the last stage's address\n",
+                     logits_listen.c_str());
+        return 2;
     }
 
     try {

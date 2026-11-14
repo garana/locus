@@ -413,6 +413,14 @@ inline std::string build_runtime(const StageOptions& opt,
         }
         out.allow.push_back(*c);
     }
+    // i#625 F8: a stage takes tokens and activations into its KV cache
+    // from whoever connects, so off loopback it must name its peers.
+    if (out.allow.empty() &&
+        !locus::pipeline::is_loopback_host(out.listen_host)) {
+        return "listen " + opt.listen +
+               " is not loopback: give --allow with the peers that may "
+               "connect (for example --allow 10.0.0.0/8)";
+    }
     out.conn.connect_timeout_ms = opt.connect_timeout;
     out.conn.reconnect_wait_ms = opt.reconnect_wait;
     out.conn.reconnect_attempts = opt.reconnect_attempts;
