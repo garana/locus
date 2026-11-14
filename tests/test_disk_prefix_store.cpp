@@ -414,6 +414,25 @@ TEST_CASE("DiskPrefixStore never follows a symlink in its directory",
     REQUIRE(s.used_bytes() == 0);
 }
 
+TEST_CASE("DiskPrefixStore resolves a symlinked directory once",
+          "[disk_prefix]") {
+    // DIR given as a symlink: the store uses the real directory, so
+    // repointing the link after startup does not move its files.
+    DirGuard g{temp_dir("locus-dps-dirlink")};
+    fs::create_directories(g.dir / "real");
+    fs::create_directories(g.dir / "other");
+    const fs::path link = g.dir / "link";
+    fs::create_symlink(g.dir / "real", link);
+    DiskPrefixStore s(link, key(), kBlockBytes, 1 << 20);
+    fs::remove(link);
+    fs::create_symlink(g.dir / "other", link);
+    const auto in = blocks(1, 5);
+    REQUIRE(s.write(kPrompt, 1, srcs(in)));
+    const std::string name = s.path_for(kPrompt, 1).filename().string();
+    REQUIRE(fs::exists(g.dir / "real" / name));
+    REQUIRE_FALSE(fs::exists(g.dir / "other" / name));
+}
+
 TEST_CASE("DiskPrefixStore removes a crash's temporary files on open",
           "[disk_prefix]") {
     DirGuard g{temp_dir("locus-dps-tmp")};

@@ -262,7 +262,7 @@ int main(int argc, char** argv) {
     }
     std::error_code ec;
     try {
-        locus::engine::ensure_private_dir(store.dir);
+        store.dir = locus::engine::ensure_private_dir(store.dir);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "locus-prefix-helper: %s\n", e.what());
         return 2;

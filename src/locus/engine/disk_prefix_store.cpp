@@ -137,10 +137,14 @@ bool parse_name(const std::string& name, std::uint64_t& digest) {
 
 }  // namespace
 
-void ensure_private_dir(const fs::path& dir) {
-    if (fs::create_directories(dir)) {
-        fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace);
+fs::path ensure_private_dir(const fs::path& given) {
+    if (fs::create_directories(given)) {
+        fs::permissions(given, fs::perms::owner_all,
+                        fs::perm_options::replace);
     }
+    // Checked and used through its real path: a symlink someone else
+    // owns could otherwise pass here and be repointed later.
+    const fs::path dir = fs::canonical(given);
     struct stat st {};
     if (::stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
         throw std::runtime_error(dir.string() + ": not a directory");
@@ -155,6 +159,7 @@ void ensure_private_dir(const fs::path& dir) {
                                  ": group or others can write to it; "
                                  "chmod go-w it, or use another directory");
     }
+    return dir;
 }
 
 DiskPrefixStore::DiskPrefixStore(DiskKey key, std::size_t block_bytes,
@@ -176,10 +181,9 @@ DiskPrefixStore::DiskPrefixStore(fs::path dir, DiskKey key,
                                  std::size_t block_bytes,
                                  std::uint64_t cap_bytes)
     : DiskPrefixStore(std::move(key), block_bytes, cap_bytes, nullptr) {
-    dir_ = std::move(dir);
     // Files hold clients' prompt tokens: owner only, and no one else
     // may plant files (or symlinks) in the directory.
-    ensure_private_dir(dir_);
+    dir_ = ensure_private_dir(dir);
     // (mtime, digest, bytes): the order across a restart is the
     // order of the files' last reads and writes.
     std::vector<std::tuple<fs::file_time_type, std::uint64_t,

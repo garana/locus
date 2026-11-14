@@ -54,10 +54,13 @@ struct DiskKey {
  * tokens, and a read trusts the KV in them.
  *
  * @param dir The cache directory.
+ * @returns `dir` with every symlink resolved: the caller opens files
+ *     through it, so repointing a symlink in `dir` later does not move
+ *     the cache.
  * @throws std::runtime_error when `dir` is not a directory, another
  *     user owns it, or its group or others can write to it.
  */
-void ensure_private_dir(const std::filesystem::path& dir);
+std::filesystem::path ensure_private_dir(const std::filesystem::path& dir);
 
 /**
  * Prefix-cache KV blocks on persistent storage (i#416), so a prompt
