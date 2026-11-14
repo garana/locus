@@ -773,14 +773,33 @@ void q6_k_raw6_sse4(const std::byte* blk, std::uint8_t aux[256]) {
     }
 }
 
+/**
+ * Q6_K's per-row offset terms, which depend on the activation only:
+ * for each block of qs (lane_pairs_mask order) and each of its 16
+ * groups of 16, the 8 lanes of 32 * (q8 pair sum), as
+ * q6_k_q8k_aux32_sse4 computes them (out: nb * 128 int16).
+ */
+void q6_k_offsets_sse4(const std::int8_t* qs, std::size_t nb,
+                       std::int16_t* out) {
+    const __m128i u1 = _mm_set1_epi8(1);
+    for (std::size_t g = 0; g < nb * 16; ++g) {
+        const __m128i qv =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs + g * 16));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + g * 8),
+                         _mm_slli_epi16(_mm_maddubs_epi16(u1, qv), 5));
+    }
+}
+
 /** SSE4 Q6_K x Q8_K: fills aux32[8] exactly as scalar
  *  vec_dot_q6_k_q8_k does (no min term). Q6_K values are signed
  *  (raw6-32), so maddubs (unsigned x signed) needs the offset trick
  *  per lane: sum((raw6-32)*q8) = sum(raw6*q8) - 32*sum(q8). raw6 (the
  *  ql-nibble | qh-2bit code, [0,63]) is reconstructed in-register,
- *  then shuffled to lane_pairs_mask order to match q8il. */
+ *  then shuffled to lane_pairs_mask order to match q8il. off: the
+ *  block's 16 groups of 32 * sum(q8) per lane (q6_k_offsets_sse4), or
+ *  null to compute them here; the same integers either way. */
 void q6_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
-                         std::int32_t aux32[8]) {
+                         const std::int16_t* off, std::int32_t aux32[8]) {
     const auto* sc = reinterpret_cast<const std::int8_t*>(blk + 192);
     const auto* ql = reinterpret_cast<const std::uint8_t*>(blk);
     const auto* qh = reinterpret_cast<const std::uint8_t*>(blk + 128);
@@ -800,8 +819,11 @@ void q6_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
         const __m128i qv = _mm_loadu_si128(
             reinterpret_cast<const __m128i*>(q8il + j * 16));
         // per lane: |raw6*q8 pair| <= 2*63*127, 32*|q8 pair| <= 32*254
-        return _mm_sub_epi16(_mm_maddubs_epi16(rv, qv),
-                             _mm_slli_epi16(_mm_maddubs_epi16(u1, qv), 5));
+        const __m128i o =
+            off != nullptr
+                ? _mm_loadu_si128(reinterpret_cast<const __m128i*>(off + j * 8))
+                : _mm_slli_epi16(_mm_maddubs_epi16(u1, qv), 5);
+        return _mm_sub_epi16(_mm_maddubs_epi16(rv, qv), o);
     };
     for (int n = 0; n < 2; ++n) {
         for (int h = 0; h < 32; h += 16) {
@@ -1112,6 +1134,9 @@ struct Q8kAct {
     const float* d;
     const std::int8_t* qs;
     const std::int16_t* bsums;
+    /** Q6_K's offset terms (q6_k_offsets_sse4), or null to compute them
+     *  per row. */
+    const std::int16_t* q6off = nullptr;
 };
 
 /** One Q2_K row against a Q8_K activation, as matvec_sse4_q8k's rows. */
@@ -1170,7 +1195,9 @@ float row_k_q8k_sse4_t(const std::byte* row, const Q8kAct& a,
             q3_k_q8k_aux32_sse4(blk, q8, aux32);
         } else {  // Q6_K, no min
             bd = f16_to_f32(load_u16(blk + 208));
-            q6_k_q8k_aux32_sse4(blk, q8, aux32);
+            q6_k_q8k_aux32_sse4(
+                blk, q8, a.q6off != nullptr ? a.q6off + b * 128 : nullptr,
+                aux32);
         }
         const __m128 d = _mm_set1_ps(bd * a.d[b]);
         const auto* v = reinterpret_cast<const __m128i*>(aux32);
@@ -1958,7 +1985,14 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
     // lane_pairs_mask one.
     quantize_q8k_sse4(x, path == Q8Path::kK && !q3k, hd.data(),
                       hqs.data(), hbs.data());
-    const Q8kAct a{hd.data(), hqs.data(), hbs.data()};
+    Q8kAct a{hd.data(), hqs.data(), hbs.data()};
+    // Q6_K's offset terms once for all rows, not per row.
+    std::vector<std::int16_t> q6off;
+    if (w.type == gguf::TensorType::kQ6_K) {
+        q6off.resize(nb * 128);
+        q6_k_offsets_sse4(hqs.data(), nb, q6off.data());
+        a.q6off = q6off.data();
+    }
     const std::size_t row_bytes = mat_row_bytes(w);
     for (std::uint32_t r = 0; r < w.rows; ++r) {
         out[r] = row_q8k_sse4(path, w.type, w.data + r * row_bytes, a, nb);
