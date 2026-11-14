@@ -553,7 +553,16 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   default on Apple GPUs, where a lone sequence costs little; elsewhere
   a lone sequence keeps the single-sequence forward (on V3D the mode
   costs a lone Q8_0 sequence 3% with the NT 1 build below, but stays
-  off by default until i#682 is understood). Under the default a lone
+  off by default until the split below has run in a few batches).
+  On V3D the kernel's v3d driver can reset the GPU for a "hang" in the
+  middle of a long compute job (a 274 ms conv dispatch, about once in
+  30), and the job's remaining workgroups never run, without an error
+  (i#682). So there a grid of more than 32 workgroups is recorded as
+  several `vkCmdDispatchBase` pieces, each its own short job, except
+  for kernels that read `gl_NumWorkGroups` (found in their SPIR-V);
+  the pieces see the same workgroup ids, so the results are the same
+  (`LOCUS_VK_SPLIT=N` sets the budget, 0 turns it off). Under the
+  default a lone
   sequence on a Q4_K or Q6_K model keeps it too (the K-quant
   short-batch kernels cost it 9 to 11% on an M2 Pro), so such a model
   is batch-invariant only with the mode set.
