@@ -42,7 +42,10 @@ class VideoJobs {
                                       const std::function<bool()>& alive)>;
 
     /**
-     * @param dir Where the MP4 files go (created when missing).
+     * @param dir Where the MP4 files go (created when missing); "" makes
+     *     a private one (mkdtemp under the system temp directory, mode
+     *     0700, so another local user can neither read the clips nor
+     *     plant a symlink for ffmpeg to follow), removed on destruction.
      * @param max_pending Most jobs queued or in progress at once.
      * @param ttl Seconds a finished job and its file are kept.
      * @param now The clock (Unix seconds); tests pass their own.
@@ -69,12 +72,16 @@ class VideoJobs {
     /** Blocks until no job is queued or running (for tests). */
     void wait_idle();
 
+    /** @returns The directory the MP4 files go to. */
+    const std::string& dir() const { return dir_; }
+
   private:
     void worker();
     /** Drops finished jobs past their expiry; called with mu_ held. */
     void sweep();
 
     std::string dir_;
+    bool own_dir_ = false;  ///< made here (dir ""), so removed here
     std::size_t max_pending_;
     std::int64_t ttl_;
     std::function<std::int64_t()> now_;

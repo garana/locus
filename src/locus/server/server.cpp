@@ -1274,12 +1274,9 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
                          opt_.ffmpeg_path.c_str());
         }
         // At most 4 clips queued or running; a finished one is kept an
-        // hour.
-        video_jobs_ = std::make_unique<video::VideoJobs>(
-            (std::filesystem::temp_directory_path() /
-             ("locus-videos-" + std::to_string(::getpid())))
-                .string(),
-            4, 3600);
+        // hour. The clips go to a private directory VideoJobs makes
+        // (mkdtemp, mode 0700), not a predictable name in a shared /tmp.
+        video_jobs_ = std::make_unique<video::VideoJobs>("", 4, 3600);
     }
     // Image input (i#241): on when the model's GGUF carries the Janus
     // vision tower. A tower that is present but broken stops the
