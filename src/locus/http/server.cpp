@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <optional>
 #include <thread>
 
 #include "locus/pipeline/net.hpp"
@@ -39,6 +40,11 @@ constexpr int kRecheckMs = 5;
 // The most a fast-path request may be (head and body): a peek of this
 // many bytes that is not a whole request goes to the pool.
 constexpr std::size_t kFastPeekBytes = 16 * 1024;
+
+// The most an inline fast-path response may take to write in all; a
+// client that reads it slower is dropped. /metrics, the largest, is
+// usually under the socket send buffer and goes out at once.
+constexpr int kInlineWriteMs = 1000;
 
 // send() flag that suppresses SIGPIPE on a write to a closed peer, where
 // the platform offers it (Linux). On macOS/BSD the same is achieved with
@@ -83,13 +89,22 @@ std::string_view trim_ows(std::string_view s) {
     return s.substr(b, e - b);
 }
 
+// Set by the acceptor while it serves a fast-path request inline
+// (i#837): a total deadline for every write of that response, so a
+// client that reads a few bytes at a time cannot hold the sole acceptor
+// while the response drains. Pool threads leave it unset: their writes
+// keep only the per-wait deadline (a long stream is fine there).
+thread_local std::optional<std::chrono::steady_clock::time_point>
+    inline_write_until;
+
 /**
  * Writes all of `data`, bouncing on EAGAIN via poll(POLLOUT). The
  * deadline bounds a single BLOCKED write (one poll wait), NOT the total
  * time: a write that keeps making progress is never cut off, which is
  * what lets a long SSE stream and a slow prefill through. A write that
  * cannot make progress for `deadline_ms`, a shutdown, or a dead peer all
- * return false. @returns true iff every byte was sent.
+ * return false; on the acceptor's inline serve, so does running past
+ * inline_write_until. @returns true iff every byte was sent.
  */
 bool write_all_deadline(int fd, std::string_view data, int wake_r,
                         int deadline_ms,
@@ -98,6 +113,18 @@ bool write_all_deadline(int fd, std::string_view data, int wake_r,
     while (off < data.size()) {
         if (stopping.load()) {
             return false;
+        }
+        if (inline_write_until) {
+            const auto left =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    *inline_write_until - std::chrono::steady_clock::now())
+                    .count();
+            if (left <= 0) return false;  // the inline total ran out
+            // A negative deadline_ms is poll's "forever": the total
+            // still applies then.
+            deadline_ms = deadline_ms < 0
+                              ? static_cast<int>(left)
+                              : std::min(deadline_ms, static_cast<int>(left));
         }
         const ssize_t n =
             ::send(fd, data.data() + off, data.size() - off, kSendFlags);
@@ -439,18 +466,20 @@ Server::Classified Server::peek_classify(int fd) {
     // partial one). There is deliberately NO poll here: this used to wait
     // up to 100 ms per connection, which serialized the sole acceptor at
     // ~100 ms per silent client (i#88). Waiting is the poll set's job.
-    std::string buf(kFastPeekBytes, '\0');
-    const ssize_t n =
-        ::recv(fd, buf.data(), buf.size(), MSG_PEEK | MSG_DONTWAIT);
+    // One buffer for every peek (acceptor-only): a partial connection is
+    // peeked every 5 ms, and a fresh zeroed 16 KiB each time adds up.
+    peek_buf_.resize(kFastPeekBytes);
+    const ssize_t n = ::recv(fd, peek_buf_.data(), peek_buf_.size(),
+                             MSG_PEEK | MSG_DONTWAIT);
     if (n <= 0) {
         return Classified::kPool;  // EOF or an error: the pool deals
     }
-    buf.resize(static_cast<std::size_t>(n));
+    const std::string_view buf(peek_buf_.data(), static_cast<std::size_t>(n));
     const bool full = buf.size() == kFastPeekBytes;
     // The request line first, so a non-fast request goes to the pool at
     // once, however much of it is still on its way.
     const auto eol = buf.find("\r\n");
-    if (eol == std::string::npos) {
+    if (eol == std::string_view::npos) {
         return full ? Classified::kPool : Classified::kWait;
     }
     const std::string_view line(buf.data(), eol);
@@ -575,7 +604,23 @@ void Server::classify_ready(int fd) {
     // connection could otherwise carry a LATER non-fast (inference)
     // request and run it inline, stalling accept.
     if (c == Classified::kServe) {
-        serve_connection_guarded(fd, peer_ip, /*single_request=*/true);
+        // The response's writes share one total deadline (i#837): the
+        // request is all here, so the only wait left is the client's
+        // reading, and a slow reader must not hold the acceptor.
+        // A guard, so nothing can leave a stale deadline behind for
+        // the next inline serve.
+        struct InlineDeadline {
+            InlineDeadline() {
+                inline_write_until =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(kInlineWriteMs);
+            }
+            ~InlineDeadline() { inline_write_until.reset(); }
+        };
+        {
+            const InlineDeadline deadline;
+            serve_connection_guarded(fd, peer_ip, /*single_request=*/true);
+        }
         ::close(fd);
         return;
     }
