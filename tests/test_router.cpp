@@ -1382,3 +1382,43 @@ TEST_CASE("router: polls instances in parallel", "[router]") {
     CHECK_FALSE(inst[1].healthy);
     CHECK(inst[2].healthy);
 }
+
+TEST_CASE("router: a model list with invalid UTF-8 does not stop it",
+          "[router]") {
+    // The json parser refuses the reply's ill-formed UTF-8, so the
+    // instance is down; the refresh returns and the router stays up.
+    int port = 0;
+    const int lfd = locus::pipeline::listen_on("127.0.0.1", 0, &port);
+    REQUIRE(lfd >= 0);
+    std::atomic<bool> stop{false};
+    std::jthread th([&] {
+        const std::string body =
+            "{\"object\":\"list\",\"data\":[{\"id\":\"m\xff\","
+            "\"object\":\"model\"}]}";
+        const std::string reply =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Connection: close\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\n\r\n" + body;
+        while (!stop) {
+            const int c = locus::pipeline::accept_one(lfd, nullptr, 200);
+            if (c < 0) continue;
+            char buf[4096];
+            [[maybe_unused]] const ssize_t got = ::read(c, buf, sizeof(buf));
+            [[maybe_unused]] const ssize_t put =
+                ::write(c, reply.data(), reply.size());
+            ::close(c);
+        }
+    });
+    RouterFixture rf({"127.0.0.1:" + std::to_string(port)});
+    rf.router->refresh();
+    const auto inst = rf.router->instances();
+    stop = true;
+    th.join();
+    ::close(lfd);
+    REQUIRE(inst.size() == 1);
+    CHECK_FALSE(inst[0].healthy);
+    CHECK(inst[0].models_json.empty());
+    Client c("127.0.0.1", rf.port);
+    const auto h = c.send(ClientRequest{"GET", "/health", {}, ""});
+    REQUIRE(h.ok);
+}
