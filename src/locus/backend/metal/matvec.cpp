@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <mutex>
 #include <unordered_map>
 
 #include "locus/backend/metal/context.hpp"
@@ -58,6 +59,13 @@ struct State {
     std::unordered_map<const std::byte*, Cached> weights;
     Context::Buffer x, out;
 };
+
+// Guards state() and the context: one matvec at a time, from any
+// thread (the forward will own its own buffers, i#866).
+std::mutex& state_mu() {
+    static std::mutex mu;
+    return mu;
+}
 
 State& state() {
     static State s;
@@ -132,6 +140,7 @@ void matvec(const Mat& w, std::span<const float> x, std::span<float> out) {
         backend::matvec(w, x, out);  // no kernel for this type
         return;
     }
+    std::lock_guard lk(state_mu());
     Context& ctx = Context::get();
     const Kind k = prepare(ctx, w, x, out);
     record(ctx, w, k);
@@ -143,6 +152,7 @@ double matvec_repeat(const Mat& w, std::span<const float> x,
     if (reps == 0) {
         throw std::invalid_argument("metal matvec_repeat: reps 0");
     }
+    std::lock_guard lk(state_mu());
     Context& ctx = Context::get();
     const Kind k = prepare(ctx, w, x, out);
     weight(ctx, w, k);  // uploaded before the clock starts
@@ -167,6 +177,7 @@ void drop_weights() {
     if (!Context::usable()) {
         return;
     }
+    std::lock_guard lk(state_mu());
     Context& ctx = Context::get();
     for (auto& [ptr, c] : state().weights) {
         ctx.free(c.buf);
