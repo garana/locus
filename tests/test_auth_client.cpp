@@ -196,7 +196,9 @@ TEST_CASE("auth resolves through the reference helper binary",
 
     auto good = client.resolve("sk-ok");
     REQUIRE(good.ok);
-    REQUIRE(good.identity == "user:sk-ok");
+    // i#625 F16: the identity names the token's place in the list, not
+    // the token, so a log of identities holds no secret.
+    REQUIRE(good.identity == "user:1");
     auto bad = client.resolve("sk-nope");
     REQUIRE_FALSE(bad.ok);
 }
