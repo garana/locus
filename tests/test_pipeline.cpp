@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -86,6 +87,45 @@ TEST_CASE("pipeline message codec round-trips", "[pipeline]") {
         REQUIRE(out.type == MsgType::kSessionEnd);
         REQUIRE(out.request_id == 42);
         REQUIRE(out.data.empty());
+    }
+
+    SECTION("expert call and reply carry layer, expert id and floats") {
+        const std::vector<float> xb = {0.5f, -1.25f, 3.0f, -0.0f};
+        const std::vector<float> d = {1e-30f, -7.5f, 2.0f, 4.0f};
+        for (const auto& m :
+             {locus::pipeline::make_expert_call(77, 23, 59, xb),
+              locus::pipeline::make_expert_out(77, 23, 59, d)}) {
+            std::string buf;
+            locus::pipeline::encode(m, buf);
+            Message out;
+            std::string err;
+            REQUIRE(locus::pipeline::decode(buf, out, err) ==
+                    Decode::kComplete);
+            REQUIRE(buf.empty());
+            REQUIRE(out.type == m.type);
+            REQUIRE(out.request_id == 77);
+            REQUIRE(out.position == 23);  // layer
+            REQUIRE(out.token == 59);     // expert id
+            REQUIRE(out.data.size() == m.data.size());
+            // Floats travel raw: the same bits, -0.0 included.
+            REQUIRE(std::memcmp(out.data.data(), m.data.data(),
+                                m.data.size() * sizeof(float)) == 0);
+        }
+        REQUIRE(locus::pipeline::make_expert_call(1, 0, 0, xb).type ==
+                MsgType::kExpertCall);
+        REQUIRE(locus::pipeline::make_expert_out(1, 0, 0, d).type ==
+                MsgType::kExpertOut);
+    }
+
+    SECTION("an unknown message type is a malformed frame") {
+        auto m = locus::pipeline::make_expert_out(5, 1, 2, {1.0f});
+        std::string buf;
+        locus::pipeline::encode(m, buf);
+        buf[4] = 7;  // the u16 type after the u32 frame_len: no kind 7
+        buf[5] = 0;
+        Message out;
+        std::string err;
+        REQUIRE(locus::pipeline::decode(buf, out, err) == Decode::kError);
     }
 
     SECTION("two frames decode in sequence (pipelining)") {

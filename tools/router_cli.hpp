@@ -208,7 +208,19 @@ inline int run_router(int argc, char** argv, int first) {
                          in.port, in.healthy ? "up" : "down",
                          kinds.c_str());
         }
-        std::fprintf(stderr, "locus-router listening on :%d\n", port);
+        // The bound host too, so a loopback-only router reads as one; an
+        // IPv6 address in brackets, as locus-server prints it.
+        if (cfg.host.empty()) {
+            std::fprintf(stderr,
+                         "locus-router listening on every interface, port "
+                         "%d\n",
+                         port);
+        } else {
+            const bool v6 = cfg.host.find(':') != std::string::npos;
+            std::fprintf(stderr, "locus-router listening on %s%s%s:%d\n",
+                         v6 ? "[" : "", cfg.host.c_str(), v6 ? "]" : "",
+                         port);
+        }
         r.wait();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "locus-router: %s\n", e.what());

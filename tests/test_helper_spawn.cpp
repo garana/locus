@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -36,6 +37,30 @@ TEST_CASE("spawn_helper round-trips through a real process", "[auth]") {
     REQUIRE(resp.has_value());
     REQUIRE(resp->type == "auth");
     REQUIRE(*resp->get("credential") == "hello");
+}
+
+// i#625 F10: the helper gets only stdin, stdout and stderr. A pipe the
+// server holds without close-on-exec must not stay open in the child:
+// once the parent closes its write end, the read end sees EOF at once,
+// even with the helper still running.
+TEST_CASE("spawn_helper does not leak the server's fds", "[auth]") {
+    int p[2];
+    REQUIRE(::pipe(p) == 0);  // no FD_CLOEXEC, on purpose
+    std::string err;
+    auto conn = spawn_helper({"cat"}, &err);
+    REQUIRE(conn);
+    ::close(p[1]);
+    pollfd pfd{p[0], POLLIN, 0};
+    REQUIRE(::poll(&pfd, 1, 2000) == 1);  // not a timeout: no writer left
+    char c;
+    REQUIRE(::read(p[0], &c, 1) == 0);  // EOF
+    ::close(p[0]);
+    // The helper itself is still up and answering.
+    HelperMessage q;
+    q.type = "auth";
+    q.set("credential", "still-here");
+    auto resp = conn->request(std::move(q), 2000ms);
+    REQUIRE(resp.has_value());
 }
 
 TEST_CASE("spawn_helper on a bad command reports broken", "[auth]") {

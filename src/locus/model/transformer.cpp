@@ -2379,6 +2379,47 @@ bool TransformerModel::moe_hybrid_touch(MoeHybrid& hy,
     return t.hot;
 }
 
+namespace {
+
+/** One SwiGLU expert on xb into out: gate and up (one pool dispatch),
+ *  silu, down; gate and up hold its ff floats. The per-pick step of
+ *  moe_ffn and of expert_out. */
+void swiglu_expert(const backend::Ops& op, const backend::Mat& wg,
+                   const backend::Mat& wu, const backend::Mat& wd,
+                   std::uint32_t ff, std::span<const float> xb,
+                   std::span<float> gate, std::span<float> up,
+                   std::span<float> out) {
+    const MatvecJob gu[] = {{wg, xb, gate.first(ff)},
+                            {wu, xb, up.first(ff)}};
+    matvec_mt_group(op, gu);
+    backend::silu_mul(gate.first(ff), up.first(ff), gate.first(ff));
+    matvec_mt(op, wd, gate.first(ff), out);
+}
+
+}  // namespace
+
+void TransformerModel::expert_out(std::uint32_t layer, std::uint32_t expert,
+                                  std::span<const float> xb,
+                                  std::span<float> d, Workspace& ws) const {
+    if (layer < layer_begin_ || layer >= layer_end_ ||
+        layers_[layer].gate_exps.base.rows == 0) {
+        throw std::out_of_range("expert_out: no MoE layer " +
+                                std::to_string(layer));
+    }
+    if (expert >= hp_.n_expert) {
+        throw std::out_of_range("expert_out: no expert " +
+                                std::to_string(expert));
+    }
+    if (xb.size() != hp_.n_embd || d.size() != hp_.n_embd) {
+        throw std::invalid_argument("expert_out: xb and d take n_embd");
+    }
+    const Layer& lay = layers_[layer];
+    const backend::Ops op = effective_ops(backend_, q8k_activations());
+    swiglu_expert(op, lay.gate_exps.expert(expert),
+                  lay.up_exps.expert(expert), lay.down_exps.expert(expert),
+                  hp_.n_ff_exp, xb, ws.gate, ws.up, d);
+}
+
 void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
                          std::uint32_t layer) const {
     using namespace locus::backend;
@@ -2473,12 +2514,7 @@ void TransformerModel::moe_ffn(const Layer& lay, Workspace& ws,
     auto swiglu_into_acc = [&](const Mat& wg, const Mat& wu,
                                const Mat& wd, std::uint32_t ff,
                                float wgt) {
-        const MatvecJob gu[] = {{wg, ws.xb, {ws.gate.data(), ff}},
-                                {wu, ws.xb, {ws.up.data(), ff}}};
-        matvec_mt_group(op, gu);
-        silu_mul({ws.gate.data(), ff}, {ws.up.data(), ff},
-                 {ws.gate.data(), ff});
-        matvec_mt(op, wd, {ws.gate.data(), ff}, ws.xb2);
+        swiglu_expert(op, wg, wu, wd, ff, ws.xb, ws.gate, ws.up, ws.xb2);
         for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
             ws.moe_acc[i] += wgt * ws.xb2[i];
         }

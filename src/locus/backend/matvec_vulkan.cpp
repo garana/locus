@@ -2021,6 +2021,56 @@ int batch_invariant_state() {
     }
     return v;
 }
+
+// LOCUS_VK_TRACE (i#682): each forward step prints the path it took,
+// the batch-invariant state, the weight uploads and evictions since the
+// last line, the kernels it dispatched and a hash of each sequence's
+// output, so two runs that should agree can be diffed step by step.
+
+/** @returns FNV-1a over v's bytes. */
+std::uint64_t trace_hash(std::span<const float> v) {
+    std::uint64_t h = 1469598103934665603ull;
+    for (const std::byte b : std::as_bytes(v)) {
+        h = (h ^ static_cast<std::uint8_t>(b)) * 1099511628211ull;
+    }
+    return h;
+}
+
+/** Prints a decline: `path` hands its n tokens to another path. */
+void trace_decline(const char* path, std::uint32_t n, const char* why) {
+    if (VulkanContext::tracing()) {
+        std::fprintf(stderr, "vk-trace: %s n=%u declined: %s\n", path, n,
+                     why);
+    }
+}
+
+/**
+ * Prints the step line of `path` over n tokens: the state, then the
+ * pool's misses and evictions and the kernels since the last step line.
+ * The caller holds state_mu and prints one trace_seq line per sequence
+ * after it.
+ */
+void trace_step(State& s, const char* path, std::uint32_t n) {
+    static std::uint64_t misses = 0, evictions = 0;
+    std::fprintf(stderr,
+                 "vk-trace: %s n=%u inv=%d misses=%llu evictions=%llu "
+                 "kernels=%s\n",
+                 path, n, batch_invariant_state(),
+                 static_cast<unsigned long long>(s.pool.misses_ - misses),
+                 static_cast<unsigned long long>(s.pool.evictions_ -
+                                                 evictions),
+                 s.ctx.take_traced_kernels().c_str());
+    misses = s.pool.misses_;
+    evictions = s.pool.evictions_;
+}
+
+/** Prints one sequence of a step: its position, token and output. */
+void trace_seq(std::uint32_t pos, tok::TokenId token,
+               std::span<const float> out) {
+    std::fprintf(stderr, "vk-trace:   pos=%u tok=%d out=%016llx\n", pos,
+                 static_cast<int>(token),
+                 static_cast<unsigned long long>(trace_hash(out)));
+}
 }  // namespace
 
 void vulkan_set_batch_invariant(bool on) {
@@ -2522,6 +2572,9 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
     const auto& hp = m.hparams();
     std::lock_guard lk(state_mu());
     State& s = state();
+    if (VulkanContext::tracing()) {
+        s.ctx.take_traced_kernels();  // only this step's kernels
+    }
     const bool quant = cache.quantized();
     auto pool_it = s.kv_pools.find(
         quant ? static_cast<const void*>(cache.qpool_data())
@@ -2534,12 +2587,14 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
         static Fallback& f =
             fallback("vulkan", "per_op", "KV pool not GPU-mapped");
         f.add();
+        trace_decline("single", 1, "KV pool not GPU-mapped");
         return false;
     }
     if (!vulkan_forward_supported(m)) {
         static Fallback& f = fallback(
             "vulkan", "per_op", "model shape or weight type unsupported");
         f.add();
+        trace_decline("single", 1, "model unsupported");
         return false;
     }
     const bool mla = hp.arch == model::Arch::kDeepseek2;
@@ -3455,6 +3510,10 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
         s.ctx.read_buffer(s.x,
                           std::as_writable_bytes(out.first(hp.n_embd)));
         s.ctx.note_token();
+        if (VulkanContext::tracing()) {
+            trace_step(s, "single", 1);
+            trace_seq(pos, token, out.first(hp.n_embd));
+        }
         return true;
     }
     norm(m.output_norm(), s.x, s.xb, hp.n_embd, 0);
@@ -3483,6 +3542,12 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
     }
     s.ctx.note_token();
     seq.n_tokens = pos + 1;
+    if (VulkanContext::tracing()) {
+        trace_step(s, "single", 1);
+        trace_seq(pos, token,
+                  row_end == 0 ? out
+                               : out.subspan(row_begin, row_end - row_begin));
+    }
     return true;
 }
 
@@ -3667,6 +3732,7 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
                     kquant(l.wo) || kquant(l.w_gate) || kquant(l.w_up) ||
                     kquant(l.w_down);
          }))) {
+        trace_decline("multi", n, "lone K-quant sequence, device default");
         return false;
     }
     if (n == 0 || n > State::kMultiMax || n > kSmallBatch ||
@@ -3690,10 +3756,14 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
                    (l.gate_inp_shexp.rows > 0 || !short_ok(l.gate_shexp) ||
                     !short_ok(l.up_shexp) || !short_ok(l.down_shexp));
         })) {
+        trace_decline("multi", n, "batch size, cache or model unsupported");
         return false;
     }
     std::lock_guard lk(state_mu());
     State& s = state();
+    if (VulkanContext::tracing()) {
+        s.ctx.take_traced_kernels();  // only this step's kernels
+    }
     // The routed experts need GPU routing (all experts resident) and an
     // id-matmul for their weight types, as vulkan_forward_batch's.
     for (const auto& lay : run) {
@@ -3702,6 +3772,7 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
              matmul_id_kernel(lay.gate_exps.base) == Kernel::kCount_ ||
              matmul_id_kernel(lay.up_exps.base) == Kernel::kCount_ ||
              matmul_id_kernel(lay.down_exps.base) == Kernel::kCount_)) {
+            trace_decline("multi", n, "MoE experts not GPU-routed");
             return false;
         }
     }
@@ -3709,6 +3780,7 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
         s.kv_pools.find(static_cast<const void*>(cache.pool_data()));
     if (pool_it == s.kv_pools.end()) {
         check_pool_device(cache.pool_data());
+        trace_decline("multi", n, "KV pool not GPU-mapped");
         return false;  // cache pool is not GPU-mapped
     }
     for (const auto& st : steps) {
@@ -4005,6 +4077,12 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
                         steps[i].logits.begin());
             s.ctx.note_token();
         }
+        if (VulkanContext::tracing()) {
+            trace_step(s, "multi", n);
+            for (const auto& st : steps) {
+                trace_seq(st.seq->n_tokens, st.token, st.logits.first(E));
+            }
+        }
         return true;
     }
     norm_rows(m.output_norm(), bx, bxb);
@@ -4022,6 +4100,14 @@ bool vulkan_forward_multi_layers(const model::TransformerModel& m,
     std::vector<float> normed_host(std::size_t{n} * E);
     s.ctx.read_buffer(blog, std::as_writable_bytes(std::span(logits_host)));
     s.ctx.read_buffer(bxb, std::as_writable_bytes(std::span(normed_host)));
+    if (VulkanContext::tracing()) {
+        trace_step(s, "multi", n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            trace_seq(steps[i].seq->n_tokens, steps[i].token,
+                      std::span<const float>(logits_host)
+                          .subspan(std::size_t{i} * n_rows, n_rows));
+        }
+    }
     for (std::uint32_t i = 0; i < n; ++i) {
         const auto& st = steps[i];
         std::copy_n(logits_host.begin() + std::size_t{i} * n_rows, n_rows,
@@ -4059,6 +4145,9 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     }
     std::lock_guard lk(state_mu());
     State& s = state();
+    if (VulkanContext::tracing()) {
+        s.ctx.take_traced_kernels();  // only this step's kernels
+    }
     const auto n = static_cast<std::uint32_t>(tokens.size());
     const bool f16 = cache.geometry().kv_type == kv::KvType::kF16;
     const bool mla = hp.arch == model::Arch::kDeepseek2;
@@ -4511,6 +4600,11 @@ bool vulkan_forward_batch(const model::TransformerModel& m,
     s.ctx.read_buffer(blogits, std::as_writable_bytes(logits));
     for (std::uint32_t t = 0; t < n; ++t) {
         s.ctx.note_token();
+    }
+    if (VulkanContext::tracing()) {
+        // pos is the chunk's first position; tok its last token.
+        trace_step(s, "prefill", n);
+        trace_seq(base, tokens.empty() ? -1 : tokens.back(), logits);
     }
     seq.n_tokens = base + n;
     return true;

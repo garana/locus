@@ -324,6 +324,22 @@ class TransformerModel {
     /** @returns A workspace sized for this model. */
     Workspace make_workspace() const;
 
+    /**
+     * One routed MoE expert on xb: gate and up, silu, then down into d,
+     * the steps moe_ffn takes for each pick before weighting it, so d
+     * has the bits moe_ffn adds. An expert host serves this for a
+     * remote token (expert parallelism, #781).
+     *
+     * @param layer An MoE layer of the loaded range.
+     * @param expert Its routed expert, below n_expert.
+     * @param xb The normed hidden state, n_embd floats.
+     * @param d Output, n_embd floats.
+     * @throws std::out_of_range for a layer or expert the model lacks.
+     */
+    void expert_out(std::uint32_t layer, std::uint32_t expert,
+                    std::span<const float> xb, std::span<float> d,
+                    Workspace& ws) const;
+
     /** @returns Paged-cache layers: the loaded slice, or the arch's
      * own count (ArchSpec::cache_layers). */
     std::uint32_t cache_layer_count() const;

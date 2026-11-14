@@ -3,13 +3,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#if defined(__linux__)
-#include <sys/syscall.h>
-#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -21,6 +17,8 @@
 #include <filesystem>
 #include <mutex>
 #include <stdexcept>
+
+#include "locus/sys/child_fds.hpp"
 
 namespace locus::video {
 
@@ -62,27 +60,6 @@ void make_pipe(int fds[2]) {
 void set_nonblocking(int fd) {
     const int flags = ::fcntl(fd, F_GETFL, 0);
     if (flags >= 0) ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-/** One past the highest fd the child may have to close, worked out in
- *  the parent (sysconf and getrlimit are not async-signal-safe). */
-int fd_limit() {
-    rlimit rl{};
-    long n = ::sysconf(_SC_OPEN_MAX);
-    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
-        n = std::max<long>(n, static_cast<long>(rl.rlim_cur));
-    }
-    if (n <= 0) n = 1024;
-    return static_cast<int>(std::min<long>(n, 1L << 20));
-}
-
-/** Closes every fd from 3 up in the child, so it does not hold
- *  locus's sockets; async-signal-safe calls only. */
-void close_from_3(int limit) {
-#if defined(__linux__) && defined(SYS_close_range)
-    if (::syscall(SYS_close_range, 3U, ~0U, 0U) == 0) return;
-#endif
-    for (int fd = 3; fd < limit; ++fd) ::close(fd);
 }
 
 /** Reads what is ready on fd into s (up to cap bytes kept); @returns
@@ -156,7 +133,7 @@ ProcessResult run_process(
     std::vector<char*> args;
     for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
     args.push_back(nullptr);
-    const int limit = fd_limit();
+    const int limit = sys::child_fd_limit();
 
     int in[2] = {-1, -1}, out[2] = {-1, -1}, err[2] = {-1, -1};
     const auto close_all = [&] {
@@ -185,7 +162,7 @@ ProcessResult run_process(
         ::dup2(in[0], 0);
         ::dup2(out[1], 1);
         ::dup2(err[1], 2);
-        close_from_3(limit);
+        sys::close_fds_from_3(limit);
         // A signal mask survives exec: locus-server blocks SIGINT and
         // SIGTERM for its stopper thread, and ffmpeg must get them.
         sigset_t none;
