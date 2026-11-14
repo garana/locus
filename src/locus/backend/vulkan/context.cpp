@@ -842,6 +842,14 @@ const KernelDesc& kernel_desc(Kernel k) {
 constexpr std::uint32_t kV3dSplitGroups = 32;
 
 /**
+ * The same for the matvec kernels (decode and short batches), whose
+ * workgroups each read a few weight rows: 1024 of them run for a few
+ * ms, and a budget of 32 cost a 1B decode 10% on V3D (the head alone
+ * is about 32000 workgroups), against nothing at 1024.
+ */
+constexpr std::uint32_t kV3dSplitMatvecGroups = 1024;
+
+/**
  * @returns Whether SPIR-V `spv` (`bytes` long) reads the NumWorkgroups
  * built-in (gl_NumWorkGroups): a grid-stride kernel, whose grid must
  * stay one dispatch.
@@ -867,14 +875,15 @@ bool spv_reads_num_workgroups(const std::uint32_t* spv, std::size_t bytes) {
 /**
  * Records a gx x gy x gz grid. With a budget `split` (V3D) it goes as
  * vkCmdDispatchBase pieces of at most `split` workgroups each, x first,
- * then y; a `whole` kernel (one that reads gl_NumWorkGroups) and a grid
- * within the budget go as one dispatch. Each piece sees the same
+ * then y; budget 0 (a kernel that reads gl_NumWorkGroups, or another
+ * device) and a grid within the budget go as one dispatch. z is never
+ * split: every kernel's grid has gz 1. Each piece sees the same
  * gl_WorkGroupID as in the whole grid, so the results are the same.
  */
-void record_grid(VkCommandBuffer cmd, std::uint32_t split, bool whole,
-                 std::uint32_t gx, std::uint32_t gy, std::uint32_t gz) {
+void record_grid(VkCommandBuffer cmd, std::uint32_t split, std::uint32_t gx,
+                 std::uint32_t gy, std::uint32_t gz) {
     const std::uint64_t column = std::uint64_t{gy} * gz;  // one x step
-    if (split == 0 || whole || column * gx <= split) {
+    if (split == 0 || column * gx <= split) {
         vkCmdDispatch(cmd, gx, gy, gz);
         return;
     }
@@ -939,8 +948,11 @@ struct VulkanContext::Impl {
      *  dispatches, each its own job (i#682): the kernel's v3d driver
      *  resets the GPU when it takes a long compute job for a hang, and
      *  that job's remaining workgroups are lost without an error. 0:
-     *  whole grids (other devices). LOCUS_VK_SPLIT=N overrides. */
+     *  whole grids (other devices). LOCUS_VK_SPLIT=N overrides, for
+     *  every kernel (`split_forced`); else matvec kernels take
+     *  kV3dSplitMatvecGroups. */
     std::uint32_t split_groups = 0;
+    bool split_forced = false;
 
     /**
      * Descriptor sets cached by (kernel, buffers): a decode token
@@ -1023,9 +1035,10 @@ struct VulkanContext::Impl {
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
         bool small = false;  ///< built from the kernel's alt_spv
-        /** The shader reads gl_NumWorkGroups (a grid-stride loop), so its
-         *  grid is never split (split_groups). */
-        bool whole = false;
+        /** This kernel's split budget (record_grid): 0 when its shader
+         *  reads gl_NumWorkGroups (a grid-stride loop) or the split is
+         *  off. */
+        std::uint32_t split = 0;
     };
     Pipe pipes[static_cast<int>(Kernel::kCount_)];
 
@@ -1432,6 +1445,7 @@ struct VulkanContext::Impl {
                 e != nullptr ? std::string_view(e) != "0"
                              : device_name.find("V3D") == std::string::npos;
             const char* sp = std::getenv("LOCUS_VK_SPLIT");
+            split_forced = sp != nullptr;
             split_groups =
                 sp != nullptr
                     ? static_cast<std::uint32_t>(std::strtoul(sp, nullptr, 10))
@@ -1582,7 +1596,12 @@ struct VulkanContext::Impl {
         if (split_groups > 0) {
             cpci.flags = VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
         }
-        p.whole = spv_reads_num_workgroups(spv, spv_bytes);
+        p.split = split_groups == 0 || spv_reads_num_workgroups(spv, spv_bytes)
+                      ? 0
+                  : !split_forced &&
+                          std::string_view(kd.name).starts_with("matvec")
+                      ? kV3dSplitMatvecGroups
+                      : split_groups;
         check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1,
                                        &cpci, nullptr,
                                        &p.pipeline),
@@ -1992,8 +2011,8 @@ void VulkanContext::dispatch(Kernel k,
     vkCmdPushConstants(im.batch_cmd, p.layout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        kd.push_bytes, push.data());
-    record_grid(im.batch_cmd, im.split_groups, p.whole, groups_x, groups_y,
-                groups_z);
+    record_grid(im.batch_cmd, p.split, groups_x, groups_y, groups_z);
+    // One per dispatch() call: a split grid's pieces count as one.
     ++im.prof.dispatches;
     ++im.batch_dispatches;
     if (tracing()) {

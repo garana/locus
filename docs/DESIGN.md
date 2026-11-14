@@ -566,8 +566,11 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   (i#682). So there a grid of more than 32 workgroups is recorded as
   several `vkCmdDispatchBase` pieces, each its own short job, except
   for kernels that read `gl_NumWorkGroups` (found in their SPIR-V);
-  the pieces see the same workgroup ids, so the results are the same
-  (`LOCUS_VK_SPLIT=N` sets the budget, 0 turns it off). Under the
+  the pieces see the same workgroup ids, so the results are the same.
+  The matvec kernels take a budget of 1024, as their workgroups are
+  short (32 cost a 1B decode 10%; 1024 costs nothing measurable).
+  `LOCUS_VK_SPLIT=N` sets one budget for every kernel, 0 turns it off.
+  Under the
   default a lone
   sequence on a Q4_K or Q6_K model keeps it too (the K-quant
   short-batch kernels cost it 9 to 11% on an M2 Pro), so such a model
