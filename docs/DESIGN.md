@@ -567,8 +567,11 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   several `vkCmdDispatchBase` pieces, each its own short job, except
   for kernels that read `gl_NumWorkGroups` (found in their SPIR-V);
   the pieces see the same workgroup ids, so the results are the same.
-  The matvec kernels take a budget of 1024, as their workgroups are
-  short (32 cost a 1B decode 10%; 1024 costs nothing measurable).
+  The one-token matvec kernels take a budget of 1024, as their
+  workgroups are short (32 cost a 1B decode 10%; 1024 costs nothing
+  measurable), and the multi-token builds less, by their work per
+  workgroup (512 for NT 2, 256 for NT 4, 128 for NT 8 and the batched,
+  pair and shared-expert ones).
   `LOCUS_VK_SPLIT=N` sets one budget for every kernel, 0 turns it off.
   Under the
   default a lone
