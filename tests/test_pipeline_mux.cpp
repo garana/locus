@@ -1792,9 +1792,9 @@ TEST_CASE("serve_stage_mux applies --allow to the metrics port",
 
 // i#849: with a key, the stage proves itself and checks its peers on
 // both sides of the loop: a client that holds the key gets the same
-// tokens as one process; a client with another key, a downstream with
-// another key, and a client that never answers each lose only their own
-// session.
+// tokens as one process; a client with another key, one that floods in
+// place of an answer, a downstream with another key, and a client that
+// never answers each lose only their own session.
 TEST_CASE("serve_stage_mux runs the key handshake on input and dial",
           "[pipeline][mux][e2e][handshake]") {
     if (!std::filesystem::exists(model_path())) {
@@ -1823,7 +1823,7 @@ TEST_CASE("serve_stage_mux runs the key handshake on input and dial",
     conn.key = key;
     conn.handshake_timeout_ms = 300;
     conn.reconnect_attempts = 1;  // a refused downstream drops at once
-    conn.serve_sessions = 4;
+    conn.serve_sessions = 5;
     std::atomic<int> sres{-1};
     std::jthread server([&] {
         sres = locus::pipeline::serve_stage_mux(
@@ -1870,6 +1870,30 @@ TEST_CASE("serve_stage_mux runs the key handshake on input and dial",
     REQUIRE_FALSE(locus::pipeline::handshake_connect(b, other, 2000));
     REQUIRE(closed_by_stage(b));
     ::close(b);
+    REQUIRE(locus::pipeline::accept_one(lc, nullptr, 200) < 0);  // no dial
+
+    // 2b. A client that streams 1 MiB in place of an answer: the stage
+    // reads only the answer's 56 bytes, refuses them, and never dials.
+    const int f = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(f >= 0);
+    {
+        std::jthread flood([f] {
+            const std::string junk(1 << 20, 'j');
+            std::size_t off = 0;
+            while (off < junk.size()) {
+                const ssize_t n = ::send(f, junk.data() + off,
+                                         junk.size() - off, MSG_NOSIGNAL);
+                if (n <= 0) {
+                    return;  // the stage closed the connection
+                }
+                off += static_cast<std::size_t>(n);
+            }
+        });
+        REQUIRE(closed_by_stage(f));
+        ::shutdown(f, SHUT_RDWR);  // ends a send still blocked
+    }
+    ::close(f);
+    REQUIRE(locus::pipeline::accept_one(lc, nullptr, 200) < 0);
 
     // 3. A downstream with another key: the stage drops the session.
     const int c = locus::pipeline::connect_to("127.0.0.1", ps);
@@ -1891,5 +1915,5 @@ TEST_CASE("serve_stage_mux runs the key handshake on input and dial",
 
     server.join();
     ::close(lc);
-    REQUIRE(sres.load() == 0);  // sessions 2 to 4 ended unclean
+    REQUIRE(sres.load() == 0);  // sessions 2 to 5 ended unclean
 }
