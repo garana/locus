@@ -28,7 +28,23 @@ struct Context::Impl {
     id<MTLCommandQueue> queue = nil;
     std::string name;
     std::unordered_map<std::string, id<MTLComputePipelineState>> kernels;
+    // The open batch (nil when none).
+    id<MTLCommandBuffer> batch = nil;
+    id<MTLComputeCommandEncoder> enc = nil;
 };
+
+namespace {
+
+void finish(id<MTLCommandBuffer> cb, std::string_view what) {
+    [cb commit];
+    [cb waitUntilCompleted];
+    if ([cb status] != MTLCommandBufferStatusCompleted) {
+        throw std::runtime_error("metal: " + std::string(what) + ": " +
+                                 ns_error([cb error]));
+    }
+}
+
+}  // namespace
 
 bool Context::usable() {
     static const bool ok = [] {
@@ -133,6 +149,30 @@ bool Context::has_kernel(std::string_view name) const {
     return impl_->kernels.count(std::string(name)) != 0;
 }
 
+void Context::begin_batch() {
+    if (impl_->batch != nil) {
+        throw std::logic_error("metal: a batch is already open");
+    }
+    impl_->batch = [impl_->queue commandBuffer];
+    impl_->enc = [impl_->batch
+        computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+}
+
+bool Context::batch_open() const { return impl_->batch != nil; }
+
+void Context::end_batch() {
+    if (impl_->batch == nil) {
+        throw std::logic_error("metal: no open batch");
+    }
+    id<MTLCommandBuffer> cb = impl_->batch;
+    [impl_->enc endEncoding];
+    impl_->enc = nil;
+    impl_->batch = nil;
+    @autoreleasepool {
+        finish(cb, "batch");
+    }
+}
+
 void Context::dispatch(std::string_view name, std::span<const Arg> args,
                        std::span<const std::byte> params,
                        std::uint32_t threads, std::uint32_t group) {
@@ -151,8 +191,11 @@ void Context::dispatch(std::string_view name, std::span<const Arg> args,
         return;
     }
     @autoreleasepool {
-        id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        const bool alone = impl_->batch == nil;
+        id<MTLCommandBuffer> cb =
+            alone ? [impl_->queue commandBuffer] : impl_->batch;
+        id<MTLComputeCommandEncoder> enc =
+            alone ? [cb computeCommandEncoder] : impl_->enc;
         [enc setComputePipelineState:pso];
         NSUInteger i = 0;
         for (const Arg& a : args) {
@@ -166,12 +209,9 @@ void Context::dispatch(std::string_view name, std::span<const Arg> args,
         [enc dispatchThreadgroups:MTLSizeMake((threads + group - 1) / group,
                                               1, 1)
             threadsPerThreadgroup:MTLSizeMake(group, 1, 1)];
-        [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
-        if ([cb status] != MTLCommandBufferStatusCompleted) {
-            throw std::runtime_error("metal: " + std::string(name) + ": " +
-                                     ns_error([cb error]));
+        if (alone) {
+            [enc endEncoding];
+            finish(cb, name);
         }
     }
 }

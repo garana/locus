@@ -81,8 +81,27 @@ class Context {
     bool has_kernel(std::string_view name) const;
 
     /**
+     * Opens a batch: dispatches record into one command buffer, each
+     * ordered after the one before (a serial encoder, so a dispatch
+     * sees every earlier one's writes), until end_batch().
+     * @throws std::logic_error when a batch is already open.
+     */
+    void begin_batch();
+
+    /** @returns Whether a batch is open. */
+    bool batch_open() const;
+
+    /**
+     * Submits the open batch and waits for it.
+     * @throws std::logic_error without an open batch;
+     *     std::runtime_error when the command buffer fails.
+     */
+    void end_batch();
+
+    /**
      * Runs kernel `name` over `threads` threads (a 1-D grid, in
-     * threadgroups of `group` threads) and waits for it. Buffers bind
+     * threadgroups of `group` threads): recorded into the open batch,
+     * or, without one, submitted alone and waited for. Buffers bind
      * at indices 0 .. args.size() - 1, then `params` (if any) as a
      * constant block at index args.size().
      * @throws std::invalid_argument for an unknown kernel or a group
