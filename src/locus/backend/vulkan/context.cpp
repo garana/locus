@@ -31,6 +31,10 @@ std::uint32_t VulkanContext::v3d_split_budget(std::string_view name) {
     // The one-token matvec builds (decode, and NT 1): on V3D one 1B
     // head workgroup runs about 10 us (32064 of them take 331 ms whole),
     // so 1024 run about 11 ms; 32 cost a 1B decode 10%, 1024 nothing.
+    // The budgets count workgroups, and a matvec workgroup's time grows
+    // with its row length: they assume rows of up to about 8k columns
+    // (a 70B's 8192 makes a 1024 piece about 45 ms, still far under the
+    // driver's 500 ms).
     constexpr std::uint32_t kOneToken = 1024;
     if (!name.starts_with("matvec_")) {
         return kV3dSplitGroups;
