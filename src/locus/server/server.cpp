@@ -898,6 +898,12 @@ bool has_image_part(const json& content, bool anthropic) {
     return false;
 }
 
+/** Most images one chat request may carry. Each is decoded (up to 4096 x
+ *  4096) and run through the vision tower before the prompt length is
+ *  known, so the count is capped up front; Janus-Pro spends 576 tokens on
+ *  each, so its context holds few more than this anyway. */
+constexpr std::size_t kMaxChatImages = 8;
+
 /**
  * One turn's text from its content: text parts as they are, each image
  * as the placeholder, joined by "\n" (the reference's
@@ -929,6 +935,11 @@ std::string vision_turn_text(const json& content, bool anthropic,
             if (!allow_images) {
                 throw std::invalid_argument(
                     "images are only accepted in user messages");
+            }
+            if (images.size() >= kMaxChatImages) {
+                throw std::invalid_argument(
+                    "at most " + std::to_string(kMaxChatImages) +
+                    " images per request");
             }
             if (anthropic) {
                 const json& src = p.at("source");
