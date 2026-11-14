@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
-#include <functional>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -16,6 +15,17 @@ namespace {
 constexpr std::uint32_t kMaxRepeat = 4096;
 /** No unbounded upper limit in {m,n}. */
 constexpr std::uint32_t kInf = std::numeric_limits<std::uint32_t>::max();
+/** Groups nested deeper than this, in a grammar or a regex, are
+ *  rejected: the parsers recurse once per level (i#625 F1). */
+constexpr int kMaxNesting = 64;
+/** A grammar whose rules hold more items than this is rejected: each
+ *  repetition copies its unit up to kMaxRepeat times. */
+constexpr std::size_t kMaxItems = std::size_t{1} << 20;
+/** Most stacks one step's expansion may visit; past it the rest are
+ *  dropped and the state is truncated, like a stack past kMaxStacks.
+ *  Nested optional repetitions can otherwise make one byte cost
+ *  millions of visits. */
+constexpr std::size_t kMaxExpandVisits = std::size_t{1} << 18;
 /** States that dropped stacks past the cap (gbnf_stack_overflows). */
 std::atomic<std::uint64_t> stack_overflows{0};
 
@@ -275,12 +285,17 @@ class GbnfBuilder {
             return {it};
         }
         if (c == '(') {
+            if (++depth_ > kMaxNesting) {
+                fail("groups nested deeper than " +
+                     std::to_string(kMaxNesting) + " levels");
+            }
             ++p_;
             skip_ws(true);
             Alts a = parse_alts(true);
             skip_ws(true);
             if (p_ >= t_.size() || t_[p_] != ')') fail("expected )");
             ++p_;
+            --depth_;
             return {ref_item(fresh(std::move(a)))};
         }
         if (is_name_char(c)) {
@@ -368,6 +383,9 @@ class GbnfBuilder {
 
     Seq repeat(Seq unit, std::uint32_t lo, std::uint32_t hi) {
         if (unit.empty()) return {};
+        // lo copies, then two items per optional (or two for x R).
+        items_ += lo + 2 * (hi == kInf ? 1 : hi - lo);
+        if (items_ > kMaxItems) fail("grammar too large");
         const Item x =
             unit.size() == 1 ? unit[0] : ref_item(fresh({std::move(unit)}));
         Seq out(lo, x);
@@ -422,10 +440,23 @@ class GbnfBuilder {
                 }
             }
         }
+        // A depth-first search for a cycle in first[], with an explicit
+        // stack of (rule, next edge): a chain of thousands of rules would
+        // overflow the thread's stack as recursion (i#625 F1).
         std::vector<int> color(n, 0);  // 0 new, 1 on path, 2 done
-        std::function<void(std::uint32_t)> visit = [&](std::uint32_t r) {
-            color[r] = 1;
-            for (const std::uint32_t s : first[r]) {
+        std::vector<std::pair<std::uint32_t, std::size_t>> path;
+        for (std::uint32_t root = 0; root < n; ++root) {
+            if (color[root] != 0) continue;
+            color[root] = 1;
+            path.push_back({root, 0});
+            while (!path.empty()) {
+                auto& [r, k] = path.back();
+                if (k == first[r].size()) {
+                    color[r] = 2;
+                    path.pop_back();
+                    continue;
+                }
+                const std::uint32_t s = first[r][k++];
                 if (color[s] == 1) {
                     throw std::invalid_argument(
                         "grammar: left recursion through rule '" +
@@ -433,12 +464,11 @@ class GbnfBuilder {
                         "' (or a repetition of something that can be "
                         "empty)");
                 }
-                if (color[s] == 0) visit(s);
+                if (color[s] == 0) {
+                    color[s] = 1;
+                    path.push_back({s, 0});
+                }
             }
-            color[r] = 2;
-        };
-        for (std::uint32_t r = 0; r < n; ++r) {
-            if (color[r] == 0) visit(r);
         }
     }
 
@@ -480,6 +510,8 @@ class GbnfBuilder {
 
     std::string_view t_;
     std::size_t p_ = 0;
+    int depth_ = 0;          ///< groups open at p_
+    std::size_t items_ = 0;  ///< items the repetitions added
     std::vector<Alts> rules_;
     std::vector<std::string> names_;
     std::vector<bool> defined_;
@@ -525,8 +557,9 @@ GbnfMatcher::GbnfMatcher(std::shared_ptr<const Gbnf> g,
                          std::size_t max_stacks)
     : g_(std::move(g)), max_stacks_(std::max<std::size_t>(max_stacks, 1)) {
     cur_.assign(1, g_->start());
-    expand(cur_, stacks_, 0);
-    truncated_ = dedup(stacks_);
+    std::size_t budget = kMaxExpandVisits;
+    const bool cut = expand(cur_, stacks_, budget);
+    truncated_ = dedup(stacks_) || cut;
     if (truncated_) count_overflow();
 }
 
@@ -534,37 +567,49 @@ std::uint64_t gbnf_stack_overflows() {
     return stack_overflows.load(std::memory_order_relaxed);
 }
 
-void GbnfMatcher::expand(std::vector<std::uint32_t>& cur, Stacks& out,
-                         int depth) const {
-    if (depth > 10000) return;  // unreachable after the left-rec check
-    if (cur.empty()) {
-        out.push(cur);
-        return;
-    }
+bool GbnfMatcher::expand(const std::vector<std::uint32_t>& cur, Stacks& out,
+                         std::size_t& budget) const {
+    // Each stack on the worklist either ends (empty: the input may stop
+    // here) or tops on a character element, and goes to `out`, or tops
+    // on a rule reference and is replaced by one stack per alternative.
+    // The left-recursion check guarantees this ends; the order of `out`
+    // does not matter (dedup sorts it).
     const auto& el = g_->elems();
-    const std::uint32_t p = cur.back();
-    if (el[p].kind == Gbnf::Elem::kChar) {
-        out.push(cur);
-        return;
-    }
-    // A rule reference: continue after it, then enter each alternative.
-    // When the reference ends its sequence the caller's frame is
-    // dropped first, so a repetition does not grow the stack. `cur` is
-    // edited in place and restored before returning.
-    cur.pop_back();
-    const bool cont = el[p + 1].kind != Gbnf::Elem::kEnd;
-    if (cont) cur.push_back(p + 1);
-    for (const std::uint32_t a : g_->alts(el[p].ref)) {
-        if (el[a].kind != Gbnf::Elem::kEnd) {
-            cur.push_back(a);
-            expand(cur, out, depth + 1);
-            cur.pop_back();
-        } else {
-            expand(cur, out, depth + 1);
+    work_.clear();
+    work_.push(cur);
+    while (work_.size() > 0) {
+        if (budget == 0) {
+            work_.clear();
+            return true;
+        }
+        --budget;
+        const std::size_t last = work_.size() - 1;
+        top_.assign(work_.data.begin() + work_.begin(last),
+                    work_.data.begin() + work_.ends[last]);
+        work_.data.resize(work_.begin(last));
+        work_.ends.pop_back();
+        if (top_.empty() || el[top_.back()].kind == Gbnf::Elem::kChar) {
+            out.push(top_);
+            continue;
+        }
+        // A rule reference: continue after it, then enter each
+        // alternative. When the reference ends its sequence the caller's
+        // frame is dropped first, so a repetition does not grow the
+        // stack.
+        const std::uint32_t p = top_.back();
+        top_.pop_back();
+        if (el[p + 1].kind != Gbnf::Elem::kEnd) top_.push_back(p + 1);
+        for (const std::uint32_t a : g_->alts(el[p].ref)) {
+            if (el[a].kind != Gbnf::Elem::kEnd) {
+                top_.push_back(a);
+                work_.push(top_);
+                top_.pop_back();
+            } else {
+                work_.push(top_);
+            }
         }
     }
-    if (cont) cur.pop_back();
-    cur.push_back(p);
+    return false;
 }
 
 bool GbnfMatcher::dedup(Stacks& s) const {
@@ -680,16 +725,18 @@ bool GbnfMatcher::step(std::uint8_t b, GbnfMatcher& out) const {
     }
     const auto& el = g_->elems();
     out.stacks_.clear();
-    for (std::size_t i = 0; i < stacks_.size(); ++i) {
+    std::size_t budget = kMaxExpandVisits;
+    bool cut = false;
+    for (std::size_t i = 0; i < stacks_.size() && !cut; ++i) {
         const std::uint32_t s = stacks_.begin(i), e = stacks_.ends[i];
         if (s == e || !g_->matches(stacks_.data[e - 1], cp)) continue;
         cur_.assign(stacks_.data.begin() + s, stacks_.data.begin() + e - 1);
         const std::uint32_t p = stacks_.data[e - 1] + 1;
         if (el[p].kind != Gbnf::Elem::kEnd) cur_.push_back(p);
-        expand(cur_, out.stacks_, 0);
+        cut = expand(cur_, out.stacks_, budget);
     }
     if (out.stacks_.size() == 0) return false;
-    out.truncated_ = dedup(out.stacks_) || truncated_;
+    out.truncated_ = dedup(out.stacks_) || truncated_ || cut;
     out.cp_ = 0;
     out.need_ = 0;
     out.len_ = 0;
@@ -825,6 +872,10 @@ class RegexToGbnf {
     std::string atom() {
         const char c = re_[p_];
         if (c == '(') {
+            if (++depth_ > kMaxNesting) {
+                fail("groups nested deeper than " +
+                     std::to_string(kMaxNesting) + " levels");
+            }
             ++p_;
             if (p_ < re_.size() && re_[p_] == '?') {
                 if (p_ + 1 < re_.size() && re_[p_ + 1] == ':') {
@@ -836,6 +887,7 @@ class RegexToGbnf {
             std::string inner = alts();
             if (p_ >= re_.size() || re_[p_] != ')') fail("expected )");
             ++p_;
+            --depth_;
             return "(" + (inner.empty() ? std::string("\"\"") : inner) + ")";
         }
         if (c == '[') return char_class();
@@ -1022,6 +1074,7 @@ class RegexToGbnf {
     std::string_view re_;
     std::size_t p_ = 0;
     bool js_ = false;
+    int depth_ = 0;  ///< groups open at p_
 };
 
 }  // namespace
