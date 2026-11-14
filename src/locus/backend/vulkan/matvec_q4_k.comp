@@ -1,6 +1,7 @@
 #version 450
 
-// Q4_K matvec: 144-byte super-blocks of 256 elements -- f16 d and
+// Q4_K matvec (and Q3_K with -DTYPE_Q3K, see below): 144-byte
+// super-blocks of 256 elements -- f16 d and
 // dmin, 12 packed 6-bit scale/min pairs, 128 nibble bytes. Sub-block
 // s = 2j + h (h = 0 low nibbles, 1 high) of super-block b covers the
 // 32 elements 64j + 32h .. of the block, from bytes 32j .. 32j + 31.
@@ -48,6 +49,15 @@
 // route[(p / kp) * r_stride + p % kp] with token p / kp's x row, writing
 // row p; matvec_q4_k_p runs workgroup y = token t, summing its kp
 // experts (x rows t * kp + j) weighted into output row t.
+
+// With -DTYPE_Q3K (matvec_q3_k and its _b / _glu / _seg builds,
+// i#173) the rows are Q3_K: 110-byte super-blocks -- hmask[32] |
+// qs[64] | scales[12] | f16 d, value d * (scale - 32) * (2-bit quant -
+// (high bit clear ? 4 : 0)), a 6-bit scale per 16 elements (cpu_ops
+// dequant_block_q3_k). A lane takes half-blocks (128 elements): the
+// half's 32 quant bytes and the block's 32 hmask bytes as words once,
+// then the four 2-bit passes from registers, two values per f16
+// unpack. Every other build option works as for Q4_K.
 
 #define LANES 16u
 #define ROWS 8u
@@ -207,6 +217,91 @@ vec4 xload(uint xk, bool xal) {
                : vec4(x[xk], x[xk + 1u], x[xk + 2u], x[xk + 3u]);
 }
 
+#ifdef TYPE_Q3K
+/** Scale group g's 6-bit scale minus 32, from the 12 bytes s0 s1 s2. */
+float q3_scale(uint s0, uint s1, uint s2, uint g) {
+    uint i = g & 3u;
+    uint grp = g >> 2;
+    uint wd = (grp & 1u) == 0u ? s0 : s1;
+    uint b = (wd >> (8u * i)) & 0xffu;
+    uint lo = grp < 2u ? (b & 0xfu) : (b >> 4);
+    uint hi = (s2 >> (8u * i + 2u * grp)) & 3u;
+    return float(int(lo | (hi << 4)) - 32);
+}
+
+/**
+ * The word at byte offset 4i + sh / 8 (sh 0 or 16) from the aligned
+ * words lo (i) and hi (i + 1): a 110-byte Q3_K block starts on a 2-byte
+ * boundary, so every other block's words straddle two aligned ones.
+ */
+uint q3_join(uint lo, uint hi, uint sh) {
+    return sh == 0u ? lo : (lo >> 16u) | (hi << 16u);
+}
+
+/**
+ * sum(q * x) over the 4 elements of quant word qw and hmask word hw at
+ * 2-bit field j, hmask bit hb: each value is (q >> 2j & 3) + 4 h - 4,
+ * the bytes 0..7 decoded two at a time through an f16 mantissa.
+ */
+float q3w(uint qw, uint hw, uint j, uint hb, vec4 xv) {
+    uint u = ((qw >> (2u * j)) & 0x03030303u) |
+             (((hw >> hb) & 0x01010101u) << 2u);
+    vec2 v02 = unpackHalf2x16((u & 0x00ff00ffu) | 0x64006400u);
+    vec2 v13 = unpackHalf2x16(((u >> 8u) & 0x00ff00ffu) | 0x64006400u);
+    vec4 qv = vec4(v02.x, v13.x, v02.y, v13.y) - 1028.0;
+    return dot(qv, xv);
+}
+
+/** This lane's share of dot(row r of the Q3_K matrix at wbase, x). */
+float row_part(uint wbase, uint xbase, uint r, uint lane, bool up) {
+    uint nb = pc.cols / 256u;
+    uint rb = wbase + r * nb * 110u;
+    bool xal = (xbase & 3u) == 0u;
+    float acc = 0.0;
+    for (uint u = lane; u < nb * 2u; u += LANES) {
+        uint b = u >> 1;
+        uint n = u & 1u;  // half: elements 128n .. 128n + 127
+        uint at = rb + b * 110u;
+        // Aligned words from at & ~3, joined pairwise when at % 4 == 2.
+        // The last one read (word 27) is the one holding d, the word
+        // the byte-wise reads of d took before.
+        uint ib = at >> 2;
+        uint sh = (at & 2u) * 8u;
+        uint qw[8], hw[8];
+        uint hlo = wword(ib, up), qlo = wword(ib + 8u + 8u * n, up);
+        for (uint k = 0u; k < 8u; ++k) {
+            uint hhi = wword(ib + k + 1u, up);
+            uint qhi = wword(ib + 9u + 8u * n + k, up);
+            hw[k] = q3_join(hlo, hhi, sh);
+            qw[k] = q3_join(qlo, qhi, sh);
+            hlo = hhi;
+            qlo = qhi;
+        }
+        uint w24 = wword(ib + 24u, up), w25 = wword(ib + 25u, up);
+        uint w26 = wword(ib + 26u, up), w27 = wword(ib + 27u, up);
+        uint s0 = q3_join(w24, w25, sh), s1 = q3_join(w25, w26, sh);
+        uint s2 = q3_join(w26, w27, sh);
+        float d = unpackHalf2x16(sh == 0u ? w27 : w27 >> 16u).x;
+        uint xi = xbase + b * 256u + n * 128u;
+        float s = 0.0;
+        for (uint j = 0u; j < 4u; ++j) {
+            uint hb = 4u * n + j;
+            float g0 = 0.0, g1 = 0.0;
+            for (uint k = 0u; k < 4u; ++k) {
+                g0 += q3w(qw[k], hw[k], j, hb,
+                          xload(xi + 32u * j + 4u * k, xal));
+                g1 += q3w(qw[k + 4u], hw[k + 4u], j, hb,
+                          xload(xi + 32u * j + 16u + 4u * k, xal));
+            }
+            uint g = 8u * n + 2u * j;
+            s += q3_scale(s0, s1, s2, g) * g0 +
+                 q3_scale(s0, s1, s2, g + 1u) * g1;
+        }
+        acc += d * s;
+    }
+    return acc;
+}
+#else
 /**
  * This lane's share of dot(row r of the matrix at wbase, x): per
  * sub-block pair, the 16-byte header, 32 nibble bytes and 16 vec4
@@ -253,6 +348,8 @@ float row_part(uint wbase, uint xbase, uint r, uint lane, bool up) {
     }
     return acc;
 }
+
+#endif
 
 #ifdef SEGMENTS
 /**

@@ -89,6 +89,33 @@ struct SseKeepalive {
     }
 };
 
+/**
+ * Writes one step of a generation's SSE stream: payload, or a keepalive
+ * when one is due. When the client has gone, cancels the generation and
+ * drops its record (both no-ops if the terminal path already released
+ * it).
+ *
+ * @param terminal Whether this is the stream's last step; the sink is
+ *     then closed.
+ * @returns false when the stream is over: the client went away, or
+ *     terminal.
+ */
+bool write_sse_step(http::Sink& sink, SseKeepalive& ka, std::string& payload,
+                    EngineLoop& loop, std::uint64_t id, bool terminal) {
+    ka.pad(payload);
+    if (!payload.empty() &&
+        !sink.write(std::string_view(payload.data(), payload.size()))) {
+        loop.cancel(id);
+        loop.release(id);
+        return false;
+    }
+    if (terminal) {
+        sink.done();
+        return false;
+    }
+    return true;
+}
+
 /** The GPU ops for the embedding and rerank models' large passes
  *  (EmbeddingModel::kGpuMacs): the Vulkan image ops where the GPU
  *  imports host memory, as for PixArt (the weights stay in the GGUF
@@ -149,6 +176,42 @@ void set_unavailable(http::ServerResponse& res, const std::string& message,
                                     {"type", "server_error"}}}}
                         .dump(-1, ' ', false, kLossy),
                     "application/json");
+}
+
+/**
+ * Takes the image lock without waiting. An image takes minutes, so when
+ * another image or video holds it, a request gets a 503 instead of
+ * holding a server thread in a queue.
+ *
+ * @param retry_after_s The Retry-After of that 503, in seconds.
+ * @returns The lock; when it does not own mu, res holds the 503.
+ */
+std::unique_lock<std::mutex> try_image_lock(std::mutex& mu,
+                                            http::ServerResponse& res,
+                                            int retry_after_s) {
+    std::unique_lock<std::mutex> lk(mu, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        set_unavailable(res,
+                        "an image or video is already being generated; "
+                        "retry later",
+                        retry_after_s);
+    }
+    return lk;
+}
+
+/** Fills res with an OpenAI images reply: one PNG, base64-encoded. */
+void set_png_reply(http::ServerResponse& res,
+                   std::span<const std::byte> png) {
+    const auto created = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now()
+                                 .time_since_epoch())
+                             .count();
+    res.set_content(
+        json{{"created", created},
+             {"data",
+              json::array({json{{"b64_json", http::base64_encode(png)}}})}}
+            .dump(-1, ' ', false, kLossy),
+        "application/json");
 }
 
 /**
@@ -913,6 +976,20 @@ std::uint32_t read_max_tokens(const json& body, std::uint32_t cap,
             std::min<std::uint64_t>(v.get<std::uint64_t>(), cap));
     }
     return dflt;
+}
+
+/**
+ * The sampling seed of a generation body: its seed, or a random one when
+ * the body sets none.
+ *
+ * @throws std::invalid_argument when seed is not an integer.
+ */
+std::uint64_t read_seed(const json& body) {
+    if (!body.contains("seed")) return std::random_device{}();
+    if (!body["seed"].is_number_integer()) {
+        throw std::invalid_argument("seed must be an integer");
+    }
+    return static_cast<std::uint64_t>(body["seed"].get<std::int64_t>());
 }
 
 /**
@@ -2263,19 +2340,8 @@ void OpenAiServer::install_routes() {
                     // engine record (the provider won't run again).
                     loop_.release(id);
                 }
-                ka.pad(payload);
-                if (!payload.empty() &&
-                    !sink.write(std::string_view(payload.data(),
-                                                 payload.size()))) {
-                    // Client vanished mid-stream: stop the generation
-                    // and drop the record (both no-ops if the terminal
-                    // path above already released it).
-                    loop_.cancel(id);
-                    loop_.release(id);
-                    return;
-                }
-                if (terminal) {
-                    sink.done();
+                if (!write_sse_step(sink, ka, payload, loop_, id,
+                                    terminal)) {
                     return;
                 }
               }
@@ -2611,19 +2677,8 @@ void OpenAiServer::install_routes() {
                     // Stream fully built from v; drop the record.
                     loop_.release(id);
                 }
-                ka.pad(payload);
-                if (!payload.empty() &&
-                    !sink.write(std::string_view(payload.data(),
-                                                 payload.size()))) {
-                    // Client vanished mid-stream: stop the generation
-                    // and drop the record (both no-ops if the terminal
-                    // path above already released it).
-                    loop_.cancel(id);
-                    loop_.release(id);
-                    return;
-                }
-                if (terminal) {
-                    sink.done();
+                if (!write_sse_step(sink, ka, payload, loop_, id,
+                                    terminal)) {
                     return;
                 }
               }
@@ -3019,15 +3074,7 @@ void OpenAiServer::install_routes() {
                     cap = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                         cap, body["max_tokens"].get<std::uint64_t>()));
                 }
-                std::uint64_t seed = std::random_device{}();
-                if (body.contains("seed")) {
-                    if (!body["seed"].is_number_integer()) {
-                        throw std::invalid_argument(
-                            "seed must be an integer");
-                    }
-                    seed = static_cast<std::uint64_t>(
-                        body["seed"].get<std::int64_t>());
-                }
+                const std::uint64_t seed = read_seed(body);
                 bool stream = false;
                 if (body.contains("stream")) {
                     if (!body["stream"].is_boolean()) {
@@ -3307,15 +3354,7 @@ void OpenAiServer::install_routes() {
                     }
                     p.guidance = static_cast<float>(g);
                 }
-                p.seed = std::random_device{}();
-                if (body.contains("seed")) {
-                    if (!body["seed"].is_number_integer()) {
-                        throw std::invalid_argument(
-                            "seed must be an integer");
-                    }
-                    p.seed = static_cast<std::uint64_t>(
-                        body["seed"].get<std::int64_t>());
-                }
+                p.seed = read_seed(body);
                 // The image models' linears run on the GPU when the
                 // Vulkan device imports host memory (unified memory:
                 // their mmapped weights cost it nothing), else on the
@@ -3330,17 +3369,8 @@ void OpenAiServer::install_routes() {
                 image::PixArtPipeline::Timing took;
                 std::vector<std::uint8_t> rgb;
                 {
-                    // An image takes minutes: a second request gets a
-                    // 503 instead of holding a server thread in a queue.
-                    std::unique_lock<std::mutex> lk(image_mu_,
-                                                    std::try_to_lock);
-                    if (!lk.owns_lock()) {
-                        set_unavailable(res,
-                                        "an image or video is already being "
-                                        "generated; retry later",
-                                        60);
-                        return;
-                    }
+                    const auto lk = try_image_lock(image_mu_, res, 60);
+                    if (!lk.owns_lock()) return;
                     rgb = pixart_->generate(p, op, ctx.client_alive, &took);
                 }
                 if (rgb.empty()) {
@@ -3354,17 +3384,7 @@ void OpenAiServer::install_routes() {
                     "encode;dur=" + std::to_string(took.encode) +
                         ", denoise;dur=" + std::to_string(took.denoise) +
                         ", decode;dur=" + std::to_string(took.decode));
-                const auto created =
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-                res.set_content(
-                    json{{"created", created},
-                         {"data", json::array({json{
-                                      {"b64_json",
-                                       http::base64_encode(png)}}})}}
-                        .dump(-1, ' ', false, kLossy),
-                    "application/json");
+                set_png_reply(res, png);
             } catch (const std::exception& e) {
                 set_error(res, e);
             }
@@ -3442,25 +3462,8 @@ void OpenAiServer::install_routes() {
                     }
                 }
                 if (body.contains("size")) {
-                    // "WxH": two decimal sides, no signs or spaces.
-                    const std::string s = str("size");
-                    const auto x = s.find('x');
-                    const auto digits = [](std::string_view d) {
-                        return !d.empty() && d.size() <= 4 &&
-                               std::all_of(d.begin(), d.end(), [](char c) {
-                                   return c >= '0' && c <= '9';
-                               });
-                    };
-                    if (x == std::string::npos ||
-                        !digits(std::string_view(s).substr(0, x)) ||
-                        !digits(std::string_view(s).substr(x + 1))) {
-                        throw std::invalid_argument(
-                            "size must be WIDTHxHEIGHT");
-                    }
-                    p.width = static_cast<std::uint32_t>(
-                        std::stoul(s.substr(0, x)));
-                    p.height = static_cast<std::uint32_t>(
-                        std::stoul(s.substr(x + 1)));
+                    std::tie(p.width, p.height) =
+                        parse_size_wxh(str("size"));
                 }
                 if (body.contains("response_format") &&
                     str("response_format") != "b64_json") {
@@ -3499,15 +3502,7 @@ void OpenAiServer::install_routes() {
                     lora_set = loras_->select(picks);
                     p.lora = &lora_set;
                 }
-                p.seed = std::random_device{}();
-                if (body.contains("seed")) {
-                    if (!body["seed"].is_number_integer()) {
-                        throw std::invalid_argument(
-                            "seed must be an integer");
-                    }
-                    p.seed = static_cast<std::uint64_t>(
-                        body["seed"].get<std::int64_t>());
-                }
+                p.seed = read_seed(body);
                 // With host-memory import (as for PixArt) the DiT runs
                 // each step on the GPU, activations resident
                 // (FluxDit::forward_vulkan); CLIP, T5 and the VAE run
@@ -3533,15 +3528,8 @@ void OpenAiServer::install_routes() {
                 image::FluxPipeline::Timing took;
                 std::vector<std::uint8_t> rgb;
                 {
-                    std::unique_lock<std::mutex> lk(image_mu_,
-                                                    std::try_to_lock);
-                    if (!lk.owns_lock()) {
-                        set_unavailable(res,
-                                        "an image or video is already being "
-                                        "generated; retry later",
-                                        60);
-                        return;
-                    }
+                    const auto lk = try_image_lock(image_mu_, res, 60);
+                    if (!lk.owns_lock()) return;
                     rgb = flux_->generate(p, op, ctx.client_alive, &took);
                 }
                 if (rgb.empty()) {
@@ -3555,17 +3543,7 @@ void OpenAiServer::install_routes() {
                     "encode;dur=" + std::to_string(took.encode) +
                         ", denoise;dur=" + std::to_string(took.denoise) +
                         ", decode;dur=" + std::to_string(took.decode));
-                const auto created =
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-                res.set_content(
-                    json{{"created", created},
-                         {"data", json::array({json{
-                                      {"b64_json",
-                                       http::base64_encode(png)}}})}}
-                        .dump(-1, ' ', false, kLossy),
-                    "application/json");
+                set_png_reply(res, png);
             } catch (const std::exception& e) {
                 set_error(res, e);
             }
@@ -3671,15 +3649,7 @@ void OpenAiServer::install_routes() {
                     throw std::invalid_argument(
                         "need finite cfg >= 0 and temperature >= 0");
                 }
-                p.seed = std::random_device{}();
-                if (body.contains("seed")) {
-                    if (!body["seed"].is_number_integer()) {
-                        throw std::invalid_argument(
-                            "seed must be an integer");
-                    }
-                    p.seed = static_cast<std::uint64_t>(
-                        body["seed"].get<std::int64_t>());
-                }
+                p.seed = read_seed(body);
 
                 using Clock = std::chrono::steady_clock;
                 const auto ids = janus_->prompt_ids(tok_, prompt);
@@ -3687,18 +3657,8 @@ void OpenAiServer::install_routes() {
                 std::vector<float> chw;
                 Clock::time_point t0, t1, t2;
                 {
-                    // As the PixArt path: a request that finds an image
-                    // in progress gets a 503, not a wait on a server
-                    // thread.
-                    std::unique_lock<std::mutex> lk(image_mu_,
-                                                    std::try_to_lock);
-                    if (!lk.owns_lock()) {
-                        set_unavailable(res,
-                                        "an image or video is already being "
-                                        "generated; retry later",
-                                        30);
-                        return;
-                    }
+                    const auto lk = try_image_lock(image_mu_, res, 30);
+                    if (!lk.owns_lock()) return;
                     t0 = Clock::now();
                     codes = janus_->generate(model_, ids, p,
                                              ctx.client_alive);
@@ -3730,17 +3690,7 @@ void OpenAiServer::install_routes() {
                                                     ms(t0, t1) +
                                                     ", decode;dur=" +
                                                     ms(t1, t2));
-                const auto created =
-                    std::chrono::duration_cast<std::chrono::seconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-                res.set_content(
-                    json{{"created", created},
-                         {"data", json::array({json{
-                                      {"b64_json",
-                                       http::base64_encode(png)}}})}}
-                        .dump(-1, ' ', false, kLossy),
-                    "application/json");
+                set_png_reply(res, png);
             } catch (const std::exception& e) {
                 set_error(res, e);
             }
@@ -3888,19 +3838,11 @@ void OpenAiServer::install_routes() {
                         }
                         loop_.release(id);
                     }
-                    ka.pad(payload);
-                    if (!payload.empty() &&
-                        !sink.write(std::string_view(payload.data(),
-                                                     payload.size()))) {
-                        loop_.cancel(id);
-                        loop_.release(id);
+                    if (!write_sse_step(sink, ka, payload, loop_, id,
+                                        terminal)) {
                         return;
                     }
                     payload.clear();
-                    if (terminal) {
-                        sink.done();
-                        return;
-                    }
                 }
             });
     };
@@ -3988,14 +3930,7 @@ void OpenAiServer::install_routes() {
                 }
                 p.true_cfg_scale = static_cast<float>(g.get<double>());
             }
-            p.seed = std::random_device{}();
-            if (body.contains("seed")) {
-                if (!body["seed"].is_number_integer()) {
-                    throw std::invalid_argument("seed must be an integer");
-                }
-                p.seed = static_cast<std::uint64_t>(
-                    body["seed"].get<std::int64_t>());
-            }
+            p.seed = read_seed(body);
             // The MMDiT and the VAE run on the GPU where it maps host
             // memory, else on the CPU; the language model always on the
             // CPU.
@@ -4006,14 +3941,8 @@ void OpenAiServer::install_routes() {
             std::vector<std::uint8_t> rgb;
             std::uint32_t w = 0, h = 0;
             {
-                std::unique_lock<std::mutex> lk(image_mu_, std::try_to_lock);
-                if (!lk.owns_lock()) {
-                    set_unavailable(res,
-                                    "an image or video is already being "
-                                    "generated; retry later",
-                                    60);
-                    return;
-                }
+                const auto lk = try_image_lock(image_mu_, res, 60);
+                if (!lk.owns_lock()) return;
                 rgb = qwen_edit_->edit(p, op, ctx.client_alive, w, h, &took);
             }
             if (rgb.empty()) {
@@ -4027,16 +3956,7 @@ void OpenAiServer::install_routes() {
                                ", denoise;dur=" +
                                std::to_string(took.denoise) +
                                ", decode;dur=" + std::to_string(took.decode));
-            const auto created =
-                std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::system_clock::now().time_since_epoch())
-                    .count();
-            res.set_content(
-                json{{"created", created},
-                     {"data", json::array({json{
-                                  {"b64_json", http::base64_encode(png)}}})}}
-                    .dump(-1, ' ', false, kLossy),
-                "application/json");
+            set_png_reply(res, png);
         } catch (const std::exception& e) {
             set_error(res, e);
         }
@@ -4159,21 +4079,7 @@ void OpenAiServer::install_routes() {
                 }
                 size = body["size"].get<std::string>();
             }
-            const auto x = size.find('x');
-            const auto digits = [](std::string_view d) {
-                return !d.empty() && d.size() <= 4 &&
-                       std::all_of(d.begin(), d.end(), [](char c) {
-                           return c >= '0' && c <= '9';
-                       });
-            };
-            if (x == std::string::npos ||
-                !digits(std::string_view(size).substr(0, x)) ||
-                !digits(std::string_view(size).substr(x + 1))) {
-                throw std::invalid_argument("size must be WIDTHxHEIGHT");
-            }
-            p.width = static_cast<std::uint32_t>(std::stoul(size.substr(0, x)));
-            p.height =
-                static_cast<std::uint32_t>(std::stoul(size.substr(x + 1)));
+            std::tie(p.width, p.height) = parse_size_wxh(size);
             double seconds = 2.0;
             if (body.contains("seconds")) {
                 const json& s = body["seconds"];
@@ -4227,14 +4133,7 @@ void OpenAiServer::install_routes() {
                         "\"deterministic\"");
                 }
             }
-            p.seed = std::random_device{}();
-            if (body.contains("seed")) {
-                if (!body["seed"].is_number_integer()) {
-                    throw std::invalid_argument("seed must be an integer");
-                }
-                p.seed = static_cast<std::uint64_t>(
-                    body["seed"].get<std::int64_t>());
-            }
+            p.seed = read_seed(body);
             if (body.contains("input_reference")) {
                 const json& ref = body["input_reference"];
                 if (!ref.is_object() || ref.contains("file_id") ||

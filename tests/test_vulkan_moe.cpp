@@ -715,12 +715,13 @@ TEST_CASE("vulkan fused SwiGLU q4_k experts match the CPU reference",
     }
 }
 
-TEST_CASE("vulkan fused SwiGLU q4_k equals the unfused chain for one "
-          "token",
+TEST_CASE("vulkan fused SwiGLU q4_k and q3_k equal the unfused chain "
+          "for one token",
           "[vulkan]") {
-    // matvec_q4_k_glu (i#688): one token's dense gate, up and silu_mul
-    // in one dispatch must give the bits of matvec_q4_k twice and
-    // silu_mul, which single-token decode ran before.
+    // matvec_q4_k_glu (i#688) and matvec_q3_k_glu (i#173): one token's
+    // dense gate, up and silu_mul in one dispatch must give the bits of
+    // the plain matvec twice and silu_mul, which single-token decode
+    // ran before.
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");
     }
@@ -729,17 +730,25 @@ TEST_CASE("vulkan fused SwiGLU q4_k equals the unfused chain for one "
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::uniform_int_distribution<int> byte_d(0, 255);
     const std::uint32_t rows = 37, cols = 768;
-    const std::size_t mat_bytes = rows * (cols / 256) * 144;
+    const bool q3 = GENERATE(false, true);
+    const std::size_t bb = q3 ? 110 : 144;
+    const Kernel glu = q3 ? Kernel::kMatvecQ3_KGlu : Kernel::kMatvecQ4_KGlu;
+    const Kernel plain = q3 ? Kernel::kMatvecQ3_K : Kernel::kMatvecQ4_K;
+    const std::size_t mat_bytes = rows * (cols / 256) * bb;
     auto quant = [&] {
         std::vector<std::byte> w(mat_bytes);
         for (auto& b : w) {
             b = static_cast<std::byte>(byte_d(rng));
         }
-        for (std::size_t at = 0; at < w.size(); at += 144) {
+        for (std::size_t at = 0; at < w.size(); at += bb) {
             const std::uint16_t d = locus::backend::f32_to_f16(0.01f);
             const std::uint16_t dmin = locus::backend::f32_to_f16(0.005f);
-            std::memcpy(&w[at], &d, 2);
-            std::memcpy(&w[at + 2], &dmin, 2);
+            if (q3) {
+                std::memcpy(&w[at + 108], &d, 2);
+            } else {
+                std::memcpy(&w[at], &d, 2);
+                std::memcpy(&w[at + 2], &dmin, 2);
+            }
         }
         return w;
     };
@@ -762,14 +771,12 @@ TEST_CASE("vulkan fused SwiGLU q4_k equals the unfused chain for one "
                                       fbits(1.0f)};
         ctx.begin_batch();
         const VulkanContext::Buffer bufs[] = {gb, xb, ob, gb, ub};
-        ctx.dispatch(Kernel::kMatvecQ4_KGlu, bufs, push,
-                     VulkanContext::matvec_groups(Kernel::kMatvecQ4_KGlu,
-                                                  rows));
+        ctx.dispatch(glu, bufs, push,
+                     VulkanContext::matvec_groups(glu, rows));
         for (const auto& [w, o] : {std::pair{gb, og}, std::pair{ub, ou}}) {
             const VulkanContext::Buffer mb[] = {w, xb, o};
-            ctx.dispatch(Kernel::kMatvecQ4_K, mb, push,
-                         VulkanContext::matvec_groups(Kernel::kMatvecQ4_K,
-                                                      rows));
+            ctx.dispatch(plain, mb, push,
+                         VulkanContext::matvec_groups(plain, rows));
         }
         const VulkanContext::Buffer sb[] = {og, ou, og};
         const std::uint32_t spush[] = {rows};
@@ -784,6 +791,7 @@ TEST_CASE("vulkan fused SwiGLU q4_k equals the unfused chain for one "
         }
     }
 }
+
 
 // i#718: the Q3_K and IQ2_S matvecs and the batched Q3_K / IQ2_S /
 // IQ2_XXS ones (Kolibri-1's experts) against the CPU dequant: the
