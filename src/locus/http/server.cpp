@@ -660,12 +660,15 @@ bool Server::take_ip_slot(const std::string& peer_ip) {
         return true;
     }
     std::lock_guard lk(per_ip_mu_);
-    std::size_t& n = per_ip_[peer_ip];
-    if (n >= cfg_.max_conns_per_ip) {
-        if (n == 0) per_ip_.erase(peer_ip);
+    const auto it = per_ip_.find(peer_ip);
+    if (it == per_ip_.end()) {
+        per_ip_.emplace(peer_ip, 1);
+        return true;
+    }
+    if (it->second >= cfg_.max_conns_per_ip) {
         return false;
     }
-    ++n;
+    ++it->second;
     return true;
 }
 

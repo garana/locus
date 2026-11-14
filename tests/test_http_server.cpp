@@ -795,9 +795,6 @@ TEST_CASE("http server: a fast-path head cut short does not stall the "
     REQUIRE(ms < 1000.0);
 }
 
-// i#837: an inline fast-path response used only the per-wait write
-// deadline, so a client that never reads a large one held the acceptor
-// for that whole deadline (and longer, a few bytes at a time).
 // i#625 F21: with a per-address cap, one client address cannot hold
 // every worker; a connection past the cap is closed at accept, and a
 // closed one gives its slot back.
@@ -828,6 +825,9 @@ TEST_CASE("http server: a per-address cap closes connections past it",
     REQUIRE(r.find("GET /y") != std::string::npos);
 }
 
+// i#837: an inline fast-path response used only the per-wait write
+// deadline, so a client that never reads a large one held the acceptor
+// for that whole deadline (and longer, a few bytes at a time).
 TEST_CASE("http server: a slow reader of a fast-path reply does not hold "
           "the acceptor", "[http_server]") {
     ServerConfig cfg;
