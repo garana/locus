@@ -707,3 +707,58 @@ TEST_CASE("bench: http metrics per request", "[.][bench]") {
     REQUIRE(m.at(m.route("/v1/images/generations")).seconds.snapshot()
                 .count == static_cast<std::uint64_t>(kN));
 }
+
+// The decode matvecs of Orpheus 3B Q4_K_M (Llama 3.2 3B) one kernel at
+// a time on Vulkan (i#784): each shape repeated in one batch, as a
+// decode step chains them, with its effective bandwidth. Random
+// weights; the time depends only on the type and shape.
+TEST_CASE("bench: vulkan decode matvecs at the orpheus shapes",
+          "[.][bench][vulkan]") {
+    if (!vulkan_backend_usable()) {
+        SKIP("no Vulkan device");
+    }
+    using TT = locus::gguf::TensorType;
+    struct Shape {
+        const char* name;
+        TT type;
+        std::uint32_t rows, cols;
+        std::size_t block_bytes, d_off;
+        int dmin_off;
+    };
+    const Shape shapes[] = {
+        {"q4_k attn_q/o   ", TT::kQ4_K, 3072, 3072, 144, 0, 2},
+        {"q4_k attn_k/v   ", TT::kQ4_K, 1024, 3072, 144, 0, 2},
+        {"q4_k ffn_gate/up", TT::kQ4_K, 8192, 3072, 144, 0, 2},
+        {"q4_k ffn_down   ", TT::kQ4_K, 3072, 8192, 144, 0, 2},
+        {"q6_k attn_v     ", TT::kQ6_K, 1024, 3072, 210, 208, -1},
+        {"q6_k ffn_down   ", TT::kQ6_K, 3072, 8192, 210, 208, -1},
+        {"q6_k head speech", TT::kQ6_K, 28682, 3072, 210, 208, -1},
+        {"q6_k head full  ", TT::kQ6_K, 156940, 3072, 210, 208, -1},
+    };
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const Shape& sh : shapes) {
+        auto w = make_kquant(sh.rows, sh.cols, sh.block_bytes, sh.d_off,
+                             sh.dmin_off, 9);
+        const Mat m{sh.type, w.data(), sh.rows, sh.cols};
+        std::vector<float> x(sh.cols), out(sh.rows), ref(sh.rows);
+        for (auto& v : x) {
+            v = dist(rng);
+        }
+        matvec_vulkan(m, x, ref);  // uploads the weight
+        // About 2 GB of weight reads a batch, at least 16 copies.
+        const auto reps = static_cast<std::uint32_t>(std::max<std::size_t>(
+            16, (std::size_t{2} << 30) / w.size()));
+        vulkan_matvec_repeat(m, x, out, reps);  // warm
+        double best = 1e30;
+        for (int i = 0; i < 3; ++i) {
+            best = std::min(best, vulkan_matvec_repeat(m, x, out, reps));
+        }
+        REQUIRE(out == ref);
+        WARN(sh.name << " " << sh.rows << " x " << sh.cols << ": " << best * 1e3
+                     << " us, "
+                     << static_cast<double>(w.size()) / (best * 1e6)
+                     << " GB/s (" << reps << " copies)");
+    }
+    SUCCEED();
+}
