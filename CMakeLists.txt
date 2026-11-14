@@ -24,6 +24,7 @@ add_library(locus
     src/locus/backend/cuda_stub.cpp
     src/locus/backend/fallbacks.cpp
     src/locus/backend/gpu_metrics.cpp
+    src/locus/backend/metal/matvec.cpp
     src/locus/backend/registry.cpp
     src/locus/backend/vulkan/context.cpp
     src/locus/chat/template.cpp
@@ -182,6 +183,36 @@ target_link_libraries(locus-experts PRIVATE locus)
 add_executable(locus-router tools/router_main.cpp)
 target_link_libraries(locus-router PRIVATE locus)
 target_include_directories(locus PUBLIC src)
+
+# The Metal backend (i#865): Objective-C++ in its own files on Apple, a
+# stub elsewhere. Metal and Foundation are system frameworks; the
+# kernels are compiled at run time from kernels.metal, which CMake
+# embeds as a string (reconfiguring when the file changes).
+if(APPLE)
+    set(CMAKE_OBJCXX_STANDARD 20)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+    set(CMAKE_OBJCXX_EXTENSIONS OFF)
+    enable_language(OBJCXX)
+    target_sources(locus PRIVATE src/locus/backend/metal/context.mm)
+    set_source_files_properties(src/locus/backend/metal/context.mm
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wall;-Wextra;-Wpedantic")
+    target_link_libraries(locus PRIVATE "-framework Metal"
+                                        "-framework Foundation")
+    set(LOCUS_METAL_KERNELS_FILE
+        ${CMAKE_SOURCE_DIR}/src/locus/backend/metal/kernels.metal)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 ${LOCUS_METAL_KERNELS_FILE})
+    file(READ ${LOCUS_METAL_KERNELS_FILE} LOCUS_METAL_KERNELS)
+    set(LOCUS_METAL_GEN ${CMAKE_BINARY_DIR}/generated/locus/backend/metal)
+    set(LOCUS_METAL_SRC "#pragma once\n// kernels.metal, embedded by CMake.\n")
+    string(APPEND LOCUS_METAL_SRC "constexpr const char* kKernelSource =\n")
+    string(APPEND LOCUS_METAL_SRC "    R\"MSL(@LOCUS_METAL_KERNELS@)MSL\";\n")
+    file(CONFIGURE OUTPUT ${LOCUS_METAL_GEN}/kernels_src.hpp
+         CONTENT "${LOCUS_METAL_SRC}" @ONLY)
+    target_include_directories(locus PRIVATE ${CMAKE_BINARY_DIR}/generated)
+else()
+    target_sources(locus PRIVATE src/locus/backend/metal/context_stub.cpp)
+endif()
 
 # ----------------------------------------------------------------
 # Vectorized CPU support: probe which SIMD flags the compiler
