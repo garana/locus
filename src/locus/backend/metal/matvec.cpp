@@ -174,7 +174,10 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t x_stride, const Context::Buffer& out,
                    std::uint64_t out_off, std::uint32_t out_stride,
                    bool accumulate) {
-    if (t != gguf::TensorType::kQ4_K || cols % 256 != 0 || n_tok == 0) {
+    const char* kernel = t == gguf::TensorType::kQ4_K   ? "mm_q4_k"
+                         : t == gguf::TensorType::kQ6_K ? "mm_q6_k"
+                                                        : nullptr;
+    if (kernel == nullptr || cols % 256 != 0 || n_tok == 0) {
         return false;
     }
     const std::uint32_t row_tiles = (rows + 63) / 64;
@@ -184,7 +187,7 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                      x_stride, out_stride, accumulate ? 1u : 0u,
                      1.0f,     row_tiles};
     const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
-    ctx.dispatch("mm_q4_k", args, std::as_bytes(std::span(&p, 1)),
+    ctx.dispatch(kernel, args, std::as_bytes(std::span(&p, 1)),
                  row_tiles * tok_tiles * 128, 128);
     return true;
 }

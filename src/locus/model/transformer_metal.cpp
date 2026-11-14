@@ -387,7 +387,7 @@ bool TransformerModel::metal_forward_batch(
         base + n > kAttnMaxPos || base + n > hp_.n_ctx ||
         base + n > cache.capacity(seq) || hd > kAttnGroup ||
         kAttnGroup % hd != 0 || (!embd.empty() && embd.size() != n) ||
-        logits.size() != std::size_t{all_logits ? n : 1} * V) {
+        logits.size() < std::size_t{all_logits ? n : 1} * V) {
         return false;
     }
     for (std::uint32_t t = 0; t < n; ++t) {
@@ -433,6 +433,8 @@ bool TransformerModel::metal_forward_batch(
         Scratch::grow(ctx, s.cs, C * hd * 4);
         Scratch::grow(ctx, s.rows, C * L * 8);
         Scratch::grow(ctx, s.blocks, std::size_t{n_blocks} * 4);
+        // With all_logits, a sub-chunk's head rows: C * V floats (131 MB
+        // for a 128k vocab at C = 256).
         Scratch::grow(ctx, s.head,
                       std::size_t{all_logits ? C : 1} * V * 4);
         std::copy_n(seq.blocks.begin(), n_blocks,
