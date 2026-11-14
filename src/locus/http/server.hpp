@@ -369,6 +369,8 @@ class Server {
      * passed to poll() is rebuilt from this each iteration (listen fd,
      * wake fd, then these), so it holds no kernel-side registration. */
     std::vector<Unclassified> unclassified_;
+    /** peek_classify's buffer (acceptor-only, like unclassified_). */
+    std::vector<char> peek_buf_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> started_{false};
     std::mutex wait_mu_;              /**< guards the wait() handoff. */

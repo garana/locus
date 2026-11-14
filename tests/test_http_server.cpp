@@ -797,6 +797,41 @@ TEST_CASE("http server: a fast-path head cut short does not stall the "
 
 // The other half of F4: a fast-path head that arrives in two parts still
 // takes the fast path (it waits as partial, then is served inline).
+// i#837: an inline fast-path response used only the per-wait write
+// deadline, so a client that never reads a large one held the acceptor
+// for that whole deadline (and longer, a few bytes at a time).
+TEST_CASE("http server: a slow reader of a fast-path reply does not hold "
+          "the acceptor", "[http_server]") {
+    ServerConfig cfg;
+    cfg.worker_threads = 2;
+    cfg.write_deadline_ms = 5000;
+    cfg.fast_path = [](std::string_view m, std::string_view t) {
+        return m == "GET" && (t == "/big" || t == "/fast");
+    };
+    const std::string big(8 << 20, 'x');  // past any socket buffer
+    Fixture f(
+        [&](const Request& req, ServerResponse& res) {
+            res.status = 200;
+            res.set_content(req.path == "/big" ? big : "fast", "text/plain");
+        },
+        cfg);
+    const int slow = client_connect(f.port);
+    send_all(slow, "GET /big HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto t0 = std::chrono::steady_clock::now();
+    const int c = client_connect(f.port);
+    send_all(c, "GET /fast HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    const std::string r = drain(c, 8000);
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    ::close(c);
+    ::close(slow);
+    REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
+    // Before: about the 5 s write deadline. Now: the 1 s inline total.
+    REQUIRE(ms < 3000.0);
+}
+
 TEST_CASE("http server: a fast-path head in two parts is still fast",
           "[http_server]") {
     ServerConfig cfg;
