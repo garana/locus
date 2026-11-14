@@ -19,6 +19,7 @@
 #include "catch_amalgamated.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
+#include "locus/pipeline/handshake.hpp"
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/pipeline/resolver.hpp"
@@ -1787,4 +1788,132 @@ TEST_CASE("serve_stage_mux applies --allow to the metrics port",
     server.join();
     ::close(a.from_stage);
     ::close(lm);
+}
+
+// i#849: with a key, the stage proves itself and checks its peers on
+// both sides of the loop: a client that holds the key gets the same
+// tokens as one process; a client with another key, one that floods in
+// place of an answer, a downstream with another key, and a client that
+// never answers each lose only their own session.
+TEST_CASE("serve_stage_mux runs the key handshake on input and dial",
+          "[pipeline][mux][e2e][handshake]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::uint32_t L = model.hparams().n_layers;
+    const auto prompt = tok.encode("Once upon a time", true);
+    const auto ref = mono_generate(model, prompt, tok.eos_id(), 1);
+    const std::string key = "0123456789abcdef0123456789abcdef";
+    const std::string other = "fedcba9876543210fedcba9876543210";
+
+    int pc = 0;
+    const int lc = locus::pipeline::listen_on("127.0.0.1", 0, &pc);
+    REQUIRE(lc >= 0);
+    int ps = 0;
+    const int ls = locus::pipeline::listen_on("127.0.0.1", 0, &ps);
+    REQUIRE(ls >= 0);
+
+    PipelineStage stage(model, 0, L);
+    const std::vector<locus::pipeline::Cidr> allow{
+        *locus::pipeline::Cidr::parse("127.0.0.0/8")};
+    locus::pipeline::StageConn conn;
+    conn.key = key;
+    conn.handshake_timeout_ms = 300;
+    conn.reconnect_attempts = 1;  // a refused downstream drops at once
+    conn.serve_sessions = 5;
+    std::atomic<int> sres{-1};
+    std::jthread server([&] {
+        sres = locus::pipeline::serve_stage_mux(
+                   stage, ls, allow, {{"127.0.0.1", pc}}, conn)
+                   ? 1
+                   : 0;
+    });
+
+    // 1. Both ends hold the key: frames flow, the tokens match.
+    Client a;
+    a.request_id = 1;
+    a.to_stage = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(a.to_stage >= 0);
+    REQUIRE(locus::pipeline::handshake_connect(a.to_stage, key, 2000));
+    a.from_stage = locus::pipeline::accept_one(lc, nullptr, 2000);
+    REQUIRE(a.from_stage >= 0);
+    REQUIRE(locus::pipeline::handshake_accept(a.from_stage, key, 2000));
+    for (const auto t : prompt) {
+        a.round_trip(t);
+    }
+    REQUIRE(a.ok);
+    REQUIRE(locus::model::argmax(a.logits) == ref.at(0));
+    ::close(a.to_stage);
+    ::close(a.from_stage);
+
+    // Reads until EOF, for up to 3 s. @returns whether the stage closed
+    // `fd`.
+    const auto closed_by_stage = [](int fd) {
+        pollfd p{fd, POLLIN, 0};
+        char buf[64];
+        for (;;) {
+            if (::poll(&p, 1, 3000) <= 0) {
+                return false;
+            }
+            if (::recv(fd, buf, sizeof(buf), 0) <= 0) {
+                return true;
+            }
+        }
+    };
+
+    // 2. A client with another key: refused, and the stage never dials.
+    const int b = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(b >= 0);
+    REQUIRE_FALSE(locus::pipeline::handshake_connect(b, other, 2000));
+    REQUIRE(closed_by_stage(b));
+    ::close(b);
+    REQUIRE(locus::pipeline::accept_one(lc, nullptr, 200) < 0);  // no dial
+
+    // 2b. A client that streams 1 MiB in place of an answer: the stage
+    // reads only the answer's 56 bytes, refuses them, and never dials.
+    const int f = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(f >= 0);
+    {
+        std::jthread flood([f] {
+            const std::string junk(1 << 20, 'j');
+            std::size_t off = 0;
+            while (off < junk.size()) {
+                const ssize_t n = ::send(f, junk.data() + off,
+                                         junk.size() - off, MSG_NOSIGNAL);
+                if (n <= 0) {
+                    return;  // the stage closed the connection
+                }
+                off += static_cast<std::size_t>(n);
+            }
+        });
+        REQUIRE(closed_by_stage(f));
+        ::shutdown(f, SHUT_RDWR);  // ends a send still blocked
+    }
+    ::close(f);
+    REQUIRE(locus::pipeline::accept_one(lc, nullptr, 200) < 0);
+
+    // 3. A downstream with another key: the stage drops the session.
+    const int c = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(c >= 0);
+    REQUIRE(locus::pipeline::handshake_connect(c, key, 2000));
+    const int cd = locus::pipeline::accept_one(lc, nullptr, 2000);
+    REQUIRE(cd >= 0);
+    REQUIRE_FALSE(locus::pipeline::handshake_accept(cd, other, 2000));
+    ::close(cd);
+    REQUIRE(closed_by_stage(c));
+    ::close(c);
+
+    // 4. A client that reads the hello and never answers: dropped after
+    // handshake_timeout_ms.
+    const int d = locus::pipeline::connect_to("127.0.0.1", ps);
+    REQUIRE(d >= 0);
+    REQUIRE(closed_by_stage(d));
+    ::close(d);
+
+    server.join();
+    ::close(lc);
+    REQUIRE(sres.load() == 0);  // sessions 2 to 5 ended unclean
 }

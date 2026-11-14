@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -28,6 +29,7 @@
 #include "locus/server/metrics_text.hpp"
 #include "locus/sys/features.hpp"
 #include "locus/sys/poller.hpp"
+#include "locus/sys/sha256.hpp"
 
 namespace locus::pipeline {
 
@@ -47,9 +49,11 @@ bool is_numeric_ip(const std::string& host) {
 }
 
 // Accepts one allowed input connection on listen_fd, logging (and
-// dropping) peers outside `allow`. @returns the fd, or -1 if accept
-// fails.
-int accept_allowed(int listen_fd, const std::vector<Cidr>& allow) {
+// dropping) peers outside `allow`, and, when `key` is not empty
+// (blocking mode only), peers that fail the handshake. @returns the
+// fd, or -1 if accept fails.
+int accept_allowed(int listen_fd, const std::vector<Cidr>& allow,
+                   const std::string& key = {}, int hs_timeout_ms = 0) {
     for (;;) {
         std::string peer;
         const int fd = accept_one(listen_fd, &peer);
@@ -60,6 +64,14 @@ int accept_allowed(int listen_fd, const std::vector<Cidr>& allow) {
             std::fprintf(stderr,
                          "serve_stage: refused connection from %s "
                          "(not in --allow)\n",
+                         peer.c_str());
+            ::close(fd);
+            continue;
+        }
+        if (!key.empty() && !handshake_accept(fd, key, hs_timeout_ms)) {
+            std::fprintf(stderr,
+                         "serve_stage: refused connection from %s "
+                         "(failed the key handshake)\n",
                          peer.c_str());
             ::close(fd);
             continue;
@@ -107,6 +119,17 @@ int connect_pool(const std::vector<HostPort>& pool, std::size_t* cursor,
             }
             const int fd =
                 connect_to(target, hp.port, conn.connect_timeout_ms);
+            if (fd >= 0 && !conn.key.empty() &&
+                !handshake_connect(fd, conn.key,
+                                   conn.handshake_timeout_ms)) {
+                // A peer without the key is not a usable replica.
+                std::fprintf(stderr,
+                             "serve_stage: downstream %s:%d failed the key "
+                             "handshake\n",
+                             hp.host.c_str(), hp.port);
+                ::close(fd);
+                continue;
+            }
             if (fd >= 0) {
                 *cursor = (idx + 1) % n;  // next session starts here
                 return fd;
@@ -211,6 +234,28 @@ struct MuxSession {
     int dial_sweeps = 0;
     Clock::time_point dial_deadline = Clock::time_point::max();
     Clock::time_point retry_at = Clock::time_point::max();
+    // i#849 handshake, when the loop has a key. `key` is this session's
+    // copy (the handshake objects view it; a reload may replace the
+    // loop's). Input: hs_in sent its hello at accept; until `in_authed`
+    // the first kAnswerBytes of inbuf are the answer, not a frame, and
+    // hs_deadline bounds the wait. Downstream: `out_fresh` marks a new
+    // dial (a pooled fd passed already); after its connect completes,
+    // `out_hs` keeps `connecting` true while hs_out reads the hello into
+    // hs_buf, sends the answer (`hs_answered`) and reads the proof, all
+    // within dial_deadline.
+    std::string key;
+    // Appended to out_key for the idle pool: a downstream that passed the
+    // handshake under one key is reused only by sessions with that key
+    // (a reload may change it). Empty without a key.
+    std::string pool_tag;
+    std::optional<HandshakeServer> hs_in;
+    bool in_authed = true;
+    Clock::time_point hs_deadline = Clock::time_point::max();
+    bool out_fresh = false;
+    bool out_hs = false;
+    bool hs_answered = false;
+    std::optional<HandshakeClient> hs_out;
+    std::string hs_buf;
 };
 
 // A pipe whose ends close on destruction. The executor's completion
@@ -412,7 +457,9 @@ bool serve_stage(PipelineStage& stage, int listen_fd,
         // connection rather than exiting. Per the terminal-kTimeout
         // contract, a session that ends always tears its fds down (in
         // stage.run) and we re-accept -- never re-read a dead fd.
-        const int in_fd = accept_allowed(listen_fd, allow_live);
+        const int in_fd = accept_allowed(listen_fd, allow_live,
+                                         conn_live.key,
+                                         conn_live.handshake_timeout_ms);
         if (in_fd < 0) {
             ::close(listen_fd);
             return false;  // accept failed (listener broken)
@@ -646,7 +693,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 s.out_watched = false;
             }
             out_index.erase(s.out_fd);
-            std::vector<int>& bucket = pool_idle[s.out_key];
+            std::vector<int>& bucket = pool_idle[s.out_key + s.pool_tag];
             if (fr == 0 && static_cast<int>(bucket.size()) <
                                conn_live.downstream_idle_max) {
                 bucket.push_back(s.out_fd);  // clean + frame-aligned
@@ -809,7 +856,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             // reused-but-dead fd would never resolve and the loop would
             // spin: pooling breaks silently. Keep the phase dispatch.
             if (!ip.empty() && conn_live.downstream_idle_max > 0) {
-                auto pit = pool_idle.find(key);
+                auto pit = pool_idle.find(key + s.pool_tag);
                 if (pit != pool_idle.end()) {
                     while (!pit->second.empty()) {
                         const int pfd = pit->second.back();
@@ -824,6 +871,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                                           conn_live.keepalive_count);
                             s.out_fd = pfd;
                             s.out_key = key;
+                            s.out_fresh = false;  // handshake done already
                             s.connecting = true;
                             poller.add(pfd, sys::Poller::Dir::kWrite);
                             s.out_watched = true;
@@ -851,6 +899,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                               conn_live.keepalive_count);
                 s.out_fd = fd;
                 s.out_key = key;
+                s.out_fresh = true;
                 s.connecting = true;
                 poller.add(fd, sys::Poller::Dir::kWrite);
                 s.out_watched = true;
@@ -878,6 +927,10 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // the sweep. One path for every failure shape (issue 39 Gap 2).
     auto fail_dial = [&](MuxSession& s) {
         ++stats.dial_failures;
+        s.out_hs = false;  // i#849: the next entry starts a new handshake
+        s.hs_answered = false;
+        s.hs_out.reset();
+        s.hs_buf.clear();
         if (s.out_fd >= 0) {
             if (s.out_watched) {
                 poller.remove(s.out_fd);
@@ -897,7 +950,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         // Gate on `connecting`: a step's output goes to the downstream, so
         // there is nothing to compute until the dial completes. Buffered
         // input waits in inbuf and is pumped on connect (issue 39).
-        if (s.connecting || s.in_flight || s.cancelled) {
+        if (s.connecting || s.in_flight || s.cancelled || !s.in_authed) {
             return;
         }
         // i#459: a reset connection dials its next downstream only once
@@ -954,8 +1007,48 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         // re-runs pump() then maybe_finish() in that order, so a frame
         // buffered mid-dial is delivered first and the EOF honored after.
         if (s.eof && !s.in_flight && !s.cancelled && !s.connecting) {
-            begin_drop(s, !s.read_error && s.inbuf.empty());
+            // A peer that left before the handshake ended is unclean.
+            begin_drop(s,
+                       s.in_authed && !s.read_error && s.inbuf.empty());
         }
+    };
+
+    // The downstream is ready for frames (connected, and through the
+    // handshake when there is a key): stop watching it and run the input
+    // buffered while the dial was in flight.
+    auto dial_done = [&](MuxSession& s) {
+        s.connecting = false;
+        s.dial_deadline = Clock::time_point::max();
+        if (s.out_watched) {
+            poller.remove(s.out_fd);  // nothing to flush yet
+            s.out_watched = false;
+        }
+        pump(s);          // process any input buffered mid-dial
+        maybe_finish(s);  // or finish if the peer already left
+    };
+
+    // i#849: the input's handshake answer is complete in inbuf. Sends the
+    // proof and lets frames through, then starts the downstream dial; a
+    // wrong answer drops the session. @returns false when it dropped.
+    auto check_answer = [&](MuxSession& s) {
+        const auto proof = s.hs_in->on_answer(
+            std::string_view(s.inbuf).substr(0, kAnswerBytes));
+        if (!proof ||
+            ::send(s.in_fd, proof->data(), proof->size(), kSendFlags) !=
+                static_cast<ssize_t>(proof->size())) {
+            std::fprintf(stderr,
+                         "serve_stage_mux: refused connection from %s "
+                         "(failed the key handshake)\n",
+                         peer_address(s.in_fd).c_str());
+            begin_drop(s, false);
+            return false;
+        }
+        s.inbuf.erase(0, kAnswerBytes);
+        s.in_authed = true;
+        s.hs_in.reset();
+        s.hs_deadline = Clock::time_point::max();
+        try_dial(s);  // as an accept without a key does
+        return true;
     };
 
     // Issue 76: re-initialize a session slot after its KV release, on a
@@ -1141,6 +1234,9 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         for (const auto& [efd, esp] : sessions) {
             (void)efd;
             const MuxSession& s = *esp;
+            if (!s.in_authed && !s.cancelled) {
+                earliest = std::min(earliest, s.hs_deadline);
+            }
             if (!s.connecting || s.cancelled) {
                 continue;
             }
@@ -1287,6 +1383,66 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                     continue;
                 }
                 MuxSession& s = *sit->second;
+                if (s.connecting && s.out_hs) {
+                    // i#849: the dial's handshake. Read no more than the
+                    // field needs; the downstream sends nothing after it.
+                    const std::size_t want =
+                        s.hs_answered ? kProofBytes : kHelloBytes;
+                    bool gone = false;
+                    while (s.hs_buf.size() < want) {
+                        char buf[kHelloBytes + kProofBytes];
+                        const ssize_t n =
+                            ::recv(s.out_fd, buf, want - s.hs_buf.size(), 0);
+                        if (n > 0) {
+                            s.hs_buf.append(buf,
+                                            static_cast<std::size_t>(n));
+                            continue;
+                        }
+                        if (n < 0 && errno == EINTR) {
+                            continue;
+                        }
+                        gone = !(n < 0 && (errno == EAGAIN ||
+                                           errno == EWOULDBLOCK));
+                        break;
+                    }
+                    if (s.hs_buf.size() < want) {
+                        if (gone) {
+                            fail_dial(s);  // closed or errored mid-way
+                        }
+                        continue;  // the rest arrives later
+                    }
+                    if (!s.hs_answered) {
+                        const auto answer = s.hs_out->on_hello(s.hs_buf);
+                        if (!answer ||
+                            ::send(s.out_fd, answer->data(), answer->size(),
+                                   kSendFlags) !=
+                                static_cast<ssize_t>(answer->size())) {
+                            std::fprintf(stderr,
+                                         "serve_stage_mux: downstream %s "
+                                         "sent no valid handshake\n",
+                                         s.out_key.c_str());
+                            fail_dial(s);
+                            continue;
+                        }
+                        s.hs_answered = true;
+                        s.hs_buf.clear();
+                        continue;  // wait for the proof
+                    }
+                    if (!s.hs_out->on_proof(s.hs_buf)) {
+                        std::fprintf(stderr,
+                                     "serve_stage_mux: downstream %s does "
+                                     "not hold the key\n",
+                                     s.out_key.c_str());
+                        fail_dial(s);
+                        continue;
+                    }
+                    s.out_hs = false;
+                    s.hs_answered = false;
+                    s.hs_out.reset();
+                    s.hs_buf.clear();
+                    dial_done(s);
+                    continue;
+                }
                 if (s.connecting) {
                     // The dial resolved. Dispatch on the PHASE, never on
                     // ev.writable: the Poller suppresses writable when
@@ -1299,15 +1455,18 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                     // spin at 100% CPU. Any event here means "dial done";
                     // read SO_ERROR exactly once.
                     const int cerr = connect_result(s.out_fd);
-                    if (cerr == 0) {
-                        s.connecting = false;
-                        s.dial_deadline = Clock::time_point::max();
-                        if (s.out_watched) {
-                            poller.remove(s.out_fd);  // nothing to flush yet
-                            s.out_watched = false;
-                        }
-                        pump(s);          // process any input buffered mid-dial
-                        maybe_finish(s);  // or finish if the peer already left
+                    if (cerr == 0 && !s.key.empty() && s.out_fresh) {
+                        // i#849: connected; now wait for the hello. The
+                        // handshake gets its own deadline.
+                        poller.modify(s.out_fd, sys::Poller::Dir::kRead);
+                        s.out_hs = true;
+                        s.hs_out.emplace(s.key);
+                        s.dial_deadline =
+                            Clock::now() +
+                            std::chrono::milliseconds(
+                                conn_live.handshake_timeout_ms);
+                    } else if (cerr == 0) {
+                        dial_done(s);
                     } else {
                         fail_dial(s);  // try the next pool entry
                     }
@@ -1338,7 +1497,17 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             // flags are hints and buffered bytes are processed first.
             for (;;) {
                 char buf[4096];
-                const ssize_t n = ::recv(s.in_fd, buf, sizeof(buf), 0);
+                // i#849: before the answer checks out, read no more than
+                // the answer (a peer without the key gets no buffer); a
+                // client sends nothing past it until it has the proof.
+                const std::size_t want =
+                    s.in_authed ? sizeof(buf)
+                                : std::min(sizeof(buf),
+                                           kAnswerBytes - s.inbuf.size());
+                if (want == 0) {
+                    break;  // the answer is in: check it first
+                }
+                const ssize_t n = ::recv(s.in_fd, buf, want, 0);
                 if (n > 0) {
                     stats.bytes_in += static_cast<std::uint64_t>(n);
                     s.inbuf.append(buf, static_cast<std::size_t>(n));
@@ -1363,6 +1532,10 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 // re-firing while a step is still in flight.
                 poller.remove(s.in_fd);
             }
+            if (!s.in_authed && s.inbuf.size() >= kAnswerBytes &&
+                !check_answer(s)) {
+                continue;
+            }
             // Submit the next frame if idle, then (once idle with the
             // peer gone) tear down. The drop is honored only AFTER the
             // buffered frame is submitted, so a client that sends its last
@@ -1383,6 +1556,14 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             for (auto& [tfd, tsp] : sessions) {
                 (void)tfd;
                 MuxSession& s = *tsp;
+                if (!s.in_authed && !s.cancelled && now >= s.hs_deadline) {
+                    std::fprintf(stderr,
+                                 "serve_stage_mux: session dropped: no "
+                                 "handshake answer within %d ms\n",
+                                 conn_live.handshake_timeout_ms);
+                    begin_drop(s, false);
+                    continue;
+                }
                 if (!s.connecting || s.cancelled) {
                     continue;
                 }
@@ -1430,7 +1611,20 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         // the fresh allowlist/pool/policy. Running sessions keep theirs.
         if (reload.flag != nullptr && *reload.flag != 0 && reload.apply) {
             *reload.flag = 0;
+            const std::string old_key = conn_live.key;
             reload.apply(allow_live, pool_live, conn_live);
+            if (conn_live.key != old_key) {
+                // The idle downstreams passed under the old key; new
+                // sessions would never take them (pool_tag), so close
+                // them now rather than hold them.
+                for (auto& [pkey, bucket] : pool_idle) {
+                    (void)pkey;
+                    for (const int pfd : bucket) {
+                        ::close(pfd);
+                    }
+                }
+                pool_idle.clear();
+            }
         }
 
         // Accept at most one new session per wakeup (level-triggered, so
@@ -1550,9 +1744,34 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             // dial resolves through the normal release path.
             s->dial_cursor = cursor;
             cursor = (cursor + 1) % pool_live.size();
+            // i#849: with a key, greet the peer and dial only once it
+            // answers (check_answer), so a stranger never makes this
+            // stage dial. A fresh socket takes the 24 bytes at once.
+            s->key = conn_live.key;
+            bool greeted = true;
+            if (!s->key.empty()) {
+                // A one-way tag of the key, never the key (a log may
+                // print the pool's names).
+                s->pool_tag =
+                    "|key:" + sys::to_hex(sys::sha256(s->key)).substr(0, 16);
+                s->hs_in.emplace(s->key);
+                s->in_authed = false;
+                s->hs_deadline = Clock::now() +
+                                 std::chrono::milliseconds(
+                                     conn_live.handshake_timeout_ms);
+                const std::string& hello = s->hs_in->hello();
+                greeted = ::send(in_fd, hello.data(), hello.size(),
+                                 kSendFlags) ==
+                          static_cast<ssize_t>(hello.size());
+            }
             poller.add(in_fd);  // watch upstream for input immediately
             auto emplaced = sessions.emplace(in_fd, std::move(s));
-            try_dial(*emplaced.first->second);  // registers out_fd (connecting)
+            MuxSession& ns = *emplaced.first->second;
+            if (!greeted) {
+                begin_drop(ns, false);  // the peer is already gone
+            } else if (ns.in_authed) {
+                try_dial(ns);  // registers out_fd (connecting)
+            }
         }
     }
 
