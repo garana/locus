@@ -335,4 +335,254 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
     return true;
 }
 
+namespace {
+
+// The prefill kernels' parameter blocks (kernels.metal).
+struct RowNormParams {
+    std::uint32_t n, stride;
+    float eps;
+};
+struct RopeRowsParams {
+    std::uint64_t off;
+    std::uint32_t n_tok, n_heads, head_dim, stride;
+};
+struct ScatterParams {
+    std::uint64_t v_off;
+    std::uint32_t n_tok, kv_dim;
+};
+struct AttnRowsParams {
+    AttnParams a;
+    std::uint32_t base, q_stride;
+};
+
+/** The prefill forward's scratch (grow-only; device_mutex). */
+struct BatchScratch {
+    Context::Buffer x, xb, q, k, v, att, gate, up, cs, rows, blocks, head;
+};
+
+BatchScratch& batch_scratch() {
+    static BatchScratch s;
+    return s;
+}
+
+constexpr std::uint32_t kPrefillChunk = 256;
+// Below this many tokens a chunk runs a GPU forward a token: no matmul
+// gain at that size, and short chunks (a speculative verify) keep the
+// per-token forward's bits.
+constexpr std::uint32_t kPrefillMin = 32;
+
+}  // namespace
+
+bool TransformerModel::metal_forward_batch(
+    std::span<const tok::TokenId> toks, std::span<const float* const> embd,
+    kv::PagedKvCache::Seq& seq, kv::PagedKvCache& cache, Workspace& ws,
+    std::span<float> logits, bool all_logits) const {
+    using namespace backend;
+    const auto n = static_cast<std::uint32_t>(toks.size());
+    const std::uint32_t base = seq.n_tokens;
+    const std::uint32_t E = hp_.n_embd, hd = hp_.head_dim, H = hp_.n_heads,
+                        KV = hp_.n_kv_heads, ff = hp_.n_ff, V = hp_.n_vocab,
+                        L = hp_.n_layers;
+    if (n < kPrefillMin || !metal_forward_supported() || cache.quantized() ||
+        base + n > kAttnMaxPos || base + n > hp_.n_ctx ||
+        base + n > cache.capacity(seq) || hd > kAttnGroup ||
+        kAttnGroup % hd != 0 || (!embd.empty() && embd.size() != n) ||
+        logits.size() != std::size_t{all_logits ? n : 1} * V) {
+        return false;
+    }
+    for (std::uint32_t t = 0; t < n; ++t) {
+        const bool embedded = !embd.empty() && embd[t] != nullptr;
+        if (!embedded &&
+            (toks[t] < 0 || static_cast<std::uint32_t>(toks[t]) >= V)) {
+            return false;  // the host path reports it
+        }
+    }
+    const std::size_t qd = std::size_t{H} * hd, kvd = std::size_t{KV} * hd;
+    const std::uint32_t bt = cache.geometry().block_tokens;
+
+    std::lock_guard lk(metal::device_mutex());
+    const Context::Buffer* pool = metal::kv_buffer(cache.pool_data());
+    if (pool == nullptr) {
+        return false;
+    }
+    try {
+        Context& ctx = Context::get();
+        if (!metal_weights_) {
+            metal_weights_ = std::make_shared<MetalWeights>();
+        }
+        MetalWeights& mw = *metal_weights_;
+        const auto wbuf = [&](const Mat& m) -> const Context::Buffer& {
+            return mw.get(ctx, m.data,
+                          metal::matvec_weight_bytes(m.type, m.rows, m.cols));
+        };
+        const auto fbuf =
+            [&](std::span<const float> v) -> const Context::Buffer& {
+            return mw.get(ctx, v.data(), v.size_bytes());
+        };
+        BatchScratch& s = batch_scratch();
+        const std::size_t C = std::min(n, kPrefillChunk);
+        const std::uint32_t n_blocks = (base + n + bt - 1) / bt;
+        Scratch::grow(ctx, s.x, C * E * 4);
+        Scratch::grow(ctx, s.xb, C * E * 4);
+        Scratch::grow(ctx, s.q, C * qd * 4);
+        Scratch::grow(ctx, s.k, C * kvd * 4);
+        Scratch::grow(ctx, s.v, C * kvd * 4);
+        Scratch::grow(ctx, s.att, C * qd * 4);
+        Scratch::grow(ctx, s.gate, C * ff * 4);
+        Scratch::grow(ctx, s.up, C * ff * 4);
+        Scratch::grow(ctx, s.cs, C * hd * 4);
+        Scratch::grow(ctx, s.rows, C * L * 8);
+        Scratch::grow(ctx, s.blocks, std::size_t{n_blocks} * 4);
+        Scratch::grow(ctx, s.head,
+                      std::size_t{all_logits ? C : 1} * V * 4);
+        std::copy_n(seq.blocks.begin(), n_blocks,
+                    static_cast<std::uint32_t*>(s.blocks.data));
+        const float* pool_base = cache.pool_data();
+
+        // out[t] (+)= w in[t] for m token rows: one matmul, or a matvec a
+        // token (independent rows: they may overlap).
+        const auto mm = [&](const Mat& w, const Context::Buffer& in,
+                            std::uint32_t in_stride,
+                            const Context::Buffer& out,
+                            std::uint32_t out_stride, bool acc,
+                            std::uint32_t m) {
+            if (metal::record_matmul(ctx, w.type, w.rows, w.cols, m, wbuf(w),
+                                     0, in, 0, in_stride, out, 0, out_stride,
+                                     acc)) {
+                return;
+            }
+            for (std::uint32_t t = 0; t < m; ++t) {
+                if (t > 0) {
+                    ctx.overlap_next();
+                }
+                metal::record_matvec(ctx, w.type, w.rows, w.cols, wbuf(w), 0,
+                                     in, t * in_stride, out,
+                                     std::uint64_t{t} * out_stride, acc);
+            }
+        };
+        const auto norm_rows = [&](std::span<const float> w,
+                                   std::uint32_t m) {
+            const RowNormParams np{E, E, hp_.rms_eps};
+            const Context::Arg a[] = {{&s.x, 0}, {&fbuf(w), 0}, {&s.xb, 0}};
+            ctx.dispatch("rmsnorm_rows", a, bytes_of(np), m * kNormGroup,
+                         kNormGroup);
+        };
+
+        for (std::uint32_t c0 = 0; c0 < n; c0 += kPrefillChunk) {
+            const std::uint32_t m = std::min(kPrefillChunk, n - c0);
+            const bool last_chunk = c0 + m == n;
+            auto* x = static_cast<float*>(s.x.data);
+            auto* cs = static_cast<float*>(s.cs.data);
+            auto* rows = static_cast<std::uint64_t*>(s.rows.data);
+            for (std::uint32_t t = 0; t < m; ++t) {
+                const std::uint32_t i = c0 + t, pos = base + i;
+                const float* e = embd.empty() ? nullptr : embd[i];
+                if (e != nullptr) {
+                    std::copy_n(e, E, x + std::size_t{t} * E);
+                } else {
+                    ops().dequant_row(embd_,
+                                      static_cast<std::uint32_t>(toks[i]),
+                                      {x + std::size_t{t} * E, E});
+                }
+                rope_norm_table(hd, pos, hp_.rope_freq_base, rope_factors(),
+                                {cs + std::size_t{t} * hd, hd});
+                for (std::uint32_t l = 0; l < L; ++l) {
+                    rows[std::size_t{l} * m + t] =
+                        static_cast<std::uint64_t>(cache.k(seq, l, pos) -
+                                                   pool_base);
+                }
+            }
+            ctx.begin_batch();
+            try {
+                for (std::uint32_t l = 0; l < L; ++l) {
+                    const Layer& lay = layers_[l];
+                    norm_rows(lay.attn_norm, m);
+                    mm(lay.wq, s.xb, E, s.q, qd, false, m);
+                    ctx.overlap_next();
+                    mm(lay.wk, s.xb, E, s.k, kvd, false, m);
+                    ctx.overlap_next();
+                    mm(lay.wv, s.xb, E, s.v, kvd, false, m);
+                    const RopeRowsParams rq{0, m, H, hd,
+                                            static_cast<std::uint32_t>(qd)};
+                    const Context::Arg ra[] = {{&s.q, 0}, {&s.cs, 0}};
+                    ctx.dispatch("rope_rows", ra, bytes_of(rq),
+                                 m * H * hd / 2, 64);
+                    ctx.overlap_next();
+                    const RopeRowsParams rk{0, m, KV, hd,
+                                            static_cast<std::uint32_t>(kvd)};
+                    const Context::Arg rka[] = {{&s.k, 0}, {&s.cs, 0}};
+                    ctx.dispatch("rope_rows", rka, bytes_of(rk),
+                                 m * KV * hd / 2, 64);
+                    const ScatterParams sp{cache.layer_floats() / 2, m,
+                                           static_cast<std::uint32_t>(kvd)};
+                    const Context::Arg sa[] = {
+                        {&s.k, 0},
+                        {&s.v, 0},
+                        {pool, 0},
+                        {&s.rows, std::size_t{l} * m * 8}};
+                    ctx.dispatch("kv_scatter", sa, bytes_of(sp),
+                                 m * static_cast<std::uint32_t>(kvd), 256);
+                    const AttnRowsParams ap{
+                        {cache.block_floats(), cache.layer_offset(l),
+                         cache.layer_floats() / 2, 0, bt, H, KV, hd,
+                         hp_.kq_scale},
+                        base + c0,
+                        static_cast<std::uint32_t>(qd)};
+                    const Context::Arg aa[] = {
+                        {&s.q, 0}, {pool, 0}, {&s.blocks, 0}, {&s.att, 0}};
+                    ctx.dispatch("attn_rows", aa, bytes_of(ap),
+                                 m * H * kAttnGroup, kAttnGroup);
+                    mm(lay.wo, s.att, static_cast<std::uint32_t>(qd), s.x, E,
+                       true, m);
+                    norm_rows(lay.ffn_norm, m);
+                    mm(lay.w_gate, s.xb, E, s.gate, ff, false, m);
+                    ctx.overlap_next();
+                    mm(lay.w_up, s.xb, E, s.up, ff, false, m);
+                    const SiluParams sp2{m * ff};
+                    const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
+                    ctx.dispatch("silu_mul", su, bytes_of(sp2), m * ff, 256);
+                    mm(lay.w_down, s.gate, ff, s.x, E, true, m);
+                }
+                if (all_logits || last_chunk) {
+                    norm_rows(out_norm_, m);
+                    const std::uint32_t t0 = all_logits ? 0 : m - 1;
+                    for (std::uint32_t t = t0; t < m; ++t) {
+                        if (t > t0) {
+                            ctx.overlap_next();
+                        }
+                        metal::record_matvec(
+                            ctx, out_w_.type, V, out_w_.cols, wbuf(out_w_), 0,
+                            s.xb, t * E, s.head,
+                            std::uint64_t{t - t0} * V, false);
+                    }
+                }
+            } catch (...) {
+                ctx.end_batch();
+                throw;
+            }
+            ctx.end_batch();
+            const auto* head = static_cast<const float*>(s.head.data);
+            if (all_logits) {
+                std::copy_n(head, std::size_t{m} * V,
+                            logits.begin() + std::size_t{c0} * V);
+            } else if (last_chunk) {
+                std::copy_n(head, V, logits.begin());
+            }
+            if (last_chunk) {
+                std::copy_n(static_cast<const float*>(s.xb.data) +
+                                std::size_t{m - 1} * E,
+                            E, ws.xb.begin());
+            }
+        }
+        for (std::uint32_t t = 0; t < (all_logits ? n : 1); ++t) {
+            scale_logits(logits.subspan(std::size_t{t} * V, V));
+        }
+        seq.n_tokens = base + n;
+        g_metal_tokens.fetch_add(n);
+    } catch (const std::exception&) {
+        return false;  // a device error: the caller runs the tokens again
+    }
+    return true;
+}
+
 }  // namespace locus::model
