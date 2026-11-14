@@ -41,6 +41,9 @@ inline std::string backend_unavail_reason(std::string_view name) {
     if (name == "cuda") {
         return "no CUDA device or non-CUDA build";
     }
+    if (name == "metal") {
+        return "no Metal device or non-Apple build";
+    }
     return "unavailable on this machine";
 }
 
@@ -100,7 +103,7 @@ inline void print_backends() {
     // AVX2 backends on an ARM build) are absent from the registry;
     // list them too so the operator sees the full matrix.
     for (const char* n : {"scalar", "neon", "sse4", "avx2", "vulkan",
-                          "cuda"}) {
+                          "cuda", "metal"}) {
         if (locus::backend::find_backend(n) == nullptr) {
             std::printf(
                 "  %-8s [unavailable: not built for this "
