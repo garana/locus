@@ -993,6 +993,50 @@ std::uint64_t read_seed(const json& body) {
 }
 
 /**
+ * The logprobs request of a completions or chat body, within OpenAI's
+ * limits: /v1/completions takes an integer `logprobs` from 0 to 5,
+ * /v1/chat/completions a bool `logprobs` and an integer `top_logprobs`
+ * from 0 to 20. A reply holds max_tokens x (top + 1) entries, so the cap
+ * keeps it small; null or false means off.
+ *
+ * @throws std::invalid_argument for any other value.
+ */
+engine::LogprobsOpt read_logprobs(const json& body, bool chat) {
+    engine::LogprobsOpt lp;
+    const auto count = [&](const char* key, std::int64_t max) {
+        const json& v = body[key];
+        if (!v.is_number_integer() || v.get<std::int64_t>() < 0 ||
+            v.get<std::int64_t>() > max) {
+            throw std::invalid_argument(std::string(key) +
+                                        " must be an integer from 0 to " +
+                                        std::to_string(max));
+        }
+        return static_cast<std::uint32_t>(v.get<std::int64_t>());
+    };
+    const bool set = body.contains("logprobs") && !body["logprobs"].is_null();
+    if (chat) {
+        if (!set) return lp;
+        if (!body["logprobs"].is_boolean()) {
+            throw std::invalid_argument("logprobs must be a boolean");
+        }
+        if (!body["logprobs"].get<bool>()) return lp;
+        lp.enabled = true;
+        if (body.contains("top_logprobs") &&
+            !body["top_logprobs"].is_null()) {
+            lp.top = count("top_logprobs", 20);
+        }
+        return lp;
+    }
+    if (!set || (body["logprobs"].is_boolean() &&
+                 !body["logprobs"].get<bool>())) {
+        return lp;
+    }
+    lp.enabled = true;
+    lp.top = count("logprobs", 5);
+    return lp;
+}
+
+/**
  * Parses a chat (OpenAI messages[]) or messages (Anthropic, with a
  * top-level system) body that carries images.
  *
@@ -2002,6 +2046,7 @@ void OpenAiServer::install_routes() {
         std::vector<ToolSpec> tools;
         std::optional<VisionChat> vision;  // a chat with images (i#241)
         OutputGrammar grammar;  // an output format
+        engine::LogprobsOpt lp;
         try {
             body = json::parse(req.body);
             if (chat) {
@@ -2039,6 +2084,7 @@ void OpenAiServer::install_routes() {
             if (!vision) {
                 grammar = output_grammar(body, req.body);
             }
+            lp = read_logprobs(body, chat);
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(make_error(e.what()).dump(-1, ' ', false, kLossy),
@@ -2053,19 +2099,6 @@ void OpenAiServer::install_routes() {
         auto [sampling, seed] = parse_sampling(body);
         std::unique_ptr<model::TokenConstraint> constraint =
             output_constraint(std::move(grammar));
-        // logprobs: /v1/completions takes an integer count; /v1/chat/
-        // completions takes a bool `logprobs` + integer `top_logprobs`.
-        engine::LogprobsOpt lp;
-        if (chat) {
-            if (body.value("logprobs", false)) {
-                lp.enabled = true;
-                lp.top = body.value("top_logprobs", 0);
-            }
-        } else if (body.contains("logprobs") &&
-                   body["logprobs"].is_number_unsigned()) {
-            lp.enabled = true;
-            lp.top = body["logprobs"].get<std::uint32_t>();
-        }
         auto prompt_ids = tok_.encode(prompt, true);
         const std::uint32_t n_prompt =
             static_cast<std::uint32_t>(prompt_ids.size());
