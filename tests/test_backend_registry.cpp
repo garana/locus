@@ -78,6 +78,10 @@ TEST_CASE("gpu_idle_warning flags a default CPU pick with a GPU usable",
     SECTION("a GPU pick does not warn") {
         const Backend list[] = {cpu, vk};
         REQUIRE(gpu_idle_warning(true, vk, list, true).empty());
+        // The Apple default's Metal pick (i#867), Vulkan usable too.
+        const Backend mt{"metal", "", true, true, {}};
+        const Backend list_mt[] = {cpu, vk, mt};
+        REQUIRE(gpu_idle_warning(true, mt, list_mt, true).empty());
     }
     SECTION("no usable GPU does not warn") {
         const Backend list[] = {cpu, vk_off};

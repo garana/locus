@@ -264,6 +264,22 @@ class TransformerModel {
      */
     void use_backend(const backend::Backend& b) { backend_ = &b; }
 
+    /**
+     * Picks this model's backend and uses it (i#867). An explicit
+     * choice (--backend, else LOCUS_BACKEND) is resolve_backend's. The
+     * default: on a host with Metal, Metal when its whole-token forward
+     * takes this model with a cache of kv_type (metal_forward declines
+     * a cache that is not f32), else Vulkan where it is usable (not Metal's
+     * per-op path), else best_backend(); elsewhere best_backend().
+     *
+     * @param choice The --backend value, empty for none.
+     * @param kv_type The KV cache type the model will run with.
+     * @returns The backend picked.
+     * @throws std::invalid_argument for an unknown or unusable choice.
+     */
+    const backend::Backend& use_backend_for(
+        std::string_view choice, kv::KvType kv_type = kv::KvType::kF32);
+
     /** @returns The backend currently doing the math. */
     const backend::Backend& active_backend() const {
         return *backend_;
