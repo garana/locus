@@ -1120,6 +1120,23 @@ __device__ float warp_sum(float v) {
     return v;
 }
 
+/** The scales of sub-blocks 2j and 2j + 1 of a Q4_K or Q5_K block (d
+ *  and dmin f16 at bytes 0 and 2, scales[12] at 4): d1 = d * scale and
+ *  m1 = dmin * min of sub-block 2j, d2 and m2 of 2j + 1. */
+__device__ inline void k4_pair_scales(const std::uint8_t* blk,
+                                      std::uint32_t j, float& d1,
+                                      float& m1, float& d2, float& m2) {
+    const float d = ld_f16(blk);
+    const float dmin = ld_f16(blk + 2);
+    std::uint8_t sc, mn;
+    scale_min_k4(2 * j, blk + 4, sc, mn);
+    d1 = d * sc;
+    m1 = dmin * mn;
+    scale_min_k4(2 * j + 1, blk + 4, sc, mn);
+    d2 = d * sc;
+    m2 = dmin * mn;
+}
+
 /**
  * One Q4_K super-block is 144 bytes: d,dmin (f16) + scales[12] +
  * qs[128], 256 weights. One warp per row: lane `l` reads the 4 qs
@@ -1148,19 +1165,8 @@ __global__ void matvec_q4_k_warp_kernel(const std::uint8_t* w,
     float acc = 0.0f;
     for (std::uint32_t b = 0; b < nsb; ++b) {
         const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 144;
-        const std::uint16_t db =
-            static_cast<std::uint16_t>(blk[0]) |
-            (static_cast<std::uint16_t>(blk[1]) << 8);
-        const std::uint16_t dmb =
-            static_cast<std::uint16_t>(blk[2]) |
-            (static_cast<std::uint16_t>(blk[3]) << 8);
-        const float d = __half2float(__ushort_as_half(db));
-        const float dmin = __half2float(__ushort_as_half(dmb));
-        std::uint8_t sc, mn;
-        scale_min_k4(2 * j, blk + 4, sc, mn);
-        const float d1 = d * sc, m1 = dmin * mn;
-        scale_min_k4(2 * j + 1, blk + 4, sc, mn);
-        const float d2 = d * sc, m2 = dmin * mn;
+        float d1, m1, d2, m2;
+        k4_pair_scales(blk, j, d1, m1, d2, m2);
         const std::uint32_t q4 =
             reinterpret_cast<const std::uint32_t*>(blk + 16)[lane];
         const float* xb =
@@ -1213,19 +1219,8 @@ __global__ void matvec_q5_k_warp_kernel(const std::uint8_t* w,
     float acc = 0.0f;
     for (std::uint32_t b = 0; b < nsb; ++b) {
         const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 176;
-        const std::uint16_t db =
-            static_cast<std::uint16_t>(blk[0]) |
-            (static_cast<std::uint16_t>(blk[1]) << 8);
-        const std::uint16_t dmb =
-            static_cast<std::uint16_t>(blk[2]) |
-            (static_cast<std::uint16_t>(blk[3]) << 8);
-        const float d = __half2float(__ushort_as_half(db));
-        const float dmin = __half2float(__ushort_as_half(dmb));
-        std::uint8_t sc, mn;
-        scale_min_k4(2 * j, blk + 4, sc, mn);
-        const float d1 = d * sc, m1 = dmin * mn;
-        scale_min_k4(2 * j + 1, blk + 4, sc, mn);
-        const float d2 = d * sc, m2 = dmin * mn;
+        float d1, m1, d2, m2;
+        k4_pair_scales(blk, j, d1, m1, d2, m2);
         const std::uint32_t ql4 =
             __ldg(reinterpret_cast<const std::uint32_t*>(blk + 48) + lane);
         const std::uint32_t qh4 =
@@ -2190,19 +2185,8 @@ __global__ void matvec_batch_q4_k_kernel(const std::uint8_t* w,
     }
     for (std::uint32_t b = 0; b < nsb; ++b) {
         const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 144;
-        const std::uint16_t db =
-            static_cast<std::uint16_t>(blk[0]) |
-            (static_cast<std::uint16_t>(blk[1]) << 8);
-        const std::uint16_t dmb =
-            static_cast<std::uint16_t>(blk[2]) |
-            (static_cast<std::uint16_t>(blk[3]) << 8);
-        const float d = __half2float(__ushort_as_half(db));
-        const float dmin = __half2float(__ushort_as_half(dmb));
-        std::uint8_t sc, mn;
-        scale_min_k4(2 * j, blk + 4, sc, mn);
-        const float d1 = d * sc, m1 = dmin * mn;
-        scale_min_k4(2 * j + 1, blk + 4, sc, mn);
-        const float d2 = d * sc, m2 = dmin * mn;
+        float d1, m1, d2, m2;
+        k4_pair_scales(blk, j, d1, m1, d2, m2);
         const std::uint32_t q4 =
             reinterpret_cast<const std::uint32_t*>(blk + 16)[lane];
         float vlo[4], vhi[4];
@@ -2310,19 +2294,8 @@ __global__ void matvec_batch_q5_k_kernel(const std::uint8_t* w,
     }
     for (std::uint32_t b = 0; b < nsb; ++b) {
         const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 176;
-        const std::uint16_t db =
-            static_cast<std::uint16_t>(blk[0]) |
-            (static_cast<std::uint16_t>(blk[1]) << 8);
-        const std::uint16_t dmb =
-            static_cast<std::uint16_t>(blk[2]) |
-            (static_cast<std::uint16_t>(blk[3]) << 8);
-        const float d = __half2float(__ushort_as_half(db));
-        const float dmin = __half2float(__ushort_as_half(dmb));
-        std::uint8_t sc, mn;
-        scale_min_k4(2 * j, blk + 4, sc, mn);
-        const float d1 = d * sc, m1 = dmin * mn;
-        scale_min_k4(2 * j + 1, blk + 4, sc, mn);
-        const float d2 = d * sc, m2 = dmin * mn;
+        float d1, m1, d2, m2;
+        k4_pair_scales(blk, j, d1, m1, d2, m2);
         const std::uint32_t ql4 =
             __ldg(reinterpret_cast<const std::uint32_t*>(blk + 48) + lane);
         const std::uint32_t qh4 =
