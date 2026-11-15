@@ -693,23 +693,78 @@ inline void mm_scale_min(uint j, device const uchar* q, thread uint& sc,
     }
 }
 
-kernel void mm_q4_k(device const uchar* wbase [[buffer(0)]],
-                   device const float* xbase [[buffer(1)]],
-                   device float* ybase [[buffer(2)]],
-                   constant MmParams& p [[buffer(3)]],
-                   uint tgi [[threadgroup_position_in_grid]],
-                   uint tid [[thread_index_in_threadgroup]],
-                   uint sg [[simdgroup_index_in_threadgroup]]) {
+// The weight loaders: each fills da[0 .. 16) with the dequantized
+// weights k0 + ah .. k0 + ah + 15 of a row (ah 0 or 16; a k stage of
+// 32 lies in one sub-block or block), and gives a row's bytes.
+struct MmLoadQ4K {
+    static ulong row_bytes(uint cols) { return ulong(cols / 256) * 144; }
+    static void load(device const uchar* row, uint k0, uint ah,
+                     threadgroup float* da) {
+        device const MmBlockQ4K& blk =
+            ((device const MmBlockQ4K*)row)[k0 / 256];
+        const uint j = (k0 % 256) / 32;
+        uint sc, mn;
+        mm_scale_min(j, blk.scales, sc, mn);
+        const float d = float(blk.d) * float(sc);
+        const float mm = float(blk.dmin) * float(mn);
+        device const uchar* q = blk.qs + 32 * (j / 2) + ah;
+        const uint sh = (j & 1) * 4;
+        for (uint i = 0; i < 16; ++i) {
+            da[i] = d * float((q[i] >> sh) & 0xF) - mm;
+        }
+    }
+};
+
+struct MmLoadQ6K {
+    static ulong row_bytes(uint cols) { return ulong(cols / 256) * 210; }
+    // Stage k0 is quarter qq of half hn of its block: l = ah + i (the
+    // layout as mv_q6_k; 210-byte blocks, read bytewise).
+    static void load(device const uchar* row, uint k0, uint ah,
+                     threadgroup float* da) {
+        device const uchar* blk = row + (k0 / 256) * 210;
+        const uint e0 = k0 % 256, hn = e0 / 128, qq = (e0 % 128) / 32;
+        device const uchar* ql = blk + 64 * hn + 32 * (qq & 1) + ah;
+        device const uchar* qh = blk + 128 + 32 * hn + ah;
+        const float d =
+            f16_at(blk + 208) *
+            float(((device const char*)(blk + 192))[8 * hn + ah / 16 +
+                                                   2 * qq]);
+        const uint lsh = (qq >> 1) * 4, hsh = 2 * qq;
+        for (uint i = 0; i < 16; ++i) {
+            const int q = int(((ql[i] >> lsh) & 0xF) |
+                              (((qh[i] >> hsh) & 3) << 4)) -
+                          32;
+            da[i] = d * float(q);
+        }
+    }
+};
+
+struct MmLoadQ8_0 {
+    static ulong row_bytes(uint cols) { return ulong(cols / 32) * 34; }
+    // Stage k0 is block k0 / 32: d, then 32 int8.
+    static void load(device const uchar* row, uint k0, uint ah,
+                     threadgroup float* da) {
+        device const uchar* blk = row + (k0 / 32) * 34;
+        const float d = f16_at(blk);
+        device const char* qv = (device const char*)(blk + 2) + ah;
+        for (uint i = 0; i < 16; ++i) {
+            da[i] = d * float(qv[i]);
+        }
+    }
+};
+
+// The tile shared by every weight type, its loader L the one difference.
+template <typename L>
+inline void mm_tile(device const uchar* wbase, device const float* xbase,
+                    device float* ybase, constant MmParams& p, uint tgi,
+                    uint tid, uint sg, threadgroup float* sa,
+                    threadgroup float* sb, threadgroup float* so) {
     const uint2 tg = uint2(tgi % p.row_tiles, tgi / p.row_tiles);
-    threadgroup float sa[kMmTM * kMmPA];
-    threadgroup float sb[kMmTN * kMmPB];
-    threadgroup float so[kMmTN * kMmPO];
-    device const MmBlockQ4K* w = (device const MmBlockQ4K*)(wbase + p.w_off);
+    device const uchar* w = wbase + p.w_off;
     device const float* x = xbase + p.x_off;
     device float* y = ybase + p.out_off;
     const uint m0 = tg.x * kMmTM;
     const uint n0 = tg.y * kMmTN;
-    const uint nb = p.cols / 256;
     const uint rm = (sg & 1) * 32;
     const uint rn = (sg >> 1) * 16;
     simdgroup_float8x8 acc[4][2];
@@ -724,23 +779,14 @@ kernel void mm_q4_k(device const uchar* wbase [[buffer(0)]],
     const uint bk = (tid & 3) * 8;
     const bool a_in = m0 + ar < p.rows;
     const bool b_in = n0 + bt < p.n_tok;
-    device const MmBlockQ4K* wrow = w + (a_in ? (m0 + ar) * nb : 0);
+    device const uchar* wrow =
+        w + (a_in ? ulong(m0 + ar) * L::row_bytes(p.cols) : 0);
     device const float* xrow = x + (b_in ? (n0 + bt) * p.x_stride : 0);
 
     for (uint k0 = 0; k0 < p.cols; k0 += kMmTK) {
         threadgroup float* da = sa + ar * kMmPA + ah;
         if (a_in) {
-            device const MmBlockQ4K& blk = wrow[k0 / 256];
-            const uint j = (k0 % 256) / 32;
-            uint sc, mn;
-            mm_scale_min(j, blk.scales, sc, mn);
-            const float d = float(blk.d) * float(sc);
-            const float mm = float(blk.dmin) * float(mn);
-            device const uchar* q = blk.qs + 32 * (j / 2) + ah;
-            const uint sh = (j & 1) * 4;
-            for (uint i = 0; i < 16; ++i) {
-                da[i] = d * float((q[i] >> sh) & 0xF) - mm;
-            }
+            L::load(wrow, k0, ah, da);
         } else {
             for (uint i = 0; i < 16; ++i) da[i] = 0.0f;
         }
@@ -783,6 +829,25 @@ kernel void mm_q4_k(device const uchar* wbase [[buffer(0)]],
         }
     }
 }
+
+#define MM_KERNEL(name, loader)                                          \
+    kernel void name(device const uchar* wbase [[buffer(0)]],           \
+                     device const float* xbase [[buffer(1)]],           \
+                     device float* ybase [[buffer(2)]],                 \
+                     constant MmParams& p [[buffer(3)]],                \
+                     uint tgi [[threadgroup_position_in_grid]],         \
+                     uint tid [[thread_index_in_threadgroup]],          \
+                     uint sg [[simdgroup_index_in_threadgroup]]) {      \
+        threadgroup float sa[kMmTM * kMmPA];                            \
+        threadgroup float sb[kMmTN * kMmPB];                            \
+        threadgroup float so[kMmTN * kMmPO];                            \
+        mm_tile<loader>(wbase, xbase, ybase, p, tgi, tid, sg, sa, sb,   \
+                        so);                                            \
+    }
+
+MM_KERNEL(mm_q4_k, MmLoadQ4K)
+MM_KERNEL(mm_q6_k, MmLoadQ6K)
+MM_KERNEL(mm_q8_0, MmLoadQ8_0)
 
 // ---------------------------------------------------------------------
 // The prefill forward's row kernels (i#866): n token rows at once.
@@ -931,102 +996,6 @@ kernel void attn_rows(device const float* q [[buffer(0)]],
     }
 }
 
-// The Q6_K matmul: mm_q4_k with a Q6_K weight loader (210-byte
-// blocks, read bytewise; the layout as mv_q6_k).
-kernel void mm_q6_k(device const uchar* wbase [[buffer(0)]],
-                   device const float* xbase [[buffer(1)]],
-                   device float* ybase [[buffer(2)]],
-                   constant MmParams& p [[buffer(3)]],
-                   uint tgi [[threadgroup_position_in_grid]],
-                   uint tid [[thread_index_in_threadgroup]],
-                   uint sg [[simdgroup_index_in_threadgroup]]) {
-    const uint2 tg = uint2(tgi % p.row_tiles, tgi / p.row_tiles);
-    threadgroup float sa[kMmTM * kMmPA];
-    threadgroup float sb[kMmTN * kMmPB];
-    threadgroup float so[kMmTN * kMmPO];
-    device const uchar* w = wbase + p.w_off;
-    device const float* x = xbase + p.x_off;
-    device float* y = ybase + p.out_off;
-    const uint m0 = tg.x * kMmTM;
-    const uint n0 = tg.y * kMmTN;
-    const uint nb = p.cols / 256;
-    const uint rm = (sg & 1) * 32;
-    const uint rn = (sg >> 1) * 16;
-    simdgroup_float8x8 acc[4][2];
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 2; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
-
-    // Loaders: A, row tid / 2, 16 elements at (tid & 1) * 16; B, token
-    // tid / 4, 8 elements at (tid & 3) * 8.
-    const uint ar = tid >> 1;
-    const uint ah = (tid & 1) * 16;
-    const uint bt = tid >> 2;
-    const uint bk = (tid & 3) * 8;
-    const bool a_in = m0 + ar < p.rows;
-    const bool b_in = n0 + bt < p.n_tok;
-    device const uchar* wrow = w + (a_in ? ulong(m0 + ar) * nb * 210 : 0);
-    device const float* xrow = x + (b_in ? (n0 + bt) * p.x_stride : 0);
-
-    for (uint k0 = 0; k0 < p.cols; k0 += kMmTK) {
-        threadgroup float* da = sa + ar * kMmPA + ah;
-        if (a_in) {
-            // Stage k0 is quarter qq of half hn of its block: l = ah + i.
-            device const uchar* blk = wrow + (k0 / 256) * 210;
-            const uint e0 = k0 % 256, hn = e0 / 128, qq = (e0 % 128) / 32;
-            device const uchar* ql = blk + 64 * hn + 32 * (qq & 1) + ah;
-            device const uchar* qh = blk + 128 + 32 * hn + ah;
-            const float d =
-                f16_at(blk + 208) *
-                float(((device const char*)(blk + 192))[8 * hn + ah / 16 +
-                                                       2 * qq]);
-            const uint lsh = (qq >> 1) * 4, hsh = 2 * qq;
-            for (uint i = 0; i < 16; ++i) {
-                const int q = int(((ql[i] >> lsh) & 0xF) |
-                                  (((qh[i] >> hsh) & 3) << 4)) - 32;
-                da[i] = d * float(q);
-            }
-        } else {
-            for (uint i = 0; i < 16; ++i) da[i] = 0.0f;
-        }
-        threadgroup float* db = sb + bt * kMmPB + bk;
-        if (b_in) {
-            device const float* src = xrow + k0 + bk;
-            for (uint i = 0; i < 8; ++i) db[i] = src[i];
-        } else {
-            for (uint i = 0; i < 8; ++i) db[i] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < kMmTK; kk += 8) {
-            simdgroup_float8x8 a[4], bm[2];
-            for (uint i = 0; i < 4; ++i)
-                simdgroup_load(a[i], sa + (rm + 8 * i) * kMmPA + kk, kMmPA);
-            // B is k x tokens: the [token][k] tile, loaded transposed.
-            for (uint j = 0; j < 2; ++j)
-                simdgroup_load(bm[j], sb + (rn + 8 * j) * kMmPB + kk, kMmPB,
-                               ulong2(0, 0), true);
-            for (uint i = 0; i < 4; ++i)
-                for (uint j = 0; j < 2; ++j)
-                    simdgroup_multiply_accumulate(acc[i][j], a[i], bm[j],
-                                                  acc[i][j]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    // The tile as [token][row] in threadgroup memory, then each thread
-    // stores its share inside the matrix.
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 2; ++j)
-            simdgroup_store(acc[i][j], so + (rn + 8 * j) * kMmPO + rm + 8 * i,
-                            kMmPO, ulong2(0, 0), true);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint e = tid; e < kMmTM * kMmTN; e += 128) {
-        const uint t = e / kMmTM, r = e % kMmTM;
-        if (n0 + t < p.n_tok && m0 + r < p.rows) {
-            device float* o = y + (n0 + t) * p.out_stride + m0 + r;
-            const float v = p.scale * so[t * kMmPO + r];
-            *o = p.accumulate != 0 ? *o + v : v;
-        }
-    }
-}
 
 // Causal attention for a chunk, tiled: threadgroup g takes queries
 // 8 (g / n_heads) .. + 8 of head g % n_heads, one simdgroup a query.
@@ -1123,91 +1092,3 @@ kernel void attn_rows_tiled(device const float* q [[buffer(0)]],
     }
 }
 
-// The Q8_0 matmul: mm_q4_k with a Q8_0 weight loader (34-byte
-// blocks of 32, a block a k stage).
-kernel void mm_q8_0(device const uchar* wbase [[buffer(0)]],
-                   device const float* xbase [[buffer(1)]],
-                   device float* ybase [[buffer(2)]],
-                   constant MmParams& p [[buffer(3)]],
-                   uint tgi [[threadgroup_position_in_grid]],
-                   uint tid [[thread_index_in_threadgroup]],
-                   uint sg [[simdgroup_index_in_threadgroup]]) {
-    const uint2 tg = uint2(tgi % p.row_tiles, tgi / p.row_tiles);
-    threadgroup float sa[kMmTM * kMmPA];
-    threadgroup float sb[kMmTN * kMmPB];
-    threadgroup float so[kMmTN * kMmPO];
-    device const uchar* w = wbase + p.w_off;
-    device const float* x = xbase + p.x_off;
-    device float* y = ybase + p.out_off;
-    const uint m0 = tg.x * kMmTM;
-    const uint n0 = tg.y * kMmTN;
-    const uint nb = p.cols / 32;
-    const uint rm = (sg & 1) * 32;
-    const uint rn = (sg >> 1) * 16;
-    simdgroup_float8x8 acc[4][2];
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 2; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
-
-    // Loaders: A, row tid / 2, 16 elements at (tid & 1) * 16; B, token
-    // tid / 4, 8 elements at (tid & 3) * 8.
-    const uint ar = tid >> 1;
-    const uint ah = (tid & 1) * 16;
-    const uint bt = tid >> 2;
-    const uint bk = (tid & 3) * 8;
-    const bool a_in = m0 + ar < p.rows;
-    const bool b_in = n0 + bt < p.n_tok;
-    device const uchar* wrow = w + (a_in ? ulong(m0 + ar) * nb * 34 : 0);
-    device const float* xrow = x + (b_in ? (n0 + bt) * p.x_stride : 0);
-
-    for (uint k0 = 0; k0 < p.cols; k0 += kMmTK) {
-        threadgroup float* da = sa + ar * kMmPA + ah;
-        if (a_in) {
-            // Stage k0 is block k0 / 32: d, then 32 int8; a lane takes 16.
-            device const uchar* blk = wrow + (k0 / 32) * 34;
-            const float d = f16_at(blk);
-            device const char* qv = (device const char*)(blk + 2) + ah;
-            for (uint i = 0; i < 16; ++i) {
-                da[i] = d * float(qv[i]);
-            }
-        } else {
-            for (uint i = 0; i < 16; ++i) da[i] = 0.0f;
-        }
-        threadgroup float* db = sb + bt * kMmPB + bk;
-        if (b_in) {
-            device const float* src = xrow + k0 + bk;
-            for (uint i = 0; i < 8; ++i) db[i] = src[i];
-        } else {
-            for (uint i = 0; i < 8; ++i) db[i] = 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint kk = 0; kk < kMmTK; kk += 8) {
-            simdgroup_float8x8 a[4], bm[2];
-            for (uint i = 0; i < 4; ++i)
-                simdgroup_load(a[i], sa + (rm + 8 * i) * kMmPA + kk, kMmPA);
-            // B is k x tokens: the [token][k] tile, loaded transposed.
-            for (uint j = 0; j < 2; ++j)
-                simdgroup_load(bm[j], sb + (rn + 8 * j) * kMmPB + kk, kMmPB,
-                               ulong2(0, 0), true);
-            for (uint i = 0; i < 4; ++i)
-                for (uint j = 0; j < 2; ++j)
-                    simdgroup_multiply_accumulate(acc[i][j], a[i], bm[j],
-                                                  acc[i][j]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    // The tile as [token][row] in threadgroup memory, then each thread
-    // stores its share inside the matrix.
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 2; ++j)
-            simdgroup_store(acc[i][j], so + (rn + 8 * j) * kMmPO + rm + 8 * i,
-                            kMmPO, ulong2(0, 0), true);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint e = tid; e < kMmTM * kMmTN; e += 128) {
-        const uint t = e / kMmTM, r = e % kMmTM;
-        if (n0 + t < p.n_tok && m0 + r < p.rows) {
-            device float* o = y + (n0 + t) * p.out_stride + m0 + r;
-            const float v = p.scale * so[t * kMmPO + r];
-            *o = p.accumulate != 0 ? *o + v : v;
-        }
-    }
-}
