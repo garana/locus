@@ -5,13 +5,14 @@
 
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/metal/context.hpp"
+#include "locus/backend/registry.hpp"
 
 namespace locus::backend::metal {
 
 /**
  * @returns Whether the Metal backend has a matvec kernel for weights
- *     of type t (F32, F16, Q8_0, Q4_0, Q5_0, Q4_K, Q5_K, Q6_K), for
- *     any shape whose columns are a whole number of t's blocks.
+ *     of type t (F32, F16, BF16, Q8_0, Q4_0, Q5_0, Q4_K, Q5_K, Q6_K),
+ *     for any shape whose columns are a whole number of t's blocks.
  */
 bool matvec_supported(gguf::TensorType t);
 
@@ -43,6 +44,23 @@ void matvec(const Mat& w, std::span<const float> x, std::span<float> out);
 double matvec_repeat(const Mat& w, std::span<const float> x,
                      std::span<float> out, std::uint32_t reps);
 
+/**
+ * matvec_batch on the GPU (the Ops contract): w applied to n
+ * token-major inputs, out row-major (out[r * n + t]). A matmul where
+ * the type has one (Q4_K, Q6_K, Q8_0, F32, F16, BF16), else a matvec a
+ * token in one batch; other types run the scalar CPU batch. Weights
+ * go through matvec()'s cache, so the same lifetime rule holds.
+ */
+void matvec_batch(const Mat& w, std::span<const float> x,
+                  std::span<float> out, std::uint32_t n);
+
+/**
+ * @returns The Ops for the image and encoder models' large passes on
+ *     Metal (as vulkan_image_ops): matvec and matvec_batch on the GPU,
+ *     self-parallel, not thread-safe.
+ */
+const Ops& image_ops();
+
 /** Frees every cached weight buffer (tests; the next matvec uploads
  *  again). */
 void drop_weights();
@@ -73,7 +91,8 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
  * once for a tile of 32 tokens. Token t of x starts at x_off + t *
  * x_stride (floats). The caller holds device_mutex().
  * @returns false, recording nothing, for a type without a matmul
- *     kernel (Q4_K, Q6_K and Q8_0): the caller loops record_matvec.
+ *     kernel (Q4_K, Q6_K, Q8_0, F32, F16, BF16) or columns that are
+ *     not whole k stages: the caller loops record_matvec.
  */
 bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t cols, std::uint32_t n_tok,

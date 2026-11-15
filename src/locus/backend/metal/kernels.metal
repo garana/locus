@@ -141,6 +141,28 @@ kernel void mv_f16(device const uchar* w [[buffer(0)]],
     mv_store(out, p, r, lane, acc);
 }
 
+// BF16: units of 4 columns (8-byte loads), widened by a shift.
+kernel void mv_bf16(device const uchar* w [[buffer(0)]],
+                    device const float* xb [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    constant MvParams& p [[buffer(3)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+    const uint lane = tid % kMvLanes;
+    const uint r = tg * kMvRows + tid / kMvLanes;
+    float acc = 0.0f;
+    if (r < p.rows) {
+        device const ushort4* row =
+            (device const ushort4*)(w + p.w_off + (ulong)r * p.cols * 2);
+        device const float4* x = (device const float4*)(xb + p.x_off);
+        for (uint u = lane; u < p.cols / 4; u += kMvLanes) {
+            const uint4 v = uint4(row[u]) << 16;
+            acc += dot(as_type<float4>(v), x[u]);
+        }
+    }
+    mv_store(out, p, r, lane, acc);
+}
+
 // Q4_0: 18-byte blocks of 32 (f16 d, 16 bytes): element j is the low
 // nibble of byte j minus 8, element j + 16 the high one.
 kernel void mv_q4_0(device const uchar* w [[buffer(0)]],
@@ -753,6 +775,41 @@ struct MmLoadQ8_0 {
     }
 };
 
+// The float weights (the image and encoder models carry them): 16
+// consecutive values of a row, F32 as is, F16 and BF16 widened.
+struct MmLoadF32 {
+    static ulong row_bytes(uint cols) { return ulong(cols) * 4; }
+    static void load(device const uchar* row, uint k0, uint ah,
+                     threadgroup float* da) {
+        device const float* v = (device const float*)row + k0 + ah;
+        for (uint i = 0; i < 16; ++i) {
+            da[i] = v[i];
+        }
+    }
+};
+
+struct MmLoadF16 {
+    static ulong row_bytes(uint cols) { return ulong(cols) * 2; }
+    static void load(device const uchar* row, uint k0, uint ah,
+                     threadgroup float* da) {
+        device const half* v = (device const half*)row + k0 + ah;
+        for (uint i = 0; i < 16; ++i) {
+            da[i] = float(v[i]);
+        }
+    }
+};
+
+struct MmLoadBF16 {
+    static ulong row_bytes(uint cols) { return ulong(cols) * 2; }
+    static void load(device const uchar* row, uint k0, uint ah,
+                     threadgroup float* da) {
+        device const ushort* v = (device const ushort*)row + k0 + ah;
+        for (uint i = 0; i < 16; ++i) {
+            da[i] = as_type<float>(uint(v[i]) << 16);
+        }
+    }
+};
+
 // The tile shared by every weight type, its loader L the one difference.
 template <typename L>
 inline void mm_tile(device const uchar* wbase, device const float* xbase,
@@ -848,6 +905,9 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
 MM_KERNEL(mm_q4_k, MmLoadQ4K)
 MM_KERNEL(mm_q6_k, MmLoadQ6K)
 MM_KERNEL(mm_q8_0, MmLoadQ8_0)
+MM_KERNEL(mm_f32, MmLoadF32)
+MM_KERNEL(mm_f16, MmLoadF16)
+MM_KERNEL(mm_bf16, MmLoadBF16)
 
 // ---------------------------------------------------------------------
 // The prefill forward's row kernels (i#866): n token rows at once.
