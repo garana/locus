@@ -28,7 +28,7 @@ namespace locus::image {
  *   token, unpatchified to [8][64][64]: 4 noise channels, then 4
  *   learned-variance channels.
  *
- * Weights come from a "pixart" GGUF (scripts/convert-pixart.py,
+ * Weights come from a "pixart" GGUF (scripts/image/convert-pixart.py,
  * checkpoint tensor names). Matrices stay in the GGUF mapping, so the
  * GgufFile must outlive the model.
  */

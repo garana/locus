@@ -27,7 +27,7 @@ namespace locus::image {
  * input the valid rows are the same, since a masked key gets weight 0
  * and the bias depends only on the distance.
  *
- * Weights come from a "t5encoder" GGUF (scripts/convert-t5-encoder.py,
+ * Weights come from a "t5encoder" GGUF (scripts/text/convert-t5-encoder.py,
  * llama.cpp's tensor names). Matrices stay in the GGUF mapping, so the
  * GgufFile must outlive the encoder.
  */

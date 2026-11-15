@@ -348,7 +348,7 @@ TEST_CASE("locus-run starts without a Vulkan device", "[cli]") {
     const std::string model =
         std::string(LOCUS_SOURCE_DIR) + "/tests/models/stories260K.gguf";
     if (!std::filesystem::exists(model)) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     for (const char* flag : {"", "--prefill-f16 "}) {
         const std::string cmd =
@@ -368,7 +368,7 @@ TEST_CASE("LOCUS_VK_TRACE prints each Vulkan forward step", "[cli][vulkan]") {
     const std::string model =
         std::string(LOCUS_SOURCE_DIR) + "/tests/models/stories260K.gguf";
     if (!std::filesystem::exists(model)) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no Vulkan device");

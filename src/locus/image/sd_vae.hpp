@@ -28,7 +28,7 @@ namespace locus::image {
  * (through a 1x1 conv when the width changes).
  *
  * Weights come from an "autoencoder_kl" GGUF
- * (scripts/convert-sd-vae.py, checkpoint names). Tensors stay in the
+ * (scripts/image/convert-sd-vae.py, checkpoint names). Tensors stay in the
  * GGUF mapping, so the GgufFile must outlive the decoder.
  */
 class SdVaeDecoder {

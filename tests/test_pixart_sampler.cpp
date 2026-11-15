@@ -50,7 +50,7 @@ double rel_error(std::span<const float> got, std::span<const float> ref) {
 }  // namespace
 
 // docs/models/pixart-alpha.md 5.3, and the scheduler's own values
-// (scripts/make-pixart-sampler-goldens.py).
+// (scripts/image/make-pixart-sampler-goldens.py).
 TEST_CASE("pixart sampler timesteps and sigmas match the scheduler",
           "[pixart][image]") {
     const DpmSolverPP s(8);
@@ -106,7 +106,8 @@ TEST_CASE("pixart sampler steps match the scheduler", "[pixart][image]") {
 TEST_CASE("pixart sampler reproduces the reference latent",
           "[pixart][image][e2e]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("pixart-xl-2-512-f32.gguf absent; see scripts/convert-pixart.py");
+        SKIP("pixart-xl-2-512-f32.gguf absent; see "
+             "scripts/image/convert-pixart.py");
     }
     if (std::getenv("LOCUS_HEAVY_TESTS") == nullptr) {
         SKIP("16 DiT calls take minutes on a CPU; set LOCUS_HEAVY_TESTS=1");

@@ -88,8 +88,8 @@ TEST_CASE("ltxv conv3d matches a direct sum", "[ltxv][image]") {
 }
 
 // VALUES, on every box: a tiny Decoder converted by
-// scripts/convert-ltxv.py, against its torch output
-// (scripts/make-ltxv-vae-goldens.py synth). Its config blocks are
+// scripts/video/convert-ltxv.py, against its torch output
+// (scripts/video/make-ltxv-vae-goldens.py synth). Its config blocks are
 // [res_x(1), compress_all(2), res_x(2)], so the up-block reversal, the
 // timestep modulation, the depth-to-space with its residual and dropped
 // frame, the final layer and the unpatchify are all pinned.
@@ -111,12 +111,12 @@ TEST_CASE("ltxv vae matches torch on a synthetic decoder",
 }
 
 // The 2B decoder against the reference in float32
-// (scripts/make-ltxv-vae-goldens.py real): a seeded 2 x 2 x 2 latent at
+// (scripts/video/make-ltxv-vae-goldens.py real): a seeded 2 x 2 x 2 latent at
 // timestep 0.05 into 9 frames of 64 x 64.
 TEST_CASE("ltxv vae matches the reference on the 2B decoder",
           "[ltxv][image][e2e]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("ltxv-2b-vae.gguf absent; see scripts/convert-ltxv.py");
+        SKIP("ltxv-2b-vae.gguf absent; see scripts/video/convert-ltxv.py");
     }
     auto g = locus::gguf::GgufFile::open(kModel);
     const auto vae = LtxvVae::load(g);
@@ -135,13 +135,13 @@ TEST_CASE("ltxv vae matches the reference on the 2B decoder",
 }
 
 // The 2B encoder against the reference in float32
-// (scripts/make-ltxv-vae-goldens.py encode): the normalized latent mean
+// (scripts/video/make-ltxv-vae-goldens.py encode): the normalized latent mean
 // of a seeded smooth 9 x 64 x 64 video, and of its first frame alone
 // (the image-to-video condition).
 TEST_CASE("ltxv vae encoder matches the reference on the 2B model",
           "[ltxv][image][e2e]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("ltxv-2b-vae.gguf absent; see scripts/convert-ltxv.py");
+        SKIP("ltxv-2b-vae.gguf absent; see scripts/video/convert-ltxv.py");
     }
     auto g = locus::gguf::GgufFile::open(kModel);
     const auto vae = LtxvVae::load(g);

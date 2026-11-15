@@ -24,7 +24,7 @@ std::string_view python_strip(std::string_view s);
 
 /**
  * Janus-Pro text-to-image generation (i#221 sections 2-3) on a llama
- * backbone loaded from the same GGUF (scripts/convert-janus.py). Image
+ * backbone loaded from the same GGUF (scripts/image/convert-janus.py). Image
  * tokens do not live in the text vocabulary: each one enters the
  * backbone through gen_embed + gen_aligner as an input embedding, and
  * the image logits come from gen_head on the final normed hidden state.

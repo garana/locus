@@ -121,7 +121,7 @@ FluxDit FluxDit::load(const gguf::GgufFile& g) {
     if (!g.get_bool("flux.kontext")) {
         std::fprintf(stderr,
                      "flux: no flux.kontext (converted before it existed); "
-                     "edits are on. Re-run scripts/convert-flux.py so a "
+                     "edits are on. Re-run scripts/image/convert-flux.py so a "
                      "FLUX.1 dev or schnell checkpoint stops serving "
                      "edits.\n");
     }

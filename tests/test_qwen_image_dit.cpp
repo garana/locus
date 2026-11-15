@@ -22,7 +22,7 @@ using Segment = QwenImageDit::Segment;
 
 const std::string kGolden = std::string(LOCUS_SOURCE_DIR) + "/tests/golden/";
 
-// Keep in sync with scripts/make-qwen-image-dit-goldens.py.
+// Keep in sync with scripts/image/make-qwen-image-dit-goldens.py.
 constexpr std::uint32_t kIn = 16, kOut = 16, kJoint = 64, kTxt = 5,
                         kWidth = 64;
 constexpr float kSigma = 0.7f;
@@ -88,8 +88,8 @@ std::vector<Leg> legs(double cpu_bound) {
 }  // namespace
 
 // i#532 VALUES, on every box: a tiny QwenImageTransformer2DModel from
-// diffusers (scripts/make-qwen-image-dit-goldens.py; its GGUF, written by
-// scripts/convert-qwen-image.py, in tests/golden) on two image segments
+// diffusers (scripts/image/make-qwen-image-dit-goldens.py; its GGUF, written by
+// scripts/image/convert-qwen-image.py, in tests/golden) on two image segments
 // (frame 0 and 1, grids 4 x 6 and 2 x 3, so the centred RoPE has odd and
 // even sides) and five text rows: the image and text rows after block 0,
 // and the velocity, against diffusers.
@@ -175,9 +175,9 @@ TEST_CASE("qwen image dit rejects bad sizes", "[qwen-image][image]") {
 // i#532 VALUES, with the real weights: a one-block model of
 // Qwen/Qwen-Image-Edit at ac7f931 (block 0 and the layers outside the
 // blocks, from the shards 00001 and 00009), converted by
-// scripts/convert-qwen-image.py --blocks 1 (BF16) to
+// scripts/image/convert-qwen-image.py --blocks 1 (BF16) to
 // tests/models/qwen-image-edit-1block-bf16.gguf, against diffusers on
-// the same weights in float32 (scripts/make-qwen-image-dit-goldens.py
+// the same weights in float32 (scripts/image/make-qwen-image-dit-goldens.py
 // --model): block 0's rows and the velocity, at the real widths.
 TEST_CASE("qwen image dit matches diffusers on a real block",
           "[qwen-image][image][e2e]") {
@@ -185,7 +185,7 @@ TEST_CASE("qwen image dit matches diffusers on a real block",
                              "/tests/models/qwen-image-edit-1block-bf16.gguf";
     if (!std::filesystem::exists(path)) {
         SKIP("qwen-image-edit-1block-bf16.gguf absent; make it with "
-             "scripts/convert-qwen-image.py --blocks 1");
+             "scripts/image/convert-qwen-image.py --blocks 1");
     }
     const std::vector<Segment> segs = {{1, 2, 4}, {1, 2, 2}};
     constexpr std::uint32_t n_img = 2 * 4 + 2 * 2, n_txt = 4;

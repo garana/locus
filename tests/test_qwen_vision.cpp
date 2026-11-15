@@ -23,7 +23,7 @@ using locus::image::QwenVision;
 
 const std::string kDir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
 
-// Keep in sync with scripts/make-qwen-vision-goldens.py.
+// Keep in sync with scripts/image/make-qwen-vision-goldens.py.
 constexpr std::uint32_t kOut = 24, kGh = 12, kGw = 16;
 constexpr std::uint32_t kPatches[] = {0, 101};
 constexpr std::uint32_t kRows = 16, kRowStep = 4, kCropH = 196,
@@ -48,7 +48,7 @@ std::vector<float> read_f32(const std::string& path) {
 
 using qwen_tiny::lcg;
 
-/** The tiny tower of scripts/make-qwen-vision-goldens.py synth
+/** The tiny tower of scripts/image/make-qwen-vision-goldens.py synth
  *  (qwen_tiny.hpp), merging to kOut. */
 std::vector<std::byte> synth_mmproj(const char* projector =
                                         "qwen2.5vl_merger") {
@@ -105,7 +105,7 @@ TEST_CASE("qwen vision windows match the reference index",
 
 // i#530 VALUES, on every box: the synthetic tower against transformers'
 // Qwen2_5_VisionTransformerPretrainedModel with the same weights
-// (scripts/make-qwen-vision-goldens.py synth). Pins the patch conv,
+// (scripts/image/make-qwen-vision-goldens.py synth). Pins the patch conv,
 // the 2D RoPE, the windowed and full attention, the SwiGLU MLP and the
 // merger, not just shapes.
 TEST_CASE("qwen vision tower matches transformers on a synthetic model",
@@ -144,13 +144,13 @@ TEST_CASE("qwen vision rejects another projector and a bad grid",
 
 // i#530: the Qwen2.5-VL 7B tower (llama.cpp's mmproj, F16) on a crop of
 // janus_apple.png, against transformers in float32 with the same
-// weights (scripts/make-qwen-vision-goldens.py real): the processor's
+// weights (scripts/image/make-qwen-vision-goldens.py real): the processor's
 // patches, sampled output rows and the whole output's RMS.
 TEST_CASE("qwen vision tower matches transformers on Qwen2.5-VL 7B",
           "[qwen-vision][image]") {
     if (!std::filesystem::exists(kModel)) {
         SKIP("mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf absent; see "
-             "scripts/fetch-test-model.sh qwen2.5-vl-mmproj");
+             "scripts/tests/fetch-test-model.sh qwen2.5-vl-mmproj");
     }
     const auto ref = read_f32(kDir + "golden/qwen_vision.f32");
     auto g = locus::gguf::GgufFile::open(kModel);

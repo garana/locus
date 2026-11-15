@@ -22,7 +22,7 @@ using qwen_tiny::kStartId;
 using qwen_tiny::kVocab;
 using qwen_tiny::lcg;
 
-// Keep in sync with scripts/make-qwen-mrope-golden.py.
+// Keep in sync with scripts/image/make-qwen-mrope-golden.py.
 const std::vector<std::int32_t> kBefore = {3, 17, 42, 9, kStartId};
 constexpr std::uint32_t kGh = 2, kGw = 3;
 const std::vector<std::int32_t> kAfter = {5, 33, 21, 58};
@@ -85,7 +85,7 @@ TEST_CASE("qwen2vl mrope positions match get_rope_index",
 // i#545 VALUES: the tiny qwen2vl model on text, an image span of input
 // embeddings with 3D positions, and text again, against transformers'
 // Qwen2_5_VLForConditionalGeneration with the same weights
-// (scripts/make-qwen-mrope-golden.py), every position's logits.
+// (scripts/image/make-qwen-mrope-golden.py), every position's logits.
 TEST_CASE("qwen2vl matches transformers with an image span",
           "[qwen2vl][mrope]") {
     std::ifstream f(std::string(LOCUS_SOURCE_DIR) +

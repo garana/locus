@@ -53,8 +53,8 @@ TEST_CASE("vae to_rgb8 follows the pipeline postprocess", "[pixart][image]") {
 }
 
 // VALUES, on every box: a tiny AutoencoderKL (block_out_channels [8, 16],
-// one layer per block) converted by scripts/convert-sd-vae.py, against
-// torch's decode of the same latent (scripts/make-pixart-vae-goldens.py
+// one layer per block) converted by scripts/image/convert-sd-vae.py, against
+// torch's decode of the same latent (scripts/image/make-pixart-vae-goldens.py
 // synth): the scaling, post-quant conv, mid resnets and attention, the
 // up blocks with a conv shortcut and an upsample, and conv_out.
 TEST_CASE("vae decoder matches torch on a synthetic model",
@@ -87,7 +87,7 @@ TEST_CASE("vae decoder matches torch on a synthetic model",
 TEST_CASE("pixart vae decode matches the reference image",
           "[pixart][image][e2e]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("sd-vae-f32.gguf absent; see scripts/convert-sd-vae.py");
+        SKIP("sd-vae-f32.gguf absent; see scripts/image/convert-sd-vae.py");
     }
     auto g = locus::gguf::GgufFile::open(kModel);
     const auto vae = SdVaeDecoder::load(g);

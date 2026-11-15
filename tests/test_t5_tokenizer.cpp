@@ -83,11 +83,11 @@ TEST_CASE("t5 tokenizer rejects a bad charsmap", "[tok][t5]") {
 TEST_CASE("xlm-r tokenizer matches llama.cpp's unigram tokenizer",
           "[tok][t5][e2e]") {
     // bge-m3's vocab (XLM-R: <s> first, </s> last, the nmt_nfkc
-    // charsmap); the ids come from scripts/make-xlmr-tok-golden.py.
+    // charsmap); the ids come from scripts/text/make-xlmr-tok-golden.py.
     const std::string model =
         std::string(LOCUS_SOURCE_DIR) + "/tests/models/bge-m3-q8_0.gguf";
     if (!std::filesystem::exists(model)) {
-        SKIP("bge-m3-q8_0.gguf absent; see scripts/fetch-test-model.sh");
+        SKIP("bge-m3-q8_0.gguf absent; see scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model);
     const auto tok = locus::tok::tokenizer_from_gguf(g);
@@ -122,9 +122,9 @@ TEST_CASE("t5 tokenizer adds a bos only when asked", "[tok][t5]") {
 
 TEST_CASE("t5 tokenizer matches transformers' T5Tokenizer",
           "[tok][t5]") {
-    // t5-vocab.gguf: scripts/convert-t5-encoder.py --vocab-only on
+    // t5-vocab.gguf: scripts/text/convert-t5-encoder.py --vocab-only on
     // PixArt-XL-2-512x512's tokenizer; the ids come from
-    // scripts/make-t5-tok-golden.py.
+    // scripts/text/make-t5-tok-golden.py.
     auto g = locus::gguf::GgufFile::open(golden("t5-vocab.gguf"));
     const auto tok = locus::tok::tokenizer_from_gguf(g);
     REQUIRE(tok->vocab_size() == 32128);

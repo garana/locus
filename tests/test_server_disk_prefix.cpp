@@ -65,7 +65,7 @@ json complete(int port, const std::string& prompt) {
 TEST_CASE("several engines refuse a shared disk prefix cache",
           "[server][disk_prefix][engine_group]") {
     if (!fs::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -86,7 +86,7 @@ TEST_CASE("several engines refuse a shared disk prefix cache",
 TEST_CASE("server serves a prompt prefix from disk after a restart",
           "[server][disk_prefix]") {
     if (!fs::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -128,7 +128,7 @@ TEST_CASE("server serves a prompt prefix from disk after a restart",
 TEST_CASE("the disk prefix key follows the model file and its settings",
           "[disk_prefix]") {
     if (!fs::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);

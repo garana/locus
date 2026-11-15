@@ -30,7 +30,7 @@ namespace locus::image {
  *   to 3 x 4 x 4 channels, unpatchified to 4 x 4 pixels.
  *
  * Runs on the CPU thread pool. Weights come from an "ltxv_vae" GGUF
- * (scripts/convert-ltxv.py) and are read in place, so the GgufFile
+ * (scripts/video/convert-ltxv.py) and are read in place, so the GgufFile
  * must outlive the decoder.
  */
 class LtxvVae {

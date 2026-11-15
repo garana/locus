@@ -113,7 +113,7 @@ class OpenAiServer {
          * --rerank-model) that enables POST /v1/rerank; /v1/models lists
          * it by its file name. Empty = the endpoint answers 503. */
         std::string rerank_model_path;
-        /** Path to a CNN image classifier GGUF (scripts/convert-cnn.py,
+        /** Path to a CNN image classifier GGUF (scripts/image/convert-cnn.py,
          * --image-classifier) that enables POST /v1/classify and image
          * inputs to /v1/embeddings under its name. Empty = 503. */
         std::string image_classifier_path;
@@ -152,7 +152,7 @@ class OpenAiServer {
          * every request when no Janus model is loaded). Empty = off. */
         std::string image_model_dir;
         /** Directory of FLUX.1 LoRAs (--lora-dir): flux_lora GGUFs from
-         * scripts/convert-lora.py, each named by its file name without
+         * scripts/image/convert-lora.py, each named by its file name without
          * ".gguf", for the "lora" field of the FLUX image requests.
          * Needs a FLUX.1 image_model_dir; every LoRA is checked against
          * its DiT at startup. Empty = no LoRAs. */

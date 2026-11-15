@@ -85,8 +85,8 @@ TEST_CASE("ltxv rope follows the reference layout", "[ltxv][image]") {
 }
 
 // VALUES, on every box: a tiny Transformer3DModel converted by
-// scripts/convert-ltxv.py, against its torch output
-// (scripts/make-ltxv-dit-goldens.py synth). The two batch rows use
+// scripts/video/convert-ltxv.py, against its torch output
+// (scripts/video/make-ltxv-dit-goldens.py synth). The two batch rows use
 // different noise levels (1.0, 0.725) and caption masks (2 and 5 valid
 // rows) over 24 tokens of a 2 x 3 x 4 latent, so the modulation, RoPE,
 // both attentions with their q / k norms, the FFN and the final layer
@@ -167,14 +167,14 @@ TEST_CASE("ltxv dit matches torch on a synthetic model", "[ltxv][image]") {
 }
 
 // The real 2B DiT (BF16 weights) against the reference upcast to
-// float32 (scripts/make-ltxv-dit-goldens.py real): one call at sigma
+// float32 (scripts/video/make-ltxv-dit-goldens.py real): one call at sigma
 // 0.9094 on a 2 x 4 x 6 latent with 7 seeded caption rows. Both sides
 // read the same BF16 weight values, so they differ only in summation
 // order.
 TEST_CASE("ltxv dit matches the reference on the 2B model",
           "[ltxv][image][e2e]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("ltxv-2b-dit.gguf absent; see scripts/convert-ltxv.py");
+        SKIP("ltxv-2b-dit.gguf absent; see scripts/video/convert-ltxv.py");
     }
     auto g = locus::gguf::GgufFile::open(kModel);
     const auto dit = LtxvDit::load(g);

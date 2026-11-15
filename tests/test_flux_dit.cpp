@@ -199,7 +199,7 @@ TEST_CASE("flux dit rejects wrong sizes", "[flux][image]") {
 // tokens through all 57 blocks (BF16 weights, F32 activations).
 TEST_CASE("flux kontext dit matches diffusers", "[flux][image][e2e]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("no " << kModel << " (scripts/convert-flux.py --dit-out)");
+        SKIP("no " << kModel << " (scripts/image/convert-flux.py --dit-out)");
     }
     const auto g = locus::gguf::GgufFile::open(kModel);
     const auto dit = FluxDit::load(g);
