@@ -14,7 +14,6 @@ namespace {
 
 using image::dense::gelu;  // BERT's GELU, the exact erf form
 using image::dense::layer_norm;
-using image::dense::parallel;
 
 }  // namespace
 
