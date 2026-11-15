@@ -1188,10 +1188,14 @@ std::uint32_t TransformerModel::prefill_chunk() const {
     // into 64-token matmul tiles: 2048 tokens give an expert ~2048 * k
     // / n_expert pairs (Qwen3-Coder: ~128 vs ~64 at 1024), so its
     // tiles run fuller (M4 Max, Qwen3-Coder: +4 to +6% over 1024,
-    // which gained 8% over 512 on DeepSeek-V2-Lite). Dense models gain
-    // nothing and pay for the bigger attention score block. On Metal,
-    // 64 -> 512 is +21% on Llama 1B, and a MoE model's 2048 more than
-    // doubles its prefill (M4 Max).
+    // which gained 8% over 512 on DeepSeek-V2-Lite). On Vulkan, dense
+    // models gain nothing and pay for the bigger attention score block.
+    // Metal's prefill takes 2048 for every model: its attention and
+    // matmuls fill the GPU better (M4 Max, against 512: Llama 1B +9%,
+    // Orpheus +9%, Qwen2.5-0.5B +31%).
+    if (backend_->name == "metal") {
+        return 2048;
+    }
     return hp_.n_expert > 0 ? 2048 : 512;
 }
 
