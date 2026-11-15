@@ -1656,6 +1656,25 @@ __device__ inline void lane_x8(const float* xb, float xs[8]) {
     xs[7] = c.w;
 }
 
+/** @returns acc plus a lane's 8 IQ3 weights times its activations xs:
+ *  the 4 u8 magnitudes of grid entry g1 then of g2, each times db and
+ *  negated where `signs` has bit j (g1) or j + 4 (g2) set, in the
+ *  order of the IQ3 warp kernels. */
+__device__ inline float iq3_grid8_dot(float acc, std::uint32_t g1,
+                                      std::uint32_t g2, float db,
+                                      std::uint32_t signs,
+                                      const float xs[8]) {
+    for (int j = 0; j < 4; ++j) {
+        const float y1 = db * static_cast<float>((g1 >> (8 * j)) & 0xff) *
+                         ((signs & (1u << j)) ? -1.0f : 1.0f);
+        const float y2 = db * static_cast<float>((g2 >> (8 * j)) & 0xff) *
+                         ((signs & (1u << (j + 4))) ? -1.0f : 1.0f);
+        acc += y1 * xs[j];
+        acc += y2 * xs[j + 4];
+    }
+    return acc;
+}
+
 /**
  * One IQ3_XXS super-block is 98 bytes: d (f16) + qs[64] +
  * scales_and_signs[32], 256 weights in 8 groups of 32, each group 4
@@ -1704,14 +1723,7 @@ __global__ void matvec_iq3_xxs_warp_kernel(const std::uint8_t* w,
         const std::uint32_t g2 = __ldg(grid + qs[2 * l + 1]);
         float xs[8];
         lane_x8(x + static_cast<std::size_t>(b) * 256 + 32 * g + 8 * l, xs);
-        for (int j = 0; j < 4; ++j) {
-            const float y1 = db * static_cast<float>((g1 >> (8 * j)) & 0xff) *
-                             ((signs & (1u << j)) ? -1.0f : 1.0f);
-            const float y2 = db * static_cast<float>((g2 >> (8 * j)) & 0xff) *
-                             ((signs & (1u << (j + 4))) ? -1.0f : 1.0f);
-            acc += y1 * xs[j];
-            acc += y2 * xs[j + 4];
-        }
+        acc = iq3_grid8_dot(acc, g1, g2, db, signs, xs);
         __syncwarp();  // the next stage overwrites this warp's slice
     }
     acc = warp_sum(acc);
@@ -1766,14 +1778,7 @@ __global__ void matvec_iq3_s_warp_kernel(const std::uint8_t* w,
             __ldg(grid + (qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)));
         float xs[8];
         lane_x8(x + static_cast<std::size_t>(b) * 256 + 32 * g + 8 * l, xs);
-        for (int j = 0; j < 4; ++j) {
-            const float y1 = db * static_cast<float>((g1 >> (8 * j)) & 0xff) *
-                             ((signs & (1u << j)) ? -1.0f : 1.0f);
-            const float y2 = db * static_cast<float>((g2 >> (8 * j)) & 0xff) *
-                             ((signs & (1u << (j + 4))) ? -1.0f : 1.0f);
-            acc += y1 * xs[j];
-            acc += y2 * xs[j + 4];
-        }
+        acc = iq3_grid8_dot(acc, g1, g2, db, signs, xs);
         __syncwarp();  // the next stage overwrites this warp's slice
     }
     acc = warp_sum(acc);
