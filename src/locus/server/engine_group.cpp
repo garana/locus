@@ -79,9 +79,17 @@ std::uint64_t EngineGroup::submit(
         }
         ++load_[e];
     }
-    const std::uint64_t local =
-        loops_[e]->submit(std::move(prompt), max_new_tokens, sampling,
-                          seed, std::move(constraint), logprobs);
+    std::uint64_t local = 0;
+    try {
+        local = loops_[e]->submit(std::move(prompt), max_new_tokens,
+                                  sampling, seed, std::move(constraint),
+                                  logprobs);
+    } catch (...) {
+        // Not submitted: it must not count toward the engine's load.
+        std::lock_guard<std::mutex> lk(live_mu_);
+        --load_[e];
+        throw;
+    }
     const std::uint64_t id = local * loops_.size() + e;
     std::lock_guard<std::mutex> lk(live_mu_);
     live_.insert(id);
