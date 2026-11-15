@@ -1489,6 +1489,152 @@ kernel void attn_rows_tiled(device const float* q [[buffer(0)]],
 }
 
 
+// Causal attention for a chunk on the simdgroup matrices: threadgroup
+// g takes queries 32 (g / n_heads) .. + 32 of head g % n_heads, a
+// simdgroup (of 4) 8 of them, over 32-position chunks. A chunk's K
+// rows are staged, each simdgroup takes its 8 x 32 scores Q K^T (Q,
+// pre-scaled by kq_scale, kept in registers), the rows' online softmax
+// turns them into P and rescales the output O (8 x head_dim, in
+// registers) by a diagonal matrix, then the V rows replace K in the
+// same threadgroup memory and O += P V. head_dim is a multiple of 8,
+// at most 128. Same parameters and buffers as attn_rows.
+constant constexpr uint kFaQ = 32;  // queries a threadgroup
+constant constexpr uint kFaC = 32;  // positions a chunk
+
+kernel void attn_rows_mma(device const float* q [[buffer(0)]],
+                          device const float* pool [[buffer(1)]],
+                          device const uint* blocks [[buffer(2)]],
+                          device float* out [[buffer(3)]],
+                          constant AttnRowsParams& pr [[buffer(4)]],
+                          uint g [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float kv[kFaC * 128];
+    threadgroup float spall[4 * 8 * kFaC];
+    threadgroup float dgall[4 * 64];
+    constant AttnParams& p = pr.a;
+    const uint hd = p.head_dim, nd = hd / 8;
+    const uint h = g % p.n_heads, t0 = (g / p.n_heads) * kFaQ;
+    const uint kvh = h / (p.n_heads / p.n_kv_heads);
+    const uint q0 = t0 + sg * 8;  // this simdgroup's first query
+    threadgroup float* sp = spall + sg * 8 * kFaC;
+    threadgroup float* dg = dgall + sg * 64;
+
+    // Q, scaled, as nd 8 x 8 matrices through dg (rows past the chunk
+    // as zero).
+    simdgroup_float8x8 qm[16], om[16];
+    for (uint k = 0; k < nd; ++k) {
+        for (uint e = lane; e < 64; e += 32) {
+            const uint r = e / 8, c = e % 8;
+            dg[e] = q0 + r < p.n_pos
+                        ? q[ulong(q0 + r) * pr.q_stride + h * hd + k * 8 +
+                            c] * p.kq_scale
+                        : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(qm[k], dg, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        om[k] = simdgroup_float8x8(0.0f);
+    }
+    float m[8], l[8];
+    for (uint r = 0; r < 8; ++r) {
+        m[r] = -INFINITY;
+        l[r] = 0.0f;
+    }
+    // Positions [0, last) are seen by some query of the block.
+    const uint last = pr.base + min(t0 + kFaQ, p.n_pos);
+    const uint mine_end = pr.base + min(q0 + 8, p.n_pos);  // this sg's
+    for (uint c = 0; c < last; c += kFaC) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < kFaC * hd; i += 128) {
+            const uint j = c + i / hd;
+            kv[i] = j < last ? pool[kv_row(p, blocks, j) + kvh * hd + i % hd]
+                             : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const bool act = q0 < p.n_pos && c < mine_end;
+        if (act) {
+            // S = Q K^T, 8 x 32, into sp.
+            for (uint cb = 0; cb < kFaC / 8; ++cb) {
+                simdgroup_float8x8 acc(0.0f);
+                for (uint k = 0; k < nd; ++k) {
+                    simdgroup_float8x8 kb;
+                    simdgroup_load(kb, kv + cb * 8 * hd + k * 8, hd,
+                                   ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(acc, qm[k], kb, acc);
+                }
+                simdgroup_store(acc, sp + cb * 8, kFaC);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            // The rows' online softmax: lane j holds position c + j.
+            for (uint e = lane; e < 64; e += 32) {
+                dg[e] = 0.0f;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint j = c + lane;
+            for (uint r = 0; r < 8; ++r) {
+                const uint qi = q0 + r;
+                const bool see = qi < p.n_pos && j <= pr.base + qi;
+                const float s = see ? sp[r * kFaC + lane] : -INFINITY;
+                const float mn = max(m[r], simd_max(s));
+                const float e = s == -INFINITY ? 0.0f : exp(s - mn);
+                const float sc = m[r] == -INFINITY ? 0.0f : exp(m[r] - mn);
+                l[r] = l[r] * sc + simd_sum(e);
+                m[r] = mn;
+                sp[r * kFaC + lane] = e;
+                if (lane == 0) {
+                    dg[r * 9] = sc;
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_float8x8 dm;
+            simdgroup_load(dm, dg, 8);
+            for (uint k = 0; k < nd; ++k) {
+                simdgroup_float8x8 t;
+                simdgroup_multiply(t, dm, om[k]);
+                om[k] = t;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < kFaC * hd; i += 128) {
+            const uint j = c + i / hd;
+            kv[i] = j < last ? pool[kv_row(p, blocks, j) + p.v_off +
+                                    kvh * hd + i % hd]
+                             : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (act) {
+            // O += P V.
+            simdgroup_float8x8 pm[kFaC / 8];
+            for (uint kb = 0; kb < kFaC / 8; ++kb) {
+                simdgroup_load(pm[kb], sp + kb * 8, kFaC);
+            }
+            for (uint n = 0; n < nd; ++n) {
+                for (uint kb = 0; kb < kFaC / 8; ++kb) {
+                    simdgroup_float8x8 vb;
+                    simdgroup_load(vb, kv + kb * 8 * hd + n * 8, hd);
+                    simdgroup_multiply_accumulate(om[n], pm[kb], vb, om[n]);
+                }
+            }
+        }
+    }
+    // O / l, through dg, rows inside the chunk.
+    for (uint n = 0; n < nd; ++n) {
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(om[n], dg, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = lane; e < 64; e += 32) {
+            const uint r = e / 8, c = e % 8;
+            if (q0 + r < p.n_pos) {
+                out[ulong(q0 + r) * pr.q_stride + h * hd + n * 8 + c] =
+                    dg[e] / l[r];
+            }
+        }
+    }
+}
+
+
 struct AxpyParams {
     uint n;
     float a;
