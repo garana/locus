@@ -155,6 +155,11 @@ struct BiasParams {
     std::uint64_t off;
     std::uint32_t n, n_tok, stride;
 };
+struct HeadNormParams {
+    std::uint64_t off;
+    std::uint32_t n_tok, n_heads, head_dim, stride;
+    float eps;
+};
 struct AttnParams {
     std::uint64_t block_floats, layer_off, v_off;
     std::uint32_t n_pos, block_tokens, n_heads, n_kv_heads, head_dim;
@@ -182,11 +187,12 @@ bool TransformerModel::metal_forward_supported() const {
         const char* e = std::getenv("LOCUS_METAL_FORWARD");
         return e != nullptr && std::string_view(e) == "0";
     }();
-    // The plain llama attention, or qwen2's (q / k / v biases, NEOX
-    // RoPE; not qwen2vl's M-RoPE, whose text positions are not the
-    // sequence's).
+    // The plain llama attention, qwen2's (q / k / v biases, NEOX RoPE;
+    // not qwen2vl's M-RoPE, whose text positions are not the
+    // sequence's), or qwen3moe's (per-head q / k norm, NEOX RoPE).
+    const bool qwen3 = spec_->name == "qwen3moe";
     const bool attn_ok =
-        spec_->plain_attention ||
+        spec_->plain_attention || qwen3 ||
         (spec_->qwen2_attention && hp_.rope_sections[0] == 0);
     if (off || backend_->name != "metal" || !attn_ok ||
         hp_.custom_layer || spec_->layer != nullptr ||
@@ -223,7 +229,7 @@ bool TransformerModel::metal_forward_supported() const {
     for (const Layer& lay : layers_) {
         if (!lay.has_separate_qkv(hp_) ||
             (lay.has_qkv_bias() && !spec_->qwen2_attention) ||
-            lay.has_qk_norm() ||
+            (lay.has_qk_norm() && !qwen3) ||
             !lay.post_attn_norm.empty() || !lay.post_ffw_norm.empty() ||
             !ok_w(lay.wq) || !ok_w(lay.wk) || !ok_w(lay.wv) || !ok_w(lay.wo) ||
             !ok_moe(lay)) {
@@ -415,7 +421,19 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                            shg);
             }
         };
-        const std::uint32_t neox = spec_->qwen2_attention ? 1u : 0u;
+        const std::uint32_t neox =
+            spec_->qwen2_attention || spec_->name == "qwen3moe" ? 1u : 0u;
+        // qwen3's per-head RMS norm on n_tok rows of `heads` heads.
+        const auto head_norm = [&](const Context::Buffer& v,
+                                   std::uint64_t off, std::uint32_t heads,
+                                   std::span<const float> w,
+                                   std::uint32_t n_tok, std::uint32_t stride) {
+            const HeadNormParams hp{off, n_tok, heads, hd, stride,
+                                    hp_.rms_eps};
+            const Context::Arg a[] = {{&v, 0}, {&fbuf(w), 0}};
+            ctx.dispatch("head_rmsnorm", a, bytes_of(hp), n_tok * heads * 32,
+                         32);
+        };
         // v[off + t * stride ..] += bias, for n_tok rows.
         const auto bias = [&](const Context::Buffer& v, std::uint64_t off,
                               std::span<const float> b, std::uint32_t n_tok,
@@ -456,6 +474,12 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     bias(*pool, krow, lay.wk_bias, 1, 0);
                     ctx.overlap_next();
                     bias(*pool, vrow, lay.wv_bias, 1, 0);
+                }
+                if (lay.has_qk_norm()) {
+                    // qwen3: the per-head q / k norms (overlapping).
+                    head_norm(s.q, 0, H, lay.attn_q_norm, 1, 0);
+                    ctx.overlap_next();
+                    head_norm(*pool, krow, KV, lay.attn_k_norm, 1, 0);
                 }
                 rope(s.q, 0, H);
                 ctx.overlap_next();
@@ -630,7 +654,19 @@ bool TransformerModel::metal_forward_batch(
             [&](std::span<const float> v) -> const Context::Buffer& {
             return mw.get(ctx, v.data(), v.size_bytes());
         };
-        const std::uint32_t neox = spec_->qwen2_attention ? 1u : 0u;
+        const std::uint32_t neox =
+            spec_->qwen2_attention || spec_->name == "qwen3moe" ? 1u : 0u;
+        // qwen3's per-head RMS norm on n_tok rows of `heads` heads.
+        const auto head_norm = [&](const Context::Buffer& v,
+                                   std::uint64_t off, std::uint32_t heads,
+                                   std::span<const float> w,
+                                   std::uint32_t n_tok, std::uint32_t stride) {
+            const HeadNormParams hp{off, n_tok, heads, hd, stride,
+                                    hp_.rms_eps};
+            const Context::Arg a[] = {{&v, 0}, {&fbuf(w), 0}};
+            ctx.dispatch("head_rmsnorm", a, bytes_of(hp), n_tok * heads * 32,
+                         32);
+        };
         // v[t * stride ..] += bias, for n_tok rows (qwen2's q / k / v).
         const auto bias = [&](const Context::Buffer& v, std::uint64_t off,
                               std::span<const float> b, std::uint32_t n_tok,
@@ -738,6 +774,13 @@ bool TransformerModel::metal_forward_batch(
                         ctx.overlap_next();
                         bias(s.v, 0, lay.wv_bias, m,
                              static_cast<std::uint32_t>(kvd));
+                    }
+                    if (lay.has_qk_norm()) {
+                        head_norm(s.q, 0, H, lay.attn_q_norm, m,
+                                  static_cast<std::uint32_t>(qd));
+                        ctx.overlap_next();
+                        head_norm(s.k, 0, KV, lay.attn_k_norm, m,
+                                  static_cast<std::uint32_t>(kvd));
                     }
                     const RopeRowsParams rq{0, m, H, hd,
                                             static_cast<std::uint32_t>(qd),

@@ -1195,3 +1195,37 @@ kernel void axpy(device float* x [[buffer(0)]],
         x[i] += p.a * y[i];
     }
 }
+
+struct HeadNormParams {
+    ulong off;     // token 0's first float
+    uint n_tok;
+    uint n_heads;
+    uint head_dim;
+    uint stride;   // floats between token rows
+    float eps;
+};
+
+// Per-head RMS norm in place (qwen3's q / k norm): each head's
+// head_dim values times 1 / rms and the head_dim-wide weight w. A
+// simdgroup a (token, head).
+kernel void head_rmsnorm(device float* v [[buffer(0)]],
+                         device const float* w [[buffer(1)]],
+                         constant HeadNormParams& p [[buffer(2)]],
+                         uint g [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    if (g >= p.n_tok * p.n_heads) {
+        return;
+    }
+    const uint t = g / p.n_heads, h = g % p.n_heads;
+    device float* x =
+        v + p.off + ulong(t) * p.stride + ulong(h) * p.head_dim;
+    float s = 0.0f;
+    for (uint i = lane; i < p.head_dim; i += 32) {
+        s += x[i] * x[i];
+    }
+    s = simd_sum(s);
+    const float inv = 1.0f / sqrt(s / float(p.head_dim) + p.eps);
+    for (uint i = lane; i < p.head_dim; i += 32) {
+        x[i] = x[i] * inv * w[i];
+    }
+}
