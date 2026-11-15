@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/arch.hpp"
@@ -32,6 +33,30 @@ using backend::Mat;
 using gguf::Error;
 using gguf::GgufFile;
 using gguf::TensorInfo;
+
+/** The model's GGUF files' bytes: released from the GPU weight caches
+ *  with the last copy of the model (i#1029). The pointers are compared,
+ *  never read, so the files may already be gone. */
+struct GpuWeightRelease {
+    std::vector<std::span<const std::byte>> files;
+    GpuWeightRelease() = default;
+    GpuWeightRelease(const GpuWeightRelease&) = delete;
+    GpuWeightRelease& operator=(const GpuWeightRelease&) = delete;
+    ~GpuWeightRelease() {
+        for (const auto& f : files) {
+            // A destructor must not throw: a failed release (Vulkan's
+            // batch open) only leaves the copies resident.
+            try {
+                backend::metal::release_weights(f.data(), f.size());
+            } catch (...) {
+            }
+            try {
+                backend::vulkan_release_weights(f.data(), f.size());
+            } catch (...) {
+            }
+        }
+    }
+};
 
 namespace {
 
@@ -609,6 +634,10 @@ TransformerModel TransformerModel::load(const GgufFile& g,
                      locked >> 20, failed >> 20);
     }
     m.stage_metrics_ = std::make_shared<StageMetrics>(m.hp_.n_layers);
+    m.gpu_release_ = std::make_shared<GpuWeightRelease>();
+    g.for_each_file([&](const GgufFile& f) {
+        m.gpu_release_->files.push_back(f.bytes());
+    });
     return m;
 }
 

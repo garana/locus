@@ -451,6 +451,37 @@ const Ops& image_ops() {
     return ops;
 }
 
+void release_weights(const void* p, std::size_t n) {
+    if (!Context::usable() || n == 0) {
+        return;
+    }
+    const auto* lo = static_cast<const std::byte*>(p);
+    const auto* hi = lo + n;
+    std::lock_guard lk(device_mutex());
+    Context& ctx = Context::get();
+    auto& ws = state().weights;
+    for (auto it = ws.begin(); it != ws.end();) {
+        if (it->first >= lo && it->first < hi) {
+            ctx.free(it->second.buf);
+            it = ws.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+std::size_t cached_weight_bytes() {
+    if (!Context::usable()) {
+        return 0;
+    }
+    std::lock_guard lk(device_mutex());
+    std::size_t b = 0;
+    for (const auto& [ptr, c] : state().weights) {
+        b += c.buf.bytes;
+    }
+    return b;
+}
+
 void drop_weights() {
     if (!Context::usable()) {
         return;

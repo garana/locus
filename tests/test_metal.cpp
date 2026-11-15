@@ -27,6 +27,7 @@
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/tok/tokenizer.hpp"
+#include "qwen_tiny.hpp"
 
 using locus::backend::metal::Context;
 
@@ -819,4 +820,28 @@ TEST_CASE("metal forward on a GGUF parsed from memory copies its weights",
         scale = std::max(scale, std::abs(cpu[r]));
     }
     CHECK(worst <= 0.01f * scale);
+}
+
+// i#1029: a destroyed model's weights leave the Metal weight cache, so
+// a process that loads model after model keeps only the live ones.
+TEST_CASE("a destroyed model releases its Metal cached weights",
+          "[metal]") {
+    if (!locus::backend::metal::Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    const auto img = qwen_tiny::lm("qwen2");
+    const auto g = locus::gguf::GgufFile::parse(img);
+    const std::size_t base = mb::cached_weight_bytes();
+    {
+        auto model = locus::model::TransformerModel::load(g);
+        const locus::backend::Mat& w = model.layers()[0].wq;
+        std::vector<float> x(w.cols, 0.5f), out(w.rows);
+        mb::matvec(w, x, out);
+        REQUIRE(mb::cached_weight_bytes() > base);
+        // A moved model keeps the release; the moved-from one has none.
+        auto moved = std::move(model);
+        mb::matvec(moved.layers()[0].wq, x, out);
+    }
+    REQUIRE(mb::cached_weight_bytes() == base);
 }
