@@ -521,6 +521,17 @@ void render_http_metrics(MetricsText& mt, const http::HttpMetrics& hm) {
     per_route("locus_http_request_seconds",
               "Request head received to response written, per route.",
               [](const auto& r) -> const auto& { return r.seconds; });
+    // i#980: a stream whose producer failed after its head went out;
+    // the client saw a truncated transfer, so a 200 alone hides it.
+    mt.family("locus_http_stream_failures_total",
+              "Streamed responses whose producer failed after the head, "
+              "by route.",
+              "counter");
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        mt.value("locus_http_stream_failures_total",
+                 MetricsText::label("route", names[i]),
+                 hm.at(i).stream_failures.load(kRelaxed));
+    }
     const std::int64_t f = hm.in_flight.load(kRelaxed);
     mt.gauge("locus_http_requests_in_flight",
              "Requests between head received and response written.",
@@ -3352,7 +3363,11 @@ void OpenAiServer::install_routes() {
                                                     codes.coarse.size()));
                                 }
                             } catch (const std::exception&) {
-                                // The head is out; end the stream short.
+                                // The head is out: the server ends the
+                                // transfer truncated, logs the reason
+                                // and counts it (i#980); returning here
+                                // instead sent a clean, empty end.
+                                throw;
                             }
                         });
                     return;

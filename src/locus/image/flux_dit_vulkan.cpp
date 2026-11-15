@@ -1,5 +1,8 @@
 #include <cstddef>
+#include <cstdint>
 
+#include "locus/backend/metal/seq.hpp"
+#include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/flux_dit.hpp"
 #include "locus/image/mmdit_vulkan.hpp"
 
@@ -10,14 +13,15 @@ namespace {
 using namespace mmdit;
 
 /** FLUX's own scratch slots, after the double-stream ones. */
-enum : Seq::Slot {
+enum : std::uint32_t {
     kCat = kFirst,  ///< [attention, gelu(mlp)] (single) [n][w + ffn]
     kLora,          ///< a LoRA's A x rows [n][rank]
 };
 
 }  // namespace
 
-std::vector<float> FluxDit::forward_vulkan(std::span<const float> x,
+template <class Seq>
+std::vector<float> FluxDit::forward_gpu(std::span<const float> x,
                                            std::uint32_t n_img,
                                            std::span<const float> text,
                                            std::uint32_t n_txt,
@@ -25,6 +29,7 @@ std::vector<float> FluxDit::forward_vulkan(std::span<const float> x,
                                            const std::vector<float>& cosv,
                                            const std::vector<float>& sinv,
                                            Trace* trace) const {
+    using Rows = typename Seq::Rows;
     const Dims d{width_, head_dim_, heads_, ffn_, n_img, n_txt, eps_};
     const std::uint32_t w = width_, hd = head_dim_, nh = heads_, f = ffn_;
     const std::uint32_t n = d.n();
@@ -80,5 +85,16 @@ std::vector<float> FluxDit::forward_vulkan(std::span<const float> x,
     }
     return output(q, d, norm_out_, proj_out_, in_ch_, lin);
 }
+
+template std::vector<float> FluxDit::forward_gpu<backend::VulkanSeq>(
+    std::span<const float> x, std::uint32_t n_img, std::span<const float> text,
+    std::uint32_t n_txt, const std::vector<float>& st,
+    const std::vector<float>& cosv, const std::vector<float>& sinv,
+    Trace* trace) const;
+template std::vector<float> FluxDit::forward_gpu<backend::metal::Seq>(
+    std::span<const float> x, std::uint32_t n_img, std::span<const float> text,
+    std::uint32_t n_txt, const std::vector<float>& st,
+    const std::vector<float>& cosv, const std::vector<float>& sinv,
+    Trace* trace) const;
 
 }  // namespace locus::image

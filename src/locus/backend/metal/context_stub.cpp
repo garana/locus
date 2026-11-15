@@ -53,6 +53,8 @@ void Context::end_batch() {
     throw std::runtime_error("metal: not built with Metal");
 }
 
+void Context::abandon_batch() noexcept {}
+
 void Context::dispatch(std::string_view, std::span<const Arg>,
                        std::span<const std::byte>, std::uint32_t,
                        std::uint32_t) {

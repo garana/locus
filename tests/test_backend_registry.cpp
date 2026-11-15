@@ -452,6 +452,31 @@ void check_matvec_variant_matches_scalar(
         }
     }
 
+    // i#982: x86 has a SIMD BF16 dot (8 weights a step), so 2051
+    // columns run both the chains and the 3-column tail.
+    SECTION("bf16, with a tail past the 8-wide steps") {
+        const std::uint32_t rows = 4, cols = 2051;
+        std::vector<std::uint16_t> w(static_cast<std::size_t>(rows) * cols);
+        for (auto& v : w) {
+            const float f = dist(rng);
+            std::uint32_t u;
+            std::memcpy(&u, &f, sizeof u);
+            v = static_cast<std::uint16_t>(u >> 16);
+        }
+        std::vector<float> x(cols);
+        for (auto& v : x) {
+            v = dist(rng);
+        }
+        Mat m{locus::gguf::TensorType::kBF16,
+              reinterpret_cast<const std::byte*>(w.data()), rows, cols};
+        std::vector<float> a(rows), b(rows);
+        matvec(m, x, a);
+        variant(m, x, b);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            REQUIRE(b[r] == Catch::Approx(a[r]).margin(1e-3));
+        }
+    }
+
     SECTION("q8_0 blocks") {
         const std::uint32_t rows = 3, cols = 64;  // 2 blocks/row
         std::vector<std::byte> w(rows * (cols / 32) * 34);

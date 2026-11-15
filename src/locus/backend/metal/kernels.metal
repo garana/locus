@@ -1498,39 +1498,93 @@ kernel void attn_rows_tiled(device const float* q [[buffer(0)]],
 // registers) by a diagonal matrix, then the V rows replace K in the
 // same threadgroup memory and O += P V. head_dim is a multiple of 8,
 // at most 128. Same parameters and buffers as attn_rows.
-constant constexpr uint kFaQ = 32;  // queries a threadgroup
 constant constexpr uint kFaC = 32;  // positions a chunk
 
-kernel void attn_rows_mma(device const float* q [[buffer(0)]],
-                          device const float* pool [[buffer(1)]],
-                          device const uint* blocks [[buffer(2)]],
-                          device float* out [[buffer(3)]],
-                          constant AttnRowsParams& pr [[buffer(4)]],
-                          uint g [[threadgroup_position_in_grid]],
-                          uint tid [[thread_index_in_threadgroup]],
-                          uint sg [[simdgroup_index_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float kv[kFaC * 128];
-    threadgroup float spall[4 * 8 * kFaC];
-    threadgroup float dgall[4 * 64];
-    constant AttnParams& p = pr.a;
-    const uint hd = p.head_dim, nd = hd / 8;
-    const uint h = g % p.n_heads, t0 = (g / p.n_heads) * kFaQ;
-    const uint kvh = h / (p.n_heads / p.n_kv_heads);
+// The operands attn_mma reads: the paged, causal prefill (AttnRowsParams)
+// or the image transformers' contiguous, unmasked rows (SeqAttnParams).
+struct MmaPaged {
+    device const float* q;
+    device const float* pool;
+    device const uint* blocks;
+    device float* out;
+    constant AttnRowsParams* pp;
+    uint n_q() const { return pp->a.n_pos; }
+    uint heads() const { return pp->a.n_heads; }
+    uint hd() const { return pp->a.head_dim; }
+    float scale() const { return pp->a.kq_scale; }
+    // Positions [0, end) are seen by queries below q_end.
+    uint kv_end(uint q_end) const { return pp->base + q_end; }
+    bool sees(uint qi, uint j) const { return j <= pp->base + qi; }
+    float qv(uint t, uint h, uint i) const {
+        return q[ulong(t) * pp->q_stride + h * pp->a.head_dim + i];
+    }
+    ulong k_at(uint j, uint h) const {
+        const uint kvh = h / (pp->a.n_heads / pp->a.n_kv_heads);
+        return kv_row(pp->a, blocks, j) + kvh * pp->a.head_dim;
+    }
+    ulong v_at(uint j, uint h) const { return k_at(j, h) + pp->a.v_off; }
+    device const float* kbuf() const { return pool; }
+    device const float* vbuf() const { return pool; }
+    device float* o_at(uint t, uint h) const {
+        return out + ulong(t) * pp->q_stride + h * pp->a.head_dim;
+    }
+};
+
+struct SeqAttnParams {
+    uint n_q, n_kv, heads, head_dim;
+    uint q_off, q_stride, k_off, k_stride;
+    uint v_off, v_stride, o_off, o_stride;
+    float scale;
+};
+
+struct MmaRows {
+    device const float* q;
+    device const float* k;
+    device const float* v;
+    device float* out;
+    constant SeqAttnParams* pp;
+    uint n_q() const { return pp->n_q; }
+    uint heads() const { return pp->heads; }
+    uint hd() const { return pp->head_dim; }
+    float scale() const { return pp->scale; }
+    uint kv_end(uint) const { return pp->n_kv; }
+    bool sees(uint, uint) const { return true; }
+    float qv(uint t, uint h, uint i) const {
+        return q[pp->q_off + ulong(t) * pp->q_stride + h * pp->head_dim + i];
+    }
+    ulong k_at(uint j, uint h) const {
+        return pp->k_off + ulong(j) * pp->k_stride + h * pp->head_dim;
+    }
+    ulong v_at(uint j, uint h) const {
+        return pp->v_off + ulong(j) * pp->v_stride + h * pp->head_dim;
+    }
+    device const float* kbuf() const { return k; }
+    device const float* vbuf() const { return v; }
+    device float* o_at(uint t, uint h) const {
+        return out + pp->o_off + ulong(t) * pp->o_stride + h * pp->head_dim;
+    }
+};
+
+// NSG simdgroups a threadgroup, 8 queries each.
+template <typename S, uint NSG>
+inline void attn_mma(thread const S& src, uint g, uint tid, uint sg,
+                     uint lane, threadgroup float* kv,
+                     threadgroup float* spall, threadgroup float* dgall) {
+    constexpr uint kQ = 8 * NSG, kThreads = 32 * NSG;
+    const uint hd = src.hd(), nd = hd / 8, n_q = src.n_q();
+    const uint h = g % src.heads(), t0 = (g / src.heads()) * kQ;
     const uint q0 = t0 + sg * 8;  // this simdgroup's first query
     threadgroup float* sp = spall + sg * 8 * kFaC;
     threadgroup float* dg = dgall + sg * 64;
 
-    // Q, scaled, as nd 8 x 8 matrices through dg (rows past the chunk
+    // Q, scaled, as nd 8 x 8 matrices through dg (rows past the queries
     // as zero).
     simdgroup_float8x8 qm[16], om[16];
     for (uint k = 0; k < nd; ++k) {
         for (uint e = lane; e < 64; e += 32) {
             const uint r = e / 8, c = e % 8;
-            dg[e] = q0 + r < p.n_pos
-                        ? q[ulong(q0 + r) * pr.q_stride + h * hd + k * 8 +
-                            c] * p.kq_scale
-                        : 0.0f;
+            dg[e] = q0 + r < n_q ? src.qv(q0 + r, h, k * 8 + c) * src.scale()
+                                 : 0.0f;
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_load(qm[k], dg, 8);
@@ -1543,17 +1597,16 @@ kernel void attn_rows_mma(device const float* q [[buffer(0)]],
         l[r] = 0.0f;
     }
     // Positions [0, last) are seen by some query of the block.
-    const uint last = pr.base + min(t0 + kFaQ, p.n_pos);
-    const uint mine_end = pr.base + min(q0 + 8, p.n_pos);  // this sg's
+    const uint last = src.kv_end(min(t0 + kQ, n_q));
+    const uint mine_end = src.kv_end(min(q0 + 8, n_q));  // this sg's
     for (uint c = 0; c < last; c += kFaC) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tid; i < kFaC * hd; i += 128) {
+        for (uint i = tid; i < kFaC * hd; i += kThreads) {
             const uint j = c + i / hd;
-            kv[i] = j < last ? pool[kv_row(p, blocks, j) + kvh * hd + i % hd]
-                             : 0.0f;
+            kv[i] = j < last ? src.kbuf()[src.k_at(j, h) + i % hd] : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const bool act = q0 < p.n_pos && c < mine_end;
+        const bool act = q0 < n_q && c < mine_end;
         if (act) {
             // S = Q K^T, 8 x 32, into sp.
             for (uint cb = 0; cb < kFaC / 8; ++cb) {
@@ -1575,7 +1628,7 @@ kernel void attn_rows_mma(device const float* q [[buffer(0)]],
             const uint j = c + lane;
             for (uint r = 0; r < 8; ++r) {
                 const uint qi = q0 + r;
-                const bool see = qi < p.n_pos && j <= pr.base + qi;
+                const bool see = qi < n_q && j < last && src.sees(qi, j);
                 const float s = see ? sp[r * kFaC + lane] : -INFINITY;
                 const float mn = max(m[r], simd_max(s));
                 const float e = s == -INFINITY ? 0.0f : exp(s - mn);
@@ -1597,11 +1650,9 @@ kernel void attn_rows_mma(device const float* q [[buffer(0)]],
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tid; i < kFaC * hd; i += 128) {
+        for (uint i = tid; i < kFaC * hd; i += kThreads) {
             const uint j = c + i / hd;
-            kv[i] = j < last ? pool[kv_row(p, blocks, j) + p.v_off +
-                                    kvh * hd + i % hd]
-                             : 0.0f;
+            kv[i] = j < last ? src.vbuf()[src.v_at(j, h) + i % hd] : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (act) {
@@ -1619,21 +1670,214 @@ kernel void attn_rows_mma(device const float* q [[buffer(0)]],
             }
         }
     }
-    // O / l, through dg, rows inside the chunk.
+    // O / l, through dg, rows inside the queries.
     for (uint n = 0; n < nd; ++n) {
         simdgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_store(om[n], dg, 8);
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (uint e = lane; e < 64; e += 32) {
             const uint r = e / 8, c = e % 8;
-            if (q0 + r < p.n_pos) {
-                out[ulong(q0 + r) * pr.q_stride + h * hd + n * 8 + c] =
-                    dg[e] / l[r];
+            if (q0 + r < n_q) {
+                src.o_at(q0 + r, h)[n * 8 + c] = dg[e] / l[r];
             }
         }
     }
 }
 
+kernel void attn_rows_mma(device const float* q [[buffer(0)]],
+                          device const float* pool [[buffer(1)]],
+                          device const uint* blocks [[buffer(2)]],
+                          device float* out [[buffer(3)]],
+                          constant AttnRowsParams& pr [[buffer(4)]],
+                          uint g [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float kv[kFaC * 128];
+    threadgroup float spall[4 * 8 * kFaC];
+    threadgroup float dgall[4 * 64];
+    const MmaPaged src{q, pool, blocks, out, &pr};
+    attn_mma<MmaPaged, 4>(src, g, tid, sg, lane, kv, spall, dgall);
+}
+
+// Unmasked attention of n_q query rows over n_kv key / value rows (the
+// image transformers, metal::Seq): as attn_rows_mma, rows at off + t *
+// stride, every head its own K / V head, kSeqAttnSg simdgroups (8
+// queries each) a threadgroup, so each staged K / V chunk serves more
+// queries.
+constant constexpr uint kSeqAttnSg = 8;
+kernel void seq_attn_mma(device const float* q [[buffer(0)]],
+                         device const float* k [[buffer(1)]],
+                         device const float* v [[buffer(2)]],
+                         device float* out [[buffer(3)]],
+                         constant SeqAttnParams& p [[buffer(4)]],
+                         uint g [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float kv[kFaC * 128];
+    threadgroup float spall[kSeqAttnSg * 8 * kFaC];
+    threadgroup float dgall[kSeqAttnSg * 64];
+    const MmaRows src{q, k, v, out, &p};
+    attn_mma<MmaRows, kSeqAttnSg>(src, g, tid, sg, lane, kv, spall, dgall);
+}
+
+// ---------------------------------------------------------------------
+// metal::Seq's row ops (the image transformers, i#868).
+
+struct SeqLnParams {
+    uint d, n, x_off, x_stride, o_off, o_stride, shift_off, scale_off;
+    float eps;
+    uint affine;  // o = ln(x) * m[scale] + m[shift], else * (1 + m[scale])
+};
+
+// LayerNorm without affine over row g (d wide), then modulated (ln_mod)
+// or with weight and bias (layer_norm), from m. One threadgroup a row.
+kernel void seq_ln(device const float* x [[buffer(0)]],
+                   device const float* m [[buffer(1)]],
+                   device float* o [[buffer(2)]],
+                   constant SeqLnParams& p [[buffer(3)]],
+                   uint row [[threadgroup_position_in_grid]],
+                   uint tid [[thread_index_in_threadgroup]],
+                   uint nt [[threads_per_threadgroup]]) {
+    threadgroup float part[32];
+    if (row >= p.n) {
+        return;
+    }
+    device const float* xr = x + p.x_off + ulong(row) * p.x_stride;
+    device float* orow = o + p.o_off + ulong(row) * p.o_stride;
+    float s = 0.0f;
+    for (uint i = tid; i < p.d; i += nt) {
+        s += xr[i];
+    }
+    const float mean = group_sum(s, part, tid, nt) / float(p.d);
+    float v = 0.0f;
+    for (uint i = tid; i < p.d; i += nt) {
+        const float c = xr[i] - mean;
+        v += c * c;
+    }
+    const float inv = rsqrt(group_sum(v, part, tid, nt) / float(p.d) + p.eps);
+    for (uint i = tid; i < p.d; i += nt) {
+        const float sc = p.affine != 0 ? m[p.scale_off + i]
+                                       : 1.0f + m[p.scale_off + i];
+        orow[i] = (xr[i] - mean) * inv * sc + m[p.shift_off + i];
+    }
+}
+
+struct SeqNormRopeParams {
+    uint n, heads, hd, x_off, x_stride, rope_row0;
+    float eps;
+};
+
+// Per-head RMS norm (weight w) then RoPE on pairs (2 i, 2 i + 1) by the
+// tables' row rope_row0 + t (hd floats a row: cos at cs, sin at sn), in
+// place. A simdgroup a (token, head).
+kernel void seq_head_norm_rope(device float* x [[buffer(0)]],
+                               device const float* w [[buffer(1)]],
+                               device const float* cs [[buffer(2)]],
+                               device const float* sn [[buffer(3)]],
+                               constant SeqNormRopeParams& p [[buffer(4)]],
+                               uint g [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    if (g >= p.n * p.heads) {
+        return;
+    }
+    const uint t = g / p.heads;
+    device float* xh = x + p.x_off + ulong(t) * p.x_stride +
+                       (g % p.heads) * p.hd;
+    float ss = 0.0f;
+    for (uint i = lane; i < p.hd; i += 32) {
+        ss += xh[i] * xh[i];
+    }
+    const float inv = rsqrt(simd_sum(ss) / float(p.hd) + p.eps);
+    const ulong tab = ulong(p.rope_row0 + t) * p.hd;
+    for (uint i = 2 * lane; i + 1 < p.hd; i += 64) {
+        const float x0 = xh[i] * inv * w[i];
+        const float x1 = xh[i + 1] * inv * w[i + 1];
+        xh[i] = x0 * cs[tab + i] - x1 * sn[tab + i];
+        xh[i + 1] = x1 * cs[tab + i + 1] + x0 * sn[tab + i + 1];
+    }
+}
+
+struct SeqEltParams {
+    uint n, d, x_off, x_stride, y_off, y_stride, g_off;
+    uint op;  // 0 gated add (g[i] y), 1 add, 2 tanh GELU, 3 erf GELU
+};
+
+// Elementwise over n rows of width d: x += g y, x += y, or a GELU of x
+// in place (the Vulkan gated_add.comp family's formulas).
+kernel void seq_elt(device float* x [[buffer(0)]],
+                    device const float* y [[buffer(1)]],
+                    device const float* gate [[buffer(2)]],
+                    constant SeqEltParams& p [[buffer(3)]],
+                    uint e [[thread_position_in_grid]]) {
+    if (e >= p.n * p.d) {
+        return;
+    }
+    const uint t = e / p.d, i = e % p.d;
+    device float* xa = x + p.x_off + ulong(t) * p.x_stride + i;
+    if (p.op <= 1) {
+        const float yv = y[p.y_off + ulong(t) * p.y_stride + i];
+        *xa += p.op == 0 ? gate[p.g_off + i] * yv : yv;
+        return;
+    }
+    const float v = *xa;
+    if (p.op == 2) {
+        const float kC = 0.79788456080286535588f;  // sqrt(2 / pi)
+        const float a = clamp(kC * (v + 0.044715f * v * v * v), -15.0f,
+                              15.0f);
+        *xa = 0.5f * v * (1.0f + precise::tanh(a));
+        return;
+    }
+    const float z = abs(v) * 0.70710678118654752440f;
+    const float r = 1.0f / (1.0f + 0.3275911f * z);
+    const float poly =
+        r * (0.254829592f +
+             r * (-0.284496736f +
+                  r * (1.421413741f + r * (-1.453152027f + r * 1.061405429f))));
+    const float ef = 1.0f - poly * exp(-z * z);
+    *xa = 0.5f * v * (1.0f + (v < 0.0f ? -ef : ef));
+}
+
+struct SeqThinParams {
+    uint rows, cols, n, x_off, x_stride, out_off, out_stride;
+    uint type;  // 0 F32, 1 F16, 2 BF16
+    float scale;
+};
+
+// out[t][r] += scale * dot(w row r, x[t]) for a matrix too thin for the
+// matmul's k stages: a LoRA's B side of rank below 32. A thread an
+// output; the rank is small, so each reads its row whole.
+kernel void seq_thin_add(device const uchar* w [[buffer(0)]],
+                         device const float* x [[buffer(1)]],
+                         device float* out [[buffer(2)]],
+                         constant SeqThinParams& p [[buffer(3)]],
+                         uint e [[thread_position_in_grid]]) {
+    if (e >= p.n * p.rows) {
+        return;
+    }
+    const uint t = e / p.rows, r = e % p.rows;
+    device const float* xr = x + p.x_off + ulong(t) * p.x_stride;
+    const ulong row = ulong(r) * p.cols;
+    float s = 0.0f;
+    if (p.type == 0) {
+        device const float* wr = (device const float*)w + row;
+        for (uint k = 0; k < p.cols; ++k) {
+            s += wr[k] * xr[k];
+        }
+    } else if (p.type == 1) {
+        device const half* wr = (device const half*)w + row;
+        for (uint k = 0; k < p.cols; ++k) {
+            s += float(wr[k]) * xr[k];
+        }
+    } else {
+        device const ushort* wr = (device const ushort*)w + row;
+        for (uint k = 0; k < p.cols; ++k) {
+            s += as_type<float>(uint(wr[k]) << 16) * xr[k];
+        }
+    }
+    out[p.out_off + ulong(t) * p.out_stride + r] += p.scale * s;
+}
 
 struct AxpyParams {
     uint n;

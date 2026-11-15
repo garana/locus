@@ -1,5 +1,7 @@
 #include <cstddef>
+#include <cstdint>
 
+#include "locus/backend/metal/seq.hpp"
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/janus_vision.hpp"
 
@@ -7,11 +9,9 @@ namespace locus::image {
 
 namespace {
 
-using Seq = backend::VulkanSeq;
-using Rows = Seq::Rows;
 
 /** The scratch slots of one tower call. */
-enum : Seq::Slot {
+enum : std::uint32_t {
     kX,       ///< residual rows [n][w]
     kH,       ///< LayerNorm output [n][w]
     kQkv,     ///< q | k | v per token [n][3 w]
@@ -27,7 +27,8 @@ enum : Seq::Slot {
 
 }  // namespace
 
-std::vector<float> JanusVision::features_vulkan(
+template <class Seq>
+std::vector<float> JanusVision::features_gpu(
     std::span<const float> chw) const {
     const std::uint32_t n = tokens(), w = width_, hd = w / heads_;
     // The stride-patch conv is a matmul: token t's row holds its patch
@@ -50,7 +51,7 @@ std::vector<float> JanusVision::features_vulkan(
     }
     Seq q;
     const std::size_t nw = std::size_t{n} * w;
-    for (Seq::Slot s : {kX, kH, kAtt, kO, kPos}) q.reserve(s, nw);
+    for (std::uint32_t s : {kX, kH, kAtt, kO, kPos}) q.reserve(s, nw);
     q.reserve(kQkv, 3 * nw);
     q.reserve(kUp, std::size_t{n} * ffn_);
     q.reserve(kPatch, patches.size());
@@ -82,5 +83,10 @@ std::vector<float> JanusVision::features_vulkan(
     q.read(kH, 0, x);
     return x;
 }
+
+template std::vector<float> JanusVision::features_gpu<backend::VulkanSeq>(
+    std::span<const float> chw) const;
+template std::vector<float> JanusVision::features_gpu<backend::metal::Seq>(
+    std::span<const float> chw) const;
 
 }  // namespace locus::image

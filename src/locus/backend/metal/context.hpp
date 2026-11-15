@@ -133,6 +133,10 @@ class Context {
      */
     void end_batch();
 
+    /** Drops the open batch unsubmitted, so its dispatches never run
+     *  (a no-op without one): an error path's way out of a batch. */
+    void abandon_batch() noexcept;
+
     /**
      * Runs kernel `name` over `threads` threads (a 1-D grid, in
      * threadgroups of `group` threads): recorded into the open batch,
