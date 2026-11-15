@@ -367,6 +367,12 @@ float* vulkan_alloc_kv(std::size_t n_floats);
 void vulkan_free_kv(float* pool);
 /** @returns The GPU-mapped KV pools alive now (for tests). */
 std::size_t vulkan_kv_pool_count();
+/**
+ * Test seam (i#976): on the calling thread's device, the next `n`
+ * buffer allocations fail, as an out-of-memory device's do; 0 clears
+ * it.
+ */
+void vulkan_fail_allocations_for_test(int n);
 
 /**
  * Frees the process-lifetime Vulkan backend state: the weight pool
