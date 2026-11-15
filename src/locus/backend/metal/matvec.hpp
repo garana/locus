@@ -68,6 +68,19 @@ const Ops& image_ops();
 void drop_weights();
 
 /**
+ * Frees the cached weights whose bytes start in [p, p + n). Every
+ * model file's unmap calls it (sys::add_unmap_hook, set with the first
+ * upload), so a dead model's copies leave the device whatever model
+ * held them. Takes device_mutex(): a file must not be unmapped by a
+ * thread that holds it (inside a metal::Seq's scope). A no-op, making
+ * nothing, before any Metal context exists.
+ */
+void release_weights(const void* p, std::size_t n);
+
+/** @returns The bytes of the cached weight buffers (tests). */
+std::size_t cached_weight_bytes();
+
+/**
  * Records out[out_off + r] (+)= dot(row r of the matrix, x[x_off ..])
  * for r < rows into ctx's open batch (or runs it alone): the forward's
  * building block. The caller holds device_mutex().

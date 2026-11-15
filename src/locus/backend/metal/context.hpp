@@ -58,6 +58,10 @@ class Context {
      */
     static Context& get();
 
+    /** @returns Whether get() has made the context (no device probe, no
+     *  compile): a cleanup with nothing to clean returns at once. */
+    static bool made();
+
     ~Context();
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;

@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <mutex>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -35,6 +36,13 @@ Registry& registry() {
 
 std::atomic<UnmapHook> unmap_hook{nullptr};
 
+/** add_unmap_hook's hooks: written under extra_mu, read lock-free (a
+ *  slot is set before the count that covers it). */
+constexpr std::size_t kExtraHooks = 4;
+std::atomic<UnmapHook> extra_hooks[kExtraHooks] = {};
+std::atomic<std::size_t> n_extra{0};
+std::mutex extra_mu;
+
 }  // namespace
 
 bool in_file_mapping(const void* p, std::size_t n) {
@@ -48,6 +56,21 @@ bool in_file_mapping(const void* p, std::size_t n) {
 
 UnmapHook set_unmap_hook(UnmapHook hook) {
     return unmap_hook.exchange(hook);
+}
+
+void add_unmap_hook(UnmapHook hook) {
+    std::lock_guard lk(extra_mu);
+    const std::size_t n = n_extra.load();
+    for (std::size_t i = 0; i < n; ++i) {
+        if (extra_hooks[i].load() == hook) {
+            return;
+        }
+    }
+    if (n == kExtraHooks) {
+        throw std::length_error("add_unmap_hook: too many hooks");
+    }
+    extra_hooks[n].store(hook);
+    n_extra.store(n + 1);
 }
 
 MappedFile::MappedFile(const std::string& path) {
@@ -93,6 +116,10 @@ MappedFile::~MappedFile() {
     if (data_ != nullptr) {
         if (auto hook = unmap_hook.load()) {
             hook(data_, size_);
+        }
+        const std::size_t n = n_extra.load();
+        for (std::size_t i = 0; i < n; ++i) {
+            extra_hooks[i].load()(data_, size_);
         }
         {
             const auto b = reinterpret_cast<std::uintptr_t>(data_);
