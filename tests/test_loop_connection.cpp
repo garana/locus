@@ -557,6 +557,11 @@ TEST_CASE("loop connection holds a stream's producer to the socket's pace",
     CHECK(std::chrono::steady_clock::now() - t0 >=
           std::chrono::milliseconds(40));
     drainer.join();
+    // The drainer's pump may or may not have taken the second piece too
+    // (it loops while the producer refills): drain here, so the queue
+    // is empty for certain, then fill it over the bound again.
+    REQUIRE(c.on_wake() == Next::kRead);
+    REQUIRE(k.replies[0]->write(piece));
 
     // Nothing takes the next bytes: the producer gives up at the write
     // deadline, and the connection closes.
