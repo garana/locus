@@ -940,3 +940,65 @@ TEST_CASE("bench: ltxv dit step stages on the cpu", "[.][bench][ltxv]") {
                  << " s a step (the timed stages)");
     SUCCEED();
 }
+
+// i#782: one Qwen2.5-0.5B layer's seven prefill matmuls (Q8_0, random
+// weights) through model::matvec_batch, as prefill runs them. Run it
+// with and without LOCUS_CPU_FAST=1 to compare the CPU kernels with
+// Accelerate's sgemm; LOCUS_BENCH_TOKENS sets the batch (default 512).
+TEST_CASE("bench: qwen2.5-0.5b layer matmuls on the cpu",
+          "[.][bench][accelerate]") {
+    const auto& be = best_backend();
+    const char* env = std::getenv("LOCUS_BENCH_TOKENS");
+    const std::uint32_t n = env != nullptr ? std::stoul(env) : 512;
+    std::mt19937 rng(782);
+    std::uniform_int_distribution<int> qd(-127, 127);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    const auto q8 = [&](std::uint32_t rows, std::uint32_t cols) {
+        std::vector<std::byte> w(std::size_t{rows} * (cols / 32) * 34);
+        for (std::size_t b = 0; b < w.size() / 34; ++b) {
+            const std::uint16_t d = f32_to_f16(0.01f);
+            std::memcpy(w.data() + b * 34, &d, 2);
+            for (int i = 0; i < 32; ++i) {
+                w[b * 34 + 2 + i] =
+                    static_cast<std::byte>(static_cast<std::int8_t>(qd(rng)));
+            }
+        }
+        return w;
+    };
+    struct Shape {
+        const char* name;
+        std::uint32_t rows, cols;
+    };
+    const Shape shapes[] = {{"q", 896, 896},     {"k", 128, 896},
+                            {"v", 128, 896},     {"o", 896, 896},
+                            {"gate", 4864, 896}, {"up", 4864, 896},
+                            {"down", 896, 4864}};
+    std::vector<float> x(std::size_t{n} * 4864), out(std::size_t{n} * 4864);
+    for (auto& v : x) {
+        v = xd(rng);
+    }
+    double layer = 0;
+    for (const Shape& s : shapes) {
+        const auto w = q8(s.rows, s.cols);
+        const Mat m{locus::gguf::TensorType::kQ8_0, w.data(), s.rows, s.cols};
+        double best = 1e300;
+        for (int rep = 0; rep < 3; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            locus::model::matvec_batch(be.ops, m,
+                                       {x.data(), std::size_t{n} * s.cols},
+                                       {out.data(), std::size_t{n} * s.rows},
+                                       n);
+            best = std::min(best, std::chrono::duration<double>(
+                                      std::chrono::steady_clock::now() - t0)
+                                      .count());
+        }
+        layer += best;
+        WARN(be.name << " " << s.name << " " << s.rows << "x" << s.cols
+                     << ", " << n << " tokens: " << best * 1e3 << " ms");
+    }
+    WARN(be.name << (cpu_fast() ? " (LOCUS_CPU_FAST)" : "") << ": a layer's "
+                 << "matmuls " << layer * 1e3 << " ms, 24 layers "
+                 << layer * 24e3 << " ms, " << n / (layer * 24)
+                 << " tok/s");
+    SUCCEED();
+}
