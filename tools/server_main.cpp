@@ -14,12 +14,14 @@
 
 #include "backend_cli.hpp"
 #include "cli_spec.hpp"
+#include "stage_config.hpp"
 #include "locus/engine/disk_prefix_key.hpp"
 #include "locus/pipeline/handshake.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/server/server.hpp"
 #include "locus/sys/features.hpp"
+#include "locus/sys/meminfo.hpp"
 #include "locus/tok/tokenizer.hpp"
 #include "router_cli.hpp"
 
@@ -252,6 +254,45 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         }
         opt.engine.spec_adaptive = !args.spec_fixed;
         opt.engine.kv_type = args.kv_type;
+        // Several engines (i#929): N shares of the CPU cores, or one
+        // Vulkan device each (several --device give one engine each).
+        std::uint32_t n_eng = args.engines;
+        if (args.devices.size() > 1 && n_eng == 0) {
+            n_eng = static_cast<std::uint32_t>(args.devices.size());
+        }
+        n_eng = std::max<std::uint32_t>(1, n_eng);
+        if (n_eng > 1) {
+            const std::string_view be = backend.name;
+            if (be == "vulkan" && args.devices.size() != n_eng) {
+                std::fprintf(stderr,
+                             "%s: --engines %u on Vulkan needs %u --device "
+                             "entries, one per engine\n",
+                             argv[0], n_eng, n_eng);
+                return 2;
+            }
+            if (be == "cuda" || be == "metal") {
+                std::fprintf(stderr,
+                             "%s: several engines need a CPU backend, or "
+                             "Vulkan with one --device each\n",
+                             argv[0]);
+                return 2;
+            }
+            if (be == "vulkan") {
+                opt.engine_devices.assign(args.devices.begin(),
+                                          args.devices.end());
+            }
+            // Each engine commits its own pool: refuse what would not
+            // fit in RAM, rather than an OOM kill once pages are touched.
+            if (const std::string err = locus_tools::check_kv_memory(
+                    model.kv_pool_bytes(opt.engine.n_blocks,
+                                        opt.engine.kv_type),
+                    static_cast<int>(n_eng), locus::sys::total_ram_bytes());
+                !err.empty()) {
+                std::fprintf(stderr, "%s: %s\n", argv[0], err.c_str());
+                return 2;
+            }
+        }
+        opt.engines = n_eng;
         if (!args.prefix_cache_dir.empty()) {
             opt.engine.disk_prefix = locus::engine::open_disk_prefix(
                 args.prefix_cache_dir,

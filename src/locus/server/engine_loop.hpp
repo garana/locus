@@ -3,22 +3,42 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "locus/engine/engine.hpp"
+#include "locus/sys/thread_pool.hpp"
 
 namespace locus::server {
+
+/** How an EngineLoop's worker thread runs (i#929), for one of several
+ *  engines over one model. The default is one engine on the process's
+ *  device and thread pool. At namespace scope, not nested: GCC refuses
+ *  a nested struct with member initializers as a default argument of
+ *  its enclosing class (CWG 1397). */
+struct EngineLoopSetup {
+    /** Runs first on the worker thread (e.g. binds it to the Vulkan
+     *  device the engine's KV pool was made on). */
+    std::function<void()> thread_init;
+    /** > 0: the worker's forwards fan out to a pool of its own with
+     *  this many threads, the worker included; 0: the process pool. */
+    std::size_t threads = 0;
+};
 
 /**
  * Thread-safe facade over the single-threaded Engine: one worker
  * thread drives step() while HTTP handler threads submit requests
  * and wait on progress. The engine mutex is held across each
- * step() iteration, so submitters block for at most one iteration.
+ * step() iteration, so callers block for at most one iteration.
+ * Waiters sleep until the worker publishes progress for their request
+ * (no polling, i#928).
  */
 class EngineLoop {
   public:
@@ -35,8 +55,14 @@ class EngineLoop {
         std::uint32_t cached_prefix_tokens = 0;
     };
 
+    using Setup = EngineLoopSetup;
+
+    /**
+     * Makes the engine (and its KV pool) on the calling thread, then
+     * starts the worker.
+     */
     EngineLoop(const model::TransformerModel& m, tok::TokenId eos,
-               engine::Engine::Config cfg);
+               engine::Engine::Config cfg, Setup setup = {});
     ~EngineLoop();
 
     EngineLoop(const EngineLoop&) = delete;
@@ -94,8 +120,10 @@ class EngineLoop {
 
     /** Drops a finished request's record once its result has been
      * delivered to the client (evict-on-consume); no-op if it is not
-     * terminal. Call once, after the last view/wait_done for the id. */
-    void release(std::uint64_t id);
+     * terminal. Call once, after the last view/wait_done for the id.
+     * @returns Whether the request is gone now (terminal, or unknown):
+     *     false when it was still running and was kept. */
+    bool release(std::uint64_t id);
 
     /** Engine gauges for /metrics (snapshotted under the mutex). */
     struct Stats {
@@ -121,11 +149,41 @@ class EngineLoop {
     kv::KvType kv_type() const { return kv_type_; }
 
   private:
+    /** What the worker last published for a watched request. */
+    struct Watch {
+        std::size_t generated = 0;
+        bool terminal = false;
+        int waiters = 0;
+    };
+    /** Registers a waiter on a request's progress for its scope. */
+    class WatchScope;
+
     void run();
     View snapshot_locked(std::uint64_t id) const;
+    /** Takes mu_ through the read_waiters_ turnstile, so the worker
+     *  hands it over after at most one step. */
+    std::unique_lock<std::mutex> lock_turn();
+    /** Publishes the watched requests' progress (call with mu_ held)
+     *  and wakes their waiters when any changed. */
+    void publish_locked();
+    /**
+     * Sleeps until the worker has published more than n_seen tokens or
+     * a terminal state for id, or until `until` (time_point::max()
+     * waits without limit). The caller holds a WatchScope for id.
+     */
+    void wait_watch(std::uint64_t id, std::size_t n_seen,
+                    std::chrono::steady_clock::time_point until);
 
     std::mutex mu_;
     std::condition_variable work_cv_;
+    /**
+     * Progress publication, apart from mu_ so a waiter never sleeps on
+     * the engine mutex (whose relock races the worker's). Lock order:
+     * mu_ before pmu_; nothing holds pmu_ while taking mu_.
+     */
+    std::mutex pmu_;
+    std::condition_variable progress_cv_;
+    std::unordered_map<std::uint64_t, Watch> watched_;
     /**
      * Count of client threads currently trying to acquire mu_ for a
      * read (view/wait_progress/wait_done/stats). The worker checks it
@@ -137,6 +195,9 @@ class EngineLoop {
     engine::Engine engine_;
     kv::KvType kv_type_;
     bool stop_ = false;
+    // Before worker_, which reads them as it starts.
+    std::function<void()> thread_init_;
+    std::unique_ptr<sys::ThreadPool> pool_;
     std::thread worker_;
 };
 

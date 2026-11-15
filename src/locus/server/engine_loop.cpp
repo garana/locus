@@ -3,25 +3,54 @@
 #include <chrono>
 #include <cstdio>
 #include <exception>
+#include <limits>
+#include <optional>
 #include <thread>
+#include <utility>
 
 #include "locus/sys/perf_counters.hpp"
 
 namespace locus::server {
 
 namespace {
-// Backoff between reader polls of the engine state. Small enough that
-// SSE latency stays imperceptible, large enough that an idle waiter
-// does not spin. The reader is serviced within one step() of a new
-// token via the read_waiters_ turnstile regardless.
-constexpr auto kPollBackoff = std::chrono::microseconds(200);
+// How often wait_done_or_cancel probes its client between progress
+// wakes: the bound on noticing a client that left while its request
+// makes no progress (queued, or a long prefill).
+constexpr auto kAliveProbe = std::chrono::milliseconds(20);
+using Clock = std::chrono::steady_clock;
 }  // namespace
+
+/** Registers a waiter on a request's progress for its scope. */
+class EngineLoop::WatchScope {
+  public:
+    WatchScope(EngineLoop& l, std::uint64_t id) : l_(l), id_(id) {
+        std::lock_guard<std::mutex> pk(l_.pmu_);
+        ++l_.watched_[id_].waiters;
+    }
+    ~WatchScope() {
+        std::lock_guard<std::mutex> pk(l_.pmu_);
+        const auto it = l_.watched_.find(id_);
+        if (it != l_.watched_.end() && --it->second.waiters == 0) {
+            l_.watched_.erase(it);
+        }
+    }
+    WatchScope(const WatchScope&) = delete;
+    WatchScope& operator=(const WatchScope&) = delete;
+
+  private:
+    EngineLoop& l_;
+    std::uint64_t id_;
+};
 
 EngineLoop::EngineLoop(const model::TransformerModel& m,
                        tok::TokenId eos,
-                       engine::Engine::Config cfg)
+                       engine::Engine::Config cfg, Setup setup)
     : engine_(m, eos, cfg),
       kv_type_(cfg.kv_type),
+      thread_init_(std::move(setup.thread_init)),
+      pool_(setup.threads > 0
+                ? std::make_unique<sys::ThreadPool>(setup.threads - 1)
+                : nullptr),
       worker_([this] { run(); }) {}
 
 EngineLoop::~EngineLoop() {
@@ -33,8 +62,50 @@ EngineLoop::~EngineLoop() {
     worker_.join();
 }
 
+std::unique_lock<std::mutex> EngineLoop::lock_turn() {
+    read_waiters_.fetch_add(1);
+    std::unique_lock<std::mutex> lk(mu_);
+    read_waiters_.fetch_sub(1);
+    return lk;
+}
+
+void EngineLoop::publish_locked() {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> pk(pmu_);
+        for (auto& [id, w] : watched_) {
+            const engine::Request* r = engine_.get(id);
+            const std::size_t n = r != nullptr ? r->generated.size() : 0;
+            const bool done = r == nullptr || engine::is_terminal(r->status);
+            if (n != w.generated || done != w.terminal) {
+                w.generated = n;
+                w.terminal = done;
+                changed = true;
+            }
+        }
+    }
+    if (changed) {
+        progress_cv_.notify_all();
+    }
+}
+
+void EngineLoop::wait_watch(std::uint64_t id, std::size_t n_seen,
+                            Clock::time_point until) {
+    std::unique_lock<std::mutex> pk(pmu_);
+    const auto ready = [&] {
+        const auto it = watched_.find(id);
+        return it == watched_.end() || it->second.terminal ||
+               it->second.generated > n_seen;
+    };
+    if (until == Clock::time_point::max()) {
+        progress_cv_.wait(pk, ready);
+    } else {
+        progress_cv_.wait_until(pk, until, ready);
+    }
+}
+
 std::string EngineLoop::admit_error(std::uint32_t n_prompt) {
-    std::lock_guard<std::mutex> lk(mu_);
+    auto lk = lock_turn();
     return engine_.admit_error(n_prompt);
 }
 
@@ -45,7 +116,7 @@ std::uint64_t EngineLoop::submit(
     engine::LogprobsOpt logprobs) {
     std::uint64_t id;
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        auto lk = lock_turn();
         id = engine_.submit(std::move(prompt), max_new_tokens,
                             sampling, seed, std::move(constraint),
                             logprobs);
@@ -59,6 +130,15 @@ void EngineLoop::run() {
     // matvec slice, so register its cache counters for /metrics too (the
     // pool workers cover the fan-out). No-op unless perf is available.
     locus::sys::perf::ThreadCounters perf_counters;
+    // One of several engines (i#929): bind this thread to the engine's
+    // device, and fan its forwards out to the engine's own pool.
+    if (thread_init_) {
+        thread_init_();
+    }
+    std::optional<sys::ThreadPool::Scope> scope;
+    if (pool_) {
+        scope.emplace(*pool_);
+    }
     std::unique_lock<std::mutex> lk(mu_);
     while (!stop_) {
         try {
@@ -73,6 +153,7 @@ void EngineLoop::run() {
                          "failed\n",
                          e.what(), n);
         }
+        publish_locked();
         // Park unless there is work step() can make progress on now.
         // Gating on has_runnable_work (not just idle) keeps the
         // worker from busy-spinning while HOLDING mu_ on a backlog it
@@ -123,41 +204,30 @@ EngineLoop::View EngineLoop::snapshot_locked(
 }
 
 EngineLoop::View EngineLoop::view(std::uint64_t id) {
-    read_waiters_.fetch_add(1);
-    std::unique_lock<std::mutex> lk(mu_);
-    read_waiters_.fetch_sub(1);
+    auto lk = lock_turn();
     return snapshot_locked(id);
 }
 
 EngineLoop::View EngineLoop::wait_progress(
     std::uint64_t id, std::size_t n_seen, std::chrono::milliseconds max_wait) {
-    // Poll under the read_waiters_ turnstile: announce intent, take
-    // mu_ (the worker yields it between steps), snapshot, and either
-    // return or back off. Polling (vs a condvar) keeps the re-acquire
-    // fair -- a condvar wait would race the worker's relock and starve
-    // the reader for the whole generation.
-    const auto until = std::chrono::steady_clock::now() + max_wait;
+    // Watch first, then snapshot: a step that lands after the snapshot
+    // is published to the watch, so the sleep below cannot miss it. The
+    // snapshot itself goes through the turnstile (at most one step).
+    WatchScope watch(*this, id);
+    const auto until = max_wait.count() > 0 ? Clock::now() + max_wait
+                                            : Clock::time_point::max();
     for (;;) {
-        read_waiters_.fetch_add(1);
-        {
-            std::unique_lock<std::mutex> lk(mu_);
-            read_waiters_.fetch_sub(1);
-            const View v = snapshot_locked(id);
-            if (v.generated.size() > n_seen ||
-                engine::is_terminal(v.status) ||
-                (max_wait.count() > 0 &&
-                 std::chrono::steady_clock::now() >= until)) {
-                return v;
-            }
+        const View v = view(id);
+        if (v.generated.size() > n_seen || engine::is_terminal(v.status) ||
+            Clock::now() >= until) {
+            return v;
         }
-        std::this_thread::sleep_for(kPollBackoff);
+        wait_watch(id, n_seen, until);
     }
 }
 
 EngineLoop::Stats EngineLoop::stats() {
-    read_waiters_.fetch_add(1);
-    std::unique_lock<std::mutex> lk(mu_);
-    read_waiters_.fetch_sub(1);
+    auto lk = lock_turn();
     Stats s;
     s.free_blocks = engine_.free_blocks();
     s.total_blocks = engine_.total_blocks();
@@ -174,46 +244,44 @@ EngineLoop::Stats EngineLoop::stats() {
 }
 
 EngineLoop::View EngineLoop::wait_done(std::uint64_t id) {
+    WatchScope watch(*this, id);
     for (;;) {
-        read_waiters_.fetch_add(1);
-        {
-            std::unique_lock<std::mutex> lk(mu_);
-            read_waiters_.fetch_sub(1);
-            const View v = snapshot_locked(id);
-            if (engine::is_terminal(v.status)) {
-                return v;
-            }
+        const View v = view(id);
+        if (engine::is_terminal(v.status)) {
+            return v;
         }
-        std::this_thread::sleep_for(kPollBackoff);
+        wait_watch(id, std::numeric_limits<std::size_t>::max(),
+                   Clock::time_point::max());
     }
 }
 
 EngineLoop::View EngineLoop::wait_done_or_cancel(
     std::uint64_t id, const std::function<bool()>& alive) {
+    WatchScope watch(*this, id);
     for (;;) {
-        read_waiters_.fetch_add(1);
-        {
-            std::unique_lock<std::mutex> lk(mu_);
-            read_waiters_.fetch_sub(1);
-            const View v = snapshot_locked(id);
-            if (engine::is_terminal(v.status)) {
-                return v;
-            }
+        const View v = view(id);
+        if (engine::is_terminal(v.status)) {
+            return v;
         }
-        // Liveness syscall runs OUTSIDE mu_ so polling the socket never
+        // Liveness syscall runs OUTSIDE mu_ so probing the socket never
         // blocks the worker's next step(). A gone client -> cancel and
         // return the now-terminal (kCancelled) snapshot.
         if (alive && !alive()) {
             cancel(id);
             return view(id);
         }
-        std::this_thread::sleep_for(kPollBackoff);
+        wait_watch(id, std::numeric_limits<std::size_t>::max(),
+                   alive ? Clock::now() + kAliveProbe
+                         : Clock::time_point::max());
     }
 }
 
-void EngineLoop::release(std::uint64_t id) {
-    std::lock_guard<std::mutex> lk(mu_);
+bool EngineLoop::release(std::uint64_t id) {
+    auto lk = lock_turn();
+    const engine::Request* r = engine_.get(id);
+    const bool gone = r == nullptr || engine::is_terminal(r->status);
     engine_.release(id);
+    return gone;
 }
 
 void EngineLoop::cancel(std::uint64_t id) {
@@ -223,11 +291,12 @@ void EngineLoop::cancel(std::uint64_t id) {
     // generation finished -- cancellation would never preempt a running
     // request. Announcing intent makes the worker yield mu_ after its
     // current step so cancel lands mid-generation.
-    read_waiters_.fetch_add(1);
     {
-        std::unique_lock<std::mutex> lk(mu_);
-        read_waiters_.fetch_sub(1);
+        auto lk = lock_turn();
         engine_.cancel(id);
+        // A parked worker may not step again (the cancelled request was
+        // its only work), so publish here: its waiters see kCancelled.
+        publish_locked();
     }
     // Wake the worker so it re-evaluates has_runnable_work and parks if
     // the cancelled request was the only work (harmless if it was not).

@@ -156,7 +156,9 @@ read-only.
 A first-party HTTP/1.1 server (`src/locus/http`) and vendored
 nlohmann/json for untrusted request bodies: hand-rolled JSON parsing
 is where API vulnerabilities come from. A worker thread drives
-`Engine::step()`; handler threads submit and wait (`EngineLoop`).
+`Engine::step()`; handler threads submit and wait (`EngineLoop`),
+asleep until the worker publishes their request's progress after a
+step.
 Chat messages are formatted by `chat::ChatTemplate`: the GGUF's
 Jinja source is fingerprinted to a known family (llama3, chatml,
 llama2, zephyr, deepseek, deepseek2, deepseek-coder) and rendered by
@@ -1044,6 +1046,17 @@ Exit test: a two-host split gives byte-identical output to the
 single-host run; at concurrency at or above the pipeline depth,
 throughput approaches the single-box ceiling, with only the hop
 latency added.
+
+`locus-server` serves the same way from several engines
+(`server::EngineGroup`, #929): each an `EngineLoop` with its own
+engine, KV pool and worker over the one loaded model, on its own
+Vulkan device (its pool made with the caller bound there, its worker
+bound to it) or its own share of the CPU cores
+(`sys::ThreadPool::share_threads`, as the stage executors). A request
+goes to the engine with the fewest unreleased requests and stays
+there; its id is `local * engines + engine`, so one engine keeps
+today's ids. `/metrics` sums the engines. The disk prefix tier serves
+one engine only; CUDA serves one engine (#924).
 
 ## 15. 8-bit activations (R16)
 

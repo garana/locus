@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -58,6 +59,29 @@ json complete(int port, const std::string& prompt) {
 }
 
 }  // namespace
+
+// i#929: one disk prefix store serves one engine; a server asked for
+// two over it refuses to start.
+TEST_CASE("several engines refuse a shared disk prefix cache",
+          "[server][disk_prefix][engine_group]") {
+    if (!fs::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const fs::path dir = fs::temp_directory_path() /
+                         ("locus-sdp2-" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    locus::server::OpenAiServer::Options opt;
+    opt.engines = 2;
+    opt.engine.disk_prefix = locus::engine::open_disk_prefix(
+        dir.string(), 64 << 20, g, model_path(), model,
+        locus::kv::KvType::kF32);
+    CHECK_THROWS_AS(locus::server::OpenAiServer(model, tok, opt),
+                    std::invalid_argument);
+    fs::remove_all(dir);
+}
 
 TEST_CASE("server serves a prompt prefix from disk after a restart",
           "[server][disk_prefix]") {
