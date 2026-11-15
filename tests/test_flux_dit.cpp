@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "gguf_builder.hpp"
 #include "json.hpp"
 #include "locus/backend/registry.hpp"
@@ -84,6 +85,9 @@ std::vector<Leg> legs() {
     std::vector<Leg> v = {{"cpu", &locus::backend::best_backend().ops}};
     if (locus::backend::vk::VulkanContext::available()) {
         v.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    if (locus::backend::metal::Context::usable()) {
+        v.push_back({"metal", &locus::backend::metal::image_ops()});
     }
     return v;
 }
