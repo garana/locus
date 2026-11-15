@@ -3,6 +3,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <mach/mach.h>
 
 #include <cstring>
 #include <stdexcept>
@@ -137,6 +138,31 @@ Context::Buffer Context::upload(std::span<const std::byte> src) {
         std::memcpy(b.data, src.data(), src.size());
     }
     return b;
+}
+
+Context::Wrapped Context::wrap(const void* p, std::size_t n) {
+    @autoreleasepool {
+        const std::uintptr_t page = vm_page_size;
+        const auto at = reinterpret_cast<std::uintptr_t>(p);
+        const std::uintptr_t lo = at / page * page;
+        const std::uintptr_t hi = (at + (n == 0 ? 1 : n) + page - 1) / page *
+                                  page;
+        id<MTLBuffer> b = [impl_->device
+            newBufferWithBytesNoCopy:reinterpret_cast<void*>(lo)
+                              length:hi - lo
+                             options:MTLResourceStorageModeShared
+                         deallocator:nil];
+        if (b == nil) {
+            throw std::runtime_error("metal: cannot wrap " +
+                                     std::to_string(hi - lo) + " bytes");
+        }
+        Wrapped w;
+        w.buf.handle = (__bridge_retained void*)b;
+        w.buf.data = reinterpret_cast<void*>(lo);
+        w.buf.bytes = hi - lo;
+        w.offset = at - lo;
+        return w;
+    }
 }
 
 void Context::free(Buffer& b) {

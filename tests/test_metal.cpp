@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <mutex>
@@ -659,4 +660,58 @@ TEST_CASE("metal matvec re-uploads a new matrix at a reused address",
         REQUIRE(got[r] == Catch::Approx(want[r]).margin(1e-3).epsilon(1e-4));
     }
     mb::drop_weights();
+}
+
+TEST_CASE("metal forward on a GGUF parsed from memory copies its weights",
+          "[metal][e2e]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/qwen2.5-0.5b-instruct-q8_0.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP(path + " absent");
+    }
+    // A heap image, not the file's mapping: the Metal weights cannot be
+    // no-copy wraps of it (page rounding would reach past the
+    // allocation), so they are copies; the forward still runs on the
+    // GPU and tracks the CPU.
+    std::ifstream f(path, std::ios::binary);
+    std::vector<std::byte> image(std::filesystem::file_size(path));
+    f.read(reinterpret_cast<char*>(image.data()),
+           static_cast<std::streamsize>(image.size()));
+    REQUIRE(f.good());
+    auto g = locus::gguf::GgufFile::parse(image);
+    REQUIRE_FALSE(g.file_backed());
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_q8k_activations(false);
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    const std::uint32_t nv = model.hparams().n_vocab;
+    const auto ids = tok->encode("The capital of France is", true);
+    const auto last = [&](std::string_view be) {
+        model.use_backend(*locus::backend::find_backend(be));
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(nv);
+        for (const auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
+        }
+        cache.release(seq);
+        return logits;
+    };
+    const auto cpu = last(locus::backend::backends().front().name);
+    const std::uint64_t before =
+        locus::model::TransformerModel::metal_forward_tokens();
+    const auto gpu = last("metal");
+    CHECK(locus::model::TransformerModel::metal_forward_tokens() - before ==
+          ids.size());
+    CHECK(locus::model::argmax(gpu) == locus::model::argmax(cpu));
+    float worst = 0.0f, scale = 0.0f;
+    for (std::uint32_t r = 0; r < nv; ++r) {
+        worst = std::max(worst, std::abs(gpu[r] - cpu[r]));
+        scale = std::max(scale, std::abs(cpu[r]));
+    }
+    CHECK(worst <= 0.01f * scale);
 }
