@@ -565,6 +565,7 @@ if(CUDAToolkit_FOUND)
     set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     target_sources(locus PRIVATE
+        src/locus/backend/cuda/cuda_conv.cu
         src/locus/backend/cuda/cuda_matvec.cu)
     set_target_properties(locus PROPERTIES CUDA_ARCHITECTURES "50")
     target_compile_definitions(locus PRIVATE LOCUS_HAS_CUDA=1)
