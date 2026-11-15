@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -95,6 +96,17 @@ struct ServerResponse {
                                       StreamProvider provider);
 };
 
+class LoopReply;
+
+/** A request's answer handed to its handler (RequestContext::defer). */
+struct Deferred {
+    /** Answers the request, from any thread. */
+    std::shared_ptr<LoopReply> reply;
+    /** Call once, after the answer: records its status and body bytes
+     *  in the server's metrics. */
+    std::function<void(int status, std::uint64_t bytes)> done;
+};
+
 /**
  * Per-request state the head stage produces for the handler: whatever a
  * HeadHandler decides on the head that the Handler needs later (today,
@@ -131,6 +143,15 @@ struct RequestContext {
      * there.
      */
     std::function<bool()> client_alive;
+    /**
+     * Set by LoopServer (i#932), empty under Server and for HEAD: takes
+     * the request's answer out of the server, which then writes nothing
+     * when the handler returns (res is ignored). The caller answers
+     * through the returned reply, later and from any thread, and calls
+     * its done() once. Lets a handler that waits on other work return
+     * its job thread.
+     */
+    std::function<Deferred()> defer;
 };
 
 /**

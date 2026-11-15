@@ -234,7 +234,8 @@ The server listens on 127.0.0.1; `--host ADDR` picks an address and
 but `/health` need a key the helper allows (`locus-auth-helper` is a
 reference one). `--event-loop` serves every connection from one I/O
 thread with the handlers on a job pool, so idle and slow clients hold
-no thread (a thread a connection otherwise). `locus-server --help`
+no thread (a thread a connection otherwise), and nor does a
+generation waiting on the engine. `locus-server --help`
 lists the options and environment
 variables;
 `--capabilities` lists the architectures, backends, weight formats

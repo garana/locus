@@ -128,6 +128,9 @@ class LoopReply {
      * answer may still be written; a long handler should stop.
      */
     bool client_gone() const;
+    /** @returns Whether write() would queue at once: the stream's queue
+     *  is under its bound (i#932, for a producer that must not block). */
+    bool has_room() const;
 
   private:
     friend class LoopConnection;

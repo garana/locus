@@ -412,8 +412,9 @@ void LoopServer::serve(const Request& req,
     if (m != nullptr) m->in_flight.fetch_add(1, std::memory_order_relaxed);
     struct Done {
         HttpMetrics* m;
+        bool deferred = false;  ///< the handler's Deferred::done ends it
         ~Done() {
-            if (m != nullptr) {
+            if (m != nullptr && !deferred) {
                 m->in_flight.fetch_sub(1, std::memory_order_relaxed);
             }
         }
@@ -421,6 +422,20 @@ void LoopServer::serve(const Request& req,
     const std::uint64_t req_bytes = req.body.size();
     RequestContext ctx;
     ctx.client_alive = [reply] { return !reply->client_gone(); };
+    if (!req.is_head) {
+        ctx.defer = [this, &done, reply, m, req_bytes, start,
+                     path = req.path] {
+            done.deferred = true;
+            return Deferred{
+                reply, [this, m, req_bytes, start, path](
+                           int status, std::uint64_t bytes) {
+                    record(path, status, req_bytes, bytes, start);
+                    if (m != nullptr) {
+                        m->in_flight.fetch_sub(1, std::memory_order_relaxed);
+                    }
+                }};
+        };
+    }
     if (head_handler_) {
         ServerResponse hres;
         bool reject = false;
@@ -443,9 +458,15 @@ void LoopServer::serve(const Request& req,
     try {
         handler_(req, res, ctx);
     } catch (...) {
+        if (done.deferred) {
+            return;  // the answer is the deferring code's to give
+        }
         // Last resort (i#243): a 500, and the server lives.
         reply->fail();
         record(req.path, 500, req_bytes, 0, start);
+        return;
+    }
+    if (done.deferred) {
         return;
     }
     if (res.provider) {

@@ -16,6 +16,7 @@
 #include "locus/model/transformer.hpp"
 #include "locus/server/engine_group.hpp"
 #include "locus/server/engine_loop.hpp"
+#include "locus/server/gen_reply.hpp"
 #include "locus/tok/tokenizer.hpp"
 #include "locus/video/ffmpeg.hpp"
 
@@ -186,8 +187,12 @@ class OpenAiServer {
         std::size_t max_conns_per_ip = 0;
         /** Serve on the event loop (http::LoopServer, i#931): one I/O
          *  thread for every connection, handlers on a job pool; false:
-         *  http::Server's thread a connection. */
+         *  http::Server's thread a connection. Generations then wait on
+         *  the engine without a job thread (i#932). */
         bool event_loop = false;
+        /** The HTTP server's threads (http::ServerConfig::worker_threads:
+         *  connections, or the event loop's job pool); 0 = its default. */
+        int http_threads = 0;
         auth::AuthConfig auth_cache;
         /** Prompt caching (KV prefix reuse) -- on by default. A
          * request sharing a block-aligned prompt prefix with a recent
@@ -289,6 +294,13 @@ class OpenAiServer {
     void vision_chat(bool anthropic, const VisionChat& chat,
                      http::ServerResponse& res,
                      const http::RequestContext& ctx);
+    /**
+     * Answers generation `id` (i#932): through pump_ when the event-loop
+     * server lets the handler defer, else on the calling job thread
+     * (serve_generation). res carries the status and headers so far.
+     */
+    void answer(std::uint64_t id, GenReply gr, http::ServerResponse& res,
+                const http::RequestContext& ctx);
 
     const model::TransformerModel& model_;
     const tok::Tokenizer& tok_;
@@ -299,6 +311,9 @@ class OpenAiServer {
     std::unique_ptr<http::Service> http_;
     /** Per-route request metrics (i#285), shared with http_. */
     std::shared_ptr<http::HttpMetrics> http_metrics_;
+    /** Drives generations under --event-loop (null otherwise). After
+     *  http_, so it goes first: its records reach a live server. */
+    std::unique_ptr<GenPump> pump_;
     std::uint32_t n_vocab_ = 0;
 
     // Cumulative counters exposed at GET /metrics (Prometheus text).
