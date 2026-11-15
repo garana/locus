@@ -49,6 +49,7 @@
 #include "locus/model/sampling.hpp"
 #include "locus/server/errors.hpp"
 #include "locus/server/metrics_text.hpp"
+#include "locus/server/request_checks.hpp"
 #include "locus/server/responses.hpp"
 #include "locus/server/image_lora.hpp"
 #include "locus/server/tools.hpp"
@@ -968,25 +969,6 @@ std::string vision_turn_text(const json& content, bool anthropic,
 }
 
 /**
- * A positive integer limit of a request body, clamped to cap.
- *
- * @returns body[key], at most cap, or dflt when the body has no key.
- * @throws std::invalid_argument when the value is not a positive integer
- *     (null included).
- */
-std::uint32_t read_count(const json& body, const char* key,
-                         std::uint32_t cap, std::uint32_t dflt) {
-    if (!body.contains(key)) return dflt;
-    const auto& v = body[key];
-    if (!v.is_number_unsigned() || v.get<std::uint64_t>() == 0) {
-        throw std::invalid_argument(std::string(key) +
-                                    " must be a positive integer");
-    }
-    return static_cast<std::uint32_t>(
-        std::min<std::uint64_t>(v.get<std::uint64_t>(), cap));
-}
-
-/**
  * The output limit of a completions or chat body: max_completion_tokens
  * (OpenAI's current name, sent by the Antigravity SDK) or else
  * max_tokens; a null value counts as absent.
@@ -1002,52 +984,6 @@ std::uint32_t read_max_tokens(const json& body, std::uint32_t cap,
         return read_count(body, key, cap, dflt);
     }
     return dflt;
-}
-
-/**
- * The image and video endpoints' common request checks (i#1030): one
- * message per error for PixArt, FLUX / Qwen-Image, Janus,
- * Qwen-Image-Edit and LTX-Video.
- */
-
-/** @returns body[k], or "" when absent.
- *  @throws std::invalid_argument when it is not a string. */
-std::string body_string(const json& body, const char* k) {
-    if (!body.contains(k)) return {};
-    if (!body[k].is_string()) {
-        throw std::invalid_argument(std::string(k) + " must be a string");
-    }
-    return body[k].get<std::string>();
-}
-
-/** @returns The body's prompt.
- *  @throws std::invalid_argument when it is missing, not a string or
- *      empty. */
-std::string require_prompt(const json& body) {
-    std::string p = body_string(body, "prompt");
-    if (p.empty()) {
-        throw std::invalid_argument("prompt must be a non-empty string");
-    }
-    return p;
-}
-
-/** @throws std::invalid_argument when the body asks for n images, n
- *      other than 1 (the pipelines make one). */
-void require_one_image(const json& body) {
-    if (body.contains("n") && (!body["n"].is_number_integer() ||
-                               body["n"].get<std::int64_t>() != 1)) {
-        throw std::invalid_argument("n must be 1");
-    }
-}
-
-/** @throws std::invalid_argument when the body asks for a
- *      response_format other than b64_json (the one the endpoints
- *      give). */
-void require_b64_json(const json& body) {
-    if (body.contains("response_format") &&
-        body_string(body, "response_format") != "b64_json") {
-        throw std::invalid_argument("response_format must be b64_json");
-    }
 }
 
 /**
@@ -3968,7 +3904,9 @@ void OpenAiServer::install_routes() {
             };
             image::QwenEditPipeline::Request p;
             p.prompt = require_prompt(body);
-            p.negative_prompt = str("negative_prompt");
+            // An optional: set, it runs true CFG (true_cfg_scale over 1),
+            // so an absent field must leave it empty.
+            p.negative_prompt = body_optional_string(body, "negative_prompt");
             require_one_image(body);
             require_b64_json(body);
             if (!body.contains("image")) {
