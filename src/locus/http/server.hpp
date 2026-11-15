@@ -105,6 +105,10 @@ struct Deferred {
     /** Call once, after the answer: records its status and body bytes
      *  in the server's metrics. */
     std::function<void(int status, std::uint64_t bytes)> done;
+    /** Call when a stream fails after its head (before done): logs the
+     *  cause and counts it in the route's stream failures, as the
+     *  server does for a provider that throws (i#980). */
+    std::function<void(const char* why)> stream_failed;
 };
 
 /**

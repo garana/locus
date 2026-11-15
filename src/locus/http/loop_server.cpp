@@ -424,14 +424,24 @@ void LoopServer::serve(const Request& req,
     ctx.client_alive = [reply] { return !reply->client_gone(); };
     if (!req.is_head) {
         ctx.defer = [this, &done, reply, m, req_bytes, start,
-                     path = req.path] {
+                     method = req.method, path = req.path] {
             done.deferred = true;
             return Deferred{
-                reply, [this, m, req_bytes, start, path](
-                           int status, std::uint64_t bytes) {
+                reply,
+                [this, m, req_bytes, start, path](int status,
+                                                  std::uint64_t bytes) {
                     record(path, status, req_bytes, bytes, start);
                     if (m != nullptr) {
                         m->in_flight.fetch_sub(1, std::memory_order_relaxed);
+                    }
+                },
+                [m, method, path](const char* why) {
+                    std::fprintf(stderr,
+                                 "locus-server: %s %s: the stream failed "
+                                 "after its head: %s\n",
+                                 method.c_str(), path.c_str(), why);
+                    if (m != nullptr) {
+                        m->stream_failed(m->route(path));
                     }
                 }};
         };

@@ -165,14 +165,22 @@ void GenPump::run() {
         incoming_.clear();
         lk.unlock();
         std::erase_if(live, [this](const std::unique_ptr<Entry>& e) {
-            try {
-                return pump(*e);
-            } catch (...) {
-                // A step that throws: a 500, or a truncated stream, as a
-                // provider that throws on the job pool.
+            // A step that throws: a 500, or a truncated stream (logged and
+            // counted, i#980), as a provider that throws on the job pool.
+            const auto failed = [&](const char* why) {
+                if (e->gr.stream && e->d.stream_failed) {
+                    e->d.stream_failed(why);
+                }
                 e->d.reply->fail();
                 drop(*e, e->gr.stream ? e->status : 500);
                 return true;
+            };
+            try {
+                return pump(*e);
+            } catch (const std::exception& ex) {
+                return failed(ex.what());
+            } catch (...) {
+                return failed("unknown exception");
             }
         });
         lk.lock();
