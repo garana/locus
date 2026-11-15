@@ -60,12 +60,12 @@ class EngineGroup {
     std::string admit_error(std::uint32_t n_prompt);
 
     /**
-     * Submits to the engine that last served a prompt with the same
-     * first kPrefixKeyTokens tokens (its prefix cache may hold their
-     * KV, i#940), unless that engine has more than kPrefixSlack
-     * requests over the least-loaded one; else, and for a shorter
-     * prompt, to the least-loaded engine (the fewest requests not yet
-     * released).
+     * Submits to the engine that last served the longest block-aligned
+     * prefix of the prompt (whole kPrefixKeyTokens blocks; its prefix
+     * cache may hold their KV, i#940, i#988), unless that engine has
+     * more than kPrefixSlack requests over the least-loaded one; else,
+     * and for a prompt under one block, to the least-loaded engine (the
+     * fewest requests not yet released).
      * @returns The request's group id.
      */
     std::uint64_t submit(
@@ -123,8 +123,12 @@ class EngineGroup {
     static constexpr std::size_t kPrefixSlack = 1;
     /** Most prefix keys kept (then the map starts over). */
     static constexpr std::size_t kPrefixKeys = 4096;
-    /** @returns A hash of the prompt's first kPrefixKeyTokens tokens. */
-    static std::uint64_t prefix_key(const std::vector<tok::TokenId>& prompt);
+    /** Most blocks of one prompt keyed (its first 1024 tokens). */
+    static constexpr std::size_t kPrefixMaxBlocks = 64;
+    /** @returns One key per whole kPrefixKeyTokens block of the prompt
+     *  (at most kPrefixMaxBlocks): key k hashes blocks 0 to k. */
+    static std::vector<std::uint64_t> prefix_keys(
+        const std::vector<tok::TokenId>& prompt);
 
     std::vector<std::unique_ptr<EngineLoop>> loops_;
     /** Requests submitted and not yet released: their ids, and their
