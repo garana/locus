@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <utility>
 
 #include "locus/pipeline/net.hpp"
@@ -408,12 +409,26 @@ void LoopServer::serve(const Request& req,
             return;
         }
         ReplySink sink(reply);
-        try {
-            res.provider(sink);
-        } catch (...) {
-            // The head is out: a truncated transfer, as Server does.
+        // The head is out: a truncated transfer, logged and counted, as
+        // Server does (i#980).
+        const auto failed = [&](const char* why) {
+            std::fprintf(stderr,
+                         "locus-server: %s %s: the stream failed after its "
+                         "head: %s\n",
+                         req.method.c_str(), req.path.c_str(), why);
+            if (m != nullptr) {
+                m->stream_failed(m->route(req.path));
+            }
             reply->fail();
             record(req.path, res.status, req_bytes, sink.bytes(), start);
+        };
+        try {
+            res.provider(sink);
+        } catch (const std::exception& e) {
+            failed(e.what());
+            return;
+        } catch (...) {
+            failed("unknown exception");
             return;
         }
         reply->end();

@@ -944,21 +944,30 @@ TEST_CASE("http server: a throwing handler answers 500 and the server lives",
 
 TEST_CASE("http server: a provider that throws mid-stream ends that stream "
           "only", "[http_server]") {
-    Fixture f([](const Request& req, ServerResponse& res) {
-        if (req.path != "/s") {
-            echo_handler(req, res);
-            return;
-        }
-        res.set_chunked_content_provider(
-            "text/event-stream", [](locus::http::Sink& sink) {
-                sink.write("a");
-                throw std::runtime_error("provider bug");
-            });
-    });
+    ServerConfig cfg;
+    cfg.metrics = std::make_shared<locus::http::HttpMetrics>(
+        std::vector<std::string>{"/s"});
+    const auto m = cfg.metrics;
+    Fixture f(
+        [](const Request& req, ServerResponse& res) {
+            if (req.path != "/s") {
+                echo_handler(req, res);
+                return;
+            }
+            res.set_chunked_content_provider(
+                "text/event-stream", [](locus::http::Sink& sink) {
+                    sink.write("a");
+                    throw std::runtime_error("provider bug");
+                });
+        },
+        cfg);
     const std::string r =
         one_request(f.port, "GET /s HTTP/1.1\r\nHost: h\r\n\r\n");
     REQUIRE(r.find("1\r\na\r\n") != std::string::npos);    // sent so far
     REQUIRE(r.find("0\r\n\r\n") == std::string::npos);     // no terminator
+    // i#980: counted (and logged), since the 200 alone hides it.
+    CHECK(m->at(m->route("/s")).stream_failures.load() == 1);
+    CHECK(m->at(m->other()).stream_failures.load() == 0);
     REQUIRE(one_request(f.port, "GET /ok HTTP/1.1\r\nHost: h\r\n\r\n")
                 .find("GET /ok") != std::string::npos);
 }

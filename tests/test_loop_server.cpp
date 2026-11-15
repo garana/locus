@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -131,7 +132,11 @@ TEST_CASE("loop server streams a chunked response", "[http][loop_server]") {
 
 TEST_CASE("loop server turns a throw into a 500 or a truncated stream",
           "[http][loop_server]") {
-    Running r({}, routes);
+    ServerConfig cfg;
+    cfg.metrics = std::make_shared<locus::http::HttpMetrics>(
+        std::vector<std::string>{"/stream-throw"});
+    const auto m = cfg.metrics;
+    Running r(cfg, routes);
     int fd = dial(r.port);
     send_all(fd, get("/throw"));
     std::string got = read_to_close(fd);
@@ -145,6 +150,10 @@ TEST_CASE("loop server turns a throw into a 500 or a truncated stream",
     CHECK(got.rfind("HTTP/1.1 200", 0) == 0);
     CHECK(got.find("4\r\npart\r\n") != std::string::npos);
     CHECK(got.find("0\r\n\r\n") == std::string::npos);
+    // i#980: counted (and logged) on its route, as on Server; the 500
+    // before any head is not a stream failure.
+    CHECK(m->at(m->route("/stream-throw")).stream_failures.load() == 1);
+    CHECK(m->at(m->other()).stream_failures.load() == 0);
     // And the server lives.
     fd = dial(r.port);
     send_all(fd, get("/hello"));
