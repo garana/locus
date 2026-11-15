@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "locus/backend/metal/matvec.hpp"
+#include "locus/backend/metal/seq.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
@@ -242,8 +244,11 @@ std::vector<float> PixArtDit::forward(std::span<const float> latent, float t,
     }
 
     std::vector<float> y;
-    if (&op == &backend::vulkan_image_ops() &&
-        backend::VulkanSeq::available()) {
+    const bool vk = &op == &backend::vulkan_image_ops() &&
+                    backend::VulkanSeq::available();
+    const bool mt = &op == &backend::metal::image_ops() &&
+                    backend::metal::Seq::available();
+    if (vk || mt) {
         const char* env = std::getenv("LOCUS_PIXART_GPU");
         if (env == nullptr || std::string(env) != "0") {
             // Each block's table plus m, then the final shift and scale.
@@ -258,7 +263,10 @@ std::vector<float> PixArtDit::forward(std::span<const float> latent, float t,
                       mods.end() - 2 * std::ptrdiff_t{w});
             std::copy(scale.begin(), scale.end(),
                       mods.end() - std::ptrdiff_t{w});
-            y = forward_vulkan(patches, text, n_text, mods);
+            y = vk ? forward_gpu<backend::VulkanSeq>(patches, text, n_text,
+                                                     mods)
+                   : forward_gpu<backend::metal::Seq>(patches, text, n_text,
+                                                      mods);
         }
     }
     if (y.empty()) {

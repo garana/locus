@@ -2193,6 +2193,8 @@ TEST_CASE("metrics carry labels and timings in well-formed histograms",
     REQUIRE(series("locus_http_request_seconds_count",
                    "route=\"/v1/embeddings\"") == 0);
     REQUIRE(metric_value(b, "locus_http_requests_in_flight") == 1);
+    // i#980: rendered for every route, 0 here (no stream failed).
+    REQUIRE(series("locus_http_stream_failures_total", route) == 0);
 
     // The forward's time per stage and per (layer, stage), and the
     // hardware (i#285). stories260K is a dense llama: no moe series.

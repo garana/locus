@@ -274,7 +274,7 @@ entries give one engine per device); a request stays on one engine.
 | scalar  | portable reference, every weight type                                                    |
 | vulkan  | the whole forward pass on the GPU: matmuls, norms, RoPE, paged attention, MoE routing    |
 | cuda    | matvec and attention on the GPU (paged weight pool, KV cache copy); the rest on the CPU  |
-| metal   | Apple GPUs (#10): plain llama on the GPU (F32/F16, Q8_0, Q4_0, Q5_0, Q4/5/6_K), else CPU |
+| metal   | Apple GPUs (#10): llama, qwen2 and MoE on the GPU, else CPU; image DiTs not served yet   |
 
 Without `--backend` or `LOCUS_BACKEND`, a Mac runs a model on metal
 when metal's whole-token forward takes it (and the KV cache is f32),

@@ -3,16 +3,43 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "locus/http/http.hpp"
 #include "locus/sys/poller.hpp"
 
 namespace locus::http {
+
+/**
+ * The connections whose replies have news for the loop (i#990), so a
+ * wake visits only those: a reply pushes its connection's id, and the
+ * first push after a take() writes one byte to the loop's wake fd.
+ * Thread-safe; ids are never reused, so a closed connection's late
+ * push names no other client.
+ */
+class WakeList {
+  public:
+    /** @param wake_fd The loop's wake pipe (non-blocking write end). */
+    explicit WakeList(int wake_fd) : wake_fd_(wake_fd) {}
+
+    /** Marks connection `id` as having news and wakes the loop. */
+    void push(std::uint64_t id);
+    /** @returns The ids pushed since the last take, each once (any
+     *  order). Read the wake fd first: a push after that read is
+     *  either in this take or wakes the loop again. */
+    std::vector<std::uint64_t> take();
+
+  private:
+    const int wake_fd_;
+    std::mutex mu_;
+    std::vector<std::uint64_t> ids_;
+};
 
 /** Bounds of one LoopConnection; the same meaning as the matching
  * ServerConfig fields. */
@@ -34,6 +61,10 @@ struct LoopConfig {
      *  loop that only answers at once. Non-blocking, owned by the
      *  loop, open for as long as any reply can be written. */
     int wake_fd = -1;
+    /** When set, replies wake the loop through this instead (pushing
+     *  wake_id), so the loop knows which connection to look at. */
+    std::shared_ptr<WakeList> wake_list;
+    std::uint64_t wake_id = 0;
     /** Most bytes of a stream queued and not yet on the socket; a
      *  producer waits while it is over this (backpressure). */
     std::size_t max_stream_buffer = 1 << 20;
@@ -57,7 +88,11 @@ using LoopHandler = std::function<void(const Request& req, Response& res)>;
  */
 class LoopReply {
   public:
-    LoopReply(int wake_fd, std::size_t max_buffer, int write_deadline_ms);
+    /** Wakes the loop through `wake_list` (pushing wake_id) when it is
+     *  set, else through wake_fd. */
+    LoopReply(int wake_fd, std::size_t max_buffer, int write_deadline_ms,
+              std::shared_ptr<WakeList> wake_list = nullptr,
+              std::uint64_t wake_id = 0);
 
     /** Answers with a buffered response. Ignored after any other call. */
     void send(Response res);
@@ -103,6 +138,8 @@ class LoopReply {
     void cancel();
 
     const int wake_fd_;
+    const std::shared_ptr<WakeList> wake_list_;
+    const std::uint64_t wake_id_;
     const std::size_t max_buffer_;
     const int write_deadline_ms_;
     mutable std::mutex mu_;

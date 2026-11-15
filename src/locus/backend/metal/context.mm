@@ -211,6 +211,16 @@ void Context::end_batch() {
     }
 }
 
+void Context::abandon_batch() noexcept {
+    if (impl_->batch == nil) {
+        return;
+    }
+    // Never committed, so the GPU never touches its buffers.
+    [impl_->enc endEncoding];
+    impl_->enc = nil;
+    impl_->batch = nil;
+}
+
 void Context::dispatch(std::string_view name, std::span<const Arg> args,
                        std::span<const std::byte> params,
                        std::uint32_t threads, std::uint32_t group) {
