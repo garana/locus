@@ -212,6 +212,74 @@ TEST_CASE("a prompt goes to the engine that holds its prefix",
     group.release(x);
 }
 
+// i#988: chat prompts share their template's first block, so routing by
+// that block alone sends every conversation to the engine that took the
+// last one. Two conversations with one 16-token preamble each go back to
+// the engine that holds their own history (the longest matching prefix).
+TEST_CASE("two conversations with one preamble keep their own engines",
+          "[engine_group][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    locus::engine::Engine::Config cfg;
+    cfg.prefix_cache = true;
+    const locus::tok::TokenId never = model.hparams().n_vocab;
+    EngineGroup group(model, never, cfg, EngineGroup::plan(2, {}));
+    const auto run = [](int from, int n) {
+        std::vector<locus::tok::TokenId> v;
+        for (int i = 0; i < n; ++i) {
+            v.push_back(from + i);
+        }
+        return v;
+    };
+    const auto cat = [](std::vector<std::vector<locus::tok::TokenId>> parts) {
+        std::vector<locus::tok::TokenId> v;
+        for (const auto& p : parts) {
+            v.insert(v.end(), p.begin(), p.end());
+        }
+        return v;
+    };
+    const auto pre = run(1, 16);  // the shared preamble: one block
+    const auto a1 = run(100, 16), a2 = run(120, 16);
+    const auto b1 = run(200, 16), b2 = run(220, 16);
+    const auto other = run(300, 20);
+    const auto finish = [&](std::uint64_t id) {
+        const auto v = group.wait_done(id);
+        group.release(id);
+        return v;
+    };
+
+    // Conversation A's first turn: engine 0 (both idle).
+    const std::uint64_t ta1 = group.submit(cat({pre, a1, {50}}), 2);
+    REQUIRE(group.engine_of(ta1) == 0);
+    finish(ta1);
+    // Engine 0 busy by two (the second follows the first's prefix), so
+    // conversation B's first turn goes to engine 1.
+    const std::uint64_t x1 = group.submit(other, 4096);
+    const std::uint64_t x2 = group.submit(cat({other, {330}}), 4096);
+    REQUIRE(group.engine_of(x1) == 0);
+    REQUIRE(group.engine_of(x2) == 0);
+    const std::uint64_t tb1 = group.submit(cat({pre, b1, {51}}), 2);
+    REQUIRE(group.engine_of(tb1) == 1);
+    finish(tb1);
+    for (const std::uint64_t id : {x1, x2}) {
+        group.cancel(id);
+        finish(id);
+    }
+
+    // Both idle. The preamble's block last went to engine 1, but each
+    // second turn goes to the engine of its own first turn, and reuses
+    // the preamble and its first message from that engine's cache.
+    const std::uint64_t ta2 = group.submit(cat({pre, a1, a2, {52}}), 2);
+    CHECK(group.engine_of(ta2) == 0);
+    CHECK(finish(ta2).reused_prefix_tokens >= 32);
+    const std::uint64_t tb2 = group.submit(cat({pre, b1, b2, {53}}), 2);
+    CHECK(group.engine_of(tb2) == 1);
+    CHECK(finish(tb2).reused_prefix_tokens >= 32);
+}
+
 TEST_CASE("two Vulkan devices run one engine each with one device's tokens",
           "[engine_group][vulkan]") {
     if (!std::filesystem::exists(model_path())) {

@@ -1,5 +1,6 @@
 #include "locus/server/engine_group.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -60,14 +61,22 @@ EngineGroup::EngineGroup(const model::TransformerModel& m,
     load_.assign(loops_.size(), 0);
 }
 
-std::uint64_t EngineGroup::prefix_key(
+std::vector<std::uint64_t> EngineGroup::prefix_keys(
     const std::vector<tok::TokenId>& prompt) {
-    // FNV-1a over the first kPrefixKeyTokens ids.
+    // FNV-1a over the ids, chained: key k covers blocks 0..k, so two
+    // prompts share key k only when their first k + 1 blocks match.
+    const std::size_t n =
+        std::min(prompt.size() / kPrefixKeyTokens, kPrefixMaxBlocks);
+    std::vector<std::uint64_t> keys;
+    keys.reserve(n);
     std::uint64_t h = 1469598103934665603ULL;
-    for (std::size_t i = 0; i < kPrefixKeyTokens; ++i) {
+    for (std::size_t i = 0; i < n * kPrefixKeyTokens; ++i) {
         h = (h ^ static_cast<std::uint32_t>(prompt[i])) * 1099511628211ULL;
+        if ((i + 1) % kPrefixKeyTokens == 0) {
+            keys.push_back(h);
+        }
     }
-    return h;
+    return keys;
 }
 
 std::string EngineGroup::admit_error(std::uint32_t n_prompt) {
@@ -89,21 +98,29 @@ std::uint64_t EngineGroup::submit(
             }
         }
         e = least;
-        // Prefix affinity (i#940): each engine has its own prefix cache,
-        // so a prompt goes where its first tokens were last served, to
-        // reuse their KV, unless that engine is busier than the least
-        // loaded by more than kPrefixSlack.
+        // Prefix affinity (i#940, i#988): each engine has its own prefix
+        // cache, so a prompt goes where its longest block-aligned prefix
+        // was last served, to reuse that KV, unless that engine is
+        // busier than the least loaded by more than kPrefixSlack. The
+        // longest match, not the first block: chat prompts mostly share
+        // their template's opening block.
         if (loops_.size() > 1 && prompt.size() >= kPrefixKeyTokens) {
-            const std::uint64_t key = prefix_key(prompt);
-            const auto it = last_engine_.find(key);
-            if (it != last_engine_.end() &&
-                load_[it->second] <= load_[least] + kPrefixSlack) {
-                e = it->second;
+            const std::vector<std::uint64_t> keys = prefix_keys(prompt);
+            for (auto k = keys.rbegin(); k != keys.rend(); ++k) {
+                const auto it = last_engine_.find(*k);
+                if (it != last_engine_.end()) {
+                    if (load_[it->second] <= load_[least] + kPrefixSlack) {
+                        e = it->second;
+                    }
+                    break;
+                }
             }
-            if (last_engine_.size() >= kPrefixKeys) {
+            if (last_engine_.size() + keys.size() > kPrefixKeys) {
                 last_engine_.clear();  // bounded: start over when full
             }
-            last_engine_[key] = e;
+            for (const std::uint64_t k : keys) {
+                last_engine_[k] = e;
+            }
         }
         ++load_[e];
     }
