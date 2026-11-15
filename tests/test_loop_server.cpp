@@ -1,9 +1,13 @@
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -330,4 +334,113 @@ TEST_CASE("loop server: a stream's chunks cost the same with idle clients",
     // The 200 idle clients add no work per chunk (their idle deadlines
     // are a minute away; the slack covers timing).
     CHECK(crowded <= alone + kChunks);
+}
+
+namespace {
+
+/** @returns The server's end of the client socket c: the test process
+ *  holds both, so it is the socket whose local address is c's peer and
+ *  whose peer is c's local address (-1 if none). */
+int server_end(int c) {
+    sockaddr_storage cl{}, cp{};
+    socklen_t n = sizeof(cl);
+    ::getsockname(c, reinterpret_cast<sockaddr*>(&cl), &n);
+    n = sizeof(cp);
+    ::getpeername(c, reinterpret_cast<sockaddr*>(&cp), &n);
+    for (int fd = 3; fd < 4096; ++fd) {
+        if (fd == c) continue;
+        sockaddr_storage l{}, p{};
+        socklen_t ln = sizeof(l), pn = sizeof(p);
+        if (::getsockname(fd, reinterpret_cast<sockaddr*>(&l), &ln) != 0 ||
+            ::getpeername(fd, reinterpret_cast<sockaddr*>(&p), &pn) != 0) {
+            continue;
+        }
+        if (ln == n && pn == n && std::memcmp(&l, &cp, n) == 0 &&
+            std::memcmp(&p, &cl, n) == 0) {
+            return fd;
+        }
+    }
+    return -1;
+}
+
+/** @returns fd's keepalive options: on, idle, interval, count. */
+std::array<int, 4> keepalive_of(int fd) {
+    std::array<int, 4> v{-1, -1, -1, -1};
+    socklen_t n = sizeof(int);
+    ::getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &v[0], &n);
+#if defined(TCP_KEEPIDLE)
+    n = sizeof(int);
+    ::getsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &v[1], &n);
+#elif defined(TCP_KEEPALIVE)
+    n = sizeof(int);
+    ::getsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &v[1], &n);
+#endif
+    n = sizeof(int);
+    ::getsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &v[2], &n);
+    n = sizeof(int);
+    ::getsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &v[3], &n);
+    return v;
+}
+
+/** One keep-alive request on a new connection to port; @returns the
+ *  client socket, still open, after the answer. */
+int answered_client(int port) {
+    const int c = dial(port);
+    send_all(c, get("/hello", false));
+    std::string got;
+    char buf[512];
+    while (got.find("hello\n") == std::string::npos) {
+        const ssize_t k = ::recv(c, buf, sizeof(buf), 0);
+        REQUIRE(k > 0);
+        got.append(buf, static_cast<std::size_t>(k));
+    }
+    return c;
+}
+
+}  // namespace
+
+// i#994: both HTTP servers turn TCP keepalive on for each client socket
+// with the configured probes, so a client whose host died is found (a
+// dead peer cannot be made on loopback: that end is checked by hand).
+TEST_CASE("the HTTP servers set TCP keepalive on client sockets",
+          "[http][loop_server]") {
+    ServerConfig cfg;
+    cfg.host = "127.0.0.1";
+    cfg.port = 0;
+    cfg.keepalive_idle_s = 45;
+    cfg.keepalive_intvl_s = 15;
+    cfg.keepalive_count = 2;
+    {
+        Running r(cfg, routes);
+        const int c = answered_client(r.port);
+        const int s = server_end(c);
+        REQUIRE(s >= 0);
+        CHECK(keepalive_of(s)[0] != 0);
+        CHECK(keepalive_of(s)[1] == 45);
+        CHECK(keepalive_of(s)[2] == 15);
+        CHECK(keepalive_of(s)[3] == 2);
+        ::close(c);
+    }
+    {
+        locus::http::Server server(cfg, routes);
+        const int port = server.start();
+        REQUIRE(port > 0);
+        const int c = answered_client(port);
+        const int s = server_end(c);
+        REQUIRE(s >= 0);
+        CHECK(keepalive_of(s)[0] != 0);
+        CHECK(keepalive_of(s)[1] == 45);
+        CHECK(keepalive_of(s)[2] == 15);
+        CHECK(keepalive_of(s)[3] == 2);
+        ::close(c);
+        server.stop();
+    }
+    // 0 turns it off.
+    cfg.keepalive_idle_s = 0;
+    Running r(cfg, routes);
+    const int c = answered_client(r.port);
+    const int s = server_end(c);
+    REQUIRE(s >= 0);
+    CHECK(keepalive_of(s)[0] == 0);
+    ::close(c);
 }

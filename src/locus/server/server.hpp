@@ -185,6 +185,11 @@ class OpenAiServer {
         /** Open connections one client address may hold (i#625 F21;
          *  http::ServerConfig::max_conns_per_ip). 0 = no cap. */
         std::size_t max_conns_per_ip = 0;
+        /** TCP keepalive on client sockets (i#994; http::ServerConfig's
+         *  keepalive fields): idle seconds (0 = off), interval, count. */
+        int keepalive_idle_s = 30;
+        int keepalive_intvl_s = 10;
+        int keepalive_count = 3;
         /** Serve on the event loop (http::LoopServer, i#931): one I/O
          *  thread for every connection, handlers on a job pool; false:
          *  http::Server's thread a connection. Generations then wait on
