@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "json.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
@@ -121,6 +122,9 @@ TEST_CASE("pixart dit matches torch on a synthetic model",
         // step.
         legs.push_back({"vulkan per op", &locus::backend::vulkan_image_ops()});
     }
+    if (locus::backend::metal::Context::usable()) {
+        legs.push_back({"metal", &locus::backend::metal::image_ops()});
+    }
     struct Reset {
         ~Reset() {
             locus::backend::vulkan_set_attn_scratch_floats(0);
@@ -180,6 +184,9 @@ TEST_CASE("pixart dit matches the reference on the first step",
         {"cpu", &locus::backend::best_backend().ops}};
     if (locus::backend::vulkan_backend_usable()) {
         legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    if (locus::backend::metal::Context::usable()) {
+        legs.push_back({"metal", &locus::backend::metal::image_ops()});
     }
     for (const auto& [name, op] : legs) {
         std::size_t at = 0;

@@ -1,6 +1,7 @@
 // The Metal matvec (i#866); see matvec.hpp.
 #include "locus/backend/metal/matvec.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -65,7 +66,29 @@ struct Cached {
     Context::Buffer buf;
     gguf::TensorType type;
     std::uint32_t rows, cols;
+    std::uint64_t print;  // fingerprint() of the bytes when uploaded
 };
+
+/**
+ * FNV-1a over three 64-byte windows of a weight's bytes (its start,
+ * middle and end): another matrix of the same type and shape that
+ * turns up at a freed one's address (a model unloaded and another
+ * mapped there, a temporary) almost surely differs in one of them, so
+ * the cache uploads it afresh instead of serving the old bytes.
+ */
+std::uint64_t fingerprint(const std::byte* p, std::size_t n) {
+    std::uint64_t h = 1469598103934665603ULL;
+    const auto mix = [&](std::size_t at) {
+        const std::size_t end = std::min(n, at + 64);
+        for (std::size_t i = at; i < end; ++i) {
+            h = (h ^ static_cast<std::uint8_t>(p[i])) * 1099511628211ULL;
+        }
+    };
+    mix(0);
+    mix(n / 2 > 32 ? n / 2 - 32 : 0);
+    mix(n > 64 ? n - 64 : 0);
+    return h;
+}
 
 /** Weights by host pointer, and the x / out scratch buffers. */
 struct State {
@@ -92,18 +115,20 @@ std::size_t weight_bytes(const Mat& w, const Kind& k) {
 
 const Context::Buffer& weight(Context& ctx, const Mat& w, const Kind& k) {
     auto& ws = state().weights;
+    const std::size_t bytes = weight_bytes(w, k);
+    const std::uint64_t print = fingerprint(w.data, bytes);
     const auto it = ws.find(w.data);
     if (it != ws.end()) {
         Cached& c = it->second;
-        if (c.type == w.type && c.rows == w.rows && c.cols == w.cols) {
+        if (c.type == w.type && c.rows == w.rows && c.cols == w.cols &&
+            c.print == print) {
             return c.buf;
         }
         // Another matrix at a freed one's address: upload it afresh.
         ctx.free(c.buf);
         ws.erase(it);
     }
-    Cached c{ctx.upload({w.data, weight_bytes(w, k)}), w.type, w.rows,
-             w.cols};
+    Cached c{ctx.upload({w.data, bytes}), w.type, w.rows, w.cols, print};
     return ws.emplace(w.data, c).first->second.buf;
 }
 
