@@ -476,10 +476,13 @@ struct RopeParams {
     ulong off;      // the first head's first float
     uint n_heads;
     uint head_dim;
+    uint neox;      // NEOX pairs (i, i + head_dim / 2), else (2 i, 2 i + 1)
 };
 
-// In place, pairs (2 i, 2 i + 1) of each head rotated by cs[2 i]
-// (cos) and cs[2 i + 1] (sin): one thread a pair.
+// In place, pair i of each head rotated by cs[2 i] (cos) and
+// cs[2 i + 1] (sin): elements (2 i, 2 i + 1) (rope_norm), or (i,
+// i + head_dim / 2) with neox (the same angle per pair): one thread a
+// pair.
 kernel void rope_norm(device float* v [[buffer(0)]],
                       device const float* cs [[buffer(1)]],
                       constant RopeParams& p [[buffer(2)]],
@@ -489,11 +492,13 @@ kernel void rope_norm(device float* v [[buffer(0)]],
         return;
     }
     const uint h = g / half_d, i = g % half_d;
-    device float* e = v + p.off + h * p.head_dim + 2 * i;
+    device float* hv = v + p.off + h * p.head_dim;
+    device float* e0 = p.neox != 0 ? hv + i : hv + 2 * i;
+    device float* e1 = p.neox != 0 ? hv + i + half_d : hv + 2 * i + 1;
     const float c = cs[2 * i], s = cs[2 * i + 1];
-    const float a = e[0], b = e[1];
-    e[0] = a * c - b * s;
-    e[1] = a * s + b * c;
+    const float a = *e0, b = *e1;
+    *e0 = a * c - b * s;
+    *e1 = a * s + b * c;
 }
 
 // Paged attention for one query over positions [0, n_pos): position t
@@ -946,6 +951,7 @@ struct RopeRowsParams {
     uint n_heads;
     uint head_dim;
     uint stride;  // floats between token rows
+    uint neox;    // NEOX pairs, as rope_norm
 };
 
 // rope_norm on n token rows: token t's heads at off + t * stride, its
@@ -960,12 +966,33 @@ kernel void rope_rows(device float* v [[buffer(0)]],
     }
     const uint t = g / per, j = g % per;
     const uint h = j / half_d, i = j % half_d;
-    device float* e =
-        v + p.off + ulong(t) * p.stride + h * p.head_dim + 2 * i;
+    device float* hv = v + p.off + ulong(t) * p.stride + h * p.head_dim;
+    device float* e0 = p.neox != 0 ? hv + i : hv + 2 * i;
+    device float* e1 = p.neox != 0 ? hv + i + half_d : hv + 2 * i + 1;
     device const float* c = cs + t * p.head_dim + 2 * i;
-    const float a = e[0], b = e[1];
-    e[0] = a * c[0] - b * c[1];
-    e[1] = a * c[1] + b * c[0];
+    const float a = *e0, b = *e1;
+    *e0 = a * c[0] - b * c[1];
+    *e1 = a * c[1] + b * c[0];
+}
+
+struct BiasParams {
+    ulong off;     // token 0's first float
+    uint n;        // the bias's length
+    uint n_tok;
+    uint stride;   // floats between token rows
+};
+
+// v[off + t * stride + i] += b[i] for n_tok rows: the q / k / v
+// projection biases (qwen2).
+kernel void add_bias(device float* v [[buffer(0)]],
+                     device const float* b [[buffer(1)]],
+                     constant BiasParams& p [[buffer(2)]],
+                     uint g [[thread_position_in_grid]]) {
+    if (g >= p.n_tok * p.n) {
+        return;
+    }
+    const uint t = g / p.n, i = g % p.n;
+    v[p.off + ulong(t) * p.stride + i] += b[i];
 }
 
 struct ScatterParams {

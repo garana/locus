@@ -90,7 +90,11 @@ struct NormParams {
 };
 struct RopeParams {
     std::uint64_t off;
-    std::uint32_t n_heads, head_dim;
+    std::uint32_t n_heads, head_dim, neox;
+};
+struct BiasParams {
+    std::uint64_t off;
+    std::uint32_t n, n_tok, stride;
 };
 struct AttnParams {
     std::uint64_t block_floats, layer_off, v_off;
@@ -115,7 +119,13 @@ bool TransformerModel::metal_forward_supported() const {
         const char* e = std::getenv("LOCUS_METAL_FORWARD");
         return e != nullptr && std::string_view(e) == "0";
     }();
-    if (off || backend_->name != "metal" || !spec_->plain_attention ||
+    // The plain llama attention, or qwen2's (q / k / v biases, NEOX
+    // RoPE; not qwen2vl's M-RoPE, whose text positions are not the
+    // sequence's).
+    const bool attn_ok =
+        spec_->plain_attention ||
+        (spec_->qwen2_attention && hp_.rope_sections[0] == 0);
+    if (off || backend_->name != "metal" || !attn_ok ||
         hp_.custom_layer || spec_->layer != nullptr ||
         spec_->forward != nullptr || layer_begin_ != 0 ||
         layer_end_ != hp_.n_layers || hp_.norm_type != NormType::kRmsNorm ||
@@ -129,7 +139,8 @@ bool TransformerModel::metal_forward_supported() const {
     };
     for (const Layer& lay : layers_) {
         if (lay.is_moe() || !lay.has_separate_qkv(hp_) ||
-            lay.has_qkv_bias() || lay.has_qk_norm() ||
+            (lay.has_qkv_bias() && !spec_->qwen2_attention) ||
+            lay.has_qk_norm() ||
             !lay.post_attn_norm.empty() || !lay.post_ffw_norm.empty() ||
             !ok_w(lay.wq) || !ok_w(lay.wk) || !ok_w(lay.wv) || !ok_w(lay.wo) ||
             !ok_w(lay.w_gate) || !ok_w(lay.w_up) || !ok_w(lay.w_down)) {
@@ -245,9 +256,22 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
             metal::record_matvec(ctx, w.type, w.rows, w.cols, wbuf(w), 0, in,
                                  0, out, out_off, acc);
         };
+        const std::uint32_t neox = spec_->qwen2_attention ? 1u : 0u;
+        // v[off + t * stride ..] += bias, for n_tok rows.
+        const auto bias = [&](const Context::Buffer& v, std::uint64_t off,
+                              std::span<const float> b, std::uint32_t n_tok,
+                              std::uint32_t stride) {
+            if (b.empty()) {
+                return;
+            }
+            const BiasParams bp{off, static_cast<std::uint32_t>(b.size()),
+                                n_tok, stride};
+            const Context::Arg a[] = {{&v, 0}, {&fbuf(b), 0}};
+            ctx.dispatch("add_bias", a, bytes_of(bp), n_tok * bp.n, 256);
+        };
         const auto rope = [&](const Context::Buffer& b, std::uint64_t off,
                               std::uint32_t heads) {
-            const RopeParams rp{off, heads, hd};
+            const RopeParams rp{off, heads, hd, neox};
             const Context::Arg a[] = {{&b, 0}, {&s.cs, 0}};
             ctx.dispatch("rope_norm", a, bytes_of(rp), heads * hd / 2, 64);
         };
@@ -266,6 +290,14 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 mv(lay.wk, s.xb, *pool, krow, false);
                 ctx.overlap_next();
                 mv(lay.wv, s.xb, *pool, vrow, false);
+                if (lay.has_qkv_bias()) {
+                    // qwen2: the biases, which may overlap, then RoPE.
+                    bias(s.q, 0, lay.wq_bias, 1, 0);
+                    ctx.overlap_next();
+                    bias(*pool, krow, lay.wk_bias, 1, 0);
+                    ctx.overlap_next();
+                    bias(*pool, vrow, lay.wv_bias, 1, 0);
+                }
                 rope(s.q, 0, H);
                 ctx.overlap_next();
                 rope(*pool, krow, KV);
@@ -344,7 +376,7 @@ struct RowNormParams {
 };
 struct RopeRowsParams {
     std::uint64_t off;
-    std::uint32_t n_tok, n_heads, head_dim, stride;
+    std::uint32_t n_tok, n_heads, head_dim, stride, neox;
 };
 struct ScatterParams {
     std::uint64_t v_off;
@@ -424,6 +456,16 @@ bool TransformerModel::metal_forward_batch(
         const auto fbuf =
             [&](std::span<const float> v) -> const Context::Buffer& {
             return mw.get(ctx, v.data(), v.size_bytes());
+        };
+        const std::uint32_t neox = spec_->qwen2_attention ? 1u : 0u;
+        // v[t * stride ..] += bias, for n_tok rows (qwen2's q / k / v).
+        const auto bias = [&](const Context::Buffer& v, std::uint64_t off,
+                              std::span<const float> b, std::uint32_t n_tok,
+                              std::uint32_t stride) {
+            const BiasParams bp{off, static_cast<std::uint32_t>(b.size()),
+                                n_tok, stride};
+            const Context::Arg a[] = {{&v, 0}, {&fbuf(b), 0}};
+            ctx.dispatch("add_bias", a, bytes_of(bp), n_tok * bp.n, 256);
         };
         BatchScratch& s = batch_scratch();
         const std::size_t C = std::min(n, kPrefillChunk);
@@ -510,14 +552,26 @@ bool TransformerModel::metal_forward_batch(
                     mm(lay.wk, s.xb, E, s.k, kvd, false, m);
                     ctx.overlap_next();
                     mm(lay.wv, s.xb, E, s.v, kvd, false, m);
+                    if (lay.has_qkv_bias()) {
+                        bias(s.q, 0, lay.wq_bias, m,
+                             static_cast<std::uint32_t>(qd));
+                        ctx.overlap_next();
+                        bias(s.k, 0, lay.wk_bias, m,
+                             static_cast<std::uint32_t>(kvd));
+                        ctx.overlap_next();
+                        bias(s.v, 0, lay.wv_bias, m,
+                             static_cast<std::uint32_t>(kvd));
+                    }
                     const RopeRowsParams rq{0, m, H, hd,
-                                            static_cast<std::uint32_t>(qd)};
+                                            static_cast<std::uint32_t>(qd),
+                                            neox};
                     const Context::Arg ra[] = {{&s.q, 0}, {&s.cs, 0}};
                     ctx.dispatch("rope_rows", ra, bytes_of(rq),
                                  m * H * hd / 2, 64);
                     ctx.overlap_next();
                     const RopeRowsParams rk{0, m, KV, hd,
-                                            static_cast<std::uint32_t>(kvd)};
+                                            static_cast<std::uint32_t>(kvd),
+                                            neox};
                     const Context::Arg rka[] = {{&s.k, 0}, {&s.cs, 0}};
                     ctx.dispatch("rope_rows", rka, bytes_of(rk),
                                  m * KV * hd / 2, 64);
