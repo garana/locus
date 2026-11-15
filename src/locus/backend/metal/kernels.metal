@@ -437,10 +437,9 @@ kernel void mv_q5_k(device const uchar* w [[buffer(0)]],
 }
 
 // Q6_K: 210-byte super-blocks of 256 (128 ql, 64 qh, 16 int8 scales,
-// f16 d at 208). Half n (0, 1) of a block holds elements 128 n ..; a
-// unit is one (n, i) with i = 0, 1: the 16 l in [16 i, 16 i + 16) of
-// that half, each giving elements l, l + 32, l + 64 and l + 96 with
-// scales sc[8 n + i + {0, 2, 4, 6}]. The block stride is not a multiple
+// f16 d at 208). Half n (0, 1) of a block holds elements 128 n ..; its
+// l in [0, 32) gives elements l, l + 32, l + 64 and l + 96 with scales
+// sc[8 n + l / 16 + {0, 2, 4, 6}]. The block stride is not a multiple
 // of 4, so the bytes load one at a time.
 kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
                     device const float* xb [[buffer(1)]],
@@ -461,18 +460,19 @@ kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
         const uint nb = p.cols / 256;
         device const uchar* row = w + wo + (ulong)r * nb * 210;
         device const float* x = xs;
-        for (uint u = lane; u < nb * 4; u += kMvLanes) {
-            const uint b = u >> 2;
-            const uint n = (u >> 1) & 1;
-            const uint i = u & 1;
+        // A lane takes 4 l of one half (ggml's layout, i#1058): lanes
+        // 0-7 the first half's l 0 .. 31, lanes 8-15 the second's, so
+        // neighbouring lanes read neighbouring bytes of one block.
+        const uint ip = lane / 8, l0 = 4 * (lane % 8);
+        for (uint b = 0; b < nb; ++b) {
             device const uchar* blk = row + b * 210;
-            device const uchar* ql = blk + 64 * n + 16 * i;
-            device const uchar* qh = blk + 128 + 32 * n + 16 * i;
+            device const uchar* ql = blk + 64 * ip + l0;
+            device const uchar* qh = blk + 128 + 32 * ip + l0;
             device const char* sc =
-                (device const char*)(blk + 192) + 8 * n + i;
-            device const float* xs = x + b * 256 + 128 * n + 16 * i;
+                (device const char*)(blk + 192) + 8 * ip + l0 / 16;
+            device const float* xs = x + b * 256 + 128 * ip + l0;
             float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-            for (uint l = 0; l < 16; ++l) {
+            for (uint l = 0; l < 4; ++l) {
                 const uint a = ql[l], c = ql[l + 32], h = qh[l];
                 const int q0 = int((a & 0xF) | ((h & 3) << 4)) - 32;
                 const int q1 = int((c & 0xF) | (((h >> 2) & 3) << 4)) - 32;
