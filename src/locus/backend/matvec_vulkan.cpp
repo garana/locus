@@ -636,10 +636,16 @@ struct State {
     void grow(VulkanContext::Buffer& b, std::size_t& cap,
               std::size_t n_floats) {
         if (n_floats > cap) {
+            // Allocate first: when it throws (the device is out of
+            // memory), b and cap still name the live old buffer. Retired
+            // before the allocation, the old one was freed by the
+            // abandoned batch while b kept it, and the next grow retired
+            // it again: a double free (i#976).
+            VulkanContext::Buffer nb = ctx.create_buffer(n_floats * 4);
             if (cap != 0) {
                 retired.push_back(b);
             }
-            b = ctx.create_buffer(n_floats * 4);
+            b = nb;
             cap = n_floats;
         }
     }
@@ -1937,6 +1943,11 @@ std::size_t vulkan_kv_pool_count() {
     }
     std::lock_guard lk(state_mu());
     return state().kv_pools.size();
+}
+
+void vulkan_fail_allocations_for_test(int n) {
+    std::lock_guard lk(state_mu());
+    state().ctx.fail_allocations_for_test(n);
 }
 
 void vulkan_free_kv(float* pool) {
