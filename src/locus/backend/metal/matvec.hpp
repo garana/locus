@@ -10,8 +10,8 @@ namespace locus::backend::metal {
 
 /**
  * @returns Whether the Metal backend has a matvec kernel for weights
- *     of type t (F32, Q8_0, Q4_K, Q6_K), for any shape whose columns
- *     are a whole number of t's blocks.
+ *     of type t (F32, F16, Q8_0, Q4_0, Q5_0, Q4_K, Q5_K, Q6_K), for
+ *     any shape whose columns are a whole number of t's blocks.
  */
 bool matvec_supported(gguf::TensorType t);
 

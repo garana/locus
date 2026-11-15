@@ -144,8 +144,9 @@ const std::vector<Backend>& list() {
         mo.alloc_kv = &metal::alloc_kv;
         mo.free_kv = &metal::free_kv;
         b.push_back({"metal",
-                     "Apple GPU via Metal: plain llama models (F32, "
-                     "Q8_0, Q4_K, Q6_K) on the GPU, the rest on the CPU",
+                     "Apple GPU via Metal: plain llama models (F32, F16, "
+                     "Q8_0, Q4_0, Q5_0, Q4_K, Q5_K, Q6_K) on the GPU, the "
+                     "rest on the CPU",
                      mt, mt, mo});
 #pragma GCC diagnostic pop
         return b;

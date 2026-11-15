@@ -167,8 +167,20 @@ std::vector<std::byte> random_weights(TensorType t, std::uint32_t rows,
         std::uint32_t elems, bytes, d_off;
         int dmin_off;
     };
+    if (t == TensorType::kF16) {
+        std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+        std::vector<std::byte> b(static_cast<std::size_t>(rows) * cols * 2);
+        for (std::size_t i = 0; i < b.size(); i += 2) {
+            const std::uint16_t h = locus::backend::f32_to_f16(d(rng));
+            std::memcpy(b.data() + i, &h, 2);
+        }
+        return b;
+    }
     const Blk k = t == TensorType::kQ8_0   ? Blk{32, 34, 0, -1}
+                  : t == TensorType::kQ4_0 ? Blk{32, 18, 0, -1}
+                  : t == TensorType::kQ5_0 ? Blk{32, 22, 0, -1}
                   : t == TensorType::kQ4_K ? Blk{256, 144, 0, 2}
+                  : t == TensorType::kQ5_K ? Blk{256, 176, 0, 2}
                                            : Blk{256, 210, 208, -1};
     std::uniform_int_distribution<int> byte(0, 255);
     std::vector<std::byte> w(static_cast<std::size_t>(rows) *
@@ -197,8 +209,10 @@ TEST_CASE("metal matvec matches the CPU for each weight type",
     namespace mb = locus::backend::metal;
     std::mt19937 rng(3);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    for (const TensorType t : {TensorType::kF32, TensorType::kQ8_0,
-                               TensorType::kQ4_K, TensorType::kQ6_K}) {
+    for (const TensorType t :
+         {TensorType::kF32, TensorType::kF16, TensorType::kQ8_0,
+          TensorType::kQ4_0, TensorType::kQ5_0, TensorType::kQ4_K,
+          TensorType::kQ5_K, TensorType::kQ6_K}) {
         CHECK(mb::matvec_supported(t));
         // Rows not a multiple of the 8 a threadgroup takes; one shape
         // with fewer blocks per row than the 16 lanes.
@@ -232,7 +246,7 @@ TEST_CASE("metal matvec matches the CPU for each weight type",
             CHECK(rep == got);
         }
     }
-    CHECK_FALSE(mb::matvec_supported(TensorType::kQ5_K));
+    CHECK_FALSE(mb::matvec_supported(TensorType::kQ2_K));
     std::vector<float> x(4), out(4);
     const std::vector<std::byte> none(64);
     const locus::backend::Mat bad{TensorType::kF32, none.data(), 4, 4};

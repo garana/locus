@@ -30,8 +30,16 @@ Kind kind_of(TensorType t) {
     switch (t) {
         case TensorType::kF32:
             return {"mv_f32", 4, 16};
+        case TensorType::kF16:
+            return {"mv_f16", 4, 8};
         case TensorType::kQ8_0:
             return {"mv_q8_0", 32, 34};
+        case TensorType::kQ4_0:
+            return {"mv_q4_0", 32, 18};
+        case TensorType::kQ5_0:
+            return {"mv_q5_0", 32, 22};
+        case TensorType::kQ5_K:
+            return {"mv_q5_k", 256, 176};
         case TensorType::kQ4_K:
             return {"mv_q4_k", 256, 144, 64, 4};
         case TensorType::kQ6_K:
