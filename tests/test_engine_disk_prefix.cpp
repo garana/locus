@@ -153,7 +153,7 @@ struct Fixture {
 TEST_CASE("engine reads an evicted prefix back from the disk tier",
           "[engine][disk_prefix]") {
     if (!fs::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     Fixture f;
     REQUIRE(f.p.size() > 2 * 16);
@@ -191,7 +191,7 @@ TEST_CASE("engine reads an evicted prefix back from the disk tier on "
           "Vulkan",
           "[engine][disk_prefix][vulkan]") {
     if (!fs::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device");
@@ -222,7 +222,7 @@ TEST_CASE("engine reads an evicted prefix back from the disk tier on "
 TEST_CASE("engine falls back to prefill on a bad disk-tier file",
           "[engine][disk_prefix]") {
     if (!fs::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     Fixture f;
     TempDir t("locus-edp-bad");
@@ -252,7 +252,7 @@ TEST_CASE("engine falls back to prefill on a bad disk-tier file",
 TEST_CASE("engine keeps decoding while a request loads from disk",
           "[engine][disk_prefix]") {
     if (!fs::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     Fixture f;
     TempDir t("locus-edp-slow");
@@ -315,7 +315,7 @@ TEST_CASE("engine keeps decoding while a request loads from disk",
 TEST_CASE("engine parks when loads fill max_running",
           "[engine][disk_prefix]") {
     if (!fs::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     Fixture f;
     TempDir t("locus-edp-cap");
@@ -353,7 +353,7 @@ TEST_CASE("engine parks when loads fill max_running",
 TEST_CASE("engine refuses a disk tier whose key does not match",
           "[engine][disk_prefix]") {
     if (!fs::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -379,7 +379,7 @@ TEST_CASE("engine refuses a disk tier whose key does not match",
 TEST_CASE("a preempted sequence reads its blocks back from the disk tier",
           "[engine][disk_prefix]") {
     if (!fs::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     Fixture f;
     Engine::Config roomy;

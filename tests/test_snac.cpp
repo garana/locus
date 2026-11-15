@@ -109,7 +109,7 @@ bool snac_e2e_inputs(std::initializer_list<std::string> goldens) {
 // the sampled-speech case below.
 TEST_CASE("snac decoder matches the reference waveform", "[snac][e2e]") {
     if (!snac_e2e_inputs({"orpheus_codes.txt", "orpheus_waveform.f32"})) {
-        SKIP("snac GGUF absent; make it with scripts/convert-snac.py");
+        SKIP("snac GGUF absent; make it with scripts/audio/convert-snac.py");
     }
     require_snac_parity(golden_dir() + "/orpheus_codes.txt",
                         golden_dir() + "/orpheus_waveform.f32");
@@ -119,13 +119,13 @@ TEST_CASE("snac decoder matches the reference waveform", "[snac][e2e]") {
 // settings and a fixed seed (by llama-cpp-python, independent of
 // locus's sampler), decoded by torch SNAC. The golden is audible speech
 // that the model ended itself, so a decoder error that a near-silent
-// signal would hide shows up here. Made by scripts/make-snac-goldens.py
+// signal would hide shows up here. Made by scripts/audio/make-snac-goldens.py
 // speech.
 TEST_CASE("snac decoder matches the reference on sampled speech",
           "[snac][e2e]") {
     if (!snac_e2e_inputs(
             {"snac_speech_codes.txt", "snac_speech_waveform.f32"})) {
-        SKIP("snac GGUF absent; make it with scripts/convert-snac.py");
+        SKIP("snac GGUF absent; make it with scripts/audio/convert-snac.py");
     }
     const double ref_rms = require_snac_parity(
         golden_dir() + "/snac_speech_codes.txt",
@@ -193,7 +193,7 @@ std::vector<std::byte> synth_snac(const std::vector<std::uint32_t>& rates,
     std::uint32_t lcg = 12345;
     // Deterministic, in [-0.25, 0.25): small enough that the tail tanh
     // stays linear, so the value fixtures are not saturated at +-1.
-    // scripts/make-snac-goldens.py (lcg_weights) ports this generator
+    // scripts/audio/make-snac-goldens.py (lcg_weights) ports this generator
     // to build the torch reference; keep the two in sync.
     auto rnd = [&] {
         lcg = lcg * 1664525u + 1013904223u;
@@ -339,7 +339,7 @@ TEST_CASE("snac decoder graph on a synthetic model", "[snac]") {
 }
 
 // VALUES, not just structure: the same synthetic model decoded by the
-// real torch snac.SNAC (scripts/make-snac-goldens.py synth) must match
+// real torch snac.SNAC (scripts/audio/make-snac-goldens.py synth) must match
 // locus sample for sample. Runs on every host (the fixtures are
 // committed and tiny). A wrong dilation, weight layout or snake formula
 // keeps every length the graph test checks, but changes these values.
@@ -545,7 +545,7 @@ TEST_CASE("snac decode_range is bit-identical to the full decode",
 TEST_CASE("snac decode_range matches the full decode on real speech",
           "[snac][e2e]") {
     if (!snac_e2e_inputs({"snac_speech_codes.txt"})) {
-        SKIP("snac GGUF absent; make it with scripts/convert-snac.py");
+        SKIP("snac GGUF absent; make it with scripts/audio/convert-snac.py");
     }
     auto g = locus::gguf::GgufFile::open(snac_gguf_path());
     const auto dec = locus::audio::SnacDecoder::load(g);

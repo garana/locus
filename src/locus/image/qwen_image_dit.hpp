@@ -37,7 +37,7 @@ namespace locus::image {
  * - A final modulated LayerNorm (scale first, then shift) and proj_out
  *   on the image tokens give 64 values per token.
  *
- * Weights come from a "qwen_image" GGUF (scripts/convert-qwen-image.py).
+ * Weights come from a "qwen_image" GGUF (scripts/image/convert-qwen-image.py).
  * Matrices stay in the GGUF mapping, so the GgufFile must outlive the
  * model.
  */

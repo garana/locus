@@ -97,7 +97,7 @@ void check_lora(const std::string& name) {
 
 }  // namespace
 
-// i#372: scripts/convert-lora.py on kohya keys (fused qkv split, alpha
+// i#372: scripts/image/convert-lora.py on kohya keys (fused qkv split, alpha
 // folded in) and diffusers keys (BF16, no alpha), against the weight
 // change diffusers and peft make; and on kohya modules of mixed ranks
 // with a single-block linear1 (q, k, v and proj_mlp from one fused B),

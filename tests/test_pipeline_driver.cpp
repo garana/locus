@@ -167,7 +167,7 @@ int connect_retry(const std::string& host, int port, int timeout_ms) {
 TEST_CASE("locus-driver drives a multi-process stage chain",
           "[pipeline][e2e][mp]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     if (!std::filesystem::exists(LOCUS_STAGE_BIN)) {
         SKIP("locus-stage binary not built");

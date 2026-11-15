@@ -215,10 +215,14 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
     ./build/tests/locus_tests
 
 Tests that need model files skip when the file is absent;
-`scripts/fetch-test-model.sh` gets the small ones (`bge`, `e5`,
+`scripts/tests/fetch-test-model.sh` gets the small ones (`bge`, `e5`,
 `bge-m3` or `nomic` as its argument gets that embedding model, `qwen2`
 the qwen2 golden's model, and `qwen2.5-vl-mmproj` the Qwen2.5-VL vision
 tower). Tests tagged as heavy also need `LOCUS_HEAVY_TESTS=1`.
+The model converters and golden generators live in `scripts/text`,
+`scripts/image`, `scripts/audio` and `scripts/video`, by the model they
+serve; `scripts/ops` holds the host setup and review tools. Run them
+from the repo root.
 
 ## Run
 
@@ -237,18 +241,19 @@ variables;
 and tokenizers of the build. Speech needs `--audio-decoder
 <snac.gguf>`, image generation `--image-decoder <vq16.gguf>` (Janus)
 or `--image-model <dir>` (PixArt: a directory with the GGUFs from
-`scripts/convert-t5-encoder.py`, `convert-pixart.py` and
-`convert-sd-vae.py`; FLUX.1: the GGUFs from `scripts/convert-flux.py`
-and `convert-t5-encoder.py`, plus `--lora-dir <dir>` for LoRAs from
-`scripts/convert-lora.py`). Video needs `--video-model <dir>` (the
-GGUFs from `scripts/convert-ltxv.py` and `convert-t5-encoder.py`) and
-an ffmpeg on PATH or at `--ffmpeg <path>`. A dedicated embedding model
+`scripts/text/convert-t5-encoder.py`, `scripts/image/convert-pixart.py`
+and `scripts/image/convert-sd-vae.py`; FLUX.1: the GGUFs from
+`scripts/image/convert-flux.py` and `scripts/text/convert-t5-encoder.py`,
+plus `--lora-dir <dir>` for LoRAs from `scripts/image/convert-lora.py`).
+Video needs `--video-model <dir>` (the GGUFs from
+`scripts/video/convert-ltxv.py` and `scripts/text/convert-t5-encoder.py`)
+and an ffmpeg on PATH or at `--ffmpeg <path>`. A dedicated embedding model
 for `/v1/embeddings` needs `--embedding-model <bert.gguf>`; task
 prefixes such as "query: " are the client's job. `/v1/rerank` needs
 `--rerank-model <reranker.gguf>`, made from a transformers XLM-R
-reranker by `scripts/convert-xlmr-reranker.py`. `/v1/classify` and
+reranker by `scripts/text/convert-xlmr-reranker.py`. `/v1/classify` and
 image inputs to `/v1/embeddings` need `--image-classifier <cnn.gguf>`,
-a ResNet-50 or Inception-v3 from `scripts/convert-cnn.py`.
+a ResNet-50 or Inception-v3 from `scripts/image/convert-cnn.py`.
 
 ## Backends
 

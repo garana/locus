@@ -115,7 +115,7 @@ TEST_CASE("unicode flags follow llama.cpp's tables", "[tok][wpm]") {
 
 TEST_CASE("wpm tokenizer matches llama.cpp's WPM tokenizer",
           "[tok][wpm]") {
-    // bert-vocab.gguf and the ids: scripts/make-bert-tok-golden.py on
+    // bert-vocab.gguf and the ids: scripts/text/make-bert-tok-golden.py on
     // bge-small-en-v1.5's GGUF.
     auto g = locus::gguf::GgufFile::open(golden("bert-vocab.gguf"));
     const auto tok = locus::tok::tokenizer_from_gguf(g);

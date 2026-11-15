@@ -130,7 +130,7 @@ TEST_CASE("ltxv requests are checked", "[ltxv][image]") {
 }
 
 // The whole pipeline on the real models against the reference
-// LTXVideoPipeline (scripts/make-ltxv-pipeline-goldens.py): the T5 ids
+// LTXVideoPipeline (scripts/video/make-ltxv-pipeline-goldens.py): the T5 ids
 // of the prompt, then the 8 steps from the reference's start noise to
 // its latent (the exit check: latent-close parity), stochastic with the
 // reference's step noise and deterministic. With LOCUS_HEAVY_TESTS=1
@@ -215,7 +215,7 @@ TEST_CASE("ltxv pipeline matches the reference clip",
 }
 
 // The first frame as load_image_to_tensor_with_resize_and_crop makes it
-// without the CRF step (scripts/make-ltxv-pipeline-goldens.py --i2v):
+// without the CRF step (scripts/video/make-ltxv-pipeline-goldens.py --i2v):
 // a 300 x 200 image cropped to 256 x 160's aspect, resized and blurred.
 TEST_CASE("ltxv first frame is prepared as the reference does",
           "[ltxv][image]") {

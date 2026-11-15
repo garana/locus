@@ -31,7 +31,7 @@ namespace locus::image {
  *   tanh-GELU FFN scaled by a gate.
  * - A final modulated LayerNorm and a linear give C values per token.
  *
- * Weights come from an "ltxv" GGUF (scripts/convert-ltxv.py). Matrices
+ * Weights come from an "ltxv" GGUF (scripts/video/convert-ltxv.py). Matrices
  * stay in the GGUF mapping, so the GgufFile must outlive the model.
  */
 class LtxvDit {

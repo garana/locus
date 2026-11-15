@@ -27,7 +27,7 @@ using Seq = locus::kv::PagedKvCache::Seq;
 TEST_CASE("forward_batch_layers equals N forward_layers (two-stage)",
           "[batch][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -101,7 +101,7 @@ TEST_CASE("forward_batch_layers equals N forward_layers (two-stage)",
 TEST_CASE("forward_batch_layers full stack equals N forward_layers",
           "[batch][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -153,7 +153,7 @@ TEST_CASE("forward_batch_layers full stack equals N forward_layers",
 TEST_CASE("forward_batch_layers ragged batch (mixed positions)",
           "[batch][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);

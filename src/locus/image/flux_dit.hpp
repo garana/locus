@@ -37,7 +37,7 @@ namespace locus::image {
  * - A final modulated LayerNorm (scale first, then shift) and a Linear
  *   on the image tokens give 64 values per token.
  *
- * Weights come from a "flux" GGUF (scripts/convert-flux.py). Matrices
+ * Weights come from a "flux" GGUF (scripts/image/convert-flux.py). Matrices
  * stay in the GGUF mapping, so the GgufFile must outlive the model.
  */
 class FluxDit {
@@ -57,7 +57,7 @@ class FluxDit {
 
     /**
      * Whether a FLUX GGUF's checkpoint edits (i#648): its flux.kontext,
-     * which scripts/convert-flux.py writes from the pipeline's class
+     * which scripts/image/convert-flux.py writes from the pipeline's class
      * (FLUX.1 Kontext and dev share their tensors). A GGUF without the
      * key, converted before it existed, may be either: true, and load()
      * says so on stderr.

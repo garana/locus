@@ -21,7 +21,7 @@ using locus::image::QwenVae;
 
 const std::string kGolden = std::string(LOCUS_SOURCE_DIR) + "/tests/golden/";
 
-// Keep in sync with scripts/make-qwen-vae-goldens.py.
+// Keep in sync with scripts/image/make-qwen-vae-goldens.py.
 constexpr std::uint32_t kZ = 4, kSize = 32, kLat = 8;
 
 std::vector<float> read_f32(const std::string& path) {
@@ -82,7 +82,7 @@ std::vector<Leg> legs() {
 }  // namespace
 
 // i#533 VALUES, on every box: a tiny AutoencoderKLQwenImage from
-// diffusers (scripts/make-qwen-vae-goldens.py, its GGUF in
+// diffusers (scripts/image/make-qwen-vae-goldens.py, its GGUF in
 // tests/golden) on one frame: the encoder's mean and the decoder's
 // output against diffusers' own encode and decode, with the first-frame
 // path of the 3D resamplers.
@@ -135,10 +135,10 @@ TEST_CASE("qwen vae rejects bad sizes", "[qwen-vae][image]") {
 }
 
 // i#531 VALUES, with the real VAE: Qwen/Qwen-Image-Edit at ac7f931's
-// vae/, converted by scripts/convert-qwen-image.py --vae-out to
+// vae/, converted by scripts/image/convert-qwen-image.py --vae-out to
 // tests/models/qwen-image-vae.gguf, against diffusers' own encode and
 // decode of the same weights in float32
-// (scripts/make-qwen-image-vae-golden.py): the converter's layout and
+// (scripts/image/make-qwen-image-vae-golden.py): the converter's layout and
 // values, and QwenVae at the real widths.
 TEST_CASE("qwen vae matches diffusers on the real Qwen-Image VAE",
           "[qwen-vae][image][e2e]") {
@@ -146,7 +146,7 @@ TEST_CASE("qwen vae matches diffusers on the real Qwen-Image VAE",
         std::string(LOCUS_SOURCE_DIR) + "/tests/models/qwen-image-vae.gguf";
     if (!std::filesystem::exists(path)) {
         SKIP("qwen-image-vae.gguf absent; make it with "
-             "scripts/convert-qwen-image.py --vae-out");
+             "scripts/image/convert-qwen-image.py --vae-out");
     }
     constexpr std::uint32_t z = 16, lat = 4;
     const auto g = locus::gguf::GgufFile::open(path);

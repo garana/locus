@@ -193,13 +193,14 @@ TEST_CASE("bpe pretokenizers: deepseek-llm splits digits and newlines",
 // newlines, letter and punctuation runs with their optional leading
 // space, trailing whitespace, CJK / Hangul / kana runs, single digits
 // (ASCII and other numerics), fullwidth forms, emoji, tabs. The ids come
-// from scripts/make-janus-goldens.py tokenizer.
+// from scripts/image/make-janus-goldens.py tokenizer.
 TEST_CASE("deepseek-llm pre-tokenizer matches the HF tokenizer",
           "[tok][e2e]") {
     const std::string model = std::string(LOCUS_SOURCE_DIR) +
                               "/tests/models/janus-pro-1b-f16.gguf";
     if (!std::filesystem::exists(model)) {
-        SKIP("janus-pro-1b-f16.gguf absent; see scripts/convert-janus.py");
+        SKIP("janus-pro-1b-f16.gguf absent; see "
+             "scripts/image/convert-janus.py");
     }
     auto g = locus::gguf::GgufFile::open(model);
     const auto tok = locus::tok::tokenizer_from_gguf(g);

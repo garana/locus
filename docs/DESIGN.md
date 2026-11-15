@@ -374,7 +374,7 @@ layer-expert slots; on GLM-5.2 (256 experts), 16 forwards touch 27.4%.
 So prefetch pays within a token (overlap the reads of the routed
 experts), not across tokens (an expert cache). `LOCUS_MOE_STATS=1`
 prints this telemetry. `LOCUS_MOE_TRACE=<file>` writes every pick as
-`layer expert`; `scripts/moe-trace-sim.py` replays a trace against
+`layer expert`; `scripts/text/moe-trace-sim.py` replays a trace against
 cache policies (LRU, LFU, Belady, step WLRU, static top) for a given
 GPU budget. On Vulkan both variables route MoE layers on the host, so
 the picks reach the CPU.
@@ -804,7 +804,7 @@ guarding the default path.
   original to 0.09, and rank the documents as the original does;
   llama.cpp drifts up to 0.3. The router gives `/v1/rerank` its own
   kind, `rerank`. ggml-org has no GGUF of the model, so
-  `scripts/convert-xlmr-reranker.py` makes one from BAAI's safetensors,
+  `scripts/text/convert-xlmr-reranker.py` makes one from BAAI's safetensors,
   with the vocab of bge-m3's GGUF (the same SentencePiece model).
 - API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
   (a log-softmax over the raw logits) and usage accounting.
