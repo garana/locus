@@ -28,7 +28,7 @@ namespace locus::image {
  *   token, unpatchified to [8][64][64]: 4 noise channels, then 4
  *   learned-variance channels.
  *
- * Weights come from a "pixart" GGUF (scripts/convert-pixart.py,
+ * Weights come from a "pixart" GGUF (scripts/image/convert-pixart.py,
  * checkpoint tensor names). Matrices stay in the GGUF mapping, so the
  * GgufFile must outlive the model.
  */
@@ -111,13 +111,15 @@ class PixArtDit {
                                    std::span<const float> shift,
                                    std::span<const float> scale,
                                    const backend::Ops& op) const;
-    /** forward_cpu() as one resident GPU step (pixart_dit_vulkan.cpp):
+    /** forward_cpu() as one resident step on the GPU sequence Seq
+     *  (VulkanSeq or metal::Seq; pixart_dit_vulkan.cpp):
      *  mods holds each block's [6][width] modulation, then the final
      *  shift and scale. */
-    std::vector<float> forward_vulkan(std::span<const float> patches,
-                                      std::span<const float> text,
-                                      std::uint32_t n_text,
-                                      const std::vector<float>& mods) const;
+    template <class Seq>
+    std::vector<float> forward_gpu(std::span<const float> patches,
+                                   std::span<const float> text,
+                                   std::uint32_t n_text,
+                                   const std::vector<float>& mods) const;
     /** [n][p p out_ch] token rows to [out_ch][S][S]. */
     std::vector<float> unpatchify(std::span<const float> y) const;
 

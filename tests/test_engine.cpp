@@ -54,7 +54,7 @@ std::vector<locus::tok::TokenId> reference_generate(
 TEST_CASE("concurrent streams match single-sequence output",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -89,7 +89,7 @@ TEST_CASE("concurrent streams match single-sequence output",
 TEST_CASE("batched prefill matches per-token prefill (engine)",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -113,7 +113,7 @@ TEST_CASE("batched prefill matches per-token prefill (engine)",
 TEST_CASE("batched decode matches the per-sequence scheduler",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -154,7 +154,7 @@ TEST_CASE("batched decode matches the per-sequence scheduler",
 TEST_CASE("preemption recomputes and still matches",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -186,7 +186,7 @@ TEST_CASE("preemption recomputes and still matches",
 TEST_CASE("prefix cache reuses KV and stays byte-exact",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -226,7 +226,7 @@ TEST_CASE("prefix cache reuses KV and stays byte-exact",
 TEST_CASE("engine reports step tokens and kv blocks by state",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -289,7 +289,7 @@ TEST_CASE("engine reports step tokens and kv blocks by state",
 TEST_CASE("a short prompt is not held back by a long prefill",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -355,7 +355,7 @@ TEST_CASE("a short prompt is not held back by a long prefill",
 TEST_CASE("a stream of short prompts does not starve a long one",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -396,7 +396,7 @@ TEST_CASE("a stream of short prompts does not starve a long one",
 TEST_CASE("speculative decoding matches greedy output",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -449,7 +449,7 @@ TEST_CASE("speculative decoding matches greedy output",
 TEST_CASE("speculative decoding on the vulkan backend matches greedy",
           "[engine][e2e][vulkan]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device / kernels not built");
@@ -484,7 +484,7 @@ TEST_CASE("speculative decoding on the vulkan backend matches greedy",
 TEST_CASE("engine on the vulkan backend matches CPU output",
           "[engine][e2e][vulkan]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device / kernels not built");
@@ -560,7 +560,7 @@ TEST_CASE("vulkan batched decode matches each request alone",
 TEST_CASE("oversized request fails instead of wedging",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -581,7 +581,7 @@ TEST_CASE("oversized request fails instead of wedging",
 TEST_CASE("admit_error rejects prompts the pool can never hold",
           "[engine]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -607,7 +607,7 @@ TEST_CASE("admit_error rejects prompts the pool can never hold",
 TEST_CASE("un-admissible prompt parks the loop instead of wedging it",
           "[engine]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -641,7 +641,7 @@ TEST_CASE("un-admissible prompt parks the loop instead of wedging it",
 TEST_CASE("finished requests reclaim their scratch buffers",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -666,7 +666,7 @@ TEST_CASE("finished requests reclaim their scratch buffers",
 TEST_CASE("finished request records are evicted (cap + release)",
           "[engine]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -711,7 +711,7 @@ TEST_CASE("finished request records are evicted (cap + release)",
 TEST_CASE("prefix cache reports reused/cached token accounting",
           "[engine]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -795,7 +795,7 @@ TEST_CASE("prefix cache adopts a long prompt without self-eviction",
 TEST_CASE("execute-slice: layer-range forward matches full forward",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -904,7 +904,7 @@ TEST_CASE("execute-slice: layer-range forward matches full forward",
 TEST_CASE("decode growth reclaims prefix-cache blocks before failing",
           "[engine][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -963,7 +963,7 @@ TEST_CASE("decode growth reclaims prefix-cache blocks before failing",
 TEST_CASE("engine fail_running fails running requests and frees KV",
           "[engine]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1000,7 +1000,7 @@ TEST_CASE("engine fail_running fails running requests and frees KV",
 TEST_CASE("engine cancel frees a running request and is byte-neutral",
           "[engine]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);

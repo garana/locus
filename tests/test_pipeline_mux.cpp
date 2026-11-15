@@ -109,7 +109,7 @@ struct Client {
 TEST_CASE("serve_stage_mux serves two concurrent sessions in isolation",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -226,7 +226,7 @@ TEST_CASE("serve_stage_mux serves two concurrent sessions in isolation",
 TEST_CASE("serve_stage_mux reuses a connection after SESSION_END, "
           "KV-isolated", "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -353,7 +353,7 @@ TEST_CASE("serve_stage_mux reuses a connection after SESSION_END, "
 TEST_CASE("serve_stage_mux reuses a pooled downstream (issue 68)",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -470,7 +470,7 @@ TEST_CASE("serve_stage_mux reuses a pooled downstream (issue 68)",
 TEST_CASE("serve_stage_mux replaces a dead pooled downstream (issue 68)",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -570,7 +570,7 @@ TEST_CASE("serve_stage_mux replaces a dead pooled downstream (issue 68)",
 TEST_CASE("serve_stage_mux closes pooled downstreams at teardown (i#68)",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -654,7 +654,7 @@ TEST_CASE("serve_stage_mux closes pooled downstreams at teardown (i#68)",
 TEST_CASE("serve_stage_mux spreads sessions across two executors",
           "[pipeline][mux][batch][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -762,7 +762,7 @@ TEST_CASE("serve_stage_mux spreads sessions across two executors",
 TEST_CASE("serve_stage_mux reassembles a frame split across reads",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -823,7 +823,7 @@ TEST_CASE("serve_stage_mux reassembles a frame split across reads",
 TEST_CASE("serve_stage_mux: EOF at a boundary is clean, mid-frame is not",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -893,7 +893,7 @@ TEST_CASE("serve_stage_mux: EOF at a boundary is clean, mid-frame is not",
 TEST_CASE("serve_stage_mux drops an idle peer that resets the connection",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -950,7 +950,7 @@ TEST_CASE("serve_stage_mux drops an idle peer that resets the connection",
 TEST_CASE("serve_stage_mux parks a backlog for a slow downstream",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1033,7 +1033,7 @@ TEST_CASE("serve_stage_mux parks a backlog for a slow downstream",
 TEST_CASE("serve_stage_mux answers a client that half-closes after a frame",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1142,7 +1142,7 @@ TEST_CASE("dial_start to a refused port reports failure, never success",
 TEST_CASE("serve_stage_mux dials across the pool past a refused entry",
           "[pipeline][mux][connect][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1214,7 +1214,7 @@ TEST_CASE("serve_stage_mux dials across the pool past a refused entry",
 TEST_CASE("serve_stage_mux drops a session with a dead downstream pool",
           "[pipeline][mux][connect][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1257,7 +1257,7 @@ TEST_CASE("serve_stage_mux drops a session with a dead downstream pool",
 TEST_CASE("serve_stage_mux drops a hostname downstream with no resolver",
           "[pipeline][mux][connect][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1307,7 +1307,7 @@ TEST_CASE("serve_stage_mux drops a hostname downstream with no resolver",
 TEST_CASE("serve_stage_mux drops a session when a reload empties the pool",
           "[pipeline][mux][connect][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1371,7 +1371,7 @@ TEST_CASE("serve_stage_mux drops a session when a reload empties the pool",
 TEST_CASE("serve_stage_mux: SESSION_END with an emptied pool drops, no "
           "divide-by-zero", "[pipeline][mux][connect][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1510,7 +1510,7 @@ TEST_CASE("tcp_rtt and peer_address on a loopback connection",
 // upstream and downstream, with the addresses the other ends see.
 TEST_CASE("serve_stage_mux reports its live peers", "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     using locus::pipeline::PeerInfo;
     auto g = locus::gguf::GgufFile::open(model_path());
@@ -1641,7 +1641,7 @@ std::string sample_value(const std::string& text, const std::string& series) {
 TEST_CASE("serve_stage_mux serves /metrics while a session runs",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1730,7 +1730,7 @@ TEST_CASE("serve_stage_mux serves /metrics while a session runs",
 TEST_CASE("serve_stage_mux applies --allow to the metrics port",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1814,7 +1814,7 @@ TEST_CASE("serve_stage_mux applies --allow to the metrics port",
 TEST_CASE("serve_stage_mux runs the key handshake on input and dial",
           "[pipeline][mux][e2e][handshake]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1940,7 +1940,7 @@ TEST_CASE("serve_stage_mux runs the key handshake on input and dial",
 TEST_CASE("serve_stage_mux caps input frames and times out a stalled one",
           "[pipeline][mux][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);

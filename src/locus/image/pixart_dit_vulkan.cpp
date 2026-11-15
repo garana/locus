@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 
+#include "locus/backend/metal/seq.hpp"
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/pixart_dit.hpp"
 
@@ -8,11 +10,9 @@ namespace locus::image {
 
 namespace {
 
-using Seq = backend::VulkanSeq;
-using Rows = Seq::Rows;
 
 /** The scratch slots of one forward. */
-enum : Seq::Slot {
+enum : std::uint32_t {
     kH,    ///< hidden rows [n][w]
     kNrm,  ///< position table, then modulated LayerNorm output [n][w]
     kQ,    ///< [n][w]
@@ -30,27 +30,31 @@ enum : Seq::Slot {
     kKh,   ///< per-head K, V^T and score blocks (attention)
     kVt,
 };
-constexpr Seq::Slot kScores = kIn;  // reused once the patches are embedded
+constexpr std::uint32_t kScores = kIn;  // reused once the patches are embedded
 
 }  // namespace
 
-std::vector<float> PixArtDit::forward_vulkan(
+template <class Seq>
+std::vector<float> PixArtDit::forward_gpu(
     std::span<const float> patches, std::span<const float> text,
     std::uint32_t n_text, const std::vector<float>& mods) const {
+    using Rows = typename Seq::Rows;
     const std::uint32_t w = width_, nh = heads_, hd = head_dim_, f = ffn_;
     const std::uint32_t n = grid_ * grid_;
     const std::uint32_t pv = in_ch_ * patch_ * patch_;
     const std::uint32_t py = patch_ * patch_ * out_ch_;
     Seq q;
     const std::size_t nw = std::size_t{n} * w;
-    for (Seq::Slot s : {kH, kNrm, kQ, kK, kV}) q.reserve(s, nw);
+    for (std::uint32_t s : {kH, kNrm, kQ, kK, kV}) q.reserve(s, nw);
     // kAtt first holds the caption rows, kFf the T5 rows: either may
     // outnumber the image rows (a small latent, a long prompt).
     q.reserve(kAtt, std::size_t{std::max(n, n_text)} * w);
     q.reserve(kO, std::size_t{n} * std::max(w, py));
     q.reserve(kFf, std::max(std::size_t{n} * f, text.size()));
     q.reserve(kMod, mods.size());
-    for (Seq::Slot s : {kU, kKc, kVc}) q.reserve(s, std::size_t{n_text} * w);
+    for (std::uint32_t s : {kU, kKc, kVc}) {
+        q.reserve(s, std::size_t{n_text} * w);
+    }
     q.reserve(kIn, patches.size());
     q.write(kIn, 0, patches);
     q.write(kNrm, 0, pos_);
@@ -109,5 +113,12 @@ std::vector<float> PixArtDit::forward_vulkan(
     q.read(kO, 0, y);
     return y;
 }
+
+template std::vector<float> PixArtDit::forward_gpu<backend::VulkanSeq>(
+    std::span<const float> patches, std::span<const float> text,
+    std::uint32_t n_text, const std::vector<float>& mods) const;
+template std::vector<float> PixArtDit::forward_gpu<backend::metal::Seq>(
+    std::span<const float> patches, std::span<const float> text,
+    std::uint32_t n_text, const std::vector<float>& mods) const;
 
 }  // namespace locus::image

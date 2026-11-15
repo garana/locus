@@ -113,7 +113,7 @@ class OpenAiServer {
          * --rerank-model) that enables POST /v1/rerank; /v1/models lists
          * it by its file name. Empty = the endpoint answers 503. */
         std::string rerank_model_path;
-        /** Path to a CNN image classifier GGUF (scripts/convert-cnn.py,
+        /** Path to a CNN image classifier GGUF (scripts/image/convert-cnn.py,
          * --image-classifier) that enables POST /v1/classify and image
          * inputs to /v1/embeddings under its name. Empty = 503. */
         std::string image_classifier_path;
@@ -152,7 +152,7 @@ class OpenAiServer {
          * every request when no Janus model is loaded). Empty = off. */
         std::string image_model_dir;
         /** Directory of FLUX.1 LoRAs (--lora-dir): flux_lora GGUFs from
-         * scripts/convert-lora.py, each named by its file name without
+         * scripts/image/convert-lora.py, each named by its file name without
          * ".gguf", for the "lora" field of the FLUX image requests.
          * Needs a FLUX.1 image_model_dir; every LoRA is checked against
          * its DiT at startup. Empty = no LoRAs. */
@@ -184,6 +184,10 @@ class OpenAiServer {
         /** Open connections one client address may hold (i#625 F21;
          *  http::ServerConfig::max_conns_per_ip). 0 = no cap. */
         std::size_t max_conns_per_ip = 0;
+        /** Serve on the event loop (http::LoopServer, i#931): one I/O
+         *  thread for every connection, handlers on a job pool; false:
+         *  http::Server's thread a connection. */
+        bool event_loop = false;
         auth::AuthConfig auth_cache;
         /** Prompt caching (KV prefix reuse) -- on by default. A
          * request sharing a block-aligned prompt prefix with a recent
@@ -292,7 +296,7 @@ class OpenAiServer {
     EngineGroup loop_;
     http::Handler route_handler_;    /**< dispatch (built in ctor). */
     http::HeadHandler auth_head_;    /**< auth head stage (built in ctor). */
-    std::unique_ptr<http::Server> http_;
+    std::unique_ptr<http::Service> http_;
     /** Per-route request metrics (i#285), shared with http_. */
     std::shared_ptr<http::HttpMetrics> http_metrics_;
     std::uint32_t n_vocab_ = 0;

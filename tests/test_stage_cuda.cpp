@@ -142,7 +142,7 @@ TEST_CASE("CUDA stage executor is byte-exact at batch>1 and agrees w/ CPU",
         SKIP("no CUDA device or non-CUDA build");
     }
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     REQUIRE(locus::backend::find_backend("cuda") != nullptr);
     locus::backend::cuda_pool_reset();

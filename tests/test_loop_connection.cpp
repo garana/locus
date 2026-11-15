@@ -377,6 +377,7 @@ TEST_CASE("loop connection serves a client from a Poller loop",
             if (it == conns.end()) continue;
             switch (it->second->on_event(ev)) {
                 case Next::kRead:
+                case Next::kIdle:  // async replies only
                     poller.modify(ev.fd, locus::sys::Poller::Dir::kRead);
                     break;
                 case Next::kWrite:
@@ -581,9 +582,14 @@ TEST_CASE("loop connection cancels a pending reply when its client goes",
         p.send(get("/slow"));
         REQUIRE(c.on_event(readable(p.fd[0])) == Next::kRead);
         reply = k.replies.at(0);
-        CHECK_FALSE(reply->cancelled());
+        CHECK_FALSE(reply->client_gone());
         p.close_client();
-        CHECK(c.on_event(readable(p.fd[0])) == Next::kClose);
+        // EOF while pending: the client has left (a long producer
+        // stops), and the answer could still be written, so the
+        // connection waits for it, watching nothing.
+        CHECK(c.on_event(readable(p.fd[0])) == Next::kIdle);
+        CHECK(reply->client_gone());
+        CHECK_FALSE(reply->cancelled());
     }  // the loop drops the connection
     CHECK(reply->cancelled());
     CHECK_FALSE(reply->begin_stream(Response{}));

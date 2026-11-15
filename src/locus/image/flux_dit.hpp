@@ -37,7 +37,7 @@ namespace locus::image {
  * - A final modulated LayerNorm (scale first, then shift) and a Linear
  *   on the image tokens give 64 values per token.
  *
- * Weights come from a "flux" GGUF (scripts/convert-flux.py). Matrices
+ * Weights come from a "flux" GGUF (scripts/image/convert-flux.py). Matrices
  * stay in the GGUF mapping, so the GgufFile must outlive the model.
  */
 class FluxDit {
@@ -57,7 +57,7 @@ class FluxDit {
 
     /**
      * Whether a FLUX GGUF's checkpoint edits (i#648): its flux.kontext,
-     * which scripts/convert-flux.py writes from the pipeline's class
+     * which scripts/image/convert-flux.py writes from the pipeline's class
      * (FLUX.1 Kontext and dev share their tensors). A GGUF without the
      * key, converted before it existed, may be either: true, and load()
      * says so on stderr.
@@ -149,17 +149,19 @@ class FluxDit {
               std::vector<float>& sin_out) const;
 
   private:
-    /** forward() with every block on the GPU (flux_dit_vulkan.cpp):
+    /** forward() with every block on the GPU sequence Seq
+     *  (backend::VulkanSeq or backend::metal::Seq; flux_dit_vulkan.cpp):
      *  st is silu of the conditioning vector, cosv / sinv the RoPE
      *  tables of the joined sequence. */
-    std::vector<float> forward_vulkan(std::span<const float> x,
-                                      std::uint32_t n_img,
-                                      std::span<const float> text,
-                                      std::uint32_t n_txt,
-                                      const std::vector<float>& st,
-                                      const std::vector<float>& cosv,
-                                      const std::vector<float>& sinv,
-                                      Trace* trace) const;
+    template <class Seq>
+    std::vector<float> forward_gpu(std::span<const float> x,
+                                   std::uint32_t n_img,
+                                   std::span<const float> text,
+                                   std::uint32_t n_txt,
+                                   const std::vector<float>& st,
+                                   const std::vector<float>& cosv,
+                                   const std::vector<float>& sinv,
+                                   Trace* trace) const;
 
   public:
     /** One linear layer, with the LoRA parts set_lora attached. */

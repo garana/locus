@@ -23,7 +23,7 @@ using locus::image::qwen_smart_resize;
 
 const std::string kDir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
 
-// Keep in sync with scripts/make-qwen-edit-image-golden.py.
+// Keep in sync with scripts/image/make-qwen-edit-image-golden.py.
 const std::vector<std::pair<std::uint32_t, std::uint32_t>> kSizes = {
     {384, 288},   {384, 384},  {288, 384}, {1920, 1080}, {1080, 1920},
     {640, 480},   {1, 1},      {37, 1000}, {5000, 3333}, {1023, 1025}};
@@ -127,7 +127,7 @@ TEST_CASE("qwen edit reference matches the pipeline's preprocessing",
 
 // i#614: the reference image's latents, as the pipeline's
 // _encode_vae_image (the posterior's mode, normalized) and
-// _pack_latents (scripts/make-qwen-edit-latents-golden.py): the
+// _pack_latents (scripts/image/make-qwen-edit-latents-golden.py): the
 // synthetic VAE of tests/golden/qwen_vae_synth.gguf on a [3][32][24]
 // LCG image, so 8 x 6 latents and 4 x 3 tokens of 16 values.
 TEST_CASE("qwen edit reference latents match the pipeline",

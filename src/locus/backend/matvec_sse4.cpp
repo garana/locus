@@ -54,6 +54,129 @@ float dot_f32_sse4(const float* w, const float* x,
     return s;
 }
 
+/** @returns bf16 h as f32 (exact: a bf16 is the top half of an f32). */
+float bf16_one(std::uint16_t h) {
+    const std::uint32_t u = static_cast<std::uint32_t>(h) << 16;
+    float f;
+    std::memcpy(&f, &u, sizeof f);
+    return f;
+}
+
+/**
+ * BF16 row . f32 x (i#982). Each 8 weights widen exactly (a 16-bit
+ * left shift, as an interleave with zeros) into two 4-lane chains,
+ * summed at the end, as the NEON kernel does: not the scalar dot's
+ * single chain (agrees to float rounding). dot_bf16_tile4 gives the
+ * same bits for each of its tokens.
+ */
+float dot_bf16_sse4(const std::uint16_t* w, const float* x,
+                    std::size_t n) {
+    const __m128i zero = _mm_setzero_si128();
+    __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m128i v =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(w + i));
+        const __m128 lo = _mm_castsi128_ps(_mm_unpacklo_epi16(zero, v));
+        const __m128 hi = _mm_castsi128_ps(_mm_unpackhi_epi16(zero, v));
+        a0 = _mm_add_ps(_mm_mul_ps(lo, _mm_loadu_ps(x + i)), a0);
+        a1 = _mm_add_ps(_mm_mul_ps(hi, _mm_loadu_ps(x + i + 4)), a1);
+    }
+    float s = hsum(_mm_add_ps(a0, a1));
+    for (; i < n; ++i) {
+        s += bf16_one(w[i]) * x[i];
+    }
+    return s;
+}
+
+/**
+ * dot_bf16_sse4 of one BF16 row against 4 tokens x0..x3 (n floats
+ * each) at once, so the row is read once for the 4 (i#982). Each token
+ * keeps its own two chains in dot_bf16_sse4's order: out[k] has its
+ * bits.
+ */
+void dot_bf16_tile4(const std::uint16_t* w, const float* const x[4],
+                    std::size_t n, float out[4]) {
+    const __m128i zero = _mm_setzero_si128();
+    __m128 a0[4], a1[4];
+    for (int k = 0; k < 4; ++k) {
+        a0[k] = _mm_setzero_ps();
+        a1[k] = _mm_setzero_ps();
+    }
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m128i v =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(w + i));
+        const __m128 lo = _mm_castsi128_ps(_mm_unpacklo_epi16(zero, v));
+        const __m128 hi = _mm_castsi128_ps(_mm_unpackhi_epi16(zero, v));
+        for (int k = 0; k < 4; ++k) {
+            a0[k] = _mm_add_ps(_mm_mul_ps(lo, _mm_loadu_ps(x[k] + i)), a0[k]);
+            a1[k] =
+                _mm_add_ps(_mm_mul_ps(hi, _mm_loadu_ps(x[k] + i + 4)), a1[k]);
+        }
+    }
+    for (int k = 0; k < 4; ++k) {
+        float s = hsum(_mm_add_ps(a0[k], a1[k]));
+        for (std::size_t j = i; j < n; ++j) {
+            s += bf16_one(w[j]) * x[k][j];
+        }
+        out[k] = s;
+    }
+}
+
+/** dot_f32_sse4 of one F32 row against 4 tokens at once (i#982), each
+ *  token in dot_f32_sse4's order: out[k] has its bits. */
+void dot_f32_tile4(const float* w, const float* const x[4], std::size_t n,
+                   float out[4]) {
+    __m128 acc[4];
+    for (int k = 0; k < 4; ++k) {
+        acc[k] = _mm_setzero_ps();
+    }
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const __m128 wv = _mm_loadu_ps(w + i);
+        for (int k = 0; k < 4; ++k) {
+            acc[k] = _mm_add_ps(_mm_mul_ps(wv, _mm_loadu_ps(x[k] + i)), acc[k]);
+        }
+    }
+    for (int k = 0; k < 4; ++k) {
+        float s = hsum(acc[k]);
+        for (std::size_t j = i; j < n; ++j) {
+            s += w[j] * x[k][j];
+        }
+        out[k] = s;
+    }
+}
+
+/**
+ * The F32 / BF16 batch (i#982): 4 tokens at a time over every row, so
+ * a row is read once per 4 tokens instead of once per token; the last
+ * tokens go one at a time. out is row-major (out[r * n + t]), and every
+ * value has the per-token kernel's bits.
+ */
+template <class Row, class Tile, class One>
+void batch_rows_tile4(const Mat& w, const float* xb, float* out,
+                      std::uint32_t n, Row row, Tile tile, One one) {
+    const std::size_t cols = w.cols;
+    std::uint32_t t = 0;
+    for (; t + 4 <= n; t += 4) {
+        const float* const x[4] = {xb + t * cols, xb + (t + 1) * cols,
+                                   xb + (t + 2) * cols, xb + (t + 3) * cols};
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            float o[4];
+            tile(row(r), x, cols, o);
+            for (int k = 0; k < 4; ++k) {
+                out[std::size_t{r} * n + t + k] = o[k];
+            }
+        }
+    }
+    for (; t < n; ++t) {
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            out[std::size_t{r} * n + t] = one(row(r), xb + t * cols, cols);
+        }
+    }
+}
+
 /** One Q8_0 block: f16 scale + 32 int8 quants (34 bytes). */
 float dot_q8_0_block_sse4(const std::byte* blk, const float* x) {
     const float d = f16_to_f32(load_u16(blk));
@@ -383,6 +506,14 @@ void matvec_sse4(const Mat& w, std::span<const float> x,
             out[r] = dot_f32_sse4(
                 rows + static_cast<std::size_t>(r) * w.cols,
                 x.data(), w.cols);
+        }
+        return;
+    }
+    if (w.type == gguf::TensorType::kBF16) {
+        const auto* rows = reinterpret_cast<const std::uint16_t*>(w.data);
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            out[r] = dot_bf16_sse4(rows + static_cast<std::size_t>(r) * w.cols,
+                                   x.data(), w.cols);
         }
         return;
     }
@@ -2386,10 +2517,26 @@ void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
         batch_q6_k_sse(w, x_batch.data(), out_batch.data(), n);
         return;
     }
+    if (w.type == gguf::TensorType::kF32) {
+        const auto* rows = reinterpret_cast<const float*>(w.data);
+        batch_rows_tile4(
+            w, x_batch.data(), out_batch.data(), n,
+            [&](std::uint32_t r) { return rows + std::size_t{r} * w.cols; },
+            dot_f32_tile4, dot_f32_sse4);
+        return;
+    }
+    if (w.type == gguf::TensorType::kBF16) {
+        const auto* rows = reinterpret_cast<const std::uint16_t*>(w.data);
+        batch_rows_tile4(
+            w, x_batch.data(), out_batch.data(), n,
+            [&](std::uint32_t r) { return rows + std::size_t{r} * w.cols; },
+            dot_bf16_tile4, dot_bf16_sse4);
+        return;
+    }
     // Other types: n per-token matvec_sse4() calls scattered into the
     // row-major layout. No weight-traffic amortization (not the hot
     // path), but bit-exact to the per-token sse4 kernel -- which for
-    // F32/Q8_0 is SIMD, so delegating to matvec_batch_scalar would
+    // Q8_0 is SIMD, so delegating to matvec_batch_scalar would
     // diverge and break batched==per-token token-exactness.
     std::vector<float> col(w.rows);
     const std::size_t xc = w.cols;

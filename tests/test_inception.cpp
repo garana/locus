@@ -23,7 +23,7 @@ using locus::image::Inception;
 const std::string kDir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
 const std::string kModel = kDir + "models/inception-v3-tv-f32.gguf";
 
-// Keep in sync with scripts/make-cnn-goldens.py.
+// Keep in sync with scripts/image/make-cnn-goldens.py.
 constexpr std::uint32_t kRows[] = {0, 149, 298};
 constexpr std::uint32_t kSize = 299, kClasses = 1000, kFeat = 2048;
 
@@ -57,13 +57,14 @@ void check_close(std::span<const float> got, std::span<const float> ref,
 }  // namespace
 
 // i#576: Inception-v3 (timm's inception_v3.tv_in1k, torchvision's
-// weights, batch norms folded by scripts/convert-cnn.py) on
-// janus_apple.png against timm in float32 (scripts/make-cnn-goldens.py):
+// weights, batch norms folded by scripts/image/convert-cnn.py) on
+// janus_apple.png against timm in float32 (scripts/image/make-cnn-goldens.py):
 // the eval transform (bicubic, 299) on three rows of each channel, the
 // 1000 logits, the top 5 and the 2048-wide pooled embedding.
 TEST_CASE("inception-v3 matches timm on an image", "[inception][image]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("inception-v3-tv-f32.gguf absent; see scripts/convert-cnn.py");
+        SKIP("inception-v3-tv-f32.gguf absent; see "
+             "scripts/image/convert-cnn.py");
     }
     const auto ref_b = read_bytes(kDir + "golden/inception_v3_apple.f32");
     std::vector<float> ref(ref_b.size() / 4);
@@ -118,7 +119,8 @@ TEST_CASE("inception-v3 matches timm on an image", "[inception][image]") {
 TEST_CASE("inception-v3 on vulkan matches the cpu",
           "[inception][image][vulkan]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("inception-v3-tv-f32.gguf absent; see scripts/convert-cnn.py");
+        SKIP("inception-v3-tv-f32.gguf absent; see "
+             "scripts/image/convert-cnn.py");
     }
     if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device");
@@ -145,7 +147,8 @@ TEST_CASE("inception-v3 on vulkan matches the cpu",
 
 TEST_CASE("inception rejects a wrong input size", "[inception][image]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("inception-v3-tv-f32.gguf absent; see scripts/convert-cnn.py");
+        SKIP("inception-v3-tv-f32.gguf absent; see "
+             "scripts/image/convert-cnn.py");
     }
     auto g = locus::gguf::GgufFile::open(kModel);
     const auto net = Inception::load(g);

@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "locus/backend/metal/matvec.hpp"
+#include "locus/backend/metal/seq.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
@@ -121,7 +123,7 @@ FluxDit FluxDit::load(const gguf::GgufFile& g) {
     if (!g.get_bool("flux.kontext")) {
         std::fprintf(stderr,
                      "flux: no flux.kontext (converted before it existed); "
-                     "edits are on. Re-run scripts/convert-flux.py so a "
+                     "edits are on. Re-run scripts/image/convert-flux.py so a "
                      "FLUX.1 dev or schnell checkpoint stops serving "
                      "edits.\n");
     }
@@ -337,12 +339,17 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
               ids.begin() + static_cast<std::ptrdiff_t>(n_txt) * 3);
     std::vector<float> cosv, sinv;
     rope(ids, n, cosv, sinv);
-    if (&op == &backend::vulkan_image_ops() &&
-        backend::VulkanSeq::available()) {
+    const bool vk = &op == &backend::vulkan_image_ops() &&
+                    backend::VulkanSeq::available();
+    const bool mt = &op == &backend::metal::image_ops() &&
+                    backend::metal::Seq::available();
+    if (vk || mt) {
         const char* env = std::getenv("LOCUS_FLUX_GPU");
         if (env == nullptr || std::string(env) != "0") {
-            return forward_vulkan(x, n_img, text, n_txt, st, cosv, sinv,
-                                  trace);
+            return vk ? forward_gpu<backend::VulkanSeq>(x, n_img, text, n_txt,
+                                                        st, cosv, sinv, trace)
+                      : forward_gpu<backend::metal::Seq>(
+                            x, n_img, text, n_txt, st, cosv, sinv, trace);
         }
     }
 

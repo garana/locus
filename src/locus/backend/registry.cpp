@@ -68,10 +68,10 @@ const std::vector<Backend>& list() {
                       .matvec_q8k = &matvec_q8k,  // scalar (no AVX2 Q8K)
                       .dequant_row = &dequant_row}});
         b.push_back({"sse4",
-                     "x86-64 SSE4.1 vectorized matvec (F32/Q8_0/"
+                     "x86-64 SSE4.1 vectorized matvec (F32/BF16/Q8_0/"
                      "Q4_K/Q6_K), 8-bit activation dots (K-quants), "
-                     "Q4_K/Q6_K register-blocked batch; built with AVX "
-                     "when the CPU has it",
+                     "Q4_K/Q6_K/F32/BF16 register-blocked batch; built "
+                     "with AVX when the CPU has it",
                      f.sse4, true,
                      {.matvec = &matvec_sse4,
                       .matvec_q8k = &matvec_sse4_q8k,

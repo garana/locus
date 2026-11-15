@@ -9,6 +9,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Warning flags are C++-only: nvcc does not understand -Wpedantic on
 # CUDA sources (host-side warnings go through -Xcompiler instead).
 add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>")
+# GCC 12's libstdc++ trips its own -Wrestrict and -Wstringop-overflow at
+# -O3 (std::string operator+, vector copies): 22 false positives in a
+# full build (i#1000). Off for GCC 12 only; other compilers keep them.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+   CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12 AND
+   CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:CXX>:-Wno-restrict;-Wno-stringop-overflow>")
+endif()
 # No implicit fused multiply-add (i#458): GCC and clang fuse a * b + c
 # by default wherever the target has FMA (always on arm64, never on
 # x86-64 without -mfma), so plain C++ would round differently per host.
@@ -26,6 +35,7 @@ add_library(locus
     src/locus/backend/gpu_metrics.cpp
     src/locus/backend/metal/kv_pool.cpp
     src/locus/backend/metal/matvec.cpp
+    src/locus/backend/metal/seq.cpp
     src/locus/backend/registry.cpp
     src/locus/backend/vulkan/context.cpp
     src/locus/chat/template.cpp
@@ -129,6 +139,7 @@ add_library(locus
     src/locus/http/client.cpp
     src/locus/http/http.cpp
     src/locus/http/loop_connection.cpp
+    src/locus/http/loop_server.cpp
     src/locus/http/server.cpp
     src/locus/http/metrics.cpp
     src/locus/sys/child_fds.cpp

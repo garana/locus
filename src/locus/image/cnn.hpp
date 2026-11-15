@@ -23,7 +23,7 @@ struct Preprocess {
 
 /**
  * Reads `prefix` input_size, resize, interpolation ("bilinear" or
- * "bicubic"), mean and std (scripts/convert-cnn.py writes them).
+ * "bicubic"), mean and std (scripts/image/convert-cnn.py writes them).
  *
  * @throws gguf::Error on a missing or bad key.
  */

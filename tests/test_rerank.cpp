@@ -38,12 +38,12 @@ TEST_CASE("bge-reranker-v2-m3 scores match exact arithmetic",
           "[rerank][e2e]") {
     if (!std::filesystem::exists(kModel)) {
         SKIP("bge-reranker-v2-m3-q8_0.gguf absent; see "
-             "scripts/convert-xlmr-reranker.py");
+             "scripts/text/convert-xlmr-reranker.py");
     }
     const auto m = EmbeddingModel::load(kModel);
     REQUIRE(m->reranker());
     REQUIRE(m->context() == 8192);
-    // Three references (scripts/make-rerank-golden.py and
+    // Three references (scripts/text/make-rerank-golden.py and
     // make-bert-q8-ref.py): q8ref is the GGUF's own weights in float64,
     // which locus must match closely; transformers on the f32 original;
     // llama-server, which rounds the activations to 8 bits before each

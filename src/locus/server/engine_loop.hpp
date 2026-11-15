@@ -114,13 +114,51 @@ class EngineLoop {
     View wait_done_or_cancel(std::uint64_t id,
                              const std::function<bool()>& alive);
 
+    /**
+     * Follows a request (i#989): after each step the worker queues its
+     * new tokens, logprobs and state, which take() collects without
+     * waiting on a step. Takes the engine mutex once (at most one step);
+     * idempotent. Ends after the take() that reports a terminal state,
+     * at unfollow(), or when release() drops the request.
+     */
+    void follow(std::uint64_t id);
+
+    /**
+     * Moves a followed request's queued progress into `acc`: appends
+     * the new tokens and logprobs, and sets the status, error and
+     * prefix counts. Never waits on a step (only the progress mutex,
+     * held for a copy). An id that is not followed leaves acc as is.
+     * @param id Request id.
+     * @param acc The caller's snapshot, empty at the first take.
+     * @returns Whether acc changed.
+     */
+    bool take(std::uint64_t id, View& acc);
+
+    /** Stops following a request (no-op if it is not followed). */
+    void unfollow(std::uint64_t id);
+
+    /** @returns How many requests are followed (tests). */
+    std::size_t follows();
+
+    /**
+     * Sets the hook the worker runs after a step (or a cancel) that
+     * queued progress for any followed request, so an event loop can
+     * wake and take(). It runs with the engine mutex held: it must not
+     * block or call into this EngineLoop. Set it before the first
+     * follow().
+     */
+    void set_progress_hook(std::function<void()> hook);
+
     /** Stops a non-terminal request early (client disconnected): the
      * engine drops it and frees its KV. No-op if unknown/terminal. */
     void cancel(std::uint64_t id);
 
     /** Drops a finished request's record once its result has been
-     * delivered to the client (evict-on-consume); no-op if it is not
-     * terminal. Call once, after the last view/wait_done for the id.
+     * delivered to the client (evict-on-consume), and its follow with
+     * it: take the final state before release (what a follower has not
+     * taken is dropped, and a later take() returns false). No-op if it
+     * is not terminal. Call once, after the last view/wait_done/take
+     * for the id.
      * @returns Whether the request is gone now (terminal, or unknown):
      *     false when it was still running and was kept. */
     bool release(std::uint64_t id);
@@ -155,8 +193,20 @@ class EngineLoop {
         bool terminal = false;
         int waiters = 0;
     };
+    /** A followed request: its progress not yet taken. */
+    struct Follow {
+        View pending;
+        std::size_t tokens = 0;    ///< generated tokens queued so far
+        std::size_t logprobs = 0;  ///< logprob entries queued so far
+        bool changed = false;
+        bool terminal = false;
+    };
     /** Registers a waiter on a request's progress for its scope. */
     class WatchScope;
+
+    /** Queues id's progress since the last queue into f (call with mu_
+     *  and pmu_ held). @returns Whether anything was queued. */
+    bool queue_locked(std::uint64_t id, Follow& f) const;
 
     void run();
     View snapshot_locked(std::uint64_t id) const;
@@ -184,6 +234,10 @@ class EngineLoop {
     std::mutex pmu_;
     std::condition_variable progress_cv_;
     std::unordered_map<std::uint64_t, Watch> watched_;
+    /** Followed requests (follow()), under pmu_. */
+    std::unordered_map<std::uint64_t, Follow> followed_;
+    /** Runs after a publish that queued follow progress (under mu_). */
+    std::function<void()> progress_hook_;
     /**
      * Count of client threads currently trying to acquire mu_ for a
      * read (view/wait_progress/wait_done/stats). The worker checks it

@@ -26,6 +26,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/http/base64.hpp"
 #include "locus/http/json_body.hpp"
+#include "locus/http/loop_server.hpp"
 #include "locus/backend/fallbacks.hpp"
 #include "locus/backend/gpu_metrics.hpp"
 #include "locus/backend/registry.hpp"
@@ -520,6 +521,17 @@ void render_http_metrics(MetricsText& mt, const http::HttpMetrics& hm) {
     per_route("locus_http_request_seconds",
               "Request head received to response written, per route.",
               [](const auto& r) -> const auto& { return r.seconds; });
+    // i#980: a stream whose producer failed after its head went out;
+    // the client saw a truncated transfer, so a 200 alone hides it.
+    mt.family("locus_http_stream_failures_total",
+              "Streamed responses whose producer failed after the head, "
+              "by route.",
+              "counter");
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        mt.value("locus_http_stream_failures_total",
+                 MetricsText::label("route", names[i]),
+                 hm.at(i).stream_failures.load(kRelaxed));
+    }
     const std::int64_t f = hm.in_flight.load(kRelaxed);
     mt.gauge("locus_http_requests_in_flight",
              "Requests between head received and response written.",
@@ -1736,9 +1748,15 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
     // they answer even when every worker is busy in a generation.
     // serve_connection still runs the head stage, so auth on /metrics
     // (when enabled) is unchanged -- only the serving thread differs.
-    cfg.fast_path = [mp = opt_.metrics_path](std::string_view method,
-                                             std::string_view target) {
-        return method == "GET" && (target == "/health" || target == mp);
+    // A fast-path route must answer at once and never stream: on the
+    // event loop it runs on the I/O thread itself. So there only
+    // /health takes it; /metrics waits up to one engine step for the
+    // engine's gauges (and may call the auth helper), which would stall
+    // every connection's I/O, so it runs on the job pool.
+    cfg.fast_path = [mp = opt_.metrics_path, loop = opt_.event_loop](
+                        std::string_view method, std::string_view target) {
+        return method == "GET" &&
+               (target == "/health" || (!loop && target == mp));
     };
     // Every route route_of serves; anything else counts as "other".
     http_metrics_ = std::make_shared<http::HttpMetrics>(
@@ -1749,8 +1767,13 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
             "/v1/classify", "/v1/audio/speech",
             "/v1/images/generations", "/v1/images/edits"});
     cfg.metrics = http_metrics_;
-    http_ = std::make_unique<http::Server>(std::move(cfg), route_handler_,
-                                           auth_head_);
+    if (opt_.event_loop) {
+        http_ = std::make_unique<http::LoopServer>(std::move(cfg),
+                                                   route_handler_, auth_head_);
+    } else {
+        http_ = std::make_unique<http::Server>(std::move(cfg), route_handler_,
+                                               auth_head_);
+    }
     return http_->start();
 }
 
@@ -3340,7 +3363,11 @@ void OpenAiServer::install_routes() {
                                                     codes.coarse.size()));
                                 }
                             } catch (const std::exception&) {
-                                // The head is out; end the stream short.
+                                // The head is out: the server ends the
+                                // transfer truncated, logs the reason
+                                // and counts it (i#980); returning here
+                                // instead sent a clean, empty end.
+                                throw;
                             }
                         });
                     return;

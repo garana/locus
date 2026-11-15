@@ -220,10 +220,10 @@ inline constexpr const char* kCommonHelp =
     "  --image-classifier P locus-server: serve /v1/classify, and\n"
     "                   image inputs to /v1/embeddings under its name,\n"
     "                   with the CNN GGUF at path P (ResNet or\n"
-    "                   Inception, from scripts/convert-cnn.py; CPU)\n"
+    "                   Inception, from scripts/image/convert-cnn.py; CPU)\n"
     "  --rerank-model P locus-server: serve /v1/rerank with the\n"
     "                   reranker GGUF at path P (from\n"
-    "                   scripts/convert-xlmr-reranker.py); both run on\n"
+    "                   scripts/text/convert-xlmr-reranker.py); both run on\n"
     "                   the CPU, a large request on Vulkan on Apple\n"
     "                   GPUs\n"
     "  --max-tokens N   locus-server: cap one request's output at N\n"
@@ -242,7 +242,7 @@ inline constexpr const char* kCommonHelp =
     "                   GGUFs) or PixArt-alpha (pixart, t5encoder and\n"
     "                   autoencoder_kl)\n"
     "  --lora-dir D     locus-server: FLUX.1 LoRAs (flux_lora GGUFs\n"
-    "                   from scripts/convert-lora.py) for the image\n"
+    "                   from scripts/image/convert-lora.py) for the image\n"
     "                   requests' lora field, each named by its file\n"
     "                   name; needs a FLUX.1 --image-model\n"
     "  --register URL   locus-server: register with the locus-router\n"
@@ -261,6 +261,9 @@ inline constexpr const char* kCommonHelp =
     "  --prefill-f16    Vulkan: stage prefill matmul operands in\n"
     "                   f16 (faster prompt ingestion; opt-in, the\n"
     "                   f32 default is exact)\n"
+    "  --event-loop     locus-server: serve every connection from one\n"
+    "                   I/O thread, handlers on a job pool (idle and\n"
+    "                   slow clients then hold no thread)\n"
     "  --speculative    prompt-lookup speculative decoding: draft\n"
     "                   tokens from n-grams already in the context,\n"
     "                   verified in one batched forward (greedy,\n"
@@ -462,6 +465,8 @@ struct BackendArgs {
     bool prefill_f16 = false;
     /** --speculative: prompt-lookup speculative decoding. */
     bool speculative = false;
+    /** --event-loop: locus-server on http::LoopServer (i#931). */
+    bool event_loop = false;
     /** From --spec-draft N: most draft tokens per verify (0 = the
      * engine default). */
     std::uint32_t spec_draft = 0;
@@ -709,6 +714,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.prefill_f16 = true;
         } else if (a == "--speculative") {
             out.speculative = true;
+        } else if (a == "--event-loop") {
+            out.event_loop = true;
         } else if (a == "--spec-draft" && i + 1 < argc) {
             number("--spec-draft", argv[++i], out.spec_draft);
         } else if (a.rfind("--spec-draft=", 0) == 0) {

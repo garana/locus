@@ -37,7 +37,7 @@ namespace locus::image {
  * - A final modulated LayerNorm (scale first, then shift) and proj_out
  *   on the image tokens give 64 values per token.
  *
- * Weights come from a "qwen_image" GGUF (scripts/convert-qwen-image.py).
+ * Weights come from a "qwen_image" GGUF (scripts/image/convert-qwen-image.py).
  * Matrices stay in the GGUF mapping, so the GgufFile must outlive the
  * model.
  */
@@ -113,18 +113,20 @@ class QwenImageDit {
               std::vector<float>& sin_out) const;
 
   private:
-    /** forward() with every block on the GPU (qwen_image_dit_vulkan.cpp):
+    /** forward() with every block on the GPU sequence Seq (VulkanSeq or
+     *  metal::Seq; qwen_image_dit_vulkan.cpp):
      *  text_normed is the text rows after txt_norm, st silu of the
      *  conditioning vector, cosv / sinv the RoPE tables of the joined
      *  sequence. */
-    std::vector<float> forward_vulkan(std::span<const float> x,
-                                      std::uint32_t n_img,
-                                      std::span<const float> text_normed,
-                                      std::uint32_t n_txt,
-                                      const std::vector<float>& st,
-                                      const std::vector<float>& cosv,
-                                      const std::vector<float>& sinv,
-                                      Trace* trace) const;
+    template <class Seq>
+    std::vector<float> forward_gpu(std::span<const float> x,
+                                   std::uint32_t n_img,
+                                   std::span<const float> text_normed,
+                                   std::uint32_t n_txt,
+                                   const std::vector<float>& st,
+                                   const std::vector<float>& cosv,
+                                   const std::vector<float>& sinv,
+                                   Trace* trace) const;
 
     struct Linear {
         backend::Mat w;
