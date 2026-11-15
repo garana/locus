@@ -122,7 +122,7 @@ struct Scratch {
     Context::Buffer x, xb, q, att, gate, up, logits, cs, scores, blocks;
     // MoE: the router logits (and the shared expert's gate logit after
     // them), and one expert's output.
-    Context::Buffer router, eout;
+    Context::Buffer router, eout, route;
 
     static void grow(Context& ctx, Context::Buffer& b, std::size_t bytes) {
         if (b.handle == nullptr || b.bytes < bytes) {
@@ -171,6 +171,14 @@ struct SiluParams {
 struct AxpyParams {
     std::uint32_t n;
     float a;
+};
+struct AxpyRouteParams {
+    std::uint32_t n, slot;
+};
+struct RouteParams {
+    std::uint32_t n_expert, k, softmax, bias_on_logit, has_bias, norm;
+    float scale;
+    std::uint32_t shared_gate;
 };
 
 constexpr std::uint32_t kNormGroup = 256;
@@ -316,6 +324,8 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         Scratch::grow(ctx, s.gate, ffw * 4);
         Scratch::grow(ctx, s.up, ffw * 4);
         Scratch::grow(ctx, s.router, (std::size_t{hp_.n_expert} + 1) * 4);
+        Scratch::grow(ctx, s.route,
+                      (2 * std::size_t{hp_.n_expert_used} + 1) * 4);
         Scratch::grow(ctx, s.eout, std::size_t{E} * 4);
         Scratch::grow(ctx, s.logits, std::size_t{R} * 4);
         Scratch::grow(ctx, s.cs, std::size_t{hd} * 4);
@@ -368,7 +378,8 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                                     const Context::Buffer& ub,
                                     std::uint64_t u_off, const Mat& d,
                                     const Context::Buffer& db,
-                                    std::uint64_t d_off, float wgt) {
+                                    std::uint64_t d_off, float wgt,
+                                    std::int64_t wgt_slot = -1) {
             metal::record_matvec(ctx, g.type, g.rows, g.cols, gb, g_off, s.xb,
                                  0, s.gate, 0, false);
             ctx.overlap_next();
@@ -379,6 +390,15 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
             ctx.dispatch("silu_mul", su, bytes_of(sp), g.rows, 256);
             metal::record_matvec(ctx, d.type, d.rows, d.cols, db, d_off,
                                  s.gate, 0, s.eout, 0, false);
+            if (wgt_slot >= 0) {
+                // The weight is on the GPU, at route[wgt_slot].
+                const AxpyRouteParams ap{E,
+                                         static_cast<std::uint32_t>(wgt_slot)};
+                const Context::Arg aa[] = {
+                    {&s.x, 0}, {&s.eout, 0}, {&s.route, 0}};
+                ctx.dispatch("axpy_routed", aa, bytes_of(ap), E, 256);
+                return;
+            }
             const AxpyParams ap{E, wgt};
             const Context::Arg aa[] = {{&s.x, 0}, {&s.eout, 0}};
             ctx.dispatch("axpy", aa, bytes_of(ap), E, 256);
@@ -387,12 +407,82 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         // expert's gate) on the GPU, the batch submitted so the CPU can
         // pick the experts (moe_select, as the CPU forward), then a new
         // batch runs them into the residual.
+        // Routing on the GPU (moe_route) when the kernel covers the
+        // arch's selection: no group-limited routing, at most 1024
+        // experts. LOCUS_METAL_MOE_ROUTE=cpu keeps the host pick (tests).
+        const char* route_env = std::getenv("LOCUS_METAL_MOE_ROUTE");
+        const bool gpu_route =
+            hp_.n_group <= 1 && hp_.n_expert <= 1024 &&
+            (route_env == nullptr || std::string_view(route_env) != "cpu");
+        // A routed expert by slot j of s.route: gate, up, SiLU, down,
+        // then the residual by the weight at route[k + j]; all on the
+        // GPU.
+        const auto routed_add = [&](const Layer& lay, std::uint32_t j) {
+            const std::uint32_t k = hp_.n_expert_used;
+            const auto gr = expert_buf(lay.gate_exps);
+            const auto ur = expert_buf(lay.up_exps);
+            const auto dr = expert_buf(lay.down_exps);
+            const Mat& g = lay.gate_exps.base;
+            const Mat& u = lay.up_exps.base;
+            const Mat& d = lay.down_exps.base;
+            metal::record_matvec_routed(ctx, g.type, g.rows, g.cols, *gr.buf,
+                                        gr.off, lay.gate_exps.expert_bytes,
+                                        s.route, j, s.xb, 0, s.gate, 0,
+                                        false);
+            ctx.overlap_next();
+            metal::record_matvec_routed(ctx, u.type, u.rows, u.cols, *ur.buf,
+                                        ur.off, lay.up_exps.expert_bytes,
+                                        s.route, j, s.xb, 0, s.up, 0, false);
+            const SiluParams sp{g.rows};
+            const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
+            ctx.dispatch("silu_mul", su, bytes_of(sp), g.rows, 256);
+            metal::record_matvec_routed(ctx, d.type, d.rows, d.cols, *dr.buf,
+                                        dr.off, lay.down_exps.expert_bytes,
+                                        s.route, j, s.gate, 0, s.eout, 0,
+                                        false);
+            const AxpyRouteParams ap{E, k + j};
+            const Context::Arg aa[] = {
+                {&s.x, 0}, {&s.eout, 0}, {&s.route, 0}};
+            ctx.dispatch("axpy_routed", aa, bytes_of(ap), E, 256);
+        };
         const auto moe = [&](const Layer& lay) {
             mv(lay.gate_inp, s.xb, s.router, 0, false);
             const bool gated = lay.gate_inp_shexp.rows > 0;
             if (gated) {
                 ctx.overlap_next();
                 mv(lay.gate_inp_shexp, s.xb, s.router, hp_.n_expert, false);
+            }
+            if (gpu_route) {
+                const std::uint32_t k = hp_.n_expert_used;
+                const bool has_bias = !lay.exp_probs_b.empty();
+                const RouteParams rp{
+                    hp_.n_expert,
+                    k,
+                    hp_.gating == GatingFunc::kSoftmax ? 1u : 0u,
+                    hp_.bias_on_logit ? 1u : 0u,
+                    has_bias ? 1u : 0u,
+                    hp_.expert_weights_norm ? 1u : 0u,
+                    hp_.expert_weights_scale,
+                    gated ? 1u : 0u};
+                const Context::Arg ra[] = {
+                    {&s.router, 0},
+                    {has_bias ? &fbuf(lay.exp_probs_b) : &s.router, 0},
+                    {&s.route, 0}};
+                ctx.dispatch("moe_route", ra, bytes_of(rp), 1024, 1024);
+                for (std::uint32_t j = 0; j < k; ++j) {
+                    routed_add(lay, j);
+                }
+                if (hp_.n_expert_shared > 0) {
+                    const auto sg = wbuf(lay.gate_shexp);
+                    const auto su = wbuf(lay.up_shexp);
+                    const auto sd = wbuf(lay.down_shexp);
+                    // The shared expert by the gate at route[2 k] (or 1).
+                    swiglu_add(lay.gate_shexp, *sg.buf, sg.off, lay.up_shexp,
+                               *su.buf, su.off, lay.down_shexp, *sd.buf,
+                               sd.off, 1.0f,
+                               gated ? std::int64_t{2} * k : -1);
+                }
+                return;
             }
             ctx.end_batch();
             const auto* rl = static_cast<const float*>(s.router.data);

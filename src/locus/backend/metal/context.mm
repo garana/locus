@@ -242,9 +242,11 @@ void Context::dispatch(std::string_view name, std::span<const Arg> args,
         [enc setComputePipelineState:pso];
         NSUInteger i = 0;
         for (const Arg& a : args) {
+            const NSUInteger at =
+                a.index >= 0 ? static_cast<NSUInteger>(a.index) : i++;
             [enc setBuffer:(__bridge id<MTLBuffer>)a.buf->handle
                     offset:a.offset
-                   atIndex:i++];
+                   atIndex:at];
         }
         if (!params.empty()) {
             [enc setBytes:params.data() length:params.size() atIndex:i];
