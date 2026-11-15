@@ -101,17 +101,18 @@ the OpenAI SDK, `client.images.with_raw_response.generate(...)` gives
 the headers). `n` must be 1,
 `size` must be the model's (FLUX: see above), and `response_format`
 must be `b64_json` (others are a 400). The PixArt directory holds the
-three GGUFs from `scripts/convert-t5-encoder.py`, `convert-pixart.py`
-and `convert-sd-vae.py`; the FLUX directory holds the four from
-`scripts/convert-flux.py` (`--dit-out`, `--clip-out`, `--vae-out`) and
-`convert-t5-encoder.py` on the pipeline's `text_encoder_2`. One image
-runs at a time; a second request while one runs gets a 503 with
-`Retry-After`.
+three GGUFs from `scripts/text/convert-t5-encoder.py`,
+`scripts/image/convert-pixart.py` and `scripts/image/convert-sd-vae.py`;
+the FLUX directory holds the four from `scripts/image/convert-flux.py`
+(`--dit-out`, `--clip-out`, `--vae-out`) and
+`scripts/text/convert-t5-encoder.py` on the pipeline's `text_encoder_2`.
+One image runs at a time; a second request while one runs gets a 503
+with `Retry-After`.
 
 `/v1/images/edits` runs FLUX.1 Kontext dev on a reference image: the
 same character, object or scene, changed as the prompt says. A FLUX.1
 dev or schnell checkpoint (its GGUF's `flux.kontext` false, written by
-`scripts/convert-flux.py`) does not edit: the route answers 503. It takes
+`scripts/image/convert-flux.py`) does not edit: the route answers 503. It takes
 a JSON body, not OpenAI's multipart form: `image` is a base64 PNG or
 JPEG, or a `data:` URL of one; `prompt`, `steps`, `guidance_scale`,
 `max_sequence_length` and `seed` are as above. Without `size` the
@@ -141,7 +142,7 @@ tokens per step and the model sees the reference at that resolution.
 A 512 x 512 edit of 20 steps on an M4 Max with the Q8_0 MMDiT
 denoises in 344 s instead of 1104 s (7.9 s per MMDiT pass instead of
 24.6 s). The directory holds four GGUFs:
-`scripts/convert-qwen-image.py`'s transformer and VAE (`--dit-out`,
+`scripts/image/convert-qwen-image.py`'s transformer and VAE (`--dit-out`,
 `--vae-out`), and llama.cpp's Qwen2.5-VL-7B-Instruct language model
 (with its tokenizer) and mmproj. The language model runs on the CPU;
 the MMDiT and the VAE run on the GPU where it maps host memory. The
@@ -150,7 +151,7 @@ a different (but repeatable) image than diffusers.
 
 FLUX requests (generations and edits) can apply LoRAs from the
 server's `--lora-dir`, a directory of GGUFs from
-`scripts/convert-lora.py` (kohya or diffusers LoRAs), each named by its
+`scripts/image/convert-lora.py` (kohya or diffusers LoRAs), each named by its
 file name without `.gguf`. `lora` is one name or an array of up to 8;
 `lora_scale` (default 1, from -4 to 4) is one number for all of them
 or an array of one per name; several LoRAs add up. An unknown name is
@@ -170,10 +171,10 @@ img = client.images.generate(
 ### Video output
 
 `--video-model <dir>` loads LTX-Video 2B distilled (the GGUFs from
-`scripts/convert-ltxv.py` and `convert-t5-encoder.py`). A clip takes
-minutes (the default 512x320, 65 frames: about 4 minutes on an M2 Pro
-with MoltenVK, most of it the VAE decode), so it is a job, in the
-shape of OpenAI's Videos API:
+`scripts/video/convert-ltxv.py` and `scripts/text/convert-t5-encoder.py`).
+A clip takes minutes (the default 512x320, 65 frames: about 4 minutes
+on an M2 Pro with MoltenVK, most of it the VAE decode), so it is a job,
+in the shape of OpenAI's Videos API:
 `POST /v1/videos` answers at once with a `video` object whose `status`
 is `queued`; `GET /v1/videos/{id}` reports `queued`, `in_progress`
 (with `progress`, 0 to 100), `completed` or `failed` (with `error`);
@@ -216,7 +217,7 @@ curl -s -o fox.mp4 localhost:8080/v1/videos/video_.../content
 ### Image classification
 
 `--image-classifier <cnn.gguf>` loads a CNN made by
-`scripts/convert-cnn.py` from a timm checkpoint (ResNet-50 or
+`scripts/image/convert-cnn.py` from a timm checkpoint (ResNet-50 or
 Inception-v3, ImageNet's 1000 classes). It runs one image at a time,
 with the checkpoint's own eval preprocessing (resize, center crop,
 mean and std). The convs run on Vulkan when the GPU maps host memory

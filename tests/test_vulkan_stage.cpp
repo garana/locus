@@ -37,7 +37,7 @@ TEST_CASE("two vulkan stages give the full vulkan forward's logits",
         SKIP("no usable Vulkan device / kernels not built");
     }
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     const KvType kv = GENERATE(KvType::kF32, KvType::kQ8, KvType::kF16);
     CAPTURE(static_cast<int>(kv));
@@ -130,7 +130,7 @@ TEST_CASE("a vulkan stage refuses a range outside its cache",
         SKIP("no usable Vulkan device / kernels not built");
     }
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     const auto& vk = *locus::backend::find_backend("vulkan");
@@ -182,7 +182,7 @@ TEST_CASE("two batched vulkan stages give the full multi pass's logits",
         SKIP("no usable Vulkan device / kernels not built");
     }
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
@@ -404,7 +404,7 @@ TEST_CASE("batched vulkan stages chunk by 8 and keep a lone sequence "
         SKIP("no usable Vulkan device / kernels not built");
     }
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     const std::uint32_t n = GENERATE(10u, 1u);
     CAPTURE(n);
@@ -488,7 +488,7 @@ TEST_CASE("vulkan decode attention merges its partials in rounds",
         SKIP("no usable Vulkan device / kernels not built");
     }
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     const KvType kv = GENERATE(KvType::kF32, KvType::kF16);
     CAPTURE(static_cast<int>(kv));

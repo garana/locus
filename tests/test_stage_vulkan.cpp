@@ -70,7 +70,7 @@ TEST_CASE("a two-stage vulkan pipeline gives the vulkan forward's logits",
         SKIP("no usable Vulkan device / kernels not built");
     }
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     const auto& vk = *locus::backend::find_backend("vulkan");

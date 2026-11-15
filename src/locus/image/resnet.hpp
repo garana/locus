@@ -20,7 +20,7 @@ namespace locus::image {
  * strided 1 x 1 projection, then ReLU), global average pooling to the
  * embedding, and the linear classifier.
  *
- * Weights come from the "resnet" GGUF of scripts/convert-cnn.py, with
+ * Weights come from the "resnet" GGUF of scripts/image/convert-cnn.py, with
  * each batch norm folded into its conv. The tensors stay in the GGUF
  * mapping, so the GgufFile must outlive the model.
  */

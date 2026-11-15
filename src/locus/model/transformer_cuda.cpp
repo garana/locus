@@ -51,7 +51,81 @@ struct DevBufs {
     }
 };
 
+/** The KV attention of layer l over the mirror: the n queries in b.q
+ *  (qd floats a row) into b.att, with the block and query tables on the
+ *  host and their device copies in b. */
+backend::KvAttend attend_args(const kv::PagedKvCache& cache,
+                              std::uint32_t l, float* mirror,
+                              const std::vector<std::uint32_t>& blocks,
+                              const std::vector<std::uint32_t>& meta,
+                              std::uint32_t n, const Hparams& hp,
+                              const DevBufs& b, std::size_t qd) {
+    backend::KvAttend a;
+    a.mirror = mirror;
+    a.blocks = blocks.data();
+    a.n_blocks = static_cast<std::uint32_t>(blocks.size());
+    a.block_stride = cache.block_floats();
+    a.layer_off = cache.layer_offset(l);
+    a.v_off = cache.layer_floats() / 2;
+    a.block_tokens = cache.geometry().block_tokens;
+    a.n_heads = hp.n_heads;
+    a.n_kv_heads = hp.n_kv_heads;
+    a.head_dim = hp.head_dim;
+    a.kq_scale = hp.kq_scale;
+    a.n_q = n;
+    a.q_pos = meta.data();
+    a.q_table = meta.data() + n;
+    a.q = b.q;
+    a.out = b.att;
+    a.q_stride = qd;
+    a.device_io = true;
+    a.dev_blocks = b.blocks;
+    a.dev_meta = b.meta;
+    return a;
+}
+
+/** Copies the n tokens' new K and V rows of every layer (kvd floats
+ *  each, from the device staging area `stage`) into the host pool,
+ *  which stays the source of truth. */
+void store_kv_rows(kv::PagedKvCache& cache,
+                   std::span<kv::PagedKvCache::Seq* const> seqs,
+                   std::span<const std::uint32_t> pos, std::uint32_t n,
+                   const std::vector<float>& stage,
+                   std::size_t stage_stride, std::size_t kvd,
+                   std::uint32_t layers) {
+    for (std::uint32_t t = 0; t < n; ++t) {
+        for (std::uint32_t l = 0; l < layers; ++l) {
+            const float* src =
+                stage.data() + t * stage_stride + std::size_t{l} * 2 * kvd;
+            std::memcpy(cache.k(*seqs[t], l, pos[t]), src,
+                        kvd * sizeof(float));
+            std::memcpy(cache.v(*seqs[t], l, pos[t]), src + kvd,
+                        kvd * sizeof(float));
+        }
+    }
+}
+
 }  // namespace
+
+bool TransformerModel::cuda_forward_supported() const {
+    static const bool off = [] {
+        const char* e = std::getenv("LOCUS_CUDA_FORWARD");
+        return e != nullptr && std::string_view(e) == "0";
+    }();
+    if (off || backend_->name != "cuda" || !spec_->plain_attention ||
+        layer_begin_ != 0 || layer_end_ != hp_.n_layers ||
+        hp_.norm_type != NormType::kRmsNorm || hp_.embd_norm ||
+        hp_.n_kv_heads == 0 || out_w_.rows != hp_.n_vocab ||
+        ops().kv_attend == nullptr) {
+        return false;
+    }
+    for (const Layer& lay : layers_) {
+        if (lay.is_moe()) {
+            return false;
+        }
+    }
+    return true;
+}
 
 bool TransformerModel::cuda_forward(
     std::span<const tok::TokenId> toks,
@@ -60,23 +134,10 @@ bool TransformerModel::cuda_forward(
     Workspace& ws, std::span<float> logits, bool all_logits,
     std::span<const float* const> embd, LogitRows rows_out) const {
     using namespace locus::backend;
-    static const bool off = [] {
-        const char* e = std::getenv("LOCUS_CUDA_FORWARD");
-        return e != nullptr && std::string_view(e) == "0";
-    }();
     const auto n = static_cast<std::uint32_t>(toks.size());
-    if (off || n == 0 || backend_->name != "cuda" ||
-        !spec_->plain_attention || cache.quantized() ||
-        cache.mirror_data() == nullptr || layer_begin_ != 0 ||
-        layer_end_ != hp_.n_layers || hp_.norm_type != NormType::kRmsNorm ||
-        hp_.embd_norm ||
-        hp_.n_kv_heads == 0 || out_w_.rows != hp_.n_vocab) {
+    if (n == 0 || !cuda_forward_supported() || cache.quantized() ||
+        cache.mirror_data() == nullptr) {
         return false;
-    }
-    for (const Layer& lay : layers_) {
-        if (lay.is_moe()) {
-            return false;
-        }
     }
     if (!embd.empty() && embd.size() != n) {
         return false;
@@ -93,9 +154,6 @@ bool TransformerModel::cuda_forward(
         }
     }
     const Ops op = ops();
-    if (op.kv_attend == nullptr) {
-        return false;
-    }
     const std::uint32_t E = hp_.n_embd, hd = hp_.head_dim,
                         H = hp_.n_heads, KV = hp_.n_kv_heads,
                         ff = hp_.n_ff, V = hp_.n_vocab, L = hp_.n_layers;
@@ -201,28 +259,8 @@ bool TransformerModel::cuda_forward(
         if (!ok) {
             break;
         }
-        KvAttend a;
-        a.mirror = mirror;
-        a.blocks = blocks.data();
-        a.n_blocks = static_cast<std::uint32_t>(blocks.size());
-        a.block_stride = cache.block_floats();
-        a.layer_off = cache.layer_offset(l);
-        a.v_off = cache.layer_floats() / 2;
-        a.block_tokens = bt;
-        a.n_heads = H;
-        a.n_kv_heads = KV;
-        a.head_dim = hd;
-        a.kq_scale = hp_.kq_scale;
-        a.n_q = n;
-        a.q_pos = meta.data();
-        a.q_table = meta.data() + n;
-        a.q = b.q;
-        a.out = b.att;
-        a.q_stride = qd;
-        a.device_io = true;
-        a.dev_blocks = b.blocks;
-        a.dev_meta = b.meta;
-        ok = op.kv_attend(a) &&
+        ok = op.kv_attend(
+                 attend_args(cache, l, mirror, blocks, meta, n, hp_, b, qd)) &&
              cuda_dev_matvec_batch(lay.wo, b.att, b.o, n, b.scratch) &&
              cuda_dev_add(b.x, b.o, std::size_t{n} * E) &&
              cuda_dev_rmsnorm(b.x, fn, eps, b.xb, E, n) &&
@@ -253,17 +291,7 @@ bool TransformerModel::cuda_forward(
         !cuda_dev_download(ws.xb.data(), b.xb + std::size_t{n - 1} * E, E)) {
         return false;
     }
-    // The host pool stays the source of truth: the new rows go there too.
-    for (std::uint32_t t = 0; t < n; ++t) {
-        for (std::uint32_t l = 0; l < L; ++l) {
-            const float* src =
-                stage.data() + t * stage_stride + std::size_t{l} * 2 * kvd;
-            std::memcpy(cache.k(*seqs[t], l, pos[t]), src,
-                        kvd * sizeof(float));
-            std::memcpy(cache.v(*seqs[t], l, pos[t]), src + kvd,
-                        kvd * sizeof(float));
-        }
-    }
+    store_kv_rows(cache, seqs, pos, n, stage, stage_stride, kvd, L);
     const float ninf = -std::numeric_limits<float>::infinity();
     for (std::uint32_t t = 0; t < nh; ++t) {
         const std::span<float> row = logits.subspan(std::size_t{t} * V, V);

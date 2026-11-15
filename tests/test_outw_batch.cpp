@@ -197,7 +197,7 @@ void sweep_backends(const std::string& path) {
 TEST_CASE("amortized LM head byte-exact: F32 head (layout guard)",
           "[batch][outw]") {
     if (!std::filesystem::exists(stories_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     sweep_backends(stories_path());
 }

@@ -15,7 +15,7 @@ namespace locus::image {
 
 /**
  * A CNN image classifier and embedder for the server (i#577): one of
- * the "resnet" or "inception" GGUFs of scripts/convert-cnn.py, picked by
+ * the "resnet" or "inception" GGUFs of scripts/image/convert-cnn.py, picked by
  * general.architecture, with its preprocessing. Owns the GGUF the model
  * maps.
  */

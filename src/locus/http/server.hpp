@@ -226,29 +226,48 @@ struct ServerConfig {
 };
 
 /**
+ * What a caller drives an HTTP server by, so it can pick the thread
+ * server (Server) or the event-loop one (LoopServer, i#931) with the
+ * same ServerConfig, Handler and HeadHandler.
+ */
+class Service {
+ public:
+    virtual ~Service() = default;
+    /** Binds host:port and starts serving on background threads.
+     * @returns the bound port (> 0), or -1 on bind/listen failure. */
+    virtual int start() = 0;
+    /** Stops serving and returns once every thread has exited. Safe to
+     * call more than once, from any thread. */
+    virtual void stop() = 0;
+    /** Blocks until stop() is called (from any thread). Returns at once
+     * if already stopping. */
+    virtual void wait() = 0;
+};
+
+/**
  * Owns a listening socket and a background accept loop. Thread-safe to
  * stop() from any thread; the destructor stops. Not copyable.
  */
-class Server {
+class Server : public Service {
  public:
     /** @param head_handler optional; runs on the head before the body
      * (auth/policy). Null = no head stage. */
     Server(ServerConfig cfg, Handler handler, HeadHandler head_handler = {});
-    ~Server();
+    ~Server() override;
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
 
     /** Binds host:port and starts accepting on a background thread.
      * @returns the bound port (> 0), or -1 on bind/listen failure. */
-    int start();
+    int start() override;
     /** Stops accepting, wakes and drains every worker promptly (a self-
      * pipe watched by each poll), closes the listen socket, and returns
      * once all workers have exited. Safe to call more than once. */
-    void stop();
+    void stop() override;
     /** Blocks until stop() is called (from any thread). Lets a caller
      * turn the background accept loop into a serve-forever call. Returns
      * immediately if already stopping. */
-    void wait();
+    void wait() override;
 
  private:
     void worker_loop();

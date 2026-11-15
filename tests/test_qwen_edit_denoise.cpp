@@ -22,7 +22,7 @@ using locus::image::QwenImageSampler;
 
 const std::string kGolden = std::string(LOCUS_SOURCE_DIR) + "/tests/golden/";
 
-// Keep in sync with scripts/make-qwen-edit-denoise-golden.py.
+// Keep in sync with scripts/image/make-qwen-edit-denoise-golden.py.
 const std::vector<std::pair<std::uint32_t, std::uint32_t>> kSigmaCases = {
     {2, 12}, {3, 256}, {4, 1024}, {20, 4096}, {50, 8192}, {28, 20000}};
 constexpr std::uint32_t kRefH = 32, kRefW = 24, kOutH = 16, kOutW = 32;
@@ -113,7 +113,7 @@ TEST_CASE("qwen true cfg mixes and rescales per token",
 }
 
 // i#615: diffusers' QwenImageEditPipeline.__call__ on the synthetic
-// MMDiT and VAE (scripts/make-qwen-edit-denoise-golden.py): 2 steps of
+// MMDiT and VAE (scripts/image/make-qwen-edit-denoise-golden.py): 2 steps of
 // true CFG (scale 4) on an 16 x 32 edit of a 32 x 24 reference, its
 // prompt 5 and its negative prompt 3 text rows. The final latents and
 // the decoded image against the pipeline's.

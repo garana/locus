@@ -37,7 +37,8 @@ TEST_CASE("janus prompt wrapping reproduces the reference ids",
     const std::string dir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
     const std::string model = dir + "models/janus-pro-1b-bf16.gguf";
     if (!std::filesystem::exists(model)) {
-        SKIP("janus-pro-1b-bf16.gguf absent; see scripts/convert-janus.py");
+        SKIP("janus-pro-1b-bf16.gguf absent; see "
+             "scripts/image/convert-janus.py");
     }
     std::ifstream f(dir + "golden/janus_tokens.txt");
     REQUIRE(f.good());
@@ -61,7 +62,7 @@ TEST_CASE("janus prompt wrapping reproduces the reference ids",
 }
 
 // i#226: Janus-Pro text-to-image codes, token-exact against the torch
-// reference (scripts/make-janus-goldens.py tokens: CFG 5, argmax in
+// reference (scripts/image/make-janus-goldens.py tokens: CFG 5, argmax in
 // f32 on the CPU) on the BF16 GGUF, whose weights are the checkpoint's
 // own bf16 values. Checks the unconditional prompt and all 576 codes.
 TEST_CASE("janus CFG argmax reproduces the reference image codes",
@@ -69,7 +70,8 @@ TEST_CASE("janus CFG argmax reproduces the reference image codes",
     const std::string dir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
     const std::string model = dir + "models/janus-pro-1b-bf16.gguf";
     if (!std::filesystem::exists(model)) {
-        SKIP("janus-pro-1b-bf16.gguf absent; see scripts/convert-janus.py");
+        SKIP("janus-pro-1b-bf16.gguf absent; see "
+             "scripts/image/convert-janus.py");
     }
     if (std::getenv("LOCUS_HEAVY_TESTS") == nullptr) {
         SKIP("576 CFG steps take minutes on a CPU; set LOCUS_HEAVY_TESTS=1");

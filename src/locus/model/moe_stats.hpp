@@ -13,7 +13,7 @@ namespace locus::model {
  *
  * LOCUS_MOE_TRACE=<file> also writes every pick, one "layer expert"
  * line in call order, so a residency policy can be replayed offline
- * (scripts/moe-trace-sim.py). Batched prefill records a chunk layer
+ * (scripts/text/moe-trace-sim.py). Batched prefill records a chunk layer
  * by layer, decode token by token.
  *
  * Single-threaded by the engine contract; zero overhead when both

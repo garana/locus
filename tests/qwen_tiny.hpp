@@ -1,8 +1,8 @@
 #pragma once
 
 // Tiny Qwen2.5-VL models for the synthetic goldens: the language model
-// of scripts/make-qwen-mrope-golden.py and the vision tower of
-// scripts/make-qwen-vision-goldens.py synth, built as GGUF images in
+// of scripts/image/make-qwen-mrope-golden.py and the vision tower of
+// scripts/image/make-qwen-vision-goldens.py synth, built as GGUF images in
 // memory and filled from the scripts' LCG in sorted tensor-name order.
 // Keep the sizes in sync with the scripts.
 

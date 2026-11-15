@@ -22,7 +22,7 @@ using locus::image::ResNet;
 const std::string kDir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
 const std::string kModel = kDir + "models/resnet50-tv-f32.gguf";
 
-// Keep in sync with scripts/make-cnn-goldens.py.
+// Keep in sync with scripts/image/make-cnn-goldens.py.
 constexpr std::uint32_t kRows[] = {0, 111, 223};
 constexpr std::uint32_t kSize = 224, kClasses = 1000, kFeat = 2048;
 
@@ -72,13 +72,13 @@ TEST_CASE("resnet top k is the highest softmax probabilities",
 }
 
 // i#575: ResNet-50 (timm's resnet50.tv_in1k, torchvision's weights,
-// batch norms folded by scripts/convert-cnn.py) on janus_apple.png
-// against timm in float32 (scripts/make-cnn-goldens.py): the eval
+// batch norms folded by scripts/image/convert-cnn.py) on janus_apple.png
+// against timm in float32 (scripts/image/make-cnn-goldens.py): the eval
 // transform's output on three rows of each channel, the 1000 logits,
 // the top 5 and the 2048-wide pooled embedding.
 TEST_CASE("resnet-50 matches timm on an image", "[resnet][image]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("resnet50-tv-f32.gguf absent; see scripts/convert-cnn.py");
+        SKIP("resnet50-tv-f32.gguf absent; see scripts/image/convert-cnn.py");
     }
     const auto ref_b = read_bytes(kDir + "golden/resnet50_apple.f32");
     std::vector<float> ref(ref_b.size() / 4);
@@ -138,7 +138,7 @@ TEST_CASE("resnet-50 matches timm on an image", "[resnet][image]") {
 // the same top 5.
 TEST_CASE("resnet-50 on vulkan matches the cpu", "[resnet][image][vulkan]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("resnet50-tv-f32.gguf absent; see scripts/convert-cnn.py");
+        SKIP("resnet50-tv-f32.gguf absent; see scripts/image/convert-cnn.py");
     }
     if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device");
@@ -165,7 +165,7 @@ TEST_CASE("resnet-50 on vulkan matches the cpu", "[resnet][image][vulkan]") {
 
 TEST_CASE("resnet rejects a wrong input size", "[resnet][image]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("resnet50-tv-f32.gguf absent; see scripts/convert-cnn.py");
+        SKIP("resnet50-tv-f32.gguf absent; see scripts/image/convert-cnn.py");
     }
     auto g = locus::gguf::GgufFile::open(kModel);
     const auto net = ResNet::load(g);

@@ -17,7 +17,7 @@ description: Build and run the locus Catch2 unit tests. Use after
   keep this list current as suites are added).
 - [mp] spawns real locus-stage processes (multi-server driver chain);
   it needs the test model and the locus-stage binary built.
-- [e2e] needs the ~1 MB test model: `scripts/fetch-test-model.sh`
+- [e2e] needs the ~1 MB test model: `scripts/tests/fetch-test-model.sh`
   (gitignored under tests/models/; tests SKIP if absent). Larger
   optional models (llama-3.2-1b Q8_0/Q4_K_M, deepseek-v2-lite)
   enable more goldens; [deepseek] alone takes ~2 min of CPU.
