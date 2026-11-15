@@ -1209,6 +1209,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     const auto metrics_next = [&](int fd, http::LoopConnection::Next n) {
         switch (n) {
             case http::LoopConnection::Next::kRead:
+            case http::LoopConnection::Next::kIdle:  // async replies only
                 poller.modify(fd, sys::Poller::Dir::kRead);
                 break;
             case http::LoopConnection::Next::kWrite:
