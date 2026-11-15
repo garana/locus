@@ -187,9 +187,9 @@ server's routes that way: one I/O thread owns every connection (the
 `allow` list and the per-address cap at accept, `/health` answered on
 the loop; `/metrics` waits up to an engine step for its gauges, which
 would stall every connection there), and a job pool runs the head
-stage and the
-handler, a stream through a `Sink` that blocks at the reply's queue
-bound. An idle or slow client then holds a buffer, not a thread.
+stage and the handler, a stream through a `Sink` that blocks at the
+reply's queue bound. An idle or slow client then holds a buffer, not a
+thread.
 `http::Server` (a thread a connection) stays the default for now.
 
 `locus-router` (`router::Router`) proxies each request to one of

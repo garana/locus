@@ -105,7 +105,7 @@ void routes(const Request& req, ServerResponse& res,
 
 }  // namespace
 
-TEST_CASE("loop server answers, keeps alive and pipelines",
+TEST_CASE("loop server answers with keep-alive and pipelining",
           "[http][loop_server]") {
     Running r({}, routes);
     const int fd = dial(r.port);
