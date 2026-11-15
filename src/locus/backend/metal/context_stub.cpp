@@ -41,6 +41,8 @@ void Context::begin_batch() {
 
 bool Context::batch_open() const { return false; }
 
+void Context::overlap_next() {}
+
 void Context::end_batch() {
     throw std::runtime_error("metal: not built with Metal");
 }

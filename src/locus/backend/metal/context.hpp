@@ -83,14 +83,22 @@ class Context {
 
     /**
      * Opens a batch: dispatches record into one command buffer, each
-     * ordered after the one before (a serial encoder, so a dispatch
-     * sees every earlier one's writes), until end_batch().
+     * after a barrier, so it sees every earlier one's writes (unless
+     * overlap_next() says otherwise), until end_batch().
      * @throws std::logic_error when a batch is already open.
      */
     void begin_batch();
 
     /** @returns Whether a batch is open. */
     bool batch_open() const;
+
+    /**
+     * In the open batch, the next dispatch need not wait for the one
+     * before it (it neither reads nor writes what that one writes), so
+     * the GPU may run them together. It still waits for every dispatch
+     * recorded before the last barrier.
+     */
+    void overlap_next();
 
     /**
      * Submits the open batch and waits for it.
