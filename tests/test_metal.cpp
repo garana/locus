@@ -281,13 +281,15 @@ TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
     // (with a Q6_K head) and Q5_K_M (Q5_K and Q6_K); requantized, so
     // only fit for this GPU-against-CPU check, not for quality numbers.
     // Qwen2.5 0.5B Q8_0 is qwen2's attention (q / k / v biases, NEOX
-    // RoPE); Qwen1.5-MoE-A2.7B adds routed and gated shared experts.
+    // RoPE); Qwen1.5-MoE-A2.7B adds routed and gated shared experts;
+    // Qwen3-Coder-30B-A3B is qwen3moe (per-head q / k norm, 128 experts).
     int ran = 0;
     for (const char* name :
          {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf",
           "llama-3.2-1b-q4_0.gguf", "llama-3.2-1b-q5_k_m.gguf",
           "qwen2.5-0.5b-instruct-q8_0.gguf",
-          "Qwen1.5-MoE-A2.7B.Q4_K_M.gguf"}) {
+          "Qwen1.5-MoE-A2.7B.Q4_K_M.gguf",
+          "qwen3-coder-30b-a3b-instruct-q4_k_m.gguf"}) {
         const std::string path =
             std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
         if (!std::filesystem::exists(path)) {
