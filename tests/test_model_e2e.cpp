@@ -338,6 +338,11 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
     if (locus::backend::vulkan_backend_usable()) {
         backends.push_back("vulkan");
     }
+    // Metal's GPU forward too, where a device is there (i#866).
+    if (const auto* m = locus::backend::find_backend("metal");
+        m != nullptr && m->available) {
+        backends.push_back("metal");
+    }
     for (const char* be : backends) {
         model.use_backend(*locus::backend::find_backend(be));
         // The GPU batch path declines this model (biases, gated shared
@@ -345,6 +350,10 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
         // runs the full GPU forward token by token, routing on the host.
         if (std::string(be) == "vulkan") {
             REQUIRE(locus::backend::vulkan_forward_supported(model));
+        }
+        // Metal's native forward, not the per-op matvecs (i#866).
+        if (std::string(be) == "metal") {
+            REQUIRE(model.metal_forward_supported());
         }
         {
             INFO(be);
@@ -407,9 +416,18 @@ TEST_CASE("qwen2 greedy decode matches exact arithmetic",
     if (locus::backend::vulkan_backend_usable()) {
         backends.push_back("vulkan");
     }
+    // Metal's GPU forward too, where a device is there (i#866).
+    if (const auto* m = locus::backend::find_backend("metal");
+        m != nullptr && m->available) {
+        backends.push_back("metal");
+    }
     for (const char* be : backends) {
         INFO(be);
         model.use_backend(*locus::backend::find_backend(be));
+        // Metal's native forward, not the per-op matvecs (i#866).
+        if (std::string(be) == "metal") {
+            REQUIRE(model.metal_forward_supported());
+        }
         auto cache = model.make_cache();
         auto ws = model.make_workspace();
         locus::kv::PagedKvCache::Seq seq;
@@ -461,6 +479,11 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
     if (locus::backend::vulkan_backend_usable()) {
         backends.push_back("vulkan");
     }
+    // Metal's GPU forward too, where a device is there (i#866).
+    if (const auto* m = locus::backend::find_backend("metal");
+        m != nullptr && m->available) {
+        backends.push_back("metal");
+    }
 
     // llama.cpp's prompt token counts (qwen2 pretokenizer; the gpt2
     // fallback gave 6, 6, 10 and 31).
@@ -490,6 +513,10 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
     };
     for (const char* be : backends) {
         model.use_backend(*locus::backend::find_backend(be));
+        // Metal's native forward, not the per-op matvecs (i#866).
+        if (std::string(be) == "metal") {
+            REQUIRE(model.metal_forward_supported());
+        }
         for (const Golden& gd : goldens) {
             INFO(be << ": " << gd.prompt);
             auto cache = model.make_cache();
