@@ -275,14 +275,16 @@ TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
     if (!Context::usable()) {
         SKIP("no Metal device");
     }
-    // Q4_K_M (Q4_K and Q6_K), Q8_0, and two made from the Q8_0 with
+    // Qwen2.5 0.5B Q8_0 is qwen2's attention (q / k / v biases, NEOX
+    // RoPE). Q4_K_M (Q4_K and Q6_K), Q8_0, and two made from the Q8_0 with
     // llama-quantize --allow-requantize (i#907): Q4_0 (with a Q6_K
     // head) and Q5_K_M (Q5_K and Q6_K). Requantized, so only fit for
     // this GPU-against-CPU check, not for quality numbers.
     int ran = 0;
     for (const char* name :
          {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf",
-          "llama-3.2-1b-q4_0.gguf", "llama-3.2-1b-q5_k_m.gguf"}) {
+          "llama-3.2-1b-q4_0.gguf", "llama-3.2-1b-q5_k_m.gguf",
+          "qwen2.5-0.5b-instruct-q8_0.gguf"}) {
         const std::string path =
             std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
         if (!std::filesystem::exists(path)) {
@@ -447,9 +449,10 @@ TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
         SKIP("no Metal device");
     }
     int ran = 0;
-    // Q4_K_M takes the matmul; Q8_0 the per-token matvecs.
+    // Llama Q4_K_M and Q8_0, and qwen2's attention (biases, NEOX RoPE).
     for (const char* name :
-         {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf"}) {
+         {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf",
+          "qwen2.5-0.5b-instruct-q8_0.gguf"}) {
         const std::string path =
             std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
         if (!std::filesystem::exists(path)) {
