@@ -388,7 +388,8 @@ TEST_CASE("metal matmuls match the CPU matvec per token",
     // Rows and tokens off the 64 x 32 tile, strided token rows.
     for (const TensorType ty :
          {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0,
-          TensorType::kF32, TensorType::kF16, TensorType::kBF16}) {
+          TensorType::kQ4_0, TensorType::kQ5_0, TensorType::kF32,
+          TensorType::kF16, TensorType::kBF16}) {
         CAPTURE(static_cast<int>(ty));
         for (const auto& [rows, cols, n_tok] :
              {std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>{
@@ -447,6 +448,74 @@ TEST_CASE("metal matmuls match the CPU matvec per token",
     CHECK_FALSE(mb::record_matmul(ctx, TensorType::kQ5_K, 4, 256, 2, none, 0,
                                   none, 0, 256, none, 0, 4, false));
     ctx.free(none);
+}
+
+TEST_CASE("metal grouped matmul matches a matvec a slot", "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    Context& ctx = Context::get();
+    std::mt19937 rng(29);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    // 23 tokens of 3 picks over 6 experts, expert 0 taking most slots
+    // (past one 32-slot tile), expert 5 none.
+    const std::uint32_t n_expert = 6, k = 3, n_tok = 23, slots = n_tok * k;
+    std::vector<std::uint32_t> route(slots);
+    std::uniform_int_distribution<std::uint32_t> pick(0, 9);
+    for (auto& e : route) {
+        const std::uint32_t r = pick(rng);
+        e = r < 5 ? 0 : r - 5;  // 0 .. 4
+    }
+    for (const TensorType ty :
+         {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0,
+          TensorType::kQ5_0}) {
+        CAPTURE(static_cast<int>(ty));
+        const std::uint32_t rows = 100, cols = 512;
+        const auto w = random_weights(ty, rows * n_expert, cols, 7);
+        const std::uint64_t eb = mb::matvec_weight_bytes(ty, rows, cols);
+        // Gate-like (x row s / k) and down-like (x row s) inputs.
+        for (const std::uint32_t div : {k, 1u}) {
+            CAPTURE(div);
+            const std::uint32_t xs = cols + 8, os = rows + 4;
+            std::vector<float> x(std::size_t{slots} * xs);
+            for (auto& v : x) {
+                v = dist(rng);
+            }
+            std::vector<float> init(std::size_t{slots} * os, 7.0f);
+            Context::Buffer wb = ctx.upload(w);
+            Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
+            Context::Buffer ob = ctx.upload(std::as_bytes(std::span(init)));
+            Context::Buffer rb = ctx.upload(std::as_bytes(std::span(route)));
+            Context::Buffer ib = ctx.alloc(
+                (slots + 3 * std::size_t{mb::moe_max_tiles(slots, n_expert)}) *
+                4);
+            {
+                std::lock_guard lk(mb::device_mutex());
+                mb::record_moe_tiles(ctx, rb, slots, n_expert, ib);
+                REQUIRE(mb::record_matmul_id(ctx, ty, rows, cols, slots,
+                                             n_expert, wb, 0, eb, xb, xs, div,
+                                             ob, os, ib));
+            }
+            const auto* got = static_cast<const float*>(ob.data);
+            std::vector<float> want(rows);
+            for (std::uint32_t s = 0; s < slots; ++s) {
+                const locus::backend::Mat m{
+                    ty, w.data() + route[s] * eb, rows, cols};
+                locus::backend::matvec(
+                    m, {x.data() + std::size_t{s / div} * xs, cols}, want);
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    REQUIRE(got[std::size_t{s} * os + r] ==
+                            Catch::Approx(want[r]).margin(1e-3).epsilon(1e-4));
+                }
+                // The stride's padding is untouched.
+                REQUIRE(got[std::size_t{s} * os + rows] == 7.0f);
+            }
+            for (auto* b : {&wb, &xb, &ob, &rb, &ib}) {
+                ctx.free(*b);
+            }
+        }
+    }
 }
 
 TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
@@ -532,6 +601,14 @@ TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
             close(std::span<const float>(all.first).subspan(
                       (ids.size() - 1) * nv, nv),
                   cpu.first);
+        }
+        if (model.hparams().n_expert > 0) {
+            // The experts as a matvec slot each, not grouped matmuls.
+            setenv("LOCUS_METAL_MOE_MM", "0", 1);
+            const auto slots = prefill("metal", false);
+            unsetenv("LOCUS_METAL_MOE_MM");
+            close(slots.first, cpu.first);
+            close(slots.second, cpu.second);
         }
     }
     if (ran == 0) {

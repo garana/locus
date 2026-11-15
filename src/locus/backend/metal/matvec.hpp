@@ -49,8 +49,8 @@ double matvec_repeat(const Mat& w, std::span<const float> x,
 /**
  * matvec_batch on the GPU (the Ops contract): w applied to n
  * token-major inputs, out row-major (out[r * n + t]). A matmul where
- * the type has one (Q4_K, Q6_K, Q8_0, F32, F16, BF16), else a matvec a
- * token in one batch; other types run the scalar CPU batch. Weights
+ * the type has one (record_matmul's), else a matvec a token in one
+ * batch; other types run the scalar CPU batch. Weights
  * go through matvec()'s cache, so the same lifetime rule holds.
  */
 void matvec_batch(const Mat& w, std::span<const float> x,
@@ -93,8 +93,9 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
  * once for a tile of 32 tokens. Token t of x starts at x_off + t *
  * x_stride (floats). The caller holds device_mutex().
  * @returns false, recording nothing, for a type without a matmul
- *     kernel (Q4_K, Q6_K, Q8_0, F32, F16, BF16) or columns that are
- *     not whole k stages: the caller loops record_matvec.
+ *     kernel (Q4_K, Q6_K, Q8_0, Q4_0, Q5_0, F32, F16, BF16) or
+ *     columns that are not whole k stages: the caller loops
+ *     record_matvec.
  */
 bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t cols, std::uint32_t n_tok,
@@ -103,6 +104,34 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t x_stride, const Context::Buffer& out,
                    std::uint64_t out_off, std::uint32_t out_stride,
                    bool accumulate);
+
+/** The tiles moe_tiles may write for n_slots slots of n_expert. */
+std::uint32_t moe_max_tiles(std::uint32_t n_slots, std::uint32_t n_expert);
+
+/**
+ * Records moe_tiles: the n_slots slots of route[0 .. n_slots) (expert
+ * ids) grouped by expert into idx (n_slots + 3 moe_max_tiles uints),
+ * for record_matmul_id. n_expert is at most 1024.
+ */
+void record_moe_tiles(Context& ctx, const Context::Buffer& route,
+                      std::uint32_t n_slots, std::uint32_t n_expert,
+                      const Context::Buffer& idx);
+
+/**
+ * The grouped matmul (MoE prefill): for each slot s of n_slots, out
+ * row s (out_stride floats apart) = expert route[s]'s matrix (at w_off
+ * + e * expert_bytes) times x row s / slot_div, each expert's weight
+ * rows read once for a tile of 32 of its slots. idx is
+ * record_moe_tiles' output.
+ * @returns false, recording nothing, where record_matmul would.
+ */
+bool record_matmul_id(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                      std::uint32_t cols, std::uint32_t n_slots,
+                      std::uint32_t n_expert, const Context::Buffer& w,
+                      std::uint64_t w_off, std::uint64_t expert_bytes,
+                      const Context::Buffer& x, std::uint32_t x_stride,
+                      std::uint32_t slot_div, const Context::Buffer& out,
+                      std::uint32_t out_stride, const Context::Buffer& idx);
 
 /**
  * record_matvec_routed for n_slots experts in one dispatch (MoE's k
