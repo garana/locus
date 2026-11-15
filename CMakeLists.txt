@@ -207,11 +207,24 @@ if(APPLE)
                  ${LOCUS_METAL_KERNELS_FILE})
     file(READ ${LOCUS_METAL_KERNELS_FILE} LOCUS_METAL_KERNELS)
     set(LOCUS_METAL_GEN ${CMAKE_BINARY_DIR}/generated/locus/backend/metal)
+    # Pieces of 32000 bytes: one literal over 65536 is past what
+    # -Woverlength-strings allows; context.mm joins them.
     set(LOCUS_METAL_SRC "#pragma once\n// kernels.metal, embedded by CMake.\n")
-    string(APPEND LOCUS_METAL_SRC "constexpr const char* kKernelSource =\n")
-    string(APPEND LOCUS_METAL_SRC "    R\"MSL(@LOCUS_METAL_KERNELS@)MSL\";\n")
-    file(CONFIGURE OUTPUT ${LOCUS_METAL_GEN}/kernels_src.hpp
-         CONTENT "${LOCUS_METAL_SRC}" @ONLY)
+    string(APPEND LOCUS_METAL_SRC "constexpr const char* kKernelParts[] = {\n")
+    string(LENGTH "${LOCUS_METAL_KERNELS}" LOCUS_METAL_LEN)
+    set(LOCUS_METAL_AT 0)
+    while(LOCUS_METAL_AT LESS LOCUS_METAL_LEN)
+        string(SUBSTRING "${LOCUS_METAL_KERNELS}" ${LOCUS_METAL_AT} 32000
+               LOCUS_METAL_PIECE)
+        string(APPEND LOCUS_METAL_SRC
+               "    R\"MSL(${LOCUS_METAL_PIECE})MSL\",\n")
+        math(EXPR LOCUS_METAL_AT "${LOCUS_METAL_AT} + 32000")
+    endwhile()
+    string(APPEND LOCUS_METAL_SRC "};\n")
+    # Written as is, and copied over only when it changed.
+    file(WRITE ${LOCUS_METAL_GEN}/kernels_src.hpp.new "${LOCUS_METAL_SRC}")
+    configure_file(${LOCUS_METAL_GEN}/kernels_src.hpp.new
+                   ${LOCUS_METAL_GEN}/kernels_src.hpp COPYONLY)
     target_include_directories(locus PRIVATE ${CMAKE_BINARY_DIR}/generated)
 else()
     target_sources(locus PRIVATE src/locus/backend/metal/context_stub.cpp)

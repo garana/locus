@@ -10,7 +10,7 @@
 #include <string>
 #include <unordered_map>
 
-// kKernelSource: kernels.metal, embedded by CMake.
+// kKernelParts: kernels.metal, embedded by CMake in pieces.
 #include "locus/backend/metal/kernels_src.hpp"
 
 namespace locus::backend::metal {
@@ -76,10 +76,14 @@ Context& Context::get() {
             }
             MTLCompileOptions* opt = [MTLCompileOptions new];
             opt.mathMode = MTLMathModeSafe;  // no fast-math reassociation
+            std::string src;
+            for (const char* piece : kKernelParts) {
+                src += piece;
+            }
             NSError* err = nil;
             id<MTLLibrary> lib = [impl->device
                 newLibraryWithSource:[NSString
-                                         stringWithUTF8String:kKernelSource]
+                                         stringWithUTF8String:src.c_str()]
                              options:opt
                                error:&err];
             if (lib == nil) {
