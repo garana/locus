@@ -182,6 +182,13 @@ on a thread that already runs a loop, such as a stage's `/metrics`
 whose chunks queue up to a byte bound (the producer waits, for at most
 the write deadline, while the socket lags); each call wakes the loop
 through a pipe, and a client that leaves cancels the reply.
+`http::LoopServer` (#931; `locus-server --event-loop`) serves the
+server's routes that way: one I/O thread owns every connection (the
+`allow` list and the per-address cap at accept, the fast-path routes
+answered on the loop), and a job pool runs the head stage and the
+handler, a stream through a `Sink` that blocks at the reply's queue
+bound. An idle or slow client then holds a buffer, not a thread.
+`http::Server` (a thread a connection) stays the default for now.
 
 `locus-router` (`router::Router`) proxies each request to one of
 several instances by kind: text, image-to-text (a chat, messages or

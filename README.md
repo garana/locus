@@ -227,7 +227,10 @@ tower). Tests tagged as heavy also need `LOCUS_HEAVY_TESTS=1`.
 The server listens on 127.0.0.1; `--host ADDR` picks an address and
 `--host '*'` every interface. `--auth-helper PATH` makes every request
 but `/health` need a key the helper allows (`locus-auth-helper` is a
-reference one). `locus-server --help` lists the options and environment
+reference one). `--event-loop` serves every connection from one I/O
+thread with the handlers on a job pool, so idle and slow clients hold
+no thread (a thread a connection otherwise). `locus-server --help`
+lists the options and environment
 variables;
 `--capabilities` lists the architectures, backends, weight formats
 and tokenizers of the build. Speech needs `--audio-decoder

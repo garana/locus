@@ -1507,6 +1507,58 @@ TEST_CASE("auth gates protected routes via a helper", "[server][e2e]") {
     th.join();
 }
 
+// i#931: the same routes on the event-loop server (http::LoopServer):
+// a completion gives the thread server's text, a chat stream ends in
+// [DONE], and the monitoring routes answer.
+TEST_CASE("the event-loop server serves the API as the thread server",
+          "[server][e2e][loop_server]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const json body = {{"prompt", "Once upon a time"}, {"max_tokens", 8}};
+    const auto complete = [&](bool loop) {
+        locus::server::OpenAiServer::Options opt;
+        opt.event_loop = loop;
+        TestServer ts(model, tok, opt);
+        httplib::Client c("127.0.0.1", ts.port);
+        auto r = c.Post("/v1/completions", body.dump(), "application/json");
+        REQUIRE(r);
+        REQUIRE(r->status == 200);
+        return json::parse(r->body)["choices"][0]["text"]
+            .get<std::string>();
+    };
+    CHECK(complete(true) == complete(false));
+
+    locus::server::OpenAiServer::Options opt;
+    opt.event_loop = true;
+    TestServer ts(model, tok, opt);
+    httplib::Client c("127.0.0.1", ts.port);
+    auto h = c.Get("/health");
+    REQUIRE(h);
+    CHECK(h->status == 200);
+    const json chat = {
+        {"messages", json::array({{{"role", "user"}, {"content", "Hi"}}})},
+        {"max_tokens", 4},
+        {"stream", true}};
+    auto s = c.Post("/v1/chat/completions", chat.dump(), "application/json");
+    REQUIRE(s);
+    CHECK(s->status == 200);
+    CHECK(s->body.find("data: [DONE]") != std::string::npos);
+    const json msg = {
+        {"messages", json::array({{{"role", "user"}, {"content", "Hi"}}})},
+        {"max_tokens", 4}};
+    auto m = c.Post("/v1/messages", msg.dump(), "application/json");
+    REQUIRE(m);
+    CHECK(m->status == 200);
+    auto mt = c.Get("/metrics");
+    REQUIRE(mt);
+    CHECK(mt->status == 200);
+    CHECK(mt->body.find("locus_requests_total") != std::string::npos);
+}
+
 TEST_CASE("metrics path is configurable", "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
         SKIP("model not present; run scripts/fetch-test-model.sh");

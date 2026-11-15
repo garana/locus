@@ -100,9 +100,33 @@ void LoopReply::end() {
     wake();
 }
 
+void LoopReply::fail() {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (cancelled_) return;  // wake_fd may be gone (see end())
+        if (state_ == State::kPending) {
+            Response r;
+            r.status = 500;
+            r.set_content(status_error_body(500), "application/json");
+            res_ = std::move(r);
+            state_ = State::kBuffered;
+        } else if (state_ == State::kStreaming) {
+            state_ = State::kFailed;
+        } else {
+            return;  // answered already
+        }
+    }
+    wake();
+}
+
 bool LoopReply::cancelled() const {
     std::lock_guard<std::mutex> lk(mu_);
     return cancelled_;
+}
+
+bool LoopReply::client_gone() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return cancelled_ || peer_closed_;
 }
 
 void LoopReply::cancel() {
@@ -256,6 +280,7 @@ void LoopConnection::take_reply() {
                 break;
             case LoopReply::State::kStreaming:
             case LoopReply::State::kEnded:
+            case LoopReply::State::kFailed:
                 if (!r.head_taken_) {
                     if (!write_chunked_head(r.res_, pending_keep_, out_,
                                             err)) {
@@ -276,6 +301,11 @@ void LoopConnection::take_reply() {
                 }
                 if (r.state_ == LoopReply::State::kEnded) {
                     if (!pending_head_) out_ += last_chunk();
+                    done = true;
+                } else if (r.state_ == LoopReply::State::kFailed) {
+                    // No terminating chunk: the client sees a truncated
+                    // transfer once the connection closes.
+                    close_after_ = true;
                     done = true;
                 }
                 break;
@@ -327,7 +357,9 @@ bool LoopConnection::pump() {
 LoopConnection::Next LoopConnection::next() const {
     if (abort_) return Next::kClose;
     if (!out_.empty()) return Next::kWrite;
-    if (pending_) return Next::kRead;  // the reply comes by on_wake()
+    // The reply comes by on_wake(); after EOF the socket stays readable,
+    // so watch nothing until then.
+    if (pending_) return peer_gone_ ? Next::kIdle : Next::kRead;
     if (close_after_ || peer_gone_) return Next::kClose;
     return Next::kRead;
 }
@@ -338,12 +370,18 @@ LoopConnection::Next LoopConnection::on_event(const sys::Poller::Event& ev) {
         if (!fill()) peer_gone_ = true;
     }
     if (pending_) {
-        // EOF while the answer is pending: the client is gone (as
-        // http::Server's probe reads it), so its producer stops. Input
-        // at the cap can no longer be read, and a level-triggered
-        // readable socket would spin: close that client too.
-        if (peer_gone_ || in_.size() >= input_cap(cfg_.limits)) {
+        // Input at the cap can no longer be read, and a level-triggered
+        // readable socket would spin: close that client.
+        if (in_.size() >= input_cap(cfg_.limits)) {
             return Next::kClose;  // the destructor cancels the reply
+        }
+        // EOF while the answer is pending: the client has left (as
+        // http::Server's probe reads it), so a long producer stops; the
+        // answer it gives (a 499, say) is still written, then the
+        // connection closes.
+        if (peer_gone_) {
+            std::lock_guard<std::mutex> lk(pending_->mu_);
+            pending_->peer_closed_ = true;
         }
     }
     if (!pump()) return Next::kClose;

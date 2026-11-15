@@ -26,6 +26,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/http/base64.hpp"
 #include "locus/http/json_body.hpp"
+#include "locus/http/loop_server.hpp"
 #include "locus/backend/fallbacks.hpp"
 #include "locus/backend/gpu_metrics.hpp"
 #include "locus/backend/registry.hpp"
@@ -1749,8 +1750,13 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
             "/v1/classify", "/v1/audio/speech",
             "/v1/images/generations", "/v1/images/edits"});
     cfg.metrics = http_metrics_;
-    http_ = std::make_unique<http::Server>(std::move(cfg), route_handler_,
-                                           auth_head_);
+    if (opt_.event_loop) {
+        http_ = std::make_unique<http::LoopServer>(std::move(cfg),
+                                                   route_handler_, auth_head_);
+    } else {
+        http_ = std::make_unique<http::Server>(std::move(cfg), route_handler_,
+                                               auth_head_);
+    }
     return http_->start();
 }
 

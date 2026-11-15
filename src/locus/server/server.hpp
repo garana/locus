@@ -184,6 +184,10 @@ class OpenAiServer {
         /** Open connections one client address may hold (i#625 F21;
          *  http::ServerConfig::max_conns_per_ip). 0 = no cap. */
         std::size_t max_conns_per_ip = 0;
+        /** Serve on the event loop (http::LoopServer, i#931): one I/O
+         *  thread for every connection, handlers on a job pool; false:
+         *  http::Server's thread a connection. */
+        bool event_loop = false;
         auth::AuthConfig auth_cache;
         /** Prompt caching (KV prefix reuse) -- on by default. A
          * request sharing a block-aligned prompt prefix with a recent
@@ -292,7 +296,7 @@ class OpenAiServer {
     EngineGroup loop_;
     http::Handler route_handler_;    /**< dispatch (built in ctor). */
     http::HeadHandler auth_head_;    /**< auth head stage (built in ctor). */
-    std::unique_ptr<http::Server> http_;
+    std::unique_ptr<http::Service> http_;
     /** Per-route request metrics (i#285), shared with http_. */
     std::shared_ptr<http::HttpMetrics> http_metrics_;
     std::uint32_t n_vocab_ = 0;
