@@ -118,6 +118,24 @@ void EngineGroup::cancel(std::uint64_t id) {
     loop_of(id).cancel(local_id(id));
 }
 
+void EngineGroup::follow(std::uint64_t id) {
+    loop_of(id).follow(local_id(id));
+}
+
+bool EngineGroup::take(std::uint64_t id, EngineLoop::View& acc) {
+    return loop_of(id).take(local_id(id), acc);
+}
+
+void EngineGroup::unfollow(std::uint64_t id) {
+    loop_of(id).unfollow(local_id(id));
+}
+
+void EngineGroup::set_progress_hook(const std::function<void()>& hook) {
+    for (const auto& l : loops_) {
+        l->set_progress_hook(hook);
+    }
+}
+
 void EngineGroup::release(std::uint64_t id) {
     // EngineLoop::release keeps a request that is not terminal, so the
     // group keeps counting it then (a later release drops it).

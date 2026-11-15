@@ -158,7 +158,9 @@ nlohmann/json for untrusted request bodies: hand-rolled JSON parsing
 is where API vulnerabilities come from. A worker thread drives
 `Engine::step()`; handler threads submit and wait (`EngineLoop`),
 asleep until the worker publishes their request's progress after a
-step.
+step. A followed request (`follow`, #989) also gets its new tokens
+queued after each step, for `take()` to collect without the engine
+mutex, and a progress hook to wake whoever drives it.
 Chat messages are formatted by `chat::ChatTemplate`: the GGUF's
 Jinja source is fingerprinted to a known family (llama3, chatml,
 llama2, zephyr, deepseek, deepseek2, deepseek-coder) and rendered by
