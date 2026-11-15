@@ -3,8 +3,10 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -12,6 +14,7 @@
 #include <vector>
 
 #include "locus/engine/engine.hpp"
+#include "locus/sys/thread_pool.hpp"
 
 namespace locus::server {
 
@@ -38,8 +41,25 @@ class EngineLoop {
         std::uint32_t cached_prefix_tokens = 0;
     };
 
+    /** How the worker thread runs (i#929), for one of several engines
+     *  over one model. The default is one engine on the process's
+     *  device and thread pool. */
+    struct Setup {
+        /** Runs first on the worker thread (e.g. binds it to the
+         *  Vulkan device the engine's KV pool was made on). */
+        std::function<void()> thread_init;
+        /** > 0: the worker's forwards fan out to a pool of its own
+         *  with this many threads, the worker included; 0: the
+         *  process pool. */
+        std::size_t threads = 0;
+    };
+
+    /**
+     * Makes the engine (and its KV pool) on the calling thread, then
+     * starts the worker.
+     */
     EngineLoop(const model::TransformerModel& m, tok::TokenId eos,
-               engine::Engine::Config cfg);
+               engine::Engine::Config cfg, Setup setup = {});
     ~EngineLoop();
 
     EngineLoop(const EngineLoop&) = delete;
@@ -97,8 +117,10 @@ class EngineLoop {
 
     /** Drops a finished request's record once its result has been
      * delivered to the client (evict-on-consume); no-op if it is not
-     * terminal. Call once, after the last view/wait_done for the id. */
-    void release(std::uint64_t id);
+     * terminal. Call once, after the last view/wait_done for the id.
+     * @returns Whether the request is gone now (terminal, or unknown):
+     *     false when it was still running and was kept. */
+    bool release(std::uint64_t id);
 
     /** Engine gauges for /metrics (snapshotted under the mutex). */
     struct Stats {
@@ -170,6 +192,9 @@ class EngineLoop {
     engine::Engine engine_;
     kv::KvType kv_type_;
     bool stop_ = false;
+    // Before worker_, which reads them as it starts.
+    std::function<void()> thread_init_;
+    std::unique_ptr<sys::ThreadPool> pool_;
     std::thread worker_;
 };
 

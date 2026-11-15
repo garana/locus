@@ -14,6 +14,7 @@
 #include "locus/http/server.hpp"
 #include "locus/model/grammar_constraint.hpp"
 #include "locus/model/transformer.hpp"
+#include "locus/server/engine_group.hpp"
 #include "locus/server/engine_loop.hpp"
 #include "locus/tok/tokenizer.hpp"
 #include "locus/video/ffmpeg.hpp"
@@ -85,6 +86,13 @@ class OpenAiServer {
          * locus_info series (empty when unknown). */
         std::string model_arch;
         engine::Engine::Config engine;
+        /** Engines serving the language model (i#929), each with its
+         *  own KV pool of `engine.n_blocks`; a request stays on one. */
+        std::uint32_t engines = 1;
+        /** One Vulkan device per engine, or empty: then the engines
+         *  share the CPU cores (or one engine runs on the process's
+         *  device). */
+        std::vector<int> engine_devices;
         /** Hard cap applied to requested max_tokens. */
         std::uint32_t max_tokens_cap = 1024;
         /** Max HTTP request body accepted before the handler runs;
@@ -216,6 +224,11 @@ class OpenAiServer {
     /** Engine config with prompt caching resolved from Options:
      * prefix_cache = engine.prefix_cache || prompt_cache. */
     static engine::Engine::Config resolve_engine_cfg(const Options& o);
+    /** The engines' slots from o.engines and o.engine_devices.
+     *  @throws std::invalid_argument for a combination that cannot
+     *      run (several engines with a disk prefix cache, a device
+     *      count other than the engine count). */
+    static std::vector<EngineGroup::Slot> engine_slots(const Options& o);
     /** Which endpoint a (method, path) hits. One home for routing, used
      * by both the dispatch handler and the auth head stage. */
     enum class Route {
@@ -276,7 +289,7 @@ class OpenAiServer {
     const model::TransformerModel& model_;
     const tok::Tokenizer& tok_;
     Options opt_;
-    EngineLoop loop_;
+    EngineGroup loop_;
     http::Handler route_handler_;    /**< dispatch (built in ctor). */
     http::HeadHandler auth_head_;    /**< auth head stage (built in ctor). */
     std::unique_ptr<http::Server> http_;
