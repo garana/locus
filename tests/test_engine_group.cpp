@@ -208,7 +208,7 @@ TEST_CASE("the generation pump visits only the requests that changed",
                                 "text/plain");
             };
             locus::http::Deferred d{
-                r, [&done](int, std::uint64_t) { done.fetch_add(1); }};
+                r, [&done](int, std::uint64_t) { done.fetch_add(1); }, {}};
             pump.add(group.submit(prompt, kTokens), std::move(gr),
                      std::move(d), locus::http::Response{});
         }
