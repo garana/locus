@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 
+#include "locus/backend/accelerate.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_forward.hpp"
 #include "locus/model/arch.hpp"
@@ -1176,6 +1177,11 @@ std::uint32_t TransformerModel::prefill_chunk() const {
     const bool gpu = backend_->name == "vulkan" ||
                      (backend_->name == "metal" && metal_forward_supported());
     if (!gpu) {
+        // Accelerate's sgemm dequantizes every weight a call (i#782); it
+        // takes the CPU backends' matmuls only (matvec_batch).
+        if (!backend_->ops.self_parallel && backend::sgemm_prefill_on()) {
+            return backend::kSgemmPrefillChunk;
+        }
         // A batched custom layer over many experts (kolibri1: 384, 6 a
         // token) groups each chunk's picks per expert: at 64 tokens an
         // expert gets one or two, so it takes a bigger chunk (i#739).
@@ -2079,6 +2085,10 @@ void TransformerModel::forward_batch_layers(
 namespace {
 
 /** Cached LOCUS_BATCH_DEQUANT toggle (read once). */
+/** Tokens a CPU batch needs before Accelerate's sgemm takes it under
+ *  LOCUS_CPU_FAST (i#782); smaller batches stay on the CPU kernels. */
+constexpr std::uint32_t kSgemmMinTokens = 32;
+
 bool batch_dequant_enabled() {
     static const bool on =
         std::getenv("LOCUS_BATCH_DEQUANT") != nullptr;
@@ -2148,6 +2158,14 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
     // types.
     const std::uint32_t xc = w.cols;
     const std::uint32_t oc = w.rows;
+    // i#782: under LOCUS_CPU_FAST, on Apple, a CPU batch of at least
+    // kSgemmMinTokens goes to Accelerate's sgemm instead: its own sum
+    // order on F32 activations, so not the bits of the kernels below.
+    if (n >= kSgemmMinTokens && !op.self_parallel &&
+        backend::sgemm_prefill_on() &&
+        backend::sgemm_batch(w, x_batch, out_batch, n)) {
+        return;
+    }
     if (op.matvec_q8k != nullptr &&
         backend::uses_quantized_activation(w.type)) {
         if (op.matvec_q8k_batch != nullptr && !op.self_parallel) {
