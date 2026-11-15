@@ -388,6 +388,36 @@ float dsa_index_score(std::span<const float> q,
     return score;
 }
 
+const backend::Backend& TransformerModel::use_backend_for(
+    std::string_view choice, kv::KvType kv_type) {
+    if (!backend::backend_defaulted(choice)) {
+        const backend::Backend& b = backend::resolve_backend(choice);
+        use_backend(b);
+        return b;
+    }
+    const auto usable = [](const backend::Backend* b) {
+        return b != nullptr && b->available && b->selectable;
+    };
+    const backend::Backend* mt = backend::find_backend("metal");
+    if (usable(mt)) {
+        if (kv_type == kv::KvType::kF32) {
+            use_backend(*mt);  // metal_forward_supported reads it
+            if (metal_forward_supported()) {
+                return *mt;
+            }
+        }
+        // Not Metal's per-op path: Vulkan, where it is usable.
+        if (const backend::Backend* vk = backend::find_backend("vulkan");
+            usable(vk)) {
+            use_backend(*vk);
+            return *vk;
+        }
+    }
+    const backend::Backend& b = backend::best_backend();
+    use_backend(b);
+    return b;
+}
+
 TransformerModel TransformerModel::load(const GgufFile& g,
                             std::uint32_t layer_begin,
                             std::uint32_t layer_end) {

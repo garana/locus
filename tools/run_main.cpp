@@ -143,9 +143,8 @@ int main(int argc, char** argv) {
         }
         auto g = locus::gguf::GgufFile::open(model_path);
         auto model = locus::model::TransformerModel::load(g);
-        const auto& backend =
-            locus::backend::resolve_backend(args.choice);
-        model.use_backend(backend);
+        // On Apple the default follows the model (i#867).
+        const auto& backend = model.use_backend_for(args.choice, args.kv_type);
         locus::backend::vulkan_set_prefill_f16(args.prefill_f16);
         auto tok_ptr = locus::tok::tokenizer_from_gguf(g);
         auto& tok = *tok_ptr;
