@@ -206,11 +206,20 @@ void encode(const Message& m, std::string& out) {
 }
 
 Decode decode(std::string& buf, Message& out, std::string& err) {
+    return decode(buf, out, err,
+                  (kMaxFrameBytes - kHeaderBytes) / sizeof(float));
+}
+
+Decode decode(std::string& buf, Message& out, std::string& err,
+              std::uint32_t max_floats) {
+    const std::uint64_t cap = std::min<std::uint64_t>(
+        kMaxFrameBytes,
+        kHeaderBytes + std::uint64_t{max_floats} * sizeof(float));
     if (buf.size() < 4) {
         return Decode::kIncomplete;
     }
     const std::uint32_t frame_len = get_u32(buf.data());
-    if (frame_len < kHeaderBytes || frame_len > kMaxFrameBytes) {
+    if (frame_len < kHeaderBytes || frame_len > cap) {
         err = "pipeline: bad frame length";
         return Decode::kError;
     }
