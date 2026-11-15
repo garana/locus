@@ -91,7 +91,8 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
  * Records out[out_off + t * out_stride + r] (+)= dot(row r, x token t)
  * for r < rows and t < n_tok: the prefill matmul, each weight row read
  * once for a tile of 32 tokens. Token t of x starts at x_off + t *
- * x_stride (floats). The caller holds device_mutex().
+ * x_stride (floats); the products are times scale. The caller holds
+ * device_mutex().
  * @returns false, recording nothing, for a type without a matmul
  *     kernel (Q4_K, Q6_K, Q8_0, Q4_0, Q5_0, F32, F16, BF16) or
  *     columns that are not whole k stages: the caller loops
@@ -103,7 +104,15 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    const Context::Buffer& x, std::uint64_t x_off,
                    std::uint32_t x_stride, const Context::Buffer& out,
                    std::uint64_t out_off, std::uint32_t out_stride,
-                   bool accumulate);
+                   bool accumulate, float scale = 1.0f);
+
+/**
+ * The device copy of w, from the matvec weight cache (uploaded on
+ * first use, keyed by its address and a fingerprint of its bytes). The
+ * caller holds device_mutex(); the buffer lives until drop_weights().
+ * @throws std::invalid_argument for a type without a matvec kernel.
+ */
+const Context::Buffer& cached_weight(Context& ctx, const Mat& w);
 
 /** The tiles moe_tiles may write for n_slots slots of n_expert. */
 std::uint32_t moe_max_tiles(std::uint32_t n_slots, std::uint32_t n_expert);

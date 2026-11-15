@@ -7,6 +7,8 @@
 #include <string>
 #include <thread>
 
+#include "locus/backend/metal/matvec.hpp"
+#include "locus/backend/metal/seq.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
@@ -190,9 +192,15 @@ std::vector<float> JanusVision::features(std::span<const float> chw,
     if (chw.size() != std::size_t{3} * image_ * image_) {
         throw std::invalid_argument("janus vision: need 3 x size x size");
     }
-    if (&op == &backend::vulkan_image_ops() &&
-        backend::VulkanSeq::available()) {
-        return features_vulkan(chw);
+    const bool vk = &op == &backend::vulkan_image_ops() &&
+                    backend::VulkanSeq::available();
+    const bool mt = &op == &backend::metal::image_ops() &&
+                    backend::metal::Seq::available();
+    if (vk) {
+        return features_gpu<backend::VulkanSeq>(chw);
+    }
+    if (mt) {
+        return features_gpu<backend::metal::Seq>(chw);
     }
     // Patch embed: [w][grid][grid] -> token-major [n][w], plus positions.
     std::vector<float> conv(std::size_t{w} * n);
