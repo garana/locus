@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include "locus/backend/metal/context.hpp"
+#include "locus/backend/registry.hpp"
 
 namespace locus::backend::metal {
 
@@ -32,6 +33,8 @@ Kind kind_of(TensorType t) {
             return {"mv_f32", 4, 16};
         case TensorType::kF16:
             return {"mv_f16", 4, 8};
+        case TensorType::kBF16:
+            return {"mv_bf16", 4, 8};
         case TensorType::kQ8_0:
             return {"mv_q8_0", 32, 34};
         case TensorType::kQ4_0:
@@ -174,11 +177,17 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t x_stride, const Context::Buffer& out,
                    std::uint64_t out_off, std::uint32_t out_stride,
                    bool accumulate) {
-    const char* kernel = t == gguf::TensorType::kQ4_K   ? "mm_q4_k"
-                         : t == gguf::TensorType::kQ6_K ? "mm_q6_k"
-                         : t == gguf::TensorType::kQ8_0 ? "mm_q8_0"
-                                                        : nullptr;
-    const std::uint32_t block = t == gguf::TensorType::kQ8_0 ? 32 : 256;
+    using TT = gguf::TensorType;
+    const char* kernel = t == TT::kQ4_K   ? "mm_q4_k"
+                         : t == TT::kQ6_K ? "mm_q6_k"
+                         : t == TT::kQ8_0 ? "mm_q8_0"
+                         : t == TT::kF32  ? "mm_f32"
+                         : t == TT::kF16  ? "mm_f16"
+                         : t == TT::kBF16 ? "mm_bf16"
+                                          : nullptr;
+    // A k stage is 32 columns: the K-quants need whole 256-blocks.
+    const std::uint32_t block =
+        t == TT::kQ4_K || t == TT::kQ6_K ? 256 : 32;
     if (kernel == nullptr || cols % block != 0 || n_tok == 0) {
         return false;
     }
@@ -239,6 +248,69 @@ double matvec_repeat(const Mat& w, std::span<const float> x,
     std::memcpy(out.data(), state().out.data, out.size_bytes());
     return std::chrono::duration<double, std::milli>(t1 - t0).count() /
            reps;
+}
+
+void matvec_batch(const Mat& w, std::span<const float> x,
+                  std::span<float> out, std::uint32_t n) {
+    if (n == 0) {
+        return;
+    }
+    if (x.size() < std::size_t{n} * w.cols ||
+        out.size() < std::size_t{n} * w.rows) {
+        throw std::invalid_argument("metal matvec_batch: span sizes");
+    }
+    const Kind k = kind_of(w.type);
+    if (k.kernel == nullptr || w.cols % k.block != 0 || w.cols % 4 != 0) {
+        matvec_batch_scalar(w, x, out, n);  // no kernel for this type
+        return;
+    }
+    std::lock_guard lk(device_mutex());
+    Context& ctx = Context::get();
+    State& s = state();
+    grow(ctx, s.x, std::size_t{n} * w.cols * 4);
+    grow(ctx, s.out, std::size_t{n} * w.rows * 4);
+    std::memcpy(s.x.data, x.data(), std::size_t{n} * w.cols * 4);
+    const Context::Buffer& wb = weight(ctx, w, k);
+    ctx.begin_batch();
+    try {
+        // The matmul where the type has one, else a matvec a token.
+        if (!record_matmul(ctx, w.type, w.rows, w.cols, n, wb, 0, s.x, 0,
+                           w.cols, s.out, 0, w.rows, false)) {
+            for (std::uint32_t t = 0; t < n; ++t) {
+                if (t > 0) {
+                    ctx.overlap_next();
+                }
+                record_matvec(ctx, w.type, w.rows, w.cols, wb, 0, s.x,
+                              t * w.cols, s.out, std::uint64_t{t} * w.rows,
+                              false);
+            }
+        }
+    } catch (...) {
+        ctx.end_batch();
+        throw;
+    }
+    ctx.end_batch();
+    // Token-major on the GPU; the Ops contract is row-major.
+    const auto* tok = static_cast<const float*>(s.out.data);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            out[std::size_t{r} * n + t] = tok[std::size_t{t} * w.rows + r];
+        }
+    }
+}
+
+const Ops& image_ops() {
+    static const Ops ops{.matvec = &matvec,
+                         .dequant_row = &dequant_row,
+                         .matvec_batch = &matvec_batch,
+                         .self_parallel = true,
+                         .alloc_kv = nullptr,
+                         .free_kv = nullptr,
+                         .prefetch = nullptr,
+                         .evict = nullptr,
+                         .pool_budget = nullptr,
+                         .mt_safe = false};
+    return ops;
 }
 
 void drop_weights() {
