@@ -257,8 +257,25 @@ struct MmParams {
     std::uint64_t w_off, x_off, out_off;
     std::uint32_t rows, cols, n_tok, x_stride, out_stride, accumulate;
     float scale;
-    std::uint32_t row_tiles;
+    std::uint32_t row_tiles, slot_div;
+    std::uint64_t expert_bytes;
 };
+
+/** The matmul kernel for a type ("" for none) and its k-stage block. */
+std::pair<std::string, std::uint32_t> mm_kernel(gguf::TensorType t) {
+    using TT = gguf::TensorType;
+    const char* k = t == TT::kQ4_K   ? "mm_q4_k"
+                    : t == TT::kQ6_K ? "mm_q6_k"
+                    : t == TT::kQ8_0 ? "mm_q8_0"
+                    : t == TT::kQ4_0 ? "mm_q4_0"
+                    : t == TT::kQ5_0 ? "mm_q5_0"
+                    : t == TT::kF32  ? "mm_f32"
+                    : t == TT::kF16  ? "mm_f16"
+                    : t == TT::kBF16 ? "mm_bf16"
+                                     : "";
+    // A k stage is 32 columns: the K-quants need whole 256-blocks.
+    return {k, t == TT::kQ4_K || t == TT::kQ6_K ? 256u : 32u};
+}
 
 }  // namespace
 
@@ -269,18 +286,8 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t x_stride, const Context::Buffer& out,
                    std::uint64_t out_off, std::uint32_t out_stride,
                    bool accumulate) {
-    using TT = gguf::TensorType;
-    const char* kernel = t == TT::kQ4_K   ? "mm_q4_k"
-                         : t == TT::kQ6_K ? "mm_q6_k"
-                         : t == TT::kQ8_0 ? "mm_q8_0"
-                         : t == TT::kF32  ? "mm_f32"
-                         : t == TT::kF16  ? "mm_f16"
-                         : t == TT::kBF16 ? "mm_bf16"
-                                          : nullptr;
-    // A k stage is 32 columns: the K-quants need whole 256-blocks.
-    const std::uint32_t block =
-        t == TT::kQ4_K || t == TT::kQ6_K ? 256 : 32;
-    if (kernel == nullptr || cols % block != 0 || n_tok == 0) {
+    const auto [kernel, block] = mm_kernel(t);
+    if (kernel.empty() || cols % block != 0 || n_tok == 0) {
         return false;
     }
     const std::uint32_t row_tiles = (rows + 63) / 64;
@@ -288,10 +295,49 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
     const MmParams p{w_off,    x_off,      out_off,
                      rows,     cols,       n_tok,
                      x_stride, out_stride, accumulate ? 1u : 0u,
-                     1.0f,     row_tiles};
+                     1.0f,     row_tiles,  1,
+                     0};
     const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
-    ctx.dispatch(kernel, args, std::as_bytes(std::span(&p, 1)),
+    ctx.dispatch(kernel.c_str(), args, std::as_bytes(std::span(&p, 1)),
                  row_tiles * tok_tiles * 128, 128);
+    return true;
+}
+
+std::uint32_t moe_max_tiles(std::uint32_t n_slots, std::uint32_t n_expert) {
+    return n_slots / 32 + n_expert;
+}
+
+void record_moe_tiles(Context& ctx, const Context::Buffer& route,
+                      std::uint32_t n_slots, std::uint32_t n_expert,
+                      const Context::Buffer& idx) {
+    const std::uint32_t p[] = {n_slots, n_expert,
+                               moe_max_tiles(n_slots, n_expert)};
+    const Context::Arg args[] = {{&route, 0}, {&idx, 0}};
+    ctx.dispatch("moe_tiles", args, std::as_bytes(std::span(p)), 1024, 1024);
+}
+
+bool record_matmul_id(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                      std::uint32_t cols, std::uint32_t n_slots,
+                      std::uint32_t n_expert, const Context::Buffer& w,
+                      std::uint64_t w_off, std::uint64_t expert_bytes,
+                      const Context::Buffer& x, std::uint32_t x_stride,
+                      std::uint32_t slot_div, const Context::Buffer& out,
+                      std::uint32_t out_stride, const Context::Buffer& idx) {
+    const auto [kernel, block] = mm_kernel(t);
+    if (kernel.empty() || cols % block != 0 || n_slots == 0 ||
+        slot_div == 0) {
+        return false;
+    }
+    const std::uint32_t row_tiles = (rows + 63) / 64;
+    const MmParams p{w_off,    0,          0,
+                     rows,     cols,       n_slots,
+                     x_stride, out_stride, 0,
+                     1.0f,     row_tiles,  slot_div,
+                     expert_bytes};
+    const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}, {&idx, 0, 4}};
+    ctx.dispatch((kernel + "_id").c_str(), args,
+                 std::as_bytes(std::span(&p, 1)),
+                 row_tiles * moe_max_tiles(n_slots, n_expert) * 128, 128);
     return true;
 }
 
