@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -140,7 +143,14 @@ TEST_CASE("two CPU engines: a followed request on each is taken whole",
 
     EngineGroup group(model, tok.eos_id(), {}, EngineGroup::plan(2, {}));
     std::atomic<int> calls{0};
-    group.set_progress_hook([&calls] { calls.fetch_add(1); });
+    // The hook gets group ids (i#1005): the ids submit returned.
+    std::mutex seen_mu;
+    std::set<std::uint64_t> seen;
+    group.set_progress_hook([&](std::span<const std::uint64_t> got) {
+        calls.fetch_add(1);
+        std::lock_guard<std::mutex> lk(seen_mu);
+        seen.insert(got.begin(), got.end());
+    });
     std::vector<std::uint64_t> ids;
     for (const auto& p : prompts) {
         ids.push_back(group.submit(p, 12));
@@ -159,6 +169,60 @@ TEST_CASE("two CPU engines: a followed request on each is taken whole",
         group.release(ids[i]);
     }
     CHECK(calls.load() > 0);
+    group.set_progress_hook({});
+    CHECK(seen == std::set<std::uint64_t>(ids.begin(), ids.end()));
+}
+
+// i#1005: the pump looks only at the entries with news. One engine
+// runs one request at a time (max_running 1), so of 40 buffered
+// generations one makes progress per step and the rest wait; the
+// pump's visits then grow with the tokens, not with tokens x entries
+// (before, every wake visited every live entry: about 40 x 20 x 9).
+TEST_CASE("the generation pump visits only the requests that changed",
+          "[engine_group][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::engine::Engine::Config cfg;
+    cfg.max_running = 1;
+    const locus::tok::TokenId never = model.hparams().n_vocab;
+    EngineGroup group(model, never, cfg, EngineGroup::plan(1, {}));
+    constexpr int kN = 40;
+    constexpr std::uint32_t kTokens = 8;
+    std::atomic<int> done{0};
+    std::vector<std::shared_ptr<locus::http::LoopReply>> replies;
+    {
+        locus::server::GenPump pump(group, std::chrono::milliseconds(0));
+        const auto prompt = tok.encode("Once upon a time", true);
+        for (int i = 0; i < kN; ++i) {
+            auto r = std::make_shared<locus::http::LoopReply>(-1, 1 << 20,
+                                                              10000);
+            replies.push_back(r);
+            locus::server::GenReply gr;
+            gr.finish = [](const EngineLoop::View& v,
+                           locus::http::ServerResponse& res) {
+                res.set_content(std::to_string(v.generated.size()),
+                                "text/plain");
+            };
+            locus::http::Deferred d{
+                r, [&done](int, std::uint64_t) { done.fetch_add(1); }, {}};
+            pump.add(group.submit(prompt, kTokens), std::move(gr),
+                     std::move(d), locus::http::Response{});
+        }
+        const auto until =
+            std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (done.load() < kN && std::chrono::steady_clock::now() < until) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        REQUIRE(done.load() == kN);
+        const std::uint64_t visits = pump.visits();
+        INFO("visits=" << visits);
+        // Per request: its first look, about one per token, its end.
+        CHECK(visits <= std::uint64_t{kN} * (kTokens + 4));
+    }
 }
 
 // i#980 on the event loop: a stream whose step throws after its head

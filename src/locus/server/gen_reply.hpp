@@ -1,13 +1,16 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "locus/http/http.hpp"
@@ -89,7 +92,10 @@ void serve_generation(EngineGroup& loop, std::uint64_t id, GenReply gr,
  * - A cancelled reply (the client left) cancels the generation; a
  *   buffered one also cancels when the client half-closes (EOF while
  *   pending), as the thread path's liveness probe does.
- * - Every 20 ms it also looks for those and for due keepalives.
+ * - It looks only at the entries with news (i#1005): the requests the
+ *   progress hook names, the replies that call back (LoopReply's
+ *   set_notify: queue taken, cancelled, half-closed) and the streams
+ *   whose keepalive is due (a min-heap); no tick.
  */
 class GenPump {
   public:
@@ -110,7 +116,12 @@ class GenPump {
      *  (idempotent). */
     void stop();
 
+    /** @returns How many times the pump has looked at an entry (tests:
+     *  the work per engine step must not grow with idle entries). */
+    std::uint64_t visits() const { return visits_.load(); }
+
   private:
+    using Clock = std::chrono::steady_clock;
     struct Entry {
         std::uint64_t id = 0;
         GenReply gr;
@@ -122,21 +133,33 @@ class GenPump {
         SseKeepalive ka;
         std::uint64_t bytes = 0;
         bool cancelled = false;
+        /** The time of its live keepalives_ entry (max: none). */
+        Clock::time_point ka_at = Clock::time_point::max();
     };
+    using Due = std::pair<Clock::time_point, std::uint64_t>;
 
     void run();
     /** One pass over e. @returns Whether e is finished. */
     bool pump(Entry& e);
     /** Ends e: cancels and releases its request, and records it. */
     void drop(Entry& e, int status);
+    /** Marks entry id for a look and wakes the thread (any thread). */
+    void mark(std::uint64_t id);
+    /** Queues e's next keepalive when it is sooner than its live entry
+     *  (pump thread). */
+    void arm(Entry& e);
 
     EngineGroup& loop_;
     std::chrono::milliseconds keepalive_;
     std::mutex mu_;
     std::condition_variable cv_;
     bool stop_ = false;
-    bool woke_ = false;
     std::vector<std::unique_ptr<Entry>> incoming_;
+    /** Entry ids with news: from the hook and the replies (under mu_). */
+    std::vector<std::uint64_t> ready_;
+    /** Due keepalives (pump thread only); stale entries are skipped. */
+    std::priority_queue<Due, std::vector<Due>, std::greater<Due>> keepalives_;
+    std::atomic<std::uint64_t> visits_{0};
     std::thread thread_;
 };
 

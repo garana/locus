@@ -131,6 +131,14 @@ class LoopReply {
     /** @returns Whether write() would queue at once: the stream's queue
      *  is under its bound (i#932, for a producer that must not block). */
     bool has_room() const;
+    /**
+     * Sets a callback the loop runs when the producer has something to
+     * look at (i#1005): the queue was taken (room again), the reply was
+     * cancelled, or the client half-closed. It runs with the reply's
+     * mutex held, so it must not call into this reply; after
+     * set_notify({}) returns it runs no more.
+     */
+    void set_notify(std::function<void()> f);
 
   private:
     friend class LoopConnection;
@@ -150,6 +158,7 @@ class LoopReply {
     State state_ = State::kPending;
     bool cancelled_ = false;
     bool peer_closed_ = false;  /**< EOF while pending (client_gone). */
+    std::function<void()> notify_;  /**< set_notify; called under mu_. */
     bool head_taken_ = false;  /**< the loop wrote the stream's head. */
     Response res_;             /**< the buffered response, or the head. */
     std::string chunks_;       /**< encoded chunks the loop has not taken. */
