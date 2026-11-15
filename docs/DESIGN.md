@@ -1076,8 +1076,11 @@ latency added.
 engine, KV pool and worker over the one loaded model, on its own
 Vulkan device (its pool made with the caller bound there, its worker
 bound to it) or its own share of the CPU cores
-(`sys::ThreadPool::share_threads`, as the stage executors). A request
-goes to the engine with the fewest unreleased requests and stays
+(`sys::ThreadPool::share_threads`, as the stage executors). Each engine
+has its own prefix cache, so a request goes to the engine that last
+served a prompt with the same first 16 tokens, unless that engine has
+more than one unreleased request over the least-loaded one; otherwise
+(and for a shorter prompt) to the least-loaded engine (#940). It stays
 there; its id is `local * engines + engine`, so one engine keeps
 today's ids. `/metrics` sums the engines. The disk prefix tier serves
 one engine only; CUDA serves one engine (#924).
