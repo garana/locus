@@ -112,7 +112,8 @@ bool TransformerModel::metal_forward_supported() const {
         return e != nullptr && std::string_view(e) == "0";
     }();
     if (off || backend_->name != "metal" || !spec_->plain_attention ||
-        layer_begin_ != 0 ||
+        hp_.custom_layer || spec_->layer != nullptr ||
+        spec_->forward != nullptr || layer_begin_ != 0 ||
         layer_end_ != hp_.n_layers || hp_.norm_type != NormType::kRmsNorm ||
         hp_.embd_norm || hp_.n_kv_heads == 0 || out_w_.rows != hp_.n_vocab ||
         hp_.head_dim % 4 != 0 || hp_.n_heads % hp_.n_kv_heads != 0 ||
@@ -124,8 +125,9 @@ bool TransformerModel::metal_forward_supported() const {
     };
     for (const Layer& lay : layers_) {
         if (lay.is_moe() || !lay.has_separate_qkv(hp_) ||
-            lay.has_qkv_bias() || lay.has_qk_norm() || !ok_w(lay.wq) ||
-            !ok_w(lay.wk) || !ok_w(lay.wv) || !ok_w(lay.wo) ||
+            lay.has_qkv_bias() || lay.has_qk_norm() ||
+            !lay.post_attn_norm.empty() || !lay.post_ffw_norm.empty() ||
+            !ok_w(lay.wq) || !ok_w(lay.wk) || !ok_w(lay.wv) || !ok_w(lay.wo) ||
             !ok_w(lay.w_gate) || !ok_w(lay.w_up) || !ok_w(lay.w_down)) {
             return false;
         }
