@@ -161,6 +161,14 @@ void record(Context& ctx, const Mat& w, const Kind& k) {
 
 }  // namespace
 
+const Context::Buffer& cached_weight(Context& ctx, const Mat& w) {
+    const Kind k = kind_of(w.type);
+    if (k.kernel == nullptr) {
+        throw std::invalid_argument("metal cached_weight: no kernel");
+    }
+    return weight(ctx, w, k);
+}
+
 bool matvec_supported(gguf::TensorType t) {
     return kind_of(t).kernel != nullptr;
 }
@@ -285,7 +293,7 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    const Context::Buffer& x, std::uint64_t x_off,
                    std::uint32_t x_stride, const Context::Buffer& out,
                    std::uint64_t out_off, std::uint32_t out_stride,
-                   bool accumulate) {
+                   bool accumulate, float scale) {
     const auto [kernel, block] = mm_kernel(t);
     if (kernel.empty() || cols % block != 0 || n_tok == 0) {
         return false;
@@ -295,7 +303,7 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
     const MmParams p{w_off,    x_off,      out_off,
                      rows,     cols,       n_tok,
                      x_stride, out_stride, accumulate ? 1u : 0u,
-                     1.0f,     row_tiles,  1,
+                     scale,    row_tiles,  1,
                      0};
     const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
     ctx.dispatch(kernel.c_str(), args, std::as_bytes(std::span(&p, 1)),

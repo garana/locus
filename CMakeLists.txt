@@ -26,6 +26,7 @@ add_library(locus
     src/locus/backend/gpu_metrics.cpp
     src/locus/backend/metal/kv_pool.cpp
     src/locus/backend/metal/matvec.cpp
+    src/locus/backend/metal/seq.cpp
     src/locus/backend/registry.cpp
     src/locus/backend/vulkan/context.cpp
     src/locus/chat/template.cpp

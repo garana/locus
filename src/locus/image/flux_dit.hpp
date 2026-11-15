@@ -149,17 +149,19 @@ class FluxDit {
               std::vector<float>& sin_out) const;
 
   private:
-    /** forward() with every block on the GPU (flux_dit_vulkan.cpp):
+    /** forward() with every block on the GPU sequence Seq
+     *  (backend::VulkanSeq or backend::metal::Seq; flux_dit_vulkan.cpp):
      *  st is silu of the conditioning vector, cosv / sinv the RoPE
      *  tables of the joined sequence. */
-    std::vector<float> forward_vulkan(std::span<const float> x,
-                                      std::uint32_t n_img,
-                                      std::span<const float> text,
-                                      std::uint32_t n_txt,
-                                      const std::vector<float>& st,
-                                      const std::vector<float>& cosv,
-                                      const std::vector<float>& sinv,
-                                      Trace* trace) const;
+    template <class Seq>
+    std::vector<float> forward_gpu(std::span<const float> x,
+                                   std::uint32_t n_img,
+                                   std::span<const float> text,
+                                   std::uint32_t n_txt,
+                                   const std::vector<float>& st,
+                                   const std::vector<float>& cosv,
+                                   const std::vector<float>& sinv,
+                                   Trace* trace) const;
 
   public:
     /** One linear layer, with the LoRA parts set_lora attached. */

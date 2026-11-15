@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -297,11 +298,22 @@ TEST_CASE("flux kontext q8_0 dit stays close to diffusers",
 // One denoiser call at real sizes: 512 text tokens and a 512 or 1024
 // px image (1024 or 4096 image tokens), random inputs.
 TEST_CASE("bench: flux dit step", "[.][bench][flux]") {
-    if (!std::filesystem::exists(kModel) ||
-        !locus::backend::vk::VulkanContext::available()) {
-        SKIP("needs " << kModel << " and a Vulkan device");
+    // LOCUS_BENCH_GPU=metal times the Metal step (else Vulkan's), and
+    // LOCUS_BENCH_Q8=1 the Q8_0 checkpoint (half the bf16's memory).
+    const char* gpu = std::getenv("LOCUS_BENCH_GPU");
+    const bool metal = gpu != nullptr && std::string(gpu) == "metal";
+    const char* q8 = std::getenv("LOCUS_BENCH_Q8");
+    const std::string model = q8 != nullptr ? kModelQ8 : kModel;
+    const bool usable = metal ? locus::backend::metal::Context::usable()
+                              : locus::backend::vk::VulkanContext::available();
+    if (!std::filesystem::exists(model) || !usable) {
+        SKIP("needs " << model << " and a " << (metal ? "Metal" : "Vulkan")
+                      << " device");
     }
-    const auto g = locus::gguf::GgufFile::open(kModel);
+    const locus::backend::Ops& op = metal
+                                        ? locus::backend::metal::image_ops()
+                                        : locus::backend::vulkan_image_ops();
+    const auto g = locus::gguf::GgufFile::open(model);
     const auto dit = FluxDit::load(g);
     const std::uint32_t n_txt = 512;
     for (const std::uint32_t side : {32u, 64u}) {  // latent patches
@@ -318,8 +330,7 @@ TEST_CASE("bench: flux dit step", "[.][bench][flux]") {
         for (int rep = 0; rep < 2; ++rep) {
             const auto t0 = std::chrono::steady_clock::now();
             const auto out = dit.forward(x, img_ids, n_img, t, txt_ids,
-                                         n_txt, p, 0.5f, 2.5f,
-                                         locus::backend::vulkan_image_ops());
+                                         n_txt, p, 0.5f, 2.5f, op);
             const double s = std::chrono::duration<double>(
                                  std::chrono::steady_clock::now() - t0)
                                  .count();

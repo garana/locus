@@ -22,6 +22,7 @@
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/metal/context.hpp"
 #include "locus/backend/metal/matvec.hpp"
+#include "locus/backend/metal/seq.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
@@ -819,4 +820,218 @@ TEST_CASE("metal forward on a GGUF parsed from memory copies its weights",
         scale = std::max(scale, std::abs(cpu[r]));
     }
     CHECK(worst <= 0.01f * scale);
+}
+
+TEST_CASE("metal::Seq ops match CPU references", "[metal]") {
+    if (!locus::backend::metal::Seq::available()) {
+        SKIP("no Metal device");
+    }
+    using Seq = locus::backend::metal::Seq;
+    std::mt19937 rng(41);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    const auto rnd = [&](std::size_t n) {
+        std::vector<float> v(n);
+        for (auto& x : v) {
+            x = dist(rng);
+        }
+        return v;
+    };
+    const auto near = [](float a, float b) {
+        return a == Catch::Approx(b).margin(1e-4).epsilon(1e-4);
+    };
+    // Rows with an offset and a stride past their width.
+    const std::uint32_t n = 45, d = 256, off = 8, st = d + 12;
+    const std::size_t slot_n = off + std::size_t{n} * st;
+    const std::vector<float> x = rnd(slot_n), y = rnd(slot_n);
+    Seq q;
+    for (Seq::Slot s = 0; s < 6; ++s) {
+        q.reserve(s, slot_n);
+    }
+    const Seq::Rows xr{0, off, st}, yr{1, off, st}, orr{2, off, st};
+    const auto at = [&](std::uint32_t t, std::uint32_t i) {
+        return off + std::size_t{t} * st + i;
+    };
+    std::vector<float> got(slot_n);
+
+    SECTION("linear (Q8_0 matmul, F32 matvec rows) with a bias") {
+        for (const TensorType ty : {TensorType::kQ8_0, TensorType::kQ5_K}) {
+            CAPTURE(static_cast<int>(ty));
+            const std::uint32_t rows = 200;
+            const auto wv = random_weights(ty, rows, d, 5);
+            const locus::backend::Mat w{ty, wv.data(), rows, d};
+            const auto b = rnd(rows);
+            q.write(0, 0, x);
+            q.linear(w, b, xr, Seq::Rows{2, 4, rows + 4}, n);
+            q.read(2, 0, got);
+            std::vector<float> want(rows);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                locus::backend::matvec(w, {x.data() + at(t, 0), d}, want);
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    REQUIRE(near(got[4 + std::size_t{t} * (rows + 4) + r],
+                                 want[r] + b[r]));
+                }
+            }
+        }
+    }
+    SECTION("linear_add scales onto the output") {
+        const std::uint32_t rows = 64;
+        const auto wv = random_weights(TensorType::kQ8_0, rows, d, 6);
+        const locus::backend::Mat w{TensorType::kQ8_0, wv.data(), rows, d};
+        q.write(0, 0, x);
+        q.write(2, 0, y);
+        q.linear_add(w, xr, orr, n, 0.5f);
+        q.read(2, 0, got);
+        std::vector<float> want(rows);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            locus::backend::matvec(w, {x.data() + at(t, 0), d}, want);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                REQUIRE(near(got[at(t, r)], y[at(t, r)] + 0.5f * want[r]));
+            }
+        }
+    }
+    SECTION("ln_mod and layer_norm") {
+        const auto mod = rnd(2 * d);
+        const auto w = rnd(d), b = rnd(d);
+        q.write(0, 0, x);
+        q.write(3, 0, mod);
+        for (const bool affine : {false, true}) {
+            CAPTURE(affine);
+            if (affine) {
+                q.layer_norm(xr, orr, n, d, w, b, 1e-6f);
+            } else {
+                q.ln_mod(xr, orr, n, d, 3, 0, d, 1e-6f);
+            }
+            q.read(2, 0, got);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                double mean = 0, var = 0;
+                for (std::uint32_t i = 0; i < d; ++i) {
+                    mean += x[at(t, i)];
+                }
+                mean /= d;
+                for (std::uint32_t i = 0; i < d; ++i) {
+                    var += (x[at(t, i)] - mean) * (x[at(t, i)] - mean);
+                }
+                const double inv = 1.0 / std::sqrt(var / d + 1e-6);
+                for (std::uint32_t i = 0; i < d; ++i) {
+                    const double ln = (x[at(t, i)] - mean) * inv;
+                    const double want = affine ? ln * w[i] + b[i]
+                                               : ln * (1 + mod[d + i]) + mod[i];
+                    REQUIRE(near(got[at(t, i)], static_cast<float>(want)));
+                }
+            }
+        }
+    }
+    SECTION("head_norm_rope") {
+        const std::uint32_t heads = 4, hd = 64;  // 4 x 64 = d
+        const auto norm = rnd(hd);
+        const std::uint32_t row0 = 3;
+        const auto cs = rnd(std::size_t{row0 + n} * hd);
+        const auto sn = rnd(cs.size());
+        q.reserve(4, cs.size());
+        q.reserve(5, cs.size());
+        q.write(0, 0, x);
+        q.write(4, 0, cs);
+        q.write(5, 0, sn);
+        q.head_norm_rope(xr, n, heads, hd, norm, 4, 5, row0, 1e-6f);
+        q.read(0, 0, got);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            for (std::uint32_t h = 0; h < heads; ++h) {
+                const std::size_t a0 = at(t, h * hd);
+                double ss = 0;
+                for (std::uint32_t i = 0; i < hd; ++i) {
+                    ss += x[a0 + i] * x[a0 + i];
+                }
+                const double inv = 1.0 / std::sqrt(ss / hd + 1e-6);
+                const std::size_t tab = std::size_t{row0 + t} * hd;
+                for (std::uint32_t i = 0; i < hd; i += 2) {
+                    const double x0 = x[a0 + i] * inv * norm[i];
+                    const double x1 = x[a0 + i + 1] * inv * norm[i + 1];
+                    REQUIRE(near(got[a0 + i], static_cast<float>(
+                                     x0 * cs[tab + i] - x1 * sn[tab + i])));
+                    REQUIRE(near(got[a0 + i + 1],
+                                 static_cast<float>(x1 * cs[tab + i + 1] +
+                                                    x0 * sn[tab + i + 1])));
+                }
+            }
+        }
+    }
+    SECTION("attention and cross attention") {
+        // Heads of 64 (4 = d / 64) and of 72 (3 heads, PixArt's width).
+        for (const auto& [heads, hd, n_q, n_kv] :
+             {std::tuple<std::uint32_t, std::uint32_t, std::uint32_t,
+                         std::uint32_t>{4, 64, n, n},
+              {3, 72, 37, n}, {2, 128, n, 40}}) {
+            CAPTURE(heads, hd, n_q, n_kv);
+            const auto kv = rnd(slot_n);
+            q.write(0, 0, x);
+            q.write(1, 0, y);
+            q.write(3, 0, kv);
+            q.cross_attention(xr, n_q, yr, Seq::Rows{3, off, st}, n_kv, orr,
+                              heads, hd, 4, 5, 6);
+            q.read(2, 0, got);
+            const double sc = 1.0 / std::sqrt(double(hd));
+            std::vector<double> s(n_kv);
+            for (std::uint32_t t = 0; t < n_q; ++t) {
+                for (std::uint32_t h = 0; h < heads; ++h) {
+                    double mx = -1e300;
+                    for (std::uint32_t j = 0; j < n_kv; ++j) {
+                        double dd = 0;
+                        for (std::uint32_t i = 0; i < hd; ++i) {
+                            dd += x[at(t, h * hd + i)] * y[at(j, h * hd + i)];
+                        }
+                        s[j] = dd * sc;
+                        mx = std::max(mx, s[j]);
+                    }
+                    double sum = 0;
+                    for (auto& e : s) {
+                        e = std::exp(e - mx);
+                        sum += e;
+                    }
+                    for (std::uint32_t i = 0; i < hd; ++i) {
+                        double o = 0;
+                        for (std::uint32_t j = 0; j < n_kv; ++j) {
+                            o += s[j] * kv[at(j, h * hd + i)];
+                        }
+                        REQUIRE(near(got[at(t, h * hd + i)],
+                                     static_cast<float>(o / sum)));
+                    }
+                }
+            }
+        }
+    }
+    SECTION("gelu, add and gated_add") {
+        const auto gate = rnd(d + 5);
+        q.reserve(3, gate.size());
+        q.write(3, 0, gate);
+        for (int op = 0; op < 4; ++op) {
+            CAPTURE(op);
+            q.write(0, 0, x);
+            q.write(1, 0, y);
+            if (op == 0) {
+                q.gelu_tanh(xr, n, d);
+            } else if (op == 1) {
+                q.gelu_erf(xr, n, d);
+            } else if (op == 2) {
+                q.add(xr, yr, n, d);
+            } else {
+                q.gated_add(xr, yr, n, d, 3, 5);
+            }
+            q.read(0, 0, got);
+            for (std::uint32_t t = 0; t < n; ++t) {
+                for (std::uint32_t i = 0; i < d; ++i) {
+                    const double v = x[at(t, i)], w = y[at(t, i)];
+                    const double u = 0.7978845608028654 *
+                                     (v + 0.044715 * v * v * v);
+                    const double want =
+                        op == 0   ? 0.5 * v * (1 + std::tanh(u))
+                        : op == 1 ? 0.5 * v * (1 + std::erf(v / std::sqrt(2.0)))
+                        : op == 2 ? v + w
+                                  : v + gate[5 + i] * w;
+                    REQUIRE(near(got[at(t, i)], static_cast<float>(want)));
+                }
+            }
+            // The stride's padding is untouched.
+            REQUIRE(got[at(0, d)] == x[at(0, d)]);
+        }
+    }
 }
