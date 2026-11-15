@@ -542,7 +542,8 @@ TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
         model.use_q8k_activations(false);  // the f32 CPU reference
         const auto tok = locus::tok::tokenizer_from_gguf(g);
         const std::uint32_t nv = model.hparams().n_vocab;
-        // Past two 256-token sub-chunks, so three run, and the next
+        // Past two 256-token sub-chunks, so the all-logits run takes
+        // three (a one-row run takes the whole prompt), and the next
         // token's decode takes the split attention (past 512).
         std::string text;
         for (int i = 0; i < 60; ++i) {
