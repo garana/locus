@@ -557,7 +557,7 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   mode a lone sequence takes the multi-sequence kernels too, so a
   request's logits are bit-identical alone and batched. It is the
   default on Apple GPUs and on V3D, where a lone sequence costs little
-  (on V3D 2.4% for a lone Q8_0 sequence with the NT 1 build below);
+  (on V3D 2.3% for a lone Q8_0 sequence with the NT 1 build below);
   elsewhere a lone sequence keeps the single-sequence forward.
   On V3D the kernel's v3d driver can reset the GPU for a "hang" in the
   middle of a long compute job (a 274 ms conv dispatch, about once in
