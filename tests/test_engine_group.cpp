@@ -1,19 +1,24 @@
 #include "locus/server/engine_group.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
+#include "locus/http/loop_connection.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/server/engine_loop.hpp"
+#include "locus/server/gen_reply.hpp"
 #include "locus/tok/tokenizer.hpp"
 
 using locus::server::EngineGroup;
@@ -154,6 +159,60 @@ TEST_CASE("two CPU engines: a followed request on each is taken whole",
         group.release(ids[i]);
     }
     CHECK(calls.load() > 0);
+}
+
+// i#980 on the event loop: a stream whose step throws after its head
+// is reported through Deferred::stream_failed (the server logs and
+// counts it), then ended truncated; a buffered reply that throws is a
+// 500 and no stream failure.
+TEST_CASE("the generation pump reports a stream that fails mid-way",
+          "[engine_group][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    EngineGroup group(model, tok.eos_id(), {}, EngineGroup::plan(1, {}));
+    std::atomic<int> failed{0}, done{0}, done_status{0};
+    const auto prompt = tok.encode("Once upon a time", true);
+    {
+        locus::server::GenPump pump(group, std::chrono::milliseconds(0));
+        for (const bool stream : {true, false}) {
+            auto r = std::make_shared<locus::http::LoopReply>(-1, 1 << 20,
+                                                              10000);
+            locus::server::GenReply gr;
+            gr.stream = stream;
+            gr.step = [](const EngineLoop::View&, std::string&) -> bool {
+                throw std::runtime_error("step bug");
+            };
+            gr.finish = [](const EngineLoop::View&,
+                           locus::http::ServerResponse&) {
+                throw std::runtime_error("finish bug");
+            };
+            locus::http::Deferred d{
+                r,
+                [&](int status, std::uint64_t) {
+                    done_status = status;
+                    done.fetch_add(1);
+                },
+                [&](const char*) { failed.fetch_add(1); }};
+            const int before = done.load();
+            pump.add(group.submit(prompt, 4), std::move(gr), std::move(d),
+                     locus::http::Response{});
+            const auto until =
+                std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            while (done.load() == before &&
+                   std::chrono::steady_clock::now() < until) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            REQUIRE(done.load() == before + 1);
+            CHECK(failed.load() == 1);  // the stream only
+            if (!stream) {
+                CHECK(done_status.load() == 500);
+            }
+        }
+    }
 }
 
 TEST_CASE("two Vulkan devices run one engine each with one device's tokens",

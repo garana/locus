@@ -131,6 +131,7 @@ add_library(locus
     src/locus/server/engine_group.cpp
     src/locus/server/engine_loop.cpp
     src/locus/server/errors.cpp
+    src/locus/server/gen_reply.cpp
     src/locus/server/server.cpp
     src/locus/server/metrics_text.cpp
     src/locus/server/responses.cpp
