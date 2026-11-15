@@ -147,7 +147,8 @@ def main():
         m.save_pretrained(d / "transformer")
         out = d / "qwen_image_dit_synth.gguf"
         subprocess.run([sys.executable, "-I",
-                        str(ROOT / "scripts" / "convert-qwen-image.py"),
+                        str(ROOT / "scripts" / "image" /
+                            "convert-qwen-image.py"),
                         "--model", str(d), "--dit-out", str(out)],
                        check=True)
         shutil.copy(out, GOLDEN / "qwen_image_dit_synth.gguf")
