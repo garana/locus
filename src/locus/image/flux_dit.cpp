@@ -12,6 +12,7 @@
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
+#include "locus/image/mmdit_cpu.hpp"
 #include "locus/image/pixart_dit.hpp"
 #include "locus/sys/thread_pool.hpp"
 
@@ -351,60 +352,27 @@ std::vector<float> FluxDit::forward(std::span<const float> x,
     run(op, ctx_embed_, text, n_txt, txt);
 
     const std::size_t nw = std::size_t{n} * w;
-    std::vector<float> q(nw), k(nw), v(nw), att(nw), nrm(nw), o(nw);
-    std::vector<float> ff(std::size_t{n} * ffn_);
-    std::vector<float> mod_i(std::size_t{6} * w), mod_t(mod_i.size());
-
-    // q / k / v of one stream into rows [row0, row0 + rows) of q, k, v.
-    const auto qkv = [&](const Stream& s, std::span<const float> in,
-                         std::uint32_t rows, std::uint32_t row0) {
-        const std::size_t at = std::size_t{row0} * w;
-        const std::size_t len = std::size_t{rows} * w;
-        const auto sub = [&](std::vector<float>& b) {
-            return std::span<float>(b).subspan(at, len);
-        };
-        run(op, s.q, in, rows, sub(q));
-        run(op, s.k, in, rows, sub(k));
-        run(op, s.v, in, rows, sub(v));
-        rms_norm(sub(q), s.q_norm, eps_, rows * nh, hd, sub(q));
-        rms_norm(sub(k), s.k_norm, eps_, rows * nh, hd, sub(k));
+    const mmdit::CpuShape sh{n_txt, n_img, w, nh, hd, ffn_, eps_};
+    mmdit::CpuBufs bufs(sh);
+    // The single blocks and the output reuse the rows.
+    std::vector<float>& q = bufs.q;
+    std::vector<float>& k = bufs.k;
+    std::vector<float>& v = bufs.v;
+    std::vector<float>& att = bufs.att;
+    std::vector<float>& nrm = bufs.nrm;
+    std::vector<float>& o = bufs.o;
+    std::vector<float>& ff = bufs.ff;
+    const auto lin = [&](const Linear& l, std::span<const float> in,
+                         std::uint32_t rows, std::span<float> out) {
+        run(op, l, in, rows, out);
     };
-    // Gated residual of one stream's attention output, then its gated
-    // FFN on the modulated LayerNorm. mod: shift, scale, gate (msa),
-    // shift, scale, gate (mlp).
-    const auto finish = [&](const Stream& s, std::vector<float>& h,
-                            std::uint32_t rows, std::uint32_t row0,
-                            const std::vector<float>& mod) {
-        const std::size_t len = std::size_t{rows} * w;
-        const auto a = std::span<const float>(att).subspan(
-            std::size_t{row0} * w, len);
-        auto ob = std::span<float>(o).subspan(0, len);
-        run(op, s.out, a, rows, ob);
-        gated_add(h, ob, &mod[2 * w], rows, w);
-        auto nb = std::span<float>(nrm).subspan(0, len);
-        ln_modulate(h, rows, w, eps_, &mod[3 * w], &mod[4 * w], nb);
-        auto fb = std::span<float>(ff).subspan(0, std::size_t{rows} * ffn_);
-        run(op, s.ff1, nb, rows, fb);
-        for (float& z : fb) z = gelu_tanh(z);
-        run(op, s.ff2, fb, rows, ob);
-        gated_add(h, ob, &mod[5 * w], rows, w);
-    };
+    const auto lin1 = [&](const Linear& l, std::span<const float> in,
+                          std::span<float> out) { run1(op, l, in, out); };
 
     for (std::size_t bi = 0; bi < doubles_.size(); ++bi) {
         const DoubleBlock& b = doubles_[bi];
-        run1(op, b.img.mod, st, mod_i);
-        run1(op, b.txt.mod, st, mod_t);
-        auto ni = std::span<float>(nrm).subspan(0, std::size_t{n_img} * w);
-        ln_modulate(img, n_img, w, eps_, &mod_i[0], &mod_i[w], ni);
-        qkv(b.img, ni, n_img, n_txt);
-        auto nt = std::span<float>(nrm).subspan(0, std::size_t{n_txt} * w);
-        ln_modulate(txt, n_txt, w, eps_, &mod_t[0], &mod_t[w], nt);
-        qkv(b.txt, nt, n_txt, 0);
-        rope_pairs(q, n, nh, hd, cosv, sinv);
-        rope_pairs(k, n, nh, hd, cosv, sinv);
-        attention(op, q, n, k, v, n, nh, hd, att);
-        finish(b.txt, txt, n_txt, 0, mod_t);
-        finish(b.img, img, n_img, n_txt, mod_i);
+        mmdit::double_block_cpu(op, b.img, b.txt, sh, st, cosv, sinv, img, txt,
+                                bufs, lin, lin1);
         if (trace != nullptr && bi == 0) {
             trace->double0_img = img;
             trace->double0_txt = txt;

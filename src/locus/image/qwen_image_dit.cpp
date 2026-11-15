@@ -11,19 +11,16 @@
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
+#include "locus/image/mmdit_cpu.hpp"
 
 namespace locus::image {
 
 namespace {
 
-using dense::attention;
-using dense::gated_add;
-using dense::gelu_tanh;
 using dense::linear;
 using dense::linear1;
 using dense::ln_modulate;
 using dense::rms_norm;
-using dense::rope_pairs;
 using dense::silu;
 
 /**
@@ -257,7 +254,6 @@ std::vector<float> QwenImageDit::forward(std::span<const float> x,
     }
     const auto n_img = static_cast<std::uint32_t>(n_img_sz);
     const std::uint32_t w = width_, hd = head_dim_, nh = heads_;
-    const std::uint32_t n = n_txt + n_img;  // joined: text, then image
 
     // The conditioning vector, then silu of it for every modulation.
     std::vector<float> h1(w), temb(w), st(w);
@@ -284,61 +280,21 @@ std::vector<float> QwenImageDit::forward(std::span<const float> x,
     linear(op, img_in_.w, img_in_.b, x, n_img, img);
     linear(op, txt_in_.w, txt_in_.b, tn, n_txt, txt);
 
-    const std::size_t nw = std::size_t{n} * w;
-    std::vector<float> q(nw), k(nw), v(nw), att(nw), nrm(nw), o(nw);
-    std::vector<float> ff(std::size_t{n} * ffn_);
-    std::vector<float> mod_i(std::size_t{6} * w), mod_t(mod_i.size());
-
-    // q / k / v of one stream into rows [row0, row0 + rows) of q, k, v.
-    const auto qkv = [&](const Stream& s, std::span<const float> in,
-                         std::uint32_t rows, std::uint32_t row0) {
-        const std::size_t at = std::size_t{row0} * w;
-        const std::size_t len = std::size_t{rows} * w;
-        const auto sub = [&](std::vector<float>& b) {
-            return std::span<float>(b).subspan(at, len);
-        };
-        linear(op, s.q.w, s.q.b, in, rows, sub(q));
-        linear(op, s.k.w, s.k.b, in, rows, sub(k));
-        linear(op, s.v.w, s.v.b, in, rows, sub(v));
-        rms_norm(sub(q), s.q_norm, eps_, rows * nh, hd, sub(q));
-        rms_norm(sub(k), s.k_norm, eps_, rows * nh, hd, sub(k));
+    const mmdit::CpuShape sh{n_txt, n_img, w, nh, hd, ffn_, eps_};
+    mmdit::CpuBufs bufs(sh);
+    const auto lin = [&](const Linear& l, std::span<const float> in,
+                         std::uint32_t rows, std::span<float> out) {
+        linear(op, l.w, l.b, in, rows, out);
     };
-    // Gated residual of one stream's attention output, then its gated
-    // FFN on the modulated LayerNorm. mod: shift, scale, gate (attn),
-    // shift, scale, gate (mlp).
-    const auto finish = [&](const Stream& s, std::vector<float>& h,
-                            std::uint32_t rows, std::uint32_t row0,
-                            const std::vector<float>& mod) {
-        const std::size_t len = std::size_t{rows} * w;
-        const auto a = std::span<const float>(att).subspan(
-            std::size_t{row0} * w, len);
-        auto ob = std::span<float>(o).subspan(0, len);
-        linear(op, s.out.w, s.out.b, a, rows, ob);
-        gated_add(h, ob, &mod[2 * w], rows, w);
-        auto nb = std::span<float>(nrm).subspan(0, len);
-        ln_modulate(h, rows, w, eps_, &mod[3 * w], &mod[4 * w], nb);
-        auto fb = std::span<float>(ff).subspan(0, std::size_t{rows} * ffn_);
-        linear(op, s.ff1.w, s.ff1.b, nb, rows, fb);
-        for (float& z : fb) z = gelu_tanh(z);
-        linear(op, s.ff2.w, s.ff2.b, fb, rows, ob);
-        gated_add(h, ob, &mod[5 * w], rows, w);
+    const auto lin1 = [&](const Linear& l, std::span<const float> in,
+                          std::span<float> out) {
+        linear1(op, l.w, l.b, in, out);
     };
 
     for (std::size_t bi = 0; bi < blocks_.size(); ++bi) {
         const Block& b = blocks_[bi];
-        linear1(op, b.img.mod.w, b.img.mod.b, st, mod_i);
-        linear1(op, b.txt.mod.w, b.txt.mod.b, st, mod_t);
-        auto ni = std::span<float>(nrm).subspan(0, std::size_t{n_img} * w);
-        ln_modulate(img, n_img, w, eps_, &mod_i[0], &mod_i[w], ni);
-        qkv(b.img, ni, n_img, n_txt);
-        auto nt = std::span<float>(nrm).subspan(0, std::size_t{n_txt} * w);
-        ln_modulate(txt, n_txt, w, eps_, &mod_t[0], &mod_t[w], nt);
-        qkv(b.txt, nt, n_txt, 0);
-        rope_pairs(q, n, nh, hd, cosv, sinv);
-        rope_pairs(k, n, nh, hd, cosv, sinv);
-        attention(op, q, n, k, v, n, nh, hd, att);
-        finish(b.txt, txt, n_txt, 0, mod_t);
-        finish(b.img, img, n_img, n_txt, mod_i);
+        mmdit::double_block_cpu(op, b.img, b.txt, sh, st, cosv, sinv, img, txt,
+                                bufs, lin, lin1);
         if (trace != nullptr && bi == 0) {
             trace->block0_img = img;
             trace->block0_txt = txt;
@@ -349,7 +305,7 @@ std::vector<float> QwenImageDit::forward(std::span<const float> x,
     // rows, then proj_out.
     std::vector<float> ss(std::size_t{2} * w);
     linear1(op, norm_out_.w, norm_out_.b, st, ss);
-    auto ni = std::span<float>(nrm).subspan(0, std::size_t{n_img} * w);
+    auto ni = std::span<float>(bufs.nrm).subspan(0, std::size_t{n_img} * w);
     ln_modulate(img, n_img, w, eps_, &ss[w], &ss[0], ni);
     std::vector<float> out(std::size_t{n_img} * out_);
     linear(op, proj_out_.w, proj_out_.b, ni, n_img, out);
