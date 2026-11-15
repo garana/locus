@@ -338,14 +338,15 @@ TEST_CASE("bench: encoder pass cpu vs vulkan", "[.][bench][vulkan]") {
     SUCCEED();
 }
 
-// Orpheus speech decode on CUDA (i#689): ms per token with the speech
-// head rows and with the full head. Run it once as is, and once with
-// LOCUS_CUDA_FORWARD=0 for the per-op path (read once per process).
-TEST_CASE("bench: orpheus decode step on cuda with speech rows",
-          "[.][bench][cuda]") {
-    if (!cuda_backend_usable()) {
-        SKIP("no usable CUDA device");
-    }
+namespace {
+
+/**
+ * Orpheus speech decode on `backend`: ms per token with the speech
+ * head rows and with the full head, over fixed inputs.
+ * @param backend The backend name ("cuda", "vulkan").
+ * @param steps Decode steps timed per run.
+ */
+void bench_orpheus_decode(const char* backend, std::uint32_t steps) {
     const std::string path = std::string(LOCUS_SOURCE_DIR) +
                              "/tests/models/orpheus-3b-0.1-ft-Q4_K_M.gguf";
     if (!std::filesystem::exists(path)) {
@@ -353,7 +354,7 @@ TEST_CASE("bench: orpheus decode step on cuda with speech rows",
     }
     auto g = locus::gguf::GgufFile::open(path);
     auto model = locus::model::TransformerModel::load(g);
-    model.use_backend(*find_backend("cuda"));
+    model.use_backend(*find_backend(backend));
     const auto tok = locus::tok::tokenizer_from_gguf(g);
     // The server's speech rows: <custom_token_0> through the 7 bands.
     const auto base =
@@ -362,7 +363,6 @@ TEST_CASE("bench: orpheus decode step on cuda with speech rows",
     const locus::model::LogitRows speech{base - 10,
                                          std::min(nv, base + 7u * 4096u)};
     const auto prompt = tok->encode("tara: Hello there, how are you?", true);
-    constexpr std::uint32_t kSteps = 48;
     auto ws = model.make_workspace();
     std::vector<float> logits(nv);
     const auto ms_per_token = [&](locus::model::LogitRows rows) {
@@ -374,7 +374,7 @@ TEST_CASE("bench: orpheus decode step on cuda with speech rows",
         }
         // Fixed inputs (the band base) so both runs do the same work.
         const auto t0 = std::chrono::steady_clock::now();
-        for (std::uint32_t i = 0; i < kSteps; ++i) {
+        for (std::uint32_t i = 0; i < steps; ++i) {
             REQUIRE(cache.ensure_capacity(seq, 1));
             model.forward(static_cast<locus::tok::TokenId>(base), cache, seq,
                           ws, logits, rows);
@@ -382,15 +382,40 @@ TEST_CASE("bench: orpheus decode step on cuda with speech rows",
         const auto t1 = std::chrono::steady_clock::now();
         cache.release(seq);
         return std::chrono::duration<double, std::milli>(t1 - t0).count() /
-               kSteps;
+               steps;
     };
     ms_per_token({});  // warm: weight pool, first touch
     const double rows_ms = ms_per_token(speech);
     const double full_ms = ms_per_token({});
-    WARN("orpheus on cuda, " << kSteps << " steps: speech rows ["
-                             << speech.begin << ", " << speech.end << ") "
-                             << rows_ms << " ms/token, full head " << full_ms
-                             << " ms/token");
+    WARN("orpheus on " << backend << ", " << steps << " steps: speech rows ["
+                       << speech.begin << ", " << speech.end << ") "
+                       << rows_ms << " ms/token, full head " << full_ms
+                       << " ms/token");
+}
+
+}  // namespace
+
+// Orpheus speech decode on CUDA (i#689): ms per token with the speech
+// head rows and with the full head. Run it once as is, and once with
+// LOCUS_CUDA_FORWARD=0 for the per-op path (read once per process).
+TEST_CASE("bench: orpheus decode step on cuda with speech rows",
+          "[.][bench][cuda]") {
+    if (!cuda_backend_usable()) {
+        SKIP("no usable CUDA device");
+    }
+    bench_orpheus_decode("cuda", 48);
+    SUCCEED();
+}
+
+// The same on Vulkan (i#784), for the comparison with llama.cpp's
+// Metal decode (llama-bench computes the full head). LOCUS_VK_PROFILE=2
+// splits it per kernel.
+TEST_CASE("bench: orpheus decode step on vulkan with speech rows",
+          "[.][bench][vulkan]") {
+    if (!vulkan_backend_usable()) {
+        SKIP("no Vulkan device");
+    }
+    bench_orpheus_decode("vulkan", 128);
     SUCCEED();
 }
 
@@ -706,4 +731,59 @@ TEST_CASE("bench: http metrics per request", "[.][bench]") {
     WARN("http metrics: " << ns << " ns per request (route + record)");
     REQUIRE(m.at(m.route("/v1/images/generations")).seconds.snapshot()
                 .count == static_cast<std::uint64_t>(kN));
+}
+
+// The decode matvecs of Orpheus 3B Q4_K_M (Llama 3.2 3B) one kernel at
+// a time on Vulkan (i#784): each shape repeated in one batch, as a
+// decode step chains them, with its effective bandwidth. Random
+// weights; the time depends only on the type and shape.
+TEST_CASE("bench: vulkan decode matvecs at the orpheus shapes",
+          "[.][bench][vulkan]") {
+    if (!vulkan_backend_usable()) {
+        SKIP("no Vulkan device");
+    }
+    using TT = locus::gguf::TensorType;
+    struct Shape {
+        const char* name;
+        TT type;
+        std::uint32_t rows, cols;
+        std::size_t block_bytes, d_off;
+        int dmin_off;
+    };
+    const Shape shapes[] = {
+        {"q4_k attn_q/o   ", TT::kQ4_K, 3072, 3072, 144, 0, 2},
+        {"q4_k attn_k/v   ", TT::kQ4_K, 1024, 3072, 144, 0, 2},
+        {"q4_k ffn_gate/up", TT::kQ4_K, 8192, 3072, 144, 0, 2},
+        {"q4_k ffn_down   ", TT::kQ4_K, 3072, 8192, 144, 0, 2},
+        {"q6_k attn_v     ", TT::kQ6_K, 1024, 3072, 210, 208, -1},
+        {"q6_k ffn_down   ", TT::kQ6_K, 3072, 8192, 210, 208, -1},
+        {"q6_k head speech", TT::kQ6_K, 28682, 3072, 210, 208, -1},
+        {"q6_k head full  ", TT::kQ6_K, 156940, 3072, 210, 208, -1},
+    };
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const Shape& sh : shapes) {
+        auto w = make_kquant(sh.rows, sh.cols, sh.block_bytes, sh.d_off,
+                             sh.dmin_off, 9);
+        const Mat m{sh.type, w.data(), sh.rows, sh.cols};
+        std::vector<float> x(sh.cols), out(sh.rows), ref(sh.rows);
+        for (auto& v : x) {
+            v = dist(rng);
+        }
+        matvec_vulkan(m, x, ref);  // uploads the weight
+        // About 2 GB of weight reads a batch, at least 16 copies.
+        const auto reps = static_cast<std::uint32_t>(std::max<std::size_t>(
+            16, (std::size_t{2} << 30) / w.size()));
+        vulkan_matvec_repeat(m, x, out, reps);  // warm
+        double best = 1e30;
+        for (int i = 0; i < 3; ++i) {
+            best = std::min(best, vulkan_matvec_repeat(m, x, out, reps));
+        }
+        REQUIRE(out == ref);
+        WARN(sh.name << " " << sh.rows << " x " << sh.cols << ": " << best * 1e3
+                     << " us, "
+                     << static_cast<double>(w.size()) / (best * 1e6)
+                     << " GB/s (" << reps << " copies)");
+    }
+    SUCCEED();
 }

@@ -583,6 +583,20 @@ void add_scaled_pairs(__m128i m0, __m128i m1, int scale, __m128i& lo,
     hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(m0, m1), scv));
 }
 
+/** Unpacks a Q4_K / Q5_K block's 12 packed scale bytes (at blk + 4)
+ *  as scalar vec_dot_q4_k_q8_k does: afterwards the bytes of utmp[0..1]
+ *  are the eight 6-bit scales and those of utmp[2..3] the eight mins. */
+void unpack_k_scales(const std::byte* blk, std::uint32_t utmp[4]) {
+    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
+                            kmask3 = 0x03030303;
+    std::memcpy(utmp, blk + 4, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    const std::uint32_t uaux = utmp[1] & kmask1;
+    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+    utmp[2] = uaux;
+    utmp[0] &= kmask1;
+}
+
 /** The Q4_K / Q5_K min term: bsums[j] * mins[j / 2] over j = 0..15, the
  *  mins being the bytes of utmp[2..3] after the scale unpack; one madd
  *  per 8 bsums (|bsum| <= 32 * 127, mins < 64: exact in int32). */
@@ -609,16 +623,9 @@ int k_min_term(const std::uint32_t utmp[4], const std::int16_t* bsums) {
 void q4_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
                          const std::int16_t* bsums, std::int32_t aux32[8],
                          int& sumi) {
-    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
-                            kmask3 = 0x03030303;
     const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 16);
     std::uint32_t utmp[4];
-    std::memcpy(utmp, blk + 4, 12);
-    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-    const std::uint32_t uaux = utmp[1] & kmask1;
-    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-    utmp[2] = uaux;
-    utmp[0] &= kmask1;
+    unpack_k_scales(blk, utmp);
     const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
     sumi = k_min_term(utmp, bsums);
     const __m128i lo4 = _mm_set1_epi8(0x0f);
@@ -665,17 +672,10 @@ void q4_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
 void q5_k_q8k_aux32_sse4(const std::byte* blk, const std::int8_t* q8il,
                          const std::int16_t* bsums, std::int32_t aux32[8],
                          int& sumi) {
-    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
-                            kmask3 = 0x03030303;
     const auto* hm = reinterpret_cast<const std::uint8_t*>(blk + 16);
     const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 48);
     std::uint32_t utmp[4];
-    std::memcpy(utmp, blk + 4, 12);
-    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-    const std::uint32_t uaux = utmp[1] & kmask1;
-    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-    utmp[2] = uaux;
-    utmp[0] &= kmask1;
+    unpack_k_scales(blk, utmp);
     const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
     sumi = k_min_term(utmp, bsums);
     const __m128i lo4 = _mm_set1_epi8(0x0f);
@@ -890,106 +890,23 @@ __m128i block32_lanes_sse4(const std::int8_t* q, const std::int8_t* x) {
 }
 
 /**
- * One Q8_0 weight row dotted with a Q8_0-quantized activation, in the
- * float order of scalar vec_dot_block32_q8_0 (two blocks per step,
- * four float lanes each, the pairwise lane reduction, then a scalar
- * tail block), so the result is bit-identical to it.
+ * One row of 32-weight blocks (an f16 scale first, kBlk bytes each)
+ * dotted with a Q8_0-quantized activation, in the float order of scalar
+ * vec_dot_block32_q8_0: two blocks per step, four float lanes each, the
+ * pairwise lane reduction, then a scalar tail block.
+ *
+ * @param lanes `lanes(blk, x)` gives one block's four int32 lane sums
+ *     against the activation's 32 int8 at x.
  */
-float row_q8_0_q8_0_sse4(const std::byte* row, const float* xd,
-                         const std::int8_t* xq, std::size_t nb) {
-    constexpr std::size_t kBlk = 34;  // f16 scale + 32 int8
+template <std::size_t kBlk, class Lanes>
+float row_block32_q8_0_sse4(const std::byte* row, const float* xd,
+                            const std::int8_t* xq, std::size_t nb,
+                            const Lanes& lanes) {
     __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
     std::size_t b = 0;
 #if defined(LOCUS_SSE4_AVX_VARIANT)
     // Block b in lanes 0-3 and b + 1 in 4-7 of one 256-bit sum: the same
     // adds as s0 and s1 below.
-    __m256 s8 = _mm256_setzero_ps();
-    for (; b + 1 < nb; b += 2) {
-        const std::byte* b0 = row + b * kBlk;
-        const std::byte* b1 = b0 + kBlk;
-        const __m256 d = _mm256_set_m128(
-            _mm_set1_ps(f16_to_f32(load_u16(b1)) * xd[b + 1]),
-            _mm_set1_ps(f16_to_f32(load_u16(b0)) * xd[b]));
-        const __m256i p = _mm256_set_m128i(
-            block32_lanes_sse4(reinterpret_cast<const std::int8_t*>(b1 + 2),
-                               xq + (b + 1) * 32),
-            block32_lanes_sse4(reinterpret_cast<const std::int8_t*>(b0 + 2),
-                               xq + b * 32));
-        s8 = _mm256_add_ps(s8, _mm256_mul_ps(_mm256_cvtepi32_ps(p), d));
-    }
-    s0 = _mm256_castps256_ps128(s8);
-    s1 = _mm256_extractf128_ps(s8, 1);
-#else
-    for (; b + 1 < nb; b += 2) {
-        const std::byte* b0 = row + b * kBlk;
-        const std::byte* b1 = b0 + kBlk;
-        const float d0 = f16_to_f32(load_u16(b0)) * xd[b];
-        const float d1 = f16_to_f32(load_u16(b1)) * xd[b + 1];
-        const __m128i p0 = block32_lanes_sse4(
-            reinterpret_cast<const std::int8_t*>(b0 + 2), xq + b * 32);
-        const __m128i p1 = block32_lanes_sse4(
-            reinterpret_cast<const std::int8_t*>(b1 + 2), xq + (b + 1) * 32);
-        s0 = _mm_add_ps(s0, _mm_mul_ps(_mm_cvtepi32_ps(p0), _mm_set1_ps(d0)));
-        s1 = _mm_add_ps(s1, _mm_mul_ps(_mm_cvtepi32_ps(p1), _mm_set1_ps(d1)));
-    }
-#endif
-    alignas(16) float l0[4], l1[4];
-    _mm_store_ps(l0, s0);
-    _mm_store_ps(l1, s1);
-    float sum = ((l0[0] + l0[1]) + (l0[2] + l0[3])) +
-                ((l1[0] + l1[1]) + (l1[2] + l1[3]));
-    for (; b < nb; ++b) {
-        const std::byte* blk = row + b * kBlk;
-        const float d = f16_to_f32(load_u16(blk)) * xd[b];
-        alignas(16) std::int32_t p[4];
-        _mm_store_si128(
-            reinterpret_cast<__m128i*>(p),
-            block32_lanes_sse4(reinterpret_cast<const std::int8_t*>(blk + 2),
-                               xq + b * 32));
-        sum += static_cast<float>(p[0] + p[1] + p[2] + p[3]) * d;
-    }
-    return sum;
-}
-
-/**
- * One Q4_0 or IQ4_NL (18 B blocks) weight row dotted with a Q8_0
- * activation, in row_q8_0_q8_0_sse4's float order (scalar
- * vec_dot_block32_q8_0, which these types share with Q8_0). Each block
- * is decoded to 32 int8 weights in two vectors first: weights 0-15 from
- * the low nibbles, 16-31 from the high ones, minus 8 (Q4_0) or through
- * kvalues_iq4nl (IQ4_NL), as scalar unpack_block32. The lane sums are
- * then block32_lanes_sse4's, so the result is bit-identical.
- */
-float row_nibble32_q8_0_sse4(bool iq4nl, const std::byte* row,
-                             const float* xd, const std::int8_t* xq,
-                             std::size_t nb) {
-    constexpr std::size_t kBlk = 18;  // f16 scale + 16 nibble bytes
-    const __m128i lo4 = _mm_set1_epi8(0x0f);
-    const __m128i table = _mm_loadu_si128(
-        reinterpret_cast<const __m128i*>(kvalues_iq4nl));
-    const __m128i eight = _mm_set1_epi8(8);
-    const auto lanes = [&](const std::byte* blk, const std::int8_t* x) {
-        const __m128i b =
-            _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 2));
-        __m128i w0 = _mm_and_si128(b, lo4);
-        __m128i w1 = _mm_and_si128(_mm_srli_epi16(b, 4), lo4);
-        if (iq4nl) {
-            w0 = _mm_shuffle_epi8(table, w0);
-            w1 = _mm_shuffle_epi8(table, w1);
-        } else {
-            w0 = _mm_sub_epi8(w0, eight);
-            w1 = _mm_sub_epi8(w1, eight);
-        }
-        const __m128i x0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x));
-        const __m128i x1 =
-            _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + 16));
-        return _mm_add_epi32(lanes16_sse4(_mm_abs_epi8(w0), w0, x0),
-                             lanes16_sse4(_mm_abs_epi8(w1), w1, x1));
-    };
-    __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps();
-    std::size_t b = 0;
-#if defined(LOCUS_SSE4_AVX_VARIANT)
-    // As row_q8_0_q8_0_sse4: blocks b, b + 1 in one 256-bit sum.
     __m256 s8 = _mm256_setzero_ps();
     for (; b + 1 < nb; b += 2) {
         const std::byte* b0 = row + b * kBlk;
@@ -1028,6 +945,58 @@ float row_nibble32_q8_0_sse4(bool iq4nl, const std::byte* row,
         sum += static_cast<float>(p[0] + p[1] + p[2] + p[3]) * d;
     }
     return sum;
+}
+
+/**
+ * One Q8_0 weight row dotted with a Q8_0-quantized activation,
+ * bit-identical to scalar vec_dot_block32_q8_0.
+ */
+float row_q8_0_q8_0_sse4(const std::byte* row, const float* xd,
+                         const std::int8_t* xq, std::size_t nb) {
+    // f16 scale + 32 int8
+    return row_block32_q8_0_sse4<34>(
+        row, xd, xq, nb, [](const std::byte* blk, const std::int8_t* x) {
+            return block32_lanes_sse4(
+                reinterpret_cast<const std::int8_t*>(blk + 2), x);
+        });
+}
+
+/**
+ * One Q4_0 or IQ4_NL (18 B blocks) weight row dotted with a Q8_0
+ * activation, in row_q8_0_q8_0_sse4's float order (scalar
+ * vec_dot_block32_q8_0, which these types share with Q8_0). Each block
+ * is decoded to 32 int8 weights in two vectors first: weights 0-15 from
+ * the low nibbles, 16-31 from the high ones, minus 8 (Q4_0) or through
+ * kvalues_iq4nl (IQ4_NL), as scalar unpack_block32. The lane sums are
+ * then block32_lanes_sse4's, so the result is bit-identical.
+ */
+float row_nibble32_q8_0_sse4(bool iq4nl, const std::byte* row,
+                             const float* xd, const std::int8_t* xq,
+                             std::size_t nb) {
+    const __m128i lo4 = _mm_set1_epi8(0x0f);
+    const __m128i table = _mm_loadu_si128(
+        reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m128i eight = _mm_set1_epi8(8);
+    const auto lanes = [&](const std::byte* blk, const std::int8_t* x) {
+        const __m128i b =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 2));
+        __m128i w0 = _mm_and_si128(b, lo4);
+        __m128i w1 = _mm_and_si128(_mm_srli_epi16(b, 4), lo4);
+        if (iq4nl) {
+            w0 = _mm_shuffle_epi8(table, w0);
+            w1 = _mm_shuffle_epi8(table, w1);
+        } else {
+            w0 = _mm_sub_epi8(w0, eight);
+            w1 = _mm_sub_epi8(w1, eight);
+        }
+        const __m128i x0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x));
+        const __m128i x1 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + 16));
+        return _mm_add_epi32(lanes16_sse4(_mm_abs_epi8(w0), w0, x0),
+                             lanes16_sse4(_mm_abs_epi8(w1), w1, x1));
+    };
+    // f16 scale + 16 nibble bytes
+    return row_block32_q8_0_sse4<18>(row, xd, xq, nb, lanes);
 }
 
 /**
@@ -1239,16 +1208,9 @@ template <int kT>
 void q4_k_q8k_aux32_sse4_xt(const std::byte* blk, const Q8kAct* a,
                             std::size_t b, std::int32_t (*aux32)[8],
                             int* sumi) {
-    constexpr std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
-                            kmask3 = 0x03030303;
     const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 16);
     std::uint32_t utmp[4];
-    std::memcpy(utmp, blk + 4, 12);
-    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-    const std::uint32_t uaux = utmp[1] & kmask1;
-    utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-    utmp[2] = uaux;
-    utmp[0] &= kmask1;
+    unpack_k_scales(blk, utmp);
     const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
     for (int t = 0; t < kT; ++t) {
         sumi[t] = k_min_term(utmp, a[t].bsums + b * 16);
