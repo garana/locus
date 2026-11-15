@@ -534,117 +534,89 @@ bool serve_stage_mux(PipelineStage& stage, int listen_fd,
                            reload, max_batch);
 }
 
-bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
-                     int listen_fd, const std::vector<Cidr>& allow,
-                     const std::vector<HostPort>& downstreams,
-                     const StageConn& conn, const StageReload& reload,
-                     std::size_t max_batch) {
-    if (stages.empty()) {
-        std::fprintf(stderr, "serve_stage_mux: no executors\n");
-        ::close(listen_fd);
-        return false;
-    }
-    if (downstreams.empty()) {
-        std::fprintf(stderr, "serve_stage_mux: empty downstream pool\n");
-        ::close(listen_fd);
-        return false;
-    }
-    // Live, mutable copies so a hot reload (SIGHUP) can refresh the
-    // allowlist, pool and policy for future accepts without disturbing
-    // the caller's originals or any session already running.
-    std::vector<Cidr> allow_live = allow;
-    std::vector<HostPort> pool_live = downstreams;
-    StageConn conn_live = conn;
+namespace {
 
-    std::size_t cursor = 0;  // round-robin position in the pool
-    int completed = 0;       // sessions that have ended
-    bool all_clean = true;   // any session ended abnormally?
+/**
+ * serve_stage_mux's loop (i#1032): its state as members and each of its
+ * steps as a member function, where they were one function's locals
+ * and lambdas. The members keep the locals' names and order: `sessions`
+ * before `exec_wake` before `executors`, so the executors, destroyed
+ * first, drain their queued releases while the seqs and the wake pipe
+ * still exist. One object serves one serve_stage_mux call, on its
+ * thread.
+ */
+class MuxServer {
+  public:
+    MuxServer(const StageConn& conn, const StageReload& reload,
+              int listen_fd, const std::vector<Cidr>& allow,
+              const std::vector<HostPort>& downstreams)
+        : reload(reload),
+          listen_fd(listen_fd),
+          allow_live(allow),
+          pool_live(downstreams),
+          conn_live(conn),
+          metrics_fd(conn.metrics_fd),
+          metrics_path(conn.metrics_path),
+          metrics_labels(conn.metrics_labels) {}
+    MuxServer(const MuxServer&) = delete;
+    MuxServer& operator=(const MuxServer&) = delete;
 
-    sys::Poller poller;
-    poller.add(listen_fd);
-    if (reload.wake_fd >= 0) {
-        poller.add(reload.wake_fd);
-    }
-    // Keyed by input fd (the fd the poller reports). unique_ptr so a
-    // session's address -- and the seq* the executor holds across an
-    // in-flight step -- stays stable as the map rehashes. Declared
-    // BEFORE the executor so it is destroyed AFTER it (reverse order),
-    // keeping seqs alive while the executor's destructor drains any
-    // queued releases.
-    std::unordered_map<int, std::unique_ptr<MuxSession>> sessions;
-    // Reverse index out_fd -> in_fd for write-readiness events.
-    std::unordered_map<int, int> out_index;
-    // issue 68: idle downstream connections available for reuse, keyed by
-    // resolved "ip:port". free_session/reset_session return a clean, fully
-    // flushed, SESSION_END-terminated fd here (up to
-    // conn.downstream_idle_max per key) instead of closing it; try_dial
-    // checks one out, liveness-probes it, and reuses it before dialing.
-    // Touched only on the loop thread (the executors never see it).
-    //
-    // Operator note on executor distribution: reusing a pooled connection
-    // keeps the DOWNSTREAM stage's executor pin. The downstream treats a
-    // reused fd as the same session (issue 76: SESSION_END resets its KV
-    // but keeps the fd pinned to its original executor), so which
-    // downstream executor serves a connection is fixed when that
-    // connection is FIRST dialed and then rides every later reuse. Pool
-    // history, not least-loaded-at-accept, therefore shapes the
-    // downstream's executor load: a heavily reused connection concentrates
-    // on its first-assigned executor. Not a correctness issue (each
-    // session's KV is still isolated), but it can present as one
-    // downstream executor running hot with no apparent cause.
-    std::unordered_map<std::string, std::vector<int>> pool_idle;
-
-    // Self-pipe carrying the executor's completion wakeups into the
-    // poller (same shape as the SIGHUP wake). Non-blocking write end, per
-    // the StageExecutor contract.
-    // Declared before the executor so its fds outlive the executor's
-    // destructor (see WakePipe); closed automatically, never in the
-    // function body.
-    WakePipe exec_wake;
-    {
-        int fds[2];
-        if (::pipe(fds) != 0) {
-            ::close(listen_fd);
-            return false;
+    /**
+     * Watches the listener, the reload wake and the executors' wake pipe,
+     * and starts one executor per stage.
+     * @returns false, with listen_fd closed, when the pipe cannot be made.
+     */
+    bool start(const std::vector<PipelineStage*>& stages,
+               std::size_t max_batch) {
+        poller.add(listen_fd);
+        if (reload.wake_fd >= 0) {
+            poller.add(reload.wake_fd);
         }
-        exec_wake.r = fds[0];
-        exec_wake.w = fds[1];
+        {
+            int fds[2];
+            if (::pipe(fds) != 0) {
+                ::close(listen_fd);
+                return false;
+            }
+            exec_wake.r = fds[0];
+            exec_wake.w = fds[1];
+        }
+        set_nonblocking(exec_wake.r);
+        set_nonblocking(exec_wake.w);
+        poller.add(exec_wake.r);
+        executors.reserve(stages.size());
+        // K executors: each gets a share of the cores of its own (i#45),
+        // so their loops do not serialize on one pool and a lone request
+        // still fans out. The shares split the performance cores where the
+        // CPU has tiers (a matvec share on an efficiency core holds back
+        // the whole loop, as mt_fanout notes), else all cores; the first
+        // `cores % K` executors take one more. One executor keeps the
+        // process-wide pool.
+        const std::size_t k = stages.size();
+        for (std::size_t i = 0; i < k; ++i) {
+            executors.push_back(std::make_unique<StageExecutor>(
+                *stages[i], exec_wake.w, max_batch,
+                sys::ThreadPool::share_threads(i, k)));
+        }
+        exec_load.assign(stages.size(), 0);
+        in_floats = stages[0]->input_floats();
+        if (conn_live.on_peers && conn_live.peer_report_ms > 0) {
+            next_report = Clock::now();
+        }
+        if (metrics_fd >= 0) {
+            set_nonblocking(metrics_fd);
+            poller.add(metrics_fd);
+        }
+        kernel_allow(listen_fd, allow_live);  // --allow covers metrics too
+        kernel_allow(metrics_fd, allow_live);
+        return true;
     }
-    set_nonblocking(exec_wake.r);
-    set_nonblocking(exec_wake.w);
-    poller.add(exec_wake.r);
-    // One executor per stage, each a continuous-batching worker on its
-    // own stage (own KV cache + workspace). They share this one wake
-    // pipe (any completion wakes the loop, which drains them all). Owns
-    // ALL stage mutation; the loop never calls step()/reset() itself.
-    // Declared AFTER exec_wake so they destruct BEFORE it -- an
-    // executor's destructor drains its release backlog and writes wake
-    // bytes, which needs the pipe fd still open (and declared after
-    // `sessions`, so the seqs it touches then are still alive).
-    std::vector<std::unique_ptr<StageExecutor>> executors;
-    executors.reserve(stages.size());
-    // K executors: each gets a share of the cores of its own (i#45), so
-    // their loops do not serialize on one pool and a lone request still
-    // fans out. The shares split the performance cores where the CPU
-    // has tiers (a matvec share on an efficiency core holds back the
-    // whole loop, as mt_fanout notes), else all cores; the first
-    // `cores % K` executors take one more. One executor keeps the
-    // process-wide pool.
-    const std::size_t k = stages.size();
-    for (std::size_t i = 0; i < k; ++i) {
-        executors.push_back(std::make_unique<StageExecutor>(
-            *stages[i], exec_wake.w, max_batch,
-            sys::ThreadPool::share_threads(i, k)));
-    }
-    // Live session count per executor, for least-loaded assignment.
-    std::vector<std::size_t> exec_load(stages.size(), 0);
-    // i#854: the most floats an input frame may carry (every executor
-    // runs the same layers of the same model).
-    const std::uint32_t in_floats = stages[0]->input_floats();
+
+  private:
     // i#854: when a session's partial frame times out, or max() when it
     // has none: frames are pumped whenever no step is in flight and the
     // dial is done, so bytes left in inbuf then are part of one frame.
-    const auto frame_deadline = [&](const MuxSession& s) {
+    Clock::time_point frame_deadline(const MuxSession& s) const {
         if (conn_live.frame_timeout_ms <= 0 || s.cancelled ||
             !s.in_authed || s.in_flight || s.connecting || s.resetting ||
             s.inbuf.empty()) {
@@ -652,17 +624,14 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         }
         return std::max(s.last_input, s.idle_since) +
                std::chrono::milliseconds(conn_live.frame_timeout_ms);
-    };
-
-    // i#22: counters for GET /metrics. Only this loop thread touches them.
-    StageStats stats;
+    }
 
     // Pushes as much of `s.outbuf` to the downstream as it will take
     // without blocking, keeping frame order. Starts watching out_fd for
     // write-readiness when bytes remain and stops once drained.
     // @returns 0 fully flushed, 1 partial (bytes still pending), -1 the
     //     downstream errored and the session must be dropped.
-    auto flush_out = [&](MuxSession& s) -> int {
+    int flush_out(MuxSession& s) {
         while (!s.outbuf.empty()) {
             const ssize_t n = ::send(s.out_fd, s.outbuf.data(),
                                      s.outbuf.size(), kSendFlags);
@@ -688,7 +657,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             s.out_watched = false;
         }
         return 0;
-    };
+    }
 
     // issue 68: hand a session's downstream fd to the idle pool for reuse
     // (keyed by its resolved ip:port) instead of closing it -- but ONLY
@@ -700,7 +669,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // that case closes. out_index is erased before the fd is pooled-or-
     // closed (fd numbers recycle), and out_fd is cleared after any
     // push_back. Loop-thread-only, like the pool itself.
-    auto release_downstream = [&](MuxSession& s) {
+    void release_downstream(MuxSession& s) {
         if (s.out_fd < 0) {
             return;  // dropped mid-dial: no downstream to release
         }
@@ -735,13 +704,13 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             ::close(s.out_fd);  // off / unclean / short write / gone / cap
         }
         s.out_fd = -1;
-    };
+    }
 
     // Frees a torn-down session once its KV release has completed on the
     // executor (so the executor is no longer touching its seq): drop its
     // fds and map entries and count it. Called only from a release
     // completion.
-    auto free_session = [&](int fd) {
+    void free_session(int fd) {
         auto it = sessions.find(fd);
         if (it == sessions.end()) {
             return;
@@ -759,7 +728,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         --exec_load[s.exec];  // this executor has one fewer live session
         ++completed;
         sessions.erase(it);
-    };
+    }
 
     // Begins tearing a session down (EOF, error, decode/step/write
     // failure). Never frees it here -- the executor may hold its seq.
@@ -767,7 +736,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // release through the executor; if a step is in flight the release is
     // deferred to that step's completion (the no-release-under-a-running-
     // step rule). free_session runs when the release completes.
-    auto begin_drop = [&](MuxSession& s, bool clean) {
+    void begin_drop(MuxSession& s, bool clean) {
         if (s.cancelled) {
             return;  // already tearing down
         }
@@ -785,7 +754,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             executors[s.exec]->submit_release(s.in_fd, &s.seq);
             s.releasing = true;
         }
-    };
+    }
 
     // Issue 76: a SESSION_END frame ended the sequence but the peer is
     // keeping the connection open to reuse it. Release this session's KV
@@ -795,7 +764,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // when !in_flight, so no step holds the seq and the release submits
     // now. The session stays pinned to its executor (the FIFO release
     // rule holds; exec_load is unchanged -- the session is still live).
-    auto begin_reset = [&](MuxSession& s) {
+    void begin_reset(MuxSession& s) {
         if (s.cancelled || s.resetting) {
             return;
         }
@@ -809,7 +778,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             executors[s.exec]->submit_release(s.in_fd, &s.seq);
             s.releasing = true;
         }
-    };
+    }
 
     // Issue 39: drive this session's NON-BLOCKING downstream dial. Tries
     // pool entries from s.dial_cursor within the current sweep, advancing
@@ -819,7 +788,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // sweep or, once dial_sweeps hits reconnect_attempts, drops the session
     // (per-session, NEVER fatal to the loop). The caller must have closed
     // and deregistered any previous out_fd before calling.
-    auto try_dial = [&](MuxSession& s) {
+    void try_dial(MuxSession& s) {
         const std::size_t n = pool_live.size();
         for (;;) {
             if (s.dial_tried >= n) {
@@ -947,14 +916,14 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             // no resolver): advance to the next entry in this sweep.
             ++stats.dial_failures;
         }
-    };
+    }
 
     // The current dial failed -- synchronously (dial_start == -1, handled
     // inside try_dial) OR asynchronously: an error/hangup event on out_fd,
     // or dial_deadline elapsing with no event at all (a blackholed address
     // emits none). Close and deregister the in-progress fd, then continue
     // the sweep. One path for every failure shape (issue 39 Gap 2).
-    auto fail_dial = [&](MuxSession& s) {
+    void fail_dial(MuxSession& s) {
         ++stats.dial_failures;
         s.out_hs = false;  // i#849: the next entry starts a new handshake
         s.hs_answered = false;
@@ -970,12 +939,12 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             s.out_fd = -1;
         }
         try_dial(s);
-    };
+    }
 
     // Submits this session's next buffered frame to the executor if it
     // is idle -- one step in flight per session, which keeps ordering
     // free. A malformed frame tears the session down.
-    auto pump = [&](MuxSession& s) {
+    void pump(MuxSession& s) {
         // Gate on `connecting`: a step's output goes to the downstream, so
         // there is nothing to compute until the dial completes. Buffered
         // input waits in inbuf and is pumped on connect (issue 39).
@@ -1020,13 +989,13 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         s.last_request_id = in.request_id;
         executors[s.exec]->submit_step(s.in_fd, &s.seq, std::move(in));
         s.in_flight = true;
-    };
+    }
 
     // After recv or a step completion: if the peer is gone and the
     // session is idle (no step in flight, no complete frame left -- pump
     // would have taken it), tear it down. Clean iff it closed at a frame
     // boundary (nothing half-read) and the socket did not error.
-    auto maybe_finish = [&](MuxSession& s) {
+    void maybe_finish(MuxSession& s) {
         // Also gate on `connecting`, for the same reason pump() does: a
         // frame read while the dial is still in flight stays in inbuf
         // (pump is a no-op), so in_flight is false, and finishing here
@@ -1042,12 +1011,12 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             begin_drop(s,
                        s.in_authed && !s.read_error && s.inbuf.empty());
         }
-    };
+    }
 
     // The downstream is ready for frames (connected, and through the
     // handshake when there is a key): stop watching it and run the input
     // buffered while the dial was in flight.
-    auto dial_done = [&](MuxSession& s) {
+    void dial_done(MuxSession& s) {
         s.connecting = false;
         s.idle_since = Clock::now();  // the frame clock starts
         s.dial_deadline = Clock::time_point::max();
@@ -1057,12 +1026,12 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         }
         pump(s);          // process any input buffered mid-dial
         maybe_finish(s);  // or finish if the peer already left
-    };
+    }
 
     // i#849: the input's handshake answer is complete in inbuf. Sends the
     // proof and lets frames through, then starts the downstream dial; a
     // wrong answer drops the session. @returns false when it dropped.
-    auto check_answer = [&](MuxSession& s) {
+    bool check_answer(MuxSession& s) {
         const auto proof = s.hs_in->on_answer(
             std::string_view(s.inbuf).substr(0, kAnswerBytes));
         if (!proof ||
@@ -1081,7 +1050,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         s.hs_deadline = Clock::time_point::max();
         try_dial(s);  // as an accept without a key does
         return true;
-    };
+    }
 
     // Issue 76: re-initialize a session slot after its KV release, on a
     // SESSION_END (not a drop), so the SAME connection serves the next
@@ -1091,7 +1060,7 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // Not counted as completed and leaves exec_load untouched: the
     // session is continuing, not finishing. Runs only from a release
     // completion, so the executor is done with the old seq.
-    auto reset_session = [&](MuxSession& s) {
+    void reset_session(MuxSession& s) {
         // issue 68: pool the downstream fd for this connection's NEXT
         // sequence instead of closing it. release_downstream stops
         // watching it, erases out_index, sends SESSION_END and either
@@ -1139,11 +1108,11 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         // sequence's buffered bytes -- not SESSION_END again, which would
         // cycle release/reset forever.
         pump(s);      // dial for any already-buffered next-sequence bytes
-    };
+    }
 
     // i#21: the live peers, read on this thread when a report (or a
     // /metrics request, i#22) is due.
-    const auto collect_peers = [&] {
+    std::vector<PeerInfo> collect_peers() const {
         std::vector<PeerInfo> peers;
         for (const auto& [ifd, sp] : sessions) {
             const MuxSession& s = *sp;
@@ -1162,25 +1131,12 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             }
         }
         return peers;
-    };
-    const auto report_peers = [&] { conn_live.on_peers(collect_peers()); };
-    Clock::time_point next_report = Clock::time_point::max();
-    if (conn_live.on_peers && conn_live.peer_report_ms > 0) {
-        next_report = Clock::now();
     }
+    void report_peers() { conn_live.on_peers(collect_peers()); }
 
-    // i#22: GET /metrics on conn.metrics_fd. Each accepted scraper is a
-    // LoopConnection on this poller; the handler reads the loop's own
-    // state, so it needs no locks. Capped so a flood of scrapers cannot
-    // grow the map without bound (the excess is closed at accept).
-    constexpr std::size_t kMaxMetricsConns = 16;
-    const int metrics_fd = conn.metrics_fd;
-    const std::string metrics_path = conn.metrics_path;
-    const auto metrics_labels = conn.metrics_labels;
-    std::unordered_map<int, std::unique_ptr<http::LoopConnection>>
-        metrics_conns;
-    const http::LoopHandler metrics_handler = [&](const http::Request& req,
-                                                  http::Response& res) {
+    // i#22: GET /metrics, a LoopConnection's handler: it reads the loop's
+    // own state, so it needs no locks.
+    void metrics_handler(const http::Request& req, http::Response& res) {
         if (req.path != metrics_path) {
             res.status = 404;
             res.set_content("not found\n", "text/plain");
@@ -1204,9 +1160,9 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
         g.peers = collect_peers();
         res.set_content(render_stage_metrics(stats, g, metrics_labels),
                         "text/plain; version=0.0.4");
-    };
+    }
     // Applies a LoopConnection's Next to its fd's registration.
-    const auto metrics_next = [&](int fd, http::LoopConnection::Next n) {
+    void metrics_next(int fd, http::LoopConnection::Next n) {
         switch (n) {
             case http::LoopConnection::Next::kRead:
             case http::LoopConnection::Next::kIdle:  // async replies only
@@ -1221,10 +1177,10 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                 metrics_conns.erase(fd);
                 break;
         }
-    };
+    }
     // Accepts every pending scraper (the listener is non-blocking). The
     // page lists every peer's address, so --allow covers this port too.
-    const auto metrics_accept = [&] {
+    void metrics_accept() {
         for (;;) {
             std::string peer;
             const int fd = accept_one(metrics_fd, &peer);
@@ -1246,25 +1202,79 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
             }
             metrics_conns.emplace(
                 fd, std::make_unique<http::LoopConnection>(
-                        fd, http::LoopConfig{}, metrics_handler));
+                        fd, http::LoopConfig{},
+                        [this](const http::Request& req,
+                               http::Response& res) {
+                            metrics_handler(req, res);
+                        }));
             poller.add(fd);
         }
-    };
-    if (metrics_fd >= 0) {
-        set_nonblocking(metrics_fd);
-        poller.add(metrics_fd);
     }
-    kernel_allow(listen_fd, allow_live);  // --allow covers metrics too
-    kernel_allow(metrics_fd, allow_live);
+  public:
+    /**
+     * Serves until serve_sessions sessions have ended, the listener
+     * breaks or the poll fails, then shuts down.
+     * @returns Whether every session ended cleanly; false too on a broken
+     *     listener or a poll error.
+     */
+    bool run() {
+        for (;;) {
+            const int pr = poller.wait(events, wait_timeout());
+            if (pr < 0) {
+                result = false;
+                break;  // poll error
+            }
+            if (next_report != Clock::time_point::max() &&
+                Clock::now() >= next_report) {
+                report_peers();
+                next_report = Clock::now() + std::chrono::milliseconds(
+                                                 conn_live.peer_report_ms);
+            }
 
-    bool result = true;
-    std::vector<sys::Poller::Event> events;
-    std::vector<StageExecutor::Completion> comps;
-    for (;;) {
-        // Wait only until the nearest pending dial timer fires (a connect
-        // timeout for an in-progress dial, or a between-sweeps retry), so
-        // those bound without a blocking sleep; -1 (forever) when none are
-        // pending. Issue 39. A due peer report (i#21) bounds it too.
+            bool listen_ready = false;
+            bool metrics_ready = false;
+            for (const auto& ev : events) {
+                on_event(ev, listen_ready, metrics_ready);
+            }
+            fire_timers();
+            metrics_timeouts();
+            if (metrics_ready) {
+                metrics_accept();
+            }
+
+            // Stop once enough sessions have ended (freed, i.e. their KV
+            // released). Checked after the whole batch so a drop reached
+            // from any event -- input, downstream flush, or a completion
+            // -- counts.
+            if (conn_live.serve_sessions > 0 &&
+                completed >= conn_live.serve_sessions) {
+                result = all_clean;
+                break;
+            }
+
+            apply_reload();
+            if (listen_ready) {
+                const Accept a = accept_session();
+                if (a == Accept::kBroken) {
+                    result = false;
+                    break;  // listener broken
+                }
+                if (a == Accept::kDone) {
+                    result = all_clean;
+                    break;
+                }
+            }
+        }
+        shutdown();
+        return result;
+    }
+
+  private:
+    // Wait only until the nearest pending dial timer fires (a connect
+    // timeout for an in-progress dial, or a between-sweeps retry), so
+    // those bound without a blocking sleep; -1 (forever) when none are
+    // pending. Issue 39. A due peer report (i#21) bounds it too.
+    int wait_timeout() const {
         Clock::time_point earliest = next_report;
         for (const auto& [efd, esp] : sessions) {
             (void)efd;
@@ -1303,569 +1313,674 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
                               : static_cast<int>(ms);
             }
         }
-        const int pr = poller.wait(events, timeout);
-        if (pr < 0) {
-            result = false;
-            break;  // poll error
-        }
-        if (next_report != Clock::time_point::max() &&
-            Clock::now() >= next_report) {
-            report_peers();
-            next_report = Clock::now() + std::chrono::milliseconds(
-                                             conn_live.peer_report_ms);
-        }
+        return timeout;
+    }
 
-        bool listen_ready = false;
-        bool metrics_ready = false;
-        for (const auto& ev : events) {
-            if (reload.wake_fd >= 0 && ev.fd == reload.wake_fd) {
-                char buf[64];  // drain the (non-blocking) wake pipe
-                while (::read(reload.wake_fd, buf, sizeof(buf)) > 0) {
+    // One poller event: the reload wake, executor completions, a
+    // listener (flagged, then served after the batch), a scraper, a
+    // downstream fd or a session's input.
+    void on_event(const sys::Poller::Event& ev, bool& listen_ready,
+                  bool& metrics_ready) {
+        if (reload.wake_fd >= 0 && ev.fd == reload.wake_fd) {
+            char buf[64];  // drain the (non-blocking) wake pipe
+            while (::read(reload.wake_fd, buf, sizeof(buf)) > 0) {
+            }
+            return;
+        }
+        if (ev.fd == exec_wake.r) {
+            on_completions();
+            return;
+        }
+        if (ev.fd == listen_fd) {
+            listen_ready = true;  // accept after the session fds
+            return;
+        }
+        if (metrics_fd >= 0 && ev.fd == metrics_fd) {
+            metrics_ready = true;  // after the batch, as listen_ready
+            return;
+        }
+        if (const auto mit = metrics_conns.find(ev.fd);
+            mit != metrics_conns.end()) {
+            metrics_next(ev.fd, mit->second->on_event(ev));
+            return;
+        }
+        // An event on a downstream (out) fd.
+        if (const auto oit = out_index.find(ev.fd); oit != out_index.end()) {
+            const auto sit = sessions.find(oit->second);
+            if (sit != sessions.end()) {
+                on_downstream(*sit->second);
+            }
+            return;
+        }
+        // A session input fd. A missing entry means already gone.
+        auto it = sessions.find(ev.fd);
+        if (it == sessions.end()) {
+            return;
+        }
+        MuxSession& s = *it->second;
+        if (s.cancelled) {
+            return;  // torn down; ignore a late event
+        }
+        on_input(s);
+    }
+
+    // The executor finished one or more jobs. Drain the wake pipe and ALL
+    // completions (level-triggered: one wake may cover several), then act
+    // on each.
+    void on_completions() {
+        // Read THEN drain -- the order is deliberate, not
+        // interchangeable. A completion that lands after the
+        // drain keeps its wake byte in the pipe, so the next poll
+        // wakes and drains again (at worst a spurious wake). The
+        // reverse (drain then read) is a lost-wakeup: a
+        // completion arriving between them writes a byte that the
+        // read then swallows, leaving its result in done_ with
+        // nothing left to wake on.
+        char buf[64];
+        while (::read(exec_wake.r, buf, sizeof(buf)) > 0) {
+        }
+        comps.clear();
+        for (auto& ex : executors) {
+            ex->drain(comps);  // one wake may cover any executor
+        }
+        for (auto& c : comps) {
+            auto cit = sessions.find(c.session);
+            if (cit == sessions.end()) {
+                continue;  // already freed (should not happen)
+            }
+            if (c.is_release) {
+                // resetting AND not cancelled: a drop that raced a
+                // reset must win (free, not resurrect). Unreachable
+                // today -- begin_reset unwatches the fds and
+                // early-returns on cancelled, so nothing drops a
+                // resetting session -- but the guard removes the
+                // class rather than relying on that.
+                if (cit->second->resetting && !cit->second->cancelled) {
+                    reset_session(*cit->second);  // reuse the fd
+                } else {
+                    free_session(c.session);  // erases the session
                 }
                 continue;
             }
-            if (ev.fd == exec_wake.r) {
-                // The executor finished one or more jobs. Drain the wake
-                // pipe and ALL completions (level-triggered: one wake may
-                // cover several), then act on each.
-                // Read THEN drain -- the order is deliberate, not
-                // interchangeable. A completion that lands after the
-                // drain keeps its wake byte in the pipe, so the next poll
-                // wakes and drains again (at worst a spurious wake). The
-                // reverse (drain then read) is a lost-wakeup: a
-                // completion arriving between them writes a byte that the
-                // read then swallows, leaving its result in done_ with
-                // nothing left to wake on.
-                char buf[64];
-                while (::read(exec_wake.r, buf, sizeof(buf)) > 0) {
-                }
-                comps.clear();
-                for (auto& ex : executors) {
-                    ex->drain(comps);  // one wake may cover any executor
-                }
-                for (auto& c : comps) {
-                    auto cit = sessions.find(c.session);
-                    if (cit == sessions.end()) {
-                        continue;  // already freed (should not happen)
-                    }
-                    if (c.is_release) {
-                        // resetting AND not cancelled: a drop that raced a
-                        // reset must win (free, not resurrect). Unreachable
-                        // today -- begin_reset unwatches the fds and
-                        // early-returns on cancelled, so nothing drops a
-                        // resetting session -- but the guard removes the
-                        // class rather than relying on that.
-                        if (cit->second->resetting && !cit->second->cancelled) {
-                            reset_session(*cit->second);  // reuse the fd
-                        } else {
-                            free_session(c.session);  // erases the session
-                        }
-                        continue;
-                    }
-                    MuxSession& s = *cit->second;
-                    s.in_flight = false;
-                    s.idle_since = Clock::now();  // the frame clock starts
-                    if (s.cancelled) {
-                        // Dropped mid-step: the step is done with the seq,
-                        // so release it now and discard the output.
-                        if (!s.releasing) {
-                            executors[s.exec]->submit_release(s.in_fd,
-                                                              &s.seq);
-                            s.releasing = true;
-                        }
-                        continue;
-                    }
-                    if (!c.ok) {
-                        std::fprintf(stderr,
-                                     "serve_stage_mux: session dropped: "
-                                     "%s\n",
-                                     c.err.c_str());
-                        begin_drop(s, false);
-                        continue;
-                    }
-                    // Send the output downstream, then submit the next
-                    // buffered frame (or finish if the peer already left).
-                    ++stats.steps;
-                    encode(c.out, s.outbuf);
-                    if (flush_out(s) < 0) {
-                        std::fprintf(stderr,
-                                     "serve_stage_mux: session dropped: "
-                                     "downstream write failed\n");
-                        begin_drop(s, false);
-                        continue;
-                    }
-                    pump(s);
-                    maybe_finish(s);
-                }
-                continue;
-            }
-            if (ev.fd == listen_fd) {
-                listen_ready = true;  // accept after the session fds
-                continue;
-            }
-            if (metrics_fd >= 0 && ev.fd == metrics_fd) {
-                metrics_ready = true;  // after the batch, as listen_ready
-                continue;
-            }
-            if (const auto mit = metrics_conns.find(ev.fd);
-                mit != metrics_conns.end()) {
-                metrics_next(ev.fd, mit->second->on_event(ev));
-                continue;
-            }
-            // An event on a downstream (out) fd.
-            if (const auto oit = out_index.find(ev.fd);
-                oit != out_index.end()) {
-                const auto sit = sessions.find(oit->second);
-                if (sit == sessions.end()) {
-                    continue;
-                }
-                MuxSession& s = *sit->second;
-                if (s.connecting && s.out_hs) {
-                    // i#849: the dial's handshake. Read no more than the
-                    // field needs; the downstream sends nothing after it.
-                    const std::size_t want =
-                        s.hs_answered ? kProofBytes : kHelloBytes;
-                    bool gone = false;
-                    while (s.hs_buf.size() < want) {
-                        char buf[kHelloBytes + kProofBytes];
-                        const ssize_t n =
-                            ::recv(s.out_fd, buf, want - s.hs_buf.size(), 0);
-                        if (n > 0) {
-                            s.hs_buf.append(buf,
-                                            static_cast<std::size_t>(n));
-                            continue;
-                        }
-                        if (n < 0 && errno == EINTR) {
-                            continue;
-                        }
-                        gone = !(n < 0 && (errno == EAGAIN ||
-                                           errno == EWOULDBLOCK));
-                        break;
-                    }
-                    if (s.hs_buf.size() < want) {
-                        if (gone) {
-                            fail_dial(s);  // closed or errored mid-way
-                        }
-                        continue;  // the rest arrives later
-                    }
-                    if (!s.hs_answered) {
-                        const auto answer = s.hs_out->on_hello(s.hs_buf);
-                        if (!answer ||
-                            ::send(s.out_fd, answer->data(), answer->size(),
-                                   kSendFlags) !=
-                                static_cast<ssize_t>(answer->size())) {
-                            std::fprintf(stderr,
-                                         "serve_stage_mux: downstream %s "
-                                         "sent no valid handshake\n",
-                                         s.out_key.c_str());
-                            fail_dial(s);
-                            continue;
-                        }
-                        s.hs_answered = true;
-                        s.hs_buf.clear();
-                        continue;  // wait for the proof
-                    }
-                    if (!s.hs_out->on_proof(s.hs_buf)) {
-                        std::fprintf(stderr,
-                                     "serve_stage_mux: downstream %s does "
-                                     "not hold the key\n",
-                                     s.out_key.c_str());
-                        fail_dial(s);
-                        continue;
-                    }
-                    s.out_hs = false;
-                    s.hs_answered = false;
-                    s.hs_out.reset();
-                    s.hs_buf.clear();
-                    dial_done(s);
-                    continue;
-                }
-                if (s.connecting) {
-                    // The dial resolved. Dispatch on the PHASE, never on
-                    // ev.writable: the Poller suppresses writable when
-                    // error is set (sys/poller.cpp; tested at
-                    // test_poller.cpp "never reports a refused connect as
-                    // writable"), so a FAILED non-blocking connect lands as
-                    // writable=false / error=true. Keying on writable would
-                    // never fire on failure, the errored fd would stay
-                    // registered, and -- level-triggered -- the loop would
-                    // spin at 100% CPU. Any event here means "dial done";
-                    // read SO_ERROR exactly once.
-                    const int cerr = connect_result(s.out_fd);
-                    if (cerr == 0 && !s.key.empty() && s.out_fresh) {
-                        // i#849: connected; now wait for the hello. The
-                        // handshake gets its own deadline.
-                        poller.modify(s.out_fd, sys::Poller::Dir::kRead);
-                        s.out_hs = true;
-                        s.hs_out.emplace(s.key);
-                        s.dial_deadline =
-                            Clock::now() +
-                            std::chrono::milliseconds(
-                                conn_live.handshake_timeout_ms);
-                    } else if (cerr == 0) {
-                        dial_done(s);
-                    } else {
-                        fail_dial(s);  // try the next pool entry
-                    }
-                    continue;
-                }
-                // Not connecting: a parked flush resumes on writability.
-                if (flush_out(s) < 0) {
-                    std::fprintf(stderr,
-                                 "serve_stage_mux: session dropped: "
-                                 "downstream write failed\n");
-                    begin_drop(s, false);
-                }
-                continue;
-            }
-            // A session input fd. A missing entry means already gone.
-            auto it = sessions.find(ev.fd);
-            if (it == sessions.end()) {
-                continue;
-            }
-            MuxSession& s = *it->second;
+            MuxSession& s = *cit->second;
+            s.in_flight = false;
+            s.idle_since = Clock::now();  // the frame clock starts
             if (s.cancelled) {
-                continue;  // torn down; ignore a late event
-            }
-
-            // Drain every available byte into the frame buffer. read()==0
-            // (clean EOF) or -1 with a non-retriable errno is the only
-            // portable "peer gone" signal (sys::Poller contract); the
-            // flags are hints and buffered bytes are processed first.
-            for (;;) {
-                char buf[4096];
-                // i#849: before the answer checks out, read no more than
-                // the answer (a peer without the key gets no buffer); a
-                // client sends nothing past it until it has the proof.
-                const std::size_t want =
-                    s.in_authed ? sizeof(buf)
-                                : std::min(sizeof(buf),
-                                           kAnswerBytes - s.inbuf.size());
-                if (want == 0) {
-                    break;  // the answer is in: check it first
+                // Dropped mid-step: the step is done with the seq,
+                // so release it now and discard the output.
+                if (!s.releasing) {
+                    executors[s.exec]->submit_release(s.in_fd, &s.seq);
+                    s.releasing = true;
                 }
-                const ssize_t n = ::recv(s.in_fd, buf, want, 0);
-                if (n > 0) {
-                    stats.bytes_in += static_cast<std::uint64_t>(n);
-                    s.inbuf.append(buf, static_cast<std::size_t>(n));
-                    s.last_input = Clock::now();
-                    continue;
-                }
-                if (n == 0) {
-                    s.eof = true;  // clean EOF
-                    break;
-                }
-                if (errno == EINTR) {
-                    continue;
-                }
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    break;  // drained all that was ready
-                }
-                s.eof = true;
-                s.read_error = true;  // e.g. ECONNRESET
-                break;
-            }
-            if (s.eof) {
-                // Nothing more to read; stop the level-triggered EOF from
-                // re-firing while a step is still in flight.
-                poller.remove(s.in_fd);
-            }
-            if (!s.in_authed && s.inbuf.size() >= kAnswerBytes &&
-                !check_answer(s)) {
                 continue;
             }
-            // Submit the next frame if idle, then (once idle with the
-            // peer gone) tear down. The drop is honored only AFTER the
-            // buffered frame is submitted, so a client that sends its last
-            // frame and half-closes still gets its answer.
+            if (!c.ok) {
+                std::fprintf(stderr,
+                             "serve_stage_mux: session dropped: "
+                             "%s\n",
+                             c.err.c_str());
+                begin_drop(s, false);
+                continue;
+            }
+            // Send the output downstream, then submit the next
+            // buffered frame (or finish if the peer already left).
+            ++stats.steps;
+            encode(c.out, s.outbuf);
+            if (flush_out(s) < 0) {
+                std::fprintf(stderr,
+                             "serve_stage_mux: session dropped: "
+                             "downstream write failed\n");
+                begin_drop(s, false);
+                continue;
+            }
             pump(s);
             maybe_finish(s);
         }
+    }
 
-        // Fire elapsed dial timers (also runs on a pure-timeout wake). A
-        // connecting session whose dial_deadline passed is a blackholed
-        // address that emitted no event -> treat as a failed entry; one
-        // whose retry_at passed is due for its next sweep. fail_dial /
-        // try_dial may begin_drop, which does NOT erase from `sessions`
-        // (teardown defers to the release completion), so iterating is
-        // safe. Issue 39.
-        {
-            const Clock::time_point now = Clock::now();
-            for (auto& [tfd, tsp] : sessions) {
-                (void)tfd;
-                MuxSession& s = *tsp;
-                if (!s.in_authed && !s.cancelled && now >= s.hs_deadline) {
-                    std::fprintf(stderr,
-                                 "serve_stage_mux: session dropped: no "
-                                 "handshake answer within %d ms\n",
-                                 conn_live.handshake_timeout_ms);
-                    begin_drop(s, false);
+    // An event on session s's downstream fd: its dial's handshake, the
+    // dial resolving, or a parked flush resuming.
+    void on_downstream(MuxSession& s) {
+        if (s.connecting && s.out_hs) {
+            // i#849: the dial's handshake. Read no more than the
+            // field needs; the downstream sends nothing after it.
+            const std::size_t want =
+                s.hs_answered ? kProofBytes : kHelloBytes;
+            bool gone = false;
+            while (s.hs_buf.size() < want) {
+                char buf[kHelloBytes + kProofBytes];
+                const ssize_t n =
+                    ::recv(s.out_fd, buf, want - s.hs_buf.size(), 0);
+                if (n > 0) {
+                    s.hs_buf.append(buf, static_cast<std::size_t>(n));
                     continue;
                 }
-                if (now >= frame_deadline(s)) {
-                    std::fprintf(stderr,
-                                 "serve_stage_mux: session dropped: a "
-                                 "frame stalled for %d ms\n",
-                                 conn_live.frame_timeout_ms);
-                    begin_drop(s, false);
+                if (n < 0 && errno == EINTR) {
                     continue;
                 }
-                if (!s.connecting || s.cancelled) {
-                    continue;
-                }
-                if (s.out_fd >= 0) {
-                    if (s.dial_deadline != Clock::time_point::max() &&
-                        now >= s.dial_deadline) {
-                        fail_dial(s);  // connect timed out (no event came)
-                    }
-                } else if (s.retry_at != Clock::time_point::max() &&
-                           now >= s.retry_at) {
-                    s.retry_at = Clock::time_point::max();
-                    try_dial(s);  // start the next sweep
-                }
-            }
-        }
-
-        // i#22: time out stalled scrapers (collected first: a close
-        // erases from the map), then accept new ones.
-        if (!metrics_conns.empty()) {
-            const Clock::time_point now = Clock::now();
-            std::vector<int> due;
-            for (const auto& [mfd, mc] : metrics_conns) {
-                if (mc->deadline() <= now) {
-                    due.push_back(mfd);
-                }
-            }
-            for (const int mfd : due) {
-                metrics_next(mfd, metrics_conns.at(mfd)->on_timeout());
-            }
-        }
-        if (metrics_ready) {
-            metrics_accept();
-        }
-
-        // Stop once enough sessions have ended (freed, i.e. their KV
-        // released). Checked after the whole batch so a drop reached from
-        // any event -- input, downstream flush, or a completion -- counts.
-        if (conn_live.serve_sessions > 0 &&
-            completed >= conn_live.serve_sessions) {
-            result = all_clean;
-            break;
-        }
-
-        // Apply a pending reload before accepting, so a new session uses
-        // the fresh allowlist/pool/policy. Running sessions keep theirs.
-        if (reload.flag != nullptr && *reload.flag != 0 && reload.apply) {
-            *reload.flag = 0;
-            const std::string old_key = conn_live.key;
-            reload.apply(allow_live, pool_live, conn_live);
-            kernel_allow(listen_fd, allow_live);
-            kernel_allow(metrics_fd, allow_live);
-            if (conn_live.key != old_key) {
-                // The idle downstreams passed under the old key; new
-                // sessions would never take them (pool_tag), so close
-                // them now rather than hold them.
-                for (auto& [pkey, bucket] : pool_idle) {
-                    (void)pkey;
-                    for (const int pfd : bucket) {
-                        ::close(pfd);
-                    }
-                }
-                pool_idle.clear();
-            }
-        }
-
-        // Accept at most one new session per wakeup (level-triggered, so
-        // a backlog re-fires). Each session dials its own downstream and
-        // gets its own KV sequence.
-        if (listen_ready) {
-            const int in_fd = accept_allowed(listen_fd, allow_live);
-            if (in_fd < 0) {
-                result = false;
-                break;  // listener broken
-            }
-            ++stats.sessions_accepted;
-            set_keepalive(in_fd, conn_live.keepalive_idle_s,
-                          conn_live.keepalive_intvl_s,
-                          conn_live.keepalive_count);
-            // in_fd non-blocking so recv() drains without blocking. The
-            // downstream dial is non-blocking and poll-driven (issue 39):
-            // the loop never stalls on connect(2), so a slow or unreachable
-            // downstream no longer delays accepting or serving others.
-            if (!set_nonblocking(in_fd)) {
-                ::close(in_fd);
-                result = false;
+                gone = !(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
                 break;
             }
-            // A SIGHUP can replace pool_live wholesale, and build_runtime
-            // accepts a config with no downstream directives, so the pool
-            // can be empty here even though the initial one was not. Drop
-            // the session (there is nothing to dial) rather than fall into
-            // the `% pool_live.size()` below. That modulo is not merely a
-            // divide by zero: on x86-64 it raises SIGFPE and the stage
-            // dies, but on arm64 (UDIV by zero yields 0) it silently gives
-            // 0, falls into try_dial with an empty pool, and with the
-            // default reconnect_attempts == 0 retries forever -- the
-            // server livelocks and never returns. Same permanent-misconfig-
-            // at-accept shape as the no-resolver case; per-session, not
-            // fatal (a later reload may restore the pool). Reachable ONLY
-            // with a resolver set: without one, the no-numeric-entry check
-            // below already catches an empty pool vacuously, so only the
-            // resolver-configured path (what the CLI always uses) reaches
-            // the modulo -- which is why its test must install a resolver.
-            if (pool_live.empty()) {
-                std::fprintf(stderr,
-                             "serve_stage_mux: session dropped: no "
-                             "downstream configured\n");
-                ::close(in_fd);
-                all_clean = false;
-                ++stats.sessions_dropped;
-                ++completed;
-                if (conn_live.serve_sessions > 0 &&
-                    completed >= conn_live.serve_sessions) {
-                    result = all_clean;
-                    break;
+            if (s.hs_buf.size() < want) {
+                if (gone) {
+                    fail_dial(s);  // closed or errored mid-way
                 }
+                return;  // the rest arrives later
+            }
+            if (!s.hs_answered) {
+                const auto answer = s.hs_out->on_hello(s.hs_buf);
+                if (!answer ||
+                    ::send(s.out_fd, answer->data(), answer->size(),
+                           kSendFlags) !=
+                        static_cast<ssize_t>(answer->size())) {
+                    std::fprintf(stderr,
+                                 "serve_stage_mux: downstream %s "
+                                 "sent no valid handshake\n",
+                                 s.out_key.c_str());
+                    fail_dial(s);
+                    return;
+                }
+                s.hs_answered = true;
+                s.hs_buf.clear();
+                return;  // wait for the proof
+            }
+            if (!s.hs_out->on_proof(s.hs_buf)) {
+                std::fprintf(stderr,
+                             "serve_stage_mux: downstream %s does "
+                             "not hold the key\n",
+                             s.out_key.c_str());
+                fail_dial(s);
+                return;
+            }
+            s.out_hs = false;
+            s.hs_answered = false;
+            s.hs_out.reset();
+            s.hs_buf.clear();
+            dial_done(s);
+            return;
+        }
+        if (s.connecting) {
+            // The dial resolved. Dispatch on the PHASE, never on
+            // ev.writable: the Poller suppresses writable when
+            // error is set (sys/poller.cpp; tested at
+            // test_poller.cpp "never reports a refused connect as
+            // writable"), so a FAILED non-blocking connect lands as
+            // writable=false / error=true. Keying on writable would
+            // never fire on failure, the errored fd would stay
+            // registered, and -- level-triggered -- the loop would
+            // spin at 100% CPU. Any event here means "dial done";
+            // read SO_ERROR exactly once.
+            const int cerr = connect_result(s.out_fd);
+            if (cerr == 0 && !s.key.empty() && s.out_fresh) {
+                // i#849: connected; now wait for the hello. The
+                // handshake gets its own deadline.
+                poller.modify(s.out_fd, sys::Poller::Dir::kRead);
+                s.out_hs = true;
+                s.hs_out.emplace(s.key);
+                s.dial_deadline =
+                    Clock::now() +
+                    std::chrono::milliseconds(conn_live.handshake_timeout_ms);
+            } else if (cerr == 0) {
+                dial_done(s);
+            } else {
+                fail_dial(s);  // try the next pool entry
+            }
+            return;
+        }
+        // Not connecting: a parked flush resumes on writability.
+        if (flush_out(s) < 0) {
+            std::fprintf(stderr,
+                         "serve_stage_mux: session dropped: "
+                         "downstream write failed\n");
+            begin_drop(s, false);
+        }
+    }
+
+    // Input on session s's upstream fd.
+    void on_input(MuxSession& s) {
+        // Drain every available byte into the frame buffer. read()==0
+        // (clean EOF) or -1 with a non-retriable errno is the only
+        // portable "peer gone" signal (sys::Poller contract); the
+        // flags are hints and buffered bytes are processed first.
+        for (;;) {
+            char buf[4096];
+            // i#849: before the answer checks out, read no more than
+            // the answer (a peer without the key gets no buffer); a
+            // client sends nothing past it until it has the proof.
+            const std::size_t want =
+                s.in_authed ? sizeof(buf)
+                            : std::min(sizeof(buf),
+                                       kAnswerBytes - s.inbuf.size());
+            if (want == 0) {
+                break;  // the answer is in: check it first
+            }
+            const ssize_t n = ::recv(s.in_fd, buf, want, 0);
+            if (n > 0) {
+                stats.bytes_in += static_cast<std::uint64_t>(n);
+                s.inbuf.append(buf, static_cast<std::size_t>(n));
+                s.last_input = Clock::now();
                 continue;
             }
-            // Permanent misconfiguration, caught once at accept rather
-            // than rediscovered each sweep: with no resolver the dial
-            // needs numeric pool entries (issue 39). If none is numeric
-            // the session can never connect, so drop it now with a cause-
-            // specific message instead of burning reconnect_attempts x
-            // reconnect_wait_ms and reporting it as a generic timeout.
-            // Per-session, not fatal: a reload may add a resolver.
-            if (conn_live.resolver == nullptr) {
-                bool any_numeric = false;
-                for (const auto& hp : pool_live) {
-                    if (is_numeric_ip(hp.host)) {
-                        any_numeric = true;
-                        break;
-                    }
-                }
-                if (!any_numeric) {
-                    std::fprintf(stderr,
-                                 "serve_stage_mux: session dropped: no "
-                                 "downstream is a numeric address and no "
-                                 "resolver is configured\n");
-                    ::close(in_fd);
-                    all_clean = false;
-                    ++stats.sessions_dropped;
-                    // Count it like any ended session so serve_sessions
-                    // still bounds the loop, and stop here if met (the
-                    // normal check at the top of the loop would otherwise
-                    // not run until the next wakeup).
-                    ++completed;
-                    if (conn_live.serve_sessions > 0 &&
-                        completed >= conn_live.serve_sessions) {
-                        result = all_clean;
-                        break;
-                    }
-                    continue;
-                }
+            if (n == 0) {
+                s.eof = true;  // clean EOF
+                break;
             }
-            auto s = std::make_unique<MuxSession>();
-            s->in_fd = in_fd;
-            // Pin to the least-loaded executor (fewest live sessions;
-            // ties to the lowest index) so load spreads across the CPU
-            // lanes and the session's KV stays in that executor's cache.
-            // This pin is fixed for the session's life, and that is a
-            // CORRECTNESS requirement, not only a locality one: the
-            // no-release-under-a-running-step rule holds because a seq's
-            // release is FIFO-ordered behind its step in the SAME
-            // executor's single queue. Migrating a live session to
-            // another executor would let a release on one executor run
-            // concurrently with an in-flight step on another for the same
-            // seq -- the use-after-free that rule exists to prevent. So
-            // do not rebalance a live session, however tempting for load.
-            std::size_t best = 0;
-            for (std::size_t i = 1; i < exec_load.size(); ++i) {
-                if (exec_load[i] < exec_load[best]) {
-                    best = i;
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;  // drained all that was ready
+            }
+            s.eof = true;
+            s.read_error = true;  // e.g. ECONNRESET
+            break;
+        }
+        if (s.eof) {
+            // Nothing more to read; stop the level-triggered EOF from
+            // re-firing while a step is still in flight.
+            poller.remove(s.in_fd);
+        }
+        if (!s.in_authed && s.inbuf.size() >= kAnswerBytes &&
+            !check_answer(s)) {
+            return;
+        }
+        // Submit the next frame if idle, then (once idle with the
+        // peer gone) tear down. The drop is honored only AFTER the
+        // buffered frame is submitted, so a client that sends its last
+        // frame and half-closes still gets its answer.
+        pump(s);
+        maybe_finish(s);
+    }
+
+    // Fire elapsed dial timers (also runs on a pure-timeout wake). A
+    // connecting session whose dial_deadline passed is a blackholed
+    // address that emitted no event -> treat as a failed entry; one
+    // whose retry_at passed is due for its next sweep. fail_dial /
+    // try_dial may begin_drop, which does NOT erase from `sessions`
+    // (teardown defers to the release completion), so iterating is
+    // safe. Issue 39.
+    void fire_timers() {
+        const Clock::time_point now = Clock::now();
+        for (auto& [tfd, tsp] : sessions) {
+            (void)tfd;
+            MuxSession& s = *tsp;
+            if (!s.in_authed && !s.cancelled && now >= s.hs_deadline) {
+                std::fprintf(stderr,
+                             "serve_stage_mux: session dropped: no "
+                             "handshake answer within %d ms\n",
+                             conn_live.handshake_timeout_ms);
+                begin_drop(s, false);
+                continue;
+            }
+            if (now >= frame_deadline(s)) {
+                std::fprintf(stderr,
+                             "serve_stage_mux: session dropped: a "
+                             "frame stalled for %d ms\n",
+                             conn_live.frame_timeout_ms);
+                begin_drop(s, false);
+                continue;
+            }
+            if (!s.connecting || s.cancelled) {
+                continue;
+            }
+            if (s.out_fd >= 0) {
+                if (s.dial_deadline != Clock::time_point::max() &&
+                    now >= s.dial_deadline) {
+                    fail_dial(s);  // connect timed out (no event came)
                 }
-            }
-            s->exec = best;
-            ++exec_load[best];
-            // Seed the round-robin dial start (load-balance across the
-            // pool), then start the non-blocking dial. The session is in
-            // the map first so a pool-exhausted drop during the initial
-            // dial resolves through the normal release path.
-            s->dial_cursor = cursor;
-            cursor = (cursor + 1) % pool_live.size();
-            // i#849: with a key, greet the peer and dial only once it
-            // answers (check_answer), so a stranger never makes this
-            // stage dial. A fresh socket takes the 24 bytes at once.
-            s->key = conn_live.key;
-            bool greeted = true;
-            if (!s->key.empty()) {
-                // A one-way tag of the key, never the key (a log may
-                // print the pool's names).
-                s->pool_tag =
-                    "|key:" + sys::to_hex(sys::sha256(s->key)).substr(0, 16);
-                s->hs_in.emplace(s->key);
-                s->in_authed = false;
-                s->hs_deadline = Clock::now() +
-                                 std::chrono::milliseconds(
-                                     conn_live.handshake_timeout_ms);
-                const std::string& hello = s->hs_in->hello();
-                greeted = ::send(in_fd, hello.data(), hello.size(),
-                                 kSendFlags) ==
-                          static_cast<ssize_t>(hello.size());
-            }
-            poller.add(in_fd);  // watch upstream for input immediately
-            auto emplaced = sessions.emplace(in_fd, std::move(s));
-            MuxSession& ns = *emplaced.first->second;
-            if (!greeted) {
-                begin_drop(ns, false);  // the peer is already gone
-            } else if (ns.in_authed) {
-                try_dial(ns);  // registers out_fd (connecting)
+            } else if (s.retry_at != Clock::time_point::max() &&
+                       now >= s.retry_at) {
+                s.retry_at = Clock::time_point::max();
+                try_dial(s);  // start the next sweep
             }
         }
     }
 
-    for (const auto& [mfd, mc] : metrics_conns) {
-        (void)mc;
-        ::close(mfd);  // the listener itself is the caller's
-    }
-    metrics_conns.clear();
-    if (metrics_fd >= 0) {
-        poller.remove(metrics_fd);
+    // i#22: time out stalled scrapers (collected first: a close erases
+    // from the map). New ones are accepted after this.
+    void metrics_timeouts() {
+        if (metrics_conns.empty()) {
+            return;
+        }
+        const Clock::time_point now = Clock::now();
+        std::vector<int> due;
+        for (const auto& [mfd, mc] : metrics_conns) {
+            if (mc->deadline() <= now) {
+                due.push_back(mfd);
+            }
+        }
+        for (const int mfd : due) {
+            metrics_next(mfd, metrics_conns.at(mfd)->on_timeout());
+        }
     }
 
-    // Shutdown. The executor still owns every live seq, so route each
-    // remaining session's KV release through it (FIFO after any in-flight
-    // step) rather than touching the stage here. Close the fds now but
-    // leave the MuxSession objects alive: the executor's destructor --
-    // which runs when this function returns, BEFORE `sessions` is
-    // destroyed, since it is declared after it -- drains those queued
-    // releases, resetting the seqs; then `sessions` frees the objects.
-    for (auto& [fd, sp] : sessions) {
-        (void)fd;
-        if (!sp->releasing) {
-            executors[sp->exec]->submit_release(sp->in_fd, &sp->seq);
-            sp->releasing = true;
+    // Apply a pending reload before accepting, so a new session uses the
+    // fresh allowlist/pool/policy. Running sessions keep theirs.
+    void apply_reload() {
+        if (reload.flag == nullptr || *reload.flag == 0 || !reload.apply) {
+            return;
         }
-        ::close(sp->in_fd);
-        ::close(sp->out_fd);
-    }
-    // issue 68: close every downstream still parked in the idle pool.
-    // These have no live session, so there is no KV to release; just
-    // close the sockets (the peer sees EOF and tears down its side). Note
-    // the lifetime this implies: with conn.serve_sessions set (the test
-    // path), a pooled connection is closed HERE, when the loop exits,
-    // rather than when the pool would otherwise evict it -- so a pooled
-    // fd outlives the session that pooled it but not the serve loop.
-    for (auto& [key, bucket] : pool_idle) {
-        (void)key;
-        for (const int pfd : bucket) {
-            ::close(pfd);
+        *reload.flag = 0;
+        const std::string old_key = conn_live.key;
+        reload.apply(allow_live, pool_live, conn_live);
+        kernel_allow(listen_fd, allow_live);
+        kernel_allow(metrics_fd, allow_live);
+        if (conn_live.key != old_key) {
+            // The idle downstreams passed under the old key; new
+            // sessions would never take them (pool_tag), so close
+            // them now rather than hold them.
+            for (auto& [pkey, bucket] : pool_idle) {
+                (void)pkey;
+                for (const int pfd : bucket) {
+                    ::close(pfd);
+                }
+            }
+            pool_idle.clear();
         }
     }
-    ::close(listen_fd);
-    // exec_wake closes itself (WakePipe dtor), AFTER the executor's
-    // destructor has drained its release backlog -- so its write fd
-    // stays valid (and its number unreusable) throughout that drain.
-    return result;
+
+    /** What an accept leaves the loop to do. */
+    enum class Accept {
+        kOk,      // serving on
+        kDone,    // the drop at accept met serve_sessions
+        kBroken,  // the listener broke
+    };
+
+    // Drops a session at accept, for a cause that no dial can fix (no
+    // downstream, or none dialable). Count it like any ended session so
+    // serve_sessions still bounds the loop, and stop here if met (the
+    // normal check at the top of the loop would otherwise not run until
+    // the next wakeup).
+    Accept drop_at_accept(int in_fd, const char* why) {
+        std::fprintf(stderr, "serve_stage_mux: session dropped: %s\n", why);
+        ::close(in_fd);
+        all_clean = false;
+        ++stats.sessions_dropped;
+        ++completed;
+        if (conn_live.serve_sessions > 0 &&
+            completed >= conn_live.serve_sessions) {
+            return Accept::kDone;
+        }
+        return Accept::kOk;
+    }
+
+    // Accept at most one new session per wakeup (level-triggered, so a
+    // backlog re-fires). Each session dials its own downstream and gets
+    // its own KV sequence.
+    Accept accept_session() {
+        const int in_fd = accept_allowed(listen_fd, allow_live);
+        if (in_fd < 0) {
+            return Accept::kBroken;
+        }
+        ++stats.sessions_accepted;
+        set_keepalive(in_fd, conn_live.keepalive_idle_s,
+                      conn_live.keepalive_intvl_s, conn_live.keepalive_count);
+        // in_fd non-blocking so recv() drains without blocking. The
+        // downstream dial is non-blocking and poll-driven (issue 39):
+        // the loop never stalls on connect(2), so a slow or unreachable
+        // downstream no longer delays accepting or serving others.
+        if (!set_nonblocking(in_fd)) {
+            ::close(in_fd);
+            return Accept::kBroken;
+        }
+        // A SIGHUP can replace pool_live wholesale, and build_runtime
+        // accepts a config with no downstream directives, so the pool
+        // can be empty here even though the initial one was not. Drop
+        // the session (there is nothing to dial) rather than fall into
+        // the `% pool_live.size()` below. That modulo is not merely a
+        // divide by zero: on x86-64 it raises SIGFPE and the stage
+        // dies, but on arm64 (UDIV by zero yields 0) it silently gives
+        // 0, falls into try_dial with an empty pool, and with the
+        // default reconnect_attempts == 0 retries forever -- the
+        // server livelocks and never returns. Same permanent-misconfig-
+        // at-accept shape as the no-resolver case; per-session, not
+        // fatal (a later reload may restore the pool). Reachable ONLY
+        // with a resolver set: without one, the no-numeric-entry check
+        // below already catches an empty pool vacuously, so only the
+        // resolver-configured path (what the CLI always uses) reaches
+        // the modulo -- which is why its test must install a resolver.
+        if (pool_live.empty()) {
+            return drop_at_accept(in_fd, "no downstream configured");
+        }
+        // Permanent misconfiguration, caught once at accept rather
+        // than rediscovered each sweep: with no resolver the dial
+        // needs numeric pool entries (issue 39). If none is numeric
+        // the session can never connect, so drop it now with a cause-
+        // specific message instead of burning reconnect_attempts x
+        // reconnect_wait_ms and reporting it as a generic timeout.
+        // Per-session, not fatal: a reload may add a resolver.
+        if (conn_live.resolver == nullptr) {
+            bool any_numeric = false;
+            for (const auto& hp : pool_live) {
+                if (is_numeric_ip(hp.host)) {
+                    any_numeric = true;
+                    break;
+                }
+            }
+            if (!any_numeric) {
+                return drop_at_accept(in_fd,
+                                      "no downstream is a numeric address "
+                                      "and no resolver is configured");
+            }
+        }
+        auto s = std::make_unique<MuxSession>();
+        s->in_fd = in_fd;
+        // Pin to the least-loaded executor (fewest live sessions;
+        // ties to the lowest index) so load spreads across the CPU
+        // lanes and the session's KV stays in that executor's cache.
+        // This pin is fixed for the session's life, and that is a
+        // CORRECTNESS requirement, not only a locality one: the
+        // no-release-under-a-running-step rule holds because a seq's
+        // release is FIFO-ordered behind its step in the SAME
+        // executor's single queue. Migrating a live session to
+        // another executor would let a release on one executor run
+        // concurrently with an in-flight step on another for the same
+        // seq -- the use-after-free that rule exists to prevent. So
+        // do not rebalance a live session, however tempting for load.
+        std::size_t best = 0;
+        for (std::size_t i = 1; i < exec_load.size(); ++i) {
+            if (exec_load[i] < exec_load[best]) {
+                best = i;
+            }
+        }
+        s->exec = best;
+        ++exec_load[best];
+        // Seed the round-robin dial start (load-balance across the
+        // pool), then start the non-blocking dial. The session is in
+        // the map first so a pool-exhausted drop during the initial
+        // dial resolves through the normal release path.
+        s->dial_cursor = cursor;
+        cursor = (cursor + 1) % pool_live.size();
+        // i#849: with a key, greet the peer and dial only once it
+        // answers (check_answer), so a stranger never makes this
+        // stage dial. A fresh socket takes the 24 bytes at once.
+        s->key = conn_live.key;
+        bool greeted = true;
+        if (!s->key.empty()) {
+            // A one-way tag of the key, never the key (a log may
+            // print the pool's names).
+            s->pool_tag =
+                "|key:" + sys::to_hex(sys::sha256(s->key)).substr(0, 16);
+            s->hs_in.emplace(s->key);
+            s->in_authed = false;
+            s->hs_deadline =
+                Clock::now() +
+                std::chrono::milliseconds(conn_live.handshake_timeout_ms);
+            const std::string& hello = s->hs_in->hello();
+            greeted =
+                ::send(in_fd, hello.data(), hello.size(), kSendFlags) ==
+                static_cast<ssize_t>(hello.size());
+        }
+        poller.add(in_fd);  // watch upstream for input immediately
+        auto emplaced = sessions.emplace(in_fd, std::move(s));
+        MuxSession& ns = *emplaced.first->second;
+        if (!greeted) {
+            begin_drop(ns, false);  // the peer is already gone
+        } else if (ns.in_authed) {
+            try_dial(ns);  // registers out_fd (connecting)
+        }
+        return Accept::kOk;
+    }
+
+    // The loop is done: close the scrapers, route every live session's KV
+    // release through its executor, close the idle downstreams and the
+    // listener.
+    void shutdown() {
+        for (const auto& [mfd, mc] : metrics_conns) {
+            (void)mc;
+            ::close(mfd);  // the listener itself is the caller's
+        }
+        metrics_conns.clear();
+        if (metrics_fd >= 0) {
+            poller.remove(metrics_fd);
+        }
+
+        // Shutdown. The executor still owns every live seq, so route each
+        // remaining session's KV release through it (FIFO after any
+        // in-flight step) rather than touching the stage here. Close the
+        // fds now but leave the MuxSession objects alive: the executor's
+        // destructor -- which runs when this MuxServer is destroyed,
+        // BEFORE `sessions`, since it is declared after it -- drains
+        // those queued releases, resetting the seqs; then `sessions`
+        // frees the objects.
+        for (auto& [fd, sp] : sessions) {
+            (void)fd;
+            if (!sp->releasing) {
+                executors[sp->exec]->submit_release(sp->in_fd, &sp->seq);
+                sp->releasing = true;
+            }
+            ::close(sp->in_fd);
+            ::close(sp->out_fd);
+        }
+        // issue 68: close every downstream still parked in the idle pool.
+        // These have no live session, so there is no KV to release; just
+        // close the sockets (the peer sees EOF and tears down its side).
+        // Note the lifetime this implies: with conn.serve_sessions set
+        // (the test path), a pooled connection is closed HERE, when the
+        // loop exits, rather than when the pool would otherwise evict it
+        // -- so a pooled fd outlives the session that pooled it but not
+        // the serve loop.
+        for (auto& [key, bucket] : pool_idle) {
+            (void)key;
+            for (const int pfd : bucket) {
+                ::close(pfd);
+            }
+        }
+        ::close(listen_fd);
+        // exec_wake closes itself (WakePipe dtor), AFTER the executor's
+        // destructor has drained its release backlog -- so its write fd
+        // stays valid (and its number unreusable) throughout that drain.
+    }
+
+    // The caller's arguments (they outlive this object).
+    const StageReload& reload;
+    const int listen_fd;
+
+    // Live, mutable copies so a hot reload (SIGHUP) can refresh the
+    // allowlist, pool and policy for future accepts without disturbing
+    // the caller's originals or any session already running.
+    std::vector<Cidr> allow_live;
+    std::vector<HostPort> pool_live;
+    StageConn conn_live;
+
+    std::size_t cursor = 0;  // round-robin position in the pool
+    int completed = 0;       // sessions that have ended
+    bool all_clean = true;   // any session ended abnormally?
+
+    sys::Poller poller;
+    // Keyed by input fd (the fd the poller reports). unique_ptr so a
+    // session's address -- and the seq* the executor holds across an
+    // in-flight step -- stays stable as the map rehashes. Declared
+    // BEFORE the executor so it is destroyed AFTER it (reverse order),
+    // keeping seqs alive while the executor's destructor drains any
+    // queued releases.
+    std::unordered_map<int, std::unique_ptr<MuxSession>> sessions;
+    // Reverse index out_fd -> in_fd for write-readiness events.
+    std::unordered_map<int, int> out_index;
+    // issue 68: idle downstream connections available for reuse, keyed by
+    // resolved "ip:port". free_session/reset_session return a clean, fully
+    // flushed, SESSION_END-terminated fd here (up to
+    // conn.downstream_idle_max per key) instead of closing it; try_dial
+    // checks one out, liveness-probes it, and reuses it before dialing.
+    // Touched only on the loop thread (the executors never see it).
+    //
+    // Operator note on executor distribution: reusing a pooled connection
+    // keeps the DOWNSTREAM stage's executor pin. The downstream treats a
+    // reused fd as the same session (issue 76: SESSION_END resets its KV
+    // but keeps the fd pinned to its original executor), so which
+    // downstream executor serves a connection is fixed when that
+    // connection is FIRST dialed and then rides every later reuse. Pool
+    // history, not least-loaded-at-accept, therefore shapes the
+    // downstream's executor load: a heavily reused connection concentrates
+    // on its first-assigned executor. Not a correctness issue (each
+    // session's KV is still isolated), but it can present as one
+    // downstream executor running hot with no apparent cause.
+    std::unordered_map<std::string, std::vector<int>> pool_idle;
+
+    // Self-pipe carrying the executor's completion wakeups into the
+    // poller (same shape as the SIGHUP wake). Non-blocking write end, per
+    // the StageExecutor contract.
+    // Declared before the executor so its fds outlive the executor's
+    // destructor (see WakePipe); closed automatically, never in a member
+    // function.
+    WakePipe exec_wake;
+    // One executor per stage, each a continuous-batching worker on its
+    // own stage (own KV cache + workspace). They share this one wake
+    // pipe (any completion wakes the loop, which drains them all). Owns
+    // ALL stage mutation; the loop never calls step()/reset() itself.
+    // Declared AFTER exec_wake so they destruct BEFORE it -- an
+    // executor's destructor drains its release backlog and writes wake
+    // bytes, which needs the pipe fd still open (and declared after
+    // `sessions`, so the seqs it touches then are still alive).
+    std::vector<std::unique_ptr<StageExecutor>> executors;
+    // Live session count per executor, for least-loaded assignment.
+    std::vector<std::size_t> exec_load;
+    // i#854: the most floats an input frame may carry (every executor
+    // runs the same layers of the same model).
+    std::uint32_t in_floats = 0;
+
+    // i#22: counters for GET /metrics. Only this loop thread touches them.
+    StageStats stats;
+    // i#21: when the next peer report is due (max(): none).
+    Clock::time_point next_report = Clock::time_point::max();
+
+    // i#22: GET /metrics on conn.metrics_fd. Each accepted scraper is a
+    // LoopConnection on this poller. Capped so a flood of scrapers cannot
+    // grow the map without bound (the excess is closed at accept).
+    static constexpr std::size_t kMaxMetricsConns = 16;
+    const int metrics_fd;
+    const std::string metrics_path;
+    const std::vector<std::pair<std::string, std::string>> metrics_labels;
+    std::unordered_map<int, std::unique_ptr<http::LoopConnection>>
+        metrics_conns;
+
+    bool result = true;
+    std::vector<sys::Poller::Event> events;
+    std::vector<StageExecutor::Completion> comps;
+};
+
+}  // namespace
+
+bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
+                     int listen_fd, const std::vector<Cidr>& allow,
+                     const std::vector<HostPort>& downstreams,
+                     const StageConn& conn, const StageReload& reload,
+                     std::size_t max_batch) {
+    if (stages.empty()) {
+        std::fprintf(stderr, "serve_stage_mux: no executors\n");
+        ::close(listen_fd);
+        return false;
+    }
+    if (downstreams.empty()) {
+        std::fprintf(stderr, "serve_stage_mux: empty downstream pool\n");
+        ::close(listen_fd);
+        return false;
+    }
+    MuxServer mux(conn, reload, listen_fd, allow, downstreams);
+    if (!mux.start(stages, max_batch)) {
+        return false;
+    }
+    return mux.run();
 }
 
 }  // namespace locus::pipeline
