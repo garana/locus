@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/accelerate.hpp"
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
@@ -2500,4 +2501,90 @@ TEST_CASE("a matvec gives the same bits for any row split",
             }
         }
     }
+}
+
+// i#782: Accelerate's sgemm (LOCUS_CPU_FAST, Apple) against the scalar
+// matvec, per weight type, within a float reordering's error: F32 as
+// is, the other types dequantized a block of rows at a time (600 rows
+// of 8192 Q8_0 columns span two 16 MB blocks).
+TEST_CASE("sgemm_batch matches the scalar matvec within rounding",
+          "[ops][batch][accelerate]") {
+    if (!accelerate_available()) {
+        SKIP("this build has no Accelerate");
+    }
+    std::mt19937 rng(782);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    const auto check = [&](const Mat& m, std::uint32_t n) {
+        const std::size_t cols = m.cols;
+        std::vector<float> x(std::size_t{n} * cols);
+        for (auto& v : x) {
+            v = xd(rng);
+        }
+        std::vector<float> got(std::size_t{n} * m.rows);
+        REQUIRE(sgemm_batch(m, x, got, n));
+        std::vector<float> ref(m.rows), row(cols);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const float* xt = x.data() + t * cols;
+            matvec(m, {xt, cols}, ref);
+            for (std::uint32_t r = 0; r < m.rows; ++r) {
+                dequant_row(m, r, row);
+                double mag = 0.0;  // the sum of |w x|: what reordering moves
+                for (std::size_t i = 0; i < cols; ++i) {
+                    mag += std::fabs(double{row[i]} * xt[i]);
+                }
+                INFO("type " << static_cast<int>(m.type) << " rows "
+                             << m.rows << " n " << n << " row " << r
+                             << " tok " << t);
+                REQUIRE(std::fabs(double{got[std::size_t{t} * m.rows + r]} -
+                                  ref[r]) <= 1e-5 * mag + 1e-6);
+            }
+        }
+    };
+    constexpr std::uint32_t rows = 37, cols = 512;
+    std::vector<float> wf(std::size_t{rows} * cols);
+    for (auto& v : wf) {
+        v = xd(rng);
+    }
+    check(Mat{TensorType::kF32, reinterpret_cast<const std::byte*>(wf.data()),
+              rows, cols},
+          40);
+    std::vector<std::uint16_t> wh(wf.size()), wb(wf.size());
+    for (std::size_t i = 0; i < wf.size(); ++i) {
+        wh[i] = f32_to_f16(wf[i]);
+        std::uint32_t u;
+        std::memcpy(&u, &wf[i], sizeof u);
+        wb[i] = static_cast<std::uint16_t>(u >> 16);
+    }
+    check(Mat{TensorType::kF16, reinterpret_cast<const std::byte*>(wh.data()),
+              rows, cols},
+          33);
+    check(Mat{TensorType::kBF16, reinterpret_cast<const std::byte*>(wb.data()),
+              rows, cols},
+          33);
+    for (const TensorType t : {TensorType::kQ4_K, TensorType::kQ6_K}) {
+        std::vector<std::byte> w;
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            const auto q = k_quant_row(t, cols / 256, 782u + r);
+            w.insert(w.end(), q.begin(), q.end());
+        }
+        check(Mat{t, w.data(), rows, cols}, 40);
+    }
+    // Q8_0: 34-byte blocks of an f16 scale and 32 int8 values.
+    const auto q8 = [&](std::uint32_t nr, std::uint32_t nc) {
+        std::vector<std::byte> w(std::size_t{nr} * (nc / 32) * 34);
+        std::uniform_int_distribution<int> qd(-127, 127);
+        for (std::size_t b = 0; b < w.size() / 34; ++b) {
+            const std::uint16_t d = f32_to_f16(0.01f);
+            std::memcpy(w.data() + b * 34, &d, 2);
+            for (int i = 0; i < 32; ++i) {
+                w[b * 34 + 2 + i] =
+                    static_cast<std::byte>(static_cast<std::int8_t>(qd(rng)));
+            }
+        }
+        return w;
+    };
+    const auto small = q8(rows, cols);
+    check(Mat{TensorType::kQ8_0, small.data(), rows, cols}, 40);
+    const auto large = q8(600, 8192);
+    check(Mat{TensorType::kQ8_0, large.data(), 600, 8192}, 33);
 }

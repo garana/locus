@@ -136,10 +136,12 @@ as llama.cpp does; `LOCUS_F32_ACTIVATIONS=1` selects f32 activations.
 (today every CPU softmax: attention, MoE routing and the image
 encoders, about 2x faster; and on ARM CPUs with i8mm, such as the
 M2 and later, Q8_0 weights through `smmla`, about 27% faster prefill
-on an M2 Pro; on x86 CPUs with AVX but not AVX2, one-token Q4_K and
-Q6_K rows in llama.cpp's float order, about 17% faster one-thread
-decode on an i5-2400): close to the default results but not
-bit-identical, so the goldens are checked without it.
+on an M2 Pro; on Apple, prefill matmuls of 32 tokens or more through
+Accelerate's `cblas_sgemm` in 2048-token chunks, about 26% faster on a
+1680-token prompt on an M2 Pro; on x86 CPUs with AVX but not AVX2,
+one-token Q4_K and Q6_K rows in llama.cpp's float order, about 17%
+faster one-thread decode on an i5-2400): close to the default results
+but not bit-identical, so the goldens are checked without it.
 
 ### Validated models
 
@@ -201,9 +203,9 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   CPU a video DiT step takes about 8x PyTorch's (#982).
 - Performance: prefill on Apple GPUs at 44% of Metal's (#10:
   MoltenVK exposes no cooperative matrix, so a native Metal backend is
-  being built, #865 to #868), CPU prefill on an M2 Pro at about 60%
-  of llama.cpp's with `LOCUS_CPU_FAST` (llama.cpp sends its prompt
-  matmuls through Apple's Accelerate; whether locus should is #782).
+  being built, #865 to #868), CPU prefill on an M2 Pro with
+  `LOCUS_CPU_FAST` at 66% of llama.cpp's on a 561-token prompt (both
+  use Accelerate; 110% of it at 1680 tokens).
 - Multi-server inference, pipeline and expert parallel (#409, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
