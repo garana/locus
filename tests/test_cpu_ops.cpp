@@ -874,50 +874,57 @@ TEST_CASE("matvec_batch_sse4 Q4_K/Q6_K byte-identical to per-token "
 
 // i#982: the F32 and BF16 batch reads a row once for 4 tokens, each
 // token in the per-token kernel's order, so every value has its bits:
-// full tiles, the 1 to 3 tokens left, and a column tail.
+// full tiles, the 1 to 3 tokens left, and a column tail. 9 rows of 8192
+// columns span several row blocks (blocks of 4 rows in F32, 8 in BF16),
+// with a short last block.
 TEST_CASE("matvec_batch_sse4 F32 and BF16 tiles give the per-token bits",
           "[ops][batch][sse4]") {
     if (!locus::sys::detect().sse4) {
         SKIP("CPU lacks SSE4.1");
     }
-    constexpr std::uint32_t rows = 5, cols = 70;
     std::mt19937 rng(982);
     std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
-    std::vector<float> wf(std::size_t{rows} * cols);
-    for (auto& v : wf) {
-        v = xd(rng);
-    }
-    std::vector<std::uint16_t> wb(wf.size());
-    for (std::size_t i = 0; i < wf.size(); ++i) {
-        std::uint32_t u;
-        std::memcpy(&u, &wf[i], sizeof u);
-        wb[i] = static_cast<std::uint16_t>(u >> 16);
-    }
-    const Mat mats[] = {
-        {TensorType::kF32, reinterpret_cast<const std::byte*>(wf.data()),
-         rows, cols},
-        {TensorType::kBF16, reinterpret_cast<const std::byte*>(wb.data()),
-         rows, cols}};
-    for (const Mat& m : mats) {
-        for (std::uint32_t n : {1u, 3u, 4u, 5u, 9u}) {
-            std::vector<float> xb(std::size_t{n} * cols);
-            for (auto& v : xb) {
-                v = xd(rng);
-            }
-            std::vector<float> got(std::size_t{rows} * n);
-            matvec_batch_sse4(m, xb, got, n);
-            for (std::uint32_t tk = 0; tk < n; ++tk) {
-                std::vector<float> ref(rows);
-                matvec_sse4(m, {xb.data() + std::size_t{tk} * cols, cols},
-                            ref);
-                for (std::uint32_t r = 0; r < rows; ++r) {
-                    INFO("type " << static_cast<int>(m.type) << " n " << n
-                                 << " row " << r << " tok " << tk);
-                    REQUIRE(got[std::size_t{r} * n + tk] == ref[r]);
+    const auto check = [&](std::uint32_t rows, std::uint32_t cols) {
+        std::vector<float> wf(std::size_t{rows} * cols);
+        for (auto& v : wf) {
+            v = xd(rng);
+        }
+        std::vector<std::uint16_t> wb(wf.size());
+        for (std::size_t i = 0; i < wf.size(); ++i) {
+            std::uint32_t u;
+            std::memcpy(&u, &wf[i], sizeof u);
+            wb[i] = static_cast<std::uint16_t>(u >> 16);
+        }
+        const Mat mats[] = {
+            {TensorType::kF32, reinterpret_cast<const std::byte*>(wf.data()),
+             rows, cols},
+            {TensorType::kBF16,
+             reinterpret_cast<const std::byte*>(wb.data()), rows, cols}};
+        for (const Mat& m : mats) {
+            for (std::uint32_t n : {1u, 3u, 4u, 5u, 9u}) {
+                std::vector<float> xb(std::size_t{n} * cols);
+                for (auto& v : xb) {
+                    v = xd(rng);
+                }
+                std::vector<float> got(std::size_t{rows} * n);
+                matvec_batch_sse4(m, xb, got, n);
+                for (std::uint32_t tk = 0; tk < n; ++tk) {
+                    std::vector<float> ref(rows);
+                    matvec_sse4(m,
+                                {xb.data() + std::size_t{tk} * cols, cols},
+                                ref);
+                    for (std::uint32_t r = 0; r < rows; ++r) {
+                        INFO("type " << static_cast<int>(m.type) << " rows "
+                                     << rows << " cols " << cols << " n "
+                                     << n << " row " << r << " tok " << tk);
+                        REQUIRE(got[std::size_t{r} * n + tk] == ref[r]);
+                    }
                 }
             }
         }
-    }
+    };
+    check(5, 70);
+    check(9, 8192);
 }
 
 // i#691: the SSE4 Q8_K / Q8_0-activation batch (prefill's matvec) and
