@@ -178,6 +178,29 @@ void gelu(std::span<float> x) {
     }
 }
 
+void layer_norm(std::span<const float> x, std::uint32_t n, std::uint32_t w,
+                std::span<const float> g, std::span<const float> b, float eps,
+                std::span<float> out) {
+    parallel(n, [&](std::size_t t) {
+        const float* r = x.data() + t * w;
+        float* o = out.data() + t * w;
+        double mean = 0.0;
+        for (std::uint32_t i = 0; i < w; ++i) mean += r[i];
+        mean /= w;
+        double var = 0.0;
+        for (std::uint32_t i = 0; i < w; ++i) {
+            const double d = r[i] - mean;
+            var += d * d;
+        }
+        var /= w;
+        const auto inv = static_cast<float>(1.0 / std::sqrt(var + eps));
+        const auto m = static_cast<float>(mean);
+        for (std::uint32_t i = 0; i < w; ++i) {
+            o[i] = (r[i] - m) * inv * g[i] + b[i];
+        }
+    });
+}
+
 void rms_norm(std::span<const float> x, std::span<const float> w, float eps,
               std::uint32_t n, std::uint32_t d, std::span<float> out) {
     parallel(n, [&](std::size_t t) {
