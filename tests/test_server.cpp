@@ -1658,7 +1658,9 @@ TEST_CASE("a prompt the KV pool cannot hold is a 400 on each endpoint",
     auto tok = locus::tok::SpmTokenizer::from_gguf(g);
 
     locus::server::OpenAiServer::Options opt;
-    opt.engine.n_blocks = 2;  // 32 tokens, the 16 of headroom included
+    // 48 tokens: a prompt over 32 cannot fit with the 16 of decode
+    // headroom; the short request's templated prompt can.
+    opt.engine.n_blocks = 3;
     TestServer ts(model, tok, opt);
     httplib::Client client("127.0.0.1", ts.port);
     // A parked request would never answer: fail instead of hanging.
@@ -1668,7 +1670,8 @@ TEST_CASE("a prompt the KV pool cannot hold is a 400 on each endpoint",
     for (int i = 0; i < 10; ++i) {
         big += "the little dog ran home ";
     }
-    // Past the pool, inside the context (so the pool is what refuses).
+    // Past the pool (over 48 - 16), inside the context (so the pool is
+    // what refuses).
     const std::size_t n_big = tok.encode(big, true).size();
     REQUIRE(n_big > 32);
     REQUIRE(n_big < model.hparams().n_ctx);
