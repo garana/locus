@@ -753,6 +753,96 @@ kernel void attn_fused(device const float* q [[buffer(0)]],
     }
 }
 
+struct AttnSplitParams {
+    AttnParams a;
+    uint n_parts;  // kAttnGroup positions a part
+};
+
+// Split-K decode attention, pass 1: threadgroup g is head g / n_parts
+// over part g % n_parts's kAttnGroup positions (a thread a position).
+// It writes the part's max score m, its exp sum l and its unnormalized
+// value sums into part[g * (head_dim + 2) ..]: head_dim sums, m, l.
+kernel void attn_split(device const float* q [[buffer(0)]],
+                       device const float* pool [[buffer(1)]],
+                       device const uint* blocks [[buffer(2)]],
+                       device float* part_out [[buffer(3)]],
+                       constant AttnSplitParams& sp [[buffer(4)]],
+                       uint g [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]]) {
+    constant AttnParams& p = sp.a;
+    threadgroup float s[kAttnGroup];
+    threadgroup float part[32];
+    threadgroup float red[kAttnGroup];
+    const uint h = g / sp.n_parts, pi = g % sp.n_parts;
+    const uint kvh = h / (p.n_heads / p.n_kv_heads);
+    const uint t0 = pi * kAttnGroup;
+    const uint cnt = min(kAttnGroup, p.n_pos - t0);
+    device const float4* qh = (device const float4*)(q + h * p.head_dim);
+    float d = -INFINITY;
+    if (tid < cnt) {
+        device const float4* k = (device const float4*)(
+            pool + kv_row(p, blocks, t0 + tid) + kvh * p.head_dim);
+        d = 0.0f;
+        for (uint i = 0; i < p.head_dim / 4; ++i) {
+            d += dot(qh[i], k[i]);
+        }
+        d *= p.kq_scale;
+    }
+    const float m = group_max(d, part, tid, kAttnGroup);
+    const float e = tid < cnt ? exp(d - m) : 0.0f;
+    s[tid] = e;
+    const float l = group_sum(e, part, tid, kAttnGroup);
+    const uint per = kAttnGroup / p.head_dim;
+    const uint c = tid % p.head_dim, slice = tid / p.head_dim;
+    float acc = 0.0f;
+    if (slice < per) {
+        for (uint t = slice; t < cnt; t += per) {
+            acc += s[t] * pool[kv_row(p, blocks, t0 + t) + p.v_off +
+                               kvh * p.head_dim + c];
+        }
+    }
+    red[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float* o = part_out + ulong(g) * (p.head_dim + 2);
+    if (slice == 0) {
+        float v = 0.0f;
+        for (uint j = 0; j < per; ++j) {
+            v += red[j * p.head_dim + c];
+        }
+        o[c] = v;
+    }
+    if (tid == 0) {
+        o[p.head_dim] = m;
+        o[p.head_dim + 1] = l;
+    }
+}
+
+// Pass 2, a thread a (head, dimension): the parts rescaled to the
+// head's max, out = sum exp(m_p - M) acc_p / sum exp(m_p - M) l_p.
+kernel void attn_merge(device const float* part_out [[buffer(0)]],
+                       device float* out [[buffer(1)]],
+                       constant AttnSplitParams& sp [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    constant AttnParams& p = sp.a;
+    if (i >= p.n_heads * p.head_dim) {
+        return;
+    }
+    const uint h = i / p.head_dim, c = i % p.head_dim;
+    const uint w = p.head_dim + 2;
+    device const float* b = part_out + ulong(h) * sp.n_parts * w;
+    float mx = -INFINITY;
+    for (uint j = 0; j < sp.n_parts; ++j) {
+        mx = max(mx, b[j * w + p.head_dim]);
+    }
+    float num = 0.0f, den = 0.0f;
+    for (uint j = 0; j < sp.n_parts; ++j) {
+        const float f = exp(b[j * w + p.head_dim] - mx);
+        num += f * b[j * w + c];
+        den += f * b[j * w + p.head_dim + 1];
+    }
+    out[i] = num / den;
+}
+
 // ---------------------------------------------------------------------
 // Prefill matmul (i#866, from #799): Y[t][r] = scale * (W X)[r][t] (+ Y)
 // for Q4_K W rows and f32 token rows of X and Y. A threadgroup of 128
