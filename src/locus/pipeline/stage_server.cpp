@@ -631,15 +631,10 @@ bool serve_stage_mux(const std::vector<PipelineStage*>& stages,
     // `cores % K` executors take one more. One executor keeps the
     // process-wide pool.
     const std::size_t k = stages.size();
-    const unsigned pcores = sys::performance_cores();
-    const std::size_t cores =
-        pcores > 0 ? pcores : std::max(1u, std::thread::hardware_concurrency());
     for (std::size_t i = 0; i < k; ++i) {
-        const std::size_t threads =
-            k > 1 ? std::max<std::size_t>(1, cores / k + (i < cores % k))
-                  : 0;
         executors.push_back(std::make_unique<StageExecutor>(
-            *stages[i], exec_wake.w, max_batch, threads));
+            *stages[i], exec_wake.w, max_batch,
+            sys::ThreadPool::share_threads(i, k)));
     }
     // Live session count per executor, for least-loaded assignment.
     std::vector<std::size_t> exec_load(stages.size(), 0);

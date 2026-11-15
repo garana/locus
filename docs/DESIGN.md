@@ -1045,6 +1045,17 @@ single-host run; at concurrency at or above the pipeline depth,
 throughput approaches the single-box ceiling, with only the hop
 latency added.
 
+`locus-server` serves the same way from several engines
+(`server::EngineGroup`, #929): each an `EngineLoop` with its own
+engine, KV pool and worker over the one loaded model, on its own
+Vulkan device (its pool made with the caller bound there, its worker
+bound to it) or its own share of the CPU cores
+(`sys::ThreadPool::share_threads`, as the stage executors). A request
+goes to the engine with the fewest unreleased requests and stays
+there; its id is `local * engines + engine`, so one engine keeps
+today's ids. `/metrics` sums the engines. The disk prefix tier serves
+one engine only; CUDA serves one engine (#924).
+
 ## 15. 8-bit activations (R16)
 
 llama.cpp does not dot quantized weights against f32 activations. For

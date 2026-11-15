@@ -41,6 +41,22 @@ class Histogram {
         std::vector<std::uint64_t> cumulative;  ///< per bound, then +Inf
         std::uint64_t count = 0;
         double sum = 0;
+
+        /** Adds another histogram's snapshot with the same bounds (one
+         *  per engine, rendered as one, i#929); into an empty
+         *  Snapshot{} it copies. */
+        void add(const Snapshot& o) {
+            if (bounds.empty() && cumulative.empty()) {
+                *this = o;
+                return;
+            }
+            for (std::size_t i = 0;
+                 i < cumulative.size() && i < o.cumulative.size(); ++i) {
+                cumulative[i] += o.cumulative[i];
+            }
+            count += o.count;
+            sum += o.sum;
+        }
     };
     Snapshot snapshot() const;
 

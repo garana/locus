@@ -44,6 +44,19 @@ ThreadPool& ThreadPool::instance() {
     return pool;
 }
 
+std::size_t ThreadPool::share_threads(std::size_t i, std::size_t k) {
+    if (k <= 1) {
+        return 0;
+    }
+    // A matvec share on an efficiency core holds back the whole loop
+    // (as mt_fanout notes), so shares split the performance cores.
+    const unsigned pcores = performance_cores();
+    const std::size_t cores =
+        pcores > 0 ? pcores
+                   : std::max(1u, std::thread::hardware_concurrency());
+    return std::max<std::size_t>(1, cores / k + (i < cores % k));
+}
+
 ThreadPool::Scope::Scope(ThreadPool& pool) : prev_(t_current) {
     t_current = &pool;
 }
