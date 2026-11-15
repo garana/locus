@@ -121,8 +121,9 @@ class EngineGroup {
     /** How many more unreleased requests than the least-loaded engine
      *  the prefix's engine may hold and still take it. */
     static constexpr std::size_t kPrefixSlack = 1;
-    /** Most prefix keys kept (then the map starts over). */
-    static constexpr std::size_t kPrefixKeys = 4096;
+    /** Most prefix keys kept (then the map starts over): about 1000
+     *  conversations of kPrefixMaxBlocks keys each (i#1003), a few MB. */
+    static constexpr std::size_t kPrefixKeys = 65536;
     /** Most blocks of one prompt keyed (its first 1024 tokens). */
     static constexpr std::size_t kPrefixMaxBlocks = 64;
     /** @returns One key per whole kPrefixKeyTokens block of the prompt
