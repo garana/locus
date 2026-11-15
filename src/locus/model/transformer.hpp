@@ -264,6 +264,11 @@ class TransformerModel {
      */
     void use_backend(const backend::Backend& b) { backend_ = &b; }
 
+    /** @returns Whether metal_forward takes this model on its backend
+     *  (any cache conditions aside): the batched paths then run it a
+     *  token at a time, so they match the per-token forward. */
+    bool metal_forward_supported() const;
+
     /** @returns The backend currently doing the math. */
     const backend::Backend& active_backend() const {
         return *backend_;
@@ -833,11 +838,6 @@ class TransformerModel {
      *  KV attention, a plain llama with every layer here, no MoE layer,
      *  and LOCUS_CUDA_FORWARD not 0. */
     bool cuda_forward_supported() const;
-
-    /** @returns Whether metal_forward takes this model on its backend
-     *  (any cache conditions aside): the batched paths then run it a
-     *  token at a time, so they match the per-token forward. */
-    bool metal_forward_supported() const;
 
     /**
      * Metal forward of a plain llama model (i#866): one token at
