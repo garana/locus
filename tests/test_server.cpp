@@ -3190,7 +3190,11 @@ TEST_CASE("video jobs make an mp4", "[server][e2e]") {
     REQUIRE(r->get_header_value("X-Video-Seed") == "7");
     const std::string id = job["id"];
     json now;
-    for (int i = 0; i < 1200; ++i) {
+    // The job takes about 214 s alone on an i5-2400, and more on a busy
+    // host; the deadline is for a slow host, not a speed check (i#1051).
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::minutes(15);
+    while (std::chrono::steady_clock::now() < deadline) {
         now = json::parse(c.Get("/v1/videos/" + id)->body);
         if (now["status"] == "completed" || now["status"] == "failed") break;
         const auto early = c.Get("/v1/videos/" + id + "/content");
