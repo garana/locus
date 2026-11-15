@@ -2112,44 +2112,17 @@ void vulkan_release_weights(const void* p, std::size_t n) {
     s.pool.release_range(p, n);
 }
 
-void matvec_vulkan(const Mat& w, std::span<const float> x,
-                   std::span<float> out) {
-    if (matvec_kernel(w) == Kernel::kCount_) {
-        static Fallback& f =
-            fallback("vulkan", "cpu", "no matvec shader for the weight type");
-        f.add();
-        matvec(w, x, out);  // no shader for this weight type
-        return;
-    }
-    std::lock_guard lk(state_mu());
-    State& s = state();
-    const Kernel k = matvec_kernel(w);
-    auto wb = s.upload_w(w);
-    s.grow(s.x, s.x_n, x.size());
-    s.grow(s.xb, s.xb_n, out.size());
-    s.ctx.write_buffer(s.x, std::as_bytes(x));
-    const VulkanContext::Buffer grid = s.grid_for(k);
-    s.ctx.begin_batch();
-    State::BatchScope batch_scope{s};
-    const VulkanContext::Buffer bufs[] = {wb, s.x, s.xb, grid};
-    const std::size_t nbuf = grid.impl != nullptr ? 4u : 3u;
-    const std::uint32_t push[] = {w.rows, w.cols, 0, 0, 0, 0,
-                                  fbits(1.0f)};
-    s.ctx.dispatch(k, {bufs, nbuf}, push,
-                   VulkanContext::matvec_groups(k, w.rows));
-    s.end_batch();
-    s.ctx.read_buffer(s.xb, std::as_writable_bytes(out));
-}
+namespace {
 
-double vulkan_matvec_repeat(const Mat& w, std::span<const float> x,
-                            std::span<float> out, std::uint32_t reps) {
-    if (matvec_kernel(w) == Kernel::kCount_) {
-        throw std::invalid_argument(
-            "vulkan_matvec_repeat: no matvec shader for the weight type");
-    }
-    if (reps == 0 || x.size() != w.cols || out.size() != w.rows) {
-        throw std::invalid_argument("vulkan_matvec_repeat: arguments");
-    }
+/**
+ * w . x into out on the GPU (w has a matvec kernel): the dispatch is
+ * recorded `reps` times in one batch, each over the same buffers, so
+ * out holds one product (i#1023: matvec_vulkan and
+ * vulkan_matvec_repeat's one path).
+ * @returns The batch's submit-to-done time in milliseconds.
+ */
+double run_matvec(const Mat& w, std::span<const float> x,
+                  std::span<float> out, std::uint32_t reps) {
     std::lock_guard lk(state_mu());
     State& s = state();
     const Kernel k = matvec_kernel(w);
@@ -2172,8 +2145,33 @@ double vulkan_matvec_repeat(const Mat& w, std::span<const float> x,
     s.end_batch();
     const auto t1 = std::chrono::steady_clock::now();
     s.ctx.read_buffer(s.xb, std::as_writable_bytes(out));
-    return std::chrono::duration<double, std::milli>(t1 - t0).count() /
-           reps;
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+}  // namespace
+
+void matvec_vulkan(const Mat& w, std::span<const float> x,
+                   std::span<float> out) {
+    if (matvec_kernel(w) == Kernel::kCount_) {
+        static Fallback& f =
+            fallback("vulkan", "cpu", "no matvec shader for the weight type");
+        f.add();
+        matvec(w, x, out);  // no shader for this weight type
+        return;
+    }
+    run_matvec(w, x, out, 1);
+}
+
+double vulkan_matvec_repeat(const Mat& w, std::span<const float> x,
+                            std::span<float> out, std::uint32_t reps) {
+    if (matvec_kernel(w) == Kernel::kCount_) {
+        throw std::invalid_argument(
+            "vulkan_matvec_repeat: no matvec shader for the weight type");
+    }
+    if (reps == 0 || x.size() != w.cols || out.size() != w.rows) {
+        throw std::invalid_argument("vulkan_matvec_repeat: arguments");
+    }
+    return run_matvec(w, x, out, reps) / reps;
 }
 
 void matvec_batch_vulkan(const Mat& w, std::span<const float> x,
@@ -3406,12 +3404,18 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                                VulkanContext::matvec_groups(
                                    Kernel::kMatvecQ8_0GluShB, ff),
                                k_used + n_sh);
-            } else if (g.type == gguf::TensorType::kQ8_0 &&
-                       u.type == gguf::TensorType::kQ8_0 &&
+            } else if (g.type == u.type &&
+                       (g.type == gguf::TensorType::kQ8_0 ||
+                        g.type == gguf::TensorType::kQ4_K) &&
                        lay.gate_exps.expert_bytes ==
                            lay.up_exps.expert_bytes) {
-                // Routed gate, up and silu_mul in one dispatch: slot
-                // y = picked expert y, its ff outputs at y * ff.
+                // Routed gate, up and silu_mul in one dispatch, over Q8_0
+                // or Q4_K experts (matvec_q8_0_glu_b / matvec_q4_k_glu_b;
+                // the activations read once): slot y = picked expert y,
+                // its ff outputs at y * ff.
+                const Kernel glu = g.type == gguf::TensorType::kQ8_0
+                                       ? Kernel::kMatvecQ8_0GluB
+                                       : Kernel::kMatvecQ4_KGluB;
                 const VulkanContext::Buffer bufs[] = {
                     s.upload_experts(lay.gate_exps, hp.n_expert), s.xb,
                     s.gate, s.route,
@@ -3420,27 +3424,8 @@ bool vulkan_forward_layers(const model::TransformerModel& m,
                     ff, g.cols, 0, 0, 0, 0, fbits(1.0f),
                     w_off_units(g, lay.gate_exps.expert_bytes), 0, ff,
                     k_used, kRouteIds, 0};
-                s.ctx.dispatch(Kernel::kMatvecQ8_0GluB, bufs, push,
-                               VulkanContext::matvec_groups(
-                                   Kernel::kMatvecQ8_0GluB, ff),
-                               k_used);
-            } else if (g.type == gguf::TensorType::kQ4_K &&
-                       u.type == gguf::TensorType::kQ4_K &&
-                       lay.gate_exps.expert_bytes ==
-                           lay.up_exps.expert_bytes) {
-                // The same fusion over Q4_K experts (matvec_q4_k_glu_b):
-                // one dispatch, the activations read once.
-                const VulkanContext::Buffer bufs[] = {
-                    s.upload_experts(lay.gate_exps, hp.n_expert), s.xb,
-                    s.gate, s.route,
-                    s.upload_experts(lay.up_exps, hp.n_expert)};
-                const std::uint32_t push[] = {
-                    ff, g.cols, 0, 0, 0, 0, fbits(1.0f),
-                    w_off_units(g, lay.gate_exps.expert_bytes), 0, ff,
-                    k_used, kRouteIds, 0};
-                s.ctx.dispatch(Kernel::kMatvecQ4_KGluB, bufs, push,
-                               VulkanContext::matvec_groups(
-                                   Kernel::kMatvecQ4_KGluB, ff),
+                s.ctx.dispatch(glu, bufs, push,
+                               VulkanContext::matvec_groups(glu, ff),
                                k_used);
             } else {
                 rec_matvec_b(s, g,
