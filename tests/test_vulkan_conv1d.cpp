@@ -343,7 +343,7 @@ struct SplitEnv {
 // and a kernel the table does not know takes the safe 32. No device:
 // the budget is a function of the kernel's name.
 TEST_CASE("v3d split budgets follow the work per workgroup",
-          "[vulkan][conv2d]") {
+          "[vulkan][split]") {
     const auto budget = [](const char* name) {
         return VulkanContext::v3d_split_budget(name);
     };
@@ -383,7 +383,7 @@ TEST_CASE("v3d split budgets follow the work per workgroup",
 // 2 x 2 output tiles; a budget of 2 splits x only, one of 1 splits y
 // too.
 TEST_CASE("vulkan split dispatches give the bits of a whole one",
-          "[vulkan][conv2d]") {
+          "[vulkan][conv2d][split]") {
     if (!VulkanContext::available()) {
         SKIP("no usable Vulkan device / kernels not built");
     }
