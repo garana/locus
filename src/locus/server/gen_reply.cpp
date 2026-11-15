@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <exception>
+#include <span>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include "locus/http/loop_connection.hpp"
@@ -12,10 +14,6 @@ namespace locus::server {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-
-// How often the pump looks for gone clients, drained queues and due
-// keepalives between progress wakes (as EngineLoop's alive probe).
-constexpr auto kTick = std::chrono::milliseconds(20);
 
 /**
  * Writes one step of a generation's SSE stream: payload, or a keepalive
@@ -86,11 +84,11 @@ void serve_generation(EngineGroup& loop, std::uint64_t id, GenReply gr,
 
 GenPump::GenPump(EngineGroup& loop, std::chrono::milliseconds keepalive)
     : loop_(loop), keepalive_(keepalive) {
-    loop_.set_progress_hook([this] {
-        // On an engine worker, under its mutex: only flag and notify.
+    loop_.set_progress_hook([this](std::span<const std::uint64_t> ids) {
+        // On an engine worker, under its mutex: only note and notify.
         {
             std::lock_guard<std::mutex> lk(mu_);
-            woke_ = true;
+            ready_.insert(ready_.end(), ids.begin(), ids.end());
         }
         cv_.notify_one();
     });
@@ -121,6 +119,9 @@ void GenPump::add(std::uint64_t id, GenReply gr, http::Deferred d,
     e->status = head.status;
     e->ka.every = keepalive_;
     loop_.follow(id);
+    // The reply calls back when its queue is taken, it is cancelled or
+    // the client half-closes: only then does the entry need a look.
+    e->d.reply->set_notify([this, id] { mark(id); });
     if (e->gr.stream) {
         // A cancelled reply refuses it; the first pass then drops e.
         e->d.reply->begin_stream(std::move(head));
@@ -131,69 +132,121 @@ void GenPump::add(std::uint64_t id, GenReply gr, http::Deferred d,
         std::lock_guard<std::mutex> lk(mu_);
         if (!stop_) {
             incoming_.push_back(std::move(e));
-            woke_ = true;
         }
     }
     if (e) {
+        e->d.reply->set_notify({});
         drop(*e, e->status);  // stopping: the client gets no answer
         return;
     }
     cv_.notify_one();
 }
 
+void GenPump::mark(std::uint64_t id) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        ready_.push_back(id);
+    }
+    cv_.notify_one();
+}
+
+void GenPump::arm(Entry& e) {
+    if (!e.gr.stream || e.ka.every.count() <= 0) {
+        return;
+    }
+    const Clock::time_point due = e.ka.last + e.ka.every;
+    if (due < e.ka_at) {
+        keepalives_.push({due, e.id});
+        e.ka_at = due;
+    }
+}
+
 void GenPump::run() {
-    std::vector<std::unique_ptr<Entry>> live;
+    std::unordered_map<std::uint64_t, std::unique_ptr<Entry>> live;
+    std::vector<std::uint64_t> ids;
     std::unique_lock<std::mutex> lk(mu_);
     const auto ready = [this] {
-        return stop_ || woke_ || !incoming_.empty();
+        return stop_ || !ready_.empty() || !incoming_.empty();
     };
     for (;;) {
-        if (live.empty()) {
+        if (keepalives_.empty()) {
             cv_.wait(lk, ready);
         } else {
-            cv_.wait_for(lk, kTick, ready);
+            cv_.wait_until(lk, keepalives_.top().first, ready);
         }
         if (stop_) {
             break;
         }
-        // One wake drains every request: a hook that runs after this
-        // reset wakes the next wait.
-        woke_ = false;
+        // The requests that changed, the replies that called back and
+        // the new entries: no other entry is looked at.
+        ids.swap(ready_);
+        ready_.clear();
         for (auto& e : incoming_) {
-            live.push_back(std::move(e));
+            ids.push_back(e->id);
+            const std::uint64_t id = e->id;
+            live.emplace(id, std::move(e));
         }
         incoming_.clear();
         lk.unlock();
-        std::erase_if(live, [this](const std::unique_ptr<Entry>& e) {
+        const auto now = Clock::now();
+        while (!keepalives_.empty() && keepalives_.top().first <= now) {
+            const auto [t, id] = keepalives_.top();
+            keepalives_.pop();
+            const auto it = live.find(id);
+            if (it != live.end() && it->second->ka_at == t) {
+                it->second->ka_at = Clock::time_point::max();
+                ids.push_back(id);
+            }
+        }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        for (const std::uint64_t id : ids) {
+            const auto it = live.find(id);
+            if (it == live.end()) {
+                continue;  // not ours, or done already
+            }
+            Entry& e = *it->second;
+            visits_.fetch_add(1, std::memory_order_relaxed);
             // A step that throws: a 500, or a truncated stream (logged and
             // counted, i#980), as a provider that throws on the job pool.
             const auto failed = [&](const char* why) {
-                if (e->gr.stream && e->d.stream_failed) {
-                    e->d.stream_failed(why);
+                if (e.gr.stream && e.d.stream_failed) {
+                    e.d.stream_failed(why);
                 }
-                e->d.reply->fail();
-                drop(*e, e->gr.stream ? e->status : 500);
+                e.d.reply->fail();
+                drop(e, e.gr.stream ? e.status : 500);
                 return true;
             };
+            bool done;
             try {
-                return pump(*e);
+                done = pump(e);
             } catch (const std::exception& ex) {
-                return failed(ex.what());
+                done = failed(ex.what());
             } catch (...) {
-                return failed("unknown exception");
+                done = failed("unknown exception");
             }
-        });
+            if (done) {
+                e.d.reply->set_notify({});
+                live.erase(it);
+            } else {
+                arm(e);
+            }
+        }
+        ids.clear();
         lk.lock();
     }
     for (auto& e : incoming_) {
-        live.push_back(std::move(e));
+        const std::uint64_t id = e->id;
+        live.emplace(id, std::move(e));
     }
     incoming_.clear();
     lk.unlock();
-    for (auto& e : live) {
+    for (auto& [id, e] : live) {
+        e->d.reply->set_notify({});
         drop(*e, e->status);
     }
 }
+
 
 void GenPump::drop(Entry& e, int status) {
     loop_.unfollow(e.id);

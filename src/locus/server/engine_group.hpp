@@ -80,8 +80,8 @@ class EngineGroup {
     /** @} */
 
     /** EngineLoop::set_progress_hook on every engine (one hook, run by
-     *  each engine's worker). */
-    void set_progress_hook(const std::function<void()>& hook);
+     *  each engine's worker), with group ids. */
+    void set_progress_hook(const EngineLoop::ProgressHook& hook);
 
     /** EngineLoop::release, and the request no longer counts toward its
      *  engine's load. Idempotent: a stream may release twice (on its
