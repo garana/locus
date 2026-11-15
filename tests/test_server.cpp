@@ -2105,6 +2105,58 @@ TEST_CASE("metrics carry labels and timings in well-formed histograms",
 // Here the double release is safe by construction anyway: request ids
 // are monotonic and never reused, and release()/cancel() no-op on an
 // absent/terminal id under the engine mutex.
+// i#929: two engines behind one server serve concurrent requests (the
+// second goes to the other engine) and /metrics counts both pools.
+TEST_CASE("a server with two engines serves and reports both",
+          "[server][e2e][engine_group]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    locus::server::OpenAiServer::Options one_opt;
+    one_opt.engine.n_blocks = 8;
+    locus::server::OpenAiServer::Options two_opt = one_opt;
+    two_opt.engines = 2;
+    const json body = {{"prompt", "Once upon a time"}, {"max_tokens", 8}};
+    std::string want;
+    long one_total = 0;
+    {
+        TestServer ts(model, tok, one_opt);
+        httplib::Client c("127.0.0.1", ts.port);
+        auto r = c.Post("/v1/completions", body.dump(), "application/json");
+        REQUIRE(r);
+        REQUIRE(r->status == 200);
+        want = json::parse(r->body)["choices"][0]["text"];
+        auto m = c.Get("/metrics");
+        REQUIRE(m);
+        one_total = metric_value(m->body, "locus_kv_blocks_total");
+    }
+    TestServer ts(model, tok, two_opt);
+    std::vector<std::string> got(2);
+    std::vector<std::jthread> clients;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        clients.emplace_back([&, i] {
+            httplib::Client c("127.0.0.1", ts.port);
+            auto r =
+                c.Post("/v1/completions", body.dump(), "application/json");
+            if (r && r->status == 200) {
+                got[i] = json::parse(r->body)["choices"][0]["text"];
+            }
+        });
+    }
+    clients.clear();  // joins
+    CHECK(got[0] == want);
+    CHECK(got[1] == want);
+    httplib::Client c("127.0.0.1", ts.port);
+    auto m = c.Get("/metrics");
+    REQUIRE(m);
+    CHECK(metric_value(m->body, "locus_engines") == 2);
+    CHECK(metric_value(m->body, "locus_kv_blocks_total") == 2 * one_total);
+}
+
 TEST_CASE("server survives concurrent mid-stream SSE aborts",
           "[server][e2e][stress]") {
     if (!std::filesystem::exists(model_path())) {

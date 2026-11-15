@@ -252,7 +252,10 @@ Every backend is compiled into the one binary, and the best one the
 machine supports is picked at startup (on x86, avx2 before sse4). Pick
 one with `--backend NAME` or `LOCUS_BACKEND=NAME`, and with `--backend
 vulkan` or `cuda` the GPU with `--device N` (`--backends` lists the
-Vulkan devices; the first is the default).
+Vulkan devices; the first is the default). `locus-server --engines N`
+serves the model from N engines, each with its own KV pool: N shares
+of the CPU cores, or on Vulkan one `--device` each (several `--device`
+entries give one engine per device); a request stays on one engine.
 
 | Backend | Runs                                                                                     |
 |---------|------------------------------------------------------------------------------------------|

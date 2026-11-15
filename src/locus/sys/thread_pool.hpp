@@ -40,6 +40,15 @@ class ThreadPool {
     static ThreadPool& instance();
 
     /**
+     * The threads of share `i` of `k` pools that split this machine
+     * (i#45, i#929): the performance cores where the CPU has tiers, else
+     * all cores, cores / k each and one more for the first cores % k;
+     * at least 1.
+     * @returns 0 for k <= 1 (one share keeps the process-wide pool).
+     */
+    static std::size_t share_threads(std::size_t i, std::size_t k);
+
+    /**
      * A pool of its own (i#45): `n_workers` threads besides the
      * caller, e.g. one per executor so several executors' loops do not
      * serialize on one pool.
