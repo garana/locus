@@ -1763,13 +1763,15 @@ bool OpenAiServer::listen_after_bind() {
 }
 
 void OpenAiServer::stop() {
-    if (http_) {
-        http_->stop();
-    }
-    // After the server: no job adds a generation now, and the ones left
-    // (their clients gone) are cancelled and released.
+    // The pump first: it writes to the HTTP server's replies, whose wake
+    // pipe the server closes as it stops, so it must be done writing by
+    // then. Its generations are cancelled and released unanswered; a job
+    // that defers after this is dropped the same way (GenPump::add).
     if (pump_) {
         pump_->stop();
+    }
+    if (http_) {
+        http_->stop();
     }
 }
 

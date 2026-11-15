@@ -311,8 +311,9 @@ class OpenAiServer {
     std::unique_ptr<http::Service> http_;
     /** Per-route request metrics (i#285), shared with http_. */
     std::shared_ptr<http::HttpMetrics> http_metrics_;
-    /** Drives generations under --event-loop (null otherwise). After
-     *  http_, so it goes first: its records reach a live server. */
+    /** Drives generations under --event-loop (null otherwise). stop()
+     *  stops it before http_; declared after http_, so it is destroyed
+     *  first too and its records reach a live server. */
     std::unique_ptr<GenPump> pump_;
     std::uint32_t n_vocab_ = 0;
 

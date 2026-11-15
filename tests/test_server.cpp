@@ -3454,6 +3454,50 @@ TEST_CASE("an event-loop stream leaves the job pool free",
     CHECK(got.find("data: [DONE]") != std::string::npos);
 }
 
+// i#932: stopping the server while the pump writes a stream. stop()
+// stops the pump before the HTTP server, whose wake pipe closes last,
+// so no pump write can reach a closed (or reused) fd; the client sees
+// the connection end, and the server goes down cleanly.
+TEST_CASE("an event-loop server stops while a stream is mid-flight",
+          "[server][e2e][loop_server]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const json req{{"prompt", "Once upon a time"},
+                   {"max_tokens", 512},
+                   {"stream", true}};
+    for (int round = 0; round < 4; ++round) {
+        locus::server::OpenAiServer::Options opt;
+        opt.event_loop = true;
+        auto ts = std::make_unique<TestServer>(model, tok, opt);
+        std::vector<int> fds;
+        for (int i = 0; i < 20; ++i) {
+            const int c =
+                locus::pipeline::connect_to("127.0.0.1", ts->port, 2000);
+            REQUIRE(c >= 0);
+            locus::pipeline::set_recv_timeout(c, 20000);
+            REQUIRE(send_all(c, make_post("/v1/completions", req.dump())));
+            fds.push_back(c);
+        }
+        // The first stream is writing (the others may still queue).
+        std::string got;
+        char buf[4096];
+        while (got.find("data: ") == std::string::npos) {
+            const ssize_t n = ::recv(fds[0], buf, sizeof(buf), 0);
+            REQUIRE(n > 0);
+            got.append(buf, static_cast<std::size_t>(n));
+        }
+        ts.reset();  // stop() with the streams still writing
+        for (const int c : fds) {
+            recv_to_eof(c);  // each connection ends (no hang)
+            ::close(c);
+        }
+    }
+}
+
 // i#932: N concurrent streams take no thread each: 200 on a pool of two
 // job threads all run to their end.
 TEST_CASE("200 event-loop streams on two job threads",
