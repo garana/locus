@@ -84,6 +84,9 @@ struct ArchSpec {
      * projections without bias, rope_norm on q and k, GQA attention,
      * output wo): forward_batch then runs the projections as batched
      * matvecs over the chunk, byte-identical to the per-token path.
+     * It says nothing of the FFN: the whole-token GPU forwards
+     * (cuda_forward, metal_forward) also assume the shared SwiGLU FFN
+     * with no custom layer body or post-norms (metal_forward checks).
      */
     bool plain_attention = false;
     /**

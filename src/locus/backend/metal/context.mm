@@ -31,6 +31,10 @@ struct Context::Impl {
     // The open batch (nil when none).
     id<MTLCommandBuffer> batch = nil;
     id<MTLComputeCommandEncoder> enc = nil;
+    // Dispatches recorded in the open batch, and whether the next one
+    // may run alongside the one before (no barrier between them).
+    std::size_t n_rec = 0;
+    bool overlap_next = false;
 };
 
 namespace {
@@ -154,11 +158,15 @@ void Context::begin_batch() {
         throw std::logic_error("metal: a batch is already open");
     }
     impl_->batch = [impl_->queue commandBuffer];
+    impl_->n_rec = 0;
+    impl_->overlap_next = false;
     impl_->enc = [impl_->batch
-        computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 }
 
 bool Context::batch_open() const { return impl_->batch != nil; }
+
+void Context::overlap_next() { impl_->overlap_next = true; }
 
 void Context::end_batch() {
     if (impl_->batch == nil) {
@@ -196,6 +204,15 @@ void Context::dispatch(std::string_view name, std::span<const Arg> args,
             alone ? [impl_->queue commandBuffer] : impl_->batch;
         id<MTLComputeCommandEncoder> enc =
             alone ? [cb computeCommandEncoder] : impl_->enc;
+        if (!alone) {
+            // A barrier before each dispatch but the first, unless the
+            // caller said this one is independent of the one before.
+            if (impl_->n_rec > 0 && !impl_->overlap_next) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            impl_->overlap_next = false;
+            ++impl_->n_rec;
+        }
         [enc setComputePipelineState:pso];
         NSUInteger i = 0;
         for (const Arg& a : args) {
@@ -214,6 +231,13 @@ void Context::dispatch(std::string_view name, std::span<const Arg> args,
             finish(cb, name);
         }
     }
+}
+
+std::mutex& device_mutex() {
+    // Leaked: a model or cache freed by a static destructor at exit
+    // still finds it.
+    static std::mutex* mu = new std::mutex;
+    return *mu;
 }
 
 }  // namespace locus::backend::metal
