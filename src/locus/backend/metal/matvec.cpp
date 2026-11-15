@@ -2,6 +2,8 @@
 #include "locus/backend/metal/matvec.hpp"
 
 #include <algorithm>
+#include <string_view>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -52,6 +54,26 @@ Kind kind_of(TensorType t) {
         default:
             return {};
     }
+}
+
+/**
+ * @returns The Q6_K matvec kernel for ctx's GPU (i#1058): ggml's
+ * half-block layout below Apple family 9 (the M2 reads Q6_K at about
+ * twice the bandwidth with it), the unit layout on 9 and up (a few
+ * percent faster on the M4). LOCUS_METAL_Q6K=halves or units picks one
+ * (tests).
+ */
+const char* q6k_kernel(const Context& ctx) {
+    if (const char* e = std::getenv("LOCUS_METAL_Q6K")) {
+        const std::string_view v(e);
+        if (v == "halves") {
+            return "mv_q6_k_halves";
+        }
+        if (v == "units") {
+            return "mv_q6_k";
+        }
+    }
+    return ctx.apple_family() >= 9 ? "mv_q6_k" : "mv_q6_k_halves";
 }
 
 /** MvParams in kernels.metal. */
@@ -224,7 +246,8 @@ void record_mv(Context& ctx, gguf::TensorType t, std::uint32_t rows,
     const Context::Arg args[] = {
         {&w, 0}, {&x, 0}, {&out, 0}, {route != nullptr ? route : &x, 0, 7}};
     const std::uint32_t groups = (rows + k.rows - 1) / k.rows;
-    ctx.dispatch(k.kernel, args, std::as_bytes(std::span(&p, 1)),
+    ctx.dispatch(t == TensorType::kQ6_K ? q6k_kernel(ctx) : k.kernel, args,
+                 std::as_bytes(std::span(&p, 1)),
                  groups * n_slots * k.group, k.group);
 }
 

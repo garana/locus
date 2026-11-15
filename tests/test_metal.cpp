@@ -1159,3 +1159,36 @@ TEST_CASE("metal::Seq destroyed mid-step leaves Metal usable", "[metal]") {
         REQUIRE(v == 2.0f);
     }
 }
+
+// i#1058: both Q6_K matvec layouts (the half-block one the M2 takes,
+// the unit one the M4 takes) match the CPU, whichever this GPU picks.
+TEST_CASE("metal Q6_K matvec layouts match the CPU", "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    std::mt19937 rng(1058);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const char* layout : {"halves", "units"}) {
+        ::setenv("LOCUS_METAL_Q6K", layout, 1);
+        for (const auto [rows, cols] :
+             {std::pair{37u, 256u}, std::pair{200u, 3072u}}) {
+            CAPTURE(layout, rows, cols);
+            const auto wv = random_weights(TensorType::kQ6_K, rows, cols,
+                                           rows + cols);
+            const locus::backend::Mat w{TensorType::kQ6_K, wv.data(), rows,
+                                        cols};
+            std::vector<float> x(cols), want(rows), got(rows);
+            for (auto& v : x) {
+                v = dist(rng);
+            }
+            locus::backend::matvec(w, x, want);
+            mb::matvec(w, x, got);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                REQUIRE(got[r] ==
+                        Catch::Approx(want[r]).margin(1e-3).epsilon(1e-4));
+            }
+        }
+    }
+    ::unsetenv("LOCUS_METAL_Q6K");
+}
