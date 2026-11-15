@@ -175,6 +175,9 @@ struct AxpyParams {
 struct AxpyRouteParams {
     std::uint32_t n, slot;
 };
+struct MoeSumParams {
+    std::uint32_t n, k;
+};
 struct RouteParams {
     std::uint32_t n_expert, k, softmax, bias_on_logit, has_bias, norm;
     float scale;
@@ -319,14 +322,16 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         const std::uint32_t shexp_ff =
             hp_.n_ff_shexp > 0 ? hp_.n_ff_shexp
                                : hp_.n_ff_exp * hp_.n_expert_shared;
-        const std::size_t ffw =
-            std::max<std::size_t>({ff, hp_.n_ff_exp, shexp_ff});
+        // (The routed experts' scratch holds all k picks at once.)
+        const std::size_t ffw = std::max<std::size_t>(
+            {ff, std::size_t{hp_.n_ff_exp} * hp_.n_expert_used, shexp_ff});
         Scratch::grow(ctx, s.gate, ffw * 4);
         Scratch::grow(ctx, s.up, ffw * 4);
         Scratch::grow(ctx, s.router, (std::size_t{hp_.n_expert} + 1) * 4);
         Scratch::grow(ctx, s.route,
                       (2 * std::size_t{hp_.n_expert_used} + 1) * 4);
-        Scratch::grow(ctx, s.eout, std::size_t{E} * 4);
+        Scratch::grow(ctx, s.eout,
+                      std::size_t{E} * std::max(1u, hp_.n_expert_used) * 4);
         Scratch::grow(ctx, s.logits, std::size_t{R} * 4);
         Scratch::grow(ctx, s.cs, std::size_t{hd} * 4);
         Scratch::grow(ctx, s.scores, std::size_t{H} * n_pos * 4);
@@ -414,37 +419,6 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         const bool gpu_route =
             hp_.n_group <= 1 && hp_.n_expert <= 1024 &&
             (route_env == nullptr || std::string_view(route_env) != "cpu");
-        // A routed expert by slot j of s.route: gate, up, SiLU, down,
-        // then the residual by the weight at route[k + j]; all on the
-        // GPU.
-        const auto routed_add = [&](const Layer& lay, std::uint32_t j) {
-            const std::uint32_t k = hp_.n_expert_used;
-            const auto gr = expert_buf(lay.gate_exps);
-            const auto ur = expert_buf(lay.up_exps);
-            const auto dr = expert_buf(lay.down_exps);
-            const Mat& g = lay.gate_exps.base;
-            const Mat& u = lay.up_exps.base;
-            const Mat& d = lay.down_exps.base;
-            metal::record_matvec_routed(ctx, g.type, g.rows, g.cols, *gr.buf,
-                                        gr.off, lay.gate_exps.expert_bytes,
-                                        s.route, j, s.xb, 0, s.gate, 0,
-                                        false);
-            ctx.overlap_next();
-            metal::record_matvec_routed(ctx, u.type, u.rows, u.cols, *ur.buf,
-                                        ur.off, lay.up_exps.expert_bytes,
-                                        s.route, j, s.xb, 0, s.up, 0, false);
-            const SiluParams sp{g.rows};
-            const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
-            ctx.dispatch("silu_mul", su, bytes_of(sp), g.rows, 256);
-            metal::record_matvec_routed(ctx, d.type, d.rows, d.cols, *dr.buf,
-                                        dr.off, lay.down_exps.expert_bytes,
-                                        s.route, j, s.gate, 0, s.eout, 0,
-                                        false);
-            const AxpyRouteParams ap{E, k + j};
-            const Context::Arg aa[] = {
-                {&s.x, 0}, {&s.eout, 0}, {&s.route, 0}};
-            ctx.dispatch("axpy_routed", aa, bytes_of(ap), E, 256);
-        };
         const auto moe = [&](const Layer& lay) {
             mv(lay.gate_inp, s.xb, s.router, 0, false);
             const bool gated = lay.gate_inp_shexp.rows > 0;
@@ -469,9 +443,35 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     {has_bias ? &fbuf(lay.exp_probs_b) : &s.router, 0},
                     {&s.route, 0}};
                 ctx.dispatch("moe_route", ra, bytes_of(rp), 1024, 1024);
-                for (std::uint32_t j = 0; j < k; ++j) {
-                    routed_add(lay, j);
-                }
+                // The k experts at once: gate and up for every slot (x
+                // shared), SiLU over the k rows, down slot by slot into
+                // k residual rows, then their weighted sum.
+                const auto gr = expert_buf(lay.gate_exps);
+                const auto ur = expert_buf(lay.up_exps);
+                const auto dr = expert_buf(lay.down_exps);
+                const Mat& g = lay.gate_exps.base;
+                const Mat& u = lay.up_exps.base;
+                const Mat& d = lay.down_exps.base;
+                metal::record_matvec_slots(
+                    ctx, g.type, g.rows, g.cols, *gr.buf, gr.off,
+                    lay.gate_exps.expert_bytes, s.route, 0, k, s.xb, 0, 0,
+                    s.gate, 0, g.rows);
+                ctx.overlap_next();
+                metal::record_matvec_slots(
+                    ctx, u.type, u.rows, u.cols, *ur.buf, ur.off,
+                    lay.up_exps.expert_bytes, s.route, 0, k, s.xb, 0, 0,
+                    s.up, 0, u.rows);
+                const SiluParams sp{k * g.rows};
+                const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
+                ctx.dispatch("silu_mul", su, bytes_of(sp), k * g.rows, 256);
+                metal::record_matvec_slots(
+                    ctx, d.type, d.rows, d.cols, *dr.buf, dr.off,
+                    lay.down_exps.expert_bytes, s.route, 0, k, s.gate, 0,
+                    g.rows, s.eout, 0, E);
+                const MoeSumParams ms{E, k};
+                const Context::Arg ma[] = {
+                    {&s.x, 0}, {&s.eout, 0}, {&s.route, 0}};
+                ctx.dispatch("moe_sum", ma, bytes_of(ms), E, 256);
                 if (hp_.n_expert_shared > 0) {
                     const auto sg = wbuf(lay.gate_shexp);
                     const auto su = wbuf(lay.up_shexp);

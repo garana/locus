@@ -40,16 +40,24 @@ struct MvParams {
     uint x_off;
     float scale;
     uint route_slot;  // kNoRoute: w_off as is
+    // Several slots in one dispatch (MoE's k experts, i#868): slot s
+    // takes threadgroups [s, s + 1) * groups-a-slot, the expert at
+    // route[route_slot + s], x at + s * x_slot_stride and out at
+    // + s * out_slot_stride. 1 slot otherwise.
+    uint n_slots;
+    uint x_slot_stride;
+    uint out_slot_stride;
 };
 
 constant constexpr uint kNoRoute = 0xFFFFFFFFu;
 
 // The weight's byte offset: w_off, plus a routed expert's (MoE on the
 // GPU, i#868: the expert id read from the route buffer at buffer 7).
-inline ulong mv_w_off(constant MvParams& p, device const uint* route) {
+inline ulong mv_w_off(constant MvParams& p, device const uint* route,
+                      uint slot) {
     return p.route_slot == kNoRoute
                ? p.w_off
-               : p.w_off + ulong(route[p.route_slot]) * p.expert_bytes;
+               : p.w_off + ulong(route[p.route_slot + slot]) * p.expert_bytes;
 }
 
 constant constexpr uint kMvLanes = 16;
@@ -64,11 +72,12 @@ inline float half_simd_sum(float v) {
     return v;
 }
 
-inline void mv_store(device float* out, constant MvParams& p, uint r,
-                     uint lane, float acc) {
+inline void mv_store(device float* out, constant MvParams& p, uint slot,
+                     uint r, uint lane, float acc) {
     const float s = half_simd_sum(acc);
     if (lane == 0 && r < p.rows) {
-        device float* o = out + p.out_off + r;
+        device float* o =
+            out + p.out_off + ulong(slot) * p.out_slot_stride + r;
         const float v = p.scale * s;
         *o = p.accumulate != 0 ? *o + v : v;
     }
@@ -89,18 +98,22 @@ kernel void mv_f32(device const uchar* w [[buffer(0)]],
                    uint tg [[threadgroup_position_in_grid]],
                    uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
-    const uint r = tg * kMvRows + tid / kMvLanes;
+    const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
+    const uint slot = tg / gps;
+    const uint r = tg % gps * kMvRows + tid / kMvLanes;
+    const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
+    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         device const float4* row =
-            (device const float4*)(w + mv_w_off(p, route) +
+            (device const float4*)(w + wo +
                                       (ulong)r * p.cols * 4);
-        device const float4* x = (device const float4*)(xb + p.x_off);
+        device const float4* x = (device const float4*)(xs);
         for (uint u = lane; u < p.cols / 4; u += kMvLanes) {
             acc += dot(row[u], x[u]);
         }
     }
-    mv_store(out, p, r, lane, acc);
+    mv_store(out, p, slot, r, lane, acc);
 }
 
 // Q8_0: 34-byte blocks (f16 d, 32 int8). Units are blocks; the block
@@ -113,12 +126,16 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
-    const uint r = tg * kMvRows + tid / kMvLanes;
+    const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
+    const uint slot = tg / gps;
+    const uint r = tg % gps * kMvRows + tid / kMvLanes;
+    const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
+    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 32;
-        device const uchar* row = w + mv_w_off(p, route) + (ulong)r * nb * 34;
-        device const float* x = xb + p.x_off;
+        device const uchar* row = w + wo + (ulong)r * nb * 34;
+        device const float* x = xs;
         for (uint b = lane; b < nb; b += kMvLanes) {
             device const uchar* blk = row + b * 34;
             device const char* q = (device const char*)(blk + 2);
@@ -132,7 +149,7 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
             acc += f16_at(blk) * s;
         }
     }
-    mv_store(out, p, r, lane, acc);
+    mv_store(out, p, slot, r, lane, acc);
 }
 
 // F16: units of 4 columns (8-byte loads: w_off a multiple of 8).
@@ -144,18 +161,22 @@ kernel void mv_f16(device const uchar* w [[buffer(0)]],
                    uint tg [[threadgroup_position_in_grid]],
                    uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
-    const uint r = tg * kMvRows + tid / kMvLanes;
+    const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
+    const uint slot = tg / gps;
+    const uint r = tg % gps * kMvRows + tid / kMvLanes;
+    const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
+    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         device const half4* row =
-            (device const half4*)(w + mv_w_off(p, route) +
+            (device const half4*)(w + wo +
                                       (ulong)r * p.cols * 2);
-        device const float4* x = (device const float4*)(xb + p.x_off);
+        device const float4* x = (device const float4*)(xs);
         for (uint u = lane; u < p.cols / 4; u += kMvLanes) {
             acc += dot(float4(row[u]), x[u]);
         }
     }
-    mv_store(out, p, r, lane, acc);
+    mv_store(out, p, slot, r, lane, acc);
 }
 
 // BF16: units of 4 columns (8-byte loads), widened by a shift.
@@ -167,19 +188,23 @@ kernel void mv_bf16(device const uchar* w [[buffer(0)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
-    const uint r = tg * kMvRows + tid / kMvLanes;
+    const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
+    const uint slot = tg / gps;
+    const uint r = tg % gps * kMvRows + tid / kMvLanes;
+    const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
+    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         device const ushort4* row =
-            (device const ushort4*)(w + mv_w_off(p, route) +
+            (device const ushort4*)(w + wo +
                                       (ulong)r * p.cols * 2);
-        device const float4* x = (device const float4*)(xb + p.x_off);
+        device const float4* x = (device const float4*)(xs);
         for (uint u = lane; u < p.cols / 4; u += kMvLanes) {
             const uint4 v = uint4(row[u]) << 16;
             acc += dot(as_type<float4>(v), x[u]);
         }
     }
-    mv_store(out, p, r, lane, acc);
+    mv_store(out, p, slot, r, lane, acc);
 }
 
 // Q4_0: 18-byte blocks of 32 (f16 d, 16 bytes): element j is the low
@@ -192,12 +217,16 @@ kernel void mv_q4_0(device const uchar* w [[buffer(0)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
-    const uint r = tg * kMvRows + tid / kMvLanes;
+    const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
+    const uint slot = tg / gps;
+    const uint r = tg % gps * kMvRows + tid / kMvLanes;
+    const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
+    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 32;
-        device const uchar* row = w + mv_w_off(p, route) + (ulong)r * nb * 18;
-        device const float* x = xb + p.x_off;
+        device const uchar* row = w + wo + (ulong)r * nb * 18;
+        device const float* x = xs;
         for (uint b = lane; b < nb; b += kMvLanes) {
             device const uchar* blk = row + b * 18;
             device const uchar* q = blk + 2;
@@ -212,7 +241,7 @@ kernel void mv_q4_0(device const uchar* w [[buffer(0)]],
             acc += f16_at(blk) * s;
         }
     }
-    mv_store(out, p, r, lane, acc);
+    mv_store(out, p, slot, r, lane, acc);
 }
 
 // Q5_0: 22-byte blocks of 32 (f16 d, 32-bit qh, 16 bytes): element j
@@ -226,12 +255,16 @@ kernel void mv_q5_0(device const uchar* w [[buffer(0)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
-    const uint r = tg * kMvRows + tid / kMvLanes;
+    const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
+    const uint slot = tg / gps;
+    const uint r = tg % gps * kMvRows + tid / kMvLanes;
+    const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
+    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 32;
-        device const uchar* row = w + mv_w_off(p, route) + (ulong)r * nb * 22;
-        device const float* x = xb + p.x_off;
+        device const uchar* row = w + wo + (ulong)r * nb * 22;
+        device const float* x = xs;
         for (uint b = lane; b < nb; b += kMvLanes) {
             device const uchar* blk = row + b * 22;
             const uint qh = uint(blk[2]) | (uint(blk[3]) << 8) |
@@ -248,7 +281,7 @@ kernel void mv_q5_0(device const uchar* w [[buffer(0)]],
             acc += f16_at(blk) * s;
         }
     }
-    mv_store(out, p, r, lane, acc);
+    mv_store(out, p, slot, r, lane, acc);
 }
 
 // Q4_K: 144-byte super-blocks of 256 (f16 d and dmin, 12 packed 6-bit
@@ -289,12 +322,16 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint sg [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
-    const uint r0 = tg * kQ4Rows + sg * 2;
+    const uint gps = (p.rows + kQ4Rows - 1) / kQ4Rows;  // groups a slot
+    const uint slot = tg / gps;
+    const uint r0 = tg % gps * kQ4Rows + sg * 2;
+    const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
+    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
     const uint nb = p.cols / 256;
     const ulong row_bytes = ulong(nb) * 144;
     const uint ix = lane / 8, jq = (lane % 8) / 4, ir = lane % 4;
-    device const uchar* w0 = w + mv_w_off(p, route) + ulong(r0) * row_bytes;
-    device const float* x = xb + p.x_off + 64 * jq + 8 * ir;
+    device const uchar* w0 = w + wo + ulong(r0) * row_bytes;
+    device const float* x = xs + 64 * jq + 8 * ir;
     float acc0 = 0.0f, acc1 = 0.0f;
     for (uint b = ix; b < nb; b += 4) {
         device const float4* y = (device const float4*)(x + b * 256);
@@ -333,7 +370,8 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
     const float t0 = simd_sum(acc0), t1 = simd_sum(acc1);
     if (lane == 0) {
         for (uint i = 0; i < 2 && r0 + i < p.rows; ++i) {
-            device float* o = out + p.out_off + r0 + i;
+            device float* o =
+                out + p.out_off + ulong(slot) * p.out_slot_stride + r0 + i;
             const float v = p.scale * (i == 0 ? t0 : t1);
             *o = p.accumulate != 0 ? *o + v : v;
         }
@@ -353,12 +391,16 @@ kernel void mv_q5_k(device const uchar* w [[buffer(0)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
-    const uint r = tg * kMvRows + tid / kMvLanes;
+    const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
+    const uint slot = tg / gps;
+    const uint r = tg % gps * kMvRows + tid / kMvLanes;
+    const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
+    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 256;
-        device const uchar* row = w + mv_w_off(p, route) + (ulong)r * nb * 176;
-        device const float* x = xb + p.x_off;
+        device const uchar* row = w + wo + (ulong)r * nb * 176;
+        device const float* x = xs;
         for (uint u = lane; u < nb * 4; u += kMvLanes) {
             const uint b = u >> 2, j = u & 3;
             device const uchar* blk = row + b * 176;
@@ -382,7 +424,7 @@ kernel void mv_q5_k(device const uchar* w [[buffer(0)]],
             acc += d * sc1 * sq1 - dmin * mn1 * sx1;
         }
     }
-    mv_store(out, p, r, lane, acc);
+    mv_store(out, p, slot, r, lane, acc);
 }
 
 // Q6_K: 210-byte super-blocks of 256 (128 ql, 64 qh, 16 int8 scales,
@@ -399,12 +441,16 @@ kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
-    const uint r = tg * kMvRows + tid / kMvLanes;
+    const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
+    const uint slot = tg / gps;
+    const uint r = tg % gps * kMvRows + tid / kMvLanes;
+    const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
+    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 256;
-        device const uchar* row = w + mv_w_off(p, route) + (ulong)r * nb * 210;
-        device const float* x = xb + p.x_off;
+        device const uchar* row = w + wo + (ulong)r * nb * 210;
+        device const float* x = xs;
         for (uint u = lane; u < nb * 4; u += kMvLanes) {
             const uint b = u >> 2;
             const uint n = (u >> 1) & 1;
@@ -432,7 +478,7 @@ kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
                     float(sc[4]) * s2 + float(sc[6]) * s3);
         }
     }
-    mv_store(out, p, r, lane, acc);
+    mv_store(out, p, slot, r, lane, acc);
 }
 
 // ---------------------------------------------------------------------
@@ -1254,6 +1300,8 @@ struct RouteParams {
 // weights. route[0 .. k) gets the ids, route[k .. 2 k) the weights as
 // float bits, route[2 k] the shared expert's sigmoid gate when asked.
 // n_expert at most 1024; no group-limited routing (the CPU keeps it).
+// Its softmax adds in another order than the CPU's, so on a near-tie
+// between two experts the pick can differ from the CPU forward's.
 kernel void moe_route(device const float* logits [[buffer(0)]],
                       device const float* bias [[buffer(1)]],
                       device uint* route [[buffer(2)]],
@@ -1364,4 +1412,27 @@ kernel void head_rmsnorm(device float* v [[buffer(0)]],
     for (uint i = lane; i < p.head_dim; i += 32) {
         x[i] = x[i] * inv * w[i];
     }
+}
+
+struct MoeSumParams {
+    uint n;   // the residual's width
+    uint k;   // experts: their outputs at eout[j * n ..], their weights
+              // at route[k + j]
+};
+
+// x[i] += sum_j w_j * eout[j * n + i]: the k experts of a token into
+// the residual in one dispatch, weights from moe_route.
+kernel void moe_sum(device float* x [[buffer(0)]],
+                    device const float* eout [[buffer(1)]],
+                    device const uint* route [[buffer(2)]],
+                    constant MoeSumParams& p [[buffer(3)]],
+                    uint i [[thread_position_in_grid]]) {
+    if (i >= p.n) {
+        return;
+    }
+    float acc = 0.0f;
+    for (uint j = 0; j < p.k; ++j) {
+        acc += as_type<float>(route[p.k + j]) * eout[ulong(j) * p.n + i];
+    }
+    x[i] += acc;
 }
