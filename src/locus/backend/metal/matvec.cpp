@@ -58,7 +58,7 @@ struct MvParams {
     std::uint64_t w_off, out_off, expert_bytes;
     std::uint32_t rows, cols, accumulate, x_off;
     float scale;
-    std::uint32_t route_slot;
+    std::uint32_t route_slot, n_slots, x_slot_stride, out_slot_stride;
 };
 
 constexpr std::uint32_t kNoRoute = 0xFFFFFFFFu;  // kernels.metal's
@@ -177,7 +177,9 @@ void record_mv(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                const Context::Buffer* route, std::uint32_t slot,
                const Context::Buffer& x, std::uint32_t x_off,
                const Context::Buffer& out, std::uint64_t out_off,
-               bool accumulate) {
+               bool accumulate, std::uint32_t n_slots = 1,
+               std::uint32_t x_slot_stride = 0,
+               std::uint32_t out_slot_stride = 0) {
     const Kind k = kind_of(t);
     if (k.kernel == nullptr || cols % k.block != 0 || x_off % 4 != 0) {
         throw std::invalid_argument("metal record_matvec: no kernel");
@@ -190,14 +192,17 @@ void record_mv(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                      accumulate ? 1u : 0u,
                      x_off,
                      1.0f,
-                     route != nullptr ? slot : kNoRoute};
+                     route != nullptr ? slot : kNoRoute,
+                     n_slots,
+                     x_slot_stride,
+                     out_slot_stride};
     // The route buffer binds at 7 always (x when there is none; the
     // kernel reads it only for a routed call).
     const Context::Arg args[] = {
         {&w, 0}, {&x, 0}, {&out, 0}, {route != nullptr ? route : &x, 0, 7}};
     const std::uint32_t groups = (rows + k.rows - 1) / k.rows;
     ctx.dispatch(k.kernel, args, std::as_bytes(std::span(&p, 1)),
-                 groups * k.group, k.group);
+                 groups * n_slots * k.group, k.group);
 }
 
 }  // namespace
@@ -209,6 +214,24 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint64_t out_off, bool accumulate) {
     record_mv(ctx, t, rows, cols, w, w_off, 0, nullptr, 0, x, x_off, out,
               out_off, accumulate);
+}
+
+void record_matvec_slots(Context& ctx, gguf::TensorType t,
+                         std::uint32_t rows, std::uint32_t cols,
+                         const Context::Buffer& w, std::uint64_t w_off,
+                         std::uint64_t expert_bytes,
+                         const Context::Buffer& route,
+                         std::uint32_t route_slot, std::uint32_t n_slots,
+                         const Context::Buffer& x, std::uint32_t x_off,
+                         std::uint32_t x_slot_stride,
+                         const Context::Buffer& out, std::uint64_t out_off,
+                         std::uint32_t out_slot_stride) {
+    if (x_slot_stride % 4 != 0) {
+        throw std::invalid_argument("metal record_matvec_slots: x stride");
+    }
+    record_mv(ctx, t, rows, cols, w, w_off, expert_bytes, &route,
+              route_slot, x, x_off, out, out_off, false, n_slots,
+              x_slot_stride, out_slot_stride);
 }
 
 void record_matvec_routed(Context& ctx, gguf::TensorType t,
