@@ -67,8 +67,10 @@ class Seq {
                 std::uint32_t n);
 
     /**
-     * out[t] += scale * w x[t] for n token rows (a LoRA's B side).
-     * @throws std::invalid_argument for a type without a matmul kernel.
+     * out[t] += scale * w x[t] for n token rows (a LoRA's B side, of
+     * any rank: a matmul where the shape has one, else a thread an
+     * output for F32, F16 and BF16).
+     * @throws std::invalid_argument for a type with neither.
      */
     void linear_add(const Mat& w, Rows x, Rows out, std::uint32_t n,
                     float scale);

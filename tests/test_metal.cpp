@@ -853,7 +853,7 @@ TEST_CASE("metal::Seq ops match CPU references", "[metal]") {
     };
     std::vector<float> got(slot_n);
 
-    SECTION("linear (Q8_0 matmul, F32 matvec rows) with a bias") {
+    SECTION("linear (Q8_0 matmul, Q5_K matvec rows) with a bias") {
         for (const TensorType ty : {TensorType::kQ8_0, TensorType::kQ5_K}) {
             CAPTURE(static_cast<int>(ty));
             const std::uint32_t rows = 200;
@@ -886,6 +886,33 @@ TEST_CASE("metal::Seq ops match CPU references", "[metal]") {
             locus::backend::matvec(w, {x.data() + at(t, 0), d}, want);
             for (std::uint32_t r = 0; r < rows; ++r) {
                 REQUIRE(near(got[at(t, r)], y[at(t, r)] + 0.5f * want[r]));
+            }
+        }
+    }
+    SECTION("linear_add on a LoRA rank below 32") {
+        // B is (rows x rank), read from packed rank-wide rows, as FLUX's
+        // LoRA parts do.
+        const std::uint32_t rows = 72;
+        for (const TensorType ty :
+             {TensorType::kF32, TensorType::kF16, TensorType::kBF16}) {
+            for (const std::uint32_t rank : {2u, 4u, 16u}) {
+                CAPTURE(static_cast<int>(ty), rank);
+                const auto wv = random_weights(ty, rows, rank, rank + 7);
+                const locus::backend::Mat w{ty, wv.data(), rows, rank};
+                q.write(0, 0, x);
+                q.write(2, 0, y);
+                q.linear_add(w, {0, off, rank}, orr, n, 0.75f);
+                q.read(2, 0, got);
+                std::vector<float> want(rows);
+                for (std::uint32_t t = 0; t < n; ++t) {
+                    locus::backend::matvec(
+                        w, {x.data() + off + std::size_t{t} * rank, rank},
+                        want);
+                    for (std::uint32_t r = 0; r < rows; ++r) {
+                        REQUIRE(near(got[at(t, r)],
+                                     y[at(t, r)] + 0.75f * want[r]));
+                    }
+                }
             }
         }
     }

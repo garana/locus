@@ -1839,6 +1839,46 @@ kernel void seq_elt(device float* x [[buffer(0)]],
     *xa = 0.5f * v * (1.0f + (v < 0.0f ? -ef : ef));
 }
 
+struct SeqThinParams {
+    uint rows, cols, n, x_off, x_stride, out_off, out_stride;
+    uint type;  // 0 F32, 1 F16, 2 BF16
+    float scale;
+};
+
+// out[t][r] += scale * dot(w row r, x[t]) for a matrix too thin for the
+// matmul's k stages: a LoRA's B side of rank below 32. A thread an
+// output; the rank is small, so each reads its row whole.
+kernel void seq_thin_add(device const uchar* w [[buffer(0)]],
+                         device const float* x [[buffer(1)]],
+                         device float* out [[buffer(2)]],
+                         constant SeqThinParams& p [[buffer(3)]],
+                         uint e [[thread_position_in_grid]]) {
+    if (e >= p.n * p.rows) {
+        return;
+    }
+    const uint t = e / p.rows, r = e % p.rows;
+    device const float* xr = x + p.x_off + ulong(t) * p.x_stride;
+    const ulong row = ulong(r) * p.cols;
+    float s = 0.0f;
+    if (p.type == 0) {
+        device const float* wr = (device const float*)w + row;
+        for (uint k = 0; k < p.cols; ++k) {
+            s += wr[k] * xr[k];
+        }
+    } else if (p.type == 1) {
+        device const half* wr = (device const half*)w + row;
+        for (uint k = 0; k < p.cols; ++k) {
+            s += float(wr[k]) * xr[k];
+        }
+    } else {
+        device const ushort* wr = (device const ushort*)w + row;
+        for (uint k = 0; k < p.cols; ++k) {
+            s += as_type<float>(uint(wr[k]) << 16) * xr[k];
+        }
+    }
+    out[p.out_off + ulong(t) * p.out_stride + r] += p.scale * s;
+}
+
 struct AxpyParams {
     uint n;
     float a;

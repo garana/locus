@@ -114,7 +114,11 @@ void grow(Context& ctx, Context::Buffer& b, std::size_t n) {
 }
 
 std::size_t weight_bytes(const Mat& w, const Kind& k) {
-    return static_cast<std::size_t>(w.rows) * (w.cols / k.block) * k.bytes;
+    // Whole blocks a row for the quantized types; the float types'
+    // rows may end mid block (a LoRA B side of rank 2), so count
+    // elements.
+    const std::size_t el = std::size_t{w.rows} * w.cols;
+    return (el * k.bytes + k.block - 1) / k.block;
 }
 
 const Context::Buffer& weight(Context& ctx, const Mat& w, const Kind& k) {

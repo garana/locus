@@ -32,6 +32,10 @@ struct SeqNormRopeParams {
 struct SeqEltParams {
     std::uint32_t n, d, x_off, x_stride, y_off, y_stride, g_off, op;
 };
+struct SeqThinParams {
+    std::uint32_t rows, cols, n, x_off, x_stride, out_off, out_stride, type;
+    float scale;
+};
 struct SeqAttnParams {
     std::uint32_t n_q, n_kv, heads, head_dim;
     std::uint32_t q_off, q_stride, k_off, k_stride;
@@ -206,12 +210,29 @@ void Seq::linear(const Mat& w, std::span<const float> b, Rows x, Rows out,
 void Seq::linear_add(const Mat& w, Rows x, Rows out, std::uint32_t n,
                      float scale) {
     Context& ctx = im_->ctx;
-    if (!record_matmul(ctx, w.type, w.rows, w.cols, n, cached_weight(ctx, w),
+    if (record_matmul(ctx, w.type, w.rows, w.cols, n, cached_weight(ctx, w),
                        0, im_->slot(x.slot), x.off, x.stride,
                        im_->slot(out.slot), out.off, out.stride, true,
                        scale)) {
-        throw std::invalid_argument("metal::Seq::linear_add: no matmul");
+        return;
     }
+    // Too thin for the matmul's k stages (a LoRA of rank below 32): a
+    // thread an output.
+    using gguf::TensorType;
+    const std::uint32_t ty = w.type == TensorType::kF32   ? 0
+                             : w.type == TensorType::kF16 ? 1
+                             : w.type == TensorType::kBF16
+                                 ? 2
+                                 : 3;
+    if (ty == 3) {
+        throw std::invalid_argument("metal::Seq::linear_add: no kernel");
+    }
+    const SeqThinParams p{w.rows,     w.cols,  n,  x.off, x.stride,
+                          out.off,    out.stride, ty, scale};
+    const Context::Arg a[] = {{&cached_weight(ctx, w), 0},
+                              {&im_->slot(x.slot), 0},
+                              {&im_->slot(out.slot), 0}};
+    ctx.dispatch("seq_thin_add", a, bytes_of(p), n * w.rows, 256);
 }
 
 void Seq::ln_mod(Rows x, Rows out, std::uint32_t n, std::uint32_t d,
