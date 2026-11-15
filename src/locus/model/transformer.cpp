@@ -894,6 +894,159 @@ void TransformerModel::forward(tok::TokenId token,
     std::fill(logits.begin() + rows.end, logits.begin() + hp_.n_vocab, ninf);
 }
 
+void TransformerModel::prefetch_after(const backend::Ops& op, std::uint32_t l,
+                                      std::uint32_t layer_end,
+                                      bool last) const {
+    // The same one-step-ahead schedule feeds both tiers: madvise (SSD
+    // -> page cache) and, on backends with a weight pager, op.prefetch
+    // (host -> device).
+    if (l + 1 < layer_end) {
+        if (advise_weights_) {
+            advise_layer_statics(layers_[l + 1]);
+        }
+        if (op.prefetch != nullptr) {
+            for_each_static_mat(layers_[l + 1], [&](const backend::Mat& m) {
+                if (m.data != nullptr && m.rows > 0) {
+                    op.prefetch(m);
+                }
+            });
+        }
+    } else if (last) {
+        if (advise_weights_) {
+            advise_mat(out_w_);
+        }
+        if (op.prefetch != nullptr) {
+            op.prefetch(out_w_);
+        }
+    }
+}
+
+void TransformerModel::attend_one(const backend::Ops& op, const Layer& lay,
+                                  std::uint32_t l, kv::PagedKvCache& cache,
+                                  kv::PagedKvCache::Seq& seq,
+                                  std::uint32_t pos, std::span<float> x,
+                                  Workspace& ws, StageLap& lap) const {
+    apply_norm(x, lay.attn_norm, hp_.rms_eps, ws.xb);
+    lap.lap(l, Stage::kNorm);
+    spec_->attention(*this, lay, cache, seq, ws, l, pos);
+    matvec_mt(op, lay.wo, ws.out, ws.xb2);
+    for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
+        x[i] += ws.xb2[i];
+    }
+    lap.lap(l, Stage::kAttention);
+}
+
+void TransformerModel::attend_plain_batch(
+    const backend::Ops& op, const Layer& lay, std::uint32_t l,
+    kv::PagedKvCache& cache, std::span<kv::PagedKvCache::Seq* const> seqs,
+    std::span<const std::uint32_t> pos, BatchBufs& b, StageLap& lap) const {
+    const auto n = static_cast<std::uint32_t>(seqs.size());
+    const std::uint32_t E = hp_.n_embd;
+    const std::uint32_t hd = hp_.head_dim;
+    const std::size_t kv_dim = std::size_t{hp_.n_kv_heads} * hd;
+    const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
+    for (std::uint32_t t = 0; t < n; ++t) {
+        const std::size_t o = static_cast<std::size_t>(t) * E;
+        apply_norm({b.x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
+                   {b.xbf.data() + o, E});
+    }
+    lap.lap(l, Stage::kNorm);
+    matvec_batch(op, lay.wq, b.xbf, b.q, n);
+    matvec_batch(op, lay.wk, b.xbf, b.k, n);
+    matvec_batch(op, lay.wv, b.xbf, b.v, n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        const kv::PagedKvCache::Seq& s = *seqs[t];
+        const std::span<float> q(b.q.data() + std::size_t{t} * E, E);
+        float* krow = cache.k(s, l, pos[t]);
+        float* vrow = cache.v(s, l, pos[t]);
+        std::copy_n(b.k.data() + std::size_t{t} * kv_dim, kv_dim, krow);
+        std::copy_n(b.v.data() + std::size_t{t} * kv_dim, kv_dim, vrow);
+        backend::rope_norm(q, hp_.n_heads, hd, pos[t], hp_.rope_freq_base,
+                           rope_factors());
+        backend::rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd, pos[t],
+                           hp_.rope_freq_base, rope_factors());
+        cache.sync_rows(s, l, pos[t], 1);
+    }
+    if (!device_gqa_attend_seqs(op, cache, seqs, l, hp_, pos, b.q.data(),
+                                b.xb2.data(), E)) {
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const kv::PagedKvCache::Seq& s = *seqs[t];
+            gqa_attend(
+                b.q.data() + std::size_t{t} * E,
+                b.xb2.data() + std::size_t{t} * E, hp_.n_heads, hd, group,
+                pos[t], hp_.kq_scale,
+                [&](std::uint32_t p) -> const float* {
+                    return cache.k(s, l, p);
+                },
+                [&](std::uint32_t p) -> const float* {
+                    return cache.v(s, l, p);
+                });
+        }
+    }
+    matvec_batch(op, lay.wo, b.xb2, b.q, n);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(n) * E; ++i) {
+        b.x[i] += b.q[i];
+    }
+    lap.lap(l, Stage::kAttention);
+}
+
+void TransformerModel::ffn_one(const backend::Ops& op, const Layer& lay,
+                               std::uint32_t l, Workspace& ws,
+                               StageLap& lap) const {
+    apply_norm(ws.x, lay.ffn_norm, hp_.rms_eps, ws.xb);
+    lap.lap(l, Stage::kNorm);
+    if (!lay.is_moe()) {
+        const MatvecJob gu[] = {{lay.w_gate, ws.xb, ws.gate},
+                                {lay.w_up, ws.xb, ws.up}};
+        matvec_mt_group(op, gu);
+        backend::silu_mul({ws.gate.data(), hp_.n_ff},
+                          {ws.up.data(), hp_.n_ff},
+                          {ws.gate.data(), hp_.n_ff});
+        matvec_mt(op, lay.w_down, {ws.gate.data(), hp_.n_ff}, ws.xb2);
+        for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
+            ws.x[i] += ws.xb2[i];
+        }
+        lap.lap(l, Stage::kFfn);
+    } else {
+        moe_ffn(lay, ws, l);
+        for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
+            ws.x[i] += ws.moe_acc[i];
+        }
+        lap.lap(l, Stage::kMoe);
+    }
+}
+
+void TransformerModel::ffn_batch(const backend::Ops& op, const Layer& lay,
+                                 std::uint32_t l, BatchBufs& b,
+                                 std::uint32_t n, Workspace& ws,
+                                 StageLap& lap) const {
+    const std::uint32_t E = hp_.n_embd;
+    const std::uint32_t ff = hp_.n_ff;
+    for (std::uint32_t t = 0; t < n; ++t) {
+        const std::size_t o = static_cast<std::size_t>(t) * E;
+        apply_norm({b.x.data() + o, E}, lay.ffn_norm, hp_.rms_eps,
+                   {b.xbf.data() + o, E});
+    }
+    lap.lap(l, Stage::kNorm);
+    if (!lay.is_moe()) {
+        matvec_batch(op, lay.w_gate, b.xbf, b.gate, n);
+        matvec_batch(op, lay.w_up, b.xbf, b.up, n);
+        for (std::uint32_t t = 0; t < n; ++t) {
+            const std::size_t o = static_cast<std::size_t>(t) * ff;
+            backend::silu_mul({b.gate.data() + o, ff}, {b.up.data() + o, ff},
+                              {b.gate.data() + o, ff});
+        }
+        matvec_batch(op, lay.w_down, b.gate, b.xb2, n);
+        for (std::size_t i = 0; i < static_cast<std::size_t>(n) * E; ++i) {
+            b.x[i] += b.xb2[i];
+        }
+        lap.lap(l, Stage::kFfn);
+    } else {
+        moe_ffn_batch(lay, l, b.xbf, b.x, n, ws);
+        lap.lap(l, Stage::kMoe);
+    }
+}
+
 void TransformerModel::forward_layers(tok::TokenId token,
                                 std::span<const float> hidden_in,
                                 std::uint32_t layer_begin,
@@ -1024,70 +1177,16 @@ void TransformerModel::forward_layers(tok::TokenId token,
     for (std::uint32_t l = layer_begin; l < layer_end; ++l) {
         const Layer& lay = layers_[l];
         if (layer_ra) {
-            // The same one-step-ahead schedule feeds both tiers:
-            // madvise (SSD -> page cache) and, on backends with
-            // a weight pager, op.prefetch (host -> device).
-            if (l + 1 < layer_end) {
-                if (advise_weights_) {
-                    advise_layer_statics(layers_[l + 1]);
-                }
-                if (op.prefetch != nullptr) {
-                    for_each_static_mat(
-                        layers_[l + 1],
-                        [&](const backend::Mat& m) {
-                            if (m.data != nullptr &&
-                                m.rows > 0) {
-                                op.prefetch(m);
-                            }
-                        });
-                }
-            } else if (last) {
-                if (advise_weights_) {
-                    advise_mat(out_w_);
-                }
-                if (op.prefetch != nullptr) {
-                    op.prefetch(out_w_);
-                }
-            }
+            prefetch_after(op, l, layer_end, last);
             lap.lap(l, Stage::kPrefetch);
         }
-
         if (spec_->layer != nullptr) {
             spec_->layer(*this, lay, cache, seq, ws, l, pos);
             lap.lap(l, Stage::kLayer);
             continue;
         }
-        apply_norm(ws.x, lay.attn_norm, hp_.rms_eps, ws.xb);
-        lap.lap(l, Stage::kNorm);
-        spec_->attention(*this, lay, cache, seq, ws, l, pos);
-        matvec_mt(op, lay.wo, ws.out, ws.xb2);
-        for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
-            ws.x[i] += ws.xb2[i];
-        }
-        lap.lap(l, Stage::kAttention);
-
-        apply_norm(ws.x, lay.ffn_norm, hp_.rms_eps, ws.xb);
-        lap.lap(l, Stage::kNorm);
-        if (!lay.is_moe()) {
-            const MatvecJob gu[] = {{lay.w_gate, ws.xb, ws.gate},
-                                    {lay.w_up, ws.xb, ws.up}};
-            matvec_mt_group(op, gu);
-            silu_mul({ws.gate.data(), hp_.n_ff},
-                     {ws.up.data(), hp_.n_ff},
-                     {ws.gate.data(), hp_.n_ff});
-            matvec_mt(op, lay.w_down, {ws.gate.data(), hp_.n_ff},
-                      ws.xb2);
-            for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
-                ws.x[i] += ws.xb2[i];
-            }
-            lap.lap(l, Stage::kFfn);
-        } else {
-            moe_ffn(lay, ws, l);
-            for (std::uint32_t i = 0; i < hp_.n_embd; ++i) {
-                ws.x[i] += ws.moe_acc[i];
-            }
-            lap.lap(l, Stage::kMoe);
-        }
+        attend_one(op, lay, l, cache, seq, pos, ws.x, ws, lap);
+        ffn_one(op, lay, l, ws, lap);
     }
 
     if (last) {
@@ -1690,7 +1789,6 @@ void TransformerModel::forward_batch_decode(
     }
     const Ops op = effective_ops(backend_, q8k_activations());
     const std::uint32_t E = hp_.n_embd;
-    const std::uint32_t ff = hp_.n_ff;
 
     // Each token is an independent sequence at its own position.
     std::vector<std::uint32_t> pos(n);
@@ -1719,29 +1817,22 @@ void TransformerModel::forward_batch_decode(
         }
     }
 
-    std::vector<float> x(static_cast<std::size_t>(n) * E);
-    std::vector<float> xbf(static_cast<std::size_t>(n) * E);
-    std::vector<float> xb2(static_cast<std::size_t>(n) * E);
-    std::vector<float> gate(static_cast<std::size_t>(n) * ff);
-    std::vector<float> up(static_cast<std::size_t>(n) * ff);
+    BatchBufs b(n, E, hp_.n_ff);
     // Plain llama attention, F32 cache: the projections as batched
-    // matvecs over the sequences, as forward_batch does for one.
+    // matvecs over the sequences, as forward_batch does for one, and
+    // the GPU attends all the sequences in one launch.
     const bool plain = spec_->plain_attention && !cache.quantized();
-    const std::uint32_t hd = hp_.head_dim;
-    const std::size_t kv_dim = std::size_t{hp_.n_kv_heads} * hd;
-    const std::uint32_t group = hp_.n_heads / hp_.n_kv_heads;
-    std::vector<float> qb, kb, vb;
     if (plain) {
-        qb.resize(static_cast<std::size_t>(n) * E);
-        kb.resize(static_cast<std::size_t>(n) * kv_dim);
-        vb.resize(kb.size());
+        b.q.resize(b.x.size());
+        b.k.resize(std::size_t{n} * hp_.n_kv_heads * hp_.head_dim);
+        b.v.resize(b.k.size());
     }
 
     StageLap lap(stage_metrics_.get());  // wall time per part (i#285)
     constexpr std::uint32_t kNoLayer = StageMetrics::kNoLayer;
     for (std::uint32_t t = 0; t < n; ++t) {
         op.dequant_row(embd_, static_cast<std::uint32_t>(toks[t]),
-                       {x.data() + static_cast<std::size_t>(t) * E,
+                       {b.x.data() + static_cast<std::size_t>(t) * E,
                         E});
     }
     lap.lap(kNoLayer, Stage::kEmbed);
@@ -1749,103 +1840,20 @@ void TransformerModel::forward_batch_decode(
     for (std::uint32_t l = 0; l < hp_.n_layers; ++l) {
         const Layer& lay = layers_[l];
         if (plain) {
-            // q / k / v and wo batched over the sequences (each weight
-            // read once); RoPE, the cache rows and the attention per
-            // sequence, as llama_attention does them. Byte-identical to
-            // it, and the GPU attends all the sequences in one launch.
-            for (std::uint32_t t = 0; t < n; ++t) {
-                const std::size_t o = static_cast<std::size_t>(t) * E;
-                apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
-                           {xbf.data() + o, E});
-            }
-            lap.lap(l, Stage::kNorm);
-            matvec_batch(op, lay.wq, xbf, qb, n);
-            matvec_batch(op, lay.wk, xbf, kb, n);
-            matvec_batch(op, lay.wv, xbf, vb, n);
-            for (std::uint32_t t = 0; t < n; ++t) {
-                const kv::PagedKvCache::Seq& s = *seqs[t];
-                const std::span<float> q(qb.data() + std::size_t{t} * E, E);
-                float* krow = cache.k(s, l, pos[t]);
-                float* vrow = cache.v(s, l, pos[t]);
-                std::copy_n(kb.data() + std::size_t{t} * kv_dim, kv_dim,
-                            krow);
-                std::copy_n(vb.data() + std::size_t{t} * kv_dim, kv_dim,
-                            vrow);
-                backend::rope_norm(q, hp_.n_heads, hd, pos[t],
-                                   hp_.rope_freq_base, rope_factors());
-                backend::rope_norm({krow, kv_dim}, hp_.n_kv_heads, hd,
-                                   pos[t], hp_.rope_freq_base,
-                                   rope_factors());
-                cache.sync_rows(s, l, pos[t], 1);
-            }
-            if (!device_gqa_attend_seqs(op, cache, seqs, l, hp_, pos,
-                                        qb.data(), xb2.data(), E)) {
-                for (std::uint32_t t = 0; t < n; ++t) {
-                    const kv::PagedKvCache::Seq& s = *seqs[t];
-                    gqa_attend(
-                        qb.data() + std::size_t{t} * E,
-                        xb2.data() + std::size_t{t} * E, hp_.n_heads, hd,
-                        group, pos[t], hp_.kq_scale,
-                        [&](std::uint32_t p) -> const float* {
-                            return cache.k(s, l, p);
-                        },
-                        [&](std::uint32_t p) -> const float* {
-                            return cache.v(s, l, p);
-                        });
-                }
-            }
-            matvec_batch(op, lay.wo, xb2, qb, n);
-            for (std::size_t i = 0; i < static_cast<std::size_t>(n) * E;
-                 ++i) {
-                x[i] += qb[i];
-            }
-            lap.lap(l, Stage::kAttention);
+            attend_plain_batch(op, lay, l, cache, seqs, pos, b, lap);
         } else {
             // Attention: each token against ITS OWN sequence's cache.
             for (std::uint32_t t = 0; t < n; ++t) {
-                const std::size_t o = static_cast<std::size_t>(t) * E;
-                apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
-                           ws.xb);
-                lap.lap(l, Stage::kNorm);
-                spec_->attention(*this, lay, cache, *seqs[t], ws, l,
-                                 pos[t]);
-                matvec_mt(op, lay.wo, ws.out, ws.xb2);
-                for (std::uint32_t i = 0; i < E; ++i) {
-                    x[o + i] += ws.xb2[i];
-                }
-                lap.lap(l, Stage::kAttention);
+                attend_one(op, lay, l, cache, *seqs[t], pos[t],
+                           {b.x.data() + std::size_t{t} * E, E}, ws, lap);
             }
         }
-        for (std::uint32_t t = 0; t < n; ++t) {
-            const std::size_t o = static_cast<std::size_t>(t) * E;
-            apply_norm({x.data() + o, E}, lay.ffn_norm, hp_.rms_eps,
-                    {xbf.data() + o, E});
-        }
-        lap.lap(l, Stage::kNorm);
-        if (!lay.is_moe()) {
-            matvec_batch(op, lay.w_gate, xbf, gate, n);
-            matvec_batch(op, lay.w_up, xbf, up, n);
-            for (std::uint32_t t = 0; t < n; ++t) {
-                const std::size_t o =
-                    static_cast<std::size_t>(t) * ff;
-                silu_mul({gate.data() + o, ff}, {up.data() + o, ff},
-                         {gate.data() + o, ff});
-            }
-            matvec_batch(op, lay.w_down, gate, xb2, n);
-            for (std::uint32_t i = 0;
-                 i < static_cast<std::size_t>(n) * E; ++i) {
-                x[i] += xb2[i];
-            }
-            lap.lap(l, Stage::kFfn);
-        } else {
-            moe_ffn_batch(lay, l, xbf, x, n, ws);
-            lap.lap(l, Stage::kMoe);
-        }
+        ffn_batch(op, lay, l, b, n, ws, lap);
     }
 
     // Every decode token needs logits; amortize the head over the batch
     // (i#52).
-    project_head_batch(op, x, xbf, logits, n);
+    project_head_batch(op, b.x, b.xbf, logits, n);
     lap.lap(kNoLayer, Stage::kHead);
     for (std::uint32_t t = 0; t < n; ++t) {
         seqs[t]->n_tokens = pos[t] + 1;
@@ -1879,7 +1887,6 @@ void TransformerModel::forward_batch_layers(
     const bool first = layer_begin == 0;
     const bool last = layer_end == hp_.n_layers;
     const std::uint32_t E = hp_.n_embd;
-    const std::uint32_t ff = hp_.n_ff;
     const std::uint32_t V = hp_.n_vocab;
     if (first) {
         if (toks.size() != n) {
@@ -1927,76 +1934,13 @@ void TransformerModel::forward_batch_layers(
     }
 
     if (backend_->name == "vulkan") {
-        // A Vulkan stage (i#566): the sequences in multi-sequence passes
-        // of at most 8 when the model fits them, else one GPU forward
-        // per sequence. A lone sequence keeps the single kernels unless
-        // the batch-invariant mode is on, as forward() does.
-        if (first) {
-            for (const tok::TokenId t : toks) {
-                if (t < 0 || static_cast<std::uint32_t>(t) >= V) {
-                    throw std::invalid_argument("token id out of vocab");
-                }
-            }
-        }
-        constexpr std::uint32_t kMultiMax = 8;  // vulkan_forward_multi's
-        const std::size_t ow = last ? V : E;
-        std::vector<float> normed(last ? std::size_t{n} * E : 0);
-        std::vector<EmbedStep> steps(n);
-        for (std::uint32_t t = 0; t < n; ++t) {
-            steps[t].token = first ? toks[t] : 0;
-            if (!first) {
-                steps[t].embd_in = hidden_in.subspan(std::size_t{t} * E, E);
-            }
-            steps[t].seq = seqs[t];
-            steps[t].logits = out.subspan(t * ow, ow);
-            if (last) {
-                steps[t].normed_out =
-                    std::span(normed).subspan(std::size_t{t} * E, E);
-            }
-        }
-        StageLap lap(stage_metrics_.get());
-        // All or nothing, as the CPU path: a failure restores every
-        // seq's position (a rerun rewrites the same KV rows).
-        std::vector<std::uint32_t> before(n);
-        for (std::uint32_t t = 0; t < n; ++t) {
-            before[t] = seqs[t]->n_tokens;
-        }
-        try {
-            for (std::uint32_t c = 0; c < n; c += kMultiMax) {
-                const std::uint32_t cn = std::min(kMultiMax, n - c);
-                const auto chunk = std::span(steps).subspan(c, cn);
-                if ((cn > 1 || backend::vulkan_batch_invariant()) &&
-                    vulkan_forward_multi_layers(*this, chunk, layer_begin,
-                                                layer_end, cache, 0, V)) {
-                    continue;
-                }
-                for (std::uint32_t t = c; t < c + cn; ++t) {
-                    if (first && last) {
-                        forward(toks[t], cache, *seqs[t], ws,
-                                steps[t].logits);
-                    } else {
-                        forward_layers(steps[t].token, steps[t].embd_in,
-                                       layer_begin, layer_end, cache,
-                                       *seqs[t], ws, steps[t].logits);
-                    }
-                }
-            }
-        } catch (...) {
-            for (std::uint32_t t = 0; t < n; ++t) {
-                seqs[t]->n_tokens = before[t];
-            }
-            throw;
-        }
-        lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
+        vulkan_batch_layers(toks, hidden_in, layer_begin, layer_end, cache,
+                            seqs, ws, out);
         return;
     }
 
     const Ops op = effective_ops(backend_, q8k_activations());
-    std::vector<float> x(static_cast<std::size_t>(n) * E);
-    std::vector<float> xbf(static_cast<std::size_t>(n) * E);
-    std::vector<float> xb2(static_cast<std::size_t>(n) * E);
-    std::vector<float> gate(static_cast<std::size_t>(n) * ff);
-    std::vector<float> up(static_cast<std::size_t>(n) * ff);
+    BatchBufs b(n, E, hp_.n_ff);
 
     // First stage embeds each token; a later stage loads the residual
     // stream handed over per sequence.
@@ -2009,62 +1953,31 @@ void TransformerModel::forward_batch_layers(
                 throw std::invalid_argument("token id out of vocab");
             }
             op.dequant_row(embd_, static_cast<std::uint32_t>(toks[t]),
-                           {x.data() + static_cast<std::size_t>(t) * E,
+                           {b.x.data() + static_cast<std::size_t>(t) * E,
                             E});
         }
     } else {
         std::copy_n(hidden_in.data(),
-                    static_cast<std::size_t>(n) * E, x.data());
+                    static_cast<std::size_t>(n) * E, b.x.data());
     }
     lap.lap(kNoLayer, Stage::kEmbed);
 
-    // Identical per-layer body to forward_batch_decode (which is
-    // byte-identical to per-sequence forward), just over [layer_begin,
+    // forward_batch_decode's per-layer body without its plain attention
+    // (both byte-identical to per-sequence forward), over [layer_begin,
     // layer_end).
     for (std::uint32_t l = layer_begin; l < layer_end; ++l) {
         const Layer& lay = layers_[l];
         for (std::uint32_t t = 0; t < n; ++t) {
-            const std::size_t o = static_cast<std::size_t>(t) * E;
-            apply_norm({x.data() + o, E}, lay.attn_norm, hp_.rms_eps,
-                       ws.xb);
-            lap.lap(l, Stage::kNorm);
-            spec_->attention(*this, lay, cache, *seqs[t], ws, l, pos[t]);
-            matvec_mt(op, lay.wo, ws.out, ws.xb2);
-            for (std::uint32_t i = 0; i < E; ++i) {
-                x[o + i] += ws.xb2[i];
-            }
-            lap.lap(l, Stage::kAttention);
+            attend_one(op, lay, l, cache, *seqs[t], pos[t],
+                       {b.x.data() + std::size_t{t} * E, E}, ws, lap);
         }
-        for (std::uint32_t t = 0; t < n; ++t) {
-            const std::size_t o = static_cast<std::size_t>(t) * E;
-            apply_norm({x.data() + o, E}, lay.ffn_norm, hp_.rms_eps,
-                       {xbf.data() + o, E});
-        }
-        lap.lap(l, Stage::kNorm);
-        if (!lay.is_moe()) {
-            matvec_batch(op, lay.w_gate, xbf, gate, n);
-            matvec_batch(op, lay.w_up, xbf, up, n);
-            for (std::uint32_t t = 0; t < n; ++t) {
-                const std::size_t o = static_cast<std::size_t>(t) * ff;
-                silu_mul({gate.data() + o, ff}, {up.data() + o, ff},
-                         {gate.data() + o, ff});
-            }
-            matvec_batch(op, lay.w_down, gate, xb2, n);
-            for (std::uint32_t i = 0;
-                 i < static_cast<std::size_t>(n) * E; ++i) {
-                x[i] += xb2[i];
-            }
-            lap.lap(l, Stage::kFfn);
-        } else {
-            moe_ffn_batch(lay, l, xbf, x, n, ws);
-            lap.lap(l, Stage::kMoe);
-        }
+        ffn_batch(op, lay, l, b, n, ws, lap);
     }
 
     if (last) {
         // Final stage: project to logits (amortized head, i#52), consume
         // the token.
-        project_head_batch(op, x, xbf, out, n);
+        project_head_batch(op, b.x, b.xbf, out, n);
         lap.lap(kNoLayer, Stage::kHead);
         for (std::uint32_t t = 0; t < n; ++t) {
             seqs[t]->n_tokens = pos[t] + 1;
@@ -2072,8 +1985,81 @@ void TransformerModel::forward_batch_layers(
     } else {
         // Hand the residual streams on; the tokens are not consumed yet
         // (the final stage advances the seqs), matching forward_layers.
-        std::copy_n(x.data(), static_cast<std::size_t>(n) * E, out.data());
+        std::copy_n(b.x.data(), static_cast<std::size_t>(n) * E, out.data());
     }
+}
+
+void TransformerModel::vulkan_batch_layers(
+    std::span<const tok::TokenId> toks, std::span<const float> hidden_in,
+    std::uint32_t layer_begin, std::uint32_t layer_end,
+    kv::PagedKvCache& cache, std::span<kv::PagedKvCache::Seq* const> seqs,
+    Workspace& ws, std::span<float> out) const {
+    // A Vulkan stage (i#566): the sequences in multi-sequence passes of
+    // at most 8 when the model fits them, else one GPU forward per
+    // sequence. A lone sequence keeps the single kernels unless the
+    // batch-invariant mode is on, as forward() does.
+    const auto n = static_cast<std::uint32_t>(seqs.size());
+    const bool first = layer_begin == 0;
+    const bool last = layer_end == hp_.n_layers;
+    const std::uint32_t E = hp_.n_embd;
+    const std::uint32_t V = hp_.n_vocab;
+    if (first) {
+        for (const tok::TokenId t : toks) {
+            if (t < 0 || static_cast<std::uint32_t>(t) >= V) {
+                throw std::invalid_argument("token id out of vocab");
+            }
+        }
+    }
+    constexpr std::uint32_t kMultiMax = 8;  // vulkan_forward_multi's
+    const std::size_t ow = last ? V : E;
+    std::vector<float> normed(last ? std::size_t{n} * E : 0);
+    std::vector<EmbedStep> steps(n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        steps[t].token = first ? toks[t] : 0;
+        if (!first) {
+            steps[t].embd_in = hidden_in.subspan(std::size_t{t} * E, E);
+        }
+        steps[t].seq = seqs[t];
+        steps[t].logits = out.subspan(t * ow, ow);
+        if (last) {
+            steps[t].normed_out =
+                std::span(normed).subspan(std::size_t{t} * E, E);
+        }
+    }
+    StageLap lap(stage_metrics_.get());
+    // All or nothing, as the CPU path: a failure restores every seq's
+    // position (a rerun rewrites the same KV rows).
+    std::vector<std::uint32_t> before(n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        before[t] = seqs[t]->n_tokens;
+    }
+    try {
+        for (std::uint32_t c = 0; c < n; c += kMultiMax) {
+            const std::uint32_t cn = std::min(kMultiMax, n - c);
+            const auto chunk = std::span(steps).subspan(c, cn);
+            if ((cn > 1 || backend::vulkan_batch_invariant()) &&
+                backend::vulkan_forward_multi_layers(*this, chunk,
+                                                     layer_begin, layer_end,
+                                                     cache, 0, V)) {
+                continue;
+            }
+            for (std::uint32_t t = c; t < c + cn; ++t) {
+                if (first && last) {
+                    forward(toks[t], cache, *seqs[t], ws, steps[t].logits);
+                } else {
+                    forward_layers(steps[t].token, steps[t].embd_in,
+                                   layer_begin, layer_end, cache, *seqs[t],
+                                   ws, steps[t].logits);
+                }
+            }
+        }
+    } catch (...) {
+        for (std::uint32_t t = 0; t < n; ++t) {
+            seqs[t]->n_tokens = before[t];
+        }
+        throw;
+    }
+    lap.lap(StageMetrics::kNoLayer, Stage::kDevice);
 }
 
 namespace {
