@@ -105,9 +105,9 @@ three GGUFs from `scripts/text/convert-t5-encoder.py`,
 `scripts/image/convert-pixart.py` and `scripts/image/convert-sd-vae.py`;
 the FLUX directory holds the four from `scripts/image/convert-flux.py`
 (`--dit-out`, `--clip-out`, `--vae-out`) and
-`scripts/text/convert-t5-encoder.py` on the pipeline's `text_encoder_2`. One image
-runs at a time; a second request while one runs gets a 503 with
-`Retry-After`.
+`scripts/text/convert-t5-encoder.py` on the pipeline's `text_encoder_2`.
+One image runs at a time; a second request while one runs gets a 503
+with `Retry-After`.
 
 `/v1/images/edits` runs FLUX.1 Kontext dev on a reference image: the
 same character, object or scene, changed as the prompt says. A FLUX.1
