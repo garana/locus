@@ -11,6 +11,7 @@
 
 #include "locus/backend/metal/context.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/sys/mmap_file.hpp"
 
 namespace locus::backend::metal {
 
@@ -132,6 +133,13 @@ const Context::Buffer& weight(Context& ctx, const Mat& w, const Kind& k) {
         ctx.free(c.buf);
         ws.erase(it);
     }
+    // A model file's unmap drops its copies (i#1029): set up with the
+    // first upload, as nothing is cached before.
+    static const bool hooked = [] {
+        sys::add_unmap_hook(&release_weights);
+        return true;
+    }();
+    (void)hooked;
     Cached c{ctx.upload({w.data, bytes}), w.type, w.rows, w.cols, print};
     return ws.emplace(w.data, c).first->second.buf;
 }

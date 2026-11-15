@@ -1,6 +1,8 @@
 // The Metal backend's skeleton (i#865): device, shared buffers, the
 // kernel library compiled from source, and the registry entry.
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cmath>
@@ -23,12 +25,11 @@
 #include "locus/backend/metal/context.hpp"
 #include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
-#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
+#include "locus/sys/mmap_file.hpp"
 #include "locus/tok/tokenizer.hpp"
-#include "qwen_tiny.hpp"
 
 using locus::backend::metal::Context;
 
@@ -823,48 +824,64 @@ TEST_CASE("metal forward on a GGUF parsed from memory copies its weights",
     CHECK(worst <= 0.01f * scale);
 }
 
-// i#1029: a destroyed model's weights leave the Metal weight cache, so
-// a process that loads model after model keeps only the live ones.
-TEST_CASE("a destroyed model releases its Metal cached weights",
-          "[metal]") {
-    if (!locus::backend::metal::Context::usable()) {
+namespace {
+
+/** A temp file of n random floats, removed with the object. */
+struct TempFloats {
+    std::string path;
+    explicit TempFloats(std::size_t n) {
+        path = (std::filesystem::temp_directory_path() /
+                ("locus-metal-unmap-" + std::to_string(::getpid()) +
+                 ".bin"))
+                   .string();
+        std::vector<float> v(n);
+        std::mt19937 rng(29);
+        std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+        for (auto& x : v) {
+            x = d(rng);
+        }
+        std::ofstream(path, std::ios::binary)
+            .write(reinterpret_cast<const char*>(v.data()),
+                   static_cast<std::streamsize>(v.size() * sizeof(float)));
+    }
+    ~TempFloats() { std::filesystem::remove(path); }
+};
+
+}  // namespace
+
+// i#1029: unmapping a model file drops the Metal copies of its weights
+// (whichever model held them), so a process that loads model after
+// model keeps only the live ones on the device.
+TEST_CASE("unmapping a file releases its Metal cached weights", "[metal]") {
+    if (!Context::usable()) {
         SKIP("no Metal device");
     }
     namespace mb = locus::backend::metal;
-    const auto img = qwen_tiny::lm("qwen2");
-    const auto g = locus::gguf::GgufFile::parse(img);
+    const std::uint32_t rows = 64, cols = 256;
+    const TempFloats f(std::size_t{rows} * cols);
     const std::size_t base = mb::cached_weight_bytes();
     {
-        auto model = locus::model::TransformerModel::load(g);
-        const locus::backend::Mat& w = model.layers()[0].wq;
-        std::vector<float> x(w.cols, 0.5f), out(w.rows);
+        const locus::sys::MappedFile map(f.path);
+        const locus::backend::Mat w{TensorType::kF32, map.bytes().data(),
+                                    rows, cols};
+        std::vector<float> x(cols, 0.5f), out(rows);
         mb::matvec(w, x, out);
-        REQUIRE(mb::cached_weight_bytes() > base);
-        // A moved model keeps the release; the moved-from one has none.
-        auto moved = std::move(model);
-        mb::matvec(moved.layers()[0].wq, x, out);
+        REQUIRE(mb::cached_weight_bytes() ==
+                base + std::size_t{rows} * cols * 4);
     }
     REQUIRE(mb::cached_weight_bytes() == base);
 }
 
-// i#1029: a model's release on destruction cleans only GPU caches that
-// exist, so a CPU-only process never builds Vulkan's State or Metal's
-// context for it. Meaningful when run alone (in the whole suite an
-// earlier test may have built both).
-TEST_CASE("a destroyed CPU model builds no GPU state",
-          "[metal][vulkan]") {
-    const bool vk = locus::backend::vulkan_state_built();
-    const bool mt = Context::made();
-    INFO("built before: vulkan " << vk << ", metal " << mt);
+// The unmap hook cleans only a cache that exists: in a process that
+// never ran Metal, unmapping a file makes no Metal context (meaningful
+// run alone; in the whole suite an earlier test may have made it).
+TEST_CASE("unmapping a file makes no Metal context", "[metal]") {
+    const bool made = Context::made();
+    INFO("made before: " << made);
     {
-        const auto img = qwen_tiny::lm("qwen2");
-        const auto g = locus::gguf::GgufFile::parse(img);
-        auto model = locus::model::TransformerModel::load(g);
-        const auto* cpu = locus::backend::find_backend("neon");
-        model.use_backend(cpu != nullptr
-                              ? *cpu
-                              : *locus::backend::find_backend("scalar"));
+        const TempFloats f(1024);
+        const locus::sys::MappedFile map(f.path);
+        (void)map;
     }
-    CHECK(locus::backend::vulkan_state_built() == vk);
-    CHECK(Context::made() == mt);
+    CHECK(Context::made() == made);
 }

@@ -62,6 +62,15 @@ using UnmapHook = void (*)(const void* p, std::size_t n);
 UnmapHook set_unmap_hook(UnmapHook hook);
 
 /**
+ * Adds a hook each MappedFile calls with its range just before
+ * unmapping it, after set_unmap_hook's slot: for a cache that lives as
+ * long as the process (Metal's weight cache, i#1029). Hooks stay for
+ * the process's life; a hook added twice runs once. Thread-safe.
+ * @throws std::length_error past 4 hooks.
+ */
+void add_unmap_hook(UnmapHook hook);
+
+/**
  * Asks the OS to start faulting in [p, p+n) asynchronously
  * (madvise WILLNEED, page-aligned). Best-effort: errors are
  * ignored. Used by the R8 expert-readahead policy to overlap the

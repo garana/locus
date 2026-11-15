@@ -182,10 +182,6 @@ class GgufFile {
     /** @returns This file's size in bytes. */
     std::size_t file_bytes() const { return buf_.size(); }
 
-    /** @returns This file's bytes (the mapping, or the parsed buffer):
-     *  every tensor of this file lies inside them. */
-    std::span<const std::byte> bytes() const { return buf_; }
-
     /** @returns This file's bytes before its data section: the header,
      *  the metadata and the tensor table (the disk prefix cache hashes
      *  them to name the model, i#416). */

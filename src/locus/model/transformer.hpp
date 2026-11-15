@@ -939,10 +939,6 @@ class TransformerModel {
     /** The Metal forward's weight buffers (i#866), uploaded on its
      *  first call and freed with the model. */
     mutable std::shared_ptr<struct MetalWeights> metal_weights_;
-    /** Releases the GGUF files' bytes from the GPU weight caches (Metal's
-     *  matvec cache, Vulkan's pool) when the last copy of the model goes
-     *  (i#1029), so a long process does not keep dead models resident. */
-    std::shared_ptr<struct GpuWeightRelease> gpu_release_;
     /** The loaded range's tensor bytes (stage_weight_bytes): decides
      *  the hybrid and sizes its hot zone. */
     std::uint64_t weight_bytes_ = 0;

@@ -410,15 +410,10 @@ bool vulkan_batch_invariant();
  * over host memory [p, p + n), as an unmap does: an image pipeline
  * whose parts do not all fit the GPU at once releases one part before
  * the next (FLUX: T5-XXL before the DiT). The next use uploads or
- * imports them again. No-op, building nothing, when the calling
- * thread's device has no State (nothing is cached there).
+ * imports them again. No-op without Vulkan.
  * @throws std::logic_error inside an open batch.
  */
 void vulkan_release_weights(const void* p, std::size_t n);
-
-/** @returns Whether the calling thread's Vulkan device has built its
- *  State (no device probe, no build). */
-bool vulkan_state_built();
 
 /**
  * CUDA matvec: F32, Q8_0, Q2_K, Q4_K, Q5_K, Q6_K and the

@@ -68,10 +68,12 @@ const Ops& image_ops();
 void drop_weights();
 
 /**
- * Frees the cached weights whose bytes start in [p, p + n): a model's
- * file going away, so a later model at the same addresses uploads its
- * own and the device memory comes back. Takes device_mutex(); a no-op,
- * making nothing, before any Metal context exists.
+ * Frees the cached weights whose bytes start in [p, p + n). Every
+ * model file's unmap calls it (sys::add_unmap_hook, set with the first
+ * upload), so a dead model's copies leave the device whatever model
+ * held them. Takes device_mutex(): a file must not be unmapped by a
+ * thread that holds it (inside a metal::Seq's scope). A no-op, making
+ * nothing, before any Metal context exists.
  */
 void release_weights(const void* p, std::size_t n);
 
