@@ -399,11 +399,29 @@ int answered_client(int port) {
 
 }  // namespace
 
+/** @returns fd's TCP_USER_TIMEOUT in ms (i#1016); where the OS has no
+ *  such option, the value the test expects, so the check is moot. */
+int user_timeout_ms(int fd, int expect) {
+#if defined(TCP_USER_TIMEOUT)
+    (void)expect;
+    unsigned int v = 1;
+    socklen_t n = sizeof(v);
+    ::getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &v, &n);
+    return static_cast<int>(v);
+#else
+    (void)fd;
+    return expect;
+#endif
+}
+
 // i#994: both HTTP servers turn TCP keepalive on for each client socket
 // with the configured probes, so a client whose host died is found (a
 // dead peer cannot be made on loopback: that end is checked by hand).
+// i#1016: and bound unacknowledged data the same way (Linux), so a
+// stream to a dead host is found as fast: 45 + 15 x 2 s.
 TEST_CASE("the HTTP servers set TCP keepalive on client sockets",
           "[http][loop_server]") {
+    constexpr int kBoundMs = (45 + 15 * 2) * 1000;
     ServerConfig cfg;
     cfg.host = "127.0.0.1";
     cfg.port = 0;
@@ -419,6 +437,7 @@ TEST_CASE("the HTTP servers set TCP keepalive on client sockets",
         CHECK(keepalive_of(s)[1] == 45);
         CHECK(keepalive_of(s)[2] == 15);
         CHECK(keepalive_of(s)[3] == 2);
+        CHECK(user_timeout_ms(s, kBoundMs) == kBoundMs);
         ::close(c);
     }
     {
@@ -432,6 +451,7 @@ TEST_CASE("the HTTP servers set TCP keepalive on client sockets",
         CHECK(keepalive_of(s)[1] == 45);
         CHECK(keepalive_of(s)[2] == 15);
         CHECK(keepalive_of(s)[3] == 2);
+        CHECK(user_timeout_ms(s, kBoundMs) == kBoundMs);
         ::close(c);
         server.stop();
     }
@@ -442,5 +462,6 @@ TEST_CASE("the HTTP servers set TCP keepalive on client sockets",
     const int s = server_end(c);
     REQUIRE(s >= 0);
     CHECK(keepalive_of(s)[0] == 0);
+    CHECK(user_timeout_ms(s, 0) == 0);
     ::close(c);
 }

@@ -585,6 +585,16 @@ void set_keepalive(int fd, int idle_s, int intvl_s, int count) {
 #endif
 }
 
+void set_user_timeout(int fd, int ms) {
+#if defined(TCP_USER_TIMEOUT)
+    const unsigned int v = ms > 0 ? static_cast<unsigned int>(ms) : 0u;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &v, sizeof(v));
+#else
+    (void)fd;
+    (void)ms;
+#endif
+}
+
 std::optional<TcpRtt> tcp_rtt(int fd) {
 #if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
     tcp_connection_info ti{};
