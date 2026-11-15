@@ -48,6 +48,10 @@ struct MvParams {
     uint x_slot_stride;
     uint out_slot_stride;
     uint slot_div;  // x of slot s is at + (s / slot_div) * x_slot_stride
+    // Q4_K only, rows not accumulated (i#1064): rows 2 i and 2 i + 1 of
+    // each rope_hd-wide head rotate by cs[(2 i) % rope_hd ..] (cos, sin)
+    // before the store, as rope_norm would after it. 0: none.
+    uint rope_hd;
 };
 
 constant constexpr uint kNoRoute = 0xFFFFFFFFu;
@@ -337,6 +341,7 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
                     device float* out [[buffer(2)]],
                     constant MvParams& p [[buffer(3)]],
                     device const uint* route [[buffer(7)]],
+                    device const float* cs [[buffer(8)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint sg [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
@@ -387,6 +392,17 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
         }
     }
     const float t0 = simd_sum(acc0), t1 = simd_sum(acc1);
+    if (lane == 0 && p.rope_hd != 0 && r0 + 1 < p.rows) {
+        // The pair (r0, r0 + 1), r0 even: rope_norm's rotation, on the
+        // values it would read back.
+        device float* o = out + p.out_off + ulong(slot) * p.out_slot_stride;
+        const uint e = r0 % p.rope_hd;
+        const float c = cs[e], s = cs[e + 1];
+        const float a = p.scale * t0, b = p.scale * t1;
+        o[r0] = a * c - b * s;
+        o[r0 + 1] = a * s + b * c;
+        return;
+    }
     if (lane == 0) {
         for (uint i = 0; i < 2 && r0 + i < p.rows; ++i) {
             device float* o =

@@ -562,6 +562,20 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
             const Context::Arg a[] = {{&v, 0}, {&fbuf(b), 0}};
             ctx.dispatch("add_bias", a, bytes_of(bp), n_tok * bp.n, 256);
         };
+        // q or k with rope_norm in the matvec's store (i#1064), where
+        // the type has the epilogue: false when it does not.
+        const auto mv_rope = [&](const Mat& w, const Context::Buffer& out,
+                                 std::uint64_t out_off) {
+            const auto r = wbuf(w);
+            return metal::record_matvec_rope(ctx, w.type, w.rows, w.cols,
+                                             *r.buf, r.off, s.xb, 0, out,
+                                             out_off, s.cs, hd);
+        };
+        // LOCUS_METAL_ROPE_EPILOGUE=0: always the separate rope_norm
+        // (tests, benches).
+        const char* re_env = std::getenv("LOCUS_METAL_ROPE_EPILOGUE");
+        const bool rope_epilogue =
+            neox == 0 && (re_env == nullptr || std::string_view(re_env) != "0");
         const auto rope = [&](const Context::Buffer& b, std::uint64_t off,
                               std::uint32_t heads) {
             const RopeParams rp{off, heads, hd, neox};
@@ -578,9 +592,19 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 rmsnorm(lay.attn_norm);
                 // q, k and v read xb and write apart: they may overlap,
                 // and so may the two RoPEs.
-                mv(lay.wq, s.xb, s.q, 0, false);
+                // RoPE straight after q and k (no biases, no q / k norm,
+                // interleaved pairs) goes in their matvecs' store.
+                const bool fuse = rope_epilogue && !lay.has_qkv_bias() &&
+                                  !lay.has_qk_norm();
+                const bool rq = fuse && mv_rope(lay.wq, s.q, 0);
+                if (!rq) {
+                    mv(lay.wq, s.xb, s.q, 0, false);
+                }
                 ctx.overlap_next();
-                mv(lay.wk, s.xb, *pool, krow, false);
+                const bool rk = fuse && mv_rope(lay.wk, *pool, krow);
+                if (!rk) {
+                    mv(lay.wk, s.xb, *pool, krow, false);
+                }
                 ctx.overlap_next();
                 mv(lay.wv, s.xb, *pool, vrow, false);
                 if (lay.has_qkv_bias()) {
@@ -597,9 +621,15 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     ctx.overlap_next();
                     head_norm(*pool, krow, KV, lay.attn_k_norm, 1, 0);
                 }
-                rope(s.q, 0, H);
-                ctx.overlap_next();
-                rope(*pool, krow, KV);
+                if (!rq) {
+                    rope(s.q, 0, H);
+                }
+                if (!rk) {
+                    if (!rq) {
+                        ctx.overlap_next();
+                    }
+                    rope(*pool, krow, KV);
+                }
                 const AttnParams ap{cache.block_floats(),
                                     cache.layer_offset(l),
                                     cache.layer_floats() / 2,
