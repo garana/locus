@@ -449,3 +449,67 @@ kernel void silu_mul(device float* gate [[buffer(0)]],
         gate[i] = g / (1.0f + exp(-g)) * up[i];
     }
 }
+
+// The three attention passes in one kernel for up to kAttnMaxPos
+// positions: one threadgroup a head computes its scores into
+// threadgroup memory, takes their softmax, then sums the values (each
+// thread a slice of positions for its dimension, the slices added
+// through threadgroup memory). Same AttnParams and buffers as
+// attn_scores, with the output at index 3.
+constant constexpr uint kAttnMaxPos = 4096;
+constant constexpr uint kAttnGroup = 256;
+
+kernel void attn_fused(device const float* q [[buffer(0)]],
+                       device const float* pool [[buffer(1)]],
+                       device const uint* blocks [[buffer(2)]],
+                       device float* out [[buffer(3)]],
+                       constant AttnParams& p [[buffer(4)]],
+                       uint h [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float s[kAttnMaxPos];
+    threadgroup float part[32];
+    threadgroup float red[kAttnGroup];
+    const uint kvh = h / (p.n_heads / p.n_kv_heads);
+    device const float4* qh = (device const float4*)(q + h * p.head_dim);
+    float m = -INFINITY;
+    for (uint t = tid; t < p.n_pos; t += kAttnGroup) {
+        device const float4* k = (device const float4*)(
+            pool + kv_row(p, blocks, t) + kvh * p.head_dim);
+        float d = 0.0f;
+        for (uint i = 0; i < p.head_dim / 4; ++i) {
+            d += dot(qh[i], k[i]);
+        }
+        d *= p.kq_scale;
+        s[t] = d;
+        m = max(m, d);
+    }
+    m = group_max(m, part, tid, kAttnGroup);
+    float sum = 0.0f;
+    for (uint t = tid; t < p.n_pos; t += kAttnGroup) {
+        const float e = exp(s[t] - m);
+        s[t] = e;
+        sum += e;
+    }
+    sum = group_sum(sum, part, tid, kAttnGroup);
+    const float inv = 1.0f / sum;
+    // Values: kAttnGroup / head_dim threads a dimension, each over every
+    // (kAttnGroup / head_dim)-th position.
+    const uint per = kAttnGroup / p.head_dim;
+    const uint d = tid % p.head_dim, slice = tid / p.head_dim;
+    float acc = 0.0f;
+    if (slice < per) {
+        for (uint t = slice; t < p.n_pos; t += per) {
+            acc += s[t] * pool[kv_row(p, blocks, t) + p.v_off +
+                               kvh * p.head_dim + d];
+        }
+    }
+    red[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (slice == 0) {
+        float v = 0.0f;
+        for (uint j = 0; j < per; ++j) {
+            v += red[j * p.head_dim + d];
+        }
+        out[h * p.head_dim + d] = v * inv;
+    }
+}
