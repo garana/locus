@@ -3,52 +3,17 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <functional>
 #include <stdexcept>
 #include <string>
 
 #include "locus/image/dense.hpp"
-#include "locus/sys/thread_pool.hpp"
 
 namespace locus::embed {
 
 namespace {
 
-/** Runs fn(i) for i in [0, n) on the thread pool. */
-void parallel(std::size_t n, const std::function<void(std::size_t)>& fn) {
-    sys::ThreadPool::instance().parallel_for(n, fn);
-}
-
-/** LayerNorm with bias over each of n rows of width w, into out (which
- *  may alias x); the moments in double. */
-void layer_norm(std::span<const float> x, std::uint32_t n, std::uint32_t w,
-                const std::vector<float>& g, const std::vector<float>& b,
-                float eps, std::span<float> out) {
-    parallel(n, [&](std::size_t t) {
-        const float* r = x.data() + t * w;
-        float* o = out.data() + t * w;
-        double mean = 0.0;
-        for (std::uint32_t i = 0; i < w; ++i) mean += r[i];
-        mean /= w;
-        double var = 0.0;
-        for (std::uint32_t i = 0; i < w; ++i) {
-            const double d = r[i] - mean;
-            var += d * d;
-        }
-        var /= w;
-        const auto inv = static_cast<float>(1.0 / std::sqrt(var + eps));
-        const auto m = static_cast<float>(mean);
-        for (std::uint32_t i = 0; i < w; ++i) {
-            o[i] = (r[i] - m) * inv * g[i] + b[i];
-        }
-    });
-}
-
-/** BERT's GELU, the exact erf form. */
-void gelu(std::span<float> x) {
-    constexpr float kInvSqrt2 = 0.70710678118654752440f;
-    for (float& v : x) v = 0.5f * v * (1.0f + std::erf(v * kInvSqrt2));
-}
+using image::dense::gelu;  // BERT's GELU, the exact erf form
+using image::dense::layer_norm;
 
 }  // namespace
 
