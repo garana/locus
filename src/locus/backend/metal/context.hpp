@@ -58,6 +58,10 @@ class Context {
      */
     static Context& get();
 
+    /** @returns Whether get() has made the context (no device probe, no
+     *  compile): a cleanup with nothing to clean returns at once. */
+    static bool made();
+
     ~Context();
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
@@ -128,6 +132,10 @@ class Context {
      *     std::runtime_error when the command buffer fails.
      */
     void end_batch();
+
+    /** Drops the open batch unsubmitted, so its dispatches never run
+     *  (a no-op without one): an error path's way out of a batch. */
+    void abandon_batch() noexcept;
 
     /**
      * Runs kernel `name` over `threads` threads (a 1-D grid, in

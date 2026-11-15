@@ -11,6 +11,7 @@
 
 #include "locus/backend/metal/context.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/sys/mmap_file.hpp"
 
 namespace locus::backend::metal {
 
@@ -114,7 +115,11 @@ void grow(Context& ctx, Context::Buffer& b, std::size_t n) {
 }
 
 std::size_t weight_bytes(const Mat& w, const Kind& k) {
-    return static_cast<std::size_t>(w.rows) * (w.cols / k.block) * k.bytes;
+    // Whole blocks a row for the quantized types; the float types'
+    // rows may end mid block (a LoRA B side of rank 2), so count
+    // elements.
+    const std::size_t el = std::size_t{w.rows} * w.cols;
+    return (el * k.bytes + k.block - 1) / k.block;
 }
 
 const Context::Buffer& weight(Context& ctx, const Mat& w, const Kind& k) {
@@ -132,6 +137,13 @@ const Context::Buffer& weight(Context& ctx, const Mat& w, const Kind& k) {
         ctx.free(c.buf);
         ws.erase(it);
     }
+    // A model file's unmap drops its copies (i#1029): set up with the
+    // first upload, as nothing is cached before.
+    static const bool hooked = [] {
+        sys::add_unmap_hook(&release_weights);
+        return true;
+    }();
+    (void)hooked;
     Cached c{ctx.upload({w.data, bytes}), w.type, w.rows, w.cols, print};
     return ws.emplace(w.data, c).first->second.buf;
 }
@@ -160,6 +172,14 @@ void record(Context& ctx, const Mat& w, const Kind& k) {
 }
 
 }  // namespace
+
+const Context::Buffer& cached_weight(Context& ctx, const Mat& w) {
+    const Kind k = kind_of(w.type);
+    if (k.kernel == nullptr) {
+        throw std::invalid_argument("metal cached_weight: no kernel");
+    }
+    return weight(ctx, w, k);
+}
 
 bool matvec_supported(gguf::TensorType t) {
     return kind_of(t).kernel != nullptr;
@@ -285,7 +305,7 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    const Context::Buffer& x, std::uint64_t x_off,
                    std::uint32_t x_stride, const Context::Buffer& out,
                    std::uint64_t out_off, std::uint32_t out_stride,
-                   bool accumulate) {
+                   bool accumulate, float scale) {
     const auto [kernel, block] = mm_kernel(t);
     if (kernel.empty() || cols % block != 0 || n_tok == 0) {
         return false;
@@ -295,7 +315,7 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
     const MmParams p{w_off,    x_off,      out_off,
                      rows,     cols,       n_tok,
                      x_stride, out_stride, accumulate ? 1u : 0u,
-                     1.0f,     row_tiles,  1,
+                     scale,    row_tiles,  1,
                      0};
     const Context::Arg args[] = {{&w, 0}, {&x, 0}, {&out, 0}};
     ctx.dispatch(kernel.c_str(), args, std::as_bytes(std::span(&p, 1)),
@@ -449,6 +469,38 @@ const Ops& image_ops() {
                          .pool_budget = nullptr,
                          .mt_safe = false};
     return ops;
+}
+
+void release_weights(const void* p, std::size_t n) {
+    // No context, no cached weights: return without making one.
+    if (!Context::made() || n == 0) {
+        return;
+    }
+    const auto* lo = static_cast<const std::byte*>(p);
+    const auto* hi = lo + n;
+    std::lock_guard lk(device_mutex());
+    Context& ctx = Context::get();
+    auto& ws = state().weights;
+    for (auto it = ws.begin(); it != ws.end();) {
+        if (it->first >= lo && it->first < hi) {
+            ctx.free(it->second.buf);
+            it = ws.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+std::size_t cached_weight_bytes() {
+    if (!Context::made()) {
+        return 0;
+    }
+    std::lock_guard lk(device_mutex());
+    std::size_t b = 0;
+    for (const auto& [ptr, c] : state().weights) {
+        b += c.buf.bytes;
+    }
+    return b;
 }
 
 void drop_weights() {

@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -131,7 +132,11 @@ TEST_CASE("loop server streams a chunked response", "[http][loop_server]") {
 
 TEST_CASE("loop server turns a throw into a 500 or a truncated stream",
           "[http][loop_server]") {
-    Running r({}, routes);
+    ServerConfig cfg;
+    cfg.metrics = std::make_shared<locus::http::HttpMetrics>(
+        std::vector<std::string>{"/stream-throw"});
+    const auto m = cfg.metrics;
+    Running r(cfg, routes);
     int fd = dial(r.port);
     send_all(fd, get("/throw"));
     std::string got = read_to_close(fd);
@@ -145,6 +150,10 @@ TEST_CASE("loop server turns a throw into a 500 or a truncated stream",
     CHECK(got.rfind("HTTP/1.1 200", 0) == 0);
     CHECK(got.find("4\r\npart\r\n") != std::string::npos);
     CHECK(got.find("0\r\n\r\n") == std::string::npos);
+    // i#980: counted (and logged) on its route, as on Server; the 500
+    // before any head is not a stream failure.
+    CHECK(m->at(m->route("/stream-throw")).stream_failures.load() == 1);
+    CHECK(m->at(m->other()).stream_failures.load() == 0);
     // And the server lives.
     fd = dial(r.port);
     send_all(fd, get("/hello"));
@@ -268,4 +277,57 @@ TEST_CASE("loop server stops with a stream producer blocked on its client",
     CHECK(Clock::now() - t0 < std::chrono::seconds(3));
     CHECK(returned.load());
     ::close(fd);
+}
+
+// i#990: a reply names its connection (WakeList) and deadlines sit in a
+// heap, so the I/O thread's work per chunk does not grow with the idle
+// connections it holds. Before, each wake ran on_wake on every
+// connection and each turn read every deadline: here about 200 visits a
+// chunk instead of one or two.
+TEST_CASE("loop server: a stream's chunks cost the same with idle clients",
+          "[http][loop_server]") {
+    constexpr int kChunks = 40;
+    const auto slow = [](const Request& req, ServerResponse& res,
+                         const RequestContext&) {
+        if (req.path != "/slow") {
+            res.set_content("hello\n", "text/plain");
+            return;
+        }
+        res.set_chunked_content_provider("text/plain", [](Sink& sink) {
+            for (int i = 0; i < kChunks; ++i) {
+                sink.write("x");
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        });
+    };
+    const auto visits_per_stream = [&](int idle) {
+        ServerConfig cfg;
+        cfg.idle_timeout_ms = 60000;
+        Running r(cfg, slow);
+        std::vector<int> idle_fds;
+        for (int i = 0; i < idle; ++i) {
+            idle_fds.push_back(dial(r.port));
+        }
+        // Every idle client is accepted (it answers in order after them).
+        int fd = dial(r.port);
+        send_all(fd, get("/hello"));
+        CHECK(read_to_close(fd).find("hello\n") != std::string::npos);
+        ::close(fd);
+        const std::uint64_t before = r.server.visits();
+        fd = dial(r.port);
+        send_all(fd, get("/slow"));
+        const std::string got = read_to_close(fd);
+        ::close(fd);
+        const std::uint64_t used = r.server.visits() - before;
+        CHECK(got.find("0\r\n\r\n") != std::string::npos);  // whole stream
+        for (const int f : idle_fds) ::close(f);
+        return used;
+    };
+    const std::uint64_t alone = visits_per_stream(0);
+    const std::uint64_t crowded = visits_per_stream(200);
+    INFO("alone=" << alone << " crowded=" << crowded);
+    CHECK(alone <= 4 * kChunks);
+    // The 200 idle clients add no work per chunk (their idle deadlines
+    // are a minute away; the slack covers timing).
+    CHECK(crowded <= alone + kChunks);
 }

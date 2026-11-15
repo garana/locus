@@ -55,6 +55,13 @@ class HttpMetrics {
     void record(std::size_t route, int status, std::uint64_t request_bytes,
                 std::uint64_t response_bytes, std::uint64_t ns);
 
+    /** Counts one streamed response whose producer failed after its
+     *  head went out (i#980): the client got a truncated transfer. */
+    void stream_failed(std::size_t route) {
+        routes_[route]->stream_failures.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+
     /** Requests between head received and response written. */
     std::atomic<std::int64_t> in_flight{0};
 
@@ -65,6 +72,8 @@ class HttpMetrics {
          * the range counts in out_of_range. */
         std::array<std::atomic<std::uint64_t>, kMaxCode - kMinCode + 1> codes;
         std::atomic<std::uint64_t> out_of_range{0};
+        /** Streams whose producer failed after the head (i#980). */
+        std::atomic<std::uint64_t> stream_failures{0};
         sys::Histogram request_bytes, response_bytes, seconds;
     };
     /** @returns Route i (i <= other()). */

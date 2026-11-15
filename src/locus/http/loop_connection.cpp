@@ -3,6 +3,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <utility>
 
@@ -30,17 +31,56 @@ std::size_t input_cap(const Limits& l) {
 
 }  // namespace
 
+namespace {
+/** Writes one wake byte to fd (EAGAIN: the pipe is full, so a wake is
+ *  already pending). */
+void wake_byte(int fd) {
+    const char b = 1;
+    while (::write(fd, &b, 1) < 0 && errno == EINTR) {
+    }
+}
+}  // namespace
+
+void WakeList::push(std::uint64_t id) {
+    bool first;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        first = ids_.empty();
+        ids_.push_back(id);
+    }
+    // A later push finds the list non-empty: the byte for this one wakes
+    // the loop, whose take() gets them all.
+    if (first && wake_fd_ >= 0) {
+        wake_byte(wake_fd_);
+    }
+}
+
+std::vector<std::uint64_t> WakeList::take() {
+    std::vector<std::uint64_t> ids;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        ids.swap(ids_);
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
 LoopReply::LoopReply(int wake_fd, std::size_t max_buffer,
-                     int write_deadline_ms)
+                     int write_deadline_ms,
+                     std::shared_ptr<WakeList> wake_list,
+                     std::uint64_t wake_id)
     : wake_fd_(wake_fd),
+      wake_list_(std::move(wake_list)),
+      wake_id_(wake_id),
       max_buffer_(max_buffer == 0 ? 1 : max_buffer),
       write_deadline_ms_(write_deadline_ms) {}
 
 void LoopReply::wake() const {
-    if (wake_fd_ < 0) return;
-    const char b = 1;
-    // EAGAIN: the pipe is full, so a wake is already pending.
-    while (::write(wake_fd_, &b, 1) < 0 && errno == EINTR) {
+    if (wake_list_) {
+        wake_list_->push(wake_id_);
+    } else if (wake_fd_ >= 0) {
+        wake_byte(wake_fd_);
     }
 }
 
@@ -216,7 +256,8 @@ void LoopConnection::answer() {
         req.keep_alive && served_ < cfg_.max_requests_per_conn;
     if (async_) {
         auto reply = std::make_shared<LoopReply>(
-            cfg_.wake_fd, cfg_.max_stream_buffer, cfg_.write_deadline_ms);
+            cfg_.wake_fd, cfg_.max_stream_buffer, cfg_.write_deadline_ms,
+            cfg_.wake_list, cfg_.wake_id);
         pending_ = reply;
         pending_keep_ = keep;
         pending_head_ = req.is_head;

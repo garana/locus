@@ -5,6 +5,7 @@
 #import <Metal/Metal.h>
 #include <mach/mach.h>
 
+#include <atomic>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -61,6 +62,13 @@ bool Context::usable() {
     return ok;
 }
 
+namespace {
+
+/** Set once get() has made the context. */
+std::atomic<bool> g_made{false};
+
+}  // namespace
+
 Context& Context::get() {
     static Context* ctx = [] {
         @autoreleasepool {
@@ -107,8 +115,11 @@ Context& Context::get() {
             return new Context(std::move(impl));
         }
     }();
+    g_made.store(true, std::memory_order_relaxed);
     return *ctx;
 }
+
+bool Context::made() { return g_made.load(std::memory_order_relaxed); }
 
 Context::Context(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
@@ -209,6 +220,16 @@ void Context::end_batch() {
     @autoreleasepool {
         finish(cb, "batch");
     }
+}
+
+void Context::abandon_batch() noexcept {
+    if (impl_->batch == nil) {
+        return;
+    }
+    // Never committed, so the GPU never touches its buffers.
+    [impl_->enc endEncoding];
+    impl_->enc = nil;
+    impl_->batch = nil;
 }
 
 void Context::dispatch(std::string_view name, std::span<const Arg> args,
