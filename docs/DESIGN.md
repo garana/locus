@@ -177,7 +177,11 @@ just under each read deadline.
 and owns the fd, the connection reads, parses, calls a non-blocking
 handler and writes, and says what to watch next; for small endpoints
 on a thread that already runs a loop, such as a stage's `/metrics`
-(#22).
+(#22). An async handler answers later, from any thread, through an
+`http::LoopReply` (#930): one buffered response, or a chunked stream
+whose chunks queue up to a byte bound (the producer waits, for at most
+the write deadline, while the socket lags); each call wakes the loop
+through a pipe, and a client that leaves cancels the reply.
 
 `locus-router` (`router::Router`) proxies each request to one of
 several instances by kind: text, image-to-text (a chat, messages or
