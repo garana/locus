@@ -1,8 +1,10 @@
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -225,4 +227,126 @@ TEST_CASE("EngineLoop wakes a waiter when a parked request is cancelled",
     const auto prompt = tok.encode("Once upon a time", true);
     CHECK(loop.wait_done(loop.submit(prompt, 4)).status ==
           locus::engine::Status::kDone);
+}
+
+namespace {
+/** Counts the progress hook's calls and wakes a waiter on each. */
+struct HookWake {
+    std::mutex mu;
+    std::condition_variable cv;
+    int calls = 0;
+
+    std::function<void()> hook() {
+        return [this] {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                ++calls;
+            }
+            cv.notify_all();
+        };
+    }
+    /** Sleeps until the hook has run more than `seen` times (or 1 s). */
+    int wait(int seen) {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait_for(lk, std::chrono::seconds(1),
+                    [&] { return calls > seen; });
+        return calls;
+    }
+};
+}  // namespace
+
+// i#989: a followed request's progress arrives through take(), woken by
+// the progress hook, and adds up to the snapshot view() gives at the
+// end: the same tokens, logprobs, status and prefix counts.
+TEST_CASE("EngineLoop follow: take() adds up to the final view",
+          "[e2e][engine_loop]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::engine::Engine::Config cfg;
+    const locus::tok::TokenId never_eos = model.hparams().n_vocab;
+    locus::server::EngineLoop loop(model, never_eos, cfg);
+    HookWake wake;
+    loop.set_progress_hook(wake.hook());
+
+    const auto prompt = tok.encode("Once upon a time", true);
+    loop.wait_done(loop.submit(prompt, 4));  // warm the weights in
+
+    locus::engine::LogprobsOpt lp;
+    lp.enabled = true;
+    lp.top = 2;
+    const std::uint64_t id = loop.submit(prompt, 64, {}, 0, nullptr, lp);
+    loop.follow(id);
+    locus::server::EngineLoop::View acc;
+    int takes = 0;
+    int calls = 0;
+    for (int round = 0; round < 10000; ++round) {
+        if (loop.take(id, acc)) ++takes;
+        if (locus::engine::is_terminal(acc.status)) break;
+        calls = wake.wait(calls);
+    }
+    REQUIRE(acc.status == locus::engine::Status::kDone);
+    CHECK(takes > 1);  // incremental, not all at the end
+    CHECK(wake.calls > 0);
+    // Ended at the terminal take: nothing more to take.
+    CHECK_FALSE(loop.take(id, acc));
+
+    const auto v = loop.view(id);
+    CHECK(acc.generated == v.generated);
+    REQUIRE(acc.logprobs.size() == v.logprobs.size());
+    for (std::size_t i = 0; i < v.logprobs.size(); ++i) {
+        CHECK(acc.logprobs[i].token == v.logprobs[i].token);
+        CHECK(acc.logprobs[i].logprob == v.logprobs[i].logprob);
+        CHECK(acc.logprobs[i].top.size() == v.logprobs[i].top.size());
+    }
+    CHECK(acc.reused_prefix_tokens == v.reused_prefix_tokens);
+    CHECK(acc.cached_prefix_tokens == v.cached_prefix_tokens);
+    CHECK(acc.generated.size() == 64);
+
+    // An id nobody follows: nothing to take, acc untouched.
+    locus::server::EngineLoop::View other;
+    CHECK_FALSE(loop.take(id + 100, other));
+    CHECK(other.generated.empty());
+}
+
+// i#989: cancelling a followed request queues kCancelled (cancel
+// publishes, so a parked worker does not hide it), and unfollow drops
+// the queue.
+TEST_CASE("EngineLoop follow: a cancel reaches take()",
+          "[e2e][engine_loop]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::engine::Engine::Config cfg;
+    const locus::tok::TokenId never_eos = model.hparams().n_vocab;
+    locus::server::EngineLoop loop(model, never_eos, cfg);
+    HookWake wake;
+    loop.set_progress_hook(wake.hook());
+
+    const auto prompt = tok.encode("Once upon a time", true);
+    const std::uint64_t id = loop.submit(prompt, 4096);
+    loop.follow(id);
+    loop.follow(id);  // idempotent
+    locus::server::EngineLoop::View acc;
+    CHECK(loop.take(id, acc));  // the first take reports the state
+    loop.cancel(id);
+    // cancel() queued the terminal state before it returned.
+    REQUIRE(loop.take(id, acc));
+    CHECK(acc.status == locus::engine::Status::kCancelled);
+    CHECK(acc.generated.size() < 4096);
+    CHECK(loop.release(id));
+
+    const std::uint64_t id2 = loop.submit(prompt, 4096);
+    loop.follow(id2);
+    loop.unfollow(id2);
+    locus::server::EngineLoop::View acc2;
+    CHECK_FALSE(loop.take(id2, acc2));
+    loop.cancel(id2);
+    loop.release(id2);
 }
