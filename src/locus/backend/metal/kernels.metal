@@ -47,6 +47,7 @@ struct MvParams {
     uint n_slots;
     uint x_slot_stride;
     uint out_slot_stride;
+    uint slot_div;  // x of slot s is at + (s / slot_div) * x_slot_stride
 };
 
 constant constexpr uint kNoRoute = 0xFFFFFFFFu;
@@ -102,7 +103,8 @@ kernel void mv_f32(device const uchar* w [[buffer(0)]],
     const uint slot = tg / gps;
     const uint r = tg % gps * kMvRows + tid / kMvLanes;
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
-    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
+    device const float* xs =
+        xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         device const float4* row =
@@ -130,7 +132,8 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
     const uint slot = tg / gps;
     const uint r = tg % gps * kMvRows + tid / kMvLanes;
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
-    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
+    device const float* xs =
+        xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 32;
@@ -165,7 +168,8 @@ kernel void mv_f16(device const uchar* w [[buffer(0)]],
     const uint slot = tg / gps;
     const uint r = tg % gps * kMvRows + tid / kMvLanes;
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
-    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
+    device const float* xs =
+        xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         device const half4* row =
@@ -192,7 +196,8 @@ kernel void mv_bf16(device const uchar* w [[buffer(0)]],
     const uint slot = tg / gps;
     const uint r = tg % gps * kMvRows + tid / kMvLanes;
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
-    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
+    device const float* xs =
+        xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         device const ushort4* row =
@@ -221,7 +226,8 @@ kernel void mv_q4_0(device const uchar* w [[buffer(0)]],
     const uint slot = tg / gps;
     const uint r = tg % gps * kMvRows + tid / kMvLanes;
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
-    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
+    device const float* xs =
+        xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 32;
@@ -259,7 +265,8 @@ kernel void mv_q5_0(device const uchar* w [[buffer(0)]],
     const uint slot = tg / gps;
     const uint r = tg % gps * kMvRows + tid / kMvLanes;
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
-    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
+    device const float* xs =
+        xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 32;
@@ -326,7 +333,8 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
     const uint slot = tg / gps;
     const uint r0 = tg % gps * kQ4Rows + sg * 2;
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
-    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
+    device const float* xs =
+        xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
     const uint nb = p.cols / 256;
     const ulong row_bytes = ulong(nb) * 144;
     const uint ix = lane / 8, jq = (lane % 8) / 4, ir = lane % 4;
@@ -395,7 +403,8 @@ kernel void mv_q5_k(device const uchar* w [[buffer(0)]],
     const uint slot = tg / gps;
     const uint r = tg % gps * kMvRows + tid / kMvLanes;
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
-    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
+    device const float* xs =
+        xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 256;
@@ -445,7 +454,8 @@ kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
     const uint slot = tg / gps;
     const uint r = tg % gps * kMvRows + tid / kMvLanes;
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
-    device const float* xs = xb + p.x_off + ulong(slot) * p.x_slot_stride;
+    device const float* xs =
+        xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 256;
@@ -1291,23 +1301,31 @@ struct RouteParams {
     uint has_bias;     // exp_probs_b (selection bias) given
     uint norm;         // normalize the picked weights to sum 1
     float scale;       // expert_weights_scale
-    uint shared_gate;  // also route[2 k] = sigmoid(logits[n_expert])
+    uint shared_gate;  // also the gate: sigmoid(logits[n_expert])
+    uint n_tok;        // tokens, a threadgroup each
+    uint logit_stride; // floats between the tokens' logit rows
 };
 
 // moe_select on the GPU for one token (one threadgroup of 1024):
 // gating, the selection score (plus the bias), the top k by repeated
 // argmax (ties to the lowest id, as the CPU's strict >), and the
-// weights. route[0 .. k) gets the ids, route[k .. 2 k) the weights as
-// float bits, route[2 k] the shared expert's sigmoid gate when asked.
+// weights. For token t (threadgroup t of n_tok): route[t k .. t k + k)
+// gets its ids, route[n_tok k + t k ..] its weights as float bits, and
+// route[2 n_tok k + t] its shared expert's sigmoid gate when asked (one
+// token: ids at 0, weights at k, the gate at 2 k).
 // n_expert at most 1024; no group-limited routing (the CPU keeps it).
 // Its softmax adds in another order than the CPU's, so on a near-tie
 // between two experts the pick can differ from the CPU forward's.
-kernel void moe_route(device const float* logits [[buffer(0)]],
+kernel void moe_route(device const float* logits_all [[buffer(0)]],
                       device const float* bias [[buffer(1)]],
-                      device uint* route [[buffer(2)]],
+                      device uint* route_all [[buffer(2)]],
                       constant RouteParams& p [[buffer(3)]],
+                      uint tok [[threadgroup_position_in_grid]],
                       uint tid [[thread_index_in_threadgroup]],
                       uint nt [[threads_per_threadgroup]]) {
+    device const float* logits = logits_all + ulong(tok) * p.logit_stride;
+    device uint* ids = route_all + tok * p.k;
+    device uint* wts = route_all + (p.n_tok + tok) * p.k;
     threadgroup float prob[1024];
     threadgroup float sel[1024];
     threadgroup float part[32];
@@ -1360,22 +1378,23 @@ kernel void moe_route(device const float* logits [[buffer(0)]],
                     at = bi[g];
                 }
             }
-            route[j] = at;
+            ids[j] = at;
             sel[at] = -INFINITY;  // taken
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid == 0) {
         for (uint j = 0; j < p.k; ++j) {
-            wsum += prob[route[j]];
+            wsum += prob[ids[j]];
         }
         const float div = p.norm != 0 ? wsum : 1.0f;
         for (uint j = 0; j < p.k; ++j) {
-            route[p.k + j] = as_type<uint>(prob[route[j]] / div * p.scale);
+            wts[j] = as_type<uint>(prob[ids[j]] / div * p.scale);
         }
         if (p.shared_gate != 0) {
             const float g = logits[p.n_expert];
-            route[2 * p.k] = as_type<uint>(1.0f / (1.0f + exp(-g)));
+            route_all[2 * p.n_tok * p.k + tok] =
+                as_type<uint>(1.0f / (1.0f + exp(-g)));
         }
     }
 }
@@ -1415,9 +1434,10 @@ kernel void head_rmsnorm(device float* v [[buffer(0)]],
 }
 
 struct MoeSumParams {
-    uint n;   // the residual's width
-    uint k;   // experts: their outputs at eout[j * n ..], their weights
-              // at route[k + j]
+    uint n;      // the residual's width
+    uint k;      // experts a token
+    uint n_tok;  // token t: outputs at eout[(t k + j) n ..], weights at
+                 // route[n_tok k + t k + j], its residual row x[t n ..]
 };
 
 // x[i] += sum_j w_j * eout[j * n + i]: the k experts of a token into
@@ -1427,12 +1447,37 @@ kernel void moe_sum(device float* x [[buffer(0)]],
                     device const uint* route [[buffer(2)]],
                     constant MoeSumParams& p [[buffer(3)]],
                     uint i [[thread_position_in_grid]]) {
-    if (i >= p.n) {
+    if (i >= p.n * p.n_tok) {
         return;
     }
+    const uint t = i / p.n, c = i % p.n;
     float acc = 0.0f;
     for (uint j = 0; j < p.k; ++j) {
-        acc += as_type<float>(route[p.k + j]) * eout[ulong(j) * p.n + i];
+        const uint s = t * p.k + j;
+        acc += as_type<float>(route[p.n_tok * p.k + s]) *
+               eout[ulong(s) * p.n + c];
     }
     x[i] += acc;
+}
+
+struct SharedAddParams {
+    uint n;       // the residual's width
+    uint n_tok;
+    uint gated;   // weight token t by route[gate_at + t], else 1
+    uint gate_at;
+};
+
+// x[t] += g_t * y[t] for n_tok rows: the shared expert's output into
+// the residual by each token's gate (qwen2moe) or 1.
+kernel void shared_add(device float* x [[buffer(0)]],
+                       device const float* y [[buffer(1)]],
+                       device const uint* route [[buffer(2)]],
+                       constant SharedAddParams& p [[buffer(3)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= p.n * p.n_tok) {
+        return;
+    }
+    const float g =
+        p.gated != 0 ? as_type<float>(route[p.gate_at + i / p.n]) : 1.0f;
+    x[i] += g * y[i];
 }
