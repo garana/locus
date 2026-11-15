@@ -155,6 +155,15 @@ void matvec_batch_sse4_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n);
 void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
                        std::span<float> out_batch, std::uint32_t n);
+/**
+ * One token through llama.cpp's x86 __AVX__ Q4_K / Q6_K rows (i#801):
+ * its float order, not the scalar kernel's, so matvec_sse4_q8k takes it
+ * only under LOCUS_CPU_FAST.
+ *
+ * @returns false (out untouched) for any other weight type.
+ */
+bool matvec_q8k_llama_avx(const Mat& w, std::span<const float> x,
+                          std::span<float> out);
 }  // namespace sse4_avx
 #endif
 
