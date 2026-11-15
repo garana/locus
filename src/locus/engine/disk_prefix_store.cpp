@@ -10,7 +10,11 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <optional>
 #include <tuple>
+#include <utility>
+
+#include "locus/sys/sha256.hpp"
 
 namespace locus::engine {
 
@@ -137,6 +141,31 @@ bool parse_name(const std::string& name, std::uint64_t& digest) {
 
 }  // namespace
 
+fs::path ensure_private_dir(const fs::path& given) {
+    if (fs::create_directories(given)) {
+        fs::permissions(given, fs::perms::owner_all,
+                        fs::perm_options::replace);
+    }
+    // Checked and used through its real path: a symlink someone else
+    // owns could otherwise pass here and be repointed later.
+    const fs::path dir = fs::canonical(given);
+    struct stat st {};
+    if (::stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        throw std::runtime_error(dir.string() + ": not a directory");
+    }
+    if (st.st_uid != ::geteuid()) {
+        throw std::runtime_error(dir.string() +
+                                 ": owned by another user; the prefix "
+                                 "cache needs a directory of its own");
+    }
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        throw std::runtime_error(dir.string() +
+                                 ": group or others can write to it; "
+                                 "chmod go-w it, or use another directory");
+    }
+    return dir;
+}
+
 DiskPrefixStore::DiskPrefixStore(DiskKey key, std::size_t block_bytes,
                                  std::uint64_t cap_bytes, std::nullptr_t)
     : key_(std::move(key)), block_bytes_(block_bytes), cap_bytes_(cap_bytes) {
@@ -156,12 +185,9 @@ DiskPrefixStore::DiskPrefixStore(fs::path dir, DiskKey key,
                                  std::size_t block_bytes,
                                  std::uint64_t cap_bytes)
     : DiskPrefixStore(std::move(key), block_bytes, cap_bytes, nullptr) {
-    dir_ = std::move(dir);
-    // Files hold clients' prompt tokens: owner only. A directory the
-    // caller made keeps its mode; the files in it are 0600 anyway.
-    if (fs::create_directories(dir_)) {
-        fs::permissions(dir_, fs::perms::owner_all, fs::perm_options::replace);
-    }
+    // Files hold clients' prompt tokens: owner only, and no one else
+    // may plant files (or symlinks) in the directory.
+    dir_ = ensure_private_dir(dir);
     // (mtime, digest, bytes): the order across a restart is the
     // order of the files' last reads and writes.
     std::vector<std::tuple<fs::file_time_type, std::uint64_t,
@@ -169,14 +195,16 @@ DiskPrefixStore::DiskPrefixStore(fs::path dir, DiskKey key,
         found;
     for (const fs::directory_entry& e : fs::directory_iterator(dir_)) {
         std::error_code ec;
-        if (!e.is_regular_file(ec)) {
-            continue;
-        }
         const std::string name = e.path().filename().string();
         if (name.size() > std::strlen(kTmpSuffix) &&
             name.ends_with(kTmpSuffix)) {
-            fs::remove(e.path(), ec);  // a write a crash cut short
+            // A write a crash cut short, or a planted symlink (remove
+            // takes the link, not its target).
+            fs::remove(e.path(), ec);
             continue;
+        }
+        if (!fs::is_regular_file(e.symlink_status(ec))) {
+            continue;  // a symlink is never a cache file
         }
         std::uint64_t digest;
         if (!parse_name(name, digest)) {
@@ -212,6 +240,10 @@ std::vector<std::uint8_t> DiskPrefixStore::header(
     put(h, key_.overrides);
     put(h, static_cast<std::uint32_t>(key_.device_attention));
     put(h, static_cast<std::uint32_t>(key_.experts_on_gpu));
+    // Keyed files end with a tag, and the header names the key by a
+    // hash of it (0: unkeyed), so stores with no key or another key
+    // name their files apart instead of removing each other's.
+    put(h, key_id_);
     put(h, key_.block_tokens);
     put(h, key_.kv_dim);
     put(h, key_.n_layers);
@@ -228,9 +260,34 @@ std::vector<std::uint8_t> DiskPrefixStore::header(
 
 std::uint64_t DiskPrefixStore::file_bytes(std::size_t header_bytes,
                                           std::uint32_t n_blocks) const {
-    // header, one checksum per block, the header checksum, the blocks
+    // header, one checksum per block, the header checksum, the blocks,
+    // and the tag when keyed
     return header_bytes + 8ull * n_blocks + 8 +
-           static_cast<std::uint64_t>(block_bytes_) * n_blocks;
+           static_cast<std::uint64_t>(block_bytes_) * n_blocks +
+           (keyed() ? kTagBytes : 0);
+}
+
+void DiskPrefixStore::seal(std::uint8_t* blob, std::size_t bytes) const {
+    if (!keyed()) return;
+    sys::HmacSha256 mac(mac_key_);
+    mac.update(blob, bytes - kTagBytes);
+    const sys::Sha256Digest t = mac.finish();
+    std::memcpy(blob + bytes - kTagBytes, t.data(), kTagBytes);
+}
+
+void DiskPrefixStore::set_mac_key(std::string key) {
+    std::lock_guard lock(mu_);
+    mac_key_ = std::move(key);
+    key_id_ = 0;
+    if (!mac_key_.empty()) {
+        // A one-way name for the key (not the key): its HMAC of a label.
+        const sys::Sha256Digest d =
+            sys::hmac_sha256(mac_key_, "locus prefix cache key id");
+        std::memcpy(&key_id_, d.data(), sizeof key_id_);
+        key_id_ |= 1;  // never 0, which means unkeyed
+    }
+    const std::vector<std::uint8_t> k = header({}, 0);
+    key_seed_ = checksum(k.data(), k.size());
 }
 
 std::vector<std::uint8_t> DiskPrefixStore::meta(
@@ -255,6 +312,16 @@ bool DiskPrefixStore::decode(std::span<const std::uint8_t> blob,
     const std::vector<std::uint8_t> want = header(prompt, n_blocks);
     if (blob.size() != file_bytes(want.size(), n_blocks)) {
         return false;
+    }
+    if (keyed()) {  // the tag first: nothing unsigned is looked at
+        sys::HmacSha256 mac(mac_key_);
+        mac.update(blob.data(), blob.size() - kTagBytes);
+        sys::Sha256Digest got{};
+        std::memcpy(got.data(), blob.data() + blob.size() - kTagBytes,
+                    kTagBytes);
+        if (!sys::digest_equal(mac.finish(), got)) {
+            return false;
+        }
     }
     const std::size_t meta = want.size() + 8ull * n_blocks + 8;
     std::uint64_t hsum;
@@ -379,7 +446,8 @@ bool DiskPrefixStore::read(std::span<const tok::TokenId> prompt,
             return false;
         }
         gen = it->second.gen;
-        f.fd = ::open(path_of(digest).c_str(), O_RDONLY | O_CLOEXEC);
+        f.fd = ::open(path_of(digest).c_str(),
+                      O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (f.fd < 0) {
             if (errno == ENOENT) {
                 forget(digest, gen);  // removed behind the store's back
@@ -418,6 +486,13 @@ bool DiskPrefixStore::read(std::span<const tok::TokenId> prompt,
         hsum != checksum(got.data(), meta - 8)) {
         return mismatch();
     }
+    // Keyed: the tag covers every byte before it, fed as it is read; a
+    // file that fails it is a miss, and dst is then unspecified.
+    std::optional<sys::HmacSha256> mac;
+    if (keyed()) {
+        mac.emplace(mac_key_);
+        mac->update(got.data(), got.size());
+    }
     off_t off = static_cast<off_t>(meta);
     for (std::uint32_t i = 0; i < n_blocks; ++i) {
         std::uint64_t sum;
@@ -428,7 +503,17 @@ bool DiskPrefixStore::read(std::span<const tok::TokenId> prompt,
         if (checksum(dst[i], block_bytes_) != sum) {
             return mismatch();
         }
+        if (mac) mac->update(dst[i], block_bytes_);
         off += static_cast<off_t>(block_bytes_);
+    }
+    if (mac) {
+        sys::Sha256Digest tag{};
+        if (!pread_full(f.fd, tag.data(), kTagBytes, off)) {
+            return false;
+        }
+        if (!sys::digest_equal(mac->finish(), tag)) {
+            return mismatch();
+        }
     }
     {
         std::lock_guard lock(mu_);
@@ -453,7 +538,8 @@ bool DiskPrefixStore::write(std::span<const tok::TokenId> prompt,
     const std::vector<std::uint8_t> meta =
         this->meta(prompt, n_blocks, src);
     const std::uint64_t bytes =
-        meta.size() + static_cast<std::uint64_t>(block_bytes_) * n_blocks;
+        meta.size() + static_cast<std::uint64_t>(block_bytes_) * n_blocks +
+        (keyed() ? kTagBytes : 0);
     if (bytes > cap_bytes_) {
         return false;
     }
@@ -474,18 +560,30 @@ bool DiskPrefixStore::write(std::span<const tok::TokenId> prompt,
     }
 
     // Write a private temporary file without the lock, then take it to
-    // make room and rename.
+    // make room and rename. O_EXCL | O_NOFOLLOW: a file or symlink
+    // already at that name fails the write, never redirects it.
     const fs::path tmp =
         path.string() + "." + std::to_string(seq) + kTmpSuffix;
     bool ok;
     {
-        Fd f{::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+        Fd f{::open(tmp.c_str(),
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                     0600)};
         ok = f.fd >= 0 && pwrite_full(f.fd, meta.data(), meta.size(), 0);
+        std::optional<sys::HmacSha256> mac;
+        if (keyed()) {
+            mac.emplace(mac_key_);
+            mac->update(meta.data(), meta.size());
+        }
         off_t off = static_cast<off_t>(meta.size());
         for (std::uint32_t i = 0; ok && i < n_blocks; ++i) {
             ok = pwrite_full(f.fd, src[i], block_bytes_, off);
+            if (mac) mac->update(src[i], block_bytes_);
             off += static_cast<off_t>(block_bytes_);
+        }
+        if (ok && mac) {  // the tag of every byte before it, last
+            const sys::Sha256Digest tag = mac->finish();
+            ok = pwrite_full(f.fd, tag.data(), kTagBytes, off);
         }
         if (f.fd >= 0) {
             ok = ::close(f.fd) == 0 && ok;

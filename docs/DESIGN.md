@@ -146,8 +146,10 @@ SPIR-V and embedded at build time.
 
 Parsing untrusted model files is an attack surface (llama.cpp has had
 parser CVEs). Rules: bounds-check every offset against the file size;
-no allocation sized by an unvalidated field; a fuzz corpus in the
-tests; mmap read-only.
+no allocation sized by an unvalidated field; hand-written hostile
+files in the tests (`[gguf]`: truncations, oversized arrays, hostile
+tensor tables; a fuzz target is not in the tree yet, #625); mmap
+read-only.
 
 ### 4.5 HTTP server
 
@@ -165,7 +167,9 @@ process-wide lock (#268). `http::Client` is the first-party client
 for locus's own upstream calls (the router of #388): a pure response
 parser with the request parser's hardening, a streaming chunk
 decoder, and connect and read deadlines with one kept-alive
-connection, resent once when the server closed it while idle.
+connection, resent once when the server closed it while idle. An
+optional total deadline per request bounds a server that sends a byte
+just under each read deadline.
 `http::LoopConnection` serves HTTP on a caller's own event loop
 (`sys::Poller`) instead of a thread per connection: the loop accepts
 and owns the fd, the connection reads, parses, calls a non-blocking
@@ -191,8 +195,11 @@ SRV lookup). A scan admits any server in the range that answers with
 a `data` list, not only locus, and with `--upstream-auth client` it
 gets the clients' prompts and keys, so scan only a range where
 everyone who can listen is trusted. A host that accepts the connect
-and then sends nothing holds a probe for the 2 s read timeout, so a
-range full of them makes a scan last about 1024 / 64 x 2.3 s = 37 s.
+and then sends nothing holds a probe for the 2 s read timeout (3 s in
+all for one that trickles bytes), so a range full of them makes a scan
+last about 1024 / 64 x 2.3 s = 37 s. Each refresh polls the instances'
+`/v1/models` in parallel, 64 at a time, each poll capped at 8 s in
+all, so a slow instance delays only its own poll.
 `mdns:SERVICE` (for example `mdns:_locus._tcp`) sends one DNS-SD
 browse on every refresh: a PTR question for `SERVICE.local` to
 224.0.0.251:5353 from an ephemeral port, so responders answer by
@@ -208,7 +215,8 @@ scan's trust rule holds for it too; with `--upstream-auth client`, an
 `mdns:` or `scan:` source makes the router warn at startup that client
 keys go to whatever answers.
 With `--register-keys`, an instance can also add
-itself (`locus-server --register`): it POSTs its host:port to
+itself (`locus-server --register`, with a `--host` the router can
+reach, since it listens on 127.0.0.1 by default): it POSTs its host:port to
 `/locus/register` with one of the keys, again every third of its TTL
 (30 s), and the router drops it when that runs out or on
 `/locus/deregister`; without keys the route is a 404, since anyone who
@@ -293,8 +301,10 @@ The areas built after the MVP:
 
 - Runtime dependencies: libc, libc++, OS APIs. Nothing else by
   default.
-- Vendored in-tree, pinned, sha256 recorded in the importing commit,
-  license files alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
+- Vendored in-tree, pinned, every file's sha256 in
+  `third_party/SHA256SUMS` (the `[third_party]` test checks the files
+  against it and that each vendored file is listed), license files
+  alongside: Catch2 v3.7.1 (BSL-1.0, tests only),
   cpp-httplib v0.18.3 (MIT, tests only: their HTTP client),
   nlohmann/json v3.11.3 (MIT), ggml's
   IQ lookup tables (`third_party/ggml/iq_grids.h`, MIT) and llama.cpp's
@@ -548,10 +558,24 @@ buffer stays one wide (an N-wide one would be N x n_ctx).
   request's logits are bit-identical alone and batched. It is the
   default on Apple GPUs and on V3D, where a lone sequence costs little
   (on V3D 2.4% for a lone Q8_0 sequence with the NT 1 build below);
-  elsewhere a lone sequence keeps the single-sequence forward. Under
-  the default a lone sequence on a Q4_K or Q6_K model keeps it too
-  (the K-quant short-batch kernels cost it 9 to 11% on an M2 Pro), so
-  such a model is batch-invariant only with the mode set.
+  elsewhere a lone sequence keeps the single-sequence forward.
+  On V3D the kernel's v3d driver can reset the GPU for a "hang" in the
+  middle of a long compute job (a 274 ms conv dispatch, about once in
+  30), and the job's remaining workgroups never run, without an error
+  (i#682). So there a grid of more than 32 workgroups is recorded as
+  several `vkCmdDispatchBase` pieces, each its own short job, except
+  for kernels that read `gl_NumWorkGroups` (found in their SPIR-V);
+  the pieces see the same workgroup ids, so the results are the same.
+  The one-token matvec kernels take a budget of 1024, as their
+  workgroups are short (32 cost a 1B decode 10%; 1024 costs nothing
+  measurable), and the multi-token builds less, by their work per
+  workgroup (512 for NT 2, 256 for NT 4, 128 for NT 8 and the batched,
+  pair and shared-expert ones).
+  `LOCUS_VK_SPLIT=N` sets one budget for every kernel, 0 turns it off.
+  Under the default a lone sequence on a Q4_K or Q6_K model keeps the
+  single-sequence forward too (the K-quant short-batch kernels cost it
+  9 to 11% on an M2 Pro), so such a model is batch-invariant only with
+  the mode set.
   `LOCUS_VK_BATCH_INVARIANT=1` / `0` (or `vulkan_set_batch_invariant`)
   overrides. Q8_0 batches of 1 or 2 take the NT 2 build of the
   short-batch kernel (on V3D a lone sequence the NT 1 build, with
@@ -650,7 +674,12 @@ guarding the default path.
   the MoE hybrid on is refused, since its hot set follows the requests
   served before), the tokens and a checksum per block, so a mismatch
   or a torn file reads as a miss; a byte cap evicts the least recently
-  used file. Entries
+  used file. The checksums catch damage, not tampering, so the
+  directory must be the server user's own and not group- or
+  world-writable (else startup fails), and symlinks in it are never
+  followed. With `--prefix-cache-key-file`, each file (or helper blob)
+  also ends with an HMAC-SHA-256 of its bytes, so one written without
+  the key is a miss: for a store others can write (#830). Entries
   evicted from RAM are written back by a worker thread, and the rest
   at shutdown; a prompt whose prefix is at least one block longer on
   disk waits in a LOADING state while the worker reads it into its
@@ -889,7 +918,24 @@ For MoE models, experts can live on different hosts, each processing
 the tokens routed to it. Routing adds traffic, but experts are
 independent, so this is a second axis that also suits a LAN. The
 multi-GPU pager (#62) shards weights within one host; a pipeline stage
-can use it underneath.
+can use it underneath. On the wire a token's owner sends `kExpertCall`
+(the layer, the expert id and the hidden state) and the expert's host
+replies with `kExpertOut` (that expert's output before the router
+weight), so the owner can combine the experts in its own pick order
+and keep one host's bits. `locus-experts` serves an expert range
+through `TransformerModel::expert_out`, the step `moe_ffn` takes per
+pick, one connection at a time, and accepts only loopback peers unless
+given `--allow` (the port has no authentication). On the token's
+side, `TransformerModel::set_remote_experts` takes a
+`model::RemoteExperts` (`pipeline::ExpertClient` over those
+connections): `moe_ffn` starts the remote picks, computes the local
+ones meanwhile, then adds every pick in pick order, and its readahead
+skips the remote experts. Only the per-token CPU forward uses it; the
+batched and GPU forwards compute every expert locally, which gives the
+same output since each host maps the whole file. `locus-run
+--remote-experts HOST:PORT=LO:HI` (repeatable) connects to each
+`locus-experts` and installs the client. A host lost mid-run ends the
+run: the client's error reaches the caller and nothing retries.
 
 ### Stage serving
 
@@ -903,7 +949,29 @@ executor, each Vulkan executor runs on its own device, with its own
 backend state (#47). Activations travel as
 length-prefixed frames over TCP, tagged by request and position. A
 connect proves only that the downstream listener is up; liveness needs
-an app-level probe.
+an app-level probe. A stage writes whatever its peer sends into its KV
+cache, so a `locus-stage --listen` (or a driver's `--logits-listen`)
+that is not loopback needs `--allow` (#847). With `--key-file` (the
+same file on every stage and the driver), each accepted connection and
+each new downstream dial first runs a shared-key HMAC handshake, and a
+peer without the key is closed before any frame; a pooled downstream
+passed it when it was dialed. In the serve loop the handshake is one
+more per-session state with its own deadline, so a silent peer does
+not stall other sessions (#849). Frames are not signed: a peer on the
+network path is not stopped.
+On Linux, every `--allow` (locus-stage and its metrics port,
+locus-experts, the driver's logits listen, and `http::Server`'s
+`allow`) is also a classic BPF socket filter on the listening socket:
+a SYN from outside the ranges is dropped in the kernel and never
+becomes a connection; the check at accept stays, and a reload
+replaces the filter (#851).
+macOS has no per-socket filter; pf can do the same with root, for
+example an anchor `locus` (listed in pf.conf) loaded with
+`sudo pfctl -a locus -f FILE`, where FILE holds
+
+    pass in quick proto tcp from 10.0.0.0/8 to any port 9000
+    block in quick proto tcp from any to any port 9000
+
 The serve loop can report its live peers (each session's upstream
 and downstream) with the kernel's smoothed TCP round-trip time, read
 from `TCP_INFO` (Linux, FreeBSD) or `TCP_CONNECTION_INFO` (macOS)
@@ -913,7 +981,8 @@ them as Prometheus text on GET `/metrics`, from the same loop through
 `http::LoopConnection`, with the session, token, byte and downstream
 dial counters (#22). Each stage serves its own page, so a scraper
 reads every stage directly; the driver does not gather them. The
-`--allow` list does not cover that port.
+`--allow` list covers that port too, since the page lists every peer's
+address.
 A connection kept open across sequences (SESSION_END) dials its next
 downstream when the next sequence sends its first frame, not at the
 reset: a last stage's downstream is a driver, and a reset-time dial
@@ -976,7 +1045,7 @@ locus ports those dots (`backend::matvec_q8k`):
 | Backend | 8-bit activation dots                                         |
 |---------|---------------------------------------------------------------|
 | scalar  | all 15 QK_K types and the block-32 types                      |
-| neon    | the K-quants, IQ1_M, IQ2_XXS/S, IQ3_XXS/S, IQ4_XS, block-32   |
+| neon    | all 15 QK_K types and the block-32 types                      |
 | sse4    | all 15 QK_K types and the block-32 types                      |
 | cuda    | all 15 QK_K types                                             |
 

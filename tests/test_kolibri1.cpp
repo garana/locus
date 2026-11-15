@@ -478,6 +478,53 @@ TEST_CASE("kolibri1 batched Vulkan prefill tracks the per-token forward",
     }
 }
 
+// i#739: the CPU batched prefill (kolibri1_layer_batch) against the
+// per-token forward, every position's logits, with the window of 3 on
+// layer 0 met at chunk boundaries inside and across it (6 + 10, 8 + 8)
+// and one chunk of 16. The batched body computes each token as the
+// per-token layer does.
+TEST_CASE("kolibri1 batched CPU prefill matches the per-token forward",
+          "[model][kolibri1]") {
+    const std::vector<int> toks = {3,  17, 9,  30, 1,  22, 5,  14,
+                                   27, 8,  11, 2,  19, 25, 6,  31};
+    const auto ts = make_tensors();
+    for (const bool norm : {false, true}) {
+        INFO("expert_weights_norm " << norm);
+        auto img = build_image(ts, norm);
+        auto g = locus::gguf::GgufFile::parse(img);
+        auto model = TransformerModel::load(g);
+        model.use_backend(locus::backend::best_backend());
+        REQUIRE(model.supports_batch_prefill());
+        const auto want = run(model, toks);
+        const std::uint32_t V = model.hparams().n_vocab;
+        const std::vector<std::vector<std::size_t>> plans = {
+            {6, 10}, {8, 8}, {16}};
+        for (const std::vector<std::size_t>& chunks : plans) {
+            INFO("first chunk " << chunks[0]);
+            auto cache = model.make_cache();
+            auto ws = model.make_workspace();
+            locus::kv::PagedKvCache::Seq seq;
+            std::size_t at = 0;
+            for (const std::size_t nb : chunks) {
+                std::vector<locus::tok::TokenId> ids(toks.begin() + at,
+                                                     toks.begin() + at + nb);
+                std::vector<float> logits(nb * V);
+                REQUIRE(cache.ensure_capacity(
+                    seq, static_cast<std::uint32_t>(nb)));
+                model.forward_batch(ids, cache, seq, ws, logits, true);
+                for (std::size_t t = 0; t < nb; ++t) {
+                    INFO("position " << at + t);
+                    for (std::uint32_t i = 0; i < V; ++i) {
+                        REQUIRE(logits[t * V + i] == want[at + t][i]);
+                    }
+                }
+                at += nb;
+            }
+            cache.release(seq);
+        }
+    }
+}
+
 // i#662: converters that write sliding_window_pattern as int32 (non-zero
 // is sliding) load the same model; another element type is refused.
 TEST_CASE("kolibri1 takes an int32 sliding_window_pattern",

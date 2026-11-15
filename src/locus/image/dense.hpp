@@ -54,9 +54,23 @@ void ln_modulate(std::span<const float> x, std::uint32_t n, std::uint32_t d,
 /** Exact GELU (torch.nn.GELU(), approximate="none"), in place. */
 void gelu(std::span<float> x);
 
-/** RMSNorm with weight w over each of n rows of width d. */
+/** RMSNorm with weight w over each of n rows of width d; out may be x. */
 void rms_norm(std::span<const float> x, std::span<const float> w, float eps,
               std::uint32_t n, std::uint32_t d, std::span<float> out);
+
+/**
+ * Rotary embedding on n rows of heads x hd, in place: each pair
+ * (2 i, 2 i + 1) of each head turns by the token's angle,
+ * (x0, x1) -> (x0 cos - x1 sin, x1 cos + x0 sin), from the [n][hd]
+ * tables cosv and sinv.
+ */
+void rope_pairs(std::span<float> x, std::uint32_t n, std::uint32_t heads,
+                std::uint32_t hd, std::span<const float> cosv,
+                std::span<const float> sinv);
+
+/** x[i] += gate[i % d] * add[i], over n rows of width d. */
+void gated_add(std::span<float> x, std::span<const float> add,
+               const float* gate, std::uint32_t n, std::uint32_t d);
 
 /** torch's F.gelu(approximate="tanh"). */
 inline float gelu_tanh(float v) {

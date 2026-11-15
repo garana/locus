@@ -12,6 +12,7 @@
 #include "cli_spec.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/pipeline/driver.hpp"
+#include "locus/pipeline/handshake.hpp"
 #include "locus/pipeline/message.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/tok/tokenizer.hpp"
@@ -33,7 +34,12 @@ const char* kUsage =
     "  --head H:P        first stage's input address to connect to\n"
     "  --logits-listen H:P  address to listen on for the last stage's\n"
     "                    logits (empty host == wildcard, \":PORT\")\n"
-    "  --allow CIDR      restrict who may connect back (repeatable)\n"
+    "  --allow CIDR      restrict who may connect back (repeatable);\n"
+    "                    needed when --logits-listen is not loopback\n"
+    "  --key-file F      shared key: the head and the last stage must\n"
+    "                    prove they hold it (the stages' --key-file;\n"
+    "                    make one with\n"
+    "                    `umask 077; head -c 32 /dev/urandom > stage.key`)\n"
     "  --max-tokens N    cap generated tokens (default 64)\n"
     "  --temp T          sampling temperature (default 0 = greedy)\n"
     "  --seed S          RNG seed for non-greedy sampling (default 0)\n"
@@ -51,7 +57,7 @@ const char* kUsage =
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model_path, head, logits_listen, prompt;
+    std::string model_path, head, logits_listen, prompt, key_file;
     bool have_prompt = false;
     std::vector<std::string> allow_str;
     int max_tokens = 64, connect_timeout = 5000, logits_timeout = 10000;
@@ -90,6 +96,8 @@ int main(int argc, char** argv) {
             logits_listen = next("--logits-listen");
         } else if (a == "--allow") {
             allow_str.push_back(next("--allow"));
+        } else if (a == "--key-file") {
+            key_file = next("--key-file");
         } else if (a == "--max-tokens") {
             max_tokens = as_int(next("--max-tokens"), "--max-tokens");
         } else if (a == "--temp") {
@@ -144,6 +152,25 @@ int main(int argc, char** argv) {
         }
         allow.push_back(*c);
     }
+    // i#625 F8: whoever connects to the logits listen feeds the output;
+    // off loopback the driver must name its peer (the last stage).
+    if (allow.empty() && !locus::pipeline::is_loopback_host(lh)) {
+        std::fprintf(stderr,
+                     "--logits-listen %s is not loopback: give --allow with "
+                     "the last stage's address\n",
+                     logits_listen.c_str());
+        return 2;
+    }
+    std::string key;  // empty: no handshake
+    if (!key_file.empty()) {
+        try {
+            key = locus::pipeline::read_key_file(key_file);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "bad --key-file: %s\n", e.what());
+            return 2;
+        }
+    }
+    constexpr int kHs = locus::pipeline::kHandshakeTimeoutMs;
 
     try {
         auto g = locus::gguf::GgufFile::open(model_path);
@@ -163,6 +190,10 @@ int main(int argc, char** argv) {
                          logits_listen.c_str());
             return 1;
         }
+        if (!locus::pipeline::attach_allow_filter(le, allow)) {
+            std::fprintf(stderr, "--allow applies at accept only (the "
+                                 "kernel refused the filter)\n");
+        }
         if (ids.empty()) {
             std::fprintf(stderr, "the prompt encodes to no tokens\n");
             return 2;
@@ -177,6 +208,14 @@ int main(int argc, char** argv) {
         for (std::size_t i = 0; i < sessions.size(); ++i) {
             auto& s = sessions[i];
             s.head_fd = locus::pipeline::connect_to(hh, hp, connect_timeout);
+            if (s.head_fd >= 0 && !key.empty() &&
+                !locus::pipeline::handshake_connect(s.head_fd, key, kHs)) {
+                std::fprintf(stderr,
+                             "head %s failed the key handshake (does it "
+                             "run with the same --key-file?)\n",
+                             head.c_str());
+                return 1;
+            }
             if (s.head_fd < 0 ||
                 !locus::pipeline::write_message(
                     s.head_fd, locus::pipeline::make_token(i + 1, 0, ids[0]))) {
@@ -201,6 +240,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr,
                              "logits connection from %s refused (not in "
                              "--allow)\n",
+                             peer.c_str());
+                return 1;
+            }
+            if (!key.empty() &&
+                !locus::pipeline::handshake_accept(fd, key, kHs)) {
+                std::fprintf(stderr,
+                             "logits connection from %s failed the key "
+                             "handshake\n",
                              peer.c_str());
                 return 1;
             }

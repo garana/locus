@@ -146,6 +146,35 @@ TEST_CASE("HelperPrefixStore stores the file store's files",
     REQUIRE(o.find(kPrompt) == 0);
 }
 
+// i#830: the helper's store may be shared or remote, so with a key the
+// blob carries the same tag as a keyed file, and one signed with another
+// key is a miss.
+TEST_CASE("HelperPrefixStore with a key signs its blobs", "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-hps-mac")};
+    const auto b = blocks(2, 5);
+    const std::string k1(32, 'x');
+    {
+        HelperPrefixStore s(helper(g.dir), key(), kBlockBytes, kCap);
+        s.set_mac_key(k1);
+        REQUIRE(s.write(kPrompt, 2, srcs(b)));
+        auto out = blocks(2, 0);
+        REQUIRE(s.read(kPrompt, 2, dsts(out)));
+        REQUIRE(out == b);
+    }
+    // Byte for byte a keyed file: a keyed file store reads it.
+    DiskPrefixStore file_store(g.dir, key(), kBlockBytes, kCap);
+    file_store.set_mac_key(k1);
+    auto out = blocks(2, 0);
+    REQUIRE(file_store.read(kPrompt, 2, dsts(out)));
+    REQUIRE(out == b);
+    // Another key names its blobs apart: no hit, and nothing removed.
+    HelperPrefixStore other(helper(g.dir), key(), kBlockBytes, kCap);
+    other.set_mac_key(std::string(32, 'y'));
+    REQUIRE(other.find(kPrompt) == 0);
+    auto out2 = blocks(2, 0);
+    REQUIRE(file_store.read(kPrompt, 2, dsts(out2)));
+}
+
 TEST_CASE("HelperPrefixStore: a blob that does not check is a miss",
           "[disk_prefix]") {
     DirGuard g{temp_dir("locus-hps-bad")};

@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "locus/pipeline/handshake.hpp"
 #include "locus/pipeline/net.hpp"
 #include "locus/pipeline/stage.hpp"
 
@@ -69,6 +70,16 @@ struct StageConn {
      * the caller (stage_main) owns it and outlives serve_stage*.
      */
     Resolver* resolver = nullptr;
+    /**
+     * i#849: the shared key (`--key-file`). When not empty, every
+     * accepted input and every fresh downstream dial runs the handshake
+     * (handshake.hpp) before any frame, and a peer that fails it is
+     * closed. A pooled downstream already passed it. Empty: no
+     * handshake.
+     */
+    std::string key;
+    /** The longest one handshake may take, ms (> 0). */
+    int handshake_timeout_ms = kHandshakeTimeoutMs;
     /**
      * i#21: serve_stage_mux calls on_peers on its loop thread, at most
      * every peer_report_ms (0 = never), with the stage's live peers:

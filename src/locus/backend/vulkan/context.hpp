@@ -4,6 +4,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "locus/backend/gpu_metrics.hpp"
@@ -274,8 +275,28 @@ class VulkanContext {
      */
     static std::uint32_t matvec_groups(Kernel k, std::uint32_t rows);
 
+    /**
+     * The most workgroups one V3D job of kernel `name` may run: on V3D a
+     * larger grid is recorded as several dispatches (i#682: the kernel's
+     * v3d driver can reset a long job and drop its last workgroups).
+     * LOCUS_VK_SPLIT=N overrides it with N for every kernel.
+     *
+     * @param name A kernel's profile name (kernel_name).
+     * @returns 1024 for a one-token matvec build (decode, NT 1), 512 for
+     *     NT 2, 256 for NT 4, 128 for NT 8 and the batched, pair,
+     *     shared-expert and transposed builds; 32 for every other kernel,
+     *     a matvec build this does not know included.
+     */
+    static std::uint32_t v3d_split_budget(std::string_view name);
+
     /** @returns true when LOCUS_VK_PROFILE is set. */
     static bool profiling();
+
+    /**
+     * @returns true when LOCUS_VK_TRACE is set and not "0": the
+     * forwards then print a vk-trace line per step to stderr (i#682).
+     */
+    static bool tracing();
 
     /**
      * @returns The count of Vulkan validation errors seen so far in
@@ -379,6 +400,13 @@ class VulkanContext {
 
     /** Counts one forwarded token toward the profile. */
     void note_token();
+
+    /**
+     * @returns The kernels dispatched since the last call, each once,
+     * by name in kernel order, comma separated; clears that record.
+     * Kept only while tracing(); empty otherwise.
+     */
+    std::string take_traced_kernels();
 
     /** @returns The profile collected so far. */
     const Profile& profile() const;

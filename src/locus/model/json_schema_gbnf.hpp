@@ -19,7 +19,9 @@ namespace locus::model {
  * date-time and uuid. Numeric bounds and other keywords are ignored:
  * the output still parses, but may not validate.
  *
- * @param schema_json The schema, as JSON text.
+ * @param schema_json The schema, as JSON text. Its nesting must already
+ *     be bounded (from http::parse_json): the conversion recurses once
+ *     per level.
  * @returns The grammar.
  * @throws std::invalid_argument on a schema it cannot express.
  */

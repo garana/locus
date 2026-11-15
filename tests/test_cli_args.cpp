@@ -1,12 +1,18 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "catch_amalgamated.hpp"
 #include "backend_cli.hpp"
+#include "locus/backend/variants.hpp"
 
 TEST_CASE("the ctx flag caps the KV pool from the command line",
           "[cli]") {
@@ -135,7 +141,7 @@ TEST_CASE("the host flag sets the server's listen address", "[cli]") {
     auto c = locus_tools::parse_backend_args(
         static_cast<int>(argv3.size()),
         const_cast<char**>(argv3.data()));
-    REQUIRE(c.host.empty());  // every interface
+    REQUIRE(c.host == "127.0.0.1");  // loopback unless asked (i#625 F7)
 }
 
 TEST_CASE("the sse-keepalive flag sets the stream keepalive", "[cli]") {
@@ -355,6 +361,41 @@ TEST_CASE("locus-run starts without a Vulkan device", "[cli]") {
     }
 }
 
+TEST_CASE("LOCUS_VK_TRACE prints each Vulkan forward step", "[cli][vulkan]") {
+    // i#682: a step line names the path, batch size and kernels, and a
+    // sequence line hashes the output; a lone request takes the multi
+    // path in batch-invariant mode and the single path out of it.
+    const std::string model =
+        std::string(LOCUS_SOURCE_DIR) + "/tests/models/stories260K.gguf";
+    if (!std::filesystem::exists(model)) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no Vulkan device");
+    }
+    const auto log = std::filesystem::temp_directory_path() /
+                     ("locus_vk_trace_" + std::to_string(::getpid()));
+    for (const auto& [mode, path] :
+         {std::pair{"1", "vk-trace: multi n=1 inv=1 "},
+          std::pair{"0", "vk-trace: single n=1 inv=0 "}}) {
+        const std::string cmd =
+            std::string("LOCUS_VK_TRACE=1 LOCUS_VK_BATCH_INVARIANT=") +
+            mode + " '" + LOCUS_RUN_BIN + "' --backend vulkan '" + model +
+            "' 'Once upon' 4 >/dev/null 2>'" + log.string() + "'";
+        INFO(cmd);
+        REQUIRE(std::system(cmd.c_str()) == 0);
+        std::ifstream in(log);
+        const std::string text((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        INFO(text);
+        CHECK(text.find("vk-trace: prefill n=") != std::string::npos);
+        CHECK(text.find(path) != std::string::npos);
+        CHECK(text.find("kernels=") != std::string::npos);
+        CHECK(text.find(" out=") != std::string::npos);
+    }
+    std::filesystem::remove(log);
+}
+
 TEST_CASE("locus-run exits 2 on a negative numeric flag", "[cli]") {
     // The check runs before the model loads, so no model is needed.
     const std::string cmd = std::string("'") + LOCUS_RUN_BIN +
@@ -425,4 +466,63 @@ TEST_CASE("bad positional numbers exit 2", "[cli]") {
                        std::string("missing.gguf '") + p + "'") == 2);
     }
     REQUIRE(status(LOCUS_SERVER_BIN, "missing.gguf 8080") == 1);
+}
+
+// i#625 F7: locus-server listens on loopback unless asked, and takes an
+// auth helper as the router does.
+TEST_CASE("the server host defaults to loopback and takes an auth helper",
+          "[cli]") {
+    const auto parse = [](std::vector<const char*> argv) {
+        argv.insert(argv.begin(), "prog");
+        return locus_tools::parse_backend_args(
+            static_cast<int>(argv.size()), const_cast<char**>(argv.data()));
+    };
+    REQUIRE(parse({"m.gguf"}).host == "127.0.0.1");
+    REQUIRE(parse({"--host", "*", "m.gguf"}).host.empty());  // every one
+    REQUIRE(parse({"--host=*", "m.gguf"}).host.empty());
+    REQUIRE(parse({"--host", "::1", "m.gguf"}).host == "::1");
+    REQUIRE(parse({"m.gguf"}).auth_helper.empty());
+    const auto a = parse({"--auth-helper", "/bin/h", "--auth-helper-arg",
+                          "x", "--auth-helper-arg", "y", "m.gguf"});
+    REQUIRE(a.auth_helper == std::vector<std::string>{"/bin/h", "x", "y"});
+    REQUIRE(a.positional == std::vector<std::string>{"m.gguf"});
+    // An argument without the helper is a usage error (exit 2).
+    const std::string cmd = std::string("'") + LOCUS_SERVER_BIN +
+                            "' --auth-helper-arg x missing.gguf "
+                            ">/dev/null 2>&1";
+    const int rc = std::system(cmd.c_str());
+    REQUIRE(WIFEXITED(rc));
+    REQUIRE(WEXITSTATUS(rc) == 2);
+}
+
+TEST_CASE("remote-experts values parse as HOST:PORT=LO:HI", "[cli]") {
+    // i#805: locus-run --remote-experts, expert parallelism (#781).
+    locus_tools::RemoteExpertsSpec r;
+    REQUIRE(locus_tools::parse_remote_experts("rpi.local:9201=32:64", r));
+    CHECK(r.host == "rpi.local");
+    CHECK(r.port == 9201);
+    CHECK(r.lo == 32);
+    CHECK(r.hi == 64);
+    REQUIRE(locus_tools::parse_remote_experts("[::1]:9201=0:1", r));
+    CHECK(r.host == "::1");
+    for (const char* bad :
+         {"rpi.local:9201", "rpi.local=32:64", ":9201=32:64",
+          "rpi.local:0=32:64", "rpi.local:9201=64:32",
+          "rpi.local:9201=32:32", "rpi.local:9201=-1:4",
+          "rpi.local:9201=32", "rpi.local:9201=a:b"}) {
+        INFO(bad);
+        CHECK_FALSE(locus_tools::parse_remote_experts(bad, r));
+    }
+    // A bad value, or two ranges that overlap, is a usage error before
+    // the model loads (exit 2).
+    for (const char* flags :
+         {"--remote-experts nope",
+          "--remote-experts a:1=0:8 --remote-experts b:1=4:12"}) {
+        INFO(flags);
+        const std::string cmd = std::string("'") + LOCUS_RUN_BIN + "' " +
+                                flags + " missing.gguf hi >/dev/null 2>&1";
+        const int rc = std::system(cmd.c_str());
+        REQUIRE(WIFEXITED(rc));
+        REQUIRE(WEXITSTATUS(rc) == 2);
+    }
 }

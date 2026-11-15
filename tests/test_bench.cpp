@@ -119,10 +119,11 @@ TEST_CASE("bench: k-quant matvec f32 vs Q8_K", "[.][bench]") {
 }
 
 #if defined(__aarch64__)
-// i#744: the NEON Q8_K dots against the scalar ones they match bit for
-// bit. (IQ1_M's f16 scale is assembled from nibbles; random bytes may
-// make it inf or NaN, which does not change the timing.)
-TEST_CASE("bench: neon q8k IQ3, IQ1_M, IQ4_XS and Q2_K", "[.][bench]") {
+// The NEON Q8_K dots of the IQ, TQ and Q2_K types against the scalar
+// ones they match bit for bit. (IQ1_M's f16 scale is assembled from
+// nibbles; random bytes may make it inf or NaN, which does not change
+// the timing.)
+TEST_CASE("bench: neon q8k IQ TQ and Q2_K", "[.][bench]") {
     using TT = locus::gguf::TensorType;
     struct Q {
         TT type;
@@ -143,13 +144,35 @@ TEST_CASE("bench: neon q8k IQ3, IQ1_M, IQ4_XS and Q2_K", "[.][bench]") {
                        Q{TT::kIQ3_S, "IQ3_S", 110, 0, -1},
                        Q{TT::kIQ1_M, "IQ1_M", 56, 0, -1},
                        Q{TT::kIQ4_XS, "IQ4_XS", 136, 0, -1},
-                       Q{TT::kQ2_K, "Q2_K", 84, 80, 82}}) {
+                       Q{TT::kQ2_K, "Q2_K", 84, 80, 82},
+                       Q{TT::kIQ2_XS, "IQ2_XS", 74, 0, -1},
+                       Q{TT::kIQ1_S, "IQ1_S", 50, 0, -1},
+                       Q{TT::kTQ1_0, "TQ1_0", 54, 52, -1},
+                       Q{TT::kTQ2_0, "TQ2_0", 66, 64, -1}}) {
         auto w = make_kquant(rows, cols, q.bytes, q.d_off, q.dmin_off, 7);
         Mat m{q.type, w.data(), rows, cols};
         const double s = time_matvec(&matvec_q8k, m, x, out, iters);
         const double v = time_matvec(&matvec_neon_q8k, m, x, out, iters);
+        // 16 tokens batched (each block decoded once per 4 tokens)
+        // against 16 one-token calls, ns per token.
+        constexpr std::uint32_t kN = 16;
+        std::vector<float> xb(std::size_t{kN} * cols);
+        std::vector<float> ob(std::size_t{kN} * rows);
+        for (std::uint32_t t = 0; t < kN; ++t) {
+            std::copy(x.begin(), x.end(), xb.begin() + std::size_t{t} * cols);
+        }
+        matvec_batch_neon_q8k(m, xb, ob, kN);  // warm
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters / 4; ++i) {
+            matvec_batch_neon_q8k(m, xb, ob, kN);
+        }
+        const double b = std::chrono::duration<double, std::nano>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count() /
+                         (iters / 4) / kN;
         WARN(q.name << ": scalar q8k=" << s << "ns neon q8k=" << v
-                    << "ns speedup=" << s / v << "x");
+                    << "ns speedup=" << s / v << "x; batched 16: " << b
+                    << "ns/token (" << v / b << "x one-token)");
     }
     SUCCEED();
 }

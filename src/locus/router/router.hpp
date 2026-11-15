@@ -196,6 +196,9 @@ struct RouterConfig {
      *  (i#610). A dead instance is caught by the health polls. */
     int text_read_timeout_ms = 30 * 60 * 1000;
     int worker_threads = 16;
+    /** Open connections one client address may hold (i#625 F21); 0 =
+     *  no cap. */
+    std::size_t max_conns_per_ip = 0;
 
     /** Client keys: when set, every request but /health needs a key
      * this auth helper allows (Authorization: Bearer, or x-api-key),

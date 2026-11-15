@@ -348,10 +348,171 @@ TEST_CASE("DiskPrefixStore keeps its files and new directory owner only",
     REQUIRE((st.st_mode & 077) == 0);
 }
 
+// i#625 F11: whoever can write the directory could plant KV for a known
+// prefix, or a symlink that redirects a write.
+TEST_CASE("DiskPrefixStore refuses a directory others can write",
+          "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-dps-shared")};
+    fs::create_directories(g.dir);
+    fs::permissions(g.dir, fs::perms::owner_all | fs::perms::group_all,
+                    fs::perm_options::replace);
+    REQUIRE_THROWS_AS(DiskPrefixStore(g.dir, key(), kBlockBytes, 1 << 20),
+                      std::runtime_error);
+    fs::permissions(g.dir, fs::perms::owner_all | fs::perms::others_write,
+                    fs::perm_options::replace);
+    REQUIRE_THROWS_AS(DiskPrefixStore(g.dir, key(), kBlockBytes, 1 << 20),
+                      std::runtime_error);
+    // Read and search for group and others are fine.
+    fs::permissions(g.dir,
+                    fs::perms::owner_all | fs::perms::group_read |
+                        fs::perms::group_exec | fs::perms::others_read |
+                        fs::perms::others_exec,
+                    fs::perm_options::replace);
+    DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+    // A regular file is not a directory.
+    std::ofstream(g.dir / "f") << "x";
+    REQUIRE_THROWS(DiskPrefixStore(g.dir / "f", key(), kBlockBytes, 1 << 20));
+}
+
+TEST_CASE("DiskPrefixStore never follows a symlink in its directory",
+          "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-dps-link")};
+    const fs::path victim = temp_dir("locus-dps-victim");
+    DirGuard gv{victim};
+    fs::create_directories(victim);
+    const fs::path target = victim / "target";
+    std::ofstream(target) << "keep me";
+    const auto in = blocks(1, 3);
+    {
+        DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+        // The first write of a fresh store uses temp name ".1.tmp": a
+        // symlink there fails the write and leaves the target alone.
+        const fs::path path = s.path_for(kPrompt, 1);
+        fs::create_symlink(target, path.string() + ".1.tmp");
+        REQUIRE_FALSE(s.write(kPrompt, 1, srcs(in)));
+        REQUIRE_FALSE(fs::exists(path));
+    }
+    {
+        std::ifstream f(target);
+        std::string text;
+        std::getline(f, text);
+        REQUIRE(text == "keep me");
+    }
+    // A good file copied out, then linked back at a cache name: a
+    // reopen does not index it, so it is never read.
+    fs::path copy;
+    {
+        DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+        REQUIRE(s.write(kPrompt, 1, srcs(in)));
+        const fs::path path = s.path_for(kPrompt, 1);
+        copy = victim / "good.lkv";
+        fs::rename(path, copy);
+        fs::create_symlink(copy, path);
+    }
+    DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+    REQUIRE(s.find(kPrompt) == 0);
+    REQUIRE(s.used_bytes() == 0);
+}
+
+// i#830: with a key, each file ends with an HMAC of its bytes, so a file
+// written without the key (or with another) is a miss, however well its
+// checksums match.
+TEST_CASE("DiskPrefixStore with a key reads only files signed with it",
+          "[disk_prefix]") {
+    DirGuard g{temp_dir("locus-dps-mac")};
+    const auto in = blocks(2, 9);
+    const std::string k1(32, 'a');
+    const std::string k2(32, 'b');
+    fs::path keyed_path;
+    {
+        DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+        s.set_mac_key(k1);
+        REQUIRE(s.write(kPrompt, 2, srcs(in)));
+        keyed_path = s.path_for(kPrompt, 2);
+        auto out = blocks(2, 0);
+        REQUIRE(s.read(kPrompt, 2, dsts(out)));
+        REQUIRE(out == in);
+        // The tag adds 32 bytes to the unkeyed file.
+        DirGuard gp{temp_dir("locus-dps-mac-plain")};
+        DiskPrefixStore plain(gp.dir, key(), kBlockBytes, 1 << 20);
+        REQUIRE(plain.write(kPrompt, 2, srcs(in)));
+        REQUIRE(fs::file_size(keyed_path) ==
+                fs::file_size(plain.path_for(kPrompt, 2)) + 32);
+    }
+    {
+        // Another key names its files apart: no hit, and the first
+        // key's file is left alone (two keyed stores do not evict each
+        // other's files as mismatches).
+        DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+        s.set_mac_key(k2);
+        REQUIRE(s.find(kPrompt) == 0);
+        REQUIRE(s.path_for(kPrompt, 2) != keyed_path);
+        REQUIRE(fs::exists(keyed_path));
+    }
+    {
+        // A file at the keyed name with a forged tag (another key's
+        // bytes copied there) is a miss, and removed.
+        DiskPrefixStore other(g.dir, key(), kBlockBytes, 1 << 20);
+        other.set_mac_key(k2);
+        REQUIRE(other.write(kPrompt, 2, srcs(in)));
+        fs::copy_file(other.path_for(kPrompt, 2), keyed_path,
+                      fs::copy_options::overwrite_existing);
+        DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+        s.set_mac_key(k1);
+        auto out = blocks(2, 0);
+        REQUIRE_FALSE(s.read(kPrompt, 2, dsts(out)));
+        REQUIRE_FALSE(fs::exists(keyed_path));
+    }
+    {
+        // An unkeyed store names keyed files apart: none is a hit.
+        DiskPrefixStore a(g.dir, key(), kBlockBytes, 1 << 20);
+        a.set_mac_key(k1);
+        REQUIRE(a.write(kPrompt, 2, srcs(in)));
+        DiskPrefixStore b(g.dir, key(), kBlockBytes, 1 << 20);
+        REQUIRE(b.find(kPrompt) == 0);
+    }
+    {
+        // One flipped byte of the tag is a miss.
+        DiskPrefixStore s(g.dir, key(), kBlockBytes, 1 << 20);
+        s.set_mac_key(k1);
+        const fs::path p = s.path_for(kPrompt, 2);
+        REQUIRE(fs::exists(p));
+        flip(p, static_cast<std::streamoff>(fs::file_size(p) - 1));
+        auto out = blocks(2, 0);
+        REQUIRE_FALSE(s.read(kPrompt, 2, dsts(out)));
+    }
+}
+
+TEST_CASE("DiskPrefixStore resolves a symlinked directory once",
+          "[disk_prefix]") {
+    // DIR given as a symlink: the store uses the real directory, so
+    // repointing the link after startup does not move its files.
+    DirGuard g{temp_dir("locus-dps-dirlink")};
+    // 0700, as a deployment would make them: the runner's umask (0002
+    // on Ubuntu) could leave them group-writable, which the store refuses.
+    for (const char* d : {"real", "other"}) {
+        fs::create_directories(g.dir / d);
+        fs::permissions(g.dir / d, fs::perms::owner_all,
+                        fs::perm_options::replace);
+    }
+    const fs::path link = g.dir / "link";
+    fs::create_symlink(g.dir / "real", link);
+    DiskPrefixStore s(link, key(), kBlockBytes, 1 << 20);
+    fs::remove(link);
+    fs::create_symlink(g.dir / "other", link);
+    const auto in = blocks(1, 5);
+    REQUIRE(s.write(kPrompt, 1, srcs(in)));
+    const std::string name = s.path_for(kPrompt, 1).filename().string();
+    REQUIRE(fs::exists(g.dir / "real" / name));
+    REQUIRE_FALSE(fs::exists(g.dir / "other" / name));
+}
+
 TEST_CASE("DiskPrefixStore removes a crash's temporary files on open",
           "[disk_prefix]") {
     DirGuard g{temp_dir("locus-dps-tmp")};
     fs::create_directories(g.dir);
+    fs::permissions(g.dir, fs::perms::owner_all,
+                    fs::perm_options::replace);  // whatever the umask
     const fs::path tmp = g.dir / "0123456789abcdef.lkv.tmp";
     const fs::path other = g.dir / "notes.txt";
     std::ofstream(tmp) << "half a file";

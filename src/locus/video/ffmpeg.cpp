@@ -3,13 +3,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#if defined(__linux__)
-#include <sys/syscall.h>
-#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -19,8 +15,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <initializer_list>
 #include <mutex>
 #include <stdexcept>
+
+#include "locus/sys/child_fds.hpp"
 
 namespace locus::video {
 
@@ -64,27 +63,6 @@ void set_nonblocking(int fd) {
     if (flags >= 0) ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-/** One past the highest fd the child may have to close, worked out in
- *  the parent (sysconf and getrlimit are not async-signal-safe). */
-int fd_limit() {
-    rlimit rl{};
-    long n = ::sysconf(_SC_OPEN_MAX);
-    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
-        n = std::max<long>(n, static_cast<long>(rl.rlim_cur));
-    }
-    if (n <= 0) n = 1024;
-    return static_cast<int>(std::min<long>(n, 1L << 20));
-}
-
-/** Closes every fd from 3 up in the child, so it does not hold
- *  locus's sockets; async-signal-safe calls only. */
-void close_from_3(int limit) {
-#if defined(__linux__) && defined(SYS_close_range)
-    if (::syscall(SYS_close_range, 3U, ~0U, 0U) == 0) return;
-#endif
-    for (int fd = 3; fd < limit; ++fd) ::close(fd);
-}
-
 /** Reads what is ready on fd into s (up to cap bytes kept); @returns
  *  false at end of file or on an error. */
 bool drain(int fd, std::string& s, std::size_t cap) {
@@ -105,37 +83,10 @@ bool drain(int fd, std::string& s, std::size_t cap) {
     }
 }
 
-bool executable_file(const std::string& p) {
-    struct stat st{};
-    return ::stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
-           ::access(p.c_str(), X_OK) == 0;
-}
-
 }  // namespace
 
 std::string find_executable(const std::string& name) {
-    if (name.empty()) return {};
-    if (name.find('/') != std::string::npos) {
-        return executable_file(name) ? name : std::string();
-    }
-    const char* env = std::getenv("PATH");
-    const std::string path = env != nullptr ? env : "/usr/bin:/bin";
-    std::size_t start = 0;
-    for (;;) {
-        const std::size_t colon = path.find(':', start);
-        std::string dir = path.substr(start, colon == std::string::npos
-                                                 ? std::string::npos
-                                                 : colon - start);
-        // An empty entry is the current dir. assign(1, '.') rather than
-        // = ".", which trips GCC 12's -Wrestrict false positive.
-        if (dir.empty()) dir.assign(1, '.');
-        std::string p = dir;
-        p += '/';
-        p += name;
-        if (executable_file(p)) return p;
-        if (colon == std::string::npos) return {};
-        start = colon + 1;
-    }
+    return sys::find_executable(name);
 }
 
 ProcessResult run_process(
@@ -156,7 +107,7 @@ ProcessResult run_process(
     std::vector<char*> args;
     for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
     args.push_back(nullptr);
-    const int limit = fd_limit();
+    const int limit = sys::child_fd_limit();
 
     int in[2] = {-1, -1}, out[2] = {-1, -1}, err[2] = {-1, -1};
     const auto close_all = [&] {
@@ -169,6 +120,13 @@ ProcessResult run_process(
         make_pipe(in);
         make_pipe(out);
         make_pipe(err);
+        // A server started with fd 0, 1 or 2 closed gets one of them
+        // here; the child's dup2 onto it would then keep close-on-exec.
+        for (int* p : {in, out, err}) {
+            if (!sys::lift_above_std(p[0]) || !sys::lift_above_std(p[1])) {
+                throw std::runtime_error("video: fcntl failed");
+            }
+        }
     } catch (...) {
         close_all();
         throw;
@@ -185,7 +143,7 @@ ProcessResult run_process(
         ::dup2(in[0], 0);
         ::dup2(out[1], 1);
         ::dup2(err[1], 2);
-        close_from_3(limit);
+        sys::close_fds_from_3(limit);
         // A signal mask survives exec: locus-server blocks SIGINT and
         // SIGTERM for its stopper thread, and ffmpeg must get them.
         sigset_t none;

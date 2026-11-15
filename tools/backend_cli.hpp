@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "locus/backend/registry.hpp"
@@ -13,6 +14,7 @@
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/kv_quant.hpp"
 #include "locus/model/arch.hpp"
+#include "locus/pipeline/net.hpp"
 #include "locus/sys/features.hpp"
 
 #include "cli_spec.hpp"
@@ -38,6 +40,9 @@ inline std::string backend_unavail_reason(std::string_view name) {
     }
     if (name == "cuda") {
         return "no CUDA device or non-CUDA build";
+    }
+    if (name == "metal") {
+        return "no Metal device or non-Apple build";
     }
     return "unavailable on this machine";
 }
@@ -98,7 +103,7 @@ inline void print_backends() {
     // AVX2 backends on an ARM build) are absent from the registry;
     // list them too so the operator sees the full matrix.
     for (const char* n : {"scalar", "neon", "sse4", "avx2", "vulkan",
-                          "cuda"}) {
+                          "cuda", "metal"}) {
         if (locus::backend::find_backend(n) == nullptr) {
             std::printf(
                 "  %-8s [unavailable: not built for this "
@@ -192,8 +197,19 @@ inline constexpr const char* kCommonHelp =
     "                   report aggregate tok/s (bench mode)\n"
     "  --metrics-path P locus-server: serve Prometheus metrics at\n"
     "                   path P (default /metrics)\n"
-    "  --host H         locus-server: listen on address H only, for\n"
-    "                   example 127.0.0.1 (default: every interface)\n"
+    "  --host H         locus-server: listen on address H (default\n"
+    "                   127.0.0.1); '*' listens on every interface\n"
+    "  --auth-helper P  locus-server: check client keys with the auth\n"
+    "                   helper P (locus-auth-helper is a reference one):\n"
+    "                   every request but /health needs a key it allows;\n"
+    "                   P is a binary or a script that starts with #!\n"
+    "  --auth-helper-arg A locus-server: an argument for the helper\n"
+    "                   (repeatable)\n"
+    "  --max-conns-per-ip N locus-server: open connections one client\n"
+    "                   address (not network: an IPv6 /64 has many) may\n"
+    "                   hold; past it a new one is closed\n"
+    "                   (default 0: no cap; a router in front reaches\n"
+    "                   the server from one address)\n"
     "  --sse-keepalive S locus-server: a stream silent for S seconds\n"
     "                   sends an SSE comment (default 15; 0 = off)\n"
     "  --audio-decoder P locus-server: enable /v1/audio/speech with\n"
@@ -264,10 +280,27 @@ inline constexpr const char* kCommonHelp =
     "  --prefix-cache-helper PATH  keep that KV through this helper\n"
     "                   process instead of DIR (locus-prefix-helper\n"
     "                   is a reference one); a prefix over the cap\n"
-    "                   is not sent\n"
+    "                   is not sent. The helper is a binary or a\n"
+    "                   script that starts with #!\n"
     "  --prefix-cache-helper-arg A  an argument for it (repeatable)\n"
+    "  --prefix-cache-key-file P  sign the disk tier's files with the\n"
+    "                   key in P (an HMAC-SHA-256 per file), so one\n"
+    "                   planted or changed without the key is a miss;\n"
+    "                   for a shared or remote store. It costs a hash\n"
+    "                   of each file's bytes per read and write (a few\n"
+    "                   hundred MB/s per core). Make a key file:\n"
+    "                     umask 077; head -c 32 /dev/urandom > cache.key\n"
     "  --batch-decode   enable R10 cross-sequence batched decode\n"
     "  --no-batch-prefill  force per-token prompt ingestion\n"
+    "  --remote-experts H:P=LO:HI  locus-run: MoE experts LO..HI-1 of\n"
+    "                   every layer run on the locus-experts at H:P\n"
+    "                   (expert parallelism; repeatable). The per-token\n"
+    "                   forward uses them; a batched prefill computes\n"
+    "                   every expert here (--no-batch-prefill sends the\n"
+    "                   prompt's too). A lost host ends the run (exit\n"
+    "                   1); locus-experts drops a connection idle past\n"
+    "                   its --idle-timeout, so a long prefill here wants\n"
+    "                   --idle-timeout 0 there\n"
     "  --timing         locus-run: print prefill and decode\n"
     "                   tok/s to stderr\n"
     "  --warmup         locus-run: run a throwaway 1-token\n"
@@ -299,6 +332,13 @@ inline constexpr const char* kCommonHelp =
     "                          Vulkan: quantized prefill matmuls\n"
     "                          prefetch the next stage (default on,\n"
     "                          off on V3D; the same results either way)\n"
+    "  LOCUS_VK_SPLIT=N        Vulkan: record a grid of more than N\n"
+    "                          workgroups as several dispatches\n"
+    "                          (default on V3D, whose kernel driver\n"
+    "                          can reset a long job and drop its last\n"
+    "                          workgroups: 32, and 128 to 1024 for the\n"
+    "                          matvec kernels; 0 elsewhere). N sets one\n"
+    "                          budget for every kernel; 0 turns it off\n"
     "  LOCUS_VK_CPU_ROUTE=1    Vulkan: route MoE experts on the\n"
     "                          host (default routes on the GPU\n"
     "                          when all experts fit unbudgeted)\n"
@@ -312,6 +352,10 @@ inline constexpr const char* kCommonHelp =
     "                          or the single-sequence ones (0, faster\n"
     "                          alone); default 1 on Apple GPUs\n"
     "                          (except Q4_K / Q6_K models), else 0\n"
+    "  LOCUS_VK_TRACE=1        Vulkan: print a vk-trace line per\n"
+    "                          forward step to stderr (path, batch\n"
+    "                          size, kernels, weight uploads, a hash\n"
+    "                          of each sequence's output)\n"
     "  LOCUS_BATCH_DEQUANT=1   in batched forward, dequant each\n"
     "                          weight row once then dot all N\n"
     "                          tokens (token-exact, not byte-\n"
@@ -345,12 +389,20 @@ struct BackendArgs {
     /** From --metrics-path P: locus-server metrics route (empty =
      * default /metrics). */
     std::string metrics_path;
-    /** From --host H: locus-server's listen address (empty = every
-     *  interface, IPv6 and IPv4). */
-    std::string host;
+    /** From --host H: locus-server's listen address. Loopback unless
+     *  asked (i#625 F7); "--host '*'" gives empty: every interface,
+     *  IPv6 and IPv4. */
+    std::string host = "127.0.0.1";
+    /** From --auth-helper PATH and --auth-helper-arg A: locus-server
+     *  checks client keys with this helper (empty = no key check). */
+    std::vector<std::string> auth_helper;
+    std::vector<std::string> auth_helper_args;
     /** From --sse-keepalive S: seconds of silence before a stream
      *  sends an SSE comment (0 = off). */
     std::uint32_t sse_keepalive = 15;
+    /** From --max-conns-per-ip N: open connections one client address
+     *  may hold on locus-server (i#625 F21); 0 = no cap. */
+    std::uint32_t max_conns_per_ip = 0;
     /** From --audio-decoder P: path to the neural-codec decoder GGUF
      * (arch "snac") enabling locus-server's /v1/audio/speech; empty =
      * the endpoint is disabled (503). */
@@ -418,6 +470,9 @@ struct BackendArgs {
     std::vector<std::string> prefix_cache_helper;
     /** --prefix-cache-helper-arg values, before PATH is known. */
     std::vector<std::string> prefix_cache_helper_args;
+    /** From --prefix-cache-key-file PATH: sign the tier's files with
+     *  the key in PATH (i#830; empty = unsigned). */
+    std::string prefix_cache_key_file;
     /** From --device N: the GPU for --backend vulkan / cuda (i#572);
      *  unset means the backend's first device. */
     std::uint32_t device = 0;
@@ -426,6 +481,9 @@ struct BackendArgs {
     bool batch_decode = false;
     /** --no-batch-prefill: force per-token prompt ingestion. */
     bool no_batch_prefill = false;
+    /** --remote-experts H:P=LO:HI (repeatable): expert hosts, as given;
+     *  locus-run parses them (parse_remote_experts). */
+    std::vector<std::string> remote_experts;
     /** --timing: locus-run prints prefill/decode rates. */
     bool timing = false;
     /** --warmup: locus-run runs a throwaway request first. */
@@ -471,6 +529,46 @@ inline bool parse_kv_type(std::string_view name, locus::kv::KvType& out) {
     return true;
 }
 
+/** One --remote-experts value: the expert host and the experts it
+ *  serves, [lo, hi). */
+struct RemoteExpertsSpec {
+    std::string host;
+    int port = 0;
+    std::uint32_t lo = 0;
+    std::uint32_t hi = 0;
+};
+
+/**
+ * Parses a --remote-experts value, "HOST:PORT=LO:HI" (HOST may be a
+ * bracketed IPv6 literal, as parse_hostport takes it).
+ *
+ * @returns false when it is malformed, the port is 0, or LO >= HI.
+ */
+inline bool parse_remote_experts(const std::string& s,
+                                 RemoteExpertsSpec& out) {
+    const auto eq = s.rfind('=');
+    if (eq == std::string::npos) {
+        return false;
+    }
+    RemoteExpertsSpec r;
+    if (!locus::pipeline::parse_hostport(s.substr(0, eq), r.host, r.port) ||
+        r.host.empty() || r.port == 0) {
+        return false;
+    }
+    const std::string range = s.substr(eq + 1);
+    const auto colon = range.find(':');
+    int lo = 0, hi = 0;
+    if (colon == std::string::npos ||
+        !parse_nonneg_int(range.substr(0, colon), lo) ||
+        !parse_nonneg_int(range.substr(colon + 1), hi) || lo >= hi) {
+        return false;
+    }
+    r.lo = static_cast<std::uint32_t>(lo);
+    r.hi = static_cast<std::uint32_t>(hi);
+    out = std::move(r);
+    return true;
+}
+
 inline BackendArgs parse_backend_args(int argc, char** argv) {
     BackendArgs out;
     // Through parse_nonneg_int, so "-1" is an error instead of wrapping
@@ -513,8 +611,16 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.metrics_path = std::string(a.substr(15));
         } else if (a == "--host" && i + 1 < argc) {
             out.host = argv[++i];
+            if (out.host == "*") out.host.clear();
         } else if (a.rfind("--host=", 0) == 0) {
             out.host = std::string(a.substr(7));
+            if (out.host == "*") out.host.clear();
+        } else if (a == "--auth-helper" && i + 1 < argc) {
+            out.auth_helper = {argv[++i]};
+        } else if (a == "--auth-helper-arg" && i + 1 < argc) {
+            out.auth_helper_args.emplace_back(argv[++i]);
+        } else if (a == "--max-conns-per-ip" && i + 1 < argc) {
+            number("--max-conns-per-ip", argv[++i], out.max_conns_per_ip);
         } else if (a == "--sse-keepalive" && i + 1 < argc) {
             number("--sse-keepalive", argv[++i], out.sse_keepalive);
         } else if (a.rfind("--sse-keepalive=", 0) == 0) {
@@ -601,6 +707,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.prefix_cache_helper = {argv[++i]};
         } else if (a == "--prefix-cache-helper-arg" && i + 1 < argc) {
             out.prefix_cache_helper_args.emplace_back(argv[++i]);
+        } else if (a == "--prefix-cache-key-file" && i + 1 < argc) {
+            out.prefix_cache_key_file = argv[++i];
         } else if (a == "--prefix-cache-disk-mib" && i + 1 < argc) {
             number("--prefix-cache-disk-mib", argv[++i],
                    out.prefix_cache_disk_mib);
@@ -617,6 +725,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.batch_decode = true;
         } else if (a == "--no-batch-prefill") {
             out.no_batch_prefill = true;
+        } else if (a == "--remote-experts" && i + 1 < argc) {
+            out.remote_experts.emplace_back(argv[++i]);
         } else if (a == "--timing") {
             out.timing = true;
         } else if (a == "--warmup") {
@@ -629,6 +739,11 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         out.prefix_cache_helper.insert(out.prefix_cache_helper.end(),
                                        out.prefix_cache_helper_args.begin(),
                                        out.prefix_cache_helper_args.end());
+    }
+    if (!out.auth_helper.empty()) {
+        out.auth_helper.insert(out.auth_helper.end(),
+                               out.auth_helper_args.begin(),
+                               out.auth_helper_args.end());
     }
     return out;
 }
@@ -647,6 +762,11 @@ inline std::string prefix_cache_error(const BackendArgs& a) {
     if ((helper || !a.prefix_cache_dir.empty()) &&
         a.prefix_cache_disk_mib == 0) {
         return "--prefix-cache-disk-mib must be > 0";
+    }
+    if (!a.prefix_cache_key_file.empty() && !helper &&
+        a.prefix_cache_dir.empty()) {
+        return "--prefix-cache-key-file needs --prefix-cache-dir or "
+               "--prefix-cache-helper";
     }
     return {};
 }

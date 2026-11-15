@@ -107,6 +107,50 @@ TEST_CASE("gbnf rejects bad grammars", "[gbnf]") {
                     std::invalid_argument);
 }
 
+// i#625 F1: each of these killed the server with a stack overflow (the
+// parsers, the left-recursion check and the matcher's expansion
+// recursed once per level or per rule).
+TEST_CASE("gbnf survives deep and long grammars", "[gbnf]") {
+    // Nesting past 64 groups is refused, in a grammar and in a regex;
+    // 64 still parses.
+    const auto parens = [](int n) {
+        return std::string(static_cast<std::size_t>(n), '(') + "\"a\"" +
+               std::string(static_cast<std::size_t>(n), ')');
+    };
+    CHECK_THROWS_AS(Gbnf::parse("root ::= " + parens(1000)),
+                    std::invalid_argument);
+    CHECK(full("root ::= " + parens(64), "a"));
+    const std::string deep_re = std::string(1000, '(') + "a" +
+                                std::string(1000, ')');
+    CHECK_THROWS_AS(regex_to_gbnf(deep_re), std::invalid_argument);
+    CHECK(re_full(std::string(64, '(') + "a" + std::string(64, ')'), "a"));
+
+    // A chain of 5000 rules: r0 ::= r1, ..., r4999 ::= "a".
+    std::string chain = "root ::= r0\n";
+    for (int i = 0; i < 4999; ++i) {
+        chain += "r" + std::to_string(i) + " ::= r" + std::to_string(i + 1) +
+                 "\n";
+    }
+    chain += "r4999 ::= \"a\"\n";
+    CHECK(full(chain, "a"));
+    CHECK_FALSE(full(chain, "b"));
+
+    // The review's 143-byte body: a nullable unit repeated 4096 times.
+    CHECK(re_full("(a?){0,4096}", std::string(10, 'a')));
+    CHECK(re_full("(a?){0,4096}", ""));
+    // Nested nullable repeats: still a matcher, maybe truncated.
+    const auto g = Gbnf::parse("root ::= " +
+                               regex_to_gbnf("((a?){0,64}){0,64}"));
+    GbnfMatcher m(g);
+    for (int i = 0; i < 20; ++i) REQUIRE(m.feed('a'));
+    CHECK(m.accepted());
+
+    // So many copies that the grammar is refused, not built.
+    std::string big = "root ::=";
+    for (int i = 0; i < 300; ++i) big += " \"a\"{4096}";
+    CHECK_THROWS_AS(Gbnf::parse(big), std::invalid_argument);
+}
+
 TEST_CASE("gbnf repetition does not grow the parse stacks", "[gbnf]") {
     // Right recursion through a repeat reuses the caller's frame, so a
     // long run stays cheap; recursion through nesting still works.
@@ -159,6 +203,71 @@ TEST_CASE("gbnf step carries the stack cap into its output", "[gbnf]") {
         cur = out;
     }
     CHECK(cur.truncated());  // capped at 8 all along, not at 4096
+}
+
+TEST_CASE("gbnf flags an expansion past the word cap", "[gbnf]") {
+    // Each level keeps a "z" to match after it, so the stacks at the
+    // bottom are about 50 words deep, and four of them are far more
+    // than 64 words: the expansion stops there, under the stack cap and
+    // the visit budget.
+    std::string g = "root ::= r0\n";
+    for (int i = 0; i < 50; ++i) {
+        g += "r" + std::to_string(i) + " ::= r" + std::to_string(i + 1) +
+             " \"z\"\n";
+    }
+    g += "r50 ::= \"a\" | \"b\" | \"c\" | \"d\"\n";
+    const auto gr = Gbnf::parse(g);
+    const GbnfMatcher wide(gr);
+    const GbnfMatcher small(gr, GbnfMatcher::kMaxStacks, 64);
+    CHECK_FALSE(wide.truncated());
+    CHECK(small.truncated());
+    CHECK(full(gr, "d" + std::string(50, 'z')));
+}
+
+TEST_CASE("gbnf step shares the visit budget across stacks", "[gbnf]") {
+    // After "x", h's expansion visits about 2^20 stacks (each c is empty
+    // two ways), past the step's budget; the other alternative's stack
+    // still gets its share, whichever order the two are in.
+    std::string h = "h ::=";
+    for (int i = 0; i < 20; ++i) h += " c";
+    h += " \"z\"\nc ::= \"a\"? | \"b\"?\n";
+    for (const char* root : {"root ::= \"x\" h | \"x\" \"y\"\n",
+                             "root ::= \"x\" \"y\" | \"x\" h\n"}) {
+        CAPTURE(root);
+        GbnfMatcher m(Gbnf::parse(std::string(root) + h));
+        CHECK_FALSE(m.truncated());
+        REQUIRE(m.feed('x'));
+        CHECK(m.truncated());
+        REQUIRE(m.feed('y'));
+        CHECK(m.accepted());
+    }
+}
+
+TEST_CASE("gbnf step's fair split loses no expansion the budget allows",
+          "[gbnf]") {
+    // After "x", 64 stacks match: h's expansion needs more than its
+    // first share (1/64 of the budget) but far less than the budget, so
+    // the second pass completes it, in either alternative order.
+    std::string h = "h ::=";
+    for (int i = 0; i < 12; ++i) h += " c";
+    h += " \"z\"\nc ::= \"a\"? | \"b\"?\n";
+    std::string light;
+    for (int i = 0; i < 63; ++i) {
+        light += " | \"x\" \"y" + std::to_string(i) + "\"";
+    }
+    for (const bool heavy_first : {true, false}) {
+        CAPTURE(heavy_first);
+        const std::string root =
+            heavy_first ? "root ::= \"x\" h" + light + "\n"
+                        : "root ::= " + light.substr(3) + " | \"x\" h\n";
+        GbnfMatcher m(Gbnf::parse(root + h));
+        REQUIRE(m.feed('x'));
+        CHECK_FALSE(m.truncated());
+        GbnfMatcher a = m;
+        for (int i = 0; i < 12; ++i) REQUIRE(a.feed('a'));
+        REQUIRE(a.feed('z'));
+        CHECK(a.accepted());
+    }
 }
 
 TEST_CASE("json schema grammars stay under the stack cap", "[gbnf]") {

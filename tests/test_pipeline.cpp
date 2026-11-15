@@ -1,10 +1,16 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <initializer_list>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -86,6 +92,45 @@ TEST_CASE("pipeline message codec round-trips", "[pipeline]") {
         REQUIRE(out.type == MsgType::kSessionEnd);
         REQUIRE(out.request_id == 42);
         REQUIRE(out.data.empty());
+    }
+
+    SECTION("expert call and reply carry layer, expert id and floats") {
+        const std::vector<float> xb = {0.5f, -1.25f, 3.0f, -0.0f};
+        const std::vector<float> d = {1e-30f, -7.5f, 2.0f, 4.0f};
+        for (const auto& m :
+             {locus::pipeline::make_expert_call(77, 23, 59, xb),
+              locus::pipeline::make_expert_out(77, 23, 59, d)}) {
+            std::string buf;
+            locus::pipeline::encode(m, buf);
+            Message out;
+            std::string err;
+            REQUIRE(locus::pipeline::decode(buf, out, err) ==
+                    Decode::kComplete);
+            REQUIRE(buf.empty());
+            REQUIRE(out.type == m.type);
+            REQUIRE(out.request_id == 77);
+            REQUIRE(out.position == 23);  // layer
+            REQUIRE(out.token == 59);     // expert id
+            REQUIRE(out.data.size() == m.data.size());
+            // Floats travel raw: the same bits, -0.0 included.
+            REQUIRE(std::memcmp(out.data.data(), m.data.data(),
+                                m.data.size() * sizeof(float)) == 0);
+        }
+        REQUIRE(locus::pipeline::make_expert_call(1, 0, 0, xb).type ==
+                MsgType::kExpertCall);
+        REQUIRE(locus::pipeline::make_expert_out(1, 0, 0, d).type ==
+                MsgType::kExpertOut);
+    }
+
+    SECTION("an unknown message type is a malformed frame") {
+        auto m = locus::pipeline::make_expert_out(5, 1, 2, {1.0f});
+        std::string buf;
+        locus::pipeline::encode(m, buf);
+        buf[4] = 7;  // the u16 type after the u32 frame_len: no kind 7
+        buf[5] = 0;
+        Message out;
+        std::string err;
+        REQUIRE(locus::pipeline::decode(buf, out, err) == Decode::kError);
     }
 
     SECTION("two frames decode in sequence (pipelining)") {
@@ -385,6 +430,166 @@ TEST_CASE("pipeline wildcard/::1 listen + allowlist", "[pipeline]") {
         ::close(s);
         ::close(lfd);
     }
+}
+
+// i#851: the allowlist as a kernel filter on the listener. A refused
+// SYN is dropped, so the connect times out instead of completing.
+TEST_CASE("attach_allow_filter drops connects from outside the ranges",
+          "[pipeline]") {
+#if !defined(__linux__)
+    SKIP("the socket filter is Linux only");
+#else
+    using locus::pipeline::Cidr;
+    const auto ranges = [](std::initializer_list<const char*> s) {
+        std::vector<Cidr> out;
+        for (const char* c : s) {
+            out.push_back(*Cidr::parse(c));
+        }
+        return out;
+    };
+    // @returns whether a connect to host:port completes within 300 ms.
+    const auto connects = [](const char* host, int port) {
+        const int c = locus::pipeline::connect_to(host, port, 300);
+        if (c >= 0) {
+            ::close(c);
+        }
+        return c >= 0;
+    };
+    int port = 0;
+    const int lfd = locus::pipeline::listen_on("", 0, &port);  // dual-stack
+    REQUIRE(lfd >= 0);
+    const bool v6 = connects("::1", port);  // before any filter
+
+    if (!locus::pipeline::attach_allow_filter(lfd,
+                                              ranges({"10.0.0.0/8"}))) {
+        // Some hosts refuse socket filters on TCP sockets (a cgroup
+        // setsockopt hook, say); the check at accept is all there is.
+        const int e = errno;
+        ::close(lfd);
+        SKIP("this host refuses a socket filter on a TCP socket: "
+             << std::strerror(e));
+    }
+    CHECK_FALSE(connects("127.0.0.1", port));
+    REQUIRE(locus::pipeline::attach_allow_filter(lfd,
+                                                 ranges({"127.0.0.1"})));
+    CHECK(connects("127.0.0.1", port));
+    // A prefix that ends inside a byte: 126.0.0.0/7 holds 127.x.
+    REQUIRE(locus::pipeline::attach_allow_filter(lfd,
+                                                 ranges({"126.0.0.0/7"})));
+    CHECK(connects("127.0.0.1", port));
+    // IPv4 packets meet only the IPv4 ranges.
+    REQUIRE(locus::pipeline::attach_allow_filter(lfd, ranges({"::/0"})));
+    CHECK_FALSE(connects("127.0.0.1", port));
+    if (v6) {
+        CHECK(connects("::1", port));
+        REQUIRE(locus::pipeline::attach_allow_filter(
+            lfd, ranges({"fe80::/10", "0.0.0.0/0"})));
+        CHECK_FALSE(connects("::1", port));
+        CHECK(connects("127.0.0.1", port));
+        // ::/127 holds ::1 (the last word decides); ::2/127 does not.
+        REQUIRE(locus::pipeline::attach_allow_filter(lfd,
+                                                     ranges({"::/127"})));
+        CHECK(connects("::1", port));
+        REQUIRE(locus::pipeline::attach_allow_filter(lfd,
+                                                     ranges({"::2/127"})));
+        CHECK_FALSE(connects("::1", port));
+    } else {
+        WARN("no IPv6 loopback: the IPv6 half did not run");
+    }
+    // An empty allowlist removes the filter.
+    REQUIRE(locus::pipeline::attach_allow_filter(lfd, {}));
+    CHECK(connects("127.0.0.1", port));
+    // Past the kernel's program size: not attached, the old one stays.
+    std::vector<Cidr> many;
+    for (int i = 0; i < 400; ++i) {
+        many.push_back(*Cidr::parse("2001:db8::" + std::to_string(i)));
+    }
+    CHECK_FALSE(locus::pipeline::attach_allow_filter(lfd, many));
+    CHECK(connects("127.0.0.1", port));
+    ::close(lfd);
+#endif
+}
+
+// The same program on a UDP socket, which every Linux host lets a user
+// filter: a datagram from outside the ranges never arrives. This checks
+// the program itself where TCP sockets refuse filters.
+TEST_CASE("attach_allow_filter's program passes and drops datagrams",
+          "[pipeline]") {
+#if !defined(__linux__)
+    SKIP("the socket filter is Linux only");
+#else
+    using locus::pipeline::Cidr;
+    const auto ranges = [](std::initializer_list<const char*> s) {
+        std::vector<Cidr> out;
+        for (const char* c : s) {
+            out.push_back(*Cidr::parse(c));
+        }
+        return out;
+    };
+    // A dual-stack UDP socket on the wildcard, and its port.
+    const int rx = ::socket(AF_INET6, SOCK_DGRAM, 0);
+    REQUIRE(rx >= 0);
+    int v6only = 0;
+    ::setsockopt(rx, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+    sockaddr_in6 any{};
+    any.sin6_family = AF_INET6;
+    any.sin6_addr = in6addr_any;
+    REQUIRE(::bind(rx, reinterpret_cast<sockaddr*>(&any), sizeof(any)) == 0);
+    socklen_t len = sizeof(any);
+    REQUIRE(::getsockname(rx, reinterpret_cast<sockaddr*>(&any), &len) == 0);
+    const std::uint16_t port = ntohs(any.sin6_port);
+    // @returns whether a datagram sent from `host` reaches rx in 200 ms.
+    const auto arrives = [&](const char* host) {
+        addrinfo hints{};
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = AI_NUMERICHOST;
+        addrinfo* res = nullptr;
+        if (::getaddrinfo(host, std::to_string(port).c_str(), &hints,
+                          &res) != 0) {
+            return false;
+        }
+        const int tx = ::socket(res->ai_family, SOCK_DGRAM, 0);
+        const bool sent =
+            tx >= 0 && ::sendto(tx, "x", 1, 0, res->ai_addr,
+                                res->ai_addrlen) == 1;
+        ::freeaddrinfo(res);
+        if (tx >= 0) {
+            ::close(tx);
+        }
+        pollfd p{rx, POLLIN, 0};
+        char b = 0;
+        return sent && ::poll(&p, 1, 200) == 1 &&
+               ::recv(rx, &b, 1, 0) == 1;
+    };
+    const bool v6 = arrives("::1");
+    REQUIRE(arrives("127.0.0.1"));
+
+    const auto check = [&](std::initializer_list<const char*> allow,
+                           bool want4, bool want6) {
+        INFO(*allow.begin());
+        REQUIRE(locus::pipeline::attach_allow_filter(rx, ranges(allow)));
+        CHECK(arrives("127.0.0.1") == want4);
+        if (v6) {
+            CHECK(arrives("::1") == want6);
+        }
+    };
+    check({"10.0.0.0/8"}, false, false);
+    check({"127.0.0.1"}, true, false);
+    check({"126.0.0.0/7"}, true, false);   // ends inside a byte
+    check({"128.0.0.0/1"}, false, false);  // 127 has the top bit clear
+    check({"0.0.0.0/0"}, true, false);
+    check({"::1"}, false, true);
+    check({"::/127"}, false, true);        // the last word decides
+    check({"::2/127"}, false, false);
+    check({"::/0"}, false, true);
+    check({"fe80::/10", "10.0.0.0/8", "127.0.0.0/8"}, true, false);
+    REQUIRE(locus::pipeline::attach_allow_filter(rx, {}));  // detach
+    CHECK(arrives("127.0.0.1"));
+    if (!v6) {
+        WARN("no IPv6 loopback: the IPv6 half did not run");
+    }
+    ::close(rx);
+#endif
 }
 
 TEST_CASE("pipeline connect_to fails fast on a dead port",

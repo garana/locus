@@ -7,9 +7,12 @@
 #include <cstdio>
 #include <set>
 #include <stdexcept>
+#include <system_error>
+#include <thread>
 
 #include "json.hpp"
 #include "locus/auth/helper_spawn.hpp"
+#include "locus/http/json_body.hpp"
 #include "locus/pipeline/net.hpp"
 
 namespace locus::router {
@@ -104,7 +107,7 @@ std::string content_text(const json& c) {
 
 std::string session_key(std::string_view header, std::string_view body) {
     if (!header.empty()) return "h:" + std::string(header);
-    const json j = json::parse(body, nullptr, /*allow_exceptions=*/false);
+    const json j = http::parse_json_or_discarded(body);
     if (!j.is_object()) return "";
     if (const auto k = j.find("prompt_cache_key");
         k != j.end() && k->is_string() && !k->get<std::string>().empty()) {
@@ -250,7 +253,7 @@ std::optional<Route> classify(std::string_view path, std::string_view body) {
     Route r;
     json j;
     if (!body.empty()) {
-        j = json::parse(body, nullptr, /*allow_exceptions=*/false);
+        j = http::parse_json_or_discarded(body);
         if (j.is_object()) {
             if (const auto m = j.find("model");
                 m != j.end() && m->is_string()) {
@@ -494,6 +497,7 @@ int Router::start() {
     sc.host = cfg_.host;
     sc.port = cfg_.port;
     sc.worker_threads = cfg_.worker_threads;
+    sc.max_conns_per_ip = cfg_.max_conns_per_ip;
     server_ = std::make_unique<http::Server>(
         sc,
         [this](const http::Request& req, http::ServerResponse& res,
@@ -650,6 +654,7 @@ void Router::scan() {
                 http::ClientOptions o;
                 o.connect_timeout_ms = 300;
                 o.read_timeout_ms = 2000;
+                o.total_timeout_ms = 3000;
                 http::Client c(probe.host, probe.port, o);
                 http::ClientRequest req{"GET", "/v1/models", {}, ""};
                 if (const std::string* key = instance_key(probe)) {
@@ -657,14 +662,22 @@ void Router::scan() {
                 }
                 const auto r = c.send(req);
                 if (r.ok && r.head.status == 200) {
-                    const json j = json::parse(r.body, nullptr, false);
+                    const json j = http::parse_json_or_discarded(r.body);
                     hit[i] = j.is_object() && j.contains("data");
                 }
             }
         };
-        std::vector<std::thread> pool;
+        std::vector<std::jthread> pool;  // joined if one fails to start
         const std::uint32_t threads = std::min<std::uint32_t>(64, sc.count);
-        for (std::uint32_t t = 0; t < threads; ++t) pool.emplace_back(worker);
+        // Fewer threads when one fails to start (a low ulimit -u): the
+        // ones running, and this one, still take every address.
+        try {
+            for (std::uint32_t t = 1; t < threads; ++t) {
+                pool.emplace_back(worker);
+            }
+        } catch (const std::system_error&) {
+        }
+        worker();  // this thread is one of them
         for (auto& t : pool) t.join();
         std::vector<std::pair<std::string, int>> found;
         for (std::uint32_t i = 0; i < sc.count; ++i) {
@@ -686,6 +699,9 @@ void Router::poll(Instance& in) const {
     http::ClientOptions o;
     o.connect_timeout_ms = 2000;
     o.read_timeout_ms = 5000;
+    // A whole poll, so an instance that sends a byte every few seconds
+    // cannot hold its refresh for long.
+    o.total_timeout_ms = 8000;
     http::Client c(in.host, in.port, o);
     // An instance that checks keys needs one for its /v1/models too:
     // the instance's key from instance_keys, in any upstream mode.
@@ -695,7 +711,7 @@ void Router::poll(Instance& in) const {
     }
     const auto r = c.send(poll);
     const json j = r.ok && r.head.status == 200
-                       ? json::parse(r.body, nullptr, false)
+                       ? http::parse_json_or_discarded(r.body)
                        : json();
     in.healthy = j.is_object() && j.contains("data");
     in.kinds.clear();
@@ -719,7 +735,10 @@ void Router::poll(Instance& in) const {
                 in.models.push_back(m["id"].get<std::string>());
             }
         }
-        in.models_json = j["data"].dump();
+        // Lossy, in case: the parse above already refuses ill-formed
+        // UTF-8, and a strict dump throws on it.
+        in.models_json =
+            j["data"].dump(-1, ' ', false, json::error_handler_t::replace);
     }
 }
 
@@ -743,8 +762,35 @@ void Router::refresh() {
         }
         seen = inst_;
     }
-    for (auto& in : seen) {
-        if (!in.gone) poll(in);
+    // In parallel, 64 at a time: a slow instance delays its own poll,
+    // not the others'. A reply that makes a poll throw marks only that
+    // instance unhealthy.
+    {
+        std::atomic<std::size_t> next{0};
+        const auto worker = [&] {
+            for (std::size_t i; (i = next.fetch_add(1)) < seen.size();) {
+                if (seen[i].gone) continue;
+                try {
+                    poll(seen[i]);
+                } catch (...) {
+                    seen[i].healthy = false;
+                    seen[i].kinds.clear();
+                    seen[i].models.clear();
+                    seen[i].models_json.clear();
+                }
+            }
+        };
+        // jthread: if one fails to start, the others are joined.
+        std::vector<std::jthread> pool;
+        const std::size_t threads = std::min<std::size_t>(64, seen.size());
+        try {  // fewer threads when one fails to start, as in scan()
+            for (std::size_t t = 1; t < threads; ++t) {
+                pool.emplace_back(worker);
+            }
+        } catch (const std::system_error&) {
+        }
+        worker();  // this thread is one of them
+        for (auto& t : pool) t.join();
     }
     // Field by field and by index: inst_ may have grown meanwhile (it
     // only grows), and a name may have dropped one of these since.
@@ -857,7 +903,7 @@ void Router::models(http::ServerResponse& res) const {
         for (const auto& in : inst_) {
             if (!in.healthy) continue;
             for (const Kind k : in.kinds) kinds.insert(static_cast<int>(k));
-            const json d = json::parse(in.models_json, nullptr, false);
+            const json d = http::parse_json_or_discarded(in.models_json);
             if (!d.is_array()) continue;
             for (const auto& m : d) {
                 if (m.is_object() && m.contains("id") && m["id"].is_string() &&
@@ -974,7 +1020,7 @@ void Router::registration(const http::Request& req,
         return;
     }
     const bool remove = req.path == "/locus/deregister";
-    const json body = json::parse(req.body, nullptr, false);
+    const json body = http::parse_json_or_discarded(req.body);
     Instance want;
     if (!body.is_object() || !body.contains("address") ||
         !body["address"].is_string() ||
@@ -1261,7 +1307,7 @@ void Router::handle(const http::Request& req, http::ServerResponse& res) {
         if (rt.kind == Kind::kVideo &&
             content_type.find("json") != std::string::npos) {
             // A job: give it the router's id, which names this instance.
-            json j = json::parse(body, nullptr, /*allow_exceptions=*/false);
+            json j = http::parse_json_or_discarded(body);
             if (j.is_object() && j.contains("id") && j["id"].is_string()) {
                 std::lock_guard lk(mu_);
                 j["id"] = router_video_id(

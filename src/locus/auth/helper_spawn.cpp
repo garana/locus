@@ -9,6 +9,8 @@
 #include <cstring>
 #include <exception>
 
+#include "locus/sys/child_fds.hpp"
+
 namespace locus::auth {
 
 namespace detail {
@@ -97,6 +99,31 @@ std::unique_ptr<HelperConnection> spawn_helper(
         ::close(in_pipe[1]);
         return fail("pipe");
     }
+    // A server started with fd 0, 1 or 2 closed gets one of them here;
+    // the child's dup2 onto it would then keep close-on-exec.
+    if (!sys::lift_above_std(in_pipe[0]) || !sys::lift_above_std(in_pipe[1]) ||
+        !sys::lift_above_std(out_pipe[0]) ||
+        !sys::lift_above_std(out_pipe[1])) {
+        close_all(in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1]);
+        return fail("fcntl");
+    }
+
+    // Everything the child needs is made here, before fork: the child of
+    // a threaded process may only make async-signal-safe calls (another
+    // thread may hold the allocator's lock at the fork), so it does not
+    // allocate.
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const std::string& a : argv) {
+        cargv.push_back(const_cast<char*>(a.c_str()));
+    }
+    cargv.push_back(nullptr);
+    const int fd_limit = sys::child_fd_limit();
+    // The PATH search too: execvp's is not async-signal-safe. A name that
+    // resolves to nothing is not exec'd at all (exec'ing a bare name
+    // would open it in the cwd, which execvp never did): the child exits
+    // 127 and the connection reads as broken, as before.
+    const std::string exe = sys::find_executable(argv[0]);
 
     const pid_t pid = ::fork();
     if (pid < 0) {
@@ -105,22 +132,18 @@ std::unique_ptr<HelperConnection> spawn_helper(
     }
     if (pid == 0) {
         // Child: stdin <- in_pipe read end, stdout -> out_pipe write
-        // end. dup2 clears CLOEXEC on the new std fds.
+        // end. dup2 clears CLOEXEC on the new std fds. Then every other
+        // fd goes, so the helper holds none of the server's sockets or
+        // files (not every fd locus opens is close-on-exec).
         ::dup2(in_pipe[0], STDIN_FILENO);
         ::dup2(out_pipe[1], STDOUT_FILENO);
-        close_all(in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1]);
-        std::vector<char*> cargv;
-        cargv.reserve(argv.size() + 1);
-        for (const std::string& a : argv) {
-            cargv.push_back(const_cast<char*>(a.c_str()));
-        }
-        cargv.push_back(nullptr);
+        sys::close_fds_from_3(fd_limit);
         // A signal mask survives exec: locus-server blocks SIGINT and
         // SIGTERM for its stopper thread, and the helper must get them.
         sigset_t none;
         sigemptyset(&none);
         ::sigprocmask(SIG_SETMASK, &none, nullptr);
-        ::execvp(cargv[0], cargv.data());
+        if (!exe.empty()) ::execv(exe.c_str(), cargv.data());
         _exit(127);  // exec failed
     }
     // Parent: keep in_pipe[1] (write to child) + out_pipe[0] (read).

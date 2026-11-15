@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "locus/backend/metal/context.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/sys/features.hpp"
 
@@ -16,7 +17,7 @@ const std::vector<Backend>& list() {
     static const std::vector<Backend> v = [] {
         const sys::Features f = sys::detect();
         std::vector<Backend> b;
-        b.reserve(6);  // fits every arch's entries; also avoids a
+        b.reserve(7);  // fits every arch's entries; also avoids a
                        // GCC-13 -Wstringop-overflow false positive
                        // on the vector-growth path.
 // GCC 13 -Wextra flags designated initializers that omit trailing
@@ -132,6 +133,15 @@ const std::vector<Backend>& list() {
                       .prefetch = &cuda_prefetch,
                       .evict = &cuda_evict,
                       .pool_budget = &cuda_pool_budget}});
+        // Metal (i#865, stage 1 of #10): the device, buffers and
+        // kernels are in, the math is not yet, so it runs this build's
+        // best CPU kernels (the first entry). Listed after the GPU
+        // backends, so it is never the default.
+        const bool mt = metal::Context::usable();
+        b.push_back({"metal",
+                     "Apple GPU via Metal (stage 1: device, buffers and "
+                     "kernels; the math still runs on the CPU kernels)",
+                     mt, mt, b.front().ops});
 #pragma GCC diagnostic pop
         return b;
     }();

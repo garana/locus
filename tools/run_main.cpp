@@ -2,16 +2,21 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "backend_cli.hpp"
 #include "cli_spec.hpp"
 #include "locus/engine/disk_prefix_key.hpp"
+#include "locus/pipeline/handshake.hpp"
 #include "locus/engine/engine.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/model/moe_stats.hpp"
+#include "locus/pipeline/expert_client.hpp"
+#include "locus/pipeline/net.hpp"
 #include "locus/sys/features.hpp"
 #include "locus/tok/tokenizer.hpp"
 
@@ -74,6 +79,29 @@ int main(int argc, char** argv) {
                      argv[0], argv[0]);
         return 2;
     }
+    // --remote-experts (expert parallelism, #781): checked before the
+    // model loads; connected after, once the expert count is known.
+    std::vector<locus_tools::RemoteExpertsSpec> remote;
+    for (const std::string& s : args.remote_experts) {
+        locus_tools::RemoteExpertsSpec r;
+        if (!locus_tools::parse_remote_experts(s, r)) {
+            std::fprintf(stderr,
+                         "%s: bad --remote-experts '%s' (want "
+                         "HOST:PORT=LO:HI)\n",
+                         argv[0], s.c_str());
+            return 2;
+        }
+        for (const auto& o : remote) {
+            if (r.lo < o.hi && o.lo < r.hi) {
+                std::fprintf(stderr,
+                             "%s: --remote-experts ranges %u:%u and %u:%u "
+                             "overlap\n",
+                             argv[0], o.lo, o.hi, r.lo, r.hi);
+                return 2;
+            }
+        }
+        remote.push_back(std::move(r));
+    }
     const std::string model_path = args.positional[0];
     const std::string prompt = args.positional[1];
     // Guarded parse: atoi wrapped "-1" to 4294967295 tokens and read
@@ -121,6 +149,33 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "%s\n", gpu_warn.c_str());
         }
 
+        std::vector<locus::pipeline::ExpertClient::Host> hosts;
+        for (const auto& r : remote) {
+            if (r.hi > hp.n_expert) {
+                std::fprintf(stderr,
+                             "%s: --remote-experts %u:%u, but the model "
+                             "has %u experts\n",
+                             argv[0], r.lo, r.hi, hp.n_expert);
+                return 2;
+            }
+            const int fd = locus::pipeline::connect_to(r.host, r.port, 5000);
+            if (fd < 0) {
+                std::fprintf(stderr, "%s: cannot reach %s:%d\n", argv[0],
+                             r.host.c_str(), r.port);
+                return 1;
+            }
+            hosts.push_back({r.lo, r.hi, fd});
+            std::fprintf(stderr, "remote experts [%u,%u) on %s:%d\n", r.lo,
+                         r.hi, r.host.c_str(), r.port);
+        }
+        // Declared before the engine, so it outlives every forward.
+        std::unique_ptr<locus::pipeline::ExpertClient> experts;
+        if (!hosts.empty()) {
+            experts = std::make_unique<locus::pipeline::ExpertClient>(
+                std::move(hosts), hp.n_embd);
+            model.set_remote_experts(experts.get());
+        }
+
         auto ids = tok.encode(prompt, true);
 
         locus::engine::Engine::Config cfg;
@@ -145,6 +200,10 @@ int main(int argc, char** argv) {
                 args.prefix_cache_helper,
                 std::uint64_t{args.prefix_cache_disk_mib} << 20, g,
                 model_path, model, args.kv_type);
+        }
+        if (cfg.disk_prefix && !args.prefix_cache_key_file.empty()) {
+            cfg.disk_prefix->set_mac_key(
+                locus::pipeline::read_key_file(args.prefix_cache_key_file));
         }
         locus::engine::Engine engine(model, tok.eos_id(), cfg);
 
@@ -236,6 +295,10 @@ int main(int argc, char** argv) {
                 sec > 0 ? total / sec : 0.0,
                 static_cast<int>(cfg.batched_decode),
                 static_cast<int>(cfg.batched_prefill));
+        }
+        if (experts) {
+            std::fprintf(stderr, "remote expert calls: %llu\n",
+                         static_cast<unsigned long long>(experts->calls()));
         }
         locus::model::MoeStats::report();
     } catch (const std::exception& e) {

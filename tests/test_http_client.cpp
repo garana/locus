@@ -481,6 +481,46 @@ TEST_CASE("http client: close-delimited bodies, refusals and timeouts",
         CHECK(r.error.find("timed out") != std::string::npos);
         CHECK(ms < 1200);
     }
+    SECTION("a server that trickles bytes stops at the total deadline") {
+        // i#625 F13: one byte every 50 ms stays under the read timeout;
+        // only total_timeout_ms ends the request.
+        int port = 0;
+        const int lfd = locus::pipeline::listen_on("127.0.0.1", 0, &port);
+        REQUIRE(lfd >= 0);
+        std::atomic<bool> stop{false};
+        std::jthread th([&] {
+            const int c = locus::pipeline::accept_one(lfd, nullptr, 3000);
+            if (c < 0) return;
+            char buf[4096];
+            [[maybe_unused]] const ssize_t got = ::read(c, buf, sizeof(buf));
+            const std::string head =
+                "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
+            [[maybe_unused]] ssize_t put =
+                ::write(c, head.data(), head.size());
+            for (int i = 0; i < 1000 && !stop; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                put = ::write(c, "x", 1);
+            }
+            ::close(c);
+        });
+        ClientOptions o;
+        o.read_timeout_ms = 1000;
+        o.total_timeout_ms = 400;
+        Client c("127.0.0.1", port, o);
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto r = c.send(ClientRequest{});
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        stop = true;
+        th.join();
+        ::close(lfd);
+        CHECK_FALSE(r.ok);
+        INFO(r.error);
+        CHECK(r.error.find("request timed out") != std::string::npos);
+        CHECK(ms >= 350);
+        CHECK(ms < 1000);
+    }
     SECTION("nothing listening") {
         int port = 0;
         const int fd = locus::pipeline::listen_on("127.0.0.1", 0, &port);

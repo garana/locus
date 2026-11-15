@@ -93,6 +93,20 @@ struct ArchSpec {
      * plain_attention's (i#671).
      */
     bool qwen2_attention = false;
+
+    /**
+     * Optional batched `layer` (i#739): runs layer l for n tokens at
+     * positions base .. base + n - 1 on x (their n * n_embd rows,
+     * token-major) in place, each token as `layer` would. With it the
+     * CPU forward_batch prefills the arch in chunks; nullptr: one token
+     * at a time.
+     */
+    void (*layer_batch)(const TransformerModel& m,
+                        const TransformerModel::Layer& lay,
+                        kv::PagedKvCache& cache, kv::PagedKvCache::Seq& seq,
+                        TransformerModel::Workspace& ws, std::uint32_t l,
+                        std::uint32_t base, std::uint32_t n,
+                        std::span<float> x) = nullptr;
 };
 
 /** @returns All implemented architectures. */

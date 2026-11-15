@@ -760,6 +760,157 @@ TEST_CASE("http server: fast path still matches when the request line "
     REQUIRE(r.find("fast") != std::string::npos);
 }
 
+// i#625 F4: a fast-path request line followed by nothing used to be
+// served on the acceptor, which then waited the whole head deadline for
+// the rest of the head and accepted no one meanwhile.
+TEST_CASE("http server: a fast-path head cut short does not stall the "
+          "acceptor", "[http_server]") {
+    ServerConfig cfg;
+    cfg.worker_threads = 2;
+    cfg.head_deadline_ms = 3000;
+    cfg.fast_path = [](std::string_view m, std::string_view t) {
+        return m == "GET" && t == "/fast";
+    };
+    Fixture f(echo_handler, cfg);
+    std::vector<int> stalled;
+    for (int i = 0; i < 2; ++i) {
+        stalled.push_back(client_connect(f.port));
+        send_all(stalled.back(), "GET /fast HTTP/1.1\r\n");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto t0 = std::chrono::steady_clock::now();
+    const int c = client_connect(f.port);
+    send_all(c, "GET /fast HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    const std::string r = drain(c, 5000);
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    ::close(c);
+    for (const int s : stalled) {
+        ::close(s);
+    }
+    REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
+    // Pre-fix: about 3000 ms (the head deadline) per stalled connection.
+    // Now: at most the 100 ms classify window, plus margin.
+    REQUIRE(ms < 1000.0);
+}
+
+// i#625 F21: with a per-address cap, one client address cannot hold
+// every worker; a connection past the cap is closed at accept, and a
+// closed one gives its slot back.
+TEST_CASE("http server: a per-address cap closes connections past it",
+          "[http_server]") {
+    ServerConfig cfg;
+    cfg.worker_threads = 4;
+    cfg.max_conns_per_ip = 2;
+    cfg.head_deadline_ms = 5000;
+    Fixture f(echo_handler, cfg);
+    const int a = client_connect(f.port);
+    const int b = client_connect(f.port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // The third, from the same address, is closed without a reply.
+    const int c = client_connect(f.port);
+    send_all(c, "GET /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    CHECK(drain(c, 2000).empty());
+    ::close(c);
+    // One of the two leaves: its slot comes back.
+    ::close(a);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const int d = client_connect(f.port);
+    send_all(d, "GET /y HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    const std::string r = drain(d, 2000);
+    ::close(d);
+    ::close(b);
+    REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
+    REQUIRE(r.find("GET /y") != std::string::npos);
+}
+
+// i#837: an inline fast-path response used only the per-wait write
+// deadline, so a client that never reads a large one held the acceptor
+// for that whole deadline (and longer, a few bytes at a time).
+TEST_CASE("http server: a slow reader of a fast-path reply does not hold "
+          "the acceptor", "[http_server]") {
+    ServerConfig cfg;
+    cfg.worker_threads = 2;
+    cfg.write_deadline_ms = 5000;
+    cfg.fast_path = [](std::string_view m, std::string_view t) {
+        return m == "GET" && (t == "/big" || t == "/fast");
+    };
+    const std::string big(8 << 20, 'x');  // past any socket buffer
+    Fixture f(
+        [&](const Request& req, ServerResponse& res) {
+            res.status = 200;
+            res.set_content(req.path == "/big" ? big : "fast", "text/plain");
+        },
+        cfg);
+    const int slow = client_connect(f.port);
+    send_all(slow, "GET /big HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto t0 = std::chrono::steady_clock::now();
+    const int c = client_connect(f.port);
+    send_all(c, "GET /fast HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    const std::string r = drain(c, 8000);
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    ::close(c);
+    ::close(slow);
+    REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
+    // Before: about the 5 s write deadline. Now: the 1 s inline total.
+    REQUIRE(ms < 3000.0);
+}
+
+// The other half of F4: a fast-path head that arrives in two parts still
+// takes the fast path (it waits as partial, then is served inline).
+TEST_CASE("http server: a fast-path head in two parts is still fast",
+          "[http_server]") {
+    ServerConfig cfg;
+    cfg.worker_threads = 1;
+    cfg.fast_path = [](std::string_view m, std::string_view t) {
+        return m == "GET" && t == "/fast";
+    };
+    std::atomic<bool> release{false};
+    auto handler = [&](const Request& req, ServerResponse& res) {
+        if (req.path == "/fast") {
+            res.status = 200;
+            res.set_content("fast", "text/plain");
+            return;
+        }
+        while (!release.load()) {  // occupies the lone worker
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        res.status = 200;
+        res.set_content("slow", "text/plain");
+    };
+    Fixture f(handler, cfg);
+    std::jthread slow([&] {
+        const int c = client_connect(f.port);
+        send_all(c, "GET /slow HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+        drain(c, 3000);
+        ::close(c);
+    });
+    struct Releaser {
+        std::atomic<bool>& release;
+        std::jthread& t;
+        ~Releaser() {
+            release.store(true);
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    } releaser{release, slow};
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    const int c = client_connect(f.port);
+    send_all(c, "GET /fast HTTP/1.1\r\n");
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    send_all(c, "Host: h\r\nConnection: close\r\n\r\n");
+    const std::string r = drain(c, 2000);
+    ::close(c);
+    REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
+    REQUIRE(r.find("fast") != std::string::npos);
+}
+
 namespace {
 
 /** One request on a fresh connection; @returns the raw response. */

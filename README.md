@@ -26,7 +26,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   qwen2 pretokenizers), the T5 unigram model and BERT's WordPiece,
   with chat templates.
 - **Backends:** neon, avx2, sse4 and scalar on the CPU; vulkan (the
-  whole forward pass on the GPU); cuda (matvec on the GPU).
+  whole forward pass on the GPU); cuda (matvec on the GPU); metal
+  (Apple GPUs, being built: #10).
 - **Serving:** continuous batching; a paged KV cache with
   copy-on-write prefix sharing; f32, f16, q8 or q4 KV.
 - **API:** `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
@@ -43,7 +44,8 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   penalties, seed), structured output (JSON mode, a JSON Schema, a
   regex or a GBNF grammar), prompt caching (in RAM, and on disk with
   `--prefix-cache-dir DIR`, read back also after a restart, or through
-  an external helper process, `--prefix-cache-helper`), logprobs,
+  an external helper process, `--prefix-cache-helper`; files signed
+  with `--prefix-cache-key-file`), logprobs,
   prompt-lookup speculative decoding with a draft length that adapts
   to the accept rate and the measured verify cost.
 - **Large models:** weights stream from disk with readahead, so a
@@ -81,7 +83,9 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 - **Tools:** `locus-server`; `locus-run` (one prompt); `locus-gguf`
   (inspect a GGUF); `locus-stage` and `locus-driver` (multi-server
   pipeline, experimental; a stage runs on the CPU, CUDA or Vulkan, and
-  can serve its own Prometheus `/metrics`);
+  can serve its own Prometheus `/metrics`); `locus-experts` (serves
+  one host's share of an MoE model's experts, for expert parallelism,
+  #781; `locus-run --remote-experts HOST:PORT=LO:HI` uses it);
   `locus-router` (or `locus-server
   --router`: one URL in front of several locus-server instances, given
   as host:port, found by DNS SRV, by mDNS / DNS-SD or by scanning an
@@ -186,14 +190,17 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
 
 ### Pending
 
-- Multimedia (#143): real-time speech on the M2 Pro (#173; the M4 Max
-  runs at 1.34x real time), Qwen-Image-Edit's 65 s CPU encode (#671,
-  parked: the edit's working set does not fit a 36 GiB host with the
-  language model on the GPU).
+- Multimedia (#143): on the M2 Pro a speech request takes 1.9x as
+  long as the audio it makes, and its token generation is 1.23x
+  slower than llama.cpp Metal's on the same weights (#784); the M4
+  Max generates faster than real time (139 audio tokens/s, where real
+  time needs about 82); a comparison
+  with other speech, image and video tools (#245).
 - Performance: prefill on Apple GPUs at 44% of Metal's (#10:
-  MoltenVK exposes no cooperative matrix), CPU prefill (#618: about
-  60% of llama.cpp's on an M2 Pro with `LOCUS_CPU_FAST`, which uses
-  Apple's Accelerate there).
+  MoltenVK exposes no cooperative matrix, so a native Metal backend is
+  being built, #865 to #868), CPU prefill on an M2 Pro at about 60%
+  of llama.cpp's with `LOCUS_CPU_FAST` (llama.cpp sends its prompt
+  matmuls through Apple's Accelerate; whether locus should is #782).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
@@ -215,8 +222,10 @@ tower). Tests tagged as heavy also need `LOCUS_HEAVY_TESTS=1`.
     locus-server model.gguf 8080
     locus-run model.gguf "Once upon a time" 32
 
-The server listens on every interface; `--host 127.0.0.1` keeps it
-on loopback. `locus-server --help` lists the options and environment
+The server listens on 127.0.0.1; `--host ADDR` picks an address and
+`--host '*'` every interface. `--auth-helper PATH` makes every request
+but `/health` need a key the helper allows (`locus-auth-helper` is a
+reference one). `locus-server --help` lists the options and environment
 variables;
 `--capabilities` lists the architectures, backends, weight formats
 and tokenizers of the build. Speech needs `--audio-decoder
@@ -251,6 +260,7 @@ Vulkan devices; the first is the default).
 | scalar  | portable reference, every weight type                                                    |
 | vulkan  | the whole forward pass on the GPU: matmuls, norms, RoPE, paged attention, MoE routing    |
 | cuda    | matvec and attention on the GPU (paged weight pool, KV cache copy); the rest on the CPU  |
+| metal   | Apple GPUs (#10, stage 1): device, buffers, kernels; the math still runs on the CPU      |
 
 Every selectable backend must reproduce the golden outputs. A GPU does
 not always beat the CPU: on a tile GPU streaming a model larger than

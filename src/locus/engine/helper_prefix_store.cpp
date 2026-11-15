@@ -333,8 +333,9 @@ bool HelperPrefixStore::write(std::span<const tok::TokenId> prompt,
     }
     const std::vector<std::uint8_t> m = meta(prompt, n_blocks, src);
     const std::size_t bb = block_bytes();
-    const std::uint64_t bytes =
-        m.size() + static_cast<std::uint64_t>(bb) * n_blocks;
+    const std::uint64_t bytes = m.size() +
+                                static_cast<std::uint64_t>(bb) * n_blocks +
+                                (keyed() ? kTagBytes : 0);
     if (bytes > cap_bytes()) {
         return false;
     }
@@ -347,6 +348,8 @@ bool HelperPrefixStore::write(std::span<const tok::TokenId> prompt,
     for (std::uint32_t i = 0; i < n_blocks; ++i) {
         std::memcpy(shm.data() + m.size() + bb * i, src[i], bb);
     }
+    seal(shm.data(), bytes);  // the tag, when keyed: the helper's store
+                              // may be shared, so the blob is signed
     HelperMessage req;
     req.type = "write";
     req.set("name", hex(digest));

@@ -1641,7 +1641,7 @@ std::size_t row_bytes(const Mat& w) {
 
 }  // namespace
 
-float f16_to_f32(std::uint16_t h) {
+float f16_to_f32_rare(std::uint16_t h) {
     const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u)
                                << 16;
     std::uint32_t exp = (h >> 10) & 0x1f;

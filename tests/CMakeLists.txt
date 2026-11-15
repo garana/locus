@@ -9,10 +9,12 @@ target_include_directories(catch2 SYSTEM PUBLIC
 
 add_executable(locus_tests
     test_sanity.cpp
+    test_third_party.cpp
     test_block_allocator.cpp
     test_features.cpp
     test_arch_registry.cpp
     test_backend_registry.cpp
+    test_metal.cpp
     test_bench.cpp
     test_engine_loop.cpp
     test_bpe_tokenizer.cpp
@@ -46,6 +48,7 @@ add_executable(locus_tests
     test_meminfo.cpp
     test_mmap_file.cpp
     test_pipeline.cpp
+    test_handshake.cpp
     test_pipeline_stage.cpp
     test_forward_batch_layers.cpp
     test_logit_rows.cpp
@@ -91,6 +94,7 @@ add_executable(locus_tests
     test_q8_layout.cpp
     test_vulkan_reset.cpp
     test_tokenizer.cpp
+    test_tokenizer_merge.cpp
     test_t5_tokenizer.cpp
     test_wpm_tokenizer.cpp
     test_bert.cpp

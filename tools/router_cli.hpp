@@ -48,9 +48,13 @@ inline constexpr const char* kRouterUsage =
     "                      1800; 0 = none)\n"
     "  --text-timeout S    the same for every other request (default\n"
     "                      1800; 0 = none)\n"
+    "  --max-conns-per-ip N  open connections one client address (not\n"
+    "                      network) may hold; past it a new one is\n"
+    "                      closed (default 0: no cap)\n"
     "  --auth-helper PATH  check client keys with this auth helper\n"
     "                      (locus-auth-helper is a reference one): every\n"
     "                      request but /health needs a key it allows\n"
+    "                      (a binary or a script that starts with #!)\n"
     "  --auth-helper-arg A an argument for the helper (repeatable)\n"
     "  --upstream-auth M   the credential sent to the instances: client\n"
     "                      (the client's own, default), none, or key\n"
@@ -106,6 +110,12 @@ inline std::string parse_router_args(int argc, char** argv, int first,
                 return std::string("bad --text-timeout: ") + argv[i];
             }
             cfg.text_read_timeout_ms = n * 1000;
+        } else if (a == "--max-conns-per-ip" && i + 1 < argc) {
+            int n = 0;
+            if (!parse_nonneg_int(argv[++i], n)) {
+                return std::string("bad --max-conns-per-ip: ") + argv[i];
+            }
+            cfg.max_conns_per_ip = static_cast<std::size_t>(n);
         } else if (a == "--auth-helper" && i + 1 < argc) {
             helper = argv[++i];
         } else if (a == "--auth-helper-arg" && i + 1 < argc) {
@@ -208,7 +218,19 @@ inline int run_router(int argc, char** argv, int first) {
                          in.port, in.healthy ? "up" : "down",
                          kinds.c_str());
         }
-        std::fprintf(stderr, "locus-router listening on :%d\n", port);
+        // The bound host too, so a loopback-only router reads as one; an
+        // IPv6 address in brackets, as locus-server prints it.
+        if (cfg.host.empty()) {
+            std::fprintf(stderr,
+                         "locus-router listening on every interface, port "
+                         "%d\n",
+                         port);
+        } else {
+            const bool v6 = cfg.host.find(':') != std::string::npos;
+            std::fprintf(stderr, "locus-router listening on %s%s%s:%d\n",
+                         v6 ? "[" : "", cfg.host.c_str(), v6 ? "]" : "",
+                         port);
+        }
         r.wait();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "locus-router: %s\n", e.what());

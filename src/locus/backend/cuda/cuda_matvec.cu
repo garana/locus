@@ -3244,21 +3244,47 @@ void launch_kernel(Kind kind, const void* dw,
     }
 }
 
+/**
+ * A weight's device copy for one call: the resident pool's, pinned
+ * until the lease ends, or an uncached per-call upload when the pool
+ * cannot hold it (too big for the budget, or every page pinned).
+ */
+class WeightLease {
+  public:
+    WeightLease(const void* host, std::size_t bytes) : host_(host) {
+        dev_ = pool().acquire(host, bytes);
+        pooled_ = dev_ != nullptr;
+        if (!pooled_ && demand_.alloc(bytes) &&
+            cuda_ok(cudaMemcpy(demand_.p, host, bytes,
+                               cudaMemcpyHostToDevice))) {
+            dev_ = demand_.p;
+        }
+    }
+    ~WeightLease() {
+        if (pooled_) {
+            pool().release(host_);
+        }
+    }
+    WeightLease(const WeightLease&) = delete;
+    WeightLease& operator=(const WeightLease&) = delete;
+
+    /** @returns The device copy, or nullptr when the upload failed. */
+    const void* get() const { return dev_; }
+
+  private:
+    const void* host_;
+    const void* dev_ = nullptr;
+    bool pooled_ = false;
+    DevBuf demand_;
+};
+
 bool run_matvec(const Mat& w, std::span<const float> x,
                 std::span<float> out, std::size_t w_bytes,
                 Kind kind, const CudaTables& t = {}) {
-    // Weight: resident pool, or an uncached per-call upload when it
-    // cannot be cached (too big for the budget / all pages pinned).
-    const void* dw = pool().acquire(w.data, w_bytes);
-    const bool pooled = dw != nullptr;
-    DevBuf dw_demand;
-    if (!pooled) {
-        if (!dw_demand.alloc(w_bytes) ||
-            !cuda_ok(cudaMemcpy(dw_demand.p, w.data, w_bytes,
-                                cudaMemcpyHostToDevice))) {
-            return false;
-        }
-        dw = dw_demand.p;
+    const WeightLease weight(w.data, w_bytes);
+    const void* dw = weight.get();
+    if (dw == nullptr) {
+        return false;
     }
 
     bool ok = false;
@@ -3279,10 +3305,6 @@ bool run_matvec(const Mat& w, std::span<const float> x,
                  cuda_ok(cudaMemcpy(out.data(), dout, out_bytes,
                                     cudaMemcpyDeviceToHost));
         }
-    }
-
-    if (pooled) {
-        pool().release(w.data);
     }
     return ok;
 }
@@ -3466,16 +3488,10 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
     if (!tables_ok) {
         return false;
     }
-    const void* dw = pool().acquire(w.data, w_bytes);
-    const bool pooled = dw != nullptr;
-    DevBuf dw_demand;
-    if (!pooled) {
-        if (!dw_demand.alloc(w_bytes) ||
-            !cuda_ok(cudaMemcpy(dw_demand.p, w.data, w_bytes,
-                                cudaMemcpyHostToDevice))) {
-            return false;
-        }
-        dw = dw_demand.p;
+    const WeightLease weight(w.data, w_bytes);
+    const void* dw = weight.get();
+    if (dw == nullptr) {
+        return false;
     }
     bool ok = false;
     {
@@ -3496,9 +3512,6 @@ bool run_batch(const Mat& w, std::span<const float> x_batch,
                  cuda_ok(cudaMemcpy(out_batch.data(), dout, out_bytes,
                                     cudaMemcpyDeviceToHost));
         }
-    }
-    if (pooled) {
-        pool().release(w.data);
     }
     return ok;
 }
@@ -3569,16 +3582,10 @@ bool cuda_has_q8k_kernel(gguf::TensorType type) {
 bool run_matvec_q8k(const Mat& w, std::span<const float> x,
                     std::span<float> out, std::size_t w_bytes,
                     const CudaTables& t) {
-    const void* dw = pool().acquire(w.data, w_bytes);
-    const bool pooled = dw != nullptr;
-    DevBuf dw_demand;
-    if (!pooled) {
-        if (!dw_demand.alloc(w_bytes) ||
-            !cuda_ok(cudaMemcpy(dw_demand.p, w.data, w_bytes,
-                                cudaMemcpyHostToDevice))) {
-            return false;
-        }
-        dw = dw_demand.p;
+    const WeightLease weight(w.data, w_bytes);
+    const void* dw = weight.get();
+    if (dw == nullptr) {
+        return false;
     }
     const std::size_t nsb = x.size() / 256;
     std::vector<float> hd(nsb);
@@ -3687,11 +3694,42 @@ bool run_matvec_q8k(const Mat& w, std::span<const float> x,
                                     cudaMemcpyDeviceToHost));
         }
     }
-    if (pooled) {
-        pool().release(w.data);
-    }
     return ok;
 }
+
+/** A convolution's device buffers: its input, weight and optional
+ *  bias uploaded, and room for its output. */
+struct ConvBufs {
+    DevBuf in, w, b, out;
+    const float* bias = nullptr;  ///< nullptr when there is no bias
+
+    /** @returns false on a failed allocation or upload. */
+    bool upload(std::span<const float> x, std::span<const float> weight,
+                std::span<const float> bias_h, std::size_t out_n) {
+        if (!in.alloc(x.size() * sizeof(float)) ||
+            !w.alloc(weight.size() * sizeof(float)) ||
+            !out.alloc(out_n * sizeof(float))) {
+            return false;
+        }
+        if (!bias_h.empty()) {
+            if (!b.alloc(bias_h.size() * sizeof(float))) {
+                return false;
+            }
+            bias = static_cast<const float*>(b.p);
+        }
+        if (!cuda_ok(cudaMemcpy(in.p, x.data(), x.size() * sizeof(float),
+                                cudaMemcpyHostToDevice)) ||
+            !cuda_ok(cudaMemcpy(w.p, weight.data(),
+                                weight.size() * sizeof(float),
+                                cudaMemcpyHostToDevice))) {
+            return false;
+        }
+        return bias == nullptr ||
+               cuda_ok(cudaMemcpy(b.p, bias_h.data(),
+                                  bias_h.size() * sizeof(float),
+                                  cudaMemcpyHostToDevice));
+    }
+};
 
 // --- conv1d family (generative-media codec decoders, F32) ----------
 // One thread per output element; the per-element math mirrors the
@@ -3815,29 +3853,8 @@ bool run_conv1d_dev(bool transpose, std::span<const float> in,
     if (out.empty()) {
         return true;  // out_ch == 0 or out_len == 0: nothing to compute
     }
-    DevBuf din, dw, db, dout;
-    if (!din.alloc(in.size() * sizeof(float)) ||
-        !dw.alloc(weight.size() * sizeof(float)) ||
-        !dout.alloc(out.size() * sizeof(float))) {
-        return false;
-    }
-    const float* dbias = nullptr;
-    if (!bias.empty()) {
-        if (!db.alloc(bias.size() * sizeof(float))) {
-            return false;
-        }
-        dbias = static_cast<const float*>(db.p);
-    }
-    if (!cuda_ok(cudaMemcpy(din.p, in.data(), in.size() * sizeof(float),
-                            cudaMemcpyHostToDevice)) ||
-        !cuda_ok(cudaMemcpy(dw.p, weight.data(),
-                            weight.size() * sizeof(float),
-                            cudaMemcpyHostToDevice))) {
-        return false;
-    }
-    if (dbias != nullptr &&
-        !cuda_ok(cudaMemcpy(db.p, bias.data(), bias.size() * sizeof(float),
-                            cudaMemcpyHostToDevice))) {
+    ConvBufs d;
+    if (!d.upload(in, weight, bias, out.size())) {
         return false;
     }
     const std::uint32_t threads = 256;
@@ -3845,21 +3862,22 @@ bool run_conv1d_dev(bool transpose, std::span<const float> in,
     const std::uint32_t blocks = (total + threads - 1) / threads;
     if (transpose) {
         conv1d_transpose_kernel<<<blocks, threads>>>(
-            static_cast<const float*>(din.p),
-            static_cast<const float*>(dw.p), dbias,
-            static_cast<float*>(dout.p), in_len, out_ch, out_len, k, stride,
-            dilation, pad, icg, ocg);
+            static_cast<const float*>(d.in.p),
+            static_cast<const float*>(d.w.p), d.bias,
+            static_cast<float*>(d.out.p), in_len, out_ch, out_len, k,
+            stride, dilation, pad, icg, ocg);
     } else {
         conv1d_kernel<<<blocks, threads>>>(
-            static_cast<const float*>(din.p),
-            static_cast<const float*>(dw.p), dbias,
-            static_cast<float*>(dout.p), in_len, out_ch, out_len, k, stride,
-            dilation, pad, icg, ocg);
+            static_cast<const float*>(d.in.p),
+            static_cast<const float*>(d.w.p), d.bias,
+            static_cast<float*>(d.out.p), in_len, out_ch, out_len, k,
+            stride, dilation, pad, icg, ocg);
     }
     if (!cuda_ok(cudaGetLastError()) || !sync_counted()) {
         return false;
     }
-    return cuda_ok(cudaMemcpy(out.data(), dout.p, out.size() * sizeof(float),
+    return cuda_ok(cudaMemcpy(out.data(), d.out.p,
+                              out.size() * sizeof(float),
                               cudaMemcpyDeviceToHost));
 }
 
@@ -3974,40 +3992,20 @@ bool run_conv2d_dev(std::span<const float> in, std::uint32_t in_ch,
     if (blocks > 0x7fffffffu) {
         return false;  // past sm_50's gridDim.x limit (2^31 - 1)
     }
-    DevBuf din, dw, db, dout;
-    if (!din.alloc(in.size() * sizeof(float)) ||
-        !dw.alloc(weight.size() * sizeof(float)) ||
-        !dout.alloc(out.size() * sizeof(float))) {
-        return false;
-    }
-    const float* dbias = nullptr;
-    if (!bias.empty()) {
-        if (!db.alloc(bias.size() * sizeof(float))) {
-            return false;
-        }
-        dbias = static_cast<const float*>(db.p);
-    }
-    if (!cuda_ok(cudaMemcpy(din.p, in.data(), in.size() * sizeof(float),
-                            cudaMemcpyHostToDevice)) ||
-        !cuda_ok(cudaMemcpy(dw.p, weight.data(),
-                            weight.size() * sizeof(float),
-                            cudaMemcpyHostToDevice))) {
-        return false;
-    }
-    if (dbias != nullptr &&
-        !cuda_ok(cudaMemcpy(db.p, bias.data(), bias.size() * sizeof(float),
-                            cudaMemcpyHostToDevice))) {
+    ConvBufs d;
+    if (!d.upload(in, weight, bias, out.size())) {
         return false;
     }
     conv2d_kernel<<<static_cast<unsigned>(blocks),
                     static_cast<unsigned>(threads)>>>(
-        static_cast<const float*>(din.p), static_cast<const float*>(dw.p),
-        dbias, static_cast<float*>(dout.p), in_h, in_w, out_ch, out_h,
+        static_cast<const float*>(d.in.p), static_cast<const float*>(d.w.p),
+        d.bias, static_cast<float*>(d.out.p), in_h, in_w, out_ch, out_h,
         out_w, kh, kw, stride, pad, icg, ocg);
     if (!cuda_ok(cudaGetLastError()) || !sync_counted()) {
         return false;
     }
-    return cuda_ok(cudaMemcpy(out.data(), dout.p, out.size() * sizeof(float),
+    return cuda_ok(cudaMemcpy(out.data(), d.out.p,
+                              out.size() * sizeof(float),
                               cudaMemcpyDeviceToHost));
 }
 

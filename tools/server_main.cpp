@@ -15,6 +15,7 @@
 #include "backend_cli.hpp"
 #include "cli_spec.hpp"
 #include "locus/engine/disk_prefix_key.hpp"
+#include "locus/pipeline/handshake.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/model/transformer.hpp"
 #include "locus/server/server.hpp"
@@ -164,6 +165,11 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         std::fprintf(stderr, "%s: %s\n", argv[0], e.c_str());
         return 2;
     }
+    if (args.auth_helper.empty() && !args.auth_helper_args.empty()) {
+        std::fprintf(stderr, "%s: --auth-helper-arg needs --auth-helper\n",
+                     argv[0]);
+        return 2;
+    }
     if (args.positional.empty()) {
         std::fprintf(stderr,
                      "usage: %s [--backend NAME] <model.gguf> "
@@ -257,11 +263,17 @@ OpenAI + Anthropic compatible inference server (default port 8080):
                 std::uint64_t{args.prefix_cache_disk_mib} << 20, g,
                 model_path, model, args.kv_type);
         }
+        if (opt.engine.disk_prefix && !args.prefix_cache_key_file.empty()) {
+            opt.engine.disk_prefix->set_mac_key(
+                locus::pipeline::read_key_file(args.prefix_cache_key_file));
+        }
         opt.chat_template =
             locus::chat::ChatTemplate::from_gguf(g);
         if (!args.metrics_path.empty()) {
             opt.metrics_path = args.metrics_path;
         }
+        opt.auth_helper_argv = args.auth_helper;
+        opt.max_conns_per_ip = args.max_conns_per_ip;
         // Capped at a day, so the milliseconds fit in 32 bits.
         opt.sse_keepalive_ms =
             std::min<std::uint32_t>(args.sse_keepalive, 86400) * 1000;
@@ -293,15 +305,30 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         }
         // An IPv6 address in brackets, so "[::1]:8080" reads unambiguously.
         const bool v6 = args.host.find(':') != std::string::npos;
-        std::fprintf(stderr, "locus-server listening on %s%s%s:%d\n",
-                     v6 ? "[" : "", args.host.c_str(), v6 ? "]" : "", port);
+        if (args.host.empty()) {
+            std::fprintf(stderr,
+                         "locus-server listening on every interface, port "
+                         "%d\n",
+                         port);
+        } else {
+            std::fprintf(stderr, "locus-server listening on %s%s%s:%d\n",
+                         v6 ? "[" : "", args.host.c_str(), v6 ? "]" : "",
+                         port);
+        }
         const bool loopback = args.host == "127.0.0.1" ||
                               args.host == "::1" ||
                               args.host == "localhost";
+        if (!loopback && opt.auth_helper_argv.empty()) {
+            std::fprintf(stderr,
+                         "warning: not loopback and no --auth-helper: "
+                         "anyone who can reach this server can use it\n");
+        }
         if (loopback && !reg.router_host.empty()) {
             std::fprintf(stderr,
-                         "warning: --host %s is loopback only; a router on "
-                         "another machine cannot reach this server\n",
+                         "warning: listening on %s, loopback only (the "
+                         "default); a router on another machine cannot "
+                         "reach this server: pass --host with its "
+                         "address, or --host '*'\n",
                          args.host.c_str());
         }
         // Registers a moment after this, once listen has bound, and

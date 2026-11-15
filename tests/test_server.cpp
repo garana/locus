@@ -213,6 +213,91 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
         REQUIRE(content[0]["top_logprobs"].size() == 2);
     }
 
+    // i#625 F2: a JSON schema about 1000 levels deep, or tool parameters
+    // about 3000 deep, crashed the server (dump and copy recurse once per
+    // level). The bounded parse answers 400 before anything recurses, and
+    // the server keeps serving.
+    SECTION("deeply nested request JSON is a 400, not a crash") {
+        std::string deep;
+        for (int i = 0; i < 3000; ++i) deep += "{\"a\":";
+        deep += "1" + std::string(3000, '}');
+        const std::string msgs =
+            R"([{"role":"user","content":"Once upon a time"}])";
+        for (const std::string& body :
+             {R"({"messages":)" + msgs + R"(,"max_tokens":2,)" +
+                  R"("response_format":{"type":"json_schema",)" +
+                  R"("json_schema":{"name":"x","schema":)" + deep + "}}}",
+              R"({"messages":)" + msgs + R"(,"max_tokens":2,"tools":[)" +
+                  R"({"type":"function","function":{"name":"f",)" +
+                  R"("parameters":)" + deep + "}}]}",
+              R"({"messages":[{"role":"user","content":)" +
+                  std::string(50000, '[') + "1" +
+                  std::string(50000, ']') + "}]}"}) {
+            auto res = client.Post("/v1/chat/completions", body,
+                                   "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 400);
+            REQUIRE(res->body.find("nested deeper") != std::string::npos);
+        }
+        // Still serving.
+        json ok{{"prompt", "Once upon a time"}, {"max_tokens", 2}};
+        auto res = client.Post("/v1/completions", ok.dump(),
+                               "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+    }
+
+    // i#625 F6: a reply holds max_tokens x (top + 1) entries, so the
+    // counts are capped at OpenAI's limits and a negative one is a 400
+    // (top_logprobs -1 used to wrap to 2^32 - 1, the whole vocabulary).
+    SECTION("logprobs counts outside OpenAI's limits are a 400") {
+        const json msgs = json::array(
+            {{{"role", "user"}, {"content", "Once upon a time"}}});
+        for (const json& top : {json(-1), json(21), json(2.5), json("3")}) {
+            INFO(top.dump());
+            json req{{"messages", msgs},
+                     {"max_tokens", 2},
+                     {"logprobs", true},
+                     {"top_logprobs", top}};
+            auto res = client.Post("/v1/chat/completions", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 400);
+        }
+        for (const json& n : {json(-1), json(6), json(1000000)}) {
+            INFO(n.dump());
+            json req{{"prompt", "Once upon a time"},
+                     {"max_tokens", 2},
+                     {"logprobs", n}};
+            auto res = client.Post("/v1/completions", req.dump(),
+                                   "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 400);
+        }
+        // The limits themselves pass, and off stays off.
+        json top20{{"messages", msgs},
+                   {"max_tokens", 2},
+                   {"logprobs", true},
+                   {"top_logprobs", 20}};
+        auto ok = client.Post("/v1/chat/completions", top20.dump(),
+                              "application/json");
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+        json five{{"prompt", "Once upon a time"},
+                  {"max_tokens", 2},
+                  {"logprobs", 5}};
+        ok = client.Post("/v1/completions", five.dump(), "application/json");
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+        json off{{"prompt", "Once upon a time"},
+                 {"max_tokens", 2},
+                 {"logprobs", nullptr}};
+        ok = client.Post("/v1/completions", off.dump(), "application/json");
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+        REQUIRE(!json::parse(ok->body)["choices"][0].contains("logprobs"));
+    }
+
     // i#279: the Antigravity SDK sends only max_completion_tokens;
     // without it the limit fell back to 16.
     SECTION("chat max_completion_tokens sets the output limit") {
@@ -2672,6 +2757,19 @@ TEST_CASE("image input on a text-only model is a 400", "[server][image]") {
     REQUIRE(b);
     REQUIRE(b->status == 400);
     REQUIRE(json::parse(b->body)["type"] == "error");
+
+    // i#625 F14: past 8 images a request is refused while it is parsed,
+    // before any image is decoded or run through a vision tower.
+    json many = openai_image_chat(url, "What are these?");
+    json& parts = many["messages"][0]["content"];
+    while (parts.size() < 9 + 1) {
+        parts.insert(parts.begin(), parts[0]);
+    }
+    auto c = client.Post("/v1/chat/completions", many.dump(),
+                         "application/json");
+    REQUIRE(c);
+    REQUIRE(c->status == 400);
+    REQUIRE(c->body.find("at most 8 images") != std::string::npos);
 }
 
 // i#241 end to end on Janus-Pro: the reference image and the golden

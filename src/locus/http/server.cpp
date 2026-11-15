@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <optional>
 #include <thread>
 
 #include "locus/pipeline/net.hpp"
@@ -30,6 +32,20 @@ namespace {
 // them to the pool, which is the starvation the fast path exists to
 // remove.
 constexpr int kClassifyDeadlineMs = 100;
+
+// How often a connection whose fast-path request is still arriving is
+// peeked again. Its buffered bytes keep it readable, so the poll set
+// cannot wait for "more" on it.
+constexpr int kRecheckMs = 5;
+
+// The most a fast-path request may be (head and body): a peek of this
+// many bytes that is not a whole request goes to the pool.
+constexpr std::size_t kFastPeekBytes = 16 * 1024;
+
+// The most an inline fast-path response may take to write in all; a
+// client that reads it slower is dropped. /metrics, the largest, is
+// usually under the socket send buffer and goes out at once.
+constexpr int kInlineWriteMs = 1000;
 
 // send() flag that suppresses SIGPIPE on a write to a closed peer, where
 // the platform offers it (Linux). On macOS/BSD the same is achieved with
@@ -74,13 +90,22 @@ std::string_view trim_ows(std::string_view s) {
     return s.substr(b, e - b);
 }
 
+// Set by the acceptor while it serves a fast-path request inline
+// (i#837): a total deadline for every write of that response, so a
+// client that reads a few bytes at a time cannot hold the sole acceptor
+// while the response drains. Pool threads leave it unset: their writes
+// keep only the per-wait deadline (a long stream is fine there).
+thread_local std::optional<std::chrono::steady_clock::time_point>
+    inline_write_until;
+
 /**
  * Writes all of `data`, bouncing on EAGAIN via poll(POLLOUT). The
  * deadline bounds a single BLOCKED write (one poll wait), NOT the total
  * time: a write that keeps making progress is never cut off, which is
  * what lets a long SSE stream and a slow prefill through. A write that
  * cannot make progress for `deadline_ms`, a shutdown, or a dead peer all
- * return false. @returns true iff every byte was sent.
+ * return false; on the acceptor's inline serve, so does running past
+ * inline_write_until. @returns true iff every byte was sent.
  */
 bool write_all_deadline(int fd, std::string_view data, int wake_r,
                         int deadline_ms,
@@ -89,6 +114,18 @@ bool write_all_deadline(int fd, std::string_view data, int wake_r,
     while (off < data.size()) {
         if (stopping.load()) {
             return false;
+        }
+        if (inline_write_until) {
+            const auto left =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    *inline_write_until - std::chrono::steady_clock::now())
+                    .count();
+            if (left <= 0) return false;  // the inline total ran out
+            // A negative deadline_ms is poll's "forever": the total
+            // still applies then.
+            deadline_ms = deadline_ms < 0
+                              ? static_cast<int>(left)
+                              : std::min(deadline_ms, static_cast<int>(left));
         }
         const ssize_t n =
             ::send(fd, data.data() + off, data.size() - off, kSendFlags);
@@ -288,6 +325,13 @@ int Server::start() {
         return -1;
     }
     make_nonblocking(listen_fd_);
+    // i#851: refused peers' SYNs are dropped in the kernel; the check at
+    // accept stays as the second layer.
+    if (!locus::pipeline::attach_allow_filter(listen_fd_, cfg_.allow)) {
+        std::fprintf(stderr,
+                     "http server: --allow is not in the kernel (filter "
+                     "refused); it applies at accept\n");
+    }
     // Re-issue listen() to set our backlog (listen_on uses a small fixed
     // one): connections beyond the worker pool queue here, and beyond the
     // backlog the kernel refuses them -- no userspace buffer, no 503.
@@ -364,14 +408,14 @@ void Server::stop() {
     // No lock: the acceptor is the only writer and it has been joined
     // above, so nothing can touch unclassified_ now.
     for (const Unclassified& u : unclassified_) {
-        ::close(u.fd);
+        close_conn(u.fd, u.peer_ip);
     }
     unclassified_.clear();
     // Close any connections the acceptor queued but no worker served.
     {
         std::lock_guard<std::mutex> lk(handoff_mu_);
         while (!handoff_.empty()) {
-            ::close(handoff_.front().fd);
+            close_conn(handoff_.front().fd, handoff_.front().peer_ip);
             handoff_.pop_front();
         }
     }
@@ -409,7 +453,7 @@ void Server::worker_loop() {
             handoff_.pop_front();
         }
         serve_connection_guarded(c.fd, c.peer_ip, false);
-        ::close(c.fd);
+        close_conn(c.fd, c.peer_ip);
     }
 }
 
@@ -425,37 +469,55 @@ void Server::serve_connection_guarded(int fd, const std::string& peer_ip,
     }
 }
 
-bool Server::peek_request_line(int fd, std::string& method,
-                               std::string& target) {
-    // Non-consuming peek of "METHOD TARGET ..." from a fd the poll set
-    // has already reported readable. There is deliberately NO poll here:
-    // this used to wait up to 100 ms per connection, which serialized the
-    // sole acceptor at ~100 ms per silent client (i#88). Waiting for
-    // readability is now the poll set's job; the window stays small, so
-    // anything not a full request line is treated as non-fast and handed
-    // to the pool, where the head deadline rules.
-    char buf[256];
-    const ssize_t n = ::recv(fd, buf, sizeof(buf), MSG_PEEK | MSG_DONTWAIT);
+Server::Classified Server::peek_classify(int fd) {
+    // Non-consuming peek from a fd that is readable (or was, for a
+    // partial one). There is deliberately NO poll here: this used to wait
+    // up to 100 ms per connection, which serialized the sole acceptor at
+    // ~100 ms per silent client (i#88). Waiting is the poll set's job.
+    // One buffer for every peek (acceptor-only): a partial connection is
+    // peeked every 5 ms, and a fresh zeroed 16 KiB each time adds up.
+    peek_buf_.resize(kFastPeekBytes);
+    const ssize_t n = ::recv(fd, peek_buf_.data(), peek_buf_.size(),
+                             MSG_PEEK | MSG_DONTWAIT);
     if (n <= 0) {
-        return false;
+        return Classified::kPool;  // EOF or an error: the pool deals
     }
-    const std::string_view line(buf, static_cast<std::size_t>(n));
+    const std::string_view buf(peek_buf_.data(), static_cast<std::size_t>(n));
+    const bool full = buf.size() == kFastPeekBytes;
+    // The request line first, so a non-fast request goes to the pool at
+    // once, however much of it is still on its way.
+    const auto eol = buf.find("\r\n");
+    if (eol == std::string_view::npos) {
+        return full ? Classified::kPool : Classified::kWait;
+    }
+    const std::string_view line(buf.data(), eol);
     const auto sp1 = line.find(' ');
-    if (sp1 == std::string_view::npos) {
-        return false;
-    }
-    const auto sp2 = line.find(' ', sp1 + 1);
+    const auto sp2 = sp1 == std::string_view::npos
+                         ? std::string_view::npos
+                         : line.find(' ', sp1 + 1);
     if (sp2 == std::string_view::npos) {
-        return false;  // request-target not fully in the peeked window
+        return Classified::kPool;  // garbled: the pool answers 400
     }
     std::string_view tgt = line.substr(sp1 + 1, sp2 - sp1 - 1);
     const auto q = tgt.find('?');  // match on the path, drop any query
     if (q != std::string_view::npos) {
         tgt = tgt.substr(0, q);
     }
-    method.assign(line.substr(0, sp1));
-    target.assign(tgt);
-    return true;
+    if (!cfg_.fast_path(line.substr(0, sp1), tgt)) {
+        return Classified::kPool;
+    }
+    // A fast route: inline only once the whole request is buffered, so
+    // serving it never waits on the client.
+    ParseContext ctx;
+    Request req;
+    const ParseResult r = parse_request(buf, cfg_.limits, ctx, req);
+    if (r.state == ParseState::kComplete) {
+        return Classified::kServe;
+    }
+    if (r.state == ParseState::kError || full) {
+        return Classified::kPool;
+    }
+    return Classified::kWait;
 }
 
 bool Server::enqueue_handoff(int fd, const std::string& peer_ip) {
@@ -496,11 +558,17 @@ void Server::accept_one_conn() {
         ::close(fd);
         return;
     }
+    // i#625 F21: a peer at its cap is closed at once, so one address
+    // cannot hold every worker (and the backlog) by itself.
+    if (!take_ip_slot(peer_ip)) {
+        ::close(fd);
+        return;
+    }
     // Nothing to classify without a fast_path predicate: straight to the
     // pool, exactly as before the fast path existed.
     if (!cfg_.fast_path) {
         if (!enqueue_handoff(fd, peer_ip)) {
-            ::close(fd);
+            close_conn(fd, peer_ip);
         }
         return;
     }
@@ -514,7 +582,7 @@ void Server::accept_one_conn() {
             : 128;
     if (unclassified_.size() >= cap) {
         if (!enqueue_handoff(fd, peer_ip)) {
-            ::close(fd);
+            close_conn(fd, peer_ip);
         }
         return;
     }
@@ -531,6 +599,15 @@ void Server::classify_ready(int fd) {
     if (it == unclassified_.end()) {
         return;  // already classified this iteration
     }
+    const Classified c = peek_classify(fd);
+    if (c == Classified::kWait) {
+        // Not all here yet: peek again shortly, until the deadline
+        // (expire_unclassified then hands it to the pool).
+        it->partial = true;
+        it->recheck = std::chrono::steady_clock::now() +
+                      std::chrono::milliseconds(kRecheckMs);
+        return;
+    }
     const std::string peer_ip = it->peer_ip;  // copy: unwatch erases it
     unwatch_unclassified(fd);
     // Fast path: serve a cheap control route inline so it is never queued
@@ -540,15 +617,29 @@ void Server::classify_ready(int fd) {
     // close, because serve_connection is a keep-alive loop and an adopted
     // connection could otherwise carry a LATER non-fast (inference)
     // request and run it inline, stalling accept.
-    std::string method, target;
-    if (peek_request_line(fd, method, target) &&
-        cfg_.fast_path(method, target)) {
-        serve_connection_guarded(fd, peer_ip, /*single_request=*/true);
-        ::close(fd);
+    if (c == Classified::kServe) {
+        // The response's writes share one total deadline (i#837): the
+        // request is all here, so the only wait left is the client's
+        // reading, and a slow reader must not hold the acceptor.
+        // A guard, so nothing can leave a stale deadline behind for
+        // the next inline serve.
+        struct InlineDeadline {
+            InlineDeadline() {
+                inline_write_until =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(kInlineWriteMs);
+            }
+            ~InlineDeadline() { inline_write_until.reset(); }
+        };
+        {
+            const InlineDeadline deadline;
+            serve_connection_guarded(fd, peer_ip, /*single_request=*/true);
+        }
+        close_conn(fd, peer_ip);
         return;
     }
     if (!enqueue_handoff(fd, peer_ip)) {
-        ::close(fd);
+        close_conn(fd, peer_ip);
     }
 }
 
@@ -567,8 +658,37 @@ void Server::expire_unclassified() {
     for (const Pending& p : due) {
         unwatch_unclassified(p.fd);
         if (!enqueue_handoff(p.fd, p.peer_ip)) {
-            ::close(p.fd);
+            close_conn(p.fd, p.peer_ip);
         }
+    }
+}
+
+bool Server::take_ip_slot(const std::string& peer_ip) {
+    if (cfg_.max_conns_per_ip == 0) {
+        return true;
+    }
+    std::lock_guard lk(per_ip_mu_);
+    const auto it = per_ip_.find(peer_ip);
+    if (it == per_ip_.end()) {
+        per_ip_.emplace(peer_ip, 1);
+        return true;
+    }
+    if (it->second >= cfg_.max_conns_per_ip) {
+        return false;
+    }
+    ++it->second;
+    return true;
+}
+
+void Server::close_conn(int fd, const std::string& peer_ip) {
+    ::close(fd);
+    if (cfg_.max_conns_per_ip == 0) {
+        return;
+    }
+    std::lock_guard lk(per_ip_mu_);
+    const auto it = per_ip_.find(peer_ip);
+    if (it != per_ip_.end() && --it->second == 0) {
+        per_ip_.erase(it);
     }
 }
 
@@ -595,15 +715,20 @@ void Server::acceptor_loop() {
         pfds.push_back(pollfd{listen_fd_, POLLIN, 0});
         pfds.push_back(pollfd{wake_r_, POLLIN, 0});
         for (const Unclassified& u : unclassified_) {
-            pfds.push_back(pollfd{u.fd, POLLIN, 0});
+            if (!u.partial) {
+                pfds.push_back(pollfd{u.fd, POLLIN, 0});
+            }
         }
         // Sleep until something is ready, or until the nearest
-        // classification deadline falls due.
+        // classification deadline or partial recheck falls due.
         int timeout_ms = -1;
         if (!unclassified_.empty()) {
             auto nearest = unclassified_.front().deadline;
             for (const Unclassified& u : unclassified_) {
                 nearest = std::min(nearest, u.deadline);
+                if (u.partial) {
+                    nearest = std::min(nearest, u.recheck);
+                }
             }
             const auto left =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -628,6 +753,12 @@ void Server::acceptor_loop() {
         for (std::size_t i = 2; i < pfds.size(); ++i) {
             if (pfds[i].revents != 0) {
                 ready.push_back(pfds[i].fd);
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        for (const Unclassified& u : unclassified_) {
+            if (u.partial && u.recheck <= now) {
+                ready.push_back(u.fd);
             }
         }
         for (const int fd : ready) {

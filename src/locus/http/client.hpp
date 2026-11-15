@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <string>
@@ -145,6 +146,11 @@ struct ClientOptions {
      * on each stall, not on the whole write (a server that takes a
      * byte now and then keeps a large body going). */
     int write_timeout_ms = 60000;
+    /** Longest time for one whole request, from begin() through the
+     *  last body byte; 0 means none (a proxied stream can run long).
+     *  A server that sends a byte now and then stays under the read
+     *  timeout, not under this. */
+    int total_timeout_ms = 0;
     ResponseLimits limits;
 };
 
@@ -220,6 +226,17 @@ class Client {
     /** Reads into buf_; @returns bytes read, 0 at EOF, -1 on error or
      * timeout (err set). */
     long read_some(std::string& err);
+    /**
+     * @param ms A wait's own cap (0: none).
+     * @returns the poll timeout for that wait, cut to what is left of
+     *     total_timeout_ms; -1 for no limit, 0 once the total ran out.
+     */
+    int wait_ms(int ms) const;
+    /** @returns whether total_timeout_ms ran out for this request. */
+    bool expired() const;
+    /** @returns whether a wait of `t` (from wait_ms(ms)) was cut by the
+     *  total, so its timeout is the request's, not the wait's own. */
+    bool total_bound(int ms, int t) const;
 
     std::string host_;
     int port_;
@@ -230,6 +247,8 @@ class Client {
      * its body is read. */
     ResponseHead pending_;
     bool active_ = false;
+    /** When the current request's total_timeout_ms runs out. */
+    std::chrono::steady_clock::time_point deadline_{};
 };
 
 }  // namespace locus::http
