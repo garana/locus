@@ -76,6 +76,7 @@ add_executable(locus_tests
     test_responses.cpp
     test_server.cpp
     test_server_errors.cpp
+    test_request_checks.cpp
     test_tools.cpp
     test_vulkan.cpp
     test_vulkan_attn.cpp
