@@ -78,6 +78,7 @@ int LoopServer::start() {
     wake_w_ = fds[1];
     make_nonblocking(wake_r_);
     make_nonblocking(wake_w_);
+    wake_list_ = std::make_shared<WakeList>(wake_w_);
     listen_fd_ = locus::pipeline::listen_on(cfg_.host, cfg_.port, &bound_port_);
     if (listen_fd_ < 0) {
         return -1;
@@ -156,16 +157,7 @@ void LoopServer::io_loop() {
     std::vector<int> fds;
     while (!stopping_.load()) {
         // Sleep to the nearest connection deadline (at most a second).
-        const auto now = Clock::now();
-        auto timeout = std::chrono::milliseconds(1000);
-        for (const auto& [fd, c] : conns_) {
-            const auto d = c.conn->deadline();
-            const auto left =
-                std::chrono::duration_cast<std::chrono::milliseconds>(d - now);
-            timeout = std::max(std::chrono::milliseconds(0),
-                               std::min(timeout, left));
-        }
-        if (poller.wait(events, static_cast<int>(timeout.count())) < 0) {
+        if (poller.wait(events, next_timeout_ms()) < 0) {
             continue;
         }
         bool woke = false;
@@ -188,24 +180,17 @@ void LoopServer::io_loop() {
             if (stopping_.load()) {
                 break;
             }
-            fds.clear();
-            for (const auto& [fd, c] : conns_) fds.push_back(fd);
-            for (const int fd : fds) {
-                if (const auto it = conns_.find(fd); it != conns_.end()) {
-                    apply(poller, fd, it->second.conn->on_wake());
-                }
+            // Only the connections whose replies pushed news (i#990).
+            for (const std::uint64_t id : wake_list_->take()) {
+                const auto f = fd_of_.find(id);
+                if (f == fd_of_.end()) continue;  // closed since
+                const auto it = conns_.find(f->second);
+                if (it == conns_.end()) continue;
+                visits_.fetch_add(1, std::memory_order_relaxed);
+                apply(poller, f->second, it->second.conn->on_wake());
             }
         }
-        const auto later = Clock::now();
-        fds.clear();
-        for (const auto& [fd, c] : conns_) {
-            if (c.conn->deadline() <= later) fds.push_back(fd);
-        }
-        for (const int fd : fds) {
-            if (const auto it = conns_.find(fd); it != conns_.end()) {
-                apply(poller, fd, it->second.conn->on_timeout());
-            }
-        }
+        run_timers(poller);
     }
     fds.clear();
     for (const auto& [fd, c] : conns_) fds.push_back(fd);
@@ -252,6 +237,9 @@ void LoopServer::accept_ready(sys::Poller& poller) {
         lc.idle_timeout_ms = cfg_.idle_timeout_ms;
         lc.write_deadline_ms = cfg_.write_deadline_ms;
         lc.wake_fd = wake_w_;
+        const std::uint64_t id = next_id_++;
+        lc.wake_list = wake_list_;
+        lc.wake_id = id;
         auto conn = std::make_unique<LoopConnection>(
             fd, lc,
             AsyncLoopHandler(
@@ -259,7 +247,68 @@ void LoopServer::accept_ready(sys::Poller& poller) {
                     dispatch(req, std::move(r));
                 }));
         poller.add(fd);
-        conns_.emplace(fd, Conn{std::move(conn), peer_ip});
+        Conn c;
+        c.conn = std::move(conn);
+        c.peer_ip = peer_ip;
+        c.id = id;
+        const auto it = conns_.emplace(fd, std::move(c)).first;
+        fd_of_[id] = fd;
+        arm(it->second);
+    }
+}
+
+void LoopServer::arm(Conn& c) {
+    const Clock::time_point d = c.conn->deadline();
+    if (d < c.queued) {
+        timers_.push({d, c.id});
+        c.queued = d;
+    }
+}
+
+int LoopServer::next_timeout_ms() {
+    while (!timers_.empty()) {
+        const auto [t, id] = timers_.top();
+        const auto f = fd_of_.find(id);
+        const auto it =
+            f == fd_of_.end() ? conns_.end() : conns_.find(f->second);
+        if (it != conns_.end() && it->second.queued == t) {
+            const auto left =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    t - Clock::now());
+            return static_cast<int>(
+                std::clamp<long long>(left.count(), 0, 1000));
+        }
+        timers_.pop();  // its connection closed, or a later entry replaced it
+    }
+    return 1000;
+}
+
+void LoopServer::run_timers(sys::Poller& poller) {
+    const auto now = Clock::now();
+    // Take the due entries first: what on_timeout queues waits a turn.
+    std::vector<std::uint64_t> due;
+    while (!timers_.empty() && timers_.top().first <= now) {
+        const auto [t, id] = timers_.top();
+        timers_.pop();
+        const auto f = fd_of_.find(id);
+        if (f == fd_of_.end()) continue;
+        const auto it = conns_.find(f->second);
+        if (it == conns_.end() || it->second.queued != t) continue;  // stale
+        it->second.queued = Clock::time_point::max();
+        due.push_back(id);
+    }
+    for (const std::uint64_t id : due) {
+        const auto f = fd_of_.find(id);
+        if (f == fd_of_.end()) continue;
+        const int fd = f->second;
+        const auto it = conns_.find(fd);
+        if (it == conns_.end()) continue;
+        visits_.fetch_add(1, std::memory_order_relaxed);
+        if (it->second.conn->deadline() > now) {
+            arm(it->second);  // it moved later: look again then
+            continue;
+        }
+        apply(poller, fd, it->second.conn->on_timeout());
     }
 }
 
@@ -278,12 +327,16 @@ void LoopServer::apply(sys::Poller& poller, int fd,
             poller.modify(fd, d);
         }
     };
+    // Every event, wake and timeout comes through here: its deadline may
+    // have moved earlier.
     switch (next) {
         case LoopConnection::Next::kRead:
             watch(sys::Poller::Dir::kRead);
+            arm(c);
             return;
         case LoopConnection::Next::kWrite:
             watch(sys::Poller::Dir::kWrite);
+            arm(c);
             return;
         case LoopConnection::Next::kIdle:
             // A half-closed client's socket stays readable: watch nothing
@@ -292,6 +345,7 @@ void LoopServer::apply(sys::Poller& poller, int fd,
                 poller.remove(fd);
                 c.idle = true;
             }
+            arm(c);
             return;
         case LoopConnection::Next::kClose:
             close_conn(poller, fd);
@@ -305,6 +359,7 @@ void LoopServer::close_conn(sys::Poller& poller, int fd) {
         return;
     }
     const std::string ip = it->second.peer_ip;
+    fd_of_.erase(it->second.id);  // its timers_ entries go stale
     conns_.erase(it);  // cancels a pending reply
     poller.remove(fd);
     ::close(fd);

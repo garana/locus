@@ -6,8 +6,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -56,23 +58,43 @@ class LoopServer : public Service {
     void stop() override;
     void wait() override;
 
+    /** @returns How many times the I/O thread has looked at one
+     *  connection for a wake or a deadline (tests: the work per chunk
+     *  must not grow with the connection count, i#990). */
+    std::uint64_t visits() const { return visits_.load(); }
+
  private:
     /** One request for the pool. */
     struct Job {
         Request req;
         std::shared_ptr<LoopReply> reply;
     };
+    using Clock = std::chrono::steady_clock;
     struct Conn {
         std::unique_ptr<LoopConnection> conn;
         std::string peer_ip;
+        std::uint64_t id = 0;  ///< never reused (WakeList, timers_)
         bool idle = false;  ///< out of the poller (Next::kIdle)
+        /** The time of its live timers_ entry (max: none). */
+        Clock::time_point queued = Clock::time_point::max();
     };
+    /** A deadline to look at: (when, connection id). Entries go stale
+     *  when the deadline moves; a pop checks against Conn::queued. */
+    using Timer = std::pair<Clock::time_point, std::uint64_t>;
 
     void io_loop();
     void accept_ready(sys::Poller& poller);
     /** Applies a LoopConnection's Next to fd (and closes it on kClose). */
     void apply(sys::Poller& poller, int fd, LoopConnection::Next next);
     void close_conn(sys::Poller& poller, int fd);
+    /** Queues c's deadline when it moved earlier than its live entry (a
+     *  later move is found when the entry pops). */
+    void arm(Conn& c);
+    /** @returns The poll timeout: to the nearest live deadline, at most a
+     *  second (drops stale entries off the top). */
+    int next_timeout_ms();
+    /** Calls on_timeout on each connection whose deadline has passed. */
+    void run_timers(sys::Poller& poller);
     /** LoopConnection's handler: a fast path inline, else a pool job. */
     void dispatch(const Request& req, std::shared_ptr<LoopReply> reply);
     void worker_loop();
@@ -94,9 +116,17 @@ class LoopServer : public Service {
     std::thread io_;
     std::vector<std::thread> workers_;
 
+    /** Replies push their connection's id here (i#990). */
+    std::shared_ptr<WakeList> wake_list_;
+
     // I/O thread only.
     std::unordered_map<int, Conn> conns_;
+    std::unordered_map<std::uint64_t, int> fd_of_;  ///< Conn::id -> fd
+    std::uint64_t next_id_ = 1;
+    std::priority_queue<Timer, std::vector<Timer>, std::greater<Timer>>
+        timers_;
     std::unordered_map<std::string, std::size_t> per_ip_;
+    std::atomic<std::uint64_t> visits_{0};
 
     std::mutex jobs_mu_;
     std::condition_variable jobs_cv_;

@@ -269,3 +269,56 @@ TEST_CASE("loop server stops with a stream producer blocked on its client",
     CHECK(returned.load());
     ::close(fd);
 }
+
+// i#990: a reply names its connection (WakeList) and deadlines sit in a
+// heap, so the I/O thread's work per chunk does not grow with the idle
+// connections it holds. Before, each wake ran on_wake on every
+// connection and each turn read every deadline: here about 200 visits a
+// chunk instead of one or two.
+TEST_CASE("loop server: a stream's chunks cost the same with idle clients",
+          "[http][loop_server]") {
+    constexpr int kChunks = 40;
+    const auto slow = [](const Request& req, ServerResponse& res,
+                         const RequestContext&) {
+        if (req.path != "/slow") {
+            res.set_content("hello\n", "text/plain");
+            return;
+        }
+        res.set_chunked_content_provider("text/plain", [](Sink& sink) {
+            for (int i = 0; i < kChunks; ++i) {
+                sink.write("x");
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        });
+    };
+    const auto visits_per_stream = [&](int idle) {
+        ServerConfig cfg;
+        cfg.idle_timeout_ms = 60000;
+        Running r(cfg, slow);
+        std::vector<int> idle_fds;
+        for (int i = 0; i < idle; ++i) {
+            idle_fds.push_back(dial(r.port));
+        }
+        // Every idle client is accepted (it answers in order after them).
+        int fd = dial(r.port);
+        send_all(fd, get("/hello"));
+        CHECK(read_to_close(fd).find("hello\n") != std::string::npos);
+        ::close(fd);
+        const std::uint64_t before = r.server.visits();
+        fd = dial(r.port);
+        send_all(fd, get("/slow"));
+        const std::string got = read_to_close(fd);
+        ::close(fd);
+        const std::uint64_t used = r.server.visits() - before;
+        CHECK(got.find("0\r\n\r\n") != std::string::npos);  // whole stream
+        for (const int f : idle_fds) ::close(f);
+        return used;
+    };
+    const std::uint64_t alone = visits_per_stream(0);
+    const std::uint64_t crowded = visits_per_stream(200);
+    INFO("alone=" << alone << " crowded=" << crowded);
+    CHECK(alone <= 4 * kChunks);
+    // The 200 idle clients add no work per chunk (their idle deadlines
+    // are a minute away; the slack covers timing).
+    CHECK(crowded <= alone + kChunks);
+}
