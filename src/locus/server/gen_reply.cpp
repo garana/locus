@@ -247,7 +247,6 @@ void GenPump::run() {
     }
 }
 
-
 void GenPump::drop(Entry& e, int status) {
     loop_.unfollow(e.id);
     loop_.cancel(e.id);
