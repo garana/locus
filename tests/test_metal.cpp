@@ -454,10 +454,12 @@ TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
         SKIP("no Metal device");
     }
     int ran = 0;
-    // Llama Q4_K_M and Q8_0, and qwen2's attention (biases, NEOX RoPE).
+    // Llama Q4_K_M and Q8_0, qwen2's attention (biases, NEOX RoPE), and
+    // MoE: routed and gated shared experts (Qwen1.5-MoE), qwen3moe.
     for (const char* name :
          {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf",
-          "qwen2.5-0.5b-instruct-q8_0.gguf"}) {
+          "qwen2.5-0.5b-instruct-q8_0.gguf", "Qwen1.5-MoE-A2.7B.Q4_K_M.gguf",
+          "qwen3-coder-30b-a3b-instruct-q4_k_m.gguf"}) {
         const std::string path =
             std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
         if (!std::filesystem::exists(path)) {

@@ -176,12 +176,15 @@ struct AxpyRouteParams {
     std::uint32_t n, slot;
 };
 struct MoeSumParams {
-    std::uint32_t n, k;
+    std::uint32_t n, k, n_tok;
+};
+struct SharedAddParams {
+    std::uint32_t n, n_tok, gated, gate_at;
 };
 struct RouteParams {
     std::uint32_t n_expert, k, softmax, bias_on_logit, has_bias, norm;
     float scale;
-    std::uint32_t shared_gate;
+    std::uint32_t shared_gate, n_tok, logit_stride;
 };
 
 constexpr std::uint32_t kNormGroup = 256;
@@ -437,7 +440,9 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     has_bias ? 1u : 0u,
                     hp_.expert_weights_norm ? 1u : 0u,
                     hp_.expert_weights_scale,
-                    gated ? 1u : 0u};
+                    gated ? 1u : 0u,
+                    1,
+                    0};
                 const Context::Arg ra[] = {
                     {&s.router, 0},
                     {has_bias ? &fbuf(lay.exp_probs_b) : &s.router, 0},
@@ -468,7 +473,7 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     ctx, d.type, d.rows, d.cols, *dr.buf, dr.off,
                     lay.down_exps.expert_bytes, s.route, 0, k, s.gate, 0,
                     g.rows, s.eout, 0, E);
-                const MoeSumParams ms{E, k};
+                const MoeSumParams ms{E, k, 1};
                 const Context::Arg ma[] = {
                     {&s.x, 0}, {&s.eout, 0}, {&s.route, 0}};
                 ctx.dispatch("moe_sum", ma, bytes_of(ms), E, 256);
@@ -670,6 +675,7 @@ struct AttnRowsParams {
 /** The prefill forward's scratch (grow-only; device_mutex). */
 struct BatchScratch {
     Context::Buffer x, xb, q, k, v, att, gate, up, cs, rows, blocks, head;
+    Context::Buffer router, route, eout;  // MoE layers
 };
 
 BatchScratch& batch_scratch() {
@@ -695,12 +701,18 @@ bool TransformerModel::metal_forward_batch(
     const std::uint32_t E = hp_.n_embd, hd = hp_.head_dim, H = hp_.n_heads,
                         KV = hp_.n_kv_heads, ff = hp_.n_ff, V = hp_.n_vocab,
                         L = hp_.n_layers;
-    // MoE layers sync on their routing every token: a chunk runs the
-    // per-token forward.
+    // MoE layers route on the GPU (moe_route a token); a selection it
+    // does not cover (group-limited, over 1024 experts, or
+    // LOCUS_METAL_MOE_ROUTE=cpu) runs the per-token forward.
     const bool any_moe = std::any_of(
         layers_.begin(), layers_.end(),
         [](const Layer& lay) { return lay.is_moe(); });
-    if (n < kPrefillMin || any_moe || !metal_forward_supported() ||
+    const char* route_env = std::getenv("LOCUS_METAL_MOE_ROUTE");
+    const bool gpu_route =
+        hp_.n_group <= 1 && hp_.n_expert <= 1024 &&
+        (route_env == nullptr || std::string_view(route_env) != "cpu");
+    if (n < kPrefillMin || (any_moe && !gpu_route) ||
+        !metal_forward_supported() ||
         cache.quantized() ||
         base + n > kAttnMaxPos || base + n > hp_.n_ctx ||
         base + n > cache.capacity(seq) || hd > kAttnGroup ||
@@ -778,8 +790,26 @@ bool TransformerModel::metal_forward_batch(
         Scratch::grow(ctx, s.k, C * kvd * 4);
         Scratch::grow(ctx, s.v, C * kvd * 4);
         Scratch::grow(ctx, s.att, C * qd * 4);
-        Scratch::grow(ctx, s.gate, C * ff * 4);
-        Scratch::grow(ctx, s.up, C * ff * 4);
+        // The FFN's widest rows: dense, a token's k experts, or the
+        // shared expert.
+        const std::uint32_t k_used = any_moe ? hp_.n_expert_used : 0;
+        std::size_t ffw = ff;
+        for (const Layer& lay : layers_) {
+            if (lay.is_moe()) {
+                ffw = std::max<std::size_t>(
+                    ffw, std::size_t{k_used} * lay.gate_exps.base.rows);
+                ffw = std::max<std::size_t>(ffw, lay.gate_shexp.rows);
+            }
+        }
+        Scratch::grow(ctx, s.gate, C * ffw * 4);
+        Scratch::grow(ctx, s.up, C * ffw * 4);
+        const std::uint32_t NR = hp_.n_expert + 1;  // a token's logits
+        if (any_moe) {
+            Scratch::grow(ctx, s.router, C * NR * 4);
+            Scratch::grow(ctx, s.route, C * (2 * std::size_t{k_used} + 1) * 4);
+            Scratch::grow(ctx, s.eout,
+                          C * std::max<std::size_t>(k_used, 1) * E * 4);
+        }
         Scratch::grow(ctx, s.cs, C * hd * 4);
         Scratch::grow(ctx, s.rows, C * L * 8);
         Scratch::grow(ctx, s.blocks, std::size_t{n_blocks} * 4);
@@ -797,10 +827,10 @@ bool TransformerModel::metal_forward_batch(
                             std::uint32_t in_stride,
                             const Context::Buffer& out,
                             std::uint32_t out_stride, bool acc,
-                            std::uint32_t m) {
+                            std::uint32_t m, std::uint64_t out_off = 0) {
             const auto r = wbuf(w);
             if (metal::record_matmul(ctx, w.type, w.rows, w.cols, m, *r.buf,
-                                     r.off, in, 0, in_stride, out, 0,
+                                     r.off, in, 0, in_stride, out, out_off,
                                      out_stride, acc)) {
                 return;
             }
@@ -810,8 +840,85 @@ bool TransformerModel::metal_forward_batch(
                 }
                 metal::record_matvec(ctx, w.type, w.rows, w.cols, *r.buf,
                                      r.off, in, t * in_stride, out,
-                                     std::uint64_t{t} * out_stride, acc);
+                                     out_off + std::uint64_t{t} * out_stride,
+                                     acc);
             }
+        };
+        // A MoE layer's FFN on m rows of s.xb into s.x: the router
+        // logits as a matmul, moe_route a token (token-major route:
+        // ids, then weights, then shared gates), each (token, pick) a
+        // matvec slot reading its token's row, the k outputs summed by
+        // their weights, then the shared expert by its gate (or 1).
+        const auto moe_rows = [&](const Layer& lay, std::uint32_t m) {
+            const std::uint32_t k = k_used;
+            mm(lay.gate_inp, s.xb, E, s.router, NR, false, m);
+            const bool gated = lay.gate_inp_shexp.rows > 0;
+            if (gated) {
+                ctx.overlap_next();
+                mm(lay.gate_inp_shexp, s.xb, E, s.router, NR, false, m,
+                   hp_.n_expert);
+            }
+            const bool has_bias = !lay.exp_probs_b.empty();
+            const RouteParams rp{
+                hp_.n_expert,
+                k,
+                hp_.gating == GatingFunc::kSoftmax ? 1u : 0u,
+                hp_.bias_on_logit ? 1u : 0u,
+                has_bias ? 1u : 0u,
+                hp_.expert_weights_norm ? 1u : 0u,
+                hp_.expert_weights_scale,
+                gated ? 1u : 0u,
+                m,
+                NR};
+            const Context::Arg ra[] = {
+                {&s.router, 0},
+                {has_bias ? &fbuf(lay.exp_probs_b) : &s.router, 0},
+                {&s.route, 0}};
+            ctx.dispatch("moe_route", ra, bytes_of(rp), m * 1024, 1024);
+            const auto expert_buf = [&](const ExpertMat& em) {
+                return mw.map(ctx, em.base.data,
+                              em.expert_bytes * std::size_t{hp_.n_expert});
+            };
+            const auto gr = expert_buf(lay.gate_exps);
+            const auto ur = expert_buf(lay.up_exps);
+            const auto dr = expert_buf(lay.down_exps);
+            const Mat& g = lay.gate_exps.base;
+            const Mat& u = lay.up_exps.base;
+            const Mat& d = lay.down_exps.base;
+            const std::uint32_t slots = m * k;
+            metal::record_matvec_slots(ctx, g.type, g.rows, g.cols, *gr.buf,
+                                       gr.off, lay.gate_exps.expert_bytes,
+                                       s.route, 0, slots, s.xb, 0, E, s.gate,
+                                       0, g.rows, k);
+            ctx.overlap_next();
+            metal::record_matvec_slots(ctx, u.type, u.rows, u.cols, *ur.buf,
+                                       ur.off, lay.up_exps.expert_bytes,
+                                       s.route, 0, slots, s.xb, 0, E, s.up,
+                                       0, u.rows, k);
+            const SiluParams sp{slots * g.rows};
+            const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
+            ctx.dispatch("silu_mul", su, bytes_of(sp), slots * g.rows, 256);
+            metal::record_matvec_slots(ctx, d.type, d.rows, d.cols, *dr.buf,
+                                       dr.off, lay.down_exps.expert_bytes,
+                                       s.route, 0, slots, s.gate, 0, g.rows,
+                                       s.eout, 0, E);
+            const MoeSumParams ms{E, k, m};
+            const Context::Arg ma[] = {{&s.x, 0}, {&s.eout, 0}, {&s.route, 0}};
+            ctx.dispatch("moe_sum", ma, bytes_of(ms), m * E, 256);
+            if (hp_.n_expert_shared == 0) {
+                return;
+            }
+            const std::uint32_t sf = lay.gate_shexp.rows;
+            mm(lay.gate_shexp, s.xb, E, s.gate, sf, false, m);
+            ctx.overlap_next();
+            mm(lay.up_shexp, s.xb, E, s.up, sf, false, m);
+            const SiluParams ssp{m * sf};
+            ctx.dispatch("silu_mul", su, bytes_of(ssp), m * sf, 256);
+            mm(lay.down_shexp, s.gate, sf, s.eout, E, false, m);
+            const SharedAddParams sa{E, m, gated ? 1u : 0u, 2 * m * k};
+            const Context::Arg sha[] = {
+                {&s.x, 0}, {&s.eout, 0}, {&s.route, 0}};
+            ctx.dispatch("shared_add", sha, bytes_of(sa), m * E, 256);
         };
         const auto norm_rows = [&](std::span<const float> w,
                                    std::uint32_t m) {
@@ -914,6 +1021,10 @@ bool TransformerModel::metal_forward_batch(
                     mm(lay.wo, s.att, static_cast<std::uint32_t>(qd), s.x, E,
                        true, m);
                     norm_rows(lay.ffn_norm, m);
+                    if (lay.is_moe()) {
+                        moe_rows(lay, m);
+                        continue;
+                    }
                     mm(lay.w_gate, s.xb, E, s.gate, ff, false, m);
                     ctx.overlap_next();
                     mm(lay.w_up, s.xb, E, s.up, ff, false, m);
