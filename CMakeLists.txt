@@ -24,6 +24,7 @@ add_library(locus
     src/locus/backend/cuda_stub.cpp
     src/locus/backend/fallbacks.cpp
     src/locus/backend/gpu_metrics.cpp
+    src/locus/backend/metal/kv_pool.cpp
     src/locus/backend/metal/matvec.cpp
     src/locus/backend/registry.cpp
     src/locus/backend/vulkan/context.cpp
@@ -97,6 +98,7 @@ add_library(locus
     src/locus/model/json_schema_gbnf.cpp
     src/locus/model/transformer.cpp
     src/locus/model/transformer_cuda.cpp
+    src/locus/model/transformer_metal.cpp
     src/locus/model/expert_cache.cpp
     src/locus/model/expert_metrics.cpp
     src/locus/model/moe_stats.cpp
