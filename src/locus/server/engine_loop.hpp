@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -140,14 +141,19 @@ class EngineLoop {
     /** @returns How many requests are followed (tests). */
     std::size_t follows();
 
+    /** A progress hook: the ids of the followed requests whose progress
+     *  a step (or a cancel) just queued. */
+    using ProgressHook =
+        std::function<void(std::span<const std::uint64_t> ids)>;
+
     /**
      * Sets the hook the worker runs after a step (or a cancel) that
-     * queued progress for any followed request, so an event loop can
-     * wake and take(). It runs with the engine mutex held: it must not
-     * block or call into this EngineLoop. Set it before the first
-     * follow().
+     * queued progress for any followed request, with their ids (i#1005),
+     * so an event loop can wake and take() those alone. It runs with
+     * the engine mutex held: it must not block or call into this
+     * EngineLoop. Set it before the first follow().
      */
-    void set_progress_hook(std::function<void()> hook);
+    void set_progress_hook(ProgressHook hook);
 
     /** Stops a non-terminal request early (client disconnected): the
      * engine drops it and frees its KV. No-op if unknown/terminal. */
@@ -237,7 +243,9 @@ class EngineLoop {
     /** Followed requests (follow()), under pmu_. */
     std::unordered_map<std::uint64_t, Follow> followed_;
     /** Runs after a publish that queued follow progress (under mu_). */
-    std::function<void()> progress_hook_;
+    ProgressHook progress_hook_;
+    /** The ids one publish queued, for the hook (under mu_). */
+    std::vector<std::uint64_t> queued_ids_;
     /**
      * Count of client threads currently trying to acquire mu_ for a
      * read (view/wait_progress/wait_done/stats). The worker checks it

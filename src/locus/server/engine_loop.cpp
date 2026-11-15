@@ -73,7 +73,7 @@ std::unique_lock<std::mutex> EngineLoop::lock_turn() {
 
 void EngineLoop::publish_locked() {
     bool changed = false;
-    bool queued = false;
+    queued_ids_.clear();
     {
         std::lock_guard<std::mutex> pk(pmu_);
         for (auto& [id, w] : watched_) {
@@ -87,14 +87,16 @@ void EngineLoop::publish_locked() {
             }
         }
         for (auto& [id, f] : followed_) {
-            queued = queue_locked(id, f) || queued;
+            if (queue_locked(id, f)) {
+                queued_ids_.push_back(id);
+            }
         }
     }
     if (changed) {
         progress_cv_.notify_all();
     }
-    if (queued && progress_hook_) {
-        progress_hook_();
+    if (!queued_ids_.empty() && progress_hook_) {
+        progress_hook_(queued_ids_);
     }
 }
 
@@ -189,7 +191,7 @@ std::size_t EngineLoop::follows() {
     return followed_.size();
 }
 
-void EngineLoop::set_progress_hook(std::function<void()> hook) {
+void EngineLoop::set_progress_hook(ProgressHook hook) {
     auto lk = lock_turn();
     progress_hook_ = std::move(hook);
 }

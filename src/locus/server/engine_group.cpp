@@ -130,9 +130,24 @@ void EngineGroup::unfollow(std::uint64_t id) {
     loop_of(id).unfollow(local_id(id));
 }
 
-void EngineGroup::set_progress_hook(const std::function<void()>& hook) {
-    for (const auto& l : loops_) {
-        l->set_progress_hook(hook);
+void EngineGroup::set_progress_hook(const EngineLoop::ProgressHook& hook) {
+    const std::uint64_t n = loops_.size();
+    for (std::uint64_t e = 0; e < n; ++e) {
+        if (!hook) {
+            loops_[e]->set_progress_hook({});
+            continue;
+        }
+        // Engine e's local ids back to group ids (local * n + e); the
+        // buffer is only touched by that engine's worker, under its mutex.
+        loops_[e]->set_progress_hook(
+            [hook, e, n, ids = std::vector<std::uint64_t>()](
+                std::span<const std::uint64_t> local) mutable {
+                ids.clear();
+                for (const std::uint64_t l : local) {
+                    ids.push_back(l * n + e);
+                }
+                hook(ids);
+            });
     }
 }
 
