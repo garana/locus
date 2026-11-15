@@ -441,7 +441,7 @@ kernel void mv_q5_k(device const uchar* w [[buffer(0)]],
 // unit is one (n, i) with i = 0, 1: the 16 l in [16 i, 16 i + 16) of
 // that half, each giving elements l, l + 32, l + 64 and l + 96 with
 // scales sc[8 n + i + {0, 2, 4, 6}]. The block stride is not a multiple
-// of 4, so the bytes load one at a time.
+// of 4, so the bytes load as packed (unaligned) vectors.
 kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
                     device const float* xb [[buffer(1)]],
                     device float* out [[buffer(2)]],
@@ -472,16 +472,38 @@ kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
                 (device const char*)(blk + 192) + 8 * n + i;
             device const float* xs = x + b * 256 + 128 * n + 16 * i;
             float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-            for (uint l = 0; l < 16; ++l) {
-                const uint a = ql[l], c = ql[l + 32], h = qh[l];
-                const int q0 = int((a & 0xF) | ((h & 3) << 4)) - 32;
-                const int q1 = int((c & 0xF) | (((h >> 2) & 3) << 4)) - 32;
-                const int q2 = int((a >> 4) | (((h >> 4) & 3) << 4)) - 32;
-                const int q3 = int((c >> 4) | (((h >> 6) & 3) << 4)) - 32;
-                s0 += float(q0) * xs[l];
-                s1 += float(q1) * xs[l + 32];
-                s2 += float(q2) * xs[l + 64];
-                s3 += float(q3) * xs[l + 96];
+            // Four l a step (i#1058): the bytes and the x values as
+            // packed vectors, one load each, any alignment; the sums
+            // keep their l order, so the bits do not change.
+            for (uint l = 0; l < 16; l += 4) {
+                const uchar4 a4 =
+                    uchar4(*(device const packed_uchar4*)(ql + l));
+                const uchar4 c4 =
+                    uchar4(*(device const packed_uchar4*)(ql + l + 32));
+                const uchar4 h4 =
+                    uchar4(*(device const packed_uchar4*)(qh + l));
+                const float4 x0 =
+                    float4(*(device const packed_float4*)(xs + l));
+                const float4 x1 =
+                    float4(*(device const packed_float4*)(xs + l + 32));
+                const float4 x2 =
+                    float4(*(device const packed_float4*)(xs + l + 64));
+                const float4 x3 =
+                    float4(*(device const packed_float4*)(xs + l + 96));
+                for (uint e = 0; e < 4; ++e) {
+                    const uint a = a4[e], c = c4[e], h = h4[e];
+                    const int q0 = int((a & 0xF) | ((h & 3) << 4)) - 32;
+                    const int q1 =
+                        int((c & 0xF) | (((h >> 2) & 3) << 4)) - 32;
+                    const int q2 =
+                        int((a >> 4) | (((h >> 4) & 3) << 4)) - 32;
+                    const int q3 =
+                        int((c >> 4) | (((h >> 6) & 3) << 4)) - 32;
+                    s0 += float(q0) * x0[e];
+                    s1 += float(q1) * x1[e];
+                    s2 += float(q2) * x2[e];
+                    s3 += float(q3) * x3[e];
+                }
             }
             acc += f16_at(blk + 208) *
                    (float(sc[0]) * s0 + float(sc[2]) * s1 +
