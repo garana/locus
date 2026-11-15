@@ -2463,6 +2463,20 @@ void OpenAiServer::install_routes() {
             vision_chat(true, *vision, res, ctx);
             return;
         }
+        // As the OpenAI endpoints: a prompt the KV pool can never hold
+        // is a 400 now, not a queue front that parks every later
+        // request until its client leaves (i#927).
+        if (const std::string why = loop_.admit_error(input_tokens);
+            !why.empty()) {
+            res.status = 400;
+            res.set_content(json{{"type", "error"},
+                                 {"error",
+                                  {{"type", "invalid_request_error"},
+                                   {"message", why}}}}
+                                .dump(-1, ' ', false, kLossy),
+                            "application/json");
+            return;
+        }
 
         requests_total_.fetch_add(1, std::memory_order_relaxed);
         prompt_tokens_total_.fetch_add(input_tokens,
