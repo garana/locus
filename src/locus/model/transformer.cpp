@@ -1330,8 +1330,13 @@ void TransformerModel::forward_batch(std::span<const tok::TokenId> toks,
         }
     }
     if (mrope.empty() && !hidden_only && metal_forward_supported()) {
-        // Metal (i#866): one GPU forward a position, so a chunk gives
-        // the per-token forward's bits (embeddings in place of rows).
+        // Metal (i#866): the batched prefill when it runs (matmuls,
+        // token-exact to the per-token forward), else one GPU forward a
+        // position.
+        if (metal_forward_batch(toks, embd, seq, cache, ws, logits,
+                                all_logits)) {
+            return;
+        }
         const std::uint32_t V = hp_.n_vocab;
         std::vector<float> spare(all_logits ? 0 : V);
         for (std::uint32_t t = 0; t < n; ++t) {

@@ -853,6 +853,28 @@ class TransformerModel {
                        kv::PagedKvCache& cache, Workspace& ws,
                        std::span<float> logits, LogitRows rows_out) const;
 
+    /**
+     * metal_forward over a prompt chunk (i#866): the tokens at
+     * seq.n_tokens on, in sub-chunks of up to 256, each one command
+     * batch with the projections as matmuls (Q4_K; per-token matvecs
+     * for other types), causal attention over the pool and the head
+     * for the last token (every token with all_logits). Token-exact,
+     * not byte-identical, to the per-token forward (matmul and matvec
+     * add in different orders). Advances seq on success.
+     * @param embd Empty, or one entry per token: nullptr to embed the
+     *     token, else n_embd floats used instead.
+     * @returns false, before any state changes, when it cannot run
+     *     (what metal_forward declines, a context past 4096 positions,
+     *     or fewer than 32 tokens, which keep the per-token bits: a
+     *     speculative verify); the caller then runs the tokens one at a
+     *     time.
+     */
+    bool metal_forward_batch(std::span<const tok::TokenId> toks,
+                             std::span<const float* const> embd,
+                             kv::PagedKvCache::Seq& seq,
+                             kv::PagedKvCache& cache, Workspace& ws,
+                             std::span<float> logits, bool all_logits) const;
+
     /** Applies the model's norm (RMS or LayerNorm per hp_.norm_type)
      * to x scaled by w, into out; uses hp_.rms_eps. */
     /** Applies hp_.logit_scale and the final logit softcap in place

@@ -67,6 +67,22 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t x_off, const Context::Buffer& out,
                    std::uint64_t out_off, bool accumulate);
 
+/**
+ * Records out[out_off + t * out_stride + r] (+)= dot(row r, x token t)
+ * for r < rows and t < n_tok: the prefill matmul, each weight row read
+ * once for a tile of 32 tokens. Token t of x starts at x_off + t *
+ * x_stride (floats). The caller holds device_mutex().
+ * @returns false, recording nothing, for a type without a matmul
+ *     kernel (Q4_K only for now): the caller loops record_matvec.
+ */
+bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                   std::uint32_t cols, std::uint32_t n_tok,
+                   const Context::Buffer& w, std::uint64_t w_off,
+                   const Context::Buffer& x, std::uint64_t x_off,
+                   std::uint32_t x_stride, const Context::Buffer& out,
+                   std::uint64_t out_off, std::uint32_t out_stride,
+                   bool accumulate);
+
 /** @returns The bytes of a rows x cols matrix of type t (0 for a type
  *  without a kernel). */
 std::size_t matvec_weight_bytes(gguf::TensorType t, std::uint32_t rows,
