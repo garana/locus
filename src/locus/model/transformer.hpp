@@ -292,6 +292,10 @@ class TransformerModel {
     /** @returns Whether the Q8-activation mode is in effect. */
     bool q8k_activations() const;
 
+    /** @returns How many tokens the Metal forward (i#866) has run in
+     *  this process (tests: whether the GPU path was taken). */
+    static std::uint64_t metal_forward_tokens();
+
     /**
      * Settles where the routed experts run (i#654) and returns it. On
      * Vulkan that depends on the free device memory when first asked,
@@ -823,6 +827,54 @@ class TransformerModel {
                       std::span<const float* const> embd = {},
                       LogitRows rows_out = {}) const;
 
+    /** @returns Whether metal_forward takes this model on its backend
+     *  (any cache conditions aside): the batched paths then run it a
+     *  token at a time, so they match the per-token forward. */
+    bool metal_forward_supported() const;
+
+    /**
+     * Metal forward of a plain llama model (i#866): one token at
+     * position pos of seq, every layer on the GPU in one command batch
+     * (rmsnorm, q / k / v with k and v written straight into the KV
+     * pool, RoPE, the attention over the pool, wo, the FFN and the
+     * residual adds), then the head rows of rows_out. The KV pool must
+     * be a Metal one (Ops.alloc_kv); the weights are uploaded once, on
+     * the first call, into buffers the model owns.
+     *
+     * @param embd nullptr to embed the token, or n_embd floats used
+     *     instead of its row.
+     * @returns false when it cannot run here (not Metal, not plain
+     *     llama, a weight type without a kernel, a pool that is not a
+     *     Metal one, or LOCUS_METAL_FORWARD=0); the caller then takes
+     *     the host path. seq is not advanced either way.
+     */
+    bool metal_forward(tok::TokenId token, const float* embd,
+                       kv::PagedKvCache::Seq& seq, std::uint32_t pos,
+                       kv::PagedKvCache& cache, Workspace& ws,
+                       std::span<float> logits, LogitRows rows_out) const;
+
+    /**
+     * metal_forward over a prompt chunk (i#866): the tokens at
+     * seq.n_tokens on, in sub-chunks of up to 256, each one command
+     * batch with the projections as matmuls (Q4_K; per-token matvecs
+     * for other types), causal attention over the pool and the head
+     * for the last token (every token with all_logits). Token-exact,
+     * not byte-identical, to the per-token forward (matmul and matvec
+     * add in different orders). Advances seq on success.
+     * @param embd Empty, or one entry per token: nullptr to embed the
+     *     token, else n_embd floats used instead.
+     * @returns false, before any state changes, when it cannot run
+     *     (what metal_forward declines, a context past 4096 positions,
+     *     or fewer than 32 tokens, which keep the per-token bits: a
+     *     speculative verify); the caller then runs the tokens one at a
+     *     time.
+     */
+    bool metal_forward_batch(std::span<const tok::TokenId> toks,
+                             std::span<const float* const> embd,
+                             kv::PagedKvCache::Seq& seq,
+                             kv::PagedKvCache& cache, Workspace& ws,
+                             std::span<float> logits, bool all_logits) const;
+
     /** Applies the model's norm (RMS or LayerNorm per hp_.norm_type)
      * to x scaled by w, into out; uses hp_.rms_eps. */
     /** Applies hp_.logit_scale and the final logit softcap in place
@@ -883,6 +935,9 @@ class TransformerModel {
     std::shared_ptr<StageMetrics> stage_metrics_;
     /** LOCUS_MOE_HYBRID state, set up on the first MoE layer. */
     std::shared_ptr<struct MoeHybrid> moe_hybrid_;
+    /** The Metal forward's weight buffers (i#866), uploaded on its
+     *  first call and freed with the model. */
+    mutable std::shared_ptr<struct MetalWeights> metal_weights_;
     /** The loaded range's tensor bytes (stage_weight_bytes): decides
      *  the hybrid and sizes its hot zone. */
     std::uint64_t weight_bytes_ = 0;

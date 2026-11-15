@@ -3,8 +3,15 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <string>
+#include <string_view>
+#include <mutex>
 #include <random>
+#include <tuple>
 #include <utility>
 #include <span>
 #include <stdexcept>
@@ -15,6 +22,10 @@
 #include "locus/backend/metal/context.hpp"
 #include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/gguf/gguf.hpp"
+#include "locus/kv/paged_cache.hpp"
+#include "locus/model/transformer.hpp"
+#include "locus/tok/tokenizer.hpp"
 
 using locus::backend::metal::Context;
 
@@ -158,8 +169,20 @@ std::vector<std::byte> random_weights(TensorType t, std::uint32_t rows,
         std::uint32_t elems, bytes, d_off;
         int dmin_off;
     };
+    if (t == TensorType::kF16) {
+        std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+        std::vector<std::byte> b(static_cast<std::size_t>(rows) * cols * 2);
+        for (std::size_t i = 0; i < b.size(); i += 2) {
+            const std::uint16_t h = locus::backend::f32_to_f16(d(rng));
+            std::memcpy(b.data() + i, &h, 2);
+        }
+        return b;
+    }
     const Blk k = t == TensorType::kQ8_0   ? Blk{32, 34, 0, -1}
+                  : t == TensorType::kQ4_0 ? Blk{32, 18, 0, -1}
+                  : t == TensorType::kQ5_0 ? Blk{32, 22, 0, -1}
                   : t == TensorType::kQ4_K ? Blk{256, 144, 0, 2}
+                  : t == TensorType::kQ5_K ? Blk{256, 176, 0, 2}
                                            : Blk{256, 210, 208, -1};
     std::uniform_int_distribution<int> byte(0, 255);
     std::vector<std::byte> w(static_cast<std::size_t>(rows) *
@@ -188,8 +211,10 @@ TEST_CASE("metal matvec matches the CPU for each weight type",
     namespace mb = locus::backend::metal;
     std::mt19937 rng(3);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    for (const TensorType t : {TensorType::kF32, TensorType::kQ8_0,
-                               TensorType::kQ4_K, TensorType::kQ6_K}) {
+    for (const TensorType t :
+         {TensorType::kF32, TensorType::kF16, TensorType::kQ8_0,
+          TensorType::kQ4_0, TensorType::kQ5_0, TensorType::kQ4_K,
+          TensorType::kQ5_K, TensorType::kQ6_K}) {
         CHECK(mb::matvec_supported(t));
         // Rows not a multiple of the 8 a threadgroup takes; one shape
         // with fewer blocks per row than the 16 lanes.
@@ -223,7 +248,7 @@ TEST_CASE("metal matvec matches the CPU for each weight type",
             CHECK(rep == got);
         }
     }
-    CHECK_FALSE(mb::matvec_supported(TensorType::kQ5_K));
+    CHECK_FALSE(mb::matvec_supported(TensorType::kQ2_K));
     std::vector<float> x(4), out(4);
     const std::vector<std::byte> none(64);
     const locus::backend::Mat bad{TensorType::kF32, none.data(), 4, 4};
@@ -231,4 +256,329 @@ TEST_CASE("metal matvec matches the CPU for each weight type",
     CHECK_THROWS_AS(mb::matvec(bad, shortx, out), std::invalid_argument);
     CHECK_THROWS_AS(mb::matvec_repeat(bad, x, out, 0), std::invalid_argument);
     mb::drop_weights();
+}
+
+TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
+          "[metal][e2e]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    // Q4_K_M (Q4_K and Q6_K), Q8_0, and two made from the Q8_0 with
+    // llama-quantize --allow-requantize (i#907): Q4_0 (with a Q6_K
+    // head) and Q5_K_M (Q5_K and Q6_K). Requantized, so only fit for
+    // this GPU-against-CPU check, not for quality numbers.
+    int ran = 0;
+    for (const char* name :
+         {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf",
+          "llama-3.2-1b-q4_0.gguf", "llama-3.2-1b-q5_k_m.gguf"}) {
+        const std::string path =
+            std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
+        if (!std::filesystem::exists(path)) {
+            WARN(path << " absent: skipped");  // the others still run
+            continue;
+        }
+        CAPTURE(name);
+        ++ran;
+        auto g = locus::gguf::GgufFile::open(path);
+        auto model = locus::model::TransformerModel::load(g);
+        // The CPU reference with f32 activations, as the GPU computes
+        // (its Q8_K default rounds them, which moves the logits ~2%).
+        model.use_q8k_activations(false);
+        const auto tok = locus::tok::tokenizer_from_gguf(g);
+        const std::uint32_t nv = model.hparams().n_vocab;
+        // The same tokens through the best CPU backend and Metal: the
+        // prompt, then the CPU's greedy continuation.
+        std::vector<locus::tok::TokenId> ids =
+            tok->encode("The capital of France is", true);
+        const auto run = [&](std::string_view be) {
+            model.use_backend(*locus::backend::find_backend(be));
+            auto cache = model.make_cache();
+            auto ws = model.make_workspace();
+            locus::kv::PagedKvCache::Seq seq;
+            std::vector<float> logits(nv);
+            std::vector<std::vector<float>> all;
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(ids[i], cache, seq, ws, logits);
+                all.push_back(logits);
+            }
+            cache.release(seq);
+            return all;
+        };
+        {
+            // Extend ids with 12 greedy CPU tokens.
+            model.use_backend(locus::backend::backends().front());
+            auto cache = model.make_cache();
+            auto ws = model.make_workspace();
+            locus::kv::PagedKvCache::Seq seq;
+            std::vector<float> logits(nv);
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(ids[i], cache, seq, ws, logits);
+            }
+            for (int i = 0; i < 12; ++i) {
+                ids.push_back(locus::model::argmax(logits));
+                REQUIRE(cache.ensure_capacity(seq, 1));
+                model.forward(ids.back(), cache, seq, ws, logits);
+            }
+            cache.release(seq);
+        }
+        const auto cpu = run(locus::backend::backends().front().name);
+        const std::uint64_t before =
+            locus::model::TransformerModel::metal_forward_tokens();
+        // The one-kernel attention (the default at this length), then
+        // the three passes.
+        for (const bool three : {false, true}) {
+            CAPTURE(three);
+            if (three) {
+                setenv("LOCUS_METAL_ATTN_PASSES", "3", 1);
+            }
+            const auto gpu = run("metal");
+            unsetenv("LOCUS_METAL_ATTN_PASSES");
+            // Every token took the GPU path.
+            CHECK(locus::model::TransformerModel::metal_forward_tokens() -
+                      before ==
+                  ids.size() * (three ? 2 : 1));
+            for (std::size_t t = 0; t < ids.size(); ++t) {
+                CAPTURE(t);
+                CHECK(locus::model::argmax(gpu[t]) ==
+                      locus::model::argmax(cpu[t]));
+                float worst = 0.0f, scale = 0.0f;
+                for (std::uint32_t r = 0; r < nv; ++r) {
+                    worst = std::max(worst, std::abs(gpu[t][r] - cpu[t][r]));
+                    scale = std::max(scale, std::abs(cpu[t][r]));
+                }
+                CHECK(worst <= 0.01f * scale);
+            }
+        }
+    }
+    if (ran == 0) {
+        SKIP("none of the llama test models is present");
+    }
+}
+
+TEST_CASE("metal Q4_K, Q6_K and Q8_0 matmuls match the CPU matvec",
+          "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    Context& ctx = Context::get();
+    std::mt19937 rng(17);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    // Rows and tokens off the 64 x 32 tile, strided token rows.
+    for (const TensorType ty :
+         {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0}) {
+        CAPTURE(static_cast<int>(ty));
+        for (const auto& [rows, cols, n_tok] :
+             {std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>{
+                  200, 512, 37},
+              {64, 256, 1}, {1027, 3072, 70}}) {
+            CAPTURE(rows, cols, n_tok);
+            const auto w = random_weights(ty, rows, cols, rows);
+            const locus::backend::Mat m{ty, w.data(), rows, cols};
+            const std::uint32_t xs = cols + 8, os = rows + 4;
+            std::vector<float> x(std::size_t{n_tok} * xs);
+            for (auto& v : x) {
+                v = dist(rng);
+            }
+            std::vector<float> init(std::size_t{n_tok} * os);
+            for (auto& v : init) {
+                v = dist(rng);
+            }
+            Context::Buffer wb = ctx.upload(w);
+            Context::Buffer xb = ctx.upload(std::as_bytes(std::span(x)));
+            for (const bool acc : {false, true}) {
+                CAPTURE(acc);
+                Context::Buffer ob = ctx.upload(std::as_bytes(std::span(init)));
+                {
+                    std::lock_guard lk(mb::device_mutex());
+                    REQUIRE(mb::record_matmul(ctx, ty, rows, cols, n_tok, wb,
+                                              0, xb, 0, xs, ob, 0, os, acc));
+                }
+                const auto* got = static_cast<const float*>(ob.data);
+                std::vector<float> want(rows);
+                for (std::uint32_t t = 0; t < n_tok; ++t) {
+                    locus::backend::matvec(
+                        m, {x.data() + std::size_t{t} * xs, cols}, want);
+                    for (std::uint32_t r = 0; r < rows; ++r) {
+                        const float base =
+                            acc ? init[std::size_t{t} * os + r] : 0.0f;
+                        REQUIRE(got[std::size_t{t} * os + r] ==
+                                Catch::Approx(base + want[r])
+                                    .margin(1e-3)
+                                    .epsilon(1e-4));
+                    }
+                    // Past the rows, the stride's padding is untouched.
+                    for (std::uint32_t r = rows; r < os; ++r) {
+                        REQUIRE(got[std::size_t{t} * os + r] ==
+                                init[std::size_t{t} * os + r]);
+                    }
+                }
+                ctx.free(ob);
+            }
+            ctx.free(wb);
+            ctx.free(xb);
+        }
+    }
+    // Types without a matmul kernel say so and record nothing.
+    Context::Buffer none = ctx.alloc(64);
+    std::lock_guard lk(mb::device_mutex());
+    CHECK_FALSE(mb::record_matmul(ctx, TensorType::kQ5_K, 4, 256, 2, none, 0,
+                                  none, 0, 256, none, 0, 4, false));
+    ctx.free(none);
+}
+
+TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    int ran = 0;
+    // Q4_K_M takes the matmul; Q8_0 the per-token matvecs.
+    for (const char* name :
+         {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf"}) {
+        const std::string path =
+            std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
+        if (!std::filesystem::exists(path)) {
+            WARN(path << " absent: skipped");
+            continue;
+        }
+        ++ran;
+        CAPTURE(name);
+        auto g = locus::gguf::GgufFile::open(path);
+        auto model = locus::model::TransformerModel::load(g);
+        model.use_q8k_activations(false);  // the f32 CPU reference
+        const auto tok = locus::tok::tokenizer_from_gguf(g);
+        const std::uint32_t nv = model.hparams().n_vocab;
+        // Past one 256-token sub-chunk, so two run.
+        std::string text;
+        for (int i = 0; i < 40; ++i) {
+            text += "The quick brown fox jumps over the lazy dog. ";
+        }
+        const auto ids = tok->encode(text, true);
+        REQUIRE(ids.size() > 256);
+        const auto prefill = [&](std::string_view be, bool all) {
+            model.use_backend(*locus::backend::find_backend(be));
+            auto cache = model.make_cache();
+            auto ws = model.make_workspace();
+            locus::kv::PagedKvCache::Seq seq;
+            REQUIRE(cache.ensure_capacity(
+                seq, static_cast<std::uint32_t>(ids.size()) + 1));
+            std::vector<float> logits((all ? ids.size() : 1) * nv);
+            model.forward_batch(ids, cache, seq, ws, logits, all);
+            REQUIRE(seq.n_tokens == ids.size());
+            // One more token on top, to check the KV the prefill wrote.
+            std::vector<float> next(nv);
+            model.forward(locus::model::argmax(std::span<const float>(
+                              logits.data() + logits.size() - nv, nv)),
+                          cache, seq, ws, next);
+            cache.release(seq);
+            return std::pair(logits, next);
+        };
+        const auto close = [&](std::span<const float> a,
+                               std::span<const float> b) {
+            CHECK(locus::model::argmax(a) == locus::model::argmax(b));
+            float worst = 0.0f, scale = 0.0f;
+            for (std::size_t r = 0; r < a.size(); ++r) {
+                worst = std::max(worst, std::abs(a[r] - b[r]));
+                scale = std::max(scale, std::abs(b[r]));
+            }
+            CHECK(worst <= 0.01f * scale);
+        };
+        const auto cpu = prefill(locus::backend::backends().front().name,
+                                 false);
+        // The tiled causal attention (the default), then attn_rows.
+        for (const bool tiled : {true, false}) {
+            CAPTURE(tiled);
+            if (!tiled) {
+                setenv("LOCUS_METAL_ATTN_TILED", "0", 1);
+            }
+            const std::uint64_t before =
+                locus::model::TransformerModel::metal_forward_tokens();
+            const auto gpu = prefill("metal", false);
+            // The prompt and the next token all ran on the GPU.
+            CHECK(locus::model::TransformerModel::metal_forward_tokens() -
+                      before ==
+                  ids.size() + 1);
+            close(gpu.first, cpu.first);
+            close(gpu.second, cpu.second);
+            // All logits: a row each, the last as the one-row run's.
+            const auto all = prefill("metal", true);
+            unsetenv("LOCUS_METAL_ATTN_TILED");
+            REQUIRE(all.first.size() == ids.size() * nv);
+            close(std::span<const float>(all.first).subspan(
+                      (ids.size() - 1) * nv, nv),
+                  cpu.first);
+        }
+    }
+    if (ran == 0) {
+        SKIP("none of the llama test models is present");
+    }
+}
+
+TEST_CASE("metal tiled causal attention matches attn_rows",
+          "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    // The parameter blocks of kernels.metal.
+    struct AttnParams {
+        std::uint64_t block_floats, layer_off, v_off;
+        std::uint32_t n_pos, block_tokens, n_heads, n_kv_heads, head_dim;
+        float kq_scale;
+    };
+    struct AttnRowsParams {
+        AttnParams a;
+        std::uint32_t base, q_stride;
+    };
+    Context& ctx = Context::get();
+    std::mt19937 rng(23);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    // Head widths 32 (64-position chunks before the cap), 64 and 128;
+    // queries off the 8-query tile; a base so chunks span blocks.
+    for (const std::uint32_t hd : {32u, 64u, 128u}) {
+        CAPTURE(hd);
+        const std::uint32_t H = 4, KV = 2, bt = 16, base = 37, m = 21;
+        const std::uint32_t n_pos = base + m;
+        const std::uint32_t n_blocks = (n_pos + bt - 1) / bt;
+        const std::size_t kvd = std::size_t{KV} * hd;
+        const std::size_t layer = 2 * bt * kvd;  // one layer: K then V
+        // Blocks in reverse order, so the block table matters.
+        std::vector<std::uint32_t> blocks(n_blocks);
+        for (std::uint32_t b = 0; b < n_blocks; ++b) {
+            blocks[b] = n_blocks - 1 - b;
+        }
+        std::vector<float> pool(std::size_t{n_blocks} * layer);
+        for (auto& v : pool) {
+            v = dist(rng);
+        }
+        const std::uint32_t qs = H * hd;
+        std::vector<float> q(std::size_t{m} * qs);
+        for (auto& v : q) {
+            v = dist(rng);
+        }
+        Context::Buffer pb = ctx.upload(std::as_bytes(std::span(pool)));
+        Context::Buffer bb = ctx.upload(std::as_bytes(std::span(blocks)));
+        Context::Buffer qb = ctx.upload(std::as_bytes(std::span(q)));
+        Context::Buffer o1 = ctx.alloc(q.size() * 4);
+        Context::Buffer o2 = ctx.alloc(q.size() * 4);
+        const AttnRowsParams p{{layer, 0, bt * kvd, m, bt, H, KV, hd,
+                                1.0f / std::sqrt(float(hd))},
+                               base,
+                               qs};
+        const auto params = std::as_bytes(std::span(&p, 1));
+        const Context::Arg a1[] = {{&qb, 0}, {&pb, 0}, {&bb, 0}, {&o1, 0}};
+        const Context::Arg a2[] = {{&qb, 0}, {&pb, 0}, {&bb, 0}, {&o2, 0}};
+        ctx.dispatch("attn_rows", a1, params, m * H * 256, 256);
+        ctx.dispatch("attn_rows_tiled", a2, params, ((m + 7) / 8) * H * 256,
+                     256);
+        const auto* r = static_cast<const float*>(o1.data);
+        const auto* t = static_cast<const float*>(o2.data);
+        for (std::size_t i = 0; i < q.size(); ++i) {
+            REQUIRE(t[i] == Catch::Approx(r[i]).margin(1e-5).epsilon(1e-4));
+        }
+        for (auto* b : {&pb, &bb, &qb, &o1, &o2}) {
+            ctx.free(*b);
+        }
+    }
 }
