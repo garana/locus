@@ -279,7 +279,7 @@ inline constexpr const char* kCommonHelp =
     "                   its own KV pool (--ctx each): N shares of the\n"
     "                   CPU cores, or one --device each on Vulkan;\n"
     "                   each has its own prefix cache, so a prompt goes\n"
-    "                   to the engine its first tokens last went to\n"
+    "                   to the engine its longest prefix last went to\n"
     "                   (unless that one is busier)\n"
     "  --kv-type T      KV cache precision: f32 (default, exact),\n"
     "                   f16 (half the cache and attention reads;\n"
