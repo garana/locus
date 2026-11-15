@@ -256,19 +256,27 @@ TEST_CASE("metal matvec matches the CPU for each weight type",
     mb::drop_weights();
 }
 
-TEST_CASE("metal forward tracks the CPU on llama Q4_K_M and Q8_0",
+TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
           "[metal][e2e]") {
     if (!Context::usable()) {
         SKIP("no Metal device");
     }
+    // Q4_K_M (Q4_K and Q6_K), Q8_0, and two made from the Q8_0 with
+    // llama-quantize --allow-requantize (i#907): Q4_0 (with a Q6_K
+    // head) and Q5_K_M (Q5_K and Q6_K). Requantized, so only fit for
+    // this GPU-against-CPU check, not for quality numbers.
+    int ran = 0;
     for (const char* name :
-         {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf"}) {
+         {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf",
+          "llama-3.2-1b-q4_0.gguf", "llama-3.2-1b-q5_k_m.gguf"}) {
         const std::string path =
             std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
         if (!std::filesystem::exists(path)) {
-            SKIP(path + " absent");
+            WARN(path << " absent: skipped");  // the others still run
+            continue;
         }
         CAPTURE(name);
+        ++ran;
         auto g = locus::gguf::GgufFile::open(path);
         auto model = locus::model::TransformerModel::load(g);
         // The CPU reference with f32 activations, as the GPU computes
@@ -341,5 +349,8 @@ TEST_CASE("metal forward tracks the CPU on llama Q4_K_M and Q8_0",
                 CHECK(worst <= 0.01f * scale);
             }
         }
+    }
+    if (ran == 0) {
+        SKIP("none of the llama test models is present");
     }
 }
