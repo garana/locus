@@ -136,8 +136,10 @@ as llama.cpp does; `LOCUS_F32_ACTIVATIONS=1` selects f32 activations.
 (today every CPU softmax: attention, MoE routing and the image
 encoders, about 2x faster; and on ARM CPUs with i8mm, such as the
 M2 and later, Q8_0 weights through `smmla`, about 27% faster prefill
-on an M2 Pro): close to the default results but not bit-identical, so
-the goldens are checked without it.
+on an M2 Pro; on x86 CPUs with AVX but not AVX2, one-token Q4_K and
+Q6_K rows in llama.cpp's float order, about 17% faster one-thread
+decode on an i5-2400): close to the default results but not
+bit-identical, so the goldens are checked without it.
 
 ### Validated models
 

@@ -309,7 +309,9 @@ The areas built after the MVP:
   nlohmann/json v3.11.3 (MIT), ggml's
   IQ lookup tables (`third_party/ggml/iq_grids.h`, MIT) and llama.cpp's
   Unicode tables (`third_party/llama/unicode-data.{h,cpp}`, MIT, commit
-  cd959bae9).
+  cd959bae9). Ported, not vendored: ggml's x86 AVX Q4_K / Q6_K dots
+  (`backend/matvec_sse4.cpp`, the LOCUS_CPU_FAST rows, from llama.cpp
+  e8e6c7a), under the same MIT notice (`third_party/ggml/LICENSE`).
 - No FetchContent and no network at configure or build time.
 - Optional system dependencies, found at configure time: the Vulkan
   loader and a shader compiler, the CUDA toolkit.
@@ -961,7 +963,11 @@ peer without the key is closed before any frame; a pooled downstream
 passed it when it was dialed. In the serve loop the handshake is one
 more per-session state with its own deadline, so a silent peer does
 not stall other sessions (#849). Frames are not signed: a peer on the
-network path is not stopped.
+network path is not stopped. A stage refuses an input frame longer than
+one activation (n_embd floats) from its length prefix, and the serve
+loop drops a session whose partial frame makes no progress for
+`--frame-timeout` (30 s); a connection idle between frames stays, as a
+pooled one must (#854).
 On Linux, every `--allow` (locus-stage and its metrics port,
 locus-experts, the driver's logits listen, and `http::Server`'s
 `allow`) is also a classic BPF socket filter on the listening socket:

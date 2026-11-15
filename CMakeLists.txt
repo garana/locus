@@ -24,6 +24,7 @@ add_library(locus
     src/locus/backend/cuda_stub.cpp
     src/locus/backend/fallbacks.cpp
     src/locus/backend/gpu_metrics.cpp
+    src/locus/backend/metal/matvec.cpp
     src/locus/backend/registry.cpp
     src/locus/backend/vulkan/context.cpp
     src/locus/chat/template.cpp
@@ -194,7 +195,7 @@ if(APPLE)
     enable_language(OBJCXX)
     target_sources(locus PRIVATE src/locus/backend/metal/context.mm)
     set_source_files_properties(src/locus/backend/metal/context.mm
-        PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wall;-Wextra")
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wall;-Wextra;-Wpedantic")
     target_link_libraries(locus PRIVATE "-framework Metal"
                                         "-framework Foundation")
     set(LOCUS_METAL_KERNELS_FILE
@@ -565,6 +566,7 @@ if(CUDAToolkit_FOUND)
     set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     target_sources(locus PRIVATE
+        src/locus/backend/cuda/cuda_conv.cu
         src/locus/backend/cuda/cuda_matvec.cu)
     set_target_properties(locus PROPERTIES CUDA_ARCHITECTURES "50")
     target_compile_definitions(locus PRIVATE LOCUS_HAS_CUDA=1)
