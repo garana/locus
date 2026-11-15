@@ -92,7 +92,9 @@ bool LoopReply::write(std::string_view data) {
 void LoopReply::end() {
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (state_ != State::kStreaming) return;
+        // Cancelled: the loop may have dropped the connection and
+        // closed (or reused) wake_fd, so write nothing to it.
+        if (cancelled_ || state_ != State::kStreaming) return;
         state_ = State::kEnded;
     }
     wake();
