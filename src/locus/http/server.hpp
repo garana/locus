@@ -260,6 +260,24 @@ struct ServerConfig {
 };
 
 /**
+ * Applies cfg's keepalive to an accepted client socket (i#994), and the
+ * same bound on unacknowledged data (i#1016: idle + interval x count,
+ * pipeline::set_user_timeout), so a client whose host died is found in
+ * about that time whether its connection idles or streams.
+ */
+inline void apply_keepalive(int fd, const ServerConfig& cfg) {
+    locus::pipeline::set_keepalive(fd, cfg.keepalive_idle_s,
+                                   cfg.keepalive_intvl_s,
+                                   cfg.keepalive_count);
+    const int bound_s =
+        cfg.keepalive_idle_s > 0
+            ? cfg.keepalive_idle_s +
+                  cfg.keepalive_intvl_s * cfg.keepalive_count
+            : 0;
+    locus::pipeline::set_user_timeout(fd, bound_s * 1000);
+}
+
+/**
  * What a caller drives an HTTP server by, so it can pick the thread
  * server (Server) or the event-loop one (LoopServer, i#931) with the
  * same ServerConfig, Handler and HeadHandler.

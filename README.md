@@ -239,7 +239,9 @@ thread with the handlers on a job pool, so idle and slow clients hold
 no thread (a thread a connection otherwise), and nor does a
 generation waiting on the engine. Client sockets have TCP keepalive
 on (`--tcp-keepalive 30,10,3` by default), so a client whose host
-died is found in about a minute and its generation stops.
+died is found in about a minute and its generation stops; on Linux
+the same bound applies to unacknowledged data, so a stream to it
+ends as fast.
 `locus-server --help`
 lists the options and environment
 variables;
