@@ -1,7 +1,7 @@
 #pragma once
 
 // Host helpers the CUDA translation units share: cuda_matvec.cu defines
-// the functions, cuda_conv.cu uses them.
+// the functions, cuda_conv.cu and cuda_attend.cu use them.
 
 #include <cuda_runtime.h>
 
