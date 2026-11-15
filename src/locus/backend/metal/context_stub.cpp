@@ -10,6 +10,8 @@ struct Context::Impl {};
 
 bool Context::usable() { return false; }
 
+bool Context::made() { return false; }
+
 Context& Context::get() {
     throw std::runtime_error("metal: not built with Metal");
 }

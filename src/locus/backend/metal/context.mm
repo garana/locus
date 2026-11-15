@@ -5,6 +5,7 @@
 #import <Metal/Metal.h>
 #include <mach/mach.h>
 
+#include <atomic>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -61,6 +62,13 @@ bool Context::usable() {
     return ok;
 }
 
+namespace {
+
+/** Set once get() has made the context. */
+std::atomic<bool> g_made{false};
+
+}  // namespace
+
 Context& Context::get() {
     static Context* ctx = [] {
         @autoreleasepool {
@@ -107,8 +115,11 @@ Context& Context::get() {
             return new Context(std::move(impl));
         }
     }();
+    g_made.store(true, std::memory_order_relaxed);
     return *ctx;
 }
+
+bool Context::made() { return g_made.load(std::memory_order_relaxed); }
 
 Context::Context(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 

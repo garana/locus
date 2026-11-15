@@ -452,7 +452,8 @@ const Ops& image_ops() {
 }
 
 void release_weights(const void* p, std::size_t n) {
-    if (!Context::usable() || n == 0) {
+    // No context, no cached weights: return without making one.
+    if (!Context::made() || n == 0) {
         return;
     }
     const auto* lo = static_cast<const std::byte*>(p);
@@ -471,7 +472,7 @@ void release_weights(const void* p, std::size_t n) {
 }
 
 std::size_t cached_weight_bytes() {
-    if (!Context::usable()) {
+    if (!Context::made()) {
         return 0;
     }
     std::lock_guard lk(device_mutex());

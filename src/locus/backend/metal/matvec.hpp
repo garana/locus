@@ -70,7 +70,8 @@ void drop_weights();
 /**
  * Frees the cached weights whose bytes start in [p, p + n): a model's
  * file going away, so a later model at the same addresses uploads its
- * own and the device memory comes back. Takes device_mutex().
+ * own and the device memory comes back. Takes device_mutex(); a no-op,
+ * making nothing, before any Metal context exists.
  */
 void release_weights(const void* p, std::size_t n);
 

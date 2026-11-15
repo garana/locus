@@ -2100,8 +2100,12 @@ void vulkan_reset_state() {
     state().free_buffers(false);
 }
 
+bool vulkan_state_built() { return state_alive(); }
+
 void vulkan_release_weights(const void* p, std::size_t n) {
-    if (!vulkan_backend_usable()) {
+    // Nothing cached on a device whose State was never built: return
+    // without probing or building it.
+    if (!state_alive()) {
         return;
     }
     std::lock_guard lk(state_mu());

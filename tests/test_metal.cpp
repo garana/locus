@@ -23,6 +23,7 @@
 #include "locus/backend/metal/context.hpp"
 #include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
@@ -844,4 +845,26 @@ TEST_CASE("a destroyed model releases its Metal cached weights",
         mb::matvec(moved.layers()[0].wq, x, out);
     }
     REQUIRE(mb::cached_weight_bytes() == base);
+}
+
+// i#1029: a model's release on destruction cleans only GPU caches that
+// exist, so a CPU-only process never builds Vulkan's State or Metal's
+// context for it. Meaningful when run alone (in the whole suite an
+// earlier test may have built both).
+TEST_CASE("a destroyed CPU model builds no GPU state",
+          "[metal][vulkan]") {
+    const bool vk = locus::backend::vulkan_state_built();
+    const bool mt = Context::made();
+    INFO("built before: vulkan " << vk << ", metal " << mt);
+    {
+        const auto img = qwen_tiny::lm("qwen2");
+        const auto g = locus::gguf::GgufFile::parse(img);
+        auto model = locus::model::TransformerModel::load(g);
+        const auto* cpu = locus::backend::find_backend("neon");
+        model.use_backend(cpu != nullptr
+                              ? *cpu
+                              : *locus::backend::find_backend("scalar"));
+    }
+    CHECK(locus::backend::vulkan_state_built() == vk);
+    CHECK(Context::made() == mt);
 }
