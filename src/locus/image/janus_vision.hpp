@@ -21,7 +21,7 @@ namespace locus::image {
  * learned position table, then 24 pre-norm blocks (LayerNorm, 16-head
  * full attention, LayerNorm, GELU MLP) and a final LayerNorm. Aligner:
  * Linear, GELU, Linear. Weights come from the vit.* tensors that
- * scripts/convert-janus.py writes; matrices stay in the GGUF mapping,
+ * scripts/image/convert-janus.py writes; matrices stay in the GGUF mapping,
  * so the GgufFile must outlive the encoder.
  */
 class JanusVision {

@@ -50,7 +50,7 @@ std::string model_path() {
 TEST_CASE("pipeline stages reproduce single-process generation",
           "[pipeline][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -225,7 +225,7 @@ TEST_CASE("pipeline stages reproduce single-process generation",
 TEST_CASE("pipeline serve_stage chain reproduces generation",
           "[pipeline][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -361,7 +361,7 @@ TEST_CASE("pipeline serve_stage chain reproduces generation",
 TEST_CASE("serve_stage reconnect gives up after N attempts",
           "[pipeline][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -416,7 +416,7 @@ TEST_CASE("serve_stage reconnect gives up after N attempts",
 TEST_CASE("serve_stage re-serves sessions with reset",
           "[pipeline][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -530,7 +530,7 @@ TEST_CASE("serve_stage re-serves sessions with reset",
 TEST_CASE("serve_stage runs the key handshake on accept and dial",
           "[pipeline][e2e][handshake]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -592,7 +592,7 @@ TEST_CASE("serve_stage runs the key handshake on accept and dial",
 TEST_CASE("serve_stage distributes across a downstream pool",
           "[pipeline][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -809,7 +809,7 @@ TEST_CASE("serve_stage distributes across a downstream pool",
 TEST_CASE("slice-only load matches full model on its layer range",
           "[pipeline]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto full = locus::model::TransformerModel::load(g);
@@ -880,7 +880,7 @@ TEST_CASE("slice-only load matches full model on its layer range",
 TEST_CASE("serve_stage applies a hot reload between sessions",
           "[pipeline][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1007,7 +1007,7 @@ TEST_CASE("serve_stage applies a hot reload between sessions",
 TEST_CASE("serve_stage dials a named downstream through the resolver",
           "[pipeline][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1137,7 +1137,7 @@ TEST_CASE("serve_stage dials a named downstream through the resolver",
 TEST_CASE("TransformerModel::kv_pool_bytes scales with the block count",
           "[pipeline][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);

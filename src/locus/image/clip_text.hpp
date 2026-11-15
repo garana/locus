@@ -23,7 +23,7 @@ namespace locus::image {
  * that is the first position of the largest id (transformers'
  * argmax), else the first position of the end token (0 without one).
  *
- * Weights come from a "clip_text" GGUF (scripts/convert-flux.py), all
+ * Weights come from a "clip_text" GGUF (scripts/image/convert-flux.py), all
  * F32. Matrices stay in the GGUF mapping, so the GgufFile must outlive
  * the encoder.
  */

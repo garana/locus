@@ -66,7 +66,7 @@ std::vector<PipelineStage::BatchInput> make_batch(
 TEST_CASE("step_batch equals N step on a full stage (ragged)",
           "[pipeline][batch]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -123,7 +123,7 @@ TEST_CASE("step_batch equals N step on a full stage (ragged)",
 TEST_CASE("step_batch two-stage equals serial step (first + last roles)",
           "[pipeline][batch]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -203,7 +203,7 @@ TEST_CASE("step_batch two-stage equals serial step (first + last roles)",
 // and are byte-identical to a solo step().
 TEST_CASE("step_batch isolates a bad frame", "[pipeline][batch]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -248,7 +248,7 @@ TEST_CASE("step_batch isolates a bad frame", "[pipeline][batch]") {
 TEST_CASE("step_batch isolates an out-of-vocab token",
           "[pipeline][batch]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -307,7 +307,7 @@ void collect(StageExecutor& ex, int wake_r,
 TEST_CASE("StageExecutor batches distinct sessions transparently",
           "[executor][batch]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -369,7 +369,7 @@ TEST_CASE("StageExecutor batches distinct sessions transparently",
 // a solo step() and in submit order.
 TEST_CASE("StageExecutor honours a small max_batch", "[executor][batch]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);

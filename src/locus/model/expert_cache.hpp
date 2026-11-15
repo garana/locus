@@ -16,7 +16,7 @@ namespace locus::model {
  * it passes down by one. When that move takes it into the zone, it is
  * promoted (uploaded), and the expert pushed from the last zone rank
  * is evicted. A new expert joins at the tail, inside the zone while
- * the list is shorter than `capacity`. scripts/moe-trace-sim.py
+ * the list is shorter than `capacity`. scripts/text/moe-trace-sim.py
  * replays the same policy (wlru-step) on a recorded trace.
  *
  * Thread-safe: touch() serializes on a mutex.

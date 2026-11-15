@@ -158,7 +158,9 @@ nlohmann/json for untrusted request bodies: hand-rolled JSON parsing
 is where API vulnerabilities come from. A worker thread drives
 `Engine::step()`; handler threads submit and wait (`EngineLoop`),
 asleep until the worker publishes their request's progress after a
-step.
+step. A followed request (`follow`, #989) also gets its new tokens
+queued after each step, for `take()` to collect without the engine
+mutex, and a progress hook to wake whoever drives it.
 Chat messages are formatted by `chat::ChatTemplate`: the GGUF's
 Jinja source is fingerprinted to a known family (llama3, chatml,
 llama2, zephyr, deepseek, deepseek2, deepseek-coder) and rendered by
@@ -182,6 +184,17 @@ on a thread that already runs a loop, such as a stage's `/metrics`
 whose chunks queue up to a byte bound (the producer waits, for at most
 the write deadline, while the socket lags); each call wakes the loop
 through a pipe, and a client that leaves cancels the reply.
+`http::LoopServer` (#931; `locus-server --event-loop`) serves the
+server's routes that way: one I/O thread owns every connection (the
+`allow` list and the per-address cap at accept, `/health` answered on
+the loop; `/metrics` waits up to an engine step for its gauges, which
+would stall every connection there), and a job pool runs the head
+stage and the handler, a stream through a `Sink` that blocks at the
+reply's queue bound. An idle or slow client then holds a buffer, not a
+thread. A reply names its connection when it wakes the loop
+(`http::WakeList`) and deadlines sit in a min-heap (#990), so the I/O
+thread's work per chunk does not grow with the connections it holds.
+`http::Server` (a thread a connection) stays the default for now.
 
 `locus-router` (`router::Router`) proxies each request to one of
 several instances by kind: text, image-to-text (a chat, messages or
@@ -365,7 +378,7 @@ layer-expert slots; on GLM-5.2 (256 experts), 16 forwards touch 27.4%.
 So prefetch pays within a token (overlap the reads of the routed
 experts), not across tokens (an expert cache). `LOCUS_MOE_STATS=1`
 prints this telemetry. `LOCUS_MOE_TRACE=<file>` writes every pick as
-`layer expert`; `scripts/moe-trace-sim.py` replays a trace against
+`layer expert`; `scripts/text/moe-trace-sim.py` replays a trace against
 cache policies (LRU, LFU, Belady, step WLRU, static top) for a given
 GPU budget. On Vulkan both variables route MoE layers on the host, so
 the picks reach the CPU.
@@ -795,7 +808,7 @@ guarding the default path.
   original to 0.09, and rank the documents as the original does;
   llama.cpp drifts up to 0.3. The router gives `/v1/rerank` its own
   kind, `rerank`. ggml-org has no GGUF of the model, so
-  `scripts/convert-xlmr-reranker.py` makes one from BAAI's safetensors,
+  `scripts/text/convert-xlmr-reranker.py` makes one from BAAI's safetensors,
   with the vocab of bge-m3's GGUF (the same SentencePiece model).
 - API: `/v1/models`, `/metrics` (Prometheus), OpenAI-shaped logprobs
   (a log-softmax over the raw logits) and usage accounting.

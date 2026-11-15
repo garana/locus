@@ -23,7 +23,7 @@ Sources:
   files above. Section 3 states it from transformers' `modeling_t5.py`
   (`T5EncoderModel`) as known to the author; it must be checked against
   the transformers source in the reference venv before code depends on it.
-- The golden script `scripts/make-pixart-goldens.py` (section 8).
+- The golden script `scripts/image/make-pixart-goldens.py` (section 8).
 
 Anything else is marked "(assumption)".
 
@@ -790,7 +790,7 @@ rounds to uint8).
 
 `general.architecture = "t5encoder"`, with llama.cpp's key and tensor
 names (an exception to 7.1's checkpoint names; loading a GGUF from
-llama.cpp's own converter is not tested). scripts/convert-t5-encoder.py
+llama.cpp's own converter is not tested). scripts/text/convert-t5-encoder.py
 writes it; the tokenizer values are checked against T5Tokenizer
 (section 2).
 
@@ -882,7 +882,7 @@ and `quant_conv` are left out.
 
 ## 8. Goldens
 
-`scripts/make-pixart-goldens.py` runs the diffusers pipeline on the CPU:
+`scripts/image/make-pixart-goldens.py` runs the diffusers pipeline on the CPU:
 T5 in bf16, the DiT and the VAE in F32. Prompt `A small red apple on a
 wooden table, soft morning light.`, seed 146, guidance 4.5, 8 steps
 (the default of its STEPS argument), 512 x 512. It writes raw

@@ -98,7 +98,7 @@ SnacDecoder SnacDecoder::load(const gguf::GgufFile& g) {
     }
     // The tensor names follow SNAC's depthwise + noise, attention-free
     // decoder layout; refuse a GGUF that records another one (keys
-    // written by scripts/convert-snac.py; older files lack them). A key
+    // written by scripts/audio/convert-snac.py; older files lack them). A key
     // of another type is an error: get_bool would read it as absent.
     const auto flag = [&g](const char* key) {
         const gguf::Value* v = g.find(key);

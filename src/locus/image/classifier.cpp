@@ -16,7 +16,7 @@ std::unique_ptr<ImageClassifier> ImageClassifier::open(
     } else {
         throw gguf::Error("image classifier: " + path +
                           " is not a resnet or inception GGUF "
-                          "(scripts/convert-cnn.py)");
+                          "(scripts/image/convert-cnn.py)");
     }
     return c;
 }

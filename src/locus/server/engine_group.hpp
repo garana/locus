@@ -74,7 +74,14 @@ class EngineGroup {
     EngineLoop::View wait_done_or_cancel(
         std::uint64_t id, const std::function<bool()>& alive);
     void cancel(std::uint64_t id);
+    void follow(std::uint64_t id);
+    bool take(std::uint64_t id, EngineLoop::View& acc);
+    void unfollow(std::uint64_t id);
     /** @} */
+
+    /** EngineLoop::set_progress_hook on every engine (one hook, run by
+     *  each engine's worker). */
+    void set_progress_hook(const std::function<void()>& hook);
 
     /** EngineLoop::release, and the request no longer counts toward its
      *  engine's load. Idempotent: a stream may release twice (on its

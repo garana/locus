@@ -23,7 +23,7 @@ namespace {
 const std::string kDir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
 const std::string kModel = kDir + "models/t5-xxl-enc-f16.gguf";
 
-// The synthetic model of scripts/make-t5-goldens.py synth.
+// The synthetic model of scripts/text/make-t5-goldens.py synth.
 constexpr std::uint32_t kVocab = 32, kWidth = 16, kHeads = 4, kHeadDim = 4,
                         kFfn = 24, kBlocks = 2, kBuckets = 8, kMaxDist = 16,
                         kTokens = 20;
@@ -170,7 +170,7 @@ TEST_CASE("t5 relative position buckets match the reference table",
 }
 
 // VALUES, on every box: the synthetic encoder against torch's
-// T5EncoderModel with the same weights (scripts/make-t5-goldens.py
+// T5EncoderModel with the same weights (scripts/text/make-t5-goldens.py
 // synth). Pins the rms norms, the bias per distance bucket (20 tokens
 // reach past max_distance 16), the unscaled attention and the gated
 // tanh GELU.
@@ -235,12 +235,13 @@ TEST_CASE("t5 encoder rejects inconsistent head sizes", "[t5][image]") {
 }
 
 // PixArt's T5 v1.1 XXL (F16) against the torch F32 run of the same
-// weights (scripts/make-t5-goldens.py real): the golden prompt, the
+// weights (scripts/text/make-t5-goldens.py real): the golden prompt, the
 // empty negative prompt and, with LOCUS_HEAVY_TESTS, a 107-token
 // caption (about 75 s more on an M2 Pro).
 TEST_CASE("t5 xxl encoder matches the reference", "[t5][image][e2e]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("t5-xxl-enc-f16.gguf absent; see scripts/convert-t5-encoder.py");
+        SKIP("t5-xxl-enc-f16.gguf absent; see "
+             "scripts/text/convert-t5-encoder.py");
     }
     auto g = locus::gguf::GgufFile::open(kModel);
     const auto enc = T5Encoder::load(g);

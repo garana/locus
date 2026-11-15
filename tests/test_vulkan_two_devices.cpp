@@ -64,7 +64,7 @@ TEST_CASE("two threads on two vulkan devices decode independently",
         SKIP("needs two Vulkan devices (e.g. a GPU and llvmpipe)");
     }
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = TransformerModel::load(g);
@@ -117,7 +117,7 @@ TEST_CASE("a vulkan KV cache cannot run on another device",
         SKIP("needs two Vulkan devices (e.g. a GPU and llvmpipe)");
     }
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = TransformerModel::load(g);
@@ -167,7 +167,7 @@ TEST_CASE("vulkan caches freed across two devices' backend calls",
         SKIP("needs two Vulkan devices (e.g. a GPU and llvmpipe)");
     }
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = TransformerModel::load(g);

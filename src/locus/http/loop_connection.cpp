@@ -3,6 +3,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <utility>
 
@@ -30,17 +31,56 @@ std::size_t input_cap(const Limits& l) {
 
 }  // namespace
 
+namespace {
+/** Writes one wake byte to fd (EAGAIN: the pipe is full, so a wake is
+ *  already pending). */
+void wake_byte(int fd) {
+    const char b = 1;
+    while (::write(fd, &b, 1) < 0 && errno == EINTR) {
+    }
+}
+}  // namespace
+
+void WakeList::push(std::uint64_t id) {
+    bool first;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        first = ids_.empty();
+        ids_.push_back(id);
+    }
+    // A later push finds the list non-empty: the byte for this one wakes
+    // the loop, whose take() gets them all.
+    if (first && wake_fd_ >= 0) {
+        wake_byte(wake_fd_);
+    }
+}
+
+std::vector<std::uint64_t> WakeList::take() {
+    std::vector<std::uint64_t> ids;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        ids.swap(ids_);
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
 LoopReply::LoopReply(int wake_fd, std::size_t max_buffer,
-                     int write_deadline_ms)
+                     int write_deadline_ms,
+                     std::shared_ptr<WakeList> wake_list,
+                     std::uint64_t wake_id)
     : wake_fd_(wake_fd),
+      wake_list_(std::move(wake_list)),
+      wake_id_(wake_id),
       max_buffer_(max_buffer == 0 ? 1 : max_buffer),
       write_deadline_ms_(write_deadline_ms) {}
 
 void LoopReply::wake() const {
-    if (wake_fd_ < 0) return;
-    const char b = 1;
-    // EAGAIN: the pipe is full, so a wake is already pending.
-    while (::write(wake_fd_, &b, 1) < 0 && errno == EINTR) {
+    if (wake_list_) {
+        wake_list_->push(wake_id_);
+    } else if (wake_fd_ >= 0) {
+        wake_byte(wake_fd_);
     }
 }
 
@@ -100,9 +140,33 @@ void LoopReply::end() {
     wake();
 }
 
+void LoopReply::fail() {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (cancelled_) return;  // wake_fd may be gone (see end())
+        if (state_ == State::kPending) {
+            Response r;
+            r.status = 500;
+            r.set_content(status_error_body(500), "application/json");
+            res_ = std::move(r);
+            state_ = State::kBuffered;
+        } else if (state_ == State::kStreaming) {
+            state_ = State::kFailed;
+        } else {
+            return;  // answered already
+        }
+    }
+    wake();
+}
+
 bool LoopReply::cancelled() const {
     std::lock_guard<std::mutex> lk(mu_);
     return cancelled_;
+}
+
+bool LoopReply::client_gone() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return cancelled_ || peer_closed_;
 }
 
 void LoopReply::cancel() {
@@ -192,7 +256,8 @@ void LoopConnection::answer() {
         req.keep_alive && served_ < cfg_.max_requests_per_conn;
     if (async_) {
         auto reply = std::make_shared<LoopReply>(
-            cfg_.wake_fd, cfg_.max_stream_buffer, cfg_.write_deadline_ms);
+            cfg_.wake_fd, cfg_.max_stream_buffer, cfg_.write_deadline_ms,
+            cfg_.wake_list, cfg_.wake_id);
         pending_ = reply;
         pending_keep_ = keep;
         pending_head_ = req.is_head;
@@ -256,6 +321,7 @@ void LoopConnection::take_reply() {
                 break;
             case LoopReply::State::kStreaming:
             case LoopReply::State::kEnded:
+            case LoopReply::State::kFailed:
                 if (!r.head_taken_) {
                     if (!write_chunked_head(r.res_, pending_keep_, out_,
                                             err)) {
@@ -276,6 +342,11 @@ void LoopConnection::take_reply() {
                 }
                 if (r.state_ == LoopReply::State::kEnded) {
                     if (!pending_head_) out_ += last_chunk();
+                    done = true;
+                } else if (r.state_ == LoopReply::State::kFailed) {
+                    // No terminating chunk: the client sees a truncated
+                    // transfer once the connection closes.
+                    close_after_ = true;
                     done = true;
                 }
                 break;
@@ -327,7 +398,9 @@ bool LoopConnection::pump() {
 LoopConnection::Next LoopConnection::next() const {
     if (abort_) return Next::kClose;
     if (!out_.empty()) return Next::kWrite;
-    if (pending_) return Next::kRead;  // the reply comes by on_wake()
+    // The reply comes by on_wake(); after EOF the socket stays readable,
+    // so watch nothing until then.
+    if (pending_) return peer_gone_ ? Next::kIdle : Next::kRead;
     if (close_after_ || peer_gone_) return Next::kClose;
     return Next::kRead;
 }
@@ -338,12 +411,18 @@ LoopConnection::Next LoopConnection::on_event(const sys::Poller::Event& ev) {
         if (!fill()) peer_gone_ = true;
     }
     if (pending_) {
-        // EOF while the answer is pending: the client is gone (as
-        // http::Server's probe reads it), so its producer stops. Input
-        // at the cap can no longer be read, and a level-triggered
-        // readable socket would spin: close that client too.
-        if (peer_gone_ || in_.size() >= input_cap(cfg_.limits)) {
+        // Input at the cap can no longer be read, and a level-triggered
+        // readable socket would spin: close that client.
+        if (in_.size() >= input_cap(cfg_.limits)) {
             return Next::kClose;  // the destructor cancels the reply
+        }
+        // EOF while the answer is pending: the client has left (as
+        // http::Server's probe reads it), so a long producer stops; the
+        // answer it gives (a 499, say) is still written, then the
+        // connection closes.
+        if (peer_gone_) {
+            std::lock_guard<std::mutex> lk(pending_->mu_);
+            pending_->peer_closed_ = true;
         }
     }
     if (!pump()) return Next::kClose;

@@ -109,7 +109,7 @@ TEST_CASE("flux euler step moves by the sigma gap", "[flux][image]") {
 // no post-quant conv.
 TEST_CASE("flux vae decoder matches diffusers", "[flux][image]") {
     if (!std::filesystem::exists(kVae)) {
-        SKIP("no " << kVae << " (scripts/convert-flux.py --vae-out)");
+        SKIP("no " << kVae << " (scripts/image/convert-flux.py --vae-out)");
     }
     const auto g = locus::gguf::GgufFile::open(kVae);
     const auto vae = locus::image::SdVaeDecoder::load(g);
@@ -131,7 +131,7 @@ TEST_CASE("flux vae decoder matches diffusers", "[flux][image]") {
 // scale.
 TEST_CASE("flux vae encoder matches diffusers", "[flux][image]") {
     if (!std::filesystem::exists(kVae)) {
-        SKIP("no " << kVae << " (scripts/convert-flux.py --vae-out)");
+        SKIP("no " << kVae << " (scripts/image/convert-flux.py --vae-out)");
     }
     const auto g = locus::gguf::GgufFile::open(kVae);
     const auto vae = locus::image::SdVaeDecoder::load(g);

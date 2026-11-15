@@ -49,7 +49,7 @@ void collect(StageExecutor& ex, int wake_r,
 TEST_CASE("StageExecutor runs steps off-thread and matches inline step",
           "[executor][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -118,7 +118,7 @@ TEST_CASE("StageExecutor runs steps off-thread and matches inline step",
 TEST_CASE("StageExecutor reports a failed step rather than throwing",
           "[executor][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
