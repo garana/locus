@@ -15,6 +15,7 @@
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
 #include "locus/image/pixart_dit.hpp"
+#include "locus/image/tensor_read.hpp"
 #include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
@@ -152,19 +153,10 @@ FluxDit FluxDit::load(const gguf::GgufFile& g) {
     }
 
     const auto info = [&](const std::string& name) {
-        const gguf::TensorInfo* ti = g.find_tensor(name);
-        if (ti == nullptr) throw gguf::Error("flux: missing tensor " + name);
-        return ti;
+        return require_tensor(g, "flux", name);
     };
     const auto vec = [&](const std::string& name, std::size_t n) {
-        const gguf::TensorInfo* ti = info(name);
-        if (ti->type != gguf::TensorType::kF32 || ti->nelements() != n) {
-            throw gguf::Error("flux: " + name + " must be F32 with " +
-                              std::to_string(n) + " values");
-        }
-        std::vector<float> out(n);
-        std::memcpy(out.data(), g.tensor_data(*ti).data(), n * sizeof(float));
-        return out;
+        return read_floats(g, "flux", name, n);
     };
     // A Linear [rows, cols], BF16, Q8_0 (convert-flux.py --dit-type
     // q8_0) or F32.
