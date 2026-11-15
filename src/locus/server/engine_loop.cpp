@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <exception>
 #include <limits>
+#include <optional>
 #include <thread>
+#include <utility>
 
 #include "locus/sys/perf_counters.hpp"
 
@@ -42,9 +44,13 @@ class EngineLoop::WatchScope {
 
 EngineLoop::EngineLoop(const model::TransformerModel& m,
                        tok::TokenId eos,
-                       engine::Engine::Config cfg)
+                       engine::Engine::Config cfg, Setup setup)
     : engine_(m, eos, cfg),
       kv_type_(cfg.kv_type),
+      thread_init_(std::move(setup.thread_init)),
+      pool_(setup.threads > 0
+                ? std::make_unique<sys::ThreadPool>(setup.threads - 1)
+                : nullptr),
       worker_([this] { run(); }) {}
 
 EngineLoop::~EngineLoop() {
@@ -124,6 +130,15 @@ void EngineLoop::run() {
     // matvec slice, so register its cache counters for /metrics too (the
     // pool workers cover the fan-out). No-op unless perf is available.
     locus::sys::perf::ThreadCounters perf_counters;
+    // One of several engines (i#929): bind this thread to the engine's
+    // device, and fan its forwards out to the engine's own pool.
+    if (thread_init_) {
+        thread_init_();
+    }
+    std::optional<sys::ThreadPool::Scope> scope;
+    if (pool_) {
+        scope.emplace(*pool_);
+    }
     std::unique_lock<std::mutex> lk(mu_);
     while (!stop_) {
         try {
@@ -261,9 +276,12 @@ EngineLoop::View EngineLoop::wait_done_or_cancel(
     }
 }
 
-void EngineLoop::release(std::uint64_t id) {
+bool EngineLoop::release(std::uint64_t id) {
     auto lk = lock_turn();
+    const engine::Request* r = engine_.get(id);
+    const bool gone = r == nullptr || engine::is_terminal(r->status);
     engine_.release(id);
+    return gone;
 }
 
 void EngineLoop::cancel(std::uint64_t id) {

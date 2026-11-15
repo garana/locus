@@ -269,7 +269,14 @@ inline constexpr const char* kCommonHelp =
     "                   length adapts to how many drafts pass\n"
     "  --spec-fixed     always draft --spec-draft tokens\n"
     "  --device N       the GPU to run on with --backend vulkan or\n"
-    "                   cuda (--backends lists the Vulkan devices)\n"
+    "                   cuda (--backends lists the Vulkan devices);\n"
+    "                   locus-server on Vulkan: repeat it, one per\n"
+    "                   engine\n"
+    "  --engines N      locus-server: N engines over one model, each\n"
+    "                   its own KV pool (--ctx each): N shares of the\n"
+    "                   CPU cores, or one --device each on Vulkan;\n"
+    "                   each has its own prefix cache, so a repeated\n"
+    "                   prompt reuses its prefix only on its engine\n"
     "  --kv-type T      KV cache precision: f32 (default, exact),\n"
     "                   f16 (half the cache and attention reads;\n"
     "                   GPU-accelerated for GQA models), q8, q4\n"
@@ -483,6 +490,12 @@ struct BackendArgs {
      *  unset means the backend's first device. */
     std::uint32_t device = 0;
     bool device_set = false;
+    /** Every --device, in order (locus-server: one per engine, i#929);
+     *  `device` is the last. */
+    std::vector<std::uint32_t> devices;
+    /** From --engines N: locus-server's engine count (0 = one, or one
+     *  per --device). */
+    std::uint32_t engines = 0;
     /** --batch-decode: enable R10 cross-sequence batched decode. */
     bool batch_decode = false;
     /** --no-batch-prefill: force per-token prompt ingestion. */
@@ -727,9 +740,15 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
         } else if (a == "--device" && i + 1 < argc) {
             number("--device", argv[++i], out.device);
             out.device_set = true;
+            out.devices.push_back(out.device);
         } else if (a.rfind("--device=", 0) == 0) {
             number("--device", std::string(a.substr(9)), out.device);
             out.device_set = true;
+            out.devices.push_back(out.device);
+        } else if (a == "--engines" && i + 1 < argc) {
+            number("--engines", argv[++i], out.engines);
+        } else if (a.rfind("--engines=", 0) == 0) {
+            number("--engines", std::string(a.substr(10)), out.engines);
         } else if (a == "--batch-decode") {
             out.batch_decode = true;
         } else if (a == "--no-batch-prefill") {
@@ -800,6 +819,13 @@ inline std::string apply_device(const BackendArgs& a) {
         if (const char* env = std::getenv("LOCUS_BACKEND")) {
             be = env;
         }
+    }
+    if (a.devices.size() > 1) {
+        // One engine per device (locus-server, i#929): each engine binds
+        // its own thread, so no process device is set here.
+        return be == "vulkan"
+                   ? ""
+                   : "several --device entries need --backend vulkan";
     }
     if (be == "vulkan") {
         locus::backend::vulkan_set_device(static_cast<int>(a.device));

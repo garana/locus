@@ -102,7 +102,7 @@ struct SseKeepalive {
  *     terminal.
  */
 bool write_sse_step(http::Sink& sink, SseKeepalive& ka, std::string& payload,
-                    EngineLoop& loop, std::uint64_t id, bool terminal) {
+                    EngineGroup& loop, std::uint64_t id, bool terminal) {
     ka.pad(payload);
     if (!payload.empty() &&
         !sink.write(std::string_view(payload.data(), payload.size()))) {
@@ -1124,13 +1124,24 @@ engine::Engine::Config OpenAiServer::resolve_engine_cfg(
     return cfg;
 }
 
+std::vector<EngineGroup::Slot> OpenAiServer::engine_slots(
+    const Options& o) {
+    // One disk prefix store serves one engine: several would share its
+    // files and helper without a lock between them.
+    if (o.engines > 1 && o.engine.disk_prefix) {
+        throw std::invalid_argument(
+            "several engines cannot share the disk prefix cache");
+    }
+    return EngineGroup::plan(o.engines, o.engine_devices);
+}
+
 OpenAiServer::OpenAiServer(const model::TransformerModel& m,
                            const tok::Tokenizer& tok,
                            Options opt)
     : model_(m),
       tok_(tok),
       opt_(std::move(opt)),
-      loop_(m, tok.eos_id(), resolve_engine_cfg(opt_)),
+      loop_(m, tok.eos_id(), resolve_engine_cfg(opt_), engine_slots(opt_)),
       n_vocab_(m.hparams().n_vocab) {
     if (!opt_.auth_helper_argv.empty()) {
         std::vector<std::unique_ptr<auth::HelperConnection>> conns;
@@ -1308,7 +1319,17 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
     // Vulkan when the PixArt models run there (see handle_pixart).
     cpu_name_ = sys::cpu_name();
     const std::string_view be = m.active_backend().name;
-    if (be == "vulkan") {
+    if (be == "vulkan" && !opt_.engine_devices.empty()) {
+        // One engine per device (i#929): each by name, without opening
+        // it (vulkan_devices opens none).
+        const auto all = backend::vulkan_devices();
+        for (const int d : opt_.engine_devices) {
+            devices_.push_back(
+                {"vulkan", d >= 0 && static_cast<std::size_t>(d) < all.size()
+                               ? all[static_cast<std::size_t>(d)].name
+                               : std::string()});
+        }
+    } else if (be == "vulkan") {
         devices_.push_back({"vulkan", backend::vulkan_device_name()});
     } else if (be == "cuda") {
         devices_.push_back({"cuda", backend::cuda_device_name()});
@@ -1936,56 +1957,73 @@ void OpenAiServer::install_routes() {
             // lock. Phase times are per-request wall time, so with
             // concurrent requests their sums exceed the elapsed time;
             // engine_busy is the engine's own step time.
-            const engine::EngineMetrics& em = loop_.metrics();
+            // With several engines (i#929) every series is their sum.
             constexpr auto kRelaxed = std::memory_order_relaxed;
             auto secs = [](std::uint64_t ns) {
                 return static_cast<double>(ns) / 1e9;
             };
+            auto total = [&](auto field) {
+                std::uint64_t t = 0;
+                for (std::size_t e = 0; e < loop_.size(); ++e) {
+                    t += (loop_.metrics(e).*field).load(kRelaxed);
+                }
+                return t;
+            };
+            auto hist = [&](engine::Histogram engine::EngineMetrics::*h) {
+                engine::Histogram::Snapshot s;
+                for (std::size_t e = 0; e < loop_.size(); ++e) {
+                    s.add((loop_.metrics(e).*h).snapshot());
+                }
+                return s;
+            };
+            using EM = engine::EngineMetrics;
             mt.histogram("locus_queue_seconds",
                          "Submit to first admission, per request.",
-                         em.queue.snapshot());
+                         hist(&EM::queue));
             mt.histogram("locus_prefill_seconds",
                          "First admission to first token, per request.",
-                         em.prefill.snapshot());
+                         hist(&EM::prefill));
             mt.histogram("locus_time_to_first_token_seconds",
                          "Submit to first token, per request.",
-                         em.ttft.snapshot());
+                         hist(&EM::ttft));
             mt.histogram("locus_decode_token_seconds",
                          "Time per generated token after the first, per "
                          "request.",
-                         em.decode_token.snapshot());
+                         hist(&EM::decode_token));
             mt.histogram("locus_request_seconds",
                          "Submit to done, per completed request.",
-                         em.request.snapshot());
+                         hist(&EM::request));
             counter("locus_prefill_tokens_total",
                     "Prompt tokens computed (not reused) by completed "
                     "requests.",
-                    em.prefill_tokens.load(kRelaxed));
+                    total(&EM::prefill_tokens));
             // Prefill wall time is locus_prefill_seconds_sum: a
             // locus_prefill_seconds_total counter would repeat it and
             // share the histogram's OpenMetrics family name.
             counter("locus_decode_tokens_total",
                     "Tokens after the first, of completed requests.",
-                    em.decode_tokens.load(kRelaxed));
+                    total(&EM::decode_tokens));
             mt.counter("locus_decode_seconds_total",
                        "Decode wall time of completed requests.",
-                       secs(em.decode_ns.load(kRelaxed)));
+                       secs(total(&EM::decode_ns)));
             mt.counter("locus_engine_busy_seconds_total",
                        "Time the engine spent in scheduling steps.",
-                       secs(em.busy_ns.load(kRelaxed)));
+                       secs(total(&EM::busy_ns)));
             counter("locus_engine_steps_total", "Engine scheduling steps.",
-                    em.steps.load(kRelaxed));
+                    total(&EM::steps));
+            gauge("locus_engines", "Engines serving the language model.",
+                  loop_.size());
             gauge("locus_sequences_running",
                   "Sequences running after the last step.",
-                  em.running.load(kRelaxed));
+                  total(&EM::running));
             gauge("locus_requests_waiting",
                   "Requests waiting for admission after the last step.",
-                  em.waiting.load(kRelaxed));
+                  total(&EM::waiting));
             gauge("locus_batch_tokens",
                   "Tokens the model computed in the last engine step "
                   "(prefill, decode and speculative verify); 0 when "
                   "idle.",
-                  em.batch_tokens.load(kRelaxed));
+                  total(&EM::batch_tokens));
             // Each block in use counted once; with locus_kv_blocks_free
             // the three sum to locus_kv_blocks_total.
             mt.family("locus_kv_blocks_used",
@@ -1994,10 +2032,10 @@ void OpenAiServer::install_routes() {
                       "else only the prefix cache.",
                       "gauge");
             for (const auto& [state, v] :
-                 {std::pair<const char*, std::uint32_t>{
-                      "prefilling", em.kv_blocks_prefilling.load(kRelaxed)},
-                  {"decoding", em.kv_blocks_decoding.load(kRelaxed)},
-                  {"cached", em.kv_blocks_cached.load(kRelaxed)}}) {
+                 {std::pair<const char*, std::uint64_t>{
+                      "prefilling", total(&EM::kv_blocks_prefilling)},
+                  {"decoding", total(&EM::kv_blocks_decoding)},
+                  {"cached", total(&EM::kv_blocks_cached)}}) {
                 mt.value("locus_kv_blocks_used",
                          MetricsText::label("state", state),
                          std::uint64_t{v});
