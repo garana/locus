@@ -1499,6 +1499,9 @@ kernel void attn_rows_tiled(device const float* q [[buffer(0)]],
 // same threadgroup memory and O += P V. head_dim is a multiple of 8,
 // at most 128. Same parameters and buffers as attn_rows.
 constant constexpr uint kFaC = 32;  // positions a chunk
+// attn_mma's K staging (a lane a position) and its softmax (four lanes
+// a row of 8 scores each) take a chunk of exactly one simdgroup.
+static_assert(kFaC == 32, "attn_mma: a chunk is one simdgroup wide");
 
 // The operands attn_mma reads: the paged, causal prefill (AttnRowsParams)
 // or the image transformers' contiguous, unmasked rows (SeqAttnParams).
@@ -1567,7 +1570,7 @@ struct MmaRows {
 
 // NSG simdgroups a threadgroup, 8 queries each.
 template <typename S, uint NSG>
-inline void attn_mma(thread const S& src, uint g, uint tid, uint sg,
+inline void attn_mma(thread const S& src, uint g, uint sg,
                      uint lane, threadgroup float* kv,
                      threadgroup float* spall, threadgroup float* dgall) {
     constexpr uint kQ = 8 * NSG;
@@ -1603,10 +1606,19 @@ inline void attn_mma(thread const S& src, uint g, uint tid, uint sg,
         // K transposed (hd x 32): lane j takes position c + j, the
         // simdgroups its dims, so the writes are contiguous.
         {
+            // Four dims a load (hd is a multiple of 8; packed, so any
+            // row offset is fine).
             const uint j = c + lane;
             const ulong at = j < last ? src.k_at(j, h) : 0;
-            for (uint i = sg; i < hd; i += NSG) {
-                kv[i * kFaC + lane] = j < last ? src.kbuf()[at + i] : 0.0f;
+            for (uint i = sg * 4; i < hd; i += NSG * 4) {
+                const float4 v =
+                    j < last ? float4(*(device const packed_float4*)(
+                                   src.kbuf() + at + i))
+                             : float4(0.0f);
+                kv[i * kFaC + lane] = v.x;
+                kv[(i + 1) * kFaC + lane] = v.y;
+                kv[(i + 2) * kFaC + lane] = v.z;
+                kv[(i + 3) * kFaC + lane] = v.w;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1677,8 +1689,11 @@ inline void attn_mma(thread const S& src, uint g, uint tid, uint sg,
         for (uint r = sg; r < kFaC; r += NSG) {
             const uint j = c + r;
             const ulong at = j < last ? src.v_at(j, h) : 0;
-            for (uint i = lane; i < hd; i += 32) {
-                kv[r * hd + i] = j < last ? src.vbuf()[at + i] : 0.0f;
+            for (uint i = lane * 4; i < hd; i += 128) {
+                *(threadgroup float4*)(kv + r * hd + i) =
+                    j < last ? float4(*(device const packed_float4*)(
+                                   src.vbuf() + at + i))
+                             : float4(0.0f);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1721,14 +1736,13 @@ kernel void attn_rows_mma(device const float* q [[buffer(0)]],
                           device float* out [[buffer(3)]],
                           constant AttnRowsParams& pr [[buffer(4)]],
                           uint g [[threadgroup_position_in_grid]],
-                          uint tid [[thread_index_in_threadgroup]],
                           uint sg [[simdgroup_index_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float kv[kFaC * 128];
     threadgroup float spall[4 * 8 * kFaC];
     threadgroup float dgall[4 * 64];
     const MmaPaged src{q, pool, blocks, out, &pr};
-    attn_mma<MmaPaged, 4>(src, g, tid, sg, lane, kv, spall, dgall);
+    attn_mma<MmaPaged, 4>(src, g, sg, lane, kv, spall, dgall);
 }
 
 // Unmasked attention of n_q query rows over n_kv key / value rows (the
@@ -1743,14 +1757,13 @@ kernel void seq_attn_mma(device const float* q [[buffer(0)]],
                          device float* out [[buffer(3)]],
                          constant SeqAttnParams& p [[buffer(4)]],
                          uint g [[threadgroup_position_in_grid]],
-                         uint tid [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float kv[kFaC * 128];
     threadgroup float spall[kSeqAttnSg * 8 * kFaC];
     threadgroup float dgall[kSeqAttnSg * 64];
     const MmaRows src{q, k, v, out, &p};
-    attn_mma<MmaRows, kSeqAttnSg>(src, g, tid, sg, lane, kv, spall, dgall);
+    attn_mma<MmaRows, kSeqAttnSg>(src, g, sg, lane, kv, spall, dgall);
 }
 
 // ---------------------------------------------------------------------
