@@ -1179,3 +1179,19 @@ kernel void attn_rows_tiled(device const float* q [[buffer(0)]],
     }
 }
 
+
+struct AxpyParams {
+    uint n;
+    float a;
+};
+
+// x[i] += a * y[i]: a routed expert's output into the residual, by its
+// mixing weight (MoE, i#868).
+kernel void axpy(device float* x [[buffer(0)]],
+                 device const float* y [[buffer(1)]],
+                 constant AxpyParams& p [[buffer(2)]],
+                 uint i [[thread_position_in_grid]]) {
+    if (i < p.n) {
+        x[i] += p.a * y[i];
+    }
+}
