@@ -885,8 +885,13 @@ constant constexpr uint kMmTM = 64;
 constant constexpr uint kMmTN = 32;
 constant constexpr uint kMmTK = 32;
 constant constexpr uint kMmPA = kMmTK + 8;
-constant constexpr uint kMmPB = kMmTK + 8;
 constant constexpr uint kMmPO = kMmTM + 4;
+// B staged as [k][token] (tokens padded), so its blocks load straight.
+constant constexpr uint kMmPBT = kMmTN + 4;
+// The output tile reuses A's threadgroup memory after the K loop: a
+// threadgroup then holds 15 KB, not 24, so more fit a core at once
+// (i#1063: +14 to 16% on the prefill).
+static_assert(kMmTN * kMmPO <= kMmTM * kMmPA, "mm_tile: so fits in sa");
 
 // Sub-block j's 6-bit scale and min (ggml's get_scale_min_k4).
 inline void mm_scale_min(uint j, device const uchar* q, thread uint& sc,
@@ -1085,22 +1090,21 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
         } else {
             for (uint i = 0; i < 16; ++i) da[i] = 0.0f;
         }
-        threadgroup float* db = sb + bt * kMmPB + bk;
+        threadgroup float* db = sb + bk * kMmPBT + bt;
         if (b_in) {
             device const float* src = xrow + k0 + bk;
-            for (uint i = 0; i < 8; ++i) db[i] = src[i];
+            for (uint i = 0; i < 8; ++i) db[i * kMmPBT] = src[i];
         } else {
-            for (uint i = 0; i < 8; ++i) db[i] = 0.0f;
+            for (uint i = 0; i < 8; ++i) db[i * kMmPBT] = 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kk = 0; kk < kMmTK; kk += 8) {
             simdgroup_float8x8 a[4], bm[2];
             for (uint i = 0; i < 4; ++i)
                 simdgroup_load(a[i], sa + (rm + 8 * i) * kMmPA + kk, kMmPA);
-            // B is k x tokens: the [token][k] tile, loaded transposed.
+            // B is k x tokens, staged that way.
             for (uint j = 0; j < 2; ++j)
-                simdgroup_load(bm[j], sb + (rn + 8 * j) * kMmPB + kk, kMmPB,
-                               ulong2(0, 0), true);
+                simdgroup_load(bm[j], sb + kk * kMmPBT + rn + 8 * j, kMmPBT);
             for (uint i = 0; i < 4; ++i)
                 for (uint j = 0; j < 2; ++j)
                     simdgroup_multiply_accumulate(acc[i][j], a[i], bm[j],
@@ -1135,8 +1139,8 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
                      uint tid [[thread_index_in_threadgroup]],          \
                      uint sg [[simdgroup_index_in_threadgroup]]) {      \
         threadgroup float sa[kMmTM * kMmPA];                            \
-        threadgroup float sb[kMmTN * kMmPB];                            \
-        threadgroup float so[kMmTN * kMmPO];                            \
+        threadgroup float sb[kMmTK * kMmPBT];                           \
+        threadgroup float* so = sa;                                     \
         mm_tile<loader, false>(wbase, xbase, ybase, p, tgi, tid, sg,    \
                                sa, sb, so, nullptr);                    \
     }                                                                   \
@@ -1149,8 +1153,8 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
                           uint tid [[thread_index_in_threadgroup]],     \
                           uint sg [[simdgroup_index_in_threadgroup]]) { \
         threadgroup float sa[kMmTM * kMmPA];                            \
-        threadgroup float sb[kMmTN * kMmPB];                            \
-        threadgroup float so[kMmTN * kMmPO];                            \
+        threadgroup float sb[kMmTK * kMmPBT];                           \
+        threadgroup float* so = sa;                                     \
         mm_tile<loader, true>(wbase, xbase, ybase, p, tgi, tid, sg, sa, \
                               sb, so, idx);                             \
     }
