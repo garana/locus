@@ -173,3 +173,56 @@ TEST_CASE("EngineLoop cancel preempts a running worker (turnstile)",
     REQUIRE(v.status == locus::engine::Status::kCancelled);  // preempted
     REQUIRE(v.generated.size() < max_new);  // not run to completion
 }
+
+// i#928: waiters sleep until the worker publishes progress. A request
+// the pool can never admit parks the worker (no step publishes again),
+// so cancel() must publish itself: a waiter on it wakes with kCancelled
+// instead of sleeping to its deadline. A wait with nothing to report
+// sleeps to its deadline and no further.
+TEST_CASE("EngineLoop wakes a waiter when a parked request is cancelled",
+          "[e2e][engine_loop]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::engine::Engine::Config cfg;
+    cfg.n_blocks = 2;  // 32 tokens, the 16 of decode headroom included
+    locus::server::EngineLoop loop(model, tok.eos_id(), cfg);
+
+    std::vector<locus::tok::TokenId> big;
+    for (int i = 0; i < 4; ++i) {
+        const auto t = tok.encode("Once upon a time there was a dog", i == 0);
+        big.insert(big.end(), t.begin(), t.end());
+    }
+    REQUIRE_FALSE(loop.admit_error(
+                          static_cast<std::uint32_t>(big.size()))
+                      .empty());
+    // submit() does not check admission: the request parks at the front.
+    const std::uint64_t id = loop.submit(big, 4);
+
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+    const auto idle =
+        loop.wait_progress(id, 0, std::chrono::milliseconds(300));
+    const auto waited = Clock::now() - t0;
+    CHECK(idle.status == locus::engine::Status::kWaiting);
+    CHECK(waited >= std::chrono::milliseconds(300));
+
+    std::thread canceller([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        loop.cancel(id);
+    });
+    const auto t1 = Clock::now();
+    const auto v = loop.wait_progress(id, 0, std::chrono::seconds(10));
+    const auto woke = Clock::now() - t1;
+    canceller.join();
+    CHECK(v.status == locus::engine::Status::kCancelled);
+    CHECK(woke < std::chrono::seconds(5));
+
+    // The queue is free again: a short request completes.
+    const auto prompt = tok.encode("Once upon a time", true);
+    CHECK(loop.wait_done(loop.submit(prompt, 4)).status ==
+          locus::engine::Status::kDone);
+}

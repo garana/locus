@@ -156,7 +156,9 @@ read-only.
 A first-party HTTP/1.1 server (`src/locus/http`) and vendored
 nlohmann/json for untrusted request bodies: hand-rolled JSON parsing
 is where API vulnerabilities come from. A worker thread drives
-`Engine::step()`; handler threads submit and wait (`EngineLoop`).
+`Engine::step()`; handler threads submit and wait (`EngineLoop`),
+asleep until the worker publishes their request's progress after a
+step.
 Chat messages are formatted by `chat::ChatTemplate`: the GGUF's
 Jinja source is fingerprinted to a known family (llama3, chatml,
 llama2, zephyr, deepseek, deepseek2, deepseek-coder) and rendered by
