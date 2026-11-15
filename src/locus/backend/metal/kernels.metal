@@ -1856,3 +1856,138 @@ kernel void shared_add(device float* x [[buffer(0)]],
         p.gated != 0 ? as_type<float>(route[p.gate_at + i / p.n]) : 1.0f;
     x[i] += g * y[i];
 }
+
+// ---------------------------------------------------------------------
+// conv2d (i#1050): the image VAEs' 2D convolution, groups 1, as an
+// implicit GEMM on the simdgroup matrices: out[oc][p] = bias[oc] +
+// sum_k W[oc][k] B[k][p], k = (ci, ky, kx) in the weight's order and B
+// the input pixels under the kernel (zero outside the plane).
+
+struct Conv2dParams {
+    uint in_ch, in_h, in_w, out_ch, oh, ow, kh, kw, stride, pad;
+    uint has_bias, K, P;  // K = in_ch kh kw, P = oh ow
+};
+
+constant constexpr uint kCvT = 64;  // a tile's out channels
+constant constexpr uint kCvP = 32;  // a tile's pixels
+constant constexpr uint kCvK = 16;  // the K step staged a time
+// The staged tiles' row strides, padded off a multiple of 32 floats so
+// a simdgroup_load's 8 rows fall in different banks.
+constant constexpr uint kCvPA = kCvK + 4;
+constant constexpr uint kCvPB = kCvP + 4;
+
+// tab[k]: k's input offset (ci in_h + ky) in_w + kx, then ky << 16 | kx,
+// so the staging divides nothing. Threadgroup g (128 threads) takes
+// out channels 64 (g / tiles_p) .. +64 and pixels 32 (g % tiles_p) ..
+// +32; simdgroup sg a 32 x 16 quarter as 4 x 2 blocks of 8 x 8 (more
+// accumulators a simdgroup ran slower: 64 x 64 tiles took twice as
+// long). Each K step stages W's 64 x 16 and B's 16 x 32 in threadgroup
+// memory.
+kernel void conv2d_gemm(device const float* in [[buffer(0)]],
+                        device const float* wt [[buffer(1)]],
+                        device const float* bias [[buffer(2)]],
+                        device float* out [[buffer(3)]],
+                        device const uint2* tab [[buffer(4)]],
+                        constant Conv2dParams& p [[buffer(5)]],
+                        uint g [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float ta[kCvT * kCvPA];  // W: [oc][k]
+    threadgroup float tb[kCvK * kCvPB];  // B: [k][pixel]
+    threadgroup float dgall[4 * 64];
+    threadgroup float* d = dgall + sg * 64;
+    const uint tiles_p = (p.P + kCvP - 1) / kCvP;
+    const uint p0 = (g % tiles_p) * kCvP, oc0 = (g / tiles_p) * kCvT;
+    const uint sr = (sg & 1) * 32, sc = (sg >> 1) * 16;
+
+    // The bias, broadcast along the pixels, starts the sums.
+    simdgroup_float8x8 acc[4][2];
+    for (uint i = 0; i < 4; ++i) {
+        for (uint e = lane; e < 64; e += 32) {
+            const uint oc = oc0 + sr + i * 8 + e / 8;
+            d[e] = p.has_bias != 0 && oc < p.out_ch ? bias[oc] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 bm;
+        simdgroup_load(bm, d, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0; j < 2; ++j) {
+            acc[i][j] = bm;
+        }
+    }
+
+    // B: this thread's pixel (128 threads over 32 pixels) and its rows
+    // bk, bk + 4, ...; W: column tid % 16 of rows tid / 16, + 8, ...
+    // (16 lanes read a row's 16 floats together).
+    const uint bp = tid % kCvP, bk = tid / kCvP;
+    const uint pix = p0 + bp;
+    const bool pin = pix < p.P;
+    const uint oy = pin ? pix / p.ow : 0, ox = pin ? pix % p.ow : 0;
+    const int iy0 = int(oy * p.stride) - int(p.pad);
+    const int ix0 = int(ox * p.stride) - int(p.pad);
+    const long base = long(iy0) * p.in_w + ix0;
+    const uint ac = tid % kCvK, ar0 = tid / kCvK;
+    for (uint k0 = 0; k0 < p.K; k0 += kCvK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ar = ar0; ar < kCvT; ar += 128 / kCvK) {
+            const uint k = k0 + ac, oc = oc0 + ar;
+            ta[ar * kCvPA + ac] =
+                oc < p.out_ch && k < p.K ? wt[ulong(oc) * p.K + k] : 0.0f;
+        }
+        for (uint i = 0; i < kCvK / 4; ++i) {
+            const uint kr = bk + 4 * i, k = k0 + kr;
+            float v = 0.0f;
+            if (pin && k < p.K) {
+                const uint2 t = tab[k];
+                const int iy = iy0 + int(t.y >> 16);
+                const int ix = ix0 + int(t.y & 0xffffu);
+                if (iy >= 0 && iy < int(p.in_h) && ix >= 0 &&
+                    ix < int(p.in_w)) {
+                    v = in[base + long(t.x)];
+                }
+            }
+            tb[kr * kCvPB + bp] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0; kk < kCvK; kk += 8) {
+            simdgroup_float8x8 a[4], b[2];
+            for (uint i = 0; i < 4; ++i) {
+                simdgroup_load(a[i], ta + (sr + i * 8) * kCvPA + kk, kCvPA);
+            }
+            for (uint j = 0; j < 2; ++j) {
+                simdgroup_load(b[j], tb + kk * kCvPB + sc + j * 8, kCvPB);
+            }
+            for (uint i = 0; i < 4; ++i) {
+                for (uint j = 0; j < 2; ++j) {
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j],
+                                                  acc[i][j]);
+                }
+            }
+        }
+    }
+
+    // Whole blocks straight out; a block over the channel or pixel tail
+    // through d, its inside rows and columns only.
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 2; ++j) {
+            const uint r0 = oc0 + sr + i * 8, c0 = p0 + sc + j * 8;
+            if (r0 >= p.out_ch || c0 >= p.P) {
+                continue;
+            }
+            if (r0 + 8 <= p.out_ch && c0 + 8 <= p.P) {
+                simdgroup_store(acc[i][j], out + ulong(r0) * p.P + c0, p.P);
+                continue;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_store(acc[i][j], d, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = lane; e < 64; e += 32) {
+                const uint r = r0 + e / 8, c = c0 + e % 8;
+                if (r < p.out_ch && c < p.P) {
+                    out[ulong(r) * p.P + c] = d[e];
+                }
+            }
+        }
+    }
+}

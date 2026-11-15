@@ -9,6 +9,8 @@
 #include <string>
 
 #include "locus/backend/cpu_ops.hpp"
+#include "locus/backend/metal/conv.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/image/dense.hpp"
@@ -138,7 +140,8 @@ std::vector<float> floats(const gguf::GgufFile& g, const std::string& key,
 }
 
 /** The 2D conv, [in][h][w] to [out][h'][w']: conv2d_vulkan on the
- *  Vulkan image ops (i#587), else the CPU's. */
+ *  Vulkan image ops (i#587), metal::conv2d on the Metal ones, else the
+ *  CPU's. */
 std::vector<float> conv2d(const Conv& c, std::span<const float> x,
                           std::uint32_t h, std::uint32_t w,
                           std::uint32_t stride, std::uint32_t pad,
@@ -149,6 +152,10 @@ std::vector<float> conv2d(const Conv& c, std::span<const float> x,
     if (&op == &backend::vulkan_image_ops()) {
         backend::conv2d_vulkan(x, c.in, h, w, c.w, c.out, c.k, c.k, c.b,
                                stride, pad, 1, out);
+    } else if (&op == &backend::metal::image_ops() &&
+               backend::metal::conv2d(x, c.in, h, w, c.w, c.out, c.k, c.k,
+                                      c.b, stride, pad, 1, out)) {
+        // On the Metal image ops (i#1050).
     } else {
         backend::conv2d_mt(x, c.in, h, w, c.w, c.out, c.k, c.k, c.b, stride,
                            pad, 1, out);

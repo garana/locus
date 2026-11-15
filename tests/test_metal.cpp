@@ -2,6 +2,8 @@
 // kernel library compiled from source, and the registry entry.
 
 #include <algorithm>
+#include <cstdio>
+#include <chrono>
 #include <cstddef>
 #include <cmath>
 #include <cstdlib>
@@ -21,8 +23,10 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/metal/context.hpp"
+#include "locus/backend/metal/conv.hpp"
 #include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
@@ -819,4 +823,96 @@ TEST_CASE("metal forward on a GGUF parsed from memory copies its weights",
         scale = std::max(scale, std::abs(cpu[r]));
     }
     CHECK(worst <= 0.01f * scale);
+}
+
+// i#1050: the Metal conv2d (implicit GEMM) against the CPU's, on the
+// image decoders' shapes: channel and pixel tails, strides 1 and 2,
+// pads 0 and 1, 1 x 1 and 3 x 3 kernels, with and without a bias.
+TEST_CASE("metal conv2d matches the CPU reference", "[metal][conv2d]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    struct Shape {
+        std::uint32_t ic, oc, h, w, k, stride, pad;
+        bool bias;
+    };
+    const Shape shapes[] = {
+        {3, 70, 17, 23, 3, 1, 1, true},    {16, 128, 32, 32, 3, 1, 1, true},
+        {128, 64, 20, 20, 1, 1, 0, true},  {64, 96, 31, 29, 3, 2, 1, false},
+        {64, 64, 16, 16, 3, 2, 0, true},   {512, 8, 9, 7, 3, 1, 1, true},
+    };
+    std::mt19937 rng(1050);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const Shape& s : shapes) {
+        CAPTURE(s.ic, s.oc, s.h, s.w, s.k, s.stride, s.pad);
+        std::vector<float> in(std::size_t{s.ic} * s.h * s.w);
+        std::vector<float> wt(std::size_t{s.oc} * s.ic * s.k * s.k);
+        std::vector<float> b(s.bias ? s.oc : 0);
+        for (auto* v : {&in, &wt, &b}) {
+            for (auto& x : *v) {
+                x = dist(rng);
+            }
+        }
+        const std::uint32_t oh = (s.h + 2 * s.pad - s.k) / s.stride + 1;
+        const std::uint32_t ow = (s.w + 2 * s.pad - s.k) / s.stride + 1;
+        std::vector<float> want(std::size_t{s.oc} * oh * ow), got(want.size());
+        locus::backend::conv2d_mt(in, s.ic, s.h, s.w, wt, s.oc, s.k, s.k, b,
+                                  s.stride, s.pad, 1, want);
+        REQUIRE(locus::backend::metal::conv2d(in, s.ic, s.h, s.w, wt, s.oc,
+                                              s.k, s.k, b, s.stride, s.pad, 1,
+                                              got));
+        float worst = 0.0f, scale = 0.0f;
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            worst = std::max(worst, std::abs(got[i] - want[i]));
+            scale = std::max(scale, std::abs(want[i]));
+        }
+        CHECK(worst <= 1e-5f * scale + 1e-5f);
+    }
+    // Groups other than 1 stay on the CPU.
+    std::vector<float> in(2 * 4 * 4), wt(2 * 1 * 3 * 3), out(2 * 4 * 4);
+    CHECK_FALSE(locus::backend::metal::conv2d(in, 2, 4, 4, wt, 2, 3, 3, {},
+                                              1, 1, 2, out));
+}
+
+// i#1050: a 3 x 3 conv of 128 to 128 channels on a 512 x 512 plane (a
+// VAE decoder's last stage at 512 px), Metal against Vulkan.
+TEST_CASE("bench: metal conv2d at a VAE shape", "[.bench][metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    const std::uint32_t c = 128, h = 512, w = 512, k = 3;
+    std::vector<float> in(std::size_t{c} * h * w), out(in.size());
+    std::vector<float> wt(std::size_t{c} * c * k * k), b(c);
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto* v : {&in, &wt, &b}) {
+        for (auto& x : *v) {
+            x = dist(rng);
+        }
+    }
+    const auto time = [&](const auto& run) {
+        run();  // warm
+        double best = 1e30;
+        for (int i = 0; i < 3; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            run();
+            const std::chrono::duration<double, std::milli> dt =
+                std::chrono::steady_clock::now() - t0;
+            best = std::min(best, dt.count());
+        }
+        return best;
+    };
+    const double mt = time([&] {
+        locus::backend::metal::conv2d(in, c, h, w, wt, c, k, k, b, 1, 1, 1,
+                                      out);
+    });
+    std::printf("conv2d %u -> %u, %u x %u: metal %.1f ms", c, c, h, w, mt);
+    if (locus::backend::vulkan_backend_usable()) {
+        const double vk = time([&] {
+            locus::backend::conv2d_vulkan(in, c, h, w, wt, c, k, k, b, 1, 1,
+                                          1, out);
+        });
+        std::printf(", vulkan %.1f ms", vk);
+    }
+    std::printf("\n");
 }
