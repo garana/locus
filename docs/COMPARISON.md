@@ -3,8 +3,8 @@
 locus is a full inference server: continuous batching, paged KV, the
 OpenAI and Anthropic APIs, sampling, constrained decoding, prompt
 caching and speculative decoding, over CPU, CUDA and Vulkan (which
-reaches Apple GPUs through MoltenVK, so there is no separate Metal
-backend). Its distinctive lever is running models that do not fit. On
+reaches Apple GPUs through MoltenVK; a native Metal backend, #10, is
+being built). Its distinctive lever is running models that do not fit. On
 one host it **streams weights when the model exceeds RAM or VRAM and
 batches inputs**, so weight reads are shared across concurrent
 requests and the page cache carries the hot working set. Across hosts,
@@ -173,3 +173,50 @@ and Anthropic server, trading kimi-k3-in-c's single-CPU simplicity for
 throughput.
 
 Sources: kimi-k3-in-c GitHub (github.com/FareedKhan-dev/kimi-k3-in-c).
+
+## Speech, image and video against other tools
+
+Measured in November 2026 (i#245), on the same weights wherever the
+other tool runs them, so speed and memory compare like for like.
+Times are per output after one warm-up request; peak memory is the
+process's physical footprint. Details, versions and sha256 sums are
+in the issue.
+
+| task           | host        | locus                          | other tool, same weights            |
+|----------------|-------------|--------------------------------|-------------------------------------|
+| speech         | M2 Pro      | Orpheus 3B: 9.3 s for 462      | llama.cpp (Metal), tokens only:     |
+|                |             | tokens (50 tok/s), RTF 1.92,   | 7.6 s (61 tok/s); no audio path of  |
+|                |             | 3.0 GB                         | its own                             |
+| image, PixArt  | M2 Pro      | 31.6 s per 512 x 512 image,    | diffusers (torch, MPS): 18.3 s,     |
+|                |             | 2.5 GB                         | 16.0 GB                             |
+| image, FLUX.1  | M4 Max      | 464-494 s per 1024 x 1024      | stable-diffusion.cpp (Metal):       |
+| Kontext (Q8_0) |             | image, 15.2 GB                 | 438-442 s, 24.7 GB                  |
+| video, LTX 2B  | i5-2400     | about 674 s a DiT step (8      | PyTorch reference (float32): about  |
+| (512 x 320,    | (CPU, 4     | steps); 15.4 GB in the steps   | 85 s a step, 23.3 GB                |
+| 65 frames)     | threads)    |                                |                                     |
+| speech         | Pi 5 (CPU)  | Orpheus 3B: real-time factor   | (not run)                           |
+|                |             | 27 to 29, first audio after    |                                     |
+|                |             | 56 to 70 s, 2.3 GB             |                                     |
+
+The speech, PixArt and FLUX rows on Apple GPUs ran through Vulkan on
+MoltenVK; the native Metal backend (#10) has since passed Vulkan in
+decode on the M2 Pro. The video times are active compute, with the
+host's heat pauses taken out.
+
+- Speed: on Apple GPUs the native Metal paths of the other tools are
+  1.1x (FLUX denoise), 1.2x (speech tokens) and 1.7x (PixArt denoise)
+  faster than locus on MoltenVK; the Metal backend (#10, #868)
+  targets that gap. On the x86 CPU, locus's video DiT step is about
+  8x the reference's (#982).
+- Memory: locus maps its weights and keeps no float32 copies, so it
+  needs 1.5x (LTX) to 6.4x (PixArt) less memory.
+- Small machines: on a Raspberry Pi 5 (4 GB) Orpheus runs on the CPU,
+  about 28x slower than real time; its 2.1 GB of weights do not fit
+  the GPU's memory heap, and PixArt's 12 GB do not fit at all.
+- Reach: one C++ binary and GGUF files, served over OpenAI's
+  `/v1/audio/speech`, `/v1/images/generations` and `/v1/videos`; the
+  others need Python and torch (diffusers), or are a CLI
+  (stable-diffusion.cpp's `sd-cli`; Piper).
+- A small voice like Piper (VITS, 63 MB) speaks 50x faster than real
+  time on a CPU; Orpheus is a 3B language model producing codec
+  tokens, a different class of voice.
