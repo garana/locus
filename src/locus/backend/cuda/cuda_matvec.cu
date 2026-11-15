@@ -1137,6 +1137,64 @@ __device__ inline void k4_pair_scales(const std::uint8_t* blk,
     m2 = dmin * mn;
 }
 
+/** The 8 weights lane `lane` owns in Q4_K block blk, as d * q - m (the
+ *  layout of matvec_q4_k_warp_kernel): vlo[k] is element 64j + c + k,
+ *  vhi[k] element 64j + 32 + c + k (j = lane / 8, c = 4 (lane % 8)). */
+__device__ inline void q4_k_lane_values(const std::uint8_t* blk,
+                                        std::uint32_t lane, float vlo[4],
+                                        float vhi[4]) {
+    float d1, m1, d2, m2;
+    k4_pair_scales(blk, lane / 8, d1, m1, d2, m2);
+    const std::uint32_t q4 =
+        reinterpret_cast<const std::uint32_t*>(blk + 16)[lane];
+    for (int k = 0; k < 4; ++k) {
+        const std::uint32_t q = (q4 >> (8 * k)) & 0xff;
+        vlo[k] = d1 * static_cast<float>(q & 0x0f) - m1;
+        vhi[k] = d2 * static_cast<float>(q >> 4) - m2;
+    }
+}
+
+/** As q4_k_lane_values for a Q5_K block (the layout of
+ *  matvec_q5_k_warp_kernel): the nibbles from ql, the 5th bits from
+ *  qh. */
+__device__ inline void q5_k_lane_values(const std::uint8_t* blk,
+                                        std::uint32_t lane, float vlo[4],
+                                        float vhi[4]) {
+    const std::uint32_t j = lane / 8;
+    const std::uint32_t c = 4 * (lane % 8);
+    float d1, m1, d2, m2;
+    k4_pair_scales(blk, j, d1, m1, d2, m2);
+    const std::uint32_t ql4 =
+        __ldg(reinterpret_cast<const std::uint32_t*>(blk + 48) + lane);
+    const std::uint32_t qh4 =
+        __ldg(reinterpret_cast<const std::uint32_t*>(blk + 16 + c));
+    for (int k = 0; k < 4; ++k) {
+        const std::uint32_t q = (ql4 >> (8 * k)) & 0xff;
+        const std::uint32_t h = (qh4 >> (8 * k)) & 0xff;
+        const std::uint32_t lo = (q & 0x0f) + (((h >> (2 * j)) & 1) << 4);
+        const std::uint32_t hi =
+            (q >> 4) + (((h >> (2 * j + 1)) & 1) << 4);
+        vlo[k] = d1 * static_cast<float>(lo) - m1;
+        vhi[k] = d2 * static_cast<float>(hi) - m2;
+    }
+}
+
+/** @returns acc plus a lane's 8 products, in the order of the Q4_K and
+ *  Q5_K kernels: vlo[k] * xb[k], then vhi[k] * xb[32 + k], for k = 0..3
+ *  (xb 16-byte aligned). */
+__device__ inline float lane_dot8(float acc, const float vlo[4],
+                                  const float vhi[4], const float* xb) {
+    const float4 xlo = __ldg(reinterpret_cast<const float4*>(xb));
+    const float4 xhi = __ldg(reinterpret_cast<const float4*>(xb + 32));
+    const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
+    const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
+    for (int k = 0; k < 4; ++k) {
+        acc += vlo[k] * xl[k];
+        acc += vhi[k] * xh[k];
+    }
+    return acc;
+}
+
 /**
  * One Q4_K super-block is 144 bytes: d,dmin (f16) + scales[12] +
  * qs[128], 256 weights. One warp per row: lane `l` reads the 4 qs
@@ -1164,23 +1222,11 @@ __global__ void matvec_q4_k_warp_kernel(const std::uint8_t* w,
     const std::uint32_t c = 4 * (lane % 8);
     float acc = 0.0f;
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 144;
-        float d1, m1, d2, m2;
-        k4_pair_scales(blk, j, d1, m1, d2, m2);
-        const std::uint32_t q4 =
-            reinterpret_cast<const std::uint32_t*>(blk + 16)[lane];
-        const float* xb =
-            x + static_cast<std::size_t>(b) * 256 + 64 * j + c;
-        const float4 xlo = __ldg(reinterpret_cast<const float4*>(xb));
-        const float4 xhi =
-            __ldg(reinterpret_cast<const float4*>(xb + 32));
-        const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
-        const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
-        for (int k = 0; k < 4; ++k) {
-            const std::uint32_t q = (q4 >> (8 * k)) & 0xff;
-            acc += (d1 * static_cast<float>(q & 0x0f) - m1) * xl[k];
-            acc += (d2 * static_cast<float>(q >> 4) - m2) * xh[k];
-        }
+        float vlo[4], vhi[4];
+        q4_k_lane_values(row + static_cast<std::size_t>(b) * 144, lane, vlo,
+                         vhi);
+        acc = lane_dot8(acc, vlo, vhi,
+                        x + static_cast<std::size_t>(b) * 256 + 64 * j + c);
     }
     acc = warp_sum(acc);
     if (lane == 0) {
@@ -1218,30 +1264,11 @@ __global__ void matvec_q5_k_warp_kernel(const std::uint8_t* w,
     const std::uint32_t c = 4 * (lane % 8);
     float acc = 0.0f;
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 176;
-        float d1, m1, d2, m2;
-        k4_pair_scales(blk, j, d1, m1, d2, m2);
-        const std::uint32_t ql4 =
-            __ldg(reinterpret_cast<const std::uint32_t*>(blk + 48) + lane);
-        const std::uint32_t qh4 =
-            __ldg(reinterpret_cast<const std::uint32_t*>(blk + 16 + c));
-        const float* xb =
-            x + static_cast<std::size_t>(b) * 256 + 64 * j + c;
-        const float4 xlo = __ldg(reinterpret_cast<const float4*>(xb));
-        const float4 xhi =
-            __ldg(reinterpret_cast<const float4*>(xb + 32));
-        const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
-        const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
-        for (int k = 0; k < 4; ++k) {
-            const std::uint32_t q = (ql4 >> (8 * k)) & 0xff;
-            const std::uint32_t h = (qh4 >> (8 * k)) & 0xff;
-            const std::uint32_t lo =
-                (q & 0x0f) + (((h >> (2 * j)) & 1) << 4);
-            const std::uint32_t hi =
-                (q >> 4) + (((h >> (2 * j + 1)) & 1) << 4);
-            acc += (d1 * static_cast<float>(lo) - m1) * xl[k];
-            acc += (d2 * static_cast<float>(hi) - m2) * xh[k];
-        }
+        float vlo[4], vhi[4];
+        q5_k_lane_values(row + static_cast<std::size_t>(b) * 176, lane, vlo,
+                         vhi);
+        acc = lane_dot8(acc, vlo, vhi,
+                        x + static_cast<std::size_t>(b) * 256 + 64 * j + c);
     }
     acc = warp_sum(acc);
     if (lane == 0) {
@@ -2184,31 +2211,14 @@ __global__ void matvec_batch_q4_k_kernel(const std::uint8_t* w,
         acc[t] = 0.0f;
     }
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 144;
-        float d1, m1, d2, m2;
-        k4_pair_scales(blk, j, d1, m1, d2, m2);
-        const std::uint32_t q4 =
-            reinterpret_cast<const std::uint32_t*>(blk + 16)[lane];
         float vlo[4], vhi[4];
-        for (int k = 0; k < 4; ++k) {
-            const std::uint32_t q = (q4 >> (8 * k)) & 0xff;
-            vlo[k] = d1 * static_cast<float>(q & 0x0f) - m1;
-            vhi[k] = d2 * static_cast<float>(q >> 4) - m2;
-        }
+        q4_k_lane_values(row + static_cast<std::size_t>(b) * 144, lane, vlo,
+                         vhi);
         for (std::uint32_t t = 0; t < n; ++t) {
-            const float* xb = x + static_cast<std::size_t>(t) * cols +
-                              static_cast<std::size_t>(b) * 256 +
-                              64 * j + c;
-            const float4 xlo =
-                __ldg(reinterpret_cast<const float4*>(xb));
-            const float4 xhi =
-                __ldg(reinterpret_cast<const float4*>(xb + 32));
-            const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
-            const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
-            for (int k = 0; k < 4; ++k) {
-                acc[t] += vlo[k] * xl[k];
-                acc[t] += vhi[k] * xh[k];
-            }
+            acc[t] = lane_dot8(acc[t], vlo, vhi,
+                               x + static_cast<std::size_t>(t) * cols +
+                                   static_cast<std::size_t>(b) * 256 +
+                                   64 * j + c);
         }
     }
     for (std::uint32_t t = 0; t < n; ++t) {
@@ -2293,38 +2303,14 @@ __global__ void matvec_batch_q5_k_kernel(const std::uint8_t* w,
         acc[t] = 0.0f;
     }
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 176;
-        float d1, m1, d2, m2;
-        k4_pair_scales(blk, j, d1, m1, d2, m2);
-        const std::uint32_t ql4 =
-            __ldg(reinterpret_cast<const std::uint32_t*>(blk + 48) + lane);
-        const std::uint32_t qh4 =
-            __ldg(reinterpret_cast<const std::uint32_t*>(blk + 16 + c));
         float vlo[4], vhi[4];
-        for (int k = 0; k < 4; ++k) {
-            const std::uint32_t q = (ql4 >> (8 * k)) & 0xff;
-            const std::uint32_t h = (qh4 >> (8 * k)) & 0xff;
-            const std::uint32_t lo =
-                (q & 0x0f) + (((h >> (2 * j)) & 1) << 4);
-            const std::uint32_t hi =
-                (q >> 4) + (((h >> (2 * j + 1)) & 1) << 4);
-            vlo[k] = d1 * static_cast<float>(lo) - m1;
-            vhi[k] = d2 * static_cast<float>(hi) - m2;
-        }
+        q5_k_lane_values(row + static_cast<std::size_t>(b) * 176, lane, vlo,
+                         vhi);
         for (std::uint32_t t = 0; t < n; ++t) {
-            const float* xb = x + static_cast<std::size_t>(t) * cols +
-                              static_cast<std::size_t>(b) * 256 +
-                              64 * j + c;
-            const float4 xlo =
-                __ldg(reinterpret_cast<const float4*>(xb));
-            const float4 xhi =
-                __ldg(reinterpret_cast<const float4*>(xb + 32));
-            const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
-            const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
-            for (int k = 0; k < 4; ++k) {
-                acc[t] += vlo[k] * xl[k];
-                acc[t] += vhi[k] * xh[k];
-            }
+            acc[t] = lane_dot8(acc[t], vlo, vhi,
+                               x + static_cast<std::size_t>(t) * cols +
+                                   static_cast<std::size_t>(b) * 256 +
+                                   64 * j + c);
         }
     }
     for (std::uint32_t t = 0; t < n; ++t) {
