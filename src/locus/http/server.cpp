@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <cstring>
 #include <optional>
 #include <thread>
@@ -1089,13 +1090,26 @@ bool Server::handle_request(int fd, const Request& req,
         }
         ServerSink sink(fd, wake_r_, cfg_.write_deadline_ms, stopping_);
         bool threw = false;
+        // The head is already out, so no 500 is possible: close without
+        // the terminating chunk, which the client sees as a truncated
+        // stream (i#243). The 200 alone would hide the failure, so it is
+        // logged and counted too (i#980).
+        const auto failed = [&](const char* why) {
+            threw = true;
+            std::fprintf(stderr,
+                         "locus-server: %s %s: the stream failed after its "
+                         "head: %s\n",
+                         req.method.c_str(), req.path.c_str(), why);
+            if (HttpMetrics* m = cfg_.metrics.get()) {
+                m->stream_failed(m->route(req.path));
+            }
+        };
         try {
             res.provider(sink);
+        } catch (const std::exception& e) {
+            failed(e.what());
         } catch (...) {
-            // The head is already out, so no 500 is possible: close
-            // without the terminating chunk, which the client sees as a
-            // truncated stream (i#243).
-            threw = true;
+            failed("unknown exception");
         }
         if (!threw) {
             sink.done();  // terminating chunk (idempotent if the handler did)
