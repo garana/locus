@@ -150,6 +150,12 @@ void attention(const backend::Ops& given, std::span<const float> q,
                 pt[j] = s[std::size_t{j} * m + t] * scale;
                 mx = std::max(mx, pt[j]);
             }
+            // LOCUS_CPU_FAST: the vectorized softmax (another order, so
+            // only there); the default keeps this loop's bits.
+            if (backend::cpu_fast()) {
+                backend::softmax_fast_inplace({pt, nk});
+                continue;
+            }
             float sum = 0.0f;
             for (std::uint32_t j = 0; j < nk; ++j) {
                 pt[j] = std::exp(pt[j] - mx);
