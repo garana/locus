@@ -1716,16 +1716,21 @@ struct VulkanContext::Impl {
         mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         mai.allocationSize = req.size;
         mai.memoryTypeIndex = type;
-        check(vkAllocateMemory(device, &mai, nullptr, &b.mem),
+        // Into a local: a failed call leaves its output undefined, and
+        // make_buffer's cleanup reads b.mem.
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        check(vkAllocateMemory(device, &mai, nullptr, &mem),
               "allocate memory");
+        b.mem = mem;
         b.bytes = req.size;
         allocated += req.size;
         gpu_metrics(GpuApi::kVulkan)
             .add_bytes(kind, static_cast<std::int64_t>(req.size));
         check(vkBindBufferMemory(device, b.buf, b.mem, 0),
               "bind memory");
-        check(vkMapMemory(device, b.mem, 0, size, 0, &b.map),
-              "map memory");
+        void* map = nullptr;
+        check(vkMapMemory(device, b.mem, 0, size, 0, &map), "map memory");
+        b.map = map;
     }
 
     /**
