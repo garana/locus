@@ -237,7 +237,10 @@ std::string gpu_idle_warning(bool defaulted, const Backend& picked,
     auto is_gpu = [](std::string_view name) {
         return name == "vulkan" || name == "cuda";
     };
-    if (!defaulted || is_gpu(picked.name)) {
+    // Metal is a GPU pick too (the Apple default, i#867); it is not
+    // suggested, since the default leaves only models its forward
+    // declines on the CPU.
+    if (!defaulted || is_gpu(picked.name) || picked.name == "metal") {
         return {};
     }
     for (const Backend& b : list) {

@@ -274,7 +274,7 @@ class TransformerModel {
      * choice (--backend, else LOCUS_BACKEND) is resolve_backend's. The
      * default: on a host with Metal, Metal when its whole-token forward
      * takes this model with a cache of kv_type (metal_forward declines
-     * a quantized one), else Vulkan where it is usable (not Metal's
+     * a cache that is not f32), else Vulkan where it is usable (not Metal's
      * per-op path), else best_backend(); elsewhere best_backend().
      *
      * @param choice The --backend value, empty for none.

@@ -1267,13 +1267,6 @@ TEST_CASE("metal Q6_K matvec layouts match the CPU", "[metal]") {
     }
     namespace mb = locus::backend::metal;
     // Puts the caller's LOCUS_METAL_Q6K back, even past a failure.
-
-// i#867: with no --backend and no LOCUS_BACKEND, a host with Metal runs
-// a model on Metal when metal_forward takes it, else on Vulkan where
-// usable, else best_backend(); an explicit choice wins.
-TEST_CASE("the default backend follows metal_forward's gate",
-          "[metal][backend]") {
-    // The test's own default: put LOCUS_BACKEND back after.
     struct EnvGuard {
         std::string old;
         bool had = false;
@@ -1518,7 +1511,18 @@ TEST_CASE("metal decode norm fold tracks the unfolded decode", "[metal]") {
         }
     }
     CHECK(worst_any > 0.0f);
+}
 
+// i#867: with no --backend and no LOCUS_BACKEND, a host with Metal runs
+// a model on Metal when metal_forward takes it, else on Vulkan where
+// usable, else best_backend(); an explicit choice wins.
+TEST_CASE("the default backend follows metal_forward's gate",
+          "[metal][backend]") {
+    // The test's own default: put LOCUS_BACKEND back after.
+    struct EnvGuard {
+        std::string old;
+        bool had = false;
+        EnvGuard() {
             if (const char* e = std::getenv("LOCUS_BACKEND")) {
                 old = e;
                 had = true;

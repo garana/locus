@@ -268,7 +268,7 @@ bool vulkan_device_beats_cpu();
  * The startup warning for a default pick that leaves a GPU idle: the
  * picked backend runs on the CPU while a GPU backend (vulkan, cuda) in
  * `list` is available and selectable. Vulkan counts only when its
- * device beats the CPU.
+ * device beats the CPU. A metal pick is a GPU pick: no warning.
  *
  * @param defaulted Whether the backend was picked by default.
  * @param picked The backend in use.
