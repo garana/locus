@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -58,8 +59,15 @@ class EngineGroup {
      *  same size). */
     std::string admit_error(std::uint32_t n_prompt);
 
-    /** Submits to the least-loaded engine (the fewest requests not yet
-     *  released). @returns The request's group id. */
+    /**
+     * Submits to the engine that last served a prompt with the same
+     * first kPrefixKeyTokens tokens (its prefix cache may hold their
+     * KV, i#940), unless that engine has more than kPrefixSlack
+     * requests over the least-loaded one; else, and for a shorter
+     * prompt, to the least-loaded engine (the fewest requests not yet
+     * released).
+     * @returns The request's group id.
+     */
     std::uint64_t submit(
         std::vector<tok::TokenId> prompt, std::uint32_t max_new_tokens,
         model::SamplingParams sampling = {}, std::uint64_t seed = 0,
@@ -107,12 +115,25 @@ class EngineGroup {
         return id / loops_.size();
     }
 
+    /** The prompt tokens a prefix key covers: one KV block at the
+     *  default geometry. */
+    static constexpr std::size_t kPrefixKeyTokens = 16;
+    /** How many more unreleased requests than the least-loaded engine
+     *  the prefix's engine may hold and still take it. */
+    static constexpr std::size_t kPrefixSlack = 1;
+    /** Most prefix keys kept (then the map starts over). */
+    static constexpr std::size_t kPrefixKeys = 4096;
+    /** @returns A hash of the prompt's first kPrefixKeyTokens tokens. */
+    static std::uint64_t prefix_key(const std::vector<tok::TokenId>& prompt);
+
     std::vector<std::unique_ptr<EngineLoop>> loops_;
     /** Requests submitted and not yet released: their ids, and their
-     *  count per engine. */
+     *  count per engine. Guards last_engine_ too. */
     std::mutex live_mu_;
     std::unordered_set<std::uint64_t> live_;
     std::vector<std::size_t> load_;
+    /** The engine each recent prefix key went to. */
+    std::unordered_map<std::uint64_t, std::size_t> last_engine_;
 };
 
 }  // namespace locus::server
