@@ -18,6 +18,20 @@
 
 namespace locus::server {
 
+/** How an EngineLoop's worker thread runs (i#929), for one of several
+ *  engines over one model. The default is one engine on the process's
+ *  device and thread pool. At namespace scope, not nested: GCC refuses
+ *  a nested struct with member initializers as a default argument of
+ *  its enclosing class (CWG 1397). */
+struct EngineLoopSetup {
+    /** Runs first on the worker thread (e.g. binds it to the Vulkan
+     *  device the engine's KV pool was made on). */
+    std::function<void()> thread_init;
+    /** > 0: the worker's forwards fan out to a pool of its own with
+     *  this many threads, the worker included; 0: the process pool. */
+    std::size_t threads = 0;
+};
+
 /**
  * Thread-safe facade over the single-threaded Engine: one worker
  * thread drives step() while HTTP handler threads submit requests
@@ -41,18 +55,7 @@ class EngineLoop {
         std::uint32_t cached_prefix_tokens = 0;
     };
 
-    /** How the worker thread runs (i#929), for one of several engines
-     *  over one model. The default is one engine on the process's
-     *  device and thread pool. */
-    struct Setup {
-        /** Runs first on the worker thread (e.g. binds it to the
-         *  Vulkan device the engine's KV pool was made on). */
-        std::function<void()> thread_init;
-        /** > 0: the worker's forwards fan out to a pool of its own
-         *  with this many threads, the worker included; 0: the
-         *  process pool. */
-        std::size_t threads = 0;
-    };
+    using Setup = EngineLoopSetup;
 
     /**
      * Makes the engine (and its KV pool) on the calling thread, then
