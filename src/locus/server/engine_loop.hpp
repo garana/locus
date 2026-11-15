@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "locus/engine/engine.hpp"
@@ -18,7 +19,9 @@ namespace locus::server {
  * Thread-safe facade over the single-threaded Engine: one worker
  * thread drives step() while HTTP handler threads submit requests
  * and wait on progress. The engine mutex is held across each
- * step() iteration, so submitters block for at most one iteration.
+ * step() iteration, so callers block for at most one iteration.
+ * Waiters sleep until the worker publishes progress for their request
+ * (no polling, i#928).
  */
 class EngineLoop {
   public:
@@ -121,11 +124,41 @@ class EngineLoop {
     kv::KvType kv_type() const { return kv_type_; }
 
   private:
+    /** What the worker last published for a watched request. */
+    struct Watch {
+        std::size_t generated = 0;
+        bool terminal = false;
+        int waiters = 0;
+    };
+    /** Registers a waiter on a request's progress for its scope. */
+    class WatchScope;
+
     void run();
     View snapshot_locked(std::uint64_t id) const;
+    /** Takes mu_ through the read_waiters_ turnstile, so the worker
+     *  hands it over after at most one step. */
+    std::unique_lock<std::mutex> lock_turn();
+    /** Publishes the watched requests' progress (call with mu_ held)
+     *  and wakes their waiters when any changed. */
+    void publish_locked();
+    /**
+     * Sleeps until the worker has published more than n_seen tokens or
+     * a terminal state for id, or until `until` (time_point::max()
+     * waits without limit). The caller holds a WatchScope for id.
+     */
+    void wait_watch(std::uint64_t id, std::size_t n_seen,
+                    std::chrono::steady_clock::time_point until);
 
     std::mutex mu_;
     std::condition_variable work_cv_;
+    /**
+     * Progress publication, apart from mu_ so a waiter never sleeps on
+     * the engine mutex (whose relock races the worker's). Lock order:
+     * mu_ before pmu_; nothing holds pmu_ while taking mu_.
+     */
+    std::mutex pmu_;
+    std::condition_variable progress_cv_;
+    std::unordered_map<std::uint64_t, Watch> watched_;
     /**
      * Count of client threads currently trying to acquire mu_ for a
      * read (view/wait_progress/wait_done/stats). The worker checks it
