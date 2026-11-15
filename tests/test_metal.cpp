@@ -169,6 +169,18 @@ std::vector<std::byte> random_weights(TensorType t, std::uint32_t rows,
         std::uint32_t elems, bytes, d_off;
         int dmin_off;
     };
+    if (t == TensorType::kBF16) {
+        std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+        std::vector<std::byte> b(static_cast<std::size_t>(rows) * cols * 2);
+        for (std::size_t i = 0; i < b.size(); i += 2) {
+            const float f = d(rng);
+            std::uint32_t u;
+            std::memcpy(&u, &f, 4);
+            const auto h = static_cast<std::uint16_t>(u >> 16);
+            std::memcpy(b.data() + i, &h, 2);
+        }
+        return b;
+    }
     if (t == TensorType::kF16) {
         std::uniform_real_distribution<float> d(-1.0f, 1.0f);
         std::vector<std::byte> b(static_cast<std::size_t>(rows) * cols * 2);
@@ -212,9 +224,9 @@ TEST_CASE("metal matvec matches the CPU for each weight type",
     std::mt19937 rng(3);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     for (const TensorType t :
-         {TensorType::kF32, TensorType::kF16, TensorType::kQ8_0,
-          TensorType::kQ4_0, TensorType::kQ5_0, TensorType::kQ4_K,
-          TensorType::kQ5_K, TensorType::kQ6_K}) {
+         {TensorType::kF32, TensorType::kF16, TensorType::kBF16,
+          TensorType::kQ8_0, TensorType::kQ4_0, TensorType::kQ5_0,
+          TensorType::kQ4_K, TensorType::kQ5_K, TensorType::kQ6_K}) {
         CHECK(mb::matvec_supported(t));
         // Rows not a multiple of the 8 a threadgroup takes; one shape
         // with fewer blocks per row than the 16 lanes.
@@ -357,7 +369,7 @@ TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
     }
 }
 
-TEST_CASE("metal Q4_K, Q6_K and Q8_0 matmuls match the CPU matvec",
+TEST_CASE("metal matmuls match the CPU matvec per token",
           "[metal]") {
     if (!Context::usable()) {
         SKIP("no Metal device");
@@ -368,7 +380,8 @@ TEST_CASE("metal Q4_K, Q6_K and Q8_0 matmuls match the CPU matvec",
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     // Rows and tokens off the 64 x 32 tile, strided token rows.
     for (const TensorType ty :
-         {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0}) {
+         {TensorType::kQ4_K, TensorType::kQ6_K, TensorType::kQ8_0,
+          TensorType::kF32, TensorType::kF16, TensorType::kBF16}) {
         CAPTURE(static_cast<int>(ty));
         for (const auto& [rows, cols, n_tok] :
              {std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>{
@@ -581,4 +594,40 @@ TEST_CASE("metal tiled causal attention matches attn_rows",
             ctx.free(*b);
         }
     }
+}
+
+TEST_CASE("metal matvec_batch matches the CPU batch, row-major",
+          "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    std::mt19937 rng(29);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    // Types with a matmul, and Q4_0 / Q5_K, which take a matvec a token.
+    for (const TensorType t :
+         {TensorType::kF32, TensorType::kF16, TensorType::kBF16,
+          TensorType::kQ8_0, TensorType::kQ4_K, TensorType::kQ6_K,
+          TensorType::kQ4_0, TensorType::kQ5_K}) {
+        CAPTURE(static_cast<int>(t));
+        const std::uint32_t rows = 97, cols = 512, n = 45;
+        const auto w = random_weights(t, rows, cols, 7);
+        const locus::backend::Mat m{t, w.data(), rows, cols};
+        std::vector<float> x(std::size_t{n} * cols);
+        std::vector<float> want(std::size_t{n} * rows), got(want.size());
+        for (auto& v : x) {
+            v = dist(rng);
+        }
+        locus::backend::matvec_batch_scalar(m, x, want, n);
+        mb::matvec_batch(m, x, got, n);
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            REQUIRE(got[i] ==
+                    Catch::Approx(want[i]).margin(1e-3).epsilon(1e-4));
+        }
+    }
+    const auto& ops = mb::image_ops();
+    CHECK(ops.matvec_batch == &mb::matvec_batch);
+    CHECK(ops.self_parallel);
+    CHECK_FALSE(ops.mt_safe);
+    mb::drop_weights();
 }
