@@ -542,13 +542,14 @@ TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
         model.use_q8k_activations(false);  // the f32 CPU reference
         const auto tok = locus::tok::tokenizer_from_gguf(g);
         const std::uint32_t nv = model.hparams().n_vocab;
-        // Past one 256-token sub-chunk, so two run.
+        // Past two 256-token sub-chunks, so three run, and the next
+        // token's decode takes the split attention (past 512).
         std::string text;
-        for (int i = 0; i < 40; ++i) {
+        for (int i = 0; i < 60; ++i) {
             text += "The quick brown fox jumps over the lazy dog. ";
         }
         const auto ids = tok->encode(text, true);
-        REQUIRE(ids.size() > 256);
+        REQUIRE(ids.size() > 512);
         const auto prefill = [&](std::string_view be, bool all) {
             model.use_backend(*locus::backend::find_backend(be));
             auto cache = model.make_cache();
@@ -601,6 +602,13 @@ TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
             close(std::span<const float>(all.first).subspan(
                       (ids.size() - 1) * nv, nv),
                   cpu.first);
+        }
+        {
+            // The decode's one-kernel attention, not split-K.
+            setenv("LOCUS_METAL_ATTN_SPLIT", "0", 1);
+            const auto whole = prefill("metal", false);
+            unsetenv("LOCUS_METAL_ATTN_SPLIT");
+            close(whole.second, cpu.second);
         }
         if (model.hparams().n_expert > 0) {
             // The experts as a matvec slot each, not grouped matmuls.

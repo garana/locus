@@ -120,6 +120,7 @@ namespace {
 /** Scratch buffers of the Metal forward (grow-only; device_mutex). */
 struct Scratch {
     Context::Buffer x, xb, q, att, gate, up, logits, cs, scores, blocks;
+    Context::Buffer parts;  // attn_split's per-part sums
     // MoE: the router logits (and the shared expert's gate logit after
     // them), and one expert's output.
     Context::Buffer router, eout, route;
@@ -164,6 +165,10 @@ struct AttnParams {
     std::uint64_t block_floats, layer_off, v_off;
     std::uint32_t n_pos, block_tokens, n_heads, n_kv_heads, head_dim;
     float kq_scale;
+};
+struct AttnSplitParams {
+    AttnParams a;
+    std::uint32_t n_parts;
 };
 struct SiluParams {
     std::uint32_t n;
@@ -292,6 +297,16 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
     const bool fused_attn =
         n_pos <= kAttnMaxPos && hd <= kAttnGroup && kAttnGroup % hd == 0 &&
         (passes == nullptr || std::string_view(passes) != "3");
+    // Past 512 positions, split-K: a threadgroup a (head, 256
+    // positions), so a long context fills the GPU, not one threadgroup
+    // a head (LOCUS_METAL_ATTN_SPLIT=0: off, for tests).
+    const char* split_env = std::getenv("LOCUS_METAL_ATTN_SPLIT");
+    const bool split_attn =
+        n_pos > 2 * kAttnGroup && hd <= kAttnGroup &&
+        kAttnGroup % hd == 0 &&
+        (passes == nullptr || std::string_view(passes) != "3") &&
+        (split_env == nullptr || std::string_view(split_env) != "0");
+    const std::uint32_t n_parts = (n_pos + kAttnGroup - 1) / kAttnGroup;
 
     std::lock_guard lk(metal::device_mutex());
     const Context::Buffer* pool = metal::kv_buffer(cache.pool_data());
@@ -338,6 +353,8 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         Scratch::grow(ctx, s.logits, std::size_t{R} * 4);
         Scratch::grow(ctx, s.cs, std::size_t{hd} * 4);
         Scratch::grow(ctx, s.scores, std::size_t{H} * n_pos * 4);
+        Scratch::grow(ctx, s.parts,
+                      std::size_t{H} * n_parts * (std::size_t{hd} + 2) * 4);
         Scratch::grow(ctx, s.blocks, std::size_t{n_blocks} * 4);
 
         // Host-side inputs, written straight into the shared buffers:
@@ -588,7 +605,16 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                                     KV,
                                     hd,
                                     hp_.kq_scale};
-                if (fused_attn) {
+                if (split_attn) {
+                    // A threadgroup a (head, 256 positions), merged.
+                    const AttnSplitParams spp{ap, n_parts};
+                    const Context::Arg pa[] = {
+                        {&s.q, 0}, {pool, 0}, {&s.blocks, 0}, {&s.parts, 0}};
+                    ctx.dispatch("attn_split", pa, bytes_of(spp),
+                                 H * n_parts * kAttnGroup, kAttnGroup);
+                    const Context::Arg ma[] = {{&s.parts, 0}, {&s.att, 0}};
+                    ctx.dispatch("attn_merge", ma, bytes_of(spp), H * hd, 64);
+                } else if (fused_attn) {
                     // One kernel, one threadgroup a head.
                     const Context::Arg fa[] = {
                         {&s.q, 0}, {pool, 0}, {&s.blocks, 0}, {&s.att, 0}};
