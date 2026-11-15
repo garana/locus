@@ -104,6 +104,7 @@ add_executable(locus_tests
     test_rerank.cpp
     test_t5_encoder.cpp
     test_clip_text.cpp
+    test_tensor_read.cpp
     test_flux_dit.cpp
     test_flux_sampler.cpp
     test_flux_pipeline.cpp
