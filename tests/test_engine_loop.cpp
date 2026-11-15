@@ -349,4 +349,25 @@ TEST_CASE("EngineLoop follow: a cancel reaches take()",
     CHECK_FALSE(loop.take(id2, acc2));
     loop.cancel(id2);
     loop.release(id2);
+
+    // A release ends the follow, taken or not: the queued kCancelled is
+    // dropped with the request (a client that left mid-stream).
+    const std::uint64_t id3 = loop.submit(prompt, 4096);
+    loop.follow(id3);
+    CHECK(loop.follows() == 1);
+    loop.cancel(id3);
+    CHECK(loop.release(id3));
+    CHECK(loop.follows() == 0);
+    locus::server::EngineLoop::View acc3;
+    CHECK_FALSE(loop.take(id3, acc3));
+    // Following goes on working for the next request.
+    const std::uint64_t id4 = loop.submit(prompt, 4);
+    loop.follow(id4);
+    CHECK(loop.wait_done(id4).status == locus::engine::Status::kDone);
+    locus::server::EngineLoop::View acc4;
+    while (loop.take(id4, acc4)) {
+    }
+    CHECK(acc4.status == locus::engine::Status::kDone);
+    CHECK(acc4.generated.size() == 4);
+    loop.release(id4);
 }

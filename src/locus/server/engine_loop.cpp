@@ -184,6 +184,11 @@ void EngineLoop::unfollow(std::uint64_t id) {
     followed_.erase(id);
 }
 
+std::size_t EngineLoop::follows() {
+    std::lock_guard<std::mutex> pk(pmu_);
+    return followed_.size();
+}
+
 void EngineLoop::set_progress_hook(std::function<void()> hook) {
     auto lk = lock_turn();
     progress_hook_ = std::move(hook);
@@ -381,6 +386,11 @@ bool EngineLoop::release(std::uint64_t id) {
     const engine::Request* r = engine_.get(id);
     const bool gone = r == nullptr || engine::is_terminal(r->status);
     engine_.release(id);
+    if (gone) {
+        // The request's record is gone: so is its follow, taken or not.
+        std::lock_guard<std::mutex> pk(pmu_);
+        followed_.erase(id);
+    }
     return gone;
 }
 

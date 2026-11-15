@@ -119,7 +119,7 @@ class EngineLoop {
      * new tokens, logprobs and state, which take() collects without
      * waiting on a step. Takes the engine mutex once (at most one step);
      * idempotent. Ends after the take() that reports a terminal state,
-     * or at unfollow().
+     * at unfollow(), or when release() drops the request.
      */
     void follow(std::uint64_t id);
 
@@ -137,6 +137,9 @@ class EngineLoop {
     /** Stops following a request (no-op if it is not followed). */
     void unfollow(std::uint64_t id);
 
+    /** @returns How many requests are followed (tests). */
+    std::size_t follows();
+
     /**
      * Sets the hook the worker runs after a step (or a cancel) that
      * queued progress for any followed request, so an event loop can
@@ -151,8 +154,11 @@ class EngineLoop {
     void cancel(std::uint64_t id);
 
     /** Drops a finished request's record once its result has been
-     * delivered to the client (evict-on-consume); no-op if it is not
-     * terminal. Call once, after the last view/wait_done for the id.
+     * delivered to the client (evict-on-consume), and its follow with
+     * it: take the final state before release (what a follower has not
+     * taken is dropped, and a later take() returns false). No-op if it
+     * is not terminal. Call once, after the last view/wait_done/take
+     * for the id.
      * @returns Whether the request is gone now (terminal, or unknown):
      *     false when it was still running and was kept. */
     bool release(std::uint64_t id);
