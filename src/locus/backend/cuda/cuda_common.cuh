@@ -34,10 +34,14 @@ void ensure_device();
  */
 bool sync_counted();
 
-/** RAII-ish scoped device buffer; frees on scope exit. */
+/** RAII-ish scoped device buffer; frees on scope exit. Not copyable:
+ *  a copy would free the pointer twice. */
 struct DevBuf {
     void* p = nullptr;
     std::size_t bytes_ = 0;
+    DevBuf() = default;
+    DevBuf(const DevBuf&) = delete;
+    DevBuf& operator=(const DevBuf&) = delete;
     bool alloc(std::size_t bytes) {
         if (!cuda_ok(cudaMalloc(&p, bytes))) {
             return false;
