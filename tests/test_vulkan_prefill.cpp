@@ -1211,3 +1211,55 @@ TEST_CASE("vulkan comes up without shaderFloat16, f16 kernels skipped",
         ctx.destroy_buffer(b);
     }
 }
+
+// i#976: a scratch buffer that fails to grow (the device out of memory)
+// must leave the old one in place. Before the fix, grow retired the old
+// buffer before allocating, so the abandoned batch freed it while the
+// scratch slot kept it, and the next grow retired it again: a double
+// free that killed locus-server on the request after a failed one.
+TEST_CASE("vulkan survives a scratch buffer that fails to grow",
+          "[e2e][vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    const std::string path = test_model("stories260K.gguf");
+    if (!std::filesystem::exists(path)) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("vulkan"));
+    auto cache = model.make_cache();
+    auto ws = model.make_workspace();
+    const std::uint32_t nv = model.hparams().n_vocab;
+    const auto prompt = [](std::size_t n) {
+        std::vector<locus::tok::TokenId> p(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            p[i] = static_cast<locus::tok::TokenId>(1 + i % 200);
+        }
+        return p;
+    };
+    const auto run = [&](const std::vector<locus::tok::TokenId>& p) {
+        locus::kv::PagedKvCache::Seq seq;
+        REQUIRE(cache.ensure_capacity(seq,
+                                      static_cast<std::uint32_t>(p.size())));
+        std::vector<float> logits(nv);
+        model.forward_batch(p, cache, seq, ws, logits, false);
+        cache.release(seq);
+        return logits;
+    };
+    const auto shortp = prompt(8), longp = prompt(200);
+    // Twice: the weights, the KV pool and every short-size scratch
+    // buffer exist, so the long prompt's first allocation is a grow.
+    const auto want = run(shortp);
+    REQUIRE(run(shortp) == want);
+    locus::backend::vulkan_fail_allocations_for_test(1);
+    try {
+        run(longp);  // fails on the GPU (or falls back): either is fine
+    } catch (const std::exception&) {
+    }
+    locus::backend::vulkan_fail_allocations_for_test(0);
+    // The next grow, then the short prompt: the same logits as before.
+    CHECK(run(longp).size() == nv);
+    CHECK(run(shortp) == want);
+}
