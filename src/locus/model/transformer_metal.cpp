@@ -439,6 +439,9 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         const bool gpu_route =
             hp_.n_group <= 1 && hp_.n_expert <= 1024 &&
             (route_env == nullptr || std::string_view(route_env) != "cpu");
+        // moe_route's threadgroup: a thread an expert, whole simdgroups.
+        const std::uint32_t route_group =
+            std::max(32u, (hp_.n_expert + 31) / 32 * 32);
         const auto moe = [&](const Layer& lay) {
             mv(lay.gate_inp, s.xb, s.router, 0, false);
             const bool gated = lay.gate_inp_shexp.rows > 0;
@@ -464,7 +467,8 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     {&s.router, 0},
                     {has_bias ? &fbuf(lay.exp_probs_b) : &s.router, 0},
                     {&s.route, 0}};
-                ctx.dispatch("moe_route", ra, bytes_of(rp), 1024, 1024);
+                ctx.dispatch("moe_route", ra, bytes_of(rp), route_group,
+                             route_group);
                 // The k experts at once: gate and up for every slot (x
                 // shared), SiLU over the k rows, down slot by slot into
                 // k residual rows, then their weighted sum.
@@ -738,6 +742,9 @@ bool TransformerModel::metal_forward_batch(
     const bool gpu_route =
         hp_.n_group <= 1 && hp_.n_expert <= 1024 &&
         (route_env == nullptr || std::string_view(route_env) != "cpu");
+    // moe_route's threadgroup: a thread an expert, whole simdgroups.
+    const std::uint32_t route_group =
+        std::max(32u, (hp_.n_expert + 31) / 32 * 32);
     if (n < kPrefillMin || (any_moe && !gpu_route) ||
         !metal_forward_supported() ||
         cache.quantized() ||
@@ -916,7 +923,8 @@ bool TransformerModel::metal_forward_batch(
                 {&s.router, 0},
                 {has_bias ? &fbuf(lay.exp_probs_b) : &s.router, 0},
                 {&s.route, 0}};
-            ctx.dispatch("moe_route", ra, bytes_of(rp), m * 1024, 1024);
+            ctx.dispatch("moe_route", ra, bytes_of(rp), m * route_group,
+                         route_group);
             const auto expert_buf = [&](const ExpertMat& em) {
                 return mw.map(ctx, em.base.data,
                               em.expert_bytes * std::size_t{hp_.n_expert});
