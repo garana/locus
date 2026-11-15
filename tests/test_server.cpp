@@ -1645,6 +1645,69 @@ TEST_CASE("request-edge size limits reject before work",
     }
 }
 
+// i#927: a prompt the KV pool can never hold is a 400 on every text
+// endpoint, /v1/messages included, and does not park the queue: a short
+// request right after it is served.
+TEST_CASE("a prompt the KV pool cannot hold is a 400 on each endpoint",
+          "[server][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+
+    locus::server::OpenAiServer::Options opt;
+    // 48 tokens: a prompt over 32 cannot fit with the 16 of decode
+    // headroom; the short request's templated prompt can.
+    opt.engine.n_blocks = 3;
+    TestServer ts(model, tok, opt);
+    httplib::Client client("127.0.0.1", ts.port);
+    // A parked request would never answer: fail instead of hanging.
+    client.set_read_timeout(30, 0);
+
+    std::string big;
+    for (int i = 0; i < 10; ++i) {
+        big += "the little dog ran home ";
+    }
+    // Past the pool (over 48 - 16), inside the context (so the pool is
+    // what refuses).
+    const std::size_t n_big = tok.encode(big, true).size();
+    REQUIRE(n_big > 32);
+    REQUIRE(n_big < model.hparams().n_ctx);
+    const json user = json::array({{{"role", "user"}, {"content", big}}});
+    const struct {
+        const char* path;
+        json body;
+    } cases[] = {
+        {"/v1/completions", {{"prompt", big}, {"max_tokens", 2}}},
+        {"/v1/chat/completions", {{"messages", user}, {"max_tokens", 2}}},
+        {"/v1/messages", {{"messages", user}, {"max_tokens", 2}}},
+        {"/v1/responses", {{"input", big}, {"max_output_tokens", 2}}},
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.path);
+        auto res = client.Post(c.path, c.body.dump(), "application/json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("KV blocks") != std::string::npos);
+    }
+    // The Anthropic error envelope on /v1/messages.
+    auto bad = client.Post("/v1/messages", cases[2].body.dump(),
+                           "application/json");
+    REQUIRE(bad);
+    const json err = json::parse(bad->body);
+    CHECK(err["type"] == "error");
+    CHECK(err["error"]["type"] == "invalid_request_error");
+
+    const json hi = json::array({{{"role", "user"}, {"content", "Hi"}}});
+    auto ok = client.Post("/v1/messages",
+                          json{{"messages", hi}, {"max_tokens", 2}}.dump(),
+                          "application/json");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
 TEST_CASE("prompt caching reports cache-hit usage fields",
           "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
