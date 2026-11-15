@@ -1138,13 +1138,15 @@ __device__ inline void q5_k_lane_values(const std::uint8_t* blk,
     }
 }
 
-/** @returns acc plus a lane's 8 products, in the order of the Q4_K and
- *  Q5_K kernels: vlo[k] * xb[k], then vhi[k] * xb[32 + k], for k = 0..3
- *  (xb 16-byte aligned). */
+/** @returns acc plus a lane's 8 products, in the order of the Q4_K,
+ *  Q5_K and IQ4_XS kernels: vlo[k] * xb[k], then vhi[k] * xb[kHi + k],
+ *  for k = 0..3 (xb 16-byte aligned; kHi 32 for the K-quants, 16 for
+ *  IQ4_XS). */
+template <std::uint32_t kHi = 32>
 __device__ inline float lane_dot8(float acc, const float vlo[4],
                                   const float vhi[4], const float* xb) {
     const float4 xlo = __ldg(reinterpret_cast<const float4*>(xb));
-    const float4 xhi = __ldg(reinterpret_cast<const float4*>(xb + 32));
+    const float4 xhi = __ldg(reinterpret_cast<const float4*>(xb + kHi));
     const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
     const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
     for (int k = 0; k < 4; ++k) {
@@ -1328,6 +1330,30 @@ __global__ void matvec_q6_k_warp_kernel(const std::uint8_t* w,
     }
 }
 
+/** @returns d times the dot of a Q8_0 block (17 16-bit words in shared
+ *  memory: d, then the 32 int8 quants) with the 32 floats at xb
+ *  (16-byte aligned), in the order of the Q8_0 kernels. */
+__device__ inline float q8_0_block_dot(const std::uint16_t* blk16,
+                                       const float* xb) {
+    const float d = __half2float(__ushort_as_half(blk16[0]));
+    const auto* x4 = reinterpret_cast<const float4*>(xb);
+    float bacc = 0.0f;
+    for (int k = 0; k < 8; ++k) {
+        const float4 xv = __ldg(x4 + k);
+        const std::uint16_t lo = blk16[1 + 2 * k];
+        const std::uint16_t hi = blk16[2 + 2 * k];
+        const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
+        const std::int8_t q[4] = {static_cast<std::int8_t>(lo & 0xff),
+                                  static_cast<std::int8_t>(lo >> 8),
+                                  static_cast<std::int8_t>(hi & 0xff),
+                                  static_cast<std::int8_t>(hi >> 8)};
+        for (int g = 0; g < 4; ++g) {
+            bacc += static_cast<float>(q[g]) * xs[g];
+        }
+    }
+    return d * bacc;
+}
+
 /**
  * One Q8_0 block is 34 bytes: f16 scale + 32 int8 quants. One warp
  * per row: lane L takes blocks L, L + 32, .... Each pass, the warp
@@ -1367,26 +1393,8 @@ __global__ void matvec_q8_0_warp_kernel(const std::uint8_t* w,
         __syncwarp();
         if (lane < nb) {
             const std::uint32_t b = b0 + lane;
-            const std::uint16_t* blk16 = mine + lane * 17;
-            const float d = __half2float(__ushort_as_half(blk16[0]));
-            const auto* x4 = reinterpret_cast<const float4*>(
-                x + static_cast<std::size_t>(b) * 32);
-            float bacc = 0.0f;
-            for (int k = 0; k < 8; ++k) {
-                const float4 xv = __ldg(x4 + k);
-                const std::uint16_t lo = blk16[1 + 2 * k];
-                const std::uint16_t hi = blk16[2 + 2 * k];
-                const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
-                const std::int8_t q[4] = {
-                    static_cast<std::int8_t>(lo & 0xff),
-                    static_cast<std::int8_t>(lo >> 8),
-                    static_cast<std::int8_t>(hi & 0xff),
-                    static_cast<std::int8_t>(hi >> 8)};
-                for (int g = 0; g < 4; ++g) {
-                    bacc += static_cast<float>(q[g]) * xs[g];
-                }
-            }
-            acc += d * bacc;
+            acc += q8_0_block_dot(mine + lane * 17,
+                                  x + static_cast<std::size_t>(b) * 32);
         }
         __syncwarp();  // the next pass overwrites this warp's slice
     }
@@ -1404,6 +1412,40 @@ __device__ void load_iq4_codebook(const std::int8_t* kvalues,
         skv[threadIdx.x] = kvalues[threadIdx.x];
     }
     __syncthreads();
+}
+
+/** The 32 codebook values of an IQ4_NL block (9 16-bit words in shared
+ *  memory: d, then qs[16]): vlo[i] is element i, vhi[i] element
+ *  16 + i. */
+__device__ inline void iq4_nl_block_values(const std::uint16_t* blk16,
+                                           const std::int8_t* skv,
+                                           float vlo[16], float vhi[16]) {
+    for (int i = 0; i < 16; ++i) {
+        const std::uint32_t q = (blk16[1 + i / 2] >> (8 * (i % 2))) & 0xff;
+        vlo[i] = static_cast<float>(skv[q & 0x0f]);
+        vhi[i] = static_cast<float>(skv[q >> 4]);
+    }
+}
+
+/** @returns d times the dot of an IQ4_NL block's values with the 32
+ *  floats at xb (16-byte aligned), in the order of the IQ4_NL kernels:
+ *  element 4k + m with its partner 16 past it, k and m 0..3. */
+__device__ inline float iq4_nl_block_dot(float d, const float vlo[16],
+                                         const float vhi[16],
+                                         const float* xb) {
+    const auto* x4 = reinterpret_cast<const float4*>(xb);
+    float s = 0.0f;
+    for (int k = 0; k < 4; ++k) {  // elements 4k .. 4k + 3
+        const float4 lo4 = __ldg(x4 + k);
+        const float4 hi4 = __ldg(x4 + 4 + k);
+        const float xl[4] = {lo4.x, lo4.y, lo4.z, lo4.w};
+        const float xh[4] = {hi4.x, hi4.y, hi4.z, hi4.w};
+        for (int m = 0; m < 4; ++m) {
+            const int i = 4 * k + m;
+            s += vlo[i] * xl[m] + vhi[i] * xh[m];
+        }
+    }
+    return d * s;
 }
 
 /**
@@ -1446,29 +1488,41 @@ __global__ void matvec_iq4_nl_warp_kernel(const std::uint8_t* w,
             const std::uint32_t b = b0 + lane;
             const std::uint16_t* blk16 = mine + lane * 9;
             const float d = __half2float(__ushort_as_half(blk16[0]));
-            const auto* x4 = reinterpret_cast<const float4*>(
-                x + static_cast<std::size_t>(b) * 32);
-            float s = 0.0f;
-            for (int k = 0; k < 4; ++k) {  // elements 4k .. 4k + 3
-                const float4 lo4 = __ldg(x4 + k);
-                const float4 hi4 = __ldg(x4 + 4 + k);
-                const float xl[4] = {lo4.x, lo4.y, lo4.z, lo4.w};
-                const float xh[4] = {hi4.x, hi4.y, hi4.z, hi4.w};
-                for (int m = 0; m < 4; ++m) {
-                    const int i = 4 * k + m;
-                    const std::uint32_t q =
-                        (blk16[1 + i / 2] >> (8 * (i % 2))) & 0xff;
-                    s += static_cast<float>(skv[q & 0x0f]) * xl[m] +
-                         static_cast<float>(skv[q >> 4]) * xh[m];
-                }
-            }
-            acc += d * s;
+            float vlo[16], vhi[16];
+            iq4_nl_block_values(blk16, skv, vlo, vhi);
+            acc += iq4_nl_block_dot(d, vlo, vhi,
+                                    x + static_cast<std::size_t>(b) * 32);
         }
         __syncwarp();  // the next pass overwrites this warp's slice
     }
     acc = warp_sum(acc);
     if (lane == 0) {
         out[r] = acc;
+    }
+}
+
+/** The 8 weights lane `lane` owns in IQ4_XS block blk, as dl times the
+ *  codebook value (the layout of matvec_iq4_xs_warp_kernel): vlo[k] is
+ *  element 32 ib + c + k of the block, vhi[k] the one 16 past it
+ *  (ib = lane / 4, c = 4 (lane % 4)). */
+__device__ inline void iq4_xs_lane_values(const std::uint8_t* blk,
+                                          std::uint32_t lane,
+                                          const std::int8_t* skv,
+                                          float vlo[4], float vhi[4]) {
+    const std::uint32_t ib = lane / 4;
+    const float d = ld_f16(blk);
+    const std::uint32_t scales_h = static_cast<std::uint32_t>(blk[2]) |
+                                   (static_cast<std::uint32_t>(blk[3]) << 8);
+    const int ls =
+        static_cast<int>(((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0x0f) |
+                         (((scales_h >> (2 * ib)) & 3) << 4));
+    const float dl = d * (ls - 32);
+    const std::uint32_t q4 =
+        __ldg(reinterpret_cast<const std::uint32_t*>(blk + 8) + lane);
+    for (int k = 0; k < 4; ++k) {
+        const std::uint32_t q = (q4 >> (8 * k)) & 0xff;
+        vlo[k] = dl * skv[q & 0x0f];
+        vhi[k] = dl * skv[q >> 4];
     }
 }
 
@@ -1504,29 +1558,12 @@ __global__ void matvec_iq4_xs_warp_kernel(const std::uint8_t* w,
     const std::uint32_t c = 4 * (lane % 4);
     float acc = 0.0f;
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 136;
-        const float d = ld_f16(blk);
-        const std::uint32_t scales_h =
-            static_cast<std::uint32_t>(blk[2]) |
-            (static_cast<std::uint32_t>(blk[3]) << 8);
-        const int ls =
-            static_cast<int>(((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0x0f) |
-                             (((scales_h >> (2 * ib)) & 3) << 4));
-        const float dl = d * (ls - 32);
-        const std::uint32_t q4 =
-            __ldg(reinterpret_cast<const std::uint32_t*>(blk + 8) + lane);
-        const float* xb =
-            x + static_cast<std::size_t>(b) * 256 + 32 * ib + c;
-        const float4 xlo = __ldg(reinterpret_cast<const float4*>(xb));
-        const float4 xhi =
-            __ldg(reinterpret_cast<const float4*>(xb + 16));
-        const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
-        const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
-        for (int k = 0; k < 4; ++k) {
-            const std::uint32_t q = (q4 >> (8 * k)) & 0xff;
-            acc += dl * skv[q & 0x0f] * xl[k];
-            acc += dl * skv[q >> 4] * xh[k];
-        }
+        float vlo[4], vhi[4];
+        iq4_xs_lane_values(row + static_cast<std::size_t>(b) * 136, lane,
+                           skv, vlo, vhi);
+        acc = lane_dot8<16>(
+            acc, vlo, vhi,
+            x + static_cast<std::size_t>(b) * 256 + 32 * ib + c);
     }
     acc = warp_sum(acc);
     if (lane == 0) {
@@ -2315,28 +2352,10 @@ __global__ void matvec_batch_q8_0_kernel(const std::uint8_t* w,
         __syncwarp();
         if (lane < nb) {
             const std::uint32_t b = b0 + lane;
-            const std::uint16_t* blk16 = mine + lane * 17;
-            const float d = __half2float(__ushort_as_half(blk16[0]));
             for (std::uint32_t t = 0; t < n; ++t) {
-                const auto* x4 = reinterpret_cast<const float4*>(
-                    x + static_cast<std::size_t>(t) * cols +
-                    static_cast<std::size_t>(b) * 32);
-                float bacc = 0.0f;
-                for (int k = 0; k < 8; ++k) {
-                    const float4 xv = __ldg(x4 + k);
-                    const std::uint16_t lo = blk16[1 + 2 * k];
-                    const std::uint16_t hi = blk16[2 + 2 * k];
-                    const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
-                    const std::int8_t q[4] = {
-                        static_cast<std::int8_t>(lo & 0xff),
-                        static_cast<std::int8_t>(lo >> 8),
-                        static_cast<std::int8_t>(hi & 0xff),
-                        static_cast<std::int8_t>(hi >> 8)};
-                    for (int g = 0; g < 4; ++g) {
-                        bacc += static_cast<float>(q[g]) * xs[g];
-                    }
-                }
-                acc[t] += d * bacc;
+                acc[t] += q8_0_block_dot(
+                    mine + lane * 17, x + static_cast<std::size_t>(t) * cols +
+                                          static_cast<std::size_t>(b) * 32);
             }
         }
         __syncwarp();  // the next pass overwrites this warp's slice
@@ -2388,28 +2407,12 @@ __global__ void matvec_batch_iq4_nl_kernel(const std::uint8_t* w,
             const std::uint16_t* blk16 = mine + lane * 9;
             const float d = __half2float(__ushort_as_half(blk16[0]));
             float vlo[16], vhi[16];
-            for (int i = 0; i < 16; ++i) {
-                const std::uint32_t q =
-                    (blk16[1 + i / 2] >> (8 * (i % 2))) & 0xff;
-                vlo[i] = static_cast<float>(skv[q & 0x0f]);
-                vhi[i] = static_cast<float>(skv[q >> 4]);
-            }
+            iq4_nl_block_values(blk16, skv, vlo, vhi);
             for (std::uint32_t t = 0; t < n; ++t) {
-                const auto* x4 = reinterpret_cast<const float4*>(
+                acc[t] += iq4_nl_block_dot(
+                    d, vlo, vhi,
                     x + static_cast<std::size_t>(t) * cols +
-                    static_cast<std::size_t>(b) * 32);
-                float s = 0.0f;
-                for (int k = 0; k < 4; ++k) {  // elements 4k .. 4k + 3
-                    const float4 lo4 = __ldg(x4 + k);
-                    const float4 hi4 = __ldg(x4 + 4 + k);
-                    const float xl[4] = {lo4.x, lo4.y, lo4.z, lo4.w};
-                    const float xh[4] = {hi4.x, hi4.y, hi4.z, hi4.w};
-                    for (int m = 0; m < 4; ++m) {
-                        const int i = 4 * k + m;
-                        s += vlo[i] * xl[m] + vhi[i] * xh[m];
-                    }
-                }
-                acc[t] += d * s;
+                        static_cast<std::size_t>(b) * 32);
             }
         }
         __syncwarp();  // the next pass overwrites this warp's slice
@@ -2451,36 +2454,14 @@ __global__ void matvec_batch_iq4_xs_kernel(const std::uint8_t* w,
         acc[t] = 0.0f;
     }
     for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk = row + static_cast<std::size_t>(b) * 136;
-        const float d = ld_f16(blk);
-        const std::uint32_t scales_h =
-            static_cast<std::uint32_t>(blk[2]) |
-            (static_cast<std::uint32_t>(blk[3]) << 8);
-        const int ls =
-            static_cast<int>(((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0x0f) |
-                             (((scales_h >> (2 * ib)) & 3) << 4));
-        const float dl = d * (ls - 32);
-        const std::uint32_t q4 =
-            __ldg(reinterpret_cast<const std::uint32_t*>(blk + 8) + lane);
         float vlo[4], vhi[4];
-        for (int k = 0; k < 4; ++k) {
-            const std::uint32_t q = (q4 >> (8 * k)) & 0xff;
-            vlo[k] = dl * skv[q & 0x0f];
-            vhi[k] = dl * skv[q >> 4];
-        }
+        iq4_xs_lane_values(row + static_cast<std::size_t>(b) * 136, lane,
+                           skv, vlo, vhi);
         for (std::uint32_t t = 0; t < n; ++t) {
-            const float* xb = x + static_cast<std::size_t>(t) * cols +
-                              static_cast<std::size_t>(b) * 256 + 32 * ib +
-                              c;
-            const float4 xlo = __ldg(reinterpret_cast<const float4*>(xb));
-            const float4 xhi =
-                __ldg(reinterpret_cast<const float4*>(xb + 16));
-            const float xl[4] = {xlo.x, xlo.y, xlo.z, xlo.w};
-            const float xh[4] = {xhi.x, xhi.y, xhi.z, xhi.w};
-            for (int k = 0; k < 4; ++k) {
-                acc[t] += vlo[k] * xl[k];
-                acc[t] += vhi[k] * xh[k];
-            }
+            acc[t] = lane_dot8<16>(acc[t], vlo, vhi,
+                                   x + static_cast<std::size_t>(t) * cols +
+                                       static_cast<std::size_t>(b) * 256 +
+                                       32 * ib + c);
         }
     }
     for (std::uint32_t t = 0; t < n; ++t) {
