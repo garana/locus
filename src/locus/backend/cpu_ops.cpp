@@ -791,10 +791,17 @@ void quantize_row_q8_k(const float* x, BlockQ8K* y, std::size_t n) {
     }
 }
 
-/** Q4_K (144B block) x Q8_K activation integer dot; ports ggml
- *  ggml_vec_dot_q4_K_q8_K_generic. `xq` holds nb Q8_K blocks. */
-float vec_dot_q4_k_q8_k(const std::byte* row, const BlockQ8K* xq,
-                        std::size_t nb) {
+/**
+ * The Q4_K / Q5_K x Q8_K integer dot both ports of ggml's generic
+ * vec_dot share: per block, `decode(blk, aux8)` writes its 256 unsigned
+ * quants, then the 6-bit scales and mins are unpacked, the min term
+ * taken from the bsums, and the scaled int sums added in ggml's order.
+ *
+ * @tparam kBlk The block's bytes (144 for Q4_K, 176 for Q5_K).
+ */
+template <std::size_t kBlk, class Decode>
+float vec_dot_k_q8_k(const std::byte* row, const BlockQ8K* xq,
+                     std::size_t nb, const Decode& decode) {
     constexpr std::uint32_t kmask1 = 0x3f3f3f3f;
     constexpr std::uint32_t kmask2 = 0x0f0f0f0f;
     constexpr std::uint32_t kmask3 = 0x03030303;
@@ -807,26 +814,13 @@ float vec_dot_q4_k_q8_k(const std::byte* row, const BlockQ8K* xq,
     std::int32_t aux32[8];
     float sumf = 0.0f;
     for (std::size_t i = 0; i < nb; ++i) {
-        const std::byte* blk = row + i * 144;
+        const std::byte* blk = row + i * kBlk;
         const float bd = f16_to_f32(load_u16(blk));
         const float bdmin = f16_to_f32(load_u16(blk + 2));
-        const auto* q4 =
-            reinterpret_cast<const std::uint8_t*>(blk + 16);
         const std::int8_t* q8 = xq[i].qs;
         std::memset(aux32, 0, sizeof(aux32));
-        std::int8_t* a = aux8;
-        for (int j = 0; j < 4; ++j) {
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
-            }
-            a += 32;
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(q4[l] >> 4);
-            }
-            a += 32;
-            q4 += 32;
-        }
-        std::memcpy(utmp, blk + 4, 12);  // Q4_K scales[12]
+        decode(blk, aux8);
+        std::memcpy(utmp, blk + 4, 12);  // scales[12]
         utmp[3] = ((utmp[2] >> 4) & kmask2) |
                   (((utmp[1] >> 6) & kmask3) << 4);
         const std::uint32_t uaux = utmp[1] & kmask1;
@@ -837,7 +831,7 @@ float vec_dot_q4_k_q8_k(const std::byte* row, const BlockQ8K* xq,
         for (int j = 0; j < 16; ++j) {
             sumi += xq[i].bsums[j] * mins[j / 2];
         }
-        a = aux8;
+        const std::int8_t* a = aux8;
         int is = 0;
         for (int j = 0; j < 8; ++j) {
             const std::int32_t scale = scales[is++];
@@ -862,6 +856,27 @@ float vec_dot_q4_k_q8_k(const std::byte* row, const BlockQ8K* xq,
         sumf += sums[l];
     }
     return sumf;
+}
+
+/** Q4_K (144B block) x Q8_K activation integer dot; ports ggml
+ *  ggml_vec_dot_q4_K_q8_K_generic. `xq` holds nb Q8_K blocks. */
+float vec_dot_q4_k_q8_k(const std::byte* row, const BlockQ8K* xq,
+                        std::size_t nb) {
+    return vec_dot_k_q8_k<144>(
+        row, xq, nb, [](const std::byte* blk, std::int8_t* a) {
+            const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 16);
+            for (int j = 0; j < 4; ++j) {
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
+                }
+                a += 32;
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(q4[l] >> 4);
+                }
+                a += 32;
+                q4 += 32;
+            }
+        });
 }
 
 /** Q6_K (210B) x Q8_K integer dot; ports ggml_vec_dot_q6_K_q8_K_
@@ -934,86 +949,33 @@ float vec_dot_q6_k_q8_k(const std::byte* row, const BlockQ8K* xq,
  *  generic (5th bit from qh, min via bsums). */
 float vec_dot_q5_k_q8_k(const std::byte* row, const BlockQ8K* xq,
                         std::size_t nb) {
-    constexpr std::uint32_t kmask1 = 0x3f3f3f3f;
-    constexpr std::uint32_t kmask2 = 0x0f0f0f0f;
-    constexpr std::uint32_t kmask3 = 0x03030303;
-    std::uint32_t utmp[4];
-    const auto* scales = reinterpret_cast<const std::uint8_t*>(&utmp[0]);
-    const auto* mins = reinterpret_cast<const std::uint8_t*>(&utmp[2]);
-    std::int8_t aux8[256];
-    std::int16_t aux16[8];
-    float sums[8] = {0};
-    std::int32_t aux32[8];
-    float sumf = 0.0f;
-    for (std::size_t i = 0; i < nb; ++i) {
-        const std::byte* blk = row + i * 176;
-        const float bd = f16_to_f32(load_u16(blk));
-        const float bdmin = f16_to_f32(load_u16(blk + 2));
-        const auto* hm =
-            reinterpret_cast<const std::uint8_t*>(blk + 16);
-        const auto* q4 =
-            reinterpret_cast<const std::uint8_t*>(blk + 48);
-        const std::int8_t* q8 = xq[i].qs;
-        std::memset(aux32, 0, sizeof(aux32));
-        std::int8_t* a = aux8;
-        std::uint8_t m = 1;
-        for (int j = 0; j < 4; ++j) {
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
-            }
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(a[l] +
-                                                ((hm[l] & m) ? 16 : 0));
-            }
-            a += 32;
-            m <<= 1;
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(q4[l] >> 4);
-            }
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(a[l] +
-                                                ((hm[l] & m) ? 16 : 0));
-            }
-            a += 32;
-            m <<= 1;
-            q4 += 32;
-        }
-        std::memcpy(utmp, blk + 4, 12);
-        utmp[3] = ((utmp[2] >> 4) & kmask2) |
-                  (((utmp[1] >> 6) & kmask3) << 4);
-        const std::uint32_t uaux = utmp[1] & kmask1;
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= kmask1;
-        int sumi = 0;
-        for (int j = 0; j < 16; ++j) {
-            sumi += xq[i].bsums[j] * mins[j / 2];
-        }
-        a = aux8;
-        int is = 0;
-        for (int j = 0; j < 8; ++j) {
-            const std::int32_t scale = scales[is++];
-            for (int k = 0; k < 4; ++k) {
-                for (int l = 0; l < 8; ++l) {
-                    aux16[l] = static_cast<std::int16_t>(q8[l] * a[l]);
+    return vec_dot_k_q8_k<176>(
+        row, xq, nb, [](const std::byte* blk, std::int8_t* a) {
+            const auto* hm = reinterpret_cast<const std::uint8_t*>(blk + 16);
+            const auto* q4 = reinterpret_cast<const std::uint8_t*>(blk + 48);
+            std::uint8_t m = 1;
+            for (int j = 0; j < 4; ++j) {
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
                 }
-                for (int l = 0; l < 8; ++l) {
-                    aux32[l] += scale * aux16[l];
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(a[l] +
+                                                    ((hm[l] & m) ? 16 : 0));
                 }
-                q8 += 8;
-                a += 8;
+                a += 32;
+                m <<= 1;
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(q4[l] >> 4);
+                }
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(a[l] +
+                                                    ((hm[l] & m) ? 16 : 0));
+                }
+                a += 32;
+                m <<= 1;
+                q4 += 32;
             }
-        }
-        const float d = bd * xq[i].d;
-        for (int l = 0; l < 8; ++l) {
-            sums[l] += d * static_cast<float>(aux32[l]);
-        }
-        sumf -= bdmin * xq[i].d * static_cast<float>(sumi);
-    }
-    for (int l = 0; l < 8; ++l) {
-        sumf += sums[l];
-    }
-    return sumf;
+        });
 }
 
 /** Q2_K (84B) x Q8_K integer dot; ports ggml_vec_dot_q2_K_q8_K_
