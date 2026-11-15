@@ -60,6 +60,16 @@ EngineGroup::EngineGroup(const model::TransformerModel& m,
     load_.assign(loops_.size(), 0);
 }
 
+std::uint64_t EngineGroup::prefix_key(
+    const std::vector<tok::TokenId>& prompt) {
+    // FNV-1a over the first kPrefixKeyTokens ids.
+    std::uint64_t h = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < kPrefixKeyTokens; ++i) {
+        h = (h ^ static_cast<std::uint32_t>(prompt[i])) * 1099511628211ULL;
+    }
+    return h;
+}
+
 std::string EngineGroup::admit_error(std::uint32_t n_prompt) {
     return loops_.front()->admit_error(n_prompt);
 }
@@ -72,10 +82,28 @@ std::uint64_t EngineGroup::submit(
     std::size_t e = 0;
     {
         std::lock_guard<std::mutex> lk(live_mu_);
+        std::size_t least = 0;
         for (std::size_t i = 1; i < loops_.size(); ++i) {
-            if (load_[i] < load_[e]) {
-                e = i;
+            if (load_[i] < load_[least]) {
+                least = i;
             }
+        }
+        e = least;
+        // Prefix affinity (i#940): each engine has its own prefix cache,
+        // so a prompt goes where its first tokens were last served, to
+        // reuse their KV, unless that engine is busier than the least
+        // loaded by more than kPrefixSlack.
+        if (loops_.size() > 1 && prompt.size() >= kPrefixKeyTokens) {
+            const std::uint64_t key = prefix_key(prompt);
+            const auto it = last_engine_.find(key);
+            if (it != last_engine_.end() &&
+                load_[it->second] <= load_[least] + kPrefixSlack) {
+                e = it->second;
+            }
+            if (last_engine_.size() >= kPrefixKeys) {
+                last_engine_.clear();  // bounded: start over when full
+            }
+            last_engine_[key] = e;
         }
         ++load_[e];
     }

@@ -279,6 +279,62 @@ TEST_CASE("the generation pump reports a stream that fails mid-way",
     }
 }
 
+// i#940: each engine has its own prefix cache, so a prompt goes to the
+// engine that last served its first tokens (and reuses their KV there),
+// unless that engine is busier than the least-loaded one by more than
+// the slack (one request).
+TEST_CASE("a prompt goes to the engine that holds its prefix",
+          "[engine_group][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    locus::engine::Engine::Config cfg;
+    cfg.prefix_cache = true;
+    // An EOS the model never emits: the long request runs until the
+    // context ends it.
+    const locus::tok::TokenId never = model.hparams().n_vocab;
+    EngineGroup group(model, never, cfg, EngineGroup::plan(2, {}));
+    std::vector<locus::tok::TokenId> shared;
+    for (int i = 0; i < 40; ++i) {
+        shared.push_back(1 + i % 200);
+    }
+    const auto with_tail = [&](locus::tok::TokenId t) {
+        auto p = shared;
+        p.push_back(t);
+        return p;
+    };
+    std::vector<locus::tok::TokenId> other;
+    for (int i = 0; i < 20; ++i) {
+        other.push_back(300 + i);
+    }
+
+    // The prefix's first request: engine 0 (both idle), done, released.
+    const std::uint64_t a = group.submit(with_tail(250), 2);
+    REQUIRE(group.engine_of(a) == 0);
+    group.wait_done(a);
+    group.release(a);
+    // Engine 0 takes one more request (another prefix), kept unreleased.
+    const std::uint64_t x = group.submit(other, 4096);
+    REQUIRE(group.engine_of(x) == 0);
+    // By load the next would go to engine 1; its prefix sends it to 0,
+    // one request over, and its first blocks come from the cache there.
+    const std::uint64_t b = group.submit(with_tail(251), 2);
+    CHECK(group.engine_of(b) == 0);
+    CHECK(group.wait_done(b).reused_prefix_tokens > 0);
+    // Engine 0 now holds two over engine 1: past the slack, so engine 1.
+    const std::uint64_t c = group.submit(with_tail(252), 2);
+    CHECK(group.engine_of(c) == 1);
+    group.wait_done(c);
+    for (const std::uint64_t id : {c, b}) {
+        group.release(id);
+    }
+    group.cancel(x);
+    group.wait_done(x);
+    group.release(x);
+}
+
 TEST_CASE("two Vulkan devices run one engine each with one device's tokens",
           "[engine_group][vulkan]") {
     if (!std::filesystem::exists(model_path())) {
