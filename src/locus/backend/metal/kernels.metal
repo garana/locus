@@ -1027,3 +1027,98 @@ kernel void mm_q6_k(device const uchar* wbase [[buffer(0)]],
         }
     }
 }
+
+// Causal attention for a chunk, tiled: threadgroup g takes queries
+// 8 (g / n_heads) .. + 8 of head g % n_heads, one simdgroup a query.
+// The positions go by in chunks of min(kTileFloats / head_dim, 32), a
+// position a lane, whose K and V rows are staged in threadgroup memory
+// once for all 8 queries; each query keeps an online softmax (running
+// max m, sum l, and its output dims d = lane + 32 i in registers).
+// head_dim is at most 128 and a multiple of 32. Same parameters and
+// buffers as attn_rows.
+constant constexpr uint kTileQ = 8;
+constant constexpr uint kTileFloats = 2048;
+
+kernel void attn_rows_tiled(device const float* q [[buffer(0)]],
+                            device const float* pool [[buffer(1)]],
+                            device const uint* blocks [[buffer(2)]],
+                            device float* out [[buffer(3)]],
+                            constant AttnRowsParams& pr [[buffer(4)]],
+                            uint g [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float kt[kTileFloats];
+    threadgroup float vt[kTileFloats];
+    threadgroup float qs[kTileQ * 128];
+    constant AttnParams& p = pr.a;
+    // A chunk is at most 32 positions: lane j scores position c + j.
+    const uint hd = p.head_dim, ch = min(kTileFloats / hd, 32u);
+    const uint h = g % p.n_heads, t0 = (g / p.n_heads) * kTileQ;
+    const uint kvh = h / (p.n_heads / p.n_kv_heads);
+    const uint t = t0 + sg;  // this simdgroup's query
+    const bool live = t < p.n_pos;  // n_pos: the chunk's token count
+    // The 8 queries' rows, staged once.
+    for (uint i = tid; i < kTileQ * hd; i += kTileQ * 32) {
+        const uint qi = i / hd;
+        qs[i] = t0 + qi < p.n_pos
+                    ? q[ulong(t0 + qi) * pr.q_stride + h * hd + i % hd]
+                    : 0.0f;
+    }
+    const uint last = pr.base + min(t0 + kTileQ, p.n_pos);  // positions
+    const uint mine = pr.base + t + 1;  // this query sees [0, mine)
+    float m = -INFINITY, l = 0.0f;
+    float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint nd = hd / 32;
+    for (uint c = 0; c < last; c += ch) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < ch * hd; i += kTileQ * 32) {
+            const uint j = c + i / hd;
+            if (j < last) {
+                const ulong r = kv_row(p, blocks, j) + kvh * hd + i % hd;
+                kt[i] = pool[r];
+                vt[i] = pool[r + p.v_off];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!live || c >= mine) {
+            continue;
+        }
+        // Lane j scores position c + j.
+        const uint j = c + lane;
+        float sc = -INFINITY;
+        if (lane < ch && j < mine) {
+            threadgroup const float4* kr =
+                (threadgroup const float4*)(kt + lane * hd);
+            threadgroup const float4* qr =
+                (threadgroup const float4*)(qs + sg * hd);
+            float d = 0.0f;
+            for (uint i = 0; i < hd / 4; ++i) {
+                d += dot(qr[i], kr[i]);
+            }
+            sc = d * p.kq_scale;
+        }
+        const float cm = simd_max(sc);
+        const float mn = max(m, cm);
+        const float e = sc == -INFINITY ? 0.0f : exp(sc - mn);
+        const float scale = m == -INFINITY ? 0.0f : exp(m - mn);
+        l = l * scale + simd_sum(e);
+        for (uint i = 0; i < nd; ++i) {
+            o[i] *= scale;
+        }
+        const uint nj = min(ch, mine - c);
+        for (uint jj = 0; jj < nj; ++jj) {
+            const float pj = simd_shuffle(e, jj);
+            for (uint i = 0; i < nd; ++i) {
+                o[i] += pj * vt[jj * hd + lane + 32 * i];
+            }
+        }
+        m = mn;
+    }
+    if (live) {
+        const float inv = 1.0f / l;
+        for (uint i = 0; i < nd; ++i) {
+            out[ulong(t) * pr.q_stride + h * hd + lane + 32 * i] = o[i] * inv;
+        }
+    }
+}
