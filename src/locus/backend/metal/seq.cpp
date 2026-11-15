@@ -131,9 +131,10 @@ Seq::Seq() {
 }
 
 Seq::~Seq() {
-    if (im_->ctx.batch_open()) {
-        im_->end();
-    }
+    // Unsubmitted ops are dropped, not run: a destructor must not wait
+    // on (or throw for) a failed command buffer, as when an exception
+    // unwinds through a step. Their results were never read.
+    im_->ctx.abandon_batch();
 }
 
 void Seq::reserve(Slot i, std::size_t n) {

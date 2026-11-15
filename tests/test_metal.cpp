@@ -1062,3 +1062,35 @@ TEST_CASE("metal::Seq ops match CPU references", "[metal]") {
         }
     }
 }
+
+// A Seq that throws mid-step drops its open batch when destroyed (no
+// wait, no throw from the destructor), and the next Seq works.
+TEST_CASE("metal::Seq destroyed mid-step leaves Metal usable", "[metal]") {
+    if (!locus::backend::metal::Seq::available()) {
+        SKIP("no Metal device");
+    }
+    using Seq = locus::backend::metal::Seq;
+    const std::uint32_t d = 256;
+    const auto wv = random_weights(TensorType::kQ5_K, 8, d, 3);
+    const locus::backend::Mat w{TensorType::kQ5_K, wv.data(), 8, d};
+    std::vector<float> x(2 * d, 1.0f);
+    {
+        Seq q;
+        q.reserve(0, x.size());
+        q.reserve(1, 16);
+        q.write(0, 0, x);
+        q.add({0, 0, d}, {0, 0, d}, 2, d);  // recorded, never run
+        // The Q5_K matvec fallback refuses an x offset off 4.
+        REQUIRE_THROWS_AS(q.linear(w, {}, {0, 1, d}, {1, 0, 8}, 2),
+                          std::invalid_argument);
+    }
+    Seq q;
+    q.reserve(0, x.size());
+    q.write(0, 0, x);
+    q.add({0, 0, d}, {0, 0, d}, 2, d);
+    std::vector<float> got(x.size());
+    q.read(0, 0, got);
+    for (const float v : got) {
+        REQUIRE(v == 2.0f);
+    }
+}

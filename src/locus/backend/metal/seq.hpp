@@ -36,7 +36,8 @@ class Seq {
     /** Takes the device lock and opens a batch.
      *  @throws std::runtime_error when Metal is not usable. */
     Seq();
-    /** Runs an unflushed batch (its results unread), releases the lock. */
+    /** Drops an unflushed batch unrun (its results were never read)
+     *  and releases the lock; never throws. */
     ~Seq();
     Seq(const Seq&) = delete;
     Seq& operator=(const Seq&) = delete;
@@ -61,7 +62,8 @@ class Seq {
      * out[t] = w x[t] + b for n token rows (b may be empty): a matmul
      * where the type has one, else a matvec a row.
      * @throws std::invalid_argument when b is neither empty nor w.rows
-     *     long, or w's type has no Metal kernel.
+     *     long, w's type has no Metal kernel, or the matvec fallback
+     *     gets an x offset or stride that is not a multiple of 4.
      */
     void linear(const Mat& w, std::span<const float> b, Rows x, Rows out,
                 std::uint32_t n);
