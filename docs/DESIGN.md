@@ -194,6 +194,15 @@ reply's queue bound. An idle or slow client then holds a buffer, not a
 thread. A reply names its connection when it wakes the loop
 (`http::WakeList`) and deadlines sit in a min-heap (#990), so the I/O
 thread's work per chunk does not grow with the connections it holds.
+A generation (completions, chat, messages, responses; #932)
+gives its job thread back after submit (`RequestContext::defer`): one
+`server::GenPump` thread, woken by the engines' progress hook, takes
+each request's new tokens (`EngineLoop::take`) and queues its SSE
+chunks or body on the reply, through the same `GenReply` steps the
+thread path runs, so N streams take no thread each. A stream over its
+queue bound is skipped until the client reads. The known limit: that
+one thread decodes and builds the JSON of every stream in turn, and
+each wake (and a 20 ms tick) visits every live generation.
 `http::Server` (a thread a connection) stays the default for now.
 
 `locus-router` (`router::Router`) proxies each request to one of

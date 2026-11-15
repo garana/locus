@@ -164,6 +164,11 @@ bool LoopReply::cancelled() const {
     return cancelled_;
 }
 
+bool LoopReply::has_room() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return chunks_.size() < max_buffer_;
+}
+
 bool LoopReply::client_gone() const {
     std::lock_guard<std::mutex> lk(mu_);
     return cancelled_ || peer_closed_;

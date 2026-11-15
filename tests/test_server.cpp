@@ -2308,6 +2308,8 @@ TEST_CASE("server survives concurrent mid-stream SSE aborts",
     // kDone).
     locus::server::OpenAiServer::Options opt;
     opt.prompt_cache = false;
+    // i#932: on the event loop the pump sees the gone client and cancels.
+    opt.event_loop = GENERATE(false, true);
     TestServer ts(model, tok, opt);
 
     // Baseline KV and request count (also proves /metrics works before
@@ -3308,4 +3310,240 @@ TEST_CASE("buffered SSE replies send keepalive comments", "[server][e2e]") {
         CHECK(std::regex_replace(events, created, "") ==
               std::regex_replace(without[i], created, ""));
     }
+}
+
+namespace {
+
+/** The generation requests of i#932's byte check: each endpoint,
+ *  buffered and streamed, with and without tools. */
+std::vector<std::pair<std::string, json>> generation_requests() {
+    const json msgs =
+        json::array({{{"role", "user"}, {"content", "Once upon a time"}}});
+    const json oa_tools = json::array(
+        {{{"type", "function"},
+          {"function",
+           {{"name", "get_weather"},
+            {"description", "weather"},
+            {"parameters", {{"type", "object"}}}}}}});
+    const json an_tools =
+        json::array({{{"name", "word_count"},
+                      {"description", "count words"},
+                      {"input_schema", {{"type", "object"}}}}});
+    std::vector<std::pair<std::string, json>> out;
+    for (const bool stream : {false, true}) {
+        out.push_back({"/v1/completions",
+                       {{"prompt", "Once upon a time"},
+                        {"max_tokens", 12},
+                        {"temperature", 0},
+                        {"logprobs", 2},
+                        {"stream", stream}}});
+        out.push_back({"/v1/chat/completions",
+                       {{"messages", msgs},
+                        {"max_tokens", 10},
+                        {"temperature", 0},
+                        {"stream", stream}}});
+        out.push_back({"/v1/chat/completions",
+                       {{"messages", msgs},
+                        {"max_tokens", 10},
+                        {"temperature", 0},
+                        {"tools", oa_tools},
+                        {"stream", stream}}});
+        out.push_back({"/v1/messages",
+                       {{"messages", msgs},
+                        {"max_tokens", 10},
+                        {"temperature", 0},
+                        {"stream", stream}}});
+        out.push_back({"/v1/messages",
+                       {{"messages", msgs},
+                        {"max_tokens", 10},
+                        {"temperature", 0},
+                        {"tools", an_tools},
+                        {"stream", stream}}});
+        out.push_back({"/v1/responses",
+                       {{"input", "Once upon a time"},
+                        {"max_output_tokens", 10},
+                        {"temperature", 0},
+                        {"stream", stream}}});
+    }
+    return out;
+}
+
+}  // namespace
+
+// i#932: on the event loop a generation is driven by the engine's
+// progress (GenPump) instead of a job thread that waits; it runs the same
+// GenReply steps, so every body is the same bytes as the thread server's.
+TEST_CASE("event-loop generations are the thread server's bytes",
+          "[server][e2e][loop_server]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const auto reqs = generation_requests();
+    const auto run = [&](bool loop) {
+        locus::server::OpenAiServer::Options opt;
+        opt.event_loop = loop;
+        opt.sse_keepalive_ms = 0;  // no timing-dependent comments
+        TestServer ts(model, tok, opt);  // fresh: the same request ids
+        httplib::Client c("127.0.0.1", ts.port);
+        c.set_read_timeout(60, 0);
+        std::vector<std::string> bodies;
+        for (const auto& [path, body] : reqs) {
+            auto r = c.Post(path, body.dump(), "application/json");
+            REQUIRE(r);
+            CHECK(r->status == 200);
+            bodies.push_back(r->body);
+        }
+        return bodies;
+    };
+    const auto thread = run(false);
+    const auto loop = run(true);
+    REQUIRE(loop.size() == thread.size());
+    const std::regex created("\"created_at\":[0-9]+");
+    for (std::size_t i = 0; i < loop.size(); ++i) {
+        INFO(reqs[i].first << " " << reqs[i].second.dump());
+        CHECK(!loop[i].empty());
+        CHECK(std::regex_replace(loop[i], created, "") ==
+              std::regex_replace(thread[i], created, ""));
+    }
+}
+
+// i#932: a generation holds no job thread on the event loop. With one
+// job thread, a stream in flight leaves it free, so /metrics (a pool
+// route under --event-loop) answers while the stream's KV is still held.
+// On the thread path the stream holds the only thread, and /metrics
+// would answer only after it ends, with every block free again.
+TEST_CASE("an event-loop stream leaves the job pool free",
+          "[server][e2e][loop_server]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::server::OpenAiServer::Options opt;
+    opt.event_loop = true;
+    opt.http_threads = 1;
+    opt.prompt_cache = false;  // free blocks return to the total
+    TestServer ts(model, tok, opt);
+    const long total = scrape_metric(ts.port, "locus_kv_blocks_total");
+    REQUIRE(total > 0);
+
+    const int c = locus::pipeline::connect_to("127.0.0.1", ts.port, 2000);
+    REQUIRE(c >= 0);
+    locus::pipeline::set_recv_timeout(c, 20000);
+    const json req{{"prompt", "Once upon a time"},
+                   {"max_tokens", 512},
+                   {"stream", true}};
+    REQUIRE(send_all(c, make_post("/v1/completions", req.dump())));
+    // The head and the first token: the generation is running.
+    std::string got;
+    char buf[4096];
+    while (got.find("data: ") == std::string::npos) {
+        const ssize_t n = ::recv(c, buf, sizeof(buf), 0);
+        REQUIRE(n > 0);
+        got.append(buf, static_cast<std::size_t>(n));
+    }
+    const long free_mid = scrape_metric(ts.port, "locus_kv_blocks_free");
+    CHECK(free_mid >= 0);
+    CHECK(free_mid < total);  // answered while the stream holds its KV
+    got += recv_to_eof(c);
+    ::close(c);
+    CHECK(got.find("data: [DONE]") != std::string::npos);
+}
+
+// i#932: stopping the server while the pump writes a stream. stop()
+// stops the pump before the HTTP server, whose wake pipe closes last,
+// so no pump write can reach a closed (or reused) fd; the client sees
+// the connection end, and the server goes down cleanly.
+TEST_CASE("an event-loop server stops while a stream is mid-flight",
+          "[server][e2e][loop_server]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const json req{{"prompt", "Once upon a time"},
+                   {"max_tokens", 512},
+                   {"stream", true}};
+    for (int round = 0; round < 4; ++round) {
+        locus::server::OpenAiServer::Options opt;
+        opt.event_loop = true;
+        auto ts = std::make_unique<TestServer>(model, tok, opt);
+        std::vector<int> fds;
+        for (int i = 0; i < 20; ++i) {
+            const int c =
+                locus::pipeline::connect_to("127.0.0.1", ts->port, 2000);
+            REQUIRE(c >= 0);
+            locus::pipeline::set_recv_timeout(c, 20000);
+            REQUIRE(send_all(c, make_post("/v1/completions", req.dump())));
+            fds.push_back(c);
+        }
+        // The first stream is writing (the others may still queue).
+        std::string got;
+        char buf[4096];
+        while (got.find("data: ") == std::string::npos) {
+            const ssize_t n = ::recv(fds[0], buf, sizeof(buf), 0);
+            REQUIRE(n > 0);
+            got.append(buf, static_cast<std::size_t>(n));
+        }
+        ts.reset();  // stop() with the streams still writing
+        for (const int c : fds) {
+            recv_to_eof(c);  // each connection ends (no hang)
+            ::close(c);
+        }
+    }
+}
+
+// i#932: N concurrent streams take no thread each: 200 on a pool of two
+// job threads all run to their end.
+TEST_CASE("200 event-loop streams on two job threads",
+          "[server][e2e][loop_server][stress]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("model not present; run scripts/fetch-test-model.sh");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::server::OpenAiServer::Options opt;
+    opt.event_loop = true;
+    opt.http_threads = 2;
+    opt.prompt_cache = false;
+    TestServer ts(model, tok, opt);
+    const long free_before = scrape_metric(ts.port, "locus_kv_blocks_free");
+    REQUIRE(free_before > 0);
+
+    constexpr int kStreams = 200;
+    const json req{{"prompt", "Once upon a time"},
+                   {"max_tokens", 16},
+                   {"stream", true}};
+    const std::string post = make_post("/v1/completions", req.dump());
+    std::vector<int> fds;
+    for (int i = 0; i < kStreams; ++i) {
+        const int c = locus::pipeline::connect_to("127.0.0.1", ts.port, 2000);
+        REQUIRE(c >= 0);
+        locus::pipeline::set_recv_timeout(c, 60000);
+        REQUIRE(send_all(c, post));
+        fds.push_back(c);
+    }
+    int done = 0;
+    for (const int c : fds) {
+        const std::string r = recv_to_eof(c);
+        ::close(c);
+        if (status_of(r) == 200 && r.find("data: [DONE]") != std::string::npos) {
+            ++done;
+        }
+    }
+    CHECK(done == kStreams);
+    // Every stream released its KV.
+    long free_after = -1;
+    for (int i = 0; i < 400; ++i) {
+        free_after = scrape_metric(ts.port, "locus_kv_blocks_free");
+        if (free_after >= free_before) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    CHECK(free_after == free_before);
 }
