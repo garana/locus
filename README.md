@@ -196,14 +196,15 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   long as the audio it makes, and its token generation is 1.23x
   slower than llama.cpp Metal's on the same weights (#784); the M4
   Max generates faster than real time (139 audio tokens/s, where real
-  time needs about 82); a comparison
-  with other speech, image and video tools (#245).
+  time needs about 82). docs/COMPARISON.md compares the speech, image
+  and video models with other tools on the same weights; on the x86
+  CPU a video DiT step takes about 8x PyTorch's (#982).
 - Performance: prefill on Apple GPUs at 44% of Metal's (#10:
   MoltenVK exposes no cooperative matrix, so a native Metal backend is
   being built, #865 to #868), CPU prefill on an M2 Pro at about 60%
   of llama.cpp's with `LOCUS_CPU_FAST` (llama.cpp sends its prompt
   matmuls through Apple's Accelerate; whether locus should is #782).
-- Multi-server inference, pipeline and expert parallel (#3, #24).
+- Multi-server inference, pipeline and expert parallel (#409, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
 
