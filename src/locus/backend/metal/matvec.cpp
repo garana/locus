@@ -58,10 +58,10 @@ Kind kind_of(TensorType t) {
 
 /**
  * @returns The Q6_K matvec kernel for ctx's GPU (i#1058): ggml's
- * half-block layout below Apple family 9 (the M2 reads Q6_K at about
- * twice the bandwidth with it), the unit layout on 9 and up (a few
- * percent faster on the M4). LOCUS_METAL_Q6K=halves or units picks one
- * (tests).
+ * half-block layout below Apple family 9 (the M2, family 8, reads Q6_K
+ * at about twice the bandwidth with it; family 7, the M1, takes it too,
+ * unmeasured), the unit layout on 9 and up (a few percent faster on the
+ * M4). LOCUS_METAL_Q6K=halves or units picks one (tests).
  */
 const char* q6k_kernel(const Context& ctx) {
     if (const char* e = std::getenv("LOCUS_METAL_Q6K")) {

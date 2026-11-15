@@ -1167,6 +1167,24 @@ TEST_CASE("metal Q6_K matvec layouts match the CPU", "[metal]") {
         SKIP("no Metal device");
     }
     namespace mb = locus::backend::metal;
+    // Puts the caller's LOCUS_METAL_Q6K back, even past a failure.
+    struct EnvGuard {
+        std::string old;
+        bool had = false;
+        EnvGuard() {
+            if (const char* e = std::getenv("LOCUS_METAL_Q6K")) {
+                old = e;
+                had = true;
+            }
+        }
+        ~EnvGuard() {
+            if (had) {
+                ::setenv("LOCUS_METAL_Q6K", old.c_str(), 1);
+            } else {
+                ::unsetenv("LOCUS_METAL_Q6K");
+            }
+        }
+    } guard;
     std::mt19937 rng(1058);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     for (const char* layout : {"halves", "units"}) {
@@ -1190,5 +1208,4 @@ TEST_CASE("metal Q6_K matvec layouts match the CPU", "[metal]") {
             }
         }
     }
-    ::unsetenv("LOCUS_METAL_Q6K");
 }
