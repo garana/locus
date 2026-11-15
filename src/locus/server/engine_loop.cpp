@@ -1,8 +1,10 @@
 #include "locus/server/engine_loop.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <thread>
@@ -71,6 +73,7 @@ std::unique_lock<std::mutex> EngineLoop::lock_turn() {
 
 void EngineLoop::publish_locked() {
     bool changed = false;
+    bool queued = false;
     {
         std::lock_guard<std::mutex> pk(pmu_);
         for (auto& [id, w] : watched_) {
@@ -83,10 +86,112 @@ void EngineLoop::publish_locked() {
                 changed = true;
             }
         }
+        for (auto& [id, f] : followed_) {
+            queued = queue_locked(id, f) || queued;
+        }
     }
     if (changed) {
         progress_cv_.notify_all();
     }
+    if (queued && progress_hook_) {
+        progress_hook_();
+    }
+}
+
+bool EngineLoop::queue_locked(std::uint64_t id, Follow& f) const {
+    if (f.terminal) {
+        return false;
+    }
+    View& p = f.pending;
+    const engine::Request* r = engine_.get(id);
+    if (r == nullptr) {
+        // Released under the follower (as snapshot_locked reports it).
+        p.status = engine::Status::kFailed;
+        p.error = "unknown request id";
+        f.terminal = true;
+        f.changed = true;
+        return true;
+    }
+    bool any = false;
+    if (r->generated.size() > f.tokens) {
+        p.generated.insert(p.generated.end(),
+                           r->generated.begin() +
+                               static_cast<std::ptrdiff_t>(f.tokens),
+                           r->generated.end());
+        f.tokens = r->generated.size();
+        any = true;
+    }
+    if (r->logprobs.size() > f.logprobs) {
+        p.logprobs.insert(p.logprobs.end(),
+                          r->logprobs.begin() +
+                              static_cast<std::ptrdiff_t>(f.logprobs),
+                          r->logprobs.end());
+        f.logprobs = r->logprobs.size();
+        any = true;
+    }
+    if (r->status != p.status || r->error != p.error ||
+        r->reused_prefix_tokens != p.reused_prefix_tokens ||
+        r->cached_prefix_tokens != p.cached_prefix_tokens) {
+        p.status = r->status;
+        p.error = r->error;
+        p.reused_prefix_tokens = r->reused_prefix_tokens;
+        p.cached_prefix_tokens = r->cached_prefix_tokens;
+        any = true;
+    }
+    f.terminal = engine::is_terminal(r->status);
+    f.changed = f.changed || any;
+    return any;
+}
+
+void EngineLoop::follow(std::uint64_t id) {
+    auto lk = lock_turn();
+    std::lock_guard<std::mutex> pk(pmu_);
+    const auto [it, fresh] = followed_.try_emplace(id);
+    if (fresh) {
+        queue_locked(id, it->second);
+        it->second.changed = true;  // the first take reports the state
+    }
+}
+
+bool EngineLoop::take(std::uint64_t id, View& acc) {
+    std::lock_guard<std::mutex> pk(pmu_);
+    const auto it = followed_.find(id);
+    if (it == followed_.end() || !it->second.changed) {
+        return false;
+    }
+    Follow& f = it->second;
+    View& p = f.pending;
+    acc.generated.insert(acc.generated.end(), p.generated.begin(),
+                         p.generated.end());
+    p.generated.clear();
+    acc.logprobs.insert(acc.logprobs.end(),
+                        std::make_move_iterator(p.logprobs.begin()),
+                        std::make_move_iterator(p.logprobs.end()));
+    p.logprobs.clear();
+    acc.status = p.status;
+    acc.error = p.error;
+    acc.reused_prefix_tokens = p.reused_prefix_tokens;
+    acc.cached_prefix_tokens = p.cached_prefix_tokens;
+    f.changed = false;
+    if (f.terminal) {
+        followed_.erase(it);
+    }
+    return true;
+}
+
+void EngineLoop::unfollow(std::uint64_t id) {
+    std::lock_guard<std::mutex> pk(pmu_);
+    followed_.erase(id);
+}
+
+std::size_t EngineLoop::follows() {
+    std::lock_guard<std::mutex> pk(pmu_);
+    return followed_.size();
+}
+
+void EngineLoop::set_progress_hook(std::function<void()> hook) {
+    auto lk = lock_turn();
+    progress_hook_ = std::move(hook);
 }
 
 void EngineLoop::wait_watch(std::uint64_t id, std::size_t n_seen,
@@ -281,6 +386,11 @@ bool EngineLoop::release(std::uint64_t id) {
     const engine::Request* r = engine_.get(id);
     const bool gone = r == nullptr || engine::is_terminal(r->status);
     engine_.release(id);
+    if (gone) {
+        // The request's record is gone: so is its follow, taken or not.
+        std::lock_guard<std::mutex> pk(pmu_);
+        followed_.erase(id);
+    }
     return gone;
 }
 

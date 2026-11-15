@@ -1,5 +1,6 @@
 #include "locus/server/engine_group.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -115,6 +116,44 @@ TEST_CASE("two CPU engines give each request the tokens of one engine",
     const auto s = group.stats();
     CHECK(s.total_blocks > 0);
     CHECK(s.free_blocks <= s.total_blocks);
+}
+
+// i#989: follow and take reach the engine that holds the id, and one
+// hook serves both engines' workers.
+TEST_CASE("two CPU engines: a followed request on each is taken whole",
+          "[engine_group][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    const std::vector<std::vector<locus::tok::TokenId>> prompts = {
+        tok.encode("Once upon a time", true),
+        tok.encode("The little dog", true)};
+    const auto want = alone(model, tok.eos_id(), prompts, 12);
+
+    EngineGroup group(model, tok.eos_id(), {}, EngineGroup::plan(2, {}));
+    std::atomic<int> calls{0};
+    group.set_progress_hook([&calls] { calls.fetch_add(1); });
+    std::vector<std::uint64_t> ids;
+    for (const auto& p : prompts) {
+        ids.push_back(group.submit(p, 12));
+        group.follow(ids.back());
+    }
+    REQUIRE(group.engine_of(ids[0]) != group.engine_of(ids[1]));
+    std::vector<EngineLoop::View> acc(ids.size());
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const auto v = group.wait_done(ids[i]);
+        REQUIRE(v.status == locus::engine::Status::kDone);
+        // The terminal step queued everything before wait_done saw it.
+        while (group.take(ids[i], acc[i])) {
+        }
+        CHECK(acc[i].status == locus::engine::Status::kDone);
+        CHECK(acc[i].generated == want[i]);
+        group.release(ids[i]);
+    }
+    CHECK(calls.load() > 0);
 }
 
 TEST_CASE("two Vulkan devices run one engine each with one device's tokens",
