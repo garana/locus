@@ -354,7 +354,7 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         Scratch::grow(ctx, s.cs, std::size_t{hd} * 4);
         Scratch::grow(ctx, s.scores, std::size_t{H} * n_pos * 4);
         Scratch::grow(ctx, s.parts,
-                      std::size_t{H} * n_parts * (std::size_t{hd} + 2) * 4);
+                      std::size_t{H} * n_parts * (std::size_t{hd} + 4) * 4);
         Scratch::grow(ctx, s.blocks, std::size_t{n_blocks} * 4);
 
         // Host-side inputs, written straight into the shared buffers:
