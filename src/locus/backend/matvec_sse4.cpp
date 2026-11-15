@@ -2201,17 +2201,17 @@ void matvec_sse4_q8k(const Mat& w, std::span<const float> x,
         }
         return;
     }
-    const std::size_t nb = cols / 256;
-    std::vector<float> hd(nb);
-    std::vector<std::int8_t> hqs(cols);
-    std::vector<std::int16_t> hbs(nb * 16);
 #if defined(LOCUS_SSE4_AVX_VARIANT)
     // i#801: LOCUS_CPU_FAST takes llama.cpp's Q4_K / Q6_K rows (another
-    // float order).
+    // float order), before the default path's buffers are allocated.
     if (cpu_fast() && self::matvec_q8k_llama_avx(w, x, out)) {
         return;
     }
 #endif
+    const std::size_t nb = cols / 256;
+    std::vector<float> hd(nb);
+    std::vector<std::int8_t> hqs(cols);
+    std::vector<std::int16_t> hbs(nb * 16);
     const bool q3k = w.type == gguf::TensorType::kQ3_K;
     // Q2_K, Q3_K and the IQ2 types read the plain order; Q4_K..Q6_K the
     // lane_pairs_mask one.
