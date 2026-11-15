@@ -33,12 +33,24 @@ kernel void add_f32(device const float* a [[buffer(0)]],
 struct MvParams {
     ulong w_off;    // bytes into the weight buffer
     ulong out_off;  // floats into the output buffer
+    ulong expert_bytes;  // routed: w_off + route[route_slot] * this
     uint rows;
     uint cols;
     uint accumulate;
     uint x_off;
     float scale;
+    uint route_slot;  // kNoRoute: w_off as is
 };
+
+constant constexpr uint kNoRoute = 0xFFFFFFFFu;
+
+// The weight's byte offset: w_off, plus a routed expert's (MoE on the
+// GPU, i#868: the expert id read from the route buffer at buffer 7).
+inline ulong mv_w_off(constant MvParams& p, device const uint* route) {
+    return p.route_slot == kNoRoute
+               ? p.w_off
+               : p.w_off + ulong(route[p.route_slot]) * p.expert_bytes;
+}
 
 constant constexpr uint kMvLanes = 16;
 constant constexpr uint kMvRows = 8;
@@ -73,6 +85,7 @@ kernel void mv_f32(device const uchar* w [[buffer(0)]],
                    device const float* xb [[buffer(1)]],
                    device float* out [[buffer(2)]],
                    constant MvParams& p [[buffer(3)]],
+                   device const uint* route [[buffer(7)]],
                    uint tg [[threadgroup_position_in_grid]],
                    uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
@@ -80,7 +93,8 @@ kernel void mv_f32(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         device const float4* row =
-            (device const float4*)(w + p.w_off + (ulong)r * p.cols * 4);
+            (device const float4*)(w + mv_w_off(p, route) +
+                                      (ulong)r * p.cols * 4);
         device const float4* x = (device const float4*)(xb + p.x_off);
         for (uint u = lane; u < p.cols / 4; u += kMvLanes) {
             acc += dot(row[u], x[u]);
@@ -95,6 +109,7 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
                     device const float* xb [[buffer(1)]],
                     device float* out [[buffer(2)]],
                     constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
@@ -102,7 +117,7 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 32;
-        device const uchar* row = w + p.w_off + (ulong)r * nb * 34;
+        device const uchar* row = w + mv_w_off(p, route) + (ulong)r * nb * 34;
         device const float* x = xb + p.x_off;
         for (uint b = lane; b < nb; b += kMvLanes) {
             device const uchar* blk = row + b * 34;
@@ -125,6 +140,7 @@ kernel void mv_f16(device const uchar* w [[buffer(0)]],
                    device const float* xb [[buffer(1)]],
                    device float* out [[buffer(2)]],
                    constant MvParams& p [[buffer(3)]],
+                   device const uint* route [[buffer(7)]],
                    uint tg [[threadgroup_position_in_grid]],
                    uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
@@ -132,7 +148,8 @@ kernel void mv_f16(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         device const half4* row =
-            (device const half4*)(w + p.w_off + (ulong)r * p.cols * 2);
+            (device const half4*)(w + mv_w_off(p, route) +
+                                      (ulong)r * p.cols * 2);
         device const float4* x = (device const float4*)(xb + p.x_off);
         for (uint u = lane; u < p.cols / 4; u += kMvLanes) {
             acc += dot(float4(row[u]), x[u]);
@@ -146,6 +163,7 @@ kernel void mv_bf16(device const uchar* w [[buffer(0)]],
                     device const float* xb [[buffer(1)]],
                     device float* out [[buffer(2)]],
                     constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
@@ -153,7 +171,8 @@ kernel void mv_bf16(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         device const ushort4* row =
-            (device const ushort4*)(w + p.w_off + (ulong)r * p.cols * 2);
+            (device const ushort4*)(w + mv_w_off(p, route) +
+                                      (ulong)r * p.cols * 2);
         device const float4* x = (device const float4*)(xb + p.x_off);
         for (uint u = lane; u < p.cols / 4; u += kMvLanes) {
             const uint4 v = uint4(row[u]) << 16;
@@ -169,6 +188,7 @@ kernel void mv_q4_0(device const uchar* w [[buffer(0)]],
                     device const float* xb [[buffer(1)]],
                     device float* out [[buffer(2)]],
                     constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
@@ -176,7 +196,7 @@ kernel void mv_q4_0(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 32;
-        device const uchar* row = w + p.w_off + (ulong)r * nb * 18;
+        device const uchar* row = w + mv_w_off(p, route) + (ulong)r * nb * 18;
         device const float* x = xb + p.x_off;
         for (uint b = lane; b < nb; b += kMvLanes) {
             device const uchar* blk = row + b * 18;
@@ -202,6 +222,7 @@ kernel void mv_q5_0(device const uchar* w [[buffer(0)]],
                     device const float* xb [[buffer(1)]],
                     device float* out [[buffer(2)]],
                     constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
@@ -209,7 +230,7 @@ kernel void mv_q5_0(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 32;
-        device const uchar* row = w + p.w_off + (ulong)r * nb * 22;
+        device const uchar* row = w + mv_w_off(p, route) + (ulong)r * nb * 22;
         device const float* x = xb + p.x_off;
         for (uint b = lane; b < nb; b += kMvLanes) {
             device const uchar* blk = row + b * 22;
@@ -264,6 +285,7 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
                     device const float* xb [[buffer(1)]],
                     device float* out [[buffer(2)]],
                     constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint sg [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
@@ -271,7 +293,7 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
     const uint nb = p.cols / 256;
     const ulong row_bytes = ulong(nb) * 144;
     const uint ix = lane / 8, jq = (lane % 8) / 4, ir = lane % 4;
-    device const uchar* w0 = w + p.w_off + ulong(r0) * row_bytes;
+    device const uchar* w0 = w + mv_w_off(p, route) + ulong(r0) * row_bytes;
     device const float* x = xb + p.x_off + 64 * jq + 8 * ir;
     float acc0 = 0.0f, acc1 = 0.0f;
     for (uint b = ix; b < nb; b += 4) {
@@ -327,6 +349,7 @@ kernel void mv_q5_k(device const uchar* w [[buffer(0)]],
                     device const float* xb [[buffer(1)]],
                     device float* out [[buffer(2)]],
                     constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
@@ -334,7 +357,7 @@ kernel void mv_q5_k(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 256;
-        device const uchar* row = w + p.w_off + (ulong)r * nb * 176;
+        device const uchar* row = w + mv_w_off(p, route) + (ulong)r * nb * 176;
         device const float* x = xb + p.x_off;
         for (uint u = lane; u < nb * 4; u += kMvLanes) {
             const uint b = u >> 2, j = u & 3;
@@ -372,6 +395,7 @@ kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
                     device const float* xb [[buffer(1)]],
                     device float* out [[buffer(2)]],
                     constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint tid [[thread_index_in_threadgroup]]) {
     const uint lane = tid % kMvLanes;
@@ -379,7 +403,7 @@ kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 256;
-        device const uchar* row = w + p.w_off + (ulong)r * nb * 210;
+        device const uchar* row = w + mv_w_off(p, route) + (ulong)r * nb * 210;
         device const float* x = xb + p.x_off;
         for (uint u = lane; u < nb * 4; u += kMvLanes) {
             const uint b = u >> 2;
@@ -1193,6 +1217,118 @@ kernel void axpy(device float* x [[buffer(0)]],
                  uint i [[thread_position_in_grid]]) {
     if (i < p.n) {
         x[i] += p.a * y[i];
+    }
+}
+
+struct AxpyRouteParams {
+    uint n;
+    uint slot;  // the weight is the float at route[slot]
+};
+
+// axpy with its weight from the route buffer (a routed expert's mixing
+// weight, or the shared expert's gate), so no host round trip.
+kernel void axpy_routed(device float* x [[buffer(0)]],
+                        device const float* y [[buffer(1)]],
+                        device const uint* route [[buffer(2)]],
+                        constant AxpyRouteParams& p [[buffer(3)]],
+                        uint i [[thread_position_in_grid]]) {
+    if (i < p.n) {
+        x[i] += as_type<float>(route[p.slot]) * y[i];
+    }
+}
+
+struct RouteParams {
+    uint n_expert;
+    uint k;            // experts a token
+    uint softmax;      // 1: softmax gating, 0: sigmoid
+    uint bias_on_logit;
+    uint has_bias;     // exp_probs_b (selection bias) given
+    uint norm;         // normalize the picked weights to sum 1
+    float scale;       // expert_weights_scale
+    uint shared_gate;  // also route[2 k] = sigmoid(logits[n_expert])
+};
+
+// moe_select on the GPU for one token (one threadgroup of 1024):
+// gating, the selection score (plus the bias), the top k by repeated
+// argmax (ties to the lowest id, as the CPU's strict >), and the
+// weights. route[0 .. k) gets the ids, route[k .. 2 k) the weights as
+// float bits, route[2 k] the shared expert's sigmoid gate when asked.
+// n_expert at most 1024; no group-limited routing (the CPU keeps it).
+kernel void moe_route(device const float* logits [[buffer(0)]],
+                      device const float* bias [[buffer(1)]],
+                      device uint* route [[buffer(2)]],
+                      constant RouteParams& p [[buffer(3)]],
+                      uint tid [[thread_index_in_threadgroup]],
+                      uint nt [[threads_per_threadgroup]]) {
+    threadgroup float prob[1024];
+    threadgroup float sel[1024];
+    threadgroup float part[32];
+    threadgroup float bv[32];
+    threadgroup uint bi[32];
+    const bool live = tid < p.n_expert;
+    const float lg = live ? logits[tid] : -INFINITY;
+    float pr;
+    if (p.softmax != 0) {
+        const float m = group_max(lg, part, tid, nt);
+        const float e = live ? exp(lg - m) : 0.0f;
+        const float s = group_sum(e, part, tid, nt);
+        pr = e / s;
+    } else {
+        pr = 1.0f / (1.0f + exp(-lg));
+    }
+    float sc = p.bias_on_logit != 0 ? lg : pr;
+    if (live && p.has_bias != 0) {
+        sc += bias[tid];
+    }
+    if (live) {
+        prob[tid] = pr;
+        sel[tid] = sc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float wsum = 0.0f;
+    for (uint j = 0; j < p.k; ++j) {
+        // The argmax of sel, ties to the lowest id.
+        float v = live ? sel[tid] : -INFINITY;
+        uint id = live ? tid : 0xFFFFFFFFu;
+        for (uint o = 16; o > 0; o >>= 1) {
+            const float v2 = simd_shuffle_down(v, o);
+            const uint i2 = simd_shuffle_down(id, o);
+            if (v2 > v || (v2 == v && i2 < id)) {
+                v = v2;
+                id = i2;
+            }
+        }
+        if (tid % 32 == 0) {
+            bv[tid / 32] = v;
+            bi[tid / 32] = id;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float best = bv[0];
+            uint at = bi[0];
+            for (uint g = 1; g < (nt + 31) / 32; ++g) {
+                if (bv[g] > best || (bv[g] == best && bi[g] < at)) {
+                    best = bv[g];
+                    at = bi[g];
+                }
+            }
+            route[j] = at;
+            sel[at] = -INFINITY;  // taken
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        for (uint j = 0; j < p.k; ++j) {
+            wsum += prob[route[j]];
+        }
+        const float div = p.norm != 0 ? wsum : 1.0f;
+        for (uint j = 0; j < p.k; ++j) {
+            route[p.k + j] = as_type<uint>(prob[route[j]] / div * p.scale);
+        }
+        if (p.shared_gate != 0) {
+            const float g = logits[p.n_expert];
+            route[2 * p.k] = as_type<uint>(1.0f / (1.0f + exp(-g)));
+        }
     }
 }
 

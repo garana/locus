@@ -104,6 +104,21 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint64_t out_off, std::uint32_t out_stride,
                    bool accumulate);
 
+/**
+ * record_matvec for a routed expert (MoE on the GPU, i#868): the
+ * matrix starts at w_off + route[slot] * expert_bytes, the expert id
+ * read on the GPU from the route buffer (moe_route's output), so no
+ * host round trip picks it.
+ */
+void record_matvec_routed(Context& ctx, gguf::TensorType t,
+                          std::uint32_t rows, std::uint32_t cols,
+                          const Context::Buffer& w, std::uint64_t w_off,
+                          std::uint64_t expert_bytes,
+                          const Context::Buffer& route, std::uint32_t slot,
+                          const Context::Buffer& x, std::uint32_t x_off,
+                          const Context::Buffer& out, std::uint64_t out_off,
+                          bool accumulate);
+
 /** @returns The bytes of a rows x cols matrix of type t (0 for a type
  *  without a kernel). */
 std::size_t matvec_weight_bytes(gguf::TensorType t, std::uint32_t rows,
