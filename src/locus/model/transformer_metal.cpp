@@ -714,7 +714,7 @@ BatchScratch& batch_scratch() {
 }
 
 constexpr std::uint32_t kPrefillChunk = 256;
-constexpr std::uint32_t kPrefillChunkMoe = 2048;
+constexpr std::uint32_t kPrefillChunkStep = 2048;
 // Below this many tokens a chunk runs a GPU forward a token: no matmul
 // gain at that size, and short chunks (a speculative verify) keep the
 // per-token forward's bits.
@@ -822,11 +822,12 @@ bool TransformerModel::metal_forward_batch(
             ctx.dispatch("add_bias", a, bytes_of(bp), n_tok * bp.n, 256);
         };
         BatchScratch& s = batch_scratch();
-        // A MoE model's sub-chunk is the engine's whole step, so each
-        // expert's matmul tiles get as many of its slots as can be (all
-        // logits keep 256: their head rows are C * V floats).
+        // The sub-chunk is the engine's whole step: the attention gets
+        // more threadgroups and each MoE expert's matmul tiles more of
+        // its slots (all logits keep 256: their head rows are C * V
+        // floats).
         const std::uint32_t chunk =
-            any_moe && !all_logits ? kPrefillChunkMoe : kPrefillChunk;
+            all_logits ? kPrefillChunk : kPrefillChunkStep;
         const std::size_t C = std::min(n, chunk);
         const std::uint32_t n_blocks = (base + n + bt - 1) / bt;
         Scratch::grow(ctx, s.x, C * E * 4);
