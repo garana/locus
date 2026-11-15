@@ -122,52 +122,38 @@ __device__ void scale_min_k4(int j, const std::uint8_t* q,
     }
 }
 
-/** Q4_K x Q8_K integer dot on device; bit-exact port of the scalar
- *  vec_dot_q4_k_q8_k (aux8 nibble unpack, per-8 int16 products, scale*
- *  int32 accumulate over 8 lanes, bsums min-correction). Activation
- *  quants arrive flat: d_y[nsb], qs_y[nsb*256], bsums_y[nsb*16]. One
- *  thread per row keeps the scalar accumulation order, so the float
- *  result is identical. */
-__global__ void matvec_q4_k_q8k_kernel(
-    const std::uint8_t* w, const float* d_y, const std::int8_t* qs_y,
-    const std::int16_t* bsums_y, float* out, std::uint32_t rows,
-    std::uint32_t cols) {
-    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) {
-        return;
-    }
-    const std::uint32_t nsb = cols / 256;
-    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 144;
-    const std::uint8_t* row =
-        w + static_cast<std::size_t>(r) * row_bytes;
+/**
+ * One row of a Q4_K or Q5_K x Q8_K integer dot on device; bit-exact port
+ * of the scalar vec_dot_q4_k_q8_k / vec_dot_q5_k_q8_k: decode(blk, aux8)
+ * unpacks a block's 256 quants, then come the 6-bit scale/min unpack,
+ * the per-8 int16 products, the scale * int32 accumulate over 8 lanes
+ * and the bsums min-correction, which the two types share.
+ *
+ * @param row The row's nsb blocks of kBlk bytes (d, dmin, scales[12] first).
+ * @param d_y, qs_y, bsums_y The activation's Q8_K quants, flat.
+ * @returns The row's dot.
+ */
+template <std::size_t kBlk, typename Decode>
+__device__ float row_k_q8k(const std::uint8_t* row, std::uint32_t nsb,
+                           const float* d_y, const std::int8_t* qs_y,
+                           const std::int16_t* bsums_y, Decode decode) {
     const std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
                         kmask3 = 0x03030303;
     float sums[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     float sumf = 0.0f;
     for (std::uint32_t b = 0; b < nsb; ++b) {
         const std::uint8_t* blk =
-            row + static_cast<std::size_t>(b) * 144;
+            row + static_cast<std::size_t>(b) * kBlk;
         const float bd = __half2float(__ushort_as_half(
             static_cast<std::uint16_t>(blk[0] | (blk[1] << 8))));
         const float bdmin = __half2float(__ushort_as_half(
             static_cast<std::uint16_t>(blk[2] | (blk[3] << 8))));
-        const std::uint8_t* q4 = blk + 16;
         const std::int8_t* q8 = qs_y + static_cast<std::size_t>(b) * 256;
         std::int8_t aux8[256];
-        std::int8_t* a = aux8;
-        for (int j = 0; j < 4; ++j) {
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
-            }
-            a += 32;
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(q4[l] >> 4);
-            }
-            a += 32;
-            q4 += 32;
-        }
+        decode(blk, aux8);
+        const std::int8_t* a = aux8;
         std::uint32_t utmp[4];
-        const std::uint8_t* s = blk + 4;  // Q4_K scales[12]
+        const std::uint8_t* s = blk + 4;  // scales[12]
         for (int k = 0; k < 3; ++k) {
             utmp[k] = static_cast<std::uint32_t>(s[4 * k]) |
                       (static_cast<std::uint32_t>(s[4 * k + 1]) << 8) |
@@ -190,7 +176,6 @@ __global__ void matvec_q4_k_q8k_kernel(
             sumi += bs[j] * mins[j / 2];
         }
         std::int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        a = aux8;
         int is = 0;
         for (int j = 0; j < 8; ++j) {
             const std::int32_t scale = scales[is++];
@@ -215,7 +200,41 @@ __global__ void matvec_q4_k_q8k_kernel(
     for (int l = 0; l < 8; ++l) {
         sumf += sums[l];
     }
-    out[r] = sumf;
+    return sumf;
+}
+
+/** Q4_K x Q8_K integer dot on device: row_k_q8k with the Q4_K nibble
+ *  unpack (144-byte blocks). Activation quants arrive flat: d_y[nsb],
+ *  qs_y[nsb*256], bsums_y[nsb*16]. One thread per row keeps the scalar
+ *  accumulation order, so the float result is identical. */
+__global__ void matvec_q4_k_q8k_kernel(
+    const std::uint8_t* w, const float* d_y, const std::int8_t* qs_y,
+    const std::int16_t* bsums_y, float* out, std::uint32_t rows,
+    std::uint32_t cols) {
+    const std::uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) {
+        return;
+    }
+    const std::uint32_t nsb = cols / 256;
+    const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 144;
+    const std::uint8_t* row =
+        w + static_cast<std::size_t>(r) * row_bytes;
+    out[r] = row_k_q8k<144>(
+        row, nsb, d_y, qs_y, bsums_y,
+        [](const std::uint8_t* blk, std::int8_t* a) {
+            const std::uint8_t* q4 = blk + 16;
+            for (int j = 0; j < 4; ++j) {
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
+                }
+                a += 32;
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(q4[l] >> 4);
+                }
+                a += 32;
+                q4 += 32;
+            }
+        });
 }
 
 /** Q6_K x Q8_K integer dot; bit-exact port of scalar vec_dot_q6_k_q8_k
@@ -291,8 +310,8 @@ __global__ void matvec_q6_k_q8k_kernel(
     out[r] = sumf;
 }
 
-/** Q5_K x Q8_K integer dot; bit-exact port of scalar vec_dot_q5_k_q8_k
- *  (nibble + hm 5th-bit unpack, 6-bit scales, bsums min-correction). */
+/** Q5_K x Q8_K integer dot; bit-exact port of scalar vec_dot_q5_k_q8_k:
+ *  row_k_q8k with the nibble + hm 5th-bit unpack (176-byte blocks). */
 __global__ void matvec_q5_k_q8k_kernel(
     const std::uint8_t* w, const float* d_y, const std::int8_t* qs_y,
     const std::int16_t* bsums_y, float* out, std::uint32_t rows,
@@ -305,94 +324,34 @@ __global__ void matvec_q5_k_q8k_kernel(
     const std::size_t row_bytes = static_cast<std::size_t>(nsb) * 176;
     const std::uint8_t* row =
         w + static_cast<std::size_t>(r) * row_bytes;
-    const std::uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f,
-                        kmask3 = 0x03030303;
-    float sums[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    float sumf = 0.0f;
-    for (std::uint32_t b = 0; b < nsb; ++b) {
-        const std::uint8_t* blk =
-            row + static_cast<std::size_t>(b) * 176;
-        const float bd = __half2float(__ushort_as_half(
-            static_cast<std::uint16_t>(blk[0] | (blk[1] << 8))));
-        const float bdmin = __half2float(__ushort_as_half(
-            static_cast<std::uint16_t>(blk[2] | (blk[3] << 8))));
-        const std::uint8_t* hm = blk + 16;
-        const std::uint8_t* q4 = blk + 48;
-        const std::int8_t* q8 = qs_y + static_cast<std::size_t>(b) * 256;
-        std::int8_t aux8[256];
-        std::int8_t* a = aux8;
-        std::uint8_t m = 1;
-        for (int j = 0; j < 4; ++j) {
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
-            }
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(
-                    a[l] + ((hm[l] & m) ? 16 : 0));
-            }
-            a += 32;
-            m <<= 1;
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(q4[l] >> 4);
-            }
-            for (int l = 0; l < 32; ++l) {
-                a[l] = static_cast<std::int8_t>(
-                    a[l] + ((hm[l] & m) ? 16 : 0));
-            }
-            a += 32;
-            m <<= 1;
-            q4 += 32;
-        }
-        std::uint32_t utmp[4];
-        const std::uint8_t* s = blk + 4;
-        for (int k = 0; k < 3; ++k) {
-            utmp[k] = static_cast<std::uint32_t>(s[4 * k]) |
-                      (static_cast<std::uint32_t>(s[4 * k + 1]) << 8) |
-                      (static_cast<std::uint32_t>(s[4 * k + 2]) << 16) |
-                      (static_cast<std::uint32_t>(s[4 * k + 3]) << 24);
-        }
-        utmp[3] = ((utmp[2] >> 4) & kmask2) |
-                  (((utmp[1] >> 6) & kmask3) << 4);
-        const std::uint32_t uaux = utmp[1] & kmask1;
-        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-        utmp[2] = uaux;
-        utmp[0] &= kmask1;
-        const auto* scales = reinterpret_cast<const std::uint8_t*>(utmp);
-        const auto* mins =
-            reinterpret_cast<const std::uint8_t*>(utmp + 2);
-        const std::int16_t* bs =
-            bsums_y + static_cast<std::size_t>(b) * 16;
-        int sumi = 0;
-        for (int j = 0; j < 16; ++j) {
-            sumi += bs[j] * mins[j / 2];
-        }
-        std::int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        a = aux8;
-        int is = 0;
-        for (int j = 0; j < 8; ++j) {
-            const std::int32_t scale = scales[is++];
-            for (int k = 0; k < 4; ++k) {
-                std::int16_t aux16[8];
-                for (int l = 0; l < 8; ++l) {
-                    aux16[l] = static_cast<std::int16_t>(q8[l] * a[l]);
+    out[r] = row_k_q8k<176>(
+        row, nsb, d_y, qs_y, bsums_y,
+        [](const std::uint8_t* blk, std::int8_t* a) {
+            const std::uint8_t* hm = blk + 16;
+            const std::uint8_t* q4 = blk + 48;
+            std::uint8_t m = 1;
+            for (int j = 0; j < 4; ++j) {
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(q4[l] & 0xF);
                 }
-                for (int l = 0; l < 8; ++l) {
-                    aux32[l] += scale * aux16[l];
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(
+                        a[l] + ((hm[l] & m) ? 16 : 0));
                 }
-                q8 += 8;
-                a += 8;
+                a += 32;
+                m <<= 1;
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(q4[l] >> 4);
+                }
+                for (int l = 0; l < 32; ++l) {
+                    a[l] = static_cast<std::int8_t>(
+                        a[l] + ((hm[l] & m) ? 16 : 0));
+                }
+                a += 32;
+                m <<= 1;
+                q4 += 32;
             }
-        }
-        const float d = bd * d_y[b];
-        for (int l = 0; l < 8; ++l) {
-            sums[l] += d * static_cast<float>(aux32[l]);
-        }
-        sumf -= bdmin * d_y[b] * static_cast<float>(sumi);
-    }
-    for (int l = 0; l < 8; ++l) {
-        sumf += sums[l];
-    }
-    out[r] = sumf;
+        });
 }
 
 /** Q2_K x Q8_K integer dot; bit-exact port of scalar vec_dot_q2_k_q8_k
