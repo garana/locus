@@ -1179,7 +1179,7 @@ std::uint32_t TransformerModel::prefill_chunk() const {
     if (!gpu) {
         // Accelerate's sgemm dequantizes every weight a call (i#782); it
         // takes the CPU backends' matmuls only (matvec_batch).
-        if (!backend_->ops.self_parallel && backend::sgemm_prefill_on()) {
+        if (backend_->ops.cpu && backend::sgemm_prefill_on()) {
             return backend::kSgemmPrefillChunk;
         }
         // A batched custom layer over many experts (kolibri1: 384, 6 a
@@ -2084,11 +2084,11 @@ void TransformerModel::forward_batch_layers(
 
 namespace {
 
-/** Cached LOCUS_BATCH_DEQUANT toggle (read once). */
 /** Tokens a CPU batch needs before Accelerate's sgemm takes it under
  *  LOCUS_CPU_FAST (i#782); smaller batches stay on the CPU kernels. */
 constexpr std::uint32_t kSgemmMinTokens = 32;
 
+/** Cached LOCUS_BATCH_DEQUANT toggle (read once). */
 bool batch_dequant_enabled() {
     static const bool on =
         std::getenv("LOCUS_BATCH_DEQUANT") != nullptr;
@@ -2158,11 +2158,11 @@ void matvec_batch(const backend::Ops& op, const Mat& w,
     // types.
     const std::uint32_t xc = w.cols;
     const std::uint32_t oc = w.rows;
-    // i#782: under LOCUS_CPU_FAST, on Apple, a CPU batch of at least
-    // kSgemmMinTokens goes to Accelerate's sgemm instead: its own sum
-    // order on F32 activations, so not the bits of the kernels below.
-    if (n >= kSgemmMinTokens && !op.self_parallel &&
-        backend::sgemm_prefill_on() &&
+    // i#782: under LOCUS_CPU_FAST, on Apple, a batch of at least
+    // kSgemmMinTokens on a CPU backend (Ops::cpu, not vulkan's or
+    // cuda's) goes to Accelerate's sgemm instead: its own sum order on
+    // F32 activations, so not the bits of the kernels below.
+    if (n >= kSgemmMinTokens && op.cpu && backend::sgemm_prefill_on() &&
         backend::sgemm_batch(w, x_batch, out_batch, n)) {
         return;
     }
