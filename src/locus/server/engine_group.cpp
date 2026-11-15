@@ -119,7 +119,9 @@ void EngineGroup::cancel(std::uint64_t id) {
 }
 
 void EngineGroup::release(std::uint64_t id) {
-    loop_of(id).release(local_id(id));
+    // EngineLoop::release keeps a request that is not terminal, so the
+    // group keeps counting it then (a later release drops it).
+    if (!loop_of(id).release(local_id(id))) return;
     std::lock_guard<std::mutex> lk(live_mu_);
     if (live_.erase(id) > 0) {
         --load_[engine_of(id)];

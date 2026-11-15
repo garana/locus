@@ -117,8 +117,10 @@ class EngineLoop {
 
     /** Drops a finished request's record once its result has been
      * delivered to the client (evict-on-consume); no-op if it is not
-     * terminal. Call once, after the last view/wait_done for the id. */
-    void release(std::uint64_t id);
+     * terminal. Call once, after the last view/wait_done for the id.
+     * @returns Whether the request is gone now (terminal, or unknown):
+     *     false when it was still running and was kept. */
+    bool release(std::uint64_t id);
 
     /** Engine gauges for /metrics (snapshotted under the mutex). */
     struct Stats {

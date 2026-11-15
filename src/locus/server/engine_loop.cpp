@@ -276,9 +276,12 @@ EngineLoop::View EngineLoop::wait_done_or_cancel(
     }
 }
 
-void EngineLoop::release(std::uint64_t id) {
+bool EngineLoop::release(std::uint64_t id) {
     auto lk = lock_turn();
+    const engine::Request* r = engine_.get(id);
+    const bool gone = r == nullptr || engine::is_terminal(r->status);
     engine_.release(id);
+    return gone;
 }
 
 void EngineLoop::cancel(std::uint64_t id) {
