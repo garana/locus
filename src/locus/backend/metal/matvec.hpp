@@ -27,8 +27,9 @@ bool matvec_shape_ok(gguf::TensorType t, std::uint32_t cols);
  * fingerprint of 192 of the bytes, so another matrix at a freed one's
  * address is uploaded afresh; one that differs from the old only
  * outside those bytes would still get them, so pass weights that stay
- * put while in use (mmapped tensors). Calls from several threads run one at a
- * time. Weight types without a kernel run the scalar CPU matvec.
+ * put while in use (mmapped tensors). Calls from several threads run
+ * one at a time. Weight types without a kernel run the scalar CPU
+ * matvec.
  * @throws std::invalid_argument when x or out has the wrong size.
  */
 void matvec(const Mat& w, std::span<const float> x, std::span<float> out);

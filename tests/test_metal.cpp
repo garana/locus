@@ -275,16 +275,18 @@ TEST_CASE("metal forward tracks the CPU on llama in each weight mix",
     if (!Context::usable()) {
         SKIP("no Metal device");
     }
+    // Llama 3.2 1B in Q4_K_M (Q4_K and Q6_K), Q8_0, and two made from
+    // the Q8_0 with llama-quantize --allow-requantize (i#907): Q4_0
+    // (with a Q6_K head) and Q5_K_M (Q5_K and Q6_K); requantized, so
+    // only fit for this GPU-against-CPU check, not for quality numbers.
     // Qwen2.5 0.5B Q8_0 is qwen2's attention (q / k / v biases, NEOX
-    // RoPE). Q4_K_M (Q4_K and Q6_K), Q8_0, and two made from the Q8_0 with
-    // llama-quantize --allow-requantize (i#907): Q4_0 (with a Q6_K
-    // head) and Q5_K_M (Q5_K and Q6_K). Requantized, so only fit for
-    // this GPU-against-CPU check, not for quality numbers.
+    // RoPE); Qwen1.5-MoE-A2.7B adds routed and gated shared experts.
     int ran = 0;
     for (const char* name :
          {"llama-3.2-1b-q4_k_m.gguf", "llama-3.2-1b-q8_0.gguf",
           "llama-3.2-1b-q4_0.gguf", "llama-3.2-1b-q5_k_m.gguf",
-          "qwen2.5-0.5b-instruct-q8_0.gguf"}) {
+          "qwen2.5-0.5b-instruct-q8_0.gguf",
+          "Qwen1.5-MoE-A2.7B.Q4_K_M.gguf"}) {
         const std::string path =
             std::string(LOCUS_SOURCE_DIR) + "/tests/models/" + name;
         if (!std::filesystem::exists(path)) {

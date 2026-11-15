@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -64,6 +65,9 @@ namespace {
 /** Scratch buffers of the Metal forward (grow-only; device_mutex). */
 struct Scratch {
     Context::Buffer x, xb, q, att, gate, up, logits, cs, scores, blocks;
+    // MoE: the router logits (and the shared expert's gate logit after
+    // them), and one expert's output.
+    Context::Buffer router, eout;
 
     static void grow(Context& ctx, Context::Buffer& b, std::size_t bytes) {
         if (b.handle == nullptr || b.bytes < bytes) {
@@ -104,6 +108,10 @@ struct AttnParams {
 struct SiluParams {
     std::uint32_t n;
 };
+struct AxpyParams {
+    std::uint32_t n;
+    float a;
+};
 
 constexpr std::uint32_t kNormGroup = 256;
 // attn_fused (kernels.metal): its threadgroup, and the positions its
@@ -137,13 +145,33 @@ bool TransformerModel::metal_forward_supported() const {
     const auto ok_w = [](const Mat& m) {
         return metal::matvec_shape_ok(m.type, m.cols);
     };
+    // MoE (i#868): routed experts in the forward, routing on the CPU;
+    // not the hybrid or another host's experts.
+    if (moe_hybrid_on() || remote_experts_ != nullptr) {
+        for (const Layer& lay : layers_) {
+            if (lay.is_moe()) {
+                return false;
+            }
+        }
+    }
+    const auto ok_moe = [&](const Layer& lay) {
+        if (!lay.is_moe()) {
+            return ok_w(lay.w_gate) && ok_w(lay.w_up) && ok_w(lay.w_down);
+        }
+        const bool shared = hp_.n_expert_shared > 0;
+        return ok_w(lay.gate_inp) && ok_w(lay.gate_exps.base) &&
+               ok_w(lay.up_exps.base) && ok_w(lay.down_exps.base) &&
+               (!shared || (ok_w(lay.gate_shexp) && ok_w(lay.up_shexp) &&
+                            ok_w(lay.down_shexp))) &&
+               (lay.gate_inp_shexp.rows == 0 || ok_w(lay.gate_inp_shexp));
+    };
     for (const Layer& lay : layers_) {
-        if (lay.is_moe() || !lay.has_separate_qkv(hp_) ||
+        if (!lay.has_separate_qkv(hp_) ||
             (lay.has_qkv_bias() && !spec_->qwen2_attention) ||
             lay.has_qk_norm() ||
             !lay.post_attn_norm.empty() || !lay.post_ffw_norm.empty() ||
             !ok_w(lay.wq) || !ok_w(lay.wk) || !ok_w(lay.wv) || !ok_w(lay.wo) ||
-            !ok_w(lay.w_gate) || !ok_w(lay.w_up) || !ok_w(lay.w_down)) {
+            !ok_moe(lay)) {
             return false;
         }
     }
@@ -216,8 +244,17 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         Scratch::grow(ctx, s.xb, E * 4);
         Scratch::grow(ctx, s.q, qd * 4);
         Scratch::grow(ctx, s.att, qd * 4);
-        Scratch::grow(ctx, s.gate, std::size_t{ff} * 4);
-        Scratch::grow(ctx, s.up, std::size_t{ff} * 4);
+        // The FFN scratch takes the widest of the dense, routed and
+        // shared FFNs.
+        const std::uint32_t shexp_ff =
+            hp_.n_ff_shexp > 0 ? hp_.n_ff_shexp
+                               : hp_.n_ff_exp * hp_.n_expert_shared;
+        const std::size_t ffw =
+            std::max<std::size_t>({ff, hp_.n_ff_exp, shexp_ff});
+        Scratch::grow(ctx, s.gate, ffw * 4);
+        Scratch::grow(ctx, s.up, ffw * 4);
+        Scratch::grow(ctx, s.router, (std::size_t{hp_.n_expert} + 1) * 4);
+        Scratch::grow(ctx, s.eout, std::size_t{E} * 4);
         Scratch::grow(ctx, s.logits, std::size_t{R} * 4);
         Scratch::grow(ctx, s.cs, std::size_t{hd} * 4);
         Scratch::grow(ctx, s.scores, std::size_t{H} * n_pos * 4);
@@ -255,6 +292,69 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                             std::uint64_t out_off, bool acc) {
             metal::record_matvec(ctx, w.type, w.rows, w.cols, wbuf(w), 0, in,
                                  0, out, out_off, acc);
+        };
+        // A routed or shared expert e of a 3-D tensor (one upload of the
+        // whole tensor, expert e at its byte offset): out += wgt * down
+        // (silu(gate x) * up x).
+        const auto expert_buf =
+            [&](const ExpertMat& em) -> const Context::Buffer& {
+            return mw.get(ctx, em.base.data,
+                          em.expert_bytes * std::size_t{hp_.n_expert});
+        };
+        const auto swiglu_add = [&](const Mat& g, const Context::Buffer& gb,
+                                    std::uint64_t g_off, const Mat& u,
+                                    const Context::Buffer& ub,
+                                    std::uint64_t u_off, const Mat& d,
+                                    const Context::Buffer& db,
+                                    std::uint64_t d_off, float wgt) {
+            metal::record_matvec(ctx, g.type, g.rows, g.cols, gb, g_off, s.xb,
+                                 0, s.gate, 0, false);
+            ctx.overlap_next();
+            metal::record_matvec(ctx, u.type, u.rows, u.cols, ub, u_off, s.xb,
+                                 0, s.up, 0, false);
+            const SiluParams sp{g.rows};
+            const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
+            ctx.dispatch("silu_mul", su, bytes_of(sp), g.rows, 256);
+            metal::record_matvec(ctx, d.type, d.rows, d.cols, db, d_off,
+                                 s.gate, 0, s.eout, 0, false);
+            const AxpyParams ap{E, wgt};
+            const Context::Arg aa[] = {{&s.x, 0}, {&s.eout, 0}};
+            ctx.dispatch("axpy", aa, bytes_of(ap), E, 256);
+        };
+        // A MoE layer's FFN on ws.xb: the router (and the shared
+        // expert's gate) on the GPU, the batch submitted so the CPU can
+        // pick the experts (moe_select, as the CPU forward), then a new
+        // batch runs them into the residual.
+        const auto moe = [&](const Layer& lay, std::uint32_t l) {
+            (void)l;
+            mv(lay.gate_inp, s.xb, s.router, 0, false);
+            const bool gated = lay.gate_inp_shexp.rows > 0;
+            if (gated) {
+                ctx.overlap_next();
+                mv(lay.gate_inp_shexp, s.xb, s.router, hp_.n_expert, false);
+            }
+            ctx.end_batch();
+            const auto* rl = static_cast<const float*>(s.router.data);
+            std::vector<float> router(rl, rl + hp_.n_expert);
+            const auto picked = moe_select(hp_, lay, router);
+            const float shg =
+                gated ? 1.0f / (1.0f + std::exp(-rl[hp_.n_expert])) : 1.0f;
+            ctx.begin_batch();
+            const Context::Buffer& gb = expert_buf(lay.gate_exps);
+            const Context::Buffer& ub = expert_buf(lay.up_exps);
+            const Context::Buffer& db = expert_buf(lay.down_exps);
+            for (const auto& [e, wgt] : picked) {
+                swiglu_add(lay.gate_exps.base, gb,
+                           lay.gate_exps.expert_bytes * e, lay.up_exps.base,
+                           ub, lay.up_exps.expert_bytes * e,
+                           lay.down_exps.base, db,
+                           lay.down_exps.expert_bytes * e, wgt);
+            }
+            if (hp_.n_expert_shared > 0) {
+                swiglu_add(lay.gate_shexp, wbuf(lay.gate_shexp), 0,
+                           lay.up_shexp, wbuf(lay.up_shexp), 0,
+                           lay.down_shexp, wbuf(lay.down_shexp), 0, shg);
+            }
         };
         const std::uint32_t neox = spec_->qwen2_attention ? 1u : 0u;
         // v[off + t * stride ..] += bias, for n_tok rows.
@@ -333,6 +433,10 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 }
                 mv(lay.wo, s.att, s.x, 0, true);
                 rmsnorm(lay.ffn_norm);
+                if (lay.is_moe()) {
+                    moe(lay, l);
+                    continue;
+                }
                 mv(lay.w_gate, s.xb, s.gate, 0, false);
                 ctx.overlap_next();  // gate and up, likewise
                 mv(lay.w_up, s.xb, s.up, 0, false);
@@ -348,7 +452,9 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                                  wbuf(out_w_), lo * row_bytes, s.xb, 0,
                                  s.logits, 0, false);
         } catch (...) {
-            ctx.end_batch();
+            if (ctx.batch_open()) {  // MoE ends and reopens it
+                ctx.end_batch();
+            }
             throw;
         }
         ctx.end_batch();
@@ -415,7 +521,13 @@ bool TransformerModel::metal_forward_batch(
     const std::uint32_t E = hp_.n_embd, hd = hp_.head_dim, H = hp_.n_heads,
                         KV = hp_.n_kv_heads, ff = hp_.n_ff, V = hp_.n_vocab,
                         L = hp_.n_layers;
-    if (n < kPrefillMin || !metal_forward_supported() || cache.quantized() ||
+    // MoE layers sync on their routing every token: a chunk runs the
+    // per-token forward.
+    const bool any_moe = std::any_of(
+        layers_.begin(), layers_.end(),
+        [](const Layer& lay) { return lay.is_moe(); });
+    if (n < kPrefillMin || any_moe || !metal_forward_supported() ||
+        cache.quantized() ||
         base + n > kAttnMaxPos || base + n > hp_.n_ctx ||
         base + n > cache.capacity(seq) || hd > kAttnGroup ||
         kAttnGroup % hd != 0 || (!embd.empty() && embd.size() != n) ||
@@ -462,6 +574,9 @@ bool TransformerModel::metal_forward_batch(
         const auto bias = [&](const Context::Buffer& v, std::uint64_t off,
                               std::span<const float> b, std::uint32_t n_tok,
                               std::uint32_t stride) {
+            if (b.empty()) {
+                return;
+            }
             const BiasParams bp{off, static_cast<std::uint32_t>(b.size()),
                                 n_tok, stride};
             const Context::Arg a[] = {{&v, 0}, {&fbuf(b), 0}};
