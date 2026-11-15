@@ -828,6 +828,12 @@ class TransformerModel {
                       std::span<const float* const> embd = {},
                       LogitRows rows_out = {}) const;
 
+    /** @returns Whether cuda_forward takes this model on its backend
+     *  (the cache, the tokens and the positions aside): CUDA ops with a
+     *  KV attention, a plain llama with every layer here, no MoE layer,
+     *  and LOCUS_CUDA_FORWARD not 0. */
+    bool cuda_forward_supported() const;
+
     /** @returns Whether metal_forward takes this model on its backend
      *  (any cache conditions aside): the batched paths then run it a
      *  token at a time, so they match the per-token forward. */
