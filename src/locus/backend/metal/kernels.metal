@@ -2133,6 +2133,44 @@ kernel void head_rmsnorm(device float* v [[buffer(0)]],
     }
 }
 
+// head_rmsnorm then rope_norm on one token's heads in one dispatch
+// (i#1064: qwen3's q / k): the normalized values stay in registers, with
+// the same arithmetic as the two kernels, so the same bits. A simdgroup
+// a head; NEOX pairs (i, i + head_dim / 2), else (2 i, 2 i + 1).
+struct HeadNormRopeParams {
+    HeadNormParams n;  // n_tok 1
+    uint neox;
+};
+
+kernel void head_norm_rope(device float* v [[buffer(0)]],
+                           device const float* w [[buffer(1)]],
+                           device const float* cs [[buffer(2)]],
+                           constant HeadNormRopeParams& p [[buffer(3)]],
+                           uint g [[threadgroup_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    if (g >= p.n.n_heads) {
+        return;
+    }
+    const uint hd = p.n.head_dim, half_d = hd / 2;
+    device float* x = v + p.n.off + ulong(g) * hd;
+    float s = 0.0f;
+    for (uint i = lane; i < hd; i += 32) {
+        s += x[i] * x[i];
+    }
+    s = simd_sum(s);
+    const float inv = 1.0f / sqrt(s / float(hd) + p.n.eps);
+    // Every lane has read its x before any lane writes.
+    simdgroup_barrier(mem_flags::mem_device);
+    for (uint i = lane; i < half_d; i += 32) {
+        const uint i0 = p.neox != 0 ? i : 2 * i;
+        const uint i1 = p.neox != 0 ? i + half_d : 2 * i + 1;
+        const float a = x[i0] * inv * w[i0], b = x[i1] * inv * w[i1];
+        const float c = cs[2 * i], sn = cs[2 * i + 1];
+        x[i0] = a * c - b * sn;
+        x[i1] = a * sn + b * c;
+    }
+}
+
 struct MoeSumParams {
     uint n;      // the residual's width
     uint k;      // experts a token
