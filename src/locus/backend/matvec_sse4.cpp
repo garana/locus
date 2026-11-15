@@ -148,31 +148,50 @@ void dot_f32_tile4(const float* w, const float* const x[4], std::size_t n,
     }
 }
 
+/** Weight bytes a row block of batch_rows_tile4 holds: half of a
+ *  256 KiB L2, so the block stays there while the tokens pass. */
+constexpr std::size_t kRowBlockBytes = std::size_t{128} << 10;
+
 /**
- * The F32 / BF16 batch (i#982): 4 tokens at a time over every row, so
- * a row is read once per 4 tokens instead of once per token; the last
- * tokens go one at a time. out is row-major (out[r * n + t]), and every
- * value has the per-token kernel's bits.
+ * The F32 / BF16 batch (i#982): rows in blocks of about kRowBlockBytes,
+ * and over each block every token, 4 at a time (the last ones one at a
+ * time). A row is then read from memory once per call and from L2 once
+ * per 4 tokens, where a pass of 4 tokens over every row would read it
+ * from L3 or memory each time. out is row-major (out[r * n + t]), and
+ * every value has the per-token kernel's bits (the order only changes
+ * which row and token come next).
+ *
+ * @param row_bytes The bytes of one weight row (sets the block's rows).
  */
 template <class Row, class Tile, class One>
 void batch_rows_tile4(const Mat& w, const float* xb, float* out,
-                      std::uint32_t n, Row row, Tile tile, One one) {
+                      std::uint32_t n, std::size_t row_bytes, Row row,
+                      Tile tile, One one) {
     const std::size_t cols = w.cols;
-    std::uint32_t t = 0;
-    for (; t + 4 <= n; t += 4) {
-        const float* const x[4] = {xb + t * cols, xb + (t + 1) * cols,
-                                   xb + (t + 2) * cols, xb + (t + 3) * cols};
-        for (std::uint32_t r = 0; r < w.rows; ++r) {
-            float o[4];
-            tile(row(r), x, cols, o);
-            for (int k = 0; k < 4; ++k) {
-                out[std::size_t{r} * n + t + k] = o[k];
+    // At least 4 rows; a block past the last row just ends there.
+    const std::uint32_t block = static_cast<std::uint32_t>(std::clamp<
+        std::size_t>(kRowBlockBytes / std::max<std::size_t>(row_bytes, 1), 4,
+                     std::max<std::size_t>(w.rows, 4)));
+    for (std::uint32_t r0 = 0; r0 < w.rows; r0 += block) {
+        const std::uint32_t r1 = std::min(w.rows, r0 + block);
+        std::uint32_t t = 0;
+        for (; t + 4 <= n; t += 4) {
+            const float* const x[4] = {xb + t * cols, xb + (t + 1) * cols,
+                                       xb + (t + 2) * cols,
+                                       xb + (t + 3) * cols};
+            for (std::uint32_t r = r0; r < r1; ++r) {
+                float o[4];
+                tile(row(r), x, cols, o);
+                for (int k = 0; k < 4; ++k) {
+                    out[std::size_t{r} * n + t + k] = o[k];
+                }
             }
         }
-    }
-    for (; t < n; ++t) {
-        for (std::uint32_t r = 0; r < w.rows; ++r) {
-            out[std::size_t{r} * n + t] = one(row(r), xb + t * cols, cols);
+        for (; t < n; ++t) {
+            for (std::uint32_t r = r0; r < r1; ++r) {
+                out[std::size_t{r} * n + t] =
+                    one(row(r), xb + t * cols, cols);
+            }
         }
     }
 }
@@ -2521,6 +2540,7 @@ void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
         const auto* rows = reinterpret_cast<const float*>(w.data);
         batch_rows_tile4(
             w, x_batch.data(), out_batch.data(), n,
+            std::size_t{w.cols} * sizeof(float),
             [&](std::uint32_t r) { return rows + std::size_t{r} * w.cols; },
             dot_f32_tile4, dot_f32_sse4);
         return;
@@ -2529,6 +2549,7 @@ void matvec_batch_sse4(const Mat& w, std::span<const float> x_batch,
         const auto* rows = reinterpret_cast<const std::uint16_t*>(w.data);
         batch_rows_tile4(
             w, x_batch.data(), out_batch.data(), n,
+            std::size_t{w.cols} * sizeof(std::uint16_t),
             [&](std::uint32_t r) { return rows + std::size_t{r} * w.cols; },
             dot_bf16_tile4, dot_bf16_sse4);
         return;
