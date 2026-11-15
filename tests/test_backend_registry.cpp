@@ -54,6 +54,20 @@ TEST_CASE("registry lists and resolves backends", "[backend]") {
     }
 }
 
+// i#782: Ops::cpu says where matvec runs, so CPU-only paths (Accelerate's
+// sgemm) never take a GPU backend's matmuls: true for the CPU entries
+// and metal's (its CPU kernels run what its forward does not take),
+// false for vulkan, cuda and the image ops.
+TEST_CASE("Ops::cpu is true only where the matmuls run on the CPU",
+          "[backend]") {
+    for (const Backend& b : backends()) {
+        INFO(b.name);
+        const bool gpu = b.name == "vulkan" || b.name == "cuda";
+        CHECK(b.ops.cpu == !gpu);
+    }
+    CHECK_FALSE(vulkan_image_ops().cpu);
+}
+
 TEST_CASE("gpu_idle_warning flags a default CPU pick with a GPU usable",
           "[backend]") {
     const Backend cpu{"neon", "", true, true, {}};
