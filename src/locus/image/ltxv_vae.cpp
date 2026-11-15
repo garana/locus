@@ -14,8 +14,7 @@ namespace locus::image {
 namespace {
 
 using dense::parallel;
-
-float silu(float v) { return v / (1.0f + std::exp(-v)); }
+using dense::silu;
 
 /**
  * The reference's PixelNorm (eps 1e-8) over the channels of x

@@ -12,29 +12,7 @@ namespace locus::image {
 
 namespace {
 
-/** LayerNorm over each row of x (n rows of w floats), into out. */
-void layer_norm(std::span<const float> x, std::uint32_t n, std::uint32_t w,
-                const std::vector<float>& g, const std::vector<float>& b,
-                float eps, std::span<float> out) {
-    for (std::uint32_t t = 0; t < n; ++t) {
-        const float* r = x.data() + std::size_t{t} * w;
-        float* o = out.data() + std::size_t{t} * w;
-        double mean = 0.0;
-        for (std::uint32_t i = 0; i < w; ++i) mean += r[i];
-        mean /= w;
-        double var = 0.0;
-        for (std::uint32_t i = 0; i < w; ++i) {
-            const double d = r[i] - mean;
-            var += d * d;
-        }
-        var /= w;
-        const auto inv = static_cast<float>(1.0 / std::sqrt(var + eps));
-        const auto m = static_cast<float>(mean);
-        for (std::uint32_t i = 0; i < w; ++i) {
-            o[i] = (r[i] - m) * inv * g[i] + b[i];
-        }
-    }
-}
+using dense::layer_norm;
 
 }  // namespace
 

@@ -14,13 +14,8 @@ namespace locus::image {
 
 namespace {
 
-/** transformers' NewGELUActivation (gelu_new, the tanh form). */
-void gelu_tanh(std::span<float> x) {
-    constexpr float kC = 0.79788456080286535588f;  // sqrt(2 / pi)
-    for (float& v : x) {
-        v = 0.5f * v * (1.0f + std::tanh(kC * (v + 0.044715f * v * v * v)));
-    }
-}
+// transformers' NewGELUActivation (gelu_new) is the tanh form.
+using dense::gelu_tanh;
 
 using dense::parallel;
 
