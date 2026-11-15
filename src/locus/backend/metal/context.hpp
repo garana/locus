@@ -75,6 +75,25 @@ class Context {
      */
     Buffer upload(std::span<const std::byte> src);
 
+    /** A buffer over host memory and where the wrapped bytes start. */
+    struct Wrapped {
+        Buffer buf;
+        std::uint64_t offset = 0;  ///< bytes from the buffer's start
+    };
+
+    /**
+     * Wraps [p, p + n) without copying it (i#868): one shared-storage
+     * buffer over the whole pages that hold it (newBufferWithBytesNoCopy
+     * on the page-aligned range), so a mapped GGUF's tensors reach the
+     * GPU with no second copy. The memory must stay mapped, and must
+     * not be written, while the buffer lives; free() only drops the
+     * buffer. The rounded range must lie inside one mapping (a mapped
+     * file's whole pages are).
+     * @returns The buffer and the offset of p in it.
+     * @throws std::runtime_error when the device refuses the range.
+     */
+    Wrapped wrap(const void* p, std::size_t n);
+
     /** Releases b (no-op on an empty one) and empties it. */
     void free(Buffer& b);
 

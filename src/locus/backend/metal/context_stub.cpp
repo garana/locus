@@ -31,6 +31,10 @@ Context::Buffer Context::upload(std::span<const std::byte>) {
     throw std::runtime_error("metal: not built with Metal");
 }
 
+Context::Wrapped Context::wrap(const void*, std::size_t) {
+    throw std::runtime_error("metal: not built with Metal");
+}
+
 void Context::free(Buffer& b) { b = Buffer{}; }
 
 bool Context::has_kernel(std::string_view) const { return false; }

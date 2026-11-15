@@ -28,12 +28,35 @@ using backend::metal::Context;
  *  the model. */
 struct MetalWeights {
     std::unordered_map<const void*, Context::Buffer> bufs;
+    std::unordered_map<const void*, Context::Wrapped> maps;
 
     ~MetalWeights() {
         std::lock_guard lk(backend::metal::device_mutex());
         for (auto& [p, b] : bufs) {
             Context::get().free(b);
         }
+        for (auto& [p, w] : maps) {
+            Context::get().free(w.buf);
+        }
+    }
+
+    /** A matrix's bytes on the device: a buffer and their offset. */
+    struct Ref {
+        const Context::Buffer* buf;
+        std::uint64_t off;
+    };
+
+    /**
+     * @returns The `bytes` bytes from p (a tensor in the GGUF mapping),
+     *     wrapped without a copy on first use (Context::wrap; i#868): a
+     *     model's matrices take no memory beyond the mapping.
+     */
+    Ref map(Context& ctx, const void* p, std::size_t bytes) {
+        auto it = maps.find(p);
+        if (it == maps.end()) {
+            it = maps.emplace(p, ctx.wrap(p, bytes)).first;
+        }
+        return {&it->second.buf, it->second.offset};
     }
 
     /** @returns The buffer holding `bytes` bytes from p, uploaded on
@@ -229,8 +252,8 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
             metal_weights_ = std::make_shared<MetalWeights>();
         }
         MetalWeights& mw = *metal_weights_;
-        const auto wbuf = [&](const Mat& m) -> const Context::Buffer& {
-            return mw.get(ctx, m.data,
+        const auto wbuf = [&](const Mat& m) {
+            return mw.map(ctx, m.data,
                           metal::matvec_weight_bytes(m.type, m.rows, m.cols));
         };
         const auto fbuf =
@@ -290,15 +313,15 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         const auto mv = [&](const Mat& w, const Context::Buffer& in,
                             const Context::Buffer& out,
                             std::uint64_t out_off, bool acc) {
-            metal::record_matvec(ctx, w.type, w.rows, w.cols, wbuf(w), 0, in,
-                                 0, out, out_off, acc);
+            const auto r = wbuf(w);
+            metal::record_matvec(ctx, w.type, w.rows, w.cols, *r.buf, r.off,
+                                 in, 0, out, out_off, acc);
         };
         // A routed or shared expert e of a 3-D tensor (one upload of the
         // whole tensor, expert e at its byte offset): out += wgt * down
         // (silu(gate x) * up x).
-        const auto expert_buf =
-            [&](const ExpertMat& em) -> const Context::Buffer& {
-            return mw.get(ctx, em.base.data,
+        const auto expert_buf = [&](const ExpertMat& em) {
+            return mw.map(ctx, em.base.data,
                           em.expert_bytes * std::size_t{hp_.n_expert});
         };
         const auto swiglu_add = [&](const Mat& g, const Context::Buffer& gb,
@@ -325,8 +348,7 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         // expert's gate) on the GPU, the batch submitted so the CPU can
         // pick the experts (moe_select, as the CPU forward), then a new
         // batch runs them into the residual.
-        const auto moe = [&](const Layer& lay, std::uint32_t l) {
-            (void)l;
+        const auto moe = [&](const Layer& lay) {
             mv(lay.gate_inp, s.xb, s.router, 0, false);
             const bool gated = lay.gate_inp_shexp.rows > 0;
             if (gated) {
@@ -340,20 +362,24 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
             const float shg =
                 gated ? 1.0f / (1.0f + std::exp(-rl[hp_.n_expert])) : 1.0f;
             ctx.begin_batch();
-            const Context::Buffer& gb = expert_buf(lay.gate_exps);
-            const Context::Buffer& ub = expert_buf(lay.up_exps);
-            const Context::Buffer& db = expert_buf(lay.down_exps);
+            const auto gr = expert_buf(lay.gate_exps);
+            const auto ur = expert_buf(lay.up_exps);
+            const auto dr = expert_buf(lay.down_exps);
             for (const auto& [e, wgt] : picked) {
-                swiglu_add(lay.gate_exps.base, gb,
-                           lay.gate_exps.expert_bytes * e, lay.up_exps.base,
-                           ub, lay.up_exps.expert_bytes * e,
-                           lay.down_exps.base, db,
-                           lay.down_exps.expert_bytes * e, wgt);
+                swiglu_add(lay.gate_exps.base, *gr.buf,
+                           gr.off + lay.gate_exps.expert_bytes * e,
+                           lay.up_exps.base, *ur.buf,
+                           ur.off + lay.up_exps.expert_bytes * e,
+                           lay.down_exps.base, *dr.buf,
+                           dr.off + lay.down_exps.expert_bytes * e, wgt);
             }
             if (hp_.n_expert_shared > 0) {
-                swiglu_add(lay.gate_shexp, wbuf(lay.gate_shexp), 0,
-                           lay.up_shexp, wbuf(lay.up_shexp), 0,
-                           lay.down_shexp, wbuf(lay.down_shexp), 0, shg);
+                const auto sg = wbuf(lay.gate_shexp);
+                const auto su = wbuf(lay.up_shexp);
+                const auto sd = wbuf(lay.down_shexp);
+                swiglu_add(lay.gate_shexp, *sg.buf, sg.off, lay.up_shexp,
+                           *su.buf, su.off, lay.down_shexp, *sd.buf, sd.off,
+                           shg);
             }
         };
         const std::uint32_t neox = spec_->qwen2_attention ? 1u : 0u;
@@ -434,7 +460,7 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 mv(lay.wo, s.att, s.x, 0, true);
                 rmsnorm(lay.ffn_norm);
                 if (lay.is_moe()) {
-                    moe(lay, l);
+                    moe(lay);
                     continue;
                 }
                 mv(lay.w_gate, s.xb, s.gate, 0, false);
@@ -448,9 +474,10 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
             rmsnorm(out_norm_);
             const std::uint64_t row_bytes =
                 metal::matvec_weight_bytes(out_w_.type, 1, out_w_.cols);
-            metal::record_matvec(ctx, out_w_.type, R, out_w_.cols,
-                                 wbuf(out_w_), lo * row_bytes, s.xb, 0,
-                                 s.logits, 0, false);
+            const auto hr = wbuf(out_w_);
+            metal::record_matvec(ctx, out_w_.type, R, out_w_.cols, *hr.buf,
+                                 hr.off + lo * row_bytes, s.xb, 0, s.logits,
+                                 0, false);
         } catch (...) {
             if (ctx.batch_open()) {  // MoE ends and reopens it
                 ctx.end_batch();
@@ -561,8 +588,8 @@ bool TransformerModel::metal_forward_batch(
             metal_weights_ = std::make_shared<MetalWeights>();
         }
         MetalWeights& mw = *metal_weights_;
-        const auto wbuf = [&](const Mat& m) -> const Context::Buffer& {
-            return mw.get(ctx, m.data,
+        const auto wbuf = [&](const Mat& m) {
+            return mw.map(ctx, m.data,
                           metal::matvec_weight_bytes(m.type, m.rows, m.cols));
         };
         const auto fbuf =
@@ -611,17 +638,18 @@ bool TransformerModel::metal_forward_batch(
                             const Context::Buffer& out,
                             std::uint32_t out_stride, bool acc,
                             std::uint32_t m) {
-            if (metal::record_matmul(ctx, w.type, w.rows, w.cols, m, wbuf(w),
-                                     0, in, 0, in_stride, out, 0, out_stride,
-                                     acc)) {
+            const auto r = wbuf(w);
+            if (metal::record_matmul(ctx, w.type, w.rows, w.cols, m, *r.buf,
+                                     r.off, in, 0, in_stride, out, 0,
+                                     out_stride, acc)) {
                 return;
             }
             for (std::uint32_t t = 0; t < m; ++t) {
                 if (t > 0) {
                     ctx.overlap_next();
                 }
-                metal::record_matvec(ctx, w.type, w.rows, w.cols, wbuf(w), 0,
-                                     in, t * in_stride, out,
+                metal::record_matvec(ctx, w.type, w.rows, w.cols, *r.buf,
+                                     r.off, in, t * in_stride, out,
                                      std::uint64_t{t} * out_stride, acc);
             }
         };
@@ -734,10 +762,11 @@ bool TransformerModel::metal_forward_batch(
                         if (t > t0) {
                             ctx.overlap_next();
                         }
+                        const auto hr = wbuf(out_w_);
                         metal::record_matvec(
-                            ctx, out_w_.type, V, out_w_.cols, wbuf(out_w_), 0,
-                            s.xb, t * E, s.head,
-                            std::uint64_t{t - t0} * V, false);
+                            ctx, out_w_.type, V, out_w_.cols, *hr.buf, hr.off,
+                            s.xb, t * E, s.head, std::uint64_t{t - t0} * V,
+                            false);
                     }
                 }
             } catch (...) {
