@@ -927,8 +927,14 @@ struct MmLoadQ4K {
         const float mm = float(blk.dmin) * float(mn);
         device const uchar* q = blk.qs + 32 * (j / 2) + ah;
         const uint sh = (j & 1) * 4;
-        for (uint i = 0; i < 16; ++i) {
-            da[i] = d * float((q[i] >> sh) & 0xF) - mm;
+        // The 16 nibble bytes in one load, decoded four at a time
+        // through an f16 mantissa (nib4; the same values).
+        const uint4 v = uint4(*(device const packed_uint4*)q);
+        for (uint c = 0; c < 4; ++c) {
+            const float4 n = nib4(v[c], sh);
+            for (uint e = 0; e < 4; ++e) {
+                da[4 * c + e] = d * n[e] - mm;
+            }
         }
     }
 };
