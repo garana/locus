@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <random>
@@ -23,6 +24,7 @@
 #include "locus/embed/embedding_model.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/http/metrics.hpp"
+#include "locus/image/dense.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/codec.hpp"
 #include "locus/model/gqa_attend.hpp"
@@ -842,5 +844,99 @@ TEST_CASE("bench: vulkan decode matvecs at the orpheus shapes",
                      << static_cast<double>(w.size()) / (best * 1e6)
                      << " GB/s (" << reps << " copies)");
     }
+    SUCCEED();
+}
+
+// i#982: one LTX-Video 2B DiT step on the CPU, stage by stage, from its
+// shapes alone (random BF16 weights, as the converter keeps them): 28
+// blocks of width 2048 (32 heads of 64), FFN 8192, 128 text tokens.
+// LOCUS_BENCH_TOKENS sets the latent tokens (default 1440: 512 x 320,
+// 65 frames). Each stage's best of two runs, times its count a step.
+// The norms, RoPE and GELU passes are not timed (elementwise).
+TEST_CASE("bench: ltxv dit step stages on the cpu", "[.][bench][ltxv]") {
+    namespace dense = locus::image::dense;
+    using TT = locus::gguf::TensorType;
+    const auto& be = best_backend();
+    const auto& op = be.ops;
+    const char* env = std::getenv("LOCUS_BENCH_TOKENS");
+    const std::uint32_t n = env != nullptr ? std::stoul(env) : 1440;
+    constexpr std::uint32_t w = 2048, ffn = 8192, n_text = 128, heads = 32,
+                            hd = 64, blocks = 28;
+    std::mt19937 rng(982);
+    std::uniform_real_distribution<float> d(-0.05f, 0.05f);
+    const auto bf16 = [&](std::size_t count) {
+        std::vector<std::uint16_t> v(count);
+        for (auto& h : v) {
+            const float f = d(rng);
+            std::uint32_t u;
+            std::memcpy(&u, &f, sizeof u);
+            h = static_cast<std::uint16_t>(u >> 16);
+        }
+        return v;
+    };
+    const auto f32 = [&](std::size_t count) {
+        std::vector<float> v(count);
+        for (auto& f : v) {
+            f = d(rng);
+        }
+        return v;
+    };
+    const auto w_sq = bf16(std::size_t{w} * w);
+    const auto w_up = bf16(std::size_t{ffn} * w);
+    const auto w_dn = bf16(std::size_t{w} * ffn);
+    const auto x = f32(std::size_t{n} * ffn);
+    std::vector<float> out(std::size_t{n} * ffn);
+    const auto best_of_2 = [](const auto& fn) {
+        double best = 1e300;
+        for (int rep = 0; rep < 2; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            fn();
+            best = std::min(
+                best, std::chrono::duration<double>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count());
+        }
+        return best;
+    };
+    const auto lin = [&](const std::vector<std::uint16_t>& wv,
+                         std::uint32_t rows, std::uint32_t cols,
+                         std::uint32_t tokens) {
+        const Mat m{TT::kBF16, reinterpret_cast<const std::byte*>(wv.data()),
+                    rows, cols};
+        return best_of_2([&] {
+            dense::linear(op, m, {}, {x.data(), std::size_t{tokens} * cols},
+                          tokens, {out.data(), std::size_t{tokens} * rows});
+        });
+    };
+    const auto att = [&](std::uint32_t nk) {
+        return best_of_2([&] {
+            dense::attention(op, {x.data(), std::size_t{n} * w}, n,
+                             {x.data(), std::size_t{nk} * w},
+                             {x.data(), std::size_t{nk} * w}, nk, heads, hd,
+                             {out.data(), std::size_t{n} * w});
+        });
+    };
+    struct Stage {
+        const char* name;
+        double s;
+        int per_block;
+    };
+    const Stage stages[] = {
+        {"linear 2048x2048, latent (q k v o, cross q o)", lin(w_sq, w, w, n), 6},
+        {"linear 2048x2048, text (cross k v)", lin(w_sq, w, w, n_text), 2},
+        {"linear ffn up 8192x2048", lin(w_up, ffn, w, n), 1},
+        {"linear ffn down 2048x8192", lin(w_dn, w, ffn, n), 1},
+        {"self attention", att(n), 1},
+        {"cross attention", att(n_text), 1},
+    };
+    double step = 0;
+    for (const Stage& s : stages) {
+        const double total = s.s * s.per_block * blocks;
+        step += total;
+        WARN(be.name << ": " << s.name << ": " << s.s << " s once, "
+                     << total << " s a step");
+    }
+    WARN(be.name << ": " << n << " latent tokens: about " << step
+                 << " s a step (the timed stages)");
     SUCCEED();
 }
