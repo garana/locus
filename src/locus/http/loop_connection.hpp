@@ -76,12 +76,27 @@ class LoopReply {
     bool write(std::string_view data);
     /** Ends the stream (idempotent). */
     void end();
-    /** @returns Whether the client is gone. */
+    /**
+     * Ends the stream as a failure (the producer threw after the head
+     * went out): what is queued is written, then the connection closes
+     * without the terminating chunk, so the client sees a truncated
+     * transfer, as http::Server does. A pending reply gets a 500.
+     */
+    void fail();
+    /** @returns Whether the connection is gone (closed, a failed write):
+     *  the reply's calls do nothing. */
     bool cancelled() const;
+    /**
+     * @returns Whether the client has left: cancelled, or it half-closed
+     * while the answer was pending (TCP cannot tell an orderly half-close
+     * from a gone client, as http::Server's liveness probe notes). The
+     * answer may still be written; a long handler should stop.
+     */
+    bool client_gone() const;
 
   private:
     friend class LoopConnection;
-    enum class State { kPending, kBuffered, kStreaming, kEnded };
+    enum class State { kPending, kBuffered, kStreaming, kEnded, kFailed };
     /** Wakes the loop. Call with mu_ released. */
     void wake() const;
     /** Marks the reply cancelled and wakes any waiting producer. */
@@ -94,6 +109,7 @@ class LoopReply {
     std::condition_variable cv_;
     State state_ = State::kPending;
     bool cancelled_ = false;
+    bool peer_closed_ = false;  /**< EOF while pending (client_gone). */
     bool head_taken_ = false;  /**< the loop wrote the stream's head. */
     Response res_;             /**< the buffered response, or the head. */
     std::string chunks_;       /**< encoded chunks the loop has not taken. */
@@ -126,16 +142,19 @@ using AsyncLoopHandler =
  * is readable. No 100-continue. Keep-alive with pipelining: requests
  * already in the buffer are answered in order, one response in flight
  * at a time, and a peer that half-closes still gets an answer to every
- * request it sent before (a deferred one excepted: EOF while it is
- * pending cancels it, as http::Server's liveness probe reads FIN as
- * gone). Input is read at most 64 KiB per event; a request that cannot
+ * request it sent before (for a deferred one, EOF while it is pending
+ * also marks the client gone, LoopReply::client_gone, as http::Server's
+ * liveness probe reads FIN, so a long handler stops; its answer is still
+ * written). Input is read at most 64 KiB per event; a request that cannot
  * finish within the input cap (its caps, with room for chunk framing)
  * is a 413.
  */
 class LoopConnection {
   public:
     /** What the loop should watch the fd for next. */
-    enum class Next { kRead, kWrite, kClose };
+    /** kIdle (async replies only): watch nothing until on_wake(), the
+     *  client having half-closed while its answer is pending. */
+    enum class Next { kRead, kWrite, kClose, kIdle };
     using Clock = std::chrono::steady_clock;
 
     /**

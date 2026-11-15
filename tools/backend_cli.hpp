@@ -261,6 +261,9 @@ inline constexpr const char* kCommonHelp =
     "  --prefill-f16    Vulkan: stage prefill matmul operands in\n"
     "                   f16 (faster prompt ingestion; opt-in, the\n"
     "                   f32 default is exact)\n"
+    "  --event-loop     locus-server: serve every connection from one\n"
+    "                   I/O thread, handlers on a job pool (idle and\n"
+    "                   slow clients then hold no thread)\n"
     "  --speculative    prompt-lookup speculative decoding: draft\n"
     "                   tokens from n-grams already in the context,\n"
     "                   verified in one batched forward (greedy,\n"
@@ -462,6 +465,8 @@ struct BackendArgs {
     bool prefill_f16 = false;
     /** --speculative: prompt-lookup speculative decoding. */
     bool speculative = false;
+    /** --event-loop: locus-server on http::LoopServer (i#931). */
+    bool event_loop = false;
     /** From --spec-draft N: most draft tokens per verify (0 = the
      * engine default). */
     std::uint32_t spec_draft = 0;
@@ -709,6 +714,8 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.prefill_f16 = true;
         } else if (a == "--speculative") {
             out.speculative = true;
+        } else if (a == "--event-loop") {
+            out.event_loop = true;
         } else if (a == "--spec-draft" && i + 1 < argc) {
             number("--spec-draft", argv[++i], out.spec_draft);
         } else if (a.rfind("--spec-draft=", 0) == 0) {

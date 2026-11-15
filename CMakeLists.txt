@@ -129,6 +129,7 @@ add_library(locus
     src/locus/http/client.cpp
     src/locus/http/http.cpp
     src/locus/http/loop_connection.cpp
+    src/locus/http/loop_server.cpp
     src/locus/http/server.cpp
     src/locus/http/metrics.cpp
     src/locus/sys/child_fds.cpp
