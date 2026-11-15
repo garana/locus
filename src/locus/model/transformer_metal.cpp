@@ -28,15 +28,30 @@ using backend::metal::Context;
  *  the model. */
 struct MetalWeights {
     std::unordered_map<const void*, Context::Buffer> bufs;
-    std::unordered_map<const void*, Context::Wrapped> maps;
+    /** A wrapped tensor and how many bytes from its pointer it covers. */
+    struct Map {
+        Context::Wrapped w;
+        std::size_t bytes = 0;
+    };
+    std::unordered_map<const void*, Map> maps;
+    /** Wraps and copies a longer request at the same pointer replaced:
+     *  kept, as batches recorded earlier in this forward may use them,
+     *  and freed with the model. */
+    std::vector<Context::Buffer> retired;
+    /** Whether the weights are the GGUF file's mapping (map() wraps
+     *  them), or a heap buffer (map() copies them). */
+    bool file_backed = true;
 
     ~MetalWeights() {
         std::lock_guard lk(backend::metal::device_mutex());
         for (auto& [p, b] : bufs) {
             Context::get().free(b);
         }
-        for (auto& [p, w] : maps) {
-            Context::get().free(w.buf);
+        for (auto& [p, m] : maps) {
+            Context::get().free(m.w.buf);
+        }
+        for (auto& b : retired) {
+            Context::get().free(b);
         }
     }
 
@@ -47,23 +62,40 @@ struct MetalWeights {
     };
 
     /**
-     * @returns The `bytes` bytes from p (a tensor in the GGUF mapping),
-     *     wrapped without a copy on first use (Context::wrap; i#868): a
-     *     model's matrices take no memory beyond the mapping.
+     * @returns The `bytes` bytes from p (a tensor of the model), on the
+     *     device: wrapped without a copy on first use when the weights
+     *     are the GGUF file's mapping (Context::wrap; i#868: read-only,
+     *     PROT_READ pages, so the GPU sees what the CPU does), else
+     *     copied (a GGUF parsed from a heap buffer, whose page rounding
+     *     would reach past the allocation). A later request for more
+     *     bytes at the same pointer wraps (or copies) the longer range.
      */
     Ref map(Context& ctx, const void* p, std::size_t bytes) {
-        auto it = maps.find(p);
-        if (it == maps.end()) {
-            it = maps.emplace(p, ctx.wrap(p, bytes)).first;
+        if (!file_backed) {
+            return {&get(ctx, p, bytes), 0};
         }
-        return {&it->second.buf, it->second.offset};
+        auto it = maps.find(p);
+        if (it != maps.end() && it->second.bytes < bytes) {
+            retired.push_back(it->second.w.buf);
+            maps.erase(it);
+            it = maps.end();
+        }
+        if (it == maps.end()) {
+            it = maps.emplace(p, Map{ctx.wrap(p, bytes), bytes}).first;
+        }
+        return {&it->second.w.buf, it->second.w.offset};
     }
 
     /** @returns The buffer holding `bytes` bytes from p, uploaded on
      *  first use. */
     const Context::Buffer& get(Context& ctx, const void* p,
                                std::size_t bytes) {
-        const auto it = bufs.find(p);
+        auto it = bufs.find(p);
+        if (it != bufs.end() && it->second.bytes < bytes) {
+            retired.push_back(it->second);  // a longer view: copy again
+            bufs.erase(it);
+            it = bufs.end();
+        }
         if (it != bufs.end()) {
             return it->second;
         }
@@ -250,6 +282,7 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         Context& ctx = Context::get();
         if (!metal_weights_) {
             metal_weights_ = std::make_shared<MetalWeights>();
+            metal_weights_->file_backed = file_backed_;
         }
         MetalWeights& mw = *metal_weights_;
         const auto wbuf = [&](const Mat& m) {
@@ -586,6 +619,7 @@ bool TransformerModel::metal_forward_batch(
         Context& ctx = Context::get();
         if (!metal_weights_) {
             metal_weights_ = std::make_shared<MetalWeights>();
+            metal_weights_->file_backed = file_backed_;
         }
         MetalWeights& mw = *metal_weights_;
         const auto wbuf = [&](const Mat& m) {
