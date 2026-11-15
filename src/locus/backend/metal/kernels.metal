@@ -1031,10 +1031,11 @@ kernel void mm_q6_k(device const uchar* wbase [[buffer(0)]],
 // Causal attention for a chunk, tiled: threadgroup g takes queries
 // 8 (g / n_heads) .. + 8 of head g % n_heads, one simdgroup a query.
 // The positions go by in chunks of min(kTileFloats / head_dim, 32), a
-// position a lane, whose K and V rows are staged in threadgroup memory once for all 8 queries; each
-// query keeps an online softmax (running max m, sum l, and its output
-// dims d = lane + 32 i in registers). head_dim is at most 128 and a
-// multiple of 32. Same parameters and buffers as attn_rows.
+// position a lane, whose K and V rows are staged in threadgroup memory
+// once for all 8 queries; each query keeps an online softmax (running
+// max m, sum l, and its output dims d = lane + 32 i in registers).
+// head_dim is at most 128 and a multiple of 32. Same parameters and
+// buffers as attn_rows.
 constant constexpr uint kTileQ = 8;
 constant constexpr uint kTileFloats = 2048;
 
