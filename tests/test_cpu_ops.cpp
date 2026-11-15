@@ -1378,6 +1378,39 @@ TEST_CASE("matvec_batch_neon BF16 and F16 tiles are byte-identical to "
     }
 }
 
+// i#982: the F32 batch in the same 2-row x 4-token tiles, each dot in
+// dot_f32_neon's order: the per-token bits (the CPU attention's score
+// and value passes run on it).
+TEST_CASE("matvec_batch_neon F32 tiles are byte-identical to per-token neon",
+          "[ops][batch][neon]") {
+    constexpr std::uint32_t rows = 5;
+    std::mt19937 rng(982);
+    std::uniform_real_distribution<float> xd(-1.0f, 1.0f);
+    for (std::uint32_t cols : {64u, 523u}) {
+        std::vector<float> w(std::size_t{rows} * cols);
+        for (auto& v : w) v = xd(rng);
+        const Mat m{TensorType::kF32,
+                    reinterpret_cast<const std::byte*>(w.data()), rows, cols};
+        for (std::uint32_t n : {1u, 4u, 6u, 9u}) {
+            std::vector<float> xb(std::size_t{n} * cols);
+            for (auto& v : xb) v = xd(rng);
+            std::vector<float> got(std::size_t{rows} * n);
+            matvec_batch_neon(m, xb, got, n);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                for (std::uint32_t tk = 0; tk < n; ++tk) {
+                    float ref = 0.0f;
+                    matvec_neon(mat_rows(m, r, 1),
+                                {xb.data() + std::size_t{tk} * cols, cols},
+                                {&ref, 1});
+                    INFO("cols " << cols << " n " << n << " r=" << r
+                                 << " t=" << tk);
+                    REQUIRE(got[std::size_t{r} * n + tk] == ref);
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("matvec_batch_neon_q8k matches the per-token q8k dots",
           "[ops][batch][neon]") {
     // n = 11. Q4_K / Q6_K run two 4-token passes and a 3-token tail
