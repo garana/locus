@@ -1737,9 +1737,15 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
     // they answer even when every worker is busy in a generation.
     // serve_connection still runs the head stage, so auth on /metrics
     // (when enabled) is unchanged -- only the serving thread differs.
-    cfg.fast_path = [mp = opt_.metrics_path](std::string_view method,
-                                             std::string_view target) {
-        return method == "GET" && (target == "/health" || target == mp);
+    // A fast-path route must answer at once and never stream: on the
+    // event loop it runs on the I/O thread itself. So there only
+    // /health takes it; /metrics waits up to one engine step for the
+    // engine's gauges (and may call the auth helper), which would stall
+    // every connection's I/O, so it runs on the job pool.
+    cfg.fast_path = [mp = opt_.metrics_path, loop = opt_.event_loop](
+                        std::string_view method, std::string_view target) {
+        return method == "GET" &&
+               (target == "/health" || (!loop && target == mp));
     };
     // Every route route_of serves; anything else counts as "other".
     http_metrics_ = std::make_shared<http::HttpMetrics>(

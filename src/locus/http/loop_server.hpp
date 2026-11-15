@@ -24,8 +24,10 @@ namespace locus::http {
  * computed. Same ServerConfig, Handler and HeadHandler as Server:
  *
  * - accept: the `allow` list and `max_conns_per_ip`, as Server;
- * - a `fast_path` request (GET /health, /metrics) runs its head stage and
- *   handler on the I/O thread, so it answers while every job is busy;
+ * - a `fast_path` request runs its head stage and handler on the I/O
+ *   thread, so it answers while every job is busy; it must answer at
+ *   once and never stream, as a wait there stalls every connection
+ *   (locus-server keeps only /health on it);
  * - any other request goes to the pool: the head stage (on the whole
  *   request: LoopConnection has read the body, within limits), then the
  *   handler with a RequestContext whose client_alive is the reply's
