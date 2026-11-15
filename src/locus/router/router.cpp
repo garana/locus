@@ -498,6 +498,9 @@ int Router::start() {
     sc.port = cfg_.port;
     sc.worker_threads = cfg_.worker_threads;
     sc.max_conns_per_ip = cfg_.max_conns_per_ip;
+    sc.keepalive_idle_s = cfg_.keepalive_idle_s;
+    sc.keepalive_intvl_s = cfg_.keepalive_intvl_s;
+    sc.keepalive_count = cfg_.keepalive_count;
     server_ = std::make_unique<http::Server>(
         sc,
         [this](const http::Request& req, http::ServerResponse& res,
