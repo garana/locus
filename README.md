@@ -27,7 +27,7 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   with chat templates.
 - **Backends:** neon, avx2, sse4 and scalar on the CPU; vulkan (the
   whole forward pass on the GPU); cuda (matvec on the GPU); metal
-  (Apple GPUs, being built: #10).
+  (Apple GPUs: #10).
 - **Serving:** continuous batching; a paged KV cache with
   copy-on-write prefix sharing; f32, f16, q8 or q4 KV.
 - **API:** `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
@@ -275,6 +275,10 @@ entries give one engine per device); a request stays on one engine.
 | vulkan  | the whole forward pass on the GPU: matmuls, norms, RoPE, paged attention, MoE routing    |
 | cuda    | matvec and attention on the GPU (paged weight pool, KV cache copy); the rest on the CPU  |
 | metal   | Apple GPUs (#10): plain llama on the GPU (F32/F16, Q8_0, Q4_0, Q5_0, Q4/5/6_K), else CPU |
+
+Without `--backend` or `LOCUS_BACKEND`, a Mac runs a model on metal
+when metal's whole-token forward takes it (and the KV cache is f32),
+else on vulkan where usable, else on neon (#867).
 
 Every selectable backend must reproduce the golden outputs. A GPU does
 not always beat the CPU: on a tile GPU streaming a model larger than
