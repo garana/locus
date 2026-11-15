@@ -530,7 +530,7 @@ namespace {
  * Embeds the golden texts with a model, all in one batch and each
  * alone, and checks them against three references:
  *
- * - q8ref (scripts/make-bert-q8-ref.py): the GGUF's own weights in
+ * - q8ref (scripts/text/make-bert-q8-ref.py): the GGUF's own weights in
  *   float64 arithmetic; locus must match it to a cosine of 0.99999.
  * - llama: llama.cpp's vectors, at least 0.9995. llama.cpp rounds the
  *   activations to 8 bits before each Q8_0 product, locus keeps them
@@ -550,7 +550,7 @@ void check_golden(const std::string& file, const char* llama,
                   double hf_bar = 0.9998) {
     const std::string path = kDir + "models/" + file;
     if (!std::filesystem::exists(path)) {
-        SKIP(file << " absent; see scripts/fetch-test-model.sh");
+        SKIP(file << " absent; see scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(path);
     const auto tok = locus::tok::tokenizer_from_gguf(g);
@@ -630,7 +630,7 @@ TEST_CASE("nomic-embed-text v1.5 embeddings match exact arithmetic",
           "[bert][e2e]") {
     // nomic-bert: NEOX rope, fused qkv, SwiGLU, no biases, mean pooling.
     // The unquantized reference is nomic-ai's F16 GGUF in float64
-    // (scripts/make-bert-q8-ref.py), which llama.cpp's F16 run matches
+    // (scripts/text/make-bert-q8-ref.py), which llama.cpp's F16 run matches
     // to 0.999999; its transformers model needs trust_remote_code.
     check_golden("nomic-embed-text-v1.5.Q8_0.gguf", "nomic_embd.json",
                  "nomic_embd_q8ref.json", "nomic_embd_f16ref.json", 768,

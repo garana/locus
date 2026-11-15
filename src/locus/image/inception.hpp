@@ -21,7 +21,7 @@ namespace locus::image {
  * and the classifier. Every conv has its batch norm folded in and a
  * ReLU after it.
  *
- * Weights come from the "inception" GGUF of scripts/convert-cnn.py,
+ * Weights come from the "inception" GGUF of scripts/image/convert-cnn.py,
  * under timm's names (Mixed_6b.branch7x7_2, ...). The tensors stay in
  * the GGUF mapping, so the GgufFile must outlive the model.
  */

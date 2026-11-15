@@ -54,7 +54,7 @@ TEST_CASE("to_rgb8 clips and truncates like the reference",
                                              223});
 }
 
-// The reference's own conversion (scripts/make-janus-goldens.py decode:
+// The reference's own conversion (scripts/image/make-janus-goldens.py decode:
 // numpy clip then uint8 assignment) of its f32 decode, against locus's
 // to_rgb8 of the same floats: every pixel identical.
 TEST_CASE("to_rgb8 reproduces the reference PNG's pixels",

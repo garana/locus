@@ -20,7 +20,7 @@ using locus::image::Rgb8;
 
 namespace {
 
-// Keep in sync with scripts/make-image-goldens.py.
+// Keep in sync with scripts/image/make-image-goldens.py.
 constexpr std::uint32_t kW = 61, kH = 37;
 
 const std::string kDir =

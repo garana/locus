@@ -30,7 +30,7 @@
 
 namespace {
 
-// Keep in sync with scripts/make-janus-goldens.py (vision).
+// Keep in sync with scripts/image/make-janus-goldens.py (vision).
 constexpr std::uint32_t kRows = 16, kRowStep = 36;
 
 const std::string kDir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
@@ -181,13 +181,13 @@ TEST_CASE("janus chat ids match the reference prompt",
 }
 
 // i#241: the SigLIP tower and the aligner on the reference image,
-// against the torch f32 reference (scripts/make-janus-goldens.py
+// against the torch f32 reference (scripts/image/make-janus-goldens.py
 // vision), on 16 sampled patches and on the RMS of the whole output.
 TEST_CASE("janus vision encoder matches the reference features",
           "[janus][image][vision]") {
     if (!have_model()) {
         SKIP("janus-pro-1b-bf16.gguf with vit.* absent; see "
-             "scripts/convert-janus.py");
+             "scripts/image/convert-janus.py");
     }
     const Golden ref = read_golden();
     auto g = locus::gguf::GgufFile::open(kModel);

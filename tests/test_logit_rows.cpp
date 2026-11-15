@@ -62,7 +62,7 @@ TEST_CASE("forward with a logit row range matches the full head",
           "[model][e2e]") {
     const std::string path = model_dir() + "stories260K.gguf";
     if (!std::filesystem::exists(path)) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(path);
     auto model = locus::model::TransformerModel::load(g);
@@ -90,7 +90,7 @@ TEST_CASE("forward_embedding checks its token and rows like forward",
           "[model][e2e]") {
     const std::string path = model_dir() + "stories260K.gguf";
     if (!std::filesystem::exists(path)) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(path);
     auto model = locus::model::TransformerModel::load(g);
@@ -143,7 +143,7 @@ TEST_CASE("forward_embeddings matches forward_embedding per sequence",
           "[model][e2e]") {
     const std::string path = model_dir() + "stories260K.gguf";
     if (!std::filesystem::exists(path)) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(path);
     std::vector<const locus::backend::Backend*> backends = {nullptr};

@@ -22,7 +22,7 @@ namespace {
 const std::string kDir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
 const std::string kModel = kDir + "models/flux/clip-l.gguf";
 
-// The synthetic model of scripts/make-clip-goldens.py synth.
+// The synthetic model of scripts/image/make-clip-goldens.py synth.
 constexpr std::uint32_t kVocab = 40, kWidth = 16, kHeads = 4, kFfn = 24,
                         kLayers = 2, kContext = 10;
 
@@ -160,7 +160,7 @@ TEST_CASE("clip text encoder rejects bad inputs", "[clip][image]") {
 // Cyrillic, emoji, the special tokens in the text, and truncation.
 TEST_CASE("clip tokenizer matches CLIPTokenizer", "[clip][tokenizer]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("no " << kModel << " (scripts/convert-flux.py --clip-out)");
+        SKIP("no " << kModel << " (scripts/image/convert-flux.py --clip-out)");
     }
     const auto g = locus::gguf::GgufFile::open(kModel);
     const auto tok = ClipTokenizer::from_gguf(g);
@@ -181,7 +181,7 @@ TEST_CASE("clip tokenizer matches CLIPTokenizer", "[clip][tokenizer]") {
 
 TEST_CASE("clip-l pooled output matches transformers", "[clip][image]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("no " << kModel << " (scripts/convert-flux.py --clip-out)");
+        SKIP("no " << kModel << " (scripts/image/convert-flux.py --clip-out)");
     }
     const auto g = locus::gguf::GgufFile::open(kModel);
     const auto tok = ClipTokenizer::from_gguf(g);

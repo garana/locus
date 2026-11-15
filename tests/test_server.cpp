@@ -96,7 +96,7 @@ TEST_CASE("server stop() unblocks the listener after requests",
 
 TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1052,7 +1052,7 @@ TEST_CASE("openai endpoints serve completions", "[server][e2e]") {
 TEST_CASE("embeddings endpoint returns normalized vectors",
           "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1180,7 +1180,7 @@ TEST_CASE("rerank endpoint orders documents by relevance",
     const std::string rr = std::string(LOCUS_SOURCE_DIR) +
                            "/tests/models/bge-reranker-v2-m3-q8_0.gguf";
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1196,7 +1196,7 @@ TEST_CASE("rerank endpoint orders documents by relevance",
     }
     if (!std::filesystem::exists(rr)) {
         SKIP("bge-reranker-v2-m3-q8_0.gguf absent; see "
-             "scripts/convert-xlmr-reranker.py");
+             "scripts/text/convert-xlmr-reranker.py");
     }
     locus::server::OpenAiServer::Options opt;
     opt.rerank_model_path = rr;
@@ -1273,13 +1273,13 @@ TEST_CASE("rerank endpoint orders documents by relevance",
 
 // i#577: POST /v1/classify (Hugging Face's image-classification shape)
 // and image inputs to /v1/embeddings with --image-classifier, here the
-// ResNet-50 of scripts/convert-cnn.py on janus_apple.png.
+// ResNet-50 of scripts/image/convert-cnn.py on janus_apple.png.
 TEST_CASE("classify endpoint labels an image and embeds it",
           "[server][e2e]") {
     const std::string dir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
     const std::string cnn = dir + "models/resnet50-tv-f32.gguf";
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1300,7 +1300,7 @@ TEST_CASE("classify endpoint labels an image and embeds it",
         REQUIRE(res->status == 503);
     }
     if (!std::filesystem::exists(cnn)) {
-        SKIP("resnet50-tv-f32.gguf absent; see scripts/convert-cnn.py");
+        SKIP("resnet50-tv-f32.gguf absent; see scripts/image/convert-cnn.py");
     }
     locus::server::OpenAiServer::Options opt;
     opt.image_classifier_path = cnn;
@@ -1373,7 +1373,7 @@ TEST_CASE("classify endpoint labels an image and embeds it",
 // PixArt, whose error names both sets.
 TEST_CASE("image model errors name the missing parts", "[server]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1419,7 +1419,7 @@ TEST_CASE("image model errors name the missing parts", "[server]") {
 // --lora-dir without one stops the server.
 TEST_CASE("a LoRA directory needs a FLUX image model", "[server][lora]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1437,7 +1437,7 @@ TEST_CASE("a LoRA directory needs a FLUX image model", "[server][lora]") {
 
 TEST_CASE("auth gates protected routes via a helper", "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1509,7 +1509,7 @@ TEST_CASE("auth gates protected routes via a helper", "[server][e2e]") {
 
 TEST_CASE("metrics path is configurable", "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1542,7 +1542,7 @@ TEST_CASE("metrics path is configurable", "[server][e2e]") {
 TEST_CASE("the any-host bind serves IPv4 and IPv6 clients",
           "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1606,7 +1606,7 @@ TEST_CASE("the any-host bind serves IPv4 and IPv6 clients",
 TEST_CASE("request-edge size limits reject before work",
           "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1651,7 +1651,7 @@ TEST_CASE("request-edge size limits reject before work",
 TEST_CASE("a prompt the KV pool cannot hold is a 400 on each endpoint",
           "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -1711,7 +1711,7 @@ TEST_CASE("a prompt the KV pool cannot hold is a 400 on each endpoint",
 TEST_CASE("prompt caching reports cache-hit usage fields",
           "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -2188,7 +2188,7 @@ TEST_CASE("metrics carry labels and timings in well-formed histograms",
 TEST_CASE("a server with two engines serves and reports both",
           "[server][e2e][engine_group]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -2904,7 +2904,7 @@ TEST_CASE("image input on a text-only model is a 400", "[server][image]") {
 
 // i#241 end to end on Janus-Pro: the reference image and the golden
 // question through both chat APIs, greedy, give the reference's answer
-// (scripts/make-janus-goldens.py vision) from its 630-id prompt.
+// (scripts/image/make-janus-goldens.py vision) from its 630-id prompt.
 // Malformed image requests are refused first, before any generation.
 TEST_CASE("chat with an image answers like the reference",
           "[server][image][vision][e2e]") {
@@ -3047,7 +3047,7 @@ TEST_CASE("chat with an image answers like the reference on vulkan",
 // /v1/videos/{id}[/content] is not one of them.
 TEST_CASE("video routes are off without a video model", "[server]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);
@@ -3179,7 +3179,7 @@ TEST_CASE("transport error bodies are the API's flat error envelope",
 // 200 buffered tokens last far longer than the 1 ms keepalive.
 TEST_CASE("buffered SSE replies send keepalive comments", "[server][e2e]") {
     if (!std::filesystem::exists(model_path())) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(model_path());
     auto model = locus::model::TransformerModel::load(g);

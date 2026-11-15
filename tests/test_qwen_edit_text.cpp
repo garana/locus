@@ -21,7 +21,7 @@ namespace {
 using locus::image::QwenVision;
 using locus::model::TransformerModel;
 
-// Keep in sync with scripts/make-qwen-edit-text-golden.py.
+// Keep in sync with scripts/image/make-qwen-edit-text-golden.py.
 constexpr std::uint32_t kGh = 4, kGw = 6, kDrop = 64;
 const std::vector<std::int32_t> kAfter = {5, 33, 21, 58, 12};
 
@@ -49,7 +49,7 @@ std::vector<float> read_f32(const std::string& path) {
 
 // i#574: the edit template with an instruction and a 4 x 6 patch image
 // through the Qwen2 tokenizer (Qwen2.5's, from a Qwen2.5 GGUF) gives
-// the reference processor's ids (scripts/make-qwen-edit-text-golden.py
+// the reference processor's ids (scripts/image/make-qwen-edit-text-golden.py
 // ids: Qwen/Qwen-Image-Edit's processor at ac7f931, the template read
 // from diffusers), the image span where the processor put it.
 TEST_CASE("qwen edit prompt matches the reference processor's ids",

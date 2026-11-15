@@ -16,7 +16,7 @@
 
 namespace {
 
-/** Real-model fixture path; see scripts/fetch-test-model.sh. */
+/** Real-model fixture path; see scripts/tests/fetch-test-model.sh. */
 std::string model_path() {
     return std::string(LOCUS_SOURCE_DIR) +
            "/tests/models/stories260K.gguf";
@@ -64,7 +64,7 @@ std::string dbrx_path() {
 TEST_CASE("loads a real Llama-family GGUF model", "[e2e]") {
     const std::string path = model_path();
     if (!std::filesystem::exists(path)) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
 
     auto g = locus::gguf::GgufFile::open(path);
@@ -165,7 +165,7 @@ double cosine(const std::vector<float>& a,
 TEST_CASE("quantized KV cache tracks the F32 forward", "[e2e][kv]") {
     const std::string path = model_path();
     if (!std::filesystem::exists(path)) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(path);
     auto model = locus::model::TransformerModel::load(g);
@@ -216,7 +216,7 @@ TEST_CASE("quantized KV cache tracks F32 under the CUDA backend",
     }
     const std::string path = model_path();
     if (!std::filesystem::exists(path)) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(path);
     auto model = locus::model::TransformerModel::load(g);
@@ -374,7 +374,7 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
 
 // qwen2 dense (Qwen2.5 0.5B Instruct, Qwen's own Q8_0 GGUF at 9217f5d,
 // 676 MB). Golden ids: the GGUF's weights dequantized and run in float64
-// (scripts/make-qwen2-q8-ref.py, the decoder as llama.cpp's graph; f32
+// (scripts/text/make-qwen2-q8-ref.py, the decoder as llama.cpp's graph; f32
 // activations pinned here). llama.cpp's own greedy output agrees for
 // the first 19 tokens, then takes " about" where exact arithmetic takes
 // " and": the two are a near-tie (-0.7212 against -0.7268), and
@@ -385,7 +385,7 @@ TEST_CASE("qwen2 greedy decode matches exact arithmetic",
                              "/tests/models/qwen2.5-0.5b-instruct-q8_0.gguf";
     if (!std::filesystem::exists(path)) {
         SKIP("qwen2.5-0.5b-instruct-q8_0.gguf absent; see "
-             "scripts/fetch-test-model.sh");
+             "scripts/tests/fetch-test-model.sh");
     }
     auto g = locus::gguf::GgufFile::open(path);
     REQUIRE(g.get_string("general.architecture") == "qwen2");
@@ -679,7 +679,7 @@ TEST_CASE("greedy decode matches the llama.cpp golden output",
           "[e2e]") {
     const std::string path = model_path();
     if (!std::filesystem::exists(path)) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     // Produced by: llama-completion -m stories260K.gguf
     //   -p "Once upon a time" -n 40 --temp 0
@@ -749,7 +749,7 @@ TEST_CASE("every selectable backend reproduces the golden output",
           "[e2e][backend]") {
     const std::string path = model_path();
     if (!std::filesystem::exists(path)) {
-        SKIP("model not present; run scripts/fetch-test-model.sh");
+        SKIP("model not present; run scripts/tests/fetch-test-model.sh");
     }
     std::ifstream golden_file(std::string(LOCUS_SOURCE_DIR) +
                               "/tests/golden/stories260K_once.txt");

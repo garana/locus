@@ -23,7 +23,7 @@ const std::string kDir = std::string(LOCUS_SOURCE_DIR) + "/tests/";
 const std::string kTokModel =
     kDir + "models/qwen2.5-0.5b-instruct-q8_0.gguf";
 
-// Keep in sync with scripts/make-qwen-edit-pipeline-golden.py.
+// Keep in sync with scripts/image/make-qwen-edit-pipeline-golden.py.
 constexpr std::uint64_t kVocab = 151936, kArea = 96 * 96;
 constexpr std::uint32_t kRefW = 80, kRefH = 56, kSteps = 2;
 constexpr float kCfg = 4.0f;
@@ -55,7 +55,7 @@ locus::image::Rgb8 reference() {
 }  // namespace
 
 // i#616: diffusers' QwenImageEditPipeline.__call__ end to end on tiny
-// parts (scripts/make-qwen-edit-pipeline-golden.py): the tiny
+// parts (scripts/image/make-qwen-edit-pipeline-golden.py): the tiny
 // Qwen2.5-VL with the real vocabulary, the synthetic MMDiT and VAE, an
 // 80 x 56 reference at a 96 x 96 pixel area, "Make the sky purple."
 // against a " " negative prompt, 2 steps of true CFG (scale 4). The

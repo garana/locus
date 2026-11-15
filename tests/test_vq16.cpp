@@ -27,7 +27,7 @@ struct SynthOpts {
 };
 
 /**
- * The tiny VQ-16 decoder of scripts/make-janus-goldens.py synth (z 32,
+ * The tiny VQ-16 decoder of scripts/image/make-janus-goldens.py synth (z 32,
  * ch 32, ch_mult (1, 2), num_res_blocks 1, codebook 16 x 8), as a GGUF
  * image: the tensors the Janus Decoder constructor creates, filled from
  * the LCG in sorted name order (std::map), exactly as the script's
@@ -151,7 +151,7 @@ std::vector<float> read_f32(const std::string& path) {
 }  // namespace
 
 // VALUES, on every box: the synthetic decoder against torch's output
-// from scripts/make-janus-goldens.py synth (the Janus Decoder class with
+// from scripts/image/make-janus-goldens.py synth (the Janus Decoder class with
 // the same weights). Pins the op order, GroupNorm, attention, upsample
 // and the l2-normalised lookup, not just shapes.
 TEST_CASE("vq16 decoder matches torch on a synthetic model",
@@ -177,7 +177,7 @@ TEST_CASE("vq16 decoder matches torch on a synthetic model",
 }
 
 // The real Janus-Pro VQ-16 decoder on the golden image tokens (CFG
-// argmax, scripts/make-janus-goldens.py tokens) against torch's f32
+// argmax, scripts/image/make-janus-goldens.py tokens) against torch's f32
 // decode of the same tokens (`decode`). The bound is i#221's 1e-4:
 // deeper than SNAC, with GroupNorm and softmax in the path.
 TEST_CASE("vq16 decoder matches the reference on Janus-Pro tokens",
@@ -190,7 +190,7 @@ TEST_CASE("vq16 decoder matches the reference on Janus-Pro tokens",
         !std::filesystem::exists(golden + "janus_tokens.txt") ||
         !std::filesystem::exists(golden + "janus_decode.f32")) {
         SKIP("vq16 GGUF or Janus goldens absent; see "
-             "scripts/convert-janus-vq16.py");
+             "scripts/image/convert-janus-vq16.py");
     }
     std::ifstream f(golden + "janus_tokens.txt");
     std::string line;

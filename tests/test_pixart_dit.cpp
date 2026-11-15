@@ -87,8 +87,8 @@ TEST_CASE("pixart timestep features put cos first", "[pixart][image]") {
 }
 
 // VALUES, on every box: a tiny PixArtTransformer2DModel converted by
-// scripts/convert-pixart.py, against its torch output
-// (scripts/make-pixart-dit-goldens.py synth). The two batch rows use
+// scripts/image/convert-pixart.py, against its torch output
+// (scripts/image/make-pixart-dit-goldens.py synth). The two batch rows use
 // different timesteps (999, 500) and caption masks (1 and 4 valid
 // rows), so the modulation, both attentions, the FFN, the final layer
 // and the unpatchify are all pinned.
@@ -160,13 +160,14 @@ TEST_CASE("pixart dit matches torch on a synthetic model",
 }
 
 // PixArt-XL-2-512x512 at step 0 (t = 999) against the diffusers
-// pipeline (scripts/make-pixart-goldens.py, trimmed by
-// scripts/make-pixart-dit-goldens.py real): row 0 is the "" negative,
+// pipeline (scripts/image/make-pixart-goldens.py, trimmed by
+// scripts/image/make-pixart-dit-goldens.py real): row 0 is the "" negative,
 // row 1 the prompt, both on the same start latent; all 8 channels.
 TEST_CASE("pixart dit matches the reference on the first step",
           "[pixart][image][e2e]") {
     if (!std::filesystem::exists(kModel)) {
-        SKIP("pixart-xl-2-512-f32.gguf absent; see scripts/convert-pixart.py");
+        SKIP("pixart-xl-2-512-f32.gguf absent; see "
+             "scripts/image/convert-pixart.py");
     }
     auto g = locus::gguf::GgufFile::open(kModel);
     const auto dit = PixArtDit::load(g);

@@ -17,7 +17,7 @@ namespace locus::image {
 /**
  * One LoRA's change to one linear layer W (out x in): y = W x + b plus
  * strength * B (A x), with A (r x in) and B (out x r, alpha / r folded
- * in by scripts/convert-lora.py), both F32.
+ * in by scripts/image/convert-lora.py), both F32.
  */
 struct LoraPart {
     backend::Mat a;  ///< r x in
