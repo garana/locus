@@ -107,10 +107,12 @@ bool record_matmul(Context& ctx, gguf::TensorType t, std::uint32_t rows,
 /**
  * record_matvec_routed for n_slots experts in one dispatch (MoE's k
  * picks, i#868): slot s multiplies the expert at route[route_slot +
- * s] (from w_off, expert_bytes apart) by x at x_off + s *
- * x_slot_stride into out at out_off + s * out_slot_stride.
- * @throws std::invalid_argument for a type without a kernel or an x
- *     stride that is not a multiple of 4.
+ * s] (from w_off, expert_bytes apart) by x at x_off + (s /
+ * slot_div) * x_slot_stride into out at out_off + s *
+ * out_slot_stride. slot_div k lets each token's k picks share its x
+ * row (MoE prefill).
+ * @throws std::invalid_argument for a type without a kernel, an x
+ *     stride that is not a multiple of 4 or a zero slot_div.
  */
 void record_matvec_slots(Context& ctx, gguf::TensorType t,
                          std::uint32_t rows, std::uint32_t cols,
@@ -121,7 +123,8 @@ void record_matvec_slots(Context& ctx, gguf::TensorType t,
                          const Context::Buffer& x, std::uint32_t x_off,
                          std::uint32_t x_slot_stride,
                          const Context::Buffer& out, std::uint64_t out_off,
-                         std::uint32_t out_slot_stride);
+                         std::uint32_t out_slot_stride,
+                         std::uint32_t slot_div = 1);
 
 /**
  * record_matvec for a routed expert (MoE on the GPU, i#868): the
