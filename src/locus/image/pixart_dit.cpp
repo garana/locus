@@ -11,6 +11,7 @@
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
+#include "locus/image/tensor_read.hpp"
 #include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
@@ -131,22 +132,10 @@ PixArtDit PixArtDit::load(const gguf::GgufFile& g) {
     d.grid_ = d.sample_ / d.patch_;
 
     const auto info = [&](const std::string& name) {
-        const gguf::TensorInfo* ti = g.find_tensor(name);
-        if (ti == nullptr) {
-            throw gguf::Error("pixart: missing tensor " + name);
-        }
-        return ti;
+        return require_tensor(g, "pixart", name);
     };
     const auto vec = [&](const std::string& name, std::size_t n) {
-        const gguf::TensorInfo* ti = info(name);
-        if (ti->type != gguf::TensorType::kF32 || ti->nelements() != n) {
-            throw gguf::Error("pixart: " + name + " must be F32 with " +
-                              std::to_string(n) + " values");
-        }
-        const auto bytes = g.tensor_data(*ti);
-        std::vector<float> out(n);
-        std::memcpy(out.data(), bytes.data(), n * sizeof(float));
-        return out;
+        return read_floats(g, "pixart", name, n);
     };
     // A Linear [rows, cols]; the patch conv [D, C, p, p] is one too.
     const auto lin = [&](const std::string& name, std::uint32_t rows,

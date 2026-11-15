@@ -10,6 +10,7 @@
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
+#include "locus/image/tensor_read.hpp"
 
 namespace locus::image {
 
@@ -109,11 +110,7 @@ JanusVision JanusVision::load(const gguf::GgufFile& g, std::uint32_t n_embd) {
     v.n_embd_ = n_embd;
 
     const auto info = [&](const std::string& name) {
-        const gguf::TensorInfo* ti = g.find_tensor(name);
-        if (ti == nullptr) {
-            throw gguf::Error("janus vision: missing tensor " + name);
-        }
-        return ti;
+        return require_tensor(g, "janus vision", name);
     };
     const auto f32 = [&](const std::string& name, std::size_t n) {
         const gguf::TensorInfo* ti = info(name);
