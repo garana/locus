@@ -675,7 +675,7 @@ struct AttnRowsParams {
 /** The prefill forward's scratch (grow-only; device_mutex). */
 struct BatchScratch {
     Context::Buffer x, xb, q, k, v, att, gate, up, cs, rows, blocks, head;
-    Context::Buffer router, route, eout;  // MoE layers
+    Context::Buffer router, route, eout, idx;  // MoE layers
 };
 
 BatchScratch& batch_scratch() {
@@ -684,6 +684,7 @@ BatchScratch& batch_scratch() {
 }
 
 constexpr std::uint32_t kPrefillChunk = 256;
+constexpr std::uint32_t kPrefillChunkMoe = 2048;
 // Below this many tokens a chunk runs a GPU forward a token: no matmul
 // gain at that size, and short chunks (a speculative verify) keep the
 // per-token forward's bits.
@@ -782,7 +783,12 @@ bool TransformerModel::metal_forward_batch(
             ctx.dispatch("add_bias", a, bytes_of(bp), n_tok * bp.n, 256);
         };
         BatchScratch& s = batch_scratch();
-        const std::size_t C = std::min(n, kPrefillChunk);
+        // A MoE model's sub-chunk is the engine's whole step, so each
+        // expert's matmul tiles get as many of its slots as can be (all
+        // logits keep 256: their head rows are C * V floats).
+        const std::uint32_t chunk =
+            any_moe && !all_logits ? kPrefillChunkMoe : kPrefillChunk;
+        const std::size_t C = std::min(n, chunk);
         const std::uint32_t n_blocks = (base + n + bt - 1) / bt;
         Scratch::grow(ctx, s.x, C * E * 4);
         Scratch::grow(ctx, s.xb, C * E * 4);
@@ -809,7 +815,17 @@ bool TransformerModel::metal_forward_batch(
             Scratch::grow(ctx, s.route, C * (2 * std::size_t{k_used} + 1) * 4);
             Scratch::grow(ctx, s.eout,
                           C * std::max<std::size_t>(k_used, 1) * E * 4);
+            const auto slots = static_cast<std::uint32_t>(C * k_used);
+            Scratch::grow(ctx, s.idx,
+                          (slots + 3 * std::size_t{metal::moe_max_tiles(
+                                           slots, hp_.n_expert)}) *
+                              4);
         }
+        // The experts as grouped matmuls (LOCUS_METAL_MOE_MM=0: a matvec
+        // slot each, for tests).
+        const char* mm_env = std::getenv("LOCUS_METAL_MOE_MM");
+        const bool moe_mm =
+            mm_env == nullptr || std::string_view(mm_env) != "0";
         Scratch::grow(ctx, s.cs, C * hd * 4);
         Scratch::grow(ctx, s.rows, C * L * 8);
         Scratch::grow(ctx, s.blocks, std::size_t{n_blocks} * 4);
@@ -884,24 +900,41 @@ bool TransformerModel::metal_forward_batch(
             const auto dr = expert_buf(lay.down_exps);
             const Mat& g = lay.gate_exps.base;
             const Mat& u = lay.up_exps.base;
-            const Mat& d = lay.down_exps.base;
             const std::uint32_t slots = m * k;
-            metal::record_matvec_slots(ctx, g.type, g.rows, g.cols, *gr.buf,
-                                       gr.off, lay.gate_exps.expert_bytes,
-                                       s.route, 0, slots, s.xb, 0, E, s.gate,
-                                       0, g.rows, k);
+            if (moe_mm) {
+                metal::record_moe_tiles(ctx, s.route, slots, hp_.n_expert,
+                                        s.idx);
+            }
+            // Slot s (token s / k) through expert route[s]: a grouped
+            // matmul, else a matvec slot each.
+            const auto experts = [&](const ExpertMat& em,
+                                     const MetalWeights::Ref& r,
+                                     const Context::Buffer& in,
+                                     std::uint32_t in_stride,
+                                     std::uint32_t div,
+                                     const Context::Buffer& out,
+                                     std::uint32_t out_stride) {
+                const Mat& w = em.base;
+                if (moe_mm &&
+                    metal::record_matmul_id(
+                        ctx, w.type, w.rows, w.cols, slots, hp_.n_expert,
+                        *r.buf, r.off, em.expert_bytes, in, in_stride, div,
+                        out, out_stride, s.idx)) {
+                    return;
+                }
+                metal::record_matvec_slots(ctx, w.type, w.rows, w.cols,
+                                           *r.buf, r.off, em.expert_bytes,
+                                           s.route, 0, slots, in, 0,
+                                           in_stride, out, 0, out_stride,
+                                           div);
+            };
+            experts(lay.gate_exps, gr, s.xb, E, k, s.gate, g.rows);
             ctx.overlap_next();
-            metal::record_matvec_slots(ctx, u.type, u.rows, u.cols, *ur.buf,
-                                       ur.off, lay.up_exps.expert_bytes,
-                                       s.route, 0, slots, s.xb, 0, E, s.up,
-                                       0, u.rows, k);
+            experts(lay.up_exps, ur, s.xb, E, k, s.up, u.rows);
             const SiluParams sp{slots * g.rows};
             const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
             ctx.dispatch("silu_mul", su, bytes_of(sp), slots * g.rows, 256);
-            metal::record_matvec_slots(ctx, d.type, d.rows, d.cols, *dr.buf,
-                                       dr.off, lay.down_exps.expert_bytes,
-                                       s.route, 0, slots, s.gate, 0, g.rows,
-                                       s.eout, 0, E);
+            experts(lay.down_exps, dr, s.gate, g.rows, 1, s.eout, E);
             const MoeSumParams ms{E, k, m};
             const Context::Arg ma[] = {{&s.x, 0}, {&s.eout, 0}, {&s.route, 0}};
             ctx.dispatch("moe_sum", ma, bytes_of(ms), m * E, 256);
@@ -928,8 +961,8 @@ bool TransformerModel::metal_forward_batch(
                          kNormGroup);
         };
 
-        for (std::uint32_t c0 = 0; c0 < n; c0 += kPrefillChunk) {
-            const std::uint32_t m = std::min(kPrefillChunk, n - c0);
+        for (std::uint32_t c0 = 0; c0 < n; c0 += chunk) {
+            const std::uint32_t m = std::min(chunk, n - c0);
             const bool last_chunk = c0 + m == n;
             auto* x = static_cast<float*>(s.x.data);
             auto* cs = static_cast<float*>(s.cs.data);

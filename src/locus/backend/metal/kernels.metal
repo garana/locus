@@ -779,6 +779,10 @@ struct MmParams {
     uint accumulate;
     float scale;
     uint row_tiles;  // threadgroup t is tile (t % row_tiles, t / row_tiles)
+    // mm_id_*: x of slot s is row s / slot_div; expert e's matrix at
+    // w_off + e * expert_bytes.
+    uint slot_div;
+    ulong expert_bytes;
 };
 
 constant constexpr uint kMmTM = 64;
@@ -860,6 +864,41 @@ struct MmLoadQ8_0 {
     }
 };
 
+// Q4_0: 18-byte blocks (f16 d, 16 bytes): element j is the low nibble
+// of byte j less 8, element j + 16 its high nibble less 8.
+struct MmLoadQ4_0 {
+    static ulong row_bytes(uint cols) { return ulong(cols / 32) * 18; }
+    static void load(device const uchar* row, uint k0, uint ah,
+                     threadgroup float* da) {
+        device const uchar* blk = row + (k0 / 32) * 18;
+        const float d = f16_at(blk);
+        device const uchar* q = blk + 2;
+        const uint sh = ah == 0 ? 0 : 4;
+        for (uint i = 0; i < 16; ++i) {
+            da[i] = d * (float((q[i] >> sh) & 0xF) - 8.0f);
+        }
+    }
+};
+
+// Q5_0: 22-byte blocks (f16 d, 32-bit qh, 16 bytes): as Q4_0 with bit
+// j of qh the fifth bit of element j, less 16.
+struct MmLoadQ5_0 {
+    static ulong row_bytes(uint cols) { return ulong(cols / 32) * 22; }
+    static void load(device const uchar* row, uint k0, uint ah,
+                     threadgroup float* da) {
+        device const uchar* blk = row + (k0 / 32) * 22;
+        const float d = f16_at(blk);
+        const uint qh = uint(blk[2]) | (uint(blk[3]) << 8) |
+                        (uint(blk[4]) << 16) | (uint(blk[5]) << 24);
+        device const uchar* q = blk + 6;
+        const uint sh = ah == 0 ? 0 : 4;
+        for (uint i = 0; i < 16; ++i) {
+            const uint v = ((q[i] >> sh) & 0xF) | (((qh >> (ah + i)) & 1) << 4);
+            da[i] = d * (float(v) - 16.0f);
+        }
+    }
+};
+
 // The float weights (the image and encoder models carry them): 16
 // consecutive values of a row, F32 as is, F16 and BF16 widened.
 struct MmLoadF32 {
@@ -896,17 +935,34 @@ struct MmLoadBF16 {
 };
 
 // The tile shared by every weight type, its loader L the one difference.
-template <typename L>
+// With G (mm_id_*, n_tok the slot count n), column tile tg.y is
+// moe_tiles' entry idx[n + 3 tg.y ..] = (expert, first, count): its
+// columns are the slots idx[first ..] (sorted by expert), their x rows
+// slot / slot_div, their outputs at row slot.
+template <typename L, bool G>
 inline void mm_tile(device const uchar* wbase, device const float* xbase,
                     device float* ybase, constant MmParams& p, uint tgi,
                     uint tid, uint sg, threadgroup float* sa,
-                    threadgroup float* sb, threadgroup float* so) {
+                    threadgroup float* sb, threadgroup float* so,
+                    device const uint* idx) {
     const uint2 tg = uint2(tgi % p.row_tiles, tgi / p.row_tiles);
     device const uchar* w = wbase + p.w_off;
     device const float* x = xbase + p.x_off;
     device float* y = ybase + p.out_off;
     const uint m0 = tg.x * kMmTM;
-    const uint n0 = tg.y * kMmTN;
+    uint n0 = tg.y * kMmTN;
+    uint n_tok = p.n_tok;
+    device const uint* perm = idx;
+    if (G) {
+        device const uint* tile = idx + p.n_tok + 3 * tg.y;
+        n_tok = tile[2];
+        if (n_tok == 0) {
+            return;  // past the last tile: the whole threadgroup
+        }
+        w += ulong(tile[0]) * p.expert_bytes;
+        perm = idx + tile[1];
+        n0 = 0;
+    }
     const uint rm = (sg & 1) * 32;
     const uint rn = (sg >> 1) * 16;
     simdgroup_float8x8 acc[4][2];
@@ -920,10 +976,11 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
     const uint bt = tid >> 2;
     const uint bk = (tid & 3) * 8;
     const bool a_in = m0 + ar < p.rows;
-    const bool b_in = n0 + bt < p.n_tok;
+    const bool b_in = n0 + bt < n_tok;
     device const uchar* wrow =
         w + (a_in ? ulong(m0 + ar) * L::row_bytes(p.cols) : 0);
-    device const float* xrow = x + (b_in ? (n0 + bt) * p.x_stride : 0);
+    const uint xr = !b_in ? 0 : G ? perm[bt] / p.slot_div : n0 + bt;
+    device const float* xrow = x + ulong(xr) * p.x_stride;
 
     for (uint k0 = 0; k0 < p.cols; k0 += kMmTK) {
         threadgroup float* da = sa + ar * kMmPA + ah;
@@ -964,8 +1021,9 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = tid; e < kMmTM * kMmTN; e += 128) {
         const uint t = e / kMmTM, r = e % kMmTM;
-        if (n0 + t < p.n_tok && m0 + r < p.rows) {
-            device float* o = y + (n0 + t) * p.out_stride + m0 + r;
+        if (n0 + t < n_tok && m0 + r < p.rows) {
+            const uint orow = G ? perm[t] : n0 + t;
+            device float* o = y + ulong(orow) * p.out_stride + m0 + r;
             const float v = p.scale * so[t * kMmPO + r];
             *o = p.accumulate != 0 ? *o + v : v;
         }
@@ -983,16 +1041,91 @@ inline void mm_tile(device const uchar* wbase, device const float* xbase,
         threadgroup float sa[kMmTM * kMmPA];                            \
         threadgroup float sb[kMmTN * kMmPB];                            \
         threadgroup float so[kMmTN * kMmPO];                            \
-        mm_tile<loader>(wbase, xbase, ybase, p, tgi, tid, sg, sa, sb,   \
-                        so);                                            \
+        mm_tile<loader, false>(wbase, xbase, ybase, p, tgi, tid, sg,    \
+                               sa, sb, so, nullptr);                    \
+    }                                                                   \
+    kernel void name##_id(device const uchar* wbase [[buffer(0)]],      \
+                          device const float* xbase [[buffer(1)]],      \
+                          device float* ybase [[buffer(2)]],            \
+                          constant MmParams& p [[buffer(3)]],           \
+                          device const uint* idx [[buffer(4)]],         \
+                          uint tgi [[threadgroup_position_in_grid]],    \
+                          uint tid [[thread_index_in_threadgroup]],     \
+                          uint sg [[simdgroup_index_in_threadgroup]]) { \
+        threadgroup float sa[kMmTM * kMmPA];                            \
+        threadgroup float sb[kMmTN * kMmPB];                            \
+        threadgroup float so[kMmTN * kMmPO];                            \
+        mm_tile<loader, true>(wbase, xbase, ybase, p, tgi, tid, sg, sa, \
+                              sb, so, idx);                             \
     }
 
 MM_KERNEL(mm_q4_k, MmLoadQ4K)
 MM_KERNEL(mm_q6_k, MmLoadQ6K)
 MM_KERNEL(mm_q8_0, MmLoadQ8_0)
+MM_KERNEL(mm_q4_0, MmLoadQ4_0)
+MM_KERNEL(mm_q5_0, MmLoadQ5_0)
 MM_KERNEL(mm_f32, MmLoadF32)
 MM_KERNEL(mm_f16, MmLoadF16)
 MM_KERNEL(mm_bf16, MmLoadBF16)
+
+struct MoeTilesParams {
+    uint n_slots;    // m k: the route's ids at route[0 .. n_slots)
+    uint n_expert;
+    uint max_tiles;  // n_slots / kMmTN + n_expert
+};
+
+// The slots grouped by expert for mm_id_*: idx[0 .. n) the slots in
+// expert order (each expert's in slot order), then from idx[n] 3 uints
+// a tile: (expert, its first slot's index into idx, count up to kMmTN),
+// zero counts past the last. One threadgroup, a thread an expert at a
+// time; deterministic.
+kernel void moe_tiles(device const uint* route [[buffer(0)]],
+                      device uint* idx [[buffer(1)]],
+                      constant MoeTilesParams& p [[buffer(2)]],
+                      uint tid [[thread_index_in_threadgroup]],
+                      uint nt [[threads_per_threadgroup]]) {
+    threadgroup uint cnt[1024];
+    threadgroup uint tiles_at[1024];
+    const uint n = p.n_slots;
+    for (uint e = tid; e < p.n_expert; e += nt) {
+        uint c = 0;
+        for (uint s = 0; s < n; ++s) {
+            c += route[s] == e ? 1u : 0u;
+        }
+        cnt[e] = c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint first = 0, tl = 0;
+        for (uint e = 0; e < p.n_expert; ++e) {
+            const uint c = cnt[e];
+            cnt[e] = first;
+            tiles_at[e] = tl;
+            first += c;
+            tl += (c + kMmTN - 1) / kMmTN;
+        }
+        for (uint i = tl; i < p.max_tiles; ++i) {
+            idx[n + 3 * i + 2] = 0;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < p.n_expert; e += nt) {
+        const uint first = cnt[e];
+        uint c = 0;
+        for (uint s = 0; s < n; ++s) {
+            if (route[s] == e) {
+                idx[first + c] = s;
+                ++c;
+            }
+        }
+        for (uint j = 0; j * kMmTN < c; ++j) {
+            device uint* tile = idx + n + 3 * (tiles_at[e] + j);
+            tile[0] = e;
+            tile[1] = first + j * kMmTN;
+            tile[2] = min(c - j * kMmTN, kMmTN);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------
 // The prefill forward's row kernels (i#866): n token rows at once.
