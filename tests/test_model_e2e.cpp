@@ -338,6 +338,11 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
     if (locus::backend::vulkan_backend_usable()) {
         backends.push_back("vulkan");
     }
+    // Metal's GPU forward too, where a device is there (i#866).
+    if (const auto* m = locus::backend::find_backend("metal");
+        m != nullptr && m->available) {
+        backends.push_back("metal");
+    }
     for (const char* be : backends) {
         model.use_backend(*locus::backend::find_backend(be));
         // The GPU batch path declines this model (biases, gated shared
@@ -407,6 +412,11 @@ TEST_CASE("qwen2 greedy decode matches exact arithmetic",
     if (locus::backend::vulkan_backend_usable()) {
         backends.push_back("vulkan");
     }
+    // Metal's GPU forward too, where a device is there (i#866).
+    if (const auto* m = locus::backend::find_backend("metal");
+        m != nullptr && m->available) {
+        backends.push_back("metal");
+    }
     for (const char* be : backends) {
         INFO(be);
         model.use_backend(*locus::backend::find_backend(be));
@@ -460,6 +470,11 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
     }
     if (locus::backend::vulkan_backend_usable()) {
         backends.push_back("vulkan");
+    }
+    // Metal's GPU forward too, where a device is there (i#866).
+    if (const auto* m = locus::backend::find_backend("metal");
+        m != nullptr && m->available) {
+        backends.push_back("metal");
     }
 
     // llama.cpp's prompt token counts (qwen2 pretokenizer; the gpt2
