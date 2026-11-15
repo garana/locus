@@ -968,15 +968,6 @@ std::string vision_turn_text(const json& content, bool anthropic,
 }
 
 /**
- * The output limit of a completions or chat body: max_completion_tokens
- * (OpenAI's current name, sent by the Antigravity SDK) or else
- * max_tokens; a null value counts as absent.
- *
- * @param cap The server's --max-tokens; a larger request is clamped.
- * @param dflt The limit when the body sets none.
- * @throws std::invalid_argument when the value is not a positive integer.
- */
-/**
  * A positive integer limit of a request body, clamped to cap.
  *
  * @returns body[key], at most cap, or dflt when the body has no key.
@@ -995,6 +986,15 @@ std::uint32_t read_count(const json& body, const char* key,
         std::min<std::uint64_t>(v.get<std::uint64_t>(), cap));
 }
 
+/**
+ * The output limit of a completions or chat body: max_completion_tokens
+ * (OpenAI's current name, sent by the Antigravity SDK) or else
+ * max_tokens; a null value counts as absent.
+ *
+ * @param cap The server's --max-tokens; a larger request is clamped.
+ * @param dflt The limit when the body sets none.
+ * @throws std::invalid_argument when the value is not a positive integer.
+ */
 std::uint32_t read_max_tokens(const json& body, std::uint32_t cap,
                               std::uint32_t dflt) {
     for (const char* key : {"max_completion_tokens", "max_tokens"}) {
