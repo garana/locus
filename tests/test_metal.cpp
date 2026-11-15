@@ -631,3 +631,27 @@ TEST_CASE("metal matvec_batch matches the CPU batch, row-major",
     CHECK_FALSE(ops.mt_safe);
     mb::drop_weights();
 }
+
+TEST_CASE("metal matvec re-uploads a new matrix at a reused address",
+          "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    namespace mb = locus::backend::metal;
+    // One buffer holding a matrix, then another of the same type and
+    // shape (a temporary reused, a model mapped where one was): the
+    // second matvec must see the new bytes.
+    const std::uint32_t rows = 64, cols = 512;
+    auto w = random_weights(TensorType::kQ8_0, rows, cols, 1);
+    const locus::backend::Mat m{TensorType::kQ8_0, w.data(), rows, cols};
+    std::vector<float> x(cols, 0.5f), got(rows), want(rows);
+    mb::matvec(m, x, got);
+    const auto w2 = random_weights(TensorType::kQ8_0, rows, cols, 2);
+    std::copy(w2.begin(), w2.end(), w.begin());
+    locus::backend::matvec(m, x, want);
+    mb::matvec(m, x, got);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        REQUIRE(got[r] == Catch::Approx(want[r]).margin(1e-3).epsilon(1e-4));
+    }
+    mb::drop_weights();
+}
