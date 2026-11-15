@@ -768,6 +768,12 @@ bool TransformerModel::metal_forward_batch(
     const bool tiled_attn =
         hd % 32 == 0 && hd <= 128 &&
         (tiled_env == nullptr || std::string_view(tiled_env) != "0");
+    // Where the tiled attention runs, its simdgroup-matrix form
+    // (LOCUS_METAL_ATTN_MMA=0: the tiled one, for tests).
+    const char* mma_env = std::getenv("LOCUS_METAL_ATTN_MMA");
+    const bool mma_attn =
+        tiled_attn &&
+        (mma_env == nullptr || std::string_view(mma_env) != "0");
     const std::uint32_t bt = cache.geometry().block_tokens;
 
     std::lock_guard lk(metal::device_mutex());
@@ -1077,7 +1083,12 @@ bool TransformerModel::metal_forward_batch(
                         static_cast<std::uint32_t>(qd)};
                     const Context::Arg aa[] = {
                         {&s.q, 0}, {pool, 0}, {&s.blocks, 0}, {&s.att, 0}};
-                    if (tiled_attn) {
+                    if (mma_attn) {
+                        // 32 queries of a head a threadgroup, on the
+                        // simdgroup matrices.
+                        ctx.dispatch("attn_rows_mma", aa, bytes_of(ap),
+                                     ((m + 31) / 32) * H * 128, 128);
+                    } else if (tiled_attn) {
                         // 8 queries of a head a threadgroup, K / V staged.
                         ctx.dispatch("attn_rows_tiled", aa, bytes_of(ap),
                                      ((m + 7) / 8) * H * 256, 256);

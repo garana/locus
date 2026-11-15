@@ -604,6 +604,12 @@ TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
                   cpu.first);
         }
         {
+            // The tiled prefill attention, not the simdgroup-matrix one.
+            setenv("LOCUS_METAL_ATTN_MMA", "0", 1);
+            const auto tiled = prefill("metal", false);
+            unsetenv("LOCUS_METAL_ATTN_MMA");
+            close(tiled.first, cpu.first);
+            close(tiled.second, cpu.second);
             // The decode's one-kernel attention, not split-K.
             setenv("LOCUS_METAL_ATTN_SPLIT", "0", 1);
             const auto whole = prefill("metal", false);
@@ -624,7 +630,7 @@ TEST_CASE("metal batched prefill tracks the CPU", "[metal][e2e]") {
     }
 }
 
-TEST_CASE("metal tiled causal attention matches attn_rows",
+TEST_CASE("metal tiled and simdgroup-matrix attention match attn_rows",
           "[metal]") {
     if (!Context::usable()) {
         SKIP("no Metal device");
@@ -643,10 +649,13 @@ TEST_CASE("metal tiled causal attention matches attn_rows",
     std::mt19937 rng(23);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     // Head widths 32 (64-position chunks before the cap), 64 and 128;
-    // queries off the 8-query tile; a base so chunks span blocks.
-    for (const std::uint32_t hd : {32u, 64u, 128u}) {
-        CAPTURE(hd);
-        const std::uint32_t H = 4, KV = 2, bt = 16, base = 37, m = 21;
+    // queries off the 8- and 32-query tiles (and past one 32-query
+    // block); a base so chunks span blocks.
+    for (const auto& [hd, m] :
+         {std::pair<std::uint32_t, std::uint32_t>{32, 21}, {64, 21},
+          {128, 21}, {64, 70}, {128, 70}}) {
+        CAPTURE(hd, m);
+        const std::uint32_t H = 4, KV = 2, bt = 16, base = 37;
         const std::uint32_t n_pos = base + m;
         const std::uint32_t n_blocks = (n_pos + bt - 1) / bt;
         const std::size_t kvd = std::size_t{KV} * hd;
@@ -670,6 +679,7 @@ TEST_CASE("metal tiled causal attention matches attn_rows",
         Context::Buffer qb = ctx.upload(std::as_bytes(std::span(q)));
         Context::Buffer o1 = ctx.alloc(q.size() * 4);
         Context::Buffer o2 = ctx.alloc(q.size() * 4);
+        Context::Buffer o3 = ctx.alloc(q.size() * 4);
         const AttnRowsParams p{{layer, 0, bt * kvd, m, bt, H, KV, hd,
                                 1.0f / std::sqrt(float(hd))},
                                base,
@@ -680,12 +690,17 @@ TEST_CASE("metal tiled causal attention matches attn_rows",
         ctx.dispatch("attn_rows", a1, params, m * H * 256, 256);
         ctx.dispatch("attn_rows_tiled", a2, params, ((m + 7) / 8) * H * 256,
                      256);
+        const Context::Arg a3[] = {{&qb, 0}, {&pb, 0}, {&bb, 0}, {&o3, 0}};
+        ctx.dispatch("attn_rows_mma", a3, params, ((m + 31) / 32) * H * 128,
+                     128);
         const auto* r = static_cast<const float*>(o1.data);
         const auto* t = static_cast<const float*>(o2.data);
+        const auto* u = static_cast<const float*>(o3.data);
         for (std::size_t i = 0; i < q.size(); ++i) {
             REQUIRE(t[i] == Catch::Approx(r[i]).margin(1e-5).epsilon(1e-4));
+            REQUIRE(u[i] == Catch::Approx(r[i]).margin(1e-5).epsilon(1e-4));
         }
-        for (auto* b : {&pb, &bb, &qb, &o1, &o2}) {
+        for (auto* b : {&pb, &bb, &qb, &o1, &o2, &o3}) {
             ctx.free(*b);
         }
     }
