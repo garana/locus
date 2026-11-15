@@ -178,9 +178,9 @@ Sources: kimi-k3-in-c GitHub (github.com/FareedKhan-dev/kimi-k3-in-c).
 
 Measured in November 2026 (i#245), on the same weights wherever the
 other tool runs them, so speed and memory compare like for like.
-Times are per output after one warm-up request; peak memory is the
-process's physical footprint. Details, versions and sha256 sums are
-in the issue.
+Times are per output, most after one warm-up request (the Pi's first
+audio is from a fresh server); peak memory is the process's physical
+footprint. Details, versions and sha256 sums are in the issue.
 
 | task           | host        | locus                          | other tool, same weights            |
 |----------------|-------------|--------------------------------|-------------------------------------|
@@ -212,7 +212,8 @@ host's heat pauses taken out.
   needs 1.5x (LTX) to 6.4x (PixArt) less memory.
 - Small machines: on a Raspberry Pi 5 (4 GB) Orpheus runs on the CPU,
   about 28x slower than real time; its 2.1 GB of weights do not fit
-  the GPU's memory heap, and PixArt's 12 GB do not fit at all.
+  the GPU's memory heap, and PixArt's 12 GB do not fit in its RAM
+  (mapped, they would page from disk; not run).
 - Reach: one C++ binary and GGUF files, served over OpenAI's
   `/v1/audio/speech`, `/v1/images/generations` and `/v1/videos`; the
   others need Python and torch (diffusers), or are a CLI
