@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "gguf_builder.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
@@ -199,6 +200,9 @@ TEST_CASE("janus vision encoder matches the reference features",
         // The whole tower on the GPU, activations resident.
         legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
     }
+    if (locus::backend::metal::Context::usable()) {
+        legs.push_back({"metal", &locus::backend::metal::image_ops()});
+    }
     for (const auto& [name, op] : legs) {
         DYNAMIC_SECTION(name) {
             const auto feat = v.features(golden_pixels(v), *op);
@@ -288,6 +292,9 @@ TEST_CASE("bench: janus vision tower", "[.][bench][janus]") {
         {"cpu", &locus::backend::best_backend().ops}};
     if (locus::backend::vulkan_backend_usable()) {
         legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    if (locus::backend::metal::Context::usable()) {
+        legs.push_back({"metal", &locus::backend::metal::image_ops()});
     }
     for (const auto& [name, op] : legs) {
         for (int rep = 0; rep < 3; ++rep) {

@@ -603,7 +603,8 @@ class TransformerModel {
 
     /** @returns The prompt tokens per batched forward this backend
      * prefers: 512 on Vulkan (a GPU matmul needs many token rows to
-     * fill the device), 64 elsewhere. */
+     * fill the device; 2048 for MoE), 2048 on Metal's GPU forward, 64
+     * elsewhere. */
     std::uint32_t prefill_chunk() const;
 
     /**

@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "json.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
@@ -133,6 +134,9 @@ TEST_CASE("flux pipeline matches diffusers", "[flux][image][e2e]") {
     if (locus::backend::vulkan_imports_host_memory()) {
         // As the server runs it: the DiT steps on the GPU, the rest per op.
         legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    if (locus::backend::metal::Context::usable()) {
+        legs.push_back({"metal", &locus::backend::metal::image_ops()});
     }
     for (const auto& [name, op] : legs) {
         DYNAMIC_SECTION(name) {

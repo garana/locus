@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "json.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
@@ -113,6 +114,9 @@ TEST_CASE("ltxv dit matches torch on a synthetic model", "[ltxv][image]") {
     if (locus::backend::vulkan_backend_usable()) {
         legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
     }
+    if (locus::backend::metal::Context::usable()) {
+        legs.push_back({"metal", &locus::backend::metal::image_ops()});
+    }
     for (const auto& [name, op] : legs) {
         for (std::size_t b = 0; b < 2; ++b) {
             INFO(name << " batch row " << b);
@@ -192,6 +196,9 @@ TEST_CASE("ltxv dit matches the reference on the 2B model",
         {"cpu", &locus::backend::best_backend().ops}};
     if (locus::backend::vulkan_backend_usable()) {
         legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    if (locus::backend::metal::Context::usable()) {
+        legs.push_back({"metal", &locus::backend::metal::image_ops()});
     }
     for (const auto& [name, op] : legs) {
         INFO(name);

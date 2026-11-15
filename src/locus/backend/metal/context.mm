@@ -3,13 +3,14 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <mach/mach.h>
 
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 
-// kKernelSource: kernels.metal, embedded by CMake.
+// kKernelParts: kernels.metal, embedded by CMake in pieces.
 #include "locus/backend/metal/kernels_src.hpp"
 
 namespace locus::backend::metal {
@@ -75,10 +76,14 @@ Context& Context::get() {
             }
             MTLCompileOptions* opt = [MTLCompileOptions new];
             opt.mathMode = MTLMathModeSafe;  // no fast-math reassociation
+            std::string src;
+            for (const char* piece : kKernelParts) {
+                src += piece;
+            }
             NSError* err = nil;
             id<MTLLibrary> lib = [impl->device
                 newLibraryWithSource:[NSString
-                                         stringWithUTF8String:kKernelSource]
+                                         stringWithUTF8String:src.c_str()]
                              options:opt
                                error:&err];
             if (lib == nil) {
@@ -137,6 +142,31 @@ Context::Buffer Context::upload(std::span<const std::byte> src) {
         std::memcpy(b.data, src.data(), src.size());
     }
     return b;
+}
+
+Context::Wrapped Context::wrap(const void* p, std::size_t n) {
+    @autoreleasepool {
+        const std::uintptr_t page = vm_page_size;
+        const auto at = reinterpret_cast<std::uintptr_t>(p);
+        const std::uintptr_t lo = at / page * page;
+        const std::uintptr_t hi = (at + (n == 0 ? 1 : n) + page - 1) / page *
+                                  page;
+        id<MTLBuffer> b = [impl_->device
+            newBufferWithBytesNoCopy:reinterpret_cast<void*>(lo)
+                              length:hi - lo
+                             options:MTLResourceStorageModeShared
+                         deallocator:nil];
+        if (b == nil) {
+            throw std::runtime_error("metal: cannot wrap " +
+                                     std::to_string(hi - lo) + " bytes");
+        }
+        Wrapped w;
+        w.buf.handle = (__bridge_retained void*)b;
+        w.buf.data = reinterpret_cast<void*>(lo);
+        w.buf.bytes = hi - lo;
+        w.offset = at - lo;
+        return w;
+    }
 }
 
 void Context::free(Buffer& b) {
@@ -216,9 +246,11 @@ void Context::dispatch(std::string_view name, std::span<const Arg> args,
         [enc setComputePipelineState:pso];
         NSUInteger i = 0;
         for (const Arg& a : args) {
+            const NSUInteger at =
+                a.index >= 0 ? static_cast<NSUInteger>(a.index) : i++;
             [enc setBuffer:(__bridge id<MTLBuffer>)a.buf->handle
                     offset:a.offset
-                   atIndex:i++];
+                   atIndex:at];
         }
         if (!params.empty()) {
             [enc setBytes:params.data() length:params.size() atIndex:i];

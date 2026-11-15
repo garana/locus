@@ -39,6 +39,9 @@ class Context {
     struct Arg {
         const Buffer* buf = nullptr;
         std::size_t offset = 0;
+        /** The buffer index to bind at; -1 (the default): the next one
+         *  in order. The params block goes after the in-order ones. */
+        int index = -1;
     };
 
     /**
@@ -74,6 +77,25 @@ class Context {
      *     memcpy into the buffer, no staging).
      */
     Buffer upload(std::span<const std::byte> src);
+
+    /** A buffer over host memory and where the wrapped bytes start. */
+    struct Wrapped {
+        Buffer buf;
+        std::uint64_t offset = 0;  ///< bytes from the buffer's start
+    };
+
+    /**
+     * Wraps [p, p + n) without copying it (i#868): one shared-storage
+     * buffer over the whole pages that hold it (newBufferWithBytesNoCopy
+     * on the page-aligned range), so a mapped GGUF's tensors reach the
+     * GPU with no second copy. The memory must stay mapped, and must
+     * not be written, while the buffer lives; free() only drops the
+     * buffer. The rounded range must lie inside one mapping (a mapped
+     * file's whole pages are).
+     * @returns The buffer and the offset of p in it.
+     * @throws std::runtime_error when the device refuses the range.
+     */
+    Wrapped wrap(const void* p, std::size_t n);
 
     /** Releases b (no-op on an empty one) and empties it. */
     void free(Buffer& b);
@@ -111,8 +133,8 @@ class Context {
      * Runs kernel `name` over `threads` threads (a 1-D grid, in
      * threadgroups of `group` threads): recorded into the open batch,
      * or, without one, submitted alone and waited for. Buffers bind
-     * at indices 0 .. args.size() - 1, then `params` (if any) as a
-     * constant block at index args.size().
+     * in order at indices 0, 1, ... (or at their Arg::index), then
+     * `params` (if any) as a constant block after the in-order ones.
      * @throws std::invalid_argument for an unknown kernel or a group
      *     size past the kernel's limit; std::runtime_error when the
      *     command buffer fails.
