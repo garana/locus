@@ -159,6 +159,49 @@ void h16_tile_neon(const std::uint16_t* w, const float* x,
     }
 }
 
+/**
+ * R F32 rows . T tokens (i#982), each dot in dot_f32_neon's exact order
+ * (one 4-lane chain, then the scalar tail), so each result is
+ * byte-identical to it. Each weight load is used for all T tokens; each
+ * x load for all R rows.
+ *
+ * @param w The first row; row k starts at w + k * cols.
+ * @param x The first token; token j starts at x + j * cols.
+ * @param out out[k * stride + j] receives row k . token j.
+ */
+template <int R, int T>
+void f32_tile_neon(const float* w, const float* x, std::size_t cols,
+                   float* out, std::size_t stride) {
+    float32x4_t acc[R][T];
+    for (int k = 0; k < R; ++k) {
+        for (int j = 0; j < T; ++j) {
+            acc[k][j] = vdupq_n_f32(0.0f);
+        }
+    }
+    std::size_t i = 0;
+    for (; i + 4 <= cols; i += 4) {
+        float32x4_t wv[R];
+        for (int k = 0; k < R; ++k) {
+            wv[k] = vld1q_f32(w + k * cols + i);
+        }
+        for (int j = 0; j < T; ++j) {
+            const float32x4_t xv = vld1q_f32(x + j * cols + i);
+            for (int k = 0; k < R; ++k) {
+                acc[k][j] = vfmaq_f32(acc[k][j], wv[k], xv);
+            }
+        }
+    }
+    for (int k = 0; k < R; ++k) {
+        for (int j = 0; j < T; ++j) {
+            float s = vaddvq_f32(acc[k][j]);
+            for (std::size_t e = i; e < cols; ++e) {
+                s += w[k * cols + e] * x[j * cols + e];
+            }
+            out[k * stride + j] = s;
+        }
+    }
+}
+
 /** One Q8_0 block: f16 scale + 32 int8 quants (34 bytes). */
 float dot_q8_0_block_neon(const std::byte* blk, const float* x) {
     const float d = half_to_float(load_u16(blk));
@@ -2262,6 +2305,33 @@ void matvec_batch_neon(const Mat& w, std::span<const float> x_batch,
     }
     if (w.type == gguf::TensorType::kF16) {
         h16(WidenF16{});
+        return;
+    }
+    // Register-blocked F32 (i#982), as BF16 above: 2-row x 4-token
+    // tiles (f32_tile_neon), byte-identical to dot_f32_neon per token.
+    if (w.type == gguf::TensorType::kF32) {
+        const auto* rows = reinterpret_cast<const float*>(w.data);
+        float* out = out_batch.data();
+        std::uint32_t t = 0;
+        for (; t + 4 <= n; t += 4) {
+            const float* xt = x_batch.data() + t * cols;
+            std::uint32_t r = 0;
+            for (; r + 2 <= w.rows; r += 2) {
+                f32_tile_neon<2, 4>(rows + r * cols, xt, cols,
+                                    out + std::size_t{r} * n + t, n);
+            }
+            if (r < w.rows) {
+                f32_tile_neon<1, 4>(rows + r * cols, xt, cols,
+                                    out + std::size_t{r} * n + t, n);
+            }
+        }
+        for (; t < n; ++t) {
+            const float* xt = x_batch.data() + t * cols;
+            for (std::uint32_t r = 0; r < w.rows; ++r) {
+                out[std::size_t{r} * n + t] =
+                    dot_f32_neon(rows + r * cols, xt, cols);
+            }
+        }
         return;
     }
     // Other types: per-token NEON, scattered row-major. Byte-
