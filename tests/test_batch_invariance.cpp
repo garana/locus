@@ -5,6 +5,7 @@
 // bit for bit on every selectable backend.
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -130,8 +131,8 @@ TEST_CASE("a request decodes the same alone or batched: Q8_0 and Q4_K_M",
           "[batch][invariance][e2e]") {
     // The scalar backend takes hours on these; stories260K covers it.
     // On Vulkan a model is batch-invariant in batch-invariant mode
-    // (#432; the default on Apple GPUs only, and there not for a lone
-    // K-quant sequence), which these legs set.
+    // (#432; the default on Apple GPUs and V3D, and there not for a
+    // lone K-quant sequence), which these legs set.
     struct Mode {
         Mode() { locus::backend::vulkan_set_batch_invariant(true); }
         ~Mode() { locus::backend::vulkan_reset_batch_invariant(); }
@@ -144,4 +145,26 @@ TEST_CASE("a request decodes the same alone or batched: Q8_0 and Q4_K_M",
         const Mode mode;
         check_model(kModels + "llama-3.2-1b-q4_k_m.gguf", 16, false);
     }
+}
+
+TEST_CASE("vulkan batch-invariant mode defaults on for Apple and V3D",
+          "[batch][invariance][vulkan]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device");
+    }
+    // The default is read once, from the device, when the env var is
+    // unset (i#791): on where a lone sequence costs little in the mode.
+    const char* env = std::getenv("LOCUS_VK_BATCH_INVARIANT");
+    const std::string saved = env != nullptr ? env : "";
+    ::unsetenv("LOCUS_VK_BATCH_INVARIANT");
+    locus::backend::vulkan_reset_batch_invariant();
+    const std::string name = locus::backend::vulkan_device_name();
+    INFO("device " << name);
+    const bool want = name.find("Apple") != std::string::npos ||
+                      name.find("V3D") != std::string::npos;
+    CHECK(locus::backend::vulkan_batch_invariant() == want);
+    if (env != nullptr) {
+        ::setenv("LOCUS_VK_BATCH_INVARIANT", saved.c_str(), 1);
+    }
+    locus::backend::vulkan_reset_batch_invariant();
 }

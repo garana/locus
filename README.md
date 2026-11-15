@@ -202,9 +202,7 @@ UD-IQ1_S, 203 GB, streamed on a 32 GB machine) and Moonlight-16B-A3B
   MoltenVK exposes no cooperative matrix, so a native Metal backend is
   being built, #865 to #868), CPU prefill on an M2 Pro at about 60%
   of llama.cpp's with `LOCUS_CPU_FAST` (llama.cpp sends its prompt
-  matmuls through
-  Apple's Accelerate; whether locus should is #782), batch-invariant
-  decode at full speed on V3D (#511).
+  matmuls through Apple's Accelerate; whether locus should is #782).
 - Multi-server inference, pipeline and expert parallel (#3, #24).
 - Waiting on hardware: the AVX2 kernel's validation needs an AVX2 host
   (#61); the multi-GPU weight pager needs several GPUs (#62).
