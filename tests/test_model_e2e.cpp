@@ -351,6 +351,10 @@ TEST_CASE("qwen2moe greedy decode matches the llama.cpp golden",
         if (std::string(be) == "vulkan") {
             REQUIRE(locus::backend::vulkan_forward_supported(model));
         }
+        // Metal's native forward, not the per-op matvecs (i#866).
+        if (std::string(be) == "metal") {
+            REQUIRE(model.metal_forward_supported());
+        }
         {
             INFO(be);
             auto cache = model.make_cache();
@@ -420,6 +424,10 @@ TEST_CASE("qwen2 greedy decode matches exact arithmetic",
     for (const char* be : backends) {
         INFO(be);
         model.use_backend(*locus::backend::find_backend(be));
+        // Metal's native forward, not the per-op matvecs (i#866).
+        if (std::string(be) == "metal") {
+            REQUIRE(model.metal_forward_supported());
+        }
         auto cache = model.make_cache();
         auto ws = model.make_workspace();
         locus::kv::PagedKvCache::Seq seq;
@@ -505,6 +513,10 @@ TEST_CASE("qwen3moe greedy decode matches the llama.cpp golden",
     };
     for (const char* be : backends) {
         model.use_backend(*locus::backend::find_backend(be));
+        // Metal's native forward, not the per-op matvecs (i#866).
+        if (std::string(be) == "metal") {
+            REQUIRE(model.metal_forward_supported());
+        }
         for (const Golden& gd : goldens) {
             INFO(be << ": " << gd.prompt);
             auto cache = model.make_cache();
