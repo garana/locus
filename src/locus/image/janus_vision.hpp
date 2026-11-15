@@ -78,10 +78,12 @@ class JanusVision {
     std::vector<float> to_pixels(std::span<const std::uint8_t> rgb) const;
 
   private:
-    /** features() on the GPU (janus_vision_vulkan.cpp): the patch
+    /** features() on the GPU sequence Seq (VulkanSeq or metal::Seq;
+     *  janus_vision_vulkan.cpp): the patch
      *  embedding as one matmul over the image's patches, then the
      *  blocks and the post LayerNorm, activations resident. */
-    std::vector<float> features_vulkan(std::span<const float> chw) const;
+    template <class Seq>
+    std::vector<float> features_gpu(std::span<const float> chw) const;
 
     struct Block {
         std::span<const float> ln1_w, ln1_b, qkv_b, out_b, ln2_w, ln2_b,

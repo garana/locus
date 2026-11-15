@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/metal/matvec.hpp"
+#include "locus/backend/metal/seq.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan_seq.hpp"
@@ -74,13 +76,17 @@ struct Leg {
     double bound;  ///< relative error bound against diffusers
 };
 
-/** The CPU, plus the whole-step Vulkan forward when there is a device
- *  (i#536; its sums run in another order, so FLUX's 1e-3 bound). */
+/** The CPU, plus the whole-step Vulkan and Metal forwards when there is
+ *  a device (i#536, i#868; their sums run in another order, so FLUX's
+ *  1e-3 bound). */
 std::vector<Leg> legs(double cpu_bound) {
     std::vector<Leg> v = {
         {"cpu", &locus::backend::best_backend().ops, cpu_bound}};
     if (locus::backend::VulkanSeq::available()) {
         v.push_back({"vulkan", &locus::backend::vulkan_image_ops(), 1e-3});
+    }
+    if (locus::backend::metal::Seq::available()) {
+        v.push_back({"metal", &locus::backend::metal::image_ops(), 1e-3});
     }
     return v;
 }

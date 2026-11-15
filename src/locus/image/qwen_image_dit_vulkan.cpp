@@ -1,15 +1,20 @@
 #include <cstddef>
+#include <cstdint>
 
+#include "locus/backend/metal/seq.hpp"
+#include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/mmdit_vulkan.hpp"
 #include "locus/image/qwen_image_dit.hpp"
 
 namespace locus::image {
 
-std::vector<float> QwenImageDit::forward_vulkan(
+template <class Seq>
+std::vector<float> QwenImageDit::forward_gpu(
     std::span<const float> x, std::uint32_t n_img,
     std::span<const float> text_normed, std::uint32_t n_txt,
     const std::vector<float>& st, const std::vector<float>& cosv,
     const std::vector<float>& sinv, Trace* trace) const {
+    using Rows = typename Seq::Rows;
     using namespace mmdit;
     const Dims d{width_, head_dim_, heads_, ffn_, n_img, n_txt, eps_};
     const std::uint32_t w = width_;
@@ -35,5 +40,16 @@ std::vector<float> QwenImageDit::forward_vulkan(
     }
     return output(q, d, norm_out_, proj_out_, out_, lin);
 }
+
+template std::vector<float> QwenImageDit::forward_gpu<backend::VulkanSeq>(
+    std::span<const float> x, std::uint32_t n_img,
+    std::span<const float> text_normed, std::uint32_t n_txt,
+    const std::vector<float>& st, const std::vector<float>& cosv,
+    const std::vector<float>& sinv, Trace* trace) const;
+template std::vector<float> QwenImageDit::forward_gpu<backend::metal::Seq>(
+    std::span<const float> x, std::uint32_t n_img,
+    std::span<const float> text_normed, std::uint32_t n_txt,
+    const std::vector<float>& st, const std::vector<float>& cosv,
+    const std::vector<float>& sinv, Trace* trace) const;
 
 }  // namespace locus::image

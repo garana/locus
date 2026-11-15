@@ -10,6 +10,8 @@
 
 #include "catch_amalgamated.hpp"
 #include "json.hpp"
+#include "locus/backend/metal/matvec.hpp"
+#include "locus/backend/metal/seq.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
@@ -86,12 +88,16 @@ struct Leg {
 };
 
 /** The CPU, plus on a GPU the Vulkan image ops: the whole-step forward
- *  and, with LOCUS_FLUX_GPU=0, the per-op one. */
+ *  and, with LOCUS_FLUX_GPU=0, the per-op one; on Metal its whole
+ *  step. */
 std::vector<Leg> legs() {
     std::vector<Leg> v = {{"cpu", &locus::backend::best_backend().ops}};
     if (locus::backend::vk::VulkanContext::available()) {
         v.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
         v.push_back({"vulkan per op", &locus::backend::vulkan_image_ops()});
+    }
+    if (locus::backend::metal::Seq::available()) {
+        v.push_back({"metal", &locus::backend::metal::image_ops()});
     }
     return v;
 }
