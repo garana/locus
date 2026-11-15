@@ -398,3 +398,212 @@ TEST_CASE("loop connection serves a client from a Poller loop",
     CHECK(got.rfind("HTTP/1.1 200", 0) == 0);
     CHECK(got.find("path=/metrics\n") != std::string::npos);
 }
+
+namespace {
+
+using locus::http::AsyncLoopHandler;
+using locus::http::LoopReply;
+
+/** A non-blocking wake pipe: [0] the loop reads, [1] replies write. */
+struct Wake {
+    int fd[2] = {-1, -1};
+    Wake() {
+        REQUIRE(::pipe(fd) == 0);
+        for (int f : fd) {
+            REQUIRE(::fcntl(f, F_SETFL, ::fcntl(f, F_GETFL) | O_NONBLOCK) ==
+                    0);
+        }
+    }
+    ~Wake() {
+        for (int f : fd) ::close(f);
+    }
+    /** @returns How many wake bytes were pending (and drains them). */
+    int drain() const {
+        int n = 0;
+        char buf[64];
+        for (ssize_t r; (r = ::read(fd[0], buf, sizeof(buf))) > 0;) {
+            n += static_cast<int>(r);
+        }
+        return n;
+    }
+};
+
+/** A handler that keeps each request's reply for the test to answer. */
+struct Keep {
+    std::vector<std::shared_ptr<LoopReply>> replies;
+    std::vector<std::string> paths;
+    AsyncLoopHandler handler() {
+        return [this](const Request& req, std::shared_ptr<LoopReply> r) {
+            paths.push_back(req.path);
+            replies.push_back(std::move(r));
+        };
+    }
+};
+
+LoopConfig with_wake(const Wake& w) {
+    LoopConfig cfg;
+    cfg.wake_fd = w.fd[1];
+    return cfg;
+}
+
+}  // namespace
+
+TEST_CASE("loop connection answers a deferred reply when woken",
+          "[http][loop]") {
+    Pair p;
+    Wake w;
+    Keep k;
+    LoopConnection c(p.fd[0], with_wake(w), k.handler());
+    p.send(get("/later"));
+    REQUIRE(c.on_event(readable(p.fd[0])) == Next::kRead);
+    REQUIRE(k.replies.size() == 1);
+    CHECK(p.recv_all().empty());  // nothing until the reply comes
+    // No request deadline while the handler works.
+    CHECK(c.deadline() > LoopConnection::Clock::now() +
+                             std::chrono::minutes(30));
+
+    std::thread producer([&] {
+        Response res;
+        res.set_content("done\n", "text/plain");
+        k.replies[0]->send(std::move(res));
+    });
+    producer.join();
+    CHECK(w.drain() >= 1);
+    REQUIRE(c.on_wake() == Next::kRead);  // keep-alive
+    const std::string got = p.recv_all();
+    CHECK(got.rfind("HTTP/1.1 200", 0) == 0);
+    CHECK(got.find("done\n") != std::string::npos);
+    // A second send is ignored.
+    k.replies[0]->send(Response{});
+    CHECK(c.on_wake() == Next::kRead);
+    CHECK(p.recv_all().empty());
+}
+
+TEST_CASE("loop connection streams a chunked reply, then the next request",
+          "[http][loop]") {
+    Pair p;
+    Wake w;
+    Keep k;
+    LoopConnection c(p.fd[0], with_wake(w), k.handler());
+    p.send(get("/stream") + get("/after"));
+    REQUIRE(c.on_event(readable(p.fd[0])) == Next::kRead);
+    REQUIRE(k.replies.size() == 1);  // one response in flight at a time
+
+    Response head;
+    head.set_header("Content-Type", "text/event-stream");
+    REQUIRE(k.replies[0]->begin_stream(std::move(head)));
+    REQUIRE(k.replies[0]->write("a"));
+    REQUIRE(k.replies[0]->write(""));  // no chunk: not the end
+    REQUIRE(k.replies[0]->write("bb"));
+    REQUIRE(c.on_wake() == Next::kRead);
+    std::string got = p.recv_all();
+    CHECK(got.rfind("HTTP/1.1 200", 0) == 0);
+    CHECK(got.find("Transfer-Encoding: chunked") != std::string::npos);
+    CHECK(got.find("\r\n\r\n1\r\na\r\n2\r\nbb\r\n") != std::string::npos);
+    CHECK(got.find("0\r\n\r\n") == std::string::npos);
+    CHECK(k.replies.size() == 1);
+
+    k.replies[0]->end();
+    CHECK_FALSE(k.replies[0]->write("late"));
+    REQUIRE(c.on_wake() == Next::kRead);
+    got = p.recv_all();
+    CHECK(got == "0\r\n\r\n");
+    // The pipelined request is answered now.
+    REQUIRE(k.replies.size() == 2);
+    CHECK(k.paths[1] == "/after");
+}
+
+TEST_CASE("loop connection streams HEAD as the head alone",
+          "[http][loop]") {
+    Pair p;
+    Wake w;
+    Keep k;
+    LoopConnection c(p.fd[0], with_wake(w), k.handler());
+    p.send("HEAD /s HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(c.on_event(readable(p.fd[0])) == Next::kRead);
+    REQUIRE(k.replies.size() == 1);
+    REQUIRE(k.replies[0]->begin_stream(Response{}));
+    REQUIRE(k.replies[0]->write("data"));
+    k.replies[0]->end();
+    REQUIRE(c.on_wake() == Next::kRead);
+    const std::string got = p.recv_all();
+    CHECK(got.rfind("HTTP/1.1 200", 0) == 0);
+    CHECK(got.find("data") == std::string::npos);
+    CHECK(got.find("0\r\n\r\n") == std::string::npos);
+}
+
+TEST_CASE("loop connection holds a stream's producer to the socket's pace",
+          "[http][loop]") {
+    Pair p;
+    Wake w;
+    Keep k;
+    LoopConfig cfg = with_wake(w);
+    cfg.max_stream_buffer = 64;
+    cfg.write_deadline_ms = 200;
+    LoopConnection c(p.fd[0], cfg, k.handler());
+    p.send(get("/s"));
+    REQUIRE(c.on_event(readable(p.fd[0])) == Next::kRead);
+    REQUIRE(k.replies[0]->begin_stream(Response{}));
+    const std::string piece(60, 'x');
+    REQUIRE(k.replies[0]->write(piece));  // 66 bytes framed: over 64
+
+    // The loop takes the queued bytes: the producer may go on.
+    std::thread drainer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        c.on_wake();
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    REQUIRE(k.replies[0]->write(piece));  // waits for the drain
+    CHECK(std::chrono::steady_clock::now() - t0 >=
+          std::chrono::milliseconds(40));
+    drainer.join();
+    // The drainer's pump may or may not have taken the second piece too
+    // (it loops while the producer refills): drain here, so the queue
+    // is empty for certain, then fill it over the bound again.
+    REQUIRE(c.on_wake() == Next::kRead);
+    REQUIRE(k.replies[0]->write(piece));
+
+    // Nothing takes the next bytes: the producer gives up at the write
+    // deadline, and the connection closes.
+    CHECK_FALSE(k.replies[0]->write(piece));
+    CHECK(k.replies[0]->cancelled());
+    CHECK(c.on_wake() == Next::kClose);
+}
+
+TEST_CASE("loop connection cancels a pending reply when its client goes",
+          "[http][loop]") {
+    Pair p;
+    Wake w;
+    Keep k;
+    std::shared_ptr<LoopReply> reply;
+    {
+        LoopConnection c(p.fd[0], with_wake(w), k.handler());
+        p.send(get("/slow"));
+        REQUIRE(c.on_event(readable(p.fd[0])) == Next::kRead);
+        reply = k.replies.at(0);
+        CHECK_FALSE(reply->cancelled());
+        p.close_client();
+        CHECK(c.on_event(readable(p.fd[0])) == Next::kClose);
+    }  // the loop drops the connection
+    CHECK(reply->cancelled());
+    CHECK_FALSE(reply->begin_stream(Response{}));
+    CHECK_FALSE(reply->write("x"));
+}
+
+TEST_CASE("loop connection turns an async handler's throw into a 500",
+          "[http][loop]") {
+    Pair p;
+    Wake w;
+    std::shared_ptr<LoopReply> kept;
+    LoopConnection c(p.fd[0], with_wake(w),
+                     [&](const Request&, std::shared_ptr<LoopReply> r) {
+                         kept = r;
+                         throw std::runtime_error("boom");
+                     });
+    p.send(get("/x"));
+    CHECK(c.on_event(readable(p.fd[0])) == Next::kClose);  // written
+    const std::string got = p.recv_all();
+    CHECK(got.rfind("HTTP/1.1 500", 0) == 0);
+    REQUIRE(kept);
+    CHECK(kept->cancelled());
+}

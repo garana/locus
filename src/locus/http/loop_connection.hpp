@@ -1,9 +1,13 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <string_view>
 
 #include "locus/http/http.hpp"
 #include "locus/sys/poller.hpp"
@@ -25,6 +29,14 @@ struct LoopConfig {
     int idle_timeout_ms = 5000;
     /** No write progress for this long closes the connection. */
     int write_deadline_ms = 10000;
+    /** Deferred replies (LoopReply) write a byte here when they have
+     *  something for the loop, which then calls on_wake(); -1 for a
+     *  loop that only answers at once. Non-blocking, owned by the
+     *  loop, open for as long as any reply can be written. */
+    int wake_fd = -1;
+    /** Most bytes of a stream queued and not yet on the socket; a
+     *  producer waits while it is over this (backpressure). */
+    std::size_t max_stream_buffer = 1 << 20;
 };
 
 /**
@@ -33,6 +45,67 @@ struct LoopConfig {
  * call is not). An exception becomes a 500.
  */
 using LoopHandler = std::function<void(const Request& req, Response& res)>;
+
+/**
+ * The answer to one request, given later and from any thread (i#930):
+ * either one buffered response (send), or a chunked stream
+ * (begin_stream, write..., end). Each call wakes the loop through
+ * LoopConfig::wake_fd; the connection then writes what it holds. Once
+ * the client is gone (a closed or failed connection, or EOF while the
+ * answer is pending) the reply is cancelled: its calls do nothing and
+ * write() returns false, so the producer stops.
+ */
+class LoopReply {
+  public:
+    LoopReply(int wake_fd, std::size_t max_buffer, int write_deadline_ms);
+
+    /** Answers with a buffered response. Ignored after any other call. */
+    void send(Response res);
+    /**
+     * Starts a chunked response with head's status and headers (its body
+     * is ignored).
+     * @returns false when cancelled or already answered.
+     */
+    bool begin_stream(Response head);
+    /**
+     * Queues one chunk of the stream. While more than max_buffer bytes
+     * wait for the socket it blocks, for at most the write deadline.
+     * @returns false when cancelled, not streaming, or the client did not
+     *     take the bytes in time (the reply is then cancelled).
+     */
+    bool write(std::string_view data);
+    /** Ends the stream (idempotent). */
+    void end();
+    /** @returns Whether the client is gone. */
+    bool cancelled() const;
+
+  private:
+    friend class LoopConnection;
+    enum class State { kPending, kBuffered, kStreaming, kEnded };
+    /** Wakes the loop. Call with mu_ released. */
+    void wake() const;
+    /** Marks the reply cancelled and wakes any waiting producer. */
+    void cancel();
+
+    const int wake_fd_;
+    const std::size_t max_buffer_;
+    const int write_deadline_ms_;
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    State state_ = State::kPending;
+    bool cancelled_ = false;
+    bool head_taken_ = false;  /**< the loop wrote the stream's head. */
+    Response res_;             /**< the buffered response, or the head. */
+    std::string chunks_;       /**< encoded chunks the loop has not taken. */
+};
+
+/**
+ * Runs on the loop thread for each request, as LoopHandler, but answers
+ * through `reply`, now or later from another thread. It must not block;
+ * an exception before it answers becomes a 500.
+ */
+using AsyncLoopHandler =
+    std::function<void(const Request& req, std::shared_ptr<LoopReply> reply)>;
 
 /**
  * One HTTP/1.1 connection driven by an event loop it does not own
@@ -47,12 +120,17 @@ using LoopHandler = std::function<void(const Request& req, Response& res)>;
  * kClose. read() and write() are the authority on a peer that left;
  * the hangup and error hints only make it look sooner.
  *
- * Buffered responses only (no streaming, no 100-continue); keep-alive
- * with pipelining: requests already in the buffer are answered in
- * order, one response in flight at a time, and a peer that half-closes
- * still gets an answer to every request it sent before. Input is read
- * at most 64 KiB per event; a request that cannot finish within the
- * input cap (its caps, with room for chunk framing) is a 413.
+ * A LoopHandler answers at once with a buffered response; an
+ * AsyncLoopHandler answers through a LoopReply, later and possibly as a
+ * chunked stream, and the loop calls on_wake() when LoopConfig::wake_fd
+ * is readable. No 100-continue. Keep-alive with pipelining: requests
+ * already in the buffer are answered in order, one response in flight
+ * at a time, and a peer that half-closes still gets an answer to every
+ * request it sent before (a deferred one excepted: EOF while it is
+ * pending cancels it, as http::Server's liveness probe reads FIN as
+ * gone). Input is read at most 64 KiB per event; a request that cannot
+ * finish within the input cap (its caps, with room for chunk framing)
+ * is a 413.
  */
 class LoopConnection {
   public:
@@ -66,6 +144,10 @@ class LoopConnection {
      * @param handler Called once per complete request.
      */
     LoopConnection(int fd, LoopConfig cfg, LoopHandler handler);
+    /** As above, with answers through a LoopReply (i#930). */
+    LoopConnection(int fd, LoopConfig cfg, AsyncLoopHandler handler);
+    /** Cancels a reply still pending, so its producer stops. */
+    ~LoopConnection();
 
     LoopConnection(const LoopConnection&) = delete;
     LoopConnection& operator=(const LoopConnection&) = delete;
@@ -92,7 +174,23 @@ class LoopConnection {
      */
     Next on_timeout();
 
+    /**
+     * Takes what a pending LoopReply has (the response, the stream's
+     * head and chunks, its end) and writes it. The loop calls it after
+     * draining LoopConfig::wake_fd (for each connection: one wake can
+     * cover many replies). Never blocks.
+     * @returns What to watch next, or kClose.
+     */
+    Next on_wake();
+
   private:
+    /** Moves a pending reply's output into out_ (only when out_ is
+     *  empty, so at most one buffer's worth waits for the socket). */
+    void take_reply();
+    /** Writes out_, then takes and writes more of the reply, and
+     *  answers the next request once it is done. @returns false on a
+     *  hard write error. */
+    bool pump();
     /** Reads until the socket would block. @returns false once the peer
      *  has gone (EOF or a hard error). */
     bool fill();
@@ -109,6 +207,14 @@ class LoopConnection {
     int fd_;
     LoopConfig cfg_;
     LoopHandler handler_;
+    AsyncLoopHandler async_;
+    /** The request being answered through a reply, and how. */
+    std::shared_ptr<LoopReply> pending_;
+    bool pending_keep_ = false;
+    bool pending_head_ = false;
+    /** The reply was cancelled under way (a producer that timed out
+     *  on a slow client): close, as the stream cannot finish. */
+    bool abort_ = false;
     std::string in_;
     ParseContext ctx_;
     std::string out_;
