@@ -976,19 +976,78 @@ std::string vision_turn_text(const json& content, bool anthropic,
  * @param dflt The limit when the body sets none.
  * @throws std::invalid_argument when the value is not a positive integer.
  */
+/**
+ * A positive integer limit of a request body, clamped to cap.
+ *
+ * @returns body[key], at most cap, or dflt when the body has no key.
+ * @throws std::invalid_argument when the value is not a positive integer
+ *     (null included).
+ */
+std::uint32_t read_count(const json& body, const char* key,
+                         std::uint32_t cap, std::uint32_t dflt) {
+    if (!body.contains(key)) return dflt;
+    const auto& v = body[key];
+    if (!v.is_number_unsigned() || v.get<std::uint64_t>() == 0) {
+        throw std::invalid_argument(std::string(key) +
+                                    " must be a positive integer");
+    }
+    return static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(v.get<std::uint64_t>(), cap));
+}
+
 std::uint32_t read_max_tokens(const json& body, std::uint32_t cap,
                               std::uint32_t dflt) {
     for (const char* key : {"max_completion_tokens", "max_tokens"}) {
         if (!body.contains(key) || body[key].is_null()) continue;
-        const auto& v = body[key];
-        if (!v.is_number_unsigned() || v.get<std::uint64_t>() == 0) {
-            throw std::invalid_argument(std::string(key) +
-                                        " must be a positive integer");
-        }
-        return static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(v.get<std::uint64_t>(), cap));
+        return read_count(body, key, cap, dflt);
     }
     return dflt;
+}
+
+/**
+ * The image and video endpoints' common request checks (i#1030): one
+ * message per error for PixArt, FLUX / Qwen-Image, Janus,
+ * Qwen-Image-Edit and LTX-Video.
+ */
+
+/** @returns body[k], or "" when absent.
+ *  @throws std::invalid_argument when it is not a string. */
+std::string body_string(const json& body, const char* k) {
+    if (!body.contains(k)) return {};
+    if (!body[k].is_string()) {
+        throw std::invalid_argument(std::string(k) + " must be a string");
+    }
+    return body[k].get<std::string>();
+}
+
+/** @returns The body's prompt.
+ *  @throws std::invalid_argument when it is missing, not a string or
+ *      empty. */
+std::string require_prompt(const json& body) {
+    std::string p = body_string(body, "prompt");
+    if (p.empty()) {
+        throw std::invalid_argument("prompt must be a non-empty string");
+    }
+    return p;
+}
+
+/** @throws std::invalid_argument when the body asks for n images, n
+ *      other than 1 (the pipelines make one). */
+void require_one_image(const json& body) {
+    if (body.contains("n") && (!body["n"].is_number_integer() ||
+                               body["n"].get<std::int64_t>() != 1)) {
+        throw std::invalid_argument("n must be 1");
+    }
+}
+
+/** @throws std::invalid_argument when the body asks for a
+ *      response_format other than b64_json (the one the endpoints
+ *      give). */
+void require_b64_json(const json& body) {
+    if (body.contains("response_format") &&
+        body_string(body, "response_format") != "b64_json") {
+        throw std::invalid_argument("response_format must be b64_json");
+    }
 }
 
 /**
@@ -2481,18 +2540,8 @@ void OpenAiServer::install_routes() {
                                      (tool_history ? kToolResultNote : "")});
                 }
                 prompt = opt_.chat_template.apply(msgs);
-                if (body.contains("max_tokens")) {
-                    const auto v = body["max_tokens"];
-                    if (!v.is_number_unsigned() ||
-                        v.get<std::uint64_t>() == 0) {
-                        throw std::invalid_argument(
-                            "max_tokens must be a positive integer");
-                    }
-                    max_tokens = static_cast<std::uint32_t>(
-                        std::min<std::uint64_t>(
-                            v.get<std::uint64_t>(),
-                            opt_.max_tokens_cap));
-                }
+                max_tokens = read_count(body, "max_tokens",
+                                        opt_.max_tokens_cap, max_tokens);
                 stream = body.value("stream", false);
                 std::tie(sampling, seed) = parse_sampling(body);
                 ids = tok_.encode(prompt, true);
@@ -3171,16 +3220,9 @@ void OpenAiServer::install_routes() {
                         "need temperature >= 0, 0 < top_p <= 1, "
                         "repetition_penalty > 0");
                 }
-                std::uint32_t cap = opt_.audio_max_tokens;
-                if (body.contains("max_tokens")) {
-                    if (!body["max_tokens"].is_number_unsigned() ||
-                        body["max_tokens"].get<std::uint64_t>() == 0) {
-                        throw std::invalid_argument(
-                            "max_tokens must be a positive integer");
-                    }
-                    cap = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                        cap, body["max_tokens"].get<std::uint64_t>()));
-                }
+                const std::uint32_t cap =
+                    read_count(body, "max_tokens", opt_.audio_max_tokens,
+                               opt_.audio_max_tokens);
                 const std::uint64_t seed = read_seed(body);
                 bool stream = false;
                 if (body.contains("stream")) {
@@ -3405,37 +3447,20 @@ void OpenAiServer::install_routes() {
                                 const http::RequestContext& ctx) {
             try {
                 const json body = http::parse_json(req.body);
-                auto str = [&](const char* k) -> std::string {
-                    if (!body.contains(k)) return {};
-                    if (!body[k].is_string()) {
-                        throw std::invalid_argument(std::string(k) +
-                                                    " must be a string");
-                    }
-                    return body[k].get<std::string>();
+                const auto str = [&](const char* k) {
+                    return body_string(body, k);
                 };
                 image::PixArtPipeline::Request p;
-                p.prompt = str("prompt");
-                if (p.prompt.empty()) {
-                    throw std::invalid_argument(
-                        "prompt must be a non-empty string");
-                }
+                p.prompt = require_prompt(body);
                 p.negative_prompt = str("negative_prompt");
-                if (body.contains("n") &&
-                    (!body["n"].is_number_integer() ||
-                     body["n"].get<std::int64_t>() != 1)) {
-                    throw std::invalid_argument("n must be 1");
-                }
+                require_one_image(body);
                 const std::uint32_t side = pixart_->image_size();
                 const std::string size =
                     std::to_string(side) + "x" + std::to_string(side);
                 if (body.contains("size") && str("size") != size) {
                     throw std::invalid_argument("size must be " + size);
                 }
-                if (body.contains("response_format") &&
-                    str("response_format") != "b64_json") {
-                    throw std::invalid_argument(
-                        "response_format must be b64_json");
-                }
+                require_b64_json(body);
                 if (body.contains("steps")) {
                     if (!body["steps"].is_number_integer() ||
                         body["steps"].get<std::int64_t>() < 1 ||
@@ -3516,13 +3541,8 @@ void OpenAiServer::install_routes() {
                               const http::RequestContext& ctx, bool edit) {
             try {
                 const json body = http::parse_json(req.body);
-                auto str = [&](const char* k) -> std::string {
-                    if (!body.contains(k)) return {};
-                    if (!body[k].is_string()) {
-                        throw std::invalid_argument(std::string(k) +
-                                                    " must be a string");
-                    }
-                    return body[k].get<std::string>();
+                const auto str = [&](const char* k) {
+                    return body_string(body, k);
                 };
                 auto integer = [&](const char* k, std::int64_t lo,
                                    std::int64_t hi) {
@@ -3536,14 +3556,8 @@ void OpenAiServer::install_routes() {
                     return body[k].get<std::int64_t>();
                 };
                 image::FluxPipeline::Request p;
-                p.prompt = str("prompt");
-                if (p.prompt.empty()) {
-                    throw std::invalid_argument(
-                        "prompt must be a non-empty string");
-                }
-                if (body.contains("n") && integer("n", 1, 1) != 1) {
-                    throw std::invalid_argument("n must be 1");
-                }
+                p.prompt = require_prompt(body);
+                require_one_image(body);
                 if (edit) {
                     if (!body.contains("image") || !body["image"].is_string()) {
                         throw std::invalid_argument(
@@ -3572,11 +3586,7 @@ void OpenAiServer::install_routes() {
                     std::tie(p.width, p.height) =
                         parse_size_wxh(str("size"));
                 }
-                if (body.contains("response_format") &&
-                    str("response_format") != "b64_json") {
-                    throw std::invalid_argument(
-                        "response_format must be b64_json");
-                }
+                require_b64_json(body);
                 if (body.contains("steps")) {
                     p.steps =
                         static_cast<std::uint32_t>(integer("steps", 1, 100));
@@ -3707,18 +3717,8 @@ void OpenAiServer::install_routes() {
             }
             try {
                 const json body = http::parse_json(req.body);
-                if (!body.contains("prompt") ||
-                    !body["prompt"].is_string() ||
-                    body["prompt"].get<std::string>().empty()) {
-                    throw std::invalid_argument(
-                        "prompt must be a non-empty string");
-                }
-                const auto prompt = body["prompt"].get<std::string>();
-                if (body.contains("n") &&
-                    (!body["n"].is_number_integer() ||
-                     body["n"].get<std::int64_t>() != 1)) {
-                    throw std::invalid_argument("n must be 1");
-                }
+                const auto prompt = require_prompt(body);
+                require_one_image(body);
                 // The model makes one fixed size: grid codes per side,
                 // upscale() pixels per code (24 * 16 = 384).
                 const std::uint32_t side = janus_->grid() * vq16_->upscale();
@@ -3729,13 +3729,7 @@ void OpenAiServer::install_routes() {
                      body["size"].get<std::string>() != size)) {
                     throw std::invalid_argument("size must be " + size);
                 }
-                if (body.contains("response_format") &&
-                    (!body["response_format"].is_string() ||
-                     body["response_format"].get<std::string>() !=
-                         "b64_json")) {
-                    throw std::invalid_argument(
-                        "response_format must be b64_json");
-                }
+                require_b64_json(body);
                 // Guidance and sampling; the defaults are the
                 // reference's (CFG 5, temperature 1). temperature 0
                 // picks the argmax code at each step.
@@ -3969,32 +3963,14 @@ void OpenAiServer::install_routes() {
                                    const http::RequestContext& ctx) {
         try {
             const json body = http::parse_json(req.body);
-            auto str = [&](const char* k) -> std::string {
-                if (!body[k].is_string()) {
-                    throw std::invalid_argument(std::string(k) +
-                                                " must be a string");
-                }
-                return body[k].get<std::string>();
+            const auto str = [&](const char* k) {
+                return body_string(body, k);
             };
             image::QwenEditPipeline::Request p;
-            if (body.contains("prompt")) p.prompt = str("prompt");
-            if (p.prompt.empty()) {
-                throw std::invalid_argument(
-                    "prompt must be a non-empty string");
-            }
-            if (body.contains("negative_prompt")) {
-                p.negative_prompt = str("negative_prompt");
-            }
-            if (body.contains("n") &&
-                (!body["n"].is_number_integer() ||
-                 body["n"].get<std::int64_t>() != 1)) {
-                throw std::invalid_argument("n must be 1");
-            }
-            if (body.contains("response_format") &&
-                str("response_format") != "b64_json") {
-                throw std::invalid_argument(
-                    "response_format must be b64_json");
-            }
+            p.prompt = require_prompt(body);
+            p.negative_prompt = str("negative_prompt");
+            require_one_image(body);
+            require_b64_json(body);
             if (!body.contains("image")) {
                 throw std::invalid_argument(
                     "image must be a base64 PNG or JPEG, or a data: URL of "
@@ -4173,12 +4149,7 @@ void OpenAiServer::install_routes() {
                 throw std::invalid_argument("the body must be a JSON object");
             }
             image::LtxvPipeline::Request p;
-            if (!body.contains("prompt") || !body["prompt"].is_string() ||
-                body["prompt"].get<std::string>().empty()) {
-                throw std::invalid_argument(
-                    "prompt must be a non-empty string");
-            }
-            p.prompt = body["prompt"].get<std::string>();
+            p.prompt = require_prompt(body);
             std::string size = "512x320";
             if (body.contains("size")) {
                 if (!body["size"].is_string()) {
