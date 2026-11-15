@@ -456,6 +456,12 @@ class VulkanContext {
                          MemKind kind = MemKind::kScratch);
 
     /**
+     * Test seam (i#976): the next `n` create_buffer calls throw, as a
+     * failed vkAllocateMemory does; 0 clears it.
+     */
+    void fail_allocations_for_test(int n);
+
+    /**
      * Wraps host memory [ptr, ptr + bytes) as a buffer without copying
      * (VK_EXT_external_memory_host: on unified memory the GPU reads the
      * mmap'd weights in place). Imports the whole pages from ptr's page

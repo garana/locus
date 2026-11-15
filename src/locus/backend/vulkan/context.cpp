@@ -1189,6 +1189,8 @@ struct VulkanContext::Impl {
     bool has_f16 = false;
     /** Bytes currently allocated through make_buffer. */
     VkDeviceSize allocated = 0;
+    /** fail_allocations_for_test: make_buffer calls left to fail. */
+    int fail_allocations = 0;
     /** The heap of the memory type make_buffer last allocated from;
      *  ~0u before the first buffer (i#364). */
     std::uint32_t buffer_heap = ~0u;
@@ -1651,6 +1653,11 @@ struct VulkanContext::Impl {
     }
 
     HostBuffer make_buffer(VkDeviceSize size, MemKind kind) {
+        if (fail_allocations > 0) {
+            // fail_allocations_for_test: fail as the device would.
+            --fail_allocations;
+            throw std::runtime_error("vulkan: allocate memory");
+        }
         HostBuffer b;
         b.kind = kind;
         VkBufferCreateInfo bci{};
@@ -1660,6 +1667,28 @@ struct VulkanContext::Impl {
         bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         check(vkCreateBuffer(device, &bci, nullptr, &b.buf),
               "create buffer");
+        try {
+            fill_buffer(b, size, kind);
+        } catch (...) {
+            // A failed allocation (out of device memory), bind or map
+            // leaves no buffer or memory behind (i#976).
+            if (b.mem != VK_NULL_HANDLE) {
+                if (b.map != nullptr) {
+                    vkUnmapMemory(device, b.mem);
+                }
+                vkFreeMemory(device, b.mem, nullptr);
+                allocated -= b.bytes;
+                gpu_metrics(GpuApi::kVulkan)
+                    .add_bytes(kind, -static_cast<std::int64_t>(b.bytes));
+            }
+            vkDestroyBuffer(device, b.buf, nullptr);
+            throw;
+        }
+        return b;
+    }
+
+    /** make_buffer's allocation, binding and mapping of b.buf. */
+    void fill_buffer(HostBuffer& b, VkDeviceSize size, MemKind kind) {
 
         VkMemoryRequirements req;
         vkGetBufferMemoryRequirements(device, b.buf, &req);
@@ -1697,7 +1726,6 @@ struct VulkanContext::Impl {
               "bind memory");
         check(vkMapMemory(device, b.mem, 0, size, 0, &b.map),
               "map memory");
-        return b;
     }
 
     /**
@@ -1912,6 +1940,10 @@ VulkanContext::Buffer VulkanContext::create_buffer(std::size_t bytes,
                                                    MemKind kind) {
     auto* hb = new Impl::HostBuffer(impl_->make_buffer(bytes, kind));
     return Buffer{hb};
+}
+
+void VulkanContext::fail_allocations_for_test(int n) {
+    impl_->fail_allocations = n;
 }
 
 VulkanContext::Buffer VulkanContext::import_host(const void* ptr,
@@ -2417,6 +2449,7 @@ namespace {
 VulkanContext::Buffer VulkanContext::create_buffer(std::size_t, MemKind) {
     no_kernels();
 }
+void VulkanContext::fail_allocations_for_test(int) { no_kernels(); }
 VulkanContext::Buffer VulkanContext::import_host(const void*, std::size_t,
                                                  std::size_t) {
     no_kernels();
