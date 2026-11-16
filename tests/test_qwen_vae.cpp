@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/metal/context.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
@@ -70,11 +72,15 @@ struct Leg {
 
 /** The CPU, plus the Vulkan image ops when there is a device (i#587:
  *  the convs on the GPU, the attention block's matmuls too, so a looser
- *  bound for their other summation order). */
+ *  bound for their other summation order), and the Metal image ops
+ *  where Metal is (i#1050: the convs on the GPU). */
 std::vector<Leg> legs() {
     std::vector<Leg> v = {{"cpu", &locus::backend::best_backend().ops, 1e-5}};
     if (locus::backend::vk::VulkanContext::available()) {
         v.push_back({"vulkan", &locus::backend::vulkan_image_ops(), 1e-4});
+    }
+    if (locus::backend::metal::Context::usable()) {
+        v.push_back({"metal", &locus::backend::metal::image_ops(), 1e-4});
     }
     return v;
 }

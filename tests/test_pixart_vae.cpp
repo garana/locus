@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "locus/backend/metal/context.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/registry.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
@@ -95,11 +97,15 @@ TEST_CASE("pixart vae decode matches the reference image",
     const auto z = read_f32(kDir + "golden/pixart/latent_final.f32");
     const auto ref = read_f32(kDir + "golden/pixart/vae_image_s4.f32");
     REQUIRE(ref.size() == std::size_t{128} * 128 * 3);
-    // The CPU backend, and the GPU when a Vulkan device is usable.
+    // The CPU backend, and the GPU when a Vulkan device is usable, and
+    // the Metal image ops' convs (i#1050) where Metal is.
     std::vector<std::pair<const char*, const locus::backend::Ops*>> legs = {
         {"cpu", &locus::backend::best_backend().ops}};
     if (locus::backend::vulkan_backend_usable()) {
         legs.push_back({"vulkan", &locus::backend::vulkan_image_ops()});
+    }
+    if (locus::backend::metal::Context::usable()) {
+        legs.push_back({"metal", &locus::backend::metal::image_ops()});
     }
     for (const auto& [name, op] : legs) {
         INFO(name);

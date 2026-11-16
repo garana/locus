@@ -4,6 +4,8 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "locus/backend/metal/conv.hpp"
+#include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/image/dense.hpp"
 
@@ -223,6 +225,11 @@ struct SdVaeDecoder::Run {
         if (&op == &backend::vulkan_image_ops()) {
             backend::conv2d_vulkan(x->data, x->ch, x->h, x->w, wt, out_ch, k,
                                    k, bs, stride, pad, 1, o.data);
+        } else if (&op == &backend::metal::image_ops() &&
+                   backend::metal::conv2d(x->data, x->ch, x->h, x->w, wt,
+                                          out_ch, k, k, bs, stride, pad, 1,
+                                          o.data)) {
+            // On the Metal image ops (i#1050).
         } else {
             backend::conv2d_mt(x->data, x->ch, x->h, x->w, wt, out_ch, k, k,
                                bs, stride, pad, 1, o.data);
