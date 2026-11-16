@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <mutex>
@@ -1461,6 +1462,8 @@ TEST_CASE("metal decode norm fold tracks the unfolded decode", "[metal]") {
     auto g = locus::gguf::GgufFile::open(path);
     auto model = locus::model::TransformerModel::load(g);
     model.use_backend(*locus::backend::find_backend("metal"));
+    // Else both runs take the host path and agree without the fold.
+    REQUIRE(model.metal_forward_supported());
     const auto tok = locus::tok::tokenizer_from_gguf(g);
     const auto ids = tok->encode("The capital of France is", true);
     const auto run = [&](const char* fold) {
@@ -1489,9 +1492,16 @@ TEST_CASE("metal decode norm fold tracks the unfolded decode", "[metal]") {
             scale = std::max(scale, std::abs(apart[t][i]));
         }
         CHECK(worst <= 0.01f * scale);
-        CHECK(std::max_element(folded[t].begin(), folded[t].end()) -
-                  folded[t].begin() ==
-              std::max_element(apart[t].begin(), apart[t].end()) -
-                  apart[t].begin());
+        // The same token where the top two logits are further apart than
+        // the fold can move them (a near tie may flip by the low bits).
+        auto sorted = apart[t];
+        std::partial_sort(sorted.begin(), sorted.begin() + 2, sorted.end(),
+                          std::greater<float>());
+        if (sorted[0] - sorted[1] > 2.0f * worst) {
+            CHECK(std::max_element(folded[t].begin(), folded[t].end()) -
+                      folded[t].begin() ==
+                  std::max_element(apart[t].begin(), apart[t].end()) -
+                      apart[t].begin());
+        }
     }
 }
