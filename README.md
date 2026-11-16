@@ -246,7 +246,10 @@ ends as fast.
 locus-server speaks plain HTTP. For HTTPS, `ops/haproxy/run.sh` runs
 HAProxy in front of it: TLS ends there, with the certificate and key
 in `LOCUS_TLS_CRT` and `LOCUS_TLS_KEY`, on `LOCUS_TLS_BIND`, and
-requests go on to locus-server on loopback.
+requests go on to locus-server on loopback. Every client then comes
+from 127.0.0.1, so `--max-conns-per-ip` stays at 0 there. HAProxy 3.0
+and later read the key in place; for older ones the script writes a
+private, temporary combined PEM.
 `locus-server --help`
 lists the options and environment
 variables;

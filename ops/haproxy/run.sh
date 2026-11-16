@@ -14,6 +14,9 @@
 #   LOCUS_UPSTREAM  locus-server [127.0.0.1:8080]
 #   HAPROXY         the haproxy binary [haproxy on PATH]
 # Clients must trust the CA that signed the certificate (curl --cacert).
+# Behind the proxy every client reaches locus-server from 127.0.0.1, so
+# leave its --max-conns-per-ip at 0 (off, the default): a cap there
+# would count all clients together.
 #
 # HAProxy 3.0 and later read the key in place. Older ones (Debian 12's
 # 2.6, Ubuntu 24.04's 2.8) need the certificate and key in one file:
