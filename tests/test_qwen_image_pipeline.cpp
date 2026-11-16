@@ -138,8 +138,10 @@ TEST_CASE("qwen image pipeline matches diffusers on tiny parts",
     norm = std::sqrt(norm / static_cast<double>(img.size()));
     WARN("error rms " << err << ", worst " << worst << ", reference rms "
                       << norm);
-    // Measured on an M2 Pro: 2.1e-7 of the RMS, the worst value 8.9e-7.
-    REQUIRE(err <= 1e-3 * norm);
+    // Measured: 2.1e-7 of the RMS on the M2 Pro, x86 GCC 13 and arm64
+    // GCC 12 alike (the worst value under 1e-6); 1e-5 keeps a ~48x
+    // margin and catches a slip the size of #1097's 1.8e-4.
+    REQUIRE(err <= 1e-5 * norm);
 
     // A cancelled run returns nothing; the byte output has the size;
     // a size that floors to 0 is refused.
