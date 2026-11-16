@@ -68,7 +68,12 @@ the client left (499) is `api_error` on every route.
 
 Images in chat requests (an OpenAI `image_url` part with a base64
 `data:` URL, or an Anthropic base64 image block) need a Janus-Pro
-model whose GGUF holds the vision tower. locus never fetches a URL.
+model whose GGUF holds the vision tower, or a Qwen2.5-VL model with
+its vision tower given by `--mmproj` (llama.cpp's mmproj GGUF). With
+Qwen2.5-VL each image keeps its size within the processor's bounds
+(sides rounded to multiples of 28, at most 12.8 million pixels), one
+token per 28 x 28 pixels, and the language model runs on a CPU
+backend. locus never fetches a URL.
 Requests with images do not support streaming, tools or structured
 output yet (each is a 400).
 
