@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -140,7 +143,14 @@ TEST_CASE("two CPU engines: a followed request on each is taken whole",
 
     EngineGroup group(model, tok.eos_id(), {}, EngineGroup::plan(2, {}));
     std::atomic<int> calls{0};
-    group.set_progress_hook([&calls] { calls.fetch_add(1); });
+    // The hook gets group ids (i#1005): the ids submit returned.
+    std::mutex seen_mu;
+    std::set<std::uint64_t> seen;
+    group.set_progress_hook([&](std::span<const std::uint64_t> got) {
+        calls.fetch_add(1);
+        std::lock_guard<std::mutex> lk(seen_mu);
+        seen.insert(got.begin(), got.end());
+    });
     std::vector<std::uint64_t> ids;
     for (const auto& p : prompts) {
         ids.push_back(group.submit(p, 12));
@@ -159,6 +169,60 @@ TEST_CASE("two CPU engines: a followed request on each is taken whole",
         group.release(ids[i]);
     }
     CHECK(calls.load() > 0);
+    group.set_progress_hook({});
+    CHECK(seen == std::set<std::uint64_t>(ids.begin(), ids.end()));
+}
+
+// i#1005: the pump looks only at the entries with news. One engine
+// runs one request at a time (max_running 1), so of 40 buffered
+// generations one makes progress per step and the rest wait; the
+// pump's visits then grow with the tokens, not with tokens x entries
+// (before, every wake visited every live entry: about 40 x 20 x 9).
+TEST_CASE("the generation pump visits only the requests that changed",
+          "[engine_group][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    auto tok = locus::tok::SpmTokenizer::from_gguf(g);
+    locus::engine::Engine::Config cfg;
+    cfg.max_running = 1;
+    const locus::tok::TokenId never = model.hparams().n_vocab;
+    EngineGroup group(model, never, cfg, EngineGroup::plan(1, {}));
+    constexpr int kN = 40;
+    constexpr std::uint32_t kTokens = 8;
+    std::atomic<int> done{0};
+    std::vector<std::shared_ptr<locus::http::LoopReply>> replies;
+    {
+        locus::server::GenPump pump(group, std::chrono::milliseconds(0));
+        const auto prompt = tok.encode("Once upon a time", true);
+        for (int i = 0; i < kN; ++i) {
+            auto r = std::make_shared<locus::http::LoopReply>(-1, 1 << 20,
+                                                              10000);
+            replies.push_back(r);
+            locus::server::GenReply gr;
+            gr.finish = [](const EngineLoop::View& v,
+                           locus::http::ServerResponse& res) {
+                res.set_content(std::to_string(v.generated.size()),
+                                "text/plain");
+            };
+            locus::http::Deferred d{
+                r, [&done](int, std::uint64_t) { done.fetch_add(1); }, {}};
+            pump.add(group.submit(prompt, kTokens), std::move(gr),
+                     std::move(d), locus::http::Response{});
+        }
+        const auto until =
+            std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (done.load() < kN && std::chrono::steady_clock::now() < until) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        REQUIRE(done.load() == kN);
+        const std::uint64_t visits = pump.visits();
+        INFO("visits=" << visits);
+        // Per request: its first look, about one per token, its end.
+        CHECK(visits <= std::uint64_t{kN} * (kTokens + 4));
+    }
 }
 
 // i#980 on the event loop: a stream whose step throws after its head
@@ -213,6 +277,130 @@ TEST_CASE("the generation pump reports a stream that fails mid-way",
             }
         }
     }
+}
+
+// i#940: each engine has its own prefix cache, so a prompt goes to the
+// engine that last served its first tokens (and reuses their KV there),
+// unless that engine is busier than the least-loaded one by more than
+// the slack (one request).
+TEST_CASE("a prompt goes to the engine that holds its prefix",
+          "[engine_group][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    locus::engine::Engine::Config cfg;
+    cfg.prefix_cache = true;
+    // An EOS the model never emits: the long request runs until the
+    // context ends it.
+    const locus::tok::TokenId never = model.hparams().n_vocab;
+    EngineGroup group(model, never, cfg, EngineGroup::plan(2, {}));
+    std::vector<locus::tok::TokenId> shared;
+    for (int i = 0; i < 40; ++i) {
+        shared.push_back(1 + i % 200);
+    }
+    const auto with_tail = [&](locus::tok::TokenId t) {
+        auto p = shared;
+        p.push_back(t);
+        return p;
+    };
+    std::vector<locus::tok::TokenId> other;
+    for (int i = 0; i < 20; ++i) {
+        other.push_back(300 + i);
+    }
+
+    // The prefix's first request: engine 0 (both idle), done, released.
+    const std::uint64_t a = group.submit(with_tail(250), 2);
+    REQUIRE(group.engine_of(a) == 0);
+    group.wait_done(a);
+    group.release(a);
+    // Engine 0 takes one more request (another prefix), kept unreleased.
+    const std::uint64_t x = group.submit(other, 4096);
+    REQUIRE(group.engine_of(x) == 0);
+    // By load the next would go to engine 1; its prefix sends it to 0,
+    // one request over, and its first blocks come from the cache there.
+    const std::uint64_t b = group.submit(with_tail(251), 2);
+    CHECK(group.engine_of(b) == 0);
+    CHECK(group.wait_done(b).reused_prefix_tokens > 0);
+    // Engine 0 now holds two over engine 1: past the slack, so engine 1.
+    const std::uint64_t c = group.submit(with_tail(252), 2);
+    CHECK(group.engine_of(c) == 1);
+    group.wait_done(c);
+    for (const std::uint64_t id : {c, b}) {
+        group.release(id);
+    }
+    group.cancel(x);
+    group.wait_done(x);
+    group.release(x);
+}
+
+// i#988: chat prompts share their template's first block, so routing by
+// that block alone sends every conversation to the engine that took the
+// last one. Two conversations with one 16-token preamble each go back to
+// the engine that holds their own history (the longest matching prefix).
+TEST_CASE("two conversations with one preamble keep their own engines",
+          "[engine_group][e2e]") {
+    if (!std::filesystem::exists(model_path())) {
+        SKIP("stories260K model not present");
+    }
+    auto g = locus::gguf::GgufFile::open(model_path());
+    auto model = locus::model::TransformerModel::load(g);
+    locus::engine::Engine::Config cfg;
+    cfg.prefix_cache = true;
+    const locus::tok::TokenId never = model.hparams().n_vocab;
+    EngineGroup group(model, never, cfg, EngineGroup::plan(2, {}));
+    const auto run = [](int from, int n) {
+        std::vector<locus::tok::TokenId> v;
+        for (int i = 0; i < n; ++i) {
+            v.push_back(from + i);
+        }
+        return v;
+    };
+    const auto cat = [](std::vector<std::vector<locus::tok::TokenId>> parts) {
+        std::vector<locus::tok::TokenId> v;
+        for (const auto& p : parts) {
+            v.insert(v.end(), p.begin(), p.end());
+        }
+        return v;
+    };
+    const auto pre = run(1, 16);  // the shared preamble: one block
+    const auto a1 = run(100, 16), a2 = run(120, 16);
+    const auto b1 = run(200, 16), b2 = run(220, 16);
+    const auto other = run(300, 20);
+    const auto finish = [&](std::uint64_t id) {
+        const auto v = group.wait_done(id);
+        group.release(id);
+        return v;
+    };
+
+    // Conversation A's first turn: engine 0 (both idle).
+    const std::uint64_t ta1 = group.submit(cat({pre, a1, {50}}), 2);
+    REQUIRE(group.engine_of(ta1) == 0);
+    finish(ta1);
+    // Engine 0 busy by two (the second follows the first's prefix), so
+    // conversation B's first turn goes to engine 1.
+    const std::uint64_t x1 = group.submit(other, 4096);
+    const std::uint64_t x2 = group.submit(cat({other, {330}}), 4096);
+    REQUIRE(group.engine_of(x1) == 0);
+    REQUIRE(group.engine_of(x2) == 0);
+    const std::uint64_t tb1 = group.submit(cat({pre, b1, {51}}), 2);
+    REQUIRE(group.engine_of(tb1) == 1);
+    finish(tb1);
+    for (const std::uint64_t id : {x1, x2}) {
+        group.cancel(id);
+        finish(id);
+    }
+
+    // Both idle. The preamble's block last went to engine 1, but each
+    // second turn goes to the engine of its own first turn, and reuses
+    // the preamble and its first message from that engine's cache.
+    const std::uint64_t ta2 = group.submit(cat({pre, a1, a2, {52}}), 2);
+    CHECK(group.engine_of(ta2) == 0);
+    CHECK(finish(ta2).reused_prefix_tokens >= 32);
+    const std::uint64_t tb2 = group.submit(cat({pre, b1, b2, {53}}), 2);
+    CHECK(group.engine_of(tb2) == 1);
+    CHECK(finish(tb2).reused_prefix_tokens >= 32);
 }
 
 TEST_CASE("two Vulkan devices run one engine each with one device's tokens",

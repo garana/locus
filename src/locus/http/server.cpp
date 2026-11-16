@@ -565,6 +565,10 @@ void Server::accept_one_conn() {
         ::close(fd);
         return;
     }
+    // i#994, i#1016: a peer whose host died sends no FIN; keepalive
+    // probes (or the unacknowledged-data bound) fail the socket, which
+    // the liveness probe then reports.
+    apply_keepalive(fd, cfg_);
     // Nothing to classify without a fast_path predicate: straight to the
     // pool, exactly as before the fast path existed.
     if (!cfg_.fast_path) {

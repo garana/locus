@@ -167,6 +167,47 @@ TEST_CASE("the sse-keepalive flag sets the stream keepalive", "[cli]") {
     REQUIRE(c.sse_keepalive == 15);
 }
 
+// i#994: IDLE[,INTVL,COUNT]; a bad value changes nothing.
+TEST_CASE("the tcp-keepalive flag sets the client socket keepalive",
+          "[cli]") {
+    int idle = 30, intvl = 10, count = 3;
+    CHECK(locus_tools::parse_tcp_keepalive("60", idle, intvl, count));
+    CHECK((idle == 60 && intvl == 10 && count == 3));
+    CHECK(locus_tools::parse_tcp_keepalive("20,5,4", idle, intvl, count));
+    CHECK((idle == 20 && intvl == 5 && count == 4));
+    CHECK(locus_tools::parse_tcp_keepalive("0", idle, intvl, count));
+    CHECK(idle == 0);  // off
+    for (const char* bad : {"", "x", "-1", "10,5", "10,5,3,1", "10,0,3",
+                            "10,5,0", "10,5,101", "86401", "10,,3"}) {
+        INFO(bad);
+        int i2 = 30, v2 = 10, c2 = 3;
+        CHECK_FALSE(locus_tools::parse_tcp_keepalive(bad, i2, v2, c2));
+        CHECK((i2 == 30 && v2 == 10 && c2 == 3));
+    }
+
+    std::array<const char*, 4> argv1 = {"prog", "--tcp-keepalive",
+                                        "45,15,2", "m.gguf"};
+    auto a = locus_tools::parse_backend_args(
+        static_cast<int>(argv1.size()),
+        const_cast<char**>(argv1.data()));
+    CHECK(a.bad_number_flag.empty());
+    CHECK((a.tcp_keepalive_idle == 45 && a.tcp_keepalive_intvl == 15 &&
+           a.tcp_keepalive_count == 2));
+    std::array<const char*, 4> argv2 = {"prog", "--tcp-keepalive", "1,2",
+                                        "m.gguf"};
+    auto b = locus_tools::parse_backend_args(
+        static_cast<int>(argv2.size()),
+        const_cast<char**>(argv2.data()));
+    CHECK(b.bad_number_flag == "--tcp-keepalive");
+    CHECK(b.bad_number_value == "1,2");
+    std::array<const char*, 2> argv3 = {"prog", "m.gguf"};
+    auto c = locus_tools::parse_backend_args(
+        static_cast<int>(argv3.size()),
+        const_cast<char**>(argv3.data()));
+    CHECK((c.tcp_keepalive_idle == 30 && c.tcp_keepalive_intvl == 10 &&
+           c.tcp_keepalive_count == 3));
+}
+
 TEST_CASE("the max-tokens flag sets the output token cap", "[cli]") {
     std::array<const char*, 5> argv1 = {"prog", "--max-tokens", "8192",
                                         "--audio-max-tokens=70", "m.gguf"};

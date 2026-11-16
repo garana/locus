@@ -9,6 +9,7 @@
 #include <thread>
 
 #include "locus/image/dense.hpp"
+#include "locus/image/tensor_read.hpp"
 
 namespace locus::image {
 
@@ -121,40 +122,10 @@ T5Encoder T5Encoder::load(const gguf::GgufFile& g) {
     const std::uint32_t inner = e.heads_ * e.head_dim_;
 
     const auto info = [&](const std::string& name) {
-        const gguf::TensorInfo* ti = g.find_tensor(name);
-        if (ti == nullptr) {
-            throw gguf::Error("t5: missing tensor " + name);
-        }
-        return ti;
+        return require_tensor(g, "t5", name);
     };
-    // A small F32 or F16 tensor, as floats.
     const auto vec = [&](const std::string& name, std::size_t n) {
-        const gguf::TensorInfo* ti = info(name);
-        if (ti->nelements() != n) {
-            throw gguf::Error("t5: " + name + " must have " +
-                              std::to_string(n) + " values");
-        }
-        const auto bytes = g.tensor_data(*ti);
-        std::vector<float> out(n);
-        if (ti->type == gguf::TensorType::kF32) {
-            std::memcpy(out.data(), bytes.data(), n * sizeof(float));
-        } else if (ti->type == gguf::TensorType::kF16) {
-            for (std::size_t i = 0; i < n; ++i) {
-                std::uint16_t h;
-                std::memcpy(&h, bytes.data() + 2 * i, 2);
-                out[i] = backend::f16_to_f32(h);
-            }
-        } else if (ti->type == gguf::TensorType::kBF16) {
-            for (std::size_t i = 0; i < n; ++i) {
-                std::uint16_t h;
-                std::memcpy(&h, bytes.data() + 2 * i, 2);
-                const std::uint32_t u = std::uint32_t{h} << 16;
-                std::memcpy(&out[i], &u, sizeof(float));
-            }
-        } else {
-            throw gguf::Error("t5: " + name + " must be F32, F16 or BF16");
-        }
-        return out;
+        return read_floats(g, "t5", name, n);
     };
     const auto mat = [&](const std::string& name, std::uint32_t rows,
                          std::uint32_t cols) {

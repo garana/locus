@@ -210,6 +210,10 @@ inline constexpr const char* kCommonHelp =
     "                   hold; past it a new one is closed\n"
     "                   (default 0: no cap; a router in front reaches\n"
     "                   the server from one address)\n"
+    "  --tcp-keepalive IDLE[,INTVL,COUNT] locus-server: TCP keepalive\n"
+    "                   on client sockets, so a client whose host died\n"
+    "                   is found and its generation stops (default\n"
+    "                   30,10,3: about a minute; 0 = off)\n"
     "  --sse-keepalive S locus-server: a stream silent for S seconds\n"
     "                   sends an SSE comment (default 15; 0 = off)\n"
     "  --audio-decoder P locus-server: enable /v1/audio/speech with\n"
@@ -278,8 +282,9 @@ inline constexpr const char* kCommonHelp =
     "  --engines N      locus-server: N engines over one model, each\n"
     "                   its own KV pool (--ctx each): N shares of the\n"
     "                   CPU cores, or one --device each on Vulkan;\n"
-    "                   each has its own prefix cache, so a repeated\n"
-    "                   prompt reuses its prefix only on its engine\n"
+    "                   each has its own prefix cache, so a prompt goes\n"
+    "                   to the engine its longest prefix last went to\n"
+    "                   (unless that one is busier)\n"
     "  --kv-type T      KV cache precision: f32 (default, exact),\n"
     "                   f16 (half the cache and attention reads;\n"
     "                   GPU-accelerated for GQA models), q8, q4\n"
@@ -419,6 +424,11 @@ struct BackendArgs {
     /** From --max-conns-per-ip N: open connections one client address
      *  may hold on locus-server (i#625 F21); 0 = no cap. */
     std::uint32_t max_conns_per_ip = 0;
+    /** From --tcp-keepalive IDLE[,INTVL,COUNT]: TCP keepalive on each
+     *  client socket of locus-server (i#994; idle 0 = off). */
+    int tcp_keepalive_idle = 30;
+    int tcp_keepalive_intvl = 10;
+    int tcp_keepalive_count = 3;
     /** From --audio-decoder P: path to the neural-codec decoder GGUF
      * (arch "snac") enabling locus-server's /v1/audio/speech; empty =
      * the endpoint is disabled (503). */
@@ -648,6 +658,15 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.auth_helper_args.emplace_back(argv[++i]);
         } else if (a == "--max-conns-per-ip" && i + 1 < argc) {
             number("--max-conns-per-ip", argv[++i], out.max_conns_per_ip);
+        } else if (a == "--tcp-keepalive" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (!parse_tcp_keepalive(v, out.tcp_keepalive_idle,
+                                     out.tcp_keepalive_intvl,
+                                     out.tcp_keepalive_count) &&
+                out.bad_number_flag.empty()) {
+                out.bad_number_flag = "--tcp-keepalive";
+                out.bad_number_value = v;
+            }
         } else if (a == "--sse-keepalive" && i + 1 < argc) {
             number("--sse-keepalive", argv[++i], out.sse_keepalive);
         } else if (a.rfind("--sse-keepalive=", 0) == 0) {
