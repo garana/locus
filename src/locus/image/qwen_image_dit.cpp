@@ -14,6 +14,7 @@
 #include "locus/backend/vulkan_seq.hpp"
 #include "locus/image/dense.hpp"
 #include "locus/image/mmdit_cpu.hpp"
+#include "locus/image/tensor_read.hpp"
 
 namespace locus::image {
 
@@ -168,21 +169,10 @@ QwenImageDit QwenImageDit::load(const gguf::GgufFile& g) {
     }
 
     const auto info = [&](const std::string& name) {
-        const gguf::TensorInfo* ti = g.find_tensor(name);
-        if (ti == nullptr) {
-            throw gguf::Error("qwen_image: missing tensor " + name);
-        }
-        return ti;
+        return require_tensor(g, "qwen_image", name);
     };
     const auto vec = [&](const std::string& name, std::size_t n) {
-        const gguf::TensorInfo* ti = info(name);
-        if (ti->type != gguf::TensorType::kF32 || ti->nelements() != n) {
-            throw gguf::Error("qwen_image: " + name + " must be F32 with " +
-                              std::to_string(n) + " values");
-        }
-        std::vector<float> out(n);
-        std::memcpy(out.data(), g.tensor_data(*ti).data(), n * sizeof(float));
-        return out;
+        return read_floats(g, "qwen_image", name, n);
     };
     // A Linear [rows, cols], BF16, Q8_0 (--dit-type q8_0) or F32.
     const auto lin = [&](const std::string& name, std::uint32_t rows,
