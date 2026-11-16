@@ -1256,6 +1256,48 @@ TEST_CASE("metal::Seq destroyed mid-step leaves Metal usable", "[metal]") {
     }
 }
 
+// i#1064: RoPE in the Q4_K q / k matvecs' store gives rope_norm's
+// results to the bit: the decode logits match with the epilogue off.
+TEST_CASE("metal decode RoPE epilogue matches rope_norm to the bit",
+          "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/llama-3.2-1b-q4_k_m.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("llama-3.2-1b-q4_k_m.gguf absent");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("metal"));
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    const auto ids = tok->encode("The capital of France is", true);
+    const auto run = [&](const char* epilogue) {
+        ::setenv("LOCUS_METAL_ROPE_EPILOGUE", epilogue, 1);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        std::vector<std::vector<float>> all;
+        for (const auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
+            all.push_back(logits);
+        }
+        cache.release(seq);
+        ::unsetenv("LOCUS_METAL_ROPE_EPILOGUE");
+        return all;
+    };
+    const auto fused = run("1");
+    const auto apart = run("0");
+    REQUIRE(fused.size() == apart.size());
+    for (std::size_t t = 0; t < fused.size(); ++t) {
+        CAPTURE(t);
+        REQUIRE(fused[t] == apart[t]);
+    }
+}
+
 // i#1012: metal::Seq's unmasked attention at FLUX's 1024 px shape (4096
 // image and 512 text tokens, 24 heads of 128), timed over 3 runs.
 TEST_CASE("bench: metal seq attention at the FLUX 1024 px shape",
