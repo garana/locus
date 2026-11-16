@@ -1569,17 +1569,21 @@ void OpenAiServer::qwen_vision_chat(bool anthropic, const VisionChat& chat,
         // (checked at startup: the M-RoPE forward is CPU-only).
         const auto& op = model_.active_backend().ops;
         std::lock_guard<std::mutex> lk(vision_mu_);
-        // Each image as the processor prepares it, then its merged grid
-        // for the prompt's pads.
+        // Each image's size first (no patches yet), then its merged grid
+        // for the prompt's pads: a prompt that does not fit the context
+        // is refused before the patches are built (about 300 MB an image
+        // at the processor's pixel bound).
         image::DecodeLimits lim;
         lim.max_bytes = opt_.max_body_bytes;
-        std::vector<image::QwenVlImage> images;
+        std::vector<image::Rgb8> decoded;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> grids;
+        const std::uint32_t ps = qwen_vision_->patch_size();
         const std::uint32_t mg = qwen_vision_->merge_size();
         for (const auto& bytes : chat.images) {
-            images.push_back(image::qwen_vl_image(
-                *qwen_vision_, image::decode_image(bytes, lim)));
-            grids.emplace_back(images.back().gh / mg, images.back().gw / mg);
+            decoded.push_back(image::decode_image(bytes, lim));
+            const auto [h, w] = image::qwen_vl_size(*qwen_vision_,
+                                                    decoded.back());
+            grids.emplace_back(h / ps / mg, w / ps / mg);
         }
         const auto p = image::qwen_vl_chat_ids(
             tok_,
@@ -1608,6 +1612,12 @@ void OpenAiServer::qwen_vision_chat(bool anthropic, const VisionChat& chat,
                 " tokens with the images) plus max_tokens does not fit the "
                 "context");
         }
+        // It fits: now the patches (each decoded image is freed after).
+        std::vector<image::QwenVlImage> images;
+        for (const auto& img : decoded) {
+            images.push_back(image::qwen_vl_image(*qwen_vision_, img));
+        }
+        decoded.clear();
         requests_total_.fetch_add(1, std::memory_order_relaxed);
         prompt_tokens_total_.fetch_add(p.ids.size(),
                                        std::memory_order_relaxed);

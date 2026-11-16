@@ -73,7 +73,10 @@ its vision tower given by `--mmproj` (llama.cpp's mmproj GGUF). With
 Qwen2.5-VL each image keeps its size within the processor's bounds
 (sides rounded to multiples of 28, at most 12.8 million pixels), one
 token per 28 x 28 pixels, and the language model runs on a CPU
-backend. locus never fetches a URL.
+backend. A large photo is many tokens (4000 x 3000 is about 15,000):
+a prompt that does not fit `--ctx` with `max_tokens` is refused
+before the image is processed, and a client that wants it faster
+sends the image smaller. locus never fetches a URL.
 Requests with images do not support streaming, tools or structured
 output yet (each is a 400).
 

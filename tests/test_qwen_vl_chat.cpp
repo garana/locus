@@ -157,6 +157,10 @@ TEST_CASE("qwen vl chat matches transformers on a tiny model",
         locus::image::qwen_vl_image(vision, img)};
     REQUIRE(im[0].gh == kH / 14);
     REQUIRE(im[0].gw == kW / 14);
+    // The size-only step (the server's context check) agrees.
+    CHECK(locus::image::qwen_vl_size(vision, img) ==
+          std::pair<std::uint32_t, std::uint32_t>{im[0].gh * 14,
+                                                  im[0].gw * 14});
     const std::uint32_t m = vision.merge_size();
     const Grid grid[] = {{im[0].gh / m, im[0].gw / m}};
     const std::vector<locus::image::ChatTurn> turns = {

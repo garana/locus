@@ -57,6 +57,18 @@ struct QwenVlImage {
 };
 
 /**
+ * The size qwen_vl_image resizes `img` to, without building anything:
+ * {height, width} in pixels, multiples of patch x merge (28). Callers
+ * check that the image's tokens fit the context with it before
+ * qwen_vl_image allocates the patches (about 300 MB at max_pixels).
+ *
+ * @throws std::invalid_argument on an empty image.
+ */
+std::pair<std::uint32_t, std::uint32_t> qwen_vl_size(
+    const QwenVision& v, const Rgb8& img,
+    std::uint64_t max_pixels = kQwenVlMaxPixels);
+
+/**
  * The processor's image: smart_resize to sides that are multiples of
  * patch x merge (28), the area within [min_pixels, max_pixels], with
  * Pillow's BICUBIC (the fast processor uses torchvision's, i#601),

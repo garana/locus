@@ -41,15 +41,19 @@ std::string qwen_vl_chat_text(std::span<const ChatTurn> turns,
     return out;
 }
 
-QwenVlImage qwen_vl_image(const QwenVision& v, const Rgb8& img,
-                          std::uint64_t max_pixels) {
+std::pair<std::uint32_t, std::uint32_t> qwen_vl_size(
+    const QwenVision& v, const Rgb8& img, std::uint64_t max_pixels) {
     if (img.w == 0 || img.h == 0 ||
         img.rgb.size() != std::size_t{img.w} * img.h * 3) {
         throw std::invalid_argument("qwen vl chat: empty or bad image");
     }
-    const auto [h, w] =
-        qwen_smart_resize(img.h, img.w, v.patch_size() * v.merge_size(),
-                          kQwenVlMinPixels, max_pixels);
+    return qwen_smart_resize(img.h, img.w, v.patch_size() * v.merge_size(),
+                             kQwenVlMinPixels, max_pixels);
+}
+
+QwenVlImage qwen_vl_image(const QwenVision& v, const Rgb8& img,
+                          std::uint64_t max_pixels) {
+    const auto [h, w] = qwen_vl_size(v, img, max_pixels);
     const Rgb8 sized =
         (w == img.w && h == img.h) ? img : resize_bicubic(img, w, h);
     QwenVlImage out;
@@ -131,6 +135,11 @@ bool qwen_vl_prefill(const model::TransformerModel& lm,
                 "qwen vl chat: an image runs past the prompt");
         }
         rows.push_back(vision.encode(im.patches, im.gh, im.gw, op));
+        if (rows.back().size() != std::size_t{n} * E) {
+            throw std::invalid_argument(
+                "qwen vl chat: the tower's rows do not match the image's "
+                "grid");
+        }
         for (std::uint32_t i = 0; i < n; ++i) {
             embd[p.image_at[k] + i] = rows.back().data() + std::size_t{i} * E;
         }
