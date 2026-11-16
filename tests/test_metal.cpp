@@ -1285,7 +1285,7 @@ TEST_CASE("metal Q6_K matvec layouts match the CPU", "[metal]") {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     for (const char* layout : {"halves", "units"}) {
         ::setenv("LOCUS_METAL_Q6K", layout, 1);
-        for (const auto [rows, cols] :
+        for (const auto& [rows, cols] :
              {std::pair{37u, 256u}, std::pair{200u, 3072u}}) {
             CAPTURE(layout, rows, cols);
             const auto wv = random_weights(TensorType::kQ6_K, rows, cols,
