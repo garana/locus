@@ -73,6 +73,7 @@ add_library(locus
     src/locus/image/qwen_image_dit_vulkan.cpp
     src/locus/image/qwen_image_sampler.cpp
     src/locus/image/qwen_edit_pipeline.cpp
+    src/locus/image/qwen_image_pipeline.cpp
     src/locus/image/qwen_vision.cpp
     src/locus/image/qwen_edit_text.cpp
     src/locus/image/qwen_vl_chat.cpp
