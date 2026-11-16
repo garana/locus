@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Converts the diffusers Qwen-Image-Edit pipeline directory
-(Qwen/Qwen-Image-Edit, QwenImageEditPipeline) to GGUFs (i#531):
+"""Converts the diffusers Qwen-Image-Edit or Qwen-Image pipeline
+directory (Qwen/Qwen-Image-Edit, QwenImageEditPipeline; Qwen/Qwen-Image,
+QwenImagePipeline) to GGUFs (i#531, i#1091):
 
 - a "qwen_image" GGUF with the transformer
   (QwenImageTransformer2DModel): the checkpoint names, 2D weights kept
@@ -8,8 +9,9 @@
   of 40.9 GB), every other tensor F32; the model keys from
   transformer/config.json, the constants the diffusers class fixes
   (RoPE theta 10000 with scale_rope, norm epsilon 1e-6, 256 timestep
-  channels, tanh GELU) and the sampler keys from
-  scheduler/scheduler_config.json;
+  channels, tanh GELU), the sampler keys from
+  scheduler/scheduler_config.json, and qwen_image.pipeline ("edit" or
+  "text-to-image", from model_index.json's _class_name; i#1099);
 - a "qwen_image_vae" GGUF with the VAE (AutoencoderKLQwenImage)
   encoder and decoder, all F32, under diffusers' names. A Conv3d weight
   [out, in, kt, kh, kw] is stored [out, in, kt * kh * kw] (GGUF holds
@@ -132,7 +134,7 @@ class Out:
         self.w.close()
 
 
-def write_dit(path, mdir, q8, max_blocks=None):
+def write_dit(path, mdir, q8, pipeline, max_blocks=None):
     t = config(mdir / "transformer")
     s = json.loads((mdir / "scheduler" /
                     "scheduler_config.json").read_text())
@@ -213,6 +215,9 @@ def write_dit(path, mdir, q8, max_blocks=None):
     w.add_array(k + "rope.axes", axes)
     w.add_bool(k + "rope.scale", True)
     w.add_string(k + "activation", "gelu_tanh")
+    # Which checkpoint this is (i#1099): the two share the class and the
+    # shapes, so locus could not tell them apart otherwise.
+    w.add_string(k + "pipeline", pipeline)
     p = k + "sampler."
     w.add_uint32(p + "num_train_timesteps", s["num_train_timesteps"])
     w.add_bool(p + "use_dynamic_shifting",
@@ -302,12 +307,13 @@ def main():
 
     mdir = pathlib.Path(a.model)
     idx = json.loads((mdir / "model_index.json").read_text())
-    if idx.get("_class_name") not in ("QwenImageEditPipeline",
-                                      "QwenImagePipeline"):
+    kinds = {"QwenImageEditPipeline": "edit",
+             "QwenImagePipeline": "text-to-image"}
+    if idx.get("_class_name") not in kinds:
         sys.exit("expected a QwenImageEditPipeline or QwenImagePipeline")
     if a.dit_out:
         write_dit(pathlib.Path(a.dit_out), mdir, a.dit_type == "q8_0",
-                  a.blocks)
+                  kinds[idx["_class_name"]], a.blocks)
     if a.vae_out:
         write_vae(pathlib.Path(a.vae_out), mdir)
 

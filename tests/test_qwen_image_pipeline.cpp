@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "catch_amalgamated.hpp"
+#include "gguf_builder.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "qwen_tiny.hpp"
 
@@ -154,4 +155,55 @@ TEST_CASE("qwen image pipeline matches diffusers on tiny parts",
     req.width = 1;  // floors to 0 at any VAE scale
     REQUIRE_THROWS_AS(p->generate(req, op, {}, ow, oh),
                       std::invalid_argument);
+}
+
+// i#1099: a transformer GGUF that says which checkpoint it holds must
+// match the pipeline its folder makes; one without the key (converted
+// before it) is accepted.
+TEST_CASE("qwen image checkpoint kind must match the pipeline",
+          "[qwen-image][image]") {
+    using locus::image::qwen_image_check_pipeline;
+    // A copy: bytes() views the builder's buffer, which dies with it.
+    const auto with = [](const char* kind) {
+        GgufBuilder b;
+        b.header(0, 2)
+            .kv_string("general.architecture", "qwen_image")
+            .kv_string("qwen_image.pipeline", kind);
+        const auto v = b.bytes();
+        return std::vector<std::byte>(v.begin(), v.end());
+    };
+    const auto edit_img = with("edit");
+    const auto t2i_img = with("text-to-image");
+    const auto odd_img = with("inpaint");
+    GgufBuilder nb;
+    nb.header(0, 1).kv_string("general.architecture", "qwen_image");
+    const auto none_img = nb.bytes();
+    const auto edit = locus::gguf::GgufFile::parse(edit_img);
+    const auto t2i = locus::gguf::GgufFile::parse(t2i_img);
+    const auto odd = locus::gguf::GgufFile::parse(odd_img);
+    const auto none = locus::gguf::GgufFile::parse(none_img);
+
+    CHECK_NOTHROW(qwen_image_check_pipeline(edit, "edit"));
+    CHECK_NOTHROW(qwen_image_check_pipeline(t2i, "text-to-image"));
+    CHECK_NOTHROW(qwen_image_check_pipeline(none, "edit"));
+    CHECK_NOTHROW(qwen_image_check_pipeline(none, "text-to-image"));
+    REQUIRE_THROWS_AS(qwen_image_check_pipeline(odd, "edit"),
+                      locus::gguf::Error);
+    // The message names the mismatch and how to fix the folder.
+    try {
+        qwen_image_check_pipeline(edit, "text-to-image");
+        FAIL("expected gguf::Error");
+    } catch (const locus::gguf::Error& e) {
+        const std::string msg = e.what();
+        CHECK(msg.find("Qwen-Image-Edit") != std::string::npos);
+        CHECK(msg.find("mmproj") != std::string::npos);
+    }
+    try {
+        qwen_image_check_pipeline(t2i, "edit");
+        FAIL("expected gguf::Error");
+    } catch (const locus::gguf::Error& e) {
+        const std::string msg = e.what();
+        CHECK(msg.find("text-to-image") != std::string::npos);
+        CHECK(msg.find("Remove the mmproj") != std::string::npos);
+    }
 }

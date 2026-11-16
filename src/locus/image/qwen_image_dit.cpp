@@ -309,4 +309,30 @@ std::vector<float> QwenImageDit::forward(std::span<const float> x,
     return out;
 }
 
+void qwen_image_check_pipeline(const gguf::GgufFile& dit,
+                               std::string_view want) {
+    const auto got = dit.get_string("qwen_image.pipeline");
+    if (!got || *got == want) return;
+    if (*got != "edit" && *got != "text-to-image") {
+        throw gguf::Error("qwen image: unknown qwen_image.pipeline \"" +
+                          std::string(*got) +
+                          "\" in the transformer GGUF (expected \"edit\" "
+                          "or \"text-to-image\")");
+    }
+    if (want == "text-to-image") {
+        throw gguf::Error(
+            "qwen image: the transformer GGUF is a Qwen-Image-Edit "
+            "checkpoint (qwen_image.pipeline \"edit\"), but its folder has "
+            "no vision tower (mmproj GGUF), so it would serve text to "
+            "image with edit weights. Add the mmproj to serve edits, or "
+            "use the Qwen-Image transformer to serve generations.");
+    }
+    throw gguf::Error(
+        "qwen image: the transformer GGUF is a Qwen-Image (text-to-image) "
+        "checkpoint (qwen_image.pipeline \"text-to-image\"), but its folder "
+        "has a vision tower (mmproj GGUF), so it would serve edits with "
+        "text-to-image weights. Remove the mmproj to serve generations, "
+        "or use the Qwen-Image-Edit transformer to serve edits.");
+}
+
 }  // namespace locus::image

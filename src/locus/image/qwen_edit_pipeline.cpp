@@ -80,6 +80,8 @@ std::unique_ptr<QwenEditPipeline> QwenEditPipeline::from_parts(
     const gguf::GgufFile& lm, const gguf::GgufFile& vision,
     const gguf::GgufFile& dit, const gguf::GgufFile& vae,
     const gguf::GgufFile& tok) {
+    // The checkpoint kind first (i#1099), before any part loads.
+    qwen_image_check_pipeline(dit, "edit");
     auto p = std::unique_ptr<QwenEditPipeline>(new QwenEditPipeline());
     p->tok_ = tok::tokenizer_from_gguf(tok);
     p->lm_ = std::make_unique<model::TransformerModel>(
