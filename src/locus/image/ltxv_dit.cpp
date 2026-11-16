@@ -8,6 +8,7 @@
 
 #include "locus/image/dense.hpp"
 #include "locus/image/pixart_dit.hpp"
+#include "locus/image/tensor_read.hpp"
 #include "locus/sys/thread_pool.hpp"
 
 namespace locus::image {
@@ -218,35 +219,12 @@ LtxvDit LtxvDit::load(const gguf::GgufFile& g) {
     }
 
     const auto info = [&](const std::string& name) {
-        const gguf::TensorInfo* ti = g.find_tensor(name);
-        if (ti == nullptr) {
-            throw gguf::Error("ltxv: missing tensor " + name);
-        }
-        return ti;
+        return require_tensor(g, "ltxv", name);
     };
-    // F32, or BF16 widened exactly: the converter keeps every 2D tensor
-    // BF16, which includes the [2][w] and [6][w] scale_shift_tables.
+    // BF16 widens exactly: the converter keeps every 2D tensor BF16,
+    // which includes the [2][w] and [6][w] scale_shift_tables.
     const auto vec = [&](const std::string& name, std::size_t n) {
-        const gguf::TensorInfo* ti = info(name);
-        if ((ti->type != gguf::TensorType::kF32 &&
-             ti->type != gguf::TensorType::kBF16) ||
-            ti->nelements() != n) {
-            throw gguf::Error("ltxv: " + name + " must be F32 or BF16 with " +
-                              std::to_string(n) + " values");
-        }
-        const auto bytes = g.tensor_data(*ti);
-        std::vector<float> out(n);
-        if (ti->type == gguf::TensorType::kF32) {
-            std::memcpy(out.data(), bytes.data(), n * sizeof(float));
-        } else {
-            for (std::size_t i = 0; i < n; ++i) {
-                std::uint16_t h;
-                std::memcpy(&h, bytes.data() + 2 * i, 2);
-                const std::uint32_t u = std::uint32_t{h} << 16;
-                std::memcpy(&out[i], &u, sizeof(float));
-            }
-        }
-        return out;
+        return read_floats(g, "ltxv", name, n);
     };
     // A Linear [rows, cols], BF16 or F32.
     const auto lin = [&](const std::string& name, std::uint32_t rows,
