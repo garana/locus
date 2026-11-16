@@ -236,7 +236,7 @@ std::string gpu_idle_warning(bool defaulted, const Backend& picked,
         }
         if (is_gpu(b.name) && b.available && b.selectable) {
             const std::string gpu(b.name);
-            return "warning: running on the CPU (" +
+            return "warning: the text model runs on the CPU (" +
                    std::string(picked.name) +
                    ") by default; a GPU is usable: pass --backend " +
                    gpu + " (or set LOCUS_BACKEND=" + gpu + ")";
