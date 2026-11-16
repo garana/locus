@@ -28,6 +28,7 @@ namespace locus::image {
 class ImageClassifier;
 class JanusImageGen;
 class JanusVision;
+class QwenVision;
 class PixArtPipeline;
 class FluxPipeline;
 class QwenEditPipeline;
@@ -119,6 +120,10 @@ class OpenAiServer {
          * --image-classifier) that enables POST /v1/classify and image
          * inputs to /v1/embeddings under its name. Empty = 503. */
         std::string image_classifier_path;
+        /** Path to a Qwen2.5-VL vision tower GGUF (llama.cpp's mmproj,
+         * --mmproj) for image input in chat with a qwen2vl model
+         * (i#1092). Empty = none. */
+        std::string mmproj_path;
         /** Max documents one /v1/rerank call may score; over this gets
          * 400. */
         std::size_t max_rerank_documents = 1000;
@@ -298,9 +303,10 @@ class OpenAiServer {
                     const std::string& identity);
     /**
      * Answers a chat (OpenAI) or messages (Anthropic) request whose
-     * messages carry images (i#241): the Janus vision encoder turns
-     * each image into its placeholder embeddings, then the reply is
-     * decoded on a dedicated cache, serialized under vision_mu_.
+     * messages carry images (i#241): the Janus vision encoder (or
+     * Qwen2.5-VL's, i#1092) turns each image into its placeholder
+     * embeddings, then the reply is decoded on a dedicated cache,
+     * serialized under vision_mu_.
      * Non-streaming.
      *
      * @param anthropic Answer in the /v1/messages shape.
@@ -310,6 +316,12 @@ class OpenAiServer {
     void vision_chat(bool anthropic, const VisionChat& chat,
                      http::ServerResponse& res,
                      const http::RequestContext& ctx);
+    /** vision_chat on Qwen2.5-VL (i#1092): the processor's images, the
+     *  chat template, the prefill and each decode step with M-RoPE
+     *  positions (image/qwen_vl_chat). */
+    void qwen_vision_chat(bool anthropic, const VisionChat& chat,
+                          http::ServerResponse& res,
+                          const http::RequestContext& ctx);
     /**
      * Answers generation `id` (i#932): through pump_ when the event-loop
      * server lets the handler defer, else on the calling job thread
@@ -415,6 +427,11 @@ class OpenAiServer {
     // mapping. Replies run one at a time on a dedicated cache.
     std::unique_ptr<gguf::GgufFile> vision_gguf_;
     std::unique_ptr<image::JanusVision> vision_;
+    // Or Qwen2.5-VL's vision tower (--mmproj with a qwen2vl model,
+    // i#1092), its matrices in qwen_vision_gguf_'s mapping; the same
+    // lock, cache and workspace.
+    std::unique_ptr<gguf::GgufFile> qwen_vision_gguf_;
+    std::unique_ptr<image::QwenVision> qwen_vision_;
     std::mutex vision_mu_;
     std::unique_ptr<kv::PagedKvCache> vision_cache_;
     model::TransformerModel::Workspace vision_ws_;

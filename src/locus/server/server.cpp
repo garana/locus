@@ -36,6 +36,8 @@
 #include "locus/image/janus.hpp"
 #include "locus/image/janus_chat.hpp"
 #include "locus/image/janus_vision.hpp"
+#include "locus/image/qwen_vision.hpp"
+#include "locus/image/qwen_vl_chat.hpp"
 #include "locus/image/flux_pipeline.hpp"
 #include "locus/image/ltxv_pipeline.hpp"
 #include "locus/image/pixart_pipeline.hpp"
@@ -925,13 +927,15 @@ constexpr std::size_t kMaxChatImages = 8;
 
 /**
  * One turn's text from its content: text parts as they are, each image
- * as the placeholder, joined by "\n" (the reference's
- * "<image_placeholder>\n<question>" form); image bytes are appended to
- * `images`. A text part may not contain the placeholder itself.
+ * as the placeholder, joined by `sep` (Janus: "\n", the reference's
+ * "<image_placeholder>\n<question>" form; Qwen2.5-VL: ""); image bytes
+ * are appended to `images`. A text part may not contain the
+ * placeholder itself.
  */
 std::string vision_turn_text(const json& content, bool anthropic,
                              bool allow_images, std::size_t max_bytes,
-                             std::vector<std::vector<std::byte>>& images) {
+                             std::vector<std::vector<std::byte>>& images,
+                             std::string_view sep) {
     const auto checked = [](std::string t) {
         if (t.find(image::kImagePlaceholder) != std::string::npos) {
             throw std::invalid_argument(
@@ -978,7 +982,7 @@ std::string vision_turn_text(const json& content, bool anthropic,
             throw std::invalid_argument("unsupported content part: " +
                                         type);
         }
-        if (!out.empty()) out += "\n";
+        if (!out.empty()) out += sep;
         out += piece;
     }
     return out;
@@ -1064,13 +1068,17 @@ engine::LogprobsOpt read_logprobs(const json& body, bool chat) {
  * Parses a chat (OpenAI messages[]) or messages (Anthropic, with a
  * top-level system) body that carries images.
  *
+ * @param sep What joins a turn's parts: "\n" for Janus (its reference's
+ *     "<image_placeholder>\n<question>"), "" for Qwen2.5-VL (its chat
+ *     template adds nothing between parts).
  * @returns nullopt when no message has an image part, so the request
  *     takes the text path unchanged.
  */
 std::optional<VisionChat> parse_vision_chat(const json& body,
                                             bool anthropic,
                                             std::uint32_t max_tokens_cap,
-                                            std::size_t max_bytes) {
+                                            std::size_t max_bytes,
+                                            std::string_view sep) {
     const json& msgs = body.at("messages");
     bool any = false;
     for (const auto& m : msgs) {
@@ -1100,7 +1108,7 @@ std::optional<VisionChat> parse_vision_chat(const json& body,
             // Anthropic: as parse_anthropic_messages, after the
             // top-level system text.
             const std::string text = vision_turn_text(
-                m["content"], anthropic, false, max_bytes, vc.images);
+                m["content"], anthropic, false, max_bytes, vc.images, sep);
             if (!vc.system.empty() && !text.empty()) vc.system += "\n";
             vc.system += text;
             vc.has_system = true;
@@ -1108,7 +1116,7 @@ std::optional<VisionChat> parse_vision_chat(const json& body,
             vc.turns.push_back(
                 {role, vision_turn_text(m["content"], anthropic,
                                         role == "user", max_bytes,
-                                        vc.images)});
+                                        vc.images, sep)});
         } else {
             throw std::invalid_argument("unsupported message role: " + role);
         }
@@ -1325,6 +1333,34 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             vision_gguf_ = std::move(vg);
         }
     }
+    // Image input on Qwen2.5-VL (i#1092): --mmproj with a qwen2vl model.
+    // Its M-RoPE forward runs on the CPU backends only, so a GPU one
+    // (vulkan, cuda, metal) is refused here, not on the first image.
+    if (!opt_.mmproj_path.empty()) {
+        const auto mg = gguf::GgufFile::open(opt_.model_path);
+        if (mg.get_string("general.architecture") != "qwen2vl") {
+            throw gguf::Error(
+                "--mmproj needs a Qwen2.5-VL model (architecture "
+                "qwen2vl)");
+        }
+        const backend::Backend& be = m.active_backend();
+        if (!be.ops.cpu || be.name == "metal") {
+            throw gguf::Error(
+                "--mmproj needs the language model on a CPU backend "
+                "(its M-RoPE forward is CPU-only); got " +
+                std::string(be.name));
+        }
+        auto vg = std::make_unique<gguf::GgufFile>(
+            gguf::GgufFile::open(opt_.mmproj_path));
+        auto v = std::make_unique<image::QwenVision>(
+            image::QwenVision::load(*vg));
+        if (v->out_dim() != m.hparams().n_embd) {
+            throw gguf::Error(
+                "--mmproj: the vision tower's width is not the model's");
+        }
+        qwen_vision_ = std::move(v);
+        qwen_vision_gguf_ = std::move(vg);
+    }
     // Hardware names for /metrics (i#285), read once here: the GPU
     // names take the GPU lock, which a scrape must never wait on. Only
     // devices this server uses: the language model's GPU backend, and
@@ -1362,6 +1398,10 @@ std::vector<std::pair<std::string, std::string>> OpenAiServer::engines()
     if (vision_) {
         out.emplace_back("image input",
                          engine_label(vision_engine(active).name));
+    }
+    if (qwen_vision_) {
+        out.emplace_back("image input (Qwen2.5-VL)",
+                         engine_label(active.name));
     }
     if (flux_ || pixart_) {
         out.emplace_back(flux_ ? "images (FLUX.1)" : "images (PixArt)",
@@ -1467,21 +1507,169 @@ std::vector<float> OpenAiServer::embed_text(const std::string& text) {
     return emb;
 }
 
+namespace {
+
+/** An image chat's reply in the /v1/messages (anthropic) or the chat
+ *  completions shape. */
+json vision_reply_json(bool anthropic, const std::string& model,
+                       const std::string& rid, const std::string& reply,
+                       bool hit_eos, std::uint32_t n_prompt,
+                       std::uint32_t n_out) {
+    if (anthropic) {
+        return {{"id", "msg_locus-vision-" + rid},
+                {"type", "message"},
+                {"role", "assistant"},
+                {"model", model},
+                {"content",
+                 json::array({{{"type", "text"}, {"text", reply}}})},
+                {"stop_reason", hit_eos ? "end_turn" : "max_tokens"},
+                {"stop_sequence", nullptr},
+                {"usage",
+                 {{"input_tokens", n_prompt},
+                  {"output_tokens", n_out},
+                  {"cache_read_input_tokens", 0},
+                  {"cache_creation_input_tokens", 0}}}};
+    }
+    return {{"id", "locus-vision-" + rid},
+            {"object", "chat.completion"},
+            {"model", model},
+            {"choices",
+             json::array({{{"index", 0},
+                           {"message",
+                            {{"role", "assistant"}, {"content", reply}}},
+                           {"finish_reason", hit_eos ? "stop" : "length"}}})},
+            {"usage",
+             {{"prompt_tokens", n_prompt},
+              {"completion_tokens", n_out},
+              {"total_tokens", n_prompt + n_out}}}};
+}
+
+/** Each API's own error envelope for an image chat. */
+void vision_fail(http::ServerResponse& res, bool anthropic, int status,
+                 const std::string& msg) {
+    res.status = status;
+    const char* type = status == 400
+                           ? "invalid_request_error"
+                           : (anthropic ? "api_error" : "server_error");
+    const json body =
+        anthropic ? json{{"type", "error"},
+                         {"error", {{"type", type}, {"message", msg}}}}
+                  : json{{"error", {{"message", msg}, {"type", type}}}};
+    res.set_content(body.dump(-1, ' ', false, kLossy), "application/json");
+}
+
+}  // namespace
+
+void OpenAiServer::qwen_vision_chat(bool anthropic, const VisionChat& chat,
+                                    http::ServerResponse& res,
+                                    const http::RequestContext& ctx) {
+    const auto alive = [&] { return !ctx.client_alive || ctx.client_alive(); };
+    try {
+        // The tower runs on the language model's backend, a CPU one
+        // (checked at startup: the M-RoPE forward is CPU-only).
+        const auto& op = model_.active_backend().ops;
+        std::lock_guard<std::mutex> lk(vision_mu_);
+        // Each image as the processor prepares it, then its merged grid
+        // for the prompt's pads.
+        image::DecodeLimits lim;
+        lim.max_bytes = opt_.max_body_bytes;
+        std::vector<image::QwenVlImage> images;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> grids;
+        const std::uint32_t mg = qwen_vision_->merge_size();
+        for (const auto& bytes : chat.images) {
+            images.push_back(image::qwen_vl_image(
+                *qwen_vision_, image::decode_image(bytes, lim)));
+            grids.emplace_back(images.back().gh / mg, images.back().gw / mg);
+        }
+        const auto p = image::qwen_vl_chat_ids(
+            tok_,
+            image::qwen_vl_chat_text(
+                chat.turns, chat.has_system
+                                ? std::optional<std::string>(chat.system)
+                                : std::nullopt),
+            grids);
+
+        if (!vision_cache_) {
+            vision_cache_ =
+                std::make_unique<kv::PagedKvCache>(model_.make_cache());
+            vision_ws_ = model_.make_workspace();
+        }
+        kv::PagedKvCache::Seq seq;
+        struct Release {
+            kv::PagedKvCache& c;
+            kv::PagedKvCache::Seq& s;
+            ~Release() { c.release(s); }
+        } release{*vision_cache_, seq};
+        const auto need =
+            static_cast<std::uint32_t>(p.ids.size() + chat.max_tokens);
+        if (!vision_cache_->ensure_capacity(seq, need)) {
+            throw std::invalid_argument(
+                "the prompt (" + std::to_string(p.ids.size()) +
+                " tokens with the images) plus max_tokens does not fit the "
+                "context");
+        }
+        requests_total_.fetch_add(1, std::memory_order_relaxed);
+        prompt_tokens_total_.fetch_add(p.ids.size(),
+                                       std::memory_order_relaxed);
+        std::vector<float> logits(n_vocab_);
+        if (!image::qwen_vl_prefill(model_, *qwen_vision_, p, images,
+                                    *vision_cache_, seq, vision_ws_, logits,
+                                    op, alive)) {
+            res.status = 499;
+            return;
+        }
+
+        // Decode to eos (or <|im_end|>, the template's turn end) or
+        // max_tokens; each token at the next M-RoPE position.
+        const auto im_end = tok_.encode("<|im_end|>", false);
+        std::mt19937_64 rng(chat.seed != 0 ? chat.seed
+                                           : std::random_device{}());
+        std::vector<tok::TokenId> history(p.ids.begin(), p.ids.end());
+        std::vector<tok::TokenId> out;
+        bool hit_eos = false;
+        for (std::uint32_t n = 0; n < chat.max_tokens; ++n) {
+            if (!alive()) {
+                res.status = 499;
+                return;
+            }
+            const tok::TokenId t =
+                model::sample(logits, chat.sampling, history, rng);
+            if (t == tok_.eos_id() ||
+                (im_end.size() == 1 && t == im_end[0])) {
+                hit_eos = true;
+                break;
+            }
+            out.push_back(t);
+            history.push_back(t);
+            if (n + 1 == chat.max_tokens) break;
+            image::qwen_vl_step(model_, t, p.next + n, *vision_cache_, seq,
+                                vision_ws_, logits);
+        }
+        const auto n_prompt = static_cast<std::uint32_t>(p.ids.size());
+        const auto n_out = static_cast<std::uint32_t>(out.size() + hit_eos);
+        completion_tokens_total_.fetch_add(n_out, std::memory_order_relaxed);
+        res.set_content(
+            vision_reply_json(
+                anthropic, opt_.model_name,
+                std::to_string(
+                    requests_total_.load(std::memory_order_relaxed)),
+                tok_.decode(out), hit_eos, n_prompt, n_out)
+                .dump(-1, ' ', false, kLossy),
+            "application/json");
+    } catch (const std::exception& e) {
+        vision_fail(res, anthropic, http_status_for(e), e.what());
+    }
+}
+
 void OpenAiServer::vision_chat(bool anthropic, const VisionChat& chat,
                                http::ServerResponse& res,
                                const http::RequestContext& ctx) {
-    // Each API's own error envelope.
+    if (qwen_vision_) {
+        qwen_vision_chat(anthropic, chat, res, ctx);
+        return;
+    }
     const auto fail = [&](int status, const std::string& msg) {
-        res.status = status;
-        const char* type = status == 400
-                               ? "invalid_request_error"
-                               : (anthropic ? "api_error" : "server_error");
-        const json body =
-            anthropic ? json{{"type", "error"},
-                             {"error", {{"type", type}, {"message", msg}}}}
-                      : json{{"error", {{"message", msg}, {"type", type}}}};
-        res.set_content(body.dump(-1, ' ', false, kLossy),
-                        "application/json");
+        vision_fail(res, anthropic, status, msg);
     };
     if (!vision_) {
         fail(400, "this model does not accept image input");
@@ -1626,41 +1814,14 @@ void OpenAiServer::vision_chat(bool anthropic, const VisionChat& chat,
         const auto n_prompt = static_cast<std::uint32_t>(ids.size());
         const auto n_out = static_cast<std::uint32_t>(out.size() + hit_eos);
         completion_tokens_total_.fetch_add(n_out, std::memory_order_relaxed);
-        const std::string reply = tok_.decode(out);
-        const std::string rid =
-            std::to_string(requests_total_.load(std::memory_order_relaxed));
-        json body;
-        if (anthropic) {
-            body = {{"id", "msg_locus-vision-" + rid},
-                    {"type", "message"},
-                    {"role", "assistant"},
-                    {"model", opt_.model_name},
-                    {"content", json::array({{{"type", "text"},
-                                              {"text", reply}}})},
-                    {"stop_reason", hit_eos ? "end_turn" : "max_tokens"},
-                    {"stop_sequence", nullptr},
-                    {"usage",
-                     {{"input_tokens", n_prompt},
-                      {"output_tokens", n_out},
-                      {"cache_read_input_tokens", 0},
-                      {"cache_creation_input_tokens", 0}}}};
-        } else {
-            body = {{"id", "locus-vision-" + rid},
-                    {"object", "chat.completion"},
-                    {"model", opt_.model_name},
-                    {"choices",
-                     json::array({{{"index", 0},
-                                   {"message",
-                                    {{"role", "assistant"},
-                                     {"content", reply}}},
-                                   {"finish_reason",
-                                    hit_eos ? "stop" : "length"}}})},
-                    {"usage",
-                     {{"prompt_tokens", n_prompt},
-                      {"completion_tokens", n_out},
-                      {"total_tokens", n_prompt + n_out}}}};
-        }
-        res.set_content(body.dump(-1, ' ', false, kLossy), "application/json");
+        res.set_content(
+            vision_reply_json(
+                anthropic, opt_.model_name,
+                std::to_string(
+                    requests_total_.load(std::memory_order_relaxed)),
+                tok_.decode(out), hit_eos, n_prompt, n_out)
+                .dump(-1, ' ', false, kLossy),
+            "application/json");
     } catch (const std::exception& e) {
         fail(http_status_for(e), e.what());
     }
@@ -1893,7 +2054,7 @@ void OpenAiServer::install_routes() {
                                 {"owned_by", "locus"}});
             }
             json kinds = json::array({"text"});
-            if (vision_) kinds.push_back("image-to-text");
+            if (vision_ || qwen_vision_) kinds.push_back("image-to-text");
             // Generations and edits apart (i#633): FLUX.1 Kontext serves
             // both, other FLUX.1 checkpoints generate (i#648),
             // Qwen-Image-Edit edits only, Janus and PixArt generate only.
@@ -2186,7 +2347,8 @@ void OpenAiServer::install_routes() {
                         "messages must be a non-empty array");
                 }
                 vision = parse_vision_chat(body, false, opt_.max_tokens_cap,
-                                           opt_.max_body_bytes);
+                                           opt_.max_body_bytes,
+                                           qwen_vision_ ? "" : "\n");
             }
             if (chat && !vision) {
                 bool tool_history = false;
@@ -2523,7 +2685,8 @@ void OpenAiServer::install_routes() {
                     "messages must be a non-empty array");
             }
             vision = parse_vision_chat(body, true, opt_.max_tokens_cap,
-                                       opt_.max_body_bytes);
+                                       opt_.max_body_bytes,
+                                       qwen_vision_ ? "" : "\n");
             if (!vision) {
                 constraint =
                     output_constraint(output_grammar(body, req.body));
