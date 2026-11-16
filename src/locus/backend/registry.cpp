@@ -38,7 +38,8 @@ const std::vector<Backend>& list() {
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_neon,
                       .matvec_q8k_batch = &matvec_batch_neon_q8k,
-                      .prefers_q8k = true}});
+                      .prefers_q8k = true,
+                      .cpu = true}});
 #if defined(LOCUS_HAS_NEON_DOTPROD_VARIANT)
         // The same kernels built with sdot, on a CPU that has it
         // (bit-identical results, faster 8-bit dots).
@@ -66,7 +67,8 @@ const std::vector<Backend>& list() {
                      f.avx2, true,
                      {.matvec = &matvec_avx2,
                       .matvec_q8k = &matvec_q8k,  // scalar (no AVX2 Q8K)
-                      .dequant_row = &dequant_row}});
+                      .dequant_row = &dequant_row,
+                      .cpu = true}});
         b.push_back({"sse4",
                      "x86-64 SSE4.1 vectorized matvec (F32/BF16/Q8_0/"
                      "Q4_K/Q6_K), 8-bit activation dots (K-quants), "
@@ -78,7 +80,8 @@ const std::vector<Backend>& list() {
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_sse4,
                       .matvec_q8k_batch = &matvec_batch_sse4_q8k,
-                      .prefers_q8k = true}});
+                      .prefers_q8k = true,
+                      .cpu = true}});
 #if defined(LOCUS_HAS_SSE4_AVX_VARIANT)
         // The same kernels built with AVX, on a CPU that has it
         // (bit-identical results; VEX encoding and 256-bit float sums).
@@ -101,7 +104,8 @@ const std::vector<Backend>& list() {
                       .matvec_q8k = &matvec_q8k,
                       .dequant_row = &dequant_row,
                       .matvec_batch = &matvec_batch_scalar,
-                      .prefers_q8k = true}});
+                      .prefers_q8k = true,
+                      .cpu = true}});
         const bool vk = f.vulkan && vulkan_backend_usable();
         b.push_back({"vulkan",
                      "GPU forward pass via Vulkan: paged/MLA "

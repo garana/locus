@@ -49,6 +49,7 @@
 #include "locus/model/sampling.hpp"
 #include "locus/server/errors.hpp"
 #include "locus/server/metrics_text.hpp"
+#include "locus/server/request_checks.hpp"
 #include "locus/server/responses.hpp"
 #include "locus/server/image_lora.hpp"
 #include "locus/server/tools.hpp"
@@ -66,57 +67,6 @@ using nlohmann::json;
  * parse error quoting the request, text cut mid-character) becomes
  * U+FFFD instead of throwing type_error.316 out of a handler (i#243). */
 constexpr auto kLossy = json::error_handler_t::replace;
-
-/**
- * An SSE stream's keepalive (i#619): a stream that has written nothing
- * for `every` gets an SSE comment, which clients ignore, so a long
- * prefill or a buffered tool reply does not look like a dead
- * connection.
- */
-struct SseKeepalive {
-    std::chrono::milliseconds every;
-    std::chrono::steady_clock::time_point last =
-        std::chrono::steady_clock::now();
-
-    /** Fills an empty payload with ": keepalive" when one is due, and
-     *  notes the time of any payload about to be written. */
-    void pad(std::string& payload) {
-        const auto now = std::chrono::steady_clock::now();
-        if (payload.empty() && every.count() > 0 && now - last >= every) {
-            payload = ": keepalive\n\n";
-        }
-        if (!payload.empty()) {
-            last = now;
-        }
-    }
-};
-
-/**
- * Writes one step of a generation's SSE stream: payload, or a keepalive
- * when one is due. When the client has gone, cancels the generation and
- * drops its record (both no-ops if the terminal path already released
- * it).
- *
- * @param terminal Whether this is the stream's last step; the sink is
- *     then closed.
- * @returns false when the stream is over: the client went away, or
- *     terminal.
- */
-bool write_sse_step(http::Sink& sink, SseKeepalive& ka, std::string& payload,
-                    EngineGroup& loop, std::uint64_t id, bool terminal) {
-    ka.pad(payload);
-    if (!payload.empty() &&
-        !sink.write(std::string_view(payload.data(), payload.size()))) {
-        loop.cancel(id);
-        loop.release(id);
-        return false;
-    }
-    if (terminal) {
-        sink.done();
-        return false;
-    }
-    return true;
-}
 
 /** The GPU ops for the embedding and rerank models' large passes
  *  (EmbeddingModel::kGpuMacs): the Vulkan image ops where the GPU
@@ -991,13 +941,7 @@ std::uint32_t read_max_tokens(const json& body, std::uint32_t cap,
                               std::uint32_t dflt) {
     for (const char* key : {"max_completion_tokens", "max_tokens"}) {
         if (!body.contains(key) || body[key].is_null()) continue;
-        const auto& v = body[key];
-        if (!v.is_number_unsigned() || v.get<std::uint64_t>() == 0) {
-            throw std::invalid_argument(std::string(key) +
-                                        " must be a positive integer");
-        }
-        return static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(v.get<std::uint64_t>(), cap));
+        return read_count(body, key, cap, dflt);
     }
     return dflt;
 }
@@ -1656,10 +1600,23 @@ std::unique_ptr<model::TokenConstraint> OpenAiServer::output_constraint(
         std::move(g.g), token_trie(), tok_.eos_id(), g.json);
 }
 
-OpenAiServer::~OpenAiServer() {
-    if (http_) {
-        http_->stop();
+OpenAiServer::~OpenAiServer() { stop(); }
+
+void OpenAiServer::answer(std::uint64_t id, GenReply gr,
+                          http::ServerResponse& res,
+                          const http::RequestContext& ctx) {
+    if (pump_ && ctx.defer) {
+        http::Response head;
+        head.status = res.status;
+        head.headers = res.headers;
+        if (gr.stream) {
+            head.set_header("Content-Type", "text/event-stream");
+        }
+        pump_->add(id, std::move(gr), ctx.defer(), std::move(head));
+        return;
     }
+    serve_generation(loop_, id, std::move(gr), res, ctx,
+                     std::chrono::milliseconds(opt_.sse_keepalive_ms));
 }
 
 OpenAiServer::Route OpenAiServer::route_of(const std::string& method,
@@ -1744,6 +1701,10 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
     // declared body on the head, before the body is read.
     cfg.limits.max_body_bytes = opt_.max_body_bytes;
     cfg.max_conns_per_ip = opt_.max_conns_per_ip;
+    cfg.worker_threads = opt_.http_threads;
+    cfg.keepalive_idle_s = opt_.keepalive_idle_s;
+    cfg.keepalive_intvl_s = opt_.keepalive_intvl_s;
+    cfg.keepalive_count = opt_.keepalive_count;
     // Serve the cheap monitoring routes on the acceptor's fast path so
     // they answer even when every worker is busy in a generation.
     // serve_connection still runs the head stage, so auth on /metrics
@@ -1768,6 +1729,8 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
             "/v1/images/generations", "/v1/images/edits"});
     cfg.metrics = http_metrics_;
     if (opt_.event_loop) {
+        pump_ = std::make_unique<GenPump>(
+            loop_, std::chrono::milliseconds(opt_.sse_keepalive_ms));
         http_ = std::make_unique<http::LoopServer>(std::move(cfg),
                                                    route_handler_, auth_head_);
     } else {
@@ -1798,6 +1761,13 @@ bool OpenAiServer::listen_after_bind() {
 }
 
 void OpenAiServer::stop() {
+    // The pump first: it writes to the HTTP server's replies, whose wake
+    // pipe the server closes as it stops, so it must be done writing by
+    // then. Its generations are cancelled and released unanswered; a job
+    // that defers after this is dropped the same way (GenPump::add).
+    if (pump_) {
+        pump_->stop();
+    }
     if (http_) {
         http_->stop();
     }
@@ -2196,13 +2166,15 @@ void OpenAiServer::install_routes() {
         const std::string rid =
             "locus-" + std::to_string(id);
 
-        if (!stream) {
-            // Stop decoding if the client disconnects before we finish,
-            // instead of running the abandoned request to max_tokens.
-            auto v = loop_.wait_done_or_cancel(id, ctx.client_alive);
-            // v is a full snapshot copy; drop the engine record now
-            // (evict-on-consume) -- nothing below touches the id.
-            loop_.release(id);
+        // The answer as steps over the request's snapshot (i#932): on the
+        // job thread, or driven by the engine's progress on the event loop.
+        GenReply gr;
+        gr.stream = stream;
+        // Buffered: the driver waits for the end, cancelling when the
+        // client disconnects (not running the abandoned request to
+        // max_tokens), and releases the request first.
+        gr.finish = [this, id, chat, rid, object, n_prompt, lp, tools](
+                        const EngineLoop::View& v, http::ServerResponse& res) {
             if (v.status == engine::Status::kCancelled) {
                 // Client disconnected before the response. Emit a
                 // diagnosable 499 rather than the default 200/empty: a
@@ -2318,8 +2290,7 @@ void OpenAiServer::install_routes() {
                           v.reused_prefix_tokens}}}}}};
             res.set_content(out.dump(-1, ' ', false, kLossy),
                             "application/json");
-            return;
-        }
+        };
 
         // SSE streaming: one chunk per token, then [DONE]. When
         // tools are supplied (chat only) locus cannot recognize a
@@ -2332,17 +2303,9 @@ void OpenAiServer::install_routes() {
         auto tools_sp =
             std::make_shared<std::vector<ToolSpec>>(std::move(tools));
         const bool buffer_tools = chat && !tools_sp->empty();
-        res.set_chunked_content_provider(
-            "text/event-stream",
+        gr.step =
             [this, id, chat, rid, sse_object, state, tools_sp,
-             buffer_tools](http::Sink& sink) {
-              // The server calls a provider ONCE; loop until terminal,
-              // one chunk per progress step.
-              SseKeepalive ka{
-                  std::chrono::milliseconds(opt_.sse_keepalive_ms)};
-              for (;;) {
-                auto v = loop_.wait_progress(id, *state, ka.every);
-                std::string payload;
+             buffer_tools](const EngineLoop::View& v, std::string& payload) {
                 if (!buffer_tools) {
                     for (std::size_t i = *state;
                          i < v.generated.size(); ++i) {
@@ -2440,16 +2403,10 @@ void OpenAiServer::install_routes() {
                                    "\n\n";
                     }
                     payload += "data: [DONE]\n\n";
-                    // Stream fully built from the snapshot v; drop the
-                    // engine record (the provider won't run again).
-                    loop_.release(id);
                 }
-                if (!write_sse_step(sink, ka, payload, loop_, id,
-                                    terminal)) {
-                    return;
-                }
-              }
-            });
+                return terminal;
+            };
+        answer(id, std::move(gr), res, ctx);
     };
 
     // Anthropic Messages API (POST /v1/messages): same engine, its
@@ -2492,18 +2449,8 @@ void OpenAiServer::install_routes() {
                                      (tool_history ? kToolResultNote : "")});
                 }
                 prompt = opt_.chat_template.apply(msgs);
-                if (body.contains("max_tokens")) {
-                    const auto v = body["max_tokens"];
-                    if (!v.is_number_unsigned() ||
-                        v.get<std::uint64_t>() == 0) {
-                        throw std::invalid_argument(
-                            "max_tokens must be a positive integer");
-                    }
-                    max_tokens = static_cast<std::uint32_t>(
-                        std::min<std::uint64_t>(
-                            v.get<std::uint64_t>(),
-                            opt_.max_tokens_cap));
-                }
+                max_tokens = read_count(body, "max_tokens",
+                                        opt_.max_tokens_cap, max_tokens);
                 stream = body.value("stream", false);
                 std::tie(sampling, seed) = parse_sampling(body);
                 ids = tok_.encode(prompt, true);
@@ -2547,10 +2494,12 @@ void OpenAiServer::install_routes() {
                          std::move(constraint));
         const std::string rid = "msg_locus-" + std::to_string(id);
 
-        if (!stream) {
-            // Stop decoding if the client disconnects before we finish.
-            auto v = loop_.wait_done_or_cancel(id, ctx.client_alive);
-            loop_.release(id);  // consumed: drop the engine record
+        // As the completions path (i#932): the driver waits for the end
+        // (cancelling when the client disconnects) and releases first.
+        GenReply gr;
+        gr.stream = stream;
+        gr.finish = [this, id, rid, input_tokens, tools](
+                        const EngineLoop::View& v, http::ServerResponse& res) {
             if (v.status == engine::Status::kCancelled) {
                 // Client disconnected before the response (see the
                 // completions path and client_alive): 499 + the
@@ -2619,8 +2568,7 @@ void OpenAiServer::install_routes() {
                 v.generated.size(), std::memory_order_relaxed);
             res.set_content(out.dump(-1, ' ', false, kLossy),
                             "application/json");
-            return;
-        }
+        };
 
         // Anthropic SSE: message_start -> content_block_start ->
         // content_block_delta* -> content_block_stop ->
@@ -2636,15 +2584,9 @@ void OpenAiServer::install_routes() {
         // defer the content_block_start until we know whether it is a
         // text or tool_use block (Anthropic streaming shape).
         const bool buffer_tools = !tools_sp->empty();
-        res.set_chunked_content_provider(
-            "text/event-stream",
+        gr.step =
             [this, id, rid, input_tokens, st, tools_sp, buffer_tools](
-                http::Sink& sink) {
-              // Call-once provider: loop until terminal (see completions).
-              SseKeepalive ka{
-                  std::chrono::milliseconds(opt_.sse_keepalive_ms)};
-              for (;;) {
-                std::string payload;
+                const EngineLoop::View& v, std::string& payload) {
                 if (!st->started) {
                     json start{
                         {"type", "message_start"},
@@ -2674,7 +2616,6 @@ void OpenAiServer::install_routes() {
                     }
                     st->started = true;
                 }
-                auto v = loop_.wait_progress(id, st->emitted, ka.every);
                 if (!buffer_tools) {
                     for (std::size_t i = st->emitted;
                          i < v.generated.size(); ++i) {
@@ -2792,15 +2733,10 @@ void OpenAiServer::install_routes() {
                                "\n\n";
                     completion_tokens_total_.fetch_add(
                         st->emitted, std::memory_order_relaxed);
-                    // Stream fully built from v; drop the record.
-                    loop_.release(id);
                 }
-                if (!write_sse_step(sink, ka, payload, loop_, id,
-                                    terminal)) {
-                    return;
-                }
-              }
-            });
+                return terminal;
+            };
+        answer(id, std::move(gr), res, ctx);
     };
 
     // OpenAI embeddings, L2-normalized. `input` is a string or an array
@@ -3182,16 +3118,9 @@ void OpenAiServer::install_routes() {
                         "need temperature >= 0, 0 < top_p <= 1, "
                         "repetition_penalty > 0");
                 }
-                std::uint32_t cap = opt_.audio_max_tokens;
-                if (body.contains("max_tokens")) {
-                    if (!body["max_tokens"].is_number_unsigned() ||
-                        body["max_tokens"].get<std::uint64_t>() == 0) {
-                        throw std::invalid_argument(
-                            "max_tokens must be a positive integer");
-                    }
-                    cap = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                        cap, body["max_tokens"].get<std::uint64_t>()));
-                }
+                const std::uint32_t cap =
+                    read_count(body, "max_tokens", opt_.audio_max_tokens,
+                               opt_.audio_max_tokens);
                 const std::uint64_t seed = read_seed(body);
                 bool stream = false;
                 if (body.contains("stream")) {
@@ -3420,37 +3349,20 @@ void OpenAiServer::install_routes() {
                                 const http::RequestContext& ctx) {
             try {
                 const json body = http::parse_json(req.body);
-                auto str = [&](const char* k) -> std::string {
-                    if (!body.contains(k)) return {};
-                    if (!body[k].is_string()) {
-                        throw std::invalid_argument(std::string(k) +
-                                                    " must be a string");
-                    }
-                    return body[k].get<std::string>();
+                const auto str = [&](const char* k) {
+                    return body_string(body, k);
                 };
                 image::PixArtPipeline::Request p;
-                p.prompt = str("prompt");
-                if (p.prompt.empty()) {
-                    throw std::invalid_argument(
-                        "prompt must be a non-empty string");
-                }
+                p.prompt = require_prompt(body);
                 p.negative_prompt = str("negative_prompt");
-                if (body.contains("n") &&
-                    (!body["n"].is_number_integer() ||
-                     body["n"].get<std::int64_t>() != 1)) {
-                    throw std::invalid_argument("n must be 1");
-                }
+                require_one_image(body);
                 const std::uint32_t side = pixart_->image_size();
                 const std::string size =
                     std::to_string(side) + "x" + std::to_string(side);
                 if (body.contains("size") && str("size") != size) {
                     throw std::invalid_argument("size must be " + size);
                 }
-                if (body.contains("response_format") &&
-                    str("response_format") != "b64_json") {
-                    throw std::invalid_argument(
-                        "response_format must be b64_json");
-                }
+                require_b64_json(body);
                 if (body.contains("steps")) {
                     if (!body["steps"].is_number_integer() ||
                         body["steps"].get<std::int64_t>() < 1 ||
@@ -3531,13 +3443,8 @@ void OpenAiServer::install_routes() {
                               const http::RequestContext& ctx, bool edit) {
             try {
                 const json body = http::parse_json(req.body);
-                auto str = [&](const char* k) -> std::string {
-                    if (!body.contains(k)) return {};
-                    if (!body[k].is_string()) {
-                        throw std::invalid_argument(std::string(k) +
-                                                    " must be a string");
-                    }
-                    return body[k].get<std::string>();
+                const auto str = [&](const char* k) {
+                    return body_string(body, k);
                 };
                 auto integer = [&](const char* k, std::int64_t lo,
                                    std::int64_t hi) {
@@ -3551,14 +3458,8 @@ void OpenAiServer::install_routes() {
                     return body[k].get<std::int64_t>();
                 };
                 image::FluxPipeline::Request p;
-                p.prompt = str("prompt");
-                if (p.prompt.empty()) {
-                    throw std::invalid_argument(
-                        "prompt must be a non-empty string");
-                }
-                if (body.contains("n") && integer("n", 1, 1) != 1) {
-                    throw std::invalid_argument("n must be 1");
-                }
+                p.prompt = require_prompt(body);
+                require_one_image(body);
                 if (edit) {
                     if (!body.contains("image") || !body["image"].is_string()) {
                         throw std::invalid_argument(
@@ -3587,11 +3488,7 @@ void OpenAiServer::install_routes() {
                     std::tie(p.width, p.height) =
                         parse_size_wxh(str("size"));
                 }
-                if (body.contains("response_format") &&
-                    str("response_format") != "b64_json") {
-                    throw std::invalid_argument(
-                        "response_format must be b64_json");
-                }
+                require_b64_json(body);
                 if (body.contains("steps")) {
                     p.steps =
                         static_cast<std::uint32_t>(integer("steps", 1, 100));
@@ -3722,18 +3619,8 @@ void OpenAiServer::install_routes() {
             }
             try {
                 const json body = http::parse_json(req.body);
-                if (!body.contains("prompt") ||
-                    !body["prompt"].is_string() ||
-                    body["prompt"].get<std::string>().empty()) {
-                    throw std::invalid_argument(
-                        "prompt must be a non-empty string");
-                }
-                const auto prompt = body["prompt"].get<std::string>();
-                if (body.contains("n") &&
-                    (!body["n"].is_number_integer() ||
-                     body["n"].get<std::int64_t>() != 1)) {
-                    throw std::invalid_argument("n must be 1");
-                }
+                const auto prompt = require_prompt(body);
+                require_one_image(body);
                 // The model makes one fixed size: grid codes per side,
                 // upscale() pixels per code (24 * 16 = 384).
                 const std::uint32_t side = janus_->grid() * vq16_->upscale();
@@ -3744,13 +3631,7 @@ void OpenAiServer::install_routes() {
                      body["size"].get<std::string>() != size)) {
                     throw std::invalid_argument("size must be " + size);
                 }
-                if (body.contains("response_format") &&
-                    (!body["response_format"].is_string() ||
-                     body["response_format"].get<std::string>() !=
-                         "b64_json")) {
-                    throw std::invalid_argument(
-                        "response_format must be b64_json");
-                }
+                require_b64_json(body);
                 // Guidance and sampling; the defaults are the
                 // reference's (CFG 5, temperature 1). temperature 0
                 // picks the argmax code at each step.
@@ -3885,9 +3766,12 @@ void OpenAiServer::install_routes() {
                                                std::memory_order_relaxed);
         };
 
-        if (!rq_sp->stream) {
-            auto v = loop_.wait_done_or_cancel(id, ctx.client_alive);
-            loop_.release(id);
+        // As the completions path (i#932): the driver waits for the end
+        // (cancelling when the client disconnects) and releases first.
+        GenReply gr;
+        gr.stream = rq_sp->stream;
+        gr.finish = [r, rq_sp, settle](const EngineLoop::View& v,
+                                       http::ServerResponse& res) {
             if (v.status == engine::Status::kCancelled) {
                 res.status = 499;
                 res.set_content(
@@ -3912,61 +3796,56 @@ void OpenAiServer::install_routes() {
                                  r->incomplete ? "incomplete" : "completed")
                     .dump(-1, ' ', false, kLossy),
                 "application/json");
-            return;
-        }
+        };
 
-        res.set_chunked_content_provider(
-            "text/event-stream",
-            [this, id, r, rq_sp, settle](http::Sink& sink) {
-                ResponsesSse sse;
-                std::size_t seen = 0;
-                bool opened = false;
-                const bool live = rq_sp->tools.empty();
-                std::string payload = sse.start(*r);
-                SseKeepalive ka{
-                    std::chrono::milliseconds(opt_.sse_keepalive_ms)};
-                for (;;) {
-                    auto v = loop_.wait_progress(id, seen, ka.every);
-                    if (live) {
-                        for (std::size_t i = seen; i < v.generated.size();
-                             ++i) {
-                            const tok::TokenId t = v.generated[i];
-                            if (t == tok_.eos_id()) continue;
-                            if (!opened) {
-                                payload += sse.message_open(*r);
-                                opened = true;
-                            }
-                            payload += sse.text_delta(*r, tok_.decode({&t, 1}));
-                        }
+        struct St {
+            ResponsesSse sse;
+            std::size_t seen = 0;
+            bool begun = false;
+            bool opened = false;
+        };
+        auto st = std::make_shared<St>();
+        gr.step = [this, r, rq_sp, settle, st](const EngineLoop::View& v,
+                                               std::string& payload) {
+            const bool live = rq_sp->tools.empty();
+            if (!st->begun) {
+                payload += st->sse.start(*r);
+                st->begun = true;
+            }
+            if (live) {
+                for (std::size_t i = st->seen; i < v.generated.size(); ++i) {
+                    const tok::TokenId t = v.generated[i];
+                    if (t == tok_.eos_id()) continue;
+                    if (!st->opened) {
+                        payload += st->sse.message_open(*r);
+                        st->opened = true;
                     }
-                    seen = v.generated.size();
-                    const bool terminal = v.status == engine::Status::kDone ||
-                                          v.status == engine::Status::kFailed;
-                    if (terminal) {
-                        if (v.status == engine::Status::kFailed) {
-                            payload += sse.event(
-                                {{"type", "response.failed"},
-                                 {"response",
-                                  [&] {
-                                      json o = responses_object(
-                                          *r, json::array(), "failed");
-                                      o["error"] = {{"code", "server_error"},
-                                                    {"message", v.error}};
-                                      return o;
-                                  }()}});
-                        } else {
-                            settle(v);
-                            payload += sse.finish(*r, *rq_sp, opened);
-                        }
-                        loop_.release(id);
-                    }
-                    if (!write_sse_step(sink, ka, payload, loop_, id,
-                                        terminal)) {
-                        return;
-                    }
-                    payload.clear();
+                    payload += st->sse.text_delta(*r, tok_.decode({&t, 1}));
                 }
-            });
+            }
+            st->seen = v.generated.size();
+            const bool terminal = v.status == engine::Status::kDone ||
+                                  v.status == engine::Status::kFailed;
+            if (terminal) {
+                if (v.status == engine::Status::kFailed) {
+                    payload += st->sse.event(
+                        {{"type", "response.failed"},
+                         {"response",
+                          [&] {
+                              json o = responses_object(*r, json::array(),
+                                                        "failed");
+                              o["error"] = {{"code", "server_error"},
+                                            {"message", v.error}};
+                              return o;
+                          }()}});
+                } else {
+                    settle(v);
+                    payload += st->sse.finish(*r, *rq_sp, st->opened);
+                }
+            }
+            return terminal;
+        };
+        answer(id, std::move(gr), res, ctx);
     };
 
     // POST /v1/images/edits with Qwen-Image-Edit (i#616): image (a
@@ -3984,32 +3863,16 @@ void OpenAiServer::install_routes() {
                                    const http::RequestContext& ctx) {
         try {
             const json body = http::parse_json(req.body);
-            auto str = [&](const char* k) -> std::string {
-                if (!body[k].is_string()) {
-                    throw std::invalid_argument(std::string(k) +
-                                                " must be a string");
-                }
-                return body[k].get<std::string>();
+            const auto str = [&](const char* k) {
+                return body_string(body, k);
             };
             image::QwenEditPipeline::Request p;
-            if (body.contains("prompt")) p.prompt = str("prompt");
-            if (p.prompt.empty()) {
-                throw std::invalid_argument(
-                    "prompt must be a non-empty string");
-            }
-            if (body.contains("negative_prompt")) {
-                p.negative_prompt = str("negative_prompt");
-            }
-            if (body.contains("n") &&
-                (!body["n"].is_number_integer() ||
-                 body["n"].get<std::int64_t>() != 1)) {
-                throw std::invalid_argument("n must be 1");
-            }
-            if (body.contains("response_format") &&
-                str("response_format") != "b64_json") {
-                throw std::invalid_argument(
-                    "response_format must be b64_json");
-            }
+            p.prompt = require_prompt(body);
+            // An optional: set, it runs true CFG (true_cfg_scale over 1),
+            // so an absent field must leave it empty.
+            p.negative_prompt = body_optional_string(body, "negative_prompt");
+            require_one_image(body);
+            require_b64_json(body);
             if (!body.contains("image")) {
                 throw std::invalid_argument(
                     "image must be a base64 PNG or JPEG, or a data: URL of "
@@ -4188,12 +4051,7 @@ void OpenAiServer::install_routes() {
                 throw std::invalid_argument("the body must be a JSON object");
             }
             image::LtxvPipeline::Request p;
-            if (!body.contains("prompt") || !body["prompt"].is_string() ||
-                body["prompt"].get<std::string>().empty()) {
-                throw std::invalid_argument(
-                    "prompt must be a non-empty string");
-            }
-            p.prompt = body["prompt"].get<std::string>();
+            p.prompt = require_prompt(body);
             std::string size = "512x320";
             if (body.contains("size")) {
                 if (!body["size"].is_string()) {

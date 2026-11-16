@@ -8,14 +8,14 @@
 
 #include "locus/image/dense.hpp"
 #include "locus/image/pixart_dit.hpp"
+#include "locus/image/tensor_read.hpp"
 
 namespace locus::image {
 
 namespace {
 
 using dense::parallel;
-
-float silu(float v) { return v / (1.0f + std::exp(-v)); }
+using dense::silu;
 
 /**
  * The reference's PixelNorm (eps 1e-8) over the channels of x
@@ -194,10 +194,7 @@ LtxvVae LtxvVae::load(const gguf::GgufFile& g) {
     }
 
     const auto info = [&](const std::string& name) {
-        const gguf::TensorInfo* ti = g.find_tensor(name);
-        if (ti == nullptr) {
-            throw gguf::Error("ltxv_vae: missing tensor " + name);
-        }
+        const gguf::TensorInfo* ti = require_tensor(g, "ltxv_vae", name);
         if (ti->type != gguf::TensorType::kF32) {
             throw gguf::Error("ltxv_vae: " + name + " is not F32");
         }

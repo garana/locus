@@ -28,7 +28,8 @@ void linear(const backend::Ops& op, const backend::Mat& w,
  *
  * Each head's keys are copied to a [nk][hd] matrix and its values to
  * [hd][nk], so the scores and the weighted sum run through the
- * backend's batched matvec, 64 queries at a time.
+ * backend's batched matvec, 64 queries at a time. Under
+ * LOCUS_CPU_FAST the softmax is softmax_fast_inplace.
  */
 void attention(const backend::Ops& op, std::span<const float> q,
                std::uint32_t nq, std::span<const float> k,
@@ -54,6 +55,12 @@ void ln_modulate(std::span<const float> x, std::uint32_t n, std::uint32_t d,
 /** Exact GELU (torch.nn.GELU(), approximate="none"), in place. */
 void gelu(std::span<float> x);
 
+/** LayerNorm with weight g and bias b over each of n rows of width w,
+ *  into out (which may alias x); the moments in double. */
+void layer_norm(std::span<const float> x, std::uint32_t n, std::uint32_t w,
+                std::span<const float> g, std::span<const float> b, float eps,
+                std::span<float> out);
+
 /** RMSNorm with weight w over each of n rows of width d; out may be x. */
 void rms_norm(std::span<const float> x, std::span<const float> w, float eps,
               std::uint32_t n, std::uint32_t d, std::span<float> out);
@@ -76,6 +83,11 @@ void gated_add(std::span<float> x, std::span<const float> add,
 inline float gelu_tanh(float v) {
     constexpr float kC = 0.79788456080286535588f;  // sqrt(2 / pi)
     return 0.5f * v * (1.0f + std::tanh(kC * (v + 0.044715f * v * v * v)));
+}
+
+/** gelu_tanh on each value of x, in place. */
+inline void gelu_tanh(std::span<float> x) {
+    for (float& v : x) v = gelu_tanh(v);
 }
 
 /** v * sigmoid(v). */

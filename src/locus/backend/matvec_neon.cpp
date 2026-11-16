@@ -765,6 +765,31 @@ inline uint8x16_t grid16(std::uint32_t a, std::uint32_t b, std::uint32_t c,
  * the same bits, the scalar kernel's.
  */
 
+/**
+ * Adds to sumf[t], for each of T tokens, dw times the token's block
+ * scale times the int dot of a decoded IQ3 block (w: 16 x 16 signed
+ * grid values, ls: the 8 sub-block scales) with the token's Q8_K block
+ * i (i#1025: the IQ3_XXS and IQ3_S kernels' one token loop).
+ */
+template <int T>
+void iq3_block_dot_xt(const int8x16_t w[16], const std::int32_t ls[8],
+                      float dw, std::size_t i, const float* yd,
+                      std::size_t ds, const std::int8_t* yq, std::size_t qs,
+                      float sumf[T]) {
+    for (int t = 0; t < T; ++t) {
+        const float d = dw * yd[t * ds + i];
+        const std::int8_t* q8 = yq + t * qs + i * 256;
+        std::int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            const int32x4_t acc = vaddq_s32(
+                dot16(w[2 * ib32], vld1q_s8(q8 + 32 * ib32)),
+                dot16(w[2 * ib32 + 1], vld1q_s8(q8 + 32 * ib32 + 16)));
+            bsum += vaddvq_s32(acc) * ls[ib32];
+        }
+        sumf[t] += d * static_cast<float>(bsum);
+    }
+}
+
 /** As vec_dot_iq3_xxs_q8_k (98-byte blocks). */
 template <int T>
 void rows_iq3_xxs_xt(const std::byte* row, std::size_t nb, const float* yd,
@@ -792,18 +817,7 @@ void rows_iq3_xxs_xt(const std::byte* row, std::size_t nb, const float* yd,
             }
             ls[ib32] = static_cast<std::int32_t>(2 * (aux32 >> 28) + 1);
         }
-        for (int t = 0; t < T; ++t) {
-            const float d = dw * yd[t * ds + i];
-            const std::int8_t* q8 = yq + t * qs + i * 256;
-            std::int32_t bsum = 0;
-            for (int ib32 = 0; ib32 < 8; ++ib32) {
-                const int32x4_t acc = vaddq_s32(
-                    dot16(w[2 * ib32], vld1q_s8(q8 + 32 * ib32)),
-                    dot16(w[2 * ib32 + 1], vld1q_s8(q8 + 32 * ib32 + 16)));
-                bsum += vaddvq_s32(acc) * ls[ib32];
-            }
-            sumf[t] += d * static_cast<float>(bsum);
-        }
+        iq3_block_dot_xt<T>(w, ls, dw, i, yd, ds, yq, qs, sumf);
     }
     for (int t = 0; t < T; ++t) {
         out[t] = 0.25f * sumf[t];
@@ -844,18 +858,7 @@ void rows_iq3_s_xt(const std::byte* row, std::size_t nb, const float* yd,
             ls[ib32] = static_cast<std::int32_t>(
                 2 * (ib32 % 2 == 0 ? sc & 0xf : sc >> 4) + 1);
         }
-        for (int t = 0; t < T; ++t) {
-            const float d = dw * yd[t * ds + i];
-            const std::int8_t* q8 = yq + t * qs + i * 256;
-            std::int32_t bsum = 0;
-            for (int ib32 = 0; ib32 < 8; ++ib32) {
-                const int32x4_t acc = vaddq_s32(
-                    dot16(w[2 * ib32], vld1q_s8(q8 + 32 * ib32)),
-                    dot16(w[2 * ib32 + 1], vld1q_s8(q8 + 32 * ib32 + 16)));
-                bsum += vaddvq_s32(acc) * ls[ib32];
-            }
-            sumf[t] += d * static_cast<float>(bsum);
-        }
+        iq3_block_dot_xt<T>(w, ls, dw, i, yd, ds, yq, qs, sumf);
     }
     for (int t = 0; t < T; ++t) {
         out[t] = sumf[t];
@@ -1923,6 +1926,36 @@ static std::uint32_t q8_token_tile(std::size_t cols) {
         std::clamp<std::size_t>((std::size_t{64} << 10) / cols, 4, 64));
 }
 
+/** Thread-local Q8_K activations of a batch (quantize_batch_q8k). */
+struct Q8kBatch {
+    std::vector<float>& yd;         ///< token t's scales at t * nb
+    std::vector<std::int8_t>& yq;   ///< token t's quants at t * cols
+    std::vector<std::int16_t>& ys;  ///< token t's sums at t * nb * 16
+};
+
+/**
+ * Quantizes each of the n tokens of x_batch (cols floats each, a
+ * multiple of 256) to Q8_K, as quantize_activation_q8k_neon does one
+ * token (i#1025: matvec_batch_neon_q8k's three paths). The buffers are
+ * this thread's, reused by the next call.
+ */
+static Q8kBatch quantize_batch_q8k(std::span<const float> x_batch,
+                                   std::size_t cols, std::uint32_t n) {
+    const std::size_t nb = cols / 256;
+    thread_local std::vector<float> yd;
+    thread_local std::vector<std::int8_t> yq;
+    thread_local std::vector<std::int16_t> ys;
+    yd.resize(nb * n);
+    yq.resize(cols * n);
+    ys.resize(nb * 16 * n);
+    for (std::uint32_t t = 0; t < n; ++t) {
+        quantize_activation_q8k_neon(x_batch.subspan(t * cols, cols),
+                                     yd.data() + t * nb, yq.data() + t * cols,
+                                     ys.data() + t * nb * 16);
+    }
+    return {yd, yq, ys};
+}
+
 void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
                            std::span<float> out_batch, std::uint32_t n) {
     const std::size_t cols = w.cols;
@@ -1935,18 +1968,7 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
         // unpack, then the tail one by one; each token takes the
         // single-token steps, so the scalar bits.
         const std::size_t nb = cols / 256;
-        thread_local std::vector<float> yd;
-        thread_local std::vector<std::int8_t> yq;
-        thread_local std::vector<std::int16_t> ys;
-        yd.resize(nb * n);
-        yq.resize(cols * n);
-        ys.resize(nb * 16 * n);
-        for (std::uint32_t t = 0; t < n; ++t) {
-            quantize_activation_q8k_neon(x_batch.subspan(t * cols, cols),
-                                         yd.data() + t * nb,
-                                         yq.data() + t * cols,
-                                         ys.data() + t * nb * 16);
-        }
+        const auto [yd, yq, ys] = quantize_batch_q8k(x_batch, cols, n);
         const std::size_t bb = i733_block(w.type);
         const std::uint32_t tile = q8_token_tile(cols);
         constexpr int kT = 8;
@@ -1977,18 +1999,7 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
         // token tile, four tokens per decoded block, then the tail one
         // by one (a token's result does not depend on the batch).
         const std::size_t nb = cols / 256;
-        thread_local std::vector<float> yd;
-        thread_local std::vector<std::int8_t> yq;
-        thread_local std::vector<std::int16_t> ys;
-        yd.resize(nb * n);
-        yq.resize(cols * n);
-        ys.resize(nb * 16 * n);
-        for (std::uint32_t t = 0; t < n; ++t) {
-            quantize_activation_q8k_neon(x_batch.subspan(t * cols, cols),
-                                         yd.data() + t * nb,
-                                         yq.data() + t * cols,
-                                         ys.data() + t * nb * 16);
-        }
+        const auto [yd, yq, ys] = quantize_batch_q8k(x_batch, cols, n);
         const std::size_t rb = mat_row_bytes(w);
         const std::uint32_t tile = q8_token_tile(cols);
         constexpr int kT = 4;
@@ -2060,17 +2071,7 @@ void matvec_batch_neon_q8k(const Mat& w, std::span<const float> x_batch,
         return;
     }
     const std::size_t nb = cols / 256;
-    thread_local std::vector<float> yd;
-    thread_local std::vector<std::int8_t> yq;
-    thread_local std::vector<std::int16_t> ys;
-    yd.resize(nb * n);
-    yq.resize(cols * n);
-    ys.resize(nb * 16 * n);
-    for (std::uint32_t t = 0; t < n; ++t) {
-        quantize_activation_q8k_neon(x_batch.subspan(t * cols, cols),
-                                yd.data() + t * nb, yq.data() + t * cols,
-                                ys.data() + t * nb * 16);
-    }
+    const auto [yd, yq, ys] = quantize_batch_q8k(x_batch, cols, n);
     const std::size_t bb = q4k ? 144 : 210;
     const std::uint32_t tile = q8_token_tile(cols);
     // Four tokens per row pass (the kernels' T), then the tail one by

@@ -456,6 +456,16 @@ TEST_CASE("router: --text-timeout and --media-timeout parse", "[router]") {
     CHECK(parse({"--media-timeout", "-1"}, cfg) ==
           "bad --media-timeout: -1");
     CHECK(parse({"--text-timeout", "x"}, cfg) == "bad --text-timeout: x");
+    // i#994: the client socket keepalive.
+    CHECK((cfg.keepalive_idle_s == 30 && cfg.keepalive_intvl_s == 10 &&
+           cfg.keepalive_count == 3));
+    CHECK(parse({"--tcp-keepalive", "60,20,5"}, cfg) == "");
+    CHECK((cfg.keepalive_idle_s == 60 && cfg.keepalive_intvl_s == 20 &&
+           cfg.keepalive_count == 5));
+    CHECK(parse({"--tcp-keepalive", "0"}, cfg) == "");
+    CHECK(cfg.keepalive_idle_s == 0);
+    CHECK(parse({"--tcp-keepalive", "5,0,3"}, cfg) ==
+          "bad --tcp-keepalive: 5,0,3");
 }
 
 TEST_CASE("router: a dead instance is skipped", "[router]") {

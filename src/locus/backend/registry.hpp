@@ -188,6 +188,14 @@ struct Ops {
      * asks for Q8.
      */
     bool prefers_q8k = false;
+    /**
+     * True when matvec and matvec_batch run on the CPU (the scalar,
+     * neon, sse4 and avx2 entries, and metal's, which runs what its
+     * forward does not take on the best CPU kernels): CPU-only paths
+     * such as Accelerate's sgemm (i#782) may take their place. False
+     * for the GPU backends (vulkan, cuda) and the image ops.
+     */
+    bool cpu = false;
 };
 
 /**

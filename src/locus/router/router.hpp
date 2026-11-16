@@ -199,6 +199,11 @@ struct RouterConfig {
     /** Open connections one client address may hold (i#625 F21); 0 =
      *  no cap. */
     std::size_t max_conns_per_ip = 0;
+    /** TCP keepalive on client sockets (i#994; http::ServerConfig's
+     *  keepalive fields): idle seconds (0 = off), interval, count. */
+    int keepalive_idle_s = 30;
+    int keepalive_intvl_s = 10;
+    int keepalive_count = 3;
 
     /** Client keys: when set, every request but /health needs a key
      * this auth helper allows (Authorization: Bearer, or x-api-key),

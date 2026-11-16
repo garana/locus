@@ -46,6 +46,42 @@ inline bool parse_nonneg_int(const std::string& s, int& out) {
 }
 
 /**
+ * Parses --tcp-keepalive's IDLE[,INTVL,COUNT] (i#994): idle seconds
+ * before the first probe (0 = off), seconds between probes and probes
+ * before the kernel fails the socket. Omitted fields keep the values
+ * the references hold. Each field is at most a day (count at most 100).
+ * @returns false on a malformed value; the outputs are then unchanged.
+ */
+inline bool parse_tcp_keepalive(const std::string& s, int& idle, int& intvl,
+                                int& count) {
+    int v[3] = {idle, intvl, count};
+    std::size_t at = 0;
+    for (int i = 0; i < 3; ++i) {
+        const std::size_t comma = s.find(',', at);
+        const std::string field =
+            s.substr(at, comma == std::string::npos ? std::string::npos
+                                                    : comma - at);
+        if (!parse_nonneg_int(field, v[i]) || v[i] > 86400 ||
+            (i == 2 && v[i] > 100)) {
+            return false;
+        }
+        if (comma == std::string::npos) {
+            if (i == 1) return false;  // IDLE, or all three
+            break;
+        }
+        if (i == 2) return false;  // a fourth field
+        at = comma + 1;
+    }
+    if (v[0] > 0 && (v[1] == 0 || v[2] == 0)) {
+        return false;  // probes need an interval and a count
+    }
+    idle = v[0];
+    intvl = v[1];
+    count = v[2];
+    return true;
+}
+
+/**
  * Whether a directive takes a parameter, and of what type. One enum
  * both the CLI parser and the config-file loader read, so a flag and
  * its config key can never disagree about arity or type.

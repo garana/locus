@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <span>
 #include <vector>
 
 #include "catch_amalgamated.hpp"
@@ -236,15 +237,18 @@ struct HookWake {
     std::condition_variable cv;
     int calls = 0;
 
-    std::function<void()> hook() {
-        return [this] {
+    locus::server::EngineLoop::ProgressHook hook() {
+        return [this](std::span<const std::uint64_t> ids) {
             {
                 std::lock_guard<std::mutex> lk(mu);
                 ++calls;
+                last.assign(ids.begin(), ids.end());
             }
             cv.notify_all();
         };
     }
+    /** The ids the hook got last (i#1005). */
+    std::vector<std::uint64_t> last;
     /** Sleeps until the hook has run more than `seen` times (or 1 s). */
     int wait(int seen) {
         std::unique_lock<std::mutex> lk(mu);
@@ -291,6 +295,11 @@ TEST_CASE("EngineLoop follow: take() adds up to the final view",
     REQUIRE(acc.status == locus::engine::Status::kDone);
     CHECK(takes > 1);  // incremental, not all at the end
     CHECK(wake.calls > 0);
+    {
+        // The hook names the request it queued (i#1005).
+        std::lock_guard<std::mutex> lk(wake.mu);
+        CHECK(wake.last == std::vector<std::uint64_t>{id});
+    }
     // Ended at the terminal take: nothing more to take.
     CHECK_FALSE(loop.take(id, acc));
 

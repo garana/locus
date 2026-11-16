@@ -76,6 +76,7 @@ add_executable(locus_tests
     test_responses.cpp
     test_server.cpp
     test_server_errors.cpp
+    test_request_checks.cpp
     test_tools.cpp
     test_vulkan.cpp
     test_vulkan_attn.cpp
@@ -100,9 +101,11 @@ add_executable(locus_tests
     test_t5_tokenizer.cpp
     test_wpm_tokenizer.cpp
     test_bert.cpp
+    test_image_dense.cpp
     test_rerank.cpp
     test_t5_encoder.cpp
     test_clip_text.cpp
+    test_tensor_read.cpp
     test_flux_dit.cpp
     test_flux_sampler.cpp
     test_flux_pipeline.cpp
