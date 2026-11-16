@@ -860,6 +860,33 @@ TEST_CASE("http server: a slow reader of a fast-path reply does not hold "
     REQUIRE(ms < 3000.0);
 }
 
+// i#1065: the inline total started before the handler ran, so a
+// fast-path reply that took over 1 s to build (a /metrics render on a
+// host paging under load) was dropped before its first byte, and the
+// client saw the connection close with no answer.
+TEST_CASE("http server: a slow fast-path handler still gets its reply out",
+          "[http_server]") {
+    ServerConfig cfg;
+    cfg.worker_threads = 1;
+    cfg.fast_path = [](std::string_view m, std::string_view t) {
+        return m == "GET" && t == "/slow-render";
+    };
+    Fixture f(
+        [](const Request&, ServerResponse& res) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+            res.status = 200;
+            res.set_content("rendered", "text/plain");
+        },
+        cfg);
+    const int c = client_connect(f.port);
+    send_all(c, "GET /slow-render HTTP/1.1\r\nHost: h\r\n"
+                "Connection: close\r\n\r\n");
+    const std::string r = drain(c, 5000);
+    ::close(c);
+    REQUIRE(r.find("HTTP/1.1 200 OK") != std::string::npos);
+    REQUIRE(r.find("rendered") != std::string::npos);
+}
+
 // The other half of F4: a fast-path head that arrives in two parts still
 // takes the fast path (it waits as partial, then is served inline).
 TEST_CASE("http server: a fast-path head in two parts is still fast",
