@@ -61,7 +61,9 @@ locus::image::Rgb8 reference() {
 // against a " " negative prompt, 2 steps of true CFG (scale 4). The
 // vision tower's image is resized with Pillow's BICUBIC here and with
 // torchvision in the pipeline's fast processor (i#601), so the bound
-// is the measured error with a margin.
+// is the measured error with a margin. The tower takes the processor's
+// image_mean and image_std (i#1094); with 0.5 and 0.25 the error was
+// 1.8e-4 of the RMS, which the old 1e-3 bound hid.
 TEST_CASE("qwen edit pipeline matches diffusers on tiny parts",
           "[qwen-edit][image]") {
     if (!std::filesystem::exists(kTokModel)) {
@@ -70,7 +72,10 @@ TEST_CASE("qwen edit pipeline matches diffusers on tiny parts",
     const auto tok_g = locus::gguf::GgufFile::open(kTokModel);
     const auto lm_img = qwen_tiny::lm("qwen2vl", kVocab);
     const auto lm_g = locus::gguf::GgufFile::parse(lm_img);
-    const auto v_img = qwen_tiny::mmproj(qwen_tiny::kE);
+    // The processor's image_mean and image_std (i#1094): the golden
+    // runs the real processor, as the real mmproj's constants do.
+    const auto v_img =
+        qwen_tiny::mmproj(qwen_tiny::kE, "qwen2.5vl_merger", true);
     const auto v_g = locus::gguf::GgufFile::parse(v_img);
     const auto dit_g =
         locus::gguf::GgufFile::open(kDir + "golden/qwen_image_dit_synth.gguf");
@@ -112,8 +117,8 @@ TEST_CASE("qwen edit pipeline matches diffusers on tiny parts",
     norm = std::sqrt(norm / static_cast<double>(img.size()));
     WARN("error rms " << err << ", worst " << worst << ", reference rms "
                       << norm);
-    // Measured on an M2 Pro: 1.8e-4 of the RMS, the worst value 8e-4.
-    REQUIRE(err <= 1e-3 * norm);
+    // Measured on an M2 Pro: 1.3e-7 of the RMS, the worst value 6e-7.
+    REQUIRE(err <= 1e-5 * norm);
 
     // A cancelled edit returns nothing.
     CHECK(p->edit_from(noise, req, op, [] { return false; }).empty());
