@@ -77,36 +77,63 @@ constexpr auto kLossy = json::error_handler_t::replace;
  *  copy the weights into the device pool: under 700 MB for these models
  *  (i#680); else null, the CPU everywhere. Not on V3D or llvmpipe,
  *  which run these passes slower than the CPU (i#612). */
-const backend::Ops* encoder_gpu_ops() {
+/** One route's engine: the backend's name (for the startup log) and
+ *  the ops the route runs with. Each route takes its ops from one of
+ *  the *_engine() functions below, and OpenAiServer::engines() its
+ *  names, so the log cannot drift from what runs. */
+struct EngineChoice {
+    std::string_view name;
+    const backend::Ops* ops;  // null: encoder_engine()'s CPU
+};
+
+EngineChoice encoder_engine() {
     if (backend::vulkan_imports_host_memory()) {
-        return &backend::vulkan_image_ops();
+        return {"vulkan", &backend::vulkan_image_ops()};
     }
     const backend::Backend* cuda = backend::find_backend("cuda");
     if (cuda != nullptr && cuda->available) {
-        return &cuda->ops;
+        return {"cuda", &cuda->ops};
     }
     if (backend::vulkan_backend_usable() &&
         backend::vulkan_device_beats_cpu()) {
-        return &backend::vulkan_image_ops();
+        return {"vulkan", &backend::vulkan_image_ops()};
     }
-    return nullptr;
+    return {backend::best_backend().name, nullptr};
 }
 
-/** @returns the backend encoder_gpu_ops() picks, "" for the CPU. */
-std::string_view encoder_gpu_name() {
+const backend::Ops* encoder_gpu_ops() { return encoder_engine().ops; }
+
+/** The diffusion models' engine (PixArt, FLUX, Qwen-Image-Edit,
+ *  LTX-Video): their linears on the GPU when the Vulkan device imports
+ *  host memory (unified memory: their mmapped weights cost it nothing),
+ *  else on the CPU backend, whatever --backend picked for the LLM. A
+ *  discrete GPU would copy 12 GB of weights into the pool, evicting the
+ *  LLM's. */
+EngineChoice diffusion_engine() {
     if (backend::vulkan_imports_host_memory()) {
-        return "vulkan";
+        return {"vulkan", &backend::vulkan_image_ops()};
     }
-    const backend::Backend* cuda = backend::find_backend("cuda");
-    if (cuda != nullptr && cuda->available) {
-        return "cuda";
-    }
-    if (backend::vulkan_backend_usable() &&
-        backend::vulkan_device_beats_cpu()) {
-        return "vulkan";
-    }
-    return {};
+    const backend::Backend& cpu = backend::best_backend();
+    return {cpu.name, &cpu.ops};
 }
+
+/** Janus's vision tower: the GPU as for the diffusion models; else the
+ *  active backend when it splits rows (a CPU one), else the best CPU
+ *  backend, as one device call per linear would be slow. */
+EngineChoice vision_engine(const backend::Backend& active) {
+    if (backend::vulkan_imports_host_memory()) {
+        return {"vulkan", &backend::vulkan_image_ops()};
+    }
+    if (backend::splits_rows(active.ops)) {
+        return {active.name, &active.ops};
+    }
+    const backend::Backend& cpu = backend::best_backend();
+    return {cpu.name, &cpu.ops};
+}
+
+/** @returns whether the classifier's convolutions run on Vulkan (they
+ *  do not run on CUDA). */
+bool classify_on_gpu() { return backend::vulkan_imports_host_memory(); }
 
 /** @returns "<name> (CPU)", or "<name> (GPU: <device>)" for a GPU one. */
 std::string engine_label(std::string_view be) {
@@ -1329,19 +1356,12 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
 std::vector<std::pair<std::string, std::string>> OpenAiServer::engines()
     const {
     const backend::Backend& active = model_.active_backend();
-    const std::string cpu = engine_label(backend::best_backend().name);
-    // The diffusion models' rule (images, edits, video): the GPU where
-    // it maps host memory, else the best CPU backend.
-    const bool host_gpu = backend::vulkan_imports_host_memory();
-    const std::string diffusion = host_gpu ? engine_label("vulkan") : cpu;
+    const std::string diffusion = engine_label(diffusion_engine().name);
     std::vector<std::pair<std::string, std::string>> out;
     out.emplace_back("text", engine_label(active.name));
     if (vision_) {
         out.emplace_back("image input",
-                         host_gpu ? engine_label("vulkan")
-                         : backend::splits_rows(active.ops)
-                             ? engine_label(active.name)
-                             : cpu);
+                         engine_label(vision_engine(active).name));
     }
     if (flux_ || pixart_) {
         out.emplace_back(flux_ ? "images (FLUX.1)" : "images (PixArt)",
@@ -1357,16 +1377,15 @@ std::vector<std::pair<std::string, std::string>> OpenAiServer::engines()
         out.emplace_back("video (LTX-Video)", diffusion);
     }
     if (bert_ || rerank_) {
-        const std::string_view g = encoder_gpu_name();
         out.emplace_back(bert_ && rerank_ ? "embeddings, rerank"
                          : bert_          ? "embeddings"
                                           : "rerank",
-                         g.empty() ? cpu : engine_label(g));
+                         engine_label(encoder_engine().name));
     }
     if (classifier_) {
-        // Its convolutions run on Vulkan only (not CUDA).
-        out.emplace_back("classify", host_gpu ? engine_label("vulkan")
-                                              : std::string("CPU"));
+        out.emplace_back("classify", classify_on_gpu()
+                                         ? engine_label("vulkan")
+                                         : std::string("CPU"));
     }
     return out;
 }
@@ -1476,12 +1495,7 @@ void OpenAiServer::vision_chat(bool anthropic, const VisionChat& chat,
         // language model uses. Otherwise per op it would make each
         // linear a separate device call, so it runs on the active
         // backend when that is a CPU one, else on the best CPU backend.
-        const auto& active = model_.active_backend().ops;
-        const auto& op = backend::vulkan_imports_host_memory()
-                             ? backend::vulkan_image_ops()
-                         : backend::splits_rows(active)
-                             ? active
-                             : backend::best_backend().ops;
+        const auto& op = *vision_engine(model_.active_backend()).ops;
         const auto& hp = model_.hparams();
         std::lock_guard<std::mutex> lk(vision_mu_);
 
@@ -2868,8 +2882,7 @@ void OpenAiServer::install_routes() {
                             std::lock_guard<std::mutex> lk(classifier_mu_);
                             // Its convs run on Vulkan only (not CUDA).
                             e = classifier_
-                                    ->run(img, backend::
-                                                   vulkan_imports_host_memory())
+                                    ->run(img, classify_on_gpu())
                                     .embedding;
                         }
                         data.push_back({{"object", "embedding"},
@@ -2993,8 +3006,7 @@ void OpenAiServer::install_routes() {
                     // (Apple), as the embedding encoders (#512); they
                     // run on Vulkan only, so not on CUDA.
                     logits = classifier_
-                                 ->run(img,
-                                       backend::vulkan_imports_host_memory())
+                                 ->run(img, classify_on_gpu())
                                  .logits;
                 }
                 json out = json::array();
@@ -3471,9 +3483,7 @@ void OpenAiServer::install_routes() {
                 // pool, evicting the LLM's. With these ops the DiT's
                 // attention and the VAE's convolutions run on the GPU
                 // too; T5's attention stays on the CPU.
-                const auto& op = backend::vulkan_imports_host_memory()
-                                     ? backend::vulkan_image_ops()
-                                     : backend::best_backend().ops;
+                const auto& op = *diffusion_engine().ops;
                 image::PixArtPipeline::Timing took;
                 std::vector<std::uint8_t> rgb;
                 {
@@ -3602,9 +3612,7 @@ void OpenAiServer::install_routes() {
                 // per op. Without it, the CPU backend. A GPU step holds
                 // the Vulkan lock for its whole length, so text
                 // generation on the same GPU waits for it.
-                const auto& op = backend::vulkan_imports_host_memory()
-                                     ? backend::vulkan_image_ops()
-                                     : backend::best_backend().ops;
+                const auto& op = *diffusion_engine().ops;
                 if (edit) {
                     // FluxKontextPipeline's size rule: the aspect at
                     // max_area pixels, 1024 x 1024 by default; a given
@@ -3993,9 +4001,7 @@ void OpenAiServer::install_routes() {
             // The MMDiT and the VAE run on the GPU where it maps host
             // memory, else on the CPU; the language model always on the
             // CPU.
-            const auto& op = backend::vulkan_imports_host_memory()
-                                 ? backend::vulkan_image_ops()
-                                 : backend::best_backend().ops;
+            const auto& op = *diffusion_engine().ops;
             image::QwenEditPipeline::Timing took;
             std::vector<std::uint8_t> rgb;
             std::uint32_t w = 0, h = 0;
@@ -4232,10 +4238,7 @@ void OpenAiServer::install_routes() {
                     {
                         std::lock_guard<std::mutex> lk(image_mu_);
                         int polls = 0;
-                        const auto& op =
-                            backend::vulkan_imports_host_memory()
-                                ? backend::vulkan_image_ops()
-                                : backend::best_backend().ops;
+                        const auto& op = *diffusion_engine().ops;
                         // The decode takes about three times the 8 DiT
                         // steps (M2 Pro, 512x320x65: 170 s vs 60 s), so
                         // the steps span 0 to 30 and the decode 30 to 90.
