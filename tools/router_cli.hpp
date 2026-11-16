@@ -51,6 +51,10 @@ inline constexpr const char* kRouterUsage =
     "  --max-conns-per-ip N  open connections one client address (not\n"
     "                      network) may hold; past it a new one is\n"
     "                      closed (default 0: no cap)\n"
+    "  --tcp-keepalive IDLE[,INTVL,COUNT]  TCP keepalive on client\n"
+    "                      sockets, so a client whose host died is\n"
+    "                      found (default 30,10,3: about a minute;\n"
+    "                      0 = off)\n"
     "  --auth-helper PATH  check client keys with this auth helper\n"
     "                      (locus-auth-helper is a reference one): every\n"
     "                      request but /health needs a key it allows\n"
@@ -116,6 +120,12 @@ inline std::string parse_router_args(int argc, char** argv, int first,
                 return std::string("bad --max-conns-per-ip: ") + argv[i];
             }
             cfg.max_conns_per_ip = static_cast<std::size_t>(n);
+        } else if (a == "--tcp-keepalive" && i + 1 < argc) {
+            if (!parse_tcp_keepalive(argv[++i], cfg.keepalive_idle_s,
+                                     cfg.keepalive_intvl_s,
+                                     cfg.keepalive_count)) {
+                return std::string("bad --tcp-keepalive: ") + argv[i];
+            }
         } else if (a == "--auth-helper" && i + 1 < argc) {
             helper = argv[++i];
         } else if (a == "--auth-helper-arg" && i + 1 < argc) {

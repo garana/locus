@@ -315,6 +315,9 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         }
         opt.auth_helper_argv = args.auth_helper;
         opt.max_conns_per_ip = args.max_conns_per_ip;
+        opt.keepalive_idle_s = args.tcp_keepalive_idle;
+        opt.keepalive_intvl_s = args.tcp_keepalive_intvl;
+        opt.keepalive_count = args.tcp_keepalive_count;
         opt.event_loop = args.event_loop;
         // Capped at a day, so the milliseconds fit in 32 bits.
         opt.sse_keepalive_ms =

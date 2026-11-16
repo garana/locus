@@ -4,6 +4,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstddef>
 #include <cmath>
 #include <cstdlib>
@@ -1200,4 +1202,40 @@ TEST_CASE("metal decode RoPE epilogue matches rope_norm to the bit",
         CAPTURE(t);
         REQUIRE(fused[t] == apart[t]);
     }
+}
+
+// i#1012: metal::Seq's unmasked attention at FLUX's 1024 px shape (4096
+// image and 512 text tokens, 24 heads of 128), timed over 3 runs.
+TEST_CASE("bench: metal seq attention at the FLUX 1024 px shape",
+          "[.bench][metal]") {
+    if (!locus::backend::metal::Seq::available()) {
+        SKIP("no Metal device");
+    }
+    using Seq = locus::backend::metal::Seq;
+    const std::uint32_t n = 4608, heads = 24, hd = 128, w = heads * hd;
+    std::vector<float> v(std::size_t{n} * w);
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& x : v) {
+        x = dist(rng);
+    }
+    Seq q;
+    for (Seq::Slot s = 0; s < 4; ++s) {
+        q.reserve(s, v.size());
+        q.write(s, 0, v);
+    }
+    const Seq::Rows r0{0, 0, w}, r1{1, 0, w}, r2{2, 0, w}, r3{3, 0, w};
+    q.attention(r0, r1, r2, r3, n, heads, hd, 4, 5, 6);
+    q.flush();
+    double best = 1e30;
+    for (int i = 0; i < 3; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        q.attention(r0, r1, r2, r3, n, heads, hd, 4, 5, 6);
+        q.flush();
+        const std::chrono::duration<double, std::milli> dt =
+            std::chrono::steady_clock::now() - t0;
+        best = std::min(best, dt.count());
+    }
+    std::printf("seq attention %u x %u heads x %u: %.1f ms\n", n, heads, hd,
+                best);
 }

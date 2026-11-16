@@ -7,6 +7,7 @@
 #include <string>
 
 #include "locus/image/dense.hpp"
+#include "locus/image/tensor_read.hpp"
 
 namespace locus::image {
 
@@ -80,11 +81,7 @@ QwenVision QwenVision::load(const gguf::GgufFile& g) {
     }
 
     const auto info = [&](const std::string& name) {
-        const gguf::TensorInfo* ti = g.find_tensor(name);
-        if (ti == nullptr) {
-            throw gguf::Error("qwen vision: missing tensor " + name);
-        }
-        return ti;
+        return require_tensor(g, "qwen vision", name);
     };
     const auto f32 = [&](const std::string& name, std::size_t n) {
         const gguf::TensorInfo* ti = info(name);

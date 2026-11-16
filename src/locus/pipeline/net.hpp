@@ -170,6 +170,20 @@ void set_recv_timeout(int fd, int ms);
  */
 void set_keepalive(int fd, int idle_s, int intvl_s, int count);
 
+/**
+ * Bounds how long sent data may stay unacknowledged on `fd` before the
+ * kernel fails the socket (Linux TCP_USER_TIMEOUT; i#1016), so a stream
+ * that keeps writing to a host that died is found as fast as keepalive
+ * finds an idle one (Linux sends no keepalive probe while data is in
+ * flight; the retransmission timeout alone takes about 15 minutes).
+ * It also bounds a zero window, so use it where a peer that reads
+ * nothing that long is gone anyway (an HTTP client), not on pipeline
+ * links. No-op where the OS has no such option (macOS).
+ *
+ * @param ms The bound in milliseconds; 0 restores the kernel's default.
+ */
+void set_user_timeout(int fd, int ms);
+
 /** The kernel's round-trip estimate for one TCP connection (i#21). */
 struct TcpRtt {
     std::uint32_t rtt_us = 0;     /**< Smoothed round-trip time. */

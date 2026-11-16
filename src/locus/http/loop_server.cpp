@@ -221,6 +221,9 @@ void LoopServer::accept_ready(sys::Poller& poller) {
         make_nonblocking(fd);
         const int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        // i#994, i#1016: a dead peer's keepalive (or unacknowledged-data)
+        // failure is a poller error.
+        apply_keepalive(fd, cfg_);
         LoopConfig lc;
         lc.limits = cfg_.limits;
         lc.max_requests_per_conn = cfg_.max_requests_per_conn;

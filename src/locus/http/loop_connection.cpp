@@ -178,8 +178,14 @@ void LoopReply::cancel() {
     {
         std::lock_guard<std::mutex> lk(mu_);
         cancelled_ = true;
+        if (notify_) notify_();
     }
     cv_.notify_all();
+}
+
+void LoopReply::set_notify(std::function<void()> f) {
+    std::lock_guard<std::mutex> lk(mu_);
+    notify_ = std::move(f);
 }
 
 LoopConnection::LoopConnection(int fd, LoopConfig cfg, LoopHandler handler)
@@ -357,7 +363,13 @@ void LoopConnection::take_reply() {
                 break;
         }
     }
-    if (taken) r.cv_.notify_all();
+    if (taken) {
+        {
+            std::lock_guard<std::mutex> lk(r.mu_);
+            if (r.notify_) r.notify_();  // room again (i#1005)
+        }
+        r.cv_.notify_all();
+    }
     if (done) {
         if (!pending_keep_) close_after_ = true;
         pending_.reset();
@@ -428,6 +440,7 @@ LoopConnection::Next LoopConnection::on_event(const sys::Poller::Event& ev) {
         if (peer_gone_) {
             std::lock_guard<std::mutex> lk(pending_->mu_);
             pending_->peer_closed_ = true;
+            if (pending_->notify_) pending_->notify_();
         }
     }
     if (!pump()) return Next::kClose;

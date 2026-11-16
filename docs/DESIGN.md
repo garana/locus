@@ -200,9 +200,11 @@ gives its job thread back after submit (`RequestContext::defer`): one
 each request's new tokens (`EngineLoop::take`) and queues its SSE
 chunks or body on the reply, through the same `GenReply` steps the
 thread path runs, so N streams take no thread each. A stream over its
-queue bound is skipped until the client reads. The known limit: that
-one thread decodes and builds the JSON of every stream in turn, and
-each wake (and a 20 ms tick) visits every live generation.
+queue bound is skipped until its reply calls back (queue taken,
+cancelled or half-closed). The pump looks only at the requests the
+progress hook names, the replies that call back and the due keepalives
+(#1005). The known limit: that one thread decodes and builds the JSON
+of every stream in turn.
 `http::Server` (a thread a connection) stays the default for now.
 
 `locus-router` (`router::Router`) proxies each request to one of
@@ -1076,8 +1078,13 @@ latency added.
 engine, KV pool and worker over the one loaded model, on its own
 Vulkan device (its pool made with the caller bound there, its worker
 bound to it) or its own share of the CPU cores
-(`sys::ThreadPool::share_threads`, as the stage executors). A request
-goes to the engine with the fewest unreleased requests and stays
+(`sys::ThreadPool::share_threads`, as the stage executors). Each engine
+has its own prefix cache, so a request goes to the engine that last
+served its longest prefix of whole 16-token blocks (a chained hash per
+block, up to 64 blocks: chat prompts share their template's first
+block), unless that engine has more than one unreleased request over
+the least-loaded one; otherwise (and for a shorter prompt) to the
+least-loaded engine (#940, #988). It stays
 there; its id is `local * engines + engine`, so one engine keeps
 today's ids. `/metrics` sums the engines. The disk prefix tier serves
 one engine only; CUDA serves one engine (#924).
