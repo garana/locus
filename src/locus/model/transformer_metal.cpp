@@ -3,6 +3,7 @@
 // place (a shared Metal buffer, Ops.alloc_kv).
 
 #include <algorithm>
+#include <initializer_list>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -863,14 +864,26 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 (route_env == nullptr ||
                  std::string_view(route_env) != "cpu"),
             std::max(32u, (hp_.n_expert + 31) / 32 * 32)};
-        // q or k with rope_norm in the matvec's store (i#1064), where
-        // the type has the epilogue: false when it does not.
-        const auto mv_rope = [&](const Mat& w, const Context::Buffer& out,
-                                 std::uint64_t out_off) {
+        // A matvec with the steps of f in it (i#1064): false when its
+        // type lacks one.
+        const auto mvf = [&](const Mat& w, const Context::Buffer& in,
+                             const Context::Buffer& out,
+                             std::uint64_t out_off, const metal::MvFuse& f) {
             const auto wb = r.w(w);
-            return metal::record_matvec_rope(ctx, w.type, w.rows, w.cols,
-                                             *wb.buf, wb.off, s.xb, 0, out,
-                                             out_off, s.cs, hd);
+            return metal::record_matvec_fused(ctx, w.type, w.rows, w.cols,
+                                              *wb.buf, wb.off, in, 0, out,
+                                              out_off, f);
+        };
+        // The RMSNorm folded into the matvecs that read it, where each
+        // of them takes it (LOCUS_METAL_NORM_FOLD=0: rmsnorm_f32 first).
+        const char* nf_env = std::getenv("LOCUS_METAL_NORM_FOLD");
+        const bool norm_fold =
+            nf_env == nullptr || std::string_view(nf_env) != "0";
+        const auto fold_ok = [&](std::initializer_list<const Mat*> ms) {
+            return norm_fold &&
+                   std::all_of(ms.begin(), ms.end(), [](const Mat* m) {
+                       return metal::matvec_prenorm_ok(m->type);
+                   });
         };
         // LOCUS_METAL_ROPE_EPILOGUE=0: always the separate rope_norm
         // (tests, benches).
@@ -898,24 +911,37 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 const Layer& lay = layers_[l];
                 const std::uint64_t krow = row_of(l, false);
                 const std::uint64_t vrow = row_of(l, true);
-                r.rmsnorm(lay.attn_norm);
-                // q, k and v read xb and write apart: they may overlap,
-                // and so may the two RoPEs.
-                // RoPE straight after q and k (no biases, no q / k norm,
-                // interleaved pairs) goes in their matvecs' store.
+                // The attention's RMSNorm in the q / k / v matvecs when
+                // all three take it, else rmsnorm_f32 into xb first.
+                const bool fold_attn = fold_ok({&lay.wq, &lay.wk, &lay.wv});
+                metal::MvFuse nf;
+                if (fold_attn) {
+                    nf.norm_w = &r.f(lay.attn_norm);
+                    nf.eps = hp_.rms_eps;
+                } else {
+                    r.rmsnorm(lay.attn_norm);
+                }
+                const Context::Buffer& qin = fold_attn ? s.x : s.xb;
+                // q, k and v read the same input and write apart: they
+                // may overlap, and so may the two RoPEs. RoPE straight
+                // after q and k (no biases, no q / k norm, interleaved
+                // pairs) goes in their matvecs' store.
                 const bool fuse = rope_epilogue && !lay.has_qkv_bias() &&
                                   !lay.has_qk_norm();
-                const bool rq = fuse && mv_rope(lay.wq, s.q, 0);
+                metal::MvFuse nr = nf;
+                nr.rope_cs = &s.cs;
+                nr.rope_hd = hd;
+                const bool rq = fuse && mvf(lay.wq, qin, s.q, 0, nr);
                 if (!rq) {
-                    r.mv(lay.wq, s.xb, s.q, 0, false);
+                    mvf(lay.wq, qin, s.q, 0, nf);
                 }
                 ctx.overlap_next();
-                const bool rk = fuse && mv_rope(lay.wk, *pool, krow);
+                const bool rk = fuse && mvf(lay.wk, qin, *pool, krow, nr);
                 if (!rk) {
-                    r.mv(lay.wk, s.xb, *pool, krow, false);
+                    mvf(lay.wk, qin, *pool, krow, nf);
                 }
                 ctx.overlap_next();
-                r.mv(lay.wv, s.xb, *pool, vrow, false);
+                mvf(lay.wv, qin, *pool, vrow, nf);
                 if (lay.has_qkv_bias()) {
                     // qwen2: the biases, which may overlap, then RoPE.
                     r.bias(s.q, 0, lay.wq_bias, 1, 0);
@@ -986,14 +1012,25 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     ctx.dispatch("attn_values", va, bytes_of(ap), H * hd, 64);
                 }
                 r.mv(lay.wo, s.att, s.x, 0, true);
-                r.rmsnorm(lay.ffn_norm);
+                // A dense FFN's RMSNorm in gate / up likewise; a MoE layer
+                // reads xb in many places, so it keeps rmsnorm_f32.
+                const bool fold_ffn =
+                    !lay.is_moe() && fold_ok({&lay.w_gate, &lay.w_up});
+                metal::MvFuse ff_nf;
+                if (fold_ffn) {
+                    ff_nf.norm_w = &r.f(lay.ffn_norm);
+                    ff_nf.eps = hp_.rms_eps;
+                } else {
+                    r.rmsnorm(lay.ffn_norm);
+                }
                 if (lay.is_moe()) {
                     r.moe(lay);
                     continue;
                 }
-                r.mv(lay.w_gate, s.xb, s.gate, 0, false);
+                const Context::Buffer& fin = fold_ffn ? s.x : s.xb;
+                mvf(lay.w_gate, fin, s.gate, 0, ff_nf);
                 ctx.overlap_next();  // gate and up, likewise
-                r.mv(lay.w_up, s.xb, s.up, 0, false);
+                mvf(lay.w_up, fin, s.up, 0, ff_nf);
                 const SiluParams sp{ff};
                 const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
                 ctx.dispatch("silu_mul", su, bytes_of(sp), ff, 256);
