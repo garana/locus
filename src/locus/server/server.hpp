@@ -5,6 +5,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "locus/auth/auth_client.hpp"
@@ -233,6 +234,16 @@ class OpenAiServer {
 
     /** Stops a running listen loop (thread-safe). */
     void stop();
+
+    /**
+     * The engine each loaded kind of request runs on, by the same rules
+     * the routes use: the text model on its backend, the image and
+     * video models on the GPU where it maps host memory whatever
+     * --backend says, and so on. For the startup log.
+     * @returns (kind of request, engine) pairs, text first; an engine
+     *     reads "neon (CPU)" or "vulkan (GPU: <device>)".
+     */
+    std::vector<std::pair<std::string, std::string>> engines() const;
 
   private:
     /** Engine config with prompt caching resolved from Options:

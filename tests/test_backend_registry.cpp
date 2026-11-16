@@ -78,8 +78,8 @@ TEST_CASE("gpu_idle_warning flags a default CPU pick with a GPU usable",
     SECTION("default CPU pick with a usable GPU warns") {
         const Backend list[] = {cpu, vk};
         REQUIRE(gpu_idle_warning(true, cpu, list, true) ==
-                "warning: running on the CPU (neon) by default; a GPU "
-                "is usable: pass --backend vulkan (or set "
+                "warning: the text model runs on the CPU (neon) by "
+                "default; a GPU is usable: pass --backend vulkan (or set "
                 "LOCUS_BACKEND=vulkan)");
         const Backend list_cuda[] = {cpu, cuda};
         REQUIRE(gpu_idle_warning(true, cpu, list_cuda, false).find(

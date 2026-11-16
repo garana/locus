@@ -92,6 +92,35 @@ const backend::Ops* encoder_gpu_ops() {
     return nullptr;
 }
 
+/** @returns the backend encoder_gpu_ops() picks, "" for the CPU. */
+std::string_view encoder_gpu_name() {
+    if (backend::vulkan_imports_host_memory()) {
+        return "vulkan";
+    }
+    const backend::Backend* cuda = backend::find_backend("cuda");
+    if (cuda != nullptr && cuda->available) {
+        return "cuda";
+    }
+    if (backend::vulkan_backend_usable() &&
+        backend::vulkan_device_beats_cpu()) {
+        return "vulkan";
+    }
+    return {};
+}
+
+/** @returns "<name> (CPU)", or "<name> (GPU: <device>)" for a GPU one. */
+std::string engine_label(std::string_view be) {
+    std::string dev;
+    if (be == "vulkan") {
+        dev = backend::vulkan_device_name();
+    } else if (be == "cuda") {
+        dev = backend::cuda_device_name();
+    } else if (be != "metal") {
+        return std::string(be) + " (CPU)";
+    }
+    return std::string(be) + (dev.empty() ? " (GPU)" : " (GPU: " + dev + ")");
+}
+
 /** @returns The OpenAI flat error envelope. @param type
  *  invalid_request_error for a request the client got wrong; api_error
  *  for a condition that is not the request's fault (a cancellation). */
@@ -1295,6 +1324,51 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         devices_.push_back({"vulkan", backend::vulkan_device_name()});
     }
     install_routes();
+}
+
+std::vector<std::pair<std::string, std::string>> OpenAiServer::engines()
+    const {
+    const backend::Backend& active = model_.active_backend();
+    const std::string cpu = engine_label(backend::best_backend().name);
+    // The diffusion models' rule (images, edits, video): the GPU where
+    // it maps host memory, else the best CPU backend.
+    const bool host_gpu = backend::vulkan_imports_host_memory();
+    const std::string diffusion = host_gpu ? engine_label("vulkan") : cpu;
+    std::vector<std::pair<std::string, std::string>> out;
+    out.emplace_back("text", engine_label(active.name));
+    if (vision_) {
+        out.emplace_back("image input",
+                         host_gpu ? engine_label("vulkan")
+                         : backend::splits_rows(active.ops)
+                             ? engine_label(active.name)
+                             : cpu);
+    }
+    if (flux_ || pixart_) {
+        out.emplace_back(flux_ ? "images (FLUX.1)" : "images (PixArt)",
+                         diffusion);
+    }
+    if (qwen_edit_) {
+        out.emplace_back("image edits (Qwen-Image-Edit)",
+                         diffusion + "; its language model on the CPU");
+    } else if (flux_ && flux_->may_edit()) {
+        out.emplace_back("image edits (FLUX.1 Kontext)", diffusion);
+    }
+    if (ltxv_) {
+        out.emplace_back("video (LTX-Video)", diffusion);
+    }
+    if (bert_ || rerank_) {
+        const std::string_view g = encoder_gpu_name();
+        out.emplace_back(bert_ && rerank_ ? "embeddings, rerank"
+                         : bert_          ? "embeddings"
+                                          : "rerank",
+                         g.empty() ? cpu : engine_label(g));
+    }
+    if (classifier_) {
+        // Its convolutions run on Vulkan only (not CUDA).
+        out.emplace_back("classify", host_gpu ? engine_label("vulkan")
+                                              : std::string("CPU"));
+    }
+    return out;
 }
 
 bool OpenAiServer::authorize(const http::Request& req,

@@ -339,12 +339,15 @@ OpenAI + Anthropic compatible inference server (default port 8080):
         opt.ffmpeg_path = args.ffmpeg;
         opt.model_path = model_path;
         locus::server::OpenAiServer server(model, tok, opt);
-        std::fprintf(
-            stderr,
-            "%s\nbackend: %s | chat template: %s\n",
-            locus::sys::to_string(locus::sys::detect()).c_str(),
-            std::string(model.active_backend().name).c_str(),
-            std::string(opt.chat_template.name()).c_str());
+        std::fprintf(stderr, "%s\nchat template: %s\n",
+                     locus::sys::to_string(locus::sys::detect()).c_str(),
+                     std::string(opt.chat_template.name()).c_str());
+        // Each kind of request names its engine: the image and video
+        // models pick theirs apart from the text model's --backend.
+        for (const auto& [kind, engine] : server.engines()) {
+            std::fprintf(stderr, "engine: %-30s %s\n", (kind + ":").c_str(),
+                         engine.c_str());
+        }
         if (!gpu_warn.empty()) {
             std::fprintf(stderr, "%s\n", gpu_warn.c_str());
         }
