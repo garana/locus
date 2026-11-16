@@ -138,6 +138,7 @@ add_executable(locus_tests
     test_qwen_edit_image.cpp
     test_qwen_edit_denoise.cpp
     test_qwen_edit_pipeline.cpp
+    test_qwen_vl_chat.cpp
     test_resnet.cpp
     test_inception.cpp
     test_png.cpp

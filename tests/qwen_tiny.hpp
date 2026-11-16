@@ -110,10 +110,14 @@ inline std::vector<std::byte> lm(const std::string& arch = "qwen2vl",
 }
 
 /** The tiny tower as an mmproj GGUF image, its merger projecting to
- *  `out` (24 in the vision golden, kE to feed the language model). */
+ *  `out` (24 in the vision golden, kE to feed the language model).
+ *  clip_norm: the Qwen2.5-VL processor's image_mean and image_std (the
+ *  real mmproj's), for goldens that run the real processor; else 0.5
+ *  and 0.25. */
 inline std::vector<std::byte> mmproj(std::uint32_t out,
                                      const char* projector =
-                                         "qwen2.5vl_merger") {
+                                         "qwen2.5vl_merger",
+                                     bool clip_norm = false) {
     std::map<std::string, Shape> shapes;
     const std::uint64_t w = kVw, f = kVffn, m = 4 * kVw;
     shapes["v.patch_embd.weight"] = {w, 3, 14, 14};
@@ -149,9 +153,13 @@ inline std::vector<std::byte> mmproj(std::uint32_t out,
         g.kv_u32("clip.vision.block_count", kVdepth);
         g.kv_u32("clip.vision.n_wa_pattern", kVwa);
         g.kv_f32("clip.vision.attention.layer_norm_epsilon", 1e-6f);
-        const float mean[] = {0.5f, 0.5f, 0.5f}, sd[] = {0.25f, 0.25f, 0.25f};
-        g.kv_f32_array("clip.vision.image_mean", mean);
-        g.kv_f32_array("clip.vision.image_std", sd);
+        const float half[] = {0.5f, 0.5f, 0.5f},
+                    quarter[] = {0.25f, 0.25f, 0.25f};
+        // preprocessor_config.json of Qwen2.5-VL (CLIP's constants).
+        const float cmean[] = {0.48145466f, 0.4578275f, 0.40821073f},
+                    cstd[] = {0.26862954f, 0.26130258f, 0.27577711f};
+        g.kv_f32_array("clip.vision.image_mean", clip_norm ? cmean : half);
+        g.kv_f32_array("clip.vision.image_std", clip_norm ? cstd : quarter);
     });
 }
 

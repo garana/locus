@@ -221,6 +221,10 @@ inline constexpr const char* kCommonHelp =
     "  --embedding-model P locus-server: serve /v1/embeddings with the\n"
     "                   BERT embedding GGUF at path P, listed in\n"
     "                   /v1/models by its file name\n"
+    "  --mmproj P       locus-server: image input in chat for a\n"
+    "                   Qwen2.5-VL model, with its vision tower GGUF at\n"
+    "                   path P (llama.cpp's mmproj; the model on a CPU\n"
+    "                   backend)\n"
     "  --image-classifier P locus-server: serve /v1/classify, and\n"
     "                   image inputs to /v1/embeddings under its name,\n"
     "                   with the CNN GGUF at path P (ResNet or\n"
@@ -442,6 +446,9 @@ struct BackendArgs {
     /** From --image-classifier P: path to a CNN GGUF for locus-server's
      * /v1/classify; empty = the endpoint answers 503. */
     std::string image_classifier;
+    /** From --mmproj P: path to a Qwen2.5-VL vision tower GGUF for
+     * image input in chat (i#1092); empty = none. */
+    std::string mmproj;
     /** From --max-tokens N: per-request output-token cap (0 = the
      * server default). */
     std::uint32_t max_tokens = 0;
@@ -688,6 +695,10 @@ inline BackendArgs parse_backend_args(int argc, char** argv) {
             out.image_classifier = argv[++i];
         } else if (a.rfind("--image-classifier=", 0) == 0) {
             out.image_classifier = std::string(a.substr(19));
+        } else if (a == "--mmproj" && i + 1 < argc) {
+            out.mmproj = argv[++i];
+        } else if (a.rfind("--mmproj=", 0) == 0) {
+            out.mmproj = std::string(a.substr(9));
         } else if (a == "--max-tokens" && i + 1 < argc) {
             number("--max-tokens", argv[++i], out.max_tokens);
         } else if (a.rfind("--max-tokens=", 0) == 0) {

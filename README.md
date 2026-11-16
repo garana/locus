@@ -79,7 +79,9 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   with unified memory the vision tower runs on the GPU with its
   activations resident, whatever backend the language model uses (on
   an M4 Max, about 0.1 s per image; an image question about 0.9 s with
-  the language model on Vulkan).
+  the language model on Vulkan). Or with Qwen2.5-VL (`--mmproj` for
+  its vision tower; the language model on a CPU backend, as its
+  M-RoPE forward is CPU-only).
 - **Tools:** `locus-server`; `locus-run` (one prompt); `locus-gguf`
   (inspect a GGUF); `locus-stage` and `locus-driver` (multi-server
   pipeline, experimental; a stage runs on the CPU, CUDA or Vulkan, and
