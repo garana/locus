@@ -1484,6 +1484,9 @@ TEST_CASE("metal decode norm fold tracks the unfolded decode", "[metal]") {
     const auto folded = run("1");
     const auto apart = run("0");
     REQUIRE(folded.size() == apart.size());
+    // The fold moves the low bits, so equal logits at every step mean it
+    // did not run (a host fallback, or the fold no longer engaging).
+    float worst_any = 0.0f;
     for (std::size_t t = 0; t < folded.size(); ++t) {
         CAPTURE(t);
         float worst = 0.0f, scale = 0.0f;
@@ -1491,6 +1494,7 @@ TEST_CASE("metal decode norm fold tracks the unfolded decode", "[metal]") {
             worst = std::max(worst, std::abs(folded[t][i] - apart[t][i]));
             scale = std::max(scale, std::abs(apart[t][i]));
         }
+        worst_any = std::max(worst_any, worst);
         CHECK(worst <= 0.01f * scale);
         // The same token where the top two logits are further apart than
         // the fold can move them (a near tie may flip by the low bits).
@@ -1504,4 +1508,5 @@ TEST_CASE("metal decode norm fold tracks the unfolded decode", "[metal]") {
                       apart[t].begin());
         }
     }
+    CHECK(worst_any > 0.0f);
 }
