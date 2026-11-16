@@ -1702,6 +1702,9 @@ int OpenAiServer::build_and_start(const std::string& host, int port) {
     cfg.limits.max_body_bytes = opt_.max_body_bytes;
     cfg.max_conns_per_ip = opt_.max_conns_per_ip;
     cfg.worker_threads = opt_.http_threads;
+    cfg.keepalive_idle_s = opt_.keepalive_idle_s;
+    cfg.keepalive_intvl_s = opt_.keepalive_intvl_s;
+    cfg.keepalive_count = opt_.keepalive_count;
     // Serve the cheap monitoring routes on the acceptor's fast path so
     // they answer even when every worker is busy in a generation.
     // serve_connection still runs the head stage, so auth on /metrics
