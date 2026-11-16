@@ -1426,3 +1426,72 @@ TEST_CASE("bench: metal seq attention at the FLUX 1024 px shape",
     std::printf("seq attention %u x %u heads x %u: %.1f ms\n", n, heads, hd,
                 best);
 }
+
+// i#1084: the decode norm fold (#1073's _pn matvecs) is on by default only
+// on Apple family 9 (#1082), so this forces it on and off on whichever GPU
+// runs the suite: the fold moves the low bits, so the logits agree within
+// the Metal forward's bound and pick the same token at every step.
+TEST_CASE("metal decode norm fold tracks the unfolded decode", "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/llama-3.2-1b-q8_0.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("llama-3.2-1b-q8_0.gguf absent");
+    }
+    // The caller's LOCUS_METAL_NORM_FOLD comes back on every exit.
+    struct EnvGuard {
+        std::string old;
+        bool had = false;
+        EnvGuard() {
+            if (const char* e = std::getenv("LOCUS_METAL_NORM_FOLD")) {
+                old = e;
+                had = true;
+            }
+        }
+        ~EnvGuard() {
+            if (had) {
+                ::setenv("LOCUS_METAL_NORM_FOLD", old.c_str(), 1);
+            } else {
+                ::unsetenv("LOCUS_METAL_NORM_FOLD");
+            }
+        }
+    } guard;
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("metal"));
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    const auto ids = tok->encode("The capital of France is", true);
+    const auto run = [&](const char* fold) {
+        ::setenv("LOCUS_METAL_NORM_FOLD", fold, 1);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        std::vector<std::vector<float>> all;
+        for (const auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
+            all.push_back(logits);
+        }
+        cache.release(seq);
+        return all;
+    };
+    const auto folded = run("1");
+    const auto apart = run("0");
+    REQUIRE(folded.size() == apart.size());
+    for (std::size_t t = 0; t < folded.size(); ++t) {
+        CAPTURE(t);
+        float worst = 0.0f, scale = 0.0f;
+        for (std::size_t i = 0; i < apart[t].size(); ++i) {
+            worst = std::max(worst, std::abs(folded[t][i] - apart[t][i]));
+            scale = std::max(scale, std::abs(apart[t][i]));
+        }
+        CHECK(worst <= 0.01f * scale);
+        CHECK(std::max_element(folded[t].begin(), folded[t].end()) -
+                  folded[t].begin() ==
+              std::max_element(apart[t].begin(), apart[t].end()) -
+                  apart[t].begin());
+    }
+}
