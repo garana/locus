@@ -2,13 +2,13 @@
 #include "locus/backend/metal/matvec.hpp"
 
 #include <algorithm>
-#include <string_view>
-#include <cstdlib>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include "locus/backend/metal/context.hpp"

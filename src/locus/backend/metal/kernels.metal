@@ -555,6 +555,8 @@ kernel void mv_q5_k(device const uchar* w [[buffer(0)]],
 // of 16 l, 4 units a block, so a lane's loads walk 16 bytes on its own.
 // The M2 (Apple family 8) reads Q6_K at about twice the bandwidth with
 // Halves; the M4 (family 9) is a few percent faster with units.
+// Halves's 16 lanes (2 halves x 8 lanes x 4 l) cover a block exactly.
+static_assert(kMvLanes == 16, "q6k_row_dot: Halves needs 16 lanes a row");
 template <bool Halves>
 inline float q6k_row_dot(device const uchar* row, device const float* x,
                          uint nb, uint lane) {
