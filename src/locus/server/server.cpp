@@ -3770,8 +3770,8 @@ void OpenAiServer::install_routes() {
         // (cancelling when the client disconnects) and releases first.
         GenReply gr;
         gr.stream = rq_sp->stream;
-        gr.finish = [this, r, rq_sp, settle](const EngineLoop::View& v,
-                                             http::ServerResponse& res) {
+        gr.finish = [r, rq_sp, settle](const EngineLoop::View& v,
+                                       http::ServerResponse& res) {
             if (v.status == engine::Status::kCancelled) {
                 res.status = 499;
                 res.set_content(
