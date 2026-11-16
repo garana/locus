@@ -52,6 +52,10 @@ struct MvParams {
     // each rope_hd-wide head rotate by cs[(2 i) % rope_hd ..] (cos, sin)
     // before the store, as rope_norm would after it. 0: none.
     uint rope_hd;
+    // The _pn kernels (i#1064, F32 and Q8_0): x is the residual before
+    // its RMSNorm, read as x * nw (buffer 9), its x^2 summed over the
+    // row, the dot scaled by 1 / sqrt(mean + eps) (rmsnorm_f32's formula).
+    float eps;
 };
 
 constant constexpr uint kNoRoute = 0xFFFFFFFFu;
@@ -90,18 +94,27 @@ inline void mv_store(device float* out, constant MvParams& p, uint slot,
 
 inline float hsum(float4 v) { return v.x + v.y + v.z + v.w; }
 
+// The _pn kernels' scale from the row's sum of squares.
+inline float mv_inv_rms(float ss, constant MvParams& p) {
+    return 1.0f / sqrt(ss / float(p.cols) + p.eps);
+}
+
 inline float f16_at(device const uchar* b) {
     return float(as_type<half>(ushort(b[0] | (b[1] << 8))));
 }
 
 // F32: units of 4 columns.
-kernel void mv_f32(device const uchar* w [[buffer(0)]],
-                   device const float* xb [[buffer(1)]],
-                   device float* out [[buffer(2)]],
-                   constant MvParams& p [[buffer(3)]],
-                   device const uint* route [[buffer(7)]],
-                   uint tg [[threadgroup_position_in_grid]],
-                   uint tid [[thread_index_in_threadgroup]]) {
+// mv_f32 with the RMSNorm prologue compiled in (PN) or out, so the
+// plain kernel is the code it was (i#1064).
+template <bool PN>
+inline void mv_f32_impl(device const uchar* w,
+    device const float* xb,
+    device float* out,
+    constant MvParams& p,
+    device const uint* route,
+    device const float* nw,
+    uint tg,
+    uint tid) {
     const uint lane = tid % kMvLanes;
     const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
     const uint slot = tg / gps;
@@ -109,28 +122,63 @@ kernel void mv_f32(device const uchar* w [[buffer(0)]],
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
     device const float* xs =
         xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
-    float acc = 0.0f;
+    float acc = 0.0f, ss = 0.0f;  // ss: prenorm's sum of x^2
     if (r < p.rows) {
         device const float4* row =
             (device const float4*)(w + wo +
                                       (ulong)r * p.cols * 4);
         device const float4* x = (device const float4*)(xs);
+        device const float4* g = (device const float4*)(nw);
         for (uint u = lane; u < p.cols / 4; u += kMvLanes) {
-            acc += dot(row[u], x[u]);
+            float4 xv = x[u];
+            if (PN) {
+                ss += dot(xv, xv);
+                xv *= g[u];
+            }
+            acc += dot(row[u], xv);
         }
+    }
+    if (PN) {
+        acc *= mv_inv_rms(half_simd_sum(ss), p);
     }
     mv_store(out, p, slot, r, lane, acc);
 }
 
+kernel void mv_f32(device const uchar* w [[buffer(0)]],
+                   device const float* xb [[buffer(1)]],
+                   device float* out [[buffer(2)]],
+                   constant MvParams& p [[buffer(3)]],
+                   device const uint* route [[buffer(7)]],
+                   device const float* nw [[buffer(9)]],
+                   uint tg [[threadgroup_position_in_grid]],
+                   uint tid [[thread_index_in_threadgroup]]) {
+    mv_f32_impl<false>(w, xb, out, p, route, nw, tg, tid);
+}
+
+kernel void mv_f32_pn(device const uchar* w [[buffer(0)]],
+                   device const float* xb [[buffer(1)]],
+                   device float* out [[buffer(2)]],
+                   constant MvParams& p [[buffer(3)]],
+                   device const uint* route [[buffer(7)]],
+                   device const float* nw [[buffer(9)]],
+                   uint tg [[threadgroup_position_in_grid]],
+                   uint tid [[thread_index_in_threadgroup]]) {
+    mv_f32_impl<true>(w, xb, out, p, route, nw, tg, tid);
+}
+
 // Q8_0: 34-byte blocks (f16 d, 32 int8). Units are blocks; the block
 // stride is not a multiple of 4, so the quants load as bytes.
-kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
-                    device const float* xb [[buffer(1)]],
-                    device float* out [[buffer(2)]],
-                    constant MvParams& p [[buffer(3)]],
-                    device const uint* route [[buffer(7)]],
-                    uint tg [[threadgroup_position_in_grid]],
-                    uint tid [[thread_index_in_threadgroup]]) {
+// mv_q8_0 with the RMSNorm prologue compiled in (PN) or out, so the
+// plain kernel is the code it was (i#1064).
+template <bool PN>
+inline void mv_q8_0_impl(device const uchar* w,
+    device const float* xb,
+    device float* out,
+    constant MvParams& p,
+    device const uint* route,
+    device const float* nw,
+    uint tg,
+    uint tid) {
     const uint lane = tid % kMvLanes;
     const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
     const uint slot = tg / gps;
@@ -138,7 +186,7 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
     device const float* xs =
         xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
-    float acc = 0.0f;
+    float acc = 0.0f, ss = 0.0f;  // ss: prenorm's sum of x^2
     if (r < p.rows) {
         const uint nb = p.cols / 32;
         device const uchar* row = w + wo + (ulong)r * nb * 34;
@@ -147,16 +195,47 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
             device const uchar* blk = row + b * 34;
             device const char* q = (device const char*)(blk + 2);
             device const float4* xv = (device const float4*)(x + b * 32);
+            device const float4* gv = (device const float4*)(nw + b * 32);
             float s = 0.0f;
             for (uint k = 0; k < 8; ++k) {
                 const float4 qv(q[4 * k], q[4 * k + 1], q[4 * k + 2],
                                 q[4 * k + 3]);
-                s += dot(qv, xv[k]);
+                float4 xk = xv[k];
+                if (PN) {
+                    ss += dot(xk, xk);
+                    xk *= gv[k];
+                }
+                s += dot(qv, xk);
             }
             acc += f16_at(blk) * s;
         }
     }
+    if (PN) {
+        acc *= mv_inv_rms(half_simd_sum(ss), p);
+    }
     mv_store(out, p, slot, r, lane, acc);
+}
+
+kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
+                    device const float* xb [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
+                    device const float* nw [[buffer(9)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+    mv_q8_0_impl<false>(w, xb, out, p, route, nw, tg, tid);
+}
+
+kernel void mv_q8_0_pn(device const uchar* w [[buffer(0)]],
+                    device const float* xb [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
+                    device const float* nw [[buffer(9)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+    mv_q8_0_impl<true>(w, xb, out, p, route, nw, tg, tid);
 }
 
 // F16: units of 4 columns (8-byte loads: w_off a multiple of 8).
