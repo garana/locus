@@ -30,7 +30,9 @@ void grow(Context& ctx, Context::Buffer& b, std::size_t bytes) {
 }
 
 void put(Context::Buffer& b, std::span<const float> v) {
-    std::memcpy(b.data, v.data(), v.size_bytes());
+    if (!v.empty()) {  // an empty span's data() may be null (no bias)
+        std::memcpy(b.data, v.data(), v.size_bytes());
+    }
 }
 
 }  // namespace
