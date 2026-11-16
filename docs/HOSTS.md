@@ -108,10 +108,14 @@ CPU default for larger ones.
 | LTX-Video 2B, one DiT step      | 75.3 s        | 77.0 s             | not run          | PyTorch 85 s  | #982   |
 
 - `LOCUS_CPU_FAST=1` gains 1 to 7% on the dense rows, near the noise:
-  the default stays, as it reproduces the goldens.
-- The MoE on the CPU trails llama.cpp (#1077, Backlog).
-- llama.cpp here is a CPU build, so the CUDA rows compare with locus's
-  own CPU.
+  the default stays, as it reproduces the goldens. On the DiT step it
+  cuts the self attention (12.2 to 10.4 s, #1062) but not the whole
+  step (one run each).
+- The MoE on the CPU trails llama.cpp (#1077, Backlog). Its rows have
+  the 9.5 GB file already in the page cache; a cold first run decodes
+  at 1.1, all page faults.
+- llama.cpp here is a CPU build (commit e8e6c7a, 4 threads), so the
+  CUDA rows compare with locus's own CPU.
 
 ## Raspberry Pi 5
 
