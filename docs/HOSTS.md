@@ -124,12 +124,12 @@ The CPU rows hold for any arm64 CPU with dotprod and no i8mm. Measured
 on a Raspberry Pi 5 (BCM2712, 4 Cortex-A76 at 2.4 GHz), 4 GB RAM,
 V3D 7.1 (Mesa 24.2.8, Vulkan 1.2); Debian 12, GCC 12.
 
-Automatic: `neon_dotprod`. Recommended: no flags; leave `--kv-type`
-at f32 and `--engines` at 1.
+Automatic: `neon` (it uses its dotprod kernels on this CPU).
+Recommended: no flags; leave `--kv-type` at f32 and `--engines` at 1.
 
 | workload                         | command               | number                                                                  | source     |
 |----------------------------------|-----------------------|-------------------------------------------------------------------------|------------|
-| text, Llama 3.2 1B Q4_K_M        | default               | prefill 31 to 33, decode 7.7 (llama.cpp: 66, 9.6)                       | #1059      |
+| text, Llama 3.2 1B Q4_K_M        | default               | prefill 31 to 33, decode 7.6 to 7.7 (llama.cpp: 66, 9.6)                | #1059      |
 | text, Qwen2.5-0.5B Q8_0          | default               | prefill 63 to 75, decode 14.5 to 14.9 (llama.cpp: 229, 13.0)            | #1059      |
 | text on V3D                      | do not                | 1B Q4_K_M prefill 1.2, decode 0.7 (neon: 24.6, 10.6)                    | #607, #612 |
 | MoE, DeepSeek-V2-Lite Q4_K_M     | default               | 15 decode tokens in 34.6 s; Vulkan 4x slower                            | #679, #252 |
@@ -146,4 +146,5 @@ at f32 and `--engines` at 1.
   llama-bench's tg128 from an empty context.
 - `--kv-type q8` only to fit a longer context: it keeps the decode
   speed and costs about 25% of the prefill.
-- `LOCUS_CPU_FAST` does not apply: its fast ARM path needs i8mm.
+- `LOCUS_CPU_FAST`: its i8mm Q8_0 path does not apply (no i8mm); its
+  faster softmax does, but is not measured here.
