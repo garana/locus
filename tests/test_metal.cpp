@@ -1298,6 +1298,49 @@ TEST_CASE("metal decode RoPE epilogue matches rope_norm to the bit",
     }
 }
 
+// i#1064: qwen3's per-head q / k norm and its RoPE in one dispatch give
+// the two kernels' results to the bit.
+TEST_CASE("metal decode head norm with RoPE matches the two kernels",
+          "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    const std::string path =
+        std::string(LOCUS_SOURCE_DIR) +
+        "/tests/models/qwen3-coder-30b-a3b-instruct-q4_k_m.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("qwen3-coder-30b-a3b-instruct-q4_k_m.gguf absent");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("metal"));
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    const auto ids = tok->encode("def fibonacci(n):", true);
+    const auto run = [&](const char* fused) {
+        ::setenv("LOCUS_METAL_NORM_ROPE", fused, 1);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        std::vector<std::vector<float>> all;
+        for (const auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
+            all.push_back(logits);
+        }
+        cache.release(seq);
+        ::unsetenv("LOCUS_METAL_NORM_ROPE");
+        return all;
+    };
+    const auto fused = run("1");
+    const auto apart = run("0");
+    REQUIRE(fused.size() == apart.size());
+    for (std::size_t t = 0; t < fused.size(); ++t) {
+        CAPTURE(t);
+        REQUIRE(fused[t] == apart[t]);
+    }
+}
+
 // i#1012: metal::Seq's unmasked attention at FLUX's 1024 px shape (4096
 // image and 512 text tokens, 24 heads of 128), timed over 3 runs.
 TEST_CASE("bench: metal seq attention at the FLUX 1024 px shape",
