@@ -83,6 +83,8 @@ struct MvParams {
     float scale;
     std::uint32_t route_slot, n_slots, x_slot_stride, out_slot_stride;
     std::uint32_t slot_div;
+    std::uint32_t rope_hd;  // Q4_K's RoPE epilogue (record_matvec_fused)
+    float eps;  // the _pn kernels' RMSNorm (record_matvec_fused)
 };
 
 constexpr std::uint32_t kNoRoute = 0xFFFFFFFFu;  // kernels.metal's
@@ -223,7 +225,8 @@ void record_mv(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                bool accumulate, std::uint32_t n_slots = 1,
                std::uint32_t x_slot_stride = 0,
                std::uint32_t out_slot_stride = 0,
-               std::uint32_t slot_div = 1) {
+               std::uint32_t slot_div = 1,
+               const MvFuse& fuse = {}) {
     const Kind k = kind_of(t);
     if (k.kernel == nullptr || cols % k.block != 0 || x_off % 4 != 0) {
         throw std::invalid_argument("metal record_matvec: no kernel");
@@ -240,14 +243,25 @@ void record_mv(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                      n_slots,
                      x_slot_stride,
                      out_slot_stride,
-                     slot_div};
+                     slot_div,
+                     fuse.rope_hd,
+                     fuse.eps};
     // The route buffer binds at 7 always (x when there is none; the
     // kernel reads it only for a routed call).
     const Context::Arg args[] = {
-        {&w, 0}, {&x, 0}, {&out, 0}, {route != nullptr ? route : &x, 0, 7}};
+        {&w, 0},
+        {&x, 0},
+        {&out, 0},
+        {route != nullptr ? route : &x, 0, 7},
+        {fuse.rope_cs != nullptr ? fuse.rope_cs : &x, 0, 8},
+        {fuse.norm_w != nullptr ? fuse.norm_w : &x, 0, 9}};
     const std::uint32_t groups = (rows + k.rows - 1) / k.rows;
-    ctx.dispatch(t == TensorType::kQ6_K ? q6k_kernel(ctx) : k.kernel, args,
-                 std::as_bytes(std::span(&p, 1)),
+    // The Q6_K layout by GPU family (i#1058). The prenorm form is its
+    // own kernel, so the plain one keeps its code (Q6_K has none).
+    const std::string name =
+        std::string(t == TensorType::kQ6_K ? q6k_kernel(ctx) : k.kernel) +
+        (fuse.norm_w != nullptr ? "_pn" : "");
+    ctx.dispatch(name.c_str(), args, std::as_bytes(std::span(&p, 1)),
                  groups * n_slots * k.group, k.group);
 }
 
@@ -260,6 +274,35 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint64_t out_off, bool accumulate) {
     record_mv(ctx, t, rows, cols, w, w_off, 0, nullptr, 0, x, x_off, out,
               out_off, accumulate);
+}
+
+bool matvec_prenorm_ok(gguf::TensorType t) {
+    // Where the fold wins (i#1064, M4 Max decode): F32 and Q8_0 read x as
+    // whole float4 runs, so the norm weight's loads ride along. In
+    // Q4_K's layout (ggml's) a lane reads x in 8-float pieces at four
+    // places a block; with the weight's loads added that cost more than
+    // the dispatch saved (Llama 1B Q4_K_M 290 -> 197 tok/s), and Q4_K_M
+    // models put Q6_K beside it, so neither takes the fold.
+    return t == TensorType::kF32 || t == TensorType::kQ8_0;
+}
+
+bool record_matvec_fused(Context& ctx, gguf::TensorType t,
+                         std::uint32_t rows, std::uint32_t cols,
+                         const Context::Buffer& w, std::uint64_t w_off,
+                         const Context::Buffer& x, std::uint32_t x_off,
+                         const Context::Buffer& out, std::uint64_t out_off,
+                         const MvFuse& fuse) {
+    if (fuse.rope_cs != nullptr &&
+        (t != TensorType::kQ4_K || fuse.rope_hd == 0 ||
+         fuse.rope_hd % 2 != 0 || rows % fuse.rope_hd != 0)) {
+        return false;
+    }
+    if (fuse.norm_w != nullptr && (!matvec_prenorm_ok(t) || x_off != 0)) {
+        return false;
+    }
+    record_mv(ctx, t, rows, cols, w, w_off, 0, nullptr, 0, x, x_off, out,
+              out_off, false, 1, 0, 0, 1, fuse);
+    return true;
 }
 
 void record_matvec_slots(Context& ctx, gguf::TensorType t,

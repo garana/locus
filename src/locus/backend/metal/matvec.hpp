@@ -100,6 +100,39 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint32_t x_off, const Context::Buffer& out,
                    std::uint64_t out_off, bool accumulate);
 
+/** The steps a matvec can take around its dot (i#1064), so the decode
+ *  saves their dispatches and barriers. */
+struct MvFuse {
+    /** rope_norm in the store: rows 2 i and 2 i + 1 of each
+     *  rope_hd-wide head rotate by rope_cs[2 i] (cos) and
+     *  rope_cs[2 i + 1] (sin), rope_norm's arithmetic on the same
+     *  values, so its bits. Q4_K only (ggml's layout gives a simdgroup
+     *  each even row and its pair). */
+    const Context::Buffer* rope_cs = nullptr;
+    std::uint32_t rope_hd = 0;
+    /** RMSNorm as a prologue: x is the norm's input, read as x * norm_w,
+     *  its x^2 summed over the row, the dot scaled by 1 / sqrt(mean +
+     *  eps). The rounding order differs from rmsnorm_f32 then the
+     *  matvec, so the low bits do. matvec_prenorm_ok types only. */
+    const Context::Buffer* norm_w = nullptr;
+    float eps = 0.0f;
+};
+
+/** @returns Whether t's matvec takes MvFuse::norm_w. */
+bool matvec_prenorm_ok(gguf::TensorType t);
+
+/**
+ * record_matvec, not accumulated, with fuse's steps.
+ * @returns false, recording nothing, when t (or the shape) lacks one of
+ *     them: the caller then runs the steps itself.
+ */
+bool record_matvec_fused(Context& ctx, gguf::TensorType t,
+                         std::uint32_t rows, std::uint32_t cols,
+                         const Context::Buffer& w, std::uint64_t w_off,
+                         const Context::Buffer& x, std::uint32_t x_off,
+                         const Context::Buffer& out, std::uint64_t out_off,
+                         const MvFuse& fuse);
+
 /**
  * Records out[out_off + t * out_stride + r] (+)= dot(row r, x token t)
  * for r < rows and t < n_tok: the prefill matmul, each weight row read

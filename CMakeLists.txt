@@ -34,6 +34,7 @@ add_library(locus
     src/locus/backend/cuda_stub.cpp
     src/locus/backend/fallbacks.cpp
     src/locus/backend/gpu_metrics.cpp
+    src/locus/backend/metal/conv.cpp
     src/locus/backend/metal/kv_pool.cpp
     src/locus/backend/metal/matvec.cpp
     src/locus/backend/metal/seq.cpp

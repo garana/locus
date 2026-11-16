@@ -25,9 +25,11 @@
 #include "catch_amalgamated.hpp"
 #include "locus/backend/cpu_ops.hpp"
 #include "locus/backend/metal/context.hpp"
+#include "locus/backend/metal/conv.hpp"
 #include "locus/backend/metal/matvec.hpp"
 #include "locus/backend/metal/seq.hpp"
 #include "locus/backend/registry.hpp"
+#include "locus/backend/variants.hpp"
 #include "locus/gguf/gguf.hpp"
 #include "locus/kv/paged_cache.hpp"
 #include "locus/model/transformer.hpp"
@@ -827,6 +829,98 @@ TEST_CASE("metal forward on a GGUF parsed from memory copies its weights",
     CHECK(worst <= 0.01f * scale);
 }
 
+// i#1050: the Metal conv2d (implicit GEMM) against the CPU's, on the
+// image decoders' shapes: channel and pixel tails, strides 1 and 2,
+// pads 0 and 1, 1 x 1 and 3 x 3 kernels, with and without a bias.
+TEST_CASE("metal conv2d matches the CPU reference", "[metal][conv2d]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    struct Shape {
+        std::uint32_t ic, oc, h, w, k, stride, pad;
+        bool bias;
+    };
+    const Shape shapes[] = {
+        {3, 70, 17, 23, 3, 1, 1, true},    {16, 128, 32, 32, 3, 1, 1, true},
+        {128, 64, 20, 20, 1, 1, 0, true},  {64, 96, 31, 29, 3, 2, 1, false},
+        {64, 64, 16, 16, 3, 2, 0, true},   {512, 8, 9, 7, 3, 1, 1, true},
+    };
+    std::mt19937 rng(1050);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const Shape& s : shapes) {
+        CAPTURE(s.ic, s.oc, s.h, s.w, s.k, s.stride, s.pad);
+        std::vector<float> in(std::size_t{s.ic} * s.h * s.w);
+        std::vector<float> wt(std::size_t{s.oc} * s.ic * s.k * s.k);
+        std::vector<float> b(s.bias ? s.oc : 0);
+        for (auto* v : {&in, &wt, &b}) {
+            for (auto& x : *v) {
+                x = dist(rng);
+            }
+        }
+        const std::uint32_t oh = (s.h + 2 * s.pad - s.k) / s.stride + 1;
+        const std::uint32_t ow = (s.w + 2 * s.pad - s.k) / s.stride + 1;
+        std::vector<float> want(std::size_t{s.oc} * oh * ow), got(want.size());
+        locus::backend::conv2d_mt(in, s.ic, s.h, s.w, wt, s.oc, s.k, s.k, b,
+                                  s.stride, s.pad, 1, want);
+        REQUIRE(locus::backend::metal::conv2d(in, s.ic, s.h, s.w, wt, s.oc,
+                                              s.k, s.k, b, s.stride, s.pad, 1,
+                                              got));
+        float worst = 0.0f, scale = 0.0f;
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            worst = std::max(worst, std::abs(got[i] - want[i]));
+            scale = std::max(scale, std::abs(want[i]));
+        }
+        CHECK(worst <= 1e-5f * scale + 1e-5f);
+    }
+    // Groups other than 1 stay on the CPU.
+    std::vector<float> in(2 * 4 * 4), wt(2 * 1 * 3 * 3), out(2 * 4 * 4);
+    CHECK_FALSE(locus::backend::metal::conv2d(in, 2, 4, 4, wt, 2, 3, 3, {},
+                                              1, 1, 2, out));
+}
+
+// i#1050: a 3 x 3 conv of 128 to 128 channels on a 512 x 512 plane (a
+// VAE decoder's last stage at 512 px), Metal against Vulkan.
+TEST_CASE("bench: metal conv2d at a VAE shape", "[.bench][metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    const std::uint32_t c = 128, h = 512, w = 512, k = 3;
+    std::vector<float> in(std::size_t{c} * h * w), out(in.size());
+    std::vector<float> wt(std::size_t{c} * c * k * k), b(c);
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto* v : {&in, &wt, &b}) {
+        for (auto& x : *v) {
+            x = dist(rng);
+        }
+    }
+    const auto time = [&](const auto& run) {
+        run();  // warm
+        double best = 1e30;
+        for (int i = 0; i < 3; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            run();
+            const std::chrono::duration<double, std::milli> dt =
+                std::chrono::steady_clock::now() - t0;
+            best = std::min(best, dt.count());
+        }
+        return best;
+    };
+    const double mt = time([&] {
+        locus::backend::metal::conv2d(in, c, h, w, wt, c, k, k, b, 1, 1, 1,
+                                      out);
+    });
+    std::printf("conv2d %u -> %u, %u x %u: metal %.1f ms", c, c, h, w, mt);
+    if (locus::backend::vulkan_backend_usable()) {
+        const double vk = time([&] {
+            locus::backend::conv2d_vulkan(in, c, h, w, wt, c, k, k, b, 1, 1,
+                                          1, out);
+        });
+        std::printf(", vulkan %.1f ms", vk);
+    }
+    std::printf("\n");
+}
+
 namespace {
 
 /** A temp file of n random floats, removed with the object. */
@@ -1209,6 +1303,91 @@ TEST_CASE("metal Q6_K matvec layouts match the CPU", "[metal]") {
                         Catch::Approx(want[r]).margin(1e-3).epsilon(1e-4));
             }
         }
+    }
+}
+
+// i#1064: RoPE in the Q4_K q / k matvecs' store gives rope_norm's
+// results to the bit: the decode logits match with the epilogue off.
+TEST_CASE("metal decode RoPE epilogue matches rope_norm to the bit",
+          "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    const std::string path = std::string(LOCUS_SOURCE_DIR) +
+                             "/tests/models/llama-3.2-1b-q4_k_m.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("llama-3.2-1b-q4_k_m.gguf absent");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("metal"));
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    const auto ids = tok->encode("The capital of France is", true);
+    const auto run = [&](const char* epilogue) {
+        ::setenv("LOCUS_METAL_ROPE_EPILOGUE", epilogue, 1);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        std::vector<std::vector<float>> all;
+        for (const auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
+            all.push_back(logits);
+        }
+        cache.release(seq);
+        ::unsetenv("LOCUS_METAL_ROPE_EPILOGUE");
+        return all;
+    };
+    const auto fused = run("1");
+    const auto apart = run("0");
+    REQUIRE(fused.size() == apart.size());
+    for (std::size_t t = 0; t < fused.size(); ++t) {
+        CAPTURE(t);
+        REQUIRE(fused[t] == apart[t]);
+    }
+}
+
+// i#1064: qwen3's per-head q / k norm and its RoPE in one dispatch give
+// the two kernels' results to the bit.
+TEST_CASE("metal decode head norm with RoPE matches the two kernels",
+          "[metal]") {
+    if (!Context::usable()) {
+        SKIP("no Metal device");
+    }
+    const std::string path =
+        std::string(LOCUS_SOURCE_DIR) +
+        "/tests/models/qwen3-coder-30b-a3b-instruct-q4_k_m.gguf";
+    if (!std::filesystem::exists(path)) {
+        SKIP("qwen3-coder-30b-a3b-instruct-q4_k_m.gguf absent");
+    }
+    auto g = locus::gguf::GgufFile::open(path);
+    auto model = locus::model::TransformerModel::load(g);
+    model.use_backend(*locus::backend::find_backend("metal"));
+    const auto tok = locus::tok::tokenizer_from_gguf(g);
+    const auto ids = tok->encode("def fibonacci(n):", true);
+    const auto run = [&](const char* fused) {
+        ::setenv("LOCUS_METAL_NORM_ROPE", fused, 1);
+        auto cache = model.make_cache();
+        auto ws = model.make_workspace();
+        locus::kv::PagedKvCache::Seq seq;
+        std::vector<float> logits(model.hparams().n_vocab);
+        std::vector<std::vector<float>> all;
+        for (const auto id : ids) {
+            REQUIRE(cache.ensure_capacity(seq, 1));
+            model.forward(id, cache, seq, ws, logits);
+            all.push_back(logits);
+        }
+        cache.release(seq);
+        ::unsetenv("LOCUS_METAL_NORM_ROPE");
+        return all;
+    };
+    const auto fused = run("1");
+    const auto apart = run("0");
+    REQUIRE(fused.size() == apart.size());
+    for (std::size_t t = 0; t < fused.size(); ++t) {
+        CAPTURE(t);
+        REQUIRE(fused[t] == apart[t]);
     }
 }
 

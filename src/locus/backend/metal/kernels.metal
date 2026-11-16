@@ -48,6 +48,14 @@ struct MvParams {
     uint x_slot_stride;
     uint out_slot_stride;
     uint slot_div;  // x of slot s is at + (s / slot_div) * x_slot_stride
+    // Q4_K only, rows not accumulated (i#1064): rows 2 i and 2 i + 1 of
+    // each rope_hd-wide head rotate by cs[(2 i) % rope_hd ..] (cos, sin)
+    // before the store, as rope_norm would after it. 0: none.
+    uint rope_hd;
+    // The _pn kernels (i#1064, F32 and Q8_0): x is the residual before
+    // its RMSNorm, read as x * nw (buffer 9), its x^2 summed over the
+    // row, the dot scaled by 1 / sqrt(mean + eps) (rmsnorm_f32's formula).
+    float eps;
 };
 
 constant constexpr uint kNoRoute = 0xFFFFFFFFu;
@@ -86,18 +94,27 @@ inline void mv_store(device float* out, constant MvParams& p, uint slot,
 
 inline float hsum(float4 v) { return v.x + v.y + v.z + v.w; }
 
+// The _pn kernels' scale from the row's sum of squares.
+inline float mv_inv_rms(float ss, constant MvParams& p) {
+    return 1.0f / sqrt(ss / float(p.cols) + p.eps);
+}
+
 inline float f16_at(device const uchar* b) {
     return float(as_type<half>(ushort(b[0] | (b[1] << 8))));
 }
 
 // F32: units of 4 columns.
-kernel void mv_f32(device const uchar* w [[buffer(0)]],
-                   device const float* xb [[buffer(1)]],
-                   device float* out [[buffer(2)]],
-                   constant MvParams& p [[buffer(3)]],
-                   device const uint* route [[buffer(7)]],
-                   uint tg [[threadgroup_position_in_grid]],
-                   uint tid [[thread_index_in_threadgroup]]) {
+// mv_f32 with the RMSNorm prologue compiled in (PN) or out, so the
+// plain kernel is the code it was (i#1064).
+template <bool PN>
+inline void mv_f32_impl(device const uchar* w,
+    device const float* xb,
+    device float* out,
+    constant MvParams& p,
+    device const uint* route,
+    device const float* nw,
+    uint tg,
+    uint tid) {
     const uint lane = tid % kMvLanes;
     const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
     const uint slot = tg / gps;
@@ -105,28 +122,63 @@ kernel void mv_f32(device const uchar* w [[buffer(0)]],
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
     device const float* xs =
         xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
-    float acc = 0.0f;
+    float acc = 0.0f, ss = 0.0f;  // ss: prenorm's sum of x^2
     if (r < p.rows) {
         device const float4* row =
             (device const float4*)(w + wo +
                                       (ulong)r * p.cols * 4);
         device const float4* x = (device const float4*)(xs);
+        device const float4* g = (device const float4*)(nw);
         for (uint u = lane; u < p.cols / 4; u += kMvLanes) {
-            acc += dot(row[u], x[u]);
+            float4 xv = x[u];
+            if (PN) {
+                ss += dot(xv, xv);
+                xv *= g[u];
+            }
+            acc += dot(row[u], xv);
         }
+    }
+    if (PN) {
+        acc *= mv_inv_rms(half_simd_sum(ss), p);
     }
     mv_store(out, p, slot, r, lane, acc);
 }
 
+kernel void mv_f32(device const uchar* w [[buffer(0)]],
+                   device const float* xb [[buffer(1)]],
+                   device float* out [[buffer(2)]],
+                   constant MvParams& p [[buffer(3)]],
+                   device const uint* route [[buffer(7)]],
+                   device const float* nw [[buffer(9)]],
+                   uint tg [[threadgroup_position_in_grid]],
+                   uint tid [[thread_index_in_threadgroup]]) {
+    mv_f32_impl<false>(w, xb, out, p, route, nw, tg, tid);
+}
+
+kernel void mv_f32_pn(device const uchar* w [[buffer(0)]],
+                   device const float* xb [[buffer(1)]],
+                   device float* out [[buffer(2)]],
+                   constant MvParams& p [[buffer(3)]],
+                   device const uint* route [[buffer(7)]],
+                   device const float* nw [[buffer(9)]],
+                   uint tg [[threadgroup_position_in_grid]],
+                   uint tid [[thread_index_in_threadgroup]]) {
+    mv_f32_impl<true>(w, xb, out, p, route, nw, tg, tid);
+}
+
 // Q8_0: 34-byte blocks (f16 d, 32 int8). Units are blocks; the block
 // stride is not a multiple of 4, so the quants load as bytes.
-kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
-                    device const float* xb [[buffer(1)]],
-                    device float* out [[buffer(2)]],
-                    constant MvParams& p [[buffer(3)]],
-                    device const uint* route [[buffer(7)]],
-                    uint tg [[threadgroup_position_in_grid]],
-                    uint tid [[thread_index_in_threadgroup]]) {
+// mv_q8_0 with the RMSNorm prologue compiled in (PN) or out, so the
+// plain kernel is the code it was (i#1064).
+template <bool PN>
+inline void mv_q8_0_impl(device const uchar* w,
+    device const float* xb,
+    device float* out,
+    constant MvParams& p,
+    device const uint* route,
+    device const float* nw,
+    uint tg,
+    uint tid) {
     const uint lane = tid % kMvLanes;
     const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
     const uint slot = tg / gps;
@@ -134,7 +186,7 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
     const ulong wo = mv_w_off(p, route, slot);  // the weight's bytes
     device const float* xs =
         xb + p.x_off + ulong(slot / p.slot_div) * p.x_slot_stride;
-    float acc = 0.0f;
+    float acc = 0.0f, ss = 0.0f;  // ss: prenorm's sum of x^2
     if (r < p.rows) {
         const uint nb = p.cols / 32;
         device const uchar* row = w + wo + (ulong)r * nb * 34;
@@ -143,16 +195,47 @@ kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
             device const uchar* blk = row + b * 34;
             device const char* q = (device const char*)(blk + 2);
             device const float4* xv = (device const float4*)(x + b * 32);
+            device const float4* gv = (device const float4*)(nw + b * 32);
             float s = 0.0f;
             for (uint k = 0; k < 8; ++k) {
                 const float4 qv(q[4 * k], q[4 * k + 1], q[4 * k + 2],
                                 q[4 * k + 3]);
-                s += dot(qv, xv[k]);
+                float4 xk = xv[k];
+                if (PN) {
+                    ss += dot(xk, xk);
+                    xk *= gv[k];
+                }
+                s += dot(qv, xk);
             }
             acc += f16_at(blk) * s;
         }
     }
+    if (PN) {
+        acc *= mv_inv_rms(half_simd_sum(ss), p);
+    }
     mv_store(out, p, slot, r, lane, acc);
+}
+
+kernel void mv_q8_0(device const uchar* w [[buffer(0)]],
+                    device const float* xb [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
+                    device const float* nw [[buffer(9)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+    mv_q8_0_impl<false>(w, xb, out, p, route, nw, tg, tid);
+}
+
+kernel void mv_q8_0_pn(device const uchar* w [[buffer(0)]],
+                    device const float* xb [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
+                    device const float* nw [[buffer(9)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+    mv_q8_0_impl<true>(w, xb, out, p, route, nw, tg, tid);
 }
 
 // F16: units of 4 columns (8-byte loads: w_off a multiple of 8).
@@ -337,6 +420,7 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
                     device float* out [[buffer(2)]],
                     constant MvParams& p [[buffer(3)]],
                     device const uint* route [[buffer(7)]],
+                    device const float* cs [[buffer(8)]],
                     uint tg [[threadgroup_position_in_grid]],
                     uint sg [[simdgroup_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]]) {
@@ -387,6 +471,17 @@ kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
         }
     }
     const float t0 = simd_sum(acc0), t1 = simd_sum(acc1);
+    if (lane == 0 && p.rope_hd != 0 && r0 + 1 < p.rows) {
+        // The pair (r0, r0 + 1), r0 even: rope_norm's rotation, on the
+        // values it would read back.
+        device float* o = out + p.out_off + ulong(slot) * p.out_slot_stride;
+        const uint e = r0 % p.rope_hd;
+        const float c = cs[e], s = cs[e + 1];
+        const float a = p.scale * t0, b = p.scale * t1;
+        o[r0] = a * c - b * s;
+        o[r0 + 1] = a * s + b * c;
+        return;
+    }
     if (lane == 0) {
         for (uint i = 0; i < 2 && r0 + i < p.rows; ++i) {
             device float* o =
@@ -2153,6 +2248,44 @@ kernel void head_rmsnorm(device float* v [[buffer(0)]],
     }
 }
 
+// head_rmsnorm then rope_norm on one token's heads in one dispatch
+// (i#1064: qwen3's q / k): the normalized values stay in registers, with
+// the same arithmetic as the two kernels, so the same bits. A simdgroup
+// a head; NEOX pairs (i, i + head_dim / 2), else (2 i, 2 i + 1).
+struct HeadNormRopeParams {
+    HeadNormParams n;  // n_tok 1
+    uint neox;
+};
+
+kernel void head_norm_rope(device float* v [[buffer(0)]],
+                           device const float* w [[buffer(1)]],
+                           device const float* cs [[buffer(2)]],
+                           constant HeadNormRopeParams& p [[buffer(3)]],
+                           uint g [[threadgroup_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    if (g >= p.n.n_heads) {
+        return;
+    }
+    const uint hd = p.n.head_dim, half_d = hd / 2;
+    device float* x = v + p.n.off + ulong(g) * hd;
+    float s = 0.0f;
+    for (uint i = lane; i < hd; i += 32) {
+        s += x[i] * x[i];
+    }
+    s = simd_sum(s);
+    const float inv = 1.0f / sqrt(s / float(hd) + p.n.eps);
+    // Every lane has read its x before any lane writes.
+    simdgroup_barrier(mem_flags::mem_device);
+    for (uint i = lane; i < half_d; i += 32) {
+        const uint i0 = p.neox != 0 ? i : 2 * i;
+        const uint i1 = p.neox != 0 ? i + half_d : 2 * i + 1;
+        const float a = x[i0] * inv * w[i0], b = x[i1] * inv * w[i1];
+        const float c = cs[2 * i], sn = cs[2 * i + 1];
+        x[i0] = a * c - b * sn;
+        x[i1] = a * sn + b * c;
+    }
+}
+
 struct MoeSumParams {
     uint n;      // the residual's width
     uint k;      // experts a token
@@ -2200,4 +2333,139 @@ kernel void shared_add(device float* x [[buffer(0)]],
     const float g =
         p.gated != 0 ? as_type<float>(route[p.gate_at + i / p.n]) : 1.0f;
     x[i] += g * y[i];
+}
+
+// ---------------------------------------------------------------------
+// conv2d (i#1050): the image VAEs' 2D convolution, groups 1, as an
+// implicit GEMM on the simdgroup matrices: out[oc][p] = bias[oc] +
+// sum_k W[oc][k] B[k][p], k = (ci, ky, kx) in the weight's order and B
+// the input pixels under the kernel (zero outside the plane).
+
+struct Conv2dParams {
+    uint in_ch, in_h, in_w, out_ch, oh, ow, kh, kw, stride, pad;
+    uint has_bias, K, P;  // K = in_ch kh kw, P = oh ow
+};
+
+constant constexpr uint kCvT = 64;  // a tile's out channels
+constant constexpr uint kCvP = 32;  // a tile's pixels
+constant constexpr uint kCvK = 16;  // the K step staged a time
+// The staged tiles' row strides, padded off a multiple of 32 floats so
+// a simdgroup_load's 8 rows fall in different banks.
+constant constexpr uint kCvPA = kCvK + 4;
+constant constexpr uint kCvPB = kCvP + 4;
+
+// tab[k]: k's input offset (ci in_h + ky) in_w + kx, then ky << 16 | kx,
+// so the staging divides nothing. Threadgroup g (128 threads) takes
+// out channels 64 (g / tiles_p) .. +64 and pixels 32 (g % tiles_p) ..
+// +32; simdgroup sg a 32 x 16 quarter as 4 x 2 blocks of 8 x 8 (more
+// accumulators a simdgroup ran slower: 64 x 64 tiles took twice as
+// long). Each K step stages W's 64 x 16 and B's 16 x 32 in threadgroup
+// memory.
+kernel void conv2d_gemm(device const float* in [[buffer(0)]],
+                        device const float* wt [[buffer(1)]],
+                        device const float* bias [[buffer(2)]],
+                        device float* out [[buffer(3)]],
+                        device const uint2* tab [[buffer(4)]],
+                        constant Conv2dParams& p [[buffer(5)]],
+                        uint g [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float ta[kCvT * kCvPA];  // W: [oc][k]
+    threadgroup float tb[kCvK * kCvPB];  // B: [k][pixel]
+    threadgroup float dgall[4 * 64];
+    threadgroup float* d = dgall + sg * 64;
+    const uint tiles_p = (p.P + kCvP - 1) / kCvP;
+    const uint p0 = (g % tiles_p) * kCvP, oc0 = (g / tiles_p) * kCvT;
+    const uint sr = (sg & 1) * 32, sc = (sg >> 1) * 16;
+
+    // The bias, broadcast along the pixels, starts the sums.
+    simdgroup_float8x8 acc[4][2];
+    for (uint i = 0; i < 4; ++i) {
+        for (uint e = lane; e < 64; e += 32) {
+            const uint oc = oc0 + sr + i * 8 + e / 8;
+            d[e] = p.has_bias != 0 && oc < p.out_ch ? bias[oc] : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 bm;
+        simdgroup_load(bm, d, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0; j < 2; ++j) {
+            acc[i][j] = bm;
+        }
+    }
+
+    // B: this thread's pixel (128 threads over 32 pixels) and its rows
+    // bk, bk + 4, ...; W: column tid % 16 of rows tid / 16, + 8, ...
+    // (16 lanes read a row's 16 floats together).
+    const uint bp = tid % kCvP, bk = tid / kCvP;
+    const uint pix = p0 + bp;
+    const bool pin = pix < p.P;
+    const uint oy = pin ? pix / p.ow : 0, ox = pin ? pix % p.ow : 0;
+    const int iy0 = int(oy * p.stride) - int(p.pad);
+    const int ix0 = int(ox * p.stride) - int(p.pad);
+    const long base = long(iy0) * p.in_w + ix0;
+    const uint ac = tid % kCvK, ar0 = tid / kCvK;
+    for (uint k0 = 0; k0 < p.K; k0 += kCvK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint ar = ar0; ar < kCvT; ar += 128 / kCvK) {
+            const uint k = k0 + ac, oc = oc0 + ar;
+            ta[ar * kCvPA + ac] =
+                oc < p.out_ch && k < p.K ? wt[ulong(oc) * p.K + k] : 0.0f;
+        }
+        for (uint i = 0; i < kCvK / 4; ++i) {
+            const uint kr = bk + 4 * i, k = k0 + kr;
+            float v = 0.0f;
+            if (pin && k < p.K) {
+                const uint2 t = tab[k];
+                const int iy = iy0 + int(t.y >> 16);
+                const int ix = ix0 + int(t.y & 0xffffu);
+                if (iy >= 0 && iy < int(p.in_h) && ix >= 0 &&
+                    ix < int(p.in_w)) {
+                    v = in[base + long(t.x)];
+                }
+            }
+            tb[kr * kCvPB + bp] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0; kk < kCvK; kk += 8) {
+            simdgroup_float8x8 a[4], b[2];
+            for (uint i = 0; i < 4; ++i) {
+                simdgroup_load(a[i], ta + (sr + i * 8) * kCvPA + kk, kCvPA);
+            }
+            for (uint j = 0; j < 2; ++j) {
+                simdgroup_load(b[j], tb + kk * kCvPB + sc + j * 8, kCvPB);
+            }
+            for (uint i = 0; i < 4; ++i) {
+                for (uint j = 0; j < 2; ++j) {
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j],
+                                                  acc[i][j]);
+                }
+            }
+        }
+    }
+
+    // Whole blocks straight out; a block over the channel or pixel tail
+    // through d, its inside rows and columns only.
+    for (uint i = 0; i < 4; ++i) {
+        for (uint j = 0; j < 2; ++j) {
+            const uint r0 = oc0 + sr + i * 8, c0 = p0 + sc + j * 8;
+            if (r0 >= p.out_ch || c0 >= p.P) {
+                continue;
+            }
+            if (r0 + 8 <= p.out_ch && c0 + 8 <= p.P) {
+                simdgroup_store(acc[i][j], out + ulong(r0) * p.P + c0, p.P);
+                continue;
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_store(acc[i][j], d, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = lane; e < 64; e += 32) {
+                const uint r = r0 + e / 8, c = c0 + e % 8;
+                if (r < p.out_ch && c < p.P) {
+                    out[ulong(r) * p.P + c] = d[e];
+                }
+            }
+        }
+    }
 }
