@@ -19,6 +19,12 @@ ids, then STEPS + 1 rows of logits (vocabulary-wide).
     run-offline.sh scripts/image/make-qwen-vl-chat-golden.py \\
         --processor DIR
 
+The processor is built from its image processor and tokenizer only
+(ImageOnly): transformers 4.56.1's Qwen2VLProcessor also builds a video
+processor, which needs torchvision, and the pinned venv has none. The
+image path never uses the video processor, and at a multiple of 28 no
+resize runs, so the slow image processor gives the fast one's pixels.
+
 Tested with Python 3.12, torch 2.5.1, transformers 4.56.1, numpy 2.1.3
 and pillow 11.3.0.
 """
@@ -30,7 +36,8 @@ import sys
 import numpy as np
 import torch
 from PIL import Image
-from transformers import Qwen2VLProcessor
+from transformers import (AutoTokenizer, Qwen2VLImageProcessor,
+                          Qwen2VLProcessor)
 
 HERE = pathlib.Path(__file__).resolve().parent
 GOLDEN = HERE.parents[1] / "tests" / "golden"
@@ -39,6 +46,23 @@ GOLDEN = HERE.parents[1] / "tests" / "golden"
 IMG_W, IMG_H = 84, 56
 QUESTION = "What is in the picture?"
 STEPS = 3
+
+
+class ImageOnly(Qwen2VLProcessor):
+    """Qwen2VLProcessor without its video processor (no torchvision):
+    ProcessorMixin's __init__ on the image processor and tokenizer, then
+    the token fields Qwen2VLProcessor's __init__ would set."""
+
+    attributes = ["image_processor", "tokenizer"]
+
+    def __init__(self, image_processor, tokenizer, chat_template=None):
+        self.video_processor = None
+        super(Qwen2VLProcessor, self).__init__(
+            image_processor, tokenizer, chat_template=chat_template)
+        self.image_token = getattr(tokenizer, "image_token", "<|image_pad|>")
+        self.video_token = getattr(tokenizer, "video_token", "<|video_pad|>")
+        self.image_token_id = tokenizer.convert_tokens_to_ids(self.image_token)
+        self.video_token_id = tokenizer.convert_tokens_to_ids(self.video_token)
 
 
 def load(name):
@@ -59,7 +83,10 @@ def main():
     vae_mod = load("make-qwen-vae-goldens")
     torch.manual_seed(0)
     model = edit.text_encoder()
-    proc = Qwen2VLProcessor.from_pretrained(a.processor)
+    proc = ImageOnly(Qwen2VLImageProcessor.from_pretrained(a.processor),
+                     AutoTokenizer.from_pretrained(a.processor),
+                     chat_template=(a.processor / "chat_template.jinja")
+                     .read_text())
 
     rgb, _ = vae_mod.lcg(777, IMG_H * IMG_W * 3)
     rgb = np.clip((rgb + 0.25) * 510.0, 0, 255).astype(np.uint8)
