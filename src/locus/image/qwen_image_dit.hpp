@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "locus/backend/cpu_ops.hpp"
@@ -150,5 +151,22 @@ class QwenImageDit {
     Linear img_in_, txt_in_, t1_, t2_, norm_out_, proj_out_;
     std::vector<Block> blocks_;
 };
+
+/**
+ * Checks that a qwen_image GGUF holds the checkpoint a pipeline needs
+ * (i#1099): Qwen-Image-Edit's and Qwen-Image's transformers share the
+ * class and every shape, so only qwen_image.pipeline ("edit" or
+ * "text-to-image", written by scripts/image/convert-qwen-image.py)
+ * tells them apart. A GGUF without the key (converted before it) is
+ * accepted.
+ *
+ * @param dit The qwen_image GGUF.
+ * @param want "edit" or "text-to-image": the pipeline its folder makes
+ *     (a vision tower GGUF beside it makes an edit pipeline).
+ * @throws gguf::Error on another or unknown value, saying how to fix
+ *     the folder.
+ */
+void qwen_image_check_pipeline(const gguf::GgufFile& dit,
+                               std::string_view want);
 
 }  // namespace locus::image

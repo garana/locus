@@ -168,7 +168,12 @@ always when Janus is not loaded. The fields are `prompt`,
 `steps` (2 to 100, default 50), `max_sequence_length` (prompt tokens
 kept, 1 to 1024, default 512), `seed` and `size` (default 1024x1024,
 sides 16 to 2048, floored to multiples of 16); `X-Image-Seed` and
-`Server-Timing` come back as for the edits.
+`Server-Timing` come back as for the edits. The converter records
+which checkpoint a transformer GGUF holds (`qwen_image.pipeline`,
+"edit" or "text-to-image"); the server refuses to start when it does
+not match the folder (an edit transformer without the mmproj, or a
+text-to-image one with it), and says how to fix the folder. A GGUF
+converted before this key loads as before.
 
 FLUX requests (generations and edits) can apply LoRAs from the
 server's `--lora-dir`, a directory of GGUFs from
