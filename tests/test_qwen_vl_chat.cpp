@@ -119,18 +119,22 @@ TEST_CASE("qwen vl chat ids expand pads and place M-RoPE positions",
                       std::invalid_argument);
 }
 
-// i#1092: transformers' Qwen2_5_VLForConditionalGeneration with its
-// processor and chat template (scripts/image/make-qwen-vl-chat-golden.py)
-// on the tiny Qwen2.5-VL with the real vocabulary: an 84 x 56 LCG image
-// then "What is in the picture?", greedy. The prompt's last logits and
-// three steps after it match, and so do the four greedy tokens.
-TEST_CASE("qwen vl chat matches transformers on a tiny model",
-          "[qwen-vl]") {
-    if (!std::filesystem::exists(kTokModel)) {
-        SKIP("qwen2.5-0.5b-instruct-q8_0.gguf absent (its tokenizer)");
-    }
+namespace {
+
+/**
+ * transformers' Qwen2_5_VLForConditionalGeneration with its processor
+ * and chat template (scripts/image/make-qwen-vl-chat-golden.py --image
+ * kWxkH --out golden) on the tiny Qwen2.5-VL with the real vocabulary:
+ * a kW x kH LCG image then "What is in the picture?", greedy. The
+ * prompt's last logits and three steps after it must match, and so must
+ * the four greedy tokens.
+ *
+ * @param split_image Also require a prefill chunk boundary inside the
+ *     image's tokens (i#1096).
+ */
+void chat_golden(std::uint32_t kW, std::uint32_t kH,
+                 const std::string& golden, bool split_image) {
     constexpr std::uint64_t kVocab = 151936;
-    constexpr std::uint32_t kW = 84, kH = 56;
     const auto tok_g = locus::gguf::GgufFile::open(kTokModel);
     const auto tok = locus::tok::tokenizer_from_gguf(tok_g);
     const auto lm_img = qwen_tiny::lm("qwen2vl", kVocab);
@@ -170,12 +174,20 @@ TEST_CASE("qwen vl chat matches transformers on a tiny model",
     const auto p = locus::image::qwen_vl_chat_ids(
         *tok, locus::image::qwen_vl_chat_text(turns, std::nullopt), grid);
 
-    const auto ref = read_f32(kGolden);
+    const auto ref = read_f32(golden);
     REQUIRE(ref.size() >= 2);
     const auto n_prompt = static_cast<std::size_t>(ref[0]);
     const auto steps = static_cast<std::size_t>(ref[1]);
     REQUIRE(ref.size() == 2 + steps + steps * kVocab);
     REQUIRE(p.ids.size() == n_prompt);
+    if (split_image) {
+        // A chunk boundary falls inside the image's tokens.
+        const std::size_t chunk = lm.prefill_chunk();
+        const std::size_t first = p.image_at[0];
+        const std::size_t end = first + std::size_t{grid[0].first} *
+                                            grid[0].second;
+        REQUIRE((first / chunk + 1) * chunk < end);
+    }
 
     auto cache = lm.make_cache();
     auto ws = lm.make_workspace();
@@ -208,4 +220,29 @@ TEST_CASE("qwen vl chat matches transformers on a tiny model",
         }
     }
     cache.release(seq);
+}
+
+}  // namespace
+
+// i#1092: an 84 x 56 image (6 merged tokens), the prompt in one chunk.
+TEST_CASE("qwen vl chat matches transformers on a tiny model",
+          "[qwen-vl]") {
+    if (!std::filesystem::exists(kTokModel)) {
+        SKIP("qwen2.5-0.5b-instruct-q8_0.gguf absent (its tokenizer)");
+    }
+    chat_golden(84, 56, kGolden, false);
+}
+
+// i#1096: a 252 x 252 image (81 merged tokens) puts a prefill chunk
+// boundary inside the image, and its 18 x 18 patches span several
+// attention windows of the tower.
+TEST_CASE("qwen vl chat matches transformers across prefill chunks",
+          "[qwen-vl]") {
+    if (!std::filesystem::exists(kTokModel)) {
+        SKIP("qwen2.5-0.5b-instruct-q8_0.gguf absent (its tokenizer)");
+    }
+    chat_golden(252, 252,
+                std::string(LOCUS_SOURCE_DIR) +
+                    "/tests/golden/qwen_vl_chat_252.f32",
+                true);
 }
