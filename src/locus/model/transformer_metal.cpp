@@ -161,6 +161,10 @@ struct HeadNormParams {
     std::uint32_t n_tok, n_heads, head_dim, stride;
     float eps;
 };
+struct HeadNormRopeParams {
+    HeadNormParams n;
+    std::uint32_t neox;
+};
 struct AttnParams {
     std::uint64_t block_floats, layer_off, v_off;
     std::uint32_t n_pos, block_tokens, n_heads, n_kv_heads, head_dim;
@@ -874,6 +878,20 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
         const bool rope_epilogue =
             r.neox == 0 &&
             (re_env == nullptr || std::string_view(re_env) != "0");
+        // head_rmsnorm then rope_norm as one dispatch (i#1064);
+        // LOCUS_METAL_NORM_ROPE=0 keeps the two (tests, benches).
+        const char* nr_env = std::getenv("LOCUS_METAL_NORM_ROPE");
+        const bool norm_rope =
+            nr_env == nullptr || std::string_view(nr_env) != "0";
+        const auto head_norm_rope = [&](const Context::Buffer& v,
+                                        std::uint64_t off,
+                                        std::uint32_t heads,
+                                        std::span<const float> w) {
+            const HeadNormRopeParams hp{{off, 1, heads, hd, 0, hp_.rms_eps},
+                                        r.neox};
+            const Context::Arg a[] = {{&v, 0}, {&r.f(w), 0}, {&s.cs, 0}};
+            ctx.dispatch("head_norm_rope", a, bytes_of(hp), heads * 32, 32);
+        };
 
         run_batch(ctx, [&] {
             for (std::uint32_t l = 0; l < L; ++l) {
@@ -906,16 +924,23 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     ctx.overlap_next();
                     r.bias(*pool, vrow, lay.wv_bias, 1, 0);
                 }
-                if (lay.has_qk_norm()) {
+                const bool qk_norm_rope = lay.has_qk_norm() && norm_rope;
+                if (qk_norm_rope) {
+                    // qwen3: the per-head q / k norms with their RoPE, one
+                    // dispatch each (overlapping).
+                    head_norm_rope(s.q, 0, H, lay.attn_q_norm);
+                    ctx.overlap_next();
+                    head_norm_rope(*pool, krow, KV, lay.attn_k_norm);
+                } else if (lay.has_qk_norm()) {
                     // qwen3: the per-head q / k norms (overlapping).
                     r.head_norm(s.q, 0, H, lay.attn_q_norm, 1, 0);
                     ctx.overlap_next();
                     r.head_norm(*pool, krow, KV, lay.attn_k_norm, 1, 0);
                 }
-                if (!rq) {
+                if (!rq && !qk_norm_rope) {
                     r.rope(s.q, 0, H);
                 }
-                if (!rk) {
+                if (!rk && !qk_norm_rope) {
                     if (!rq) {
                         ctx.overlap_next();
                     }
