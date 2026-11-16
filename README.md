@@ -57,7 +57,9 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   (T5-XXL encoder, DiT, DPM-Solver++, SD VAE; one 512 x 512 PNG), or
   with FLUX.1 dev, schnell or Kontext dev as text to image (CLIP-L and
   T5-XXL, the MMDiT, flow-matching Euler, the FLUX VAE; up to 1024 x
-  1024 pixels). `/v1/images/edits` runs Qwen-Image-Edit
+  1024 pixels), or with Qwen-Image (Qwen2.5-VL text encoder, the 20B
+  MMDiT with true CFG, the Qwen-Image VAE; up to 2048 a side).
+  `/v1/images/edits` runs Qwen-Image-Edit
   (instruction-based edits with true CFG) or FLUX.1 Kontext dev on a
   reference image (its VAE-encoded tokens join the image tokens), for
   the same character or scene in a new picture. On a Vulkan GPU with
@@ -101,11 +103,11 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 
 ### Media: from what to what
 
-| From \ To | Text                                   | Image                                               | Video                                    |
-|-----------|----------------------------------------|-----------------------------------------------------|------------------------------------------|
-| Text      | completions, chat, messages, responses | `/v1/images/generations`: Janus-Pro, PixArt, FLUX.1 | `/v1/videos`: LTX-Video                  |
-| Image     | chat with an image: Janus-Pro-1B       | `/v1/images/edits`: Qwen-Image-Edit, FLUX.1 Kontext | `/v1/videos` with `input_reference`: LTX |
-| Video     | no                                     | no                                                  | no                                       |
+| From \ To | Text                                   | Image                                                           | Video                                    |
+|-----------|----------------------------------------|-----------------------------------------------------------------|------------------------------------------|
+| Text      | completions, chat, messages, responses | `/v1/images/generations`: Janus-Pro, PixArt, FLUX.1, Qwen-Image | `/v1/videos`: LTX-Video                  |
+| Image     | chat with an image: Janus-Pro-1B       | `/v1/images/edits`: Qwen-Image-Edit, FLUX.1 Kontext             | `/v1/videos` with `input_reference`: LTX |
+| Video     | no                                     | no                                                              | no                                       |
 
 Speech (text to audio) is `/v1/audio/speech`. How these run together:
 
