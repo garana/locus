@@ -101,6 +101,23 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint64_t out_off, bool accumulate);
 
 /**
+ * record_matvec (not accumulated) with rope_norm applied in its store
+ * (i#1064): rows 2 i and 2 i + 1 of each head_dim-wide head rotate by
+ * cs[2 i] (cos) and cs[2 i + 1] (sin), the same arithmetic on the same
+ * values, so the result is rope_norm's to the bit, one dispatch and one
+ * barrier fewer.
+ * @returns false, recording nothing, unless t is Q4_K (ggml's layout
+ *     gives a simdgroup each even row with its pair) and rows is whole
+ *     even-width heads: the caller then runs rope_norm itself.
+ */
+bool record_matvec_rope(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                        std::uint32_t cols, const Context::Buffer& w,
+                        std::uint64_t w_off, const Context::Buffer& x,
+                        std::uint32_t x_off, const Context::Buffer& out,
+                        std::uint64_t out_off, const Context::Buffer& cs,
+                        std::uint32_t head_dim);
+
+/**
  * Records out[out_off + t * out_stride + r] (+)= dot(row r, x token t)
  * for r < rows and t < n_tok: the prefill matmul, each weight row read
  * once for a tile of 32 tokens. Token t of x starts at x_off + t *

@@ -61,6 +61,7 @@ struct MvParams {
     float scale;
     std::uint32_t route_slot, n_slots, x_slot_stride, out_slot_stride;
     std::uint32_t slot_div;
+    std::uint32_t rope_hd;  // Q4_K's RoPE epilogue (record_matvec_rope)
 };
 
 constexpr std::uint32_t kNoRoute = 0xFFFFFFFFu;  // kernels.metal's
@@ -201,7 +202,9 @@ void record_mv(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                bool accumulate, std::uint32_t n_slots = 1,
                std::uint32_t x_slot_stride = 0,
                std::uint32_t out_slot_stride = 0,
-               std::uint32_t slot_div = 1) {
+               std::uint32_t slot_div = 1,
+               const Context::Buffer* rope_cs = nullptr,
+               std::uint32_t rope_hd = 0) {
     const Kind k = kind_of(t);
     if (k.kernel == nullptr || cols % k.block != 0 || x_off % 4 != 0) {
         throw std::invalid_argument("metal record_matvec: no kernel");
@@ -218,11 +221,16 @@ void record_mv(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                      n_slots,
                      x_slot_stride,
                      out_slot_stride,
-                     slot_div};
+                     slot_div,
+                     rope_hd};
     // The route buffer binds at 7 always (x when there is none; the
     // kernel reads it only for a routed call).
     const Context::Arg args[] = {
-        {&w, 0}, {&x, 0}, {&out, 0}, {route != nullptr ? route : &x, 0, 7}};
+        {&w, 0},
+        {&x, 0},
+        {&out, 0},
+        {route != nullptr ? route : &x, 0, 7},
+        {rope_cs != nullptr ? rope_cs : &x, 0, 8}};
     const std::uint32_t groups = (rows + k.rows - 1) / k.rows;
     ctx.dispatch(k.kernel, args, std::as_bytes(std::span(&p, 1)),
                  groups * n_slots * k.group, k.group);
@@ -237,6 +245,21 @@ void record_matvec(Context& ctx, gguf::TensorType t, std::uint32_t rows,
                    std::uint64_t out_off, bool accumulate) {
     record_mv(ctx, t, rows, cols, w, w_off, 0, nullptr, 0, x, x_off, out,
               out_off, accumulate);
+}
+
+bool record_matvec_rope(Context& ctx, gguf::TensorType t, std::uint32_t rows,
+                        std::uint32_t cols, const Context::Buffer& w,
+                        std::uint64_t w_off, const Context::Buffer& x,
+                        std::uint32_t x_off, const Context::Buffer& out,
+                        std::uint64_t out_off, const Context::Buffer& cs,
+                        std::uint32_t head_dim) {
+    if (t != TensorType::kQ4_K || head_dim == 0 || head_dim % 2 != 0 ||
+        rows % head_dim != 0) {
+        return false;
+    }
+    record_mv(ctx, t, rows, cols, w, w_off, 0, nullptr, 0, x, x_off, out,
+              out_off, false, 1, 0, 0, 1, &cs, head_dim);
+    return true;
 }
 
 void record_matvec_slots(Context& ctx, gguf::TensorType t,
