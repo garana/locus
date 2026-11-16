@@ -229,6 +229,15 @@ struct ServerConfig {
      * past it is closed at accept (i#625 F21). 0 (default) = no cap: a
      * router in front reaches an instance from one address. */
     std::size_t max_conns_per_ip = 0;
+    /** TCP keepalive on each accepted socket (i#994;
+     * pipeline::set_keepalive): probes after this many idle seconds,
+     * then every keepalive_intvl_s, and the kernel fails the socket
+     * after keepalive_count unanswered ones, so a client whose host
+     * died is found in about a minute and its generation stops. 0 =
+     * off. */
+    int keepalive_idle_s = 30;
+    int keepalive_intvl_s = 10;
+    int keepalive_count = 3;
     /** Routes served on the fast-path acceptor thread rather than the
      * inference worker pool, so cheap control endpoints (/health,
      * /metrics) are not starved when every worker is busy in a long
@@ -249,6 +258,24 @@ struct ServerConfig {
      * errors); null records nothing. */
     std::shared_ptr<HttpMetrics> metrics;
 };
+
+/**
+ * Applies cfg's keepalive to an accepted client socket (i#994), and the
+ * same bound on unacknowledged data (i#1016: idle + interval x count,
+ * pipeline::set_user_timeout), so a client whose host died is found in
+ * about that time whether its connection idles or streams.
+ */
+inline void apply_keepalive(int fd, const ServerConfig& cfg) {
+    locus::pipeline::set_keepalive(fd, cfg.keepalive_idle_s,
+                                   cfg.keepalive_intvl_s,
+                                   cfg.keepalive_count);
+    const int bound_s =
+        cfg.keepalive_idle_s > 0
+            ? cfg.keepalive_idle_s +
+                  cfg.keepalive_intvl_s * cfg.keepalive_count
+            : 0;
+    locus::pipeline::set_user_timeout(fd, bound_s * 1000);
+}
 
 /**
  * What a caller drives an HTTP server by, so it can pick the thread

@@ -7,6 +7,7 @@
 #include <string>
 
 #include "locus/image/dense.hpp"
+#include "locus/image/tensor_read.hpp"
 
 namespace locus::image {
 
@@ -48,8 +49,7 @@ ClipTextEncoder ClipTextEncoder::load(const gguf::GgufFile& g) {
     }
 
     const auto info = [&](const std::string& name, std::uint64_t n) {
-        const gguf::TensorInfo* ti = g.find_tensor(name);
-        if (ti == nullptr) throw gguf::Error("clip: missing " + name);
+        const gguf::TensorInfo* ti = require_tensor(g, "clip", name);
         if (ti->type != gguf::TensorType::kF32 || ti->nelements() != n) {
             throw gguf::Error("clip: " + name + " must be F32 with " +
                               std::to_string(n) + " values");
@@ -57,10 +57,7 @@ ClipTextEncoder ClipTextEncoder::load(const gguf::GgufFile& g) {
         return ti;
     };
     const auto vec = [&](const std::string& name, std::uint32_t n) {
-        const auto bytes = g.tensor_data(*info(name, n));
-        std::vector<float> out(n);
-        std::memcpy(out.data(), bytes.data(), std::size_t{n} * 4);
-        return out;
+        return read_floats(g, "clip", name, n);
     };
     const auto lin = [&](const std::string& p, std::uint32_t rows,
                          std::uint32_t cols) {

@@ -264,6 +264,11 @@ class TransformerModel {
      */
     void use_backend(const backend::Backend& b) { backend_ = &b; }
 
+    /** @returns Whether metal_forward takes this model on its backend
+     *  (any cache conditions aside): the batched paths then run it a
+     *  token at a time, so they match the per-token forward. */
+    bool metal_forward_supported() const;
+
     /** @returns The backend currently doing the math. */
     const backend::Backend& active_backend() const {
         return *backend_;
@@ -834,11 +839,6 @@ class TransformerModel {
      *  and LOCUS_CUDA_FORWARD not 0. */
     bool cuda_forward_supported() const;
 
-    /** @returns Whether metal_forward takes this model on its backend
-     *  (any cache conditions aside): the batched paths then run it a
-     *  token at a time, so they match the per-token forward. */
-    bool metal_forward_supported() const;
-
     /**
      * Metal forward of a plain llama model (i#866): one token at
      * position pos of seq, every layer on the GPU in one command batch
@@ -859,6 +859,10 @@ class TransformerModel {
                        kv::PagedKvCache::Seq& seq, std::uint32_t pos,
                        kv::PagedKvCache& cache, Workspace& ws,
                        std::span<float> logits, LogitRows rows_out) const;
+
+    /** @returns 1 when the Metal forwards pair RoPE NEOX-style (qwen2's
+     *  and qwen3moe's attention), else 0. */
+    std::uint32_t metal_neox() const;
 
     /**
      * metal_forward over a prompt chunk (i#866): the tokens at

@@ -28,7 +28,8 @@ void linear(const backend::Ops& op, const backend::Mat& w,
  *
  * Each head's keys are copied to a [nk][hd] matrix and its values to
  * [hd][nk], so the scores and the weighted sum run through the
- * backend's batched matvec, 64 queries at a time.
+ * backend's batched matvec, 64 queries at a time. Under
+ * LOCUS_CPU_FAST the softmax is softmax_fast_inplace.
  */
 void attention(const backend::Ops& op, std::span<const float> q,
                std::uint32_t nq, std::span<const float> k,

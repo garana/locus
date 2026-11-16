@@ -133,15 +133,16 @@ is cancelled. On the CPU, quantized weights use 8-bit activations
 where the backend's int8 dot is the fast path (neon, sse4, scalar),
 as llama.cpp does; `LOCUS_F32_ACTIVATIONS=1` selects f32 activations.
 `LOCUS_CPU_FAST=1` opts in to CPU kernels with a different float order
-(today every CPU softmax: attention, MoE routing and the image
-encoders, about 2x faster; and on ARM CPUs with i8mm, such as the
-M2 and later, Q8_0 weights through `smmla`, about 27% faster prefill
-on an M2 Pro; on Apple, prefill matmuls of 32 tokens or more through
-Accelerate's `cblas_sgemm` in 2048-token chunks, about 26% faster on a
-1680-token prompt on an M2 Pro; on x86 CPUs with AVX but not AVX2,
-one-token Q4_K and Q6_K rows in llama.cpp's float order, about 17%
-faster one-thread decode on an i5-2400): close to the default results
-but not bit-identical, so the goldens are checked without it.
+(today every CPU softmax: attention, including the image and video
+models', MoE routing and the image encoders, about 2x faster; and on
+ARM CPUs with i8mm, such as the M2 and later, Q8_0 weights through
+`smmla`, about 27% faster prefill on an M2 Pro; on Apple, prefill
+matmuls of 32 tokens or more through Accelerate's `cblas_sgemm` in
+2048-token chunks, about 26% faster on a 1680-token prompt on an M2
+Pro; on x86 CPUs with AVX but not AVX2, one-token Q4_K and Q6_K rows
+in llama.cpp's float order, about 17% faster one-thread decode on an
+i5-2400): close to the default results but not bit-identical, so the
+goldens are checked without it.
 
 ### Validated models
 
@@ -237,7 +238,12 @@ but `/health` need a key the helper allows (`locus-auth-helper` is a
 reference one). `--event-loop` serves every connection from one I/O
 thread with the handlers on a job pool, so idle and slow clients hold
 no thread (a thread a connection otherwise), and nor does a
-generation waiting on the engine. `locus-server --help`
+generation waiting on the engine. Client sockets have TCP keepalive
+on (`--tcp-keepalive 30,10,3` by default), so a client whose host
+died is found in about a minute and its generation stops; on Linux
+the same bound applies to unacknowledged data, so a stream to it
+ends as fast.
+`locus-server --help`
 lists the options and environment
 variables;
 `--capabilities` lists the architectures, backends, weight formats

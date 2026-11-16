@@ -1,5 +1,6 @@
 #include "locus/server/engine_group.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -60,6 +61,24 @@ EngineGroup::EngineGroup(const model::TransformerModel& m,
     load_.assign(loops_.size(), 0);
 }
 
+std::vector<std::uint64_t> EngineGroup::prefix_keys(
+    const std::vector<tok::TokenId>& prompt) {
+    // FNV-1a over the ids, chained: key k covers blocks 0..k, so two
+    // prompts share key k only when their first k + 1 blocks match.
+    const std::size_t n =
+        std::min(prompt.size() / kPrefixKeyTokens, kPrefixMaxBlocks);
+    std::vector<std::uint64_t> keys;
+    keys.reserve(n);
+    std::uint64_t h = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < n * kPrefixKeyTokens; ++i) {
+        h = (h ^ static_cast<std::uint32_t>(prompt[i])) * 1099511628211ULL;
+        if ((i + 1) % kPrefixKeyTokens == 0) {
+            keys.push_back(h);
+        }
+    }
+    return keys;
+}
+
 std::string EngineGroup::admit_error(std::uint32_t n_prompt) {
     return loops_.front()->admit_error(n_prompt);
 }
@@ -72,9 +91,35 @@ std::uint64_t EngineGroup::submit(
     std::size_t e = 0;
     {
         std::lock_guard<std::mutex> lk(live_mu_);
+        std::size_t least = 0;
         for (std::size_t i = 1; i < loops_.size(); ++i) {
-            if (load_[i] < load_[e]) {
-                e = i;
+            if (load_[i] < load_[least]) {
+                least = i;
+            }
+        }
+        e = least;
+        // Prefix affinity (i#940, i#988): each engine has its own prefix
+        // cache, so a prompt goes where its longest block-aligned prefix
+        // was last served, to reuse that KV, unless that engine is
+        // busier than the least loaded by more than kPrefixSlack. The
+        // longest match, not the first block: chat prompts mostly share
+        // their template's opening block.
+        if (loops_.size() > 1 && prompt.size() >= kPrefixKeyTokens) {
+            const std::vector<std::uint64_t> keys = prefix_keys(prompt);
+            for (auto k = keys.rbegin(); k != keys.rend(); ++k) {
+                const auto it = last_engine_.find(*k);
+                if (it != last_engine_.end()) {
+                    if (load_[it->second] <= load_[least] + kPrefixSlack) {
+                        e = it->second;
+                    }
+                    break;
+                }
+            }
+            if (last_engine_.size() + keys.size() > kPrefixKeys) {
+                last_engine_.clear();  // bounded: start over when full
+            }
+            for (const std::uint64_t k : keys) {
+                last_engine_[k] = e;
             }
         }
         ++load_[e];
@@ -130,9 +175,24 @@ void EngineGroup::unfollow(std::uint64_t id) {
     loop_of(id).unfollow(local_id(id));
 }
 
-void EngineGroup::set_progress_hook(const std::function<void()>& hook) {
-    for (const auto& l : loops_) {
-        l->set_progress_hook(hook);
+void EngineGroup::set_progress_hook(const EngineLoop::ProgressHook& hook) {
+    const std::uint64_t n = loops_.size();
+    for (std::uint64_t e = 0; e < n; ++e) {
+        if (!hook) {
+            loops_[e]->set_progress_hook({});
+            continue;
+        }
+        // Engine e's local ids back to group ids (local * n + e); the
+        // buffer is only touched by that engine's worker, under its mutex.
+        loops_[e]->set_progress_hook(
+            [hook, e, n, ids = std::vector<std::uint64_t>()](
+                std::span<const std::uint64_t> local) mutable {
+                ids.clear();
+                for (const std::uint64_t l : local) {
+                    ids.push_back(l * n + e);
+                }
+                hook(ids);
+            });
     }
 }
 
