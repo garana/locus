@@ -843,6 +843,9 @@ TEST_CASE("bench: vulkan decode matvecs at the orpheus shapes",
                      << " us, "
                      << static_cast<double>(w.size()) / (best * 1e6)
                      << " GB/s (" << reps << " copies)");
+        // The pool is keyed by pointer, and the next shape's weights may
+        // take this vector's freed address (i#1039).
+        vulkan_release_weights(w.data(), w.size());
     }
     SUCCEED();
 }
