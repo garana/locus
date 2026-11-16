@@ -68,15 +68,6 @@ using nlohmann::json;
  * U+FFFD instead of throwing type_error.316 out of a handler (i#243). */
 constexpr auto kLossy = json::error_handler_t::replace;
 
-/** The GPU ops for the embedding and rerank models' large passes
- *  (EmbeddingModel::kGpuMacs): the Vulkan image ops where the GPU
- *  imports host memory, as for PixArt (the weights stay in the GGUF
- *  mapping, #512); else the CUDA ops when a CUDA device is usable, the
- *  matrices through its batched matvec (i#519); else the Vulkan image
- *  ops on a device measured faster than the CPU (a discrete GPU), which
- *  copy the weights into the device pool: under 700 MB for these models
- *  (i#680); else null, the CPU everywhere. Not on V3D or llvmpipe,
- *  which run these passes slower than the CPU (i#612). */
 /** One route's engine: the backend's name (for the startup log) and
  *  the ops the route runs with. Each route takes its ops from one of
  *  the *_engine() functions below, and OpenAiServer::engines() its
@@ -86,6 +77,15 @@ struct EngineChoice {
     const backend::Ops* ops;  // null: encoder_engine()'s CPU
 };
 
+/** The embedding and rerank models' engine for their large passes
+ *  (EmbeddingModel::kGpuMacs): the Vulkan image ops where the GPU
+ *  imports host memory, as for PixArt (the weights stay in the GGUF
+ *  mapping, #512); else the CUDA ops when a CUDA device is usable, the
+ *  matrices through its batched matvec (i#519); else the Vulkan image
+ *  ops on a device measured faster than the CPU (a discrete GPU), which
+ *  copy the weights into the device pool: under 700 MB for these models
+ *  (i#680); else the CPU everywhere (null ops). Not on V3D or llvmpipe,
+ *  which run these passes slower than the CPU (i#612). */
 EngineChoice encoder_engine() {
     if (backend::vulkan_imports_host_memory()) {
         return {"vulkan", &backend::vulkan_image_ops()};
@@ -1347,7 +1347,7 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
         devices_.push_back({"cuda", backend::cuda_device_name()});
     }
     if ((pixart_ || flux_ || qwen_edit_) && be != "vulkan" &&
-        backend::vulkan_imports_host_memory()) {
+        diffusion_engine().name == "vulkan") {
         devices_.push_back({"vulkan", backend::vulkan_device_name()});
     }
     install_routes();
