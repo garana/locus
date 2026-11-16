@@ -103,11 +103,11 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
 
 ### Media: from what to what
 
-| From \ To | Text                                   | Image                                                           | Video                                    |
-|-----------|----------------------------------------|-----------------------------------------------------------------|------------------------------------------|
-| Text      | completions, chat, messages, responses | `/v1/images/generations`: Janus-Pro, PixArt, FLUX.1, Qwen-Image | `/v1/videos`: LTX-Video                  |
-| Image     | chat with an image: Janus-Pro-1B       | `/v1/images/edits`: Qwen-Image-Edit, FLUX.1 Kontext             | `/v1/videos` with `input_reference`: LTX |
-| Video     | no                                     | no                                                              | no                                       |
+| From \ To | Text                                         | Image                                                           | Video                                    |
+|-----------|----------------------------------------------|-----------------------------------------------------------------|------------------------------------------|
+| Text      | completions, chat, messages, responses       | `/v1/images/generations`: Janus-Pro, PixArt, FLUX.1, Qwen-Image | `/v1/videos`: LTX-Video                  |
+| Image     | chat with an image: Janus-Pro-1B, Qwen2.5-VL | `/v1/images/edits`: Qwen-Image-Edit, FLUX.1 Kontext             | `/v1/videos` with `input_reference`: LTX |
+| Video     | no                                           | no                                                              | no                                       |
 
 Speech (text to audio) is `/v1/audio/speech`. How these run together:
 
