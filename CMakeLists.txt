@@ -75,6 +75,7 @@ add_library(locus
     src/locus/image/qwen_edit_pipeline.cpp
     src/locus/image/qwen_vision.cpp
     src/locus/image/qwen_edit_text.cpp
+    src/locus/image/qwen_vl_chat.cpp
     src/locus/image/qwen_edit_image.cpp
     src/locus/image/classifier.cpp
     src/locus/image/cnn.cpp
