@@ -43,6 +43,7 @@
 #include "locus/image/pixart_pipeline.hpp"
 #include "locus/image/png.hpp"
 #include "locus/image/qwen_edit_pipeline.hpp"
+#include "locus/image/qwen_image_pipeline.hpp"
 #include "locus/image/vq16.hpp"
 #include "locus/model/codec.hpp"
 #include "locus/model/expert_metrics.hpp"
@@ -1257,10 +1258,11 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
     // A broken image pipeline directory stops the server here too. A
     // flux or clip_text GGUF (parts only FLUX.1 has) makes it a FLUX.1
     // pipeline, so a FLUX set missing a part names the FLUX parts; a
-    // qwen_image GGUF makes it Qwen-Image-Edit; else PixArt, whose
-    // error names both sets.
+    // qwen_image GGUF makes it Qwen-Image-Edit with the vision tower (a
+    // clip GGUF) and Qwen-Image text to image without it; else PixArt,
+    // whose error names both sets.
     if (!opt_.image_model_dir.empty()) {
-        bool flux = false, qwen = false;
+        bool flux = false, qwen = false, clip = false;
         std::error_code ec;
         for (const auto& e : std::filesystem::directory_iterator(
                  opt_.image_model_dir, ec)) {
@@ -1272,10 +1274,14 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
             const auto arch = g.get_string("general.architecture");
             if (arch == "flux" || arch == "clip_text") flux = true;
             if (arch == "qwen_image") qwen = true;
+            if (arch == "clip") clip = true;
         }
-        if (qwen) {
+        if (qwen && clip) {
             qwen_edit_ =
                 image::QwenEditPipeline::load_dir(opt_.image_model_dir);
+        } else if (qwen) {
+            qwen_image_ =
+                image::QwenImagePipeline::load_dir(opt_.image_model_dir);
         } else if (flux) {
             flux_ = image::FluxPipeline::load_dir(opt_.image_model_dir);
         } else {
@@ -1382,7 +1388,7 @@ OpenAiServer::OpenAiServer(const model::TransformerModel& m,
     } else if (be == "cuda") {
         devices_.push_back({"cuda", backend::cuda_device_name()});
     }
-    if ((pixart_ || flux_ || qwen_edit_) && be != "vulkan" &&
+    if ((pixart_ || flux_ || qwen_edit_ || qwen_image_) && be != "vulkan" &&
         diffusion_engine().name == "vulkan") {
         devices_.push_back({"vulkan", backend::vulkan_device_name()});
     }
@@ -1406,6 +1412,10 @@ std::vector<std::pair<std::string, std::string>> OpenAiServer::engines()
     if (flux_ || pixart_) {
         out.emplace_back(flux_ ? "images (FLUX.1)" : "images (PixArt)",
                          diffusion);
+    }
+    if (qwen_image_) {
+        out.emplace_back("images (Qwen-Image)",
+                         diffusion + "; its language model on the CPU");
     }
     if (qwen_edit_) {
         out.emplace_back("image edits (Qwen-Image-Edit)",
@@ -2067,8 +2077,11 @@ void OpenAiServer::install_routes() {
             if (vision_ || qwen_vision_) kinds.push_back("image-to-text");
             // Generations and edits apart (i#633): FLUX.1 Kontext serves
             // both, other FLUX.1 checkpoints generate (i#648),
-            // Qwen-Image-Edit edits only, Janus and PixArt generate only.
-            if (janus_ || pixart_ || flux_) kinds.push_back("image");
+            // Qwen-Image-Edit edits only, Janus, PixArt and Qwen-Image
+            // generate only.
+            if (janus_ || pixart_ || flux_ || qwen_image_) {
+                kinds.push_back("image");
+            }
             if ((flux_ && flux_->may_edit()) || qwen_edit_) {
                 kinds.push_back("image-edit");
             }
@@ -3830,11 +3843,111 @@ void OpenAiServer::install_routes() {
     // request whose model starts with "pixart", or every request when
     // Janus is not loaded, goes to handle_pixart). One image at a time,
     // under image_mu_.
-    auto handle_images = [this, handle_pixart, handle_flux](
-                             const http::Request& req,
-                             http::ServerResponse& res,
-                             const http::RequestContext& ctx) {
+    // POST /v1/images/generations with Qwen-Image (i#1091): prompt -> the
+    // image, as b64_json. Extensions to the OpenAI shape, as diffusers'
+    // QwenImagePipeline takes them: negative_prompt (true CFG when
+    // true_cfg_scale is over 1; default none), true_cfg_scale (default
+    // 4), steps (2 to 100, default 50), max_sequence_length (1 to 1024,
+    // default 512) and seed. size "WxH" (default 1024x1024), each side
+    // from 16 to 2048, floored to a multiple of 16. One image at a time,
+    // under image_mu_.
+    auto handle_qwen_image = [this](const http::Request& req,
+                                    http::ServerResponse& res,
+                                    const http::RequestContext& ctx) {
+        try {
+            const json body = http::parse_json(req.body);
+            image::QwenImagePipeline::Request p;
+            p.prompt = require_prompt(body);
+            // An optional: set, it runs true CFG (true_cfg_scale over 1),
+            // so an absent field must leave it empty.
+            p.negative_prompt = body_optional_string(body, "negative_prompt");
+            require_one_image(body);
+            require_b64_json(body);
+            if (body.contains("size")) {
+                std::tie(p.width, p.height) =
+                    parse_size_wxh(body_string(body, "size"));
+                if (p.width < 16 || p.height < 16 || p.width > 2048 ||
+                    p.height > 2048) {
+                    throw std::invalid_argument(
+                        "size sides must be from 16 to 2048");
+                }
+            }
+            const auto integer = [&](const char* k, std::int64_t lo,
+                                     std::int64_t hi, std::uint32_t& out) {
+                if (!body.contains(k)) return;
+                const auto& v = body[k];
+                if (!v.is_number_integer() || v.get<std::int64_t>() < lo ||
+                    v.get<std::int64_t>() > hi) {
+                    throw std::invalid_argument(
+                        std::string(k) + " must be an integer from " +
+                        std::to_string(lo) + " to " + std::to_string(hi));
+                }
+                out = static_cast<std::uint32_t>(v.get<std::int64_t>());
+            };
+            integer("steps", 2, 100, p.steps);
+            integer("max_sequence_length", 1, 1024, p.max_sequence_length);
+            if (body.contains("true_cfg_scale")) {
+                const auto& g = body["true_cfg_scale"];
+                if (!g.is_number() || !std::isfinite(g.get<double>()) ||
+                    g.get<double>() < 0.0 || g.get<double>() > 100.0) {
+                    throw std::invalid_argument(
+                        "true_cfg_scale must be from 0 to 100");
+                }
+                p.true_cfg_scale = static_cast<float>(g.get<double>());
+            }
+            p.seed = read_seed(body);
+            // The MMDiT and the VAE run on the GPU where it maps host
+            // memory, else on the CPU; the language model always on the
+            // CPU.
+            const auto& op = *diffusion_engine().ops;
+            image::QwenImagePipeline::Timing took;
+            std::vector<std::uint8_t> rgb;
+            std::uint32_t w = 0, h = 0;
+            {
+                const auto lk = try_image_lock(image_mu_, res, 60);
+                if (!lk.owns_lock()) return;
+                rgb = qwen_image_->generate(p, op, ctx.client_alive, w, h,
+                                            &took);
+            }
+            if (rgb.empty()) {
+                res.status = 499;  // the client went away
+                return;
+            }
+            const auto png = image::encode_png(rgb, w, h);
+            res.set_header("X-Image-Seed", std::to_string(p.seed));
+            res.set_header("Server-Timing",
+                           "encode;dur=" + std::to_string(took.encode) +
+                               ", denoise;dur=" +
+                               std::to_string(took.denoise) +
+                               ", decode;dur=" + std::to_string(took.decode));
+            set_png_reply(res, png);
+        } catch (const std::exception& e) {
+            set_error(res, e);
+        }
+    };
+
+    auto handle_images = [this, handle_pixart, handle_flux,
+                          handle_qwen_image](const http::Request& req,
+                                             http::ServerResponse& res,
+                                             const http::RequestContext& ctx) {
             auth_event("create", "images.generations", ctx.identity);
+            // Qwen-Image, as FLUX.1: a model that starts with "qwen", or
+            // every request when Janus is not loaded.
+            if (qwen_image_) {
+                bool named = false;
+                try {
+                    const json b = http::parse_json(req.body);
+                    named = b.contains("model") && b["model"].is_string() &&
+                            b["model"].get<std::string>().rfind("qwen", 0) ==
+                                0;
+                } catch (const std::exception&) {
+                    // handle_qwen_image reports the parse error
+                }
+                if (named || !vq16_ || !janus_) {
+                    handle_qwen_image(req, res, ctx);
+                    return;
+                }
+            }
             if (flux_) {
                 bool named = false;
                 try {

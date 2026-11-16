@@ -32,6 +32,7 @@ class QwenVision;
 class PixArtPipeline;
 class FluxPipeline;
 class QwenEditPipeline;
+class QwenImagePipeline;
 class LoraLibrary;
 class LtxvPipeline;
 class Vq16Decoder;
@@ -405,9 +406,12 @@ class OpenAiServer {
     // its GGUF mappings and shares image_mu_ with Janus.
     std::unique_ptr<image::PixArtPipeline> pixart_;
     std::unique_ptr<image::FluxPipeline> flux_;
-    // Qwen-Image-Edit (--image-model with a qwen_image GGUF), for
-    // /v1/images/edits.
+    // Qwen-Image-Edit (--image-model with a qwen_image GGUF and the
+    // vision tower), for /v1/images/edits.
     std::unique_ptr<image::QwenEditPipeline> qwen_edit_;
+    // Qwen-Image text to image (a qwen_image GGUF without the vision
+    // tower, i#1091), for /v1/images/generations.
+    std::unique_ptr<image::QwenImagePipeline> qwen_image_;
     // The FLUX LoRAs (--lora-dir; null when not given).
     std::unique_ptr<image::LoraLibrary> loras_;
     std::mutex image_mu_;
