@@ -96,6 +96,10 @@ std::string_view trim_ows(std::string_view s) {
 // client that reads a few bytes at a time cannot hold the sole acceptor
 // while the response drains. Pool threads leave it unset: their writes
 // keep only the per-wait deadline (a long stream is fine there).
+thread_local bool inline_serving = false;
+// The total's end, from the response's first write (i#1065): building
+// the response is not the client's reading, so a slow /metrics render
+// (a host paging under load) must not use it up before a byte is sent.
 thread_local std::optional<std::chrono::steady_clock::time_point>
     inline_write_until;
 
@@ -115,6 +119,10 @@ bool write_all_deadline(int fd, std::string_view data, int wake_r,
     while (off < data.size()) {
         if (stopping.load()) {
             return false;
+        }
+        if (inline_serving && !inline_write_until) {
+            inline_write_until = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(kInlineWriteMs);
         }
         if (inline_write_until) {
             const auto left =
@@ -625,16 +633,15 @@ void Server::classify_ready(int fd) {
     if (c == Classified::kServe) {
         // The response's writes share one total deadline (i#837): the
         // request is all here, so the only wait left is the client's
-        // reading, and a slow reader must not hold the acceptor.
-        // A guard, so nothing can leave a stale deadline behind for
-        // the next inline serve.
+        // reading, and a slow reader must not hold the acceptor. It
+        // starts at the first write (i#1065). A guard, so nothing can
+        // leave a stale deadline behind for the next inline serve.
         struct InlineDeadline {
-            InlineDeadline() {
-                inline_write_until =
-                    std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(kInlineWriteMs);
+            InlineDeadline() { inline_serving = true; }
+            ~InlineDeadline() {
+                inline_serving = false;
+                inline_write_until.reset();
             }
-            ~InlineDeadline() { inline_write_until.reset(); }
         };
         {
             const InlineDeadline deadline;
