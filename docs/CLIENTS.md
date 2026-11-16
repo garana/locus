@@ -15,7 +15,7 @@ own docs.
 | POST /v1/classify             | HF-style  | image labels; needs `--image-classifier`    |
 | GET  /v1/models (and /{id})   | OpenAI    | model discovery                             |
 | POST /v1/audio/speech         | OpenAI    | Orpheus-TTS; needs `--audio-decoder`        |
-| POST /v1/images/generations   | OpenAI    | Janus-Pro, PixArt-alpha or FLUX.1           |
+| POST /v1/images/generations   | OpenAI    | Janus-Pro, PixArt-alpha, FLUX.1, Qwen-Image |
 | POST /v1/images/edits         | OpenAI    | Qwen-Image-Edit, FLUX.1 Kontext; JSON body  |
 | POST /v1/videos               | OpenAI    | LTX-Video job; see Video output             |
 | GET  /v1/videos/{id}          | OpenAI    | the job: status, progress, error            |
@@ -156,6 +156,19 @@ denoises in 344 s instead of 1104 s (7.9 s per MMDiT pass instead of
 the MMDiT and the VAE run on the GPU where it maps host memory. The
 start noise is locus's seeded sampler, not torch's, so a seed gives
 a different (but repeatable) image than diffusers.
+
+A Qwen-Image directory (the same GGUFs without the mmproj, and the
+text-to-image transformer, Qwen/Qwen-Image's) makes
+`/v1/images/generations` run Qwen-Image text to image, as diffusers'
+QwenImagePipeline does: the prompt goes through Qwen2.5-VL with the
+text-to-image template, and the loop runs true CFG on the noise
+alone. A request goes to it when its `model` starts with `qwen`, or
+always when Janus is not loaded. The fields are `prompt`,
+`negative_prompt`, `true_cfg_scale` (default 4, from 0 to 100),
+`steps` (2 to 100, default 50), `max_sequence_length` (prompt tokens
+kept, 1 to 1024, default 512), `seed` and `size` (default 1024x1024,
+sides 16 to 2048, floored to multiples of 16); `X-Image-Seed` and
+`Server-Timing` come back as for the edits.
 
 FLUX requests (generations and edits) can apply LoRAs from the
 server's `--lora-dir`, a directory of GGUFs from
