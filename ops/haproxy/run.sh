@@ -13,6 +13,10 @@
 #   LOCUS_TLS_BIND  "addr:port[,addr:port...]" [127.0.0.1:8443]
 #   LOCUS_UPSTREAM  locus-server [127.0.0.1:8080]
 #   HAPROXY         the haproxy binary [haproxy on PATH]
+#   LOCUS_TLS_CLIENT_CA   a CA certificate, PEM: when set, every client
+#                   must present a certificate it signed (mutual TLS);
+#                   unset, no client certificate is asked for [unset]
+#   LOCUS_TLS_CLIENT_CRL  that CA's revocation list, PEM [unset]
 # Clients must trust the CA that signed the certificate (curl --cacert).
 # Behind the proxy every client reaches locus-server from 127.0.0.1, so
 # leave its --max-conns-per-ip at 0 (off, the default): a cap there
@@ -30,6 +34,26 @@ set -euo pipefail
 export LOCUS_TLS_CRT LOCUS_TLS_KEY
 export LOCUS_TLS_BIND=${LOCUS_TLS_BIND:-127.0.0.1:8443}
 export LOCUS_UPSTREAM=${LOCUS_UPSTREAM:-127.0.0.1:8080}
+# Client certificates: HAProxy needs only the CA's certificate (never
+# its key, nor each client's certificate), and accepts any certificate
+# that CA signed. The options reach the bind line as separate words, so
+# these paths may not contain spaces.
+# locus speaks HTTP/1.1.
+LOCUS_TLS_OPTS="alpn http/1.1"
+if [ -n "${LOCUS_TLS_CLIENT_CA:-}" ]; then
+    LOCUS_TLS_OPTS+=" ca-file $LOCUS_TLS_CLIENT_CA verify required"
+    if [ -n "${LOCUS_TLS_CLIENT_CRL:-}" ]; then
+        LOCUS_TLS_OPTS+=" crl-file $LOCUS_TLS_CLIENT_CRL"
+    fi
+elif [ -n "${LOCUS_TLS_CLIENT_CRL:-}" ]; then
+    echo "LOCUS_TLS_CLIENT_CRL needs LOCUS_TLS_CLIENT_CA" >&2
+    exit 2
+fi
+case "${LOCUS_TLS_CLIENT_CA:-}${LOCUS_TLS_CLIENT_CRL:-}" in
+    *" "*) echo "client CA / CRL paths may not contain spaces" >&2
+           exit 2 ;;
+esac
+export LOCUS_TLS_OPTS
 HAPROXY=${HAPROXY:-haproxy}
 cfg="$(cd "$(dirname "$0")" && pwd)/locus.cfg"
 
