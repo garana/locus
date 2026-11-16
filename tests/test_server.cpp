@@ -2263,6 +2263,7 @@ TEST_CASE("a server with two engines serves and reports both",
         REQUIRE(r->status == 200);
         want = json::parse(r->body)["choices"][0]["text"];
         auto m = c.Get("/metrics");
+        INFO("GET /metrics: " << httplib::to_string(m.error()));  // i#1065
         REQUIRE(m);
         one_total = metric_value(m->body, "locus_kv_blocks_total");
     }
@@ -2284,6 +2285,7 @@ TEST_CASE("a server with two engines serves and reports both",
     CHECK(got[1] == want);
     httplib::Client c("127.0.0.1", ts.port);
     auto m = c.Get("/metrics");
+    INFO("GET /metrics: " << httplib::to_string(m.error()));
     REQUIRE(m);
     CHECK(metric_value(m->body, "locus_engines") == 2);
     CHECK(metric_value(m->body, "locus_kv_blocks_total") == 2 * one_total);
