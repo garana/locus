@@ -875,10 +875,14 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                                               out_off, f);
         };
         // The RMSNorm folded into the matvecs that read it, where each
-        // of them takes it (LOCUS_METAL_NORM_FOLD=0: rmsnorm_f32 first).
+        // of them takes it: by default on Apple GPU family 9 and up,
+        // where it gains; family 8 (the M2) decodes Q8_0 12 to 24%
+        // slower with it (i#1081). LOCUS_METAL_NORM_FOLD=1 or 0 forces
+        // it on or off (0: rmsnorm_f32 first).
         const char* nf_env = std::getenv("LOCUS_METAL_NORM_FOLD");
         const bool norm_fold =
-            nf_env == nullptr || std::string_view(nf_env) != "0";
+            nf_env != nullptr ? std::string_view(nf_env) != "0"
+                              : ctx.apple_family() >= 9;
         const auto fold_ok = [&](std::initializer_list<const Mat*> ms) {
             return norm_fold &&
                    std::all_of(ms.begin(), ms.end(), [](const Mat* m) {
