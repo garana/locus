@@ -29,6 +29,7 @@ struct Context::Impl {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
     std::string name;
+    int apple_family = 0;
     std::unordered_map<std::string, id<MTLComputePipelineState>> kernels;
     // The open batch (nil when none).
     id<MTLCommandBuffer> batch = nil;
@@ -78,6 +79,13 @@ Context& Context::get() {
                 throw std::runtime_error("metal: no Metal device");
             }
             impl->name = [[impl->device name] UTF8String];
+            if ([impl->device supportsFamily:MTLGPUFamilyApple9]) {
+                impl->apple_family = 9;
+            } else if ([impl->device supportsFamily:MTLGPUFamilyApple8]) {
+                impl->apple_family = 8;
+            } else if ([impl->device supportsFamily:MTLGPUFamilyApple7]) {
+                impl->apple_family = 7;
+            }
             impl->queue = [impl->device newCommandQueue];
             if (impl->queue == nil) {
                 throw std::runtime_error("metal: no command queue");
@@ -126,6 +134,8 @@ Context::Context(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Context::~Context() = default;
 
 const std::string& Context::device_name() const { return impl_->name; }
+
+int Context::apple_family() const { return impl_->apple_family; }
 
 Context::Buffer Context::alloc(std::size_t bytes) {
     @autoreleasepool {

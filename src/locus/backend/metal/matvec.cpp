@@ -2,6 +2,8 @@
 #include "locus/backend/metal/matvec.hpp"
 
 #include <algorithm>
+#include <string_view>
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -52,6 +54,26 @@ Kind kind_of(TensorType t) {
         default:
             return {};
     }
+}
+
+/**
+ * @returns The Q6_K matvec kernel for ctx's GPU (i#1058): ggml's
+ * half-block layout below Apple family 9 (the M2, family 8, reads Q6_K
+ * at about twice the bandwidth with it; family 7, the M1, takes it too,
+ * unmeasured), the unit layout on 9 and up (a few percent faster on the
+ * M4). LOCUS_METAL_Q6K=halves or units picks one (tests).
+ */
+const char* q6k_kernel(const Context& ctx) {
+    if (const char* e = std::getenv("LOCUS_METAL_Q6K")) {
+        const std::string_view v(e);
+        if (v == "halves") {
+            return "mv_q6_k_halves";
+        }
+        if (v == "units") {
+            return "mv_q6_k";
+        }
+    }
+    return ctx.apple_family() >= 9 ? "mv_q6_k" : "mv_q6_k_halves";
 }
 
 /** MvParams in kernels.metal. */
@@ -234,9 +256,11 @@ void record_mv(Context& ctx, gguf::TensorType t, std::uint32_t rows,
         {fuse.rope_cs != nullptr ? fuse.rope_cs : &x, 0, 8},
         {fuse.norm_w != nullptr ? fuse.norm_w : &x, 0, 9}};
     const std::uint32_t groups = (rows + k.rows - 1) / k.rows;
-    // The prenorm form is its own kernel, so the plain one keeps its code.
+    // The Q6_K layout by GPU family (i#1058). The prenorm form is its
+    // own kernel, so the plain one keeps its code (Q6_K has none).
     const std::string name =
-        std::string(k.kernel) + (fuse.norm_w != nullptr ? "_pn" : "");
+        std::string(t == TensorType::kQ6_K ? q6k_kernel(ctx) : k.kernel) +
+        (fuse.norm_w != nullptr ? "_pn" : "");
     ctx.dispatch(name.c_str(), args, std::as_bytes(std::span(&p, 1)),
                  groups * n_slots * k.group, k.group);
 }

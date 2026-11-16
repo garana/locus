@@ -69,6 +69,10 @@ class Context {
     /** @returns The device's name, such as "Apple M4 Max". */
     const std::string& device_name() const;
 
+    /** @returns The highest Apple GPU family the device supports (8: the
+     *  M2's, 9: the M3's and M4's), or 0 below 7 or off Apple. */
+    int apple_family() const;
+
     /**
      * @param bytes The size (0 gives a 1-byte buffer).
      * @returns A zeroed shared-storage buffer.
