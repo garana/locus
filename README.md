@@ -274,6 +274,8 @@ Vulkan devices; the first is the default). `locus-server --engines N`
 serves the model from N engines, each with its own KV pool: N shares
 of the CPU cores, or on Vulkan one `--device` each (several `--device`
 entries give one engine per device); a request stays on one engine.
+Which backend and flags to pick on each kind of machine, with the
+measurements behind each choice: [docs/HOSTS.md](docs/HOSTS.md).
 
 | Backend | Runs                                                                                     |
 |---------|------------------------------------------------------------------------------------------|
