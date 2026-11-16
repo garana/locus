@@ -3,14 +3,15 @@
 // place (a shared Metal buffer, Ops.alloc_kv).
 
 #include <algorithm>
-#include <initializer_list>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <initializer_list>
 #include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -874,6 +875,17 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                                               *wb.buf, wb.off, in, 0, out,
                                               out_off, f);
         };
+        // mvf where the matvec must be recorded (no fusion, or a norm
+        // fold fold_ok allowed): a false would drop it silently, so it
+        // throws, and the host path runs the token.
+        const auto mvf_must = [&](const Mat& w, const Context::Buffer& in,
+                                  const Context::Buffer& out,
+                                  std::uint64_t out_off,
+                                  const metal::MvFuse& f) {
+            if (!mvf(w, in, out, out_off, f)) {
+                throw std::logic_error("metal decode: a matvec not recorded");
+            }
+        };
         // The RMSNorm folded into the matvecs that read it, where each
         // of them takes it (LOCUS_METAL_NORM_FOLD=0: rmsnorm_f32 first).
         const char* nf_env = std::getenv("LOCUS_METAL_NORM_FOLD");
@@ -933,15 +945,15 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                 nr.rope_hd = hd;
                 const bool rq = fuse && mvf(lay.wq, qin, s.q, 0, nr);
                 if (!rq) {
-                    mvf(lay.wq, qin, s.q, 0, nf);
+                    mvf_must(lay.wq, qin, s.q, 0, nf);
                 }
                 ctx.overlap_next();
                 const bool rk = fuse && mvf(lay.wk, qin, *pool, krow, nr);
                 if (!rk) {
-                    mvf(lay.wk, qin, *pool, krow, nf);
+                    mvf_must(lay.wk, qin, *pool, krow, nf);
                 }
                 ctx.overlap_next();
-                mvf(lay.wv, qin, *pool, vrow, nf);
+                mvf_must(lay.wv, qin, *pool, vrow, nf);
                 if (lay.has_qkv_bias()) {
                     // qwen2: the biases, which may overlap, then RoPE.
                     r.bias(s.q, 0, lay.wq_bias, 1, 0);
@@ -1028,9 +1040,9 @@ bool TransformerModel::metal_forward(tok::TokenId token, const float* embd,
                     continue;
                 }
                 const Context::Buffer& fin = fold_ffn ? s.x : s.xb;
-                mvf(lay.w_gate, fin, s.gate, 0, ff_nf);
+                mvf_must(lay.w_gate, fin, s.gate, 0, ff_nf);
                 ctx.overlap_next();  // gate and up, likewise
-                mvf(lay.w_up, fin, s.up, 0, ff_nf);
+                mvf_must(lay.w_up, fin, s.up, 0, ff_nf);
                 const SiluParams sp{ff};
                 const Context::Arg su[] = {{&s.gate, 0}, {&s.up, 0}};
                 ctx.dispatch("silu_mul", su, bytes_of(sp), ff, 256);
