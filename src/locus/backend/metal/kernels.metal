@@ -315,10 +315,21 @@ inline void q4k_scale_min(uint j, device const uchar* q, thread float& sc,
 // both rows. (The layout of ggml's Metal Q4_K matvec.)
 constant constexpr uint kQ4Rows = 4;
 
+// Four nibbles of v at shift sh as floats: two at a time land in the
+// mantissas of f16 1024 + n (exact), as Vulkan's matvec_q4_k.comp
+// decodes them (i#1064: the uchar4 -> float4 conversion bounded this
+// kernel on the M4).
+inline float4 nib4(uint v, uint sh) {
+    const half2 n02 =
+        as_type<half2>(((v >> sh) & 0x000f000fu) | 0x64006400u);
+    const half2 n13 =
+        as_type<half2>(((v >> (sh + 8)) & 0x000f000fu) | 0x64006400u);
+    return float4(float(n02.x), float(n13.x), float(n02.y), float(n13.y)) -
+           1024.0f;
+}
+
 inline float dot8(float4 a, float4 b, uint2 q, uint sh) {
-    const float4 q0 = float4((as_type<uchar4>(q.x) >> sh) & uchar4(0xF));
-    const float4 q1 = float4((as_type<uchar4>(q.y) >> sh) & uchar4(0xF));
-    return dot(q0, a) + dot(q1, b);
+    return dot(nib4(q.x, sh), a) + dot(nib4(q.y, sh), b);
 }
 
 kernel void mv_q4_k(device const uchar* w [[buffer(0)]],
