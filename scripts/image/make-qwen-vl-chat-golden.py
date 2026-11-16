@@ -17,7 +17,13 @@ Writes float32: the prompt length, STEPS + 1, the STEPS + 1 greedy
 ids, then STEPS + 1 rows of logits (vocabulary-wide).
 
     run-offline.sh scripts/image/make-qwen-vl-chat-golden.py \\
-        --processor DIR
+        --processor DIR [--image WxH] [--out NAME]
+
+--image sets the image's size (both sides multiples of 28; default
+84x56); --out the fixture's name under tests/golden (default
+qwen_vl_chat.f32). At 252x252 (i#1096) the image has 81 merged tokens,
+more than locus's 64-position prefill chunk, so a chunk boundary falls
+inside it, and its 18 x 18 patches span several attention windows.
 
 The processor is built from its image processor and tokenizer only
 (ImageOnly): transformers 4.56.1's Qwen2VLProcessor also builds a video
@@ -78,7 +84,13 @@ def load(name):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--processor", type=pathlib.Path, required=True)
+    ap.add_argument("--image", default=f"{IMG_W}x{IMG_H}",
+                    help="WxH, multiples of 28")
+    ap.add_argument("--out", default="qwen_vl_chat.f32")
     a = ap.parse_args()
+    img_w, img_h = (int(x) for x in a.image.split("x"))
+    if img_w % 28 or img_h % 28 or not img_w or not img_h:
+        sys.exit("--image sides must be positive multiples of 28")
     edit = load("make-qwen-edit-pipeline-golden")
     vae_mod = load("make-qwen-vae-goldens")
     torch.manual_seed(0)
@@ -88,16 +100,16 @@ def main():
                      chat_template=(a.processor / "chat_template.jinja")
                      .read_text())
 
-    rgb, _ = vae_mod.lcg(777, IMG_H * IMG_W * 3)
+    rgb, _ = vae_mod.lcg(777, img_h * img_w * 3)
     rgb = np.clip((rgb + 0.25) * 510.0, 0, 255).astype(np.uint8)
-    image = Image.fromarray(rgb.reshape(IMG_H, IMG_W, 3))
+    image = Image.fromarray(rgb.reshape(img_h, img_w, 3))
     messages = [{"role": "user", "content": [
         {"type": "image"}, {"type": "text", "text": QUESTION}]}]
     text = proc.apply_chat_template(messages, add_generation_prompt=True,
                                     tokenize=False)
     inputs = proc(text=[text], images=[image], return_tensors="pt")
     grid = inputs["image_grid_thw"][0].tolist()
-    assert grid == [1, IMG_H // 14, IMG_W // 14], grid
+    assert grid == [1, img_h // 14, img_w // 14], grid
     n_prompt = inputs["input_ids"].shape[1]
     with torch.no_grad():
         out = model.generate(**inputs, max_new_tokens=STEPS + 1,
@@ -109,7 +121,7 @@ def main():
     blob = np.concatenate([
         np.array([n_prompt, STEPS + 1], dtype=np.float32),
         np.array(ids, dtype=np.float32), logits.ravel()])
-    path = GOLDEN / "qwen_vl_chat.f32"
+    path = GOLDEN / a.out
     path.write_bytes(blob.astype("<f4").tobytes())
     print(path, n_prompt, ids, text.encode())
 
