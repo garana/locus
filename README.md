@@ -243,6 +243,10 @@ on (`--tcp-keepalive 30,10,3` by default), so a client whose host
 died is found in about a minute and its generation stops; on Linux
 the same bound applies to unacknowledged data, so a stream to it
 ends as fast.
+locus-server speaks plain HTTP. For HTTPS, `ops/haproxy/run.sh` runs
+HAProxy in front of it: TLS ends there, with the certificate and key
+in `LOCUS_TLS_CRT` and `LOCUS_TLS_KEY`, on `LOCUS_TLS_BIND`, and
+requests go on to locus-server on loopback.
 `locus-server --help`
 lists the options and environment
 variables;
