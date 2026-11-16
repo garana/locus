@@ -30,6 +30,7 @@ add_library(locus
     src/locus/backend/matvec_neon.cpp
     src/locus/backend/matvec_sse4.cpp
     src/locus/backend/matvec_vulkan.cpp
+    src/locus/backend/accelerate.cpp
     src/locus/backend/cuda_stub.cpp
     src/locus/backend/fallbacks.cpp
     src/locus/backend/gpu_metrics.cpp
@@ -131,6 +132,7 @@ add_library(locus
     src/locus/server/engine_group.cpp
     src/locus/server/engine_loop.cpp
     src/locus/server/errors.cpp
+    src/locus/server/gen_reply.cpp
     src/locus/server/server.cpp
     src/locus/server/metrics_text.cpp
     src/locus/server/responses.cpp
@@ -213,6 +215,10 @@ if(APPLE)
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-Wall;-Wextra;-Wpedantic")
     target_link_libraries(locus PRIVATE "-framework Metal"
                                         "-framework Foundation")
+    # Accelerate's cblas_sgemm for the CPU's batched prefill under
+    # LOCUS_CPU_FAST (i#782); a system framework like Metal.
+    target_link_libraries(locus PRIVATE "-framework Accelerate")
+    target_compile_definitions(locus PRIVATE LOCUS_HAS_ACCELERATE)
     set(LOCUS_METAL_KERNELS_FILE
         ${CMAKE_SOURCE_DIR}/src/locus/backend/metal/kernels.metal)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS

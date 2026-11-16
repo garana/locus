@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -58,8 +59,15 @@ class EngineGroup {
      *  same size). */
     std::string admit_error(std::uint32_t n_prompt);
 
-    /** Submits to the least-loaded engine (the fewest requests not yet
-     *  released). @returns The request's group id. */
+    /**
+     * Submits to the engine that last served the longest block-aligned
+     * prefix of the prompt (whole kPrefixKeyTokens blocks; its prefix
+     * cache may hold their KV, i#940, i#988), unless that engine has
+     * more than kPrefixSlack requests over the least-loaded one; else,
+     * and for a prompt under one block, to the least-loaded engine (the
+     * fewest requests not yet released).
+     * @returns The request's group id.
+     */
     std::uint64_t submit(
         std::vector<tok::TokenId> prompt, std::uint32_t max_new_tokens,
         model::SamplingParams sampling = {}, std::uint64_t seed = 0,
@@ -80,8 +88,8 @@ class EngineGroup {
     /** @} */
 
     /** EngineLoop::set_progress_hook on every engine (one hook, run by
-     *  each engine's worker). */
-    void set_progress_hook(const std::function<void()>& hook);
+     *  each engine's worker), with group ids. */
+    void set_progress_hook(const EngineLoop::ProgressHook& hook);
 
     /** EngineLoop::release, and the request no longer counts toward its
      *  engine's load. Idempotent: a stream may release twice (on its
@@ -107,12 +115,30 @@ class EngineGroup {
         return id / loops_.size();
     }
 
+    /** The prompt tokens a prefix key covers: one KV block at the
+     *  default geometry. */
+    static constexpr std::size_t kPrefixKeyTokens = 16;
+    /** How many more unreleased requests than the least-loaded engine
+     *  the prefix's engine may hold and still take it. */
+    static constexpr std::size_t kPrefixSlack = 1;
+    /** Most prefix keys kept (then the map starts over): about 1000
+     *  conversations of kPrefixMaxBlocks keys each (i#1003), a few MB. */
+    static constexpr std::size_t kPrefixKeys = 65536;
+    /** Most blocks of one prompt keyed (its first 1024 tokens). */
+    static constexpr std::size_t kPrefixMaxBlocks = 64;
+    /** @returns One key per whole kPrefixKeyTokens block of the prompt
+     *  (at most kPrefixMaxBlocks): key k hashes blocks 0 to k. */
+    static std::vector<std::uint64_t> prefix_keys(
+        const std::vector<tok::TokenId>& prompt);
+
     std::vector<std::unique_ptr<EngineLoop>> loops_;
     /** Requests submitted and not yet released: their ids, and their
-     *  count per engine. */
+     *  count per engine. Guards last_engine_ too. */
     std::mutex live_mu_;
     std::unordered_set<std::uint64_t> live_;
     std::vector<std::size_t> load_;
+    /** The engine each recent prefix key went to. */
+    std::unordered_map<std::uint64_t, std::size_t> last_engine_;
 };
 
 }  // namespace locus::server

@@ -264,6 +264,11 @@ class TransformerModel {
      */
     void use_backend(const backend::Backend& b) { backend_ = &b; }
 
+    /** @returns Whether metal_forward takes this model on its backend
+     *  (any cache conditions aside): the batched paths then run it a
+     *  token at a time, so they match the per-token forward. */
+    bool metal_forward_supported() const;
+
     /** @returns The backend currently doing the math. */
     const backend::Backend& active_backend() const {
         return *backend_;
@@ -834,11 +839,6 @@ class TransformerModel {
      *  and LOCUS_CUDA_FORWARD not 0. */
     bool cuda_forward_supported() const;
 
-    /** @returns Whether metal_forward takes this model on its backend
-     *  (any cache conditions aside): the batched paths then run it a
-     *  token at a time, so they match the per-token forward. */
-    bool metal_forward_supported() const;
-
     /**
      * Metal forward of a plain llama model (i#866): one token at
      * position pos of seq, every layer on the GPU in one command batch
@@ -859,6 +859,10 @@ class TransformerModel {
                        kv::PagedKvCache::Seq& seq, std::uint32_t pos,
                        kv::PagedKvCache& cache, Workspace& ws,
                        std::span<float> logits, LogitRows rows_out) const;
+
+    /** @returns 1 when the Metal forwards pair RoPE NEOX-style (qwen2's
+     *  and qwen3moe's attention), else 0. */
+    std::uint32_t metal_neox() const;
 
     /**
      * metal_forward over a prompt chunk (i#866): the tokens at
@@ -935,6 +939,65 @@ class TransformerModel {
                        const std::vector<float>& xbf,
                        std::vector<float>& x, std::uint32_t n,
                        Workspace& ws) const;
+
+    /** The n tokens' buffers of a batched CPU forward, each n rows:
+     * the residual x, the normed input xbf, the projection out xb2,
+     * the FFN gate and up; q, k and v only for plain attention. */
+    struct BatchBufs {
+        BatchBufs(std::uint32_t n, std::uint32_t embd, std::uint32_t ff)
+            : x(std::size_t{n} * embd), xbf(x.size()), xb2(x.size()),
+              gate(std::size_t{n} * ff), up(gate.size()) {}
+        std::vector<float> x, xbf, xb2, gate, up, q, k, v;
+    };
+
+    /**
+     * One token's attention step: the norm, the arch's attention, wo
+     * and the residual add, with a lap after the norm and at the end.
+     * @param x The token's residual (n_embd), updated in place.
+     */
+    void attend_one(const backend::Ops& op, const Layer& lay,
+                    std::uint32_t l, kv::PagedKvCache& cache,
+                    kv::PagedKvCache::Seq& seq, std::uint32_t pos,
+                    std::span<float> x, Workspace& ws, StageLap& lap) const;
+
+    /**
+     * Plain llama attention over n sequences, F32 cache: q, k, v and wo
+     * as batched matvecs (each weight read once), RoPE, the cache rows
+     * and the attention per sequence. Byte-identical to attend_one.
+     */
+    void attend_plain_batch(const backend::Ops& op, const Layer& lay,
+                            std::uint32_t l, kv::PagedKvCache& cache,
+                            std::span<kv::PagedKvCache::Seq* const> seqs,
+                            std::span<const std::uint32_t> pos,
+                            BatchBufs& b, StageLap& lap) const;
+
+    /** The FFN step of one token on ws.x: the norm, then the dense FFN
+     * or the MoE, and the residual add. */
+    void ffn_one(const backend::Ops& op, const Layer& lay, std::uint32_t l,
+                 Workspace& ws, StageLap& lap) const;
+
+    /** The FFN step of n tokens on b.x: the norms, then the dense FFN
+     * as batched matvecs or moe_ffn_batch, and the residual add.
+     * Byte-identical to n ffn_one calls. */
+    void ffn_batch(const backend::Ops& op, const Layer& lay,
+                   std::uint32_t l, BatchBufs& b, std::uint32_t n,
+                   Workspace& ws, StageLap& lap) const;
+
+    /** Layer readahead before layer l runs: pages in layer l+1's
+     * static weights, or the output head after a final stage's last
+     * layer (madvise and, with a weight pager, op.prefetch). */
+    void prefetch_after(const backend::Ops& op, std::uint32_t l,
+                        std::uint32_t layer_end, bool last) const;
+
+    /** forward_batch_layers on Vulkan: multi-sequence passes of at most
+     * 8, else one GPU forward per sequence; all or nothing on the seq
+     * positions. */
+    void vulkan_batch_layers(std::span<const tok::TokenId> toks,
+                             std::span<const float> hidden_in,
+                             std::uint32_t layer_begin,
+                             std::uint32_t layer_end, kv::PagedKvCache& cache,
+                             std::span<kv::PagedKvCache::Seq* const> seqs,
+                             Workspace& ws, std::span<float> out) const;
 
     Hparams hp_;
     const struct ArchSpec* spec_ = nullptr;

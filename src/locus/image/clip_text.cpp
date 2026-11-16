@@ -7,34 +7,13 @@
 #include <string>
 
 #include "locus/image/dense.hpp"
+#include "locus/image/tensor_read.hpp"
 
 namespace locus::image {
 
 namespace {
 
-/** LayerNorm over each row of x (n rows of w floats), into out. */
-void layer_norm(std::span<const float> x, std::uint32_t n, std::uint32_t w,
-                const std::vector<float>& g, const std::vector<float>& b,
-                float eps, std::span<float> out) {
-    for (std::uint32_t t = 0; t < n; ++t) {
-        const float* r = x.data() + std::size_t{t} * w;
-        float* o = out.data() + std::size_t{t} * w;
-        double mean = 0.0;
-        for (std::uint32_t i = 0; i < w; ++i) mean += r[i];
-        mean /= w;
-        double var = 0.0;
-        for (std::uint32_t i = 0; i < w; ++i) {
-            const double d = r[i] - mean;
-            var += d * d;
-        }
-        var /= w;
-        const auto inv = static_cast<float>(1.0 / std::sqrt(var + eps));
-        const auto m = static_cast<float>(mean);
-        for (std::uint32_t i = 0; i < w; ++i) {
-            o[i] = (r[i] - m) * inv * g[i] + b[i];
-        }
-    }
-}
+using dense::layer_norm;
 
 }  // namespace
 
@@ -70,8 +49,7 @@ ClipTextEncoder ClipTextEncoder::load(const gguf::GgufFile& g) {
     }
 
     const auto info = [&](const std::string& name, std::uint64_t n) {
-        const gguf::TensorInfo* ti = g.find_tensor(name);
-        if (ti == nullptr) throw gguf::Error("clip: missing " + name);
+        const gguf::TensorInfo* ti = require_tensor(g, "clip", name);
         if (ti->type != gguf::TensorType::kF32 || ti->nelements() != n) {
             throw gguf::Error("clip: " + name + " must be F32 with " +
                               std::to_string(n) + " values");
@@ -79,10 +57,7 @@ ClipTextEncoder ClipTextEncoder::load(const gguf::GgufFile& g) {
         return ti;
     };
     const auto vec = [&](const std::string& name, std::uint32_t n) {
-        const auto bytes = g.tensor_data(*info(name, n));
-        std::vector<float> out(n);
-        std::memcpy(out.data(), bytes.data(), std::size_t{n} * 4);
-        return out;
+        return read_floats(g, "clip", name, n);
     };
     const auto lin = [&](const std::string& p, std::uint32_t rows,
                          std::uint32_t cols) {
