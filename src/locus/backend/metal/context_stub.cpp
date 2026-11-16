@@ -20,6 +20,8 @@ Context::Context(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 Context::~Context() = default;
 
+int Context::apple_family() const { return 0; }
+
 const std::string& Context::device_name() const {
     static const std::string none;
     return none;

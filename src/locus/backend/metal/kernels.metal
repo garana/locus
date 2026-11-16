@@ -543,18 +543,60 @@ kernel void mv_q5_k(device const uchar* w [[buffer(0)]],
 }
 
 // Q6_K: 210-byte super-blocks of 256 (128 ql, 64 qh, 16 int8 scales,
-// f16 d at 208). Half n (0, 1) of a block holds elements 128 n ..; a
-// unit is one (n, i) with i = 0, 1: the 16 l in [16 i, 16 i + 16) of
-// that half, each giving elements l, l + 32, l + 64 and l + 96 with
-// scales sc[8 n + i + {0, 2, 4, 6}]. The block stride is not a multiple
+// f16 d at 208). Half n (0, 1) of a block holds elements 128 n ..; its
+// l in [0, 32) gives elements l, l + 32, l + 64 and l + 96 with scales
+// sc[8 n + l / 16 + {0, 2, 4, 6}]. The block stride is not a multiple
 // of 4, so the bytes load one at a time.
-kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
-                    device const float* xb [[buffer(1)]],
-                    device float* out [[buffer(2)]],
-                    constant MvParams& p [[buffer(3)]],
-                    device const uint* route [[buffer(7)]],
-                    uint tg [[threadgroup_position_in_grid]],
-                    uint tid [[thread_index_in_threadgroup]]) {
+//
+// One row's dot over its kMvLanes lanes, in one of two layouts (i#1058),
+// picked by the GPU: Halves, ggml's, gives each lane 4 l of one half of
+// one block (lanes 0-7 the first half, 8-15 the second), so neighbouring
+// lanes read neighbouring bytes; the other gives each lane a unit (n, i)
+// of 16 l, 4 units a block, so a lane's loads walk 16 bytes on its own.
+// The M2 (Apple family 8) reads Q6_K at about twice the bandwidth with
+// Halves; the M4 (family 9) is a few percent faster with units.
+template <bool Halves>
+inline float q6k_row_dot(device const uchar* row, device const float* x,
+                         uint nb, uint lane) {
+    float acc = 0.0f;
+    const uint per_block = Halves ? 1 : 4;
+    const uint first = Halves ? 0 : lane;
+    const uint step = Halves ? 1 : kMvLanes;
+    for (uint u = first; u < nb * per_block; u += step) {
+        // The (block, half, first l) this lane takes now.
+        const uint b = Halves ? u : u >> 2;
+        const uint n = Halves ? lane / 8 : (u >> 1) & 1;
+        const uint l0 = Halves ? 4 * (lane % 8) : 16 * (u & 1);
+        const uint len = Halves ? 4 : 16;
+        device const uchar* blk = row + b * 210;
+        device const uchar* ql = blk + 64 * n + l0;
+        device const uchar* qh = blk + 128 + 32 * n + l0;
+        device const char* sc =
+            (device const char*)(blk + 192) + 8 * n + l0 / 16;
+        device const float* xs = x + b * 256 + 128 * n + l0;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        for (uint l = 0; l < len; ++l) {
+            const uint a = ql[l], c = ql[l + 32], h = qh[l];
+            const int q0 = int((a & 0xF) | ((h & 3) << 4)) - 32;
+            const int q1 = int((c & 0xF) | (((h >> 2) & 3) << 4)) - 32;
+            const int q2 = int((a >> 4) | (((h >> 4) & 3) << 4)) - 32;
+            const int q3 = int((c >> 4) | (((h >> 6) & 3) << 4)) - 32;
+            s0 += float(q0) * xs[l];
+            s1 += float(q1) * xs[l + 32];
+            s2 += float(q2) * xs[l + 64];
+            s3 += float(q3) * xs[l + 96];
+        }
+        acc += f16_at(blk + 208) *
+               (float(sc[0]) * s0 + float(sc[2]) * s1 + float(sc[4]) * s2 +
+                float(sc[6]) * s3);
+    }
+    return acc;
+}
+
+template <bool Halves>
+inline void mv_q6_k_impl(device const uchar* w, device const float* xb,
+                         device float* out, constant MvParams& p,
+                         device const uint* route, uint tg, uint tid) {
     const uint lane = tid % kMvLanes;
     const uint gps = (p.rows + kMvRows - 1) / kMvRows;  // groups a slot
     const uint slot = tg / gps;
@@ -565,36 +607,30 @@ kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
     float acc = 0.0f;
     if (r < p.rows) {
         const uint nb = p.cols / 256;
-        device const uchar* row = w + wo + (ulong)r * nb * 210;
-        device const float* x = xs;
-        for (uint u = lane; u < nb * 4; u += kMvLanes) {
-            const uint b = u >> 2;
-            const uint n = (u >> 1) & 1;
-            const uint i = u & 1;
-            device const uchar* blk = row + b * 210;
-            device const uchar* ql = blk + 64 * n + 16 * i;
-            device const uchar* qh = blk + 128 + 32 * n + 16 * i;
-            device const char* sc =
-                (device const char*)(blk + 192) + 8 * n + i;
-            device const float* xs = x + b * 256 + 128 * n + 16 * i;
-            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-            for (uint l = 0; l < 16; ++l) {
-                const uint a = ql[l], c = ql[l + 32], h = qh[l];
-                const int q0 = int((a & 0xF) | ((h & 3) << 4)) - 32;
-                const int q1 = int((c & 0xF) | (((h >> 2) & 3) << 4)) - 32;
-                const int q2 = int((a >> 4) | (((h >> 4) & 3) << 4)) - 32;
-                const int q3 = int((c >> 4) | (((h >> 6) & 3) << 4)) - 32;
-                s0 += float(q0) * xs[l];
-                s1 += float(q1) * xs[l + 32];
-                s2 += float(q2) * xs[l + 64];
-                s3 += float(q3) * xs[l + 96];
-            }
-            acc += f16_at(blk + 208) *
-                   (float(sc[0]) * s0 + float(sc[2]) * s1 +
-                    float(sc[4]) * s2 + float(sc[6]) * s3);
-        }
+        acc = q6k_row_dot<Halves>(w + wo + (ulong)r * nb * 210, xs, nb,
+                                  lane);
     }
     mv_store(out, p, slot, r, lane, acc);
+}
+
+kernel void mv_q6_k(device const uchar* w [[buffer(0)]],
+                    device const float* xb [[buffer(1)]],
+                    device float* out [[buffer(2)]],
+                    constant MvParams& p [[buffer(3)]],
+                    device const uint* route [[buffer(7)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+    mv_q6_k_impl<false>(w, xb, out, p, route, tg, tid);
+}
+
+kernel void mv_q6_k_halves(device const uchar* w [[buffer(0)]],
+                           device const float* xb [[buffer(1)]],
+                           device float* out [[buffer(2)]],
+                           constant MvParams& p [[buffer(3)]],
+                           device const uint* route [[buffer(7)]],
+                           uint tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]]) {
+    mv_q6_k_impl<true>(w, xb, out, p, route, tg, tid);
 }
 
 // ---------------------------------------------------------------------
