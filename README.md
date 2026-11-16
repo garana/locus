@@ -253,7 +253,9 @@ in `LOCUS_TLS_CRT` and `LOCUS_TLS_KEY`, on `LOCUS_TLS_BIND`, and
 requests go on to locus-server on loopback. Every client then comes
 from 127.0.0.1, so `--max-conns-per-ip` stays at 0 there. HAProxy 3.0
 and later read the key in place; for older ones the script writes a
-private, temporary combined PEM.
+private, temporary combined PEM. With `LOCUS_TLS_CLIENT_CA` set, every
+client must present a certificate that CA signed (mutual TLS), and
+`LOCUS_TLS_CLIENT_CRL` adds the CA's revocation list; off by default.
 `locus-server --help`
 lists the options and environment
 variables;
