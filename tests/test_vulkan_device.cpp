@@ -1,3 +1,7 @@
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <stdexcept>
 #include <string>
 
@@ -59,4 +63,40 @@ TEST_CASE("vulkan_set_device cannot move a running backend",
     REQUIRE_THROWS_AS(locus::backend::vulkan_set_device(other),
                       std::runtime_error);
     REQUIRE(locus::backend::vulkan_device_name() == running);
+}
+
+// i#1119: the child of the test below. Hidden, so it runs only when
+// named: it builds the backend's State and keeps a KV pool alive, then
+// returns, so the process exits with the State still there.
+TEST_CASE("vulkan exit child builds the state and keeps a pool", "[.]") {
+    float* pool = locus::backend::vulkan_alloc_kv(1024);
+    REQUIRE(pool != nullptr);
+}
+
+// i#1119: a process that used the backend exits 0. A static State was
+// destroyed from the exit handlers, after the NVIDIA driver's own
+// teardown, and every such process died with SIGSEGV after its work.
+// The child is a fresh exec of this binary, so the driver starts clean.
+TEST_CASE("a process that used vulkan exits cleanly", "[vulkan][device]") {
+    if (!locus::backend::vulkan_backend_usable()) {
+        SKIP("no usable Vulkan device / kernels not built");
+    }
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        const int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            ::dup2(devnull, 1);
+            ::dup2(devnull, 2);
+        }
+        ::execl("/proc/self/exe", "locus_tests",
+                "vulkan exit child builds the state and keeps a pool",
+                static_cast<char*>(nullptr));
+        _exit(127);  // exec failed
+    }
+    REQUIRE(pid >= 0);
+    int status = 0;
+    REQUIRE(::waitpid(pid, &status, 0) == pid);
+    CAPTURE(WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    REQUIRE(WIFEXITED(status));
+    REQUIRE(WEXITSTATUS(status) == 0);
 }

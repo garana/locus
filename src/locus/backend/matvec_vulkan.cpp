@@ -812,9 +812,13 @@ void drain_kv_frees(State& s) {
     }
 }
 
-/** The States, by device index (null until first used there). */
+/** The States, by device index (null until first used there). Never
+ *  freed, as the mutexes above: a static's destructor would run from
+ *  the exit handlers, after the NVIDIA driver's own teardown, and its
+ *  Vulkan calls would jump into unmapped code (i#1119). The OS takes
+ *  the device back at exit. */
 std::unique_ptr<State>* states() {
-    static std::unique_ptr<State> s[kMaxDevices];
+    static auto* s = new std::unique_ptr<State>[kMaxDevices];
     return s;
 }
 
