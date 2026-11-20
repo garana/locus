@@ -201,7 +201,7 @@ def write_dit(path, mdir, q8, pipeline, max_blocks=None):
 
     o = Out(path, "qwen_image")
     w = o.w
-    w.add_name(mdir.name)
+    w.add_name(hf_source.model_name(mdir))
     hf_source.add_source(w, mdir)
     k = "qwen_image."
     w.add_uint32(k + "block_count", n_blocks)

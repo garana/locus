@@ -9,8 +9,11 @@ When the input lies in a Hugging Face cache snapshot
   has no standard key for it). locus's X-Model-Files header reports its
   first 12 digits as the version.
 
-Any other input gets neither key, and a note on stderr says so. Standard
-library only, so the unit test runs without the converters' venv.
+Any other input gets neither key, and a note on stderr says so.
+model_name gives a converter that names the model after its input
+folder the repo's name when that folder is a snapshot (named after its
+commit). Standard library only, so the unit test runs without the
+converters' venv.
 """
 import os
 import pathlib
@@ -62,6 +65,24 @@ def snapshot_of(path):
         if m:
             return m
     return None
+
+
+def model_name(path):
+    """
+    A model name from the converter's input folder: the folder's own
+    name, except for a snapshot folder itself, which is named after its
+    commit; that one gives the repo's name ("Qwen-Image" for
+    Qwen/Qwen-Image). A link with its own name keeps that name.
+
+    @param path The input folder.
+    @returns The name for general.name.
+    """
+    p = pathlib.Path(path)
+    if _COMMIT.fullmatch(p.absolute().name):
+        found = snapshot_of(p)
+        if found:
+            return found[0].split("/")[-1]
+    return p.name
 
 
 def cache_dir():
