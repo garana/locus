@@ -39,6 +39,9 @@ import sys
 import gguf
 import numpy as np
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
+
 
 def read_header(path):
     """@returns (header dict without metadata, data offset)."""
@@ -136,6 +139,7 @@ def write_dit(path, mdir, q8, kontext):
 
     w = gguf.GGUFWriter(str(path), "flux")
     w.add_name(mdir.name)
+    hf_source.add_source(w, mdir)
     k = "flux."
     w.add_uint32(k + "block_count", t["num_layers"])
     w.add_uint32(k + "single_block_count", t["num_single_layers"])
@@ -220,6 +224,7 @@ def write_clip(path, mdir):
 
     w = gguf.GGUFWriter(str(path), "clip_text")
     w.add_name("clip-l")
+    hf_source.add_source(w, mdir)
     k = "clip_text."
     w.add_uint32(k + "block_count", c["num_hidden_layers"])
     w.add_uint32(k + "embedding_length", c["hidden_size"])
@@ -269,6 +274,7 @@ def write_vae(path, mdir):
 
     w = gguf.GGUFWriter(str(path), "autoencoder_kl")
     w.add_name("flux-vae")
+    hf_source.add_source(w, mdir)
     k = "autoencoder_kl."
     w.add_uint32(k + "latent_channels", v["latent_channels"])
     w.add_uint32(k + "out_channels", v["out_channels"])

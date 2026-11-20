@@ -24,6 +24,9 @@ import sys
 import gguf
 from safetensors.numpy import load_file
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
+
 ARCH = "autoencoder_kl"
 
 
@@ -48,6 +51,7 @@ def main():
 
     w = gguf.GGUFWriter(a.out, ARCH)
     w.add_name("sd-vae")
+    hf_source.add_source(w, vdir)
     k = ARCH + "."
     w.add_uint32(k + "latent_channels", cfg["latent_channels"])
     w.add_uint32(k + "out_channels", cfg["out_channels"])

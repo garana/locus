@@ -33,12 +33,16 @@ or an odd rate; the 32 and 44 kHz models are refused), and records the
 layout flags as snac.depthwise / snac.noise / snac.attention.
 """
 import argparse
+import pathlib
 import sys
 
 import numpy as np
 import snac as snac_mod
 import torch
 import torch.nn.functional as F
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
 
 # Max abs difference allowed between the folded re-implementation and
 # model.decode(): float32 summation-order noise only.
@@ -175,7 +179,7 @@ def check_layout(model):
                  "(residual units at block.3/.4/.5)")
 
 
-def emit_gguf(model, sd, path):
+def emit_gguf(model, sd, path, repo):
     """
     Writes the folded decoder as a GGUF (arch "snac"): every
     weight-normed conv on the decode path becomes `<module>.weight`;
@@ -183,10 +187,15 @@ def emit_gguf(model, sd, path):
     encoder and the quantizers' encode-side in_proj are left out.
 
     @param path Output file.
+    @param repo The --repo value: a repo id, or a local directory.
     """
     from gguf import GGUFWriter
 
     out = GGUFWriter(path, "snac")
+    if pathlib.Path(repo).is_dir():
+        hf_source.add_source(out, path=repo)
+    else:
+        hf_source.add_source(out, repo=repo)
     out.add_uint32("snac.sampling_rate", model.sampling_rate)
     out.add_uint32("snac.decoder_dim", model.decoder_dim)
     out.add_array("snac.decoder_rates", list(model.decoder_rates))
@@ -254,7 +263,7 @@ def main():
     if not diff <= TOLERANCE:
         sys.exit(f"fold check FAILED: {diff:.3g} > {TOLERANCE}")
 
-    emit_gguf(model, sd, a.out)
+    emit_gguf(model, sd, a.out, a.repo)
     print("wrote", a.out)
 
 

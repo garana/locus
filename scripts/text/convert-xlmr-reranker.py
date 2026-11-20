@@ -25,10 +25,15 @@ Needs gguf 0.19.0, safetensors 0.4.5 and numpy (the golden venv):
 import argparse
 import json
 import os
+import pathlib
+import sys
 
 import gguf
 import numpy as np
 from safetensors import safe_open
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
 
 Q = gguf.GGMLQuantizationType
 
@@ -61,6 +66,7 @@ def main():
 
     w = gguf.GGUFWriter(a.out, "bert")
     w.add_name("bge-reranker-v2-m3")
+    hf_source.add_source(w, a.model)
     w.add_context_length(cfg["max_position_embeddings"] - offset)
     w.add_embedding_length(cfg["hidden_size"])
     w.add_feed_forward_length(cfg["intermediate_size"])

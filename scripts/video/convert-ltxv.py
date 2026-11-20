@@ -28,11 +28,15 @@ ltxv-2b-0.9.8-distilled.safetensors (sha256 76aa8c47...2cad8f):
 
 import argparse
 import json
+import pathlib
 import struct
 import sys
 
 import gguf
 import numpy as np
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
 
 DIT_PREFIX = "model.diffusion_model."
 VAE_KEEP = ("vae.decoder.", "vae.encoder.", "vae.per_channel_statistics.")
@@ -68,7 +72,7 @@ def to_f32(a):
     return a.astype(np.float32)
 
 
-def write_dit(path, cfg, sch, steps, tensors):
+def write_dit(path, cfg, sch, steps, tensors, ckpt):
     t = cfg
     if t.get("positional_embedding_type") != "rope":
         sys.exit("expected rope positions")
@@ -102,6 +106,7 @@ def write_dit(path, cfg, sch, steps, tensors):
 
     w = gguf.GGUFWriter(path, "ltxv")
     w.add_name("ltxv")
+    hf_source.add_source(w, ckpt)
     k = "ltxv."
     w.add_uint32(k + "block_count", t["num_layers"])
     w.add_uint32(k + "embedding_length", inner)
@@ -142,7 +147,7 @@ def write_dit(path, cfg, sch, steps, tensors):
     w.close()
 
 
-def write_vae(path, cfg, tensors):
+def write_vae(path, cfg, tensors, ckpt):
     v = cfg
     if v.get("dims") != 3 or v.get("causal_decoder"):
         sys.exit("expected a 3D, non-causal decoder")
@@ -188,6 +193,7 @@ def write_vae(path, cfg, tensors):
 
     w = gguf.GGUFWriter(path, "ltxv_vae")
     w.add_name("ltxv-vae")
+    hf_source.add_source(w, ckpt)
     k = "ltxv_vae."
     w.add_uint32(k + "latent_channels", v["latent_channels"])
     w.add_uint32(k + "out_channels", v["out_channels"])
@@ -259,9 +265,9 @@ def main():
             vae.append((name[len("vae."):], load(mm, base, hdr[name])))
     if a.dit_out:
         write_dit(a.dit_out, cfg["transformer"], cfg["scheduler"],
-                  cfg.get("allowed_inference_steps", []), dit)
+                  cfg.get("allowed_inference_steps", []), dit, a.ckpt)
     if a.vae_out:
-        write_vae(a.vae_out, cfg["vae"], vae)
+        write_vae(a.vae_out, cfg["vae"], vae, a.ckpt)
 
 
 if __name__ == "__main__":

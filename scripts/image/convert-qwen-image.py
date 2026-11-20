@@ -45,6 +45,9 @@ import sys
 import gguf
 import numpy as np
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
+
 Q8 = gguf.GGMLQuantizationType.Q8_0
 BF16 = gguf.GGMLQuantizationType.BF16
 
@@ -199,6 +202,7 @@ def write_dit(path, mdir, q8, pipeline, max_blocks=None):
     o = Out(path, "qwen_image")
     w = o.w
     w.add_name(mdir.name)
+    hf_source.add_source(w, mdir)
     k = "qwen_image."
     w.add_uint32(k + "block_count", n_blocks)
     w.add_uint32(k + "embedding_length", inner)
@@ -265,6 +269,7 @@ def write_vae(path, mdir):
     o = Out(path, "qwen_image_vae")
     w = o.w
     w.add_name("qwen-image-vae")
+    hf_source.add_source(w, mdir)
     k = "qwen_image_vae."
     for key in ("base_dim", "z_dim", "num_res_blocks"):
         w.add_uint32(k + key, v[key])

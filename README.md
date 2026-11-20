@@ -278,6 +278,10 @@ prefixes such as "query: " are the client's job. `/v1/rerank` needs
 reranker by `scripts/text/convert-xlmr-reranker.py`. `/v1/classify` and
 image inputs to `/v1/embeddings` need `--image-classifier <cnn.gguf>`,
 a ResNet-50 or Inception-v3 from `scripts/image/convert-cnn.py`.
+A converter whose input lies in a Hugging Face cache snapshot records
+the repository and commit (`general.source.url`,
+`general.source.revision`; `scripts/hf_source.py`, tested by
+`scripts/tests/test_hf_source.py`).
 
 ## Backends
 

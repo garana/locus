@@ -32,6 +32,9 @@ import sys
 import numpy as np
 import torch
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
+
 PREFIX = "gen_vision_model."
 KEEP = ("quantize.embedding.weight", "post_quant_conv.", "decoder.")
 
@@ -93,6 +96,7 @@ def main():
 
     from gguf import GGUFWriter  # noqa: E402
     out = GGUFWriter(args.out, "vq16")
+    hf_source.add_source(out, args.model)
     out.add_uint32("vq16.codebook_size", args16.codebook_size)
     out.add_uint32("vq16.embed_dim", args16.codebook_embed_dim)
     out.add_bool("vq16.codebook_l2_norm", True)
