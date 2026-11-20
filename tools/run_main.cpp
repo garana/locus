@@ -234,6 +234,17 @@ int main(int argc, char** argv) {
                 locus::pipeline::read_key_file(args.prefix_cache_key_file));
         }
         locus::engine::Engine engine(model, tok.eos_id(), cfg);
+        // A prompt the engine can never hold ends with no tokens and no
+        // word about it; say why and fail instead (i#1118).
+        if (const std::string why = engine.admit_error(
+                static_cast<std::uint32_t>(ids.size()));
+            !why.empty()) {
+            std::fprintf(stderr,
+                         "error: %s (--ctx sizes the KV pool, up to the "
+                         "model's context)\n",
+                         why.c_str());
+            return 1;
+        }
 
         using clock = std::chrono::steady_clock;
         if (args.warmup && !ids.empty()) {
