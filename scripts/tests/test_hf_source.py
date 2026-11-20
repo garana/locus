@@ -88,6 +88,38 @@ class SnapshotOf(unittest.TestCase):
         self.assertIsNone(hf_source.snapshot_of(other))
 
 
+class ModelName(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.c = Cache(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_snapshot_folder_gives_the_repo_name(self):
+        self.assertEqual(hf_source.model_name(self.c.snap), "Qwen-Image")
+        old = os.getcwd()
+        os.chdir(self.c.snap)
+        try:
+            self.assertEqual(hf_source.model_name("."), "Qwen-Image")
+        finally:
+            os.chdir(old)
+
+    def test_link_keeps_its_name(self):
+        link = pathlib.Path(self.tmp.name) / "qwen-image"
+        link.symlink_to(self.c.snap)
+        self.assertEqual(hf_source.model_name(link), "qwen-image")
+
+    def test_plain_folder_keeps_its_name(self):
+        plain = pathlib.Path(self.tmp.name) / "FLUX.1-dev"
+        plain.mkdir()
+        self.assertEqual(hf_source.model_name(plain), "FLUX.1-dev")
+        # A commit-like name outside a snapshot is still a folder name.
+        odd = pathlib.Path(self.tmp.name) / COMMIT
+        odd.mkdir()
+        self.assertEqual(hf_source.model_name(odd), COMMIT)
+
+
 class SourceKeys(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -138,7 +138,7 @@ def write_dit(path, mdir, q8, kontext):
         sys.exit("guidance_embeds disagrees with the tensors")
 
     w = gguf.GGUFWriter(str(path), "flux")
-    w.add_name(mdir.name)
+    w.add_name(hf_source.model_name(mdir))
     hf_source.add_source(w, mdir)
     k = "flux."
     w.add_uint32(k + "block_count", t["num_layers"])
