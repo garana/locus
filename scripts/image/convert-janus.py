@@ -54,7 +54,7 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import hf_source  # noqa: E402
 
-LM ="language_model."
+LM = "language_model."
 
 
 def permute(w, n_head):

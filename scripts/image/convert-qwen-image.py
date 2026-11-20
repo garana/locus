@@ -48,7 +48,7 @@ import numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import hf_source  # noqa: E402
 
-Q8 =gguf.GGMLQuantizationType.Q8_0
+Q8 = gguf.GGMLQuantizationType.Q8_0
 BF16 = gguf.GGMLQuantizationType.BF16
 
 
