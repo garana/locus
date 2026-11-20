@@ -210,8 +210,12 @@ class LtxvPipeline {
                                                 std::string_view text,
                                                 std::size_t max_length = 256);
 
+    /** @returns The GGUFs load_dir used, by name; others it skipped. */
+    const std::vector<std::string>& file_paths() const { return paths_; }
+
   private:
     std::vector<std::unique_ptr<gguf::GgufFile>> files_;
+    std::vector<std::string> paths_;
     std::unique_ptr<tok::UgmTokenizer> tok_;
     std::unique_ptr<T5Encoder> t5_;
     std::unique_ptr<LtxvDit> dit_;

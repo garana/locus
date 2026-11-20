@@ -159,6 +159,8 @@ class QwenImagePipeline {
     std::uint32_t channels() const { return dit_->channels(); }
     /** @returns The VAE's spatial scale (8). */
     std::uint32_t vae_scale() const { return vae_->scale(); }
+    /** @returns The GGUFs load_dir used, by name; others it skipped. */
+    const std::vector<std::string>& file_paths() const { return paths_; }
 
   private:
     QwenImagePipeline() = default;
@@ -168,6 +170,7 @@ class QwenImagePipeline {
                                  std::uint32_t& n) const;
 
     std::vector<std::unique_ptr<gguf::GgufFile>> files_;
+    std::vector<std::string> paths_;
     std::unique_ptr<tok::Tokenizer> tok_;
     std::unique_ptr<model::TransformerModel> lm_;
     std::unique_ptr<QwenImageDit> dit_;

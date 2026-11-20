@@ -30,18 +30,22 @@ images, video) says which model ran, in two headers. `X-Model` is
 one token: the GGUF's architecture for a single model (`llama`,
 `qwen2vl`, `bert`), or the pipeline (`janus-pro`, `pixart`, `flux`,
 `flux-kontext`, `qwen-image`, `qwen-image-edit`, `ltx-video`).
-`X-Model-Files` lists each GGUF it uses, in the RFC 8941 style: the
-file name, then `name` (`general.name`), `version` (`general.version`,
-else the first 12 hex digits of `general.source.revision`) when set,
-and `type`, the tensor type that holds most of the file's bytes, which
-says whether and how it is quantized (`q4_k` for a Q4_K_M file):
+`X-Model-Files` lists each GGUF it uses (for a pipeline, the GGUFs it
+loaded from its folder, not others kept there), in the RFC 8941 style:
+the file name, then `name` (`general.name`), `version`
+(`general.version`, else the first 12 hex digits of
+`general.source.revision`) when set, and `type`, the tensor type that
+holds most of the file's bytes, which says whether and how it is
+quantized (`q4_k` for a Q4_K_M file):
 
     X-Model: llama
     X-Model-Files: "llama-3.2-1b-q4_k_m.gguf";name="Llama 3.2 1B Instruct";type=q4_k
 
 A FLUX reply that applied LoRAs adds `X-Image-Lora`, each LoRA's name
 and scale (`"line-art";scale=0.6`). The server reads these from the
-GGUF headers once, at startup; it hashes no weights.
+GGUF headers once, at startup; it hashes no weights. An error reply
+(400, 503) may carry them too, naming the model that would have run.
+A GGUF whose architecture is not a header token gets no `X-Model`.
 
 The chat endpoints and `/v1/responses` accept a `tools` list and
 return structured tool calls (OpenAI `tool_calls`, Anthropic

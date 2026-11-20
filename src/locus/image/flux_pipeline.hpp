@@ -168,8 +168,12 @@ class FluxPipeline {
     std::vector<tok::TokenId> t5_ids(const std::string& prompt,
                                      std::uint32_t max_length) const;
 
+    /** @returns The GGUFs load_dir used, by name; others it skipped. */
+    const std::vector<std::string>& file_paths() const { return paths_; }
+
   private:
     std::vector<std::unique_ptr<gguf::GgufFile>> files_;
+    std::vector<std::string> paths_;
     /** The tensor bytes of the T5 and DiT GGUFs, for
      *  backend::vulkan_release_weights. */
     std::span<const std::byte> t5_bytes_, dit_bytes_;

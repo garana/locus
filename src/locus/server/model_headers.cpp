@@ -1,6 +1,5 @@
 #include "locus/server/model_headers.hpp"
 
-#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 
@@ -22,6 +21,20 @@ std::string sf_string(std::string_view s) {
     return out;
 }
 
+bool is_sf_token(std::string_view s) {
+    const auto alpha = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    };
+    if (s.empty() || !(alpha(s[0]) || s[0] == '*')) return false;
+    for (const char c : s) {
+        const bool ok = alpha(c) || (c >= '0' && c <= '9') ||
+                        std::string_view("!#$%&'*+-.^_`|~:/").find(c) !=
+                            std::string_view::npos;
+        if (!ok) return false;
+    }
+    return true;
+}
+
 std::string model_file_item(std::string_view file, const gguf::GgufFile& g) {
     std::string out = sf_string(file);
     if (const auto name = g.get_string("general.name")) {
@@ -40,7 +53,7 @@ std::string model_file_item(std::string_view file, const gguf::GgufFile& g) {
 ModelHeaders model_headers(std::string model,
                            std::span<const std::string> paths) {
     ModelHeaders h;
-    h.model = std::move(model);
+    if (is_sf_token(model)) h.model = std::move(model);
     for (const std::string& p : paths) {
         const auto g = gguf::GgufFile::open(p);
         if (!h.files.empty()) h.files += ", ";
@@ -48,18 +61,6 @@ ModelHeaders model_headers(std::string model,
             std::filesystem::path(p).filename().string(), g);
     }
     return h;
-}
-
-std::vector<std::string> gguf_files_in(const std::string& dir) {
-    std::vector<std::string> out;
-    std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
-        if (e.is_regular_file() && e.path().extension() == ".gguf") {
-            out.push_back(e.path().string());
-        }
-    }
-    std::sort(out.begin(), out.end());
-    return out;
 }
 
 std::string lora_header(std::span<const image::LoraPick> picks) {

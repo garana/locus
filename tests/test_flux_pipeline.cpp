@@ -115,6 +115,7 @@ TEST_CASE("flux pipeline matches diffusers", "[flux][image][e2e]") {
         SKIP("needs the four FLUX GGUFs in " << kModels);
     }
     const auto p = FluxPipeline::load_dir(kModels);
+    REQUIRE(p->file_paths().size() == 4);
     std::ifstream f(kDir + "golden/flux/pipeline.json");
     REQUIRE(f.good());
     const auto j = nlohmann::json::parse(f);

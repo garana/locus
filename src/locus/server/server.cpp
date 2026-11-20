@@ -1428,26 +1428,40 @@ void OpenAiServer::build_model_headers() {
                                  std::vector<std::string>{*path});
         }
     }
-    if (!opt_.image_model_dir.empty()) {
-        const std::string token =
-            qwen_edit_    ? "qwen-image-edit"
-            : qwen_image_ ? "qwen-image"
-            : flux_       ? (flux_->may_edit() ? "flux-kontext" : "flux")
-                          : "pixart";
+    // The pipelines list the GGUFs they loaded, so a file kept in the
+    // folder but not used is not named.
+    if (qwen_edit_) {
         image_headers_ =
-            model_headers(token, gguf_files_in(opt_.image_model_dir));
+            model_headers("qwen-image-edit", qwen_edit_->file_paths());
+    } else if (qwen_image_) {
+        image_headers_ =
+            model_headers("qwen-image", qwen_image_->file_paths());
+    } else if (flux_) {
+        image_headers_ =
+            model_headers(flux_->may_edit() ? "flux-kontext" : "flux",
+                          flux_->file_paths());
+    } else if (pixart_) {
+        image_headers_ = model_headers("pixart", pixart_->file_paths());
     }
-    if (!opt_.video_model_dir.empty()) {
-        video_headers_ =
-            model_headers("ltx-video", gguf_files_in(opt_.video_model_dir));
+    if (ltxv_) {
+        video_headers_ = model_headers("ltx-video", ltxv_->file_paths());
+    }
+    for (const ModelHeaders* h :
+         {&text_headers_, &audio_headers_, &janus_headers_, &embed_headers_,
+          &rerank_headers_, &classify_headers_}) {
+        if (!h->files.empty() && h->model.empty()) {
+            std::fprintf(stderr,
+                         "locus-server: a model's general.architecture is "
+                         "not a header token; replies leave out X-Model\n");
+            break;
+        }
     }
 }
 
 void OpenAiServer::set_model_headers(http::ServerResponse& res,
                                      const ModelHeaders& h) {
-    if (h.model.empty() && h.files.empty()) return;
-    res.set_header("X-Model", h.model);
-    res.set_header("X-Model-Files", h.files);
+    if (!h.model.empty()) res.set_header("X-Model", h.model);
+    if (!h.files.empty()) res.set_header("X-Model-Files", h.files);
 }
 
 std::vector<std::pair<std::string, std::string>> OpenAiServer::engines()
