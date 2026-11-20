@@ -2,14 +2,44 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
+#include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "catch_amalgamated.hpp"
 #include "locus/backend/variants.hpp"
 #include "locus/backend/vulkan/context.hpp"
 
 using locus::backend::vk::VulkanContext;
+
+namespace {
+
+/**
+ * @returns The path of this test binary, to exec a fresh child of it;
+ *     empty where it is not known.
+ */
+std::string self_exe() {
+#if defined(__linux__)
+    return "/proc/self/exe";
+#elif defined(__APPLE__)
+    std::uint32_t n = 0;
+    _NSGetExecutablePath(nullptr, &n);
+    std::vector<char> buf(n);
+    if (_NSGetExecutablePath(buf.data(), &n) != 0) {
+        return {};
+    }
+    return buf.data();
+#else
+    return {};
+#endif
+}
+
+}  // namespace
 
 // i#572: the devices with a compute queue are listed without opening
 // one, and a context opens on any of them by index.
@@ -81,6 +111,10 @@ TEST_CASE("a process that used vulkan exits cleanly", "[vulkan][device]") {
     if (!locus::backend::vulkan_backend_usable()) {
         SKIP("no usable Vulkan device / kernels not built");
     }
+    const std::string exe = self_exe();
+    if (exe.empty()) {
+        SKIP("this OS gives no path to the test binary");
+    }
     const pid_t pid = ::fork();
     if (pid == 0) {
         const int devnull = ::open("/dev/null", O_WRONLY);
@@ -88,7 +122,7 @@ TEST_CASE("a process that used vulkan exits cleanly", "[vulkan][device]") {
             ::dup2(devnull, 1);
             ::dup2(devnull, 2);
         }
-        ::execl("/proc/self/exe", "locus_tests",
+        ::execl(exe.c_str(), "locus_tests",
                 "vulkan exit child builds the state and keeps a pool",
                 static_cast<char*>(nullptr));
         _exit(127);  // exec failed
