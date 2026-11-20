@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <random>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -177,6 +178,50 @@ TEST_CASE("bench: neon q8k IQ TQ and Q2_K", "[.][bench]") {
         WARN(q.name << ": scalar q8k=" << s << "ns neon q8k=" << v
                     << "ns speedup=" << s / v << "x; batched 16: " << b
                     << "ns/token (" << v / b << "x one-token)");
+    }
+    SUCCEED();
+}
+
+TEST_CASE("bench: neon q8k block-32 prefill batch", "[.][bench]") {
+    // i#1076: Qwen2.5 0.5B's FFN up projection (4864 x 896) against a
+    // 64-token batch, one thread, ns per token; against 64 one-token
+    // calls. The best backend's ops, so the dotprod kernels where the
+    // CPU has them.
+    using TT = locus::gguf::TensorType;
+    const auto& ops = locus::backend::best_backend().ops;
+    REQUIRE(ops.matvec_q8k_batch != nullptr);
+    const std::uint32_t rows = 4864, cols = 896;
+    constexpr std::uint32_t kN = 64;
+    std::mt19937 rng(1076);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> xb(std::size_t{kN} * cols), ob(std::size_t{kN} * rows);
+    for (auto& v : xb) {
+        v = dist(rng);
+    }
+    const int iters = 10;
+    for (const auto& [type, name, bytes] :
+         {std::tuple{TT::kQ8_0, "Q8_0", std::size_t{34}},
+          std::tuple{TT::kQ4_0, "Q4_0", std::size_t{18}}}) {
+        // make_kquant sizes 256-element blocks: 8x the columns gives
+        // cols / 32 blocks of `bytes` per row, each with its f16 scale.
+        auto w = make_kquant(rows, cols * 8, bytes, 0, -1, 9);
+        Mat m{type, w.data(), rows, cols};
+        std::vector<float> out(rows);
+        const double one = time_matvec(
+            ops.matvec_q8k, m, std::span<const float>(xb.data(), cols), out,
+            iters);
+        ops.matvec_q8k_batch(m, xb, ob, kN);  // warm
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            ops.matvec_q8k_batch(m, xb, ob, kN);
+        }
+        const double b = std::chrono::duration<double, std::nano>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count() /
+                         iters / kN;
+        WARN(name << " " << rows << "x" << cols << ": one-token " << one
+                  << "ns; batched " << kN << ": " << b << "ns/token ("
+                  << one / b << "x)");
     }
     SUCCEED();
 }
