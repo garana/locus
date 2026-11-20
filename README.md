@@ -32,7 +32,9 @@ OpenAI and Anthropic HTTP APIs, with a small, vendored dependency set.
   copy-on-write prefix sharing; f32, f16, q8 or q4 KV.
 - **API:** `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
   `/v1/responses` (stateless), `/v1/embeddings`, `/v1/rerank`,
-  `/v1/classify`, `/v1/models`, `/metrics`, `/health`.
+  `/v1/classify`, `/v1/models`, `/metrics`, `/health`. Each reply
+  names the model that ran, its version and quantization (`X-Model`,
+  `X-Model-Files`; docs/CLIENTS.md).
 - **Embedding models:** GGUFs of arch `bert` (BERT with WordPiece, or
   XLM-R with SentencePiece) or `nomic-bert`, with `--embedding-model`,
   beside the chat model; tested with bge-small-en-v1.5, e5-small-v2,

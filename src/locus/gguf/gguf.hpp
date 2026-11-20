@@ -223,4 +223,20 @@ class GgufFile {
     std::vector<std::unique_ptr<GgufFile>> shards_;
 };
 
+/**
+ * @param t A tensor type.
+ * @returns Its lowercase ggml name ("f32", "q8_0", "q4_k", "iq2_xxs").
+ */
+std::string_view tensor_type_name(TensorType t);
+
+/**
+ * The tensor type that holds the most bytes across a model's files
+ * (every shard): what a model was quantized to, as Q4_K for a Q4_K_M
+ * file whose few Q6_K tensors hold fewer bytes.
+ *
+ * @param g A parsed model.
+ * @returns That type; kF32 for a model without tensors.
+ */
+TensorType main_tensor_type(const GgufFile& g);
+
 }  // namespace locus::gguf
