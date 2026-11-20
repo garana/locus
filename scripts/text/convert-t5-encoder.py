@@ -44,6 +44,9 @@ import gguf
 import numpy as np
 from sentencepiece import sentencepiece_model_pb2 as spb
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
+
 # SentencePiece piece types -> GGUF token types.
 SP_TYPES = {1: gguf.TokenType.NORMAL, 2: gguf.TokenType.UNKNOWN,
             3: gguf.TokenType.CONTROL, 4: gguf.TokenType.USER_DEFINED,
@@ -119,6 +122,7 @@ def main():
 
     w = gguf.GGUFWriter(a.out, "t5encoder")
     w.add_name(cfg.get("_name_or_path", "t5").split("/")[-1] or "t5")
+    hf_source.add_source(w, mdir)
     w.add_context_length(512)
     w.add_embedding_length(cfg["d_model"])
     w.add_feed_forward_length(cfg["d_ff"])

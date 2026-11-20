@@ -27,6 +27,9 @@ import sys
 import gguf
 from safetensors.numpy import load_file
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
+
 ARCH = "pixart"
 SKIP = {"caption_projection.y_embedding"}
 
@@ -65,6 +68,7 @@ def main():
 
     w = gguf.GGUFWriter(a.out, ARCH)
     w.add_name("pixart")
+    hf_source.add_source(w, tdir)
     k = ARCH + "."
     w.add_uint32(k + "block_count", cfg["num_layers"])
     w.add_uint32(k + "embedding_length", inner)

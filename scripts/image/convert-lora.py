@@ -53,6 +53,9 @@ import sys
 import gguf
 import numpy as np
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
+
 
 def read_safetensors(path):
     """@returns {name: array} of one safetensors file; BF16 widened to
@@ -235,6 +238,7 @@ def main():
         sys.exit("no DiT layers in the LoRA")
     w = gguf.GGUFWriter(a.out, "flux_lora")
     w.add_name(pathlib.Path(a.lora).stem)
+    hf_source.add_source(w, a.lora)
     w.add_string("flux_lora.source_format", fmt)
     w.add_uint32("flux_lora.layer_count", len(layers))
     for layer, la, lb in layers:

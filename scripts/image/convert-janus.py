@@ -51,7 +51,10 @@ import sys
 import numpy as np
 import torch
 
-LM = "language_model."
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
+
+LM ="language_model."
 
 
 def permute(w, n_head):
@@ -89,6 +92,7 @@ def main():
     from gguf import GGUFWriter, GGMLQuantizationType, TokenType, quants
     out = GGUFWriter(args.out, "llama")
     out.add_name("Janus-Pro-1B")
+    hf_source.add_source(out, d)
     out.add_context_length(cfg["max_position_embeddings"])
     out.add_embedding_length(cfg["hidden_size"])
     out.add_block_count(n_layer)

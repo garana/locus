@@ -39,6 +39,9 @@ import gguf
 import numpy as np
 from safetensors.numpy import load_file
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import hf_source  # noqa: E402
+
 READ = set()  # the checkpoint keys read, to catch one left out
 
 
@@ -115,6 +118,7 @@ def main():
 
     w = gguf.GGUFWriter(a.out, gguf_arch)
     w.add_name(f"{arch}.{pc.get('tag', '')}")
+    hf_source.add_source(w, d)
     k = gguf_arch + "."
     for key, val in extra.items():
         w.add_array(k + key, val)
