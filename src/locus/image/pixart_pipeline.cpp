@@ -62,6 +62,7 @@ std::unique_ptr<PixArtPipeline> PixArtPipeline::load_dir(
         }
         *slot = g.get();
         p->files_.push_back(std::move(g));
+        p->paths_.push_back(path.string());
     }
     if (t5 == nullptr || dit == nullptr || vae == nullptr) {
         throw gguf::Error("pixart: " + dir +

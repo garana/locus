@@ -113,8 +113,12 @@ class PixArtPipeline {
     static std::vector<float> normal_latent(std::uint64_t seed,
                                             std::size_t n);
 
+    /** @returns The GGUFs load_dir used, by name; others it skipped. */
+    const std::vector<std::string>& file_paths() const { return paths_; }
+
   private:
     std::vector<std::unique_ptr<gguf::GgufFile>> files_;
+    std::vector<std::string> paths_;
     std::unique_ptr<tok::UgmTokenizer> tok_;
     std::unique_ptr<T5Encoder> t5_;
     std::unique_ptr<PixArtDit> dit_;
