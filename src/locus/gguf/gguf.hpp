@@ -55,9 +55,11 @@ enum class ValueType : std::uint32_t {
  *   of 16 or 32; each sub-block has its own small scale (and min),
  *   themselves scaled by an f16 d (and dmin) of the super-block.
  * - IQn ("i-quants"): super-blocks of 256 (IQ4_NL: blocks of 32);
- *   groups of 4 or 8 weights share one index into a fixed table of
- *   value patterns, plus sign bits; 1.5625 to 4.5 bpw. _XXS, _XS, _S
- *   and _M name variants of one width, from fewest to most bits.
+ *   1.5625 to 4.5 bpw. IQ1 to IQ3: groups of 4 or 8 weights share one
+ *   index into a fixed table of value patterns (IQ2 and IQ3 add sign
+ *   bits). IQ4: one 4-bit code per weight into a 16-value table. _XXS,
+ *   _XS, _S and _M name variants of one width, from fewest to most
+ *   bits.
  * - TQn_0: ternary weights (each -1, 0 or +1, times d), for BitNet
  *   b1.58 models.
  *
@@ -130,7 +132,8 @@ enum class TensorType : std::uint32_t {
     /** bfloat16: the top 16 bits of an f32 (same range, fewer digits);
      *  16 bpw. */
     kBF16 = 30,
-    /** Ternary, 5 weights packed per byte in base 3; 1.6875 bpw. */
+    /** Ternary, 5 weights packed per byte in base 3 (the last 16: 4
+     *  per byte); 1.6875 bpw. */
     kTQ1_0 = 34,
     /** Ternary, 2 bits per weight; 2.0625 bpw. */
     kTQ2_0 = 35,
